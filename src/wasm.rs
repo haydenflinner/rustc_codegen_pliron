@@ -611,7 +611,7 @@ fn nskip(b: &[u8], p: &mut usize, n: usize) -> Option<()> {
     Some(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum WPeek {
     Get(u32),
     Set(u32),
@@ -622,6 +622,8 @@ enum WPeek {
     Ctl,
     /// Deleted by the rewrite passes; emits no bytes.
     Del,
+    /// `local.set` proven dead; emits `drop` to keep the stack effect.
+    Drop,
     Other,
 }
 
@@ -633,8 +635,10 @@ enum WPeek {
 /// identical and only span adjacent instructions, so structured
 /// control flow is unaffected (branch targets are label depths, not
 /// byte offsets). Returns None — caller keeps the original bytes — on
-/// any opcode it can't decode.
-fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
+/// any opcode it can't decode. `fsig`/`tsig` give (pops, pushes) per
+/// function index and per type index so calls can take part in
+/// stack-effect tracking.
+fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u8>> {
     // Locals prefix: vec of (count, valtype). waffle emits one group per
     // local; re-emit adjacent same-type runs as a single group. This is
     // index-preserving (merge only, never reorder), so it needs no other
@@ -1237,166 +1241,595 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             false
         };
-        let mut live: Vec<bool> = vec![true; cand.len()];
-        loop {
-            // Instruction indices the surviving candidates rewrite or
-            // delete; accesses to a destination local are only allowed
-            // through these.
-            let mut mset: FxHashMap<usize, ()> = FxHashMap::default();
-            for (ci, &(p1, gi, si, _, _)) in cand.iter().enumerate() {
-                if live[ci] {
-                    mset.insert(p1, ());
-                    mset.insert(gi, ());
-                    mset.insert(si, ());
+        // d dominates u (as a def covering it) when d's structured
+        // context is a prefix of u's: d is on u's mandatory path, so no
+        // path reaches u without first passing d's position. Branches
+        // between them can't divert control into u except through d's
+        // own region, so they don't affect covering.
+        let covers = |d: usize, u: usize| -> bool {
+            let (cd, cu) = (&ctx[ins[d].3], &ctx[ins[u].3]);
+            cd.len() <= cu.len() && cu[..cd.len()] == cd[..]
+        };
+        // Back-edge reach: a def textually after a read still reaches it
+        // when both sit inside a `loop` with a back-edge branch after
+        // the def. loopbe[construct] = branch positions targeting the
+        // loop (br to a loop label re-enters at its head).
+        let mut loopbe: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (i, &(k, s, _, ci)) in ins.iter().enumerate() {
+            if !matches!(k, WPeek::Ctl) {
+                continue;
+            }
+            let mut lbls: [u32; 2] = [u32::MAX; 2];
+            let mut nl = 0usize;
+            match b[s] {
+                0x0c | 0x0d => {
+                    let mut q = s + 1;
+                    if let Some(l) = urd(b, &mut q) {
+                        lbls[0] = l;
+                        nl = 1;
+                    }
+                }
+                0x0e => {
+                    // br_table: every target counts.
+                    let mut q = s + 1;
+                    if let Some(n) = urd(b, &mut q) {
+                        let mut all = Vec::with_capacity(n as usize + 1);
+                        for _ in 0..=n {
+                            if let Some(l) = urd(b, &mut q) {
+                                all.push(l);
+                            }
+                        }
+                        for l in all {
+                            let c = &ctx[ci];
+                            if (l as usize) < c.len() {
+                                let e = c[c.len() - 1 - l as usize].0;
+                                if dop[e as usize] == 0x03 {
+                                    loopbe.entry(e).or_default().push(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for &l in &lbls[..nl] {
+                let c = &ctx[ci];
+                if (l as usize) < c.len() {
+                    let e = c[c.len() - 1 - l as usize].0;
+                    if dop[e as usize] == 0x03 {
+                        loopbe.entry(e).or_default().push(i);
+                    }
                 }
             }
-            let mut dropped = false;
-            for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
-                if !live[ci] {
-                    continue;
+        }
+        // backedge(d,u): a shared loop e encloses both, and some
+        // back-edge branch to e sits after d with no live def of the
+        // local covering the branch — a dominating def hides d's value
+        // from the next iteration.
+        let backedge = |dl: &[usize],
+                        extra: &[usize],
+                        d: usize,
+                        u: usize,
+                        gone: &dyn Fn(usize) -> bool|
+         -> bool {
+            let (cd, cu) = (&ctx[ins[d].3], &ctx[ins[u].3]);
+            cd.iter().any(|e| {
+                if dop[e.0 as usize] != 0x03 || !cu.contains(e) {
+                    return false;
                 }
-                let mut ok = true;
-                let mut why = 0;
-                // The copy-get must actually read the producer's value:
-                // it has to be reachable from the producer (not on a
-                // sibling arm) with no reachable def of t in between.
-                if arm_div(p1, gi) {
-                    ok = false;
-                    why = 1;
-                }
-                if ok {
-                    for &d in defs.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        if d > p1 && d < gi && !arm_div(p1, d) {
-                            ok = false;
-                            why = 2;
-                            break;
-                        }
-                    }
-                }
-                // Every other use of the temp that can observe the
-                // producer's value must not exist: a use is safe only
-                // when it is unreachable from the producer (different
-                // arm) or shadowed by a later def in its own region.
-                if ok {
-                    for &u in uses.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        if u <= p1 || u == gi {
-                            continue;
-                        }
-                        if arm_div(p1, u) {
-                            continue; // sibling arm: never sees p1's def
-                        }
-                        let shadowed = defs
-                            .get(&t)
-                            .map(|v| {
-                                v.iter().any(|&d| {
-                                    d > p1
-                                        && d < u
-                                        && !mset.contains_key(&d)
-                                        && ctx[ins[d].3] == ctx[ins[u].3]
+                loopbe
+                    .get(&e.0)
+                    .map(|bs| {
+                        bs.iter().any(|&bpos| {
+                            bpos > d
+                                && !dl.iter().chain(extra.iter()).any(|&d2| {
+                                    d2 > d && d2 < bpos && !gone(d2) && covers(d2, bpos)
                                 })
-                            })
-                            .unwrap_or(false);
-                        if !shadowed {
-                            ok = false;
-                            why = 3;
-                            if verbose {
-                                if pliron_cfg::tracing_on() {
-                                    tracing::debug!(target: "pliron::wasm",
-                                        "  fail3 t={} use@{} uctx={:?} pctx={:?}",
-                                        t, ins[u].1, ctx[ins[u].3], ctx[ins[p1].3]
-                                    )
-                                };
-                            }
-                            break;
-                        }
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        // Reaching-def analysis over a def list (with optional extra
+        // defs, e.g. a producer being retargeted onto this local).
+        // `gone` marks defs a rewrite removes — they neither reach nor
+        // cover. Forward (d < u): reaches unless arm-divergent or a
+        // covering live def hides it. Backward (d > u): only via a
+        // shared-loop back-edge.
+        let reaches = |dl: &[usize], extra: &[usize], d: usize, u: usize, gone: &dyn Fn(usize) -> bool| -> bool {
+            if arm_div(d, u) {
+                return false;
+            }
+            if d < u {
+                !dl.iter().chain(extra.iter()).any(|&d2| {
+                    d2 > d && d2 < u && !gone(d2) && covers(d2, u)
+                })
+            } else {
+                backedge(dl, extra, d, u, gone)
+            }
+        };
+        let obs = |dl: &[usize], extra: &[usize], u: usize, gone: &dyn Fn(usize) -> bool| -> Vec<usize> {
+            let mut v: Vec<usize> = dl
+                .iter()
+                .chain(extra.iter())
+                .copied()
+                .filter(|&d| !gone(d) && reaches(dl, extra, d, u, gone))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        // Defs of x inside the (p1, si) window per candidate: these
+        // must relocate onto the temp local t, which the producer
+        // retarget frees. (si itself is the copy-set, handled apart.)
+        let xdefs: Vec<Vec<usize>> = cand
+            .iter()
+            .map(|&(p1, _, si, _, x)| {
+                defs.get(&x)
+                    .map(|v| {
+                        v.iter()
+                            .copied()
+                            .filter(|&d| d > p1 && d < si)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        // Greatest fixpoint over observed-def sets: a candidate is
+        // rewritten iff, in the post-rewrite program, every read keeps
+        // observing the same value sources. The producer's local p1 and
+        // the copy set si both denote the producer's value — normalize
+        // them to one marker so sets compare by value source.
+        const PSRC: usize = usize::MAX;
+        let norm = |v: &mut Vec<usize>, p1: usize, si: usize| {
+            for d in v.iter_mut() {
+                if *d == p1 || *d == si {
+                    *d = PSRC;
+                }
+            }
+            v.sort_unstable();
+            v.dedup();
+        };
+        let (live, acts) = {
+            let mut live = vec![true; cand.len()];
+            let mut acts: Vec<Option<(Vec<usize>, Vec<usize>)>> = vec![None; cand.len()];
+            for _round in 0..16 {
+                // def instructions the live candidates remove/retarget;
+                // gone in the post-rewrite program.
+                let mut mset: FxHashSet<usize> = FxHashSet::default();
+                for (ci, &(p1, gi, si, _, _)) in cand.iter().enumerate() {
+                    if live[ci] {
+                        mset.extend([p1, gi, si]);
+                        mset.extend(xdefs[ci].iter().copied());
                     }
                 }
-                // Straight-line producer->copy window; the destination
-                // local is only touched by instructions being rewritten.
-                if ok {
-                    for (i, &(k, _, _, _)) in ins[p1 + 1..si].iter().enumerate() {
-                        let i = i + p1 + 1;
-                        match k {
-                            WPeek::Ctl => {
-                                ok = false;
-                                why = 4;
-                                break;
+                let mut committed: FxHashSet<usize> = FxHashSet::default();
+                let mut dropped = false;
+                for ci in 0..cand.len() {
+                    if !live[ci] {
+                        continue;
+                    }
+                    let (p1, gi, si, t, x) = cand[ci];
+                    let rel = &xdefs[ci];
+                    let own = |d: usize| d == p1 || d == gi || d == si || rel.contains(&d);
+                    let gone_o = |d: usize| mset.contains(&d) && !own(d);
+                    // new-program views: x loses si and the relocated
+                    // defs but gains p1; t loses p1 but gains relocs.
+                    let gonx = |d: usize| gone_o(d) || d == si || rel.contains(&d);
+                    let gont = |d: usize| gone_o(d) || d == p1;
+                    let nogone = |_: usize| false;
+                    let dl_t = defs.get(&t).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let dl_x = defs.get(&x).map(|v| v.as_slice()).unwrap_or(&[]);
+                    // The copy-get must read exactly the producer.
+                    let mut ok = obs(dl_t, &[], gi, &nogone) == [p1];
+                    let mut why = if ok { 0 } else { 1 };
+                    let mut tre: Vec<usize> = Vec::new();
+                    let mut xrd: Vec<usize> = Vec::new();
+                    if ok {
+                        for &u in uses.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if u == gi || !matches!(ins[u].0, WPeek::Get(_)) {
+                                continue;
                             }
-                            WPeek::Get(l) | WPeek::Set(l) | WPeek::Tee(l) if l == x => {
-                                if !mset.contains_key(&i) {
+                            let s = obs(dl_t, &[], u, &nogone);
+                            if s.contains(&p1) {
+                                // reads p1's value -> retarget to x;
+                                // valid only when p1 is its sole source
+                                // and x carries exactly p1's value to u.
+                                let sx = obs(dl_x, &[p1], u, &gonx);
+                                if s != [p1] || sx != [p1] {
                                     ok = false;
-                                    why = 5;
-                                    if verbose {
-                                        if pliron_cfg::tracing_on() {
-                                            tracing::debug!(target: "pliron::wasm","  fail5 x={} i@{}", x, ins[i].1)
-                                        };
-                                    }
+                                    why = 2;
+                                    break;
+                                }
+                                tre.push(u);
+                            } else {
+                                // keeps reading t: new t-defs must be
+                                // exactly its old sources.
+                                let st = obs(dl_t, rel, u, &gont);
+                                if st != s {
+                                    ok = false;
+                                    why = 3;
                                     break;
                                 }
                             }
-                            _ => {}
                         }
                     }
-                }
-                // p1 must be ours alone (not another pair's get/set —
-                // those get deleted, not retargeted), and temp/dest
-                // must be unique among live candidates. Sharing a temp
-                // or a dest clobbers the other rewrite, so only the
-                // earlier candidate wins; dead candidates don't count.
-                if ok {
-                    for (cj, &(_pq, qg, qs, qt, qx)) in cand.iter().enumerate() {
-                        if cj == ci {
-                            continue;
-                        }
-                        if qg == p1 || qs == p1 || ((qx == x || qt == t) && live[cj] && cj < ci) {
+                    if ok {
+                        for &u in uses.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if !matches!(ins[u].0, WPeek::Get(_)) {
+                                continue;
+                            }
+                            let so = obs(dl_x, &[], u, &nogone);
+                            let sn = obs(dl_x, &[p1], u, &gonx);
+                            let (mut a, mut c) = (so.clone(), sn.clone());
+                            norm(&mut a, p1, si);
+                            norm(&mut c, p1, si);
+                            if a == c {
+                                continue;
+                            }
+                            // Every old source was a window def being
+                            // relocated to t: retarget the read iff t
+                            // mirrors x's old reaching set exactly.
+                            if !so.is_empty()
+                                && so.iter().all(|d| rel.contains(d))
+                                && obs(dl_t, rel, u, &gont) == so
+                            {
+                                xrd.push(u);
+                                continue;
+                            }
                             ok = false;
-                            why = 6;
+                            why = 4;
                             break;
                         }
                     }
+                    // p1 must be ours alone (not another pair's get/set)
+                    // and temp/dest unique among earlier live candidates;
+                    // rewrite sets must be disjoint.
+                    if ok {
+                        let mut mine: FxHashSet<usize> =
+                            [p1, gi, si].iter().copied().collect();
+                        mine.extend(rel.iter().copied());
+                        mine.extend(tre.iter().copied());
+                        mine.extend(xrd.iter().copied());
+                        if mine.iter().any(|d| committed.contains(d)) {
+                            ok = false;
+                            why = 5;
+                        } else {
+                            for (cj, &(_, qg, qs, qt, qx)) in cand.iter().enumerate() {
+                                if cj >= ci || !live[cj] {
+                                    continue;
+                                }
+                                if qg == p1
+                                    || qs == p1
+                                    || qx == x
+                                    || qx == t
+                                    || qt == x
+                                    || qt == t
+                                {
+                                    ok = false;
+                                    why = 6;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                committed.extend(mine);
+                            }
+                        }
+                    }
+                    if ok {
+                        acts[ci] = Some((tre, xrd));
+                    } else {
+                        if verbose && pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::wasm","wpeep: drop t={t} x={x} p1={} why={why}", ins[p1].1)
+                        };
+                        live[ci] = false;
+                        acts[ci] = None;
+                        dropped = true;
+                    }
                 }
-                if verbose && !ok {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm","wpeep: drop t={t} x={x} why={why}")
-                    };
-                }
-                if !ok {
-                    live[ci] = false;
-                    dropped = true;
+                if !dropped {
+                    break;
                 }
             }
-            if verbose {
-                for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm",
-                            "wpeep cand p1={} gi={} si={} t={} x={} live={}",
-                            ins[p1].1, ins[gi].1, ins[si].1, t, x, live[ci]
-                        )
-                    };
-                }
-            }
-            if !dropped {
-                break;
-            }
-        }
+            (live, acts)
+        };
         let mut changed = false;
-        for (ci, &(p1, gi, si, _, x)) in cand.iter().enumerate() {
+        for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
             if !live[ci] {
                 continue;
             }
+            let Some((tre, xrd)) = acts[ci].clone() else {
+                continue;
+            };
             match ins[p1].0 {
-                WPeek::Set(_) => ins[p1] = (WPeek::Set(x), ins[p1].1, ins[p1].2, ins[p1].3),
-                WPeek::Tee(_) => ins[p1] = (WPeek::Tee(x), ins[p1].1, ins[p1].2, ins[p1].3),
+                WPeek::Set(_) => ins[p1].0 = WPeek::Set(x),
+                WPeek::Tee(_) => ins[p1].0 = WPeek::Tee(x),
                 _ => continue,
             }
             ins[gi].0 = WPeek::Del;
             ins[si].0 = WPeek::Del;
+            for &u in &tre {
+                ins[u].0 = WPeek::Get(x);
+            }
+            for &d in &xdefs[ci] {
+                ins[d].0 = match ins[d].0 {
+                    WPeek::Set(_) => WPeek::Set(t),
+                    WPeek::Tee(_) => WPeek::Tee(t),
+                    k => k,
+                };
+            }
+            for &u in &xrd {
+                ins[u].0 = WPeek::Get(t);
+            }
             changed = true;
         }
         if !changed {
             break;
         }
         ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
+        // Dead-write sweep: a `local.set t` whose value no read can
+        // observe is just `drop`; a `local.tee t` likewise is a no-op
+        // (it leaves the stack untouched). A read positioned after the
+        // write observes it unless a dominating later def covers it; a
+        // read inside a shared loop before it may see it through a
+        // back-edge.
+        let mut dread: Vec<usize> = Vec::new();
+        for (i, &(k, _, _, _)) in ins.iter().enumerate() {
+            let l = match k {
+                WPeek::Set(l) | WPeek::Tee(l) => l,
+                _ => continue,
+            };
+            let mut live = false;
+            for (u, &(k2, _, _, _)) in ins.iter().enumerate() {
+                if !matches!(k2, WPeek::Get(l2) if l2 == l) {
+                    continue;
+                }
+                if u == i {
+                    continue;
+                }
+                if u > i {
+                    // covered by a dominating later write before u?
+                    let covered = (i + 1..u).any(|d2| {
+                        matches!(ins[d2].0, WPeek::Set(l2) | WPeek::Tee(l2) if l2 == l) && {
+                            let (cd, cu) = (&ctx[ins[d2].3], &ctx[ins[u].3]);
+                            cd.len() <= cu.len() && cu[..cd.len()] == cd[..]
+                        }
+                    });
+                    if !covered {
+                        live = true;
+                        break;
+                    }
+                    continue;
+                }
+                // u < i: only via a shared-loop back-edge after i.
+                let share = ctx[ins[i].3]
+                    .iter()
+                    .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[u].3].contains(e));
+                if share {
+                    live = true;
+                    break;
+                }
+            }
+            if !live {
+                dread.push(i);
+            }
+        }
+        for &i in &dread {
+            ins[i].0 = match ins[i].0 {
+                WPeek::Tee(_) => WPeek::Del,
+                _ => WPeek::Drop,
+            };
+        }
+    }
+    // Keep-on-stack: `P; local.set t; W; local.get t` where W never
+    // touches the spilled value keeps it on the operand stack instead:
+    // the set becomes a tee (the write still happens, so t's reads
+    // need no further checking), the window pushes that survive to the
+    // get hoist below the producer, and the get goes away. When the
+    // get was the only reader of the write the set deletes outright.
+    // Prelude gets are keyed on the target instruction's byte offset —
+    // stable as `ins` entries are marked Del and compacted. Anchors are
+    // protected: no later rewrite may delete the instruction a prelude
+    // group emits before, or the gets would silently vanish.
+    let mut prel: Vec<(usize, u32)> = Vec::new();
+    let mut protected: FxHashSet<usize> = FxHashSet::default();
+    for _ in 0..if crate::env_get("PLIRON_WASM_KOS") == Some("0") {
+        0
+    } else {
+        8
+    } {
+        // (set idx, get idx, producer start, hoisted get idxs)
+        let mut acts2: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
+        {
+            let eff = |i: usize| -> Option<(u32, u32)> {
+                // calls decode as Ctl but have a signature-known
+                // effect.
+                if matches!(b[ins[i].1], 0x10 | 0x11) {
+                    let mut q = ins[i].1 + 1;
+                    let idx = urd(b, &mut q)?;
+                    return if b[ins[i].1] == 0x10 {
+                        fsig.get(idx as usize).copied()
+                    } else {
+                        let (pp, qq) = *tsig.get(idx as usize)?;
+                        Some((pp + 1, qq)) // +1: the table index operand
+                    };
+                }
+                match ins[i].0 {
+                    WPeek::Get(_) => Some((0, 1)),
+                    WPeek::Set(_) => Some((1, 0)),
+                    WPeek::Tee(_) => Some((1, 1)),
+                    WPeek::Other => {
+                        let op = b[ins[i].1];
+                        Some(match op {
+                            0x01 => (0, 0),
+                            0x1a => (1, 0),
+                            0x1b | 0x1c => (3, 1),
+                            0x23 => (0, 1),
+                            0x28..=0x35 => (1, 1),
+                            0x41..=0x44 => (0, 1),
+                            0x45 | 0x50 => (1, 1),
+                            0x46..=0x4f | 0x51..=0x66 => (2, 1),
+                            0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => {
+                                (1, 1)
+                            }
+                            0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => {
+                                (2, 1)
+                            }
+                            0xa7..=0xc4 => (1, 1),
+                            0xd1 | 0xd2 => (0, 1),
+                            _ => return None,
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            for s in 0..ins.len() {
+                let t = match ins[s].0 {
+                    WPeek::Set(t) if !protected.contains(&ins[s].1) => t,
+                    _ => continue,
+                };
+                // next `local.get t` in the same context, with no other
+                // write of t in between (u then reads s's value).
+                let mut u = None;
+                for v in s + 1..ins.len() {
+                    match ins[v].0 {
+                        WPeek::Get(l2) if l2 == t => {
+                            u = Some(v);
+                            break;
+                        }
+                        WPeek::Set(l2) | WPeek::Tee(l2) if l2 == t => break,
+                        _ => {}
+                    }
+                }
+                let Some(u) = u else { continue };
+                if protected.contains(&ins[u].1) {
+                    continue;
+                }
+                if ctx[ins[s].3] != ctx[ins[u].3] {
+                    continue;
+                }
+                // Window stack simulation: slots above the kept value
+                // and the instruction that produced each. May never
+                // dip below the kept value.
+                let mut slots: Vec<usize> = Vec::new();
+                let mut wok = true;
+                for v in s + 1..u {
+                    let Some((pp, qq)) = eff(v) else { wok = false; break };
+                    if slots.len() < pp as usize {
+                        wok = false;
+                        break;
+                    }
+                    for _ in 0..pp {
+                        slots.pop();
+                    }
+                    for _ in 0..qq {
+                        slots.push(v);
+                    }
+                }
+                if !wok {
+                    continue;
+                }
+                let hoists: Vec<usize> = slots;
+                // Producer start for the kept value: minimal
+                // self-contained suffix (net +1, no negative dip).
+                let mut need2: i32 = 1;
+                let mut ps = None;
+                for v in (0..s).rev() {
+                    let Some((pp, qq)) = eff(v) else { break };
+                    need2 -= qq as i32;
+                    need2 += pp as i32;
+                    if need2 == 0 {
+                        ps = Some(v);
+                        break;
+                    }
+                    if need2 < 0 {
+                        break;
+                    }
+                }
+                let Some(ps) = ps else { continue };
+                // Each surviving push must hoist below the producer:
+                // only `local.get lx` moves, and only when no def of
+                // lx sits between the insertion point and its old
+                // position.
+                let mut gok = true;
+                for &g in &hoists {
+                    match ins[g].0 {
+                        WPeek::Get(lx) => {
+                            if protected.contains(&ins[g].1) {
+                                gok = false;
+                                break;
+                            }
+                            for v in ps..g {
+                                if matches!(ins[v].0, WPeek::Set(l2) | WPeek::Tee(l2) if l2 == lx)
+                                {
+                                    gok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            gok = false;
+                            break;
+                        }
+                    }
+                    if !gok {
+                        break;
+                    }
+                }
+                if !gok {
+                    continue;
+                }
+                acts2.push((s, u, ps, hoists));
+            }
+        } // eff scope ends
+        // Only candidates whose whole [producer-start, get] span is
+        // strictly disjoint from every accepted span: the producer is
+        // part of the span — an interleaving rewrite can delete an
+        // instruction the other's producer or prelude anchor needs.
+        let mut sel: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
+        'cand: for a in acts2 {
+            for &(_, u2, ps2, _) in &sel {
+                if !(a.1 < ps2 || a.2 > u2) {
+                    continue 'cand;
+                }
+            }
+            sel.push(a);
+        }
+        let applied = !sel.is_empty();
+        for (s, u, ps, hoists) in sel {
+            protected.insert(ins[ps].1);
+            for &g in &hoists {
+                if let WPeek::Get(lx) = ins[g].0 {
+                    prel.push((ins[ps].1, lx));
+                }
+                ins[g].0 = WPeek::Del;
+            }
+            let t = match ins[s].0 {
+                WPeek::Set(t) => t,
+                _ => unreachable!(),
+            };
+            // If no read other than u can observe this write (a later
+            // read, or an earlier one through a shared-loop
+            // back-edge), drop the write entirely; else keep it as a
+            // tee.
+            let dead = !ins.iter().enumerate().any(|(v, &(k2, _, _, _))| {
+                if !matches!(k2, WPeek::Get(l2) if l2 == t) || v == u {
+                    return false;
+                }
+                if v > s {
+                    return true;
+                }
+                ctx[ins[s].3]
+                    .iter()
+                    .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[v].3].contains(e))
+            });
+            ins[s].0 = if dead { WPeek::Del } else { WPeek::Tee(t) };
+            ins[u].0 = WPeek::Del;
+        }
+        ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
+        if !applied {
+            break;
+        }
     }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
@@ -1413,6 +1846,12 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         .filter(|&i| b[ins[i].1] == 0x0f);
     let mut wi = 0;
     while wi < ins.len() {
+        // Keep-on-stack hoisted pushes emit as `local.get` preludes.
+        while let Some(ppos) = prel.iter().position(|&(pp, _)| pp == ins[wi].1) {
+            let (_, pl) = prel.remove(ppos);
+            nb.push(0x20);
+            leb(&mut nb, pl);
+        }
         if Some(wi) == drop_ret {
             wi += 1;
             continue;
@@ -1464,6 +1903,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
             WPeek::Del => {}
+            WPeek::Drop => nb.push(0x1a),
         }
         wi += 1;
     }
@@ -1478,6 +1918,10 @@ fn wpeep(bytes: &mut Vec<u8>) {
         return;
     }
     let mut out = bytes[..8].to_vec();
+    // (pops, pushes) per type index and per function index, for
+    // stack-effect tracking inside `peep_body`.
+    let mut tsig: Vec<(u32, u32)> = Vec::new();
+    let mut fsig: Vec<(u32, u32)> = Vec::new();
     let mut p = 8usize;
     while p < bytes.len() {
         let id = bytes[p];
@@ -1491,6 +1935,111 @@ fn wpeep(bytes: &mut Vec<u8>) {
         }
         out.push(id);
         if id != 10 {
+            match id {
+                1 => {
+                    // Type section: functypes only.
+                    let mut q = s;
+                    let mut nty = match urd(bytes, &mut q) {
+                        Some(n) => n,
+                        None => return,
+                    };
+                    while nty > 0 {
+                        nty -= 1;
+                        let Some(ft) = bytes.get(q).copied() else { return };
+                        q += 1;
+                        if ft != 0x60 {
+                            break;
+                        }
+                        let Some(np) = urd(bytes, &mut q) else { return };
+                        for _ in 0..np {
+                            let Some(_) = bytes.get(q) else { return };
+                            q += 1;
+                        }
+                        let Some(nr) = urd(bytes, &mut q) else { return };
+                        for _ in 0..nr {
+                            let Some(_) = bytes.get(q) else { return };
+                            q += 1;
+                        }
+                        tsig.push((np, nr));
+                    }
+                }
+                2 => {
+                    // Import section: kind-0 imports are functions.
+                    let mut q = s;
+                    let mut ni = match urd(bytes, &mut q) {
+                        Some(n) => n,
+                        None => return,
+                    };
+                    while ni > 0 {
+                        ni -= 1;
+                        for _ in 0..2 {
+                            let Some(nl) = urd(bytes, &mut q) else { return };
+                            if nskip(bytes, &mut q, nl as usize).is_none() {
+                                return;
+                            }
+                        }
+                        let Some(kind) = bytes.get(q).copied() else { return };
+                        q += 1;
+                        match kind {
+                            0x00 => {
+                                let Some(ti) = urd(bytes, &mut q) else { return };
+                                if let Some(&sg) = tsig.get(ti as usize) {
+                                    fsig.push(sg);
+                                } else {
+                                    fsig.push((0, 0));
+                                }
+                            }
+                            0x01 => {
+                                // table: reftype + limits
+                                if bytes.get(q).is_none() {
+                                    return;
+                                }
+                                q += 1;
+                                let Some(fl) = bytes.get(q).copied() else { return };
+                                q += 1;
+                                let Some(_) = urd(bytes, &mut q) else { return };
+                                if fl & 1 != 0 {
+                                    let Some(_) = urd(bytes, &mut q) else { return };
+                                }
+                            }
+                            0x02 => {
+                                // memory: limits
+                                let Some(fl) = bytes.get(q).copied() else { return };
+                                q += 1;
+                                let Some(_) = urd(bytes, &mut q) else { return };
+                                if fl & 1 != 0 {
+                                    let Some(_) = urd(bytes, &mut q) else { return };
+                                }
+                            }
+                            0x03 => {
+                                // global: type + mut
+                                if nskip(bytes, &mut q, 2).is_none() {
+                                    return;
+                                }
+                            }
+                            _ => return,
+                        }
+                    }
+                }
+                3 => {
+                    // Function section: type index per declared func.
+                    let mut q = s;
+                    let mut nf = match urd(bytes, &mut q) {
+                        Some(n) => n,
+                        None => return,
+                    };
+                    while nf > 0 {
+                        nf -= 1;
+                        let Some(ti) = urd(bytes, &mut q) else { return };
+                        if let Some(&sg) = tsig.get(ti as usize) {
+                            fsig.push(sg);
+                        } else {
+                            fsig.push((0, 0));
+                        }
+                    }
+                }
+                _ => {}
+            }
             leb(&mut out, sz);
             out.extend_from_slice(&bytes[s..e]);
             p = e;
@@ -1511,7 +2060,8 @@ fn wpeep(bytes: &mut Vec<u8>) {
             if be > e {
                 return;
             }
-            let nb = peep_body(&bytes[q..be]).unwrap_or_else(|| bytes[q..be].to_vec());
+            let nb =
+                peep_body(&bytes[q..be], &fsig, &tsig).unwrap_or_else(|| bytes[q..be].to_vec());
             leb(&mut body_out, nb.len() as u32);
             body_out.extend_from_slice(&nb);
             q = be;
