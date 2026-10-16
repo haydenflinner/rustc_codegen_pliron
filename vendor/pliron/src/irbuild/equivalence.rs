@@ -237,8 +237,8 @@ fn op_eq_mapped(
 
     // Recurse into nested regions.
     for region_idx in 0..num_regions {
-        let l_region = lhs.deref(ctx).get_region(region_idx);
-        let r_region = rhs.deref(ctx).get_region(region_idx);
+        let l_region = lhs.deref(ctx).get_region(ctx, region_idx);
+        let r_region = rhs.deref(ctx).get_region(ctx, region_idx);
         match region_eq(ctx, mapper, l_region, r_region, ignore_config) {
             EqResult::Eq => {}
             neq => return neq,
@@ -498,7 +498,7 @@ fn hash_op_full(
     };
 
     for region_idx in 0..num_regions {
-        let region = op.deref(ctx).get_region(region_idx);
+        let region = op.deref(ctx).get_region(ctx, region_idx);
         hash_blocks_full(
             ctx,
             numbering,

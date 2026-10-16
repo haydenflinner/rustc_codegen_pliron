@@ -358,7 +358,7 @@ fn promote_with(
 /// Vector bf16/f16 arithmetic -> f32 twins (before [`plan_wide`]).
 pub fn promote(ctx: &mut Context, func: Ptr<Operation>) {
     let mut hfv = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for &r in &regions {
         let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
         for b in blocks {
@@ -370,7 +370,7 @@ pub fn promote(ctx: &mut Context, func: Ptr<Operation>) {
         promote_with(ctx, op, is_f16_any, widen_f16_any);
     }
     let mut bfv = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for &r in &regions {
         let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
         for b in blocks {
@@ -387,7 +387,7 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     promote(ctx, func);
     let mut todo = Vec::new();
     let mut shuffles = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for r in regions {
         for b in r.deref(ctx).iter(ctx) {
             for op in b.deref(ctx).iter(ctx) {
@@ -414,7 +414,7 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
         split(ctx, op, e, n);
     }
     let mut bf = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for r in regions {
         for b in r.deref(ctx).iter(ctx) {
             for op in b.deref(ctx).iter(ctx) {
@@ -491,7 +491,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
         }
     };
     for &f in funcs {
-        for r in f.deref(ctx).regions() {
+        for r in f.deref(ctx).regions(ctx) {
             for (i, b) in r.deref(ctx).iter(ctx).enumerate() {
                 for a in b.deref(ctx).arguments() {
                     note(ctx, a.get_type(ctx), i != 0, i != 0);

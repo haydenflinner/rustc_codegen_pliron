@@ -92,6 +92,11 @@ pub struct Context {
     /// `deref`.
     pub(crate) op_kind:
         RefCell<Vec<(u64, crate::op::ConcreteOpInfo)>>,
+    /// PLIRON: global pool of region ids owned by [Operation]s — each op
+    /// stores an [`crate::operation::OpSpan`] into this Vec instead of an
+    /// inline list (DoD step 5). Length changes append a new span and
+    /// orphan the old one; CGU-scoped lifetimes keep the garbage bounded.
+    pub(crate) op_region_pool: RefCell<Vec<Ptr<Region>>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
@@ -149,6 +154,7 @@ impl Default for Context {
             op_links: RefCell::new(Vec::new()),
             block_links: RefCell::new(Vec::new()),
             op_kind: RefCell::new(Vec::new()),
+            op_region_pool: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),

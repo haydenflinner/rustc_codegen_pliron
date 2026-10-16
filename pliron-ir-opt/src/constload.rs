@@ -118,7 +118,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     for f in fns {
         let ops: Vec<Ptr<Operation>> = f
             .deref(ctx)
-            .get_region(0)
+            .get_region(ctx, 0)
             .deref(ctx)
             .iter(ctx)
             .flat_map(|b| b.deref(ctx).iter(ctx).collect::<Vec<_>>())

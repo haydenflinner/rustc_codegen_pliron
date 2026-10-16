@@ -425,7 +425,7 @@ pub fn canonical_syntax_print(
         arguments: op.operands().map(|opd| opd.get_type(ctx)).collect(),
         results: op.results().map(|res| res.get_type(ctx)).collect(),
     };
-    let regions = iter_with_sep(op.regions(), printable::ListSeparator::Newline);
+    let regions = iter_with_sep(op.regions(ctx), printable::ListSeparator::Newline);
 
     if op.get_num_results() != 0 {
         let results = iter_with_sep(op.results(), sep);

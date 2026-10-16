@@ -167,7 +167,7 @@ pub mod interruptible {
                                 reg_idx < root_ref.num_regions(),
                                 "Region deleted during walk"
                             );
-                            root_ref.get_region(reg_idx)
+                            root_ref.get_region(ctx, reg_idx)
                         };
                         walk_region(ctx, state, config, region, callback)?;
                     }
@@ -177,7 +177,7 @@ pub mod interruptible {
                         let region = {
                             let root_ref = &*root.deref(ctx);
                             assert!(i < root_ref.num_regions(), "Region deleted during walk");
-                            root_ref.get_region(i)
+                            root_ref.get_region(ctx, i)
                         };
                         walk_region(ctx, state, config, region, callback)?;
                     }
@@ -301,7 +301,7 @@ pub mod interruptible {
                                 reg_idx < root_ref.num_regions(),
                                 "Region deleted during walk"
                             );
-                            root_ref.get_region(reg_idx)
+                            root_ref.get_region(ctx, reg_idx)
                         };
                         walk_region(ctx, state, config, region, callback)?;
                     }
@@ -311,7 +311,7 @@ pub mod interruptible {
                         let region = {
                             let root_ref = &*root.deref(ctx);
                             assert!(i < root_ref.num_regions(), "Region deleted during walk");
-                            root_ref.get_region(i)
+                            root_ref.get_region(ctx, i)
                         };
                         walk_region(ctx, state, config, region, callback)?;
                     }

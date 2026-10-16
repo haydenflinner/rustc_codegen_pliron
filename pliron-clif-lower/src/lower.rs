@@ -2021,7 +2021,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn lower(&mut self, f: Ptr<Operation>) {
         let ctx = self.ctx;
-        let region = f.deref(ctx).get_region(0);
+        let region = f.deref(ctx).get_region(ctx, 0);
         let pblocks: Vec<Ptr<BasicBlock>> = region.deref(ctx).iter(ctx).collect();
         for pb in &pblocks {
             let cb = self.b.create_block();

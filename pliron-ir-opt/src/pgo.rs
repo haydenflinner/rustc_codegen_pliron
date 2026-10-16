@@ -303,7 +303,7 @@ pub fn instrument(
             bump(ctx, st, *b, &ctrs_sym, base + i as u32);
         }
         nctrs += bs.len() as u32;
-        let region = fop.deref(ctx).get_region(0);
+        let region = fop.deref(ctx).get_region(ctx, 0);
         for &(pi, si) in &edges {
             let Some(t) = terminator(ctx, bs[pi as usize]) else {
                 continue;

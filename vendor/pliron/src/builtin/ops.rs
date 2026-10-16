@@ -188,7 +188,7 @@ impl FuncOp {
 
         // Create an empty entry block.
         let arg_types = ty.deref(ctx).arg_types().clone();
-        let region = op.deref_mut(ctx).get_region(0);
+        let region = op.deref_mut(ctx).get_region(ctx, 0);
         let body = BasicBlock::new(ctx, Some(ident!("entry")), arg_types);
         body.insert_at_front(region, ctx);
 

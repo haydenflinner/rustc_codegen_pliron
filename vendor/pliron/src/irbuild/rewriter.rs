@@ -268,7 +268,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
     fn erase_operation(&mut self, ctx: &mut Context, op: Ptr<Operation>) {
         // We don't rely on `Operation::erase` below to erase sub-entities
         // because we want the listener to be notified for each erased sub-entity.
-        let regions = op.deref(ctx).regions().collect::<Vec<_>>();
+        let regions = op.deref(ctx).regions(ctx).collect::<Vec<_>>();
         for region in regions.into_iter().rev() {
             self.erase_region(ctx, region);
         }

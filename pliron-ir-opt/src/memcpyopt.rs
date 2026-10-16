@@ -155,7 +155,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         if !has_body(ctx, f) {
             continue;
         }
-        let Some(entry) = f.deref(ctx).get_region(0).deref(ctx).get_head() else {
+        let Some(entry) = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head() else {
             continue;
         };
         let sret_args: Vec<Value> = params
@@ -164,7 +164,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             .filter(|(i, e)| **e == ArgExt::SRet && *i < entry.deref(ctx).get_num_arguments())
             .map(|(i, _)| entry.deref(ctx).get_argument(i))
             .collect();
-        let blocks: Vec<_> = f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect();
+        let blocks: Vec<_> = f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx).collect();
         for b in blocks {
             let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
             for op in ops {

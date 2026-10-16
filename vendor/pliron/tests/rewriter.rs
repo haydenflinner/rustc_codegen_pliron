@@ -533,7 +533,7 @@ fn inline_region_on_const_zero() -> Result<()> {
         ) -> Result<()> {
             let func_op = op.deref(ctx).get_parent_op(ctx).unwrap();
             // Get the region from the matched function
-            let region = func_op.deref(ctx).get_region(0);
+            let region = func_op.deref(ctx).get_region(ctx, 0);
 
             // Inline the region at the end of the second function's block
             rewriter.inline_region(

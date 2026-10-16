@@ -98,6 +98,22 @@ struct BlockLinks {
     parent_block: Option<Ptr<BasicBlock>>,
 }
 
+/// PLIRON: an (offset, length) pair into a Context-global flat pool —
+/// the span representation op payload columns use instead of per-op
+/// vectors (DoD step 5).
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub(crate) struct OpSpan {
+    pub(crate) off: u32,
+    pub(crate) len: u32,
+}
+
+impl OpSpan {
+    #[inline]
+    fn range(&self) -> core::ops::Range<usize> {
+        self.off as usize..(self.off + self.len) as usize
+    }
+}
+
 /// Basic unit of execution. May or may not be in a [BasicBlock].
 pub struct Operation {
     /// A [Ptr] to self.
@@ -117,9 +133,10 @@ pub struct Operation {
     block_links: BlockLinks,
     /// A dictionary of attributes.
     pub attributes: AttributeDict,
-    /// Regions contained inside this operation. Most ops hold zero or
-    /// one.
-    pub(crate) regions: SmallVec<[Ptr<Region>; 1]>,
+    /// Regions contained inside this operation: a span into
+    /// `Context::op_region_pool` (PLIRON, DoD step 5). Most ops hold a
+    /// zero-length span.
+    pub(crate) regions: OpSpan,
     /// Source location of this operation.
     loc: Location,
 }
@@ -166,7 +183,7 @@ impl Operation {
             successors: SmallVec::with_capacity(successors.len()),
             block_links: BlockLinks::default(),
             attributes: AttributeDict::default(),
-            regions: SmallVec::with_capacity(num_regions),
+            regions: OpSpan::default(),
             loc: Location::Unknown,
         };
 
@@ -189,9 +206,10 @@ impl Operation {
             .map(|def| Operand::new(ctx, *def, newop))
             .collect();
         newop.deref_mut(ctx).successors = successors;
-        newop.deref_mut(ctx).regions = (0..num_regions)
+        let new_regions: Vec<Ptr<Region>> = (0..num_regions)
             .map(|_| Region::new(ctx, newop))
             .collect();
+        newop.deref_mut(ctx).regions = Self::alloc_region_span(ctx, new_regions);
 
         newop
     }
@@ -545,54 +563,100 @@ impl Operation {
         Self::get_op_dyn(ptr, ctx).get_opid()
     }
 
+    /// PLIRON: append `items` to the context-global region pool and
+    /// return the span covering them (DoD step 5).
+    pub(crate) fn alloc_region_span(
+        ctx: &Context,
+        items: impl IntoIterator<Item = Ptr<Region>>,
+    ) -> OpSpan {
+        let mut pool = ctx.op_region_pool.borrow_mut();
+        let off = pool.len() as u32;
+        pool.extend(items);
+        OpSpan {
+            off,
+            len: pool.len() as u32 - off,
+        }
+    }
+
     /// Get a [Ptr] to the `reg_idx`th region. Panics on invalid index.
-    pub fn get_region(&self, reg_idx: usize) -> Ptr<Region> {
+    pub fn get_region(&self, ctx: &Context, reg_idx: usize) -> Ptr<Region> {
         assert!(
-            reg_idx < self.regions.len(),
+            reg_idx < self.num_regions(),
             "get_region({reg_idx}) on {} with {} region(s)",
             (self.concrete_op.0)(self.self_ptr).get_opid(),
-            self.regions.len()
+            self.num_regions()
         );
-        self.regions[reg_idx]
+        ctx.op_region_pool.borrow()[self.regions.off as usize + reg_idx]
     }
 
     /// Number of regions.
     pub fn num_regions(&self) -> usize {
-        self.regions.len()
+        self.regions.len as usize
     }
 
     /// Add a new empty region to the operation and return its [Ptr].
     pub fn add_region(ptr: Ptr<Self>, ctx: &mut Context) -> Ptr<Region> {
         let region = Region::new(ctx, ptr);
-        ptr.deref_mut(ctx).regions.push(region);
+        Self::push_region(ptr, ctx, region);
         region
+    }
+
+    /// PLIRON: append `region` to this op's region span — allocates a new
+    /// pool span and orphans the old one.
+    pub(crate) fn push_region(ptr: Ptr<Self>, ctx: &Context, region: Ptr<Region>) {
+        let mut cur = ptr.deref(ctx).regions_slice(ctx).to_vec();
+        cur.push(region);
+        let span = Self::alloc_region_span(ctx, cur);
+        ptr.deref_mut(ctx).regions = span;
+    }
+
+    /// PLIRON: remove `region` from this op's region span (swap_remove
+    /// semantics: order is not preserved).
+    pub(crate) fn remove_region_by_value(
+        ptr: Ptr<Self>,
+        ctx: &Context,
+        region: Ptr<Region>,
+    ) {
+        let mut cur = ptr.deref(ctx).regions_slice(ctx).to_vec();
+        let pos = cur
+            .iter()
+            .position(|x| *x == region)
+            .expect("Region missing in it's current parent Operation");
+        cur.swap_remove(pos);
+        let span = Self::alloc_region_span(ctx, cur);
+        ptr.deref_mut(ctx).regions = span;
     }
 
     /// Erase `reg_idx`'th region. Affects the index of all regions after it.
     /// Panics on invalid index.
     pub fn erase_region(ptr: Ptr<Self>, ctx: &mut Context, reg_idx: usize) {
-        let reg = ptr.deref(ctx).regions[reg_idx];
+        let reg = ptr.deref(ctx).get_region(ctx, reg_idx);
         Region::drop_all_uses(reg, ctx);
-        ptr.deref_mut(ctx).regions.remove(reg_idx);
+        let mut cur = ptr.deref(ctx).regions_slice(ctx).to_vec();
+        cur.remove(reg_idx);
+        let span = Self::alloc_region_span(ctx, cur);
+        ptr.deref_mut(ctx).regions = span;
         ArenaObj::dealloc(reg, ctx);
     }
 
     /// Get an iterator on the regions.
-    pub fn regions(&self) -> impl Iterator<Item = Ptr<Region>> + Clone + '_ {
-        self.regions.iter().cloned()
+    pub fn regions<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> impl Iterator<Item = Ptr<Region>> + Clone + 'a {
+        self.regions_slice(ctx).to_vec().into_iter()
     }
 
-    /// PLIRON: raw region-id slice (crate-internal store escape hatch).
+    /// PLIRON: raw region-id slice borrowed from the context pool
+    /// (crate-internal read hatch).
     #[inline]
-    pub(crate) fn regions_slice(&self) -> &[Ptr<Region>] {
-        &self.regions
-    }
-
-    /// PLIRON: mutable region store (crate-internal; allows structural
-    /// edits like push/remove that a slice can't).
-    #[inline]
-    pub(crate) fn regions_mut(&mut self) -> &mut SmallVec<[Ptr<Region>; 1]> {
-        &mut self.regions
+    pub(crate) fn regions_slice<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> core::cell::Ref<'a, [Ptr<Region>]> {
+        core::cell::Ref::map(ctx.op_region_pool.borrow(), |pool| {
+            &pool[self.regions.range()]
+        })
     }
 
     /// Get [ConcreteOpInfo], useful for creating a [new](Operation::new) operation
@@ -614,7 +678,7 @@ impl Operation {
             succ.drop_use(ctx, ptr);
         }
 
-        let regions = ptr.deref(ctx).regions.clone();
+        let regions = ptr.deref(ctx).regions_slice(ctx).to_vec();
         for region in regions {
             Region::drop_all_uses(region, ctx);
         }
@@ -707,7 +771,7 @@ impl ArenaObj for Operation {
         }
     }
     fn dealloc_sub_objects(ptr: Ptr<Self>, ctx: &mut Context) {
-        let regions = ptr.deref(ctx).regions.clone();
+        let regions = ptr.deref(ctx).regions_slice(ctx).to_vec();
         for region in regions {
             ArenaObj::dealloc(region, ctx);
         }
@@ -883,7 +947,7 @@ impl Verify for Operation {
             opr.successors
                 .iter()
                 .try_for_each(|succ| succ.verify(ctx, opr.self_ptr))?;
-            opr.regions
+            opr.regions_slice(ctx)
                 .iter()
                 .try_for_each(|region| region.verify(ctx))?;
             opr.results

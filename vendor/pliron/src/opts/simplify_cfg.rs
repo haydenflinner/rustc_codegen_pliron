@@ -147,7 +147,7 @@ pub fn remove_blocks_inside_op(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
-    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions().collect();
+    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions(ctx).collect();
     let mut status = IRStatus::Unchanged;
     //TODO: RegionBranchOpInterface should allow us to handle this less conservatively
     for region in regions {
@@ -233,7 +233,7 @@ pub fn merge_inside_op(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
-    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions().collect();
+    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions(ctx).collect();
     let mut status = IRStatus::Unchanged;
     //TODO: RegionBranchOpInterface should allow us to handle this less conservatively
     for region in regions {

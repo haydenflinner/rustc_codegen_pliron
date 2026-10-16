@@ -276,7 +276,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
     let mut ids: FxHashMap<Value, Id> = FxHashMap::default();
     let mut leaves: FxHashMap<Symbol, Value> = FxHashMap::default();
     let mut roots: Vec<(Ptr<Operation>, Value, Id)> = Vec::new();
-    let blocks: Vec<_> = f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect();
+    let blocks: Vec<_> = f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx).collect();
     let mut nops = 0;
     for b in blocks {
         let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
@@ -418,7 +418,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
 /// the quotient feeds other uses; a div that loses its last use is erased.
 fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
     let mut hits: Vec<(Ptr<Operation>, Value, Value, bool, Ptr<Operation>)> = Vec::new();
-    for b in f.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+    for b in f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
         for op in b.deref(ctx).iter(ctx) {
             if !Operation::is_op::<MulOp>(op, ctx) {
                 continue;
@@ -575,7 +575,7 @@ impl POp {
 fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize) {
     // Collect the covered ops in layout order.
     let mut ops: Vec<POp> = Vec::new();
-    for b in f.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+    for b in f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
         for op in b.deref(ctx).iter(ctx) {
             if ops.len() > MAX_OPS || op.deref(ctx).get_num_results() != 1 {
                 continue;

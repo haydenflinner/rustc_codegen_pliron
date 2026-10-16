@@ -737,7 +737,7 @@ impl Analysis for DomInfo {
         Self: Sized,
     {
         let mut dom_info = DomInfo::default();
-        for region in op.deref(ctx).regions() {
+        for region in op.deref(ctx).regions(ctx) {
             dom_info.get_dom_tree(ctx, region);
         }
         Ok(dom_info)
@@ -1368,7 +1368,7 @@ mod tests {
         fn new(ctx: &mut Context) -> ScopeOp {
             let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 1);
             // Create an entry block in the region.
-            let region = op.deref(ctx).get_region(0);
+            let region = op.deref(ctx).get_region(ctx, 0);
             let block = BasicBlock::new(ctx, None, vec![]);
             block.insert_at_front(region, ctx);
             ScopeOp { op }

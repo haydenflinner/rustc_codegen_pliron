@@ -148,7 +148,7 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
             st.rmw
                 .insert(op, r.get_attr_llvm_rmw_kind(ctx).unwrap().clone());
         }
-        let regions: Vec<_> = op.deref(ctx).regions().collect();
+        let regions: Vec<_> = op.deref(ctx).regions(ctx).collect();
         for r in regions {
             let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
             for b in blocks {
@@ -228,7 +228,7 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
             st.sym_to_ident.insert(name, id);
             if defined {
                 crate::scalarize::run(ctx, op);
-                let regions: Vec<_> = op.deref(ctx).regions().collect();
+                let regions: Vec<_> = op.deref(ctx).regions(ctx).collect();
                 for r in regions {
                     let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
                     for b in blocks {

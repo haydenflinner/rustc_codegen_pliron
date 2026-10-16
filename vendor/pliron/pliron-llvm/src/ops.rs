@@ -2851,7 +2851,7 @@ impl GlobalOp {
     /// Get the initializer region of this global variable.
     pub fn get_initializer_region(&self, ctx: &Context) -> Option<Ptr<Region>> {
         (self.op.deref(ctx).num_regions() > 0)
-            .then(|| self.get_operation().deref(ctx).get_region(0))
+            .then(|| self.get_operation().deref(ctx).get_region(ctx, 0))
     }
 
     /// Set a simple initializer value for this global variable.
@@ -4840,7 +4840,7 @@ impl FuncOp {
     pub fn get_entry_block(&self, ctx: &Context) -> Option<Ptr<BasicBlock>> {
         self.op
             .deref(ctx)
-            .regions()
+            .regions(ctx)
             .next()
             .and_then(|region| region.deref(ctx).get_head())
     }
@@ -4853,7 +4853,7 @@ impl FuncOp {
 
         // Create an empty entry block.
         assert!(
-            self.op.deref(ctx).regions().next().is_none(),
+            self.op.deref(ctx).regions(ctx).next().is_none(),
             "FuncOp already has a region, but no block inside it"
         );
         let region = Operation::add_region(self.op, ctx);

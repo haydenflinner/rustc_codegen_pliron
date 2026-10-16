@@ -194,8 +194,8 @@ fn fill_operation(
     // the clone.
     let num_regions = op.deref(ctx).num_regions();
     for region_idx in 0..num_regions {
-        let src_region = op.deref(ctx).get_region(region_idx);
-        let dest_region = new_op.deref(ctx).get_region(region_idx);
+        let src_region = op.deref(ctx).get_region(ctx, region_idx);
+        let dest_region = new_op.deref(ctx).get_region(ctx, region_idx);
         clone_region_into(src_region, dest_region, ctx, rewriter, mapper);
     }
 }

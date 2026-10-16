@@ -831,7 +831,7 @@ fn hash_distinguishes_trivial_extra_items() -> Result<()> {
             vec![],
             1,
         );
-        let one_block_region = one_block_op.deref(ctx).get_region(0);
+        let one_block_region = one_block_op.deref(ctx).get_region(ctx, 0);
         BasicBlock::new(ctx, None, vec![]).insert_at_back(one_block_region, ctx);
         assert_ne!(
             operation_hash(ctx, empty_region, &ignore),
@@ -848,7 +848,7 @@ fn hash_distinguishes_trivial_extra_items() -> Result<()> {
             vec![],
             1,
         );
-        let two_block_region = two_block_op.deref(ctx).get_region(0);
+        let two_block_region = two_block_op.deref(ctx).get_region(ctx, 0);
         BasicBlock::new(ctx, None, vec![]).insert_at_back(two_block_region, ctx);
         BasicBlock::new(ctx, None, vec![]).insert_at_back(two_block_region, ctx);
         assert_ne!(

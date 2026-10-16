@@ -71,7 +71,7 @@ pub fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
     // Bodiless `llvm.func` ops (extern decls like `rust_eh_personality`)
     // legitimately have no regions — callers iterating all funcs see an
     // empty body rather than a panic.
-    let Some(r) = f.deref(ctx).regions().next() else {
+    let Some(r) = f.deref(ctx).regions(ctx).next() else {
         return Vec::new();
     };
     r.deref(ctx).iter(ctx).collect()

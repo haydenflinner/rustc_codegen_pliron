@@ -1275,7 +1275,7 @@ fn validate(ctx: &Context, st: &mut State, a: Value) {
 
 /// Allocas anywhere in `f` (inlined callees' allocas live outside the entry block).
 pub fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
-    let r = f.deref(ctx).get_region(0);
+    let r = f.deref(ctx).get_region(ctx, 0);
     r.deref(ctx)
         .iter(ctx)
         .flat_map(|b| {
@@ -1342,7 +1342,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         {
             let (mut n, mut k, mut kk) = (0, 0, 0);
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
-                for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+                for b in f.op.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
                     for op in b.deref(ctx).iter(ctx) {
                         if Operation::is_op::<pliron_llvm::ops::CondBrOp>(op, ctx) {
                             n += 1;
@@ -1390,7 +1390,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 }
             };
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
-                for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+                for b in f.op.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
                     for op in b.deref(ctx).iter(ctx) {
                         if intrinsic(st, op) == Some("llvm.memcpy") {
                             let o: Vec<Value> = op.deref(ctx).operands().collect();
@@ -1461,7 +1461,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
             for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
-                for b in f.op.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+                for b in f.op.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
                     for op in b.deref(ctx).iter(ctx) {
                         let n = Operation::get_opid(op, ctx).to_string();
                         let n = st.intrinsics.get(op).map_or(n, |i| i.clone());

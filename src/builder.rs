@@ -305,7 +305,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if f.get_entry_block(&ctx).is_none() {
             return f.get_or_create_entry_block(&mut ctx);
         }
-        let region = llfn.deref(&ctx).get_region(0);
+        let region = llfn.deref(&ctx).get_region(&ctx, 0);
         let bb = BasicBlock::new(&mut ctx, None, vec![]);
         bb.insert_at_back(region, &ctx);
         bb

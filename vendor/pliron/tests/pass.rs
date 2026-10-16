@@ -73,7 +73,7 @@ fn parse(ctx: &mut Context, input: &str) -> Ptr<Operation> {
 /// Get a `Ptr` to the first operation immediately nested inside `op`
 /// (i.e., the head of the first block of the first region).
 fn first_nested_op(ctx: &Context, op: Ptr<Operation>) -> Ptr<Operation> {
-    let region = op.deref(ctx).regions().next().expect("op has a region");
+    let region = op.deref(ctx).regions(ctx).next().expect("op has a region");
     let block = region.deref(ctx).get_head().expect("region has a block");
     block.deref(ctx).get_head().expect("block has an op")
 }
@@ -244,7 +244,7 @@ impl Pass for CorruptTerminatorPass {
         ctx: &mut Context,
         _analyses: &mut AnalysisManager,
     ) -> Result<PassResult> {
-        let region = op.deref(ctx).regions().next().expect("op has a region");
+        let region = op.deref(ctx).regions(ctx).next().expect("op has a region");
         let block = region.deref(ctx).get_head().expect("region has a block");
         let terminator = block.deref(ctx).get_tail().expect("block has a terminator");
         Operation::erase(terminator, ctx);

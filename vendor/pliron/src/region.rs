@@ -56,15 +56,8 @@ impl Region {
         if src == new_parent_op {
             return;
         }
-        let mut src_guard = src.deref_mut(ctx);
-        let regions = src_guard.regions_mut();
-        regions.swap_remove(
-            regions
-                .iter()
-                .position(|x| *x == ptr)
-                .expect("Region missing in it's current parent Operation"),
-        );
-        new_parent_op.deref_mut(ctx).regions_mut().push(ptr);
+        Operation::remove_region_by_value(src, ctx, ptr);
+        Operation::push_region(new_parent_op, ctx, ptr);
         ptr.deref_mut(ctx).parent_op = new_parent_op;
     }
 
@@ -93,7 +86,7 @@ impl Region {
         let parent_op = self.get_parent_op();
         parent_op
             .deref(ctx)
-            .regions
+            .regions_slice(ctx)
             .iter()
             .position(|r| *r == self.self_ptr)
             .expect("Region missing in it's parent Operation")
