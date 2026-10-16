@@ -97,11 +97,9 @@ iteration under register pressure where LLVM keeps them in registers.
 ## WebAssembly
 
 `bench/wasm/run.sh` compiles the same kernel sources to
-wasm32-unknown-unknown three ways: stock rustc (LLVM + wasm-ld), the
-pliron backend (dialect → waffle), and the same backend under
-`PLIRON_WASM_CLIF=1`. Note the CLIF pipeline is now the default wasm
-route, so the second and third columns produce identical modules —
-`PLIRON_WASM_CLIF=0` selects the minimal dialect fallback.
+wasm32-unknown-unknown two ways: stock rustc (LLVM + wasm-ld) and the
+pliron backend (CLIF → waffle). The table below also shows the since-
+removed dialect → waffle path (`PLIRON_WASM_CLIF=0` at the time).
 `bench/wasm/run.mjs` times
 each `k_<name>(iters)` export in node (V8): warm calls for
 Liftoff→TurboFan tier-up, then 9 interleaved samples of ~150 ms. The

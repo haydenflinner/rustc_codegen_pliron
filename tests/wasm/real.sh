@@ -14,10 +14,6 @@ esac
 FEAT=""; MODE=both
 for a in "$@"; do case "$a" in --simd) FEAT="-Ctarget-feature=+simd128" ;; --native-only) MODE=native ;; --wasm-only) MODE=wasm ;; esac; done
 BE="${BACKEND:-$ROOT/target/debug/$lib}"
-# The dialect->waffle path has no vector lowering; the CLIF path
-# (full clif-opt pipeline -> waffle) does. Default to it; override with
-# PLIRON_WASM_CLIF=0 to exercise the dialect path.
-export PLIRON_WASM_CLIF="${PLIRON_WASM_CLIF:-1}"
 W=$ROOT/target/wasm-real
 mkdir -p "$W/crate"
 cp tests/wasm/real/real.rs tests/wasm/real/lib.rs tests/wasm/real/main.rs "$W/crate/"

@@ -1,19 +1,18 @@
-// node run.mjs <llvm.wasm> <pliron.wasm> [dialect.wasm] [name-filter]
+// node run.mjs <llvm.wasm> <pliron.wasm> [extra.wasm] [name-filter]
 //
 // Times every `k_<name>(iters)` export in the modules and prints a
 // comparison table, the wasm counterpart of bench/run.sh's criterion
 // run. `k_<name>_prep` (kernels whose input is consumed) is called
-// before each timed call and is not part of the timing. With a third
-// module (the PLIRON_WASM_CLIF=0 build) a second comparison column
-// shows the dialect->waffle fallback beside the default CLIF path.
+// before each timed call and is not part of the timing. An optional
+// third module adds a second comparison column beside pliron.
 import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
 const args = process.argv.slice(2);
 const filter = args.find((a) => !a.endsWith(".wasm")) ?? "";
-const [llvmPath, plirPath, dialPath] = args.filter((a) => a.endsWith(".wasm"));
+const [llvmPath, plirPath, extraPath] = args.filter((a) => a.endsWith(".wasm"));
 if (!llvmPath || !plirPath) {
-  console.error("usage: node run.mjs <llvm.wasm> <pliron.wasm> [dialect.wasm] [name-filter]");
+  console.error("usage: node run.mjs <llvm.wasm> <pliron.wasm> [extra.wasm] [name-filter]");
   process.exit(2);
 }
 
@@ -27,7 +26,7 @@ async function load(p) {
 }
 
 const mods = [{ tag: "pliron", path: plirPath, ...(await load(plirPath)) }];
-if (dialPath) mods.push({ tag: "dialect", path: dialPath, ...(await load(dialPath)) });
+if (extraPath) mods.push({ tag: "extra", path: extraPath, ...(await load(extraPath)) });
 const L = await load(llvmPath);
 
 // Call k_<name>_prep if present, then time e[k](iters).

@@ -46,7 +46,7 @@ matmul, nbody, tokenize); worst regressions: strwork +41.6 %, chars_alpha
 |---|---|---|
 | stock LLVM (wasm-ld) | 648 ms | 1.00× |
 | pliron CLIF→waffle (default) | 2757 ms | 4.25× slower |
-| pliron dialect→waffle (`PLIRON_WASM_CLIF=0`) | 6072 ms | 9.37× slower |
+| pliron dialect→waffle (`PLIRON_WASM_CLIF=0`, since removed) | 6072 ms | 9.37× slower |
 
 ## 4. Wasm runtime — `bench/wasm/run.sh`, node v24.21, 9 samples/kernel
 

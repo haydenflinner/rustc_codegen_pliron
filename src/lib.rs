@@ -434,7 +434,7 @@ const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
     ("PLIRON_CGDUMP2", "pliron::dump", tracing::Level::INFO),
     ("PLIRON_XPACK_CLIF", "pliron::dump", tracing::Level::INFO),
     ("PLIRON_VCODE", "pliron::dump", tracing::Level::INFO),
-    ("PLIRON_WASM_LOOPS", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_WASM_DUMP", "pliron::dump", tracing::Level::INFO),
     ("PLIRON_JT_PROF", "pliron::jumpthread", tracing::Level::INFO),
     (
         "PLIRON_JT_PROF2",
@@ -462,7 +462,6 @@ const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
         "pliron::stepcache",
         tracing::Level::INFO,
     ),
-    ("PLIRON_WASM_LICM", "pliron::wasm", tracing::Level::INFO),
     ("PLIRON_PGO", "pliron::pgo", tracing::Level::INFO),
     ("PLIRON_PGO_USE", "pliron::pgo", tracing::Level::INFO),
     (
@@ -1035,27 +1034,22 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         };
     }
     if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        // The CLIF-pipeline path is the default — it runs the full
-        // pliron-clif-opt suite (and loopvec under +simd128); the dialect
-        // path (`PLIRON_WASM_CLIF=0`) is the minimal fallback.
-        let obj = if crate::env_get("PLIRON_WASM_CLIF") != Some("0") {
-            wasm::lower_to_wasm_clif(
-                &cx.pctx.borrow(),
-                &cx.st.borrow(),
-                cx.tcx.sess,
-                name,
-                &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
-                cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-            )
-        } else {
-            wasm::lower_to_wasm(
-                &cx.pctx.borrow(),
-                &cx.st.borrow(),
-                name,
-                &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
-                cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-            )
-        };
+        // Wasm goes through FnLower + the full pliron-clif-opt suite (and
+        // loopvec under +simd128) into `clif_emit`'s CLIF -> waffle emit.
+        if crate::env_get("PLIRON_WASM_CLIF") == Some("0") {
+            cx.tcx.sess.dcx().warn(
+                "PLIRON_WASM_CLIF=0 ignored: the dialect -> waffle path was \
+                 removed; wasm always uses the CLIF pipeline",
+            );
+        }
+        let obj = wasm::lower_to_wasm_clif(
+            &cx.pctx.borrow(),
+            &cx.st.borrow(),
+            cx.tcx.sess,
+            name,
+            &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
+            cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
+        );
         return PlironModule {
             obj,
             ir,

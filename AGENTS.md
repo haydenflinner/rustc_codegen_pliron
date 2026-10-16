@@ -288,13 +288,12 @@ becomes a multi-minute blowup. Invariants that keep passes linear:
   name contains the substring; `PLIRON_VERIFY=full` runs the cranelift
   verifier after each step; any other truthy value verifies once after
   the pipeline, then retries per-step on failure for attribution.
-- `PLIRON_WASM_CLIF=1` — wasm via FnLower + the clif-opt pipeline then
-  CLIF→waffle (vector/simd128 lowering only exists here); `=0` is the
-  older dialect→waffle path (kept as a bisection fallback). The
-  `tests/wasm/{simd,fuzz,real,bench}.sh` scripts default it on.
+- Wasm always goes via FnLower + the clif-opt pipeline then
+  CLIF→waffle (`src/wasm.rs::clif_emit`); the older dialect→waffle
+  path was removed (`PLIRON_WASM_CLIF=0` now just warns it is ignored).
   `PLIRON_WASM_STUBLOG=<file>` writes stub reasons per function;
   `PLIRON_WASM_VERBOSE=1` / `PLIRON_WASM_PANIC=1` list stubs / unmute
-  panic locations.
+  panic locations; `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies.
 - Quick single-file check (no test.sh):
   `rustc +nightly-2026-10-06 -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs -o out`
 - Gotcha: build-level caching does **not** track `PLIRON_*` env or the
