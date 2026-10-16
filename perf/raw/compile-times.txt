@@ -1,0 +1,8 @@
+# native lib.rs (~4kLOC kernels), --emit link, median of 3
+llvm:        488 ms
+pliron-dbg: 1188 ms
+pliron-rel:  925 ms
+# wasm32 --emit obj, median of 3
+llvm:    648 ms
+clif:   2757 ms
+dialect: 6072 ms

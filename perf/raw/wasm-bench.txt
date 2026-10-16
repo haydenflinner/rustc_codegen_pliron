@@ -1,0 +1,19 @@
+kernel              LLVM    pliron   change   dialect   change
+chars_alpha      3.011ms   2.698ms   -10.1%   5.198ms    70.5%
+chars_ascii      1.267ms   1.901ms    48.7%   3.165ms   147.7%
+chars_mixed     13.130ms  19.748ms    50.2%  13.863ms     5.8%
+contains_rng     5.441ms   6.078ms    11.8%  10.720ms    95.9%
+eqbug            0.119ms   0.113ms    -5.7%   0.130ms     9.2%
+fib              5.710ms  10.026ms    77.7%  18.039ms   217.2%
+hashmap         46.340ms  71.735ms    53.2%  73.040ms    54.2%
+hmget            9.031ms  14.063ms    55.6%  13.551ms    50.2%
+iterw           58.063ms  35.419ms   -39.4%  64.164ms     8.6%
+matmul          26.612ms  23.468ms   -11.9%  20.100ms   -24.5%
+nbody           73.385ms  81.018ms    10.0% 126.145ms    74.2%
+parse_only     297.189ms 367.485ms    23.6% 347.666ms    16.5%
+sieve           13.647ms  14.482ms     5.0%  14.831ms     9.0%
+sortw            6.534ms   6.940ms     4.1%   8.071ms    14.6%
+strwork         12.997ms  17.430ms    32.5%  22.473ms    71.9%
+tokenize         3.300ms   4.065ms    23.4%  15.090ms   355.4%
+
+geomean pliron/llvm = 1.166   geomean dialect/llvm = 1.553 (16 kernels)

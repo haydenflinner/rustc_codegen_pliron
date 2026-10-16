@@ -1,0 +1,15 @@
+=== compute_direct (clif, best of 5) ===
+f32 1.1378 TOPS/s | f16 1.1378 TOPS/s | bf16 1.1378 TOPS/s
+=== compute_direct (llvm, best of 5) ===
+f32 1.1378 TOPS/s | f16 1.1299 TOPS/s | bf16 1.1378 TOPS/s
+=== memory copy/read/write ===
+clif:  35.53 / 43.71 / 21.35 GB/s
+llvm:  38.46 / 43.79 / 26.37 GB/s
+=== launch overhead ===
+clif 2.27-2.51 µs | llvm 2.43-2.57 µs
+=== JIT compile (17 kernels) ===
+clif 155.5 ms total (9.1 ms avg)
+llvm 421.9 ms total (24.8 ms avg)
+=== cubecl-cpu suite ===
+clif: 1048/1051 (3 pre-existing powi fails)
+llvm: 989/1071 (bf16 broken + powi)

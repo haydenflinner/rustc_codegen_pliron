@@ -17,6 +17,12 @@ esac
 cargo build  # the backend dylib
 cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml
 WLD=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WLD=$(cygpath -m "$(cygpath -u "$WLD.exe")") ;; esac
+
+# Cargo mangles RUSTFLAGS containing POSIX-spelled paths; spell ROOT
+# Windows-style for the -Zcodegen-backend/-Clinker flags below.
+WROOT=$ROOT
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WROOT=$(cygpath -m "$ROOT") ;; esac
 
 # LLVM: prebuilt wasm32 std, rustc's own wasm-ld invocation.
 (cd bench/wasm &&
@@ -33,14 +39,14 @@ WLD=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld
 rm -rf "$ROOT/target/wasm-bench"
 (cd bench/wasm &&
   CARGO_TARGET_DIR=$ROOT/target/wasm-bench \
-  RUSTFLAGS="-Zcodegen-backend=$ROOT/target/debug/$lib -Clinker=$WLD" \
+  RUSTFLAGS="-Zcodegen-backend=$WROOT/target/debug/$lib -Clinker=$WLD" \
   cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=std,panic_abort)
 rm -rf "$ROOT/target/wasm-bench-dialect"
 (cd bench/wasm &&
   CARGO_TARGET_DIR=$ROOT/target/wasm-bench-dialect \
   PLIRON_WASM_CLIF=0 \
-  RUSTFLAGS="-Zcodegen-backend=$ROOT/target/debug/$lib -Clinker=$WLD" \
+  RUSTFLAGS="-Zcodegen-backend=$WROOT/target/debug/$lib -Clinker=$WLD" \
   cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=std,panic_abort)
 

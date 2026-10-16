@@ -1,0 +1,386 @@
+warning: patch `cranelift-jit v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-jit)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+   Compiling cranelift-codegen-meta v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-codegen-meta)
+   Compiling pliron v0.19.0 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\pliron)
+   Compiling pliron-cfg v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron\pliron-cfg)
+   Compiling pliron-clif-opt v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron\pliron-clif-opt)
+   Compiling rustc_codegen_pliron v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron)
+   Compiling cranelift-codegen v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-codegen)
+   Compiling pliron-llvm v0.19.0 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\pliron\pliron-llvm)
+   Compiling cranelift-module v0.135.5
+   Compiling cranelift-interpreter v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-interpreter)
+   Compiling cranelift-frontend v0.135.5
+   Compiling cranelift-object v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-object)
+   Compiling pliron-ir-opt v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron\pliron-ir-opt)
+   Compiling pliron-clif-lower v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron\pliron-clif-lower)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2m 29s
+warning: patch `cranelift-jit v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-jit)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+   Compiling pliron-bench v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron\bench)
+    Finished `bench` profile [optimized] target(s) in 3.33s
+Benchmarking chars_alpha
+Benchmarking chars_alpha: Warming up for 1.0000 s
+Benchmarking chars_alpha: Collecting 100 samples in estimated 2.1564 s (1200 iterations)
+Benchmarking chars_alpha: Analyzing
+chars_alpha             time:   [1.7810 ms 1.7923 ms 1.8044 ms]
+                        change: [−8.2803% −3.9827% +0.2720%] (p = 0.08 > 0.05)
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  7 (7.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking chars_ascii
+Benchmarking chars_ascii: Warming up for 1.0000 s
+Benchmarking chars_ascii: Collecting 100 samples in estimated 2.0030 s (2100 iterations)
+Benchmarking chars_ascii: Analyzing
+chars_ascii             time:   [951.93 µs 958.85 µs 966.14 µs]
+                        change: [−23.357% −20.912% −18.319%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking chars_mixed
+Benchmarking chars_mixed: Warming up for 1.0000 s
+Benchmarking chars_mixed: Collecting 100 samples in estimated 2.8468 s (300 iterations)
+Benchmarking chars_mixed: Analyzing
+chars_mixed             time:   [9.3144 ms 9.3634 ms 9.4169 ms]
+                        change: [−17.445% −14.832% −12.161%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking contains_rng
+Benchmarking contains_rng: Warming up for 1.0000 s
+Benchmarking contains_rng: Collecting 100 samples in estimated 2.2657 s (800 iterations)
+Benchmarking contains_rng: Analyzing
+contains_rng            time:   [2.5842 ms 2.5986 ms 2.6142 ms]
+                        change: [−10.802% −8.2184% −5.6330%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking eqbug
+Benchmarking eqbug: Warming up for 1.0000 s
+Benchmarking eqbug: Collecting 100 samples in estimated 2.3315 s (20k iterations)
+Benchmarking eqbug: Analyzing
+eqbug                   time:   [116.13 µs 117.10 µs 118.21 µs]
+                        change: [−13.724% −10.186% −6.7624%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  2 (2.00%) high mild
+  7 (7.00%) high severe
+
+Benchmarking fib
+Benchmarking fib: Warming up for 1.0000 s
+Benchmarking fib: Collecting 100 samples in estimated 2.3142 s (300 iterations)
+Benchmarking fib: Analyzing
+fib                     time:   [7.6902 ms 7.7365 ms 7.7920 ms]
+                        change: [−7.3204% −4.2286% −1.0179%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking hashmap
+Benchmarking hashmap: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 4.9s, or reduce sample count to 40.
+Benchmarking hashmap: Collecting 100 samples in estimated 4.8579 s (100 iterations)
+Benchmarking hashmap: Analyzing
+hashmap                 time:   [48.629 ms 49.499 ms 50.386 ms]
+                        change: [−19.002% −16.254% −13.564%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking hmget
+Benchmarking hmget: Warming up for 1.0000 s
+Benchmarking hmget: Collecting 100 samples in estimated 2.0858 s (200 iterations)
+Benchmarking hmget: Analyzing
+hmget                   time:   [10.350 ms 10.392 ms 10.437 ms]
+                        change: [−14.618% −11.827% −9.0660%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking iterw
+Benchmarking iterw: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 3.8s, or reduce sample count to 50.
+Benchmarking iterw: Collecting 100 samples in estimated 3.8206 s (100 iterations)
+Benchmarking iterw: Analyzing
+iterw                   time:   [33.028 ms 33.703 ms 34.425 ms]
+                        change: [−21.112% −18.277% −15.335%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking matmul
+Benchmarking matmul: Warming up for 1.0000 s
+Benchmarking matmul: Collecting 100 samples in estimated 2.5472 s (400 iterations)
+Benchmarking matmul: Analyzing
+matmul                  time:   [5.9417 ms 6.0413 ms 6.1469 ms]
+                        change: [−9.7498% −6.4949% −3.2825%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+
+Benchmarking nbody
+Benchmarking nbody: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 7.0s, or reduce sample count to 20.
+Benchmarking nbody: Collecting 100 samples in estimated 7.0199 s (100 iterations)
+Benchmarking nbody: Analyzing
+nbody                   time:   [70.365 ms 70.963 ms 71.610 ms]
+                        change: [−11.096% −9.2933% −7.5314%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 13 outliers among 100 measurements (13.00%)
+  12 (12.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking parse_only
+Benchmarking parse_only: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 28.0s, or reduce sample count to 10.
+Benchmarking parse_only: Collecting 100 samples in estimated 27.998 s (100 iterations)
+Benchmarking parse_only: Analyzing
+parse_only              time:   [275.64 ms 276.20 ms 276.77 ms]
+                        change: [−15.626% −14.132% −12.636%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking sieve
+Benchmarking sieve: Warming up for 1.0000 s
+Benchmarking sieve: Collecting 100 samples in estimated 2.7266 s (200 iterations)
+Benchmarking sieve: Analyzing
+sieve                   time:   [13.665 ms 13.751 ms 13.842 ms]
+                        change: [−15.510% −13.569% −11.667%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  8 (8.00%) high mild
+
+Benchmarking sortw
+Benchmarking sortw: Warming up for 1.0000 s
+Benchmarking sortw: Collecting 100 samples in estimated 2.2425 s (300 iterations)
+Benchmarking sortw: Analyzing
+sortw                   time:   [6.6124 ms 6.7390 ms 6.8614 ms]
+                        change: [−3.5101% −0.0398% +3.4248%] (p = 0.99 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  6 (6.00%) low mild
+  1 (1.00%) high mild
+
+Benchmarking strwork
+Benchmarking strwork: Warming up for 1.0000 s
+Benchmarking strwork: Collecting 100 samples in estimated 2.3582 s (200 iterations)
+Benchmarking strwork: Analyzing
+strwork                 time:   [11.518 ms 11.580 ms 11.648 ms]
+                        change: [−50.489% −48.914% −47.321%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+
+Benchmarking tokenize
+Benchmarking tokenize: Warming up for 1.0000 s
+Benchmarking tokenize: Collecting 100 samples in estimated 2.1769 s (800 iterations)
+Benchmarking tokenize: Analyzing
+tokenize                time:   [2.6608 ms 2.6784 ms 2.6973 ms]
+                        change: [−20.211% −15.103% −9.9716%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+
+warning: patch `cranelift-jit v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-jit)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+     Removed 34 files, 1.2MiB total
+warning: patch `cranelift-jit v0.135.5 (C:\Users\haydu\code\rustc_codegen_pliron\vendor\cranelift-jit)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+   Compiling pliron-bench v0.1.0 (C:\Users\haydu\code\rustc_codegen_pliron\bench)
+    Finished `bench` profile [optimized] target(s) in 8.32s
+Benchmarking chars_alpha
+Benchmarking chars_alpha: Warming up for 1.0000 s
+Benchmarking chars_alpha: Collecting 100 samples in estimated 2.0629 s (900 iterations)
+Benchmarking chars_alpha: Analyzing
+chars_alpha             time:   [2.2863 ms 2.3009 ms 2.3163 ms]
+                        change: [+27.231% +28.382% +29.564%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking chars_ascii
+Benchmarking chars_ascii: Warming up for 1.0000 s
+Benchmarking chars_ascii: Collecting 100 samples in estimated 2.0377 s (2100 iterations)
+Benchmarking chars_ascii: Analyzing
+chars_ascii             time:   [956.64 µs 962.49 µs 968.82 µs]
+                        change: [−0.5827% +0.3793% +1.3433%] (p = 0.45 > 0.05)
+                        No change in performance detected.
+Found 9 outliers among 100 measurements (9.00%)
+  8 (8.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking chars_mixed
+Benchmarking chars_mixed: Warming up for 1.0000 s
+Benchmarking chars_mixed: Collecting 100 samples in estimated 2.8585 s (300 iterations)
+Benchmarking chars_mixed: Analyzing
+chars_mixed             time:   [9.4170 ms 9.4778 ms 9.5444 ms]
+                        change: [+0.3558% +1.2220% +2.1335%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 9 outliers among 100 measurements (9.00%)
+  8 (8.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking contains_rng
+Benchmarking contains_rng: Warming up for 1.0000 s
+Benchmarking contains_rng: Collecting 100 samples in estimated 2.1491 s (700 iterations)
+Benchmarking contains_rng: Analyzing
+contains_rng            time:   [3.0165 ms 3.0301 ms 3.0445 ms]
+                        change: [+15.768% +16.605% +17.488%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+
+Benchmarking eqbug
+Benchmarking eqbug: Warming up for 1.0000 s
+Benchmarking eqbug: Collecting 100 samples in estimated 2.1419 s (20k iterations)
+Benchmarking eqbug: Analyzing
+eqbug                   time:   [106.67 µs 107.55 µs 108.45 µs]
+                        change: [−9.4710% −8.3381% −7.1594%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking fib
+Benchmarking fib: Warming up for 1.0000 s
+Benchmarking fib: Collecting 100 samples in estimated 2.2604 s (300 iterations)
+Benchmarking fib: Analyzing
+fib                     time:   [7.4881 ms 7.5402 ms 7.5974 ms]
+                        change: [−3.4779% −2.5383% −1.5916%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking hashmap
+Benchmarking hashmap: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 4.7s, or reduce sample count to 40.
+Benchmarking hashmap: Collecting 100 samples in estimated 4.7325 s (100 iterations)
+Benchmarking hashmap: Analyzing
+hashmap                 time:   [45.418 ms 45.630 ms 45.859 ms]
+                        change: [−9.4750% −7.8173% −6.0864%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking hmget
+Benchmarking hmget: Warming up for 1.0000 s
+Benchmarking hmget: Collecting 100 samples in estimated 2.0583 s (200 iterations)
+Benchmarking hmget: Analyzing
+hmget                   time:   [10.323 ms 10.401 ms 10.483 ms]
+                        change: [−0.7948% +0.0884% +0.9467%] (p = 0.84 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking iterw
+Benchmarking iterw: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 3.2s, or reduce sample count to 60.
+Benchmarking iterw: Collecting 100 samples in estimated 3.2469 s (100 iterations)
+Benchmarking iterw: Analyzing
+iterw                   time:   [32.100 ms 32.441 ms 32.821 ms]
+                        change: [−6.0320% −3.7448% −1.4771%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking matmul
+Benchmarking matmul: Warming up for 1.0000 s
+Benchmarking matmul: Collecting 100 samples in estimated 2.4987 s (400 iterations)
+Benchmarking matmul: Analyzing
+matmul                  time:   [5.5547 ms 5.5933 ms 5.6353 ms]
+                        change: [−9.1555% −7.4162% −5.7805%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+
+Benchmarking nbody
+Benchmarking nbody: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 6.9s, or reduce sample count to 20.
+Benchmarking nbody: Collecting 100 samples in estimated 6.9068 s (100 iterations)
+Benchmarking nbody: Analyzing
+nbody                   time:   [68.964 ms 69.285 ms 69.618 ms]
+                        change: [−3.3789% −2.3651% −1.3952%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking parse_only
+Benchmarking parse_only: Warming up for 1.0000 s
+
+Warning: Unable to complete 100 samples in 2.0s. You may wish to increase target time to 30.3s, or reduce sample count to 10.
+Benchmarking parse_only: Collecting 100 samples in estimated 30.346 s (100 iterations)
+Benchmarking parse_only: Analyzing
+parse_only              time:   [301.41 ms 302.94 ms 304.65 ms]
+                        change: [+9.1035% +9.6835% +10.280%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking sieve
+Benchmarking sieve: Warming up for 1.0000 s
+Benchmarking sieve: Collecting 100 samples in estimated 3.0089 s (200 iterations)
+Benchmarking sieve: Analyzing
+sieve                   time:   [14.265 ms 14.308 ms 14.353 ms]
+                        change: [+3.2909% +4.0507% +4.7526%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking sortw
+Benchmarking sortw: Warming up for 1.0000 s
+Benchmarking sortw: Collecting 100 samples in estimated 2.3584 s (300 iterations)
+Benchmarking sortw: Analyzing
+sortw                   time:   [7.2955 ms 7.3633 ms 7.4333 ms]
+                        change: [+7.0260% +9.2645% +11.554%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking strwork
+Benchmarking strwork: Warming up for 1.0000 s
+Benchmarking strwork: Collecting 100 samples in estimated 3.0855 s (200 iterations)
+Benchmarking strwork: Analyzing
+strwork                 time:   [15.449 ms 16.398 ms 17.412 ms]
+                        change: [+34.137% +41.606% +49.307%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+
+Benchmarking tokenize
+Benchmarking tokenize: Warming up for 1.0000 s
+Benchmarking tokenize: Collecting 100 samples in estimated 2.0358 s (700 iterations)
+Benchmarking tokenize: Analyzing
