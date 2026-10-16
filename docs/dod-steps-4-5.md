@@ -3,6 +3,65 @@
 Status: queued after steps 1–3 of the DoD plan. Read `docs/performance.md`
 ("Wall decomposition") first for where the time actually goes.
 
+## Landing order (prerequisites first — each compiles and ships alone)
+
+1. **R1: field→accessor facades.** `Operation`'s SmallVec/attr fields are
+   `pub(crate)`-accessed directly at hundreds of sites across
+   vendor/pliron, pliron-llvm, pliron-ir-opt, clif-lower, src. Route every
+   `d.results`/`d.operands`/`d.successors`/`d.attributes` read through
+   accessor methods (`fn operands(&self) -> &[Operand]`). This is the big
+   mechanical diff — it turns step 5 into "change ~5 accessor impls".
+   Expect ~zero perf delta; verify with the harness.
+2. **R2: ordinal accessors.** One documented `Ptr::ord() -> u32`
+   (ArenaIndex slot index = low 32 of `as_ffi()`) + confirm `Value::val_uid`
+   density. All column indexing goes through these.
+3. **R3: `State` accessor layer.** `st.calls(op) -> Option<&CallInfo>`
+   style — rename probe sites once; the storage swap is then free.
+4. **R4: consolidate the existing ad-hoc dense tables**
+   (`op_links`/`block_links`/`op_kind`, PLIRON-marked) into one
+   `OpTable`/`BlockTable` column struct — step 5's span columns land there.
+5. Step 4 below, then step 5a (flat pools), then 5b (attr flattening on
+   the AttrInstId arena from `3d06c3d`).
+
+## Step 4 detail
+
+Value-keyed maps → `Vec<Option<T>>` by `val_uid` (grow-on-write).
+Op-keyed maps → `Vec<Option<T>>` by op ordinal, sized once at the CGU
+scan that populates `State` anyway; deleted-op tombstones are fine, never
+compact. String-keyed: check whether pliron `Identifier` is already an
+interned u32 — if so `Vec`-indexed columns almost for free, plus an
+insertion-order `Vec<Identifier>` where emission order matters
+(`funcs`/`globals`).
+
+## Step 5 detail
+
+- `Operation` ~100B → ~48B row `{self_ptr, kind: u16, operand_span,
+  result_span, succ_span, region_span, attr_span, block_links, loc}` in
+  the `OpTable` (R4); `concrete_op` dispatch via the kind column.
+- Global flat pools `operands_flat`/`results_flat`/`succs_flat`/
+  `regions_flat` + per-op `(u32 off, u16 len)` spans; reads become slices.
+- Mutation: same-len operand writes go straight into the pool (most
+  peepholes); length changes append a new span, orphaning the old —
+  CGU-scoped lifetime bounds the garbage; compaction only if it matters.
+- Attrs → flat `Vec<(kind_id, AttrInstId)>` span, insertion-ordered
+  (print order must not change — dumps/tests compare text), linear
+  scan ≤4; capability bitmask per kind replaces `attr_impls` dyn casts.
+- Sequence: dual-write pools at op construction → flip readers inside the
+  accessor impls (R1 makes this localized) → writers last → delete
+  SmallVec fields.
+
+## Expected payoff (honest)
+
+- Step 4: ~3-6% CPU (state probes → array index).
+- Step 5a: kills per-op alloc traffic (~2.7% malloc/free) + ~2× walk
+  cache density (48B rows vs ~100B) — est. 8-15% of pass CPU.
+- Step 5b: ~1-2% residual (AttrInstId interning + callee memoization
+  already took most attr-read cost).
+- Combined ~1.3-1.6× compile-time. **The real prize is the unlock:**
+  columnar `&Context` reads become Sync-shareable → per-fn parallelism in
+  phaseA/iropt without `-Zthreads` — the only remaining 4-8× lever on
+  the default serial-CGU path.
+
 Baseline for whoever picks this up (x86-64 box, 8 cores, pinned
 nightly-2026-10-06):
 
