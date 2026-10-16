@@ -267,8 +267,15 @@ fn apply(func: &mut Function, s: &Shift) {
         }
     }
     for &i in &s.subst {
+        // `subst` was collected by resolved use site; a use reaching `p`
+        // through an alias must still be rewritten, so compare resolved.
+        let aliased: FxHashSet<Value> = func
+            .dfg
+            .inst_values(i)
+            .filter(|&v| func.dfg.resolve_aliases(v) == s.p)
+            .collect();
         func.dfg
-            .map_inst_values(i, |v| if v == s.p { s.p_next } else { v });
+            .map_inst_values(i, |v| if aliased.contains(&v) { s.p_next } else { v });
     }
     for &(inst, di, a, _) in &s.entries {
         let dfg = &mut func.dfg;
