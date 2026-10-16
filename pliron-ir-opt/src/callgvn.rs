@@ -211,18 +211,29 @@ fn cone_args(
 
 /// Any write in `os[lo..hi]`? `os` is a pre-erasure snapshot — `dead`
 /// holds ops already erased (deref on them is a dangling-Ptr panic).
+/// `op_writes` was computed pre-erasure too, so a dead op's entry is
+/// still valid to read (it is just skipped).
 fn writes_between(
-    ctx: &Context,
-    st: &State,
     os: &[Ptr<Operation>],
     lo: usize,
     hi: usize,
-    arg_allocas: &FxHashSet<Value>,
+    op_writes: &FxHashMap<Ptr<Operation>, bool>,
     dead: &FxHashSet<Ptr<Operation>>,
 ) -> bool {
     os[lo..hi]
         .iter()
-        .any(|&o| !dead.contains(&o) && writes(ctx, st, o, arg_allocas))
+        .any(|&o| !dead.contains(&o) && op_writes.get(&o).copied().unwrap_or(false))
+}
+
+/// (callee, args) hash for the dedup tables: the maps key on `u64` +
+/// store the full pair in the bucket, so lookups pay a hash instead of
+/// a `String` + `Vec` clone per candidate op.
+fn ckey(c: &str, args: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    c.hash(&mut h);
+    args.hash(&mut h);
+    h.finish()
 }
 
 /// Every path from `src`'s block to `dst`'s (distinct, dominated-by-src)
@@ -352,10 +363,20 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         }
     }
     let mut writes_blk = FxHashSet::default();
+    // Per-op write flag: `writes` is consulted per op here, again in the
+    // dedup scan, and per range query in `writes_between` — cache it once
+    // `arg_allocas` (its only function-global input) is complete.
+    let mut op_writes: FxHashMap<Ptr<Operation>, bool> = FxHashMap::default();
     let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     let mut succ: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     for &b in &bs {
-        if bops[&b].iter().any(|&o| writes(ctx, st, o, &arg_allocas)) {
+        let mut wb = false;
+        for &op in &bops[&b] {
+            let w = writes(ctx, st, op, &arg_allocas);
+            op_writes.insert(op, w);
+            wb |= w;
+        }
+        if wb {
             writes_blk.insert(b);
         }
         for op in &bops[&b] {
@@ -370,15 +391,20 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         }
     }
     let mut gone = FxHashSet::default();
+    // `dedupable` runs per op in each of the three passes below; its
+    // inputs (op shape, `st` fact tables) are all pass-stable, so the
+    // result is memoized per (op, invoke-allowed).
+    let mut dmemo: FxHashMap<(Ptr<Operation>, bool), Option<(String, Vec<Value>, Value)>> =
+        FxHashMap::default();
 
     // 1) Block-local dedup + dead-call elim.
-    let mut index: FxHashMap<(String, Vec<Value>), Vec<(Ptr<BasicBlock>, usize, Ptr<Operation>)>> =
+    let mut index: FxHashMap<u64, Vec<(String, Vec<Value>, Ptr<BasicBlock>, usize, Ptr<Operation>)>> =
         FxHashMap::default();
     for &b in &bs {
-        let mut seen: FxHashMap<(String, Vec<Value>), Value> = FxHashMap::default();
+        let mut seen: FxHashMap<u64, Vec<(String, Vec<Value>, Value)>> = FxHashMap::default();
         let os = &bops[&b];
         for (i, &op) in os.iter().enumerate() {
-            if writes(ctx, st, op, &arg_allocas) {
+            if op_writes.get(&op).copied().unwrap_or(false) {
                 seen.clear();
             }
             if crate::env_set("PLIRON_CGDBG") && Operation::is_op::<CallOp>(op, ctx) {
@@ -399,29 +425,37 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 };
                 eprintln!("callgvn   call dedupable={why}");
             }
-            let Some((c, args, res)) = dedupable(ctx, st, op, false) else {
+            let Some((c, args, res)) = dmemo
+                .entry((op, false))
+                .or_insert_with(|| dedupable(ctx, st, op, false))
+                .as_ref()
+            else {
                 continue;
             };
             // Dead: nowrite + nounwind + unused result (willreturn comes
             // free through `dedupable` — LLVM's `isRemovable` triple).
             if res.uses(ctx).is_empty()
-                && st.nowrite.get(&c) == Some(&true)
-                && st.funcs.get(&c).is_some_and(|f| f.nounwind)
+                && st.nowrite.get(c) == Some(&true)
+                && st.funcs.get(c).is_some_and(|f| f.nounwind)
             {
                 gone.insert(op);
                 continue;
             }
-            match seen.get(&(c.clone(), args.clone())) {
-                Some(&prev) => {
-                    res.replace_all_uses_with(ctx, &prev);
-                    gone.insert(op);
-                    continue;
-                }
-                None => {
-                    seen.insert((c.clone(), args.clone()), res);
-                }
+            let h = ckey(c, args);
+            let prev = seen
+                .get(&h)
+                .and_then(|bkt| bkt.iter().find(|(c2, a2, _)| c2 == c && a2 == args))
+                .map(|e| e.2);
+            if let Some(prev) = prev {
+                res.replace_all_uses_with(ctx, &prev);
+                gone.insert(op);
+                continue;
             }
-            index.entry((c, args)).or_default().push((b, i, op));
+            seen.entry(h).or_default().push((c.clone(), args.clone(), *res));
+            index
+                .entry(h)
+                .or_default()
+                .push((c.clone(), args.clone(), b, i, op));
         }
     }
     for &op in &gone {
@@ -436,28 +470,35 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             if gone.contains(&op) {
                 continue;
             }
-            let Some((c, args, res)) = dedupable(ctx, st, op, false) else {
+            let Some((c, args, res)) = dmemo
+                .entry((op, false))
+                .or_insert_with(|| dedupable(ctx, st, op, false))
+                .as_ref()
+            else {
                 continue;
             };
-            let Some(cands) = index.get(&(c, args)) else {
+            let Some(cands) = index.get(&ckey(c, args)) else {
                 continue;
             };
-            for &(cb, ci, cop) in cands {
-                if gone.contains(&cop) || killed.contains(&cop) || cb == b || !dom.dominates(cb, b) {
+            for e in cands {
+                let (c2, a2, cb, ci, cop) = e;
+                if c2 != c || a2 != args {
+                    continue; // hash-collision guard
+                }
+                if gone.contains(cop) || killed.contains(cop) || cb == &b || !dom.dominates(*cb, b)
+                {
                     continue;
                 }
                 // No writes after c1 in its block, none before c2 in ours,
                 // none in any block on a c1→c2 path.
                 if writes_between(
-                    ctx,
-                    st,
-                    &bops[&cb],
-                    ci + 1,
-                    bops[&cb].len(),
-                    &arg_allocas,
+                    &bops[cb],
+                    *ci + 1,
+                    bops[cb].len(),
+                    &op_writes,
                     &gone,
-                ) || writes_between(ctx, st, os, 0, i, &arg_allocas, &gone)
-                    || !path_write_free(&preds, &writes_blk, cb, b)
+                ) || writes_between(os, 0, i, &op_writes, &gone)
+                    || !path_write_free(&preds, &writes_blk, *cb, b)
                 {
                     continue;
                 }
@@ -560,7 +601,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
                 // Hoists may carry invokes: the unwind edge is an
                 // `st.invokes` entry keyed on the op, so it moves with it.
-                let Some((c, args, _)) = dedupable(ctx, st, op, true) else {
+                let Some((c, args, _)) = dmemo
+                    .entry((op, true))
+                    .or_insert_with(|| dedupable(ctx, st, op, true))
+                    .as_ref()
+                else {
                     continue;
                 };
                 // Any `nowrite` entry works: a `false` callee writes only
@@ -570,7 +615,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 // way from the preheader as from the loop body. (`dedupable`
                 // already required `willreturn`, the part that makes
                 // speculation itself safe.)
-                if !st.nowrite.contains_key(&c) {
+                if !st.nowrite.contains_key(c) {
                     continue;
                 }
                 // Args need to reach the preheader: values defined inside
