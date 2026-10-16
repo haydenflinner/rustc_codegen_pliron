@@ -219,5 +219,5 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &cand {
         crate::dump_fact("nnret", s, &t.contains(s));
     }
-    st.nnret = t;
+    st.nnret = t.into_iter().collect();
 }

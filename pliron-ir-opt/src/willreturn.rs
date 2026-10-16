@@ -146,5 +146,5 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &bodied {
         crate::dump_fact("willreturn", s, &wr.contains(s));
     }
-    st.willreturn = wr;
+    st.willreturn = wr.into_iter().collect();
 }

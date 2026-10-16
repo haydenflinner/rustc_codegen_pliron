@@ -242,5 +242,5 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &bodied {
         crate::dump_fact("nowrite", s, &nw.get(s));
     }
-    st.nowrite = nw;
+    st.nowrite = nw.into_iter().collect();
 }

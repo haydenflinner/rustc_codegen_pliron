@@ -13,10 +13,170 @@ use pliron::value::Value;
 use pliron_llvm::attributes::AtomicRmwKindAttr;
 use pliron_llvm::ops::FuncOp;
 pub use pliron::cols::{ColMap, ColSet};
+
+/// PLIRON: string-keyed companion to [ColMap] — intern `String` names to
+/// dense u32 once (`ids`), values in a parallel Vec. `iter`/`keys`
+/// follow intern (insertion) order, matching `IndexMap` semantics that
+/// `funcs`/`globals` emission order relies on.
+#[derive(Clone, Debug)]
+pub struct SymMap<V> {
+    ids: FxHashMap<String, u32>,
+    names: Vec<String>,
+    vals: Vec<Option<V>>,
+}
+
+impl<V> Default for SymMap<V> {
+    fn default() -> Self {
+        Self {
+            ids: FxHashMap::default(),
+            names: Vec::new(),
+            vals: Vec::new(),
+        }
+    }
+}
+
+impl<V> SymMap<V> {
+    #[inline]
+    pub fn get(&self, k: &str) -> Option<&V> {
+        self.ids.get(k).and_then(|&i| self.vals[i as usize].as_ref())
+    }
+    #[inline]
+    pub fn get_mut(&mut self, k: &str) -> Option<&mut V> {
+        match self.ids.get(k) {
+            Some(&i) => self.vals[i as usize].as_mut(),
+            None => None,
+        }
+    }
+    /// IndexMap::get_key_value — the canonical stored key.
+    pub fn get_key_value(&self, k: &str) -> Option<(&String, &V)> {
+        self.ids
+            .get(k)
+            .and_then(|&i| self.vals[i as usize].as_ref().map(|v| (&self.names[i as usize], v)))
+    }
+    pub fn insert(&mut self, k: String, v: V) -> Option<V> {
+        match self.ids.get(k.as_str()) {
+            Some(&i) => self.vals[i as usize].replace(v),
+            None => {
+                let i = self.vals.len() as u32;
+                self.ids.insert(k.clone(), i);
+                self.names.push(k);
+                self.vals.push(Some(v));
+                None
+            }
+        }
+    }
+    #[inline]
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.get(k).is_some()
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.vals.iter().flatten().count()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Insertion-ordered (`IndexMap` parity).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &V)> {
+        self.names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| self.vals[i].as_ref().map(|v| (n, v)))
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.iter().map(|(k, _)| k)
+    }
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+}
+
+impl<V> core::ops::Index<&str> for SymMap<V> {
+    type Output = V;
+    #[inline]
+    fn index(&self, k: &str) -> &V {
+        self.get(k).expect("SymMap index of absent key")
+    }
+}
+impl<V> core::ops::Index<&String> for SymMap<V> {
+    type Output = V;
+    #[inline]
+    fn index(&self, k: &String) -> &V {
+        &self[k.as_str()]
+    }
+}
+impl<V> core::ops::Index<String> for SymMap<V> {
+    type Output = V;
+    #[inline]
+    fn index(&self, k: String) -> &V {
+        &self[k.as_str()]
+    }
+}
+
+impl<'a, V> IntoIterator for &'a SymMap<V> {
+    type Item = (&'a String, &'a V);
+    type IntoIter = Box<dyn Iterator<Item = Self::Item> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl<V> FromIterator<(String, V)> for SymMap<V> {
+    fn from_iter<I: IntoIterator<Item = (String, V)>>(it: I) -> Self {
+        let mut m = Self::default();
+        m.extend(it);
+        m
+    }
+}
+
+impl FromIterator<String> for SymSet {
+    fn from_iter<I: IntoIterator<Item = String>>(it: I) -> Self {
+        let mut s = Self::default();
+        s.extend(it);
+        s
+    }
+}
+
+impl<V> Extend<(String, V)> for SymMap<V> {
+    fn extend<I: IntoIterator<Item = (String, V)>>(&mut self, it: I) {
+        for (k, v) in it {
+            self.insert(k, v);
+        }
+    }
+}
+
+/// PLIRON: interned-string set — [SymMap] with `()` values.
+#[derive(Clone, Debug, Default)]
+pub struct SymSet(SymMap<()>);
+
+impl SymSet {
+    #[inline]
+    pub fn contains(&self, k: &str) -> bool {
+        self.0.contains_key(k)
+    }
+    pub fn insert(&mut self, k: String) -> bool {
+        self.0.insert(k, ()).is_none()
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Extend<String> for SymSet {
+    fn extend<I: IntoIterator<Item = String>>(&mut self, it: I) {
+        for k in it {
+            self.insert(k);
+        }
+    }
+}
 use rustc_hash::FxHashMap;
 
-/// Order-preserving map (rustc's `FxIndexMap` equivalent).
-type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConstVal {
@@ -137,8 +297,8 @@ pub struct CallInfo {
 #[derive(Default)]
 pub struct State {
     pub consts: ColMap<Value, ConstVal>,
-    pub funcs: FxIndexMap<String, FuncInfo>,
-    pub globals: FxIndexMap<String, GlobalInfo>,
+    pub funcs: SymMap<FuncInfo>,
+    pub globals: SymMap<GlobalInfo>,
     pub ident_to_sym: FxHashMap<String, String>,
     pub sym_to_ident: FxHashMap<String, Identifier>,
     pub allocas: ColMap<Value, (u64, u64)>,
@@ -149,7 +309,7 @@ pub struct State {
     pub calls: ColMap<Ptr<Operation>, CallInfo>,
     pub intrinsics: ColMap<Ptr<Operation>, String>,
     pub rmw: ColMap<Ptr<Operation>, AtomicRmwKindAttr>,
-    pub strs: FxHashMap<String, Value>,
+    pub strs: SymMap<Value>,
     pub counter: usize,
     pub cgu: String,
     pub asm: String,
@@ -158,7 +318,7 @@ pub struct State {
     /// call op → (landing block, is catch_unwind catch-all)
     pub invokes: ColMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
     pub last_call: Option<Ptr<Operation>>,
-    pub llvm_stubs: rustc_hash::FxHashSet<String>,
+    pub llvm_stubs: SymSet,
     /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
     pub volatile: ColSet<Ptr<Operation>>,
     /// Loads whose (pointer) result rustc marked `!nonnull`.
@@ -170,17 +330,17 @@ pub struct State {
     /// (dereferenceable bytes when known, writable when not `readonly`).
     pub noalias: ColMap<Value, (u64, bool)>,
     /// Functions that write no memory (`true`) or none before a normal return (nowrite.rs).
-    pub nowrite: rustc_hash::FxHashMap<String, bool>,
+    pub nowrite: SymMap<bool>,
     /// Functions that provably come back (return/unwind/tail-call/UB) and
     /// behave deterministically — no volatile, atomic, asm, trap, indirect
     /// or unknown-callee interaction (willreturn.rs).
-    pub willreturn: rustc_hash::FxHashSet<String>,
+    pub willreturn: SymSet,
     /// Per-callee body-level capture analysis: param indices provably not
     /// retained past the call (nocapture.rs).
-    pub nocapture: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<u32>>,
+    pub nocapture: SymMap<rustc_hash::FxHashSet<u32>>,
     /// Bodies inferred to return a non-null pointer (nnret.rs); lowering
     /// seeds their call results into `FnLower::nonnull` for jumpthread.
-    pub nnret: rustc_hash::FxHashSet<String>,
+    pub nnret: SymSet,
     /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
     pub bool01: ColSet<Ptr<Operation>>,
     /// Args inside inlined clones that bind a `noalias readonly` callee
@@ -232,7 +392,7 @@ pub struct State {
     /// `inbounds` GEPs: null only if their base is.
     pub inbounds: ColSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
-    pub dead_fns: rustc_hash::FxHashSet<String>,
+    pub dead_fns: SymSet,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
     pub notrap: bool,
     /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).
@@ -272,7 +432,7 @@ pub struct State {
     /// cond_br op → expected condition value (`likely`/`unlikely`).
     pub expect: ColMap<Ptr<Operation>, bool>,
     /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
-    pub wasm_imports: FxHashMap<String, (String, String)>,
+    pub wasm_imports: SymMap<(String, String)>,
     /// Loaded PGO profile (`PLIRON_PGO_USE`): FuncOp → function record.
     /// Only functions whose CFG fingerprint matched are present.
     pub prof: ColMap<Ptr<Operation>, crate::pgo::ProfFn>,

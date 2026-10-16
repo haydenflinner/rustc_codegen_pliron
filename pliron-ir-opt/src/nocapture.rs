@@ -395,5 +395,5 @@ pub fn run(ctx: &Context, st: &mut State) {
         v.sort();
         crate::dump_fact("nocapture", s, &v);
     }
-    st.nocapture = nc;
+    st.nocapture = nc.into_iter().collect();
 }
