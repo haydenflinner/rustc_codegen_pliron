@@ -10317,6 +10317,93 @@ impl<'o, 'a> CX<'o, 'a> {
         use Opcode as P;
         let lane = t.lane_type();
         let (a, b) = (self.get1(args[0]), self.get1(args[1]));
+        // i64x2 has no min/max lanes: expand via vicmp (vicmp already
+        // sign-biases unsigned i64 compares) + bitselect.
+        if lane == clt::I64
+            && matches!(op, P::Smin | P::Smax | P::Umin | P::Umax)
+        {
+            let cc = match op {
+                P::Smin => ir::condcodes::IntCC::SignedLessThan,
+                P::Smax => ir::condcodes::IntCC::SignedGreaterThan,
+                P::Umin => ir::condcodes::IntCC::UnsignedLessThan,
+                _ => ir::condcodes::IntCC::UnsignedGreaterThan,
+            };
+            let m = self.vicmp(cc, t, a, b);
+            let v = self.op(O::V128Bitselect, &[a, b, m], WT::V128);
+            self.set(f.dfg.inst_results(i)[0], v);
+            return;
+        }
+        // i64x2 saturating add/sub: no lanes either.
+        if lane == clt::I64
+            && matches!(op, P::UaddSat | P::UsubSat | P::SaddSat | P::SsubSat)
+        {
+            let add = matches!(op, P::UaddSat | P::SaddSat);
+            let s = self.op(
+                if add { O::I64x2Add } else { O::I64x2Sub },
+                &[a, b],
+                WT::V128,
+            );
+            let v = if matches!(op, P::UaddSat | P::UsubSat) {
+                // uadd: sum <u a -> all 1s. usub: a <u b -> 0.
+                let (x, y) = if add { (s, a) } else { (a, b) };
+                let m = self.vicmp(ir::condcodes::IntCC::UnsignedLessThan, t, x, y);
+                let k = self.op(
+                    O::V128Const {
+                        value: if add { u128::MAX } else { 0 },
+                    },
+                    &[],
+                    WT::V128,
+                );
+                self.op(O::V128Bitselect, &[k, s, m], WT::V128)
+            } else {
+                // ovf bit = sign of (a^s)&(a^?b): add uses b^s, sub a^b.
+                let z = self.op(O::V128Const { value: 0 }, &[], WT::V128);
+                let x1 = self.op(O::V128Xor, &[a, s], WT::V128);
+                let (xa, xb) = if add { (b, s) } else { (a, b) };
+                let x2 = self.op(O::V128Xor, &[xa, xb], WT::V128);
+                let m = self.op(O::V128And, &[x1, x2], WT::V128);
+                let ovf =
+                    self.vicmp(ir::condcodes::IntCC::SignedLessThan, t, m, z);
+                let neg =
+                    self.vicmp(ir::condcodes::IntCC::SignedLessThan, t, a, z);
+                let mn = self.op(
+                    O::V128Const {
+                        value: 0x8000_0000_0000_0000_8000_0000_0000_0000,
+                    },
+                    &[],
+                    WT::V128,
+                );
+                let mx = self.op(
+                    O::V128Const {
+                        value: 0x7fff_ffff_ffff_ffff_7fff_ffff_ffff_ffff,
+                    },
+                    &[],
+                    WT::V128,
+                );
+                let sat = self.op(O::V128Bitselect, &[mn, mx, neg], WT::V128);
+                self.op(O::V128Bitselect, &[sat, s, ovf], WT::V128)
+            };
+            self.set(f.dfg.inst_results(i)[0], v);
+            return;
+        }
+        // i8x16 has no mul: extend both halves to i16, mul, and shuffle
+        // the products' low bytes back together (wraparound = low byte).
+        if lane == clt::I8 && op == P::Imul {
+            let ae = self.op(O::I16x8ExtendLowI8x16U, &[a], WT::V128);
+            let be = self.op(O::I16x8ExtendLowI8x16U, &[b], WT::V128);
+            let ao = self.op(O::I16x8ExtendHighI8x16U, &[a], WT::V128);
+            let bo = self.op(O::I16x8ExtendHighI8x16U, &[b], WT::V128);
+            let pe = self.op(O::I16x8Mul, &[ae, be], WT::V128);
+            let po = self.op(O::I16x8Mul, &[ao, bo], WT::V128);
+            let mut lanes = [0u8; 16];
+            for i in 0..8u8 {
+                lanes[i as usize] = 2 * i;
+                lanes[8 + i as usize] = 16 + 2 * i;
+            }
+            let v = self.op(O::I8x16Shuffle { lanes }, &[pe, po], WT::V128);
+            self.set(f.dfg.inst_results(i)[0], v);
+            return;
+        }
         if op == P::IaddPairwise {
             // phadd-style: result lanes are x's adjacent pairs in the low
             // half, y's in the high half — shuffle evens and odds of each
