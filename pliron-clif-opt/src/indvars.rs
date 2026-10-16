@@ -1794,6 +1794,7 @@ fn edge_avail(
     func: &Function,
     ps: &FxHashMap<Value, Value>,
     na: &FxHashSet<Value>,
+    cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     loc: crate::loadfwd::Loc,
     e: &Edge,
@@ -1847,6 +1848,13 @@ fn edge_avail(
             }
         }
         upto = None;
+        // The idom chain is only the unique path to `e` when every block
+        // below the one holding the found access has a single
+        // predecessor — a merge could join a side path carrying a
+        // clobber this scan never sees.
+        if cfg.pred_iter(b).nth(1).is_some() {
+            return None;
+        }
         b = dt.idom(b)?;
     }
     None
@@ -2182,7 +2190,7 @@ fn rot_loop(
             for e in &edges {
                 if inb(func, e) {
                     es.push(None);
-                } else if let Some(v) = sloc.and_then(|l| edge_avail(func, ps, na, dt, l, e)) {
+                } else if let Some(v) = sloc.and_then(|l| edge_avail(func, ps, na, cfg, dt, l, e)) {
                     es.push(Some(Seed::V(v)));
                 } else if every && rot_edge_ok(func, dt, &bdec, e) {
                     es.push(Some(Seed::Load));
@@ -3339,6 +3347,89 @@ mod tests {
             .ins()
             .return_(&[]);
 
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(rotld(&mut func, &mut an), 0);
+        assert_eq!(func.dfg.block_params(h).len(), 1);
+    }
+
+    /// The seed scan must not reuse a dominating access across a merge:
+    /// `merge` joins an arm that clobbers `v[1]` with one that doesn't,
+    /// so the load's value no longer provably holds at the loop edge —
+    /// seeding `prev` from it would be stale on the storing arm.
+    #[test]
+    fn ldrot_refuses_seed_behind_merge() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let left = func.dfg.make_block();
+        let right = func.dfg.make_block();
+        let merge = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [entry, left, right, merge, h, body, latch, done] {
+            func.layout.append_block(b);
+        }
+        let base = func.dfg.append_block_param(entry, types::I64);
+        let len = func.dfg.append_block_param(entry, types::I64);
+        let i = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), base, 8);
+        let c0 = cur.ins().icmp_imm(IntCC::Equal, len, 0);
+        cur.ins().brif(c0, left, &[], right, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(left);
+        let nine = cur.ins().iconst(types::I64, 9);
+        cur.ins()
+            .store(MemFlagsData::new().with_notrap(), nine, base, 8);
+        cur.ins().jump(merge, &[]);
+
+        FuncCursor::new(&mut func)
+            .at_bottom(right)
+            .ins()
+            .jump(merge, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(merge);
+        let two = cur.ins().iconst(types::I64, 2);
+        cur.ins().jump(h, &[two.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let g = cur.ins().icmp(IntCC::UnsignedLessThan, i, len);
+        cur.ins().brif(g, body, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let eight = cur.ins().iconst(types::I64, 8);
+        let off = cur.ins().imul(i, eight);
+        let a_cur = cur.ins().iadd(base, off);
+        let one = cur.ins().iconst(types::I64, 1);
+        let im1 = cur.ins().isub(i, one);
+        let off2 = cur.ins().imul(im1, eight);
+        let a_prev = cur.ins().iadd(base, off2);
+        let _la = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), a_cur, 0);
+        let lb = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), a_prev, 0);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, lb, i);
+        cur.ins().brif(c, latch, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        let i2 = cur.ins().iadd(i, one);
+        cur.ins().jump(h, &[i2.into()]);
+
+        FuncCursor::new(&mut func)
+            .at_bottom(done)
+            .ins()
+            .return_(&[]);
+
+        // `body` doesn't run every iteration (its exit to `done` isn't
+        // dominated by it), so `Seed::Load` is also out: no rotation.
         let mut an = crate::pipeline::Analysis::default();
         assert_eq!(rotld(&mut func, &mut an), 0);
         assert_eq!(func.dfg.block_params(h).len(), 1);
