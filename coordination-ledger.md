@@ -1577,3 +1577,35 @@ optional-in-practice attrs (`llvm_nneg_flag`, `llvm_fast_math_flags`,
 - Reminder: samply inclusive attribution misleads when callees inline —
   s_mergechain showed 1634 samples but PLIRON_JT_PROF2 sub-phases sum to
   ~356ms; trust PLIRON_TIMING for step ranking, samply for leaf frames.
+
+## 2026-10-16 batch: carry_one/slp-Uses/callgvn/ifconv (devin 761f9fa8, cont.)
+- `8b9f81f` pipeline::carry_one: the site-fact coverage check
+  (try_value_def x2 + pp_block + pp_cmp per carried pair) now runs only
+  when `d` actually has a derived/nonnull fact — two hash probes first.
+  carry_one was ~650 leaf samples on the bench samply profile.
+- `3d15f19` slp: Uses map is now CSR (u32 offsets + flat Vec<Inst> +
+  tombstone `dead` set for applied packs) — vec![SmallVec; num_values]
+  init + per-value spill allocs were ~2k samples. Removal is
+  dead.insert(i) — no per-list retain walk. slp 1.6-2.3s -> ~1.5-1.8s.
+- `1483c45` callgvn: per-op `writes` cached in op_writes (was recomputed
+  for writes_blk, the dedup scan, and every writes_between range query);
+  dedup tables keyed by u64 hash + bucketed (c,args) instead of
+  String+Vec clone per lookup; `dedupable` memoized per (op, inv) across
+  all three passes. callgvn+callgvn2 ~1.1s samply -> ~713ms timing.
+- `af45cb4` ifconv: the scan rescans to fixpoint INSIDE run() — cfg/
+  domtree/msets/preds-deltas carry across rounds (deltas are idempotent
+  vs a recomputed cfg). s_ifconv2's outer 8x loop removed; jumpthread's
+  per-iteration `ifconv::run` now gets full fixpoint per call.
+  ifconv2 step ~505 -> ~442ms. NOTE: this commit also contains the
+  user's PLIRON_GIANT_MAX bail (was sitting uncommitted in pipeline.rs;
+  swept in by the hunk staging — intentional retention, it compiles and
+  passed the bench run).
+- Latest bench snapshot (still noisy, machine shared): pipeline 9.9s,
+  jumpthread 2.1s, slp 1.56s, ifconv2 442ms, loadfwd 386ms, mergechain
+  357ms, unroll 310ms, sameargs2 305ms, edgespec 299ms; total ~20.3s.
+- Still open: jumpthread remains the whale (~2.1s; nn+round ~1.1s of
+  it); linked_list::Iter::next ~1.4k leaf samples is structural
+  per-node RefCell borrow — only reducible by walking fewer ops;
+  clifpeep.rs is owned by another agent (dirty worktree) — webmerge_ctx
+  /khash_m/subtree_hashes ~1.1k samples are theirs to profile;
+  emit-side lower_to_object/FnLower::lower ~3s incl. Context::compile.
