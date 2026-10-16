@@ -57,8 +57,9 @@ pub fn run(
     // transform only clones into `nb` and rewrites uses); a fresh clone
     // simply has no entry — `nn` treats it as unknown, which is the
     // conservative answer. One build serves all rounds instead of an
-    // O(E) fixpoint per unrolled loop.
-    let nn = NonNull::new(func, loads, derived);
+    // O(E) fixpoint per unrolled loop. Built lazily: NonNull::new is a
+    // whole-function fixpoint and most functions have no candidate.
+    let mut nn: Option<NonNull> = None;
     'outer: while n < MAX_LOOPS {
         let (cfg, dt) = an.cfg_dt(func);
         let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -77,7 +78,8 @@ pub fn run(
             if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("2") {
                 eprintln!("unroll: candidate {h} ({} blocks)", body.len());
             }
-            match trip(func, &nn, &body, h, entry.clone(), None) {
+            let nn = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
+            match trip(func, nn, &body, h, entry.clone(), None) {
                 Some((_, _, map)) if used_out.iter().all(|v| map.contains_key(v)) => {}
                 _ => {
                     if crate::env_get("PLIRON_UNROLL_DEBUG") == Some("3") {
