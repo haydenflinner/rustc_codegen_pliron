@@ -802,6 +802,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
     let _pgiro = cx.tcx.sess.prof.generic_activity("pliron_iropt");
+    let tiro = std::time::Instant::now();
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
         let wasm = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32;
@@ -1029,6 +1030,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
     }
     drop(_siro);
+    pliron_cfg::trace("*iropt*", tiro.elapsed().as_secs_f64() * 1e3, name);
     if crate::env_set("PLIRON_DUMP_OPT") {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", cx.print_ir())
