@@ -74,7 +74,7 @@ impl ConstantOp {
             0,
         );
         op.deref_mut(ctx)
-            .attributes
+            .attributes()
             .0
             .insert(constant_op::ATTR_KEY_VALUE.clone(), Box::new(int_attr));
         ConstantOp { op }
@@ -82,7 +82,7 @@ impl ConstantOp {
 
     pub fn get_value(&self, ctx: &Context) -> AttrObj {
         let op = self.get_operation().deref(ctx);
-        op.attributes
+        op.attributes()
             .0
             .get(&constant_op::ATTR_KEY_VALUE)
             .unwrap()

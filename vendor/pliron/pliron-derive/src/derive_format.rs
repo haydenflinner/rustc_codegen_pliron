@@ -407,7 +407,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             {
                 let name = ::pliron::ident!(#attr_name);
                 let self_op = self.get_operation().deref(ctx);
-                let attr = self_op.attributes.get_obj(ctx, &name).expect(&#missing_attr_err);
+                let attr = self_op.attributes().get_obj(ctx, &name).expect(&#missing_attr_err);
                 if ::pliron::attribute::attr_should_outline(&**attr, ctx) {
                     write!(fmt, "{}", ::pliron::irfmt::outlined::OUTLINED_ATTR_MARKER)?;
                 } else {
@@ -506,7 +506,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
 
             res.extend(quote! {
                 let self_op = self.get_operation().deref(ctx);
-                let attr = self_op.attributes.get::<#attr_type>(
+                let attr = self_op.attributes().get::<#attr_type>(
                     ctx,
                     &::pliron::ident!(#attr_dict_key)
                 );
@@ -671,7 +671,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
         } else if d.name == "attr_dict" {
             Ok(quote! {
                 let self_op = self.get_operation().deref(ctx);
-                let attrs = self_op.attributes.clone_skip_outlined(ctx);
+                let attrs = self_op.attributes().clone_skip_outlined(ctx);
                 ::pliron::printable::Printable::fmt(&attrs, ctx, state, fmt)?;
             })
         } else {
@@ -1265,7 +1265,7 @@ impl ParsableBuilder<OpParserState> for DeriveOpParsable {
                     attribute_sets.extend(quote! {
                         // `None` is either an `opt_attr` or an outlined attribute.
                         if let Some(#attr_ident) = #attr_ident {
-                            op.deref_mut(state_stream.state.ctx).attributes.set_obj(
+                            op.deref_mut(state_stream.state.ctx).attributes_mut().set_obj(
                                 state_stream.state.ctx,
                                 ::pliron::ident!(#attr_name),
                                 #attr_ident,
@@ -1276,7 +1276,7 @@ impl ParsableBuilder<OpParserState> for DeriveOpParsable {
             }
             ElementSpec::All(attr_sets_name) => {
                 attribute_sets = quote! {
-                    op.deref_mut(state_stream.state.ctx).attributes = #attr_sets_name;
+                    *op.deref_mut(state_stream.state.ctx).attributes_mut() = #attr_sets_name;
                 }
             }
         }

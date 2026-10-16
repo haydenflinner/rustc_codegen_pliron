@@ -965,7 +965,7 @@ fn test_outline_attr() -> Result<()> {
     let op = ConstantOp::new(ctx, 42);
     op.get_operation()
         .deref_mut(ctx)
-        .attributes
+        .attributes()
         .0
         .insert(ident!("test_attr"), Box::new(attr));
 
@@ -1017,12 +1017,12 @@ fn test_outline_printonce_attr() -> Result<()> {
     let op44 = ConstantOp::new(ctx, 44);
     op42.get_operation()
         .deref_mut(ctx)
-        .attributes
+        .attributes()
         .0
         .insert(ident!("test_print_once_attr"), Box::new(attr.clone()));
     op44.get_operation()
         .deref_mut(ctx)
-        .attributes
+        .attributes()
         .0
         .insert(ident!("test_print_once_attr"), Box::new(attr));
 
@@ -1115,7 +1115,7 @@ fn test_outline_attr_canonical_op() -> Result<()> {
     let op = CanonicalOp::new(ctx);
     op.get_operation()
         .deref_mut(ctx)
-        .attributes
+        .attributes()
         .0
         .insert(ident!("test_attr"), Box::new(attr));
 
@@ -1151,7 +1151,7 @@ fn test_outline_attr_on_block() -> Result<()> {
     let entry_block = func_op.get_entry_block(ctx);
     entry_block
         .deref_mut(ctx)
-        .attributes
+        .attributes()
         .0
         .insert(ident!("test_attr"), Box::new(attr));
 

@@ -2952,7 +2952,7 @@ impl Printable for GlobalOp {
 
         // Print attributes except for type, initializer and symbol name.
         let mut attributes_to_print_separately =
-            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+            self.op.deref(ctx).attributes().clone_skip_outlined(ctx);
         attributes_to_print_separately.0.retain(|key, _| {
             key != &ATTR_KEY_LLVM_GLOBAL_TYPE
                 && key != &ATTR_KEY_SYM_NAME
@@ -3008,7 +3008,7 @@ impl Parsable for GlobalOp {
         let op = GlobalOp::new(state_stream.state.ctx, name, ty);
         op.get_operation()
             .deref_mut(state_stream.state.ctx)
-            .attributes
+            .attributes_mut()
             .0
             .extend(attr_dict.0);
 
@@ -4881,7 +4881,7 @@ impl Printable for FuncOp {
 
         // Print attributes except for function type and symbol name.
         let mut attributes_to_print_separately =
-            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+            self.op.deref(ctx).attributes().clone_skip_outlined(ctx);
         attributes_to_print_separately
             .0
             .retain(|key, _| key != &ATTR_KEY_LLVM_FUNC_TYPE && key != &ATTR_KEY_SYM_NAME);
@@ -4938,7 +4938,7 @@ impl Parsable for FuncOp {
             .parse_stream(state_stream)
             .map(|(fname, fty, attrs, _region)| -> OpObj {
                 let ctx = &mut state_stream.state.ctx;
-                op.deref_mut(ctx).attributes = attrs;
+                *op.deref_mut(ctx).attributes_mut() = attrs;
                 let ty_attr = TypeAttr::new(fty);
                 let opop = FuncOp { op };
                 opop.set_symbol_name(ctx, fname);

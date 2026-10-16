@@ -1008,7 +1008,7 @@ fn parse_function_with_attrs() -> Result<()> {
         .deref(ctx)
         .get_parent_op(ctx)
         .unwrap();
-    func_op.deref_mut(ctx).attributes.set(
+    func_op.deref_mut(ctx).attributes_mut().set(
         ctx,
         ATTR_KEY_TEST_ON_FUNC_VALUE.clone(),
         StringAttr::new("func_attr_value".into()),
@@ -1528,7 +1528,7 @@ fn block_inline_attrs_print() -> Result<()> {
     let entry_block = func_op.get_entry_block(ctx);
 
     // Set an inline attribute on the block
-    entry_block.deref_mut(ctx).attributes.set(
+    entry_block.deref_mut(ctx).attributes_mut().set(
         ctx,
         ATTR_KEY_BLOCK_TEST.clone(),
         StringAttr::new("test_value".into()),
@@ -1590,11 +1590,11 @@ fn block_multiple_inline_attrs() -> Result<()> {
     // Set multiple inline attributes on the function's entry block
     func_entry_block
         .deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ident!("attr1"), StringAttr::new("value1".into()));
     func_entry_block
         .deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ident!("attr2"), StringAttr::new("value2".into()));
 
     let printed = format!("{}", module_op.disp(ctx));

@@ -137,7 +137,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
             successors,
             op_ref.get_num_operands(),
             op_ref.num_regions(),
-            op_ref.attributes.clone(),
+            op_ref.attributes().clone(),
             op_ref.loc(),
         )
     };
@@ -153,7 +153,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     );
     {
         let mut new_ref = new_op.deref_mut(ctx);
-        new_ref.attributes = attributes;
+        *new_ref.attributes_mut() = attributes;
         new_ref.set_loc(loc);
     }
 
@@ -241,7 +241,7 @@ pub fn clone_blocks_into(
             (
                 arg_types,
                 block_ref.label.clone(),
-                block_ref.attributes.clone(),
+                block_ref.attributes().clone(),
                 block_ref.loc(),
             )
         };
@@ -254,7 +254,7 @@ pub fn clone_blocks_into(
 
         {
             let mut new_ref = new_block.deref_mut(ctx);
-            new_ref.attributes = attrs;
+            *new_ref.attributes_mut() = attrs;
             new_ref.set_loc(loc);
         }
 

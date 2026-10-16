@@ -93,7 +93,7 @@ impl Printable for ModuleOp {
         symb_op_header(self).fmt(ctx, state, f)?;
         write!(f, " ")?;
         let mut attributes_to_print_separately =
-            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+            self.op.deref(ctx).attributes().clone_skip_outlined(ctx);
         attributes_to_print_separately
             .0
             .retain(|key, _| key != &ATTR_KEY_SYM_NAME);
@@ -137,7 +137,7 @@ impl Parsable for ModuleOp {
             .parse_stream(state_stream)
             .map(|(name, attributes, _region)| -> OpObj {
                 let ctx = &mut state_stream.state.ctx;
-                op.deref_mut(ctx).attributes = attributes.unwrap_or_default();
+                *op.deref_mut(ctx).attributes_mut() = attributes.unwrap_or_default();
                 let opop = ModuleOp { op };
                 opop.set_symbol_name(ctx, name);
                 OpObj::new(opop)
@@ -228,7 +228,7 @@ impl Printable for FuncOp {
         typed_symb_op_header(self).fmt(ctx, state, f)?;
         write!(f, " ")?;
         let mut attributes_to_print_separately =
-            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+            self.op.deref(ctx).attributes().clone_skip_outlined(ctx);
         attributes_to_print_separately
             .0
             .retain(|key, _| key != &ATTR_KEY_BUILTIN_FUNC_TYPE && key != &ATTR_KEY_SYM_NAME);
@@ -277,7 +277,7 @@ impl Parsable for FuncOp {
             .parse_stream(state_stream)
             .map(|(fname, fty, attributes, _region)| -> OpObj {
                 let ctx = &mut state_stream.state.ctx;
-                op.deref_mut(ctx).attributes = attributes.unwrap_or_default();
+                *op.deref_mut(ctx).attributes_mut() = attributes.unwrap_or_default();
                 let ty_attr = TypeAttr::new(fty);
                 let opop = FuncOp { op };
                 opop.set_symbol_name(ctx, fname);

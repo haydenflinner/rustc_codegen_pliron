@@ -438,7 +438,7 @@ pub fn canonical_syntax_print(
         opid.print(ctx, state),
         operands.print(ctx, state),
         successors.print(ctx, state),
-        op.attributes.clone_skip_outlined(ctx).print(ctx, state),
+        op.attributes().clone_skip_outlined(ctx).print(ctx, state),
         op_type.print(ctx, state),
     )?;
 
@@ -522,7 +522,7 @@ fn canonical_syntax_parse_impl<'a>(
                         successors.clone(),
                         0,
                     );
-                    opr.deref_mut(ctx).attributes = attr_dict.clone();
+                    *opr.deref_mut(ctx).attributes_mut() = attr_dict.clone();
                     process_parsed_ssa_defs(parsable_state, &results, opr)?;
                     Ok(opr).into_parse_result()
                 })

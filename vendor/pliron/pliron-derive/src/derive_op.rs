@@ -268,12 +268,12 @@ pub(crate) fn derive_attr_get_set(
                 pub fn #fn_name_get<'a>(&self, ctx: &'a ::pliron::context::Context)
                     -> Option<&'a #ty>
                 {
-                    self.op.deref(ctx).attributes.get::<#ty>(ctx, &#module_name::#attr_name_const)
+                    self.op.deref(ctx).attributes().get::<#ty>(ctx, &#module_name::#attr_name_const)
                 }
 
                 #[doc = #fn_comment_set]
                 pub fn #fn_name_set(&self, ctx: &::pliron::context::Context, value: #ty) {
-                    self.op.deref_mut(ctx).attributes.set(ctx, #module_name::#attr_name_const.clone(), value);
+                    self.op.deref_mut(ctx).attributes_mut().set(ctx, #module_name::#attr_name_const.clone(), value);
                 }
             }
         } else {
@@ -283,7 +283,7 @@ pub(crate) fn derive_attr_get_set(
                 pub fn #fn_name_get<'a>(&self, ctx: &'a ::pliron::context::Context)
                     -> Option<&'a ::pliron::attribute::AttrObj>
                 {
-                    self.op.deref(ctx).attributes.get_obj(ctx, &#module_name::#attr_name_const)
+                    self.op.deref(ctx).attributes().get_obj(ctx, &#module_name::#attr_name_const)
                 }
 
                 #[doc = #fn_comment_set]
@@ -291,7 +291,7 @@ pub(crate) fn derive_attr_get_set(
                     (&self, ctx: &::pliron::context::Context,
                     value: ::pliron::attribute::AttrObj)
                 {
-                    self.op.deref_mut(ctx).attributes
+                    self.op.deref_mut(ctx).attributes_mut()
                         .set_obj(ctx, #module_name::#attr_name_const.clone(), value);
                 }
             }

@@ -152,6 +152,19 @@ impl BasicBlock {
         newblock
     }
 
+    /// PLIRON: attribute dictionary accessor. Prefer this over direct
+    /// `.attributes` field reads so the backing store can change shape.
+    #[inline]
+    pub fn attributes(&self) -> &crate::attribute::AttributeDict {
+        &self.attributes
+    }
+
+    /// PLIRON: mutable attribute dictionary accessor.
+    #[inline]
+    pub fn attributes_mut(&mut self) -> &mut crate::attribute::AttributeDict {
+        &mut self.attributes
+    }
+
     /// Set the block's label.
     /// This corresponds to the [given_name](Named::given_name) of this block.
     pub fn set_label(&mut self, label: Option<Identifier>) {
@@ -400,7 +413,7 @@ impl Verify for BasicBlock {
         {
             verify_err!(self.loc(), BasicBlockVerifyErr::MissingTerminator(label))?;
         }
-        self.attributes
+        self.attributes()
             .iter(ctx)
             .try_for_each(|(_, attr)| verify_attr(&**attr, ctx))?;
         // Check that every use is of this block.
@@ -462,7 +475,7 @@ impl Printable for BasicBlock {
         )?;
 
         // Print non-outlined attributes inline.
-        let inline_attrs = self.attributes.clone_skip_outlined(ctx);
+        let inline_attrs = self.attributes().clone_skip_outlined(ctx);
         if !inline_attrs.0.is_empty() {
             write!(f, " ")?;
             inline_attrs.fmt(ctx, state, f)?;
@@ -531,7 +544,7 @@ impl Parsable for BasicBlock {
 
         // Set seen attributes.
         if let Some(attrs) = attrs_opt {
-            block.deref_mut(state_stream.state.ctx).attributes = attrs;
+            *block.deref_mut(state_stream.state.ctx).attributes_mut() = attrs;
         }
 
         for (arg_idx, (arg_loc, name)) in arg_names.into_iter().enumerate() {

@@ -89,7 +89,7 @@ pub(crate) fn preprint_outline_operation(
 
     // Check if there's any attribute that's outlined.
     if op
-        .attributes
+        .attributes()
         .iter(ctx)
         .any(|(_, attr)| attr_should_outline(&**attr, ctx))
     {
@@ -127,7 +127,7 @@ pub(crate) fn preprint_outline_block(
 
     // Check if there's any attribute that's outlined.
     if bl
-        .attributes
+        .attributes()
         .iter(ctx)
         .any(|(_, attr)| attr_should_outline(&**attr, ctx))
     {
@@ -212,7 +212,7 @@ pub(crate) fn print_outlines(
                     f,
                     &mut outline_state.print_once_attrs,
                     &mut print_once_attr_indices,
-                    &opr.attributes,
+                    opr.attributes(),
                     opr.loc(),
                 )?;
             }
@@ -224,7 +224,7 @@ pub(crate) fn print_outlines(
                     f,
                     &mut outline_state.print_once_attrs,
                     &mut print_once_attr_indices,
-                    &bl.attributes,
+                    bl.attributes(),
                     bl.loc(),
                 )?;
             }
@@ -431,13 +431,13 @@ pub(crate) fn parse_outlines(state_stream: &mut StateStream) -> Result<()> {
                 match attr_or_ref {
                     AttrOrOutlineEntryRef::Attr(attr) => {
                         opr.deref_mut(state_stream.state.ctx)
-                            .attributes
+                            .attributes_mut()
                             .set_obj(state_stream.state.ctx, name, attr);
                     }
                     AttrOrOutlineEntryRef::OutlineEntryRef((ref_outindex_loc, ref_outindex)) => {
                         if let Some(attr) = print_once_entries.get(&ref_outindex) {
                             opr.deref_mut(state_stream.state.ctx)
-                                .attributes
+                                .attributes_mut()
                                 .set_obj(state_stream.state.ctx, name, attr.clone());
                         } else {
                             return input_err!(
@@ -458,14 +458,14 @@ pub(crate) fn parse_outlines(state_stream: &mut StateStream) -> Result<()> {
                     AttrOrOutlineEntryRef::Attr(attr) => {
                         block
                             .deref_mut(state_stream.state.ctx)
-                            .attributes
+                            .attributes_mut()
                             .set_obj(state_stream.state.ctx, name, attr);
                     }
                     AttrOrOutlineEntryRef::OutlineEntryRef((ref_outindex_loc, ref_outindex)) => {
                         if let Some(attr) = print_once_entries.get(&ref_outindex) {
                             block
                                 .deref_mut(state_stream.state.ctx)
-                                .attributes
+                                .attributes_mut()
                                 .set_obj(state_stream.state.ctx, name, attr.clone());
                         } else {
                             return input_err!(

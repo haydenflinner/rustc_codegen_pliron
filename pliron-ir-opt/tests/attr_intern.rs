@@ -147,8 +147,8 @@ fn given_names_are_copy_on_write() {
     set_operation_result_name(ctx, b, 0, Some(ident!("x")));
     // Same names → the two ops share the deduped GivenNamesAttr.
     assert_eq!(
-        a.deref(ctx).attributes.get_id(&key),
-        b.deref(ctx).attributes.get_id(&key)
+        a.deref(ctx).attributes().get_id(&key),
+        b.deref(ctx).attributes().get_id(&key)
     );
 
     // Renaming `a` must not rename `b`.
@@ -159,6 +159,6 @@ fn given_names_are_copy_on_write() {
     // Removing a's name leaves b's intact and drops a's attr entirely.
     remove_operation_result_name(ctx, a, 0);
     assert_eq!(get_operation_result_name(ctx, a, 0), None);
-    assert!(a.deref(ctx).attributes.get_id(&key).is_none());
+    assert!(a.deref(ctx).attributes().get_id(&key).is_none());
     assert_eq!(get_operation_result_name(ctx, b, 0), Some(ident!("x")));
 }

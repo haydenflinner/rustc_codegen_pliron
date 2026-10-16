@@ -178,7 +178,7 @@ fn op_eq_map(
         return EqResult::FirstNEQOps((lhs, rhs));
     }
 
-    if !attributes_eq(ctx, ignore_config, &lhs_ref.attributes, &rhs_ref.attributes) {
+    if !attributes_eq(ctx, ignore_config, lhs_ref.attributes(), rhs_ref.attributes()) {
         return EqResult::FirstNEQOps((lhs, rhs));
     }
 
@@ -356,7 +356,7 @@ fn block_eq_map(
         return EqResult::FirstNEQBlocks((lhs, rhs));
     }
 
-    if !attributes_eq(ctx, ignore_config, &lhs_ref.attributes, &rhs_ref.attributes) {
+    if !attributes_eq(ctx, ignore_config, lhs_ref.attributes(), rhs_ref.attributes()) {
         return EqResult::FirstNEQBlocks((lhs, rhs));
     }
 
@@ -464,7 +464,7 @@ fn hash_op_shell(
             op_ref.loc().stable_hash(ctx, state);
         }
 
-        attributes_hash(ctx, ignore_config, &op_ref.attributes, state);
+        attributes_hash(ctx, ignore_config, op_ref.attributes(), state);
 
         for res in op_ref.results() {
             res.get_type(ctx).stable_hash(ctx, state);
@@ -525,7 +525,7 @@ fn hash_block_shell(
             block_ref.loc().stable_hash(ctx, state);
         }
 
-        attributes_hash(ctx, ignore_config, &block_ref.attributes, state);
+        attributes_hash(ctx, ignore_config, block_ref.attributes(), state);
 
         for arg in block_ref.arguments() {
             arg.get_type(ctx).stable_hash(ctx, state);

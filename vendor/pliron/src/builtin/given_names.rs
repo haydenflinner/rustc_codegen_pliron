@@ -95,7 +95,7 @@ pub fn set_operation_result_name(
     let num_results = op.get_num_results();
     assert!(res_idx < num_results);
 
-    set_name_in_attr_map(ctx, &mut op.attributes, res_idx, name);
+    set_name_in_attr_map(ctx, op.attributes_mut(), res_idx, name);
 }
 
 /// Insert a name for a result in an [Operation] at the given index,
@@ -111,7 +111,7 @@ pub fn insert_operation_result_name(
     let num_results = op.get_num_results();
     assert!(res_idx <= num_results);
 
-    insert_name_in_attr_map(ctx, &mut op.attributes, res_idx, name);
+    insert_name_in_attr_map(ctx, op.attributes_mut(), res_idx, name);
 }
 
 /// Remove the name for a result in an [Operation] at the given index,
@@ -122,7 +122,7 @@ pub fn remove_operation_result_name(ctx: &Context, op: Ptr<Operation>, res_idx: 
     let num_results = op.get_num_results();
     assert!(res_idx < num_results);
 
-    remove_name_from_attr_map(ctx, &mut op.attributes, res_idx);
+    remove_name_from_attr_map(ctx, op.attributes_mut(), res_idx);
 }
 
 /// Get name for a result in an [Operation].
@@ -132,7 +132,7 @@ pub fn get_operation_result_name(
     res_idx: usize,
 ) -> Option<Identifier> {
     let op = &*op.deref(ctx);
-    get_name_from_attr_map(ctx, &op.attributes, res_idx)
+    get_name_from_attr_map(ctx, op.attributes(), res_idx)
 }
 
 /// Set the name for an argument in a [BasicBlock].
@@ -147,7 +147,7 @@ pub fn set_block_arg_name(
     let num_args = block.get_num_arguments();
     assert!(arg_idx < num_args);
 
-    set_name_in_attr_map(ctx, &mut block.attributes, arg_idx, name);
+    set_name_in_attr_map(ctx, block.attributes_mut(), arg_idx, name);
 }
 
 /// Insert a name for an argument in a [BasicBlock] at the given index,
@@ -163,7 +163,7 @@ pub fn insert_block_arg_name(
     let num_args = block.get_num_arguments();
     assert!(arg_idx <= num_args);
 
-    insert_name_in_attr_map(ctx, &mut block.attributes, arg_idx, name);
+    insert_name_in_attr_map(ctx, block.attributes_mut(), arg_idx, name);
 }
 
 /// Remove the name for an argument in a [BasicBlock] at the given index,
@@ -174,7 +174,7 @@ pub fn remove_block_arg_name(ctx: &Context, block: Ptr<BasicBlock>, arg_idx: usi
     let num_args = block.get_num_arguments();
     assert!(arg_idx < num_args);
 
-    remove_name_from_attr_map(ctx, &mut block.attributes, arg_idx);
+    remove_name_from_attr_map(ctx, block.attributes_mut(), arg_idx);
 }
 
 /// Get name for an argument in a [BasicBlock].
@@ -184,7 +184,7 @@ pub fn get_block_arg_name(
     arg_idx: usize,
 ) -> Option<Identifier> {
     let block = &*block.deref(ctx);
-    get_name_from_attr_map(ctx, &block.attributes, arg_idx)
+    get_name_from_attr_map(ctx, block.attributes(), arg_idx)
 }
 
 /// Recursively erase every [given_name](crate::common_traits::Named::given_name)

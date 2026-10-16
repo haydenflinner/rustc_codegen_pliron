@@ -196,6 +196,19 @@ impl Operation {
         newop
     }
 
+    /// PLIRON: attribute dictionary accessor. Prefer this over direct
+    /// `.attributes` field reads so the backing store can change shape.
+    #[inline]
+    pub fn attributes(&self) -> &crate::attribute::AttributeDict {
+        &self.attributes
+    }
+
+    /// PLIRON: mutable attribute dictionary accessor.
+    #[inline]
+    pub fn attributes_mut(&mut self) -> &mut crate::attribute::AttributeDict {
+        &mut self.attributes
+    }
+
     /// Get parent block.
     pub fn get_parent_block(&self) -> Option<Ptr<BasicBlock>> {
         self.block_links.parent_block
@@ -811,7 +824,7 @@ pub fn verify_operation(opr: Ptr<Operation>, ctx: &Context) -> Result<()> {
 impl Verify for Operation {
     fn verify(&self, ctx: &Context) -> Result<()> {
         fn verify_inner(opr: &Operation, ctx: &Context) -> Result<()> {
-            opr.attributes
+            opr.attributes()
                 .iter(ctx)
                 .try_for_each(|(_, attr)| verify_attr(&**attr, ctx))?;
             opr.operands

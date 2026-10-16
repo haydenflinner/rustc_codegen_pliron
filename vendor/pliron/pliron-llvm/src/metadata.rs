@@ -578,7 +578,7 @@ pub fn get_metadata_table(ctx: &Context, module_op: ModuleOp) -> Option<MdTableA
     module_op
         .get_operation()
         .deref(ctx)
-        .attributes
+        .attributes()
         .get::<MdTableAttr>(ctx, &ATTR_KEY_MD_TABLE)
         .cloned()
 }
@@ -588,7 +588,7 @@ pub fn set_metadata_table(ctx: &Context, module_op: ModuleOp, table: MdTableAttr
     module_op
         .get_operation()
         .deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ctx, ATTR_KEY_MD_TABLE.clone(), table);
 }
 
@@ -597,7 +597,7 @@ pub fn get_named_metadata(ctx: &Context, module_op: ModuleOp) -> Option<NamedMdA
     module_op
         .get_operation()
         .deref(ctx)
-        .attributes
+        .attributes()
         .get::<NamedMdAttr>(ctx, &ATTR_KEY_NAMED_MD)
         .cloned()
 }
@@ -607,14 +607,14 @@ pub fn set_named_metadata(ctx: &Context, module_op: ModuleOp, named: NamedMdAttr
     module_op
         .get_operation()
         .deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ctx, ATTR_KEY_NAMED_MD.clone(), named);
 }
 
 /// Get the metadata attached to `op`.
 pub fn get_attachments(ctx: &Context, op: Ptr<Operation>) -> Option<MdAttachmentsAttr> {
     op.deref(ctx)
-        .attributes
+        .attributes()
         .get::<MdAttachmentsAttr>(ctx, &ATTR_KEY_MD_ATTACHMENTS)
         .cloned()
 }
@@ -622,7 +622,7 @@ pub fn get_attachments(ctx: &Context, op: Ptr<Operation>) -> Option<MdAttachment
 /// Attach `attachments` to `op`, replacing whatever was attached to it.
 pub fn set_attachments(ctx: &Context, op: Ptr<Operation>, attachments: MdAttachmentsAttr) {
     op.deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ctx, ATTR_KEY_MD_ATTACHMENTS.clone(), attachments);
 }
 
