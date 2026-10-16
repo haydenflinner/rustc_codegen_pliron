@@ -88,7 +88,7 @@ def main():
     ]:
         gen(out, lib, os.path.join(SYS32, dll))
 
-    # synchronization.lib â€” the WinSDK lib mapping WaitOnAddress etc. onto
+    # synchronization.lib — the WinSDK lib mapping WaitOnAddress etc. onto
     # api-ms-win-core-synch-l1-2-0.dll (no real file; forwarders only).
     api = "API-MS-WIN-CORE-SYNCH-L1-2-0"
     sync = os.path.join(out, "synchronization.def")

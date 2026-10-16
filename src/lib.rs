@@ -276,7 +276,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let flags = settings::Flags::new(fb);
     let mut isa = cranelift_codegen::isa::lookup(triple.clone())
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
-    // Target features â†’ ISA flags. `sess.internal_target_features` holds the
+    // Target features → ISA flags. `sess.internal_target_features` holds the
     // effective set (spec baseline + `-Ctarget-cpu` + `-Ctarget-feature`).
     let tf = |rust: &str| {
         sess.internal_target_features
@@ -296,7 +296,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         // resulting ISA flags per function; `WIDE_VECTOR_BITS` tracks the
         // ceiling). `PLIRON_X64_VEX=0` opts out -- e.g. under Rosetta, where
         // VEX-128 encodings translate ~2x slower than legacy SSE.
-        // BMI1/BMI2 stay: GPR VEX (mulx/shlx/â€¦) measures fast under Rosetta.
+        // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
         target_lexicon::Architecture::X86_64 => &[
             ("sse3", "has_sse3"),
             ("ssse3", "has_ssse3"),
@@ -349,7 +349,7 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         } else {
             128
         };
-        // The vendored static only exists with the `x86` codegen feature â€”
+        // The vendored static only exists with the `x86` codegen feature —
         // `host-arch` gives it on x86 hosts (the only hosts x64 targets
         // build on today; all-arch cross would need a different gate).
         #[cfg(target_arch = "x86_64")]
@@ -853,7 +853,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         }
         // Emulated EH (wasm, COFF) unwinds through ordinary calls the body
         // scan can't see -- `llvm.wasm.throw`-class entries are declared
-        // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp â€”
+        // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp —
         // so nounwind.rs models them explicitly (THROWS + the rethrow check).
         // On COFF the inference also lets lowering skip the flag check after
         // calls that can't throw.
@@ -907,7 +907,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                 let (sites, owners) = pt!(cx, "devirt", inline::devirt(ctx, st));
                 pt!(cx, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
                 if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
-                    // Passes since the inline rounds may have moved calls â€”
+                    // Passes since the inline rounds may have moved calls —
                     // rebuild the adjacency fresh.
                     adj = None;
                     pt!(
@@ -1118,13 +1118,13 @@ fn native_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool
         _ => false,
     }
 }
-/// rustc `-Ctarget-cpu` names â†’ feature sets, for the cpus whose properties
+/// rustc `-Ctarget-cpu` names → feature sets, for the cpus whose properties
 /// feed cranelift lowering. Only entries we can state confidently go here;
 /// anything else falls back to the spec baseline.
 fn cpu_features(cpu: &str) -> &'static [&'static str] {
-    // x86-64 psABI levels: each arm lists entry-point features only â€”
+    // x86-64 psABI levels: each arm lists entry-point features only —
     // `internal_target_features` expands the implied closure
-    // (avx2 â†’ avx â†’ sse4.2 â†’ â€¦ â†’ sse2), so the v2 non-SIMD extras are the
+    // (avx2 → avx → sse4.2 → … → sse2), so the v2 non-SIMD extras are the
     // only ones repeated per tier.
     const X64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse4.2"];
     const X64_AVX: &[&str] = &["avx", "cmpxchg16b", "lahfsahf", "popcnt"];
@@ -1197,7 +1197,7 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         // AVX without AVX2: Sandy Bridge/Ivy Bridge and the matching AMD.
         "sandybridge" | "corei7-avx" | "ivybridge" | "core-avx-i" | "bdver1" | "bdver2"
         | "btver2" => X64_AVX,
-        // AVX2-class (v3): Haswell onward, Zen 1â€“3, recent E-cores.
+        // AVX2-class (v3): Haswell onward, Zen 1–3, recent E-cores.
         "x86-64-v3" | "haswell" | "core-avx2" | "broadwell" | "skylake" | "kabylake"
         | "coffeelake" | "cometlake" | "whiskeylake" | "amberlake" | "alderlake" | "raptorlake"
         | "meteorlake" | "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake"
