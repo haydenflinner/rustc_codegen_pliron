@@ -8865,6 +8865,7 @@ impl<'o, 'a> CX<'o, 'a> {
                             | P::Iabs
                             | P::Clz
                             | P::Ctz
+                            | P::CtzNonzero
                             | P::Popcnt
                             | P::Bswap
                             | P::Bitrev
@@ -8981,7 +8982,8 @@ impl<'o, 'a> CX<'o, 'a> {
                         let v = self.op(o, &[a], wt);
                         self.set(f.dfg.inst_results(i)[0], v);
                     }
-                    P::Clz | P::Ctz | P::Popcnt | P::Bswap | P::Bitrev | P::Cls => {
+                    P::Clz | P::Ctz | P::CtzNonzero | P::Popcnt | P::Bswap | P::Bitrev
+                    | P::Cls => {
                         let a = self.get1(arg);
                         let v = self.bitop(opcode, t, a);
                         self.bind(f, i, smallvec![v]);
@@ -9822,7 +9824,10 @@ impl<'o, 'a> CX<'o, 'a> {
                     self.op(O::I32Sub, &[c, off], WT::I32)
                 }
             }
-            P::Ctz => {
+            // `ctz_nonzero` has the same lowering — the caller's nonzero
+            // guarantee just lets us skip the zero case a plain ctz
+            // already produces.
+            P::Ctz | P::CtzNonzero => {
                 if i64 {
                     self.op(O::I64Ctz, &[a], WT::I64)
                 } else if w == 32 {
@@ -10150,7 +10155,7 @@ impl<'o, 'a> CX<'o, 'a> {
                 let z = self.i64c(0);
                 self.setv(r0, smallvec![cnt, z]);
             }
-            P::Ctz => {
+            P::Ctz | P::CtzNonzero => {
                 let ctl = self.op(O::I64Ctz, &[al], WT::I64);
                 let cth = self.op(O::I64Ctz, &[ah], WT::I64);
                 let p64 = self.i64c(64);
