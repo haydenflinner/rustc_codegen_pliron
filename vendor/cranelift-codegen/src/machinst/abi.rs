@@ -584,6 +584,18 @@ pub trait ABIMachineSpec {
     /// Get the ABI-dependent MachineEnv for managing register allocation.
     fn get_machine_env(flags: &settings::Flags, call_conv: isa::CallConv) -> &MachineEnv;
 
+    /// PLIRON: per-function variant of `get_machine_env`, letting a backend
+    /// narrow the allocatable set for this particular function. `has_wide`
+    /// is whether the function's CLIF values include a vector wider than
+    /// 256 bits. Default: ignore it.
+    fn get_machine_env_for(
+        _has_wide: bool,
+        flags: &settings::Flags,
+        call_conv: isa::CallConv,
+    ) -> &MachineEnv {
+        Self::get_machine_env(flags, call_conv)
+    }
+
     /// Get all caller-save registers, that is, registers that we expect
     /// not to be saved across a call to a callee with the given ABI.
     fn get_regs_clobbered_by_call(
@@ -1196,6 +1208,11 @@ pub struct Callee<M: ABIMachineSpec> {
     /// registers and keep nothing live after this sequence of instructions.
     stack_limit: Option<(Reg, SmallInstVec<M::I>)>,
 
+    /// PLIRON: whether the function's CLIF values include a vector wider
+    /// than 256 bits (a 512-bit value); used by `machine_env` for
+    /// per-function register-env selection.
+    has_wide_vector: bool,
+
     _mach: PhantomData<M>,
 }
 
@@ -1241,6 +1258,14 @@ impl<M: ABIMachineSpec> Callee<M> {
         sigs: &SigSet,
     ) -> CodegenResult<Self> {
         trace!("ABI: func signature {:?}", f.signature);
+        // PLIRON: whether any value's vector type is wider than 256 bits;
+        // the x64 backend uses it to keep zmm16-31 out of functions whose
+        // values are all narrow, where parking a narrow vreg in a high
+        // register miscompiles (see PLIRON patch 49).
+        let has_wide_vector = f
+            .dfg
+            .values()
+            .any(|v| f.dfg.value_type(v).is_vector() && f.dfg.value_type(v).bits() > 256);
 
         {
             let ord = PLIRON_FN_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1370,6 +1395,7 @@ impl<M: ABIMachineSpec> Callee<M> {
             flags,
             isa_flags: isa_flags.clone(),
             stack_limit,
+            has_wide_vector,
             _mach: PhantomData,
         })
     }
@@ -1588,7 +1614,9 @@ impl<M: ABIMachineSpec> Callee<M> {
 
     /// Get the ABI-dependent MachineEnv for managing register allocation.
     pub fn machine_env(&self) -> &MachineEnv {
-        M::get_machine_env(&self.flags, self.call_conv)
+        // PLIRON: pass the per-function wide-vector signal so backends can
+        // narrow the env (see `get_machine_env_for`).
+        M::get_machine_env_for(self.has_wide_vector, &self.flags, self.call_conv)
     }
 
     /// The offsets of all sized stack slots (not spill slots) for debuginfo purposes.
