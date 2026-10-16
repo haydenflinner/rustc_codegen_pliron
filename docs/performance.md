@@ -31,22 +31,22 @@ fallback there.
 
 | kernel | LLVM | pliron | change |
 |---|---|---|---|
-| chars_alpha | 2.135 ms | 2.162 ms | +1.2% (noise) |
-| chars_ascii | 2.204 ms | 1.550 ms | −29.7% improved |
-| chars_mixed | 15.79 ms | 15.88 ms | +0.6% (noise) |
-| contains_rng | 2.204 ms | 2.148 ms | −2.5% improved |
-| eqbug | 112.4 µs | 119.9 µs | +6.7% regressed |
-| fib | 14.73 ms | 13.31 ms | −9.6% improved |
-| hashmap | 77.05 ms | 66.45 ms | −13.7% improved |
-| hmget | 12.81 ms | 13.14 ms | +2.5% regressed |
-| iterw | 19.84 ms | 15.99 ms | −19.4% improved |
-| matmul | 8.64 ms | 8.64 ms | +0.0% (parity) |
-| nbody | 117.3 ms | 120.7 ms | +2.9% regressed |
-| parse_only | 371.1 ms | 366.4 ms | −1.1% (parity) |
-| sieve | 12.29 ms | 13.51 ms | +10.5% regressed (see note) |
-| sortw | 6.86 ms | 6.86 ms | −2.2% improved |
-| strwork | 14.03 ms | 14.03 ms | −3.1% improved |
-| tokenize | 6.03 ms | 4.03 ms | −33.0% improved |
+| chars_alpha | 3.51 ms | 3.33 ms | −5.0% (noise, p=0.38) |
+| chars_ascii | 2.21 ms | 2.22 ms | +0.4% (noise) |
+| chars_mixed | 18.11 ms | 20.34 ms | +12.3% regressed |
+| contains_rng | 4.85 ms | 4.47 ms | −7.8% (p=0.06) |
+| eqbug | 208 µs | 207 µs | −5.2% (noise) |
+| fib | 10.12 ms | 11.50 ms | +13.7% regressed |
+| hashmap | 102.1 ms | 85.97 ms | −15.8% improved |
+| hmget | 18.86 ms | 18.43 ms | −2.3% (p=0.07) |
+| iterw | 66.59 ms | 80.79 ms | +21.3% regressed |
+| matmul | 12.10 ms | 10.08 ms | −16.7% improved |
+| nbody | 152.7 ms | 170.6 ms | +11.7% regressed |
+| parse_only | 639.5 ms | 543.1 ms | −15.1% improved |
+| sieve | 22.33 ms | 24.68 ms | +10.5% (p=0.06) |
+| sortw | 8.92 ms | 10.59 ms | +18.8% regressed |
+| strwork | 15.71 ms | 16.79 ms | +6.9% regressed |
+| tokenize | 6.24 ms | 4.39 ms | −29.6% improved |
 
 `sieve` reads +10.5% under criterion but the marking loop is
 instruction-identical-or-tighter than LLVM's (5-instr inner loop vs
@@ -121,28 +121,29 @@ std codegen; and measurement granularity is a whole `run()` call.
 This run is the committed default configuration on an otherwise idle
 host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 
-| kernel | LLVM | pliron | change | clif | change |
+| kernel | LLVM | pliron | change | dialect | change |
 |---|---|---|---|---|---|
-| chars_alpha | 4.577 ms | 4.040 ms | −12.1% | 4.020 ms | −12.2% |
-| chars_ascii | 2.330 ms | 2.327 ms | −0.1% | 2.329 ms | +0.0% |
-| chars_mixed | 18.56 ms | 25.54 ms | +37.7% | 25.56 ms | +37.9% |
-| contains_rng | 4.926 ms | 5.506 ms | +11.6% | 5.507 ms | +11.5% |
-| eqbug | 0.136 ms | 0.119 ms | −12.2% | 0.120 ms | −11.7% |
-| fib | 9.462 ms | 9.011 ms | −5.5% | 8.911 ms | −5.8% |
-| hashmap | 66.71 ms | 77.26 ms | +15.7% | 76.97 ms | +15.2% |
-| hmget | 11.58 ms | 16.50 ms | +42.6% | 16.55 ms | +42.6% |
-| iterw | 67.29 ms | 57.69 ms | −14.0% | 57.69 ms | −14.3% |
-| matmul | 30.87 ms | 27.68 ms | −10.6% | 27.61 ms | −10.8% |
-| nbody | 84.39 ms | 91.73 ms | +8.7% | 91.69 ms | +8.7% |
-| parse_only | 382.9 ms | 510.6 ms | +33.4% | 510.7 ms | +33.0% |
-| sieve | 14.05 ms | 17.12 ms | +21.8% | 17.12 ms | +21.9% |
-| sortw | 6.258 ms | 7.757 ms | +23.6% | 7.753 ms | +23.9% |
-| strwork | 17.40 ms | 23.77 ms | +36.8% | 23.92 ms | +37.5% |
-| tokenize | 7.747 ms | 5.258 ms | −31.8% | 5.263 ms | −32.3% |
+| chars_alpha | 3.88 ms | 4.56 ms | +17.6% | 8.61 ms | +122% |
+| chars_ascii | 2.43 ms | 3.46 ms | +42.1% | 5.20 ms | +114% |
+| chars_mixed | 21.30 ms | 30.14 ms | +41.6% | 25.85 ms | +21.1% |
+| contains_rng | 7.69 ms | 10.15 ms | +31.9% | 18.55 ms | +141% |
+| eqbug | 0.24 ms | 0.19 ms | −20.8% | 0.25 ms | +5.2% |
+| fib | 15.54 ms | 15.89 ms | +2.3% | 27.61 ms | +77.6% |
+| hashmap | 75.64 ms | 130.17 ms | +72.3% | 123.50 ms | +63.2% |
+| hmget | 16.17 ms | 29.38 ms | +81.6% | 24.23 ms | +49.8% |
+| iterw | 107.85 ms | 52.82 ms | −51.1% | 103.61 ms | −5.2% |
+| matmul | 38.87 ms | 27.56 ms | −29.1% | 39.47 ms | +1.4% |
+| nbody | 131.36 ms | 127.91 ms | −2.6% | 260.98 ms | +98.7% |
+| parse_only | 490.14 ms | 591.46 ms | +20.7% | 648.81 ms | +32.4% |
+| sieve | 20.32 ms | 20.16 ms | −0.4% | 21.30 ms | +4.8% |
+| sortw | 7.73 ms | 10.27 ms | +32.6% | 11.44 ms | +48.1% |
+| strwork | 24.25 ms | 33.92 ms | +40.0% | 44.23 ms | +82.4% |
+| tokenize | 6.31 ms | 7.19 ms | +14.1% | 20.34 ms | +223% |
 
-Geomeans: pliron/LLVM = 1.069 (both pliron columns build the same
-CLIF-pipeline module; 16 kernels), down from 1.674 before the inlining
-work below. Module sizes: LLVM 97 KB, pliron 187 KB.
+Geomeans: pliron/LLVM = 1.127, dialect/LLVM = 1.577 (16 kernels). All
+kernel accumulators matched across the three modules (the driver
+cross-checks return values). Module sizes: LLVM 97 KB, pliron 813 KB,
+dialect 1.1 MB.
 
 Changes since the 1.674 geomean:
 
@@ -192,10 +193,26 @@ loop bonus, growth budget) are the other candidate lever.
 
 ## Compile time
 
-The backend is slower than LLVM to compile code. Single files take about
-3–5 times longer (0.3–1.9 s vs 0.1–0.3 s). The optimizer pipeline takes
-about 95% of backend time. Function-level worker threads run the pipeline
-in parallel across a crate's code-generation units.
+The backend is slower than LLVM to compile code, and the gap widens with
+crate size. Wall-clock `cargo rustc --release` on workspace-member crates
+(deps pre-built by stock rustc; release backend `.so`):
+
+| crate | LLVM | pliron | ratio |
+|---|---|---|---|
+| regex-syntax 0.8.11 | 3.04 s | 16.1 s | ~5.3x |
+| serde_json 1.0.154 | 1.33 s | 9.5 s | ~7.1x |
+| syn 2.0.119 | 3.83 s | 152.9 s | ~40x |
+
+`syn` is the pathological case: ~182s of summed pipeline-step time spread
+uniformly across passes (looprot 23.7s, indvars 18.9s, slp 15.1s,
+jumpthread 11.4s, emit 10.6s, then ivrefold/loadfwd/ifconv2/selfarg/licm/
+mergechain/edgespec ~6-7s each) — no single quadratic, just ~95 passes of
+per-function cost on syn's macro-generated functions. One CGU alone holds
+72s (slp 12.5s inside it is the largest single-step spend).
+
+The optimizer pipeline takes ~95% of backend time. Function-level worker
+threads run the pipeline in parallel across a crate's code-generation
+units.
 
 A content-addressed step cache (`PLIRON_STEPCACHE=1`) stores per-pass and
 per-function results. A warm rerun of the pipeline takes about 16 ms per
