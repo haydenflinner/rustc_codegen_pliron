@@ -23,6 +23,7 @@ use pliron::builtin::op_interfaces::BranchOpInterface;
 use pliron::context::{Context, Ptr};
 use pliron::op::{Op, op_cast};
 use pliron::operation::Operation;
+use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::attributes::ICmpPredicateAttr as P;
 use pliron_llvm::ops::{
@@ -57,12 +58,15 @@ enum Rel {
     Ne,
 }
 
-/// A comparable value: an SSA value, or "whatever a load of `slot` reads
-/// given exactly these reaching stores" (same slot + same set ⇒ same value).
+/// A comparable value: an SSA value, or "whatever a load of `[slot+off,
+/// slot+off+size)` reads given exactly these reaching stores" — the range
+/// must be part of the key: two loads of one slot at different offsets or
+/// widths see different bytes, and a store only fully determines the load
+/// when it covers the load's range exactly.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum Atom {
     V(Value),
-    Slot(Value, Vec<Ptr<Operation>>),
+    Slot(Value, i64, i64, Vec<Ptr<Operation>>),
     /// A block argument: (block, argument index). Its value is whichever
     /// operand a predecessor branch forwarded — multi-pred = multi-source.
     Arg(Ptr<BasicBlock>, usize),
@@ -72,8 +76,9 @@ enum Atom {
 struct FnInfo {
     bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>>,
     preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
-    /// slot -> stores reaching the block head (None = overflow/unknown).
-    inn: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>>,
+    /// (slot, off, size) -> stores reaching the block head (None =
+    /// overflow/unknown/mixed bytes).
+    inn: FxHashMap<Ptr<BasicBlock>, FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>>,
     escaped: FxHashSet<Value>,
 }
 
@@ -90,23 +95,67 @@ pub(crate) fn slot_base(ctx: &Context, mut p: Value) -> Option<Value> {
     }
 }
 
-/// Stores reaching `slot` at op position `i` inside `b` (kill semantics:
-/// the last in-block store supersedes everything before it).
+/// `(slot, byte offset)` a pointer addresses, peeling constant-offset GEPs.
+/// `None` when the chain leaves a frame slot or carries a dynamic index —
+/// callers needing the range must not guess at offset 0.
+fn slot_range(ctx: &Context, st: &State, mut p: Value) -> Option<(Value, i64)> {
+    let mut off = 0i64;
+    loop {
+        match p.defining_op() {
+            Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return Some((p, off)),
+            Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
+                off = off.checked_add(crate::sroa::gep_offset(ctx, st, d)?)?;
+                p = d.deref(ctx).get_operand(0)
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `(slot, off, size)` of a store's destination: `None` when the pointer
+/// isn't a frame slot or the offset is dynamic (unknown overlap — poison).
+fn store_range(ctx: &Context, st: &State, op: Ptr<Operation>) -> Option<(Value, i64, i64)> {
+    let od = op.deref(ctx);
+    let (s, off) = slot_range(ctx, st, od.get_operand(1))?;
+    let sz = crate::types::size_align(ctx, od.get_operand(0).get_type(ctx)).0 as i64;
+    Some((s, off, sz))
+}
+
+/// Stores reaching `[slot+off, slot+off+size)` at op position `i` inside
+/// `b`: the latest in-block store *exactly covering* the range supersedes
+/// the reaching set; an earlier partial or unresolvable overlap poisons
+/// (the load mixes bytes no single store operand names); disjoint stores
+/// are skipped.
 fn stores_of(
     ctx: &Context,
+    st: &State,
     info: &FnInfo,
     b: Ptr<BasicBlock>,
     i: usize,
     slot: Value,
+    off: i64,
+    size: i64,
 ) -> Option<Vec<Ptr<Operation>>> {
-    let last = info.bops.get(&b)?.iter().take(i).rev().find(|&&op| {
-        Operation::is_op::<StoreOp>(op, ctx)
-            && slot_base(ctx, op.deref(ctx).get_operand(1)) == Some(slot)
-    });
-    if let Some(&s) = last {
-        return Some(vec![s]);
+    for &op in info.bops.get(&b)?.iter().take(i).rev() {
+        if !Operation::is_op::<StoreOp>(op, ctx)
+            || slot_base(ctx, op.deref(ctx).get_operand(1)) != Some(slot)
+        {
+            continue;
+        }
+        match store_range(ctx, st, op) {
+            Some((_, soff, ssz)) => {
+                if soff == off && ssz == size {
+                    return Some(vec![op]);
+                }
+                if soff < off + size && off < soff + ssz {
+                    return None;
+                }
+                // disjoint — keep scanning back
+            }
+            None => return None,
+        }
     }
-    info.inn.get(&b)?.get(&slot).cloned()?
+    info.inn.get(&b)?.get(&(slot, off, size)).cloned()?
 }
 
 /// Canonicalize `v`: non-volatile loads of an unescaped frame slot become
@@ -127,9 +176,10 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
         return Atom::V(v);
     }
-    let Some(slot) = slot_base(ctx, d.deref(ctx).get_operand(0)) else {
+    let Some((slot, loff)) = slot_range(ctx, st, d.deref(ctx).get_operand(0)) else {
         return Atom::V(v);
     };
+    let lsz = crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
     if info.escaped.contains(&slot) {
         return Atom::V(v);
     }
@@ -143,13 +193,13 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     else {
         return Atom::V(v);
     };
-    let Some(mut set) = stores_of(ctx, info, b, i, slot) else {
+    let Some(mut set) = stores_of(ctx, st, info, b, i, slot, loff, lsz) else {
         return Atom::V(v);
     };
     // Canonical order for atom equality; Ptr has no Ord — sort by its
     // stable-in-run debug index.
     set.sort_by_cached_key(|p| format!("{p:?}"));
-    Atom::Slot(slot, set)
+    Atom::Slot(slot, loff, lsz, set)
 }
 
 /// Facts true on entry to `b`: walk the idom chain; for each dominator `d`
@@ -265,7 +315,7 @@ fn sources(
     a: &Atom,
 ) -> Vec<(Atom, Ptr<BasicBlock>)> {
     match a {
-        Atom::Slot(_, set) => set
+        Atom::Slot(_, _, _, set) => set
             .iter()
             .filter_map(|&s| {
                 let w = stored_atom(ctx, st, info, s);
@@ -496,7 +546,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     // outside the closure answer `V` atoms, which only weakens proofs.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum Nd {
-        Slot(Value),
+        Slot(Value, i64, i64),
         Arg(Ptr<BasicBlock>, usize),
     }
     let node_of = |v: Value| -> Option<Nd> {
@@ -510,9 +560,11 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
             return None;
         }
-        slot_base(ctx, d.deref(ctx).get_operand(0)).map(Nd::Slot)
+        let (s, off) = slot_range(ctx, st, d.deref(ctx).get_operand(0))?;
+        let sz = crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
+        Some(Nd::Slot(s, off, sz))
     };
-    let mut needed: FxHashSet<Value> = FxHashSet::default();
+    let mut needed: FxHashSet<(Value, i64, i64)> = FxHashSet::default();
     {
         let mut seen: FxHashSet<Nd> = FxHashSet::default();
         let mut stack: Vec<Nd> = Vec::new();
@@ -529,12 +581,16 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 continue;
             }
             match n {
-                Nd::Slot(s) => {
-                    if !needed.insert(s) {
+                Nd::Slot(s, off, sz) => {
+                    if !needed.insert((s, off, sz)) {
                         continue;
                     }
                     for &so in stores_by_slot.get(&s).into_iter().flatten() {
-                        if let Some(m) = node_of(so.deref(ctx).get_operand(0)) {
+                        // Only exact-cover stores are sources of this key's
+                        // loads; partial overlaps poison instead.
+                        if store_range(ctx, st, so) == Some((s, off, sz))
+                            && let Some(m) = node_of(so.deref(ctx).get_operand(0))
+                        {
                             stack.push(m);
                         }
                     }
@@ -565,14 +621,23 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             }
         }
     }
-    let relevant: FxHashSet<Value> = store_slots
-        .intersection(&load_slots)
+    let relevant: FxHashSet<(Value, i64, i64)> = needed
+        .iter()
         .copied()
-        .filter(|s| !escaped.contains(s) && needed.contains(s))
+        .filter(|&(s, off, sz)| {
+            !escaped.contains(&s)
+                && stores_by_slot
+                    .get(&s)
+                    .into_iter()
+                    .flatten()
+                    .any(|&o| store_range(ctx, st, o) == Some((s, off, sz)))
+        })
         .collect();
     gefn.record("rel", relevant.len());
-    let mut inn: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
-        FxHashMap::default();
+    let mut inn: FxHashMap<
+        Ptr<BasicBlock>,
+        FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>,
+    > = FxHashMap::default();
     {
     let _gefix = tracing::info_span!(target: "pliron::iropt", "gefix").entered();
     if !relevant.is_empty() {
@@ -587,22 +652,25 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         }
         return false;
     }
-    // Reaching stores per (block, slot): forward fixpoint over reachable
+    // Reaching stores per (block, key): forward fixpoint over reachable
     // blocks only (unreachable preds would pollute the may-sets).
-    let mut outt: FxHashMap<Ptr<BasicBlock>, FxHashMap<Value, Option<Vec<Ptr<Operation>>>>> =
-        FxHashMap::default();
+    let mut outt: FxHashMap<
+        Ptr<BasicBlock>,
+        FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>>,
+    > = FxHashMap::default();
     let mut wl: Vec<Ptr<BasicBlock>> = reach.clone();
     let mut inq: FxHashSet<Ptr<BasicBlock>> = wl.iter().copied().collect();
     while let Some(b) = wl.pop() {
         inq.remove(&b);
-        let mut m: FxHashMap<Value, Option<Vec<Ptr<Operation>>>> = FxHashMap::default();
+        let mut m: FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>> =
+            FxHashMap::default();
         for &p in preds.get(&b).into_iter().flatten() {
             let Some(pm) = outt.get(&p) else { continue };
-            for (&s, set) in pm {
-                if !relevant.contains(&s) {
+            for (&key, set) in pm {
+                if !relevant.contains(&key) {
                     continue;
                 }
-                let e = m.entry(s).or_insert_with(|| Some(Vec::new()));
+                let e = m.entry(key).or_insert_with(|| Some(Vec::new()));
                 match (e.as_mut(), set) {
                     (Some(v), Some(ps)) => {
                         for &op in ps {
@@ -618,13 +686,36 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 }
             }
         }
-        // out = in, killed per-slot by the block's own (last) stores.
+        // out = in, killed per-key by the block's own stores: exact cover
+        // replaces the set, a partial or unresolvable overlap poisons it,
+        // disjoint stores leave it alone.
         for &op in &bops[&b] {
-            if Operation::is_op::<StoreOp>(op, ctx)
-                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
-                && relevant.contains(&s)
-            {
-                m.insert(s, Some(vec![op]));
+            if !Operation::is_op::<StoreOp>(op, ctx) {
+                continue;
+            }
+            let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(1)) else {
+                continue;
+            };
+            match store_range(ctx, st, op) {
+                Some((_, soff, ssz)) => {
+                    for &(s, off, sz) in &relevant {
+                        if s != sl {
+                            continue;
+                        }
+                        if soff == off && ssz == sz {
+                            m.insert((s, off, sz), Some(vec![op]));
+                        } else if soff < off + sz && off < soff + ssz {
+                            m.insert((s, off, sz), None);
+                        }
+                    }
+                }
+                None => {
+                    for &(s, off, sz) in &relevant {
+                        if s == sl {
+                            m.insert((s, off, sz), None);
+                        }
+                    }
+                }
             }
         }
         if outt.get(&b) != Some(&m) {
@@ -640,14 +731,15 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     }
     // inn[b][slot] = union of preds' out — the reaching set at block head.
     for &b in &reach {
-        let mut m: FxHashMap<Value, Option<Vec<Ptr<Operation>>>> = FxHashMap::default();
+        let mut m: FxHashMap<(Value, i64, i64), Option<Vec<Ptr<Operation>>>> =
+            FxHashMap::default();
         for &p in preds.get(&b).into_iter().flatten() {
             let Some(pm) = outt.get(&p) else { continue };
-            for (&s, set) in pm {
-                if !relevant.contains(&s) {
+            for (&key, set) in pm {
+                if !relevant.contains(&key) {
                     continue;
                 }
-                let e = m.entry(s).or_insert_with(|| Some(Vec::new()));
+                let e = m.entry(key).or_insert_with(|| Some(Vec::new()));
                 match (e.as_mut(), set) {
                     (Some(v), Some(ps)) => {
                         for &op in ps {
@@ -792,5 +884,79 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     }
     if crate::env_set("PLIRON_STATS") {
         eprintln!("guardelim {}: {} fns folded", st.cgu, n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::State;
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::parsable::parse_from_str;
+    use pliron_llvm::ops::FuncOp;
+
+    fn module_funcs(ctx: &Context, m: ModuleOp) -> Vec<Ptr<Operation>> {
+        crate::inline::blocks(ctx, m.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+            .filter(|&op| Operation::is_op::<FuncOp>(op, ctx))
+            .collect()
+    }
+
+    /// Two loads of one alloca at different constant offsets, both fed by a
+    /// two-store reaching set on each path. The old atom keyed only on the
+    /// slot: both loads got `Slot(s, {y,z})`, `icmp eq` folded, and the
+    /// `unreachable` was eliminated even though s.0 != s.1 is possible.
+    #[test]
+    fn slot_atoms_track_offset() {
+        let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <builtin.integer i32(builtin.integer i32, builtin.integer i32, builtin.integer i32, builtin.integer i1) variadic = false> [] {
+          ^entry_block_1_0(x: builtin.integer i32, y: builtin.integer i32, z: builtin.integer i32, c: builtin.integer i1):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            four = llvm.constant <builtin.integer <4: i64>> : builtin.integer i64;
+            p = llvm.alloca [builtin.integer i32 x one] : llvm.ptr (0);
+            q = llvm.gep <builtin.integer i8> (p, four)[OperandIdx(1)] : llvm.ptr (0);
+            llvm.store *p <- x;
+            llvm.store *q <- y;
+            llvm.cond_br if c ^block_2_0() else ^block_3_0()
+          ^block_2_0():
+            llvm.store *p <- z;
+            llvm.store *q <- z;
+            llvm.br ^block_3_0()
+          ^block_3_0():
+            a = llvm.load p : builtin.integer i32;
+            b = llvm.load q : builtin.integer i32;
+            e = llvm.icmp a <EQ> b : builtin.integer i1;
+            llvm.cond_br if e ^block_5_0() else ^block_4_0()
+          ^block_4_0():
+            llvm.unreachable
+          ^block_5_0():
+            llvm.return a
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input)
+            .expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let fs = module_funcs(ctx, mop);
+        let st = &mut State::default();
+        for fop in fs {
+            run_fn(ctx, st, fop);
+        }
+        let cond_brs = module_funcs(ctx, mop)
+            .into_iter()
+            .map(|fop| {
+                crate::inline::blocks(ctx, fop)
+                    .into_iter()
+                    .flat_map(|b| crate::inline::ops(ctx, b))
+                    .filter(|&op| Operation::is_op::<CondBrOp>(op, ctx))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(cond_brs, 2, "guardelim folded a range-blind slot fact");
     }
 }
