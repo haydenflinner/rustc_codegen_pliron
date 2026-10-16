@@ -47,6 +47,9 @@ pub struct CodegenCx<'tcx> {
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), Value>>,
     pub tcache: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), TypeHandle>>,
     pub scache: RefCell<FxHashMap<Ty<'tcx>, TypeHandle>>,
+    /// CGU symbol this codegen context is building (set at construction;
+    /// read-only afterwards — tracing uses it without borrowing `st`).
+    pub cgu_name: String,
 }
 
 pub fn map_linkage(l: RLinkage, vis: Visibility) -> Linkage {
@@ -74,6 +77,7 @@ impl<'tcx> CodegenCx<'tcx> {
             .get_operation();
         CodegenCx {
             tcx,
+            cgu_name: name.to_string(),
             pctx: RefCell::new(ctx),
             module,
             st: RefCell::new(State::default()),

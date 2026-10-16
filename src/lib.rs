@@ -717,7 +717,10 @@ macro_rules! pt {
             .sess
             .prof
             .generic_activity(concat!("pliron_ir_", $n));
-        $e
+        let _t = std::time::Instant::now();
+        let _r = $e;
+        pliron_cfg::trace($n, _t.elapsed().as_secs_f64() * 1e3, &$cx.cgu_name);
+        _r
     }};
 }
 
