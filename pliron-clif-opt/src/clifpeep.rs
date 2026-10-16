@@ -5329,6 +5329,13 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     if !adj_add.is_empty() {
         let uses = use_counts(func);
         for (inst, si, k) in adj_add {
+            // PLIRON: `si`/`inst` were captured during the scan; the
+            // dead_sel/mul_id apply loops above may have deleted them.
+            if func.layout.inst_block(si).is_none()
+                || func.layout.inst_block(inst).is_none()
+            {
+                continue;
+            }
             let res = func.dfg.first_result(si);
             if uses
                 .get(&func.dfg.resolve_aliases(res))
