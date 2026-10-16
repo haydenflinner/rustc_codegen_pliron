@@ -544,3 +544,29 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     casts (`fvpromote_f16`/`_lo`/`_hi` -> `fcvtl`/`fcvtl2`,
     `fvdemote_f16_pair` -> `fcvtn` + `fcvtn2`). Used by the pliron
     lowerer's CubeCL path when `types::NATIVE_F16`/`F16C` are set.
+
+45. Exact `size_hint` on the layout iterators (`src/ir/layout.rs`):
+    `BlockNode` gains a per-block inst `count` and `Layout` gains a
+    `num_blocks` counter (maintained in append/insert/remove/split),
+    feeding `Blocks`/`Insts` `size_hint`/`ExactSizeIterator`. Passes
+    that snapshot `layout.block_insts(b).collect()`/`blocks().collect()`
+    were hitting `spec_from_iter_nested` growth — a ~1% leaf —
+    because the linked-list iterators reported `(0, None)`. The serde
+    round-trip rebuilds counts through the public insert path.
+
+46. `LoopAnalysis::is_in_loop` O(1) (`src/loop_analysis.rs`): `compute`
+    now also assigns each loop an Euler-tour interval `[tin, tout)` over
+    the loop forest (`assign_loop_intervals`); `is_in_loop` tests
+    `tin[lp] <= tin[innermost(block)] < tout[lp]` instead of finger-
+    walking the parent chain. The opt pipeline calls it per
+    (loop, block) pair inside `layout.blocks()` filters — O(loops ×
+    blocks × depth) per pass — ~40k/2.65M leaf samples in the rustc
+    profile.
+
+47. Seedable `cfg`/`domtree` in `Context::optimize` (`src/context.rs`):
+    the initial `compute_cfg`/`compute_domtree` pair is now guarded by
+    `is_valid()` — the pliron pipeline moves its own exact analyses
+    (built by `Analysis` on the final IR) into the context before
+    `compile`, so emit no longer rebuilds them per function. Paths
+    that mutate the function after seeding (the narrow-vector
+    `veclegalize` retry in pliron-clif-lower) must `clear()` both.

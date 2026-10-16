@@ -126,6 +126,11 @@ pub struct CallInfo {
     /// `black_box` barrier: the callee is a never-defined `__pliron_bb*`
     /// symbol; lowering emits the CLIF `black_box` op instead of a call.
     pub bb: bool,
+    /// Resolved `llvm.call.callee` symbol at CallInfo creation. The attr
+    /// is constructor-only (set in `CallOp::new`), so the memoized copy
+    /// can't go stale; `direct_callee` reads this instead of the attr
+    /// dict, and ops without a `calls` entry still fall back to it.
+    pub callee: Option<String>,
 }
 
 #[derive(Default)]

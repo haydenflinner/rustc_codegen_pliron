@@ -18,7 +18,6 @@ use cranelift_codegen::ir::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::{NonNull, eval, known};
-use crate::uses::Uses;
 
 const MAX_ITERS: usize = 32;
 /// Cap on instructions emitted into the straight-line replacement block —
@@ -62,10 +61,12 @@ pub fn run(
     // whole-function fixpoint and most functions have no candidate.
     let mut nn: Option<NonNull> = None;
     // `uses` feeds each candidate's `used_out` query: without it the
-    // outside-use scan is O(fn) per loop header. Stale after an unroll,
-    // so invalidated alongside the CFG.
-    let mut uses: Option<crate::uses::Uses> = None;
+    // outside-use scan is O(fn) per loop header. Shared index; an
+    // unroll's `an.invalidate()` rebuilds it for the next round.
     'outer: while n < MAX_LOOPS {
+        // Fetched before `cfg_dt` — its `&mut` borrow would block the
+        // shared index call.
+        let u = an.uses(func);
         let (cfg, dt) = an.cfg_dt(func);
         let blocks: Vec<Block> = func.layout.blocks().collect();
         for h in blocks {
@@ -77,13 +78,7 @@ pub fn run(
             if prof.get(&h) == Some(&0) {
                 continue;
             }
-            let Some((pred, pinst, body, entry, used_out)) = candidate(
-                func,
-                cfg,
-                dt,
-                uses.get_or_insert_with(|| Uses::new(func)),
-                h,
-            ) else {
+            let Some((pred, pinst, body, entry, used_out)) = candidate(func, cfg, dt, &u, h) else {
                 continue;
             };
             if pliron_cfg::tracing_on()
@@ -148,8 +143,7 @@ pub fn run(
             }
             n += 1;
             // The preheader block + edge retargets rewired the CFG.
-            an.invalidate();
-            uses = None;
+            an.invalidate(func);
             continue 'outer;
         }
         break;

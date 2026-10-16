@@ -117,6 +117,8 @@ pub trait ContainsLinkedList<T: LinkedList>: private::ContainsLinkedList<T> {
     /// Simply get the tail of the list.
     fn get_tail(&self) -> Option<Ptr<T>>;
     /// Get an iterator over the items. Context is borrowed throughout.
+    /// PLIRON: `#[inline]` — list iteration is a measured hot path.
+    #[inline]
     fn iter<'a>(&self, ctx: &'a Context) -> Iter<'a, T> {
         Iter {
             next: self.get_head(),
@@ -146,6 +148,9 @@ impl<T: LinkedList> Clone for Iter<'_, T> {
 impl<T: LinkedList> Iterator for Iter<'_, T> {
     type Item = Ptr<T>;
 
+    // PLIRON: `#[inline]` on the iterator methods — profiling shows
+    // outlined `Iter::next`/`next_back` calls as a top leaf.
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.next.inspect(|curr| {
             if *curr
@@ -161,12 +166,14 @@ impl<T: LinkedList> Iterator for Iter<'_, T> {
         })
     }
 
+    #[inline]
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
 }
 
 impl<T: LinkedList> DoubleEndedIterator for Iter<'_, T> {
+    #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         self.next_back.inspect(|curr| {
             if *curr == self.next.expect("Some(next_back) => Some(next) violated") {
@@ -211,11 +218,13 @@ where
 {
     /// The node after self in its linked list. PLIRON: reads the dense
     /// per-kind [NodeLinks] table — no node deref on the walk.
+    #[inline]
     pub fn get_next(&self, ctx: &Context) -> Option<Ptr<T>> {
         NodeLinks::get(ctx, *self).next
     }
 
     /// The node before self in its linked list.
+    #[inline]
     pub fn get_prev(&self, ctx: &Context) -> Option<Ptr<T>> {
         NodeLinks::get(ctx, *self).prev
     }

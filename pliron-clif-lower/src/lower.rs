@@ -493,6 +493,9 @@ pub fn lower_module(
         scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
         invariant: FxHashSet<ir::Inst>,
         operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
+        /// Dense gate for `Pipe::carry_one`'s fact probes — re-seeded
+        /// from the tables at each `Pipe` construction.
+        fact_bits: cranelift_codegen::entity::SecondaryMap<ir::Value, u8>,
         block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
         // PGO: CLIF block -> executed count (from st.prof_bcount via
         // block_region); CLIF passes read it through Pipe.prof.
@@ -525,6 +528,7 @@ pub fn lower_module(
     // pliron `Context`, which is RefCell-interned and not shareable.
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
     let _pgfl = host.prof().activity("pliron_fnlower", None);
+    let tpa = std::time::Instant::now();
     let mut jobs: Vec<FnJob> = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -658,6 +662,7 @@ pub fn lower_module(
             scoped,
             invariant,
             operand_frozen,
+            fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
             block_region,
             prof,
             lifetimes,
@@ -744,6 +749,7 @@ pub fn lower_module(
                     scoped: &j.scoped,
                     invariant: &j.invariant,
                     operand_frozen: &mut j.operand_frozen,
+                    fact_bits: &mut j.fact_bits,
                     block_region: &j.block_region,
                     prof: &j.prof,
                     region_parent: sh.region_parent,
@@ -762,6 +768,7 @@ pub fn lower_module(
                     carry_log: Vec::new(),
                     prof_hook: Some(&prof_hook),
                 };
+                pipe.seed_fact_bits();
                 crate::pipeline::run_pipeline(&mut pipe);
             }
             if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
@@ -840,6 +847,9 @@ pub fn lower_module(
                     break defr;
                 }
                 vec_retry += 1;
+                // Seeded cfg/domtree describe the pre-legalize func.
+                clctx.cfg.clear();
+                clctx.domtree.clear();
                 continue;
             }
             break defr;
@@ -880,6 +890,8 @@ pub fn lower_module(
         clctx.clear();
     }
 
+    pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+    let tpb = std::time::Instant::now();
     let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
     let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
         1
@@ -917,6 +929,8 @@ pub fn lower_module(
         jobs.into_iter().map(|m| m.into_inner().unwrap()).collect()
     };
 
+    pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+    let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
     // compiling each function serially.
@@ -1095,6 +1109,7 @@ pub fn lower_module(
         m.define_data(id, &desc)
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
+    pliron_cfg::trace("*phaseC*", tpc.elapsed().as_secs_f64() * 1e3, name);
     Lowered {
         eh,
         ids,
@@ -1532,9 +1547,11 @@ pub fn lower_clif_wasm(
         let mut noalias = noalias;
         let mut deref = deref;
         let mut operand_frozen = operand_frozen;
+        let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
         let mut lifetimes = lifetimes;
         let mut pipe = crate::pipeline::Pipe {
             cur_step: "",
+            fact_bits: &mut fact_bits,
             clctx: &mut clctx,
             isa: &*isa,
             fname: n,
@@ -1575,6 +1592,7 @@ pub fn lower_clif_wasm(
         let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
             && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
         if run_pipe {
+            pipe.seed_fact_bits();
             crate::pipeline::run_pipeline(&mut pipe);
         }
         drop(pipe);

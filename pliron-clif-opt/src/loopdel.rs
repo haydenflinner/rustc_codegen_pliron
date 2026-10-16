@@ -23,7 +23,7 @@ const MAX_DELETIONS: usize = 16;
 
 pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     fold_inc_overflow(func);
-    an.invalidate();
+    an.invalidate(func);
     let mut n = 0;
     while n < MAX_DELETIONS {
         let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
@@ -55,7 +55,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
         // Redirected preds rewired the graph — recompute before the next
         // deletion candidate scan (edge edits don't change the shape
         // fingerprint, so this stays explicit).
-        an.invalidate();
+        an.invalidate(func);
     }
     n
 }

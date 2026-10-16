@@ -2078,7 +2078,7 @@ pub fn run(
             let k = run_loop(func, cfg, dt, la, lp, name, throw_ret, &mut seen);
             did += k;
             if k > 0 {
-                an.invalidate();
+                an.invalidate(func);
                 break; // cfg/dt/la now stale; rescan
             }
         }
@@ -2357,7 +2357,7 @@ pub fn unswitch(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &
             let k = unswitch_loop(func, cfg, dt, la, lp, name, &mut seen);
             did += k;
             if k > 0 {
-                an.invalidate();
+                an.invalidate(func);
                 break; // cfg/dt/la now stale; rescan
             }
         }

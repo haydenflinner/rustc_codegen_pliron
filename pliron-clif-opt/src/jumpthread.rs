@@ -1289,7 +1289,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
 /// `sel == K` on every path into it (`x == K` on the mid edge is the same
 /// value), `X_target` sees `sel == x` — provided the block had no other
 /// preds, so `b`/`mid` alone decide entry.
-pub fn split_niche_tests(func: &mut Function) -> usize {
+pub fn split_niche_tests(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
     struct Plan {
         b: Block,
         term: Inst,
@@ -1512,9 +1512,9 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
         }
         // Defer any plan whose key insts an earlier apply rewrote or
         // removed, or whose targets gained a `mid` pred — both make the
-        // plan's collected facts stale. `Uses::new` is fresh each plan
-        // anyway for the dead-select sweep; here it needs one build for
-        // all of them.
+        // plan's collected facts stale. The use index is refetched each
+        // round anyway for the dead-select sweep; here it needs one
+        // fetch for all of them.
         let mut mutated: FxHashSet<Inst> = FxHashSet::default();
         let mut claimed: FxHashSet<Block> = FxHashSet::default();
         let mut dead_sweep: Vec<Inst> = Vec::new();
@@ -1626,8 +1626,11 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
         // One use index for the whole sweep: removals only delete
         // uses, so a stale entry just skips a removal the next
         // outer round catches — a per-inst whole-function scan
-        // was O(dead × fn).
-        let uses = crate::uses::Uses::new(func);
+        // was O(dead × fn). Shared snapshot: applies that added insts
+        // changed `num_insts` so `an.uses` rebuilds; a same-shape
+        // refetch may serve a stale snapshot, which the comment
+        // above already tolerates.
+        let uses = an.uses(func);
         for di in dead_sweep {
             if func.layout.inst_block(di).is_none() {
                 continue;
@@ -2475,15 +2478,18 @@ pub fn merge_chains(func: &mut Function) {
 /// edge, and rename the uses. Once the exports travel as edge args an
 /// edgespec threading can land on `s` — an enum-discriminant dispatch
 /// whose use-cone is small (a couple of epilogue blocks) then folds.
-pub fn rebind_exports(func: &mut Function) -> usize {
+pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = std::time::Instant::now();
+    // cfg/dom stay local: callers in this step mutate the CFG without
+    // invalidating `an`, so its cfg/dt may be stale here. The use index
+    // is safe — `an.uses` keys on `num_insts` and rebuilds when the
+    // shape changed; same-shape stale entries overcount uses, which
+    // only keeps the cone walks conservative.
+    let uses = an.uses(func);
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
-    // Resolved use index — one O(fn) scan shared by every (y, s) cone
-    // walk instead of re-walking `inst_values` per use.
-    let uses = crate::uses::Uses::new(func);
     if prof2 {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",

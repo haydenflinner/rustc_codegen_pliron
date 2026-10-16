@@ -221,11 +221,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         args: &[Value],
         exts: Exts,
     ) -> Value {
-        let callable = match self.cval(callee) {
+        let (callable, callee_sym) = match self.cval(callee) {
             Some(ConstVal::Sym { sym, off: 0 }) if self.st.borrow().funcs.contains_key(&sym) => {
-                CallOpCallable::Direct(self.ident(&sym))
+                (CallOpCallable::Direct(self.ident(&sym)), Some(sym))
             }
-            _ => CallOpCallable::Indirect(callee),
+            _ => (CallOpCallable::Indirect(callee), None),
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
@@ -244,6 +244,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 arg_extent: None,
                 arg_noalias: None,
                 bb: false,
+                callee: callee_sym,
             },
         );
         self.st.borrow_mut().last_call = Some(p);

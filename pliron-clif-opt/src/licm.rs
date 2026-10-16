@@ -1363,7 +1363,7 @@ pub fn run(
         };
         n += n2;
         if n2 > 0 {
-            an.invalidate();
+            an.invalidate(func);
         }
         if n >= MAX_MOVES * MAX_LOOPS {
             break;

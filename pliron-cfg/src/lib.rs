@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub struct PassConfig {
     /// Every `PLIRON_*` var present in the environment (raw values).
@@ -91,9 +91,23 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// How many read windows are open across all threads. When zero,
+/// `record()` skips its TLS walk entirely — the common case is every
+/// env knob read on the no-stepcache path paying this one atomic load.
+static READS_OPEN: AtomicUsize = AtomicUsize::new(0);
+
+/// True while a read-recording window is open on some thread. Callers
+/// memoizing an env-derived value must take the real `config()` path
+/// under this so the reads still land in the open windows.
+#[inline]
+pub fn reads_open() -> bool {
+    READS_OPEN.load(Ordering::Relaxed) != 0
+}
+
 /// Open a read-recording frame. Always succeeds — frames nest, and each
 /// frame sees only the reads that happen inside it.
 pub fn reads_begin() -> bool {
+    READS_OPEN.fetch_add(1, Ordering::Relaxed);
     READS.with(|r| {
         r.borrow_mut().push(Default::default());
         true
@@ -102,7 +116,11 @@ pub fn reads_begin() -> bool {
 
 /// Close the innermost frame and return its `(var, value)` pairs.
 pub fn reads_take() -> std::collections::BTreeMap<String, Option<String>> {
-    READS.with(|r| r.borrow_mut().pop().unwrap_or_default())
+    let m = READS.with(|r| r.borrow_mut().pop());
+    if m.is_some() {
+        READS_OPEN.fetch_sub(1, Ordering::Relaxed);
+    }
+    m.unwrap_or_default()
 }
 
 fn record(k: &str, v: Option<&str>) {
@@ -113,6 +131,9 @@ fn record(k: &str, v: Option<&str>) {
         k,
         "PLIRON_STEPCACHE" | "PLIRON_CACHE_DIR" | "PLIRON_CACHE_LOG"
     ) {
+        return;
+    }
+    if READS_OPEN.load(Ordering::Relaxed) == 0 {
         return;
     }
     READS.with(|r| {

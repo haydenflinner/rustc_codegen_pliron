@@ -31,23 +31,6 @@ fallback there.
 
 | kernel | LLVM | pliron | change |
 |---|---|---|---|
-| chars_alpha | 3.51 ms | 3.33 ms | −5.0% (noise, p=0.38) |
-| chars_ascii | 2.21 ms | 2.22 ms | +0.4% (noise) |
-| chars_mixed | 18.11 ms | 20.34 ms | +12.3% regressed |
-| contains_rng | 4.85 ms | 4.47 ms | −7.8% (p=0.06) |
-| eqbug | 208 µs | 207 µs | −5.2% (noise) |
-| fib | 10.12 ms | 11.50 ms | +13.7% regressed |
-| hashmap | 102.1 ms | 85.97 ms | −15.8% improved |
-| hmget | 18.86 ms | 18.43 ms | −2.3% (p=0.07) |
-| iterw | 66.59 ms | 80.79 ms | +21.3% regressed |
-| matmul | 12.10 ms | 10.08 ms | −16.7% improved |
-| nbody | 152.7 ms | 170.6 ms | +11.7% regressed |
-| parse_only | 639.5 ms | 543.1 ms | −15.1% improved |
-| sieve | 22.33 ms | 24.68 ms | +10.5% (p=0.06) |
-| sortw | 8.92 ms | 10.59 ms | +18.8% regressed |
-| strwork | 15.71 ms | 16.79 ms | +6.9% regressed |
-| tokenize | 6.24 ms | 4.39 ms | −29.6% improved |
-||||||| parent of a4c036c (docs: fresh native/wasm tables; CubeCL gemm_cpu comparison)
 | chars_alpha | 2.135 ms | 2.162 ms | +1.2% (noise) |
 | chars_ascii | 2.204 ms | 1.550 ms | −29.7% improved |
 | chars_mixed | 15.79 ms | 15.88 ms | +0.6% (noise) |
@@ -151,23 +134,6 @@ host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 
 | kernel | LLVM | pliron | change | dialect | change |
 |---|---|---|---|---|---|
-| chars_alpha | 3.88 ms | 4.56 ms | +17.6% | 8.61 ms | +122% |
-| chars_ascii | 2.43 ms | 3.46 ms | +42.1% | 5.20 ms | +114% |
-| chars_mixed | 21.30 ms | 30.14 ms | +41.6% | 25.85 ms | +21.1% |
-| contains_rng | 7.69 ms | 10.15 ms | +31.9% | 18.55 ms | +141% |
-| eqbug | 0.24 ms | 0.19 ms | −20.8% | 0.25 ms | +5.2% |
-| fib | 15.54 ms | 15.89 ms | +2.3% | 27.61 ms | +77.6% |
-| hashmap | 75.64 ms | 130.17 ms | +72.3% | 123.50 ms | +63.2% |
-| hmget | 16.17 ms | 29.38 ms | +81.6% | 24.23 ms | +49.8% |
-| iterw | 107.85 ms | 52.82 ms | −51.1% | 103.61 ms | −5.2% |
-| matmul | 38.87 ms | 27.56 ms | −29.1% | 39.47 ms | +1.4% |
-| nbody | 131.36 ms | 127.91 ms | −2.6% | 260.98 ms | +98.7% |
-| parse_only | 490.14 ms | 591.46 ms | +20.7% | 648.81 ms | +32.4% |
-| sieve | 20.32 ms | 20.16 ms | −0.4% | 21.30 ms | +4.8% |
-| sortw | 7.73 ms | 10.27 ms | +32.6% | 11.44 ms | +48.1% |
-| strwork | 24.25 ms | 33.92 ms | +40.0% | 44.23 ms | +82.4% |
-| tokenize | 6.31 ms | 7.19 ms | +14.1% | 20.34 ms | +223% |
-||||||| parent of a4c036c (docs: fresh native/wasm tables; CubeCL gemm_cpu comparison)
 | chars_alpha | 4.577 ms | 4.040 ms | −12.1% | 4.020 ms | −12.2% |
 | chars_ascii | 2.330 ms | 2.327 ms | −0.1% | 2.329 ms | +0.0% |
 | chars_mixed | 18.56 ms | 25.54 ms | +37.7% | 25.56 ms | +37.9% |
@@ -185,11 +151,6 @@ host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 | strwork | 17.40 ms | 23.77 ms | +36.8% | 23.92 ms | +37.5% |
 | tokenize | 7.747 ms | 5.258 ms | −31.8% | 5.263 ms | −32.3% |
 
-Geomeans: pliron/LLVM = 1.127, dialect/LLVM = 1.577 (16 kernels). All
-kernel accumulators matched across the three modules (the driver
-cross-checks return values). Module sizes: LLVM 97 KB, pliron 813 KB,
-dialect 1.1 MB.
-||||||| parent of a4c036c (docs: fresh native/wasm tables; CubeCL gemm_cpu comparison)
 Geomeans: pliron/LLVM = 1.069 (both pliron columns build the same
 CLIF-pipeline module; 16 kernels), down from 1.674 before the inlining
 work below. Module sizes: LLVM 97 KB, pliron 187 KB.
@@ -327,18 +288,34 @@ crate size. Wall-clock `cargo rustc --release` on workspace-member crates
 |---|---|---|---|
 | regex-syntax 0.8.11 | 3.04 s | 16.1 s | ~5.3x |
 | serde_json 1.0.154 | 1.33 s | 9.5 s | ~7.1x |
-| syn 2.0.119 | 3.83 s | 152.9 s | ~40x |
+| syn 2.0.119 | 3.83 s | ~122 s | ~32x |
 
-`syn` is the pathological case: ~182s of summed pipeline-step time spread
-uniformly across passes (looprot 23.7s, indvars 18.9s, slp 15.1s,
-jumpthread 11.4s, emit 10.6s, then ivrefold/loadfwd/ifconv2/selfarg/licm/
-mergechain/edgespec ~6-7s each) — no single quadratic, just ~95 passes of
-per-function cost on syn's macro-generated functions. One CGU alone holds
-72s (slp 12.5s inside it is the largest single-step spend).
+`syn` is the pathological case. After the per-pass fixes below, summed
+pipeline-step time dropped from ~483s to ~220s and the heaviest CGU from
+100.9s to 43.2s — but wall barely moved because codegen is bound by the
+non-pipeline floor: with `PLIRON_OPT_BISECT=0` (all clif passes off) syn
+still takes ~87s vs LLVM's 3.8s total. A perf profile of that floor is
+diffuse: ~14% hash-map infra (IndexMap attribute lookups, `CallInfo`/`State`
+tables), ~6.5% `pliron_clif_lower::lower`, ~9.7% *ungated* ir-opt work
+(`inline` 4.4% — its first round runs with no `pass_enabled` gate —
+plus nocapture/nowrite/phisimp/domcheck), ~2.6% regalloc2, long tail in
+pliron op construction (`pliron_llvm::ops`, `value`/`operation` tables).
+So the remaining compile-time gap is mostly *our glue*: op construction +
+hash tables + lowering, not the clif passes and not vendored cranelift.
 
-The optimizer pipeline takes ~95% of backend time. Function-level worker
-threads run the pipeline in parallel across a crate's code-generation
-units.
+Per-pass fixes that took pipeline CPU ~483s → ~220s:
+
+- `indvars::elim_shadowed`: the fixpoint rebuilt the whole-function use
+  set every round (O(fn × rounds) per loop) — now a per-value operand
+  refcount decremented in place when a pure inst dies.
+- `Analysis::uses()`/`refresh_uses()`: a `(ver, num_insts)`-keyed shared
+  `Uses` index (Rc snapshot) so steps that each rebuilt `Uses::new` share
+  one build per IR version. Wired into ivalign, ivrefold::deadrecs,
+  looprot; ~7 more call sites remain (jumpthread ×2, unroll, memspec ×2,
+  bcheck, slp).
+
+Function-level worker threads run the pipeline in parallel across a
+crate's code-generation units.
 
 A content-addressed step cache (`PLIRON_STEPCACHE=1`) stores per-pass and
 per-function results. A warm rerun of the pipeline takes about 16 ms per

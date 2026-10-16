@@ -188,8 +188,15 @@ impl Context {
 
         self.verify_if(isa)?;
 
-        self.compute_cfg();
-        self.compute_domtree();
+        // PLIRON: the pliron pipeline seeds `cfg`/`domtree` with the
+        // analyses it already built for this exact function state —
+        // only recompute what's missing.
+        if !self.cfg.is_valid() {
+            self.compute_cfg();
+        }
+        if !self.domtree.is_valid() {
+            self.compute_domtree();
+        }
         self.eliminate_unreachable_code(isa)?;
         self.remove_constant_phis(isa)?;
 

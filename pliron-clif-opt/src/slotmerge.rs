@@ -327,10 +327,9 @@ pub fn run(
                         .unwrap_or(&[])
                 };
                 if op.is_call() {
-                    let info =
-                        d.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables);
-                    if let CallInfo::Direct(fr, cargs)
-                    | CallInfo::DirectWithSig(fr, _, cargs) = info
+                    let info = d.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables);
+                    if let CallInfo::Direct(fr, cargs) | CallInfo::DirectWithSig(fr, _, cargs) =
+                        info
                     {
                         use cranelift_codegen::ir::{ExternalName, LibCall};
                         if cargs.len() >= 2
@@ -382,8 +381,7 @@ pub fn run(
                                         }
                                     }
                                 }
-                                for &s in &from_bytes[func.dfg.resolve_aliases(args[k])]
-                                {
+                                for &s in &from_bytes[func.dfg.resolve_aliases(args[k])] {
                                     for &d2 in &dst {
                                         if s != d2 {
                                             grew += cpy.insert((s, d2)) as usize;
@@ -625,8 +623,7 @@ pub fn run(
                                     }
                                 }
                                 if dst.is_empty() {
-                                    for &s in &from_bytes[func.dfg.resolve_aliases(args[k])]
-                                    {
+                                    for &s in &from_bytes[func.dfg.resolve_aliases(args[k])] {
                                         escape_deep!(contains, s, i);
                                     }
                                 }
