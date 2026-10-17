@@ -428,3 +428,50 @@ Stage-2 needs the Linux box.
   (likely the array-init/drop-glue lowering emitting per-element code).
 - everything else is env noise (stock ICEs-in-common, missing aux files,
   panic-message/abort formatting, pointer addresses).
+
+## regalloc `mov A,B; mov B,A` bounce — mechanism + a failed fix (reverted)
+
+The systematic ~4% native gap is block-param edge moves: a value threaded
+through a single-icmp `brif`-block cascade (e.g. `is_alphabetic`'s
+`'a'..='z'|'A'..='Z'|...` match → block38/167/150/154/168/169/170) gets a
+param binding per block → regalloc emits an `InEdgeMoves`/`OutEdgeMoves`
+`mov` per hop, and consecutive-edge `mov`s of the same value produce
+`movq %r8,%rcx; movq %rcx,%r8` round-trips LLVM doesn't have.
+
+Root cause located by subagent analysis (`native-notes` + vendored src):
+`vendor/regalloc2/src/ion/moves.rs::resolve_inserted_moves` calls
+`redundant_move_process_side_effects` between consecutive move groups; it
+`redundant_moves.clear()`s at EVERY `insn_block` transition — even when the
+new block's only predecessor is the block just left, so the `Copy`/`Orig`
+facts that would elide the bounce-back move get dropped.
+
+Attempted fix (REVERTED — miscompiled `nostd` `print_num` at O0):
+- Seed `redundant_moves` from the last-scanned block's tail state when the
+  new block's `block_preds(b).len()==1` and that pred == the block left.
+- `print_num`: `movq %rdi,%rax` (reload n→rax for `mulq`) at a loop-body
+  top got elided — the block is reachable from a `jbe` fall-through AND a
+  latch `jmp`, but `block_preds` does not reliably prove the scanned edge
+  was the block's *only* register-flow entry (fall-through/critical-edge
+  trampolines aren't a single `block_preds` entry the scan can attest).
+  Wrongly eliding the param-copy move left `rax` holding a stale value →
+  `n/=10` loop ran ~20 iters → `i` underflow → overflow panic.
+
+Lesson: a correct version must key on the *actually-traversed edge*
+(the scan's `cur`→`b` transition is sound ONLY if `b`'s register flow is
+exclusively via that edge — `block_preds.len()==1` is necessary but the
+edge-move/`try_call`/trampoline bookkeeping means it isn't sufficient to
+just check). This is the `natperf` regalloc-v2 / mimas line of work —
+defer to it. `PLIRON_VCODE` + `llvm-objdump` diff on a `print_num`/`fib`
+O0 build is the fast repro if it comes back up.
+
+Other confirmed micro-gaps (all codegen density, no missing pass):
+- `parse_only` `u32::from_str`: LLVM unrolls the digit loop with
+  `cmpq $N,%rsi; je` length-driven exits + `lea` for `x*10`; ours keeps
+  `iter.next()` `Option`-unwrap (`subq $0x10; cmpq %rcx; jne`) + `seto` +
+  `imull $0xa` per digit — ~2.7x insts.
+- `chars_alpha`/`is_alphabetic`: emits the `(c|0x20)-'a'<26` merged check
+  AND a cascade of per-range `brif` blocks (the `match` arms) — the dead
+  `v452`/`v454` lowercase check IS in final CLIF but correctly not
+  emitted; the residual cost is the per-block param threading.
+- `contains_rng`: 8 vector accumulators → xmm6-15 callee-save spills are
+  inherent (LLVM also spills), residual is per-edge movs.
