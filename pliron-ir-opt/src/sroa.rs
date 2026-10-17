@@ -896,6 +896,7 @@ fn split(
     st: &mut State,
     alloca: Ptr<Operation>,
     made: &mut Vec<Ptr<Operation>>,
+    cfg_dirty: &mut bool,
 ) -> bool {
     let a = alloca.deref(ctx).get_result(ctx, 0);
     let Some(&(size, align)) = st.allocas.get(a) else {
@@ -1329,6 +1330,7 @@ fn split(
                 br.insert_at_back(t, ctx);
                 reload_sync(ctx, st, pa, pin_lo, &sl, &new, &ss, br);
                 st.invokes.insert(*cop, (t, catch));
+                *cfg_dirty = true;
             }
         }
     }
@@ -1387,10 +1389,15 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .filter(|&f| has_body(ctx, f))
         .collect();
     for f in funcs {
+        // The `Dom` survives both `forward_single_store` calls — neither
+        // it nor `split` moves edges; only a spliced invoke-pad
+        // trampoline (flagged by `cfg_dirty`) forces a rebuild.
+        let mut dom: Option<crate::domcheck::Dom> = None;
+        let mut dom_stale = false;
         // Again after `phisimp`: loads that went through trivial block args
         // now name the slot directly.
         if crate::pass_enabled("PLIRON_SROA_FWD") {
-            forward_single_store(ctx, st, f);
+            forward_single_store_d(ctx, st, f, &mut dom);
         }
         // Retry worklist instead of rescanning the body each round:
         // `split` erases its alloca only when the rewrite left it
@@ -1405,7 +1412,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let mut made = Vec::new();
             for op in wl.drain(..) {
                 let a = op.deref(ctx).get_result(ctx, 0);
-                changed |= split(ctx, st, op, &mut made);
+                let mut cfg_dirty = false;
+                changed |= split(ctx, st, op, &mut made, &mut cfg_dirty);
+                dom_stale |= cfg_dirty;
                 retry.extend(made.drain(..));
                 if st.allocas.contains(a) {
                     retry.push(op);
@@ -1418,7 +1427,10 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         }
         // And after splitting: a slice left holding one stored value.
         if crate::pass_enabled("PLIRON_SROA_FWD") {
-            forward_single_store(ctx, st, f);
+            if dom_stale {
+                dom = None;
+            }
+            forward_single_store_d(ctx, st, f, &mut dom);
         }
         for op in allocas(ctx, f) {
             let a = op.deref(ctx).get_result(ctx, 0);
@@ -1716,8 +1728,25 @@ pub fn forward(ctx: &mut Context, st: &State) {
 /// was parked in such a slot (e.g. a closure's captured `&&K`), so `split`
 /// can promote them too.
 fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
-    let Some(dom) = crate::domcheck::Dom::new(ctx, st, f) else {
-        return 0;
+    let mut dom = None;
+    forward_single_store_d(ctx, st, f, &mut dom)
+}
+
+/// `forward_single_store` over a caller-held `Dom` — `sroa::run` calls
+/// this before and after its split rounds, and the dominator tree only
+/// needs rebuilding when a split spliced in a trampoline block.
+fn forward_single_store_d(
+    ctx: &mut Context,
+    st: &State,
+    f: Ptr<Operation>,
+    dom_slot: &mut Option<crate::domcheck::Dom>,
+) -> usize {
+    let dom = match dom_slot {
+        Some(d) => d,
+        slot @ None => match crate::domcheck::Dom::new(ctx, st, f) {
+            Some(d) => slot.insert(d),
+            None => return 0,
+        },
     };
     // `pos` is asked per (store, same-block load) pair — a fresh
     // `ops().position()` scan each time is O(loads × block ops). Block
