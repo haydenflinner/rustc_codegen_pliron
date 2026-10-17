@@ -338,6 +338,27 @@ Per-pass fixes that took pipeline CPU ~483s → ~220s:
 Function-level worker threads run the pipeline in parallel across a
 crate's code-generation units.
 
+### Sample-profiled cleanups (2026-10-17, bench crate, ~10.6s wall)
+
+A `sample` of the rustc process during the `pliron-bench` build showed
+~15% of codegen stacks inside `getenv`/env-lock waits — `PLIRON_*`
+debug/gate vars were re-read per inst/block/function across the
+pipeline *and* vendored cranelift (`PLIRON_POSTIDX_DEBUG` alone ran per
+lowered inst). All hot sites now cache through `pliron_cfg` or a
+`OnceLock` (patch 51); `getenv` is absent from the post-change sample.
+
+The same profile put `jumpthread` first among passes (of ~9s of
+sampled pipeline CPU across workers: `jumpthread::run` ~30% of it —
+`round` and a per-round `NonNull` fixpoint rebuild — then
+`webmerge_ctx`, `loadfwd`, `edgespec`, `slp`, `ifconv2`). Stray
+duplicate CFG builds were folded into caller-built ones:
+`proots::facts_cfg` now backs `webmerge_ctx`'s `web_nf`/`canon_map`
+(WmCtx's round-invariant cfg), `loadfwd`, `celim`, and `loopvec`'s
+per-loop facts. Remaining structural item: `sameargs`' fixpoint calls
+`webmerge_ctx` as a full-function rescan each round (×3 sameargs
+steps) — a dirty-block worklist would need to track dropped-param arg
+rebinds function-wide, not just on successor edges.
+
 A content-addressed step cache (`PLIRON_STEPCACHE=1`) stores per-pass and
 per-function results. A warm rerun of the pipeline takes about 16 ms per
 code-generation unit instead of about 800 ms. A gate flip such as
