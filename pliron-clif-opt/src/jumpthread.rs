@@ -1902,16 +1902,18 @@ pub(crate) fn round<'a>(
         if Some(b) == entry || locked.contains(&b) {
             continue;
         }
-        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-        let Some((&term, body)) = insts.split_last() else {
+        let Some(term) = func.layout.last_inst(b) else {
             continue;
         };
+        // All but the terminator, in order — recreated on each use to
+        // skip the per-block `Vec` (this loop runs every round).
+        let body = || func.layout.block_insts(b).filter(|&i| i != term);
         // `iconst`s cost nothing to evaluate through the env map; budget
         // the real ops only (long niche-merge chains — `Option<char>`
         // flag test + sentinel compare — otherwise exceed MAX_BODY).
         let real = if bodyk {
-            body.iter()
-                .filter(|&&i| {
+            body()
+                .filter(|&i| {
                     !matches!(
                         func.dfg.insts[i],
                         InstructionData::UnaryImm {
@@ -1922,9 +1924,9 @@ pub(crate) fn round<'a>(
                 })
                 .count()
         } else {
-            body.len()
+            body().count()
         };
-        if real > MAX_BODY || !body.iter().all(|&i| pure_op(func, i)) {
+        if real > MAX_BODY || !body().all(|i| pure_op(func, i)) {
             continue;
         }
         let InstructionData::Brif {
@@ -1935,7 +1937,7 @@ pub(crate) fn round<'a>(
         else {
             continue;
         };
-        let params = func.dfg.block_params(b).to_vec();
+        let params = func.dfg.block_params(b);
         let mut body_vals_l: Option<FxHashSet<Value>> = None;
         for pred in cfg.pred_iter(b) {
             let (pinst, pblock) = (pred.inst, pred.block);
@@ -2022,7 +2024,7 @@ pub(crate) fn round<'a>(
                     }
                 }
                 let rg = |v: Value| prange.get(&func.dfg.resolve_aliases(v)).copied();
-                for &i in body {
+                for i in body() {
                     if let Some(c) =
                         eval(func, &env, &nz, &rg, i).or_else(|| kfold(func, &env, &kenv, i))
                     {
@@ -2186,7 +2188,7 @@ pub(crate) fn round<'a>(
                 }
                 let mut new = Vec::new();
                 let body_vals = body_vals_l.get_or_insert_with(|| {
-                    body.iter().map(|&i| func.dfg.first_result(i)).collect()
+                    body().map(|i| func.dfg.first_result(i)).collect()
                 });
                 for a in t.args(&func.dfg.value_lists) {
                     let BlockArg::Value(v) = a else {
