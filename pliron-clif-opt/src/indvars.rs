@@ -3032,7 +3032,7 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
                 InstructionData::Binary {
                     opcode: Opcode::Isub,
                     args: [a, b],
-                } => iconst(func, b).map(|c| (a, -c)),
+                } => iconst(func, b).map(|c| (a, c.wrapping_neg())),
                 _ => None,
             },
             _ => None,
@@ -3040,7 +3040,10 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
         match step {
             Some((nv, c)) => {
                 v = nv;
-                k += c;
+                // iadd/isub wrap mod 2^64 — accumulate the same way
+                // (iconst is i64::MIN for isub, or a chain of huge
+                // offsets, can overflow a plain `+` under debug checks).
+                k = k.wrapping_add(c);
             }
             None => return (rv, k),
         }
