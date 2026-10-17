@@ -1851,6 +1851,10 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // (cfg/dom/edges) is round-invariant, so it is built once here
     // rather than per call.
     let mut wctx = WmCtx::new(func);
+    // A round's merges rebind only values inside the merged blocks'
+    // dominated regions — the next round's scan is confined to those
+    // regions plus their out-edge targets (`merge_dirty`).
+    let mut dirty: Option<FxHashSet<Block>> = None;
     for _ in 0..8 {
         // `webmerge` subsumes the old `sameargs_round`/`phimerge`/
         // `affparm` trio: phase A is the uniform-arg merge (with
@@ -1858,7 +1862,8 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // phase B the duplicate-param merge, phases C/D the rest.
         // Looping webmerge alone still reaches the cross-block fixpoint
         // — each drop can expose uniform args in successor blocks.
-        let (k, pm) = webmerge_ctx(func, &mut wctx);
+        let (k, pm, merged) = webmerge_ctx(func, &mut wctx, dirty.as_ref());
+        dirty = Some(merge_dirty(&wctx, &merged));
         n += k;
         if !pm.is_empty() {
             // Compose into the accumulated map: old carriers may
@@ -2072,11 +2077,13 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // `const_sweep` inside the loop folds `brif`s to `jump`s — rebuild
     // it whenever a sweep changes the edge list.
     let mut wctx = WmCtx::new(func);
+    let mut dirty: Option<FxHashSet<Block>> = None;
     for _ in 0..8 {
         // `cparm_round`'s carried-const chase is `webmerge` iterated:
         // each uniform-param link drops via phase A (the const leaf
         // materializes through `emit_key`), exposing the next link.
-        let (k, pm) = webmerge_ctx(func, &mut wctx);
+        let (k, pm, merged) = webmerge_ctx(func, &mut wctx, dirty.as_ref());
+        dirty = Some(merge_dirty(&wctx, &merged));
         n += k;
         for v in pmap.values_mut() {
             while let Some(&w) = pm.get(v) {
@@ -2098,6 +2105,9 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             n += cs;
             if cs > 0 {
                 wctx = WmCtx::new(func);
+                // Folded branches change the edge list — the dirty set
+                // was computed against the old topology.
+                dirty = None;
             }
         }
     }
@@ -2361,10 +2371,45 @@ fn subtree_hashes(
 
 pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut ctx = WmCtx::new(func);
-    webmerge_ctx(func, &mut ctx)
+    let (n, pmap, _) = webmerge_ctx(func, &mut ctx, None);
+    (n, pmap)
 }
 
-pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<Value, Value>) {
+/// Blocks a `webmerge_ctx` round can have changed the merge inputs of:
+/// the merged blocks, every block they dominate (a dropped param or a
+/// materialized carrier can only be *used* under dominator scoping),
+/// and the immediate out-edge targets whose arg slots the global
+/// `pmap` rewrite may have rewritten.
+fn merge_dirty(ctx: &WmCtx, merged: &FxHashSet<Block>) -> FxHashSet<Block> {
+    let mut d: FxHashSet<Block> = FxHashSet::default();
+    let mut stack: Vec<Block> = merged.iter().copied().collect();
+    while let Some(x) = stack.pop() {
+        if d.insert(x) {
+            stack.extend(ctx.dom.children(x));
+        }
+    }
+    let region: Vec<Block> = d.iter().copied().collect();
+    for x in region {
+        for s in ctx.cfg.succ_iter(x) {
+            d.insert(s);
+        }
+    }
+    d
+}
+
+/// `dirty`, when `Some`, restricts the scan to those blocks — used by
+/// the fixpoint callers with `merge_dirty`. A merge at `b` rewrites
+/// only values dominated by `b` (SSA scoping bounds every use of a
+/// dropped param and of anything defined under `b`), plus arg slots on
+/// edges leaving that region, so a block outside `dom(b) ∪
+/// succs(dom(b))` sees identical inputs and would make identical
+/// decisions. The third return element is the set of blocks that
+/// actually merged this round — feed it to `merge_dirty`.
+pub fn webmerge_ctx(
+    func: &mut Function,
+    ctx: &mut WmCtx,
+    dirty: Option<&FxHashSet<Block>>,
+) -> (usize, FxHashMap<Value, Value>, FxHashSet<Block>) {
     use crate::proots::Key;
     let t0 = std::time::Instant::now();
     let WmCtx { cfg, dom, edges } = ctx;
@@ -2412,8 +2457,17 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     let no_phased = pliron_cfg::env_set("PLIRON_WM_NOPHASED");
     let no_phasec = pliron_cfg::env_set("PLIRON_WM_NOPHASEC");
     let no_phaseb = pliron_cfg::env_set("PLIRON_WM_NOPHASEB");
+    let dirty = if pliron_cfg::env_set("PLIRON_WM_NODIRTY") {
+        None
+    } else {
+        dirty
+    };
     for (&b, es) in edges.iter() {
         let tb0 = std::time::Instant::now();
+        if dirty.is_some_and(|d| !d.contains(&b)) {
+            tpre_sum += tb0.elapsed();
+            continue;
+        }
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
             tpre_sum += tb0.elapsed();
@@ -3302,7 +3356,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         }
     }
     if param_drops.is_empty() {
-        return (0, pmap);
+        return (0, pmap, FxHashSet::default());
     }
     let tprep = std::time::Instant::now();
     // Materialize each non-member class at its block's head, operands
@@ -3331,6 +3385,9 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             !ixs.is_empty()
         });
     }
+    // Blocks that actually changed — param drops still attached below,
+    // so `value_def` still names their owner block.
+    let mut merged: FxHashSet<Block> = orders.keys().copied().collect();
     for (b, insts) in orders {
         match func.layout.first_inst(b) {
             Some(fi) => {
@@ -3352,6 +3409,11 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             (i, d, ixs)
         })
         .collect();
+    for &p in &param_drops {
+        if let ValueDef::Param(b, _) = func.dfg.value_def(p) {
+            merged.insert(b);
+        }
+    }
     let n = param_drops.len();
     let temit = std::time::Instant::now();
     apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
@@ -3373,7 +3435,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             )
         };
     }
-    (n, pmap)
+    (n, pmap, merged)
 }
 
 /// Does `key` contain a `P` leaf — i.e. is it a slot-relative shape?
