@@ -180,15 +180,14 @@ fn fill_operation(
         .lookup_op(op)
         .expect("op shell must be created before it is filled");
 
-    // Operands, remapped through the now-complete mapping and pushed in order.
+    // Operands, remapped through the now-complete mapping, set in one
+    // rewrite — a push per operand would rebuild the pool span each time.
     let operands: Vec<Value> = op
         .deref(ctx)
         .operands(ctx)
         .map(|v| mapper.lookup_value_or_default(v))
         .collect();
-    for operand in operands {
-        Operation::push_operand(new_op, ctx, operand);
-    }
+    Operation::set_operands(new_op, ctx, operands);
 
     // Clone the blocks of each region into the corresponding (empty) region of
     // the clone.

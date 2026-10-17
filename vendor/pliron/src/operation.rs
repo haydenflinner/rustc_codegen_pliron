@@ -608,6 +608,14 @@ impl Operation {
             .into_iter()
     }
 
+    /// PLIRON: replace the whole operand list in one rewrite. Pushing `defs`
+    /// one at a time via [`Operation::push_operand`] pays a span realloc plus
+    /// a full use-node rebuild per element; bulk construction (op cloning)
+    /// does a single drop + span append.
+    pub fn set_operands(this: Ptr<Operation>, ctx: &Context, defs: Vec<Value>) {
+        Self::rewrite_operands(this, ctx, defs);
+    }
+
     /// Add a new operand to the end of the operand list, returning its index.
     pub fn push_operand(this: Ptr<Operation>, ctx: &Context, new_opd: Value) -> usize {
         let mut defs = this.deref(ctx).operand_defs(ctx);
