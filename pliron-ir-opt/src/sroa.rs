@@ -1484,8 +1484,15 @@ pub fn run(ctx: &mut Context, st: &mut State) {
 fn why(ctx: &Context, st: &State, a: Value) -> String {
     let mut memo = AccMemo::default();
     let mut work = vec![a];
+    // The store->slot_loads->work re-entry path can cycle through shared
+    // GEP/load chains; without a visited set the worklist grew without
+    // bound and OOMed the backend under PLIRON_STATS_WHY.
+    let mut seen: rustc_hash::FxHashSet<Value> = Default::default();
     let mut uses = Vec::new();
     while let Some(p) = work.pop() {
+        if !seen.insert(p) {
+            continue;
+        }
         for u in p.uses(ctx) {
             let op = u.user_op();
             let idx = u.find_index(ctx);
