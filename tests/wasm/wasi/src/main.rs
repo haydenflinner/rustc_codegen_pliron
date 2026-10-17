@@ -75,6 +75,18 @@ fn main() {
         "libm",
         (x.exp() - std::f64::consts::E).abs() < 1e-12 && (x.atan2(x) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
     );
+    // wpeep regression: str::lt compares a prefix then falls back to the
+    // length difference; a deleted `get l; set l` self-copy hid the write
+    // carrying that difference out of the branch, and the copy-forward
+    // pass overwrote it with the memcmp result (lt returned false).
+    {
+        let c = std::hint::black_box("cccc");
+        let cc = std::hint::black_box("ccccc");
+        check("str lt", c < cc && !(cc < c) && c != cc && cc > c);
+        let b = std::hint::black_box(b"abcd".as_slice());
+        let bb = std::hint::black_box(b"abcde".as_slice());
+        check("slice lt", b < bb && bb > b);
+    }
     eprintln!("wasi std OK");
 }
 

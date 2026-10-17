@@ -485,6 +485,14 @@ enum WPeek {
     Del,
     /// `local.set` proven dead; emits `drop` to keep the stack effect.
     Drop,
+    /// A `local.get l; local.set l` self-copy deleted by the adjacent-pair
+    /// coalescing. Emits no bytes — the pair is a real no-op — but it both
+    /// *reads* l and *writes back the observed value*, and later rewrites
+    /// (the copy-forward fixpoint below) move defs between locals, which
+    /// can change what l holds at this point. Keeping the marker makes the
+    /// analysis see the read and the reaffirming write it would otherwise
+    /// lose track of.
+    Nop(u32),
     Other,
 }
 
@@ -669,23 +677,34 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         let mut changed = false;
         let mut i = 0;
         while i < ins.len() {
-            let pair = (ins[i].0, ins.get(i + 1).map(|x| x.0));
+            // Pair detection skips Nop markers: deleted self-copies are
+            // stack-transparent, so `get a; <nop>; set a` is still a
+            // no-op pair. Skipped markers are re-emitted either way.
+            let mut j = i + 1;
+            while j < ins.len() && matches!(ins[j].0, WPeek::Nop(_)) {
+                j += 1;
+            }
+            let pair = (ins[i].0, ins.get(j).map(|x| x.0));
             match pair {
                 (WPeek::Get(a), Some(WPeek::Set(c))) if a == c => {
+                    out.push((WPeek::Nop(a), ins[i].1, ins[i].2, ins[i].3));
+                    out.extend_from_slice(&ins[i + 1..j]);
                     changed = true;
-                    i += 2;
+                    i = j + 1;
                     continue;
                 }
                 (WPeek::Set(a), Some(WPeek::Get(c))) if a == c => {
                     out.push((WPeek::Tee(a), ins[i].1, ins[i].2, ins[i].3));
+                    out.extend_from_slice(&ins[i + 1..j]);
                     changed = true;
-                    i += 2;
+                    i = j + 1;
                     continue;
                 }
                 (WPeek::Tee(a), Some(WPeek::Set(c))) if a == c => {
                     out.push((WPeek::Set(a), ins[i].1, ins[i].2, ins[i].3));
+                    out.extend_from_slice(&ins[i + 1..j]);
                     changed = true;
-                    i += 2;
+                    i = j + 1;
                     continue;
                 }
                 _ => {}
@@ -1041,6 +1060,15 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             match k {
                 WPeek::Get(l) => uses.entry(l).or_default().push(i),
                 WPeek::Set(l) => defs.entry(l).or_default().push(i),
+                WPeek::Nop(l) => {
+                    // Deleted `get l; set l`: reads l and writes the same
+                    // value back — a use plus an identity def. Without it
+                    // in both maps the analysis could retarget a producer
+                    // onto l (changing what the read would observe) or
+                    // lose the reaffirming write a merge point relied on.
+                    uses.entry(l).or_default().push(i);
+                    defs.entry(l).or_default().push(i);
+                }
                 WPeek::Tee(l) => {
                     uses.entry(l).or_default().push(i);
                     defs.entry(l).or_default().push(i);
@@ -1056,6 +1084,9 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         for (i, &(k, _, _, _)) in ins.iter().enumerate() {
             match k {
                 WPeek::Get(_) | WPeek::Tee(_) => pending.push(i),
+                // A deleted self-copy is stack-neutral: keep matching
+                // through it exactly as if it weren't there.
+                WPeek::Nop(_) => {}
                 WPeek::Set(_) => {
                     if let Some(g) = pending.pop() {
                         pairs.push((g, i));
@@ -1075,7 +1106,13 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             if t == x {
                 continue; // get x ... set x: stack-neutral no-op, leave it
             }
-            let Some(&p1) = defs.get(&t).and_then(|v| v.iter().rev().find(|&&d| d < gi)) else {
+            // A Nop marker can never be the producer: it writes back the
+            // value it read, so retargeting it would leave x unwritten.
+            let Some(&p1) = defs.get(&t).and_then(|v| {
+                v.iter()
+                    .rev()
+                    .find(|&&d| d < gi && !matches!(ins[d].0, WPeek::Nop(_)))
+            }) else {
                 continue;
             };
             cand.push((p1, gi, si, t, x));
@@ -1223,6 +1260,8 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         // Defs of x inside the (p1, si) window per candidate: these
         // must relocate onto the temp local t, which the producer
         // retarget frees. (si itself is the copy-set, handled apart.)
+        // Nop markers aren't relocatable — they emit no instruction and
+        // their write is bound to the value x holds at their position.
         let xdefs: Vec<Vec<usize>> = cand
             .iter()
             .map(|&(p1, _, si, _, x)| {
@@ -1230,7 +1269,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                     .map(|v| {
                         v.iter()
                             .copied()
-                            .filter(|&d| d > p1 && d < si)
+                            .filter(|&d| d > p1 && d < si && !matches!(ins[d].0, WPeek::Nop(_)))
                             .collect()
                     })
                     .unwrap_or_default()
@@ -1288,7 +1327,10 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                     let mut xrd: Vec<usize> = Vec::new();
                     if ok {
                         for &u in uses.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
-                            if u == gi || !matches!(ins[u].0, WPeek::Get(_)) {
+                            // Nop markers count as reads: they may be
+                            // retargeted like a get (the self-copy stays a
+                            // no-op on whichever local it points at).
+                            if u == gi || !matches!(ins[u].0, WPeek::Get(_) | WPeek::Nop(_)) {
                                 continue;
                             }
                             let s = obs(dl_t, &[], u, &nogone);
@@ -1317,7 +1359,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                     }
                     if ok {
                         for &u in uses.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
-                            if !matches!(ins[u].0, WPeek::Get(_)) {
+                            if !matches!(ins[u].0, WPeek::Get(_) | WPeek::Nop(_)) {
                                 continue;
                             }
                             let so = obs(dl_x, &[], u, &nogone);
@@ -1409,8 +1451,13 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             }
             ins[gi].0 = WPeek::Del;
             ins[si].0 = WPeek::Del;
+            // A retargeted Nop stays a marker (still a no-op self-copy,
+            // now on the other local); a real get becomes a real get.
             for &u in &tre {
-                ins[u].0 = WPeek::Get(x);
+                ins[u].0 = match ins[u].0 {
+                    WPeek::Nop(_) => WPeek::Nop(x),
+                    _ => WPeek::Get(x),
+                };
             }
             for &d in &xdefs[ci] {
                 ins[d].0 = match ins[d].0 {
@@ -1420,7 +1467,10 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                 };
             }
             for &u in &xrd {
-                ins[u].0 = WPeek::Get(t);
+                ins[u].0 = match ins[u].0 {
+                    WPeek::Nop(_) => WPeek::Nop(t),
+                    _ => WPeek::Get(t),
+                };
             }
             changed = true;
         }
@@ -1763,7 +1813,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                 leb(&mut nb, n);
             }
             WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
-            WPeek::Del => {}
+            WPeek::Del | WPeek::Nop(_) => {}
             WPeek::Drop => nb.push(0x1a),
         }
         wi += 1;
@@ -1935,6 +1985,92 @@ fn wpeep(bytes: &mut Vec<u8>) {
         p = e;
     }
     *bytes = out;
+}
+
+#[cfg(test)]
+mod wpeep_tests {
+    use super::*;
+
+    /// Wrap an instruction stream in a body prefix: one local group of
+    /// `nl` i32s, then the instructions, then the body `end`.
+    fn body(nl: u32, ins: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x01, nl as u8, 0x7f];
+        b.extend_from_slice(ins);
+        b.push(0x0b);
+        b
+    }
+
+    fn has_seq(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // Regression: a `local.get x; local.set x` no-op pair inside one arm
+    // of an if is still a *use* of x — waffle emits it when a br's block
+    // param is copied onto the local that already holds it. The
+    // copy-forward fixpoint must not retarget the producer onto x across
+    // it: that changes what x holds on the arm's exit path. (This is the
+    // <&str>::lt miscompile: the then-arm carried the len difference in
+    // l4 through a deleted self-copy; retargeting the memcmp producer to
+    // l4 made the block yield memcmp's 0 instead of -1.)
+    //
+    //   block
+    //     get 1; get 3; i32.sub; set 4    ; d0 = l4
+    //     i32.const 0; tee 5              ; producer p1 -> t=5
+    //     i32.eqz; if
+    //       get 4; set 4; br 1            ; self-copy (deleted as a pair)
+    //     else
+    //       get 5; set 4; br 1            ; copy t -> x
+    //     end
+    //   end
+    //   get 4; drop
+    #[test]
+    fn self_copy_blocks_producer_retarget() {
+        let b = body(
+            8,
+            &[
+                0x02, 0x40, // block
+                0x20, 0x01, 0x20, 0x03, 0x6b, // get 1; get 3; i32.sub
+                0x21, 0x04, // set 4
+                0x41, 0x00, // i32.const 0
+                0x22, 0x05, // tee 5
+                0x45, // i32.eqz
+                0x04, 0x40, // if
+                0x20, 0x04, 0x21, 0x04, // get 4; set 4
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x20, 0x05, 0x21, 0x04, // get 5; set 4
+                0x0c, 0x01, // br 1
+                0x0b, // end
+                0x0b, // end
+                0x20, 0x04, 0x1a, // get 4; drop
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        // The producer must stay on local 5 and the else copy must
+        // survive — retargeting it (tee 4 / deleting get5;set4) is the
+        // miscompile.
+        assert!(has_seq(&out, &[0x22, 0x05]), "producer lost: {out:02x?}");
+        assert!(has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy gone: {out:02x?}");
+        assert!(!has_seq(&out, &[0x22, 0x04]), "miscompile: {out:02x?}");
+    }
+
+    // Same shape without the interfering self-copy: forwarding must still
+    // fire, retargeting the producer onto the copy destination.
+    #[test]
+    fn plain_copy_still_forwards() {
+        let b = body(
+            8,
+            &[
+                0x41, 0x07, // i32.const 7
+                0x22, 0x05, // tee 5
+                0x20, 0x05, 0x21, 0x04, // get 5; set 4
+                0x20, 0x04, 0x1a, // get 4; drop
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x22, 0x04]), "no forward: {out:02x?}");
+        assert!(!has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy left: {out:02x?}");
+    }
 }
 
 /// Rebuild `succs`/`preds`/`pos_in_succ_pred`/`pos_in_pred_succ` from
