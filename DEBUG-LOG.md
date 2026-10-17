@@ -351,3 +351,35 @@ write. Verified: estr-slice/infer-rhs/try-macro/overeager all pass, the
 4 original ui-wasm bugs are dead, 16468-pass full suite. Remaining
 noise: 2 `output-mismatch` (raw pointer addresses — expected) + 2
 `run-fail` (f16/f128 unsupported — same under PEEP=0).
+
+## night pass — wasm correctness + inlining consolidation
+
+**wasm correctness (now clean):** all 4 known ui-wasm miscompiles fixed
+(bittab range-match `4e9195d`, extend narrow-sign `11d5810`, branch
+i64-cond `11d5810`, wpeep self-copy `1928c86`) + 2 more found by the
+full ui-wasm suite: `estr-slice`'s `str::lt` lost-write (peep
+coalesce/copy-forward, `Nop` marker) and `k_adler`'s KOS hoist landing
+under an escaping `local.tee` (`1306866`/`4040ba4` positional guard).
+Suite now: 16468 pass, only f16/f128 unsupported + pointer-address
+noise + abort-vs-trap stderr formatting remain.
+
+**wasm perf (agent-landed):** `59cd928` xcgu emit-closure `visible`
+root fix + `WASM_HOT` loop callsite bonus + `constload` ptr-size relocs
++ `sroa` memset scalarize → hashmap +52%→+13%, hmget +58%→+6%, geomean
+1.15→1.057. `loopvec` lagged-ptr-param (`a12df2b`) + sat idiom.
+
+**native (unfixed tonight):** matmul/bsearch/loopvec-class gaps —
+`armmerge` (twin-arm → `select`, natperf worktree) targets bsearch's
+branchy update arms; SLP covers 2-lane pairs but not [f64;3] groups
+(nbody +68%: LLVM 168 `*pd`, ours 83 + 253 scalar — the 3-lane pad).
+
+**remaining wasm gaps:** `chars_mixed` +49% (unicode `skip_search`/
+`is_alphabetic` codegen density), `parse_only` +34%, `tokenize` +27%,
+`chars_ascii` +28% — the str-iter/char-method codegen class; `armmerge`
+should help `chars_mixed`/`tokenize` (unicode tables are skip-searches
+on range tables — same branchy shape as `bsearch`).
+
+**in-flight:** `natperf` armmerge+loopvec, `ui` loadfwd_call_indirect,
+`diff` sysroot stage-2 probes + filetest-deletion cleanup (review on
+merge — deleting `.clif` is coverage loss). `f16`/`f128` unimplemented
+(type lowering + libcall ABI — `lang_start` stubs).
