@@ -151,3 +151,31 @@ pub extern "C" fn eq_bytes_check(x: u32) -> u32 {
     }
     hits
 }
+
+static mut ADLER_BUF: [u8; 16384] = [0; 16384];
+
+/// Dual-accumulator byte loop under volatile perturb writes: `wpeep`'s
+/// keep-on-stack pass used to hoist a surviving `local.get` below an
+/// escaping `local.tee` copy here, reordering the operand stack so the
+/// loop-exit `i32.ne` compared the checksum (not the pointer) against the
+/// end — the loop ran off the end of memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn adler32(reps: u32) -> u32 {
+    let mut acc = 0u32;
+    for r in 0..reps {
+        unsafe {
+            let i = (r as usize) & 15;
+            core::ptr::write_volatile(&raw mut ADLER_BUF[i], r as u8);
+        }
+        acc = acc.wrapping_add(core::hint::black_box({
+            let t = unsafe { &ADLER_BUF[..] };
+            let (mut a, mut b) = (1u32, 0u32);
+            for &x in t {
+                a = (a + x as u32) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }));
+    }
+    acc
+}

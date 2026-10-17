@@ -1656,47 +1656,30 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                         break;
                     }
                 }
-                if crate::env_set("PLIRON_WASM_KOSDBG") {
-                    eprintln!(
-                        "wpeep kos: cand set l{} @{} get @{} ps={:?}({:?}@{:?}) hoists={:?}",
-                        t,
-                        ins[s].1,
-                        ins[u].1,
-                        ps,
-                        ps.map(|v| ins[v].0),
-                        ps.map(|v| ins[v].1),
-                        hoists.iter().map(|&g| (ins[g].0, ins[g].1)).collect::<Vec<_>>()
-                    );
-                }
                 let Some(ps) = ps else { continue };
-                // The kept value must be the ONLY slot the producer
-                // leaves on the stack: a `local.tee`/kept copy or any
-                // other push inside [ps, s) that survives past `u` sits
-                // between the hoisted gets (emitted below `ps`) and the
-                // kept value — a later consumer then pops the wrong
-                // operand (the survivor landed on top of a hoisted get).
                 // Positional check: emit the hoists at `ps`, then simulate
-                // [ps, u) including the pending prelude pushes of earlier
+                // [ps, u) including pending prelude pushes of earlier
                 // rewrites (they're not in `ins`). The transform is only
                 // sound when the stack at `u` is [.., h0..hn, kept]: any
                 // other value still on the stack between the hoisted gets
-                // and the kept value (a `local.tee`'s kept copy, or a
-                // value the producer leaked) makes later consumers pop
-                // the wrong operand.
+                // and the kept value — a `local.tee`'s kept copy, a value
+                // the producer leaked, or a prelude queued inside the span
+                // — makes a later consumer pop the wrong operand.
                 const KEPT: usize = usize::MAX;
+                const PREL: usize = usize::MAX - 1;
                 let mut slots: Vec<usize> = Vec::new();
                 let mut ok = true;
                 // Preludes queued for the same `ps` anchor emit first.
-                for &(off, pl) in &prel {
+                for &(off, _) in &prel {
                     if off == ins[ps].1 {
-                        slots.push(pl as usize);
+                        slots.push(PREL);
                     }
                 }
                 slots.extend_from_slice(&hoists);
                 for v in ps..u {
-                    for &(off, pl) in &prel {
+                    for &(off, _) in &prel {
                         if off == ins[v].1 {
-                            slots.push(pl as usize);
+                            slots.push(PREL);
                         }
                     }
                     if v == s {
@@ -1725,9 +1708,6 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                     for _ in 0..qq {
                         slots.push(v);
                     }
-                }
-                if crate::env_set("PLIRON_WASM_KOSDBG") {
-                    eprintln!("wpeep kos: surv={slots:?} for cand set l{t} @{}, get @{}", ins[s].1, ins[u].1);
                 }
                 let suf = slots.len().saturating_sub(hoists.len() + 1);
                 if !ok
@@ -1786,23 +1766,6 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         }
         let applied = !sel.is_empty();
         for (s, u, ps, hoists) in sel {
-            if crate::env_set("PLIRON_WASM_KOSDBG") {
-                eprintln!("wpeep kos: window {:?}", (ps..=u).map(|v| (ins[v].0, ins[v].1)).collect::<Vec<_>>());
-                eprintln!(
-                    "wpeep kos: set l{} @{} -> get @{} ps={:?} hoists={:?}",
-                    match ins[s].0 {
-                        WPeek::Set(l) => l,
-                        _ => unreachable!(),
-                    },
-                    ins[s].1,
-                    ins[u].1,
-                    ins[ps].1,
-                    hoists
-                        .iter()
-                        .map(|&g| (ins[g].0, ins[g].1))
-                        .collect::<Vec<_>>()
-                );
-            }
             protected.insert(ins[ps].1);
             for &g in &hoists {
                 if let WPeek::Get(lx) = ins[g].0 {
