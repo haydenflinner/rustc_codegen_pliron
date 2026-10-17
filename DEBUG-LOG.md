@@ -284,26 +284,21 @@ codegen. `PLIRON_DIFFCHECK=1` on the genisle crate (cranelift-meta
 build) produced zero reports (dir only created on mismatch).
 `PLIRON_VERIFY=full` clean on genisle.
 
-## hashmap/hmget residual â€” inliner incremental-rescan gap (perf)
+## hashmap/hmget residual — probe-loop codegen, not call overhead (perf)
 
-Native `HashMap::get`/`insert` in a hot loop: `run -> hash_one`
-scores `n=932 cost=935` â€” `t` starts at `DEFAULT_LIMIT`(320) but the
-loop-callsite bonus (`PLIRON_INLINE_LOOP`, +limit*8/4=640) lifts it to
-960 â†’ ACCEPT for `run`/`main` (the outermost caller). The same
-callsite inside `get`/`insert`/`reserve_rehash` is scored BEFORE those
-fns inline into `run`: `t=320` flat â†’ reject. After `get`/`insert`
-inline into `run`, those rejected `hash_one` callsites physically move
-into `run`'s loop but keep their reject decisions â€” the incremental
-rescan re-evaluates the *caller* (`run -> hash_one` accept fired once)
-but the stale-reject callsites inside the inlined body aren't
-rescored. Result: `run` inlines one `hash_one` copy yet still emits
-~6 calls. LLVM inlines `hash_one` at every hot callsite (0 out-of-line
-refs). Fix direction: after a caller inlines a callee, rescore the
-newly-materialized callsites under the caller's loop/cold context, not
-the callee's old one â€” the rescan loop exists but only re-runs callers
-that changed at the callsite level.
+Native `HashMap::get` in a hot loop: the inliner DOES reach `hash_one`
+correctly — `run -> get` (n=286, t=3840) and `run -> hash_one`
+(n=932, cost=935, t=960 via the `PLIRON_INLINE_LOOP` bonus) both
+ACCEPT: `run`'s emitted body has `hash_one` fully inlined. The
+remaining `hash_one` callsites in the object are `main`'s cold
+setup/rehash path (`insert`/`reserve_rehash`/`make_hasher -> hash_one`
+scored at flat t=320 — rejected — correctly, they're not hot).
+So the +38% hashmap / +52% hmget gap is inside the inlined probe loop
+itself: our `run` emits ~32 xmm ops vs LLVM's 53 — hashbrown's SSE2
+group-scan (loadu/cmpgt/movemask/shuffle) partially un-lowered, plus
+per-iteration structure differences, not missing hash inlining.
 
-Side note: `PLIRON_INLINE_VERBOSE` maps to `pliron::inline` at DEBUG
-but the scoring path gates on `enabled!(pliron::frozen)` â€” set
+`PLIRON_INLINE_VERBOSE` maps to `pliron::inline` at DEBUG but the
+scoring path gates on `enabled!(pliron::frozen)` — set
 `PLIRON_TRACE=pliron::frozen=debug,pliron::inline=debug` to see
 cost/t/reject lines until the target is renamed.
