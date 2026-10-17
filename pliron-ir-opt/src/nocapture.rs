@@ -130,6 +130,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
     let mut work = vec![op.deref(ctx).get_operand(ctx, 0)];
     let mut seen = FxHashSet::default();
     let mut stored = Vec::new();
+    let mut ubuf = Vec::new();
     while let Some(v) = work.pop() {
         if !seen.insert(v) {
             continue;
@@ -144,7 +145,8 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
             work.push(d.deref(ctx).get_operand(ctx, 0));
             continue;
         }
-        for u in v.uses(ctx) {
+        v.uses_into(ctx, &mut ubuf);
+        for u in ubuf.iter().copied() {
             let o = u.user_op();
             if st.volatile.contains(o) {
                 bail!("volatile use");

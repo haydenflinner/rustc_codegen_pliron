@@ -313,6 +313,9 @@ pub(crate) struct AccMemo {
     /// slot otherwise re-walks its whole copy-out closure for every
     /// `store *q <- p` use.
     loads: FxHashMap<(Value, u32), Option<Vec<Value>>>,
+    /// `gep_offset` per op — a GEP re-visited under another root or
+    /// depth re-decodes its index attr otherwise.
+    geps: FxHashMap<Ptr<Operation>, Option<i64>>,
     /// Shared exploration budget across the memo's nested walks: the
     /// per-walk `visited` cap alone still lets K distinct (root,depth)
     /// subgraphs each burn `MAX_ACC_WALK`. `accesses` caps one
@@ -327,9 +330,26 @@ impl Default for AccMemo {
         Self {
             acc: Default::default(),
             loads: Default::default(),
+            geps: Default::default(),
             budget: usize::MAX,
         }
     }
+}
+
+/// `gep_offset` through an `AccMemo` — a GEP's decoded offset is
+/// use-independent, so it survives across the memo's whole lifetime.
+fn gep_offset_m(
+    ctx: &Context,
+    st: &State,
+    op: Ptr<Operation>,
+    memo: &mut AccMemo,
+) -> Option<i64> {
+    if let Some(&r) = memo.geps.get(&op) {
+        return r;
+    }
+    let r = gep_offset(ctx, st, op);
+    memo.geps.insert(op, r);
+    r
 }
 
 /// `dst` is the address operand of `store *dst <- p` that carried a pointer
@@ -457,6 +477,7 @@ fn accesses_inner(
     let mut geps = Vec::new();
     let mut work = vec![(a, 0i64, false)];
     let mut visited = FxHashSet::default();
+    let mut ubuf = Vec::new();
     while let Some((p, base, flow)) = work.pop() {
         if !visited.insert((p, base, flow)) {
             continue;
@@ -465,7 +486,8 @@ fn accesses_inner(
         if memo.budget == 0 || visited.len() > MAX_ACC_WALK {
             return None;
         }
-        for u in p.uses(ctx) {
+        p.uses_into(ctx, &mut ubuf);
+        for u in ubuf.iter().copied() {
             let op = u.user_op();
             let idx = u.find_index(ctx);
             if st.volatile.contains(op) {
@@ -478,7 +500,7 @@ fn accesses_inner(
                 if idx != 0 {
                     return None;
                 }
-                let o = base.checked_add(gep_offset(ctx, st, op)?)?;
+                let o = base.checked_add(gep_offset_m(ctx, st, op, memo)?)?;
                 if !flow {
                     geps.push(op);
                 }
@@ -1548,15 +1570,17 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
     // bound and OOMed the backend under PLIRON_STATS_WHY.
     let mut seen: rustc_hash::FxHashSet<Value> = Default::default();
     let mut uses = Vec::new();
+    let mut ubuf = Vec::new();
     while let Some(p) = work.pop() {
         if !seen.insert(p) {
             continue;
         }
-        for u in p.uses(ctx) {
+        p.uses_into(ctx, &mut ubuf);
+        for u in ubuf.iter().copied() {
             let op = u.user_op();
             let idx = u.find_index(ctx);
             if Operation::is_op::<GetElementPtrOp>(op, ctx) && idx == 0 {
-                if gep_offset(ctx, st, op).is_none() {
+                if gep_offset_m(ctx, st, op, &mut memo).is_none() {
                     return "dynamic gep".into();
                 }
                 work.push(op.deref(ctx).get_result(ctx, 0));
@@ -1692,8 +1716,10 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
     for op in allocas(ctx, f) {
         let (mut store, mut loads, mut geps, mut ok) = (None, Vec::new(), Vec::new(), true);
         let mut work = vec![op.deref(ctx).get_result(ctx, 0)];
+        let mut ubuf = Vec::new();
         while let Some(p) = work.pop() {
-            for u in p.uses(ctx) {
+            p.uses_into(ctx, &mut ubuf);
+            for u in ubuf.iter().copied() {
                 let o = u.user_op();
                 ok &= !st.volatile.contains(o)
                     && if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {

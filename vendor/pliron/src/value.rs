@@ -234,6 +234,14 @@ impl Value {
         self.get_defnode_ref(ctx).uses().collect()
     }
 
+    /// PLIRON: [`Value::uses`] into a caller-owned buffer so per-node
+    /// queries in a worklist walk share one allocation. The copy is still
+    /// required — the defnode sits behind a RefCell.
+    pub fn uses_into(&self, ctx: &Context, out: &mut Vec<Use<Value>>) {
+        out.clear();
+        out.extend(self.get_defnode_ref(ctx).uses());
+    }
+
     /// Does this definition have any [Use]?
     pub fn is_used(&self, ctx: &Context) -> bool {
         self.get_defnode_ref(ctx).is_used()
