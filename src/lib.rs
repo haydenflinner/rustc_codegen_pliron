@@ -1682,6 +1682,13 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             rustc_middle::mono::Visibility::Default,
         );
     }
+    let dump = crate::env_set("PLIRON_MONODUMP");
+    if dump {
+        eprintln!("PLIRON-MONO {cgu_name} items={} extra={}", mono_items.len(), extra.len());
+        for &inst in &extra {
+            eprintln!("PLIRON-MONO {cgu_name} EXTRA {}", inst);
+        }
+    }
     for &(mono_item, data) in &mono_items {
         // `inlined` local-copy and `Internal` instances share the same
         // dangling-call hazard as `extra` copies: xcgu copies elsewhere
@@ -1694,6 +1701,9 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
                     .xcgu_copies
                     .insert(tcx.symbol_name(inst).name.to_string());
             }
+        }
+        if dump {
+            eprintln!("PLIRON-MONO {cgu_name} {:?} inlined={} vis={:?}", (mono_item, data.linkage), data.inlined, data.visibility);
         }
         mono_item.predefine::<Builder<'_, '_>>(
             &mut cx,
