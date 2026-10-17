@@ -749,6 +749,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
             st,
             true,
             inline::SMALL_LIMIT,
+            0,
             None,
             true,
             None,
@@ -818,6 +819,19 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         } else {
             inline::SMALL_LIMIT
         };
+        // wasm only: callsites in loops get WASM_HOT x the flat limit —
+        // std `hash_one` into hashbrown's probe loop. -Os/-Oz stay flat.
+        let hot = if wasm
+            && !matches!(
+                cx.tcx.sess.opts.optimize,
+                OptLevel::Size | OptLevel::SizeMin
+            ) {
+            crate::env_get("PLIRON_INLINE_HOT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(inline::WASM_HOT)
+        } else {
+            0
+        };
         if pass_enabled("PLIRON_FROZEN") {
             pt!(
                 cx,
@@ -846,7 +860,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         let d1 = pt!(
             cx,
             "inline",
-            inline::run(ctx, st, small, small_limit, None, false, None, &mut adj)
+            inline::run(ctx, st, small, small_limit, hot, None, false, None, &mut adj)
         );
         // Second round: callsites that just moved into a hot caller (e.g.
         // `get`'s `hash_one` landing inside `main`'s probe loop) never got
@@ -871,6 +885,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                     st,
                     small,
                     small_limit,
+                    hot,
                     None,
                     false,
                     Some(&touched),
@@ -957,6 +972,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
                             st,
                             small,
                             small_limit,
+                            hot,
                             Some(&sites),
                             false,
                             Some(&owners),
@@ -1703,6 +1719,20 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             cgu_name.as_str(),
             data,
         );
+        if let Some(w) = crate::env_get("PLIRON_STATS_XCGU")
+            && rustc_middle::ty::print::with_no_trimmed_paths!(inst.to_string())
+                .contains(&w)
+            && pliron_cfg::tracing_on()
+        {
+            let sym = tcx.symbol_name(inst).name;
+            let st = cx.st.borrow();
+            let f = st.funcs.get(sym);
+            tracing::info!(target: "pliron::stats", "xcgu def {} -> {sym}: linkage={:?} body={}",
+                rustc_middle::ty::print::with_no_trimmed_paths!(inst.to_string()),
+                f.map(|f| f.linkage),
+                f.is_some_and(|f| has_body(&*cx.pctx.borrow(), f.op)),
+            );
+        }
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
     drop(_sdef);

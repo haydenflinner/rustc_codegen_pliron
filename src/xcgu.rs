@@ -51,6 +51,50 @@ fn used<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>) -> Option<&'tcx [Spanned<
         .map(|(u, _)| u)
 }
 
+/// Deps that need a definition here: `Virtual` calls stay indirect (they
+/// dispatch through the vtable), so only `Item`/`Shim` callees count.
+///
+/// `#[rustc_intrinsic]` fns show up in `used` lists as `Item` instances
+/// (via `rustc_intrinsic_const_stable_indirect` fallback bodies), and
+/// most of them DO need a body — their callsites take
+/// `IntrinsicResult::Fallback` and emit a real call (`integer_min`,
+/// `carrying_mul_add`). The exception is the rotate/funnel family, which
+/// `codegen_intrinsic_call` lowers to `llvm.fshl`/`llvm.fshr` at every
+/// callsite — without the exemption `std::intrinsics::rotate_left` inside
+/// SipHash makes `hash_one`'s copy closure uncoverable.
+fn needs_body<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
+    let MonoItem::Fn(inst) = m else {
+        return true;
+    };
+    match inst.def {
+        InstanceKind::Item(def_id) => !matches!(
+            tcx.opt_item_name(def_id),
+            Some(
+                rustc_span::sym::rotate_left
+                    | rustc_span::sym::rotate_right
+                    | rustc_span::sym::unchecked_funnel_shl
+                    | rustc_span::sym::unchecked_funnel_shr
+            )
+        ),
+        InstanceKind::Shim(_) => true,
+        _ => false,
+    }
+}
+
+/// `PLIRON_XCGU_SIZE` default: wasm gets a bigger one — copies exist to
+/// feed the inliner, and wasm's IR-inline `WASM_LIMIT`+`WASM_HOT` reach
+/// well past the native hot loop (std `hash_one`'s SipHash, the biggest
+/// `bench/wasm` call miss, is ~250 MIR stmts).
+fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
+    crate::env_get("PLIRON_XCGU_SIZE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
+            512
+        } else {
+            50
+        })
+}
+
 /// Instances from other CGUs to define here as internal copies.
 pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
     if crate::pass_enabled("PLIRON_XCGU_FIXPOINT") {
@@ -61,9 +105,7 @@ pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<
 }
 
 fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
-    let limit = crate::env_get("PLIRON_XCGU_SIZE")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let limit = size_limit(tcx);
     let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
     // Single-CGU builds already hold every mono item: no foreign body can
     // be a copy candidate, so skip the used-item scans entirely.
@@ -138,6 +180,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
                     ours.contains_key(&u.node)
                         || visible.contains(&u.node)
                         || accepted.contains(&u.node)
+                        || !needs_body(tcx, &u.node)
                 })
             });
             if !ok
@@ -201,12 +244,14 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
 }
 
 fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
-    let limit = crate::env_get("PLIRON_XCGU_SIZE")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let limit = size_limit(tcx);
+    // Frontier rounds of mono-item use-chains to descend. The emitted set
+    // is bounded by `cap` regardless, so a generous bound here just lets
+    // deep `#[inline]` helper chains (std's SipHash path is five mono-item
+    // levels under `hash_one`) become candidates.
     let depth = crate::env_get("PLIRON_XCGU_DEPTH")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(3usize);
+        .unwrap_or(8usize);
     let ours = cgu.items();
     let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
     if parts.len() <= 1 {
@@ -217,6 +262,22 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     let cap = crate::env_get("PLIRON_XCGU_CAP")
         .and_then(|s| s.parse().ok())
         .unwrap_or(ours.len());
+    let why = crate::env_get("PLIRON_STATS_XCGU");
+    // Size-rejected candidates are otherwise invisible: they never reach
+    // `remaining`, so neither `xcgu reject` (fixpoint) nor `xcgu nocopy`
+    // (emit) ever names them.
+    let size_report = |c: Instance<'tcx>| {
+        if let Some(w) = &why
+            && !copyable(tcx, c, limit)
+            && with_no_trimmed_paths!(c.to_string()).contains(*w)
+            && pliron_cfg::tracing_on()
+        {
+            tracing::info!(target: "pliron::stats", "xcgu toobig {}: {}",
+                with_no_trimmed_paths!(c.to_string()),
+                tcx.size_estimate(c)
+            );
+        }
+    };
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut frontier = Vec::new();
     for item in ours.keys() {
@@ -227,9 +288,11 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             if direct.insert(u.node)
                 && let MonoItem::Fn(c) = u.node
                 && !ours.contains_key(&u.node)
-                && copyable(tcx, c, limit)
             {
-                frontier.push(c);
+                size_report(c);
+                if copyable(tcx, c, limit) {
+                    frontier.push(c);
+                }
             }
         }
     }
@@ -273,9 +336,11 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     && !ours.contains_key(&u.node)
                     && seen.insert(u.node)
                     && inlined.contains(&u.node)
-                    && copyable(tcx, c2, limit)
                 {
-                    next.push(c2);
+                    size_report(c2);
+                    if copyable(tcx, c2, limit) {
+                        next.push(c2);
+                    }
                 }
             }
         }
@@ -297,7 +362,6 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
 
     let mut remaining: FxHashSet<MonoItem<'tcx>> =
         candidates.iter().map(|&c| MonoItem::Fn(c)).collect();
-    let why = crate::env_get("PLIRON_STATS_XCGU");
     loop {
         let removed: Vec<(Instance<'tcx>, Vec<MonoItem<'tcx>>)> = candidates
             .iter()
@@ -308,7 +372,8 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     .iter()
                     .map(|u| u.node)
                     .filter(|m| {
-                        !ours.contains_key(m)
+                        needs_body(tcx, m)
+                            && !ours.contains_key(m)
                             && !visible.contains(m)
                             && !remaining.contains(m)
                     })
@@ -335,7 +400,11 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                                     .map(|d| format!("{:?}/inlined={}", d.linkage, d.inlined))
                             })
                             .collect();
-                        format!("{} @ {:?}", with_no_trimmed_paths!(u.to_string()), home)
+                        let kind = match u {
+                            MonoItem::Fn(inst) => format!("{:?}", inst.def),
+                            _ => "?".into(),
+                        };
+                        format!("{} [{kind}] @ {:?}", with_no_trimmed_paths!(u.to_string()), home)
                     })
                     .collect();
                 if pliron_cfg::tracing_on() {
@@ -365,7 +434,15 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         let mut closure: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
         let mut stack = vec![m];
         while let Some(n) = stack.pop() {
-            if ours.contains_key(&n) || visible.contains(&n) || emit.contains(&n) {
+            // `visible` only resolves *deps* (the copy calls the external
+            // symbol) — it must not skip `m` itself: a candidate that is
+            // External in its home CGU is exactly what a local copy is for
+            // (std `hash_one` is External in cgu.0 and needed a body here
+            // to inline into hashbrown's probe loop).
+            if ours.contains_key(&n)
+                || (n != m && (visible.contains(&n) || emit.contains(&n)))
+                || !needs_body(tcx, &n)
+            {
                 continue;
             }
             if !remaining.contains(&n) || !closure.insert(n) {
@@ -381,11 +458,52 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     || visible.contains(&u.node)
                     || emit.contains(&u.node)
                     || closure.contains(&u.node)
+                    || !needs_body(tcx, &u.node)
             }),
             _ => false,
         });
         if coverable && emit.len() + closure.len() <= cap {
+            if let Some(w) = &why
+                && with_no_trimmed_paths!(c.to_string()).contains(*w)
+                && pliron_cfg::tracing_on()
+            {
+                tracing::info!(target: "pliron::stats", "xcgu emit {} [{:?}] in {} (+{} deps; closure={:?})",
+                    with_no_trimmed_paths!(c.to_string()),
+                    c.def,
+                    cgu.name(),
+                    closure.len(),
+                    closure,
+                );
+            }
             emit.extend(closure);
+        } else if let Some(w) = &why
+            && with_no_trimmed_paths!(c.to_string()).contains(*w)
+        {
+            let hole: Vec<String> = if coverable {
+                vec![format!("cap: {} + {} > {}", emit.len(), closure.len(), cap)]
+            } else {
+                closure
+                    .iter()
+                    .filter(|n| match n {
+                        MonoItem::Fn(inst) => !refs[inst].iter().all(|u| {
+                            ours.contains_key(&u.node)
+                                || visible.contains(&u.node)
+                                || emit.contains(&u.node)
+                                || closure.contains(&u.node)
+                                || !needs_body(tcx, &u.node)
+                        }),
+                        _ => true,
+                    })
+                    .map(|n| with_no_trimmed_paths!(n.to_string()))
+                    .collect()
+            };
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::stats", "xcgu nocopy {} in {}: {:?}",
+                    with_no_trimmed_paths!(c.to_string()),
+                    cgu.name(),
+                    hole
+                )
+            };
         }
     }
     candidates
