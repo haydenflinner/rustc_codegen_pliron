@@ -2035,14 +2035,60 @@ fn run_loop(
     let hc = bmap[&h];
     pos.ins().brif(ok, hc, &gpargs, h, &gpargs);
 
-    // Cloned panic blocks are unreachable now; drop anything that lost all
-    // predecessors so stale blocks don't keep phantom CFG edges.
+    // The folded edges can orphan whole clone subtrees: only the subtree
+    // root is predecessor-less at first glance, so a one-shot pred sweep
+    // detaches defs its siblings still use (rustc_apfloat's
+    // `from_decimal_string` verifier-failed this way —
+    // `v is defined by inst which has no block`). Mark what is reachable
+    // from the entry; a clone block outside that set dies only when no
+    // surviving block still references its defs — the same keep-alive
+    // criterion `unswitch_loop`'s sweep uses.
     let cfg2 = ControlFlowGraph::with_function(func);
-    let dead: Vec<Block> = bmap
+    let mut live: FxHashSet<Block> = FxHashSet::default();
+    if let Some(e) = func.layout.entry_block() {
+        let mut stack = vec![e];
+        while let Some(b) = stack.pop() {
+            if !live.insert(b) {
+                continue;
+            }
+            for s in cfg2.succ_iter(b) {
+                stack.push(s);
+            }
+        }
+    }
+    let mut dead: FxHashSet<Block> = bmap
         .values()
         .copied()
-        .filter(|&b| cfg2.pred_iter(b).next().is_none())
+        .filter(|b| !live.contains(b))
         .collect();
+    let uses = crate::uses::Uses::new(func);
+    loop {
+        let keep: Vec<Block> = dead
+            .iter()
+            .copied()
+            .filter(|d| {
+                func.dfg
+                    .block_params(*d)
+                    .iter()
+                    .chain(
+                        func.layout
+                            .block_insts(*d)
+                            .flat_map(|i| func.dfg.inst_results(i)),
+                    )
+                    .any(|&v| {
+                        uses.sites(func.dfg.resolve_aliases(v))
+                            .iter()
+                            .any(|(b, _)| !dead.contains(b))
+                    })
+            })
+            .collect();
+        if keep.is_empty() {
+            break;
+        }
+        for d in keep {
+            dead.remove(&d);
+        }
+    }
     for b in dead {
         func.layout.remove_block_and_insts(b);
     }
