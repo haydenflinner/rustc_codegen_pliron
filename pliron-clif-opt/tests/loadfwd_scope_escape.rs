@@ -21,7 +21,7 @@ fn run(f: &mut Function, na: &FxHashSet<Value>) -> usize {
         &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashMap::default(),
+        &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         &FxHashSet::default(),

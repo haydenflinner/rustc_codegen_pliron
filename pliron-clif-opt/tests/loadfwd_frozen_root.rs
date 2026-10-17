@@ -65,7 +65,7 @@ fn run(
         &FxHashSet::default(),
         ofz,
         &FxHashMap::default(),
-        &FxHashMap::default(),
+        &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         nocap,
