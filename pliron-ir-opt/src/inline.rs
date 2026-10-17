@@ -45,6 +45,13 @@ pub const SMALL_LIMIT: usize = 40;
 /// +81% to +16% and hmget from +163% to +43% (geomean 1.08); 768 buys
 /// nothing further and lets `tokenize` slip back to parity.
 pub const WASM_LIMIT: usize = 512;
+/// wasm loop-callsite bonus (x the flat limit): a call every iteration
+/// pays the call+prologue cost every iteration, so a fatter callee is
+/// worth it there — hashbrown's `hash_one` (SipHash, ~926 ops in cgu.0)
+/// sits just over `WASM_LIMIT` but inlining it into `get`'s probe loop
+/// is where most of the `bench/wasm` hashmap gap lives. Kept off for
+/// -Os/-Oz, where growth is the point of `small`.
+pub const WASM_HOT: usize = 3;
 
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
@@ -636,6 +643,9 @@ fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
 /// - `PLIRON_INLINE_GROWTH` (default `GROWTH_MULT`x the base) caps the
 ///   non-free ops one caller may absorb; `PLIRON_INLINE_CALLER_MAX` still
 ///   bounds total size. `small` disables every bonus and the budget.
+/// `hot` (small mode only): callsites inside a loop get `hot`x the flat
+/// `limit` as their threshold — see [`WASM_HOT`]. 0 disables.
+///
 /// `callers` restricts which callers get (re)scored: the incremental
 /// rounds pass the callers previous runs/devirt touched instead of
 /// rescanning the whole module. A caller outside the filter can't inline
@@ -648,6 +658,7 @@ pub fn run(
     st: &mut State,
     small: bool,
     small_limit: usize,
+    hot: usize,
     only: Option<&FxHashSet<Ptr<Operation>>>,
     always_only: bool,
     callers: Option<&FxHashSet<String>>,
@@ -713,7 +724,7 @@ pub fn run(
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
     let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
+        && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
@@ -926,6 +937,21 @@ pub fn run(
                             // charged; `cap` still bounds the caller's size.
                             cost = ci.n;
                         }
+                    } else if hot > 1
+                        && ci.ncalls <= 2
+                        && loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                    {
+                        // Small mode keeps the flat rule everywhere except a
+                        // callsite in a loop: it runs the callee once per
+                        // iteration, so up to `hot`x the limit is worth it
+                        // (std `hash_one` into hashbrown's probe loop).
+                        // Leaf-ish bodies only — a callee that still carries
+                        // many calls of its own (`try_fold` folds, ~5 calls)
+                        // just moves that call traffic into the loop and
+                        // regressed `tokenize` ~30% at `hot=2`.
+                        t = t.max(limit.saturating_mul(hot));
                     }
                     // A callee with landing pads may go into an invoke whose pad is a
                     // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not

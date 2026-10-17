@@ -21,7 +21,7 @@ use pliron_llvm::op_interfaces::{
 };
 use pliron_llvm::ops::{
     AllocaOp, AndOp, BrOp, CallOp, GepIndex, GetElementPtrOp, ICmpOp, IntToPtrOp, LShrOp, LoadOp,
-    OrOp, PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
+    MulOp, OrOp, PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
 };
 use pliron_llvm::types::ArrayType;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -44,7 +44,10 @@ enum Kind {
     },
     Set {
         n: u64,
-        byte: u8,
+        /// `Some(b)` for a constant byte; `None` keeps the memset operand
+        /// (`bval`) so the rewrite can splat it into covered int slices.
+        byte: Option<u8>,
+        bval: Value,
     },
     /// Operand `idx` of a call straight before `unreachable`: gets a fresh
     /// copy of the whole alloca, so the rest can still be split.
@@ -563,10 +566,10 @@ fn accesses_inner(
                     }
                     "llvm.memset" if idx == 0 => {
                         let n = const_int(ctx, st, opnds[2])?;
-                        let byte = const_int(ctx, st, opnds[1])? as u8;
                         Kind::Set {
                             n: u64::try_from(n).ok()?,
-                            byte,
+                            byte: const_int(ctx, st, opnds[1]).map(|b| b as u8),
+                            bval: opnds[1],
                         }
                     }
                     _ => return None,
@@ -895,6 +898,23 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
         return false;
     };
 
+    // A runtime-byte memset scalarizes to an integer splat, which the
+    // rewrite arm only knows how to build for int slices of <=16 bytes —
+    // if a covered slice is anything else, refuse the whole scalarization
+    // (the alloca keeps its real memset).
+    for x in &acc {
+        if let Kind::Set { n, byte: None, .. } = x.kind {
+            for s in sl
+                .iter()
+                .filter(|s| x.off <= s.off && s.off + s.size <= x.off + n)
+            {
+                if !matches!(classify(ctx, s.ty), TyK::Int(_)) || s.size > 16 {
+                    return false;
+                }
+            }
+        }
+    }
+
     // A pinned slice can still promote when every access covering it is a
     // `Pin` on a nonretaining call operand: the callee sees real memory in
     // `pin_a`, and the SSA view is synced with a writeback before the call
@@ -1109,19 +1129,58 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 st.intrinsics.remove(x.op);
                 Operation::erase(x.op, ctx);
             }
-            Kind::Set { n, byte } => {
+            Kind::Set { n, byte, bval } => {
                 for (i, s) in sl
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| x.off <= s.off && s.off + s.size <= x.off + n)
                 {
-                    if byte == 0 {
+                    if byte == Some(0) {
                         let c = mk_const(ctx, st, s.ty, ConstVal::Zero);
                         StoreOp::new(ctx, c, new[i])
                             .get_operation()
                             .insert_before(ctx, x.op);
                         continue;
                     }
+                    let Some(byte) = byte else {
+                        // Runtime byte: splat it — `zext(bval) * 0x0101..`
+                        // fills the whole slice (LLVM does the same fold
+                        // for `u64::from_ne_bytes([b; 8])`-style code, e.g.
+                        // hashbrown's tag broadcast). Coverage is confined
+                        // to int slices by the preflight in `split`.
+                        let (bsize, _) = size_align(ctx, bval.get_type(ctx));
+                        let v = if bsize < s.size {
+                            let o =
+                                ZExtOp::new_with_nneg(ctx, bval, s.ty, false).get_operation();
+                            o.insert_before(ctx, x.op);
+                            o.deref(ctx).get_result(ctx, 0)
+                        } else {
+                            bval
+                        };
+                        let rep = (0..s.size).fold(0u128, |acc, k| acc | (1u128 << (8 * k)));
+                        let c = mk_const(
+                            ctx,
+                            st,
+                            s.ty,
+                            ConstVal::Bits(mask(rep, (s.size * 8) as u32)),
+                        );
+                        let m = MulOp::new_with_overflow_flag(
+                            ctx,
+                            v,
+                            c,
+                            IntegerOverflowFlagsAttr {
+                                nsw: false,
+                                nuw: false,
+                            },
+                        )
+                        .get_operation();
+                        m.insert_before(ctx, x.op);
+                        let m = m.deref(ctx).get_result(ctx, 0);
+                        StoreOp::new(ctx, m, new[i])
+                            .get_operation()
+                            .insert_before(ctx, x.op);
+                        continue;
+                    };
                     if s.size <= 16 {
                         let rep =
                             (0..s.size).fold(0u128, |acc, k| acc | ((byte as u128) << (8 * k)));
