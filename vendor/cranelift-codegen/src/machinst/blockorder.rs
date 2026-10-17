@@ -228,6 +228,17 @@ impl BlockLoweringOrder {
         let mut orig_order: Vec<Block> = Vec::new();
         if bchain {
             let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
+            // PLIRON: a block whose own terminator reaches a dominator is
+            // a loop latch — preferring it as the fallthrough puts the
+            // loop's hot spine on the not-taken side of the brif, so an
+            // iteration pays only the latch's own back-edge branch.
+            let mut is_latch = SecondaryMap::with_default(false);
+            for &block in &rpo {
+                let range = block_succ_range[block].clone();
+                is_latch[block] = block_succs[range]
+                    .iter()
+                    .any(|lb| domtree.block_dominates(lb.orig_block().unwrap(), block));
+            }
             let mut best_succ = SecondaryMap::with_default(
                 crate::packed_option::PackedOption::<Block>::default(),
             );
@@ -236,6 +247,7 @@ impl BlockLoweringOrder {
                 let mut pick: Option<Block> = None;
                 let mut pick_in = 0;
                 let mut pick_rank = 0;
+                let mut pick_latch = false;
                 for lb in &block_succs[range] {
                     let succ = lb.orig_block().unwrap();
                     if f.is_effectively_cold(succ) || domtree.block_dominates(succ, block) {
@@ -257,7 +269,8 @@ impl BlockLoweringOrder {
                     // - a shared merge whose region extends outside
                     //   `block`'s subtree — adjacent only as a last resort;
                     //   pulling it in scatters the region.
-                    // In-count breaks ties within a class.
+                    // In-count breaks ties within a class, and a latch
+                    // beats a non-latch of the same count.
                     let rank = if block_preds[block]
                         .iter()
                         .any(|&p| domtree.block_dominates(succ, p))
@@ -268,17 +281,28 @@ impl BlockLoweringOrder {
                     } else {
                         0
                     };
+                    let latch = is_latch[succ];
                     if pick.is_none()
                         || rank > pick_rank
-                        || (rank == pick_rank && block_in_count[succ] >= pick_in)
+                        || (rank == pick_rank
+                            && ((latch && !pick_latch)
+                                || (latch == pick_latch
+                                    && block_in_count[succ] >= pick_in)))
                     {
                         pick = Some(succ);
                         pick_in = block_in_count[succ];
                         pick_rank = rank;
+                        pick_latch = latch;
                     }
                 }
                 if let Some(s) = pick {
                     best_succ[block] = s.into();
+                    if std::env::var_os("PLIRON_BCHAIN_DEBUG").is_some() {
+                        eprintln!(
+                            "bchain {} {block}: pick {s} rank={pick_rank} latch={pick_latch} in={pick_in}",
+                            f.name
+                        );
+                    }
                 }
             }
             let mut emitted = FxHashSet::default();
