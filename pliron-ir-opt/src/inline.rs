@@ -109,9 +109,35 @@ pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Op
         // `devirt` rewrites these later, but that runs after the main pass.
         CallOpCallable::Indirect(p) => match st.consts.get(p) {
             Some(ConstVal::Sym { sym, off: 0 }) => st.funcs.get_key_value(sym).map(|(k, _)| k),
-            _ => None,
+            // `consts` is codegen-time; passes that rewrite the callee
+            // operand leave the Sym const on an aliased-away value, so
+            // fall through to the operand's definition before giving up.
+            _ => indirect_callee(ctx, st, p),
         },
     }
+}
+
+/// Resolve an indirect-call operand to a known function through its
+/// definition chain: `llvm.addressof` and aliases of `sym_addr` values.
+fn indirect_callee<'a>(ctx: &Context, st: &'a State, mut p: Value) -> Option<&'a String> {
+    for _ in 0..8 {
+        if let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(p) {
+            return st.funcs.get_key_value(sym).map(|(k, _)| k);
+        }
+        let d = p.defining_op()?;
+        if let Some(a) = Operation::get_op::<pliron_llvm::ops::AddressOfOp>(d, ctx) {
+            let id = a.get_global_name(ctx);
+            let sym = st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref()));
+            return sym.and_then(|s| st.funcs.get_key_value(s).map(|(k, _)| k));
+        }
+        // Transparent defs (casts/bitwise ops on the pointer) — keep walking.
+        if Operation::is_op::<BitcastOp>(d, ctx) || Operation::is_op::<AddrSpaceCastOp>(d, ctx) {
+            p = d.deref(ctx).get_operand(ctx, 0);
+            continue;
+        }
+        return None;
+    }
+    None
 }
 
 /// Callee-body facts the callsite score is computed from.

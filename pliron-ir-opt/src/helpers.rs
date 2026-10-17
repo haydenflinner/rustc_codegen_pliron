@@ -2,9 +2,10 @@
 
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
 use pliron::value::Value;
-use pliron_llvm::ops::FuncOp;
+use pliron_llvm::ops::{AddressOfOp, FuncOp};
 
 use crate::state::{ConstVal, State};
 
@@ -24,6 +25,26 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
         if let ConstVal::Sym { sym, .. } = c {
             if v.is_used(ctx) || escaped.contains(&v) {
                 taken.insert(sym.clone());
+            }
+        }
+    }
+    // `llvm.addressof` ops produce fn-ptr values the codegen-time
+    // `st.consts` never saw (they're created by iropt rewrites or fed
+    // through aliases `is_used` can't see on the original const).
+    for f in st.funcs.values() {
+        if !has_body(ctx, f.op) {
+            continue;
+        }
+        for b in crate::inline::blocks(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                if let Some(a) = Operation::get_op::<AddressOfOp>(op, ctx) {
+                    let id = a.get_global_name(ctx);
+                    if let Some(sym) =
+                        st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref()))
+                    {
+                        taken.insert(sym.clone());
+                    }
+                }
             }
         }
     }
