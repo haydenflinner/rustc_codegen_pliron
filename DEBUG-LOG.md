@@ -414,3 +414,17 @@ Still in flight: natperf loopvec inv-reconstruction, ui
 loadfwd_call_indirect probe, diff sysroot stage-2 probes (+ a filetest
 deletion set to review — it removes regression coverage; don't merge).
 Stage-2 needs the Linux box.
+
+## ui sweep (native, post-merges) — clean modulo known limits
+
+16,505 pass. Real signals:
+- `cfg-expr`/`cfg_select-expr` run-fails: `catch_unwind` on stock-std
+  (real SEH throw vs our emulated-EH handler) — the documented
+  `pliron_stock_seh` limitation, not a regression.
+- `issue-109004-drop-large-array` compile-error: `try_from_fn`/
+  `NeverShortCircuit` on `[String; 64_000_000]` →
+  `CodegenError::ImplLimitExceeded` — huge const-array-by-value codegen
+  blows cranelift's inst cap. Edge case; needs the huge-aggregate path
+  (likely the array-init/drop-glue lowering emitting per-element code).
+- everything else is env noise (stock ICEs-in-common, missing aux files,
+  panic-message/abort formatting, pointer addresses).
