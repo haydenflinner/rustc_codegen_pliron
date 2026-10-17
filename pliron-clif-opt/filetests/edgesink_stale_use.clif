@@ -1,0 +1,37 @@
+; test edgesink
+; `v6` (w) in block1 sinks to block3 first; the use_in bookkeeping then
+; dropped block1 from `v5`'s use set even though the `icmp` still reads
+; `v5` there. Pushing `v5` out of block2 then rewrote only {3,4} and the
+; removed def left the icmp operand dangling ("defined by inst which has
+; no block" verifier error — pliron_clif_opt's edge_arg/run_loops ICE'd).
+; block1 precedes block2 in layout order though block2 dominates it —
+; like loop-header defs used earlier in the layout.
+; check: return
+; check-not: has no block
+function %push_stale(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 1
+    v2 = iconst.i64 2
+    v3 = iconst.i64 3
+    jump block2(v0)
+
+block1:
+    v6 = iadd.i64 v5, v1
+    v7 = icmp.i64 eq v5, v0
+    brif v7, block3, block4
+
+block2(v8: i64):
+    v5 = iadd.i64 v8, v1
+    jump block1
+
+block3:
+    v9 = imul.i64 v6, v2
+    jump block5(v9)
+
+block4:
+    v10 = imul.i64 v5, v3
+    jump block5(v10)
+
+block5(v11: i64):
+    return v11
+}

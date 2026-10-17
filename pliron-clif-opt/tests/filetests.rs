@@ -37,6 +37,7 @@ fn pass(name: &str) -> Pass {
         "cparm" => |f| clifpeep::cparm(f).0,
         "dgvn" => clifpeep::dgvn,
         "edgefwd" => edgefwd::run,
+        "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,

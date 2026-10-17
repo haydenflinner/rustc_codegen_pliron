@@ -277,16 +277,28 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
                         .map_inst_values(ui, |w| if raw.contains(&w) { nv } else { w });
                 }
             }
+            func.layout.remove_inst(i);
+            func.dfg.clear_results(i);
             // Keep `use_in` honest for later defs in this sweep: the
             // clones add uses of `i`'s operands in each `u`, and `i`'s
-            // removal drops their use in `b`.
+            // removal drops their use in `b` — but only when `i` was the
+            // last user: a sibling inst in `b` can still read the operand
+            // (an `iadd` sunk past a same-block `icmp` on the same value
+            // left the operand dangling once the def pushed out of `b`,
+            // verifier: "defined by inst which has no block"). Check the
+            // remaining insts in `b` before dropping the entry.
             for w in func.dfg.inst_args(i).to_vec() {
                 let wr = func.dfg.resolve_aliases(w);
                 use_in.entry(wr).or_default().extend(ubs.iter().copied());
-                use_in.entry(wr).or_default().remove(&b);
+                let still_used = func.layout.block_insts(b).any(|ui| {
+                    func.dfg
+                        .inst_values(ui)
+                        .any(|x| func.dfg.resolve_aliases(x) == wr)
+                });
+                if !still_used {
+                    use_in.entry(wr).or_default().remove(&b);
+                }
             }
-            func.layout.remove_inst(i);
-            func.dfg.clear_results(i);
             pushed += 1;
         }
     }
