@@ -283,3 +283,27 @@ IDENTICAL outputs. The stage-2 miscompile is not in these crates'
 codegen. `PLIRON_DIFFCHECK=1` on the genisle crate (cranelift-meta
 build) produced zero reports (dir only created on mismatch).
 `PLIRON_VERIFY=full` clean on genisle.
+
+## hashmap/hmget residual — inliner incremental-rescan gap (perf)
+
+Native `HashMap::get`/`insert` in a hot loop: `run -> hash_one`
+scores `n=932 cost=935` — `t` starts at `DEFAULT_LIMIT`(320) but the
+loop-callsite bonus (`PLIRON_INLINE_LOOP`, +limit*8/4=640) lifts it to
+960 → ACCEPT for `run`/`main` (the outermost caller). The same
+callsite inside `get`/`insert`/`reserve_rehash` is scored BEFORE those
+fns inline into `run`: `t=320` flat → reject. After `get`/`insert`
+inline into `run`, those rejected `hash_one` callsites physically move
+into `run`'s loop but keep their reject decisions — the incremental
+rescan re-evaluates the *caller* (`run -> hash_one` accept fired once)
+but the stale-reject callsites inside the inlined body aren't
+rescored. Result: `run` inlines one `hash_one` copy yet still emits
+~6 calls. LLVM inlines `hash_one` at every hot callsite (0 out-of-line
+refs). Fix direction: after a caller inlines a callee, rescore the
+newly-materialized callsites under the caller's loop/cold context, not
+the callee's old one — the rescan loop exists but only re-runs callers
+that changed at the callsite level.
+
+Side note: `PLIRON_INLINE_VERBOSE` maps to `pliron::inline` at DEBUG
+but the scoring path gates on `enabled!(pliron::frozen)` — set
+`PLIRON_TRACE=pliron::frozen=debug,pliron::inline=debug` to see
+cost/t/reject lines until the target is renamed.
