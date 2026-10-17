@@ -18,10 +18,10 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use pliron::basic_block::BasicBlock;
-use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
+use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
-use pliron::op::{Op, OpId};
+use pliron::op::{Op, OpId, op_cast};
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
@@ -2468,8 +2468,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if depth >= 8 {
             return None;
         }
-        let op = v.defining_op()?;
         let ctx = self.ctx;
+        let Some(op) = v.defining_op() else {
+            // `select` on a scalar pair (i128/f128) codegen's branchy —
+            // `condbr c, t(ct…), f(cf…)`; the merged argument is still
+            // constant when `c` is, e.g. `7u128.max(1)` reaching a `udiv`
+            // divisor.
+            let blk = v.defining_block()?;
+            let ai = v.try_find_index(ctx).ok()?;
+            return Some((self.block_arg_bits(blk, ai, depth)?, int_ty(v)));
+        };
         let id = Operation::get_opid(op, ctx);
         if pliron_cfg::tracing_on()
             && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG)
@@ -2581,10 +2589,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             if rest.iter().all(|(_, s)| *s == rest[0].1) {
                 rest[0].1.0
-            } else if !cyclic && rest.len() == 2 {
+            } else if rest.len() == 2 {
                 let b1 = rest[0].0.deref(ctx).get_parent_block()?;
                 let b2 = rest[1].0.deref(ctx).get_parent_block()?;
                 if b1 == b2 {
+                    if cyclic {
+                        return None;
+                    }
                     // Sequential stores in one block: the later wins.
                     let bl: Vec<Ptr<Operation>> = b1.deref(ctx).iter(ctx).collect();
                     let p1 = bl.iter().position(|o| *o == rest[0].0)?;
@@ -2592,7 +2603,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     if p1 > p2 { rest[0].1.0 } else { rest[1].1.0 }
                 } else {
                     // `if c { v_t } else { v_f }` arms: each arm must be
-                    // single-entry from one shared `condbr`.
+                    // single-entry from one shared `condbr`. A constant
+                    // condition means the other arm is dead — its store can
+                    // never run — so this holds even on a cycle: the last
+                    // writer is always the selected arm.
                     let arm = |b: Ptr<BasicBlock>| {
                         let us = b.uses(ctx);
                         (us.len() == 1).then(|| (us[0].user_op(), us[0].find_index(ctx)))
@@ -2654,6 +2668,57 @@ impl<'a, 'b> FnLower<'a, 'b> {
             mask(v, wa)
         };
         Some((r, int_ty(v)))
+    }
+
+    /// The constant bit pattern forwarded to argument `ai` of `blk` —
+    /// every predecessor must forward constants. They either all agree, or
+    /// the block merges the two arms of one `condbr` whose condition is
+    /// itself constant (the `arm` trick from `const_bits`' `LoadOp` case).
+    fn block_arg_bits(&self, blk: Ptr<BasicBlock>, ai: usize, depth: u32) -> Option<u128> {
+        let ctx = self.ctx;
+        let bit = |v| self.const_bits(v, depth + 1);
+        let mut arms = Vec::new();
+        for u in blk.uses(ctx) {
+            let uop = u.user_op();
+            let si = u.find_index(ctx);
+            let o = Operation::get_op_dyn(uop, ctx);
+            let &arg = op_cast::<dyn BranchOpInterface>(&*o)?
+                .successor_operands(ctx, si)
+                .get(ai)?;
+            arms.push((uop.deref(ctx).get_parent_block()?, arg));
+        }
+        if arms.is_empty() {
+            return None;
+        }
+        let mut cs = Vec::with_capacity(arms.len());
+        for &(_, a) in &arms {
+            cs.push(bit(a)?);
+        }
+        if cs.iter().all(|c| c == &cs[0]) {
+            return Some(cs[0].0);
+        }
+        if arms.len() != 2 {
+            return None;
+        }
+        let arm = |b: Ptr<BasicBlock>| {
+            let us = b.uses(ctx);
+            (us.len() == 1).then(|| (us[0].user_op(), us[0].find_index(ctx)))
+        };
+        let ((b1, _), (b2, _)) = (arms[0], arms[1]);
+        let (t1, i1) = arm(b1)?;
+        let (t2, i2) = arm(b2)?;
+        if t1 != t2
+            || i1 == i2
+            || Operation::get_opid(t1, ctx) != CondBrOp::get_opid_static()
+        {
+            return None;
+        }
+        let (c, _) = bit(t1.deref(ctx).get_operand(ctx, 0))?;
+        Some(if (i1 == 0) == (c & 1 == 1) {
+            cs[0].0
+        } else {
+            cs[1].0
+        })
     }
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
