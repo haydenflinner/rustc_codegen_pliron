@@ -52,10 +52,18 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     // functions whose CLIF name contains <substr>; `all` matches every
     // function. (CLIF names are `u0:N` — correlate to symbols with
     // `PLIRON_CLIF` output.)
-    let prevcode_match = std::env::var("PLIRON_PREVCODE")
-        .ok()
-        .map(|pat| pat == "all" || (!pat.is_empty() && format!("{}", f.name).contains(&pat)))
+    static PREVCODE: std::sync::OnceLock<Option<alloc::string::String>> =
+        std::sync::OnceLock::new();
+    static RA2_VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static RA2_EDITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let prevcode_match = PREVCODE
+        .get_or_init(|| std::env::var("PLIRON_PREVCODE").ok())
+        .as_deref()
+        .map(|pat| pat == "all" || (!pat.is_empty() && format!("{}", f.name).contains(pat)))
         .unwrap_or(false);
+    let ra2_verbose =
+        *RA2_VERBOSE.get_or_init(|| std::env::var_os("PLIRON_RA2_VERBOSE").is_some());
+    let ra2_edits = *RA2_EDITS.get_or_init(|| std::env::var_os("PLIRON_RA2_EDITS").is_some());
     if prevcode_match {
         eprintln!("==== prevcode {} ====\n{:?}", f.name, vcode);
     }
@@ -65,7 +73,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         let _tt = timing::regalloc();
         let mut options = RegallocOptions::default();
         options.verbose_log = b.flags().regalloc_verbose_logs()
-            || std::env::var_os("PLIRON_RA2_VERBOSE").is_some();
+            || ra2_verbose;
 
         if cfg!(debug_assertions) {
             options.validate_ssa = true;
@@ -91,7 +99,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
 
         // PLIRON: `PLIRON_RA2_VERBOSE=1` dumps regalloc decision
         // annotations for the same functions as `PLIRON_PREVCODE`.
-        if prevcode_match && std::env::var_os("PLIRON_RA2_VERBOSE").is_some() {
+        if prevcode_match && ra2_verbose {
             let mut anns: Vec<_> = regalloc_ctx
                 .debug_annotations
                 .iter()
@@ -109,7 +117,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         // PLIRON: `PLIRON_RA2_EDITS=1` dumps regalloc-inserted moves
         // (program point → edit) for the same functions as
         // `PLIRON_PREVCODE`.
-        if prevcode_match && std::env::var_os("PLIRON_RA2_EDITS").is_some() {
+        if prevcode_match && ra2_edits {
             eprintln!("==== ra2edits {} ====", f.name);
             for (pp, edit) in &regalloc_ctx.output.edits {
                 let inst = pp.inst();

@@ -2900,7 +2900,7 @@ fn below_max(func: &Function, n: Value) -> bool {
 /// `p < n`. Under that invariant `p < n` ⟺ `p != n`, and `!=` survives the
 /// `+1` modulo 2^w, so no overflow condition is needed.
 pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
-    if std::env::var("PLIRON_POSTINC_NE").is_ok_and(|v| v == "0") {
+    if pliron_cfg::env_is("PLIRON_POSTINC_NE", "0") {
         return 0;
     }
     let crate::pipeline::CfgDtLa { cfg, la, .. } = an.cfg_dt_la(func);

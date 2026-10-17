@@ -637,7 +637,7 @@ impl State {
     /// compiled serially, so publish-before-import order is
     /// deterministic; later CGUs simply see more.
     pub fn share_facts(&mut self, ctx: &Context) {
-        let filt = std::env::var("PLIRON_STATS_XCGU").unwrap_or_default();
+        let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
         let mut g = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut exported = 0usize;
         for (sym, f) in self.funcs.iter() {

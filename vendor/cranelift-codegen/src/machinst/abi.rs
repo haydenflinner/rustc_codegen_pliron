@@ -1268,15 +1268,21 @@ impl<M: ABIMachineSpec> Callee<M> {
             .any(|v| f.dfg.value_type(v).is_vector() && f.dfg.value_type(v).bits() > 256);
 
         {
+            static FN_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static FP_FNS: std::sync::OnceLock<Option<alloc::string::String>> =
+                std::sync::OnceLock::new();
+            static FP_RANGE: std::sync::OnceLock<Option<alloc::string::String>> =
+                std::sync::OnceLock::new();
             let ord = PLIRON_FN_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = alloc::format!("{}", f.name);
-            if std::env::var_os("PLIRON_FN_DUMP").is_some() {
+            if *FN_DUMP.get_or_init(|| std::env::var_os("PLIRON_FN_DUMP").is_some()) {
                 eprintln!("fn {ord}: {name}");
             }
-            let mut force = std::env::var("PLIRON_FP_FNS").ok().map_or(false, |pats| {
+            let fp_fns = FP_FNS.get_or_init(|| std::env::var("PLIRON_FP_FNS").ok());
+            let mut force = fp_fns.as_deref().map_or(false, |pats| {
                 pats.split(',').any(|p| !p.is_empty() && name.contains(p))
             });
-            if let Ok(range) = std::env::var("PLIRON_FP_RANGE") {
+            if let Some(range) = FP_RANGE.get_or_init(|| std::env::var("PLIRON_FP_RANGE").ok()) {
                 if let Some((a, b)) = range.split_once(':') {
                     if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
                         force |= ord >= a && ord < b;

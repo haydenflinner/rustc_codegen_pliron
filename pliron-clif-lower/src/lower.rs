@@ -264,7 +264,7 @@ pub fn lower_to_object(
     // /defaultlib:msvcrt is already on rustc's line, so advertise the rest
     // via .drectve.
     if isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
-        && std::env::var_os("PLIRON_CRTFREE").is_some_and(|v| v != "0")
+        && pliron_cfg::pass_enabled("PLIRON_CRTFREE")
     {
         let s =
             product

@@ -2404,9 +2404,14 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     // per-block loop (16k lookups per webmerge round otherwise).
     let wmprof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
-    let wm_nodiffb = std::env::var_os("PLIRON_WM_NODIFFB").is_some();
+    let wm_nodiffb = pliron_cfg::env_set("PLIRON_WM_NODIFFB");
     let wm_rel = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::DEBUG);
+    // `env::var_os` takes the process env lock per call — keep reads out
+    // of the per-block loop (they showed up as ~15% of codegen samples).
+    let no_phased = pliron_cfg::env_set("PLIRON_WM_NOPHASED");
+    let no_phasec = pliron_cfg::env_set("PLIRON_WM_NOPHASEC");
+    let no_phaseb = pliron_cfg::env_set("PLIRON_WM_NOPHASEB");
     for (&b, es) in edges.iter() {
         let tb0 = std::time::Instant::now();
         let ps = func.dfg.block_params(b).to_vec();
@@ -2554,9 +2559,6 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 };
             }
         }
-        let no_phased = std::env::var_os("PLIRON_WM_NOPHASED").is_some();
-        let no_phasec = std::env::var_os("PLIRON_WM_NOPHASEC").is_some();
-        let no_phaseb = std::env::var_os("PLIRON_WM_NOPHASEB").is_some();
         // `pk[e][i]` — slot `i`'s key on edge `e`, paramized relative to
         // the block's slots (skip = i), computed lazily: most slots
         // either merge at phase A or are never a viable sibling, so an

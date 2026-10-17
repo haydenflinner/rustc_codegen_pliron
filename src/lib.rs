@@ -1421,7 +1421,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
         // slot, template boundary markers, _fltused, and the PE entry
         // thunks -- so `rust-lld` plus synthesized import libraries (see
         // tools/mkwinlibs) need nothing from a Visual Studio install.
-        let crtfree = coff && std::env::var_os("PLIRON_CRTFREE").is_some_and(|v| v != "0");
+        let crtfree = coff && pliron_cfg::pass_enabled("PLIRON_CRTFREE");
         if crtfree {
             let i32t = cx.type_i32();
             let ptr = cx.type_ptr();

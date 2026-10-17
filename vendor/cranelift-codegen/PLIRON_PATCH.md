@@ -611,3 +611,19 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     (LLVM's latch-before-head shape; ~25% on a per-element
     `filter().count()` loop). `PLIRON_BCHAIN_DEBUG` prints pick
     decisions.
+
+51. OnceLock-cached `PLIRON_*` env reads (`src/context.rs`,
+    `src/machinst/{vcode,lower,compile,abi,blockorder}.rs`,
+    `src/isa/aarch64/lower.rs`, `src/isa/x64/abi.rs`): debug/gate
+    env vars that were re-read via `std::env::var{,_os}` per inst,
+    per block, or per function are now read once into `OnceLock`
+    statics (`PLIRON_POSTIDX_DEBUG`, `PLIRON_COMPILE_EGRAPH`,
+    `PLIRON_POSTOPT`, `PLIRON_LUDEBUG`, `PLIRON_REMATSINK_DEBUG`,
+    `PLIRON_STATS`, `PLIRON_PRECOMPILE`, `PLIRON_ALIGN`,
+    `PLIRON_LOWER_DEBUG`, `PLIRON_FN_DUMP`, `PLIRON_FP_FNS`,
+    `PLIRON_FP_RANGE`, `PLIRON_PREVCODE`, `PLIRON_RA2_VERBOSE`,
+    `PLIRON_RA2_EDITS`, `PLIRON_BCHAIN_DEBUG`, `PLIRON_NO_FREE_RBP`,
+    `PLIRON_HI_ALWAYS`). `std::env::var` takes the process env lock
+    per call — a backend-codegen profile showed ~11% of samples in
+    `getenv`/lock waits even after the workspace-side reads were
+    cached.

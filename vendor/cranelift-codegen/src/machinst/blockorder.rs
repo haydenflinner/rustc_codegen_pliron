@@ -225,6 +225,10 @@ impl BlockLoweringOrder {
         let bchain = *BCHAIN
             .get_or_init(|| std::env::var("PLIRON_BCHAIN").map_or(true, |v| v != "0"));
 
+        static BCHAIN_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bchain_debug =
+            *BCHAIN_DEBUG.get_or_init(|| std::env::var_os("PLIRON_BCHAIN_DEBUG").is_some());
+
         let mut orig_order: Vec<Block> = Vec::new();
         if bchain {
             let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
@@ -297,7 +301,7 @@ impl BlockLoweringOrder {
                 }
                 if let Some(s) = pick {
                     best_succ[block] = s.into();
-                    if std::env::var_os("PLIRON_BCHAIN_DEBUG").is_some() {
+                    if bchain_debug {
                         eprintln!(
                             "bchain {} {block}: pick {s} rank={pick_rank} latch={pick_latch} in={pick_in}",
                             f.name

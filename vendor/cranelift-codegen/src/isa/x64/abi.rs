@@ -76,11 +76,13 @@ impl IsaFlags for x64_settings::Flags {}
 fn machine_env_inner(flags: &settings::Flags, _call_conv: isa::CallConv, hi_in: bool) -> &MachineEnv {
     // PLIRON: when frame pointers are omitted, RBP is unused by the frame
     // and becomes a callee-saved allocatable register like any other.
+    static NO_FREE_RBP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static HI_ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let free_rbp = !flags.preserve_frame_pointers()
-        && std::env::var_os("PLIRON_NO_FREE_RBP").is_none();
+        && !*NO_FREE_RBP.get_or_init(|| std::env::var_os("PLIRON_NO_FREE_RBP").is_some());
     // PLIRON_HI_ALWAYS diagnostic: force the hi env even for functions
     // with no >256-bit values (A/B the patch-49 gate).
-    let hi = (hi_in || std::env::var_os("PLIRON_HI_ALWAYS").is_some())
+    let hi = (hi_in || *HI_ALWAYS.get_or_init(|| std::env::var_os("PLIRON_HI_ALWAYS").is_some()))
         && super::inst::high_xmm_regs();
     match (flags.enable_pinned_reg(), free_rbp, hi) {
         (true, false, false) => {

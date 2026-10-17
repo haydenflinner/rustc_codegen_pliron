@@ -133,6 +133,7 @@ impl Context {
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
+        static PRECOMPILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let result;
         trace!("****** START compiling {}", self.func.display_spec());
         {
@@ -141,7 +142,7 @@ impl Context {
             self.verify_if(isa)?;
             self.optimize(isa, ctrl_plane)?;
             // PLIRON: debug hook — dump the CLIF in its final pre-isel form.
-            if std::env::var_os("PLIRON_PRECOMPILE").is_some() {
+            if *PRECOMPILE.get_or_init(|| std::env::var_os("PLIRON_PRECOMPILE").is_some()) {
                 eprintln!("==== clif {} precompile ====\n{}", self.func.name, self.func.display());
             }
             result = isa.compile_function(
@@ -166,6 +167,8 @@ impl Context {
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<()> {
+        static COMPILE_EGRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static POSTOPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         log::debug!(
             "Number of CLIF instructions to optimize: {}",
             self.func.dfg.num_insts()
@@ -207,7 +210,8 @@ impl Context {
         // rewrites, and this measures what it still buys.
         if opt_level != OptLevel::None
             && self.egraph_safe()
-            && std::env::var("PLIRON_COMPILE_EGRAPH").as_deref() != Ok("0")
+            && *COMPILE_EGRAPH
+                .get_or_init(|| std::env::var("PLIRON_COMPILE_EGRAPH").as_deref() != Ok("0"))
         {
             self.egraph_pass(isa, ctrl_plane)?;
         }
@@ -230,7 +234,7 @@ impl Context {
         // copy at codegen.
         self.lastuse_schedule();
 
-        if std::env::var_os("PLIRON_POSTOPT").is_some() {
+        if *POSTOPT.get_or_init(|| std::env::var_os("PLIRON_POSTOPT").is_some()) {
             eprintln!(
                 "==== clif {} postopt ====\n{}",
                 self.func.name,
@@ -268,10 +272,12 @@ impl Context {
         use alloc::vec::Vec;
 
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static LUDEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| std::env::var_os("PLIRON_LASTUSE").is_none_or(|v| v != "0"))
         {
             return;
         }
+        let ludebug = *LUDEBUG.get_or_init(|| std::env::var_os("PLIRON_LUDEBUG").is_some());
 
         // Opcodes whose lowering can tie a source operand to the
         // destination register (two-address forms: add/sub/and/xor/rol/...
@@ -415,7 +421,7 @@ impl Context {
                     }
                     // Emit `move_set` in original order, just before `r`.
                     budget -= 1;
-                    if std::env::var_os("PLIRON_LUDEBUG").is_some() {
+                    if ludebug {
                         eprintln!("lastuse: move {:?} before {}", move_set, r);
                     }
                     frozen.extend(move_set.iter().copied());
@@ -461,6 +467,7 @@ impl Context {
         use crate::{FxHashMap, FxHashSet};
 
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static POSTIDX_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| {
             std::env::var_os("PLIRON_BUMPHOIST").is_none_or(|v| v != "0")
         }) {
@@ -729,7 +736,9 @@ impl Context {
             // wrong slot; splice every use to the kept result now.
             self.func.dfg.resolve_all_aliases();
         }
-        if moved > 0 && std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some() {
+        if moved > 0
+            && *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some())
+        {
             eprintln!(
                 "bumphoist {}: moved {} remat {}",
                 self.func.name, moved, remats
@@ -754,6 +763,7 @@ impl Context {
         use crate::{FxHashMap, FxHashSet};
 
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static REMATSINK_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| {
             std::env::var_os("PLIRON_REMATSINK").is_none_or(|v| v != "0")
         }) {
@@ -852,7 +862,10 @@ impl Context {
                 self.func.dfg.clear_results(d);
             }
         }
-        if n > 0 && std::env::var_os("PLIRON_REMATSINK_DEBUG").is_some() {
+        if n > 0
+            && *REMATSINK_DEBUG
+                .get_or_init(|| std::env::var_os("PLIRON_REMATSINK_DEBUG").is_some())
+        {
             eprintln!("rematsink {}: sunk {}", self.func.name, n);
         }
     }
@@ -1080,6 +1093,7 @@ impl Context {
     where
         FOI: Into<FlagsOrIsa<'a>>,
     {
+        static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let _tt = timing::egraph();
 
         trace!(
@@ -1099,7 +1113,7 @@ impl Context {
         );
         pass.run();
         log::debug!("egraph stats: {:?}", pass.stats);
-        if std::env::var_os("PLIRON_STATS").is_some() {
+        if *STATS.get_or_init(|| std::env::var_os("PLIRON_STATS").is_some()) {
             let stats = pass.stats.clone();
             drop(pass);
             eprintln!("egraph stats {:?}: {:?}", self.func.name, stats);

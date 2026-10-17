@@ -806,6 +806,9 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         block: Block,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<()> {
+        static LOWER_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lower_debug =
+            *LOWER_DEBUG.get_or_init(|| std::env::var_os("PLIRON_LOWER_DEBUG").is_some());
         self.cur_scan_entry_color = Some(self.block_end_colors[block]);
         // Lowering loop:
         // - For each non-branch instruction, in reverse order:
@@ -879,7 +882,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // (otherwise we want to keep using the earlier label instead).
             self.emit_value_label_live_range_start_for_inst(inst, has_side_effect || value_needed);
 
-            if std::env::var_os("PLIRON_LOWER_DEBUG").is_some() {
+            if lower_debug {
                 if matches!(
                     self.f.dfg.insts[inst].opcode(),
                     crate::ir::Opcode::Iadd | crate::ir::Opcode::Isub
