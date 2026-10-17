@@ -65,11 +65,17 @@ pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
 }
 
 /// Functions the bottom-up analyses infer facts for: bodied and not
-/// preemptible (an interposed definition could do anything).
+/// preemptible (an interposed definition could do anything). ODR-linked
+/// bodies (`f.odr`) are the exception: every emitted copy of the symbol
+/// is semantically identical, so facts inferred here apply to whichever
+/// copy a call binds.
 pub fn bodied(ctx: &Context, st: &State) -> Vec<String> {
     st.funcs
         .iter()
-        .filter(|(_, f)| f.linkage != cranelift_module::Linkage::Preemptible && has_body(ctx, f.op))
+        .filter(|(_, f)| {
+            (f.linkage != cranelift_module::Linkage::Preemptible || f.odr)
+                && has_body(ctx, f.op)
+        })
         .map(|(s, _)| s.clone())
         .collect()
 }

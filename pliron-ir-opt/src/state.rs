@@ -84,6 +84,13 @@ impl<V> SymMap<V> {
             .enumerate()
             .filter_map(|(i, n)| self.vals[i].as_ref().map(|v| (n, v)))
     }
+    /// [`iter`] yielding `&mut V`.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut V)> {
+        self.names
+            .iter()
+            .zip(self.vals.iter_mut())
+            .filter_map(|(n, v)| v.as_mut().map(|v| (n, v)))
+    }
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.iter().map(|(k, _)| k)
     }
@@ -175,7 +182,7 @@ impl Extend<String> for SymSet {
         }
     }
 }
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +232,13 @@ pub struct FuncInfo {
     pub cold: bool,
     /// Declared or inferred unable to unwind (see nounwind.rs).
     pub nounwind: bool,
+    /// Defined with an ODR linkage (`weak_odr`/`linkonce_odr`): every
+    /// emitted copy is semantically identical, so contract facts inferred
+    /// on this body hold for whichever copy a call binds (unlike
+    /// `weak_any`/`linkonce_any`, which the linker may replace with an
+    /// arbitrary definition). Marks `Preemptible` bodies that are still
+    /// safe for `bodied` inference and `share_facts`.
+    pub odr: bool,
     /// Backend type of the value returned through the sret pointer.
     pub sret_ty: Option<TypeHandle>,
     /// Params pointing at memory rustc marks `noalias readonly` (frozen `&T`):
@@ -537,4 +551,146 @@ pub fn nonnull_values(ctx: &Context, st: &State) -> Vec<(Value, u64)> {
         }
     }
     out
+}
+
+/// Process-global callee-contract facts merged across codegen units
+/// (`State::share_facts`). A call to a bodiless symbol binds whichever
+/// copy the linker picks; since contract facts are semantic properties of
+/// the function, a fact is only shared once *every* emitted copy seen so
+/// far agrees (`copies` vs per-fact counts, intersection for `nocapture`).
+/// `Import` declarations never contribute; `Preemptible` bodies that were
+/// excluded from inference (non-ODR) count as copies but bring no facts,
+/// which poisons their symbol's merge — conservative by construction.
+#[derive(Default)]
+pub struct GlobalFacts {
+    /// Emitted copies seen per symbol (any bodied non-`Import` func).
+    copies: FxHashMap<String, u32>,
+    /// Intersection of per-copy nocapture arg sets.
+    nocapture: FxHashMap<String, FxHashSet<u32>>,
+    /// Copies proving `nowrite = Some(true)` / `Some(false)` resp.
+    nowrite_strict: FxHashMap<String, u32>,
+    nowrite_relaxed: FxHashMap<String, u32>,
+    /// Copies proving each contract.
+    nnret: FxHashMap<String, u32>,
+    willreturn: FxHashMap<String, u32>,
+    nounwind: FxHashMap<String, u32>,
+}
+
+impl GlobalFacts {
+    fn publish(&mut self, sym: &str, st: &State, nounwind: bool) {
+        *self.copies.entry(sym.to_string()).or_default() += 1;
+        let nc = self
+            .nocapture
+            .entry(sym.to_string())
+            .or_insert_with(|| st.nocapture.get(sym).cloned().unwrap_or_default());
+        if let Some(v) = st.nocapture.get(sym) {
+            nc.retain(|a| v.contains(a));
+        } else {
+            nc.clear();
+        }
+        match st.nowrite.get(sym) {
+            Some(true) => *self.nowrite_strict.entry(sym.to_string()).or_default() += 1,
+            Some(false) => *self.nowrite_relaxed.entry(sym.to_string()).or_default() += 1,
+            None => {}
+        }
+        if st.nnret.contains(sym) {
+            *self.nnret.entry(sym.to_string()).or_default() += 1;
+        }
+        if st.willreturn.contains(sym) {
+            *self.willreturn.entry(sym.to_string()).or_default() += 1;
+        }
+        if nounwind {
+            *self.nounwind.entry(sym.to_string()).or_default() += 1;
+        }
+    }
+
+    fn nowrite(&self, sym: &str) -> Option<bool> {
+        let n = *self.copies.get(sym)?;
+        let strict = self.nowrite_strict.get(sym).copied().unwrap_or(0);
+        let relaxed = self.nowrite_relaxed.get(sym).copied().unwrap_or(0);
+        if strict == n {
+            Some(true)
+        } else if strict + relaxed == n {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn proven(map: &FxHashMap<String, u32>, copies: &FxHashMap<String, u32>, sym: &str) -> bool {
+        match (map.get(sym), copies.get(sym)) {
+            (Some(&c), Some(&n)) => c == n,
+            _ => false,
+        }
+    }
+}
+
+static GLOBAL_FACTS: std::sync::LazyLock<std::sync::Mutex<GlobalFacts>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl State {
+    /// Publish this CGU's emitted bodies to [`GLOBAL_FACTS`], then adopt
+    /// merged contract facts for symbols this CGU only declares — a
+    /// foreign call binds an emitted copy the fact was computed on, so
+    /// the shared fact describes the bound code. Local results always
+    /// win: import only fills `funcs` entries without a body. CGUs are
+    /// compiled serially, so publish-before-import order is
+    /// deterministic; later CGUs simply see more.
+    pub fn share_facts(&mut self, ctx: &Context) {
+        let filt = std::env::var("PLIRON_STATS_XCGU").unwrap_or_default();
+        let mut g = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut exported = 0usize;
+        for (sym, f) in self.funcs.iter() {
+            if f.linkage == Linkage::Import || !crate::has_body(ctx, f.op) {
+                continue;
+            }
+            exported += 1;
+            g.publish(sym, self, f.nounwind);
+            if !filt.is_empty() && sym.contains(&filt) {
+                tracing::info!(target: "pliron::stats",
+                    "xfacts {} publish {sym}", self.cgu);
+            }
+        }
+        let mut imported = 0usize;
+        for (sym, f) in self.funcs.iter_mut() {
+            if crate::has_body(ctx, f.op) {
+                continue;
+            }
+            if !g.copies.contains_key(sym) {
+                continue;
+            }
+            let mut hit = false;
+            if let Some(v) = g.nocapture.get(sym) {
+                self.nocapture.insert(sym.clone(), v.clone());
+                hit = !v.is_empty();
+            }
+            if let Some(v) = g.nowrite(sym) {
+                self.nowrite.insert(sym.clone(), v);
+                hit = true;
+            }
+            if GlobalFacts::proven(&g.nnret, &g.copies, sym) {
+                self.nnret.insert(sym.clone());
+                hit = true;
+            }
+            if GlobalFacts::proven(&g.willreturn, &g.copies, sym) {
+                self.willreturn.insert(sym.clone());
+                hit = true;
+            }
+            if GlobalFacts::proven(&g.nounwind, &g.copies, sym) {
+                f.nounwind = true;
+                hit = true;
+            }
+            if hit {
+                imported += 1;
+                if !filt.is_empty() && sym.contains(&filt) {
+                    tracing::info!(target: "pliron::stats",
+                        "xfacts {} import {sym}", self.cgu);
+                }
+            }
+        }
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "xfacts {}: published {exported}, imported {imported}", self.cgu);
+        }
+    }
 }

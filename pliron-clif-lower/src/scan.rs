@@ -217,6 +217,7 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
                     inline_hint: false,
                     cold: false,
                     nounwind: true,
+                    odr: false,
                     sret_ty: None,
                     frozen: Vec::new(),
                     noalias: Vec::new(),
