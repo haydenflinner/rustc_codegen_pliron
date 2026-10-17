@@ -627,3 +627,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     per call — a backend-codegen profile showed ~11% of samples in
     `getenv`/lock waits even after the workspace-side reads were
     cached.
+
+52. Conditional domtree recompute after the egraph (`src/context.rs`,
+    `src/egraph/mod.rs`): `EgraphPass::run` now returns
+    `remove_pure_and_optimize`'s `cfg_maybe_changed`. The pass already
+    recomputes `cfg` itself when it rewrites a terminator and
+    `eliminate_unreachable_code` maintains it through block removal, so
+    `Context::egraph_pass` no longer recomputes `cfg` unconditionally
+    and recomputes `domtree` only when edges actually moved — about
+    1.4s of analysis rebuilds per bench build was unconditional.

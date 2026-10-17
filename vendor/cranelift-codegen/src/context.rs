@@ -1111,7 +1111,7 @@ impl Context {
             ctrl_plane,
             &mut self.cfg,
         );
-        pass.run();
+        let cfg_maybe_changed = pass.run();
         log::debug!("egraph stats: {:?}", pass.stats);
         if *STATS.get_or_init(|| std::env::var_os("PLIRON_STATS").is_some()) {
             let stats = pass.stats.clone();
@@ -1120,9 +1120,13 @@ impl Context {
         }
         trace!("After egraph optimization:\n{}", self.func.display());
 
-        // Branch optimizations can invalidate these; recompute them.
-        self.compute_cfg();
-        self.compute_domtree();
+        // PLIRON: `run` recomputes `cfg` when it rewrites a terminator
+        // and its unreachable-block sweep maintains it — the graph is
+        // always valid here. `domtree` is stale only in that case:
+        // pure-node rewrites keep dominance intact.
+        if cfg_maybe_changed {
+            self.compute_domtree();
+        }
 
         self.verify_if(fisa)?;
 
