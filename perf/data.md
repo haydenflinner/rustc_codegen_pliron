@@ -19,26 +19,27 @@ pliron-release ≈ 0.72 s (the rest is shared rustc frontend work).
 
 | kernel | LLVM (ms) | pliron (ms) | ratio |
 |---|---|---|---|
-| chars_alpha | 1.7923 | 2.3009 | 1.284 |
-| chars_ascii | 0.9589 | 0.9625 | 1.004 |
-| chars_mixed | 9.3634 | 9.4778 | 1.012 |
-| contains_rng | 2.5986 | 3.0301 | 1.166 |
-| eqbug | 0.1171 | 0.1076 | 0.919 |
-| fib | 7.7365 | 7.5402 | 0.975 |
-| hashmap | 49.499 | 45.630 | 0.922 |
-| hmget | 10.392 | 10.401 | 1.001 |
-| iterw | 33.703 | 32.441 | 0.963 |
-| matmul | 6.0413 | 5.5933 | 0.926 |
-| nbody | 70.963 | 69.285 | 0.976 |
-| parse_only | 276.20 | 302.94 | 1.097 |
-| sieve | 13.751 | 14.308 | 1.040 |
-| sortw | 6.7390 | 7.3633 | 1.093 |
-| strwork | 11.580 | 16.398 | 1.416 |
-| tokenize | 2.6784 | 2.4677 | 0.921 |
+| chars_alpha | 1.7879 | 2.2779 | 1.274 |
+| chars_ascii | 0.9483 | 0.9604 | 1.013 |
+| chars_mixed | 9.3674 | 9.3921 | 1.003 |
+| contains_rng | 2.5120 | 2.9918 | 1.191 |
+| eqbug | 0.1152 | 0.1067 | 0.926 |
+| fib | 7.6769 | 7.4544 | 0.971 |
+| hashmap | 45.660 | 45.927 | 1.006 |
+| hmget | 10.176 | 10.374 | 1.019 |
+| iterw | 30.172 | 31.491 | 1.044 |
+| matmul | 5.6799 | 5.6127 | 0.988 |
+| nbody | 69.958 | 69.455 | 0.993 |
+| parse_only | 276.76 | 303.54 | 1.097 |
+| sieve | 13.574 | 14.072 | 1.037 |
+| sortw | 6.9629 | 8.3779 | 1.203 |
+| strwork | 11.592 | 12.272 | 1.059 |
+| tokenize | 2.6700 | 2.4155 | 0.905 |
 
-geomean pliron/LLVM = **1.037**; faster on 7/16 (eqbug, fib, hashmap, iterw,
-matmul, nbody, tokenize); worst regressions: strwork +41.6 %, chars_alpha
-+28.4 %, contains_rng +16.6 %.
+geomean pliron/LLVM = **1.041**; faster on 5/16 (eqbug, fib, matmul,
+nbody, tokenize); worst regressions: chars_alpha +27.4 %, sortw +20.3 %,
+contains_rng +19.1 %. `strwork` dropped +41.6 % → +5.9 % after the
+inlining work.
 
 ## 3. Wasm compile time — same lib, `--target wasm32-unknown-unknown --emit obj`
 
