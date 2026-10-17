@@ -3819,6 +3819,20 @@ mod clif_emit {
             self.cvt(self.get1(v), WT::I32)
         }
 
+        /// Branch/trap/select condition: `cvt` wraps an i64 carrier to its
+        /// low 32 bits, which loses values nonzero only in the high half —
+        /// `(x & 0x8000..) != 0` sign tests wrapped to 0 and flipped
+        /// `x < 0` branches (wasm `if`/`br_if`/`select` read i32). Emit
+        /// `v != 0` for i64 operands instead.
+        fn cond(&mut self, v: WV) -> WV {
+            if self.ty_of(v) == WT::I64 {
+                let z = self.i64c(0);
+                self.op(O::I64Ne, &[v, z], WT::I32)
+            } else {
+                self.cvt(v, WT::I32)
+            }
+        }
+
         fn load(&mut self, t: ClType, p: WV, off: u64) -> WV {
             let memory = self.ma(off, t.bytes() as u64);
             let (o, ty) = match t {
@@ -4507,7 +4521,7 @@ mod clif_emit {
                             return;
                         }
                         let flat = self.flat(rt);
-                        let c = self.cvt(self.get1(args[0]), WT::I32);
+                        let c = self.cond(self.get1(args[0]));
                         if flat.len() == 1 {
                             let x = self.cvt(self.get1(args[1]), flat[0]);
                             let y = self.cvt(self.get1(args[2]), flat[0]);
@@ -5008,7 +5022,7 @@ mod clif_emit {
                         .set_terminator(self.cur, Terminator::Br { target: t });
                 }
                 ir::InstructionData::Brif { arg, blocks, .. } => {
-                    let c = self.cvt(self.get1(arg), WT::I32);
+                    let c = self.cond(self.get1(arg));
                     let if_true = self.block_target(f, &blocks[0]);
                     let if_false = self.block_target(f, &blocks[1]);
                     self.b.set_terminator(
@@ -5052,7 +5066,7 @@ mod clif_emit {
                     self.b.set_terminator(self.cur, Terminator::Unreachable);
                 }
                 ir::InstructionData::CondTrap { arg, .. } => {
-                    let c = self.cvt(self.get1(arg), WT::I32);
+                    let c = self.cond(self.get1(arg));
                     // trapnz traps when nonzero; trapz when zero.
                     let c = if opc == P::Trapz {
                         let z = self.i32c(0);
@@ -5503,7 +5517,21 @@ mod clif_emit {
         fn extend(&mut self, f: &ir::Function, arg: ir::Value, rt: ClType, signed: bool) -> Vals {
             let st = self.vty(f, arg);
             if rt == clt::I128 || rt == clt::F128 {
-                let a = self.cvt(self.get1(arg), WT::I64);
+                let raw = self.get1(arg);
+                let a = if wty(st) == WT::I64 {
+                    raw
+                } else if signed {
+                    // Sign-extend the narrow container to i32, then i32->i64
+                    // signed — `cvt`'s I64ExtendI32U would leave -1 as
+                    // 0xFFFFFFFF (e.g. a signed i8 enum discriminant cast).
+                    let s = self.sext(raw, st.bits());
+                    self.op(O::I64ExtendI32S, &[s], WT::I64)
+                } else {
+                    // Zero-extend: canonicalize the narrow container first so
+                    // stray high bits can't leak into the low word.
+                    let z = self.norm(raw, st.bits());
+                    self.op(O::I64ExtendI32U, &[z], WT::I64)
+                };
                 let hi = if signed {
                     let s = self.i64c(63);
                     self.op(O::I64ShrS, &[a, s], WT::I64)
