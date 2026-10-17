@@ -600,3 +600,14 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     data keep the wide env, so zmm codegen stays profitable where it
     is used. The `high_xmm_regs()`/`WIDE_VECTOR_BITS` knobs are
     unchanged — they cap the maximum, this patch gates it per fn.
+
+50. `src/machinst/blockorder.rs`: the chained-order successor pick prefers
+    a block that is itself a loop latch (its terminator reaches back to a
+    dominator — `is_latch`) over a non-latch of the same rank; in-count
+    breaks remaining ties as before. Placing the latch right after the
+    loop head puts the hot continuation on the not-taken edge of the
+    head's `brif`, so each iteration pays only the latch's own back-edge
+    branch instead of an extra taken branch to reach the arm block
+    (LLVM's latch-before-head shape; ~25% on a per-element
+    `filter().count()` loop). `PLIRON_BCHAIN_DEBUG` prints pick
+    decisions.

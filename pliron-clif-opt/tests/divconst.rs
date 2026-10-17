@@ -4,7 +4,7 @@
 //! magic-division fixups).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::ir::{Function, InstructionData, Opcode};
+use cranelift_codegen::ir::{Function, InstBuilder, InstructionData, Opcode};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
 
 fn parse(src: &str) -> Function {
@@ -139,6 +139,73 @@ fn mixed_widths() {
     for d in [i16::MAX as i64, i16::MIN as i64] {
         check_one("sdiv", "i16", d, 64);
         check_one("urem", "i16", d, 64);
+    }
+}
+
+/// i128 `udiv`/`urem` by a constant — the libcall (`__udivti3`) case. The
+/// divisor goes in as `iconcat`d i64 limbs: the form lowering actually
+/// emits (`iconst.i128` has no isel rule and the reader rejects it).
+fn check_one_128(op: &str, d: u128, trials: u32) {
+    use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName, types};
+    use cranelift_codegen::isa::CallConv;
+    let mut f = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(CallConv::SystemV),
+    );
+    f.signature.params.push(AbiParam::new(types::I128));
+    f.signature.returns.push(AbiParam::new(types::I128));
+    let b = f.dfg.make_block();
+    f.layout.append_block(b);
+    let v0 = f.dfg.append_block_param(b, types::I128);
+    {
+        let mut pos = FuncCursor::new(&mut f).at_bottom(b);
+        let lo = pos.ins().iconst(types::I64, d as u64 as i64);
+        let hi = pos.ins().iconst(types::I64, (d >> 64) as u64 as i64);
+        let dc = pos.ins().iconcat(lo, hi);
+        let v = match op {
+            "udiv" => pos.ins().udiv(v0, dc),
+            "urem" => pos.ins().urem(v0, dc),
+            _ => unreachable!(),
+        };
+        pos.ins().return_(&[v]);
+    }
+    let before = f.clone();
+    let k = pliron_clif_opt::divconst::run(&mut f);
+    assert_eq!(k, 1, "no expansion: {op}.i128 by {d:#x}");
+    assert!(no_divs(&f), "div left: {op}.i128 by {d:#x}");
+    let cfg = Config {
+        trials,
+        ..Config::default()
+    };
+    if let Err(m) = check(&before, &f, &Facts::default(), &cfg) {
+        panic!("{op}.i128 by {d:#x}: {m}\n---- after\n{}", f.display());
+    }
+}
+
+#[test]
+fn unsigned_i128() {
+    // pow2 edges, small magics, the 2^64 limb boundary, and extremes whose
+    // magic fills both limbs.
+    for d in [
+        1u128,
+        2,
+        3,
+        5,
+        7,
+        8,
+        97,
+        100,
+        10u128.pow(18),
+        u64::MAX as u128,
+        1u128 << 64,
+        (1u128 << 64) + 1,
+        u64::MAX as u128 + 2,
+        (1u128 << 127) - 1,
+        1u128 << 127,
+        u128::MAX,
+    ] {
+        check_one_128("udiv", d, 64);
+        check_one_128("urem", d, 64);
     }
 }
 

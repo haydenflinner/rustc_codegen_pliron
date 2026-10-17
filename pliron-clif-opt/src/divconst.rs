@@ -9,7 +9,11 @@
 //! The `mulhi` helper is also exported for loopvec, which emits *vector*
 //! `{s,u}mulhi` for ≤32-bit lanes as widen+imul+uzp2 — `smull`/`smull2`
 //! +`uzp2` on aarch64 — since no target lowers vector mulhi directly.
-//! i128 stays a hardware div: there is no cheap wider multiply.
+//! Unsigned i128 is covered too: `umulhi.i128` has no isa lowering, but the
+//! 128×128→256 high half decomposes into four ≤64×≤64 `imul.i128` partial
+//! products — ~30 scalar insts vs a `__udivti3`/`__umodti3` libcall per
+//! division. Signed i128 still takes the libcall: `smagics` needs a signed
+//! high-half the same decomposition does not yield directly.
 //!
 //! `x % d` rewrites as `x - (x/d)*d` once `x/d` is expanded; powers of two
 //! use the `ushr`/`band` (unsigned) or sign-fixup `sshr` (signed) forms.
@@ -135,6 +139,130 @@ pub fn magic_unsigned_lz(d: u64, w: u32, lz: u32) -> (u64, bool, u32) {
         shift -= 1;
     }
     (magic, is_add, shift)
+}
+
+/// `(magic, is_add, shift)` for unsigned division by `d` (`d >= 2`) at
+/// 128 bits — `magic_unsigned_lz` with `lz = 0`, since `vmax`'s bound is
+/// u64-shaped. All arithmetic is plain `u128`; `nc`'s `(all_ones + 1 - d)`
+/// wraps to `2^128 - d` as at narrower widths.
+fn magic_unsigned_128(d: u128) -> (u128, bool, u32) {
+    let signed_min = 1u128 << 127;
+    let signed_max = signed_min - 1;
+    let nc = u128::MAX - (u128::MAX.wrapping_add(1).wrapping_sub(d) % d);
+    debug_assert!(nc % d == d - 1);
+    let mut p = 127u32;
+    let (mut q1, mut r1) = (signed_min / nc, signed_min % nc);
+    let (mut q2, mut r2) = (signed_max / d, signed_max % d);
+    let mut is_add = false;
+    loop {
+        p += 1;
+        if r1 >= nc - r1 {
+            q1 = (q1 << 1) + 1;
+            r1 = (r1 << 1).wrapping_sub(nc);
+        } else {
+            q1 <<= 1;
+            r1 <<= 1;
+        }
+        if r2.wrapping_add(1) >= d - r2 {
+            if q2 >= signed_max {
+                is_add = true;
+            }
+            q2 = (q2 << 1) + 1;
+            r2 = (r2 << 1).wrapping_add(1).wrapping_sub(d);
+        } else {
+            if q2 >= signed_min {
+                is_add = true;
+            }
+            q2 <<= 1;
+            r2 = (r2 << 1).wrapping_add(1);
+        }
+        let delta = d - 1 - r2;
+        if !(p < 256 && (q1 < delta || (q1 == delta && r1 == 0))) {
+            break;
+        }
+    }
+    let magic = q2.wrapping_add(1);
+    let mut shift = p - 128;
+    if is_add {
+        shift -= 1;
+    }
+    (magic, is_add, shift)
+}
+
+/// `c` as an i128 constant — `iconcat`'d i64 limbs, since `iconst.i128`
+/// has no isel rule and an imm64 can't hold a 128-bit pattern anyway.
+fn cst128(pos: &mut FuncCursor, c: u128) -> Value {
+    let lo = pos.ins().iconst(types::I64, c as u64 as i64);
+    let hi = pos.ins().iconst(types::I64, (c >> 64) as u64 as i64);
+    pos.ins().iconcat(lo, hi)
+}
+
+/// An `i64` shift-amount constant (i128 shifts take a scalar amount).
+fn cst_amt(pos: &mut FuncCursor, k: u32) -> Value {
+    pos.ins().iconst(types::I64, k as i64)
+}
+
+/// `umulhi.i128` synthesized from `imul.i128` partial products — no target
+/// lowers the opcode, but with `x = xl + xh·2^64` and `m` split likewise,
+/// `P = p1 + (p2 + p3)·2^64 + p4·2^128` and every partial product of two
+/// <2^64 operands fits its 128-bit result:
+///   `P.hi = p4 + p2.hi + p3.hi + carry64(p1.hi + p2.lo + p3.lo)`.
+fn mulhi_u128(pos: &mut FuncCursor, x: Value, m: u128) -> Value {
+    let mask = cst128(pos, u64::MAX as u128);
+    let c64 = cst_amt(pos, 64);
+    let xl = pos.ins().band(x, mask);
+    let xh = pos.ins().ushr(x, c64);
+    let ml = cst128(pos, m as u64 as u128);
+    let mh = cst128(pos, (m >> 64) as u128);
+    let p1 = pos.ins().imul(xl, ml);
+    let p2 = pos.ins().imul(xl, mh);
+    let p3 = pos.ins().imul(xh, ml);
+    let p4 = pos.ins().imul(xh, mh);
+    let p2l = pos.ins().band(p2, mask);
+    let p3l = pos.ins().band(p3, mask);
+    let mid = pos.ins().iadd(p2l, p3l);
+    let p1h = pos.ins().ushr(p1, c64);
+    let mid = pos.ins().iadd(mid, p1h);
+    let carry = pos.ins().ushr(mid, c64);
+    let p2h = pos.ins().ushr(p2, c64);
+    let p3h = pos.ins().ushr(p3, c64);
+    let t = pos.ins().iadd(p4, p2h);
+    let t = pos.ins().iadd(t, p3h);
+    pos.ins().iadd(t, carry)
+}
+
+/// `x / d` (or `x % d`) for unsigned i128. `d == 1` reaches the pow2 path
+/// (`ushr` by 0 / `band` by 0) which is already the answer.
+fn expand_u128(pos: &mut FuncCursor, x: Value, d: u128, rem: bool) -> Value {
+    if rem && d.is_power_of_two() {
+        let dm1 = cst128(pos, d - 1);
+        return pos.ins().band(x, dm1);
+    }
+    let q = if d.is_power_of_two() {
+        let c = cst_amt(pos, d.trailing_zeros());
+        pos.ins().ushr(x, c)
+    } else {
+        let (magic, is_add, shift) = magic_unsigned_128(d);
+        let mut q = mulhi_u128(pos, x, magic);
+        if is_add {
+            let t = pos.ins().isub(x, q);
+            let c1 = cst_amt(pos, 1);
+            let t = pos.ins().ushr(t, c1);
+            q = pos.ins().iadd(t, q);
+        }
+        if shift > 0 {
+            let c = cst_amt(pos, shift);
+            q = pos.ins().ushr(q, c);
+        }
+        q
+    };
+    if rem {
+        let dc = cst128(pos, d);
+        let qd = pos.ins().imul(q, dc);
+        pos.ins().isub(x, qd)
+    } else {
+        q
+    }
 }
 
 /// A `w`-bit pattern `k` as an `iconst` (div/rem are scalar-only).
@@ -342,8 +470,49 @@ fn divisor(func: &Function, ty: Type, v: Value) -> Option<u64> {
     Some((raw as u64) & mask(ty.lane_type().bits()))
 }
 
+/// An i64 `iconst`'s 64-bit pattern.
+fn iconst64(func: &Function, v: Value) -> Option<u64> {
+    let v = func.dfg.resolve_aliases(v);
+    match func.dfg.value_def(v) {
+        cranelift_codegen::ir::ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } if func.dfg.value_type(v) == types::I64 => Some(imm.bits() as u64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The divisor's i128 value. Lowering materializes i128 constants as
+/// `iconcat`d i64 limbs (the `iconst.i128` form is a builder artifact
+/// rewritten before this step runs); accept both.
+fn divisor128(func: &Function, v: Value) -> Option<u128> {
+    let v = func.dfg.resolve_aliases(v);
+    match func.dfg.value_def(v) {
+        cranelift_codegen::ir::ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Some(imm.bits() as u128),
+            InstructionData::Binary {
+                opcode: Opcode::Iconcat,
+                args,
+            } => {
+                let lo = iconst64(func, args[0])?;
+                let hi = iconst64(func, args[1])?;
+                Some((u128::from(hi) << 64) | u128::from(lo))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn run(func: &mut Function) -> usize {
     let mut hits = Vec::new();
+    let mut hits128 = Vec::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
@@ -358,12 +527,28 @@ pub fn run(func: &mut Function) -> usize {
             let res = func.dfg.first_result(i);
             let ty = func.dfg.value_type(res);
             let w = ty.lane_type().bits();
-            // Scalar-only opcodes, so `ty` is scalar; i128 has no
-            // 2×-wide multiply to take the high half of.
-            if !matches!(w, 8 | 16 | 32 | 64) || ty.is_vector() {
+            // Scalar-only opcodes, so `ty` is scalar.
+            if ty.is_vector() {
                 continue;
             }
             let x = func.dfg.resolve_aliases(args[0]);
+            if w == 128 {
+                // Signed i128 keeps the libcall (see the module doc).
+                if !matches!(opcode, Opcode::Udiv | Opcode::Urem) {
+                    continue;
+                }
+                let Some(d) = divisor128(func, args[1]) else {
+                    continue;
+                };
+                if d == 0 {
+                    continue;
+                }
+                hits128.push((i, x, d, opcode));
+                continue;
+            }
+            if !matches!(w, 8 | 16 | 32 | 64) {
+                continue;
+            }
             let Some(d) = divisor(func, ty, args[1]) else {
                 continue;
             };
@@ -373,12 +558,26 @@ pub fn run(func: &mut Function) -> usize {
             hits.push((i, ty, x, d, opcode));
         }
     }
-    let n = hits.len();
+    let n = hits.len() + hits128.len();
     if n == 0 {
         return 0;
     }
     let mut pos = FuncCursor::new(func);
     let mut done = 0;
+    for (i, x, d, op) in hits128 {
+        pos.goto_inst(i);
+        let res = pos.func.dfg.first_result(i);
+        let v = expand_u128(&mut pos, x, d, op == Opcode::Urem);
+        pos.func.dfg.clear_results(i);
+        pos.func.layout.remove_inst(i);
+        pos.func.dfg.change_to_alias(res, v);
+        done += 1;
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::divconst", tracing::Level::DEBUG)
+        {
+            tracing::debug!(target: "pliron::divconst", "divconst: expanded {op}.i128 by {d:#x}")
+        }
+    }
     for (i, ty, x, d, op) in hits {
         pos.goto_inst(i);
         let res = pos.func.dfg.first_result(i);

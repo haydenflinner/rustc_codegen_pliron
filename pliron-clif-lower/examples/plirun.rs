@@ -92,7 +92,7 @@ fn main() {
 
     let mut st = scan::scan(&mut ctx, module);
     let mut adj = None;
-    iropt::inline::run(&mut ctx, &mut st, false, iropt::inline::SMALL_LIMIT, None, false, None, &mut adj);
+    iropt::inline::run(&mut ctx, &mut st, false, iropt::inline::SMALL_LIMIT, 0, None, false, None, &mut adj);
     iropt::instcombine::run(&mut ctx, &mut st);
     iropt::memcpyopt::run(&mut ctx, &mut st);
     iropt::phisimp::run(&mut ctx, &mut st);
