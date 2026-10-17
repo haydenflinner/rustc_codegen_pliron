@@ -319,12 +319,12 @@ pub fn lower_to_object(
 /// Declare and define every function and global of `ctx`'s module in `m`
 /// (an `ObjectModule`, a `JITModule`, ...).
 #[allow(clippy::too_many_arguments)]
-pub fn lower_module(
+pub fn lower_module<'a>(
     m: &mut dyn Module,
     unwind: bool,
     hot: bool,
     ctx: &Context,
-    st: &State,
+    st: &'a State,
     isa: &Arc<dyn TargetIsa>,
     name: &str,
     host: &dyn Host,
@@ -526,10 +526,25 @@ pub fn lower_module(
     let _pglo = host.prof().activity("pliron_lowerobj", None);
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
+    // Each finished `FnJob` is fully self-contained though, so the (B)
+    // worker pool starts draining as soon as the first job lands rather
+    // than waiting for the last lowering: jobs stream over a channel
+    // and phase (B)'s wall hides behind phase (A)'s serial walk. Serial
+    // when `PLIRON_OPT_BISECT` is set (the bisect counter must number
+    // pass applications deterministically) or `PLIRON_PAR` overrides.
+    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
+    let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
+        1
+    } else {
+        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .min(st.funcs.len().max(1))
+            .max(1)
+    };
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
     let _pgfl = host.prof().activity("pliron_fnlower", None);
     let tpa = std::time::Instant::now();
-    let mut jobs: Vec<FnJob> = Vec::new();
+    let mut idx = 0usize;
+    let mut produce = |emit: &mut dyn FnMut(usize, FnJob<'a>)| {
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -648,7 +663,7 @@ pub fn lower_module(
                 .filter_map(|(&cb, &rb)| st.prof_bcount.get(rb).map(|&c| (cb, c)))
                 .collect();
         }
-        jobs.push(FnJob {
+        emit(idx, FnJob {
             name: n,
             id,
             func: std::mem::replace(&mut clctx.func, ir::Function::new()),
@@ -673,10 +688,10 @@ pub fn lower_module(
             code: None,
             dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
         });
+        idx += 1;
         m.clear_context(&mut clctx);
     }
-
-    drop(_sfl);
+    };
     // Phase (B): CLIF pipeline + cranelift compile per function. Each job
     // is fully self-contained, so workers can run them in any order;
     // results are applied in declaration order in phase (C), keeping the
@@ -890,52 +905,59 @@ pub fn lower_module(
         clctx.clear();
     }
 
-    pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
-    let tpb = std::time::Instant::now();
-    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
-    let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
-        1
-    } else {
-        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-            .min(jobs.len().max(1))
-            .max(1)
-    };
-    let jobs = if nthreads <= 1 {
+    let mut jobs: Vec<FnJob> = Vec::new();
+    if nthreads <= 1 {
+        produce(&mut |_, j| jobs.push(j));
+        drop(_sfl);
+        drop(_pgfl);
+        pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+        let tpb = std::time::Instant::now();
         let mut wcl = cranelift_codegen::Context::new();
         for j in &mut jobs {
             run_job(j, &mut wcl, &shared);
         }
-        jobs
+        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
     } else {
-        // Compile longest-first (LPT): a CGU's pipeline wall is bound by
-        // its slowest function, and an arbitrary order can leave the one
-        // 10s fn for last while the pool drains 100ms fns.
-        let mut order: Vec<usize> = (0..jobs.len()).collect();
-        order.sort_unstable_by_key(|&i| std::cmp::Reverse(jobs[i].func.dfg.num_insts()));
-        let jobs: Vec<std::sync::Mutex<FnJob>> =
-            jobs.into_iter().map(std::sync::Mutex::new).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
+        // Workers pull jobs over a channel while `produce` lowers — the
+        // serial lowering is the slower side, so the pool stays starved
+        // and arrival (FIFO) order replaces the old largest-first sort;
+        // the drain below only waits for the pipeline's tail. Results
+        // come back indexed so phase (C) sees declaration order.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, FnJob<'a>)>();
+        let (dtx, drx) = std::sync::mpsc::channel::<(usize, FnJob<'a>)>();
+        let rx = std::sync::Mutex::new(rx);
         let shared = &shared;
-        let order = &order;
         std::thread::scope(|s| {
             for _ in 0..nthreads {
-                s.spawn(|| {
+                let rx = &rx;
+                let dtx = dtx.clone();
+                s.spawn(move || {
                     let mut wcl = cranelift_codegen::Context::new();
                     loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= order.len() {
-                            break;
-                        }
-                        let mut j = jobs[order[i]].lock().unwrap_or_else(|e| e.into_inner());
+                        let got = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((i, mut j)) = got else { break };
                         run_job(&mut j, &mut wcl, shared);
+                        let _ = dtx.send((i, j));
                     }
                 });
             }
+            drop(dtx);
+            produce(&mut |i, j| {
+                let _ = tx.send((i, j));
+            });
+            drop(tx);
+            drop(_sfl);
+            drop(_pgfl);
+            pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+            let tpb = std::time::Instant::now();
+            let mut done = std::collections::BTreeMap::new();
+            while let Ok((i, j)) = drx.recv() {
+                done.insert(i, j);
+            }
+            jobs = done.into_values().collect();
+            pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
         });
-        jobs.into_iter().map(|m| m.into_inner().unwrap()).collect()
-    };
-
-    pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+    }
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
