@@ -131,28 +131,30 @@ std codegen; and measurement granularity is a whole `run()` call.
 This run is the committed default configuration on an otherwise idle
 host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 
-| kernel | LLVM | pliron | change | dialect | change |
-|---|---|---|---|---|---|
-| chars_alpha | 4.577 ms | 4.040 ms | −12.1% | 4.020 ms | −12.2% |
-| chars_ascii | 2.330 ms | 2.327 ms | −0.1% | 2.329 ms | +0.0% |
-| chars_mixed | 18.56 ms | 25.54 ms | +37.7% | 25.56 ms | +37.9% |
-| contains_rng | 4.926 ms | 5.506 ms | +11.6% | 5.507 ms | +11.5% |
-| eqbug | 0.136 ms | 0.119 ms | −12.2% | 0.120 ms | −11.7% |
-| fib | 9.462 ms | 9.011 ms | −5.5% | 8.911 ms | −5.8% |
-| hashmap | 66.71 ms | 77.26 ms | +15.7% | 76.97 ms | +15.2% |
-| hmget | 11.58 ms | 16.50 ms | +42.6% | 16.55 ms | +42.6% |
-| iterw | 67.29 ms | 57.69 ms | −14.0% | 57.69 ms | −14.3% |
-| matmul | 30.87 ms | 27.68 ms | −10.6% | 27.61 ms | −10.8% |
-| nbody | 84.39 ms | 91.73 ms | +8.7% | 91.69 ms | +8.7% |
-| parse_only | 382.9 ms | 510.6 ms | +33.4% | 510.7 ms | +33.0% |
-| sieve | 14.05 ms | 17.12 ms | +21.8% | 17.12 ms | +21.9% |
-| sortw | 6.258 ms | 7.757 ms | +23.6% | 7.753 ms | +23.9% |
-| strwork | 17.40 ms | 23.77 ms | +36.8% | 23.92 ms | +37.5% |
-| tokenize | 7.747 ms | 5.258 ms | −31.8% | 5.263 ms | −32.3% |
+| kernel | LLVM | pliron | change |
+|---|---|---|---|
+| chars_alpha | 3.040 ms | 2.457 ms | −18.8% |
+| chars_ascii | 1.278 ms | 1.636 ms | +28.2% |
+| chars_mixed | 12.79 ms | 19.19 ms | +49.3% |
+| contains_rng | 5.332 ms | 5.334 ms | +0.0% |
+| eqbug | 0.119 ms | 0.112 ms | −6.2% |
+| fib | 5.697 ms | 6.277 ms | +10.4% |
+| hashmap | 46.52 ms | 53.07 ms | +13.4% |
+| hmget | 8.990 ms | 9.526 ms | +6.8% |
+| iterw | 58.76 ms | 35.15 ms | −40.6% |
+| matmul | 26.45 ms | 24.35 ms | −8.7% |
+| nbody | 72.57 ms | 77.55 ms | +6.8% |
+| parse_only | 293.8 ms | 392.3 ms | +34.6% |
+| sieve | 13.77 ms | 14.20 ms | +3.5% |
+| sortw | 6.742 ms | 6.907 ms | +2.3% |
+| strwork | 12.83 ms | 15.16 ms | +17.9% |
+| tokenize | 3.395 ms | 4.323 ms | +27.4% |
 
-Geomeans: pliron/LLVM = 1.069 (both pliron columns build the same
-CLIF-pipeline module; 16 kernels), down from 1.674 before the inlining
-work below. Module sizes: LLVM 97 KB, pliron 187 KB.
+Geomean: pliron/LLVM = 1.057 (16 kernels), down from 1.674 at the
+inlining work and the earlier recorded 1.069 — the `xcgu` emit-closure
+`visible` fix + `WASM_HOT` loop bonus + `constload` ptr-size +
+`memset` scalarize in the wasm path dropped hashmap +52% → +13% and
+hmget +43% → +7%. Module sizes: LLVM 97 KB, pliron 224 KB.
 
 Changes since the 1.674 geomean:
 
