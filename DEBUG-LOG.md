@@ -227,3 +227,59 @@ non-xcgu fns with uncountable callers (fl.-clones, stubs).
 Side bug found during the hunt: `PLIRON_STATS=1` kills the backend with
 STATUS_STACK_BUFFER_OVERRUN (0xC0000409) — the stats/tracing path has a
 latent smash; don't use it for diagnostics until fixed.
+
+## FIXED: bittab sign-crossing isets silently dropped match arms
+
+`bittab::signed_to_unsigned` emitted a sign-wrapping signed interval
+`[a,b]` (a<0<=b) as `[(a_signed, umax), (0, b)]` — descending order in
+the unsigned domain. `meet`/`complement` merge-walk assumes ascending
+input, so intersecting a taken-arm iset silently produced empty (leaf
+edge dropped as dead) and the complement swelled to cover it: a
+guarded-range match like `match x+1 { 100=>0, 0..=2 if false=>1,
+1..=3=>2, _=>3 }` folded to a 2-leaf mask routing `x+1 in 1..=3` to
+the wildcard (3, not 2) at every signed int width, -O0 too. This is
+the `tests/ui/match/overeager-sub-match-pruning-13027` miscompile
+(also reported by the wasm differential suite). Fix (`2bc9495`, plus
+the independent `a4c731e` in the diff-agent worktree adding sortedness
+debug_asserts + a filetest): emit `[(0,b),(neg,max)]` ascending.
+
+## PLIRON_STATS=1 crash fixed
+
+`STATUS_STACK_BUFFER_OVERRUN` under `PLIRON_STATS{,_WHY}` was not a
+real stack smash: `sroa::why`/`why2` grew a worklist over use chains
+with no visited set; cyclic use graphs made the Vec allocation
+unbounded (handle_alloc_error → fast-fail). `c114d2f` adds an
+FxHashSet visited-set. `PLIRON_STATS_WHY=1` on genisle now completes.
+
+## strwork/hashmap/call-chain pattern (perf, not yet fixed)
+
+Disasm compare on `strwork`-shaped and `vpush` probes: our codegen
+keeps the std machinery call chains ~2x deeper than LLVM —
+`Vec::push` → `push_mut` → `reserve` → `try_allocate_in` →
+`finish_grow`/`grow_amortized` → `alloc_impl_runtime` → `__rust_alloc`
+survives as separate calls; LLVM folds the amortized fast path into
+the caller and keeps ~3 of those call sites. `strwork::run` obj: 82
+call sites (LLVM 19); `vpush::main`: 58 (LLVM 15). Same class as the
+wasm `hash_one` gap — inlining-depth/call-chain, not per-call codegen.
+`PLIRON_INLINE_LIMIT` has no effect (limit isn't the gate — the
+callees aren't scored inlinable or the model's growth cap binds
+first); `PLIRON_INLINE_GROWTH=16` made it worse. Also seen:
+`unicode::alphabetic::lookup_slow` call inside the chars() loop —
+`is_alphabetic`'s ASCII fast path IS inlined (LLVM-fused `c&~0x20 -
+'A' < 26` arithmetic) but non-ASCII ≥0xAA calls into the TLS-checked
+`eh_check` path every call: `_tls_index` + `gs:0x58` + `__pliron_eh`
+load + flag test = ~7 extra insts/call for any extern callee rustc
+can't prove `nounwind`.
+
+## rustc leaf crates differential — all clean
+
+Standalone differential probes (pliron vs stock LLVM, release +
+8 CGUs + `-Zbuild-std` pliron-built std): `rustc_lexer` token stream
+on ~300 ui files + rustc sources — byte-identical; `rustc_arena`
+TypedArena alloc/drop of nested enum/box/vec structures;
+`rustc_hashes` SipHash128; `rustc_serialize` FileEncoder/MemDecoder
+roundtrip; `rustc_parse_format` pieces on format strings — all
+IDENTICAL outputs. The stage-2 miscompile is not in these crates'
+codegen. `PLIRON_DIFFCHECK=1` on the genisle crate (cranelift-meta
+build) produced zero reports (dir only created on mismatch).
+`PLIRON_VERIFY=full` clean on genisle.
