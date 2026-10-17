@@ -19,27 +19,29 @@ pliron-release ≈ 0.72 s (the rest is shared rustc frontend work).
 
 | kernel | LLVM (ms) | pliron (ms) | ratio |
 |---|---|---|---|
-| chars_alpha | 1.7879 | 2.2779 | 1.274 |
-| chars_ascii | 0.9483 | 0.9604 | 1.013 |
-| chars_mixed | 9.3674 | 9.3921 | 1.003 |
-| contains_rng | 2.5120 | 2.9918 | 1.191 |
-| eqbug | 0.1152 | 0.1067 | 0.926 |
-| fib | 7.6769 | 7.4544 | 0.971 |
-| hashmap | 45.660 | 45.927 | 1.006 |
-| hmget | 10.176 | 10.374 | 1.019 |
-| iterw | 30.172 | 31.491 | 1.044 |
-| matmul | 5.6799 | 5.6127 | 0.988 |
-| nbody | 69.958 | 69.455 | 0.993 |
-| parse_only | 276.76 | 303.54 | 1.097 |
-| sieve | 13.574 | 14.072 | 1.037 |
-| sortw | 6.9629 | 8.3779 | 1.203 |
-| strwork | 11.592 | 12.272 | 1.059 |
-| tokenize | 2.6700 | 2.4155 | 0.905 |
+| chars_alpha | 1.8170 | 2.2752 | 1.252 |
+| chars_ascii | 0.9562 | 0.9562 | 1.000 |
+| chars_mixed | 9.4444 | 9.4172 | 0.997 |
+| contains_rng | 2.5357 | 3.0036 | 1.185 |
+| eqbug | 0.1139 | 0.1056 | 0.928 |
+| fib | 7.6202 | 7.5028 | 0.984 |
+| hashmap | 47.612 | 43.867 | 0.921 |
+| hmget | 10.265 | 10.167 | 0.991 |
+| iterw | 30.355 | 32.548 | 1.072 |
+| matmul | 5.7740 | 5.6475 | 0.978 |
+| nbody | 71.065 | 69.260 | 0.975 |
+| parse_only | 275.62 | 305.16 | 1.107 |
+| sieve | 13.565 | 14.034 | 1.035 |
+| sortw | 7.4688 | 7.9840 | 1.069 |
+| strwork | 11.520 | 12.305 | 1.068 |
+| tokenize | 2.6451 | 2.4465 | 0.925 |
 
-geomean pliron/LLVM = **1.041**; faster on 5/16 (eqbug, fib, matmul,
-nbody, tokenize); worst regressions: chars_alpha +27.4 %, sortw +20.3 %,
-contains_rng +19.1 %. `strwork` dropped +41.6 % → +5.9 % after the
-inlining work.
+geomean pliron/LLVM = **1.028**; faster on 7/16 (eqbug, hashmap, tokenize,
+nbody, matmul, fib, hmget — chars_mixed/strwork/ascii flat); worst
+regressions: chars_alpha +25.2 %, contains_rng +18.5 %, parse_only +10.7 %.
+`strwork` dropped +41.6 % → +6.8 % after the inlining work; `sortw`
++20.3 % → +6.9 % and `iterw` +9.1 % → +7.2 % after upstream `130d743`
+(blockorder loop-latch fallthrough) + `f5b86a0`/`ab2ae1b` (i128 divconst).
 
 ## 3. Wasm compile time — same lib, `--target wasm32-unknown-unknown --emit obj`
 
