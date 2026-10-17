@@ -132,8 +132,11 @@ fn signed_to_unsigned(a: i64, b: i64, bits: u32) -> ISet {
     if a >= 0 || b < 0 {
         vec![(conv(a), conv(b))]
     } else {
-        // Wraps the sign boundary: negative half, then [0, b].
-        vec![(conv(a), max), (0, conv(b))]
+        // Wraps the sign boundary: [0, b], then the negative half. The
+        // unsigned-domain pieces must stay sorted ascending — `meet`/
+        // `complement` merge-walk the lists and silently drop intervals
+        // that arrive out of order.
+        vec![(0, conv(b)), (conv(a), max)]
     }
 }
 
