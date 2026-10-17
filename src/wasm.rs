@@ -1494,11 +1494,10 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
     // group emits before, or the gets would silently vanish.
     let mut prel: Vec<(usize, u32)> = Vec::new();
     let mut protected: FxHashSet<usize> = FxHashSet::default();
-    for _ in 0..if crate::env_get("PLIRON_WASM_KOS") == Some("0") {
-        0
-    } else {
-        8
-    } {
+    for _ in 0..crate::env_get("PLIRON_WASM_KOS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+    {
         // (set idx, get idx, producer start, hoisted get idxs)
         let mut acts2: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
         {
@@ -1608,6 +1607,65 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                     }
                 }
                 let Some(ps) = ps else { continue };
+                // Positional check: emit the hoists at `ps`, then simulate
+                // [ps, u) including pending prelude pushes of earlier
+                // rewrites (they're not in `ins`). The transform is only
+                // sound when the stack at `u` is [.., h0..hn, kept]: any
+                // other value still on the stack between the hoisted gets
+                // and the kept value — a `local.tee`'s kept copy, a value
+                // the producer leaked, or a prelude queued inside the span
+                // — makes a later consumer pop the wrong operand.
+                const KEPT: usize = usize::MAX;
+                const PREL: usize = usize::MAX - 1;
+                let mut slots: Vec<usize> = Vec::new();
+                let mut ok = true;
+                // Preludes queued for the same `ps` anchor emit first.
+                for &(off, _) in &prel {
+                    if off == ins[ps].1 {
+                        slots.push(PREL);
+                    }
+                }
+                slots.extend_from_slice(&hoists);
+                for v in ps..u {
+                    for &(off, _) in &prel {
+                        if off == ins[v].1 {
+                            slots.push(PREL);
+                        }
+                    }
+                    if v == s {
+                        if slots.is_empty() {
+                            ok = false;
+                            break;
+                        }
+                        slots.pop();
+                        slots.push(KEPT);
+                        continue;
+                    }
+                    if hoists.contains(&v) {
+                        continue; // deleted at its old position
+                    }
+                    let Some((pp, qq)) = eff(v) else {
+                        ok = false;
+                        break;
+                    };
+                    if slots.len() < pp as usize {
+                        ok = false;
+                        break;
+                    }
+                    for _ in 0..pp {
+                        slots.pop();
+                    }
+                    for _ in 0..qq {
+                        slots.push(v);
+                    }
+                }
+                let suf = slots.len().saturating_sub(hoists.len() + 1);
+                if !ok
+                    || slots.last() != Some(&KEPT)
+                    || slots[suf..suf + hoists.len()] != hoists[..]
+                {
+                    continue;
+                }
                 // Each surviving push must hoist below the producer:
                 // only `local.get lx` moves, and only when no def of
                 // lx sits between the insertion point and its old
