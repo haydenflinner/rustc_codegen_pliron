@@ -383,3 +383,34 @@ on range tables — same branchy shape as `bsearch`).
 `diff` sysroot stage-2 probes + filetest-deletion cleanup (review on
 merge — deleting `.clif` is coverage loss). `f16`/`f128` unimplemented
 (type lowering + libcall ABI — `lang_start` stubs).
+
+## night wrap — remaining gap = codegen density, not passes
+
+All wasm miscompiles dead (ui-wasm: 16468 pass, only f16/f128-unsupported
+and pointer-address/abort-format noise remain). Wasm geomean 1.16→1.057,
+native ~1.04.
+
+The residual kernels all show the same signature — we emit ~1.5-2x the
+instructions LLVM does per hot-loop iteration, dominated by:
+
+- **regalloc copies**: `movq %rcx,%r8` back-to-back dup copies and
+  redundant reg-reg moves (chars_alpha inner loop ~10 insts vs LLVM ~8;
+  eqbug ~9 vs ~6). Values re-materialized into new regs instead of
+  coalesced. Probably a spill-segment/coalescing gap in regalloc v2.
+- **dead-callee-saved-xmm spills**: `contains_rng`'s scalar `run` saves
+  14 xmm6-15 regs in its prologue though the loop uses none — a vec
+  value regalloc kept live (probably a broadcast the loop didn't fully
+  consume) forces the saves.
+- **checked-op / Option-Result density**: parse_only `from_str` ~
+  1.9x LLVM's code (328 vs 173 insts in `run`); the checked-mul-add +
+  Result wrap costs more per digit.
+
+`armmerge` covers the branch-select idiom (bsearch/unicode skip-search
+arms); the rest is lowering+regalloc quality, which is what the
+natperf/loopvec agents are working on. `chars_alpha` shows we DO emit
+the `(c|0x20)-'a'<26` idiom — LLVM still wins on the copies around it.
+
+Still in flight: natperf loopvec inv-reconstruction, ui
+loadfwd_call_indirect probe, diff sysroot stage-2 probes (+ a filetest
+deletion set to review — it removes regression coverage; don't merge).
+Stage-2 needs the Linux box.
