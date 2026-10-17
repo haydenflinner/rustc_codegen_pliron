@@ -306,6 +306,22 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 .filter_map(|(&item, data)| data.inlined.then_some(item))
         })
         .collect();
+    // Items bindable without a copy: some partition emits the symbol
+    // externally. An Internal dep (e.g. `RawVecInner::deallocate` under a
+    // `RawVec::drop` copy) can only be satisfied by a copy of its own, so
+    // the frontier must descend into it even though it isn't inlined in
+    // its home CGU — otherwise the dep is unreachable and the parent's
+    // copy dies in the remaining-prune below.
+    let externs: FxHashSet<MonoItem<'tcx>> = parts
+        .iter()
+        .flat_map(|other| {
+            other
+                .items()
+                .iter()
+                .filter(|(_, data)| matches!(data.linkage, Linkage::External))
+                .map(|(&item, _)| item)
+        })
+        .collect();
     // `seen` seeds with the frontier only: items referenced by our own
     // items are NOT guaranteed-emitted elsewhere (an Internal+inlined
     // mono item can be dead-stripped in its home CGU), so they may still
@@ -335,7 +351,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 if let MonoItem::Fn(c2) = u.node
                     && !ours.contains_key(&u.node)
                     && seen.insert(u.node)
-                    && inlined.contains(&u.node)
+                    && (inlined.contains(&u.node) || !externs.contains(&u.node))
                 {
                     size_report(c2);
                     if copyable(tcx, c2, limit) {
