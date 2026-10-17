@@ -888,7 +888,15 @@ fn trivially_promotable(
     ty
 }
 
-fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
+/// Split one alloca into slices; `made` collects the ops it creates —
+/// all `insert_before(alloca)`, so pushing them in creation order keeps
+/// a caller-maintained alloca list in exact body-scan order.
+fn split(
+    ctx: &mut Context,
+    st: &mut State,
+    alloca: Ptr<Operation>,
+    made: &mut Vec<Ptr<Operation>>,
+) -> bool {
     let a = alloca.deref(ctx).get_result(ctx, 0);
     let Some(&(size, align)) = st.allocas.get(a) else {
         return false;
@@ -1038,6 +1046,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
         let arr = ArrayType::get(ctx, i8t, pin_hi - pin_lo).into();
         let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
         op.insert_before(ctx, alloca);
+        made.push(op);
         let v = op.deref(ctx).get_result(ctx, 0);
         st.allocas.insert(v, (pin_hi - pin_lo, align.max(1)));
         // Its bytes back a live call operand — re-splitting would just
@@ -1057,6 +1066,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
             let arr = ArrayType::get(ctx, i8t, s.size).into();
             let op = AllocaOp::new(ctx, arr, count, 0).get_operation();
             op.insert_before(ctx, alloca);
+            made.push(op);
             let v = op.deref(ctx).get_result(ctx, 0);
             let al = if s.off == 0 {
                 align
@@ -1240,9 +1250,10 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
             }
             Kind::Escape { idx } => {
                 let arr = ArrayType::get(ctx, i8t, size).into();
-                let tmp = AllocaOp::new(ctx, arr, count, 0).get_operation();
-                tmp.insert_before(ctx, alloca);
-                let tmp = tmp.deref(ctx).get_result(ctx, 0);
+                let tmp_op = AllocaOp::new(ctx, arr, count, 0).get_operation();
+                tmp_op.insert_before(ctx, alloca);
+                made.push(tmp_op);
+                let tmp = tmp_op.deref(ctx).get_result(ctx, 0);
                 st.allocas.insert(tmp, (size, align));
                 st.escape_copies.insert(tmp);
                 for (i, s) in sl.iter().enumerate() {
@@ -1381,15 +1392,29 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         if crate::pass_enabled("PLIRON_SROA_FWD") {
             forward_single_store(ctx, st, f);
         }
+        // Retry worklist instead of rescanning the body each round:
+        // `split` erases its alloca only when the rewrite left it
+        // unused — anything still in `st.allocas` (failed splits and
+        // partial splits alike) is what the next round's rescan would
+        // have retried, plus the ops `split` created, which sat just
+        // before their parent in the scan. Order is preserved exactly.
+        let mut wl = allocas(ctx, f);
         for _round in 0..3 {
-            let allocas = allocas(ctx, f);
             let mut changed = false;
-            for op in allocas {
-                changed |= split(ctx, st, op);
+            let mut retry = Vec::new();
+            let mut made = Vec::new();
+            for op in wl.drain(..) {
+                let a = op.deref(ctx).get_result(ctx, 0);
+                changed |= split(ctx, st, op, &mut made);
+                retry.extend(made.drain(..));
+                if st.allocas.contains(a) {
+                    retry.push(op);
+                }
             }
             if !changed {
                 break;
             }
+            wl = retry;
         }
         // And after splitting: a slice left holding one stored value.
         if crate::pass_enabled("PLIRON_SROA_FWD") {
