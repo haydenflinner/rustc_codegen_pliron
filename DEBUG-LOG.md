@@ -328,3 +328,26 @@ Plus `trait-object-arrays-11205` (dse/loadfwd, fixed upstream earlier).
 NOTE for sysroot repro: `ui-wsys-build` cargo fingerprinting does NOT
 track the backend dll — must `rm -rf target/ui-wsys{,-build}` after a
 backend fix or the sysroot rlibs stay stale (cost me a false negative).
+
+## wasm peephole miscompile — `str::lt`/`slice::cmp` prefix-equal (fixed `1928c86`)
+
+`<str as PartialOrd>::lt` returned wrong results in some contexts
+(`estr-slice.rs` failing `assert!(c < cc)` for "cccc" < "ccccc", and a
+minimal `let lt = c < cc` repro). `PLIRON_WASM_PEEP=0` fixed it — the
+bug was a lost-write hazard between two `peep_body` sub-passes in
+`src/wasm.rs`:
+
+- Adjacent-pair coalescing deleted a `local.get 4; local.set 4` self-copy
+  (a no-op) outright and fused a `set 5; get 5` to `tee 5`.
+- The copy-forward fixpoint then paired `get 5 -> set 4`, retargeted
+  `tee 5 -> tee 4`, and deleted the copy — but the deleted self-copy was
+  the only marker that local 4's value was consumed/reaffirmed on that
+  path, so the block exited with l4 = the wrong source on every path.
+
+Fix: a `WPeek::Nop(l)` marker for each deleted `get l; set l` — it acts
+as a use+identity-def in the fixpoint's reaching-def analysis and a
+motion barrier in FWD/KOS, so producer-retargeting can't drop a real
+write. Verified: estr-slice/infer-rhs/try-macro/overeager all pass, the
+4 original ui-wasm bugs are dead, 16468-pass full suite. Remaining
+noise: 2 `output-mismatch` (raw pointer addresses — expected) + 2
+`run-fail` (f16/f128 unsupported — same under PEEP=0).
