@@ -2526,6 +2526,10 @@ fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_armmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    armmerge::run(&mut p.clctx.func)
+}
+
 // Loop count tests against a wide constant rematerialize it per
 // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
 // a non-constant preheader value codegen pins in a register. Runs
@@ -3154,6 +3158,11 @@ pub static DEFAULT: &[Step] = &[
         s_webmerge,
     )
     .needs(shape::MULTI),
+    // taildup/jtr twin-arm clones (`binary_search`'s two update paths)
+    // differ only in operand values — merge into one block with `select`s,
+    // turning a data-dependent branch per iteration into `cmov`s.
+    cstep("armmerge", "armmerge", Gate::Env("PLIRON_ARMMERGE"), s_armmerge)
+        .needs(shape::CONDBR),
     // The late jtr/mergechain/taildup rounds stamp a fresh `iconst` per
     // block copy (a `mov #10` before every unrolled `madd` — parse_only);
     // merge them back to the dominating def so one register serves the
