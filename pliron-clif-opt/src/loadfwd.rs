@@ -15,6 +15,7 @@ use cranelift_codegen::ir::{
     Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 
 const MAX_ENTRIES: usize = 64;
 const MAX_ITERS: usize = 32;
@@ -973,47 +974,62 @@ pub fn run(
         }
         acc
     };
-    let mut stable = false;
     let t0 = std::time::Instant::now();
     let mut iters = 0;
-    for _ in 0..MAX_ITERS {
+    // Worklist over RPO order: `meet` only shrinks loc sets (a must
+    // analysis), so the unique fixpoint is order-independent and a
+    // block needs re-transferring only after one of its inputs
+    // actually changed — a per-round full rescan just re-verifies
+    // stable blocks. The bail mirrors `MAX_ITERS` rounds: a block
+    // whose out changes more than that would have needed one more
+    // RPO round than the old loop allowed.
+    let mut work: VecDeque<Block> = rpo.iter().copied().collect();
+    let mut inq: FxHashSet<Block> = work.iter().copied().collect();
+    let mut nch: FxHashMap<Block, u32> = FxHashMap::default();
+    let mut stable = true;
+    while let Some(b) = work.pop_front() {
+        inq.remove(&b);
+        let Some(mut av) = input(&out, b) else {
+            continue;
+        };
         iters += 1;
-        let mut changed = false;
-        for &b in &rpo {
-            let Some(mut av) = input(&out, b) else {
-                continue;
-            };
-            transfer(
-                func,
-                ps,
-                &stop,
-                noalias,
-                b,
-                &mut av,
-                None,
-                &iso,
-                &ncc,
-                inv_insts,
-                &mut invs,
-                breg.get(&b).copied(),
-                ofrozen,
-                &mut invreg,
-                rpar,
-                nw,
-                fbnd,
-                fpm,
-                eh,
-            );
-            if out.get(&b) != Some(&av) {
-                out.insert(b, av);
-                changed = true;
+        transfer(
+            func,
+            ps,
+            &stop,
+            noalias,
+            b,
+            &mut av,
+            None,
+            &iso,
+            &ncc,
+            inv_insts,
+            &mut invs,
+            breg.get(&b).copied(),
+            ofrozen,
+            &mut invreg,
+            rpar,
+            nw,
+            fbnd,
+            fpm,
+            eh,
+        );
+        if out.get(&b) != Some(&av) {
+            out.insert(b, av);
+            let c = nch.entry(b).or_default();
+            *c += 1;
+            if *c > MAX_ITERS as u32 {
+                stable = false;
+                break;
+            }
+            for s in cfg.succ_iter(b) {
+                if inq.insert(s) {
+                    work.push_back(s);
+                }
             }
         }
-        if !changed {
-            stable = true;
-            break;
-        }
     }
+    let stable = stable && work.is_empty();
     if prof2 {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::loadfwd", "    lf-fxpt {:.3}ms (iters={iters})",
@@ -1323,55 +1339,65 @@ fn pre(
         }
         Some(acc)
     };
-    let mut stable = false;
-    for _ in 0..MAX_ITERS {
-        let mut changed = false;
-        for &b in rpo {
-            let Some(keys) = input(&out, b) else {
-                continue;
-            };
-            let mut av: Avail = keys
-                .into_iter()
-                .map(|k| (k, Value::reserved_value()))
-                .collect();
-            transfer(
-                func,
-                ps,
-                na,
-                na0,
-                b,
-                &mut av,
-                None,
-                iso,
-                ncc,
-                // `out` must agree with the `st` scan below, which tracks
-                // no invariant immunity — pass empty sets so `transfer`
-                // marks and retains nothing extra here. `iso` is real:
-                // `kill` needs it to keep locs disjoint from the store's
-                // root, or every unrelated store empties the set.
-                &FxHashSet::default(),
-                &mut FxHashSet::default(),
-                None,
-                &FxHashMap::default(),
-                &mut FxHashMap::default(),
-                &pliron::cols::ColMap::default(),
-                nw,
-                bnd,
-                pm,
-                eh,
-            );
-            let ks: FxHashSet<Loc> = av.into_keys().collect();
-            if out.get(&b) != Some(&ks) {
-                out.insert(b, ks);
-                changed = true;
+    // Same worklist shape as the forwarding fixpoint above: the key-set
+    // meet only shrinks, so re-transferring is needed only when an
+    // input changed. Per-block change cap mirrors `MAX_ITERS` rounds.
+    let mut work: VecDeque<Block> = rpo.iter().copied().collect();
+    let mut inq: FxHashSet<Block> = work.iter().copied().collect();
+    let mut nch: FxHashMap<Block, u32> = FxHashMap::default();
+    let mut stable = true;
+    while let Some(b) = work.pop_front() {
+        inq.remove(&b);
+        let Some(keys) = input(&out, b) else {
+            continue;
+        };
+        let mut av: Avail = keys
+            .into_iter()
+            .map(|k| (k, Value::reserved_value()))
+            .collect();
+        transfer(
+            func,
+            ps,
+            na,
+            na0,
+            b,
+            &mut av,
+            None,
+            iso,
+            ncc,
+            // `out` must agree with the `st` scan below, which tracks
+            // no invariant immunity — pass empty sets so `transfer`
+            // marks and retains nothing extra here. `iso` is real:
+            // `kill` needs it to keep locs disjoint from the store's
+            // root, or every unrelated store empties the set.
+            &FxHashSet::default(),
+            &mut FxHashSet::default(),
+            None,
+            &FxHashMap::default(),
+            &mut FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            nw,
+            bnd,
+            pm,
+            eh,
+        );
+        let ks: FxHashSet<Loc> = av.into_keys().collect();
+        if out.get(&b) != Some(&ks) {
+            out.insert(b, ks);
+            let c = nch.entry(b).or_default();
+            *c += 1;
+            if *c > MAX_ITERS as u32 {
+                stable = false;
+                break;
+            }
+            for s in cfg.succ_iter(b) {
+                if inq.insert(s) {
+                    work.push_back(s);
+                }
             }
         }
-        if !changed {
-            stable = true;
-            break;
-        }
     }
-    if !stable {
+    if !(stable && work.is_empty()) {
         return 0;
     }
     let ins: FxHashMap<Block, FxHashSet<Loc>> = rpo
