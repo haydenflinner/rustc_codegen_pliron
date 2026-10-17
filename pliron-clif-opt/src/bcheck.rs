@@ -1123,26 +1123,39 @@ fn run_loop(
     };
     let edges = edges_to(func, cfg, h);
     let mut entries: Vec<Edge> = Vec::new();
-    let mut back = None;
+    let mut backs: Vec<Edge> = Vec::new();
     for e in edges {
         let pb = func.layout.inst_block(e.inst).unwrap();
         if body.contains(&pb) {
-            if back.replace(e).is_some() {
-                bail!("multiple backedges");
-            }
+            backs.push(e);
         } else {
             entries.push(e);
         }
     }
-    let (Some(back), false) = (back, entries.is_empty()) else {
+    if backs.is_empty() || entries.is_empty() {
         bail!("no entry/back edge");
-    };
-    let latch = func.layout.inst_block(back.inst).unwrap();
+    }
+    // With a single backedge a bound test at the latch constrains the
+    // next iteration's iv; with several backedges each latch test only
+    // constrains its own edge, so the iv's in-body bound must come from
+    // the header's own test (re-checked on every trip).
+    let single = backs.len() == 1;
+    let latch = func.layout.inst_block(backs[0].inst).unwrap();
+    let sites: &[Block] = if single { &[latch, h] } else { &[h] };
     let params = func.dfg.block_params(h).to_vec();
+    // The value fed for each param — only kept when every backedge
+    // passes the same resolved value, so a step read on `ba` constrains
+    // all of them.
     let bargs: Vec<Option<Value>> = params
         .iter()
         .enumerate()
-        .map(|(i, _)| edge_arg(func, &back, i))
+        .map(|(i, _)| {
+            let mut it = backs
+                .iter()
+                .map(|e| edge_arg(func, e, i).map(|v| func.dfg.resolve_aliases(v)));
+            let first = it.next().flatten();
+            first.filter(|f| it.all(|v| v == Some(*f)))
+        })
         .collect();
     let eargs: Vec<Option<Value>> = params
         .iter()
@@ -1247,7 +1260,7 @@ fn run_loop(
         if !same {
             iv0k = None;
         }
-        for site in [latch, h] {
+        for &site in sites {
             let Some((bound, adj, _)) = bound_test(site, p, ba) else {
                 continue;
             };
@@ -1337,7 +1350,7 @@ fn run_loop(
     {
         let iv = info.iv;
         let ba = bargs[info.iv0].unwrap_or(iv);
-        for site in [latch, h] {
+        for &site in sites {
             if let Some((_, _, ti)) = bound_test(site, iv, ba) {
                 trip_tests.insert(ti);
             }
