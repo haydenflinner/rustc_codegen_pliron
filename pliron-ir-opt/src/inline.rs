@@ -526,6 +526,7 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
                 f.linkage == Linkage::Local
                     && has_body(ctx, f.op)
                     && !st.dead_fns.contains(n.as_str())
+                    && !st.xcgu_copies.contains(n.as_str())
                     && !taken.contains(n.as_str())
                     && !counts.contains_key(n.as_str())
             })

@@ -1651,6 +1651,14 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
         };
     }
     for &inst in &extra {
+        // Rustc's `used` lists don't cover copy-to-copy calls, so these
+        // bodies can end up with zero `direct_callee`-resolvable callers
+        // while still being referenced at lowering — keep them off
+        // `dead_fns` (see `State::xcgu_copies`).
+        cx.st
+            .borrow_mut()
+            .xcgu_copies
+            .insert(tcx.symbol_name(inst).name.to_string());
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),
@@ -1659,6 +1667,18 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
         );
     }
     for &(mono_item, data) in &mono_items {
+        // `inlined` local-copy and `Internal` instances share the same
+        // dangling-call hazard as `extra` copies: xcgu copies elsewhere
+        // in this CGU can call them through ops `direct_callee` can't
+        // resolve, and neither shows up as a caller in `call_counts`.
+        if data.inlined || data.linkage == rustc_attr_ir::Linkage::Internal {
+            if let rustc_middle::mono::MonoItem::Fn(inst) = mono_item {
+                cx.st
+                    .borrow_mut()
+                    .xcgu_copies
+                    .insert(tcx.symbol_name(inst).name.to_string());
+            }
+        }
         mono_item.predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),

@@ -393,6 +393,13 @@ pub struct State {
     pub inbounds: ColSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
     pub dead_fns: SymSet,
+    /// xcgu extra-copy symbols (`xcgu::copies` in lib.rs). Rustc never
+    /// reports cross-CGU callers of a local-copy instance, so `dead_fns`
+    /// must not strip them: a copy's only callers can be other copies
+    /// whose call ops escape `direct_callee` (they survive to lowering
+    /// and would emit dangling `U`s). Keeping an unused copy is only
+    /// object-code bloat; stripping a referenced one breaks the link.
+    pub xcgu_copies: SymSet,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
     pub notrap: bool,
     /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).
