@@ -192,3 +192,38 @@ stock-LLVM wasm side.
 The two float cases may share a root cause in the pliron-built wasip1
 std float parse. Also: `wty(clt::F16)` panics to `unreachable` stub on
 wasip1 (2 tests: f16-f128-lit, primitive-usage) — known f16 limitation.
+
+## FIXED: xcgu local copies dead-stripped -> dangling `U` link failures
+
+Repro: `cargo build` of `vendor/cranelift-assembler-x64-meta` (via
+`/tmp/genisle`, a one-file runner calling `meta::generate_rust_assembler`)
+with the pliron backend at `-O`, default CGU sharding (8+) -> 24
+unresolved generic monomorphizations at link
+(`IntoIterator::into_iter` for `[Operand; N]` / `IntoIter<Operand, N>`,
+`Into::into` for `Location`/`Rex`/`Features`, `Iterator::collect`).
+`-Ccodegen-units=1`, `PLIRON_XCGU=0`, `PLIRON_XCGU_CAP=max`, and
+`PLIRON_DEADFN=0` each link clean and emit byte-identical generated
+output to stock LLVM (145k-line assembler.rs, 0 diffs) — the bug is
+emission, not generated code.
+
+Root cause: `inline::dead_fns` marks `Linkage::Local` fns with zero
+`call_counts`/`address_taken` callers and lower.rs skips emitting them.
+The xcgu `extra` copies (`Linkage::Internal` -> Local) and `inlined=true`/
+`Internal` mono items can still be *called* — by other copies and mono
+items whose `llvm.call`s `direct_callee` doesn't count (rust `used`
+lists don't model copy-to-copy edges at all) — so the body was stripped
+while callers emitted direct `callq` relocs -> `U` with no def.
+
+Fix (`e111bdd`): `State::xcgu_copies` records `extra` copies plus
+`inlined`/`Internal` mono items; `dead_fns` exempts them. Keeping an
+unused copy is object bloat; stripping a referenced one breaks the
+link. Still open (cheaper to revisit than the dangling `U`s): the
+*counting* blindspot itself — `direct_callee`'s `Indirect` arm resolves
+only via `st.consts.get(p)`, which is stale/incomplete at iropt time
+when passes rewrite call operands (the operand's ConstVal::Sym may sit
+on an aliased-away value). dead_fns remains unsound for `Local`
+non-xcgu fns with uncountable callers (fl.-clones, stubs).
+
+Side bug found during the hunt: `PLIRON_STATS=1` kills the backend with
+STATUS_STACK_BUFFER_OVERRUN (0xC0000409) — the stats/tracing path has a
+latent smash; don't use it for diagnostics until fixed.
