@@ -754,16 +754,29 @@ thread_local! {
     static EDGE_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
 }
 
-pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize {
+pub fn run(
+    func: &mut Function,
+    derived: &mut FxHashMap<Value, Value>,
+    cd: Option<(&mut ControlFlowGraph, &mut DominatorTree)>,
+) -> usize {
     EDGE_NS.set(0);
-    let mut cfg = ControlFlowGraph::with_function(func);
-    let mut domtree = DominatorTree::with_function(func, &cfg);
+    // The caller's cached cfg/dt may be reused: edge-args and values may
+    // have changed since it was built, but block adjacency has not.
+    let (mut cfg_l, mut dt_l);
+    let (cfg, domtree) = match cd {
+        Some((c, d)) => (c, d),
+        None => {
+            cfg_l = ControlFlowGraph::with_function(func);
+            dt_l = DominatorTree::with_function(func, &cfg_l);
+            (&mut cfg_l, &mut dt_l)
+        }
+    };
     let mut flat = Flat {
         ok: false,
         la: LoopAnalysis::new(),
         interior: FxHashMap::default(),
     };
-    let mut msets = Msets::new(func, &domtree);
+    let mut msets = Msets::new(func, domtree);
     let mut dirty = false;
     // Exact pred deltas for applied folds — (gained direct preds, lost
     // preds) per block — so checks that need fresh pred sets don't pay a
@@ -781,9 +794,13 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
     // reads still trigger the incremental recompute. The pred deltas
     // are idempotent against a recomputed cfg, so a recompute inside a
     // round leaves later rounds correct.
+    // Folds only rewrite terminators and emit into the scanned block —
+    // no block is ever added or removed, so the scan list is stable
+    // across rounds.
+    let blocks: Vec<Block> = func.layout.blocks().collect();
     'outer: for _ in 0..8 {
         let mut rn = 0;
-        for b in func.layout.blocks().collect::<Vec<_>>() {
+        for b in blocks.iter().copied() {
             let Some(term) = func.layout.last_inst(b) else {
                 continue;
             };
@@ -791,8 +808,8 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
                     && conv_table(
                         func,
-                        &mut cfg,
-                        &mut domtree,
+                        cfg,
+                        domtree,
                         &mut flat,
                         &mut msets,
                         &mut dirty,
@@ -872,12 +889,12 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             if ta.chained || ea.chained {
                 if dirty {
                     cfg.compute(func);
-                    domtree.compute(func, &cfg);
-                    msets.recompute(func, &domtree);
+                    domtree.compute(func, cfg);
+                    msets.recompute(func, domtree);
                     flat.ok = false;
                     dirty = false;
                 }
-                flat.ensure(func, &cfg, &domtree);
+                flat.ensure(func, cfg, domtree);
                 if !flat.flat(b) {
                     continue;
                 }
@@ -886,7 +903,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 ta.chain.iter().chain(ea.chain.iter()).copied().collect();
             let mset = msets.get(m);
             let t0 = std::time::Instant::now();
-            let ok = !mset.is_empty() && edge_ok(func, &domtree, m, mset, &chains, term);
+            let ok = !mset.is_empty() && edge_ok(func, domtree, m, mset, &chains, term);
             EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
             if !ok {
                 continue;
@@ -1107,7 +1124,7 @@ mod tests {
         };
 
         let mut derived = FxHashMap::default();
-        assert_eq!(run(&mut func, &mut derived), 1);
+        assert_eq!(run(&mut func, &mut derived, None), 1);
         let term = func.layout.last_inst(b).unwrap();
         let InstructionData::Jump { destination, .. } = &func.dfg.insts[term] else {
             panic!("table not folded: {}", func.display());
@@ -1243,7 +1260,7 @@ mod tests {
         };
 
         let mut derived = FxHashMap::default();
-        let _ = run(&mut func, &mut derived);
+        let _ = run(&mut func, &mut derived, None);
         // hop's own diamond fold is legitimate; the latch's fold must be
         // rejected — its arms resolve through `hop` while `hop`'s params
         // and `cnd` still feed blocks below `merge`.

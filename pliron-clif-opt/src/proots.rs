@@ -885,6 +885,22 @@ pub fn paramize<'k>(
     // `Rc` addresses can only miss a match, never make a wrong one.
     // `slotk` materializes sibling keys lazily — a hit is the only
     // point they're needed.
+    paramize_r(k, nslots, slotk, ps, skip, hmap, vmap, hmemo).unwrap_or_else(|| k.clone())
+}
+
+/// `paramize` returning `Some` only when the key changed — unchanged
+/// subtrees stay `Rc`-shared instead of being rebuilt, which also keeps
+/// `hmemo`'s address-keyed hashes warm.
+fn paramize_r<'k>(
+    k: &Key,
+    nslots: usize,
+    slotk: &dyn Fn(usize) -> &'k Key,
+    ps: &[Value],
+    skip: usize,
+    hmap: &FxHashMap<u64, u32>,
+    vmap: &FxHashMap<Value, u32>,
+    hmemo: &mut FxHashMap<*const Key, u64>,
+) -> Option<Key> {
     if let Some(&i) = hmap.get(&khash_m(k, hmemo)) {
         let mut i = i as usize;
         if i == skip || slotk(i) != k {
@@ -896,29 +912,34 @@ pub fn paramize<'k>(
             }
         }
         if i != usize::MAX {
-            return Key::P(i as u32);
+            return Some(Key::P(i as u32));
         }
     }
     if let Key::V(w) = k
         && let Some(&i) = vmap.get(w)
     {
-        return Key::Q(i);
+        return Some(Key::Q(i));
     }
     match k {
-        Key::A(t, rk, off) => Key::A(
-            *t,
-            std::rc::Rc::new(paramize(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo)),
-            *off,
-        ),
-        Key::N(op, t, args, extra) => Key::N(
-            *op,
-            *t,
-            args.iter()
-                .map(|a| paramize(a, nslots, slotk, ps, skip, hmap, vmap, hmemo))
-                .collect(),
-            *extra,
-        ),
-        _ => k.clone(),
+        Key::A(t, rk, off) => paramize_r(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo)
+            .map(|nk| Key::A(*t, std::rc::Rc::new(nk), *off)),
+        Key::N(op, t, args, extra) => {
+            let mut news: Option<Vec<Key>> = None;
+            for (i, a) in args.iter().enumerate() {
+                match paramize_r(a, nslots, slotk, ps, skip, hmap, vmap, hmemo) {
+                    Some(nk) => news
+                        .get_or_insert_with(|| args[..i].to_vec())
+                        .push(nk),
+                    None => {
+                        if let Some(ns) = &mut news {
+                            ns.push(a.clone());
+                        }
+                    }
+                }
+            }
+            news.map(|ns| Key::N(*op, *t, ns.into(), *extra))
+        }
+        _ => None,
     }
 }
 
@@ -982,17 +1003,30 @@ pub fn khash_m(k: &Key, memo: &mut FxHashMap<*const Key, u64>) -> u64 {
 /// its class leader's leaf, so per-edge signatures compare structurally
 /// (a back-edge arg `p_j` keys as `V(rep)` just like `p_i`'s does).
 pub fn key_rep(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Key {
-    match k {
-        Key::V(w) if ps.contains(w) => Key::V(rep(*w)),
-        Key::A(t, rk, o) => Key::A(*t, std::rc::Rc::new(key_rep(rk, ps, rep)), *o),
-        Key::N(op, t, args, x) => Key::N(
-            *op,
-            *t,
-            args.iter().map(|a| key_rep(a, ps, rep)).collect(),
-            *x,
-        ),
-        _ => k.clone(),
+    fn go(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Option<Key> {
+        match k {
+            Key::V(w) if ps.contains(w) => Some(Key::V(rep(*w))),
+            Key::A(t, rk, o) => go(rk, ps, rep).map(|nk| Key::A(*t, std::rc::Rc::new(nk), *o)),
+            Key::N(op, t, args, x) => {
+                let mut news: Option<Vec<Key>> = None;
+                for (i, a) in args.iter().enumerate() {
+                    match go(a, ps, rep) {
+                        Some(nk) => news
+                            .get_or_insert_with(|| args[..i].to_vec())
+                            .push(nk),
+                        None => {
+                            if let Some(ns) = &mut news {
+                                ns.push(a.clone());
+                            }
+                        }
+                    }
+                }
+                news.map(|ns| Key::N(*op, *t, ns.into(), *x))
+            }
+            _ => None,
+        }
     }
+    go(k, ps, rep).unwrap_or_else(|| k.clone())
 }
 
 /// Peel an `A`-chain to (base, total offset). Non-`A` keys peel to

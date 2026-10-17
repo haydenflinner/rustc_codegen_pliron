@@ -2850,9 +2850,22 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
 /// target, so a constant arg reaches the block that tests it. Each forwarded
 /// arg must be a param of the bypassed block or defined where it dominates
 /// the predecessor's branch. Returns the edges retargeted.
-fn bypass_forwarders(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+fn bypass_forwarders(
+    func: &mut Function,
+    cd: Option<(&ControlFlowGraph, &DominatorTree)>,
+) -> usize {
+    // A caller-held cfg/domtree is reusable: retargets only shrink `b`'s
+    // pred lists (a stale entry fails the `bc.block == b` re-check) and
+    // can only strengthen dominance — both directions stay conservative.
+    let (cfg_l, dt_l);
+    let (cfg, domtree) = match cd {
+        Some((c, d)) => (c, d),
+        None => {
+            cfg_l = ControlFlowGraph::with_function(func);
+            dt_l = DominatorTree::with_function(func, &cfg_l);
+            (&cfg_l, &dt_l)
+        }
+    };
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
     // Block params used outside their own block: bypassing that block would
@@ -4084,7 +4097,11 @@ pub fn run(
         // side blocks keep phantom CFG edges (skewing dominance checks), so
         // sweep them once unreachable.
         let ic = if ifconv {
-            crate::ifconv::run(func, derived)
+            crate::ifconv::run(
+                func,
+                derived,
+                cd.as_mut().map(|(c, d)| (&mut *c, &mut *d)),
+            )
         } else {
             0
         };
@@ -4095,7 +4112,7 @@ pub fn run(
             remove_unreachable_blocks(func);
         }
         check(func, "unreach");
-        let bpn = bypass_forwarders(func);
+        let bpn = bypass_forwarders(func, cd.as_ref().map(|(c, d)| (&*c, &*d)));
         check(func, "bypass");
         if bpn > 0 {
             changed = true;

@@ -1684,7 +1684,7 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
     // leaf-up: `run` rescans to fixpoint internally on one
     // cfg/domtree setup.
-    let k = ifconv::run(&mut p.clctx.func, p.derived);
+    let k = ifconv::run(&mut p.clctx.func, p.derived, None);
     if k > 0 {
         // Folded merges leave dead forwarders still edging into
         // the merge — remove them so the merge is single-pred,
