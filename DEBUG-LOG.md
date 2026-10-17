@@ -302,3 +302,29 @@ per-iteration structure differences, not missing hash inlining.
 scoring path gates on `enabled!(pliron::frozen)` � set
 `PLIRON_TRACE=pliron::frozen=debug,pliron::inline=debug` to see
 cost/t/reject lines until the target is renamed.
+
+## ui-wasm miscompiles — all four root-caused and fixed
+
+Two wasm-emit bugs (`src/wasm.rs`), both sign-extension:
+
+1. `cast-discriminant-zst-enum` — `extend()`'s i128 branch did
+   `cvt(get1, I64)` = `I64ExtendI32U` for the low word of a signed
+   narrow->i128 cast: `-1` enum discriminant -> i128 `0xFFFFFFFF`.
+   Now sexts to i32 then `I64ExtendI32S`. Fixed in `11d5810`.
+
+2. `try-macro` + `infer-rhs-type` (all float parsing!) — `Brif`/
+   `CondTrap`/`Select` on an i64 condition went through `cvt` =
+   `I32WrapI64`: `(x & 0x8000..) != 0` sign tests wrapped to 0,
+   flipping `x < 0` branches. In dec2flt `exponent < 0` took the
+   multiply arm → `10 * TABLE[(-1) & 31]` = `10 * TABLE[31]` = `10 * 0`
+   = 0, so EVERY fractional float parsed as 0.0 (`"1.0".parse() -> 0`).
+   New `cond()` emits `i64.ne v, 0`. Fixed in `11d5810`.
+
+3. `overeager-sub-match-pruning` — bittab sign-crossing iset ordering
+   (`4e9195d`/`2bc9495`) fixed it on wasm too — confirmed passing.
+
+Plus `trait-object-arrays-11205` (dse/loadfwd, fixed upstream earlier).
+
+NOTE for sysroot repro: `ui-wsys-build` cargo fingerprinting does NOT
+track the backend dll — must `rm -rf target/ui-wsys{,-build}` after a
+backend fix or the sysroot rlibs stay stale (cost me a false negative).
