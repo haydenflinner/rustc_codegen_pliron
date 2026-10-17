@@ -155,21 +155,23 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
     let mut clone = Vec::new();
     let mut psub = Vec::new();
     while chain.len() < 8 {
-        let insts: Vec<Inst> = func.layout.block_insts(cur).collect();
-        let Some((&jmp, body)) = insts.split_last() else {
+        let Some(jmp) = func.layout.last_inst(cur) else {
             break;
         };
         let InstructionData::Jump { destination, .. } = func.dfg.insts[jmp] else {
             break;
         };
+        // All but the terminator — iterated rather than collected since
+        // this runs per brif arm per round.
+        let body = || func.layout.block_insts(cur).filter(|&i| i != jmp);
         let params = func.dfg.block_params(cur);
         // The inst cap bounds total speculation across the chain; arms
         // deeper than SPEC_NARROW additionally need `bool_merge` at the
         // conversion site.
         if cur_edge.len() != params.len()
-            || clone.len() + body.len() > SPEC_WIDE
+            || clone.len() + body().count() > SPEC_WIDE
             || !cur_edge.iter().all(|a| matches!(a, BlockArg::Value(_)))
-            || !body.iter().all(|&i| crate::jumpthread::pure_op(func, i))
+            || !body().all(|i| crate::jumpthread::pure_op(func, i))
         {
             break;
         }
@@ -179,7 +181,7 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
             };
             psub.push((p, func.dfg.resolve_aliases(v)));
         }
-        clone.extend_from_slice(body);
+        clone.extend(body());
         chain.push(cur);
         cur_edge = destination.args(&func.dfg.value_lists).collect();
         cur = destination.block(&func.dfg.value_lists);
@@ -805,8 +807,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 continue;
             };
             let dests = func.dfg.insts[term]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .to_vec();
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
             let [t_bc, e_bc] = dests[..] else {
                 continue;
             };

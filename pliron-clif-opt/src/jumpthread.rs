@@ -464,6 +464,21 @@ impl<'a> NonNull<'a> {
         self.is_deps(func, v, &mut FxHashSet::default())
     }
 
+    /// `is` behind a caller-owned memo. Answers depend on `func` as it
+    /// stands at query time, so the memo is only sound across a span
+    /// where `func` does not change — `round`'s edge scan and
+    /// `fold_null_tests`' collection both qualify; a caller that
+    /// rewrites `func` between queries must drop the memo too.
+    pub fn is_m(&self, func: &Function, v: Value, memo: &mut FxHashMap<Value, bool>) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if let Some(&r) = memo.get(&v) {
+            return r;
+        }
+        let r = self.is(func, v);
+        memo.insert(v, r);
+        r
+    }
+
     /// `is_deps` behind a per-value memo — legal only while `params` is
     /// frozen (the `new` seeding pass); eviction shrinks `params`, which
     /// can change answers, so callers there pass `None`.
@@ -1035,6 +1050,9 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
     let mut dt_lazy: Option<DominatorTree> = None;
     // `ne_params` sets per sentinel constant, built on first use.
     let mut ne_sets: FxHashMap<u64, FxHashSet<Value>> = FxHashMap::default();
+    // `nn` queries run only inside this immutable scan — `hits` apply
+    // after — so one memo covers them all.
+    let mut nnm: FxHashMap<Value, bool> = FxHashMap::default();
     for b in func.layout.blocks() {
         for inst in func.layout.block_insts(b) {
             let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[inst] else {
@@ -1101,7 +1119,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 hits.push((inst, f));
                 continue;
             }
-            if nn.is(func, x) {
+            if nn.is_m(func, x, &mut nnm) {
                 hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
                 continue;
             }
@@ -1146,7 +1164,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                         match known(func, &none, arg) {
                             Some(0) => edges.push((arm, true)),
                             Some(_) => edges.push((arm, false)),
-                            None if nn.is(func, arg) => edges.push((arm, false)),
+                            None if nn.is_m(func, arg, &mut nnm) => edges.push((arm, false)),
                             _ => {
                                 ok = false;
                                 break;
@@ -1230,8 +1248,8 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 continue;
             };
             // `select c, 0, X == 0` iff `c` (X ≠ 0); `select c, X, 0` mirrors.
-            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is(func, sa[2]);
-            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is(func, sa[1]);
+            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is_m(func, sa[2], &mut nnm);
+            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is_m(func, sa[1], &mut nnm);
             let c = sa[0];
             let f = match (t0, t1, ne) {
                 (true, _, false) | (false, true, true) if booly(func, c) => Fold::Alias(c),
@@ -1898,6 +1916,10 @@ pub(crate) fn round<'a>(
     let mut pn: FxHashSet<Value> = FxHashSet::default();
     let mut kenv: KBits = FxHashMap::default();
     let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
+    // `NonNull::is_m` memo — valid for the whole collection phase since
+    // `func` is only rewritten once `edits` apply below. RefCell so the
+    // `&dyn Fn` `nz` closure can share it.
+    let nnm = std::cell::RefCell::new(FxHashMap::<Value, bool>::default());
     for b in func.layout.blocks() {
         if Some(b) == entry || locked.contains(&b) {
             continue;
@@ -1975,7 +1997,7 @@ pub(crate) fn round<'a>(
                     argv.insert(p, v);
                     if let Some(c) = known(func, &env, v) {
                         env.insert(p, c);
-                    } else if nnr.is(func, v) {
+                    } else if nnr.is_m(func, v, &mut nnm.borrow_mut()) {
                         pn.insert(p);
                     }
                 }
@@ -1997,7 +2019,7 @@ pub(crate) fn round<'a>(
                 }
                 let nz = |v: Value| {
                     let v = func.dfg.resolve_aliases(v);
-                    nnr.is(func, v) || pn.contains(&v)
+                    nnr.is_m(func, v, &mut nnm.borrow_mut()) || pn.contains(&v)
                 };
                 // Ranges of the incoming args implied by branches dominating the pred.
                 prange.clear();
@@ -3723,30 +3745,45 @@ pub fn remove_dead_params(func: &mut Function) -> usize {
         .map(|&block| (block, vec![false; func.dfg.num_block_params(block)]))
         .collect();
     let mut protected: FxHashSet<Block> = func.layout.entry_block().into_iter().collect();
-    let mut preds: FxHashMap<Block, Vec<Vec<BlockArg>>> = FxHashMap::default();
-    let mut insts = Vec::new();
+    // `preds[b]` = (terminator, dest-slot) pairs feeding b — args are
+    // re-read on demand, so edges whose target never marks a live param
+    // don't pay for a Vec<BlockArg> each.
+    let mut preds: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    let mut work = Vec::new();
 
     for &block in &blocks {
         for inst in func.layout.block_insts(block) {
-            insts.push(inst);
             let data = &func.dfg.insts[inst];
-            for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            for (di, call) in data
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .into_iter()
+                .enumerate()
+            {
                 let target = call.block(&func.dfg.value_lists);
-                let args: Vec<BlockArg> = call.args(&func.dfg.value_lists).collect();
-                if args.iter().any(|arg| !matches!(arg, BlockArg::Value(_))) {
+                if call
+                    .args(&func.dfg.value_lists)
+                    .any(|arg| !matches!(arg, BlockArg::Value(_)))
+                {
                     protected.insert(target);
                 }
-                preds.entry(target).or_default().push(args);
+                preds.entry(target).or_default().push((inst, di));
+            }
+            for &value in func.dfg.inst_args(inst) {
+                mark_live_param(func, value, &mut live, &mut work);
             }
             if let Some(table) = data.exception_table() {
                 for target in func.dfg.exception_tables[table].all_branches() {
                     protected.insert(target.block(&func.dfg.value_lists));
                 }
+                for item in func.dfg.exception_tables[table].items() {
+                    if let ExceptionTableItem::Context(value) = item {
+                        mark_live_param(func, value, &mut live, &mut work);
+                    }
+                }
             }
         }
     }
 
-    let mut work = Vec::new();
     for &block in &blocks {
         if protected.contains(&block) {
             for (index, is_live) in live.get_mut(&block).unwrap().iter_mut().enumerate() {
@@ -3757,25 +3794,15 @@ pub fn remove_dead_params(func: &mut Function) -> usize {
             }
         }
     }
-    for inst in &insts {
-        for &value in func.dfg.inst_args(*inst) {
-            mark_live_param(func, value, &mut live, &mut work);
-        }
-        if let Some(table) = func.dfg.insts[*inst].exception_table() {
-            for item in func.dfg.exception_tables[table].items() {
-                if let ExceptionTableItem::Context(value) = item {
-                    mark_live_param(func, value, &mut live, &mut work);
-                }
-            }
-        }
-    }
 
     while let Some((target, index)) = work.pop() {
         let Some(incoming) = preds.get(&target) else {
             continue;
         };
-        for args in incoming {
-            if let Some(BlockArg::Value(value)) = args.get(index).copied() {
+        for &(term, di) in incoming {
+            let bc = func.dfg.insts[term]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[di];
+            if let Some(BlockArg::Value(value)) = bc.args(&func.dfg.value_lists).nth(index) {
                 mark_live_param(func, value, &mut live, &mut work);
             }
         }

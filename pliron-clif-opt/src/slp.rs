@@ -742,19 +742,22 @@ fn try_block<'d>(
         s.pos = pos_at(&pos, s.inst);
     }
     // Group by (linear terms, elem type, flags); within each, find
-    // consecutive-offset runs of exactly `16/esz` or `8/esz` lanes.
-    let mut by_key: FxHashMap<(Vec<(Value, i64)>, Type, MemFlagsData), Vec<&StoreInfo>> =
-        FxHashMap::default();
+    // consecutive-offset runs of exactly `16/esz` or `8/esz` lanes. A
+    // Vec-scan over the few distinct keys beats cloning every store's
+    // key into a map entry.
+    let mut by_key: Vec<(Vec<(Value, i64)>, Type, MemFlagsData, Vec<&StoreInfo>)> = Vec::new();
     for s in &stores {
-        by_key
-            .entry((s.key.clone(), s.ty, s.flags))
-            .or_default()
-            .push(s);
+        match by_key
+            .iter_mut()
+            .find(|(k, t, f, _)| *t == s.ty && *f == s.flags && *k == s.key)
+        {
+            Some(g) => g.3.push(s),
+            None => by_key.push((s.key.clone(), s.ty, s.flags, vec![s])),
+        }
     }
     let mut changed = 0;
     let mut taken = TakenMap::new();
-    for group in by_key.values() {
-        let mut g: Vec<&StoreInfo> = group.clone();
+    for (_, _, _, g) in &mut by_key {
         g.sort_by_key(|s| s.off);
         let esz = i64::from(g[0].ty.bytes());
         for &lanes in &[16 / esz, 8 / esz] {
@@ -767,7 +770,7 @@ fn try_block<'d>(
                 continue;
             }
             let mut run: Vec<&StoreInfo> = Vec::new();
-            for &s in &g {
+            for &s in g.iter() {
                 if taken[s.inst] {
                     continue;
                 }
