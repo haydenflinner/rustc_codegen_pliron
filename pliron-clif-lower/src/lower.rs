@@ -5140,7 +5140,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // out-param — a later call writing through it would bypass the
         // slot's writeback/reload sync. Only true no-capture flags the
         // CLIF arg a bounded use: no usable alias outlives the call.
-        let own = callee_sym.and_then(|s| self.st.nocapture.get(&s));
+        let own = callee_sym.as_ref().and_then(|s| self.st.nocapture.get(&s));
         if info.nocap.is_some() || own.is_some() {
             for (k, &s) in csrc.iter().enumerate() {
                 let flagged = s != usize::MAX
@@ -5156,6 +5156,49 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
+        }
+    }
+
+    /// `v` is a `stack_addr` (possibly under `+ const` adds) — i.e. a slot
+    /// slotprom could promote. Used to pick scalar mem_chunks for slot
+    /// copies: an i8x16 access spanning two i64 fields is a partial overlap
+    /// that keeps the whole slot on memory.
+    fn slot_derived(&self, v: ir::Value) -> bool {
+        let mut v = v;
+        for _ in 0..4 {
+            v = self.b.func.dfg.resolve_aliases(v);
+            let Some(i) = self.b.func.dfg.value_def(v).inst() else {
+                return false;
+            };
+            match self.b.func.dfg.insts[i] {
+                ir::InstructionData::StackAddr { .. } => return true,
+                ir::InstructionData::Binary {
+                    opcode: ir::Opcode::Iadd,
+                    args,
+                } => {
+                    if self.iconst_i64(args[0]).is_some() {
+                        v = args[1];
+                    } else if self.iconst_i64(args[1]).is_some() {
+                        v = args[0];
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn iconst_i64(&self, v: ir::Value) -> Option<i64> {
+        let v = self.b.func.dfg.resolve_aliases(v);
+        let i = self.b.func.dfg.value_def(v).inst()?;
+        match self.b.func.dfg.insts[i] {
+            ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+            } => Some(imm.bits()),
+            _ => None,
         }
     }
 
@@ -5601,7 +5644,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 {
                     // Load everything before storing, so this is also a valid memmove.
                     let mf = self.plain_mf(op);
-                    let vals: Vec<_> = mem_chunks(n as u64)
+                    // A wide chunk spanning two same-size slot fields blocks
+                    // slotprom field splitting — use scalar chunks when the
+                    // copy touches a stack slot.
+                    let scalar = self.slot_derived(a[0]) || self.slot_derived(a[1]);
+                    let vals: Vec<_> = mem_chunks(n as u64, !scalar)
                         .into_iter()
                         .map(|(o, t)| (o, self.b.ins().load(t, mf, a[1], o)))
                         .collect();
@@ -5633,7 +5680,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let byte = c as u8 as u64;
                     let mf = self.plain_mf(op);
                     let mut splat = None;
-                    for (o, t) in mem_chunks(n as u64) {
+                    let scalar = self.slot_derived(a[0]);
+                    for (o, t) in mem_chunks(n as u64, !scalar) {
                         let v = if t.is_vector() {
                             *splat.get_or_insert_with(|| {
                                 let b = self.b.ins().iconst(clt::I8, byte as i64);
@@ -6041,10 +6089,10 @@ fn rpo_split(
 /// Constant-size memcpy/memmove/memset up to this many bytes are expanded inline.
 const SMALL_MEM: i128 = 128;
 
-fn mem_chunks(n: u64) -> Vec<(i32, ClType)> {
+fn mem_chunks(n: u64, wide_ok: bool) -> Vec<(i32, ClType)> {
     let mut v = Vec::new();
     let mut o = 0;
-    let wide = if crate::pass_enabled("PLIRON_SIMD") {
+    let wide = if wide_ok && crate::pass_enabled("PLIRON_SIMD") {
         16
     } else {
         0
