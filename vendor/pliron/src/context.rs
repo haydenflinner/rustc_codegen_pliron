@@ -125,6 +125,11 @@ pub struct Context {
     pub aux_data: SlotMap<AuxDataIndex, Box<dyn Any + Send>>,
     /// A dictionary with keys mapping to an index in [Self::aux_data].
     pub aux_data_map: HMap<Identifier, AuxDataIndex>,
+    /// PLIRON: memo for IR-level type layout queries. [TypeHandle] indices
+    /// are Context-scoped and types are immutable once interned (a
+    /// `deref_mut` mutation may not change hash/layout-relevant contents),
+    /// so the result is exact for the Context's lifetime.
+    pub ty_size_align: RefCell<HMap<crate::r#type::TypeHandle, (u64, u64)>>,
 }
 
 impl Context {
@@ -176,6 +181,7 @@ impl Default for Context {
             attr_store: UniqueStore::default(),
             aux_data: SlotMap::with_key(),
             aux_data_map: HMap::default(),
+            ty_size_align: RefCell::new(HMap::default()),
         };
 
         // Verify that all dictionary keys are unique.
