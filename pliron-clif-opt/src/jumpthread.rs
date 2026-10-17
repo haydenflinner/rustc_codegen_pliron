@@ -2896,22 +2896,8 @@ fn bypass_forwarders(func: &mut Function) -> usize {
         let Some(term) = func.layout.last_inst(b) else {
             continue;
         };
-        // Any other insts must be pure and used only by each other.
-        let body: Vec<Inst> = func.layout.block_insts(b).filter(|&i| i != term).collect();
-        let mut local: FxHashMap<Value, u32> = FxHashMap::default();
-        for &i in &body {
-            for &a in func.dfg.inst_args(i) {
-                *local.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
-            }
-        }
-        if !body.iter().all(|&i| {
-            pure_op(func, i) && {
-                let r = func.dfg.first_result(i);
-                uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
-            }
-        }) {
-            continue;
-        }
+        // Cheap gates first: a forwarder ends in `jump t` — the body
+        // purity scan below only runs for blocks that are one.
         let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
             continue;
         };
@@ -2927,6 +2913,22 @@ fn bypass_forwarders(func: &mut Function) -> usize {
             }
         }
         if targs.len() != func.dfg.num_block_params(t) {
+            continue;
+        }
+        // Any other insts must be pure and used only by each other.
+        let body: Vec<Inst> = func.layout.block_insts(b).filter(|&i| i != term).collect();
+        let mut local: FxHashMap<Value, u32> = FxHashMap::default();
+        for &i in &body {
+            for &a in func.dfg.inst_args(i) {
+                *local.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+        }
+        if !body.iter().all(|&i| {
+            pure_op(func, i) && {
+                let r = func.dfg.first_result(i);
+                uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
+            }
+        }) {
             continue;
         }
         let params = func.dfg.block_params(b).to_vec();
