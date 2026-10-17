@@ -261,7 +261,7 @@ fn emit_obj(
 ) -> Vec<u8> {
     // Waffle-IR inlining: splice small / single-callsite callees into
     // callers while `Call` targets still index `o.funcs`. Callees whose
-    // last call edge disappears are dropped by wasm-ld's GC — this is
+    // last call edge disappears are dropped by wasm-ld's GC â€” this is
     // the main lever on the 4x function-count gap vs stock.
     if crate::env_get("PLIRON_WASM_INLINE") != Some("0") {
         winline(&mut o.funcs, verbose, o.sp);
@@ -486,7 +486,7 @@ enum WPeek {
     /// `local.set` proven dead; emits `drop` to keep the stack effect.
     Drop,
     /// A `local.get l; local.set l` self-copy deleted by the adjacent-pair
-    /// coalescing. Emits no bytes — the pair is a real no-op — but it both
+    /// coalescing. Emits no bytes â€” the pair is a real no-op â€” but it both
     /// *reads* l and *writes back the observed value*, and later rewrites
     /// (the copy-forward fixpoint below) move defs between locals, which
     /// can change what l holds at this point. Keeping the marker makes the
@@ -503,7 +503,7 @@ enum WPeek {
 /// `local.set x`. All three edits keep the operand stack and locals
 /// identical and only span adjacent instructions, so structured
 /// control flow is unaffected (branch targets are label depths, not
-/// byte offsets). Returns None — caller keeps the original bytes — on
+/// byte offsets). Returns None â€” caller keeps the original bytes â€” on
 /// any opcode it can't decode. `fsig`/`tsig` give (pops, pushes) per
 /// function index and per type index so calls can take part in
 /// stack-effect tracking.
@@ -518,7 +518,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
     for _ in 0..nl {
         let c = urd(b, &mut p)?;
         // Single-byte valtypes only (numeric/v128/funcref/externref);
-        // typed refs (0x63/0x64 + heaptype) need a longer decode — bail.
+        // typed refs (0x63/0x64 + heaptype) need a longer decode â€” bail.
         let t = *b.get(p)?;
         if !matches!(t, 0x6f | 0x70 | 0x78..=0x7f) {
             return None;
@@ -532,14 +532,14 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
     // Instruction stream: (kind, byte range). `depth` tracks structured
     // constructs so the scan stops on the `end` that closes the body.
     // `stack` additionally records each instruction's structured
-    // context — the enclosing (construct, arm) pairs — so the rewrite
+    // context â€” the enclosing (construct, arm) pairs â€” so the rewrite
     // pass can tell when a use/def lives on a different `if` arm than
     // the producer (and can therefore never observe its value).
     let mut ins: Vec<(WPeek, usize, usize, usize)> = Vec::new();
     let mut ctx: Vec<Vec<(u32, u8)>> = Vec::new();
     // Opcode per decode-time ins index: ctx entries record the
     // construct's decode index, which coalescing below makes stale as
-    // an `ins` index — `dop` keeps it resolvable.
+    // an `ins` index â€” `dop` keeps it resolvable.
     let mut dop: Vec<u8> = Vec::new();
     let mut stack: Vec<(u32, u8)> = Vec::new();
     let mut depth = 0i32;
@@ -719,17 +719,17 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
     }
     // Materialization forwarding: waffle's treeify only inlines pure
     // ops, so every load / non-pure result gets `P; local.set t` then a
-    // later `local.get t` — LLVM instead keeps such values on the
+    // later `local.get t` â€” LLVM instead keeps such values on the
     // operand stack, which is why its loops are ~40% shorter. When t is
     // defined exactly once (that set) and read exactly once (a later
     // `local.get`), we can replay P at the use site and drop both local
-    // ops. P must be a self-contained stack unit — net effect +1 and
-    // never consuming values pushed before it — composed only of
+    // ops. P must be a self-contained stack unit â€” net effect +1 and
+    // never consuming values pushed before it â€” composed only of
     // "transparent" instrs: no control flow, no local/global writes,
     // no stores/calls (loads and pure ops may reorder freely; a load
     // moving across another load changes only trap order, which is
     // unobservable). Everything between a forwarded set and its use
-    // must be transparent too — an `else`, a `local.set` of another
+    // must be transparent too â€” an `else`, a `local.set` of another
     // local, or a store between them makes the move unsafe (the use
     // could observe a different local value, or a load could cross a
     // store). Stack shape is preserved exactly: each producer replayed
@@ -775,7 +775,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             }
         }
         // Forwardable `local.set t` at i: u is the ONLY use of t in the
-        // window (i, next def of t) — so deleting the set cannot leave
+        // window (i, next def of t) â€” so deleting the set cannot leave
         // a stale read: uses before i read an earlier def, uses after
         // the next def read a newer one, and we replace u itself with
         // the producer. Multi-def locals (temps reused across unrolled
@@ -796,7 +796,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         };
         // A later def d of a local provably rewrites the value before
         // use u reads it only when d's context encloses u's (same
-        // construct path and arm — it can't be skipped) and no
+        // construct path and arm â€” it can't be skipped) and no
         // branch-family instruction between them can hop over d. A def
         // on a conditional arm never covers: paths that skip it still
         // observe the earlier value.
@@ -814,7 +814,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                 return None;
             }
             // A read positioned before the set can observe its value
-            // through a `loop` back-edge feeding the next iteration —
+            // through a `loop` back-edge feeding the next iteration â€”
             // that makes the set unforwardable outright (the producer
             // can never be moved backwards to it).
             if uses
@@ -835,9 +835,9 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             }
             // The use must be the *only* later-positioned reader that
             // can observe this set's value: any use not covered by a
-            // following def (conditional defs don't cover — paths that
+            // following def (conditional defs don't cover â€” paths that
             // skip them still see this value). A read inside a
-            // conditional arm counts as a reader too — it just can't
+            // conditional arm counts as a reader too â€” it just can't
             // serve as the splice target below.
             let w: Vec<usize> = uses
                 .get(&t)
@@ -860,7 +860,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                 .unwrap_or_default();
             let [u] = w.as_slice() else { return None };
             // Splice-target validity: every path reaching u must pass
-            // through i, and the producer can't gain conditionality —
+            // through i, and the producer can't gain conditionality â€”
             // an `if` construct on either side of the context LCP
             // means some path observes a different value (or the
             // producer, possibly trapping, no longer always runs).
@@ -975,7 +975,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                                 })
                                 // Nor may it read a local whose def was
                                 // already deleted by an earlier
-                                // forwarding — the producer would replay
+                                // forwarding â€” the producer would replay
                                 // against the pre-segment value.
                                 && !(ps..s).any(|m| {
                                     matches!(ins[m].0, WPeek::Get(l2) | WPeek::Tee(l2)
@@ -1062,7 +1062,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                 WPeek::Set(l) => defs.entry(l).or_default().push(i),
                 WPeek::Nop(l) => {
                     // Deleted `get l; set l`: reads l and writes the same
-                    // value back — a use plus an identity def. Without it
+                    // value back â€” a use plus an identity def. Without it
                     // in both maps the analysis could retarget a producer
                     // onto l (changing what the read would observe) or
                     // lose the reaffirming write a merge point relied on.
@@ -1202,7 +1202,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         }
         // backedge(d,u): a shared loop e encloses both, and some
         // back-edge branch to e sits after d with no live def of the
-        // local covering the branch — a dominating def hides d's value
+        // local covering the branch â€” a dominating def hides d's value
         // from the next iteration.
         let backedge = |dl: &[usize],
                         extra: &[usize],
@@ -1230,7 +1230,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         };
         // Reaching-def analysis over a def list (with optional extra
         // defs, e.g. a producer being retargeted onto this local).
-        // `gone` marks defs a rewrite removes — they neither reach nor
+        // `gone` marks defs a rewrite removes â€” they neither reach nor
         // cover. Forward (d < u): reaches unless arm-divergent or a
         // covering live def hides it. Backward (d > u): only via a
         // shared-loop back-edge.
@@ -1260,7 +1260,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         // Defs of x inside the (p1, si) window per candidate: these
         // must relocate onto the temp local t, which the producer
         // retarget frees. (si itself is the copy-set, handled apart.)
-        // Nop markers aren't relocatable — they emit no instruction and
+        // Nop markers aren't relocatable â€” they emit no instruction and
         // their write is bound to the value x holds at their position.
         let xdefs: Vec<Vec<usize>> = cand
             .iter()
@@ -1278,7 +1278,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         // Greatest fixpoint over observed-def sets: a candidate is
         // rewritten iff, in the post-rewrite program, every read keeps
         // observing the same value sources. The producer's local p1 and
-        // the copy set si both denote the producer's value — normalize
+        // the copy set si both denote the producer's value â€” normalize
         // them to one marker so sets compare by value source.
         const PSRC: usize = usize::MAX;
         let norm = |v: &mut Vec<usize>, p1: usize, si: usize| {
@@ -1538,17 +1538,16 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
     // need no further checking), the window pushes that survive to the
     // get hoist below the producer, and the get goes away. When the
     // get was the only reader of the write the set deletes outright.
-    // Prelude gets are keyed on the target instruction's byte offset —
+    // Prelude gets are keyed on the target instruction's byte offset â€”
     // stable as `ins` entries are marked Del and compacted. Anchors are
     // protected: no later rewrite may delete the instruction a prelude
     // group emits before, or the gets would silently vanish.
     let mut prel: Vec<(usize, u32)> = Vec::new();
     let mut protected: FxHashSet<usize> = FxHashSet::default();
-    for _ in 0..if crate::env_get("PLIRON_WASM_KOS") == Some("0") {
-        0
-    } else {
-        8
-    } {
+    for _ in 0..crate::env_get("PLIRON_WASM_KOS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+    {
         // (set idx, get idx, producer start, hoisted get idxs)
         let mut acts2: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
         {
@@ -1657,7 +1656,86 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                         break;
                     }
                 }
+                if crate::env_set("PLIRON_WASM_KOSDBG") {
+                    eprintln!(
+                        "wpeep kos: cand set l{} @{} get @{} ps={:?}({:?}@{:?}) hoists={:?}",
+                        t,
+                        ins[s].1,
+                        ins[u].1,
+                        ps,
+                        ps.map(|v| ins[v].0),
+                        ps.map(|v| ins[v].1),
+                        hoists.iter().map(|&g| (ins[g].0, ins[g].1)).collect::<Vec<_>>()
+                    );
+                }
                 let Some(ps) = ps else { continue };
+                // The kept value must be the ONLY slot the producer
+                // leaves on the stack: a `local.tee`/kept copy or any
+                // other push inside [ps, s) that survives past `u` sits
+                // between the hoisted gets (emitted below `ps`) and the
+                // kept value — a later consumer then pops the wrong
+                // operand (the survivor landed on top of a hoisted get).
+                // Positional check: emit the hoists at `ps`, then simulate
+                // [ps, u) including the pending prelude pushes of earlier
+                // rewrites (they're not in `ins`). The transform is only
+                // sound when the stack at `u` is [.., h0..hn, kept]: any
+                // other value still on the stack between the hoisted gets
+                // and the kept value (a `local.tee`'s kept copy, or a
+                // value the producer leaked) makes later consumers pop
+                // the wrong operand.
+                const KEPT: usize = usize::MAX;
+                let mut slots: Vec<usize> = Vec::new();
+                let mut ok = true;
+                // Preludes queued for the same `ps` anchor emit first.
+                for &(off, pl) in &prel {
+                    if off == ins[ps].1 {
+                        slots.push(pl as usize);
+                    }
+                }
+                slots.extend_from_slice(&hoists);
+                for v in ps..u {
+                    for &(off, pl) in &prel {
+                        if off == ins[v].1 {
+                            slots.push(pl as usize);
+                        }
+                    }
+                    if v == s {
+                        if slots.is_empty() {
+                            ok = false;
+                            break;
+                        }
+                        slots.pop();
+                        slots.push(KEPT);
+                        continue;
+                    }
+                    if hoists.contains(&v) {
+                        continue; // deleted at its old position
+                    }
+                    let Some((pp, qq)) = eff(v) else {
+                        ok = false;
+                        break;
+                    };
+                    if slots.len() < pp as usize {
+                        ok = false;
+                        break;
+                    }
+                    for _ in 0..pp {
+                        slots.pop();
+                    }
+                    for _ in 0..qq {
+                        slots.push(v);
+                    }
+                }
+                if crate::env_set("PLIRON_WASM_KOSDBG") {
+                    eprintln!("wpeep kos: surv={slots:?} for cand set l{t} @{}, get @{}", ins[s].1, ins[u].1);
+                }
+                let suf = slots.len().saturating_sub(hoists.len() + 1);
+                if !ok
+                    || slots.last() != Some(&KEPT)
+                    || slots[suf..suf + hoists.len()] != hoists[..]
+                {
+                    continue;
+                }
                 // Each surviving push must hoist below the producer:
                 // only `local.get lx` moves, and only when no def of
                 // lx sits between the insertion point and its old
@@ -1695,7 +1773,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         } // eff scope ends
         // Only candidates whose whole [producer-start, get] span is
         // strictly disjoint from every accepted span: the producer is
-        // part of the span — an interleaving rewrite can delete an
+        // part of the span â€” an interleaving rewrite can delete an
         // instruction the other's producer or prelude anchor needs.
         let mut sel: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
         'cand: for a in acts2 {
@@ -1708,6 +1786,23 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         }
         let applied = !sel.is_empty();
         for (s, u, ps, hoists) in sel {
+            if crate::env_set("PLIRON_WASM_KOSDBG") {
+                eprintln!("wpeep kos: window {:?}", (ps..=u).map(|v| (ins[v].0, ins[v].1)).collect::<Vec<_>>());
+                eprintln!(
+                    "wpeep kos: set l{} @{} -> get @{} ps={:?} hoists={:?}",
+                    match ins[s].0 {
+                        WPeek::Set(l) => l,
+                        _ => unreachable!(),
+                    },
+                    ins[s].1,
+                    ins[u].1,
+                    ins[ps].1,
+                    hoists
+                        .iter()
+                        .map(|&g| (ins[g].0, ins[g].1))
+                        .collect::<Vec<_>>()
+                );
+            }
             protected.insert(ins[ps].1);
             for &g in &hoists {
                 if let WPeek::Get(lx) = ins[g].0 {
@@ -1749,7 +1844,7 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
         nb.push(t);
     }
     // A `return` followed only by `end` opcodes (i.e. the last
-    // non-`end` instruction of the body) is dead — the function
+    // non-`end` instruction of the body) is dead â€” the function
     // falls through with the same stack either way.
     let drop_ret = ins
         .iter()
@@ -2005,7 +2100,7 @@ mod wpeep_tests {
     }
 
     // Regression: a `local.get x; local.set x` no-op pair inside one arm
-    // of an if is still a *use* of x — waffle emits it when a br's block
+    // of an if is still a *use* of x â€” waffle emits it when a br's block
     // param is copied onto the local that already holds it. The
     // copy-forward fixpoint must not retarget the producer onto x across
     // it: that changes what x holds on the arm's exit path. (This is the
@@ -2047,7 +2142,7 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[]).unwrap();
         // The producer must stay on local 5 and the else copy must
-        // survive — retargeting it (tee 4 / deleting get5;set4) is the
+        // survive â€” retargeting it (tee 4 / deleting get5;set4) is the
         // miscompile.
         assert!(has_seq(&out, &[0x22, 0x05]), "producer lost: {out:02x?}");
         assert!(has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy gone: {out:02x?}");
@@ -2151,7 +2246,7 @@ fn wloops(b: &FunctionBody, cfg: &waffle::cfg::CFGInfo) -> Vec<(WBlock, FxHashSe
 /// global.set sp = fp` at the head plus `global.set sp = s|fp` restores
 /// on exits. `inline_site` folds every well-formed chain into one
 /// entry-level reservation in the caller so the spliced body doesn't
-/// rerun the adjust/restore dance at the callsite — which for loop-body
+/// rerun the adjust/restore dance at the callsite â€” which for loop-body
 /// callsites costs ~10 ops per iteration.
 fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, u64)> {
     // users[v] = values whose defs reference v.
@@ -2207,7 +2302,7 @@ fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, 
         let Some(size) = wconst(cb, cb.arg_pool[*saa][1]) else {
             continue;
         };
-        // The sub feeds exactly the align `and` — the frame pointer.
+        // The sub feeds exactly the align `and` â€” the frame pointer.
         let mut fu = users.get(&sub).into_iter().flatten();
         let (Some(&fp), None) = (fu.next(), fu.next()) else {
             continue;
@@ -2251,7 +2346,7 @@ fn inline_site(
     // emitted as `s = global.get sp; t = s - SZ;
     // fp = t & -A; global.set sp = fp` at the head plus `global.set sp`
     // restores on exits, and the splice would re-execute that whole
-    // dance at the callsite — ~10 ops per loop iteration for hot
+    // dance at the callsite â€” ~10 ops per loop iteration for hot
     // callsites. Instead the frame is laid out inside the caller's own
     // reservation (`fp + K_i`, like LLVM's merged inline allocas): the
     // caller's `SZ` is bumped by the extra space and its mask widened
@@ -2265,7 +2360,7 @@ fn inline_site(
         let entry = body.entry;
         // Find the caller's frame chain rooted at entry insts[0]: any
         // `global.get sp` there starts either the real prologue or an
-        // earlier splice's reservation — growing either is safe, since
+        // earlier splice's reservation â€” growing either is safe, since
         // every slot is fp-relative. `add` ops are new-frame bases.
         // (sub, and, gset entry position) of the caller's frame chain.
         let mut acc: Option<(WV, WV, usize)> = None;
@@ -2291,7 +2386,7 @@ fn inline_site(
                 }
             }
             // and = the sub's I32And-with-const consumer; the gset must
-            // set SP to it, else this isn't a frame chain — don't touch.
+            // set SP to it, else this isn't a frame chain â€” don't touch.
             if let (Some(s), Some(gpos)) = (sub, gpos) {
                 let and = body.blocks[entry].insts.iter().find(|&&iv| {
                     matches!(
@@ -2313,7 +2408,7 @@ fn inline_site(
             }
         }
         // When the callsite itself is in `entry`, emitted insts must
-        // land at or before the call's index — anything later gets
+        // land at or before the call's index â€” anything later gets
         // swept into `after` by the split below and stops dominating
         // the spliced body (SSA breakage, misaligned frames).
         let call_idx = if blk == entry {
@@ -2362,8 +2457,8 @@ fn inline_site(
             k += sz;
             maxa = maxa.max(al);
         }
-        // Each emitted op carries an anchor — the inst it is inserted
-        // before (None = end of entry) — so multiple inserts can't
+        // Each emitted op carries an anchor â€” the inst it is inserted
+        // before (None = end of entry) â€” so multiple inserts can't
         // drift past one another or past the call.
         let mut chunk: Vec<(WV, Option<WV>)> = Vec::new();
         if let Some((s, a, gpos)) = anchor {
@@ -2418,7 +2513,7 @@ fn inline_site(
         } else {
             // Fresh reservation: `ibase = align(SP - k); SP = ibase`,
             // plus per-frame `ibase + K` bases. Insert just past the
-            // first `global.set sp` in entry — every callsite sits
+            // first `global.set sp` in entry â€” every callsite sits
             // after that point (calls can't precede the prologue, and
             // earlier splices only leave SP ops before the callsites
             // they replaced); position 0 when no SP adjust exists.
@@ -2507,7 +2602,7 @@ fn inline_site(
             }
         }
         // Move emitted ops (currently at the end of entry's insts) to
-        // their anchors — inserted just before the anchored inst, and
+        // their anchors â€” inserted just before the anchored inst, and
         // never past the call when it shares this block.
         {
             let insts = &mut body.blocks[entry].insts;
@@ -2536,7 +2631,7 @@ fn inline_site(
         // The callee's SP ops die with the fold: the get/sub chain
         // members (fp is remapped through fold_base), plus every
         // `global.set sp` whose argument computes through folded
-        // values — the entry adjust and the restores. A set whose arg
+        // values â€” the entry adjust and the restores. A set whose arg
         // derives only from unfolded chains stays verbatim.
         let folded: FxHashSet<WV> = chains
             .iter()
@@ -2750,11 +2845,11 @@ fn inline_site(
 
 /// `if (c) { br m(x) } else { br m(y) }` diamonds whose arms are pure
 /// forwarders (no insts, no blockparams) to the same single-param merge
-/// become `select`, deleting two blocks and the branch structure —
+/// become `select`, deleting two blocks and the branch structure â€”
 /// LLVM emits `select` for the same shapes. Soundness: x is used at
 /// its arm block, so it dominates that block; `a` is a pred of the
 /// arm, so x dominates `a` too, and arm blocks define nothing else
-/// (no insts, no params — a param could still have uses in blocks the
+/// (no insts, no params â€” a param could still have uses in blocks the
 /// arm dominates, which is why param'd arms are rejected). Arm blocks
 /// with other preds stay live via those edges and are unaffected.
 /// Range folding: `x <u C` / `x >=u C` where `x`'s unsigned maximum is
@@ -3125,7 +3220,7 @@ fn wsel(b: &mut FunctionBody) -> bool {
         let arm = |t: &BlockTarget| -> Option<(WBlock, WV)> {
             let tb = t.block;
             // Arms must be pure forwarders: no insts (side effects) and
-            // no blockparams — a param can have uses in blocks the arm
+            // no blockparams â€” a param can have uses in blocks the arm
             // dominates, and bypassing the arm would drop its def.
             if tb == a || !b.blocks[tb].insts.is_empty() || !b.blocks[tb].params.is_empty() {
                 return None;
@@ -3176,15 +3271,15 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     const TINY: usize = 12;
     const SOLO: usize = 300;
     // Mid-size (<=64) multi-callsite inlining measured ~1% runtime for
-    // +2% size on wbig — wasm calls really are cheap and the splice's
+    // +2% size on wbig â€” wasm calls really are cheap and the splice's
     // optimizer doesn't recover the rest. Not a rule.
     // Loop-body callsites execute the call every iteration, so a
     // moderately-sized callee is worth duplicating there.
     const HOT: usize = 36;
     // `#[inline]` (LLVM `inlinehint`) callees: LLVM's inliner gives the
-    // attribute a large budget bonus — mirror that with a raised cap.
+    // attribute a large budget bonus â€” mirror that with a raised cap.
     // Off by default: on a real std workload (regex wbig) it added
-    // ~30% code size for no measurable runtime gain — wasm calls are
+    // ~30% code size for no measurable runtime gain â€” wasm calls are
     // cheap and our post-splice optimizer doesn't exploit the merge
     // the way LLVM's does. `PLIRON_WASM_HINT=n` re-enables.
     let hint_cap = crate::env_get("PLIRON_WASM_HINT")
@@ -3266,7 +3361,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             if fi == ci {
                                 continue;
                             }
-                            // `#[inline(never)]` is a hard no —
+                            // `#[inline(never)]` is a hard no â€”
                             // LLVM refuses to inline it too.
                             if funcs[fi].no_inline {
                                 continue;
@@ -3277,7 +3372,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // Entry with preds can't merge (its
                             // blockparams would need the back-edge args
                             // too); locals beyond params would need
-                            // remapping — our bodies have none; arity
+                            // remapping â€” our bodies have none; arity
                             // must match (the args become the params).
                             if !cb.blocks[cb.entry].preds.is_empty()
                                 || cb.locals.len() != cb.n_params
@@ -3461,7 +3556,7 @@ fn link_section(ctx: &Context, st: &State) -> Vec<u8> {
 /// When no stack slots were ever allocated, the save/align/restore dance
 /// around `__stack_pointer` is pure overhead. Drop every `global.set` of it
 /// (entry adjust, return/unwind/rethrow restores) plus the now-dead
-/// fp/mask producer chain rooted at `roots` — the callee's own SP is never
+/// fp/mask producer chain rooted at `roots` â€” the callee's own SP is never
 /// touched, so nothing needs restoring. A stray consumer of the dead
 /// values cancels the whole rewrite (defensive).
 fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
@@ -3510,7 +3605,7 @@ fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
 //
 // `lower_to_wasm_clif` runs FnLower + the pliron-clif-opt suite (same as the
 // native backend) via `lower::lower_clif_wasm`, then translates each
-// function's optimized CLIF to waffle SSA here — the pipeline's
+// function's optimized CLIF to waffle SSA here â€” the pipeline's
 // CSE/loop/idominate work (and, with `simd` on, loopvec->v128) in front of
 // the waffle backend.
 mod clif_emit {
@@ -3956,7 +4051,7 @@ mod clif_emit {
         }
 
         /// Branch/trap/select condition: `cvt` wraps an i64 carrier to its
-        /// low 32 bits, which loses values nonzero only in the high half —
+        /// low 32 bits, which loses values nonzero only in the high half â€”
         /// `(x & 0x8000..) != 0` sign tests wrapped to 0 and flipped
         /// `x < 0` branches (wasm `if`/`br_if`/`select` read i32). Emit
         /// `v != 0` for i64 operands instead.
@@ -4193,7 +4288,7 @@ mod clif_emit {
                 P::Ishl => {
                     // CLIF masks the amount by the value's bit width; wasm masks
                     // mod the container width. Narrow types must mask themselves.
-                    // The amount may carry a wider CLIF type than the value —
+                    // The amount may carry a wider CLIF type than the value â€”
                     // wasm shift operands must match the value's container.
                     let b = self.cvt(b, wty(t));
                     let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
@@ -4431,7 +4526,7 @@ mod clif_emit {
                 }
             }
             // Layout order can put a dominated (e.g. cold) block before its
-            // def block — walk in RPO so defs precede uses.
+            // def block â€” walk in RPO so defs precede uses.
             let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
             let mut seen = FxHashSet::default();
             let mut post = Vec::new();
@@ -5658,7 +5753,7 @@ mod clif_emit {
                     raw
                 } else if signed {
                     // Sign-extend the narrow container to i32, then i32->i64
-                    // signed — `cvt`'s I64ExtendI32U would leave -1 as
+                    // signed â€” `cvt`'s I64ExtendI32U would leave -1 as
                     // 0xFFFFFFFF (e.g. a signed i8 enum discriminant cast).
                     let s = self.sext(raw, st.bits());
                     self.op(O::I64ExtendI32S, &[s], WT::I64)
@@ -5900,7 +5995,7 @@ mod clif_emit {
                         self.op(O::I32Sub, &[c, off], WT::I32)
                     }
                 }
-                // `ctz_nonzero` has the same lowering — the caller's nonzero
+                // `ctz_nonzero` has the same lowering â€” the caller's nonzero
                 // guarantee just lets us skip the zero case a plain ctz
                 // already produces.
                 P::Ctz | P::CtzNonzero => {
@@ -6446,7 +6541,7 @@ mod clif_emit {
             }
             if op == P::IaddPairwise {
                 // phadd-style: result lanes are x's adjacent pairs in the low
-                // half, y's in the high half — shuffle evens and odds of each
+                // half, y's in the high half â€” shuffle evens and odds of each
                 // input together, then lane-wise add.
                 let lb = (lane.bits() / 8) as usize;
                 let pairs = 16 / lb / 2;
@@ -7031,7 +7126,7 @@ mod clif_emit {
             let cur = self.cur;
             // Restore SP to the entry value (function epilogue shape):
             // `inline_site`'s frame folding only drops restores whose value
-            // derives from the callee's folded frame chain — a `GlobalGet sp +
+            // derives from the callee's folded frame chain â€” a `GlobalGet sp +
             // frame` form would survive the splice and ratchet SP upward on
             // every inlined call.
             let (sp, sp0) = (self.o.sp, self.sp0);
