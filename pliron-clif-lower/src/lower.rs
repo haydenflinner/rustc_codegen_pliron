@@ -543,12 +543,31 @@ pub fn lower_module<'a>(
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
     let _pgfl = host.prof().activity("pliron_fnlower", None);
     let tpa = std::time::Instant::now();
-    let mut idx = 0usize;
+    // `oi` stays the declaration index so results can be re-ordered for
+    // phase (C) even though production streams biggest-first: the drain
+    // after the last lowering is bound by the largest fn still queued,
+    // so feeding megafunctions early keeps it short. Block count is a
+    // rough size proxy — cheap to take and close enough for scheduling.
+    let mut order: Vec<(usize, (&String, &crate::iropt::state::FuncInfo))> = st
+        .funcs
+        .iter()
+        .enumerate()
+        .filter(|(_, (n, f))| has_body(ctx, f.op) && !st.dead_fns.contains(n))
+        .collect();
+    if nthreads > 1 {
+        order.sort_unstable_by_key(|(_, (_, f))| {
+            std::cmp::Reverse(
+                f.op
+                    .deref(ctx)
+                    .regions(ctx)
+                    .next()
+                    .map(|r| r.deref(ctx).iter(ctx).count())
+                    .unwrap_or(0),
+            )
+        });
+    }
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob<'a>)| {
-    for (n, f) in &st.funcs {
-        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
-            continue;
-        }
+    for &(idx, (n, f)) in &order {
         CUR_FN.with(|c| c.borrow_mut().clone_from(n));
         let Sym::F(id, _) = ids[n] else {
             unreachable!()
@@ -688,7 +707,6 @@ pub fn lower_module<'a>(
             code: None,
             dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
         });
-        idx += 1;
         m.clear_context(&mut clctx);
     }
     };
