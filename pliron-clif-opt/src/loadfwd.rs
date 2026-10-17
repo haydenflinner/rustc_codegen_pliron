@@ -882,7 +882,7 @@ pub fn run(
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut rpo = rpo_of(&cfg);
     let mut n = 0;
-    let pf = crate::proots::facts(func);
+    let pf = crate::proots::facts_cfg(func, &cfg);
     let ps = &crate::proots::alias_of(&pf);
     // `ms` disjointness pays off in `pre` (more locs survive → more
     // redundancy hoisting — fewer loads execute) but not in the plain

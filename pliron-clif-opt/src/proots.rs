@@ -175,7 +175,12 @@ pub fn alias_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value
 /// different in-edge paths that provably carry the same value compare
 /// congruent.
 pub fn canon_map(func: &Function) -> FxHashMap<Value, Value> {
-    let f = facts(func);
+    canon_map_cfg(func, &ControlFlowGraph::with_function(func))
+}
+
+/// `canon_map` over a caller-built CFG.
+pub fn canon_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, Value> {
+    let f = facts_cfg(func, cfg);
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
@@ -268,8 +273,13 @@ pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
 /// self-carry edge contributes no fact at all — under induction the
 /// carried value stays in the class the other edges established.
 pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
+    web_nf_cfg(func, &ControlFlowGraph::with_function(func))
+}
+
+/// `web_nf` over a caller-built CFG.
+pub fn web_nf_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, (Value, i64)> {
     let mut nf = affine_nf(func);
-    let f = facts(func);
+    let f = facts_cfg(func, cfg);
     let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
     loop {
         let mut grew = false;

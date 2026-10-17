@@ -1994,7 +1994,7 @@ pub fn run(func: &mut Function) -> usize {
     join_facts(func, &cfg, &domtree, &mut fact);
     let t_join = tp.elapsed();
     let mut folds: Vec<(Inst, bool)> = Vec::new();
-    let srcs = crate::proots::alias_map(func);
+    let srcs = crate::proots::alias_map_cfg(func, &cfg);
     tp = std::time::Instant::now();
     for (h, fs) in induction_facts(func, &cfg, &domtree, &fact, &srcs) {
         fact.entry(h).or_default().extend(fs);

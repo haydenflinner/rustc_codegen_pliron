@@ -2368,9 +2368,9 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     use crate::proots::Key;
     let t0 = std::time::Instant::now();
     let WmCtx { cfg, dom, edges } = ctx;
-    let nf = crate::proots::web_nf(func);
+    let nf = crate::proots::web_nf_cfg(func, cfg);
     let t2 = std::time::Instant::now();
-    let canon = crate::proots::canon_map(func);
+    let canon = crate::proots::canon_map_cfg(func, cfg);
     let t3 = std::time::Instant::now();
     if pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO)

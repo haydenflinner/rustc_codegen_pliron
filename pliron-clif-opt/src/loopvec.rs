@@ -4867,7 +4867,7 @@ pub fn run(
         if prof.get(&la.loop_header(lp)) == Some(&0) {
             continue;
         }
-        let facts = proots::facts(func);
+        let facts = proots::facts_cfg(func, &cfg);
         let ps = proots::alias_of(&facts);
         let Some(p) = plan(
             func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64, wc,
