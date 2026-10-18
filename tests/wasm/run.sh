@@ -13,9 +13,15 @@ case "$(uname -s)" in
   *)                    lib=librustc_codegen_pliron.so ;;
 esac
 export RUSTFLAGS="-Zcodegen-backend=${BACKEND:-$ROOT/target/debug/$lib} -Clinker=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe"
-export CARGO_TARGET_DIR=$ROOT/target/wasm
-# cargo doesn't track the backend dylib; start clean so core is rebuilt by the current backend.
-rm -rf "$CARGO_TARGET_DIR"
+# cargo doesn't track the backend dylib, so key the sysroot dir on its
+# content: same backend -> core/std reuse (seconds), new backend -> fresh
+# dir rebuilt by it. Older keys are pruned.
+BE_KEY=$(cksum < "${BACKEND:-$ROOT/target/debug/$lib}" | cut -d' ' -f1)
+export CARGO_TARGET_DIR=$ROOT/target/wasm/be-$BE_KEY
+mkdir -p "$ROOT/target/wasm"
+for d in "$ROOT"/target/wasm/*; do
+  [[ "$d" == "$CARGO_TARGET_DIR" ]] || rm -rf "$d"
+done
 (cd tests/wasm && cargo build -q --release --target wasm32-unknown-unknown \
   -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem)
 node tests/wasm/run.mjs "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/wasmtest.wasm"

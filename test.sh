@@ -25,7 +25,9 @@ for a in "$@"; do
 done
 want() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
 
-cargo build
+# TEST_NOBUILD=1: the caller (harness/gate.py) already built the backend.
+[[ -n "${TEST_NOBUILD:-}" ]] || cargo build
+export RUSTC_ICE=${RUSTC_ICE:-$PWD/target/ices}
 case "$(uname -s)" in
   Darwin)              lib=librustc_codegen_pliron.dylib; exe= ;;
   MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll;     exe=.exe ;;
@@ -349,7 +351,10 @@ t_pgo() {
   # wasm leg: the instrumented module carries no runtime; the host pulls
   # the same .prof out of linear memory via __pliron_prof_hdrs.
   if command -v node > /dev/null 2>&1 && command -v cargo > /dev/null 2>&1; then
-    local wdir=$PWD/$out/wasm-pgo
+    # Keyed on the backend: cargo doesn't track the dylib, so a reused
+    # dir would keep core from an older backend.
+    local wdir=$PWD/$out/wasm-pgo-$(cksum < target/debug/$lib | cut -d' ' -f1)
+    for d in $PWD/$out/wasm-pgo*; do [[ "$d" == "$wdir" ]] || rm -rf "$d"; done
     # RUSTFLAGS must be fully windows-spelled on msys: cargo's POSIX-path
     # translation mangles flag values containing ':' when any flag's path
     # is /c/-spelled. Build both off one native root.
