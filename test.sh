@@ -10,6 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro wasm pgo
+#   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -385,6 +386,16 @@ t_proc_macro() {
       rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user$exe && $out/pm_user$exe
 }
 
+t_wasm_smoke() {
+  # Emit pipeline only: leaf crates -> pliron wasm objects -> pliron-wasm-ld
+  # -> node. No -Zbuild-std, so ~seconds; the std-through-pliron legs are
+  # `tests/wasm/run.sh` (the `wasm` stanza).
+  command -v node >/dev/null \
+    && rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown \
+    || return 0
+  tests/wasm/smoke.sh
+}
+
 t_sysroot() {
   (cd tests/sysroot && export RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot &&
     T="$(rustc -vV | sed -n 's/host: //p')" &&
@@ -457,6 +468,7 @@ want proc_macro && t_proc_macro
 want pgo && t_pgo
 [[ -n "$sysroot" ]] && want sysroot && t_sysroot
 [[ -n "$mold" ]] && want mold && t_mold
+want wasm_smoke && t_wasm_smoke
 if want wasm && command -v node >/dev/null \
     && rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
   tests/wasm/run.sh

@@ -1,17 +1,22 @@
 #!/usr/bin/env -S python3 -I
 """Merge gate: everything a change must pass before it lands, in parallel.
 
-Usage: harness/gate.py [--jobs N] [--skip unit,wasm,...] [--only a,b] [--record]
+Usage: harness/gate.py [--jobs N] [--skip unit,wasm,...] [--only a,b]
+                       [--full] [--record]
        harness/gate.py --install-hook      run the gate from git's pre-push hook
 
 Runs, after one `cargo build`:
   unit      cargo test for the stable crates (pliron-cfg, -clif-opt, -ir-opt)
-  <stanza>  every `./test.sh` stanza (nostd, std, licm, ..., wasm) as its own
+  <stanza>  every `./test.sh` stanza (nostd, std, licm, ...) as its own
             job — TEST_NOBUILD=1 ./test.sh --only=<stanza>
   corpus:*  `clif-check report --check` over each recorded corpus under
             target/corpus/ (harness/corpus.sh); fails on any verifier error,
             panic, or interpreter mismatch not listed in
             harness/expectations/corpus-known.txt
+The `wasm` stanza (tests/wasm/run.sh) is OFF by default: it rebuilds core/std
+through the backend for every backend change (~4 min). The default gate runs
+`wasm_smoke` — emit->link->run, ~1 s — instead. `--full` or `--only wasm`
+adds the sysroot legs; run it before landing wasm/wpeep/linker changes.
 --record (re)records the smoke and std corpora first (~40 s).
 
 Logs: target/gate/<job>.log; summary: target/gate/summary.json (read by the
@@ -29,7 +34,7 @@ CLIF_CHECK = os.path.join(ROOT, "target/debug/clif-check")
 def stanzas():
     src = open(os.path.join(ROOT, "test.sh")).read()
     names = re.findall(r"want (\w+) && t_\w+", src)
-    return [n for n in names if n not in ("sysroot", "mold")] + ["wasm"]
+    return [n for n in names if n not in ("sysroot", "mold")]
 
 
 def run(name, cmd, env=None, timeout=1800):
@@ -78,6 +83,8 @@ def main():
     ap.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) // 2))
     ap.add_argument("--skip", default="")
     ap.add_argument("--only", default="")
+    ap.add_argument("--full", action="store_true",
+                    help="include heavyweight legs off by default (wasm sysroot builds)")
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--install-hook", action="store_true")
     a = ap.parse_args()
@@ -116,10 +123,15 @@ def main():
         jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", "-p", "pliron-cfg", "-p",
                                                   "pliron-clif-opt", "-p", "pliron-ir-opt"])))
     # Slowest first so the pool's tail is short.
-    order = sorted(stanzas(), key=lambda n: n not in ("wasm", "pgo", "std", "unwind"))
+    order = sorted(stanzas(), key=lambda n: n not in ("pgo", "std", "unwind"))
     for n in order:
         if want(n):
             jobs.append((n, lambda n=n: run(n, ["./test.sh", f"--only={n}"], {"TEST_NOBUILD": "1"})))
+    # The wasm sysroot leg is opt-in: four -Zbuild-std builds per backend
+    # change makes it ~10x every other job. wasm_smoke covers emit->link->run.
+    if (a.full or "wasm" in only) and "wasm" not in skip:
+        jobs.append(("wasm", lambda: run("wasm", ["./test.sh", "--only=wasm"],
+                                         {"TEST_NOBUILD": "1"})))
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
         if want(f"corpus:{d}"):

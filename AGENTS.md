@@ -12,9 +12,11 @@ Read it before picking a task.
 
 ## Rules
 
-1. **Run `harness/gate.py` before merging to main** (~5 min; ~40 s with
-   `--skip wasm` — the wasm leg rebuilds core/std for every new backend).
-   main stays green: a red gate is fixed before new work lands.
+1. **Run `harness/gate.py` before merging to main** (~40 s — the wasm
+   sysroot leg is off by default; `--full` or `--only wasm` adds it for
+   wasm/wpeep/linker changes. `wasm_smoke`, always on, covers
+   emit->link->run in ~1 s). main stays green: a red gate is fixed
+   before new work lands.
 2. **New passes and new transforms land default-off**
    (`env_is("PLIRON_X", "1")`), then flip on in a separate commit once
    the gate and the corpus are clean. Every pass keeps a
@@ -140,7 +142,8 @@ time) in ~15 min and writes `target/parity/summary.md`.
 - **Audits**: `PLIRON_WASM_AUDIT=1|panic` checks every wpeep
   copy-forward round with a Datalog translation validator (the code and
   the rewrite's assumptions as one fact stream; `docs/audit.md`) and
-  reverts rounds that fail. On in `tests/wasm/run.sh` (so in the gate).
+  reverts rounds that fail. On in `tests/wasm/run.sh` and `smoke.sh`
+  (so in the gate).
 - `harness/run.py --tier 0|1` — smoke/determinism/UI suites diffed
   against stock rustc, ratcheted in `harness/expectations/`
   (`docs/test-harness.md`). `selfhost/verify.sh` runs rustc's own UI
