@@ -52,10 +52,10 @@ Read it before picking a task.
 `black_box` is a real optimization barrier: a call to a never-defined
 `__pliron_bb*` symbol (opaque to every IR pass) that `lower.rs` turns
 into the CLIF `black_box` op (zero instructions). Don't "simplify" it to
-a pass-through. wasm still takes the older alloca + volatile-load
-fallback (`intrinsic.rs`, `clif_bb = !is_like_wasm`), a leftover from the
-removed dialect→waffle path — `clif_emit` already handles the CLIF op,
-so that gate can likely go.
+a pass-through. wasm deliberately keeps an alloca + volatile-load round
+trip instead (`intrinsic.rs`, `clif_bb = !is_like_wasm`): that is what
+LLVM emits on wasm too, and a bare identity would let V8 fold through it
+and make our wasm benchmarks look better than they are.
 
 ## Build
 

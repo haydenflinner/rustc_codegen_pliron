@@ -26,9 +26,9 @@ and captures its args, so nothing can fold through it), and `lower.rs`
 rewrites the call into `black_box` — a CLIF instruction we added to the
 vendored Cranelift (`can_store` + `other_side_effects`, i.e. exactly
 LLVM's `asm("" : "r,~{memory}" :: v)` semantics) that lowers to zero
-machine instructions: the result vreg aliases the input's. wasm still
-takes the alloca + volatile-load fallback (a leftover from the removed
-dialect path; `clif_emit` already handles the CLIF op).
+machine instructions: the result vreg aliases the input's. On wasm both
+backends use a stack store + reload (LLVM's wasm lowering of the same
+barrier), so pliron keeps its alloca + volatile-load form there.
 
 ## Run time of compiled code
 

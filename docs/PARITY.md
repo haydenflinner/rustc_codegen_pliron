@@ -95,9 +95,9 @@ inliner and `wpeep` on top of the same pipeline; profile
 | contains_rng, hashmap | 1.05 | |
 | matmul 0.74, iterw 0.79, tokenize 0.79, chars_alpha 0.82, eqbug 0.88 | | ahead |
 
-Also: `black_box` on wasm still takes the alloca + volatile fallback
-(`intrinsic.rs` `clif_bb = !is_like_wasm`) though `clif_emit` handles
-the CLIF op — likely a free win on every kernel's harness overhead.
+`black_box` on wasm is a stack store + reload under both backends (LLVM
+does the same), so it is not a source of the gap — don't "optimize" it
+to an identity; that would only make the benchmarks lie.
 Module size (2.2x) is mostly pliron-wasm-ld's weaker dead-code GC and
 inlining growth; `winline`'s caller-growth cap already took it from 8x.
 
