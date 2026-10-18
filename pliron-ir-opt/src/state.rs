@@ -469,6 +469,29 @@ pub struct State {
     /// single-pred block counts); drives profile-weighted block layout
     /// and `expect` seeding.
     pub prof_edges: ColMap<Ptr<Operation>, Vec<u64>>,
+    /// `leaves` leaf-decomposition memo. Types are interned and immutable
+    /// for the Context's lifetime, so the decomposition is stable for the
+    /// whole CGU. `Arc` not `Rc`: `State` is `Send` (cgupool moves it to
+    /// a worker thread).
+    pub leaf_memo: std::cell::RefCell<
+        FxHashMap<TypeHandle, std::sync::Arc<Vec<(u64, cranelift_codegen::ir::Type)>>>,
+    >,
+}
+
+impl State {
+    /// `crate::types::leaves` through the per-CGU memo.
+    pub fn leaves(
+        &self,
+        ctx: &Context,
+        ty: TypeHandle,
+    ) -> std::sync::Arc<Vec<(u64, cranelift_codegen::ir::Type)>> {
+        if let Some(v) = self.leaf_memo.borrow().get(&ty) {
+            return v.clone();
+        }
+        let v = std::sync::Arc::new(crate::types::leaves(ctx, ty));
+        self.leaf_memo.borrow_mut().insert(ty, v.clone());
+        v
+    }
 }
 
 pub fn mask(bits: u128, w: u32) -> u128 {

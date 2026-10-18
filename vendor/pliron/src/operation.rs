@@ -303,6 +303,13 @@ impl Operation {
             .collect()
     }
 
+    /// PLIRON: append this op's operand defs to `out`, reusing the
+    /// caller's allocation — [`Self::operands`] allocs fresh per call,
+    /// which dominates in per-op lowering loops.
+    pub fn operand_defs_into(&self, ctx: &Context, out: &mut Vec<Value>) {
+        out.extend(self.operands_slice(ctx).iter().map(Operand::get_def));
+    }
+
     /// PLIRON: drop every use held in `ptr`'s operand span and reset it
     /// to empty (orphaning the pool slots).
     fn drop_operand_uses(ptr: Ptr<Self>, ctx: &Context) {
@@ -407,6 +414,12 @@ impl Operation {
             .iter()
             .map(|opd| opd.get_def())
             .collect()
+    }
+
+    /// PLIRON: append this op's successor defs to `out`, reusing the
+    /// caller's allocation — [`Self::successors`] allocs fresh per call.
+    pub fn successor_defs_into(&self, ctx: &Context, out: &mut Vec<Ptr<BasicBlock>>) {
+        out.extend(self.successors_slice(ctx).iter().map(|o| o.get_def()));
     }
 
     /// PLIRON: drop every use held in `ptr`'s successor span and reset
@@ -807,6 +820,14 @@ impl Operation {
     /// Get the [OpId] this Operation. Builds an intermediate [OpObj].
     pub fn get_opid(ptr: Ptr<Self>, ctx: &Context) -> OpId {
         Self::get_op_dyn(ptr, ctx).get_opid()
+    }
+
+    /// PLIRON: the concrete op's `TypeId` — the same discriminator
+    /// [`Self::is_op`] uses, hoistable out of hot per-op dispatch
+    /// chains (a `TypeId` compare beats an `OpId` string compare).
+    #[inline]
+    pub fn op_type_id(ptr: Ptr<Self>, ctx: &Context) -> core::any::TypeId {
+        Self::dispatch(ptr, ctx).1
     }
 
     /// PLIRON: append `items` to the context-global region pool and

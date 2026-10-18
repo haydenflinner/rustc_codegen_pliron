@@ -21,7 +21,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
-use pliron::op::{Op, OpId, op_cast};
+use pliron::op::op_cast;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
@@ -37,6 +37,18 @@ use crate::types::{
 use crate::{address_taken, has_body};
 
 type Vals = SmallVec<[ir::Value; 2]>;
+
+/// Recover the scratch tables from a finished `FnLower`, clearing them
+/// for the next function — a macro rather than a `&mut FnLower` method
+/// because `fl.b.finalize`/`fl.lifetimes` leave `fl` partially moved.
+/// Call after all post-lower reads of `fl.vals`/`fl.cconst`.
+macro_rules! retake_scratch {
+    ($scratch:expr, $fl:expr, $($f:ident),+ $(,)?) => {$(
+        $scratch.$f = std::mem::take(&mut $fl.$f);
+        $scratch.$f.clear();
+    )+};
+}
+
 
 #[derive(Clone, Copy)]
 enum Sym {
@@ -566,6 +578,9 @@ pub fn lower_module<'a>(
             )
         });
     }
+    let mut t_lower = std::time::Duration::ZERO;
+    let mut t_fin = std::time::Duration::ZERO;
+    let mut scratch = FlScratch::default();
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob<'a>)| {
     for &(idx, (n, f)) in &order {
         CUR_FN.with(|c| c.borrow_mut().clone_from(n));
@@ -597,12 +612,12 @@ pub fn lower_module<'a>(
                 m: &mut *m,
                 ids: &ids,
                 b,
-                vals: FxHashMap::default(),
-                cconst: FxHashMap::default(),
-                blocks: FxHashMap::default(),
-                frefs: FxHashMap::default(),
-                cfrefs: FxHashMap::default(),
-                gvs: FxHashMap::default(),
+                vals: std::mem::take(&mut scratch.vals),
+                cconst: std::mem::take(&mut scratch.cconst),
+                blocks: std::mem::take(&mut scratch.blocks),
+                frefs: std::mem::take(&mut scratch.frefs),
+                cfrefs: std::mem::take(&mut scratch.cfrefs),
+                gvs: std::mem::take(&mut scratch.gvs),
                 terminated: false,
                 cc,
                 tcfg: cfg,
@@ -610,10 +625,10 @@ pub fn lower_module<'a>(
                 own_tail: internal.contains(n),
                 wasm: false,
                 exn: None,
-                vars: FxHashMap::default(),
+                vars: std::mem::take(&mut scratch.vars),
                 stubs: rustc_hash::FxHashSet::default(),
                 nonnull: FxHashSet::default(),
-                bool01: FxHashSet::default(),
+                bool01: std::mem::take(&mut scratch.bool01),
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
@@ -626,16 +641,23 @@ pub fn lower_module<'a>(
                 lifetimes: Vec::new(),
                 nocap: FxHashSet::default(),
                 va_buf: None,
-                va_fids: FxHashMap::default(),
+                va_fids: std::mem::take(&mut scratch.va_fids),
                 eh_data,
                 eh_tls_v: None,
                 eject: None,
+                opnds: std::mem::take(&mut scratch.opnds),
+                succs: std::mem::take(&mut scratch.succs),
             };
             if pliron_cfg::tracing_on() {
                 tracing::debug!(target: "pliron::lower", lowerfn = %n);
             }
+            let tl = std::time::Instant::now();
             fl.lower(f.op);
+            let tl2 = tl.elapsed();
+            t_lower += tl2;
+            let tl3 = std::time::Instant::now();
             fl.b.finalize(cfg);
+            t_fin += tl3.elapsed();
             asm_stubs.extend(fl.stubs.iter().copied());
             nonnull = std::mem::take(&mut fl.nonnull);
             derived = std::mem::take(&mut fl.derived);
@@ -681,6 +703,10 @@ pub fn lower_module<'a>(
                 .iter()
                 .filter_map(|(&cb, &rb)| st.prof_bcount.get(rb).map(|&c| (cb, c)))
                 .collect();
+            retake_scratch!(
+                scratch, fl, vals, cconst, blocks, frefs, cfrefs, gvs, vars, bool01, va_fids,
+                opnds, succs
+            );
         }
         emit(idx, FnJob {
             name: n,
@@ -709,6 +735,8 @@ pub fn lower_module<'a>(
         });
         m.clear_context(&mut clctx);
     }
+    pliron_cfg::trace("*pA-lower*", t_lower.as_secs_f64() * 1e3, name);
+    pliron_cfg::trace("*pA-fin*", t_fin.as_secs_f64() * 1e3, name);
     };
     // Phase (B): CLIF pipeline + cranelift compile per function. Each job
     // is fully self-contained, so workers can run them in any order;
@@ -1458,6 +1486,7 @@ pub fn lower_clif_wasm(
         slp: st.slp,
     };
     let mut out = Vec::new();
+    let mut scratch = FlScratch::default();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -1490,12 +1519,12 @@ pub fn lower_clif_wasm(
                 m: &mut m,
                 ids: &ids,
                 b,
-                vals: FxHashMap::default(),
-                cconst: FxHashMap::default(),
-                blocks: FxHashMap::default(),
-                frefs: FxHashMap::default(),
-                cfrefs: FxHashMap::default(),
-                gvs: FxHashMap::default(),
+                vals: std::mem::take(&mut scratch.vals),
+                cconst: std::mem::take(&mut scratch.cconst),
+                blocks: std::mem::take(&mut scratch.blocks),
+                frefs: std::mem::take(&mut scratch.frefs),
+                cfrefs: std::mem::take(&mut scratch.cfrefs),
+                gvs: std::mem::take(&mut scratch.gvs),
                 terminated: false,
                 cc,
                 tcfg,
@@ -1503,10 +1532,10 @@ pub fn lower_clif_wasm(
                 own_tail: internal.contains(n),
                 wasm: true,
                 exn: None,
-                vars: FxHashMap::default(),
+                vars: std::mem::take(&mut scratch.vars),
                 stubs: rustc_hash::FxHashSet::default(),
                 nonnull: FxHashSet::default(),
-                bool01: FxHashSet::default(),
+                bool01: std::mem::take(&mut scratch.bool01),
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
@@ -1519,10 +1548,12 @@ pub fn lower_clif_wasm(
                 lifetimes: Vec::new(),
                 nocap: FxHashSet::default(),
                 va_buf: None,
-                va_fids: FxHashMap::default(),
+                va_fids: std::mem::take(&mut scratch.va_fids),
                 eh_data,
                 eh_tls_v: None,
                 eject: None,
+                opnds: std::mem::take(&mut scratch.opnds),
+                succs: std::mem::take(&mut scratch.succs),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -1556,6 +1587,10 @@ pub fn lower_clif_wasm(
                 .iter()
                 .filter_map(|(&cb, &rb)| st.prof_bcount.get(rb).map(|&c| (cb, c)))
                 .collect();
+            retake_scratch!(
+                scratch, fl, vals, cconst, blocks, frefs, cfrefs, gvs, vars, bool01, va_fids,
+                opnds, succs
+            );
             (
                 fl.nonnull,
                 fl.derived,
@@ -2049,6 +2084,30 @@ struct FnLower<'a, 'b> {
     eh_tls_v: Option<ir::Value>,
     /// Shared early-return block used to propagate a pending "exception".
     eject: Option<Block>,
+    /// Per-op operand/successor snapshot scratch — `lower_op` takes and
+    /// refills these instead of allocating two `Vec`s per op.
+    opnds: Vec<Value>,
+    succs: Vec<Ptr<BasicBlock>>,
+}
+
+/// Tables `FnLower` rebuilds per function that are *not* extracted into
+/// the `FnJob` — moved into each `FnLower` and taken back afterward so
+/// their capacity survives to the next function instead of regrowing
+/// ~10 hash tables from empty per function. Contents are cleared on
+/// `retake`; only allocations persist.
+#[derive(Default)]
+struct FlScratch {
+    vals: FxHashMap<Value, Vals>,
+    cconst: FxHashMap<Value, Vals>,
+    blocks: FxHashMap<Ptr<BasicBlock>, Block>,
+    frefs: FxHashMap<FuncId, FuncRef>,
+    cfrefs: FxHashMap<FuncId, FuncRef>,
+    gvs: FxHashMap<DataId, GlobalValue>,
+    vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
+    bool01: FxHashSet<ir::Value>,
+    va_fids: FxHashMap<String, FuncId>,
+    opnds: Vec<Value>,
+    succs: Vec<Ptr<BasicBlock>>,
 }
 
 impl<'a, 'b> FnLower<'a, 'b> {
@@ -2140,9 +2199,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
         for op in crate::sroa::allocas(ctx, f) {
             let a = op.deref(ctx).get_result(ctx, 0);
             if let Some(&ty) = self.st.promoted.get(a) {
-                let vs = leaves(ctx, ty)
-                    .into_iter()
-                    .map(|(_, t)| (self.b.declare_var(t), t))
+                let lv = self.st.leaves(ctx, ty);
+                let vs = lv
+                    .iter()
+                    .map(|&(_, t)| (self.b.declare_var(t), t))
                     .collect();
                 self.vars.insert(a, vs);
             }
@@ -2347,8 +2407,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
-    fn ty_leaves(&self, t: TypeHandle) -> Vec<(u64, ClType)> {
-        leaves(self.ctx, t)
+    fn ty_leaves(&self, t: TypeHandle) -> std::sync::Arc<Vec<(u64, ClType)>> {
+        self.st.leaves(self.ctx, t)
     }
 
     fn get(&mut self, v: Value) -> Vals {
@@ -2522,6 +2582,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             return Some((self.block_arg_bits(blk, ai, depth)?, int_ty(v)));
         };
         let id = Operation::get_opid(op, ctx);
+        let tid = Operation::op_type_id(op, ctx);
         if pliron_cfg::tracing_on()
             && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG)
         {
@@ -2529,7 +2590,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 tracing::debug!(target: "pliron::lower", "const_bits {}: {}", depth, id)
             };
         }
-        let ops: Vec<Value> = op.deref(ctx).operands(ctx).collect();
+        // Indexed `get_operand` instead of a `Vec` snapshot — this runs
+        // once per recursion level on every int op's operand chain.
+        let og = |i: usize| op.deref(ctx).get_operand(ctx, i);
         let bit = |v| self.const_bits(v, depth + 1);
         let sext = |(b, w): (u128, u32)| -> i128 {
             if w < 128 && (b >> (w - 1)) & 1 == 1 {
@@ -2538,14 +2601,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 b as i128
             }
         };
-        let r = if id == SelectOp::get_opid_static() {
-            let (c, _) = bit(ops[0])?;
-            bit(if c & 1 == 1 { ops[1] } else { ops[2] })?.0
-        } else if id == ICmpOp::get_opid_static() {
+        let r = if tid == core::any::TypeId::of::<SelectOp>() {
+            let (c, _) = bit(og(0))?;
+            bit(if c & 1 == 1 { og(1) } else { og(2) })?.0
+        } else if tid == core::any::TypeId::of::<ICmpOp>() {
             use ICmpPredicateAttr as P;
             let pred = Operation::get_op::<ICmpOp>(op, ctx).unwrap().predicate(ctx);
-            let (a, wa) = bit(ops[0])?;
-            let (b, _) = bit(ops[1])?;
+            let (a, wa) = bit(og(0))?;
+            let (b, _) = bit(og(1))?;
             let (sa, sb) = (sext((a, wa)), sext((b, wa)));
             let r = match pred {
                 P::EQ => a == b,
@@ -2560,22 +2623,22 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 P::UGE => a >= b,
             };
             return Some((u128::from(r), 1));
-        } else if id == LoadOp::get_opid_static() && !self.st.volatile.contains(op) {
+        } else if tid == core::any::TypeId::of::<LoadOp>() && !self.st.volatile.contains(op) {
             // `const 7i128` operands codegen_ssa spills to an alloca come
             // back as loads. Whenever the load executes before any store it
             // reads uninitialized memory (UB), so the value is determined by
             // whichever constant stores can run before it.
-            if !self.st.allocas.contains(ops[0]) {
+            if !self.st.allocas.contains(og(0)) {
                 return None;
             }
             let lb = op.deref(ctx).get_parent_block()?;
             let mut stores = Vec::new();
-            for u in ops[0].uses(ctx) {
+            for u in og(0).uses(ctx) {
                 let uop = u.user_op();
-                let uid = Operation::get_opid(uop, ctx);
+                let uid = Operation::op_type_id(uop, ctx);
                 // Loads read whatever the matching stores wrote; lifetime
                 // markers don't touch memory.
-                if uid == LoadOp::get_opid_static()
+                if uid == core::any::TypeId::of::<LoadOp>()
                     || self
                         .st
                         .intrinsics.get(uop)
@@ -2583,7 +2646,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 {
                     continue;
                 }
-                if uid != StoreOp::get_opid_static()
+                if uid != core::any::TypeId::of::<StoreOp>()
                     || u.find_index(ctx) != 1
                     || self.st.volatile.contains(uop)
                 {
@@ -2658,7 +2721,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let (t2, i2) = arm(b2)?;
                     if t1 != t2
                         || i1 == i2
-                        || Operation::get_opid(t1, ctx) != CondBrOp::get_opid_static()
+                        || Operation::op_type_id(t1, ctx) != core::any::TypeId::of::<CondBrOp>()
                     {
                         return None;
                     }
@@ -2673,37 +2736,41 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 return None;
             }
         } else {
-            let Some(&o0) = ops.first() else {
+            if op.deref(ctx).get_num_operands() == 0 {
                 return None;
+            }
+            let (a, wa) = bit(og(0))?;
+            let (b, _) = if op.deref(ctx).get_num_operands() > 1 {
+                bit(og(1))?
+            } else {
+                (0, wa)
             };
-            let (a, wa) = bit(o0)?;
-            let (b, _) = if ops.len() > 1 { bit(ops[1])? } else { (0, wa) };
             let (sa, sb) = (sext((a, wa)), sext((b, wa)));
-            let v = if id == AddOp::get_opid_static() {
+            let v = if tid == core::any::TypeId::of::<AddOp>() {
                 a.wrapping_add(b)
-            } else if id == SubOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<SubOp>() {
                 a.wrapping_sub(b)
-            } else if id == MulOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<MulOp>() {
                 a.wrapping_mul(b)
-            } else if id == AndOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<AndOp>() {
                 a & b
-            } else if id == OrOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<OrOp>() {
                 a | b
-            } else if id == XorOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<XorOp>() {
                 a ^ b
-            } else if id == ShlOp::get_opid_static() && b < wa as u128 {
+            } else if tid == core::any::TypeId::of::<ShlOp>() && b < wa as u128 {
                 a.wrapping_shl(b as u32)
-            } else if id == LShrOp::get_opid_static() && b < wa as u128 {
+            } else if tid == core::any::TypeId::of::<LShrOp>() && b < wa as u128 {
                 a.wrapping_shr(b as u32)
-            } else if id == AShrOp::get_opid_static() && b < wa as u128 {
+            } else if tid == core::any::TypeId::of::<AShrOp>() && b < wa as u128 {
                 sa.wrapping_shr(b as u32) as u128
-            } else if id == UDivOp::get_opid_static() && b != 0 {
+            } else if tid == core::any::TypeId::of::<UDivOp>() && b != 0 {
                 a / b
-            } else if id == URemOp::get_opid_static() && b != 0 {
+            } else if tid == core::any::TypeId::of::<URemOp>() && b != 0 {
                 a % b
-            } else if id == SDivOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1) {
+            } else if tid == core::any::TypeId::of::<SDivOp>() && b != 0 && !(sa == i128::MIN && sb == -1) {
                 (sa / sb) as u128
-            } else if id == SRemOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1) {
+            } else if tid == core::any::TypeId::of::<SRemOp>() && b != 0 && !(sa == i128::MIN && sb == -1) {
                 (sa % sb) as u128
             } else {
                 return None;
@@ -2752,7 +2819,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let (t2, i2) = arm(b2)?;
         if t1 != t2
             || i1 == i2
-            || Operation::get_opid(t1, ctx) != CondBrOp::get_opid_static()
+            || Operation::op_type_id(t1, ctx) != core::any::TypeId::of::<CondBrOp>()
         {
             return None;
         }
@@ -2881,8 +2948,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ConstVal::Zero | ConstVal::Undef => self
                 .ty_leaves(ty)
-                .into_iter()
-                .map(|(_, t)| self.iconst_any(t, 0))
+                .iter()
+                .map(|&(_, t)| self.iconst_any(t, 0))
                 .collect(),
             ConstVal::Bytes(bs) => bs
                 .iter()
@@ -3082,7 +3149,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     fn int_divrem(
         &mut self,
         op: Ptr<Operation>,
-        opnds: Vec<Value>,
+        opnds: &[Value],
         lib: &str,
         unsigned: bool,
         rem: bool,
@@ -3426,25 +3493,26 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     /// `op` is a pure int-producing op in `const_bits`' evaluable set (the
     /// loads const_bits resolves are operands, not top-level results).
-    fn op_int_constable(&self, op: Ptr<Operation>, id: &OpId) -> bool {
-        let eval = [
-            ICmpOp::get_opid_static(),
-            SelectOp::get_opid_static(),
-            AddOp::get_opid_static(),
-            SubOp::get_opid_static(),
-            MulOp::get_opid_static(),
-            AndOp::get_opid_static(),
-            OrOp::get_opid_static(),
-            XorOp::get_opid_static(),
-            ShlOp::get_opid_static(),
-            LShrOp::get_opid_static(),
-            AShrOp::get_opid_static(),
-            UDivOp::get_opid_static(),
-            URemOp::get_opid_static(),
-            SDivOp::get_opid_static(),
-            SRemOp::get_opid_static(),
+    fn op_int_constable(&self, op: Ptr<Operation>, tid: core::any::TypeId) -> bool {
+        use core::any::TypeId as T;
+        const EVAL: &[T] = &[
+            T::of::<ICmpOp>(),
+            T::of::<SelectOp>(),
+            T::of::<AddOp>(),
+            T::of::<SubOp>(),
+            T::of::<MulOp>(),
+            T::of::<AndOp>(),
+            T::of::<OrOp>(),
+            T::of::<XorOp>(),
+            T::of::<ShlOp>(),
+            T::of::<LShrOp>(),
+            T::of::<AShrOp>(),
+            T::of::<UDivOp>(),
+            T::of::<URemOp>(),
+            T::of::<SDivOp>(),
+            T::of::<SRemOp>(),
         ];
-        if !eval.contains(id) {
+        if !EVAL.contains(&tid) {
             return false;
         }
         matches!(classify(self.ctx, self.res_ty(op)), TyK::Int(_))
@@ -3476,16 +3544,35 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
+    /// Operand/successor snapshots go through `self`'s scratch buffers
+    /// (take/putback) so the per-op loop doesn't allocate two `Vec`s —
+    /// plus the two `operand_defs`/`successor_defs` allocs underneath
+    /// `operands()`/`successors()` — per op.
     fn lower_op(&mut self, op: Ptr<Operation>) {
+        let mut opnds = std::mem::take(&mut self.opnds);
+        let mut succs = std::mem::take(&mut self.succs);
+        opnds.clear();
+        succs.clear();
+        {
+            let o = op.deref(self.ctx);
+            o.operand_defs_into(self.ctx, &mut opnds);
+            o.successor_defs_into(self.ctx, &mut succs);
+        }
+        self.lower_op_inner(op, &opnds, &succs);
+        self.opnds = opnds;
+        self.succs = succs;
+    }
+
+    fn lower_op_inner(&mut self, op: Ptr<Operation>, opnds: &[Value], succs: &[Ptr<BasicBlock>]) {
         let ctx = self.ctx;
         let id = Operation::get_opid(op, ctx);
-        let (opnds, succs): (Vec<Value>, Vec<Ptr<BasicBlock>>) = {
-            let o = op.deref(ctx);
-            (o.operands(ctx).collect(), o.successors(ctx).collect())
-        };
+        // One dense-table lookup for the whole dispatch chain: every
+        // `is!` arm is then a `TypeId` compare instead of an `OpId`
+        // string compare.
+        let tid = Operation::op_type_id(op, ctx);
         macro_rules! is {
             ($t:ty) => {
-                id == <$t>::get_opid_static()
+                tid == ::core::any::TypeId::of::<$t>()
             };
         }
         macro_rules! binop {
@@ -3532,7 +3619,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // iconst directly. rustc's mir-opts leave some constant expressions
         // unfolded (`7u128.max(1)` lowers to `select(icmp ..)`); folding
         // here also collapses their dependent Assert(cond) checks.
-        if crate::pass_enabled("PLIRON_LOWERFOLD") && self.op_int_constable(op, &id) {
+        if crate::pass_enabled("PLIRON_LOWERFOLD") && self.op_int_constable(op, tid) {
             let r = op.deref(ctx).get_result(ctx, 0);
             let t = self.ty_leaves(r.get_type(ctx));
             if t.len() == 1 {
@@ -3555,7 +3642,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             self.terminated = true;
         } else if is!(BrOp) {
             let d = self.blocks[&succs[0]];
-            let a = self.block_args(&opnds);
+            let a = self.block_args(opnds);
             self.b.ins().jump(d, &a);
             self.terminated = true;
         } else if is!(SwitchOp) {
@@ -3857,7 +3944,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let xs = self.get(opnds[0]);
             let dts = self.ty_leaves(self.res_ty(op));
             let mut r = Vals::new();
-            for (x, (_, t)) in xs.into_iter().zip(dts) {
+            for (x, &(_, t)) in xs.into_iter().zip(dts.iter()) {
                 let v = if is!(TruncOp) && dst_w == 1 && self.bool01.contains(&x) {
                     self.resize(x, clt::I8, false)
                 } else if is!(TruncOp) && dst_w == 1 {
@@ -4037,17 +4124,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let r: Vals = if dts.iter().map(|d| d.1).eq(sts.iter().copied()) {
                 xs
             } else if xs.len() == dts.len()
-                && sts.iter().zip(&dts).all(|(s, d)| s.bits() == d.1.bits())
+                && sts.iter().zip(dts.iter()).all(|(s, d)| s.bits() == d.1.bits())
             {
                 xs.iter()
-                    .zip(&dts)
+                    .zip(dts.iter())
                     .map(|(x, d)| self.bitcast_to(d.1, *x))
                     .collect()
             } else {
                 let (sz, _) = size_align(ctx, self.res_ty(op));
                 let slot = self.slot(sz.max(16), 16);
                 let sl = self.ty_leaves(opnds[0].get_type(ctx));
-                for (x, (o, _)) in xs.iter().zip(sl) {
+                for (x, &(o, _)) in xs.iter().zip(sl.iter()) {
                     self.b
                         .ins()
                         .store(MemFlagsData::trusted(), *x, slot, o as i32);
@@ -4067,8 +4154,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let vars = self.vars[&opnds[0]].clone();
             let r = vars
                 .into_iter()
-                .zip(lv)
-                .map(|((var, vt), (_, t))| {
+                .zip(lv.iter())
+                .map(|((var, vt), &(_, t))| {
                     let x = self.b.use_var(var);
                     if vt == t { x } else { self.bitcast_to(t, x) }
                 })
@@ -4105,8 +4192,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             let r: Vals = self
                 .ty_leaves(self.res_ty(op))
-                .into_iter()
-                .map(|(o, t)| {
+                .iter()
+                .map(|&(o, t)| {
                     if atomic && self.needs_atomic_stub(t) {
                         self.atomic_load_stub(p, o)
                     } else if atomic && t.is_float() {
@@ -4163,7 +4250,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             if vol {
                 self.b.ins().fence();
             }
-            for (v, (o, t)) in vs.into_iter().zip(lv) {
+            for (v, &(o, t)) in vs.into_iter().zip(lv.iter()) {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
                 } else if is!(AtomicStoreOp) {
@@ -4232,7 +4319,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(CallOp) {
             self.lower_call(op);
         } else if is!(CallIntrinsicOp) {
-            self.lower_intrinsic(op, &opnds);
+            self.lower_intrinsic(op, opnds);
         } else if is!(SelectOp) {
             let c = self.get(opnds[0]);
             let a = self.get(opnds[1]);
@@ -4352,8 +4439,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
             let r = self
                 .ty_leaves(self.res_ty(op))
-                .into_iter()
-                .map(|(_, t)| self.iconst_any(t, 0))
+                .iter()
+                .map(|&(_, t)| self.iconst_any(t, 0))
                 .collect();
             self.set(op, r);
         } else {
@@ -4551,7 +4638,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             TyK::Vector(e, _) => size_align(self.ctx, e).0,
             _ => sz / a.len() as u64,
         };
-        for (x, (o, _)) in a.iter().zip(self.ty_leaves(v.get_type(self.ctx))) {
+        for (x, &(o, _)) in a.iter().zip(self.ty_leaves(v.get_type(self.ctx)).iter()) {
             self.b.ins().store(MemFlagsData::trusted(), *x, p, o as i32);
         }
         (p, es)
@@ -4978,14 +5065,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     if ind {
                         let (sz, al) = size_align(ctx, ty);
                         let dst = self.slot(sz.max(1), al.max(1));
-                        for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        let lv = self.st.leaves(ctx, ty);
+                        for ((lo, _), v) in lv.iter().copied().zip(self.get(a)) {
                             self.b.ins().store(MemFlagsData::new(), v, dst, lo as i32);
                         }
                         self.b
                             .ins()
                             .store(MemFlagsData::new(), dst, buf, slot as i32);
                     } else {
-                        for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        let lv = self.st.leaves(ctx, ty);
+                        for ((lo, _), v) in lv.iter().copied().zip(self.get(a)) {
                             self.b
                                 .ins()
                                 .store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
