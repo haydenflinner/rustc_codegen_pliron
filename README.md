@@ -3,11 +3,16 @@
 An out-of-tree rustc codegen backend with no LLVM:
 
 ```
-rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranelift-object (+ rsasm for asm) → wild
+rustc MIR → rustc_codegen_ssa → pliron LLVM dialect → Cranelift → cranelift-object (+ rsasm for asm) → system linker / wild
+                                                             └→ waffle → wasm (+ tools/pliron-wasm-ld)
 ```
 
 [pliron](https://github.com/vaivaswatha/pliron) is vendored in `vendor/` with its LLVM (llvm-sys) features disabled.
-`src/lower.rs` lowers the pliron LLVM dialect to Cranelift IR.
+`pliron-clif-lower/src/lower.rs` lowers the pliron LLVM dialect to Cranelift IR.
+Optimizations: pliron-IR passes in `pliron-ir-opt/` (inlining, SROA, IPO summaries, ...) and ~80 CLIF passes in `pliron-clif-opt/`.
+
+**Status and work list: [`docs/PARITY.md`](docs/PARITY.md)** (runtime and compile-time parity with LLVM, native and wasm).
+Working on the code: [`AGENTS.md`](AGENTS.md).
 
 ## Usage
 ```
@@ -24,7 +29,10 @@ bench/run.sh                   # criterion kernels: LLVM baseline vs pliron, wit
 examples/bevy-game/build.sh    # then run target/x86_64-unknown-linux-gnu/debug/pliron_bevy_game
 ```
 
-## Status (x86_64 Linux)
+## Status
+
+Developed mainly on aarch64-apple-darwin; x86_64 Linux and x86_64 Windows (MSVC, including an MSVC-free link path — `docs/platforms.md`) also work.
+
 - `no_std` and `std` programs compile and run.
 - `-Zbuild-std=std,panic_unwind`: core, alloc and std build with this backend, and the resulting binaries run.
 - Unwinding: `invoke` lowers to Cranelift `try_call`, and `.eh_frame` and LSDA are emitted (adapted from rustc_codegen_cranelift).
@@ -46,18 +54,21 @@ examples/bevy-game/build.sh    # then run target/x86_64-unknown-linux-gnu/debug/
   A patch is the crate recompiled normally with `--emit=obj`. `examples/pliron-hot` (call `pliron_hot::start()`) loads it in the running process: it maps the object next to the executable, resolves symbols against the executable's own symbol table, keeps Rust statics bound to the live copies, registers `.eh_frame`, and repoints the slots of the functions whose code changed.
   `examples/bevy-game/hot.sh` is the edit loop: save `src/main.rs`, the patch builds in ~1.2s and applies in ~50ms, and ECS state is kept. `tests/hot/run.sh` is a smoke test.
   Limits: x86_64 ELF only, no new thread-locals in patches, changed struct layouts need a restart.
-- Mid-level passes: a small same-CGU inliner (`src/inline.rs`, at -O; `PLIRON_INLINE=0` disables it).
-- Not done yet: debuginfo, LTO, and targets other than x86_64.
+- Self-hosting: a pliron-built stage1 rustc builds a working stage2 compiler (`selfhost/`).
+- Not done yet: debuginfo, LTO.
 
-## wasm32 (in progress)
+## wasm32
 
-`--target wasm32-unknown-unknown` lowers the pliron LLVM dialect to
+wasm32 goes through the same FnLower + CLIF pipeline as native, then
+`src/wasm.rs::clif_emit` translates the optimized CLIF to
 [waffle](https://github.com/bytecodealliance/waffle) IR, which does the
-reducify/stackify/localify into structured wasm (`src/wasm.rs`). Each
+reducify/stackify/localify into structured wasm. Each
 codegen unit becomes a wasm "object" that imports memory, the stack pointer,
 the function table and GOT-style globals, plus a `pliron.link` custom section
 with data and relocations. `tools/pliron-wasm-ld` links those objects and
 rlibs into one module (wasm-ld is LLVM, so it is not used).
 
-`tests/wasm/run.sh` builds core, compiler_builtins and a test crate this way
-and runs it in node. Not done yet: std, unwinding, rustc itself as wasm.
+`tests/wasm/run.sh` builds core, std (wasm32-unknown-unknown and
+wasm32-wasip1, with a pure-Rust libc in `tools/pliron-wasi-libc`) and
+panic=unwind (emulated EH) test crates this way and runs them in node /
+wasmtime. Not done yet: rustc itself as wasm.

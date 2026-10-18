@@ -4696,7 +4696,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // emit. The rustc-flag path is off by default: folding the extra
         // guards reshapes the `split_whitespace` dispatch badly enough to
         // cost ~8% on tokenize while the chars loop it was aimed at gains
-        // nothing (see `chars_alpha` in coordination-ledger.md).
+        // nothing (see `chars_alpha` in docs/history/coordination-ledger.md).
         static IBNN: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| crate::env_is("PLIRON_INBOUNDSNN", "1"));
         if addr != base_v

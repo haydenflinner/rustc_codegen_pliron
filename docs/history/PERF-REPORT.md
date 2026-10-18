@@ -3,7 +3,7 @@
 **Machine:** Windows x64 (`x86_64-pc-windows-msvc`), Intel i7-12700K
 (8 P-cores + 4 E-cores, AVX2, no AVX512), RTX 3080.
 **Revisions:** rustc `nightly-2026-10-06`, pliron backend `45063dd`,
-cubecl `clif-cpu-jit` `2556b654f`. Raw data: [`perf/data.md`](perf/data.md).
+cubecl `clif-cpu-jit` `2556b654f`. Raw data: [`perf-data-2026-10-16.md`](perf-data-2026-10-16.md).
 
 | axis | LLVM | pliron | verdict |
 |---|---|---|---|

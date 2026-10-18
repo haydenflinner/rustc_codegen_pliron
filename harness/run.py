@@ -21,7 +21,7 @@ Tier 0 = smoke + determinism, tier 1 = tier 0 + ui.
 Results go to target/harness/<suite>/results.json, ICE dumps to target/harness/ices.
 Expectations live in harness/expectations/<suite>.<host>[.O].json; the run fails on a
 test that was expected to pass and no longer does, or on a new test that fails.
---accept rewrites the expectations from this run. See test-harness.md.
+--accept rewrites the expectations from this run. See docs/test-harness.md.
 """
 import argparse, collections, concurrent.futures as cf, hashlib, json, os, platform, re, shutil, subprocess, sys
 
