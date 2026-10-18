@@ -413,14 +413,17 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `MInst.Extend`. Visible as `cset; uxtb` pairs on every
     bool-as-integer idiom (`(x == y) as i64`, `select c, 1, 0`).
 
-34. DFG alias epoch (`src/ir/dfg.rs`): `alias_epoch` counter bumped on
-    every alias write (`change_to_alias`, `replace_with_aliases`,
-    `make_value_alias_for_serialization`); tombstone writes and
-    same-root retargets (`compact_aliases`, `resolve_all_aliases`)
-    don't bump since they create no new resolvable pairs.
-    `carry_aliases` in the opt pipeline compares against its last-seen
-    epoch and skips the whole-`values()` scan on mutating steps that
-    created no aliases — ~1.5% of bench pipeline time.
+34. DFG alias epoch + write list (`src/ir/dfg.rs`): `alias_epoch`
+    counter bumped on every alias write (`change_to_alias`,
+    `replace_with_aliases`, `make_value_alias_for_serialization`);
+    tombstone writes and same-root retargets (`compact_aliases`,
+    `resolve_all_aliases`) don't bump since they create no new
+    resolvable pairs. `alias_dirty` records each write's `dest` in
+    order (duplicates kept), so `carry_aliases` scans only the
+    watermark backlog and `compact_aliases` walks writes instead of
+    the whole `values` table — the epoch early-out and
+    whole-`values()` scans were ~1.5% of bench pipeline time and the
+    backlog scan was ~2% of regex-syntax phaseB CPU.
 
 35. `imul.i8x16` x64 lowering (`src/isa/x64/lower.isle`, `inst.isle`,
     `lower/isle.rs`): upstream leaves i8x16 multiplication unimplemented

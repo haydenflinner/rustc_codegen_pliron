@@ -521,8 +521,10 @@ pub struct Analysis {
     /// Alias pairs already carried onto their targets; facts are inputs
     /// and aliases are permanent, so a pair never needs carrying twice.
     carried: FxHashSet<(Value, Value)>,
-    /// `dfg.alias_epoch` at the last `carry_aliases` scan.
-    alias_epoch: u32,
+    /// Position into `dfg.alias_writes()` covered by the last
+    /// `carry_aliases` scan — the list is append-only, so equal lengths
+    /// mean no new aliases exist and `wm..len` is exactly the backlog.
+    alias_wm: usize,
     /// `dfg.alias_epoch` when `compact_aliases` last ran. Chains only
     /// deepen when an alias's target is itself aliased — an epoch bump —
     /// so equal epochs mean every chain is already flat and the
@@ -2646,9 +2648,10 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
 /// and `an.carried` skips pairs already handled.
 fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
     // Steps that wrote no aliases since the last scan can't have new
-    // (alias, root) pairs — most mutating steps don't alias anything, so
-    // the whole-`values()` walk is usually dead work.
-    if p.clctx.func.dfg.alias_epoch() == an.alias_epoch {
+    // (alias, root) pairs — most mutating steps don't alias anything,
+    // so the backlog walk is usually dead work.
+    let dirty = p.clctx.func.dfg.alias_writes();
+    if dirty.len() == an.alias_wm {
         return;
     }
     if p.derived.is_empty()
@@ -2659,19 +2662,22 @@ fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
         && p.operand_frozen.is_empty()
         && p.lifetimes.is_empty()
     {
-        // Don't record the epoch here: a later step may add a fact map
-        // entry without touching aliases, and this epoch's pairs still
-        // need carrying then.
+        // Don't advance the watermark here: a later step may add a fact
+        // map entry without touching aliases, and this backlog's pairs
+        // still need carrying then.
         return;
     }
-    an.alias_epoch = p.clctx.func.dfg.alias_epoch();
+    let wm = an.alias_wm;
+    an.alias_wm = dirty.len();
     let func = &p.clctx.func;
-    let pairs: Vec<(Value, Value)> = func
-        .dfg
-        .values()
+    let pairs: Vec<(Value, Value)> = dirty[wm..]
+        .iter()
+        .copied()
         .filter_map(|v| {
             // Tombstone chains from deleted defs dead-end at reserved
             // targets — `resolve_aliases` panics there; just skip them.
+            // Re-aliased values repeat in `dirty`; each new write is a
+            // fresh pair candidate regardless.
             let r = func.dfg.try_resolve_aliases(v)?;
             (r != v && !an.carried.contains(&(v, r))).then_some((v, r))
         })
