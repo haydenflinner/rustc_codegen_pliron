@@ -3984,16 +3984,45 @@ pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
     })
 }
 
+/// `fold_null_tests` behind a fresh `TESTC` check: every fold starts
+/// from an `icmp` on an `iconst`, so without that shape the whole call
+/// — and the `NonNull` fixpoint it needs — is dead work.
+fn fnn<'a>(
+    func: &mut Function,
+    loads: &'a FxHashSet<Value>,
+    derived: &'a FxHashMap<Value, Value>,
+    nn: Option<NonNull<'a>>,
+) -> usize {
+    if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
+        return 0;
+    }
+    fold_null_tests(
+        func,
+        &nn.unwrap_or_else(|| NonNull::new(func, loads, derived)),
+    )
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
     derived: &mut FxHashMap<Value, Value>,
+    sh: u32,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
+    use crate::pipeline::shape;
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
     let mut tp = std::time::Instant::now();
-    merge_chains(func);
+    // Sub-phase guards use the entry-time `shape` bits: no phase below
+    // can create the first edge (MULTI), block param (BPARAM), or
+    // conditional branch (CONDBR) — they only remove them — so an
+    // absent bit stays absent and a present bit merely over-admits a
+    // no-op scan. JUMP/TESTC *can* appear (domcond folds `brif`→`jump`,
+    // threading rewrites args to `iconst`), but nothing below consumes
+    // a stale-false JUMP and `fnn` checks TESTC fresh when it runs.
+    if sh & shape::JUMP != 0 {
+        merge_chains(func);
+    }
     if prof {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.elapsed())
@@ -4047,7 +4076,7 @@ pub fn run(
     for _ in 0..8 {
         let mut tp = std::time::Instant::now();
         let mut changed = false;
-        if trivp {
+        if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
             let v = {
                 let (_, d) = cd.get_or_insert_with(|| cfg_dt(func));
                 remove_trivial_params(func, d)
@@ -4062,7 +4091,7 @@ pub fn run(
             };
             tp = std::time::Instant::now();
         }
-        if deadp {
+        if deadp && sh & shape::BPARAM != 0 {
             let removed = remove_dead_params(func);
             dead_params += removed;
             if removed != 0 {
@@ -4077,7 +4106,7 @@ pub fn run(
             };
             tp = std::time::Instant::now();
         }
-        let dc = if domcond {
+        let dc = if domcond && sh & shape::CONDBR != 0 {
             let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
             fold_dominated_conds_at(func, c, d)
         } else {
@@ -4096,7 +4125,7 @@ pub fn run(
         // new diamonds and bypass_forwarders collapses the residue. The dead
         // side blocks keep phantom CFG edges (skewing dominance checks), so
         // sweep them once unreachable.
-        let ic = if ifconv {
+        let ic = if ifconv && sh & shape::CONDBR != 0 {
             crate::ifconv::run(
                 func,
                 derived,
@@ -4112,7 +4141,11 @@ pub fn run(
             remove_unreachable_blocks(func);
         }
         check(func, "unreach");
-        let bpn = bypass_forwarders(func, cd.as_ref().map(|(c, d)| (&*c, &*d)));
+        let bpn = if sh & shape::MULTI != 0 {
+            bypass_forwarders(func, cd.as_ref().map(|(c, d)| (&*c, &*d)))
+        } else {
+            0
+        };
         check(func, "bypass");
         if bpn > 0 {
             changed = true;
@@ -4127,7 +4160,7 @@ pub fn run(
             tp = std::time::Instant::now();
         }
         let mut nn_opt = None;
-        let rn = if round_quiet && !changed {
+        let rn = if sh & shape::CONDBR == 0 || (round_quiet && !changed) {
             round_skips += 1;
             0
         } else {
@@ -4147,12 +4180,11 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
-            fnn_cur = Some(fold_null_tests(
-                func,
-                &nn_opt.unwrap_or_else(|| NonNull::new(func, loads, derived)),
-            ));
+            fnn_cur = Some(fnn(func, loads, derived, nn_opt));
             break;
         }
+        // No refresh needed: the guarded bits can only shrink inside
+        // this loop, so `sh` stays a sound over-approximation.
     }
     if prof {
         if pliron_cfg::tracing_on() {
@@ -4162,7 +4194,7 @@ pub fn run(
     }
     let fnn = match fnn_cur {
         Some(x) => x,
-        None => fold_null_tests(func, &NonNull::new(func, loads, derived)),
+        None => fnn(func, loads, derived, None),
     };
     if prof {
         if pliron_cfg::tracing_on() {

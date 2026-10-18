@@ -272,18 +272,65 @@ pub mod shape {
     /// Any integer div/rem — `divconst` rewrites the constant-divisor
     /// cases and loopvec treats the opcodes as side effects.
     pub const DIVREM: u32 = 1 << 7;
+    /// A non-entry block declares at least one block param — the web/
+    /// param transforms (`sameargs`/`webmerge`/`cparm`, jumpthread's
+    /// `trivp`/`deadp`) only move edge args into and out of params; a
+    /// function with none has nothing to merge or drop. Unreachable
+    /// param'd blocks count: `deadp` cleans them too.
+    pub const BPARAM: u32 = 1 << 8;
+    /// An unconditional `jump` terminator exists — chain merging,
+    /// forwarder bypass/folding, and the jump-plan paths only inspect
+    /// `jump` predecessors.
+    pub const JUMP: u32 = 1 << 9;
+    /// At least one load-family inst — loadfwd's dataflow only ever
+    /// produces forwards for loads; a load-free function can only have
+    /// kills.
+    pub const LOAD: u32 = 1 << 10;
+    /// At least one store-family inst — DSE and dead-slot-store
+    /// sweeps only remove stores.
+    pub const STORE: u32 = 1 << 11;
+    /// An `icmp` exists — `fold_null_tests`' null/sentinel folds all
+    /// start from one (its `known()` operand test is finer, but the
+    /// bit deliberately skips the per-arg walk).
+    pub const TESTC: u32 = 1 << 12;
+    /// More than one block — tail merge/dup, unreachable-block sweeps,
+    /// and cross-block def-use passes need a second block to act on.
+    pub const BLOCKS2: u32 = 1 << 13;
+    /// An `iconst` exists — `const_sweep`'s `eval`/`known` seeds.
+    pub const ICONST: u32 = 1 << 14;
+    /// A stack slot is declared — `slotmerge` can merge slots no
+    /// instruction references (dead decls carry no `MEM` inst).
+    pub const SLOT: u32 = 1 << 15;
+    /// The entry block has params (i.e. the function takes args) —
+    /// `edgespec`'s `deadbits` zeroes demandless uses of any param,
+    /// entry args included.
+    pub const EPARAM: u32 = 1 << 16;
 }
 
 /// Computes the `shape` bits in one pass over the function.
-fn shape_of(func: &Function) -> u32 {
+pub(crate) fn shape_of(func: &Function) -> u32 {
     use cranelift_codegen::ir::Opcode as Op;
     let mut bits = 0u32;
-    // Layout-order index per block for the back-edge test.
-    let mut idx: FxHashMap<Block, u32> = FxHashMap::default();
+    if func.layout.num_blocks() > 1 {
+        bits |= shape::BLOCKS2;
+    }
+    if !func.sized_stack_slots.is_empty() || !func.dynamic_stack_slots.is_empty() {
+        bits |= shape::SLOT;
+    }
+    let entry = func.layout.entry_block();
+    if entry.is_some_and(|e| func.dfg.num_block_params(e) > 0) {
+        bits |= shape::EPARAM;
+    }
+    // Layout-order index per block for the back-edge test — dense by
+    // block index, not hashed.
+    let mut idx = vec![0u32; func.dfg.num_blocks()];
     for (i, b) in func.layout.blocks().enumerate() {
-        idx.insert(b, i as u32);
+        idx[b.index()] = i as u32;
     }
     for (i, b) in func.layout.blocks().enumerate() {
+        if Some(b) != entry && func.dfg.num_block_params(b) > 0 {
+            bits |= shape::BPARAM;
+        }
         // (base, elem bytes) → store count: a pair in one group is the
         // cheap necessary shape for every store-pack path.
         let mut stores: FxHashMap<(Value, u32), u32> = FxHashMap::default();
@@ -296,7 +343,13 @@ fn shape_of(func: &Function) -> u32 {
             let op = func.dfg.insts[inst].opcode();
             // `stack_addr` reports neither load nor store but marks a
             // slot the memory passes walk (slotprom/slotmerge).
-            if op.can_load() || op.can_store() || op == Op::StackAddr {
+            if op.can_load() {
+                bits |= shape::MEM | shape::LOAD;
+            }
+            if op.can_store() {
+                bits |= shape::MEM | shape::STORE;
+            }
+            if op == Op::StackAddr {
                 bits |= shape::MEM;
             }
             if op.is_call() {
@@ -305,7 +358,14 @@ fn shape_of(func: &Function) -> u32 {
             match op {
                 Op::Brif => bits |= shape::CONDBR,
                 Op::BrTable => bits |= shape::CONDBR | shape::SWITCH,
+                Op::Jump => bits |= shape::JUMP,
                 Op::Sdiv | Op::Udiv | Op::Srem | Op::Urem => bits |= shape::DIVREM,
+                Op::Iconst => bits |= shape::ICONST,
+                // `fold_null_tests` fires only on `icmp` tests where
+                // `known()` resolves an operand to an `iconst` — any
+                // `icmp` over-reports (no per-arg walk in `shape_of`)
+                // but stays a sound necessary condition.
+                Op::Icmp => bits |= shape::TESTC,
                 Op::Store => {
                     let fl = func.dfg.mem_flags[func.dfg.insts[inst].memflags().unwrap()];
                     let args = func.dfg.inst_args(inst);
@@ -356,7 +416,7 @@ fn shape_of(func: &Function) -> u32 {
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     bits |= shape::MULTI;
-                    if idx[&bc.block(pool)] <= i as u32 {
+                    if idx[bc.block(pool).index()] <= i as u32 {
                         bits |= shape::LOOPS;
                     }
                 }
@@ -699,6 +759,11 @@ pub struct Step {
     /// apply. Checked per function at run time (not selection time):
     /// earlier steps can create the shape a later step needs.
     pub shape: u32,
+    /// `shape` bits of which at least one must be present — for steps
+    /// whose sub-transforms need different shapes (e.g. `mergechain`
+    /// merges `jump` chains or rewrites `brif` dispatches). Skipped
+    /// only when every bit is absent.
+    pub any: u32,
     pub gate: Gate,
     pub run: fn(&mut Pipe, &mut Analysis) -> usize,
 }
@@ -707,6 +772,11 @@ impl Step {
     /// `shape` requirement, builder-style: `step(..).needs(shape::LOOPS)`.
     const fn needs(mut self, mask: u32) -> Step {
         self.shape |= mask;
+        self
+    }
+    /// At-least-one `shape` requirement: `step(..).needs_any(a | b)`.
+    const fn needs_any(mut self, mask: u32) -> Step {
+        self.any |= mask;
         self
     }
 }
@@ -725,6 +795,7 @@ const fn step(
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate,
         run,
     }
@@ -746,6 +817,7 @@ const fn cstep(
         mutates: true,
         cached: true,
         shape: 0,
+        any: 0,
         gate,
         run,
     }
@@ -1138,7 +1210,17 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         (*SHAPE_ONLY, *NOSHAPE)
     };
     let req = s.shape & mask;
-    if req != 0 && !noshape && an.shape_bits(&p.clctx.func) & req != req {
+    let req_any = s.any & mask;
+    // Only gated steps pay for the bits — `shape_bits` is version-cached,
+    // but the probe itself isn't free either.
+    let sbits = if req != 0 || req_any != 0 {
+        an.shape_bits(&p.clctx.func)
+    } else {
+        0
+    };
+    if !noshape
+        && ((req != 0 && sbits & req != req) || (req_any != 0 && sbits & req_any == 0))
+    {
         if crate::config::tracing_on()
             && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
         {
@@ -1258,13 +1340,25 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
         }
     };
     let mut n = 0;
-    if crate::pass_enabled("PLIRON_CHAINMERGE") {
+    // `merge_chains` only inspects `jump` predecessors; the dispatch
+    // work below needs a conditional branch. The step gate is `MULTI`,
+    // so a jump-only function reaches here — the CONDBR guard keeps
+    // the dispatch phases on exactly the functions the old step gate
+    // admitted.
+    // `merge_chains` only inspects `jump` predecessors; the dispatch
+    // work below needs a conditional branch. Cached step-entry bits
+    // suffice: `merge_chains` touches jump chains only, so it can
+    // neither create CONDBR nor remove JUMP's need here — stale-true
+    // bits merely over-admit a no-op scan.
+    let mc = an.shape_bits(&p.clctx.func);
+    if crate::pass_enabled("PLIRON_CHAINMERGE") && mc & shape::JUMP != 0 {
         let t0 = std::time::Instant::now();
         jumpthread::merge_chains(&mut p.clctx.func);
         tt("chains", t0);
     }
+    let cond = mc & shape::CONDBR != 0;
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
-    if crate::pass_enabled("PLIRON_DISPATCHDUP") {
+    if cond && crate::pass_enabled("PLIRON_DISPATCHDUP") {
         let t0 = std::time::Instant::now();
         // Duplicating a dispatch into a jump pred rewires that pred's own
         // jump-preds onto the dispatch — run to fixpoint so multi-hop
@@ -1286,7 +1380,7 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
         }
         tt("dup1", t0);
     }
-    if crate::pass_enabled("PLIRON_EDGESPEC2") {
+    if cond && crate::pass_enabled("PLIRON_EDGESPEC2") {
         cd = None;
         if crate::pass_enabled("PLIRON_REBIND") {
             let t0 = std::time::Instant::now();
@@ -1318,7 +1412,11 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
         }
     }
     let t0 = std::time::Instant::now();
-    let k = clifpeep::brif_fold(&mut p.clctx.func);
+    let k = if cond {
+        clifpeep::brif_fold(&mut p.clctx.func)
+    } else {
+        0
+    };
     tt("brifold", t0);
     n += k;
     if n > 0 {
@@ -1383,8 +1481,10 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     total
 }
 
-fn s_jumpthread(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let (n, dead, folds, pmap) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived);
+fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let sh = an.shape_bits(&p.clctx.func);
+    let (n, dead, folds, pmap) =
+        jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived, sh);
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }
@@ -1490,19 +1590,24 @@ fn s_tailrec(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
-fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
+fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     let t = std::time::Instant::now();
-    p.stats.forwarded += loadfwd::run(
-        &mut p.clctx.func,
-        p.noalias,
-        p.invariant,
-        p.operand_frozen,
-        p.block_region,
-        p.region_parent,
-        p.nowrite,
-        p.call_frozen,
-        p.nocap,
-    );
+    // The dataflow only ever forwards a `load` (every `Fwd` is pushed
+    // on a load arm) — without one, the CFG/RPO/proot/iso setup and
+    // the fixpoint can produce nothing.
+    if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
+        p.stats.forwarded += loadfwd::run(
+            &mut p.clctx.func,
+            p.noalias,
+            p.invariant,
+            p.operand_frozen,
+            p.block_region,
+            p.region_parent,
+            p.nowrite,
+            p.call_frozen,
+            p.nocap,
+        );
+    }
     if crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO)
     {
@@ -1515,9 +1620,12 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
             && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
         // A load whose only user was a removed dead store keeps its own
         // slot alive, so alternate the two until nothing changes.
+        let has_store = an.shape_bits(&p.clctx.func) & shape::STORE != 0;
         for i in 0..4 {
             let t = std::time::Instant::now();
-            p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
+            if has_store {
+                p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
+            }
             if prof2 {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::loadfwd", "    lf-dss[{i}] {:?}", t.elapsed())
@@ -1660,7 +1768,8 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // Carried-constant params (`RangeInclusive`'s exhausted flag
     // — a self-edge param fed a literal at entry) fold here so
     // the dispatch arms they drive die before flattening
-    // (`PLIRON_CPARM`).
+    // (`PLIRON_CPARM`). The `CONDBR | BPARAM` step gate covers its
+    // webmerge (BPARAM) and const-sweep (CONDBR) halves.
     if config().enabled("PLIRON_CPARM") {
         let (k, pmap) = clifpeep::cparm(&mut p.clctx.func);
         if !pmap.is_empty() {
@@ -1683,8 +1792,16 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     }
     // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
     // leaf-up: `run` rescans to fixpoint internally on one
-    // cfg/domtree setup.
-    let k = ifconv::run(&mut p.clctx.func, p.derived, None);
+    // cfg/domtree setup. A diamond needs a `brif` header and `jump`
+    // arms — `cparm`'s `const_sweep` folds `brif const` into `jump`,
+    // so JUMP can appear here even when entry lacked it. Fresh bits.
+    let k = if shape_of(&p.clctx.func) & (shape::CONDBR | shape::JUMP)
+        == (shape::CONDBR | shape::JUMP)
+    {
+        ifconv::run(&mut p.clctx.func, p.derived, None)
+    } else {
+        0
+    };
     if k > 0 {
         // Folded merges leave dead forwarders still edging into
         // the merge — remove them so the merge is single-pred,
@@ -2682,10 +2799,14 @@ pub static DEFAULT: &[Step] = &[
         stat: "",
         verify: true,
         mutates: true,
-        // Ungated on shape: beyond edge threading it also merges
-        // identical exit blocks, which needs no edges at all.
+        // Needs at least one of: an edge (threading/chains/bypass), a
+        // non-entry param (`deadp` cleans unreachable param'd blocks),
+        // or an `icmp` (`fold_null_tests` — the only sub-phase that can
+        // fire on a lone straightline block). Finer sub-phase guards
+        // live inside `jumpthread::run`.
         cached: true,
         shape: 0,
+        any: shape::MULTI | shape::BPARAM | shape::TESTC,
         gate: JT,
         run: s_jumpthread,
     },
@@ -2704,6 +2825,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: true,
         shape: shape::LOOPS,
+        any: 0,
         gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
         run: s_unroll,
     },
@@ -2716,11 +2838,12 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: true,
         shape: 0,
+        any: 0,
         gate: Gate::Flag(FlagId::Peep),
         run: s_clifpeep,
     },
-    step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge),
-    step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup),
+    step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge).needs(shape::BLOCKS2),
+    step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
     step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec).needs(shape::CALL),
     Step {
         name: "loadfwd",
@@ -2729,9 +2852,11 @@ pub static DEFAULT: &[Step] = &[
         verify: true,
         mutates: true,
         cached: true,
-        // Fires on mem-free functions too (arg/result forwarding in
-        // e.g. alloc shims), so no shape gate.
+        // The `remove_dead_insts` cleanup in `s_loadfwd` can fire on
+        // any function, so no step-level gate; the `loadfwd` dataflow
+        // and dead-store sweep are LOAD/STORE-gated inside instead.
         shape: 0,
+        any: 0,
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
     },
@@ -2744,7 +2869,7 @@ pub static DEFAULT: &[Step] = &[
         s_slotprom,
     )
     .needs(shape::MEM),
-    cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::MEM),
+    cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::STORE),
     Step {
         name: "egraph",
         bisect: Some("egraph"),
@@ -2753,6 +2878,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: true,
         shape: 0,
+        any: 0,
         gate: Gate::OptIn("PLIRON_EGRAPH"),
         run: s_egraph,
     },
@@ -2779,7 +2905,9 @@ pub static DEFAULT: &[Step] = &[
         Gate::All(&[Gate::Flag(FlagId::Loopvec), Gate::Env("PLIRON_IFCONV2")]),
         s_ifconv2,
     )
-    .needs(shape::CONDBR),
+    // `ifconv` needs the diamond (CONDBR+JUMP — checked inside); `cparm`
+    // runs `webmerge` (BPARAM) + a brif const-sweep (CONDBR).
+    .needs_any(shape::CONDBR | shape::BPARAM),
     cstep(
         "unswitch",
         "unswitch",
@@ -2815,6 +2943,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: shape::CONDBR,
+        any: 0,
         gate: Gate::OptIn("PLIRON_CONSTBR"),
         run: s_constbr2,
     },
@@ -2824,7 +2953,9 @@ pub static DEFAULT: &[Step] = &[
         Gate::All(&[JT, Gate::Env("PLIRON_LOOPDEL")]),
         s_loopdel,
     )
-    .needs(shape::LOOPS),
+    // `fold_inc_overflow` needs only a `brif`; loop deletion needs
+    // the back edge.
+    .needs_any(shape::LOOPS | shape::CONDBR),
     cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
     // Re-time rotated loops that test the pre-increment IV so the latch
     // tests `iadd p, s` directly — drops the backedge register copy.
@@ -2860,6 +2991,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Always,
         run: s_frozen_loads,
     },
@@ -2877,6 +3009,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
         run: s_commute,
     },
@@ -2888,6 +3021,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Always,
         run: s_wide_minmax,
     },
@@ -2899,12 +3033,14 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Env("PLIRON_COLDARG"),
         run: s_coldarg,
     },
     step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse).needs(shape::MULTI),
-    cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd),
-    step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf),
+    cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd)
+        .needs_any(shape::MULTI | shape::BLOCKS2),
+    step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf).needs(shape::JUMP),
     cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
     cstep(
         "ivrefold",
@@ -2921,25 +3057,31 @@ pub static DEFAULT: &[Step] = &[
         "sameargs",
         Gate::Env("PLIRON_SAMEARG"),
         s_sameargs,
-    ),
+    )
+    // The `webmerge` loop needs a block param; the `const_sweep` tail
+    // only needs an `iconst` to fold through.
+    .needs_any(shape::BPARAM | shape::ICONST),
     // `load (select)` speculation once the compare-exchange diamonds
     // are selects (fuse/sameargs ran) — early enough that loadfwd2 can
     // forward the network's own stores into the fresh arm loads.
-    step("loadsel", "loadsel", Gate::Env("PLIRON_LDSEL"), s_loadsel).needs(shape::MEM),
+    step("loadsel", "loadsel", Gate::Env("PLIRON_LDSEL"), s_loadsel).needs(shape::LOAD),
     step(
         "loadfwd2",
         "loadfwd2",
         Gate::Flag(FlagId::Loadfwd),
         s_loadfwd2,
     )
-    .needs(shape::MEM),
+    .needs(shape::LOAD),
     step("mask01", "mask01", Gate::Env("PLIRON_MASK01"), s_mask01),
     cstep(
         "edgespec",
         "edgespec",
         Gate::Env("PLIRON_EDGESPEC"),
         s_edgespec,
-    ),
+    )
+    // Plans need a `jump`/`brif` predecessor: pure-`jump` forwarder
+    // chains resolve too, not just conditional dispatches.
+    .needs_any(shape::JUMP | shape::CONDBR | shape::BPARAM | shape::EPARAM),
     cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab).needs(shape::CONDBR),
     step(
         "coldedge",
@@ -2947,7 +3089,7 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_COLDEDGE"),
         s_coldedge,
     ),
-    cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2).needs(shape::MEM),
+    cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2).needs(shape::STORE),
     step("vecslot", "vecslot", Gate::Env("PLIRON_VECSLOT"), s_vecslot).needs(shape::MEM),
     // Late value numbering: the edge transforms and vecslot leave
     // identical insts in one block; also drives the mem-offset and
@@ -2960,10 +3102,11 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
-    step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32).needs(shape::MEM),
+    step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32).needs(shape::LOAD),
     // `icmp p, K` count latches become `icmp p+s, K+s` — the test folds
     // into the already-computed step value (one-register `add;cmp;jcc`)
     // and leaves boundcmp's post-inc shape behind.
@@ -2974,16 +3117,19 @@ pub static DEFAULT: &[Step] = &[
     // Sink `splat(const)` defs into their use blocks: a cross-region live
     // splat becomes a spill reload per loop iteration; a local one is a
     // single `movi`/`dup` at the use.
-    step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
+    step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink).needs(shape::BLOCKS2),
     // Flag-merge brif blocks (a bool merged through a param, then tested)
     // only settle after edgespec/celim — dup them onto const edges here too.
-    step("taildup2", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
+    step("taildup2", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
     // Late dispatch-block duplication + edge re-spec: collapses the
     // `select -> ireduce -> icmp -> brif` dispatch tail onto a direct brif
     // on the flag (tokenize's block388/block859 discriminant chain —
     // only pays off once jtround can repair multi-pred targets, so this
     // sits right before the looping jtround).
-    step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::CONDBR),
+    // Everything inside needs an edge: `merge_chains` a `jump` chain,
+    // the dispatch/brif work a conditional (guarded per-phase inside
+    // for the CONDBR-less case the old gate used to skip wholesale).
+    step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::MULTI),
     step(
         "jtround",
         "threaded",
@@ -2991,7 +3137,7 @@ pub static DEFAULT: &[Step] = &[
         s_jtround,
     )
     .needs(shape::CONDBR),
-    cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
+    cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
     step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
     // Fold constants any earlier pass left behind — late value folds
     // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
@@ -3010,6 +3156,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -3022,7 +3169,10 @@ pub static DEFAULT: &[Step] = &[
         "sameargs",
         Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG2")]),
         s_sameargs,
-    ),
+    )
+    // The `webmerge` loop needs a block param; the `const_sweep` tail
+    // only needs an `iconst` to fold through.
+    .needs_any(shape::BPARAM | shape::ICONST),
     // (The old `arghoist` position was a second webmerge call right
     // after sameargs2's fixpoint — webmerge now hoists same-shape edge
     // args via phase-B `P`-keys, so nothing was left for it.)
@@ -3084,7 +3234,10 @@ pub static DEFAULT: &[Step] = &[
         "sameargs",
         Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG3")]),
         s_sameargs,
-    ),
+    )
+    // The `webmerge` loop needs a block param; the `const_sweep` tail
+    // only needs an `iconst` to fold through.
+    .needs_any(shape::BPARAM | shape::ICONST),
     // Late dead-param drop: sameargs/paramsink retargeting can close a
     // param-flow cycle that was live at jtround time (tokenize's token
     // (start,end) pair — `count()` discards it, so the four-block
@@ -3097,9 +3250,11 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Env("PLIRON_DEADP"),
         run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
-    },
+    }
+    .needs(shape::BPARAM),
     // Phi merge through affine congruence: every in-edge of a param
     // carries the same `root + k` class (`proots::affine_nf` — Ascent),
     // so distinct SSA values that are transposed copies of one carrier
@@ -3111,7 +3266,7 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_WEBMERGE"),
         s_webmerge,
     )
-    .needs(shape::MULTI),
+    .needs(shape::MULTI | shape::BPARAM),
     // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
     // range unions `(x|d)-k_hi u<w` — rustc's char classification
     // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
@@ -3145,6 +3300,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -3153,12 +3309,12 @@ pub static DEFAULT: &[Step] = &[
     // hashmap's per-iteration `x` store dies only once the tail branch
     // structure resolves) — the orphaned store would otherwise reach
     // codegen as a stack write per loop iteration.
-    cstep("dse3", "dse3", Gate::Env("PLIRON_DSE3"), s_dse3).needs(shape::MEM),
+    cstep("dse3", "dse3", Gate::Env("PLIRON_DSE3"), s_dse3).needs(shape::STORE),
     // Loop-latch merges (`brif …, tail, …` where `tail` loops back) only
     // shrink under MAX_INSTS after the late folds — clone them last so the
     // loop's hot tail lands on the fallthrough edge instead of a `jmp`
     // per iteration (chars_*/tokenize dispatch).
-    step("taildup3", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
+    step("taildup3", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
     // taildup's per-edge clones leave congruent `iadd`/`isub` args on a
     // shared successor — one more merge round after the last clone step.
     step(
@@ -3167,7 +3323,7 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_WEBMERGE"),
         s_webmerge,
     )
-    .needs(shape::MULTI),
+    .needs(shape::MULTI | shape::BPARAM),
     // taildup/jtr twin-arm clones (`binary_search`'s two update paths)
     // differ only in operand values — merge into one block with `select`s,
     // turning a data-dependent branch per iteration into `cmov`s.
@@ -3193,7 +3349,9 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_EDGESINK"),
         s_edgesink,
     )
-    .needs(shape::CONDBR),
+    // The `brif` sink loop needs CONDBR; `push_to_use_blocks` only
+    // needs a second block to push into.
+    .needs_any(shape::CONDBR | shape::BLOCKS2),
     Step {
         name: "coldret",
         bisect: Some("coldret"),
@@ -3202,6 +3360,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
     },
@@ -3215,6 +3374,7 @@ pub static DEFAULT: &[Step] = &[
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
         gate: Gate::Always,
         run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
     },
