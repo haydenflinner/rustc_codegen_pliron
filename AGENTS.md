@@ -12,10 +12,9 @@ Read it before picking a task.
 
 ## Rules
 
-1. **Run `harness/gate.py` before every push** (also the `pre-push`
-   hook; ~2 min warm, ~6 min after a backend change rebuilds the wasm
-   sysroots). main stays green: a red gate is fixed before new work
-   lands. Bypass (`--no-verify`) only with the reason in the commit.
+1. **Run `harness/gate.py` before merging to main** (~5 min; ~40 s with
+   `--skip wasm` — the wasm leg rebuilds core/std for every new backend).
+   main stays green: a red gate is fixed before new work lands.
 2. **New passes and new transforms land default-off**
    (`env_is("PLIRON_X", "1")`), then flip on in a separate commit once
    the gate and the corpus are clean. Every pass keeps a
