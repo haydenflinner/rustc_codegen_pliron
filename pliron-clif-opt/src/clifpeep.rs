@@ -4429,7 +4429,9 @@ fn loadsel_pair(
     flags: cranelift_codegen::ir::MemFlags,
     offset: cranelift_codegen::ir::immediates::Offset32,
 ) -> bool {
-    if !pos.func.dfg.mem_flags[flags].notrap() {
+    // Plain `load` only: the rewrite re-emits `load ty`, which for a
+    // `uload8.i64`-style extending load would read 8 bytes, not 1.
+    if !pos.func.dfg.mem_flags[flags].notrap() || pos.func.dfg.insts[inst].opcode() != Opcode::Load {
         return false;
     }
     let a = pos.func.dfg.resolve_aliases(arg);
@@ -4462,12 +4464,18 @@ fn loadsel_pair(
             continue;
         }
         let InstructionData::Load {
-            arg: a2, flags: f2, ..
+            opcode: Opcode::Load,
+            arg: a2,
+            flags: f2,
+            offset: o2,
         } = pos.func.dfg.insts[i]
         else {
             continue;
         };
-        if !pos.func.dfg.mem_flags[f2].notrap() {
+        // Both halves are rebuilt from `inst`'s offset, so the sibling
+        // must read the same field (core's sort9/swap_if_less pair a
+        // key load at +0 with a +16 load of the same select).
+        if !pos.func.dfg.mem_flags[f2].notrap() || o2 != offset {
             continue;
         }
         let Some(d2) = pos.func.dfg.resolved_value_def(a2).inst() else {
@@ -8334,7 +8342,7 @@ mod tests {
     /// shared speculative loads.
     #[test]
     fn loadsel_speculates_complementary_pair() {
-        let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true);
+        let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true, 0, false);
         let entry = func.layout.entry_block().unwrap();
         assert!(run(&mut func, true) > 0);
         let ops: Vec<Opcode> = func
@@ -8373,7 +8381,7 @@ mod tests {
             (MemFlagsData::new().with_notrap(), false),
             (MemFlagsData::new(), true),
         ] {
-            let mut func = loadsel_func(flags, sibling);
+            let mut func = loadsel_func(flags, sibling, 0, false);
             let entry = func.layout.entry_block().unwrap();
             run(&mut func, true);
             let ops: Vec<Opcode> = func
@@ -8406,8 +8414,35 @@ mod tests {
         }
     }
 
-    /// `select c, pa, pb; *sel` ×2 (the second with swapped arms), sum.
-    fn loadsel_func(flags: MemFlagsData, sibling: bool) -> Function {
+    /// A sibling at another offset (`*sel` vs `sel->field`) or an
+    /// extending load names different bytes than the rewritten pair
+    /// would read — the pair must stay as is (miscompiled
+    /// `core::slice::sort::shared::smallsort::swap_if_less`, found by
+    /// `clif-check report --check` over the std corpus).
+    #[test]
+    fn loadsel_needs_matching_offset_and_plain_load() {
+        for (sib_off, narrow) in [(16, false), (0, true)] {
+            let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true, sib_off, narrow);
+            let entry = func.layout.entry_block().unwrap();
+            run(&mut func, true);
+            let selects_feeding_loads = func
+                .layout
+                .block_insts(entry)
+                .filter(|&i| match func.dfg.insts[i] {
+                    InstructionData::Load { arg, .. } => {
+                        func.dfg.insts[func.dfg.resolved_value_def(arg).inst().unwrap()].opcode()
+                            == Opcode::Select
+                    }
+                    _ => false,
+                })
+                .count();
+            assert_eq!(selects_feeding_loads, 2, "off={sib_off} narrow={narrow}\n{}", func.display());
+        }
+    }
+
+    /// `select c, pa, pb; *sel` ×2 (the second with swapped arms, at
+    /// `sib_off`, a `uload8` if `narrow`), sum.
+    fn loadsel_func(flags: MemFlagsData, sibling: bool, sib_off: i32, narrow: bool) -> Function {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params = vec![
             AbiParam::new(types::I64),
@@ -8427,7 +8462,11 @@ mod tests {
         let l1 = cur.ins().load(types::I64, flags.clone(), s1, 0);
         let l2 = if sibling {
             let s2 = cur.ins().select(c, pb, pa);
-            cur.ins().load(types::I64, flags, s2, 0)
+            if narrow {
+                cur.ins().uload8(types::I64, flags, s2, sib_off)
+            } else {
+                cur.ins().load(types::I64, flags, s2, sib_off)
+            }
         } else {
             cur.ins().iconst(types::I64, 0)
         };
