@@ -239,6 +239,7 @@ fn step_of(func: &Function, p: Value, arg: Value) -> Option<Step> {
 fn invariant(
     func: &Function,
     cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
     info: &LoopInfo,
     body: &FxHashSet<Block>,
     v: Value,
@@ -270,7 +271,12 @@ fn invariant(
             }
             false
         }
-        Some(b) => !body.contains(&b),
+        // Outside `body` alone is not enough: the def must dominate the
+        // header `h` — i.e. every entry edge's source, hence the guard `g`
+        // all entries get retargeted to. Nested loops hit this: a value
+        // defined in an OUTER loop's body is outside `body` but does not
+        // dominate the inner preheader.
+        Some(b) => !body.contains(&b) && dt.try_dominates(b, info.h, &func.layout),
         None => true,
     }
 }
@@ -321,6 +327,7 @@ fn diamond_on() -> bool {
 fn invariant_v(
     func: &Function,
     cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
     info: &LoopInfo,
     body: &FxHashSet<Block>,
     v: Value,
@@ -328,7 +335,7 @@ fn invariant_v(
     depth: usize,
 ) -> bool {
     let v = func.dfg.resolve_aliases(v);
-    if invariant(func, cfg, info, body, v) {
+    if invariant(func, cfg, dt, info, body, v) {
         return true;
     }
     if depth == 0 || !seen.insert(v) {
@@ -346,7 +353,7 @@ fn invariant_v(
     func.dfg
         .inst_args(i)
         .iter()
-        .all(|&a| invariant_v(func, cfg, info, body, a, seen, depth - 1))
+        .all(|&a| invariant_v(func, cfg, dt, info, body, a, seen, depth - 1))
 }
 
 /// Emit `v`'s in-body-invariant def chain at `pos` (the guard block) and
@@ -360,6 +367,7 @@ fn invariant_v(
 fn remat_guard(
     pos: &mut FuncCursor,
     cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
     body: &FxHashSet<Block>,
     info: &LoopInfo,
     gp: &[Value],
@@ -369,6 +377,7 @@ fn remat_guard(
     fn rec(
         func: &Function,
         cfg: &ControlFlowGraph,
+        dt: &DominatorTree,
         info: &LoopInfo,
         body: &FxHashSet<Block>,
         v: Value,
@@ -378,10 +387,26 @@ fn remat_guard(
     ) -> bool {
         let v = func.dfg.resolve_aliases(v);
         if iconst(func, v).is_some() {
+            // An in-body iconst must be cloned into `g` like any other
+            // inst — the old def does not dominate `g`. Outside-body
+            // consts are left for the caller's rematerialization path.
+            if def_block(func, v).is_some_and(|b| body.contains(&b)) {
+                let Some(i) = func.dfg.value_def(v).inst() else {
+                    return false;
+                };
+                if seen.insert(v) {
+                    out.push(i);
+                }
+            }
             return true;
         }
         if !def_block(func, v).is_some_and(|b| body.contains(&b)) {
-            return true; // a real invariant leaf
+            // A real invariant leaf — but only usable at `g` when it
+            // dominates `h` (outer-loop-body values in nested loops do
+            // not). `invariant` now enforces the same dominance rule, so
+            // a false here only fires for chains admission predates.
+            return def_block(func, v)
+                .is_none_or(|b| dt.try_dominates(b, info.h, &func.layout));
         }
         if depth == 0 || !seen.insert(v) {
             return false;
@@ -392,7 +417,7 @@ fn remat_guard(
             // leaf: `invariant()` gives exactly that answer for a param,
             // and a stepped one must not reach the entry-value rewrite.
             cranelift_codegen::ir::ValueDef::Param(b, _) => {
-                b == info.h && invariant(func, cfg, info, body, v)
+                b == info.h && invariant(func, cfg, dt, info, body, v)
             }
             cranelift_codegen::ir::ValueDef::Result(i, n) => {
                 if n != 0
@@ -404,7 +429,7 @@ fn remat_guard(
                 func.dfg
                     .inst_args(i)
                     .iter()
-                    .all(|&a| rec(func, cfg, info, body, a, seen, out, depth - 1))
+                    .all(|&a| rec(func, cfg, dt, info, body, a, seen, out, depth - 1))
                     && {
                         out.push(i);
                         true
@@ -419,11 +444,13 @@ fn remat_guard(
         return iconst_masked(pos, ty, k);
     }
     if !def_block(pos.func, v).is_some_and(|b| body.contains(&b)) {
+        // Outside-body leaves must dominate `h` to be usable at `g`;
+        // `invariant` enforces the same rule at admission.
         return v;
     }
     let func = &mut *pos.func;
     let mut chain = Vec::new();
-    if !rec(func, cfg, info, body, v, &mut FxHashSet::default(), &mut chain, 8) {
+    if !rec(func, cfg, dt, info, body, v, &mut FxHashSet::default(), &mut chain, 8) {
         return v;
     }
     let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
@@ -468,6 +495,7 @@ fn remat_guard(
 fn affine(
     func: &Function,
     cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
     info: &LoopInfo,
     body: &FxHashSet<Block>,
     depth: usize,
@@ -515,8 +543,8 @@ fn affine(
         } => {
             let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
             for (x, y) in [(a, b), (b, a)] {
-                if let Some(mut af) = affine(func, cfg, info, body, depth - 1, x)
-                    && invariant_v(func, cfg, info, body, y, &mut FxHashSet::default(), 8)
+                if let Some(mut af) = affine(func, cfg, dt, info, body, depth - 1, x)
+                    && invariant_v(func, cfg, dt, info, body, y, &mut FxHashSet::default(), 8)
                 {
                     // Constants sign-extend into the wide domain; a `V` term
                     // would zext `-k` into `2^64-k` and sink every guard.
@@ -536,8 +564,8 @@ fn affine(
         } => {
             let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
             // `affine - invariant`: subtract one b term.
-            if let Some(mut af) = affine(func, cfg, info, body, depth - 1, a)
-                && invariant_v(func, cfg, info, body, b, &mut FxHashSet::default(), 8)
+            if let Some(mut af) = affine(func, cfg, dt, info, body, depth - 1, a)
+                && invariant_v(func, cfg, dt, info, body, b, &mut FxHashSet::default(), 8)
             {
                 let (v, k) = match iconst(func, b) {
                     Some(k) => (Lin::K(k), -1),
@@ -549,8 +577,8 @@ fn affine(
             // `invariant - affine` (e.g. `n - 1 - i`): negate m and every
             // b term, then add the invariant. The index sequence decreases,
             // so the guard bounds the entry value instead of the last one.
-            if invariant_v(func, cfg, info, body, a, &mut FxHashSet::default(), 8)
-                && let Some(mut af) = affine(func, cfg, info, body, depth - 1, b)
+            if invariant_v(func, cfg, dt, info, body, a, &mut FxHashSet::default(), 8)
+                && let Some(mut af) = affine(func, cfg, dt, info, body, depth - 1, b)
             {
                 af.m = match af.m {
                     Lin::K(k) => Lin::K(k.checked_neg()?),
@@ -578,7 +606,7 @@ fn affine(
             for (x, y) in [(a, b), (b, a)] {
                 // counter * invariant: idx = i*y + iv0*y; the iv0*y term is
                 // a V*V product we can only express when iv0 is a constant.
-                if x == info.iv && invariant_v(func, cfg, info, body, y, &mut FxHashSet::default(), 8) {
+                if x == info.iv && invariant_v(func, cfg, dt, info, body, y, &mut FxHashSet::default(), 8) {
                     let k = info.iv0k?;
                     return Some(Aff {
                         m: Lin::V(y),
@@ -587,7 +615,7 @@ fn affine(
                 }
                 // affine * const: scale m and every b term.
                 if let Some(k) = iconst(func, y)
-                    && let Some(mut af) = affine(func, cfg, info, body, depth - 1, x)
+                    && let Some(mut af) = affine(func, cfg, dt, info, body, depth - 1, x)
                 {
                     // A runtime m stays linear only when it scales a const.
                     if let Lin::K(c) = af.m {
@@ -1276,8 +1304,8 @@ fn run_loop(
                 bargs: bargs.clone(),
                 eargs: eargs.clone(),
             };
-            if !invariant_v(func, cfg, &lo, &body, bound, &mut FxHashSet::default(), 8)
-                || matches!(istep, Step::V(sv) if !invariant_v(func, cfg, &lo, &body, sv, &mut FxHashSet::default(), 8))
+            if !invariant_v(func, cfg, dt, &lo, &body, bound, &mut FxHashSet::default(), 8)
+                || matches!(istep, Step::V(sv) if !invariant_v(func, cfg, dt, &lo, &body, sv, &mut FxHashSet::default(), 8))
             {
                 continue;
             }
@@ -1291,7 +1319,7 @@ fn run_loop(
                 };
                 let inv = match s {
                     Step::K(_) => true,
-                    Step::V(sv) => invariant_v(func, cfg, &lo, &body, sv, &mut FxHashSet::default(), 8),
+                    Step::V(sv) => invariant_v(func, cfg, dt, &lo, &body, sv, &mut FxHashSet::default(), 8),
                 };
                 if inv {
                     lo.stepped.insert(q, (j, s));
@@ -1330,7 +1358,7 @@ fn run_loop(
                     bargs: bargs.clone(),
                     eargs: eargs.clone(),
                 };
-                if invariant_v(func, cfg, &lo, &body, bound, &mut FxHashSet::default(), 8) {
+                if invariant_v(func, cfg, dt, &lo, &body, bound, &mut FxHashSet::default(), 8) {
                     found = Some(lo);
                     break;
                 }
@@ -1404,7 +1432,7 @@ fn run_loop(
                 IntCC::UnsignedGreaterThan => (false, true),
                 _ => continue,
             };
-            if !invariant_v(func, cfg, &info, &body, bb, &mut FxHashSet::default(), 8) {
+            if !invariant_v(func, cfg, dt, &info, &body, bb, &mut FxHashSet::default(), 8) {
                 if debug {
                     if pliron_cfg::tracing_on() {
                         tracing::debug!(target: "pliron::bcheck", "bcheck {name} block{}: blk{} len {bb:?} not invariant (icmp {x:?} {cc:?} {y:?})",
@@ -1457,7 +1485,7 @@ fn run_loop(
                     None => continue,
                 }
             } else {
-                match affine(func, cfg, &info, &body, MAX_AFFINE_DEPTH, a) {
+                match affine(func, cfg, dt, &info, &body, MAX_AFFINE_DEPTH, a) {
                     Some(af) => af,
                     // (x64 wt note) data-dependent but range-limited index:
                     // `cnt[a[i]]` with a u8 `a` is `hi = 255`, not affine. A
@@ -1549,14 +1577,14 @@ fn run_loop(
             for i in func.layout.block_insts(b) {
                 match func.dfg.insts[i] {
                     InstructionData::Store { args, .. } => {
-                        let ok = affine(func, cfg, &info, &body, MAX_AFFINE_DEPTH, args[1])
+                        let ok = affine(func, cfg, dt, &info, &body, MAX_AFFINE_DEPTH, args[1])
                             .is_some_and(|af| !matches!(af.m, Lin::K(0)));
                         if !ok {
                             dyn_store = true;
                         }
                     }
                     InstructionData::Load { arg, .. } => {
-                        let ok = affine(func, cfg, &info, &body, MAX_AFFINE_DEPTH, arg)
+                        let ok = affine(func, cfg, dt, &info, &body, MAX_AFFINE_DEPTH, arg)
                             .is_some_and(|af| !matches!(af.m, Lin::K(0)));
                         if !ok {
                             dyn_load = true;
@@ -1701,7 +1729,7 @@ fn run_loop(
             Some(k) => iconst_masked(pos, ity, k),
             None => {
                 let g = info.g.unwrap();
-                remat_guard(pos, cfg, body, info, gp, g, v)
+                remat_guard(pos, cfg, dt, body, info, gp, g, v)
             }
         }
     };
