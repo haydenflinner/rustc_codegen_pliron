@@ -92,7 +92,51 @@ Pinned toolchain: `rust-toolchain.toml` (`nightly-2026-10-06`, needs
   `//@ run-pass` tests from a rustc checkout (defaults: `$RUST_CHECKOUT`,
   then a `rust` dir next to this repo, else `~/work/rust`)
 
+## Landing changes: the gate
+
+- `harness/gate.py` is the merge gate: one `cargo build`, then in
+  parallel the stable crates' unit tests, every `test.sh` stanza (wasm
+  included) and `clif-check report --check` over each recorded corpus.
+  ~2 min; logs in `target/gate/`. Run it before every push; it is also
+  the git `pre-push` hook (`harness/gate.py --install-hook`; bypass
+  with `--no-verify` only with a note in the ledger). main must stay
+  green — a red gate is fixed or reverted before new work lands.
+- New passes and new transforms in existing passes land **default off**
+  (`env_is("PLIRON_X", "1")`) and flip to default-on in a separate
+  commit after the gate, the corpus and one self-host build are clean.
+- Self-host copies carry their source revision: `selfhost/setup.sh`
+  writes `.pliron-src-rev`; `PLIRON_VERSION=1 rustc ...` prints the
+  backend's (`harness/src-rev.sh`). Check it before trusting a stage2
+  result.
+- `RUSTC_ICE` points at `target/ices/` in the scripts — never leave
+  `rustc-ice-*.txt` in repo roots. `harness/disk.sh [--sweep]` reports
+  and reclaims build-dir space.
+
+## The corpus and the live loop
+
+- `harness/corpus.sh smoke|std|cargo DIR` records every function's
+  pre-pipeline CLIF + facts (`PLIRON_CORPUS`) into `target/corpus/<set>`
+  (std: ~15k functions in 30 s). Re-record after lowering / ir-opt changes;
+  pass-only edits replay the existing corpus.
+- `clif-check report target/corpus/std out.json --check` runs the whole
+  CLIF pipeline + interpreter diff on every function in parallel (~7 s
+  for std). It found a real std miscompile (`loadsel`, sort networks) on
+  its first run.
+- `harness/live/live.py` watches the pass sources, rebuilds `clif-check`
+  and replays the corpora on every save; http://localhost:8765 shows
+  new failures with repro commands, code-size movers and per-step time
+  against a saved baseline. Use it while editing any CLIF pass.
+
 ## Miscompile hunting
+
+- `harness/fnbisect.py -- <cmd>` finds the function(s) whose optimization
+  breaks a program with `PLIRON_OPT_FNS` (per-symbol selection — stable
+  across threads, CGUs, processes and rebuilds, so it works on a whole
+  `-Zbuild-std` or bootstrap build, unlike `PLIRON_OPT_BISECT`). Selected
+  functions get the per-function pliron-IR transforms and the CLIF
+  pipeline; the rest keep their unoptimized bodies (IPO rewrites still
+  apply to all). `<cmd>` must recompile (fresh `CARGO_TARGET_DIR`).
+  Then `PLIRON_OPT_BISECT`/`PLIRON_DIFFCHECK_FN` within that function.
 
 - `PLIRON_DIFFCHECK=1` runs each function's CLIF before and after the
   pipeline in `cranelift-interpreter` on random inputs (pointer params get

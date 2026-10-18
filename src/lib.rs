@@ -1341,6 +1341,11 @@ impl CodegenBackend for PlironCodegenBackend {
 
     fn init(&mut self, _sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
         tracing_init();
+        // Which source tree built this dylib (harness/src-rev.sh) — check it
+        // before trusting a self-host or bisect result.
+        if pliron_cfg::env_set("PLIRON_VERSION") {
+            eprintln!("pliron backend {}", env!("PLIRON_SRC_REV"));
+        }
         // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
         rustc_session::CodegenBackendInit {
             thin_lto_supported: false,

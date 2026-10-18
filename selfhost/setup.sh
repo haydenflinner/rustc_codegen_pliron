@@ -29,4 +29,8 @@ fi
 # when the edit is older than the last build artifact.
 rsync -rlpc --delete --exclude 'target*' --exclude rust-toolchain.toml --exclude examples --exclude .git \
     "$B/" "$WT/compiler/rustc_codegen_pliron/"
+# Provenance: the copy has no .git, so build.rs stamps the dylib from this
+# file — `PLIRON_VERSION=1 build/<host>/stage2/bin/rustc -vV` prints it.
+"$B/harness/src-rev.sh" > "$WT/compiler/rustc_codegen_pliron/.pliron-src-rev"
+echo "synced backend $(cat "$WT/compiler/rustc_codegen_pliron/.pliron-src-rev") -> $WT"
 echo "now: cd $WT && ./x build --stage 1 library && ./x build --stage 2 compiler"
