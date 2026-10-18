@@ -36,22 +36,19 @@ One database, two kinds of rows:
 - **The code, both versions.** Control-flow edges between instruction
   positions (`succ`; the rewrite only renames locals and deletes copy
   pairs, so both versions share positions), and for each version the
-  writes, with the value source each one stores (`odef`/`ndef`), and the
-  reads (`oread`/`nread`).
+  writes, with the value source each one stores (`owr`/`nwr`), and the
+  reads (`sread` for the same local in both, `rread` for a read the
+  rewrite redirected to another local).
 - **The assumptions, as the rewrite commits them.** "The copy-set stores
   the producer's value" (both versions name that value by the producer's
   position) and "the copy-get reads exactly the producer"
   (`assume_copy`).
 
-Then four rules walk both programs down the *same* path in lockstep:
-
-    flow(pos, old_local, new_local, old_src, new_src)
-
-and one rule flags a read where the two sources differ (`bad_read`).
-That product construction is exactly the path-sensitive question the
-pass approximated with sets. The assumption gets checked by the same
-reaching-definition machinery (`oflow` → `bad_assume`), so a wrong
-belief is as visible as a wrong rewrite.
+Then the rules walk both programs down the *same* path in lockstep and
+flag any read where the values differ (`bad_read`, `bad_rread`). That is
+exactly the path-sensitive question the pass approximated with sets.
+The assumption is checked by the same machinery (`cb` → `bad_assume`),
+so a wrong belief is as visible as a wrong rewrite.
 
 ## Why it's a good shape
 
@@ -80,17 +77,39 @@ belief is as visible as a wrong rewrite.
 | straight-line check off, audit on | all pass: the audit caught and reverted the bad rounds | 32 |
 | straight-line check on, audit on | all pass, no false alarms over every std body | 0 |
 
-Cost: ~7% of a full std build. The product state grows as positions ×
-(old sources × new sources), so like every other fixpoint in this repo
-it has a budget (`BUDGET` in `wpeep_audit.rs`): a round over it is left
-unaudited and counted (`PLIRON_TRACE=pliron::wasm=debug` shows them),
-never hung on. Before the budget, one `proc_macro` body for wasip1 held a
-rustc for 28+ minutes. With it, the whole wasm test leg runs in the same
-~4.5 min as without the audit; 21 of its rounds were over budget. It is
-on in `tests/wasm/run.sh` (and so in the gate) as
-`PLIRON_WASM_AUDIT=panic`. Unit tests:
-`wasm::wpeep_tests::{without_pathcheck_branch_past_copy_miscompiles,
-audit_rejects_branch_past_copy, audit_accepts_plain_copy}`.
+Cost: ~7% of a full std build, and proportional to the code around
+each rewrite rather than to the function. It is on in
+`tests/wasm/run.sh` (and so in the gate) as `PLIRON_WASM_AUDIT=panic`.
+
+## Making it cheap: only compute where the programs can differ
+
+The first version tracked, at every instruction, every pair of
+(old source, new source) a path could produce, from the function entry.
+On a 1,063,726-instruction `proc_macro` body that held a rustc for 28+
+minutes. The two programs are identical except at the rewritten
+instructions, so almost all of that work proved "they agree". The rules
+now store and compute only what a check needs:
+
+- **Disagreements only.** Agreement is the implicit default for a
+  tracked local. A `dis` row exists only on a path where the two
+  versions hold different values. Rows start at rewritten writes and end
+  at the next write both versions make identically.
+- **Demand-driven agreement.** Where only one version writes a local,
+  the outcome depends on whether the two agreed just before. That is
+  answered by a backward walk from the write (`dem` → `agree_in`) that
+  stops at the nearest identical write. Renamed reads and the
+  copy-get assumption are backward queries the same way.
+- **Block at a time.** The CFG is contracted to control instructions and
+  instructions that touch a tracked local; everything in between
+  collapses.
+- **Loop iterations.** Values are named by the instruction that produced
+  them, so one from an earlier iteration would look like a fresh one. A
+  held value becomes `STALE` when its producer runs again.
+
+Result on the same body: 136,186 graph nodes, 49,417 disagreement rows,
+**0.68 s**; the 328,801-instruction one takes 37 ms. The budget
+(`BUDGET`, on graph nodes × tracked locals) remains as a safety net and
+no longer triggers anywhere in the wasm test leg.
 
 ## Limits
 

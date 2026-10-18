@@ -354,7 +354,10 @@ t_pgo() {
     # Keyed on the backend: cargo doesn't track the dylib, so a reused
     # dir would keep core from an older backend.
     local wdir=$PWD/$out/wasm-pgo-$(cksum < target/debug/$lib | cut -d' ' -f1)
-    for d in $PWD/$out/wasm-pgo*; do [[ "$d" == "$wdir" ]] || rm -rf "$d"; done
+    mkdir -p "$wdir" && touch "$wdir"
+    # Prune only keys idle for an hour: a concurrent run may own a younger one.
+    find "$PWD/$out" -mindepth 1 -maxdepth 1 -type d -name 'wasm-pgo*' -mmin +60 \
+      ! -path "$wdir" -exec rm -rf {} + 2>/dev/null || true
     # RUSTFLAGS must be fully windows-spelled on msys: cargo's POSIX-path
     # translation mangles flag values containing ':' when any flag's path
     # is /c/-spelled. Build both off one native root.

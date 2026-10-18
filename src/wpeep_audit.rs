@@ -18,20 +18,46 @@
 //! - **the code**, both versions at once: control-flow edges (`succ`,
 //!   shared — the rewrite only renames locals and deletes copy pairs, so
 //!   both programs have the same instruction positions), and per version
-//!   the writes (`odef`/`ndef`, with the *value source* each write
-//!   stores) and reads (`oread`/`nread`);
+//!   the writes (`owr`/`nwr`, with the *value source* each write
+//!   stores) and the reads (`sread`: same local in both; `rread`: a read
+//!   the rewrite redirected to another local);
 //! - **the assumptions**, emitted by the rewrite as it commits each
 //!   candidate: "the copy-set carries the producer's value" (the source
 //!   normalization below) and "the copy-get reads exactly the producer"
 //!   (`assume_copy`).
 //!
-//! Then one rule family walks both programs down the *same* path in
-//! lockstep (`flow`: at position `j`, local `lo` in the old program last
-//! held source `o` while local `ln` in the new one held `n`) and flags
-//! any read where they disagree. That product construction is the
-//! path-sensitive check the pass approximated with sets, in four rules.
-//! Assumptions are checked by the same machinery (`oflow`), so a wrong
-//! assumption is as visible as a wrong rewrite.
+//! Then the rules walk both programs down the *same* path in lockstep and
+//! flag any read where they disagree — the path-sensitive check the pass
+//! approximated with sets. Assumptions are checked by the same machinery
+//! (`cb` → `bad_assume`), so a wrong assumption is as visible as a wrong
+//! rewrite.
+//!
+//! # Evaluation: only where the programs can differ
+//!
+//! The two programs are identical except at the rewritten instructions,
+//! so almost every (position, local) pair trivially agrees. The rules
+//! store only what can differ and only compute what a check asks for:
+//!
+//! - **Disagreements only** (`dis`). Agreement is the implicit default
+//!   for a local the rewrite touched; a `dis(pos, l, o, n)` row exists
+//!   only on paths where old `l` holds source `o` and new `l` holds `n`
+//!   with `o != n`. Rows start at rewritten writes and die at the next
+//!   write both programs make identically.
+//! - **Demand-driven agreement** (`dem` → `agree_in`). Where only one
+//!   program writes `l`, the result depends on whether the two agreed on
+//!   the way in. That is asked by a backward walk from the write that
+//!   stops at the nearest identical write — local, not whole-function.
+//! - **Renamed reads** (old reads `t`, new reads `x`) are backward
+//!   queries too (`rb`): from the read to the nearest write of either.
+//! - **Block at a time.** The CFG is contracted to nodes that matter:
+//!   control instructions and instructions touching a tracked local.
+//!   Straight-line runs that touch nothing tracked collapse away.
+//!
+//! Sources are static positions, so a value from an earlier loop
+//! iteration would look like a fresh one from the same producer. A
+//! held source becomes `STALE` when its producer runs again, and markers
+//! (`STALE`, `PREV` — "the value both agreed on before this write")
+//! never compare equal to anything.
 //!
 //! Why this shape is worth having:
 //!
@@ -50,73 +76,107 @@
 //!   body keeps the pre-round instructions), so debug builds become
 //!   "verified peephole" builds rather than just noisy ones.
 //!
-//! Cost: one fixpoint per rewrite round over the tracked locals only
-//! (`track`: pairs touched by the round). The product state can grow as
-//! positions × (old sources × new sources) per pair, so like every other
-//! fixpoint here it has a budget (`BUDGET`): a round whose bound exceeds
-//! it is left unaudited and counted, never hung on (proc_macro's bridge
-//! bodies took one rustc 28+ minutes before the budget existed).
+//! Cost: proportional to the regions around the rewrites, not to the
+//! function (the first version tracked every source pair from the entry
+//! and held a rustc 28+ minutes on a 1M-instruction proc_macro body).
+//! A budget on the contracted graph (`BUDGET`) stays as a safety net.
 //! Scope: local-variable dataflow. The operand stack isn't modelled —
 //! copy-forward deletes `get t; set x` pairs, which are stack-neutral.
 
 use super::WPeek;
 use rustc_hash::FxHashSet;
 
-/// Value source for a local's initial (param / zero) value.
-const ENTRY: u32 = u32::MAX;
+/// Marker sources (never equal to anything, including themselves).
+const STALE: u32 = u32::MAX - 1;
+const PREV: u32 = u32::MAX - 2;
 
-/// Upper bound on `flow` rows a round may produce before it is skipped:
-/// positions × Σ over tracked pairs of (old sources + 1) × (new sources + 1).
-const BUDGET: u64 = 4_000_000;
+/// Skip rounds whose contracted graph × tracked locals exceeds this.
+const BUDGET: u64 = 50_000_000;
+
+fn stale(v: u32, j: u32) -> u32 {
+    if v == j { STALE } else { v }
+}
 
 ascent::ascent! {
     struct Audit;
     relation entry(u32);
     relation succ(u32, u32);
-    /// Local pairs (old local, new local) read at a common position.
-    relation track(u32, u32);
-    /// Old/new program writes `local` at `pos` with value source `src`.
-    relation odef(u32, u32, u32);
-    relation ndef(u32, u32, u32);
-    relation okill(u32, u32);
-    relation nkill(u32, u32);
-    relation oread(u32, u32);
-    relation nread(u32, u32);
-    /// Locals whose old-program reaching sources are needed for
-    /// assumption checks.
-    relation ofocus(u32);
-    /// Assumption: at `pos` the copy-get reads `local`, whose only
-    /// reaching source is `src` (the producer).
+    /// Old / new program writes local `l` at node `j` with source `s`.
+    relation owr(u32, u32, u32);
+    relation nwr(u32, u32, u32);
+    relation o_any(u32, u32);
+    relation n_any(u32, u32);
+    /// Read of the same tracked local in both programs.
+    relation sread(u32, u32);
+    /// Read renamed by the rewrite: old reads `lo`, new reads `ln`.
+    relation rread(u32, u32, u32);
+    /// Assumption: the copy-get at `g` reads `t`, whose only reaching
+    /// write is the producer `p`.
     relation assume_copy(u32, u32, u32);
 
-    okill(p, l) <-- odef(p, l, _);
-    nkill(p, l) <-- ndef(p, l, _);
+    o_any(j, l) <-- owr(j, l, _);
+    n_any(j, l) <-- nwr(j, l, _);
 
-    /// Before `pos`, on some path: old `lo` holds `o`, new `ln` holds `n`.
-    relation flow(u32, u32, u32, u32, u32);
-    flow(e, lo, ln, ENTRY, ENTRY) <-- entry(e), track(lo, ln);
-    flow(k, lo, ln, o2, n2) <-- flow(j, lo, ln, _o, _n), succ(j, k),
-        odef(j, lo, o2), ndef(j, ln, n2);
-    flow(k, lo, ln, o2, n) <-- flow(j, lo, ln, _o, n), succ(j, k),
-        odef(j, lo, o2), !nkill(j, ln);
-    flow(k, lo, ln, o, n2) <-- flow(j, lo, ln, o, _n), succ(j, k),
-        !okill(j, lo), ndef(j, ln, n2);
-    flow(k, lo, ln, o, n) <-- flow(j, lo, ln, o, n), succ(j, k),
-        !okill(j, lo), !nkill(j, ln);
+    relation both_eq(u32, u32);
+    both_eq(j, l) <-- owr(j, l, s), nwr(j, l, s2), if s == s2;
+    relation oonly(u32, u32, u32);
+    oonly(j, l, s) <-- owr(j, l, s), !n_any(j, l);
+    relation nonly(u32, u32, u32);
+    nonly(j, l, s) <-- nwr(j, l, s), !o_any(j, l);
 
-    /// A read that sees different value sources on the same path.
-    relation bad_read(u32, u32, u32, u32, u32);
-    bad_read(u, lo, ln, o, n) <-- oread(u, lo), nread(u, ln),
-        flow(u, lo, ln, o, n), if o != n;
+    // ---- same-local disagreements (forward, only where they exist) ----
+    relation dis(u32, u32, u32, u32);
+    dis(k, l, so, sn) <-- owr(j, l, so), nwr(j, l, sn), if so != sn, succ(j, k);
+    dis(k, l, so, n2) <-- oonly(j, l, so), dis(j, l, _o, n), let n2 = stale(*n, *j),
+        if *so != n2, succ(j, k);
+    dis(k, l, o2, sn) <-- nonly(j, l, sn), dis(j, l, o, _n), let o2 = stale(*o, *j),
+        if o2 != *sn, succ(j, k);
+    dis(k, l, so, PREV) <-- oonly(j, l, so), agree_in(j, l), succ(j, k);
+    dis(k, l, PREV, sn) <-- nonly(j, l, sn), agree_in(j, l), succ(j, k);
+    dis(k, l, o2, n2) <-- dis(j, l, o, n), !o_any(j, l), !n_any(j, l), succ(j, k),
+        let o2 = stale(*o, *j), let n2 = stale(*n, *j);
 
-    /// Old-program reaching sources, for checking assumptions.
-    relation oflow(u32, u32, u32);
-    oflow(e, l, ENTRY) <-- entry(e), ofocus(l);
-    oflow(k, l, s) <-- oflow(j, l, _s0), succ(j, k), odef(j, l, s);
-    oflow(k, l, s) <-- oflow(j, l, s), succ(j, k), !okill(j, l);
+    /// A one-sided write that makes a disagreement agree again.
+    relation reconv(u32, u32);
+    reconv(j, l) <-- oonly(j, l, so), dis(j, l, _o, n), if stale(*n, *j) == *so;
+    reconv(j, l) <-- nonly(j, l, sn), dis(j, l, o, _n), if stale(*o, *j) == *sn;
 
+    // ---- demand-driven agreement before a one-sided write ----
+    relation dem(u32, u32);
+    dem(j, l) <-- oonly(j, l, _);
+    dem(j, l) <-- nonly(j, l, _);
+    dem(p, l) <-- dem(j, l), succ(p, j), !o_any(p, l), !n_any(p, l);
+    relation agree_in(u32, u32);
+    agree_in(j, l) <-- dem(j, l), entry(j);
+    agree_in(j, l) <-- dem(j, l), succ(p, j), both_eq(p, l);
+    agree_in(j, l) <-- dem(j, l), succ(p, j), reconv(p, l);
+    agree_in(j, l) <-- dem(j, l), succ(p, j), !o_any(p, l), !n_any(p, l), agree_in(p, l);
+
+    relation bad_read(u32, u32, u32, u32);
+    bad_read(u, l, o, n) <-- sread(u, l), dis(u, l, o, n);
+
+    // ---- renamed reads: backward to the nearest write of either ----
+    relation agen(u32, u32, u32);
+    agen(j, lo, ln) <-- rread(_u, lo, ln), owr(j, lo, s), nwr(j, ln, s2), if s == s2;
+    relation dgen(u32, u32, u32);
+    dgen(j, lo, ln) <-- rread(_u, lo, ln), owr(j, lo, _), !agen(j, lo, ln);
+    dgen(j, lo, ln) <-- rread(_u, lo, ln), nwr(j, ln, _), !agen(j, lo, ln);
+    relation rb(u32, u32, u32, u32);
+    rb(p, u, lo, ln) <-- rread(u, lo, ln), succ(p, u);
+    rb(q, u, lo, ln) <-- rb(p, u, lo, ln), !agen(p, lo, ln), !dgen(p, lo, ln), succ(q, p);
+    relation bad_rread(u32, u32, u32, u32);
+    bad_rread(u, lo, ln, p) <-- rb(p, u, lo, ln), dgen(p, lo, ln);
+    bad_rread(u, lo, ln, p) <-- rb(p, u, lo, ln), entry(p), !agen(p, lo, ln), !dgen(p, lo, ln);
+    bad_rread(u, lo, ln, u) <-- rread(u, lo, ln), entry(u);
+
+    // ---- assumption: the copy-get reads exactly the producer ----
+    relation cb(u32, u32, u32);
+    cb(p, g, t) <-- assume_copy(g, t, _), succ(p, g);
+    cb(q, g, t) <-- cb(p, g, t), !o_any(p, t), succ(q, p);
     relation bad_assume(u32, u32, u32);
-    bad_assume(p, l, s) <-- assume_copy(p, l, want), oflow(p, l, s), if s != want;
+    bad_assume(g, t, s) <-- cb(p, g, t), owr(p, t, s), assume_copy(g, t, want), if s != want;
+    bad_assume(g, t, PREV) <-- cb(p, g, t), entry(p), !o_any(p, t);
+    bad_assume(g, t, PREV) <-- assume_copy(g, t, _), entry(g);
 }
 
 /// Control-flow successors over instruction positions of a decoded body.
@@ -232,14 +292,10 @@ pub(super) fn audit(
     let Some(edges) = cfg(b, old) else {
         return Some(vec!["audit: could not build the CFG".into()]);
     };
-    let mut a = Audit::default();
-    a.entry.push((0,));
-    a.succ = edges.into_iter().collect();
-    // Assumption: each copy-set stores the producer's value — both
-    // programs name it by the producer's position.
+    let focus: FxHashSet<u32> = claims.iter().flat_map(|c| [c.t, c.x]).collect();
+    // The copy-set stores the producer's value: name it by the producer.
     let norm: rustc_hash::FxHashMap<usize, usize> =
         claims.iter().map(|c| (c.si, c.p1)).collect();
-    let focus: FxHashSet<u32> = claims.iter().flat_map(|c| [c.t, c.x]).collect();
     let write = |k: WPeek| match k {
         WPeek::Set(l) | WPeek::Tee(l) => Some(l),
         _ => None,
@@ -248,61 +304,82 @@ pub(super) fn audit(
         WPeek::Get(l) | WPeek::Nop(l) => Some(l),
         _ => None,
     };
-    for (i, (o, n)) in old.iter().zip(new).enumerate() {
-        let src = *norm.get(&i).unwrap_or(&i) as u32;
-        if let Some(l) = write(o.0) {
-            a.odef.push((i as u32, l, src));
+    let touches = |k: WPeek| write(k).or(read(k)).is_some_and(|l| focus.contains(&l));
+    let structural = |i: usize| {
+        matches!(old[i].0, WPeek::Ctl)
+            && matches!(b[old[i].1], 0x00 | 0x02 | 0x03 | 0x04 | 0x05 | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f)
+    };
+    let n = old.len();
+    // Contract: every position maps to the next node that matters.
+    let node = |i: usize| structural(i) || touches(old[i].0) || touches(new[i].0);
+    let mut nxt = vec![usize::MAX; n + 1];
+    for i in (0..n).rev() {
+        nxt[i] = if node(i) { i } else { nxt[i + 1] };
+    }
+    let mut a = Audit::default();
+    let mut nodes = 0u64;
+    for &(f, t) in &edges {
+        let (f, t) = (f as usize, t as usize);
+        if node(f) && nxt[t] != usize::MAX {
+            a.succ.push((f as u32, nxt[t] as u32));
         }
-        if let Some(l) = write(n.0) {
-            a.ndef.push((i as u32, l, i as u32));
+    }
+    if nxt[0] != usize::MAX {
+        a.entry.push((nxt[0] as u32,));
+    }
+    for i in (0..n).filter(|&i| node(i)) {
+        nodes += 1;
+        let (o, w) = (old[i].0, new[i].0);
+        if let Some(l) = write(o).filter(|l| focus.contains(l)) {
+            a.owr.push((i as u32, l, *norm.get(&i).unwrap_or(&i) as u32));
         }
-        if let (Some(lo), Some(ln)) = (read(o.0), read(n.0)) {
-            a.oread.push((i as u32, lo));
-            a.nread.push((i as u32, ln));
-            if focus.contains(&lo) || focus.contains(&ln) {
-                a.track.push((lo, ln));
+        if let Some(l) = write(w).filter(|l| focus.contains(l)) {
+            a.nwr.push((i as u32, l, i as u32));
+        }
+        if let (Some(lo), Some(ln)) = (read(o), read(w))
+            && (focus.contains(&lo) || focus.contains(&ln))
+        {
+            if lo == ln {
+                a.sread.push((i as u32, lo));
+            } else {
+                a.rread.push((i as u32, lo, ln));
             }
         }
     }
-    for c in claims {
-        a.ofocus.push((c.t,));
-        a.assume_copy.push((c.gi as u32, c.t, c.p1 as u32));
-    }
-    let mut srcs: rustc_hash::FxHashMap<(bool, u32), u64> = Default::default();
-    for &(_, l, _) in &a.odef {
-        *srcs.entry((false, l)).or_default() += 1;
-    }
-    for &(_, l, _) in &a.ndef {
-        *srcs.entry((true, l)).or_default() += 1;
-    }
-    let pairs: FxHashSet<(u32, u32)> = a.track.iter().copied().collect();
-    let per_pos: u64 = pairs
-        .iter()
-        .map(|&(lo, ln)| {
-            (srcs.get(&(false, lo)).copied().unwrap_or(0) + 1)
-                * (srcs.get(&(true, ln)).copied().unwrap_or(0) + 1)
-        })
-        .sum();
-    if per_pos.saturating_mul(old.len() as u64) > BUDGET {
+    if nodes.saturating_mul(focus.len() as u64 + 1) > BUDGET {
         return None;
     }
+    for c in claims {
+        a.assume_copy.push((c.gi as u32, c.t, c.p1 as u32));
+    }
+    let t0 = std::time::Instant::now();
     a.run();
+    if n > 100_000 && pliron_cfg::tracing_on() {
+        tracing::debug!(target: "pliron::wasm",
+            "wpeep audit: {n} insts, {nodes} nodes, {} dis rows, {:.1?}", a.dis.len(), t0.elapsed());
+    }
     let at = |p: u32| old.get(p as usize).map_or(0, |e| e.1);
-    let src = |s: u32| if s == ENTRY { "entry".to_string() } else { format!("@{:#x}", at(s)) };
+    let src = |s: u32| match s {
+        STALE => "a stale (earlier-iteration) value".to_string(),
+        PREV => "the value from before the rewrite".to_string(),
+        s => format!("the write @{:#x}", at(s)),
+    };
     let mut out: Vec<String> = a
         .bad_read
         .iter()
-        .map(|&(u, lo, ln, o, n)| {
-            format!(
-                "read @{:#x}: old local {lo} sees {} but new local {ln} sees {} on the same path",
-                at(u),
-                src(o),
-                src(n)
-            )
+        .map(|&(u, l, o, nn)| {
+            format!("read of local {l} @{:#x}: old program sees {}, new sees {}", at(u), src(o), src(nn))
         })
         .collect();
-    out.extend(a.bad_assume.iter().map(|&(p, l, s)| {
-        format!("assumption broken @{:#x}: copy-get of local {l} also sees {}", at(p), src(s))
+    out.extend(a.bad_rread.iter().map(|&(u, lo, ln, p)| {
+        format!(
+            "renamed read @{:#x} (old local {lo}, new local {ln}): a path from @{:#x} reaches it with the two disagreeing",
+            at(u),
+            at(p)
+        )
+    }));
+    out.extend(a.bad_assume.iter().map(|&(g, l, s)| {
+        format!("assumption broken @{:#x}: copy-get of local {l} can see {}", at(g), src(s))
     }));
     out.sort();
     out.dedup();
