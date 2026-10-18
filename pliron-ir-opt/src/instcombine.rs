@@ -22,7 +22,7 @@ use pliron::{
 use pliron_llvm::{attributes::ICmpPredicateAttr as P, op_interfaces::BinArithOp, ops::*};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::has_body;
+use crate::opt_body;
 use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
 
@@ -384,7 +384,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| opt_body(ctx, st, f))
         .collect();
     for f in funcs {
         let (c, v) = if egg {

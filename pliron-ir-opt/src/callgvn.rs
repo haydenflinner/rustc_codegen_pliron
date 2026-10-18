@@ -321,6 +321,9 @@ pub fn run(ctx: &mut Context, st: &State) {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
     for name in bodied(ctx, st) {
+        if st.opt_skip.contains(&st.funcs[&name].op) {
+            continue;
+        }
         if dbg {
             if pliron_cfg::tracing_on() {
                 tracing::debug!(target: "pliron::callgvn", "callgvn fn={name}")

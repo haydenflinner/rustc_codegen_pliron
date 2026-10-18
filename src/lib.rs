@@ -808,6 +808,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let tiro = std::time::Instant::now();
     if cx.tcx.sess.opts.optimize != OptLevel::No {
         let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+        pliron_ir_opt::opt_skip_init(ctx, st);
         let wasm = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32;
         let small = wasm
             || matches!(

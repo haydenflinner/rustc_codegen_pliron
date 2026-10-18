@@ -57,6 +57,25 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
     taken
 }
 
+/// `has_body` and selected by `PLIRON_OPT_FNS` — the filter for passes
+/// that rewrite a function's own body (never for call-site scans).
+pub fn opt_body(ctx: &Context, st: &State, f: Ptr<Operation>) -> bool {
+    has_body(ctx, f) && !st.opt_skip.contains(&f)
+}
+
+/// Fill `st.opt_skip` from `PLIRON_OPT_FNS` (no-op when unset).
+pub fn opt_skip_init(ctx: &Context, st: &mut State) {
+    if pliron_cfg::env_get("PLIRON_OPT_FNS").is_none() {
+        return;
+    }
+    st.opt_skip = st
+        .funcs
+        .iter()
+        .filter(|(n, f)| has_body(ctx, f.op) && !pliron_cfg::fn_opt_selected(n))
+        .map(|(_, f)| f.op)
+        .collect();
+}
+
 pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx)
         .unwrap()

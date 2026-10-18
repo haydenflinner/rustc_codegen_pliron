@@ -407,6 +407,10 @@ pub struct State {
     pub inbounds: ColSet<Ptr<Operation>>,
     /// Local fns with no remaining references after inlining; not lowered.
     pub dead_fns: SymSet,
+    /// Bodies `PLIRON_OPT_FNS` leaves unoptimized: the per-function
+    /// transforms skip them (`helpers::opt_body`); interprocedural
+    /// rewrites and analyses still read them.
+    pub opt_skip: rustc_hash::FxHashSet<Ptr<Operation>>,
     /// xcgu extra-copy symbols (`xcgu::copies` in lib.rs). Rustc never
     /// reports cross-CGU callers of a local-copy instance, so `dead_fns`
     /// must not strip them: a copy's only callers can be other copies

@@ -1386,7 +1386,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| crate::opt_body(ctx, st, f))
         .collect();
     for f in funcs {
         // The `Dom` survives both `forward_single_store` calls — neither
@@ -1708,7 +1708,7 @@ pub fn forward(ctx: &mut Context, st: &State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| crate::opt_body(ctx, st, f))
         .collect();
     let n: usize = funcs
         .into_iter()

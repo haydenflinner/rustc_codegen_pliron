@@ -766,6 +766,9 @@ pub fn run(ctx: &mut Context, st: &mut State) -> usize {
     let mut n = 0usize;
     for s in bodied(ctx, st) {
         let fop = st.funcs[&s].op;
+        if st.opt_skip.contains(&fop) {
+            continue;
+        }
         let f = run_fn(ctx, st, fop);
         if f > 0 {
             n += f;

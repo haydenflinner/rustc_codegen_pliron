@@ -11,7 +11,7 @@ use pliron::{
 };
 use pliron_llvm::ops::{AllocaOp, GetElementPtrOp, LoadOp, StoreOp};
 
-use crate::has_body;
+use crate::opt_body;
 use crate::sroa::const_int;
 use crate::state::{ArgExt, State};
 
@@ -152,7 +152,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .map(|f| (f.op, f.exts.params.clone()))
         .collect();
     for (f, params) in funcs {
-        if !has_body(ctx, f) {
+        if !opt_body(ctx, st, f) {
             continue;
         }
         let Some(entry) = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head() else {

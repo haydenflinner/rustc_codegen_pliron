@@ -801,8 +801,10 @@ pub fn lower_module<'a>(
                     carry_log: Vec::new(),
                     prof_hook: Some(&prof_hook),
                 };
-                pipe.seed_fact_bits();
-                crate::pipeline::run_pipeline(&mut pipe);
+                if pliron_cfg::fn_opt_selected(n) {
+                    pipe.seed_fact_bits();
+                    crate::pipeline::run_pipeline(&mut pipe);
+                }
             }
             if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
                 clctx.set_disasm(true);
@@ -1636,7 +1638,8 @@ pub fn lower_clif_wasm(
         // Debug bisection: PLIRON_PIPEFN=<substr> runs the pipeline only on
         // matching functions; PLIRON_PIPEFNX=<substr> skips matches.
         let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
-            && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
+            && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
+            && pliron_cfg::fn_opt_selected(n);
         if run_pipe {
             pipe.seed_fact_bits();
             crate::pipeline::run_pipeline(&mut pipe);

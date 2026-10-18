@@ -14,7 +14,7 @@ use pliron::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::has_body;
+use crate::opt_body;
 use crate::inline::blocks;
 use crate::state::State;
 
@@ -58,7 +58,7 @@ pub fn run(ctx: &mut Context, st: &State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| opt_body(ctx, st, f))
         .collect();
     let mut n = 0;
     for f in fns {

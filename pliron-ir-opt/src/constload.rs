@@ -14,7 +14,7 @@ use pliron::{
 use pliron_llvm::ops::{GetElementPtrOp, LoadOp};
 use rustc_hash::FxHashMap;
 
-use crate::has_body;
+use crate::opt_body;
 use crate::sroa::{gep_offset, mk_const};
 use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify, ptr32, size_align, struct_offsets};
@@ -119,7 +119,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| opt_body(ctx, st, f))
         .collect();
     let mut n = 0;
     for f in fns {

@@ -758,6 +758,9 @@ pub fn run(
     let _scan = tracing::info_span!(target: "pliron::iropt", "inline-scan").entered();
     for sym in order {
         let caller = st.funcs[&sym].op;
+        if st.opt_skip.contains(&caller) {
+            continue;
+        }
         let mut size: usize = blocks(ctx, caller)
             .iter()
             .map(|&b| b.deref(ctx).iter(ctx).count())
@@ -1024,7 +1027,7 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
     let fns: Vec<(String, _)> = st
         .funcs
         .iter()
-        .filter(|(_, f)| has_body(ctx, f.op))
+        .filter(|(_, f)| crate::opt_body(ctx, st, f.op))
         .map(|(n, f)| (n.clone(), f.op))
         .collect();
     for (fname, f) in fns {

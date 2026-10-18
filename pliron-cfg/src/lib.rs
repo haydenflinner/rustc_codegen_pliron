@@ -258,3 +258,135 @@ pub fn bisect_count() -> u64 {
 pub fn bisect_skip(n: u64) {
     BISECT_COUNT.fetch_add(n, Ordering::Relaxed);
 }
+
+/// Stable 32-bit id of a symbol for `PLIRON_OPT_FNS` ranges: the high
+/// half of its 64-bit FNV-1a hash. Unlike the `PLIRON_OPT_BISECT`
+/// counter it depends on nothing but the name, so it agrees across
+/// threads, CGUs, rustc processes and rebuilds — a whole bootstrap can
+/// be bisected by function.
+pub fn fn_hash(name: &str) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (h >> 32) as u32
+}
+
+enum FnSel {
+    /// `lo..hi` over `fn_hash` (`hi` exclusive, `u32::MAX + 1` allowed).
+    Range(u64, u64),
+    /// `~substr`: names containing it.
+    Sub(String),
+    /// `@file`: exact names, one per line (`#` comments; a leading
+    /// `<hash>\t` column, as `PLIRON_OPT_FNS_LOG` writes, is skipped).
+    Names(rustc_hash::FxHashSet<String>),
+}
+
+fn parse_num(s: &str) -> Option<u64> {
+    match s.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+fn parse_fn_sel(spec: &str) -> Option<(bool, FnSel)> {
+    let (neg, s) = match spec.strip_prefix('!') {
+        Some(r) => (true, r),
+        None => (false, spec),
+    };
+    let sel = if let Some(sub) = s.strip_prefix('~') {
+        FnSel::Sub(sub.to_string())
+    } else if let Some(path) = s.strip_prefix('@') {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("PLIRON_OPT_FNS=@{path}: {e}"));
+        FnSel::Names(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.rsplit('\t').next().unwrap_or(l).to_string())
+                .collect(),
+        )
+    } else {
+        let (lo, hi) = s.split_once("..")?;
+        FnSel::Range(parse_num(lo)?, parse_num(hi)?)
+    };
+    Some((neg, sel))
+}
+
+/// `PLIRON_OPT_FNS=<sel>`: optimize only the selected functions — the
+/// rest keep their unoptimized body through the per-function pliron-IR
+/// transforms and skip the CLIF pipeline. Interprocedural rewrites
+/// (signature changes, dead-fn sweeps) still see every function, so a
+/// mixed build stays consistent. `<sel>` is `lo..hi` over [`fn_hash`]
+/// (decimal or 0x hex, `hi` exclusive; `0..0x100000000` is everything),
+/// `~substr`, or `@file`; a leading `!` inverts. Unset selects all.
+///
+/// `PLIRON_OPT_FNS_LOG=<path>` appends `<hash>\t<name>` for every
+/// selected function — `harness/fnbisect.py` reads it to name the
+/// culprits once the range is narrow.
+pub fn fn_opt_selected(name: &str) -> bool {
+    static SEL: LazyLock<Option<(bool, FnSel)>> = LazyLock::new(|| {
+        let spec = env_get("PLIRON_OPT_FNS")?;
+        Some(
+            parse_fn_sel(spec)
+                .unwrap_or_else(|| panic!("PLIRON_OPT_FNS: bad selector `{spec}`")),
+        )
+    });
+    // Record the read so step-cache variants key on the selector.
+    if reads_open() {
+        let _ = env_get("PLIRON_OPT_FNS");
+    }
+    let Some((neg, sel)) = &*SEL else {
+        return true;
+    };
+    let h = fn_hash(name);
+    let hit = match sel {
+        FnSel::Range(lo, hi) => (*lo..*hi).contains(&(h as u64)),
+        FnSel::Sub(s) => name.contains(s.as_str()),
+        FnSel::Names(set) => set.contains(name),
+    };
+    let on = hit != *neg;
+    if on && let Some(path) = env_get("PLIRON_OPT_FNS_LOG") {
+        use std::io::Write;
+        // Every gated pass asks again; log each name once per process.
+        static LOGGED: std::sync::Mutex<Option<rustc_hash::FxHashSet<String>>> =
+            std::sync::Mutex::new(None);
+        if !LOGGED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(name.to_string())
+        {
+            return on;
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(format!("{h:08x}\t{name}\n").as_bytes());
+        }
+    }
+    on
+}
+
+#[cfg(test)]
+mod fn_sel_tests {
+    use super::*;
+
+    #[test]
+    fn hash_is_stable() {
+        // Pinned: bisect logs from older builds must stay comparable.
+        assert_eq!(fn_hash(""), 0xcbf29ce4);
+        assert_eq!(fn_hash("main"), fn_hash("main"));
+        assert_ne!(fn_hash("main"), fn_hash("mains"));
+    }
+
+    #[test]
+    fn selectors_parse() {
+        assert!(matches!(parse_fn_sel("0..0x100000000"), Some((false, FnSel::Range(0, 0x1_0000_0000)))));
+        assert!(matches!(parse_fn_sel("!~drop"), Some((true, FnSel::Sub(s))) if s == "drop"));
+        assert!(parse_fn_sel("12").is_none());
+    }
+}
