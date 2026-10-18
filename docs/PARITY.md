@@ -74,12 +74,13 @@ Next steps, in expected-payoff order:
    main-thread-serial, and each job's inner lowering spawns its own
    per-function threads — a shared pool or `PLIRON_PAR` capping would
    cut the oversubscription.
-2. **Applicability prechecks**: most steps change nothing on most
-   functions. A cheap scan that proves "this step cannot fire" (no
-   loops → skip loop passes; no select/brif shapes → skip ifconv2;
-   no vector-able ops → skip slp) before building analyses.
-   `clif-check report` + `PLIRON_STATS=1` show which steps fire where;
-   `clif-check bench` measures the win with no rustc.
+2. ~~Applicability prechecks~~ **done**: `shape_of` computes a bitmask
+   of function-shape facts (loops, brifs, params, inst kinds) in one
+   pass; `Step::needs`/`needs_any` gate heavy steps before their
+   analysis builds, and the cached bits widen by each mutating step's
+   `creates` (superset — a clear bit certifies absence; under-admission
+   is a missed opt, never a miscompile; `PLIRON_SHAPE_CHECK` catches it).
+   `clif-check bench target/corpus/std`: 35.5 s → 28.7 s (~19%).
 3. **The heavy steps**: jumpthread, ifconv2, slp, loadfwd, mergechain.
    Each is the subject of earlier rounds (see docs/performance.md); the
    remaining cost is per-function analysis rebuilds — use the shared

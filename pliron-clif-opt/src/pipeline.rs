@@ -305,6 +305,19 @@ pub mod shape {
     /// `edgespec`'s `deadbits` zeroes demandless uses of any param,
     /// entry args included.
     pub const EPARAM: u32 = 1 << 16;
+
+    /// Bits an ordinary mutating step may introduce where none existed:
+    /// edge shape (const-branch folds create `jump`s, block clones and
+    /// rewrites create edges/blocks/back-edges), block params (clone
+    /// or substitution paths), and constants (`iconst` materialization
+    /// — which can in turn make an existing `icmp` a `TESTC` case).
+    /// The inst-kind bits (`LOAD`/`STORE`/`MEM`/`CALL`/`SLOT`/`SLP`/
+    /// `DIVREM`/`SWITCH`) and `EPARAM` are absent: cloning or rewriting
+    /// can't produce an instruction kind the function never had, and the
+    /// signature is fixed. Steps that *do* materialize a new inst kind
+    /// (`slotprom`'s stack accesses, `loopidiom`/`clifpeep`'s libcalls,
+    /// vectorizers) declare `creates_all` instead.
+    pub const CREATED: u32 = MULTI | LOOPS | CONDBR | BPARAM | JUMP | TESTC | BLOCKS2 | ICONST;
 }
 
 /// Computes the `shape` bits in one pass over the function.
@@ -499,9 +512,12 @@ pub struct Analysis {
     pub(crate) pk: Option<[u8; 32]>,
     pub(crate) stepfile: Option<Vec<crate::stepcache::StepEntry>>,
     pub(crate) stepfile_dirty: bool,
-    /// `shape_of` result and the `ver` it was computed at; recomputed
-    /// lazily after any mutating step.
-    fshape: Option<(u64, u32)>,
+    /// `shape_of` result OR'd with the `creates` mask of every mutating
+    /// step run since the scan — a superset of the current bits, so a
+    /// clear bit still certifies absence while a set bit may be stale
+    /// (over-admission: harmless). Never rescanned; the whole point is
+    /// that gate checks stay O(1) after the first one.
+    fshape: Option<u32>,
     /// Alias pairs already carried onto their targets; facts are inputs
     /// and aliases are permanent, so a pair never needs carrying twice.
     carried: FxHashSet<(Value, Value)>,
@@ -557,9 +573,15 @@ impl Analysis {
     /// The pipeline advanced the IR version (a step declared `mutates`).
     /// When the cached CFG's edge fingerprint still matches — the step
     /// rewrote only values/args — cfg/dt/la stay valid and only the
-    /// value-keyed caches drop.
-    pub fn bump(&mut self, func: &Function) {
+    /// value-keyed caches drop. `creates` (the step's `Step::creates`)
+    /// is OR'd into `fshape`: the bits are a superset of the current
+    /// shape, so a bit the step could have produced stops certifying
+    /// absence from here on.
+    pub fn bump(&mut self, func: &Function, creates: u32) {
         self.ver += 1;
+        if let Some(s) = &mut self.fshape {
+            *s |= creates;
+        }
         if self.cfg.is_some() && self.cfg_fp == Some(edge_fp(func)) {
             self.clear_values();
         } else {
@@ -724,14 +746,16 @@ impl Analysis {
         self.ver
     }
 
-    /// The function's `shape` bits, computed once and held until the
-    /// next `bump()`.
+    /// The function's `shape` bits as a superset: scanned lazily once,
+    /// then widened by each mutating step's `creates` (see `bump`).
+    /// Callers must treat set bits as "may be present" — only a clear
+    /// bit certifies absence.
     pub fn shape_bits(&mut self, func: &Function) -> u32 {
         match self.fshape {
-            Some((v, s)) if v == self.ver => s,
-            _ => {
+            Some(s) => s,
+            None => {
                 let s = shape_of(func);
-                self.fshape = Some((self.ver, s));
+                self.fshape = Some(s);
                 s
             }
         }
@@ -764,6 +788,14 @@ pub struct Step {
     /// merges `jump` chains or rewrites `brif` dispatches). Skipped
     /// only when every bit is absent.
     pub any: u32,
+    /// `shape` bits this step may introduce where none existed, OR'd
+    /// into the cached superset after the step runs (`shape::CREATED`
+    /// for ordinary rewrite passes; `creates_all` for steps that
+    /// materialize a whole instruction kind — see the const's comment).
+    /// Under-declaring only over-skips later gated steps (missed
+    /// optimizations), never miscompiles — `PLIRON_SHAPE_CHECK` catches
+    /// it on the corpus.
+    pub creates: u32,
     pub gate: Gate,
     pub run: fn(&mut Pipe, &mut Analysis) -> usize,
 }
@@ -777,6 +809,12 @@ impl Step {
     /// At-least-one `shape` requirement: `step(..).needs_any(a | b)`.
     const fn needs_any(mut self, mask: u32) -> Step {
         self.any |= mask;
+        self
+    }
+    /// The step may materialize inst kinds the function never had —
+    /// every shape bit becomes possibly-present after it mutates.
+    const fn creates_all(mut self) -> Step {
+        self.creates = u32::MAX;
         self
     }
 }
@@ -796,6 +834,7 @@ const fn step(
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate,
         run,
     }
@@ -817,6 +856,7 @@ const fn cstep(
         mutates: true,
         cached: true,
         shape: 0,
+        creates: shape::CREATED,
         any: 0,
         gate,
         run,
@@ -1286,7 +1326,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         // reports 0 would leave cfg/domtree stale for the next step.
         // `bump` fingerprints the CFG: a value-only step keeps the
         // cached cfg/dt/la and drops just the value-keyed caches.
-        an.bump(&p.clctx.func);
+        an.bump(&p.clctx.func, s.creates);
         if prof_chain {
             let (m, t) = chain_stats(&p.clctx.func);
             if m >= 8 {
@@ -2807,6 +2847,7 @@ pub static DEFAULT: &[Step] = &[
         cached: true,
         shape: 0,
         any: shape::MULTI | shape::BPARAM | shape::TESTC,
+        creates: shape::CREATED,
         gate: JT,
         run: s_jumpthread,
     },
@@ -2826,6 +2867,7 @@ pub static DEFAULT: &[Step] = &[
         cached: true,
         shape: shape::LOOPS,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
         run: s_unroll,
     },
@@ -2839,6 +2881,8 @@ pub static DEFAULT: &[Step] = &[
         cached: true,
         shape: 0,
         any: 0,
+        // `memcpy`/`memset` folding emits libcalls — CALL can appear.
+        creates: u32::MAX,
         gate: Gate::Flag(FlagId::Peep),
         run: s_clifpeep,
     },
@@ -2857,6 +2901,7 @@ pub static DEFAULT: &[Step] = &[
         // and dead-store sweep are LOAD/STORE-gated inside instead.
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
     },
@@ -2868,7 +2913,8 @@ pub static DEFAULT: &[Step] = &[
         Gate::Env("PLIRON_SLOTPROM"),
         s_slotprom,
     )
-    .needs(shape::MEM),
+    .needs(shape::MEM)
+    .creates_all(),
     cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::STORE),
     Step {
         name: "egraph",
@@ -2879,10 +2925,14 @@ pub static DEFAULT: &[Step] = &[
         cached: true,
         shape: 0,
         any: 0,
+        // Rewrite-by-reconstruction can emit inst kinds the input
+        // lacked.
+        creates: u32::MAX,
         gate: Gate::OptIn("PLIRON_EGRAPH"),
         run: s_egraph,
     },
-    cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars).needs(shape::LOOPS),
+    // `prev` seed materialization emits loads.
+    cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars).needs(shape::LOOPS).creates_all(),
     step(
         "ldrot",
         "ldrot",
@@ -2890,7 +2940,7 @@ pub static DEFAULT: &[Step] = &[
         s_ldrot,
     )
     .needs(shape::LOOPS | shape::MEM),
-    cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
+    cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS).creates_all(),
     step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm).needs(shape::LOOPS),
     step(
         "loopidiom",
@@ -2898,7 +2948,9 @@ pub static DEFAULT: &[Step] = &[
         Gate::Flag(FlagId::Loopidiom),
         s_loopidiom,
     )
-    .needs(shape::LOOPS | shape::MEM),
+    .needs(shape::LOOPS | shape::MEM)
+    // `memset`/`memcpy` idiom recognition emits libcalls.
+    .creates_all(),
     cstep(
         "ifconv2",
         "ifconv2",
@@ -2927,13 +2979,13 @@ pub static DEFAULT: &[Step] = &[
         s_divconst,
     )
     .needs(shape::DIVREM),
-    cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec).needs(shape::LOOPS),
-    cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp).needs(shape::SLP),
+    cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec).needs(shape::LOOPS).creates_all(),
+    cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp).needs(shape::SLP).creates_all(),
     // bcheck's per-loop version guards sit at the inner loop's entry —
     // their len/min/carry parts are invariant in every enclosing loop
     // but the only licm already ran. matmul's guard re-evaluates
     // `min(n-1, len)` and the offset chain ~n² times; hoist it.
-    cstep("licm2", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
+    cstep("licm2", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS).creates_all(),
     step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap).needs(shape::SWITCH),
     Step {
         name: "constbr2",
@@ -2944,6 +2996,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: shape::CONDBR,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::OptIn("PLIRON_CONSTBR"),
         run: s_constbr2,
     },
@@ -2973,7 +3026,7 @@ pub static DEFAULT: &[Step] = &[
     // hoist could not move (e.g. bcheck's versioned loop header: the
     // thread-base chain is cloned K times into the unrolled group and
     // would recompute per iteration).
-    cstep("licm3", "", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
+    cstep("licm3", "", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS).creates_all(),
     // Merge identical constants across dominated blocks — unroll/clone
     // passes stamp fresh `iconst`s per copy, and each one is a `mov`
     // downstream instead of a shared register (or `wzr`).
@@ -2992,6 +3045,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Always,
         run: s_frozen_loads,
     },
@@ -3010,6 +3064,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
         run: s_commute,
     },
@@ -3022,6 +3077,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Always,
         run: s_wide_minmax,
     },
@@ -3034,6 +3090,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Env("PLIRON_COLDARG"),
         run: s_coldarg,
     },
@@ -3103,6 +3160,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -3157,6 +3215,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -3251,6 +3310,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Env("PLIRON_DEADP"),
         run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
     }
@@ -3288,7 +3348,7 @@ pub static DEFAULT: &[Step] = &[
     // `jump`-edge continuations whose param-bound loads a pred just
     // stored (or_insert's `*v += 1` reading its own `0`) get cloned onto
     // the edge so lcse4 can fold the RMW to a direct store.
-    step("memspec", "memspec", Gate::Env("PLIRON_MEMSPEC"), s_memspec).needs(shape::MEM),
+    step("memspec", "memspec", Gate::Env("PLIRON_MEMSPEC"), s_memspec).needs(shape::MEM).creates_all(),
     // sameargs3/paramsink substitute edge args into isub uses, leaving
     // `isub (iadd x, k), x` cursor deltas that only now have visible iadd
     // defs (tokenize's per-path byte lengths) — one more local fold.
@@ -3301,6 +3361,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
     },
@@ -3361,6 +3422,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
     },
@@ -3375,6 +3437,7 @@ pub static DEFAULT: &[Step] = &[
         cached: false,
         shape: 0,
         any: 0,
+        creates: shape::CREATED,
         gate: Gate::Always,
         run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
     },
