@@ -17,7 +17,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | wasm module size | 2.18 (206 KiB vs 94 KiB) | behind |
 | compile time: bench kernels, native | **0.98** (0.42 s vs 0.43 s) | at parity |
 | compile time: bench kernels, wasm | **2.56** (1.40 s vs 0.55 s) | behind |
-| compile time: regex-syntax (~40 kLOC) | **2.27** (3.5 s vs 1.5 s) | behind; was 6.57 before CGU jobs went parallel |
+| compile time: regex-syntax (~40 kLOC) | **2.26** (3.3 s vs 1.5 s) | behind; was 6.57 before CGU jobs went parallel |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
@@ -88,8 +88,16 @@ Next steps, in expected-payoff order:
 4. **xcgu copies** multiply IR-opt work per CGU (`PLIRON_XCGU=0` cut syn
    78 → 55 s) but feed the inliner. Share analyzed bodies across CGUs
    instead of re-optimizing each copy.
-5. **Glue**: dense columns instead of `FxHashMap<Ptr<Operation>, _>`
-   side tables (DoD step 4, `docs/history/dod-steps-4-5.md`).
+5. ~~Glue~~ **partly done, premise revised**: the inter-step
+   bookkeeping is now ~3% of phaseB CPU. `carry_aliases`/`compact_aliases`
+   walk `dfg.alias_writes()` (the per-write list behind `alias_epoch`)
+   instead of rescanning `values()` — step-glue −41% on regex-syntax.
+   `sample` profiling says the remaining mass is the ~80 per-fn scan
+   loops themselves (`inst_values`/`Uses::new`/`resolve_aliases` ≈ 26%
+   of leaf samples, spread across every step); `FxHashMap` side-table
+   hashing is only ~6%, so dense columns are no longer the obvious win
+   (DoD step 4, `docs/history/dod-steps-4-5.md` still applies to the
+   pliron-IR side).
 
 wasm compile time (2.56x) adds the CLIF → waffle translation, the waffle
 inliner and `wpeep` on top of the same pipeline; profile
