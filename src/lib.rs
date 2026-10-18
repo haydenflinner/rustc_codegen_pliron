@@ -1049,7 +1049,9 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         // only declares — a foreign call binds an emitted copy the merged
         // fact was computed on. Runs ahead of callgvn, which reads
         // nowrite + willreturn, and lowering, which reads all five.
-        pt!(cx, "xfacts", st.share_facts(ctx));
+        if pass_enabled("PLIRON_XFACTS") {
+            pt!(cx, "xfacts", st.share_facts(ctx));
+        }
         // Dead-call elim + readonly call dedup + loop-call hoist, on the
         // final post-inline call set.
         if pass_enabled("PLIRON_CALLGVN") {

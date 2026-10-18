@@ -76,6 +76,19 @@ pub fn opt_skip_init(ctx: &Context, st: &mut State) {
         .collect();
 }
 
+/// `f`'s symbol for `bisect_in` logs — only looked up while
+/// `PLIRON_OPT_BISECT` is set (a linear scan of `st.funcs`).
+pub fn bisect_name(st: &State, f: Ptr<Operation>) -> String {
+    if pliron_cfg::bisect_limit().is_none() {
+        return String::new();
+    }
+    st.funcs
+        .iter()
+        .find(|(_, i)| i.op == f)
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default()
+}
+
 pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx)
         .unwrap()

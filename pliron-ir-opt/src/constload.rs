@@ -154,6 +154,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             else {
                 continue;
             };
+            if !crate::bisect_in("constload", "") {
+                continue;
+            }
             let k = mk_const(ctx, st, r.get_type(ctx), cv);
             r.replace_all_uses_with(ctx, &k);
             Operation::erase(op, ctx);

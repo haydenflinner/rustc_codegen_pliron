@@ -1406,6 +1406,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         // have retried, plus the ops `split` created, which sat just
         // before their parent in the scan. Order is preserved exactly.
         let mut wl = allocas(ctx, f);
+        let bname = crate::bisect_name(st, f);
         for _round in 0..3 {
             let mut changed = false;
             let mut retry = Vec::new();
@@ -1413,7 +1414,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             for op in wl.drain(..) {
                 let a = op.deref(ctx).get_result(ctx, 0);
                 let mut cfg_dirty = false;
-                changed |= split(ctx, st, op, &mut made, &mut cfg_dirty);
+                // One PLIRON_OPT_BISECT unit per split attempt.
+                changed |= crate::bisect_in("sroa", &bname)
+                    && split(ctx, st, op, &mut made, &mut cfg_dirty);
                 dom_stale |= cfg_dirty;
                 retry.extend(made.drain(..));
                 if st.allocas.contains(a) {
@@ -1812,7 +1815,7 @@ fn forward_single_store_d(
                             dom.dominates(sb, lb)
                         })
             });
-        if !fwd {
+        if !fwd || !crate::bisect_in("sroa-fwd", "") {
             continue;
         }
         for l in loads {
