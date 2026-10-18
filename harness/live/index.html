@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pliron Live</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
+  --ok: #2f7d4f; --bad: #c0392b; --warn: #b7791f; --info: #2b6cb0; --bar: #c9d6e8; --barbase: #1d1d1b;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9a9993; --line: #34332f;
+    --ok: #5cb880; --bad: #ef6b5b; --warn: #e0a84a; --info: #6aa6e8; --bar: #33465f; --barbase: #ecebe6;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+  padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+h1 { font-size: 16px; margin: 0; font-weight: 650; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+main { padding: 16px; display: grid; gap: 16px; max-width: 1400px; margin: 0 auto; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+.pill { padding: 2px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; color: #fff; background: var(--muted); }
+.pill.idle, .pill.passed { background: var(--ok); } .pill.running, .pill.building { background: var(--info); }
+.pill.build-failed, .pill.run-failed, .pill.failed { background: var(--bad); }
+.meta { color: var(--muted); font-size: 12px; }
+button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); cursor: pointer; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+.stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 12px; }
+.d { font-size: 12px; font-variant-numeric: tabular-nums; margin-left: 4px; }
+.up-bad, .new { color: var(--bad); } .down-good { color: var(--ok); } .neutral { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: left; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--line); padding: 4px 6px; }
+td { border-bottom: 1px solid var(--line); padding: 4px 6px; vertical-align: top; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.fn { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+.msg { color: var(--muted); font-family: var(--mono); font-size: 11.5px; word-break: break-word; }
+.scroll { max-height: 420px; overflow: auto; }
+.bar { position: relative; height: 14px; background: var(--bar); border-radius: 2px; }
+.bar i { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--barbase); }
+pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; margin: 0; max-height: 360px; overflow: auto; }
+.tag { font-size: 11px; font-weight: 700; padding: 0 6px; border-radius: 4px; border: 1px solid currentColor; }
+.empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pliron live</h1>
+  <span id="state" class="pill">…</span>
+  <span id="meta" class="meta"></span>
+  <span style="flex:1"></span>
+  <span id="gate" class="meta"></span>
+  <button id="baseline" title="Make the current results the comparison point">Save baseline</button>
+</header>
+<main>
+  <section id="logpanel" class="panel" hidden><h2>Build / run output</h2><pre id="log"></pre></section>
+  <div id="corpora" class="grid"></div>
+  <div class="grid">
+    <section class="panel"><h2>Failures (verifier · panic · mismatch)</h2><div class="scroll" id="fails"></div></section>
+    <section class="panel"><h2>Biggest size changes vs baseline</h2><div class="scroll" id="movers"></div></section>
+  </div>
+  <section class="panel"><h2>Pipeline time by step (bar = now, tick = baseline)</h2><div class="scroll" id="steps"></div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = n => n >= 1e6 ? (n/1e6).toFixed(2)+"M" : n >= 1e4 ? (n/1e3).toFixed(1)+"k" : String(Math.round(n));
+// Readable path from a v0/legacy mangled corpus file name: the length-prefixed identifiers.
+function demangle(file) {
+  // Drop v0 crate disambiguators (`Cs<hash>_`) and legacy `17h<hash>E` tails.
+  const base = file.replace(/\.\d+\.clif$/, "").split("/").pop().replace(/Cs[0-9A-Za-z]*_/g, "C").replace(/17h[0-9a-f]{16}E$/, "");
+  const out = []; let i = 0;
+  while (i < base.length) {
+    const m = /^(\d+)/.exec(base.slice(i));
+    if (!m) { i++; continue; }
+    const n = +m[1], s = base.slice(i + m[1].length, i + m[1].length + n);
+    if (n > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s)) { out.push(s); i += m[1].length + n; }
+    else i += m[1].length;
+  }
+  return out.length ? out.join("::") : base;
+}
+function delta(now, base, lowerIsBetter = true, pct = false) {
+  if (base == null || now == null) return "";
+  const d = now - base;
+  if (Math.abs(d) < (pct ? base * 0.001 : 0.5)) return `<span class="d neutral">±0</span>`;
+  const good = lowerIsBetter ? d < 0 : d > 0;
+  const txt = pct ? `${d > 0 ? "+" : ""}${(100 * d / Math.max(base, 1)).toFixed(2)}%` : `${d > 0 ? "+" : ""}${fmt(d)}`;
+  return `<span class="d ${good ? "down-good" : "up-bad"}">${txt}</span>`;
+}
+const BAD = new Set(["mismatch", "verifier", "panic"]);
+let lastFinished = null, status = {};
+
+async function getJSON(u) { try { const r = await fetch(u, {cache: "no-store"}); return r.ok ? r.json() : null; } catch { return null; } }
+
+async function loadReports() {
+  const names = status.corpora || [];
+  const reps = await Promise.all(names.map(async c => [c, await getJSON(`/data/${c}.json`), await getJSON(`/data/baseline/${c}.json`)]));
+  renderCorpora(reps); renderFails(reps); renderMovers(reps); renderSteps(reps);
+}
+
+function sum(rep, k) { return rep ? rep.functions.reduce((a, f) => a + (f[k] || 0), 0) : null; }
+
+function renderCorpora(reps) {
+  $("corpora").innerHTML = reps.map(([c, r, b]) => {
+    if (!r) return `<section class="panel"><h2>${esc(c)}</h2><p class="empty">no report yet</p></section>`;
+    const cnt = k => r.counts[k] || 0, bc = k => b ? (b.counts[k] || 0) : null;
+    const bad = ["mismatch","verifier","panic"].reduce((a,k)=>a+cnt(k),0);
+    const bbad = b ? ["mismatch","verifier","panic"].reduce((a,k)=>a+bc(k),0) : null;
+    return `<section class="panel"><h2>${esc(c)} · ${fmt(r.functions.length)} fns</h2><div class="stats">
+      <div class="stat"><b class="${bad ? "new" : ""}">${bad}</b><span>failures${delta(bad, bbad)}</span></div>
+      <div class="stat"><b>${fmt(cnt("ok"))}</b><span>${r.checked ? "checked equal" : "ok (unchecked)"}</span></div>
+      <div class="stat"><b>${fmt(cnt("inconclusive"))}</b><span>inconclusive</span></div>
+      <div class="stat"><b>${fmt(sum(r,"insts_after"))}</b><span>insts after${delta(sum(r,"insts_after"), sum(b,"insts_after"), true, true)}</span></div>
+      <div class="stat"><b>${(r.wall_ms/1000).toFixed(1)}s</b><span>wall${delta(r.wall_ms, b?.wall_ms, true, true)}</span></div>
+    </div></section>`;
+  }).join("") || `<section class="panel empty">No corpora. Record one: <code>harness/corpus.sh smoke</code></section>`;
+}
+
+function renderFails(reps) {
+  const rows = [];
+  for (const [c, r, b] of reps) {
+    if (!r) continue;
+    const before = new Map((b?.functions || []).map(f => [f.file, f.status]));
+    for (const f of r.functions) if (BAD.has(f.status)) rows.push({c, f, isNew: !BAD.has(before.get(f.file))});
+  }
+  rows.sort((x, y) => y.isNew - x.isNew);
+  $("fails").innerHTML = rows.length ? `<table><tr><th></th><th>function</th><th>status</th></tr>${rows.map(({c, f, isNew}) =>
+    `<tr><td>${isNew ? `<span class="tag new">NEW</span>` : ""}</td>
+     <td><div class="fn" title="${esc(f.file)}">${esc(demangle(f.file))}</div>
+     <div class="msg">${esc(f.msg.slice(0, 300))}</div>
+     <button data-copy="target/debug/clif-check pipeline target/corpus/${esc(c)}/${esc(f.file)}">copy repro</button></td>
+     <td>${esc(f.status)}</td></tr>`).join("")}</table>` : `<p class="empty">None.</p>`;
+}
+
+function renderMovers(reps) {
+  const rows = [];
+  for (const [c, r, b] of reps) {
+    if (!r || !b) continue;
+    const base = new Map(b.functions.map(f => [f.file, f]));
+    for (const f of r.functions) {
+      const g = base.get(f.file);
+      if (g && !BAD.has(f.status) && !BAD.has(g.status) && f.insts_after !== g.insts_after)
+        rows.push({c, f, d: f.insts_after - g.insts_after, was: g.insts_after});
+    }
+  }
+  rows.sort((x, y) => Math.abs(y.d) - Math.abs(x.d));
+  const grow = rows.filter(r => r.d > 0).length, shrink = rows.length - grow;
+  $("movers").innerHTML = rows.length ? `<p class="meta">${shrink} smaller · ${grow} larger</p><table>
+    <tr><th>function</th><th class="num">was</th><th class="num">now</th></tr>${rows.slice(0, 60).map(({f, d, was}) =>
+    `<tr><td class="fn" title="${esc(f.file)}">${esc(demangle(f.file))}</td><td class="num">${was}</td>
+     <td class="num">${f.insts_after}${delta(f.insts_after, was)}</td></tr>`).join("")}</table>`
+    : `<p class="empty">No instruction-count changes against the baseline.</p>`;
+}
+
+function renderSteps(reps) {
+  const now = new Map(), base = new Map();
+  for (const [, r, b] of reps) {
+    for (const s of r?.steps || []) now.set(s.step, (now.get(s.step) || 0) + s.ms);
+    for (const s of b?.steps || []) base.set(s.step, (base.get(s.step) || 0) + s.ms);
+  }
+  const rows = [...now].sort((a, b) => b[1] - a[1]).slice(0, 30);
+  const max = Math.max(1, ...rows.map(r => Math.max(r[1], base.get(r[0]) || 0)));
+  $("steps").innerHTML = rows.length ? `<table><tr><th>step</th><th style="width:55%"></th><th class="num">cpu ms</th></tr>${rows.map(([s, ms]) => {
+    const b = base.get(s);
+    return `<tr><td class="fn">${esc(s)}</td><td><div class="bar" style="width:${100*ms/max}%">${b != null ? `<i style="left:${100*b/Math.max(ms,1e-9)}%"></i>` : ""}</div></td>
+      <td class="num">${fmt(ms)}${delta(ms, b, true, true)}</td></tr>`;}).join("")}</table>` : `<p class="empty">No timings yet.</p>`;
+}
+
+async function poll() {
+  const s = await getJSON("/data/status.json");
+  if (s) {
+    status = s;
+    $("state").className = "pill " + s.state; $("state").textContent = s.state;
+    const ago = s.finished ? Math.round(Date.now() / 1000 - s.finished) : null;
+    $("meta").textContent = [`run ${s.runs}`, s.build_s != null && `build ${s.build_s}s`, s.run_s != null && `replay ${s.run_s}s`,
+      ago != null && `${ago}s ago`, s.changed?.length && `changed: ${s.changed.slice(0, 3).join(", ")}${s.changed.length > 3 ? "…" : ""}`].filter(Boolean).join(" · ");
+    $("logpanel").hidden = !s.log; $("log").textContent = s.log || "";
+    if (s.finished !== lastFinished) { lastFinished = s.finished; loadReports(); }
+  }
+  const g = await getJSON("/gate/summary.json");
+  if (g) {
+    const failed = (g.jobs || []).filter(j => !j.ok).map(j => j.job);
+    $("gate").innerHTML = `gate <span class="pill ${g.state}">${esc(g.state)}</span> ${esc(g.rev)}${failed.length ? " · failed: " + esc(failed.join(", ")) : ""}`;
+  }
+}
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-copy]");
+  if (t) { navigator.clipboard?.writeText(t.dataset.copy); t.textContent = "copied"; setTimeout(() => t.textContent = "copy repro", 1200); }
+});
+$("baseline").onclick = async () => { await fetch("/baseline", {method: "POST"}); loadReports(); };
+poll(); setInterval(poll, 1000);
+</script>
+</body>
+</html>

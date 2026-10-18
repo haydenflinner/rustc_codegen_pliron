@@ -1215,6 +1215,7 @@ dependencies = [
  "cranelift-reader",
  "pliron-clif-opt",
  "rustc-hash",
+ "serde_json",
  "target-lexicon",
 ]
 
