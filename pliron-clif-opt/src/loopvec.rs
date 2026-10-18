@@ -822,6 +822,16 @@ fn early_cond(func: &Function, info: &Info, e: Edge) -> Option<(Value, bool)> {
     Some((c, e.slot == 0))
 }
 
+/// Can `v` be splat-emitted at `elem` lanes? `emit_val` adjusts int
+/// scalars to lane width (reduce/extend — sound for mask operands and
+/// trunc-commuting ops), but nothing crosses the int/float divide:
+/// an `i64` scalar in an `f64` loop would emit `icmp.f64x2` — or, for
+/// data operands, silently truncate the value.
+fn splat_lane_ok(func: &Function, v: Value, elem: Type) -> bool {
+    let t = func.dfg.value_type(v);
+    t == elem || (t.is_int() && elem.is_int())
+}
+
 /// `v` is a splattable loop-invariant operand: defined outside the loop, an
 /// `Inv` param (its entry value), or a constant.
 fn is_splat(
@@ -1856,9 +1866,10 @@ fn plan(
     }
     // IV-as-stream loops: lane k of the iv is `iv + k*step`, emitted per
     // group as a base splat plus an iota `vconst` (`apply` pre-seeds each
-    // group's `vmap` with it).
+    // group's `vmap` with it). The iota is `p.vt`-typed, so a non-`elem`
+    // iv (an i64 index in an `f32` loop) would mistype it.
     let iv_stream = mems.is_empty();
-    if iv_stream {
+    if iv_stream && func.dfg.value_type(cnt.iv) == elem {
         can_vec.insert(cnt.iv);
     }
     loop {
@@ -1885,7 +1896,9 @@ fn plan(
                 } => {
                     let x = func.dfg.resolve_aliases(args[0]);
                     let s = func.dfg.resolve_aliases(args[1]);
-                    (can_vec.contains(&x) || is_splat(func, &info, &kinds, &mut splat_cache, x))
+                    (can_vec.contains(&x)
+                        || (is_splat(func, &info, &kinds, &mut splat_cache, x)
+                            && splat_lane_ok(func, x, elem)))
                         && is_splat(func, &info, &kinds, &mut splat_cache, s)
                 }
                 // Mask-valued bitwise ops stay masks (e.g. the `bor` chain
@@ -1903,17 +1916,23 @@ fn plan(
                 }
                 InstructionData::Binary { args, .. } => args.iter().all(|&a| {
                     let a = func.dfg.resolve_aliases(a);
-                    can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                    can_vec.contains(&a)
+                        || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                            && splat_lane_ok(func, a, elem))
                 }),
                 InstructionData::Unary { arg, .. } => {
                     let a = func.dfg.resolve_aliases(*arg);
-                    can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                    can_vec.contains(&a)
+                        || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                            && splat_lane_ok(func, a, elem))
                 }
                 InstructionData::IntCompare { args, .. }
                 | InstructionData::FloatCompare { args, .. } => {
                     let ok = args.iter().all(|&a| {
                         let a = func.dfg.resolve_aliases(a);
-                        can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                        can_vec.contains(&a)
+                            || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                                && splat_lane_ok(func, a, elem))
                     });
                     if ok {
                         masks.insert(rv);
@@ -1930,12 +1949,15 @@ fn plan(
                         && args[1..].iter().all(|&a| {
                             let a = func.dfg.resolve_aliases(a);
                             can_vec.contains(&a)
-                                || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                                || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                                    && splat_lane_ok(func, a, elem))
                         })
                 }
                 InstructionData::Ternary { args, .. } => args.iter().all(|&a| {
                     let a = func.dfg.resolve_aliases(a);
-                    can_vec.contains(&a) || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                    can_vec.contains(&a)
+                        || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                            && splat_lane_ok(func, a, elem))
                 }),
                 _ => false,
             };
@@ -1987,7 +2009,8 @@ fn plan(
                                 let a = func.dfg.resolve_aliases(a);
                                 ib(a)
                                     || can_vec.contains(&a)
-                                    || is_splat(func, &info, &kinds, &mut splat_cache, a)
+                                    || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                                        && splat_lane_ok(func, a, elem))
                             }))
                 }
                 InstructionData::Ternary {
@@ -2105,7 +2128,10 @@ fn plan(
             unreachable!()
         };
         let v = func.dfg.resolve_aliases(args[0]);
-        if !can_vec.contains(&v) && !is_splat(func, &info, &kinds, &mut splat_cache, v) {
+        if !can_vec.contains(&v)
+            && !(is_splat(func, &info, &kinds, &mut splat_cache, v)
+                && func.dfg.value_type(func.dfg.resolve_aliases(v)) == elem)
+        {
             why!(fname; "store value {}", func.dfg.display_inst(s));
         }
     }
@@ -2908,10 +2934,14 @@ fn emit_mask(
     let Some(t0) = terms.next() else {
         unreachable!("Cond without terms");
     };
+    // `needs_ne` compares the emitted term against zero — its type follows
+    // the term's emitted mask vector, which is not necessarily `p.vt`
+    // (non-`elem` lanes still need `iconst` on an int lane type).
     let mut m = emit_val(pos, p, vmap, splats, smemo, addrs, t0.c, 0);
     if t0.needs_ne {
-        let z = pos.ins().iconst(p.elem, 0);
-        let z = pos.ins().splat(p.vt, z);
+        let mt = pos.func.dfg.value_type(m);
+        let z = pos.ins().iconst(mt.lane_type(), 0);
+        let z = pos.ins().splat(mt, z);
         m = pos.ins().icmp(IntCC::NotEqual, m, z);
     }
     if t0.invert {
@@ -2920,8 +2950,9 @@ fn emit_mask(
     for t in terms {
         let mut m2 = emit_val(pos, p, vmap, splats, smemo, addrs, t.c, 0);
         if t.needs_ne {
-            let z = pos.ins().iconst(p.elem, 0);
-            let z = pos.ins().splat(p.vt, z);
+            let mt = pos.func.dfg.value_type(m2);
+            let z = pos.ins().iconst(mt.lane_type(), 0);
+            let z = pos.ins().splat(mt, z);
             m2 = pos.ins().icmp(IntCC::NotEqual, m2, z);
         }
         if t.invert {
@@ -3076,8 +3107,12 @@ fn widen_delta(
             } else {
                 (a, sa, b, sb)
             };
-            if (!can_vec.contains(&a) && !is_splat(func, info, kinds, splat_cache, a))
-                || (!can_vec.contains(&b) && !is_splat(func, info, kinds, splat_cache, b))
+            if (!can_vec.contains(&a)
+                && !(is_splat(func, info, kinds, splat_cache, a)
+                    && splat_lane_ok(func, a, elem)))
+                || (!can_vec.contains(&b)
+                    && !(is_splat(func, info, kinds, splat_cache, b)
+                        && splat_lane_ok(func, b, elem)))
             {
                 return false;
             }
@@ -3377,8 +3412,9 @@ fn cond_data(
     if is_splat(func, info, kinds, splat_cache, v) {
         // Emit remats `iconst`s at lane width and truncates wider values;
         // a narrower invariant would need a signedness-aware extend — reject.
-        let w = func.dfg.value_type(v).bits();
-        return w >= elem.bits() || is_const(func, v);
+        // Float scalars can't splat into int lanes at all (and vice versa).
+        let t = func.dfg.value_type(v);
+        return splat_lane_ok(func, v, elem) && (t.bits() >= elem.bits() || is_const(func, v));
     }
     let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
         return false;
@@ -3685,7 +3721,10 @@ fn cond_term(
                     ok = false;
                 } else if bools.contains(&a) {
                     todo.push(a);
-                } else if !can_vec.contains(&a) && !is_splat(func, info, kinds, splat_cache, a) {
+                } else if !can_vec.contains(&a)
+                    && !(is_splat(func, info, kinds, splat_cache, a)
+                        && splat_lane_ok(func, a, elem))
+                {
                     // emit_val must produce every non-bool operand too:
                     // lane-replicated or splatted. An unemittable in-body
                     // value would miscompile as a uniform splat (or ICE on
