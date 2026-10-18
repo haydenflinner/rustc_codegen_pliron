@@ -508,6 +508,45 @@ enum WPeek {
 /// function index and per type index so calls can take part in
 /// stack-effect tracking.
 fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u8>> {
+    peep_body_opts(b, fsig, tsig, &PeepOpts::from_env())
+}
+
+#[path = "wpeep_audit.rs"]
+mod wpeep_audit;
+
+/// `wpeep` switches. `from_env`: `PLIRON_WASM_AUDIT=1` audits every
+/// copy-forward round with the Datalog checker in `wpeep_audit` and
+/// reverts rounds that fail it (`=panic` panics instead);
+/// `PLIRON_WASM_PEEP_PATHCHECK=0` drops the straight-line requirement
+/// (dab149b) — only for demonstrating that the audit catches that class.
+struct PeepOpts {
+    audit: bool,
+    audit_panic: bool,
+    pathcheck: bool,
+    violations: std::cell::Cell<u32>,
+    /// Rounds over the audit's budget, left unaudited.
+    skipped: std::cell::Cell<u32>,
+}
+
+impl PeepOpts {
+    fn from_env() -> Self {
+        let a = crate::env_get("PLIRON_WASM_AUDIT");
+        PeepOpts {
+            audit: a.is_some_and(|v| v != "0"),
+            audit_panic: a == Some("panic"),
+            pathcheck: crate::pass_enabled("PLIRON_WASM_PEEP_PATHCHECK"),
+            violations: std::cell::Cell::new(0),
+            skipped: std::cell::Cell::new(0),
+        }
+    }
+}
+
+fn peep_body_opts(
+    b: &[u8],
+    fsig: &[(u32, u32)],
+    tsig: &[(u32, u32)],
+    opts: &PeepOpts,
+) -> Option<Vec<u8>> {
     // Locals prefix: vec of (count, valtype). waffle emits one group per
     // local; re-emit adjacent same-type runs as a single group. This is
     // index-preserving (merge only, never reorder), so it needs no other
@@ -1125,10 +1164,11 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             // (A `br` out of an `if` arm between them kept a frame-slot
             // address in x on the exit path; the retarget overwrote it
             // with a finish_grow result — wasm std `words` miscompile.)
-            if ctx[ins[p1].3] != ctx[ins[si].3]
+            if opts.pathcheck
+                && (ctx[ins[p1].3] != ctx[ins[si].3]
                 || (p1..si).any(|i| {
                     matches!(ins[i].0, WPeek::Ctl) && matches!(b[ins[i].1], 0x0c | 0x0d | 0x0e | 0x0f)
-                })
+                }))
             {
                 continue;
             }
@@ -1453,6 +1493,10 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             }
             (live, acts)
         };
+        // Audit mode: snapshot the round's input; the rewrite below
+        // states what it assumed as `Claim`s, checked after it applies.
+        let before = opts.audit.then(|| ins.clone());
+        let mut claims: Vec<wpeep_audit::Claim> = Vec::new();
         let mut changed = false;
         for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
             if !live[ci] {
@@ -1468,6 +1512,9 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             }
             ins[gi].0 = WPeek::Del;
             ins[si].0 = WPeek::Del;
+            if before.is_some() {
+                claims.push(wpeep_audit::Claim { p1, gi, si, t, x });
+            }
             // A retargeted Nop stays a marker (still a no-op self-copy,
             // now on the other local); a real get becomes a real get.
             for &u in &tre {
@@ -1490,6 +1537,29 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
                 };
             }
             changed = true;
+        }
+        if changed && let Some(old) = before {
+            let v = wpeep_audit::audit(b, &old, &ins, &claims);
+            if v.is_none() {
+                // Over budget: the round stands as the pass decided.
+                opts.skipped.set(opts.skipped.get() + 1);
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::wasm", "wpeep audit: round over budget ({} insts), not audited", old.len());
+                }
+            }
+            if let Some(v) = v
+                && !v.is_empty()
+            {
+                opts.violations.set(opts.violations.get() + v.len() as u32);
+                let msg = format!("wpeep audit: copy-forward round rejected\n  {}", v.join("\n  "));
+                if opts.audit_panic {
+                    panic!("{msg}");
+                }
+                eprintln!("{msg}");
+                // Guard: drop the whole round; earlier rounds stand.
+                ins = old;
+                break;
+            }
         }
         if !changed {
             break;
@@ -2156,9 +2226,8 @@ mod wpeep_tests {
     //     end
     //   end
     //   get 2; drop
-    #[test]
-    fn branch_past_copy_blocks_producer_retarget() {
-        let b = body(
+    fn branch_past_copy_body() -> Vec<u8> {
+        body(
             8,
             &[
                 0x41, 0x63, 0x21, 0x02, // i32.const 99; set 2
@@ -2173,11 +2242,60 @@ mod wpeep_tests {
                 0x0b, // end
                 0x20, 0x02, 0x1a, // get 2; drop
             ],
-        );
+        )
+    }
+
+    fn opts(audit: bool, pathcheck: bool) -> PeepOpts {
+        PeepOpts {
+            audit,
+            audit_panic: false,
+            pathcheck,
+            violations: std::cell::Cell::new(0),
+            skipped: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn branch_past_copy_blocks_producer_retarget() {
+        let b = branch_past_copy_body();
         let out = peep_body(&b, &[], &[]).unwrap();
         assert!(has_seq(&out, &[0x20, 0x07, 0x21, 0x02]), "copy gone: {out:02x?}");
         assert!(!has_seq(&out, &[0x41, 0x07, 0x21, 0x02]), "miscompile: {out:02x?}");
         assert!(!has_seq(&out, &[0x41, 0x07, 0x22, 0x02]), "miscompile: {out:02x?}");
+    }
+
+    // The audit catches the dab149b class on its own: with the
+    // straight-line requirement off, the pass's set-based check accepts
+    // the retarget (first test: it really does miscompile), and the
+    // Datalog audit rejects the round (second: the read after the block
+    // sees `i32.const 99` in the old program and the producer in the new
+    // one on the `br` path) and reverts it.
+    #[test]
+    fn without_pathcheck_branch_past_copy_miscompiles() {
+        let out = peep_body_opts(&branch_past_copy_body(), &[], &[], &opts(false, false)).unwrap();
+        assert!(
+            has_seq(&out, &[0x41, 0x07, 0x21, 0x02]) || has_seq(&out, &[0x41, 0x07, 0x22, 0x02]),
+            "expected the unguarded retarget: {out:02x?}"
+        );
+    }
+
+    #[test]
+    fn audit_rejects_branch_past_copy() {
+        let o = opts(true, false);
+        let out = peep_body_opts(&branch_past_copy_body(), &[], &[], &o).unwrap();
+        assert!(o.violations.get() > 0, "audit missed it: {out:02x?}");
+        assert!(has_seq(&out, &[0x20, 0x07, 0x21, 0x02]), "copy gone: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x07, 0x21, 0x02]), "miscompile survived: {out:02x?}");
+    }
+
+    // No false alarm on a sound forward: the rewrite still fires.
+    #[test]
+    fn audit_accepts_plain_copy() {
+        let b = body(8, &[0x41, 0x07, 0x22, 0x05, 0x20, 0x05, 0x21, 0x04, 0x20, 0x04, 0x1a]);
+        let o = opts(true, true);
+        let out = peep_body_opts(&b, &[], &[], &o).unwrap();
+        assert_eq!(o.violations.get(), 0);
+        assert!(has_seq(&out, &[0x22, 0x04]), "no forward: {out:02x?}");
     }
 
     // Same shape without the interfering self-copy: forwarding must still

@@ -12,6 +12,9 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll ;;
   *)                    lib=librustc_codegen_pliron.so ;;
 esac
+# Every wpeep copy-forward round is checked by the Datalog audit
+# (src/wpeep_audit.rs, ~7% build time); a rejected round fails the run.
+export PLIRON_WASM_AUDIT=${PLIRON_WASM_AUDIT:-panic}
 export RUSTFLAGS="-Zcodegen-backend=${BACKEND:-$ROOT/target/debug/$lib} -Clinker=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe"
 # cargo doesn't track the backend dylib, so key the sysroot dir on its
 # content: same backend -> core/std reuse (seconds), new backend -> fresh

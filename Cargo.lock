@@ -1433,6 +1433,7 @@ dependencies = [
 name = "rustc_codegen_pliron"
 version = "0.1.0"
 dependencies = [
+ "ascent",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",

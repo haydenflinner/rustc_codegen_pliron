@@ -47,7 +47,7 @@ Read it before picking a task.
 | `harness/` | gate, corpus, live dashboard, bisectors, compile-time and disk tools |
 | `bench/` | runtime kernels (criterion native, `bench/wasm/` node) |
 | `tests/` | `test.sh` programs (one dir per stanza) |
-| `docs/` | `PARITY.md` (start here), `performance.md` (narrative history of the perf work), `test-harness.md`, `phi-web.md`, `pgo.md`, `rustc-thorns.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `history/` |
+| `docs/` | `PARITY.md` (start here), `audit.md` (Datalog rewrite audits), `performance.md` (narrative history of the perf work), `test-harness.md`, `phi-web.md`, `pgo.md`, `rustc-thorns.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `history/` |
 
 `black_box` is a real optimization barrier: a call to a never-defined
 `__pliron_bb*` symbol (opaque to every IR pass) that `lower.rs` turns
@@ -138,6 +138,10 @@ time) in ~15 min and writes `target/parity/summary.md`.
   `PLIRON_WASM_PEEP_LIMIT=N` peepholes only the first N bodies — bisect
   it), `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies,
   `PLIRON_WASM_STUBLOG=<file>` lists functions that fell back to stubs.
+- **Audits**: `PLIRON_WASM_AUDIT=1|panic` checks every wpeep
+  copy-forward round with a Datalog translation validator (the code and
+  the rewrite's assumptions as one fact stream; `docs/audit.md`) and
+  reverts rounds that fail. On in `tests/wasm/run.sh` (so in the gate).
 - `harness/run.py --tier 0|1` — smoke/determinism/UI suites diffed
   against stock rustc, ratcheted in `harness/expectations/`
   (`docs/test-harness.md`). `selfhost/verify.sh` runs rustc's own UI
