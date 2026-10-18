@@ -6,7 +6,7 @@ is the current scoreboard and the ranked work list. Update it when a
 number moves (`harness/parity.py` regenerates the tables).
 
 **Last measured:** 2026-10-18, aarch64-apple-darwin (Apple Silicon),
-backend `40d729d` (+ uncommitted bcheck/loopvec edits), toolchain
+backend `40d729d` + parallel-CGU jobs (`src/cgupool.rs`), toolchain
 nightly-2026-10-06. `harness/parity.py`, nothing else running.
 Ratio = pliron / LLVM: **below 1 means pliron is better.**
 
@@ -15,9 +15,9 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
 | wasm runtime (geomean, 16 kernels) | **1.045** | behind; 7 kernels behind by >5% |
 | wasm module size | 2.18 (206 KiB vs 94 KiB) | behind |
-| compile time: bench kernels, native | **1.94** (0.85 s vs 0.44 s) | behind |
-| compile time: bench kernels, wasm | **3.35** (1.82 s vs 0.54 s) | far behind |
-| compile time: regex-syntax (~40 kLOC) | **6.57** (10.3 s vs 1.6 s) | far behind — the biggest gap |
+| compile time: bench kernels, native | **0.98** (0.42 s vs 0.43 s) | at parity |
+| compile time: bench kernels, wasm | **2.56** (1.40 s vs 0.55 s) | behind |
+| compile time: regex-syntax (~40 kLOC) | **2.27** (3.5 s vs 1.5 s) | behind; was 6.57 before CGU jobs went parallel |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
@@ -46,7 +46,7 @@ regex-syntax, one `rustc -O` (release dylib), 11.6 s wall:
 |---|---|---|
 | rustc frontend (shared with LLVM) | < 1 s | |
 | our codegen (`codegen_crate`) | 10.9 s | LLVM's *entire* compile is 1.56 s |
-| ├ IR-opt (`*iropt*`) | 5.1 s | **serial**: CGUs run one after another |
+| ├ IR-opt (`*iropt*`) | 5.1 s | was serial; now parallel across CGU jobs |
 | ├ lowering phases A/B (`*phaseA*`, `*phaseB*`) | 5.5 s | |
 | └ CLIF pipeline (`*pipeline*`) | ~43 CPU-s | parallel across lowering threads; 3,485 fns × every step |
 | top CLIF steps (CPU) | jumpthread 2.3 s, ifconv2 1.3 s, slp 1.0 s, loadfwd 0.8 s, mergechain 0.8 s, dse 0.6 s, edgespec 0.6 s | |
@@ -58,10 +58,22 @@ side-table hashing, lowering — not Cranelift. syn was 32x; flags alone
 (`-Zthreads=8`, fewer CGUs) took it 102 s → 24 s.
 
 Next steps, in expected-payoff order:
-1. **Run CGUs' IR-opt in parallel.** It is serial today (half of
-   codegen wall on regex-syntax). `Context` is `Send`; the blocker is
-   per-CGU state shared through globals (`GLOBAL_FACTS` for xfacts,
-   bisect counters). Expected: near-linear on the IR-opt half.
+1. ~~Run CGUs' IR-opt in parallel~~ **done**: `compile_codegen_unit`
+   stops after mono-item `define`s and queues the pliron
+   `Context`+`State` as a job in `src/cgupool.rs`; `optimize` (rustc's
+   jobserver-token workers) runs whatever job is runnable until its own
+   module exists — IR-opt *and* CLIF lowering both moved off the main
+   thread. The one cross-CGU edge (`xfacts` publish→adopt) splits into
+   `facts_publish`/`facts_adopt` on per-CGU ordinals; a CGU's tail parks
+   until every earlier ordinal has published, reproducing serial adopt
+   sets exactly (parallel objects are byte-identical to
+   `PLIRON_CGUPAR=0`'s). `--jobs-backend` (default: all cores) sizes the
+   pool; `PLIRON_CGUPAR=0`, `PLIRON_OPT_BISECT` and `--jobs-frontend`
+   keep the serial path. regex-syntax 6.57 → 2.27; kernels 1.94 → 0.98.
+   Remaining in that gap: the front half (MIR→pliron `define`s) is still
+   main-thread-serial, and each job's inner lowering spawns its own
+   per-function threads — a shared pool or `PLIRON_PAR` capping would
+   cut the oversubscription.
 2. **Applicability prechecks**: most steps change nothing on most
    functions. A cheap scan that proves "this step cannot fire" (no
    loops → skip loop passes; no select/brif shapes → skip ifconv2;
@@ -78,7 +90,7 @@ Next steps, in expected-payoff order:
 5. **Glue**: dense columns instead of `FxHashMap<Ptr<Operation>, _>`
    side tables (DoD step 4, `docs/history/dod-steps-4-5.md`).
 
-wasm compile time (3.35x) adds the CLIF → waffle translation, the waffle
+wasm compile time (2.56x) adds the CLIF → waffle translation, the waffle
 inliner and `wpeep` on top of the same pipeline; profile
 `--target wasm32-unknown-unknown --emit obj` the same way.
 

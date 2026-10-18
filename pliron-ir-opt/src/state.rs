@@ -557,16 +557,10 @@ pub fn nonnull_values(ctx: &Context, st: &State) -> Vec<(Value, u64)> {
     out
 }
 
-/// Process-global callee-contract facts merged across codegen units
-/// (`State::share_facts`). A call to a bodiless symbol binds whichever
-/// copy the linker picks; since contract facts are semantic properties of
-/// the function, a fact is only shared once *every* emitted copy seen so
-/// far agrees (`copies` vs per-fact counts, intersection for `nocapture`).
-/// `Import` declarations never contribute; `Preemptible` bodies that were
-/// excluded from inference (non-ODR) count as copies but bring no facts,
-/// which poisons their symbol's merge — conservative by construction.
+/// One CGU's contribution to [`GlobalFacts`]: the merge state a single
+/// `facts_publish` call produces.
 #[derive(Default)]
-pub struct GlobalFacts {
+struct CguFacts {
     /// Emitted copies seen per symbol (any bodied non-`Import` func).
     copies: FxHashMap<String, u32>,
     /// Intersection of per-copy nocapture arg sets.
@@ -580,7 +574,29 @@ pub struct GlobalFacts {
     nounwind: FxHashMap<String, u32>,
 }
 
-impl GlobalFacts {
+/// Process-global callee-contract facts merged across codegen units
+/// (`State::share_facts` / `facts_publish` + `facts_adopt`). A call to a
+/// bodiless symbol binds whichever copy the linker picks; since contract
+/// facts are semantic properties of the function, a fact is only shared
+/// once *every* emitted copy seen so far agrees (`copies` vs per-fact
+/// counts, intersection for `nocapture`). `Import` declarations never
+/// contribute; `Preemptible` bodies that were excluded from inference
+/// (non-ODR) count as copies but bring no facts, which poisons their
+/// symbol's merge — conservative by construction.
+///
+/// Contributions are kept per participant ordinal so an adopting CGU
+/// sees exactly the CGUs that preceded it in submission order — the
+/// same set serial codegen gives it — regardless of which worker
+/// finished first.
+#[derive(Default)]
+struct GlobalFacts {
+    /// Participant ordinal -> that CGU's published facts.
+    by_ord: std::collections::BTreeMap<u32, CguFacts>,
+    /// Next ordinal for the serial path (`share_facts`).
+    next_ord: u32,
+}
+
+impl CguFacts {
     fn publish(&mut self, sym: &str, st: &State, nounwind: bool) {
         *self.copies.entry(sym.to_string()).or_default() += 1;
         let nc = self
@@ -608,6 +624,29 @@ impl GlobalFacts {
         }
     }
 
+    fn merge(&mut self, other: &CguFacts) {
+        for (s, &c) in &other.copies {
+            *self.copies.entry(s.clone()).or_default() += c;
+        }
+        for (s, v) in &other.nocapture {
+            self.nocapture
+                .entry(s.clone())
+                .or_insert_with(|| v.clone())
+                .retain(|a| v.contains(a));
+        }
+        for (m, o) in [
+            (&mut self.nowrite_strict, &other.nowrite_strict),
+            (&mut self.nowrite_relaxed, &other.nowrite_relaxed),
+            (&mut self.nnret, &other.nnret),
+            (&mut self.willreturn, &other.willreturn),
+            (&mut self.nounwind, &other.nounwind),
+        ] {
+            for (s, &c) in o {
+                *m.entry(s.clone()).or_default() += c;
+            }
+        }
+    }
+
     fn nowrite(&self, sym: &str) -> Option<bool> {
         let n = *self.copies.get(sym)?;
         let strict = self.nowrite_strict.get(sym).copied().unwrap_or(0);
@@ -632,27 +671,66 @@ impl GlobalFacts {
 static GLOBAL_FACTS: std::sync::LazyLock<std::sync::Mutex<GlobalFacts>> =
     std::sync::LazyLock::new(Default::default);
 
+/// Clear the cross-CGU fact table — called once per `codegen_crate` so
+/// per-crate ordinals never collide with a previous crate's leftovers
+/// (a rustc process normally compiles one crate; this keeps embedded
+/// drivers correct too).
+pub fn reset_facts() {
+    *GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner()) = GlobalFacts::default();
+}
+
 impl State {
-    /// Publish this CGU's emitted bodies to [`GLOBAL_FACTS`], then adopt
-    /// merged contract facts for symbols this CGU only declares — a
-    /// foreign call binds an emitted copy the fact was computed on, so
-    /// the shared fact describes the bound code. Local results always
-    /// win: import only fills `funcs` entries without a body. CGUs are
-    /// compiled serially, so publish-before-import order is
-    /// deterministic; later CGUs simply see more.
+    /// Serial-codegen form of the xfacts merge: publish under a fresh
+    /// ordinal, then adopt every earlier ordinal — the prefix semantics
+    /// the parallel path reproduces with explicit ordinals.
     pub fn share_facts(&mut self, ctx: &Context) {
+        let mut g = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
+        let ord = g.next_ord;
+        g.next_ord += 1;
+        drop(g);
+        self.facts_publish(ctx, ord);
+        self.facts_adopt(ctx, ord);
+    }
+
+    /// Publish this CGU's emitted bodies to [`GLOBAL_FACTS`] under
+    /// participant ordinal `ord`.
+    pub fn facts_publish(&mut self, ctx: &Context, ord: u32) {
         let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
         let mut g = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cf = CguFacts::default();
         let mut exported = 0usize;
         for (sym, f) in self.funcs.iter() {
             if f.linkage == Linkage::Import || !crate::has_body(ctx, f.op) {
                 continue;
             }
             exported += 1;
-            g.publish(sym, self, f.nounwind);
+            cf.publish(sym, self, f.nounwind);
             if !filt.is_empty() && sym.contains(&filt) {
                 tracing::info!(target: "pliron::stats",
                     "xfacts {} publish {sym}", self.cgu);
+            }
+        }
+        g.by_ord.insert(ord, cf);
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "xfacts {}: published {exported}", self.cgu);
+        }
+    }
+
+    /// Adopt merged contract facts for symbols this CGU only declares —
+    /// a foreign call binds an emitted copy the fact was computed on, so
+    /// the shared fact describes the bound code. Local results always
+    /// win: import only fills `funcs` entries without a body. The merge
+    /// covers exactly participant ordinals `< ord` — under the parallel
+    /// scheduler the caller parks until that prefix is complete, giving
+    /// the same adopt set serial codegen produces.
+    pub fn facts_adopt(&mut self, ctx: &Context, ord: u32) {
+        let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
+        let mut g = CguFacts::default();
+        {
+            let global = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, cf) in global.by_ord.range(..ord) {
+                g.merge(cf);
             }
         }
         let mut imported = 0usize;
@@ -672,15 +750,15 @@ impl State {
                 self.nowrite.insert(sym.clone(), v);
                 hit = true;
             }
-            if GlobalFacts::proven(&g.nnret, &g.copies, sym) {
+            if CguFacts::proven(&g.nnret, &g.copies, sym) {
                 self.nnret.insert(sym.clone());
                 hit = true;
             }
-            if GlobalFacts::proven(&g.willreturn, &g.copies, sym) {
+            if CguFacts::proven(&g.willreturn, &g.copies, sym) {
                 self.willreturn.insert(sym.clone());
                 hit = true;
             }
-            if GlobalFacts::proven(&g.nounwind, &g.copies, sym) {
+            if CguFacts::proven(&g.nounwind, &g.copies, sym) {
                 f.nounwind = true;
                 hit = true;
             }
@@ -694,7 +772,7 @@ impl State {
         }
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::stats",
-                "xfacts {}: published {exported}, imported {imported}", self.cgu);
+                "xfacts {}: imported {imported}", self.cgu);
         }
     }
 }

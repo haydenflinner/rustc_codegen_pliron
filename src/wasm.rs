@@ -7295,23 +7295,13 @@ mod clif_emit {
     pub(crate) fn lower_to_wasm_clif(
         ctx: &Context,
         st: &State,
-        sess: &rustc_session::Session,
+        host: &dyn crate::lower::Host,
         name: &str,
         features: &[String],
         unwind: bool,
     ) -> Vec<u8> {
         let simd = features.iter().any(|f| f == "simd128");
-        let mut wc = crate::lower::lower_clif_wasm(
-            ctx,
-            st,
-            &crate::RustcHost {
-                sess,
-                prof: crate::RustcProf(&sess.prof),
-            },
-            name,
-            unwind,
-            simd,
-        );
+        let mut wc = crate::lower::lower_clif_wasm(ctx, st, host, name, unwind, simd);
         let mut m = Module::empty();
         let mem = m.memories.push(MemoryData {
             initial_pages: 0,
