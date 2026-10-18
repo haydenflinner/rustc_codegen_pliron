@@ -1115,6 +1115,23 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u
             }) else {
                 continue;
             };
+            // Retargeting makes the producer write x on *every* path from
+            // p1, not just the ones through the copy-set. The fixpoint
+            // below compares the sets of defs reaching each read, which
+            // can't see a path that leaves (p1, si) early: the same
+            // sources still reach, on different paths. So require
+            // straight-line control: same structured context and no
+            // branch in between, i.e. every path from p1 reaches si.
+            // (A `br` out of an `if` arm between them kept a frame-slot
+            // address in x on the exit path; the retarget overwrote it
+            // with a finish_grow result — wasm std `words` miscompile.)
+            if ctx[ins[p1].3] != ctx[ins[si].3]
+                || (p1..si).any(|i| {
+                    matches!(ins[i].0, WPeek::Ctl) && matches!(b[ins[i].1], 0x0c | 0x0d | 0x0e | 0x0f)
+                })
+            {
+                continue;
+            }
             cand.push((p1, gi, si, t, x));
         }
         // Greatest fixpoint: drop candidates whose side conditions fail
@@ -2029,8 +2046,19 @@ fn wpeep(bytes: &mut Vec<u8>) {
             if be > e {
                 return;
             }
-            let nb =
-                peep_body(&bytes[q..be], &fsig, &tsig).unwrap_or_else(|| bytes[q..be].to_vec());
+            // `PLIRON_WASM_PEEP_LIMIT=N`: peephole only the first N bodies
+            // this process emits — bisects a wpeep miscompile to one body.
+            static PEEPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let limit = crate::env_get("PLIRON_WASM_PEEP_LIMIT").and_then(|v| v.parse::<u64>().ok());
+            let k = PEEPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nb = if limit.is_none_or(|l| k < l) {
+                if crate::env_set("PLIRON_WASM_PEEP_LOG") {
+                    eprintln!("wpeep body {k} ({bsz} bytes)");
+                }
+                peep_body(&bytes[q..be], &fsig, &tsig).unwrap_or_else(|| bytes[q..be].to_vec())
+            } else {
+                bytes[q..be].to_vec()
+            };
             leb(&mut body_out, nb.len() as u32);
             body_out.extend_from_slice(&nb);
             q = be;
@@ -2110,6 +2138,46 @@ mod wpeep_tests {
         assert!(has_seq(&out, &[0x22, 0x05]), "producer lost: {out:02x?}");
         assert!(has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy gone: {out:02x?}");
         assert!(!has_seq(&out, &[0x22, 0x04]), "miscompile: {out:02x?}");
+    }
+
+    // Regression (wasm std `words`): the producer and the copy sit in
+    // different arms' reach — one arm branches out before the copy, so on
+    // that path x must keep its old value. Reaching-def sets are equal
+    // before and after the retarget (both sources still reach the final
+    // read), so only the straight-line requirement rejects it.
+    //
+    //   i32.const 99; set 2          ; x's old value (frame-slot address)
+    //   block
+    //     i32.const 7; set 7         ; producer p1 -> t=7
+    //     get 0; if
+    //       br 1                     ; exit: x must still be 99
+    //     else
+    //       get 7; set 2             ; copy t -> x
+    //     end
+    //   end
+    //   get 2; drop
+    #[test]
+    fn branch_past_copy_blocks_producer_retarget() {
+        let b = body(
+            8,
+            &[
+                0x41, 0x63, 0x21, 0x02, // i32.const 99; set 2
+                0x02, 0x40, // block
+                0x41, 0x07, 0x21, 0x07, // i32.const 7; set 7
+                0x20, 0x00, // get 0
+                0x04, 0x40, // if
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x20, 0x07, 0x21, 0x02, // get 7; set 2
+                0x0b, // end
+                0x0b, // end
+                0x20, 0x02, 0x1a, // get 2; drop
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x07, 0x21, 0x02]), "copy gone: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x07, 0x21, 0x02]), "miscompile: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x07, 0x22, 0x02]), "miscompile: {out:02x?}");
     }
 
     // Same shape without the interfering self-copy: forwarding must still
