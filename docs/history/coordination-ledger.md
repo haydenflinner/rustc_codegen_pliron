@@ -1913,3 +1913,153 @@ Verified: `PLIRON_STATS`, `PLIRON_TIMING`, `PLIRON_TRACE=pliron::step`
 Known residual: `enabled!` callsites inside closures (e.g.
 `ifconv::EDGE_NS.with`) still pay the registry walk when reached, but
 their outer guards now gate them.
+
+---
+
+## post-tracing-gate profile (prof11, 3.3M samples) + easy-win batch
+
+Deep profile of `cargo rustc -p pliron-clif-opt` through the backend:
+2.65M/3.3M samples leafed in our dylib; `run_steps` = 2.19M inclusive.
+New leaf picture after the tracing gate landed: CFG/domtree recompute
+(~394k, ~12% — owned by the `devin/analysis-granularity` worktree),
+linked_list::Iter (~40k, fixed: `#[inline]`), `LoopAnalysis::is_in_loop`
+(~40k — same subagent), `Vec<Inst>::from_iter` growth (~25k, fixed:
+layout `size_hint`), pliron_cfg env-hash leaf (~19k, fixed: reads-open
+gate + step memoization), `carry_one` (~17.6k, fixed: `fact_bits`
+sidecar), bforest maps inside CFG/DT, `slp::build_uses` (~12k).
+
+Changes (this commit):
+- `pliron_cfg::reads_open()` — cross-thread `AtomicUsize` gate; `record()`
+  skips the TLS walk when no stepcache window is open anywhere.
+- `selected()` memoized per `FnFlags` bits (thread-local) when no read
+  window is open — the `PLIRON_PIPELINE` custom path is never memoized.
+- `run_step`'s shape knobs (`SHAPE_ONLY`/`NOSHAPE`/`SHAPE_CHECK`),
+  `giant_max()`, and `stepcache::enabled()`/`dir()` are `LazyLock`-cached
+  with a `reads_open()` fallback that re-reads through `config()` so
+  armed windows still record the consulted vars.
+- Per-step `stats.timing` accumulates into a `Vec<Duration>` slot
+  indexed by `sel` position and merges into the map once per function —
+  kills a `FxHashMap<&str>` probe per step per fn.
+- `vendor/pliron` `linked_list::Iter`/`get_next`/`get_prev`/`iter`
+  `#[inline]` (PLIRON-marked).
+- `vendor/cranelift-codegen` `layout.rs` patch 45: `BlockNode.count` +
+  `Layout.num_blocks` maintained through every insert/remove/split; both
+  iterators get exact `size_hint` + `ExactSizeIterator`; serde uses the
+  stored counts.
+- `Pipe::fact_bits: SecondaryMap<Value, u8>` — `carry_one` does one
+  dense probe gating all six fact-table lookups; bits set on every
+  insert path + seeded at each `Pipe` construction (pre-Pipe writes)
+  and after wholesale `*p.derived =` restores. Stale bits are
+  conservative-safe; a missing bit would be a skipped carry, so all
+  write paths were audited (~22 sites, all covered).
+
+Verify: `cargo test -p pliron-clif-opt` green (incl. the
+`carry_keeps_param_facts_scoped` test), workspace check clean, smoke
+compile + `PLIRON_DIFFCHECK=1` run clean, `bench /tmp/corpus-s` 76.2s
+(noise-equal to the 74.8s baseline — this batch is constant-factor
+shaving; the box's noise floor swamps ~2%).
+
+Bench harness: `PLIRON_CORPUS=<dir>` dumps pre-pipeline CLIF per fn;
+`clif-check bench <dir> [reps]` replays + prints per-step times.
+Corpus at `/tmp/corpus` (55.3k fns), subset `/tmp/corpus-s` (4k).
+
+## slp → shared uses snapshot (3e8331b)
+
+`slp::Uses` no longer owns its CSR arrays; it wraps `Rc<uses::Uses>`
+from `Analysis::uses` plus a `&RefCell<FxHashSet<Inst>>` tombstone set
+owned by `run()` for the whole pass. Applies `remove()` member insts
+into `dead`; xpack also extends `dead` with `apply_pair`'s removals
+(`dead` lanes + non-`keep` kept-lanes — NOT `sink`, which is only
+repositioned; tombstoning live insts would undercount uses and let a
+plan drop a lane a moved inst still reads). Refetches go through
+`an.uses(func)`: applies emit insts so `num_insts` usually changed →
+fresh rebuild == old rebuild semantics; same-shape refetches get the
+stale snapshot + tombstones. Laziness kept via `Option<Uses>` —
+functions with no candidate runs never fetch the index. `Analysis`
+grew a `&self` `domtree()` accessor so `uses()` can be called while
+the domtree borrow is held (`cfg_dt` pins `&mut self`).
+
+`clif-check corpus` falls back to the flat `*.clif` glob when no
+`before.clif` dirs exist, so a `PLIRON_CORPUS` dump is directly
+diffcheckable.
+
+Verify: `cargo test -p pliron-clif-opt` green; `clif-check corpus` on
+200 corpus fns → 0 mismatches; `cargo check` clean post-rebase onto
+9c5e3b0 (SmallVec operand vectors).
+
+## jumpthread Uses::new → an.uses (523a7e1) — closes the "unshared Uses" note
+
+The `~4s of unshared Uses::new` flag is now handled: slp (3e8331b) +
+jumpthread `split_niche_tests`/`rebind_exports` (this commit). Both
+take `&Analysis`; refetch is keyed on (ver, num_insts) so it rebuilds
+exactly when shape changed and shares otherwise. Stale-snapshot
+direction is overcount-uses → conservative-safe at both sites.
+
+Deliberately left unshared: `memspec` (2 builds — num_insts-net-zero
+mutations make the key lie, and escape queries can't undercount) and
+`bcheck::unswitch_loop`'s sweep (clone-added uses missing from a stale
+snapshot = dangling-block miscompile). Those need `refresh_uses`,
+which costs what `Uses::new` costs — no win, real risk.
+
+## slp FMA/RMW packs + plirun harness merged (9f3b4aa via devin/gpu-vec)
+
+Merged subagent B's `slp.rs` work: `Opcode::Fma` in `vecable`, pack
+formation accepts loads anywhere in the block (`tloads` —
+(inst,pos,Lin,esz) validated against member stores post-collection,
+`tree` for the dead-tree check, both snapshotted/rolled back on
+failed packs), and a `Lin` Σcoeff·x+k address decomposer for
+`(idx+lane)*4` addressing `base_off` can't see. Target: CubeCL
+simple_unit GEMM unrolled RMW tile (the 40–960× gap). `plirun`
+(pliron-clif-lower example) replays `CUBECL_DEBUG_PLIRON` dumps
+through scan→ir-opt→CLIF→obj without cubek/rustc — the iteration
+harness for kernel codegen quality.
+
+Merge note: three-way merge combined cleanly with the `Uses<'d>`
+shared-snapshot refactor (3e8331b) — wrapper API (`iter`/`remove`)
+was unchanged so B's code merged textually-correct. Verified: full
+`cargo test -p pliron-clif-opt` (27 binaries incl. new slp_fma),
+workspace check, plirun example builds.
+
+## attr interning: AttributeDict → AttrInstId(u32) arena handles (attr leg)
+
+`AttributeDict` values are now `AttrInstId(u32)` handles into a
+`Context::attr_store: UniqueStore<AttrEntry>` instead of a
+`Box<dyn Attribute>` per op — kills a heap Box per attribute per op.
+Dedup is full hash-consing on the existing `hash_attr`/`eq_attr` hooks
+(not the "cheap v0" the scoping note assumed — the hooks already
+existed), so identical attrs share one entry and dict clone/eq/hash
+are 4-byte handle ops.
+
+Interface "capability bitmask" became per-entry interface lists
+instead: >64 registered cast targets killed the u64 mask (ir-opt tests
+caught it). Each `AttrEntry` lazily computes the interface TypeIds it
+casts to (`OnceCell<Box<[TypeId]>>` scanned once per unique attr from
+`iter_caster_pairs`, new in trait_cast.rs); `dict.impls::<I>`/
+`attr_should_outline` short-circuit on a ~3-entry TypeId scan, no
+caster-map probe.
+
+Semantics: interned attrs are immutable — `given_names` (the one
+in-place mutation path upstream) is copy-on-write (clone, mutate,
+re-set). Accessors take `&Context` (`get`/`get_as`/`set`/`set_obj`/
+`get_obj`/`iter`/`impls`); returned `&T` borrows the ctx store, not
+the op `Ref` — strictly looser. Generated op attr getters now return
+`Option<&T>` not `Option<Ref<T>>`; `ConstantOp::get_value` returns
+`&dyn TypedAttrInterface`. `OnceVec` chunks never move, so refs are
+stable. `AttributeDict` PartialEq/Hash compare handles — same-ctx
+only (documented; no cross-ctx dict-transfer API exists). `DictAttr`
+keeps the interned dict (`new`/`insert`/`lookup` take `&Context`).
+
+Traps hit: `as_any()` on `Box<dyn Attribute>` resolves to
+`Downcast`'s blanket `impl<T: Any>` → yields the *Box's* TypeId, not
+the attr's — `ifaces()` must go through `&dyn Attribute` first (test
+caught it; `attr_cast` only works because it takes `&dyn Attribute`).
+
+Verify: `cargo test -p pliron-ir-opt` (incl. new tests/attr_intern.rs:
+dedup, iface pos/neg, parse/print roundtrip, given-names COW across
+deduped ops) + `cargo test -p pliron-clif-opt` (27 binaries) green;
+`cargo check` workspace clean; pliron-llvm `--no-default-features
+--features std` clean (LLVM 23 absent — vendored pliron's own test
+target still can't build here). Smoke: compiled+ran a real program
+through the dylib — output matches stock rustc. Vendored-pliron unit
+tests for ifaces can't run here (dev-dep → llvm-sys); the ir-opt
+public-API test covers the same ground.

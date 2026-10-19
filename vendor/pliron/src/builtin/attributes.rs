@@ -577,32 +577,29 @@ impl Parsable for DictAttr {
 
 impl DictAttr {
     /// Create a new [DictAttr].
-    pub fn new(value: Vec<(Identifier, AttrObj)>) -> Self {
+    /// PLIRON: entries are interned in `ctx`'s attr store.
+    pub fn new(ctx: &Context, value: Vec<(Identifier, AttrObj)>) -> Self {
         let mut dict = AttributeDict::default();
         for (name, val) in value {
-            dict.0.insert(name, val);
+            dict.set_obj(ctx, name, val);
         }
         DictAttr(dict)
     }
 
     /// Add an entry to the dictionary.
-    pub fn insert(&mut self, key: &Identifier, val: AttrObj) {
-        self.0.0.insert(key.clone(), val);
+    pub fn insert(&mut self, ctx: &Context, key: &Identifier, val: AttrObj) {
+        self.0.set_obj(ctx, key.clone(), val);
     }
 
     /// Remove an entry from the dictionary.
     pub fn remove(&mut self, key: &Identifier) {
-        self.0.0.remove(key);
+        self.0.remove(key);
     }
 
     /// Lookup a name in the dictionary.
-    pub fn lookup<'a>(&'a self, key: &Identifier) -> Option<&'a AttrObj> {
-        self.0.0.get(key)
-    }
-
-    /// Lookup a name in the dictionary, get a mutable reference.
-    pub fn lookup_mut<'a>(&'a mut self, key: &Identifier) -> Option<&'a mut AttrObj> {
-        self.0.0.get_mut(key)
+    /// PLIRON: the reference borrows `ctx`'s attr store.
+    pub fn lookup<'c>(&self, ctx: &'c Context, key: &Identifier) -> Option<&'c AttrObj> {
+        self.0.get_obj(ctx, key)
     }
 }
 
@@ -954,23 +951,24 @@ mod tests {
 
     #[test]
     fn test_dictionary_attributes() {
+        let ctx = &Context::new();
         let hello_attr: AttrObj = StringAttr::new("hello".to_string()).into();
         let world_attr: AttrObj = StringAttr::new("world".to_string()).into();
 
         let hello_id: Identifier = ident!("hello");
         let world_id: Identifier = ident!("world");
 
-        let mut dict1: AttrObj = DictAttr::new(vec![
+        let mut dict1: AttrObj = DictAttr::new(&ctx, vec![
             (hello_id.clone(), hello_attr.clone()),
             (world_id.clone(), world_attr.clone()),
         ])
         .into();
-        let mut dict2 = DictAttr::new(vec![(
+        let mut dict2 = DictAttr::new(&ctx, vec![(
             hello_id.clone(),
             StringAttr::new("hello".to_string()).into(),
         )])
         .into();
-        let dict1_rev = DictAttr::new(vec![
+        let dict1_rev = DictAttr::new(&ctx, vec![
             (world_id.clone(), world_attr.clone()),
             (hello_id.clone(), hello_attr.clone()),
         ])
@@ -980,10 +978,10 @@ mod tests {
 
         let dict1_attr = dict1.as_mut().downcast_mut::<DictAttr>().unwrap();
         let dict2_attr = dict2.as_mut().downcast_mut::<DictAttr>().unwrap();
-        assert!(dict1_attr.lookup(&hello_id).unwrap() == &hello_attr);
-        assert!(dict1_attr.lookup(&world_id).unwrap() == &world_attr);
-        assert!(dict1_attr.lookup(&ident!("hello_world")).is_none());
-        dict2_attr.insert(&world_id, world_attr);
+        assert!(dict1_attr.lookup(&ctx, &hello_id).unwrap() == &hello_attr);
+        assert!(dict1_attr.lookup(&ctx, &world_id).unwrap() == &world_attr);
+        assert!(dict1_attr.lookup(&ctx, &ident!("hello_world")).is_none());
+        dict2_attr.insert(&ctx, &world_id, world_attr);
         assert!(dict1_attr == dict2_attr);
 
         dict1_attr.remove(&hello_id);

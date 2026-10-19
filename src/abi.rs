@@ -111,7 +111,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
             .unwrap();
         let live: Vec<bool> = entry
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .map(|a| a.is_used(ctx))
             .collect();
         if live.len() != args.len() || live.iter().all(|&l| l) {
@@ -120,7 +120,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
         let calls = sites.get(sym).cloned().unwrap_or_default();
         if calls
             .iter()
-            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+            .any(|c| st.calls.get(*c).is_none_or(|i| i.fn_ty != f.ty))
         {
             continue;
         }
@@ -156,10 +156,10 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                 CallOp::new(ctx, CallOpCallable::Direct(id.clone()), nty, kept).get_operation();
             nc.insert_before(ctx, c);
             if c.deref(ctx).get_num_results() > 0 {
-                let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                let (old, new) = (c.deref(ctx).get_result(ctx, 0), nc.deref(ctx).get_result(ctx, 0));
                 old.replace_all_uses_with(ctx, &new);
             }
-            let mut info = st.calls.remove(&c).unwrap();
+            let mut info = st.calls.remove(c).unwrap();
             info.fn_ty = nty.into();
             info.exts = exts.clone();
             // `nocap`/`arg_extent` are indexed by operand position — re-index
@@ -177,7 +177,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                     .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
             st.calls.insert(nc, info);
-            if let Some(u) = st.invokes.remove(&c) {
+            if let Some(u) = st.invokes.remove(c) {
                 st.invokes.insert(nc, u);
             }
             if st.last_call == Some(c) {
@@ -207,7 +207,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 .unwrap()
                 .get_entry_block(ctx)
                 .unwrap();
-            for a in e.deref(ctx).arguments() {
+            for a in e.deref(ctx).arguments(ctx) {
                 total += 1;
                 if !a.is_used(ctx) {
                     dead += 1;
@@ -243,7 +243,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         let calls = sites.get(sym).cloned().unwrap_or_default();
         if calls
             .iter()
-            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+            .any(|c| st.calls.get(*c).is_none_or(|i| i.fn_ty != f.ty))
         {
             continue;
         }
@@ -287,9 +287,9 @@ fn rewrite(
     let one = mk_const(ctx, st, i32t, ConstVal::Bits(1));
     let a = AllocaOp::new(ctx, arr, one, 0).get_operation();
     a.insert_at_front(entry, ctx);
-    let slot = a.deref(ctx).get_result(0);
+    let slot = a.deref(ctx).get_result(ctx, 0);
     st.allocas.insert(slot, (size, align));
-    let sret = entry.deref(ctx).get_argument(0);
+    let sret = entry.deref(ctx).get_argument(ctx, 0);
     sret.replace_all_uses_with(ctx, &slot);
     BasicBlock::remove_argument(entry, ctx, 0);
     let rets: Vec<_> = blocks(ctx, fop)
@@ -303,10 +303,10 @@ fn rewrite(
             let p = ptr_plus(ctx, st, slot, off, r);
             let ld = LoadOp::new(ctx, p, t).get_operation();
             ld.insert_before(ctx, r);
-            let v = ld.deref(ctx).get_result(0);
+            let v = ld.deref(ctx).get_result(ctx, 0);
             let iv = InsertValueOp::new(ctx, agg, v, vec![i as u32]).get_operation();
             iv.insert_before(ctx, r);
-            agg = iv.deref(ctx).get_result(0);
+            agg = iv.deref(ctx).get_result(ctx, 0);
         }
         ReturnOp::new(ctx, Some(agg))
             .get_operation()
@@ -334,19 +334,19 @@ fn rewrite(
         )
         .get_operation();
         nc.insert_before(ctx, c);
-        let r = nc.deref(ctx).get_result(0);
+        let r = nc.deref(ctx).get_result(ctx, 0);
         for (i, &(off, _)) in leaves.iter().enumerate() {
             let ev = ExtractValueOp::new(ctx, r, vec![i as u32])
                 .unwrap()
                 .get_operation();
             ev.insert_before(ctx, c);
-            let v = ev.deref(ctx).get_result(0);
+            let v = ev.deref(ctx).get_result(ctx, 0);
             let p = ptr_plus(ctx, st, cargs[0], off, c);
             StoreOp::new(ctx, v, p)
                 .get_operation()
                 .insert_before(ctx, c);
         }
-        let mut info = st.calls.remove(&c).unwrap();
+        let mut info = st.calls.remove(c).unwrap();
         info.fn_ty = nty.into();
         info.exts = exts.clone();
         // `nocap`/`arg_extent` are indexed by operand position, and operand 0
@@ -361,7 +361,7 @@ fn rewrite(
             info.arg_noalias = (v.len() == cargs.len()).then(|| v[1..].into());
         }
         st.calls.insert(nc, info);
-        if let Some(u) = st.invokes.remove(&c) {
+        if let Some(u) = st.invokes.remove(c) {
             st.invokes.insert(nc, u);
         }
         if st.last_call == Some(c) {

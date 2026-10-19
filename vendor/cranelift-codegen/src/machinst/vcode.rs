@@ -774,7 +774,9 @@ impl<I: VCodeInst> VCode<I> {
         // can be 16-byte aligned below (the back-edge jumps to the block's
         // label, which binds after the padding, so the padding costs a few
         // NOPs only on the fallthrough entry). `PLIRON_ALIGN=0` disables.
-        let align_loops = std::env::var("PLIRON_ALIGN").map_or(true, |v| v != "0");
+        static ALIGN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let align_loops =
+            *ALIGN.get_or_init(|| std::env::var("PLIRON_ALIGN").map_or(true, |v| v != "0"));
         let mut loop_head = vec![false; self.num_blocks()];
         if align_loops {
             let mut order_of = vec![usize::MAX; self.num_blocks()];

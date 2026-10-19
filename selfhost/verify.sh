@@ -38,6 +38,9 @@ export PATH="$HOME/.rustup/toolchains/nightly-2026-10-06-$HOST/lib/rustlib/$HOST
 
 mkdir -p "$OUT"
 cd "$WT"
+# Which backend source this stage2 was built from (selfhost/setup.sh).
+REV=$(cat compiler/rustc_codegen_pliron/.pliron-src-rev 2>/dev/null || echo "unknown (re-run selfhost/setup.sh)")
+echo "verify: backend source $REV" | tee "$OUT/backend-rev"
 
 kill_stragglers() {
     # Only stage1/stage2 test-invoked rustc — the bootstrap driver rustc

@@ -247,8 +247,8 @@ fn test_replace_within_same_def_site() {
         0,
     );
     let (res1, res2) = (
-        dual_def_op.deref(ctx).get_result(0),
-        dual_def_op.deref(ctx).get_result(1),
+        dual_def_op.deref(ctx).get_result(ctx, 0),
+        dual_def_op.deref(ctx).get_result(ctx, 1),
     );
     let (module_op, func_op, const_op, ret_op) = const_ret_in_mod(ctx).unwrap();
     dual_def_op.insert_before(ctx, ret_op.get_operation());
@@ -277,8 +277,8 @@ fn test_replace_within_same_def_site() {
 
     let dual_arg_block = BasicBlock::new(ctx, None, vec![u64_ty, u64_ty]);
     let (arg1, arg2) = (
-        dual_arg_block.deref(ctx).get_argument(0),
-        dual_arg_block.deref(ctx).get_argument(1),
+        dual_arg_block.deref(ctx).get_argument(ctx, 0),
+        dual_arg_block.deref(ctx).get_argument(ctx, 1),
     );
     dual_arg_block.insert_after(ctx, func_op.get_entry_block(ctx));
     let ret_op = ReturnOp::new(ctx, arg1);
@@ -330,13 +330,13 @@ fn test_operand_push_pop_insert_remove() -> Result<()> {
     let c2 = const2_op.get_result(ctx);
 
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 1);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c0);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c0);
 
     let pushed_idx = Operation::push_operand(ret_ptr, ctx, c1);
     assert_eq!(pushed_idx, 1);
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 2);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c0);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(1), c1);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c0);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 1), c1);
     for r#use in c1.uses(ctx) {
         assert!(r#use.get_def(ctx) == c1);
         assert!(r#use.user_op() == ret_ptr && r#use.find_index(ctx) == 1);
@@ -350,7 +350,7 @@ fn test_operand_push_pop_insert_remove() -> Result<()> {
     let popped = Operation::pop_operand(ret_ptr, ctx);
     assert_eq!(popped, c1);
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 1);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c0);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c0);
     assert!(c1.uses(ctx).is_empty()); // c1 should have no uses now.
     for r#use in c0.uses(ctx) {
         assert!(r#use.get_def(ctx) == c0);
@@ -360,8 +360,8 @@ fn test_operand_push_pop_insert_remove() -> Result<()> {
 
     Operation::insert_operand(ret_ptr, ctx, 0, c1);
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 2);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c1);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(1), c0);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c1);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 1), c0);
     for r#use in c1.uses(ctx) {
         assert!(r#use.get_def(ctx) == c1);
         assert!(r#use.user_op() == ret_ptr && r#use.find_index(ctx) == 0);
@@ -374,9 +374,9 @@ fn test_operand_push_pop_insert_remove() -> Result<()> {
 
     Operation::insert_operand(ret_ptr, ctx, 2, c2);
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 3);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c1);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(1), c0);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(2), c2);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c1);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 1), c0);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 2), c2);
     for r#use in c1.uses(ctx) {
         assert!(r#use.get_def(ctx) == c1);
         assert!(r#use.user_op() == ret_ptr && r#use.find_index(ctx) == 0);
@@ -395,8 +395,8 @@ fn test_operand_push_pop_insert_remove() -> Result<()> {
     let removed_mid = Operation::remove_operand(ret_ptr, ctx, 1);
     assert_eq!(removed_mid, c0);
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 2);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c1);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(1), c2);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c1);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 1), c2);
     for r#use in c1.uses(ctx) {
         assert!(r#use.get_def(ctx) == c1);
         assert!(r#use.user_op() == ret_ptr && r#use.find_index(ctx) == 0);
@@ -410,7 +410,7 @@ fn test_operand_push_pop_insert_remove() -> Result<()> {
     let removed_front = Operation::remove_operand(ret_ptr, ctx, 0);
     assert_eq!(removed_front, c1);
     assert_eq!(ret_ptr.deref(ctx).get_num_operands(), 1);
-    assert_eq!(ret_ptr.deref(ctx).get_operand(0), c2);
+    assert_eq!(ret_ptr.deref(ctx).get_operand(ctx, 0), c2);
     for r#use in c2.uses(ctx) {
         assert!(r#use.get_def(ctx) == c2);
         assert!(r#use.user_op() == ret_ptr && r#use.find_index(ctx) == 0);
@@ -468,8 +468,8 @@ fn test_result_push_pop_insert_remove() -> Result<()> {
         0,
     );
 
-    let r0 = op.deref(ctx).get_result(0);
-    let r1 = op.deref(ctx).get_result(1);
+    let r0 = op.deref(ctx).get_result(ctx, 0);
+    let r1 = op.deref(ctx).get_result(ctx, 1);
 
     r0.set_name(ctx, Some(ident!("r0")));
     r1.set_name(ctx, Some(ident!("r1")));
@@ -477,8 +477,8 @@ fn test_result_push_pop_insert_remove() -> Result<()> {
     assert_eq!(op.deref(ctx).get_num_results(), 2);
     assert_eq!(r0.find_index(ctx), 0);
     assert_eq!(r1.find_index(ctx), 1);
-    assert_eq!(op.deref(ctx).get_type(0), i64_ty);
-    assert_eq!(op.deref(ctx).get_type(1), i64_ty);
+    assert_eq!(op.deref(ctx).get_type(ctx, 0), i64_ty);
+    assert_eq!(op.deref(ctx).get_type(ctx, 1), i64_ty);
     assert_eq!(get_operation_result_name(ctx, op, 0), Some(ident!("r0")));
     assert_eq!(get_operation_result_name(ctx, op, 1), Some(ident!("r1")));
 
@@ -489,9 +489,9 @@ fn test_result_push_pop_insert_remove() -> Result<()> {
     // r0 and r1 still have the same indices.
     assert_eq!(r0.find_index(ctx), 0);
     assert_eq!(r1.find_index(ctx), 1);
-    let r2 = op.deref(ctx).get_result(2);
+    let r2 = op.deref(ctx).get_result(ctx, 2);
     assert_eq!(r2.find_index(ctx), 2);
-    assert_eq!(op.deref(ctx).get_type(2), i32_ty);
+    assert_eq!(op.deref(ctx).get_type(ctx, 2), i32_ty);
     assert_eq!(get_operation_result_name(ctx, op, 2), None);
 
     // Pop the last result (r2 has no uses).
@@ -505,7 +505,7 @@ fn test_result_push_pop_insert_remove() -> Result<()> {
     // Insert an i32 result at index 0, shifting r0 -> 1 and r1 -> 2.
     Operation::insert_result(op, ctx, 0, i32_ty);
     assert_eq!(op.deref(ctx).get_num_results(), 3);
-    assert_eq!(op.deref(ctx).get_type(0), i32_ty);
+    assert_eq!(op.deref(ctx).get_type(ctx, 0), i32_ty);
     assert_eq!(r0.find_index(ctx), 1);
     assert_eq!(r1.find_index(ctx), 2);
     assert_eq!(get_operation_result_name(ctx, op, 0), None);
@@ -524,7 +524,7 @@ fn test_result_push_pop_insert_remove() -> Result<()> {
     Operation::insert_result(op, ctx, 1, i32_ty);
     assert_eq!(op.deref(ctx).get_num_results(), 3);
     assert_eq!(r0.find_index(ctx), 0);
-    assert_eq!(op.deref(ctx).get_type(1), i32_ty);
+    assert_eq!(op.deref(ctx).get_type(ctx, 1), i32_ty);
     assert_eq!(r1.find_index(ctx), 2);
 
     // Remove index 1 (no uses), shifting r1 back to 1.
@@ -538,7 +538,7 @@ fn test_result_push_pop_insert_remove() -> Result<()> {
     assert_eq!(op.deref(ctx).get_num_results(), 3);
     assert_eq!(r0.find_index(ctx), 0);
     assert_eq!(r1.find_index(ctx), 1);
-    assert_eq!(op.deref(ctx).get_type(2), i32_ty);
+    assert_eq!(op.deref(ctx).get_type(ctx, 2), i32_ty);
     assert_eq!(get_operation_result_name(ctx, op, 0), Some(ident!("r0")));
     assert_eq!(get_operation_result_name(ctx, op, 1), Some(ident!("r1")));
     assert_eq!(get_operation_result_name(ctx, op, 2), None);
@@ -565,8 +565,8 @@ fn test_block_arg_push_pop_insert_remove() -> Result<()> {
     // Create a block with two i64 arguments.
     let block = BasicBlock::new(ctx, None, vec![i64_ty, i64_ty]);
 
-    let a0 = block.deref(ctx).get_argument(0);
-    let a1 = block.deref(ctx).get_argument(1);
+    let a0 = block.deref(ctx).get_argument(ctx, 0);
+    let a1 = block.deref(ctx).get_argument(ctx, 1);
 
     a0.set_name(ctx, Some(ident!("a0")));
     a1.set_name(ctx, Some(ident!("a1")));
@@ -584,7 +584,7 @@ fn test_block_arg_push_pop_insert_remove() -> Result<()> {
     // a0 and a1 retain their indices.
     assert_eq!(a0.find_index(ctx), 0);
     assert_eq!(a1.find_index(ctx), 1);
-    let a2 = block.deref(ctx).get_argument(2);
+    let a2 = block.deref(ctx).get_argument(ctx, 2);
     assert_eq!(a2.find_index(ctx), 2);
     assert_eq!(get_block_arg_name(ctx, block, 2), None);
 
@@ -664,53 +664,53 @@ fn test_result_index_tracking_with_uses() -> Result<()> {
         0,
     );
 
-    let r0 = dual_op.deref(ctx).get_result(0);
-    let r1 = dual_op.deref(ctx).get_result(1);
+    let r0 = dual_op.deref(ctx).get_result(ctx, 0);
+    let r1 = dual_op.deref(ctx).get_result(ctx, 1);
 
     // Build a user op that holds r0 as its first operand, r1 as its second.
     let user_op = ReturnOp::new(ctx, r0).get_operation();
     Operation::push_operand(user_op, ctx, r1);
 
     // Sanity: operands are r0 and r1; their result indices are 0 and 1.
-    assert_eq!(user_op.deref(ctx).get_operand(0), r0);
-    assert_eq!(user_op.deref(ctx).get_operand(1), r1);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0), r0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1), r1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Insert a new i32 result at index 0 of dual_op, shifting r0 -> 1 and r1 -> 2.
     Operation::insert_result(dual_op, ctx, 0, i32_ty);
     assert_eq!(dual_op.deref(ctx).get_num_results(), 3);
-    assert_eq!(user_op.deref(ctx).get_operand(0), r0);
-    assert_eq!(user_op.deref(ctx).get_operand(1), r1);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 1);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 2);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0), r0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1), r1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 2);
 
     // Remove the new result at index 0, restoring r0 -> 0 and r1 -> 1.
     Operation::remove_result(dual_op, ctx, 0);
     assert_eq!(dual_op.deref(ctx).get_num_results(), 2);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Insert a new result between r0 and r1 (at index 1), shifting r1 -> 2.
     Operation::insert_result(dual_op, ctx, 1, i32_ty);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 2);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 2);
 
     // Remove at index 1, restoring r1 -> 1.
     Operation::remove_result(dual_op, ctx, 1);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Push a result at the end (after r1); r0 and r1 indices are unchanged.
     let pushed_idx = Operation::push_result(dual_op, ctx, i32_ty);
     assert_eq!(pushed_idx, 2);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Pop the trailing result; indices still unchanged.
     Operation::pop_result(dual_op, ctx);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     Ok(())
 }
@@ -729,53 +729,53 @@ fn test_block_arg_index_tracking_with_uses() -> Result<()> {
     // Create a block with two i64 arguments: a0 at index 0, a1 at index 1.
     let block = BasicBlock::new(ctx, None, vec![i64_ty, i64_ty]);
 
-    let a0 = block.deref(ctx).get_argument(0);
-    let a1 = block.deref(ctx).get_argument(1);
+    let a0 = block.deref(ctx).get_argument(ctx, 0);
+    let a1 = block.deref(ctx).get_argument(ctx, 1);
 
     // Build a user op that holds a0 as its first operand, a1 as its second.
     let user_op = ReturnOp::new(ctx, a0).get_operation();
     Operation::push_operand(user_op, ctx, a1);
 
     // Sanity: operands are a0 and a1; their argument indices are 0 and 1.
-    assert_eq!(user_op.deref(ctx).get_operand(0), a0);
-    assert_eq!(user_op.deref(ctx).get_operand(1), a1);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0), a0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1), a1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Insert a new i32 argument at index 0, shifting a0 -> 1 and a1 -> 2.
     BasicBlock::insert_argument(block, ctx, 0, i32_ty);
     assert_eq!(block.deref(ctx).get_num_arguments(), 3);
-    assert_eq!(user_op.deref(ctx).get_operand(0), a0);
-    assert_eq!(user_op.deref(ctx).get_operand(1), a1);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 1);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 2);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0), a0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1), a1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 2);
 
     // Remove the new argument at index 0, restoring a0 -> 0 and a1 -> 1.
     BasicBlock::remove_argument(block, ctx, 0);
     assert_eq!(block.deref(ctx).get_num_arguments(), 2);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Insert a new argument between a0 and a1 (at index 1), shifting a1 -> 2.
     BasicBlock::insert_argument(block, ctx, 1, i32_ty);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 2);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 2);
 
     // Remove at index 1, restoring a1 -> 1.
     BasicBlock::remove_argument(block, ctx, 1);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Push an argument at the end (after a1); a0 and a1 indices are unchanged.
     let pushed_idx = BasicBlock::push_argument(block, ctx, i32_ty);
     assert_eq!(pushed_idx, 2);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     // Pop the trailing argument; indices still unchanged.
     BasicBlock::pop_argument(block, ctx);
-    assert_eq!(user_op.deref(ctx).get_operand(0).find_index(ctx), 0);
-    assert_eq!(user_op.deref(ctx).get_operand(1).find_index(ctx), 1);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 0).find_index(ctx), 0);
+    assert_eq!(user_op.deref(ctx).get_operand(ctx, 1).find_index(ctx), 1);
 
     Ok(())
 }
@@ -835,7 +835,7 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     verify_op(&module_op, ctx)?;
 
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 1);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ0);
     assert_block_pred_uses(ctx, succ0);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 1);
@@ -844,9 +844,9 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let pushed_idx = Operation::push_successor(branch_like, ctx, succ1);
     assert_eq!(pushed_idx, 1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 2);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ0);
     assert_block_pred_uses(ctx, succ0);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ1);
     assert_block_pred_uses(ctx, succ1);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -859,7 +859,7 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let popped = Operation::pop_successor(branch_like, ctx);
     assert_eq!(popped, succ1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 1);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ0);
     assert_block_pred_uses(ctx, succ0);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 1);
@@ -871,9 +871,9 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
 
     Operation::insert_successor(branch_like, ctx, 0, succ1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 2);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ1);
     assert_block_pred_uses(ctx, succ1);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ0);
     assert_block_pred_uses(ctx, succ0);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -885,11 +885,11 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
 
     Operation::insert_successor(branch_like, ctx, 2, succ2);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 3);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ1);
     assert_block_pred_uses(ctx, succ1);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ0);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ0);
     assert_block_pred_uses(ctx, succ0);
-    assert_eq!(branch_like.deref(ctx).get_successor(2), succ2);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 2), succ2);
     assert_block_pred_uses(ctx, succ2);
     assert_eq!(succ0.num_preds(ctx), 2);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -905,9 +905,9 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let removed_mid = Operation::remove_successor(branch_like, ctx, 1);
     assert_eq!(removed_mid, succ0);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 2);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ1);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ1);
     assert_block_pred_uses(ctx, succ1);
-    assert_eq!(branch_like.deref(ctx).get_successor(1), succ2);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 1), succ2);
     assert_block_pred_uses(ctx, succ2);
     assert_eq!(succ0.num_preds(ctx), 1);
     assert_eq!(succ1.num_preds(ctx), 2);
@@ -923,7 +923,7 @@ fn test_successor_push_pop_insert_remove() -> Result<()> {
     let removed_front = Operation::remove_successor(branch_like, ctx, 0);
     assert_eq!(removed_front, succ1);
     assert_eq!(branch_like.deref(ctx).get_num_successors(), 1);
-    assert_eq!(branch_like.deref(ctx).get_successor(0), succ2);
+    assert_eq!(branch_like.deref(ctx).get_successor(ctx, 0), succ2);
     assert_block_pred_uses(ctx, succ2);
     assert_eq!(succ0.num_preds(ctx), 1);
     assert_eq!(succ1.num_preds(ctx), 1);
@@ -1008,7 +1008,8 @@ fn parse_function_with_attrs() -> Result<()> {
         .deref(ctx)
         .get_parent_op(ctx)
         .unwrap();
-    func_op.deref_mut(ctx).attributes.set(
+    func_op.deref_mut(ctx).attributes_mut().set(
+        ctx,
         ATTR_KEY_TEST_ON_FUNC_VALUE.clone(),
         StringAttr::new("func_attr_value".into()),
     );
@@ -1498,7 +1499,7 @@ fn test_verify_operation_fails_on_undominated_block_argument_use() {
     );
     branch.insert_at_back(entry, ctx);
 
-    let b1_arg0 = b1.deref(ctx).get_argument(0);
+    let b1_arg0 = b1.deref(ctx).get_argument(ctx, 0);
 
     ReturnOp::new(ctx, b1_arg0)
         .get_operation()
@@ -1527,7 +1528,8 @@ fn block_inline_attrs_print() -> Result<()> {
     let entry_block = func_op.get_entry_block(ctx);
 
     // Set an inline attribute on the block
-    entry_block.deref_mut(ctx).attributes.set(
+    entry_block.deref_mut(ctx).attributes_mut().set(
+        ctx,
         ATTR_KEY_BLOCK_TEST.clone(),
         StringAttr::new("test_value".into()),
     );
@@ -1588,11 +1590,11 @@ fn block_multiple_inline_attrs() -> Result<()> {
     // Set multiple inline attributes on the function's entry block
     func_entry_block
         .deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ident!("attr1"), StringAttr::new("value1".into()));
     func_entry_block
         .deref_mut(ctx)
-        .attributes
+        .attributes_mut()
         .set(ident!("attr2"), StringAttr::new("value2".into()));
 
     let printed = format!("{}", module_op.disp(ctx));

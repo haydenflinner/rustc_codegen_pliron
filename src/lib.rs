@@ -25,6 +25,7 @@ extern crate rustc_target;
 mod abi;
 mod asm;
 mod builder;
+mod cgupool;
 mod consts;
 mod context;
 mod intrinsic;
@@ -84,6 +85,9 @@ pub struct PlironModule {
     pub obj: Vec<u8>,
     pub ir: String,
     pub asm: String,
+    /// `Some` while this module's finish work is queued in `cgupool`;
+    /// `optimize` resolves it into `obj`/`ir`/`asm` on a worker thread.
+    pub pending: Option<u32>,
 }
 
 pub struct PlironBuffer(Vec<u8>);
@@ -156,7 +160,7 @@ fn native_feat(sess: &Session, feature: &str) -> bool {
 fn native_feat(_sess: &Session, _feature: &str) -> bool {
     false
 }
-fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
+pub(crate) fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     // COFF has no GOT: is_pic would emit sym@GOTPCREL loads that read the
     // symbol's bytes rather than its address.
@@ -374,7 +378,7 @@ pub(crate) struct RustcHost<'a> {
 }
 
 /// `Session` is not `Sync`; worker threads only see the profiler.
-pub(crate) struct RustcProf<'a>(&'a SelfProfilerRef);
+pub(crate) struct RustcProf<'a>(pub(crate) &'a SelfProfilerRef);
 
 impl lower::Prof for RustcProf<'_> {
     fn activity(&self, nm: &'static str, arg: Option<&str>) -> Box<dyn Send + '_> {
@@ -434,7 +438,7 @@ const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
     ("PLIRON_CGDUMP2", "pliron::dump", tracing::Level::INFO),
     ("PLIRON_XPACK_CLIF", "pliron::dump", tracing::Level::INFO),
     ("PLIRON_VCODE", "pliron::dump", tracing::Level::INFO),
-    ("PLIRON_WASM_LOOPS", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_WASM_DUMP", "pliron::dump", tracing::Level::INFO),
     ("PLIRON_JT_PROF", "pliron::jumpthread", tracing::Level::INFO),
     (
         "PLIRON_JT_PROF2",
@@ -462,7 +466,6 @@ const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
         "pliron::stepcache",
         tracing::Level::INFO,
     ),
-    ("PLIRON_WASM_LICM", "pliron::wasm", tracing::Level::INFO),
     ("PLIRON_PGO", "pliron::pgo", tracing::Level::INFO),
     ("PLIRON_PGO_USE", "pliron::pgo", tracing::Level::INFO),
     (
@@ -709,382 +712,50 @@ fn tracing_init() {
 /// Wrap an ir-opt pass call in a tracing span: `PLIRON_TRACE=pliron::iropt`
 /// prints each pass's `time.busy` on span close (see `tracing_init`).
 macro_rules! pt {
-    ($cx:expr, $n:literal, $e:expr) => {{
+    ($prof:expr, $cgu:expr, $n:literal, $e:expr) => {{
         let _s = tracing::info_span!(target: "pliron::iropt", $n).entered();
         // Same interval in rustc's self-profile: `-Zself-profile` shows
         // `pliron_ir_<pass>` next to LLVM's own `LLVM_*` activities.
-        let _pg = $cx
-            .tcx
-            .sess
-            .prof
-            .generic_activity(concat!("pliron_ir_", $n));
-        $e
+        let _pg = $prof.generic_activity(concat!("pliron_ir_", $n));
+        let _t = std::time::Instant::now();
+        let _r = $e;
+        pliron_cfg::trace($n, _t.elapsed().as_secs_f64() * 1e3, $cgu);
+        _r
     }};
 }
+pub(crate) use pt;
 
 fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
-    let emit_ir = cx
-        .tcx
-        .sess
-        .opts
-        .output_types
-        .contains_key(&OutputType::LlvmAssembly)
-        || crate::env_set("PLIRON_DUMP");
-    let ir = if emit_ir {
-        cx.print_ir()
-    } else {
-        String::new()
-    };
-    if crate::env_set("PLIRON_DUMP") {
-        if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::dump", "==== {name} ====\n{ir}")
-        };
-    }
-    if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
-        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        inline::run(
+    let cfg = cgupool::CrateCfg::new(cx.tcx);
+    let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+    let ir = cgupool::finish_pre(ctx, st, cx.module, name, &cfg);
+    let mut iropt = std::time::Duration::ZERO;
+    if cfg.optimize {
+        let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
+        let _pgiro = cx.tcx.sess.prof.generic_activity("pliron_iropt");
+        let t = std::time::Instant::now();
+        cgupool::iropt_head(
             ctx,
             st,
-            true,
-            inline::SMALL_LIMIT,
-            None,
-            true,
-            None,
-            &mut None,
+            &cx.tcx.sess.prof,
+            name,
+            &cfg,
+            cgupool::FactsMode::Share,
         );
-        domcheck::run(ctx, st, "always-inline");
-        inline::dead_fns(ctx, st);
+        cgupool::iropt_tail(ctx, st, &cx.tcx.sess.prof, name, &cfg, None);
+        iropt = t.elapsed();
     }
-    // PGO: `PLIRON_PGO=<dir>` instruments every body (source-level
-    // attribution -- the inliner clones counters, keeping counts on the
-    // callee), `PLIRON_PGO_USE=<file>` loads a profile before the
-    // pipeline. Both run after the O0 always-inline round so
-    // fingerprints are computed at the same CFG stage in gen and use
-    // builds.
-    if crate::env_set("PLIRON_PGO") || crate::env_set("PLIRON_PGO_USE") {
-        let fmt = match cx.tcx.sess.target.options.binary_format {
-            rustc_target::spec::BinaryFormat::MachO => pgo::ObjFmt::MachO,
-            rustc_target::spec::BinaryFormat::Coff => pgo::ObjFmt::Coff,
-            rustc_target::spec::BinaryFormat::Wasm => pgo::ObjFmt::Wasm,
-            _ => pgo::ObjFmt::Elf,
-        };
-        let asm = {
-            let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-            let mut asm = None;
-            if crate::env_set("PLIRON_PGO") {
-                let (hdr, ctor, _) = pgo::instrument(ctx, st, name, fmt);
-                asm = pgo::ctor_asm(
-                    &hdr,
-                    &ctor,
-                    matches!(cx.tcx.sess.target.arch, rustc_target::spec::Arch::AArch64),
-                    fmt,
-                );
-            }
-            if let Some(f) = crate::env_get("PLIRON_PGO_USE") {
-                pgo::load(ctx, st, f);
-            }
-            asm
-        };
-        if let Some(a) = asm {
-            // The ctor's `jmp __pliron_prof_register` resolves through the
-            // splice's symbol map like any other callee -- declare the
-            // import so Mach-O gets its `_` mangle (and every format a
-            // real undefined symbol rather than an asm-only name).
-            let fty = cx.type_func(&[cx.type_ptr()], cx.type_void());
-            cx.declare_fn_sym(
-                "__pliron_prof_register",
-                fty,
-                Linkage::Import,
-                Exts::default(),
-            );
-            cx.st.borrow_mut().asm.push_str(&a);
-        }
+    let host = RustcHost {
+        sess: cx.tcx.sess,
+        prof: RustcProf(&cx.tcx.sess.prof),
+    };
+    let fin = cgupool::finish_b(ctx, st, cx.module, name, &cfg, &host, ir, iropt);
+    PlironModule {
+        obj: fin.obj,
+        ir: fin.ir,
+        asm: fin.asm,
+        pending: None,
     }
-    let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
-    let _pgiro = cx.tcx.sess.prof.generic_activity("pliron_iropt");
-    if cx.tcx.sess.opts.optimize != OptLevel::No {
-        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        let wasm = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32;
-        let small = wasm
-            || matches!(
-                cx.tcx.sess.opts.optimize,
-                OptLevel::Size | OptLevel::SizeMin
-            );
-        let small_limit = if wasm {
-            inline::WASM_LIMIT
-        } else {
-            inline::SMALL_LIMIT
-        };
-        if pass_enabled("PLIRON_FROZEN") {
-            pt!(
-                cx,
-                "frozen",
-                st.frozen = context::frozen_values(ctx, st).into_iter().collect()
-            );
-        }
-        if pass_enabled("PLIRON_NOALIAS_FWD") {
-            pt!(
-                cx,
-                "noalias",
-                st.noalias = context::noalias_values(ctx, st)
-                    .into_iter()
-                    .map(|(v, d, w)| (v, (d, w)))
-                    .collect()
-            );
-        }
-        if pass_enabled("PLIRON_NNARGS") {
-            pt!(
-                cx,
-                "nnargs",
-                st.nnargs = context::nonnull_values(ctx, st).into_iter().collect()
-            );
-        }
-        let mut adj = None;
-        let d1 = pt!(
-            cx,
-            "inline",
-            inline::run(ctx, st, small, small_limit, None, false, None, &mut adj)
-        );
-        // Second round: callsites that just moved into a hot caller (e.g.
-        // `get`'s `hash_one` landing inside `main`'s probe loop) never got
-        // scored in their new context -- re-run so the loop bonus applies.
-        // Incremental: rescore only the callers round 1 inlined into, plus
-        // callers of callees that lost a callsite (a now-single callee can
-        // newly inline free there).
-        if pass_enabled("PLIRON_INLINE_ITER") && !d1.callers.is_empty() {
-            let mut touched = d1.callers;
-            if let Some(a) = &adj {
-                for c in &d1.callees {
-                    if let Some(v) = a.callers_of.get(c) {
-                        touched.extend(v.iter().cloned());
-                    }
-                }
-            }
-            pt!(
-                cx,
-                "inline2",
-                inline::run(
-                    ctx,
-                    st,
-                    small,
-                    small_limit,
-                    None,
-                    false,
-                    Some(&touched),
-                    &mut adj,
-                )
-            );
-        }
-        pt!(cx, "domcheck:inline", domcheck::run(ctx, st, "inline"));
-        if pass_enabled("PLIRON_SPEC") {
-            pt!(cx, "spec", spec::run(ctx, st));
-            pt!(cx, "domcheck:spec", domcheck::run(ctx, st, "spec"));
-        }
-        // Emulated EH (wasm, COFF) unwinds through ordinary calls the body
-        // scan can't see -- `llvm.wasm.throw`-class entries are declared
-        // `!can_unwind` externs and `pliron.eh.rethrow` is a CallIntrinsicOp —
-        // so nounwind.rs models them explicitly (THROWS + the rethrow check).
-        // On COFF the inference also lets lowering skip the flag check after
-        // calls that can't throw.
-        let coff_eh = cx.tcx.sess.target.options.binary_format
-            == rustc_target::spec::BinaryFormat::Coff
-            && cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
-        if pass_enabled("PLIRON_NOUNWIND") || coff_eh {
-            pt!(cx, "nounwind", nounwind::run(ctx, st));
-        }
-        if pass_enabled("PLIRON_SRET2REG") {
-            pt!(cx, "sret2reg", abi::run(ctx, st));
-            pt!(cx, "domcheck:abi", domcheck::run(ctx, st, "abi"));
-        }
-        if crate::env_is("PLIRON_DEADARG", "1") {
-            pt!(cx, "deadarg", abi::dead_args(ctx, st));
-        }
-        if pass_enabled("PLIRON_INSTCOMBINE") {
-            pt!(cx, "instcombine", instcombine::run(ctx, st));
-            pt!(cx, "domcheck:ic", domcheck::run(ctx, st, "instcombine"));
-        }
-        if pass_enabled("PLIRON_MEMCPYOPT") {
-            pt!(cx, "memcpyopt", memcpyopt::run(ctx, st));
-            pt!(cx, "domcheck:mc", domcheck::run(ctx, st, "memcpyopt"));
-        }
-        if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
-            pt!(cx, "sroa-fwd", sroa::forward(ctx, st));
-            pt!(cx, "domcheck:sf", domcheck::run(ctx, st, "sroa-fwd"));
-        }
-        if pass_enabled("PLIRON_PHISIMP") {
-            pt!(cx, "phisimp", phisimp::run(ctx, st));
-            pt!(cx, "domcheck:ps", domcheck::run(ctx, st, "phisimp"));
-        }
-        // Run ahead of sroa: its `copyable_arg` check consults `st.nowrite`
-        // and `st.nocapture` to decide which call args can take a fresh copy.
-        if pass_enabled("PLIRON_NOWRITE") {
-            pt!(cx, "nowrite", nowrite::run(ctx, st));
-        }
-        if pass_enabled("PLIRON_NOCAP") {
-            pt!(cx, "nocap", nocapture::run(ctx, st));
-        }
-        if pass_enabled("PLIRON_SROA") {
-            pt!(cx, "sroa", sroa::run(ctx, st));
-            pt!(cx, "domcheck:sroa", domcheck::run(ctx, st, "sroa"));
-        }
-        if pass_enabled("PLIRON_CONSTLOAD") {
-            pt!(cx, "constload", constload::run(ctx, st));
-            pt!(cx, "domcheck:cl", domcheck::run(ctx, st, "constload"));
-            // Inlining + SROA make vtable pointers constant: call those slots
-            // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
-            if pass_enabled("PLIRON_DEVIRT") {
-                let (sites, owners) = pt!(cx, "devirt", inline::devirt(ctx, st));
-                pt!(cx, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
-                if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
-                    // Passes since the inline rounds may have moved calls —
-                    // rebuild the adjacency fresh.
-                    adj = None;
-                    pt!(
-                        cx,
-                        "devirt-inline",
-                        inline::run(
-                            ctx,
-                            st,
-                            small,
-                            small_limit,
-                            Some(&sites),
-                            false,
-                            Some(&owners),
-                            &mut adj,
-                        )
-                    );
-                    pt!(cx, "domcheck:di", domcheck::run(ctx, st, "devirt-inline"));
-                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
-                        pt!(cx, "sroa-fwd2", sroa::forward(ctx, st));
-                    }
-                    if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
-                        pt!(cx, "phisimp2", phisimp::run(ctx, st));
-                    }
-                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_DEVIRT_SROA") {
-                        pt!(cx, "sroa2", sroa::run(ctx, st));
-                    }
-                    if pass_enabled("PLIRON_DEVIRT_CL") {
-                        pt!(cx, "constload2", constload::run(ctx, st));
-                    }
-                }
-            }
-        }
-        // Re-run capture inference now that devirt/constload have made
-        // callee sets final: indirect calls through fn-ptr slots resolve to
-        // `arg` edges, and params those callees don't keep go non-capturing.
-        // The earlier run stays for sroa's `copyable_arg` check.
-        if pass_enabled("PLIRON_NOCAP") {
-            pt!(cx, "nocap2", nocapture::run(ctx, st));
-        }
-        // IPO return-value attributes, after inlining/devirt so remaining
-        // direct calls are the final set. `nnret` is consumed at lowering
-        // (nonnull call results feed jumpthread); `retarg` folds call
-        // results to the returned argument in place.
-        if pass_enabled("PLIRON_NNRET") {
-            pt!(cx, "nnret", nnret::run(ctx, st));
-        }
-        if pass_enabled("PLIRON_RETARG") {
-            pt!(cx, "retarg", retarg::run(ctx, st));
-            pt!(cx, "domcheck:ra", domcheck::run(ctx, st, "retarg"));
-        }
-        // Provably-dead panic paths, on the canonical post-sroa IR (the
-        // bounds check's slot indirections are gone by now): a callee whose
-        // only unwind path is a dead bounds-check panic becomes nounwind
-        // and its writes-only-on-nonreturn nowrite=Some(false) upgrades to
-        // Some(true), which dead-callsite elim consumes. nounwind/nowrite
-        // re-run so the summaries see the cleaned CFG.
-        if pass_enabled("PLIRON_GUARDELIM") {
-            pt!(cx, "guardelim", guardelim::run(ctx, st));
-        }
-        if pass_enabled("PLIRON_NOUNWIND") || coff_eh {
-            pt!(cx, "nounwind2", nounwind::run(ctx, st));
-        }
-        if pass_enabled("PLIRON_NOWRITE") {
-            pt!(cx, "nowrite2", nowrite::run(ctx, st));
-        }
-        // `willreturn` on the final post-inline/devirt call set: callgvn
-        // needs it to erase still-used dedups and to speculate hoists.
-        if pass_enabled("PLIRON_WILLRETURN") {
-            pt!(cx, "willreturn", willreturn::run(ctx, st));
-        }
-        // Dead-call elim + readonly call dedup + loop-call hoist, on the
-        // final post-inline call set.
-        if pass_enabled("PLIRON_CALLGVN") {
-            pt!(cx, "callgvn", callgvn::run(ctx, st));
-            pt!(cx, "domcheck:cg", domcheck::run(ctx, st, "callgvn"));
-        }
-        // `acc ^= inv` loop idiom: a hoisted call's result feeding only
-        // an even-count xor recurrence leaves the loop a no-op -- erase
-        // it, then re-run callgvn so the now-unused call dies too.
-        if pass_enabled("PLIRON_XORIDEM") {
-            pt!(cx, "xoridem", xoridem::run(ctx, st));
-            if pass_enabled("PLIRON_CALLGVN") {
-                pt!(cx, "callgvn2", callgvn::run(ctx, st));
-                pt!(cx, "domcheck:cg2", domcheck::run(ctx, st, "callgvn2"));
-            }
-        }
-        pliron_clif_lower::scan::pass_flags(st);
-        if pass_enabled("PLIRON_DEADFN") {
-            inline::dead_fns(ctx, st);
-        }
-    }
-    drop(_siro);
-    if crate::env_set("PLIRON_DUMP_OPT") {
-        if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", cx.print_ir())
-        };
-    }
-    if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        // The CLIF-pipeline path is the default — it runs the full
-        // pliron-clif-opt suite (and loopvec under +simd128); the dialect
-        // path (`PLIRON_WASM_CLIF=0`) is the minimal fallback.
-        let obj = if crate::env_get("PLIRON_WASM_CLIF") != Some("0") {
-            wasm::lower_to_wasm_clif(
-                &cx.pctx.borrow(),
-                &cx.st.borrow(),
-                cx.tcx.sess,
-                name,
-                &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
-                cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-            )
-        } else {
-            wasm::lower_to_wasm(
-                &cx.pctx.borrow(),
-                &cx.st.borrow(),
-                name,
-                &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
-                cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-            )
-        };
-        return PlironModule {
-            obj,
-            ir,
-            asm: String::new(),
-        };
-    }
-    let isa = build_isa(
-        cx.tcx.sess,
-        cx.tcx
-            .features()
-            .enabled(rustc_span::sym::explicit_tail_calls)
-            || crate::env_set("PLIRON_TAILCALL"),
-    );
-    let hot = crate::env_get("PLIRON_HOT")
-        .is_some_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
-    let obj = lower::lower_to_object(
-        cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-        hot,
-        &cx.pctx.borrow(),
-        &cx.st.borrow(),
-        isa,
-        name,
-        &RustcHost {
-            sess: cx.tcx.sess,
-            prof: RustcProf(&cx.tcx.sess.prof),
-        },
-    );
-    let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
-    PlironModule { obj, ir, asm }
 }
 
 /// Whether a rustc target feature is enabled in the *base* target machine:
@@ -1300,6 +971,11 @@ impl CodegenBackend for PlironCodegenBackend {
 
     fn init(&mut self, _sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
         tracing_init();
+        // Which source tree built this dylib (harness/src-rev.sh) — check it
+        // before trusting a self-host or bisect result.
+        if pliron_cfg::env_set("PLIRON_VERSION") {
+            eprintln!("pliron backend {}", env!("PLIRON_SRC_REV"));
+        }
         // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
         rustc_session::CodegenBackendInit {
             thin_lto_supported: false,
@@ -1314,6 +990,13 @@ impl CodegenBackend for PlironCodegenBackend {
     }
 
     fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        if cgupool::enabled(tcx) {
+            cgupool::begin(tcx);
+        } else {
+            // Even on the serial path the facts table is per-ordinal now;
+            // a fresh crate must not inherit a previous one's ordinals.
+            pliron_ir_opt::state::reset_facts();
+        }
         Box::new(codegen_crate(self.clone(), tcx))
     }
 
@@ -1381,7 +1064,10 @@ impl ExtraBackendMethods for PlironCodegenBackend {
         // slot, template boundary markers, _fltused, and the PE entry
         // thunks -- so `rust-lld` plus synthesized import libraries (see
         // tools/mkwinlibs) need nothing from a Visual Studio install.
-        let crtfree = coff && std::env::var_os("PLIRON_CRTFREE").is_some_and(|v| v != "0");
+        // Opt-in: a stock `link.exe` + real CRT link resolves the same
+        // symbols from msvcrt.lib, so emitting the stubs unconditionally
+        // produces `__security_cookie` LNK2005/ucrtbase LNK1104 dupes.
+        let crtfree = coff && pliron_cfg::env_is("PLIRON_CRTFREE", "1");
         if crtfree {
             let i32t = cx.type_i32();
             let ptr = cx.type_ptr();
@@ -1587,6 +1273,23 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 },
             );
         }
+        if cgupool::enabled(tcx) {
+            // The allocator shim is created ahead of every CGU, so its
+            // store ordinal is 0 — the same position its `share_facts`
+            // call holds on the serial path.
+            let pending = cgupool::submit(
+                module_name.to_string(),
+                cx.pctx.into_inner(),
+                cx.st.into_inner(),
+                cx.module,
+            );
+            return PlironModule {
+                obj: Vec::new(),
+                ir: String::new(),
+                asm: String::new(),
+                pending: Some(pending),
+            };
+        }
         finish_module(&cx, module_name)
     }
 
@@ -1609,6 +1312,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
 }
 
 fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
+    let tmod = std::time::Instant::now();
     let _smod = tracing::info_span!(target: "pliron::module", "module", cgu = %cgu_name).entered();
     let _pgmod = tcx
         .sess
@@ -1633,6 +1337,14 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
         };
     }
     for &inst in &extra {
+        // Rustc's `used` lists don't cover copy-to-copy calls, so these
+        // bodies can end up with zero `direct_callee`-resolvable callers
+        // while still being referenced at lowering — keep them off
+        // `dead_fns` (see `State::xcgu_copies`).
+        cx.st
+            .borrow_mut()
+            .xcgu_copies
+            .insert(tcx.symbol_name(inst).name.to_string());
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),
@@ -1640,7 +1352,29 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             rustc_middle::mono::Visibility::Default,
         );
     }
+    let dump = crate::env_set("PLIRON_MONODUMP");
+    if dump {
+        eprintln!("PLIRON-MONO {cgu_name} items={} extra={}", mono_items.len(), extra.len());
+        for &inst in &extra {
+            eprintln!("PLIRON-MONO {cgu_name} EXTRA {}", inst);
+        }
+    }
     for &(mono_item, data) in &mono_items {
+        // `inlined` local-copy and `Internal` instances share the same
+        // dangling-call hazard as `extra` copies: xcgu copies elsewhere
+        // in this CGU can call them through ops `direct_callee` can't
+        // resolve, and neither shows up as a caller in `call_counts`.
+        if data.inlined || data.linkage == rustc_attr_ir::Linkage::Internal {
+            if let rustc_middle::mono::MonoItem::Fn(inst) = mono_item {
+                cx.st
+                    .borrow_mut()
+                    .xcgu_copies
+                    .insert(tcx.symbol_name(inst).name.to_string());
+            }
+        }
+        if dump {
+            eprintln!("PLIRON-MONO {cgu_name} {:?} inlined={} vis={:?}", (mono_item, data.linkage), data.inlined, data.visibility);
+        }
         mono_item.predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),
@@ -1665,10 +1399,42 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             cgu_name.as_str(),
             data,
         );
+        if let Some(w) = crate::env_get("PLIRON_STATS_XCGU")
+            && rustc_middle::ty::print::with_no_trimmed_paths!(inst.to_string())
+                .contains(&w)
+            && pliron_cfg::tracing_on()
+        {
+            let sym = tcx.symbol_name(inst).name;
+            let st = cx.st.borrow();
+            let f = st.funcs.get(sym);
+            tracing::info!(target: "pliron::stats", "xcgu def {} -> {sym}: linkage={:?} body={}",
+                rustc_middle::ty::print::with_no_trimmed_paths!(inst.to_string()),
+                f.map(|f| f.linkage),
+                f.is_some_and(|f| has_body(&*cx.pctx.borrow(), f.op)),
+            );
+        }
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
     drop(_sdef);
-    let m = finish_module(&cx, cgu_name.as_str());
+    let m = if cgupool::enabled(tcx) {
+        // Hand the finished pliron module to the worker pool: IR-opt,
+        // the facts merge and CLIF lowering all run off the main thread.
+        let pending = cgupool::submit(
+            cgu_name.to_string(),
+            cx.pctx.into_inner(),
+            cx.st.into_inner(),
+            cx.module,
+        );
+        PlironModule {
+            obj: Vec::new(),
+            ir: String::new(),
+            asm: String::new(),
+            pending: Some(pending),
+        }
+    } else {
+        finish_module(&cx, cgu_name.as_str())
+    };
+    pliron_cfg::trace("*modgen*", tmod.elapsed().as_secs_f64() * 1e3, cgu_name.as_str());
     ModuleCodegen::new_regular(cgu_name.to_string(), m)
 }
 
@@ -1706,7 +1472,10 @@ impl WriteBackendMethods for PlironCodegenBackend {
     type ThinData = ();
 
     fn supports_parallel(&self) -> bool {
-        false
+        // The jobserver-token worker pool schedules `optimize` items;
+        // each one runs our queued IR-opt + lowering for whichever CGU
+        // is runnable (see `cgupool`).
+        true
     }
 
     fn target_machine_factory(
@@ -1743,11 +1512,18 @@ impl WriteBackendMethods for PlironCodegenBackend {
 
     fn optimize(
         _cgcx: &CodegenContext,
-        _prof: &SelfProfilerRef,
-        _shared_emitter: &SharedEmitter,
-        _module: &mut ModuleCodegen<PlironModule>,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
+        module: &mut ModuleCodegen<PlironModule>,
         _config: &ModuleConfig,
     ) {
+        let Some(key) = module.module_llvm.pending.take() else {
+            return;
+        };
+        let fin = cgupool::run_until(key, prof, shared_emitter);
+        module.module_llvm.obj = fin.obj;
+        module.module_llvm.ir = fin.ir;
+        module.module_llvm.asm = fin.asm;
     }
 
     fn optimize_and_codegen_thin(

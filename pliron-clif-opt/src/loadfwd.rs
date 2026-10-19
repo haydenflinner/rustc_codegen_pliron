@@ -15,6 +15,7 @@ use cranelift_codegen::ir::{
     Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 
 const MAX_ENTRIES: usize = 64;
 const MAX_ITERS: usize = 32;
@@ -42,13 +43,13 @@ type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
 
 /// `cur` is inside region `target` (or is it): regions nest through
 /// `region_parent` — same walk licm does for scoped loads.
-pub fn in_region(cur: Region, target: Region, rpar: &FxHashMap<Region, Region>) -> bool {
+pub fn in_region(cur: Region, target: Region, rpar: &pliron::cols::ColMap<Region, Region>) -> bool {
     let mut r = Some(cur);
     while let Some(x) = r {
         if x == target {
             return true;
         }
-        r = rpar.get(&x).copied().filter(|&n| n != x);
+        r = rpar.get(x).copied().filter(|&n| n != x);
     }
     false
 }
@@ -337,6 +338,65 @@ pub fn root_pair(
     ((r, o), n)
 }
 
+/// Per-phase memo of root/normalization walks — `ps`/`na`/`na0`/
+/// `bnd`/`pm` are fixed while a phase analyzes (`func` mutates only
+/// through the collected edits and add-only `pre` inserts), so a base
+/// pointer repeats its ≤16-hop chain walk once per phase, not once
+/// per load/store/fixpoint round. `pair` also serves `norm_root`
+/// (it's `root_pair`'s `.1`); `n0` covers the `na0` name; `rm` is
+/// `ms_of`'s bounded `root_min`.
+#[derive(Default)]
+struct NrMemo {
+    pair: std::cell::RefCell<FxHashMap<Value, ((Root, i64), (Root, i64))>>,
+    n0: std::cell::RefCell<FxHashMap<Value, (Root, i64)>>,
+    rm: std::cell::RefCell<FxHashMap<Value, (Root, i64)>>,
+}
+
+impl NrMemo {
+    fn pair(
+        &self,
+        func: &Function,
+        ps: &FxHashMap<Value, Value>,
+        na: &FxHashSet<Value>,
+        v: Value,
+    ) -> ((Root, i64), (Root, i64)) {
+        *self
+            .pair
+            .borrow_mut()
+            .entry(v)
+            .or_insert_with(|| root_pair(func, ps, na, v))
+    }
+
+    fn n0(
+        &self,
+        func: &Function,
+        ps: &FxHashMap<Value, Value>,
+        na0: &FxHashSet<Value>,
+        v: Value,
+    ) -> (Root, i64) {
+        *self
+            .n0
+            .borrow_mut()
+            .entry(v)
+            .or_insert_with(|| norm_root(func, ps, na0, v))
+    }
+
+    fn rm(
+        &self,
+        func: &Function,
+        ps: &FxHashMap<Value, Value>,
+        na: &FxHashSet<Value>,
+        bnd: &FxHashMap<Value, u64>,
+        v: Value,
+    ) -> (Root, i64) {
+        *self
+            .rm
+            .borrow_mut()
+            .entry(v)
+            .or_insert_with(|| root_min(func, ps, na, Some(bnd), v))
+    }
+}
+
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite. `ms`,
 /// when set, is a proven `(root, minimum offset)` for the store's
 /// address (from `root_min` through bounded addends): the store then
@@ -353,7 +413,7 @@ pub fn kill(
     invs: &FxHashSet<Loc>,
     cur: Option<Region>,
     invreg: &FxHashMap<Loc, Vec<Region>>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
 ) {
     let n = i64::from(ty.bytes());
     // `iso` roots can't be reached by untracked pointers at all; `ncc`
@@ -521,16 +581,20 @@ pub fn isolated_escapes(
                 let ok = match data {
                     InstructionData::Load { .. } => k == 0,
                     InstructionData::Store { .. } => k == 1,
-                    // The result is tracked under the same root, or is
-                    // itself a distinct `noalias` scope (a param bound to
-                    // `base + k`, like `&v[1..]` next to `pivot`): either
-                    // way the address stays tracked.
+                    // The result must itself normalize to `r`: a `base + k`
+                    // cursor keys under `r` only when the peel reaches the
+                    // same object. A scoped (`noalias`) result that does NOT
+                    // normalize to `r` — e.g. `slot + i*16`, whose demand
+                    // keys under `V(res)` — is an untracked alias of the
+                    // slot's memory, not a benign use: keeping the slot
+                    // isolated would let stores die under demands rooted at
+                    // the scope name (trait-object-arrays-11205 SIGSEGV).
                     InstructionData::Binary {
                         opcode: Opcode::Iadd,
                         ..
                     } => {
                         let res = func.dfg.first_result(i);
-                        rt(func, res).0 == r || noalias.contains(&res)
+                        rt(func, res).0 == r
                     }
                     // A comparison can't carry the pointer anywhere.
                     _ if matches!(data.opcode(), Opcode::Icmp) => true,
@@ -630,11 +694,12 @@ fn transfer(
     cur: Option<Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     invreg: &mut FxHashMap<Loc, Vec<Region>>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     bnd: &FxHashMap<Value, u64>,
     pm: &FxHashMap<Value, (Root, i64)>,
     eh: bool,
+    nm: &NrMemo,
 ) {
     let mut rw = rw;
     // A proven `(root, min offset)` for an address `root` left opaque —
@@ -643,7 +708,7 @@ fn transfer(
     // keep locs the store provably writes above. `off` is the caller's
     // exact offset from the opaque root value.
     let ms_of = |rv: Value, off: i64| {
-        let (mr, mo) = root_min(func, ps, na, Some(bnd), rv);
+        let (mr, mo) = nm.rm(func, ps, na, bnd, rv);
         let (mr, mo) = match mr {
             Root::V(q) => match pm.get(&q) {
                 Some(&(qr, qo)) => (qr, mo.wrapping_add(qo)),
@@ -670,7 +735,7 @@ fn transfer(
                 // Loc keys use the normalized root — `ofz` bookkeeping
                 // keeps the scope-named one, since its byte bound is
                 // measured from the operand, not the slot.
-                let ((r0, o0), (r, o)) = root_pair(func, ps, na, arg);
+                let ((r0, o0), (r, o)) = nm.pair(func, ps, na, arg);
                 let off = o.wrapping_add(i64::from(i32::from(offset)));
                 let off0 = o0.wrapping_add(i64::from(i32::from(offset)));
                 let loc = (r, off, ty);
@@ -727,7 +792,7 @@ fn transfer(
             } if notrap(func, i) => {
                 let val = func.dfg.resolve_aliases(args[0]);
                 let ty = func.dfg.value_type(val);
-                let (r, o) = norm_root(func, ps, na, args[1]);
+                let (r, o) = nm.pair(func, ps, na, args[1]).1;
                 let o = o.wrapping_add(i64::from(i32::from(offset)));
                 let ms = match r {
                     Root::V(rv) => ms_of(rv, o),
@@ -738,7 +803,7 @@ fn transfer(
                 // under `na0` — the same memory can carry two root names.
                 // Kill under the `na0` name too or the store dodges the
                 // classification it was made under.
-                let (r0, o0) = norm_root(func, ps, na0, args[1]);
+                let (r0, o0) = nm.n0(func, ps, na0, args[1]);
                 let o0 = o0.wrapping_add(i64::from(i32::from(offset)));
                 if r0 != r || o0 != o {
                     kill(av, r0, o0, ty, None, iso, ncc, invs, cur, invreg, rpar);
@@ -754,14 +819,14 @@ fn transfer(
                     } = func.dfg.insts[si]
                 {
                     for &a in &sargs[1..] {
-                        let (ra, oa) = norm_root(func, ps, na, a);
+                        let (ra, oa) = nm.pair(func, ps, na, a).1;
                         let oa = oa.wrapping_add(o);
                         let ms = match ra {
                             Root::V(arv) => ms_of(arv, oa),
                             _ => None,
                         };
                         kill(av, ra, oa, ty, ms, iso, ncc, invs, cur, invreg, rpar);
-                        let (ra0, oa0) = norm_root(func, ps, na0, a);
+                        let (ra0, oa0) = nm.n0(func, ps, na0, a);
                         let oa0 = oa0.wrapping_add(o);
                         if ra0 != ra || oa0 != oa {
                             kill(av, ra0, oa0, ty, None, iso, ncc, invs, cur, invreg, rpar);
@@ -783,13 +848,13 @@ fn transfer(
                     // a fn pointer, harmless to include.
                     let mut reach: FxHashSet<Root> = FxHashSet::default();
                     for v in func.dfg.inst_values(i) {
-                        reach.insert(norm_root(func, ps, na, v).0);
+                        reach.insert(nm.pair(func, ps, na, v).1.0);
                         // `iso`/`ncc` were classified under `na0`
                         // (`noalias` alone); a `ofrozen` stop on an arg
                         // (`na` includes them) renames its root, so the
                         // plain-`noalias` root must be in `reach` too or
                         // an ncc loc survives a call that mutates it.
-                        reach.insert(norm_root(func, ps, na0, v).0);
+                        reach.insert(nm.n0(func, ps, na0, v).0);
                     }
                     av.retain(|&(r, o, t), _| {
                         iso.contains(&r)
@@ -837,11 +902,14 @@ fn meet(acc: &mut Option<Avail>, x: &Avail) {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     func: &mut Function,
+    cfg: &ControlFlowGraph,
+    pf: &crate::proots::Facts,
+    ps: &FxHashMap<Value, Value>,
     noalias: &FxHashSet<Value>,
     inv_insts: &FxHashSet<Inst>,
     ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
     breg: &FxHashMap<Block, Region>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
     nocap: &FxHashSet<(Inst, u32)>,
@@ -874,12 +942,14 @@ pub fn run(
     };
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
-    let t0 = std::time::Instant::now();
-    let mut cfg = ControlFlowGraph::with_function(func);
-    let mut rpo = rpo_of(&cfg);
+    let t0 = prof2.then(std::time::Instant::now);
+    // `cfg`/`pf`/`ps` are step-entry snapshots from `Analysis::lf_inputs`
+    // (shared with dse's alias map); a rebuilt CFG after `pre` mutates
+    // goes in `cfg2` below. `pf`/`ps` intentionally stay stale across
+    // that mutation, exactly as the one-shot build did.
+    let mut cfg2: Option<ControlFlowGraph> = None;
+    let mut rpo = rpo_of(cfg);
     let mut n = 0;
-    let pf = crate::proots::facts(func);
-    let ps = &crate::proots::alias_of(&pf);
     // `ms` disjointness pays off in `pre` (more locs survive → more
     // redundancy hoisting — fewer loads execute) but not in the plain
     // forwarding pass: there it only swaps a load for a value defined
@@ -889,7 +959,7 @@ pub fn run(
     let pre_ms = crate::pass_enabled("PLIRON_MINROOT_PRE");
     let fwd_ms = crate::env_set("PLIRON_MINROOT_FWD");
     let bnd = if pre_ms || fwd_ms {
-        crate::proots::bounds(func, &pf)
+        crate::proots::bounds(func, pf)
     } else {
         FxHashMap::default()
     };
@@ -898,7 +968,7 @@ pub fn run(
     // the real set so operand values don't get function-wide immunity.
     let stop: FxHashSet<Value> = noalias.iter().chain(ofrozen.keys()).copied().collect();
     let pm = if pre_ms || fwd_ms {
-        pmroots(func, ps, &stop, &bnd, &pf)
+        pmroots(func, ps, &stop, &bnd, pf)
     } else {
         FxHashMap::default()
     };
@@ -922,31 +992,33 @@ pub fn run(
     }
     if prof2 {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+            tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3)
         };
     }
-    let tt = |name: &str, t0: std::time::Instant| {
-        if prof2 {
+    let tt = |name: &str, t0: Option<std::time::Instant>| {
+        if let (true, Some(t0)) = (prof2, t0) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::loadfwd", "    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
             };
         }
     };
     if crate::pass_enabled("PLIRON_LOADPRE") {
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
         n += pre(
-            func, ps, &stop, noalias, &cfg, &rpo, entry, &iso, &ncc, pbnd, ppm,
+            func, ps, &stop, noalias, cfg, &rpo, entry, &iso, &ncc, pbnd, ppm,
         );
         tt("pre", t0);
         if n > 0 {
-            cfg = ControlFlowGraph::with_function(func);
-            rpo = rpo_of(&cfg);
+            let c = ControlFlowGraph::with_function(func);
+            rpo = rpo_of(&c);
+            cfg2 = Some(c);
         }
     }
+    let cfg: &ControlFlowGraph = cfg2.as_ref().unwrap_or(cfg);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut invs: FxHashSet<Loc> = FxHashSet::default();
     let mut invreg: FxHashMap<Loc, Vec<Region>> = FxHashMap::default();
@@ -969,58 +1041,77 @@ pub fn run(
         }
         acc
     };
-    let mut stable = false;
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let mut iters = 0;
-    for _ in 0..MAX_ITERS {
+    // Worklist over RPO order: `meet` only shrinks loc sets (a must
+    // analysis), so the unique fixpoint is order-independent and a
+    // block needs re-transferring only after one of its inputs
+    // actually changed — a per-round full rescan just re-verifies
+    // stable blocks. The bail mirrors `MAX_ITERS` rounds: a block
+    // whose out changes more than that would have needed one more
+    // RPO round than the old loop allowed.
+    let mut work: VecDeque<Block> = rpo.iter().copied().collect();
+    let mut inq: FxHashSet<Block> = work.iter().copied().collect();
+    let mut nch: FxHashMap<Block, u32> = FxHashMap::default();
+    let mut stable = true;
+    // One root-walk memo for the whole fixpoint + scan pair — `ps`/
+    // `stop`/`fbnd`/`fpm` are fixed for this phase.
+    let nm = NrMemo::default();
+    while let Some(b) = work.pop_front() {
+        inq.remove(&b);
+        let Some(mut av) = input(&out, b) else {
+            continue;
+        };
         iters += 1;
-        let mut changed = false;
-        for &b in &rpo {
-            let Some(mut av) = input(&out, b) else {
-                continue;
-            };
-            transfer(
-                func,
-                ps,
-                &stop,
-                noalias,
-                b,
-                &mut av,
-                None,
-                &iso,
-                &ncc,
-                inv_insts,
-                &mut invs,
-                breg.get(&b).copied(),
-                ofrozen,
-                &mut invreg,
-                rpar,
-                nw,
-                fbnd,
-                fpm,
-                eh,
-            );
-            if out.get(&b) != Some(&av) {
-                out.insert(b, av);
-                changed = true;
+        transfer(
+            func,
+            ps,
+            &stop,
+            noalias,
+            b,
+            &mut av,
+            None,
+            &iso,
+            &ncc,
+            inv_insts,
+            &mut invs,
+            breg.get(&b).copied(),
+            ofrozen,
+            &mut invreg,
+            rpar,
+            nw,
+            fbnd,
+            fpm,
+            eh,
+            &nm,
+        );
+        if out.get(&b) != Some(&av) {
+            out.insert(b, av);
+            let c = nch.entry(b).or_default();
+            *c += 1;
+            if *c > MAX_ITERS as u32 {
+                stable = false;
+                break;
+            }
+            for s in cfg.succ_iter(b) {
+                if inq.insert(s) {
+                    work.push_back(s);
+                }
             }
         }
-        if !changed {
-            stable = true;
-            break;
-        }
     }
+    let stable = stable && work.is_empty();
     if prof2 {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::loadfwd", "    lf-fxpt {:.3}ms (iters={iters})",
-                t0.elapsed().as_secs_f64() * 1e3
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3
             )
         };
     }
     if !stable {
         return 0;
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let mut fwd: Vec<(Inst, Fwd)> = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {
@@ -1044,6 +1135,7 @@ pub fn run(
                 fbnd,
                 fpm,
                 eh,
+                &nm,
             );
         }
     }
@@ -1238,8 +1330,8 @@ fn edge_pre(
             *dom = Some(DominatorTree::with_function(func, cfg));
         }
         let ok = match func.dfg.value_def(arg) {
-            ValueDef::Result(di, _) => dom.as_ref().unwrap().dominates(di, pinst, &func.layout),
-            ValueDef::Param(db, _) => dom.as_ref().unwrap().dominates(db, pinst, &func.layout),
+            ValueDef::Result(di, _) => dom.as_ref().unwrap().try_dominates(di, pinst, &func.layout),
+            ValueDef::Param(db, _) => dom.as_ref().unwrap().try_dominates(db, pinst, &func.layout),
             _ => false,
         };
         if !ok {
@@ -1319,55 +1411,69 @@ fn pre(
         }
         Some(acc)
     };
-    let mut stable = false;
-    for _ in 0..MAX_ITERS {
-        let mut changed = false;
-        for &b in rpo {
-            let Some(keys) = input(&out, b) else {
-                continue;
-            };
-            let mut av: Avail = keys
-                .into_iter()
-                .map(|k| (k, Value::reserved_value()))
-                .collect();
-            transfer(
-                func,
-                ps,
-                na,
-                na0,
-                b,
-                &mut av,
-                None,
-                iso,
-                ncc,
-                // `out` must agree with the `st` scan below, which tracks
-                // no invariant immunity — pass empty sets so `transfer`
-                // marks and retains nothing extra here. `iso` is real:
-                // `kill` needs it to keep locs disjoint from the store's
-                // root, or every unrelated store empties the set.
-                &FxHashSet::default(),
-                &mut FxHashSet::default(),
-                None,
-                &FxHashMap::default(),
-                &mut FxHashMap::default(),
-                &FxHashMap::default(),
-                nw,
-                bnd,
-                pm,
-                eh,
-            );
-            let ks: FxHashSet<Loc> = av.into_keys().collect();
-            if out.get(&b) != Some(&ks) {
-                out.insert(b, ks);
-                changed = true;
+    // Same worklist shape as the forwarding fixpoint above: the key-set
+    // meet only shrinks, so re-transferring is needed only when an
+    // input changed. Per-block change cap mirrors `MAX_ITERS` rounds.
+    let mut work: VecDeque<Block> = rpo.iter().copied().collect();
+    let mut inq: FxHashSet<Block> = work.iter().copied().collect();
+    let mut nch: FxHashMap<Block, u32> = FxHashMap::default();
+    let mut stable = true;
+    // One root-walk memo for this whole fixpoint + the apply scan —
+    // `ps`/`na`/`na0`/`bnd`/`pm` are fixed for the phase.
+    let nm = NrMemo::default();
+    while let Some(b) = work.pop_front() {
+        inq.remove(&b);
+        let Some(keys) = input(&out, b) else {
+            continue;
+        };
+        let mut av: Avail = keys
+            .into_iter()
+            .map(|k| (k, Value::reserved_value()))
+            .collect();
+        transfer(
+            func,
+            ps,
+            na,
+            na0,
+            b,
+            &mut av,
+            None,
+            iso,
+            ncc,
+            // `out` must agree with the `st` scan below, which tracks
+            // no invariant immunity — pass empty sets so `transfer`
+            // marks and retains nothing extra here. `iso` is real:
+            // `kill` needs it to keep locs disjoint from the store's
+            // root, or every unrelated store empties the set.
+            &FxHashSet::default(),
+            &mut FxHashSet::default(),
+            None,
+            &FxHashMap::default(),
+            &mut FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            nw,
+            bnd,
+            pm,
+            eh,
+            &nm,
+        );
+        let ks: FxHashSet<Loc> = av.into_keys().collect();
+        if out.get(&b) != Some(&ks) {
+            out.insert(b, ks);
+            let c = nch.entry(b).or_default();
+            *c += 1;
+            if *c > MAX_ITERS as u32 {
+                stable = false;
+                break;
+            }
+            for s in cfg.succ_iter(b) {
+                if inq.insert(s) {
+                    work.push_back(s);
+                }
             }
         }
-        if !changed {
-            stable = true;
-            break;
-        }
     }
-    if !stable {
+    if !(stable && work.is_empty()) {
         return 0;
     }
     let ins: FxHashMap<Block, FxHashSet<Loc>> = rpo
@@ -1383,6 +1489,8 @@ fn pre(
     };
     let mut dom: Option<DominatorTree> = None;
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
+    // `nm` covers the apply scan too — `func` mutates only through
+    // `edge_pre`'s add-only inserts and the `fwd` rewrites below.
     for &b in rpo {
         let mut st: FxHashMap<Loc, St> = ins[&b].iter().map(|&l| (l, St::In)).collect();
         // May-write footprints since block start plus a cleared-state flag,
@@ -1403,7 +1511,7 @@ fn pre(
                 } if notrap(func, i) => {
                     let res = func.dfg.first_result(i);
                     let ty = func.dfg.value_type(res);
-                    let (r, o) = norm_root(func, ps, na, arg);
+                    let (r, o) = nm.pair(func, ps, na, arg).1;
                     let loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                     if let Some(&s) = st.get(&loc) {
                         // `St::In` with no materializable entry value
@@ -1440,10 +1548,10 @@ fn pre(
                 } if notrap(func, i) => {
                     let val = func.dfg.resolve_aliases(args[0]);
                     let ty = func.dfg.value_type(val);
-                    let (r, o) = norm_root(func, ps, na, args[1]);
+                    let (r, o) = nm.pair(func, ps, na, args[1]).1;
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
                     let ms_of = |rv: Value, off: i64| {
-                        let (mr, mo) = root_min(func, ps, na, Some(bnd), rv);
+                        let (mr, mo) = nm.rm(func, ps, na, bnd, rv);
                         let (mr, mo) = match mr {
                             Root::V(q) => match pm.get(&q) {
                                 Some(&(qr, qo)) => (qr, mo.wrapping_add(qo)),
@@ -1465,7 +1573,7 @@ fn pre(
                     // `na0` name too — `iso`/`ncc` classify under it,
                     // so a store named only under `na`'s `ofrozen` stop
                     // would dodge its kill set (see `transfer`).
-                    let (r0, o0) = norm_root(func, ps, na0, args[1]);
+                    let (r0, o0) = nm.n0(func, ps, na0, args[1]);
                     let o0 = o0.wrapping_add(i64::from(i32::from(offset)));
                     if r0 != r || o0 != o {
                         kill_st(&mut st, r0, o0, ty, None, &iso, ncc);
@@ -1483,7 +1591,7 @@ fn pre(
                         } = func.dfg.insts[si]
                     {
                         for &a in &sargs[1..] {
-                            let (ra, oa) = norm_root(func, ps, na, a);
+                            let (ra, oa) = nm.pair(func, ps, na, a).1;
                             let oa = oa.wrapping_add(o);
                             let ms = match ra {
                                 Root::V(arv) => ms_of(arv, oa),
@@ -1492,7 +1600,7 @@ fn pre(
                             let al = (ra, oa, ty);
                             kill_st(&mut st, al.0, al.1, al.2, ms, &iso, ncc);
                             writes.push((al, ms));
-                            let (ra0, oa0) = norm_root(func, ps, na0, a);
+                            let (ra0, oa0) = nm.n0(func, ps, na0, a);
                             let oa0 = oa0.wrapping_add(o);
                             if ra0 != ra || oa0 != oa {
                                 let a0 = (ra0, oa0, ty);
@@ -1517,8 +1625,8 @@ fn pre(
                     // ran under `na0`, so both names must be in `reach`.
                     let mut reach: FxHashSet<Root> = FxHashSet::default();
                     for v in func.dfg.inst_values(i) {
-                        reach.insert(norm_root(func, ps, na, v).0);
-                        reach.insert(norm_root(func, ps, na0, v).0);
+                        reach.insert(nm.pair(func, ps, na, v).1.0);
+                        reach.insert(nm.n0(func, ps, na0, v).0);
                     }
                     st.retain(|&(r, _, _), _| {
                         iso.contains(&r) || (ncc.contains(&r) && !reach.contains(&r))

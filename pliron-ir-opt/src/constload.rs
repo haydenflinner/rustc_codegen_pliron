@@ -14,10 +14,10 @@ use pliron::{
 use pliron_llvm::ops::{GetElementPtrOp, LoadOp};
 use rustc_hash::FxHashMap;
 
-use crate::has_body;
+use crate::opt_body;
 use crate::sroa::{gep_offset, mk_const};
 use crate::state::{ConstVal, State};
-use crate::types::{TyK, classify, size_align, struct_offsets};
+use crate::types::{TyK, classify, ptr32, size_align, struct_offsets};
 
 /// Byte image of a constant: known bytes, plus pointer relocations by offset.
 #[derive(Default)]
@@ -26,11 +26,16 @@ struct Image {
     relocs: FxHashMap<usize, (String, i64)>,
 }
 
+/// Pointer size for the target (4 on wasm32, 8 elsewhere).
+fn ptrsz() -> u64 {
+    if ptr32() { 4 } else { 8 }
+}
+
 fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
     let ty = v.get_type(ctx);
     let (size, _) = size_align(ctx, ty);
     let start = out.bytes.len();
-    match st.consts.get(&v)? {
+    match st.consts.get(v)? {
         ConstVal::Bits(b) if size <= 16 => out
             .bytes
             .extend(b.to_le_bytes()[..size as usize].iter().map(|&x| Some(x))),
@@ -38,9 +43,11 @@ fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
         ConstVal::Bytes(bs) if bs.len() as u64 == size => {
             out.bytes.extend(bs.iter().map(|&x| Some(x)))
         }
-        ConstVal::Sym { sym, off } if size == 8 => {
+        // Pointer-sized reloc (a fn/struct address): on wasm32 pointers
+        // are 4 bytes, so this must not assume 8.
+        ConstVal::Sym { sym, off } if size == ptrsz() => {
             out.relocs.insert(start, (sym.clone(), *off));
-            out.bytes.extend([None; 8]);
+            out.bytes.extend(vec![None; size as usize]);
         }
         ConstVal::Agg(es) => {
             let offs = match classify(ctx, ty) {
@@ -68,13 +75,13 @@ fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
 
 /// The global symbol and byte offset `p` points at, if constant.
 fn sym_off(ctx: &Context, st: &State, p: Value) -> Option<(String, i64)> {
-    if let Some(ConstVal::Sym { sym, off }) = st.consts.get(&p) {
+    if let Some(ConstVal::Sym { sym, off }) = st.consts.get(p) {
         return Some((sym.clone(), *off));
     }
     let op = p.defining_op()?;
     Operation::get_op::<GetElementPtrOp>(op, ctx)?;
     let o = gep_offset(ctx, st, op)?;
-    let (s, base) = sym_off(ctx, st, op.deref(ctx).get_operand(0))?;
+    let (s, base) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0))?;
     Some((s, base + o))
 }
 
@@ -112,22 +119,22 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| opt_body(ctx, st, f))
         .collect();
     let mut n = 0;
     for f in fns {
         let ops: Vec<Ptr<Operation>> = f
             .deref(ctx)
-            .get_region(0)
+            .get_region(ctx, 0)
             .deref(ctx)
             .iter(ctx)
             .flat_map(|b| b.deref(ctx).iter(ctx).collect::<Vec<_>>())
             .collect();
         for op in ops {
-            if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(&op) {
+            if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(op) {
                 continue;
             }
-            let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(0)) else {
+            let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0)) else {
                 continue;
             };
             let img = images.entry(sym.clone()).or_insert_with(|| {
@@ -140,13 +147,16 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 image(ctx, st, g.init?, &mut img)?;
                 Some(img)
             });
-            let r = op.deref(ctx).get_result(0);
+            let r = op.deref(ctx).get_result(ctx, 0);
             let Some(cv) = img
                 .as_ref()
                 .and_then(|img| fold(ctx, img, off, r.get_type(ctx)))
             else {
                 continue;
             };
+            if !crate::bisect_in("constload", "") {
+                continue;
+            }
             let k = mk_const(ctx, st, r.get_type(ctx), cv);
             r.replace_all_uses_with(ctx, &k);
             Operation::erase(op, ctx);

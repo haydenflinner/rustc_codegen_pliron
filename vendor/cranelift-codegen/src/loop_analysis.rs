@@ -24,7 +24,7 @@ entity_impl!(Loop, "loop");
 pub struct LoopAnalysis {
     loops: PrimaryMap<Loop, LoopData>,
     block_loop_map: SecondaryMap<Block, PackedOption<Loop>>,
-    // PLIRON (patch 45): Euler-tour intervals over the loop forest.
+    // PLIRON (patch 46): Euler-tour intervals over the loop forest.
     // `inner` is `lp` or a descendant iff `tin[lp] <= tin[inner] <
     // tout[lp]`, so `is_in_loop` is O(1) — the opt pipeline calls it
     // once per (loop, block) pair inside per-loop block filters.
@@ -138,7 +138,7 @@ impl LoopAnalysis {
     ///
     /// Returns `true` if `block` is in loop `lp`.
     pub fn is_in_loop(&self, block: Block, lp: Loop) -> bool {
-        // PLIRON (patch 45): O(1) subtree-interval test — the upstream
+        // PLIRON (patch 46): O(1) subtree-interval test — the upstream
         // version ran a finger along the parent chain (O(loop depth)
         // per query), and passes filter `layout.blocks()` per loop.
         match self.block_loop_map[block].expand() {
@@ -179,7 +179,7 @@ impl LoopAnalysis {
         self.find_loop_headers(cfg, domtree);
         self.discover_loop_blocks(cfg, domtree);
         self.assign_loop_levels();
-        self.assign_loop_intervals(); // PLIRON (patch 45)
+        self.assign_loop_intervals(); // PLIRON (patch 46)
         self.valid = true;
     }
 
@@ -313,7 +313,7 @@ impl LoopAnalysis {
         }
     }
 
-    // PLIRON (patch 45): one DFS numbering over the whole loop forest.
+    // PLIRON (patch 46): one DFS numbering over the whole loop forest.
     // A loop's descendants occupy a contiguous `tin` range, so
     // `tin[lp] <= tin[x] < tout[lp]` iff `x` is `lp` or nested inside it.
     fn assign_loop_intervals(&mut self) {

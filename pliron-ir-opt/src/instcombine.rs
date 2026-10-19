@@ -22,7 +22,7 @@ use pliron::{
 use pliron_llvm::{attributes::ICmpPredicateAttr as P, op_interfaces::BinArithOp, ops::*};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::has_body;
+use crate::opt_body;
 use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
 
@@ -276,7 +276,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
     let mut ids: FxHashMap<Value, Id> = FxHashMap::default();
     let mut leaves: FxHashMap<Symbol, Value> = FxHashMap::default();
     let mut roots: Vec<(Ptr<Operation>, Value, Id)> = Vec::new();
-    let blocks: Vec<_> = f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect();
+    let blocks: Vec<_> = f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx).collect();
     let mut nops = 0;
     for b in blocks {
         let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
@@ -285,17 +285,17 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
             if nops > MAX_OPS || op.deref(ctx).get_num_results() != 1 {
                 continue;
             }
-            let r = op.deref(ctx).get_result(0);
+            let r = op.deref(ctx).get_result(ctx, 0);
             if int_width(ctx, r).is_none() {
                 continue;
             }
-            let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+            let opnds: Vec<Value> = op.deref(ctx).operands(ctx).collect();
             let mut a = Vec::with_capacity(opnds.len());
             for &v in &opnds {
                 let id = if let Some(&id) = ids.get(&v) {
                     id
                 } else if let Some(vw) = int_width(ctx, v) {
-                    let id = match st.consts.get(&v) {
+                    let id = match st.consts.get(v) {
                         Some(ConstVal::Bits(c)) => eg.add(IC::Const(Cst(*c, vw))),
                         Some(ConstVal::Zero) => eg.add(IC::Const(Cst(0, vw))),
                         _ => {
@@ -341,7 +341,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
             nc += 1;
             let ty = r.get_type(ctx);
             let k = UndefOp::new(ctx, ty).get_operation();
-            let kv = k.deref(ctx).get_result(0);
+            let kv = k.deref(ctx).get_result(ctx, 0);
             st.consts.insert(
                 kv,
                 if c == 0 {
@@ -352,7 +352,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
             );
             kv
         } else {
-            let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+            let opnds: Vec<Value> = op.deref(ctx).operands(ctx).collect();
             let Some(v) = class
                 .nodes
                 .iter()
@@ -384,7 +384,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| opt_body(ctx, st, f))
         .collect();
     for f in funcs {
         let (c, v) = if egg {
@@ -418,15 +418,15 @@ pub fn run(ctx: &mut Context, st: &mut State) {
 /// the quotient feeds other uses; a div that loses its last use is erased.
 fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
     let mut hits: Vec<(Ptr<Operation>, Value, Value, bool, Ptr<Operation>)> = Vec::new();
-    for b in f.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+    for b in f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
         for op in b.deref(ctx).iter(ctx) {
             if !Operation::is_op::<MulOp>(op, ctx) {
                 continue;
             }
-            if int_width(ctx, op.deref(ctx).get_result(0)).is_none() {
+            if int_width(ctx, op.deref(ctx).get_result(ctx, 0)).is_none() {
                 continue;
             }
-            let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+            let opnds: Vec<Value> = op.deref(ctx).operands(ctx).collect();
             for i in 0..2 {
                 let Some(dop) = opnds[i].defining_op() else {
                     continue;
@@ -435,7 +435,7 @@ fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
                 if !signed && !Operation::is_op::<UDivOp>(dop, ctx) {
                     continue;
                 }
-                let dopnds: Vec<Value> = dop.deref(ctx).operands().collect();
+                let dopnds: Vec<Value> = dop.deref(ctx).operands(ctx).collect();
                 // Constants are per-use `undef` values, so two `7`s only
                 // match through `st.consts`, not `Value` identity.
                 if canon_eq(st, dopnds[1], opnds[1 - i]) {
@@ -457,18 +457,18 @@ fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
                 URemOp::new(ctx, *x, *d).get_operation()
             };
             rop.insert_before(ctx, *op);
-            rop.deref(ctx).get_result(0)
+            rop.deref(ctx).get_result(ctx, 0)
         });
         let sub = SubOp::new(ctx, *x, rem).get_operation();
         sub.insert_before(ctx, *op);
-        let sub_r = sub.deref(ctx).get_result(0);
-        let r = op.deref(ctx).get_result(0);
+        let sub_r = sub.deref(ctx).get_result(ctx, 0);
+        let r = op.deref(ctx).get_result(ctx, 0);
         r.replace_all_uses_with(ctx, &sub_r);
         Operation::erase(*op, ctx);
         divs.insert(*dop);
     }
     for dop in divs {
-        if !dop.deref(ctx).get_result(0).is_used(ctx) {
+        if !dop.deref(ctx).get_result(ctx, 0).is_used(ctx) {
             Operation::erase(dop, ctx);
         }
     }
@@ -479,7 +479,7 @@ fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
 /// distinct `undef` result sharing a `ConstVal`.
 fn canon_eq(st: &State, a: Value, b: Value) -> bool {
     a == b
-        || match (st.consts.get(&a), st.consts.get(&b)) {
+        || match (st.consts.get(a), st.consts.get(b)) {
             (Some(ConstVal::Zero), Some(ConstVal::Zero)) => true,
             (Some(ConstVal::Bits(x)), Some(ConstVal::Bits(y))) => x == y,
             (Some(ConstVal::Zero), Some(ConstVal::Bits(y)))
@@ -575,16 +575,16 @@ impl POp {
 fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize) {
     // Collect the covered ops in layout order.
     let mut ops: Vec<POp> = Vec::new();
-    for b in f.deref(ctx).get_region(0).deref(ctx).iter(ctx) {
+    for b in f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
         for op in b.deref(ctx).iter(ctx) {
             if ops.len() > MAX_OPS || op.deref(ctx).get_num_results() != 1 {
                 continue;
             }
-            let r = op.deref(ctx).get_result(0);
+            let r = op.deref(ctx).get_result(ctx, 0);
             let Some(rw) = int_width(ctx, r) else {
                 continue;
             };
-            let opnds: Vec<Value> = op.deref(ctx).operands().collect();
+            let opnds: Vec<Value> = op.deref(ctx).operands(ctx).collect();
             if !(2..=3).contains(&opnds.len()) {
                 continue;
             }
@@ -685,7 +685,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize
                 nc += 1;
                 let ty = r.get_type(ctx);
                 let kv = UndefOp::new(ctx, ty).get_operation();
-                let kv = kv.deref(ctx).get_result(0);
+                let kv = kv.deref(ctx).get_result(ctx, 0);
                 st.consts.insert(
                     kv,
                     if c == 0 {
@@ -737,7 +737,7 @@ fn safe_leaf(ops: &[POp], defop: &FxHashMap<Value, usize>, i: usize, v: Value) -
 /// Canonical key for a value: `st.consts` constants key by masked value,
 /// everything else by SSA name.
 fn key(st: &State, v: Value, w: u32) -> K {
-    match st.consts.get(&v) {
+    match st.consts.get(v) {
         Some(ConstVal::Bits(c)) => K::C(mask(*c, w)),
         Some(ConstVal::Zero) => K::C(0),
         _ => K::V(v),

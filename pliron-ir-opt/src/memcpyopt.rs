@@ -11,7 +11,7 @@ use pliron::{
 };
 use pliron_llvm::ops::{AllocaOp, GetElementPtrOp, LoadOp, StoreOp};
 
-use crate::has_body;
+use crate::opt_body;
 use crate::sroa::const_int;
 use crate::state::{ArgExt, State};
 
@@ -25,10 +25,10 @@ fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
         } else if Operation::is_op::<StoreOp>(o, ctx) {
             i == 1
         } else if Operation::is_op::<GetElementPtrOp>(o, ctx) {
-            i == 0 && non_escaping(ctx, st, o.deref(ctx).get_result(0))
+            i == 0 && non_escaping(ctx, st, o.deref(ctx).get_result(ctx, 0))
         } else {
             matches!(
-                st.intrinsics.get(&o).map(|s| s.as_str()),
+                st.intrinsics.get(o).map(|s| s.as_str()),
                 Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
             ) && i <= 1
         }
@@ -41,16 +41,16 @@ fn touches(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
         let o = u.user_op();
         o == op
             || (Operation::is_op::<GetElementPtrOp>(o, ctx)
-                && touches(ctx, op, o.deref(ctx).get_result(0)))
+                && touches(ctx, op, o.deref(ctx).get_result(ctx, 0)))
     })
 }
 
 fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Operation>) -> bool {
-    if st.volatile.contains(&m) || st.intrinsics.get(&m).map(|s| s.as_str()) != Some("llvm.memcpy")
+    if st.volatile.contains(m) || st.intrinsics.get(m).map(|s| s.as_str()) != Some("llvm.memcpy")
     {
         return false;
     }
-    let o: Vec<Value> = m.deref(ctx).operands().collect();
+    let o: Vec<Value> = m.deref(ctx).operands(ctx).collect();
     let (dst, src) = (o[0], o[1]);
     let Some(n) = const_int(ctx, st, o[2]) else {
         return false;
@@ -58,7 +58,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
     let Some(a) = src.defining_op() else {
         return false;
     };
-    if !Operation::is_op::<AllocaOp>(a, ctx) || st.allocas.get(&src).map(|x| x.0 as i128) != Some(n)
+    if !Operation::is_op::<AllocaOp>(a, ctx) || st.allocas.get(src).map(|x| x.0 as i128) != Some(n)
     {
         return false;
     }
@@ -73,10 +73,10 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
     let Some(&(call, idx)) = uses.iter().find(|(u, _)| *u != m) else {
         return false;
     };
-    let Some(ci) = st.calls.get(&call) else {
+    let Some(ci) = st.calls.get(call) else {
         return false;
     };
-    if st.invokes.contains_key(&call) {
+    if st.invokes.contains(call) {
         return false;
     }
     let nopd = call.deref(ctx).get_num_operands();
@@ -93,7 +93,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
         non_escaping(ctx, st, dst)
     } else if let Some(d) = dst.defining_op() {
         Operation::is_op::<AllocaOp>(d, ctx)
-            && st.allocas.get(&dst).is_some_and(|x| x.0 as i128 >= n)
+            && st.allocas.get(dst).is_some_and(|x| x.0 as i128 >= n)
             && non_escaping(ctx, st, dst)
             && dominates_in_block(ctx, d, call)
     } else {
@@ -116,10 +116,10 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
         return false;
     }
     Operation::replace_operand(call, ctx, idx, dst);
-    st.intrinsics.remove(&m);
+    st.intrinsics.remove(m);
     Operation::erase(m, ctx);
-    st.allocas.remove(&src);
-    st.promoted.remove(&src);
+    st.allocas.remove(src);
+    st.promoted.remove(src);
     Operation::erase(a, ctx);
     true
 }
@@ -152,19 +152,19 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .map(|f| (f.op, f.exts.params.clone()))
         .collect();
     for (f, params) in funcs {
-        if !has_body(ctx, f) {
+        if !opt_body(ctx, st, f) {
             continue;
         }
-        let Some(entry) = f.deref(ctx).get_region(0).deref(ctx).get_head() else {
+        let Some(entry) = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head() else {
             continue;
         };
         let sret_args: Vec<Value> = params
             .iter()
             .enumerate()
             .filter(|(i, e)| **e == ArgExt::SRet && *i < entry.deref(ctx).get_num_arguments())
-            .map(|(i, _)| entry.deref(ctx).get_argument(i))
+            .map(|(i, _)| entry.deref(ctx).get_argument(ctx, i))
             .collect();
-        let blocks: Vec<_> = f.deref(ctx).get_region(0).deref(ctx).iter(ctx).collect();
+        let blocks: Vec<_> = f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx).collect();
         for b in blocks {
             let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
             for op in ops {

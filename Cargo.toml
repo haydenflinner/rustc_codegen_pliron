@@ -20,6 +20,7 @@ target-lexicon = "0.13"
 object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf", "macho"] }
 smallvec = "1"
 egg = "0.10"
+ascent = { version = "0.8", default-features = false }
 waffle = "0.3.2"
 pliron-clif-opt = { path = "pliron-clif-opt" }
 pliron-clif-lower = { path = "pliron-clif-lower" }

@@ -122,10 +122,10 @@ pub fn attributes_eq(
     let is_relevant = |attr: &AttrObj| !(ignore_config.ignore_attr)(ctx, attr.as_ref());
 
     let lhs_relevant: IMap<&Identifier, &AttrObj> =
-        lhs.0.iter().filter(|(_, attr)| is_relevant(attr)).collect();
+        lhs.iter(ctx).filter(|(_, attr)| is_relevant(attr)).collect();
 
     let rhs_relevant: IMap<&Identifier, &AttrObj> =
-        rhs.0.iter().filter(|(_, attr)| is_relevant(attr)).collect();
+        rhs.iter(ctx).filter(|(_, attr)| is_relevant(attr)).collect();
 
     if lhs_relevant.len() != rhs_relevant.len() {
         return false;
@@ -178,12 +178,12 @@ fn op_eq_map(
         return EqResult::FirstNEQOps((lhs, rhs));
     }
 
-    if !attributes_eq(ctx, ignore_config, &lhs_ref.attributes, &rhs_ref.attributes) {
+    if !attributes_eq(ctx, ignore_config, lhs_ref.attributes(), rhs_ref.attributes()) {
         return EqResult::FirstNEQOps((lhs, rhs));
     }
 
     // Check result types.
-    let results = lhs_ref.results().zip(rhs_ref.results());
+    let results = lhs_ref.results(ctx).zip(rhs_ref.results(ctx));
     if results
         .clone()
         .any(|(l_res, r_res)| l_res.get_type(ctx) != r_res.get_type(ctx))
@@ -217,7 +217,7 @@ fn op_eq_mapped(
 
         // If an operand is mapped, its image must match. Otherwise, it must
         // be identical (e.g. a free/external value shared by both sides).
-        for (l_opd, r_opd) in lhs_ref.operands().zip(rhs_ref.operands()) {
+        for (l_opd, r_opd) in lhs_ref.operands(ctx).zip(rhs_ref.operands(ctx)) {
             if mapper.lookup_value_or_default(l_opd) != r_opd
                 || l_opd.get_type(ctx) != r_opd.get_type(ctx)
             {
@@ -227,7 +227,7 @@ fn op_eq_mapped(
 
         // If a successor is mapped, its image must match. Otherwise, it must
         // be identical (e.g. a free/external block shared by both sides).
-        for (l_succ, r_succ) in lhs_ref.successors().zip(rhs_ref.successors()) {
+        for (l_succ, r_succ) in lhs_ref.successors(ctx).zip(rhs_ref.successors(ctx)) {
             if mapper.lookup_block_or_default(l_succ) != r_succ {
                 return EqResult::FirstNEQOps((lhs, rhs));
             }
@@ -237,8 +237,8 @@ fn op_eq_mapped(
 
     // Recurse into nested regions.
     for region_idx in 0..num_regions {
-        let l_region = lhs.deref(ctx).get_region(region_idx);
-        let r_region = rhs.deref(ctx).get_region(region_idx);
+        let l_region = lhs.deref(ctx).get_region(ctx, region_idx);
+        let r_region = rhs.deref(ctx).get_region(ctx, region_idx);
         match region_eq(ctx, mapper, l_region, r_region, ignore_config) {
             EqResult::Eq => {}
             neq => return neq,
@@ -356,12 +356,12 @@ fn block_eq_map(
         return EqResult::FirstNEQBlocks((lhs, rhs));
     }
 
-    if !attributes_eq(ctx, ignore_config, &lhs_ref.attributes, &rhs_ref.attributes) {
+    if !attributes_eq(ctx, ignore_config, lhs_ref.attributes(), rhs_ref.attributes()) {
         return EqResult::FirstNEQBlocks((lhs, rhs));
     }
 
     // Check arg types.
-    let args = lhs_ref.arguments().zip(rhs_ref.arguments());
+    let args = lhs_ref.arguments(ctx).zip(rhs_ref.arguments(ctx));
     if args
         .clone()
         .any(|(l_arg, r_arg)| l_arg.get_type(ctx) != r_arg.get_type(ctx))
@@ -431,8 +431,7 @@ fn attributes_hash(
     let is_relevant = |attr: &AttrObj| !(ignore_config.ignore_attr)(ctx, attr.as_ref());
 
     let mut relevant: Vec<_> = attributes
-        .0
-        .iter()
+        .iter(ctx)
         .filter(|(_, attr)| is_relevant(attr))
         .collect();
     // Sort by key so that the hash doesn't depend on insertion order.
@@ -465,14 +464,14 @@ fn hash_op_shell(
             op_ref.loc().stable_hash(ctx, state);
         }
 
-        attributes_hash(ctx, ignore_config, &op_ref.attributes, state);
+        attributes_hash(ctx, ignore_config, op_ref.attributes(), state);
 
-        for res in op_ref.results() {
+        for res in op_ref.results(ctx) {
             res.get_type(ctx).stable_hash(ctx, state);
         }
     }
 
-    for res in op.deref(ctx).results() {
+    for res in op.deref(ctx).results(ctx) {
         numbering.define_value(res);
     }
 }
@@ -489,17 +488,17 @@ fn hash_op_full(
     let num_regions = {
         let op_ref = op.deref(ctx);
 
-        for opd in op_ref.operands() {
+        for opd in op_ref.operands(ctx) {
             numbering.hash_value(opd, state);
         }
-        for succ in op_ref.successors() {
+        for succ in op_ref.successors(ctx) {
             numbering.hash_block(succ, state);
         }
         op_ref.num_regions()
     };
 
     for region_idx in 0..num_regions {
-        let region = op.deref(ctx).get_region(region_idx);
+        let region = op.deref(ctx).get_region(ctx, region_idx);
         hash_blocks_full(
             ctx,
             numbering,
@@ -526,15 +525,15 @@ fn hash_block_shell(
             block_ref.loc().stable_hash(ctx, state);
         }
 
-        attributes_hash(ctx, ignore_config, &block_ref.attributes, state);
+        attributes_hash(ctx, ignore_config, block_ref.attributes(), state);
 
-        for arg in block_ref.arguments() {
+        for arg in block_ref.arguments(ctx) {
             arg.get_type(ctx).stable_hash(ctx, state);
         }
     }
 
     numbering.define_block(block);
-    for arg in block.deref(ctx).arguments() {
+    for arg in block.deref(ctx).arguments(ctx) {
         numbering.define_value(arg);
     }
 }

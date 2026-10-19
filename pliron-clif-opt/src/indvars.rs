@@ -232,7 +232,7 @@ fn np_off(
     if let Some(&m) = noff.get(&k)
         && (m == np
             || matches!(func.dfg.value_def(m), ValueDef::Result(di, _)
-                if dt.dominates(di, at, &func.layout)))
+                if dt.try_dominates(di, at, &func.layout)))
     {
         return m;
     }
@@ -1070,7 +1070,7 @@ fn elim_shadowed(
             if edges.iter().all(|e2| {
                 func.layout
                     .inst_block(e2.inst)
-                    .is_none_or(|pb| !body.contains(&pb) || dt.dominates(bi, pb, &func.layout))
+                    .is_none_or(|pb| !body.contains(&pb) || dt.try_dominates(bi, pb, &func.layout))
             }) {
                 let bn = bval(bnd)?;
                 pin = Some(pin.map_or(bn, |p: u128| p.max(bn)));
@@ -1126,7 +1126,7 @@ fn elim_shadowed(
                 && edges.iter().all(|e2| {
                     func.layout
                         .inst_block(e2.inst)
-                        .is_none_or(|pb| !body.contains(&pb) || dt.dominates(b, pb, &func.layout))
+                        .is_none_or(|pb| !body.contains(&pb) || dt.try_dominates(b, pb, &func.layout))
                 })
         });
         if !guarded {
@@ -1300,12 +1300,16 @@ fn elim_shadowed(
         let m = m.unwrap();
         let pend = pends[&bnd];
         let mut data = func.dfg.insts[i];
-        if let InstructionData::IntCompare { cond, args, .. } = &mut data {
+        if let InstructionData::IntCompare { args, .. } = &mut data {
             if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(w) {
                 *args = [m, pend];
             } else {
+                // `bnd` was operand 0 and `w` operand 1: `pend` fills the
+                // `bnd` slot and `m` the `w` slot, preserving operand
+                // order — the condition code stays as-is (swapping it
+                // here inverts the test, mir_raw_fat_ptr's `i < j` coming
+                // out as `i > j`).
                 *args = [pend, m];
-                *cond = cond.swap_args();
             }
         }
         func.dfg.insts[i] = data;
@@ -1870,8 +1874,8 @@ fn dec_addr(
 /// is an out-of-loop value that must dominate the branch.
 fn rot_edge_ok(func: &Function, dt: &DominatorTree, dec: &Dec, e: &Edge) -> bool {
     dec.0.iter().all(|&(v, _)| match func.dfg.value_def(v) {
-        ValueDef::Result(i, _) => dt.dominates(i, e.inst, &func.layout),
-        ValueDef::Param(b, _) => dt.dominates(b, e.inst, &func.layout),
+        ValueDef::Result(i, _) => dt.try_dominates(i, e.inst, &func.layout),
+        ValueDef::Param(b, _) => dt.try_dominates(b, e.inst, &func.layout),
         _ => false,
     })
 }
@@ -1990,12 +1994,12 @@ fn runs_every_iteration(
         .iter()
         .filter_map(|e| func.layout.inst_block(e.inst))
         .filter(|b| body.contains(b))
-        .all(|b| dt.dominates(ib, b, &func.layout));
+        .all(|b| dt.try_dominates(ib, b, &func.layout));
     latches_ok
         && body.iter().all(|&b| {
             let mut succs = cfg.succ_iter(b).peekable();
             let leaves = succs.peek().is_none() || succs.any(|s| !body.contains(&s));
-            !leaves || dt.dominates(ib, b, &func.layout)
+            !leaves || dt.try_dominates(ib, b, &func.layout)
         })
 }
 
@@ -2254,7 +2258,7 @@ fn rot_loop(
                     && o == bop
                     && i != bi
                     && !removed.contains(&i)
-                    && dt.dominates(i, bi, &func.layout)
+                    && dt.try_dominates(i, bi, &func.layout)
             }) {
                 let ares = func.dfg.resolve_aliases(ares);
                 func.layout.remove_inst(bi);
@@ -2286,7 +2290,7 @@ fn rot_loop(
                     && edges
                         .iter()
                         .filter(|e| inb(func, e))
-                        .all(|e| dt.dominates(i, e.inst, &func.layout))
+                        .all(|e| dt.try_dominates(i, e.inst, &func.layout))
             }) else {
                 continue;
             };
@@ -2809,7 +2813,7 @@ pub fn postinc(func: &mut Function, an: &mut crate::pipeline::Analysis, smax: i6
                     ValueDef::Param(db, _) => ProgramPoint::Block(db),
                     ValueDef::Union(_, _) => continue,
                 };
-                if !dt.dominates(dom, ci, &func.layout) {
+                if !dt.try_dominates(dom, ci, &func.layout) {
                     // `a`'s def sits after `ci` in the latch — move the
                     // compare down beside its new operand, safe while the
                     // brif is its only use.
@@ -2896,7 +2900,7 @@ fn below_max(func: &Function, n: Value) -> bool {
 /// `p < n`. Under that invariant `p < n` ⟺ `p != n`, and `!=` survives the
 /// `+1` modulo 2^w, so no overflow condition is needed.
 pub fn postinc_ne(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
-    if std::env::var("PLIRON_POSTINC_NE").is_ok_and(|v| v == "0") {
+    if pliron_cfg::env_is("PLIRON_POSTINC_NE", "0") {
         return 0;
     }
     let crate::pipeline::CfgDtLa { cfg, la, .. } = an.cfg_dt_la(func);
@@ -3028,7 +3032,7 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
                 InstructionData::Binary {
                     opcode: Opcode::Isub,
                     args: [a, b],
-                } => iconst(func, b).map(|c| (a, -c)),
+                } => iconst(func, b).map(|c| (a, c.wrapping_neg())),
                 _ => None,
             },
             _ => None,
@@ -3036,7 +3040,10 @@ fn lin(func: &Function, mut v: Value) -> (Value, i64) {
         match step {
             Some((nv, c)) => {
                 v = nv;
-                k += c;
+                // iadd/isub wrap mod 2^64 — accumulate the same way
+                // (iconst is i64::MIN for isub, or a chain of huge
+                // offsets, can overflow a plain `+` under debug checks).
+                k = k.wrapping_add(c);
             }
             None => return (rv, k),
         }

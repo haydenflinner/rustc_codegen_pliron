@@ -19,7 +19,7 @@ use pliron_llvm::ops::{CallOp, UndefOp};
 use rustc_hash::FxHashMap;
 
 use crate::has_body;
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 
 pub fn run(ctx: &mut Context, st: &mut State) {
@@ -27,12 +27,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         && tracing::enabled!(target: "pliron::spec", tracing::Level::DEBUG);
     // Direct callsites per callee.
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
+    let mut scratch = Vec::new();
     for f in st.funcs.values() {
         if !has_body(ctx, f.op) {
             continue;
         }
         for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 if let Some(sym) = direct_callee(ctx, st, op) {
                     sites.entry(sym.clone()).or_default().push(op);
                 }
@@ -65,14 +67,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         let Some(calls) = sites.get(sym) else {
             continue;
         };
-        let params: Vec<Value> = blocks(ctx, f.op)[0].deref(ctx).arguments().collect();
+        let params: Vec<Value> = blocks(ctx, f.op)[0].deref(ctx).arguments(ctx).collect();
         let args: Vec<Vec<Value>> = calls
             .iter()
             .map(|&c| Operation::get_op::<CallOp>(c, ctx).unwrap().args(ctx))
             .collect();
         for (i, p) in params.iter().enumerate() {
             let Some(a0) = args[0].get(i) else { break };
-            let Some(c0) = st.consts.get(a0).cloned() else {
+            let Some(c0) = st.consts.get(*a0).cloned() else {
                 continue;
             };
             if a0.get_type(ctx) != p.get_type(ctx) {
@@ -80,7 +82,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             }
             if !args
                 .iter()
-                .all(|a| a.get(i).is_some_and(|&v| st.consts.get(&v) == Some(&c0)))
+                .all(|a| a.get(i).is_some_and(|&v| st.consts.get(v) == Some(&c0)))
             {
                 continue;
             }
@@ -90,7 +92,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             let nv = UndefOp::new(ctx, p.get_type(ctx))
                 .get_operation()
                 .deref(ctx)
-                .get_result(0);
+                .get_result(ctx, 0);
             st.consts.insert(nv, c0);
             p.replace_all_uses_with(ctx, &nv);
             done += 1;

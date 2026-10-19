@@ -917,6 +917,7 @@ fn un_not_chain(
     arg: Value,
     mut chain: Option<&mut Vec<(Value, bool)>>,
 ) -> (Value, bool) {
+    let eq01 = crate::pass_enabled("PLIRON_EQ01");
     let (mut v, mut neg) = (func.dfg.resolve_aliases(arg), false);
     for _ in 0..8 {
         if let Some(c) = chain.as_deref_mut() {
@@ -962,7 +963,7 @@ fn un_not_chain(
                         cond,
                         args,
                         ..
-                    } if crate::pass_enabled("PLIRON_EQ01")
+                    } if eq01
                         && matches!(cond, IntCC::Equal | IntCC::NotEqual) =>
                     {
                         let (x, k) = if let Some(k) =
@@ -1149,16 +1150,18 @@ pub fn brif_argspec(func: &mut Function, inst: Inst) -> usize {
 /// after `merge_chains` remerged a dispatch block into its pred.
 pub fn brif_fold(func: &mut Function) -> usize {
     let mut n = 0;
+    let argspec = crate::pass_enabled("PLIRON_ARGSPEC");
+    let brifnot = crate::pass_enabled("PLIRON_BRIFNOT");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             if pos.func.dfg.insts[inst].opcode() != Opcode::Brif {
                 continue;
             }
-            if crate::pass_enabled("PLIRON_ARGSPEC") {
+            if argspec {
                 n += brif_argspec(pos.func, inst);
             }
-            if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
+            if brifnot && brif_not(pos.func, inst) {
                 n += 1;
             }
         }
@@ -1472,7 +1475,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
             return Some(pargs[k]);
         }
         let ok = match func.dfg.value_def(v) {
-            ValueDef::Result(i, _) => i != pinst && domtree.dominates(i, pinst, &func.layout),
+            ValueDef::Result(i, _) => i != pinst && domtree.try_dominates(i, pinst, &func.layout),
             ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
             _ => false,
         };
@@ -1624,7 +1627,7 @@ pub fn foldforwarders(func: &mut Function) -> usize {
                                 }
                                 let dom = match func.dfg.value_def(v) {
                                     ValueDef::Result(i, _) => {
-                                        i != pinst && domtree.dominates(i, pinst, &func.layout)
+                                        i != pinst && domtree.try_dominates(i, pinst, &func.layout)
                                     }
                                     ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                                     _ => false,
@@ -1851,6 +1854,10 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // (cfg/dom/edges) is round-invariant, so it is built once here
     // rather than per call.
     let mut wctx = WmCtx::new(func);
+    // A round's merges rebind only values inside the merged blocks'
+    // dominated regions — the next round's scan is confined to those
+    // regions plus their out-edge targets (`merge_dirty`).
+    let mut dirty: Option<FxHashSet<Block>> = None;
     for _ in 0..8 {
         // `webmerge` subsumes the old `sameargs_round`/`phimerge`/
         // `affparm` trio: phase A is the uniform-arg merge (with
@@ -1858,7 +1865,8 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         // phase B the duplicate-param merge, phases C/D the rest.
         // Looping webmerge alone still reaches the cross-block fixpoint
         // — each drop can expose uniform args in successor blocks.
-        let (k, pm) = webmerge_ctx(func, &mut wctx);
+        let (k, pm, merged) = webmerge_ctx(func, &mut wctx, dirty.as_ref());
+        dirty = Some(merge_dirty(&wctx, &merged));
         n += k;
         if !pm.is_empty() {
             // Compose into the accumulated map: old carriers may
@@ -2072,11 +2080,13 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // `const_sweep` inside the loop folds `brif`s to `jump`s — rebuild
     // it whenever a sweep changes the edge list.
     let mut wctx = WmCtx::new(func);
+    let mut dirty: Option<FxHashSet<Block>> = None;
     for _ in 0..8 {
         // `cparm_round`'s carried-const chase is `webmerge` iterated:
         // each uniform-param link drops via phase A (the const leaf
         // materializes through `emit_key`), exposing the next link.
-        let (k, pm) = webmerge_ctx(func, &mut wctx);
+        let (k, pm, merged) = webmerge_ctx(func, &mut wctx, dirty.as_ref());
+        dirty = Some(merge_dirty(&wctx, &merged));
         n += k;
         for v in pmap.values_mut() {
             while let Some(&w) = pm.get(v) {
@@ -2098,6 +2108,9 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             n += cs;
             if cs > 0 {
                 wctx = WmCtx::new(func);
+                // Folded branches change the edge list — the dirty set
+                // was computed against the old topology.
+                dirty = None;
             }
         }
     }
@@ -2361,20 +2374,80 @@ fn subtree_hashes(
 
 pub fn webmerge(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     let mut ctx = WmCtx::new(func);
-    webmerge_ctx(func, &mut ctx)
+    let (n, pmap, _) = webmerge_ctx(func, &mut ctx, None);
+    (n, pmap)
 }
 
-pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<Value, Value>) {
+/// Blocks a `webmerge_ctx` round can have changed the merge inputs of:
+/// the merged blocks, every block they dominate (a dropped param or a
+/// materialized carrier can only be *used* under dominator scoping),
+/// and the immediate out-edge targets whose arg slots the global
+/// `pmap` rewrite may have rewritten.
+fn merge_dirty(ctx: &WmCtx, merged: &FxHashSet<Block>) -> FxHashSet<Block> {
+    let mut d: FxHashSet<Block> = FxHashSet::default();
+    let mut stack: Vec<Block> = merged.iter().copied().collect();
+    while let Some(x) = stack.pop() {
+        if d.insert(x) {
+            stack.extend(ctx.dom.children(x));
+        }
+    }
+    let region: Vec<Block> = d.iter().copied().collect();
+    for x in region {
+        for s in ctx.cfg.succ_iter(x) {
+            d.insert(s);
+        }
+    }
+    d
+}
+
+/// `dirty`, when `Some`, restricts the scan to those blocks — used by
+/// the fixpoint callers with `merge_dirty`. A merge at `b` rewrites
+/// only values dominated by `b` (SSA scoping bounds every use of a
+/// dropped param and of anything defined under `b`), plus arg slots on
+/// edges leaving that region, so a block outside `dom(b) ∪
+/// succs(dom(b))` sees identical inputs and would make identical
+/// decisions. The third return element is the set of blocks that
+/// actually merged this round — feed it to `merge_dirty`.
+pub fn webmerge_ctx(
+    func: &mut Function,
+    ctx: &mut WmCtx,
+    dirty: Option<&FxHashSet<Block>>,
+) -> (usize, FxHashMap<Value, Value>, FxHashSet<Block>) {
     use crate::proots::Key;
-    let t0 = std::time::Instant::now();
+    // Flat `edges × params` matrix: `m[e]` yields the row slice, so the
+    // `m[e][ix]` indexing below reads exactly like the `Vec<Vec>` it
+    // replaced — one allocation per matrix instead of one per edge.
+    struct Mat<T> {
+        stride: usize,
+        v: Vec<T>,
+    }
+    impl<T> Mat<T> {
+        fn rows(&self) -> std::slice::ChunksExact<'_, T> {
+            self.v.chunks_exact(self.stride)
+        }
+    }
+    impl<T> std::ops::Index<usize> for Mat<T> {
+        type Output = [T];
+        fn index(&self, e: usize) -> &[T] {
+            &self.v[e * self.stride..(e + 1) * self.stride]
+        }
+    }
+    // `var_os` reads /proc-level state per call — hoisted out of the
+    // per-block loop (16k lookups per webmerge round otherwise). Every
+    // clock read in this function only feeds these `wmprof` log lines,
+    // so they're all gated on it.
+    let wmprof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
+    let t0 = wmprof.then(std::time::Instant::now);
     let WmCtx { cfg, dom, edges } = ctx;
-    let nf = crate::proots::web_nf(func);
-    let t2 = std::time::Instant::now();
-    let canon = crate::proots::canon_map(func);
-    let t3 = std::time::Instant::now();
-    if pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO)
-    {
+    // One edge-fact scan feeds both the web normal forms and the
+    // canonical-class proots — nothing mutates between them.
+    let facts = crate::proots::facts_cfg(func, cfg);
+    let nf = crate::proots::web_nf_facts(func, &facts);
+    let t2 = wmprof.then(std::time::Instant::now);
+    let canon = crate::proots::canon_map_facts(&facts);
+    let t3 = wmprof.then(std::time::Instant::now);
+    if let (Some(t0), Some(t2), Some(t3)) = (t0, t2, t3) {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::clifpeep", "webmerge {}: web_nf {:?} canon {:?}",
                 func.name,
@@ -2398,20 +2471,33 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
     // (target block, class key, param to rebind) — emission happens after
     // the scan so `Value`s stay valid and insertions keep operand order.
     let mut inserts: Vec<(Block, Key, Value)> = vec![];
-    let twloop = std::time::Instant::now();
+    let twloop = wmprof.then(std::time::Instant::now);
     let mut tpre_sum = std::time::Duration::ZERO;
-    // `var_os` reads /proc-level state per call — hoisted out of the
-    // per-block loop (16k lookups per webmerge round otherwise).
-    let wmprof = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
-    let wm_nodiffb = std::env::var_os("PLIRON_WM_NODIFFB").is_some();
+    let wm_nodiffb = pliron_cfg::env_set("PLIRON_WM_NODIFFB");
     let wm_rel = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::DEBUG);
+    // `env::var_os` takes the process env lock per call — keep reads out
+    // of the per-block loop (they showed up as ~15% of codegen samples).
+    let no_phased = pliron_cfg::env_set("PLIRON_WM_NOPHASED");
+    let no_phasec = pliron_cfg::env_set("PLIRON_WM_NOPHASEC");
+    let no_phaseb = pliron_cfg::env_set("PLIRON_WM_NOPHASEB");
+    let dirty = if pliron_cfg::env_set("PLIRON_WM_NODIRTY") {
+        None
+    } else {
+        dirty
+    };
+    // The per-block clocks only feed `wmprof` diagnostics — don't pay
+    // two syscalls per block per round when it's off.
+    let el = |t: Option<std::time::Instant>| t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     for (&b, es) in edges.iter() {
-        let tb0 = std::time::Instant::now();
+        let tb0 = wmprof.then(std::time::Instant::now);
+        if dirty.is_some_and(|d| !d.contains(&b)) {
+            tpre_sum += el(tb0);
+            continue;
+        }
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
-            tpre_sum += tb0.elapsed();
+            tpre_sum += el(tb0);
             continue;
         }
         // `diff_b` re-proves the same (x, y) pairs across oracle calls
@@ -2441,10 +2527,10 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             };
         }
         if es.len().saturating_mul(ps.len()) > 4_000_000 {
-            tpre_sum += tb0.elapsed();
+            tpre_sum += el(tb0);
             continue;
         }
-        tpre_sum += tb0.elapsed();
+        tpre_sum += el(tb0);
         // Per-edge resolved args: `eargs[e][ix]` for `Value` args,
         // `svh[e][ix]` for their structural hash — pseudo-args
         // (`TryCallRet`/`TryCallExn`) are `None` in `eargs` but key as
@@ -2454,11 +2540,20 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // materializes on demand: hashing the def-DAG directly via
         // `vhash` skips building ~10⁵-node `Key` trees for slots that
         // never merge (unrolled hash kernels reach ~877k nodes).
-        let tkeys = std::time::Instant::now();
-        let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
-        let mut svh: Vec<Vec<u64>> = Vec::with_capacity(es.len());
+        let tkeys = wmprof.then(std::time::Instant::now);
+        let mut eargs = Mat {
+            stride: ps.len(),
+            v: Vec::with_capacity(es.len() * ps.len()),
+        };
+        let mut svh = Mat {
+            stride: ps.len(),
+            v: Vec::with_capacity(es.len() * ps.len()),
+        };
         // O-payload per pseudo-arg cell for `skey_of` to reconstruct.
-        let mut okey: Vec<Vec<Option<u64>>> = Vec::with_capacity(es.len());
+        let mut okey = Mat {
+            stride: ps.len(),
+            v: Vec::with_capacity(es.len() * ps.len()),
+        };
         let mut arity_ok = true;
         for &(i, d) in es {
             let args: Vec<BlockArg> = func.dfg.insts[i]
@@ -2469,45 +2564,36 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 arity_ok = false;
                 break;
             }
-            eargs.push(
+            eargs.v.extend(
                 args.iter()
-                    .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v)))
-                    .collect(),
+                    .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v))),
             );
             // `(inst, tag, payload)` — same `BlockCall` arg is the same
             // value, anything else differs.
-            svh.push(
-                args.iter()
-                    .map(|a| match a {
-                        BlockArg::Value(v) => crate::proots::vhash(
-                            func,
-                            &nf,
-                            &canon,
-                            &mut vhmemo,
-                            func.dfg.resolve_aliases(*v),
-                        ),
-                        BlockArg::TryCallRet(x) => {
-                            crate::proots::ohash((i.index() as u64) << 32 | 1 << 30 | *x as u64)
-                        }
-                        BlockArg::TryCallExn(x) => {
-                            crate::proots::ohash((i.index() as u64) << 32 | 2 << 30 | *x as u64)
-                        }
-                    })
-                    .collect(),
-            );
-            okey.push(
-                args.iter()
-                    .map(|a| match a {
-                        BlockArg::Value(_) => None,
-                        BlockArg::TryCallRet(x) => {
-                            Some((i.index() as u64) << 32 | 1 << 30 | *x as u64)
-                        }
-                        BlockArg::TryCallExn(x) => {
-                            Some((i.index() as u64) << 32 | 2 << 30 | *x as u64)
-                        }
-                    })
-                    .collect(),
-            );
+            svh.v.extend(args.iter().map(|a| match a {
+                BlockArg::Value(v) => crate::proots::vhash(
+                    func,
+                    &nf,
+                    &canon,
+                    &mut vhmemo,
+                    func.dfg.resolve_aliases(*v),
+                ),
+                BlockArg::TryCallRet(x) => {
+                    crate::proots::ohash((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                }
+                BlockArg::TryCallExn(x) => {
+                    crate::proots::ohash((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                }
+            }));
+            okey.v.extend(args.iter().map(|a| match a {
+                BlockArg::Value(_) => None,
+                BlockArg::TryCallRet(x) => {
+                    Some((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                }
+                BlockArg::TryCallExn(x) => {
+                    Some((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                }
+            }));
         }
         if !arity_ok {
             continue;
@@ -2518,7 +2604,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // matrices into tens of GB of keys. Cap the block's total arg
         // tree size; `vnodes` is memoized so the scan is cheap.
         let mut arg_nodes = 0usize;
-        'cap: for r in &eargs {
+        'cap: for r in eargs.rows() {
             for c in r {
                 if let Some(v) = c {
                     arg_nodes = arg_nodes.saturating_add(crate::proots::vnodes(
@@ -2542,7 +2628,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         {
             for (ix, _) in ps.iter().enumerate() {
                 let sz: Vec<usize> = eargs
-                    .iter()
+                    .rows()
                     .map(|r| {
                         r[ix].map_or(1, |v| {
                             crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
@@ -2554,9 +2640,6 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 };
             }
         }
-        let no_phased = std::env::var_os("PLIRON_WM_NOPHASED").is_some();
-        let no_phasec = std::env::var_os("PLIRON_WM_NOPHASEC").is_some();
-        let no_phaseb = std::env::var_os("PLIRON_WM_NOPHASEB").is_some();
         // `pk[e][i]` — slot `i`'s key on edge `e`, paramized relative to
         // the block's slots (skip = i), computed lazily: most slots
         // either merge at phase A or are never a viable sibling, so an
@@ -2566,9 +2649,12 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             ps.iter().enumerate().map(|(i, &p)| (p, i as u32)).collect();
         // Keys stay lazy: `skey_of` materializes `skc[e][ix]` on demand
         // — the hash gates above decide most slots never need one.
-        let skc: Vec<Vec<std::cell::OnceCell<Key>>> = (0..es.len())
-            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
-            .collect();
+        let skc = Mat {
+            stride: ps.len(),
+            v: (0..es.len() * ps.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        };
         let skey_of = |e: usize, ix: usize| -> &Key {
             skc[e][ix].get_or_init(|| match (eargs[e][ix], okey[e][ix]) {
                 (Some(v), _) => crate::proots::key_of(func, &nf, &canon, &mut memo.borrow_mut(), v),
@@ -2589,9 +2675,12 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // structural `==` on a 10⁴-node key costs as much as computing
         // the hash once, so comparisons go through `pkh` first.
         let hmemo = std::cell::RefCell::new(hmemo);
-        let pk: Vec<Vec<std::cell::OnceCell<(Key, u64)>>> = (0..es.len())
-            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
-            .collect();
+        let pk = Mat {
+            stride: ps.len(),
+            v: (0..es.len() * ps.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        };
         // A materialized cell costs a `paramize`+hash over the arg's
         // def-DAG — bound the per-block matrix so a megablock's scan
         // can't go quadratic. Past the cap, cells degrade to a
@@ -2615,7 +2704,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                     &ps,
                     i,
                     &hmaps.get_or_init(|| {
-                        svh.iter()
+                        svh.rows()
                             .map(|row| {
                                 let mut m = FxHashMap::default();
                                 for (i, &h) in row.iter().enumerate() {
@@ -2656,7 +2745,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             && es.iter().any(|&(i, _)| {
                 func.layout
                     .inst_block(i)
-                    .is_some_and(|eb| dom.dominates(b, eb, &func.layout))
+                    .is_some_and(|eb| dom.try_dominates(b, eb, &func.layout))
             });
         // Shared `diff_b` probe budget for the block's phase-D oracle,
         // dealt out per slot. `diff_b` chases cost tens of µs each and
@@ -2669,8 +2758,8 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // budget only means "unproven" (no merge), never a wrong merge.
         const DIFF_B_BLOCK_FUEL: usize = 4096;
         let dfuel_cap = (DIFF_B_BLOCK_FUEL / ps.len().max(1)).clamp(2, 96) as i32;
-        let tblk = std::time::Instant::now();
-        let dkeys = tblk - tkeys;
+        let tblk = wmprof.then(std::time::Instant::now);
+        let dkeys = tblk.and_then(|e| tkeys.map(|s| e - s)).unwrap_or_default();
         nblk += 1;
         tkeys_sum += dkeys;
         if wmprof && dkeys.as_micros() > 200 {
@@ -3123,7 +3212,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         // `p1`; with seeds in place the shared `stack` catches the cycle
         // and both resolve to `None`.
         if wmprof {
-            let d = tblk.elapsed();
+            let d = el(tblk);
             if d.as_micros() > 200 {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: {} slots {} edges ixl {:?}",
@@ -3169,7 +3258,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             }
         }
 
-        let dblk = tblk.elapsed();
+        let dblk = el(tblk);
         tblk_sum += dblk;
         if wmprof && dblk.as_micros() > 200 {
             if pliron_cfg::tracing_on() {
@@ -3193,7 +3282,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
         if no_phasec {
             continue;
         }
-        let tphasec = std::time::Instant::now();
+        let tphasec = wmprof.then(std::time::Instant::now);
         // Survivors, capped by key size: `key_rep` rebuilds a whole
         // signature tree per (slot, edge, round), so slots carrying
         // 10⁴-node expression keys make refinement quadratic-by-
@@ -3213,7 +3302,7 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             })
             .collect();
         if surv.len() >= 2 {
-            let tbis = std::time::Instant::now();
+            let tbis = wmprof.then(std::time::Instant::now);
             // Initial partition: one class per value type.
             let mut cls: FxHashMap<usize, usize> = FxHashMap::default();
             for &i in &surv {
@@ -3264,14 +3353,14 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 }
                 cls = next;
             }
-            if wmprof && tbis.elapsed().as_micros() > 200 {
+            if tbis.is_some_and(|t| t.elapsed().as_micros() > 200) {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: bisim surv={} E={} rounds={} {:?}",
                         func.name,
                         surv.len(),
                         es.len(),
                         rounds,
-                        tbis.elapsed()
+                        tbis.unwrap().elapsed()
                     )
                 };
             }
@@ -3288,21 +3377,21 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
                 }
             }
         }
-        if wmprof && tphasec.elapsed().as_micros() > 200 {
+        if tphasec.is_some_and(|t| t.elapsed().as_micros() > 200) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: phaseC P={} E={} {:?}",
                     func.name,
                     ps.len(),
                     es.len(),
-                    tphasec.elapsed()
+                    tphasec.unwrap().elapsed()
                 )
             };
         }
     }
     if param_drops.is_empty() {
-        return (0, pmap);
+        return (0, pmap, FxHashSet::default());
     }
-    let tprep = std::time::Instant::now();
+    let tprep = wmprof.then(std::time::Instant::now);
     // Materialize each non-member class at its block's head, operands
     // before users, then insert the run before the original first inst.
     let mut orders: FxHashMap<Block, Vec<Inst>> = FxHashMap::default();
@@ -3329,6 +3418,9 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             !ixs.is_empty()
         });
     }
+    // Blocks that actually changed — param drops still attached below,
+    // so `value_def` still names their owner block.
+    let mut merged: FxHashSet<Block> = orders.keys().copied().collect();
     for (b, insts) in orders {
         match func.layout.first_inst(b) {
             Some(fi) => {
@@ -3350,28 +3442,31 @@ pub fn webmerge_ctx(func: &mut Function, ctx: &mut WmCtx) -> (usize, FxHashMap<V
             (i, d, ixs)
         })
         .collect();
+    for &p in &param_drops {
+        if let ValueDef::Param(b, _) = func.dfg.value_def(p) {
+            merged.insert(b);
+        }
+    }
     let n = param_drops.len();
-    let temit = std::time::Instant::now();
+    let temit = wmprof.then(std::time::Instant::now);
     apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
-    let demit = temit.elapsed();
-    if pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO)
-    {
+    let demit = temit.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    if wmprof {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::clifpeep", "webmerge {}: total {:?} wloop {:?} pre {:?} keying {:?} ixscan {:?} prep {:?} emit {:?} blocks {}",
                 func.name,
-                t0.elapsed(),
-                twloop.elapsed(),
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+                twloop.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 tpre_sum,
                 tkeys_sum,
                 tblk_sum,
-                tprep.elapsed(),
+                tprep.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 demit,
                 nblk
             )
         };
     }
-    (n, pmap)
+    (n, pmap, merged)
 }
 
 /// Does `key` contain a `P` leaf — i.e. is it a slot-relative shape?
@@ -4365,7 +4460,9 @@ fn loadsel_pair(
     flags: cranelift_codegen::ir::MemFlags,
     offset: cranelift_codegen::ir::immediates::Offset32,
 ) -> bool {
-    if !pos.func.dfg.mem_flags[flags].notrap() {
+    // Plain `load` only: the rewrite re-emits `load ty`, which for a
+    // `uload8.i64`-style extending load would read 8 bytes, not 1.
+    if !pos.func.dfg.mem_flags[flags].notrap() || pos.func.dfg.insts[inst].opcode() != Opcode::Load {
         return false;
     }
     let a = pos.func.dfg.resolve_aliases(arg);
@@ -4398,12 +4495,18 @@ fn loadsel_pair(
             continue;
         }
         let InstructionData::Load {
-            arg: a2, flags: f2, ..
+            opcode: Opcode::Load,
+            arg: a2,
+            flags: f2,
+            offset: o2,
         } = pos.func.dfg.insts[i]
         else {
             continue;
         };
-        if !pos.func.dfg.mem_flags[f2].notrap() {
+        // Both halves are rebuilt from `inst`'s offset, so the sibling
+        // must read the same field (core's sort9/swap_if_less pair a
+        // key load at +0 with a +16 load of the same select).
+        if !pos.func.dfg.mem_flags[f2].notrap() || o2 != offset {
             continue;
         }
         let Some(d2) = pos.func.dfg.resolved_value_def(a2).inst() else {
@@ -4669,13 +4772,26 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut dead_sel: Vec<(Inst, Value, Value)> = Vec::new();
     let mut adj_add: Vec<(Inst, Inst, i64)> = Vec::new();
     let mut mul_id: Vec<(Inst, Value, Value)> = Vec::new();
+    // `pass_enabled` is two string-keyed lookups — read once, not per
+    // Load inst (AGENTS.md: config once per pass).
+    let ldsel = crate::pass_enabled("PLIRON_LDSEL");
+    let argspec = crate::pass_enabled("PLIRON_ARGSPEC");
+    let brifnot = crate::pass_enabled("PLIRON_BRIFNOT");
+    let rgpair_on = crate::pass_enabled("PLIRON_RGPAIR");
+    let selnot_on = crate::pass_enabled("PLIRON_SELNOT");
+    let minmax_on = crate::pass_enabled("PLIRON_MINMAX");
+    let seladd = crate::pass_enabled("PLIRON_SELADD");
+    let vmax_on = crate::pass_enabled("PLIRON_VMAX");
+    let bittab_on = crate::pass_enabled("PLIRON_BITTAB");
+    let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
+    let divchk_on = crate::pass_enabled("PLIRON_DIVCHK");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
-            if let InstructionData::Load {
-                arg, flags, offset, ..
-            } = pos.func.dfg.insts[inst]
-                && crate::pass_enabled("PLIRON_LDSEL")
+            if ldsel
+                && let InstructionData::Load {
+                    arg, flags, offset, ..
+                } = pos.func.dfg.insts[inst]
                 && loadsel_pair(&mut pos, inst, arg, flags, offset)
             {
                 n += 1;
@@ -4684,10 +4800,10 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
             if pos.func.dfg.insts[inst].opcode() == Opcode::Brif {
                 // `brif_argspec` must see the brif's own chain before
                 // `brif_not` strips it.
-                if crate::pass_enabled("PLIRON_ARGSPEC") {
+                if argspec {
                     n += brif_argspec(pos.func, inst);
                 }
-                if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
+                if brifnot && brif_not(pos.func, inst) {
                     n += 1;
                 }
                 continue;
@@ -4942,7 +5058,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 opcode: Opcode::Band,
                 args,
             } = pos.func.dfg.insts[inst]
-                && crate::pass_enabled("PLIRON_RGPAIR")
+                && rgpair_on
                 && let Some(f) = rgpair(pos.func, args[0], args[1])
             {
                 n += rgapply(&mut pos, inst, f);
@@ -5057,7 +5173,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // `Range*::contains` as one sub+compare instead of a
                     // guard branch's worth of work; under loopvec a
                     // single pcmpgtd group per lane.
-                    if crate::pass_enabled("PLIRON_RGPAIR")
+                    if rgpair_on
                         && iconst(pos.func, args[2]) == Some(0)
                         && let Some(f) = rgpair(pos.func, args[0], args[1])
                     {
@@ -5065,10 +5181,10 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         continue;
                     }
                 }
-                if crate::pass_enabled("PLIRON_SELNOT") && sel_not(pos.func, inst) {
+                if selnot_on && sel_not(pos.func, inst) {
                     n += 1;
                 }
-                if crate::pass_enabled("PLIRON_MINMAX") && minmax(&mut pos, inst) {
+                if minmax_on && minmax(&mut pos, inst) {
                     n += 1;
                 }
                 continue;
@@ -5081,7 +5197,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
             // with the arm-fact rewrite above, which runs after this
             // inst's position in the scan.
             if !x64
-                && crate::pass_enabled("PLIRON_SELADD")
+                && seladd
                 && let InstructionData::Binary {
                     opcode: Opcode::Iadd,
                     args,
@@ -5162,7 +5278,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // `mx`: proven unsigned ceiling on the non-const operand;
                     // `nn`: x's range stays in the signed-positive half, so
                     // signed compares against `k` behave like unsigned ones.
-                    let (mx, nn) = if crate::pass_enabled("PLIRON_VMAX") {
+                    let (mx, nn) = if vmax_on {
                         let m = vmax(pos.func, x);
                         (m, m <= smax as u64)
                     } else {
@@ -5251,20 +5367,20 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     }
                 }
             }
-            if crate::pass_enabled("PLIRON_BITTAB")
+            if bittab_on
                 && cond == IntCC::NotEqual
                 && bittab(&mut pos, inst, args)
             {
                 n += 1;
                 continue;
             }
-            if crate::pass_enabled("PLIRON_ICMPEQFOLD")
+            if icmpeq
                 && icmp_eqfold(&mut pos, inst, cond, args, ty, &mut uses)
             {
                 n += 1;
                 continue;
             }
-            if crate::pass_enabled("PLIRON_DIVCHK")
+            if divchk_on
                 && ty.is_int()
                 && !ty.is_vector()
                 && ty.bits() <= 64
@@ -5329,6 +5445,13 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     if !adj_add.is_empty() {
         let uses = use_counts(func);
         for (inst, si, k) in adj_add {
+            // PLIRON: `si`/`inst` were captured during the scan; the
+            // dead_sel/mul_id apply loops above may have deleted them.
+            if func.layout.inst_block(si).is_none()
+                || func.layout.inst_block(inst).is_none()
+            {
+                continue;
+            }
             let res = func.dfg.first_result(si);
             if uses
                 .get(&func.dfg.resolve_aliases(res))
@@ -6379,12 +6502,14 @@ fn icmp_eqfold(
 pub fn sublea(func: &mut Function) -> usize {
     let mut n = 0;
     let mut uses = None;
+    // Once per pass — `pass_enabled` is two string-keyed lookups.
+    let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             // Post-punroll icmp normalization: the peeled countdowns and
             // shifted compares only exist once punroll has run.
-            if crate::pass_enabled("PLIRON_ICMPEQFOLD")
+            if icmpeq
                 && let InstructionData::IntCompare {
                     opcode: Opcode::Icmp,
                     cond,
@@ -6698,6 +6823,13 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
 /// Per-block CSE with the shared keying: later insts in a block alias
 /// the earliest equivalent def, which dominates them.
 pub fn lcse(func: &mut Function) -> usize {
+    // `pass_enabled` is two string-keyed lookups — read once per pass,
+    // not per inst/candidate.
+    let extred = crate::pass_enabled("PLIRON_EXTRED");
+    let memoff_on = crate::pass_enabled("PLIRON_MEMOFF");
+    let memoff_nest = crate::pass_enabled("PLIRON_MEMOFF_NEST");
+    let negfold = crate::pass_enabled("PLIRON_NEGFOLD");
+    let subsub = crate::pass_enabled("PLIRON_SUBSUB");
     let key = cse_key;
     type Seen = FxHashMap<CseKey, Value>;
     // `uses`/`dec`/`inc` maintain an exact use tally (`usecnt` below) —
@@ -6757,7 +6889,7 @@ pub fn lcse(func: &mut Function) -> usize {
         } = data
         {
             let a = func.dfg.resolve_aliases(arg);
-            if !crate::pass_enabled("PLIRON_EXTRED") {
+            if !extred {
                 return None;
             }
             if let Some(d) = func.dfg.value_def(a).inst()
@@ -6853,7 +6985,7 @@ pub fn lcse(func: &mut Function) -> usize {
                   seen: &mut Seen,
                   cnt: &mut FxHashMap<Value, u32>|
      -> usize {
-        if !crate::pass_enabled("PLIRON_MEMOFF") {
+        if !memoff_on {
             return 0;
         }
         let mut depth = 0;
@@ -6886,7 +7018,7 @@ pub fn lcse(func: &mut Function) -> usize {
             else {
                 break;
             };
-            if !crate::pass_enabled("PLIRON_MEMOFF_NEST") {
+            if !memoff_nest {
                 break;
             }
             let mut inner = None;
@@ -6980,7 +7112,7 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Binary {
                     opcode: Opcode::Iadd,
                     args,
-                } if crate::pass_enabled("PLIRON_NEGFOLD") => {
+                } if negfold => {
                     let ra = func.dfg.resolve_aliases(args[0]);
                     let rb = func.dfg.resolve_aliases(args[1]);
                     // `iadd (ineg a), b` → `isub b, a` — isel turns the
@@ -7114,7 +7246,7 @@ pub fn lcse(func: &mut Function) -> usize {
                     // single-use and shortening the dep chain off `e`.
                     // Each rewrite drops the result a def-level deeper in
                     // the DAG, so repeat applications terminate.
-                    if !crate::pass_enabled("PLIRON_SUBSUB") {
+                    if !subsub {
                         continue;
                     }
                     let sub_of = |func: &Function, v: Value| -> Option<(Value, Value)> {
@@ -7180,7 +7312,7 @@ pub fn lcse(func: &mut Function) -> usize {
                 n += 1;
                 continue;
             }
-            let Some(k) = key(func, i) else { continue };
+            let Some(k) = cse_key(func, i) else { continue };
             match seen.entry(k) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     // Alias eagerly so later insts in this block key on the
@@ -7658,7 +7790,7 @@ pub fn vecslot(func: &mut Function) -> usize {
             };
             if !lbytes
                 .iter()
-                .all(|&(_, st)| domtree.dominates(st, l, &func.layout))
+                .all(|&(_, st)| domtree.try_dominates(st, l, &func.layout))
             {
                 all_folded = false;
                 continue;
@@ -8263,7 +8395,7 @@ mod tests {
     /// shared speculative loads.
     #[test]
     fn loadsel_speculates_complementary_pair() {
-        let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true);
+        let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true, 0, false);
         let entry = func.layout.entry_block().unwrap();
         assert!(run(&mut func, true) > 0);
         let ops: Vec<Opcode> = func
@@ -8302,7 +8434,7 @@ mod tests {
             (MemFlagsData::new().with_notrap(), false),
             (MemFlagsData::new(), true),
         ] {
-            let mut func = loadsel_func(flags, sibling);
+            let mut func = loadsel_func(flags, sibling, 0, false);
             let entry = func.layout.entry_block().unwrap();
             run(&mut func, true);
             let ops: Vec<Opcode> = func
@@ -8335,8 +8467,35 @@ mod tests {
         }
     }
 
-    /// `select c, pa, pb; *sel` ×2 (the second with swapped arms), sum.
-    fn loadsel_func(flags: MemFlagsData, sibling: bool) -> Function {
+    /// A sibling at another offset (`*sel` vs `sel->field`) or an
+    /// extending load names different bytes than the rewritten pair
+    /// would read — the pair must stay as is (miscompiled
+    /// `core::slice::sort::shared::smallsort::swap_if_less`, found by
+    /// `clif-check report --check` over the std corpus).
+    #[test]
+    fn loadsel_needs_matching_offset_and_plain_load() {
+        for (sib_off, narrow) in [(16, false), (0, true)] {
+            let mut func = loadsel_func(MemFlagsData::new().with_notrap(), true, sib_off, narrow);
+            let entry = func.layout.entry_block().unwrap();
+            run(&mut func, true);
+            let selects_feeding_loads = func
+                .layout
+                .block_insts(entry)
+                .filter(|&i| match func.dfg.insts[i] {
+                    InstructionData::Load { arg, .. } => {
+                        func.dfg.insts[func.dfg.resolved_value_def(arg).inst().unwrap()].opcode()
+                            == Opcode::Select
+                    }
+                    _ => false,
+                })
+                .count();
+            assert_eq!(selects_feeding_loads, 2, "off={sib_off} narrow={narrow}\n{}", func.display());
+        }
+    }
+
+    /// `select c, pa, pb; *sel` ×2 (the second with swapped arms, at
+    /// `sib_off`, a `uload8` if `narrow`), sum.
+    fn loadsel_func(flags: MemFlagsData, sibling: bool, sib_off: i32, narrow: bool) -> Function {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params = vec![
             AbiParam::new(types::I64),
@@ -8356,7 +8515,11 @@ mod tests {
         let l1 = cur.ins().load(types::I64, flags.clone(), s1, 0);
         let l2 = if sibling {
             let s2 = cur.ins().select(c, pb, pa);
-            cur.ins().load(types::I64, flags, s2, 0)
+            if narrow {
+                cur.ins().uload8(types::I64, flags, s2, sib_off)
+            } else {
+                cur.ins().load(types::I64, flags, s2, sib_off)
+            }
         } else {
             cur.ins().iconst(types::I64, 0)
         };

@@ -1,0 +1,85 @@
+// nowrite — verbatim transcription of pliron-ir-opt/src/nowrite.rs's
+// WriteFx ascent block. Input relations are what the Rust `run` emits
+// after its CFG walk; the rules here are byte-for-byte the same logic.
+//
+// Synthetic module (u32 ids):
+//   f0 pure body                        -> nowrite strict
+//   f1 store to non-frame in ret-block  -> ret_write   (absent: writes on return)
+//   f2 store in dead block              -> dead_write  (nw=false: writes only on dead path)
+//   f3 calls f1                         -> strict+on_return via callee
+//   f4 invokes f2                       -> on_return via strict(c) on invoke edge
+//   f5 indirect call                    -> any -> strict+on_return
+//   f6 calls unknown ext (id 9)         -> !known -> any -> strict+on_return
+//   f7 calls f1, then unreachable       -> strict but no on_return (nw=false: panic path only)
+//   f8 calls f0                         -> clean (nw=true)
+
+
+let (ret_write_, dead_write_, call_, callr_, icall_, icallr_, known_, any_, strict_, on_return_) = datalog {
+    rel ret_write(f: int)
+    rel dead_write(f: int)
+    rel call(f: int, c: int, inv: bool, unr: bool)
+    rel callr(f: int, c: int, inv: bool, unr: bool)
+    rel icall(f: int, inv: bool, unr: bool)
+    rel icallr(f: int, inv: bool, unr: bool)
+    rel known(f: int)
+
+    rel any(f: int, inv: bool, unr: bool)
+    any(f, inv, unr) if icall(f, inv, unr)
+    any(f, inv, unr) if call(f, c, inv, unr), !known(c)
+
+    rel strict(f: int)
+    strict(f) if ret_write(f)
+    strict(f) if dead_write(f)
+    strict(f) if any(f, _, _)
+    strict(f) if call(f, c, _, _), strict(c)
+
+    rel on_return(f: int)
+    on_return(f) if ret_write(f)
+    on_return(f) if icallr(f, inv, unr), inv || !unr
+    on_return(f) if callr(f, c, inv, unr), !known(c), inv || !unr
+    on_return(f) if callr(f, c, true, _), strict(c)
+    on_return(f) if callr(f, c, false, false), on_return(c)
+
+    // --- input facts (what the Rust CFG walk would emit) ---
+    ret_write(1)
+    dead_write(2)
+    call(3, 1, false, false)
+    callr(3, 1, false, false)
+    call(4, 2, true, false)
+    callr(4, 2, true, false)
+    icall(5, false, false)
+    icallr(5, false, false)
+    call(6, 9, false, false)
+    callr(6, 9, false, false)
+    call(7, 1, false, true)
+    callr(7, 1, false, true)
+    call(8, 0, false, false)
+    callr(8, 0, false, false)
+    // known: f0..f8 bodied + libc (9 is the unknown ext — deliberately not known)
+    known(0)
+    known(1)
+    known(2)
+    known(3)
+    known(4)
+    known(5)
+    known(6)
+    known(7)
+    known(8)
+    known(100)
+    known(101)
+};
+
+// nw[f] = !on_return(f) present -> (f, !strict(f)); absent from map otherwise.
+// Mirror the Rust: bodied f, !on_return -> entry (f, !strict(f)).
+let strict_set = strict_;
+let on_ret_set = on_return_;
+let nw = for f in [0, 1, 2, 3, 4, 5, 6, 7, 8] collect {
+    let onr = false;
+    for r in on_ret_set { if r.0 == f { onr = true; } }
+    if !onr {
+        let st = false;
+        for r in strict_set { if r.0 == f { st = true; } }
+        print(f"f{f}: nowrite={!st}");
+    }
+};
+print("nowrite ok");

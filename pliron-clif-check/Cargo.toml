@@ -16,4 +16,5 @@ cranelift-codegen = { version = "=0.135.5", default-features = false, features =
 cranelift-module = "=0.135.5"
 cranelift-reader = "=0.135.5"
 rustc-hash = "2"
+serde_json = "1"
 target-lexicon = "0.13"

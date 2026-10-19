@@ -500,7 +500,7 @@ impl<T: RegionLiveness + 'static> Analysis for Liveness<T> {
         let mut liveness = Self::default();
         let mut dom_info = analyses.get_analysis_mut::<DomInfo>(op, ctx)?;
         // Precompute liveness for the top-level regions of the operation.
-        for region in op.deref(ctx).regions() {
+        for region in op.deref(ctx).regions(ctx) {
             liveness.get_region_info(ctx, &mut dom_info, region);
         }
         Ok(liveness)
@@ -742,7 +742,7 @@ mod tests {
             0,
         );
         def_op.insert_at_back(block, ctx);
-        let value = def_op.deref(ctx).get_result(0);
+        let value = def_op.deref(ctx).get_result(ctx, 0);
         (def_op, value)
     }
 
@@ -777,7 +777,7 @@ mod tests {
             1,
         );
         holder.insert_at_back(block, ctx);
-        let region = holder.deref(ctx).get_region(0);
+        let region = holder.deref(ctx).get_region(ctx, 0);
         let inner_block = BasicBlock::new(ctx, None, vec![]);
         inner_block.insert_at_back(region, ctx);
         (holder, region, inner_block)

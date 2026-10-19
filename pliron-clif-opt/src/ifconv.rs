@@ -155,21 +155,23 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
     let mut clone = Vec::new();
     let mut psub = Vec::new();
     while chain.len() < 8 {
-        let insts: Vec<Inst> = func.layout.block_insts(cur).collect();
-        let Some((&jmp, body)) = insts.split_last() else {
+        let Some(jmp) = func.layout.last_inst(cur) else {
             break;
         };
         let InstructionData::Jump { destination, .. } = func.dfg.insts[jmp] else {
             break;
         };
+        // All but the terminator — iterated rather than collected since
+        // this runs per brif arm per round.
+        let body = || func.layout.block_insts(cur).filter(|&i| i != jmp);
         let params = func.dfg.block_params(cur);
         // The inst cap bounds total speculation across the chain; arms
         // deeper than SPEC_NARROW additionally need `bool_merge` at the
         // conversion site.
         if cur_edge.len() != params.len()
-            || clone.len() + body.len() > SPEC_WIDE
+            || clone.len() + body().count() > SPEC_WIDE
             || !cur_edge.iter().all(|a| matches!(a, BlockArg::Value(_)))
-            || !body.iter().all(|&i| crate::jumpthread::pure_op(func, i))
+            || !body().all(|i| crate::jumpthread::pure_op(func, i))
         {
             break;
         }
@@ -179,7 +181,7 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
             };
             psub.push((p, func.dfg.resolve_aliases(v)));
         }
-        clone.extend_from_slice(body);
+        clone.extend(body());
         chain.push(cur);
         cur_edge = destination.args(&func.dfg.value_lists).collect();
         cur = destination.block(&func.dfg.value_lists);
@@ -324,7 +326,7 @@ fn edge_ok(
                     ValueDef::Result(di, _) => {
                         let db = func.layout.inst_block(di).unwrap_or(m);
                         !chains.contains(&db)
-                            && (mset.contains(&db) || domtree.dominates(di, term, &func.layout))
+                            && (mset.contains(&db) || domtree.try_dominates(di, term, &func.layout))
                     }
                     _ => true,
                 })
@@ -648,9 +650,11 @@ fn conv_table(
     }
     let chains: FxHashSet<Block> = arms.iter().flat_map(|a| a.chain.iter().copied()).collect();
     let mset = msets.get(m);
-    let t0 = std::time::Instant::now();
+    let t0 = EDGE_PROF.with(|c| c.get()).then(std::time::Instant::now);
     let ok = !mset.is_empty() && edge_ok(func, domtree, m, mset, &chains, term);
-    EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+    if let Some(t0) = t0 {
+        EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+    }
     if !ok {
         return false;
     }
@@ -679,7 +683,7 @@ fn conv_table(
                 continue;
             }
             let dom = match func.dfg.value_def(v) {
-                ValueDef::Result(di, _) => domtree.dominates(di, term, &func.layout),
+                ValueDef::Result(di, _) => domtree.try_dominates(di, term, &func.layout),
                 ValueDef::Param(db, _) => domtree.block_dominates(db, b),
                 _ => false,
             };
@@ -750,18 +754,39 @@ fn conv_table(
 
 thread_local! {
     static EDGE_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    // `edge_ok` runs per candidate arm — its per-call `Instant::now` only
+    // ever feeds the `EDGE_NS` total printed at the end of `run`, so the
+    // clock reads are gated on `pliron::ifconv` INFO being live.
+    static EDGE_PROF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize {
+pub fn run(
+    func: &mut Function,
+    derived: &mut FxHashMap<Value, Value>,
+    cd: Option<(&mut ControlFlowGraph, &mut DominatorTree)>,
+) -> usize {
     EDGE_NS.set(0);
-    let mut cfg = ControlFlowGraph::with_function(func);
-    let mut domtree = DominatorTree::with_function(func, &cfg);
+    EDGE_PROF.set(
+        pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO),
+    );
+    // The caller's cached cfg/dt may be reused: edge-args and values may
+    // have changed since it was built, but block adjacency has not.
+    let (mut cfg_l, mut dt_l);
+    let (cfg, domtree) = match cd {
+        Some((c, d)) => (c, d),
+        None => {
+            cfg_l = ControlFlowGraph::with_function(func);
+            dt_l = DominatorTree::with_function(func, &cfg_l);
+            (&mut cfg_l, &mut dt_l)
+        }
+    };
     let mut flat = Flat {
         ok: false,
         la: LoopAnalysis::new(),
         interior: FxHashMap::default(),
     };
-    let mut msets = Msets::new(func, &domtree);
+    let mut msets = Msets::new(func, domtree);
     let mut dirty = false;
     // Exact pred deltas for applied folds — (gained direct preds, lost
     // preds) per block — so checks that need fresh pred sets don't pay a
@@ -779,9 +804,13 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
     // reads still trigger the incremental recompute. The pred deltas
     // are idempotent against a recomputed cfg, so a recompute inside a
     // round leaves later rounds correct.
+    // Folds only rewrite terminators and emit into the scanned block —
+    // no block is ever added or removed, so the scan list is stable
+    // across rounds.
+    let blocks: Vec<Block> = func.layout.blocks().collect();
     'outer: for _ in 0..8 {
         let mut rn = 0;
-        for b in func.layout.blocks().collect::<Vec<_>>() {
+        for b in blocks.iter().copied() {
             let Some(term) = func.layout.last_inst(b) else {
                 continue;
             };
@@ -789,8 +818,8 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
                     && conv_table(
                         func,
-                        &mut cfg,
-                        &mut domtree,
+                        cfg,
+                        domtree,
                         &mut flat,
                         &mut msets,
                         &mut dirty,
@@ -805,8 +834,7 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
                 continue;
             };
             let dests = func.dfg.insts[term]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .to_vec();
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
             let [t_bc, e_bc] = dests[..] else {
                 continue;
             };
@@ -871,12 +899,12 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             if ta.chained || ea.chained {
                 if dirty {
                     cfg.compute(func);
-                    domtree.compute(func, &cfg);
-                    msets.recompute(func, &domtree);
+                    domtree.compute(func, cfg);
+                    msets.recompute(func, domtree);
                     flat.ok = false;
                     dirty = false;
                 }
-                flat.ensure(func, &cfg, &domtree);
+                flat.ensure(func, cfg, domtree);
                 if !flat.flat(b) {
                     continue;
                 }
@@ -884,9 +912,11 @@ pub fn run(func: &mut Function, derived: &mut FxHashMap<Value, Value>) -> usize 
             let chains: FxHashSet<Block> =
                 ta.chain.iter().chain(ea.chain.iter()).copied().collect();
             let mset = msets.get(m);
-            let t0 = std::time::Instant::now();
-            let ok = !mset.is_empty() && edge_ok(func, &domtree, m, mset, &chains, term);
-            EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+            let t0 = EDGE_PROF.with(|c| c.get()).then(std::time::Instant::now);
+            let ok = !mset.is_empty() && edge_ok(func, domtree, m, mset, &chains, term);
+            if let Some(t0) = t0 {
+                EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+            }
             if !ok {
                 continue;
             }
@@ -1106,7 +1136,7 @@ mod tests {
         };
 
         let mut derived = FxHashMap::default();
-        assert_eq!(run(&mut func, &mut derived), 1);
+        assert_eq!(run(&mut func, &mut derived, None), 1);
         let term = func.layout.last_inst(b).unwrap();
         let InstructionData::Jump { destination, .. } = &func.dfg.insts[term] else {
             panic!("table not folded: {}", func.display());
@@ -1242,7 +1272,7 @@ mod tests {
         };
 
         let mut derived = FxHashMap::default();
-        let _ = run(&mut func, &mut derived);
+        let _ = run(&mut func, &mut derived, None);
         // hop's own diamond fold is legitimate; the latch's fold must be
         // rejected — its arms resolve through `hop` while `hop`'s params
         // and `cnd` still feed blocks below `merge`.

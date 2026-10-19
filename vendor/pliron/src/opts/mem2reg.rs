@@ -426,7 +426,7 @@ fn process_rename_block(
 
     // Push phi args for this block.
     for &(ref cand, arg_idx) in new_phis_in_block.get(&block).into_iter().flatten() {
-        let new_val = block.deref(ctx).get_argument(arg_idx);
+        let new_val = block.deref(ctx).get_argument(ctx, arg_idx);
         reaching_def_map
             .get_mut(&cand.alloc_info.ptr)
             .unwrap()

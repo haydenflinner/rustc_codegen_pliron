@@ -38,6 +38,7 @@ pub mod analyses;
 pub mod attribute;
 pub mod basic_block;
 pub mod builtin;
+pub mod cols; // PLIRON: dense columnar side tables
 pub mod common_traits;
 pub mod context;
 pub mod dialect;

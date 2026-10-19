@@ -127,36 +127,38 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
     if !Operation::is_op::<LoadOp>(op, ctx) {
         bail!("callee not a load");
     }
-    let mut work = vec![op.deref(ctx).get_operand(0)];
+    let mut work = vec![op.deref(ctx).get_operand(ctx, 0)];
     let mut seen = FxHashSet::default();
     let mut stored = Vec::new();
+    let mut ubuf = Vec::new();
     while let Some(v) = work.pop() {
         if !seen.insert(v) {
             continue;
         }
-        if !st.allocas.contains_key(&v) {
+        if !st.allocas.contains(v) {
             let Some(d) = v.defining_op() else {
                 bail!("non-alloca non-gep ptr (block arg)");
             };
             if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
                 bail!("non-alloca ptr from non-gep");
             }
-            work.push(d.deref(ctx).get_operand(0));
+            work.push(d.deref(ctx).get_operand(ctx, 0));
             continue;
         }
-        for u in v.uses(ctx) {
+        v.uses_into(ctx, &mut ubuf);
+        for u in ubuf.iter().copied() {
             let o = u.user_op();
-            if st.volatile.contains(&o) {
+            if st.volatile.contains(o) {
                 bail!("volatile use");
             }
             if Operation::is_op::<GetElementPtrOp>(o, ctx) {
-                work.push(o.deref(ctx).get_result(0));
+                work.push(o.deref(ctx).get_result(ctx, 0));
             } else if Operation::is_op::<LoadOp>(o, ctx) {
             } else if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {
-                stored.push(o.deref(ctx).get_operand(0));
+                stored.push(o.deref(ctx).get_operand(ctx, 0));
             } else if !Operation::is_op::<CallIntrinsicOp>(o, ctx)
                 || !matches!(
-                    st.intrinsics.get(&o).map(|s| s.as_str()),
+                    st.intrinsics.get(o).map(|s| s.as_str()),
                     Some(n) if n.starts_with("llvm.lifetime.")
                 )
             {
@@ -169,7 +171,7 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
     }
     let mut syms = Vec::new();
     for v in stored {
-        match st.consts.get(&v) {
+        match st.consts.get(v) {
             Some(ConstVal::Sym { sym, off: 0 }) => syms.push(sym.clone()),
             _ => {
                 if dbg {
@@ -205,7 +207,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         p.nparams.push((f, n.min(MAX_PARAMS)));
         for (i, a) in bs[0]
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .enumerate()
             .take(MAX_PARAMS as usize)
         {
@@ -238,9 +240,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                         })
                     };
                     let bridge = is!(PtrToIntOp) || is!(IntToPtrOp);
-                    for r in d.results() {
+                    for r in d.results(ctx) {
                         let (rp, ri) = pk(r);
-                        for v in d.operands() {
+                        for v in d.operands(ctx) {
                             let (vp, vi) = pk(v);
                             if bridge || !(vp && ri) && !(vi && rp) {
                                 p.flow.push((v, r));
@@ -248,22 +250,22 @@ pub fn run(ctx: &Context, st: &mut State) {
                         }
                     }
                 }
-                if d.successors().next().is_some()
+                if d.successors(ctx).next().is_some()
                     && let Some(t) =
                         op_cast::<dyn BranchOpInterface>(&*Operation::get_op_dyn(op, ctx))
                 {
-                    for (si, s) in d.successors().enumerate() {
+                    for (si, s) in d.successors(ctx).enumerate() {
                         let args = t.successor_operands(ctx, si);
                         p.flow
-                            .extend(args.into_iter().zip(s.deref(ctx).arguments()));
+                            .extend(args.into_iter().zip(s.deref(ctx).arguments(ctx)));
                     }
                 }
                 // The exception payload is produced by the callee; it may
                 // encode any arg.
-                if let Some(&(lp, _)) = st.invokes.get(&op)
-                    && let Some(x) = lp.deref(ctx).arguments().next()
+                if let Some(&(lp, _)) = st.invokes.get(op)
+                    && let Some(x) = lp.deref(ctx).arguments(ctx).next()
                 {
-                    p.flow.extend(d.operands().map(|v| (v, x)));
+                    p.flow.extend(d.operands(ctx).map(|v| (v, x)));
                 }
                 let mut retain = |v: Value| {
                     p.retain.push((f, v));
@@ -279,17 +281,17 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // not a capture: the pointer can only come back through
                     // that slot's load results, so flow to them instead.
                     // Anything else retains — the pointer can roam.
-                    let (sv, dp) = (d.get_operand(0), d.get_operand(1));
+                    let (sv, dp) = (d.get_operand(ctx, 0), d.get_operand(ctx, 1));
                     match crate::sroa::slot_loads(ctx, st, dp, 0, &mut accmemo) {
                         Some(ls) => p.flow.extend(ls.into_iter().map(|r| (sv, r))),
                         None => retain(sv),
                     }
                 } else if is!(AtomicStoreOp) {
-                    retain(d.get_operand(0));
+                    retain(d.get_operand(ctx, 0));
                 } else if is!(AtomicRmwOp) {
-                    retain(d.get_operand(1));
+                    retain(d.get_operand(ctx, 1));
                 } else if is!(AtomicCmpxchgOp) {
-                    retain(d.get_operand(2));
+                    retain(d.get_operand(ctx, 2));
                 } else if is!(CallOp) {
                     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
                     match direct_callee(ctx, st, op) {
@@ -327,7 +329,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                         }
                     }
                 } else if is!(CallIntrinsicOp) {
-                    match st.intrinsics.get(&op).map(|s| s.as_str()) {
+                    match st.intrinsics.get(op).map(|s| s.as_str()) {
                         // A bulk read+region write: neither operand is
                         // retained — the bytes move, but every derived
                         // pointer inside was already retained by the store
@@ -338,15 +340,17 @@ pub fn run(ctx: &Context, st: &mut State) {
                                 || n.starts_with("llvm.dbg.")
                                 || PURE.iter().any(|p| n.starts_with(p)) => {}
                         // Unknown intrinsic: may retain any operand.
-                        _ => d.operands().for_each(retain),
+                        _ => d.operands(ctx).for_each(retain),
                     }
                 } else if is!(ReturnOp) || is!(InlineAsmOp) {
-                    d.operands().for_each(retain);
+                    d.operands(ctx).for_each(retain);
                 }
             }
         }
     }
+    let trun = std::time::Instant::now();
     p.run();
+    pliron_cfg::trace("nocap-fixpoint", trun.elapsed().as_secs_f64() * 1e3, &st.cgu);
     if dbg.is_some()
         && pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG)
@@ -393,5 +397,5 @@ pub fn run(ctx: &Context, st: &mut State) {
         v.sort();
         crate::dump_fact("nocapture", s, &v);
     }
-    st.nocapture = nc;
+    st.nocapture = nc.into_iter().collect();
 }

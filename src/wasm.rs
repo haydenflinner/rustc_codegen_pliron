@@ -1,4 +1,8 @@
-//! pliron LLVM dialect -> waffle IR -> wasm32 "object" module.
+//! Optimized Cranelift IR -> waffle IR -> wasm32 "object" module.
+//!
+//! `lower_to_wasm_clif` runs FnLower + the pliron-clif-opt suite (same as
+//! the native backend) via `lower::lower_clif_wasm`, then `clif_emit`
+//! translates each function's optimized CLIF to waffle SSA.
 //!
 //! An object is a complete wasm module. Linear memory, `__stack_pointer` and
 //! `__indirect_function_table` are imported from `env`; functions it calls but
@@ -18,16 +22,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use cranelift_codegen::ir::{Type as ClType, types as clt};
 use cranelift_module::Linkage;
-use pliron::basic_block::BasicBlock;
-use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
-use pliron::context::{Context, Ptr};
-use pliron::linked_list::ContainsLinkedList;
-use pliron::op::Op;
-use pliron::operation::Operation;
+use pliron::context::Context;
 use pliron::r#type::{TypeHandle, Typed};
-use pliron::value::Value;
-use pliron_llvm::attributes::{AtomicRmwKindAttr, FCmpPredicateAttr, ICmpPredicateAttr};
-use pliron_llvm::ops::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use waffle::entity::EntityRef;
@@ -37,12 +33,10 @@ use waffle::{
     Signature, SignatureData, Table, TableData, Terminator, Type as WT, Value as WV, ValueDef,
 };
 
-use crate::context::{ArgExt, ConstVal, State};
+use crate::context::State;
 use crate::has_body;
-use crate::lower::{rpo, write_const};
-use crate::types::{
-    TyK, align_to, classify, leaves, members, size_align, struct_offsets, va_indirect,
-};
+use crate::lower::write_const;
+use crate::types::{TyK, classify, leaves, size_align};
 
 type Vals = SmallVec<[WV; 2]>;
 
@@ -92,20 +86,6 @@ fn wsig(ctx: &Context, fn_ty: TypeHandle) -> SignatureData {
     }
 }
 
-/// (first leaf, leaf count) of the member at `idx` inside `ty`.
-fn wleaf_range(ctx: &Context, mut ty: TypeHandle, idx: &[u32]) -> (usize, usize) {
-    let mut start = 0;
-    for &i in idx {
-        let ms = members(ctx, ty);
-        start += ms[..i as usize]
-            .iter()
-            .map(|m| wleaves(ctx, *m).len())
-            .sum::<usize>();
-        ty = ms[i as usize];
-    }
-    (start, wleaves(ctx, ty).len())
-}
-
 thread_local!(static QUIET: Cell<bool> = const { Cell::new(false) });
 
 /// Diagnose malformed targets before waffle's optimizer ICEs on
@@ -150,7 +130,6 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
 struct FDecl {
     name: String,
     sig: Signature,
-    ty: Option<TypeHandle>,
     body: Option<FunctionBody>,
     /// `#[inline(always)]`: splice at every callsite regardless of
     /// size (LLVM's AlwaysInliner parity). `#[inline(never)]` blocks
@@ -161,9 +140,7 @@ struct FDecl {
     no_inline: bool,
 }
 
-struct Obj<'a> {
-    ctx: &'a Context,
-    st: &'a State,
+struct Obj {
     m: Module<'static>,
     sigs: FxHashMap<(Vec<WT>, Vec<WT>), Signature>,
     funcs: Vec<FDecl>,
@@ -172,13 +149,9 @@ struct Obj<'a> {
     sp: Global,
     table: Table,
     mem: Memory,
-    /// panic=unwind: emulated EH (see `FL::eh_check`).
-    unwind: bool,
-    /// `PLIRON_WASM_TRIP` shared loop-trip counter (created lazily).
-    trip: waffle::Global,
 }
 
-impl<'a> Obj<'a> {
+impl Obj {
     fn sig(&mut self, s: SignatureData) -> Signature {
         let key = (s.params.clone(), s.returns.clone());
         if let Some(x) = self.sigs.get(&key) {
@@ -203,15 +176,9 @@ impl<'a> Obj<'a> {
         g
     }
 
-    /// `GOT.func.<sym>` (table index) or `GOT.mem.<sym>` (address).
-    fn got(&mut self, sym: &str) -> Global {
-        let func = self.st.funcs.contains_key(sym);
-        self.got_at(func, sym)
-    }
-
-    /// `got` with the func/data class explicit — the CLIF path knows it
-    /// from the reference namespace even when the name isn't in st.funcs
-    /// (`\x01` verbatim syms, libcalls, extern data).
+    /// `GOT.func.<sym>` (table index) or `GOT.mem.<sym>` (address); the
+    /// func/data class comes from the reference namespace even when the
+    /// name isn't in st.funcs (`\x01` verbatim syms, libcalls, extern data).
     fn got_at(&mut self, func: bool, sym: &str) -> Global {
         if let Some(g) = self.got.get(&(func, sym.to_string())) {
             return *g;
@@ -231,7 +198,6 @@ impl<'a> Obj<'a> {
         self.funcs.push(FDecl {
             name: name.into(),
             sig,
-            ty: None,
             body: None,
             always: false,
             hint: false,
@@ -280,112 +246,7 @@ pub fn target_features(
     f
 }
 
-pub fn lower_to_wasm(
-    ctx: &Context,
-    st: &State,
-    name: &str,
-    features: &[String],
-    unwind: bool,
-) -> Vec<u8> {
-    let mut m = Module::empty();
-    let mem = m.memories.push(MemoryData {
-        initial_pages: 0,
-        maximum_pages: None,
-        segments: vec![],
-    });
-    m.imports.push(Import {
-        module: "env".into(),
-        name: "memory".into(),
-        kind: ImportKind::Memory(mem),
-    });
-    let table = m.tables.push(TableData {
-        ty: WT::FuncRef,
-        initial: 0,
-        max: None,
-        func_elements: None,
-    });
-    m.imports.push(Import {
-        module: "env".into(),
-        name: "__indirect_function_table".into(),
-        kind: ImportKind::Table(table),
-    });
-    let mut o = Obj {
-        ctx,
-        st,
-        m,
-        sigs: FxHashMap::default(),
-        funcs: Vec::new(),
-        fidx: FxHashMap::default(),
-        got: FxHashMap::default(),
-        sp: Global::invalid(),
-        table,
-        mem,
-        unwind,
-        trip: waffle::Global::invalid(),
-    };
-    o.sp = o.import_global("env", "__stack_pointer", true);
-
-    for (n, f) in &st.funcs {
-        if st.dead_fns.contains(n) {
-            continue;
-        }
-        let s = wsig(ctx, f.ty);
-        let sig = o.sig(s);
-        o.funcs.push(FDecl {
-            name: n.clone(),
-            sig,
-            ty: Some(f.ty),
-            body: None,
-            always: f.always_inline,
-            hint: f.inline_hint,
-            no_inline: f.no_inline,
-        });
-        o.fidx.insert(n.clone(), o.funcs.len() - 1);
-    }
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    let mut stubs = 0;
-    let mut defined = 0;
-    for (n, f) in &st.funcs {
-        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
-            continue;
-        }
-        defined += 1;
-        let i = o.fidx[n];
-        let sig = o.funcs[i].sig;
-        let body = match guarded(|| {
-            let mut fl = FL::new(&mut o, sig);
-            fl.name = n.clone();
-            fl.lower(f.op);
-            fl.finish()
-        }) {
-            Ok(b) => b,
-            Err(e) => {
-                stubs += 1;
-                if let Some(f) = crate::env_get("PLIRON_WASM_STUBLOG") {
-                    use std::fmt::Write as _;
-                    let mut s = String::new();
-                    writeln!(s, "stub {n}: {e}").unwrap();
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(f)
-                        .map(|mut x| std::io::Write::write_all(&mut x, s.as_bytes()));
-                }
-                if verbose {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm","pliron-wasm: stub {n}: {e}")
-                    };
-                }
-                stub(&o.m, sig)
-            }
-        };
-        o.funcs[i].body = Some(body);
-    }
-    emit_obj(o, ctx, st, name, features, stubs, defined, verbose)
-}
-
-/// Shared module tail for both wasm paths: waffle-IR inlining, function
+/// Module tail: waffle-IR inlining, function
 /// index remap (imports first), per-body wasm emit with stub fallback,
 /// exports, and the `pliron.link`/`target_features`/custom sections.
 fn emit_obj(
@@ -400,7 +261,7 @@ fn emit_obj(
 ) -> Vec<u8> {
     // Waffle-IR inlining: splice small / single-callsite callees into
     // callers while `Call` targets still index `o.funcs`. Callees whose
-    // last call edge disappears are dropped by wasm-ld's GC — this is
+    // last call edge disappears are dropped by wasm-ld's GC â€” this is
     // the main lever on the 4x function-count gap vs stock.
     if crate::env_get("PLIRON_WASM_INLINE") != Some("0") {
         winline(&mut o.funcs, verbose, o.sp);
@@ -611,7 +472,7 @@ fn nskip(b: &[u8], p: &mut usize, n: usize) -> Option<()> {
     Some(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum WPeek {
     Get(u32),
     Set(u32),
@@ -622,6 +483,16 @@ enum WPeek {
     Ctl,
     /// Deleted by the rewrite passes; emits no bytes.
     Del,
+    /// `local.set` proven dead; emits `drop` to keep the stack effect.
+    Drop,
+    /// A `local.get l; local.set l` self-copy deleted by the adjacent-pair
+    /// coalescing. Emits no bytes â€” the pair is a real no-op â€” but it both
+    /// *reads* l and *writes back the observed value*, and later rewrites
+    /// (the copy-forward fixpoint below) move defs between locals, which
+    /// can change what l holds at this point. Keeping the marker makes the
+    /// analysis see the read and the reaffirming write it would otherwise
+    /// lose track of.
+    Nop(u32),
     Other,
 }
 
@@ -632,9 +503,50 @@ enum WPeek {
 /// `local.set x`. All three edits keep the operand stack and locals
 /// identical and only span adjacent instructions, so structured
 /// control flow is unaffected (branch targets are label depths, not
-/// byte offsets). Returns None — caller keeps the original bytes — on
-/// any opcode it can't decode.
-fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
+/// byte offsets). Returns None â€” caller keeps the original bytes â€” on
+/// any opcode it can't decode. `fsig`/`tsig` give (pops, pushes) per
+/// function index and per type index so calls can take part in
+/// stack-effect tracking.
+fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)]) -> Option<Vec<u8>> {
+    peep_body_opts(b, fsig, tsig, &PeepOpts::from_env())
+}
+
+#[path = "wpeep_audit.rs"]
+mod wpeep_audit;
+
+/// `wpeep` switches. `from_env`: `PLIRON_WASM_AUDIT=1` audits every
+/// copy-forward round with the Datalog checker in `wpeep_audit` and
+/// reverts rounds that fail it (`=panic` panics instead);
+/// `PLIRON_WASM_PEEP_PATHCHECK=0` drops the straight-line requirement
+/// (dab149b) — only for demonstrating that the audit catches that class.
+struct PeepOpts {
+    audit: bool,
+    audit_panic: bool,
+    pathcheck: bool,
+    violations: std::cell::Cell<u32>,
+    /// Rounds over the audit's budget, left unaudited.
+    skipped: std::cell::Cell<u32>,
+}
+
+impl PeepOpts {
+    fn from_env() -> Self {
+        let a = crate::env_get("PLIRON_WASM_AUDIT");
+        PeepOpts {
+            audit: a.is_some_and(|v| v != "0"),
+            audit_panic: a == Some("panic"),
+            pathcheck: crate::pass_enabled("PLIRON_WASM_PEEP_PATHCHECK"),
+            violations: std::cell::Cell::new(0),
+            skipped: std::cell::Cell::new(0),
+        }
+    }
+}
+
+fn peep_body_opts(
+    b: &[u8],
+    fsig: &[(u32, u32)],
+    tsig: &[(u32, u32)],
+    opts: &PeepOpts,
+) -> Option<Vec<u8>> {
     // Locals prefix: vec of (count, valtype). waffle emits one group per
     // local; re-emit adjacent same-type runs as a single group. This is
     // index-preserving (merge only, never reorder), so it needs no other
@@ -645,7 +557,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     for _ in 0..nl {
         let c = urd(b, &mut p)?;
         // Single-byte valtypes only (numeric/v128/funcref/externref);
-        // typed refs (0x63/0x64 + heaptype) need a longer decode — bail.
+        // typed refs (0x63/0x64 + heaptype) need a longer decode â€” bail.
         let t = *b.get(p)?;
         if !matches!(t, 0x6f | 0x70 | 0x78..=0x7f) {
             return None;
@@ -659,14 +571,14 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     // Instruction stream: (kind, byte range). `depth` tracks structured
     // constructs so the scan stops on the `end` that closes the body.
     // `stack` additionally records each instruction's structured
-    // context — the enclosing (construct, arm) pairs — so the rewrite
+    // context â€” the enclosing (construct, arm) pairs â€” so the rewrite
     // pass can tell when a use/def lives on a different `if` arm than
     // the producer (and can therefore never observe its value).
     let mut ins: Vec<(WPeek, usize, usize, usize)> = Vec::new();
     let mut ctx: Vec<Vec<(u32, u8)>> = Vec::new();
     // Opcode per decode-time ins index: ctx entries record the
     // construct's decode index, which coalescing below makes stale as
-    // an `ins` index — `dop` keeps it resolvable.
+    // an `ins` index â€” `dop` keeps it resolvable.
     let mut dop: Vec<u8> = Vec::new();
     let mut stack: Vec<(u32, u8)> = Vec::new();
     let mut depth = 0i32;
@@ -804,23 +716,34 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         let mut changed = false;
         let mut i = 0;
         while i < ins.len() {
-            let pair = (ins[i].0, ins.get(i + 1).map(|x| x.0));
+            // Pair detection skips Nop markers: deleted self-copies are
+            // stack-transparent, so `get a; <nop>; set a` is still a
+            // no-op pair. Skipped markers are re-emitted either way.
+            let mut j = i + 1;
+            while j < ins.len() && matches!(ins[j].0, WPeek::Nop(_)) {
+                j += 1;
+            }
+            let pair = (ins[i].0, ins.get(j).map(|x| x.0));
             match pair {
                 (WPeek::Get(a), Some(WPeek::Set(c))) if a == c => {
+                    out.push((WPeek::Nop(a), ins[i].1, ins[i].2, ins[i].3));
+                    out.extend_from_slice(&ins[i + 1..j]);
                     changed = true;
-                    i += 2;
+                    i = j + 1;
                     continue;
                 }
                 (WPeek::Set(a), Some(WPeek::Get(c))) if a == c => {
                     out.push((WPeek::Tee(a), ins[i].1, ins[i].2, ins[i].3));
+                    out.extend_from_slice(&ins[i + 1..j]);
                     changed = true;
-                    i += 2;
+                    i = j + 1;
                     continue;
                 }
                 (WPeek::Tee(a), Some(WPeek::Set(c))) if a == c => {
                     out.push((WPeek::Set(a), ins[i].1, ins[i].2, ins[i].3));
+                    out.extend_from_slice(&ins[i + 1..j]);
                     changed = true;
-                    i += 2;
+                    i = j + 1;
                     continue;
                 }
                 _ => {}
@@ -835,17 +758,17 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
     }
     // Materialization forwarding: waffle's treeify only inlines pure
     // ops, so every load / non-pure result gets `P; local.set t` then a
-    // later `local.get t` — LLVM instead keeps such values on the
+    // later `local.get t` â€” LLVM instead keeps such values on the
     // operand stack, which is why its loops are ~40% shorter. When t is
     // defined exactly once (that set) and read exactly once (a later
     // `local.get`), we can replay P at the use site and drop both local
-    // ops. P must be a self-contained stack unit — net effect +1 and
-    // never consuming values pushed before it — composed only of
+    // ops. P must be a self-contained stack unit â€” net effect +1 and
+    // never consuming values pushed before it â€” composed only of
     // "transparent" instrs: no control flow, no local/global writes,
     // no stores/calls (loads and pure ops may reorder freely; a load
     // moving across another load changes only trap order, which is
     // unobservable). Everything between a forwarded set and its use
-    // must be transparent too — an `else`, a `local.set` of another
+    // must be transparent too â€” an `else`, a `local.set` of another
     // local, or a store between them makes the move unsafe (the use
     // could observe a different local value, or a load could cross a
     // store). Stack shape is preserved exactly: each producer replayed
@@ -891,7 +814,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
         }
         // Forwardable `local.set t` at i: u is the ONLY use of t in the
-        // window (i, next def of t) — so deleting the set cannot leave
+        // window (i, next def of t) â€” so deleting the set cannot leave
         // a stale read: uses before i read an earlier def, uses after
         // the next def read a newer one, and we replace u itself with
         // the producer. Multi-def locals (temps reused across unrolled
@@ -912,7 +835,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         };
         // A later def d of a local provably rewrites the value before
         // use u reads it only when d's context encloses u's (same
-        // construct path and arm — it can't be skipped) and no
+        // construct path and arm â€” it can't be skipped) and no
         // branch-family instruction between them can hop over d. A def
         // on a conditional arm never covers: paths that skip it still
         // observe the earlier value.
@@ -930,7 +853,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
             // A read positioned before the set can observe its value
-            // through a `loop` back-edge feeding the next iteration —
+            // through a `loop` back-edge feeding the next iteration â€”
             // that makes the set unforwardable outright (the producer
             // can never be moved backwards to it).
             if uses
@@ -951,9 +874,9 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             // The use must be the *only* later-positioned reader that
             // can observe this set's value: any use not covered by a
-            // following def (conditional defs don't cover — paths that
+            // following def (conditional defs don't cover â€” paths that
             // skip them still see this value). A read inside a
-            // conditional arm counts as a reader too — it just can't
+            // conditional arm counts as a reader too â€” it just can't
             // serve as the splice target below.
             let w: Vec<usize> = uses
                 .get(&t)
@@ -976,7 +899,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 .unwrap_or_default();
             let [u] = w.as_slice() else { return None };
             // Splice-target validity: every path reaching u must pass
-            // through i, and the producer can't gain conditionality —
+            // through i, and the producer can't gain conditionality â€”
             // an `if` construct on either side of the context LCP
             // means some path observes a different value (or the
             // producer, possibly trapping, no longer always runs).
@@ -1091,7 +1014,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                                 })
                                 // Nor may it read a local whose def was
                                 // already deleted by an earlier
-                                // forwarding — the producer would replay
+                                // forwarding â€” the producer would replay
                                 // against the pre-segment value.
                                 && !(ps..s).any(|m| {
                                     matches!(ins[m].0, WPeek::Get(l2) | WPeek::Tee(l2)
@@ -1176,6 +1099,15 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             match k {
                 WPeek::Get(l) => uses.entry(l).or_default().push(i),
                 WPeek::Set(l) => defs.entry(l).or_default().push(i),
+                WPeek::Nop(l) => {
+                    // Deleted `get l; set l`: reads l and writes the same
+                    // value back â€” a use plus an identity def. Without it
+                    // in both maps the analysis could retarget a producer
+                    // onto l (changing what the read would observe) or
+                    // lose the reaffirming write a merge point relied on.
+                    uses.entry(l).or_default().push(i);
+                    defs.entry(l).or_default().push(i);
+                }
                 WPeek::Tee(l) => {
                     uses.entry(l).or_default().push(i);
                     defs.entry(l).or_default().push(i);
@@ -1191,6 +1123,9 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         for (i, &(k, _, _, _)) in ins.iter().enumerate() {
             match k {
                 WPeek::Get(_) | WPeek::Tee(_) => pending.push(i),
+                // A deleted self-copy is stack-neutral: keep matching
+                // through it exactly as if it weren't there.
+                WPeek::Nop(_) => {}
                 WPeek::Set(_) => {
                     if let Some(g) = pending.pop() {
                         pairs.push((g, i));
@@ -1210,9 +1145,33 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             if t == x {
                 continue; // get x ... set x: stack-neutral no-op, leave it
             }
-            let Some(&p1) = defs.get(&t).and_then(|v| v.iter().rev().find(|&&d| d < gi)) else {
+            // A Nop marker can never be the producer: it writes back the
+            // value it read, so retargeting it would leave x unwritten.
+            let Some(&p1) = defs.get(&t).and_then(|v| {
+                v.iter()
+                    .rev()
+                    .find(|&&d| d < gi && !matches!(ins[d].0, WPeek::Nop(_)))
+            }) else {
                 continue;
             };
+            // Retargeting makes the producer write x on *every* path from
+            // p1, not just the ones through the copy-set. The fixpoint
+            // below compares the sets of defs reaching each read, which
+            // can't see a path that leaves (p1, si) early: the same
+            // sources still reach, on different paths. So require
+            // straight-line control: same structured context and no
+            // branch in between, i.e. every path from p1 reaches si.
+            // (A `br` out of an `if` arm between them kept a frame-slot
+            // address in x on the exit path; the retarget overwrote it
+            // with a finish_grow result — wasm std `words` miscompile.)
+            if opts.pathcheck
+                && (ctx[ins[p1].3] != ctx[ins[si].3]
+                || (p1..si).any(|i| {
+                    matches!(ins[i].0, WPeek::Ctl) && matches!(b[ins[i].1], 0x0c | 0x0d | 0x0e | 0x0f)
+                }))
+            {
+                continue;
+            }
             cand.push((p1, gi, si, t, x));
         }
         // Greatest fixpoint: drop candidates whose side conditions fail
@@ -1237,166 +1196,696 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
             }
             false
         };
-        let mut live: Vec<bool> = vec![true; cand.len()];
-        loop {
-            // Instruction indices the surviving candidates rewrite or
-            // delete; accesses to a destination local are only allowed
-            // through these.
-            let mut mset: FxHashMap<usize, ()> = FxHashMap::default();
-            for (ci, &(p1, gi, si, _, _)) in cand.iter().enumerate() {
-                if live[ci] {
-                    mset.insert(p1, ());
-                    mset.insert(gi, ());
-                    mset.insert(si, ());
+        // d dominates u (as a def covering it) when d's structured
+        // context is a prefix of u's: d is on u's mandatory path, so no
+        // path reaches u without first passing d's position. Branches
+        // between them can't divert control into u except through d's
+        // own region, so they don't affect covering.
+        let covers = |d: usize, u: usize| -> bool {
+            let (cd, cu) = (&ctx[ins[d].3], &ctx[ins[u].3]);
+            cd.len() <= cu.len() && cu[..cd.len()] == cd[..]
+        };
+        // Back-edge reach: a def textually after a read still reaches it
+        // when both sit inside a `loop` with a back-edge branch after
+        // the def. loopbe[construct] = branch positions targeting the
+        // loop (br to a loop label re-enters at its head).
+        let mut loopbe: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (i, &(k, s, _, ci)) in ins.iter().enumerate() {
+            if !matches!(k, WPeek::Ctl) {
+                continue;
+            }
+            let mut lbls: [u32; 2] = [u32::MAX; 2];
+            let mut nl = 0usize;
+            match b[s] {
+                0x0c | 0x0d => {
+                    let mut q = s + 1;
+                    if let Some(l) = urd(b, &mut q) {
+                        lbls[0] = l;
+                        nl = 1;
+                    }
+                }
+                0x0e => {
+                    // br_table: every target counts.
+                    let mut q = s + 1;
+                    if let Some(n) = urd(b, &mut q) {
+                        let mut all = Vec::with_capacity(n as usize + 1);
+                        for _ in 0..=n {
+                            if let Some(l) = urd(b, &mut q) {
+                                all.push(l);
+                            }
+                        }
+                        for l in all {
+                            let c = &ctx[ci];
+                            if (l as usize) < c.len() {
+                                let e = c[c.len() - 1 - l as usize].0;
+                                if dop[e as usize] == 0x03 {
+                                    loopbe.entry(e).or_default().push(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for &l in &lbls[..nl] {
+                let c = &ctx[ci];
+                if (l as usize) < c.len() {
+                    let e = c[c.len() - 1 - l as usize].0;
+                    if dop[e as usize] == 0x03 {
+                        loopbe.entry(e).or_default().push(i);
+                    }
                 }
             }
-            let mut dropped = false;
-            for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
-                if !live[ci] {
-                    continue;
+        }
+        // backedge(d,u): a shared loop e encloses both, and some
+        // back-edge branch to e sits after d with no live def of the
+        // local covering the branch â€” a dominating def hides d's value
+        // from the next iteration.
+        let backedge = |dl: &[usize],
+                        extra: &[usize],
+                        d: usize,
+                        u: usize,
+                        gone: &dyn Fn(usize) -> bool|
+         -> bool {
+            let (cd, cu) = (&ctx[ins[d].3], &ctx[ins[u].3]);
+            cd.iter().any(|e| {
+                if dop[e.0 as usize] != 0x03 || !cu.contains(e) {
+                    return false;
                 }
-                let mut ok = true;
-                let mut why = 0;
-                // The copy-get must actually read the producer's value:
-                // it has to be reachable from the producer (not on a
-                // sibling arm) with no reachable def of t in between.
-                if arm_div(p1, gi) {
-                    ok = false;
-                    why = 1;
-                }
-                if ok {
-                    for &d in defs.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        if d > p1 && d < gi && !arm_div(p1, d) {
-                            ok = false;
-                            why = 2;
-                            break;
-                        }
-                    }
-                }
-                // Every other use of the temp that can observe the
-                // producer's value must not exist: a use is safe only
-                // when it is unreachable from the producer (different
-                // arm) or shadowed by a later def in its own region.
-                if ok {
-                    for &u in uses.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        if u <= p1 || u == gi {
-                            continue;
-                        }
-                        if arm_div(p1, u) {
-                            continue; // sibling arm: never sees p1's def
-                        }
-                        let shadowed = defs
-                            .get(&t)
-                            .map(|v| {
-                                v.iter().any(|&d| {
-                                    d > p1
-                                        && d < u
-                                        && !mset.contains_key(&d)
-                                        && ctx[ins[d].3] == ctx[ins[u].3]
+                loopbe
+                    .get(&e.0)
+                    .map(|bs| {
+                        bs.iter().any(|&bpos| {
+                            bpos > d
+                                && !dl.iter().chain(extra.iter()).any(|&d2| {
+                                    d2 > d && d2 < bpos && !gone(d2) && covers(d2, bpos)
                                 })
-                            })
-                            .unwrap_or(false);
-                        if !shadowed {
-                            ok = false;
-                            why = 3;
-                            if verbose {
-                                if pliron_cfg::tracing_on() {
-                                    tracing::debug!(target: "pliron::wasm",
-                                        "  fail3 t={} use@{} uctx={:?} pctx={:?}",
-                                        t, ins[u].1, ctx[ins[u].3], ctx[ins[p1].3]
-                                    )
-                                };
-                            }
-                            break;
-                        }
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        // Reaching-def analysis over a def list (with optional extra
+        // defs, e.g. a producer being retargeted onto this local).
+        // `gone` marks defs a rewrite removes â€” they neither reach nor
+        // cover. Forward (d < u): reaches unless arm-divergent or a
+        // covering live def hides it. Backward (d > u): only via a
+        // shared-loop back-edge.
+        let reaches = |dl: &[usize], extra: &[usize], d: usize, u: usize, gone: &dyn Fn(usize) -> bool| -> bool {
+            if arm_div(d, u) {
+                return false;
+            }
+            if d < u {
+                !dl.iter().chain(extra.iter()).any(|&d2| {
+                    d2 > d && d2 < u && !gone(d2) && covers(d2, u)
+                })
+            } else {
+                backedge(dl, extra, d, u, gone)
+            }
+        };
+        let obs = |dl: &[usize], extra: &[usize], u: usize, gone: &dyn Fn(usize) -> bool| -> Vec<usize> {
+            let mut v: Vec<usize> = dl
+                .iter()
+                .chain(extra.iter())
+                .copied()
+                .filter(|&d| !gone(d) && reaches(dl, extra, d, u, gone))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        // Defs of x inside the (p1, si) window per candidate: these
+        // must relocate onto the temp local t, which the producer
+        // retarget frees. (si itself is the copy-set, handled apart.)
+        // Nop markers aren't relocatable â€” they emit no instruction and
+        // their write is bound to the value x holds at their position.
+        let xdefs: Vec<Vec<usize>> = cand
+            .iter()
+            .map(|&(p1, _, si, _, x)| {
+                defs.get(&x)
+                    .map(|v| {
+                        v.iter()
+                            .copied()
+                            .filter(|&d| d > p1 && d < si && !matches!(ins[d].0, WPeek::Nop(_)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        // Greatest fixpoint over observed-def sets: a candidate is
+        // rewritten iff, in the post-rewrite program, every read keeps
+        // observing the same value sources. The producer's local p1 and
+        // the copy set si both denote the producer's value â€” normalize
+        // them to one marker so sets compare by value source.
+        const PSRC: usize = usize::MAX;
+        let norm = |v: &mut Vec<usize>, p1: usize, si: usize| {
+            for d in v.iter_mut() {
+                if *d == p1 || *d == si {
+                    *d = PSRC;
+                }
+            }
+            v.sort_unstable();
+            v.dedup();
+        };
+        let (live, acts) = {
+            let mut live = vec![true; cand.len()];
+            let mut acts: Vec<Option<(Vec<usize>, Vec<usize>)>> = vec![None; cand.len()];
+            for _round in 0..16 {
+                // def instructions the live candidates remove/retarget;
+                // gone in the post-rewrite program.
+                let mut mset: FxHashSet<usize> = FxHashSet::default();
+                for (ci, &(p1, gi, si, _, _)) in cand.iter().enumerate() {
+                    if live[ci] {
+                        mset.extend([p1, gi, si]);
+                        mset.extend(xdefs[ci].iter().copied());
                     }
                 }
-                // Straight-line producer->copy window; the destination
-                // local is only touched by instructions being rewritten.
-                if ok {
-                    for (i, &(k, _, _, _)) in ins[p1 + 1..si].iter().enumerate() {
-                        let i = i + p1 + 1;
-                        match k {
-                            WPeek::Ctl => {
-                                ok = false;
-                                why = 4;
-                                break;
+                let mut committed: FxHashSet<usize> = FxHashSet::default();
+                let mut dropped = false;
+                for ci in 0..cand.len() {
+                    if !live[ci] {
+                        continue;
+                    }
+                    let (p1, gi, si, t, x) = cand[ci];
+                    let rel = &xdefs[ci];
+                    let own = |d: usize| d == p1 || d == gi || d == si || rel.contains(&d);
+                    let gone_o = |d: usize| mset.contains(&d) && !own(d);
+                    // new-program views: x loses si and the relocated
+                    // defs but gains p1; t loses p1 but gains relocs.
+                    let gonx = |d: usize| gone_o(d) || d == si || rel.contains(&d);
+                    let gont = |d: usize| gone_o(d) || d == p1;
+                    let nogone = |_: usize| false;
+                    let dl_t = defs.get(&t).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let dl_x = defs.get(&x).map(|v| v.as_slice()).unwrap_or(&[]);
+                    // The copy-get must read exactly the producer.
+                    let mut ok = obs(dl_t, &[], gi, &nogone) == [p1];
+                    let mut why = if ok { 0 } else { 1 };
+                    let mut tre: Vec<usize> = Vec::new();
+                    let mut xrd: Vec<usize> = Vec::new();
+                    if ok {
+                        for &u in uses.get(&t).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            // Nop markers count as reads: they may be
+                            // retargeted like a get (the self-copy stays a
+                            // no-op on whichever local it points at).
+                            if u == gi || !matches!(ins[u].0, WPeek::Get(_) | WPeek::Nop(_)) {
+                                continue;
                             }
-                            WPeek::Get(l) | WPeek::Set(l) | WPeek::Tee(l) if l == x => {
-                                if !mset.contains_key(&i) {
+                            let s = obs(dl_t, &[], u, &nogone);
+                            if s.contains(&p1) {
+                                // reads p1's value -> retarget to x;
+                                // valid only when p1 is its sole source
+                                // and x carries exactly p1's value to u.
+                                let sx = obs(dl_x, &[p1], u, &gonx);
+                                if s != [p1] || sx != [p1] {
                                     ok = false;
-                                    why = 5;
-                                    if verbose {
-                                        if pliron_cfg::tracing_on() {
-                                            tracing::debug!(target: "pliron::wasm","  fail5 x={} i@{}", x, ins[i].1)
-                                        };
-                                    }
+                                    why = 2;
+                                    break;
+                                }
+                                tre.push(u);
+                            } else {
+                                // keeps reading t: new t-defs must be
+                                // exactly its old sources.
+                                let st = obs(dl_t, rel, u, &gont);
+                                if st != s {
+                                    ok = false;
+                                    why = 3;
                                     break;
                                 }
                             }
-                            _ => {}
                         }
                     }
-                }
-                // p1 must be ours alone (not another pair's get/set —
-                // those get deleted, not retargeted), and temp/dest
-                // must be unique among live candidates. Sharing a temp
-                // or a dest clobbers the other rewrite, so only the
-                // earlier candidate wins; dead candidates don't count.
-                if ok {
-                    for (cj, &(_pq, qg, qs, qt, qx)) in cand.iter().enumerate() {
-                        if cj == ci {
-                            continue;
-                        }
-                        if qg == p1 || qs == p1 || ((qx == x || qt == t) && live[cj] && cj < ci) {
+                    if ok {
+                        for &u in uses.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if !matches!(ins[u].0, WPeek::Get(_) | WPeek::Nop(_)) {
+                                continue;
+                            }
+                            let so = obs(dl_x, &[], u, &nogone);
+                            let sn = obs(dl_x, &[p1], u, &gonx);
+                            let (mut a, mut c) = (so.clone(), sn.clone());
+                            norm(&mut a, p1, si);
+                            norm(&mut c, p1, si);
+                            if a == c {
+                                continue;
+                            }
+                            // Every old source was a window def being
+                            // relocated to t: retarget the read iff t
+                            // mirrors x's old reaching set exactly.
+                            if !so.is_empty()
+                                && so.iter().all(|d| rel.contains(d))
+                                && obs(dl_t, rel, u, &gont) == so
+                            {
+                                xrd.push(u);
+                                continue;
+                            }
                             ok = false;
-                            why = 6;
+                            why = 4;
                             break;
                         }
                     }
+                    // p1 must be ours alone (not another pair's get/set)
+                    // and temp/dest unique among earlier live candidates;
+                    // rewrite sets must be disjoint.
+                    if ok {
+                        let mut mine: FxHashSet<usize> =
+                            [p1, gi, si].iter().copied().collect();
+                        mine.extend(rel.iter().copied());
+                        mine.extend(tre.iter().copied());
+                        mine.extend(xrd.iter().copied());
+                        if mine.iter().any(|d| committed.contains(d)) {
+                            ok = false;
+                            why = 5;
+                        } else {
+                            for (cj, &(_, qg, qs, qt, qx)) in cand.iter().enumerate() {
+                                if cj >= ci || !live[cj] {
+                                    continue;
+                                }
+                                if qg == p1
+                                    || qs == p1
+                                    || qx == x
+                                    || qx == t
+                                    || qt == x
+                                    || qt == t
+                                {
+                                    ok = false;
+                                    why = 6;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                committed.extend(mine);
+                            }
+                        }
+                    }
+                    if ok {
+                        acts[ci] = Some((tre, xrd));
+                    } else {
+                        if verbose && pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::wasm","wpeep: drop t={t} x={x} p1={} why={why}", ins[p1].1)
+                        };
+                        live[ci] = false;
+                        acts[ci] = None;
+                        dropped = true;
+                    }
                 }
-                if verbose && !ok {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm","wpeep: drop t={t} x={x} why={why}")
-                    };
-                }
-                if !ok {
-                    live[ci] = false;
-                    dropped = true;
+                if !dropped {
+                    break;
                 }
             }
-            if verbose {
-                for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm",
-                            "wpeep cand p1={} gi={} si={} t={} x={} live={}",
-                            ins[p1].1, ins[gi].1, ins[si].1, t, x, live[ci]
-                        )
-                    };
-                }
-            }
-            if !dropped {
-                break;
-            }
-        }
+            (live, acts)
+        };
+        // Audit mode: snapshot the round's input; the rewrite below
+        // states what it assumed as `Claim`s, checked after it applies.
+        let before = opts.audit.then(|| ins.clone());
+        let mut claims: Vec<wpeep_audit::Claim> = Vec::new();
         let mut changed = false;
-        for (ci, &(p1, gi, si, _, x)) in cand.iter().enumerate() {
+        for (ci, &(p1, gi, si, t, x)) in cand.iter().enumerate() {
             if !live[ci] {
                 continue;
             }
+            let Some((tre, xrd)) = acts[ci].clone() else {
+                continue;
+            };
             match ins[p1].0 {
-                WPeek::Set(_) => ins[p1] = (WPeek::Set(x), ins[p1].1, ins[p1].2, ins[p1].3),
-                WPeek::Tee(_) => ins[p1] = (WPeek::Tee(x), ins[p1].1, ins[p1].2, ins[p1].3),
+                WPeek::Set(_) => ins[p1].0 = WPeek::Set(x),
+                WPeek::Tee(_) => ins[p1].0 = WPeek::Tee(x),
                 _ => continue,
             }
             ins[gi].0 = WPeek::Del;
             ins[si].0 = WPeek::Del;
+            if before.is_some() {
+                claims.push(wpeep_audit::Claim { p1, gi, si, t, x });
+            }
+            // A retargeted Nop stays a marker (still a no-op self-copy,
+            // now on the other local); a real get becomes a real get.
+            for &u in &tre {
+                ins[u].0 = match ins[u].0 {
+                    WPeek::Nop(_) => WPeek::Nop(x),
+                    _ => WPeek::Get(x),
+                };
+            }
+            for &d in &xdefs[ci] {
+                ins[d].0 = match ins[d].0 {
+                    WPeek::Set(_) => WPeek::Set(t),
+                    WPeek::Tee(_) => WPeek::Tee(t),
+                    k => k,
+                };
+            }
+            for &u in &xrd {
+                ins[u].0 = match ins[u].0 {
+                    WPeek::Nop(_) => WPeek::Nop(t),
+                    _ => WPeek::Get(t),
+                };
+            }
             changed = true;
+        }
+        if changed && let Some(old) = before {
+            let v = wpeep_audit::audit(b, &old, &ins, &claims);
+            if v.is_none() {
+                // Over budget: the round stands as the pass decided.
+                opts.skipped.set(opts.skipped.get() + 1);
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::wasm", "wpeep audit: round over budget ({} insts), not audited", old.len());
+                }
+            }
+            if let Some(v) = v
+                && !v.is_empty()
+            {
+                opts.violations.set(opts.violations.get() + v.len() as u32);
+                let msg = format!("wpeep audit: copy-forward round rejected\n  {}", v.join("\n  "));
+                if opts.audit_panic {
+                    panic!("{msg}");
+                }
+                eprintln!("{msg}");
+                // Guard: drop the whole round; earlier rounds stand.
+                ins = old;
+                break;
+            }
         }
         if !changed {
             break;
         }
         ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
+        // Dead-write sweep: a `local.set t` whose value no read can
+        // observe is just `drop`; a `local.tee t` likewise is a no-op
+        // (it leaves the stack untouched). A read positioned after the
+        // write observes it unless a dominating later def covers it; a
+        // read inside a shared loop before it may see it through a
+        // back-edge.
+        let mut dread: Vec<usize> = Vec::new();
+        for (i, &(k, _, _, _)) in ins.iter().enumerate() {
+            let l = match k {
+                WPeek::Set(l) | WPeek::Tee(l) => l,
+                _ => continue,
+            };
+            let mut live = false;
+            for (u, &(k2, _, _, _)) in ins.iter().enumerate() {
+                if !matches!(k2, WPeek::Get(l2) if l2 == l) {
+                    continue;
+                }
+                if u == i {
+                    continue;
+                }
+                if u > i {
+                    // covered by a dominating later write before u?
+                    let covered = (i + 1..u).any(|d2| {
+                        matches!(ins[d2].0, WPeek::Set(l2) | WPeek::Tee(l2) if l2 == l) && {
+                            let (cd, cu) = (&ctx[ins[d2].3], &ctx[ins[u].3]);
+                            cd.len() <= cu.len() && cu[..cd.len()] == cd[..]
+                        }
+                    });
+                    if !covered {
+                        live = true;
+                        break;
+                    }
+                    continue;
+                }
+                // u < i: only via a shared-loop back-edge after i.
+                let share = ctx[ins[i].3]
+                    .iter()
+                    .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[u].3].contains(e));
+                if share {
+                    live = true;
+                    break;
+                }
+            }
+            if !live {
+                dread.push(i);
+            }
+        }
+        for &i in &dread {
+            ins[i].0 = match ins[i].0 {
+                WPeek::Tee(_) => WPeek::Del,
+                _ => WPeek::Drop,
+            };
+        }
+    }
+    // Keep-on-stack: `P; local.set t; W; local.get t` where W never
+    // touches the spilled value keeps it on the operand stack instead:
+    // the set becomes a tee (the write still happens, so t's reads
+    // need no further checking), the window pushes that survive to the
+    // get hoist below the producer, and the get goes away. When the
+    // get was the only reader of the write the set deletes outright.
+    // Prelude gets are keyed on the target instruction's byte offset â€”
+    // stable as `ins` entries are marked Del and compacted. Anchors are
+    // protected: no later rewrite may delete the instruction a prelude
+    // group emits before, or the gets would silently vanish.
+    let mut prel: Vec<(usize, u32)> = Vec::new();
+    let mut protected: FxHashSet<usize> = FxHashSet::default();
+    for _ in 0..crate::env_get("PLIRON_WASM_KOS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+    {
+        // (set idx, get idx, producer start, hoisted get idxs)
+        let mut acts2: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
+        {
+            let eff = |i: usize| -> Option<(u32, u32)> {
+                // calls decode as Ctl but have a signature-known
+                // effect.
+                if matches!(b[ins[i].1], 0x10 | 0x11) {
+                    let mut q = ins[i].1 + 1;
+                    let idx = urd(b, &mut q)?;
+                    return if b[ins[i].1] == 0x10 {
+                        fsig.get(idx as usize).copied()
+                    } else {
+                        let (pp, qq) = *tsig.get(idx as usize)?;
+                        Some((pp + 1, qq)) // +1: the table index operand
+                    };
+                }
+                match ins[i].0 {
+                    WPeek::Get(_) => Some((0, 1)),
+                    WPeek::Set(_) => Some((1, 0)),
+                    WPeek::Tee(_) => Some((1, 1)),
+                    WPeek::Other => {
+                        let op = b[ins[i].1];
+                        Some(match op {
+                            0x01 => (0, 0),
+                            0x1a => (1, 0),
+                            0x1b | 0x1c => (3, 1),
+                            0x23 => (0, 1),
+                            0x28..=0x35 => (1, 1),
+                            0x41..=0x44 => (0, 1),
+                            0x45 | 0x50 => (1, 1),
+                            0x46..=0x4f | 0x51..=0x66 => (2, 1),
+                            0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => {
+                                (1, 1)
+                            }
+                            0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => {
+                                (2, 1)
+                            }
+                            0xa7..=0xc4 => (1, 1),
+                            0xd1 | 0xd2 => (0, 1),
+                            _ => return None,
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            for s in 0..ins.len() {
+                let t = match ins[s].0 {
+                    WPeek::Set(t) if !protected.contains(&ins[s].1) => t,
+                    _ => continue,
+                };
+                // next `local.get t` in the same context, with no other
+                // write of t in between (u then reads s's value).
+                let mut u = None;
+                for v in s + 1..ins.len() {
+                    match ins[v].0 {
+                        WPeek::Get(l2) if l2 == t => {
+                            u = Some(v);
+                            break;
+                        }
+                        WPeek::Set(l2) | WPeek::Tee(l2) if l2 == t => break,
+                        _ => {}
+                    }
+                }
+                let Some(u) = u else { continue };
+                if protected.contains(&ins[u].1) {
+                    continue;
+                }
+                if ctx[ins[s].3] != ctx[ins[u].3] {
+                    continue;
+                }
+                // Window stack simulation: slots above the kept value
+                // and the instruction that produced each. May never
+                // dip below the kept value.
+                let mut slots: Vec<usize> = Vec::new();
+                let mut wok = true;
+                for v in s + 1..u {
+                    let Some((pp, qq)) = eff(v) else { wok = false; break };
+                    if slots.len() < pp as usize {
+                        wok = false;
+                        break;
+                    }
+                    for _ in 0..pp {
+                        slots.pop();
+                    }
+                    for _ in 0..qq {
+                        slots.push(v);
+                    }
+                }
+                if !wok {
+                    continue;
+                }
+                let hoists: Vec<usize> = slots;
+                // Producer start for the kept value: minimal
+                // self-contained suffix (net +1, no negative dip).
+                let mut need2: i32 = 1;
+                let mut ps = None;
+                for v in (0..s).rev() {
+                    let Some((pp, qq)) = eff(v) else { break };
+                    need2 -= qq as i32;
+                    need2 += pp as i32;
+                    if need2 == 0 {
+                        ps = Some(v);
+                        break;
+                    }
+                    if need2 < 0 {
+                        break;
+                    }
+                }
+                let Some(ps) = ps else { continue };
+                // Positional check: emit the hoists at `ps`, then simulate
+                // [ps, u) including pending prelude pushes of earlier
+                // rewrites (they're not in `ins`). The transform is only
+                // sound when the stack at `u` is [.., h0..hn, kept]: any
+                // other value still on the stack between the hoisted gets
+                // and the kept value — a `local.tee`'s kept copy, a value
+                // the producer leaked, or a prelude queued inside the span
+                // — makes a later consumer pop the wrong operand.
+                const KEPT: usize = usize::MAX;
+                const PREL: usize = usize::MAX - 1;
+                let mut slots: Vec<usize> = Vec::new();
+                let mut ok = true;
+                // Preludes queued for the same `ps` anchor emit first.
+                for &(off, _) in &prel {
+                    if off == ins[ps].1 {
+                        slots.push(PREL);
+                    }
+                }
+                slots.extend_from_slice(&hoists);
+                for v in ps..u {
+                    for &(off, _) in &prel {
+                        if off == ins[v].1 {
+                            slots.push(PREL);
+                        }
+                    }
+                    if v == s {
+                        if slots.is_empty() {
+                            ok = false;
+                            break;
+                        }
+                        slots.pop();
+                        slots.push(KEPT);
+                        continue;
+                    }
+                    if hoists.contains(&v) {
+                        continue; // deleted at its old position
+                    }
+                    let Some((pp, qq)) = eff(v) else {
+                        ok = false;
+                        break;
+                    };
+                    if slots.len() < pp as usize {
+                        ok = false;
+                        break;
+                    }
+                    for _ in 0..pp {
+                        slots.pop();
+                    }
+                    for _ in 0..qq {
+                        slots.push(v);
+                    }
+                }
+                let suf = slots.len().saturating_sub(hoists.len() + 1);
+                if !ok
+                    || slots.last() != Some(&KEPT)
+                    || slots[suf..suf + hoists.len()] != hoists[..]
+                {
+                    continue;
+                }
+                // Each surviving push must hoist below the producer:
+                // only `local.get lx` moves, and only when no def of
+                // lx sits between the insertion point and its old
+                // position.
+                let mut gok = true;
+                for &g in &hoists {
+                    match ins[g].0 {
+                        WPeek::Get(lx) => {
+                            if protected.contains(&ins[g].1) {
+                                gok = false;
+                                break;
+                            }
+                            for v in ps..g {
+                                if matches!(ins[v].0, WPeek::Set(l2) | WPeek::Tee(l2) if l2 == lx)
+                                {
+                                    gok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            gok = false;
+                            break;
+                        }
+                    }
+                    if !gok {
+                        break;
+                    }
+                }
+                if !gok {
+                    continue;
+                }
+                acts2.push((s, u, ps, hoists));
+            }
+        } // eff scope ends
+        // Only candidates whose whole [producer-start, get] span is
+        // strictly disjoint from every accepted span: the producer is
+        // part of the span â€” an interleaving rewrite can delete an
+        // instruction the other's producer or prelude anchor needs.
+        let mut sel: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
+        'cand: for a in acts2 {
+            for &(_, u2, ps2, _) in &sel {
+                if !(a.1 < ps2 || a.2 > u2) {
+                    continue 'cand;
+                }
+            }
+            sel.push(a);
+        }
+        let applied = !sel.is_empty();
+        for (s, u, ps, hoists) in sel {
+            protected.insert(ins[ps].1);
+            for &g in &hoists {
+                if let WPeek::Get(lx) = ins[g].0 {
+                    prel.push((ins[ps].1, lx));
+                }
+                ins[g].0 = WPeek::Del;
+            }
+            let t = match ins[s].0 {
+                WPeek::Set(t) => t,
+                _ => unreachable!(),
+            };
+            // If no read other than u can observe this write (a later
+            // read, or an earlier one through a shared-loop
+            // back-edge), drop the write entirely; else keep it as a
+            // tee.
+            let dead = !ins.iter().enumerate().any(|(v, &(k2, _, _, _))| {
+                if !matches!(k2, WPeek::Get(l2) if l2 == t) || v == u {
+                    return false;
+                }
+                if v > s {
+                    return true;
+                }
+                ctx[ins[s].3]
+                    .iter()
+                    .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[v].3].contains(e))
+            });
+            ins[s].0 = if dead { WPeek::Del } else { WPeek::Tee(t) };
+            ins[u].0 = WPeek::Del;
+        }
+        ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
+        if !applied {
+            break;
+        }
     }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
@@ -1405,7 +1894,7 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         nb.push(t);
     }
     // A `return` followed only by `end` opcodes (i.e. the last
-    // non-`end` instruction of the body) is dead — the function
+    // non-`end` instruction of the body) is dead â€” the function
     // falls through with the same stack either way.
     let drop_ret = ins
         .iter()
@@ -1413,6 +1902,12 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
         .filter(|&i| b[ins[i].1] == 0x0f);
     let mut wi = 0;
     while wi < ins.len() {
+        // Keep-on-stack hoisted pushes emit as `local.get` preludes.
+        while let Some(ppos) = prel.iter().position(|&(pp, _)| pp == ins[wi].1) {
+            let (_, pl) = prel.remove(ppos);
+            nb.push(0x20);
+            leb(&mut nb, pl);
+        }
         if Some(wi) == drop_ret {
             wi += 1;
             continue;
@@ -1463,7 +1958,8 @@ fn peep_body(b: &[u8]) -> Option<Vec<u8>> {
                 leb(&mut nb, n);
             }
             WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
-            WPeek::Del => {}
+            WPeek::Del | WPeek::Nop(_) => {}
+            WPeek::Drop => nb.push(0x1a),
         }
         wi += 1;
     }
@@ -1478,6 +1974,10 @@ fn wpeep(bytes: &mut Vec<u8>) {
         return;
     }
     let mut out = bytes[..8].to_vec();
+    // (pops, pushes) per type index and per function index, for
+    // stack-effect tracking inside `peep_body`.
+    let mut tsig: Vec<(u32, u32)> = Vec::new();
+    let mut fsig: Vec<(u32, u32)> = Vec::new();
     let mut p = 8usize;
     while p < bytes.len() {
         let id = bytes[p];
@@ -1491,6 +1991,111 @@ fn wpeep(bytes: &mut Vec<u8>) {
         }
         out.push(id);
         if id != 10 {
+            match id {
+                1 => {
+                    // Type section: functypes only.
+                    let mut q = s;
+                    let mut nty = match urd(bytes, &mut q) {
+                        Some(n) => n,
+                        None => return,
+                    };
+                    while nty > 0 {
+                        nty -= 1;
+                        let Some(ft) = bytes.get(q).copied() else { return };
+                        q += 1;
+                        if ft != 0x60 {
+                            break;
+                        }
+                        let Some(np) = urd(bytes, &mut q) else { return };
+                        for _ in 0..np {
+                            let Some(_) = bytes.get(q) else { return };
+                            q += 1;
+                        }
+                        let Some(nr) = urd(bytes, &mut q) else { return };
+                        for _ in 0..nr {
+                            let Some(_) = bytes.get(q) else { return };
+                            q += 1;
+                        }
+                        tsig.push((np, nr));
+                    }
+                }
+                2 => {
+                    // Import section: kind-0 imports are functions.
+                    let mut q = s;
+                    let mut ni = match urd(bytes, &mut q) {
+                        Some(n) => n,
+                        None => return,
+                    };
+                    while ni > 0 {
+                        ni -= 1;
+                        for _ in 0..2 {
+                            let Some(nl) = urd(bytes, &mut q) else { return };
+                            if nskip(bytes, &mut q, nl as usize).is_none() {
+                                return;
+                            }
+                        }
+                        let Some(kind) = bytes.get(q).copied() else { return };
+                        q += 1;
+                        match kind {
+                            0x00 => {
+                                let Some(ti) = urd(bytes, &mut q) else { return };
+                                if let Some(&sg) = tsig.get(ti as usize) {
+                                    fsig.push(sg);
+                                } else {
+                                    fsig.push((0, 0));
+                                }
+                            }
+                            0x01 => {
+                                // table: reftype + limits
+                                if bytes.get(q).is_none() {
+                                    return;
+                                }
+                                q += 1;
+                                let Some(fl) = bytes.get(q).copied() else { return };
+                                q += 1;
+                                let Some(_) = urd(bytes, &mut q) else { return };
+                                if fl & 1 != 0 {
+                                    let Some(_) = urd(bytes, &mut q) else { return };
+                                }
+                            }
+                            0x02 => {
+                                // memory: limits
+                                let Some(fl) = bytes.get(q).copied() else { return };
+                                q += 1;
+                                let Some(_) = urd(bytes, &mut q) else { return };
+                                if fl & 1 != 0 {
+                                    let Some(_) = urd(bytes, &mut q) else { return };
+                                }
+                            }
+                            0x03 => {
+                                // global: type + mut
+                                if nskip(bytes, &mut q, 2).is_none() {
+                                    return;
+                                }
+                            }
+                            _ => return,
+                        }
+                    }
+                }
+                3 => {
+                    // Function section: type index per declared func.
+                    let mut q = s;
+                    let mut nf = match urd(bytes, &mut q) {
+                        Some(n) => n,
+                        None => return,
+                    };
+                    while nf > 0 {
+                        nf -= 1;
+                        let Some(ti) = urd(bytes, &mut q) else { return };
+                        if let Some(&sg) = tsig.get(ti as usize) {
+                            fsig.push(sg);
+                        } else {
+                            fsig.push((0, 0));
+                        }
+                    }
+                }
+                _ => {}
+            }
             leb(&mut out, sz);
             out.extend_from_slice(&bytes[s..e]);
             p = e;
@@ -1511,7 +2116,19 @@ fn wpeep(bytes: &mut Vec<u8>) {
             if be > e {
                 return;
             }
-            let nb = peep_body(&bytes[q..be]).unwrap_or_else(|| bytes[q..be].to_vec());
+            // `PLIRON_WASM_PEEP_LIMIT=N`: peephole only the first N bodies
+            // this process emits — bisects a wpeep miscompile to one body.
+            static PEEPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let limit = crate::env_get("PLIRON_WASM_PEEP_LIMIT").and_then(|v| v.parse::<u64>().ok());
+            let k = PEEPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nb = if limit.is_none_or(|l| k < l) {
+                if crate::env_set("PLIRON_WASM_PEEP_LOG") {
+                    eprintln!("wpeep body {k} ({bsz} bytes)");
+                }
+                peep_body(&bytes[q..be], &fsig, &tsig).unwrap_or_else(|| bytes[q..be].to_vec())
+            } else {
+                bytes[q..be].to_vec()
+            };
             leb(&mut body_out, nb.len() as u32);
             body_out.extend_from_slice(&nb);
             q = be;
@@ -1524,6 +2141,180 @@ fn wpeep(bytes: &mut Vec<u8>) {
         p = e;
     }
     *bytes = out;
+}
+
+#[cfg(test)]
+mod wpeep_tests {
+    use super::*;
+
+    /// Wrap an instruction stream in a body prefix: one local group of
+    /// `nl` i32s, then the instructions, then the body `end`.
+    fn body(nl: u32, ins: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x01, nl as u8, 0x7f];
+        b.extend_from_slice(ins);
+        b.push(0x0b);
+        b
+    }
+
+    fn has_seq(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // Regression: a `local.get x; local.set x` no-op pair inside one arm
+    // of an if is still a *use* of x â€” waffle emits it when a br's block
+    // param is copied onto the local that already holds it. The
+    // copy-forward fixpoint must not retarget the producer onto x across
+    // it: that changes what x holds on the arm's exit path. (This is the
+    // <&str>::lt miscompile: the then-arm carried the len difference in
+    // l4 through a deleted self-copy; retargeting the memcmp producer to
+    // l4 made the block yield memcmp's 0 instead of -1.)
+    //
+    //   block
+    //     get 1; get 3; i32.sub; set 4    ; d0 = l4
+    //     i32.const 0; tee 5              ; producer p1 -> t=5
+    //     i32.eqz; if
+    //       get 4; set 4; br 1            ; self-copy (deleted as a pair)
+    //     else
+    //       get 5; set 4; br 1            ; copy t -> x
+    //     end
+    //   end
+    //   get 4; drop
+    #[test]
+    fn self_copy_blocks_producer_retarget() {
+        let b = body(
+            8,
+            &[
+                0x02, 0x40, // block
+                0x20, 0x01, 0x20, 0x03, 0x6b, // get 1; get 3; i32.sub
+                0x21, 0x04, // set 4
+                0x41, 0x00, // i32.const 0
+                0x22, 0x05, // tee 5
+                0x45, // i32.eqz
+                0x04, 0x40, // if
+                0x20, 0x04, 0x21, 0x04, // get 4; set 4
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x20, 0x05, 0x21, 0x04, // get 5; set 4
+                0x0c, 0x01, // br 1
+                0x0b, // end
+                0x0b, // end
+                0x20, 0x04, 0x1a, // get 4; drop
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        // The producer must stay on local 5 and the else copy must
+        // survive â€” retargeting it (tee 4 / deleting get5;set4) is the
+        // miscompile.
+        assert!(has_seq(&out, &[0x22, 0x05]), "producer lost: {out:02x?}");
+        assert!(has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy gone: {out:02x?}");
+        assert!(!has_seq(&out, &[0x22, 0x04]), "miscompile: {out:02x?}");
+    }
+
+    // Regression (wasm std `words`): the producer and the copy sit in
+    // different arms' reach — one arm branches out before the copy, so on
+    // that path x must keep its old value. Reaching-def sets are equal
+    // before and after the retarget (both sources still reach the final
+    // read), so only the straight-line requirement rejects it.
+    //
+    //   i32.const 99; set 2          ; x's old value (frame-slot address)
+    //   block
+    //     i32.const 7; set 7         ; producer p1 -> t=7
+    //     get 0; if
+    //       br 1                     ; exit: x must still be 99
+    //     else
+    //       get 7; set 2             ; copy t -> x
+    //     end
+    //   end
+    //   get 2; drop
+    fn branch_past_copy_body() -> Vec<u8> {
+        body(
+            8,
+            &[
+                0x41, 0x63, 0x21, 0x02, // i32.const 99; set 2
+                0x02, 0x40, // block
+                0x41, 0x07, 0x21, 0x07, // i32.const 7; set 7
+                0x20, 0x00, // get 0
+                0x04, 0x40, // if
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x20, 0x07, 0x21, 0x02, // get 7; set 2
+                0x0b, // end
+                0x0b, // end
+                0x20, 0x02, 0x1a, // get 2; drop
+            ],
+        )
+    }
+
+    fn opts(audit: bool, pathcheck: bool) -> PeepOpts {
+        PeepOpts {
+            audit,
+            audit_panic: false,
+            pathcheck,
+            violations: std::cell::Cell::new(0),
+            skipped: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn branch_past_copy_blocks_producer_retarget() {
+        let b = branch_past_copy_body();
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x07, 0x21, 0x02]), "copy gone: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x07, 0x21, 0x02]), "miscompile: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x07, 0x22, 0x02]), "miscompile: {out:02x?}");
+    }
+
+    // The audit catches the dab149b class on its own: with the
+    // straight-line requirement off, the pass's set-based check accepts
+    // the retarget (first test: it really does miscompile), and the
+    // Datalog audit rejects the round (second: the read after the block
+    // sees `i32.const 99` in the old program and the producer in the new
+    // one on the `br` path) and reverts it.
+    #[test]
+    fn without_pathcheck_branch_past_copy_miscompiles() {
+        let out = peep_body_opts(&branch_past_copy_body(), &[], &[], &opts(false, false)).unwrap();
+        assert!(
+            has_seq(&out, &[0x41, 0x07, 0x21, 0x02]) || has_seq(&out, &[0x41, 0x07, 0x22, 0x02]),
+            "expected the unguarded retarget: {out:02x?}"
+        );
+    }
+
+    #[test]
+    fn audit_rejects_branch_past_copy() {
+        let o = opts(true, false);
+        let out = peep_body_opts(&branch_past_copy_body(), &[], &[], &o).unwrap();
+        assert!(o.violations.get() > 0, "audit missed it: {out:02x?}");
+        assert!(has_seq(&out, &[0x20, 0x07, 0x21, 0x02]), "copy gone: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x07, 0x21, 0x02]), "miscompile survived: {out:02x?}");
+    }
+
+    // No false alarm on a sound forward: the rewrite still fires.
+    #[test]
+    fn audit_accepts_plain_copy() {
+        let b = body(8, &[0x41, 0x07, 0x22, 0x05, 0x20, 0x05, 0x21, 0x04, 0x20, 0x04, 0x1a]);
+        let o = opts(true, true);
+        let out = peep_body_opts(&b, &[], &[], &o).unwrap();
+        assert_eq!(o.violations.get(), 0);
+        assert!(has_seq(&out, &[0x22, 0x04]), "no forward: {out:02x?}");
+    }
+
+    // Same shape without the interfering self-copy: forwarding must still
+    // fire, retargeting the producer onto the copy destination.
+    #[test]
+    fn plain_copy_still_forwards() {
+        let b = body(
+            8,
+            &[
+                0x41, 0x07, // i32.const 7
+                0x22, 0x05, // tee 5
+                0x20, 0x05, 0x21, 0x04, // get 5; set 4
+                0x20, 0x04, 0x1a, // get 4; drop
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x22, 0x04]), "no forward: {out:02x?}");
+        assert!(!has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy left: {out:02x?}");
+    }
 }
 
 /// Rebuild `succs`/`preds`/`pos_in_succ_pred`/`pos_in_pred_succ` from
@@ -1573,12 +2364,38 @@ fn tree_touches(cb: &FunctionBody, v: WV, set: &FxHashSet<WV>, depth: u32) -> bo
     }
 }
 
-/// A folded callee frame: `(fp value, size, align)`. FL emits each
-/// function frame as `s = global.get sp; t = s - SZ; fp = t & -A;
+/// Natural loops of the body: (header, member-blocks) pairs.
+fn wloops(b: &FunctionBody, cfg: &waffle::cfg::CFGInfo) -> Vec<(WBlock, FxHashSet<WBlock>)> {
+    let mut out = Vec::new();
+    for h in b.blocks.iter() {
+        let latch: Vec<WBlock> = b.blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .filter(|&p| p == h || cfg.dominates(h, p))
+            .collect();
+        if latch.is_empty() {
+            continue;
+        }
+        // Blocks reaching a latch without crossing the header.
+        let mut body_set: FxHashSet<WBlock> = [h].into_iter().collect();
+        let mut wl = latch;
+        while let Some(x) = wl.pop() {
+            if body_set.insert(x) {
+                wl.extend(b.blocks[x].preds.iter().copied());
+            }
+        }
+        out.push((h, body_set));
+    }
+    out
+}
+
+/// A folded callee frame: `(fp value, size, align)`. Each function frame is
+/// emitted as `s = global.get sp; t = s - SZ; fp = t & -A;
 /// global.set sp = fp` at the head plus `global.set sp = s|fp` restores
 /// on exits. `inline_site` folds every well-formed chain into one
 /// entry-level reservation in the caller so the spliced body doesn't
-/// rerun the adjust/restore dance at the callsite — which for loop-body
+/// rerun the adjust/restore dance at the callsite â€” which for loop-body
 /// callsites costs ~10 ops per iteration.
 fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, u64)> {
     // users[v] = values whose defs reference v.
@@ -1634,7 +2451,7 @@ fn frame_chains(cb: &FunctionBody, sp: waffle::Global) -> Vec<(WV, WV, WV, u64, 
         let Some(size) = wconst(cb, cb.arg_pool[*saa][1]) else {
             continue;
         };
-        // The sub feeds exactly the align `and` — the frame pointer.
+        // The sub feeds exactly the align `and` â€” the frame pointer.
         let mut fu = users.get(&sub).into_iter().flatten();
         let (Some(&fp), None) = (fu.next(), fu.next()) else {
             continue;
@@ -1674,11 +2491,11 @@ fn inline_site(
     callee: &FunctionBody,
     sp: waffle::Global,
 ) {
-    // Fold the callee's stack frames into the caller's frame: FL emits
-    // each function frame as `s = global.get sp; t = s - SZ;
+    // Fold the callee's stack frames into the caller's frame: frames are
+    // emitted as `s = global.get sp; t = s - SZ;
     // fp = t & -A; global.set sp = fp` at the head plus `global.set sp`
     // restores on exits, and the splice would re-execute that whole
-    // dance at the callsite — ~10 ops per loop iteration for hot
+    // dance at the callsite â€” ~10 ops per loop iteration for hot
     // callsites. Instead the frame is laid out inside the caller's own
     // reservation (`fp + K_i`, like LLVM's merged inline allocas): the
     // caller's `SZ` is bumped by the extra space and its mask widened
@@ -1692,7 +2509,7 @@ fn inline_site(
         let entry = body.entry;
         // Find the caller's frame chain rooted at entry insts[0]: any
         // `global.get sp` there starts either the real prologue or an
-        // earlier splice's reservation — growing either is safe, since
+        // earlier splice's reservation â€” growing either is safe, since
         // every slot is fp-relative. `add` ops are new-frame bases.
         // (sub, and, gset entry position) of the caller's frame chain.
         let mut acc: Option<(WV, WV, usize)> = None;
@@ -1718,7 +2535,7 @@ fn inline_site(
                 }
             }
             // and = the sub's I32And-with-const consumer; the gset must
-            // set SP to it, else this isn't a frame chain — don't touch.
+            // set SP to it, else this isn't a frame chain â€” don't touch.
             if let (Some(s), Some(gpos)) = (sub, gpos) {
                 let and = body.blocks[entry].insts.iter().find(|&&iv| {
                     matches!(
@@ -1740,7 +2557,7 @@ fn inline_site(
             }
         }
         // When the callsite itself is in `entry`, emitted insts must
-        // land at or before the call's index — anything later gets
+        // land at or before the call's index â€” anything later gets
         // swept into `after` by the split below and stops dominating
         // the spliced body (SSA breakage, misaligned frames).
         let call_idx = if blk == entry {
@@ -1789,8 +2606,8 @@ fn inline_site(
             k += sz;
             maxa = maxa.max(al);
         }
-        // Each emitted op carries an anchor — the inst it is inserted
-        // before (None = end of entry) — so multiple inserts can't
+        // Each emitted op carries an anchor â€” the inst it is inserted
+        // before (None = end of entry) â€” so multiple inserts can't
         // drift past one another or past the call.
         let mut chunk: Vec<(WV, Option<WV>)> = Vec::new();
         if let Some((s, a, gpos)) = anchor {
@@ -1845,7 +2662,7 @@ fn inline_site(
         } else {
             // Fresh reservation: `ibase = align(SP - k); SP = ibase`,
             // plus per-frame `ibase + K` bases. Insert just past the
-            // first `global.set sp` in entry — every callsite sits
+            // first `global.set sp` in entry â€” every callsite sits
             // after that point (calls can't precede the prologue, and
             // earlier splices only leave SP ops before the callsites
             // they replaced); position 0 when no SP adjust exists.
@@ -1934,7 +2751,7 @@ fn inline_site(
             }
         }
         // Move emitted ops (currently at the end of entry's insts) to
-        // their anchors — inserted just before the anchored inst, and
+        // their anchors â€” inserted just before the anchored inst, and
         // never past the call when it shares this block.
         {
             let insts = &mut body.blocks[entry].insts;
@@ -1963,7 +2780,7 @@ fn inline_site(
         // The callee's SP ops die with the fold: the get/sub chain
         // members (fp is remapped through fold_base), plus every
         // `global.set sp` whose argument computes through folded
-        // values — the entry adjust and the restores. A set whose arg
+        // values â€” the entry adjust and the restores. A set whose arg
         // derives only from unfolded chains stays verbatim.
         let folded: FxHashSet<WV> = chains
             .iter()
@@ -2177,11 +2994,11 @@ fn inline_site(
 
 /// `if (c) { br m(x) } else { br m(y) }` diamonds whose arms are pure
 /// forwarders (no insts, no blockparams) to the same single-param merge
-/// become `select`, deleting two blocks and the branch structure —
+/// become `select`, deleting two blocks and the branch structure â€”
 /// LLVM emits `select` for the same shapes. Soundness: x is used at
 /// its arm block, so it dominates that block; `a` is a pred of the
 /// arm, so x dominates `a` too, and arm blocks define nothing else
-/// (no insts, no params — a param could still have uses in blocks the
+/// (no insts, no params â€” a param could still have uses in blocks the
 /// arm dominates, which is why param'd arms are rejected). Arm blocks
 /// with other preds stay live via those edges and are unaffected.
 /// Range folding: `x <u C` / `x >=u C` where `x`'s unsigned maximum is
@@ -2189,6 +3006,16 @@ fn inline_site(
 /// bounds check `byte <u 256` on an `i32.load8_u` result (LLVM gets the
 /// same from u8 range info); folding the compare lets DCE drop the
 /// never-taken panic arm and the loop carry.
+
+/// Constant value of `v`, if it is an int-const op.
+fn wconst(b: &FunctionBody, v: WV) -> Option<i64> {
+    match b.values[b.resolve_alias(v)] {
+        ValueDef::Operator(O::I32Const { value }, ..) => Some(value as i32 as i64),
+        ValueDef::Operator(O::I64Const { value }, ..) => Some(value as i64),
+        _ => None,
+    }
+}
+
 fn wrange(b: &mut FunctionBody) -> bool {
     // Static unsigned upper bound for an i32 value.
     fn ubound(b: &FunctionBody, v: WV, depth: u32) -> Option<u32> {
@@ -2542,7 +3369,7 @@ fn wsel(b: &mut FunctionBody) -> bool {
         let arm = |t: &BlockTarget| -> Option<(WBlock, WV)> {
             let tb = t.block;
             // Arms must be pure forwarders: no insts (side effects) and
-            // no blockparams — a param can have uses in blocks the arm
+            // no blockparams â€” a param can have uses in blocks the arm
             // dominates, and bypassing the arm would drop its def.
             if tb == a || !b.blocks[tb].insts.is_empty() || !b.blocks[tb].params.is_empty() {
                 return None;
@@ -2593,15 +3420,15 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     const TINY: usize = 12;
     const SOLO: usize = 300;
     // Mid-size (<=64) multi-callsite inlining measured ~1% runtime for
-    // +2% size on wbig — wasm calls really are cheap and the splice's
+    // +2% size on wbig â€” wasm calls really are cheap and the splice's
     // optimizer doesn't recover the rest. Not a rule.
     // Loop-body callsites execute the call every iteration, so a
     // moderately-sized callee is worth duplicating there.
     const HOT: usize = 36;
     // `#[inline]` (LLVM `inlinehint`) callees: LLVM's inliner gives the
-    // attribute a large budget bonus — mirror that with a raised cap.
+    // attribute a large budget bonus â€” mirror that with a raised cap.
     // Off by default: on a real std workload (regex wbig) it added
-    // ~30% code size for no measurable runtime gain — wasm calls are
+    // ~30% code size for no measurable runtime gain â€” wasm calls are
     // cheap and our post-splice optimizer doesn't exploit the merge
     // the way LLVM's does. `PLIRON_WASM_HINT=n` re-enables.
     let hint_cap = crate::env_get("PLIRON_WASM_HINT")
@@ -2683,7 +3510,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             if fi == ci {
                                 continue;
                             }
-                            // `#[inline(never)]` is a hard no —
+                            // `#[inline(never)]` is a hard no â€”
                             // LLVM refuses to inline it too.
                             if funcs[fi].no_inline {
                                 continue;
@@ -2694,7 +3521,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // Entry with preds can't merge (its
                             // blockparams would need the back-edge args
                             // too); locals beyond params would need
-                            // remapping — our bodies have none; arity
+                            // remapping â€” our bodies have none; arity
                             // must match (the args become the params).
                             if !cb.blocks[cb.entry].preds.is_empty()
                                 || cb.locals.len() != cb.n_params
@@ -2797,6 +3624,9 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 
 /// Link flags: bit 0 = global (visible to other objects), bit 1 = weak.
 const INIT_ARRAY: u8 = 4;
+/// `#[used(linker)]`: keep the object alive through link-time GC even
+/// when nothing references it.
+const USED: u8 = 8;
 
 fn link_flags(l: Linkage) -> u8 {
     match l {
@@ -2810,7 +3640,8 @@ fn link_flags(l: Linkage) -> u8 {
 /// `nfuncs { name, u8 flags }` for defined functions, then
 /// `ndata { name, u8 flags, align, bytes, nrelocs { off, u8 is_func, sym, i32 addend } }`
 /// for defined data objects. Flags: bit 0 global, bit 1 preemptible, bit 2 an
-/// `.init_array` entry (constructor pointers the linker calls from `__wasm_call_ctors`).
+/// `.init_array` entry (constructor pointers the linker calls from
+/// `__wasm_call_ctors`), bit 3 `#[used(linker)]` (GC root).
 fn link_section(ctx: &Context, st: &State) -> Vec<u8> {
     let mut out = Vec::new();
     let fs: Vec<_> = st
@@ -2852,7 +3683,11 @@ fn link_section(ctx: &Context, st: &State) -> Vec<u8> {
             .section
             .as_deref()
             .is_some_and(|s| s.starts_with(".init_array"));
-        out.push(link_flags(l) | if ctor { INIT_ARRAY } else { 0 });
+        out.push(link_flags(l) | if ctor { INIT_ARRAY } else { 0 } | if g.used {
+            USED
+        } else {
+            0
+        });
         put_u32(&mut out, g.align.max(1) as u32);
         put_u32(&mut out, bytes.len() as u32);
         out.extend_from_slice(&bytes);
@@ -2867,32 +3702,10 @@ fn link_section(ctx: &Context, st: &State) -> Vec<u8> {
     out
 }
 
-/// SSA tracking for `st.promoted` allocas. Waffle IR has no mutable locals,
-/// so each promoted alloca leaf is a virtual variable whose block-param
-/// wiring is built lazily — the same algorithm waffle's own wasm frontend
-/// uses for locals (`frontend.rs::LocalTracker`), keyed on our leaf indices.
-#[derive(Default)]
-struct Promo {
-    /// Alloca result -> (first leaf index, leaf count).
-    slots: FxHashMap<Value, (u32, u32)>,
-    /// Wasm type per leaf slot.
-    tys: Vec<WT>,
-    /// Live-out leaf values of a block (or current in-block values).
-    map: FxHashMap<WBlock, FxHashMap<u32, WV>>,
-    /// Blocks whose predecessor set is final.
-    sealed: FxHashSet<WBlock>,
-    /// Waffle blocks that map to a pliron block (vs. internal continuations).
-    mapped: FxHashSet<WBlock>,
-    /// Waffle blocks with their terminator set.
-    finished: FxHashSet<WBlock>,
-    /// Phi placeholders awaiting the block's seal.
-    incomplete: FxHashMap<WBlock, Vec<(u32, WV)>>,
-}
-
 /// When no stack slots were ever allocated, the save/align/restore dance
 /// around `__stack_pointer` is pure overhead. Drop every `global.set` of it
 /// (entry adjust, return/unwind/rethrow restores) plus the now-dead
-/// fp/mask producer chain rooted at `roots` — the callee's own SP is never
+/// fp/mask producer chain rooted at `roots` â€” the callee's own SP is never
 /// touched, so nothing needs restoring. A stray consumer of the dead
 /// values cancels the whole rewrite (defensive).
 fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
@@ -2937,5009 +3750,13 @@ fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
     }
 }
 
-struct FL<'o, 'a> {
-    o: &'o mut Obj<'a>,
-    ctx: &'a Context,
-    st: &'a State,
-    b: FunctionBody,
-    cur: WBlock,
-    vals: FxHashMap<Value, Vals>,
-    cconst: FxHashMap<Value, Vals>,
-    blocks: FxHashMap<Ptr<BasicBlock>, WBlock>,
-    promo: Promo,
-    terminated: bool,
-    sp0: WV,
-    fp: WV,
-    frame_c: WV,
-    mask_c: WV,
-    frame: u64,
-    frame_align: u64,
-    /// Shared "an unwind is in flight" epilogue: restores SP and returns
-    /// dummy values so the caller sees the flag and keeps unwinding.
-    epi: Option<WBlock>,
-    /// This function's wasm result types, for the epilogue's dummy values.
-    rets: Vec<WT>,
-    /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
-    va_buf: Option<WV>,
-    /// Load results emitted as a wide `i64.load{8,16,32}_{s,u}` because
-    /// their only use is a same-block extend (value -> signed).
-    fused_ext: FxHashMap<Value, bool>,
-    name: String,
-}
-
-impl<'o, 'a> FL<'o, 'a> {
-    fn new(o: &'o mut Obj<'a>, sig: Signature) -> Self {
-        let rets = o.m.signatures[sig].returns.clone();
-        let b = FunctionBody::new(&o.m, sig);
-        let cur = b.entry;
-        let (ctx, st) = (o.ctx, o.st);
-        let mut fl = FL {
-            o,
-            ctx,
-            st,
-            b,
-            cur,
-            vals: FxHashMap::default(),
-            cconst: FxHashMap::default(),
-            blocks: FxHashMap::default(),
-            promo: Promo::default(),
-            terminated: false,
-            epi: None,
-            rets,
-            sp0: WV::invalid(),
-            fp: WV::invalid(),
-            frame_c: WV::invalid(),
-            mask_c: WV::invalid(),
-            frame: 0,
-            frame_align: 16,
-            va_buf: None,
-            fused_ext: FxHashMap::default(),
-            name: String::new(),
-        };
-        let sp = fl.o.sp;
-        fl.sp0 = fl.op(O::GlobalGet { global_index: sp }, &[], WT::I32);
-        fl.frame_c = fl.i32c(0);
-        let t = fl.op(O::I32Sub, &[fl.sp0, fl.frame_c], WT::I32);
-        fl.mask_c = fl.i32c(!15);
-        fl.fp = fl.op(O::I32And, &[t, fl.mask_c], WT::I32);
-        fl.op0(O::GlobalSet { global_index: sp }, &[fl.fp]);
-        fl
-    }
-
-    fn finish(mut self) -> FunctionBody {
-        // Patch the frame placeholders before optimizing: GVN would otherwise
-        // alias same-valued consts onto frame_c/mask_c, and the rewrite below
-        // would corrupt them.
-        let frame = crate::types::align_to(self.frame, self.frame_align) as u32;
-        let mask = !(self.frame_align as u32 - 1);
-        for (v, c) in [(self.frame_c, frame), (self.mask_c, mask)] {
-            if let ValueDef::Operator(op, ..) = &mut self.b.values[v] {
-                *op = O::I32Const { value: c };
-            }
-        }
-        if self.frame == 0 {
-            elide_sp_frame(
-                &mut self.b,
-                self.o.sp,
-                [self.sp0, self.fp, self.frame_c, self.mask_c],
-            );
-        }
-        // Provable-range folds (`byte <u 256` etc.); the optimize below
-        // drops the dead arms this opens up.
-        wrange(&mut self.b);
-        waddr(&mut self.b);
-        self.b.optimize(&waffle::OptOptions::default());
-        // Fold `v == K1 || v == K2` CondBr chains into br_table Selects
-        // (LLVM does the same at ISel for small eq-chains).
-        if crate::pass_enabled("PLIRON_WASM_TAB") {
-            for _ in 0..4 {
-                if !wtab(&mut self.b) {
-                    break;
-                }
-            }
-        }
-        let dbg = crate::env_get("PLIRON_WASM_LOOPS")
-            .map(|f| f.is_empty() || self.name.contains(&f))
-            .unwrap_or(false);
-        if dbg {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump",
-                    "==== pre-loopopt {} ====\n{}",
-                    self.name,
-                    self.b.display("  ", None)
-                )
-            };
-        }
-        // Second range pass: optimize/wtab can expose new bounded
-        // operands (copy-prop through and/select). DCE immediately so
-        // loop analysis sees the loop without dead panic arms.
-        if wrange(&mut self.b) | waddr(&mut self.b) {
-            self.b.optimize(&waffle::OptOptions::default());
-        }
-        if crate::pass_enabled("PLIRON_WASM_WLOOP") {
-            // `&T` entry params (noalias + readonly + dereferenceable):
-            // loads within the pointee bound are loop-hoistable. Maps
-            // pliron args to their waffle entry-param values.
-            let mut frozen: FxHashMap<WV, u64> = FxHashMap::default();
-            for (&a, &s) in self.st.frozen.iter() {
-                if let Some(vs) = self.vals.get(&a)
-                    && vs.len() == 1
-                {
-                    frozen.insert(vs[0], s);
-                }
-            }
-            // noalias entry params (incl. `&mut T`) are dereferenceable
-            // within `pointee_size` — a dead load there can't trap.
-            let mut deref: FxHashMap<WV, u64> = frozen.clone();
-            for (&a, &(s, _)) in self.st.noalias.iter() {
-                if s == 0 {
-                    continue;
-                }
-                if let Some(vs) = self.vals.get(&a)
-                    && vs.len() == 1
-                {
-                    deref.entry(vs[0]).or_insert(s);
-                }
-            }
-            wloop_opt(
-                &mut self.b,
-                self.o.sp,
-                &frozen,
-                &deref,
-                &self.o.funcs,
-                &self.st.nowrite,
-                &self.name,
-            );
-        }
-        if dbg {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump",
-                    "==== post-loopopt {} ====\n{}",
-                    self.name,
-                    self.b.display("  ", None)
-                )
-            };
-        }
-        self.b.optimize(&waffle::OptOptions::default());
-        if let Some(lim) = crate::env_get("PLIRON_WASM_TRIP").and_then(|v| v.parse::<u64>().ok()) {
-            if self.o.trip == waffle::Global::invalid() {
-                // Resolved by the linker to one shared mutable global.
-                self.o.trip = self.o.import_global("env", "__pliron_trip", true);
-            }
-            wtrip_guard(&mut self.b, self.o.trip, lim);
-        }
-        if crate::env_get("PLIRON_WASM_DUMP")
-            .map(|f| f.is_empty() || self.name.contains(&f))
-            .unwrap_or(false)
-        {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump",
-                    "==== wasm body {} ====\n{}",
-                    self.name,
-                    self.b.display("  ", None)
-                )
-            };
-        }
-        self.b
-    }
-
-    fn op(&mut self, o: O, args: &[WV], ty: WT) -> WV {
-        self.b.add_op(self.cur, o, args, &[ty])
-    }
-
-    fn op0(&mut self, o: O, args: &[WV]) {
-        self.b.add_op(self.cur, o, args, &[]);
-    }
-
-    /// An op with several results: one value per result.
-    fn opn(&mut self, o: O, args: &[WV], tys: &[WT]) -> Vals {
-        let v = self.b.add_op(self.cur, o, args, tys);
-        match tys.len() {
-            0 => Vals::new(),
-            1 => smallvec![v],
-            _ => tys
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let p = self.b.add_value(ValueDef::PickOutput(v, i as u32, *t));
-                    self.b.append_to_block(self.cur, p);
-                    p
-                })
-                .collect(),
-        }
-    }
-
-    fn i32c(&mut self, v: u32) -> WV {
-        self.op(O::I32Const { value: v }, &[], WT::I32)
-    }
-
-    fn i64c(&mut self, v: u64) -> WV {
-        self.op(O::I64Const { value: v }, &[], WT::I64)
-    }
-
-    fn ic(&mut self, w: u32, v: u64) -> WV {
-        if w > 32 {
-            self.i64c(v)
-        } else {
-            self.i32c(v as u32)
-        }
-    }
-
-    fn ty_of(&self, v: WV) -> WT {
-        match &self.b.values[v] {
-            ValueDef::BlockParam(_, _, t)
-            | ValueDef::PickOutput(_, _, t)
-            | ValueDef::Placeholder(t) => *t,
-            ValueDef::Operator(_, _, tys) => self.b.type_pool[*tys][0],
-            ValueDef::Alias(a) => self.ty_of(*a),
-            _ => panic!("type of {v}"),
-        }
-    }
-
-    fn ma(&self, off: u64, bytes: u64) -> MemoryArg {
-        // Hint natural alignment like LLVM: the wasm align immediate
-        // is advisory only (misaligned access still works), and a
-        // 1-byte hint can steer engines to conservative codegen.
-        MemoryArg {
-            align: bytes.trailing_zeros(),
-            offset: off as u32,
-            memory: self.o.mem,
-        }
-    }
-
-    fn load(&mut self, t: ClType, p: WV, off: u64) -> WV {
-        let memory = self.ma(off, t.bytes() as u64);
-        let (o, ty) = match t {
-            clt::I8 => (O::I32Load8U { memory }, WT::I32),
-            clt::I16 => (O::I32Load16U { memory }, WT::I32),
-            clt::I32 => (O::I32Load { memory }, WT::I32),
-            clt::I64 => (O::I64Load { memory }, WT::I64),
-            clt::F32 => (O::F32Load { memory }, WT::F32),
-            clt::F64 => (O::F64Load { memory }, WT::F64),
-            t => panic!("load {t}"),
-        };
-        self.op(o, &[p], ty)
-    }
-
-    /// Do `a` and `b` (in that order) lower to the same waffle block?
-    /// Post-terminator ops in one pliron block start a fresh waffle
-    /// block, where a value defined before the terminator does not
-    /// dominate its use.
-    fn same_wb(&self, a: Ptr<Operation>, b: Ptr<Operation>) -> bool {
-        let ctx = self.ctx;
-        let Some(pb) = a.deref(ctx).get_parent_block() else {
-            return false;
-        };
-        if b.deref(ctx).get_parent_block() != Some(pb) {
-            return false;
-        }
-        let mut it = pb.deref(ctx).iter(ctx);
-        for x in it.by_ref() {
-            if x == a {
-                break;
-            }
-        }
-        for x in it.by_ref() {
-            if x == b {
-                return true;
-            }
-            let xid = Operation::get_opid(x, ctx);
-            if x.deref(ctx).successors().next().is_some()
-                || xid == ReturnOp::get_opid_static()
-                || xid == UnreachableOp::get_opid_static()
-                || self.st.invokes.contains_key(&x)
-            {
-                return false;
-            }
-        }
-        false
-    }
-
-    /// Narrow integer load fused with a following extension: emits
-    /// `i64.load{8,16,32}_{s,u}`, whose memory access (and alignment
-    /// hint) is the same as the unfused narrow load.
-    fn wload(&mut self, t: ClType, p: WV, off: u64, signed: bool) -> WV {
-        let memory = self.ma(off, t.bytes() as u64);
-        let o = match (t, signed) {
-            (clt::I8, true) => O::I64Load8S { memory },
-            (clt::I8, false) => O::I64Load8U { memory },
-            (clt::I16, true) => O::I64Load16S { memory },
-            (clt::I16, false) => O::I64Load16U { memory },
-            (clt::I32, true) => O::I64Load32S { memory },
-            (clt::I32, false) => O::I64Load32U { memory },
-            t => panic!("wload {t:?}"),
-        };
-        self.op(o, &[p], WT::I64)
-    }
-
-    fn store(&mut self, t: ClType, v: WV, p: WV, off: u64) {
-        let memory = self.ma(off, t.bytes() as u64);
-        let o = match t {
-            clt::I8 => O::I32Store8 { memory },
-            clt::I16 => O::I32Store16 { memory },
-            clt::I32 => O::I32Store { memory },
-            clt::I64 => O::I64Store { memory },
-            clt::F32 => O::F32Store { memory },
-            clt::F64 => O::F64Store { memory },
-            t => panic!("store {t}"),
-        };
-        self.op0(o, &[p, v]);
-    }
-
-    fn slot(&mut self, size: u64, align: u64) -> WV {
-        let align = align.max(1);
-        self.frame_align = self.frame_align.max(align);
-        let off = crate::types::align_to(self.frame, align);
-        self.frame = off + size;
-        self.add_imm(self.fp, off as i64)
-    }
-
-    fn add_imm(&mut self, x: WV, k: i64) -> WV {
-        if k == 0 {
-            return x;
-        }
-        let c = self.i32c(k as u32);
-        self.op(O::I32Add, &[x, c], WT::I32)
-    }
-
-    fn sel(&mut self, c: WV, x: WV, y: WV) -> WV {
-        let t = self.ty_of(x);
-        self.op(O::Select, &[x, y, c], t)
-    }
-
-    /// Clear the bits above `w` (no-op for full-width containers).
-    fn norm(&mut self, v: WV, w: u32) -> WV {
-        match w {
-            32 | 64 => v,
-            w if w > 32 => {
-                let m = self.i64c((1u64 << w) - 1);
-                self.op(O::I64And, &[v, m], WT::I64)
-            }
-            w => {
-                let m = self.i32c(((1u64 << w) - 1) as u32);
-                self.op(O::I32And, &[v, m], WT::I32)
-            }
-        }
-    }
-
-    /// Sign-extend a `w`-bit value to its container.
-    fn sext(&mut self, v: WV, w: u32) -> WV {
-        match w {
-            32 | 64 => v,
-            8 => self.op(O::I32Extend8S, &[v], WT::I32),
-            16 => self.op(O::I32Extend16S, &[v], WT::I32),
-            w if w > 32 => {
-                let s = self.i64c(64 - w as u64);
-                let x = self.op(O::I64Shl, &[v, s], WT::I64);
-                self.op(O::I64ShrS, &[x, s], WT::I64)
-            }
-            w => {
-                let s = self.i32c(32 - w);
-                let x = self.op(O::I32Shl, &[v, s], WT::I32);
-                self.op(O::I32ShrS, &[x, s], WT::I32)
-            }
-        }
-    }
-
-    /// Convert between i32 and i64 containers.
-    fn to_wide(&mut self, v: WV, wide: bool, signed: bool) -> WV {
-        match (self.ty_of(v), wide) {
-            (WT::I32, true) => self.op(
-                if signed {
-                    O::I64ExtendI32S
-                } else {
-                    O::I64ExtendI32U
-                },
-                &[v],
-                WT::I64,
-            ),
-            (WT::I64, false) => self.op(O::I32WrapI64, &[v], WT::I32),
-            _ => v,
-        }
-    }
-
-    fn ib(&mut self, w: u32, o32: O, o64: O, a: WV, b: WV) -> WV {
-        if w > 32 {
-            self.op(o64, &[a, b], WT::I64)
-        } else {
-            self.op(o32, &[a, b], WT::I32)
-        }
-    }
-
-    fn get(&mut self, v: Value) -> Vals {
-        if let Some(x) = self.vals.get(&v) {
-            return x.clone();
-        }
-        if let Some(x) = self.cconst.get(&v) {
-            return x.clone();
-        }
-        let cv = self
-            .st
-            .consts
-            .get(&v)
-            .cloned()
-            .unwrap_or_else(|| panic!("value used before definition"));
-        let r = self.mat(v.get_type(self.ctx), cv);
-        self.cconst.insert(v, r.clone());
-        r
-    }
-
-    fn get1(&mut self, v: Value) -> WV {
-        let x = self.get(v);
-        assert_eq!(x.len(), 1, "expected a scalar");
-        x[0]
-    }
-
-    fn leafc(&mut self, t: ClType, bits: u64) -> WV {
-        match wty(t) {
-            WT::I32 => self.i32c(bits as u32),
-            WT::I64 => self.i64c(bits),
-            WT::F32 => self.op(O::F32Const { value: bits as u32 }, &[], WT::F32),
-            WT::F64 => self.op(O::F64Const { value: bits }, &[], WT::F64),
-            _ => unreachable!(),
-        }
-    }
-
-    fn mat(&mut self, ty: TypeHandle, cv: ConstVal) -> Vals {
-        match cv {
-            ConstVal::Bits(bits) => {
-                let lv = wleaves(self.ctx, ty);
-                match lv.len() {
-                    1 => smallvec![self.leafc(lv[0].1, bits as u64)],
-                    2 => smallvec![self.i64c(bits as u64), self.i64c((bits >> 64) as u64)],
-                    n => panic!("{n}-leaf scalar constant"),
-                }
-            }
-            ConstVal::Zero | ConstVal::Undef => wleaves(self.ctx, ty)
-                .into_iter()
-                .map(|(_, t)| self.leafc(t, 0))
-                .collect(),
-            ConstVal::Bytes(bs) => bs.iter().map(|b| self.i32c(*b as u32)).collect(),
-            ConstVal::Agg(elems) => elems.iter().flat_map(|e| self.get(*e)).collect(),
-            ConstVal::Sym { sym, off } => {
-                let g = self.o.got(&sym);
-                let base = self.op(O::GlobalGet { global_index: g }, &[], WT::I32);
-                smallvec![self.add_imm(base, off)]
-            }
-        }
-    }
-
-    fn const_int(&self, v: Value) -> Option<i128> {
-        let ConstVal::Bits(b) = self.st.consts.get(&v)? else {
-            return if matches!(self.st.consts.get(&v)?, ConstVal::Zero) {
-                Some(0)
-            } else {
-                None
-            };
-        };
-        let w = match classify(self.ctx, v.get_type(self.ctx)) {
-            TyK::Int(w) => w,
-            _ => 32,
-        };
-        let b = *b;
-        Some(if w < 128 && (b >> (w - 1)) & 1 == 1 {
-            (b | (!0u128 << w)) as i128
-        } else {
-            b as i128
-        })
-    }
-
-    fn set(&mut self, op: Ptr<Operation>, vals: Vals) {
-        let r = op.deref(self.ctx).get_result(0);
-        self.vals.insert(r, vals);
-    }
-
-    fn set1(&mut self, op: Ptr<Operation>, v: WV) {
-        self.set(op, smallvec![v]);
-    }
-
-    fn res_ty(&self, op: Ptr<Operation>) -> TypeHandle {
-        op.deref(self.ctx).get_result(0).get_type(self.ctx)
-    }
-
-    /// Bit width of an int/pointer type, or of a vector's element.
-    fn width(&self, t: TypeHandle) -> u32 {
-        match classify(self.ctx, t) {
-            TyK::Int(w) => w,
-            TyK::Ptr => 32,
-            TyK::Vector(e, _) => self.width(e),
-            k => panic!("int width of {k:?}"),
-        }
-    }
-
-    /// Call a C-ABI runtime function. As in rustc's wasm32 C ABI, a 128-bit
-    /// result is returned through a pointer passed as the first argument.
-    fn call_named(&mut self, name: &str, args: &[WV], params: &[WT], rets: &[WT]) -> Vals {
-        if rets == [WT::I64, WT::I64] {
-            let ret = self.slot(16, 16);
-            let ps: Vec<WT> = std::iter::once(WT::I32)
-                .chain(params.iter().copied())
-                .collect();
-            let i = self.o.libfunc(
-                name,
-                SignatureData {
-                    params: ps,
-                    returns: vec![],
-                },
-            );
-            let a: Vec<WV> = std::iter::once(ret).chain(args.iter().copied()).collect();
-            self.opn(
-                O::Call {
-                    function_index: Func::new(i),
-                },
-                &a,
-                &[],
-            );
-            return smallvec![self.load(clt::I64, ret, 0), self.load(clt::I64, ret, 8)];
-        }
-        let i = self.o.libfunc(
-            name,
-            SignatureData {
-                params: params.to_vec(),
-                returns: rets.to_vec(),
-            },
-        );
-        self.opn(
-            O::Call {
-                function_index: Func::new(i),
-            },
-            args,
-            rets,
-        )
-    }
-
-    /// Read a promoted-alloca leaf in the current block.
-    fn pget(&mut self, loc: u32) -> WV {
-        let at = self.cur;
-        self.pget_in(at, loc)
-    }
-
-    /// Write a promoted-alloca leaf in the current block.
-    fn pset(&mut self, loc: u32, v: WV) {
-        self.promo.map.entry(self.cur).or_default().insert(loc, v);
-    }
-
-    /// The leaf's value at `at`: the in-block map for an open block, the
-    /// recorded end map once it is done, else a phi resolved at seal time.
-    fn pget_in(&mut self, at: WBlock, loc: u32) -> WV {
-        if (at == self.cur || self.promo.sealed.contains(&at))
-            && let Some(&v) = self.promo.map.get(&at).and_then(|m| m.get(&loc))
-        {
-            return v;
-        }
-        let ty = self.promo.tys[loc as usize];
-        if self.promo.sealed.contains(&at) {
-            if self.b.blocks[at].preds.is_empty() {
-                return self.pzero(at, ty);
-            }
-            let ph = self.b.add_placeholder(ty);
-            self.promo.map.entry(at).or_default().insert(loc, ph);
-            self.phi(at, loc, ph);
-            return ph;
-        }
-        if let Some(&v) = self.promo.map.get(&at).and_then(|m| m.get(&loc)) {
-            return v;
-        }
-        let ph = self.b.add_placeholder(ty);
-        self.promo.map.entry(at).or_default().insert(loc, ph);
-        self.promo.incomplete.entry(at).or_default().push((loc, ph));
-        ph
-    }
-
-    /// A default (uninitialized) leaf value emitted into a pred-less block.
-    fn pzero(&mut self, at: WBlock, ty: WT) -> WV {
-        let o = match ty {
-            WT::I32 => O::I32Const { value: 0 },
-            WT::I64 => O::I64Const { value: 0 },
-            WT::F32 => O::F32Const { value: 0 },
-            WT::F64 => O::F64Const { value: 0 },
-            WT::V128 => O::V128Const { value: 0 },
-            t => panic!("promoted leaf type {t:?}"),
-        };
-        self.b.add_op(at, o, &[], &[ty])
-    }
-
-    /// `wb`'s predecessor set is final: resolve its phi placeholders.
-    fn pseal(&mut self, wb: WBlock) {
-        if !self.promo.sealed.insert(wb) {
-            return;
-        }
-        for (loc, ph) in self.promo.incomplete.remove(&wb).unwrap_or_default() {
-            self.phi(wb, loc, ph);
-        }
-    }
-
-    /// Fill leaf phi `ph` in `wb` from each pred's live-out value, or fold it
-    /// to an alias when all preds agree.
-    fn phi(&mut self, wb: WBlock, loc: u32, ph: WV) {
-        let preds = self.b.blocks[wb].preds.clone();
-        let mut results = Vec::with_capacity(preds.len());
-        for pred in preds {
-            results.push(self.pget_in(pred, loc));
-        }
-        let mut non_self = results.iter().filter(|&&v| v != ph);
-        let alias = match non_self.next() {
-            None => None,
-            Some(&first) if non_self.all(|&v| v == first) && self.b.resolve_alias(first) != ph => {
-                Some(first)
-            }
-            Some(_) => None,
-        };
-        if let Some(v) = alias {
-            self.b.set_alias(ph, v);
-        } else {
-            self.b.replace_placeholder_with_blockparam(wb, ph);
-            for (i, result) in results.into_iter().enumerate() {
-                let pred = self.b.blocks[wb].preds[i];
-                let index = self.b.blocks[wb].pos_in_pred_succ[i];
-                self.b.blocks[pred].terminator.update_target(index, |t| {
-                    t.args.push(result);
-                });
-            }
-        }
-    }
-
-    /// Seal an internal (non-pliron) waffle block once its preds — which are
-    /// final as soon as they exist — have all been emitted.
-    fn maybe_seal(&mut self, wb: WBlock) {
-        if self.promo.sealed.contains(&wb)
-            || self.promo.mapped.contains(&wb)
-            || Some(wb) == self.epi
-        {
-            return;
-        }
-        if self.b.blocks[wb]
-            .preds
-            .iter()
-            .all(|p| self.promo.finished.contains(p))
-        {
-            self.pseal(wb);
-        }
-    }
-
-    /// Reinterpret `v` as another same-width wasm container type.
-    fn reinterp(&mut self, v: WV, to: WT) -> WV {
-        let from = self.ty_of(v);
-        if from == to {
-            return v;
-        }
-        let o = match (from, to) {
-            (WT::I32, WT::F32) => O::F32ReinterpretI32,
-            (WT::F32, WT::I32) => O::I32ReinterpretF32,
-            (WT::I64, WT::F64) => O::F64ReinterpretI64,
-            (WT::F64, WT::I64) => O::I64ReinterpretF64,
-            (a, b) => panic!("reinterp {a:?} -> {b:?}"),
-        };
-        self.op(o, &[v], to)
-    }
-
-    fn lower(&mut self, f: Ptr<Operation>) {
-        let ctx = self.ctx;
-        let region = f.deref(ctx).get_region(0);
-        let pblocks: Vec<Ptr<BasicBlock>> = region.deref(ctx).iter(ctx).collect();
-        let entry = self.b.entry;
-        self.blocks.insert(pblocks[0], entry);
-        for pb in &pblocks[1..] {
-            let wb = self.b.add_block();
-            self.blocks.insert(*pb, wb);
-            let args: Vec<Value> = pb.deref(ctx).arguments().collect();
-            for a in args {
-                let vs: Vals = wleaves(ctx, a.get_type(ctx))
-                    .into_iter()
-                    .map(|(_, t)| self.b.add_blockparam(wb, wty(t)))
-                    .collect();
-                self.vals.insert(a, vs);
-            }
-        }
-        let params: Vec<WV> = self.b.blocks[entry].params.iter().map(|p| p.1).collect();
-        let mut i = 0;
-        let args: Vec<Value> = pblocks[0].deref(ctx).arguments().collect();
-        for arg in args {
-            let n = wleaves(ctx, arg.get_type(ctx)).len();
-            self.vals.insert(arg, params[i..i + n].into());
-            i += n;
-        }
-        if i < params.len() {
-            // Variadic functions carry one extra hidden param (see wsig).
-            self.va_buf = Some(params[i]);
-        }
-        for op in crate::sroa::allocas(ctx, f) {
-            let a = op.deref(ctx).get_result(0);
-            if let Some(&ty) = self.st.promoted.get(&a) {
-                let base = self.promo.tys.len() as u32;
-                let n = wleaves(ctx, ty).len() as u32;
-                self.promo
-                    .tys
-                    .extend(wleaves(ctx, ty).iter().map(|&(_, t)| wty(t)));
-                self.promo.slots.insert(a, (base, n));
-            }
-        }
-        self.promo.mapped = self.blocks.values().copied().collect();
-        // Pliron-level predecessors: a mapped block's waffle `preds` is only
-        // complete once every pliron predecessor has finished emitting.
-        let succ = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
-            b.deref(ctx)
-                .iter(ctx)
-                .flat_map(|op| {
-                    let mut v: Vec<_> = op.deref(ctx).successors().collect();
-                    v.extend(self.st.invokes.get(&op).map(|&(l, _)| l));
-                    v
-                })
-                .collect()
-        };
-        let mut ppred: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
-        for &pb in &pblocks {
-            for sb in succ(pb) {
-                ppred.entry(sb).or_default().push(pb);
-            }
-        }
-        let mut pdone: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
-        for pb in rpo(ctx, self.st, &pblocks) {
-            self.cur = self.blocks[&pb];
-            self.cconst.clear();
-            self.terminated = false;
-            if ppred
-                .get(&pb)
-                .is_none_or(|ps| ps.iter().all(|p| pdone.contains(p)))
-            {
-                self.pseal(self.cur);
-            }
-            let ops: Vec<Ptr<Operation>> = pb.deref(ctx).iter(ctx).collect();
-            for op in ops {
-                if self.terminated {
-                    let wb = self.b.add_block();
-                    self.cur = wb;
-                    self.maybe_seal(wb);
-                    self.cconst.clear();
-                    self.terminated = false;
-                }
-                self.lower_op(op);
-            }
-            if !self.terminated {
-                let c = self.cur;
-                self.b.set_terminator(c, Terminator::Unreachable);
-                self.promo.finished.insert(c);
-            }
-            pdone.insert(pb);
-            for sb in succ(pb) {
-                if let Some(&wb) = self.blocks.get(&sb)
-                    && ppred[&sb].iter().all(|p| pdone.contains(p))
-                {
-                    self.pseal(wb);
-                }
-            }
-        }
-        // Unsealed leftovers (e.g. the unwind epilogue, which gathers preds
-        // over the whole function): all preds exist now.
-        while let Some(&wb) = self.promo.incomplete.keys().next() {
-            self.pseal(wb);
-        }
-    }
-
-    fn target(&mut self, pb: Ptr<BasicBlock>, args: &[Value]) -> BlockTarget {
-        let args = args.iter().flat_map(|v| self.get(*v)).collect();
-        BlockTarget {
-            block: self.blocks[&pb],
-            args,
-        }
-    }
-
-    fn term(&mut self, t: Terminator) {
-        let c = self.cur;
-        self.b.set_terminator(c, t);
-        self.promo.finished.insert(c);
-        self.terminated = true;
-    }
-
-    /// Emulated EH storage: `__pliron_eh` is an 8-byte data symbol synthesized
-    /// by the linker; +0 is the "unwind in flight" flag, +4 the exception ptr.
-    fn eh_addr(&mut self) -> WV {
-        let g = self.o.got("__pliron_eh");
-        self.op(O::GlobalGet { global_index: g }, &[], WT::I32)
-    }
-
-    fn eh_flag(&mut self) -> WV {
-        let p = self.eh_addr();
-        self.load(clt::I32, p, 0)
-    }
-
-    fn zero_of(&mut self, t: WT) -> WV {
-        self.op(
-            match t {
-                WT::I32 => O::I32Const { value: 0 },
-                WT::I64 => O::I64Const { value: 0 },
-                WT::F32 => O::F32Const { value: 0 },
-                WT::F64 => O::F64Const { value: 0 },
-                WT::V128 => O::V128Const { value: 0 },
-                t => panic!("eh epilogue return type {t:?}"),
-            },
-            &[],
-            t,
-        )
-    }
-
-    /// The shared epilogue reached when an unwind propagates out of this
-    /// function: restore the stack pointer and return dummy values; the
-    /// caller's own flag check keeps unwinding.
-    fn unwind_epilogue(&mut self) -> WBlock {
-        if let Some(b) = self.epi {
-            return b;
-        }
-        let b = self.b.add_block();
-        let (sp, sp0) = (self.o.sp, self.sp0);
-        let save = std::mem::replace(&mut self.cur, b);
-        self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
-        let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
-        self.b.set_terminator(b, Terminator::Return { values });
-        self.promo.finished.insert(b);
-        self.cur = save;
-        self.epi = Some(b);
-        b
-    }
-
-    /// panic=unwind check after a call: if the callee started an unwind, go to
-    /// `landing` (the invoke's cleanup pad) or propagate out of this function.
-    fn eh_check(&mut self, landing: Option<Ptr<BasicBlock>>) {
-        if !self.o.unwind {
-            return;
-        }
-        let f = self.eh_flag();
-        let cont = self.b.add_block();
-        let if_true = match landing {
-            Some(pb) => BlockTarget {
-                block: self.blocks[&pb],
-                args: vec![],
-            },
-            None => BlockTarget {
-                block: self.unwind_epilogue(),
-                args: vec![],
-            },
-        };
-        let c = self.cur;
-        self.b.set_terminator(
-            c,
-            Terminator::CondBr {
-                cond: f,
-                if_true,
-                if_false: BlockTarget {
-                    block: cont,
-                    args: vec![],
-                },
-            },
-        );
-        self.promo.finished.insert(c);
-        self.cur = cont;
-        self.maybe_seal(cont);
-    }
-
-    fn icmp(&mut self, pred: ICmpPredicateAttr, a: &[WV], b: &[WV], w: u32) -> WV {
-        use ICmpPredicateAttr as P;
-        if w == 128 {
-            let lo_eq = self.op(O::I64Eq, &[a[0], b[0]], WT::I32);
-            let hi_eq = self.op(O::I64Eq, &[a[1], b[1]], WT::I32);
-            let eq = self.op(O::I32And, &[lo_eq, hi_eq], WT::I32);
-            return match pred {
-                P::EQ => eq,
-                P::NE => self.op(O::I32Eqz, &[eq], WT::I32),
-                _ => {
-                    let (hs, lo) = match pred {
-                        P::SLT => (O::I64LtS, O::I64LtU),
-                        P::SLE => (O::I64LtS, O::I64LeU),
-                        P::SGT => (O::I64GtS, O::I64GtU),
-                        P::SGE => (O::I64GtS, O::I64GeU),
-                        P::ULT => (O::I64LtU, O::I64LtU),
-                        P::ULE => (O::I64LtU, O::I64LeU),
-                        P::UGT => (O::I64GtU, O::I64GtU),
-                        P::UGE => (O::I64GtU, O::I64GeU),
-                        _ => unreachable!(),
-                    };
-                    let h = self.op(hs, &[a[1], b[1]], WT::I32);
-                    let l = self.op(lo, &[a[0], b[0]], WT::I32);
-                    self.sel(hi_eq, l, h)
-                }
-            };
-        }
-        let signed = matches!(pred, P::SLT | P::SLE | P::SGT | P::SGE);
-        let (x, y) = if signed {
-            (self.sext(a[0], w), self.sext(b[0], w))
-        } else {
-            (a[0], b[0])
-        };
-        let (o32, o64) = match pred {
-            P::EQ => (O::I32Eq, O::I64Eq),
-            P::NE => (O::I32Ne, O::I64Ne),
-            P::SLT => (O::I32LtS, O::I64LtS),
-            P::SLE => (O::I32LeS, O::I64LeS),
-            P::SGT => (O::I32GtS, O::I64GtS),
-            P::SGE => (O::I32GeS, O::I64GeS),
-            P::ULT => (O::I32LtU, O::I64LtU),
-            P::ULE => (O::I32LeU, O::I64LeU),
-            P::UGT => (O::I32GtU, O::I64GtU),
-            P::UGE => (O::I32GeU, O::I64GeU),
-        };
-        let o = if w > 32 { o64 } else { o32 };
-        self.op(o, &[x, y], WT::I32)
-    }
-
-    fn fcmp(&mut self, pred: FCmpPredicateAttr, a: WV, b: WV) -> WV {
-        use FCmpPredicateAttr as P;
-        let f64 = self.ty_of(a) == WT::F64;
-        let c = |o: &str| -> O {
-            match (o, f64) {
-                ("eq", false) => O::F32Eq,
-                ("ne", false) => O::F32Ne,
-                ("lt", false) => O::F32Lt,
-                ("le", false) => O::F32Le,
-                ("gt", false) => O::F32Gt,
-                ("ge", false) => O::F32Ge,
-                ("eq", true) => O::F64Eq,
-                ("ne", true) => O::F64Ne,
-                ("lt", true) => O::F64Lt,
-                ("le", true) => O::F64Le,
-                ("gt", true) => O::F64Gt,
-                _ => O::F64Ge,
-            }
-        };
-        let cmp = |s: &mut Self, o: &str, x: WV, y: WV| s.op(c(o), &[x, y], WT::I32);
-        let not = |s: &mut Self, x: WV| s.op(O::I32Eqz, &[x], WT::I32);
-        match pred {
-            P::False => self.i32c(0),
-            P::True => self.i32c(1),
-            P::OEQ => cmp(self, "eq", a, b),
-            P::OGT => cmp(self, "gt", a, b),
-            P::OGE => cmp(self, "ge", a, b),
-            P::OLT => cmp(self, "lt", a, b),
-            P::OLE => cmp(self, "le", a, b),
-            P::UNE => cmp(self, "ne", a, b),
-            P::ONE | P::UEQ => {
-                let l = cmp(self, "lt", a, b);
-                let g = cmp(self, "gt", a, b);
-                let one = self.op(O::I32Or, &[l, g], WT::I32);
-                if matches!(pred, P::ONE) {
-                    one
-                } else {
-                    not(self, one)
-                }
-            }
-            P::ORD | P::UNO => {
-                let x = cmp(self, "eq", a, a);
-                let y = cmp(self, "eq", b, b);
-                let ord = self.op(O::I32And, &[x, y], WT::I32);
-                if matches!(pred, P::ORD) {
-                    ord
-                } else {
-                    not(self, ord)
-                }
-            }
-            P::UGT => {
-                let r = cmp(self, "le", a, b);
-                not(self, r)
-            }
-            P::UGE => {
-                let r = cmp(self, "lt", a, b);
-                not(self, r)
-            }
-            P::ULT => {
-                let r = cmp(self, "ge", a, b);
-                not(self, r)
-            }
-            P::ULE => {
-                let r = cmp(self, "gt", a, b);
-                not(self, r)
-            }
-        }
-    }
-
-    fn lower_op(&mut self, op: Ptr<Operation>) {
-        let ctx = self.ctx;
-        let id = Operation::get_opid(op, ctx);
-        let (opnds, succs): (Vec<Value>, Vec<Ptr<BasicBlock>>) = {
-            let o = op.deref(ctx);
-            (o.operands().collect(), o.successors().collect())
-        };
-        macro_rules! is {
-            ($t:ty) => {
-                id == <$t>::get_opid_static()
-            };
-        }
-        // Lane-wise integer op; `fix` re-normalizes narrow results.
-        macro_rules! intop {
-            ($o32:expr, $o64:expr, $pre:ident, $fix:expr) => {{
-                let w = self.width(self.res_ty(op));
-                if w == 128 {
-                    return self.i128_op(op, id, &opnds);
-                }
-                let a = self.get(opnds[0]);
-                let b = self.get(opnds[1]);
-                let mut r = Vals::new();
-                for (x, y) in a.into_iter().zip(b) {
-                    let (x, y) = self.$pre(x, y, w);
-                    let v = self.ib(w, $o32, $o64, x, y);
-                    r.push(if $fix { self.norm(v, w) } else { v });
-                }
-                self.set(op, r);
-            }};
-        }
-        // f16 arrives as raw i16 bits and f128 as an i64 pair: neither can go
-        // through scalar wasm float ops, and this sysroot has no hf/tf
-        // builtins to call. Panic here becomes an `unreachable` stub.
-        let int_float_ty = |t: TypeHandle| {
-            wleaves(ctx, t)
-                .iter()
-                .any(|l| !matches!(l.1, clt::F32 | clt::F64))
-        };
-        macro_rules! fop {
-            ($o32:expr, $o64:expr) => {{
-                if int_float_ty(opnds[0].get_type(ctx)) {
-                    panic!("f16/f128 arithmetic on wasm");
-                }
-                let a = self.get(opnds[0]);
-                let b = self.get(opnds[1]);
-                let r = a
-                    .into_iter()
-                    .zip(b)
-                    .map(|(x, y)| {
-                        let f64 = self.ty_of(x) == WT::F64;
-                        self.op(
-                            if f64 { $o64 } else { $o32 },
-                            &[x, y],
-                            if f64 { WT::F64 } else { WT::F32 },
-                        )
-                    })
-                    .collect();
-                self.set(op, r);
-            }};
-        }
-
-        if is!(ReturnOp) {
-            let values = match opnds.first() {
-                Some(v) => self.get(*v).into_vec(),
-                None => vec![],
-            };
-            let (sp, sp0) = (self.o.sp, self.sp0);
-            self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
-            self.term(Terminator::Return { values });
-        } else if is!(UnreachableOp) {
-            self.term(Terminator::Unreachable);
-        } else if is!(BrOp) {
-            let t = self.target(succs[0], &opnds);
-            self.term(Terminator::Br { target: t });
-        } else if is!(CondBrOp) {
-            let c = self.get1(opnds[0]);
-            let cb = Operation::get_op::<CondBrOp>(op, ctx).unwrap();
-            let ta = cb.get_true_dest_operands(ctx);
-            let ea = cb.get_false_dest_operands(ctx);
-            let if_true = self.target(succs[0], &ta);
-            let if_false = self.target(succs[1], &ea);
-            self.term(Terminator::CondBr {
-                cond: c,
-                if_true,
-                if_false,
-            });
-        } else if is!(ICmpOp) {
-            let pred = Operation::get_op::<ICmpOp>(op, ctx).unwrap().predicate(ctx);
-            let w = self.width(opnds[0].get_type(ctx));
-            let a = self.get(opnds[0]);
-            let b = self.get(opnds[1]);
-            let r = if w == 128 {
-                smallvec![self.icmp(pred, &a, &b, w)]
-            } else {
-                a.iter()
-                    .zip(b.iter())
-                    .map(|(x, y)| self.icmp(pred.clone(), &[*x], &[*y], w))
-                    .collect()
-            };
-            self.set(op, r);
-        } else if is!(FCmpOp) {
-            if int_float_ty(opnds[0].get_type(ctx)) {
-                panic!("f16/f128 compare on wasm");
-            }
-            let pred = Operation::get_op::<FCmpOp>(op, ctx).unwrap().predicate(ctx);
-            let a = self.get(opnds[0]);
-            let b = self.get(opnds[1]);
-            let r = a
-                .iter()
-                .zip(b.iter())
-                .map(|(x, y)| self.fcmp(pred.clone(), *x, *y))
-                .collect();
-            self.set(op, r);
-        } else if is!(AddOp) {
-            intop!(O::I32Add, O::I64Add, raw2, true)
-        } else if is!(SubOp) {
-            intop!(O::I32Sub, O::I64Sub, raw2, true)
-        } else if is!(MulOp) {
-            intop!(O::I32Mul, O::I64Mul, raw2, true)
-        } else if is!(AndOp) {
-            intop!(O::I32And, O::I64And, raw2, false)
-        } else if is!(OrOp) {
-            intop!(O::I32Or, O::I64Or, raw2, false)
-        } else if is!(XorOp) {
-            intop!(O::I32Xor, O::I64Xor, raw2, false)
-        } else if is!(ShlOp) {
-            intop!(O::I32Shl, O::I64Shl, raw2, true)
-        } else if is!(LShrOp) {
-            intop!(O::I32ShrU, O::I64ShrU, raw2, false)
-        } else if is!(AShrOp) {
-            intop!(O::I32ShrS, O::I64ShrS, sext1, true)
-        } else if is!(UDivOp) {
-            intop!(O::I32DivU, O::I64DivU, raw2, false)
-        } else if is!(URemOp) {
-            intop!(O::I32RemU, O::I64RemU, raw2, false)
-        } else if is!(SDivOp) {
-            intop!(O::I32DivS, O::I64DivS, sext2, true)
-        } else if is!(SRemOp) {
-            intop!(O::I32RemS, O::I64RemS, sext2, true)
-        } else if is!(FAddOp) {
-            fop!(O::F32Add, O::F64Add)
-        } else if is!(FSubOp) {
-            fop!(O::F32Sub, O::F64Sub)
-        } else if is!(FMulOp) {
-            fop!(O::F32Mul, O::F64Mul)
-        } else if is!(FDivOp) {
-            fop!(O::F32Div, O::F64Div)
-        } else if is!(FRemOp) {
-            if int_float_ty(opnds[0].get_type(ctx)) {
-                panic!("f16/f128 rem on wasm");
-            }
-            let a = self.get1(opnds[0]);
-            let b = self.get1(opnds[1]);
-            let t = self.ty_of(a);
-            let r = self.call_named(
-                if t == WT::F32 { "fmodf" } else { "fmod" },
-                &[a, b],
-                &[t, t],
-                &[t],
-            )[0];
-            self.set1(op, r);
-        } else if is!(FNegOp) {
-            let a = self.get(opnds[0]);
-            let ls = wleaves(ctx, opnds[0].get_type(ctx));
-            let r = if ls.len() == 2 {
-                // f128 (lo, hi) i64 pair: flip the sign bit in hi.
-                let s = self.i64c(1u64 << 63);
-                smallvec![a[0], self.op(O::I64Xor, &[a[1], s], WT::I64)]
-            } else if ls[0].1 == clt::I16 {
-                // f16: raw bits zero-extended in an i32; flip bit 15.
-                let s = self.i32c(1 << 15);
-                smallvec![self.op(O::I32Xor, &[a[0], s], WT::I32)]
-            } else {
-                a.into_iter()
-                    .map(|x| {
-                        let t = self.ty_of(x);
-                        self.op(if t == WT::F64 { O::F64Neg } else { O::F32Neg }, &[x], t)
-                    })
-                    .collect()
-            };
-            self.set(op, r);
-        } else if is!(TruncOp) || is!(ZExtOp) || is!(SExtOp) || is!(PtrToIntOp) || is!(IntToPtrOp) {
-            let sw = self.width(opnds[0].get_type(ctx));
-            let dw = self.width(self.res_ty(op));
-            let xs = self.get(opnds[0]);
-            let signed = is!(SExtOp);
-            let lanes = if sw == 128 { 1 } else { xs.len() };
-            let mut r = Vals::new();
-            for l in 0..lanes {
-                let x = if sw == 128 { xs[0] } else { xs[l] };
-                let hi_in = if sw == 128 { Some(xs[1]) } else { None };
-                // A fused load+extend operand is already the wide value.
-                let x = if signed && !self.fused_ext.contains_key(&opnds[0]) {
-                    self.sext(x, sw.min(64))
-                } else {
-                    x
-                };
-                if dw == 128 {
-                    let lo = self.to_wide(x, true, signed);
-                    let hi = match hi_in {
-                        Some(h) => h,
-                        None if signed => {
-                            let s = self.i64c(63);
-                            self.op(O::I64ShrS, &[lo, s], WT::I64)
-                        }
-                        None => self.i64c(0),
-                    };
-                    r.push(lo);
-                    r.push(hi);
-                } else {
-                    let v = self.to_wide(x, dw > 32, signed);
-                    r.push(self.norm(v, dw));
-                }
-            }
-            self.set(op, r);
-        } else if is!(FPTruncOp) || is!(FPExtOp) {
-            let x = self.get(opnds[0]);
-            let from = wleaves(ctx, opnds[0].get_type(ctx));
-            let to = wleaves(ctx, self.res_ty(op));
-            let fk = |s: &[(u64, ClType)]| match (s.len(), s[0].1) {
-                (2, _) => "tf",
-                (_, clt::I16) => "hf",
-                (_, clt::F32) => "sf",
-                _ => "df",
-            };
-            let (f, t) = (fk(&from), fk(&to));
-            let r: Vals = match (f, t) {
-                ("df", "sf") => smallvec![self.op(O::F32DemoteF64, &[x[0]], WT::F32)],
-                ("sf", "df") => smallvec![self.op(O::F64PromoteF32, &[x[0]], WT::F64)],
-                // hf/tf conversions call __extend*/__trunc* builtins that this
-                // sysroot lacks; a stub traps only when actually invoked.
-                ("hf", _) | (_, "hf") | ("tf", _) | (_, "tf") => {
-                    panic!("f16/f128 conversion on wasm")
-                }
-                _ => {
-                    let name = format!(
-                        "__{}{f}{t}2",
-                        if is!(FPTruncOp) { "trunc" } else { "extend" }
-                    );
-                    let ps: Vec<WT> = from.iter().map(|l| wty(l.1)).collect();
-                    let rs: Vec<WT> = to.iter().map(|l| wty(l.1)).collect();
-                    self.call_named(&name, &x, &ps, &rs)
-                }
-            };
-            self.set(op, r);
-        } else if is!(FPToUIOp) || is!(FPToSIOp) {
-            if int_float_ty(opnds[0].get_type(ctx)) {
-                panic!("f16/f128 to int on wasm");
-            }
-            let x = self.get1(opnds[0]);
-            let w = self.width(self.res_ty(op));
-            let r = self.fcvt_sat(is!(FPToSIOp), w, x);
-            self.set(op, r);
-        } else if is!(UIToFPOp) || is!(SIToFPOp) {
-            if int_float_ty(self.res_ty(op)) {
-                panic!("int to f16/f128 on wasm");
-            }
-            let xs = self.get(opnds[0]);
-            let w = self.width(opnds[0].get_type(ctx));
-            let signed = is!(SIToFPOp);
-            let t = wty(wleaves(ctx, self.res_ty(op))[0].1);
-            let f32 = t == WT::F32;
-            let r = if w == 128 {
-                let name = match (signed, f32) {
-                    (true, true) => "__floattisf",
-                    (true, false) => "__floattidf",
-                    (false, true) => "__floatuntisf",
-                    (false, false) => "__floatuntidf",
-                };
-                self.call_named(name, &xs, &[WT::I64, WT::I64], &[t])[0]
-            } else {
-                let x = if signed { self.sext(xs[0], w) } else { xs[0] };
-                let o = match (w > 32, signed, f32) {
-                    (false, true, true) => O::F32ConvertI32S,
-                    (false, false, true) => O::F32ConvertI32U,
-                    (true, true, true) => O::F32ConvertI64S,
-                    (true, false, true) => O::F32ConvertI64U,
-                    (false, true, false) => O::F64ConvertI32S,
-                    (false, false, false) => O::F64ConvertI32U,
-                    (true, true, false) => O::F64ConvertI64S,
-                    (true, false, false) => O::F64ConvertI64U,
-                };
-                self.op(o, &[x], t)
-            };
-            self.set1(op, r);
-        } else if is!(BitcastOp) || is!(AddrSpaceCastOp) || is!(FreezeOp) {
-            let xs = self.get(opnds[0]);
-            let sl = wleaves(ctx, opnds[0].get_type(ctx));
-            let dl = wleaves(ctx, self.res_ty(op));
-            let r: Vals = if sl.iter().map(|l| l.1).eq(dl.iter().map(|l| l.1)) {
-                xs
-            } else if xs.len() == 1 && dl.len() == 1 && sl[0].1.bits() == dl[0].1.bits() {
-                let o = match (self.ty_of(xs[0]), wty(dl[0].1)) {
-                    (WT::I32, WT::F32) => O::F32ReinterpretI32,
-                    (WT::F32, WT::I32) => O::I32ReinterpretF32,
-                    (WT::I64, WT::F64) => O::F64ReinterpretI64,
-                    (WT::F64, WT::I64) => O::I64ReinterpretF64,
-                    (a, b) => panic!("bitcast {a} -> {b}"),
-                };
-                smallvec![self.op(o, &[xs[0]], wty(dl[0].1))]
-            } else {
-                let (sz, _) = size_align(ctx, self.res_ty(op));
-                let slot = self.slot(sz.max(16), 16);
-                for (x, (o, t)) in xs.iter().zip(sl) {
-                    self.store(t, *x, slot, o);
-                }
-                dl.iter().map(|(o, t)| self.load(*t, slot, *o)).collect()
-            };
-            self.set(op, r);
-        } else if is!(AllocaOp) {
-            let res = op.deref(ctx).get_result(0);
-            if !self.promo.slots.contains_key(&res) {
-                let (size, align) = self.st.allocas[&res];
-                let p = self.slot(size, align);
-                self.set1(op, p);
-            }
-        } else if is!(LoadOp) && self.promo.slots.contains_key(&opnds[0]) {
-            let (base, _) = self.promo.slots[&opnds[0]];
-            let r: Vals = wleaves(ctx, self.res_ty(op))
-                .iter()
-                .enumerate()
-                .map(|(k, &(_, t))| {
-                    let v = self.pget(base + k as u32);
-                    self.reinterp(v, wty(t))
-                })
-                .collect();
-            self.set(op, r);
-        } else if is!(StoreOp) && self.promo.slots.contains_key(&opnds[1]) {
-            let (base, _) = self.promo.slots[&opnds[1]];
-            let vs = self.get(opnds[0]);
-            for (k, x) in vs.into_iter().enumerate() {
-                let slot = base + k as u32;
-                let x = self.reinterp(x, self.promo.tys[slot as usize]);
-                self.pset(slot, x);
-            }
-        } else if is!(LoadOp) || is!(AtomicLoadOp) {
-            let p = self.get1(opnds[0]);
-            // If this load's only use is a same-block sext/zext, emit the
-            // extending `i64.load{8,16,32}_{s,u}` form directly: same
-            // memory access, one instruction instead of load+extend
-            // (what LLVM emits too). The extend's lowering sees the
-            // value is already wide and becomes a no-op.
-            let res = op.deref(ctx).get_result(0);
-            let mut wide: Option<bool> = None;
-            if is!(LoadOp) && wleaves(ctx, res.get_type(ctx)).len() == 1 {
-                if let [u] = res.uses(ctx)[..] {
-                    let uop = u.user_op();
-                    let uid = Operation::get_opid(uop, ctx);
-                    let se = uid == SExtOp::get_opid_static();
-                    if (se || uid == ZExtOp::get_opid_static())
-                        && u.try_find_index(ctx).ok() == Some(0)
-                        && self.width(uop.deref(ctx).get_result(0).get_type(ctx)) > 32
-                        && self.same_wb(op, uop)
-                    {
-                        wide = Some(se);
-                        self.fused_ext.insert(res, se);
-                    }
-                }
-            }
-            let r = wleaves(ctx, self.res_ty(op))
-                .into_iter()
-                .map(|(o, t)| match wide {
-                    Some(s) if matches!(t, clt::I8 | clt::I16 | clt::I32) => self.wload(t, p, o, s),
-                    _ => self.load(t, p, o),
-                })
-                .collect();
-            self.set(op, r);
-        } else if is!(StoreOp) || is!(AtomicStoreOp) {
-            let vs = self.get(opnds[0]);
-            let p = self.get1(opnds[1]);
-            for (v, (o, t)) in vs.into_iter().zip(wleaves(ctx, opnds[0].get_type(ctx))) {
-                self.store(t, v, p, o);
-            }
-        } else if is!(AtomicRmwOp) {
-            // Single-threaded: a plain load / op / store.
-            let p = self.get1(opnds[0]);
-            let v = self.get1(opnds[1]);
-            let w = self.width(opnds[1].get_type(ctx));
-            let t = wleaves(ctx, opnds[1].get_type(ctx))[0].1;
-            let old = self.load(t, p, 0);
-            let lt = |s: &mut Self, signed: bool| {
-                let (x, y) = if signed {
-                    (s.sext(old, w), s.sext(v, w))
-                } else {
-                    (old, v)
-                };
-                let o = match (w > 32, signed) {
-                    (false, true) => O::I32LtS,
-                    (false, false) => O::I32LtU,
-                    (true, true) => O::I64LtS,
-                    (true, false) => O::I64LtU,
-                };
-                s.op(o, &[x, y], WT::I32)
-            };
-            let new = match self.st.rmw[&op] {
-                AtomicRmwKindAttr::Xchg => v,
-                AtomicRmwKindAttr::Add => self.ib(w, O::I32Add, O::I64Add, old, v),
-                AtomicRmwKindAttr::Sub => self.ib(w, O::I32Sub, O::I64Sub, old, v),
-                AtomicRmwKindAttr::And => self.ib(w, O::I32And, O::I64And, old, v),
-                AtomicRmwKindAttr::Nand => {
-                    let a = self.ib(w, O::I32And, O::I64And, old, v);
-                    let m = self.ic(w, u64::MAX);
-                    self.ib(w, O::I32Xor, O::I64Xor, a, m)
-                }
-                AtomicRmwKindAttr::Or => self.ib(w, O::I32Or, O::I64Or, old, v),
-                AtomicRmwKindAttr::Xor => self.ib(w, O::I32Xor, O::I64Xor, old, v),
-                AtomicRmwKindAttr::Max | AtomicRmwKindAttr::UMax => {
-                    let signed = matches!(self.st.rmw[&op], AtomicRmwKindAttr::Max);
-                    let c = lt(self, signed);
-                    self.sel(c, v, old)
-                }
-                AtomicRmwKindAttr::Min | AtomicRmwKindAttr::UMin => {
-                    let signed = matches!(self.st.rmw[&op], AtomicRmwKindAttr::Min);
-                    let c = lt(self, signed);
-                    self.sel(c, old, v)
-                }
-                _ => unreachable!(),
-            };
-            self.store(t, new, p, 0);
-            self.set1(op, old);
-        } else if is!(AtomicCmpxchgOp) {
-            let p = self.get1(opnds[0]);
-            let c = self.get1(opnds[1]);
-            let n = self.get1(opnds[2]);
-            let w = self.width(opnds[1].get_type(ctx));
-            let t = wleaves(ctx, opnds[1].get_type(ctx))[0].1;
-            let old = self.load(t, p, 0);
-            let ok = self.op(if w > 32 { O::I64Eq } else { O::I32Eq }, &[old, c], WT::I32);
-            let new = self.sel(ok, n, old);
-            self.store(t, new, p, 0);
-            self.set(op, smallvec![old, ok]);
-        } else if is!(FenceOp) {
-        } else if is!(GetElementPtrOp) {
-            self.lower_gep(op, opnds[0]);
-        } else if is!(CallOp) {
-            self.lower_call(op);
-        } else if is!(CallIntrinsicOp) {
-            self.lower_intrinsic(op, &opnds);
-        } else if is!(SelectOp) {
-            let c = self.get(opnds[0]);
-            let a = self.get(opnds[1]);
-            let b = self.get(opnds[2]);
-            let r = a
-                .iter()
-                .zip(b.iter())
-                .enumerate()
-                .map(|(i, (x, y))| {
-                    let ci = if c.len() == 1 { c[0] } else { c[i] };
-                    self.sel(ci, *x, *y)
-                })
-                .collect();
-            self.set(op, r);
-        } else if is!(ExtractValueOp) {
-            let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
-                .unwrap()
-                .indices(ctx);
-            let (s, n) = wleaf_range(ctx, opnds[0].get_type(ctx), &idx);
-            let a = self.get(opnds[0]);
-            self.set(op, a[s..s + n].into());
-        } else if is!(InsertValueOp) {
-            let idx = Operation::get_op::<InsertValueOp>(op, ctx)
-                .unwrap()
-                .indices(ctx);
-            let (s, n) = wleaf_range(ctx, opnds[0].get_type(ctx), &idx);
-            let mut a = self.get(opnds[0]);
-            let v = self.get(opnds[1]);
-            a.drain(s..s + n);
-            a.insert_many(s, v);
-            self.set(op, a);
-        } else if is!(ExtractElementOp) {
-            let a = self.get(opnds[0]);
-            let r = match self.const_int(opnds[1]) {
-                Some(i) => a[i as usize],
-                None => {
-                    let (p, es, t) = self.spill_vec(opnds[0], &a);
-                    let addr = self.dyn_index(p, opnds[1], es);
-                    self.load(t, addr, 0)
-                }
-            };
-            self.set1(op, r);
-        } else if is!(InsertElementOp) {
-            let mut a = self.get(opnds[0]);
-            let e = self.get1(opnds[1]);
-            match self.const_int(opnds[2]) {
-                Some(i) => a[i as usize] = e,
-                None => {
-                    let (p, es, t) = self.spill_vec(opnds[0], &a);
-                    let addr = self.dyn_index(p, opnds[2], es);
-                    self.store(t, e, addr, 0);
-                    for (i, x) in a.iter_mut().enumerate() {
-                        *x = self.load(t, p, i as u64 * es);
-                    }
-                }
-            }
-            self.set(op, a);
-        } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
-            let r = wleaves(ctx, self.res_ty(op))
-                .into_iter()
-                .map(|(_, t)| self.leafc(t, 0))
-                .collect();
-            self.set(op, r);
-        } else {
-            panic!("pliron->wasm: unsupported op {id}");
-        }
-    }
-
-    fn raw2(&mut self, x: WV, y: WV, _w: u32) -> (WV, WV) {
-        (x, y)
-    }
-
-    fn sext1(&mut self, x: WV, y: WV, w: u32) -> (WV, WV) {
-        (self.sext(x, w), y)
-    }
-
-    fn sext2(&mut self, x: WV, y: WV, w: u32) -> (WV, WV) {
-        (self.sext(x, w), self.sext(y, w))
-    }
-
-    /// 128-bit integer arithmetic on (lo, hi) pairs.
-    fn i128_op(&mut self, op: Ptr<Operation>, id: pliron::op::OpId, opnds: &[Value]) {
-        macro_rules! is {
-            ($t:ty) => {
-                id == <$t>::get_opid_static()
-            };
-        }
-        let a = self.get(opnds[0]);
-        let b = self.get(opnds[1]);
-        let i64s = [WT::I64; 4];
-        let r: Vals = if is!(AndOp) || is!(OrOp) || is!(XorOp) {
-            let o = if is!(AndOp) {
-                O::I64And
-            } else if is!(OrOp) {
-                O::I64Or
-            } else {
-                O::I64Xor
-            };
-            smallvec![
-                self.op(o, &[a[0], b[0]], WT::I64),
-                self.op(o, &[a[1], b[1]], WT::I64)
-            ]
-        } else if is!(AddOp) {
-            self.add128(&a, &b)
-        } else if is!(SubOp) {
-            self.sub128(&a, &b)
-        } else if is!(MulOp) {
-            let (lo, h) = self.mul64(a[0], b[0]);
-            let x = self.op(O::I64Mul, &[a[0], b[1]], WT::I64);
-            let y = self.op(O::I64Mul, &[a[1], b[0]], WT::I64);
-            let h = self.op(O::I64Add, &[h, x], WT::I64);
-            smallvec![lo, self.op(O::I64Add, &[h, y], WT::I64)]
-        } else if is!(ShlOp) || is!(LShrOp) || is!(AShrOp) {
-            self.shift128(id, &a, b[0])
-        } else {
-            let name = if is!(UDivOp) {
-                "__udivti3"
-            } else if is!(SDivOp) {
-                "__divti3"
-            } else if is!(URemOp) {
-                "__umodti3"
-            } else if is!(SRemOp) {
-                "__modti3"
-            } else {
-                panic!("i128 {id}")
-            };
-            self.call_named(name, &[a[0], a[1], b[0], b[1]], &i64s, &[WT::I64, WT::I64])
-        };
-        self.set(op, r);
-    }
-
-    /// Full 64x64 -> 128-bit unsigned product as (lo, hi).
-    fn mul64(&mut self, a: WV, b: WV) -> (WV, WV) {
-        let m = self.i64c(0xffff_ffff);
-        let s = self.i64c(32);
-        let al = self.op(O::I64And, &[a, m], WT::I64);
-        let ah = self.op(O::I64ShrU, &[a, s], WT::I64);
-        let bl = self.op(O::I64And, &[b, m], WT::I64);
-        let bh = self.op(O::I64ShrU, &[b, s], WT::I64);
-        let p0 = self.op(O::I64Mul, &[al, bl], WT::I64);
-        let p1 = self.op(O::I64Mul, &[al, bh], WT::I64);
-        let p2 = self.op(O::I64Mul, &[ah, bl], WT::I64);
-        let p3 = self.op(O::I64Mul, &[ah, bh], WT::I64);
-        let p0h = self.op(O::I64ShrU, &[p0, s], WT::I64);
-        let p1l = self.op(O::I64And, &[p1, m], WT::I64);
-        let p2l = self.op(O::I64And, &[p2, m], WT::I64);
-        let mid = self.op(O::I64Add, &[p0h, p1l], WT::I64);
-        let mid = self.op(O::I64Add, &[mid, p2l], WT::I64);
-        let p0l = self.op(O::I64And, &[p0, m], WT::I64);
-        let midl = self.op(O::I64Shl, &[mid, s], WT::I64);
-        let lo = self.op(O::I64Or, &[p0l, midl], WT::I64);
-        let p1h = self.op(O::I64ShrU, &[p1, s], WT::I64);
-        let p2h = self.op(O::I64ShrU, &[p2, s], WT::I64);
-        let midh = self.op(O::I64ShrU, &[mid, s], WT::I64);
-        let hi = self.op(O::I64Add, &[p3, p1h], WT::I64);
-        let hi = self.op(O::I64Add, &[hi, p2h], WT::I64);
-        let hi = self.op(O::I64Add, &[hi, midh], WT::I64);
-        (lo, hi)
-    }
-
-    /// Branchless 128-bit shl/lshr/ashr by `amt` (low word of the i128 amount).
-    fn shift128(&mut self, id: pliron::op::OpId, a: &[WV], amt: WV) -> Vals {
-        let (lo, hi) = (a[0], a[1]);
-        let c63 = self.i64c(63);
-        let c64 = self.i64c(64);
-        let c1 = self.i64c(1);
-        let k = self.op(O::I64And, &[amt, c63], WT::I64);
-        let inv = self.op(O::I64Sub, &[c63, k], WT::I64);
-        let big = self.op(O::I64And, &[amt, c64], WT::I64);
-        let big = self.op(O::I64Eqz, &[big], WT::I32);
-        let big = self.op(O::I32Eqz, &[big], WT::I32);
-        if id == ShlOp::get_opid_static() {
-            let lo_sh = self.op(O::I64Shl, &[lo, k], WT::I64);
-            let h = self.op(O::I64Shl, &[hi, k], WT::I64);
-            let c = self.op(O::I64ShrU, &[lo, c1], WT::I64);
-            let c = self.op(O::I64ShrU, &[c, inv], WT::I64);
-            let hi_sh = self.op(O::I64Or, &[h, c], WT::I64);
-            let z = self.i64c(0);
-            smallvec![self.sel(big, z, lo_sh), self.sel(big, lo_sh, hi_sh)]
-        } else {
-            let arith = id == AShrOp::get_opid_static();
-            let l = self.op(O::I64ShrU, &[lo, k], WT::I64);
-            let c = self.op(O::I64Shl, &[hi, c1], WT::I64);
-            let c = self.op(O::I64Shl, &[c, inv], WT::I64);
-            let lo_sh = self.op(O::I64Or, &[l, c], WT::I64);
-            let hi_sh = self.op(
-                if arith { O::I64ShrS } else { O::I64ShrU },
-                &[hi, k],
-                WT::I64,
-            );
-            let fill = if arith {
-                self.op(O::I64ShrS, &[hi, c63], WT::I64)
-            } else {
-                self.i64c(0)
-            };
-            smallvec![self.sel(big, hi_sh, lo_sh), self.sel(big, fill, hi_sh)]
-        }
-    }
-
-    fn add128(&mut self, a: &[WV], b: &[WV]) -> Vals {
-        let lo = self.op(O::I64Add, &[a[0], b[0]], WT::I64);
-        let c = self.op(O::I64LtU, &[lo, a[0]], WT::I32);
-        let c = self.op(O::I64ExtendI32U, &[c], WT::I64);
-        let hi = self.op(O::I64Add, &[a[1], b[1]], WT::I64);
-        let hi = self.op(O::I64Add, &[hi, c], WT::I64);
-        smallvec![lo, hi]
-    }
-
-    fn sub128(&mut self, a: &[WV], b: &[WV]) -> Vals {
-        let lo = self.op(O::I64Sub, &[a[0], b[0]], WT::I64);
-        let c = self.op(O::I64LtU, &[a[0], b[0]], WT::I32);
-        let c = self.op(O::I64ExtendI32U, &[c], WT::I64);
-        let hi = self.op(O::I64Sub, &[a[1], b[1]], WT::I64);
-        let hi = self.op(O::I64Sub, &[hi, c], WT::I64);
-        smallvec![lo, hi]
-    }
-
-    fn spill_vec(&mut self, v: Value, a: &Vals) -> (WV, u64, ClType) {
-        let (sz, al) = size_align(self.ctx, v.get_type(self.ctx));
-        let p = self.slot(sz, al);
-        let lv = wleaves(self.ctx, v.get_type(self.ctx));
-        let es = sz / a.len() as u64;
-        for (x, (o, t)) in a.iter().zip(&lv) {
-            self.store(*t, *x, p, *o);
-        }
-        (p, es, lv[0].1)
-    }
-
-    /// `base + idx * scale` with the index converted to i32.
-    fn dyn_index(&mut self, base: WV, idx: Value, scale: u64) -> WV {
-        let w = self.width(idx.get_type(self.ctx));
-        let xs = self.get(idx);
-        let x = if w > 64 { xs[0] } else { self.sext(xs[0], w) };
-        let x = self.to_wide(x, false, true);
-        let x = if scale == 1 {
-            x
-        } else {
-            let s = self.i32c(scale as u32);
-            self.op(O::I32Mul, &[x, s], WT::I32)
-        };
-        self.op(O::I32Add, &[base, x], WT::I32)
-    }
-
-    fn lower_gep(&mut self, op: Ptr<Operation>, base: Value) {
-        use pliron_llvm::ops::GepIndex;
-        let ctx = self.ctx;
-        let gep = Operation::get_op::<GetElementPtrOp>(op, ctx).unwrap();
-        let idxs = gep.indices(ctx);
-        let mut cur = gep.src_elem_type(ctx);
-        let mut addr = self.get1(base);
-        for (k, idx) in idxs.iter().enumerate() {
-            let c = match idx {
-                GepIndex::Constant(c) => Some(*c as i128),
-                GepIndex::Value(v) => self.const_int(*v),
-            };
-            let scale;
-            if k == 0 {
-                scale = size_align(ctx, cur).0;
-            } else {
-                match classify(ctx, cur) {
-                    TyK::Struct(fs, packed) => {
-                        let i = c.expect("struct GEP index must be constant") as usize;
-                        let offs = struct_offsets(ctx, &fs, packed).0;
-                        addr = self.add_imm(addr, offs[i] as i64);
-                        cur = fs[i];
-                        continue;
-                    }
-                    TyK::Array(e, _) | TyK::Vector(e, _) => {
-                        cur = e;
-                        scale = size_align(ctx, e).0;
-                    }
-                    k => panic!("GEP into {k:?}"),
-                }
-            }
-            match (c, idx) {
-                (Some(c), _) => addr = self.add_imm(addr, (c as i64).wrapping_mul(scale as i64)),
-                (None, GepIndex::Value(v)) => addr = self.dyn_index(addr, *v, scale),
-                _ => unreachable!(),
-            }
-        }
-        self.set1(op, addr);
-    }
-
-    fn lower_call(&mut self, op: Ptr<Operation>) {
-        let ctx = self.ctx;
-        let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
-        // panic=unwind only: where an in-flight unwind is delivered.
-        let landing = self.st.invokes.get(&op).map(|&(b, _)| b);
-        if landing.is_some() && !self.o.unwind {
-            panic!("invoke on wasm needs panic=unwind");
-        }
-        let info = &self.st.calls[&op];
-        let fn_ty = info.fn_ty;
-        let exts = info.exts.clone();
-        let sigd = wsig(ctx, fn_ty);
-        let rets = sigd.returns.clone();
-        let mut wargs = Vec::new();
-        let (nfixed, var_arg) = match classify(ctx, fn_ty) {
-            TyK::Func(_, a, v) => (a.len(), v),
-            _ => unreachable!(),
-        };
-        let mut va_args: Vec<Value> = Vec::new();
-        for (i, a) in call.args(ctx).into_iter().enumerate() {
-            if var_arg && i >= nfixed {
-                va_args.push(a);
-                continue;
-            }
-            let vs = self.get(a);
-            if let Some(ArgExt::ByVal(n)) = exts.params.get(i).copied() {
-                let dst = self.slot(n as u64, 16);
-                let len = self.i32c(n);
-                let mem = self.o.mem;
-                self.op0(
-                    O::MemoryCopy {
-                        dst_mem: mem,
-                        src_mem: mem,
-                    },
-                    &[dst, vs[0], len],
-                );
-                wargs.push(dst);
-            } else {
-                wargs.extend(vs);
-            }
-        }
-        if var_arg {
-            // wasm C ABI (tool-conventions BasicCABI): each vararg sits at
-            // its natural alignment and occupies align_up(size, 4) bytes —
-            // clang's emitVoidPtrVAArg with a 4-byte slot. Aggregates other
-            // than single-element structs are indirect: the slot holds a
-            // pointer to a caller-side copy.
-            let mut off = 0u64;
-            let mut plan = Vec::new();
-            for &a in &va_args {
-                let ty = a.get_type(ctx);
-                let ind = va_indirect(ctx, ty);
-                let (size, align) = if ind { (4, 4) } else { size_align(ctx, ty) };
-                off = align_to(off, align);
-                let slot = off;
-                off += align_to(size, 4);
-                plan.push((a, ty, ind, slot));
-            }
-            let buf = self.slot(off.max(1), 16);
-            for (a, ty, ind, slot) in plan {
-                if ind {
-                    let (sz, al) = size_align(ctx, ty);
-                    let dst = self.slot(sz.max(1), al.max(1));
-                    for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
-                        self.store(lt, v, dst, lo);
-                    }
-                    self.store(clt::I32, dst, buf, slot);
-                } else {
-                    for ((lo, lt), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
-                        self.store(lt, v, buf, slot + lo);
-                    }
-                }
-            }
-            wargs.push(buf);
-        }
-        // core::arch::wasm32 memory intrinsics are declared as `llvm.*`
-        // link_name functions, which become `__pliron_llvm_*` symbols.
-        if let CallOpCallable::Direct(ident) = call.callee(ctx) {
-            let st = self.st;
-            let sym = &st.ident_to_sym[&ident.to_string()];
-            let mem = self.o.mem;
-            if sym.starts_with("__pliron_llvm_wasm_memory_grow") {
-                let v = self.op(O::MemoryGrow { mem }, &[wargs[1]], WT::I32);
-                return self.set(op, smallvec![v]);
-            }
-            if sym.starts_with("__pliron_llvm_wasm_memory_size") {
-                let v = self.op(O::MemorySize { mem }, &[], WT::I32);
-                return self.set(op, smallvec![v]);
-            }
-            // wasm EH intrinsics on the emulated-EH flag/exception words.
-            if sym == "__pliron_llvm_wasm_throw" || sym == "llvm.wasm.throw" {
-                let p = self.eh_addr();
-                self.store(clt::I32, wargs[1], p, 4);
-                let one = self.i32c(1);
-                self.store(clt::I32, one, p, 0);
-                self.eh_check(None);
-                return;
-            }
-            if sym == "__pliron_llvm_wasm_rethrow" || sym == "llvm.wasm.rethrow" {
-                let p = self.eh_addr();
-                let one = self.i32c(1);
-                self.store(clt::I32, one, p, 0);
-                self.eh_check(None);
-                return;
-            }
-            if sym == "__pliron_llvm_wasm_get_exception" || sym == "llvm.wasm.get_exception" {
-                let p = self.eh_addr();
-                let v = self.load(clt::I32, p, 4);
-                return self.set(op, smallvec![v]);
-            }
-            if sym == "__pliron_llvm_wasm_get_ehselector"
-                || sym == "__pliron_llvm_wasm_landingpad_index"
-                || sym == "llvm.wasm.get_ehselector"
-                || sym == "llvm.wasm.landingpad_index"
-            {
-                let v = self.i32c(0);
-                return self.set(op, smallvec![v]);
-            }
-            if let Some((o, n, rt)) = vw_intrinsic(sym) {
-                let v = self.op(o, &wargs[..n], rt);
-                return self.set(op, smallvec![v]);
-            }
-        }
-        let direct = match call.callee(ctx) {
-            CallOpCallable::Direct(ident) => {
-                let sym = self.st.ident_to_sym[&ident.to_string()].clone();
-                match self.o.fidx.get(&sym).copied() {
-                    Some(i) if self.o.funcs[i].ty == Some(fn_ty) => Ok(i),
-                    _ => Err(self.mat(fn_ty, ConstVal::Sym { sym, off: 0 })[0]),
-                }
-            }
-            CallOpCallable::Indirect(v) => Err(self.get1(v)),
-        };
-        let rs = match direct {
-            Ok(i) => self.opn(
-                O::Call {
-                    function_index: Func::new(i),
-                },
-                &wargs,
-                &rets,
-            ),
-            Err(callee) => {
-                let sig_index = self.o.sig(sigd);
-                wargs.push(callee);
-                let table_index = self.o.table;
-                self.opn(
-                    O::CallIndirect {
-                        sig_index,
-                        table_index,
-                    },
-                    &wargs,
-                    &rets,
-                )
-            }
-        };
-        if op.deref(ctx).get_num_results() > 0 {
-            self.set(op, rs);
-        }
-        self.eh_check(landing);
-    }
-
-    fn fcvt_sat(&mut self, signed: bool, w: u32, x: WV) -> Vals {
-        let f64 = self.ty_of(x) == WT::F64;
-        if w == 128 {
-            let name = match (signed, f64) {
-                (true, false) => "__fixsfti",
-                (true, true) => "__fixdfti",
-                (false, false) => "__fixunssfti",
-                (false, true) => "__fixunsdfti",
-            };
-            let ft = self.ty_of(x);
-            return self.call_named(name, &[x], &[ft], &[WT::I64, WT::I64]);
-        }
-        let wide = w > 32;
-        let o = match (wide, signed, f64) {
-            (false, true, false) => O::I32TruncSatF32S,
-            (false, false, false) => O::I32TruncSatF32U,
-            (false, true, true) => O::I32TruncSatF64S,
-            (false, false, true) => O::I32TruncSatF64U,
-            (true, true, false) => O::I64TruncSatF32S,
-            (true, false, false) => O::I64TruncSatF32U,
-            (true, true, true) => O::I64TruncSatF64S,
-            (true, false, true) => O::I64TruncSatF64U,
-        };
-        let r = self.op(o, &[x], if wide { WT::I64 } else { WT::I32 });
-        if w == 32 || w == 64 {
-            return smallvec![r];
-        }
-        assert!(w < 32, "fptoint to i{w}");
-        let r = if signed {
-            let lo = self.i32c((-(1i64 << (w - 1))) as u32);
-            let hi = self.i32c(((1i64 << (w - 1)) - 1) as u32);
-            let c = self.op(O::I32LtS, &[r, lo], WT::I32);
-            let r = self.sel(c, lo, r);
-            let c = self.op(O::I32GtS, &[r, hi], WT::I32);
-            self.sel(c, hi, r)
-        } else {
-            let hi = self.i32c(((1u64 << w) - 1) as u32);
-            let c = self.op(O::I32GtU, &[r, hi], WT::I32);
-            self.sel(c, hi, r)
-        };
-        smallvec![self.norm(r, w)]
-    }
-
-    fn bswap(&mut self, x: WV, w: u32) -> WV {
-        let wide = w > 32;
-        let sh = |s: &mut Self, x: WV, k: u64, left: bool| {
-            let c = s.ic(w, k);
-            let o = match (wide, left) {
-                (false, true) => O::I32Shl,
-                (false, false) => O::I32ShrU,
-                (true, true) => O::I64Shl,
-                (true, false) => O::I64ShrU,
-            };
-            s.op(o, &[x, c], s.ty_of(x))
-        };
-        let and = |s: &mut Self, x: WV, m: u64| {
-            let c = s.ic(w, m);
-            s.ib(w, O::I32And, O::I64And, x, c)
-        };
-        let or = |s: &mut Self, x: WV, y: WV| s.ib(w, O::I32Or, O::I64Or, x, y);
-        // Swap adjacent groups of `k` bits selected by `m`.
-        let swap = |s: &mut Self, x: WV, k: u64, m: u64| {
-            let a = and(s, x, m);
-            let a = sh(s, a, k, true);
-            let b = sh(s, x, k, false);
-            let b = and(s, b, m);
-            or(s, a, b)
-        };
-        match w {
-            8 => x,
-            16 => {
-                let r = swap(self, x, 8, 0x00ff);
-                self.norm(r, 16)
-            }
-            32 => {
-                let x = swap(self, x, 8, 0x00ff_00ff);
-                let c = self.i32c(16);
-                self.op(O::I32Rotl, &[x, c], WT::I32)
-            }
-            64 => {
-                let x = swap(self, x, 8, 0x00ff_00ff_00ff_00ff);
-                let x = swap(self, x, 16, 0x0000_ffff_0000_ffff);
-                let c = self.i64c(32);
-                self.op(O::I64Rotl, &[x, c], WT::I64)
-            }
-            w => panic!("bswap i{w}"),
-        }
-    }
-
-    fn bitrev(&mut self, x: WV, w: u32) -> WV {
-        let wide = w > 32;
-        let mut x = x;
-        for (k, m) in [
-            (1u64, 0x5555_5555_5555_5555u64),
-            (2, 0x3333_3333_3333_3333),
-            (4, 0x0f0f_0f0f_0f0f_0f0f),
-        ] {
-            let m = if wide { m } else { m & 0xffff_ffff };
-            let c = self.ic(w, k);
-            let mm = self.ic(w, m);
-            let (shl, shr, and, or) = if wide {
-                (O::I64Shl, O::I64ShrU, O::I64And, O::I64Or)
-            } else {
-                (O::I32Shl, O::I32ShrU, O::I32And, O::I32Or)
-            };
-            let t = self.ty_of(x);
-            let a = self.op(and, &[x, mm], t);
-            let a = self.op(shl, &[a, c], t);
-            let b = self.op(shr, &[x, c], t);
-            let b = self.op(and, &[b, mm], t);
-            x = self.op(or, &[a, b], t);
-        }
-        if w == 8 {
-            self.norm(x, 8)
-        } else {
-            self.bswap(x, w)
-        }
-    }
-
-    fn lower_intrinsic(&mut self, op: Ptr<Operation>, opnds: &[Value]) {
-        let name = self.st.intrinsics[&op].clone();
-        let name = name.as_str();
-        let ctx = self.ctx;
-        let w = |s: &Self, i: usize| s.width(opnds[i].get_type(ctx));
-        match name {
-            "llvm.memcpy" | "llvm.memmove" | "llvm.memset" => {
-                // Small constant lengths become plain loads and stores: a
-                // `memory.copy`/`memory.fill` instruction costs far more than
-                // the access it replaces in V8 (LLVM expands these too).
-                if let Some(c) = self.const_int(opnds[2])
-                    && (0..=32).contains(&c)
-                {
-                    let n = c as u64;
-                    let d = self.get1(opnds[0]);
-                    let mut chunks: Vec<(u64, u64)> = Vec::new(); // (offset, bytes)
-                    let mut off = 0;
-                    for w in [8u64, 4, 2, 1] {
-                        while n - off >= w {
-                            chunks.push((off, w));
-                            off += w;
-                        }
-                    }
-                    let lt = |w: u64| match w {
-                        8 => clt::I64,
-                        4 => clt::I32,
-                        2 => clt::I16,
-                        _ => clt::I8,
-                    };
-                    if name == "llvm.memset" {
-                        let v = self.get1(opnds[1]);
-                        let b8 = {
-                            let m = self.i32c(0xff);
-                            self.op(O::I32And, &[v, m], WT::I32)
-                        };
-                        for &(o, w) in &chunks {
-                            let x = match w {
-                                1 => b8,
-                                2 => {
-                                    let k = self.i32c(0x0101);
-                                    self.op(O::I32Mul, &[b8, k], WT::I32)
-                                }
-                                4 => {
-                                    let k = self.i32c(0x0101_0101);
-                                    self.op(O::I32Mul, &[b8, k], WT::I32)
-                                }
-                                _ => {
-                                    let w64 = self.op(O::I64ExtendI32U, &[b8], WT::I64);
-                                    let k = self.i64c(0x0101_0101_0101_0101);
-                                    self.op(O::I64Mul, &[w64, k], WT::I64)
-                                }
-                            };
-                            self.store(lt(w), x, d, o);
-                        }
-                    } else {
-                        let s = self.get1(opnds[1]);
-                        // all loads first: correct for overlapping memmove
-                        let vals: Vec<WV> = chunks
-                            .iter()
-                            .map(|&(o, w)| self.load(lt(w), s, o))
-                            .collect();
-                        for (&(o, w), v) in chunks.iter().zip(vals) {
-                            self.store(lt(w), v, d, o);
-                        }
-                    }
-                    return;
-                }
-                let d = self.get1(opnds[0]);
-                let s = self.get1(opnds[1]);
-                let n = self.get(opnds[2]);
-                let n = self.to_wide(n[0], false, false);
-                let mem = self.o.mem;
-                if name == "llvm.memset" {
-                    self.op0(O::MemoryFill { mem }, &[d, s, n]);
-                } else {
-                    self.op0(
-                        O::MemoryCopy {
-                            dst_mem: mem,
-                            src_mem: mem,
-                        },
-                        &[d, s, n],
-                    );
-                }
-                return;
-            }
-            "llvm.trap" => {
-                self.term(Terminator::Unreachable);
-                return;
-            }
-            // Storage-liveness markers for slotmerge (native); wasm has no
-            // explicit stack slots to color, so they're a plain no-op.
-            "llvm.lifetime.start" | "llvm.lifetime.end" => {
-                return;
-            }
-            // Landing-pad read of the in-flight exception: delivers the
-            // exception pointer and clears the unwind flag so the handler's
-            // own calls work normally.
-            "pliron.eh.exn" => {
-                let p = self.eh_addr();
-                let exn = self.load(clt::I32, p, 4);
-                let z = self.i32c(0);
-                self.store(clt::I32, z, p, 0);
-                self.set(op, smallvec![exn]);
-                return;
-            }
-            "pliron.va.buf" => {
-                let v = self
-                    .va_buf
-                    .expect("pliron.va.buf in a non-variadic function");
-                self.set(op, smallvec![v]);
-                return;
-            }
-            // Rethrow: the unwind continues out of this function.
-            "pliron.eh.rethrow" => {
-                let p = self.eh_addr();
-                let one = self.i32c(1);
-                self.store(clt::I32, one, p, 0);
-                let (sp, sp0) = (self.o.sp, self.sp0);
-                self.op0(O::GlobalSet { global_index: sp }, &[sp0]);
-                let values: Vec<WV> = self.rets.clone().iter().map(|&t| self.zero_of(t)).collect();
-                self.term(Terminator::Return { values });
-                return;
-            }
-            _ => {}
-        }
-        let a: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
-        let a0 = a[0][0];
-        let r: Vals = match name {
-            "llvm.ctpop" | "llvm.ctlz" | "llvm.cttz" | "llvm.cttz_nz" if w(self, 0) == 128 => {
-                let (lo, hi) = (a[0][0], a[0][1]);
-                let r = match name {
-                    "llvm.ctpop" => {
-                        let x = self.op(O::I64Popcnt, &[lo], WT::I64);
-                        let y = self.op(O::I64Popcnt, &[hi], WT::I64);
-                        self.op(O::I64Add, &[x, y], WT::I64)
-                    }
-                    _ => {
-                        let (first, second, o) = if name == "llvm.ctlz" {
-                            (hi, lo, O::I64Clz)
-                        } else {
-                            (lo, hi, O::I64Ctz)
-                        };
-                        let z = self.op(O::I64Eqz, &[first], WT::I32);
-                        let f = self.op(o, &[first], WT::I64);
-                        let s = self.op(o, &[second], WT::I64);
-                        let c = self.i64c(64);
-                        let s = self.op(O::I64Add, &[s, c], WT::I64);
-                        self.sel(z, s, f)
-                    }
-                };
-                smallvec![r, self.i64c(0)]
-            }
-            "llvm.ctpop" => {
-                let w = w(self, 0);
-                smallvec![if w > 32 {
-                    self.op(O::I64Popcnt, &[a0], WT::I64)
-                } else {
-                    self.op(O::I32Popcnt, &[a0], WT::I32)
-                }]
-            }
-            "llvm.ctlz" => {
-                let w = w(self, 0);
-                let (o, k) = if w > 32 {
-                    (O::I64Clz, 64)
-                } else {
-                    (O::I32Clz, 32)
-                };
-                let t = self.ty_of(a0);
-                let r = self.op(o, &[a0], t);
-                smallvec![if w == k {
-                    r
-                } else {
-                    let c = self.ic(w, (k - w) as u64);
-                    self.ib(w, O::I32Sub, O::I64Sub, r, c)
-                }]
-            }
-            "llvm.cttz" | "llvm.cttz_nz" => {
-                let w = w(self, 0);
-                let (o, k) = if w > 32 {
-                    (O::I64Ctz, 64)
-                } else {
-                    (O::I32Ctz, 32)
-                };
-                let x = if w == k || name == "llvm.cttz_nz" {
-                    a0
-                } else {
-                    let c = self.ic(w, 1u64 << w);
-                    self.ib(w, O::I32Or, O::I64Or, a0, c)
-                };
-                let t = self.ty_of(x);
-                smallvec![self.op(o, &[x], t)]
-            }
-            "llvm.bswap" if w(self, 0) == 128 => {
-                let lo = self.bswap(a[0][1], 64);
-                let hi = self.bswap(a[0][0], 64);
-                smallvec![lo, hi]
-            }
-            "llvm.bswap" => {
-                let w = w(self, 0);
-                smallvec![self.bswap(a0, w)]
-            }
-            "llvm.bitreverse" if w(self, 0) == 128 => {
-                let lo = self.bitrev(a[0][1], 64);
-                let hi = self.bitrev(a[0][0], 64);
-                smallvec![lo, hi]
-            }
-            "llvm.bitreverse" => {
-                let w = w(self, 0);
-                smallvec![self.bitrev(a0, w)]
-            }
-            "llvm.fshl" | "llvm.fshr" if w(self, 0) == 128 => {
-                let c127 = self.i64c(127);
-                let s = self.op(O::I64And, &[a[2][0], c127], WT::I64);
-                let c128 = self.i64c(128);
-                let inv = self.op(O::I64Sub, &[c128, s], WT::I64);
-                let left = name == "llvm.fshl";
-                let (sx, sy) = if left { (s, inv) } else { (inv, s) };
-                let (x, y) = ([a[0][0], a[0][1]], [a[1][0], a[1][1]]);
-                let hi = self.shift128(ShlOp::get_opid_static(), &x, sx);
-                let lo = self.shift128(LShrOp::get_opid_static(), &y, sy);
-                let c0 = self.op(O::I64Or, &[hi[0], lo[0]], WT::I64);
-                let c1 = self.op(O::I64Or, &[hi[1], lo[1]], WT::I64);
-                let z = self.op(O::I64Eqz, &[s], WT::I32);
-                let keep = if left { x } else { y };
-                smallvec![self.sel(z, keep[0], c0), self.sel(z, keep[1], c1)]
-            }
-            "llvm.fshl" | "llvm.fshr" => {
-                let w = w(self, 0);
-                assert!(w <= 64, "funnel shift i{w}");
-                let (x, y) = (a[0][0], a[1][0]);
-                let m = self.ic(w, w as u64 - 1);
-                let s = self.ib(w, O::I32And, O::I64And, a[2][0], m);
-                let left = name == "llvm.fshl";
-                if x == y && (w == 32 || w == 64) {
-                    let o = match (w > 32, left) {
-                        (false, true) => O::I32Rotl,
-                        (false, false) => O::I32Rotr,
-                        (true, true) => O::I64Rotl,
-                        (true, false) => O::I64Rotr,
-                    };
-                    let t = self.ty_of(x);
-                    smallvec![self.op(o, &[x, s], t)]
-                } else {
-                    let wv = self.ic(w, w as u64);
-                    let inv = self.ib(w, O::I32Sub, O::I64Sub, wv, s);
-                    let (hi, lo) = if left {
-                        (
-                            self.ib(w, O::I32Shl, O::I64Shl, x, s),
-                            self.ib(w, O::I32ShrU, O::I64ShrU, y, inv),
-                        )
-                    } else {
-                        (
-                            self.ib(w, O::I32Shl, O::I64Shl, x, inv),
-                            self.ib(w, O::I32ShrU, O::I64ShrU, y, s),
-                        )
-                    };
-                    let comb = self.ib(w, O::I32Or, O::I64Or, hi, lo);
-                    let comb = self.norm(comb, w);
-                    let zero = self.ic(w, 0);
-                    let z = self.op(
-                        if w > 32 { O::I64Eq } else { O::I32Eq },
-                        &[s, zero],
-                        WT::I32,
-                    );
-                    let keep = if left { x } else { y };
-                    smallvec![self.sel(z, keep, comb)]
-                }
-            }
-            n if n.ends_with(".with.overflow") => {
-                let w = w(self, 0);
-                let (r, of) = self.overflow_op(n, w, &a[0], &a[1]);
-                let mut v = r;
-                v.push(of);
-                v
-            }
-            "llvm.fptoui.sat" | "llvm.fptosi.sat" => {
-                let w = self.width(self.res_ty(op));
-                self.fcvt_sat(name == "llvm.fptosi.sat", w, a0)
-            }
-            _ => {
-                let t = self.ty_of(a0);
-                let f64 = t == WT::F64;
-                let un = |o32: O, o64: O| if f64 { o64 } else { o32 };
-                let native = match name {
-                    "llvm.sqrt" => Some(un(O::F32Sqrt, O::F64Sqrt)),
-                    "llvm.fabs" => Some(un(O::F32Abs, O::F64Abs)),
-                    "llvm.floor" => Some(un(O::F32Floor, O::F64Floor)),
-                    "llvm.ceil" => Some(un(O::F32Ceil, O::F64Ceil)),
-                    "llvm.trunc" => Some(un(O::F32Trunc, O::F64Trunc)),
-                    "llvm.roundeven" => Some(un(O::F32Nearest, O::F64Nearest)),
-                    "llvm.copysign" => Some(un(O::F32Copysign, O::F64Copysign)),
-                    "llvm.minimum" => Some(un(O::F32Min, O::F64Min)),
-                    "llvm.maximum" => Some(un(O::F32Max, O::F64Max)),
-                    _ => None,
-                };
-                let args: Vec<WV> = a.iter().map(|v| v[0]).collect();
-                if let Some(o) = native {
-                    smallvec![self.op(o, &args, t)]
-                } else if name == "llvm.fmuladd" {
-                    let m = self.op(un(O::F32Mul, O::F64Mul), &args[..2], t);
-                    smallvec![self.op(un(O::F32Add, O::F64Add), &[m, args[2]], t)]
-                } else if matches!(
-                    name,
-                    "llvm.fma"
-                        | "llvm.round"
-                        | "llvm.sin"
-                        | "llvm.cos"
-                        | "llvm.exp"
-                        | "llvm.exp2"
-                        | "llvm.log"
-                        | "llvm.log2"
-                        | "llvm.log10"
-                        | "llvm.pow"
-                        | "llvm.minnum"
-                        | "llvm.maxnum"
-                ) && matches!(t, WT::F32 | WT::F64)
-                {
-                    let base = match &name["llvm.".len()..] {
-                        "minnum" => "fmin",
-                        "maxnum" => "fmax",
-                        b => b,
-                    };
-                    let f = if f64 {
-                        base.to_string()
-                    } else {
-                        format!("{base}f")
-                    };
-                    let ps = vec![t; args.len()];
-                    self.call_named(&f, &args, &ps, &[t])
-                } else {
-                    panic!("pliron->wasm: unsupported intrinsic {name}")
-                }
-            }
-        };
-        self.set(op, r);
-    }
-
-    /// `llvm.{s,u}{add,sub,mul}.with.overflow`: (result leaves, overflow bit).
-    fn overflow_op(&mut self, n: &str, w: u32, a: &[WV], b: &[WV]) -> (Vals, WV) {
-        let signed = n.starts_with("llvm.s");
-        let kind = &n["llvm.s".len()..n.len() - ".with.overflow".len()];
-        if w == 128 {
-            return match kind {
-                "add" | "sub" => {
-                    let r = if kind == "add" {
-                        self.add128(a, b)
-                    } else {
-                        self.sub128(a, b)
-                    };
-                    let of = if signed {
-                        // add: (a^r)&(b^r) < 0; sub: (a^b)&(a^r) < 0, on the high word.
-                        let x = self.op(O::I64Xor, &[a[1], r[1]], WT::I64);
-                        let y = if kind == "add" {
-                            self.op(O::I64Xor, &[b[1], r[1]], WT::I64)
-                        } else {
-                            self.op(O::I64Xor, &[a[1], b[1]], WT::I64)
-                        };
-                        let m = self.op(O::I64And, &[x, y], WT::I64);
-                        let z = self.i64c(0);
-                        self.op(O::I64LtS, &[m, z], WT::I32)
-                    } else if kind == "add" {
-                        self.icmp(ICmpPredicateAttr::ULT, &r, a, 128)
-                    } else {
-                        self.icmp(ICmpPredicateAttr::ULT, a, b, 128)
-                    };
-                    (r, of)
-                }
-                _ => {
-                    let slot = self.slot(4, 4);
-                    let f = if signed {
-                        "__rust_i128_mulo"
-                    } else {
-                        "__rust_u128_mulo"
-                    };
-                    let r = self.call_named(
-                        f,
-                        &[a[0], a[1], b[0], b[1], slot],
-                        &[WT::I64, WT::I64, WT::I64, WT::I64, WT::I32],
-                        &[WT::I64, WT::I64],
-                    );
-                    let o = self.load(clt::I32, slot, 0);
-                    let z = self.i32c(0);
-                    (r, self.op(O::I32Ne, &[o, z], WT::I32))
-                }
-            };
-        }
-        let (x, y) = (a[0], b[0]);
-        if w < 32 {
-            // Exact in i32: compare the full result against its truncation.
-            let (x, y) = if signed {
-                (self.sext(x, w), self.sext(y, w))
-            } else {
-                (x, y)
-            };
-            let o = match kind {
-                "add" => O::I32Add,
-                "sub" => O::I32Sub,
-                _ => O::I32Mul,
-            };
-            let full = self.op(o, &[x, y], WT::I32);
-            let r = self.norm(full, w);
-            let back = if signed { self.sext(r, w) } else { r };
-            let of = self.op(O::I32Ne, &[back, full], WT::I32);
-            return (smallvec![r], of);
-        }
-        assert!(w == 32 || w == 64, "overflow op on i{w}");
-        let wide = w == 64;
-        let zero = self.ic(w, 0);
-        let lt_s = if wide { O::I64LtS } else { O::I32LtS };
-        let lt_u = if wide { O::I64LtU } else { O::I32LtU };
-        match kind {
-            "add" | "sub" => {
-                let r = if kind == "add" {
-                    self.ib(w, O::I32Add, O::I64Add, x, y)
-                } else {
-                    self.ib(w, O::I32Sub, O::I64Sub, x, y)
-                };
-                let of = if signed {
-                    let p = self.ib(w, O::I32Xor, O::I64Xor, x, r);
-                    let q = if kind == "add" {
-                        self.ib(w, O::I32Xor, O::I64Xor, y, r)
-                    } else {
-                        self.ib(w, O::I32Xor, O::I64Xor, x, y)
-                    };
-                    let m = self.ib(w, O::I32And, O::I64And, p, q);
-                    self.op(lt_s, &[m, zero], WT::I32)
-                } else if kind == "add" {
-                    self.op(lt_u, &[r, x], WT::I32)
-                } else {
-                    self.op(lt_u, &[x, y], WT::I32)
-                };
-                (smallvec![r], of)
-            }
-            _ if !wide => {
-                let xw = self.to_wide(x, true, signed);
-                let yw = self.to_wide(y, true, signed);
-                let p = self.op(O::I64Mul, &[xw, yw], WT::I64);
-                let r = self.op(O::I32WrapI64, &[p], WT::I32);
-                let back = self.to_wide(r, true, signed);
-                let of = self.op(O::I64Ne, &[back, p], WT::I32);
-                (smallvec![r], of)
-            }
-            _ if signed => {
-                let slot = self.slot(4, 4);
-                let r = self.call_named(
-                    "__mulodi4",
-                    &[x, y, slot],
-                    &[WT::I64, WT::I64, WT::I32],
-                    &[WT::I64],
-                )[0];
-                let o = self.load(clt::I32, slot, 0);
-                let z = self.i32c(0);
-                (smallvec![r], self.op(O::I32Ne, &[o, z], WT::I32))
-            }
-            _ => {
-                let (lo, hi) = self.mul64(x, y);
-                let z = self.i64c(0);
-                let of = self.op(O::I64Ne, &[hi, z], WT::I32);
-                (smallvec![lo], of)
-            }
-        }
-    }
-}
-
-/// Natural loops of the body: (header, member-blocks) pairs.
-fn wloops(b: &FunctionBody, cfg: &waffle::cfg::CFGInfo) -> Vec<(WBlock, FxHashSet<WBlock>)> {
-    let mut out = Vec::new();
-    for h in b.blocks.iter() {
-        let latch: Vec<WBlock> = b.blocks[h]
-            .preds
-            .iter()
-            .copied()
-            .filter(|&p| p == h || cfg.dominates(h, p))
-            .collect();
-        if latch.is_empty() {
-            continue;
-        }
-        // Blocks reaching a latch without crossing the header.
-        let mut body_set: FxHashSet<WBlock> = [h].into_iter().collect();
-        let mut wl = latch;
-        while let Some(x) = wl.pop() {
-            if body_set.insert(x) {
-                wl.extend(b.blocks[x].preds.iter().copied());
-            }
-        }
-        out.push((h, body_set));
-    }
-    out
-}
-
-/// Edges into `h` from outside the loop: (pred, target-index) pairs.
-fn outside_edges(b: &FunctionBody, h: WBlock, inloop: &FxHashSet<WBlock>) -> Vec<(WBlock, usize)> {
-    b.blocks[h]
-        .preds
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| !inloop.contains(p))
-        .map(|(j, _)| (b.blocks[h].preds[j], b.blocks[h].pos_in_pred_succ[j]))
-        .collect()
-}
-
-/// A loop header with several entry edges gets a forwarding preheader:
-/// `pre` params mirror `h`'s, its terminator forwards them, and all
-/// outside edges are retargeted to `pre`.
-fn mk_pre(b: &mut FunctionBody, h: WBlock, inloop: &FxHashSet<WBlock>) -> WBlock {
-    // Collect outside edges before pre's own edge exists.
-    let edges = outside_edges(b, h, inloop);
-    let pre = b.add_block();
-    let fwd: Vec<WV> = b.blocks[h]
-        .params
-        .clone()
-        .into_iter()
-        .map(|(t, _)| b.add_blockparam(pre, t))
-        .collect();
-    for (pr, tidx) in edges {
-        b.blocks[pr]
-            .terminator
-            .update_target(tidx, |t| t.block = pre);
-    }
-    b.set_terminator(
-        pre,
-        Terminator::Br {
-            target: BlockTarget {
-                block: h,
-                args: fwd,
-            },
-        },
-    );
-    b.recompute_edges();
-    pre
-}
-
-/// Loop optimizations on a finished waffle body: hoists speculatable
-/// loop-invariant ops (and immutable-global reads) to each loop's
-/// preheader, and strength-reduces `base + iv*K` addressing into
-/// induction-variable block params. The wasm path bypasses the CLIF
-/// pipeline, so this fills in for licm/indvars there.
-fn wloop_opt(
-    b: &mut FunctionBody,
-    sp: waffle::Global,
-    frozen: &FxHashMap<WV, u64>,
-    deref: &FxHashMap<WV, u64>,
-    funcs: &[FDecl],
-    nowrite: &FxHashMap<String, bool>,
-    fname: &str,
-) {
-    // Merge multi-entry loop headers so every loop has a preheader.
-    {
-        let cfg = waffle::cfg::CFGInfo::new(b);
-        for (h, inloop) in wloops(b, &cfg) {
-            let mut preds: Vec<WBlock> = outside_edges(b, h, &inloop)
-                .into_iter()
-                .map(|(p, _)| p)
-                .collect();
-            preds.sort();
-            preds.dedup();
-            if preds.len() > 1 {
-                mk_pre(b, h, &inloop);
-            }
-        }
-    }
-    let mut cfg = waffle::cfg::CFGInfo::new(b);
-    // LICM/indvars move and create insts, so track defining blocks in a
-    // live map rather than the (stale) CFGInfo.
-    let mut defb = cfg.def_block.clone();
-    let loops = wloops(b, &cfg);
-    for (h, inloop) in &loops {
-        let outside = outside_edges(b, *h, inloop);
-        if outside.is_empty() {
-            continue;
-        }
-        let mut preds: Vec<WBlock> = outside.iter().map(|&(p, _)| p).collect();
-        preds.sort();
-        preds.dedup();
-        if let [pre] = preds[..] {
-            loop_licm(
-                b, &cfg, &mut defb, inloop, pre, sp, frozen, deref, funcs, nowrite,
-            );
-        }
-        // Indvars to a fixed point: each new param may itself be the
-        // `pv` of a `mul(pv, K)` addressing site (e.g. `idx*4` where
-        // idx already strides), needing another pass to strength-reduce.
-        for _ in 0..4 {
-            let n0 = b.blocks[*h].params.len();
-            loop_indvars(b, &mut defb, inloop, *h);
-            if b.blocks[*h].params.len() == n0 {
-                break;
-            }
-        }
-        // Loop-closed exits: funnel leaked loop values through exit
-        // block params so cloning (wbcheck/unroll) is legal.
-        if crate::pass_enabled("PLIRON_WASM_SEAL") {
-            wseal_exits(b, &mut defb, &cfg, inloop, *h);
-        }
-    }
-    // Version loops on provably-passing bounds checks, innermost-first:
-    // an outer loop's clone must capture the already-versioned inner
-    // structure (guard + both clones) or its fast copy keeps running the
-    // checked inner loop. Membership recorded before a round's clone is
-    // stale for enclosing loops, so defer them to the next recollection.
-    let bcheck_off = crate::env_get("PLIRON_WASM_BCHECK") == Some("0");
-    if !bcheck_off {
-        let mut done: FxHashSet<WBlock> = FxHashSet::default();
-        for _ in 0..8 {
-            let mut work = wloops(b, &cfg);
-            work.sort_by_key(|(_, s)| s.len());
-            let mut this_round: Vec<WBlock> = Vec::new();
-            let mut any = false;
-            for (h, inloop) in &work {
-                if done.contains(h) {
-                    continue;
-                }
-                if this_round.iter().any(|&v| inloop.contains(&v)) {
-                    continue;
-                }
-                done.insert(*h);
-                if wbcheck(b, &mut defb, &cfg, inloop, *h, &work).is_some() {
-                    this_round.push(*h);
-                    any = true;
-                }
-            }
-            if !any {
-                break;
-            }
-            cfg = waffle::cfg::CFGInfo::new(b);
-        }
-    }
-    // Unroll innermost loops (bodies containing no other loop header).
-    // Recollect: wbcheck's fast clones introduce loop headers `loops`
-    // doesn't know — without this, a versioned outer loop looks
-    // innermost and unrolls *around* its still-checked inner loop
-    // instead of letting the clean inner loop unroll.
-    let unr = crate::env_get("PLIRON_WASM_UNROLL")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let uloops = wloops(b, &cfg);
-    for (h, inloop) in &uloops {
-        let innermost = uloops.iter().all(|(h2, _)| h2 == h || !inloop.contains(h2));
-        if innermost {
-            wunroll(b, &mut defb, &cfg, inloop, *h, unr, fname);
-        }
-    }
-    wdce(b, deref);
-}
-
-/// `PLIRON_WASM_TRIP=n`: splice a shared i32 counter check onto every
-/// latch edge. A loop spinning past `n` back-edges traps `unreachable`
-/// instead of hanging, and the trap names the function.
-fn wtrip_guard(b: &mut FunctionBody, g: waffle::Global, limit: u64) {
-    let cfg = waffle::cfg::CFGInfo::new(b);
-    let mut edges = Vec::new();
-    for (h, inloop) in wloops(b, &cfg) {
-        for (j, &p) in b.blocks[h].preds.iter().enumerate() {
-            if inloop.contains(&p) {
-                edges.push((h, p, b.blocks[h].pos_in_pred_succ[j]));
-            }
-        }
-    }
-    let mut trap = None;
-    for (h, p, tidx) in edges {
-        let chk = b.add_block();
-        let fwd: Vec<WV> = b.blocks[h]
-            .params
-            .clone()
-            .into_iter()
-            .map(|(t, _)| b.add_blockparam(chk, t))
-            .collect();
-        let c = b.add_op(chk, O::GlobalGet { global_index: g }, &[], &[WT::I32]);
-        let one = b.add_op(chk, O::I32Const { value: 1 }, &[], &[WT::I32]);
-        let c2 = b.add_op(chk, O::I32Add, &[c, one], &[WT::I32]);
-        b.add_op(chk, O::GlobalSet { global_index: g }, &[c2], &[]);
-        let lim = b.add_op(
-            chk,
-            O::I32Const {
-                value: limit as u32,
-            },
-            &[],
-            &[WT::I32],
-        );
-        let over = b.add_op(chk, O::I32GeU, &[c, lim], &[WT::I32]);
-        let t = *trap.get_or_insert_with(|| {
-            let t = b.add_block();
-            b.set_terminator(t, Terminator::Unreachable);
-            t
-        });
-        b.set_terminator(
-            chk,
-            Terminator::CondBr {
-                cond: over,
-                if_true: BlockTarget {
-                    block: t,
-                    args: vec![],
-                },
-                if_false: BlockTarget {
-                    block: h,
-                    args: fwd,
-                },
-            },
-        );
-        b.blocks[p]
-            .terminator
-            .update_target(tidx, |t| t.block = chk);
-    }
-    b.recompute_edges();
-}
-
-/// Move pure ops and non-SP global reads with all-invariant args to `pre`.
-/// Access size in bytes for load ops (stores excluded — hoisting a
-/// store is a different question entirely).
-fn load_bytes(op: &O) -> Option<u64> {
-    Some(match op {
-        O::I32Load { .. } | O::I64Load32S { .. } | O::I64Load32U { .. } | O::F32Load { .. } => 4,
-        O::I64Load { .. } | O::F64Load { .. } => 8,
-        O::I32Load8S { .. } | O::I32Load8U { .. } | O::I64Load8S { .. } | O::I64Load8U { .. } => 1,
-        O::I32Load16S { .. }
-        | O::I32Load16U { .. }
-        | O::I64Load16S { .. }
-        | O::I64Load16U { .. } => 2,
-        _ => return None,
-    })
-}
-
-/// Bytes written by a store op, `None` for non-stores.
-fn store_bytes(op: &O) -> Option<u64> {
-    Some(match op {
-        O::I32Store { .. } | O::F32Store { .. } | O::I64Store32 { .. } => 4,
-        O::I64Store { .. } | O::F64Store { .. } => 8,
-        O::I32Store8 { .. } | O::I64Store8 { .. } => 1,
-        O::I32Store16 { .. } | O::I64Store16 { .. } => 2,
-        O::V128Store { .. } => 16,
-        _ => return None,
-    })
-}
-
-/// Does `v` derive from the entry-level pointer `base`? `None` = no;
-/// `Some(None)` = derived at an unmeasurable offset; `Some(Some(k))` =
-/// exactly `base + k`. rustc's `noalias` means only `base`-derived
-/// pointers may touch `base`'s pointee inside the function, so `None`
-/// proves disjointness: a store through an unrelated pointer (a loaded
-/// pointer, a global, another param) cannot reach the pointee legally.
-fn derive_off(b: &FunctionBody, base: WV, v: WV, depth: u32) -> Option<Option<i64>> {
-    if depth > 8 {
-        return Some(None);
-    }
-    let v = b.resolve_alias(v);
-    if v == base {
-        return Some(Some(0));
-    }
-    match b.values[v] {
-        ValueDef::Operator(op @ (O::I32Add | O::I64Add | O::I32Sub | O::I64Sub), aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                return Some(None);
-            };
-            let sub = matches!(op, O::I32Sub | O::I64Sub);
-            if let Some(k) = wconst(b, y) {
-                let k = if sub { -k } else { k };
-                derive_off(b, base, x, depth + 1).map(|o| o.map(|e| e.wrapping_add(k)))
-            } else if let Some(k) = wconst(b, x).filter(|_| !sub) {
-                derive_off(b, base, y, depth + 1).map(|o| o.map(|e| e.wrapping_add(k)))
-            } else if derive_off(b, base, x, depth + 1).is_some()
-                || derive_off(b, base, y, depth + 1).is_some()
-            {
-                Some(None)
-            } else {
-                None
-            }
-        }
-        ValueDef::Operator(op, aa, _) if op.is_pure() => b.arg_pool[aa]
-            .iter()
-            .any(|&a| derive_off(b, base, a, depth + 1).is_some())
-            .then_some(None),
-        // A block arg or pick can carry `base` through; can't prove
-        // disjointness locally. An entry param other than `base` is a
-        // sibling pointer — disjoint under noalias.
-        ValueDef::BlockParam(blk, ..) => (blk != b.entry).then_some(None),
-        ValueDef::PickOutput(..) => Some(None),
-        _ => None,
-    }
-}
-
-/// A loop-internal write: a direct store, an in-module direct call whose
-/// callee's per-param write set can be resolved, or `Bail` for opaque
-/// effects (indirect/foreign calls, bulk-memory ops).
-enum Writer {
-    Store { base: WV, off: i64, sz: u64 },
-    Call { fi: usize, args: Vec<WV> },
-    Bail,
-}
-
-/// Everything in the loop that might write memory, collected once so
-/// several candidate loads share the scan.
-fn loop_writers(
-    b: &FunctionBody,
-    inloop: &FxHashSet<WBlock>,
-    funcs: &[FDecl],
-    nowrite: &FxHashMap<String, bool>,
-) -> Vec<Writer> {
-    let mut ws = Vec::new();
-    for &lb in inloop {
-        for &iv in &b.blocks[lb].insts {
-            let ValueDef::Operator(op, aa, _) = &b.values[iv] else {
-                continue;
-            };
-            if let (Some(sz), Some(m)) = (store_bytes(op), memarg_of(op)) {
-                if let Some(&base) = b.arg_pool[*aa].first() {
-                    ws.push(Writer::Store {
-                        base: b.resolve_alias(base),
-                        off: m.offset as i64,
-                        sz,
-                    });
-                }
-            } else if let O::Call { function_index } = op {
-                let fi = function_index.index();
-                // Write-free callees (possibly except noreturn paths,
-                // which a normal return never observes) can't clobber.
-                if nowrite.contains_key(&funcs[fi].name) {
-                    continue;
-                }
-                ws.push(Writer::Call {
-                    fi,
-                    args: b.arg_pool[*aa].to_vec(),
-                });
-            } else if !op.is_pure()
-                && load_bytes(op).is_none()
-                && !matches!(
-                    op,
-                    O::GlobalSet { .. } | O::TableSet { .. } | O::MemorySize { .. } | O::Nop
-                )
-            {
-                // Indirect calls, bulk-memory ops, atomics, anything
-                // else that might write unattributably.
-                ws.push(Writer::Bail);
-            }
-        }
-    }
-    ws
-}
-
-/// `v` chains back to `GlobalGet(sp)` through pure ops: the callee's own
-/// stack frame, which can't overlap a caller's noalias pointee.
-fn frame_based(cb: &FunctionBody, v: WV, sp: waffle::Global, depth: u32) -> bool {
-    if depth > 8 {
-        return false;
-    }
-    match cb.values[cb.resolve_alias(v)] {
-        ValueDef::Operator(O::GlobalGet { global_index }, ..) => global_index == sp,
-        ValueDef::Operator(op, aa, _) if op.is_pure() => cb.arg_pool[aa]
-            .iter()
-            .any(|&a| frame_based(cb, a, sp, depth + 1)),
-        _ => false,
-    }
-}
-
-/// Trace `v` to (entry param index, const byte offset) in the callee —
-/// aliases and constant add/sub only.
-fn param_off(cb: &FunctionBody, v: WV, depth: u32) -> Option<(u32, i64)> {
-    if depth > 8 {
-        return None;
-    }
-    match cb.values[cb.resolve_alias(v)] {
-        ValueDef::BlockParam(blk, i, _) if blk == cb.entry => Some((i, 0)),
-        ValueDef::Operator(op @ (O::I32Add | O::I64Add | O::I32Sub | O::I64Sub), aa, _) => {
-            let &[x, y, ..] = &cb.arg_pool[aa][..] else {
-                return None;
-            };
-            let sub = matches!(op, O::I32Sub | O::I64Sub);
-            let (bv, k) = if let Some(k) = wconst(cb, y) {
-                (x, if sub { -k } else { k })
-            } else if let Some(k) = wconst(cb, x).filter(|_| !sub) {
-                (y, k)
-            } else {
-                return None;
-            };
-            let (i, o) = param_off(cb, bv, depth + 1)?;
-            Some((i, o.wrapping_add(k)))
-        }
-        _ => None,
-    }
-}
-
-/// Byte ranges the callee writes through its own params, as (param
-/// index, start offset, size). `None` = an unattributable write exists:
-/// a call, a bulk-memory op, or a store whose base is neither
-/// frame-local nor traceable to an entry param.
-fn callee_writes(cb: &FunctionBody, sp: waffle::Global) -> Option<Vec<(u32, i64, u64)>> {
-    let mut out = Vec::new();
-    for blk in cb.blocks.iter() {
-        for &iv in &cb.blocks[blk].insts {
-            let ValueDef::Operator(op, aa, _) = &cb.values[iv] else {
-                continue;
-            };
-            if let Some(sz) = store_bytes(op) {
-                let (Some(m), Some(&base)) = (memarg_of(op), cb.arg_pool[*aa].first()) else {
-                    return None;
-                };
-                if frame_based(cb, base, sp, 0) {
-                    continue;
-                }
-                let (pi, off) = param_off(cb, base, 0)?;
-                out.push((pi, off.wrapping_add(m.offset as i64), sz));
-            } else if !op.is_pure()
-                && load_bytes(op).is_none()
-                && !matches!(
-                    op,
-                    O::GlobalSet { .. } | O::TableSet { .. } | O::MemorySize { .. }
-                )
-            {
-                return None;
-            }
-        }
-    }
-    Some(out)
-}
-
-/// Does anything inside the loop write `[vb+lo, vb+hi)`? `vb` is a
-/// noalias param pointer, so only `vb`-derived addresses can legally
-/// reach the pointee; everything else is disjoint.
-fn clobbered(
-    b: &FunctionBody,
-    funcs: &[FDecl],
-    writers: &[Writer],
-    wcache: &mut FxHashMap<usize, Option<Vec<(u32, i64, u64)>>>,
-    sp: waffle::Global,
-    vb: WV,
-    lo: u64,
-    hi: u64,
-) -> bool {
-    let hits = |d: i64, off: i64, sz: u64| {
-        let s = d as i128 + off as i128;
-        s + sz as i128 > lo as i128 && s < hi as i128
-    };
-    for w in writers {
-        match w {
-            Writer::Bail => return true,
-            Writer::Store { base, off, sz } => match derive_off(b, vb, *base, 0) {
-                Some(None) => return true,
-                Some(Some(d)) if hits(d, *off, *sz) => return true,
-                _ => {}
-            },
-            Writer::Call { fi, args } => {
-                let Some(cb) = funcs[*fi].body.as_ref() else {
-                    return true;
-                };
-                let ws = match wcache.entry(*fi).or_insert_with(|| callee_writes(cb, sp)) {
-                    Some(ws) => ws,
-                    None => return true,
-                };
-                for &(pi, off, sz) in ws.iter() {
-                    let Some(&a) = args.get(pi as usize) else {
-                        return true;
-                    };
-                    match derive_off(b, vb, b.resolve_alias(a), 0) {
-                        Some(None) => return true,
-                        Some(Some(d)) if hits(d, off, sz) => return true,
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-fn loop_licm(
-    b: &mut FunctionBody,
-    cfg: &waffle::cfg::CFGInfo,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    inloop: &FxHashSet<WBlock>,
-    pre: WBlock,
-    sp: waffle::Global,
-    frozen: &FxHashMap<WV, u64>,
-    deref: &FxHashMap<WV, u64>,
-    funcs: &[FDecl],
-    nowrite: &FxHashMap<String, bool>,
-) {
-    // Loop-internal writers + per-callee write sets, computed lazily on
-    // the first writable-noalias load that could hoist.
-    let mut writers: Option<Vec<Writer>> = None;
-    let mut wcache: FxHashMap<usize, Option<Vec<(u32, i64, u64)>>> = FxHashMap::default();
-    let mut n_deref = 0u32;
-    // Process in RPO order so defs hoist before their users.
-    let mut order: Vec<WBlock> = inloop.iter().copied().collect();
-    order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
-    loop {
-        let mut moved = false;
-        for &lb in &order {
-            let mut i = 0;
-            while i < b.blocks[lb].insts.len() {
-                let v = b.blocks[lb].insts[i];
-                let hoist = match b.values[v] {
-                    ValueDef::Operator(op, args, _) => {
-                        let safe = match op {
-                            O::GlobalGet { global_index } => global_index != sp,
-                            _ => {
-                                if op.is_pure() {
-                                    true
-                                } else {
-                                    // Loads on `frozen` (noalias +
-                                    // readonly + dereferenceable)
-                                    // params: within the pointee bound
-                                    // they can't trap, and frozen
-                                    // memory can't change — hoisting is
-                                    // always safe. This is what LLVM's
-                                    // param attrs buy it on this loop.
-                                    // Writable noalias params hoist too
-                                    // when nothing in the loop can
-                                    // write the loaded bytes.
-                                    load_bytes(&op)
-                                        .and_then(|sz| {
-                                            let m = memarg_of(&op)?;
-                                            let a = b.resolve_alias(*b.arg_pool[args].first()?);
-                                            let lo = m.offset as u64;
-                                            if let Some(&bound) = frozen.get(&a) {
-                                                return (lo + sz <= bound).then_some(());
-                                            }
-                                            let bound = *deref.get(&a)?;
-                                            if lo + sz > bound {
-                                                return None;
-                                            }
-                                            if writers.is_none() {
-                                                writers =
-                                                    Some(loop_writers(b, inloop, funcs, nowrite));
-                                            }
-                                            let ok = !clobbered(
-                                                b,
-                                                funcs,
-                                                writers.as_ref().unwrap(),
-                                                &mut wcache,
-                                                sp,
-                                                a,
-                                                lo,
-                                                lo + sz,
-                                            );
-                                            n_deref += ok as u32;
-                                            ok.then_some(())
-                                        })
-                                        .is_some()
-                                }
-                            }
-                        };
-                        safe && b.arg_pool[args]
-                            .iter()
-                            .all(|&a| !inloop.contains(&defb[b.resolve_alias(a)]))
-                    }
-                    _ => false,
-                };
-                if hoist {
-                    b.blocks[lb].insts.remove(i);
-                    b.blocks[pre].insts.push(v);
-                    defb[v] = pre;
-                    moved = true;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    if n_deref > 0
-        && pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::INFO)
-    {
-        if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::wasm", "loop_licm: {n_deref} noalias-param loads hoisted past writers")
-        };
-    }
-}
-
-/// Constant value of `v`, if it is an int-const op.
-fn wconst(b: &FunctionBody, v: WV) -> Option<i64> {
-    match b.values[b.resolve_alias(v)] {
-        ValueDef::Operator(O::I32Const { value }, ..) => Some(value as i32 as i64),
-        ValueDef::Operator(O::I64Const { value }, ..) => Some(value as i64),
-        _ => None,
-    }
-}
-
-/// If `c` resolves to `v == K` (or its `eqz` negation `v != K`),
-/// return `(v, K, eq_on_true)` — `eq_on_true` says whether `v == K`
-/// takes the CondBr's if_true edge.
-fn eq_of(b: &FunctionBody, c: WV) -> Option<(WV, i64, bool)> {
-    let c = b.resolve_alias(c);
-    let (aa, pol) = match b.values[c] {
-        ValueDef::Operator(O::I32Eq, aa, _) => (aa, true),
-        ValueDef::Operator(O::I32Eqz, aa, _) => {
-            let a = b.resolve_alias(*b.arg_pool[aa].first()?);
-            match b.values[a] {
-                ValueDef::Operator(O::I32Eq, aa, _) => (aa, false),
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-    let &[x, y, ..] = &b.arg_pool[aa][..] else {
-        return None;
-    };
-    let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
-    if let Some(k) = wconst(b, y) {
-        return Some((x, k, pol));
-    }
-    if let Some(k) = wconst(b, x) {
-        return Some((y, k, pol));
-    }
-    None
-}
-
-/// Fold `v == K1 || v == K2` two-block CondBr chains into a br_table
-/// (waffle `Select`) on `v - min(K1,K2)` — the same lowering LLVM's
-/// wasm backend gives small equality chains. `blk` must end in
-/// `CondBr(eq, hit, nxt)` where `nxt` is reached *only* from `blk`,
-/// has no params, holds only pure insts (the second `eq` plus whatever
-/// feeds it, e.g. its const), and ends in `CondBr(eq, hit, miss)`
-/// sharing the hit block. Per-index targets
-/// keep their original edge args (hit and miss args differ on the two
-/// original edges), so the only requirement is that the chain block's
-/// edge args aren't defined inside it. Returns whether it folded.
-fn wtab(b: &mut FunctionBody) -> bool {
-    // Use sites per value, keyed by the block each use lives in. A
-    // folded-away chain block keeps its insts but becomes unreachable, so
-    // any value it defines that is used elsewhere (e.g. a GVN-deduped
-    // constant feeding another block's edge args) would lose its
-    // dominating def. Reject the fold unless every nxt def is used only
-    // inside nxt.
-    let mut uses: FxHashMap<WV, FxHashSet<WBlock>> = FxHashMap::default();
-    for blk in b.blocks.iter() {
-        for &i in &b.blocks[blk].insts {
-            b.values[i].visit_uses(&b.arg_pool, |u| {
-                uses.entry(b.resolve_alias(u)).or_default().insert(blk);
-            });
-        }
-        b.blocks[blk].terminator.visit_uses(|u| {
-            uses.entry(b.resolve_alias(u)).or_default().insert(blk);
-        });
-    }
-    let mut edits: Vec<(WBlock, WV, i64, i64, BlockTarget, BlockTarget, BlockTarget)> = Vec::new();
-    for blk in b.blocks.iter() {
-        let Terminator::CondBr {
-            cond: c1,
-            if_true: t1,
-            if_false: f1,
-        } = &b.blocks[blk].terminator
-        else {
-            continue;
-        };
-        let Some((v1, k1, pol1)) = eq_of(b, *c1) else {
-            continue;
-        };
-        // The edge taken when v == k1 is the "hit" (if_true for eq,
-        // if_false for ne); the chain block sits on the other edge.
-        let (hit1, nxt_t) = if pol1 { (t1, f1) } else { (f1, t1) };
-        let nxt = nxt_t.block;
-        if nxt == blk || b.blocks[nxt].preds.as_slice() != [blk] {
-            continue;
-        }
-        if !b.blocks[nxt].params.is_empty() {
-            continue;
-        }
-        let Terminator::CondBr {
-            cond: c2,
-            if_true: t2,
-            if_false: f2,
-        } = &b.blocks[nxt].terminator
-        else {
-            continue;
-        };
-        let c2v = b.resolve_alias(*c2);
-        if !b.blocks[nxt].insts.contains(&c2v) {
-            continue;
-        }
-        // Everything else nxt computes must be pure — folding skips its
-        // execution entirely.
-        if b.blocks[nxt].insts.iter().any(|&i| {
-            i != c2v
-                && !matches!(b.values[i], ValueDef::Alias(_))
-                && !matches!(b.values[i], ValueDef::Operator(op, ..) if op.is_pure())
-        }) {
-            continue;
-        }
-        let Some((v2, k2, pol2)) = eq_of(b, c2v) else {
-            continue;
-        };
-        let (hit2, miss) = if pol2 { (t2, f2) } else { (f2, t2) };
-        if v2 != v1 || hit2.block != hit1.block {
-            continue;
-        }
-        // Edge args evaluated in nxt's frame must exist in blk's: no
-        // arg may be a nxt-local value.
-        if hit2
-            .args
-            .iter()
-            .chain(&miss.args)
-            .map(|&a| b.resolve_alias(a))
-            .any(|a| b.blocks[nxt].insts.contains(&a))
-        {
-            continue;
-        }
-        // No value defined in nxt may be used outside it: folding skips
-        // nxt's execution, so an escaping def would stop dominating its
-        // use.
-        if b.blocks[nxt].insts.iter().any(|&i| {
-            uses.get(&b.resolve_alias(i))
-                .is_some_and(|bs| bs.iter().any(|&ub| ub != nxt))
-        }) {
-            continue;
-        }
-        let (lo, hi) = (k1.min(k2), k1.max(k2));
-        if hi - lo + 1 > 16 {
-            continue;
-        }
-        edits.push((blk, v1, k1, k2, hit1.clone(), hit2.clone(), miss.clone()));
-    }
-    if edits.is_empty() {
-        return false;
-    }
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    for (blk, v, k1, k2, hit1, hit2, miss) in edits {
-        if verbose {
-            if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::wasm","wtab: {blk} {v}=={k1}|{k2} -> {hit1:?} {hit2:?} miss={miss:?}")
-            };
-        }
-        let lo = k1.min(k2);
-        let idx = if lo == 0 {
-            v
-        } else {
-            let lc = b.add_op(blk, O::I32Const { value: lo as u32 }, &[], &[WT::I32]);
-            b.add_op(blk, O::I32Sub, &[v, lc], &[WT::I32])
-        };
-        let span = (k1.max(k2) - lo + 1) as usize;
-        let mut targets = Vec::with_capacity(span);
-        for i in 0..span as i64 {
-            let k = lo + i;
-            targets.push(if k == k1 {
-                hit1.clone()
-            } else if k == k2 {
-                hit2.clone()
-            } else {
-                miss.clone()
-            });
-        }
-        b.blocks[blk].terminator = Terminator::Select {
-            value: idx,
-            targets,
-            default: miss,
-        };
-    }
-    b.recompute_edges();
-    true
-}
-
-/// Is `v` loop-invariant: defined outside the loop, a constant, or a
-/// pure op whose operands all are? In-loop defs of pure ops (e.g. a
-/// `mul` of two invariants left on a latch edge by strength reduction)
-/// count too — the value is still identical every iteration.
-fn winv(
-    b: &FunctionBody,
-    defb: &waffle::entity::PerEntity<WV, WBlock>,
-    inloop: &FxHashSet<WBlock>,
-    v: WV,
-) -> bool {
-    let v = b.resolve_alias(v);
-    match b.values[v] {
-        ValueDef::Operator(
-            O::I32Const { .. } | O::I64Const { .. } | O::F32Const { .. } | O::F64Const { .. },
-            ..,
-        ) => true,
-        ValueDef::Operator(op, aa, _) => {
-            !inloop.contains(&defb[v])
-                || (op.is_pure() && b.arg_pool[aa].iter().all(|&a| winv(b, defb, inloop, a)))
-        }
-        _ => !inloop.contains(&defb[v]),
-    }
-}
-
-/// Materialize a `winv`-invariant value inside `blk`: outside defs are
-/// used as-is; an in-loop pure op is re-emitted with recursively
-/// materialized args so the result is dominated where it's used.
-fn mat_inv(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    inloop: &FxHashSet<WBlock>,
-    blk: WBlock,
-    v: WV,
-) -> WV {
-    let v = b.resolve_alias(v);
-    let (op, aa, tt) = match b.values[v] {
-        ValueDef::Operator(op, aa, tt) if inloop.contains(&defb[v]) && op.is_pure() => (op, aa, tt),
-        _ => return v,
-    };
-    let mut args: Vec<WV> = Vec::with_capacity(b.arg_pool[aa].len());
-    for i in 0..b.arg_pool[aa].len() {
-        let a = b.arg_pool[aa][i];
-        args.push(mat_inv(b, defb, inloop, blk, a));
-    }
-    let tys: Vec<WT> = b.type_pool[tt].to_vec();
-    let nv = b.add_op(blk, op, &args, &tys);
-    defb[nv] = blk;
-    nv
-}
-
-/// The value arriving for param `pidx` of `h` on edge `tidx` of `pred`.
-fn edge_arg(b: &mut FunctionBody, pred: WBlock, tidx: usize, pidx: usize) -> WV {
-    b.blocks[pred]
-        .terminator
-        .visit_target(tidx, |t| t.args[pidx])
-}
-
-/// Push `v` as an extra block-arg on the `tidx`-th target of `pred`.
-fn edge_push(b: &mut FunctionBody, pred: WBlock, tidx: usize, v: WV) {
-    b.blocks[pred]
-        .terminator
-        .update_target(tidx, |t| t.args.push(v));
-}
-
-/// Turn `add(base, iv*K)` addresses into `p += step*K` induction params.
-fn loop_indvars(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    inloop: &FxHashSet<WBlock>,
-    h: WBlock,
-) {
-    let params = b.blocks[h].params.clone();
-    for (pidx, &(pty, pv)) in params.iter().enumerate() {
-        if pty != WT::I32 {
-            continue;
-        }
-        // Incoming edges into h: (pred, target-index, arg for pidx).
-        let mut edges = Vec::new();
-        let preds = b.blocks[h].preds.clone();
-        for (j, &pr) in preds.iter().enumerate() {
-            let tidx = b.blocks[h].pos_in_pred_succ[j];
-            let arg = edge_arg(b, pr, tidx, pidx);
-            let arg = b.resolve_alias(arg);
-            edges.push((pr, tidx, arg));
-        }
-        // Each in-loop edge must feed `pv + c` (or pv itself: step 0).
-        let mut steps: Vec<Option<WV>> = Vec::new();
-        let mut ok = true;
-        for &(pr, _, arg) in &edges {
-            if !inloop.contains(&pr) {
-                steps.push(None);
-                continue;
-            }
-            if arg == pv {
-                steps.push(Some(WV::invalid()));
-                continue;
-            }
-            let c = match b.values[arg] {
-                ValueDef::Operator(O::I32Add, aa, _) => {
-                    let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                        ok = false;
-                        break;
-                    };
-                    let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
-                    if x == pv && winv(b, defb, inloop, y) {
-                        Some(y)
-                    } else if y == pv && winv(b, defb, inloop, x) {
-                        Some(x)
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                _ => {
-                    ok = false;
-                    break;
-                }
-            };
-            steps.push(c);
-        }
-        if !ok {
-            continue;
-        }
-        // Addressing sites: `mul(<affine pv>, K)` feeding `add(base, m)`,
-        // where <affine pv> is `pv` itself or `pv + off` for invariant
-        // off (`base + (pv+off)*K` still strides by K per step of pv).
-        let mut sites: Vec<(WV, WV, WV, Option<WV>)> = Vec::new(); // (add, base, K, off)
-        let affine_pv = |b: &FunctionBody, x: WV, pv: WV| -> Option<Option<WV>> {
-            if x == pv {
-                return Some(None);
-            }
-            if let ValueDef::Operator(O::I32Add, xa, _) = b.values[x] {
-                let &[p, q, ..] = &b.arg_pool[xa][..] else {
-                    return None;
-                };
-                let (p, q) = (b.resolve_alias(p), b.resolve_alias(q));
-                if p == pv && winv(b, defb, inloop, q) {
-                    return Some(Some(q));
-                }
-                if q == pv && winv(b, defb, inloop, p) {
-                    return Some(Some(p));
-                }
-            }
-            None
-        };
-        for &lb in inloop.iter() {
-            for &inst in &b.blocks[lb].insts {
-                if let ValueDef::Operator(O::I32Add, aa, _) = b.values[inst] {
-                    let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                        continue;
-                    };
-                    for (m, base) in [(x, y), (y, x)] {
-                        let m = b.resolve_alias(m);
-                        let base = b.resolve_alias(base);
-                        if !winv(b, defb, inloop, base) {
-                            continue;
-                        }
-                        if let ValueDef::Operator(O::I32Mul, mm, _) = b.values[m] {
-                            let &[u, k, ..] = &b.arg_pool[mm][..] else {
-                                continue;
-                            };
-                            let (u, k) = (b.resolve_alias(u), b.resolve_alias(k));
-                            for (x, kk) in [(u, k), (k, u)] {
-                                if let Some(off) = affine_pv(b, x, pv) {
-                                    if winv(b, defb, inloop, kk) {
-                                        sites.push((inst, base, kk, off));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (add_v, base, k, off) in sites {
-            let p = b.add_blockparam(h, WT::I32);
-            defb[p] = h;
-            for (i, &(pr, tidx, arg)) in edges.iter().enumerate() {
-                if !inloop.contains(&pr) {
-                    // Preheader edge: p = base + (arg + off)*K.
-                    let arg = match off {
-                        Some(off) => {
-                            let off = mat_inv(b, defb, inloop, pr, off);
-                            let t = b.add_op(pr, O::I32Add, &[arg, off], &[WT::I32]);
-                            defb[t] = pr;
-                            t
-                        }
-                        None => arg,
-                    };
-                    let k = mat_inv(b, defb, inloop, pr, k);
-                    let base = mat_inv(b, defb, inloop, pr, base);
-                    let m = b.add_op(pr, O::I32Mul, &[arg, k], &[WT::I32]);
-                    let init = b.add_op(pr, O::I32Add, &[base, m], &[WT::I32]);
-                    defb[m] = pr;
-                    defb[init] = pr;
-                    edge_push(b, pr, tidx, init);
-                } else {
-                    // Latch edge: p += c*K (p itself when the step is 0).
-                    let next = match steps[i] {
-                        None => unreachable!(),
-                        Some(c) if !c.is_valid() => p,
-                        Some(c) => {
-                            let c = mat_inv(b, defb, inloop, pr, c);
-                            let k = mat_inv(b, defb, inloop, pr, k);
-                            let inc = match (wconst(b, c), wconst(b, k)) {
-                                (Some(c), Some(k)) => b.add_op(
-                                    pr,
-                                    O::I32Const {
-                                        value: (c * k) as u32,
-                                    },
-                                    &[],
-                                    &[WT::I32],
-                                ),
-                                _ => b.add_op(pr, O::I32Mul, &[c, k], &[WT::I32]),
-                            };
-                            let next = b.add_op(pr, O::I32Add, &[p, inc], &[WT::I32]);
-                            defb[inc] = pr;
-                            defb[next] = pr;
-                            next
-                        }
-                    };
-                    edge_push(b, pr, tidx, next);
-                }
-            }
-            b.set_alias(add_v, p);
-        }
-    }
-}
-
-/// Drop now-dead speculatable insts (left behind by strength reduction).
-fn wdce(b: &mut FunctionBody, deref: &FxHashMap<WV, u64>) {
-    loop {
-        let mut uses: FxHashMap<WV, u32> = FxHashMap::default();
-        for blk in b.blocks.iter() {
-            for &v in &b.blocks[blk].insts {
-                match b.values[v] {
-                    ValueDef::Operator(_, args, _) => {
-                        for i in 0..args.len() {
-                            let a = b.resolve_alias(b.arg_pool[args][i]);
-                            *uses.entry(a).or_default() += 1;
-                        }
-                    }
-                    ValueDef::PickOutput(src, ..) => {
-                        let src = b.resolve_alias(src);
-                        *uses.entry(src).or_default() += 1;
-                    }
-                    _ => {}
-                }
-            }
-            b.blocks[blk]
-                .terminator
-                .visit_uses(|v| *uses.entry(b.resolve_alias(v)).or_default() += 1);
-        }
-        let mut removed = false;
-        for blk in b.blocks.iter() {
-            let insts = std::mem::take(&mut b.blocks[blk].insts);
-            let keep: Vec<WV> = insts
-                .into_iter()
-                .filter(|&v| {
-                    let dead = uses.get(&v).copied().unwrap_or(0) == 0
-                        && match b.values[v] {
-                            ValueDef::Operator(op, args, _) => {
-                                op.is_pure()
-                                    || matches!(op, O::GlobalGet { .. })
-                                    || (
-                                        // A dead load can't change
-                                        // behavior only when it can't
-                                        // trap: base inside a `noalias`/
-                                        // `frozen` param's deref bound.
-                                        load_bytes(&op)
-                                            .and_then(|sz| {
-                                                let m = memarg_of(&op)?;
-                                                let a = b.resolve_alias(*b.arg_pool[args].first()?);
-                                                let bound = *deref.get(&a)?;
-                                                (m.offset as u64 + sz <= bound).then_some(())
-                                            })
-                                            .is_some()
-                                    )
-                            }
-                            ValueDef::Alias(_) | ValueDef::PickOutput(..) => true,
-                            _ => false,
-                        };
-                    removed |= dead;
-                    !dead
-                })
-                .collect();
-            b.blocks[blk].insts = keep;
-        }
-        if !removed {
-            break;
-        }
-    }
-}
-
-/// Unroll a loop `copies` times by cloning all of its blocks `copies-1`
-/// times and chaining the copies through their (cloned) headers. Because
-/// the loop header — including its exit test — is cloned, each copy
-/// re-checks the condition and no epilogue is needed:
-/// `body → h₁ → body₁ → h₂ → … → h`. Runs after licm/indvars so the
-/// cloned body is already lean.
-fn wunroll(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    cfg: &waffle::cfg::CFGInfo,
-    inloop: &FxHashSet<WBlock>,
-    h: WBlock,
-    copies: usize,
-    fname: &str,
-) {
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    // Size limits: unrolling is a tradeoff, not a free win. Scale the
-    // copy count down for larger bodies — a 64-inst loop gets 2 copies,
-    // a tiny one gets the full 8. `unreachable` panic sinks are cold:
-    // they inflate the raw CFG shape but not the hot path, so count
-    // them separately when deciding whether the loop is worth cloning.
-    let sink_blocks: usize = inloop.iter().filter(|&&lb| cloneable_sink(b, lb)).count();
-    let insts: usize = inloop
-        .iter()
-        .filter(|&&lb| !cloneable_sink(b, lb))
-        .map(|&lb| b.blocks[lb].insts.len())
-        .sum();
-    let eff_blocks = inloop.len() - sink_blocks;
-    let copies = copies.min((256 / insts.max(1)).max(2));
-    if copies < 2 || eff_blocks > 16 || insts > 64 {
-        if verbose {
-            if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::wasm",
-                    "wunroll: {fname} {h} skipped size blocks={eff_blocks}+{sink_blocks} insts={insts}"
-                )
-            };
-            for &lb in inloop {
-                if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::wasm",
-                        "wunroll:   {lb} insts={} term={:?} -> {:?} {}",
-                        b.blocks[lb].insts.len(),
-                        std::mem::discriminant(&b.blocks[lb].terminator),
-                        {
-                            let mut ts = Vec::new();
-                            b.blocks[lb].terminator.visit_targets(|t| ts.push(t.block));
-                            ts
-                        },
-                        match &b.blocks[lb].terminator {
-                            Terminator::CondBr { cond, .. } => {
-                                format!("cond={:?}", b.values[b.resolve_alias(*cond)])
-                            }
-                            _ => String::new(),
-                        }
-                    )
-                };
-            }
-        }
-        return;
-    }
-    if !loop_cloneable(b, defb, inloop, h) {
-        return;
-    }
-    let mut order: Vec<WBlock> = inloop.iter().copied().collect();
-    order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
-    let flat_ok = crate::env_get("PLIRON_WASM_FLAT") != Some("0");
-    if flat_ok && wunroll_flat(b, defb, inloop, h, copies, &order) {
-        if verbose {
-            if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::wasm","wunroll: {fname} {h} flat")
-            };
-        }
-        return;
-    }
-    if verbose {
-        if pliron_cfg::tracing_on() {
-            tracing::debug!(target: "pliron::wasm","wunroll: {fname} {h} chain x{copies}")
-        };
-    }
-    // Build the copies.
-    let mut heads = vec![h];
-    let mut copies_blocks: Vec<Vec<WBlock>> = Vec::new();
-    for _ in 1..copies {
-        let (bmap, _) = clone_loop(b, defb, &order);
-        heads.push(bmap[&h]);
-        copies_blocks.push(order.iter().map(|lb| bmap[lb]).collect());
-    }
-    // Chain: copy k's back-edges to its own header go to copy k+1's header
-    // (the last copy's go back to the original h).
-    for k in 0..copies {
-        let srcs: &[WBlock] = if k == 0 {
-            &order
-        } else {
-            &copies_blocks[k - 1]
-        };
-        let next = heads[(k + 1) % copies];
-        for &lb in srcs {
-            b.blocks[lb].terminator.update_targets(|t| {
-                if t.block == heads[k] {
-                    t.block = next;
-                }
-            });
-        }
-    }
-    b.recompute_edges();
-}
-
-/// Flat unrolling for canonical counted loops `iv <u n` stepping by a
-/// uniform constant: test once per `copies` iterations rather than once
-/// per cloned body. A new header `hT` tests `iv <s t64` where the
-/// preheader computes `t64 = n - (copies-1)*step` in i64 (no wrap:
-/// negative just means fewer than `copies` iterations remain). Every
-/// clone's header test is replaced by an unconditional branch to its
-/// pass arm — entering a group guarantees all `copies` iterations are
-/// in-trip. The original loop is the remainder: `hT`'s fail edge feeds
-/// it the live params and its per-iteration test finishes the tail.
-/// Returns false when the loop lacks the canonical shape.
-fn wunroll_flat(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    inloop: &FxHashSet<WBlock>,
-    h: WBlock,
-    copies: usize,
-    order: &[WBlock],
-) -> bool {
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    macro_rules! rej {
-        ($why:expr) => {{
-            if verbose {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wunroll_flat: {h} reject: {}", $why) };
-            }
-            return false;
-        }};
-    }
-    let Terminator::CondBr {
-        cond,
-        if_true,
-        if_false,
-    } = &b.blocks[h].terminator
-    else {
-        rej!("header not condbr");
-    };
-    // Canonical counted test: `iv <u n`/`iv >=u n` via as_check, plus
-    // `iv != n`/`iv == n` — pointer-bump loops (`for &x in a`) compare
-    // the cursor against the end pointer for equality. With a uniform
-    // positive step, the group test `iv <s n-(copies-1)*step` still
-    // puts every copy strictly below n, so none can equal it, and
-    // non-terminating cases (iv > n, or n-iv not a multiple of step)
-    // fall through to the unchanged `!=` remainder with identical
-    // behavior.
-    let Some((iv, n, pass_true)) = (|cond: WV| -> Option<(WV, WV, bool)> {
-        if let Some(ck) = as_check(b, cond) {
-            return Some(ck);
-        }
-        match b.values[b.resolve_alias(cond)] {
-            ValueDef::Operator(O::I32Eq, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                    return None;
-                };
-                Some((b.resolve_alias(x), b.resolve_alias(y), false))
-            }
-            ValueDef::Operator(O::I32Ne, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                    return None;
-                };
-                Some((b.resolve_alias(x), b.resolve_alias(y), true))
-            }
-            _ => None,
-        }
-    })(*cond) else {
-        rej!("cond not a recognized check");
-    };
-    let (pass, _) = if pass_true {
-        (if_true, if_false)
-    } else {
-        (if_false, if_true)
-    };
-    if !inloop.contains(&pass.block) || pass.block == h {
-        rej!("pass arm not in loop / is header");
-    }
-    if !winv(b, defb, inloop, n) {
-        rej!("n not loop-invariant");
-    }
-    let ValueDef::BlockParam(hb, pidx, WT::I32) = b.values[iv] else {
-        rej!("iv not an i32 header blockparam");
-    };
-    // A stale BlockParam can outlive its slot if optimize dropped the
-    // param; `iv` must still own index `pidx` before edge args are read.
-    if hb != h || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == iv) {
-        rej!("iv blockparam slot stale");
-    }
-    // Uniform positive constant step on iv across all latches (an
-    // unchanged feed contributes 0 like wbcheck's rule).
-    let latches: Vec<(WBlock, usize)> = b.blocks[h]
-        .preds
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| inloop.contains(p))
-        .map(|(j, &p)| (p, b.blocks[h].pos_in_pred_succ[j]))
-        .collect();
-    if latches.is_empty() {
-        rej!("no latches");
-    }
-    // The latch arg is `iv + step` as an affine relation — chase add
-    // chains (upstream unrolling leaves `add(add(iv,1),1)…`) rather
-    // than requiring a literal `add(iv, const)`.
-    fn step_of(b: &FunctionBody, iv: WV, arg: WV) -> Option<i64> {
-        let arg = b.resolve_alias(arg);
-        if arg == iv {
-            return Some(0);
-        }
-        if let ValueDef::Operator(O::I32Add, aa, _) = b.values[arg] {
-            let u = b.resolve_alias(b.arg_pool[aa][0]);
-            let v = b.resolve_alias(b.arg_pool[aa][1]);
-            if let Some(c) = wconst(b, v) {
-                return step_of(b, iv, u).map(|s| s + c);
-            }
-            if let Some(c) = wconst(b, u) {
-                return step_of(b, iv, v).map(|s| s + c);
-            }
-        }
-        None
-    }
-    let mut step: Option<i64> = None;
-    for &(la, tidx) in &latches {
-        let arg = edge_arg(b, la, tidx, pidx as usize);
-        let s = match step_of(b, iv, arg) {
-            Some(s) => s,
-            None => rej!("latch iv arg not iv+const chain"),
-        };
-        match step {
-            None => step = Some(s),
-            Some(st) if st == s => {}
-            _ => rej!("non-uniform step"),
-        }
-    }
-    let Some(step) = step else {
-        rej!("step not positive (or none)")
-    };
-    if step <= 0 {
-        return false;
-    }
-    // Outside edges retarget to the new group header.
-    let edges = outside_edges(b, h, inloop);
-    // `copies` clones of the whole loop; each clone's header keeps its
-    // params but loses the trip test.
-    let mut heads = Vec::new();
-    let mut blocks_of = Vec::new();
-    for _ in 0..copies {
-        let (bmap, _) = clone_loop(b, defb, order);
-        let ch = bmap[&h];
-        let pt = match &b.blocks[ch].terminator {
-            Terminator::CondBr {
-                if_true, if_false, ..
-            } => {
-                if pass_true {
-                    if_true.clone()
-                } else {
-                    if_false.clone()
-                }
-            }
-            _ => return false,
-        };
-        b.blocks[ch].terminator = Terminator::Br { target: pt };
-        heads.push(ch);
-        blocks_of.push(order.iter().map(|lb| bmap[lb]).collect::<Vec<_>>());
-    }
-    // The group header mirrors h's params and tests once per group:
-    // t64 = n - (copies-1)*step in i64 (no wrap: a negative result just
-    // means fewer than `copies` iterations remain, which the signed
-    // compare reports correctly).
-    let h_t = b.add_block();
-    let mut htp = Vec::new();
-    for &(ty, _) in &b.blocks[h].params.clone() {
-        let np = b.add_blockparam(h_t, ty);
-        defb[np] = h_t;
-        htp.push(np);
-    }
-    let nm = mat_inv(b, defb, inloop, h_t, n);
-    let n64 = b.add_op(h_t, O::I64ExtendI32U, &[nm], &[WT::I64]);
-    defb[n64] = h_t;
-    let cc = b.add_op(
-        h_t,
-        O::I64Const {
-            value: ((copies as i64 - 1) * step) as u64,
-        },
-        &[],
-        &[WT::I64],
-    );
-    defb[cc] = h_t;
-    let t64 = b.add_op(h_t, O::I64Sub, &[n64, cc], &[WT::I64]);
-    defb[t64] = h_t;
-    let iv64 = b.add_op(h_t, O::I64ExtendI32U, &[htp[pidx as usize]], &[WT::I64]);
-    defb[iv64] = h_t;
-    let cond_t = b.add_op(h_t, O::I64LtS, &[iv64, t64], &[WT::I32]);
-    defb[cond_t] = h_t;
-    b.set_terminator(
-        h_t,
-        Terminator::CondBr {
-            cond: cond_t,
-            if_true: BlockTarget {
-                block: heads[0],
-                args: htp.clone(),
-            },
-            if_false: BlockTarget {
-                block: h,
-                args: htp,
-            },
-        },
-    );
-    for (pr, tidx) in edges {
-        b.blocks[pr]
-            .terminator
-            .update_target(tidx, |t| t.block = h_t);
-    }
-    // Chain the group: copy i's edges to its own header instead enter
-    // copy i+1's; the last copy's loop back to h_t.
-    for i in 0..copies {
-        let next = if i + 1 < copies { heads[i + 1] } else { h_t };
-        for &lb in &blocks_of[i] {
-            b.blocks[lb].terminator.update_targets(|t| {
-                if t.block == heads[i] {
-                    t.block = next;
-                }
-            });
-        }
-    }
-    b.recompute_edges();
-    if verbose {
-        if pliron_cfg::tracing_on() {
-            tracing::debug!(target: "pliron::wasm","wunroll: {h} flat x{copies} -> {h_t}")
-        };
-    }
-    true
-}
-
-/// `unreachable`-terminated blocks of ordinary ops are pure sinks (panic
-/// paths): a loop clone may point at its own copy of the sink, so values
-/// leaking into them stay dominated.
-fn cloneable_sink(b: &FunctionBody, blk: WBlock) -> bool {
-    matches!(b.blocks[blk].terminator, Terminator::Unreachable)
-        && b.blocks[blk].insts.iter().all(|&v| {
-            matches!(
-                b.values[v],
-                ValueDef::Operator(..) | ValueDef::Alias(_) | ValueDef::PickOutput(..)
-            )
-        })
-}
-
-/// Can this loop's blocks be safely cloned? Requires ordinary insts only,
-/// supported terminators, and no loop-defined value used *inside* a
-/// reachable non-sink outside block (edge args get remapped per copy;
-/// dead blocks may carry dangling args and don't count).
-fn loop_cloneable(
-    b: &FunctionBody,
-    defb: &waffle::entity::PerEntity<WV, WBlock>,
-    inloop: &FxHashSet<WBlock>,
-    h: WBlock,
-) -> bool {
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    for &lb in inloop {
-        for &inst in &b.blocks[lb].insts {
-            if !matches!(
-                b.values[inst],
-                ValueDef::Operator(..) | ValueDef::Alias(_) | ValueDef::PickOutput(..)
-            ) {
-                if verbose {
-                    let k = match b.values[inst] {
-                        ValueDef::PickOutput(..) => "pickoutput",
-                        ValueDef::Placeholder(..) => "placeholder",
-                        ValueDef::BlockParam(..) => "blockparam",
-                        _ => "other",
-                    };
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm","wloop: {h} skipped exotic inst {inst} {k}")
-                    };
-                }
-                return false;
-            }
-        }
-        if !matches!(
-            b.blocks[lb].terminator,
-            Terminator::Br { .. } | Terminator::CondBr { .. } | Terminator::Select { .. }
-        ) {
-            if verbose {
-                if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::wasm","wloop: {h} skipped terminator in {lb}")
-                };
-            }
-            return false;
-        }
-    }
-    let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
-    {
-        let mut wl = vec![WBlock::new(0)];
-        while let Some(x) = wl.pop() {
-            b.blocks[x].terminator.visit_targets(|t| {
-                if reach.insert(t.block) {
-                    wl.push(t.block);
-                }
-            });
-        }
-    }
-    for blk in b.blocks.iter() {
-        if inloop.contains(&blk) || !reach.contains(&blk) {
-            continue;
-        }
-        let sink = cloneable_sink(b, blk);
-        if !sink {
-            for &v in &b.blocks[blk].insts {
-                match b.values[v] {
-                    ValueDef::Operator(_, aa, _) => {
-                        if b.arg_pool[aa]
-                            .iter()
-                            .any(|&a| inloop.contains(&defb[b.resolve_alias(a)]))
-                        {
-                            if verbose {
-                                if pliron_cfg::tracing_on() {
-                                    tracing::debug!(target: "pliron::wasm","wloop: {h} skipped leak {v} in {blk}")
-                                };
-                            }
-                            return false;
-                        }
-                    }
-                    ValueDef::PickOutput(src, ..) => {
-                        if inloop.contains(&defb[b.resolve_alias(src)]) {
-                            if verbose {
-                                if pliron_cfg::tracing_on() {
-                                    tracing::debug!(target: "pliron::wasm","wloop: {h} skipped leak pick {v} in {blk}")
-                                };
-                            }
-                            return false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // All terminator uses count as leaks: cond/select/return are
-            // direct operands, and edge args on this block's outgoing
-            // edges must be dominated here too.
-            let mut leak = None;
-            b.blocks[blk].terminator.visit_uses(|a| {
-                let a = b.resolve_alias(a);
-                if inloop.contains(&defb[a]) {
-                    leak = Some(a);
-                }
-            });
-            if let Some(a) = leak {
-                if verbose {
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::wasm",
-                            "wloop: {h} skipped leak via terminator {a} in {blk} defb={} term={:?}",
-                            defb[a], b.blocks[blk].terminator
-                        )
-                    };
-                }
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Rewrite every use of `v` inside `blk` — inst args, alias targets and
-/// all terminator operands — to `np`.
-fn rewrite_block_uses(b: &mut FunctionBody, blk: WBlock, v: WV, np: WV) {
-    let insts = b.blocks[blk].insts.clone();
-    for inst in insts {
-        match b.values[inst] {
-            ValueDef::Operator(_, aa, _) => {
-                for ai in 0..b.arg_pool[aa].len() {
-                    let a = b.arg_pool[aa][ai];
-                    if b.resolve_alias(a) == v {
-                        b.arg_pool[aa][ai] = np;
-                    }
-                }
-            }
-            ValueDef::Alias(a) if b.resolve_alias(a) == v => {
-                b.values[inst] = ValueDef::Alias(np);
-            }
-            _ => {}
-        }
-    }
-    let mut term = b.blocks[blk].terminator.clone();
-    term.update_uses(|a| {
-        if b.resolve_alias(*a) == v {
-            *a = np;
-        }
-    });
-    b.blocks[blk].terminator = term;
-}
-
-/// A value equal to `v` usable inside `blk`'s frame. Unreachable blocks
-/// may use `v` directly (dead uses don't count); reachable blocks get a
-/// *carrier* param fed by every incoming edge — in-loop blocks included.
-/// Feeding a carrier pushes args into the preds' terminators. Only an
-/// in-loop pred `v` dominates (or a dead pred, whose args dangle
-/// harmlessly) may take `v` itself; any other pred gets its own carrier
-/// on demand. Both halves of that condition are load-bearing:
-/// domination keeps the pushed arg valid SSA (`v` dominating `blk` does
-/// *not* imply it dominates `blk`'s preds — `entry→pr→cur→def(v)→blk`
-/// is a legal shape), and the in-loop requirement keeps `loop_cloneable`
-/// happy — an outside block dominated by the loop def is still an
-/// outside block, and pushing `v` there plants a fresh leak. The
-/// carrier is registered before its edges are fed, so CFG cycles
-/// resolve to each other's params instead of recursing forever.
-///
-/// Feasibility is checked before any mutation: the pred-walk must bottom
-/// out at dead blocks or dominated in-loop ones and can never cross the
-/// entry block (its params are the function signature). If the walk
-/// would reach entry, `v` is returned unsealed and cloning simply bails.
-fn seal_value(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    cfg: &waffle::cfg::CFGInfo,
-    inloop: &FxHashSet<WBlock>,
-    reach: &FxHashSet<WBlock>,
-    carriers: &mut FxHashMap<(WBlock, WV), WV>,
-    blk: WBlock,
-    v: WV,
-) -> WV {
-    let v = b.resolve_alias(v);
-    if inloop.contains(&blk) || !reach.contains(&blk) {
-        return v;
-    }
-    if let Some(&np) = carriers.get(&(blk, v)) {
-        return np;
-    }
-    let Some(ty) = b.values[v].ty(&b.type_pool) else {
-        // Multi-result/untyped defs can't be params; the leak stays and
-        // cloning still bails, but the rest of the block's leaks seal.
-        return v;
-    };
-    let dblk = defb[v];
-    // Mirror of the carrier walk below, without mutating: infeasible iff
-    // it would need a carrier on the entry block.
-    {
-        let mut seen: FxHashSet<WBlock> = [blk].into_iter().collect();
-        let mut wl = vec![blk];
-        while let Some(cur) = wl.pop() {
-            for &pr in &b.blocks[cur].preds {
-                if !seen.insert(pr)
-                    || !reach.contains(&pr)
-                    || (inloop.contains(&pr) && cfg.dominates(dblk, pr))
-                    || carriers.contains_key(&(pr, v))
-                {
-                    continue;
-                }
-                if pr == WBlock::new(0) {
-                    return v;
-                }
-                wl.push(pr);
-            }
-        }
-    }
-    let np = b.add_blockparam(blk, ty);
-    defb[np] = blk;
-    carriers.insert((blk, v), np);
-    rewrite_block_uses(b, blk, v, np);
-    let mut wl = vec![blk];
-    while let Some(cur) = wl.pop() {
-        let preds = b.blocks[cur].preds.clone();
-        let poss = b.blocks[cur].pos_in_pred_succ.clone();
-        for (j, pr) in preds.iter().enumerate() {
-            let c = if !reach.contains(pr) || (inloop.contains(pr) && cfg.dominates(dblk, *pr)) {
-                v
-            } else if let Some(&c) = carriers.get(&(*pr, v)) {
-                c
-            } else {
-                let c = b.add_blockparam(*pr, ty);
-                defb[c] = *pr;
-                carriers.insert((*pr, v), c);
-                rewrite_block_uses(b, *pr, v, c);
-                wl.push(*pr);
-                c
-            };
-            edge_push(b, *pr, poss[j], c);
-        }
-    }
-    np
-}
-
-/// A value equal to `PickOutput(from, idx)` usable inside `blk`'s frame.
-/// `from` is a multi-result def and can't itself be a param: blocks the
-/// pick may be recomputed in (dead ones, or in-loop ones `from`
-/// dominates — same rule as `seal_value`) get a fresh `PickOutput`;
-/// other blocks get a carrier param fed recursively.
-fn seal_pick(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    cfg: &waffle::cfg::CFGInfo,
-    inloop: &FxHashSet<WBlock>,
-    reach: &FxHashSet<WBlock>,
-    carriers: &mut FxHashMap<(WBlock, WV, u32), WV>,
-    blk: WBlock,
-    from: WV,
-    idx: u32,
-    ty: WT,
-) -> WV {
-    let from = b.resolve_alias(from);
-    let mkpick =
-        |b: &mut FunctionBody, defb: &mut waffle::entity::PerEntity<WV, WBlock>, blk: WBlock| {
-            let pv = b.add_value(ValueDef::PickOutput(from, idx, ty));
-            defb[pv] = blk;
-            b.blocks[blk].insts.push(pv);
-            pv
-        };
-    if inloop.contains(&blk) || !reach.contains(&blk) {
-        return mkpick(b, defb, blk);
-    }
-    if let Some(&np) = carriers.get(&(blk, from, idx)) {
-        return np;
-    }
-    let dblk = defb[from];
-    // Same feasibility pre-check as `seal_value`: the pred-walk must
-    // never need a carrier on the entry block.
-    {
-        let mut seen: FxHashSet<WBlock> = [blk].into_iter().collect();
-        let mut wl = vec![blk];
-        while let Some(cur) = wl.pop() {
-            for &pr in &b.blocks[cur].preds {
-                if !seen.insert(pr)
-                    || !reach.contains(&pr)
-                    || (inloop.contains(&pr) && cfg.dominates(dblk, pr))
-                    || carriers.contains_key(&(pr, from, idx))
-                {
-                    continue;
-                }
-                if pr == WBlock::new(0) {
-                    return mkpick(b, defb, blk);
-                }
-                wl.push(pr);
-            }
-        }
-    }
-    let np = b.add_blockparam(blk, ty);
-    defb[np] = blk;
-    carriers.insert((blk, from, idx), np);
-    let mut wl = vec![blk];
-    while let Some(cur) = wl.pop() {
-        let preds = b.blocks[cur].preds.clone();
-        let poss = b.blocks[cur].pos_in_pred_succ.clone();
-        for (j, pr) in preds.iter().enumerate() {
-            let c = if !reach.contains(pr) || (inloop.contains(pr) && cfg.dominates(dblk, *pr)) {
-                mkpick(b, defb, *pr)
-            } else if let Some(&c) = carriers.get(&(*pr, from, idx)) {
-                c
-            } else {
-                let c = b.add_blockparam(*pr, ty);
-                defb[c] = *pr;
-                carriers.insert((*pr, from, idx), c);
-                wl.push(*pr);
-                c
-            };
-            edge_push(b, *pr, poss[j], c);
-        }
-    }
-    np
-}
-
-/// Loop-closed exits: any in-loop value used inside a reachable outside
-/// block is funneled through a new block param, fed by a carrier on
-/// every incoming edge (see `seal_value`). Cloned loop copies remap the
-/// edge args and stay dominated. `unreachable`-terminated pure sinks are
-/// sealed too: a clone may keep its own copy of a directly-targeted
-/// sink, but flow from a clone can also reach the *original* sink
-/// through shared outside blocks — sealing the use is what keeps it
-/// dominated on every incoming path.
-fn wseal_exits(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    cfg: &waffle::cfg::CFGInfo,
-    inloop: &FxHashSet<WBlock>,
-    h: WBlock,
-) {
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    let mut reach: FxHashSet<WBlock> = [WBlock::new(0)].into_iter().collect();
-    let mut wl = vec![WBlock::new(0)];
-    while let Some(x) = wl.pop() {
-        b.blocks[x].terminator.visit_targets(|t| {
-            if reach.insert(t.block) {
-                wl.push(t.block);
-            }
-        });
-    }
-    let mut carriers: FxHashMap<(WBlock, WV), WV> = FxHashMap::default();
-    let mut pick_carriers: FxHashMap<(WBlock, WV, u32), WV> = FxHashMap::default();
-    for blk in b.blocks.iter() {
-        if inloop.contains(&blk) || !reach.contains(&blk) {
-            continue;
-        }
-        // Leaked values: loop defs used by this block's insts or its
-        // terminator (visit_uses covers cond/select/return and the edge
-        // args, which evaluate in this block's frame).
-        let mut leaks: FxHashSet<WV> = FxHashSet::default();
-        // PickOutput sources can't become params (they must stay
-        // multi-result defs); seal each output separately instead.
-        let mut picks: Vec<(WV, WV, u32, WT)> = Vec::new();
-        for &v in &b.blocks[blk].insts {
-            match b.values[v] {
-                ValueDef::Operator(_, aa, _) => {
-                    for &a in b.arg_pool[aa].iter() {
-                        let a = b.resolve_alias(a);
-                        if inloop.contains(&defb[a]) {
-                            leaks.insert(a);
-                        }
-                    }
-                }
-                ValueDef::Alias(a) => {
-                    let a = b.resolve_alias(a);
-                    if inloop.contains(&defb[a]) {
-                        leaks.insert(a);
-                    }
-                }
-                ValueDef::PickOutput(from, idx, ty) => {
-                    let f = b.resolve_alias(from);
-                    if inloop.contains(&defb[f]) {
-                        picks.push((v, f, idx, ty));
-                    }
-                }
-                _ => {}
-            }
-        }
-        b.blocks[blk].terminator.visit_uses(|a| {
-            let a = b.resolve_alias(a);
-            if inloop.contains(&defb[a]) {
-                leaks.insert(a);
-            }
-        });
-        if leaks.is_empty() && picks.is_empty() {
-            continue;
-        }
-        if verbose {
-            if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::wasm","wseal: {h} {blk} leaks={leaks:?} picks={picks:?}")
-            };
-        }
-        let mut leaks: Vec<WV> = leaks.into_iter().collect();
-        leaks.sort();
-        for &v in &leaks {
-            let np = seal_value(b, defb, cfg, inloop, &reach, &mut carriers, blk, v);
-            if np == v && verbose {
-                if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::wasm","wseal: {h} {blk} unsealable leak {v} {:?}", b.values[v])
-                };
-            }
-        }
-        for &(inst, from, idx, ty) in &picks {
-            let np = seal_pick(
-                b,
-                defb,
-                cfg,
-                inloop,
-                &reach,
-                &mut pick_carriers,
-                blk,
-                from,
-                idx,
-                ty,
-            );
-            b.values[inst] = ValueDef::Alias(np);
-        }
-    }
-}
-
-fn remap_v(b: &FunctionBody, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
-    let r = b.resolve_alias(v);
-    vmap.get(&r).copied().unwrap_or(r)
-}
-
-/// Clone the blocks in `order` once: params, operator/alias insts, and
-/// terminators are remapped into the copy; in-loop targets point at the
-/// copy, exits keep their block, and cloneable sinks are cloned so their
-/// leaked args stay dominated.
-fn clone_loop(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    order: &[WBlock],
-) -> (FxHashMap<WBlock, WBlock>, FxHashMap<WV, WV>) {
-    let mut bmap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
-    let mut vmap: FxHashMap<WV, WV> = FxHashMap::default();
-    for &lb in order {
-        let nb = b.add_block();
-        bmap.insert(lb, nb);
-        for &(ty, pv) in b.blocks[lb].params.clone().iter() {
-            let np = b.add_blockparam(nb, ty);
-            defb[np] = nb;
-            vmap.insert(pv, np);
-        }
-    }
-    let mut aliases = Vec::new();
-    for &lb in order {
-        let nb = bmap[&lb];
-        let insts = b.blocks[lb].insts.clone();
-        for inst in insts {
-            match b.values[inst] {
-                ValueDef::Operator(op, aa, tt) => {
-                    let args: Vec<WV> = b.arg_pool[aa]
-                        .iter()
-                        .map(|&a| remap_v(b, &vmap, a))
-                        .collect();
-                    let tys: Vec<WT> = b.type_pool[tt].to_vec();
-                    let nv = b.add_op(nb, op, &args, &tys);
-                    defb[nv] = nb;
-                    vmap.insert(inst, nv);
-                }
-                ValueDef::PickOutput(from, idx, ty) => {
-                    let nv = b.add_value(ValueDef::PickOutput(remap_v(b, &vmap, from), idx, ty));
-                    b.blocks[nb].insts.push(nv);
-                    defb[nv] = nb;
-                    vmap.insert(inst, nv);
-                }
-                ValueDef::Alias(_) => aliases.push(inst),
-                _ => {}
-            }
-        }
-    }
-    // Aliases may point at insts cloned in any order; remap them now that
-    // every operator has a clone.
-    for inst in aliases {
-        if let ValueDef::Alias(a) = b.values[inst] {
-            let nv = remap_v(b, &vmap, a);
-            vmap.insert(inst, nv);
-        }
-    }
-    let mut smap: FxHashMap<WBlock, WBlock> = FxHashMap::default();
-    for &lb in order {
-        let nb = bmap[&lb];
-        let term = b.blocks[lb].terminator.clone();
-        let mut remap_t = |b: &mut FunctionBody, t: &BlockTarget| {
-            let blk = if let Some(&c) = bmap.get(&t.block) {
-                c
-            } else if cloneable_sink(b, t.block) {
-                *smap
-                    .entry(t.block)
-                    .or_insert_with_key(|&tb| clone_sink(b, defb, &vmap, tb))
-            } else {
-                t.block
-            };
-            BlockTarget {
-                block: blk,
-                args: t.args.iter().map(|&a| remap_v(b, &vmap, a)).collect(),
-            }
-        };
-        let nt = match term {
-            Terminator::Br { target } => Terminator::Br {
-                target: remap_t(b, &target),
-            },
-            Terminator::CondBr {
-                cond,
-                if_true,
-                if_false,
-            } => Terminator::CondBr {
-                cond: remap_v(b, &vmap, cond),
-                if_true: remap_t(b, &if_true),
-                if_false: remap_t(b, &if_false),
-            },
-            Terminator::Select {
-                value,
-                targets,
-                default,
-            } => {
-                let value = remap_v(b, &vmap, value);
-                let targets: Vec<_> = targets.iter().map(|t| remap_t(b, t)).collect();
-                let default = remap_t(b, &default);
-                Terminator::Select {
-                    value,
-                    targets,
-                    default,
-                }
-            }
-            _ => Terminator::Unreachable,
-        };
-        b.set_terminator(nb, nt);
-    }
-    (bmap, vmap)
-}
-
-/// Loop versioning for in-loop unsigned bounds checks. Given a canonical
-/// induction variable `i` bounded by a dominating `i <u n` exit test, an
-/// in-loop check `idx <u len` (`idx = i + d`) always passes when the last
-/// iteration's index is in bounds. The preheader computes
-/// `hi = i0 + (n - i0 - 1) * step + d` in u64 (exact: it fits, since
-/// `(n - i0 - 1) * step < 2^64` and wraps make `hi >= 2^32 > len` bail to
-/// the slow path) and branches to a check-free clone when `i0 >=u n`
-/// (zero trips) or `hi <u len`. The original loop stays as the slow path.
-///
-/// Static upper bound for an i32 value, in u64, derived from constants
-/// and enclosing counted loops: a blockparam of an enclosing loop whose
-/// own header tests `param <u n_out` (constant bound, uniform
-/// non-negative step) is at most `n_out - 1` anywhere inside the loop
-/// nest. Returns None when no bound is provable.
-fn bound_u64(
-    b: &FunctionBody,
-    loops: &[(WBlock, FxHashSet<WBlock>)],
-    h: WBlock,
-    v: WV,
-    depth: u32,
-) -> Option<u64> {
-    if depth > 8 {
-        return None;
-    }
-    let v = b.resolve_alias(v);
-    match b.values[v] {
-        ValueDef::Operator(O::I32Const { value }, ..) => Some(value as u32 as u64),
-        ValueDef::Operator(O::I32Add, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                return None;
-            };
-            let s = bound_u64(b, loops, h, x, depth + 1)?.checked_add(bound_u64(
-                b,
-                loops,
-                h,
-                y,
-                depth + 1,
-            )?)?;
-            (s <= u32::MAX as u64).then_some(s)
-        }
-        ValueDef::Operator(O::I32Mul, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                return None;
-            };
-            let s = bound_u64(b, loops, h, x, depth + 1)?.checked_mul(bound_u64(
-                b,
-                loops,
-                h,
-                y,
-                depth + 1,
-            )?)?;
-            (s <= u32::MAX as u64).then_some(s)
-        }
-        ValueDef::BlockParam(oh, opidx, WT::I32) if oh != h => {
-            let (_, il2) = loops.iter().find(|(h2, _)| *h2 == oh)?;
-            if !il2.contains(&h) {
-                return None;
-            }
-            let Terminator::CondBr {
-                cond,
-                if_true,
-                if_false,
-            } = &b.blocks[oh].terminator
-            else {
-                return None;
-            };
-            let (x, n_out, pt) = as_check(b, *cond)?;
-            let pass = if pt { if_true } else { if_false };
-            if !il2.contains(&pass.block) {
-                return None;
-            }
-            let ValueDef::BlockParam(pb, pp, _) = b.values[x] else {
-                return None;
-            };
-            if pb != oh || pp != opidx {
-                return None;
-            }
-            // Uniform non-negative constant step on that param across
-            // oh's latches (an unchanged feed contributes 0). `v` must
-            // still own slot `opidx` — a stale BlockParam may index a
-            // removed slot after optimize drops an unused param.
-            if !matches!(b.blocks[oh].params.get(opidx as usize), Some(&(_, pv)) if pv == v) {
-                return None;
-            }
-            let pv = v;
-            let mut st: Option<i64> = None;
-            for (j, &p) in b.blocks[oh].preds.iter().enumerate() {
-                if !il2.contains(&p) {
-                    continue;
-                }
-                let tidx = b.blocks[oh].pos_in_pred_succ[j];
-                let mut arg = None;
-                b.blocks[p]
-                    .terminator
-                    .visit_target(tidx, |t| arg = t.args.get(opidx as usize).copied());
-                let arg = b.resolve_alias(arg?);
-                let s = if arg == pv {
-                    0
-                } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[arg] {
-                    let u = b.resolve_alias(b.arg_pool[aa][0]);
-                    let w = b.resolve_alias(b.arg_pool[aa][1]);
-                    let s = if u == pv {
-                        wconst(b, w)
-                    } else if w == pv {
-                        wconst(b, u)
-                    } else {
-                        None
-                    };
-                    match s {
-                        Some(s) => s,
-                        None => return None,
-                    }
-                } else {
-                    return None;
-                };
-                match st {
-                    None => st = Some(s),
-                    Some(t) if t == s => {}
-                    _ => return None,
-                }
-            }
-            if st? < 0 {
-                return None;
-            }
-            let nb = wconst(b, n_out)? as u64;
-            Some(nb.saturating_sub(1))
-        }
-        _ => None,
-    }
-}
-
-/// Normalize a CondBr `cond` into (idx, bound, pass-is-true) for
-/// `idx <u bound` / `idx >=u bound` shapes.
-fn as_check(b: &FunctionBody, cond: WV) -> Option<(WV, WV, bool)> {
-    match b.values[b.resolve_alias(cond)] {
-        ValueDef::Operator(O::I32LtU, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                return None;
-            };
-            Some((b.resolve_alias(x), b.resolve_alias(y), true))
-        }
-        ValueDef::Operator(O::I32GeU, aa, _) => {
-            let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                return None;
-            };
-            Some((b.resolve_alias(x), b.resolve_alias(y), false))
-        }
-        _ => None,
-    }
-}
-
-fn wbcheck(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    cfg: &waffle::cfg::CFGInfo,
-    inloop: &FxHashSet<WBlock>,
-    h: WBlock,
-    loops: &[(WBlock, FxHashSet<WBlock>)],
-) -> Option<(WBlock, FxHashSet<WBlock>)> {
-    let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
-    macro_rules! bail {
-        ($($a:tt)*) => {{
-            if verbose {
-                if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::wasm","wbcheck: {h} {}", format_args!($($a)*)) };
-            }
-            return None;
-        }};
-    }
-    // Single preheader that just forwards to h.
-    let edges = outside_edges(b, h, inloop);
-    let mut preds: Vec<WBlock> = edges.iter().map(|&(p, _)| p).collect();
-    preds.sort();
-    preds.dedup();
-    let [pre] = preds[..] else {
-        bail!("outside preds {preds:?}")
-    };
-    let pre_tidx = edges.iter().find(|&&(p, _)| p == pre)?.1;
-    let Terminator::Br { target: pre_t } = &b.blocks[pre].terminator else {
-        bail!("pre {pre} not a forwarder");
-    };
-    if pre_t.block != h {
-        bail!("pre {pre} targets {}", pre_t.block);
-    }
-    // Latches: in-loop preds of h.
-    let latches: Vec<(WBlock, usize)> = b.blocks[h]
-        .preds
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| inloop.contains(p))
-        .map(|(j, &p)| (p, b.blocks[h].pos_in_pred_succ[j]))
-        .collect();
-    if latches.is_empty() {
-        bail!("no latches");
-    }
-    // Normalize a CondBr `cond` into (idx, bound, pass-is-true) for
-    // `idx <u bound` / `idx >=u bound` shapes (`as_check` is the free fn).
-    // Exit-test candidates: `iv <u n`, one arm leaves the loop, the block
-    // dominates every latch so each iteration is gated by it. Several
-    // blocks can match (a bounds check has the same shape); pick per
-    // candidate the checks it dominates and use the first that yields
-    // any — ordered by RPO so a dominating test wins.
-    let mut cands: Vec<(WBlock, usize, WV)> = Vec::new();
-    'cand: for &lb in inloop.iter() {
-        let Terminator::CondBr {
-            cond,
-            if_true,
-            if_false,
-        } = &b.blocks[lb].terminator
-        else {
-            continue;
-        };
-        let Some((x, n, pass_true)) = as_check(b, *cond) else {
-            continue;
-        };
-        let pass = if pass_true { if_true } else { if_false };
-        let fail = if pass_true { if_false } else { if_true };
-        if !inloop.contains(&pass.block) || inloop.contains(&fail.block) {
-            continue;
-        }
-        let ValueDef::BlockParam(blk, pidx, _) = b.values[x] else {
-            continue;
-        };
-        // A stale BlockParam can outlive its slot: optimize may drop
-        // an unused param without rewriting the (dead) ValueDef that
-        // indexed it, leaving `x` pointing at a removed index.
-        if blk != h
-            || !matches!(b.blocks[h].params.get(pidx as usize), Some(&(_, v)) if v == x)
-            || !winv(b, defb, inloop, n)
-        {
-            continue;
-        }
-        for &(la, _) in &latches {
-            if !cfg.dominates(lb, la) {
-                continue 'cand;
-            }
-        }
-        cands.push((lb, pidx as usize, n));
-    }
-    cands.sort_by_key(|&(lb, _, _)| cfg.rpo_pos[lb]);
-    // How a provable check index relates to the counted exit test:
-    // `Same(d)` is `pv` itself or `pv + d`; `Ind(pidx, x0, step)` is a
-    // different header blockparam that is itself an affine IV (start
-    // `x0`, constant non-negative `step` on every latch) — e.g. a
-    // strength-reduced second induction like `k*256 + j`.
-    enum Chk {
-        Same(Option<WV>),
-        Ind(WV, i64),
-    }
-    let mut picked = None;
-    for &(tb, pidx, n) in &cands {
-        let pv = b.blocks[h].params[pidx].1;
-        // Check sites: `idx <u len`, dominated by the exit test, idx
-        // affine in pv or in another uniform-step induction param. The
-        // "pass" arm may stay in or leave the loop — removing a
-        // proven-true edge is sound either way.
-        let mut checks: Vec<(WBlock, WV, Chk, bool)> = Vec::new();
-        for &lb in inloop.iter() {
-            if lb == tb || !cfg.dominates(tb, lb) {
-                continue;
-            }
-            let Terminator::CondBr {
-                cond,
-                if_true,
-                if_false,
-            } = &b.blocks[lb].terminator
-            else {
-                continue;
-            };
-            let Some((x, len, pass_true)) = as_check(b, *cond) else {
-                continue;
-            };
-            let pass = if pass_true { if_true } else { if_false };
-            if !inloop.contains(&pass.block) || !winv(b, defb, inloop, len) {
-                continue;
-            }
-            let d = if x == pv {
-                Chk::Same(None)
-            } else if let ValueDef::Operator(O::I32Add, aa, _) = b.values[x] {
-                let &[u, v, ..] = &b.arg_pool[aa][..] else {
-                    continue;
-                };
-                let (u, v) = (b.resolve_alias(u), b.resolve_alias(v));
-                if u == pv && winv(b, defb, inloop, v) {
-                    Chk::Same(Some(v))
-                } else if v == pv && winv(b, defb, inloop, u) {
-                    Chk::Same(Some(u))
-                } else {
-                    continue;
-                }
-            } else if let ValueDef::BlockParam(hb, p2, _) = b.values[x] {
-                // Same stale-param guard: `x` must still own slot p2.
-                if hb != h
-                    || p2 as usize == pidx
-                    || !matches!(b.blocks[h].params.get(p2 as usize), Some(&(_, v)) if v == x)
-                {
-                    continue;
-                }
-                // Uniform non-negative constant step across latches (an
-                // unchanged feed is a step-0 latch, skipped like pv's).
-                let mut step: Option<i64> = None;
-                let mut ok = true;
-                for &(la, tidx) in &latches {
-                    let arg = edge_arg(b, la, tidx, p2 as usize);
-                    let arg = b.resolve_alias(arg);
-                    if arg == x {
-                        continue;
-                    }
-                    let s = match b.values[arg] {
-                        ValueDef::Operator(O::I32Add, aa, _) => {
-                            let u = b.resolve_alias(b.arg_pool[aa][0]);
-                            let v = b.resolve_alias(b.arg_pool[aa][1]);
-                            if u == x {
-                                wconst(b, v)
-                            } else if v == x {
-                                wconst(b, u)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    let Some(s) = s else {
-                        ok = false;
-                        break;
-                    };
-                    if s < 0 {
-                        ok = false;
-                        break;
-                    }
-                    match step {
-                        None => step = Some(s),
-                        Some(st) if st == s => {}
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-                let x0 = edge_arg(b, pre, pre_tidx, p2 as usize);
-                let x0 = b.resolve_alias(x0);
-                Chk::Ind(x0, step.unwrap_or(0))
-            } else {
-                continue;
-            };
-            checks.push((lb, len, d, pass_true));
-        }
-        if !checks.is_empty() {
-            picked = Some((tb, pidx, n, checks));
-            break;
-        }
-    }
-    let Some((_, pidx, n, checks)) = picked else {
-        bail!("no exit test with checks ({} candidates)", cands.len());
-    };
-    let pv = b.blocks[h].params[pidx].1;
-    if checks.len() > 8 {
-        bail!("too many checks");
-    }
-    // pv must be affine on every latch edge with one common invariant
-    // step (a latch feeding pv unchanged is step 0).
-    let mut c: Option<WV> = None;
-    for &(la, tidx) in &latches {
-        let arg = edge_arg(b, la, tidx, pidx);
-        let arg = b.resolve_alias(arg);
-        if arg == pv {
-            continue;
-        }
-        let step = match b.values[arg] {
-            ValueDef::Operator(O::I32Add, aa, _) => {
-                let &[x, y, ..] = &b.arg_pool[aa][..] else {
-                    return None;
-                };
-                let (x, y) = (b.resolve_alias(x), b.resolve_alias(y));
-                if x == pv && winv(b, defb, inloop, y) {
-                    y
-                } else if y == pv && winv(b, defb, inloop, x) {
-                    x
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        };
-        match c {
-            None => c = Some(step),
-            Some(c) if c == step => {}
-            _ => return None,
-        }
-    }
-    let i0 = edge_arg(b, pre, pre_tidx, pidx);
-    let i0 = b.resolve_alias(i0);
-    if !loop_cloneable(b, defb, inloop, h) {
-        bail!("not cloneable");
-    }
-    // Guard in the preheader, in u64: hi = i0 + (n - i0 - 1)*c + d.
-    let mut pop = |b: &mut FunctionBody, op: O, args: &[WV], tys: &[WT]| {
-        let v = b.add_op(pre, op, args, tys);
-        defb[v] = pre;
-        v
-    };
-    let i064 = pop(b, O::I64ExtendI32U, &[i0], &[WT::I64]);
-    let n64 = pop(b, O::I64ExtendI32U, &[n], &[WT::I64]);
-    let c64 = match c {
-        Some(c) => pop(b, O::I64ExtendI32U, &[c], &[WT::I64]),
-        None => pop(b, O::I64Const { value: 0 }, &[], &[WT::I64]),
-    };
-    let one = pop(b, O::I64Const { value: 1 }, &[], &[WT::I64]);
-    let trip = pop(b, O::I64Sub, &[n64, i064], &[WT::I64]);
-    let tm1 = pop(b, O::I64Sub, &[trip, one], &[WT::I64]);
-    let span = pop(b, O::I64Mul, &[tm1, c64], &[WT::I64]);
-    let last = pop(b, O::I64Add, &[i064, span], &[WT::I64]);
-    let mut acc: Option<WV> = None;
-    for &(_, len, ref d, _) in &checks {
-        let len64 = pop(b, O::I64ExtendI32U, &[len], &[WT::I64]);
-        // Static bound: when the affine start is bounded through
-        // enclosing counted loops (e.g. `i*n + k` bounded by the outer
-        // `i`/`j` tests), `hi` collapses to a constant — a
-        // loop-invariant test the engine can hoist out of the whole
-        // nest instead of recomputing per loop entry.
-        let n_c = wconst(b, n).map(|v| v as u64);
-        let hi_static = (|d: &Chk| -> Option<u64> {
-            match d {
-                Chk::Same(d) => {
-                    let db = match d {
-                        Some(d) => bound_u64(b, loops, h, *d, 0)?,
-                        None => 0,
-                    };
-                    n_c.and_then(|nc| nc.checked_sub(1)?.checked_add(db))
-                }
-                Chk::Ind(x0, k) => {
-                    let xb = bound_u64(b, loops, h, *x0, 0)?;
-                    if *k == 0 {
-                        Some(xb)
-                    } else {
-                        // `(iters-1)*step <= n-1` needs `iters <= n`,
-                        // i.e. the counted iv to step at least +1.
-                        let iv_step_ok = c
-                            .and_then(|v| wconst(b, v))
-                            .map(|s| s >= 1)
-                            .unwrap_or(false);
-                        if !iv_step_ok {
-                            return None;
-                        }
-                        n_c.and_then(|nc| {
-                            nc.checked_sub(1)?.checked_mul(*k as u64)?.checked_add(xb)
-                        })
-                    }
-                }
-            }
-        })(d);
-        let hi = match hi_static {
-            Some(v) => pop(b, O::I64Const { value: v }, &[], &[WT::I64]),
-            None => match d {
-                Chk::Same(Some(d)) => {
-                    let d64 = pop(b, O::I64ExtendI32U, &[*d], &[WT::I64]);
-                    pop(b, O::I64Add, &[last, d64], &[WT::I64])
-                }
-                Chk::Same(None) => last,
-                // Other affine param: hi = x0 + (trip-1)*step, step >= 0.
-                Chk::Ind(x0, k) => {
-                    let x064 = pop(b, O::I64ExtendI32U, &[*x0], &[WT::I64]);
-                    let k64 = pop(b, O::I64Const { value: *k as u64 }, &[], &[WT::I64]);
-                    let sp = pop(b, O::I64Mul, &[tm1, k64], &[WT::I64]);
-                    pop(b, O::I64Add, &[x064, sp], &[WT::I64])
-                }
-            },
-        };
-        let ok = pop(b, O::I64LtU, &[hi, len64], &[WT::I32]);
-        acc = Some(match acc {
-            None => ok,
-            Some(a) => pop(b, O::I32And, &[a, ok], &[WT::I32]),
-        });
-    }
-    let acc = acc.unwrap();
-    let zt = pop(b, O::I32GeU, &[i0, n], &[WT::I32]);
-    let guard = pop(b, O::I32Or, &[zt, acc], &[WT::I32]);
-    // Fast copy: clone the loop, drop each proven check's branch.
-    let mut order: Vec<WBlock> = inloop.iter().copied().collect();
-    order.sort_by_key(|&lb| cfg.rpo_pos[lb]);
-    let (bmap, _) = clone_loop(b, defb, &order);
-    for &(cb, _, _, pass_true) in &checks {
-        let nb = bmap[&cb];
-        let Terminator::CondBr {
-            if_true, if_false, ..
-        } = b.blocks[nb].terminator.clone()
-        else {
-            continue;
-        };
-        let pass = if pass_true { if_true } else { if_false };
-        b.blocks[nb].terminator = Terminator::Br { target: pass };
-    }
-    // Route the preheader edge: guard -> fast clone, else original.
-    let args = match &b.blocks[pre].terminator {
-        Terminator::Br { target } => target.args.clone(),
-        _ => unreachable!(),
-    };
-    let fh = bmap[&h];
-    b.blocks[pre].terminator = Terminator::CondBr {
-        cond: guard,
-        if_true: BlockTarget {
-            block: fh,
-            args: args.clone(),
-        },
-        if_false: BlockTarget { block: h, args },
-    };
-    b.recompute_edges();
-    if verbose {
-        if pliron_cfg::tracing_on() {
-            tracing::debug!(target: "pliron::wasm","wbcheck: {h} versioned {} checks -> {fh}", checks.len())
-        };
-    }
-    Some((fh, order.iter().map(|lb| bmap[lb]).collect()))
-}
-
-/// Clone an `unreachable`-terminated sink block (panic path) for a loop
-/// copy, remapping loop values through `vmap` and its own params/insts
-/// locally.
-fn clone_sink(
-    b: &mut FunctionBody,
-    defb: &mut waffle::entity::PerEntity<WV, WBlock>,
-    vmap: &FxHashMap<WV, WV>,
-    blk: WBlock,
-) -> WBlock {
-    fn mapv(b: &FunctionBody, lmap: &FxHashMap<WV, WV>, vmap: &FxHashMap<WV, WV>, v: WV) -> WV {
-        let r = b.resolve_alias(v);
-        lmap.get(&r).or_else(|| vmap.get(&r)).copied().unwrap_or(r)
-    }
-    let nb = b.add_block();
-    let mut lmap: FxHashMap<WV, WV> = FxHashMap::default();
-    for &(ty, pv) in b.blocks[blk].params.clone().iter() {
-        let np = b.add_blockparam(nb, ty);
-        defb[np] = nb;
-        lmap.insert(pv, np);
-    }
-    let insts = b.blocks[blk].insts.clone();
-    let mut aliases = Vec::new();
-    for inst in insts {
-        match b.values[inst] {
-            ValueDef::Operator(op, aa, tt) => {
-                let args: Vec<WV> = b.arg_pool[aa]
-                    .iter()
-                    .map(|&a| mapv(b, &lmap, vmap, a))
-                    .collect();
-                let tys: Vec<WT> = b.type_pool[tt].to_vec();
-                let nv = b.add_op(nb, op, &args, &tys);
-                defb[nv] = nb;
-                lmap.insert(inst, nv);
-            }
-            ValueDef::PickOutput(from, idx, ty) => {
-                let nv = b.add_value(ValueDef::PickOutput(mapv(b, &lmap, vmap, from), idx, ty));
-                b.blocks[nb].insts.push(nv);
-                defb[nv] = nb;
-                lmap.insert(inst, nv);
-            }
-            ValueDef::Alias(_) => aliases.push(inst),
-            _ => {}
-        }
-    }
-    for inst in aliases {
-        if let ValueDef::Alias(a) = b.values[inst] {
-            let nv = mapv(b, &lmap, vmap, a);
-            lmap.insert(inst, nv);
-        }
-    }
-    b.set_terminator(nb, Terminator::Unreachable);
-    nb
-}
-
-// ---------- CLIF -> waffle emit: the wasm path through the CLIF pipeline ----
+// ---------- CLIF -> waffle emit ----
 //
 // `lower_to_wasm_clif` runs FnLower + the pliron-clif-opt suite (same as the
 // native backend) via `lower::lower_clif_wasm`, then translates each
-// function's optimized CLIF to waffle SSA here. The dialect path above skips
-// all of that and goes straight to waffle; this path keeps the pipeline's
+// function's optimized CLIF to waffle SSA here â€” the pipeline's
 // CSE/loop/idominate work (and, with `simd` on, loopvec->v128) in front of
-// the same waffle backend.
+// the waffle backend.
 mod clif_emit {
     use super::*;
 
@@ -7992,7 +3809,7 @@ mod clif_emit {
 
     /// Post-pipeline CLIF -> waffle `FunctionBody`.
     struct CX<'o, 'a> {
-        o: &'o mut Obj<'a>,
+        o: &'o mut Obj,
         /// FuncId::index() -> symbol (the bookkeeping module's declarations).
         fn_names: &'a [String],
         /// DataId::index() -> symbol.
@@ -8004,7 +3821,7 @@ mod clif_emit {
         wbs: FxHashMap<ir::Block, WBlock>,
         /// Frame layout: CLIF stack slot -> byte offset under `fp`.
         slots: FxHashMap<CSS, u32>,
-        // Same frame machinery as FL: entry computes fp = (sp - frame) & mask,
+        // Frame machinery: entry computes fp = (sp - frame) & mask,
         // patched once `frame` is final.
         sp0: WV,
         fp: WV,
@@ -8017,7 +3834,7 @@ mod clif_emit {
 
     impl<'o, 'a> CX<'o, 'a> {
         fn new(
-            o: &'o mut Obj<'a>,
+            o: &'o mut Obj,
             sig: Signature,
             fn_names: &'a [String],
             data_names: &'a [String],
@@ -8382,6 +4199,20 @@ mod clif_emit {
             self.cvt(self.get1(v), WT::I32)
         }
 
+        /// Branch/trap/select condition: `cvt` wraps an i64 carrier to its
+        /// low 32 bits, which loses values nonzero only in the high half â€”
+        /// `(x & 0x8000..) != 0` sign tests wrapped to 0 and flipped
+        /// `x < 0` branches (wasm `if`/`br_if`/`select` read i32). Emit
+        /// `v != 0` for i64 operands instead.
+        fn cond(&mut self, v: WV) -> WV {
+            if self.ty_of(v) == WT::I64 {
+                let z = self.i64c(0);
+                self.op(O::I64Ne, &[v, z], WT::I32)
+            } else {
+                self.cvt(v, WT::I32)
+            }
+        }
+
         fn load(&mut self, t: ClType, p: WV, off: u64) -> WV {
             let memory = self.ma(off, t.bytes() as u64);
             let (o, ty) = match t {
@@ -8606,7 +4437,7 @@ mod clif_emit {
                 P::Ishl => {
                     // CLIF masks the amount by the value's bit width; wasm masks
                     // mod the container width. Narrow types must mask themselves.
-                    // The amount may carry a wider CLIF type than the value —
+                    // The amount may carry a wider CLIF type than the value â€”
                     // wasm shift operands must match the value's container.
                     let b = self.cvt(b, wty(t));
                     let b = if w < 32 { self.norm(b, w.ilog2()) } else { b };
@@ -8844,7 +4675,7 @@ mod clif_emit {
                 }
             }
             // Layout order can put a dominated (e.g. cold) block before its
-            // def block — walk in RPO so defs precede uses.
+            // def block â€” walk in RPO so defs precede uses.
             let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
             let mut seen = FxHashSet::default();
             let mut post = Vec::new();
@@ -8881,7 +4712,7 @@ mod clif_emit {
         }
 
         fn finish(mut self, _f: &ir::Function) -> FunctionBody {
-            // Patch frame placeholders (see FL::finish).
+            // Patch frame placeholders (see CX::new).
             let frame = crate::types::align_to(self.frame, self.frame_align) as u32;
             let mask = !(self.frame_align as u32 - 1);
             let patch = vec![(self.frame_c, frame), (self.mask_c, mask)];
@@ -9070,7 +4901,7 @@ mod clif_emit {
                             return;
                         }
                         let flat = self.flat(rt);
-                        let c = self.cvt(self.get1(args[0]), WT::I32);
+                        let c = self.cond(self.get1(args[0]));
                         if flat.len() == 1 {
                             let x = self.cvt(self.get1(args[1]), flat[0]);
                             let y = self.cvt(self.get1(args[2]), flat[0]);
@@ -9571,7 +5402,7 @@ mod clif_emit {
                         .set_terminator(self.cur, Terminator::Br { target: t });
                 }
                 ir::InstructionData::Brif { arg, blocks, .. } => {
-                    let c = self.cvt(self.get1(arg), WT::I32);
+                    let c = self.cond(self.get1(arg));
                     let if_true = self.block_target(f, &blocks[0]);
                     let if_false = self.block_target(f, &blocks[1]);
                     self.b.set_terminator(
@@ -9615,7 +5446,7 @@ mod clif_emit {
                     self.b.set_terminator(self.cur, Terminator::Unreachable);
                 }
                 ir::InstructionData::CondTrap { arg, .. } => {
-                    let c = self.cvt(self.get1(arg), WT::I32);
+                    let c = self.cond(self.get1(arg));
                     // trapnz traps when nonzero; trapz when zero.
                     let c = if opc == P::Trapz {
                         let z = self.i32c(0);
@@ -10066,7 +5897,21 @@ mod clif_emit {
         fn extend(&mut self, f: &ir::Function, arg: ir::Value, rt: ClType, signed: bool) -> Vals {
             let st = self.vty(f, arg);
             if rt == clt::I128 || rt == clt::F128 {
-                let a = self.cvt(self.get1(arg), WT::I64);
+                let raw = self.get1(arg);
+                let a = if wty(st) == WT::I64 {
+                    raw
+                } else if signed {
+                    // Sign-extend the narrow container to i32, then i32->i64
+                    // signed â€” `cvt`'s I64ExtendI32U would leave -1 as
+                    // 0xFFFFFFFF (e.g. a signed i8 enum discriminant cast).
+                    let s = self.sext(raw, st.bits());
+                    self.op(O::I64ExtendI32S, &[s], WT::I64)
+                } else {
+                    // Zero-extend: canonicalize the narrow container first so
+                    // stray high bits can't leak into the low word.
+                    let z = self.norm(raw, st.bits());
+                    self.op(O::I64ExtendI32U, &[z], WT::I64)
+                };
                 let hi = if signed {
                     let s = self.i64c(63);
                     self.op(O::I64ShrS, &[a, s], WT::I64)
@@ -10299,7 +6144,7 @@ mod clif_emit {
                         self.op(O::I32Sub, &[c, off], WT::I32)
                     }
                 }
-                // `ctz_nonzero` has the same lowering — the caller's nonzero
+                // `ctz_nonzero` has the same lowering â€” the caller's nonzero
                 // guarantee just lets us skip the zero case a plain ctz
                 // already produces.
                 P::Ctz | P::CtzNonzero => {
@@ -10699,7 +6544,7 @@ mod clif_emit {
 
         /// 128-bit shift on a (lo,hi) pair; `amt` is an i64 count (masked
         /// internally). `shl` selects left, `arith` the right-shift flavour.
-        /// Same construction as the dialect path's `shift128`.
+        /// Same construction as the old dialect path's `shift128`.
         fn sh128(&mut self, shl: bool, arith: bool, lo: WV, hi: WV, amt: WV) -> (WV, WV) {
             let c63 = self.i64c(63);
             let c64 = self.i64c(64);
@@ -10845,7 +6690,7 @@ mod clif_emit {
             }
             if op == P::IaddPairwise {
                 // phadd-style: result lanes are x's adjacent pairs in the low
-                // half, y's in the high half — shuffle evens and odds of each
+                // half, y's in the high half â€” shuffle evens and odds of each
                 // input together, then lane-wise add.
                 let lb = (lane.bits() / 8) as usize;
                 let pairs = 16 / lb / 2;
@@ -11294,8 +7139,8 @@ mod clif_emit {
                     self.setv(r0, smallvec![lo, hi]);
                 }
                 P::Ishl | P::Ushr | P::Sshr => {
-                    // Inline (like the dialect path): the compiler-rt shift
-                    // helpers themselves contain i128 shifts, so libcalling
+                    // Lowered inline: the compiler-rt shift helpers
+                    // themselves contain i128 shifts, so libcalling
                     // would recurse.
                     let amt = self.cvt(bl, WT::I64);
                     let (lo, hi) = self.sh128(op == P::Ishl, op == P::Sshr, al, ah, amt);
@@ -11319,8 +7164,8 @@ mod clif_emit {
                 }
                 P::Umulhi | P::Smulhi => panic!("i128 mulhi (no __umulh128)"),
                 P::UaddOverflow | P::SaddOverflow | P::UsubOverflow | P::SsubOverflow => {
-                    // (result, flag): same high-word sign test as the dialect
-                    // path. Flag is a canonical i8.
+                    // (result, flag): high-word sign test.
+                    // Flag is a canonical i8.
                     let r1 = f.dfg.inst_results(i)[1];
                     let is_add = matches!(op, P::UaddOverflow | P::SaddOverflow);
                     let signed = matches!(op, P::SaddOverflow | P::SsubOverflow);
@@ -11428,9 +7273,9 @@ mod clif_emit {
         /// function frame (stack pointer restore happens here).
         fn ret(&mut self, vs: &[WV]) {
             let cur = self.cur;
-            // Restore SP to the entry value (same shape as FL's epilogue):
+            // Restore SP to the entry value (function epilogue shape):
             // `inline_site`'s frame folding only drops restores whose value
-            // derives from the callee's folded frame chain — a `GlobalGet sp +
+            // derives from the callee's folded frame chain â€” a `GlobalGet sp +
             // frame` form would survive the splice and ratchet SP upward on
             // every inlined call.
             let (sp, sp0) = (self.o.sp, self.sp0);
@@ -11444,30 +7289,19 @@ mod clif_emit {
         }
     }
 
-    /// The CLIF-pipeline wasm path (`PLIRON_WASM_CLIF=1`): lower_clif_wasm gives
-    /// each defined function's optimized CLIF + FuncId/DataId symbol tables; CX
-    /// translates them to waffle; `emit_obj` finishes the module identically to
-    /// the dialect path.
+    /// The wasm path: lower_clif_wasm gives each defined function's
+    /// optimized CLIF + FuncId/DataId symbol tables; CX translates them to
+    /// waffle; `emit_obj` finishes the module.
     pub(crate) fn lower_to_wasm_clif(
         ctx: &Context,
         st: &State,
-        sess: &rustc_session::Session,
+        host: &dyn crate::lower::Host,
         name: &str,
         features: &[String],
         unwind: bool,
     ) -> Vec<u8> {
         let simd = features.iter().any(|f| f == "simd128");
-        let mut wc = crate::lower::lower_clif_wasm(
-            ctx,
-            st,
-            &crate::RustcHost {
-                sess,
-                prof: crate::RustcProf(&sess.prof),
-            },
-            name,
-            unwind,
-            simd,
-        );
+        let mut wc = crate::lower::lower_clif_wasm(ctx, st, host, name, unwind, simd);
         let mut m = Module::empty();
         let mem = m.memories.push(MemoryData {
             initial_pages: 0,
@@ -11491,8 +7325,6 @@ mod clif_emit {
             kind: ImportKind::Table(table),
         });
         let mut o = Obj {
-            ctx,
-            st,
             m,
             sigs: FxHashMap::default(),
             funcs: Vec::new(),
@@ -11501,8 +7333,6 @@ mod clif_emit {
             sp: Global::invalid(),
             table,
             mem,
-            unwind,
-            trip: waffle::Global::invalid(),
         };
         o.sp = o.import_global("env", "__stack_pointer", true);
 
@@ -11510,13 +7340,12 @@ mod clif_emit {
             if st.dead_fns.contains(n) {
                 continue;
             }
-            // Reuse the dialect leaf-flattening for the declared signature; the
+            // Declare the signature from the pliron leaf-flattening; the
             // CLIF sig is the same leaf set in the same order.
             let sig = o.sig(wsig(ctx, f.ty));
             o.funcs.push(FDecl {
                 name: n.clone(),
                 sig,
-                ty: Some(f.ty),
                 body: None,
                 always: f.always_inline,
                 hint: f.inline_hint,

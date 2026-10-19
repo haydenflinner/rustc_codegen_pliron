@@ -1,0 +1,2 @@
+# Corpus functions whose clif-check report failure is known checker noise,
+# one <set>/<file> per line with a # reason. harness/gate.py ignores these.

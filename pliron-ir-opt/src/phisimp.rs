@@ -14,7 +14,7 @@ use pliron::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::has_body;
+use crate::opt_body;
 use crate::inline::blocks;
 use crate::state::State;
 
@@ -31,7 +31,7 @@ fn succ_operand(ctx: &Context, t: Ptr<Operation>, si: usize, i: usize, na: usize
 fn defined_in(ctx: &Context, v: Value, b: Ptr<BasicBlock>) -> bool {
     match v.defining_op() {
         Some(op) => op.deref(ctx).get_parent_block() == Some(b),
-        None => b.deref(ctx).arguments().any(|a| a == v),
+        None => b.deref(ctx).arguments(ctx).any(|a| a == v),
     }
 }
 
@@ -45,8 +45,8 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
         }
         // Only the terminator carries successor edges (invokes included).
         if let Some(t) = b.deref(ctx).iter(ctx).last() {
-            work.extend(t.deref(ctx).successors());
-            work.extend(st.invokes.get(&t).map(|&(l, _)| l));
+            work.extend(t.deref(ctx).successors(ctx));
+            work.extend(st.invokes.get(t).map(|&(l, _)| l));
         }
     }
     seen
@@ -58,7 +58,7 @@ pub fn run(ctx: &mut Context, st: &State) {
         .funcs
         .values()
         .map(|f| f.op)
-        .filter(|&f| has_body(ctx, f))
+        .filter(|&f| opt_body(ctx, st, f))
         .collect();
     let mut n = 0;
     for f in fns {
@@ -73,7 +73,7 @@ pub fn run(ctx: &mut Context, st: &State) {
             let Some(t) = b.deref(ctx).iter(ctx).last() else {
                 continue;
             };
-            let succs: Vec<_> = t.deref(ctx).successors().collect();
+            let succs: Vec<_> = t.deref(ctx).successors(ctx).collect();
             for (si, s) in succs.into_iter().enumerate() {
                 preds.entry(s).or_default().push((t, si));
             }
@@ -89,7 +89,7 @@ pub fn run(ctx: &mut Context, st: &State) {
                 };
                 let na = b.deref(ctx).get_num_arguments();
                 for i in (0..na).rev() {
-                    let arg = b.deref(ctx).get_argument(i);
+                    let arg = b.deref(ctx).get_argument(ctx, i);
                     let mut uniq = None;
                     let ok = ps
                         .iter()

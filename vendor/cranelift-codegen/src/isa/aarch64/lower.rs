@@ -142,12 +142,13 @@ fn postindex_mem(f: &Function, inst: IRInst, base: Value) -> Option<PostIndexCan
 
 fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static POSTIDX_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var("PLIRON_POSTIDX").map_or(true, |v| v != "0"))
     {
         return None;
     }
     let f = ctx.f;
-    if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+    if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
         if let InstructionData::Binary { opcode, .. } = ctx.data(ir_inst) {
             if matches!(opcode, Opcode::Iadd | Opcode::Isub) {
                 eprintln!(
@@ -181,7 +182,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         _ => None,
     };
     let Some((base, wb)) = pair else {
-        if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+        if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
             if let InstructionData::Binary { args, .. } = ctx.data(ir_inst) {
                 eprintln!(
                     "postidx {} {ir_inst}: no const in args {:?} ({:?})",
@@ -193,7 +194,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
         return None;
     };
-    let debug = std::env::var("PLIRON_POSTIDX_DEBUG").is_ok();
+    let debug = *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some());
     if wb == 0 || !(-256..=255).contains(&wb) {
         return None;
     }
@@ -222,7 +223,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
     }
     let Some(cand) = cand else {
-        if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+        if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
             eprintln!(
                 "postidx {} {ir_inst}@{:?}: no cand on base {base}",
                 f.name,
@@ -232,7 +233,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         return None;
     };
     let Some(kind) = postindex_mem(f, cand, base) else {
-        if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+        if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
             eprintln!("postidx {} {ir_inst}: cand {cand} not mem", f.name);
         }
         return None;
@@ -254,7 +255,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
             continue;
         }
         if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
-            if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+            if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
                 eprintln!("postidx {} {ir_inst}: base live at {inst}", f.name);
             }
             return None;
@@ -266,7 +267,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
         for inst in f.layout.block_insts(bb) {
             if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
-                if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+                if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
                     eprintln!("postidx {} {ir_inst}: base live in {bb} at {inst}", f.name);
                 }
                 return None;
@@ -287,7 +288,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         .map(|v| f.dfg.resolve_aliases(*v));
     if let Some(v) = ld_result {
         if !ctx.value_has_multiple_uses(v) {
-            if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+            if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
                 eprintln!("postidx {} {ir_inst}: cand {cand} single-use result {v}", f.name);
             }
             let mut in_range = false;
@@ -309,7 +310,7 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
         }
     }
 
-    if std::env::var("PLIRON_POSTIDX_DEBUG").is_ok() {
+    if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
         eprintln!("postidx {} {ir_inst}@{block:?}: FUSED cand {cand}", f.name);
     }
     let flags = match f.dfg.insts[cand] {

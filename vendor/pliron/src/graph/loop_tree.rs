@@ -542,7 +542,7 @@ impl Analysis for LoopInfo {
     fn compute(op: Ptr<Operation>, ctx: &Context, analyses: &mut AnalysisManager) -> Result<Self> {
         let mut dom_info = analyses.get_analysis_mut::<DomInfo>(op, ctx)?;
         let mut loop_info = Self::default();
-        for region in op.deref(ctx).regions() {
+        for region in op.deref(ctx).regions(ctx) {
             loop_info.get_loop_tree(ctx, region, &mut dom_info);
         }
         Ok(loop_info)

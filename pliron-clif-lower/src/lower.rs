@@ -18,10 +18,10 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default_libcall_names};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use pliron::basic_block::BasicBlock;
-use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
+use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
-use pliron::op::{Op, OpId};
+use pliron::op::op_cast;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
@@ -37,6 +37,17 @@ use crate::types::{
 use crate::{address_taken, has_body};
 
 type Vals = SmallVec<[ir::Value; 2]>;
+
+/// Recover the scratch tables from a finished `FnLower`, clearing them
+/// for the next function — a macro rather than a `&mut FnLower` method
+/// because `fl.b.finalize`/`fl.lifetimes` leave `fl` partially moved.
+/// Call after all post-lower reads of `fl.vals`/`fl.cconst`.
+macro_rules! retake_scratch {
+    ($scratch:expr, $fl:expr, $($f:ident),+ $(,)?) => {$(
+        $scratch.$f = std::mem::take(&mut $fl.$f);
+        $scratch.$f.clear();
+    )+};
+}
 
 #[derive(Clone, Copy)]
 enum Sym {
@@ -124,7 +135,7 @@ pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> 
     taken.extend(
         st.invokes
             .keys()
-            .filter_map(|&op| crate::inline::direct_callee(ctx, st, op))
+            .filter_map(|op| crate::inline::direct_callee(ctx, st, op))
             .cloned(),
     );
     st.funcs
@@ -262,9 +273,10 @@ pub fn lower_to_object(
     // PLIRON_CRTFREE: the bookkeeping module emits the CRT/TLS statics; the
     // remaining piece is making the linker pull the CRT import libraries —
     // /defaultlib:msvcrt is already on rustc's line, so advertise the rest
-    // via .drectve.
+    // via .drectve. Opt-in (rust-lld + mkwinlibs only): a stock `link.exe`
+    // resolves ucrtbase from the SDK, not our synthesized lib.
     if isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
-        && std::env::var_os("PLIRON_CRTFREE").is_some_and(|v| v != "0")
+        && pliron_cfg::env_is("PLIRON_CRTFREE", "1")
     {
         let s =
             product
@@ -319,12 +331,12 @@ pub fn lower_to_object(
 /// Declare and define every function and global of `ctx`'s module in `m`
 /// (an `ObjectModule`, a `JITModule`, ...).
 #[allow(clippy::too_many_arguments)]
-pub fn lower_module(
+pub fn lower_module<'a>(
     m: &mut dyn Module,
     unwind: bool,
     hot: bool,
     ctx: &Context,
-    st: &State,
+    st: &'a State,
     isa: &Arc<dyn TargetIsa>,
     name: &str,
     host: &dyn Host,
@@ -493,6 +505,9 @@ pub fn lower_module(
         scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
         invariant: FxHashSet<ir::Inst>,
         operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
+        /// Dense gate for `Pipe::carry_one`'s fact probes — re-seeded
+        /// from the tables at each `Pipe` construction.
+        fact_bits: cranelift_codegen::entity::SecondaryMap<ir::Value, u8>,
         block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
         // PGO: CLIF block -> executed count (from st.prof_bcount via
         // block_region); CLIF passes read it through Pipe.prof.
@@ -516,7 +531,7 @@ pub fn lower_module(
         verify_env: bool,
         verify_full_env: bool,
         fn_flags: &'a crate::pipeline::FnFlags,
-        region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+        region_parent: &'a crate::context::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
         prof: &'a dyn Prof,
         /// FuncId-indexed symbol table for `PLIRON_CORPUS` name maps.
         fn_names: &'a [String],
@@ -525,194 +540,51 @@ pub fn lower_module(
     let _pglo = host.prof().activity("pliron_lowerobj", None);
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
+    // Each finished `FnJob` is fully self-contained though, so the (B)
+    // worker pool starts draining as soon as the first job lands rather
+    // than waiting for the last lowering: jobs stream over a channel
+    // and phase (B)'s wall hides behind phase (A)'s serial walk. Serial
+    // when `PLIRON_OPT_BISECT` is set (the bisect counter must number
+    // pass applications deterministically) or `PLIRON_PAR` overrides.
+    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
+    let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
+        1
+    } else {
+        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .min(st.funcs.len().max(1))
+            .max(1)
+    };
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
     let _pgfl = host.prof().activity("pliron_fnlower", None);
-    let mut jobs: Vec<FnJob> = Vec::new();
-    for (n, f) in &st.funcs {
-        if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
-            continue;
-        }
-        CUR_FN.with(|c| c.borrow_mut().clone_from(n));
-        let Sym::F(id, _) = ids[n] else {
-            unreachable!()
-        };
-        let id = hot_bodies.get(n).copied().unwrap_or(id);
-        clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
-        let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
-        let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
-        let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
-        let noalias: FxHashSet<cranelift_codegen::ir::Value>;
-        let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
-        let nowrite: FxHashMap<FuncRef, bool>;
-        let call_frozen: FxHashMap<FuncRef, u64>;
-        let scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>;
-        let invariant: FxHashSet<ir::Inst>;
-        let operand_frozen: FxHashMap<cranelift_codegen::ir::Value, Vec<(u64, Ptr<BasicBlock>)>>;
-        let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
-        let prof: FxHashMap<ir::Block, u64>;
-        let lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>;
-        let nocap: FxHashSet<(ir::Inst, u32)>;
-        let stubs: rustc_hash::FxHashSet<&'static str>;
-        {
-            let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
-            let mut fl = FnLower {
-                ctx,
-                st,
-                m: &mut *m,
-                ids: &ids,
-                b,
-                vals: FxHashMap::default(),
-                cconst: FxHashMap::default(),
-                blocks: FxHashMap::default(),
-                frefs: FxHashMap::default(),
-                cfrefs: FxHashMap::default(),
-                gvs: FxHashMap::default(),
-                terminated: false,
-                cc,
-                tcfg: cfg,
-                internal: &internal,
-                own_tail: internal.contains(n),
-                wasm: false,
-                exn: None,
-                vars: FxHashMap::default(),
-                stubs: rustc_hash::FxHashSet::default(),
-                nonnull: FxHashSet::default(),
-                bool01: FxHashSet::default(),
-                derived: FxHashMap::default(),
-                frozen: FxHashMap::default(),
-                noalias: FxHashSet::default(),
-                deref: FxHashMap::default(),
-                call_frozen: FxHashMap::default(),
-                scoped: FxHashMap::default(),
-                invariant: FxHashSet::default(),
-                block_region: FxHashMap::default(),
-                nowrite: FxHashMap::default(),
-                lifetimes: Vec::new(),
-                nocap: FxHashSet::default(),
-                va_buf: None,
-                va_fids: FxHashMap::default(),
-                eh_data,
-                eh_tls_v: None,
-                eject: None,
-            };
-            if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::lower", lowerfn = %n);
-            }
-            fl.lower(f.op);
-            // Resolve each marker's pointer to its CLIF value — safe now
-            // that every def has been lowered. Untranslatable pointers
-            // (promoted allocas, folded ops) just drop the marker. The
-            // value is resolved to its stack slots here: by slotmerge's
-            // point in the pipeline the operand is usually long dead.
-            // (This has to precede `finalize`: it moves `fl.b` and keeps
-            // `clctx.func` borrowed for `fl`'s whole lifetime.)
-            let lt_dbg = crate::env_set("PLIRON_LT_DEBUG");
-            let mut lt_dropped = FxHashMap::default();
-            lifetimes = std::mem::take(&mut fl.lifetimes)
-                .into_iter()
-                .filter_map(|(p, anchor, b, start)| {
-                    let r = fl
-                        .vals
-                        .get(&p)
-                        .or_else(|| fl.cconst.get(&p))
-                        .and_then(|vs| vs.first().copied())
-                        .map(|v| {
-                            (
-                                crate::slotmerge::marker_slots(fl.b.func, v),
-                                anchor,
-                                b,
-                                start,
-                            )
-                        });
-                    if lt_dbg {
-                        match &r {
-                            None => *lt_dropped.entry(format!("noval {p:?}")).or_insert(0u32) += 1,
-                            Some((ss, ..)) if ss.is_empty() => {
-                                *lt_dropped.entry(format!("empty {p:?}")).or_insert(0u32) += 1
-                            }
-                            _ => {}
-                        }
-                    }
-                    r
-                })
-                .collect();
-            if lt_dbg {
-                let n: u32 = lt_dropped.values().sum();
-                let nalloc = crate::sroa::allocas(fl.ctx, f.op).len();
-                let nslots = fl.b.func.sized_stack_slots.len();
-                eprintln!(
-                    "lt-debug {n}: dropped/empty {n} markers, kept {} — {nalloc} allocas ({} promoted), {nslots} slots",
-                    lifetimes.len(),
-                    fl.st.promoted.len(),
-                );
-                for (k, c) in lt_dropped.iter().take(40) {
-                    eprintln!("lt-debug   {c}x {k}");
-                }
-            }
-            fl.b.finalize(cfg);
-            asm_stubs.extend(fl.stubs.iter().copied());
-            nonnull = std::mem::take(&mut fl.nonnull);
-            derived = std::mem::take(&mut fl.derived);
-            frozen = std::mem::take(&mut fl.frozen);
-            noalias = std::mem::take(&mut fl.noalias);
-            deref = std::mem::take(&mut fl.deref);
-            nowrite = std::mem::take(&mut fl.nowrite);
-            call_frozen = std::mem::take(&mut fl.call_frozen);
-            scoped = std::mem::take(&mut fl.scoped);
-            invariant = std::mem::take(&mut fl.invariant);
-            block_region = std::mem::take(&mut fl.block_region);
-            nocap = std::mem::take(&mut fl.nocap);
-            // Caller-side operands of `noalias readonly` clone params, in
-            // CLIF values (`State::region_frozen_op`): `*v` is immutable
-            // while the binding clone runs — loadfwd's scoped immunity.
-            let mut ofz = FxHashMap::default();
-            for (&pv, rs) in &fl.st.region_frozen_op {
-                if let Some(&v) = fl
-                    .vals
-                    .get(&pv)
-                    .or_else(|| fl.cconst.get(&pv))
-                    .and_then(|vs| vs.first())
-                {
-                    ofz.entry(v).or_insert_with(Vec::new).extend_from_slice(rs);
-                }
-            }
-            operand_frozen = ofz;
-            stubs = std::mem::take(&mut fl.stubs);
-            prof = block_region
-                .iter()
-                .filter_map(|(&cb, &rb)| st.prof_bcount.get(&rb).map(|&c| (cb, c)))
-                .collect();
-        }
-        jobs.push(FnJob {
-            name: n,
-            id,
-            func: std::mem::replace(&mut clctx.func, ir::Function::new()),
-            nonnull,
-            derived,
-            frozen,
-            noalias,
-            deref,
-            nowrite,
-            call_frozen,
-            scoped,
-            invariant,
-            operand_frozen,
-            block_region,
-            prof,
-            lifetimes,
-            nocap,
-            stubs,
-            stats: crate::pipeline::Stats::default(),
-            err: None,
-            code: None,
-            dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
+    let tpa = std::time::Instant::now();
+    // `oi` stays the declaration index so results can be re-ordered for
+    // phase (C) even though production streams biggest-first: the drain
+    // after the last lowering is bound by the largest fn still queued,
+    // so feeding megafunctions early keeps it short. Block count is a
+    // rough size proxy — cheap to take and close enough for scheduling.
+    let mut order: Vec<(usize, (&String, &crate::iropt::state::FuncInfo))> = st
+        .funcs
+        .iter()
+        .enumerate()
+        .filter(|(_, (n, f))| has_body(ctx, f.op) && !st.dead_fns.contains(n))
+        .collect();
+    if nthreads > 1 {
+        order.sort_unstable_by_key(|(_, (_, f))| {
+            std::cmp::Reverse(
+                f.op.deref(ctx)
+                    .regions(ctx)
+                    .next()
+                    .map(|r| r.deref(ctx).iter(ctx).count())
+                    .unwrap_or(0),
+            )
         });
-        m.clear_context(&mut clctx);
     }
-
-    drop(_sfl);
-    // FuncId -> symbol table for corpus name maps (built late: `FnLower`
-    // can declare libcall stubs mid-lower).
+    let mut t_lower = std::time::Duration::ZERO;
+    let mut t_fin = std::time::Duration::ZERO;
+    let mut scratch = FlScratch::default();
+    // FuncId -> symbol table for corpus name maps. Built before
+    // `produce` borrows `m` — libcall stubs `FnLower` declares mid-lower
+    // get empty entries (`fn_names.get` stays bounds-safe).
     let mut fn_names: Vec<String> = Vec::new();
     for (id, d) in m.declarations().get_functions() {
         if fn_names.len() <= id.index() {
@@ -720,6 +592,208 @@ pub fn lower_module(
         }
         fn_names[id.index()] = d.name.clone().unwrap_or_default();
     }
+    let mut produce = |emit: &mut dyn FnMut(usize, FnJob<'a>)| {
+        for &(idx, (n, f)) in &order {
+            CUR_FN.with(|c| c.borrow_mut().clone_from(n));
+            let Sym::F(id, _) = ids[n] else {
+                unreachable!()
+            };
+            let id = hot_bodies.get(n).copied().unwrap_or(id);
+            clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
+            let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
+            let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
+            let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
+            let noalias: FxHashSet<cranelift_codegen::ir::Value>;
+            let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
+            let nowrite: FxHashMap<FuncRef, bool>;
+            let call_frozen: FxHashMap<FuncRef, u64>;
+            let scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>;
+            let invariant: FxHashSet<ir::Inst>;
+            let operand_frozen: FxHashMap<
+                cranelift_codegen::ir::Value,
+                Vec<(u64, Ptr<BasicBlock>)>,
+            >;
+            let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
+            let prof: FxHashMap<ir::Block, u64>;
+            let lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>;
+            let nocap: FxHashSet<(ir::Inst, u32)>;
+            let stubs: rustc_hash::FxHashSet<&'static str>;
+            {
+                let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
+                let mut fl = FnLower {
+                    ctx,
+                    st,
+                    m: &mut *m,
+                    ids: &ids,
+                    b,
+                    vals: std::mem::take(&mut scratch.vals),
+                    cconst: std::mem::take(&mut scratch.cconst),
+                    blocks: std::mem::take(&mut scratch.blocks),
+                    frefs: std::mem::take(&mut scratch.frefs),
+                    cfrefs: std::mem::take(&mut scratch.cfrefs),
+                    gvs: std::mem::take(&mut scratch.gvs),
+                    terminated: false,
+                    cc,
+                    tcfg: cfg,
+                    internal: &internal,
+                    own_tail: internal.contains(n),
+                    wasm: false,
+                    exn: None,
+                    vars: std::mem::take(&mut scratch.vars),
+                    stubs: rustc_hash::FxHashSet::default(),
+                    nonnull: FxHashSet::default(),
+                    bool01: std::mem::take(&mut scratch.bool01),
+                    derived: FxHashMap::default(),
+                    frozen: FxHashMap::default(),
+                    noalias: FxHashSet::default(),
+                    deref: FxHashMap::default(),
+                    call_frozen: FxHashMap::default(),
+                    scoped: FxHashMap::default(),
+                    invariant: FxHashSet::default(),
+                    block_region: FxHashMap::default(),
+                    nowrite: FxHashMap::default(),
+                    lifetimes: Vec::new(),
+                    nocap: FxHashSet::default(),
+                    va_buf: None,
+                    va_fids: std::mem::take(&mut scratch.va_fids),
+                    eh_data,
+                    eh_tls_v: None,
+                    eject: None,
+                    opnds: std::mem::take(&mut scratch.opnds),
+                    succs: std::mem::take(&mut scratch.succs),
+                };
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::lower", lowerfn = %n);
+                }
+                let tl = std::time::Instant::now();
+                fl.lower(f.op);
+                let tl2 = tl.elapsed();
+                t_lower += tl2;
+                let tl3 = std::time::Instant::now();
+                // Resolve each marker's pointer to its CLIF value — safe now
+                // that every def has been lowered. Untranslatable pointers
+                // (promoted allocas, folded ops) just drop the marker. The
+                // value is resolved to its stack slots here: by slotmerge's
+                // point in the pipeline the operand is usually long dead.
+                // (This has to precede `finalize`: it moves `fl.b` and keeps
+                // `clctx.func` borrowed for `fl`'s whole lifetime.)
+                let lt_dbg = crate::env_set("PLIRON_LT_DEBUG");
+                let mut lt_dropped = FxHashMap::default();
+                lifetimes = std::mem::take(&mut fl.lifetimes)
+                    .into_iter()
+                    .filter_map(|(p, anchor, b, start)| {
+                        let r = fl
+                            .vals
+                            .get(&p)
+                            .or_else(|| fl.cconst.get(&p))
+                            .and_then(|vs| vs.first().copied())
+                            .map(|v| {
+                                (
+                                    crate::slotmerge::marker_slots(fl.b.func, v),
+                                    anchor,
+                                    b,
+                                    start,
+                                )
+                            });
+                        if lt_dbg {
+                            match &r {
+                                None => {
+                                    *lt_dropped.entry(format!("noval {p:?}")).or_insert(0u32) += 1
+                                }
+                                Some((ss, ..)) if ss.is_empty() => {
+                                    *lt_dropped.entry(format!("empty {p:?}")).or_insert(0u32) += 1
+                                }
+                                _ => {}
+                            }
+                        }
+                        r
+                    })
+                    .collect();
+                if lt_dbg {
+                    let n: u32 = lt_dropped.values().sum();
+                    let nalloc = crate::sroa::allocas(fl.ctx, f.op).len();
+                    let nslots = fl.b.func.sized_stack_slots.len();
+                    eprintln!(
+                        "lt-debug {n}: dropped/empty {n} markers, kept {} — {nalloc} allocas ({} promoted), {nslots} slots",
+                        lifetimes.len(),
+                        fl.st.promoted.len(),
+                    );
+                    for (k, c) in lt_dropped.iter().take(40) {
+                        eprintln!("lt-debug   {c}x {k}");
+                    }
+                }
+                fl.b.finalize(cfg);
+                t_fin += tl3.elapsed();
+                asm_stubs.extend(fl.stubs.iter().copied());
+                nonnull = std::mem::take(&mut fl.nonnull);
+                derived = std::mem::take(&mut fl.derived);
+                frozen = std::mem::take(&mut fl.frozen);
+                noalias = std::mem::take(&mut fl.noalias);
+                deref = std::mem::take(&mut fl.deref);
+                nowrite = std::mem::take(&mut fl.nowrite);
+                call_frozen = std::mem::take(&mut fl.call_frozen);
+                scoped = std::mem::take(&mut fl.scoped);
+                invariant = std::mem::take(&mut fl.invariant);
+                block_region = std::mem::take(&mut fl.block_region);
+                nocap = std::mem::take(&mut fl.nocap);
+                // Caller-side operands of `noalias readonly` clone params, in
+                // CLIF values (`State::region_frozen_op`): `*v` is immutable
+                // while the binding clone runs — loadfwd's scoped immunity.
+                let mut ofz = FxHashMap::default();
+                for (pv, rs) in fl.st.region_frozen_op.iter() {
+                    if let Some(&v) = fl
+                        .vals
+                        .get(&pv)
+                        .or_else(|| fl.cconst.get(&pv))
+                        .and_then(|vs| vs.first())
+                    {
+                        ofz.entry(v).or_insert_with(Vec::new).extend_from_slice(rs);
+                    }
+                }
+                operand_frozen = ofz;
+                stubs = std::mem::take(&mut fl.stubs);
+                prof = block_region
+                    .iter()
+                    .filter_map(|(&cb, &rb)| st.prof_bcount.get(rb).map(|&c| (cb, c)))
+                    .collect();
+                retake_scratch!(
+                    scratch, fl, vals, cconst, blocks, frefs, cfrefs, gvs, vars, bool01, va_fids,
+                    opnds, succs
+                );
+            }
+            emit(
+                idx,
+                FnJob {
+                    name: n,
+                    id,
+                    func: std::mem::replace(&mut clctx.func, ir::Function::new()),
+                    nonnull,
+                    derived,
+                    frozen,
+                    noalias,
+                    deref,
+                    nowrite,
+                    call_frozen,
+                    scoped,
+                    invariant,
+                    operand_frozen,
+                    fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
+                    block_region,
+                    prof,
+                    lifetimes,
+                    nocap,
+                    stubs,
+                    stats: crate::pipeline::Stats::default(),
+                    err: None,
+                    code: None,
+                    dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
+                },
+            );
+            m.clear_context(&mut clctx);
+        }
+        pliron_cfg::trace("*pA-lower*", t_lower.as_secs_f64() * 1e3, name);
+        pliron_cfg::trace("*pA-fin*", t_fin.as_secs_f64() * 1e3, name);
+    };
     // Phase (B): CLIF pipeline + cranelift compile per function. Each job
     // is fully self-contained, so workers can run them in any order;
     // results are applied in declaration order in phase (C), keeping the
@@ -793,6 +867,7 @@ pub fn lower_module(
                     scoped: &j.scoped,
                     invariant: &j.invariant,
                     operand_frozen: &mut j.operand_frozen,
+                    fact_bits: &mut j.fact_bits,
                     block_region: &j.block_region,
                     prof: &j.prof,
                     region_parent: sh.region_parent,
@@ -814,10 +889,11 @@ pub fn lower_module(
                 };
                 // Debug bisection: same `PLIRON_PIPEFN[X]` filter as the
                 // wasm path — the pipeline runs only on matching fns.
-                let run_pipe = crate::env_get("PLIRON_PIPEFN")
-                    .is_none_or(|f| n.contains(&f))
-                    && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
+                let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
+                    && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
+                    && pliron_cfg::fn_opt_selected(n);
                 if run_pipe {
+                    pipe.seed_fact_bits();
                     crate::pipeline::run_pipeline(&mut pipe);
                 }
             }
@@ -897,6 +973,9 @@ pub fn lower_module(
                     break defr;
                 }
                 vec_retry += 1;
+                // Seeded cfg/domtree describe the pre-legalize func.
+                clctx.cfg.clear();
+                clctx.domtree.clear();
                 continue;
             }
             break defr;
@@ -937,43 +1016,60 @@ pub fn lower_module(
         clctx.clear();
     }
 
-    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
-    let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
-        1
-    } else {
-        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-            .min(jobs.len().max(1))
-            .max(1)
-    };
-    let jobs = if nthreads <= 1 {
+    let mut jobs: Vec<FnJob> = Vec::new();
+    if nthreads <= 1 {
+        produce(&mut |_, j| jobs.push(j));
+        drop(_sfl);
+        drop(_pgfl);
+        pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+        let tpb = std::time::Instant::now();
         let mut wcl = cranelift_codegen::Context::new();
         for j in &mut jobs {
             run_job(j, &mut wcl, &shared);
         }
-        jobs
+        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
     } else {
-        let jobs: Vec<std::sync::Mutex<FnJob>> =
-            jobs.into_iter().map(std::sync::Mutex::new).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
+        // Workers pull jobs over a channel while `produce` lowers — the
+        // serial lowering is the slower side, so the pool stays starved
+        // and arrival (FIFO) order replaces the old largest-first sort;
+        // the drain below only waits for the pipeline's tail. Results
+        // come back indexed so phase (C) sees declaration order.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, FnJob<'a>)>();
+        let (dtx, drx) = std::sync::mpsc::channel::<(usize, FnJob<'a>)>();
+        let rx = std::sync::Mutex::new(rx);
         let shared = &shared;
         std::thread::scope(|s| {
             for _ in 0..nthreads {
-                s.spawn(|| {
+                let rx = &rx;
+                let dtx = dtx.clone();
+                s.spawn(move || {
                     let mut wcl = cranelift_codegen::Context::new();
                     loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= jobs.len() {
-                            break;
-                        }
-                        let mut j = jobs[i].lock().unwrap_or_else(|e| e.into_inner());
+                        let got = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((i, mut j)) = got else { break };
                         run_job(&mut j, &mut wcl, shared);
+                        let _ = dtx.send((i, j));
                     }
                 });
             }
+            drop(dtx);
+            produce(&mut |i, j| {
+                let _ = tx.send((i, j));
+            });
+            drop(tx);
+            drop(_sfl);
+            drop(_pgfl);
+            pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+            let tpb = std::time::Instant::now();
+            let mut done = std::collections::BTreeMap::new();
+            while let Ok((i, j)) = drx.recv() {
+                done.insert(i, j);
+            }
+            jobs = done.into_values().collect();
+            pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
         });
-        jobs.into_iter().map(|m| m.into_inner().unwrap()).collect()
-    };
-
+    }
+    let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
     // compiling each function serially.
@@ -1152,6 +1248,7 @@ pub fn lower_module(
         m.define_data(id, &desc)
             .unwrap_or_else(|e| panic!("define data {n}: {e}"));
     }
+    pliron_cfg::trace("*phaseC*", tpc.elapsed().as_secs_f64() * 1e3, name);
     Lowered {
         eh,
         ids,
@@ -1459,6 +1556,7 @@ pub fn lower_clif_wasm(
         decl_names[id.index()] = d.name.clone().unwrap_or_default();
     }
     let mut out = Vec::new();
+    let mut scratch = FlScratch::default();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
@@ -1491,12 +1589,12 @@ pub fn lower_clif_wasm(
                 m: &mut m,
                 ids: &ids,
                 b,
-                vals: FxHashMap::default(),
-                cconst: FxHashMap::default(),
-                blocks: FxHashMap::default(),
-                frefs: FxHashMap::default(),
-                cfrefs: FxHashMap::default(),
-                gvs: FxHashMap::default(),
+                vals: std::mem::take(&mut scratch.vals),
+                cconst: std::mem::take(&mut scratch.cconst),
+                blocks: std::mem::take(&mut scratch.blocks),
+                frefs: std::mem::take(&mut scratch.frefs),
+                cfrefs: std::mem::take(&mut scratch.cfrefs),
+                gvs: std::mem::take(&mut scratch.gvs),
                 terminated: false,
                 cc,
                 tcfg,
@@ -1504,10 +1602,10 @@ pub fn lower_clif_wasm(
                 own_tail: internal.contains(n),
                 wasm: true,
                 exn: None,
-                vars: FxHashMap::default(),
+                vars: std::mem::take(&mut scratch.vars),
                 stubs: rustc_hash::FxHashSet::default(),
                 nonnull: FxHashSet::default(),
-                bool01: FxHashSet::default(),
+                bool01: std::mem::take(&mut scratch.bool01),
                 derived: FxHashMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
@@ -1520,10 +1618,12 @@ pub fn lower_clif_wasm(
                 lifetimes: Vec::new(),
                 nocap: FxHashSet::default(),
                 va_buf: None,
-                va_fids: FxHashMap::default(),
+                va_fids: std::mem::take(&mut scratch.va_fids),
                 eh_data,
                 eh_tls_v: None,
                 eject: None,
+                opnds: std::mem::take(&mut scratch.opnds),
+                succs: std::mem::take(&mut scratch.succs),
             };
             fl.lower(f.op);
             let lifetimes = fl
@@ -1546,7 +1646,7 @@ pub fn lower_clif_wasm(
                 .collect();
             fl.b.finalize(cfg);
             let mut operand_frozen = FxHashMap::default();
-            for (&pv, rs) in &fl.st.region_frozen_op {
+            for (pv, rs) in fl.st.region_frozen_op.iter() {
                 if let Some(&v) = fl
                     .vals
                     .get(&pv)
@@ -1562,8 +1662,12 @@ pub fn lower_clif_wasm(
             let prof = fl
                 .block_region
                 .iter()
-                .filter_map(|(&cb, &rb)| st.prof_bcount.get(&rb).map(|&c| (cb, c)))
+                .filter_map(|(&cb, &rb)| st.prof_bcount.get(rb).map(|&c| (cb, c)))
                 .collect();
+            retake_scratch!(
+                scratch, fl, vals, cconst, blocks, frefs, cfrefs, gvs, vars, bool01, va_fids,
+                opnds, succs
+            );
             (
                 fl.nonnull,
                 fl.derived,
@@ -1603,9 +1707,11 @@ pub fn lower_clif_wasm(
         let mut noalias = noalias;
         let mut deref = deref;
         let mut operand_frozen = operand_frozen;
+        let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
         let mut lifetimes = lifetimes;
         let mut pipe = crate::pipeline::Pipe {
             cur_step: "",
+            fact_bits: &mut fact_bits,
             clctx: &mut clctx,
             isa: &*isa,
             fname: n,
@@ -1645,8 +1751,10 @@ pub fn lower_clif_wasm(
         // Debug bisection: PLIRON_PIPEFN=<substr> runs the pipeline only on
         // matching functions; PLIRON_PIPEFNX=<substr> skips matches.
         let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
-            && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
+            && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
+            && pliron_cfg::fn_opt_selected(n);
         if run_pipe {
+            pipe.seed_fact_bits();
             crate::pipeline::run_pipeline(&mut pipe);
         }
         drop(pipe);
@@ -1904,7 +2012,7 @@ pub fn write_const(
     let ty = v.get_type(ctx);
     match st
         .consts
-        .get(&v)
+        .get(v)
         .unwrap_or_else(|| panic!("non-constant value in initializer"))
     {
         ConstVal::Bits(b) => {
@@ -2055,13 +2163,37 @@ struct FnLower<'a, 'b> {
     eh_tls_v: Option<ir::Value>,
     /// Shared early-return block used to propagate a pending "exception".
     eject: Option<Block>,
+    /// Per-op operand/successor snapshot scratch — `lower_op` takes and
+    /// refills these instead of allocating two `Vec`s per op.
+    opnds: Vec<Value>,
+    succs: Vec<Ptr<BasicBlock>>,
+}
+
+/// Tables `FnLower` rebuilds per function that are *not* extracted into
+/// the `FnJob` — moved into each `FnLower` and taken back afterward so
+/// their capacity survives to the next function instead of regrowing
+/// ~10 hash tables from empty per function. Contents are cleared on
+/// `retake`; only allocations persist.
+#[derive(Default)]
+struct FlScratch {
+    vals: FxHashMap<Value, Vals>,
+    cconst: FxHashMap<Value, Vals>,
+    blocks: FxHashMap<Ptr<BasicBlock>, Block>,
+    frefs: FxHashMap<FuncId, FuncRef>,
+    cfrefs: FxHashMap<FuncId, FuncRef>,
+    gvs: FxHashMap<DataId, GlobalValue>,
+    vars: FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
+    bool01: FxHashSet<ir::Value>,
+    va_fids: FxHashMap<String, FuncId>,
+    opnds: Vec<Value>,
+    succs: Vec<Ptr<BasicBlock>>,
 }
 
 impl<'a, 'b> FnLower<'a, 'b> {
     /// Flags for a plain load/store. Non-volatile accesses to invalid memory are UB
     /// (as in LLVM), so at -O they need no trap record and may be removed or reordered.
     fn plain_mf(&self, op: Ptr<Operation>) -> MemFlagsData {
-        if self.st.notrap && !self.st.volatile.contains(&op) {
+        if self.st.notrap && !self.st.volatile.contains(op) {
             MemFlagsData::new().with_notrap()
         } else {
             MemFlagsData::new()
@@ -2070,7 +2202,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn lower(&mut self, f: Ptr<Operation>) {
         let ctx = self.ctx;
-        let region = f.deref(ctx).get_region(0);
+        let region = f.deref(ctx).get_region(ctx, 0);
         let pblocks: Vec<Ptr<BasicBlock>> = region.deref(ctx).iter(ctx).collect();
         for pb in &pblocks {
             let cb = self.b.create_block();
@@ -2078,7 +2210,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // Unmapped blocks belong to the outermost region — the function
             // body — anchored at its entry so licm's ancestry walk bottoms
             // out here.
-            let r = self.st.region_blocks.get(pb).copied().unwrap_or(pblocks[0]);
+            let r = self
+                .st
+                .region_blocks
+                .get(*pb)
+                .copied()
+                .unwrap_or(pblocks[0]);
             self.block_region.insert(cb, r);
         }
         let entry = self.blocks[&pblocks[0]];
@@ -2089,7 +2226,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
         }
         for pb in &pblocks[1..] {
-            let args: Vec<Value> = pb.deref(ctx).arguments().collect();
+            let args: Vec<Value> = pb.deref(ctx).arguments(ctx).collect();
             for a in args {
                 let cb = self.blocks[pb];
                 let vs: Vals = leaves(ctx, a.get_type(ctx))
@@ -2101,7 +2238,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // clone, so seed `noalias`/`deref` — licm's hoists stay
                 // inside the region — rather than `frozen`'s function-wide
                 // `readonly can_move` load flags.
-                if let Some(rs) = self.st.region_frozen.get(&a) {
+                if let Some(rs) = self.st.region_frozen.get(a) {
                     for &(sub, bytes, _) in rs {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
@@ -2119,7 +2256,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 // Any `noalias` callee param — the pivot/slice scope split
                 // described on `State::region_noalias`.
-                if let Some(subs) = self.st.region_noalias.get(&a) {
+                if let Some(subs) = self.st.region_noalias.get(a) {
                     for &sub in subs {
                         let Some(&v) = vs.get(sub as usize) else {
                             continue;
@@ -2130,7 +2267,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             if pliron_cfg::tracing_on() {
                                 tracing::debug!(target: "pliron::frozen", "region_noalias seed {v} leaf {sub} blk {cb:?} pb={:?} a={a:?} nargs={}",
                                     *pb,
-                                    pb.deref(ctx).arguments().count()
+                                    pb.deref(ctx).arguments(ctx).count()
                                 )
                             };
                         }
@@ -2144,29 +2281,30 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let exn = self.b.declare_var(pt);
         self.exn = Some(exn);
         for op in crate::sroa::allocas(ctx, f) {
-            let a = op.deref(ctx).get_result(0);
-            if let Some(&ty) = self.st.promoted.get(&a) {
-                let vs = leaves(ctx, ty)
-                    .into_iter()
-                    .map(|(_, t)| (self.b.declare_var(t), t))
+            let a = op.deref(ctx).get_result(ctx, 0);
+            if let Some(&ty) = self.st.promoted.get(a) {
+                let lv = self.st.leaves(ctx, ty);
+                let vs = lv
+                    .iter()
+                    .map(|&(_, t)| (self.b.declare_var(t), t))
                     .collect();
                 self.vars.insert(a, vs);
             }
         }
         let params = self.b.block_params(entry).to_vec();
         let mut i = 0;
-        let args: Vec<Value> = pblocks[0].deref(ctx).arguments().collect();
+        let args: Vec<Value> = pblocks[0].deref(ctx).arguments(ctx).collect();
         for arg in args {
             let n = leaves(ctx, arg.get_type(ctx)).len();
             if n == 1
-                && let Some(&s) = self.st.frozen.get(&arg)
+                && let Some(&s) = self.st.frozen.get(arg)
             {
                 self.frozen.insert(params[i], s);
             }
             // `noalias` applies to the pointee; for wide refs (`&mut [T]`,
             // `&mut dyn`) the first leaf is the data pointer.
             if n >= 1
-                && let Some(&(d, w)) = self.st.noalias.get(&arg)
+                && let Some(&(d, w)) = self.st.noalias.get(arg)
             {
                 self.noalias.insert(params[i]);
                 self.deref.insert(params[i], (d, w));
@@ -2175,7 +2313,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // seed them like `!nonnull` load results so jumpthread's
             // lattice folds the `Option<ptr>` niche selects iterator
             // adapters emit (`Chars`, `slice::Iter`).
-            if let Some(&mask) = self.st.nnargs.get(&arg) {
+            if let Some(&mask) = self.st.nnargs.get(arg) {
                 for (k, &p) in params[i..i + n].iter().enumerate() {
                     if mask & (1 << k) != 0 {
                         self.nonnull.insert(p);
@@ -2353,8 +2491,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
-    fn ty_leaves(&self, t: TypeHandle) -> Vec<(u64, ClType)> {
-        leaves(self.ctx, t)
+    fn ty_leaves(&self, t: TypeHandle) -> std::sync::Arc<Vec<(u64, ClType)>> {
+        self.st.leaves(self.ctx, t)
     }
 
     fn get(&mut self, v: Value) -> Vals {
@@ -2364,7 +2502,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if let Some(x) = self.cconst.get(&v) {
             return x.clone();
         }
-        let Some(cv) = self.st.consts.get(&v).cloned() else {
+        let Some(cv) = self.st.consts.get(v).cloned() else {
             let why = match v.defining_op() {
                 Some(op) => {
                     let blk = op.deref(self.ctx).get_parent_block();
@@ -2506,7 +2644,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             _ => 64,
         };
         let int_ty = |v: Value| width(v.get_type(self.ctx));
-        if let Some(cv) = self.st.consts.get(&v) {
+        if let Some(cv) = self.st.consts.get(v) {
             let w = int_ty(v);
             return match cv {
                 ConstVal::Bits(b) => Some((mask(*b, w), w)),
@@ -2517,9 +2655,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if depth >= 8 {
             return None;
         }
-        let op = v.defining_op()?;
         let ctx = self.ctx;
+        let Some(op) = v.defining_op() else {
+            // `select` on a scalar pair (i128/f128) codegen's branchy —
+            // `condbr c, t(ct…), f(cf…)`; the merged argument is still
+            // constant when `c` is, e.g. `7u128.max(1)` reaching a `udiv`
+            // divisor.
+            let blk = v.defining_block()?;
+            let ai = v.try_find_index(ctx).ok()?;
+            return Some((self.block_arg_bits(blk, ai, depth)?, int_ty(v)));
+        };
         let id = Operation::get_opid(op, ctx);
+        let tid = Operation::op_type_id(op, ctx);
         if pliron_cfg::tracing_on()
             && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG)
         {
@@ -2527,7 +2674,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 tracing::debug!(target: "pliron::lower", "const_bits {}: {}", depth, id)
             };
         }
-        let ops: Vec<Value> = op.deref(ctx).operands().collect();
+        // Indexed `get_operand` instead of a `Vec` snapshot — this runs
+        // once per recursion level on every int op's operand chain.
+        let og = |i: usize| op.deref(ctx).get_operand(ctx, i);
         let bit = |v| self.const_bits(v, depth + 1);
         let sext = |(b, w): (u128, u32)| -> i128 {
             if w < 128 && (b >> (w - 1)) & 1 == 1 {
@@ -2536,14 +2685,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 b as i128
             }
         };
-        let r = if id == SelectOp::get_opid_static() {
-            let (c, _) = bit(ops[0])?;
-            bit(if c & 1 == 1 { ops[1] } else { ops[2] })?.0
-        } else if id == ICmpOp::get_opid_static() {
+        let r = if tid == core::any::TypeId::of::<SelectOp>() {
+            let (c, _) = bit(og(0))?;
+            bit(if c & 1 == 1 { og(1) } else { og(2) })?.0
+        } else if tid == core::any::TypeId::of::<ICmpOp>() {
             use ICmpPredicateAttr as P;
             let pred = Operation::get_op::<ICmpOp>(op, ctx).unwrap().predicate(ctx);
-            let (a, wa) = bit(ops[0])?;
-            let (b, _) = bit(ops[1])?;
+            let (a, wa) = bit(og(0))?;
+            let (b, _) = bit(og(1))?;
             let (sa, sb) = (sext((a, wa)), sext((b, wa)));
             let r = match pred {
                 P::EQ => a == b,
@@ -2558,37 +2707,37 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 P::UGE => a >= b,
             };
             return Some((u128::from(r), 1));
-        } else if id == LoadOp::get_opid_static() && !self.st.volatile.contains(&op) {
+        } else if tid == core::any::TypeId::of::<LoadOp>() && !self.st.volatile.contains(op) {
             // `const 7i128` operands codegen_ssa spills to an alloca come
             // back as loads. Whenever the load executes before any store it
             // reads uninitialized memory (UB), so the value is determined by
             // whichever constant stores can run before it.
-            if !self.st.allocas.contains_key(&ops[0]) {
+            if !self.st.allocas.contains(og(0)) {
                 return None;
             }
             let lb = op.deref(ctx).get_parent_block()?;
             let mut stores = Vec::new();
-            for u in ops[0].uses(ctx) {
+            for u in og(0).uses(ctx) {
                 let uop = u.user_op();
-                let uid = Operation::get_opid(uop, ctx);
+                let uid = Operation::op_type_id(uop, ctx);
                 // Loads read whatever the matching stores wrote; lifetime
                 // markers don't touch memory.
-                if uid == LoadOp::get_opid_static()
+                if uid == core::any::TypeId::of::<LoadOp>()
                     || self
                         .st
                         .intrinsics
-                        .get(&uop)
+                        .get(uop)
                         .is_some_and(|n| n.starts_with("llvm.lifetime"))
                 {
                     continue;
                 }
-                if uid != StoreOp::get_opid_static()
+                if uid != core::any::TypeId::of::<StoreOp>()
                     || u.find_index(ctx) != 1
-                    || self.st.volatile.contains(&uop)
+                    || self.st.volatile.contains(uop)
                 {
                     return None;
                 }
-                stores.push((uop, bit(uop.deref(ctx).get_operand(0))?));
+                stores.push((uop, bit(uop.deref(ctx).get_operand(ctx, 0))?));
             }
             let (pre, rest): (Vec<_>, Vec<_>) = stores
                 .iter()
@@ -2597,20 +2746,35 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // wins outright — nothing can write between them.
             let lops: Vec<Ptr<Operation>> = lb.deref(ctx).iter(ctx).collect();
             let lpos = lops.iter().position(|o| *o == op)?;
-            let local = pre
-                .iter()
-                .filter_map(|(uop, s)| {
-                    lops.iter()
-                        .position(|o| o == uop)
-                        .filter(|p| *p < lpos)
-                        .map(|p| (p, s))
-                })
-                .max_by_key(|(p, _)| *p);
-            if let Some((_, s)) = local {
-                return Some(*s);
+            // Unless the block is on a cycle: a store positioned after the
+            // load ran on an earlier iteration, so every store is a
+            // candidate previous write and no same-block ordering applies.
+            let cyclic = lb
+                .deref(ctx)
+                .iter(ctx)
+                .flat_map(|o| o.deref(ctx).successors(ctx).collect::<Vec<_>>())
+                .any(|s| reaches(ctx, s, lb));
+            if !cyclic {
+                let local = pre
+                    .iter()
+                    .filter_map(|(uop, s)| {
+                        lops.iter()
+                            .position(|o| o == uop)
+                            .filter(|p| *p < lpos)
+                            .map(|p| (p, s))
+                    })
+                    .max_by_key(|(p, _)| *p);
+                if let Some((_, s)) = local {
+                    return Some(*s);
+                }
             }
             // Stores in other blocks: paths reaching the load either ran one
             // of these or read uninitialized (UB).
+            let rest: Vec<_> = if cyclic {
+                pre.iter().chain(rest.iter()).copied().collect()
+            } else {
+                rest
+            };
             if rest.is_empty() {
                 return None;
             }
@@ -2620,6 +2784,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let b1 = rest[0].0.deref(ctx).get_parent_block()?;
                 let b2 = rest[1].0.deref(ctx).get_parent_block()?;
                 if b1 == b2 {
+                    if cyclic {
+                        return None;
+                    }
                     // Sequential stores in one block: the later wins.
                     let bl: Vec<Ptr<Operation>> = b1.deref(ctx).iter(ctx).collect();
                     let p1 = bl.iter().position(|o| *o == rest[0].0)?;
@@ -2627,7 +2794,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     if p1 > p2 { rest[0].1.0 } else { rest[1].1.0 }
                 } else {
                     // `if c { v_t } else { v_f }` arms: each arm must be
-                    // single-entry from one shared `condbr`.
+                    // single-entry from one shared `condbr`. A constant
+                    // condition means the other arm is dead — its store can
+                    // never run — so this holds even on a cycle: the last
+                    // writer is always the selected arm.
                     let arm = |b: Ptr<BasicBlock>| {
                         let us = b.uses(ctx);
                         (us.len() == 1).then(|| (us[0].user_op(), us[0].find_index(ctx)))
@@ -2636,11 +2806,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let (t2, i2) = arm(b2)?;
                     if t1 != t2
                         || i1 == i2
-                        || Operation::get_opid(t1, ctx) != CondBrOp::get_opid_static()
+                        || Operation::op_type_id(t1, ctx) != core::any::TypeId::of::<CondBrOp>()
                     {
                         return None;
                     }
-                    let (c, _) = bit(t1.deref(ctx).get_operand(0))?;
+                    let (c, _) = bit(t1.deref(ctx).get_operand(ctx, 0))?;
                     if (i1 == 0) == (c & 1 == 1) {
                         rest[0].1.0
                     } else {
@@ -2651,37 +2821,47 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 return None;
             }
         } else {
-            let Some(&o0) = ops.first() else {
+            if op.deref(ctx).get_num_operands() == 0 {
                 return None;
+            }
+            let (a, wa) = bit(og(0))?;
+            let (b, _) = if op.deref(ctx).get_num_operands() > 1 {
+                bit(og(1))?
+            } else {
+                (0, wa)
             };
-            let (a, wa) = bit(o0)?;
-            let (b, _) = if ops.len() > 1 { bit(ops[1])? } else { (0, wa) };
             let (sa, sb) = (sext((a, wa)), sext((b, wa)));
-            let v = if id == AddOp::get_opid_static() {
+            let v = if tid == core::any::TypeId::of::<AddOp>() {
                 a.wrapping_add(b)
-            } else if id == SubOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<SubOp>() {
                 a.wrapping_sub(b)
-            } else if id == MulOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<MulOp>() {
                 a.wrapping_mul(b)
-            } else if id == AndOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<AndOp>() {
                 a & b
-            } else if id == OrOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<OrOp>() {
                 a | b
-            } else if id == XorOp::get_opid_static() {
+            } else if tid == core::any::TypeId::of::<XorOp>() {
                 a ^ b
-            } else if id == ShlOp::get_opid_static() && b < wa as u128 {
+            } else if tid == core::any::TypeId::of::<ShlOp>() && b < wa as u128 {
                 a.wrapping_shl(b as u32)
-            } else if id == LShrOp::get_opid_static() && b < wa as u128 {
+            } else if tid == core::any::TypeId::of::<LShrOp>() && b < wa as u128 {
                 a.wrapping_shr(b as u32)
-            } else if id == AShrOp::get_opid_static() && b < wa as u128 {
+            } else if tid == core::any::TypeId::of::<AShrOp>() && b < wa as u128 {
                 sa.wrapping_shr(b as u32) as u128
-            } else if id == UDivOp::get_opid_static() && b != 0 {
+            } else if tid == core::any::TypeId::of::<UDivOp>() && b != 0 {
                 a / b
-            } else if id == URemOp::get_opid_static() && b != 0 {
+            } else if tid == core::any::TypeId::of::<URemOp>() && b != 0 {
                 a % b
-            } else if id == SDivOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1) {
+            } else if tid == core::any::TypeId::of::<SDivOp>()
+                && b != 0
+                && !(sa == i128::MIN && sb == -1)
+            {
                 (sa / sb) as u128
-            } else if id == SRemOp::get_opid_static() && b != 0 && !(sa == i128::MIN && sb == -1) {
+            } else if tid == core::any::TypeId::of::<SRemOp>()
+                && b != 0
+                && !(sa == i128::MIN && sb == -1)
+            {
                 (sa % sb) as u128
             } else {
                 return None;
@@ -2689,6 +2869,57 @@ impl<'a, 'b> FnLower<'a, 'b> {
             mask(v, wa)
         };
         Some((r, int_ty(v)))
+    }
+
+    /// The constant bit pattern forwarded to argument `ai` of `blk` —
+    /// every predecessor must forward constants. They either all agree, or
+    /// the block merges the two arms of one `condbr` whose condition is
+    /// itself constant (the `arm` trick from `const_bits`' `LoadOp` case).
+    fn block_arg_bits(&self, blk: Ptr<BasicBlock>, ai: usize, depth: u32) -> Option<u128> {
+        let ctx = self.ctx;
+        let bit = |v| self.const_bits(v, depth + 1);
+        let mut arms = Vec::new();
+        for u in blk.uses(ctx) {
+            let uop = u.user_op();
+            let si = u.find_index(ctx);
+            let o = Operation::get_op_dyn(uop, ctx);
+            let &arg = op_cast::<dyn BranchOpInterface>(&*o)?
+                .successor_operands(ctx, si)
+                .get(ai)?;
+            arms.push((uop.deref(ctx).get_parent_block()?, arg));
+        }
+        if arms.is_empty() {
+            return None;
+        }
+        let mut cs = Vec::with_capacity(arms.len());
+        for &(_, a) in &arms {
+            cs.push(bit(a)?);
+        }
+        if cs.iter().all(|c| c == &cs[0]) {
+            return Some(cs[0].0);
+        }
+        if arms.len() != 2 {
+            return None;
+        }
+        let arm = |b: Ptr<BasicBlock>| {
+            let us = b.uses(ctx);
+            (us.len() == 1).then(|| (us[0].user_op(), us[0].find_index(ctx)))
+        };
+        let ((b1, _), (b2, _)) = (arms[0], arms[1]);
+        let (t1, i1) = arm(b1)?;
+        let (t2, i2) = arm(b2)?;
+        if t1 != t2
+            || i1 == i2
+            || Operation::op_type_id(t1, ctx) != core::any::TypeId::of::<CondBrOp>()
+        {
+            return None;
+        }
+        let (c, _) = bit(t1.deref(ctx).get_operand(ctx, 0))?;
+        Some(if (i1 == 0) == (c & 1 == 1) {
+            cs[0].0
+        } else {
+            cs[1].0
+        })
     }
 
     fn iconst_any(&mut self, t: ClType, bits: u128) -> ir::Value {
@@ -2744,7 +2975,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let mut bytes = vec![0u8; t.bytes() as usize];
         let mut all_const = true;
         for (i, e) in elems.iter().enumerate() {
-            match self.st.consts.get(e) {
+            match self.st.consts.get(*e) {
                 Some(ConstVal::Bits(b)) => {
                     bytes[i * lb..(i + 1) * lb].copy_from_slice(&b.to_le_bytes()[..lb])
                 }
@@ -2808,8 +3039,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ConstVal::Zero | ConstVal::Undef => self
                 .ty_leaves(ty)
-                .into_iter()
-                .map(|(_, t)| self.iconst_any(t, 0))
+                .iter()
+                .map(|&(_, t)| self.iconst_any(t, 0))
                 .collect(),
             ConstVal::Bytes(bs) => bs
                 .iter()
@@ -3009,7 +3240,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     fn int_divrem(
         &mut self,
         op: Ptr<Operation>,
-        opnds: Vec<Value>,
+        opnds: &[Value],
         lib: &str,
         unsigned: bool,
         rem: bool,
@@ -3343,7 +3574,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn set(&mut self, op: Ptr<Operation>, vals: Vals) {
-        let r = op.deref(self.ctx).get_result(0);
+        let r = op.deref(self.ctx).get_result(self.ctx, 0);
         self.vals.insert(r, vals);
     }
 
@@ -3353,32 +3584,35 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     /// `op` is a pure int-producing op in `const_bits`' evaluable set (the
     /// loads const_bits resolves are operands, not top-level results).
-    fn op_int_constable(&self, op: Ptr<Operation>, id: &OpId) -> bool {
-        let eval = [
-            ICmpOp::get_opid_static(),
-            SelectOp::get_opid_static(),
-            AddOp::get_opid_static(),
-            SubOp::get_opid_static(),
-            MulOp::get_opid_static(),
-            AndOp::get_opid_static(),
-            OrOp::get_opid_static(),
-            XorOp::get_opid_static(),
-            ShlOp::get_opid_static(),
-            LShrOp::get_opid_static(),
-            AShrOp::get_opid_static(),
-            UDivOp::get_opid_static(),
-            URemOp::get_opid_static(),
-            SDivOp::get_opid_static(),
-            SRemOp::get_opid_static(),
+    fn op_int_constable(&self, op: Ptr<Operation>, tid: core::any::TypeId) -> bool {
+        use core::any::TypeId as T;
+        const EVAL: &[T] = &[
+            T::of::<ICmpOp>(),
+            T::of::<SelectOp>(),
+            T::of::<AddOp>(),
+            T::of::<SubOp>(),
+            T::of::<MulOp>(),
+            T::of::<AndOp>(),
+            T::of::<OrOp>(),
+            T::of::<XorOp>(),
+            T::of::<ShlOp>(),
+            T::of::<LShrOp>(),
+            T::of::<AShrOp>(),
+            T::of::<UDivOp>(),
+            T::of::<URemOp>(),
+            T::of::<SDivOp>(),
+            T::of::<SRemOp>(),
         ];
-        if !eval.contains(id) {
+        if !EVAL.contains(&tid) {
             return false;
         }
         matches!(classify(self.ctx, self.res_ty(op)), TyK::Int(_))
     }
 
     fn res_ty(&self, op: Ptr<Operation>) -> TypeHandle {
-        op.deref(self.ctx).get_result(0).get_type(self.ctx)
+        op.deref(self.ctx)
+            .get_result(self.ctx, 0)
+            .get_type(self.ctx)
     }
 
     fn int_width(&self, t: TypeHandle) -> u32 {
@@ -3403,16 +3637,35 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
+    /// Operand/successor snapshots go through `self`'s scratch buffers
+    /// (take/putback) so the per-op loop doesn't allocate two `Vec`s —
+    /// plus the two `operand_defs`/`successor_defs` allocs underneath
+    /// `operands()`/`successors()` — per op.
     fn lower_op(&mut self, op: Ptr<Operation>) {
+        let mut opnds = std::mem::take(&mut self.opnds);
+        let mut succs = std::mem::take(&mut self.succs);
+        opnds.clear();
+        succs.clear();
+        {
+            let o = op.deref(self.ctx);
+            o.operand_defs_into(self.ctx, &mut opnds);
+            o.successor_defs_into(self.ctx, &mut succs);
+        }
+        self.lower_op_inner(op, &opnds, &succs);
+        self.opnds = opnds;
+        self.succs = succs;
+    }
+
+    fn lower_op_inner(&mut self, op: Ptr<Operation>, opnds: &[Value], succs: &[Ptr<BasicBlock>]) {
         let ctx = self.ctx;
         let id = Operation::get_opid(op, ctx);
-        let (opnds, succs): (Vec<Value>, Vec<Ptr<BasicBlock>>) = {
-            let o = op.deref(ctx);
-            (o.operands().collect(), o.successors().collect())
-        };
+        // One dense-table lookup for the whole dispatch chain: every
+        // `is!` arm is then a `TypeId` compare instead of an `OpId`
+        // string compare.
+        let tid = Operation::op_type_id(op, ctx);
         macro_rules! is {
             ($t:ty) => {
-                id == <$t>::get_opid_static()
+                tid == ::core::any::TypeId::of::<$t>()
             };
         }
         macro_rules! binop {
@@ -3459,8 +3712,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // iconst directly. rustc's mir-opts leave some constant expressions
         // unfolded (`7u128.max(1)` lowers to `select(icmp ..)`); folding
         // here also collapses their dependent Assert(cond) checks.
-        if crate::pass_enabled("PLIRON_LOWERFOLD") && self.op_int_constable(op, &id) {
-            let r = op.deref(ctx).get_result(0);
+        if crate::pass_enabled("PLIRON_LOWERFOLD") && self.op_int_constable(op, tid) {
+            let r = op.deref(ctx).get_result(ctx, 0);
             let t = self.ty_leaves(r.get_type(ctx));
             if t.len() == 1 {
                 if let Some((b, _)) = self.const_bits(r, 0) {
@@ -3482,7 +3735,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             self.terminated = true;
         } else if is!(BrOp) {
             let d = self.blocks[&succs[0]];
-            let a = self.block_args(&opnds);
+            let a = self.block_args(opnds);
             self.b.ins().jump(d, &a);
             self.terminated = true;
         } else if is!(SwitchOp) {
@@ -3784,7 +4037,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let xs = self.get(opnds[0]);
             let dts = self.ty_leaves(self.res_ty(op));
             let mut r = Vals::new();
-            for (x, (_, t)) in xs.into_iter().zip(dts) {
+            for (x, &(_, t)) in xs.into_iter().zip(dts.iter()) {
                 let v = if is!(TruncOp) && dst_w == 1 && self.bool01.contains(&x) {
                     self.resize(x, clt::I8, false)
                 } else if is!(TruncOp) && dst_w == 1 {
@@ -3964,17 +4217,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let r: Vals = if dts.iter().map(|d| d.1).eq(sts.iter().copied()) {
                 xs
             } else if xs.len() == dts.len()
-                && sts.iter().zip(&dts).all(|(s, d)| s.bits() == d.1.bits())
+                && sts
+                    .iter()
+                    .zip(dts.iter())
+                    .all(|(s, d)| s.bits() == d.1.bits())
             {
                 xs.iter()
-                    .zip(&dts)
+                    .zip(dts.iter())
                     .map(|(x, d)| self.bitcast_to(d.1, *x))
                     .collect()
             } else {
                 let (sz, _) = size_align(ctx, self.res_ty(op));
                 let slot = self.slot(sz.max(16), 16);
                 let sl = self.ty_leaves(opnds[0].get_type(ctx));
-                for (x, (o, _)) in xs.iter().zip(sl) {
+                for (x, &(o, _)) in xs.iter().zip(sl.iter()) {
                     self.b
                         .ins()
                         .store(MemFlagsData::trusted(), *x, slot, o as i32);
@@ -3988,14 +4244,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .collect()
             };
             self.set(op, r);
-        } else if is!(AllocaOp) && self.vars.contains_key(&op.deref(ctx).get_result(0)) {
+        } else if is!(AllocaOp) && self.vars.contains_key(&op.deref(ctx).get_result(ctx, 0)) {
         } else if is!(LoadOp) && self.vars.contains_key(&opnds[0]) {
             let lv = self.ty_leaves(self.res_ty(op));
             let vars = self.vars[&opnds[0]].clone();
             let r = vars
                 .into_iter()
-                .zip(lv)
-                .map(|((var, vt), (_, t))| {
+                .zip(lv.iter())
+                .map(|((var, vt), &(_, t))| {
                     let x = self.b.use_var(var);
                     if vt == t { x } else { self.bitcast_to(t, x) }
                 })
@@ -4013,8 +4269,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.b.def_var(var, x);
             }
         } else if is!(AllocaOp) {
-            let res = op.deref(ctx).get_result(0);
-            let (size, align) = self.st.allocas[&res];
+            let res = op.deref(ctx).get_result(ctx, 0);
+            let (size, align) = self.st.allocas[res];
             let p = self.slot(size, align);
             self.set1(op, p);
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
@@ -4025,15 +4281,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // its alias analysis can fold a volatile load to an earlier
             // value or dead-store-eliminate a volatile store. The fences put
             // each volatile access behind an unkillable memory version.
-            let vol = !atomic && self.st.volatile.contains(&op);
+            let vol = !atomic && self.st.volatile.contains(op);
             let mf = self.plain_mf(op);
             if vol {
                 self.b.ins().fence();
             }
             let r: Vals = self
                 .ty_leaves(self.res_ty(op))
-                .into_iter()
-                .map(|(o, t)| {
+                .iter()
+                .map(|&(o, t)| {
                     if atomic && self.needs_atomic_stub(t) {
                         self.atomic_load_stub(p, o)
                     } else if atomic && t.is_float() {
@@ -4050,7 +4306,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             if vol {
                 self.b.ins().fence();
             }
-            if r.len() == 1 && self.st.nonnull.contains(&op) {
+            if r.len() == 1 && self.st.nonnull.contains(op) {
                 if pliron_cfg::tracing_on()
                     && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG)
                 {
@@ -4060,17 +4316,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 self.nonnull.insert(r[0]);
             }
-            if r.len() == 1 && self.st.bool01.contains(&op) {
+            if r.len() == 1 && self.st.bool01.contains(op) {
                 self.bool01.insert(r[0]);
             }
-            if let Some(&reg) = self.st.frozen_loads.get(&op) {
+            if let Some(&reg) = self.st.frozen_loads.get(op) {
                 for &v in &r {
                     if let Some(i) = self.b.func.dfg.value_def(v).inst() {
                         self.scoped.insert(i, reg);
                     }
                 }
             }
-            if self.st.invariant.contains(&op) {
+            if self.st.invariant.contains(op) {
                 for &v in &r {
                     if let Some(i) = self.b.func.dfg.value_def(v).inst() {
                         self.invariant.insert(i);
@@ -4086,11 +4342,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // Volatile store: bracket with fences so cranelift's alias
             // analysis can never dead-store-eliminate or reorder it (see
             // the LoadOp branch above).
-            let vol = !is!(AtomicStoreOp) && self.st.volatile.contains(&op);
+            let vol = !is!(AtomicStoreOp) && self.st.volatile.contains(op);
             if vol {
                 self.b.ins().fence();
             }
-            for (v, (o, t)) in vs.into_iter().zip(lv) {
+            for (v, &(o, t)) in vs.into_iter().zip(lv.iter()) {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
                 } else if is!(AtomicStoreOp) {
@@ -4113,14 +4369,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let p = self.get1(opnds[0]);
             let v = self.get1(opnds[1]);
             use pliron_llvm::attributes::AtomicRmwKindAttr as KA;
-            let kind = &self.st.rmw[&op];
+            let kind = &self.st.rmw[op];
             if self.b.func.dfg.value_type(v).is_float()
                 || matches!(kind, KA::FAdd | KA::FSub | KA::FMax | KA::FMin)
             {
                 let r = self.float_rmw(kind.clone(), p, v);
                 return self.set1(op, r);
             }
-            let k = match self.st.rmw[&op] {
+            let k = match self.st.rmw[op] {
                 KA::Xchg => R::Xchg,
                 KA::Add => R::Add,
                 KA::Sub => R::Sub,
@@ -4159,7 +4415,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(CallOp) {
             self.lower_call(op);
         } else if is!(CallIntrinsicOp) {
-            self.lower_intrinsic(op, &opnds);
+            self.lower_intrinsic(op, opnds);
         } else if is!(SelectOp) {
             let c = self.get(opnds[0]);
             let a = self.get(opnds[1]);
@@ -4279,8 +4535,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
             let r = self
                 .ty_leaves(self.res_ty(op))
-                .into_iter()
-                .map(|(_, t)| self.iconst_any(t, 0))
+                .iter()
+                .map(|&(_, t)| self.iconst_any(t, 0))
                 .collect();
             self.set(op, r);
         } else {
@@ -4478,7 +4734,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             TyK::Vector(e, _) => size_align(self.ctx, e).0,
             _ => sz / a.len() as u64,
         };
-        for (x, (o, _)) in a.iter().zip(self.ty_leaves(v.get_type(self.ctx))) {
+        for (x, &(o, _)) in a.iter().zip(self.ty_leaves(v.get_type(self.ctx)).iter()) {
             self.b.ins().store(MemFlagsData::trusted(), *x, p, o as i32);
         }
         (p, es)
@@ -4623,11 +4879,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // emit. The rustc-flag path is off by default: folding the extra
         // guards reshapes the `split_whitespace` dispatch badly enough to
         // cost ~8% on tokenize while the chars loop it was aimed at gains
-        // nothing (see `chars_alpha` in coordination-ledger.md).
+        // nothing (see `chars_alpha` in docs/history/coordination-ledger.md).
         static IBNN: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| crate::env_is("PLIRON_INBOUNDSNN", "1"));
         if addr != base_v
-            && (self.st.inbounds.contains(&op)
+            && (self.st.inbounds.contains(op)
                 || (*IBNN && gep.no_wrap_flags(ctx).contains(GepNoWrapFlags::INBOUNDS)))
         {
             self.derived.insert(addr, base_v);
@@ -4715,7 +4971,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     fn lower_call(&mut self, op: Ptr<Operation>) {
         let ctx = self.ctx;
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
-        let info = &self.st.calls[&op];
+        let info = &self.st.calls[op];
         let fn_ty = info.fn_ty;
         let cc = match call.callee(ctx) {
             CallOpCallable::Direct(id)
@@ -4905,14 +5161,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     if ind {
                         let (sz, al) = size_align(ctx, ty);
                         let dst = self.slot(sz.max(1), al.max(1));
-                        for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        let lv = self.st.leaves(ctx, ty);
+                        for ((lo, _), v) in lv.iter().copied().zip(self.get(a)) {
                             self.b.ins().store(MemFlagsData::new(), v, dst, lo as i32);
                         }
                         self.b
                             .ins()
                             .store(MemFlagsData::new(), dst, buf, slot as i32);
                     } else {
-                        for ((lo, _), v) in leaves(ctx, ty).into_iter().zip(self.get(a)) {
+                        let lv = self.st.leaves(ctx, ty);
+                        for ((lo, _), v) in lv.iter().copied().zip(self.get(a)) {
                             self.b
                                 .ins()
                                 .store(MemFlagsData::new(), v, buf, (slot + lo) as i32);
@@ -5079,20 +5337,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
             self.terminated = true;
             return;
         }
-        let (inst, rs): (ir::Inst, Vals) =
-            if let Some(&(catch, is_catch)) = self.st.invokes.get(&op) {
-                self.try_call(target, &cargs, catch, is_catch)
-            } else {
-                let inst = match target {
-                    Ok(fr) => self.b.ins().call(fr, &cargs),
-                    Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
-                };
-                let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
-                if self.eh_data.is_some() && maythrow {
-                    self.eh_check(None);
-                }
-                (inst, rs)
+        let (inst, rs): (ir::Inst, Vals) = if let Some(&(catch, is_catch)) = self.st.invokes.get(op)
+        {
+            self.try_call(target, &cargs, catch, is_catch)
+        } else {
+            let inst = match target {
+                Ok(fr) => self.b.ins().call(fr, &cargs),
+                Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
             };
+            let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
+            if self.eh_data.is_some() && maythrow {
+                self.eh_check(None);
+            }
+            (inst, rs)
+        };
         // `st.nnret` inference: a nonnull-returning callee's result is a
         // known-non-null pointer for jumpthread's null-test folds.
         if rs.len() == 1
@@ -5110,7 +5368,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // out-param — a later call writing through it would bypass the
         // slot's writeback/reload sync. Only true no-capture flags the
         // CLIF arg a bounded use: no usable alias outlives the call.
-        let own = callee_sym.and_then(|s| self.st.nocapture.get(&s));
+        let own = callee_sym.as_ref().and_then(|s| self.st.nocapture.get(&s));
         if info.nocap.is_some() || own.is_some() {
             for (k, &s) in csrc.iter().enumerate() {
                 let flagged = s != usize::MAX
@@ -5126,6 +5384,49 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         if op.deref(ctx).get_num_results() > 0 {
             self.set(op, rs);
+        }
+    }
+
+    /// `v` is a `stack_addr` (possibly under `+ const` adds) — i.e. a slot
+    /// slotprom could promote. Used to pick scalar mem_chunks for slot
+    /// copies: an i8x16 access spanning two i64 fields is a partial overlap
+    /// that keeps the whole slot on memory.
+    fn slot_derived(&self, v: ir::Value) -> bool {
+        let mut v = v;
+        for _ in 0..4 {
+            v = self.b.func.dfg.resolve_aliases(v);
+            let Some(i) = self.b.func.dfg.value_def(v).inst() else {
+                return false;
+            };
+            match self.b.func.dfg.insts[i] {
+                ir::InstructionData::StackAddr { .. } => return true,
+                ir::InstructionData::Binary {
+                    opcode: ir::Opcode::Iadd,
+                    args,
+                } => {
+                    if self.iconst_i64(args[0]).is_some() {
+                        v = args[1];
+                    } else if self.iconst_i64(args[1]).is_some() {
+                        v = args[0];
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn iconst_i64(&self, v: ir::Value) -> Option<i64> {
+        let v = self.b.func.dfg.resolve_aliases(v);
+        let i = self.b.func.dfg.value_def(v).inst()?;
+        match self.b.func.dfg.insts[i] {
+            ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+            } => Some(imm.bits()),
+            _ => None,
         }
     }
 
@@ -5473,7 +5774,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn lower_intrinsic(&mut self, op: Ptr<Operation>, opnds: &[Value]) {
-        let name = self.st.intrinsics[&op].as_str();
+        let name = self.st.intrinsics[op].as_str();
         if name.starts_with("pliron.v") {
             let rl = self.ty_leaves(self.res_ty(op)).len();
             let k = opnds
@@ -5571,7 +5872,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 {
                     // Load everything before storing, so this is also a valid memmove.
                     let mf = self.plain_mf(op);
-                    let vals: Vec<_> = mem_chunks(n as u64)
+                    // A wide chunk spanning two same-size slot fields blocks
+                    // slotprom field splitting — use scalar chunks when the
+                    // copy touches a stack slot.
+                    let scalar = self.slot_derived(a[0]) || self.slot_derived(a[1]);
+                    let vals: Vec<_> = mem_chunks(n as u64, !scalar)
                         .into_iter()
                         .map(|(o, t)| (o, self.b.ins().load(t, mf, a[1], o)))
                         .collect();
@@ -5581,7 +5886,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     return;
                 }
                 if crate::pass_enabled("PLIRON_MEMFAST")
-                    && !self.st.volatile.contains(&op)
+                    && !self.st.volatile.contains(op)
                     && self.b.func.dfg.value_type(a[2]) == clt::I64
                 {
                     self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2]);
@@ -5603,7 +5908,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let byte = c as u8 as u64;
                     let mf = self.plain_mf(op);
                     let mut splat = None;
-                    for (o, t) in mem_chunks(n as u64) {
+                    let scalar = self.slot_derived(a[0]);
+                    for (o, t) in mem_chunks(n as u64, !scalar) {
                         let v = if t.is_vector() {
                             *splat.get_or_insert_with(|| {
                                 let b = self.b.ins().iconst(clt::I8, byte as i64);
@@ -5902,8 +6208,8 @@ fn cold_blocks(
             cold.insert(b);
         }
         let t = term(b);
-        if let Some(&e) = st.expect.get(&t) {
-            let s = t.deref(ctx).get_successor(if e { 1 } else { 0 });
+        if let Some(&e) = st.expect.get(t) {
+            let s = t.deref(ctx).get_successor(ctx, if e { 1 } else { 0 });
             // An expect hint that marks a loop arm cold (hashbrown's
             // `likely(match_empty)` marks the probe-advance latch
             // "unlikely") banishes a back-edge that runs once per
@@ -5921,7 +6227,7 @@ fn cold_blocks(
                 continue;
             }
             let t = term(b);
-            let succ: Vec<_> = t.deref(ctx).successors().collect();
+            let succ: Vec<_> = t.deref(ctx).successors(ctx).collect();
             if !succ.is_empty() && succ.iter().all(|s| cold.contains(s)) {
                 cold.insert(b);
                 changed = true;
@@ -5948,7 +6254,7 @@ fn reaches(ctx: &Context, from: Ptr<BasicBlock>, to: Ptr<BasicBlock>) -> bool {
             continue;
         }
         for op in b.deref(ctx).iter(ctx) {
-            stack.extend(op.deref(ctx).successors());
+            stack.extend(op.deref(ctx).successors(ctx));
         }
     }
     false
@@ -5971,15 +6277,15 @@ fn rpo_split(
         b.deref(ctx)
             .iter(ctx)
             .flat_map(|op| {
-                let mut v: Vec<_> = op.deref(ctx).successors().collect();
+                let mut v: Vec<_> = op.deref(ctx).successors(ctx).collect();
                 // Profile-weighted order: hottest successor first, so RPO
                 // places hot blocks earlier in the function's layout.
-                if let Some(cs) = st.prof_edges.get(&op) {
+                if let Some(cs) = st.prof_edges.get(op) {
                     let mut ord: Vec<usize> = (0..v.len()).collect();
                     ord.sort_by_key(|&i| std::cmp::Reverse(cs.get(i).copied().unwrap_or(0)));
                     v = ord.into_iter().map(|i| v[i]).collect();
                 }
-                v.extend(st.invokes.get(&op).map(|&(l, _)| l));
+                v.extend(st.invokes.get(op).map(|&(l, _)| l));
                 v
             })
             .collect()
@@ -6011,10 +6317,10 @@ fn rpo_split(
 /// Constant-size memcpy/memmove/memset up to this many bytes are expanded inline.
 const SMALL_MEM: i128 = 128;
 
-fn mem_chunks(n: u64) -> Vec<(i32, ClType)> {
+fn mem_chunks(n: u64, wide_ok: bool) -> Vec<(i32, ClType)> {
     let mut v = Vec::new();
     let mut o = 0;
-    let wide = if crate::pass_enabled("PLIRON_SIMD") {
+    let wide = if wide_ok && crate::pass_enabled("PLIRON_SIMD") {
         16
     } else {
         0

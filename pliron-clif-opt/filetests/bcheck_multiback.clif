@@ -1,0 +1,37 @@
+; test bcheck
+; Several backedges re-enter the header (sieve's outer scan: composite
+; i's skip straight back, primes return through the marking loop's
+; exits). The header's own `i < n` test still bounds the iv on every
+; trip, so the in-body `i < len` check folds in the fast clone under a
+; one-time `n - 1 < len` guard.
+; check: uadd_overflow
+; check: block10 cold
+; diffcheck
+function %multi(i64, i64) -> i64 {
+block0(v0: i64, v50: i64):
+    v1 = iconst.i64 2
+    v2 = iconst.i64 1
+    jump block1(v1)
+
+block1(v4: i64):
+    v6 = icmp ult v4, v0
+    brif v6, block2, block9
+
+block2:
+    v7 = icmp ult v4, v50
+    brif v7, block3, block10
+
+block3:
+    v8 = iadd v4, v2
+    v9 = band v4, v2
+    brif v9, block4, block1(v8)
+
+block4:
+    jump block1(v8)
+
+block9:
+    return v4
+
+block10 cold:
+    trap user2
+}

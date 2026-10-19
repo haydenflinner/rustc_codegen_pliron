@@ -133,6 +133,7 @@ impl Context {
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
+        static PRECOMPILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let result;
         trace!("****** START compiling {}", self.func.display_spec());
         {
@@ -141,7 +142,7 @@ impl Context {
             self.verify_if(isa)?;
             self.optimize(isa, ctrl_plane)?;
             // PLIRON: debug hook — dump the CLIF in its final pre-isel form.
-            if std::env::var_os("PLIRON_PRECOMPILE").is_some() {
+            if *PRECOMPILE.get_or_init(|| std::env::var_os("PLIRON_PRECOMPILE").is_some()) {
                 eprintln!("==== clif {} precompile ====\n{}", self.func.name, self.func.display());
             }
             result = isa.compile_function(
@@ -166,6 +167,8 @@ impl Context {
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<()> {
+        static COMPILE_EGRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static POSTOPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         log::debug!(
             "Number of CLIF instructions to optimize: {}",
             self.func.dfg.num_insts()
@@ -188,8 +191,15 @@ impl Context {
 
         self.verify_if(isa)?;
 
-        self.compute_cfg();
-        self.compute_domtree();
+        // PLIRON: the pliron pipeline seeds `cfg`/`domtree` with the
+        // analyses it already built for this exact function state —
+        // only recompute what's missing.
+        if !self.cfg.is_valid() {
+            self.compute_cfg();
+        }
+        if !self.domtree.is_valid() {
+            self.compute_domtree();
+        }
         self.eliminate_unreachable_code(isa)?;
         self.remove_constant_phis(isa)?;
 
@@ -200,7 +210,8 @@ impl Context {
         // rewrites, and this measures what it still buys.
         if opt_level != OptLevel::None
             && self.egraph_safe()
-            && std::env::var("PLIRON_COMPILE_EGRAPH").as_deref() != Ok("0")
+            && *COMPILE_EGRAPH
+                .get_or_init(|| std::env::var("PLIRON_COMPILE_EGRAPH").as_deref() != Ok("0"))
         {
             self.egraph_pass(isa, ctrl_plane)?;
         }
@@ -210,13 +221,20 @@ impl Context {
         // uses and would undo the placement.
         self.bump_hoist();
 
+        // PLIRON: rematerializable-address sinking (see below). Runs
+        // after the egraph for the same reason: elaboration hoists a
+        // `tls_value`/`symbol_value`/`func_addr` out of the loop its
+        // only uses sit in, buying it a loop-spanning live range (and
+        // regalloc2 boundary moves on every region crossing).
+        self.remat_sink();
+
         // PLIRON: reorder pure insts so a shared operand's last use lands
         // on a destructive two-address op; elaboration's DFS arg order can
         // strand a later use past a `rotl`-like op, forcing a live-range
         // copy at codegen.
         self.lastuse_schedule();
 
-        if std::env::var_os("PLIRON_POSTOPT").is_some() {
+        if *POSTOPT.get_or_init(|| std::env::var_os("PLIRON_POSTOPT").is_some()) {
             eprintln!(
                 "==== clif {} postopt ====\n{}",
                 self.func.name,
@@ -254,10 +272,12 @@ impl Context {
         use alloc::vec::Vec;
 
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static LUDEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| std::env::var_os("PLIRON_LASTUSE").is_none_or(|v| v != "0"))
         {
             return;
         }
+        let ludebug = *LUDEBUG.get_or_init(|| std::env::var_os("PLIRON_LUDEBUG").is_some());
 
         // Opcodes whose lowering can tie a source operand to the
         // destination register (two-address forms: add/sub/and/xor/rol/...
@@ -401,7 +421,7 @@ impl Context {
                     }
                     // Emit `move_set` in original order, just before `r`.
                     budget -= 1;
-                    if std::env::var_os("PLIRON_LUDEBUG").is_some() {
+                    if ludebug {
                         eprintln!("lastuse: move {:?} before {}", move_set, r);
                     }
                     frozen.extend(move_set.iter().copied());
@@ -447,6 +467,7 @@ impl Context {
         use crate::{FxHashMap, FxHashSet};
 
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static POSTIDX_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| {
             std::env::var_os("PLIRON_BUMPHOIST").is_none_or(|v| v != "0")
         }) {
@@ -715,11 +736,137 @@ impl Context {
             // wrong slot; splice every use to the kept result now.
             self.func.dfg.resolve_all_aliases();
         }
-        if moved > 0 && std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some() {
+        if moved > 0
+            && *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some())
+        {
             eprintln!(
                 "bumphoist {}: moved {} remat {}",
                 self.func.name, moved, remats
             );
+        }
+    }
+
+    /// PLIRON: sink rematerializable-address defs into loop use blocks.
+    ///
+    /// `tls_value`/`symbol_value`/`func_addr` lower to a `lea`/`movsym`
+    /// (plus at most one fixed TLS-segment load on COFF/ELF-IE): pure,
+    /// non-trapping, identical on every execution. When such a def sits
+    /// outside a loop while all of its uses sit inside, its live range
+    /// spans every back edge — holding a register hostage for the whole
+    /// loop and forcing regalloc2 boundary moves at each region crossing
+    /// (count_alpha's `mov %rbp,%rdx`/`mov %rdx,%rbp` pairs around the
+    /// `__pliron_eh` check path). The pliron-side `splink` pass does this
+    /// for the CLIF pipeline, but the egraph elaborator re-hoists these
+    /// ops as loop-invariant — so repeat the sinking here, post-egraph.
+    fn remat_sink(&mut self) {
+        use crate::ir::{Inst, InstructionData, Opcode, Value};
+        use crate::{FxHashMap, FxHashSet};
+
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static REMATSINK_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("PLIRON_REMATSINK").is_none_or(|v| v != "0")
+        }) {
+            return;
+        }
+
+        // remat inst -> set of use blocks (other than its def block).
+        let mut uses: FxHashMap<Inst, FxHashSet<crate::ir::Block>> = FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                for v in self.func.dfg.inst_values(i) {
+                    let v = self.func.dfg.resolve_aliases(v);
+                    let Some(d) = self.func.dfg.value_def(v).inst() else {
+                        continue;
+                    };
+                    if self.func.layout.inst_block(d) == Some(b) {
+                        continue;
+                    }
+                    if !matches!(
+                        self.func.dfg.insts[d],
+                        InstructionData::UnaryGlobalValue {
+                            opcode: Opcode::TlsValue
+                                | Opcode::SymbolValue
+                                | Opcode::FuncAddr,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
+                    uses.entry(d).or_default().insert(b);
+                }
+            }
+        }
+        // Skip the (re)compute unless a remat addr crosses a block.
+        if uses.is_empty() {
+            return;
+        }
+        self.compute_loop_analysis();
+        let mut n = 0;
+        for (d, bs) in uses {
+            let Some(db) = self.func.layout.inst_block(d) else {
+                continue;
+            };
+            let old = self.func.dfg.resolve_aliases(self.func.dfg.first_result(d));
+            for &b in &bs {
+                // Only sink across a loop boundary: the use's innermost
+                // loop must not contain the def.
+                let Some(lp) = self.loop_analysis.innermost_loop(b) else {
+                    continue;
+                };
+                if self.loop_analysis.is_in_loop(db, lp) {
+                    continue;
+                }
+                let data = self.func.dfg.insts[d];
+                let ni = self.func.dfg.make_inst(data);
+                let ctv = self.func.dfg.ctrl_typevar(d);
+                self.func.dfg.make_inst_results(ni, ctv);
+                match self.func.layout.first_inst(b) {
+                    Some(first) => self.func.layout.insert_inst(ni, first),
+                    None => self.func.layout.append_inst(ni, b),
+                }
+                let nv = self.func.dfg.first_result(ni);
+                let mut raw: FxHashSet<Value> = FxHashSet::default();
+                for i in self.func.layout.block_insts(b) {
+                    for v in self.func.dfg.inst_values(i) {
+                        if self.func.dfg.resolve_aliases(v) == old {
+                            raw.insert(v);
+                        }
+                    }
+                }
+                for i in self.func.layout.block_insts(b).collect::<Vec<_>>() {
+                    self.func
+                        .dfg
+                        .map_inst_values(i, |v| if raw.contains(&v) { nv } else { v });
+                }
+                n += 1;
+            }
+            // Uses left on `old` (def block, or non-qualifying use
+            // blocks) keep the original alive; otherwise drop it.
+            let mut still_used = false;
+            'outer: for b in self.func.layout.blocks() {
+                for i in self.func.layout.block_insts(b) {
+                    if self
+                        .func
+                        .dfg
+                        .inst_values(i)
+                        .any(|v| self.func.dfg.resolve_aliases(v) == old)
+                    {
+                        still_used = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if !still_used {
+                self.func.layout.remove_inst(d);
+                self.func.dfg.clear_results(d);
+            }
+        }
+        if n > 0
+            && *REMATSINK_DEBUG
+                .get_or_init(|| std::env::var_os("PLIRON_REMATSINK_DEBUG").is_some())
+        {
+            eprintln!("rematsink {}: sunk {}", self.func.name, n);
         }
     }
 
@@ -946,6 +1093,7 @@ impl Context {
     where
         FOI: Into<FlagsOrIsa<'a>>,
     {
+        static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let _tt = timing::egraph();
 
         trace!(
@@ -963,18 +1111,22 @@ impl Context {
             ctrl_plane,
             &mut self.cfg,
         );
-        pass.run();
+        let cfg_maybe_changed = pass.run();
         log::debug!("egraph stats: {:?}", pass.stats);
-        if std::env::var_os("PLIRON_STATS").is_some() {
+        if *STATS.get_or_init(|| std::env::var_os("PLIRON_STATS").is_some()) {
             let stats = pass.stats.clone();
             drop(pass);
             eprintln!("egraph stats {:?}: {:?}", self.func.name, stats);
         }
         trace!("After egraph optimization:\n{}", self.func.display());
 
-        // Branch optimizations can invalidate these; recompute them.
-        self.compute_cfg();
-        self.compute_domtree();
+        // PLIRON: `run` recomputes `cfg` when it rewrites a terminator
+        // and its unreachable-block sweep maintains it — the graph is
+        // always valid here. `domtree` is stale only in that case:
+        // pure-node rewrites keep dominance intact.
+        if cfg_maybe_changed {
+            self.compute_domtree();
+        }
 
         self.verify_if(fisa)?;
 

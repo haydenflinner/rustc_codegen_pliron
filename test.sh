@@ -10,6 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro wasm pgo
+#   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -25,7 +26,9 @@ for a in "$@"; do
 done
 want() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
 
-cargo build
+# TEST_NOBUILD=1: the caller (harness/gate.py) already built the backend.
+[[ -n "${TEST_NOBUILD:-}" ]] || cargo build
+export RUSTC_ICE=${RUSTC_ICE:-$PWD/target/ices}
 case "$(uname -s)" in
   Darwin)              lib=librustc_codegen_pliron.dylib; exe= ;;
   MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll;     exe=.exe ;;
@@ -349,7 +352,13 @@ t_pgo() {
   # wasm leg: the instrumented module carries no runtime; the host pulls
   # the same .prof out of linear memory via __pliron_prof_hdrs.
   if command -v node > /dev/null 2>&1 && command -v cargo > /dev/null 2>&1; then
-    local wdir=$PWD/$out/wasm-pgo
+    # Keyed on the backend: cargo doesn't track the dylib, so a reused
+    # dir would keep core from an older backend.
+    local wdir=$PWD/$out/wasm-pgo-$(cksum < target/debug/$lib | cut -d' ' -f1)
+    mkdir -p "$wdir" && touch "$wdir"
+    # Prune only keys idle for an hour: a concurrent run may own a younger one.
+    find "$PWD/$out" -mindepth 1 -maxdepth 1 -type d -name 'wasm-pgo*' -mmin +60 \
+      ! -path "$wdir" -exec rm -rf {} + 2>/dev/null || true
     # RUSTFLAGS must be fully windows-spelled on msys: cargo's POSIX-path
     # translation mangles flag values containing ':' when any flag's path
     # is /c/-spelled. Build both off one native root.
@@ -375,6 +384,16 @@ t_proc_macro() {
   # proc macro built by us, loaded by stock rustc: exercises the C ABI (byval/sret) across the bridge
   rustc $BE --edition 2021 --crate-type proc-macro tests/proc_macro/pm.rs -o $out/libpm.$so &&
       rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user$exe && $out/pm_user$exe
+}
+
+t_wasm_smoke() {
+  # Emit pipeline only: leaf crates -> pliron wasm objects -> pliron-wasm-ld
+  # -> node. No -Zbuild-std, so ~seconds; the std-through-pliron legs are
+  # `tests/wasm/run.sh` (the `wasm` stanza).
+  command -v node >/dev/null \
+    && rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown \
+    || return 0
+  tests/wasm/smoke.sh
 }
 
 t_sysroot() {
@@ -449,6 +468,7 @@ want proc_macro && t_proc_macro
 want pgo && t_pgo
 [[ -n "$sysroot" ]] && want sysroot && t_sysroot
 [[ -n "$mold" ]] && want mold && t_mold
+want wasm_smoke && t_wasm_smoke
 if want wasm && command -v node >/dev/null \
     && rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
   tests/wasm/run.sh

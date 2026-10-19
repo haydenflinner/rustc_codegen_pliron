@@ -407,7 +407,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             {
                 let name = ::pliron::ident!(#attr_name);
                 let self_op = self.get_operation().deref(ctx);
-                let attr = self_op.attributes.0.get(&name).expect(&#missing_attr_err);
+                let attr = self_op.attributes().get_obj(ctx, &name).expect(&#missing_attr_err);
                 if ::pliron::attribute::attr_should_outline(&**attr, ctx) {
                     write!(fmt, "{}", ::pliron::irfmt::outlined::OUTLINED_ATTR_MARKER)?;
                 } else {
@@ -423,7 +423,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
         index: usize,
     ) -> Result<TokenStream> {
         Ok(quote! {
-            let opd = self.get_operation().deref(ctx).get_operand(#index);
+            let opd = self.get_operation().deref(ctx).get_operand(ctx, #index);
             ::pliron::printable::Printable::fmt(&opd, ctx, state, fmt)?;
         })
     }
@@ -448,7 +448,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             }
             if let Elem::UnnamedVar(UnnamedVar { index, .. }) = &d.args[0] {
                 Ok(quote! {
-                    let res = self.get_operation().deref(ctx).get_type(#index);
+                    let res = self.get_operation().deref(ctx).get_type(ctx, #index);
                     ::pliron::printable::Printable::fmt(&res, ctx, state, fmt)?;
                 })
             } else {
@@ -464,7 +464,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             }
             if let Elem::UnnamedVar(UnnamedVar { index, .. }) = &d.args[0] {
                 Ok(quote! {
-                    let opd = ::pliron::r#type::Typed::get_type(&self.get_operation().deref(ctx).get_operand(#index), ctx);
+                    let opd = ::pliron::r#type::Typed::get_type(&self.get_operation().deref(ctx).get_operand(ctx, #index), ctx);
                     ::pliron::printable::Printable::fmt(&opd, ctx, state, fmt)?;
                 })
             } else {
@@ -506,7 +506,8 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
 
             res.extend(quote! {
                 let self_op = self.get_operation().deref(ctx);
-                let attr = self_op.attributes.get::<#attr_type>(
+                let attr = self_op.attributes().get::<#attr_type>(
+                    ctx,
                     &::pliron::ident!(#attr_dict_key)
                 );
                 if let Some(attr) = attr {
@@ -541,7 +542,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
                 return err;
             };
             Ok(quote! {
-                let succ = self.get_operation().deref(ctx).get_successor(#index);
+                let succ = self.get_operation().deref(ctx).get_successor(ctx, #index);
                 let succ_name = succ.unique_name(ctx);
                 let succ_name = ::pliron::printable::Printable::print(&succ_name, ctx, state);
                 ::core::write!(fmt, "^{}", succ_name)?;
@@ -563,7 +564,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
                 let succs = ::pliron::irfmt::printers::iter_with_sep_by(
-                    op.successors(),
+                    op.successors(ctx),
                     #sep,
                     |succ, ctx, state, fmt| {
                     let succ_name = succ.unique_name(ctx);
@@ -609,7 +610,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let operands = op.operands();
+                let operands = op.operands(ctx);
                 let operands = ::pliron::irfmt::printers::iter_with_sep(operands, #sep);
                 ::pliron::printable::Printable::fmt(&operands, ctx, state, fmt)?;
             })
@@ -629,7 +630,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let types = op.result_types();
+                let types = op.result_types(ctx);
                 let types = ::pliron::irfmt::printers::iter_with_sep(types, #sep);
                 ::pliron::printable::Printable::fmt(&types, ctx, state, fmt)?;
             })
@@ -649,7 +650,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let operand_types = op.operands().map(|opd| ::pliron::r#type::Typed::get_type(&opd, ctx));
+                let operand_types = op.operands(ctx).map(|opd| ::pliron::r#type::Typed::get_type(&opd, ctx));
                 let operand_types = ::pliron::irfmt::printers::iter_with_sep(operand_types, #sep);
                 ::pliron::printable::Printable::fmt(&operand_types, ctx, state, fmt)?;
             })
@@ -663,14 +664,14 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
                 let arguments = op.operand_types(ctx).collect();
-                let results = op.result_types().collect();
+                let results = op.result_types(ctx).collect();
                 let typesig = ::pliron::r#type::TypeSig { arguments, results };
                 ::pliron::printable::Printable::fmt(&typesig, ctx, state, fmt)?;
             })
         } else if d.name == "attr_dict" {
             Ok(quote! {
                 let self_op = self.get_operation().deref(ctx);
-                let attrs = self_op.attributes.clone_skip_outlined(ctx);
+                let attrs = self_op.attributes().clone_skip_outlined(ctx);
                 ::pliron::printable::Printable::fmt(&attrs, ctx, state, fmt)?;
             })
         } else {
@@ -689,7 +690,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
                 let op = self.get_operation().deref(ctx);
                 if op.get_num_results() > 0 {
                     let sep = ::pliron::printable::ListSeparator::CharSpace(',');
-                    let results = iter_with_sep(op.results(), sep);
+                    let results = iter_with_sep(op.results(ctx), sep);
                     write!(fmt, "{} = ", results.print(ctx, state))?;
                 }
                 write!(fmt, "{} ", self.get_opid())?;
@@ -1264,7 +1265,8 @@ impl ParsableBuilder<OpParserState> for DeriveOpParsable {
                     attribute_sets.extend(quote! {
                         // `None` is either an `opt_attr` or an outlined attribute.
                         if let Some(#attr_ident) = #attr_ident {
-                            op.deref_mut(state_stream.state.ctx).attributes.0.insert(
+                            op.deref_mut(state_stream.state.ctx).attributes_mut().set_obj(
+                                state_stream.state.ctx,
                                 ::pliron::ident!(#attr_name),
                                 #attr_ident,
                             );
@@ -1274,7 +1276,7 @@ impl ParsableBuilder<OpParserState> for DeriveOpParsable {
             }
             ElementSpec::All(attr_sets_name) => {
                 attribute_sets = quote! {
-                    op.deref_mut(state_stream.state.ctx).attributes = #attr_sets_name;
+                    *op.deref_mut(state_stream.state.ctx).attributes_mut() = #attr_sets_name;
                 }
             }
         }

@@ -3,10 +3,11 @@
 
 //! A [BasicBlock] is a list of [Operation]s.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use thiserror::Error;
 
 use crate::{
+    operation::OpSpan,
     attribute::{AttributeDict, verify_attr},
     builtin::{
         given_names,
@@ -34,7 +35,6 @@ use crate::{
     region::Region,
     result::Result,
     r#type::{TypeHandle, Typed},
-    utils::vec_exns::VecExtns,
     value::{DefNode, DefiningEntity, Value},
     verify_err, verify_error,
 };
@@ -105,7 +105,8 @@ pub struct BasicBlock {
     pub(crate) self_ptr: Ptr<BasicBlock>,
     pub(crate) label: Option<Identifier>,
     pub(crate) ops_list: OpsInBlock,
-    pub(crate) args: Vec<BlockArgument>,
+    /// PLIRON: span into `Context::block_arg_pool`.
+    pub(crate) args: OpSpan,
     pub(crate) preds: DefNode<Ptr<BasicBlock>>,
     /// Links to the parent [Region] and
     /// previous and next [BasicBlock]s in the block.
@@ -134,7 +135,7 @@ impl BasicBlock {
         let f = |self_ptr: Ptr<BasicBlock>| BasicBlock {
             self_ptr,
             label,
-            args: vec![],
+            args: OpSpan::default(),
             ops_list: OpsInBlock::default(),
             preds: DefNode::new(),
             region_links: RegionLinks::default(),
@@ -143,13 +144,86 @@ impl BasicBlock {
         };
         let newblock = Self::alloc(ctx, f);
         // Let's update the args of the new block. Easier to do it here than during creation.
-        let args = arg_types
+        let args: Vec<BlockArgument> = arg_types
             .into_iter()
             .map(|ty| BlockArgument::new(ctx, ty))
             .collect();
-        newblock.deref_mut(ctx).args = args;
+        {
+            let mut pool = ctx.block_arg_pool.borrow_mut();
+            let off = pool.len() as u32;
+            let len = args.len() as u32;
+            pool.extend(args);
+            newblock.deref_mut(ctx).args = OpSpan { off, len };
+        }
         // We're done.
         newblock
+    }
+
+    /// PLIRON: attribute dictionary accessor. Prefer this over direct
+    /// `.attributes` field reads so the backing store can change shape.
+    #[inline]
+    pub fn attributes(&self) -> &crate::attribute::AttributeDict {
+        &self.attributes
+    }
+
+    /// PLIRON: mutable attribute dictionary accessor.
+    #[inline]
+    pub fn attributes_mut(&mut self) -> &mut crate::attribute::AttributeDict {
+        &mut self.attributes
+    }
+
+    /// PLIRON: raw block-argument slice (crate-internal store escape hatch).
+    #[inline]
+    pub(crate) fn args_slice<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> core::cell::Ref<'a, [BlockArgument]> {
+        core::cell::Ref::map(ctx.block_arg_pool.borrow(), |pool| {
+            &pool[self.args.range()]
+        })
+    }
+
+    /// PLIRON: mutable arg store (crate-internal).
+    #[inline]
+    pub(crate) fn args_slice_mut<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> core::cell::RefMut<'a, [BlockArgument]> {
+        core::cell::RefMut::map(ctx.block_arg_pool.borrow_mut(), |pool| {
+            &mut pool[self.args.range()]
+        })
+    }
+
+    /// PLIRON: rebuild `block`'s argument list into a fresh tail span
+    /// of `new_len` BlockArguments seeded with `seed_ty`, moving old
+    /// node `i` to `map_old(i)` (`None` drops it). Preserves
+    /// val_uid/DefNode identity without Clone; unmapped nodes die
+    /// with the orphaned span (same as Vec::remove).
+    fn rewrite_args(
+        block: Ptr<BasicBlock>,
+        ctx: &Context,
+        new_len: usize,
+        seed_ty: TypeHandle,
+        map_old: impl Fn(usize) -> Option<usize>,
+    ) {
+        let span = block.deref(ctx).args;
+        let old = span.range();
+        let seeds: Vec<BlockArgument> = (0..new_len)
+            .map(|_| BlockArgument::new(ctx, seed_ty))
+            .collect();
+        let mut pool = ctx.block_arg_pool.borrow_mut();
+        let new_off = pool.len();
+        pool.extend(seeds);
+        for i in (0..span.len as usize).rev() {
+            if let Some(dst) = map_old(i) {
+                pool.swap(old.start + i, new_off + dst);
+            }
+        }
+        drop(pool);
+        block.deref_mut(ctx).args = OpSpan {
+            off: new_off as u32,
+            len: new_len as u32,
+        };
     }
 
     /// Set the block's label.
@@ -176,25 +250,31 @@ impl BasicBlock {
     }
 
     /// Get idx'th argument as a Value. Panics on invalid index.
-    pub fn get_argument(&self, arg_idx: usize) -> Value {
-        self.args[arg_idx].as_value(self.self_ptr)
+    pub fn get_argument(&self, ctx: &Context, arg_idx: usize) -> Value {
+        self.args_slice(ctx)[arg_idx].as_value(self.self_ptr)
     }
 
     /// Get an iterator over the arguments
-    pub fn arguments(&self) -> impl Iterator<Item = Value> + Clone + '_ {
-        self.args.iter().map(|arg| arg.as_value(self.self_ptr))
+    pub fn arguments<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Value> + Clone + 'a {
+        let sp = self.self_ptr;
+        self.args_slice(ctx)
+            .iter()
+            .map(|arg| arg.as_value(sp))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Add an argument to the end of the argument list, returning its index.
     pub fn push_argument(block: Ptr<BasicBlock>, ctx: &Context, ty: TypeHandle) -> usize {
-        let new_block_arg = BlockArgument::new(ctx, ty);
-        block.deref_mut(ctx).args.push_back(new_block_arg)
+        let len = block.deref(ctx).get_num_arguments();
+        Self::rewrite_args(block, ctx, len + 1, ty, |i| Some(i));
+        len
     }
 
     /// Remove the last argument. Panics if there are no arguments or if the argument has uses.
     /// Any [Value] referring to the removed argument is invalidated.
     pub fn pop_argument(block: Ptr<BasicBlock>, ctx: &Context) {
-        let len = block.deref(ctx).args.len();
+        let len = block.deref(ctx).get_num_arguments();
         assert!(
             len > 0,
             "Can't pop argument from block {} with no arguments",
@@ -206,8 +286,10 @@ impl BasicBlock {
     /// Insert a new argument at `arg_idx`, shifting existing arguments, from `arg_idx`, to the right.
     /// Panics on invalid index.
     pub fn insert_argument(block: Ptr<BasicBlock>, ctx: &Context, arg_idx: usize, ty: TypeHandle) {
-        let new_block_arg = BlockArgument::new(ctx, ty);
-        block.deref_mut(ctx).args.insert(arg_idx, new_block_arg);
+        let len = block.deref(ctx).get_num_arguments();
+        Self::rewrite_args(block, ctx, len + 1, ty, |i| {
+            Some(if i < arg_idx { i } else { i + 1 })
+        });
         given_names::insert_block_arg_name(ctx, block, arg_idx, None);
     }
 
@@ -215,7 +297,7 @@ impl BasicBlock {
     /// Panics on invalid index or if the argument has uses.
     /// Any [Value] referring to the removed argument is invalidated.
     pub fn remove_argument(block: Ptr<BasicBlock>, ctx: &Context, arg_idx: usize) {
-        let value = block.deref(ctx).get_argument(arg_idx);
+        let value = block.deref(ctx).get_argument(ctx, arg_idx);
         assert!(
             !value.is_used(ctx),
             "Can't remove argument {} from block {} with uses",
@@ -223,18 +305,26 @@ impl BasicBlock {
             block.deref(ctx).unique_name(ctx)
         );
         given_names::remove_block_arg_name(ctx, block, arg_idx);
-        block.deref_mut(ctx).args.remove(arg_idx);
+        let seed_ty = block.deref(ctx).args_slice(ctx)[arg_idx].ty;
+        let len = block.deref(ctx).get_num_arguments();
+        Self::rewrite_args(block, ctx, len - 1, seed_ty, |i| {
+            if i == arg_idx {
+                None
+            } else {
+                Some(i - (i > arg_idx) as usize)
+            }
+        });
     }
 
     /// Get the number of arguments.
     pub fn get_num_arguments(&self) -> usize {
-        self.args.len()
+        self.args.len as usize
     }
 
     /// Get all successors of this block.
     pub fn succs(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
         self.get_terminator(ctx)
-            .map(|term| term.deref(ctx).successors().collect())
+            .map(|term| term.deref(ctx).successors(ctx).collect())
             .unwrap_or_default()
     }
 
@@ -249,7 +339,7 @@ impl BasicBlock {
     /// O(n) in the number of successors.
     pub fn is_succ(&self, ctx: &Context, succ: Ptr<BasicBlock>) -> bool {
         self.get_terminator(ctx)
-            .is_some_and(|term| term.deref(ctx).successors().any(|s| s == succ))
+            .is_some_and(|term| term.deref(ctx).successors(ctx).any(|s| s == succ))
     }
 
     /// Get the `i`-th successor of this block.
@@ -258,7 +348,7 @@ impl BasicBlock {
         self.get_terminator(ctx)
             .expect("Can't get successor of block with no terminator")
             .deref(ctx)
-            .get_successor(i)
+            .get_successor(ctx, i)
     }
 
     /// Get the number of successors of this block. Returns 0 if there is no terminator.
@@ -293,14 +383,14 @@ impl BasicBlock {
             ptr.deref(ctx).unique_name(ctx),
             ptr.preds(ctx).first().unwrap().deref(ctx).unique_name(ctx)
         );
-        if let Some(arg) = ptr.deref(ctx).arguments().find(|arg| arg.is_used(ctx)) {
+        if let Some(arg) = ptr.deref(ctx).arguments(ctx).find(|arg| arg.is_used(ctx)) {
             panic!(
                 "Attempting to erase block {} whose argument {} has use outside the block",
                 ptr.deref(ctx).unique_name(ctx),
                 arg.unique_name(ctx)
             );
         }
-        if let Some(op) = ptr.deref(ctx).iter(ctx).find(|op| op.deref(ctx).has_use()) {
+        if let Some(op) = ptr.deref(ctx).iter(ctx).find(|op| op.deref(ctx).has_use(ctx)) {
             panic!(
                 "Attempting to erase block {} which contains {} with use outside the block",
                 ptr.deref(ctx).unique_name(ctx),
@@ -400,10 +490,9 @@ impl Verify for BasicBlock {
         {
             verify_err!(self.loc(), BasicBlockVerifyErr::MissingTerminator(label))?;
         }
-        self.attributes
-            .0
-            .values()
-            .try_for_each(|attr| verify_attr(&**attr, ctx))?;
+        self.attributes()
+            .iter(ctx)
+            .try_for_each(|(_, attr)| verify_attr(&**attr, ctx))?;
         // Check that every use is of this block.
         for r#use in self.self_ptr.uses(ctx) {
             if r#use.get_def(ctx) != self.self_ptr {
@@ -417,7 +506,7 @@ impl Verify for BasicBlock {
                 verify_err!(self.loc(), DefUseVerifyErr::OperandNotUseOfDef)?;
             }
         }
-        self.args
+        self.args_slice(ctx)
             .iter()
             .try_for_each(|arg| arg.as_value(self.self_ptr).verify(ctx))?;
         self.iter(ctx).try_for_each(|op| op.deref(ctx).verify(ctx))
@@ -443,8 +532,9 @@ impl Printable for BasicBlock {
         state: &printable::State,
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
+        let args_slice = self.args_slice(ctx);
         let args = iter_with_sep_by(
-            self.args.iter(),
+            args_slice.iter(),
             ListSeparator::CharSpace(','),
             |arg, ctx, state, f| {
                 write!(
@@ -463,7 +553,7 @@ impl Printable for BasicBlock {
         )?;
 
         // Print non-outlined attributes inline.
-        let inline_attrs = self.attributes.clone_skip_outlined(ctx);
+        let inline_attrs = self.attributes().clone_skip_outlined(ctx);
         if !inline_attrs.0.is_empty() {
             write!(f, " ")?;
             inline_attrs.fmt(ctx, state, f)?;
@@ -532,11 +622,14 @@ impl Parsable for BasicBlock {
 
         // Set seen attributes.
         if let Some(attrs) = attrs_opt {
-            block.deref_mut(state_stream.state.ctx).attributes = attrs;
+            *block.deref_mut(state_stream.state.ctx).attributes_mut() = attrs;
         }
 
         for (arg_idx, (arg_loc, name)) in arg_names.into_iter().enumerate() {
-            let def: Value = block.deref(state_stream.state.ctx).args[arg_idx].as_value(block);
+            let def: Value = block
+                .deref(state_stream.state.ctx)
+                .args_slice(state_stream.state.ctx)[arg_idx]
+                .as_value(block);
             state_stream.state.name_tracker.ssa_def(
                 state_stream.state.ctx,
                 &(name.clone(), arg_loc),

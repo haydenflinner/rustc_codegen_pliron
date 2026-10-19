@@ -64,6 +64,8 @@ that came up while working unsupervised.
    path; `=0` is the dialect fallback). run.sh's third column is
    therefore always identical to the second — worth removing the
    duplicate build to halve bench time?
+   (Done — and the dialect path itself is now deleted, so the third
+   build/column is gone entirely.)
 
 ## Update — wide-guard merge + swap_unchecked inlining (second pass)
 

@@ -14,7 +14,7 @@ use pliron_llvm::ops::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied};
 
@@ -62,7 +62,7 @@ pub(crate) fn frame_local(ctx: &Context, mut p: Value) -> bool {
         match p.defining_op() {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return true,
             Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return false,
         }
@@ -140,14 +140,14 @@ pub fn run(ctx: &Context, st: &mut State) {
         let mut rp: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
         for &b in &bs {
             for op in b.deref(ctx).iter(ctx) {
-                for s in op.deref(ctx).successors() {
+                for s in op.deref(ctx).successors(ctx) {
                     rp.entry(s).or_default().push(b);
                 }
-                if let Some(&(l, _)) = st.invokes.get(&op) {
+                if let Some(&(l, _)) = st.invokes.get(op) {
                     rp.entry(l).or_default().push(b);
                 }
                 if Operation::is_op::<ReturnOp>(op, ctx)
-                    || st.calls.get(&op).is_some_and(|ci| ci.tail)
+                    || st.calls.get(op).is_some_and(|ci| ci.tail)
                 {
                     if can_ret.insert(b) {
                         wl.push(b);
@@ -162,9 +162,10 @@ pub fn run(ctx: &Context, st: &mut State) {
                 }
             }
         }
+        let mut os = Vec::new();
         for b in bs {
             let cr = can_ret.contains(&b);
-            let os = ops(ctx, b);
+            crate::inline::ops_into(ctx, b, &mut os);
             for (k, &op) in os.iter().enumerate() {
                 macro_rules! is {
                     ($t:ty) => {
@@ -172,7 +173,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     };
                 }
                 if is!(CallOp) {
-                    let inv = st.invokes.contains_key(&op);
+                    let inv = st.invokes.contains(op);
                     let unr = os
                         .get(k + 1)
                         .is_some_and(|&n| Operation::is_op::<UnreachableOp>(n, ctx));
@@ -190,7 +191,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                             }
                         }
                     }
-                } else if (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(1)))
+                } else if (is!(StoreOp) && !frame_local(ctx, op.deref(ctx).get_operand(ctx, 1)))
                     || is!(AtomicRmwOp)
                     || is!(AtomicCmpxchgOp)
                     || is!(FenceOp)
@@ -200,8 +201,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     || is!(VAArgOp)
                     || (is!(CallIntrinsicOp)
                         && !st
-                            .intrinsics
-                            .get(&op)
+                            .intrinsics.get(op)
                             .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
                 {
                     if cr {
@@ -242,5 +242,5 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &bodied {
         crate::dump_fact("nowrite", s, &nw.get(s));
     }
-    st.nowrite = nw;
+    st.nowrite = nw.into_iter().collect();
 }

@@ -26,7 +26,7 @@ use pliron_llvm::ops::{
 use pliron_llvm::types::PointerType;
 use rustc_hash::FxHashSet;
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::{ConstVal, State};
 use crate::types::{TyK, classify};
 use crate::{Syms, bodied, has_body};
@@ -41,7 +41,7 @@ fn defined(ctx: &Context, st: &State, sym: &str) -> bool {
 /// A constant that can't be null: a defined symbol's address or non-zero
 /// bits.
 fn const_nonnull(ctx: &Context, st: &State, v: Value) -> bool {
-    match st.consts.get(&v) {
+    match st.consts.get(v) {
         Some(ConstVal::Sym { sym, .. }) => defined(ctx, st, sym),
         Some(ConstVal::Bits(b)) => *b != 0,
         _ => false,
@@ -88,14 +88,16 @@ pub fn run(ctx: &Context, st: &mut State) {
     let mut p = MayNull::default();
     // Every value the bodies define.
     let mut local: FxHashSet<Value> = FxHashSet::default();
+    let mut scratch = Vec::new();
     for s in &cand {
         let f = ids.id(s);
         p.cand.push((f,));
         let bs = blocks(ctx, st.funcs[s].op);
         for &b in &bs {
-            local.extend(b.deref(ctx).arguments());
-            for op in ops(ctx, b) {
-                local.extend(op.deref(ctx).results());
+            local.extend(b.deref(ctx).arguments(ctx));
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
+                local.extend(op.deref(ctx).results(ctx));
             }
         }
         // Entry params: only `nonnull` pointers. A landing pad's payload
@@ -103,8 +105,8 @@ pub fn run(ctx: &Context, st: &mut State) {
         // are non-null unless an incoming edge says otherwise (a param with
         // no incoming edge is in an unreachable block, whose `ret`s can't
         // run).
-        for a in bs[0].deref(ctx).arguments() {
-            if !(ptr(a) && st.nnargs.get(&a).is_some_and(|m| m & 1 != 0)) {
+        for a in bs[0].deref(ctx).arguments(ctx) {
+            if !(ptr(a) && st.nnargs.get(a).is_some_and(|m| m & 1 != 0)) {
                 p.src.push((a,));
             }
         }
@@ -112,21 +114,22 @@ pub fn run(ctx: &Context, st: &mut State) {
             let pad = pads.contains(&b);
             p.src.extend(
                 b.deref(ctx)
-                    .arguments()
+                    .arguments(ctx)
                     .filter(|&a| pad || !ptr(a))
                     .map(|a| (a,)),
             );
         }
         for &b in &bs {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 let d = op.deref(ctx);
-                if d.successors().next().is_some()
+                if d.successors(ctx).next().is_some()
                     && let Some(br) =
                         op_cast::<dyn BranchOpInterface>(&*Operation::get_op_dyn(op, ctx))
                 {
-                    for (si, s) in d.successors().enumerate() {
+                    for (si, s) in d.successors(ctx).enumerate() {
                         let args = br.successor_operands(ctx, si);
-                        for (k, prm) in s.deref(ctx).arguments().enumerate() {
+                        for (k, prm) in s.deref(ctx).arguments(ctx).enumerate() {
                             match args.get(k) {
                                 Some(&a) => p.copy.push((a, prm)),
                                 None => p.src.push((prm,)),
@@ -141,7 +144,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     }
                     continue;
                 }
-                let mut rs = d.results().peekable();
+                let mut rs = d.results(ctx).peekable();
                 if rs.peek().is_none() {
                     continue;
                 }
@@ -151,24 +154,24 @@ pub fn run(ctx: &Context, st: &mut State) {
                     };
                 }
                 for r in rs {
-                    if st.consts.contains_key(&r) {
+                    if st.consts.contains(r) {
                         if !const_nonnull(ctx, st, r) {
                             p.src.push((r,));
                         }
-                    } else if st.nonnull.contains(&op) || is!(AllocaOp) {
+                    } else if st.nonnull.contains(op) || is!(AllocaOp) {
                     } else if is!(BitcastOp) || is!(FreezeOp) {
-                        p.copy.push((d.get_operand(0), r));
+                        p.copy.push((d.get_operand(ctx, 0), r));
                     } else if is!(GetElementPtrOp)
-                        && (st.inbounds.contains(&op)
+                        && (st.inbounds.contains(op)
                             || Operation::get_op::<GetElementPtrOp>(op, ctx)
                                 .unwrap()
                                 .no_wrap_flags(ctx)
                                 .contains(GepNoWrapFlags::INBOUNDS))
                     {
-                        p.copy.push((d.get_operand(0), r));
+                        p.copy.push((d.get_operand(ctx, 0), r));
                     } else if is!(SelectOp) {
-                        p.copy.push((d.get_operand(1), r));
-                        p.copy.push((d.get_operand(2), r));
+                        p.copy.push((d.get_operand(ctx, 1), r));
+                        p.copy.push((d.get_operand(ctx, 2), r));
                     } else if is!(CallOp)
                         && let Some(c) = direct_callee(ctx, st, op)
                     {
@@ -216,5 +219,5 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &cand {
         crate::dump_fact("nnret", s, &t.contains(s));
     }
-    st.nnret = t;
+    st.nnret = t.into_iter().collect();
 }

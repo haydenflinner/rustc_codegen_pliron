@@ -344,7 +344,7 @@ impl Analysis for ControlDependenceInfo {
 
     fn compute(op: Ptr<Operation>, ctx: &Context, _analyses: &mut AnalysisManager) -> Result<Self> {
         let mut info = Self::default();
-        for region in op.deref(ctx).regions() {
+        for region in op.deref(ctx).regions(ctx) {
             info.get_control_dependence(ctx, region);
         }
         Ok(info)

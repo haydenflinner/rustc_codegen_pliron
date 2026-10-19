@@ -340,7 +340,7 @@ pub fn apply_dialect_conversion<C: DialectConversion>(
                 "Converting block arguments for block: {}",
                 block.deref(ctx).unique_name(ctx).disp(ctx)
             );
-            let args: Vec<_> = block.deref(ctx).arguments().collect();
+            let args: Vec<_> = block.deref(ctx).arguments(ctx).collect();
             for arg in args {
                 self.convert_block_argument_type(ctx, arg)?;
             }
@@ -426,7 +426,7 @@ pub fn apply_dialect_conversion<C: DialectConversion>(
                 return Ok(());
             }
 
-            let operands: Vec<_> = op.deref(ctx).operands().collect();
+            let operands: Vec<_> = op.deref(ctx).operands(ctx).collect();
             let mut pending_defs = Vec::new();
             for operand in &operands {
                 // Block-argument operands should already be converted.
@@ -455,7 +455,7 @@ pub fn apply_dialect_conversion<C: DialectConversion>(
                 return Ok(());
             }
 
-            let operands: Vec<_> = op.deref(ctx).operands().collect();
+            let operands: Vec<_> = op.deref(ctx).operands(ctx).collect();
             let operands_info = OperandsInfo::new(
                 operands
                     .into_iter()

@@ -134,6 +134,16 @@ static TRAIT_CASTERS_MAP: LazyLock<HMap<(TypeId, TypeId), &'static (dyn Any + Sy
             .collect()
     });
 
+/// PLIRON: every `TraitCasterInfo` registration, as an iterator over
+/// `(from, to)` TypeId pairs. Used to precompute the interface TypeIds
+/// an attribute implements; the registry is static, so callers may
+/// cache the results.
+pub(crate) fn iter_caster_pairs() -> impl Iterator<Item = (TypeId, TypeId)> {
+    get_trait_casters()
+        .flat_map(|infos| infos.iter())
+        .map(|info| (info.from, info.to))
+}
+
 /// Specify that a type may be casted to a `dyn Trait` object. Use [any_to_trait] for the actual cast.
 /// Example:
 /// ```

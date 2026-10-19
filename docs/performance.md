@@ -1,5 +1,8 @@
 # Performance of rustc_codegen_pliron
 
+> Narrative history of the performance work, oldest measurements first.
+> **Current numbers and the work list are in [`PARITY.md`](PARITY.md).**
+
 We measured the pliron code generator against the LLVM code generator in
 rustc. Both paths use the same rustc MIR and the same MIR-level
 optimizations. Only the backend is different.
@@ -23,9 +26,9 @@ and captures its args, so nothing can fold through it), and `lower.rs`
 rewrites the call into `black_box` — a CLIF instruction we added to the
 vendored Cranelift (`can_store` + `other_side_effects`, i.e. exactly
 LLVM's `asm("" : "r,~{memory}" :: v)` semantics) that lowers to zero
-machine instructions: the result vreg aliases the input's. On wasm the
-CLIF path doesn't exist, so `black_box` keeps the alloca + volatile-load
-fallback there.
+machine instructions: the result vreg aliases the input's. On wasm both
+backends use a stack store + reload (LLVM's wasm lowering of the same
+barrier), so pliron keeps its alloca + volatile-load form there.
 
 ## Run time of compiled code
 
@@ -109,10 +112,9 @@ iteration under register pressure where LLVM keeps them in registers.
 ## WebAssembly
 
 `bench/wasm/run.sh` compiles the same kernel sources to
-wasm32-unknown-unknown three ways: stock rustc (LLVM + wasm-ld), the
-pliron backend (CLIF pipeline → waffle, the default), and the same
-backend under `PLIRON_WASM_CLIF=0`, which selects the minimal
-dialect→waffle fallback for comparison.
+wasm32-unknown-unknown two ways: stock rustc (LLVM + wasm-ld) and the
+pliron backend (CLIF → waffle). The table below also shows the since-
+removed dialect → waffle path (`PLIRON_WASM_CLIF=0` at the time).
 `bench/wasm/run.mjs` times
 each `k_<name>(iters)` export in node (V8): warm calls for
 Liftoff→TurboFan tier-up, then 9 interleaved samples of ~150 ms. The
@@ -132,28 +134,30 @@ std codegen; and measurement granularity is a whole `run()` call.
 This run is the committed default configuration on an otherwise idle
 host; per-kernel deltas carry ±2% noise, so ±5% and smaller are wash.
 
-| kernel | LLVM | pliron | change | dialect | change |
-|---|---|---|---|---|---|
-| chars_alpha | 4.577 ms | 4.040 ms | −12.1% | 4.020 ms | −12.2% |
-| chars_ascii | 2.330 ms | 2.327 ms | −0.1% | 2.329 ms | +0.0% |
-| chars_mixed | 18.56 ms | 25.54 ms | +37.7% | 25.56 ms | +37.9% |
-| contains_rng | 4.926 ms | 5.506 ms | +11.6% | 5.507 ms | +11.5% |
-| eqbug | 0.136 ms | 0.119 ms | −12.2% | 0.120 ms | −11.7% |
-| fib | 9.462 ms | 9.011 ms | −5.5% | 8.911 ms | −5.8% |
-| hashmap | 66.71 ms | 77.26 ms | +15.7% | 76.97 ms | +15.2% |
-| hmget | 11.58 ms | 16.50 ms | +42.6% | 16.55 ms | +42.6% |
-| iterw | 67.29 ms | 57.69 ms | −14.0% | 57.69 ms | −14.3% |
-| matmul | 30.87 ms | 27.68 ms | −10.6% | 27.61 ms | −10.8% |
-| nbody | 84.39 ms | 91.73 ms | +8.7% | 91.69 ms | +8.7% |
-| parse_only | 382.9 ms | 510.6 ms | +33.4% | 510.7 ms | +33.0% |
-| sieve | 14.05 ms | 17.12 ms | +21.8% | 17.12 ms | +21.9% |
-| sortw | 6.258 ms | 7.757 ms | +23.6% | 7.753 ms | +23.9% |
-| strwork | 17.40 ms | 23.77 ms | +36.8% | 23.92 ms | +37.5% |
-| tokenize | 7.747 ms | 5.258 ms | −31.8% | 5.263 ms | −32.3% |
+| kernel | LLVM | pliron | change |
+|---|---|---|---|
+| chars_alpha | 3.040 ms | 2.457 ms | −18.8% |
+| chars_ascii | 1.278 ms | 1.636 ms | +28.2% |
+| chars_mixed | 12.79 ms | 19.19 ms | +49.3% |
+| contains_rng | 5.332 ms | 5.334 ms | +0.0% |
+| eqbug | 0.119 ms | 0.112 ms | −6.2% |
+| fib | 5.697 ms | 6.277 ms | +10.4% |
+| hashmap | 46.52 ms | 53.07 ms | +13.4% |
+| hmget | 8.990 ms | 9.526 ms | +6.8% |
+| iterw | 58.76 ms | 35.15 ms | −40.6% |
+| matmul | 26.45 ms | 24.35 ms | −8.7% |
+| nbody | 72.57 ms | 77.55 ms | +6.8% |
+| parse_only | 293.8 ms | 392.3 ms | +34.6% |
+| sieve | 13.77 ms | 14.20 ms | +3.5% |
+| sortw | 6.742 ms | 6.907 ms | +2.3% |
+| strwork | 12.83 ms | 15.16 ms | +17.9% |
+| tokenize | 3.395 ms | 4.323 ms | +27.4% |
 
-Geomeans: pliron/LLVM = 1.069 (both pliron columns build the same
-CLIF-pipeline module; 16 kernels), down from 1.674 before the inlining
-work below. Module sizes: LLVM 97 KB, pliron 187 KB.
+Geomean: pliron/LLVM = 1.057 (16 kernels), down from 1.674 at the
+inlining work and the earlier recorded 1.069 — the `xcgu` emit-closure
+`visible` fix + `WASM_HOT` loop bonus + `constload` ptr-size +
+`memset` scalarize in the wasm path dropped hashmap +52% → +13% and
+hmget +43% → +7%. Module sizes: LLVM 97 KB, pliron 224 KB.
 
 Changes since the 1.674 geomean:
 
@@ -303,6 +307,26 @@ pliron op construction (`pliron_llvm::ops`, `value`/`operation` tables).
 So the remaining compile-time gap is mostly *our glue*: op construction +
 hash tables + lowering, not the clif passes and not vendored cranelift.
 
+### Wall decomposition + config lever (2026-10-16)
+
+`*modgen*`/`*iropt*`/`*phaseA|B|C*` trace lines (PLIRON_TRACE_FILE)
+decompose per-CGU codegen. On syn CU=16 serial: modgen 99.9s of 102s
+wall — CGUs compile serially, and modgen CPU is superlinear in CGU
+count (152s at CU16 vs 38s at CU2): `PLIRON_XCGU` local copies +
+per-CGU `State`/iropt re-analyze shared generic bodies per CGU.
+
+Flags alone move wall dramatically (no code changes):
+
+| crate | default | `-Zthreads=8` + CGUs | wall |
+|---|---|---|---|
+| syn | 102 s | CU=2 | **24.0 s** |
+| syn | 102 s | CU=4 | 25.2 s |
+| regex-syntax | 14.9 s | CU=4 | **5.97 s** |
+
+`PLIRON_XCGU=0` alone cuts syn CU16 wall 78→55s (iropt 76.5→57.2s,
+phaseB 59.5→30.5s) at a runtime-quality cost — copies exist to feed
+the inliner.
+
 Per-pass fixes that took pipeline CPU ~483s → ~220s:
 
 - `indvars::elim_shadowed`: the fixpoint rebuilt the whole-function use
@@ -316,6 +340,27 @@ Per-pass fixes that took pipeline CPU ~483s → ~220s:
 
 Function-level worker threads run the pipeline in parallel across a
 crate's code-generation units.
+
+### Sample-profiled cleanups (2026-10-17, bench crate, ~10.6s wall)
+
+A `sample` of the rustc process during the `pliron-bench` build showed
+~15% of codegen stacks inside `getenv`/env-lock waits — `PLIRON_*`
+debug/gate vars were re-read per inst/block/function across the
+pipeline *and* vendored cranelift (`PLIRON_POSTIDX_DEBUG` alone ran per
+lowered inst). All hot sites now cache through `pliron_cfg` or a
+`OnceLock` (patch 51); `getenv` is absent from the post-change sample.
+
+The same profile put `jumpthread` first among passes (of ~9s of
+sampled pipeline CPU across workers: `jumpthread::run` ~30% of it —
+`round` and a per-round `NonNull` fixpoint rebuild — then
+`webmerge_ctx`, `loadfwd`, `edgespec`, `slp`, `ifconv2`). Stray
+duplicate CFG builds were folded into caller-built ones:
+`proots::facts_cfg` now backs `webmerge_ctx`'s `web_nf`/`canon_map`
+(WmCtx's round-invariant cfg), `loadfwd`, `celim`, and `loopvec`'s
+per-loop facts. Remaining structural item: `sameargs`' fixpoint calls
+`webmerge_ctx` as a full-function rescan each round (×3 sameargs
+steps) — a dirty-block worklist would need to track dropped-param arg
+rebinds function-wide, not just on successor edges.
 
 A content-addressed step cache (`PLIRON_STEPCACHE=1`) stores per-pass and
 per-function results. A warm rerun of the pipeline takes about 16 ms per
@@ -419,3 +464,11 @@ VEX-128 forms on for the ops that have `use_avx*` rules).
   chains, and inner loops inside outer loops.
 - Compile time: run `slp` only where vectorizable shapes exist, or add an
   applicability check that skips passes that cannot fire.
+
+### DoD step 5 landed (62eafb7, 2026-10-16)
+
+All op list fields + BasicBlock.args now OpSpan into Context-global
+flat pools (no unsafe, no per-op allocs). regex-syntax wall ~13.8-17.7s
+(box noise ±2s) — flat vs ~15s baseline as predicted: the step is
+structural (dense rows, Sync-readable path), wins compound with the
+per-fn parallelism it unlocks, not standalone.

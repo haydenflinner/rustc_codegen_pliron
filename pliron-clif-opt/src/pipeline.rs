@@ -9,7 +9,7 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::entity::EntityRef;
+use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, StackSlot, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
@@ -154,11 +154,16 @@ pub struct Pipe<'a> {
     pub scoped: &'a FxHashMap<Inst, Ptr<BasicBlock>>,
     pub invariant: &'a FxHashSet<Inst>,
     pub operand_frozen: &'a mut FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    /// Dense "value may carry a fact" bitmask (`F_*`) — one
+    /// `SecondaryMap` probe in `carry_one` gates the six hash-table
+    /// lookups. Bits are only ever set, never cleared: a stale bit costs
+    /// one wasted probe against a table that decides anyway.
+    pub fact_bits: &'a mut SecondaryMap<Value, u8>,
     pub block_region: &'a FxHashMap<Block, Ptr<BasicBlock>>,
     /// PGO: CLIF block -> executed count (empty without PLIRON_PGO_USE).
     /// Loop passes scale budgets off it; `block_count` is the read path.
     pub prof: &'a FxHashMap<Block, u64>,
-    pub region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    pub region_parent: &'a pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
     /// `llvm.lifetime.{start,end}` markers as (slots, anchor inst,
     /// block, is_start). The operand pointer is resolved to slots at
     /// lowering/`Facts` time — by slotmerge's point in the pipeline the
@@ -206,7 +211,15 @@ impl Pipe<'_> {
                     self.fname,
                     self.clctx.func.display()
                 )
-            };
+            } else {
+                // Non-rustc embedders (cubecl's JIT) install no tracing
+                // subscriber — write the dump straight to stderr.
+                eprintln!(
+                    "==== clif {} after {tag} ====\n{}",
+                    self.fname,
+                    self.clctx.func.display()
+                );
+            }
         }
     }
     fn log(&self, label: &str, k: usize) {
@@ -266,18 +279,78 @@ pub mod shape {
     /// Any integer div/rem — `divconst` rewrites the constant-divisor
     /// cases and loopvec treats the opcodes as side effects.
     pub const DIVREM: u32 = 1 << 7;
+    /// A non-entry block declares at least one block param — the web/
+    /// param transforms (`sameargs`/`webmerge`/`cparm`, jumpthread's
+    /// `trivp`/`deadp`) only move edge args into and out of params; a
+    /// function with none has nothing to merge or drop. Unreachable
+    /// param'd blocks count: `deadp` cleans them too.
+    pub const BPARAM: u32 = 1 << 8;
+    /// An unconditional `jump` terminator exists — chain merging,
+    /// forwarder bypass/folding, and the jump-plan paths only inspect
+    /// `jump` predecessors.
+    pub const JUMP: u32 = 1 << 9;
+    /// At least one load-family inst — loadfwd's dataflow only ever
+    /// produces forwards for loads; a load-free function can only have
+    /// kills.
+    pub const LOAD: u32 = 1 << 10;
+    /// At least one store-family inst — DSE and dead-slot-store
+    /// sweeps only remove stores.
+    pub const STORE: u32 = 1 << 11;
+    /// An `icmp` exists — `fold_null_tests`' null/sentinel folds all
+    /// start from one (its `known()` operand test is finer, but the
+    /// bit deliberately skips the per-arg walk).
+    pub const TESTC: u32 = 1 << 12;
+    /// More than one block — tail merge/dup, unreachable-block sweeps,
+    /// and cross-block def-use passes need a second block to act on.
+    pub const BLOCKS2: u32 = 1 << 13;
+    /// An `iconst` exists — `const_sweep`'s `eval`/`known` seeds.
+    pub const ICONST: u32 = 1 << 14;
+    /// A stack slot is declared — `slotmerge` can merge slots no
+    /// instruction references (dead decls carry no `MEM` inst).
+    pub const SLOT: u32 = 1 << 15;
+    /// The entry block has params (i.e. the function takes args) —
+    /// `edgespec`'s `deadbits` zeroes demandless uses of any param,
+    /// entry args included.
+    pub const EPARAM: u32 = 1 << 16;
+
+    /// Bits an ordinary mutating step may introduce where none existed:
+    /// edge shape (const-branch folds create `jump`s, block clones and
+    /// rewrites create edges/blocks/back-edges), block params (clone
+    /// or substitution paths), and constants (`iconst` materialization
+    /// — which can in turn make an existing `icmp` a `TESTC` case).
+    /// The inst-kind bits (`LOAD`/`STORE`/`MEM`/`CALL`/`SLOT`/`SLP`/
+    /// `DIVREM`/`SWITCH`) and `EPARAM` are absent: cloning or rewriting
+    /// can't produce an instruction kind the function never had, and the
+    /// signature is fixed. Steps that *do* materialize a new inst kind
+    /// (`slotprom`'s stack accesses, `loopidiom`/`clifpeep`'s libcalls,
+    /// vectorizers) declare `creates_all` instead.
+    pub const CREATED: u32 = MULTI | LOOPS | CONDBR | BPARAM | JUMP | TESTC | BLOCKS2 | ICONST;
 }
 
 /// Computes the `shape` bits in one pass over the function.
-fn shape_of(func: &Function) -> u32 {
+pub(crate) fn shape_of(func: &Function) -> u32 {
     use cranelift_codegen::ir::Opcode as Op;
     let mut bits = 0u32;
-    // Layout-order index per block for the back-edge test.
-    let mut idx: FxHashMap<Block, u32> = FxHashMap::default();
+    if func.layout.num_blocks() > 1 {
+        bits |= shape::BLOCKS2;
+    }
+    if !func.sized_stack_slots.is_empty() || !func.dynamic_stack_slots.is_empty() {
+        bits |= shape::SLOT;
+    }
+    let entry = func.layout.entry_block();
+    if entry.is_some_and(|e| func.dfg.num_block_params(e) > 0) {
+        bits |= shape::EPARAM;
+    }
+    // Layout-order index per block for the back-edge test — dense by
+    // block index, not hashed.
+    let mut idx = vec![0u32; func.dfg.num_blocks()];
     for (i, b) in func.layout.blocks().enumerate() {
-        idx.insert(b, i as u32);
+        idx[b.index()] = i as u32;
     }
     for (i, b) in func.layout.blocks().enumerate() {
+        if Some(b) != entry && func.dfg.num_block_params(b) > 0 {
+            bits |= shape::BPARAM;
+        }
         // (base, elem bytes) → store count: a pair in one group is the
         // cheap necessary shape for every store-pack path.
         let mut stores: FxHashMap<(Value, u32), u32> = FxHashMap::default();
@@ -290,7 +363,13 @@ fn shape_of(func: &Function) -> u32 {
             let op = func.dfg.insts[inst].opcode();
             // `stack_addr` reports neither load nor store but marks a
             // slot the memory passes walk (slotprom/slotmerge).
-            if op.can_load() || op.can_store() || op == Op::StackAddr {
+            if op.can_load() {
+                bits |= shape::MEM | shape::LOAD;
+            }
+            if op.can_store() {
+                bits |= shape::MEM | shape::STORE;
+            }
+            if op == Op::StackAddr {
                 bits |= shape::MEM;
             }
             if op.is_call() {
@@ -299,7 +378,14 @@ fn shape_of(func: &Function) -> u32 {
             match op {
                 Op::Brif => bits |= shape::CONDBR,
                 Op::BrTable => bits |= shape::CONDBR | shape::SWITCH,
+                Op::Jump => bits |= shape::JUMP,
                 Op::Sdiv | Op::Udiv | Op::Srem | Op::Urem => bits |= shape::DIVREM,
+                Op::Iconst => bits |= shape::ICONST,
+                // `fold_null_tests` fires only on `icmp` tests where
+                // `known()` resolves an operand to an `iconst` — any
+                // `icmp` over-reports (no per-arg walk in `shape_of`)
+                // but stays a sound necessary condition.
+                Op::Icmp => bits |= shape::TESTC,
                 Op::Store => {
                     let fl = func.dfg.mem_flags[func.dfg.insts[inst].memflags().unwrap()];
                     let args = func.dfg.inst_args(inst);
@@ -350,7 +436,7 @@ fn shape_of(func: &Function) -> u32 {
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     bits |= shape::MULTI;
-                    if idx[&bc.block(pool)] <= i as u32 {
+                    if idx[bc.block(pool).index()] <= i as u32 {
                         bits |= shape::LOOPS;
                     }
                 }
@@ -433,17 +519,31 @@ pub struct Analysis {
     pub(crate) pk: Option<[u8; 32]>,
     pub(crate) stepfile: Option<Vec<crate::stepcache::StepEntry>>,
     pub(crate) stepfile_dirty: bool,
-    /// `shape_of` result and the `ver` it was computed at; recomputed
-    /// lazily after any mutating step.
-    fshape: Option<(u64, u32)>,
+    /// `shape_of` result OR'd with the `creates` mask of every mutating
+    /// step run since the scan — a superset of the current bits, so a
+    /// clear bit still certifies absence while a set bit may be stale
+    /// (over-admission: harmless). Never rescanned; the whole point is
+    /// that gate checks stay O(1) after the first one.
+    fshape: Option<u32>,
     /// Alias pairs already carried onto their targets; facts are inputs
     /// and aliases are permanent, so a pair never needs carrying twice.
     carried: FxHashSet<(Value, Value)>,
-    /// `dfg.alias_epoch` at the last `carry_aliases` scan.
-    alias_epoch: u32,
+    /// Position into `dfg.alias_writes()` covered by the last
+    /// `carry_aliases` scan — the list is append-only, so equal lengths
+    /// mean no new aliases exist and `wm..len` is exactly the backlog.
+    alias_wm: usize,
+    /// `dfg.alias_epoch` when `compact_aliases` last ran. Chains only
+    /// deepen when an alias's target is itself aliased — an epoch bump —
+    /// so equal epochs mean every chain is already flat and the
+    /// whole-`values()` scan is dead work.
+    compact_epoch: u32,
     /// `proots::alias_map_cfg` for the current `ver` — the param-alias
     /// relation every memory pass needs (dse runs three times).
     amap: Option<FxHashMap<Value, Value>>,
+    /// `proots::facts_cfg` for the current `ver` — the edge facts that
+    /// feed `amap`, `loadfwd`'s `bounds`/`pmroots`, and any other
+    /// proots consumer in this version. `amap` derives from it.
+    facts: Option<crate::proots::Facts>,
     /// `loadfwd::isolated` (empty-`nocap` variant) for the current `ver`,
     /// paired with the `noalias.len()` it was computed against:
     /// `carry_aliases` can grow `Pipe::noalias` inside a version, and the
@@ -479,6 +579,7 @@ impl Analysis {
     /// CFG edge/block structure provably intact (`edge_fp` match).
     fn clear_values(&mut self) {
         self.amap = None;
+        self.facts = None;
         self.iso = None;
         self.uses.get_mut().take();
     }
@@ -486,9 +587,15 @@ impl Analysis {
     /// The pipeline advanced the IR version (a step declared `mutates`).
     /// When the cached CFG's edge fingerprint still matches — the step
     /// rewrote only values/args — cfg/dt/la stay valid and only the
-    /// value-keyed caches drop.
-    pub fn bump(&mut self, func: &Function) {
+    /// value-keyed caches drop. `creates` (the step's `Step::creates`)
+    /// is OR'd into `fshape`: the bits are a superset of the current
+    /// shape, so a bit the step could have produced stops certifying
+    /// absence from here on.
+    pub fn bump(&mut self, func: &Function, creates: u32) {
         self.ver += 1;
+        if let Some(s) = &mut self.fshape {
+            *s |= creates;
+        }
         if self.cfg.is_some() && self.cfg_fp == Some(edge_fp(func)) {
             self.clear_values();
         } else {
@@ -544,6 +651,13 @@ impl Analysis {
             dt: self.dt.as_ref().unwrap(),
             la: self.la.as_ref().unwrap(),
         }
+    }
+
+    /// The cached domtree under a shared borrow. Caller must have
+    /// materialized it first (`cfg_dt`/`cfg_dt_la`); lets `&self`
+    /// consumers like `uses()` run while the borrow is held.
+    pub fn domtree(&self) -> &DominatorTree {
+        self.dt.as_ref().expect("Analysis::domtree before cfg_dt")
     }
 
     /// Recompute whatever is missing, then borrow cfg+domtree.
@@ -615,16 +729,20 @@ impl Analysis {
         std::time::Duration,
         std::time::Duration,
     ) {
-        let t = std::time::Instant::now();
+        // `t_ps`/`t_iso` only feed `dseprof` log lines — skip the clock
+        // reads unless `pliron::dse` tracing is live.
+        let prof = crate::config::tracing_on()
+            && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
+        let t = prof.then(std::time::Instant::now);
         self.materialize(func);
-        if self.amap.is_none() {
-            self.amap = Some(crate::proots::alias_map_cfg(
-                func,
-                self.cfg.as_ref().unwrap(),
-            ));
+        if self.facts.is_none() {
+            self.facts = Some(crate::proots::facts_cfg(func, self.cfg.as_ref().unwrap()));
         }
-        let t_ps = t.elapsed();
-        let t = std::time::Instant::now();
+        if self.amap.is_none() {
+            self.amap = Some(crate::proots::alias_of(self.facts.as_ref().unwrap()));
+        }
+        let t_ps = t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let t = prof.then(std::time::Instant::now);
         if self.iso.as_ref().is_none_or(|&(n, _)| n != noalias.len()) {
             self.iso = Some((
                 noalias.len(),
@@ -636,7 +754,7 @@ impl Analysis {
             self.amap.as_ref().unwrap(),
             &self.iso.as_ref().unwrap().1,
             t_ps,
-            t.elapsed(),
+            t.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
         )
     }
 
@@ -646,14 +764,42 @@ impl Analysis {
         self.ver
     }
 
-    /// The function's `shape` bits, computed once and held until the
-    /// next `bump()`.
+    /// `loadfwd`'s entry inputs — `(cfg, edge facts, param-alias map)` —
+    /// each computed at most once per `ver` (the facts are shared with
+    /// `dse_inputs`' `amap` source). Snapshots: callers treat them like
+    /// locals built at this point — stale after their own mutations.
+    pub fn lf_inputs<'a>(
+        &'a mut self,
+        func: &Function,
+    ) -> (
+        &'a ControlFlowGraph,
+        &'a crate::proots::Facts,
+        &'a FxHashMap<Value, Value>,
+    ) {
+        self.materialize(func);
+        if self.facts.is_none() {
+            self.facts = Some(crate::proots::facts_cfg(func, self.cfg.as_ref().unwrap()));
+        }
+        if self.amap.is_none() {
+            self.amap = Some(crate::proots::alias_of(self.facts.as_ref().unwrap()));
+        }
+        (
+            self.cfg.as_ref().unwrap(),
+            self.facts.as_ref().unwrap(),
+            self.amap.as_ref().unwrap(),
+        )
+    }
+
+    /// The function's `shape` bits as a superset: scanned lazily once,
+    /// then widened by each mutating step's `creates` (see `bump`).
+    /// Callers must treat set bits as "may be present" — only a clear
+    /// bit certifies absence.
     pub fn shape_bits(&mut self, func: &Function) -> u32 {
         match self.fshape {
-            Some((v, s)) if v == self.ver => s,
-            _ => {
+            Some(s) => s,
+            None => {
                 let s = shape_of(func);
-                self.fshape = Some((self.ver, s));
+                self.fshape = Some(s);
                 s
             }
         }
@@ -681,14 +827,42 @@ pub struct Step {
     /// apply. Checked per function at run time (not selection time):
     /// earlier steps can create the shape a later step needs.
     pub shape: u32,
+    /// `shape` bits of which at least one must be present — for steps
+    /// whose sub-transforms need different shapes (e.g. `mergechain`
+    /// merges `jump` chains or rewrites `brif` dispatches). Skipped
+    /// only when every bit is absent.
+    pub any: u32,
+    /// `shape` bits this step may introduce where none existed, OR'd
+    /// into the cached superset after the step runs (`shape::CREATED`
+    /// for ordinary rewrite passes; `creates_all` for steps that
+    /// materialize a whole instruction kind — see the const's comment).
+    /// Under-declaring only over-skips later gated steps (missed
+    /// optimizations), never miscompiles — `PLIRON_SHAPE_CHECK` catches
+    /// it on the corpus.
+    pub creates: u32,
     pub gate: Gate,
     pub run: fn(&mut Pipe, &mut Analysis) -> usize,
+    /// Per-step `pliron::step` callsite, resolved once — `dyn_site`
+    /// takes a global mutex per call, which every worker hit per step
+    /// per function.
+    pub site: std::sync::OnceLock<&'static crate::trace::DynSite>,
 }
 
 impl Step {
     /// `shape` requirement, builder-style: `step(..).needs(shape::LOOPS)`.
     const fn needs(mut self, mask: u32) -> Step {
         self.shape |= mask;
+        self
+    }
+    /// At-least-one `shape` requirement: `step(..).needs_any(a | b)`.
+    const fn needs_any(mut self, mask: u32) -> Step {
+        self.any |= mask;
+        self
+    }
+    /// The step may materialize inst kinds the function never had —
+    /// every shape bit becomes possibly-present after it mutates.
+    const fn creates_all(mut self) -> Step {
+        self.creates = u32::MAX;
         self
     }
 }
@@ -707,8 +881,11 @@ const fn step(
         mutates: true,
         cached: false,
         shape: 0,
+        any: 0,
+        creates: shape::CREATED,
         gate,
         run,
+        site: std::sync::OnceLock::new(),
     }
 }
 
@@ -728,8 +905,11 @@ const fn cstep(
         mutates: true,
         cached: true,
         shape: 0,
+        creates: shape::CREATED,
+        any: 0,
         gate,
         run,
+        site: std::sync::OnceLock::new(),
     }
 }
 
@@ -867,8 +1047,46 @@ pub(crate) fn selected(p: &Pipe, quiet: bool) -> Vec<&'static Step> {
         out.extend(DEFAULT.iter().filter(|s| matches!(s.gate, Gate::Always)));
         out
     } else {
-        DEFAULT.iter().filter(|s| s.gate.ok(p)).collect()
+        gate_sel(p)
     }
+}
+
+/// `FnFlags` packed for the `SEL_MEMO` key — field order only.
+fn flags_key(f: &FnFlags) -> u64 {
+    (f.jumpthread as u64)
+        | (f.unreach as u64) << 1
+        | (f.peep as u64) << 2
+        | (f.tailmerge as u64) << 3
+        | (f.taildup as u64) << 4
+        | (f.tailrec as u64) << 5
+        | (f.loadfwd as u64) << 6
+        | (f.slot_dse as u64) << 7
+        | (f.dse as u64) << 8
+        | (f.indvars as u64) << 9
+        | (f.licm as u64) << 10
+        | (f.loopidiom as u64) << 11
+        | (f.loopvec as u64) << 12
+        | (f.bcheck as u64) << 13
+        | (f.slp as u64) << 14
+}
+
+fn gate_sel(p: &Pipe) -> Vec<&'static Step> {
+    thread_local! {
+        /// Env gates are process-fixed, so a flags key decides the same
+        /// selection every call. Skipped while a stepcache read window
+        /// is open — the window must see the gate vars actually consulted.
+        static SEL_MEMO: std::cell::RefCell<FxHashMap<u64, Vec<&'static Step>>> =
+            Default::default();
+    }
+    if !pliron_cfg::reads_open() {
+        return SEL_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            m.entry(flags_key(&p.flags))
+                .or_insert_with(|| DEFAULT.iter().filter(|s| s.gate.ok(p)).collect())
+                .clone()
+        });
+    }
+    DEFAULT.iter().filter(|s| s.gate.ok(p)).collect()
 }
 
 /// Runs the selected steps. With `check_each`, every step that changes
@@ -903,15 +1121,19 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     }
     let draws0 = bisect_count();
     let sel = selected(p, false);
+    // Per-step wall time accumulates into a dense slot during the loop
+    // and merges into `stats.timing` once — a `FxHashMap<&str>` probe
+    // per step per function was a measurable leaf.
+    let mut step_t = vec![std::time::Duration::ZERO; sel.len()];
     let mut found = false;
-    for &s in &sel {
+    for (i, &s) in sel.iter().enumerate() {
         if !check_each {
-            run_step(p, s, &mut an);
+            run_step(p, s, &mut an, &mut step_t[i]);
             continue;
         }
         let before = p.clctx.func.clone();
         let before_text = before.display().to_string();
-        run_step(p, s, &mut an);
+        run_step(p, s, &mut an, &mut step_t[i]);
         if p.clctx.func.display().to_string() != before_text {
             found |= crate::diffcheck::check_and_report(
                 p.fname,
@@ -921,6 +1143,9 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
                 &facts_of(p),
             );
         }
+    }
+    for (&s, d) in sel.iter().zip(step_t) {
+        *p.stats.timing.entry(s.name).or_default() += d;
     }
     let reads = reads_take();
     let draws = bisect_count() - draws0;
@@ -932,6 +1157,15 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     p.stats.cfg_builds += an.cfg_builds;
     p.stats.dt_builds += an.dt_builds;
     p.stats.la_builds += an.la_builds;
+    // Hand the pipeline's cfg/domtree to the Context — still exact for
+    // the final IR state (`Some` implies `cfg_fp` matched at last
+    // materialize and nothing invalidated since), so `optimize()`
+    // skips its per-fn rebuild.
+    if let (Some(c), Some(d)) = (an.cfg.take(), an.dt.take()) {
+        p.clctx.cfg = c;
+        p.clctx.domtree = d;
+        tracing::debug!(target: "pliron::pipeline", "seeded cfg+dt for {}", p.fname);
+    }
     found
 }
 
@@ -983,10 +1217,12 @@ fn run_whole_checked(p: &mut Pipe) {
     let final_func = std::mem::replace(&mut p.clctx.func, initial.clone());
     let final_derived = std::mem::replace(p.derived, derived0);
     let real_stats = std::mem::take(p.stats);
+    p.seed_derived_bits();
     let localized = run_steps(p, true);
     *p.stats = real_stats;
     p.clctx.func = final_func;
     *p.derived = final_derived;
+    p.seed_derived_bits();
     if !localized {
         crate::diffcheck::report(
             p.fname,
@@ -1051,6 +1287,14 @@ fn chain_stats(func: &Function) -> (usize, u64) {
 /// themselves (see `run_step`). `PLIRON_GIANT_MAX=<n>` overrides;
 /// `=0` disables the bail entirely.
 fn giant_max() -> usize {
+    if pliron_cfg::reads_open() {
+        return giant_max_env();
+    }
+    static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(giant_max_env);
+    *MAX
+}
+
+fn giant_max_env() -> usize {
     match config()
         .get("PLIRON_GIANT_MAX")
         .and_then(|v| v.parse().ok())
@@ -1062,7 +1306,7 @@ fn giant_max() -> usize {
 }
 const GIANT_MAX: usize = 50_000;
 
-fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
+fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Duration) {
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
     {
@@ -1083,24 +1327,50 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
     // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on
     // span close; the step's real name is the span name (see trace.rs).
     let _s = crate::config::tracing_on().then(|| {
-        crate::trace::dyn_site("pliron::step", &["fn"], s.name)
+        s.site
+            .get_or_init(|| crate::trace::dyn_site("pliron::step", &["fn"], s.name))
             .span_with("fn", p.fname)
             .entered()
     });
     let _pg = p.prof_hook.map(|h| h(s.name));
-    let t0 = std::time::Instant::now();
+    let t0 = pliron_cfg::step_timing_on().then(std::time::Instant::now);
     // A step whose required shape bits are absent cannot apply — skip it
     // before any cache lookup. Evaluated on the current state rather than
     // at selection time: earlier steps can create a later step's shape
     // (unrolled bodies seed `slp` pairs, rotations create back edges).
     // `PLIRON_NOSHAPE` disables the skip for A/B debugging;
     // `PLIRON_SHAPE_ONLY=<hex>` masks which bits gate (bisecting).
-    let mask = config()
-        .get("PLIRON_SHAPE_ONLY")
-        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(u32::MAX);
+    // These debug knobs are process-fixed; under a stepcache read window
+    // they must go through `config()` so the reads get recorded.
+    let (mask, noshape) = if pliron_cfg::reads_open() {
+        (
+            config()
+                .get("PLIRON_SHAPE_ONLY")
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(u32::MAX),
+            env_set("PLIRON_NOSHAPE"),
+        )
+    } else {
+        static SHAPE_ONLY: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            config()
+                .get("PLIRON_SHAPE_ONLY")
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(u32::MAX)
+        });
+        static NOSHAPE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| env_set("PLIRON_NOSHAPE"));
+        (*SHAPE_ONLY, *NOSHAPE)
+    };
     let req = s.shape & mask;
-    if req != 0 && !env_set("PLIRON_NOSHAPE") && an.shape_bits(&p.clctx.func) & req != req {
+    let req_any = s.any & mask;
+    // Only gated steps pay for the bits — `shape_bits` is version-cached,
+    // but the probe itself isn't free either.
+    let sbits = if req != 0 || req_any != 0 {
+        an.shape_bits(&p.clctx.func)
+    } else {
+        0
+    };
+    if !noshape && ((req != 0 && sbits & req != req) || (req_any != 0 && sbits & req_any == 0)) {
         if crate::config::tracing_on()
             && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
         {
@@ -1112,7 +1382,14 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         // changed the function — the bits are supposed to be necessary
         // conditions, so any mutation means the gate is wrong. The
         // function is restored so the pipeline keeps gated semantics.
-        if env_set("PLIRON_SHAPE_CHECK") {
+        let shape_check = if pliron_cfg::reads_open() {
+            env_set("PLIRON_SHAPE_CHECK")
+        } else {
+            static SHAPE_CHECK: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| env_set("PLIRON_SHAPE_CHECK"));
+            *SHAPE_CHECK
+        };
+        if shape_check {
             let before = p.clctx.func.clone();
             let before_text = before.display().to_string();
             let derived0 = p.derived.clone();
@@ -1122,9 +1399,12 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
             }
             p.clctx.func = before;
             *p.derived = derived0;
+            p.seed_derived_bits();
             an.invalidate(&p.clctx.func);
         }
-        *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
+        if let Some(t0) = t0 {
+            *slot += t0.elapsed();
+        }
         return;
     }
     p.cur_step = s.name;
@@ -1151,14 +1431,17 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         }
         k
     };
-    *p.stats.timing.entry(s.name).or_default() += t0.elapsed();
-    trace(s.name, t0.elapsed().as_secs_f64() * 1e3, p.fname);
+    if let Some(t0) = t0 {
+        let d = t0.elapsed();
+        *slot += d;
+        trace(s.name, d.as_secs_f64() * 1e3, p.fname);
+    }
     if s.mutates {
         // Not conditional on `k`: a pass that removes blocks but
         // reports 0 would leave cfg/domtree stale for the next step.
         // `bump` fingerprints the CFG: a value-only step keeps the
         // cached cfg/dt/la and drops just the value-keyed caches.
-        an.bump(&p.clctx.func);
+        an.bump(&p.clctx.func, s.creates);
         if prof_chain {
             let (m, t) = chain_stats(&p.clctx.func);
             if m >= 8 {
@@ -1170,8 +1453,13 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
         if k > 0 {
             // Alias targets can themselves be aliased later, so chains
             // grow a hop per re-alias — flatten before the next step's
-            // per-inst resolves multiply by the depth.
-            p.clctx.func.dfg.compact_aliases();
+            // per-inst resolves multiply by the depth. Every alias write
+            // bumps `alias_epoch`, so no bump since the last compaction
+            // means nothing can be deeper than a hop.
+            if p.clctx.func.dfg.alias_epoch() != an.compact_epoch {
+                p.clctx.func.dfg.compact_aliases();
+                an.compact_epoch = p.clctx.func.dfg.alias_epoch();
+            }
             carry_aliases(p, an);
         }
     }
@@ -1196,25 +1484,37 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis) {
 // rebundled the dispatch's uses behind edge args (the `select→icmp`
 // discriminant in the pred then folds to `brif` on the raw flag via
 // `brif_not`/`brif_argspec`, and `jtround` threads the decided edge).
-fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     let prof2 = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
-    let tt = |name: &str, t0: std::time::Instant| {
-        if prof2 {
+    let tt = |name: &str, t0: Option<std::time::Instant>| {
+        if let (true, Some(t0)) = (prof2, t0) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::jumpthread", "    mc-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
             };
         }
     };
     let mut n = 0;
-    if crate::pass_enabled("PLIRON_CHAINMERGE") {
-        let t0 = std::time::Instant::now();
+    // `merge_chains` only inspects `jump` predecessors; the dispatch
+    // work below needs a conditional branch. The step gate is `MULTI`,
+    // so a jump-only function reaches here — the CONDBR guard keeps
+    // the dispatch phases on exactly the functions the old step gate
+    // admitted.
+    // `merge_chains` only inspects `jump` predecessors; the dispatch
+    // work below needs a conditional branch. Cached step-entry bits
+    // suffice: `merge_chains` touches jump chains only, so it can
+    // neither create CONDBR nor remove JUMP's need here — stale-true
+    // bits merely over-admit a no-op scan.
+    let mc = an.shape_bits(&p.clctx.func);
+    if crate::pass_enabled("PLIRON_CHAINMERGE") && mc & shape::JUMP != 0 {
+        let t0 = prof2.then(std::time::Instant::now);
         jumpthread::merge_chains(&mut p.clctx.func);
         tt("chains", t0);
     }
+    let cond = mc & shape::CONDBR != 0;
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
-    if crate::pass_enabled("PLIRON_DISPATCHDUP") {
-        let t0 = std::time::Instant::now();
+    if cond && crate::pass_enabled("PLIRON_DISPATCHDUP") {
+        let t0 = prof2.then(std::time::Instant::now);
         // Duplicating a dispatch into a jump pred rewires that pred's own
         // jump-preds onto the dispatch — run to fixpoint so multi-hop
         // chains (851/853/854 -> 388 -> 859) fully collapse.
@@ -1235,18 +1535,18 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
         }
         tt("dup1", t0);
     }
-    if crate::pass_enabled("PLIRON_EDGESPEC2") {
+    if cond && crate::pass_enabled("PLIRON_EDGESPEC2") {
         cd = None;
         if crate::pass_enabled("PLIRON_REBIND") {
-            let t0 = std::time::Instant::now();
-            n += jumpthread::rebind_exports(&mut p.clctx.func);
+            let t0 = prof2.then(std::time::Instant::now);
+            n += jumpthread::rebind_exports(&mut p.clctx.func, an);
             tt("rebind", t0);
         }
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         n += edgespec::run(&mut p.clctx.func);
         tt("espec", t0);
         if crate::pass_enabled("PLIRON_DISPATCHDUP") {
-            let t0 = std::time::Instant::now();
+            let t0 = prof2.then(std::time::Instant::now);
             // Edgespec can leave fresh jump preds on small dispatch blocks.
             for _ in 0..6 {
                 let k = {
@@ -1266,12 +1566,16 @@ fn s_mergechain(p: &mut Pipe, _an: &mut Analysis) -> usize {
             tt("dup2", t0);
         }
     }
-    let t0 = std::time::Instant::now();
-    let k = clifpeep::brif_fold(&mut p.clctx.func);
+    let t0 = prof2.then(std::time::Instant::now);
+    let k = if cond {
+        clifpeep::brif_fold(&mut p.clctx.func)
+    } else {
+        0
+    };
     tt("brifold", t0);
     n += k;
     if n > 0 {
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
         edgespec::sweep_dead(&mut p.clctx.func);
         tt("sweep", t0);
@@ -1332,8 +1636,9 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     total
 }
 
-fn s_jumpthread(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let (n, dead, folds, pmap) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived);
+fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let sh = an.shape_bits(&p.clctx.func);
+    let (n, dead, folds, pmap) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived, sh);
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }
@@ -1373,8 +1678,12 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     if k > 0 && config().enabled("PLIRON_UNROLL_CLEANUP") {
         let ub = jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
         let (mut dp, mut di) = (0, 0);
+        // Everything the loop runs keeps predecessor sets: param drops
+        // shrink edge args, `fold_same_target_brifs` rewrites in place,
+        // and `remove_dead_insts` can't reach terminators.
+        let ucfg = ControlFlowGraph::with_function(&p.clctx.func);
         for _ in 0..4 {
-            let p2 = jumpthread::remove_dead_params(&mut p.clctx.func)
+            let p2 = jumpthread::remove_dead_params(&mut p.clctx.func, &ucfg)
                 + jumpthread::fold_same_target_brifs(&mut p.clctx.func);
             let i = jumpthread::remove_dead_insts(&mut p.clctx.func, true);
             (dp, di) = (dp + p2, di + i);
@@ -1439,40 +1748,50 @@ fn s_tailrec(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
-fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let t = std::time::Instant::now();
-    p.stats.forwarded += loadfwd::run(
-        &mut p.clctx.func,
-        p.noalias,
-        p.invariant,
-        p.operand_frozen,
-        p.block_region,
-        p.region_parent,
-        p.nowrite,
-        p.call_frozen,
-        p.nocap,
-    );
-    if crate::config::tracing_on()
-        && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO)
-    {
+fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let prof = crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
+    let t = prof.then(std::time::Instant::now);
+    // The dataflow only ever forwards a `load` (every `Fwd` is pushed
+    // on a load arm) — without one, the CFG/RPO/proot/iso setup and
+    // the fixpoint can produce nothing.
+    if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
+        let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
+        p.stats.forwarded += loadfwd::run(
+            &mut p.clctx.func,
+            cfg,
+            pf,
+            ps,
+            p.noalias,
+            p.invariant,
+            p.operand_frozen,
+            p.block_region,
+            p.region_parent,
+            p.nowrite,
+            p.call_frozen,
+            p.nocap,
+        );
+    }
+    if let Some(t) = t {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::loadfwd", "    lf-run {:?}", t.elapsed())
         };
     }
     if p.flags.slot_dse {
-        let prof2 = crate::config::tracing_on()
-            && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
         // A load whose only user was a removed dead store keeps its own
         // slot alive, so alternate the two until nothing changes.
+        let has_store = an.shape_bits(&p.clctx.func) & shape::STORE != 0;
         for i in 0..4 {
-            let t = std::time::Instant::now();
-            p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
-            if prof2 {
+            let t = prof.then(std::time::Instant::now);
+            if has_store {
+                p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
+            }
+            if let Some(t) = t {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::loadfwd", "    lf-dss[{i}] {:?}", t.elapsed())
                 };
             }
-            let t = std::time::Instant::now();
+            let t = prof.then(std::time::Instant::now);
             let n = if config().enabled("PLIRON_DEAD_LOADS") {
                 jumpthread::remove_dead_insts(
                     &mut p.clctx.func,
@@ -1481,7 +1800,7 @@ fn s_loadfwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
             } else {
                 0
             };
-            if prof2 {
+            if let Some(t) = t {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::loadfwd", "    lf-rdi[{i}] {n} {:?}", t.elapsed())
                 };
@@ -1609,7 +1928,8 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // Carried-constant params (`RangeInclusive`'s exhausted flag
     // — a self-edge param fed a literal at entry) fold here so
     // the dispatch arms they drive die before flattening
-    // (`PLIRON_CPARM`).
+    // (`PLIRON_CPARM`). The `CONDBR | BPARAM` step gate covers its
+    // webmerge (BPARAM) and const-sweep (CONDBR) halves.
     if config().enabled("PLIRON_CPARM") {
         let (k, pmap) = clifpeep::cparm(&mut p.clctx.func);
         if !pmap.is_empty() {
@@ -1632,8 +1952,16 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     }
     // Nested range-check diamonds (`is_ascii_alphabetic` &co) fold
     // leaf-up: `run` rescans to fixpoint internally on one
-    // cfg/domtree setup.
-    let k = ifconv::run(&mut p.clctx.func, p.derived);
+    // cfg/domtree setup. A diamond needs a `brif` header and `jump`
+    // arms — `cparm`'s `const_sweep` folds `brif const` into `jump`,
+    // so JUMP can appear here even when entry lacked it. Fresh bits.
+    let k = if shape_of(&p.clctx.func) & (shape::CONDBR | shape::JUMP)
+        == (shape::CONDBR | shape::JUMP)
+    {
+        ifconv::run(&mut p.clctx.func, p.derived, None)
+    } else {
+        0
+    };
     if k > 0 {
         // Folded merges leave dead forwarders still edging into
         // the merge — remove them so the merge is single-pred,
@@ -1977,8 +2305,13 @@ fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `icmp eq (select c, 0, ptr), 0` → `c` when `ptr` is non-null — the
 // Option-niche test behind `Chars::next`'s bounds check; kills the
 // `mov 0; cmp; csel; cmp` tail sequence.
-fn s_niche(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
+fn s_niche(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let nn = jumpthread::NonNull::new(
+        &p.clctx.func,
+        an.cfg_dt(&p.clctx.func).0,
+        p.nonnull,
+        p.derived,
+    );
     let k =
         niche::run(&mut p.clctx.func, &nn) + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
     if k > 0 {
@@ -2047,8 +2380,8 @@ fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `brif (icmp cc (select c, K, x), K)` niche-select dispatch →
 // `brif c` + a middle block testing `x` — see
 // `jumpthread::split_niche_tests`.
-fn s_seltest(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = jumpthread::split_niche_tests(&mut p.clctx.func);
+fn s_seltest(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = jumpthread::split_niche_tests(&mut p.clctx.func, an);
     if k > 0 && p.dump {
         p.dump("seltest");
     }
@@ -2059,9 +2392,13 @@ fn s_seltest(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `p_j = p_i + k` collapse) turn formerly opaque param addresses into
 // `iadd` chains that `concrete` peels to exact (root, offset) locs —
 // making stores/loads that were unprovable at the early run disjoint.
-fn s_loadfwd2(p: &mut Pipe, _an: &mut Analysis) -> usize {
+fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
     let k = loadfwd::run(
         &mut p.clctx.func,
+        cfg,
+        pf,
+        ps,
         p.noalias,
         p.invariant,
         p.operand_frozen,
@@ -2176,8 +2513,8 @@ fn s_dse3(p: &mut Pipe, an: &mut Analysis) -> usize {
 // `0` the fresh-insert edge wrote — clone the small block onto the edge
 // and alias the load to the stored value so lcse/dse fold `store 0` +
 // `load;+1;store` into `store 1`.
-fn s_memspec(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = memspec::run(&mut p.clctx.func, p.noalias, p.nowrite, p.call_frozen);
+fn s_memspec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = memspec::run(&mut p.clctx.func, an, p.noalias, p.nowrite, p.call_frozen);
     if k > 0 && p.dump {
         p.dump("memspec");
     }
@@ -2224,6 +2561,54 @@ fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Carry `d`'s recorded facts onto `w` when `w` is `d`'s value
 // everywhere — a merge carrier, an alias target, or a sunk/rebased
 // replacement.
+/// `Pipe::fact_bits` flag bits — which per-value fact tables `d` may
+/// appear in. Stale-set bits are safe (the table probe decides); a bit
+/// must never be absent while the table holds the value.
+pub(crate) mod fact_bits {
+    pub const DERIVED: u8 = 1;
+    pub const NONNULL: u8 = 2;
+    pub const FROZEN: u8 = 4;
+    pub const NOALIAS: u8 = 8;
+    pub const DEREF: u8 = 16;
+    pub const OPERAND_FROZEN: u8 = 32;
+}
+
+impl Pipe<'_> {
+    /// Seed `fact_bits` from the already-populated fact tables — the
+    /// only place bits can be missing is writes made before this `Pipe`
+    /// borrowed them. Bits only gate lookups, so a stale-set bit costs
+    /// one wasted probe and a missing bit is a skipped carry.
+    pub fn seed_fact_bits(&mut self) {
+        for &v in self.derived.keys() {
+            self.fact_bits[v] |= fact_bits::DERIVED;
+        }
+        for &v in self.nonnull.iter() {
+            self.fact_bits[v] |= fact_bits::NONNULL;
+        }
+        for &v in self.frozen.keys() {
+            self.fact_bits[v] |= fact_bits::FROZEN;
+        }
+        for &v in self.noalias.iter() {
+            self.fact_bits[v] |= fact_bits::NOALIAS;
+        }
+        for &v in self.deref.keys() {
+            self.fact_bits[v] |= fact_bits::DEREF;
+        }
+        for &v in self.operand_frozen.keys() {
+            self.fact_bits[v] |= fact_bits::OPERAND_FROZEN;
+        }
+    }
+
+    /// Re-seed one table's bit after a wholesale `*p.derived = ...`
+    /// replace — the collect doesn't go through `insert`, so no bits
+    /// were set along the way.
+    pub fn seed_derived_bits(&mut self) {
+        for &v in self.derived.keys() {
+            self.fact_bits[v] |= fact_bits::DERIVED;
+        }
+    }
+}
+
 pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     p.carry_log.push((d, w));
     // `nonnull` and `derived` are site facts — `!nonnull`/inbounds mark a
@@ -2236,82 +2621,97 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // first (a param "def" is the block head).
     // The coverage check below only matters when `d` carries a site
     // fact (derived/nonnull); most carried pairs have neither, so gate
-    // the two `try_value_def` + `pp_block` lookups on the hash probes.
-    let dbase = p.derived.get(&d).copied();
-    let dnn = p.nonnull.contains(&d);
-    if dbase.is_some() || dnn {
-        let covered = {
-            use cranelift_codegen::ir::ProgramPoint;
-            let f = &p.clctx.func;
-            // `try_value_def` skips reserved/stale values and doesn't
-            // chase aliases (`value_def` resolves unchecked and panics
-            // on chains ending at a tombstone); an alias def just falls
-            // through to no-carry. Program points compare in O(1): a
-            // param's point is its block head, which orders before
-            // every inst in the block — the same ordering the old
-            // inst-index scan gave.
-            let pp = |v: Value| match f.dfg.try_value_def(v) {
-                // A def may be detached (removed from the layout) while
-                // its value still exists — `pp_block`/`pp_cmp` panic on
-                // those, where the old position scan returned `None`.
-                Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
-                    Some(ProgramPoint::Inst(i))
+    // the two `try_value_def` + `pp_block` lookups on the fact bits.
+    let bits = p.fact_bits[d];
+    if bits & (fact_bits::DERIVED | fact_bits::NONNULL) != 0 {
+        let dbase = p.derived.get(&d).copied();
+        let dnn = p.nonnull.contains(&d);
+        if dbase.is_some() || dnn {
+            let covered = {
+                use cranelift_codegen::ir::ProgramPoint;
+                let f = &p.clctx.func;
+                // `try_value_def` skips reserved/stale values and doesn't
+                // chase aliases (`value_def` resolves unchecked and panics
+                // on chains ending at a tombstone); an alias def just falls
+                // through to no-carry. Program points compare in O(1): a
+                // param's point is its block head, which orders before
+                // every inst in the block — the same ordering the old
+                // inst-index scan gave.
+                let pp = |v: Value| match f.dfg.try_value_def(v) {
+                    // A def may be detached (removed from the layout) while
+                    // its value still exists — `pp_block`/`pp_cmp` panic on
+                    // those, where the old position scan returned `None`.
+                    Some(ValueDef::Result(i, _)) if f.layout.inst_block(i).is_some() => {
+                        Some(ProgramPoint::Inst(i))
+                    }
+                    Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
+                        Some(ProgramPoint::Block(b))
+                    }
+                    _ => None,
+                };
+                match (pp(d), pp(w)) {
+                    (Some(a), Some(b)) => {
+                        f.layout.pp_block(a) == f.layout.pp_block(b)
+                            && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
+                    }
+                    _ => false,
                 }
-                Some(ValueDef::Param(b, _)) if f.layout.is_block_inserted(b) => {
-                    Some(ProgramPoint::Block(b))
-                }
-                _ => None,
             };
-            match (pp(d), pp(w)) {
-                (Some(a), Some(b)) => {
-                    f.layout.pp_block(a) == f.layout.pp_block(b)
-                        && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
+            if covered {
+                if let Some(b) = dbase {
+                    p.derived.insert(w, b);
+                    p.fact_bits[w] |= fact_bits::DERIVED;
                 }
-                _ => false,
-            }
-        };
-        if covered {
-            if let Some(b) = dbase {
-                p.derived.insert(w, b);
-            }
-            if dnn {
-                if crate::config::tracing_on()
-                    && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
-                {
-                    let dd = p
-                        .clctx
-                        .func
-                        .dfg
-                        .value_def(d)
-                        .inst()
-                        .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-                    let wd = p
-                        .clctx
-                        .func
-                        .dfg
-                        .value_def(w)
-                        .inst()
-                        .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
-                    if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::pipeline", "nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step)
-                    };
+                if dnn {
+                    if crate::config::tracing_on()
+                        && tracing::enabled!(target: "pliron::pipeline", tracing::Level::DEBUG)
+                    {
+                        let dd = p
+                            .clctx
+                            .func
+                            .dfg
+                            .value_def(d)
+                            .inst()
+                            .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+                        let wd = p
+                            .clctx
+                            .func
+                            .dfg
+                            .value_def(w)
+                            .inst()
+                            .map(|i| p.clctx.func.dfg.display_inst(i).to_string());
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::pipeline", "nndbg carry {w} <- {d} [{}] w={wd:?} d={dd:?}", p.cur_step)
+                        };
+                    }
+                    p.nonnull.insert(w);
+                    p.fact_bits[w] |= fact_bits::NONNULL;
                 }
-                p.nonnull.insert(w);
             }
         }
     }
-    if p.noalias.contains(&d) {
+    if bits & fact_bits::NOALIAS != 0 && p.noalias.contains(&d) {
         p.noalias.insert(w);
+        p.fact_bits[w] |= fact_bits::NOALIAS;
     }
-    if let Some(&f) = p.frozen.get(&d) {
+    if bits & fact_bits::FROZEN != 0
+        && let Some(&f) = p.frozen.get(&d)
+    {
         p.frozen.insert(w, f);
+        p.fact_bits[w] |= fact_bits::FROZEN;
     }
-    if let Some(&x) = p.deref.get(&d) {
+    if bits & fact_bits::DEREF != 0
+        && let Some(&x) = p.deref.get(&d)
+    {
         p.deref.insert(w, x);
+        p.fact_bits[w] |= fact_bits::DEREF;
     }
-    if let Some(v) = p.operand_frozen.get(&d) {
+    if bits & fact_bits::OPERAND_FROZEN != 0
+        && let Some(v) = p.operand_frozen.get(&d)
+    {
         let v = v.clone();
         p.operand_frozen.insert(w, v);
+        p.fact_bits[w] |= fact_bits::OPERAND_FROZEN;
     }
 }
 
@@ -2370,9 +2770,10 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
 /// and `an.carried` skips pairs already handled.
 fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
     // Steps that wrote no aliases since the last scan can't have new
-    // (alias, root) pairs — most mutating steps don't alias anything, so
-    // the whole-`values()` walk is usually dead work.
-    if p.clctx.func.dfg.alias_epoch() == an.alias_epoch {
+    // (alias, root) pairs — most mutating steps don't alias anything,
+    // so the backlog walk is usually dead work.
+    let dirty = p.clctx.func.dfg.alias_writes();
+    if dirty.len() == an.alias_wm {
         return;
     }
     if p.derived.is_empty()
@@ -2383,26 +2784,29 @@ fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
         && p.operand_frozen.is_empty()
         && p.lifetimes.is_empty()
     {
-        // Don't record the epoch here: a later step may add a fact map
-        // entry without touching aliases, and this epoch's pairs still
-        // need carrying then.
+        // Don't advance the watermark here: a later step may add a fact
+        // map entry without touching aliases, and this backlog's pairs
+        // still need carrying then.
         return;
     }
-    an.alias_epoch = p.clctx.func.dfg.alias_epoch();
+    let wm = an.alias_wm;
+    an.alias_wm = dirty.len();
     let func = &p.clctx.func;
-    let pairs: Vec<(Value, Value)> = func
-        .dfg
-        .values()
+    let pairs: Vec<(Value, Value)> = dirty[wm..]
+        .iter()
+        .copied()
         .filter_map(|v| {
             // Tombstone chains from deleted defs dead-end at reserved
             // targets — `resolve_aliases` panics there; just skip them.
+            // Re-aliased values repeat in `dirty`; each new write is a
+            // fresh pair candidate regardless.
             let r = func.dfg.try_resolve_aliases(v)?;
             (r != v && !an.carried.contains(&(v, r))).then_some((v, r))
         })
         .collect();
-    for (d, w) in pairs {
-        an.carried.insert((d, w));
-        carry_one(p, d, w);
+    for (d, w) in &pairs {
+        an.carried.insert((*d, *w));
+        carry_one(p, *d, *w);
     }
 }
 
@@ -2415,6 +2819,10 @@ fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
         }
     }
     k
+}
+
+fn s_armmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    armmerge::run(&mut p.clctx.func)
 }
 
 // Loop count tests against a wide constant rematerialize it per
@@ -2564,540 +2972,656 @@ fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 const JT: Gate = Gate::Flag(FlagId::Jumpthread);
 
-pub static DEFAULT: &[Step] = &[
-    Step {
-        name: "jumpthread",
-        bisect: Some("jumpthread"),
-        stat: "",
-        verify: true,
-        mutates: true,
-        // Ungated on shape: beyond edge threading it also merges
-        // identical exit blocks, which needs no edges at all.
-        cached: true,
-        shape: 0,
-        gate: JT,
-        run: s_jumpthread,
-    },
-    cstep(
-        "constbr",
-        "constbr",
-        Gate::All(&[JT, Gate::Env("PLIRON_CONSTBR")]),
-        s_constbr,
-    )
-    .needs(shape::CONDBR),
-    Step {
-        name: "unroll",
-        bisect: Some("unroll"),
-        stat: "",
-        verify: true,
-        mutates: true,
-        cached: true,
-        shape: shape::LOOPS,
-        gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
-        run: s_unroll,
-    },
-    step("unreach", "", Gate::Flag(FlagId::Unreach), s_unreach),
-    Step {
-        name: "clifpeep",
-        bisect: Some("clifpeep"),
-        stat: "",
-        verify: false,
-        mutates: true,
-        cached: true,
-        shape: 0,
-        gate: Gate::Flag(FlagId::Peep),
-        run: s_clifpeep,
-    },
-    step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge),
-    step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup),
-    step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec).needs(shape::CALL),
-    Step {
-        name: "loadfwd",
-        bisect: Some("loadfwd"),
-        stat: "",
-        verify: true,
-        mutates: true,
-        cached: true,
-        // Fires on mem-free functions too (arg/result forwarding in
-        // e.g. alloc shims), so no shape gate.
-        shape: 0,
-        gate: Gate::Flag(FlagId::Loadfwd),
-        run: s_loadfwd,
-    },
-    // Stack-slot SSA promotion before the loop passes so the promoted
-    // fields are loop-carried SSA values indvars/licm/bcheck can see.
-    step(
-        "slotprom",
-        "slotprom",
-        Gate::Env("PLIRON_SLOTPROM"),
-        s_slotprom,
-    )
-    .needs(shape::MEM),
-    cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::MEM),
-    Step {
-        name: "egraph",
-        bisect: Some("egraph"),
-        stat: "",
-        verify: false,
-        mutates: true,
-        cached: true,
-        shape: 0,
-        gate: Gate::OptIn("PLIRON_EGRAPH"),
-        run: s_egraph,
-    },
-    cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars).needs(shape::LOOPS),
-    step(
-        "ldrot",
-        "ldrot",
-        Gate::All(&[Gate::Flag(FlagId::Indvars), Gate::Env("PLIRON_LDROT")]),
-        s_ldrot,
-    )
-    .needs(shape::LOOPS | shape::MEM),
-    cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
-    step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm).needs(shape::LOOPS),
-    step(
-        "loopidiom",
-        "idiom",
-        Gate::Flag(FlagId::Loopidiom),
-        s_loopidiom,
-    )
-    .needs(shape::LOOPS | shape::MEM),
-    cstep(
-        "ifconv2",
-        "ifconv2",
-        Gate::All(&[Gate::Flag(FlagId::Loopvec), Gate::Env("PLIRON_IFCONV2")]),
-        s_ifconv2,
-    )
-    .needs(shape::CONDBR),
-    cstep(
-        "unswitch",
-        "unswitch",
-        Gate::Env("PLIRON_UNSWITCH"),
-        s_unswitch,
-    )
-    .needs(shape::LOOPS),
-    cstep("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck).needs(shape::CONDBR),
-    // `x / k` / `x % k` → magic-multiply + shift sequences. The div/rem
-    // ops are `can_trap` side effects to loopvec, so expanding here is
-    // what lets a `x % 3 != 0` filter predicate vectorize at all — and
-    // the ~5-instr sequence beats a hardware `sdiv` in scalar code too.
-    step(
-        "divconst",
-        "divconst",
-        Gate::Env("PLIRON_DIVCONST"),
-        s_divconst,
-    )
-    .needs(shape::DIVREM),
-    cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec).needs(shape::LOOPS),
-    cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp).needs(shape::SLP),
-    // bcheck's per-loop version guards sit at the inner loop's entry —
-    // their len/min/carry parts are invariant in every enclosing loop
-    // but the only licm already ran. matmul's guard re-evaluates
-    // `min(n-1, len)` and the offset chain ~n² times; hoist it.
-    cstep("licm2", "licm", Gate::Flag(FlagId::Licm), s_licm).needs(shape::LOOPS),
-    step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap).needs(shape::SWITCH),
-    Step {
-        name: "constbr2",
-        bisect: Some("constbr"),
-        stat: "",
-        verify: true,
-        mutates: true,
-        cached: false,
-        shape: shape::CONDBR,
-        gate: Gate::OptIn("PLIRON_CONSTBR"),
-        run: s_constbr2,
-    },
-    cstep(
-        "loopdel",
-        "loopdel",
-        Gate::All(&[JT, Gate::Env("PLIRON_LOOPDEL")]),
-        s_loopdel,
-    )
-    .needs(shape::LOOPS),
-    cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
-    // Re-time rotated loops that test the pre-increment IV so the latch
-    // tests `iadd p, s` directly — drops the backedge register copy.
-    step("ivalign", "ivalign", Gate::Env("PLIRON_IVALIGN"), s_ivalign).needs(shape::LOOPS),
-    // Scalar unroll of linear counted loops (e.g. ordered float
-    // reductions that can't vectorize): K bodies per branch.
-    cstep(
-        "punroll",
-        "punroll",
-        Gate::All(&[JT, Gate::Env("PLIRON_PUNROLL")]),
-        s_punroll,
-    )
-    .needs(shape::LOOPS),
-    // Merge identical constants across dominated blocks — unroll/clone
-    // passes stamp fresh `iconst`s per copy, and each one is a `mov`
-    // downstream instead of a shared register (or `wzr`).
-    step(
-        "constdedup",
-        "constdedup",
-        Gate::Env("PLIRON_CSTDEDUP"),
-        s_constdedup,
-    ),
-    Step {
-        name: "frozen_loads",
-        bisect: None,
-        stat: "",
-        verify: false,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Always,
-        run: s_frozen_loads,
-    },
-    cstep(
-        "sublea",
-        "sublea",
-        Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_SUBLEA")]),
-        s_sublea,
-    ),
-    Step {
-        name: "commute",
-        bisect: Some("commute"),
-        stat: "commute",
-        verify: false,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
-        run: s_commute,
-    },
-    Step {
-        name: "wide_minmax",
-        bisect: None,
-        stat: "",
-        verify: false,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Always,
-        run: s_wide_minmax,
-    },
-    Step {
-        name: "coldarg",
-        bisect: Some("coldarg"),
-        stat: "coldarg",
-        verify: false,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Env("PLIRON_COLDARG"),
-        run: s_coldarg,
-    },
-    step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse).needs(shape::MULTI),
-    cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd),
-    step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf),
-    cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
-    cstep(
-        "ivrefold",
-        "ivrefold",
-        Gate::Env("PLIRON_IVREFOLD"),
-        s_ivrefold,
-    )
-    .needs(shape::LOOPS),
-    cstep("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec).needs(shape::LOOPS),
-    cstep("lcse", "lcse", Gate::Env("PLIRON_LCSE"), s_lcse),
-    cstep("dgvn", "dgvn", Gate::Env("PLIRON_DGVN"), s_dgvn),
-    cstep(
-        "sameargs",
-        "sameargs",
-        Gate::Env("PLIRON_SAMEARG"),
-        s_sameargs,
-    ),
-    // `load (select)` speculation once the compare-exchange diamonds
-    // are selects (fuse/sameargs ran) — early enough that loadfwd2 can
-    // forward the network's own stores into the fresh arm loads.
-    step("loadsel", "loadsel", Gate::Env("PLIRON_LDSEL"), s_loadsel).needs(shape::MEM),
-    step(
-        "loadfwd2",
-        "loadfwd2",
-        Gate::Flag(FlagId::Loadfwd),
-        s_loadfwd2,
-    )
-    .needs(shape::MEM),
-    step("mask01", "mask01", Gate::Env("PLIRON_MASK01"), s_mask01),
-    cstep(
-        "edgespec",
-        "edgespec",
-        Gate::Env("PLIRON_EDGESPEC"),
-        s_edgespec,
-    ),
-    cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab).needs(shape::CONDBR),
-    step(
-        "coldedge",
-        "coldedge",
-        Gate::Env("PLIRON_COLDEDGE"),
-        s_coldedge,
-    ),
-    cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2).needs(shape::MEM),
-    step("vecslot", "vecslot", Gate::Env("PLIRON_VECSLOT"), s_vecslot).needs(shape::MEM),
-    // Late value numbering: the edge transforms and vecslot leave
-    // identical insts in one block; also drives the mem-offset and
-    // neg folds on late-introduced addressing.
-    Step {
-        name: "lcse2",
-        bisect: Some("lcse"),
-        stat: "lcse",
-        verify: true,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Env("PLIRON_LCSE"),
-        run: s_lcse,
-    },
-    step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32).needs(shape::MEM),
-    // `icmp p, K` count latches become `icmp p+s, K+s` — the test folds
-    // into the already-computed step value (one-register `add;cmp;jcc`)
-    // and leaves boundcmp's post-inc shape behind.
-    step("postinc", "postinc", Gate::Env("PLIRON_POSTINC"), s_postinc).needs(shape::LOOPS),
-    step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp).needs(shape::LOOPS),
-    step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg),
-    step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain).needs(shape::SWITCH),
-    // Sink `splat(const)` defs into their use blocks: a cross-region live
-    // splat becomes a spill reload per loop iteration; a local one is a
-    // single `movi`/`dup` at the use.
-    step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink),
-    // Flag-merge brif blocks (a bool merged through a param, then tested)
-    // only settle after edgespec/celim — dup them onto const edges here too.
-    step("taildup2", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
-    // Late dispatch-block duplication + edge re-spec: collapses the
-    // `select -> ireduce -> icmp -> brif` dispatch tail onto a direct brif
-    // on the flag (tokenize's block388/block859 discriminant chain —
-    // only pays off once jtround can repair multi-pred targets, so this
-    // sits right before the looping jtround).
-    step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::CONDBR),
-    step(
-        "jtround",
-        "threaded",
-        Gate::Env("PLIRON_JTROUND"),
-        s_jtround,
-    )
-    .needs(shape::CONDBR),
-    cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::MEM),
-    step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
-    // Fold constants any earlier pass left behind — late value folds
-    // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
-    // `ishl` chains the early clifpeep round never saw (matmul's
-    // `((-(-216))>>3)<<6` vector-trip bound recomputed per iteration).
-    step("csweep2", "", Gate::Env("PLIRON_CSWEEP2"), s_csweep2),
-    // `jtround`/`mergechain` threading leaves `isub(isub e,a),(isub e,b)`
-    // telescopes on the new edges (`end-front` vs `end-ptr'` lengths —
-    // the token-len recomputes in tokenize's block303). lcse2 already
-    // ran, so one more local pass here.
-    Step {
-        name: "lcse3",
-        bisect: Some("lcse"),
-        stat: "lcse",
-        verify: true,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Env("PLIRON_LCSE"),
-        run: s_lcse,
-    },
-    // Late uniform-param drop: mergechain/jtround retarget edges past
-    // shared join blocks, and the remaining edges often agree on an
-    // arg that was non-uniform when sameargs first ran (chars_alpha's
-    // Option<char> flag: exits retargeted away, all survivors pass 1).
-    step(
-        "sameargs2",
-        "sameargs",
-        Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG2")]),
-        s_sameargs,
-    ),
-    // (The old `arghoist` position was a second webmerge call right
-    // after sameargs2's fixpoint — webmerge now hoists same-shape edge
-    // args via phase-B `P`-keys, so nothing was left for it.)
-    step(
-        "paramsink",
-        "paramsink",
-        Gate::Env("PLIRON_PARAMSINK"),
-        s_paramsink,
-    ),
-    // paramsink re-bases count latches to `icmp p, K` — re-point the
-    // test at the `p + s` edge arg so the latch lowers to `add;cmp;jcc`
-    // on one register.
-    step(
-        "postinc2",
-        "postinc",
-        Gate::Env("PLIRON_POSTINC"),
-        s_postinc,
-    )
-    .needs(shape::LOOPS),
-    // Second ivalign slot: paramsink is what re-times loop params into
-    // the `icmp p, bound` / `iadd p, s` backedge shape (sieve's marking
-    // loop), so the pattern rarely exists at the post-looprot position.
-    // postinc covers only constant bounds — a runtime bound needs the
-    // edge retiming.
-    step(
-        "ivalign2",
-        "ivalign",
-        Gate::Env("PLIRON_IVALIGN"),
-        s_ivalign,
-    )
-    .needs(shape::LOOPS),
-    // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
-    // — are phase-D relational merges; the later sameargs3/webmerge
-    // positions cover anything this extra call found.)
-    // `icmp CC (select c,K,x), K` folds to `c`/`!c` when the live arm's
-    // compare is provable — a pure fold, so it gets first crack at the
-    // niche dispatch; `seltest` below handles the unprovable cases by
-    // splitting the branch.
-    step("nfold", "niche", Gate::Env("PLIRON_NFOLD"), s_niche),
-    step("selargs", "selargs", Gate::Env("PLIRON_SELARGS"), s_selargs),
-    // `brif (icmp (select c,K,x), K)` niche dispatch → `brif c` +
-    // `icmp x,K` middle block — every edge knows `c`'s side, so the
-    // `select c,·,·` args fold to arms and the cmov cluster dies
-    // (`Chars::next`/`split_terminator` per-element cost). Runs late:
-    // the select form only exists after ifconv/merge retargeting.
-    step("seltest", "seltest", Gate::Env("PLIRON_SELTEST"), s_seltest).needs(shape::CONDBR),
-    // `(x >= lo) && (x < hi)` merged to `(x - lo) <u w` — select/band
-    // scalar forms plus loopvec's `bitselect(masked cmp, cmp, 0)` —
-    // after sameargs folds the bounds to `iconst`/`splat(iconst)` the
-    // merge becomes one `icmp` per element instead of cmp+cmp+select
-    // (or two `pcmpgtd` + mask ops per SIMD group).
-    step("rgmerge", "rgmerge", Gate::Env("PLIRON_RGPAIR"), s_rgmerge),
-    // selargs/seltest resolve the niche selects in edge args, exposing
-    // affine relations (`next = cur + 1` cursor pairs) that were opaque
-    // to affparm at sameargs2 — one more round drops them, shrinking
-    // the per-iteration edge copies in decode loops.
-    step(
-        "sameargs3",
-        "sameargs",
-        Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG3")]),
-        s_sameargs,
-    ),
-    // Late dead-param drop: sameargs/paramsink retargeting can close a
-    // param-flow cycle that was live at jtround time (tokenize's token
-    // (start,end) pair — `count()` discards it, so the four-block
-    // carry chain is pure cargo for regalloc).
-    Step {
-        name: "deadp",
-        bisect: Some("deadp"),
-        stat: "deadp",
-        verify: true,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Env("PLIRON_DEADP"),
-        run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
-    },
-    // Phi merge through affine congruence: every in-edge of a param
-    // carries the same `root + k` class (`proots::affine_nf` — Ascent),
-    // so distinct SSA values that are transposed copies of one carrier
-    // still merge. Catches the shapes `taildup`'s per-edge clones and
-    // jumpthread's copied `iadd`s leave behind.
-    step(
-        "webmerge",
-        "webmerge",
-        Gate::Env("PLIRON_WEBMERGE"),
-        s_webmerge,
-    )
-    .needs(shape::MULTI),
-    // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
-    // range unions `(x|d)-k_hi u<w` — rustc's char classification
-    // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
-    // branch each and the union merges the pair, LLVM's `c|0x20`.
-    step(
-        "rangefold",
-        "rangefold",
-        Gate::Env("PLIRON_RANGEFOLD"),
-        s_rangefold,
-    )
-    .needs(shape::CONDBR),
-    // One-bit compares feeding a `brif` — `byte <u 0x80` (the UTF-8
-    // ASCII/continuation test in tokenize/chars_*), `x <s 0` — become
-    // `brif (band v, 1<<b)` (targets swapped for the clear-polarity
-    // case), which isel fuses into a single `tbnz`/`tbz` on aarch64 and
-    // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
-    // every earlier pass.
-    step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest).needs(shape::CONDBR),
-    // `jump`-edge continuations whose param-bound loads a pred just
-    // stored (or_insert's `*v += 1` reading its own `0`) get cloned onto
-    // the edge so lcse4 can fold the RMW to a direct store.
-    step("memspec", "memspec", Gate::Env("PLIRON_MEMSPEC"), s_memspec).needs(shape::MEM),
-    // sameargs3/paramsink substitute edge args into isub uses, leaving
-    // `isub (iadd x, k), x` cursor deltas that only now have visible iadd
-    // defs (tokenize's per-path byte lengths) — one more local fold.
-    Step {
-        name: "lcse4",
-        bisect: Some("lcse"),
-        stat: "lcse",
-        verify: true,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Env("PLIRON_LCSE"),
-        run: s_lcse,
-    },
-    // Third DSE: the late edge/jtr cleanup can delete a slot's last
-    // readers after `dse2` ran (SipHash's `&key` tail-byte loads —
-    // hashmap's per-iteration `x` store dies only once the tail branch
-    // structure resolves) — the orphaned store would otherwise reach
-    // codegen as a stack write per loop iteration.
-    cstep("dse3", "dse3", Gate::Env("PLIRON_DSE3"), s_dse3).needs(shape::MEM),
-    // Loop-latch merges (`brif …, tail, …` where `tail` loops back) only
-    // shrink under MAX_INSTS after the late folds — clone them last so the
-    // loop's hot tail lands on the fallthrough edge instead of a `jmp`
-    // per iteration (chars_*/tokenize dispatch).
-    step("taildup3", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::CONDBR),
-    // taildup's per-edge clones leave congruent `iadd`/`isub` args on a
-    // shared successor — one more merge round after the last clone step.
-    step(
-        "webmerge2",
-        "webmerge",
-        Gate::Env("PLIRON_WEBMERGE"),
-        s_webmerge,
-    )
-    .needs(shape::MULTI),
-    // The late jtr/mergechain/taildup rounds stamp a fresh `iconst` per
-    // block copy (a `mov #10` before every unrolled `madd` — parse_only);
-    // merge them back to the dominating def so one register serves the
-    // loop instead of a remat per block.
-    step(
-        "constdedup2",
-        "constdedup",
-        Gate::Env("PLIRON_CSTDEDUP"),
-        s_constdedup,
-    ),
-    // Error/merge payloads computed in `b` but used only by one
-    // `brif` edge's args (parse_only's `ParseIntError` pack on every
-    // digit-validity branch) run unconditionally there — sink them
-    // onto the edge so the taken path alone pays.
-    step(
-        "edgesink",
-        "edgesink",
-        Gate::Env("PLIRON_EDGESINK"),
-        s_edgesink,
-    )
-    .needs(shape::CONDBR),
-    Step {
-        name: "coldret",
-        bisect: Some("coldret"),
-        stat: "coldret",
-        verify: false,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Env("PLIRON_COLDRET"),
-        run: s_coldret,
-    },
-    // Legality, not optimization: `iconst.i128` reaches isel with no
-    // lowering rule and panics. Any pass can mint one, so sweep last.
-    Step {
-        name: "iconst128",
-        bisect: None,
-        stat: "",
-        verify: false,
-        mutates: true,
-        cached: false,
-        shape: 0,
-        gate: Gate::Always,
-        run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
-    },
-];
+pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(|| {
+    vec![
+        Step {
+            name: "jumpthread",
+            bisect: Some("jumpthread"),
+            stat: "",
+            verify: true,
+            mutates: true,
+            // Needs at least one of: an edge (threading/chains/bypass), a
+            // non-entry param (`deadp` cleans unreachable param'd blocks),
+            // or an `icmp` (`fold_null_tests` — the only sub-phase that can
+            // fire on a lone straightline block). Finer sub-phase guards
+            // live inside `jumpthread::run`.
+            cached: true,
+            shape: 0,
+            any: shape::MULTI | shape::BPARAM | shape::TESTC,
+            creates: shape::CREATED,
+            gate: JT,
+            run: s_jumpthread,
+            site: std::sync::OnceLock::new(),
+        },
+        cstep(
+            "constbr",
+            "constbr",
+            Gate::All(&[JT, Gate::Env("PLIRON_CONSTBR")]),
+            s_constbr,
+        )
+        .needs(shape::CONDBR),
+        Step {
+            name: "unroll",
+            bisect: Some("unroll"),
+            stat: "",
+            verify: true,
+            mutates: true,
+            cached: true,
+            shape: shape::LOOPS,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
+            run: s_unroll,
+            site: std::sync::OnceLock::new(),
+        },
+        step("unreach", "", Gate::Flag(FlagId::Unreach), s_unreach),
+        Step {
+            name: "clifpeep",
+            bisect: Some("clifpeep"),
+            stat: "",
+            verify: false,
+            mutates: true,
+            cached: true,
+            shape: 0,
+            any: 0,
+            // `memcpy`/`memset` folding emits libcalls — CALL can appear.
+            creates: u32::MAX,
+            gate: Gate::Flag(FlagId::Peep),
+            run: s_clifpeep,
+            site: std::sync::OnceLock::new(),
+        },
+        step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge).needs(shape::BLOCKS2),
+        step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
+        step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec).needs(shape::CALL),
+        Step {
+            name: "loadfwd",
+            bisect: Some("loadfwd"),
+            stat: "",
+            verify: true,
+            mutates: true,
+            cached: true,
+            // The `remove_dead_insts` cleanup in `s_loadfwd` can fire on
+            // any function, so no step-level gate; the `loadfwd` dataflow
+            // and dead-store sweep are LOAD/STORE-gated inside instead.
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Flag(FlagId::Loadfwd),
+            run: s_loadfwd,
+            site: std::sync::OnceLock::new(),
+        },
+        // Stack-slot SSA promotion before the loop passes so the promoted
+        // fields are loop-carried SSA values indvars/licm/bcheck can see.
+        step(
+            "slotprom",
+            "slotprom",
+            Gate::Env("PLIRON_SLOTPROM"),
+            s_slotprom,
+        )
+        .needs(shape::MEM)
+        .creates_all(),
+        cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::STORE),
+        Step {
+            name: "egraph",
+            bisect: Some("egraph"),
+            stat: "",
+            verify: false,
+            mutates: true,
+            cached: true,
+            shape: 0,
+            any: 0,
+            // Rewrite-by-reconstruction can emit inst kinds the input
+            // lacked.
+            creates: u32::MAX,
+            gate: Gate::OptIn("PLIRON_EGRAPH"),
+            run: s_egraph,
+            site: std::sync::OnceLock::new(),
+        },
+        // `prev` seed materialization emits loads.
+        cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars)
+            .needs(shape::LOOPS)
+            .creates_all(),
+        step(
+            "ldrot",
+            "ldrot",
+            Gate::All(&[Gate::Flag(FlagId::Indvars), Gate::Env("PLIRON_LDROT")]),
+            s_ldrot,
+        )
+        .needs(shape::LOOPS | shape::MEM),
+        cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm)
+            .needs(shape::LOOPS)
+            .creates_all(),
+        step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm).needs(shape::LOOPS),
+        step(
+            "loopidiom",
+            "idiom",
+            Gate::Flag(FlagId::Loopidiom),
+            s_loopidiom,
+        )
+        .needs(shape::LOOPS | shape::MEM)
+        // `memset`/`memcpy` idiom recognition emits libcalls.
+        .creates_all(),
+        cstep(
+            "ifconv2",
+            "ifconv2",
+            Gate::All(&[Gate::Flag(FlagId::Loopvec), Gate::Env("PLIRON_IFCONV2")]),
+            s_ifconv2,
+        )
+        // `ifconv` needs the diamond (CONDBR+JUMP — checked inside); `cparm`
+        // runs `webmerge` (BPARAM) + a brif const-sweep (CONDBR).
+        .needs_any(shape::CONDBR | shape::BPARAM),
+        cstep(
+            "unswitch",
+            "unswitch",
+            Gate::Env("PLIRON_UNSWITCH"),
+            s_unswitch,
+        )
+        .needs(shape::LOOPS),
+        cstep("bcheck", "bcheck", Gate::Flag(FlagId::Bcheck), s_bcheck).needs(shape::CONDBR),
+        // `x / k` / `x % k` → magic-multiply + shift sequences. The div/rem
+        // ops are `can_trap` side effects to loopvec, so expanding here is
+        // what lets a `x % 3 != 0` filter predicate vectorize at all — and
+        // the ~5-instr sequence beats a hardware `sdiv` in scalar code too.
+        step(
+            "divconst",
+            "divconst",
+            Gate::Env("PLIRON_DIVCONST"),
+            s_divconst,
+        )
+        .needs(shape::DIVREM),
+        cstep("loopvec", "loopvec", Gate::Flag(FlagId::Loopvec), s_loopvec)
+            .needs(shape::LOOPS)
+            .creates_all(),
+        cstep("slp", "slp", Gate::Flag(FlagId::Slp), s_slp)
+            .needs(shape::SLP)
+            .creates_all(),
+        // bcheck's per-loop version guards sit at the inner loop's entry —
+        // their len/min/carry parts are invariant in every enclosing loop
+        // but the only licm already ran. matmul's guard re-evaluates
+        // `min(n-1, len)` and the offset chain ~n² times; hoist it.
+        cstep("licm2", "licm", Gate::Flag(FlagId::Licm), s_licm)
+            .needs(shape::LOOPS)
+            .creates_all(),
+        step("switchmap", "", Gate::Env("PLIRON_SWITCHMAP"), s_switchmap).needs(shape::SWITCH),
+        Step {
+            name: "constbr2",
+            bisect: Some("constbr"),
+            stat: "",
+            verify: true,
+            mutates: true,
+            cached: false,
+            shape: shape::CONDBR,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::OptIn("PLIRON_CONSTBR"),
+            run: s_constbr2,
+            site: std::sync::OnceLock::new(),
+        },
+        cstep(
+            "loopdel",
+            "loopdel",
+            Gate::All(&[JT, Gate::Env("PLIRON_LOOPDEL")]),
+            s_loopdel,
+        )
+        // `fold_inc_overflow` needs only a `brif`; loop deletion needs
+        // the back edge.
+        .needs_any(shape::LOOPS | shape::CONDBR),
+        cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
+        // Re-time rotated loops that test the pre-increment IV so the latch
+        // tests `iadd p, s` directly — drops the backedge register copy.
+        step("ivalign", "ivalign", Gate::Env("PLIRON_IVALIGN"), s_ivalign).needs(shape::LOOPS),
+        // Scalar unroll of linear counted loops (e.g. ordered float
+        // reductions that can't vectorize): K bodies per branch.
+        cstep(
+            "punroll",
+            "punroll",
+            Gate::All(&[JT, Gate::Env("PLIRON_PUNROLL")]),
+            s_punroll,
+        )
+        .needs(shape::LOOPS),
+        // punroll clones whole blocks, including in-header insts an earlier
+        // hoist could not move (e.g. bcheck's versioned loop header: the
+        // thread-base chain is cloned K times into the unrolled group and
+        // would recompute per iteration).
+        cstep("licm3", "", Gate::Flag(FlagId::Licm), s_licm)
+            .needs(shape::LOOPS)
+            .creates_all(),
+        // Merge identical constants across dominated blocks — unroll/clone
+        // passes stamp fresh `iconst`s per copy, and each one is a `mov`
+        // downstream instead of a shared register (or `wzr`).
+        step(
+            "constdedup",
+            "constdedup",
+            Gate::Env("PLIRON_CSTDEDUP"),
+            s_constdedup,
+        ),
+        Step {
+            name: "frozen_loads",
+            bisect: None,
+            stat: "",
+            verify: false,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Always,
+            run: s_frozen_loads,
+            site: std::sync::OnceLock::new(),
+        },
+        cstep(
+            "sublea",
+            "sublea",
+            Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_SUBLEA")]),
+            s_sublea,
+        ),
+        Step {
+            name: "commute",
+            bisect: Some("commute"),
+            stat: "commute",
+            verify: false,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
+            run: s_commute,
+            site: std::sync::OnceLock::new(),
+        },
+        Step {
+            name: "wide_minmax",
+            bisect: None,
+            stat: "",
+            verify: false,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Always,
+            run: s_wide_minmax,
+            site: std::sync::OnceLock::new(),
+        },
+        Step {
+            name: "coldarg",
+            bisect: Some("coldarg"),
+            stat: "coldarg",
+            verify: false,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Env("PLIRON_COLDARG"),
+            run: s_coldarg,
+            site: std::sync::OnceLock::new(),
+        },
+        step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse).needs(shape::MULTI),
+        cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd)
+            .needs_any(shape::MULTI | shape::BLOCKS2),
+        step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf).needs(shape::JUMP),
+        cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
+        cstep(
+            "ivrefold",
+            "ivrefold",
+            Gate::Env("PLIRON_IVREFOLD"),
+            s_ivrefold,
+        )
+        .needs(shape::LOOPS),
+        cstep("deadrec", "deadrec", Gate::Env("PLIRON_DEADREC"), s_deadrec).needs(shape::LOOPS),
+        cstep("lcse", "lcse", Gate::Env("PLIRON_LCSE"), s_lcse),
+        cstep("dgvn", "dgvn", Gate::Env("PLIRON_DGVN"), s_dgvn),
+        cstep(
+            "sameargs",
+            "sameargs",
+            Gate::Env("PLIRON_SAMEARG"),
+            s_sameargs,
+        )
+        // The `webmerge` loop needs a block param; the `const_sweep` tail
+        // only needs an `iconst` to fold through.
+        .needs_any(shape::BPARAM | shape::ICONST),
+        // `load (select)` speculation once the compare-exchange diamonds
+        // are selects (fuse/sameargs ran) — early enough that loadfwd2 can
+        // forward the network's own stores into the fresh arm loads.
+        step("loadsel", "loadsel", Gate::Env("PLIRON_LDSEL"), s_loadsel).needs(shape::LOAD),
+        step(
+            "loadfwd2",
+            "loadfwd2",
+            Gate::Flag(FlagId::Loadfwd),
+            s_loadfwd2,
+        )
+        .needs(shape::LOAD),
+        step("mask01", "mask01", Gate::Env("PLIRON_MASK01"), s_mask01),
+        cstep(
+            "edgespec",
+            "edgespec",
+            Gate::Env("PLIRON_EDGESPEC"),
+            s_edgespec,
+        )
+        // Plans need a `jump`/`brif` predecessor: pure-`jump` forwarder
+        // chains resolve too, not just conditional dispatches.
+        .needs_any(shape::JUMP | shape::CONDBR | shape::BPARAM | shape::EPARAM),
+        cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab).needs(shape::CONDBR),
+        step(
+            "coldedge",
+            "coldedge",
+            Gate::Env("PLIRON_COLDEDGE"),
+            s_coldedge,
+        ),
+        cstep("dse2", "dse2", Gate::Env("PLIRON_DSE2"), s_dse2).needs(shape::STORE),
+        step("vecslot", "vecslot", Gate::Env("PLIRON_VECSLOT"), s_vecslot).needs(shape::MEM),
+        // Late value numbering: the edge transforms and vecslot leave
+        // identical insts in one block; also drives the mem-offset and
+        // neg folds on late-introduced addressing.
+        Step {
+            name: "lcse2",
+            bisect: Some("lcse"),
+            stat: "lcse",
+            verify: true,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Env("PLIRON_LCSE"),
+            run: s_lcse,
+            site: std::sync::OnceLock::new(),
+        },
+        step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32).needs(shape::LOAD),
+        // `icmp p, K` count latches become `icmp p+s, K+s` — the test folds
+        // into the already-computed step value (one-register `add;cmp;jcc`)
+        // and leaves boundcmp's post-inc shape behind.
+        step("postinc", "postinc", Gate::Env("PLIRON_POSTINC"), s_postinc).needs(shape::LOOPS),
+        step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp).needs(shape::LOOPS),
+        step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg),
+        step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain).needs(shape::SWITCH),
+        // Sink `splat(const)` defs into their use blocks: a cross-region live
+        // splat becomes a spill reload per loop iteration; a local one is a
+        // single `movi`/`dup` at the use.
+        step("splink", "splink", Gate::Env("PLIRON_SPLINK"), s_splink).needs(shape::BLOCKS2),
+        // Flag-merge brif blocks (a bool merged through a param, then tested)
+        // only settle after edgespec/celim — dup them onto const edges here too.
+        step("taildup2", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
+        // Late dispatch-block duplication + edge re-spec: collapses the
+        // `select -> ireduce -> icmp -> brif` dispatch tail onto a direct brif
+        // on the flag (tokenize's block388/block859 discriminant chain —
+        // only pays off once jtround can repair multi-pred targets, so this
+        // sits right before the looping jtround).
+        // Everything inside needs an edge: `merge_chains` a `jump` chain,
+        // the dispatch/brif work a conditional (guarded per-phase inside
+        // for the CONDBR-less case the old gate used to skip wholesale).
+        step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::MULTI),
+        step(
+            "jtround",
+            "threaded",
+            Gate::Env("PLIRON_JTROUND"),
+            s_jtround,
+        )
+        .needs(shape::CONDBR),
+        cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
+        step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
+        // Fold constants any earlier pass left behind — late value folds
+        // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
+        // `ishl` chains the early clifpeep round never saw (matmul's
+        // `((-(-216))>>3)<<6` vector-trip bound recomputed per iteration).
+        step("csweep2", "", Gate::Env("PLIRON_CSWEEP2"), s_csweep2),
+        // `jtround`/`mergechain` threading leaves `isub(isub e,a),(isub e,b)`
+        // telescopes on the new edges (`end-front` vs `end-ptr'` lengths —
+        // the token-len recomputes in tokenize's block303). lcse2 already
+        // ran, so one more local pass here.
+        Step {
+            name: "lcse3",
+            bisect: Some("lcse"),
+            stat: "lcse",
+            verify: true,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Env("PLIRON_LCSE"),
+            run: s_lcse,
+            site: std::sync::OnceLock::new(),
+        },
+        // Late uniform-param drop: mergechain/jtround retarget edges past
+        // shared join blocks, and the remaining edges often agree on an
+        // arg that was non-uniform when sameargs first ran (chars_alpha's
+        // Option<char> flag: exits retargeted away, all survivors pass 1).
+        step(
+            "sameargs2",
+            "sameargs",
+            Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG2")]),
+            s_sameargs,
+        )
+        // The `webmerge` loop needs a block param; the `const_sweep` tail
+        // only needs an `iconst` to fold through.
+        .needs_any(shape::BPARAM | shape::ICONST),
+        // (The old `arghoist` position was a second webmerge call right
+        // after sameargs2's fixpoint — webmerge now hoists same-shape edge
+        // args via phase-B `P`-keys, so nothing was left for it.)
+        step(
+            "paramsink",
+            "paramsink",
+            Gate::Env("PLIRON_PARAMSINK"),
+            s_paramsink,
+        ),
+        // paramsink re-bases count latches to `icmp p, K` — re-point the
+        // test at the `p + s` edge arg so the latch lowers to `add;cmp;jcc`
+        // on one register.
+        step(
+            "postinc2",
+            "postinc",
+            Gate::Env("PLIRON_POSTINC"),
+            s_postinc,
+        )
+        .needs(shape::LOOPS),
+        // Second ivalign slot: paramsink is what re-times loop params into
+        // the `icmp p, bound` / `iadd p, s` backedge shape (sieve's marking
+        // loop), so the pattern rarely exists at the post-looprot position.
+        // postinc covers only constant bounds — a runtime bound needs the
+        // edge retiming.
+        step(
+            "ivalign2",
+            "ivalign",
+            Gate::Env("PLIRON_IVALIGN"),
+            s_ivalign,
+        )
+        .needs(shape::LOOPS),
+        // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
+        // — are phase-D relational merges; the later sameargs3/webmerge
+        // positions cover anything this extra call found.)
+        // `icmp CC (select c,K,x), K` folds to `c`/`!c` when the live arm's
+        // compare is provable — a pure fold, so it gets first crack at the
+        // niche dispatch; `seltest` below handles the unprovable cases by
+        // splitting the branch.
+        step("nfold", "niche", Gate::Env("PLIRON_NFOLD"), s_niche),
+        step("selargs", "selargs", Gate::Env("PLIRON_SELARGS"), s_selargs),
+        // `brif (icmp (select c,K,x), K)` niche dispatch → `brif c` +
+        // `icmp x,K` middle block — every edge knows `c`'s side, so the
+        // `select c,·,·` args fold to arms and the cmov cluster dies
+        // (`Chars::next`/`split_terminator` per-element cost). Runs late:
+        // the select form only exists after ifconv/merge retargeting.
+        step("seltest", "seltest", Gate::Env("PLIRON_SELTEST"), s_seltest).needs(shape::CONDBR),
+        // `(x >= lo) && (x < hi)` merged to `(x - lo) <u w` — select/band
+        // scalar forms plus loopvec's `bitselect(masked cmp, cmp, 0)` —
+        // after sameargs folds the bounds to `iconst`/`splat(iconst)` the
+        // merge becomes one `icmp` per element instead of cmp+cmp+select
+        // (or two `pcmpgtd` + mask ops per SIMD group).
+        step("rgmerge", "rgmerge", Gate::Env("PLIRON_RGPAIR"), s_rgmerge),
+        // selargs/seltest resolve the niche selects in edge args, exposing
+        // affine relations (`next = cur + 1` cursor pairs) that were opaque
+        // to affparm at sameargs2 — one more round drops them, shrinking
+        // the per-iteration edge copies in decode loops.
+        step(
+            "sameargs3",
+            "sameargs",
+            Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::Env("PLIRON_SAMEARG3")]),
+            s_sameargs,
+        )
+        // The `webmerge` loop needs a block param; the `const_sweep` tail
+        // only needs an `iconst` to fold through.
+        .needs_any(shape::BPARAM | shape::ICONST),
+        // Late dead-param drop: sameargs/paramsink retargeting can close a
+        // param-flow cycle that was live at jtround time (tokenize's token
+        // (start,end) pair — `count()` discards it, so the four-block
+        // carry chain is pure cargo for regalloc).
+        Step {
+            name: "deadp",
+            bisect: Some("deadp"),
+            stat: "deadp",
+            verify: true,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Env("PLIRON_DEADP"),
+            run: |p, an| {
+                let (cfg, _) = an.cfg_dt(&p.clctx.func);
+                jumpthread::remove_dead_params(&mut p.clctx.func, cfg)
+            },
+            site: std::sync::OnceLock::new(),
+        }
+        .needs(shape::BPARAM),
+        // Phi merge through affine congruence: every in-edge of a param
+        // carries the same `root + k` class (`proots::affine_nf` — Ascent),
+        // so distinct SSA values that are transposed copies of one carrier
+        // still merge. Catches the shapes `taildup`'s per-edge clones and
+        // jumpthread's copied `iadd`s leave behind.
+        step(
+            "webmerge",
+            "webmerge",
+            Gate::Env("PLIRON_WEBMERGE"),
+            s_webmerge,
+        )
+        .needs(shape::MULTI | shape::BPARAM),
+        // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
+        // range unions `(x|d)-k_hi u<w` — rustc's char classification
+        // (a-z|A-Z) lands as a 4-branch chain; the offset form is one
+        // branch each and the union merges the pair, LLVM's `c|0x20`.
+        step(
+            "rangefold",
+            "rangefold",
+            Gate::Env("PLIRON_RANGEFOLD"),
+            s_rangefold,
+        )
+        .needs(shape::CONDBR),
+        // One-bit compares feeding a `brif` — `byte <u 0x80` (the UTF-8
+        // ASCII/continuation test in tokenize/chars_*), `x <s 0` — become
+        // `brif (band v, 1<<b)` (targets swapped for the clear-polarity
+        // case), which isel fuses into a single `tbnz`/`tbz` on aarch64 and
+        // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
+        // every earlier pass.
+        step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest).needs(shape::CONDBR),
+        // `jump`-edge continuations whose param-bound loads a pred just
+        // stored (or_insert's `*v += 1` reading its own `0`) get cloned onto
+        // the edge so lcse4 can fold the RMW to a direct store.
+        step("memspec", "memspec", Gate::Env("PLIRON_MEMSPEC"), s_memspec)
+            .needs(shape::MEM)
+            .creates_all(),
+        // sameargs3/paramsink substitute edge args into isub uses, leaving
+        // `isub (iadd x, k), x` cursor deltas that only now have visible iadd
+        // defs (tokenize's per-path byte lengths) — one more local fold.
+        Step {
+            name: "lcse4",
+            bisect: Some("lcse"),
+            stat: "lcse",
+            verify: true,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Env("PLIRON_LCSE"),
+            run: s_lcse,
+            site: std::sync::OnceLock::new(),
+        },
+        // Third DSE: the late edge/jtr cleanup can delete a slot's last
+        // readers after `dse2` ran (SipHash's `&key` tail-byte loads —
+        // hashmap's per-iteration `x` store dies only once the tail branch
+        // structure resolves) — the orphaned store would otherwise reach
+        // codegen as a stack write per loop iteration.
+        cstep("dse3", "dse3", Gate::Env("PLIRON_DSE3"), s_dse3).needs(shape::STORE),
+        // Loop-latch merges (`brif …, tail, …` where `tail` loops back) only
+        // shrink under MAX_INSTS after the late folds — clone them last so the
+        // loop's hot tail lands on the fallthrough edge instead of a `jmp`
+        // per iteration (chars_*/tokenize dispatch).
+        step("taildup3", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
+        // taildup's per-edge clones leave congruent `iadd`/`isub` args on a
+        // shared successor — one more merge round after the last clone step.
+        step(
+            "webmerge2",
+            "webmerge",
+            Gate::Env("PLIRON_WEBMERGE"),
+            s_webmerge,
+        )
+        .needs(shape::MULTI | shape::BPARAM),
+        // taildup/jtr twin-arm clones (`binary_search`'s two update paths)
+        // differ only in operand values — merge into one block with `select`s,
+        // turning a data-dependent branch per iteration into `cmov`s.
+        cstep(
+            "armmerge",
+            "armmerge",
+            Gate::Env("PLIRON_ARMMERGE"),
+            s_armmerge,
+        )
+        .needs(shape::CONDBR),
+        // The late jtr/mergechain/taildup rounds stamp a fresh `iconst` per
+        // block copy (a `mov #10` before every unrolled `madd` — parse_only);
+        // merge them back to the dominating def so one register serves the
+        // loop instead of a remat per block.
+        step(
+            "constdedup2",
+            "constdedup",
+            Gate::Env("PLIRON_CSTDEDUP"),
+            s_constdedup,
+        ),
+        // Error/merge payloads computed in `b` but used only by one
+        // `brif` edge's args (parse_only's `ParseIntError` pack on every
+        // digit-validity branch) run unconditionally there — sink them
+        // onto the edge so the taken path alone pays.
+        step(
+            "edgesink",
+            "edgesink",
+            Gate::Env("PLIRON_EDGESINK"),
+            s_edgesink,
+        )
+        // The `brif` sink loop needs CONDBR; `push_to_use_blocks` only
+        // needs a second block to push into.
+        .needs_any(shape::CONDBR | shape::BLOCKS2),
+        Step {
+            name: "coldret",
+            bisect: Some("coldret"),
+            stat: "coldret",
+            verify: false,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Env("PLIRON_COLDRET"),
+            run: s_coldret,
+            site: std::sync::OnceLock::new(),
+        },
+        // Legality, not optimization: `iconst.i128` reaches isel with no
+        // lowering rule and panics. Any pass can mint one, so sweep last.
+        Step {
+            name: "iconst128",
+            bisect: None,
+            stat: "",
+            verify: false,
+            mutates: true,
+            cached: false,
+            shape: 0,
+            any: 0,
+            creates: shape::CREATED,
+            gate: Gate::Always,
+            run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
+            site: std::sync::OnceLock::new(),
+        },
+    ]
+});
 
 #[cfg(test)]
 mod tests {
@@ -3156,7 +3680,8 @@ mod tests {
         let invariant: FxHashSet<Inst> = Default::default();
         let block_region: FxHashMap<Block, Ptr<BasicBlock>> = Default::default();
         let prof: FxHashMap<Block, u64> = Default::default();
-        let region_parent: FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>> = Default::default();
+        let region_parent: pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>> =
+            Default::default();
         let nocap: FxHashSet<(Inst, u32)> = Default::default();
         let mut nonnull = FxHashSet::default();
         nonnull.insert(v4);
@@ -3167,8 +3692,10 @@ mod tests {
         let mut operand_frozen = FxHashMap::default();
         let mut lifetimes = Vec::new();
         let mut stats = Stats::default();
+        let mut fact_bits = SecondaryMap::new();
         let flags = FnFlags::default();
         let mut p = Pipe {
+            fact_bits: &mut fact_bits,
             clctx: &mut clctx,
             isa: &*isa,
             fname: "carry_keeps_param_facts_scoped",
@@ -3203,6 +3730,7 @@ mod tests {
             fn_names: &[],
             cur_step: "",
         };
+        p.seed_fact_bits();
         // The buggy pair: a param's guarded nonnull onto the wider-scope
         // call result — must not transfer (different blocks: v4's site
         // doesn't cover v1's def).
@@ -3214,6 +3742,7 @@ mod tests {
         // Dedup carries still work: a result's mark reaches its
         // later-defined twin in the same block.
         p.nonnull.insert(v1);
+        p.fact_bits[v1] |= fact_bits::NONNULL;
         carry_one(&mut p, v1, v2);
         assert!(
             p.nonnull.contains(&v2),

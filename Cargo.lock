@@ -530,6 +530,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-native"
+version = "0.135.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "273c79e0265b754f67ff76c42d6db4856dabf9101e3bb1b23c83255e2438dd02"
+dependencies = [
+ "cranelift-codegen",
+ "libc",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cranelift-object"
 version = "0.135.5"
 dependencies = [
@@ -1204,6 +1215,7 @@ dependencies = [
  "cranelift-reader",
  "pliron-clif-opt",
  "rustc-hash",
+ "serde_json",
  "target-lexicon",
 ]
 
@@ -1214,6 +1226,7 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",
+ "cranelift-native",
  "cranelift-object",
  "gimli",
  "object",
@@ -1228,6 +1241,7 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1419,6 +1433,7 @@ dependencies = [
 name = "rustc_codegen_pliron"
 version = "0.1.0"
 dependencies = [
+ "ascent",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-module",

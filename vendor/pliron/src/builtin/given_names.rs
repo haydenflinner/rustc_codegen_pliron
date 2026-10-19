@@ -18,78 +18,68 @@ use crate::{
     },
     identifier::Identifier,
     operation::Operation,
-    utils::table::smalltable,
 };
 
-fn set_name_in_attr_map(attributes: &mut AttributeDict, idx: usize, name: Option<Identifier>) {
-    match attributes.0.entry(ATTR_KEY_GIVEN_NAMES.clone()) {
-        smalltable::Entry::Occupied(mut occupied) => {
-            let given_names = occupied
-                .get_mut()
-                .downcast_mut::<GivenNamesAttr>()
-                .expect("Existing attribute entry for given names incorrect");
-            let name_is_none = name.is_none();
-            given_names.set_name(idx, name);
-            // If the given names attribute has all None entries, remove it from the map.
-            if name_is_none && given_names.are_all_names_unset() {
-                occupied.remove();
-            }
-        }
-        smalltable::Entry::Vacant(vacant) => {
-            // Only insert a new given names attribute if there's actually a name to set.
-            if name.is_some() {
-                let mut given_names = GivenNamesAttr::default();
-                given_names.set_name(idx, name);
-                vacant.insert(given_names.into());
-            }
-        }
+/// PLIRON: interned attrs are immutable — name edits clone the
+/// (unshared) `GivenNamesAttr`, mutate the clone, and re-intern it.
+/// `op` is the mutation to apply (`set`/`insert`/`remove` name).
+fn edit_names_in_attr_map(
+    ctx: &Context,
+    attributes: &mut AttributeDict,
+    idx: usize,
+    name: Option<Identifier>,
+    op: fn(&mut GivenNamesAttr, usize, Option<Identifier>),
+) {
+    let name_is_none = name.is_none();
+    if attributes.get_id(&ATTR_KEY_GIVEN_NAMES).is_none() && name_is_none {
+        // Nothing stored and nothing to store.
+        return;
+    }
+    let mut given_names = attributes
+        .get::<GivenNamesAttr>(ctx, &ATTR_KEY_GIVEN_NAMES)
+        .cloned()
+        .unwrap_or_default();
+    op(&mut given_names, idx, name);
+    // If the given names attribute has all None entries, remove it from the map.
+    if name_is_none && given_names.are_all_names_unset() {
+        attributes.remove(&ATTR_KEY_GIVEN_NAMES);
+    } else {
+        attributes.set(ctx, ATTR_KEY_GIVEN_NAMES.clone(), given_names);
     }
 }
 
-fn insert_name_in_attr_map(attributes: &mut AttributeDict, idx: usize, name: Option<Identifier>) {
-    match attributes.0.entry(ATTR_KEY_GIVEN_NAMES.clone()) {
-        smalltable::Entry::Occupied(mut occupied) => {
-            let given_names = occupied
-                .get_mut()
-                .downcast_mut::<GivenNamesAttr>()
-                .expect("Existing attribute entry for given names incorrect");
-            let name_is_none = name.is_none();
-            given_names.insert_name(idx, name);
-            // If the given names attribute has all None entries, remove it from the map.
-            if name_is_none && given_names.are_all_names_unset() {
-                occupied.remove();
-            }
-        }
-        smalltable::Entry::Vacant(vacant) => {
-            // Only insert a new given names attribute if there's actually a name to set.
-            if name.is_some() {
-                let mut given_names = GivenNamesAttr::default();
-                given_names.insert_name(idx, name);
-                vacant.insert(given_names.into());
-            }
-        }
-    }
+fn set_name_in_attr_map(
+    ctx: &Context,
+    attributes: &mut AttributeDict,
+    idx: usize,
+    name: Option<Identifier>,
+) {
+    edit_names_in_attr_map(ctx, attributes, idx, name, GivenNamesAttr::set_name)
 }
 
-fn remove_name_from_attr_map(attributes: &mut AttributeDict, idx: usize) {
-    if let smalltable::Entry::Occupied(mut occupied) =
-        attributes.0.entry(ATTR_KEY_GIVEN_NAMES.clone())
-    {
-        let given_names = occupied
-            .get_mut()
-            .downcast_mut::<GivenNamesAttr>()
-            .expect("Existing attribute entry for given names incorrect");
-        given_names.remove_name(idx);
-        // If the given names attribute has no more names, remove it from the map.
-        if given_names.are_all_names_unset() {
-            occupied.remove();
-        }
-    }
+fn insert_name_in_attr_map(
+    ctx: &Context,
+    attributes: &mut AttributeDict,
+    idx: usize,
+    name: Option<Identifier>,
+) {
+    edit_names_in_attr_map(ctx, attributes, idx, name, GivenNamesAttr::insert_name)
 }
 
-fn get_name_from_attr_map(attributes: &AttributeDict, idx: usize) -> Option<Identifier> {
+fn remove_name_from_attr_map(ctx: &Context, attributes: &mut AttributeDict, idx: usize) {
+    edit_names_in_attr_map(ctx, attributes, idx, None, |gn, i, n| {
+        gn.remove_name(i);
+        debug_assert!(n.is_none());
+    })
+}
+
+fn get_name_from_attr_map(
+    ctx: &Context,
+    attributes: &AttributeDict,
+    idx: usize,
+) -> Option<Identifier> {
     attributes
-        .get::<GivenNamesAttr>(&ATTR_KEY_GIVEN_NAMES)
+        .get::<GivenNamesAttr>(ctx, &ATTR_KEY_GIVEN_NAMES)
         .and_then(|given_names| given_names.get_name(idx))
 }
 
@@ -105,7 +95,7 @@ pub fn set_operation_result_name(
     let num_results = op.get_num_results();
     assert!(res_idx < num_results);
 
-    set_name_in_attr_map(&mut op.attributes, res_idx, name);
+    set_name_in_attr_map(ctx, op.attributes_mut(), res_idx, name);
 }
 
 /// Insert a name for a result in an [Operation] at the given index,
@@ -121,7 +111,7 @@ pub fn insert_operation_result_name(
     let num_results = op.get_num_results();
     assert!(res_idx <= num_results);
 
-    insert_name_in_attr_map(&mut op.attributes, res_idx, name);
+    insert_name_in_attr_map(ctx, op.attributes_mut(), res_idx, name);
 }
 
 /// Remove the name for a result in an [Operation] at the given index,
@@ -132,7 +122,7 @@ pub fn remove_operation_result_name(ctx: &Context, op: Ptr<Operation>, res_idx: 
     let num_results = op.get_num_results();
     assert!(res_idx < num_results);
 
-    remove_name_from_attr_map(&mut op.attributes, res_idx);
+    remove_name_from_attr_map(ctx, op.attributes_mut(), res_idx);
 }
 
 /// Get name for a result in an [Operation].
@@ -142,7 +132,7 @@ pub fn get_operation_result_name(
     res_idx: usize,
 ) -> Option<Identifier> {
     let op = &*op.deref(ctx);
-    get_name_from_attr_map(&op.attributes, res_idx)
+    get_name_from_attr_map(ctx, op.attributes(), res_idx)
 }
 
 /// Set the name for an argument in a [BasicBlock].
@@ -157,7 +147,7 @@ pub fn set_block_arg_name(
     let num_args = block.get_num_arguments();
     assert!(arg_idx < num_args);
 
-    set_name_in_attr_map(&mut block.attributes, arg_idx, name);
+    set_name_in_attr_map(ctx, block.attributes_mut(), arg_idx, name);
 }
 
 /// Insert a name for an argument in a [BasicBlock] at the given index,
@@ -173,7 +163,7 @@ pub fn insert_block_arg_name(
     let num_args = block.get_num_arguments();
     assert!(arg_idx <= num_args);
 
-    insert_name_in_attr_map(&mut block.attributes, arg_idx, name);
+    insert_name_in_attr_map(ctx, block.attributes_mut(), arg_idx, name);
 }
 
 /// Remove the name for an argument in a [BasicBlock] at the given index,
@@ -184,7 +174,7 @@ pub fn remove_block_arg_name(ctx: &Context, block: Ptr<BasicBlock>, arg_idx: usi
     let num_args = block.get_num_arguments();
     assert!(arg_idx < num_args);
 
-    remove_name_from_attr_map(&mut block.attributes, arg_idx);
+    remove_name_from_attr_map(ctx, block.attributes_mut(), arg_idx);
 }
 
 /// Get name for an argument in a [BasicBlock].
@@ -194,7 +184,7 @@ pub fn get_block_arg_name(
     arg_idx: usize,
 ) -> Option<Identifier> {
     let block = &*block.deref(ctx);
-    get_name_from_attr_map(&block.attributes, arg_idx)
+    get_name_from_attr_map(ctx, block.attributes(), arg_idx)
 }
 
 /// Recursively erase every [given_name](crate::common_traits::Named::given_name)

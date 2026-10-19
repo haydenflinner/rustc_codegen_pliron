@@ -1,0 +1,40 @@
+; test bcheck
+; Check1's `uge` folds to the JOIN edge in the fast clone, orphaning the
+; {subA,subB} clone subtree: subA's clone defines d, subB's clone uses it.
+; A one-shot predecessor sweep removes only subA-clone and leaves subB's
+; use of d dangling ("defined by inst which has no block" verifier error —
+; rustc_apfloat::from_decimal_string hit this on real builds).
+; The whole unreachable subtree must die together.
+; check: return
+; check-not: has no block
+function %orphan(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = iconst.i64 1
+    jump block1(v1, v1)
+
+block1(v3: i64, v4: i64):
+    v5 = icmp ult v3, v0
+    brif v5, block2, block9
+
+block2:
+    v6 = iadd v3, v2
+    v7 = icmp uge v6, v0
+    brif v7, block3, block5
+
+block3:
+    v8 = iadd v6, v2
+    v9 = icmp ult v8, v0
+    brif v9, block4, block5
+
+block4:
+    v10 = imul v8, v2
+    jump block5
+
+block5:
+    v11 = iadd v3, v2
+    jump block1(v11, v4)
+
+block9:
+    return v3
+}

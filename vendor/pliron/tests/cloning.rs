@@ -52,7 +52,7 @@ struct BranchOp {}
 /// The single successor of a terminator (asserting there is exactly one).
 fn sole_successor(ctx: &Context, term: Ptr<Operation>) -> Ptr<BasicBlock> {
     let term_ref = term.deref(ctx);
-    let mut succs = term_ref.successors();
+    let mut succs = term_ref.successors(ctx);
     let first = succs.next().expect("terminator should have a successor");
     assert!(succs.next().is_none(), "expected exactly one successor");
     first
@@ -138,7 +138,7 @@ fn clone_function_remaps_operands() -> Result<()> {
     assert_eq!(mapper.lookup_op(func.get_operation()), Some(cloned_func));
 
     // The constant's result maps to a fresh value in the clone.
-    let orig_const_val = const_op.get_operation().deref(ctx).get_result(0);
+    let orig_const_val = const_op.get_operation().deref(ctx).get_result(ctx, 0);
     let cloned_const_val = mapper
         .lookup_value(orig_const_val)
         .expect("constant result should be mapped");
@@ -148,9 +148,9 @@ fn clone_function_remaps_operands() -> Result<()> {
     let cloned_ret = mapper
         .lookup_op(ret_op.get_operation())
         .expect("return should be mapped");
-    assert_eq!(cloned_ret.deref(ctx).get_operand(0), cloned_const_val);
+    assert_eq!(cloned_ret.deref(ctx).get_operand(ctx, 0), cloned_const_val);
     assert_eq!(
-        ret_op.get_operation().deref(ctx).get_operand(0),
+        ret_op.get_operation().deref(ctx).get_operand(ctx, 0),
         orig_const_val
     );
 
@@ -224,7 +224,7 @@ fn clone_blocks_remaps_branches_and_block_args() -> Result<()> {
     // Block B takes one argument and returns it.
     let block_b = BasicBlock::new(ctx, None, vec![i64_ty.into()]);
     block_b.insert_at_back(region, ctx);
-    let b_arg = block_b.deref(ctx).get_argument(0);
+    let b_arg = block_b.deref(ctx).get_argument(ctx, 0);
     ReturnOp::new(ctx, b_arg)
         .get_operation()
         .insert_at_back(block_b, ctx);
@@ -264,16 +264,16 @@ fn clone_blocks_remaps_branches_and_block_args() -> Result<()> {
         .get_terminator(ctx)
         .expect("A's clone has a terminator");
     assert_eq!(sole_successor(ctx, a2_term), b2);
-    assert_eq!(a2_term.deref(ctx).get_operand(0), c2);
+    assert_eq!(a2_term.deref(ctx).get_operand(ctx, 0), c2);
 
     // B's clone has its own fresh argument, and its return reads that argument.
-    let b2_arg = b2.deref(ctx).get_argument(0);
+    let b2_arg = b2.deref(ctx).get_argument(ctx, 0);
     assert_eq!(mapper.lookup_value(b_arg), Some(b2_arg));
     let b2_term = b2
         .deref(ctx)
         .get_terminator(ctx)
         .expect("B's clone has a terminator");
-    assert_eq!(b2_term.deref(ctx).get_operand(0), b2_arg);
+    assert_eq!(b2_term.deref(ctx).get_operand(ctx, 0), b2_arg);
 
     Ok(())
 }
@@ -382,8 +382,8 @@ fn clone_blocks_resolves_op_result_forward_ref_in_any_order() -> Result<()> {
     let b2 = mapper.lookup_block(block_b).expect("B should be mapped");
     let b2_term = b2.deref(ctx).get_terminator(ctx).expect("B' terminator");
     // B's clone returns the *cloned* constant, not A's original.
-    assert_eq!(b2_term.deref(ctx).get_operand(0), c2);
-    assert_ne!(b2_term.deref(ctx).get_operand(0), c_val);
+    assert_eq!(b2_term.deref(ctx).get_operand(ctx, 0), c2);
+    assert_ne!(b2_term.deref(ctx).get_operand(ctx, 0), c_val);
 
     Ok(())
 }
@@ -460,7 +460,7 @@ fn clone_blocks_keeps_external_value_shared() -> Result<()> {
     let b2 = mapper.lookup_block(block_b).expect("B should be mapped");
     let b2_term = b2.deref(ctx).get_terminator(ctx).expect("B' terminator");
     // The clone still returns A's original constant.
-    assert_eq!(b2_term.deref(ctx).get_operand(0), c_val);
+    assert_eq!(b2_term.deref(ctx).get_operand(ctx, 0), c_val);
     // ...and the mapping has no entry for that external value.
     assert_eq!(mapper.lookup_value(c_val), None);
 
@@ -501,7 +501,8 @@ fn clone_blocks_copies_block_label_and_attributes() -> Result<()> {
     let label: Identifier = ident!("myblock");
     src.deref_mut(ctx).set_label(Some(label.clone()));
     let key: Identifier = ident!("test_block_attr");
-    src.deref_mut(ctx).attributes.set(
+    src.deref_mut(ctx).attributes_mut().set(
+        ctx,
         key.clone(),
         IntegerAttr::new(i64_ty, APInt::from_u64(42, bw(64))),
     );
@@ -514,8 +515,8 @@ fn clone_blocks_copies_block_label_and_attributes() -> Result<()> {
     let clone_ref = clone.deref(ctx);
     // The clone carries the same attribute.
     let copied = clone_ref
-        .attributes
-        .get::<IntegerAttr>(&key)
+        .attributes()
+        .get::<IntegerAttr>(ctx, &key)
         .expect("block attribute should be copied to the clone");
     assert_eq!(copied.value().to_u64(), 42);
     // ... and the same label (given_name), but a distinct unique_name.
@@ -763,7 +764,7 @@ fn self_contained_blocks_hash_equal() -> Result<()> {
 
     let make_block = |ctx: &mut Context| -> Ptr<BasicBlock> {
         let block = BasicBlock::new(ctx, None, vec![i64_ty.into()]);
-        let arg = block.deref(ctx).get_argument(0);
+        let arg = block.deref(ctx).get_argument(ctx, 0);
         ReturnOp::new(ctx, arg)
             .get_operation()
             .insert_at_back(block, ctx);
@@ -830,7 +831,7 @@ fn hash_distinguishes_trivial_extra_items() -> Result<()> {
             vec![],
             1,
         );
-        let one_block_region = one_block_op.deref(ctx).get_region(0);
+        let one_block_region = one_block_op.deref(ctx).get_region(ctx, 0);
         BasicBlock::new(ctx, None, vec![]).insert_at_back(one_block_region, ctx);
         assert_ne!(
             operation_hash(ctx, empty_region, &ignore),
@@ -847,7 +848,7 @@ fn hash_distinguishes_trivial_extra_items() -> Result<()> {
             vec![],
             1,
         );
-        let two_block_region = two_block_op.deref(ctx).get_region(0);
+        let two_block_region = two_block_op.deref(ctx).get_region(ctx, 0);
         BasicBlock::new(ctx, None, vec![]).insert_at_back(two_block_region, ctx);
         BasicBlock::new(ctx, None, vec![]).insert_at_back(two_block_region, ctx);
         assert_ne!(

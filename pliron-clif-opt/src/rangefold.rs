@@ -80,10 +80,10 @@ fn body_avail(func: &Function, dom: &DominatorTree, hdest: Block, at: Inst) -> b
             match func.dfg.value_def(v) {
                 ValueDef::Result(di, _) => {
                     func.layout.inst_block(di) == Some(hdest)
-                        || dom.dominates(ProgramPoint::Inst(di), at, &func.layout)
+                        || dom.try_dominates(ProgramPoint::Inst(di), at, &func.layout)
                 }
                 ValueDef::Param(b, _) => {
-                    b == hdest || dom.dominates(ProgramPoint::Block(b), at, &func.layout)
+                    b == hdest || dom.try_dominates(ProgramPoint::Block(b), at, &func.layout)
                 }
                 _ => false,
             }
@@ -185,7 +185,7 @@ fn args_avail(func: &Function, dom: &DominatorTree, bc: BlockCall, inst: Inst) -
                 ValueDef::Param(b, _) => ProgramPoint::Block(b),
                 _ => return false,
             };
-            dom.dominates(pp, inst, &func.layout)
+            dom.try_dominates(pp, inst, &func.layout)
         }
         _ => true,
     })
@@ -215,7 +215,7 @@ fn mat_of(func: &Function, dom: &DominatorTree, a: BlockArg, at: Inst) -> Option
         ValueDef::Param(b, _) => ProgramPoint::Block(b),
         _ => return None,
     };
-    if dom.dominates(pp, at, &func.layout) {
+    if dom.try_dominates(pp, at, &func.layout) {
         return Some(Mat::Arg(a));
     }
     if let Some(k) = iconst(func, v) {
@@ -237,7 +237,7 @@ fn mat_of(func: &Function, dom: &DominatorTree, a: BlockArg, at: Inst) -> Option
             ValueDef::Param(b, _) => ProgramPoint::Block(b),
             _ => return false,
         };
-        dom.dominates(pp, at, &func.layout)
+        dom.try_dominates(pp, at, &func.layout)
     });
     ok.then_some(Mat::Clone(di))
 }

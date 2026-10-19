@@ -3,7 +3,7 @@
 **Machine:** Windows x64 (`x86_64-pc-windows-msvc`), Intel i7-12700K
 (8 P-cores + 4 E-cores, AVX2, no AVX512), RTX 3080.
 **Revisions:** rustc `nightly-2026-10-06`, pliron backend `45063dd`,
-cubecl `clif-cpu-jit` `2556b654f`. Raw data: [`perf/data.md`](perf/data.md).
+cubecl `clif-cpu-jit` `2556b654f`. Raw data: [`perf-data-2026-10-16.md`](perf-data-2026-10-16.md).
 
 | axis | LLVM | pliron | verdict |
 |---|---|---|---|
@@ -77,7 +77,8 @@ pipeline itself (the CLIF pass suite runs per-function where LLVM batch
 `bench/wasm/run.sh` builds the same kernels to `wasm32-unknown-unknown`
 three ways — stock LLVM+wasm-ld, the CLIF→waffle path (default since
 `PLIRON_WASM_CLIF` flipped on), and the old dialect→waffle fallback — then
-times all 16 in node.
+times all 16 in node. (The dialect→waffle path has since been deleted;
+run.sh now builds two columns.)
 
 | | LLVM | pliron CLIF | pliron dialect |
 |---|---|---|---|
@@ -104,8 +105,8 @@ Three things stand out:
   Runtime geomean unchanged (1.166→1.157) — wasm calls are cheap, the
   inlining never paid for itself anyway.
 
-Compile time is now 1.27× LLVM for CLIF→waffle (the dialect path is still
-slower to compile than it is to run).
+Compile time is now 1.27× LLVM for CLIF→waffle (the dialect path, since
+removed, was slower to compile than it is to run).
 
 ## 3. CubeCL: LLVM LLJIT vs Cranelift JIT
 

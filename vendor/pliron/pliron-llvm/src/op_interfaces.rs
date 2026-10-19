@@ -148,8 +148,8 @@ pub trait IntBinArithOpWithOverflowFlag: IntBinArithOp {
     {
         self.get_operation()
             .deref(ctx)
-            .attributes
-            .get::<IntegerOverflowFlagsAttr>(&ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
+            .attributes()
+            .get::<IntegerOverflowFlagsAttr>(ctx, &ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
             .expect("Integer overflow flag missing or is of incorrect type")
             .clone()
     }
@@ -161,8 +161,8 @@ pub trait IntBinArithOpWithOverflowFlag: IntBinArithOp {
     {
         self.get_operation()
             .deref_mut(ctx)
-            .attributes
-            .set(ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(), flag);
+            .attributes_mut()
+            .set(ctx, ATTR_KEY_INTEGER_OVERFLOW_FLAGS.clone(), flag);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -171,8 +171,8 @@ pub trait IntBinArithOpWithOverflowFlag: IntBinArithOp {
     {
         let op = op.get_operation().deref(ctx);
         if op
-            .attributes
-            .get::<IntegerOverflowFlagsAttr>(&ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
+            .attributes()
+            .get::<IntegerOverflowFlagsAttr>(ctx, &ATTR_KEY_INTEGER_OVERFLOW_FLAGS)
             .is_none()
         {
             return verify_err!(op.loc(), IntBinArithOpWithOverflowFlagErr);
@@ -214,8 +214,8 @@ pub trait FastMathFlags {
         *self
             .get_operation()
             .deref(ctx)
-            .attributes
-            .get::<FastmathFlagsAttr>(&ATTR_KEY_FAST_MATH_FLAGS)
+            .attributes()
+            .get::<FastmathFlagsAttr>(ctx, &ATTR_KEY_FAST_MATH_FLAGS)
             .expect("Fast math flags missing or is of incorrect type")
     }
 
@@ -226,8 +226,8 @@ pub trait FastMathFlags {
     {
         self.get_operation()
             .deref_mut(ctx)
-            .attributes
-            .set(ATTR_KEY_FAST_MATH_FLAGS.clone(), flag);
+            .attributes_mut()
+            .set(ctx, ATTR_KEY_FAST_MATH_FLAGS.clone(), flag);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -236,8 +236,8 @@ pub trait FastMathFlags {
     {
         let op = op.get_operation().deref(ctx);
         if op
-            .attributes
-            .get::<FastmathFlagsAttr>(&ATTR_KEY_FAST_MATH_FLAGS)
+            .attributes()
+            .get::<FastmathFlagsAttr>(ctx, &ATTR_KEY_FAST_MATH_FLAGS)
             .is_none()
         {
             return verify_err!(op.loc(), FastmathFlagMissingErr);
@@ -267,8 +267,8 @@ pub trait SyncScopeInterface {
     {
         self.get_operation()
             .deref(ctx)
-            .attributes
-            .get::<SyncScopeAttr>(&ATTR_KEY_SYNC_SCOPE)
+            .attributes()
+            .get::<SyncScopeAttr>(ctx, &ATTR_KEY_SYNC_SCOPE)
             .expect("Synchronization scope missing or is of incorrect type")
             .clone()
     }
@@ -280,8 +280,8 @@ pub trait SyncScopeInterface {
     {
         self.get_operation()
             .deref_mut(ctx)
-            .attributes
-            .set(ATTR_KEY_SYNC_SCOPE.clone(), syncscope);
+            .attributes_mut()
+            .set(ctx, ATTR_KEY_SYNC_SCOPE.clone(), syncscope);
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -290,8 +290,8 @@ pub trait SyncScopeInterface {
     {
         let op = op.get_operation().deref(ctx);
         if op
-            .attributes
-            .get::<SyncScopeAttr>(&ATTR_KEY_SYNC_SCOPE)
+            .attributes()
+            .get::<SyncScopeAttr>(ctx, &ATTR_KEY_SYNC_SCOPE)
             .is_none()
         {
             return verify_err!(op.loc(), SyncScopeMissingErr);
@@ -343,8 +343,8 @@ pub trait NNegFlag {
     fn nneg(&self, ctx: &Context) -> bool {
         self.get_operation()
             .deref(ctx)
-            .attributes
-            .get::<BoolAttr>(&ATTR_KEY_NNEG_FLAG)
+            .attributes()
+            .get::<BoolAttr>(ctx, &ATTR_KEY_NNEG_FLAG)
             .expect("NNEG flag missing or is of incorrect type")
             .clone()
             .into()
@@ -353,15 +353,15 @@ pub trait NNegFlag {
     fn set_nneg(&self, ctx: &Context, flag: bool) {
         self.get_operation()
             .deref_mut(ctx)
-            .attributes
-            .set(ATTR_KEY_NNEG_FLAG.clone(), BoolAttr::new(flag));
+            .attributes_mut()
+            .set(ctx, ATTR_KEY_NNEG_FLAG.clone(), BoolAttr::new(flag));
     }
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
     where
         Self: Sized,
     {
         let op = op.get_operation().deref(ctx);
-        if op.attributes.get::<BoolAttr>(&ATTR_KEY_NNEG_FLAG).is_none() {
+        if op.attributes().get::<BoolAttr>(ctx, &ATTR_KEY_NNEG_FLAG).is_none() {
             return verify_err!(op.loc(), NNegFlagMissingErr);
         }
 
@@ -478,15 +478,14 @@ pub trait LlvmSymbolName: SymbolOpInterface {
     fn llvm_symbol_name(&self, ctx: &Context) -> Option<String> {
         self.get_operation()
             .deref(ctx)
-            .attributes
-            .get::<pliron::builtin::attributes::StringAttr>(&ATTR_KEY_LLVM_SYMBOL_NAME)
+            .attributes()
+            .get::<pliron::builtin::attributes::StringAttr>(ctx, &ATTR_KEY_LLVM_SYMBOL_NAME)
             .map(|attr| attr.clone().into())
     }
 
     /// Set the original LLVM symbol name.
     fn set_llvm_symbol_name(&self, ctx: &Context, name: String) {
-        self.get_operation().deref_mut(ctx).attributes.set(
-            ATTR_KEY_LLVM_SYMBOL_NAME.clone(),
+        self.get_operation().deref_mut(ctx).attributes_mut().set(ctx, ATTR_KEY_LLVM_SYMBOL_NAME.clone(),
             pliron::builtin::attributes::StringAttr::new(name),
         );
     }
@@ -515,8 +514,8 @@ pub trait AlignableOpInterface {
     {
         self.get_operation()
             .deref(ctx)
-            .attributes
-            .get::<AlignmentAttr>(&ATTR_KEY_LLVM_ALIGNMENT)
+            .attributes()
+            .get::<AlignmentAttr>(ctx, &ATTR_KEY_LLVM_ALIGNMENT)
             .map(|attr| attr.0)
     }
 
@@ -527,8 +526,8 @@ pub trait AlignableOpInterface {
     {
         self.get_operation()
             .deref_mut(ctx)
-            .attributes
-            .set(ATTR_KEY_LLVM_ALIGNMENT.clone(), AlignmentAttr(alignment));
+            .attributes_mut()
+            .set(ctx, ATTR_KEY_LLVM_ALIGNMENT.clone(), AlignmentAttr(alignment));
     }
 
     fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
@@ -555,8 +554,8 @@ pub trait VolatilityOpInterface {
     {
         self.get_operation()
             .deref(ctx)
-            .attributes
-            .get::<BoolAttr>(&ATTR_KEY_LLVM_VOLATILE)
+            .attributes()
+            .get::<BoolAttr>(ctx, &ATTR_KEY_LLVM_VOLATILE)
             .map(|attr| attr.clone().into())
             .unwrap_or(false)
     }
@@ -568,8 +567,8 @@ pub trait VolatilityOpInterface {
     {
         self.get_operation()
             .deref_mut(ctx)
-            .attributes
-            .set(ATTR_KEY_LLVM_VOLATILE.clone(), BoolAttr::new(is_volatile));
+            .attributes_mut()
+            .set(ctx, ATTR_KEY_LLVM_VOLATILE.clone(), BoolAttr::new(is_volatile));
     }
 
     fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
@@ -691,13 +690,13 @@ pub trait ScalarOrVectorOpd<T: Type, const N: usize> {
     /// Get the type of operand N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypedHandle<T> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of(op.get_operand(N).get_type(ctx), ctx)
+        elem_ty_of(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of operand N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_operand(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -715,13 +714,13 @@ pub trait ScalarOrVectorOpdImpls<I: ?Sized + TypeInterfaceMarker + 'static, cons
     /// Get the type of operand N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypeInterfaceHandle<I> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of_impls::<I>(op.get_operand(N).get_type(ctx), ctx)
+        elem_ty_of_impls::<I>(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of operand N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_operand(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_operand(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -739,13 +738,13 @@ pub trait ScalarOrVectorRes<T: Type, const N: usize> {
     /// Get the type of result N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypedHandle<T> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of(op.get_result(N).get_type(ctx), ctx)
+        elem_ty_of(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of result N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_result(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
@@ -763,13 +762,13 @@ pub trait ScalarOrVectorResImpls<I: ?Sized + TypeInterfaceMarker + 'static, cons
     /// Get the type of result N, or its element type if its [VectorType].
     fn scalar_or_vector_elem_ty(&self, ctx: &Context) -> TypeInterfaceHandle<I> {
         let op = &*self.get_operation().deref(ctx);
-        elem_ty_of_impls::<I>(op.get_result(N).get_type(ctx), ctx)
+        elem_ty_of_impls::<I>(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     /// Get the vector shape of result N, or `None` if it is not a [VectorType].
     fn vector_shape(&self, ctx: &Context) -> Option<(u32, VectorTypeKind)> {
         let op = &*self.get_operation().deref(ctx);
-        vector_shape_of(op.get_result(N).get_type(ctx), ctx)
+        vector_shape_of(op.get_result(ctx, N).get_type(ctx), ctx)
     }
 
     fn verify(op: &dyn Op, ctx: &Context) -> Result<()>

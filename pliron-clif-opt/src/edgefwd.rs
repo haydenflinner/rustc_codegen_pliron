@@ -200,7 +200,7 @@ fn bypass_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
                     }
                     let dom = match func.dfg.value_def(v) {
                         ValueDef::Result(i, _) => {
-                            i != pinst && domtree.dominates(i, pinst, &func.layout)
+                            i != pinst && domtree.try_dominates(i, pinst, &func.layout)
                         }
                         ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                         _ => false,
@@ -395,7 +395,7 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
                         }
                         let dom = match func.dfg.value_def(a) {
                             ValueDef::Result(i2, _) => {
-                                i2 != pinst && domtree.dominates(i2, pinst, &func.layout)
+                                i2 != pinst && domtree.try_dominates(i2, pinst, &func.layout)
                             }
                             ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                             _ => false,
@@ -414,7 +414,7 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
                         }
                         let dom = match func.dfg.value_def(v) {
                             ValueDef::Result(i2, _) => {
-                                i2 != pinst && domtree.dominates(i2, pinst, &func.layout)
+                                i2 != pinst && domtree.try_dominates(i2, pinst, &func.layout)
                             }
                             ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                             _ => false,

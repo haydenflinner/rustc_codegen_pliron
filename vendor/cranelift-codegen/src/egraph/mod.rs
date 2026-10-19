@@ -798,7 +798,12 @@ impl<'a> EgraphPass<'a> {
     }
 
     /// Run the process.
-    pub fn run(&mut self) {
+    ///
+    /// PLIRON: returns `remove_pure_and_optimize`'s
+    /// `cfg_maybe_changed` — the only edge-changing phase — so callers
+    /// can recompute dominator/loop analyses just when terminators
+    /// moved (this pass already recomputes `cfg` itself in that case).
+    pub fn run(&mut self) -> bool {
         let cfg_maybe_changed = self.remove_pure_and_optimize();
 
         trace!("egraph built:\n{}\n", self.func.display());
@@ -829,6 +834,7 @@ impl<'a> EgraphPass<'a> {
         self.elaborate();
 
         log::trace!("stats: {:#?}", self.stats);
+        cfg_maybe_changed
     }
 
     /// Remove pure nodes from the `Layout` of the function, ensuring

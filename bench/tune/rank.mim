@@ -1,0 +1,25 @@
+let rows = [
+  ("fib", 0, 12017000.0),
+  ("matmul", 0, 15617000.0),
+  ("fib", 1, 13375000.0),
+  ("matmul", 1, 10992000.0),
+  ("fib", 2, 21554000.0),
+  ("matmul", 2, 53052000.0),
+  ("fib", 3, 21238000.0),
+  ("matmul", 3, 41089000.0),
+];
+fn beaten_row(a: (str, int, float), rows: [(str, int, float)]) -> bool {
+    for b in rows {
+        if b.0 == a.0 && b.2 < a.2 { return true; }
+    }
+    false
+}
+let beaten = for a in rows collect (a.0, a.2, beaten_row(a, rows));
+let (res_, beaten_, best_) = datalog {
+    rel res(kernel: str, cid: int, ns: float) from rows
+    rel beaten(kernel: str, ns: float, f: bool) from beaten
+    rel best(kernel: str, cid: int, ns: float)
+    best(k, c, ns) if res(k, c, ns), !beaten(k, ns, true)
+};
+print("== best per kernel ==");
+for b in best_ { print(f"{b.0} config {b.1} {b.2} ns"); }

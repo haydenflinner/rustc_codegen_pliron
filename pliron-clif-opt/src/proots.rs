@@ -175,11 +175,21 @@ pub fn alias_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value
 /// different in-edge paths that provably carry the same value compare
 /// congruent.
 pub fn canon_map(func: &Function) -> FxHashMap<Value, Value> {
-    let f = facts(func);
+    canon_map_cfg(func, &ControlFlowGraph::with_function(func))
+}
+
+/// `canon_map` over a caller-built CFG.
+pub fn canon_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, Value> {
+    canon_map_facts(&facts_cfg(func, cfg))
+}
+
+/// `canon_map_cfg` over caller-supplied edge facts — the same `Facts`
+/// can feed `web_nf_facts` when nothing mutates in between.
+pub fn canon_map_facts(f: &Facts) -> FxHashMap<Value, Value> {
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
-    p.diffs = diffs_rows(&f);
+    p.diffs = diffs_rows(f);
     p.run();
     p.canon.into_iter().collect()
 }
@@ -268,8 +278,18 @@ pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
 /// self-carry edge contributes no fact at all — under induction the
 /// carried value stays in the class the other edges established.
 pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
+    web_nf_cfg(func, &ControlFlowGraph::with_function(func))
+}
+
+/// `web_nf` over a caller-built CFG.
+pub fn web_nf_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, (Value, i64)> {
+    web_nf_facts(func, &facts_cfg(func, cfg))
+}
+
+/// `web_nf_cfg` over caller-supplied edge facts — one `facts_cfg` can
+/// serve both this and `canon_map_facts` while the IR stays still.
+pub fn web_nf_facts(func: &Function, f: &Facts) -> FxHashMap<Value, (Value, i64)> {
     let mut nf = affine_nf(func);
-    let f = facts(func);
     let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
     loop {
         let mut grew = false;
@@ -875,6 +895,22 @@ pub fn paramize<'k>(
     // `Rc` addresses can only miss a match, never make a wrong one.
     // `slotk` materializes sibling keys lazily — a hit is the only
     // point they're needed.
+    paramize_r(k, nslots, slotk, ps, skip, hmap, vmap, hmemo).unwrap_or_else(|| k.clone())
+}
+
+/// `paramize` returning `Some` only when the key changed — unchanged
+/// subtrees stay `Rc`-shared instead of being rebuilt, which also keeps
+/// `hmemo`'s address-keyed hashes warm.
+fn paramize_r<'k>(
+    k: &Key,
+    nslots: usize,
+    slotk: &dyn Fn(usize) -> &'k Key,
+    ps: &[Value],
+    skip: usize,
+    hmap: &FxHashMap<u64, u32>,
+    vmap: &FxHashMap<Value, u32>,
+    hmemo: &mut FxHashMap<*const Key, u64>,
+) -> Option<Key> {
     if let Some(&i) = hmap.get(&khash_m(k, hmemo)) {
         let mut i = i as usize;
         if i == skip || slotk(i) != k {
@@ -886,29 +922,34 @@ pub fn paramize<'k>(
             }
         }
         if i != usize::MAX {
-            return Key::P(i as u32);
+            return Some(Key::P(i as u32));
         }
     }
     if let Key::V(w) = k
         && let Some(&i) = vmap.get(w)
     {
-        return Key::Q(i);
+        return Some(Key::Q(i));
     }
     match k {
-        Key::A(t, rk, off) => Key::A(
-            *t,
-            std::rc::Rc::new(paramize(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo)),
-            *off,
-        ),
-        Key::N(op, t, args, extra) => Key::N(
-            *op,
-            *t,
-            args.iter()
-                .map(|a| paramize(a, nslots, slotk, ps, skip, hmap, vmap, hmemo))
-                .collect(),
-            *extra,
-        ),
-        _ => k.clone(),
+        Key::A(t, rk, off) => paramize_r(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo)
+            .map(|nk| Key::A(*t, std::rc::Rc::new(nk), *off)),
+        Key::N(op, t, args, extra) => {
+            let mut news: Option<Vec<Key>> = None;
+            for (i, a) in args.iter().enumerate() {
+                match paramize_r(a, nslots, slotk, ps, skip, hmap, vmap, hmemo) {
+                    Some(nk) => news
+                        .get_or_insert_with(|| args[..i].to_vec())
+                        .push(nk),
+                    None => {
+                        if let Some(ns) = &mut news {
+                            ns.push(a.clone());
+                        }
+                    }
+                }
+            }
+            news.map(|ns| Key::N(*op, *t, ns.into(), *extra))
+        }
+        _ => None,
     }
 }
 
@@ -972,17 +1013,30 @@ pub fn khash_m(k: &Key, memo: &mut FxHashMap<*const Key, u64>) -> u64 {
 /// its class leader's leaf, so per-edge signatures compare structurally
 /// (a back-edge arg `p_j` keys as `V(rep)` just like `p_i`'s does).
 pub fn key_rep(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Key {
-    match k {
-        Key::V(w) if ps.contains(w) => Key::V(rep(*w)),
-        Key::A(t, rk, o) => Key::A(*t, std::rc::Rc::new(key_rep(rk, ps, rep)), *o),
-        Key::N(op, t, args, x) => Key::N(
-            *op,
-            *t,
-            args.iter().map(|a| key_rep(a, ps, rep)).collect(),
-            *x,
-        ),
-        _ => k.clone(),
+    fn go(k: &Key, ps: &[Value], rep: &dyn Fn(Value) -> Value) -> Option<Key> {
+        match k {
+            Key::V(w) if ps.contains(w) => Some(Key::V(rep(*w))),
+            Key::A(t, rk, o) => go(rk, ps, rep).map(|nk| Key::A(*t, std::rc::Rc::new(nk), *o)),
+            Key::N(op, t, args, x) => {
+                let mut news: Option<Vec<Key>> = None;
+                for (i, a) in args.iter().enumerate() {
+                    match go(a, ps, rep) {
+                        Some(nk) => news
+                            .get_or_insert_with(|| args[..i].to_vec())
+                            .push(nk),
+                        None => {
+                            if let Some(ns) = &mut news {
+                                ns.push(a.clone());
+                            }
+                        }
+                    }
+                }
+                news.map(|ns| Key::N(*op, *t, ns.into(), *x))
+            }
+            _ => None,
+        }
     }
+    go(k, ps, rep).unwrap_or_else(|| k.clone())
 }
 
 /// Peel an `A`-chain to (base, total offset). Non-`A` keys peel to

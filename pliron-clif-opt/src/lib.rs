@@ -5,6 +5,7 @@
 //! host `.clif` filetests and differential tests without relinking the
 //! backend dylib.
 
+pub mod armmerge;
 pub mod bcheck;
 pub mod bittab;
 pub mod brchain;

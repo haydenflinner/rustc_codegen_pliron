@@ -47,6 +47,9 @@ pub struct CodegenCx<'tcx> {
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), Value>>,
     pub tcache: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), TypeHandle>>,
     pub scache: RefCell<FxHashMap<Ty<'tcx>, TypeHandle>>,
+    /// CGU symbol this codegen context is building (set at construction;
+    /// read-only afterwards — tracing uses it without borrowing `st`).
+    pub cgu_name: String,
 }
 
 pub fn map_linkage(l: RLinkage, vis: Visibility) -> Linkage {
@@ -74,6 +77,7 @@ impl<'tcx> CodegenCx<'tcx> {
             .get_operation();
         CodegenCx {
             tcx,
+            cgu_name: name.to_string(),
             pctx: RefCell::new(ctx),
             module,
             st: RefCell::new(State::default()),
@@ -88,14 +92,14 @@ impl<'tcx> CodegenCx<'tcx> {
         let v = {
             let mut ctx = self.pctx.borrow_mut();
             let op = UndefOp::new(&mut ctx, ty).get_operation();
-            op.deref(&ctx).get_result(0)
+            op.deref(&ctx).get_result(&ctx, 0)
         };
         self.st.borrow_mut().consts.insert(v, cv);
         v
     }
 
     pub fn cval(&self, v: Value) -> Option<ConstVal> {
-        self.st.borrow().consts.get(&v).cloned()
+        self.st.borrow().consts.get(v).cloned()
     }
 
     pub fn ty_of(&self, v: Value) -> TypeHandle {
@@ -170,6 +174,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 inline_hint: false,
                 cold: false,
                 nounwind: false,
+                odr: false,
                 sret_ty: None,
                 frozen: Vec::new(),
                 noalias: Vec::new(),
@@ -520,6 +525,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
             f.no_inline = matches!(inline, InlineAttr::Never);
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
             f.inline_hint = matches!(inline, InlineAttr::Hint);
+            f.odr = matches!(linkage, RLinkage::WeakODR | RLinkage::LinkOnceODR);
         }
         self.mark_attrs(symbol_name, instance, fn_abi);
         let attrs = self.tcx.codegen_instance_attrs(instance.def);

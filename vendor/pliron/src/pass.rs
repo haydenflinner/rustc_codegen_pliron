@@ -306,7 +306,7 @@ impl Pass for NestedOpsPass {
 
         let mut pass_res = PassResult::default();
 
-        let regions = op.deref(ctx).regions().collect::<Vec<_>>();
+        let regions = op.deref(ctx).regions(ctx).collect::<Vec<_>>();
         for region in regions {
             let blocks = region.deref(ctx).iter(ctx).collect::<Vec<_>>();
             for block in blocks {

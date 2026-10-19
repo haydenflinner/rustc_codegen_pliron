@@ -26,3 +26,8 @@ pliron-cfg = { path = "../pliron-cfg" }
 rustc-hash = "2"
 tracing = "0.1"
 rustc_apfloat = "0.2"
+
+[dev-dependencies]
+# `plirun` example: replay a dumped `.pliron` module through the clif path.
+cranelift-native = "=0.135.5"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

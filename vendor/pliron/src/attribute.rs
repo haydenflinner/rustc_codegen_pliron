@@ -4,11 +4,17 @@
 //! Attributes are non-SSA data stored in [Operation](crate::operation::Operation)s.
 //!
 //! See [MLIR Attributes](https://mlir.llvm.org/docs/LangRef/#attributes).
-//! Unlike in MLIR, we do not unique attributes, and hence they are mutable.
 //! These are similar in concept to [Properties](https://discourse.llvm.org/t/rfc-introducing-mlir-operation-properties/67846).
 //! Attribute objects are boxed and not wrapped with [Ptr](crate::context::Ptr).
 //! They are heavy (i.e., not just a pointer, handle or reference),
 //! making clones potentially expensive.
+//!
+//! PLIRON: [Operation](crate::operation::Operation) attribute
+//! dictionaries store [AttrInstId] handles interned in
+//! [Context::attr_store](crate::context::Context), deduplicated on
+//! `hash_attr`/`eq_attr` — closer to MLIR's unique'd attributes than
+//! upstream pliron's boxed-per-op model. Interned attributes are
+//! immutable; edits are copy-on-write (clone, mutate, re-set).
 //!
 //! The [pliron_attr](pliron::derive::pliron_attr) proc macro from the
 //! pliron-derive create can be used to implement [Attribute] for a rust type.
@@ -118,16 +124,15 @@ impl Printable for AttributeDict {
         state: &printable::State,
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
+        let key_vals: Vec<_> = self
+            .iter(ctx)
+            .map(|(key, val)| AttributeDictKeyVal { key, val })
+            .collect();
         write!(
             f,
             "[{}]",
-            iter_with_sep(
-                self.0
-                    .iter()
-                    .map(|(key, val)| AttributeDictKeyVal { key, val }),
-                printable::ListSeparator::CharSpace(','),
-            )
-            .print(ctx, state)
+            iter_with_sep(key_vals.iter(), printable::ListSeparator::CharSpace(','))
+                .print(ctx, state)
         )
     }
 }
@@ -141,15 +146,109 @@ impl Parsable for AttributeDict {
         _arg: Self::Arg,
     ) -> ParseResult<'a, Self::Parsed> {
         delimited_list_parser('[', ']', ',', AttributeDictKeyVal::parser(()))
-            .map(|key_vals| AttributeDict(key_vals.into_iter().collect()))
             .parse_stream(state_stream)
+            .map(|key_vals| {
+                let mut dict = AttributeDict::default();
+                for (k, v) in key_vals {
+                    dict.set_obj(&*state_stream.state.ctx, k, v);
+                }
+                dict
+            })
             .into_result()
     }
 }
 
-pub type AttributeDictContainer = SmallMap<Identifier, AttrObj, 1>;
+/// PLIRON: a dense handle to an [AttrObj] interned in
+/// [Context::attr_store](crate::context::Context). `AttributeDict`
+/// entries hold these instead of a `Box<dyn Attribute>` per op — the
+/// store deduplicates via `hash_attr`/`eq_attr`, so identical
+/// attributes share one allocation and dict clones are index copies.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AttrInstId(u32);
+
+/// PLIRON: an interned [AttrObj] plus its lazily-computed list of
+/// interface TypeIds it casts to (the `to`s registered for its
+/// concrete type via `type_to_trait!`). Lets `attr_impls`-style queries
+/// on dict entries resolve to a scan of a handful of TypeIds instead
+/// of a caster-map hash probe.
+pub(crate) struct AttrEntry {
+    pub(crate) obj: AttrObj,
+    ifaces: core::cell::OnceCell<Box<[core::any::TypeId]>>,
+}
+
+impl AttrEntry {
+    /// The interface TypeIds this attribute casts to — computed once
+    /// per unique attribute by scanning the (linkme-static) caster
+    /// registry.
+    fn ifaces(&self) -> &[core::any::TypeId] {
+        self.ifaces.get_or_init(|| {
+            // `as_any` must resolve through `&dyn Attribute`: calling it
+            // on the `Box` hits `Downcast`'s blanket `impl<T: Any>` and
+            // yields `Box<dyn Attribute>`'s TypeId, not the attr's.
+            let tid = (*self.obj).as_any().type_id();
+            crate::utils::trait_cast::iter_caster_pairs()
+                .filter(|(from, _)| *from == tid)
+                .map(|(_, to)| to)
+                .collect()
+        })
+    }
+}
+
+/// PLIRON: intern `obj` in `ctx`'s attr store, deduplicating on
+/// `hash_attr`/`eq_attr`.
+pub(crate) fn attr_intern(ctx: &Context, obj: AttrObj) -> AttrInstId {
+    let hash = obj.hash_attr();
+    let idx = ctx.attr_store.get_or_create_unique(
+        AttrEntry {
+            obj,
+            ifaces: core::cell::OnceCell::new(),
+        },
+        hash,
+        &|a: &AttrEntry, b: &AttrEntry| a.obj.eq_attr(&*b.obj),
+    );
+    AttrInstId(u32::try_from(idx).expect("attr store index overflow"))
+}
+
+/// PLIRON: resolve `id` to its interned [AttrObj]. The reference
+/// borrows `ctx`'s store, so it outlives any `Ref` borrow of the
+/// containing [crate::operation::Operation].
+pub(crate) fn attr_get<'c>(ctx: &'c Context, id: AttrInstId) -> &'c AttrObj {
+    &ctx.attr_store
+        .unique_store
+        .get(id.0 as usize)
+        .expect("AttrInstId not in context attr store")
+        .obj
+}
+
+/// PLIRON: does the interned attr `id` implement interface `T`?
+/// Arena index + TypeId scan — no caster-map hash probe.
+pub(crate) fn attr_impls_id<T: ?Sized + AttrInterfaceMarker + 'static>(
+    ctx: &Context,
+    id: AttrInstId,
+) -> bool {
+    ctx.attr_store
+        .unique_store
+        .get(id.0 as usize)
+        .is_some_and(|e| e.ifaces().contains(&core::any::TypeId::of::<T>()))
+}
+
+/// PLIRON: `attr_should_outline` on an interned entry — the iface list
+/// short-circuits the cast for the (common) non-outlined case.
+fn attr_should_outline_id(ctx: &Context, id: AttrInstId) -> bool {
+    attr_impls_id::<dyn OutlinedAttr>(ctx, id)
+        && attr_cast::<dyn OutlinedAttr>(&**attr_get(ctx, id))
+            .is_some_and(|attr| OutlinedAttr::outline(attr, ctx))
+}
+
+/// PLIRON: dict values are [AttrInstId] handles into the context attr
+/// store, not per-op [AttrObj]s.
+pub type AttributeDictContainer = SmallMap<Identifier, AttrInstId, 1>;
 
 /// A dictionary of attributes, mapping keys to attribute objects.
+///
+/// PLIRON: values are interned per-[Context] handles; `PartialEq`/`Hash`
+/// are handle equality and are only meaningful between dicts in the
+/// same context.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct AttributeDict(pub AttributeDictContainer);
 
@@ -163,37 +262,80 @@ impl Hash for AttributeDict {
 }
 
 impl AttributeDict {
+    /// Get the interned [AttrObj] mapped to key `k`.
+    pub fn get_obj<'c>(&self, ctx: &'c Context, k: &Identifier) -> Option<&'c AttrObj> {
+        self.0.get(k).map(|&id| attr_get(ctx, id))
+    }
+
     /// Get reference to attribute value that is mapped to key `k`.
-    pub fn get<T: Attribute>(&self, k: &Identifier) -> Option<&T> {
-        self.0.get(k).and_then(|ao| ao.downcast_ref::<T>())
+    /// PLIRON: the reference is borrowed from `ctx`'s attr store, so it
+    /// outlives any `Ref` borrow of the containing [crate::operation::Operation].
+    pub fn get<'c, T: Attribute>(&self, ctx: &'c Context, k: &Identifier) -> Option<&'c T> {
+        self.get_obj(ctx, k).and_then(|ao| ao.downcast_ref::<T>())
     }
 
-    /// Get mutable reference to attribute value that is mapped to key `k`.
-    pub fn get_mut<T: Attribute>(&mut self, k: &Identifier) -> Option<&mut T> {
-        self.0.get_mut(k).and_then(|ao| ao.downcast_mut::<T>())
+    /// Reference to the attribute value (that is mapped to key `k`) as
+    /// an interface reference.
+    pub fn get_as<'c, T: ?Sized + AttrInterfaceMarker + 'static>(
+        &self,
+        ctx: &'c Context,
+        k: &Identifier,
+    ) -> Option<&'c T> {
+        let &id = self.0.get(k)?;
+        if !attr_impls_id::<T>(ctx, id) {
+            return None;
+        }
+        attr_cast::<T>(&**attr_get(ctx, id))
     }
 
-    /// Reference to the attribute value (that is mapped to key `k`) as an interface reference.
-    pub fn get_as<T: ?Sized + AttrInterfaceMarker + 'static>(&self, k: &Identifier) -> Option<&T> {
-        self.0.get(k).and_then(|ao| attr_cast::<T>(&**ao))
+    /// Does the attribute mapped to `k` implement interface `T`?
+    pub fn impls<T: ?Sized + AttrInterfaceMarker + 'static>(
+        &self,
+        ctx: &Context,
+        k: &Identifier,
+    ) -> bool {
+        self.0
+            .get(k)
+            .is_some_and(|&id| attr_impls_id::<T>(ctx, id))
     }
 
-    /// Set the attribute value for key `k`.
-    pub fn set<T: Attribute>(&mut self, k: Identifier, v: T) {
-        self.0.insert(k, Box::new(v));
+    /// Set the attribute value for key `k`, interning it in `ctx`.
+    pub fn set<T: Attribute>(&mut self, ctx: &Context, k: Identifier, v: T) {
+        self.0.insert(k, attr_intern(ctx, AttrObj::from(v)));
+    }
+
+    /// Set an already-boxed attribute object for key `k`, interning it.
+    pub fn set_obj(&mut self, ctx: &Context, k: Identifier, v: AttrObj) {
+        self.0.insert(k, attr_intern(ctx, v));
+    }
+
+    /// Remove the attribute mapped to key `k`, returning its handle.
+    pub fn remove(&mut self, k: &Identifier) -> Option<AttrInstId> {
+        self.0.remove(k)
+    }
+
+    /// The interned handle mapped to `k`.
+    pub fn get_id(&self, k: &Identifier) -> Option<AttrInstId> {
+        self.0.get(k).copied()
+    }
+
+    /// `(&key, &attr)` pairs; the attribute references borrow `ctx`'s
+    /// attr store.
+    pub fn iter<'c>(
+        &self,
+        ctx: &'c Context,
+    ) -> impl Iterator<Item = (&'_ Identifier, &'c AttrObj)> {
+        self.0.iter().map(|(k, &id)| (k, attr_get(ctx, id)))
     }
 
     /// Clone, but skip [Outlined](OutlinedAttr) attributes.
+    /// PLIRON: ids are copied, not the attr objects — deduplication
+    /// means equal attributes keep equal handles.
     pub fn clone_skip_outlined(&self, ctx: &Context) -> Self {
         self.0
             .iter()
-            .filter_map(|(k, v)| {
-                if attr_should_outline(&**v, ctx) {
-                    None
-                } else {
-                    Some((k.clone(), dyn_clone::clone_box(&**v)))
-                }
-            })
+            .filter(|(_, id)| !attr_should_outline_id(ctx, **id))
+            .map(|(k, &id)| (k.clone(), id))
             .collect::<AttributeDictContainer>()
             .into()
     }

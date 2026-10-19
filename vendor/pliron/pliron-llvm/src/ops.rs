@@ -10,7 +10,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{cell::Ref, num::NonZero, ops::Range};
+use core::{num::NonZero, ops::Range};
 
 use pliron::{
     arg_err_noloc,
@@ -164,7 +164,7 @@ impl Verify for ReturnOp {
         } else if num_operands != 1 {
             verify_err!(self.loc(ctx), ReturnOpVerifyErr::NonVoidArity)?
         } else {
-            let ret_ty = self.get_operation().deref(ctx).get_operand(0).get_type(ctx);
+            let ret_ty = self.get_operation().deref(ctx).get_operand(ctx, 0).get_type(ctx);
             if ret_ty != res_ty {
                 verify_err!(self.loc(ctx), ReturnOpVerifyErr::ResultTypeMismatch)?
             }
@@ -802,7 +802,7 @@ impl Printable for CondBrOp {
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
         let op = self.get_operation().deref(ctx);
-        let condition = op.get_operand(0);
+        let condition = op.get_operand(ctx, 0);
         let true_dest_opds = self.successor_operands(ctx, 0);
         let false_dest_opds = self.successor_operands(ctx, 1);
         let res = write!(
@@ -810,13 +810,13 @@ impl Printable for CondBrOp {
             "{} if {} ^{}({}) else ^{}({})",
             Self::get_opid_static(),
             condition.print(ctx, state),
-            op.get_successor(0).deref(ctx).unique_name(ctx),
+            op.get_successor(ctx, 0).deref(ctx).unique_name(ctx),
             iter_with_sep(
                 true_dest_opds.iter(),
                 pliron::printable::ListSeparator::CharSpace(',')
             )
             .print(ctx, state),
-            op.get_successor(1).deref(ctx).unique_name(ctx),
+            op.get_successor(ctx, 1).deref(ctx).unique_name(ctx),
             iter_with_sep(
                 false_dest_opds.iter(),
                 pliron::printable::ListSeparator::CharSpace(',')
@@ -1011,10 +1011,10 @@ impl Printable for SwitchOp {
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
         let op = self.get_operation().deref(ctx);
-        let condition = op.get_operand(0);
+        let condition = op.get_operand(ctx, 0);
 
         let default_successor = op
-            .successors()
+            .successors(ctx)
             .next()
             .expect("SwitchOp must have at least one successor");
         let num_total_successors = op.get_num_successors();
@@ -1153,7 +1153,7 @@ impl SwitchOp {
 
         let op = self.get_operation().deref(ctx);
         // Skip the first one, which is the default successor.
-        let successors = op.successors().skip(1);
+        let successors = op.successors(ctx).skip(1);
 
         successors
             .zip(case_values.0.iter())
@@ -1172,7 +1172,7 @@ impl SwitchOp {
 
     /// Get the default destination of this switch operation.
     pub fn default_dest(&self, ctx: &Context) -> Ptr<BasicBlock> {
-        self.get_operation().deref(ctx).get_successor(0)
+        self.get_operation().deref(ctx).get_successor(ctx, 0)
     }
 
     /// Get the operands to pass to the default destination.
@@ -1257,7 +1257,7 @@ impl Verify for SwitchOp {
             verify_err!(loc.clone(), SwitchOpVerifyErr::DefaultDestErr)?;
         }
 
-        let condition_ty = pliron::r#type::Typed::get_type(&op.get_operand(0), ctx);
+        let condition_ty = pliron::r#type::Typed::get_type(&op.get_operand(ctx, 0), ctx);
         let condition_ty = TypedHandle::<IntegerType>::from_handle(condition_ty, ctx)?;
 
         if let Some(case_value) = case_values.0.first() {
@@ -1346,7 +1346,7 @@ impl Printable for IndirectBrOp {
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
         let op = self.get_operation().deref(ctx);
-        let address = op.get_operand(0);
+        let address = op.get_operand(ctx, 0);
         let dests = self.destinations(ctx);
 
         write!(
@@ -1441,7 +1441,7 @@ impl IndirectBrOp {
     /// passed to each.
     pub fn destinations(&self, ctx: &Context) -> Vec<IndirectBrDest> {
         let op = self.get_operation().deref(ctx);
-        op.successors()
+        op.successors(ctx)
             .enumerate()
             .map(|(i, dest)| IndirectBrDest {
                 dest,
@@ -1691,7 +1691,7 @@ impl GetElementPtrOp {
             .iter()
             .map(|index| match index {
                 GepIndexAttr::Constant(c) => GepIndex::Constant(*c),
-                GepIndexAttr::OperandIdx(i) => GepIndex::Value(op.get_operand(*i)),
+                GepIndexAttr::OperandIdx(i) => GepIndex::Value(op.get_operand(ctx, *i)),
             })
             .collect()
     }
@@ -2382,7 +2382,7 @@ impl CallOpInterface for CallOp {
                 op.get_num_operands() > 0,
                 "Indirect call must have function pointer operand"
             );
-            CallOpCallable::Indirect(op.get_operand(0))
+            CallOpCallable::Indirect(op.get_operand(ctx, 0))
         }
     }
 
@@ -2549,18 +2549,15 @@ pub struct ConstantOp;
 
 impl ConstantOp {
     /// Get the constant value that this Op defines.
-    /// The [Ref] is a borrow of the containing [Operation] object.
+    /// PLIRON: the reference is borrowed from `ctx`'s attribute store.
     ///
     /// Use [pliron::dyn_clone::clone_box] to clone the value if required.
-    pub fn get_value<'a>(&self, ctx: &'a Context) -> Ref<'a, dyn TypedAttrInterface> {
-        Ref::map(
-            self.get_attr_llvm_constant_value(ctx)
-                .expect("ConstantOp must have a value attribute"),
-            |attr| {
-                attr_cast::<dyn TypedAttrInterface>(&**attr)
-                    .expect("ConstantOp's value attribute must impl TypedAttrInterface")
-            },
-        )
+    pub fn get_value<'a>(&self, ctx: &'a Context) -> &'a dyn TypedAttrInterface {
+        let attr = self
+            .get_attr_llvm_constant_value(ctx)
+            .expect("ConstantOp must have a value attribute");
+        attr_cast::<dyn TypedAttrInterface>(&**attr)
+            .expect("ConstantOp's value attribute must impl TypedAttrInterface")
     }
 
     /// Create a new [ConstantOp] holding `value`.
@@ -2854,7 +2851,7 @@ impl GlobalOp {
     /// Get the initializer region of this global variable.
     pub fn get_initializer_region(&self, ctx: &Context) -> Option<Ptr<Region>> {
         (self.op.deref(ctx).num_regions() > 0)
-            .then(|| self.get_operation().deref(ctx).get_region(0))
+            .then(|| self.get_operation().deref(ctx).get_region(ctx, 0))
     }
 
     /// Set a simple initializer value for this global variable.
@@ -2955,7 +2952,7 @@ impl Printable for GlobalOp {
 
         // Print attributes except for type, initializer and symbol name.
         let mut attributes_to_print_separately =
-            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+            self.op.deref(ctx).attributes().clone_skip_outlined(ctx);
         attributes_to_print_separately.0.retain(|key, _| {
             key != &ATTR_KEY_LLVM_GLOBAL_TYPE
                 && key != &ATTR_KEY_SYM_NAME
@@ -3011,7 +3008,7 @@ impl Parsable for GlobalOp {
         let op = GlobalOp::new(state_stream.state.ctx, name, ty);
         op.get_operation()
             .deref_mut(state_stream.state.ctx)
-            .attributes
+            .attributes_mut()
             .0
             .extend(attr_dict.0);
 
@@ -3848,7 +3845,7 @@ impl Verify for InsertValueOp {
         use pliron::r#type::Typed;
 
         // Check that the value we are inserting is of the correct type.
-        let aggr_type = self.get_operation().deref(ctx).get_operand(0).get_type(ctx);
+        let aggr_type = self.get_operation().deref(ctx).get_operand(ctx, 0).get_type(ctx);
         let indices = self.indices(ctx);
         match ExtractValueOp::indexed_type(ctx, aggr_type, &indices) {
             Err(e @ Error { .. }) => {
@@ -3860,7 +3857,7 @@ impl Verify for InsertValueOp {
                 });
             }
             Ok(indexed_type) => {
-                if indexed_type != self.get_operation().deref(ctx).get_operand(1).get_type(ctx) {
+                if indexed_type != self.get_operation().deref(ctx).get_operand(ctx, 1).get_type(ctx) {
                     return verify_err!(loc, InsertExtractValueErr::ValueTypeErr);
                 }
             }
@@ -3899,7 +3896,7 @@ impl Verify for ExtractValueOp {
 
         use pliron::r#type::Typed;
         // Check that the result type matches the indexed type
-        let aggr_type = self.get_operation().deref(ctx).get_operand(0).get_type(ctx);
+        let aggr_type = self.get_operation().deref(ctx).get_operand(ctx, 0).get_type(ctx);
         let indices = self.indices(ctx);
         match Self::indexed_type(ctx, aggr_type, &indices) {
             Err(e @ Error { .. }) => {
@@ -3911,7 +3908,7 @@ impl Verify for ExtractValueOp {
                 });
             }
             Ok(indexed_type) => {
-                if indexed_type != self.get_operation().deref(ctx).get_type(0) {
+                if indexed_type != self.get_operation().deref(ctx).get_type(ctx, 0) {
                     return verify_err!(loc, InsertExtractValueErr::ValueTypeErr);
                 }
             }
@@ -4019,9 +4016,9 @@ impl Verify for InsertElementOp {
 
         let loc = self.loc(ctx);
         let op = &*self.op.deref(ctx);
-        let vector_ty = op.get_operand(0).get_type(ctx);
-        let element_ty = op.get_operand(1).get_type(ctx);
-        let index_ty = op.get_operand(2).get_type(ctx);
+        let vector_ty = op.get_operand(ctx, 0).get_type(ctx);
+        let element_ty = op.get_operand(ctx, 1).get_type(ctx);
+        let index_ty = op.get_operand(ctx, 2).get_type(ctx);
 
         let vector_ty = vector_ty.deref(ctx);
         let vector_ty = vector_ty.downcast_ref::<VectorType>();
@@ -4056,7 +4053,7 @@ impl InsertElementOp {
 
     /// Get the vector type of the InsertElementOp.
     pub fn vector_type(&self, ctx: &Context) -> TypedHandle<VectorType> {
-        let ty = self.get_operation().deref(ctx).get_type(0);
+        let ty = self.get_operation().deref(ctx).get_type(ctx, 0);
         TypedHandle::<VectorType>::from_handle(ty, ctx)
             .expect("InsertElementOp result type is not a VectorType")
     }
@@ -4094,11 +4091,11 @@ impl Verify for ExtractElementOp {
         use pliron::r#type::Typed;
         let loc = self.loc(ctx);
         let op = &*self.op.deref(ctx);
-        let vector_ty = op.get_operand(0).get_type(ctx);
-        let index_ty = op.get_operand(1).get_type(ctx);
+        let vector_ty = op.get_operand(ctx, 0).get_type(ctx);
+        let index_ty = op.get_operand(ctx, 1).get_type(ctx);
         let vector_ty = vector_ty.deref(ctx);
         let vector_ty = vector_ty.downcast_ref::<VectorType>();
-        if vector_ty.is_none_or(|ty| ty.elem_type() != op.get_type(0)) {
+        if vector_ty.is_none_or(|ty| ty.elem_type() != op.get_type(ctx, 0)) {
             return verify_err!(loc, InsertExtractElementOpVerifyErr::ElementTypeErr);
         }
         if !index_ty.deref(ctx).is::<IntegerType>() {
@@ -4167,8 +4164,8 @@ impl Verify for ShuffleVectorOp {
 
         let loc = self.loc(ctx);
         let op = &*self.op.deref(ctx);
-        let vector1_ty = op.get_operand(0).get_type(ctx);
-        let vector2_ty = op.get_operand(1).get_type(ctx);
+        let vector1_ty = op.get_operand(ctx, 0).get_type(ctx);
+        let vector2_ty = op.get_operand(ctx, 1).get_type(ctx);
 
         let vector1_ty = vector1_ty.deref(ctx);
         let vector1_ty = vector1_ty.downcast_ref::<VectorType>();
@@ -4183,7 +4180,7 @@ impl Verify for ShuffleVectorOp {
             return verify_err!(loc, ShuffleVectorOpVerifyErr::OperandsTypeErr);
         }
 
-        let res_ty = op.get_type(0).deref(ctx);
+        let res_ty = op.get_type(ctx, 0).deref(ctx);
         let res_ty = res_ty.downcast_ref::<VectorType>();
         let Some(res_ty) = res_ty else {
             return verify_err!(loc, ShuffleVectorOpVerifyErr::ResultTypeErr);
@@ -4310,10 +4307,10 @@ impl Verify for SelectOp {
 
         let loc = self.loc(ctx);
         let op = &*self.op.deref(ctx);
-        let ty = op.get_type(0);
-        let cond_ty = op.get_operand(0).get_type(ctx);
-        let true_ty = op.get_operand(1).get_type(ctx);
-        let false_ty = op.get_operand(2).get_type(ctx);
+        let ty = op.get_type(ctx, 0);
+        let cond_ty = op.get_operand(ctx, 0).get_type(ctx);
+        let true_ty = op.get_operand(ctx, 1).get_type(ctx);
+        let false_ty = op.get_operand(ctx, 2).get_type(ctx);
         if ty != true_ty || ty != false_ty {
             return verify_err!(loc, SelectOpVerifyErr::ResultTypeErr);
         }
@@ -4613,7 +4610,7 @@ impl Printable for CallIntrinsicOp {
         f: &mut core::fmt::Formatter<'_>,
     ) -> core::fmt::Result {
         // [result = ] llvm.call_intrinsic @name <FastMathFlags> (operands) : type
-        if let Some(res) = self.op.deref(ctx).results().next() {
+        if let Some(res) = self.op.deref(ctx).results(ctx).next() {
             write!(f, "{} = ", res.print(ctx, state))?;
         }
 
@@ -4636,7 +4633,7 @@ impl Printable for CallIntrinsicOp {
             f,
             "({}) : {}",
             iter_with_sep(
-                self.op.deref(ctx).operands(),
+                self.op.deref(ctx).operands(ctx),
                 printable::ListSeparator::CharSpace(',')
             )
             .print(ctx, state),
@@ -4720,18 +4717,18 @@ impl Verify for CallIntrinsicOp {
         // Check that the operand and result types match the intrinsic type.
         let op = &*self.op.deref(ctx);
         let intrinsic_arg_types = ty.deref(ctx).arg_types();
-        if op.operands().count() != intrinsic_arg_types.len() {
+        if op.operands(ctx).count() != intrinsic_arg_types.len() {
             return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::OperandsMismatch);
         }
 
-        for (i, operand) in op.operands().enumerate() {
+        for (i, operand) in op.operands(ctx).enumerate() {
             let opd_ty = pliron::r#type::Typed::get_type(&operand, ctx);
             if opd_ty != arg_types[i] {
                 return verify_err!(self.loc(ctx), CallIntrinsicVerifyErr::OperandsMismatch);
             }
         }
 
-        let mut result_types = op.result_types();
+        let mut result_types = op.result_types(ctx);
         if let Some(result_type) = result_types.next()
             && result_type == res_type
             && result_types.next().is_none()
@@ -4843,7 +4840,7 @@ impl FuncOp {
     pub fn get_entry_block(&self, ctx: &Context) -> Option<Ptr<BasicBlock>> {
         self.op
             .deref(ctx)
-            .regions()
+            .regions(ctx)
             .next()
             .and_then(|region| region.deref(ctx).get_head())
     }
@@ -4856,7 +4853,7 @@ impl FuncOp {
 
         // Create an empty entry block.
         assert!(
-            self.op.deref(ctx).regions().next().is_none(),
+            self.op.deref(ctx).regions(ctx).next().is_none(),
             "FuncOp already has a region, but no block inside it"
         );
         let region = Operation::add_region(self.op, ctx);
@@ -4884,7 +4881,7 @@ impl Printable for FuncOp {
 
         // Print attributes except for function type and symbol name.
         let mut attributes_to_print_separately =
-            self.op.deref(ctx).attributes.clone_skip_outlined(ctx);
+            self.op.deref(ctx).attributes().clone_skip_outlined(ctx);
         attributes_to_print_separately
             .0
             .retain(|key, _| key != &ATTR_KEY_LLVM_FUNC_TYPE && key != &ATTR_KEY_SYM_NAME);
@@ -4941,7 +4938,7 @@ impl Parsable for FuncOp {
             .parse_stream(state_stream)
             .map(|(fname, fty, attrs, _region)| -> OpObj {
                 let ctx = &mut state_stream.state.ctx;
-                op.deref_mut(ctx).attributes = attrs;
+                *op.deref_mut(ctx).attributes_mut() = attrs;
                 let ty_attr = TypeAttr::new(fty);
                 let opop = FuncOp { op };
                 opop.set_symbol_name(ctx, fname);

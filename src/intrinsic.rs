@@ -268,8 +268,13 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 // (a place's contents become unknown), retarg can't fold
                 // — and lower.rs rewrites the call into the CLIF
                 // `black_box` op, which emits zero machine instructions.
-                // wasm lowers CallOps to real calls, so it keeps the
-                // alloca + volatile round-trip below.
+                // wasm deliberately keeps the alloca + volatile round-trip
+                // below: it is what stock rustc emits there too (LLVM's
+                // wasm `black_box` is a stack store + reload — compare
+                // `k_fib` in both bench modules), and the CLIF op would
+                // lower to a bare identity in `clif_emit`, which V8 folds
+                // through — a cheaper, weaker barrier than LLVM's would
+                // skew every wasm benchmark in our favour.
                 let clif_bb = !self.tcx.sess.target.is_like_wasm;
                 if layout.is_zst() {
                     if clif_bb {

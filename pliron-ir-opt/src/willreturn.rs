@@ -39,7 +39,7 @@ use pliron_llvm::ops::{
 };
 use rustc_hash::FxHashSet;
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied};
 
@@ -82,10 +82,11 @@ pub fn run(ctx: &Context, st: &mut State) {
     {
         p.known.push((ids.id(s),));
     }
+    let mut os = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
         for b in blocks(ctx, st.funcs[s].op) {
-            let os = ops(ctx, b);
+            crate::inline::ops_into(ctx, b, &mut os);
             for (k, &op) in os.iter().enumerate() {
                 macro_rules! is {
                     ($t:ty) => {
@@ -95,7 +96,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                 if is!(CallOp) {
                     // A tail call *is* the caller's exit: `unreachable`
                     // after it can't let an unknown callee off the hook.
-                    let tail = st.calls.get(&op).is_some_and(|ci| ci.tail);
+                    let tail = st.calls.get(op).is_some_and(|ci| ci.tail);
                     let unr = !tail
                         && os
                             .get(k + 1)
@@ -104,7 +105,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                         Some(c) => p.call.push((f, ids.id(c), unr)),
                         None => p.icall.push((f, unr)),
                     }
-                } else if st.volatile.contains(&op)
+                } else if st.volatile.contains(op)
                     || is!(AtomicRmwOp)
                     || is!(AtomicCmpxchgOp)
                     || is!(AtomicLoadOp)
@@ -112,7 +113,7 @@ pub fn run(ctx: &Context, st: &mut State) {
                     || is!(FenceOp)
                     || is!(InlineAsmOp)
                     || (is!(CallIntrinsicOp)
-                        && st.intrinsics.get(&op).is_some_and(|n| n.contains("trap")))
+                        && st.intrinsics.get(op).is_some_and(|n| n.contains("trap")))
                 {
                     p.side_fx.push((f,));
                 }
@@ -145,5 +146,5 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &bodied {
         crate::dump_fact("willreturn", s, &wr.contains(s));
     }
-    st.willreturn = wr;
+    st.willreturn = wr.into_iter().collect();
 }

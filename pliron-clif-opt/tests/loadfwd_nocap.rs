@@ -29,13 +29,19 @@ fn loads(f: &Function) -> usize {
 }
 
 fn run(f: &mut Function, nocap: &FxHashSet<(Inst, u32)>) -> usize {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
+    let pf = pliron_clif_opt::proots::facts_cfg(f, &cfg);
+    let ps = pliron_clif_opt::proots::alias_of(&pf);
     pliron_clif_opt::loadfwd::run(
         f,
+        &cfg,
+        &pf,
+        &ps,
         &FxHashSet::default(),
         &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashMap::default(),
+        &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         nocap,

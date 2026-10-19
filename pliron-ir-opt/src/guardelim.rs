@@ -88,7 +88,7 @@ pub(crate) fn slot_base(ctx: &Context, mut p: Value) -> Option<Value> {
         match p.defining_op() {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return Some(p),
             Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return None,
         }
@@ -105,7 +105,7 @@ fn slot_range(ctx: &Context, st: &State, mut p: Value) -> Option<(Value, i64)> {
             Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => return Some((p, off)),
             Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
                 off = off.checked_add(crate::sroa::gep_offset(ctx, st, d)?)?;
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return None,
         }
@@ -116,8 +116,8 @@ fn slot_range(ctx: &Context, st: &State, mut p: Value) -> Option<(Value, i64)> {
 /// isn't a frame slot or the offset is dynamic (unknown overlap — poison).
 fn store_range(ctx: &Context, st: &State, op: Ptr<Operation>) -> Option<(Value, i64, i64)> {
     let od = op.deref(ctx);
-    let (s, off) = slot_range(ctx, st, od.get_operand(1))?;
-    let sz = crate::types::size_align(ctx, od.get_operand(0).get_type(ctx)).0 as i64;
+    let (s, off) = slot_range(ctx, st, od.get_operand(ctx, 1))?;
+    let sz = crate::types::size_align(ctx, od.get_operand(ctx, 0).get_type(ctx)).0 as i64;
     Some((s, off, sz))
 }
 
@@ -138,7 +138,7 @@ fn stores_of(
 ) -> Option<Vec<Ptr<Operation>>> {
     for &op in info.bops.get(&b)?.iter().take(i).rev() {
         if !Operation::is_op::<StoreOp>(op, ctx)
-            || slot_base(ctx, op.deref(ctx).get_operand(1)) != Some(slot)
+            || slot_base(ctx, op.deref(ctx).get_operand(ctx, 1)) != Some(slot)
         {
             continue;
         }
@@ -165,7 +165,7 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     if let Some(b) = v.defining_block() {
         return b
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .position(|a| a == v)
             .map(|i| Atom::Arg(b, i))
             .unwrap_or(Atom::V(v));
@@ -173,10 +173,10 @@ fn atom(ctx: &Context, st: &State, info: &FnInfo, v: Value) -> Atom {
     let Some(d) = v.defining_op() else {
         return Atom::V(v);
     };
-    if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
+    if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(d) {
         return Atom::V(v);
     }
-    let Some((slot, loff)) = slot_range(ctx, st, d.deref(ctx).get_operand(0)) else {
+    let Some((slot, loff)) = slot_range(ctx, st, d.deref(ctx).get_operand(ctx, 0)) else {
         return Atom::V(v);
     };
     let lsz = crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
@@ -229,8 +229,8 @@ fn facts(
         if !Operation::is_op::<CondBrOp>(term, ctx) {
             continue;
         }
-        let tdst = term.deref(ctx).get_successor(0);
-        let fdst = term.deref(ctx).get_successor(1);
+        let tdst = term.deref(ctx).get_successor(ctx, 0);
+        let fdst = term.deref(ctx).get_successor(ctx, 1);
         let neg = if dom.dominates(tdst, b) {
             false
         } else if dom.dominates(fdst, b) {
@@ -238,14 +238,14 @@ fn facts(
         } else {
             continue;
         };
-        let cond = term.deref(ctx).get_operand(0);
+        let cond = term.deref(ctx).get_operand(ctx, 0);
         let Some(ci) = cond.defining_op() else {
             continue;
         };
         let Some(icmp) = Operation::get_op::<ICmpOp>(ci, ctx) else {
             continue;
         };
-        let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
+        let (x, y) = (ci.deref(ctx).get_operand(ctx, 0), ci.deref(ctx).get_operand(ctx, 1));
         let (rel, swap) = match (icmp.predicate(ctx), neg) {
             // Edge fact `x P y` (or its negation) normalized to `a R b`.
             (P::ULT, false) => (Rel::Lt, false),
@@ -271,7 +271,7 @@ fn facts(
 
 /// Atom form of a store's stored value.
 fn stored_atom(ctx: &Context, st: &State, info: &FnInfo, store: Ptr<Operation>) -> Atom {
-    atom(ctx, st, info, store.deref(ctx).get_operand(0))
+    atom(ctx, st, info, store.deref(ctx).get_operand(ctx, 0))
 }
 
 /// The values a predecessor branch forwards to an `Arg` atom:
@@ -292,7 +292,7 @@ fn arg_sources(
         let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
             continue;
         };
-        for (si, s) in t.deref(ctx).successors().enumerate() {
+        for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
             if s != b {
                 continue;
             }
@@ -453,13 +453,13 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             if !Operation::is_op::<CondBrOp>(term, ctx) {
                 return None;
             }
-            let ci = term.deref(ctx).get_operand(0).defining_op()?;
+            let ci = term.deref(ctx).get_operand(ctx, 0).defining_op()?;
             let icmp = Operation::get_op::<ICmpOp>(ci, ctx)?;
             match icmp.predicate(ctx) {
                 P::ULT | P::ULE | P::UGT | P::UGE | P::EQ | P::NE => {}
                 _ => return None,
             }
-            if unterm(term.deref(ctx).get_successor(0)) || unterm(term.deref(ctx).get_successor(1))
+            if unterm(term.deref(ctx).get_successor(ctx, 0)) || unterm(term.deref(ctx).get_successor(ctx, 1))
             {
                 Some(term)
             } else {
@@ -484,21 +484,20 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     for &b in &bs {
         for &op in &bops[&b] {
             if Operation::is_op::<StoreOp>(op, ctx)
-                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(1))
+                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(ctx, 1))
             {
                 store_slots.insert(s);
                 stores_by_slot.entry(s).or_default().push(op);
             }
             if Operation::is_op::<LoadOp>(op, ctx)
-                && !st.volatile.contains(&op)
-                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(0))
+                && !st.volatile.contains(op)
+                && let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(ctx, 0))
             {
                 load_slots.insert(s);
             }
             let pure_intr = Operation::is_op::<CallIntrinsicOp>(op, ctx)
                 && st
-                    .intrinsics
-                    .get(&op)
+                    .intrinsics.get(op)
                     .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p)));
             if Operation::is_op::<LoadOp>(op, ctx)
                 || Operation::is_op::<StoreOp>(op, ctx)
@@ -508,7 +507,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 continue;
             }
             for i in 0..op.deref(ctx).get_num_operands() {
-                if let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(i)) {
+                if let Some(s) = slot_base(ctx, op.deref(ctx).get_operand(ctx, i)) {
                     escaped.insert(s);
                 }
             }
@@ -524,7 +523,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         }
         reach.push(b);
         for op in &bops[&b] {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 if dom.idx.contains_key(&s) {
                     preds.entry(s).or_default().push(b);
                 }
@@ -553,15 +552,15 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         if let Some(b) = v.defining_block() {
             return b
                 .deref(ctx)
-                .arguments()
+                .arguments(ctx)
                 .position(|a| a == v)
                 .map(|i| Nd::Arg(b, i));
         }
         let d = v.defining_op()?;
-        if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(&d) {
+        if !Operation::is_op::<LoadOp>(d, ctx) || st.volatile.contains(d) {
             return None;
         }
-        let (s, off) = slot_range(ctx, st, d.deref(ctx).get_operand(0))?;
+        let (s, off) = slot_range(ctx, st, d.deref(ctx).get_operand(ctx, 0))?;
         let sz = crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
         Some(Nd::Slot(s, off, sz))
     };
@@ -570,9 +569,9 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         let mut seen: FxHashSet<Nd> = FxHashSet::default();
         let mut stack: Vec<Nd> = Vec::new();
         for &term in &cand_terms {
-            let ci = term.deref(ctx).get_operand(0).defining_op().unwrap();
+            let ci = term.deref(ctx).get_operand(ctx, 0).defining_op().unwrap();
             for k in 0..2 {
-                if let Some(n) = node_of(ci.deref(ctx).get_operand(k)) {
+                if let Some(n) = node_of(ci.deref(ctx).get_operand(ctx, k)) {
                     stack.push(n);
                 }
             }
@@ -590,7 +589,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                         // Only exact-cover stores are sources of this key's
                         // loads; partial overlaps poison instead.
                         if store_range(ctx, st, so) == Some((s, off, sz))
-                            && let Some(m) = node_of(so.deref(ctx).get_operand(0))
+                            && let Some(m) = node_of(so.deref(ctx).get_operand(ctx, 0))
                         {
                             stack.push(m);
                         }
@@ -605,7 +604,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                         let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
                             continue;
                         };
-                        for (si, s) in t.deref(ctx).successors().enumerate() {
+                        for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
                             if s != b {
                                 continue;
                             }
@@ -702,7 +701,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                     if !Operation::is_op::<StoreOp>(op, ctx) {
                         continue;
                     }
-                    let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(1)) else {
+                    let Some(sl) = slot_base(ctx, op.deref(ctx).get_operand(ctx, 1)) else {
                         continue;
                     };
                     match store_range(ctx, st, op) {
@@ -730,7 +729,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                 if outt.get(&b) != Some(&m) {
                     outt.insert(b, m);
                     for op in &bops[&b] {
-                        for s in op.deref(ctx).successors() {
+                        for s in op.deref(ctx).successors(ctx) {
                             if dom.idx.contains_key(&s) && inq.insert(s) {
                                 wl.push(s);
                             }
@@ -798,14 +797,14 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             if !Operation::is_op::<CondBrOp>(term, ctx) {
                 continue;
             }
-            let cond = term.deref(ctx).get_operand(0);
+            let cond = term.deref(ctx).get_operand(ctx, 0);
             let Some(ci) = cond.defining_op() else {
                 continue;
             };
             let Some(icmp) = Operation::get_op::<ICmpOp>(ci, ctx) else {
                 continue;
             };
-            let (x, y) = (ci.deref(ctx).get_operand(0), ci.deref(ctx).get_operand(1));
+            let (x, y) = (ci.deref(ctx).get_operand(ctx, 0), ci.deref(ctx).get_operand(ctx, 1));
             let (ax, ay) = (atom(ctx, st, &info, x), atom(ctx, st, &info, y));
             pr.fuel = MAX_PROOF;
             let fs = pr.facts_of(b);
@@ -867,8 +866,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
             };
             let cb = Operation::get_op::<CondBrOp>(term, ctx).unwrap();
             let (tdst, fdst) = (
-                term.deref(ctx).get_successor(0),
-                term.deref(ctx).get_successor(1),
+                term.deref(ctx).get_successor(ctx, 0),
+                term.deref(ctx).get_successor(ctx, 1),
             );
             let (dst, ods) = if t && unreachable_terminated(ctx, &info, fdst) {
                 (tdst, cb.get_true_dest_operands(ctx))
@@ -901,6 +900,9 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     let mut n = 0usize;
     for s in bodied(ctx, st) {
         let fop = st.funcs[&s].op;
+        if st.opt_skip.contains(&fop) {
+            continue;
+        }
         if run_fn(ctx, st, fop) {
             n += 1;
             let bs = blocks(ctx, fop);

@@ -8,6 +8,10 @@
 //!   clif-check pair before.clif after.clif check two saved functions
 //!   clif-check corpus <dir>                `pipeline` on every before.clif under dir
 //!   clif-check bench <dir> [reps]          time `run_pipeline` over the corpus
+//!   clif-check report <dir> <out.json>     pipeline over the corpus in parallel;
+//!                                          per-fn size/time/verdict as JSON
+//!                                          (--check: also diffcheck each fn,
+//!                                          --jobs N, --limit N)
 //!   clif-check steps                       list step names
 //!
 //! Options (after the subcommand args): --trials N, --seed N, --fuel N, --print.
@@ -27,6 +31,9 @@ use pliron_clif_opt::pipeline::{self, FnFlags, Pipe, Stats};
 struct Opts {
     cfg: Config,
     print: bool,
+    check: bool,
+    jobs: usize,
+    limit: usize,
 }
 
 fn main() -> ExitCode {
@@ -35,6 +42,9 @@ fn main() -> ExitCode {
     let mut opts = Opts {
         cfg: diffcheck::config_from_env(),
         print: false,
+        check: false,
+        jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
+        limit: usize::MAX,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -48,6 +58,9 @@ fn main() -> ExitCode {
             "--seed" => opts.cfg.seed = num(),
             "--fuel" => opts.cfg.fuel = num(),
             "--print" => opts.print = true,
+            "--check" => opts.check = true,
+            "--jobs" => opts.jobs = num().max(1) as usize,
+            "--limit" => opts.limit = num() as usize,
             _ => pos.push(a.clone()),
         }
     }
@@ -80,6 +93,11 @@ fn main() -> ExitCode {
         ["corpus", dir] => {
             let mut files = Vec::new();
             collect(Path::new(dir), &mut files);
+            // A PLIRON_CORPUS dump is flat `<name>.<n>.clif`, not
+            // per-fn `before.clif` dirs — fall back to that layout.
+            if files.is_empty() {
+                collect_clif(Path::new(dir), &mut files);
+            }
             files.sort();
             let mut bad = 0;
             for f in &files {
@@ -91,6 +109,7 @@ fn main() -> ExitCode {
             println!("{} files, {bad} with mismatches", files.len());
             bad == 0
         }
+        ["report", dir, out] => report_corpus(&isa, Path::new(dir), Path::new(out), &opts),
         ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
         ["bench", dir, reps] => bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps")),
         _ => {
@@ -254,7 +273,9 @@ fn with_pipe<R>(
         Default::default(),
         facts.lifetimes(&clctx.func),
     );
+    let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
     let mut p = Pipe {
+        fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa,
         fname: "clif-check",
@@ -289,6 +310,7 @@ fn with_pipe<R>(
         carry_log: Vec::new(),
         cur_step: "",
     };
+    p.seed_fact_bits();
     k(&mut p)
 }
 
@@ -329,6 +351,9 @@ fn run_one(
 /// collection), printing the per-step timing table. Pure pass code: no
 /// rustc, no sampler — the iteration loop for pipeline perf work.
 fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
+    // The per-step table below reads `Stats::timing`; the pipeline skips
+    // its per-step clock reads unless told the numbers are observable.
+    pliron_clif_opt::config::mark_step_timing();
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();
@@ -410,4 +435,162 @@ fn report(label: &str, before: &Function, after: &Function, facts: &OwnedFacts, 
             false
         }
     }
+}
+
+/// One function's outcome in `report`.
+struct FnRow {
+    file: String,
+    insts: (usize, usize),
+    blocks: (usize, usize),
+    us: u128,
+    /// `ok`, `changed`... see `report_one`.
+    status: &'static str,
+    msg: String,
+}
+
+fn size_of(f: &Function) -> (usize, usize) {
+    let mut n = 0;
+    let mut b = 0;
+    for blk in f.layout.blocks() {
+        b += 1;
+        n += f.layout.block_insts(blk).count();
+    }
+    (n, b)
+}
+
+/// Pipeline (and with `--check`, diffcheck) one corpus file. Status:
+/// `ok` (checked equal or unchecked), `inconclusive` (checker couldn't
+/// compare any trial), `mismatch`, `verifier`, `panic`, `parse`.
+fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &std::sync::Mutex<Stats>) -> FnRow {
+    let rel = file.strip_prefix(root).unwrap_or(file).display().to_string();
+    let mut row = FnRow { file: rel, insts: (0, 0), blocks: (0, 0), us: 0, status: "ok", msg: String::new() };
+    let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
+        let mut fs = cranelift_reader::parse_functions(&text).ok()?;
+        (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
+    });
+    let Some((func, facts)) = loaded else {
+        row.status = "parse";
+        return row;
+    };
+    let before = func.clone();
+    let (ib, bb) = size_of(&before);
+    let t0 = std::time::Instant::now();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_pipe(isa, func, &facts, |p| {
+            pipeline::run_pipeline(p);
+            steps.lock().unwrap().merge(&*p.stats);
+            p.clctx.func.clone()
+        })
+    }));
+    row.us = t0.elapsed().as_micros();
+    let after = match ran {
+        Ok(a) => a,
+        Err(e) => {
+            row.status = "panic";
+            row.msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            row.insts = (ib, 0);
+            row.blocks = (bb, 0);
+            return row;
+        }
+    };
+    let (ia, ba) = size_of(&after);
+    row.insts = (ib, ia);
+    row.blocks = (bb, ba);
+    if let Err(e) = cranelift_codegen::verify_function(
+        &after,
+        &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
+    ) {
+        row.status = "verifier";
+        row.msg = e.to_string().lines().take(3).collect::<Vec<_>>().join(" | ");
+        return row;
+    }
+    if o.check {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            diffcheck::check(&before, &after, &facts.facts(), &o.cfg).map_err(|m| m.to_string())
+        }));
+        match r {
+            Ok(Ok(s)) if s.compared == 0 => {
+                row.status = "inconclusive";
+                row.msg = s.why.unwrap_or_default().lines().next().unwrap_or("").to_string();
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(m)) => {
+                row.status = "mismatch";
+                row.msg = m.lines().take(4).collect::<Vec<_>>().join(" | ");
+            }
+            Err(_) => {
+                row.status = "inconclusive";
+                row.msg = "checker panicked".into();
+            }
+        }
+    }
+    row
+}
+
+/// `report <dir> <out.json>` — the live-loop workhorse: every corpus
+/// function through `run_pipeline` on `--jobs` threads, written as JSON
+/// for `harness/live/` (and the gate). Never aborts on a bad function:
+/// panics, verifier errors and mismatches become rows.
+fn report_corpus(isa: &std::sync::Arc<dyn TargetIsa>, dir: &Path, out: &Path, o: &Opts) -> bool {
+    // `steps.timing` lands in the JSON's per-step table — the pipeline
+    // skips its per-step clock reads unless told they're observable.
+    pliron_clif_opt::config::mark_step_timing();
+    let mut files = Vec::new();
+    collect_clif(dir, &mut files);
+    files.sort();
+    files.truncate(o.limit);
+    std::panic::set_hook(Box::new(|_| {}));
+    let t0 = std::time::Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let rows = std::sync::Mutex::new(Vec::with_capacity(files.len()));
+    let steps = std::sync::Mutex::new(Stats::default());
+    std::thread::scope(|s| {
+        for _ in 0..o.jobs {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(f) = files.get(i) else { break };
+                let r = report_one(&**isa, dir, f, o, &steps);
+                rows.lock().unwrap().push(r);
+            });
+        }
+    });
+    let _ = std::panic::take_hook();
+    let mut rows = rows.into_inner().unwrap();
+    rows.sort_by(|a, b| a.file.cmp(&b.file));
+    let wall = t0.elapsed();
+    let steps = steps.into_inner().unwrap();
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for r in &rows {
+        *counts.entry(r.status).or_default() += 1;
+    }
+    let mut step_ms: Vec<_> = steps.timing.iter().map(|(n, d)| (*n, d.as_secs_f64() * 1e3)).collect();
+    step_ms.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let json = serde_json::json!({
+        "generated": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        "corpus": dir.display().to_string(),
+        "checked": o.check,
+        "wall_ms": wall.as_secs_f64() * 1e3,
+        "counts": counts,
+        "steps": step_ms.iter().map(|(n, ms)| serde_json::json!({"step": n, "ms": ms})).collect::<Vec<_>>(),
+        "functions": rows.iter().map(|r| serde_json::json!({
+            "file": r.file, "status": r.status, "msg": r.msg, "us": r.us,
+            "insts_before": r.insts.0, "insts_after": r.insts.1,
+            "blocks_before": r.blocks.0, "blocks_after": r.blocks.1,
+        })).collect::<Vec<_>>(),
+    });
+    let tmp = out.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string(&json).unwrap()).expect("write report");
+    std::fs::rename(&tmp, out).expect("rename report");
+    let bad = rows.iter().filter(|r| matches!(r.status, "mismatch" | "verifier" | "panic")).count();
+    println!(
+        "report: {} fns in {wall:.2?} ({} jobs) — {counts:?} -> {}",
+        rows.len(),
+        o.jobs,
+        out.display()
+    );
+    bad == 0
 }

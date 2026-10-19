@@ -35,7 +35,7 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
 /// Speculatable: executing it unconditionally can't trap, touch memory, or
 /// branch. Constants and frame addresses are free everywhere, so hoisting
 /// them is pure churn — skipped.
-fn speculatable(func: &Function, i: Inst) -> bool {
+pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
     let op = func.dfg.insts[i].opcode();
     if func.dfg.inst_results(i).is_empty()
         || op.is_terminator()
@@ -153,7 +153,7 @@ fn hoists(
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     pb: Block,
     i: Inst,
@@ -262,7 +262,7 @@ fn hoists(
                 // the whole clone — the hoist stays inside it.
                 return true;
             }
-            r = rpar.get(&x).copied().filter(|&n| n != x);
+            r = rpar.get(x).copied().filter(|&n| n != x);
         }
         if dbg {
             if pliron_cfg::tracing_on() {
@@ -342,7 +342,7 @@ fn run_loop(
     debug: bool,
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
-    rpar: &FxHashMap<Region, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
 ) -> usize {
     let h = la.loop_header(lp);
@@ -393,7 +393,7 @@ fn run_loop(
     // body — not a given: LoopAnalysis admits irreducible bodies with
     // external entries bypassing it.
     let pb = func.layout.inst_block(pinst).unwrap();
-    if !dt.dominates(pb, h, &func.layout) || !body.iter().all(|&b| dt.dominates(h, b, &func.layout))
+    if !dt.try_dominates(pb, h, &func.layout) || !body.iter().all(|&b| dt.try_dominates(h, b, &func.layout))
     {
         if debug {
             if pliron_cfg::tracing_on() {
@@ -411,8 +411,8 @@ fn run_loop(
             return false;
         }
         match func.dfg.value_def(v) {
-            ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
-            ValueDef::Param(b, _) => dt.dominates(b, pinst, &func.layout),
+            ValueDef::Result(i, _) => dt.try_dominates(i, pinst, &func.layout),
+            ValueDef::Param(b, _) => dt.try_dominates(b, pinst, &func.layout),
             _ => false,
         }
     };
@@ -628,7 +628,7 @@ fn run_loop(
                 }
             }
             if exits.is_empty()
-                || !exits.iter().all(|&(t, _)| dt.dominates(s, t, &func.layout))
+                || !exits.iter().all(|&(t, _)| dt.try_dominates(s, t, &func.layout))
                 || !exits.iter().all(|&(t, slot)| {
                     func.dfg.insts[t]
                         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[slot]
@@ -983,8 +983,8 @@ fn promote_loc(
     // covers all of them.
     if let Root::V(v) = loc.0 {
         let ok = match func.dfg.resolved_value_def(v) {
-            ValueDef::Result(i, _) => dt.dominates(i, pinst, &func.layout),
-            ValueDef::Param(b, _) => dt.dominates(b, pb, &func.layout),
+            ValueDef::Result(i, _) => dt.try_dominates(i, pinst, &func.layout),
+            ValueDef::Param(b, _) => dt.try_dominates(b, pb, &func.layout),
             _ => false,
         };
         if !ok {
@@ -1308,10 +1308,7 @@ pub fn run(
     cfrozen: &FxHashMap<FuncRef, u64>,
     scoped: &FxHashMap<Inst, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     breg: &FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
-    rpar: &FxHashMap<
-        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
-        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
-    >,
+    rpar: &pliron::cols::ColMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
 ) -> usize {
     let mut la = LoopAnalysis::new();
@@ -1453,7 +1450,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
-            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -1513,7 +1510,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
-            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());

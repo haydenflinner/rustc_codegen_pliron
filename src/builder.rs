@@ -110,7 +110,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let ctx = self.cx.pctx.borrow();
         op.insert_at_back(self.block, &ctx);
         let o = op.deref(&ctx);
-        (o.get_num_results() > 0).then(|| o.get_result(0))
+        (o.get_num_results() > 0).then(|| o.get_result(&ctx, 0))
     }
 
     fn mk_op<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Ptr<Operation> {
@@ -221,11 +221,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         args: &[Value],
         exts: Exts,
     ) -> Value {
-        let callable = match self.cval(callee) {
+        let (callable, callee_sym) = match self.cval(callee) {
             Some(ConstVal::Sym { sym, off: 0 }) if self.st.borrow().funcs.contains_key(&sym) => {
-                CallOpCallable::Direct(self.ident(&sym))
+                (CallOpCallable::Direct(self.ident(&sym)), Some(sym))
             }
-            _ => CallOpCallable::Indirect(callee),
+            _ => (CallOpCallable::Indirect(callee), None),
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
@@ -244,6 +244,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 arg_extent: None,
                 arg_noalias: None,
                 bb: false,
+                callee: callee_sym,
             },
         );
         self.st.borrow_mut().last_call = Some(p);
@@ -273,7 +274,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let v = self.call_sym(sym, ret, args);
         let mut st = self.st.borrow_mut();
         if let Some(p) = st.last_call {
-            st.calls.get_mut(&p).unwrap().bb = true;
+            st.calls.get_mut(p).unwrap().bb = true;
         }
         v
     }
@@ -304,7 +305,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if f.get_entry_block(&ctx).is_none() {
             return f.get_or_create_entry_block(&mut ctx);
         }
-        let region = llfn.deref(&ctx).get_region(0);
+        let region = llfn.deref(&ctx).get_region(&ctx, 0);
         let bb = BasicBlock::new(&mut ctx, None, vec![]);
         bb.insert_at_back(region, &ctx);
         bb
@@ -603,7 +604,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .get_head()
                 .expect("function has no entry block");
             op.insert_at_front(entry, &ctx);
-            op.deref(&ctx).get_result(0)
+            op.deref(&ctx).get_result(&ctx, 0)
         };
         self.st
             .borrow_mut()
@@ -1285,7 +1286,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
             let mut st = self.st.borrow_mut();
-            let info = st.calls.get_mut(&p).unwrap();
+            let info = st.calls.get_mut(p).unwrap();
             info.foreign = foreign;
             info.cc = cc;
             info.nocap = any_nc.then(|| nc.into_boxed_slice());
@@ -1320,7 +1321,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // skipped by the terminator logic once `return_call` is emitted.
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
-            self.st.borrow_mut().calls.get_mut(&p).unwrap().tail = true;
+            self.st.borrow_mut().calls.get_mut(p).unwrap().tail = true;
         }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),
@@ -1339,7 +1340,7 @@ impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
             .unwrap()
             .get_entry_block(&ctx)
             .unwrap();
-        entry.deref(&ctx).get_argument(index)
+        entry.deref(&ctx).get_argument(&ctx, index)
     }
 }
 

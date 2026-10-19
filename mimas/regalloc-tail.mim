@@ -1,0 +1,86 @@
+// regalloc-tail.mim — appended after cliffacts.py output: block-boundary
+// liveness + interference as datalog fixpoints, then a greedy spill loop:
+// while the worst block exceeds K, evict the cheapest vreg live there.
+// Model notes: whole-vreg spills (no range splitting), block-boundary
+// liveness, cost = def+use count x 10^loop-depth — a slice of the model,
+// not a regalloc2 replacement.
+
+let (blk_, buse_, bdef_, succ_, live_in_, live_out_, live_at_, interfere_) = datalog {
+    rel blk(b: int) from blk_rows
+    rel buse(v: int, b: int) from buse_rows
+    rel bdef(v: int, b: int) from bdef_rows
+    rel succ(b: int, c: int) from succ_rows
+
+    rel live_in(v: int, b: int)
+    rel live_out(v: int, b: int)
+    rel live_at(v: int, b: int)
+    rel interfere(a: int, b: int)
+
+    live_in(v, b) if buse(v, b)
+    live_in(v, b) if live_out(v, b), !bdef(v, b)
+    live_out(v, b) if succ(b, c), live_in(v, c)
+    live_at(v, b) if live_in(v, b)
+    live_at(v, b) if live_out(v, b)
+    interfere(x, y) if live_at(x, k), live_at(y, k), x < y
+};
+
+fn costof(v: int) -> int {
+    for c in cost_rows { if c.0 == v { return c.1; } }
+    0
+}
+
+fn member(v: int, xs: [int]) -> bool {
+    for x in xs { if x == v { return true; } }
+    false
+}
+
+fn pressure_in(b: int, spilled: [int]) -> int {
+    let n = 0;
+    for t in live_at_ {
+        if t.1 == b && !member(t.0, spilled) { n = n + 1; }
+    }
+    n
+}
+
+fn worst_block(spilled: [int]) -> (int, int) {
+    // (block, pressure) of the highest-pressure block
+    let m = 0;
+    let mb = -1;
+    for b in blk_ {
+        let p = pressure_in(b.0, spilled);
+        if p > m { m = p; mb = b.0; }
+    }
+    (mb, m)
+}
+
+fn live_in_block(b: int, spilled: [int]) -> [int] {
+    let vs: [int] = [];
+    for t in live_at_ {
+        if t.1 == b && !member(t.0, spilled) { vs.push(t.0); }
+    }
+    vs
+}
+
+let K = 14;
+print(f"blocks={blk_.len()} live_at={live_at_.len()} interfere={interfere_.len()}");
+
+// greedy spill: while the worst block exceeds K, evict the cheapest
+// vreg live there (cost per boundary-tuple relieved is the weight)
+let spilled: [int] = [];
+let wb = worst_block(spilled);
+while wb.1 > K {
+    let vs = live_in_block(wb.0, spilled);
+    let pick = vs[0];
+    let pc = costof(vs[0]);
+    for v in vs {
+        let c = costof(v);
+        if c < pc { pc = c; pick = v; }
+    }
+    spilled.push(pick);
+    wb = worst_block(spilled);
+}
+let total = 0;
+for v in spilled { total = total + costof(v); }
+print(f"K={K}: spilled {spilled.len()} vregs, total cost {total}");
+for v in spilled { print(f"  v{v} cost={costof(v)}"); }
+print(f"final max pressure {worst_block(spilled).1}");

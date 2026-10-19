@@ -12,6 +12,7 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
@@ -99,23 +100,13 @@ pub fn eval(
         } => imm.bits() as u64,
         InstructionData::IntCompare { cond, args, .. } => {
             let aw = bits(func, args[0])?;
-            let ranged = range_cmp(
-                cond,
-                known(func, env, args[0]),
-                known(func, env, args[1]),
-                rg(args[0]),
-                rg(args[1]),
-                aw,
-            );
-            match (known(func, env, args[0]), known(func, env, args[1])) {
+            let (ka, kb) = (known(func, env, args[0]), known(func, env, args[1]));
+            let ranged = range_cmp(cond, ka, kb, rg(args[0]), rg(args[1]), aw);
+            match (ka, kb) {
                 _ if ranged.is_some() => u64::from(ranged == Some(true)),
                 (Some(a), Some(b)) => icmp(cond, a, b, aw) as u64,
                 (Some(0), None) | (None, Some(0)) => {
-                    let x = if known(func, env, args[0]).is_some() {
-                        args[1]
-                    } else {
-                        args[0]
-                    };
+                    let x = if ka.is_some() { args[1] } else { args[0] };
                     match (cond, nz(x)) {
                         (IntCC::Equal, true) => 0,
                         (IntCC::NotEqual, true) => 1,
@@ -339,6 +330,7 @@ pub struct NonNull<'a> {
 impl<'a> NonNull<'a> {
     pub fn new(
         func: &Function,
+        cfg: &ControlFlowGraph,
         loads: &'a FxHashSet<Value>,
         derived: &'a FxHashMap<Value, Value>,
     ) -> Self {
@@ -387,41 +379,46 @@ impl<'a> NonNull<'a> {
         // so a value feeding many edges is proven once. Cleared before the
         // eviction pass, which re-proves against the shrinking set.
         let mut memo = Some(FxHashMap::default());
-        for b in func.layout.blocks() {
-            let Some(t) = func.layout.last_inst(b) else {
+        // Only in-edges of blocks with candidate params can evict — walk
+        // those preds via the CFG instead of every edge in the function.
+        for d in func.layout.blocks() {
+            let bparams = func.dfg.block_params(d);
+            if !bparams.iter().any(|p| nn.params.contains(p)) {
                 continue;
-            };
-            for (ei, bc) in func.dfg.insts[t]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .into_iter()
-                .enumerate()
-            {
-                let d = bc.block(&func.dfg.value_lists);
-                // Most edges feed blocks with no candidate params — collect
-                // the edge args only once one matches.
-                let mut args: Option<Vec<BlockArg>> = None;
-                for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
-                    if !nn.params.contains(&p) {
+            }
+            for pred in cfg.pred_iter(d) {
+                let t = pred.inst;
+                for (ei, bc) in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if bc.block(&func.dfg.value_lists) != d {
                         continue;
                     }
-                    let args = args.get_or_insert_with(|| bc.args(&func.dfg.value_lists).collect());
-                    let Some(&BlockArg::Value(v)) = args.get(i) else {
-                        evict.push(p);
-                        continue;
-                    };
-                    let v = func.dfg.resolve_aliases(v);
-                    deps.clear();
-                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo) {
-                        dependents_entry(&mut dependents, &deps, checks.len());
-                        checks.push(Chk {
-                            p,
-                            t,
-                            ei,
-                            v,
-                            deps: deps.iter().copied().collect(),
-                        });
-                    } else {
-                        evict.push(p);
+                    let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                    for (i, &p) in bparams.iter().enumerate() {
+                        if !nn.params.contains(&p) {
+                            continue;
+                        }
+                        let Some(&BlockArg::Value(v)) = args.get(i) else {
+                            evict.push(p);
+                            continue;
+                        };
+                        let v = func.dfg.resolve_aliases(v);
+                        deps.clear();
+                        if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo) {
+                            dependents_entry(&mut dependents, &deps, checks.len());
+                            checks.push(Chk {
+                                p,
+                                t,
+                                ei,
+                                v,
+                                deps: deps.iter().copied().collect(),
+                            });
+                        } else {
+                            evict.push(p);
+                        }
                     }
                 }
             }
@@ -462,6 +459,21 @@ impl<'a> NonNull<'a> {
 
     pub fn is(&self, func: &Function, v: Value) -> bool {
         self.is_deps(func, v, &mut FxHashSet::default())
+    }
+
+    /// `is` behind a caller-owned memo. Answers depend on `func` as it
+    /// stands at query time, so the memo is only sound across a span
+    /// where `func` does not change — `round`'s edge scan and
+    /// `fold_null_tests`' collection both qualify; a caller that
+    /// rewrites `func` between queries must drop the memo too.
+    pub fn is_m(&self, func: &Function, v: Value, memo: &mut FxHashMap<Value, bool>) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if let Some(&r) = memo.get(&v) {
+            return r;
+        }
+        let r = self.is(func, v);
+        memo.insert(v, r);
+        r
     }
 
     /// `is_deps` behind a per-value memo — legal only while `params` is
@@ -1030,11 +1042,16 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             .inst()
             .is_some_and(|i| matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp))
     };
+    let sentinel = crate::pass_enabled("PLIRON_SENTINEL");
+    let paramnull = crate::pass_enabled("PLIRON_PARAMNULL");
     let mut hits = Vec::new();
     let mut cfg_lazy: Option<ControlFlowGraph> = None;
     let mut dt_lazy: Option<DominatorTree> = None;
     // `ne_params` sets per sentinel constant, built on first use.
     let mut ne_sets: FxHashMap<u64, FxHashSet<Value>> = FxHashMap::default();
+    // `nn` queries run only inside this immutable scan — `hits` apply
+    // after — so one memo covers them all.
+    let mut nnm: FxHashMap<Value, bool> = FxHashMap::default();
     for b in func.layout.blocks() {
         for inst in func.layout.block_insts(b) {
             let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[inst] else {
@@ -1056,7 +1073,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             };
             let k = mask(k, w);
             if k != 0 {
-                if !crate::pass_enabled("PLIRON_SENTINEL") {
+                if !sentinel {
                     continue;
                 }
                 // `select c, X, K == K` iff `!c` when `X != K`;
@@ -1101,7 +1118,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 hits.push((inst, f));
                 continue;
             }
-            if nn.is(func, x) {
+            if nn.is_m(func, x, &mut nnm) {
                 hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
                 continue;
             }
@@ -1111,7 +1128,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             // zero. `p == 0` iff a zero edge was taken; when every edge
             // funnels through the same `brif c`, the test is that
             // condition itself.
-            if crate::pass_enabled("PLIRON_PARAMNULL")
+            if paramnull
                 && let ValueDef::Param(d, pidx) = func.dfg.value_def(x)
             {
                 let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
@@ -1146,7 +1163,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                         match known(func, &none, arg) {
                             Some(0) => edges.push((arm, true)),
                             Some(_) => edges.push((arm, false)),
-                            None if nn.is(func, arg) => edges.push((arm, false)),
+                            None if nn.is_m(func, arg, &mut nnm) => edges.push((arm, false)),
                             _ => {
                                 ok = false;
                                 break;
@@ -1207,7 +1224,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                     ValueDef::Param(cb, _) => ProgramPoint::Block(cb),
                     _ => continue,
                 };
-                if !dt.dominates(pp, inst, &func.layout) {
+                if !dt.try_dominates(pp, inst, &func.layout) {
                     continue;
                 }
                 // `p == 0` ⇔ arm `az` taken ⇔ (az ? c : !c); `ne` inverts.
@@ -1230,8 +1247,8 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 continue;
             };
             // `select c, 0, X == 0` iff `c` (X ≠ 0); `select c, X, 0` mirrors.
-            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is(func, sa[2]);
-            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is(func, sa[1]);
+            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is_m(func, sa[2], &mut nnm);
+            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is_m(func, sa[1], &mut nnm);
             let c = sa[0];
             let f = match (t0, t1, ne) {
                 (true, _, false) | (false, true, true) if booly(func, c) => Fold::Alias(c),
@@ -1289,7 +1306,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
 /// `sel == K` on every path into it (`x == K` on the mid edge is the same
 /// value), `X_target` sees `sel == x` — provided the block had no other
 /// preds, so `b`/`mid` alone decide entry.
-pub fn split_niche_tests(func: &mut Function) -> usize {
+pub fn split_niche_tests(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
     struct Plan {
         b: Block,
         term: Inst,
@@ -1512,9 +1529,9 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
         }
         // Defer any plan whose key insts an earlier apply rewrote or
         // removed, or whose targets gained a `mid` pred — both make the
-        // plan's collected facts stale. `Uses::new` is fresh each plan
-        // anyway for the dead-select sweep; here it needs one build for
-        // all of them.
+        // plan's collected facts stale. The use index is refetched each
+        // round anyway for the dead-select sweep; here it needs one
+        // fetch for all of them.
         let mut mutated: FxHashSet<Inst> = FxHashSet::default();
         let mut claimed: FxHashSet<Block> = FxHashSet::default();
         let mut dead_sweep: Vec<Inst> = Vec::new();
@@ -1626,8 +1643,11 @@ pub fn split_niche_tests(func: &mut Function) -> usize {
         // One use index for the whole sweep: removals only delete
         // uses, so a stale entry just skips a removal the next
         // outer round catches — a per-inst whole-function scan
-        // was O(dead × fn).
-        let uses = crate::uses::Uses::new(func);
+        // was O(dead × fn). Shared snapshot: applies that added insts
+        // changed `num_insts` so `an.uses` rebuilds; a same-shape
+        // refetch may serve a stale snapshot, which the comment
+        // above already tolerates.
+        let uses = an.uses(func);
         for di in dead_sweep {
             if func.layout.inst_block(di).is_none() {
                 continue;
@@ -1702,7 +1722,7 @@ fn map_val(
             ValueDef::Param(db, _) => ProgramPoint::Block(db),
             _ => return false,
         };
-        if !dom.dominates(pp, pinst, &func.layout) {
+        if !dom.try_dominates(pp, pinst, &func.layout) {
             return false;
         }
         out.push(Arg::V(v));
@@ -1895,20 +1915,26 @@ pub(crate) fn round<'a>(
     let mut pn: FxHashSet<Value> = FxHashSet::default();
     let mut kenv: KBits = FxHashMap::default();
     let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
+    // `NonNull::is_m` memo — valid for the whole collection phase since
+    // `func` is only rewritten once `edits` apply below. RefCell so the
+    // `&dyn Fn` `nz` closure can share it.
+    let nnm = std::cell::RefCell::new(FxHashMap::<Value, bool>::default());
     for b in func.layout.blocks() {
         if Some(b) == entry || locked.contains(&b) {
             continue;
         }
-        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-        let Some((&term, body)) = insts.split_last() else {
+        let Some(term) = func.layout.last_inst(b) else {
             continue;
         };
+        // All but the terminator, in order — recreated on each use to
+        // skip the per-block `Vec` (this loop runs every round).
+        let body = || func.layout.block_insts(b).filter(|&i| i != term);
         // `iconst`s cost nothing to evaluate through the env map; budget
         // the real ops only (long niche-merge chains — `Option<char>`
         // flag test + sentinel compare — otherwise exceed MAX_BODY).
         let real = if bodyk {
-            body.iter()
-                .filter(|&&i| {
+            body()
+                .filter(|&i| {
                     !matches!(
                         func.dfg.insts[i],
                         InstructionData::UnaryImm {
@@ -1919,9 +1945,9 @@ pub(crate) fn round<'a>(
                 })
                 .count()
         } else {
-            body.len()
+            body().count()
         };
-        if real > MAX_BODY || !body.iter().all(|&i| pure_op(func, i)) {
+        if real > MAX_BODY || !body().all(|i| pure_op(func, i)) {
             continue;
         }
         let InstructionData::Brif {
@@ -1932,7 +1958,7 @@ pub(crate) fn round<'a>(
         else {
             continue;
         };
-        let params = func.dfg.block_params(b).to_vec();
+        let params = func.dfg.block_params(b);
         let mut body_vals_l: Option<FxHashSet<Value>> = None;
         for pred in cfg.pred_iter(b) {
             let (pinst, pblock) = (pred.inst, pred.block);
@@ -1956,7 +1982,7 @@ pub(crate) fn round<'a>(
                 // A real candidate edge — the first one per round builds
                 // the NonNull fixpoint; blocks failing the gates above
                 // never reach it.
-                let nnr = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
+                let nnr = nn.get_or_insert_with(|| NonNull::new(func, cfg, loads, derived));
                 env.clear();
                 argv.clear();
                 pn.clear();
@@ -1970,7 +1996,7 @@ pub(crate) fn round<'a>(
                     argv.insert(p, v);
                     if let Some(c) = known(func, &env, v) {
                         env.insert(p, c);
-                    } else if nnr.is(func, v) {
+                    } else if nnr.is_m(func, v, &mut nnm.borrow_mut()) {
                         pn.insert(p);
                     }
                 }
@@ -1992,7 +2018,7 @@ pub(crate) fn round<'a>(
                 }
                 let nz = |v: Value| {
                     let v = func.dfg.resolve_aliases(v);
-                    nnr.is(func, v) || pn.contains(&v)
+                    nnr.is_m(func, v, &mut nnm.borrow_mut()) || pn.contains(&v)
                 };
                 // Ranges of the incoming args implied by branches dominating the pred.
                 prange.clear();
@@ -2019,7 +2045,7 @@ pub(crate) fn round<'a>(
                     }
                 }
                 let rg = |v: Value| prange.get(&func.dfg.resolve_aliases(v)).copied();
-                for &i in body {
+                for i in body() {
                     if let Some(c) =
                         eval(func, &env, &nz, &rg, i).or_else(|| kfold(func, &env, &kenv, i))
                     {
@@ -2122,7 +2148,7 @@ pub(crate) fn round<'a>(
                                         break;
                                     }
                                 };
-                                if !domtree.dominates(pp, q, &func.layout) {
+                                if !domtree.try_dominates(pp, q, &func.layout) {
                                     okr = false;
                                     break;
                                 }
@@ -2183,7 +2209,7 @@ pub(crate) fn round<'a>(
                 }
                 let mut new = Vec::new();
                 let body_vals = body_vals_l.get_or_insert_with(|| {
-                    body.iter().map(|&i| func.dfg.first_result(i)).collect()
+                    body().map(|i| func.dfg.first_result(i)).collect()
                 });
                 for a in t.args(&func.dfg.value_lists) {
                     let BlockArg::Value(v) = a else {
@@ -2250,7 +2276,7 @@ pub(crate) fn round<'a>(
             ValueDef::Param(db, _) => ProgramPoint::Block(db),
             _ => return false,
         };
-        if !domtree.dominates(pp, u, &func.layout) {
+        if !domtree.try_dominates(pp, u, &func.layout) {
             return false;
         }
         let Some(db) = def_block(v) else {
@@ -2390,7 +2416,7 @@ pub(crate) fn round<'a>(
 pub fn merge_chains(func: &mut Function) {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
-    let t0 = std::time::Instant::now();
+    let t0 = prof.then(std::time::Instant::now);
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -2406,14 +2432,14 @@ pub fn merge_chains(func: &mut Function) {
                 break;
             };
             let y = destination.block(&func.dfg.value_lists);
-            let tp = std::time::Instant::now();
+            let tp = prof.then(std::time::Instant::now);
             // `take(2)`, not `count()`: a shared merge block can have one
             // predecessor list entry per dispatch arm, and counting them
             // all per arm is O(arms x preds) on giant `br_table` fns.
             if y == x || Some(y) == entry || cfg.pred_iter(y).take(2).count() != 1 {
                 break;
             }
-            t_cfg += tp.elapsed().as_nanos();
+            t_cfg += tp.map_or(0, |t| t.elapsed().as_nanos());
             let args: Vec<Value> = destination
                 .args(&func.dfg.value_lists)
                 .filter_map(|a| match a {
@@ -2434,15 +2460,15 @@ pub fn merge_chains(func: &mut Function) {
             {
                 break;
             }
-            let tp = std::time::Instant::now();
+            let tp = prof.then(std::time::Instant::now);
             let params = func.dfg.detach_block_params(y);
             let params: Vec<Value> = params.as_slice(&func.dfg.value_lists).to_vec();
             for (p, a) in params.into_iter().zip(args) {
                 func.dfg.change_to_alias(p, a);
             }
-            t_alias += tp.elapsed().as_nanos();
+            t_alias += tp.map_or(0, |t| t.elapsed().as_nanos());
             func.layout.remove_inst(term);
-            let tp = std::time::Instant::now();
+            let tp = prof.then(std::time::Instant::now);
             let insts: Vec<Inst> = func.layout.block_insts(y).collect();
             for i in insts {
                 func.layout.remove_inst(i);
@@ -2450,7 +2476,7 @@ pub fn merge_chains(func: &mut Function) {
                 moves += 1;
             }
             func.layout.remove_block(y);
-            t_move += tp.elapsed().as_nanos();
+            t_move += tp.map_or(0, |t| t.elapsed().as_nanos());
             merges += 1;
             gone.insert(y);
         }
@@ -2459,7 +2485,7 @@ pub fn merge_chains(func: &mut Function) {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
                 "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
-                t0.elapsed(),
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 t_cfg / 1_000_000,
                 t_alias / 1_000_000,
                 t_move / 1_000_000
@@ -2475,24 +2501,27 @@ pub fn merge_chains(func: &mut Function) {
 /// edge, and rename the uses. Once the exports travel as edge args an
 /// edgespec threading can land on `s` — an enum-discriminant dispatch
 /// whose use-cone is small (a couple of epilogue blocks) then folds.
-pub fn rebind_exports(func: &mut Function) -> usize {
+pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
+    // cfg/dom stay local: callers in this step mutate the CFG without
+    // invalidating `an`, so its cfg/dt may be stale here. The use index
+    // is safe — `an.uses` keys on `num_insts` and rebuilds when the
+    // shape changed; same-shape stale entries overcount uses, which
+    // only keeps the cone walks conservative.
+    let uses = an.uses(func);
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
-    // Resolved use index — one O(fn) scan shared by every (y, s) cone
-    // walk instead of re-walking `inst_values` per use.
-    let uses = crate::uses::Uses::new(func);
     if prof2 {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
                 "    rebind setup {:.3}ms",
-                t0.elapsed().as_secs_f64() * 1e3
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3
             )
         };
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let mut edits = Vec::new();
     for y in func.layout.blocks().collect::<Vec<_>>() {
         // Params then inst results — deterministic order.
@@ -2579,12 +2608,12 @@ pub fn rebind_exports(func: &mut Function) -> usize {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
                 "    rebind scan {:.3}ms (edits={})",
-                t0.elapsed().as_secs_f64() * 1e3,
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3,
                 edits.len()
             )
         };
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let n = edits.len();
     // Edge args grouped by term — a giant dispatch has an edit per arm,
     // and a full destination rescan per edit is O(arms²).
@@ -2630,7 +2659,7 @@ pub fn rebind_exports(func: &mut Function) -> usize {
     }
     if prof2 {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+            tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3)
         };
     }
     n
@@ -2722,7 +2751,7 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
                     }
                     ValueDef::Result(di, _) => {
                         func.layout.inst_block(di) == Some(y)
-                            || dom.dominates(di, term, &func.layout)
+                            || dom.try_dominates(di, term, &func.layout)
                     }
                     _ => false,
                 };
@@ -2820,9 +2849,22 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
 /// target, so a constant arg reaches the block that tests it. Each forwarded
 /// arg must be a param of the bypassed block or defined where it dominates
 /// the predecessor's branch. Returns the edges retargeted.
-fn bypass_forwarders(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let domtree = DominatorTree::with_function(func, &cfg);
+fn bypass_forwarders(
+    func: &mut Function,
+    cd: Option<(&ControlFlowGraph, &DominatorTree)>,
+) -> usize {
+    // A caller-held cfg/domtree is reusable: retargets only shrink `b`'s
+    // pred lists (a stale entry fails the `bc.block == b` re-check) and
+    // can only strengthen dominance — both directions stay conservative.
+    let (cfg_l, dt_l);
+    let (cfg, domtree) = match cd {
+        Some((c, d)) => (c, d),
+        None => {
+            cfg_l = ControlFlowGraph::with_function(func);
+            dt_l = DominatorTree::with_function(func, &cfg_l);
+            (&cfg_l, &dt_l)
+        }
+    };
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
     // Block params used outside their own block: bypassing that block would
@@ -2866,22 +2908,8 @@ fn bypass_forwarders(func: &mut Function) -> usize {
         let Some(term) = func.layout.last_inst(b) else {
             continue;
         };
-        // Any other insts must be pure and used only by each other.
-        let body: Vec<Inst> = func.layout.block_insts(b).filter(|&i| i != term).collect();
-        let mut local: FxHashMap<Value, u32> = FxHashMap::default();
-        for &i in &body {
-            for &a in func.dfg.inst_args(i) {
-                *local.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
-            }
-        }
-        if !body.iter().all(|&i| {
-            pure_op(func, i) && {
-                let r = func.dfg.first_result(i);
-                uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
-            }
-        }) {
-            continue;
-        }
+        // Cheap gates first: a forwarder ends in `jump t` — the body
+        // purity scan below only runs for blocks that are one.
         let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
             continue;
         };
@@ -2897,6 +2925,22 @@ fn bypass_forwarders(func: &mut Function) -> usize {
             }
         }
         if targs.len() != func.dfg.num_block_params(t) {
+            continue;
+        }
+        // Any other insts must be pure and used only by each other.
+        let body: Vec<Inst> = func.layout.block_insts(b).filter(|&i| i != term).collect();
+        let mut local: FxHashMap<Value, u32> = FxHashMap::default();
+        for &i in &body {
+            for &a in func.dfg.inst_args(i) {
+                *local.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+        }
+        if !body.iter().all(|&i| {
+            pure_op(func, i) && {
+                let r = func.dfg.first_result(i);
+                uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
+            }
+        }) {
             continue;
         }
         let params = func.dfg.block_params(b).to_vec();
@@ -2934,7 +2978,7 @@ fn bypass_forwarders(func: &mut Function) -> usize {
                     }
                     let ok = match func.dfg.value_def(v) {
                         ValueDef::Result(i, _) => {
-                            i != pinst && domtree.dominates(i, pinst, &func.layout)
+                            i != pinst && domtree.try_dominates(i, pinst, &func.layout)
                         }
                         ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
                         _ => false,
@@ -3474,17 +3518,38 @@ fn dominated_conds(
     // nearest-first (stack top = the block itself), and `env` keeps the
     // original furthest-ancestor-wins precedence — entries are only
     // filled when an ancestor didn't already set them, and an undo log
-    // restores them on exit.
-    let mut children: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+    // restores them on exit. The tree itself is CSR-built (`head`/`kids`)
+    // so this per-iteration scan doesn't pay a hashmap + Vec per edge.
+    let mut head: SecondaryMap<Block, u32> = SecondaryMap::new();
+    let mut deg: SecondaryMap<Block, u32> = SecondaryMap::new();
     for b in func.layout.blocks() {
         if let Some(p) = domtree.idom(b) {
-            children.entry(p).or_default().push(b);
+            deg[p] += 1;
+        }
+    }
+    let mut total = 0u32;
+    for b in func.layout.blocks() {
+        head[b] = total;
+        total += deg[b];
+    }
+    let mut kids = vec![Block::from_u32(0); total as usize];
+    let mut cur = head.clone();
+    for b in func.layout.blocks() {
+        if let Some(p) = domtree.idom(b) {
+            kids[cur[p] as usize] = b;
+            cur[p] += 1;
         }
     }
     let mut fs: Vec<Cmp> = Vec::new();
     let mut env: FxHashMap<Value, u64> = FxHashMap::default();
     let mut undo: Vec<Value> = Vec::new();
     let mut folds = Vec::new();
+    // Scratch reused per block — `fs`/`eqs` views and the `alts` lists
+    // were three small Vec allocs per factful block per iteration.
+    let mut fsv: Vec<Cmp> = Vec::new();
+    let mut eqs: Vec<(Value, Value)> = Vec::new();
+    let mut av: Vec<Value> = Vec::new();
+    let mut bv: Vec<Value> = Vec::new();
     // (block, fs_mark, undo_mark, exiting) — enter pushes the block's
     // own facts after recording marks, exit truncates back to them.
     let mut stack: Vec<(Block, usize, usize, bool)> = func
@@ -3513,31 +3578,33 @@ fn dominated_conds(
             }
         }
         stack.push((b, fmark, umark, true));
-        for &c in children.get(&b).into_iter().flatten() {
+        for &c in &kids[head[b] as usize..head[b] as usize + deg[b] as usize] {
             stack.push((c, 0, 0, false));
         }
         if !range2 && fs.is_empty() && env.is_empty() {
             continue;
         }
         // Nearest-ancestor-first, as `facts_at` produced.
-        let fsv: Vec<Cmp> = fs.iter().rev().copied().collect();
+        fsv.clear();
+        fsv.extend(fs.iter().rev().copied());
         let fs = fsv.as_slice();
         // `x == y` facts let a query on `y` be decided through `x`.
-        let eqs: Vec<(Value, Value)> = fs
-            .iter()
-            .filter(|f| f.0 == IntCC::Equal)
-            .map(|f| (f.1, f.2))
-            .collect();
-        let alts = |v: Value| {
-            let mut a = vec![v];
+        eqs.clear();
+        eqs.extend(
+            fs.iter()
+                .filter(|f| f.0 == IntCC::Equal)
+                .map(|f| (f.1, f.2)),
+        );
+        let alts = |scratch: &mut Vec<Value>, v: Value| {
+            scratch.clear();
+            scratch.push(v);
             for &(x, y) in &eqs {
                 if x == v {
-                    a.push(y);
+                    scratch.push(y);
                 } else if y == v {
-                    a.push(x);
+                    scratch.push(x);
                 }
             }
-            a
         };
         let decide = |q: Cmp| -> Option<bool> {
             if let Some(r) = fs.iter().find_map(|&f| implied(f, q)) {
@@ -3561,10 +3628,14 @@ fn dominated_conds(
             let Some(q) = norm_icmp(func, i) else {
                 continue;
             };
-            let r = alts(q.1)
-                .into_iter()
-                .flat_map(|a| alts(q.2).into_iter().map(move |b| (q.0, a, b)))
-                .find_map(decide);
+            alts(&mut av, q.1);
+            let r = av.iter().copied().find_map(|a| {
+                alts(&mut bv, q.2);
+                bv.iter()
+                    .copied()
+                    .map(|b| (q.0, a, b))
+                    .find_map(decide)
+            });
             if let Some(k) = r {
                 folds.push((i, k));
             }
@@ -3577,7 +3648,11 @@ fn dominated_conds(
 /// the param itself) become aliases of `v`. Threading's SSA repair creates
 /// these, and Cranelift only removes them after our condition folding ran, so
 /// the same value seen through two params would not match a dominating test.
-pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Value, Value)> {
+pub fn remove_trivial_params(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+) -> Vec<(Value, Value)> {
     #[derive(Clone, Copy, PartialEq)]
     enum In {
         Unset,
@@ -3585,42 +3660,51 @@ pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Va
         Many,
     }
     let entry = func.layout.entry_block();
+    // Only a block with params can yield a removal: visit just its
+    // in-edges (from the caller's CFG) rather than folding over every
+    // edge in the function.
     let mut inc: FxHashMap<Block, Vec<In>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        let Some(t) = func.layout.last_inst(b) else {
+    for s in func.layout.blocks() {
+        if Some(s) == entry {
             continue;
-        };
-        let fixed = matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif);
-        for bc in
-            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-        {
-            let s = bc.block(&func.dfg.value_lists);
-            let params = func.dfg.block_params(s);
-            let st = inc
-                .entry(s)
-                .or_insert_with(|| vec![In::Unset; params.len()]);
-            if !fixed {
+        }
+        let params = func.dfg.block_params(s);
+        if params.is_empty() {
+            continue;
+        }
+        let mut st = vec![In::Unset; params.len()];
+        for pred in cfg.pred_iter(s) {
+            let t = pred.inst;
+            if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
                 st.iter_mut().for_each(|x| *x = In::Many);
-                continue;
+                break;
             }
-            for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
-                let new = match a {
-                    BlockArg::Value(v) => {
-                        let v = func.dfg.resolve_aliases(v);
-                        if v == params[i] {
-                            continue;
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                if bc.block(&func.dfg.value_lists) != s {
+                    continue;
+                }
+                for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
+                    let new = match a {
+                        BlockArg::Value(v) => {
+                            let v = func.dfg.resolve_aliases(v);
+                            if v == params[i] {
+                                continue;
+                            }
+                            In::One(v)
                         }
-                        In::One(v)
-                    }
-                    _ => In::Many,
-                };
-                st[i] = match (st[i], new) {
-                    (In::Unset, x) => x,
-                    (In::One(a), In::One(b)) if a == b => In::One(a),
-                    _ => In::Many,
-                };
+                        _ => In::Many,
+                    };
+                    st[i] = match (st[i], new) {
+                        (In::Unset, x) => x,
+                        (In::One(a), In::One(b)) if a == b => In::One(a),
+                        _ => In::Many,
+                    };
+                }
             }
         }
+        inc.insert(s, st);
     }
     let def_block = |func: &Function, v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
@@ -3640,7 +3724,7 @@ pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Va
             if let In::One(v) = *s
                 && let Some(d) = def_block(func, v)
                 && d != b
-                && dt.dominates(d, b, &func.layout)
+                && dt.try_dominates(d, b, &func.layout)
             {
                 rm.push((b, i, ps[i], v));
             }
@@ -3708,37 +3792,49 @@ fn mark_live_param(
     }
 }
 
-pub fn remove_dead_params(func: &mut Function) -> usize {
+pub fn remove_dead_params(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut live: FxHashMap<Block, Vec<bool>> = blocks
         .iter()
         .map(|&block| (block, vec![false; func.dfg.num_block_params(block)]))
         .collect();
     let mut protected: FxHashSet<Block> = func.layout.entry_block().into_iter().collect();
-    let mut preds: FxHashMap<Block, Vec<Vec<BlockArg>>> = FxHashMap::default();
-    let mut insts = Vec::new();
+    // In-edges come from the caller's CFG (`pred_iter`) instead of a
+    // per-edge (inst, dest) map built here every round. Edge args are
+    // re-read on demand, so edges whose target never marks a live param
+    // don't pay for a Vec<BlockArg> each.
+    let mut work = Vec::new();
 
     for &block in &blocks {
         for inst in func.layout.block_insts(block) {
-            insts.push(inst);
             let data = &func.dfg.insts[inst];
-            for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            for call in
+                data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
                 let target = call.block(&func.dfg.value_lists);
-                let args: Vec<BlockArg> = call.args(&func.dfg.value_lists).collect();
-                if args.iter().any(|arg| !matches!(arg, BlockArg::Value(_))) {
+                if call
+                    .args(&func.dfg.value_lists)
+                    .any(|arg| !matches!(arg, BlockArg::Value(_)))
+                {
                     protected.insert(target);
                 }
-                preds.entry(target).or_default().push(args);
+            }
+            for &value in func.dfg.inst_args(inst) {
+                mark_live_param(func, value, &mut live, &mut work);
             }
             if let Some(table) = data.exception_table() {
                 for target in func.dfg.exception_tables[table].all_branches() {
                     protected.insert(target.block(&func.dfg.value_lists));
                 }
+                for item in func.dfg.exception_tables[table].items() {
+                    if let ExceptionTableItem::Context(value) = item {
+                        mark_live_param(func, value, &mut live, &mut work);
+                    }
+                }
             }
         }
     }
 
-    let mut work = Vec::new();
     for &block in &blocks {
         if protected.contains(&block) {
             for (index, is_live) in live.get_mut(&block).unwrap().iter_mut().enumerate() {
@@ -3749,26 +3845,19 @@ pub fn remove_dead_params(func: &mut Function) -> usize {
             }
         }
     }
-    for inst in &insts {
-        for &value in func.dfg.inst_args(*inst) {
-            mark_live_param(func, value, &mut live, &mut work);
-        }
-        if let Some(table) = func.dfg.insts[*inst].exception_table() {
-            for item in func.dfg.exception_tables[table].items() {
-                if let ExceptionTableItem::Context(value) = item {
-                    mark_live_param(func, value, &mut live, &mut work);
-                }
-            }
-        }
-    }
 
     while let Some((target, index)) = work.pop() {
-        let Some(incoming) = preds.get(&target) else {
-            continue;
-        };
-        for args in incoming {
-            if let Some(BlockArg::Value(value)) = args.get(index).copied() {
-                mark_live_param(func, value, &mut live, &mut work);
+        for pred in cfg.pred_iter(target) {
+            for bc in func.dfg.insts[pred.inst].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                if bc.block(&func.dfg.value_lists) != target {
+                    continue;
+                }
+                if let Some(BlockArg::Value(value)) = bc.args(&func.dfg.value_lists).nth(index) {
+                    mark_live_param(func, value, &mut live, &mut work);
+                }
             }
         }
     }
@@ -3934,21 +4023,61 @@ pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
     })
 }
 
+/// `fold_null_tests` behind a fresh `TESTC` check: every fold starts
+/// from an `icmp` on an `iconst`, so without that shape the whole call
+/// — and the `NonNull` fixpoint it needs — is dead work.
+fn cfg_dt(func: &Function) -> (ControlFlowGraph, DominatorTree) {
+    let c = ControlFlowGraph::with_function(func);
+    let d = DominatorTree::with_function(func, &c);
+    (c, d)
+}
+
+fn fnn<'a>(
+    func: &mut Function,
+    loads: &'a FxHashSet<Value>,
+    derived: &'a FxHashMap<Value, Value>,
+    nn: Option<NonNull<'a>>,
+    cd: &mut Option<(ControlFlowGraph, DominatorTree)>,
+) -> usize {
+    if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
+        return 0;
+    }
+    let nn = match nn {
+        Some(nn) => nn,
+        None => {
+            let (c, _) = cd.get_or_insert_with(|| cfg_dt(func));
+            NonNull::new(func, c, loads, derived)
+        }
+    };
+    fold_null_tests(func, &nn)
+}
+
 /// Thread until nothing changes (bounded); returns the edges retargeted.
 pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
     derived: &mut FxHashMap<Value, Value>,
+    sh: u32,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
+    use crate::pipeline::shape;
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
-    let mut tp = std::time::Instant::now();
-    merge_chains(func);
+    let mut tp = prof.then(std::time::Instant::now);
+    // Sub-phase guards use the entry-time `shape` bits: no phase below
+    // can create the first edge (MULTI), block param (BPARAM), or
+    // conditional branch (CONDBR) — they only remove them — so an
+    // absent bit stays absent and a present bit merely over-admits a
+    // no-op scan. JUMP/TESTC *can* appear (domcond folds `brif`→`jump`,
+    // threading rewrites args to `iconst`), but nothing below consumes
+    // a stale-false JUMP and `fnn` checks TESTC fresh when it runs.
+    if sh & shape::JUMP != 0 {
+        merge_chains(func);
+    }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
-        tp = std::time::Instant::now();
+        tp = Some(std::time::Instant::now());
     }
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
@@ -3975,11 +4104,6 @@ pub fn run(
     // (trivp, deadp, domcond, inst sweeps) leave block adjacency intact,
     // while ifconv/bypass/round retarget edges and force a rebuild.
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
-    let cfg_dt = |func: &Function| {
-        let c = ControlFlowGraph::with_function(func);
-        let d = DominatorTree::with_function(func, &c);
-        (c, d)
-    };
     // `round` builds NonNull lazily on the first real candidate edge — a
     // quiet round never pays for the fixpoint. `derived` mutates across
     // iterations (ifconv), so the Option is per-iteration; when the loop
@@ -3995,12 +4119,12 @@ pub fn run(
     let mut round_quiet = false;
     let mut round_skips = 0usize;
     for _ in 0..8 {
-        let mut tp = std::time::Instant::now();
+        let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
-        if trivp {
+        if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
             let v = {
-                let (_, d) = cd.get_or_insert_with(|| cfg_dt(func));
-                remove_trivial_params(func, d)
+                let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+                remove_trivial_params(func, c, d)
             };
             changed = !v.is_empty();
             pmap.extend(v);
@@ -4008,12 +4132,15 @@ pub fn run(
         }
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
-        if deadp {
-            let removed = remove_dead_params(func);
+        if deadp && sh & shape::BPARAM != 0 {
+            let removed = {
+                let (c, _) = cd.get_or_insert_with(|| cfg_dt(func));
+                remove_dead_params(func, c)
+            };
             dead_params += removed;
             if removed != 0 {
                 remove_unused_notrap_loads(func);
@@ -4023,11 +4150,11 @@ pub fn run(
         }
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
-        let dc = if domcond {
+        let dc = if domcond && sh & shape::CONDBR != 0 {
             let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
             fold_dominated_conds_at(func, c, d)
         } else {
@@ -4038,16 +4165,20 @@ pub fn run(
         check(func, "domcond");
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
         // Select-diamond if-conversion feeds back: folded forwarders expose
         // new diamonds and bypass_forwarders collapses the residue. The dead
         // side blocks keep phantom CFG edges (skewing dominance checks), so
         // sweep them once unreachable.
-        let ic = if ifconv {
-            crate::ifconv::run(func, derived)
+        let ic = if ifconv && sh & shape::CONDBR != 0 {
+            crate::ifconv::run(
+                func,
+                derived,
+                cd.as_mut().map(|(c, d)| (&mut *c, &mut *d)),
+            )
         } else {
             0
         };
@@ -4058,7 +4189,11 @@ pub fn run(
             remove_unreachable_blocks(func);
         }
         check(func, "unreach");
-        let bpn = bypass_forwarders(func);
+        let bpn = if sh & shape::MULTI != 0 {
+            bypass_forwarders(func, cd.as_ref().map(|(c, d)| (&*c, &*d)))
+        } else {
+            0
+        };
         check(func, "bypass");
         if bpn > 0 {
             changed = true;
@@ -4068,12 +4203,12 @@ pub fn run(
         }
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
         let mut nn_opt = None;
-        let rn = if round_quiet && !changed {
+        let rn = if sh & shape::CONDBR == 0 || (round_quiet && !changed) {
             round_skips += 1;
             0
         } else {
@@ -4084,7 +4219,7 @@ pub fn run(
         check(func, "round");
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
         }
         if rn > 0 {
@@ -4093,26 +4228,25 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
-            fnn_cur = Some(fold_null_tests(
-                func,
-                &nn_opt.unwrap_or_else(|| NonNull::new(func, loads, derived)),
-            ));
+            fnn_cur = Some(fnn(func, loads, derived, nn_opt, &mut cd));
             break;
         }
+        // No refresh needed: the guarded bits can only shrink inside
+        // this loop, so `sh` stays a sound over-approximation.
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.elapsed())
+            tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
-        tp = std::time::Instant::now();
+        tp = Some(std::time::Instant::now());
     }
     let fnn = match fnn_cur {
         Some(x) => x,
-        None => fold_null_tests(func, &NonNull::new(func, loads, derived)),
+        None => fnn(func, loads, derived, None, &mut cd),
     };
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
     (total + fnn, dead_params, dominated_folds, pmap)
@@ -4121,6 +4255,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::remove_dead_params;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -4163,7 +4298,8 @@ mod tests {
             (loop_block, exit_block)
         };
 
-        assert_eq!(remove_dead_params(&mut func), 1);
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(remove_dead_params(&mut func, &cfg), 1);
         assert_eq!(func.dfg.num_block_params(loop_block), 1);
         assert_eq!(func.dfg.num_block_params(exit_block), 1);
         for block in func.layout.blocks() {

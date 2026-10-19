@@ -672,7 +672,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
             let (ctx, const_array) = field_vals.iter().enumerate().try_fold(
                 (ctx, undef_op.get_operation()),
                 |(ctx, acc), (field_idx, field_val)| -> Result<_> {
-                    let acc_val = acc.deref(ctx).get_result(0);
+                    let acc_val = acc.deref(ctx).get_result(ctx, 0);
                     let insert_op = InsertValueOp::new(
                         ctx,
                         acc_val,
@@ -686,7 +686,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
             )?;
 
             cctx.value_map
-                .insert(val, const_array.deref(ctx).get_result(0));
+                .insert(val, const_array.deref(ctx).get_result(ctx, 0));
         }
         LLVMValueKind::LLVMConstantStructValueKind => {
             if const_llvm_value_to_const_op(ctx, cctx, val)? {
@@ -708,7 +708,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
             let (ctx, const_struct) = field_vals.iter().enumerate().try_fold(
                 (ctx, undef_op.get_operation()),
                 |(ctx, acc), (field_idx, field_val)| -> Result<_> {
-                    let acc_val = acc.deref(ctx).get_result(0);
+                    let acc_val = acc.deref(ctx).get_result(ctx, 0);
                     let insert_op = InsertValueOp::new(
                         ctx,
                         acc_val,
@@ -722,7 +722,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
             )?;
 
             cctx.value_map
-                .insert(val, const_struct.deref(ctx).get_result(0));
+                .insert(val, const_struct.deref(ctx).get_result(ctx, 0));
         }
         LLVMValueKind::LLVMConstantExprValueKind => {
             let opcode = llvm_get_const_opcode(val);
@@ -880,7 +880,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
             let const_vector = element_vals.iter().enumerate().try_fold(
                 undef_op.get_operation(),
                 |acc, (elem_idx, elem_val)| -> Result<_> {
-                    let acc_val = acc.deref(ctx).get_result(0);
+                    let acc_val = acc.deref(ctx).get_result(ctx, 0);
                     // The index needs to be a [Value], so we create a ConstantOp for it.
                     let idx_attr = IntegerAttr::new(
                         ty_int32,
@@ -888,7 +888,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
                     );
                     let idx_const_op = ConstantOp::new(ctx, Box::new(idx_attr)).get_operation();
                     insert_const_inst(ctx, cctx, idx_const_op);
-                    let idx_val = idx_const_op.deref(ctx).get_result(0);
+                    let idx_val = idx_const_op.deref(ctx).get_result(ctx, 0);
                     let insert_op =
                         InsertElementOp::new(ctx, acc_val, *elem_val, idx_val).get_operation();
                     insert_const_inst(ctx, cctx, insert_op);
@@ -896,7 +896,7 @@ fn process_constant(ctx: &mut Context, cctx: &mut ConversionContext, val: LLVMVa
                 },
             )?;
             cctx.value_map
-                .insert(val, const_vector.deref(ctx).get_result(0));
+                .insert(val, const_vector.deref(ctx).get_result(ctx, 0));
         }
         LLVMValueKind::LLVMBlockAddressValueKind => {
             let function = llvm_get_block_address_function(val);
@@ -1727,12 +1727,12 @@ fn convert_block(
             let ty = convert_type(ctx, cctx, llvm_type_of(inst))?;
             let arg_idx = BasicBlock::push_argument(m_block, ctx, ty);
             cctx.value_map
-                .insert(inst, m_block.deref(ctx).get_argument(arg_idx));
+                .insert(inst, m_block.deref(ctx).get_argument(ctx, arg_idx));
         } else {
             let m_inst = convert_instruction(ctx, cctx, inst)?;
             inserter.insert_operation(ctx, m_inst);
             convert_instruction_metadata(ctx, cctx, module, inst, m_inst)?;
-            let m_inst_result = m_inst.deref(ctx).results().next();
+            let m_inst_result = m_inst.deref(ctx).results(ctx).next();
             // LLVM instructions have at most one result.
             if let Some(result) = m_inst_result {
                 let res_name = llvm_get_value_name(inst)
@@ -1801,7 +1801,7 @@ fn convert_function(
         let m_entry_block_ref = m_entry_block.deref(ctx);
         // Map function args to entry block args.
         for (arg_idx, arg) in param_iter(function).enumerate() {
-            val_map.insert(arg, m_entry_block_ref.get_argument(arg_idx));
+            val_map.insert(arg, m_entry_block_ref.get_argument(ctx, arg_idx));
         }
     }
 

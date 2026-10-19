@@ -454,7 +454,7 @@ fn split_block_after_const_zero() -> Result<()> {
 
             // Insert constant 1 in the new block at the start
             let const1_op = ConstantOp::new(ctx, 1).get_operation();
-            let const1_result = const1_op.deref(ctx).get_result(0);
+            let const1_result = const1_op.deref(ctx).get_result(ctx, 0);
             rewriter.set_insertion_point(OpInsertionPoint::AtBlockStart(new_block));
             rewriter.insert_operation(ctx, const1_op);
             // Modify the return operation in the new block to return constant 1
@@ -533,7 +533,7 @@ fn inline_region_on_const_zero() -> Result<()> {
         ) -> Result<()> {
             let func_op = op.deref(ctx).get_parent_op(ctx).unwrap();
             // Get the region from the matched function
-            let region = func_op.deref(ctx).get_region(0);
+            let region = func_op.deref(ctx).get_region(ctx, 0);
 
             // Inline the region at the end of the second function's block
             rewriter.inline_region(

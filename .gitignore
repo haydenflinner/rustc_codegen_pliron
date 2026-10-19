@@ -3,3 +3,4 @@ rustc-ice-*.txt
 __pycache__/
 examples/bevy-game/target-*/
 selfhost/libpliron_prof_rt.a
+.pliron-src-rev

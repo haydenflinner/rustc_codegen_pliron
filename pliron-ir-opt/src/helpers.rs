@@ -2,9 +2,10 @@
 
 use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
 use pliron::value::Value;
-use pliron_llvm::ops::FuncOp;
+use pliron_llvm::ops::{AddressOfOp, FuncOp};
 
 use crate::state::{ConstVal, State};
 
@@ -20,10 +21,30 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
         }
     }
     let mut taken = FxHashSet::default();
-    for (v, c) in &st.consts {
+    for (v, c) in st.consts.iter() {
         if let ConstVal::Sym { sym, .. } = c {
-            if v.is_used(ctx) || escaped.contains(v) {
+            if v.is_used(ctx) || escaped.contains(&v) {
                 taken.insert(sym.clone());
+            }
+        }
+    }
+    // `llvm.addressof` ops produce fn-ptr values the codegen-time
+    // `st.consts` never saw (they're created by iropt rewrites or fed
+    // through aliases `is_used` can't see on the original const).
+    for f in st.funcs.values() {
+        if !has_body(ctx, f.op) {
+            continue;
+        }
+        for b in crate::inline::blocks(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                if let Some(a) = Operation::get_op::<AddressOfOp>(op, ctx) {
+                    let id = a.get_global_name(ctx);
+                    if let Some(sym) =
+                        st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref()))
+                    {
+                        taken.insert(sym.clone());
+                    }
+                }
             }
         }
     }
@@ -36,6 +57,38 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
     taken
 }
 
+/// `has_body` and selected by `PLIRON_OPT_FNS` — the filter for passes
+/// that rewrite a function's own body (never for call-site scans).
+pub fn opt_body(ctx: &Context, st: &State, f: Ptr<Operation>) -> bool {
+    has_body(ctx, f) && !st.opt_skip.contains(&f)
+}
+
+/// Fill `st.opt_skip` from `PLIRON_OPT_FNS` (no-op when unset).
+pub fn opt_skip_init(ctx: &Context, st: &mut State) {
+    if pliron_cfg::env_get("PLIRON_OPT_FNS").is_none() {
+        return;
+    }
+    st.opt_skip = st
+        .funcs
+        .iter()
+        .filter(|(n, f)| has_body(ctx, f.op) && !pliron_cfg::fn_opt_selected(n))
+        .map(|(_, f)| f.op)
+        .collect();
+}
+
+/// `f`'s symbol for `bisect_in` logs — only looked up while
+/// `PLIRON_OPT_BISECT` is set (a linear scan of `st.funcs`).
+pub fn bisect_name(st: &State, f: Ptr<Operation>) -> String {
+    if pliron_cfg::bisect_limit().is_none() {
+        return String::new();
+    }
+    st.funcs
+        .iter()
+        .find(|(_, i)| i.op == f)
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default()
+}
+
 pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
     Operation::get_op::<FuncOp>(f, ctx)
         .unwrap()
@@ -44,11 +97,17 @@ pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
 }
 
 /// Functions the bottom-up analyses infer facts for: bodied and not
-/// preemptible (an interposed definition could do anything).
+/// preemptible (an interposed definition could do anything). ODR-linked
+/// bodies (`f.odr`) are the exception: every emitted copy of the symbol
+/// is semantically identical, so facts inferred here apply to whichever
+/// copy a call binds.
 pub fn bodied(ctx: &Context, st: &State) -> Vec<String> {
     st.funcs
         .iter()
-        .filter(|(_, f)| f.linkage != cranelift_module::Linkage::Preemptible && has_body(ctx, f.op))
+        .filter(|(_, f)| {
+            (f.linkage != cranelift_module::Linkage::Preemptible || f.odr)
+                && has_body(ctx, f.op)
+        })
         .map(|(s, _)| s.clone())
         .collect()
 }
@@ -92,8 +151,8 @@ pub fn erase_unreachable(
             continue;
         }
         for op in ops_of(b) {
-            wl.extend(op.deref(ctx).successors());
-            if let Some(&(l, _)) = st.invokes.get(&op) {
+            wl.extend(op.deref(ctx).successors(ctx));
+            if let Some(&(l, _)) = st.invokes.get(op) {
                 wl.push(l);
             }
         }
@@ -105,12 +164,12 @@ pub fn erase_unreachable(
         .collect();
     for &b in &dead {
         for op in ops_of(b) {
-            st.calls.remove(&op);
-            st.invokes.remove(&op);
-            st.intrinsics.remove(&op);
-            st.volatile.remove(&op);
-            st.rmw.remove(&op);
-            st.nonnull.remove(&op);
+            st.calls.remove(op);
+            st.invokes.remove(op);
+            st.intrinsics.remove(op);
+            st.volatile.remove(op);
+            st.rmw.remove(op);
+            st.nonnull.remove(op);
         }
         BasicBlock::drop_all_uses(b, ctx);
     }

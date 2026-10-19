@@ -161,13 +161,13 @@ impl SccpState {
     /// by marking each of their entry blocks as Reachable and each of their
     /// entry blocks' arguments as NotAConstant.
     pub(super) fn seed_nested_regions(&mut self, op: Ptr<Operation>, ctx: &Context) {
-        let regions: Vec<_> = op.deref(ctx).regions().collect();
+        let regions: Vec<_> = op.deref(ctx).regions(ctx).collect();
         for region in regions {
             let Some(entry) = region.deref(ctx).get_head() else {
                 continue;
             };
             self.merge_block_state(ctx, entry, BlockState::Reachable);
-            let entry_args: Vec<Value> = entry.deref(ctx).arguments().collect();
+            let entry_args: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
             for arg in entry_args {
                 self.merge_val_state(ctx, arg, Constness::NotAConstant);
             }

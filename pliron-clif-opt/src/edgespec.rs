@@ -525,7 +525,7 @@ impl<'a> W<'a> {
                     let ib = self.func.layout.inst_block(i);
                     if let Some(b) = ib
                         && !skipped.contains(&b)
-                        && self.dom.dominates(i, self.pterm, &self.func.layout)
+                        && self.dom.try_dominates(i, self.pterm, &self.func.layout)
                     {
                         return Some(A::V(v));
                     }
@@ -675,7 +675,7 @@ impl<'a> W<'a> {
                 ConeDef::Param(b) => b,
                 ConeDef::Res(di, b) => {
                     if !skipped.contains(&b)
-                        && self.dom.dominates(di, self.pterm, &self.func.layout)
+                        && self.dom.try_dominates(di, self.pterm, &self.func.layout)
                     {
                         continue;
                     }
@@ -715,11 +715,11 @@ impl<'a> W<'a> {
     /// not be consumed anywhere downstream (`cone_ok`) and the carried args
     /// must not themselves be skipped defs that a re-walked binding would
     /// have refreshed.
-    fn fin_edge(&self, d: Block, args: Vec<Value>, skipped: &FxHashSet<Block>) -> Option<Edge> {
+    fn fin_edge(&self, d: Block, args: &[Value], skipped: &FxHashSet<Block>) -> Option<Edge> {
         if !self.cone_ok(d, skipped) {
             return None;
         }
-        for &a in &args {
+        for &a in args {
             let a = self.func.dfg.resolve_aliases(a);
             let db = match self.func.dfg.value_def(a) {
                 ValueDef::Param(b, _) => Some(b),
@@ -730,7 +730,9 @@ impl<'a> W<'a> {
                 return None;
             }
         }
-        Some(Edge::Fin(d, args))
+        // The Vec materializes only on the landing edge — every rejected
+        // candidate above used to pay a `clone` for nothing.
+        Some(Edge::Fin(d, args.to_vec()))
     }
 
     /// Follow an edge into `d` with `args`, folding through decided
@@ -750,14 +752,14 @@ impl<'a> W<'a> {
         skipped: &mut FxHashSet<Block>,
     ) -> Option<Edge> {
         if depth >= MAX_HOPS || !self.pure(d) {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
         if d == self.p {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
-        let params = self.func.dfg.block_params(d).to_vec();
+        let params = self.func.dfg.block_params(d);
         if params.len() != args.len() {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
         // Re-entering a walked block, or passing `d` one of its own params
         // (a loop header fed from inside the loop), would rebind a value
@@ -768,7 +770,7 @@ impl<'a> W<'a> {
                 .iter()
                 .any(|&a| params.contains(&subv(self.func, &sub, a)) || params.contains(&a))
         {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
         // `env`/`sub` arrive by value; this path owns them outright.
         let mut env = env;
@@ -802,7 +804,7 @@ impl<'a> W<'a> {
                 skipped.insert(d);
                 let r = self.resolve($env, $sub, $nb, $nargs, depth + 1, split_ok, skipped);
                 skipped.remove(&d);
-                r.or_else(|| self.fin_edge(d, args.clone(), skipped))
+                r.or_else(|| self.fin_edge(d, &args, skipped))
             }};
         }
         match self.func.dfg.insts[term] {
@@ -812,7 +814,7 @@ impl<'a> W<'a> {
             }
             InstructionData::Brif { arg: c, blocks, .. } => {
                 match eval(self.func, &mut env, &sub, c, 0) {
-                    E::Unk | E::B(..) => self.fin_edge(d, args, skipped),
+                    E::Unk | E::B(..) => self.fin_edge(d, &args, skipped),
                     E::K(k) => {
                         let (nb, nargs) = self.map_call(blocks[usize::from(k == 0)], &sub)?;
                         go!(env, sub, nb, nargs)
@@ -829,12 +831,12 @@ impl<'a> W<'a> {
                             return go!(env, sub, nb, nargs);
                         };
                         if !split_ok {
-                            return self.fin_edge(d, args, skipped);
+                            return self.fin_edge(d, &args, skipped);
                         }
                         skipped.insert(d);
                         let Some(cv) = self.avail_a(cv, &sub, skipped) else {
                             skipped.remove(&d);
-                            return self.fin_edge(d, args, skipped);
+                            return self.fin_edge(d, &args, skipped);
                         };
                         let (tb, ta) = self.map_call(tbc, &sub)?;
                         let (eb, ea) = self.map_call(ebc, &sub)?;
@@ -848,7 +850,7 @@ impl<'a> W<'a> {
                                 false,
                                 skipped,
                             )
-                            .or_else(|| self.fin_edge(tb, ta, skipped));
+                            .or_else(|| self.fin_edge(tb, &ta, skipped));
                         let te = match te {
                             Some(te) => te,
                             None => {
@@ -858,7 +860,7 @@ impl<'a> W<'a> {
                         };
                         let ee = self
                             .resolve(env, sub, eb, ea.clone(), depth + 1, false, skipped)
-                            .or_else(|| self.fin_edge(eb, ea, skipped));
+                            .or_else(|| self.fin_edge(eb, &ea, skipped));
                         skipped.remove(&d);
                         Some(Edge::Br(cv, Box::new(te), Box::new(ee?)))
                     }
@@ -875,7 +877,7 @@ impl<'a> W<'a> {
                     }
                 };
                 match eval(self.func, &mut env, &sub, arg, 0) {
-                    E::Unk => self.fin_edge(d, args, skipped),
+                    E::Unk => self.fin_edge(d, &args, skipped),
                     E::K(k) => {
                         let (nb, nargs) = self.map_call(pick(k), &sub)?;
                         go!(env, sub, nb, nargs)
@@ -884,7 +886,7 @@ impl<'a> W<'a> {
                         skipped.insert(d);
                         let Some(cv) = self.avail_a(cv, &sub, skipped) else {
                             skipped.remove(&d);
-                            return self.fin_edge(d, args, skipped);
+                            return self.fin_edge(d, &args, skipped);
                         };
                         let (tb, ta) = self.map_call(pick(tv), &sub)?;
                         let (eb, ea) = self.map_call(pick(ev), &sub)?;
@@ -898,7 +900,7 @@ impl<'a> W<'a> {
                                 false,
                                 skipped,
                             )
-                            .or_else(|| self.fin_edge(tb, ta, skipped));
+                            .or_else(|| self.fin_edge(tb, &ta, skipped));
                         let te = match te {
                             Some(te) => te,
                             None => {
@@ -908,14 +910,14 @@ impl<'a> W<'a> {
                         };
                         let ee = self
                             .resolve(env, sub, eb, ea.clone(), depth + 1, false, skipped)
-                            .or_else(|| self.fin_edge(eb, ea, skipped));
+                            .or_else(|| self.fin_edge(eb, &ea, skipped));
                         skipped.remove(&d);
                         Some(Edge::Br(cv, Box::new(te), Box::new(ee?)))
                     }
-                    _ => self.fin_edge(d, args, skipped),
+                    _ => self.fin_edge(d, &args, skipped),
                 }
             }
-            _ => self.fin_edge(d, args, skipped),
+            _ => self.fin_edge(d, &args, skipped),
         }
     }
 }
@@ -1092,7 +1094,7 @@ fn prep_args(
             }
             ValueDef::Result(i, _) => {
                 let inst = func.dfg.insts[i];
-                if func.layout.inst_block(i).is_some() && dom.dominates(i, pterm, &func.layout) {
+                if func.layout.inst_block(i).is_some() && dom.try_dominates(i, pterm, &func.layout) {
                     out.push(A::V(v));
                 } else if let InstructionData::UnaryImm {
                     opcode: Opcode::Iconst,
@@ -1147,7 +1149,7 @@ pub fn sweep_dead(func: &mut Function) {
 pub fn run(func: &mut Function) -> usize {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::edgespec", tracing::Level::INFO);
-    let t0 = std::time::Instant::now();
+    let t0 = prof.then(std::time::Instant::now);
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
     // All-pure blocks — plans are collected before any apply, so this
@@ -1162,10 +1164,10 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     // Cones are CFG-invariant for the whole plans phase (no mutation until
     // apply); many preds land on the same dispatch blocks, so memoize.
     let cones = std::cell::RefCell::new(FxHashMap::default());
@@ -1187,10 +1189,10 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     let mut n = 0;
     let lim = crate::env_get("PLIRON_EDGESPEC_LIMIT").and_then(|s| s.parse::<usize>().ok());
     for (p, t, nt) in plans {
@@ -1239,35 +1241,49 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     if n > 0 {
         sweep_blocks(func);
         sweep_dead(func);
     }
-    n += splices(func);
-    if n > 0 {
+    // `n == 0` means nothing mutated since `cfg`/`dom` were built at the
+    // top — reuse them. Otherwise the walker redirects and sweeps
+    // changed edges/blocks: rebuild so dominance answers match the
+    // current graph.
+    let s = if n == 0 {
+        splices(func, &cfg, &dom)
+    } else {
+        let cfg2 = ControlFlowGraph::with_function(func);
+        let dom2 = DominatorTree::with_function(func, &cfg2);
+        splices(func, &cfg2, &dom2)
+    };
+    n += s;
+    if s > 0 {
         sweep_blocks(func);
         sweep_dead(func);
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     let d = deadbits(func);
     if d > 0 {
-        crate::jumpthread::remove_dead_params(func);
+        crate::jumpthread::remove_dead_params(
+            func,
+            &cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func),
+        );
         sweep_dead(func);
         sweep_blocks(func);
         n += d;
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
     n
@@ -1545,11 +1561,7 @@ fn deadbits(func: &mut Function) -> usize {
 /// bit and forwards the packed word onward. Each pred's tag is already
 /// constant (the merge only ever sets known bits), so the join and its test
 /// are pure overhead.
-fn splices(func: &mut Function) -> usize {
-    // The walker's redirects mutated the CFG since `run`'s domtree was
-    // built — recompute it so dominance answers match the current graph.
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+fn splices(func: &mut Function, cfg: &ControlFlowGraph, dom: &DominatorTree) -> usize {
     // Function-wide indexes, O(fn) each: value → blocks containing a use,
     // and block → its predecessor blocks. Built lazily past the cheap
     // rejections (they used to be rebuilt per candidate — O(candidates ×
@@ -1816,7 +1828,7 @@ fn splices(func: &mut Function) -> usize {
                     match func.dfg.value_def(av) {
                         ValueDef::Result(i, _)
                             if func.layout.inst_block(i) != Some(j)
-                                && dom.dominates(i, *pt, &func.layout) =>
+                                && dom.try_dominates(i, *pt, &func.layout) =>
                         {
                             new_args.push(BlockArg::Value(av))
                         }

@@ -413,14 +413,17 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `MInst.Extend`. Visible as `cset; uxtb` pairs on every
     bool-as-integer idiom (`(x == y) as i64`, `select c, 1, 0`).
 
-34. DFG alias epoch (`src/ir/dfg.rs`): `alias_epoch` counter bumped on
-    every alias write (`change_to_alias`, `replace_with_aliases`,
-    `make_value_alias_for_serialization`); tombstone writes and
-    same-root retargets (`compact_aliases`, `resolve_all_aliases`)
-    don't bump since they create no new resolvable pairs.
-    `carry_aliases` in the opt pipeline compares against its last-seen
-    epoch and skips the whole-`values()` scan on mutating steps that
-    created no aliases — ~1.5% of bench pipeline time.
+34. DFG alias epoch + write list (`src/ir/dfg.rs`): `alias_epoch`
+    counter bumped on every alias write (`change_to_alias`,
+    `replace_with_aliases`, `make_value_alias_for_serialization`);
+    tombstone writes and same-root retargets (`compact_aliases`,
+    `resolve_all_aliases`) don't bump since they create no new
+    resolvable pairs. `alias_dirty` records each write's `dest` in
+    order (duplicates kept), so `carry_aliases` scans only the
+    watermark backlog and `compact_aliases` walks writes instead of
+    the whole `values` table — the epoch early-out and
+    whole-`values()` scans were ~1.5% of bench pipeline time and the
+    backlog scan was ~2% of regex-syntax phaseB CPU.
 
 35. `imul.i8x16` x64 lowering (`src/isa/x64/lower.isle`, `inst.isle`,
     `lower/isle.rs`): upstream leaves i8x16 multiplication unimplemented
@@ -545,7 +548,16 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `fvdemote_f16_pair` -> `fcvtn` + `fcvtn2`). Used by the pliron
     lowerer's CubeCL path when `types::NATIVE_F16`/`F16C` are set.
 
-45. `LoopAnalysis::is_in_loop` O(1) (`src/loop_analysis.rs`): `compute`
+45. Exact `size_hint` on the layout iterators (`src/ir/layout.rs`):
+    `BlockNode` gains a per-block inst `count` and `Layout` gains a
+    `num_blocks` counter (maintained in append/insert/remove/split),
+    feeding `Blocks`/`Insts` `size_hint`/`ExactSizeIterator`. Passes
+    that snapshot `layout.block_insts(b).collect()`/`blocks().collect()`
+    were hitting `spec_from_iter_nested` growth — a ~1% leaf —
+    because the linked-list iterators reported `(0, None)`. The serde
+    round-trip rebuilds counts through the public insert path.
+
+46. `LoopAnalysis::is_in_loop` O(1) (`src/loop_analysis.rs`): `compute`
     now also assigns each loop an Euler-tour interval `[tin, tout)` over
     the loop forest (`assign_loop_intervals`); `is_in_loop` tests
     `tin[lp] <= tin[innermost(block)] < tout[lp]` instead of finger-
@@ -553,3 +565,77 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     (loop, block) pair inside `layout.blocks()` filters — O(loops ×
     blocks × depth) per pass — ~40k/2.65M leaf samples in the rustc
     profile.
+
+47. Seedable `cfg`/`domtree` in `Context::optimize` (`src/context.rs`):
+    the initial `compute_cfg`/`compute_domtree` pair is now guarded by
+    `is_valid()` — the pliron pipeline moves its own exact analyses
+    (built by `Analysis` on the final IR) into the context before
+    `compile`, so emit no longer rebuilds them per function. Paths
+    that mutate the function after seeding (the narrow-vector
+    `veclegalize` retry in pliron-clif-lower) must `clear()` both.
+
+48. Sub-128-bit vector ops in wide xmm regs (`src/isa/x64/lower.isle`):
+    an F32X2/F16X4 value lives in the low 64 bits of an xmm and only its
+    real lanes are observable, so the packed 128-bit op is used and the
+    high lanes carry unobservable garbage. Adds F32X2
+    fadd/fsub/fmul/fdiv/fsqrt/fneg/fabs/fmin/fmax rules, an `x64_round`
+    F32X2 arm (ceil/floor/nearest/trunc), F32X2 arms on all eight
+    vfmadd/vfnmadd/vfmsub/vfnmsub 213/132 decls (fma.f32x2 arrives via
+    the type-polymorphic fmadd rules), f32x2 pshufd extractlane +
+    f32x4_insertlane reuse, xmm `fvpromote_f16`/`fvdemote_f16` arms for
+    <4 x f16> <-> <4 x f32> (F16C), f16x4 pshuflw/pinsrw lane ops, and
+    F16X4 vaddph-family arms for AVX512-FP16 hosts. Lets
+    pliron-clif-lower's `simd_leaves` admit these 64-bit leaves; the
+    fmin/fmax helpers copy the F32X4 NaN-safe sequences verbatim.
+
+49. Per-function wide-xmm gating (`src/machinst/abi.rs`,
+    `src/isa/x64/abi.rs`): `Callee` records `has_wide_vector` (any CLIF
+    value whose vector type is >256 bits) computed in `new` from
+    `f.dfg.values()`, and `machine_env()` calls a new defaulted
+    `ABIMachineSpec::get_machine_env_for(has_wide, flags, call_conv)`.
+    On x64 it forces the hi=false env for functions with no >256-bit
+    values: when `wide_vector_bits() >= 512` offered all 32 zmm regs to
+    every function, regalloc parked narrow (<=256-bit) vregs in
+    zmm16-31 under pressure — those functions never need the regs for
+    their own ops — and the parked values read back corrupted
+    (observed: lanes 12-15 of each 64-byte region returned the
+    slot's chunk-0 bytes). Functions that actually manipulate 512-bit
+    data keep the wide env, so zmm codegen stays profitable where it
+    is used. The `high_xmm_regs()`/`WIDE_VECTOR_BITS` knobs are
+    unchanged — they cap the maximum, this patch gates it per fn.
+
+50. `src/machinst/blockorder.rs`: the chained-order successor pick prefers
+    a block that is itself a loop latch (its terminator reaches back to a
+    dominator — `is_latch`) over a non-latch of the same rank; in-count
+    breaks remaining ties as before. Placing the latch right after the
+    loop head puts the hot continuation on the not-taken edge of the
+    head's `brif`, so each iteration pays only the latch's own back-edge
+    branch instead of an extra taken branch to reach the arm block
+    (LLVM's latch-before-head shape; ~25% on a per-element
+    `filter().count()` loop). `PLIRON_BCHAIN_DEBUG` prints pick
+    decisions.
+
+51. OnceLock-cached `PLIRON_*` env reads (`src/context.rs`,
+    `src/machinst/{vcode,lower,compile,abi,blockorder}.rs`,
+    `src/isa/aarch64/lower.rs`, `src/isa/x64/abi.rs`): debug/gate
+    env vars that were re-read via `std::env::var{,_os}` per inst,
+    per block, or per function are now read once into `OnceLock`
+    statics (`PLIRON_POSTIDX_DEBUG`, `PLIRON_COMPILE_EGRAPH`,
+    `PLIRON_POSTOPT`, `PLIRON_LUDEBUG`, `PLIRON_REMATSINK_DEBUG`,
+    `PLIRON_STATS`, `PLIRON_PRECOMPILE`, `PLIRON_ALIGN`,
+    `PLIRON_LOWER_DEBUG`, `PLIRON_FN_DUMP`, `PLIRON_FP_FNS`,
+    `PLIRON_FP_RANGE`, `PLIRON_PREVCODE`, `PLIRON_RA2_VERBOSE`,
+    `PLIRON_RA2_EDITS`, `PLIRON_BCHAIN_DEBUG`, `PLIRON_NO_FREE_RBP`,
+    `PLIRON_HI_ALWAYS`). `std::env::var` takes the process env lock
+    per call — a backend-codegen profile showed ~11% of samples in
+    `getenv`/lock waits even after the workspace-side reads were
+    cached.
+
+52. Conditional domtree recompute after the egraph (`src/context.rs`,
+    `src/egraph/mod.rs`): `EgraphPass::run` now returns
+    `remove_pure_and_optimize`'s `cfg_maybe_changed`. The pass already
+    recomputes `cfg` itself when it rewrites a terminator and
+    `eliminate_unreachable_code` maintains it through block removal, so
+    `Context::egraph_pass` no longer recomputes `cfg` unconditionally
+    and recomputes `domtree` only when edges actually moved — about
+    1.4s of analysis rebuilds per bench build was unconditional.

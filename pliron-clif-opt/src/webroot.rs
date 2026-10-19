@@ -50,7 +50,7 @@ pub const ANY: i64 = i64::MIN;
 /// a slot member silently — that could hide an escape).
 const MAX_SLOTS: usize = 16;
 /// Fixpoint iteration bound.
-const MAX_ROUNDS: usize = 16;
+const MAX_ROUNDS: usize = 64;
 /// Structural-eval recursion bound.
 const MAX_DEPTH: usize = 32;
 
@@ -109,6 +109,9 @@ impl Web {
                 }
             }
             self.slots = by_slot;
+            if self.slots.len() > MAX_SLOTS && pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::webroot", "webroot: poisoned on MAX_SLOTS ({} slots)", self.slots.len());
+            }
             if self.slots.len() > MAX_SLOTS {
                 poisoned.set(true);
             }
@@ -293,14 +296,19 @@ impl Webs {
         }
         // Param fixpoint: `pw[p]` = union over in-edge args' webs. The
         // iteration must converge — an early-stopped least fixpoint
-        // under-approximates and would hide escapes.
+        // under-approximates and would hide escapes. Accumulate into the
+        // existing web rather than replacing: eval of a not-yet-computed
+        // dep param yields `other`, so wholesale replacement can shrink
+        // a web and oscillate; joining is monotone and keeps slot
+        // members once seen (over-approximation is sound — `other`
+        // never counts as a slot escape).
         let mut rounds = 0;
         loop {
             rounds += 1;
             let mut changed = false;
             for (b, es) in w.edges.iter() {
                 for (k, &p) in func.dfg.block_params(*b).iter().enumerate() {
-                    let mut nw = Web::default();
+                    let mut nw = w.pw.get(&p).cloned().unwrap_or_default();
                     for e in es {
                         if let Some(Some(a)) = e.args.get(k) {
                             nw.join(&w.eval(func, *a, 0), &w.poisoned);
@@ -316,6 +324,9 @@ impl Webs {
                 break;
             }
             if rounds >= MAX_ROUNDS {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::webroot", "webroot: poisoned on MAX_ROUNDS ({})", func.name);
+                }
                 w.poisoned.set(true);
                 break;
             }
@@ -406,6 +417,9 @@ impl Webs {
 
     fn at_in(&self, func: &Function, v: Value, b: Block, d: usize) -> Web {
         if d > MAX_DEPTH {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::webroot", "webroot: poisoned on at_in MAX_DEPTH ({})", func.name);
+            }
             self.poisoned.set(true);
             return Web::other();
         }
@@ -456,7 +470,7 @@ impl Webs {
             if let Some(es) = self.edges.get(&blk) {
                 'e: for e in es {
                     for (j, eb) in eps.iter() {
-                        if !eb.iter().any(|&e| self.dt.dominates(e, b, &func.layout)) {
+                        if !eb.iter().any(|&e| self.dt.try_dominates(e, b, &func.layout)) {
                             continue;
                         }
                         let Some(&Some(a)) = e.args.get(*j) else {
@@ -527,6 +541,9 @@ impl Webs {
     /// params).
     fn eval(&self, func: &Function, v: Value, d: usize) -> Web {
         if d > MAX_DEPTH {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::webroot", "webroot: poisoned on eval MAX_DEPTH ({})", func.name);
+            }
             self.poisoned.set(true);
             return Web::other();
         }

@@ -18,6 +18,7 @@ use pliron::utils::apint::APInt;
 use pliron_llvm::op_interfaces::CastOpInterface;
 use pliron_llvm::ops::*;
 use pliron_llvm::types::{VectorType, VectorTypeKind};
+use cranelift_codegen::ir::types as clt;
 
 fn vec_of(ctx: &Context, t: TypeHandle) -> Option<(TypeHandle, u32)> {
     t.deref(ctx)
@@ -62,8 +63,8 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
     }
     let o = op.deref(ctx);
     let tys: Vec<_> = o
-        .operands()
-        .chain([o.get_result(0)])
+        .operands(ctx)
+        .chain([o.get_result(ctx, 0)])
         .map(|v| v.get_type(ctx))
         .collect();
     let bfv = tys
@@ -92,7 +93,14 @@ fn native_leafwise(ctx: &Context, op: Ptr<Operation>) -> bool {
 fn simd_leaves(ctx: &Context, t: TypeHandle) -> bool {
     vec_of(ctx, t).is_none() || {
         let l = crate::types::leaves(ctx, t);
-        !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() >= 128)
+        // 64-bit leaves are admitted only where the vendored x64 lowering
+        // really covers them (PLIRON 48): F32X2 packed-float ops + the
+        // F16X4 packed-convert container (whose non-cast ops still split).
+        !l.is_empty()
+            && l.iter().all(|x| {
+                x.1.is_vector()
+                    && (x.1.bits() >= 128 || matches!(x.1, clt::F32X2 | clt::F16X4))
+            })
     }
 }
 
@@ -125,7 +133,7 @@ fn bf16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
     {
         return false;
     }
-    let t = op.deref(ctx).get_result(0).get_type(ctx);
+    let t = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
     match vec_of(ctx, t) {
         Some((e, n)) if is_bf16(ctx, e) => {
             if lane_op {
@@ -158,16 +166,16 @@ fn idx(ctx: &mut Context, i: u32, before: Ptr<Operation>) -> pliron::value::Valu
     let a = IntegerAttr::new(t, APInt::from_u64(i.into(), 32.try_into().unwrap()));
     let c = ConstantOp::new(ctx, Box::new(a)).get_operation();
     c.insert_before(ctx, before);
-    c.deref(ctx).get_result(0)
+    c.deref(ctx).get_result(ctx, 0)
 }
 
 fn split(ctx: &mut Context, op: Ptr<Operation>, ety: TypeHandle, n: u32) {
-    let vty = op.deref(ctx).get_result(0).get_type(ctx);
-    let opnds: Vec<_> = op.deref(ctx).operands().collect();
+    let vty = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
+    let opnds: Vec<_> = op.deref(ctx).operands(ctx).collect();
     let mut rw = IRRewriter::<DummyListener>::default();
     let p = PoisonOp::new(ctx, vty).get_operation();
     p.insert_before(ctx, op);
-    let mut acc = p.deref(ctx).get_result(0);
+    let mut acc = p.deref(ctx).get_result(ctx, 0);
     for i in 0..n {
         let ix = idx(ctx, i, op);
         let mut map = IrMapping::new();
@@ -175,18 +183,18 @@ fn split(ctx: &mut Context, op: Ptr<Operation>, ety: TypeHandle, n: u32) {
             if vec_of(ctx, v.get_type(ctx)).is_some() {
                 let e = ExtractElementOp::new(ctx, v, ix).get_operation();
                 e.insert_before(ctx, op);
-                map.map_value(v, e.deref(ctx).get_result(0));
+                map.map_value(v, e.deref(ctx).get_result(ctx, 0));
             }
         }
         let s = clone_operation(op, ctx, &mut rw, &mut map);
-        let lane = s.deref(ctx).get_result(0);
+        let lane = s.deref(ctx).get_result(ctx, 0);
         lane.set_type(ctx, ety);
         s.insert_before(ctx, op);
         let ins = InsertElementOp::new(ctx, acc, lane, ix).get_operation();
         ins.insert_before(ctx, op);
-        acc = ins.deref(ctx).get_result(0);
+        acc = ins.deref(ctx).get_result(ctx, 0);
     }
-    let old = op.deref(ctx).get_result(0);
+    let old = op.deref(ctx).get_result(ctx, 0);
     old.replace_all_uses_with(ctx, &acc);
     Operation::erase(op, ctx);
 }
@@ -198,13 +206,13 @@ fn shuffle(ctx: &mut Context, op: Ptr<Operation>) {
     let mask = sv.get_attr_llvm_shuffle_vector_mask(ctx).unwrap().0.clone();
     let (a, b) = {
         let o = op.deref(ctx);
-        (o.get_operand(0), o.get_operand(1))
+        (o.get_operand(ctx, 0), o.get_operand(ctx, 1))
     };
     let na = vec_of(ctx, a.get_type(ctx)).unwrap().1 as i32;
-    let vty = op.deref(ctx).get_result(0).get_type(ctx);
+    let vty = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
     let p = PoisonOp::new(ctx, vty).get_operation();
     p.insert_before(ctx, op);
-    let mut acc = p.deref(ctx).get_result(0);
+    let mut acc = p.deref(ctx).get_result(ctx, 0);
     for (i, &m) in mask.iter().enumerate() {
         if m < 0 {
             continue;
@@ -213,13 +221,13 @@ fn shuffle(ctx: &mut Context, op: Ptr<Operation>) {
         let jx = idx(ctx, j as u32, op);
         let e = ExtractElementOp::new(ctx, src, jx).get_operation();
         e.insert_before(ctx, op);
-        let lane = e.deref(ctx).get_result(0);
+        let lane = e.deref(ctx).get_result(ctx, 0);
         let ix = idx(ctx, i as u32, op);
         let ins = InsertElementOp::new(ctx, acc, lane, ix).get_operation();
         ins.insert_before(ctx, op);
-        acc = ins.deref(ctx).get_result(0);
+        acc = ins.deref(ctx).get_result(ctx, 0);
     }
-    let old = op.deref(ctx).get_result(0);
+    let old = op.deref(ctx).get_result(ctx, 0);
     old.replace_all_uses_with(ctx, &acc);
     Operation::erase(op, ctx);
 }
@@ -311,11 +319,16 @@ fn f16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
     if !lane_op && native_f16() && f16_native_arith(ctx, op) {
         return false;
     }
-    let t = op.deref(ctx).get_result(0).get_type(ctx);
+    let t = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
     match vec_of(ctx, t) {
         Some((e, n)) if e.deref(ctx).is::<FP16Type>() => {
+            // Promote when the <n x f32> twin is itself natively lowered —
+            // 256-bit-wide leaves for large n as before, and now F32X4/F32X2
+            // leaves for n == 4/2 (their casts are the packed F16C converts
+            // or per-lane converts into native f32x2 inserts).
             let f32t: TypeHandle = FP32Type::get(ctx).into();
-            crate::types::wide_f32_candidate(ctx, f32t, n as u64)
+            let vt: TypeHandle = VectorType::get(ctx, f32t, n, VectorTypeKind::Fixed).into();
+            simd_leaves(ctx, vt)
         }
         _ => false,
     }
@@ -327,7 +340,7 @@ fn promote_with(
     has_bf16: fn(&Context, TypeHandle) -> bool,
     widen_bf16: fn(&mut Context, TypeHandle) -> TypeHandle,
 ) {
-    let opnds: Vec<_> = op.deref(ctx).operands().collect();
+    let opnds: Vec<_> = op.deref(ctx).operands(ctx).collect();
     let mut map = IrMapping::new();
     for &v in &opnds {
         let t = v.get_type(ctx);
@@ -335,21 +348,21 @@ fn promote_with(
             let f32t = widen_bf16(ctx, t);
             let e = FPExtOp::new(ctx, v, f32t).get_operation();
             e.insert_before(ctx, op);
-            map.map_value(v, e.deref(ctx).get_result(0));
+            map.map_value(v, e.deref(ctx).get_result(ctx, 0));
         }
     }
     let mut rw = IRRewriter::<DummyListener>::default();
     let s = clone_operation(op, ctx, &mut rw, &mut map);
     s.insert_before(ctx, op);
-    let old = op.deref(ctx).get_result(0);
-    let mut new = s.deref(ctx).get_result(0);
+    let old = op.deref(ctx).get_result(ctx, 0);
+    let mut new = s.deref(ctx).get_result(ctx, 0);
     let rt = old.get_type(ctx);
     if has_bf16(ctx, rt) {
         let f32t = widen_bf16(ctx, rt);
         new.set_type(ctx, f32t);
         let t = FPTruncOp::new(ctx, new, rt).get_operation();
         t.insert_before(ctx, op);
-        new = t.deref(ctx).get_result(0);
+        new = t.deref(ctx).get_result(ctx, 0);
     }
     old.replace_all_uses_with(ctx, &new);
     Operation::erase(op, ctx);
@@ -358,7 +371,7 @@ fn promote_with(
 /// Vector bf16/f16 arithmetic -> f32 twins (before [`plan_wide`]).
 pub fn promote(ctx: &mut Context, func: Ptr<Operation>) {
     let mut hfv = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for &r in &regions {
         let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
         for b in blocks {
@@ -370,7 +383,7 @@ pub fn promote(ctx: &mut Context, func: Ptr<Operation>) {
         promote_with(ctx, op, is_f16_any, widen_f16_any);
     }
     let mut bfv = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for &r in &regions {
         let blocks: Vec<_> = r.deref(ctx).iter(ctx).collect();
         for b in blocks {
@@ -387,7 +400,7 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     promote(ctx, func);
     let mut todo = Vec::new();
     let mut shuffles = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for r in regions {
         for b in r.deref(ctx).iter(ctx) {
             for op in b.deref(ctx).iter(ctx) {
@@ -399,7 +412,7 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
                 if o.get_num_results() != 1 {
                     continue;
                 }
-                if let Some((e, n)) = vec_of(ctx, o.get_result(0).get_type(ctx)) {
+                if let Some((e, n)) = vec_of(ctx, o.get_result(ctx, 0).get_type(ctx)) {
                     if elementwise(ctx, op) && !native_leafwise(ctx, op) {
                         todo.push((op, e, n));
                     }
@@ -414,7 +427,7 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
         split(ctx, op, e, n);
     }
     let mut bf = Vec::new();
-    let regions: Vec<_> = func.deref(ctx).regions().collect();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
     for r in regions {
         for b in r.deref(ctx).iter(ctx) {
             for op in b.deref(ctx).iter(ctx) {
@@ -422,8 +435,8 @@ pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
                 if o.get_num_results() != 1 || !bf16_arith(ctx, op) {
                     continue;
                 }
-                if o.operands()
-                    .chain([o.get_result(0)])
+                if o.operands(ctx)
+                    .chain([o.get_result(ctx, 0)])
                     .any(|v| is_bf16(ctx, v.get_type(ctx)))
                 {
                     bf.push(op);
@@ -491,9 +504,9 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
         }
     };
     for &f in funcs {
-        for r in f.deref(ctx).regions() {
+        for r in f.deref(ctx).regions(ctx) {
             for (i, b) in r.deref(ctx).iter(ctx).enumerate() {
-                for a in b.deref(ctx).arguments() {
+                for a in b.deref(ctx).arguments(ctx) {
                     note(ctx, a.get_type(ctx), i != 0, i != 0);
                 }
                 for op in b.deref(ctx).iter(ctx) {
@@ -506,8 +519,8 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
                         && tracing::enabled!(target: "pliron::scalarize", tracing::Level::DEBUG)
                         && op
                             .deref(ctx)
-                            .operands()
-                            .chain(op.deref(ctx).results())
+                            .operands(ctx)
+                            .chain(op.deref(ctx).results(ctx))
                             .any(|v| {
                                 vec_of(ctx, v.get_type(ctx))
                                     .is_some_and(|(e, _)| e == f16h || e == bf16h)
@@ -518,7 +531,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
                         };
                     }
                     let o = op.deref(ctx);
-                    for v in o.operands().chain(o.results()) {
+                    for v in o.operands(ctx).chain(o.results(ctx)) {
                         note(ctx, v.get_type(ctx), good, good16);
                     }
                 }
@@ -539,7 +552,7 @@ pub fn plan_wide(ctx: &mut Context, funcs: &[Ptr<Operation>]) {
 fn will_split(ctx: &Context, op: Ptr<Operation>) -> bool {
     Operation::get_op::<ShuffleVectorOp>(op, ctx).is_some()
         || (op.deref(ctx).get_num_results() == 1
-            && vec_of(ctx, op.deref(ctx).get_result(0).get_type(ctx)).is_some()
+            && vec_of(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).is_some()
             && elementwise(ctx, op)
             && !native_leafwise(ctx, op))
 }

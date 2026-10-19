@@ -128,16 +128,16 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     let (concrete_op, result_types, successors, num_operands, num_regions, attributes, loc) = {
         let op_ref = op.deref(ctx);
         let successors: Vec<Ptr<BasicBlock>> = op_ref
-            .successors()
+            .successors(ctx)
             .map(|b| mapper.lookup_block_or_default(b))
             .collect();
         (
             op_ref.concrete_op_info(),
-            op_ref.result_types().collect::<Vec<_>>(),
+            op_ref.result_types(ctx).collect::<Vec<_>>(),
             successors,
             op_ref.get_num_operands(),
             op_ref.num_regions(),
-            op_ref.attributes.clone(),
+            op_ref.attributes().clone(),
             op_ref.loc(),
         )
     };
@@ -153,7 +153,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     );
     {
         let mut new_ref = new_op.deref_mut(ctx);
-        new_ref.attributes = attributes;
+        *new_ref.attributes_mut() = attributes;
         new_ref.set_loc(loc);
     }
 
@@ -161,7 +161,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     mapper.map_op(op, new_op);
     let old_ref = op.deref(ctx);
     let new_ref = new_op.deref(ctx);
-    for (old, new) in old_ref.results().zip(new_ref.results()) {
+    for (old, new) in old_ref.results(ctx).zip(new_ref.results(ctx)) {
         mapper.map_value(old, new);
     }
 
@@ -180,22 +180,21 @@ fn fill_operation(
         .lookup_op(op)
         .expect("op shell must be created before it is filled");
 
-    // Operands, remapped through the now-complete mapping and pushed in order.
+    // Operands, remapped through the now-complete mapping, set in one
+    // rewrite — a push per operand would rebuild the pool span each time.
     let operands: Vec<Value> = op
         .deref(ctx)
-        .operands()
+        .operands(ctx)
         .map(|v| mapper.lookup_value_or_default(v))
         .collect();
-    for operand in operands {
-        Operation::push_operand(new_op, ctx, operand);
-    }
+    Operation::set_operands(new_op, ctx, operands);
 
     // Clone the blocks of each region into the corresponding (empty) region of
     // the clone.
     let num_regions = op.deref(ctx).num_regions();
     for region_idx in 0..num_regions {
-        let src_region = op.deref(ctx).get_region(region_idx);
-        let dest_region = new_op.deref(ctx).get_region(region_idx);
+        let src_region = op.deref(ctx).get_region(ctx, region_idx);
+        let dest_region = new_op.deref(ctx).get_region(ctx, region_idx);
         clone_region_into(src_region, dest_region, ctx, rewriter, mapper);
     }
 }
@@ -237,11 +236,11 @@ pub fn clone_blocks_into(
     for &src_block in blocks {
         let (arg_types, label, attrs, loc) = {
             let block_ref = src_block.deref(ctx);
-            let arg_types: Vec<_> = block_ref.arguments().map(|arg| arg.get_type(ctx)).collect();
+            let arg_types: Vec<_> = block_ref.arguments(ctx).map(|arg| arg.get_type(ctx)).collect();
             (
                 arg_types,
                 block_ref.label.clone(),
-                block_ref.attributes.clone(),
+                block_ref.attributes().clone(),
                 block_ref.loc(),
             )
         };
@@ -254,13 +253,13 @@ pub fn clone_blocks_into(
 
         {
             let mut new_ref = new_block.deref_mut(ctx);
-            new_ref.attributes = attrs;
+            *new_ref.attributes_mut() = attrs;
             new_ref.set_loc(loc);
         }
 
         let src_ref = src_block.deref(ctx);
         let new_ref = new_block.deref(ctx);
-        for (old, new) in src_ref.arguments().zip(new_ref.arguments()) {
+        for (old, new) in src_ref.arguments(ctx).zip(new_ref.arguments(ctx)) {
             mapper.map_value(old, new);
         }
 

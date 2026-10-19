@@ -92,16 +92,44 @@ pub struct Context {
     /// `deref`.
     pub(crate) op_kind:
         RefCell<Vec<(u64, crate::op::ConcreteOpInfo)>>,
+    /// PLIRON: global pool of region ids owned by [Operation]s — each op
+    /// stores an [`crate::operation::OpSpan`] into this Vec instead of an
+    /// inline list (DoD step 5). Length changes append a new span and
+    /// orphan the old one; CGU-scoped lifetimes keep the garbage bounded.
+    pub(crate) op_region_pool: RefCell<Vec<Ptr<Region>>>,
+    /// PLIRON: flat pool of op successor operand nodes (DoD step 5).
+    pub(crate) op_successor_pool:
+        RefCell<Vec<crate::operation::Operand<Ptr<BasicBlock>>>>,
+    /// PLIRON: flat pool of op result nodes (DoD step 5).
+    pub(crate) op_result_pool: RefCell<Vec<crate::operation::OpResult>>,
+    /// PLIRON: flat pool of op operand nodes (DoD step 5).
+    pub(crate) op_operand_pool:
+        RefCell<Vec<crate::operation::Operand<crate::value::Value>>>,
+    /// PLIRON: flat pool of block-argument nodes (DoD step 5).
+    pub(crate) block_arg_pool:
+        RefCell<Vec<crate::basic_block::BlockArgument>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
     pub(crate) type_store: UniqueStore<TypeObj>,
     /// Storage for other uniqued objects.
     pub(crate) uniqued_any_store: UniqueStore<UniquedAny>,
+    /// PLIRON: storage for interned [crate::attribute::AttrObj]s.
+    /// `AttributeDict` maps [Identifier] keys to `AttrInstId` indices
+    /// into this store instead of owning a `Box<dyn Attribute>` per
+    /// entry; the store deduplicates via `hash_attr`/`eq_attr`, so
+    /// identical attributes are shared across ops and dict clones are
+    /// shallow index copies.
+    pub(crate) attr_store: UniqueStore<crate::attribute::AttrEntry>,
     /// Arbitrary data storage. Use [Self::aux_data_map] for dictionary access.
     pub aux_data: SlotMap<AuxDataIndex, Box<dyn Any + Send>>,
     /// A dictionary with keys mapping to an index in [Self::aux_data].
     pub aux_data_map: HMap<Identifier, AuxDataIndex>,
+    /// PLIRON: memo for IR-level type layout queries. [TypeHandle] indices
+    /// are Context-scoped and types are immutable once interned (a
+    /// `deref_mut` mutation may not change hash/layout-relevant contents),
+    /// so the result is exact for the Context's lifetime.
+    pub ty_size_align: RefCell<HMap<crate::r#type::TypeHandle, (u64, u64)>>,
 }
 
 impl Context {
@@ -142,11 +170,18 @@ impl Default for Context {
             op_links: RefCell::new(Vec::new()),
             block_links: RefCell::new(Vec::new()),
             op_kind: RefCell::new(Vec::new()),
+            op_region_pool: RefCell::new(Vec::new()),
+            op_successor_pool: RefCell::new(Vec::new()),
+            op_result_pool: RefCell::new(Vec::new()),
+            op_operand_pool: RefCell::new(Vec::new()),
+            block_arg_pool: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),
+            attr_store: UniqueStore::default(),
             aux_data: SlotMap::with_key(),
             aux_data_map: HMap::default(),
+            ty_size_align: RefCell::new(HMap::default()),
         };
 
         // Verify that all dictionary keys are unique.
@@ -277,6 +312,16 @@ impl<'a, T: ArenaObj> Ptr<T> {
             .ok_or_else(|| arg_error_noloc!(DanglingPtrDerefError))?
             .try_borrow_mut()
             .map_err(|err| arg_error_noloc!(err))
+    }
+
+    /// PLIRON: dense arena slot ordinal (`ArenaIndex` index component,
+    /// low 32 of `as_ffi`) — indexes the columnar side tables
+    /// (`pliron_ir_opt::state::ColMap`/`ColSet`). Includes no version
+    /// bits: callers storing the `Ptr` itself (as column entries do)
+    /// detect stale slots by key equality.
+    #[inline]
+    pub fn ord(&self) -> usize {
+        self.idx.ffi() as u32 as usize
     }
 
     /// Create a unique (to the arena) name based on the arena index.

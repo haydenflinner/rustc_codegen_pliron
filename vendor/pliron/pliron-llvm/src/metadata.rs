@@ -578,8 +578,8 @@ pub fn get_metadata_table(ctx: &Context, module_op: ModuleOp) -> Option<MdTableA
     module_op
         .get_operation()
         .deref(ctx)
-        .attributes
-        .get::<MdTableAttr>(&ATTR_KEY_MD_TABLE)
+        .attributes()
+        .get::<MdTableAttr>(ctx, &ATTR_KEY_MD_TABLE)
         .cloned()
 }
 
@@ -588,8 +588,8 @@ pub fn set_metadata_table(ctx: &Context, module_op: ModuleOp, table: MdTableAttr
     module_op
         .get_operation()
         .deref_mut(ctx)
-        .attributes
-        .set(ATTR_KEY_MD_TABLE.clone(), table);
+        .attributes_mut()
+        .set(ctx, ATTR_KEY_MD_TABLE.clone(), table);
 }
 
 /// Get the named metadata of `module_op`.
@@ -597,8 +597,8 @@ pub fn get_named_metadata(ctx: &Context, module_op: ModuleOp) -> Option<NamedMdA
     module_op
         .get_operation()
         .deref(ctx)
-        .attributes
-        .get::<NamedMdAttr>(&ATTR_KEY_NAMED_MD)
+        .attributes()
+        .get::<NamedMdAttr>(ctx, &ATTR_KEY_NAMED_MD)
         .cloned()
 }
 
@@ -607,23 +607,23 @@ pub fn set_named_metadata(ctx: &Context, module_op: ModuleOp, named: NamedMdAttr
     module_op
         .get_operation()
         .deref_mut(ctx)
-        .attributes
-        .set(ATTR_KEY_NAMED_MD.clone(), named);
+        .attributes_mut()
+        .set(ctx, ATTR_KEY_NAMED_MD.clone(), named);
 }
 
 /// Get the metadata attached to `op`.
 pub fn get_attachments(ctx: &Context, op: Ptr<Operation>) -> Option<MdAttachmentsAttr> {
     op.deref(ctx)
-        .attributes
-        .get::<MdAttachmentsAttr>(&ATTR_KEY_MD_ATTACHMENTS)
+        .attributes()
+        .get::<MdAttachmentsAttr>(ctx, &ATTR_KEY_MD_ATTACHMENTS)
         .cloned()
 }
 
 /// Attach `attachments` to `op`, replacing whatever was attached to it.
 pub fn set_attachments(ctx: &Context, op: Ptr<Operation>, attachments: MdAttachmentsAttr) {
     op.deref_mut(ctx)
-        .attributes
-        .set(ATTR_KEY_MD_ATTACHMENTS.clone(), attachments);
+        .attributes_mut()
+        .set(ctx, ATTR_KEY_MD_ATTACHMENTS.clone(), attachments);
 }
 
 /// Attach the node `node` to `op` under the LLVM metadata kind `kind`.

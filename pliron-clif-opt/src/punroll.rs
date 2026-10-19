@@ -323,6 +323,8 @@ pub fn run(
     } else {
         &empty_prof
     };
+    let jam_on = crate::pass_enabled("PLIRON_JAM");
+    let peel_on = crate::pass_enabled("PLIRON_PEEL");
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut normed: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
@@ -351,7 +353,7 @@ pub fn run(
             // linear inner chain gets J fused copies before punroll can
             // disturb the inner loop's shape. Jammed loop headers join
             // `tried` so a rescan doesn't re-jam the same outer loop.
-            if crate::pass_enabled("PLIRON_JAM") {
+            if jam_on {
                 for lp in loops.iter().copied() {
                     let h = la.loop_header(lp);
                     if tried.contains(&h) {
@@ -413,7 +415,7 @@ pub fn run(
                     hit = true;
                     break; // cfg/la stale; rescan
                 }
-                if crate::pass_enabled("PLIRON_PEEL")
+                if peel_on
                     && run_peel(func, cfg, dt, la, lp, h, name).is_some()
                 {
                     n += 1;
@@ -651,7 +653,7 @@ fn find_count(
             if !cfg
                 .pred_iter(h)
                 .filter(|p| !body.contains(&p.block))
-                .all(|p| dt.dominates(bi, p.inst, &func.layout))
+                .all(|p| dt.try_dominates(bi, p.inst, &func.layout))
             {
                 continue;
             }
@@ -668,7 +670,7 @@ fn find_count(
                 // never dominate the header, so loop-carried values are
                 // still rejected.)
                 cranelift_codegen::ir::ValueDef::Param(bb, _)
-                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
+                    if bb != h && dt.try_dominates(bb, h, &func.layout) => {}
                 _ => continue,
             }
         }
@@ -1183,7 +1185,12 @@ fn run_loop(
         rotated,
         body,
     } = walk(func, cfg, dt, la, lp, h, name)?;
-    if loop_uses_vectors(func, &chain) {
+    // `PLIRON_PUNROLL_VEC=1`: allow unrolling loops that touch vector
+    // values. The `loop_uses_vectors` rationale assumes vector work is
+    // already vf-wide in the element domain — but a streaming-store loop
+    // (cubecl memory_write: 2x256b stores/iter) still amortizes its loop
+    // overhead exactly like LLVM's 4x unroll of the same loop.
+    if loop_uses_vectors(func, &chain) && !vec_on() {
         bail!("vector-typed loop");
     }
     let n_insts = body_insts(func, &chain);
@@ -1702,6 +1709,14 @@ fn run_loop(
 /// vf*UNROLL-wide in the element domain; cloning the body again pays a
 /// fresh group guard per K*vf*UNROLL elements for no benefit and pessi-
 /// mizes addressing (post-index forms get cloned into reg+imm offsets).
+/// `PLIRON_PUNROLL_VEC=1` lifts the `loop_uses_vectors` bail — see the
+/// call site comment.
+fn vec_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PLIRON_PUNROLL_VEC").is_some_and(|v| v != "0"));
+    *ON
+}
+
 fn loop_uses_vectors(func: &Function, blocks: &[Block]) -> bool {
     blocks.iter().any(|&b| {
         func.dfg
@@ -1915,7 +1930,7 @@ pub(crate) fn latch_count(
             if !cfg
                 .pred_iter(h)
                 .filter(|p| !body.contains(&p.block))
-                .all(|p| dt.dominates(bi, p.inst, &func.layout))
+                .all(|p| dt.try_dominates(bi, p.inst, &func.layout))
             {
                 return None;
             }
@@ -1933,7 +1948,7 @@ pub(crate) fn latch_count(
                     bpidx = Some(q);
                 }
                 cranelift_codegen::ir::ValueDef::Param(bb, _)
-                    if bb != h && dt.dominates(bb, h, &func.layout) => {}
+                    if bb != h && dt.try_dominates(bb, h, &func.layout) => {}
                 _ => return None,
             }
         }

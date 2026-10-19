@@ -530,8 +530,8 @@ impl DialectConversion for ForwardOnlyConversion {
         op: Ptr<Operation>,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
-        let succ = op.deref(ctx).get_successor(0);
-        let succ_arg = succ.deref(ctx).get_argument(0);
+        let succ = op.deref(ctx).get_successor(ctx, 0);
+        let succ_arg = succ.deref(ctx).get_argument(ctx, 0);
         let succ_arg_width = succ_arg
             .get_type(ctx)
             .deref(ctx)
@@ -554,7 +554,7 @@ fn dialect_conversion_block_arg_type_conversion() -> Result<()> {
     let body = module.get_body(ctx, 0);
     let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed).into();
     let arg_idx = BasicBlock::push_argument(body, ctx, i64_ty);
-    let block_arg = body.deref(ctx).get_argument(arg_idx);
+    let block_arg = body.deref(ctx).get_argument(ctx, arg_idx);
 
     let consumer = ConsumerOp::new(ctx, block_arg);
     consumer.get_operation().insert_at_back(body, ctx);
@@ -589,7 +589,7 @@ fn dialect_conversion_dead_block_arg_type_conversion() -> Result<()> {
     let mut conversion = ConsumerOnlyConversion::default();
     apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
 
-    let dead_arg = dead_block.deref(ctx).get_argument(0);
+    let dead_arg = dead_block.deref(ctx).get_argument(ctx, 0);
     let dead_arg_width = dead_arg
         .get_type(ctx)
         .deref(ctx)
@@ -628,7 +628,7 @@ fn dialect_conversion_successor_block_arg_type_conversion_without_uses() -> Resu
     apply_dialect_conversion(ctx, &mut conversion, module.get_operation())?;
     assert!(conversion.saw_forward);
 
-    let succ_arg = succ_block.deref(ctx).get_argument(0);
+    let succ_arg = succ_block.deref(ctx).get_argument(ctx, 0);
     let succ_arg_width = succ_arg
         .get_type(ctx)
         .deref(ctx)

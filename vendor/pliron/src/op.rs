@@ -417,18 +417,18 @@ pub fn canonical_syntax_print(
     let sep = printable::ListSeparator::CharSpace(',');
     let opid = op.as_ref().get_opid();
     let op = op.as_ref().get_operation().deref(ctx);
-    let operands = iter_with_sep(op.operands(), sep);
-    let successors = iter_with_sep_by(op.successors(), sep, |successor, ctx, state, f| {
+    let operands = iter_with_sep(op.operands(ctx), sep);
+    let successors = iter_with_sep_by(op.successors(ctx), sep, |successor, ctx, state, f| {
         write!(f, "^{}", successor.unique_name(ctx).print(ctx, state))
     });
     let op_type = TypeSig {
-        arguments: op.operands().map(|opd| opd.get_type(ctx)).collect(),
-        results: op.results().map(|res| res.get_type(ctx)).collect(),
+        arguments: op.operands(ctx).map(|opd| opd.get_type(ctx)).collect(),
+        results: op.results(ctx).map(|res| res.get_type(ctx)).collect(),
     };
-    let regions = iter_with_sep(op.regions(), printable::ListSeparator::Newline);
+    let regions = iter_with_sep(op.regions(ctx), printable::ListSeparator::Newline);
 
     if op.get_num_results() != 0 {
-        let results = iter_with_sep(op.results(), sep);
+        let results = iter_with_sep(op.results(ctx), sep);
         write!(f, "{} = ", results.print(ctx, state))?;
     }
 
@@ -438,7 +438,7 @@ pub fn canonical_syntax_print(
         opid.print(ctx, state),
         operands.print(ctx, state),
         successors.print(ctx, state),
-        op.attributes.clone_skip_outlined(ctx).print(ctx, state),
+        op.attributes().clone_skip_outlined(ctx).print(ctx, state),
         op_type.print(ctx, state),
     )?;
 
@@ -522,7 +522,7 @@ fn canonical_syntax_parse_impl<'a>(
                         successors.clone(),
                         0,
                     );
-                    opr.deref_mut(ctx).attributes = attr_dict.clone();
+                    *opr.deref_mut(ctx).attributes_mut() = attr_dict.clone();
                     process_parsed_ssa_defs(parsable_state, &results, opr)?;
                     Ok(opr).into_parse_result()
                 })

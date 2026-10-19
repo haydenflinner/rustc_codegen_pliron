@@ -64,7 +64,7 @@ use super::state::{BlockState, Constness, SccpState};
 /// Get the [Constness] of `op`'s operands as a vector of optional attributes.
 fn operand_attrs(op: Ptr<Operation>, ctx: &Context, state: &SccpState) -> Vec<Option<AttrObj>> {
     op.deref(ctx)
-        .operands()
+        .operands(ctx)
         .map(|v| match state.get_val_state(v) {
             Constness::Constant { val } => Some(val.clone()),
             Constness::NotAConstant => None,
@@ -83,7 +83,7 @@ fn operand_attrs(op: Ptr<Operation>, ctx: &Context, state: &SccpState) -> Vec<Op
 fn process_fold_op(fold_op: &dyn ConstFoldInterface, ctx: &Context, state: &mut SccpState) {
     let op = fold_op.get_operation();
     let attrs = operand_attrs(op, ctx, state);
-    let results: Vec<Value> = op.deref(ctx).results().collect();
+    let results: Vec<Value> = op.deref(ctx).results(ctx).collect();
     let folded_results = fold_op.check_fold(ctx, &attrs);
     for (res, attr) in results.iter().zip(folded_results) {
         let new_state = match attr {
@@ -110,16 +110,16 @@ fn process_branch_op(branch_op: &dyn BranchOpInterface, ctx: &Context, state: &m
                         weakening sccp optimization",
                     branch_op.disp(ctx)
                 );
-                op.deref(ctx).successors().collect()
+                op.deref(ctx).successors(ctx).collect()
             }
         };
-    let static_successors: Vec<Ptr<BasicBlock>> = op.deref(ctx).successors().collect();
+    let static_successors: Vec<Ptr<BasicBlock>> = op.deref(ctx).successors(ctx).collect();
     for (succ_idx, succ_block) in static_successors.into_iter().enumerate() {
         if !feasible_successors.contains(&succ_block) {
             continue;
         }
         let forwarded = branch_op.successor_operands(ctx, succ_idx);
-        let target_args: Vec<Value> = succ_block.deref(ctx).arguments().collect();
+        let target_args: Vec<Value> = succ_block.deref(ctx).arguments(ctx).collect();
         for (fwd_val, target_arg) in forwarded.into_iter().zip(target_args) {
             let incoming = state.get_val_state(fwd_val);
             state.merge_val_state(ctx, target_arg, incoming);
@@ -130,7 +130,7 @@ fn process_branch_op(branch_op: &dyn BranchOpInterface, ctx: &Context, state: &m
 
 /// Mark all `op`'s results as [Constness::NotAConstant].
 fn process_generic_op(op: Ptr<Operation>, ctx: &Context, state: &mut SccpState) {
-    let results: Vec<Value> = op.deref(ctx).results().collect();
+    let results: Vec<Value> = op.deref(ctx).results(ctx).collect();
     for res in results {
         state.merge_val_state(ctx, res, Constness::NotAConstant);
     }
@@ -220,7 +220,7 @@ pub fn sccp(root_op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
                 if !matches!(state.get_block_state(block), BlockState::Reachable) {
                     return;
                 }
-                for arg in block.deref(ctx).arguments() {
+                for arg in block.deref(ctx).arguments(ctx) {
                     if let Constness::Constant { val } = state.get_val_state(arg) {
                         const_args.push((block, arg, val));
                     }
@@ -280,7 +280,7 @@ pub fn sccp(root_op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
         let materialized_op = materializable.materialize(ctx);
         rewriter.set_insertion_point_to_block_start(block);
         rewriter.insert_operation(ctx, materialized_op);
-        let new_value = materialized_op.deref(ctx).get_result(0);
+        let new_value = materialized_op.deref(ctx).get_result(ctx, 0);
         rewriter.replace_value_uses_with(ctx, arg, new_value);
         status |= IRStatus::Changed;
     }

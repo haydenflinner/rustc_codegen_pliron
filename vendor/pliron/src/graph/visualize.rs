@@ -232,7 +232,7 @@ fn graphviz_callback(
                     format!("operation_{}", oper_index)
                 };
 
-            for region in op.deref(ctx).regions() {
+            for region in op.deref(ctx).regions(ctx) {
                 let entry_block_identifier: String = region
                     .deref(ctx)
                     .get_head()

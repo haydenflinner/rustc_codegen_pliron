@@ -93,7 +93,12 @@ impl Uses {
     /// resolved — an unresolved alias reads as unused, same as a hash
     /// lookup miss did.
     pub fn sites(&self, v: Value) -> &[(Block, Inst)] {
-        let i = v.index();
+        self.sites_idx(v.index())
+    }
+
+    /// `sites` by raw value index — callers that already hold
+    /// `.index()` of a resolved value.
+    pub fn sites_idx(&self, i: usize) -> &[(Block, Inst)] {
         if i + 1 < self.off.len() {
             &self.flat[self.off[i] as usize..self.off[i + 1] as usize]
         } else {

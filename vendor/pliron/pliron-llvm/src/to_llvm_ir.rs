@@ -567,7 +567,7 @@ macro_rules! to_llvm_value_int_bin_op {
                 cctx: &mut ConversionContext,
             ) -> Result<LLVMValue> {
                 let op = self.get_operation().deref(ctx);
-                let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+                let (lhs, rhs) = (op.get_operand(ctx, 0), op.get_operand(ctx, 1));
                 let lhs = convert_value_operand(cctx, ctx, &lhs)?;
                 let rhs = convert_value_operand(cctx, ctx, &rhs)?;
                 Ok($builder_function(
@@ -712,7 +712,7 @@ impl ToLLVMValue for BrOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let succ = op.get_successor(0);
+        let succ = op.get_successor(ctx, 0);
         let succ_llvm = convert_block_operand(cctx, ctx, succ)?;
         let branch_op = llvm_build_br(&cctx.builder, succ_llvm);
 
@@ -738,7 +738,7 @@ impl ToLLVMValue for CondBrOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (true_succ, false_succ) = (op.get_successor(0), op.get_successor(1));
+        let (true_succ, false_succ) = (op.get_successor(ctx, 0), op.get_successor(ctx, 1));
         let true_succ_llvm = convert_block_operand(cctx, ctx, true_succ)?;
         let false_succ_llvm = convert_block_operand(cctx, ctx, false_succ)?;
         let cond = convert_value_operand(cctx, ctx, &self.get_operand_condition(ctx))?;
@@ -927,7 +927,7 @@ impl ToLLVMValue for AtomicRmwOp {
     ) -> Result<LLVMValue> {
         let (ptr_opd, val_opd) = {
             let op = self.get_operation().deref(ctx);
-            (op.get_operand(0), op.get_operand(1))
+            (op.get_operand(ctx, 0), op.get_operand(ctx, 1))
         };
         let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
         let val = convert_value_operand(cctx, ctx, &val_opd)?;
@@ -964,7 +964,7 @@ impl ToLLVMValue for AtomicCmpxchgOp {
     ) -> Result<LLVMValue> {
         let (ptr_opd, cmp_opd, new_opd) = {
             let op = self.get_operation().deref(ctx);
-            (op.get_operand(0), op.get_operand(1), op.get_operand(2))
+            (op.get_operand(ctx, 0), op.get_operand(ctx, 1), op.get_operand(ctx, 2))
         };
         let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
         let cmp = convert_value_operand(cctx, ctx, &cmp_opd)?;
@@ -1022,7 +1022,7 @@ impl ToLLVMValue for AtomicLoadOp {
     ) -> Result<LLVMValue> {
         let (ptr_opd, result_val) = {
             let op = self.get_operation().deref(ctx);
-            (op.get_operand(0), op.get_result(0))
+            (op.get_operand(ctx, 0), op.get_result(ctx, 0))
         };
         let pointee_ty = convert_type(ctx, llvm_ctx, &mut cctx.types, result_val.get_type(ctx))?;
         let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
@@ -1057,7 +1057,7 @@ impl ToLLVMValue for AtomicStoreOp {
     ) -> Result<LLVMValue> {
         let (val_opd, ptr_opd) = {
             let op = self.get_operation().deref(ctx);
-            (op.get_operand(0), op.get_operand(1))
+            (op.get_operand(ctx, 0), op.get_operand(ctx, 1))
         };
         let value = convert_value_operand(cctx, ctx, &val_opd)?;
         let ptr = convert_value_operand(cctx, ctx, &ptr_opd)?;
@@ -1088,8 +1088,8 @@ impl ToLLVMValue for InlineAsmOp {
         let (arg_opds, result_val) = {
             let op = self.get_operation().deref(ctx);
             let n = op.get_num_operands();
-            let args: Vec<Value> = (0..n).map(|i| op.get_operand(i)).collect();
-            (args, op.get_result(0))
+            let args: Vec<Value> = (0..n).map(|i| op.get_operand(ctx, i)).collect();
+            (args, op.get_result(ctx, 0))
         };
         let args: Vec<LLVMValue> = arg_opds
             .iter()
@@ -1155,8 +1155,8 @@ impl ToLLVMValue for ICmpOp {
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
         let predicate = convert_ipredicate(self.predicate(ctx));
-        let lhs = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
-        let rhs = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let lhs = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
+        let rhs = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 1))?;
         let icmp_op = llvm_build_icmp(
             &cctx.builder,
             predicate,
@@ -1231,7 +1231,7 @@ impl ToLLVMValue for IntToPtrOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let inttoptr_op = llvm_build_int_to_ptr(
             &cctx.builder,
@@ -1252,7 +1252,7 @@ impl ToLLVMValue for PtrToIntOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let ptrtoint_op = llvm_build_ptr_to_int(
             &cctx.builder,
@@ -1358,7 +1358,7 @@ impl ToLLVMValue for FreezeOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let freeze_op = llvm_build_freeze(
             &cctx.builder,
             arg,
@@ -1428,7 +1428,7 @@ impl ToLLVMValue for CallIntrinsicOp {
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
         let args: Vec<_> = (0..op.get_num_operands())
-            .map(|i| convert_value_operand(cctx, ctx, &op.get_operand(i)))
+            .map(|i| convert_value_operand(cctx, ctx, &op.get_operand(ctx, i)))
             .collect::<Result<_>>()?;
         let fn_ty = convert_type(
             ctx,
@@ -1497,7 +1497,7 @@ impl ToLLVMValue for SExtOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let sext_op = llvm_build_sext(
             &cctx.builder,
@@ -1518,7 +1518,7 @@ impl ToLLVMValue for ZExtOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let zext_op = llvm_build_zext(
             &cctx.builder,
@@ -1544,7 +1544,7 @@ impl ToLLVMValue for TruncOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let trunc_op = llvm_build_trunc(
             &cctx.builder,
@@ -1601,8 +1601,8 @@ impl ToLLVMValue for InsertValueOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let base = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
-        let value = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let base = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
+        let value = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 1))?;
         let indices = self.indices(ctx);
         if indices.len() != 1 {
             return input_err!(op.loc(), ToLLVMErr::InsertExtractValueIndices);
@@ -1627,7 +1627,7 @@ impl ToLLVMValue for ExtractValueOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let base = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let base = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let indices = self.indices(ctx);
         if indices.len() != 1 {
             return input_err!(op.loc(), ToLLVMErr::InsertExtractValueIndices);
@@ -1697,8 +1697,8 @@ impl ToLLVMValue for ShuffleVectorOp {
             .expect("ShuffleVectorOp missing mask attribute")
             .0;
         let op = self.get_operation().deref(ctx);
-        let vec1 = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
-        let vec2 = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let vec1 = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
+        let vec2 = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 1))?;
         let int_ty = llvm_int_type_in_context(llvm_ctx, 32);
 
         let mask = mask
@@ -1727,9 +1727,9 @@ impl ToLLVMValue for SelectOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let cond = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
-        let true_val = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
-        let false_val = convert_value_operand(cctx, ctx, &op.get_operand(2))?;
+        let cond = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
+        let true_val = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 1))?;
+        let false_val = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 2))?;
         let select_op = llvm_build_select(
             &cctx.builder,
             cond,
@@ -1756,7 +1756,7 @@ impl ToLLVMValue for FAddOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let (lhs, rhs) = (op.get_operand(ctx, 0), op.get_operand(ctx, 1));
         let lhs = convert_value_operand(cctx, ctx, &lhs)?;
         let rhs = convert_value_operand(cctx, ctx, &rhs)?;
         let inst = llvm_build_fadd(
@@ -1783,7 +1783,7 @@ impl ToLLVMValue for FSubOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let (lhs, rhs) = (op.get_operand(ctx, 0), op.get_operand(ctx, 1));
         let lhs = convert_value_operand(cctx, ctx, &lhs)?;
         let rhs = convert_value_operand(cctx, ctx, &rhs)?;
         let inst = llvm_build_fsub(
@@ -1810,7 +1810,7 @@ impl ToLLVMValue for FMulOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let (lhs, rhs) = (op.get_operand(ctx, 0), op.get_operand(ctx, 1));
         let lhs = convert_value_operand(cctx, ctx, &lhs)?;
         let rhs = convert_value_operand(cctx, ctx, &rhs)?;
         let inst = llvm_build_fmul(
@@ -1837,7 +1837,7 @@ impl ToLLVMValue for FDivOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let (lhs, rhs) = (op.get_operand(ctx, 0), op.get_operand(ctx, 1));
         let lhs = convert_value_operand(cctx, ctx, &lhs)?;
         let rhs = convert_value_operand(cctx, ctx, &rhs)?;
         let inst = llvm_build_fdiv(
@@ -1864,7 +1864,7 @@ impl ToLLVMValue for FRemOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let (lhs, rhs) = (op.get_operand(0), op.get_operand(1));
+        let (lhs, rhs) = (op.get_operand(ctx, 0), op.get_operand(ctx, 1));
         let lhs = convert_value_operand(cctx, ctx, &lhs)?;
         let rhs = convert_value_operand(cctx, ctx, &rhs)?;
         let inst = llvm_build_frem(
@@ -1892,8 +1892,8 @@ impl ToLLVMValue for FCmpOp {
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
         let predicate = convert_fpredicate(self.predicate(ctx));
-        let lhs = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
-        let rhs = convert_value_operand(cctx, ctx, &op.get_operand(1))?;
+        let lhs = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
+        let rhs = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 1))?;
         let fcmp_op = llvm_build_fcmp(
             &cctx.builder,
             predicate,
@@ -1919,7 +1919,7 @@ impl ToLLVMValue for FNegOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let inst = llvm_build_fneg(
             &cctx.builder,
             arg,
@@ -1943,7 +1943,7 @@ impl ToLLVMValue for FPExtOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let fpext_op = llvm_build_fpext(
             &cctx.builder,
@@ -1969,7 +1969,7 @@ impl ToLLVMValue for FPTruncOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let fptrunc_op = llvm_build_fptrunc(
             &cctx.builder,
@@ -1994,7 +1994,7 @@ impl ToLLVMValue for FPToSIOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let fptosi_op = llvm_build_fptosi(
             &cctx.builder,
@@ -2015,7 +2015,7 @@ impl ToLLVMValue for SIToFPOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let sitofp_op = llvm_build_sitofp(
             &cctx.builder,
@@ -2036,7 +2036,7 @@ impl ToLLVMValue for FPToUIOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let fptoui_op = llvm_build_fptoui(
             &cctx.builder,
@@ -2057,7 +2057,7 @@ impl ToLLVMValue for UIToFPOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let arg = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
         let uitofp_op = llvm_build_uitofp(
             &cctx.builder,
@@ -2084,7 +2084,7 @@ impl ToLLVMValue for VAArgOp {
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
-        let opd = convert_value_operand(cctx, ctx, &op.get_operand(0))?;
+        let opd = convert_value_operand(cctx, ctx, &op.get_operand(ctx, 0))?;
         log::warn!("Generating va_arg instruction: It is poorly supported by LLVM");
         let vaarg_op = llvm_build_va_arg(
             &cctx.builder,
@@ -2122,7 +2122,7 @@ fn convert_block(
             let opr_ref = opr.deref(ctx);
             // LLVM instructions have at most one result.
             if opr_ref.get_num_results() == 1 {
-                cctx.value_map.insert(opr_ref.get_result(0), op_llvm);
+                cctx.value_map.insert(opr_ref.get_result(ctx, 0), op_llvm);
             }
         }
     }
@@ -2152,7 +2152,7 @@ fn convert_function(
     {
         let entry = block_iter.next().expect("Missing entry block");
         // Map entry block arguments to LLVM function arguments.
-        for (arg_idx, arg) in entry.deref(ctx).arguments().enumerate() {
+        for (arg_idx, arg) in entry.deref(ctx).arguments(ctx).enumerate() {
             cctx.value_map
                 .insert(arg, llvm_get_param(func_llvm, arg_idx.try_into().unwrap()));
         }
@@ -2170,7 +2170,7 @@ fn convert_function(
             block.deref(ctx).unique_name(ctx).as_ref(),
         );
         llvm_position_builder_at_end(&cctx.builder, llvm_block);
-        for arg in block.deref(ctx).arguments() {
+        for arg in block.deref(ctx).arguments(ctx) {
             let arg_type = convert_type(ctx, llvm_ctx, &mut cctx.types, arg.get_type(ctx))?;
             let phi = llvm_build_phi(&cctx.builder, arg_type, arg.unique_name(ctx).as_ref());
             cctx.value_map.insert(arg, phi);
@@ -2608,8 +2608,8 @@ impl OpToLLVMConstValue for InsertValueOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let base = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
-        let value = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(1))?;
+        let base = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 0))?;
+        let value = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 1))?;
         let indices = self.indices(ctx);
         if indices.len() != 1 {
             return input_err!(op.loc(), ToLLVMErr::InsertExtractValueIndices);
@@ -2639,8 +2639,8 @@ impl OpToLLVMConstValue for InsertElementOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let base = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
-        let value = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(1))?;
+        let base = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 0))?;
+        let value = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 1))?;
         let index = self.get_operand_index(ctx);
         let index = convert_to_llvm_const(ctx, cctx, llvm_ctx, index)?;
 
@@ -2668,7 +2668,7 @@ impl OpToLLVMConstValue for TruncOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let arg = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
 
         // LLVM's builder tries to fold this, so we rely on that.
@@ -2694,8 +2694,8 @@ impl OpToLLVMConstValue for SubOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let lhs = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
-        let rhs = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(1))?;
+        let lhs = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 0))?;
+        let rhs = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 1))?;
 
         // LLVM's builder tries to fold this, so we rely on that.
         let sub_op = llvm_build_sub(
@@ -2720,7 +2720,7 @@ impl OpToLLVMConstValue for PtrToIntOp {
         cctx: &mut ConversionContext,
     ) -> Result<LLVMValue> {
         let op = self.get_operation().deref(ctx);
-        let arg = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(0))?;
+        let arg = convert_to_llvm_const(ctx, cctx, llvm_ctx, op.get_operand(ctx, 0))?;
         let ty = convert_type(ctx, llvm_ctx, &mut cctx.types, self.result_type(ctx))?;
 
         // LLVM's builder tries to fold this, so we rely on that.

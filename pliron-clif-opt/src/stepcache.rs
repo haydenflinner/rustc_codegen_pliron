@@ -42,7 +42,7 @@ use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{config, reads_begin, reads_take};
 use crate::pipeline::{Analysis, Pipe, Stats, Step};
@@ -153,14 +153,24 @@ impl StatDelta {
 }
 
 fn enabled() -> bool {
-    config().is("PLIRON_STEPCACHE", "1")
+    // `PLIRON_STEPCACHE` is process-fixed and excluded from read
+    // recording (it configures the cache, not the computation), so a
+    // one-time parse is safe — called per cached step per function.
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| config().is("PLIRON_STEPCACHE", "1"));
+    *ON
 }
 
-fn dir() -> Option<PathBuf> {
-    config()
-        .get("PLIRON_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|h| h.join(".cache/pliron-steps")))
+fn dir() -> Option<&'static Path> {
+    // Both inputs are process-fixed record-excluded cache knobs; the
+    // fallback allocates a PathBuf per call otherwise.
+    static DIR: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+        config()
+            .get("PLIRON_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|h| h.join(".cache/pliron-steps")))
+    });
+    DIR.as_deref()
 }
 
 fn log(what: &str) {
@@ -324,6 +334,7 @@ fn apply_func(
     p.clctx.domtree = DominatorTree::new();
     p.clctx.loop_analysis = LoopAnalysis::new();
     *p.derived = derived.iter().copied().collect();
+    p.seed_derived_bits();
 }
 
 // ---------------------------------------------------------------------
@@ -452,9 +463,10 @@ pub fn lookup(p: &mut Pipe, s: &Step, an: &mut Analysis) -> Option<usize> {
         apply_func(p, func, &derived);
     } else {
         *p.derived = derived.iter().copied().collect();
+        p.seed_derived_bits();
     }
-    for (d, w) in facts {
-        crate::pipeline::carry_one(p, d, w);
+    for (d, w) in &facts {
+        crate::pipeline::carry_one(p, *d, *w);
     }
     stats.apply(p.stats);
     an.clif_hash = Some(out_hash);

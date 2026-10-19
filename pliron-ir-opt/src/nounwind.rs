@@ -9,7 +9,7 @@ use pliron::operation::Operation;
 use pliron_llvm::ops::CallOp;
 use rustc_hash::FxHashSet;
 
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied};
 
@@ -58,21 +58,22 @@ pub fn run(ctx: &Context, st: &mut State) {
             p.nounwind.push((ids.id(s),));
         }
     }
+    let mut scratch = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
         p.body.push((f,));
         for b in blocks(ctx, st.funcs[s].op) {
-            for op in ops(ctx, b) {
+            crate::inline::ops_into(ctx, b, &mut scratch);
+            for &op in &scratch {
                 // `pliron.eh.rethrow` unwinds out of `f` through a
                 // CallIntrinsicOp — the `call` relation only sees CallOps.
                 if st
-                    .intrinsics
-                    .get(&op)
+                    .intrinsics.get(op)
                     .is_some_and(|n| n == "pliron.eh.rethrow")
                 {
                     p.may_unwind.push((f,));
                 }
-                if Operation::is_op::<CallOp>(op, ctx) && !st.invokes.contains_key(&op) {
+                if Operation::is_op::<CallOp>(op, ctx) && !st.invokes.contains(op) {
                     match direct_callee(ctx, st, op) {
                         Some(c) => p.call.push((f, ids.id(c))),
                         None => p.icall.push((f,)),
@@ -94,7 +95,6 @@ pub fn run(ctx: &Context, st: &mut State) {
     let dead: Vec<_> = st
         .invokes
         .keys()
-        .copied()
         .filter(|&op| {
             direct_callee(ctx, st, op).is_some_and(|c| {
                 !THROWS.contains(&c.as_str())
@@ -114,7 +114,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         };
     }
     for op in dead {
-        st.invokes.remove(&op);
+        st.invokes.remove(op);
     }
     // Persist the inference: the emulated-EH flag check after calls on COFF
     // is skipped for callees that can't unwind.

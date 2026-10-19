@@ -162,4 +162,4 @@ requested.
 - Backend-visible `captures(none)` / `nonnull` arg attrs from rustc feed
   jumpthread/slotmerge — useful hints, but deduced at fn-ABI granularity,
   so call rewrites (sret2reg, dead_args) must re-index them or they
-  desync (stage2 miscompilation #3, coordination-ledger).
+  desync (stage2 miscompilation #3, docs/history/coordination-ledger.md).

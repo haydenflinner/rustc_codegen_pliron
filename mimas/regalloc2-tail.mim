@@ -1,0 +1,163 @@
+// regalloc2-tail.mim — appended after cliffacts.py output.
+// v2: block-boundary liveness as the datalog fixpoint (small, converges
+// fast), then exact inst-level live sets by a backward host scan within
+// each block — same two-level structure the compiler uses. Spill units
+// are (v,b) segments: spilling frees only live-THROUGH positions (a
+// spilled v still needs a reg at its own use/def insts).
+
+let (blk_, buse_, bdef_, succ_, live_in_, live_out_) = datalog {
+    rel blk(b: int) from blk_rows
+    rel buse(v: int, b: int) from buse_rows
+    rel bdef(v: int, b: int) from bdef_rows
+    rel succ(b: int, c: int) from succ_rows
+    rel live_in(v: int, b: int)
+    rel live_out(v: int, b: int)
+
+    live_in(v, b) if buse(v, b)
+    live_in(v, b) if live_out(v, b), !bdef(v, b)
+    live_out(v, b) if succ(b, c), live_in(v, c)
+};
+
+// ---- host: inst-level expansion ------------------------------------------
+
+fn member(v: int, xs: [int]) -> bool {
+    for x in xs { if x == v { return true; } }
+    false
+}
+
+let MAXI = 0;
+for r in iblk_rows { if r.0 > MAXI { MAXI = r.0; } }
+
+let inst_blk: [int] = [];
+for i in 0 .. MAXI + 1 { inst_blk.push(-1); }
+for r in iblk_rows { inst_blk[r.0] = r.1; }
+
+// next[i] = successor insts of i
+let next_of: [[int]] = [];
+for i in 0 .. MAXI + 1 { next_of.push([]); }
+for r in next_rows { next_of[r.0].push(r.1); }
+
+// block -> live_in/live_out lookup lists
+let lin_b: [[int]] = [];
+let lout_b: [[int]] = [];
+for b in blk_ {
+    while lin_b.len() <= b.0 { lin_b.push([]); lout_b.push([]); }
+    lin_b[b.0] = []; lout_b[b.0] = [];
+}
+for t in live_in_ { lin_b[t.1].push(t.0); }
+for t in live_out_ { lout_b[t.1].push(t.0); }
+
+// live_in_inst[i]: walk each block backward — carry = live_out(b), then
+// per inst: live_before = (carry ∪ uses) − defs.
+let live_in_inst: [[int]] = [];
+let use_at: [[int]] = [];
+let def_at: [[int]] = [];
+for i in 0 .. MAXI + 1 { live_in_inst.push([]); use_at.push([]); def_at.push([]); }
+for t in use_rows { use_at[t.1].push(t.0); }
+for t in def_rows { def_at[t.1].push(t.0); }
+
+// first inst of each block (blocks are contiguous ranges in dump order)
+let first_of: [int] = [];
+for b in blk_ { while first_of.len() <= b.0 { first_of.push(-1); } }
+for r in iblk_rows {
+    if first_of[r.1] < 0 || r.0 < first_of[r.1] { first_of[r.1] = r.0; }
+}
+
+for b in blk_ {
+    let carry: [int] = [];
+    for v in lout_b[b.0] { carry.push(v); }
+    // walk insts of b backward: start at last inst whose block is b
+    let i = first_of[b.0];
+    let insts: [int] = [];
+    while i <= MAXI && inst_blk[i] == b.0 { insts.push(i); i = i + 1; }
+    let k = insts.len();
+    while k > 0 {
+        k = k - 1;
+        let j = insts[k];
+        for v in use_at[j] { if !member(v, carry) { carry.push(v); } }
+        live_in_inst[j] = for v in carry collect v;
+        for v in def_at[j] {
+            let nl: [int] = [];
+            for x in carry { if x != v { nl.push(x); } }
+            carry = nl;
+        }
+    }
+}
+
+// interference pairs at inst granularity (count only — for the report)
+let n_inter = 0;
+for i in 0 .. MAXI + 1 {
+    let n = live_in_inst[i].len();
+    n_inter = n_inter + ((n * (n - 1)) / 2).to_int();
+}
+
+// (v,b) -> through positions: live before i but not used/def'd at i —
+// the positions a spill actually frees.
+let thr = ~{};
+for i in 0 .. MAXI + 1 {
+    for v in live_in_inst[i] {
+        if !member(v, use_at[i]) && !member(v, def_at[i]) {
+            let k = f"{v}x{inst_blk[i]}";
+            if !thr.contains_key(k) { thr[k] = []; }
+            thr[k]!.push(i);
+        }
+    }
+}
+
+fn vbcost(v: int, b: int) -> int {
+    for c in vcost_rows { if c.0 == v && c.1 == b { return c.2; } }
+    1
+}
+
+fn member_s(v: str, xs: [str]) -> bool {
+    for x in xs { if x == v { return true; } }
+    false
+}
+
+let K = 14;
+print(f"blocks={blk_.len()} insts={MAXI + 1} live pairs={n_inter} seg keys={thr.len()}");
+
+let base_max = 0; let base_i = -1;
+for i in 0 .. MAXI + 1 {
+    if live_in_inst[i].len() > base_max { base_max = live_in_inst[i].len(); base_i = i; }
+}
+print(f"K={K} base max pressure={base_max} at inst {base_i} (block {inst_blk[base_i]})");
+
+// greedy: at the worst inst, spill the (v,b) with the best relief-per-cost
+let spilled: [str] = [];
+while true {
+    let wi = -1; let wp = 0;
+    for i in 0 .. MAXI + 1 {
+        if live_in_inst[i].len() > wp { wp = live_in_inst[i].len(); wi = i; }
+    }
+    if wp <= K { break; }
+    let bb = inst_blk[wi];
+    let pick = -1; let pscore = -1.0; let pinsts: [int] = [];
+    for v in live_in_inst[wi] {
+        let k = f"{v}x{bb}";
+        if member_s(k, spilled) || !thr.contains_key(k) { continue; }
+        let ps = thr[k]!;
+        let relief = 0;
+        for i in ps { if member(v, live_in_inst[i]) { relief = relief + 1; } }
+        let score = relief.to_float() / (vbcost(v, bb) + 1).to_float();
+        if score > pscore { pscore = score; pick = v; pinsts = ps; }
+    }
+    if pick < 0 { break; }
+    spilled.push(f"{pick}x{bb}");
+    for i in pinsts {
+        let nl: [int] = [];
+        for v in live_in_inst[i] { if v != pick { nl.push(v); } }
+        live_in_inst[i] = nl;
+    }
+}
+
+let total = 0;
+for k in spilled {
+    let v = k.split("x")[0].to_int()!; let b = k.split("x")[1].to_int()!;
+    total = total + vbcost(v, b);
+}
+print(f"spilled {spilled.len()} segments, total cost {total}");
+for k in spilled { print(f"  {k}"); }
+let fm = 0;
+for i in 0 .. MAXI + 1 { if live_in_inst[i].len() > fm { fm = live_in_inst[i].len(); } }
+print(f"final max pressure {fm}");

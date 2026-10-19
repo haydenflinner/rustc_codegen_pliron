@@ -1171,7 +1171,7 @@ fn outlined_attributes_in_op_formats() {
     fn check<T: Op>(ctx: &mut Context, expected: Expect) {
         let op = Operation::new(ctx, T::get_concrete_op_info(), vec![], vec![], vec![], 0);
         op.deref_mut(ctx)
-            .attributes
+            .attributes_mut()
             .set(ident!("outlined"), GivenNamesAttr::default());
 
         let printed = op.disp(ctx).to_string();

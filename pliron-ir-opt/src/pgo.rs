@@ -92,10 +92,10 @@ fn bump(ctx: &mut Context, st: &mut State, block: Ptr<BasicBlock>, ctrs: &str, i
         vec![r]
     } else {
         let l = LoadOp::new(ctx, addr, i64t).get_operation();
-        let lv = l.deref(ctx).get_result(0);
+        let lv = l.deref(ctx).get_result(ctx, 0);
         let one = crate::sroa::mk_const(ctx, st, i64t, ConstVal::Bits(1));
         let a = AddOp::new(ctx, lv, one).get_operation();
-        let av = a.deref(ctx).get_result(0);
+        let av = a.deref(ctx).get_result(ctx, 0);
         let s = StoreOp::new(ctx, av, addr).get_operation();
         st.volatile.insert(l);
         st.volatile.insert(s);
@@ -132,7 +132,7 @@ fn terminator(ctx: &Context, b: Ptr<BasicBlock>) -> Option<Ptr<Operation>> {
 }
 
 fn succs(ctx: &Context, t: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
-    t.deref(ctx).successors().collect()
+    t.deref(ctx).successors(ctx).collect()
 }
 
 /// Edges block counts can't determine: a terminator with >1 successor
@@ -145,7 +145,7 @@ fn ambiguous_edges(
     let mut npred: rustc_hash::FxHashMap<Ptr<BasicBlock>, u32> = FxHashMap::default();
     for b in bs {
         for op in b.deref(ctx).iter(ctx) {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 *npred.entry(s).or_default() += 1;
             }
         }
@@ -303,17 +303,17 @@ pub fn instrument(
             bump(ctx, st, *b, &ctrs_sym, base + i as u32);
         }
         nctrs += bs.len() as u32;
-        let region = fop.deref(ctx).get_region(0);
+        let region = fop.deref(ctx).get_region(ctx, 0);
         for &(pi, si) in &edges {
             let Some(t) = terminator(ctx, bs[pi as usize]) else {
                 continue;
             };
-            let s = t.deref(ctx).get_successor(si as usize);
+            let s = t.deref(ctx).get_successor(ctx, si as usize);
             let arg_tys: Vec<TypeHandle> =
-                s.deref(ctx).arguments().map(|a| a.get_type(ctx)).collect();
+                s.deref(ctx).arguments(ctx).map(|a| a.get_type(ctx)).collect();
             let e = BasicBlock::new(ctx, None, arg_tys);
             e.insert_at_back(region, ctx);
-            let args: Vec<Value> = e.deref(ctx).arguments().collect();
+            let args: Vec<Value> = e.deref(ctx).arguments(ctx).collect();
             let br = BrOp::new(ctx, s, args).get_operation();
             br.insert_at_back(e, ctx);
             bump(ctx, st, e, &ctrs_sym, nctrs);
@@ -701,10 +701,10 @@ pub fn load(ctx: &Context, st: &mut State, path: &str) -> usize {
 
 /// Profiled entry count of the block, if a matching record exists.
 pub fn block_count(st: &State, b: Ptr<BasicBlock>) -> Option<u64> {
-    st.prof_bcount.get(&b).copied()
+    st.prof_bcount.get(b).copied()
 }
 
 /// Total entry count (block 0) of the FuncOp, if profiled.
 pub fn func_count(st: &State, f: Ptr<Operation>) -> Option<u64> {
-    st.prof.get(&f)?.blocks.first().copied()
+    st.prof.get(f)?.blocks.first().copied()
 }

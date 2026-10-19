@@ -26,6 +26,7 @@ fn pass(name: &str) -> Pass {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::bcheck::run(f, &mut an, "filetest", true)
         },
+        "armmerge" => pliron_clif_opt::armmerge::run,
         "bittab" => pliron_clif_opt::bittab::run,
         "brif_fold" => clifpeep::brif_fold,
         "celim" => celim::run,
@@ -37,6 +38,7 @@ fn pass(name: &str) -> Pass {
         "cparm" => |f| clifpeep::cparm(f).0,
         "dgvn" => clifpeep::dgvn,
         "edgefwd" => edgefwd::run,
+        "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,
@@ -56,6 +58,10 @@ fn pass(name: &str) -> Pass {
         "selargs" => clifpeep::selargs,
         "selfarg" => clifpeep::selfarg,
         "sgntest" => clifpeep::sgntest,
+        "slp" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::slp::run(f, &mut an, &rustc_hash::FxHashSet::default(), true, false)
+        },
         "sublea" => clifpeep::sublea,
         "uloads32" => clifpeep::uloads32,
         "unswitch" => |f| {

@@ -151,6 +151,12 @@ pub struct DataFlowGraph {
     /// whole-table alias scans on mutations that created none.
     alias_epoch: u32,
 
+    /// PLIRON: `dest` of every real alias write (the same events that
+    /// bump `alias_epoch`), in write order with duplicates. Consumers
+    /// that need "which values became aliases" walk this instead of the
+    /// whole `values` table — O(alias writes) rather than O(values).
+    alias_dirty: Vec<Value>,
+
     /// Function signature table. These signatures are referenced by indirect call instructions as
     /// well as the external function references.
     pub signatures: PrimaryMap<SigRef, Signature>,
@@ -192,6 +198,7 @@ impl DataFlowGraph {
             value_lists: ValueListPool::new(),
             values: PrimaryMap::new(),
             alias_epoch: 0,
+            alias_dirty: Vec::new(),
             signatures: PrimaryMap::new(),
             ext_funcs: PrimaryMap::new(),
             values_labels: None,
@@ -213,6 +220,7 @@ impl DataFlowGraph {
         self.dynamic_types.clear();
         self.value_lists.clear();
         self.values.clear();
+        self.alias_dirty.clear();
         self.signatures.clear();
         self.ext_funcs.clear();
         self.values_labels = None;
@@ -270,6 +278,14 @@ impl DataFlowGraph {
 #[inline]
     pub fn alias_epoch(&self) -> u32 {
         self.alias_epoch
+    }
+
+    /// PLIRON: `dest` of every real alias write since creation/clear, in
+    /// write order (values can repeat when re-aliased). The write list
+    /// for `alias_epoch` — see the field comment.
+    #[inline]
+    pub fn alias_writes(&self) -> &[Value] {
+        &self.alias_dirty
     }
 
     /// Get an iterator over all values and their definitions.
@@ -714,6 +730,7 @@ impl DataFlowGraph {
 
         self.values[dest] = ValueData::Alias { ty, original }.into();
         self.alias_epoch = self.alias_epoch.wrapping_add(1);
+        self.alias_dirty.push(dest);
     }
 
     /// PLIRON: flatten every alias so its `original` is the chain's final
@@ -725,8 +742,13 @@ impl DataFlowGraph {
     /// `original` in place keeps every later resolve O(1).
     pub fn compact_aliases(&mut self) {
         let mut memo: crate::FxHashMap<Value, Value> = Default::default();
-        for i in 0..self.values.len() {
-            let v = Value::from_u32(i as u32);
+        // PLIRON: `alias_dirty` holds every value ever written as an
+        // alias — a superset of the live aliases (dead ends stay
+        // Alias-typed and dead entries just fail the match below), so
+        // this walks O(alias writes) instead of O(values). Duplicates
+        // re-enter a 1-hop chain and hit the memo immediately.
+        for i in 0..self.alias_dirty.len() {
+            let v = self.alias_dirty[i];
             let ValueData::Alias { original, .. } = ValueData::from(self.values[v])
             else {
                 continue;
@@ -816,6 +838,7 @@ impl DataFlowGraph {
             debug_assert_ne!(ty, types::INVALID);
 
             self.values[dest] = ValueData::Alias { ty, original }.into();
+            self.alias_dirty.push(dest);
         }
 
         self.alias_epoch = self.alias_epoch.wrapping_add(1);
@@ -1765,6 +1788,7 @@ impl DataFlowGraph {
         let data = ValueData::Alias { ty, original: src };
         self.values[dest] = data.into();
         self.alias_epoch = self.alias_epoch.wrapping_add(1);
+        self.alias_dirty.push(dest);
     }
 
     /// If `v` is already defined as an alias, return its destination value.

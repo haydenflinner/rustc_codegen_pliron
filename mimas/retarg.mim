@@ -1,0 +1,49 @@
+fn check(c: bool) -> bool! {
+    if !c { raise "check failed" }
+    c
+}
+
+// retarg.ascent transcribed: which functions return a parameter unchanged.
+// vN = value ids, fN = function ids; module:
+//   f0(p0) -> ret p0              => returned(f0, 0)
+//   f1(p0) -> ret f0(p0)          => returned(f1, 0)  (call result of returned callee)
+//   f2(p0,p1) -> ret select(p0,p0)=> returned(f2, 0)  (both arms are param 0)
+//   f3(p0) -> ret p0 + 1          => not returned     (no rule derives it)
+let (param_, call_, sel_, ret_, nrets_, isv_, upto_, returned_) = datalog {
+    rel param(v: int, i: int)
+    rel call(c: int, r: int, j: int, a: int)
+    rel sel(r: int, a: int, b: int)
+    rel ret(f: int, i: int, v: int)
+    rel nrets(f: int, n: int)
+    rel isv(v: int, k: int)
+    rel upto(f: int, i: int, k: int)
+    rel returned(f: int, k: int)
+
+    // f0: param 0 is value 1; single ret returns it
+    param(1, 0)
+    ret(0, 0, 1)
+    nrets(0, 1)
+    // f1: param 0 is value 2; calls f0 giving value 3; ret value 3
+    param(2, 0)
+    call(0, 3, 0, 2)
+    ret(1, 0, 3)
+    nrets(1, 1)
+    // f2: params are values 4,5; selects between 4 and 4; ret value 6
+    param(4, 0)
+    param(5, 1)
+    sel(6, 4, 4)
+    ret(2, 0, 6)
+    nrets(2, 1)
+
+    isv(v, i) if param(v, i)
+    isv(r, k) if call(c, r, j, a), returned(c, j), isv(a, k)
+    isv(r, k) if sel(r, a, b), isv(a, k), isv(b, k)
+    upto(f, 0, k) if ret(f, 0, v), isv(v, k)
+    upto(f, i + 1, k) if upto(f, i, k), ret(f, i + 1, v), isv(v, k)
+    returned(f, k) if nrets(f, n), upto(f, n - 1, k)
+};
+check(returned_.len() == 3);
+check(returned_.contains((0, 0)));
+check(returned_.contains((1, 0)));
+check(returned_.contains((2, 0)));
+print("retarg ok");

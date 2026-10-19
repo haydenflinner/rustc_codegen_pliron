@@ -53,7 +53,7 @@ fn base_alloca(ctx: &Context, mut p: Value) -> Option<Value> {
         match p.defining_op() {
             Some(d) if Operation::is_op::<pliron_llvm::ops::AllocaOp>(d, ctx) => return Some(p),
             Some(d) if Operation::is_op::<pliron_llvm::ops::GetElementPtrOp>(d, ctx) => {
-                p = d.deref(ctx).get_operand(0)
+                p = d.deref(ctx).get_operand(ctx, 0)
             }
             _ => return None,
         }
@@ -82,7 +82,7 @@ fn writes_impl(
     op: Ptr<Operation>,
     arg_allocas: &FxHashSet<Value>,
 ) -> bool {
-    if st.volatile.contains(&op) {
+    if st.volatile.contains(op) {
         return true;
     }
     macro_rules! is {
@@ -99,7 +99,7 @@ fn writes_impl(
         };
     }
     (is!(StoreOp) && {
-        let a = op.deref(ctx).get_operand(1);
+        let a = op.deref(ctx).get_operand(ctx, 1);
         !frame_local(ctx, a) || base_alloca(ctx, a).is_some_and(|b| arg_allocas.contains(&b))
     }) || is!(AtomicRmwOp)
         || is!(AtomicCmpxchgOp)
@@ -110,8 +110,7 @@ fn writes_impl(
         || is!(VAArgOp)
         || (is!(CallIntrinsicOp)
             && !st
-                .intrinsics
-                .get(&op)
+                .intrinsics.get(op)
                 .is_some_and(|n| PURE.iter().any(|p| n.starts_with(p))))
 }
 
@@ -129,14 +128,13 @@ fn dedupable(
     inv: bool,
 ) -> Option<(String, Vec<Value>, Value)> {
     if !Operation::is_op::<CallOp>(op, ctx)
-        || (!inv && st.invokes.contains_key(&op))
+        || (!inv && st.invokes.contains(op))
         || op.deref(ctx).get_num_results() != 1
     {
         return None;
     }
     if st
-        .calls
-        .get(&op)
+        .calls.get(op)
         .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
     {
         return None;
@@ -146,7 +144,7 @@ fn dedupable(
         return None;
     }
     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
-    Some((c.clone(), args, op.deref(ctx).get_result(0)))
+    Some((c.clone(), args, op.deref(ctx).get_result(ctx, 0)))
 }
 
 /// Can `v` be made available in `ph`? Values defined outside the loop body
@@ -184,7 +182,7 @@ fn cone_args(
     let Some(d) = v.defining_op() else {
         return false; // phi of a body block
     };
-    if writes(ctx, st, d, arg_allocas) || d.deref(ctx).successors().next().is_some() {
+    if writes(ctx, st, d, arg_allocas) || d.deref(ctx).successors(ctx).next().is_some() {
         return false;
     }
     // A read that reaches the preheader must not look at memory the loop
@@ -193,12 +191,12 @@ fn cone_args(
     // a load of a stored alloca, or a movable call taking its pointer.
     let mem_reads = |a: Value| base_alloca(ctx, a).is_some_and(|b| stored_allocas.contains(&b));
     if (Operation::is_op::<pliron_llvm::ops::LoadOp>(d, ctx)
-        && mem_reads(d.deref(ctx).get_operand(0)))
-        || (Operation::is_op::<CallOp>(d, ctx) && d.deref(ctx).operands().any(|a| mem_reads(a)))
+        && mem_reads(d.deref(ctx).get_operand(ctx, 0)))
+        || (Operation::is_op::<CallOp>(d, ctx) && d.deref(ctx).operands(ctx).any(|a| mem_reads(a)))
     {
         return false;
     }
-    for a in d.deref(ctx).operands() {
+    for a in d.deref(ctx).operands(ctx) {
         if !cone_args(
             ctx,
             st,
@@ -322,13 +320,17 @@ fn natural_loops(
 pub fn run(ctx: &mut Context, st: &State) {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
+    let dumpf = crate::env_get("PLIRON_CGDUMP");
     for name in bodied(ctx, st) {
+        if st.opt_skip.contains(&st.funcs[&name].op) {
+            continue;
+        }
         if dbg {
             if pliron_cfg::tracing_on() {
                 tracing::debug!(target: "pliron::callgvn", "callgvn fn={name}")
             };
         }
-        if crate::env_get("PLIRON_CGDUMP").is_some_and(|s| name.contains(s)) {
+        if dumpf.as_ref().is_some_and(|s| name.contains(s)) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::dump", "{}",
                     st.funcs[&name]
@@ -369,7 +371,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     for &b in &bs {
         for &op in &bops[&b] {
             if Operation::is_op::<CallOp>(op, ctx) {
-                for a in op.deref(ctx).operands() {
+                for a in op.deref(ctx).operands(ctx) {
                     if let Some(ba) = base_alloca(ctx, a) {
                         arg_allocas.insert(ba);
                     }
@@ -395,11 +397,11 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             writes_blk.insert(b);
         }
         for op in &bops[&b] {
-            for s in op.deref(ctx).successors() {
+            for s in op.deref(ctx).successors(ctx) {
                 preds.entry(s).or_default().push(b);
                 succ.entry(b).or_default().push(s);
             }
-            if let Some(&(l, _)) = st.invokes.get(op) {
+            if let Some(&(l, _)) = st.invokes.get(*op) {
                 preds.entry(l).or_default().push(b);
                 succ.entry(b).or_default().push(l);
             }
@@ -428,13 +430,12 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG)
                 && Operation::is_op::<CallOp>(op, ctx)
             {
-                let why = if st.invokes.contains_key(&op) {
+                let why = if st.invokes.contains(op) {
                     "invoke"
                 } else if op.deref(ctx).get_num_results() != 1 {
                     "results"
                 } else if st
-                    .calls
-                    .get(&op)
+                    .calls.get(op)
                     .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
                 {
                     "flags"
@@ -521,7 +522,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 {
                     continue;
                 }
-                let prev = cop.deref(ctx).get_result(0);
+                let prev = cop.deref(ctx).get_result(ctx, 0);
                 res.replace_all_uses_with(ctx, &prev);
                 killed.insert(op);
                 break;
@@ -582,7 +583,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                     continue;
                 }
                 if Operation::is_op::<StoreOp>(op, ctx)
-                    && let Some(ba) = base_alloca(ctx, op.deref(ctx).get_operand(1))
+                    && let Some(ba) = base_alloca(ctx, op.deref(ctx).get_operand(ctx, 1))
                 {
                     stored_allocas.insert(ba);
                 }
@@ -603,8 +604,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                     let why = if op.deref(ctx).get_num_results() != 1 {
                         "results"
                     } else if st
-                        .calls
-                        .get(&op)
+                        .calls.get(op)
                         .is_some_and(|ci| ci.bb || ci.tail || ci.foreign)
                     {
                         "flags"
@@ -644,7 +644,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 // put: hoisting it adds a `ph → pad` edge that bypasses the
                 // header, so the header stops dominating the pad and every
                 // header-defined value used downstream of it.
-                if st.invokes.get(&op).is_some_and(|&(l, _)| body.contains(&l)) {
+                if st.invokes.get(op).is_some_and(|&(l, _)| body.contains(&l)) {
                     continue;
                 }
                 // Args need to reach the preheader: values defined inside
