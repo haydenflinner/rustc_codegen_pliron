@@ -276,6 +276,72 @@ fn nonnull_load_fact_is_honored() {
 }
 
 #[test]
+fn uninit_slot_bytes_may_reshuffle() {
+    // slotmerge folds an output slot onto a live one: bytes the original
+    // left unwritten read back as the slot-mate's real data instead of
+    // the interpreter's zero fill. Legal — those bytes were never
+    // defined — so the differing lanes are excused, not a mismatch.
+    let a = parse(
+        "function %f() -> i64 {
+            ss0 = explicit_slot 8, align = 8
+            ss1 = explicit_slot 16, align = 8
+        block0:
+            v1 = stack_addr.i64 ss0
+            v2 = stack_addr.i64 ss1
+            v5 = iconst.i16 0x6261
+            store v5, v2+6
+            v8 = load.i8 v2
+            v3 = iconst.i32 0x785c
+            store v3, v1
+            v6 = iconst.i16 0x30
+            store v6, v1+4
+            v4 = load.i64 v1
+            return v4
+        }",
+    );
+    // The merged body: ss0's accesses land on ss1, so the load's top two
+    // bytes observe the table bytes (0x6162), not uninit.
+    let b = parse(
+        "function %f() -> i64 {
+            ss1 = explicit_slot 16, align = 8
+        block0:
+            v2 = stack_addr.i64 ss1
+            v5 = iconst.i16 0x6261
+            store v5, v2+6
+            v8 = load.i8 v2
+            v3 = iconst.i32 0x785c
+            store v3, v2
+            v6 = iconst.i16 0x30
+            store v6, v2+4
+            v4 = load.i64 v2
+            return v4
+        }",
+    );
+    let s = check(&a, &b, &Facts::default(), &cfg()).unwrap();
+    assert_eq!(s.inconclusive, 32, "{s:?}");
+
+    // The same rewrite with a wrong *written* byte is still a miscompile:
+    // determined bytes must survive any transform.
+    let c = parse(
+        "function %f() -> i64 {
+            ss1 = explicit_slot 16, align = 8
+        block0:
+            v2 = stack_addr.i64 ss1
+            v5 = iconst.i16 0x6261
+            store v5, v2+6
+            v8 = load.i8 v2
+            v3 = iconst.i32 0x785d
+            store v3, v2
+            v6 = iconst.i16 0x30
+            store v6, v2+4
+            v4 = load.i64 v2
+            return v4
+        }",
+    );
+    assert!(check(&a, &c, &Facts::default(), &cfg()).is_err());
+}
+
+#[test]
 fn noalias_param_memory_is_not_reachable_from_other_memory() {
     // `v1` is noalias, so a pointer loaded from `v0`'s memory can't point
     // into it: forwarding `*v1` across a call given that pointer is fine.

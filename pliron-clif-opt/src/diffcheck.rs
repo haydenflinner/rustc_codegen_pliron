@@ -197,34 +197,51 @@ pub fn check(
             }
             _ if same(&a, &b) => sum.compared += 1,
             _ => {
-                return Err(Mismatch {
-                    trial,
-                    args: world.args.clone(),
-                    before: b,
-                    after: a,
-                });
+                // `b` may not pin this trial down: a pass can legally
+                // reshuffle uninitialized bytes (slotmerge folds a slot
+                // onto live storage, so its never-written reads yield
+                // real bytes, not the zero fill). Re-run `before` under a
+                // different stack fill; `a` must match on every byte the
+                // original itself kept stable.
+                let world1 = World {
+                    stack_fill: 0xa5,
+                    ..world.clone()
+                };
+                let b1 = run(before, &world1, &nowrite_names, &self_name, cfg.fuel, true);
+                if underdetermined(&a, &b, &b1) {
+                    sum.inconclusive += 1;
+                    sum.why.get_or_insert_with(|| {
+                        "before's output depends on uninit stack bytes".into()
+                    });
+                } else {
+                    return Err(Mismatch {
+                        trial,
+                        args: world.args.clone(),
+                        before: b,
+                        after: a,
+                    });
+                }
             }
         }
     }
     Ok(sum)
 }
 
+/// By type and bytes: `DataValue`'s float `==` says NaN != NaN.
+fn norm(v: &DataValue) -> (Type, [u8; 16]) {
+    let mut b = [0u8; 16];
+    match v {
+        DataValue::F32(f) if f.is_nan() => b[..4].copy_from_slice(&0x7fc0_0000u32.to_le_bytes()),
+        DataValue::F64(f) if f.is_nan() => {
+            b[..8].copy_from_slice(&0x7ff8_0000_0000_0000u64.to_le_bytes())
+        }
+        v => v.write_to_slice_le(&mut b[..v.ty().bytes() as usize]),
+    }
+    (v.ty(), b)
+}
+
 /// Equality that treats any two NaNs as equal: passes may change payloads.
 fn same(a: &Outcome, b: &Outcome) -> bool {
-    // By type and bytes: `DataValue`'s float `==` says NaN != NaN.
-    fn norm(v: &DataValue) -> (Type, [u8; 16]) {
-        let mut b = [0u8; 16];
-        match v {
-            DataValue::F32(f) if f.is_nan() => {
-                b[..4].copy_from_slice(&0x7fc0_0000u32.to_le_bytes())
-            }
-            DataValue::F64(f) if f.is_nan() => {
-                b[..8].copy_from_slice(&0x7ff8_0000_0000_0000u64.to_le_bytes())
-            }
-            v => v.write_to_slice_le(&mut b[..v.ty().bytes() as usize]),
-        }
-        (v.ty(), b)
-    }
     let nv = |vs: &[DataValue]| vs.iter().map(norm).collect::<Vec<_>>();
     match (a, b) {
         (
@@ -249,6 +266,92 @@ fn same(a: &Outcome, b: &Outcome) -> bool {
         }
         _ => a == b,
     }
+}
+
+/// `a != b0` may still be a legal rewrite: passes can reshuffle bytes the
+/// original never defined — slotmerge folds a slot onto live storage, so
+/// reads of its never-written bytes yield real data instead of the
+/// zero-fill convention. `b1` is `b0` re-run under a different stack
+/// fill: every observable byte where `b0` and `b1` disagree was never
+/// determined by the source program, and `a` may show anything there.
+/// True when `a` differs from `b0` only on such bytes (or the original's
+/// whole behavior is fill-dependent, which leaves nothing to check).
+fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
+    let (
+        Outcome::Returned {
+            rets: r0,
+            calls: c0,
+            writes: w0,
+        },
+        Outcome::Returned {
+            rets: r1,
+            calls: c1,
+            writes: w1,
+        },
+    ) = (b0, b1)
+    else {
+        // The other fill traps where the first returned: the original's
+        // control flow depends on uninit bytes, so nothing here is pinned.
+        // An inconclusive rerun says nothing either way — keep the report.
+        return matches!(b1, Outcome::Trapped(_));
+    };
+    // The original's own shape moved with the fill: nothing to compare.
+    if r0.len() != r1.len() || c0.len() != c1.len() {
+        return true;
+    }
+    let Outcome::Returned {
+        rets: ra,
+        calls: ca,
+        writes: wa,
+    } = a
+    else {
+        return false;
+    };
+    if ra.len() != r0.len() || ca.len() != c0.len() {
+        return false;
+    }
+    // `v0`'s byte k is determined iff the two original runs agree on it;
+    // `a` must reproduce every determined byte.
+    let lanes_ok = |xs: &[DataValue], ys: &[DataValue], zs: &[DataValue]| {
+        xs.iter()
+            .zip(ys)
+            .zip(zs)
+            .all(|((xa, x0), x1)| {
+                let (ta, na) = norm(xa);
+                let (t0, n0) = norm(x0);
+                let (t1, n1) = norm(x1);
+                ta == t0
+                    && t0 == t1
+                    && (0..t0.bytes() as usize)
+                        .all(|k| n0[k] != n1[k] || na[k] == n0[k])
+            })
+    };
+    if !lanes_ok(ra, r0, r1) {
+        return false;
+    }
+    for ((x0, x1), ya) in c0.iter().zip(c1).zip(ca) {
+        if x0.0 != x1.0 {
+            return true; // the original's call sequence is fill-dependent
+        }
+        if ya.0 != x0.0 || ya.1.len() != x0.1.len() || x0.1.len() != x1.1.len() {
+            return false;
+        }
+        if !lanes_ok(&ya.1, &x0.1, &x1.1) {
+            return false;
+        }
+    }
+    // Written bytes, by address. A fill-dependent write set means the
+    // original's memory traffic itself is underdetermined.
+    let m = |w: &Vec<(u64, u8)>| w.iter().copied().collect::<BTreeMap<u64, u8>>();
+    let (m0, m1, ma) = (m(w0), m(w1), m(wa));
+    if m0.keys().ne(m1.keys()) {
+        return true;
+    }
+    if ma.keys().ne(m0.keys()) {
+        return false;
+    }
+    m0.iter()
+        .all(|(k, v)| m1[k] != *v || ma[k] == *v)
 }
 
 fn mix(a: u64, b: u64) -> u64 {
@@ -304,6 +407,10 @@ struct World {
     regions: BTreeMap<u64, Region>,
     args: Vec<DataValue>,
     seed: u64,
+    /// Byte fresh stack frames are filled with. Normally 0; `check`
+    /// re-runs `before` under a different fill on a mismatch to find
+    /// output bytes the original never determined.
+    stack_fill: u8,
     /// Values the optimizer may assume nonzero (`!nonnull` loads too): a
     /// load that yields 0 into one is undefined behavior, so the run stops.
     nonnull: FxHashSet<Value>,
@@ -368,6 +475,7 @@ impl World {
             regions,
             args,
             seed,
+            stack_fill: 0,
             nonnull: facts.nonnull.cloned().unwrap_or_default(),
         }
     }
@@ -570,6 +678,7 @@ struct Sandbox<'a> {
     nowrite: &'a FxHashSet<String>,
     nonnull: &'a FxHashSet<Value>,
     seed: u64,
+    stack_fill: u8,
     pinned: DataValue,
     /// Last address a load or store fell outside the sandbox at.
     fault: Cell<Option<u64>>,
@@ -658,9 +767,10 @@ impl<'a> State<'a> for Sandbox<'a> {
             Region {
                 // Uninit stack reads must yield a value slotprom-style
                 // passes can legally rematerialize: 0 matches the
-                // `iconst 0` emitted for never-stored slots. 0xa5 made
-                // every undef-byte reshuffle a false report.
-                data: vec![0; self.frame_size as usize],
+                // `iconst 0` emitted for never-stored slots. A nonzero
+                // fill (World::stack_fill) re-runs the original to see
+                // which observed bytes it actually determined.
+                data: vec![self.stack_fill; self.frame_size as usize],
                 init: Vec::new(),
                 stub_writable: false,
             },
@@ -908,6 +1018,7 @@ fn run_inner(
             &no_facts
         },
         seed: world.seed,
+        stack_fill: world.stack_fill,
         pinned: DataValue::I64(0),
         fault: Cell::new(None),
     };
