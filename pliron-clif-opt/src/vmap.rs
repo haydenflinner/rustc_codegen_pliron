@@ -1,46 +1,53 @@
-//! Dense `Value`-keyed tables: `FxHashMap<Value, _>` drops in as `VMap`,
+//! Dense entity-keyed tables: `FxHashMap<Value, _>` drops in as `VMap`,
 //! which replaces hashing with a bounds-checked index into a
 //! `Vec<Slot>` and clears in O(1) via a generation stamp. Insertion
-//! order is tracked in `keys` so `iter` costs O(present), not O(value
+//! order is tracked in `keys` so `iter` costs O(present), not O(entity
 //! space). Per-slot `(stamp, Option<V>)` makes `remove` a tombstone —
 //! a removed key's list entry is filtered on iteration and reinsert
 //! needs no list fixup.
 //!
 //! Use these only for tables whose probe/insert count is on the order
-//! of the function's value space and whose lifetime is a pass or
+//! of the function's entity space and whose lifetime is a pass or
 //! longer — small per-edge scratch maps stay cheaper as hash maps.
 
 use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir::Value;
+use cranelift_codegen::ir::{Block, Inst, Value};
+use std::marker::PhantomData;
 
 struct Slot<V> {
     stamp: u32,
     val: Option<V>,
 }
 
-/// Dense `Value → V` map with hash-map semantics.
-pub struct VMap<V> {
+/// Dense `K → V` map over any `EntityRef` key with hash-map semantics.
+pub struct EMap<K: EntityRef, V> {
     slots: Vec<Slot<V>>,
     stamp: u32,
-    keys: Vec<Value>,
+    keys: Vec<K>,
     len: usize,
+    _k: PhantomData<K>,
 }
 
-impl<V> Default for VMap<V> {
+/// `Value → V`.
+pub type VMap<V> = EMap<Value, V>;
+/// `Inst → V`.
+pub type IMap<V> = EMap<Inst, V>;
+/// `Block → V`.
+pub type BMap<V> = EMap<Block, V>;
+
+impl<K: EntityRef, V> Default for EMap<K, V> {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
             stamp: 1,
             keys: Vec::new(),
             len: 0,
+            _k: PhantomData,
         }
     }
 }
 
-impl<V> Clone for VMap<V>
-where
-    V: Clone,
-{
+impl<K: EntityRef, V: Clone> Clone for EMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             slots: self
@@ -54,11 +61,12 @@ where
             stamp: self.stamp,
             keys: self.keys.clone(),
             len: self.len,
+            _k: PhantomData,
         }
     }
 }
 
-impl<V> VMap<V> {
+impl<K: EntityRef, V> EMap<K, V> {
     /// O(1) reset: bumps the generation so every old slot reads stale.
     /// Keeps `slots`/`keys` capacity for reuse across calls.
     pub fn clear(&mut self) {
@@ -76,12 +84,12 @@ impl<V> VMap<V> {
         }
     }
 
-    /// Grow `slots` to cover `v` and ensure its slot is in the current
+    /// Grow `slots` to cover `k` and ensure its slot is in the current
     /// generation (first touch pushes `keys`). Field-level so callers
     /// can touch `len` while a slot borrow is live.
     #[inline(always)]
-    fn touch(&mut self, v: Value) -> usize {
-        let i = v.index();
+    fn touch(&mut self, k: K) -> usize {
+        let i = k.index();
         if i >= self.slots.len() {
             self.slots.resize_with(i + 1, || Slot {
                 stamp: 0,
@@ -91,22 +99,22 @@ impl<V> VMap<V> {
         if self.slots[i].stamp != self.stamp {
             self.slots[i].stamp = self.stamp;
             self.slots[i].val = None;
-            self.keys.push(v);
+            self.keys.push(k);
         }
         i
     }
 
     #[inline(always)]
-    pub fn get(&self, v: &Value) -> Option<&V> {
+    pub fn get(&self, k: &K) -> Option<&V> {
         self.slots
-            .get(v.index())
+            .get(k.index())
             .filter(|s| s.stamp == self.stamp)
             .and_then(|s| s.val.as_ref())
     }
 
     #[inline(always)]
-    pub fn get_mut(&mut self, v: &Value) -> Option<&mut V> {
-        let i = v.index();
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        let i = k.index();
         if i >= self.slots.len() {
             return None;
         }
@@ -119,8 +127,8 @@ impl<V> VMap<V> {
 
     /// Insert, returning the previous value if the key was present.
     #[inline]
-    pub fn insert(&mut self, v: Value, x: V) -> Option<V> {
-        let i = self.touch(v);
+    pub fn insert(&mut self, k: K, x: V) -> Option<V> {
+        let i = self.touch(k);
         let old = self.slots[i].val.replace(x);
         if old.is_none() {
             self.len += 1;
@@ -131,8 +139,8 @@ impl<V> VMap<V> {
     /// `entry().or_insert_with` — the slot grows on first touch and a
     /// tombstoned key needs no keys-list fixup.
     #[inline]
-    pub fn or_insert_with(&mut self, v: Value, f: impl FnOnce() -> V) -> &mut V {
-        let i = self.touch(v);
+    pub fn or_insert_with(&mut self, k: K, f: impl FnOnce() -> V) -> &mut V {
+        let i = self.touch(k);
         let s = &mut self.slots[i];
         if s.val.is_none() {
             s.val = Some(f());
@@ -143,17 +151,17 @@ impl<V> VMap<V> {
 
     /// `entry().or_default()`.
     #[inline]
-    pub fn or_default(&mut self, v: Value) -> &mut V
+    pub fn or_default(&mut self, k: K) -> &mut V
     where
         V: Default,
     {
-        self.or_insert_with(v, V::default)
+        self.or_insert_with(k, V::default)
     }
 
     /// Remove, returning the value if present. Tombstones the slot; the
     /// keys entry is filtered by `iter`.
-    pub fn remove(&mut self, v: &Value) -> Option<V> {
-        let i = v.index();
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        let i = k.index();
         if i >= self.slots.len() {
             return None;
         }
@@ -166,8 +174,8 @@ impl<V> VMap<V> {
     }
 
     #[inline(always)]
-    pub fn contains_key(&self, v: &Value) -> bool {
-        self.get(v).is_some()
+    pub fn contains_key(&self, k: &K) -> bool {
+        self.get(k).is_some()
     }
 
     #[inline(always)]
@@ -180,8 +188,8 @@ impl<V> VMap<V> {
         self.len == 0
     }
 
-    /// Iterate `(Value, &V)` over present entries, insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = (Value, &V)> {
+    /// Iterate `(K, &V)` over present entries, insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
         let stamp = self.stamp;
         self.keys.iter().filter_map(move |&k| {
             let s = &self.slots[k.index()];
@@ -192,7 +200,7 @@ impl<V> VMap<V> {
     }
 
     /// Iterate present keys, insertion order.
-    pub fn keys(&self) -> impl Iterator<Item = Value> + '_ {
+    pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
         self.iter().map(|(k, _)| k)
     }
 
@@ -202,22 +210,22 @@ impl<V> VMap<V> {
     }
 }
 
-impl<'a, V> IntoIterator for &'a VMap<V> {
-    type Item = (Value, &'a V);
-    type IntoIter = Box<dyn Iterator<Item = (Value, &'a V)> + 'a>;
+impl<'a, K: EntityRef, V> IntoIterator for &'a EMap<K, V> {
+    type Item = (K, &'a V);
+    type IntoIter = Box<dyn Iterator<Item = (K, &'a V)> + 'a>;
     fn into_iter(self) -> Self::IntoIter {
         Box::new(self.iter())
     }
 }
 
-impl<V: std::fmt::Debug> std::fmt::Debug for VMap<V> {
+impl<K: EntityRef + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for EMap<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<V> std::iter::FromIterator<(Value, V)> for VMap<V> {
-    fn from_iter<T: IntoIterator<Item = (Value, V)>>(it: T) -> Self {
+impl<K: EntityRef, V> std::iter::FromIterator<(K, V)> for EMap<K, V> {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(it: T) -> Self {
         let mut m = Self::default();
         for (k, v) in it {
             m.insert(k, v);
@@ -226,13 +234,13 @@ impl<V> std::iter::FromIterator<(Value, V)> for VMap<V> {
     }
 }
 
-impl<V> IntoIterator for VMap<V> {
-    type Item = (Value, V);
-    type IntoIter = std::vec::IntoIter<(Value, V)>;
+impl<K: EntityRef, V> IntoIterator for EMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::vec::IntoIter<(K, V)>;
     fn into_iter(mut self) -> Self::IntoIter {
         let stamp = self.stamp;
         let slots = &mut self.slots;
-        let out: Vec<(Value, V)> = self
+        let out: Vec<(K, V)> = self
             .keys
             .iter()
             .filter_map(|&k| {
@@ -244,15 +252,22 @@ impl<V> IntoIterator for VMap<V> {
     }
 }
 
-/// Dense `Value` set — membership by generation stamp, O(1) clear.
-pub struct VSet {
+/// Dense `K` set — membership by generation stamp, O(1) clear.
+pub struct ESet<K: EntityRef> {
     slots: Vec<u32>,
     stamp: u32,
-    keys: Vec<Value>,
+    keys: Vec<K>,
     len: usize,
 }
 
-impl Default for VSet {
+/// `Value` set.
+pub type VSet = ESet<Value>;
+/// `Inst` set.
+pub type ISet = ESet<Inst>;
+/// `Block` set.
+pub type BSet = ESet<Block>;
+
+impl<K: EntityRef> Default for ESet<K> {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
@@ -263,7 +278,7 @@ impl Default for VSet {
     }
 }
 
-impl Clone for VSet {
+impl<K: EntityRef> Clone for ESet<K> {
     fn clone(&self) -> Self {
         Self {
             slots: self.slots.clone(),
@@ -274,7 +289,7 @@ impl Clone for VSet {
     }
 }
 
-impl VSet {
+impl<K: EntityRef> ESet<K> {
     pub fn clear(&mut self) {
         self.keys.clear();
         self.len = 0;
@@ -286,16 +301,14 @@ impl VSet {
     }
 
     #[inline(always)]
-    pub fn contains(&self, v: &Value) -> bool {
-        self.slots
-            .get(v.index())
-            .is_some_and(|&s| s == self.stamp)
+    pub fn contains(&self, k: &K) -> bool {
+        self.slots.get(k.index()).is_some_and(|&s| s == self.stamp)
     }
 
-    /// Insert; returns true if the value was absent.
+    /// Insert; returns true if the key was absent.
     #[inline]
-    pub fn insert(&mut self, v: Value) -> bool {
-        let i = v.index();
+    pub fn insert(&mut self, k: K) -> bool {
+        let i = k.index();
         if i >= self.slots.len() {
             self.slots.resize(i + 1, 0);
         }
@@ -303,13 +316,13 @@ impl VSet {
             return false;
         }
         self.slots[i] = self.stamp;
-        self.keys.push(v);
+        self.keys.push(k);
         self.len += 1;
         true
     }
 
-    pub fn remove(&mut self, v: &Value) -> bool {
-        let i = v.index();
+    pub fn remove(&mut self, k: &K) -> bool {
+        let i = k.index();
         if i >= self.slots.len() || self.slots[i] != self.stamp {
             return false;
         }
@@ -329,7 +342,7 @@ impl VSet {
     }
 
     /// Present members, insertion order (skips removed entries).
-    pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = K> + '_ {
         let stamp = self.stamp;
         self.keys
             .iter()
@@ -338,11 +351,11 @@ impl VSet {
     }
 }
 
-impl std::iter::FromIterator<Value> for VSet {
-    fn from_iter<T: IntoIterator<Item = Value>>(it: T) -> Self {
+impl<K: EntityRef> std::iter::FromIterator<K> for ESet<K> {
+    fn from_iter<T: IntoIterator<Item = K>>(it: T) -> Self {
         let mut s = Self::default();
-        for v in it {
-            s.insert(v);
+        for k in it {
+            s.insert(k);
         }
         s
     }

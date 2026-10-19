@@ -570,9 +570,9 @@ pub fn run(func: &mut Function) -> usize {
     // expansion it enables when there's no candidate.
     let mut bctx: Option<(
         ControlFlowGraph,
-        FxHashMap<Block, Rc<clifpeep::BoundsMap>>,
-        FxHashMap<Block, Rc<clifpeep::BoundsMap>>,
-        FxHashSet<Block>,
+        crate::vmap::BMap<Rc<clifpeep::BoundsMap>>,
+        crate::vmap::BMap<Rc<clifpeep::BoundsMap>>,
+        crate::vmap::BSet,
     )> = None;
     let narrow_on = crate::pass_enabled("PLIRON_DIVNARROW");
     let mut pos = FuncCursor::new(func);
@@ -618,9 +618,9 @@ pub fn run(func: &mut Function) -> usize {
                 let (cfg, ememo, memo, visiting) = bctx.get_or_insert_with(|| {
                     (
                         ControlFlowGraph::with_function(pos.func),
-                        FxHashMap::default(),
-                        FxHashMap::default(),
-                        FxHashSet::default(),
+                        crate::vmap::BMap::default(),
+                        crate::vmap::BMap::default(),
+                        crate::vmap::BSet::default(),
                     )
                 });
                 let ub = clifpeep::bound_at(pos.func, cfg, ememo, memo, visiting, b, x);

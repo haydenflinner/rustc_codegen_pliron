@@ -26,7 +26,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData,
     LibCall, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
-use crate::vmap::VMap;
+use crate::vmap::{BMap, BSet, VMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
@@ -6929,16 +6929,16 @@ fn edge_fact(func: &Function, pi: Inst, matches: &[(usize, &BlockCall)]) -> Boun
 pub(crate) fn entry_b(
     func: &Function,
     cfg: &ControlFlowGraph,
-    ememo: &mut FxHashMap<Block, Rc<BoundsMap>>,
-    memo: &mut FxHashMap<Block, Rc<BoundsMap>>,
-    visiting: &mut FxHashSet<Block>,
+    ememo: &mut BMap<Rc<BoundsMap>>,
+    memo: &mut BMap<Rc<BoundsMap>>,
+    visiting: &mut BSet,
     b: Block,
     depth: usize,
 ) -> Rc<BoundsMap> {
     if let Some(m) = ememo.get(&b) {
         return m.clone();
     }
-    let mut m = BoundsMap::default();
+    let mut m: Rc<BoundsMap> = Rc::new(BoundsMap::default());
         let preds: Vec<_> = cfg.pred_iter(b).collect();
         if !preds.is_empty() && depth > 0 {
             // Edge args → this block's params: `min` over a pred's matching
@@ -6955,7 +6955,7 @@ pub(crate) fn entry_b(
             // otherwise). Facts and param bindings may tighten it below.
             if preds.len() == 1 {
                 let pe = end_b(func, cfg, ememo, memo, visiting, preds[0].block, depth - 1);
-                m = (*pe).clone();
+                m = pe;
             }
             for (pix, p) in func.dfg.block_params(b).iter().enumerate() {
                 let pty = func.dfg.value_type(*p);
@@ -6994,7 +6994,7 @@ pub(crate) fn entry_b(
                 if let Some(bv) = bv
                     && bv < umax_ty(pty)
                 {
-                    m.insert(*p, bv);
+                    Rc::make_mut(&mut m).insert(*p, bv);
                 }
             }
             // Single-pred: the `icmp` edge fact also bounds `x` itself in
@@ -7014,20 +7014,22 @@ pub(crate) fn entry_b(
                     .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == b)
                     .collect();
                 for (x, ub) in edge_fact(func, pi, &matches) {
-                    m.entry(x).and_modify(|e| *e = (*e).min(ub)).or_insert(ub);
+                    Rc::make_mut(&mut m)
+                        .entry(x)
+                        .and_modify(|e| *e = (*e).min(ub))
+                        .or_insert(ub);
                 }
             }
         }
-        let m = Rc::new(m);
         ememo.insert(b, m.clone());
         m
     }
 pub(crate) fn end_b(
     func: &Function,
     cfg: &ControlFlowGraph,
-    ememo: &mut FxHashMap<Block, Rc<BoundsMap>>,
-    memo: &mut FxHashMap<Block, Rc<BoundsMap>>,
-    visiting: &mut FxHashSet<Block>,
+    ememo: &mut BMap<Rc<BoundsMap>>,
+    memo: &mut BMap<Rc<BoundsMap>>,
+    visiting: &mut BSet,
     b: Block,
     depth: usize,
 ) -> Rc<BoundsMap> {
@@ -7037,12 +7039,14 @@ pub(crate) fn end_b(
     if !visiting.insert(b) {
         return Rc::new(BoundsMap::default());
     }
-    let mut m = (*entry_b(func, cfg, ememo, memo, visiting, b, depth)).clone();
-    for i in func.layout.block_insts(b) {
-        inst_bounds(func, &mut m, i);
+    let mut m = entry_b(func, cfg, ememo, memo, visiting, b, depth);
+    {
+        let mm = Rc::make_mut(&mut m);
+        for i in func.layout.block_insts(b) {
+            inst_bounds(func, mm, i);
+        }
     }
     visiting.remove(&b);
-    let m = Rc::new(m);
     memo.insert(b, m.clone());
     m
 }
@@ -7054,9 +7058,9 @@ pub(crate) fn end_b(
 pub(crate) fn bound_at(
     func: &Function,
     cfg: &ControlFlowGraph,
-    ememo: &mut FxHashMap<Block, Rc<BoundsMap>>,
-    memo: &mut FxHashMap<Block, Rc<BoundsMap>>,
-    visiting: &mut FxHashSet<Block>,
+    ememo: &mut BMap<Rc<BoundsMap>>,
+    memo: &mut BMap<Rc<BoundsMap>>,
+    visiting: &mut BSet,
     b: Block,
     x: Value,
 ) -> u64 {
@@ -7152,12 +7156,12 @@ fn val_bnd(m: &BoundsMap, func: &Function, x: Value, depth: usize) -> u64 {
 pub fn ovkill(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
 
-    let mut ememo = FxHashMap::default();
-    let mut memo = FxHashMap::default();
-    let mut visiting = FxHashSet::default();
+    let mut ememo = BMap::default();
+    let mut memo = BMap::default();
+    let mut visiting = BSet::default();
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
-        let mut m = (*entry_b(func, &cfg, &mut ememo, &mut memo, &mut visiting, b, 512)).clone();
+        let mut m = entry_b(func, &cfg, &mut ememo, &mut memo, &mut visiting, b, 512);
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
             match func.dfg.insts[i] {
                 InstructionData::Binary {
@@ -7175,7 +7179,7 @@ pub fn ovkill(func: &mut Function) -> usize {
                         _ => a.checked_mul(x),
                     };
                     let Some(lo) = ok.filter(|&s| s <= um) else {
-                        inst_bounds(func, &mut m, i);
+                        inst_bounds(func, Rc::make_mut(&mut m), i);
                         continue;
                     };
                     let mut pos = FuncCursor::new(func).at_inst(i);
@@ -7188,7 +7192,7 @@ pub fn ovkill(func: &mut Function) -> usize {
                     pos.func.dfg.change_to_alias(res[0], nv);
                     pos.func.dfg.change_to_alias(res[1], z);
                     pos.func.layout.remove_inst(i);
-                    m.insert(nv, lo);
+                    Rc::make_mut(&mut m).insert(nv, lo);
                     n += 1;
                 }
                 InstructionData::IntCompare {
@@ -7198,7 +7202,7 @@ pub fn ovkill(func: &mut Function) -> usize {
                 } => {
                     let ty = func.dfg.value_type(args[0]);
                     if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
-                        inst_bounds(func, &mut m, i);
+                        inst_bounds(func, Rc::make_mut(&mut m), i);
                         continue;
                     }
                     let um = umax_ty(ty);
@@ -7237,7 +7241,7 @@ pub fn ovkill(func: &mut Function) -> usize {
                     } else if let Some(k) = iconst(func, args[0]) {
                         (cond.swap_args(), func.dfg.resolve_aliases(args[1]), k)
                     } else {
-                        inst_bounds(func, &mut m, i);
+                        inst_bounds(func, Rc::make_mut(&mut m), i);
                         continue;
                     };
                     let ku = (k as u64) & um;
@@ -7256,9 +7260,9 @@ pub fn ovkill(func: &mut Function) -> usize {
                         n += 1;
                         continue;
                     }
-                    inst_bounds(func, &mut m, i);
+                    inst_bounds(func, Rc::make_mut(&mut m), i);
                 }
-                _ => inst_bounds(func, &mut m, i),
+                _ => inst_bounds(func, Rc::make_mut(&mut m), i),
             }
         }
     }
