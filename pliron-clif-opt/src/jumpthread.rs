@@ -2712,22 +2712,9 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
     let entry = func.layout.entry_block();
     // Values with any use outside their def block: a `y` whose defs all
     // stay internal can be cloned without stranding downstream uses.
-    let mut escaping: FxHashSet<Value> = FxHashSet::default();
-    for x in func.layout.blocks() {
-        for i in func.layout.block_insts(x) {
-            for v in func.dfg.inst_values(i) {
-                let v = func.dfg.resolve_aliases(v);
-                let db = match func.dfg.value_def(v) {
-                    ValueDef::Param(b, _) => Some(b),
-                    ValueDef::Result(di, _) => func.layout.inst_block(di),
-                    _ => None,
-                };
-                if db.is_some_and(|b| b != x) {
-                    escaping.insert(v);
-                }
-            }
-        }
-    }
+    // Built lazily — the whole-function scan only pays when a dispatch
+    // candidate actually survives the cheap gates below.
+    let mut escaping: Option<FxHashSet<Value>> = None;
     let mut edits = Vec::new();
     for p in func.layout.blocks() {
         let Some(term) = func.layout.last_inst(p) else {
@@ -2803,14 +2790,33 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
         }
         // Nothing `y` defines may be observed outside `y`.
         if ok {
+            let esc = escaping.get_or_insert_with(|| {
+                let mut e: FxHashSet<Value> = FxHashSet::default();
+                for x in func.layout.blocks() {
+                    for i in func.layout.block_insts(x) {
+                        for v in func.dfg.inst_values(i) {
+                            let v = func.dfg.resolve_aliases(v);
+                            let db = match func.dfg.value_def(v) {
+                                ValueDef::Param(b, _) => Some(b),
+                                ValueDef::Result(di, _) => func.layout.inst_block(di),
+                                _ => None,
+                            };
+                            if db.is_some_and(|b| b != x) {
+                                e.insert(v);
+                            }
+                        }
+                    }
+                }
+                e
+            });
             for i in insts.iter().take(body.len()) {
                 for r in func.dfg.inst_results(*i).iter() {
-                    if escaping.contains(&func.dfg.resolve_aliases(*r)) {
+                    if esc.contains(&func.dfg.resolve_aliases(*r)) {
                         ok = false;
                     }
                 }
             }
-            if params.iter().any(|pv| escaping.contains(pv)) {
+            if params.iter().any(|pv| esc.contains(pv)) {
                 ok = false;
             }
         }
