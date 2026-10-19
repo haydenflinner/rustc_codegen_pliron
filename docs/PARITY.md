@@ -25,15 +25,16 @@ here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold +
 `NonNull`-i32 `PLIRON_NN_ANYINT` + `dem64` + `clifpeep`
 `ext_load`/`icmpk`/`addnorm`/`icmpred`/`bitmerge`/`post_sweep` +
 `divnarrow`/`ovfk`/`lih`/`band(uextend)` + `selord` (bool-algebra over
-compare-outcome masks + `brif`/`sel` peels), `bench/wasm/run.sh`):
-**~0.995 — at parity** — wins `chars_alpha` −34%, `iterw` −40%,
-`matmul` −12%, `eqbug` −10%, `parse_only` −13%, `contains_rng` −1%;
-`chars_ascii` +35→+10%, `chars_mixed` +50→**+14%** (`unicode_data::`
-`lookup_slow` `Ordering`-decode → single `icmp`), `strwork` +16%,
-`hashmap`/`hmget` ~+21%, `tokenize` +29%, `fib` +10%, `nbody` +7%,
-`sortw`→**-2%**, `sieve` +1.5% — residuals are `Split`/`next_match`/
-`hash`/`memcpy` call-boundary + decode-loop peel + spill-nonnull
-(below).
+compare-outcome masks + `brif`/`sel` peels) + `unroll::merge_arms`
+(`PLIRON_UNROLL_MERGE`, fixed-trip `binary_search` → `select` chain),
+`bench/wasm/run.sh`): **~0.99 — at parity** — wins `chars_alpha` −33%,
+`iterw` −41%, `matmul` −12%, `eqbug` −10%, `parse_only` −13%, `sortw`
+−2%, `contains_rng` −1%; `chars_ascii` +35→+10%, `chars_mixed`
++50→**+7.8%**, `sieve` +1.5%. Remaining: `tokenize` ~+30% and
+`hashmap`/`hmget` ~+21% (non-inlined `next_match`/`hash_one` call
+boundaries — `pliron-ir-opt` inline scope), `strwork` +18% (memcpy/
+code size), `fib` +10%, `nbody` +7% — emission-level `local.set`/`phi`
+copies + specialization duplication (below).
 
 ## How to measure
 
