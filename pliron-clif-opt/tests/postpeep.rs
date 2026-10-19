@@ -10,8 +10,9 @@
 //! - `iconst128`'s `post_sweep`: dead pure insts, `x<<0`-class
 //!   identities, covered `band` masks (`uextend.i32 x8 & 255`).
 
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Function, InstructionData, Opcode, types};
+use cranelift_codegen::ir::{Function, InstructionData, Opcode, Value, types};
 use pliron_clif_opt::clifpeep;
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
 
@@ -49,6 +50,135 @@ fn equiv(before: &Function, after: &Function) {
     if let Err(m) = check(before, after, &Facts::default(), &Config::default()) {
         panic!("mismatch: {m}\n---- after\n{}", after.display());
     }
+}
+
+/// `umul_overflow x, K` → `imul x, K` + `icmp ugt x, MAX/K`: the
+/// emitter expands `umulhi` for the flag (a widened multiply + shift
+/// on wasm); the dividend-side compare is two ops.
+#[test]
+fn ovfk_const_rhs() {
+    let src = "function %f(i32) -> i32, i8 {
+block0(v0: i32):
+    v1 = iconst.i32 10
+    v2, v3 = umul_overflow.i32 v0, v1
+    return v2, v3
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let _ = pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::UmulOverflow), 0, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Umulhi), 0, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Imul), 1, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Icmp), 1, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// Same at i64 — the `umulhi.i64` the emitter would synthesize is ~20
+/// wasm ops; `icmp ugt x, 2^64-1/K` is two.
+#[test]
+fn ovfk_i64() {
+    let src = "function %f(i64) -> i64, i8 {
+block0(v0: i64):
+    v1 = iconst.i64 0x7fff_ffff
+    v2, v3 = umul_overflow.i64 v0, v1
+    return v2, v3
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let _ = pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::UmulOverflow), 0, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Umulhi), 0, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// `band.i32 (uextend.i32 x8), K` → `uextend.i32 (band.i8 x, K)` — the
+/// extension's zeroed high half is masked regardless, so mask at the
+/// source width and widen after (`&255 &1` on call results).
+#[test]
+fn band_uextend_narrows() {
+    let src = "function %f(i8) -> i32 {
+block0(v0: i8):
+    v1 = uextend.i32 v0
+    v2 = iconst.i32 1
+    v3 = band.i32 v1, v2
+    return v3
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let _ = pipeline(&mut f);
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            if let InstructionData::Binary {
+                opcode: Opcode::Band,
+                ..
+            } = f.dfg.insts[i]
+            {
+                assert_eq!(f.dfg.value_type(f.dfg.first_result(i)), types::I8);
+            }
+        }
+    }
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// `icmpk`'s `a + k != b` collapse re-materializes `base + len - 1`
+/// inside the residual loop — `PLIRON_LIH` pulls the invariant spine
+/// back to the entry edge.
+#[test]
+fn lih_invariant_sum() {
+    let src = "function %f(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iconst.i32 0
+    jump block1(v0, v2)
+block1(v3: i32, v4: i32):
+    v5 = iadd.i32 v0, v1
+    v6 = iconst.i32 -1
+    v7 = iadd.i32 v5, v6
+    v8 = icmp ne v3, v7
+    brif v8, block2, block3
+block2:
+    v9 = iconst.i32 1
+    v10 = iadd.i32 v3, v9
+    v11 = iadd.i32 v4, v9
+    jump block1(v10, v11)
+block3:
+    return v4
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let _ = pipeline(&mut f);
+    // `base + len` (and the `-1` tail) must now live outside the loop.
+    let (v0, v1) = (Value::new(0), Value::new(1));
+    let entry = f.layout.entry_block().unwrap();
+    let mut found = false;
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            if let InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } = f.dfg.insts[i]
+            {
+                let (a0, a1) = (
+                    f.dfg.resolve_aliases(args[0]),
+                    f.dfg.resolve_aliases(args[1]),
+                );
+                if (a0 == v0 && a1 == v1) || (a0 == v1 && a1 == v0) {
+                    found = true;
+                    assert_eq!(
+                        f.layout.inst_block(i),
+                        Some(entry),
+                        "invariant iadd stayed in-loop:\n{}",
+                        f.display()
+                    );
+                }
+            }
+        }
+    }
+    assert!(found, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
 }
 
 /// `icmp ne ((len - (-ptr)) - d - 1), 0` — the parse/decode loop bound

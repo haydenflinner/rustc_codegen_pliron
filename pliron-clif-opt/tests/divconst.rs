@@ -4,7 +4,7 @@
 //! magic-division fixups).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::ir::{Function, InstBuilder, InstructionData, Opcode};
+use cranelift_codegen::ir::{Function, InstBuilder, InstructionData, Opcode, types};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
 
 fn parse(src: &str) -> Function {
@@ -206,6 +206,103 @@ fn unsigned_i128() {
     ] {
         check_one_128("udiv", d, 64);
         check_one_128("urem", d, 64);
+    }
+}
+
+/// `PLIRON_DIVNARROW`: an edge-fact-bounded i64 dividend (`brif
+/// (uge i, 1e8)` → `i <= 1e8 - 1` on the else edge) takes the i32
+/// expansion — the emitter's `umulhi.i64` synthesis is ~4x the i32
+/// path's size on targets without a native mulhi (wasm).
+#[test]
+fn narrow_bounded_i64_dividend() {
+    let src = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 100000000
+    v2 = icmp.i64 uge v0, v1
+    brif v2, block3, block2
+block2:
+    v3 = iconst.i64 5
+    v4 = urem.i64 v0, v3
+    return v4
+block3:
+    v5 = iconst.i64 0
+    return v5
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let k = pliron_clif_opt::divconst::run(&mut f);
+    assert_eq!(k, 1, "no expansion:\n{}", f.display());
+    assert!(no_divs(&f), "rem left: {}", f.display());
+    let (mut hi32, mut hi64) = (0, 0);
+    let (mut red, mut ext) = (0, 0);
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            match f.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode: Opcode::Umulhi,
+                    ..
+                } => {
+                    if f.dfg.value_type(f.dfg.first_result(i)) == types::I32 {
+                        hi32 += 1;
+                    } else {
+                        hi64 += 1;
+                    }
+                }
+                InstructionData::Unary { opcode, .. } => match opcode {
+                    Opcode::Ireduce => red += 1,
+                    Opcode::Uextend => ext += 1,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(hi64, 0, "umulhi.i64 left: {}", f.display());
+    assert_eq!(hi32, 1, "no umulhi.i32: {}", f.display());
+    assert_eq!(red, 1, "no ireduce: {}", f.display());
+    assert_eq!(ext, 1, "no uextend: {}", f.display());
+    let cfg = Config {
+        trials: 64,
+        ..Config::default()
+    };
+    if let Err(m) = check(&before, &f, &Facts::default(), &cfg) {
+        panic!("narrow: {m}\n---- after\n{}", f.display());
+    }
+}
+
+/// Unbounded dividends keep the i64 expansion — the bound must be
+/// proven, not assumed.
+#[test]
+fn narrow_keeps_unbounded_i64() {
+    let src = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v3 = iconst.i64 5
+    v4 = urem.i64 v0, v3
+    return v4
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let k = pliron_clif_opt::divconst::run(&mut f);
+    assert_eq!(k, 1, "no expansion:\n{}", f.display());
+    assert!(no_divs(&f));
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            if let InstructionData::Binary {
+                opcode: Opcode::Umulhi,
+                ..
+            } = f.dfg.insts[i]
+            {
+                assert_eq!(
+                    f.dfg.value_type(f.dfg.first_result(i)),
+                    types::I64,
+                    "narrowed without a bound: {}",
+                    f.display()
+                );
+            }
+        }
+    }
+    if let Err(m) = check(&before, &f, &Facts::default(), &Config::default()) {
+        panic!("{m}\n{}", f.display());
     }
 }
 

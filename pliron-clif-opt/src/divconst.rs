@@ -22,10 +22,13 @@
 
 use crate::clifpeep;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
-    Value, types,
+    Block, ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode,
+    Type, Value, types,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 
 /// `v`'s low `w` bits.
 fn mask(w: u32) -> u64 {
@@ -562,6 +565,16 @@ pub fn run(func: &mut Function) -> usize {
     if n == 0 {
         return 0;
     }
+    // `ovkill`-style bound tables, built lazily on the first i64
+    // dividend that might narrow: the CFG walk costs more than the
+    // expansion it enables when there's no candidate.
+    let mut bctx: Option<(
+        ControlFlowGraph,
+        FxHashMap<Block, Rc<clifpeep::BoundsMap>>,
+        FxHashMap<Block, Rc<clifpeep::BoundsMap>>,
+        FxHashSet<Block>,
+    )> = None;
+    let narrow_on = crate::pass_enabled("PLIRON_DIVNARROW");
     let mut pos = FuncCursor::new(func);
     let mut done = 0;
     for (i, x, d, op) in hits128 {
@@ -585,13 +598,57 @@ pub fn run(func: &mut Function) -> usize {
         // replacing the `(x - q) >>> 1 + q` fixup with a plain shift.
         // Only when the bound still exceeds the divisor — `x % d = x`
         // outright for `d > max(x)` but that's a fold elsewhere.
-        let vm = clifpeep::vmax(pos.func, x);
+        let mut vm = clifpeep::vmax(pos.func, x);
+        // `umulhi.i64` synthesizes a 64x64->128 product on targets with no
+        // native mulhi (wasm: ~20 ops vs ~5 for `umulhi.i32`). When the
+        // dividend provably fits u32 — a `brif`-bounded loop counter like
+        // `i` in `i % 5` where the exit test is `i >= 1e8` — run the whole
+        // expansion at i32 and re-widen the result (`PLIRON_DIVNARROW`).
+        // Unsigned only: a `[0, 2^32)` bound can't place a signed dividend.
+        let narrow = narrow_on
+            && ty == types::I64
+            && !matches!(op, Opcode::Sdiv | Opcode::Srem)
+            && d <= u32::MAX as u64
+            && if vm <= u32::MAX as u64 {
+                true
+            } else {
+                let Some(b) = pos.func.layout.inst_block(i) else {
+                    unreachable!("hit inst with no block")
+                };
+                let (cfg, ememo, memo, visiting) = bctx.get_or_insert_with(|| {
+                    (
+                        ControlFlowGraph::with_function(pos.func),
+                        FxHashMap::default(),
+                        FxHashMap::default(),
+                        FxHashSet::default(),
+                    )
+                });
+                let ub = clifpeep::bound_at(pos.func, cfg, ememo, memo, visiting, b, x);
+                if ub <= u32::MAX as u64 {
+                    vm = ub;
+                    true
+                } else {
+                    false
+                }
+            };
         let lz = if vm >= d {
             (ty.bits() as u32).saturating_sub(64 - (vm | 1).leading_zeros())
         } else {
             0
         };
-        let Some(v) = expand(&mut pos, ty, x, d, op, lz) else {
+        let v = if narrow {
+            let x32 = pos.ins().ireduce(types::I32, x);
+            let lz32 = if vm >= d {
+                ((vm as u32) | 1).leading_zeros()
+            } else {
+                0
+            };
+            expand(&mut pos, types::I32, x32, d, op, lz32)
+                .map(|v32| pos.ins().uextend(ty, v32))
+        } else {
+            None
+        };
+        let Some(v) = v.or_else(|| expand(&mut pos, ty, x, d, op, lz)) else {
             continue;
         };
         pos.func.dfg.clear_results(i);

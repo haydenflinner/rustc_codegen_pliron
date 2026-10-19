@@ -19,6 +19,7 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::entity::packed_option::ReservedValue;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData,
@@ -6665,43 +6666,35 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     n
 }
 
-/// Forward-propagate unsigned upper bounds across CFG edges — a
-/// `brif (icmp uge d, 10)` proves `d <= 9` in the fall-through, params
-/// join as the `max` of their edge args — and through add/mul/band
-/// chains; kill provably-dead checks:
-/// `umul_overflow`/`uadd_overflow` flags, `ult (iadd a,b), a` carries, and
-/// compares vs constant the bounds decide. The peeled `acc*10+d` parse
-/// chains (`d <= 9`, <= 8 digits) can't overflow their type.
-pub fn ovkill(func: &mut Function) -> usize {
-    use cranelift_codegen::flowgraph::ControlFlowGraph;
-    type BMap = FxHashMap<Value, u64>;
-    let cfg = ControlFlowGraph::with_function(func);
+/// `ovkill`'s per-value proven unsigned ceiling — shared with
+/// `divconst`'s bounded-dividend narrowing.
+pub(crate) type BoundsMap = FxHashMap<Value, u64>;
 
-    fn umax_ty(ty: Type) -> u64 {
-        let b = ty.bits();
-        if b >= 64 { u64::MAX } else { (1u64 << b) - 1 }
+pub(crate) fn umax_ty(ty: Type) -> u64 {
+    let b = ty.bits();
+    if b >= 64 { u64::MAX } else { (1u64 << b) - 1 }
+}
+pub(crate) fn bnd(m: &BoundsMap, func: &Function, v: Value) -> u64 {
+    // Bounds are recorded under the result value as-written; an
+    // `ovkill` rewrite can turn it into an alias afterwards, so check
+    // both spellings and keep the tighter (either is a valid bound).
+    let mut b = u64::MAX;
+    if let Some(&k) = m.get(&v) {
+        b = b.min(k);
     }
-    fn bnd(m: &BMap, func: &Function, v: Value) -> u64 {
-        // Bounds are recorded under the result value as-written; an
-        // `ovkill` rewrite can turn it into an alias afterwards, so check
-        // both spellings and keep the tighter (either is a valid bound).
-        let mut b = u64::MAX;
-        if let Some(&k) = m.get(&v) {
-            b = b.min(k);
-        }
-        let v = func.dfg.resolve_aliases(v);
-        if let Some(&k) = m.get(&v) {
-            b = b.min(k);
-        }
-        if b != u64::MAX {
-            return b;
-        }
-        if let Some(k) = iconst(func, v) {
-            return (k as u64) & umax_ty(func.dfg.value_type(v));
-        }
-        vmax(func, v)
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(&k) = m.get(&v) {
+        b = b.min(k);
     }
-    fn inst_bounds(func: &Function, m: &mut BMap, i: Inst) {
+    if b != u64::MAX {
+        return b;
+    }
+    if let Some(k) = iconst(func, v) {
+        return (k as u64) & umax_ty(func.dfg.value_type(v));
+    }
+    vmax(func, v)
+}
+pub(crate) fn inst_bounds(func: &Function, m: &mut BoundsMap, i: Inst) {
         for &r in func.dfg.inst_results(i) {
             let t = func.dfg.value_type(r);
             if !t.is_int() || t.is_vector() || t.bits() > 64 {
@@ -6738,12 +6731,12 @@ pub fn ovkill(func: &mut Function) -> usize {
         }
     }
 
-    // `brif (icmp cc x, k)` edge facts: `x <= k-1` on the `ult`/`uge`-fail
-    // edges, `x <= k` on `ule`/`ugt`-fail, `x == k` on `eq`-hit. Only
-    // meaningful when the cond selects this edge — if every destination
-    // is `b` there is no fact.
-    fn edge_fact(func: &Function, pi: Inst, matches: &[(usize, &BlockCall)]) -> BMap {
-        let mut f = BMap::default();
+// `brif (icmp cc x, k)` edge facts: `x <= k-1` on the `ult`/`uge`-fail
+// edges, `x <= k` on `ule`/`ugt`-fail, `x == k` on `eq`-hit. Only
+// meaningful when the cond selects this edge — if every destination
+// is `b` there is no fact.
+fn edge_fact(func: &Function, pi: Inst, matches: &[(usize, &BlockCall)]) -> BoundsMap {
+    let mut f = BoundsMap::default();
         if matches.len() != 1 {
             return f;
         }
@@ -6783,29 +6776,29 @@ pub fn ovkill(func: &mut Function) -> usize {
         f
     }
 
-    // `ememo`: bounds provable at block entry; `memo`: bounds at end.
-    // `visiting`: in-progress `end_b`s — a backedge re-entry returns empty
-    // (unbounded), which is conservative and breaks CFG cycles.
-    fn entry_b(
-        func: &Function,
-        cfg: &ControlFlowGraph,
-        ememo: &mut FxHashMap<Block, Rc<BMap>>,
-        memo: &mut FxHashMap<Block, Rc<BMap>>,
-        visiting: &mut FxHashSet<Block>,
-        b: Block,
-        depth: usize,
-    ) -> Rc<BMap> {
-        if let Some(m) = ememo.get(&b) {
-            return m.clone();
-        }
-        let mut m = BMap::default();
+// `ememo`: bounds provable at block entry; `memo`: bounds at end.
+// `visiting`: in-progress `end_b`s — a backedge re-entry returns empty
+// (unbounded), which is conservative and breaks CFG cycles.
+pub(crate) fn entry_b(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    ememo: &mut FxHashMap<Block, Rc<BoundsMap>>,
+    memo: &mut FxHashMap<Block, Rc<BoundsMap>>,
+    visiting: &mut FxHashSet<Block>,
+    b: Block,
+    depth: usize,
+) -> Rc<BoundsMap> {
+    if let Some(m) = ememo.get(&b) {
+        return m.clone();
+    }
+    let mut m = BoundsMap::default();
         let preds: Vec<_> = cfg.pred_iter(b).collect();
         if !preds.is_empty() && depth > 0 {
             // Edge args → this block's params: `min` over a pred's matching
             // edges, `max` over preds (an unsigned bound is an upper bound —
             // the join must cover every incoming value). Each pred's
             // `icmp` fact qualifies its own edge args.
-            let ebnd = |pe: &BMap, f: &BMap, v: Value| {
+            let ebnd = |pe: &BoundsMap, f: &BoundsMap, v: Value| {
                 let v = func.dfg.resolve_aliases(v);
                 f.get(&v)
                     .map_or_else(|| bnd(pe, func, v), |&fb| fb.min(bnd(pe, func, v)))
@@ -6882,30 +6875,127 @@ pub fn ovkill(func: &mut Function) -> usize {
         ememo.insert(b, m.clone());
         m
     }
-    fn end_b(
-        func: &Function,
-        cfg: &ControlFlowGraph,
-        ememo: &mut FxHashMap<Block, Rc<BMap>>,
-        memo: &mut FxHashMap<Block, Rc<BMap>>,
-        visiting: &mut FxHashSet<Block>,
-        b: Block,
-        depth: usize,
-    ) -> Rc<BMap> {
-        if let Some(m) = memo.get(&b) {
-            return m.clone();
-        }
-        if !visiting.insert(b) {
-            return Rc::new(BMap::default());
-        }
-        let mut m = (*entry_b(func, cfg, ememo, memo, visiting, b, depth)).clone();
-        for i in func.layout.block_insts(b) {
-            inst_bounds(func, &mut m, i);
-        }
-        visiting.remove(&b);
-        let m = Rc::new(m);
-        memo.insert(b, m.clone());
-        m
+pub(crate) fn end_b(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    ememo: &mut FxHashMap<Block, Rc<BoundsMap>>,
+    memo: &mut FxHashMap<Block, Rc<BoundsMap>>,
+    visiting: &mut FxHashSet<Block>,
+    b: Block,
+    depth: usize,
+) -> Rc<BoundsMap> {
+    if let Some(m) = memo.get(&b) {
+        return m.clone();
     }
+    if !visiting.insert(b) {
+        return Rc::new(BoundsMap::default());
+    }
+    let mut m = (*entry_b(func, cfg, ememo, memo, visiting, b, depth)).clone();
+    for i in func.layout.block_insts(b) {
+        inst_bounds(func, &mut m, i);
+    }
+    visiting.remove(&b);
+    let m = Rc::new(m);
+    memo.insert(b, m.clone());
+    m
+}
+
+/// `x`'s proven unsigned ceiling at the top of `b` — `ovkill`'s bound
+/// walk exposed for one-off queries (divconst's dividend narrowing).
+/// `u64::MAX` when nothing is provable. Memo tables are caller-owned:
+/// build them once per function and reuse across queries.
+pub(crate) fn bound_at(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    ememo: &mut FxHashMap<Block, Rc<BoundsMap>>,
+    memo: &mut FxHashMap<Block, Rc<BoundsMap>>,
+    visiting: &mut FxHashSet<Block>,
+    b: Block,
+    x: Value,
+) -> u64 {
+    let m = entry_b(func, cfg, ememo, memo, visiting, b, 512);
+    val_bnd(&m, func, x, 8)
+}
+
+/// `x`'s bound against entry-map `m`, descending `x`'s own def tree so
+/// facts on intermediates (`iadd (bound-param), c`) stay tight. Leaves
+/// resolve via the map, then `iconst`/`vmax`.
+fn val_bnd(m: &BoundsMap, func: &Function, x: Value, depth: usize) -> u64 {
+    if let Some(&u) = m.get(&x) {
+        return u;
+    }
+    let x = func.dfg.resolve_aliases(x);
+    if let Some(&u) = m.get(&x) {
+        return u;
+    }
+    let ty = func.dfg.value_type(x);
+    if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+        return vmax(func, x);
+    }
+    let um = umax_ty(ty);
+    if depth == 0 {
+        return vmax(func, x);
+    }
+    let Some(d) = func.dfg.value_def(x).inst() else {
+        return m.get(&x).copied().unwrap_or_else(|| {
+            iconst(func, x).map_or_else(|| vmax(func, x), |k| (k as u64) & um)
+        });
+    };
+    let b = match func.dfg.insts[d] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) & um,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => val_bnd(m, func, arg, depth - 1),
+        InstructionData::Binary { opcode, args } => {
+            let (a, b) = (
+                val_bnd(m, func, args[0], depth - 1),
+                val_bnd(m, func, args[1], depth - 1),
+            );
+            match opcode {
+                Opcode::Iadd | Opcode::UaddOverflow => {
+                    a.checked_add(b).map_or(um, |s| s.min(um))
+                }
+                Opcode::Imul | Opcode::UmulOverflow => {
+                    a.checked_mul(b).map_or(um, |s| s.min(um))
+                }
+                Opcode::Band => a.min(b),
+                Opcode::Isub => a,
+                Opcode::Ushr => {
+                    if let Some(s) = iconst(func, args[1]) {
+                        um >> ((s as u64) % u64::from(ty.bits()))
+                    } else {
+                        um
+                    }
+                }
+                Opcode::Urem => iconst(func, args[1])
+                    .filter(|&d| d > 0)
+                    .map_or(um, |d| um.min((d as u64) - 1)),
+                _ => return vmax(func, x),
+            }
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select | Opcode::SelectSpectreGuard,
+            args,
+        } => val_bnd(m, func, args[1], depth - 1).max(val_bnd(m, func, args[2], depth - 1)),
+        InstructionData::IntCompare { .. } => 1,
+        _ => return vmax(func, x),
+    };
+    b.min(um)
+}
+
+/// Forward-propagate unsigned upper bounds across CFG edges — a
+/// `brif (icmp uge d, 10)` proves `d <= 9` in the fall-through, params
+/// join as the `max` of their edge args — and through add/mul/band
+/// chains; kill provably-dead checks:
+/// `umul_overflow`/`uadd_overflow` flags, `ult (iadd a,b), a` carries, and
+/// compares vs constant the bounds decide. The peeled `acc*10+d` parse
+/// chains (`d <= 9`, <= 8 digits) can't overflow their type.
+pub fn ovkill(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
 
     let mut ememo = FxHashMap::default();
     let mut memo = FxHashMap::default();
@@ -7783,8 +7873,39 @@ pub fn wide_minmax(func: &mut Function) -> usize {
 fn post_sweep(func: &mut Function) -> usize {
     let mut n = crate::jumpthread::remove_dead_insts(func, true);
     let mut hits = Vec::new();
+    let ovfk_on = crate::pass_enabled("PLIRON_OVFK");
+    let mut ovf: Vec<(Inst, Value, u64)> = Vec::new();
+    // `band.iN (uextend.iN x_M), K` → `uextend.iN (band.iM x, K & maskM)`:
+    // the `uextend` emits a `& mask` on wasm, and `band.iM` results are
+    // already `normed` there — same mask work for free.
+    let mut bue: Vec<(Inst, Value, i64, Type)> = Vec::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
+            // `umul_overflow x, K` → `imul x, K` + `icmp ugt x, MAX/K`:
+            // the emitter expands `umulhi` for the flag (a widened
+            // multiply + shift on wasm); the dividend-side compare is
+            // two ops. `K == 0` → flag false, product 0.
+            if ovfk_on
+                && let InstructionData::Binary {
+                    opcode: Opcode::UmulOverflow,
+                    args,
+                } = func.dfg.insts[i]
+            {
+                let rs = func.dfg.inst_results(i);
+                let ty = rs
+                    .first()
+                    .map(|&r| func.dfg.value_type(r))
+                    .unwrap_or(types::INVALID);
+                if rs.len() == 2 && ty.is_int() && !ty.is_vector() && ty.bits() <= 64 {
+                    let (ka, kb) = (iconst(func, args[0]), iconst(func, args[1]));
+                    let um = umax_ty(ty);
+                    let pick = |k: Option<i64>, x: Value| k.map(|k| (x, (k as u64) & um));
+                    if let Some((x, k)) = pick(kb, args[0]).or_else(|| pick(ka, args[1])) {
+                        ovf.push((i, x, k));
+                    }
+                }
+                continue;
+            }
             let rs = func.dfg.inst_results(i);
             if rs.len() != 1 {
                 continue;
@@ -7833,6 +7954,36 @@ fn post_sweep(func: &mut Function) -> usize {
                                     None => None,
                                 }
                             }
+                            // `band (uextend x), K`: the uextend's
+                            // high-half zeros are masked anyway — do
+                            // the band at the source width and widen
+                            // after (`&255 &1` on call results).
+                            .or_else(|| {
+                                if !ty.is_int() || ty.is_vector() {
+                                    return None;
+                                }
+                                for (a, k) in [(args[0], kb), (args[1], ka)] {
+                                    let (a, Some(k)) = (a, k) else { continue };
+                                    let a = func.dfg.resolve_aliases(a);
+                                    let Some(d) = func.dfg.value_def(a).inst() else {
+                                        continue;
+                                    };
+                                    let InstructionData::Unary {
+                                        opcode: Opcode::Uextend,
+                                        arg: x,
+                                    } = func.dfg.insts[d]
+                                    else {
+                                        continue;
+                                    };
+                                    let st = func.dfg.value_type(x);
+                                    if st.is_int() && !st.is_vector() && st.bits() < ty.bits()
+                                    {
+                                        bue.push((i, func.dfg.resolve_aliases(x), k, st));
+                                        return None;
+                                    }
+                                }
+                                None
+                            })
                         }
                         Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
                             (kb == Some(0)).then_some(args[0])
@@ -7873,6 +8024,47 @@ fn post_sweep(func: &mut Function) -> usize {
         func.dfg.clear_results(i);
         func.layout.remove_inst(i);
         func.dfg.change_to_alias(r, a);
+    }
+    if !ovf.is_empty() || !bue.is_empty() {
+        let mut pos = FuncCursor::new(func);
+        for (i, x, k) in ovf {
+            pos.goto_inst(i);
+            let rs = pos.func.dfg.inst_results(i).to_vec();
+            let args = match pos.func.dfg.insts[i] {
+                InstructionData::Binary { args, .. } => args,
+                _ => continue,
+            };
+            let ty = pos.func.dfg.value_type(rs[0]);
+            let um = umax_ty(ty);
+            let (prod, flag) = match k {
+                0 => (pos.ins().iconst(ty, 0), pos.ins().iconst(types::I8, 0)),
+                1 => (x, pos.ins().iconst(types::I8, 0)),
+                _ => {
+                    let p = pos.ins().imul(args[0], args[1]);
+                    // `x * K` overflows `um` iff `x > um / K`.
+                    let c = pos.ins().iconst(ty, (um / k) as i64);
+                    let f = pos.ins().icmp(IntCC::UnsignedGreaterThan, x, c);
+                    (p, f)
+                }
+            };
+            pos.func.dfg.clear_results(i);
+            pos.func.dfg.change_to_alias(rs[0], prod);
+            pos.func.dfg.change_to_alias(rs[1], flag);
+            pos.func.layout.remove_inst(i);
+            n += 1;
+        }
+        for (i, x, k, st) in bue {
+            pos.goto_inst(i);
+            let rs = pos.func.dfg.inst_results(i).to_vec();
+            let ty = pos.func.dfg.value_type(rs[0]);
+            let km = pos.ins().iconst(st, k & umax_ty(st) as i64);
+            let nb = pos.ins().band(x, km);
+            let ne = pos.ins().uextend(ty, nb);
+            pos.func.dfg.clear_results(i);
+            pos.func.dfg.change_to_alias(rs[0], ne);
+            pos.func.layout.remove_inst(i);
+            n += 1;
+        }
     }
     if crate::pass_enabled("PLIRON_BITMERGE") {
         n += bitmerge(func);
@@ -7955,9 +8147,134 @@ fn post_sweep(func: &mut Function) -> usize {
     // spines, `brif`-dropped selects, `bitmerge`'s inner links) — one
     // more reap, params first so arg-held values can die too.
     if crate::pass_enabled("PLIRON_POSTSWEEP") {
-        let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+        let cfg = ControlFlowGraph::with_function(func);
         crate::jumpthread::remove_dead_params(func, &cfg);
         n += crate::jumpthread::remove_dead_insts(func, true);
+    }
+    if crate::pass_enabled("PLIRON_LIH") {
+        n += hoist_invariants(func);
+    }
+    n
+}
+
+/// `icmpk`/`addnorm` collapse a compare's operand spine where the compare
+/// sits — inside loops that re-materializes `base + len - 1` invariants
+/// every iteration (`parse`'s residual checked loop, `chars`' end test),
+/// and the wasm emitter has no LICM behind this sweep to lift them back.
+/// Pull speculatable single-result insts whose operands are all defined
+/// outside the loop to the entry edge — `licm`'s move, scoped to pure ops
+/// so no aliasing/clobber audit is needed (`PLIRON_LIH=0` off).
+fn hoist_invariants(func: &mut Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let mut la = LoopAnalysis::new();
+    la.compute(func, &cfg, &dt);
+    // Innermost first: an inst hoisted out of an inner loop lands in the
+    // parent body and can hoist again on the same pass.
+    let mut loops: Vec<Loop> = la.loops().collect();
+    loops.sort_by_key(|&lp| {
+        std::cmp::Reverse(
+            func.layout
+                .blocks()
+                .filter(|&b| la.is_in_loop(b, lp))
+                .map(|b| la.loop_level(b).level())
+                .max()
+                .unwrap_or(0),
+        )
+    });
+    let mut n = 0;
+    for lp in loops {
+        let h = la.loop_header(lp);
+        // Exactly one branch destination in from outside (same entry scan
+        // as `licm`'s: multi-entry headers get no safe anchor).
+        let mut entry: Option<Inst> = None;
+        let mut ok = true;
+        for p in cfg.pred_iter(h) {
+            if la.is_in_loop(p.block, lp) {
+                continue;
+            }
+            for bc in func.dfg.insts[p.inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                if bc.block(&func.dfg.value_lists) != h {
+                    continue;
+                }
+                if entry.is_some() {
+                    ok = false;
+                    break;
+                }
+                entry = Some(p.inst);
+            }
+            if !ok {
+                break;
+            }
+        }
+        let Some(pinst) = entry.filter(|_| ok) else {
+            continue;
+        };
+        let pb = func.layout.inst_block(pinst).unwrap();
+        let body: FxHashSet<Block> = func
+            .layout
+            .blocks()
+            .filter(|&b| la.is_in_loop(b, lp))
+            .collect();
+        // The entry block must dominate the header and the header the
+        // body — otherwise `pinst`'s position can't dominate every use.
+        if !dt.try_dominates(pb, h, &func.layout)
+            || !body
+                .iter()
+                .all(|&b| dt.try_dominates(h, b, &func.layout))
+        {
+            continue;
+        }
+        // `v` is loop-invariant when defined outside the body and
+        // dominating `pinst` — it stays valid at `pinst`'s position.
+        let inv = |func: &Function, v: Value| {
+            let v = func.dfg.resolve_aliases(v);
+            match func.dfg.value_def(v) {
+                ValueDef::Result(d, _) => {
+                    func.layout
+                        .inst_block(d)
+                        .is_some_and(|db| !body.contains(&db))
+                        && dt.try_dominates(d, pinst, &func.layout)
+                }
+                ValueDef::Param(b2, _) => {
+                    !body.contains(&b2) && dt.try_dominates(b2, pinst, &func.layout)
+                }
+                _ => false,
+            }
+        };
+        // Two rounds: results of moved insts become outside-the-loop
+        // operands themselves, exposing chains.
+        for _ in 0..2 {
+            let mut moved = 0;
+            for &b in &body.iter().copied().collect::<Vec<_>>() {
+                for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+                    if !crate::licm::speculatable(func, i)
+                        && !matches!(func.dfg.insts[i].opcode(), Opcode::Iconst)
+                    {
+                        continue;
+                    }
+                    if func.dfg.inst_results(i).len() != 1
+                        || !func.dfg.inst_args(i).iter().all(|&a| inv(func, a))
+                    {
+                        continue;
+                    }
+                    // Inserting before `pinst` runs the inst on `pb`'s
+                    // non-loop edges too — speculatable, so just a little
+                    // extra work, never wrong.
+                    func.layout.remove_inst(i);
+                    func.layout.insert_inst(i, pinst);
+                    n += 1;
+                    moved += 1;
+                }
+            }
+            if moved == 0 {
+                break;
+            }
+        }
     }
     n
 }
