@@ -2517,11 +2517,11 @@ pub(crate) fn round<'a>(
 
 /// Splice `jump`-only successors that have no other predecessor into their
 /// predecessor, so a merge block and its test end up in one block.
-pub fn merge_chains(func: &mut Function) {
+pub fn merge_chains(func: &mut Function, cd: &mut Cd) {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = prof.then(std::time::Instant::now);
-    let cfg = ControlFlowGraph::with_function(func);
+    let (cfg, _) = cd.get(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut gone: FxHashSet<Block> = FxHashSet::default();
@@ -2585,6 +2585,9 @@ pub fn merge_chains(func: &mut Function) {
             gone.insert(y);
         }
     }
+    if merges + moves > 0 {
+        cd.stale();
+    }
     if prof {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
@@ -2605,7 +2608,11 @@ pub fn merge_chains(func: &mut Function) {
 /// edge, and rename the uses. Once the exports travel as edge args an
 /// edgespec threading can land on `s` — an enum-discriminant dispatch
 /// whose use-cone is small (a couple of epilogue blocks) then folds.
-pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
+pub fn rebind_exports(
+    func: &mut Function,
+    an: &crate::pipeline::Analysis,
+    cd: &mut Cd,
+) -> usize {
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let t0 = prof2.then(std::time::Instant::now);
@@ -2615,8 +2622,7 @@ pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> us
     // shape changed; same-shape stale entries overcount uses, which
     // only keeps the cone walks conservative.
     let uses = an.uses(func);
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+    let (cfg, dom) = cd.get(func);
     if prof2 {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
@@ -3576,7 +3582,7 @@ pub fn fold_dominated_conds(func: &mut Function) -> usize {
     fold_dominated_conds_at(func, &cfg, &domtree)
 }
 
-fn fold_dominated_conds_at(
+pub(crate) fn fold_dominated_conds_at(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     domtree: &DominatorTree,
@@ -3593,7 +3599,16 @@ fn fold_dominated_conds_at(
 pub fn known_values(func: &Function) -> FxHashMap<Value, u64> {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
-    let mut env: FxHashMap<Value, u64> = dominated_conds(func, &cfg, &domtree)
+    known_values_at(func, &cfg, &domtree)
+}
+
+/// `known_values` over caller-supplied cfg/domtree.
+pub fn known_values_at(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> FxHashMap<Value, u64> {
+    let mut env: FxHashMap<Value, u64> = dominated_conds(func, cfg, domtree)
         .into_iter()
         .map(|(i, k)| (func.dfg.first_result(i), u64::from(k)))
         .collect();
@@ -4137,13 +4152,46 @@ pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
     })
 }
 
-/// `fold_null_tests` behind a fresh `TESTC` check: every fold starts
-/// from an `icmp` on an `iconst`, so without that shape the whole call
-/// — and the `NonNull` fixpoint it needs — is dead work.
-fn cfg_dt(func: &Function) -> (ControlFlowGraph, DominatorTree) {
-    let c = ControlFlowGraph::with_function(func);
-    let d = DominatorTree::with_function(func, &c);
-    (c, d)
+/// One CFG+domtree "graph epoch" shared across a fixpoint's phases:
+/// `stale()` marks edge-adjacency edits, `get` recomputes into the same
+/// storage — the CSR/domtree backing arrays persist across epochs
+/// instead of being dropped and regrown (`with_function` per epoch was
+/// a measurable allocator leaf on 8-round giant functions). `as_ref`/
+/// `as_mut` hand out the pair only while fresh.
+pub struct Cd(Option<(ControlFlowGraph, DominatorTree)>, bool);
+
+impl Cd {
+    pub(crate) fn new() -> Self {
+        Cd(None, false)
+    }
+    pub(crate) fn stale(&mut self) {
+        self.1 = true;
+    }
+    pub(crate) fn get<'a>(
+        &'a mut self,
+        func: &Function,
+    ) -> (&'a ControlFlowGraph, &'a DominatorTree) {
+        if self.1 || self.0.is_none() {
+            let (c, d) = self.0.get_or_insert_with(|| {
+                (ControlFlowGraph::new(), DominatorTree::new())
+            });
+            c.compute(func);
+            d.compute(func, c);
+            self.1 = false;
+        }
+        let (c, d) = self.0.as_ref().unwrap();
+        (c, d)
+    }
+    pub(crate) fn as_ref(&self) -> Option<(&ControlFlowGraph, &DominatorTree)> {
+        (!self.1)
+            .then(|| self.0.as_ref().map(|(c, d)| (&*c, &*d)))
+            .flatten()
+    }
+    pub(crate) fn as_mut(&mut self) -> Option<(&mut ControlFlowGraph, &mut DominatorTree)> {
+        (!self.1)
+            .then(|| self.0.as_mut().map(|(c, d)| (&mut *c, &mut *d)))
+            .flatten()
+    }
 }
 
 fn fnn<'a>(
@@ -4151,7 +4199,7 @@ fn fnn<'a>(
     loads: &'a FxHashSet<Value>,
     derived: &'a VMap<Value>,
     nn: Option<NonNull<'a>>,
-    cd: &mut Option<(ControlFlowGraph, DominatorTree)>,
+    cd: &mut Cd,
 ) -> usize {
     if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
         return 0;
@@ -4159,7 +4207,7 @@ fn fnn<'a>(
     let nn = match nn {
         Some(nn) => nn,
         None => {
-            let (c, _) = cd.get_or_insert_with(|| cfg_dt(func));
+            let (c, _) = cd.get(func);
             NonNull::new(func, c, loads, derived)
         }
     };
@@ -4184,8 +4232,9 @@ pub fn run(
     // no-op scan. JUMP/TESTC *can* appear (domcond folds `brif`→`jump`,
     // threading rewrites args to `iconst`), but nothing below consumes
     // a stale-false JUMP and `fnn` checks TESTC fresh when it runs.
+    let mut cd = Cd::new();
     if sh & shape::JUMP != 0 {
-        merge_chains(func);
+        merge_chains(func, &mut cd);
     }
     if prof {
         if pliron_cfg::tracing_on() {
@@ -4214,10 +4263,10 @@ pub fn run(
     // `change_to_alias` merges reported so the pipeline can carry the
     // dropped params' facts (nonnull/deref/…) onto their carriers.
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
-    // One CFG + domtree per "graph epoch": param/alias/value rewrites
-    // (trivp, deadp, domcond, inst sweeps) leave block adjacency intact,
-    // while ifconv/bypass/round retarget edges and force a rebuild.
-    let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
+    // The `cd` epoch box above is reused through the fixpoint:
+    // param/alias/value rewrites (trivp, deadp, domcond, inst sweeps)
+    // leave adjacency intact, while ifconv/bypass/round retarget edges
+    // and mark it stale.
     // `round` builds NonNull lazily on the first real candidate edge — a
     // quiet round never pays for the fixpoint. `derived` mutates across
     // iterations (ifconv), so the Option is per-iteration; when the loop
@@ -4254,7 +4303,7 @@ pub fn run(
         let mut changed = false;
         if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
             let v = {
-                let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+                let (c, d) = cd.get(func);
                 remove_trivial_params(func, c, d)
             };
             // Removed params become aliases — an edge arg that named
@@ -4275,7 +4324,7 @@ pub fn run(
         }
         if deadp && sh & shape::BPARAM != 0 {
             let removed = {
-                let (c, _) = cd.get_or_insert_with(|| cfg_dt(func));
+                let (c, _) = cd.get(func);
                 remove_dead_params(func, c)
             };
             dead_params += removed;
@@ -4292,7 +4341,7 @@ pub fn run(
             tp = Some(std::time::Instant::now());
         }
         let dc = if domcond && sh & shape::CONDBR != 0 {
-            let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+            let (c, d) = cd.get(func);
             fold_dominated_conds_at(func, c, d)
         } else {
             0
@@ -4322,7 +4371,7 @@ pub fn run(
             crate::ifconv::run(
                 func,
                 derived,
-                cd.as_mut().map(|(c, d)| (&mut *c, &mut *d)),
+                cd.as_mut(),
             )
         } else {
             0
@@ -4330,7 +4379,7 @@ pub fn run(
         check(func, "ifconv");
         if ic > 0 {
             changed = true;
-            cd = None;
+            cd.stale();
             remove_unreachable_blocks(func);
             // The sweep's dead-pred removal can satisfy `edge_ok` for a
             // diamond ifconv's own fixpoint couldn't reach.
@@ -4344,7 +4393,7 @@ pub fn run(
             let mut ev = FxHashSet::default();
             let k = bypass_forwarders(
                 func,
-                cd.as_ref().map(|(c, d)| (&*c, &*d)),
+                cd.as_ref(),
                 Some(&mut ev),
             );
             if let Some(ps) = &mut nn_params {
@@ -4364,7 +4413,7 @@ pub fn run(
             changed = true;
             // Edge retargets invalidate the cached graph before `round`
             // reads it — and can create pure forwarders ifconv wants.
-            cd = None;
+            cd.stale();
             ic_dirty = true;
         }
         if prof {
@@ -4377,7 +4426,7 @@ pub fn run(
             round_skips += 1;
             0
         } else {
-            let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+            let (c, d) = cd.get(func);
             let mut nn_opt = nn_params
                 .take()
                 .map(|ps| NonNull::from_params(loads, derived, ps));
@@ -4413,7 +4462,7 @@ pub fn run(
             };
         }
         if rn > 0 {
-            cd = None;
+            cd.stale();
             ic_dirty = true;
         }
         let n = dc + ic + bpn + rn;

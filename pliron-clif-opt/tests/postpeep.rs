@@ -24,7 +24,7 @@ fn parse(src: &str) -> Function {
 /// `post_sweep`'s DCE/identity cleanup) — mirrors the real pipeline so
 /// dead leftovers don't count.
 fn pipeline(f: &mut Function) -> usize {
-    clifpeep::run(f, false) + clifpeep::iconst128(f)
+    clifpeep::run(f, false) + clifpeep::iconst128(f, true)
 }
 
 fn ops(f: &Function) -> Vec<Opcode> {
@@ -383,7 +383,7 @@ block0(v0: i32):
 }";
     let before = parse(src);
     let mut f = before.clone();
-    let n = clifpeep::iconst128(&mut f);
+    let n = clifpeep::iconst128(&mut f, true);
     assert!(n > 0, "nothing swept: {}", f.display());
     assert_eq!(count(&f, Opcode::Ishl), 0, "{}", f.display());
     assert_eq!(count(&f, Opcode::Band), 0, "{}", f.display());
@@ -452,7 +452,7 @@ block2:
     return v7
 }");
     let mut f = before.clone();
-    let n = clifpeep::iconst128(&mut f);
+    let n = clifpeep::iconst128(&mut f, true);
     assert!(n > 0, "nothing swept: {}", f.display());
     // The brif now tests the icmp directly with swapped targets.
     let brif = f

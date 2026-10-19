@@ -87,7 +87,7 @@ block0(v0: i32, v1: i32):
         ),
         v1
     );
-    pliron_clif_opt::clifpeep::iconst128(&mut f);
+    pliron_clif_opt::clifpeep::iconst128(&mut f, true);
     let text = f.display().to_string();
     assert!(
         text.contains("icmp ugt v0, v1"),

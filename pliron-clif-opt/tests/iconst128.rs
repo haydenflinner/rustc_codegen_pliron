@@ -23,7 +23,7 @@ fn iconst128_lowers_to_iconcat() {
         let k128 = pos.ins().iconst(types::I128, k);
         pos.ins().return_(&[k128]);
         let before = f.clone();
-        let n = pliron_clif_opt::clifpeep::iconst128(&mut f);
+        let n = pliron_clif_opt::clifpeep::iconst128(&mut f, true);
         assert_eq!(n, 1, "k={k}");
         let text = f.display().to_string();
         assert!(!text.contains("iconst.i128"), "k={k}:\n{text}");

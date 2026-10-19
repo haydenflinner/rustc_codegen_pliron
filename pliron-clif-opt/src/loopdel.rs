@@ -27,7 +27,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let mut n = 0;
     while n < MAX_DELETIONS {
         let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
-        let env = crate::jumpthread::known_values(func);
+        let env = crate::jumpthread::known_values_at(func, cfg, dt);
         let Some((lp, exit, args)) = la
             .loops()
             .find_map(|lp| deletable(func, cfg, dt, la, &env, lp))

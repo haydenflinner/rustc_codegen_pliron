@@ -202,6 +202,10 @@ pub struct Pipe<'a> {
     /// member — emit with only the `Gate::Always` correctness
     /// lowerings (same bail class as `giant_max`).
     pub unopt: bool,
+    /// A mutating step reported edits since `iconst128`'s reap last
+    /// ran. `post_sweep`'s whole-function DCE+fold walks are gated on
+    /// this — with nothing mutated they can only re-scan clean IR.
+    pub since_reap: bool,
     pub stats: &'a mut Stats,
     /// Every `(d, w)` pair `carry_one` applied, in order — the
     /// stepcache's fact-delta record (replaying the pairs reproduces
@@ -1600,6 +1604,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             }
         }
         if k > 0 {
+            p.since_reap = true;
             // Alias targets can themselves be aliased later, so chains
             // grow a hop per re-alias — flatten before the next step's
             // per-inst resolves multiply by the depth. Every alias write
@@ -1655,13 +1660,15 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     // neither create CONDBR nor remove JUMP's need here — stale-true
     // bits merely over-admit a no-op scan.
     let mc = an.shape_bits(&p.clctx.func);
+    // Shared cfg/domtree epoch across the merge + dispatch fixpoints:
+    // marked stale on edge edits, recomputed in place on next use.
+    let mut cd = jumpthread::Cd::new();
     if crate::pass_enabled("PLIRON_CHAINMERGE") && mc & shape::JUMP != 0 {
         let t0 = prof2.then(std::time::Instant::now);
-        jumpthread::merge_chains(&mut p.clctx.func);
+        jumpthread::merge_chains(&mut p.clctx.func, &mut cd);
         tt("chains", t0);
     }
     let cond = mc & shape::CONDBR != 0;
-    let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
     if cond && crate::pass_enabled("PLIRON_DISPATCHDUP") {
         let t0 = prof2.then(std::time::Instant::now);
         // Duplicating a dispatch into a jump pred rewires that pred's own
@@ -1669,26 +1676,22 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
         // chains (851/853/854 -> 388 -> 859) fully collapse.
         for _ in 0..6 {
             let k = {
-                let (_, d) = cd.get_or_insert_with(|| {
-                    let c = ControlFlowGraph::with_function(&p.clctx.func);
-                    let d = DominatorTree::with_function(&p.clctx.func, &c);
-                    (c, d)
-                });
+                let (_, d) = cd.get(&p.clctx.func);
                 jumpthread::dispatch_dup(&mut p.clctx.func, d)
             };
             n += k;
             if k == 0 {
                 break;
             }
-            cd = None;
+            cd.stale();
         }
         tt("dup1", t0);
     }
     if cond && crate::pass_enabled("PLIRON_EDGESPEC2") {
-        cd = None;
+        cd.stale();
         if crate::pass_enabled("PLIRON_REBIND") {
             let t0 = prof2.then(std::time::Instant::now);
-            n += jumpthread::rebind_exports(&mut p.clctx.func, an);
+            n += jumpthread::rebind_exports(&mut p.clctx.func, an, &mut cd);
             tt("rebind", t0);
         }
         let t0 = prof2.then(std::time::Instant::now);
@@ -1699,18 +1702,14 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
             // Edgespec can leave fresh jump preds on small dispatch blocks.
             for _ in 0..6 {
                 let k = {
-                    let (_, d) = cd.get_or_insert_with(|| {
-                        let c = ControlFlowGraph::with_function(&p.clctx.func);
-                        let d = DominatorTree::with_function(&p.clctx.func, &c);
-                        (c, d)
-                    });
+                    let (_, d) = cd.get(&p.clctx.func);
                     jumpthread::dispatch_dup(&mut p.clctx.func, d)
                 };
                 n += k;
                 if k == 0 {
                     break;
                 }
-                cd = None;
+                cd.stale();
             }
             tt("dup2", t0);
         }
@@ -2221,13 +2220,17 @@ fn s_slp(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
-fn s_switchmap(p: &mut Pipe, _an: &mut Analysis) -> usize {
+fn s_switchmap(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = switchmap::run(&mut p.clctx.func);
     // The new bounds tests are often implied by a dominating check.
     let f =
         if k > 0 && config().enabled("PLIRON_DOMCOND") && config().enabled("PLIRON_SWITCHMAP_FOLD")
         {
-            let folds = jumpthread::fold_dominated_conds(&mut p.clctx.func);
+            // switchmap::run rewrote edges since the last bump — refresh
+            // the shared epoch rather than building a private cfg/dt.
+            an.invalidate(&p.clctx.func);
+            let (cfg, dt) = an.cfg_dt(&p.clctx.func);
+            let folds = jumpthread::fold_dominated_conds_at(&mut p.clctx.func, cfg, dt);
             p.stats.dominated_folds += folds;
             if folds > 0 {
                 jumpthread::fold_const_branches(&mut p.clctx.func)
@@ -3830,7 +3833,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             any: 0,
             creates: shape::CREATED,
             gate: Gate::Always,
-            run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
+            run: |p, _an| {
+                let reap = p.since_reap;
+                p.since_reap = false;
+                clifpeep::iconst128(&mut p.clctx.func, reap)
+            },
             site: std::sync::OnceLock::new(),
         },
     ]
@@ -3941,6 +3948,7 @@ mod tests {
             dump: false,
             verify_full: false,
             unopt: false,
+            since_reap: false,
             stats: &mut stats,
             carry_log: Vec::new(),
             fn_names: &[],

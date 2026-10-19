@@ -321,6 +321,7 @@ fn with_pipe<R>(
         flags: &flags,
         dump: false,
         verify_full: false,
+        since_reap: false,
         unopt: false,
         stats: &mut stats,
         carry_log: Vec::new(),
@@ -398,7 +399,7 @@ fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
             );
             let mut rows: Vec<_> = stats.timing.iter().collect();
             rows.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
-            for (n, d) in rows.iter().take(24) {
+            for (n, d) in rows.iter().take(200) {
                 println!("  {d:>9.1?}  {n}");
             }
         }

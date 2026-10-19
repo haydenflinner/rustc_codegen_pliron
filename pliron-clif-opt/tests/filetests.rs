@@ -42,7 +42,7 @@ fn pass(name: &str) -> Pass {
         "foldforwarders" => clifpeep::foldforwarders,
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,
-        "iconst128" => clifpeep::iconst128,
+        "iconst128" => |f| clifpeep::iconst128(f, true),
         "unroll" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             let prof = std::collections::HashMap::default();

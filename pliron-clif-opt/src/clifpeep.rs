@@ -9190,7 +9190,7 @@ fn hoist_invariants(func: &mut Function) -> usize {
 /// Runs last in the pipeline, so it also drives `post_sweep`
 /// (`PLIRON_POSTSWEEP=0` off): the dead-inst/identity/covered-mask
 /// residue late passes leave for the emitter.
-pub fn iconst128(func: &mut Function) -> usize {
+pub fn iconst128(func: &mut Function, reap: bool) -> usize {
     let mut n = 0;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
@@ -9212,7 +9212,11 @@ pub fn iconst128(func: &mut Function) -> usize {
             n += 1;
         }
     }
-    if crate::pass_enabled("PLIRON_POSTSWEEP") {
+    // `post_sweep` is three whole-function walks; with no mutation
+    // since entry they can only re-scan already-clean IR. `reap` is the
+    // pipeline's "edits since last reap" bit; our own i128 rewrites
+    // count too.
+    if crate::pass_enabled("PLIRON_POSTSWEEP") && (reap || n > 0) {
         n += post_sweep(func);
     }
     n

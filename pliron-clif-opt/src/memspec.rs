@@ -439,8 +439,8 @@ pub fn run(
             func.dfg.change_to_alias(res, sv);
         }
         n += 1;
-        cfg = ControlFlowGraph::with_function(func);
-        domtree = DominatorTree::with_function(func, &cfg);
+        cfg.compute(func);
+        domtree.compute(func, &cfg);
         uses = an.refresh_uses(func);
         ps = loadfwd::param_src(func);
         (iso, escapes, _) =
