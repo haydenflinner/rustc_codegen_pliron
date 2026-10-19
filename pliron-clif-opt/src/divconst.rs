@@ -512,7 +512,11 @@ fn divisor128(func: &Function, v: Value) -> Option<u128> {
     }
 }
 
-pub fn run(func: &mut Function) -> usize {
+/// `mulhi64_expensive`: true on targets without a one-instruction i64
+/// mulhi (wasm32 — ~20 synthesized ops) where narrowing the expansion to
+/// i32 pays for its ireduce/uextend wrapping. Native ISAs emit `umulh`
+/// directly, so the wrapping is pure overhead there.
+pub fn run(func: &mut Function, mulhi64_expensive: bool) -> usize {
     let mut hits = Vec::new();
     let mut hits128 = Vec::new();
     for b in func.layout.blocks() {
@@ -604,7 +608,10 @@ pub fn run(func: &mut Function) -> usize {
         // `i` in `i % 5` where the exit test is `i >= 1e8` — run the whole
         // expansion at i32 and re-widen the result (`PLIRON_DIVNARROW`).
         // Unsigned only: a `[0, 2^32)` bound can't place a signed dividend.
+        // Native ISAs emit one `umulh` — the wrap costs ~2 insts/div
+        // (measured: parse_only +5% on aarch64), so wasm only.
         let narrow = narrow_on
+            && mulhi64_expensive
             && ty == types::I64
             && !matches!(op, Opcode::Sdiv | Opcode::Srem)
             && d <= u32::MAX as u64

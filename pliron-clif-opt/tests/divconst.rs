@@ -29,7 +29,7 @@ fn check_one(op: &str, ty: &str, d: i64, trials: u32) {
     );
     let before = parse(&src);
     let mut after = before.clone();
-    let k = pliron_clif_opt::divconst::run(&mut after);
+    let k = pliron_clif_opt::divconst::run(&mut after, true);
     assert!(k > 0, "no expansion: {op}.{ty} by {d}");
     assert!(no_divs(&after), "div left: {op}.{ty} by {d}");
     let cfg = Config {
@@ -170,7 +170,7 @@ fn check_one_128(op: &str, d: u128, trials: u32) {
         pos.ins().return_(&[v]);
     }
     let before = f.clone();
-    let k = pliron_clif_opt::divconst::run(&mut f);
+    let k = pliron_clif_opt::divconst::run(&mut f, true);
     assert_eq!(k, 1, "no expansion: {op}.i128 by {d:#x}");
     assert!(no_divs(&f), "div left: {op}.i128 by {d:#x}");
     let cfg = Config {
@@ -230,7 +230,7 @@ block3:
 }";
     let before = parse(src);
     let mut f = before.clone();
-    let k = pliron_clif_opt::divconst::run(&mut f);
+    let k = pliron_clif_opt::divconst::run(&mut f, true);
     assert_eq!(k, 1, "no expansion:\n{}", f.display());
     assert!(no_divs(&f), "rem left: {}", f.display());
     let (mut hi32, mut hi64) = (0, 0);
@@ -270,6 +270,54 @@ block3:
     }
 }
 
+/// Targets with a native i64 mulhi (`mulhi64_expensive = false`) keep
+/// the i64 expansion even when the dividend provably narrows — the
+/// ireduce/uextend wrap is pure overhead next to one `umulh`
+/// (parse_only +5% on aarch64).
+#[test]
+fn narrow_skipped_when_mulhi64_is_native() {
+    let src = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 100000000
+    v2 = icmp.i64 uge v0, v1
+    brif v2, block3, block2
+block2:
+    v3 = iconst.i64 5
+    v4 = urem.i64 v0, v3
+    return v4
+block3:
+    v5 = iconst.i64 0
+    return v5
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let k = pliron_clif_opt::divconst::run(&mut f, false);
+    assert_eq!(k, 1, "no expansion:\n{}", f.display());
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            match f.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode: Opcode::Umulhi,
+                    ..
+                } => assert_eq!(
+                    f.dfg.value_type(f.dfg.first_result(i)),
+                    types::I64,
+                    "narrowed on a native-mulhi target: {}",
+                    f.display()
+                ),
+                InstructionData::Unary {
+                    opcode: Opcode::Ireduce,
+                    ..
+                } => panic!("ireduce on a native-mulhi target: {}", f.display()),
+                _ => {}
+            }
+        }
+    }
+    if let Err(m) = check(&before, &f, &Facts::default(), &Config::default()) {
+        panic!("{m}\n{}", f.display());
+    }
+}
+
 /// Unbounded dividends keep the i64 expansion — the bound must be
 /// proven, not assumed.
 #[test]
@@ -282,7 +330,7 @@ block0(v0: i64):
 }";
     let before = parse(src);
     let mut f = before.clone();
-    let k = pliron_clif_opt::divconst::run(&mut f);
+    let k = pliron_clif_opt::divconst::run(&mut f, true);
     assert_eq!(k, 1, "no expansion:\n{}", f.display());
     assert!(no_divs(&f));
     for b in f.layout.blocks() {
@@ -328,7 +376,7 @@ block3:
 }";
     let before = parse(src);
     let mut f = before.clone();
-    let k = pliron_clif_opt::divconst::run(&mut f);
+    let k = pliron_clif_opt::divconst::run(&mut f, true);
     assert_eq!(k, 1, "no expansion:\n{}", f.display());
     assert!(no_divs(&f));
     for b in f.layout.blocks() {

@@ -2159,7 +2159,13 @@ fn s_bcheck(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_divconst(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = divconst::run(&mut p.clctx.func);
+    // wasm32 CLIF (i32 pointers) is the only path where `umulhi.i64` is a
+    // synthesized sequence rather than one `umulh`/`mul` — that's where
+    // divnarrow's i32 expansion wins.
+    let k = divconst::run(
+        &mut p.clctx.func,
+        p.tcfg.pointer_width == target_lexicon::PointerWidth::U32,
+    );
     if k > 0 && p.dump {
         p.dump("divconst");
     }
