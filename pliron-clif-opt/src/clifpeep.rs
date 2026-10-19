@@ -9168,6 +9168,11 @@ pub fn selfarg(func: &mut Function) -> usize {
         }
     }
     let mut n = 0;
+    // `h` -> (param idx, param value, feed closure) to drop; edge-arg
+    // rewrites for all drops happen in ONE trailing function scan
+    // instead of one scan per dropped param.
+    let mut alldrops: FxHashMap<Block, Vec<(usize, Value, FxHashSet<Inst>)>> =
+        FxHashMap::default();
     for h in func.layout.blocks().collect::<Vec<_>>() {
         // Entry params are signature args, not edge-fed — never drop.
         if Some(h) == func.layout.entry_block() {
@@ -9242,27 +9247,41 @@ pub fn selfarg(func: &mut Function) -> usize {
                 drops.push((idx, p, inset));
             }
         }
-        // Apply in descending param order so earlier removals don't shift
-        // later indices.
-        drops.sort_by_key(|(idx, _, _)| usize::MAX - idx);
-        for (idx, p, inset) in drops {
-            for b2 in func.layout.blocks().collect::<Vec<_>>() {
-                for i in func.layout.block_insts(b2).collect::<Vec<_>>() {
-                    let ndest = func.dfg.insts[i]
-                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                        .len();
-                    for d in 0..ndest {
-                        let dfg = &mut func.dfg;
-                        let bc = &mut dfg.insts[i].branch_destination_mut(
-                            &mut dfg.jump_tables,
-                            &mut dfg.exception_tables,
-                        )[d];
-                        if bc.block(&dfg.value_lists) == h {
-                            bc.remove(idx, &mut dfg.value_lists);
-                        }
-                    }
+        if !drops.is_empty() {
+            // Descending param order so earlier removals don't shift
+            // later indices.
+            drops.sort_by_key(|(idx, _, _)| usize::MAX - idx);
+            alldrops.insert(h, drops);
+        }
+    }
+    if alldrops.is_empty() {
+        return 0;
+    }
+    // One scan for every block's drops: `bc.remove` per dropped index,
+    // highest first so indices stay valid mid-dest.
+    for b2 in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b2).collect::<Vec<_>>() {
+            let ndest = func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .len();
+            for d in 0..ndest {
+                let dfg = &mut func.dfg;
+                let bc = &mut dfg.insts[i].branch_destination_mut(
+                    &mut dfg.jump_tables,
+                    &mut dfg.exception_tables,
+                )[d];
+                let h = bc.block(&dfg.value_lists);
+                let Some(drops) = alldrops.get(&h) else {
+                    continue;
+                };
+                for &(idx, _, _) in drops {
+                    bc.remove(idx, &mut dfg.value_lists);
                 }
             }
+        }
+    }
+    for drops in alldrops.into_values() {
+        for (_, p, inset) in drops {
             func.dfg.remove_block_param(p);
             for i in inset {
                 // A feed inst can appear in another param's closure too

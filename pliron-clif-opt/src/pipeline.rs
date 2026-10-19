@@ -3419,7 +3419,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // and leaves boundcmp's post-inc shape behind.
         step("postinc", "postinc", Gate::Env("PLIRON_POSTINC"), s_postinc).needs(shape::LOOPS),
         step("boundcmp", "boundcmp", Gate::Env("PLIRON_BCMP"), s_boundcmp).needs(shape::LOOPS),
-        step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg),
+        step("selfarg", "selfarg", Gate::Env("PLIRON_SELFARG"), s_selfarg)
+            .needs(shape::BPARAM),
         step("brchain", "brchain", Gate::Env("PLIRON_BRCHAIN"), s_brchain).needs(shape::SWITCH),
         // Sink `splat(const)` defs into their use blocks: a cross-region live
         // splat becomes a spill reload per loop iteration; a local one is a
