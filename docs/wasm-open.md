@@ -4,11 +4,12 @@ Working ledger for "pliron must not lose to LLVM on any wasmbench
 kernel" (geomean first, then per-kernel). Update as items resolve;
 `docs/PARITY.md` holds the measured numbers.
 
-## Status snapshot (bench/wasm/run.sh, post `677c37b`)
+## Status snapshot (bench/wasm/run.sh, post `4756155`)
 
-geomean pliron/llvm = **0.977**. Wins: `chars_alpha` −36%, `iterw`
-−39%, `parse_only` −13%, `matmul` −13%, `eqbug` −9%. Parity: `sieve`
-+1.8%, `sortw` +2.1%, `contains_rng` −2%.
+geomean pliron/llvm = **0.975** (best 0.970 pre-`walias` — swing is
+inside noise). Wins: `chars_alpha` −36%, `iterw` −41%, `parse_only`
+−14%, `matmul` −12%, `eqbug` −10%. Parity: `sieve` +2.5%, `sortw`
++3.6%, `contains_rng` +1.3%.
 
 Landed since: `sfwd` v2 + intra-span DSE (`62dbebb`), `licm` bounded
 loop-invariant `get;get;binop` hoisting (`677c37b`), `bandk` in
@@ -56,16 +57,20 @@ module −5 KiB).
    convenience inline) rather than a global budget change. Deferred to
    whoever owns `pliron-ir-opt` next.
 
-2. **`hashmap` +16 / `hmget` +14 / `tokenize` +16 — locals coalescing
-   (`walias`-class).** Residual `local.set`/`local.get`/`local.tee`
-   churn from waffle materialization. A straight-line `get A; set D …
-   get D → get A` + dead-`set` drop is bounded, but most churn crosses
-   control (phi-edge moves) — a real dataflow problem. Agent claims of
-   this (`b7cd5a7`, `7ebf0f1`, `8d13f65`) were phantom commits — **no
-   `walias`/`pderef`/`sinks`/`localcfg-gto`/`paramcopy`/`ir_callee_size`
-   work exists on main.** If implementing: must be a `wpeep` linear
-   scan with the same barrier discipline as `sfwd`, or a proper
-   reaching-defs pass — decide scope first.
+2. **`hashmap` +16 / `hmget` +13 / `tokenize` +16 — locals coalescing
+   (`walias`-class).** `walias` landed (`4756155`): operand-stack-aware
+   linear scan doing `get;drop` elision, dead-`set`/`tee` → `drop`/`del`,
+   and `get T → get U` copy-forwarding within straight-line spans
+   (path-sensitive state cleared at every `Ctl`/`Br`/`BrIf`;
+   `Nop` self-copy counts as a use). `PLIRON_WASM_WALIAS_MODE` selects
+   transform bits; default 14 = all but pair-cancel. **Parked:** the
+   `set T … get T` pair-cancel bit (1) — its phantom-slot model
+   miscompiled around multi-value calls (`sin`'s `call rem_pio2`
+   returned `(f64,i32,i32,f64)`; `set3` popped an untracked operand
+   because `vstack` cleared at the `call`, so `dv=0` "matched" `get3`
+   at len 0 — fixed via `popped.is_some()` but strwork still showed a
+   `ret differs` miscompile — needs a real dominance/liveness model,
+   not linear-slot tracking).
 
 3. **`br_if` fold — arm1 pure-op relaxation.** Else-retarget landed
    (`9e75ac5`), but `if c {arith/stores;br} else {R}` still can't fold
