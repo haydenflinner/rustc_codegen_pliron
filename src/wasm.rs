@@ -2121,6 +2121,134 @@ fn peep_body_opts(
         }
         ins = out;
     }
+    // Fresh local index for `tee`-captured values / LICM-hoisted
+    // temporaries — shared by every local-minting pass below.
+    let mut next_local = nparams + groups.iter().map(|&(c, _)| c).sum::<u32>();
+    let mut minted = 0u32;
+    const MAX_SFWD_LOCALS: u32 = 48;
+    // Bounded loop-invariant hoisting: a pure `get A; get B; <binop>`
+    // triple inside a `loop` whose locals are written nowhere in the
+    // loop's span recomputes per iteration (chars_ascii's `ptr+off`
+    // bound check, etc.) — hoist it once before the loop into a fresh
+    // local and leave `get T` in place. Only non-trapping binary ops
+    // are hoisted (no div/rem).
+    {
+        let restype = |op: u8| -> Option<u8> {
+            match op {
+                0x6a..=0x6c | 0x71..=0x78 => Some(0x7f), // i32 arith
+                0x46..=0x4f | 0x51..=0x66 => Some(0x7f), // compares -> i32
+                0x7c..=0x7e | 0x83..=0x8a => Some(0x7e), // i64 arith
+                0x92..=0x98 => Some(0x7d),             // f32 arith
+                0xa0..=0xa6 => Some(0x7c),             // f64 arith
+                _ => None,
+            }
+        };
+        let mut k = 0usize;
+        let mut splices: Vec<(usize, Vec<(WPeek, usize, usize, usize)>)> = Vec::new();
+        while k < ins.len() {
+            if !(matches!(ins[k].0, WPeek::Ctl) && b[ins[k].1] == 0x03) {
+                k += 1;
+                continue;
+            }
+            // Match the loop's `end` by depth over Ctl openers.
+            let mut d = 1i32;
+            let mut e = k + 1;
+            while e < ins.len() {
+                if matches!(ins[e].0, WPeek::Ctl) {
+                    match b[ins[e].1] {
+                        0x02 | 0x03 | 0x04 => d += 1,
+                        0x0b => {
+                            d -= 1;
+                            if d == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                e += 1;
+            }
+            if e >= ins.len() {
+                break;
+            }
+            let mut written: FxHashSet<u32> = FxHashSet::default();
+            for m in (k + 1)..e {
+                if let WPeek::Set(l) | WPeek::Tee(l) = ins[m].0 {
+                    written.insert(l);
+                }
+            }
+            let mut seen: FxHashMap<(u32, u32, u8), u32> = FxHashMap::default();
+            let mut hoist: Vec<(WPeek, usize, usize, usize)> = Vec::new();
+            let mut rewrites: Vec<(usize, u32)> = Vec::new();
+            let mut m = k + 1;
+            while m + 2 < e {
+                let (WPeek::Get(a), ..) = ins[m] else {
+                    m += 1;
+                    continue;
+                };
+                let (WPeek::Get(bb), ..) = ins[m + 1] else {
+                    m += 1;
+                    continue;
+                };
+                let (WPeek::Other, s3, ..) = ins[m + 2] else {
+                    m += 1;
+                    continue;
+                };
+                let op = b[s3];
+                if written.contains(&a) || written.contains(&bb) {
+                    m += 1;
+                    continue;
+                }
+                let Some(vt) = restype(op) else {
+                    m += 1;
+                    continue;
+                };
+                if minted >= MAX_SFWD_LOCALS {
+                    m += 1;
+                    continue;
+                }
+                let t = match seen.get(&(a, bb, op)) {
+                    Some(&t) => t,
+                    None => {
+                        let t = next_local;
+                        next_local += 1;
+                        minted += 1;
+                        groups.push((1, vt));
+                        hoist.push((WPeek::Get(a), ins[k].1, ins[k].1, ins[k].3));
+                        hoist.push((WPeek::Get(bb), ins[k].1, ins[k].1, ins[k].3));
+                        // `Other` instrs emit `b[s..e]` — keep the op's
+                        // own byte range so the hoist emits the real op.
+                        hoist.push((ins[m + 2].0, ins[m + 2].1, ins[m + 2].2, ins[k].3));
+                        hoist.push((WPeek::Set(t), ins[k].1, ins[k].1, ins[k].3));
+                        seen.insert((a, bb, op), t);
+                        t
+                    }
+                };
+                rewrites.push((m, t));
+                m += 3;
+            }
+            for (m, t) in rewrites {
+                ins[m].0 = WPeek::Get(t);
+                ins[m + 1].0 = WPeek::Nop(0);
+                ins[m + 2].0 = WPeek::Nop(0);
+            }
+            if !hoist.is_empty() {
+                splices.push((k, hoist));
+            }
+            k = e + 1;
+        }
+        // Splice hoisted preambles before their loops — ascending
+        // position order with a cumulative insert offset.
+        splices.sort_by_key(|(k, _)| *k);
+        let mut acc = 0usize;
+        for (k, vec) in splices {
+            let n = vec.len();
+            for (j, t) in vec.into_iter().enumerate() {
+                ins.insert(k + acc + j, t);
+            }
+            acc += n;
+        }
+    }
     // Materialize `prel` keep-on-stack pushes into the instruction
     // stream so `sfwd`'s operand-stack walk sees a balanced body: each
     // `(pos, local)` pair emits a `local.get` before the instruction at
@@ -2341,10 +2469,6 @@ fn peep_body_opts(
                 rem = rem - covered + pops;
             }
         };
-        // Fresh local index for `tee`-captured values.
-        let mut next_local = nparams + groups.iter().map(|&(c, _)| c).sum::<u32>();
-        let mut minted = 0u32;
-        const MAX_SFWD_LOCALS: u32 = 48;
         for i in 0..ins.len() {
             match ins[i].0 {
                 WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
@@ -3322,6 +3446,59 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
         assert!(has_seq(&out, &[0x28]), "unsound fwd: {out:02x?}");
+    }
+
+    // Loop-invariant `get;get;binop` hoists before the loop into a
+    // minted local; the in-loop triple becomes a single `get`.
+    #[test]
+    fn licm_get_get_add_hoists() {
+        let b = body(
+            8,
+            &[
+                0x03, 0x40, // loop
+                0x20, 0x00, 0x20, 0x01, 0x6a, // get0;get1;i32.add  (invariant)
+                0x20, 0x02, 0x20, 0x03, 0x6b, // get2;get3;i32.sub  (invariant)
+                0x6a, // i32.add (stack operands)
+                0x1a, // drop
+                0x0b, // end
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        // preamble: get0;get1;add;set8;get2;get3;sub;set9; then loop body
+        // starts with get8;get9;i32.add;drop
+        assert!(
+            has_seq(
+                &out,
+                &[
+                    0x20, 0x00, 0x20, 0x01, 0x6a, 0x21, 0x08, // get0;get1;add;set8
+                    0x20, 0x02, 0x20, 0x03, 0x6b, 0x21, 0x09, // get2;get3;sub;set9
+                    0x03, 0x40, // loop
+                    0x20, 0x08, 0x20, 0x09, 0x6a, 0x1a, // get8;get9;add;drop
+                ]
+            ),
+            "licm hoist missing: {out:02x?}"
+        );
+    }
+
+    // A `get;get;binop` triple where either local is written in-loop
+    // stays put.
+    #[test]
+    fn licm_written_local_stays() {
+        let b = body(
+            8,
+            &[
+                0x03, 0x40, // loop
+                0x20, 0x00, 0x20, 0x01, 0x6a, // get0;get1;i32.add
+                0x21, 0x01, // set 1  (writes operand!)
+                0x0b, // end
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        // no `set 8` preamble may appear
+        assert!(
+            !has_seq(&out, &[0x6a, 0x21, 0x08]),
+            "unsound hoist: {out:02x?}"
+        );
     }
 
     // Dead-store elimination: a second same-slot store before any read
