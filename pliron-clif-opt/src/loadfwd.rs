@@ -1420,6 +1420,14 @@ fn pre(
     };
     let mut dom: Option<DominatorTree> = None;
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
+    // `norm_root`/`root_min` results are stable for the apply scan —
+    // `func` is untouched until `fwd` applies below and `ps`/`na`/`bnd`
+    // are all precomputed. Repeated base pointers otherwise re-walk
+    // their ≤16-hop alias/offset chains once per load and ~8× per
+    // store (`na` + `na0` names, select arms).
+    let nr_memo = std::cell::RefCell::new(FxHashMap::<Value, (Root, i64)>::default());
+    let nr0_memo = std::cell::RefCell::new(FxHashMap::<Value, (Root, i64)>::default());
+    let rm_memo = std::cell::RefCell::new(FxHashMap::<Value, (Root, i64)>::default());
     for &b in rpo {
         let mut st: FxHashMap<Loc, St> = ins[&b].iter().map(|&l| (l, St::In)).collect();
         // May-write footprints since block start plus a cleared-state flag,
@@ -1440,7 +1448,7 @@ fn pre(
                 } if notrap(func, i) => {
                     let res = func.dfg.first_result(i);
                     let ty = func.dfg.value_type(res);
-                    let (r, o) = norm_root(func, ps, na, arg);
+                    let (r, o) = *nr_memo.borrow_mut().entry(arg).or_insert_with(|| norm_root(func, ps, na, arg));
                     let loc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
                     if let Some(&s) = st.get(&loc) {
                         // `St::In` with no materializable entry value
@@ -1477,10 +1485,13 @@ fn pre(
                 } if notrap(func, i) => {
                     let val = func.dfg.resolve_aliases(args[0]);
                     let ty = func.dfg.value_type(val);
-                    let (r, o) = norm_root(func, ps, na, args[1]);
+                    let (r, o) = *nr_memo.borrow_mut().entry(args[1]).or_insert_with(|| norm_root(func, ps, na, args[1]));
                     let o = o.wrapping_add(i64::from(i32::from(offset)));
                     let ms_of = |rv: Value, off: i64| {
-                        let (mr, mo) = root_min(func, ps, na, Some(bnd), rv);
+                        let (mr, mo) = *rm_memo
+                            .borrow_mut()
+                            .entry(rv)
+                            .or_insert_with(|| root_min(func, ps, na, Some(bnd), rv));
                         let (mr, mo) = match mr {
                             Root::V(q) => match pm.get(&q) {
                                 Some(&(qr, qo)) => (qr, mo.wrapping_add(qo)),
@@ -1502,7 +1513,7 @@ fn pre(
                     // `na0` name too — `iso`/`ncc` classify under it,
                     // so a store named only under `na`'s `ofrozen` stop
                     // would dodge its kill set (see `transfer`).
-                    let (r0, o0) = norm_root(func, ps, na0, args[1]);
+                    let (r0, o0) = *nr0_memo.borrow_mut().entry(args[1]).or_insert_with(|| norm_root(func, ps, na0, args[1]));
                     let o0 = o0.wrapping_add(i64::from(i32::from(offset)));
                     if r0 != r || o0 != o {
                         kill_st(&mut st, r0, o0, ty, None, &iso, ncc);
@@ -1520,7 +1531,7 @@ fn pre(
                         } = func.dfg.insts[si]
                     {
                         for &a in &sargs[1..] {
-                            let (ra, oa) = norm_root(func, ps, na, a);
+                            let (ra, oa) = *nr_memo.borrow_mut().entry(a).or_insert_with(|| norm_root(func, ps, na, a));
                             let oa = oa.wrapping_add(o);
                             let ms = match ra {
                                 Root::V(arv) => ms_of(arv, oa),
@@ -1529,7 +1540,7 @@ fn pre(
                             let al = (ra, oa, ty);
                             kill_st(&mut st, al.0, al.1, al.2, ms, &iso, ncc);
                             writes.push((al, ms));
-                            let (ra0, oa0) = norm_root(func, ps, na0, a);
+                            let (ra0, oa0) = *nr0_memo.borrow_mut().entry(a).or_insert_with(|| norm_root(func, ps, na0, a));
                             let oa0 = oa0.wrapping_add(o);
                             if ra0 != ra || oa0 != oa {
                                 let a0 = (ra0, oa0, ty);
@@ -1554,8 +1565,20 @@ fn pre(
                     // ran under `na0`, so both names must be in `reach`.
                     let mut reach: FxHashSet<Root> = FxHashSet::default();
                     for v in func.dfg.inst_values(i) {
-                        reach.insert(norm_root(func, ps, na, v).0);
-                        reach.insert(norm_root(func, ps, na0, v).0);
+                        reach.insert(
+                            nr_memo
+                                .borrow_mut()
+                                .entry(v)
+                                .or_insert_with(|| norm_root(func, ps, na, v))
+                                .0,
+                        );
+                        reach.insert(
+                            nr0_memo
+                                .borrow_mut()
+                                .entry(v)
+                                .or_insert_with(|| norm_root(func, ps, na0, v))
+                                .0,
+                        );
                     }
                     st.retain(|&(r, _, _), _| {
                         iso.contains(&r) || (ncc.contains(&r) && !reach.contains(&r))
