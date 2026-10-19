@@ -1899,10 +1899,12 @@ fn peep_body_opts(
     // arm is only local copies + `br` and the else arm reads none of the
     // copied locals (and holds no depth-referencing/structured op), hoist
     // the copies before `if`, emit `br_if` for the edge, drop the
-    // if/else/end wrapper. `PLIRON_WASM_BRF=0` disables. Skipped while
-    // `prel` has hoisted pushes (they emit by byte-position; the reorder
-    // would move them).
-    if crate::env_get("PLIRON_WASM_BRF") != Some("0") && prel.is_empty() {
+    // if/else/end wrapper. `PLIRON_WASM_BRF=0` disables. `prel` hoisted
+    // pushes emit by byte-position — a `prel` anchored inside the folded
+    // region would land at the wrong operand-stack point, so each fold
+    // checks the range it reorders rather than bailing on any prel in
+    // the body.
+    if crate::env_get("PLIRON_WASM_BRF") != Some("0") {
         let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
         let mut i = 0;
         'iter: while i < ins.len() {
@@ -2001,6 +2003,15 @@ fn peep_body_opts(
                     && j < ins.len()
                     && b[ins[j].1] == 0x0b;
                 if !valid {
+                    break 'fold;
+                }
+                // A `prel` anchored inside the reordered range emits at
+                // the wrong operand-stack point — outside it is
+                // untouched.
+                if prel
+                    .iter()
+                    .any(|&(pp, _)| pp >= ins[i].1 && pp <= ins[j].1)
+                {
                     break 'fold;
                 }
                 // The hoisted `writes` hold the arm's (new) value on the
@@ -2687,6 +2698,38 @@ mod wpeep_tests {
         let out = peep_body(&b, &[], &[]).unwrap();
         assert!(!has_seq(&out, &[0x0d]), "unsound br_if: {out:02x?}");
         assert!(has_seq(&out, &[0x0c, 0x01]), "br still there: {out:02x?}");
+    }
+
+    // Regression (wasm `fib` inner loop): `if c { get2;get3;set1;set4;
+    // br L } else { get2;extend;get3;add;tee1;return }` — the else arm
+    // writes a copy dest (allowed — writes aren't reads) and ends in
+    // `return` (safe Ctl — no label operand).
+    #[test]
+    fn backedge_if_fib_shape_folds() {
+        let b = body(
+            6,
+            &[
+                0x03, 0x40, // loop
+                0x20, 0x01, 0x20, 0x04, 0x41, 0x7f, 0x6a, // get1;get4;const-1;add
+                0x10, 0x05, // call 5
+                0x20, 0x04, 0x41, 0x7e, 0x6a, 0x21, 0x02, // get4;const-2;add;set2
+                0x7c, 0x21, 0x03, // i64.add; set3
+                0x20, 0x02, 0x41, 0x02, 0x4f, 0x22, 0x04, // get2;const2;ge_u;tee4
+                0x04, 0x40, // if
+                0x20, 0x02, 0x20, 0x03, 0x21, 0x01, 0x21, 0x04, // get2;get3;set1;set4
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x20, 0x02, 0xad, 0x20, 0x03, 0x7c, 0x22, 0x01, 0x0f, // get2;ext;get3;add;tee1;return
+                0x0b, // end (if)
+                0x0b, // end (loop)
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(
+            has_seq(&out, &[0x20, 0x02, 0x20, 0x03, 0x21, 0x01, 0x21, 0x04, 0x0d, 0x00]),
+            "no br_if fold: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0x0c, 0x01]), "br not folded: {out:02x?}");
     }
 
     // sfwd: `get fp; get v; store` … `get fp; load` re-reads bytes the
