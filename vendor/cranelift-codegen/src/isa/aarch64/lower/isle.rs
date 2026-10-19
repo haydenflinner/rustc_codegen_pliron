@@ -890,11 +890,12 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     /// PLIRON: may a multi-use `iadd` load/store base stay whole in the amode
     /// instead of being decomposed into reg+reg? Free when the sum is needed
-    /// as a value anyway; bounded for small all-address fanout (see
-    /// `Lower::amode_shareable`). Opt-in: `PLIRON_AMODESHARE=1` enables.
+    /// as a value anyway; bounded for small all-address fanout under a
+    /// block-pressure cutoff (see `Lower::amode_shareable`).
+    /// `PLIRON_AMODESHARE=0` disables.
     fn amode_share_ok(&mut self, val: Value) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("PLIRON_AMODESHARE").as_deref() == Ok("1"))
+        *ENABLED.get_or_init(|| std::env::var("PLIRON_AMODESHARE").as_deref() != Ok("0"))
             && self.lower_ctx.amode_shareable(val)
     }
 

@@ -1974,9 +1974,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     /// accesses holds its register over the span while decomposed
     /// reg+reg amodes are free. `value_max_pressure` is the live-in
     /// proxy measured in `compute_use_states`;
-    /// `PLIRON_AMODESHARE_PRESS` tunes the cutoff (default 8 —
-    /// measured: keeps sieve's −5.5% win, drops the sortw/hashmap
-    /// regressions to ~noise; looser thresholds regress).
+    /// `PLIRON_AMODESHARE_PRESS` tunes the cutoff (default 5 —
+    /// measured: keeps the sieve/parse_only wins (~−5%/−3%), and the
+    /// sortw/hashmap hot functions stay byte-identical to OFF; looser
+    /// thresholds regress).
     pub fn amode_shareable(&self, val: Value) -> bool {
         if self.value_ir_uses[val] != ValueUseState::Multiple {
             return false;
@@ -1992,7 +1993,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             std::env::var("PLIRON_AMODESHARE_PRESS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8)
+                .unwrap_or(5)
         });
         self.value_max_pressure[val] <= max
     }

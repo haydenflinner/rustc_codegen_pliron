@@ -681,10 +681,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `compute_use_states` builds `value_non_amode_use` in the same
     inst scan, `arg_is_mem_addr` identifies the address arg of plain
     loads/stores), or when the all-address fanout is ≤3 AND the
-    block's live-in count is ≤ `PLIRON_AMODESHARE_PRESS` (default 8).
+    block's live-in count is ≤ `PLIRON_AMODESHARE_PRESS` (default 5).
     The pressure proxy counts cross-block arg uses per block and
     rolls the max up per value (`value_max_pressure`) — a kept base
     would hold a register across those blocks, and measured
     regressions (sortw +5%, hashmap +2.6% unbounded) live in
     high-pressure blocks while the win (sieve −5.5%) lives in
-    low-pressure ones. Still opt-in: `PLIRON_AMODESHARE=1`.
+    low-pressure ones. Default on (PRESS=5): paired medians give
+    sieve −5.5% / parse_only −3% wins with sortw/hashmap hot fns
+    byte-identical to OFF; `PLIRON_AMODESHARE=0` disables.
