@@ -44,6 +44,7 @@ use cranelift_codegen::ir::{
     Opcode, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 /// Bound on pure-op chains evaluated per value, and on dispatch blocks
 /// threaded per edge.
@@ -415,10 +416,36 @@ fn subv(func: &Function, sub: &FxHashMap<Value, Value>, v: Value) -> Value {
     v
 }
 
+/// Destination args carried through the resolve walk — almost always
+/// a handful of edge arguments, so keep them inline.
+type Args = SmallVec<[Value; 8]>;
+
+/// Walked-block set — bounded by `MAX_HOPS`, so a linear SmallVec beats
+/// a hash set on every insert/remove/contains.
+#[derive(Default)]
+struct Skip(SmallVec<[Block; 32]>);
+
+impl Skip {
+    fn contains(&self, b: &Block) -> bool {
+        self.0.contains(b)
+    }
+    fn insert(&mut self, b: Block) {
+        if !self.0.contains(&b) {
+            self.0.push(b);
+        }
+    }
+    fn remove(&mut self, b: &Block) {
+        self.0.retain(|x| x != b);
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// An edge outcome: a final destination plus substituted arguments, or a
 /// split decided by a condition materializable at the pred's tail.
 enum Edge {
-    Fin(Block, Vec<Value>),
+    Fin(Block, Args),
     Br(A, Box<Edge>, Box<Edge>),
 }
 
@@ -475,9 +502,9 @@ impl<'a> W<'a> {
         &self,
         bc: BlockCall,
         sub: &FxHashMap<Value, Value>,
-    ) -> Option<(Block, Vec<Value>)> {
+    ) -> Option<(Block, Args)> {
         let b = bc.block(&self.func.dfg.value_lists);
-        let mut args = Vec::new();
+        let mut args = Args::new();
         for a in bc.args(&self.func.dfg.value_lists) {
             let BlockArg::Value(v) = a else { return None };
             let v = self.func.dfg.resolve_aliases(v);
@@ -496,7 +523,7 @@ impl<'a> W<'a> {
         &self,
         mut v: Value,
         sub: &FxHashMap<Value, Value>,
-        skipped: &FxHashSet<Block>,
+        skipped: &Skip,
     ) -> Option<A> {
         v = self.func.dfg.resolve_aliases(v);
         for _ in 0..16 {
@@ -655,7 +682,7 @@ impl<'a> W<'a> {
         }
     }
 
-    fn cone_ok(&self, d: Block, skipped: &FxHashSet<Block>) -> bool {
+    fn cone_ok(&self, d: Block, skipped: &Skip) -> bool {
         if d == self.p && skipped.is_empty() {
             return true;
         }
@@ -715,7 +742,7 @@ impl<'a> W<'a> {
     /// not be consumed anywhere downstream (`cone_ok`) and the carried args
     /// must not themselves be skipped defs that a re-walked binding would
     /// have refreshed.
-    fn fin_edge(&self, d: Block, args: &[Value], skipped: &FxHashSet<Block>) -> Option<Edge> {
+    fn fin_edge(&self, d: Block, args: &[Value], skipped: &Skip) -> Option<Edge> {
         if !self.cone_ok(d, skipped) {
             return None;
         }
@@ -732,7 +759,7 @@ impl<'a> W<'a> {
         }
         // The Vec materializes only on the landing edge — every rejected
         // candidate above used to pay a `clone` for nothing.
-        Some(Edge::Fin(d, args.to_vec()))
+        Some(Edge::Fin(d, Args::from_slice(args)))
     }
 
     /// Follow an edge into `d` with `args`, folding through decided
@@ -746,10 +773,10 @@ impl<'a> W<'a> {
         env: FxHashMap<Value, E>,
         sub: FxHashMap<Value, Value>,
         d: Block,
-        args: Vec<Value>,
+        args: Args,
         depth: usize,
         split_ok: bool,
-        skipped: &mut FxHashSet<Block>,
+        skipped: &mut Skip,
     ) -> Option<Edge> {
         if depth >= MAX_HOPS || !self.pure(d) {
             return self.fin_edge(d, &args, skipped);
@@ -924,13 +951,13 @@ impl<'a> W<'a> {
 
 /// A planned replacement terminator for block `p`.
 enum NewTerm {
-    Jump(Block, Vec<Value>),
-    Brif(A, Block, Vec<Value>, Block, Vec<Value>),
+    Jump(Block, Args),
+    Brif(A, Block, Args, Block, Args),
 }
 
-fn call_parts(func: &Function, bc: BlockCall) -> Option<(Block, Vec<Value>)> {
+fn call_parts(func: &Function, bc: BlockCall) -> Option<(Block, Args)> {
     let b = bc.block(&func.dfg.value_lists);
-    let mut args = Vec::new();
+    let mut args = Args::new();
     for a in bc.args(&func.dfg.value_lists) {
         let BlockArg::Value(v) = a else { return None };
         args.push(v);
@@ -939,7 +966,7 @@ fn call_parts(func: &Function, bc: BlockCall) -> Option<(Block, Vec<Value>)> {
 }
 
 /// Flatten to a single edge; a nested split keeps the original destination.
-fn fin(e: Edge, orig: (Block, Vec<Value>)) -> (Block, Vec<Value>) {
+fn fin(e: Edge, orig: (Block, Args)) -> (Block, Args) {
     match e {
         Edge::Fin(b, a) => (b, a),
         Edge::Br(..) => orig,
@@ -975,7 +1002,7 @@ fn plan(
                 args,
                 0,
                 true,
-                &mut FxHashSet::default(),
+                &mut Skip::default(),
             )? {
                 Edge::Br(cv, t, e) => {
                     let (tb, ta) = fin(*t, od.clone());
@@ -1001,7 +1028,7 @@ fn plan(
                         args,
                         0,
                         true,
-                        &mut FxHashSet::default(),
+                        &mut Skip::default(),
                     )? {
                         Edge::Br(cv, t, e) => {
                             let (tb, ta) = fin(*t, od.clone());
@@ -1017,7 +1044,7 @@ fn plan(
                 e => {
                     // Thread one edge past dispatch blocks (split_ok off —
                     // splits only originate at the block's own terminator).
-                    let thread = |bc: BlockCall| -> Option<(Block, Vec<Value>)> {
+                    let thread = |bc: BlockCall| -> Option<(Block, Args)> {
                         let (d, args) = call_parts(func, bc)?;
                         let od = (d, args.clone());
                         if d == p {
@@ -1030,7 +1057,7 @@ fn plan(
                             args,
                             0,
                             false,
-                            &mut FxHashSet::default(),
+                            &mut Skip::default(),
                         )?;
                         Some(fin(e, od))
                     };
@@ -1038,7 +1065,7 @@ fn plan(
                         && tv != ev
                         && (tv == 0 || ev == 0)
                         && let Some(cva) =
-                            w.avail_a(cv, &FxHashMap::default(), &FxHashSet::default())
+                            w.avail_a(cv, &FxHashMap::default(), &Skip::default())
                     {
                         // `cv ? tv : ev` with one side 0: the branch is
                         // decided by `cv` alone (arms swapped when `tv == 0`).
