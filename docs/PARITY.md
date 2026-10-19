@@ -333,19 +333,19 @@ inlining growth; `winline`'s caller-growth cap already took it from 8x.
 | sieve | 1.02 | marking loop is instruction-tight; residual is elsewhere |
 | chars_ascii 0.57, tokenize 0.66, iterw 0.70, contains_rng 0.78, hashmap 0.88, sortw 0.90, fib 0.95 | | ahead |
 
-**Tried and parked** — `PLIRON_AMODESHARE` (aarch64 amode rules keep a
-multi-use `iadd` base whole instead of reg-reg decomposition; opt-in,
-default-off, `vendor/cranelift-codegen` patches #55–56). Strictly
-fewer insts (−290 reg-reg loads, +30 `ldp`/`stp` across the bench
-binary), but unbounded it was a wash: sieve −6%, sortw +5%, hashmap
-+2.6%. Use-shape discriminators (non-amode use, fanout ≤3) each kept
-or lost everything together — wins and losses are in the same class.
-What finally discriminated was a **block live-in pressure proxy**
+**`PLIRON_AMODESHARE` — default on** (aarch64 amode rules keep a
+multi-use `iadd` base whole instead of reg-reg decomposition;
+`vendor/cranelift-codegen` patches #55–56; `PLIRON_AMODESHARE=0`
+disables). Strictly fewer insts where it fires, but unbounded it was
+a wash: sieve −6%, sortw +5%, hashmap +2.6%. Use-shape
+discriminators (non-amode use, fanout ≤3) each kept or lost
+everything together — wins and losses are in the same class. What
+finally discriminated was a **block live-in pressure proxy**
 (cross-block arg uses per block, rolled up per value): gate
 `amode_shareable` = non-amode use OR (fanout ≤3 AND
-`PLIRON_AMODESHARE_PRESS` ≤8) keeps sieve −5.5% and shrinks sortw /
-hashmap to ~+1% (noise). Still opt-in — verify on more workloads
-before default-on.
+`PLIRON_AMODESHARE_PRESS` ≤5). Flipped on at PRESS=5 (`5ad49ed`):
+paired medians give sieve −5.5% / parse_only −3%, and the sortw /
+hashmap hot functions stay byte-identical to the off state.
 
 `PLIRON_REASSOC` (opt-in CLIF pass) reassociates `((r+a)+b)+c`
 accumulator chains into `r+((a+b)+c)` when `r` is a block param — one
