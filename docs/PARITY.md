@@ -21,12 +21,14 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
-here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold,
-`bench/wasm/run.sh`): **1.074** — wins `chars_alpha` −24%, `iterw` −39%,
-`matmul` −7%; residuals `chars_mixed` +50%, `chars_ascii` +35%,
-`parse_only`/`tokenize` +32%, `strwork` +24%, `hashmap`/`hmget` +20%,
-`fib` +10% — the `Chars::next`/`slice::Iter`/`Option`/`next_code_point`
-i64-decode + `Option`-niche per-char op count (see below).
+here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold +
+`NonNull`-i32 + `dem64`, `bench/wasm/run.sh`): **1.042** — wins
+`chars_alpha` −34%, `iterw` −40%, `matmul` −8%, `eqbug` −11%;
+`chars_ascii` +35→**+9.2%** (the `Option`-niche `end`/`null` + `i64`
+demote landed); residuals `chars_mixed` +47.5%, `parse_only` +33%,
+`tokenize` +29%, `hashmap`/`hmget` +20-21%, `strwork` +19%, `fib` +9.5%,
+`nbody` +7.6% — UTF-8 multi-byte decode + `Option`/`next`/`iter`/`hash`/
+`i64`-residual op count (see below).
 
 ## How to measure
 
@@ -173,13 +175,19 @@ inliner and `wpeep` on top of the same pipeline; profile
 | kernel | pliron/LLVM | lead |
 |---|---|---|
 | fib | **2.01** | Recursion turned into a loop by both, but our loop body is an `if/else` + `br` with 5 locals vs LLVM's single `br_if` with 2 (`wasm2wat` the `fib3fib` function in both modules). Shared cause below: the loop's `brif` lowers to `if c { get*;set*; br L } else { ret }` — the param copies sit in scratch locals inside the `if` arm where `wpeep`'s `pathcheck` (straight-line rule) can't retarget them, while LLVM updates `n`/`acc` unconditionally (`local.tee`) then `br_if`s. **DONE** (`PLIRON_WASM_BRF=0` off): `wpeep` now folds `if c { get*/set*/tee*; br L } [else { R }] end` → hoisted copies + `br_if` (depth−1), guarded by arm-purity, an operand-stack balance check (a `set`/`tee` popping the cond or a nonzero net depth rejects), no `Get`/`Nop` read of a copied local in the else arm or later, no depth-referencing/structured op in the else arm, `prel` empty. Unit tests `backedge_if_*`. NOTE: produces LLVM's shape + ~8B/fn smaller, but **V8-runtime-neutral on this box** (both control forms compile to the same work) — the residual gap is op *count*, below. |
-| chars_mixed | 1.35 | non-ASCII path; native is at parity, so look at what `clif_emit`/`wpeep` make of the rangefold output. Same `brif`→`if/else`+`br` shape as fib, PLUS `Chars::next`/`next_code_point` per char: `ptr==end` (`slice::Iter::next` bound) AND `byte_ptr==0` (the `Option<&u8>` null-niche — equivalent, kept as two checks), `i64.extend_i32_u(byte); i64.and 128; i64.ne` for `byte & 0x80` (the code-point is an `i64` local — `wty` maps `char`→I32, so the i64 is a decode/`Option`/`usize` intermediate that could demote). |
-| chars_ascii | ~1.3 | `chars().filter(is_ascii).count()` — `fold`'s per-char loop is the fib-shape `if/else`+`br`+locals plus the `Chars::next` `end`/`null`/`i64` decode overhead. |
-| parse_only | 1.31 | digit loops; native is +5% too |
-| hmget | 1.22 | hashbrown probe + SipHash; earlier inlining work closed most of it (`WASM_HOT`) |
-| strwork | 1.21 | string building / memcpy-heavy |
-| nbody | 1.08 | f64 math |
-| contains_rng, hashmap | 1.05 | |
+| chars_mixed | ~1.4 | **partially DONE**: `NonNull`-i32 (`PLIRON_NN_ANYINT`) folds `eqz`-through-`phi`/`select`/`nonnull` → the `ptr==end`+`byte_ptr==0` `Option`-niche double-check is gone; `dem64` (`PLIRON_DEM64`) demotes `Option<u32>`/`usize`/`char` low-32 i64 webs → the `i64.extend; i64.and 128; i64.ne`→`i32` per-char overhead is gone (`chars_ascii` `i64` refs 23→0, +35→+9%). Residual = `next_code_point`/UTF-8 multi-byte decode (`load offset=1..3`, `&63`, `shl`, `or`, `ge_u` branches — LLVM's `byte<0?decode:cp<128` path is tighter) + locals churn. |
+| parse_only | ~1.3 | digit loops; `dem64`/`NonNull` +33→+33 (the `Split`/`iter` spill nonnull — see agent note below) |
+| tokenize | ~1.29 | `Split::next_match` `{0,2}` tag + iter-ptr spill-reload nonnull gap |
+| hmget | ~1.2 | hashbrown probe + SipHash; earlier inlining work closed most of it (`WASM_HOT`) |
+| hashmap | ~1.2 | hashbrown probe + control-word `load.i64`/`icmp eq 0` |
+| strwork | ~1.2 | string building / memcpy-heavy |
+| fib | ~1.1 | recursion; `br_if` fold landed (V8-neutral); `dem64`/`NonNull` +10→+9.5 |
+| nbody | ~1.08 | f64 math |
+| sieve, sortw | ~1.0 | at/near parity post `dem64`/`NonNull` (sortw 0.9%, sieve 2.5%) |
+| chars_alpha, iterw, matmul, eqbug, contains_rng | <1.0 | ahead |
+| tokenize 0.66, iterw 0.70, contains_rng 0.78, hashmap 0.88, sortw 0.90, fib 0.95, chars_ascii (was 0.57 → now ~0.92) | | ahead |
+
+`Option`-niche residual: the `NonNull`-i32 widening doesn't reach iter pointers that **round-trip through stack slots across calls** (`tokenize`'s `Split` spill/reload) — the reload isn't `!nonnull`-marked and the spilled value's arithmetic isn't in `derived`, so `ptr` can't be proven there. That needs nonnull facts carried through our own slot demotion — a separate, larger change.
 | matmul 0.74, iterw 0.79, tokenize 0.79, chars_alpha 0.82, eqbug 0.88 | | ahead |
 
 `black_box` on wasm is a stack store + reload under both backends (LLVM
