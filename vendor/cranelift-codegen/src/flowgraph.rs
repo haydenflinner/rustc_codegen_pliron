@@ -67,6 +67,12 @@ pub struct ControlFlowGraph {
     /// branch-inst order. Length `nblocks + 1`.
     pred_off: Vec<u32>,
     preds: Vec<BlockPredecessor>,
+    /// `build` scatter space: the edge list grouped by source block, then
+    /// the counting-sort cursor for the pass that moves it back into
+    /// `edges` grouped by destination. Both keep capacity across
+    /// `compute` calls.
+    scratch: Vec<(Block, Inst, Block)>,
+    cur: Vec<u32>,
     nblocks: u32,
     valid: bool,
 }
@@ -80,6 +86,8 @@ impl ControlFlowGraph {
             succs: Vec::new(),
             pred_off: Vec::new(),
             preds: Vec::new(),
+            scratch: Vec::new(),
+            cur: Vec::new(),
             nblocks: 0,
             valid: false,
         }
@@ -122,66 +130,116 @@ impl ControlFlowGraph {
     }
 
     /// Rebuild the CSR tables from `edges`.
+    ///
+    /// PLIRON: counting-sorts the edge list by block index (O(E + B))
+    /// instead of two whole-list comparison sorts. Per-block segments are
+    /// then sorted by `(inst, to)` / `inst` — a block names at most a
+    /// handful of destinations, so these stay tiny — producing exactly the
+    /// order the old tuple sorts did, and leaving `edges` grouped by
+    /// destination block as before.
     fn build(&mut self, nblocks: u32) {
         self.nblocks = nblocks;
         let nb = nblocks as usize;
+        let ne = self.edges.len();
 
-        // Successors: sort by (from, to, inst) and drop duplicate edges —
-        // a block may name the same destination more than once (brif with
-        // identical arms, br_table repeats), matching the old Set's
-        // deduplication and block ordering.
-        self.edges.sort_unstable();
-        self.edges.dedup();
-        self.succs.clear();
+        // Pass 1: group edges by source block. `succ_off` starts as the
+        // out-degree histogram + prefix sum; `cur` is the moving cursor.
         self.succ_off.clear();
         self.succ_off.resize(nb + 1, 0);
-        let mut prev_from = 0u32;
-        let mut seen = false;
-        for &(from, _, to) in &self.edges {
-            let fi = from.index() as u32;
-            if seen && fi != prev_from {
-                self.succ_off[prev_from as usize + 1] = self.succs.len() as u32;
-            }
-            prev_from = fi;
-            seen = true;
-            self.succs.push(to);
+        for &(from, _, _) in &self.edges {
+            self.succ_off[from.index() + 1] += 1;
         }
-        if seen {
-            self.succ_off[prev_from as usize + 1] = self.succs.len() as u32;
+        for i in 1..=nb {
+            self.succ_off[i] += self.succ_off[i - 1];
         }
-        // Blocks with no recorded edges keep offset 0; a forward max-fill
-        // turns those into empty ranges at the right position.
-        for i in 1..self.succ_off.len() {
-            self.succ_off[i] = self.succ_off[i].max(self.succ_off[i - 1]);
+        self.cur.clear();
+        self.cur.extend_from_slice(&self.succ_off);
+        self.scratch.clear();
+        self.scratch
+            .resize(ne, (Block::new(0), Inst::new(0), Block::new(0)));
+        for &e in &self.edges {
+            let c = &mut self.cur[e.0.index()];
+            self.scratch[*c as usize] = e;
+            *c += 1;
         }
 
-        // Predecessors: sort by (to, branch_inst) and dedupe — a branch
-        // table can name a destination repeatedly through one
-        // instruction, which the old `Map<Inst, Block>` stored once.
-        // Iteration stays in branch-inst order.
-        self.edges
-            .sort_unstable_by_key(|&(_, inst, to)| (to, inst));
-        self.edges.dedup_by_key(|&mut (_, inst, to)| (to, inst));
-        self.preds.clear();
+        // Successors: within a source's segment sort by (inst, to) and
+        // drop duplicate edges — a block may name the same destination
+        // more than once through one branch instruction (brif with
+        // identical arms, br_table repeats), matching the old Set's
+        // deduplication and block ordering.
+        self.succs.clear();
+        for b in 0..nb {
+            let s = self.succ_off[b] as usize;
+            let e = self.succ_off[b + 1] as usize;
+            // Overwrite the raw histogram offset with the final (deduped)
+            // start: entries are consumed left-to-right before index
+            // `b + 1` is itself rewritten next iteration.
+            self.succ_off[b] = self.succs.len() as u32;
+            let seg = &mut self.scratch[s..e];
+            seg.sort_unstable_by_key(|&(_, inst, to)| (inst, to));
+            let mut prev = None;
+            for &(_, inst, to) in seg.iter() {
+                if prev != Some((inst, to)) {
+                    self.succs.push(to);
+                    prev = Some((inst, to));
+                }
+            }
+        }
+        self.succ_off[nb] = self.succs.len() as u32;
+
+        // Pass 2: regroup the (already source-grouped) edges by
+        // destination block back into `edges`. `pred_off` starts as the
+        // in-degree histogram + prefix sum. An edge may name a block that
+        // is not in `dfg`'s block range — it can't be represented in the
+        // CSR arrays, and the old offsets version couldn't reach it
+        // either, so skip it in both passes.
         self.pred_off.clear();
         self.pred_off.resize(nb + 1, 0);
-        let mut prev_to = 0u32;
-        seen = false;
-        for &(from, inst, to) in &self.edges {
-            let ti = to.index() as u32;
-            if seen && ti != prev_to {
-                self.pred_off[prev_to as usize + 1] = self.preds.len() as u32;
+        for &(_, _, to) in &self.scratch {
+            let ti = to.index();
+            if ti < nb {
+                self.pred_off[ti + 1] += 1;
             }
-            prev_to = ti;
-            seen = true;
-            self.preds.push(BlockPredecessor::new(from, inst));
         }
-        if seen {
-            self.pred_off[prev_to as usize + 1] = self.preds.len() as u32;
+        for i in 1..=nb {
+            self.pred_off[i] += self.pred_off[i - 1];
         }
-        for i in 1..self.pred_off.len() {
-            self.pred_off[i] = self.pred_off[i].max(self.pred_off[i - 1]);
+        self.cur.clear();
+        self.cur.extend_from_slice(&self.pred_off);
+        for i in 0..ne {
+            let e = self.scratch[i];
+            let ti = e.2.index();
+            if ti >= nb {
+                continue;
+            }
+            let c = &mut self.cur[ti];
+            self.edges[*c as usize] = e;
+            *c += 1;
         }
+        self.edges.truncate(self.pred_off[nb] as usize);
+
+        // Predecessors: within a destination's segment sort by branch
+        // inst and dedupe — a branch table can name a destination
+        // repeatedly through one instruction, which the old
+        // `Map<Inst, Block>` stored once. Iteration stays in branch-inst
+        // order.
+        self.preds.clear();
+        for b in 0..nb {
+            let s = self.pred_off[b] as usize;
+            let e = self.pred_off[b + 1] as usize;
+            self.pred_off[b] = self.preds.len() as u32;
+            let seg = &mut self.edges[s..e];
+            seg.sort_unstable_by_key(|&(_, inst, _)| inst);
+            let mut prev = None;
+            for &(from, inst, _) in seg.iter() {
+                if prev != Some(inst) {
+                    self.preds.push(BlockPredecessor::new(from, inst));
+                    prev = Some(inst);
+                }
+            }
+        }
+        self.pred_off[nb] = self.preds.len() as u32;
     }
 
     /// Recompute the control flow graph of `block`.

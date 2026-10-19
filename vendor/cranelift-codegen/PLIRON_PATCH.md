@@ -650,3 +650,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     largest allocator leaf in the pipeline profile, ~3.5% of samples
     via `visit_block_succs`/`add_edge`). `recompute_block` patches the
     edge list and rebuilds (still O(E); nothing calls it hot).
+
+54. `ControlFlowGraph::build` counting-sorts (`src/flowgraph.rs`): the
+    two whole-edge-list `sort_unstable` calls (by `(from, inst, to)`
+    then `(to, inst)`) are replaced by O(E + B) counting scatters keyed
+    on block index — histogram + prefix-sum offsets + scatter into
+    `scratch`/`edges`, then per-block segment sorts by `(inst, to)` /
+    `inst` (a block names at most a handful of destinations, so these
+    stay tiny). Output order is unchanged; `edges` still ends grouped
+    by destination. CFG build time on the corpus roughly halved.

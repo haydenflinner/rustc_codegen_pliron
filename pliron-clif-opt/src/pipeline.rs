@@ -559,6 +559,10 @@ pub struct Analysis {
     /// inst count changes on value-only rewrites that leave the CFG
     /// intact, while this catches every edge/block/terminator change.
     cfg_fp: Option<u64>,
+    /// `cfg`/`dt`/`la` may describe a pre-bump IR state — the edge
+    /// fingerprint is checked at the next read, not per `bump`, so a
+    /// run of mutating steps between cfg consumers pays one walk total.
+    cfg_dirty: bool,
     cfg: Option<ControlFlowGraph>,
     dt: Option<DominatorTree>,
     la: Option<LoopAnalysis>,
@@ -637,6 +641,7 @@ pub struct CfgDtLa<'a> {
 impl Analysis {
     fn clear(&mut self) {
         self.cfg_fp = None;
+        self.cfg_dirty = false;
         self.spare_cfg = self.cfg.take().or_else(|| self.spare_cfg.take());
         self.spare_dt = self.dt.take().or_else(|| self.spare_dt.take());
         self.spare_la = self.la.take().or_else(|| self.spare_la.take());
@@ -660,11 +665,13 @@ impl Analysis {
     /// shape, so a bit the step could have produced stops certifying
     /// absence from here on.
     pub fn bump(&mut self, func: &Function, creates: u32) {
+        let _ = func;
         self.ver += 1;
         if let Some(s) = &mut self.fshape {
             *s |= creates;
         }
-        if self.cfg.is_some() && self.cfg_fp == Some(edge_fp(func)) {
+        if self.cfg.is_some() {
+            self.cfg_dirty = true;
             self.clear_values();
         } else {
             self.clear();
@@ -673,9 +680,11 @@ impl Analysis {
 
     /// A pass mutated the function mid-step; drop everything computed
     /// against the old state. Same granularity as `bump`: a value-only
-    /// rewrite keeps cfg/dt/la.
+    /// rewrite keeps cfg/dt/la (deferred — see `cfg_dirty`).
     pub fn invalidate(&mut self, func: &Function) {
-        if self.cfg.is_some() && self.cfg_fp == Some(edge_fp(func)) {
+        let _ = func;
+        if self.cfg.is_some() {
+            self.cfg_dirty = true;
             self.clear_values();
         } else {
             self.clear();
@@ -685,6 +694,18 @@ impl Analysis {
     /// Lazily fills the CFG only — `dt`/`la` build in their own
     /// accessors, so a cfg-only consumer doesn't pay for domtree+loops.
     fn materialize(&mut self, func: &Function) {
+        if self.cfg_dirty {
+            self.cfg_dirty = false;
+            // Resolve the deferred edge fingerprint once: a match keeps
+            // cfg/dt/la (value-only rewrites), a miss drops them to the
+            // spare shells for rebuild below.
+            if self.cfg.is_some() && self.cfg_fp != Some(edge_fp(func)) {
+                self.cfg_fp = None;
+                self.spare_cfg = self.cfg.take().or_else(|| self.spare_cfg.take());
+                self.spare_dt = self.dt.take().or_else(|| self.spare_dt.take());
+                self.spare_la = self.la.take().or_else(|| self.spare_la.take());
+            }
+        }
         if self.cfg.is_some() {
             debug_assert_eq!(
                 self.cfg_fp,
@@ -699,6 +720,21 @@ impl Analysis {
             self.cfg = Some(cfg);
             self.cfg_ns += t.elapsed().as_nanos() as u64;
             self.cfg_builds += 1;
+        }
+    }
+
+    /// Hand the pipeline's cfg/domtree to the Context at pipeline end.
+    /// Materialize first — under `cfg_dirty` the cached graph may be
+    /// stale and must be checked before it is exported.
+    pub fn take_cfg_dt(
+        &mut self,
+        func: &Function,
+    ) -> Option<(ControlFlowGraph, DominatorTree)> {
+        self.materialize(func);
+        if self.cfg.is_some() && self.dt.is_some() {
+            Some((self.cfg.take().unwrap(), self.dt.take().unwrap()))
+        } else {
+            None
         }
     }
 
@@ -1245,10 +1281,9 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     p.stats.la_ns += an.la_ns;
     p.stats.la_builds += an.la_builds;
     // Hand the pipeline's cfg/domtree to the Context — still exact for
-    // the final IR state (`Some` implies `cfg_fp` matched at last
-    // materialize and nothing invalidated since), so `optimize()`
-    // skips its per-fn rebuild.
-    if let (Some(c), Some(d)) = (an.cfg.take(), an.dt.take()) {
+    // the final IR state (`take_cfg_dt` resolves the deferred edge
+    // fingerprint first), so `optimize()` skips its per-fn rebuild.
+    if let Some((c, d)) = an.take_cfg_dt(&p.clctx.func) {
         p.clctx.cfg = c;
         p.clctx.domtree = d;
         tracing::debug!(target: "pliron::pipeline", "seeded cfg+dt for {}", p.fname);
