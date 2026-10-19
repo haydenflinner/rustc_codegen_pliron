@@ -84,9 +84,16 @@ Next steps, in expected-payoff order:
    pool; `PLIRON_CGUPAR=0`, `PLIRON_OPT_BISECT` and `--jobs-frontend`
    keep the serial path. regex-syntax 6.57 → 2.27; kernels 1.94 → 0.98.
    Remaining in that gap: the front half (MIR→pliron `define`s) is still
-   main-thread-serial, and each job's inner lowering spawns its own
-   per-function threads — a shared pool or `PLIRON_PAR` capping would
-   cut the oversubscription.
+   main-thread-serial, and each job's inner lowering used to spawn its
+   own per-function threads — **done** (`e246be2`): one process-wide
+   `VecDeque`+condvar queue sized to `available_parallelism`/`PLIRON_PAR`
+   serves every CGU's phase-B jobs; `FnJob`/`JobShared` are fully owned
+   (`'static`, profiler via Arc'd `SelfProfilerRef`) and a producer that
+   finishes lowering drains queue items itself while waiting on its own
+   results. regex-syntax wall was neutral (3.16→3.21 s, user +0.2 s —
+   cgupool's ordinals already limited concurrent phase-B), but thread
+   count is now bounded regardless of CGU fan-out and no core parks in
+   a drain while jobs sit queued.
 2. ~~Applicability prechecks~~ **done**: `shape_of` computes a bitmask
    of function-shape facts (loops, brifs, params, inst kinds) in one
    pass; `Step::needs`/`needs_any` gate heavy steps before their
