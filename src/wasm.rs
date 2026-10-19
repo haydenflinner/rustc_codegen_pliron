@@ -3656,7 +3656,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // optimizer doesn't recover the rest. Not a rule.
     // Loop-body callsites execute the call every iteration, so a
     // moderately-sized callee is worth duplicating there.
-    const HOT: usize = 36;
+    let hot_cap = crate::env_get("PLIRON_WASM_HOT")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(36);
     // `#[inline]` (LLVM `inlinehint`) callees: LLVM's inliner gives the
     // attribute a large budget bonus â€” mirror that with a raised cap.
     // Off by default: on a real std workload (regex wbig) it added
@@ -3779,7 +3781,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                                 || n <= TINY
                                 || (k == 1 && refs[fi] == 0 && n <= SOLO)
                                 || gc_done
-                                || (inloop.contains(&blk) && n <= HOT)
+                                || (inloop.contains(&blk) && n <= hot_cap)
                             {
                                 sites.push((iv, fi));
                             }
