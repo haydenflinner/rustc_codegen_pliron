@@ -468,6 +468,36 @@ impl<'a> NonNull<'a> {
         nn
     }
 
+    /// Wrap a caller-kept `params` set — skips the seed+proof fixpoint
+    /// entirely. The set must only ever *shrink* between rounds (drop
+    /// params whose in-edges changed); it may contain dead values —
+    /// queries only name live ones, so stragglers are harmless.
+    fn from_params(
+        loads: &'a FxHashSet<Value>,
+        derived: &'a FxHashMap<Value, Value>,
+        params: FxHashSet<Value>,
+    ) -> Self {
+        NonNull {
+            loads,
+            derived,
+            params,
+            nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
+            nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
+        }
+    }
+
+    /// Drop proofs for params of `evict` blocks — an in-edge's args
+    /// feed every param slot of its target, so a new or rewritten edge
+    /// invalidates the whole block's entries.
+    pub(crate) fn evict_params(&mut self, func: &Function, evict: &FxHashSet<Block>) {
+        if evict.is_empty() {
+            return;
+        }
+        self.params.retain(|&p| {
+            !matches!(func.dfg.value_def(p), ValueDef::Param(b, _) if evict.contains(&b))
+        });
+    }
+
     pub fn is(&self, func: &Function, v: Value) -> bool {
         self.is_deps(func, v, &mut FxHashSet::default())
     }
@@ -1883,6 +1913,13 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 }
 
 /// Thread one round; returns the number of edges retargeted.
+///
+/// `evict` lets a caller keep a `NonNull` across rounds: it collects the
+/// blocks whose in-edges changed — an applied edit retargets `e.pinst`'s
+/// edge onto `e.s`, and a `repair` additionally appends args onto the
+/// `term`/`extra`/`reg` edges — so every touched target's param proofs
+/// are stale. Fresh params appended by a repair are simply absent from
+/// the kept set (unproven) — sound, just less proven.
 pub(crate) fn round<'a>(
     func: &mut Function,
     loads: &'a FxHashSet<Value>,
@@ -1891,6 +1928,7 @@ pub(crate) fn round<'a>(
     domcond: bool,
     cfg: &ControlFlowGraph,
     domtree: &DominatorTree,
+    mut evict: Option<&mut FxHashSet<Block>>,
 ) -> usize {
     // Both whole-function indexes are consulted only once a candidate
     // edge actually threads — lazy so a no-work round is a linear scan.
@@ -2387,7 +2425,35 @@ pub(crate) fn round<'a>(
     }
     let n = kept.len();
     for e in kept {
+        if let Some(ev) = evict.as_deref_mut() {
+            ev.insert(e.s);
+        }
         if let Some((term, ti, needed, reg, extra)) = e.repair {
+            // Repairs append params to `e.s` and rewrite `reg`/`term`/
+            // `extra` inst operands — those terminators' edge args feed
+            // param proofs a kept `NonNull` holds, so evict their
+            // targets as well. Fresh params appended here are simply
+            // absent from the kept set (unproven) — sound.
+            if let Some(ev) = evict.as_deref_mut() {
+                let dfg = &func.dfg;
+                let mut dests = |i: Inst| {
+                    for bc in dfg
+                        .insts[i]
+                        .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                    {
+                        ev.insert(bc.block(&dfg.value_lists));
+                    }
+                };
+                dests(term);
+                for &(q, _) in &extra {
+                    dests(q);
+                }
+                for &x in &reg {
+                    if let Some(lt) = func.layout.last_inst(x) {
+                        dests(lt);
+                    }
+                }
+            }
             let mut to: FxHashMap<Value, Value> = FxHashMap::default();
             for &w in &needed {
                 let ty = func.dfg.value_type(w);
@@ -2895,6 +2961,7 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
 fn bypass_forwarders(
     func: &mut Function,
     cd: Option<(&ControlFlowGraph, &DominatorTree)>,
+    mut evict: Option<&mut FxHashSet<Block>>,
 ) -> usize {
     // A caller-held cfg/domtree is reusable: retargets only shrink `b`'s
     // pred lists (a stale entry fails the `bc.block == b` re-check) and
@@ -3039,6 +3106,9 @@ fn bypass_forwarders(
                 dfg.insts[pinst]
                     .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
                     nbc;
+                if let Some(ev) = evict.as_deref_mut() {
+                    ev.insert(t);
+                }
                 n += 1;
             }
         }
@@ -4170,6 +4240,14 @@ pub fn run(
     // any edit since the last nested ifconv, including that call's own
     // `unreach` sweep (dead-pred removal can satisfy `edge_ok`).
     let mut ic_dirty = true;
+    // The `NonNull` proof fixpoint persists across rounds as a bare
+    // param set — `round` re-wraps it each iteration (`from_params`),
+    // `bypass`/`round` retargets evict just the touched targets'
+    // params, `trivp`/`deadp`/`unreach` removals keep it sound (proofs
+    // only shrink), and `ifconv` conversions drop it wholesale. The
+    // `Option<NonNull>` itself can't outlive a round: `ifconv` needs
+    // `&mut *derived` while `NonNull` holds it shared.
+    let mut nn_params: Option<FxHashSet<Value>> = None;
     for _ in 0..8 {
         let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
@@ -4178,6 +4256,12 @@ pub fn run(
                 let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
                 remove_trivial_params(func, c, d)
             };
+            // Removed params become aliases — an edge arg that named
+            // one now resolves to its carrier, so kept `NonNull` proofs
+            // are stale even where edge shapes didn't change.
+            if !v.is_empty() {
+                nn_params = None;
+            }
             changed = !v.is_empty();
             pmap.extend(v);
             check(func, "trivp");
@@ -4214,6 +4298,11 @@ pub fn run(
         };
         changed |= dc > 0;
         dominated_folds += dc;
+        if dc > 0 {
+            // `func.replace` aliases the folded compare onto an
+            // `iconst` — edge args naming it resolve differently now.
+            nn_params = None;
+        }
         check(func, "domcond");
         if prof {
             if pliron_cfg::tracing_on() {
@@ -4245,10 +4334,27 @@ pub fn run(
             // The sweep's dead-pred removal can satisfy `edge_ok` for a
             // diamond ifconv's own fixpoint couldn't reach.
             ic_dirty = true;
+            // Conversions splice selects and retarget merge edges —
+            // too entangled for per-block eviction.
+            nn_params = None;
         }
         check(func, "unreach");
         let bpn = if sh & shape::MULTI != 0 {
-            bypass_forwarders(func, cd.as_ref().map(|(c, d)| (&*c, &*d)))
+            let mut ev = FxHashSet::default();
+            let k = bypass_forwarders(
+                func,
+                cd.as_ref().map(|(c, d)| (&*c, &*d)),
+                Some(&mut ev),
+            );
+            if let Some(ps) = &mut nn_params {
+                ps.retain(|&p| {
+                    !matches!(
+                        func.dfg.value_def(p),
+                        ValueDef::Param(b, _) if ev.contains(&b)
+                    )
+                });
+            }
+            k
         } else {
             0
         };
@@ -4266,13 +4372,37 @@ pub fn run(
             };
             tp = Some(std::time::Instant::now());
         }
-        let mut nn_opt = None;
         let rn = if sh & shape::CONDBR == 0 || (round_quiet && !changed) {
             round_skips += 1;
             0
         } else {
             let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
-            round(func, loads, derived, &mut nn_opt, domcond, c, d)
+            let mut nn_opt = nn_params
+                .take()
+                .map(|ps| NonNull::from_params(loads, derived, ps));
+            let mut evict = FxHashSet::default();
+            let rn = round(
+                func,
+                loads,
+                derived,
+                &mut nn_opt,
+                domcond,
+                c,
+                d,
+                Some(&mut evict),
+            );
+            // `round`'s retargets handed each `evict` block a new or
+            // rewritten in-edge — drop those params' stale proofs.
+            nn_params = nn_opt.map(|n| n.params);
+            if let Some(ps) = &mut nn_params {
+                ps.retain(|&p| {
+                    !matches!(
+                        func.dfg.value_def(p),
+                        ValueDef::Param(b, _) if evict.contains(&b)
+                    )
+                });
+            }
+            rn
         };
         round_quiet = rn == 0;
         check(func, "round");
@@ -4288,7 +4418,9 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
-            fnn_cur = Some(fnn(func, loads, derived, nn_opt, &mut cd));
+            // `fold_null_tests` on the converged function — a fresh
+            // `NonNull` matches the proofs a rebuild would produce.
+            fnn_cur = Some(fnn(func, loads, derived, None, &mut cd));
             break;
         }
         // No refresh needed: the guarded bits can only shrink inside

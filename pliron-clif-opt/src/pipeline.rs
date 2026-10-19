@@ -1747,6 +1747,7 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // a round that threads nothing never pays for the fixpoint.
     let mut nn: Option<jumpthread::NonNull> = None;
     for i in 0..8 {
+        let mut evict = FxHashSet::default();
         let n = {
             let (c, d) = cd.get_or_insert_with(|| {
                 let c = ControlFlowGraph::with_function(&p.clctx.func);
@@ -1761,11 +1762,14 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
                 crate::pass_enabled("PLIRON_DOMCOND"),
                 c,
                 d,
+                Some(&mut evict),
             )
         };
         if n > 0 {
             cd = None;
-            nn = None;
+            if let Some(nnv) = &mut nn {
+                nnv.evict_params(&p.clctx.func, &evict);
+            }
         }
         total += n;
         if p.dump {
