@@ -9344,7 +9344,7 @@ fn hoist_invariants(func: &mut Function) -> usize {
 /// Runs last in the pipeline, so it also drives `post_sweep`
 /// (`PLIRON_POSTSWEEP=0` off): the dead-inst/identity/covered-mask
 /// residue late passes leave for the emitter.
-pub fn iconst128(func: &mut Function, reap: bool) -> usize {
+fn iconst128_sweep(func: &mut Function) -> usize {
     let mut n = 0;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
@@ -9366,12 +9366,24 @@ pub fn iconst128(func: &mut Function, reap: bool) -> usize {
             n += 1;
         }
     }
+    n
+}
+
+pub fn iconst128(func: &mut Function, reap: bool) -> usize {
+    let mut n = iconst128_sweep(func);
     // `post_sweep` is three whole-function walks; with no mutation
     // since entry they can only re-scan already-clean IR. `reap` is the
     // pipeline's "edits since last reap" bit; our own i128 rewrites
     // count too.
     if crate::pass_enabled("PLIRON_POSTSWEEP") && (reap || n > 0) {
-        n += post_sweep(func);
+        let m = post_sweep(func);
+        n += m;
+        // `post_sweep`'s folds materialize constants of widened types
+        // (`icmpred`, `bandk`) — the i128 sweep must stay literally
+        // last, or a fresh `iconst.i128` escapes to isel.
+        if m > 0 {
+            n += iconst128_sweep(func);
+        }
     }
     n
 }
@@ -12586,5 +12598,68 @@ mod tests {
         };
         assert_eq!(func.dfg.value_type(arg), types::I64);
         dem64_verify(&func, "dem64 brif hi0");
+    }
+
+
+
+    /// `post_sweep` runs after `iconst128`'s legalization sweep, so a
+    /// fold that re-materializes a widened constant can mint a bare
+    /// `iconst.i128` that escapes — `const_panic`'s
+    /// `panic_inner::<u128>` hit `iconst_bounds` this way when
+    /// `icmpred` widened `icmp.u8 (ireduce x128), 10` to the i128
+    /// source (`uextend`'s cover proves the operand fits).
+    #[test]
+    fn iconst128_sweeps_icmpred_widened_const() {
+        let mut func = dem64_func(&[types::I8]);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let p = func.dfg.append_block_param(entry, types::I8);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let w = cur.ins().uextend(types::I128, p);
+        let n = cur.ins().ireduce(types::I8, w);
+        let k = cur.ins().iconst(types::I8, 10);
+        let c = cur.ins().icmp(IntCC::UnsignedLessThan, n, k);
+        let out = cur.ins().uextend(types::I64, c);
+        cur.ins().return_(&[out]);
+
+        iconst128(&mut func, true);
+        assert!(
+            !func.display().to_string().contains("iconst.i128"),
+            "post_sweep minted an unlegalized iconst.i128:\n{}",
+            func.display()
+        );
+        dem64_verify(&func, "iconst128 post_sweep icmpred");
+    }
+
+    /// `bandk`'s zero-fold is the second post_sweep emitter that can
+    /// reach i128: `band.i128 (band.i128 x, 15), 240` folds to a
+    /// constant 0 that must come out as an `iconcat` pair.
+    #[test]
+    fn iconst128_sweeps_bandk_zero() {
+        let mut func = dem64_func(&[types::I128]);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let p = func.dfg.append_block_param(entry, types::I128);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let k1 = cur.ins().iconst(types::I64, 15);
+        let k2 = cur.ins().iconst(types::I64, 0);
+        let m1 = cur.ins().iconcat(k1, k2);
+        let inner = cur.ins().band(p, m1);
+        let k3 = cur.ins().iconst(types::I64, 240);
+        let k4 = cur.ins().iconst(types::I64, 0);
+        let m2 = cur.ins().iconcat(k3, k4);
+        let z = cur.ins().band(inner, m2);
+        let lo = cur.ins().ireduce(types::I64, z);
+        cur.ins().return_(&[lo]);
+
+        iconst128(&mut func, true);
+        assert!(
+            !func.display().to_string().contains("iconst.i128"),
+            "post_sweep minted an unlegalized iconst.i128:\n{}",
+            func.display()
+        );
+        dem64_verify(&func, "iconst128 post_sweep bandk");
     }
 }
