@@ -139,7 +139,17 @@ Next steps, in expected-payoff order:
    backing storage instead of regrowing bforest node pools (the #1
    allocator ancestor, ~3.5% of pipeline samples via
    `visit_block_succs`): `clif-check bench` 28.4 → 28.0 s, .o members
-   byte-identical, corpus clean. Left: jumpthread ~4.0 s (a ~6-phase
+   byte-identical, corpus clean. The CFG edge build itself is
+   counting-sorted (O(E+B) bucket scatters keyed on block index, ~114 →
+   58 ms of analysis-build time). `slp`'s per-block `SecondaryMap`s are
+   stamp-reset dense maps allocated once per `run` (the reset was
+   O(blocks × insts)); `jumpthread`'s nested `ifconv::run` is gated on
+   an `ic_dirty` flag (only edits that can expose a new pure forwarder
+   re-scan), a quiet round skips the identical follow-up, and the
+   `NonNull` param-proof fixpoint persists across rounds as a bare
+   `FxHashSet` with per-block eviction on retargets — dropped wholesale
+   only on trivp/domcond/ifconv aliasing edits (jtround 612 → 528 ms).
+   Left: jumpthread ~3.8 s (a ~6-phase
    fixpoint; `round`'s threading walk is the residue — `domcond`
    ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
    the webmerge family ~4 s (`cparm`/`sameargs*` per-block key
