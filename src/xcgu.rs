@@ -65,11 +65,29 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
     let ours = cgu.items();
+    let why = crate::env_get("PLIRON_STATS_XCGU");
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut cands = Vec::new();
     for item in ours.keys() {
         let MonoItem::Fn(inst) = *item else { continue };
-        for u in used(tcx, inst).unwrap_or(&[]) {
+        let us = used(tcx, inst);
+        if why.is_some() && us.is_none() && pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "xcgu: used() failed for {}", with_no_trimmed_paths!(inst.to_string()));
+        }
+        for u in us.unwrap_or(&[]) {
+            if let Some(w) = &why
+                && let MonoItem::Fn(c) = u.node
+                && !ours.contains_key(&u.node)
+                && with_no_trimmed_paths!(c.to_string()).contains(*w)
+            {
+                tracing::info!(target: "pliron::stats",
+                    "xcgu cand {} in {}: copyable={} size={}",
+                    with_no_trimmed_paths!(c.to_string()),
+                    cgu.name(),
+                    copyable(tcx, c, limit),
+                    tcx.size_estimate(c));
+            }
             if direct.insert(u.node)
                 && let MonoItem::Fn(c) = u.node
                 && !ours.contains_key(&u.node)
@@ -192,13 +210,31 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         .and_then(|s| s.parse().ok())
         .unwrap_or(3usize);
     let ours = cgu.items();
+    let why = crate::env_get("PLIRON_STATS_XCGU");
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut frontier = Vec::new();
     for item in ours.keys() {
         let MonoItem::Fn(inst) = *item else {
             continue;
         };
-        for u in used(tcx, inst).unwrap_or(&[]) {
+        let us = used(tcx, inst);
+        if why.is_some() && us.is_none() && pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "xcgu: used() failed for {}", with_no_trimmed_paths!(inst.to_string()));
+        }
+        for u in us.unwrap_or(&[]) {
+            if let Some(w) = &why
+                && let MonoItem::Fn(c) = u.node
+                && !ours.contains_key(&u.node)
+                && with_no_trimmed_paths!(c.to_string()).contains(*w)
+            {
+                tracing::info!(target: "pliron::stats",
+                    "xcgu cand {} in {}: copyable={} size={}",
+                    with_no_trimmed_paths!(c.to_string()),
+                    cgu.name(),
+                    copyable(tcx, c, limit),
+                    tcx.size_estimate(c));
+            }
             if direct.insert(u.node)
                 && let MonoItem::Fn(c) = u.node
                 && !ours.contains_key(&u.node)
@@ -210,15 +246,6 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     }
 
     let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
-    let inlined: FxHashSet<MonoItem<'tcx>> = parts
-        .iter()
-        .flat_map(|other| {
-            other
-                .items()
-                .iter()
-                .filter_map(|(&item, data)| data.inlined.then_some(item))
-        })
-        .collect();
     let mut seen = direct.clone();
     let mut candidates = Vec::new();
     let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
@@ -238,10 +265,12 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 if !ours.contains_key(&u.node) && !direct.contains(&u.node) {
                     needed.insert(u.node);
                 }
+                // `inlined`-in-home deps must be copied (internal symbols are
+                // unresolvable); small `External` deps are copied too so the
+                // IR inliner sees bodies like ThinLTO imports give LLVM.
                 if let MonoItem::Fn(c2) = u.node
                     && !ours.contains_key(&u.node)
                     && seen.insert(u.node)
-                    && inlined.contains(&u.node)
                     && copyable(tcx, c2, limit)
                 {
                     next.push(c2);
@@ -267,7 +296,6 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
 
     let mut remaining: FxHashSet<MonoItem<'tcx>> =
         candidates.iter().map(|&c| MonoItem::Fn(c)).collect();
-    let why = crate::env_get("PLIRON_STATS_XCGU");
     loop {
         let removed: Vec<(Instance<'tcx>, Vec<MonoItem<'tcx>>)> = candidates
             .iter()

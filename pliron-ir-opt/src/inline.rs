@@ -674,7 +674,7 @@ pub fn run(
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
     let verbose = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
+        && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
