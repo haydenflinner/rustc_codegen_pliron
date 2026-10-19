@@ -20,6 +20,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::jumpthread::{NonNull, eval, known};
 
 const MAX_ITERS: usize = 32;
+
+fn max_iters() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::env_get("PLIRON_UNROLL_ITERS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_ITERS)
+    })
+}
 /// Cap on instructions emitted into the straight-line replacement block —
 /// the whole loop is gone, so the cost is pure code size. Must cover
 /// nested loops the trip simulation walks through: nbody's `advance`
@@ -308,7 +317,7 @@ fn trip(
         }
         if b == h {
             visits += 1;
-            if visits > MAX_ITERS {
+            if visits > max_iters() {
                 return why("iters");
             }
         }
