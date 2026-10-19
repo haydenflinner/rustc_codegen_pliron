@@ -164,6 +164,7 @@ pub(crate) fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block,
 
 /// Returns the number of jumps replaced by a copy of the return block.
 pub fn run(func: &mut Function) -> usize {
+    let edge_on = crate::pass_enabled("PLIRON_TAILDUP_EDGE");
     let entry = func.layout.entry_block();
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
@@ -205,7 +206,7 @@ pub fn run(func: &mut Function) -> usize {
         let is_brif = matches!(func.dfg.insts[t], InstructionData::Brif { .. });
         let dests: Vec<BlockCall> = match func.dfg.insts[t] {
             InstructionData::Jump { destination, .. } => vec![destination],
-            InstructionData::Brif { blocks, .. } if crate::pass_enabled("PLIRON_TAILDUP_EDGE") => {
+            InstructionData::Brif { blocks, .. } if edge_on => {
                 blocks.to_vec()
             }
             _ => continue,

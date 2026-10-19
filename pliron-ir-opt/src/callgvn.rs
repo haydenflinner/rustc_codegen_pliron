@@ -320,6 +320,7 @@ fn natural_loops(
 pub fn run(ctx: &mut Context, st: &State) {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);
+    let dumpf = crate::env_get("PLIRON_CGDUMP");
     for name in bodied(ctx, st) {
         if st.opt_skip.contains(&st.funcs[&name].op) {
             continue;
@@ -329,7 +330,7 @@ pub fn run(ctx: &mut Context, st: &State) {
                 tracing::debug!(target: "pliron::callgvn", "callgvn fn={name}")
             };
         }
-        if crate::env_get("PLIRON_CGDUMP").is_some_and(|s| name.contains(s)) {
+        if dumpf.as_ref().is_some_and(|s| name.contains(s)) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::dump", "{}",
                     st.funcs[&name]
