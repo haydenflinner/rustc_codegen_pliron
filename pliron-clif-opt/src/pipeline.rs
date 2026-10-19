@@ -2430,6 +2430,17 @@ fn s_pushin(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// Reassociate `((r + a) + b) + c` accumulator chains into `r + ((a +
+// b) + c)` when `r` is a block param — one add stays on the
+// loop-carried edge instead of the whole chain (LLVM's isel shape).
+fn s_reassoc(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = reassoc::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("reassoc");
+    }
+    k
+}
+
 // Refold loop-carried affine params (i' = i+s on every back
 // edge) onto one anchor IV: `p` becomes `bp + r*i` computed in
 // the loop body instead of a regalloc parallel copy plus an
@@ -3815,6 +3826,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // The `brif` sink loop needs CONDBR; `push_to_use_blocks` only
         // needs a second block to push into.
         .needs_any(shape::CONDBR | shape::BLOCKS2),
+        // `acc + a + b + c` chains rooted at a block param keep only
+        // one add on the loop-carried edge; runs late so it sees the
+        // final chain shapes.
+        step("reassoc", "reassoc", Gate::OptIn("PLIRON_REASSOC"), s_reassoc)
+            .needs(shape::BPARAM),
         // i64->i32 low-word demotion — after the late folds so their
         // residuals demote too, before coldret so block layout is final.
         step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),

@@ -41,6 +41,7 @@ pub mod proots;
 pub mod punroll;
 pub mod pushin;
 pub mod rangefold;
+pub mod reassoc;
 pub mod revnorm;
 pub mod slotmerge;
 pub mod slotprom;
