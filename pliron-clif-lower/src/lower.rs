@@ -491,6 +491,56 @@ fn fn_worker(p: &'static FPool) {
     }
 }
 
+thread_local! {
+    /// `cgupool::run_until`'s step-once closure, installed for the
+    /// duration of a CGU thread's wait loop: this thread's phase-(B)
+    /// drain calls it when both its result channel and the fn pool are
+    /// empty, converting the `drx.recv()` park into another CGU's
+    /// iropt/lowering work. TLS because threading a callback through
+    /// `finish_b`/`lower_to_object`/`lower_module` would need a new
+    /// `dyn Fn` param on the whole path — and a nested `run_job`'s own
+    /// drain must reach the same slot anyway.
+    static CGU_STEAL: std::cell::RefCell<Option<std::rc::Rc<dyn Fn() -> bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install/clear the CGU-job stealer for the calling thread.
+/// `cgupool::run_until` sets it on entry and clears it on return.
+pub fn set_cgu_steal(f: Option<std::rc::Rc<dyn Fn() -> bool>>) {
+    CGU_STEAL.with(|c| *c.borrow_mut() = f);
+}
+
+/// Run one stolen CGU job if a stealer is installed and a job is
+/// runnable. `false` means "no work available" — park as usual.
+fn cgu_steal() -> bool {
+    crate::pass_enabled("PLIRON_CGUSTEAL")
+        && CGU_STEAL.with(|c| c.borrow().as_ref().cloned().is_some_and(|f| f()))
+}
+
+/// Pop and run one queued phase-(B) job on the calling thread — the
+/// same work-while-you-wait the drain loop does, exported so threads
+/// parked in `cgupool::run_until` lend their core to the shared queue
+/// instead of sleeping on its condvar while pipeline work waits.
+/// Returns `false` when the queue was empty.
+pub fn steal_fnjob() -> bool {
+    let Some(GMsg { i, mut j, done }) = fn_pool_pop(fn_pool()) else {
+        return false;
+    };
+    // `run_job` never reaches back into this function, so the borrow is
+    // never re-entered.
+    thread_local! {
+        static STEAL_CTX: std::cell::RefCell<cranelift_codegen::Context> =
+            std::cell::RefCell::new(cranelift_codegen::Context::new());
+    }
+    let sh = j.sh.clone();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        STEAL_CTX.with(|c| run_job(&mut j, &mut c.borrow_mut(), &sh));
+        j
+    }));
+    let _ = done.send((i, r));
+    true
+}
+
 /// Phase (B) of one function: CLIF pipeline, verify, cranelift compile.
 /// Self-contained — everything it touches is `j`/`clctx`/`sh`.
 fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
@@ -1207,14 +1257,23 @@ pub fn lower_module<'a>(
                     }));
                     let _ = d.send((i, r));
                 }
-                None => match drx.recv() {
-                    Ok((i, Ok(j))) => {
-                        done.insert(i, j);
-                        got += 1;
+                None => {
+                    // Queue and channel both empty — a queued job can
+                    // still land (producers stream), and another CGU's
+                    // cgupool work may be runnable. Steal one before
+                    // parking on our own results.
+                    if cgu_steal() {
+                        continue;
                     }
-                    Ok((_, Err(p))) => std::panic::resume_unwind(p),
-                    Err(e) => panic!("fn pool disconnected: {e}"),
-                },
+                    match drx.recv() {
+                        Ok((i, Ok(j))) => {
+                            done.insert(i, j);
+                            got += 1;
+                        }
+                        Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                        Err(e) => panic!("fn pool disconnected: {e}"),
+                    }
+                }
             }
         }
         jobs = done.into_values().collect();

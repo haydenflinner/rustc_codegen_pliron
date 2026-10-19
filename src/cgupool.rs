@@ -306,68 +306,106 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
 /// exists, then hand it back. Pulling any runnable job — not just the
 /// caller's own — is what makes the facts barrier safe: a token-holding
 /// worker is never blocked while runnable work remains.
-pub(crate) fn run_until(key: u32, prof: &SelfProfilerRef, emitter: &SharedEmitter) -> Finished {
+/// Pop one runnable job from `ready`, run it on this thread, and fold
+/// the outcome back into the store (`done`/`published`/`parked`).
+/// Returns `false` when nothing was runnable. Shared by `run_until`'s
+/// wait loop and — through `lower`'s `CGU_STEAL` slot — the phase-(B)
+/// drain, so a thread parked on either queue can lend its core to the
+/// other.
+fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
     let mut g = STORE.lock().unwrap();
-    loop {
+    let Some(job) = g.ready.pop_front() else {
+        return false;
+    };
+    let jkey = job.key;
+    let jord = job.ord;
+    drop(g);
+    let r = catch_unwind(AssertUnwindSafe(|| run_job(job, prof)));
+    g = STORE.lock().unwrap();
+    match r {
+        Ok(RunOut::Done { key, out }) => {
+            g.done.insert(key, Ok(out));
+        }
+        Ok(RunOut::Published { job }) => {
+            g.published.insert(job.ord);
+            advance_cover(&mut g);
+            if job.ord < g.cover {
+                g.ready.push_back(job);
+            } else {
+                g.parked.insert(job.ord, job);
+            }
+        }
+        Err(p) => {
+            let p = match p.downcast::<HostFatal>() {
+                Ok(hf) => {
+                    emit_err(emitter, hf.0);
+                    Box::new(FatalErrorMarker) as Box<dyn std::any::Any + Send>
+                }
+                Err(p) => {
+                    let msg = p
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| p.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    emit_err(emitter, format!("pliron worker panic: {msg}"));
+                    p
+                }
+            };
+            g.done.insert(jkey, Err(p));
+            // A job that never reached publish would stall every
+            // higher-ordinal parked job (and the coordinator, which
+            // joins workers on abort). Count the ordinal as covered:
+            // adopters merge only `by_ord` entries, so a CGU that
+            // never published simply contributes no facts — the
+            // conservative result, and the compile is dying anyway.
+            if jord != u32::MAX {
+                g.published.insert(jord);
+                advance_cover(&mut g);
+            }
+        }
+    }
+    CV.notify_all();
+    true
+}
+
+pub(crate) fn run_until(key: u32, prof: &SelfProfilerRef, emitter: &SharedEmitter) -> Finished {
+    // The phase-(B) drain inside `finish_b` parks on its own result
+    // channel when the fn pool is momentarily empty — install this
+    // thread's `step_once` so it can run another CGU's work instead
+    // (see lower::CGU_STEAL). Cleared before returning.
+    let sprof = prof.clone();
+    let sem = emitter.clone();
+    lower::set_cgu_steal(Some(std::rc::Rc::new(move || {
+        step_once(&sprof, &sem)
+    })));
+    let mut g = STORE.lock().unwrap();
+    let out = loop {
         if let Some(r) = g.done.remove(&key) {
-            return match r {
+            // Clear before the `resume_unwind` path too — the TLS slot
+            // outlives the loop break otherwise.
+            lower::set_cgu_steal(None);
+            break match r {
                 Ok(f) => f,
                 Err(p) => resume_unwind(p),
             };
         }
-        let Some(job) = g.ready.pop_front() else {
-            g = CV.wait(g).unwrap();
-            continue;
-        };
-        let jkey = job.key;
-        let jord = job.ord;
+        // CGU work first, then the shared fn pool; park only when both
+        // are empty. The wait's recheck covers pushes that landed
+        // while the lock was down (their notify went to nobody).
         drop(g);
-        let r = catch_unwind(AssertUnwindSafe(|| run_job(job, prof)));
-        g = STORE.lock().unwrap();
-        match r {
-            Ok(RunOut::Done { key, out }) => {
-                g.done.insert(key, Ok(out));
-            }
-            Ok(RunOut::Published { job }) => {
-                g.published.insert(job.ord);
-                advance_cover(&mut g);
-                if job.ord < g.cover {
-                    g.ready.push_back(job);
-                } else {
-                    g.parked.insert(job.ord, job);
-                }
-            }
-            Err(p) => {
-                let p = match p.downcast::<HostFatal>() {
-                    Ok(hf) => {
-                        emit_err(emitter, hf.0);
-                        Box::new(FatalErrorMarker) as Box<dyn std::any::Any + Send>
-                    }
-                    Err(p) => {
-                        let msg = p
-                            .downcast_ref::<String>()
-                            .map(String::as_str)
-                            .or_else(|| p.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown panic");
-                        emit_err(emitter, format!("pliron worker panic: {msg}"));
-                        p
-                    }
-                };
-                g.done.insert(jkey, Err(p));
-                // A job that never reached publish would stall every
-                // higher-ordinal parked job (and the coordinator, which
-                // joins workers on abort). Count the ordinal as covered:
-                // adopters merge only `by_ord` entries, so a CGU that
-                // never published simply contributes no facts — the
-                // conservative result, and the compile is dying anyway.
-                if jord != u32::MAX {
-                    g.published.insert(jord);
-                    advance_cover(&mut g);
-                }
-            }
+        if step_once(prof, emitter)
+            || (pass_enabled("PLIRON_CGUSTEAL")
+                && pliron_clif_lower::lower::steal_fnjob())
+        {
+            g = STORE.lock().unwrap();
+            continue;
         }
-        CV.notify_all();
-    }
+        g = STORE.lock().unwrap();
+        if !g.done.contains_key(&key) && g.ready.is_empty() {
+            g = CV.wait(g).unwrap();
+        }
+    };
+    out
 }
 
 /// `cover` = every participant ordinal below it has published; release
