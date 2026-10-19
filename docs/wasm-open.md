@@ -4,11 +4,15 @@ Working ledger for "pliron must not lose to LLVM on any wasmbench
 kernel" (geomean first, then per-kernel). Update as items resolve;
 `docs/PARITY.md` holds the measured numbers.
 
-## Status snapshot (bench/wasm/run.sh, post `9e75ac5` + pending)
+## Status snapshot (bench/wasm/run.sh, post `677c37b`)
 
-geomean pliron/llvm = **0.977**. Wins: `chars_alpha` −31%, `iterw`
-−41%, `parse_only` −15%, `matmul` −11%, `eqbug` −9%, `sortw` −3%.
-Parity: `sieve` +1.9%, `contains_rng` +1.4%.
+geomean pliron/llvm = **0.977**. Wins: `chars_alpha` −36%, `iterw`
+−39%, `parse_only` −13%, `matmul` −13%, `eqbug` −9%. Parity: `sieve`
++1.8%, `sortw` +2.1%, `contains_rng` −2%.
+
+Landed since: `sfwd` v2 + intra-span DSE (`62dbebb`), `licm` bounded
+loop-invariant `get;get;binop` hoisting (`677c37b`), `bandk` in
+clifpeep, `wpeep` else-arm retarget, `PLIRON_UNROLL_ITERS` knob.
 
 Post-snapshot landed work (uncommitted at time of writing):
 `sfwd` v2 (operand-stack `need`-walk + `local.tee` capture of
@@ -18,6 +22,25 @@ Post-snapshot landed work (uncommitted at time of writing):
 (stack_addr, k<align)` → `iconst 0` — killed `strwork`'s ~2.3k-line
 dead `if` arm: `strwork3run` 4781→~2410 lines merged into `k_strwork`,
 module −5 KiB).
+
+## Lessons / pitfalls discovered
+
+- **V8 wasm-inlining is a hard module-size budget**: `fib` regressed
+  +79% on identical function bytes because the module grew ~3 KiB past
+  V8's per-module inlining cap (`budget=min(172, 700)` vs `min(177,
+  831)` — `fib3fib`'s self-inline needed ≤172). Deferred tee-minting
+  brought the module back under and restored the win. **Any future
+  size-growing transform must be checked against this cliff** — diff
+  per-function sizes (`wasm-tools print | func line counts`) between
+  builds and watch `fib`/`chars_ascii` specifically.
+- **`prel` KOS pushes are invisible to `ins`**: any operand-stack walk
+  (`operands`, `esf`, `eff`) sees an unbalanced stream on KOS'd bodies.
+  Fix was materializing `prel` into real `Get` instrs before the scan.
+- **`esf` table had `f32/f64` unary ops (0x8e–0x91, 0x9c–0x9f) as
+  (2,1)** — `f64.sqrt`/`floor`/`trunc`/`nearest` underflowed every
+  walk. Table has 3 copies (lines ~802, ~1678, ~2258) — all fixed.
+- `PLIRON_WASM_SFWD_DBG=1` prints per-event `sfwd` tracing; removed
+  the temp `sfwd_advance_body_debug` test (read a temp-file body).
 
 ## Undecided / deferred calls
 
@@ -66,23 +89,22 @@ module −5 KiB).
    ever grows `br_table` support, retarget each operand by the same
    `rel` rule (operand == rel → reject).
 
-6. **`sfwd` coverage gaps — partially resolved.** v2 resolves
-   operands via a `need`-counted backward walk (any producer shape,
-   not just adjacent `get;get`) and captures non-`get` stored values
-   with a `local.tee T` splice into a minted local. Still open:
-   narrow stores (`i32.store8/16`, `i64.store8/16/32`) kill but never
-   mint; **dead-store elimination** — repeated `store (B,off)` in one
-   span (nbody's per-pair `v_i` stores) could collapse to `drop;drop`
-   + final store, LLVM keeps `v` in regs until loop end. Deferred:
-   needs per-entry "exposed" tracking (unforwarded overlapping reads
-   block the kill).
+6. **`sfwd` coverage gaps — narrowed.** DSE landed (`62dbebb`):
+   intra-span same-slot overwrite → `drop`, with per-entry `exposed`
+   tracking blocking kills across unforwarded reads; tee-capture is
+   deferred to first forwarded use so dead stores mint nothing.
+   Remaining: narrow stores (`i32.store8/16`, `i64.store8/16/32`)
+   kill but never mint (no forwarding local exists for a partial
+   write — could mint the *loaded-back* bytes, complex); 80-step
+   operand-walk cap may need `PLIRON_WASM_SFWD_STEPS` if a real body
+   hits it.
 
-7. **`prel`-anchored `sfwd` interplay.** `sfwd` preserves byte
-   positions of rewritten instrs so `prel` pushes stay correct — but
-   `sfwd` deletes a `get B` whose *position* a `prel` could anchor.
-   Reviewed: safe (the push emits at the `Del`'d ins, then `get V`
-   follows — same stack shape). Left as an invariant to keep, not a
-   pass to write.
+7. **`prel`-anchored `sfwd` interplay — resolved by materialization.**
+   `prel` pushes are spliced into `ins` as real `Get` instrs before
+   the `sfwd` scan (and `prel` cleared so emit doesn't double them) —
+   walks see a balanced stream and `Del`/`Drop` edits compose
+   normally. Invariant to keep: any new operand-stack walk must run
+   after materialization.
 
 8. **`strwork`/`hashmap`/`tokenize` shared shape — `pliron-ir-opt`
    nonnull-through-slot.** Iter-pointer spill→reload loses
