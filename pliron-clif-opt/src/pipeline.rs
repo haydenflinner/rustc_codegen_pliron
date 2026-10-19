@@ -2572,6 +2572,19 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+
+// i64 value webs whose consumers only read the low 32 bits (the
+// Option<u32>/usize widenings and uloads i64 loads) re-emitted as i32 —
+// wasm i64.* + i32.wrap_i64 per-iteration overhead. Runs late so the
+// whole pipeline residuals are covered; clifpeep also calls it early.
+fn s_dem64(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::dem64(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("dem64");
+    }
+    k
+}
+
 fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     let mut k = indvars::postinc(&mut p.clctx.func, an, 1024);
     if k > 0 {
@@ -3616,6 +3629,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // The `brif` sink loop needs CONDBR; `push_to_use_blocks` only
         // needs a second block to push into.
         .needs_any(shape::CONDBR | shape::BLOCKS2),
+        // i64->i32 low-word demotion — after the late folds so their
+        // residuals demote too, before coldret so block layout is final.
+        step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),
         Step {
             name: "coldret",
             bisect: Some("coldret"),

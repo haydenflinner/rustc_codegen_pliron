@@ -181,7 +181,7 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
             hi = hi.min(u64::from(ty.bits()));
         }
         InstructionData::Binary {
-            opcode: Opcode::Bxor,
+            opcode: Opcode::Bxor | Opcode::Bor,
             args,
         } => {
             let m = vmax_d(func, args[0], depth - 1) | vmax_d(func, args[1], depth - 1);
@@ -190,6 +190,14 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
                     .and_then(|x| x.checked_next_power_of_two())
                     .map_or(u64::MAX, |p| p - 1),
             );
+        }
+        // `select`'s ceiling is the looser arm — the pick can't grow.
+        InstructionData::Ternary {
+            opcode: Opcode::Select | Opcode::SelectSpectreGuard,
+            args,
+        } => {
+            let m = vmax_d(func, args[1], depth - 1).max(vmax_d(func, args[2], depth - 1));
+            hi = hi.min(m);
         }
         _ => {}
     }
@@ -424,6 +432,661 @@ pub fn uloads32(func: &mut Function) -> usize {
         }
     }
     n
+}
+
+/// One i64 value's use in `dem64`'s web.
+#[derive(Clone, Copy)]
+enum Dem64Use {
+    /// `ireduce` — reads only the low bits; always a safe sink.
+    Reduce,
+    /// `brif` condition — safe when the value stays < 2^32.
+    Cond,
+    /// `icmp.i64` operand — safe when the compare narrows exactly.
+    Cmp(Inst),
+    /// Operand of another demotion candidate — safe iff the
+    /// consuming inst is itself demoted.
+    Web(Inst),
+    /// Anything else (edge args, calls, returns, stores, high-half
+    /// reads, load addresses) — escapes the web, blocking demotion.
+    Hard,
+}
+
+/// Whether `inst`'s i64 result can be re-emitted as the i32 op that
+/// produces the same low 32 bits: widenings, u32 loads, constants,
+/// low-half-only binops (`band`/`iadd`/`ishl`…), selects.
+///
+/// `ushr` needs the shifted operand < 2^32 (high-half bits otherwise
+/// reach into the low word); `ishl`/`ushr` need the amount < 32 (CLIF
+/// masks i64 shifts to 63, i32 to 31). `sshr` and the signed min/maxes
+/// are out: an operand in [2^31, 2^32) flips sign under i32. `umin`/
+/// `umax` of sub-2^32 operands are exact.
+fn dem64_op(func: &Function, inst: Inst) -> bool {
+    if func.dfg.inst_results(inst).len() != 1
+        || func.dfg.value_type(func.dfg.first_result(inst)) != types::I64
+    {
+        return false;
+    }
+    let lt32 = |a: Value| {
+        let a = func.dfg.resolve_aliases(a);
+        iconst(func, a).is_some_and(|k| (k as u64) < 32) || vmax(func, a) < 32
+    };
+    let hi0 = |a: Value| vmax(func, a) <= u32::MAX as u64;
+    match func.dfg.insts[inst] {
+        InstructionData::Unary { opcode, arg } => match opcode {
+            Opcode::Uextend | Opcode::Sextend | Opcode::Bmask => {
+                let at = func.dfg.value_type(func.dfg.resolve_aliases(arg));
+                at.is_int() && !at.is_vector() && at.bits() <= 32
+            }
+            Opcode::Ireduce => {
+                func.dfg.value_type(func.dfg.resolve_aliases(arg)) == types::I128
+            }
+            Opcode::Bnot | Opcode::Ineg => true,
+            _ => false,
+        },
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            ..
+        } => true,
+        InstructionData::Binary { opcode, args } => match opcode {
+            Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor
+            | Opcode::Iadd
+            | Opcode::Isub
+            | Opcode::Imul
+            | Opcode::Iconcat => true,
+            Opcode::Ishl => lt32(args[1]),
+            Opcode::Ushr => lt32(args[1]) && hi0(args[0]),
+            Opcode::Umin | Opcode::Umax => hi0(args[0]) && hi0(args[1]),
+            _ => false,
+        },
+        InstructionData::Ternary { opcode, .. } => matches!(
+            opcode,
+            Opcode::Select | Opcode::SelectSpectreGuard | Opcode::Bitselect
+        ),
+        InstructionData::Load { opcode, .. } => matches!(
+            opcode,
+            Opcode::Load
+                | Opcode::Uload8
+                | Opcode::Uload16
+                | Opcode::Uload32
+                | Opcode::Sload8
+                | Opcode::Sload16
+                | Opcode::Sload32
+        ),
+        InstructionData::LoadNoOffset { .. } => true,
+        _ => false,
+    }
+}
+
+/// `icmp.i64 cc a, b` narrows to `icmp.i32` when each operand fits the
+/// compare's bound — u32 for `eq`/`ne`/unsigned tests, i32 for signed
+/// (a possibly-negative operand fails `vmax`, so signed operands here
+/// are provably non-negative and the i32 compare is exact).
+fn dem64_cmp(func: &Function, cond: IntCC, args: [Value; 2]) -> bool {
+    let signed = matches!(
+        cond,
+        IntCC::SignedLessThan
+            | IntCC::SignedLessThanOrEqual
+            | IntCC::SignedGreaterThan
+            | IntCC::SignedGreaterThanOrEqual
+    );
+    let bound = if signed {
+        i32::MAX as u64
+    } else {
+        u32::MAX as u64
+    };
+    args.iter().all(|&a| {
+        let a = func.dfg.resolve_aliases(a);
+        match iconst(func, a) {
+            Some(k) if signed => k as i32 as i64 == k,
+            Some(k) => k as u64 <= u32::MAX as u64,
+            None => vmax(func, a) <= bound,
+        }
+    })
+}
+
+/// `v`'s i32 low word at the cursor: the demoted twin when `v` is in
+/// the web, else a free extraction through the def's own wrapper
+/// (`uextend`/`sextend` → the arg, `iconcat` → the low half, `iconst`
+/// → the truncated const), else a plain `ireduce.i32`.
+fn dem64_m32(pos: &mut FuncCursor, v32: &FxHashMap<Value, Value>, v: Value) -> Value {
+    let f = &*pos.func;
+    let v = f.dfg.resolve_aliases(v);
+    if let Some(&x) = v32.get(&v) {
+        return x;
+    }
+    if let Some(d) = f.dfg.value_def(v).inst() {
+        match f.dfg.insts[d] {
+            InstructionData::Unary {
+                opcode: op @ (Opcode::Uextend | Opcode::Sextend),
+                arg,
+            } => {
+                let a = f.dfg.resolve_aliases(arg);
+                let at = f.dfg.value_type(a);
+                if at == types::I32 {
+                    return a;
+                }
+                if at.is_int() && !at.is_vector() && at.bits() < 32 {
+                    return match op {
+                        Opcode::Uextend => pos.ins().uextend(types::I32, a),
+                        _ => pos.ins().sextend(types::I32, a),
+                    };
+                }
+            }
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } => {
+                let a = f.dfg.resolve_aliases(arg);
+                return pos.ins().ireduce(types::I32, a);
+            }
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => {
+                return pos.ins().iconst(types::I32, imm.bits() as i32 as i64);
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Iconcat,
+                args,
+            } => {
+                return f.dfg.resolve_aliases(args[0]);
+            }
+            _ => {}
+        }
+    }
+    pos.ins().ireduce(types::I32, v)
+}
+
+/// Emit the i32 twin of demoted def `d` immediately before it (same
+/// dominance as `d`'s result) and record `v32[result]`. Dem operands
+/// arrive through `dem64_m32`, which the `unready` worklist has
+/// already emitted; anything else degrades to `ireduce.i32` of the
+/// surviving i64 def — always a valid low-word read.
+fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) {
+    let Some(d) = func.dfg.value_def(v).inst() else {
+        return;
+    };
+    let data = func.dfg.insts[d];
+    let mut pos = FuncCursor::new(func).at_inst(d);
+    let val = match data {
+        InstructionData::Unary { opcode, arg } => {
+            let a = pos.func.dfg.resolve_aliases(arg);
+            match opcode {
+                // `uextend.i64`/`sextend.i64` of an i32 arg is the arg
+                // itself in the low word — no inst at all.
+                Opcode::Uextend | Opcode::Sextend
+                    if pos.func.dfg.value_type(a) == types::I32 =>
+                {
+                    a
+                }
+                Opcode::Uextend => pos.ins().uextend(types::I32, a),
+                Opcode::Sextend => pos.ins().sextend(types::I32, a),
+                Opcode::Bmask => pos.ins().bmask(types::I32, a),
+                Opcode::Ireduce => pos.ins().ireduce(types::I32, a),
+                Opcode::Bnot => {
+                    let m = dem64_m32(&mut pos, v32, a);
+                    pos.ins().bnot(m)
+                }
+                Opcode::Ineg => {
+                    let m = dem64_m32(&mut pos, v32, a);
+                    pos.ins().ineg(m)
+                }
+                _ => return,
+            }
+        }
+        InstructionData::UnaryImm { imm, .. } => {
+            pos.ins().iconst(types::I32, imm.bits() as i32 as i64)
+        }
+        InstructionData::Binary { opcode, args } => {
+            if opcode == Opcode::Iconcat {
+                // `iconcat(lo, hi)` packs i32 halves — the low word
+                // is `lo` verbatim.
+                pos.func.dfg.resolve_aliases(args[0])
+            } else {
+                let a = dem64_m32(&mut pos, v32, args[0]);
+                let b = dem64_m32(&mut pos, v32, args[1]);
+                match opcode {
+                    Opcode::Band => pos.ins().band(a, b),
+                    Opcode::Bor => pos.ins().bor(a, b),
+                    Opcode::Bxor => pos.ins().bxor(a, b),
+                    Opcode::Iadd => pos.ins().iadd(a, b),
+                    Opcode::Isub => pos.ins().isub(a, b),
+                    Opcode::Imul => pos.ins().imul(a, b),
+                    Opcode::Ishl => pos.ins().ishl(a, b),
+                    Opcode::Ushr => pos.ins().ushr(a, b),
+                    Opcode::Umin => pos.ins().umin(a, b),
+                    Opcode::Umax => pos.ins().umax(a, b),
+                    _ => return,
+                }
+            }
+        }
+        InstructionData::Ternary { opcode, args } => {
+            if opcode == Opcode::Bitselect {
+                let c = dem64_m32(&mut pos, v32, args[0]);
+                let a = dem64_m32(&mut pos, v32, args[1]);
+                let b = dem64_m32(&mut pos, v32, args[2]);
+                pos.ins().bitselect(c, a, b)
+            } else {
+                let c = args[0];
+                let t = dem64_m32(&mut pos, v32, args[1]);
+                let f = dem64_m32(&mut pos, v32, args[2]);
+                if opcode == Opcode::Select {
+                    pos.ins().select(c, t, f)
+                } else {
+                    pos.ins().select_spectre_guard(c, t, f)
+                }
+            }
+        }
+        InstructionData::Load {
+            opcode,
+            flags,
+            arg,
+            offset,
+        } => {
+            // The address operand stays i64 — it is a pointer, not a
+            // low-word value (its own use is `Hard` and never demoted).
+            let flags = pos.func.dfg.mem_flags[flags].clone();
+            match opcode {
+                Opcode::Uload8 => pos.ins().uload8(types::I32, flags, arg, offset),
+                Opcode::Uload16 => pos.ins().uload16(types::I32, flags, arg, offset),
+                Opcode::Sload8 => pos.ins().sload8(types::I32, flags, arg, offset),
+                Opcode::Sload16 => pos.ins().sload16(types::I32, flags, arg, offset),
+                // `uload32`/`sload32`/`load` to i32 are plain loads.
+                _ => pos.ins().load(types::I32, flags, arg, offset),
+            }
+        }
+        InstructionData::LoadNoOffset { flags, arg, .. } => {
+            let flags = pos.func.dfg.mem_flags[flags].clone();
+            pos.ins().load(types::I32, flags, arg, 0)
+        }
+        _ => return,
+    };
+    v32.insert(v, val);
+}
+
+/// Demote i64 value webs that only ever produce/consume the low 32
+/// bits to i32.
+///
+/// rustc's `Option<u32>`/`char`/`usize` packing and `uloads`' i64
+/// widening leave `uextend`/`uload8`/`band`/`icmp`/`brif` webs where
+/// every consumer is a low-word read — on wasm each is a 64-bit op
+/// plus an `i32.wrap_i64` per read where LLVM emits `i32.*`, and on
+/// x64 each is a regalloc vreg that exists only to be truncated.
+///
+/// The web is a greatest fixpoint: seed every i64 def whose op has an
+/// exact low-32 rewrite (`dem64_op`), then drop any value with a use
+/// that escapes the web — edge/call/return/store args, high-half
+/// reads (`ushr ≥32`, `isplit`, wider extends), shifts by ≥32, or
+/// compares the bound check can't narrow. Survivors are re-emitted as
+/// i32 at their def sites; `ireduce`/`icmp`/`brif` sinks are rewritten
+/// to match, and non-dem i64 operands reach the i32 ops through a
+/// wrapper look-through or a fresh `ireduce`.
+///
+/// A final sweep also narrows standalone `icmp.i64`s whose operands
+/// are sub-2^32 extractable even when their producers stay i64 —
+/// `icmp.i64 eq (uextend x), 0` becomes `icmp.i32 eq x, 0` with the
+/// `uextend` left for its wider consumers.
+pub fn dem64(func: &mut Function) -> usize {
+    // Use index: inst args classified by position (a load's address is
+    // a full-width use even though the load's *result* demotes), plus
+    // edge/exception args, which are always `Hard`.
+    let mut uses: FxHashMap<Value, Vec<Dem64Use>> = Default::default();
+    let mut dem: FxHashSet<Value> = Default::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let web = dem64_op(func, i);
+            let op = func.dfg.insts[i].opcode();
+            if web {
+                let res = func.dfg.first_result(i);
+                dem.insert(res);
+            }
+            // A load's address operand reads the pointer's full width —
+            // never a low-32 use, whatever the load opcode.
+            let is_load = matches!(
+                func.dfg.insts[i],
+                InstructionData::Load { .. } | InstructionData::LoadNoOffset { .. }
+            );
+            for &a in func.dfg.inst_args(i) {
+                let a = func.dfg.resolve_aliases(a);
+                if func.dfg.value_type(a) != types::I64 {
+                    continue;
+                }
+                let k = match op {
+                    Opcode::Ireduce => Dem64Use::Reduce,
+                    Opcode::Brif => Dem64Use::Cond,
+                    Opcode::Icmp => Dem64Use::Cmp(i),
+                    _ if web && !is_load => Dem64Use::Web(i),
+                    _ => Dem64Use::Hard,
+                };
+                uses.entry(a).or_default().push(k);
+            }
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(x) = a {
+                        let x = func.dfg.resolve_aliases(x);
+                        uses.entry(x).or_default().push(Dem64Use::Hard);
+                    }
+                }
+            }
+            if let Some(et) = func.dfg.insts[i].exception_table() {
+                for item in func.dfg.exception_tables[et].items() {
+                    if let cranelift_codegen::ir::ExceptionTableItem::Context(x) = item {
+                        let x = func.dfg.resolve_aliases(x);
+                        uses.entry(x).or_default().push(Dem64Use::Hard);
+                    }
+                }
+            }
+        }
+    }
+    // Zero-use defs are dead code — leave them for the DCE steps
+    // rather than churning a demoted twin nobody reads.
+    dem.retain(|v| uses.contains_key(v));
+    if dem.is_empty() {
+        return 0;
+    }
+    // Greatest fixpoint: drop candidates with a non-sink use. `Web`
+    // uses are safe exactly while the consumer stays demoted, so this
+    // iterates to convergence (only ever shrinks).
+    loop {
+        let mut drop = Vec::new();
+        for &v in &dem {
+            let ok = uses.get(&v).is_none_or(|us| {
+                us.iter().all(|&k| match k {
+                    Dem64Use::Reduce => true,
+                    Dem64Use::Cond => vmax(func, v) <= u32::MAX as u64,
+                    Dem64Use::Cmp(u) => match func.dfg.insts[u] {
+                        InstructionData::IntCompare { cond, args, .. } => {
+                            dem64_cmp(func, cond, args)
+                        }
+                        _ => false,
+                    },
+                    Dem64Use::Web(u) => {
+                        func.dfg.has_results(u) && dem.contains(&func.dfg.first_result(u))
+                    }
+                    Dem64Use::Hard => false,
+                })
+            });
+            if !ok {
+                drop.push(v);
+            }
+        }
+        if drop.is_empty() {
+            break;
+        }
+        for v in drop {
+            dem.remove(&v);
+        }
+    }
+    // Emit i32 twins dependency-first: a dem value's dem operands get
+    // their twins before the consumer emits (`feed`/`unready` — the
+    // web is a DAG since cycles would need a non-dem block param).
+    let mut feed: FxHashMap<Value, Vec<Value>> = Default::default();
+    let mut unready: FxHashMap<Value, u32> = Default::default();
+    for &v in &dem {
+        let Some(d) = func.dfg.value_def(v).inst() else {
+            continue;
+        };
+        for &a in func.dfg.inst_args(d) {
+            let a = func.dfg.resolve_aliases(a);
+            if dem.contains(&a) {
+                feed.entry(a).or_default().push(v);
+                *unready.entry(v).or_default() += 1;
+            }
+        }
+    }
+    let mut ready: Vec<Value> = dem
+        .iter()
+        .copied()
+        .filter(|v| !unready.contains_key(v))
+        .collect();
+    let mut v32: FxHashMap<Value, Value> = Default::default();
+    while let Some(v) = ready.pop() {
+        dem64_emit(func, &mut v32, v);
+        if let Some(cs) = feed.get(&v) {
+            for &c in cs {
+                if let Some(u) = unready.get_mut(&c) {
+                    *u -= 1;
+                    if *u == 0 {
+                        ready.push(c);
+                    }
+                }
+            }
+        }
+    }
+    // Sink sweep — every `ireduce`/`icmp`/`brif` over an i64 operand,
+    // the web's own uses and standalone wrapper look-throughs alike.
+    // Runs before the old defs come out so `dem64_m32` sees the whole
+    // web; dedup is free since each sink rewrites itself once.
+    let mut n = v32.len();
+    let mut dead: Vec<(Inst, Value, Value)> = Vec::new();
+    let mut sinks: Vec<Inst> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            match func.dfg.insts[i] {
+                InstructionData::Unary {
+                    opcode: Opcode::Ireduce,
+                    arg,
+                } if func.dfg.value_type(func.dfg.resolve_aliases(arg)) == types::I64 => {
+                    sinks.push(i)
+                }
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond,
+                    args,
+                } if func.dfg.value_type(args[0]) == types::I64
+                    && dem64_cmp(func, cond, args) =>
+                {
+                    sinks.push(i)
+                }
+                InstructionData::Brif { arg, .. }
+                    if func.dfg.value_type(func.dfg.resolve_aliases(arg)) == types::I64 =>
+                {
+                    sinks.push(i)
+                }
+                _ => {}
+            }
+        }
+    }
+    for u in sinks {
+        match func.dfg.insts[u] {
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                ..
+            } => {
+                n += dem64_reduce_sink(func, &v32, u, &mut dead);
+            }
+            InstructionData::IntCompare { args, .. } => {
+                let mut pos = FuncCursor::new(func).at_inst(u);
+                let a = dem64_m32(&mut pos, &v32, args[0]);
+                let b = dem64_m32(&mut pos, &v32, args[1]);
+                if let InstructionData::IntCompare { args: a2, .. } =
+                    &mut pos.func.dfg.insts[u]
+                {
+                    *a2 = [a, b];
+                    n += 1;
+                }
+            }
+            InstructionData::Brif { arg, .. } => {
+                let mut pos = FuncCursor::new(func).at_inst(u);
+                if let Some(m) = dem64_cond_arg(&mut pos, &v32, arg)
+                    && let InstructionData::Brif { arg: a, .. } =
+                        &mut pos.func.dfg.insts[u]
+                {
+                    *a = m;
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, res, m) in dead {
+        func.dfg.clear_results(i);
+        func.layout.remove_inst(i);
+        func.dfg.change_to_alias(res, m);
+    }
+    // Remove the old i64 defs — every use was a rewritten sink or a
+    // demoted (and itself removed) web member. Unemitted leftovers
+    // (a `feed` cycle is impossible, but stay conservative) keep
+    // their i64 defs so `mat32` fallbacks stay valid.
+    for &v in &dem {
+        if !v32.contains_key(&v) {
+            continue;
+        }
+        if let Some(d) = func.dfg.value_def(v).inst() {
+            func.dfg.clear_results(d);
+            func.layout.remove_inst(d);
+        }
+    }
+    n
+}
+
+/// `ireduce.T (i64 v)` narrowed through `v`'s def: extend/reduce
+/// chains collapse to the source width, `iconcat` peels the low
+/// half, consts truncate, and demoted web values read their i32
+/// twin. `T == i32` aliases the result outright; `T < i32` keeps a
+/// narrower `ireduce` or re-extends the source.
+fn dem64_reduce_sink(
+    func: &mut Function,
+    v32: &FxHashMap<Value, Value>,
+    u: Inst,
+    dead: &mut Vec<(Inst, Value, Value)>,
+) -> usize {
+    let InstructionData::Unary {
+        opcode: Opcode::Ireduce,
+        arg,
+    } = func.dfg.insts[u]
+    else {
+        return 0;
+    };
+    let rt = func.dfg.value_type(func.dfg.first_result(u));
+    let res = func.dfg.first_result(u);
+    let v = func.dfg.resolve_aliases(arg);
+    let Some(d) = func.dfg.value_def(v).inst() else {
+        return 0;
+    };
+    enum Fold {
+        /// Result is `m` — the ireduce inst dies.
+        Alias(Value),
+        /// `ireduce.T m` — same shape, narrower source.
+        Arg(Value),
+        /// Re-extend the extend's source to `T` (same op).
+        Extend(Opcode, Value),
+        /// `iconst.T` of the low bits.
+        K(i64),
+    }
+    let fold = if let Some(&m) = v32.get(&v) {
+        // Demoted web value: the i32 twin is the exact low word.
+        if rt == types::I32 {
+            Fold::Alias(m)
+        } else {
+            Fold::Arg(m)
+        }
+    } else {
+        match func.dfg.insts[d] {
+            // `ireduce.T (ext.W a)` reads `a` directly: alias at the
+            // same width, a narrower `ireduce` above it, or the same
+            // extend replayed to `T` below it.
+            InstructionData::Unary {
+                opcode: op @ (Opcode::Uextend | Opcode::Sextend),
+                arg: a,
+            } => {
+                let a = func.dfg.resolve_aliases(a);
+                let at = func.dfg.value_type(a);
+                if !at.is_int() || at.is_vector() || at.bits() > 32 {
+                    return 0;
+                }
+                if at == rt {
+                    Fold::Alias(a)
+                } else if at.bits() > rt.bits() {
+                    Fold::Arg(a)
+                } else {
+                    Fold::Extend(op, a)
+                }
+            }
+            // `ireduce.T (ireduce.i64 x128)` — straight to `x128`.
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg: a,
+            } => Fold::Arg(func.dfg.resolve_aliases(a)),
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Fold::K(imm.bits()),
+            InstructionData::Binary {
+                opcode: Opcode::Iconcat,
+                args,
+            } => {
+                let lo = func.dfg.resolve_aliases(args[0]);
+                if rt == types::I32 {
+                    Fold::Alias(lo)
+                } else {
+                    Fold::Arg(lo)
+                }
+            }
+            _ => return 0,
+        }
+    };
+    match fold {
+        Fold::Alias(m) => dead.push((u, res, m)),
+        Fold::Arg(m) => {
+            func.replace(u).ireduce(rt, m);
+        }
+        Fold::Extend(op, a) => {
+            if op == Opcode::Uextend {
+                func.replace(u).uextend(rt, a);
+            } else {
+                func.replace(u).sextend(rt, a);
+            }
+        }
+        Fold::K(k) => {
+            let mask = if rt.bits() >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << rt.bits()) - 1
+            };
+            let k = sext(k as u64 & mask, rt.bits().min(64));
+            func.replace(u).iconst(rt, k);
+        }
+    }
+    1
+}
+
+/// `brif`'s i64 arg as an equivalent narrow `!= 0` test: the demoted
+/// i32 twin (the `Cond` gate proved `v < 2^32` before letting it
+/// reach here), an `uextend`/`sextend`'s arg — `ext(x) != 0` is
+/// `x != 0` at any width — or an `iconcat`'s `lo | hi` test.
+fn dem64_cond_arg(
+    pos: &mut FuncCursor,
+    v32: &FxHashMap<Value, Value>,
+    arg: Value,
+) -> Option<Value> {
+    let f = &*pos.func;
+    let v = f.dfg.resolve_aliases(arg);
+    if let Some(&m) = v32.get(&v) {
+        return Some(m);
+    }
+    match f.dfg.insts[f.dfg.value_def(v).inst()?] {
+        InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Sextend,
+            arg: a,
+        } => Some(f.dfg.resolve_aliases(a)),
+        // `iconcat(lo, hi) != 0` is `lo | hi` in i32.
+        InstructionData::Binary {
+            opcode: Opcode::Iconcat,
+            args,
+        } => {
+            let (lo, hi) = (
+                f.dfg.resolve_aliases(args[0]),
+                f.dfg.resolve_aliases(args[1]),
+            );
+            Some(pos.ins().bor(lo, hi))
+        }
+        _ => None,
+    }
 }
 
 /// The `(op, x, k)` of `v = op x, k` for constant `k` (either operand).
@@ -5488,6 +6151,13 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     if crate::pass_enabled("PLIRON_BITMERGE") {
         n += bitmerge(func);
     }
+    // i64→i32 low-word demotion of `uloads`' i64 loads and rustc's
+    // `Option<u32>`/`usize` widenings — wasm's `i64.*`+`i32.wrap_i64`
+    // per-iteration overhead; a no-op fold on x64 where the narrow
+    // ops cost the same. Late `dem64` step catches residuals too.
+    if crate::pass_enabled("PLIRON_DEM64") {
+        n += dem64(func);
+    }
     n
 }
 
@@ -8001,7 +8671,7 @@ pub fn memcall(func: &mut Function) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranelift_codegen::ir::{AbiParam, ExtFuncData, Signature, UserFuncName};
+    use cranelift_codegen::ir::{AbiParam, ExtFuncData, MemFlagsData, Signature, UserFuncName};
     use cranelift_codegen::isa::CallConv;
 
     /// `call %Memcpy(dst, src, iconst 8)` becomes `load.i64; store.i64`
@@ -9204,5 +9874,280 @@ mod tests {
             "lcse took {:?} on {K}-deep alias chain",
             t.elapsed()
         );
+    }
+
+    fn dem64_func(params: &[Type]) -> Function {
+        let mut sig = Signature::new(CallConv::Fast);
+        for &p in params {
+            sig.params.push(AbiParam::new(p));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        Function::with_name_signature(UserFuncName::user(0, 0), sig)
+    }
+
+    fn dem64_verify(func: &Function, what: &str) {
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(func, &flags) {
+            panic!("{what} produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// The `Chars::next` wasm residue: `uload8.i64` read by a `band.i64`
+    /// tag test on `brif`, an `ireduce.i32` ASCII path, and an
+    /// `ireduce.i8` decode path. Demotion makes the whole web i32 —
+    /// `i32.load8_u`/`i32.and`/`br_if` with no `i32.wrap_i64`.
+    #[test]
+    fn dem64_narrows_uload_tag_test() {
+        let mut func = dem64_func(&[types::I64]);
+        let entry = func.dfg.make_block();
+        let hit = func.dfg.make_block();
+        let miss = func.dfg.make_block();
+        for b in [entry, hit, miss] {
+            func.layout.append_block(b);
+        }
+        let p = func.dfg.append_block_param(entry, types::I64);
+
+        let arg = func.dfg.append_block_param(miss, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let w = cur.ins().uload8(types::I64, MemFlagsData::trusted(), p, 0);
+        let k = cur.ins().iconst(types::I64, 128);
+        let tag = cur.ins().band(w, k);
+        let _lo = cur.ins().ireduce(types::I32, w);
+        let narrow = cur.ins().ireduce(types::I8, w);
+        let narrow_ext = cur.ins().uextend(types::I32, narrow);
+        let cp = cur.ins().uextend(types::I64, narrow_ext);
+        cur.ins().brif(tag, hit, &[], miss, &[cp.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(hit);
+        cur.ins().return_(&[p]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(miss);
+        cur.ins().return_(&[arg]);
+
+        // 4 twins (w, k, tag, cp — cp is demoted even though its
+        // *edge* arg stays i64? no — the edge use is `Hard`, so cp
+        // stays i64) + the i32 twin load/mask/brif + reduce folds.
+        let n = dem64(&mut func);
+        assert!(n >= 4, "dem64 fired only {n}:\n{}", func.display());
+        let ops: Vec<Opcode> = func
+            .layout
+            .block_insts(entry)
+            .map(|i| func.dfg.insts[i].opcode())
+            .collect();
+        // uload8.i64 → uload8.i32, band.i64 → band.i32, brif on the
+        // i32 mask, `ireduce.i8` survives against the i32 load, the
+        // cp `uextend` feeds the i64 edge arg — `lo`'s ireduce.i32
+        // and the narrow `uextend` chain collapse.
+        assert_eq!(
+            ops,
+            [
+                Opcode::Uload8,
+                Opcode::Iconst,
+                Opcode::Band,
+                Opcode::Ireduce,
+                Opcode::Uextend,
+                Opcode::Uextend,
+                Opcode::Brif
+            ]
+        );
+        for i in func.layout.block_insts(entry) {
+            let op = func.dfg.insts[i].opcode();
+            for v in func.dfg.inst_values(i) {
+                // Load/branch-address operands legitimately stay i64.
+                if matches!(op, Opcode::Uload8 | Opcode::Brif) {
+                    continue;
+                }
+                assert_ne!(
+                    func.dfg.value_type(func.dfg.resolve_aliases(v)),
+                    types::I64,
+                    "i64 operand left in demoted web: {}",
+                    func.dfg.display_inst(i)
+                );
+            }
+        }
+        // The demoted load reads i32; `brif` takes the i32 mask.
+        let l = func.layout.block_insts(entry).next().unwrap();
+        assert_eq!(
+            func.dfg.value_type(func.dfg.first_result(l)),
+            types::I32
+        );
+        dem64_verify(&func, "dem64 uload tag test");
+    }
+
+    /// `ireduce.i32 (uextend.i64 x)` narrows to `x` even when the
+    /// `uextend` keeps real i64 uses — the store is a `Hard` sink, so
+    /// the extension stays but the reduce's user still reads `x`.
+    #[test]
+    fn dem64_reduce_of_uextend_keeps_wide_use() {
+        let mut func = dem64_func(&[types::I64, types::I64]);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let p = func.dfg.append_block_param(entry, types::I64);
+        let q = func.dfg.append_block_param(entry, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let x = cur.ins().ireduce(types::I32, q);
+        let w = cur.ins().uextend(types::I64, x);
+        cur.ins().store(MemFlagsData::trusted(), w, p, 0);
+        let r = cur.ins().ireduce(types::I32, w);
+        cur.ins().uextend(types::I64, r);
+        cur.ins().return_(&[w]);
+
+        assert_eq!(dem64(&mut func), 1);
+        // The `uextend.i64` lives on for store/return; the reduce was
+        // replaced by an i32 twin chain ending at `x` (the dead
+        // trailing `uextend` is left for DCE, not demoted).
+        let uses_of_w: Vec<Inst> = func
+            .layout
+            .block_insts(entry)
+            .filter(|&i| func.dfg.inst_values(i).any(|v| func.dfg.resolve_aliases(v) == w))
+            .collect();
+        assert_eq!(uses_of_w.len(), 2); // store + return
+        dem64_verify(&func, "dem64 reduce-of-uextend");
+    }
+
+    /// `icmp.i64 eq (uextend x), 0` narrows standalone: the compare
+    // becomes i32 while the `uextend` stays for a hard consumer.
+    #[test]
+    fn dem64_standalone_icmp_narrows() {
+        let mut func = dem64_func(&[types::I64, types::I32]);
+        let entry = func.dfg.make_block();
+        let yes = func.dfg.make_block();
+        for b in [entry, yes] {
+            func.layout.append_block(b);
+        }
+        let p = func.dfg.append_block_param(entry, types::I64);
+        let x32 = func.dfg.append_block_param(entry, types::I32);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let w = cur.ins().uextend(types::I64, x32);
+        cur.ins().store(MemFlagsData::trusted(), w, p, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, w, z);
+        cur.ins().brif(c, yes, &[], yes, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(yes);
+        cur.ins().return_(&[w]);
+
+        assert_eq!(dem64(&mut func), 2);
+        // The icmp now compares `x32` against an i32 zero.
+        let cmp = func
+            .layout
+            .block_insts(entry)
+            .find(|&i| func.dfg.insts[i].opcode() == Opcode::Icmp)
+            .unwrap();
+        let InstructionData::IntCompare { args, .. } = func.dfg.insts[cmp] else {
+            panic!()
+        };
+        assert_eq!(func.dfg.value_type(args[0]), types::I32);
+        assert_eq!(func.dfg.resolve_aliases(args[0]), x32);
+        dem64_verify(&func, "dem64 standalone icmp");
+    }
+
+    /// `iadd.i64 (uextend a), (uextend b)` feeding only `ireduce.i32`:
+    /// the sum can carry into bit 32 but nobody reads it — i32 add.
+    #[test]
+    fn dem64_web_iadd_through_extends() {
+        let mut func = dem64_func(&[types::I32, types::I32]);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let a = func.dfg.append_block_param(entry, types::I32);
+        let b = func.dfg.append_block_param(entry, types::I32);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let wa = cur.ins().uextend(types::I64, a);
+        let wb = cur.ins().uextend(types::I64, b);
+        let s = cur.ins().iadd(wa, wb);
+        let r = cur.ins().ireduce(types::I32, s);
+        let out = cur.ins().uextend(types::I64, r);
+        cur.ins().return_(&[out]);
+
+        assert_eq!(dem64(&mut func), 4);
+        let ops: Vec<Opcode> = func
+            .layout
+            .block_insts(entry)
+            .map(|i| func.dfg.insts[i].opcode())
+            .collect();
+        // uextends+add demoted; the reduce aliases to the i32 add,
+        // leaving `uextend.i64 (iadd.i32 a, b)` for the return.
+        assert_eq!(
+            ops,
+            [Opcode::Iadd, Opcode::Uextend, Opcode::Return]
+        );
+        dem64_verify(&func, "dem64 web iadd");
+    }
+
+    /// A genuine `Option<u32>` pack — `bor lo, ishl hi, 32` with a
+    /// `ushr 32` tag extract — reads both halves, so it must NOT
+    /// demote. The `ushr`'s `ireduce` sink still peels the tag to i32.
+    #[test]
+    fn dem64_keeps_real_pack() {
+        let mut func = dem64_func(&[types::I32, types::I32]);
+        let entry = func.dfg.make_block();
+        let next = func.dfg.make_block();
+        for b in [entry, next] {
+            func.layout.append_block(b);
+        }
+        let lo = func.dfg.append_block_param(entry, types::I32);
+        let hi = func.dfg.append_block_param(entry, types::I32);
+        let arg = func.dfg.append_block_param(next, types::I32);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let wl = cur.ins().uextend(types::I64, lo);
+        let wh = cur.ins().uextend(types::I64, hi);
+        let sh = cur.ins().iconst(types::I64, 32);
+        let hi64 = cur.ins().ishl(wh, sh);
+        let packed = cur.ins().bor(wl, hi64);
+        let tag = cur.ins().ushr(packed, sh);
+        let tag32 = cur.ins().ireduce(types::I32, tag);
+        cur.ins().jump(next, &[tag32.into()]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(next);
+        let out = cur.ins().uextend(types::I64, arg);
+        cur.ins().return_(&[out]);
+
+        // `ushr packed, 32` reads the high word: not demotable, so the
+        // pack's `bor`/`ishl` web stays i64. Only `uextend.i64 w`'s
+        // ireduce-side narrowing fires — nothing here should rewrite.
+        let n = dem64(&mut func);
+        assert!(
+            func.layout
+                .block_insts(entry)
+                .any(|i| func.dfg.insts[i].opcode() == Opcode::Bor
+                    && func.dfg.value_type(func.dfg.first_result(i)) == types::I64),
+            "the real i64 pack must survive:\n{}",
+            func.display()
+        );
+        dem64_verify(&func, "dem64 real pack");
+        let _ = n;
+    }
+
+    /// `brif` on a value that isn't provably < 2^32 stays i64 — a
+    /// widened `select`'s high bit could be the whole condition.
+    #[test]
+    fn dem64_brif_needs_hi0() {
+        let mut func = dem64_func(&[types::I64, types::I8]);
+        let entry = func.dfg.make_block();
+        let yes = func.dfg.make_block();
+        for b in [entry, yes] {
+            func.layout.append_block(b);
+        }
+        let _p = func.dfg.append_block_param(entry, types::I64);
+        let c8 = func.dfg.append_block_param(entry, types::I8);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let a = cur.ins().iconst(types::I64, 0x1_0000_0000);
+        let b = cur.ins().iconst(types::I64, 0);
+        let s = cur.ins().select(c8, a, b);
+        cur.ins().brif(s, yes, &[], yes, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(yes);
+        cur.ins().return_(&[s]);
+
+        dem64(&mut func);
+        // The select is hi0-unproven (arm 2^32): no demotion anywhere.
+        let InstructionData::Brif { arg, .. } = func.dfg.insts
+            [func.layout.block_insts(entry).last().unwrap()]
+        else {
+            panic!()
+        };
+        assert_eq!(func.dfg.value_type(arg), types::I64);
+        dem64_verify(&func, "dem64 brif hi0");
     }
 }
