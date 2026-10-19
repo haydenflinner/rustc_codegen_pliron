@@ -17,6 +17,7 @@
 //! extra vreg regalloc had to coalesce).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -7865,6 +7866,663 @@ pub fn wide_minmax(func: &mut Function) -> usize {
     n
 }
 
+// ===== selord: bool algebra over compare-outcome masks ===============
+//
+// An integer comparison's result partitions operand space into five
+// disjoint classes: equal, unsigned-less ∧ signed-less, unsigned-less
+// only (`x <u y` with `y` negative), signed-less only (`x` negative),
+// and greater under both orders. Every `IntCC` is a subset of them, so
+// booleans built from compares of the same pair collapse by mask
+// arithmetic — `Ordering`'s `lt ? -1 : (ne ? 1 : 0)` nested `select`s
+// answer `ord == Greater` as `ne & !lt` = `ugt` on the original
+// operands, and `Option` tag decodes/`!c` spellings peel the same
+// way.
+
+/// x == y (all orders agree).
+const OC_EQ: u8 = 1;
+/// x <u y and x <s y.
+const OC_LL: u8 = 2;
+/// x <u y but x >=s y (x non-negative, y negative).
+const OC_UL: u8 = 4;
+/// x >=u y but x <s y (x negative, y non-negative).
+const OC_SU: u8 = 8;
+/// x >u y and x >s y.
+const OC_GG: u8 = 16;
+const OC_ALL: u8 = OC_EQ | OC_LL | OC_UL | OC_SU | OC_GG;
+
+fn cc_mask(cc: IntCC) -> u8 {
+    match cc {
+        IntCC::Equal => OC_EQ,
+        IntCC::NotEqual => OC_ALL & !OC_EQ,
+        IntCC::UnsignedLessThan => OC_LL | OC_UL,
+        IntCC::UnsignedLessThanOrEqual => OC_EQ | OC_LL | OC_UL,
+        IntCC::UnsignedGreaterThan => OC_SU | OC_GG,
+        IntCC::UnsignedGreaterThanOrEqual => OC_EQ | OC_SU | OC_GG,
+        IntCC::SignedLessThan => OC_LL | OC_SU,
+        IntCC::SignedLessThanOrEqual => OC_EQ | OC_LL | OC_SU,
+        IntCC::SignedGreaterThan => OC_UL | OC_GG,
+        IntCC::SignedGreaterThanOrEqual => OC_EQ | OC_UL | OC_GG,
+    }
+}
+
+/// The negated compare (`!m` stays a single cc for every `IntCC`).
+fn cc_inv(cc: IntCC) -> IntCC {
+    match cc {
+        IntCC::Equal => IntCC::NotEqual,
+        IntCC::NotEqual => IntCC::Equal,
+        IntCC::UnsignedLessThan => IntCC::UnsignedGreaterThanOrEqual,
+        IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThan,
+        IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThanOrEqual,
+        IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThan,
+        IntCC::SignedLessThan => IntCC::SignedGreaterThanOrEqual,
+        IntCC::SignedLessThanOrEqual => IntCC::SignedGreaterThan,
+        IntCC::SignedGreaterThan => IntCC::SignedLessThanOrEqual,
+        IntCC::SignedGreaterThanOrEqual => IntCC::SignedLessThan,
+    }
+}
+
+/// The unique `IntCC` whose outcome set is `m`, if it's a single cc.
+fn mask_cc(m: u8) -> Option<IntCC> {
+    [
+        IntCC::Equal,
+        IntCC::NotEqual,
+        IntCC::UnsignedLessThan,
+        IntCC::UnsignedLessThanOrEqual,
+        IntCC::UnsignedGreaterThan,
+        IntCC::UnsignedGreaterThanOrEqual,
+        IntCC::SignedLessThan,
+        IntCC::SignedLessThanOrEqual,
+        IntCC::SignedGreaterThan,
+        IntCC::SignedGreaterThanOrEqual,
+    ]
+    .into_iter()
+    .find(|&cc| cc_mask(cc) == m)
+}
+
+/// `a CC b` on `w`-bit constants (operands masked to width).
+fn cc_eval(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
+    let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let (a, b) = (a & m, b & m);
+    let (sa, sb) = (sext(a, w), sext(b, w));
+    match cc {
+        IntCC::Equal => a == b,
+        IntCC::NotEqual => a != b,
+        IntCC::UnsignedLessThan => a < b,
+        IntCC::UnsignedLessThanOrEqual => a <= b,
+        IntCC::UnsignedGreaterThan => a > b,
+        IntCC::UnsignedGreaterThanOrEqual => a >= b,
+        IntCC::SignedLessThan => sa < sb,
+        IntCC::SignedLessThanOrEqual => sa <= sb,
+        IntCC::SignedGreaterThan => sa > sb,
+        IntCC::SignedGreaterThanOrEqual => sa >= sb,
+    }
+}
+
+/// `v` as a 0/1 predicate over one fixed operand pair: returns
+/// `(x, y, mask, src)` — `v != 0` exactly on `mask`'s outcome classes
+/// of `x ? y`, and `src` is a canonical 0/1 value computing `mask`
+/// when the peel found one (the innermost `icmp`). Peels
+/// `uextend`/`ireduce`, `x & 1`, `x ^ 1`, `select c, 0, 1` / `1, 0`,
+/// `icmp cc z, K` re-based through `z`'s own pair, and `select`s whose
+/// cond and arms all live on the same pair. Anything non-bool (or a
+/// select arm on a different pair) bails with `None`.
+fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8, Option<Value>)> {
+    if depth == 0 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    let d = func.dfg.value_def(v).inst()?;
+    match func.dfg.insts[d] {
+        InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Ireduce,
+            arg,
+        } => bool_mask(func, arg, depth - 1),
+        InstructionData::Binary { opcode, args } => {
+            let inv = match opcode {
+                Opcode::Band => false,
+                Opcode::Bxor => true,
+                _ => return None,
+            };
+            let (x, k) = bin_k_data(func, args)?;
+            if k != 1 {
+                return None;
+            }
+            let (x, y, m, src) = bool_mask(func, x, depth - 1)?;
+            // `b ^ 1` flips the predicate only when `b` is 0/1 — which
+            // `bool_mask`'s domain guarantees by construction.
+            Some((x, y, if inv { !m & OC_ALL } else { m }, src))
+        }
+        InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond,
+            args,
+            ..
+        } => {
+            // `icmp cc z, K` where `z` is itself a bool re-bases onto
+            // z's operand pair: `z ? cc(1,K) : cc(0,K)` in mask space.
+            let pick = if let Some(k) = iconst(func, args[1]) {
+                Some((cond, args[0], k))
+            } else {
+                iconst(func, args[0]).map(|k| (cond.swap_args(), args[1], k))
+            };
+            if let Some((c2, z, k)) = pick {
+                if let Some((x, y, m, _)) = bool_mask(func, z, depth - 1) {
+                    let zw = func.dfg.value_type(z).bits();
+                    let ku = k as u64;
+                    let m2 = (if cc_eval(c2, 0, ku, zw) { !m } else { 0 }
+                        | if cc_eval(c2, 1, ku, zw) { m } else { 0 })
+                        & OC_ALL;
+                    return Some((x, y, m2, Some(z)));
+                }
+            }
+            Some((args[0], args[1], cc_mask(cond), Some(v)))
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } => {
+            let c = func.dfg.resolve_aliases(args[0]);
+            let (x, y, mc, cs) = bool_mask(func, c, depth - 1)?;
+            // Arm masks over the same pair; a constant arm is all/none.
+            let arm = |v: Value| -> Option<(u8, Option<Value>)> {
+                let v = func.dfg.resolve_aliases(v);
+                if let Some(k) = iconst(func, v) {
+                    return Some((if k != 0 { OC_ALL } else { 0 }, None));
+                }
+                let (x2, y2, m, s) = bool_mask(func, v, depth - 1)?;
+                (func.dfg.resolve_aliases(x2) == func.dfg.resolve_aliases(x)
+                    && func.dfg.resolve_aliases(y2) == func.dfg.resolve_aliases(y))
+                .then_some((m, s))
+            };
+            let (ma, sa) = arm(args[1])?;
+            let (mb, sb) = arm(args[2])?;
+            let m = (ma & mc) | (mb & !mc & OC_ALL);
+            // The composed select is a canonical bool — remember a
+            // source value whenever the mask happens to be a known one.
+            let src = if m == mc {
+                cs
+            } else if m == ma {
+                sa
+            } else if m == mb {
+                sb
+            } else {
+                None
+            };
+            Some((x, y, m, src))
+        }
+        _ => None,
+    }
+}
+
+/// What `icmp cc v, K` evaluates to.
+enum CmpVal {
+    /// Decided constant.
+    K(bool),
+    /// `mask` over operand pair `(x, y)` — materializes as `icmp`.
+    P(Value, Value, u8),
+    /// An existing canonical 0/1 value (negated when `neg`).
+    V(Value, bool),
+}
+
+/// `v` coerced to an i8 bool at `pos` (`ireduce` of a wider 0/1).
+fn bool_i8(pos: &mut FuncCursor, v: Value) -> Value {
+    let v = pos.func.dfg.resolve_aliases(v);
+    if pos.func.dfg.value_type(v) == types::I8 {
+        v
+    } else {
+        pos.ins().ireduce(types::I8, v)
+    }
+}
+
+/// Emit `!b` as an i8 bool: inverse `icmp` when `b` is one, else
+/// `icmp eq b, 0`.
+fn bool_not(pos: &mut FuncCursor, b: Value) -> Value {
+    let b = pos.func.dfg.resolve_aliases(b);
+    if let Some(d) = pos.func.dfg.value_def(b).inst()
+        && let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond,
+            args,
+            ..
+        } = pos.func.dfg.insts[d]
+    {
+        return pos.ins().icmp(cc_inv(cond), args[0], args[1]);
+    }
+    let b = bool_i8(pos, b);
+    let z = pos.ins().iconst(types::I8, 0);
+    pos.ins().icmp(IntCC::Equal, b, z)
+}
+
+/// What `v`'s truth reduces to given the compare `cc(·, K)` of a bool:
+/// `z` is 0/1, so only `cc(0, K)`/`cc(1, K)` matter.
+fn bool_cmp_k(func: &Function, v: Value, cc: IntCC, k: u64) -> CmpVal {
+    let w = func.dfg.value_type(v).bits();
+    match (cc_eval(cc, 0, k, w), cc_eval(cc, 1, k, w)) {
+        (false, false) => CmpVal::K(false),
+        (true, true) => CmpVal::K(true),
+        (false, true) => CmpVal::V(v, false),
+        (true, false) => CmpVal::V(v, true),
+    }
+}
+
+/// Evaluate `icmp cc v, k` (`w` = operand width): constants decide,
+/// bools re-base through `bool_mask`, and a `select` recurses arm-wise
+/// so `icmp eq (select lt, -1, select ne, 1, 0), 1` reads
+/// `!lt & ne` on the shared pair = `ugt`.
+fn eval_cmp(func: &mut Function, v: Value, cc: IntCC, k: u64, w: u32, depth: u32) -> Option<CmpVal> {
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(kv) = ceval(func, v, 6) {
+        return Some(CmpVal::K(cc_eval(cc, kv as u64, k, w)));
+    }
+    if is01(func, v, 4) {
+        if let Some((x, y, m, src)) = bool_mask(func, v, 4) {
+            let zw = func.dfg.value_type(v).bits();
+            let t0 = cc_eval(cc, 0, k, zw);
+            let t1 = cc_eval(cc, 1, k, zw);
+            let m2 = (if t0 { !m } else { 0 } | if t1 { m } else { 0 }) & OC_ALL;
+            // Mask survived untouched → the peeled source already is
+            // the answer (`icmp ne (icmp ult), 0` → the inner icmp).
+            if m2 == m && let Some(s) = src {
+                return Some(CmpVal::V(s, false));
+            }
+            return Some(match m2 {
+                0 => CmpVal::K(false),
+                OC_ALL => CmpVal::K(true),
+                m => CmpVal::P(x, y, m),
+            });
+        }
+        return Some(bool_cmp_k(func, v, cc, k));
+    }
+    if depth >= 3 {
+        return None;
+    }
+    let d = func.dfg.value_def(v).inst()?;
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args,
+    } = func.dfg.insts[d]
+    else {
+        return None;
+    };
+    let c = func.dfg.resolve_aliases(args[0]);
+    let ea = eval_cmp(func, args[1], cc, k, w, depth + 1)?;
+    let eb = eval_cmp(func, args[2], cc, k, w, depth + 1)?;
+    sel_cmp(func, c, ea, eb)
+}
+
+/// `select c, ea, eb` where `ea`/`eb` are evaluated compare results.
+/// Only fires when `c`'s own predicate shares the pair (so the select
+/// mask-combines) or both arms collapsed to constants.
+fn sel_cmp(func: &mut Function, c: Value, ea: CmpVal, eb: CmpVal) -> Option<CmpVal> {
+    use CmpVal::*;
+    if let (K(a), K(b)) = (&ea, &eb) {
+        let (a, b) = (*a, *b);
+        if a == b {
+            return Some(K(a));
+        }
+        // `c ? 1 : 0` is truthy(c), `c ? 0 : 1` its negation — re-base
+        // on c's pair when it has one so the Ordering decode keeps
+        // collapsing.
+        if let Some((x, y, mc, _)) = bool_mask(func, c, 4) {
+            return Some(P(x, y, if a { mc } else { !mc & OC_ALL }));
+        }
+        if is01(func, c, 4) {
+            return Some(V(c, !a));
+        }
+        return None;
+    }
+    let (x, y, mc, _) = bool_mask(func, c, 4)?;
+    let pair = |e: &CmpVal| -> Option<u8> {
+        match e {
+            K(t) => Some(if *t { OC_ALL } else { 0 }),
+            P(x2, y2, m) => (*x2 == x && *y2 == y).then_some(*m),
+            V(v, neg) => bool_mask(func, *v, 4)
+                .filter(|&(x2, y2, _, _)| {
+                    func.dfg.resolve_aliases(x2) == x && func.dfg.resolve_aliases(y2) == y
+                })
+                .map(|(_, _, m, _)| if *neg { !m & OC_ALL } else { m }),
+        }
+    };
+    let (ma, mb) = (pair(&ea)?, pair(&eb)?);
+    Some(P(x, y, (ma & mc) | (mb & !mc & OC_ALL)))
+}
+
+/// Lazily-built `icmp` reuse table: `(cc, a, b)` → producing insts, plus
+/// the domtree for the dominance check. An Ordering decode repeats the
+/// same compares in every sibling block — reuse avoids minting a second
+/// `icmp ne` next to the one it replaced.
+struct CmpReuse {
+    imap: FxHashMap<(IntCC, Value, Value), Vec<Inst>>,
+    dt: DominatorTree,
+}
+
+impl CmpReuse {
+    fn new(func: &Function) -> Self {
+        use cranelift_codegen::dominator_tree::DominatorTree;
+        let cfg = ControlFlowGraph::with_function(func);
+        let mut imap: FxHashMap<(IntCC, Value, Value), Vec<Inst>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                if let InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond,
+                    args,
+                    ..
+                } = func.dfg.insts[i]
+                {
+                    imap.entry((
+                        cond,
+                        func.dfg.resolve_aliases(args[0]),
+                        func.dfg.resolve_aliases(args[1]),
+                    ))
+                    .or_default()
+                    .push(i);
+                }
+            }
+        }
+        Self {
+            imap,
+            dt: DominatorTree::with_function(func, &cfg),
+        }
+    }
+
+    /// A dominating `icmp cc x, y` already producing this compare.
+    /// Re-checks the cached inst's data — selord's in-place rewrites
+    /// can retarget a compare since the table was built.
+    fn get(&self, func: &Function, cc: IntCC, x: Value, y: Value, at: Inst) -> Option<Value> {
+        for &ci in self.imap.get(&(cc, x, y))? {
+            if func.layout.inst_block(ci).is_none() {
+                continue;
+            }
+            let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond: c2,
+                args,
+                ..
+            } = func.dfg.insts[ci]
+            else {
+                continue;
+            };
+            if c2 == cc
+                && func.dfg.resolve_aliases(args[0]) == x
+                && func.dfg.resolve_aliases(args[1]) == y
+                && self.dt.try_dominates(ci, at, &func.layout)
+            {
+                return Some(func.dfg.first_result(ci));
+            }
+        }
+        None
+    }
+}
+
+/// Materialize `cv` as an i8 bool at `pos`; `reuse` finds an existing
+/// dominating `icmp` first.
+fn mkcmp(
+    pos: &mut FuncCursor,
+    cv: CmpVal,
+    reuse: &mut Option<CmpReuse>,
+    at: Inst,
+) -> Option<Value> {
+    let v = match cv {
+        CmpVal::K(b) => pos.ins().iconst(types::I8, b as i64),
+        CmpVal::V(v, neg) => {
+            let b = bool_i8(pos, v);
+            if neg { bool_not(pos, b) } else { b }
+        }
+        CmpVal::P(x, y, m) => {
+            if m == 0 {
+                return Some(pos.ins().iconst(types::I8, 0));
+            }
+            if m == OC_ALL {
+                return Some(pos.ins().iconst(types::I8, 1));
+            }
+            let cc = mask_cc(m)?;
+            let (x, y) = (pos.func.dfg.resolve_aliases(x), pos.func.dfg.resolve_aliases(y));
+            let r = reuse.get_or_insert_with(|| CmpReuse::new(pos.func));
+            match r.get(pos.func, cc, x, y, at) {
+                Some(v) => v,
+                None => pos.ins().icmp(cc, x, y),
+            }
+        }
+    };
+    Some(v)
+}
+
+/// `icmp cc x, K` where `x` is a bool chain or a `select` of
+/// evaluable arms — rewrite/alias to the collapsed form.
+fn selord_icmp(
+    pos: &mut FuncCursor,
+    inst: Inst,
+    cond: IntCC,
+    args: [Value; 2],
+    reuse: &mut Option<CmpReuse>,
+) -> bool {
+    let (cond, x, k) = if let Some(k) = iconst(pos.func, args[1]) {
+        (cond, args[0], k)
+    } else if let Some(k) = iconst(pos.func, args[0]) {
+        (cond.swap_args(), args[1], k)
+    } else {
+        return false;
+    };
+    let x = pos.func.dfg.resolve_aliases(x);
+    let w = pos.func.dfg.value_type(x).bits();
+    if w > 64 {
+        return false; // `cc_eval` truncates past u64
+    }
+    // `icmp cc z, K` on a bool operand re-bases through z's pair —
+    // `icmp eq (icmp2), 0` → `icmp !cc2` on the inner operands. The
+    // `cc(0,K)`/`cc(1,K)` table is only valid when `z` is 0/1; the bare
+    // truth tests `ne z, 0`/`eq z, 0` are just `m`/`!m` for any `z`.
+    if let Some((a, b, m, src)) = bool_mask(pos.func, x, 4) {
+        let zw = pos.func.dfg.value_type(x).bits();
+        let ku = (k as u64) & if zw >= 64 { u64::MAX } else { (1u64 << zw) - 1 };
+        let m2 = if ku == 0 && matches!(cond, IntCC::NotEqual) {
+            Some(m) // `z != 0` is the truth mask itself
+        } else if ku == 0 && matches!(cond, IntCC::Equal) {
+            Some(!m & OC_ALL)
+        } else if is01(pos.func, x, 4) {
+            let t0 = cc_eval(cond, 0, ku, zw);
+            let t1 = cc_eval(cond, 1, ku, zw);
+            Some((if t0 { !m } else { 0 } | if t1 { m } else { 0 }) & OC_ALL)
+        } else {
+            None // not 0/1 — try the select push-down below instead
+        };
+        if let Some(m2) = m2 {
+            if m2 == m && let Some(s) = src {
+                // `cc z, K` is the un-modified predicate — alias to `src`.
+                if pos.func.dfg.value_type(s) == types::I8 {
+                    let res = pos.func.dfg.first_result(inst);
+                    pos.func.dfg.clear_results(inst);
+                    pos.remove_inst_and_step_back();
+                    pos.func.dfg.change_to_alias(res, s);
+                    return true;
+                }
+            }
+            if let Some(cc2) = mask_cc(m2) {
+                pos.func.dfg.insts[inst] = InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond: cc2,
+                    args: [a, b],
+                };
+                return true;
+            }
+            if m2 == 0 || m2 == OC_ALL {
+                let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                pos.func.replace(inst).iconst(ty, (m2 == OC_ALL) as i64);
+                return true;
+            }
+        }
+    }
+    // `icmp cc (select c, a, b), K` — evaluate each arm under the
+    // compare; the push-down only fires when both arms reduce.
+    let Some(d) = pos.func.dfg.value_def(x).inst() else {
+        return false;
+    };
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args: sa,
+    } = pos.func.dfg.insts[d]
+    else {
+        return false;
+    };
+    let ea = eval_cmp(pos.func, sa[1], cond, k as u64, w, 0);
+    let eb = eval_cmp(pos.func, sa[2], cond, k as u64, w, 0);
+    let (Some(ea), Some(eb)) = (ea, eb) else {
+        return false;
+    };
+    let Some(cv) = sel_cmp(pos.func, pos.func.dfg.resolve_aliases(sa[0]), ea, eb) else {
+        return false;
+    };
+    let Some(res) = mkcmp(pos, cv, reuse, inst) else {
+        return false;
+    };
+    let old = pos.func.dfg.first_result(inst);
+    pos.func.dfg.clear_results(inst);
+    pos.remove_inst_and_step_back();
+    pos.func.dfg.change_to_alias(old, res);
+    true
+}
+
+/// `band`/`bor`/`bxor` of two bools over the same operand pair → a
+/// single `icmp` — `ne & !lt` = `ugt` and friends, the tail of every
+/// `Ordering` decode after `selord_icmp` flattens the selects.
+fn selord_bit(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[inst] else {
+        return false;
+    };
+    if !matches!(opcode, Opcode::Band | Opcode::Bor | Opcode::Bxor) {
+        return false;
+    }
+    let res = func.dfg.first_result(inst);
+    if func.dfg.value_type(res) != types::I8 {
+        return false;
+    }
+    let Some((x, y, ma, _)) = bool_mask(func, args[0], 4) else {
+        return false;
+    };
+    let Some((x2, y2, mb, _)) = bool_mask(func, args[1], 4) else {
+        return false;
+    };
+    if func.dfg.resolve_aliases(x2) != x || func.dfg.resolve_aliases(y2) != y {
+        return false;
+    }
+    let m = match opcode {
+        Opcode::Band => ma & mb,
+        Opcode::Bor => ma | mb,
+        _ => ma ^ mb,
+    };
+    let Some(cc) = mask_cc(m) else {
+        return false;
+    };
+    func.dfg.insts[inst] = InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond: cc,
+        args: [x, y],
+    };
+    true
+}
+
+/// `select c, KA, KB` value forms: `select c, 0, 1` ≡ `!c`,
+/// `select c, 1, 0` ≡ `c`, `select c, k, k` ≡ `k` — and the
+/// pair-masked `select c, 0, b`/`select c, b, 0` (`b & !c` / `b & c`)
+/// merging to one `icmp` when `b`/`c` share operands. i8 results only —
+/// wider selects keep their (wider) arms.
+fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args,
+    } = pos.func.dfg.insts[inst]
+    else {
+        return false;
+    };
+    let res = pos.func.dfg.first_result(inst);
+    if pos.func.dfg.value_type(res) != types::I8 {
+        return false;
+    }
+    let c = pos.func.dfg.resolve_aliases(args[0]);
+    let (a, b) = (
+        pos.func.dfg.resolve_aliases(args[1]),
+        pos.func.dfg.resolve_aliases(args[2]),
+    );
+    // Const arms.
+    if let (Some(ka), Some(kb)) = (iconst(pos.func, a), iconst(pos.func, b)) {
+        let canon = match (ka, kb) {
+            (x, y) if x == y => return alias_to(pos, inst, res, a),
+            (1, 0) => Some((c, false)),
+            (0, 1) => Some((c, true)),
+            _ => None,
+        };
+        let Some((c, neg)) = canon else {
+            return false;
+        };
+        // `select c, 1, 0` ≡ truthy(c): alias a canonical bool c, else
+        // `icmp ne/eq c, 0`.
+        if !neg {
+            if is01(pos.func, c, 4) {
+                return alias_to(pos, inst, res, c);
+            }
+            let z = pos.ins().iconst(types::I8, 0);
+            pos.func.dfg.insts[inst] = InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond: IntCC::NotEqual,
+                args: [c, z],
+            };
+            return true;
+        }
+        if let Some((x, y, mc, _)) = bool_mask(pos.func, c, 4)
+            && let Some(cc) = mask_cc(!mc & OC_ALL)
+        {
+            pos.func.dfg.insts[inst] = InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond: cc,
+                args: [x, y],
+            };
+            return true;
+        }
+        let z = pos.ins().iconst(types::I8, 0);
+        pos.func.dfg.insts[inst] = InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond: IntCC::Equal,
+            args: [c, z],
+        };
+        return true;
+    }
+    // `select c, 0, b` / `select c, b, 0` where `b` is pair-masked —
+    // mask combine needs `c` on the same pair.
+    for (a0, b0, negate_c) in [(a, b, true), (b, a, false)] {
+        if iconst(pos.func, a0) != Some(0) {
+            continue;
+        }
+        let Some((x, y, mc, _)) = bool_mask(pos.func, c, 4) else {
+            return false;
+        };
+        let Some((x2, y2, mb, _)) = bool_mask(pos.func, b0, 4) else {
+            return false;
+        };
+        if pos.func.dfg.resolve_aliases(x2) != x || pos.func.dfg.resolve_aliases(y2) != y {
+            return false;
+        }
+        let m = if negate_c { mb & !mc & OC_ALL } else { mb & mc };
+        let Some(cc) = mask_cc(m) else {
+            return false;
+        };
+        pos.func.dfg.insts[inst] = InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond: cc,
+            args: [x, y],
+        };
+        return true;
+    }
+    false
+}
+
+fn alias_to(pos: &mut FuncCursor, inst: Inst, res: Value, v: Value) -> bool {
+    pos.func.dfg.clear_results(inst);
+    pos.remove_inst_and_step_back();
+    pos.func.dfg.change_to_alias(res, v);
+    true
+}
+
 /// The last-sweep cleanups `iconst128` runs after the pipeline's final
 /// mutating step — the wasm emitter walks every inst into a real op
 /// with no DCE behind it, so pure leftovers cost real code:
@@ -8080,9 +8738,13 @@ fn post_sweep(func: &mut Function) -> usize {
     let icmpk_on = crate::pass_enabled("PLIRON_ICMPK");
     let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
     let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM");
-    if !icmpk_on && !icmpred_on && !addnorm_on {
+    let selord_on = crate::pass_enabled("PLIRON_SELORD");
+    let selnot_on = crate::pass_enabled("PLIRON_SELNOT");
+    let brifnot_on = crate::pass_enabled("PLIRON_BRIFNOT");
+    if !(icmpk_on || icmpred_on || addnorm_on || selord_on || selnot_on || brifnot_on) {
         return n;
     }
+    let mut reuse = None;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -8092,6 +8754,10 @@ fn post_sweep(func: &mut Function) -> usize {
                     cond,
                     args,
                 } => {
+                    if selord_on && selord_icmp(&mut pos, inst, cond, args, &mut reuse) {
+                        n += 1;
+                        continue;
+                    }
                     if icmpred_on && icmpred(&mut pos, inst, cond, args) {
                         n += 1;
                         continue;
@@ -8116,34 +8782,63 @@ fn post_sweep(func: &mut Function) -> usize {
                 } if addnorm_on => {
                     n += usize::from(addnorm(&mut pos, inst));
                 }
+                // `band`/`bor`/`bxor` of two bools on one compare pair
+                // → one `icmp` (`ne & !lt` = `ugt` — Ordering decode
+                // tails).
+                InstructionData::Binary {
+                    opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
+                    ..
+                } if selord_on => {
+                    n += usize::from(selord_bit(pos.func, inst));
+                }
+                // `select c, 0, 1` ≡ `!c`, `select c, b, 0` ≡ `b & c`
+                // — canonical bools collapse to an `icmp` on the pair.
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    ..
+                } => {
+                    if selnot_on && sel_not(pos.func, inst) {
+                        n += 1;
+                        continue;
+                    }
+                    if selord_on && selord_sel(&mut pos, inst) {
+                        n += 1;
+                    }
+                }
                 // `brif (select c, 0, 1)` ≡ `brif c` with the targets
                 // swapped (`select c,0,1` is `!c`); `select c,1,0` is
                 // `c` — the `is-some` tests the iter machinery emits.
                 InstructionData::Brif { arg, .. } => {
                     let s = pos.func.dfg.resolve_aliases(arg);
-                    let Some(d) = pos.func.dfg.value_def(s).inst() else {
-                        continue;
-                    };
-                    let InstructionData::Ternary {
-                        opcode: Opcode::Select,
-                        args: sa,
-                    } = pos.func.dfg.insts[d]
-                    else {
-                        continue;
-                    };
-                    let swap = match (iconst(pos.func, sa[1]), iconst(pos.func, sa[2])) {
-                        (Some(0), Some(1)) => true,
-                        (Some(1), Some(0)) => false,
-                        _ => continue,
-                    };
-                    if let InstructionData::Brif {
-                        arg, blocks, ..
-                    } = &mut pos.func.dfg.insts[inst]
+                    let mut done = false;
+                    if let Some(d) = pos.func.dfg.value_def(s).inst()
+                        && let InstructionData::Ternary {
+                            opcode: Opcode::Select,
+                            args: sa,
+                        } = pos.func.dfg.insts[d]
+                        && let Some(swap) = match (
+                            iconst(pos.func, sa[1]),
+                            iconst(pos.func, sa[2]),
+                        ) {
+                            (Some(0), Some(1)) => Some(true),
+                            (Some(1), Some(0)) => Some(false),
+                            _ => None,
+                        }
+                        && let InstructionData::Brif {
+                            arg, blocks, ..
+                        } = &mut pos.func.dfg.insts[inst]
                     {
                         *arg = sa[0];
                         if swap {
                             blocks.swap(0, 1);
                         }
+                        n += 1;
+                        done = true;
+                    }
+                    // Deeper peel: `brif (ireduce (band (select ..),1))`
+                    // chains — the `Option`-niche tests sroa/paramsink
+                    // leave after the early `brif_fold` ran.
+                    if !done && brifnot_on && brif_not(pos.func, inst) {
                         n += 1;
                     }
                 }

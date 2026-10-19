@@ -501,3 +501,204 @@ block0(v0: i32):
     verify(&f);
     equiv(&before, &f);
 }
+
+/// `icmp eq (select lt, -1, (select ne, 1, 0)), 1` — the `Ordering`
+/// decode `unicode_data::skip_search` builds for `binary_search`'s
+/// result — is `ugt` on the compared operands: three values and two
+/// selects become one compare.
+#[test]
+fn selord_ordering_gt() {
+    let src = "function %f(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp.i8 ult v0, v1
+    v3 = icmp.i8 ne v0, v1
+    v4 = iconst.i8 1
+    v5 = iconst.i8 0
+    v6 = select.i8 v3, v4, v5
+    v7 = iconst.i8 -1
+    v8 = select.i8 v2, v7, v6
+    v9 = iconst.i8 1
+    v10 = icmp.i8 eq v8, v9
+    return v10
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Select), 0, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Icmp), 1, "{}", f.display());
+    let i = ops(&f)
+        .iter()
+        .zip(f.layout.blocks().flat_map(|b| f.layout.block_insts(b)))
+        .find(|&(o, _)| *o == Opcode::Icmp)
+        .map(|(_, i)| i)
+        .unwrap();
+    let InstructionData::IntCompare { cond, args, .. } = f.dfg.insts[i] else {
+        unreachable!()
+    };
+    assert_eq!(cond, IntCC::UnsignedGreaterThan);
+    assert_eq!(
+        args.map(|a| f.dfg.resolve_aliases(a)),
+        [v0_arg(&f, 0), v0_arg(&f, 1)]
+    );
+    verify(&f);
+    equiv(&before, &f);
+}
+
+fn v0_arg(f: &Function, n: usize) -> Value {
+    f.dfg.block_params(f.layout.entry_block().unwrap())[n]
+}
+
+/// `icmp eq ord, 0` on the same decode → `icmp eq` on the pair.
+#[test]
+fn selord_ordering_eq() {
+    let src = "function %f(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp.i8 ult v0, v1
+    v3 = icmp.i8 ne v0, v1
+    v4 = iconst.i8 1
+    v5 = iconst.i8 0
+    v6 = select.i8 v3, v4, v5
+    v7 = iconst.i8 -1
+    v8 = select.i8 v2, v7, v6
+    v9 = iconst.i8 0
+    v10 = icmp.i8 eq v8, v9
+    return v10
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Select), 0, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Icmp), 1, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// `icmp eq (icmp ult a, b), 0` → `icmp uge a, b` — the `!c` spelling
+/// `Option`/bool code emits before a `band 1`.
+#[test]
+fn selord_icmp_of_icmp() {
+    let src = "function %f(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
+    v2 = icmp.i32 ult v0, v1
+    v3 = iconst.i8 0
+    v4 = icmp.i8 eq v2, v3
+    return v4
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Icmp), 1, "{}", f.display());
+    let i = f
+        .layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .find(|&i| matches!(f.dfg.insts[i], InstructionData::IntCompare { .. }))
+        .unwrap();
+    let InstructionData::IntCompare { cond, .. } = f.dfg.insts[i] else {
+        unreachable!()
+    };
+    assert_eq!(cond, IntCC::UnsignedGreaterThanOrEqual, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// `select c, 0, (icmp ne)` on the same pair — `b & !c` — collapses
+/// to `icmp ugt`.
+#[test]
+fn selord_sel_mask() {
+    let src = "function %f(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp.i8 ult v0, v1
+    v3 = icmp.i8 ne v0, v1
+    v4 = iconst.i8 0
+    v5 = select.i8 v2, v4, v3
+    return v5
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Select), 0, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Icmp), 1, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// Same shape on *different* operand pairs must not merge — `x<y &&
+/// x!=z` isn't a single compare.
+#[test]
+fn selord_sel_cross_pair_kept() {
+    let src = "function %f(i8, i8, i8) -> i8 {
+block0(v0: i8, v1: i8, v9: i8):
+    v2 = icmp.i8 ult v0, v1
+    v3 = icmp.i8 ne v0, v9
+    v4 = iconst.i8 0
+    v5 = select.i8 v2, v4, v3
+    return v5
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Select), 1, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// `band (icmp ne a,b), (icmp uge a,b)` → `icmp ugt a,b` — bool
+/// combination on one pair.
+#[test]
+fn selord_band_icmps() {
+    let src = "function %f(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp.i8 ne v0, v1
+    v3 = icmp.i8 uge v0, v1
+    v4 = band.i8 v2, v3
+    return v4
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Icmp), 1, "{}", f.display());
+    assert_eq!(count(&f, Opcode::Band), 0, "{}", f.display());
+    verify(&f);
+    equiv(&before, &f);
+}
+
+/// `brif (ireduce.i8 (select.i32 c, 0, 1))` — the `Option`-niche
+/// materialization — branches on `c` with swapped targets.
+#[test]
+fn selord_brif_peels_ireduce_select() {
+    let src = "function %f(i8) -> i32 {
+block0(v0: i8):
+    v1 = iconst.i32 0
+    v2 = iconst.i32 1
+    v3 = select.i32 v0, v1, v2
+    v4 = ireduce.i8 v3
+    brif v4, block1, block2
+block1:
+    v6 = iconst.i32 7
+    return v6
+block2:
+    v7 = iconst.i32 9
+    return v7
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    assert_eq!(count(&f, Opcode::Select), 0, "{}", f.display());
+    let brif = f
+        .layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .find(|&i| matches!(f.dfg.insts[i], InstructionData::Brif { .. }))
+        .unwrap();
+    let InstructionData::Brif { arg, blocks, .. } = f.dfg.insts[brif] else {
+        unreachable!()
+    };
+    assert_eq!(f.dfg.resolve_aliases(arg), v0_arg(&f, 0));
+    // `!c` was tested → the `7` (taken-when-false) arm moved second.
+    let t1 = blocks[1].block(&f.dfg.value_lists);
+    let ret = f.layout.block_insts(t1).next_back().unwrap();
+    assert_eq!(f.dfg.insts[ret].opcode(), Opcode::Return);
+    verify(&f);
+    equiv(&before, &f);
+}
