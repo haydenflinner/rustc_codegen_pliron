@@ -800,6 +800,10 @@ pub struct Step {
     pub creates: u32,
     pub gate: Gate,
     pub run: fn(&mut Pipe, &mut Analysis) -> usize,
+    /// Per-step `pliron::step` callsite, resolved once — `dyn_site`
+    /// takes a global mutex per call, which every worker hit per step
+    /// per function.
+    pub site: std::sync::OnceLock<&'static crate::trace::DynSite>,
 }
 
 impl Step {
@@ -839,6 +843,7 @@ const fn step(
         creates: shape::CREATED,
         gate,
         run,
+        site: std::sync::OnceLock::new(),
     }
 }
 
@@ -862,6 +867,7 @@ const fn cstep(
         any: 0,
         gate,
         run,
+        site: std::sync::OnceLock::new(),
     }
 }
 
@@ -1218,7 +1224,8 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
     // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on
     // span close; the step's real name is the span name (see trace.rs).
     let _s = crate::config::tracing_on().then(|| {
-        crate::trace::dyn_site("pliron::step", &["fn"], s.name)
+        s.site
+            .get_or_init(|| crate::trace::dyn_site("pliron::step", &["fn"], s.name))
             .span_with("fn", p.fname)
             .entered()
     });
@@ -2586,10 +2593,48 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         p.operand_frozen.insert(w, v);
         p.fact_bits[w] |= fact_bits::OPERAND_FROZEN;
     }
+    // `lifetimes` updates happen in `carry_lts` — one pass per batch of
+    // pairs instead of a full scan per pair.
+}
+
+/// Batched `lifetimes` rewrite for a set of carried pairs: one pass
+/// over the markers plus a memoized chain walk per hit — the same
+/// result `carry_one`'s per-pair scan gave (first matching pair wins,
+/// then later pairs walk the result forward), but O(|pairs| +
+/// |lifetimes|) instead of O(|pairs| × |lifetimes|).
+pub(crate) fn carry_lts(p: &mut Pipe, pairs: &[(Value, Value)]) {
+    if pairs.is_empty() || p.lifetimes.is_empty() {
+        return;
+    }
+    let mut map: FxHashMap<Value, Value> = FxHashMap::default();
+    for &(d, w) in pairs {
+        map.entry(d).or_insert(w);
+    }
+    let mut memo: FxHashMap<Value, Value> = FxHashMap::default();
     for lt in p.lifetimes.iter_mut() {
-        if lt.0 == d {
-            lt.0 = w;
+        if !map.contains_key(&lt.0) {
+            continue;
         }
+        let start = lt.0;
+        if let Some(&r) = memo.get(&start) {
+            lt.0 = r;
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut v = start;
+        let r = loop {
+            match map.get(&v) {
+                Some(&w) if path.len() <= map.len() => {
+                    path.push(v);
+                    v = w;
+                }
+                _ => break v,
+            }
+        };
+        for &x in &path {
+            memo.insert(x, r);
+        }
+        lt.0 = r;
     }
 }
 
@@ -2635,10 +2680,13 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     // invariant — so `d`'s recorded facts hold of `w` too, whatever the
     // merge kind (a phase-A carrier, a deduped sibling, or a
     // materialized `f(siblings)` tree).
+    let mut pairs = Vec::with_capacity(pmap.len());
     for (&d, &w) in pmap {
         let w = resolve(w, &mut memo);
         carry_one(p, d, w);
+        pairs.push((d, w));
     }
+    carry_lts(p, &pairs);
 }
 
 /// `change_to_alias(d, w)` makes `w` `d`'s value everywhere, so facts
@@ -2682,10 +2730,11 @@ fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
             (r != v && !an.carried.contains(&(v, r))).then_some((v, r))
         })
         .collect();
-    for (d, w) in pairs {
-        an.carried.insert((d, w));
-        carry_one(p, d, w);
+    for (d, w) in &pairs {
+        an.carried.insert((*d, *w));
+        carry_one(p, *d, *w);
     }
+    carry_lts(p, &pairs);
 }
 
 fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -2838,7 +2887,7 @@ fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 const JT: Gate = Gate::Flag(FlagId::Jumpthread);
 
-pub static DEFAULT: &[Step] = &[
+pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(|| vec![
     Step {
         name: "jumpthread",
         bisect: Some("jumpthread"),
@@ -2856,6 +2905,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: JT,
         run: s_jumpthread,
+        site: std::sync::OnceLock::new(),
     },
     cstep(
         "constbr",
@@ -2876,6 +2926,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL")]),
         run: s_unroll,
+        site: std::sync::OnceLock::new(),
     },
     step("unreach", "", Gate::Flag(FlagId::Unreach), s_unreach),
     Step {
@@ -2891,6 +2942,7 @@ pub static DEFAULT: &[Step] = &[
         creates: u32::MAX,
         gate: Gate::Flag(FlagId::Peep),
         run: s_clifpeep,
+        site: std::sync::OnceLock::new(),
     },
     step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge).needs(shape::BLOCKS2),
     step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
@@ -2910,6 +2962,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Flag(FlagId::Loadfwd),
         run: s_loadfwd,
+        site: std::sync::OnceLock::new(),
     },
     // Stack-slot SSA promotion before the loop passes so the promoted
     // fields are loop-carried SSA values indvars/licm/bcheck can see.
@@ -2936,6 +2989,7 @@ pub static DEFAULT: &[Step] = &[
         creates: u32::MAX,
         gate: Gate::OptIn("PLIRON_EGRAPH"),
         run: s_egraph,
+        site: std::sync::OnceLock::new(),
     },
     // `prev` seed materialization emits loads.
     cstep("indvars", "indvars", Gate::Flag(FlagId::Indvars), s_indvars).needs(shape::LOOPS).creates_all(),
@@ -3005,6 +3059,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::OptIn("PLIRON_CONSTBR"),
         run: s_constbr2,
+        site: std::sync::OnceLock::new(),
     },
     cstep(
         "loopdel",
@@ -3054,6 +3109,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Always,
         run: s_frozen_loads,
+        site: std::sync::OnceLock::new(),
     },
     cstep(
         "sublea",
@@ -3073,6 +3129,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::All(&[Gate::Flag(FlagId::Peep), Gate::Env("PLIRON_COMMUTE")]),
         run: s_commute,
+        site: std::sync::OnceLock::new(),
     },
     Step {
         name: "wide_minmax",
@@ -3086,6 +3143,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Always,
         run: s_wide_minmax,
+        site: std::sync::OnceLock::new(),
     },
     Step {
         name: "coldarg",
@@ -3099,6 +3157,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_COLDARG"),
         run: s_coldarg,
+        site: std::sync::OnceLock::new(),
     },
     step("fuse", "fuse", Gate::Env("PLIRON_FUSE"), s_fuse).needs(shape::MULTI),
     cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd)
@@ -3169,6 +3228,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
+        site: std::sync::OnceLock::new(),
     },
     step("uload32", "uload32", Gate::Env("PLIRON_ULOAD32"), s_uload32).needs(shape::LOAD),
     // `icmp p, K` count latches become `icmp p+s, K+s` — the test folds
@@ -3224,6 +3284,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
+        site: std::sync::OnceLock::new(),
     },
     // Late uniform-param drop: mergechain/jtround retarget edges past
     // shared join blocks, and the remaining edges often agree on an
@@ -3319,6 +3380,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_DEADP"),
         run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
+        site: std::sync::OnceLock::new(),
     }
     .needs(shape::BPARAM),
     // Phi merge through affine congruence: every in-edge of a param
@@ -3370,6 +3432,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_LCSE"),
         run: s_lcse,
+        site: std::sync::OnceLock::new(),
     },
     // Third DSE: the late edge/jtr cleanup can delete a slot's last
     // readers after `dse2` ran (SipHash's `&key` tail-byte loads —
@@ -3431,6 +3494,7 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_COLDRET"),
         run: s_coldret,
+        site: std::sync::OnceLock::new(),
     },
     // Legality, not optimization: `iconst.i128` reaches isel with no
     // lowering rule and panics. Any pass can mint one, so sweep last.
@@ -3446,8 +3510,10 @@ pub static DEFAULT: &[Step] = &[
         creates: shape::CREATED,
         gate: Gate::Always,
         run: |p, _an| clifpeep::iconst128(&mut p.clctx.func),
+        site: std::sync::OnceLock::new(),
     },
-];
+]);
+
 
 #[cfg(test)]
 mod tests {

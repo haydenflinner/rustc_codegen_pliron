@@ -2413,9 +2413,12 @@ pub fn webmerge_ctx(
     use crate::proots::Key;
     let t0 = std::time::Instant::now();
     let WmCtx { cfg, dom, edges } = ctx;
-    let nf = crate::proots::web_nf_cfg(func, cfg);
+    // One edge-fact scan feeds both the web normal forms and the
+    // canonical-class proots — nothing mutates between them.
+    let facts = crate::proots::facts_cfg(func, cfg);
+    let nf = crate::proots::web_nf_facts(func, &facts);
     let t2 = std::time::Instant::now();
-    let canon = crate::proots::canon_map_cfg(func, cfg);
+    let canon = crate::proots::canon_map_facts(&facts);
     let t3 = std::time::Instant::now();
     if pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO)

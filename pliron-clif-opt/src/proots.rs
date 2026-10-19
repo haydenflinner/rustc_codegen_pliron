@@ -180,11 +180,16 @@ pub fn canon_map(func: &Function) -> FxHashMap<Value, Value> {
 
 /// `canon_map` over a caller-built CFG.
 pub fn canon_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, Value> {
-    let f = facts_cfg(func, cfg);
+    canon_map_facts(&facts_cfg(func, cfg))
+}
+
+/// `canon_map_cfg` over caller-supplied edge facts — the same `Facts`
+/// can feed `web_nf_facts` when nothing mutates in between.
+pub fn canon_map_facts(f: &Facts) -> FxHashMap<Value, Value> {
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
-    p.diffs = diffs_rows(&f);
+    p.diffs = diffs_rows(f);
     p.run();
     p.canon.into_iter().collect()
 }
@@ -278,8 +283,13 @@ pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
 
 /// `web_nf` over a caller-built CFG.
 pub fn web_nf_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, (Value, i64)> {
+    web_nf_facts(func, &facts_cfg(func, cfg))
+}
+
+/// `web_nf_cfg` over caller-supplied edge facts — one `facts_cfg` can
+/// serve both this and `canon_map_facts` while the IR stays still.
+pub fn web_nf_facts(func: &Function, f: &Facts) -> FxHashMap<Value, (Value, i64)> {
     let mut nf = affine_nf(func);
-    let f = facts_cfg(func, cfg);
     let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
     loop {
         let mut grew = false;

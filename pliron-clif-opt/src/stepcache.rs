@@ -387,6 +387,7 @@ pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
     for &(d, w) in &v.facts {
         crate::pipeline::carry_one(p, d, w);
     }
+    crate::pipeline::carry_lts(p, &v.facts);
     v.stats.apply(p.stats);
     crate::config::bisect_skip(v.draws);
     PipeLookup::Hit
@@ -465,9 +466,10 @@ pub fn lookup(p: &mut Pipe, s: &Step, an: &mut Analysis) -> Option<usize> {
         *p.derived = derived.iter().copied().collect();
         p.seed_derived_bits();
     }
-    for (d, w) in facts {
-        crate::pipeline::carry_one(p, d, w);
+    for (d, w) in &facts {
+        crate::pipeline::carry_one(p, *d, *w);
     }
+    crate::pipeline::carry_lts(p, &facts);
     stats.apply(p.stats);
     an.clif_hash = Some(out_hash);
     p.dump(s.name);
