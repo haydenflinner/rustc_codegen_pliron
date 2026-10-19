@@ -2048,6 +2048,147 @@ fn peep_body_opts(
         }
         ins = out;
     }
+    // Store→load forwarding through a provably-stable base local: the
+    // frame-resident aggregate splice leaves `get fp; get v; store +K`
+    // … `get fp; load +K` — the load re-reads bytes the store just
+    // wrote (the call-boundary spill/reload that costs ~10 memory ops
+    // per loop iteration around inlined callees). Within one
+    // straight-line span, when a `get B; get V; store(B,off)` triple is
+    // followed by `get B; load(B,off)` at the same width, and nothing
+    // in between writes B or V or any memory that could alias
+    // [B+off,+w), the load is exactly `local.get V`. The map entry dies
+    // on any `Ctl`/`BrIf`/call/`memory.*` boundary, on a write of B or
+    // V, and on any store whose base isn't a provable `get B` at a
+    // disjoint offset. `PLIRON_WASM_SFWD=0` disables.
+    if crate::env_get("PLIRON_WASM_SFWD") != Some("0") {
+        // (opcode, memarg offset) for a memory op.
+        let memop = |i: usize| -> Option<(u8, u32)> {
+            if !matches!(ins[i].0, WPeek::Other) {
+                return None;
+            }
+            let s = ins[i].1;
+            let op = b[s];
+            if !(0x28..=0x3e).contains(&op) {
+                return None;
+            }
+            let mut q = s + 1;
+            urd(b, &mut q)?; // align
+            let off = urd(b, &mut q)?;
+            Some((op, off))
+        };
+        let swidth = |op: u8| -> u32 {
+            match op {
+                0x3a | 0x3b => 1,         // i32/i64 store8
+                0x3c | 0x3d => 2,         // i32/i64 store16
+                0x37 | 0x39 => 8,         // i64/f64 store
+                _ => 4,                   // i32/f32 store, i64.store32
+            }
+        };
+        // (base local, offset) -> (source local, store opcode)
+        let mut fmap: FxHashMap<(u32, u32), (u32, u8)> = FxHashMap::default();
+        // Rewrites are collected, not applied mid-scan: `dead` hides a
+        // deleted `get B` from `prev_e`/`get_of` and `repl` respells a
+        // forwarded load as the `get` it becomes, so later producer
+        // lookups see the post-rewrite instruction stream.
+        let dead = std::cell::RefCell::new(FxHashSet::default());
+        let repl = std::cell::RefCell::new(FxHashMap::default());
+        let mut rewrites: Vec<(usize, usize, u32)> = Vec::new(); // (get ins, load ins, V)
+        let prev_e = |mut j: usize| -> Option<usize> {
+            let dead = dead.borrow();
+            loop {
+                j = j.checked_sub(1)?;
+                if !dead.contains(&j)
+                    && !matches!(ins[j].0, WPeek::Del | WPeek::Nop(_))
+                {
+                    return Some(j);
+                }
+            }
+        };
+        let get_of = |j: usize| -> Option<u32> {
+            if dead.borrow().contains(&j) {
+                return None;
+            }
+            if let Some(&v) = repl.borrow().get(&j) {
+                return Some(v);
+            }
+            match ins[j].0 {
+                WPeek::Get(l) => Some(l),
+                _ => None,
+            }
+        };
+        for i in 0..ins.len() {
+            match ins[i].0 {
+                WPeek::Ctl | WPeek::BrIf(_) => fmap.clear(),
+                WPeek::Set(l) | WPeek::Tee(l) => {
+                    fmap.retain(|&(b2, _), &mut (v, _)| b2 != l && v != l);
+                }
+                // `Nop(l)`/`Drop`/`Del` leave locals and memory alone;
+                // `Get` is a plain read.
+                WPeek::Nop(_) | WPeek::Drop | WPeek::Del | WPeek::Get(_) => {}
+                WPeek::Other => match b[ins[i].1] {
+                    // calls decode as Ctl; `memory.*`/`0xfb`-`0xfe` are
+                    // opaque — atomics/SIMD/GC bail at decode anyway.
+                    0xfc => fmap.clear(),
+                    0x36..=0x3e => {
+                        let Some((sop, off)) = memop(i) else {
+                            continue;
+                        };
+                        let w = swidth(sop);
+                        // `get B; get V; store`: the two pushes survive
+                        // to the store's operand pair ([B, V]) only
+                        // when both are `local.get` (zero pops).
+                        let m1 = prev_e(i); // val producer ins index
+                        let e1 = m1.and_then(get_of); // -> source local
+                        let e2 = m1.and_then(prev_e).and_then(get_of); // -> base local
+                        match (e2, e1) {
+                            (Some(bx), Some(vx)) => {
+                                // Keep only same-base slots this store
+                                // can't reach: a store through a
+                                // *different* local could still alias —
+                                // two locals may hold equal addresses.
+                                fmap.retain(|&(b2, o2), &mut (_, sop2)| {
+                                    b2 == bx
+                                        && (o2 + swidth(sop2) <= off
+                                            || off + w <= o2)
+                                });
+                                if !(0x36..=0x39).contains(&sop) {
+                                    continue; // narrow stores forward nothing
+                                }
+                                fmap.insert((bx, off), (vx, sop));
+                            }
+                            // Computed address — could alias any slot.
+                            _ => fmap.clear(),
+                        }
+                    }
+                    0x28..=0x2b => {
+                        let Some((lop, off)) = memop(i) else {
+                            continue;
+                        };
+                        let Some(m) = prev_e(i) else {
+                            continue;
+                        };
+                        let Some(bx) = get_of(m) else {
+                            continue;
+                        };
+                        let Some(&(vx, sop)) = fmap.get(&(bx, off)) else {
+                            continue;
+                        };
+                        if lop + 0x0e != sop {
+                            continue; // width/pair mismatch
+                        }
+                        dead.borrow_mut().insert(m);
+                        repl.borrow_mut().insert(i, vx);
+                        rewrites.push((m, i, vx));
+                    }
+                    _ => {}
+                },
+            }
+        }
+        for (m, i, vx) in rewrites {
+            ins[m].0 = WPeek::Del; // the `get B` addr
+            ins[i].0 = WPeek::Get(vx);
+        }
+    }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
     for &(c, t) in &groups {
@@ -2546,6 +2687,121 @@ mod wpeep_tests {
         let out = peep_body(&b, &[], &[]).unwrap();
         assert!(!has_seq(&out, &[0x0d]), "unsound br_if: {out:02x?}");
         assert!(has_seq(&out, &[0x0c, 0x01]), "br still there: {out:02x?}");
+    }
+
+    // sfwd: `get fp; get v; store` … `get fp; load` re-reads bytes the
+    // store just wrote — the frame spill/reload around an spliced
+    // callee. Same base local, same offset, same width, no aliasing
+    // write between → the load is `get v`.
+    #[test]
+    fn sfwd_store_load_pair_forwards() {
+        let b = body(
+            4,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x04, // get0;get2;store fp+4
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 -> get 1
+                0x20, 0x00, 0x28, 0x02, 0x04, // get0;load fp+4 -> get 2
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        // The two `get fp; load` pairs collapse to `get 1` / `get 2` at
+        // the load sites (after both stores).
+        assert!(
+            has_seq(&out, &[0x36, 0x02, 0x04, 0x20, 0x01, 0x20, 0x02]),
+            "no fwd: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0x28]), "load left: {out:02x?}");
+    }
+
+    // A write of the stored local between the store and the load kills
+    // the forward — `get v` at the load would see the new value.
+    #[test]
+    fn sfwd_source_write_blocks() {
+        let b = body(
+            4,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x41, 0x07, 0x21, 0x01, // i32.const 7; set 1
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — stays
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x00, 0x28, 0x02, 0x00]), "unsound fwd: {out:02x?}");
+    }
+
+    // A write of the base local kills it too — the address moves.
+    #[test]
+    fn sfwd_base_write_blocks() {
+        let b = body(
+            4,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x02, 0x21, 0x00, // get 2; set 0
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — stays
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        // `set 0` kills the forward; the load stays a load (copy-forward
+        // may re-spell `get2;set0` as `tee0`, dropping the dead `get0`).
+        assert!(has_seq(&out, &[0x28]), "unsound fwd: {out:02x?}");
+    }
+
+    // A store through a *different* base local could alias — kills all
+    // entries (can't prove the two base locals differ at run time).
+    #[test]
+    fn sfwd_other_base_blocks() {
+        let b = body(
+            5,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x04, 0x20, 0x02, 0x36, 0x02, 0x00, // get4;get2;store q+0
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — stays
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x00, 0x28, 0x02, 0x00]), "unsound fwd: {out:02x?}");
+    }
+
+    // An overlapping same-base store kills just that slot; a disjoint
+    // same-base store leaves it alone.
+    #[test]
+    fn sfwd_overlap_kills_disjoint_survives() {
+        let b = body(
+            5,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x02, // get0;get2;store fp+2 (overlap [0,4))
+                0x20, 0x00, 0x20, 0x03, 0x36, 0x02, 0x08, // get0;get3;store fp+8 (disjoint)
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — stays (killed by +2)
+                0x20, 0x00, 0x28, 0x02, 0x08, // get0;load fp+8 -> get 3
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x00, 0x28, 0x02, 0x00]), "unsound fwd: {out:02x?}");
+        // The disjoint +8 load forwards to `get 3` right after the +0
+        // load stays as `get0;load+0`.
+        assert!(
+            has_seq(&out, &[0x28, 0x02, 0x00, 0x20, 0x03]),
+            "no fwd: {out:02x?}"
+        );
+    }
+
+    // A control boundary between the store and the load kills the map —
+    // the load could observe a different write on another path.
+    #[test]
+    fn sfwd_ctl_blocks() {
+        let b = body(
+            4,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x02, 0x40, // block
+                0x0b, // end
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — stays
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x00, 0x28, 0x02, 0x00]), "unsound fwd: {out:02x?}");
     }
 }
 
