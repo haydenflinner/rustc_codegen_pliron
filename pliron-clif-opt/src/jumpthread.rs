@@ -1042,6 +1042,8 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             .inst()
             .is_some_and(|i| matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp))
     };
+    let sentinel = crate::pass_enabled("PLIRON_SENTINEL");
+    let paramnull = crate::pass_enabled("PLIRON_PARAMNULL");
     let mut hits = Vec::new();
     let mut cfg_lazy: Option<ControlFlowGraph> = None;
     let mut dt_lazy: Option<DominatorTree> = None;
@@ -1071,7 +1073,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             };
             let k = mask(k, w);
             if k != 0 {
-                if !crate::pass_enabled("PLIRON_SENTINEL") {
+                if !sentinel {
                     continue;
                 }
                 // `select c, X, K == K` iff `!c` when `X != K`;
@@ -1126,7 +1128,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
             // zero. `p == 0` iff a zero edge was taken; when every edge
             // funnels through the same `brif c`, the test is that
             // condition itself.
-            if crate::pass_enabled("PLIRON_PARAMNULL")
+            if paramnull
                 && let ValueDef::Param(d, pidx) = func.dfg.value_def(x)
             {
                 let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));

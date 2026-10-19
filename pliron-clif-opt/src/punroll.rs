@@ -323,6 +323,8 @@ pub fn run(
     } else {
         &empty_prof
     };
+    let jam_on = crate::pass_enabled("PLIRON_JAM");
+    let peel_on = crate::pass_enabled("PLIRON_PEEL");
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut normed: FxHashSet<Block> = FxHashSet::default();
     let mut n = 0;
@@ -351,7 +353,7 @@ pub fn run(
             // linear inner chain gets J fused copies before punroll can
             // disturb the inner loop's shape. Jammed loop headers join
             // `tried` so a rescan doesn't re-jam the same outer loop.
-            if crate::pass_enabled("PLIRON_JAM") {
+            if jam_on {
                 for lp in loops.iter().copied() {
                     let h = la.loop_header(lp);
                     if tried.contains(&h) {
@@ -413,7 +415,7 @@ pub fn run(
                     hit = true;
                     break; // cfg/la stale; rescan
                 }
-                if crate::pass_enabled("PLIRON_PEEL")
+                if peel_on
                     && run_peel(func, cfg, dt, la, lp, h, name).is_some()
                 {
                     n += 1;
