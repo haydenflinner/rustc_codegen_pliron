@@ -5785,6 +5785,148 @@ pub fn loadsel(func: &mut Function) -> usize {
 /// field — `ParseIntError` inside `str::parse` is
 /// `x & ~0xff00 | 0x100 & ~0xff | 1` — and LLVM folds these to a single
 /// mask+set pair where we ran four ALU ops per site.
+/// `band (band x, k1), k2` → `band x, (k1&k2)` — associativity applied
+/// to the *outer* inst only, so it fires even when the inner `band`
+/// stays live for other uses (`bitmerge` requires the whole chain to
+/// be single-use; rustc's frame-base `& -16` value feeding an `& 1`
+/// niche-tag decode is shared by every stack access, so the chain
+/// can't merge — but rewriting just the outer band still collapses
+/// `band(band(x,-16),1)` to `band(x,0)` → `iconst 0`, which
+/// `const_sweep` then turns into a dead `brif` arm — that kills the
+/// duplicated dead `if` bodies rustc's enum niches leave on aligned
+/// pointers). `bor`/`bxor` reassociate the same way (`|`/`-1`,
+/// `^`/`0`…).
+fn bandk(func: &mut Function) -> usize {
+    let mut hits: Vec<(Inst, Value, u128, Opcode, Type, u32)> = Vec::new();
+    let mut zeros: Vec<Inst> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+                continue;
+            };
+            let fold = match opcode {
+                Opcode::Band => |a: u128, b: u128| a & b,
+                Opcode::Bor => |a: u128, b: u128| a | b,
+                Opcode::Bxor => |a: u128, b: u128| a ^ b,
+                _ => continue,
+            };
+            // outer = `op (x, k2)`; x's producer = same-op `(base, k1)`.
+            let (x_arg, k2) = if let Some(k) = kval(func, args[1]) {
+                (args[0], k)
+            } else if let Some(k) = kval(func, args[0]) {
+                (args[1], k)
+            } else {
+                continue;
+            };
+            let x = func.dfg.resolve_aliases(x_arg);
+            let Some(d) = func.dfg.value_def(x).inst() else {
+                continue;
+            };
+            let res = func.dfg.first_result(i);
+            let ty = func.dfg.value_type(res);
+            if !ty.is_int() || ty.is_vector() || ty.bits() > 128 {
+                continue;
+            }
+            let w = ty.bits();
+            let wm = u128::MAX >> (128 - w);
+            // `band (stack_addr ss[+k]), m` with m's set bits entirely
+            // below the slot's alignment is provably 0 — rustc's
+            // `(&place as usize) & tag` niche decodes on aligned stack
+            // slots produce exactly this and leave dead `brif` arms.
+            if opcode == Opcode::Band {
+                let mut sd: Option<(u64, i64)> = None; // (align, offset)
+                match func.dfg.insts[d] {
+                    InstructionData::StackAddr {
+                        stack_slot, offset, ..
+                    } => {
+                        let a = 1u64
+                            << func.sized_stack_slots[stack_slot].align_shift;
+                        sd = Some((a, offset.into()));
+                    }
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        args: a2,
+                    } => {
+                        for (slot_c, off_c) in [(a2[0], a2[1]), (a2[1], a2[0])] {
+                            let sc = func.dfg.resolve_aliases(slot_c);
+                            let Some(sd_i) = func.dfg.value_def(sc).inst()
+                            else {
+                                continue;
+                            };
+                            let Some(off) = iconst(func, off_c) else {
+                                continue;
+                            };
+                            if let InstructionData::StackAddr {
+                                stack_slot,
+                                offset,
+                                ..
+                            } = func.dfg.insts[sd_i]
+                            {
+                                let a = 1u64
+                                    << func.sized_stack_slots[stack_slot]
+                                        .align_shift;
+                                sd = Some((a, i64::from(offset) + off));
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((align, off)) = sd
+                    && align > 0
+                    && off % (align as i64) == 0
+                    && k2 < align as u128
+                {
+                    zeros.push(i);
+                    continue;
+                }
+            }
+            let InstructionData::Binary {
+                opcode: o2,
+                args: a2,
+            } = func.dfg.insts[d]
+            else {
+                continue;
+            };
+            if o2 != opcode {
+                continue;
+            }
+            let (base, k1) = if let Some(k) = kval(func, a2[1]) {
+                (a2[0], k)
+            } else if let Some(k) = kval(func, a2[0]) {
+                (a2[1], k)
+            } else {
+                continue;
+            };
+            let k = fold(k1, k2) & wm;
+            if k == 0 && opcode == Opcode::Band {
+                zeros.push(i);
+            } else {
+                hits.push((i, func.dfg.resolve_aliases(base), k, opcode, ty, w));
+            }
+        }
+    }
+    let n = hits.len() + zeros.len();
+    for i in zeros {
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        let pos = FuncCursor::new(func).at_inst(i);
+        pos.func.replace(i).iconst(ty, 0);
+    }
+    for (i, base, k, opcode, ty, w) in hits {
+        if func.layout.inst_block(i).is_none() {
+            continue;
+        }
+        let mut pos = FuncCursor::new(func).at_inst(i);
+        let kv = kcon(&mut pos, ty, w, k);
+        match opcode {
+            Opcode::Band => pos.func.replace(i).band(base, kv),
+            Opcode::Bor => pos.func.replace(i).bor(base, kv),
+            _ => pos.func.replace(i).bxor(base, kv),
+        };
+    }
+    n
+}
+
 fn bitmerge(func: &mut Function) -> usize {
     let uses = use_counts(func);
     let mut hits = Vec::new();
@@ -6656,6 +6798,9 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     }
     if crate::pass_enabled("PLIRON_BITMERGE") {
         n += bitmerge(func);
+    }
+    if crate::pass_enabled("PLIRON_BANDK") {
+        n += bandk(func);
     }
     // i64→i32 low-word demotion of `uloads`' i64 loads and rustc's
     // `Option<u32>`/`usize` widenings — wasm's `i64.*`+`i32.wrap_i64`
@@ -8754,6 +8899,9 @@ fn post_sweep(func: &mut Function) -> usize {
     if crate::pass_enabled("PLIRON_BITMERGE") {
         n += bitmerge(func);
     }
+    if crate::pass_enabled("PLIRON_BANDK") {
+        n += bandk(func);
+    }
     let icmpk_on = crate::pass_enabled("PLIRON_ICMPK");
     let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
     let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM");
@@ -10723,6 +10871,86 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("bitmerge produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// `band (band x,-16),1` where the inner band has a *second* use —
+    /// `bitmerge` can't merge the shared chain, but `bandk` still
+    /// rewrites the outer to `band x,0` → `iconst 0` (rustc's aligned
+    /// frame base feeding a niche `&1` decode). The inner band keeps
+    /// its other use.
+    #[test]
+    fn bandk_multiuse_inner_folds_zero() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let x = func.dfg.append_block_param(entry, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let m = cur.ins().iconst(types::I64, -16);
+        let inner = cur.ins().band(x, m);
+        let one = cur.ins().iconst(types::I64, 1);
+        let outer = cur.ins().band(inner, one); // -> band x,0 -> iconst 0
+        let sum = cur.ins().iadd(inner, outer); // inner's second use
+        cur.ins().return_(&[sum]);
+
+        run(&mut func, false);
+        // The shared inner band survives; the `&1` became `iconst 0`,
+        // so the ret's arg is `iadd (band x,-16), 0`.
+        let ret = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| func.dfg.insts[i].opcode() == Opcode::Return)
+            .unwrap();
+        let rv = func.dfg.inst_args(ret)[0];
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } = func.dfg.insts[func.dfg.resolved_value_def(rv).inst().unwrap()]
+        else {
+            panic!("sum not an iadd\n{}", func.display())
+        };
+        assert!(
+            ceval(&func, args[0], 6) == Some(0) || ceval(&func, args[1], 6) == Some(0),
+            "{}",
+            func.display()
+        );
+    }
+
+    /// `band (stack_addr ss),1` on an 8-aligned slot is `iconst 0` —
+    /// rustc's `(&place as usize) & tag` niche decode. The same mask
+    /// on an `iadd stack_addr, +8` (offset keeps alignment) folds too.
+    #[test]
+    fn bandk_stack_addr_align_folds_zero() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let ss = func.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            48,
+            3, // align_shift → 8-byte aligned
+        ));
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let addr = cur.ins().stack_addr(types::I64, ss, 0);
+        let one = cur.ins().iconst(types::I64, 1);
+        let tag = cur.ins().band(addr, one); // -> iconst 0
+        cur.ins().return_(&[tag]);
+
+        run(&mut func, false);
+        let ret = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| func.dfg.insts[i].opcode() == Opcode::Return)
+            .unwrap();
+        let rv = func.dfg.inst_args(ret)[0];
+        assert_eq!(ceval(&func, rv, 6), Some(0), "{}", func.display());
     }
 
     /// `imul (imul x, c1), c2` reassociates to `imul x, c1·c2`, and a
