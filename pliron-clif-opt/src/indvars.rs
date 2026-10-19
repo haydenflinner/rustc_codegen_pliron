@@ -15,6 +15,7 @@ use cranelift_codegen::ir::{
     types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loopidiom::deepest_first;
@@ -1885,7 +1886,7 @@ fn rot_edge_ok(func: &Function, dt: &DominatorTree, dec: &Dec, e: &Edge) -> bool
 /// (`v + koff`); multi-term seeds can't name one location.
 fn seed_loc(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     (terms, _, koff): &Dec,
     ty: Type,
@@ -1906,7 +1907,7 @@ fn seed_loc(
 /// every iteration.
 fn edge_avail(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
@@ -2049,7 +2050,7 @@ fn rot_loop(
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     debug: bool,
 ) -> usize {
@@ -2590,7 +2591,7 @@ fn step_ok(
     func: &Function,
     dt: &DominatorTree,
     body: &FxHashSet<Block>,
-    psrc: &FxHashMap<Value, Value>,
+    psrc: &VMap<Value>,
     i: Inst,
     a: Value,
     p: Value,
@@ -2631,7 +2632,7 @@ fn step_ok(
 fn bounded(
     func: &Function,
     dt: &DominatorTree,
-    psrc: &FxHashMap<Value, Value>,
+    psrc: &VMap<Value>,
     i: Inst,
     s: Value,
 ) -> bool {

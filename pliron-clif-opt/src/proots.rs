@@ -14,6 +14,7 @@
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::InstructionData;
 use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, Opcode, Value};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
@@ -136,14 +137,14 @@ fn diffs_rows(f: &Facts) -> Vec<(Value,)> {
     let mut first: FxHashMap<Value, Value> = FxHashMap::default();
     let mut diffs: Vec<(Value,)> = Vec::new();
     for &(p, v) in &f.edge {
-        match first.entry(p) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                if *e.get() != v {
+        match first.get(&p) {
+            Some(&old) => {
+                if old != v {
                     diffs.push((p,));
                 }
             }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(v);
+            None => {
+                first.insert(p, v);
             }
         }
     }
@@ -151,7 +152,7 @@ fn diffs_rows(f: &Facts) -> Vec<(Value,)> {
 }
 
 /// The alias relation over pre-extracted `facts` — `param_src`'s job.
-pub fn alias_of(f: &Facts) -> FxHashMap<Value, Value> {
+pub fn alias_of(f: &Facts) -> VMap< Value> {
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
@@ -161,12 +162,12 @@ pub fn alias_of(f: &Facts) -> FxHashMap<Value, Value> {
 }
 
 /// The alias relation alone — `param_src`'s job.
-pub fn alias_map(func: &Function) -> FxHashMap<Value, Value> {
+pub fn alias_map(func: &Function) -> VMap< Value> {
     alias_of(&facts(func))
 }
 
 /// `alias_map` over a caller-built CFG.
-pub fn alias_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, Value> {
+pub fn alias_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> VMap< Value> {
     alias_of(&facts_cfg(func, cfg))
 }
 
@@ -174,18 +175,18 @@ pub fn alias_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value
 /// source). Used to normalize `Key::V` leaves in `key_of` so params on
 /// different in-edge paths that provably carry the same value compare
 /// congruent.
-pub fn canon_map(func: &Function) -> FxHashMap<Value, Value> {
+pub fn canon_map(func: &Function) -> VMap< Value> {
     canon_map_cfg(func, &ControlFlowGraph::with_function(func))
 }
 
 /// `canon_map` over a caller-built CFG.
-pub fn canon_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, Value> {
+pub fn canon_map_cfg(func: &Function, cfg: &ControlFlowGraph) -> VMap< Value> {
     canon_map_facts(&facts_cfg(func, cfg))
 }
 
 /// `canon_map_cfg` over caller-supplied edge facts — the same `Facts`
 /// can feed `web_nf_facts` when nothing mutates in between.
-pub fn canon_map_facts(f: &Facts) -> FxHashMap<Value, Value> {
+pub fn canon_map_facts(f: &Facts) -> VMap< Value> {
     let mut p = Proots::default();
     p.edge_arg = f.edge.clone();
     p.blocked = f.blocked.iter().map(|&v| (v,)).collect();
@@ -258,7 +259,7 @@ ascent::ascent! {
 }
 
 /// `v ↦ (root, k)` affine normal form over the whole function.
-pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
+pub fn affine_nf(func: &Function) -> VMap< (Value, i64)> {
     let mut p = AffN::default();
     p.aff = aff_facts(func);
     p.run();
@@ -277,18 +278,18 @@ pub fn affine_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
 /// correctly keep `p` out of any class rooted at `p` itself, and a
 /// self-carry edge contributes no fact at all — under induction the
 /// carried value stays in the class the other edges established.
-pub fn web_nf(func: &Function) -> FxHashMap<Value, (Value, i64)> {
+pub fn web_nf(func: &Function) -> VMap< (Value, i64)> {
     web_nf_cfg(func, &ControlFlowGraph::with_function(func))
 }
 
 /// `web_nf` over a caller-built CFG.
-pub fn web_nf_cfg(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Value, (Value, i64)> {
+pub fn web_nf_cfg(func: &Function, cfg: &ControlFlowGraph) -> VMap< (Value, i64)> {
     web_nf_facts(func, &facts_cfg(func, cfg))
 }
 
 /// `web_nf_cfg` over caller-supplied edge facts — one `facts_cfg` can
 /// serve both this and `canon_map_facts` while the IR stays still.
-pub fn web_nf_facts(func: &Function, f: &Facts) -> FxHashMap<Value, (Value, i64)> {
+pub fn web_nf_facts(func: &Function, f: &Facts) -> VMap< (Value, i64)> {
     let mut nf = affine_nf(func);
     let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
     loop {
@@ -331,9 +332,9 @@ pub fn web_nf_facts(func: &Function, f: &Facts) -> FxHashMap<Value, (Value, i64)
     // final root; cycles (p ↦ r ↦ p) keep the last true equivalence.
     for _ in 0..nf.len().max(1) {
         let mut moved = false;
-        let keys: Vec<Value> = nf.keys().copied().collect();
+        let keys: Vec<Value> = nf.keys().collect();
         for p in keys {
-            let (mut r, mut k) = nf[&p];
+            let (mut r, mut k) = nf.get(&p).copied().unwrap_or((p, 0));
             let mut seen: FxHashSet<Value> = [p].into_iter().collect();
             while seen.insert(r) {
                 match nf.get(&r) {
@@ -344,7 +345,7 @@ pub fn web_nf_facts(func: &Function, f: &Facts) -> FxHashMap<Value, (Value, i64)
                     _ => break,
                 }
             }
-            if r != p && nf[&p] != (r, k) {
+            if r != p && nf.get(&p).copied().unwrap_or((p, 0)) != (r, k) {
                 nf.insert(p, (r, k));
                 moved = true;
             }
@@ -397,16 +398,16 @@ pub enum Key {
 /// params/`V` leaves — SSA def chains are finite.
 pub fn key_of(
     func: &Function,
-    nf: &FxHashMap<Value, (Value, i64)>,
-    canon: &FxHashMap<Value, Value>,
-    memo: &mut FxHashMap<Value, Key>,
+    nf: &VMap< (Value, i64)>,
+    canon: &VMap< Value>,
+    memo: &mut VMap< Key>,
     v: Value,
 ) -> Key {
     fn go(
         func: &Function,
-        nf: &FxHashMap<Value, (Value, i64)>,
-        canon: &FxHashMap<Value, Value>,
-        memo: &mut FxHashMap<Value, Key>,
+        nf: &VMap< (Value, i64)>,
+        canon: &VMap< Value>,
+        memo: &mut VMap< Key>,
         v: Value,
         d: usize,
     ) -> Key {
@@ -424,9 +425,9 @@ pub fn key_of(
     }
     fn go_uncached(
         func: &Function,
-        nf: &FxHashMap<Value, (Value, i64)>,
-        canon: &FxHashMap<Value, Value>,
-        memo: &mut FxHashMap<Value, Key>,
+        nf: &VMap< (Value, i64)>,
+        canon: &VMap< Value>,
+        memo: &mut VMap< Key>,
         v: Value,
         d: usize,
     ) -> Key {
@@ -574,9 +575,9 @@ pub fn key_of(
 /// probes inside `paramize` stay consistent.
 pub fn vhash(
     func: &Function,
-    nf: &FxHashMap<Value, (Value, i64)>,
-    canon: &FxHashMap<Value, Value>,
-    memo: &mut FxHashMap<Value, u64>,
+    nf: &VMap< (Value, i64)>,
+    canon: &VMap< Value>,
+    memo: &mut VMap< u64>,
     v: Value,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -596,9 +597,9 @@ pub fn vhash(
     }
     fn go(
         func: &Function,
-        nf: &FxHashMap<Value, (Value, i64)>,
-        canon: &FxHashMap<Value, Value>,
-        memo: &mut FxHashMap<Value, u64>,
+        nf: &VMap< (Value, i64)>,
+        canon: &VMap< Value>,
+        memo: &mut VMap< u64>,
         v: Value,
         d: usize,
     ) -> u64 {
@@ -616,9 +617,9 @@ pub fn vhash(
     }
     fn go_uncached(
         func: &Function,
-        nf: &FxHashMap<Value, (Value, i64)>,
-        canon: &FxHashMap<Value, Value>,
-        memo: &mut FxHashMap<Value, u64>,
+        nf: &VMap< (Value, i64)>,
+        canon: &VMap< Value>,
+        memo: &mut VMap< u64>,
         v: Value,
         d: usize,
     ) -> u64 {
@@ -736,16 +737,16 @@ pub fn vhash(
 /// relational probing must see the key's size, not the def-DAG's.
 pub fn vnodes(
     func: &Function,
-    nf: &FxHashMap<Value, (Value, i64)>,
-    canon: &FxHashMap<Value, Value>,
-    memo: &mut FxHashMap<Value, usize>,
+    nf: &VMap< (Value, i64)>,
+    canon: &VMap< Value>,
+    memo: &mut VMap< usize>,
     v: Value,
 ) -> usize {
     fn go(
         func: &Function,
-        nf: &FxHashMap<Value, (Value, i64)>,
-        canon: &FxHashMap<Value, Value>,
-        memo: &mut FxHashMap<Value, usize>,
+        nf: &VMap< (Value, i64)>,
+        canon: &VMap< Value>,
+        memo: &mut VMap< usize>,
         v: Value,
         d: usize,
     ) -> usize {
@@ -763,9 +764,9 @@ pub fn vnodes(
     }
     fn unc(
         func: &Function,
-        nf: &FxHashMap<Value, (Value, i64)>,
-        canon: &FxHashMap<Value, Value>,
-        memo: &mut FxHashMap<Value, usize>,
+        nf: &VMap< (Value, i64)>,
+        canon: &VMap< Value>,
+        memo: &mut VMap< usize>,
         v: Value,
         d: usize,
     ) -> usize {
@@ -1336,31 +1337,31 @@ pub fn like_map(f: &Facts, interior: impl Iterator<Item = Value>, acc: Value) ->
 /// doesn't change the value, so `edge`'s skipping is exact here too).
 /// Bounds only tighten on update, so a worklist over def→use edges
 /// reaches the least fixpoint directly.
-pub fn bounds(func: &Function, f: &Facts) -> FxHashMap<Value, u64> {
+pub fn bounds(func: &Function, f: &Facts) -> VMap< u64> {
     let ra = |v: Value| func.dfg.resolve_aliases(v);
     let tbound = |v: Value| {
         let b = func.dfg.value_type(v).bits();
         (b < 64).then(|| (1u64 << b) - 1)
     };
-    let mut bnd: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut bnd: VMap< u64> = VMap::default();
     // `users[a]` = values whose bound can tighten when `a`'s does.
-    let mut users: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let mut users: VMap< Vec<Value>> = VMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let Some(&res) = func.dfg.inst_results(i).first() else {
                 continue;
             };
             for &a in func.dfg.inst_args(i) {
-                users.entry(ra(a)).or_default().push(res);
+                users.or_default(ra(a)).push(res);
             }
         }
     }
     // Param sources: `f.edge` grouped by param, minus `blocked` params
     // (their edge list is partial — a `non-Value` source is unbounded).
-    let mut pargs: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let mut pargs: VMap< Vec<Value>> = VMap::default();
     for &(p, a) in &f.edge {
-        pargs.entry(p).or_default().push(a);
-        users.entry(a).or_default().push(p);
+        pargs.or_default(p).push(a);
+        users.or_default(a).push(p);
     }
     let blocked: FxHashSet<Value> = f.blocked.iter().copied().collect();
     let konst = |v: Value| {
@@ -1375,7 +1376,7 @@ pub fn bounds(func: &Function, f: &Facts) -> FxHashMap<Value, u64> {
     };
     // One bound candidate for `v` from its definition; `None` when the
     // def can't bound it. Param candidates come from the edge group.
-    let eval = |bnd: &FxHashMap<Value, u64>, v: Value| -> Option<u64> {
+    let eval = |bnd: &VMap< u64>, v: Value| -> Option<u64> {
         if let Some(srcs) = pargs.get(&v) {
             if blocked.contains(&v) {
                 return None;
@@ -1411,7 +1412,7 @@ pub fn bounds(func: &Function, f: &Facts) -> FxHashMap<Value, u64> {
     for b in func.layout.blocks() {
         for &p in func.dfg.block_params(b) {
             if let Some(t) = tbound(p) {
-                bnd.entry(ra(p)).or_insert(t);
+                bnd.or_insert_with(ra(p), || t);
             }
         }
         for i in func.layout.block_insts(b) {
@@ -1444,7 +1445,7 @@ pub fn bounds(func: &Function, f: &Facts) -> FxHashMap<Value, u64> {
             }
         }
     }
-    wl.extend(bnd.keys().copied());
+    wl.extend(bnd.keys());
     while let Some(x) = wl.pop_front() {
         let Some(us) = users.get(&x) else { continue };
         for &u in us {
@@ -1521,10 +1522,10 @@ mod tests {
 
         let f = facts(&func);
         let bnd = bounds(&func, &f);
-        assert_eq!(bnd[&w], 255);
-        assert_eq!(bnd[&m], 2040);
-        assert_eq!(bnd[&s], 2042);
-        assert_eq!(bnd[&small], 2042);
+        assert_eq!(bnd.get(&w).copied().unwrap_or(u64::MAX), 255);
+        assert_eq!(bnd.get(&m).copied().unwrap_or(u64::MAX), 2040);
+        assert_eq!(bnd.get(&s).copied().unwrap_or(u64::MAX), 2042);
+        assert_eq!(bnd.get(&small).copied().unwrap_or(u64::MAX), 2042);
         assert!(!bnd.contains_key(&cnt));
         assert!(!bnd.contains_key(&c2));
     }
@@ -1564,9 +1565,9 @@ mod tests {
 
         let nf = web_nf(&func);
         let canon = canon_map(&func);
-        let mut km: FxHashMap<Value, Key> = FxHashMap::default();
-        let mut hm: FxHashMap<Value, u64> = FxHashMap::default();
-        let mut nm: FxHashMap<Value, usize> = FxHashMap::default();
+        let mut km: VMap< Key> = VMap::default();
+        let mut hm: VMap< u64> = VMap::default();
+        let mut nm: VMap< usize> = VMap::default();
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
                 for v in func.dfg.inst_values(i) {

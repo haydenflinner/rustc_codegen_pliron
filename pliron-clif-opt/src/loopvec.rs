@@ -26,6 +26,7 @@ use cranelift_codegen::ir::{
     InstructionData, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
@@ -235,7 +236,7 @@ struct Plan {
     lagged: FxHashMap<usize, Value>,
     /// `proots` interior-param aliases — `bv` may route through params
     /// the coeff walk resolved via this map (populated iff `lagged` is).
-    alias: FxHashMap<Value, Value>,
+    alias: VMap<Value>,
     elem: Type,
     vt: Type,
     vf: i64,
@@ -536,7 +537,7 @@ fn stream_base(
 /// interior-block param, non-affine op, …).
 fn param_coeffs(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     info: &Info,
     kinds: &[Param],
     v: Value,
@@ -643,7 +644,7 @@ fn param_coeffs(
 /// rustc's dead zip-header fields don't guarantee.
 fn upgrade_lagged(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     info: &Info,
     kinds: &mut Vec<Param>,
     lagged: &mut FxHashMap<usize, Value>,
@@ -1137,7 +1138,7 @@ impl WideCaps {
 
 fn plan(
     func: &mut Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     facts: &proots::Facts,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
@@ -2427,7 +2428,7 @@ fn plan(
         preds,
         kinds,
         alias: if lagged.is_empty() {
-            FxHashMap::default()
+            VMap::default()
         } else {
             ps.clone()
         },

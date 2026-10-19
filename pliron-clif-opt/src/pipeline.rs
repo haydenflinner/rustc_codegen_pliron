@@ -17,6 +17,7 @@ use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_module::FuncId;
 use pliron::basic_block::BasicBlock;
 use pliron::context::Ptr;
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::config::{bisect, bisect_count, config, env_set, reads_begin, reads_take, trace};
@@ -156,7 +157,7 @@ pub struct Pipe<'a> {
     pub fname: &'a str,
     pub func_id: FuncId,
     pub nonnull: &'a mut FxHashSet<Value>,
-    pub derived: &'a mut FxHashMap<Value, Value>,
+    pub derived: &'a mut VMap<Value>,
     pub frozen: &'a mut FxHashMap<Value, u64>,
     pub noalias: &'a mut FxHashSet<Value>,
     pub deref: &'a mut FxHashMap<Value, (u64, bool)>,
@@ -611,7 +612,7 @@ pub struct Analysis {
     compact_epoch: u32,
     /// `proots::alias_map_cfg` for the current `ver` — the param-alias
     /// relation every memory pass needs (dse runs three times).
-    amap: Option<FxHashMap<Value, Value>>,
+    amap: Option<VMap<Value>>,
     /// `proots::facts_cfg` for the current `ver` — the edge facts that
     /// feed `amap`, `loadfwd`'s `bounds`/`pmroots`, and any other
     /// proots consumer in this version. `amap` derives from it.
@@ -836,7 +837,7 @@ impl Analysis {
         cfrozen: &FxHashMap<FuncRef, u64>,
     ) -> (
         &'a ControlFlowGraph,
-        &'a FxHashMap<Value, Value>,
+        &'a VMap<Value>,
         &'a FxHashSet<crate::loadfwd::Root>,
         std::time::Duration,
         std::time::Duration,
@@ -886,7 +887,7 @@ impl Analysis {
     ) -> (
         &'a ControlFlowGraph,
         &'a crate::proots::Facts,
-        &'a FxHashMap<Value, Value>,
+        &'a VMap<Value>,
     ) {
         self.materialize(func);
         if self.facts.is_none() {
@@ -2744,7 +2745,7 @@ impl Pipe<'_> {
     /// borrowed them. Bits only gate lookups, so a stale-set bit costs
     /// one wasted probe and a missing bit is a skipped carry.
     pub fn seed_fact_bits(&mut self) {
-        for &v in self.derived.keys() {
+        for v in self.derived.keys() {
             self.fact_bits[v] |= fact_bits::DERIVED;
         }
         for &v in self.nonnull.iter() {
@@ -2768,7 +2769,7 @@ impl Pipe<'_> {
     /// replace — the collect doesn't go through `insert`, so no bits
     /// were set along the way.
     pub fn seed_derived_bits(&mut self) {
-        for &v in self.derived.keys() {
+        for v in self.derived.keys() {
             self.fact_bits[v] |= fact_bits::DERIVED;
         }
     }
@@ -2911,7 +2912,7 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     let mut memo: FxHashMap<Value, Value> = FxHashMap::default();
     // `x` derived from a dropped param is derived from its carrier, and
     // a dropped param's own base moves to the carrier too.
-    let keys: Vec<Value> = p.derived.keys().copied().collect();
+    let keys: Vec<Value> = p.derived.keys().collect();
     for x in keys {
         if let Some(&b) = p.derived.get(&x) {
             let b = resolve(b, &mut memo);
@@ -3854,7 +3855,7 @@ mod tests {
         let nocap: FxHashSet<(Inst, u32)> = Default::default();
         let mut nonnull = FxHashSet::default();
         nonnull.insert(v4);
-        let mut derived = FxHashMap::default();
+        let mut derived = VMap::default();
         let mut frozen = FxHashMap::default();
         let mut noalias = FxHashSet::default();
         let mut deref = FxHashMap::default();

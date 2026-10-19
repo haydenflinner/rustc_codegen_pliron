@@ -14,6 +14,7 @@ use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
 };
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
@@ -60,7 +61,7 @@ pub fn in_region(cur: Region, target: Region, rpar: &pliron::cols::ColMap<Region
 /// that value for analysis purposes. Maps param → that value.
 /// `proots::alias_map` computes the relation (reachable edges only —
 /// args on unreachable edges are indistinguishable from absent ones).
-pub fn param_src(func: &Function) -> FxHashMap<Value, Value> {
+pub fn param_src(func: &Function) -> VMap<Value> {
     crate::proots::alias_map(func)
 }
 
@@ -68,7 +69,7 @@ pub fn param_src(func: &Function) -> FxHashMap<Value, Value> {
 /// always equals. Bounded: param chains are short, and cycles can't occur
 /// in valid SSA — a param can only feed blocks it dominates.
 pub fn psrc(
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     func: &Function,
     mut v: Value,
@@ -114,7 +115,7 @@ const BND_CAP: u64 = 1 << 32;
 
 pub fn root(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     v: Value,
 ) -> (Root, i64) {
@@ -129,9 +130,9 @@ pub fn root(
 /// never on exact byte equality.
 fn root_min(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
-    bnd: Option<&FxHashMap<Value, u64>>,
+    bnd: Option<&VMap<u64>>,
     v: Value,
 ) -> (Root, i64) {
     // Check the un-resolved value too: a scope root may itself be an
@@ -229,17 +230,17 @@ fn root_min(
 /// `base + k` cursor posing as its base is harmless here.
 fn pmroots(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
-    bnd: &FxHashMap<Value, u64>,
+    bnd: &VMap<u64>,
     pf: &crate::proots::Facts,
-) -> FxHashMap<Value, (Root, i64)> {
+) -> VMap<(Root, i64)> {
     let blocked: FxHashSet<Value> = pf.blocked.iter().copied().collect();
     let mut byp: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
     for &(p, a) in &pf.edge {
         byp.entry(p).or_default().push(a);
     }
-    let mut pm: FxHashMap<Value, (Root, i64)> = FxHashMap::default();
+    let mut pm: VMap<(Root, i64)> = VMap::default();
     loop {
         let mut changed = false;
         for (&p, srcs) in &byp {
@@ -299,7 +300,7 @@ pub fn notrap(func: &Function, i: Inst) -> bool {
 /// when both peels bottom out somewhere disjoint — today, separate
 /// `stack_addr`s. Returning `(V(v), off)` means "unresolved", not
 /// "different object": callers must keep treating it as may-alias.
-pub fn concrete(func: &Function, ps: &FxHashMap<Value, Value>, v: Value) -> (Root, i64) {
+pub fn concrete(func: &Function, ps: &VMap<Value>, v: Value) -> (Root, i64) {
     root(func, ps, &FxHashSet::default(), v)
 }
 
@@ -309,7 +310,7 @@ pub fn concrete(func: &Function, ps: &FxHashMap<Value, Value>, v: Value) -> (Roo
 /// different locals compare disjoint like any other slot pair.
 pub fn norm_root(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     v: Value,
 ) -> (Root, i64) {
@@ -323,7 +324,7 @@ pub fn norm_root(
 /// slot, and stores to other slots are disjoint without `iso`.
 pub fn root_pair(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     v: Value,
 ) -> ((Root, i64), (Root, i64)) {
@@ -356,7 +357,7 @@ impl NrMemo {
     fn pair(
         &self,
         func: &Function,
-        ps: &FxHashMap<Value, Value>,
+        ps: &VMap<Value>,
         na: &FxHashSet<Value>,
         v: Value,
     ) -> ((Root, i64), (Root, i64)) {
@@ -370,7 +371,7 @@ impl NrMemo {
     fn n0(
         &self,
         func: &Function,
-        ps: &FxHashMap<Value, Value>,
+        ps: &VMap<Value>,
         na0: &FxHashSet<Value>,
         v: Value,
     ) -> (Root, i64) {
@@ -384,9 +385,9 @@ impl NrMemo {
     fn rm(
         &self,
         func: &Function,
-        ps: &FxHashMap<Value, Value>,
+        ps: &VMap<Value>,
         na: &FxHashSet<Value>,
-        bnd: &FxHashMap<Value, u64>,
+        bnd: &VMap<u64>,
         v: Value,
     ) -> (Root, i64) {
         *self
@@ -496,7 +497,7 @@ fn unwind_edge(func: &Function, inst: Inst, b: Block, nw: &FxHashMap<FuncRef, bo
 pub fn isolated(
     func: &Function,
     noalias: &FxHashSet<Value>,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     cfrozen: &FxHashMap<FuncRef, u64>,
 ) -> FxHashSet<Root> {
     isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default()).0
@@ -515,7 +516,7 @@ pub fn isolated(
 pub fn isolated_escapes(
     func: &Function,
     noalias: &FxHashSet<Value>,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     _cfrozen: &FxHashMap<FuncRef, u64>,
     nocap: &FxHashSet<(Inst, u32)>,
 ) -> (
@@ -638,7 +639,7 @@ pub fn isolated_escapes(
 /// targets legalize (aarch64 can't pick an i128 or a vector lane-wise).
 fn sel_split(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     av: &Avail,
     arg: Value,
@@ -681,7 +682,7 @@ fn sel_split(
 #[allow(clippy::too_many_arguments)]
 fn transfer(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     na0: &FxHashSet<Value>,
     b: Block,
@@ -696,8 +697,8 @@ fn transfer(
     invreg: &mut FxHashMap<Loc, Vec<Region>>,
     rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
-    bnd: &FxHashMap<Value, u64>,
-    pm: &FxHashMap<Value, (Root, i64)>,
+    bnd: &VMap<u64>,
+    pm: &VMap<(Root, i64)>,
     eh: bool,
     nm: &NrMemo,
 ) {
@@ -904,7 +905,7 @@ pub fn run(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     pf: &crate::proots::Facts,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     noalias: &FxHashSet<Value>,
     inv_insts: &FxHashSet<Inst>,
     ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
@@ -961,7 +962,7 @@ pub fn run(
     let bnd = if pre_ms || fwd_ms {
         crate::proots::bounds(func, pf)
     } else {
-        FxHashMap::default()
+        VMap::default()
     };
     // Root-resolution stop set: real `noalias` plus frozen operands —
     // either way the value names its own memory scope. `isolated` keeps
@@ -970,17 +971,17 @@ pub fn run(
     let pm = if pre_ms || fwd_ms {
         pmroots(func, ps, &stop, &bnd, pf)
     } else {
-        FxHashMap::default()
+        VMap::default()
     };
-    let (pbnd, ppm): (&FxHashMap<Value, u64>, &FxHashMap<Value, (Root, i64)>) = if pre_ms {
+    let (pbnd, ppm): (&VMap<u64>, &VMap<(Root, i64)>) = if pre_ms {
         (&bnd, &pm)
     } else {
-        (&FxHashMap::default(), &FxHashMap::default())
+        (&VMap::default(), &VMap::default())
     };
     let (fbnd, fpm) = if fwd_ms {
         (&bnd, &pm)
     } else {
-        (&FxHashMap::default(), &FxHashMap::default())
+        (&VMap::default(), &VMap::default())
     };
     let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap);
     if let Some(f) = crate::env_get("PLIRON_LF_DEBUG") {
@@ -1367,7 +1368,7 @@ fn edge_pre(
 /// sets follow `transfer` exactly, so every needed end value exists.
 fn pre(
     func: &mut Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     na0: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
@@ -1375,8 +1376,8 @@ fn pre(
     entry: Block,
     iso: &FxHashSet<Root>,
     ncc: &FxHashSet<Root>,
-    bnd: &FxHashMap<Value, u64>,
-    pm: &FxHashMap<Value, (Root, i64)>,
+    bnd: &VMap<u64>,
+    pm: &VMap<(Root, i64)>,
 ) -> usize {
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let eh = false;

@@ -17,6 +17,7 @@ use cranelift_codegen::ir::{
     MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Loc, Root, in_region};
@@ -63,7 +64,7 @@ pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
 /// Whether a write-ish instruction `w` can touch `loc`.
 fn clobbers(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     w: Inst,
     loc: Loc,
@@ -144,7 +145,7 @@ type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
 #[allow(clippy::too_many_arguments)]
 fn hoists(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     inv: &dyn Fn(&Function, Value) -> bool,
     writers: &[Inst],
@@ -329,7 +330,7 @@ fn hoists(
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
     func: &mut Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
@@ -678,7 +679,7 @@ fn run_loop(
 /// be a plain `load`/`store` of one type at one offset.
 fn promote(
     func: &mut Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
@@ -905,7 +906,7 @@ fn promote(
 /// out-version on every exit edge (and before each in-loop `return`).
 fn promote_loc(
     func: &mut Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,

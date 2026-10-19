@@ -21,6 +21,7 @@ use cranelift_codegen::ir::{
     ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -282,7 +283,7 @@ fn emit_arm(
     func: &mut Function,
     term: Inst,
     arm: &Arm,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
 ) -> Vec<Value> {
     let mut map: FxHashMap<Value, Value> = arm.psub.iter().copied().collect();
     {
@@ -520,7 +521,7 @@ fn conv_table(
     ),
     b: Block,
     term: Inst,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
 ) -> bool {
     let InstructionData::BranchTable { arg, table, .. } = func.dfg.insts[term] else {
         return false;
@@ -786,7 +787,7 @@ thread_local! {
 
 pub fn run(
     func: &mut Function,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
     cd: Option<(&mut ControlFlowGraph, &mut DominatorTree)>,
 ) -> usize {
     EDGE_NS.set(0);
@@ -1171,7 +1172,7 @@ mod tests {
             (b, merge)
         };
 
-        let mut derived = FxHashMap::default();
+        let mut derived = VMap::default();
         assert_eq!(run(&mut func, &mut derived, None), 1);
         let term = func.layout.last_inst(b).unwrap();
         let InstructionData::Jump { destination, .. } = &func.dfg.insts[term] else {
@@ -1307,7 +1308,7 @@ mod tests {
             (latch, hp[0])
         };
 
-        let mut derived = FxHashMap::default();
+        let mut derived = VMap::default();
         let _ = run(&mut func, &mut derived, None);
         // hop's own diamond fold is legitimate; the latch's fold must be
         // rejected — its arms resolve through `hop` while `hop`'s params

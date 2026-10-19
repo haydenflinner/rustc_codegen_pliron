@@ -31,6 +31,7 @@ use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot, Type,
     Value, ValueDef,
 };
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -1052,7 +1053,7 @@ pub fn run(
         // facts); xpack's applies never touch block params, so one
         // map serves every block — built on the first block that
         // reaches the plan stage, not for every `slp` call.
-        let mut ps = None;
+        let mut ps: Option<VMap<Value>> = None;
         for block in func.layout.blocks().collect::<Vec<_>>() {
             changed += xpack_block(
                 func,
@@ -1090,7 +1091,7 @@ pub fn run(
 /// A `(root, offset, size)` memory footprint for an access inst.
 fn mem_range(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     i: Inst,
 ) -> Option<(crate::loadfwd::Root, i64, u32)> {
@@ -1142,7 +1143,7 @@ fn res_of(func: &Function, i: Inst) -> Option<Value> {
 
 struct X<'a> {
     func: &'a Function,
-    ps: &'a FxHashMap<Value, Value>,
+    ps: &'a VMap<Value>,
     na: &'a FxHashSet<Value>,
     domtree: &'a DominatorTree,
     pos: &'a PosMap,
@@ -1653,7 +1654,7 @@ fn store_dead(
 /// edits are applied by [`apply_pair`].
 fn plan_pair(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     domtree: &DominatorTree,
     uses: &Uses,
@@ -2039,7 +2040,7 @@ fn ra_fix(func: &Function, v: Value) -> Value {
 /// layout, unlike op pairs which can swap.
 fn plan_store(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     domtree: &DominatorTree,
     uses: &Uses,
@@ -2240,7 +2241,7 @@ fn xpack_block<'d>(
     block: Block,
     uses: &mut Option<Uses<'d>>,
     dead_set: &'d std::cell::RefCell<FxHashSet<Inst>>,
-    ps: &mut Option<FxHashMap<Value, Value>>,
+    ps: &mut Option<VMap<Value>>,
     x64: bool,
     pos: &mut PosMap,
     taken: &mut TakenMap,

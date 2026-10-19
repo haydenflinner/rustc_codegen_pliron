@@ -9,6 +9,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::CondCode;
 use cranelift_codegen::ir::{Block, BlockArg, BlockCall, Function, Inst, InstructionData, Value};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 8;
@@ -17,7 +18,7 @@ const MAX_ROTATIONS: usize = 256;
 pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
 ) -> usize {
     // Each block is evaluated once, in layout order: re-scanning let cloned
     // headers created by earlier rotations starve late-layout loops (e.g.
@@ -149,7 +150,7 @@ fn rotate(
     cfg: &ControlFlowGraph,
     domtree: &DominatorTree,
     h: Block,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
     useidx: &crate::uses::Uses,
 ) -> bool {
     let t = func.layout.last_inst(h).unwrap();

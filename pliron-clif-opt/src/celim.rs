@@ -42,6 +42,7 @@ use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
 use cranelift_codegen::loop_analysis::LoopAnalysis;
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 fn mask(v: u64, bits: u32) -> u64 {
@@ -321,9 +322,9 @@ fn uniform_slot(
     })
 }
 
-fn sub_op(m: &FxHashMap<Value, Value>, o: Op) -> Op {
+fn sub_op(mut f: impl FnMut(Value) -> Value, o: Op) -> Op {
     match o {
-        Op::V(v, d) => Op::V(*m.get(&v).unwrap_or(&v), d),
+        Op::V(v, d) => Op::V(f(v), d),
         k => k,
     }
 }
@@ -365,11 +366,11 @@ fn edge_facts(
                     let fs = fact.entry(s).or_default();
                     // The branch value itself: `v != 0` on the taken edge.
                     let vc = if take { IntCC::NotEqual } else { IntCC::Equal };
-                    fs.push((vc, sub_op(&m, plain(func, arg)), Op::K(0)));
+                    fs.push((vc, sub_op(|v| *m.get(&v).unwrap_or(&v), plain(func, arg)), Op::K(0)));
                     for &i in if take { &icmps } else { &n_icmps } {
                         if let Some(((cc, x, y), _)) = norm_icmp(func, i, true) {
                             let cc = if take { cc } else { cc.complement() };
-                            fs.push((cc, sub_op(&m, x), sub_op(&m, y)));
+                            fs.push((cc, sub_op(|v| *m.get(&v).unwrap_or(&v), x), sub_op(|v| *m.get(&v).unwrap_or(&v), y)));
                         }
                     }
                 }
@@ -419,7 +420,7 @@ fn edge_facts(
                     let m = edge_args(func, cfg, t, s);
                     let fs = fact.entry(s).or_default();
                     for &x in &bases {
-                        fs.push((IntCC::Equal, sub_op(&m, plain(func, x)), Op::K(k as u64)));
+                        fs.push((IntCC::Equal, sub_op(|v| *m.get(&v).unwrap_or(&v), plain(func, x)), Op::K(k as u64)));
                     }
                 }
             }
@@ -590,7 +591,7 @@ fn induction_facts(
     cfg: &ControlFlowGraph,
     domtree: &DominatorTree,
     fact: &FxHashMap<Block, Vec<Cmp>>,
-    srcs: &FxHashMap<Value, Value>,
+    srcs: &VMap<Value>,
 ) -> FxHashMap<Block, Vec<Cmp>> {
     let mut la = LoopAnalysis::new();
     la.compute(func, cfg, domtree);
@@ -1546,7 +1547,7 @@ fn isub_index_decide(
     func: &Function,
     fs: &[&Cmp],
     q: Cmp,
-    srcs: &FxHashMap<Value, Value>,
+    srcs: &VMap<Value>,
     depth: u32,
 ) -> Option<bool> {
     if depth >= 4 || !ucc(q.0) {
@@ -1616,7 +1617,7 @@ fn decide(
     fs: &[&Cmp],
     q: Cmp,
     raw: (Value, Value),
-    srcs: &FxHashMap<Value, Value>,
+    srcs: &VMap<Value>,
 ) -> Option<bool> {
     decide_d(func, fs, q, raw, srcs, 0)
 }
@@ -1626,7 +1627,7 @@ fn decide_d(
     fs: &[&Cmp],
     q: Cmp,
     raw: (Value, Value),
-    srcs: &FxHashMap<Value, Value>,
+    srcs: &VMap<Value>,
     depth: u32,
 ) -> Option<bool> {
     // `x == y` facts let the query match on either name.

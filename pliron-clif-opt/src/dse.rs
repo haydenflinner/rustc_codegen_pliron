@@ -23,6 +23,7 @@
 
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, InstructionData, Opcode, Value};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
@@ -239,7 +240,7 @@ fn mem_width(func: &Function, i: Inst) -> Option<i64> {
 /// many accesses, and `root` re-peels the alias/`iadd` chain each call.
 fn mem_loc(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     memo: &mut FxHashMap<Value, (Root, i64)>,
     i: Inst,
@@ -281,7 +282,7 @@ enum Op {
 /// blocks the kill sweep can produce dead insts in.
 fn decode(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
     eh: bool,

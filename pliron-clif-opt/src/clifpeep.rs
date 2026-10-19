@@ -26,6 +26,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExternalName, Function, Inst, InstBuilder, InstructionData,
     LibCall, MemFlagsData, Opcode, Type, Value, ValueDef, types,
 };
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
@@ -3591,9 +3592,9 @@ pub fn webmerge_ctx(
     // Keys memoize across args — shared operand trees key once.
     // `RefCell` because `skey_of`/`pk_of` materialize lazily from inside
     // immutable borrows of the cell matrices.
-    let memo = std::cell::RefCell::new(FxHashMap::<Value, crate::proots::Key>::default());
-    let mut vhmemo: FxHashMap<Value, u64> = FxHashMap::default();
-    let vnmemo = std::cell::RefCell::new(FxHashMap::<Value, usize>::default());
+    let memo = std::cell::RefCell::new(VMap::<crate::proots::Key>::default());
+    let mut vhmemo: VMap<u64> = VMap::default();
+    let vnmemo = std::cell::RefCell::new(VMap::<usize>::default());
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();

@@ -40,6 +40,7 @@ use cranelift_codegen::ir::entities::UserExternalNameRef;
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{Function, UserExternalName, Value};
 use cranelift_codegen::loop_analysis::LoopAnalysis;
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -527,7 +528,7 @@ fn state_hash(p: &Pipe) -> [u8; 32] {
     for name in params.user_named_funcs().values() {
         uen_key(name, p).hash(&mut h);
     }
-    seq_hash(&mut h, p.derived.iter());
+    seq_hash(&mut h, p.derived.iter().map(|(a, b)| (a, *b)));
     h.0.finalize().into()
 }
 
@@ -721,7 +722,7 @@ fn apply_func(
     p.clctx.cfg = ControlFlowGraph::new();
     p.clctx.domtree = DominatorTree::new();
     p.clctx.loop_analysis = LoopAnalysis::new();
-    *p.derived = derived.iter().copied().collect();
+    *p.derived = derived.iter().copied().collect::<VMap<_>>();
     p.seed_derived_bits();
 }
 
@@ -940,7 +941,7 @@ pub fn pipeline_store(
         reads: reads.into_iter().collect(),
         ran: ran.map(str::to_string).collect(),
         func: (p.clctx.func.stencil.clone(), p.clctx.func.params.clone()),
-        derived: p.derived.iter().map(|(a, b)| (*a, *b)).collect(),
+        derived: p.derived.iter().map(|(a, b)| (a, *b)).collect(),
         facts: p.carry_log.clone(),
         stats: StatDelta::delta(before, p.stats),
         draws,
@@ -1019,7 +1020,7 @@ pub fn lookup(p: &mut Pipe, s: &Step, an: &mut Analysis) -> Option<usize> {
             return None;
         }
     } else {
-        *p.derived = derived.iter().copied().collect();
+        *p.derived = derived.iter().copied().collect::<VMap<_>>();
         p.seed_derived_bits();
     }
     for (d, w) in &facts {
@@ -1062,7 +1063,7 @@ pub fn compute(p: &mut Pipe, s: &Step, an: &mut Analysis) -> usize {
         reads: reads.into_iter().collect(),
         out_hash,
         func,
-        derived: p.derived.iter().map(|(a, b)| (*a, *b)).collect(),
+        derived: p.derived.iter().map(|(a, b)| (a, *b)).collect(),
         facts: p.carry_log[cmark..].to_vec(),
         stats: StatDelta::delta(&before, p.stats),
         names,

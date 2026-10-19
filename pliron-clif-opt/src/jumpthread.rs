@@ -21,6 +21,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
     Opcode, ProgramPoint, Type, Value, ValueDef,
 };
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_BODY: usize = 12;
@@ -320,7 +321,7 @@ const MAX_WALK: usize = 4096;
 /// (greatest fixpoint).
 pub struct NonNull<'a> {
     loads: &'a FxHashSet<Value>,
-    derived: &'a FxHashMap<Value, Value>,
+    derived: &'a VMap<Value>,
     params: FxHashSet<Value>,
     /// `PLIRON_NN_ADDR`, read once — `pass_enabled` does a TLS-tracked
     /// lookup per call, which is too hot inside `is_deps`.
@@ -338,7 +339,7 @@ impl<'a> NonNull<'a> {
         func: &Function,
         cfg: &ControlFlowGraph,
         loads: &'a FxHashSet<Value>,
-        derived: &'a FxHashMap<Value, Value>,
+        derived: &'a VMap<Value>,
     ) -> Self {
         let mut nn = NonNull {
             loads,
@@ -474,7 +475,7 @@ impl<'a> NonNull<'a> {
     /// queries only name live ones, so stragglers are harmless.
     fn from_params(
         loads: &'a FxHashSet<Value>,
-        derived: &'a FxHashMap<Value, Value>,
+        derived: &'a VMap<Value>,
         params: FxHashSet<Value>,
     ) -> Self {
         NonNull {
@@ -624,7 +625,7 @@ fn non_zero_const(func: &Function, v: Value) -> bool {
 /// `NonNull` recovers the live base positionally from the clone's def.
 pub fn prop_derived(
     dfg: &cranelift_codegen::ir::DataFlowGraph,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
     o: Value,
     nr: Value,
     map: &FxHashMap<Value, Value>,
@@ -1923,7 +1924,7 @@ fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
 pub(crate) fn round<'a>(
     func: &mut Function,
     loads: &'a FxHashSet<Value>,
-    derived: &'a FxHashMap<Value, Value>,
+    derived: &'a VMap<Value>,
     nn: &mut Option<NonNull<'a>>,
     domcond: bool,
     cfg: &ControlFlowGraph,
@@ -4148,7 +4149,7 @@ fn cfg_dt(func: &Function) -> (ControlFlowGraph, DominatorTree) {
 fn fnn<'a>(
     func: &mut Function,
     loads: &'a FxHashSet<Value>,
-    derived: &'a FxHashMap<Value, Value>,
+    derived: &'a VMap<Value>,
     nn: Option<NonNull<'a>>,
     cd: &mut Option<(ControlFlowGraph, DominatorTree)>,
 ) -> usize {
@@ -4169,7 +4170,7 @@ fn fnn<'a>(
 pub fn run(
     func: &mut Function,
     loads: &FxHashSet<Value>,
-    derived: &mut FxHashMap<Value, Value>,
+    derived: &mut VMap<Value>,
     sh: u32,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
     use crate::pipeline::shape;
@@ -4451,6 +4452,7 @@ mod tests {
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, InstructionData, Opcode, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use crate::vmap::VMap;
     use rustc_hash::{FxHashMap, FxHashSet};
 
     /// wasm32 `Chars::next`'s residual: the iter `ptr` is an i32 loop
@@ -4505,7 +4507,7 @@ mod tests {
         )[0]]
         .into_iter()
         .collect();
-        let derived: FxHashMap<_, _> = [(np, p)].into_iter().collect();
+        let derived: VMap<_> = [(np, p)].into_iter().collect();
         let cfg = ControlFlowGraph::with_function(&func);
         let nn = NonNull::new(&func, &cfg, &loads, &derived);
         assert!(nn.is(&func, p), "i32 loop param should prove non-null");
@@ -4572,7 +4574,7 @@ mod tests {
             [func.dfg.block_params(func.layout.entry_block().unwrap())[0]]
                 .into_iter()
                 .collect();
-        let derived: FxHashMap<_, _> = Default::default();
+        let derived: VMap<_> = Default::default();
         let cfg = ControlFlowGraph::with_function(&func);
         let nn = NonNull::new(&func, &cfg, &loads, &derived);
         // `p == 0` ⟺ the `c`-true edge — the icmp aliases `c`.

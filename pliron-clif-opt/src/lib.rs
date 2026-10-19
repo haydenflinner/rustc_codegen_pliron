@@ -53,6 +53,7 @@ pub mod unreach;
 pub mod unroll;
 pub(crate) mod uses;
 pub mod veclegalize;
+pub mod vmap;
 pub mod webroot;
 
 pub use config::{bisect, env_get, env_is, env_set, pass_enabled};

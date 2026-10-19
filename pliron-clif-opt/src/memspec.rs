@@ -22,6 +22,7 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, Value,
 };
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
@@ -35,7 +36,7 @@ const MAX_SCAN: usize = 128;
 /// `(root, offset, width)` of a plain load/store inst.
 fn mem_loc(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     i: Inst,
 ) -> Option<(Root, i64, i64)> {
@@ -87,7 +88,7 @@ fn mem_loc(
 /// roots at all.
 fn last_writer(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,

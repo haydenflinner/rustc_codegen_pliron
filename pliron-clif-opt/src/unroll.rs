@@ -15,6 +15,7 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, StackSlot,
     Value,
 };
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::{NonNull, eval, known};
@@ -50,7 +51,7 @@ pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
     loads: &FxHashSet<Value>,
-    derived: &FxHashMap<Value, Value>,
+    derived: &VMap<Value>,
     prof: &FxHashMap<Block, u64>,
 ) -> usize {
     // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.

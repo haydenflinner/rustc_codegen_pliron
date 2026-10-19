@@ -18,6 +18,7 @@ use cranelift_codegen::ir::{
     ValueDef, types,
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
@@ -1264,7 +1265,7 @@ pub fn trips_ptr(cnt: &Count, size: i64) -> Option<(Ins, Vec<Pred>)> {
 /// The affine destination `dst0` + byte `len` + guards for one loop, or None.
 pub fn plan(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1804,7 +1805,7 @@ fn inv_guard_pred(func: &Function, info: &Info, kinds: &[Param], e: Edge) -> Opt
 /// None when the shape doesn't fit — the loop stays undeleted.
 fn rmw_locs(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     dt: &DominatorTree,
     info: &Info,
@@ -1968,7 +1969,7 @@ fn rmw_locs(
 /// the count isn't provable, or an exit edge arg can't be recomputed.
 fn plan_dead(
     func: &Function,
-    ps: &FxHashMap<Value, Value>,
+    ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,

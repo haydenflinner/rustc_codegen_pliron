@@ -38,6 +38,7 @@ use cranelift_interpreter::instruction::DfgInstructionContext;
 use cranelift_interpreter::interpreter::LibCallHandler;
 use cranelift_interpreter::state::{InterpreterFunctionRef, MemoryError, State};
 use cranelift_interpreter::step::{ControlFlow, CraneliftTrap, step};
+use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Facts the optimizer was allowed to assume; inputs are generated to
@@ -58,7 +59,7 @@ pub struct Facts<'a> {
     pub self_name: Option<String>,
     /// Derived pointer → its base, as the pipeline tracks them. Not used by
     /// the check; saved in repros so `clif-check` replays a step faithfully.
-    pub derived: Option<&'a FxHashMap<Value, Value>>,
+    pub derived: Option<&'a VMap<Value>>,
 }
 
 pub struct Config {
@@ -1392,7 +1393,7 @@ pub struct OwnedFacts {
     pub frozen: FxHashMap<Value, u64>,
     pub nowrite: FxHashMap<FuncRef, bool>,
     pub self_name: Option<String>,
-    pub derived: FxHashMap<Value, Value>,
+    pub derived: VMap<Value>,
     /// `(FuncRef, arg-index)` pairs a `; diffcheck-nocap:` header records;
     /// applied to every direct callsite of that callee on replay.
     pub nocap: Vec<(FuncRef, u32)>,

@@ -50,7 +50,7 @@ fn pass(name: &str) -> Pass {
                 f,
                 &mut an,
                 &rustc_hash::FxHashSet::default(),
-                &rustc_hash::FxHashMap::default(),
+                &pliron_clif_opt::vmap::VMap::default(),
                 &prof,
             )
         },
