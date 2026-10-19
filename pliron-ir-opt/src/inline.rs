@@ -253,6 +253,138 @@ fn callee_info(
     Some(ci)
 }
 
+// Side-table annotation bits for [`CalleeTags`]. A callee's annotations
+// are discovered once (lazily, on first inline) and replayed for every
+// later inline of that body — otherwise each clone pays ~15 `ColMap`
+// probes per op plus two `Vec` collects per block all over again.
+const OP_CALLS: u16 = 1 << 0;
+const OP_INTRINSICS: u16 = 1 << 1;
+const OP_RMW: u16 = 1 << 2;
+const OP_EXPECT: u16 = 1 << 3;
+const OP_PROF_EDGES: u16 = 1 << 4;
+const OP_VOLATILE: u16 = 1 << 5;
+const OP_NONNULL: u16 = 1 << 6;
+const OP_INBOUNDS: u16 = 1 << 7;
+const OP_BOOL01: u16 = 1 << 8;
+const OP_FROZEN_LOADS: u16 = 1 << 9;
+const OP_RETURN: u16 = 1 << 10;
+
+const V_ALLOCAS: u8 = 1;
+const V_PROMOTED: u8 = 1 << 1;
+const V_CONSTS: u8 = 1 << 2;
+const V_RFROZEN: u8 = 1 << 3;
+const V_RNOALIAS: u8 = 1 << 4;
+const V_RFROZEN_OP: u8 = 1 << 5;
+
+const B_REGION: u8 = 1;
+const B_PARENT: u8 = 1 << 1;
+const B_BCOUNT: u8 = 1 << 2;
+
+/// Which `State` side tables carry an entry for each block/op/value of a
+/// callee body. Built by one body walk and cached per callee op; a body
+/// that is itself rewritten as a caller drops its entry (see the
+/// `tagcache.remove` after each caller's fixpoint).
+#[derive(Default)]
+struct CalleeTags {
+    /// `blocks(ctx, callee)` — cached so each inline skips the collect.
+    src: Vec<Ptr<BasicBlock>>,
+    blocks: Vec<(Ptr<BasicBlock>, u8)>,
+    ops: Vec<(Ptr<Operation>, u16)>,
+    vals: Vec<(Value, u8)>,
+}
+
+fn tag_value(tags: &mut CalleeTags, st: &State, v: Value) {
+    let mut m = 0;
+    if st.allocas.contains(v) {
+        m |= V_ALLOCAS;
+    }
+    if st.promoted.contains(v) {
+        m |= V_PROMOTED;
+    }
+    if st.consts.contains(v) {
+        m |= V_CONSTS;
+    }
+    if st.region_frozen.contains(v) {
+        m |= V_RFROZEN;
+    }
+    if st.region_noalias.contains(v) {
+        m |= V_RNOALIAS;
+    }
+    if st.region_frozen_op.contains(v) {
+        m |= V_RFROZEN_OP;
+    }
+    if m != 0 {
+        tags.vals.push((v, m));
+    }
+}
+
+fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags {
+    let src = blocks(ctx, callee);
+    let mut tags = CalleeTags::default();
+    for &b in &src {
+        let mut bm = 0;
+        if st.region_blocks.contains(b) {
+            bm |= B_REGION;
+        }
+        if st.region_parent.contains(b) {
+            bm |= B_PARENT;
+        }
+        if st.prof_bcount.contains(b) {
+            bm |= B_BCOUNT;
+        }
+        if bm != 0 {
+            tags.blocks.push((b, bm));
+        }
+        for a in b.deref(ctx).arguments(ctx) {
+            tag_value(&mut tags, st, a);
+        }
+        for op in b.deref(ctx).iter(ctx) {
+            let mut m = 0;
+            if st.calls.contains(op) {
+                m |= OP_CALLS;
+            }
+            if st.intrinsics.contains(op) {
+                m |= OP_INTRINSICS;
+            }
+            if st.rmw.contains(op) {
+                m |= OP_RMW;
+            }
+            if st.expect.contains(op) {
+                m |= OP_EXPECT;
+            }
+            if st.prof_edges.contains(op) {
+                m |= OP_PROF_EDGES;
+            }
+            if st.volatile.contains(op) {
+                m |= OP_VOLATILE;
+            }
+            if st.nonnull.contains(op) {
+                m |= OP_NONNULL;
+            }
+            if st.inbounds.contains(op) {
+                m |= OP_INBOUNDS;
+            }
+            if st.bool01.contains(op) {
+                m |= OP_BOOL01;
+            }
+            if st.frozen_loads.contains(op) {
+                m |= OP_FROZEN_LOADS;
+            }
+            if Operation::is_op::<ReturnOp>(op, ctx) {
+                m |= OP_RETURN;
+            }
+            if m != 0 {
+                tags.ops.push((op, m));
+            }
+            for v in op.deref(ctx).results(ctx) {
+                tag_value(&mut tags, st, v);
+            }
+        }
+    }
+    tags.src = src;
+    tags
+}
+
 /// Per entry-param use shape: `mem` = loads/stores/mem intrinsics reached
 /// through GEP/bitcast chains (a by-ref arg whose actual is a local slot or a
 /// constant becomes direct access the cleanup passes can resolve); `fold` =
@@ -857,6 +989,10 @@ pub fn run(
     let _scan = tracing::info_span!(target: "pliron::iropt", "inline-scan").entered();
     let (mut t_scan, mut t_call, mut t_info) = (0f64, 0f64, 0f64);
     let mut t0 = std::time::Instant::now();
+    // Lazily-built per-callee side-table annotation lists; a callee's
+    // entry is dropped when that function's own body is rewritten below
+    // (it may be inlined again afterwards with the new body).
+    let mut tagcache: FxHashMap<Ptr<Operation>, CalleeTags> = FxHashMap::default();
     for sym in order {
         let caller = st.funcs[&sym].op;
         if st.opt_skip.contains(&caller) {
@@ -1094,12 +1230,16 @@ pub fn run(
                 }
             }
             t_scan += t0.elapsed().as_secs_f64() * 1e3;
+            t0 = std::time::Instant::now();
             if sites.is_empty() {
                 break;
             }
-            t0 = std::time::Instant::now();
             for (call, callee, cs) in sites {
-                let (b, mut news) = inline_call(ctx, st, &mut rw, call, callee);
+                let tags = tagcache
+                    .entry(callee)
+                    .or_insert_with(|| callee_tags(&*ctx, st, callee));
+                let (b, mut news) =
+                    inline_call(ctx, st, &mut rw, call, callee, &cs, &sym, tags);
                 // `news[0]` is the split continuation (follows `b` in region
                 // order); the rest are callee clones appended at region end.
                 pending.entry(b).or_default().push(news.remove(0));
@@ -1116,6 +1256,7 @@ pub fn run(
         if bottom_up {
             add_info!(&sym);
         }
+        tagcache.remove(&caller);
     }
     pliron_cfg::trace("in.scan", t_scan, &st.cgu);
     pliron_cfg::trace("in.call", t_call, &st.cgu);
@@ -1922,7 +2063,8 @@ fn frozen_of(
 fn frozen_args(
     ctx: &Context,
     st: &mut State,
-    callee: Ptr<Operation>,
+    callee: &str,
+    caller: &str,
     src: &[Ptr<BasicBlock>],
     map: &IrMapping,
     call_args: &[Value],
@@ -1961,7 +2103,7 @@ fn frozen_args(
             st.region_blocks.or_insert_with(nb, || entry);
         }
     }
-    let Some(f) = st.funcs.values().find(|f| f.op == callee) else {
+    let Some(f) = st.funcs.get(callee) else {
         if dbg {
             if pliron_cfg::tracing_on() {
                 tracing::debug!(target: "pliron::frozen", "frozen_args: callee {callee:?} not in funcs")
@@ -1969,14 +2111,10 @@ fn frozen_args(
         }
         return;
     };
-    let fname = st
-        .funcs
-        .iter()
-        .find(|(_, x)| x.op == callee)
-        .map(|(n, _)| n.clone());
+    let callee_frozen = !f.frozen.is_empty();
     if dbg {
         if pliron_cfg::tracing_on() {
-            tracing::debug!(target: "pliron::frozen", "frozen_args: na={:?} frz={:?} callee={fname:?} entry={entry:?}",
+            tracing::debug!(target: "pliron::frozen", "frozen_args: na={:?} frz={:?} callee={callee:?} entry={entry:?}",
                 f.noalias.len(),
                 f.frozen.len()
             )
@@ -1987,7 +2125,7 @@ fn frozen_args(
     // a frozen arg) is often phi-forwarded through args of *enclosing*
     // clone blocks — `partition`'s pivot reaches `lt` callsites that way.
     let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> = FxHashMap::default();
-    if !f.frozen.is_empty()
+    if callee_frozen
         && let Some(region) = call_block.deref(ctx).get_parent_region()
     {
         for b in region.deref(ctx).iter(ctx) {
@@ -2001,8 +2139,9 @@ fn frozen_args(
     // `(bytes, region)` for a base resolved at leaf `bl`: an enclosing
     // clone-arg record first; else a frozen param of the containing
     // function itself — the outermost region, anchored at its entry.
-    let caller_frz: Vec<(usize, u64)> = fop
-        .and_then(|o| st.funcs.values().find(|x| x.op == o))
+    let caller_frz: Vec<(usize, u64)> = st
+        .funcs
+        .get(caller)
         .map(|x| x.frozen.clone())
         .unwrap_or_default();
     // Caller-side operands bound to each entry arg, for region inheritance.
@@ -2066,7 +2205,7 @@ fn frozen_args(
                 .collect::<Vec<_>>()
                 .join(" ; ");
             if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::frozen", "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} callee={fname:?} cv={cv:?} rb={rb:?} {rbs} | {cvs} || {cas}"
+                tracing::debug!(target: "pliron::frozen", "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} callee={callee:?} cv={cv:?} rb={rb:?} {rbs} | {cvs} || {cas}"
                 )
             };
         }
@@ -2086,46 +2225,56 @@ fn frozen_args(
         }
     }
     // Loads inside the clone that provably read inside a frozen pointee:
-    // they may hoist within the region without a clobber scan.
-    for &b in src {
-        let Some(nb) = map.lookup_block(b) else {
-            continue;
-        };
-        for op in nb.deref(ctx).iter(ctx) {
-            if !Operation::is_op::<LoadOp>(op, ctx) {
-                continue;
-            }
-            let ptr = op.deref(ctx).get_operand(ctx, 0);
-            let Some((base, bl, Some(off))) =
-                ptr_base(ctx, st, &preds, ptr, &mut FxHashSet::default())
-            else {
+    // they may hoist within the region without a clobber scan. Nothing can
+    // match while no frozen record exists anywhere — the usual case for
+    // leaf callees — so skip the cloned-op walk outright.
+    let any_frozen = callee_frozen
+        || !caller_frz.is_empty()
+        || !st.region_frozen.is_empty()
+        || !st.region_frozen_op.is_empty();
+    if any_frozen {
+        for &b in src {
+            let Some(nb) = map.lookup_block(b) else {
                 continue;
             };
-            let Some((bytes, region)) = frozen_of(ctx, st, &caller_frz, fentry, entry, base, bl)
-            else {
-                if dbg
-                    && pliron_cfg::tracing_on()
-                    && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
-                {
-                    let bs = base
-                        .defining_op()
-                        .map(|o| OpDbg { op: o, ctx }.to_string())
-                        .unwrap_or_default();
+            for op in nb.deref(ctx).iter(ctx) {
+                if !Operation::is_op::<LoadOp>(op, ctx) {
+                    continue;
+                }
+                let ptr = op.deref(ctx).get_operand(ctx, 0);
+                let Some((base, bl, Some(off))) =
+                    ptr_base(ctx, st, &preds, ptr, &mut FxHashSet::default())
+                else {
+                    continue;
+                };
+                let Some((bytes, region)) =
+                    frozen_of(ctx, st, &caller_frz, fentry, entry, base, bl)
+                else {
+                    if dbg
+                        && pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+                    {
+                        let bs = base
+                            .defining_op()
+                            .map(|o| OpDbg { op: o, ctx }.to_string())
+                            .unwrap_or_default();
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::frozen", "frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}")
+                        };
+                    }
+                    continue;
+                };
+                let sz =
+                    size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0 as i64;
+                if off < 0 || off + sz > bytes as i64 {
+                    continue;
+                }
+                st.frozen_loads.insert(op, region);
+                if dbg {
                     if pliron_cfg::tracing_on() {
-                        tracing::debug!(target: "pliron::frozen", "frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}")
+                        tracing::debug!(target: "pliron::frozen", "frozen_args: load {op:?} base {base:?} off {off} region {region:?}")
                     };
                 }
-                continue;
-            };
-            let sz = size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0 as i64;
-            if off < 0 || off + sz > bytes as i64 {
-                continue;
-            }
-            st.frozen_loads.insert(op, region);
-            if dbg {
-                if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::frozen", "frozen_args: load {op:?} base {base:?} off {off} region {region:?}")
-                };
             }
         }
     }
@@ -2151,6 +2300,9 @@ fn inline_call(
     rw: &mut IRRewriter<DummyListener>,
     call: Ptr<Operation>,
     callee: Ptr<Operation>,
+    cs: &str,
+    caller: &str,
+    tags: &CalleeTags,
 ) -> (Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>) {
     let block = call.deref(ctx).get_parent_block().unwrap();
     let region = block.deref(ctx).get_parent_region().unwrap();
@@ -2170,102 +2322,105 @@ fn inline_call(
         _ => x,
     };
 
-    let src = blocks(ctx, callee);
+    let src = &tags.src;
     let mut map = IrMapping::new();
-    clone_blocks_into(&src, region, ctx, rw, &mut map);
+    clone_blocks_into(src, region, ctx, rw, &mut map);
     // Region ids are `Ptr<BasicBlock>`s in the source's block space: every
     // record copied below must remap through `map` so a tag anchored at
     // the callee's own entry (or a nested clone's) resolves inside the
     // clone — verbatim copies point at blocks the caller's `region_blocks`
     // never maps, and licm's ancestry walk dead-ends on them.
     let remap = |r: Ptr<BasicBlock>| map.lookup_block(r).unwrap_or(r);
-    for &b in &src {
+    for &(b, m) in &tags.blocks {
         let nb = map.lookup_block(b).unwrap();
-        if let Some(&pr) = st.region_blocks.get(b) {
-            st.region_blocks.insert(nb, remap(pr));
+        if m & B_REGION != 0 {
+            st.region_blocks.insert(nb, remap(st.region_blocks[b]));
         }
-        if let Some(&pp) = st.region_parent.get(b) {
-            st.region_parent.insert(nb, remap(pp));
+        if m & B_PARENT != 0 {
+            st.region_parent.insert(nb, remap(st.region_parent[b]));
         }
-        if let Some(&c) = st.prof_bcount.get(b) {
-            st.prof_bcount.insert(nb, scale(c));
+        if m & B_BCOUNT != 0 {
+            st.prof_bcount.insert(nb, scale(st.prof_bcount[b]));
         }
-        for (a, na) in b.deref(ctx).arguments(ctx).zip(nb.deref(ctx).arguments(ctx)) {
-            if let Some(f) = st.region_frozen.get(a).cloned() {
-                st.region_frozen.insert(
-                    na,
-                    f.into_iter().map(|(s, b, r)| (s, b, remap(r))).collect(),
-                );
-            }
-            if let Some(f) = st.region_noalias.get(a).cloned() {
-                st.region_noalias.insert(na, f);
-            }
-            if let Some(f) = st.region_frozen_op.get(a).cloned() {
-                st.region_frozen_op
-                    .insert(na, f.into_iter().map(|(b, r)| (b, remap(r))).collect());
+    }
+    for &(v, m) in &tags.vals {
+        let Some(nv) = map.lookup_value(v) else {
+            continue;
+        };
+        if m & V_ALLOCAS != 0 {
+            st.allocas.insert(nv, st.allocas[v]);
+        }
+        if m & V_PROMOTED != 0 {
+            st.promoted.insert(nv, st.promoted[v]);
+        }
+        if m & V_CONSTS != 0 {
+            st.consts.insert(nv, st.consts[v].clone());
+        }
+        if m & V_RFROZEN != 0 {
+            let f = st.region_frozen[v]
+                .iter()
+                .map(|&(s, b, r)| (s, b, remap(r)))
+                .collect();
+            st.region_frozen.insert(nv, f);
+        }
+        if m & V_RNOALIAS != 0 {
+            st.region_noalias.insert(nv, st.region_noalias[v].clone());
+        }
+        if m & V_RFROZEN_OP != 0 {
+            let f = st.region_frozen_op[v]
+                .iter()
+                .map(|&(b, r)| (b, remap(r)))
+                .collect();
+            st.region_frozen_op.insert(nv, f);
+        }
+    }
+    for &(op, m) in &tags.ops {
+        let Some(new) = map.lookup_op(op) else {
+            continue;
+        };
+        if m & OP_CALLS != 0 {
+            st.calls.insert(new, st.calls[op].clone());
+            if let Some(&(lp, catch)) = st.invokes.get(op) {
+                st.invokes
+                    .insert(new, (map.lookup_block(lp).unwrap(), catch));
+            } else if let Some(u) = unwind {
+                st.invokes.insert(new, u);
             }
         }
-        for (op, new) in ops(ctx, b).into_iter().zip(ops(ctx, nb)) {
-            if let Some(c) = st.calls.get(op).cloned() {
-                st.calls.insert(new, c);
-                if let Some(&(lp, catch)) = st.invokes.get(op) {
-                    st.invokes
-                        .insert(new, (map.lookup_block(lp).unwrap(), catch));
-                } else if let Some(u) = unwind {
-                    st.invokes.insert(new, u);
-                }
-            }
-            if let Some(s) = st.intrinsics.get(op).cloned() {
-                st.intrinsics.insert(new, s);
-            }
-            if let Some(r) = st.rmw.get(op).cloned() {
-                st.rmw.insert(new, r);
-            }
-            if let Some(e) = st.expect.get(op).copied() {
-                st.expect.insert(new, e);
-            }
-            if let Some(cs) = st.prof_edges.get(op).cloned() {
-                st.prof_edges
-                    .insert(new, cs.iter().map(|&c| scale(c)).collect());
-            }
-            if st.volatile.contains(op) {
-                st.volatile.insert(new);
-            }
-            if st.nonnull.contains(op) {
-                st.nonnull.insert(new);
-            }
-            if st.inbounds.contains(op) {
-                st.inbounds.insert(new);
-            }
-            if st.bool01.contains(op) {
-                st.bool01.insert(new);
-            }
-            if let Some(r) = st.frozen_loads.get(op).copied() {
-                st.frozen_loads.insert(new, remap(r));
-            }
-            let n = op.deref(ctx).get_num_results();
-            for i in 0..n {
-                let (v, nv) = (op.deref(ctx).get_result(ctx, i), new.deref(ctx).get_result(ctx, i));
-                if let Some(a) = st.allocas.get(v).copied() {
-                    st.allocas.insert(nv, a);
-                }
-                if let Some(t) = st.promoted.get(v).copied() {
-                    st.promoted.insert(nv, t);
-                }
-                if let Some(c) = st.consts.get(v).cloned() {
-                    st.consts.insert(nv, c);
-                }
-                if let Some(f) = st.region_frozen_op.get(v).cloned() {
-                    st.region_frozen_op
-                        .insert(nv, f.into_iter().map(|(b, r)| (b, remap(r))).collect());
-                }
-            }
-            if let Some(r) = Operation::get_op::<ReturnOp>(new, ctx) {
-                let rv: Vec<_> = r.retval(ctx).into_iter().collect();
-                let br = BrOp::new(ctx, cont, rv).get_operation();
-                br.insert_before(ctx, new);
-                Operation::erase(new, ctx);
-            }
+        if m & OP_INTRINSICS != 0 {
+            st.intrinsics.insert(new, st.intrinsics[op].clone());
+        }
+        if m & OP_RMW != 0 {
+            st.rmw.insert(new, st.rmw[op].clone());
+        }
+        if m & OP_EXPECT != 0 {
+            st.expect.insert(new, st.expect[op]);
+        }
+        if m & OP_PROF_EDGES != 0 {
+            st.prof_edges
+                .insert(new, st.prof_edges[op].iter().map(|&c| scale(c)).collect());
+        }
+        if m & OP_VOLATILE != 0 {
+            st.volatile.insert(new);
+        }
+        if m & OP_NONNULL != 0 {
+            st.nonnull.insert(new);
+        }
+        if m & OP_INBOUNDS != 0 {
+            st.inbounds.insert(new);
+        }
+        if m & OP_BOOL01 != 0 {
+            st.bool01.insert(new);
+        }
+        if m & OP_FROZEN_LOADS != 0 {
+            st.frozen_loads.insert(new, remap(st.frozen_loads[op]));
+        }
+        if m & OP_RETURN != 0 {
+            let r = Operation::get_op::<ReturnOp>(new, ctx).unwrap();
+            let rv: Vec<_> = r.retval(ctx).into_iter().collect();
+            let br = BrOp::new(ctx, cont, rv).get_operation();
+            br.insert_before(ctx, new);
+            Operation::erase(new, ctx);
         }
     }
     if let Some(res) = res {
@@ -2280,7 +2435,7 @@ fn inline_call(
     let entry = map.lookup_block(src[0]).unwrap();
     let br = BrOp::new(ctx, entry, args.clone()).get_operation();
     br.insert_before(ctx, call);
-    frozen_args(ctx, st, callee, &src, &map, &args, block);
+    frozen_args(ctx, st, cs, caller, src, &map, &args, block);
     st.calls.remove(call);
     Operation::erase(call, ctx);
     let clones = src.iter().map(|b| map.lookup_block(*b).unwrap());
