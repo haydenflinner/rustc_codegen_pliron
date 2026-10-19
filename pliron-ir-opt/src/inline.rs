@@ -855,6 +855,8 @@ pub fn run(
     let _setup_end = tracing::info_span!(target: "pliron::iropt", "inline-prep").entered();
     drop(_setup_end);
     let _scan = tracing::info_span!(target: "pliron::iropt", "inline-scan").entered();
+    let (mut t_scan, mut t_call, mut t_info) = (0f64, 0f64, 0f64);
+    let mut t0 = std::time::Instant::now();
     for sym in order {
         let caller = st.funcs[&sym].op;
         if st.opt_skip.contains(&caller) {
@@ -920,10 +922,12 @@ pub fn run(
                         continue;
                     }
                     if !infos.contains_key(cs) {
+                        let ti = std::time::Instant::now();
                         infos.insert(
                             cs.clone(),
                             callee_info(ctx, st, cs, model, limit, bonus, fold),
                         );
+                        t_info += ti.elapsed().as_secs_f64() * 1e3;
                     }
                     let ci = &infos[cs];
                     let Some(ci) = ci.as_ref() else {
@@ -1089,9 +1093,11 @@ pub fn run(
                     }
                 }
             }
+            t_scan += t0.elapsed().as_secs_f64() * 1e3;
             if sites.is_empty() {
                 break;
             }
+            t0 = std::time::Instant::now();
             for (call, callee, cs) in sites {
                 let (b, mut news) = inline_call(ctx, st, &mut rw, call, callee);
                 // `news[0]` is the split continuation (follows `b` in region
@@ -1104,11 +1110,16 @@ pub fn run(
                 delta.callers.insert(sym.clone());
                 delta.callees.insert(cs);
             }
+            t_call += t0.elapsed().as_secs_f64() * 1e3;
+            t0 = std::time::Instant::now();
         }
         if bottom_up {
             add_info!(&sym);
         }
     }
+    pliron_cfg::trace("in.scan", t_scan, &st.cgu);
+    pliron_cfg::trace("in.call", t_call, &st.cgu);
+    pliron_cfg::trace("in.info", t_info, &st.cgu);
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
     {
         left_stats(ctx, st, &mut infos, model, limit, bonus, fold);

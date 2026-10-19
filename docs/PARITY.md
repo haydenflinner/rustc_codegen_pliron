@@ -154,7 +154,26 @@ Next steps, in expected-payoff order:
    retained bodies emit rawer (object bytes differ; +~6 KB on
    regex-syntax), so it stays off until the artifact-parity story is
    decided. The remaining iropt duplication is live copies re-running
-   pliron-IR passes per CGU.
+   pliron-IR passes per CGU. **Tried and rejected**: copies skipping
+   body-rewriting passes outright (`opt_skip` on `xcgu_extra`) is
+   ~+0.7 CPU-s *worse* — copy iropt is load-bearing prepay that shrinks
+   the bodies before they splice into callers; unoptimized fodder just
+   moves the cost downstream. Dedup must share the *result* of copy
+   optimization across CGUs, not skip it.
+   **Tried and rejected — inliner callsite worklist**: replacing
+   `inline`'s per-round block rescan (`done_blocks`/`pending`) with an
+   incrementally-maintained callsite index cut the `in.scan` span 8.2 s
+   → 0.25 s but moved *zero* real CPU — the span was ~95%
+   descheduled-time inflation from 16-jobs-over-14-cores, and the
+   worklist flipped ~970 cap-boundary decisions toward more accepts
+   (+0.15 s clone work, +0.3 s wall) — reverted. Kept: lazy caller-size
+   (`op_count` computed only when a site reaches the cap check) and
+   permanent `in.scan`/`in.call`/`in.info` `PLIRON_TRACE_FILE` rows.
+   Lesson: per-step span times under the CGU pool read ~3-10x high;
+   trust A/B `user` time for pass-level costs. The real inliner cost
+   is `in.call` cloning (~1.4 s), already linear; the remaining
+   pliron-IR mass is the same 80-linear-passes-over-big-functions
+   shape as the CLIF pipeline (item 5).
 5. ~~Glue~~ **partly done, premise revised**: the inter-step
    bookkeeping is now ~3% of phaseB CPU. `carry_aliases`/`compact_aliases`
    walk `dfg.alias_writes()` (the per-write list behind `alias_epoch`)
