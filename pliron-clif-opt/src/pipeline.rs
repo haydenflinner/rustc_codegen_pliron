@@ -533,6 +533,10 @@ pub struct Analysis {
     /// `proots::alias_map_cfg` for the current `ver` — the param-alias
     /// relation every memory pass needs (dse runs three times).
     amap: Option<FxHashMap<Value, Value>>,
+    /// `proots::facts_cfg` for the current `ver` — the edge facts that
+    /// feed `amap`, `loadfwd`'s `bounds`/`pmroots`, and any other
+    /// proots consumer in this version. `amap` derives from it.
+    facts: Option<crate::proots::Facts>,
     /// `loadfwd::isolated` (empty-`nocap` variant) for the current `ver`,
     /// paired with the `noalias.len()` it was computed against:
     /// `carry_aliases` can grow `Pipe::noalias` inside a version, and the
@@ -568,6 +572,7 @@ impl Analysis {
     /// CFG edge/block structure provably intact (`edge_fp` match).
     fn clear_values(&mut self) {
         self.amap = None;
+        self.facts = None;
         self.iso = None;
         self.uses.get_mut().take();
     }
@@ -719,11 +724,11 @@ impl Analysis {
     ) {
         let t = std::time::Instant::now();
         self.materialize(func);
+        if self.facts.is_none() {
+            self.facts = Some(crate::proots::facts_cfg(func, self.cfg.as_ref().unwrap()));
+        }
         if self.amap.is_none() {
-            self.amap = Some(crate::proots::alias_map_cfg(
-                func,
-                self.cfg.as_ref().unwrap(),
-            ));
+            self.amap = Some(crate::proots::alias_of(self.facts.as_ref().unwrap()));
         }
         let t_ps = t.elapsed();
         let t = std::time::Instant::now();
@@ -746,6 +751,32 @@ impl Analysis {
     /// whole cache between steps.
     pub fn version(&self) -> u64 {
         self.ver
+    }
+
+    /// `loadfwd`'s entry inputs — `(cfg, edge facts, param-alias map)` —
+    /// each computed at most once per `ver` (the facts are shared with
+    /// `dse_inputs`' `amap` source). Snapshots: callers treat them like
+    /// locals built at this point — stale after their own mutations.
+    pub fn lf_inputs<'a>(
+        &'a mut self,
+        func: &Function,
+    ) -> (
+        &'a ControlFlowGraph,
+        &'a crate::proots::Facts,
+        &'a FxHashMap<Value, Value>,
+    ) {
+        self.materialize(func);
+        if self.facts.is_none() {
+            self.facts = Some(crate::proots::facts_cfg(func, self.cfg.as_ref().unwrap()));
+        }
+        if self.amap.is_none() {
+            self.amap = Some(crate::proots::alias_of(self.facts.as_ref().unwrap()));
+        }
+        (
+            self.cfg.as_ref().unwrap(),
+            self.facts.as_ref().unwrap(),
+            self.amap.as_ref().unwrap(),
+        )
     }
 
     /// The function's `shape` bits as a superset: scanned lazily once,
@@ -1649,8 +1680,12 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     // on a load arm) — without one, the CFG/RPO/proot/iso setup and
     // the fixpoint can produce nothing.
     if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
+        let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
         p.stats.forwarded += loadfwd::run(
             &mut p.clctx.func,
+            cfg,
+            pf,
+            ps,
             p.noalias,
             p.invariant,
             p.operand_frozen,
@@ -2281,9 +2316,13 @@ fn s_seltest(p: &mut Pipe, an: &mut Analysis) -> usize {
 // `p_j = p_i + k` collapse) turn formerly opaque param addresses into
 // `iadd` chains that `concrete` peels to exact (root, offset) locs —
 // making stores/loads that were unprovable at the early run disjoint.
-fn s_loadfwd2(p: &mut Pipe, _an: &mut Analysis) -> usize {
+fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
     let k = loadfwd::run(
         &mut p.clctx.func,
+        cfg,
+        pf,
+        ps,
         p.noalias,
         p.invariant,
         p.operand_frozen,

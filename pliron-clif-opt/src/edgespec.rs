@@ -1247,8 +1247,19 @@ pub fn run(func: &mut Function) -> usize {
         sweep_blocks(func);
         sweep_dead(func);
     }
-    n += splices(func);
-    if n > 0 {
+    // `n == 0` means nothing mutated since `cfg`/`dom` were built at the
+    // top — reuse them. Otherwise the walker redirects and sweeps
+    // changed edges/blocks: rebuild so dominance answers match the
+    // current graph.
+    let s = if n == 0 {
+        splices(func, &cfg, &dom)
+    } else {
+        let cfg2 = ControlFlowGraph::with_function(func);
+        let dom2 = DominatorTree::with_function(func, &cfg2);
+        splices(func, &cfg2, &dom2)
+    };
+    n += s;
+    if s > 0 {
         sweep_blocks(func);
         sweep_dead(func);
     }
@@ -1548,11 +1559,7 @@ fn deadbits(func: &mut Function) -> usize {
 /// bit and forwards the packed word onward. Each pred's tag is already
 /// constant (the merge only ever sets known bits), so the join and its test
 /// are pure overhead.
-fn splices(func: &mut Function) -> usize {
-    // The walker's redirects mutated the CFG since `run`'s domtree was
-    // built — recompute it so dominance answers match the current graph.
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+fn splices(func: &mut Function, cfg: &ControlFlowGraph, dom: &DominatorTree) -> usize {
     // Function-wide indexes, O(fn) each: value → blocks containing a use,
     // and block → its predecessor blocks. Built lazily past the cheap
     // rejections (they used to be rebuilt per candidate — O(candidates ×

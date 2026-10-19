@@ -842,6 +842,9 @@ fn meet(acc: &mut Option<Avail>, x: &Avail) {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     func: &mut Function,
+    cfg: &ControlFlowGraph,
+    pf: &crate::proots::Facts,
+    ps: &FxHashMap<Value, Value>,
     noalias: &FxHashSet<Value>,
     inv_insts: &FxHashSet<Inst>,
     ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
@@ -880,11 +883,13 @@ pub fn run(
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
     let t0 = std::time::Instant::now();
-    let mut cfg = ControlFlowGraph::with_function(func);
-    let mut rpo = rpo_of(&cfg);
+    // `cfg`/`pf`/`ps` are step-entry snapshots from `Analysis::lf_inputs`
+    // (shared with dse's alias map); a rebuilt CFG after `pre` mutates
+    // goes in `cfg2` below. `pf`/`ps` intentionally stay stale across
+    // that mutation, exactly as the one-shot build did.
+    let mut cfg2: Option<ControlFlowGraph> = None;
+    let mut rpo = rpo_of(cfg);
     let mut n = 0;
-    let pf = crate::proots::facts_cfg(func, &cfg);
-    let ps = &crate::proots::alias_of(&pf);
     // `ms` disjointness pays off in `pre` (more locs survive → more
     // redundancy hoisting — fewer loads execute) but not in the plain
     // forwarding pass: there it only swaps a load for a value defined
@@ -894,7 +899,7 @@ pub fn run(
     let pre_ms = crate::pass_enabled("PLIRON_MINROOT_PRE");
     let fwd_ms = crate::env_set("PLIRON_MINROOT_FWD");
     let bnd = if pre_ms || fwd_ms {
-        crate::proots::bounds(func, &pf)
+        crate::proots::bounds(func, pf)
     } else {
         FxHashMap::default()
     };
@@ -903,7 +908,7 @@ pub fn run(
     // the real set so operand values don't get function-wide immunity.
     let stop: FxHashSet<Value> = noalias.iter().chain(ofrozen.keys()).copied().collect();
     let pm = if pre_ms || fwd_ms {
-        pmroots(func, ps, &stop, &bnd, &pf)
+        pmroots(func, ps, &stop, &bnd, pf)
     } else {
         FxHashMap::default()
     };
@@ -944,14 +949,16 @@ pub fn run(
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
         n += pre(
-            func, ps, &stop, noalias, &cfg, &rpo, entry, &iso, &ncc, pbnd, ppm,
+            func, ps, &stop, noalias, cfg, &rpo, entry, &iso, &ncc, pbnd, ppm,
         );
         tt("pre", t0);
         if n > 0 {
-            cfg = ControlFlowGraph::with_function(func);
-            rpo = rpo_of(&cfg);
+            let c = ControlFlowGraph::with_function(func);
+            rpo = rpo_of(&c);
+            cfg2 = Some(c);
         }
     }
+    let cfg: &ControlFlowGraph = cfg2.as_ref().unwrap_or(cfg);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let mut invs: FxHashSet<Loc> = FxHashSet::default();
     let mut invreg: FxHashMap<Loc, Vec<Region>> = FxHashMap::default();

@@ -59,8 +59,14 @@ fn run(
     nocap: &FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<BasicBlock>)>>,
 ) -> usize {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
+    let pf = pliron_clif_opt::proots::facts_cfg(f, &cfg);
+    let ps = pliron_clif_opt::proots::alias_of(&pf);
     pliron_clif_opt::loadfwd::run(
         f,
+        &cfg,
+        &pf,
+        &ps,
         &[Value::from_u32(0)].into_iter().collect(),
         &FxHashSet::default(),
         ofz,

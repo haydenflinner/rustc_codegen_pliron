@@ -15,8 +15,14 @@ fn parse(src: &str) -> Function {
 }
 
 fn run(f: &mut Function, na: &FxHashSet<Value>) -> usize {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
+    let pf = pliron_clif_opt::proots::facts_cfg(f, &cfg);
+    let ps = pliron_clif_opt::proots::alias_of(&pf);
     pliron_clif_opt::loadfwd::run(
         f,
+        &cfg,
+        &pf,
+        &ps,
         na,
         &FxHashSet::default(),
         &FxHashMap::default(),
