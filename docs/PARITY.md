@@ -132,8 +132,16 @@ Next steps, in expected-payoff order:
    DFS keeps block params as slices and clones edge args only on the
    landing `Fin` (rejections used to pay a `Vec` clone each);
    `jumpthread::eval`'s icmp arm reads `known` once per operand.
-   Left: jumpthread ~4.0 s (a ~6-phase fixpoint; `round`'s threading
-   walk is the residue — `domcond` ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
+   `ControlFlowGraph` edge storage is flat CSR (sorted `edges` Vec →
+   `succ_off`/`succs` + `pred_off`/`preds`; `PredIter`/`SuccIter` are
+   slice walks now) and `Analysis` recycles cleared cfg/dt/la as
+   compute-into shells, so the ~54k corpus CFG rebuilds reuse their
+   backing storage instead of regrowing bforest node pools (the #1
+   allocator ancestor, ~3.5% of pipeline samples via
+   `visit_block_succs`): `clif-check bench` 28.4 → 28.0 s, .o members
+   byte-identical, corpus clean. Left: jumpthread ~4.0 s (a ~6-phase
+   fixpoint; `round`'s threading walk is the residue — `domcond`
+   ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
    the webmerge family ~4 s (`cparm`/`sameargs*` per-block key
    matrices + per-call `facts_cfg`/`affine_nf`/`Proots` Ascent —
    cross-round caching is unsound: `apply_param_drops` rewrites inst
