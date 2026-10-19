@@ -200,9 +200,10 @@ time) in ~15 min and writes `target/parity/summary.md`.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
 - `PLIRON_DEADUNOPT=0` — callerless retained `xcgu` copies emit through
-  `Gate::Always` lowerings only. `PLIRON_EARLYDEAD=1` (opt-in) marks
-  them before the iropt passes so `bodied`/`opt_body` skip them too;
-  disabled under `PLIRON_OPT_FNS`.
+  `Gate::Always` lowerings only. `PLIRON_EARLYDEAD=0` — also marks
+  them before the iropt passes so `bodied`/`opt_body` skip them too
+  (default-on; marked bodies emit rawer, so object bytes differ;
+  disabled under `PLIRON_OPT_FNS`).
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 

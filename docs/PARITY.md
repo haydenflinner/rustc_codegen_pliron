@@ -212,12 +212,11 @@ Next steps, in expected-payoff order:
    safety (rustc's used-lists can't see copy→copy calls, so `dead_fns`
    can't strip them). `PLIRON_DEADUNOPT` emits them through
    `Gate::Always` lowerings only — −3 CPU-s on regex-syntax, all
-   symbols still defined. **`PLIRON_EARLYDEAD=1` (opt-in)** marks them
-   at iropt entry and post-devirt so `bodied`/`opt_body` passes skip
-   their emit-only bodies entirely — a further ~0.5 CPU-s, but the
-   retained bodies emit rawer (object bytes differ; +~6 KB on
-   regex-syntax), so it stays off until the artifact-parity story is
-   decided. The remaining iropt duplication is live copies re-running
+   symbols still defined. **`PLIRON_EARLYDEAD` (default-on)** marks
+   them at iropt entry and post-devirt so `bodied`/`opt_body` passes
+   skip their emit-only bodies entirely — ~8% wall on regex-syntax;
+   the retained bodies emit rawer (+~6 KB object bytes), accepted
+   since they're callerless (`=0` opts out). The remaining iropt duplication is live copies re-running
    pliron-IR passes per CGU. **Tried and rejected**: copies skipping
    body-rewriting passes outright (`opt_skip` on `xcgu_extra`) is
    ~+0.7 CPU-s *worse* — copy iropt is load-bearing prepay that shrinks
