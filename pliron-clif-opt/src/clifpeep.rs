@@ -70,12 +70,35 @@ fn kcon(pos: &mut FuncCursor, ty: Type, w: u32, c: u128) -> Value {
 }
 
 fn sext(v: u64, bits: u32) -> i64 {
-    if bits >= 64 {
-        v as i64
+    let sh = 64 - bits.min(64);
+    ((v << sh) as i64) >> sh
+}
+
+/// `v`'s iconst sign-extended at its own width — `iconst.i32 -1` stores
+/// `0xFFFFFFFF`, so raw `iconst()` reads `-1`-in-type as a huge positive
+/// and breaks every signed comparison/koff accumulation.
+fn sconst(func: &Function, v: Value) -> Option<i64> {
+    let v = func.dfg.resolve_aliases(v);
+    let d = func.dfg.value_def(v).inst()?;
+    let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = func.dfg.insts[d]
+    else {
+        return None;
+    };
+    let w = func.dfg.value_type(func.dfg.first_result(d)).bits();
+    Some(sext(imm.bits() as u64, w))
+}
+
+/// `v` is `iconst` of all-ones in `ty` — the width-aware `-1`.
+fn allones(func: &Function, v: Value, ty: Type) -> bool {
+    let m = if ty.bits() >= 64 {
+        u64::MAX
     } else {
-        let s = 64 - bits;
-        ((v << s) as i64) >> s
-    }
+        (1u64 << ty.bits()) - 1
+    };
+    iconst(func, v).is_some_and(|k| (k as u64) & m == m)
 }
 
 /// Tight unsigned ceiling on `v` — its proven maximum value. Defaults to the
@@ -289,6 +312,56 @@ fn narrow(pos: &mut FuncCursor, amt: Value) -> Option<Value> {
     })
 }
 
+/// `uextend`/`sextend` of a narrow `Load` emitted as the fused widening
+/// load: `uextend.i32 (load.i8 p)` → `uload8.i32 p`, with the narrow
+/// load rewritten to `ireduce` for its other uses — `uloads`' move
+/// applied where `widen`/`dem64` mint the pair after `uloads` ran
+/// (UTF-8 continuation bytes: `load.i8`+`uextend` is two wasm ops where
+/// `i32.load8_u` is one). The wide load emits at the narrow load's site
+/// so it inherits its dominance; the caller substitutes the returned
+/// value for the extend it was about to emit.
+fn ext_load(func: &mut Function, signed: bool, to: Type, v: Value) -> Option<Value> {
+    let v = func.dfg.resolve_aliases(v);
+    let d = func.dfg.value_def(v).inst()?;
+    let InstructionData::Load {
+        opcode: Opcode::Load,
+        flags,
+        arg,
+        offset,
+    } = func.dfg.insts[d]
+    else {
+        return None;
+    };
+    let nt = func.dfg.value_type(v);
+    if !to.is_int()
+        || to.is_vector()
+        || !nt.is_int()
+        || nt.is_vector()
+        || nt.bits() >= to.bits()
+        || to.bits() > 64
+    {
+        return None;
+    }
+    if nt.bits() == 32 && to != types::I64 {
+        return None;
+    }
+    let flags = func.dfg.mem_flags[flags].clone();
+    let mut pos = FuncCursor::new(func).at_inst(d);
+    // `uload32`/`sload32` results are i64-only; the narrow loads take
+    // the target type.
+    let wide = match (signed, nt.bits()) {
+        (false, 8) => pos.ins().uload8(to, flags, arg, offset),
+        (false, 16) => pos.ins().uload16(to, flags, arg, offset),
+        (false, 32) => pos.ins().uload32(flags, arg, offset),
+        (true, 8) => pos.ins().sload8(to, flags, arg, offset),
+        (true, 16) => pos.ins().sload16(to, flags, arg, offset),
+        (true, 32) => pos.ins().sload32(flags, arg, offset),
+        _ => return None,
+    };
+    pos.func.replace(d).ireduce(nt, wide);
+    Some(wide)
+}
+
 fn widen(pos: &mut FuncCursor, inst: Inst, arg: Value) -> bool {
     let f = &*pos.func;
     let to = f.dfg.value_type(f.dfg.first_result(inst));
@@ -305,8 +378,13 @@ fn widen(pos: &mut FuncCursor, inst: Inst, arg: Value) -> bool {
     if !matches!(opcode, Opcode::Band | Opcode::Bor | Opcode::Bxor) {
         return false;
     }
-    let a = pos.ins().uextend(to, args[0]);
-    let b = pos.ins().uextend(to, args[1]);
+    // An `uextend` of a narrow `load` fuses to the widening load instead
+    // of widening in two ops (`&63` continuation-byte masks read
+    // `uload8.i32` directly).
+    let xa = pos.func.dfg.resolve_aliases(args[0]);
+    let xb = pos.func.dfg.resolve_aliases(args[1]);
+    let a = ext_load(pos.func, false, to, xa).unwrap_or_else(|| pos.ins().uextend(to, xa));
+    let b = ext_load(pos.func, false, to, xb).unwrap_or_else(|| pos.ins().uextend(to, xb));
     let r = pos.func.replace(inst);
     match opcode {
         Opcode::Band => r.band(a, b),
@@ -569,8 +647,10 @@ fn dem64_m32(pos: &mut FuncCursor, v32: &FxHashMap<Value, Value>, v: Value) -> V
                 }
                 if at.is_int() && !at.is_vector() && at.bits() < 32 {
                     return match op {
-                        Opcode::Uextend => pos.ins().uextend(types::I32, a),
-                        _ => pos.ins().sextend(types::I32, a),
+                        Opcode::Uextend => ext_load(pos.func, false, types::I32, a)
+                            .unwrap_or_else(|| pos.ins().uextend(types::I32, a)),
+                        _ => ext_load(pos.func, true, types::I32, a)
+                            .unwrap_or_else(|| pos.ins().sextend(types::I32, a)),
                     };
                 }
             }
@@ -621,8 +701,10 @@ fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) 
                 {
                     a
                 }
-                Opcode::Uextend => pos.ins().uextend(types::I32, a),
-                Opcode::Sextend => pos.ins().sextend(types::I32, a),
+                Opcode::Uextend => ext_load(pos.func, false, types::I32, a)
+                    .unwrap_or_else(|| pos.ins().uextend(types::I32, a)),
+                Opcode::Sextend => ext_load(pos.func, true, types::I32, a)
+                    .unwrap_or_else(|| pos.ins().sextend(types::I32, a)),
                 Opcode::Bmask => pos.ins().bmask(types::I32, a),
                 Opcode::Ireduce => pos.ins().ireduce(types::I32, a),
                 Opcode::Bnot => {
@@ -1127,6 +1209,380 @@ fn addend(func: &Function, v: Value) -> Option<(Value, i64)> {
     }
 }
 
+/// `v`'s additive decomposition `Σ sᵢ·tᵢ + K` through `iadd`/`isub`/
+/// `ineg`/`imul x,-1`/`iconst` — the `icmp eq/ne` linear fold moves the
+/// negated half to the rhs. `(terms, koff, consumed)` — `consumed` counts
+/// the op nodes folded away, so a bare operand reports 0 and callers can
+/// tell a real rewrite from a no-op. `None` past 8 tree nodes (bounded
+/// peel) — wider trees stay put.
+fn lin_flat(func: &Function, v: Value, mut koff: i64) -> Option<(Vec<(Value, i64)>, i64, usize)> {
+    let mut terms: Vec<(Value, i64)> = Vec::new();
+    let mut consumed = 0usize;
+    let mut stack = vec![(func.dfg.resolve_aliases(v), 1i64)];
+    while let Some((x, s)) = stack.pop() {
+        if let Some(k) = sconst(func, x) {
+            koff = koff.wrapping_add(s.wrapping_mul(k));
+        } else {
+            let d = match func.dfg.value_def(x).inst() {
+                Some(d) => d,
+                None => {
+                    terms.push((x, s));
+                    continue;
+                }
+            };
+            match func.dfg.insts[d] {
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args,
+                } => {
+                    consumed += 1;
+                    stack.push((func.dfg.resolve_aliases(args[0]), s));
+                    stack.push((func.dfg.resolve_aliases(args[1]), s));
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Isub,
+                    args,
+                } => {
+                    consumed += 1;
+                    stack.push((func.dfg.resolve_aliases(args[0]), s));
+                    stack.push((func.dfg.resolve_aliases(args[1]), -s));
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Imul,
+                    args,
+                } if sconst(func, args[0]) == Some(-1)
+                    || sconst(func, args[1]) == Some(-1) =>
+                {
+                    consumed += 1;
+                    let y = if sconst(func, args[0]) == Some(-1) {
+                        args[1]
+                    } else {
+                        args[0]
+                    };
+                    stack.push((func.dfg.resolve_aliases(y), -s));
+                }
+                InstructionData::Unary {
+                    opcode: Opcode::Ineg,
+                    arg,
+                } => {
+                    consumed += 1;
+                    stack.push((func.dfg.resolve_aliases(arg), -s));
+                }
+                _ => terms.push((x, s)),
+            }
+        }
+        if stack.len() + terms.len() > 8 {
+            return None;
+        }
+    }
+    Some((terms, koff, consumed))
+}
+
+/// `icmp {eq,ne} X, C` where `X` is an `iadd`/`isub`/`ineg`/`imul -1`
+/// tree — `x + k != C` → `x != C - k`, `a - b != 0` → `a != b`, and the
+/// `len - (-ptr) - d - 1 != 0` chains rustc's parse/decode loops build
+/// become `a + K != b`: one compare, no negation plumbing.
+fn icmpk(pos: &mut FuncCursor, inst: Inst, cc: IntCC, x: Value, c: i64) -> bool {
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) {
+        return false;
+    }
+    let x = pos.func.dfg.resolve_aliases(x);
+    let ty = pos.func.dfg.value_type(x);
+    if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+        return false;
+    }
+    // `c` comes in as the raw `iconst` bits — sign-extend at `ty`.
+    let c = sext(c as u64, ty.bits());
+    let Some((terms, mut koff, consumed)) = lin_flat(pos.func, x, c.wrapping_neg()) else {
+        return false;
+    };
+    if consumed == 0 {
+        return false;
+    }
+    let bits = ty.bits().min(64);
+    if bits < 64 {
+        koff = ((koff as u64) & ((1u64 << bits) - 1)) as i64;
+        koff = (koff << (64 - bits)) >> (64 - bits);
+    }
+    // Everything folded to a constant: `K == 0` decides the compare.
+    if terms.is_empty() {
+        let v = i64::from((koff == 0) == (cc == IntCC::Equal));
+        pos.func.replace(inst).iconst(types::I8, v);
+        return true;
+    }
+    // `K - x == 0` → `x == K`; `x + K == 0` → `x == -K`.
+    if terms.len() == 1 {
+        let (t, s) = terms[0];
+        let k = pos.ins().iconst(ty, if s > 0 { koff.wrapping_neg() } else { koff });
+        pos.func.replace(inst).icmp(cc, t, k);
+        return true;
+    }
+    // Two-sided: positives stay on the left with the const, negatives
+    // sum on the right — `a - b - 1 != 0` → `a - 1 != b`.
+    let (mut pl, mut nl) = (Vec::new(), Vec::new());
+    for (t, s) in terms {
+        if s > 0 {
+            pl.push(t);
+        } else {
+            nl.push(t);
+        }
+    }
+    if pl.is_empty() || nl.is_empty() {
+        return false;
+    }
+    let mut lhs = pl[0];
+    for &t in &pl[1..] {
+        lhs = pos.ins().iadd(lhs, t);
+    }
+    if koff != 0 {
+        let k = pos.ins().iconst(ty, koff);
+        lhs = pos.ins().iadd(lhs, k);
+    }
+    let mut rhs = nl[0];
+    for &t in &nl[1..] {
+        rhs = pos.ins().iadd(rhs, t);
+    }
+    pos.func.replace(inst).icmp(cc, lhs, rhs);
+    true
+}
+
+/// `icmp cc.T (ireduce x), y` widened back to `x`'s source type —
+/// `icmp.i8` on `uload8`/`band`-bounded values pays a `&255` norm per
+/// operand plus the `ireduce` itself at wasm emission, while `x`
+/// already sits in an i32 local.
+///
+/// Unsigned ccs and `eq`/`ne` widen freely when `cover(x)` fits in `T`
+/// (then `x == zext(ireduce x)`); signed ccs need `x`'s sign bit provably
+/// clear (`cover(x) >> (T-1) == 0`). Both-`ireduce` compares fold when
+/// both sources fit; a const operand widens `zext`/`sext` by the cc.
+fn icmpred(pos: &mut FuncCursor, inst: Inst, cc: IntCC, args: [Value; 2]) -> bool {
+    let ty = pos.func.dfg.value_type(args[0]);
+    if !ty.is_int() || ty.is_vector() || ty.bits() >= 64 {
+        return false;
+    }
+    let signed = matches!(
+        cc,
+        IntCC::SignedGreaterThan
+            | IntCC::SignedGreaterThanOrEqual
+            | IntCC::SignedLessThan
+            | IntCC::SignedLessThanOrEqual
+    );
+    let nb = ty.bits();
+    let fits = |f: &Function, x: Value| -> bool {
+        let c = cover(f, x, 6);
+        if signed {
+            c >> (nb - 1) == 0
+        } else {
+            c >> nb == 0
+        }
+    };
+    let mut wide: Vec<Option<Value>> = Vec::with_capacity(2);
+    let mut wide_ty = None;
+    for (i, a) in args.iter().enumerate() {
+        let a = pos.func.dfg.resolve_aliases(*a);
+        if let Some(d) = pos.func.dfg.value_def(a).inst()
+            && let InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg: x,
+            } = pos.func.dfg.insts[d]
+        {
+            let x = pos.func.dfg.resolve_aliases(x);
+            let xt = pos.func.dfg.value_type(x);
+            if xt.is_vector() || !xt.is_int() || xt.bits() <= nb {
+                return false;
+            }
+            match wide_ty {
+                None => wide_ty = Some(xt),
+                Some(t) if t == xt => {}
+                _ => return false,
+            }
+            if !fits(pos.func, x) {
+                return false;
+            }
+            wide.push(Some(x));
+            continue;
+        }
+        if let Some(k) = iconst(pos.func, a) {
+            wide.push(None);
+            let _ = (i, k);
+            continue;
+        }
+        return false;
+    }
+    if wide.iter().all(|w| w.is_none()) {
+        return false;
+    }
+    let wt = wide_ty.unwrap();
+    let mut ops = [None; 2];
+    for (i, a) in args.iter().enumerate() {
+        if let Some(x) = wide[i] {
+            ops[i] = Some(x);
+        } else {
+            let k = iconst(pos.func, *a).unwrap();
+            let kk = if signed {
+                sext(k as u64, nb)
+            } else {
+                (k as u64 & ((1u64 << nb) - 1)) as i64
+            };
+            ops[i] = Some(pos.ins().iconst(wt, kk));
+        }
+    }
+    pos.func.replace(inst).icmp(cc, ops[0].unwrap(), ops[1].unwrap());
+    true
+}
+
+/// `v` as `y + K` (`iadd`/`isub` with a constant, either side) or
+/// `K - y`: the inner node's pieces for `addnorm`'s const reassoc.
+enum LinK {
+    /// `y + K`.
+    YK(Value, i64),
+    /// `K - y`.
+    KY(i64, Value),
+}
+
+fn inner_lin(func: &Function, v: Value) -> Option<LinK> {
+    let v = func.dfg.resolve_aliases(v);
+    let d = func.dfg.value_def(v).inst()?;
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[d] else {
+        return None;
+    };
+    let (a, b) = (func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1]));
+    match opcode {
+        Opcode::Iadd => {
+            if let Some(k) = sconst(func, b) {
+                Some(LinK::YK(a, k))
+            } else {
+                sconst(func, a).map(|k| LinK::YK(b, k))
+            }
+        }
+        Opcode::Isub => {
+            if let Some(k) = sconst(func, b) {
+                Some(LinK::YK(a, k.wrapping_neg()))
+            } else {
+                sconst(func, a).map(|k| LinK::KY(k, b))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `(x ± k1) ± k2` → `x ± (k1±k2)` — const chains on an `iadd`/`isub`
+/// spine re-associate so the combined offset folds in once (the decode
+/// `ptr+1+1`s, `x+8 == 0`-style leftovers), and `a ± (x·-1)` → `a ∓ x`
+/// merges rustc's negate-by-multiply into the add.
+fn addnorm(pos: &mut FuncCursor, inst: Inst) -> bool {
+    let InstructionData::Binary { opcode, args } = pos.func.dfg.insts[inst] else {
+        return false;
+    };
+    if !matches!(opcode, Opcode::Iadd | Opcode::Isub) {
+        return false;
+    }
+    let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+    if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+        return false;
+    }
+    // `a + (x·-1)` → `a - x`; `a - (x·-1)` → `a + x`. For `isub` only
+    // the rhs can be the product — `-x - a` is `-(x+a)`, a worse shape.
+    let isub_rhs = opcode == Opcode::Isub;
+    for i in usize::from(isub_rhs)..2 {
+        let v = pos.func.dfg.resolve_aliases(args[i]);
+        let Some(d) = pos.func.dfg.value_def(v).inst() else {
+            continue;
+        };
+        let InstructionData::Binary {
+            opcode: Opcode::Imul,
+            args: ia,
+        } = pos.func.dfg.insts[d]
+        else {
+            continue;
+        };
+        let (a0, a1) = (
+            pos.func.dfg.resolve_aliases(ia[0]),
+            pos.func.dfg.resolve_aliases(ia[1]),
+        );
+        let y = if sconst(pos.func, a1) == Some(-1) {
+            a0
+        } else if sconst(pos.func, a0) == Some(-1) {
+            a1
+        } else {
+            continue;
+        };
+        let rest = args[1 - i];
+        match opcode {
+            Opcode::Iadd => {
+                pos.func.replace(inst).isub(rest, y);
+            }
+            _ => {
+                pos.func.replace(inst).iadd(rest, y);
+            }
+        }
+        return true;
+    }
+    // Const reassoc on the additive spine: `iadd (y+k1), k2` and
+    // `isub (y+k1), k2` → `y + (k1±k2)`; `isub k2, (y+k1)` → `(k2-k1) - y`.
+    enum Outer {
+        /// `X + K2` — `iadd`, or `isub X, K2`'s lhs position.
+        AddK,
+        /// `X - K2`.
+        SubK,
+        /// `K2 - X`.
+        KSub,
+    }
+    let mut forms: Vec<(Outer, usize, i64)> = Vec::with_capacity(2);
+    if opcode == Opcode::Iadd {
+        if let Some(k) = sconst(pos.func, args[1]) {
+            forms.push((Outer::AddK, 0, k));
+        }
+        if let Some(k) = sconst(pos.func, args[0]) {
+            forms.push((Outer::AddK, 1, k));
+        }
+    } else {
+        if let Some(k) = sconst(pos.func, args[1]) {
+            forms.push((Outer::SubK, 0, k));
+        }
+        if let Some(k) = sconst(pos.func, args[0]) {
+            forms.push((Outer::KSub, 1, k));
+        }
+    }
+    for (form, xi, k2) in forms {
+        let Some(l) = inner_lin(pos.func, args[xi]) else {
+            continue;
+        };
+        match (l, form) {
+            // `(y+k1) + k2` / `(y+k1) - k2` → `y + (k1±k2)`
+            (LinK::YK(y, k1), Outer::AddK) => {
+                let kk = pos.ins().iconst(ty, k1.wrapping_add(k2));
+                pos.func.replace(inst).iadd(y, kk);
+            }
+            (LinK::YK(y, k1), Outer::SubK) => {
+                let kk = pos.ins().iconst(ty, k1.wrapping_sub(k2));
+                pos.func.replace(inst).iadd(y, kk);
+            }
+            // `(k1-y) + k2` / `(k1-y) - k2` → `(k1±k2) - y`
+            (LinK::KY(k1, y), Outer::AddK) => {
+                let kk = pos.ins().iconst(ty, k1.wrapping_add(k2));
+                pos.func.replace(inst).isub(kk, y);
+            }
+            (LinK::KY(k1, y), Outer::SubK) => {
+                let kk = pos.ins().iconst(ty, k1.wrapping_sub(k2));
+                pos.func.replace(inst).isub(kk, y);
+            }
+            // `k2 - (y+k1)` → `(k2-k1) - y`
+            (LinK::YK(y, k1), Outer::KSub) => {
+                let kk = pos.ins().iconst(ty, k2.wrapping_sub(k1));
+                pos.func.replace(inst).isub(kk, y);
+            }
+            // `k2 - (k1-y)` → `(k2-k1) + y`
+            (LinK::KY(k1, y), Outer::KSub) => {
+                let kk = pos.ins().iconst(ty, k2.wrapping_sub(k1));
+                pos.func.replace(inst).iadd(y, kk);
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// `icmp eq|ne` normalized to `(x + a) cc k`: `eq` is whether the
 /// equality holds when the compare is true (false for `ne`), `x`/`a`
 /// come from the add-chain operand — a bare operand is `x + 0` — and `k`
@@ -1346,6 +1802,12 @@ fn cover(func: &Function, v: Value, depth: usize) -> u64 {
             opcode: Opcode::Uextend,
             arg,
         } => cover(func, arg, depth - 1),
+        // `ireduce` keeps the arg's low bits — the result-width mask
+        // already bounds them.
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => cover(func, arg, depth - 1) & all,
         InstructionData::Binary {
             opcode: Opcode::Band,
             args,
@@ -1361,6 +1823,11 @@ fn cover(func: &Function, v: Value, depth: usize) -> u64 {
             Some(s) => cover(func, args[0], depth - 1) >> (s as u64 % ty.bits() as u64),
             None => all,
         },
+        // `select c, a, b`: result's bits ⊆ a|b.
+        InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } => (cover(func, args[1], depth - 1) | cover(func, args[2], depth - 1)) & all,
         InstructionData::Load { opcode, .. } => match opcode {
             Opcode::Uload8 => 0xff,
             Opcode::Uload16 => 0xffff,
@@ -5368,7 +5835,12 @@ fn bitmerge(func: &mut Function) -> usize {
                     links.push((d, o2, k2));
                     base = func.dfg.resolve_aliases(other);
                 }
-                if links.len() >= 3 {
+                // ≥3 links always wins (≥3 insts → ≤2); a 2-link chain
+                // wins only when it's the same op twice — `x&m1 &m2` →
+                // `x & m1&m2`, `x|k1 |k2` → `x | k1|k2` (the `&31 &7`
+                // decode masks, `&255 &1` flag tests) — a mixed
+                // `&/|` pair re-emits as two insts anyway.
+                if links.len() >= 3 || (links.len() == 2 && links[0].1 == links[1].1) {
                     best = Some((links, base));
                     break;
                 }
@@ -5448,6 +5920,9 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let bittab_on = crate::pass_enabled("PLIRON_BITTAB");
     let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
     let divchk_on = crate::pass_enabled("PLIRON_DIVCHK");
+    let icmpk_on = crate::pass_enabled("PLIRON_ICMPK");
+    let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
+    let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
@@ -5885,6 +6360,19 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     continue;
                 }
             }
+            // `(x ± k1) ± k2` → `x ± (k1±k2)` and `a ± (x·-1)` → `a ∓ x`:
+            // normalize additive spines before the icmp dispatch so
+            // compare folds see collapsed offsets.
+            if addnorm_on
+                && matches!(
+                    pos.func.dfg.insts[inst].opcode(),
+                    Opcode::Iadd | Opcode::Isub
+                )
+                && addnorm(&mut pos, inst)
+            {
+                n += 1;
+                continue;
+            }
             let InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
                 cond,
@@ -5900,6 +6388,13 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
             // `x8 <u 0x100000` bounds checks on narrow indexes).
             let ty = pos.func.dfg.value_type(args[0]);
             if ty.is_int() && !ty.is_vector() && ty.bits() <= 64 {
+                // `icmp cc.T (ireduce x), K` → `icmp cc x, K'` widened —
+                // i8/i16 compares pay `&mask` norms at emission the
+                // wider source already proved away.
+                if icmpred_on && icmpred(&mut pos, inst, cond, args) {
+                    n += 1;
+                    continue;
+                }
                 let (mut cc, mut k, mut x) = (cond, args[1], args[0]);
                 if iconst(pos.func, args[0]).is_some() {
                     cc = cc.swap_args();
@@ -5907,6 +6402,15 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     x = args[1];
                 }
                 if let Some(k) = iconst(pos.func, k) {
+                    // `icmp {eq,ne} (±terms + K), C` → `icmp {eq,ne} Σ+, Σ−`
+                    // — `x+k != C` → `x != C-k`, `a-b != 0` → `a != b`.
+                    if icmpk_on
+                        && matches!(cc, IntCC::Equal | IntCC::NotEqual)
+                        && icmpk(&mut pos, inst, cc, x, k)
+                    {
+                        n += 1;
+                        continue;
+                    }
                     let bits = ty.bits() as u32;
                     let umax = if bits == 64 {
                         u64::MAX
@@ -7263,11 +7767,210 @@ pub fn wide_minmax(func: &mut Function) -> usize {
     n
 }
 
+/// The last-sweep cleanups `iconst128` runs after the pipeline's final
+/// mutating step — the wasm emitter walks every inst into a real op
+/// with no DCE behind it, so pure leftovers cost real code:
+///
+/// - dead pure insts (`remove_dead_insts`): rangefold's bypassed
+///   compares, dem64's stale i64 wrappers, paramsink's sunk spares.
+/// - identity aliases: `x+0`, `x-0`, `x|0`, `x^0`, `x&-1`, `x*1`,
+///   `x<<0`, `x>>0`, and `uextend (ireduce v)` when `v` fits — all
+///   minted post-`lcse4` by dem64/coldret/selargs emission.
+/// - covered `band` masks: `x & m` where `x`'s set bits all live in `m`
+///   (`uextend.i32 x8 & 255` — unicode lookup results).
+/// - `icmpk`/`addnorm` on the survivors, for chains the earlier sweeps
+///   predated.
+fn post_sweep(func: &mut Function) -> usize {
+    let mut n = crate::jumpthread::remove_dead_insts(func, true);
+    let mut hits = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let rs = func.dfg.inst_results(i);
+            if rs.len() != 1 {
+                continue;
+            }
+            let alias = match func.dfg.insts[i] {
+                InstructionData::Binary { opcode, args } => {
+                    let ty = func.dfg.value_type(rs[0]);
+                    let (ka, kb) = (iconst(func, args[0]), iconst(func, args[1]));
+                    match opcode {
+                        Opcode::Iadd | Opcode::Bor | Opcode::Bxor => {
+                            if ka == Some(0) {
+                                Some(args[1])
+                            } else {
+                                (kb == Some(0)).then_some(args[0])
+                            }
+                        }
+                        Opcode::Isub => (kb == Some(0)).then_some(args[0]),
+                        Opcode::Imul => {
+                            if ka == Some(1) {
+                                Some(args[1])
+                            } else {
+                                (kb == Some(1)).then_some(args[0])
+                            }
+                        }
+                        Opcode::Band => {
+                            if ty.is_int()
+                                && !ty.is_vector()
+                                && (allones(func, args[0], ty)
+                                    || allones(func, args[1], ty))
+                            {
+                                if allones(func, args[0], ty) {
+                                    Some(args[1])
+                                } else {
+                                    Some(args[0])
+                                }
+                            } else {
+                                // `x & m` is `x` when `x`'s possibly-set
+                                // bits all live inside `m`.
+                                let om = kb.map(|m| (args[0], m)).or_else(|| {
+                                    ka.map(|m| (args[1], m))
+                                });
+                                match om {
+                                    Some((other, m)) => (cover(func, other, 6) & !(m as u64)
+                                        == 0)
+                                    .then_some(other),
+                                    None => None,
+                                }
+                            }
+                        }
+                        Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
+                            (kb == Some(0)).then_some(args[0])
+                        }
+                        _ => None,
+                    }
+                }
+                // `uextend (ireduce v)` == `v` when `v` fits the reduced
+                // width — late widen/dem64 pairs past `lcse`'s extred.
+                InstructionData::Unary {
+                    opcode: Opcode::Uextend,
+                    arg,
+                } => (|| {
+                    let a = func.dfg.resolve_aliases(arg);
+                    let d = func.dfg.value_def(a).inst()?;
+                    let InstructionData::Unary {
+                        opcode: Opcode::Ireduce,
+                        arg: x,
+                    } = func.dfg.insts[d]
+                    else {
+                        return None;
+                    };
+                    let x = func.dfg.resolve_aliases(x);
+                    let rt = func.dfg.value_type(rs[0]);
+                    let w = func.dfg.value_type(func.dfg.first_result(d)).bits();
+                    (func.dfg.value_type(x) == rt && w < 64 && (vmax(func, x) >> w) == 0)
+                        .then_some(x)
+                })(),
+                _ => None,
+            };
+            if let Some(a) = alias {
+                hits.push((i, rs[0], func.dfg.resolve_aliases(a)));
+            }
+        }
+    }
+    n += hits.len();
+    for (i, r, a) in hits {
+        func.dfg.clear_results(i);
+        func.layout.remove_inst(i);
+        func.dfg.change_to_alias(r, a);
+    }
+    if crate::pass_enabled("PLIRON_BITMERGE") {
+        n += bitmerge(func);
+    }
+    let icmpk_on = crate::pass_enabled("PLIRON_ICMPK");
+    let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
+    let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM");
+    if !icmpk_on && !icmpred_on && !addnorm_on {
+        return n;
+    }
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            match pos.func.dfg.insts[inst] {
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond,
+                    args,
+                } => {
+                    if icmpred_on && icmpred(&mut pos, inst, cond, args) {
+                        n += 1;
+                        continue;
+                    }
+                    if !icmpk_on || !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+                        continue;
+                    }
+                    let (cc, x, k) = if let Some(c) = iconst(pos.func, args[0]) {
+                        (cond.swap_args(), args[1], Some(c))
+                    } else {
+                        (cond, args[0], iconst(pos.func, args[1]))
+                    };
+                    if let Some(k) = k
+                        && icmpk(&mut pos, inst, cc, x, k)
+                    {
+                        n += 1;
+                    }
+                }
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd | Opcode::Isub,
+                    ..
+                } if addnorm_on => {
+                    n += usize::from(addnorm(&mut pos, inst));
+                }
+                // `brif (select c, 0, 1)` ≡ `brif c` with the targets
+                // swapped (`select c,0,1` is `!c`); `select c,1,0` is
+                // `c` — the `is-some` tests the iter machinery emits.
+                InstructionData::Brif { arg, .. } => {
+                    let s = pos.func.dfg.resolve_aliases(arg);
+                    let Some(d) = pos.func.dfg.value_def(s).inst() else {
+                        continue;
+                    };
+                    let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args: sa,
+                    } = pos.func.dfg.insts[d]
+                    else {
+                        continue;
+                    };
+                    let swap = match (iconst(pos.func, sa[1]), iconst(pos.func, sa[2])) {
+                        (Some(0), Some(1)) => true,
+                        (Some(1), Some(0)) => false,
+                        _ => continue,
+                    };
+                    if let InstructionData::Brif {
+                        arg, blocks, ..
+                    } = &mut pos.func.dfg.insts[inst]
+                    {
+                        *arg = sa[0];
+                        if swap {
+                            blocks.swap(0, 1);
+                        }
+                        n += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // The folds above strand fresh dead values (`icmpk`'s collapsed
+    // spines, `brif`-dropped selects, `bitmerge`'s inner links) — one
+    // more reap, params first so arg-held values can die too.
+    if crate::pass_enabled("PLIRON_POSTSWEEP") {
+        let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+        crate::jumpthread::remove_dead_params(func, &cfg);
+        n += crate::jumpthread::remove_dead_insts(func, true);
+    }
+    n
+}
+
 /// `iconst.i128` is legal CLIF but no target lowers it (the aarch64 ISLE
 /// `imm` helper has no I128 rule, so it panics in isel). Any pass that
 /// materializes a scalar constant through `iconst(ty, …)` can mint one —
 /// sweep the whole function last rather than audit every emitter. The
 /// Imm64 sign-extends, so the high half is `k >> 63`.
+///
+/// Runs last in the pipeline, so it also drives `post_sweep`
+/// (`PLIRON_POSTSWEEP=0` off): the dead-inst/identity/covered-mask
+/// residue late passes leave for the emitter.
 pub fn iconst128(func: &mut Function) -> usize {
     let mut n = 0;
     let mut pos = FuncCursor::new(func);
@@ -7289,6 +7992,9 @@ pub fn iconst128(func: &mut Function) -> usize {
             pos.func.replace(inst).iconcat(lo, hi);
             n += 1;
         }
+    }
+    if crate::pass_enabled("PLIRON_POSTSWEEP") {
+        n += post_sweep(func);
     }
     n
 }
