@@ -941,9 +941,9 @@ pub fn run(func: &mut Function) -> usize {
     if crate::pass_enabled("PLIRON_EQRANGE") {
         n += eqrange(func);
     }
+    let mut cd = crate::jumpthread::Cd::new();
     loop {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dom = DominatorTree::with_function(func, &cfg);
+        let (cfg, dom) = cd.get(func);
         // value -> blocks using it
         let mut ublocks: FxHashMap<Value, FxHashSet<Block>> = FxHashMap::default();
         for b in func.layout.blocks() {
@@ -1052,10 +1052,12 @@ pub fn run(func: &mut Function) -> usize {
             func.layout.remove_block(b);
         }
         n += 1;
+        // Fold rewrote edges — refresh cfg/dom in place next round.
+        cd.stale();
     }
     if n > 0 {
         crate::edgespec::sweep_dead(func);
-        crate::edgespec::sweep_blocks(func);
+        crate::edgespec::sweep_blocks(func, &mut cd);
     }
     n
 }

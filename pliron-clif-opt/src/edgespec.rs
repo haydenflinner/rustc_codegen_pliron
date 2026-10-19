@@ -1149,9 +1149,12 @@ fn emit_args(cur: &mut FuncCursor, args: &[A]) -> Vec<BlockArg> {
 }
 
 /// Drop unreachable blocks (folds can orphan whole dispatch chains).
-pub fn sweep_blocks(func: &mut Function) {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+/// `cd` is marked stale + refreshed: callers invoke this only after
+/// mutations, so the rebuild cost is what a private build paid while
+/// the backing storage persists.
+pub fn sweep_blocks(func: &mut Function, cd: &mut crate::jumpthread::Cd) {
+    cd.stale();
+    let (cfg, dom) = cd.get(func);
     let dead: Vec<Block> = func
         .layout
         .blocks()
@@ -1173,12 +1176,11 @@ pub fn sweep_dead(func: &mut Function) {
     });
 }
 
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, cd: &mut crate::jumpthread::Cd) -> usize {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::edgespec", tracing::Level::INFO);
     let t0 = prof.then(std::time::Instant::now);
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+    let (cfg, dom) = cd.get(func);
     // All-pure blocks — plans are collected before any apply, so this
     // stays valid for every `plan` below.
     let mut pure_blocks: FxHashSet<Block> = FxHashSet::default();
@@ -1273,23 +1275,22 @@ pub fn run(func: &mut Function) -> usize {
     }
     let tp = prof.then(std::time::Instant::now);
     if n > 0 {
-        sweep_blocks(func);
+        sweep_blocks(func, cd);
         sweep_dead(func);
     }
     // `n == 0` means nothing mutated since `cfg`/`dom` were built at the
-    // top — reuse them. Otherwise the walker redirects and sweeps
-    // changed edges/blocks: rebuild so dominance answers match the
-    // current graph.
-    let s = if n == 0 {
-        splices(func, &cfg, &dom)
-    } else {
-        let cfg2 = ControlFlowGraph::with_function(func);
-        let dom2 = DominatorTree::with_function(func, &cfg2);
-        splices(func, &cfg2, &dom2)
+    // top — `cd.get` hands the same pair back. Otherwise the walker
+    // redirected edges: mark stale so the refresh matches the graph.
+    let s = {
+        if n > 0 {
+            cd.stale();
+        }
+        let (c, d) = cd.get(func);
+        splices(func, c, d)
     };
     n += s;
     if s > 0 {
-        sweep_blocks(func);
+        sweep_blocks(func, cd);
         sweep_dead(func);
     }
     if prof {
@@ -1300,12 +1301,13 @@ pub fn run(func: &mut Function) -> usize {
     let tp = prof.then(std::time::Instant::now);
     let d = deadbits(func);
     if d > 0 {
-        crate::jumpthread::remove_dead_params(
-            func,
-            &cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func),
-        );
+        cd.stale();
+        {
+            let (c, _) = cd.get(func);
+            crate::jumpthread::remove_dead_params(func, c);
+        }
         sweep_dead(func);
-        sweep_blocks(func);
+        sweep_blocks(func, cd);
         n += d;
     }
     if prof {

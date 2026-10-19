@@ -1695,7 +1695,7 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
             tt("rebind", t0);
         }
         let t0 = prof2.then(std::time::Instant::now);
-        n += edgespec::run(&mut p.clctx.func);
+        n += edgespec::run(&mut p.clctx.func, &mut cd);
         tt("espec", t0);
         if crate::pass_enabled("PLIRON_DISPATCHDUP") {
             let t0 = prof2.then(std::time::Instant::now);
@@ -2612,8 +2612,14 @@ fn s_mask01(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `select`/`ireduce`/`icmp eq k` cascades collapse to a `brif` on the
 // flag or a direct edge. Runs before coldedges so any hot->cold edge
 // it creates still gets an adapter.
-fn s_edgespec(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = edgespec::run(&mut p.clctx.func);
+fn s_edgespec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Adopt the shared cache's cfg/dt storage: refreshes inside
+    // edgespec then reuse it rather than allocating afresh.
+    let mut cd = match an.take_cfg_dt(&p.clctx.func) {
+        Some((c, d)) => jumpthread::Cd::from_parts(c, d),
+        None => jumpthread::Cd::new(),
+    };
+    let k = edgespec::run(&mut p.clctx.func, &mut cd);
     if k > 0 && p.dump {
         p.dump("edgespec");
     }

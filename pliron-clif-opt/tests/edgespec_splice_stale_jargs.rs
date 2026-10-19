@@ -77,7 +77,7 @@ fn spliced_pred_jargs_replay_remap() {
     );
     let mut after = before.clone();
     let j = after.layout.blocks().nth(1).unwrap();
-    pliron_clif_opt::edgespec::run(&mut after);
+    pliron_clif_opt::edgespec::run(&mut after, &mut pliron_clif_opt::jumpthread::Cd::new());
     // The splice ran to completion: all of J's preds were redirected and
     // the join block itself is gone.
     assert!(

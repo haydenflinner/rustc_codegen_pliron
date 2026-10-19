@@ -4161,13 +4161,18 @@ pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
 pub struct Cd(Option<(ControlFlowGraph, DominatorTree)>, bool);
 
 impl Cd {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Cd(None, false)
     }
-    pub(crate) fn stale(&mut self) {
+    /// Adopt an already-built pair (e.g. `Analysis::take_cfg_dt`) so a
+    /// pass's refreshes reuse the shared cache's storage.
+    pub fn from_parts(c: ControlFlowGraph, d: DominatorTree) -> Self {
+        Cd(Some((c, d)), false)
+    }
+    pub fn stale(&mut self) {
         self.1 = true;
     }
-    pub(crate) fn get<'a>(
+    pub fn get<'a>(
         &'a mut self,
         func: &Function,
     ) -> (&'a ControlFlowGraph, &'a DominatorTree) {
@@ -4182,12 +4187,12 @@ impl Cd {
         let (c, d) = self.0.as_ref().unwrap();
         (c, d)
     }
-    pub(crate) fn as_ref(&self) -> Option<(&ControlFlowGraph, &DominatorTree)> {
+    pub fn as_ref(&self) -> Option<(&ControlFlowGraph, &DominatorTree)> {
         (!self.1)
             .then(|| self.0.as_ref().map(|(c, d)| (&*c, &*d)))
             .flatten()
     }
-    pub(crate) fn as_mut(&mut self) -> Option<(&mut ControlFlowGraph, &mut DominatorTree)> {
+    pub fn as_mut(&mut self) -> Option<(&mut ControlFlowGraph, &mut DominatorTree)> {
         (!self.1)
             .then(|| self.0.as_mut().map(|(c, d)| (&mut *c, &mut *d)))
             .flatten()

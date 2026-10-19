@@ -47,7 +47,7 @@ fn back_edge_into_header_keeps_old_param_values() {
         }",
     );
     let mut after = before.clone();
-    pliron_clif_opt::edgespec::run(&mut after);
+    pliron_clif_opt::edgespec::run(&mut after, &mut pliron_clif_opt::jumpthread::Cd::new());
     let cfg = Config {
         trials: 128,
         ..Config::default()
