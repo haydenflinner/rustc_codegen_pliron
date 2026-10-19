@@ -23,12 +23,23 @@ Logs: target/gate/<job>.log; summary: target/gate/summary.json (read by the
 live dashboard). Exit status is nonzero when any job fails. Bypass the hook
 with `git push --no-verify` — and say so in the commit/ledger.
 """
-import argparse, concurrent.futures as cf, json, os, re, subprocess, sys, time
+import argparse, concurrent.futures as cf, json, os, re, shutil, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "target/gate")
 KNOWN = os.path.join(ROOT, "harness/expectations/corpus-known.txt")
-CLIF_CHECK = os.path.join(ROOT, "target/debug/clif-check")
+WIN = os.name == "nt"
+CLIF_CHECK = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "clif-check")
+# Bash for .sh legs: CreateProcess doesn't honor `#!/bin/sh`, so the
+# shell scripts need an explicit interpreter on Windows.
+BASH = shutil.which("bash") or shutil.which("sh")
+
+
+def shell(cmd):
+    """Prefix `bash`/`sh` for `.sh` commands on Windows (no shebang exec)."""
+    if WIN and cmd and cmd[0].endswith(".sh"):
+        return [(BASH or "bash")] + [cmd[0].replace("./", "", 1) if cmd[0].startswith("./") else cmd[0]] + cmd[1:]
+    return cmd
 
 
 def stanzas():
@@ -73,7 +84,7 @@ def install_hook():
     path = os.path.join(ROOT, hooks, "hooks", "pre-push")
     with open(path, "w") as f:
         f.write("#!/bin/sh\n# Installed by harness/gate.py --install-hook. Bypass: git push --no-verify\n"
-                "exec harness/gate.py\n")
+                "exec python harness/gate.py\n")
     os.chmod(path, 0o755)
     print(f"gate: installed {path}")
 
@@ -114,7 +125,7 @@ def main():
         sys.exit("gate: build failed")
     if a.record:
         for s in ("smoke", "std"):
-            summary["jobs"].append(run(f"record:{s}", ["harness/corpus.sh", s]))
+            summary["jobs"].append(run(f"record:{s}", shell(["harness/corpus.sh", s])))
     skip = set(filter(None, a.skip.split(",")))
     only = set(filter(None, a.only.split(",")))
     want = lambda n: (not only or n in only or n.split(":")[0] in only) and n not in skip and n.split(":")[0] not in skip
@@ -126,11 +137,11 @@ def main():
     order = sorted(stanzas(), key=lambda n: n not in ("pgo", "std", "unwind"))
     for n in order:
         if want(n):
-            jobs.append((n, lambda n=n: run(n, ["./test.sh", f"--only={n}"], {"TEST_NOBUILD": "1"})))
+            jobs.append((n, lambda n=n: run(n, shell(["./test.sh", f"--only={n}"]), {"TEST_NOBUILD": "1"})))
     # The wasm sysroot leg is opt-in: four -Zbuild-std builds per backend
     # change makes it ~10x every other job. wasm_smoke covers emit->link->run.
     if (a.full or "wasm" in only) and "wasm" not in skip:
-        jobs.append(("wasm", lambda: run("wasm", ["./test.sh", "--only=wasm"],
+        jobs.append(("wasm", lambda: run("wasm", shell(["./test.sh", "--only=wasm"]),
                                          {"TEST_NOBUILD": "1"})))
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
