@@ -448,18 +448,6 @@ impl Operation {
         })
     }
 
-    /// PLIRON: mutable operand-node slice borrowed from the context
-    /// pool (crate-internal write hatch).
-    #[inline]
-    pub(crate) fn operands_slice_mut<'a>(
-        &self,
-        ctx: &'a Context,
-    ) -> core::cell::RefMut<'a, [Operand<Value>]> {
-        core::cell::RefMut::map(ctx.op_operand_pool.borrow_mut(), |pool| {
-            &mut pool[self.operands.range()]
-        })
-    }
-
     /// PLIRON: collect this op's operand defs.
     fn operand_defs(&self, ctx: &Context) -> Vec<Value> {
         self.operands_slice(ctx)
@@ -558,18 +546,6 @@ impl Operation {
     ) -> core::cell::Ref<'a, [Operand<Ptr<BasicBlock>>]> {
         core::cell::Ref::map(ctx.op_successor_pool.borrow(), |pool| {
             &pool[self.successors.range()]
-        })
-    }
-
-    /// PLIRON: mutable successor-node slice borrowed from the context
-    /// pool (crate-internal write hatch).
-    #[inline]
-    pub(crate) fn successors_slice_mut<'a>(
-        &self,
-        ctx: &'a Context,
-    ) -> core::cell::RefMut<'a, [Operand<Ptr<BasicBlock>>]> {
-        core::cell::RefMut::map(ctx.op_successor_pool.borrow_mut(), |pool| {
-            &mut pool[self.successors.range()]
         })
     }
 

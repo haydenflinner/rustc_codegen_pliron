@@ -349,6 +349,25 @@ pub mod shape {
     /// (`slotprom`'s stack accesses, `loopidiom`/`clifpeep`'s libcalls,
     /// vectorizers) declare `creates_all` instead.
     pub const CREATED: u32 = MULTI | LOOPS | CONDBR | BPARAM | JUMP | TESTC | BLOCKS2 | ICONST;
+    /// Every settable bit — `shape_of` early-exits its scan once all
+    /// are proven, which happens quickly on large functions.
+    pub const ALL: u32 = MULTI
+        | LOOPS
+        | CONDBR
+        | SWITCH
+        | MEM
+        | CALL
+        | SLP
+        | DIVREM
+        | BPARAM
+        | JUMP
+        | LOAD
+        | STORE
+        | TESTC
+        | BLOCKS2
+        | ICONST
+        | SLOT
+        | EPARAM;
 }
 
 /// Computes the `shape` bits in one pass over the function.
@@ -372,17 +391,22 @@ pub(crate) fn shape_of(func: &Function) -> u32 {
         idx[b.index()] = i as u32;
     }
     for (i, b) in func.layout.blocks().enumerate() {
+        if bits & shape::ALL == shape::ALL {
+            break;
+        }
         if Some(b) != entry && func.dfg.num_block_params(b) > 0 {
             bits |= shape::BPARAM;
         }
         // (base, elem bytes) → store count: a pair in one group is the
-        // cheap necessary shape for every store-pack path.
-        let mut stores: FxHashMap<(Value, u32), u32> = FxHashMap::default();
+        // cheap necessary shape for every store-pack path. Lazy: most
+        // blocks have no stores at all, and two hashmaps per block was
+        // ~10k empty allocs on megafunctions.
+        let mut stores: Option<FxHashMap<(Value, u32), u32>> = None;
         // Same-op float-inst count → xpack op-pair seed. Integer dups are
         // excluded on purpose: two `iadd`s in a block is ambient pointer
         // arithmetic (every address computation), while float dups are
         // the unrolled-math shape xpack actually packs.
-        let mut vecops: FxHashMap<Op, u32> = FxHashMap::default();
+        let mut vecops: Option<FxHashMap<Op, u32>> = None;
         for inst in func.layout.block_insts(b) {
             let op = func.dfg.insts[inst].opcode();
             // `stack_addr` reports neither load nor store but marks a
@@ -410,14 +434,17 @@ pub(crate) fn shape_of(func: &Function) -> u32 {
                 // `icmp` over-reports (no per-arg walk in `shape_of`)
                 // but stays a sound necessary condition.
                 Op::Icmp => bits |= shape::TESTC,
-                Op::Store => {
+                Op::Store if bits & shape::SLP == 0 => {
                     let fl = func.dfg.mem_flags[func.dfg.insts[inst].memflags().unwrap()];
                     let args = func.dfg.inst_args(inst);
                     let val = func.dfg.resolve_aliases(args[0]);
                     let ty = func.dfg.value_type(val);
                     if fl.notrap() && !ty.is_vector() && matches!(ty.bytes(), 1 | 2 | 4 | 8) {
                         let base = crate::slp::base_off(func, args[1]).0;
-                        let c = stores.entry((base, ty.bytes())).or_insert(0);
+                        let c = stores
+                            .get_or_insert_with(FxHashMap::default)
+                            .entry((base, ty.bytes()))
+                            .or_insert(0);
                         *c += 1;
                         if *c >= 2 {
                             bits |= shape::SLP;
@@ -435,8 +462,13 @@ pub(crate) fn shape_of(func: &Function) -> u32 {
                 | Op::Fmax
                 | Op::Fneg
                 | Op::Fabs
-                | Op::Sqrt => {
-                    let c = vecops.entry(op).or_insert(0);
+                | Op::Sqrt
+                    if bits & shape::SLP == 0 =>
+                {
+                    let c = vecops
+                        .get_or_insert_with(FxHashMap::default)
+                        .entry(op)
+                        .or_insert(0);
                     *c += 1;
                     if *c >= 2 {
                         bits |= shape::SLP;
@@ -446,11 +478,12 @@ pub(crate) fn shape_of(func: &Function) -> u32 {
             }
             // Vector-typed results (a function loopvec already rewrote)
             // leave scalar leftovers worth packing.
-            if func
-                .dfg
-                .inst_results(inst)
-                .first()
-                .is_some_and(|&r| func.dfg.value_type(r).is_vector())
+            if bits & shape::SLP == 0
+                && func
+                    .dfg
+                    .inst_results(inst)
+                    .first()
+                    .is_some_and(|&r| func.dfg.value_type(r).is_vector())
             {
                 bits |= shape::SLP;
             }
