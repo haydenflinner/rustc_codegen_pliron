@@ -2270,6 +2270,330 @@ fn peep_body_opts(
         }
         prel.clear();
     }
+    // `walias` — operand-stack-aware locals cancellation, phase 1
+    // (straight-line spans). Four rewrites:
+    //
+    //   (B) `set T … get T` where T's value never leaves the stack
+    //       (net effect 0 back to v's slot, never underflowing it) —
+    //       `Del` both: the producer's value flows to the get's
+    //       consumer without touching T. A second `get T` forces the
+    //       pair back (tracked in `canceled`).
+    //   `get T; drop` → `Del` both — the pushed copy is discarded.
+    //   `set T`/`tee T` never `get` before their next write →
+    //       `Drop`/`Del` (dead local write — `drop` keeps the same
+    //       stack effect for `set`; `tee` is net-0 so it deletes).
+    //   `set T(get U)`/`tee T(get U)` → `get T` rewrites to `get U`
+    //       while neither local is rewritten (copymap).
+    //
+    // `vstack` abstracts the operand stack — each entry is the local
+    // whose value it holds (`Named`, pushed by `get`/`tee`) or `OTHER`.
+    // `pend` holds live `set T` candidates (ins idx, v's slot, running
+    // min-depth); `canceled` remembers deleted pairs so a second
+    // `get T` restores them; `last_write`/`loop_gets` feed the
+    // dead-write checks (a `get` inside a containing loop reads the
+    // in-loop write via the backedge).
+    if crate::env_get("PLIRON_WASM_WALIAS") != Some("0") {
+        // Mode bits: 1=set/get pair-cancel, 2=get;drop, 4=dead-write,
+        // 8=copy-forward. Pair-cancel is parked at 14 — its phantom-slot
+        // model still miscompiles around multi-value calls/branches.
+        let wmode: u32 = crate::env_get("PLIRON_WASM_WALIAS_MODE")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(14);
+        const OTHER: u32 = u32::MAX;
+        // `None` = opaque (bail at decode anyway for the weird ops);
+        // the walk treats it as a span boundary, never a miscount.
+        let eff = |s: usize| -> Option<(u32, u32)> {
+            let op = b[s];
+            Some(match op {
+                0x01 => (0, 0),
+                0x1a => (1, 0),
+                0x1b | 0x1c => (3, 1),               // select
+                0x23 => (0, 1),                      // global.get
+                0x24 => (1, 0),                      // global.set
+                0x25 => (1, 1),                      // table.get
+                0x26 => (2, 0),                      // table.set
+                0x28..=0x35 => (1, 1),               // loads
+                0x36..=0x3e => (2, 0),               // stores
+                0x3f => (0, 1),                      // memory.size
+                0x40 => (1, 1),                      // memory.grow
+                0x41..=0x44 => (0, 1),               // consts
+                0x45 | 0x50 => (1, 1),               // eqz
+                0x46..=0x4f | 0x51..=0x66 => (2, 1), // compares
+                0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => (1, 1),
+                0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => (2, 1),
+                0xa7..=0xc4 => (1, 1), // conversions
+                0xd0 | 0xd2 => (0, 1), // ref.null / ref.func
+                0xd1 => (1, 1),        // ref.is_null
+                0xfc => match b.get(s + 1).copied().unwrap_or(0) {
+                    0..=7 => (1, 1),                  // trunc_sat*
+                    8 | 10 | 11 | 12 | 14 | 17 => (3, 0), // mem.init/copy/fill, table.*
+                    9 | 13 => (0, 0),                 // data.drop / elem.drop
+                    15 => (2, 1),                     // table.grow
+                    16 => (0, 1),                     // table.size
+                    _ => return None,
+                },
+                _ => return None,
+            })
+        };
+        // Loop spans (for the backedge-read rule) + per-loop locals read.
+        let mut ctl_stk: Vec<usize> = Vec::new();
+        let mut loop_spans: Vec<(usize, usize)> = Vec::new();
+        for (i, &(k, s, ..)) in ins.iter().enumerate() {
+            if !matches!(k, WPeek::Ctl) {
+                continue;
+            }
+            match b[s] {
+                0x02 | 0x03 | 0x04 => ctl_stk.push(i),
+                0x0b => {
+                    if let Some(k2) = ctl_stk.pop()
+                        && b[ins[k2].1] == 0x03
+                    {
+                        loop_spans.push((k2, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // For each local, the set of loop spans containing a `get` —
+        // a `set`/`tee` inside any of those loops is backedge-read.
+        let mut loop_read: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+        let mut enclosers: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        for (li, &(k, e)) in loop_spans.iter().enumerate() {
+            for i in (k + 1)..e {
+                if let WPeek::Get(l) = ins[i].0 {
+                    loop_read.entry(l).or_default().insert(li);
+                }
+                enclosers.entry(i).or_default().push(li);
+            }
+        }
+        // `pi` is backedge-read iff some enclosing loop reads `t`.
+        let loop_reads = |pi: usize, t: u32| -> bool {
+            let Some(loops) = enclosers.get(&pi) else {
+                return false;
+            };
+            let Some(read) = loop_read.get(&t) else {
+                return false;
+            };
+            loops.iter().any(|li| read.contains(li))
+        };
+        if crate::env_set("PLIRON_WASM_SFWD_DBG") {
+            for (i, &(k, s, ..)) in ins.iter().enumerate() {
+                eprintln!("  walias-ins[{i}] {k:?} op={:02x}", b[s]);
+            }
+        }
+        let mut vstack: Vec<u32> = Vec::new();
+        let mut pend: FxHashMap<u32, (usize, usize, usize)> = FxHashMap::default();
+        let mut canceled: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+        let mut copymap: FxHashMap<u32, u32> = FxHashMap::default();
+        // local -> (ins idx, is_tee, was-read)
+        let mut last_write: FxHashMap<u32, (usize, bool, bool)> = FxHashMap::default();
+        let mut dels: FxHashSet<usize> = FxHashSet::default();
+        let mut drops: Vec<usize> = Vec::new();
+        let mut rewrites: Vec<(usize, WPeek)> = Vec::new();
+        for i in 0..ins.len() {
+            match ins[i].0 {
+                WPeek::Del => continue,
+                WPeek::Nop(l) => {
+                    // `Nop` is a deleted `get l; set l` self-copy — a
+                    // real use of `l` for dead-write purposes.
+                    if let Some(lw) = last_write.get_mut(&l) {
+                        lw.2 = true;
+                    }
+                    continue;
+                }
+                WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
+                    // `copymap`/`last_write` are path-sensitive: a
+                    // `set` on one arm doesn't dominate `get`s on the
+                    // other side of the merge. `canceled` survives —
+                    // a `get T` anywhere must restore its pair since
+                    // the `Del`'d `set` may be T's only writer.
+                    vstack.clear();
+                    pend.clear();
+                    copymap.clear();
+                    last_write.clear();
+                    continue;
+                }
+                WPeek::Drop => {
+                    vstack.pop();
+                }
+                WPeek::Set(t) | WPeek::Tee(t) => {
+                    let is_tee = matches!(ins[i].0, WPeek::Tee(_));
+                    // T reassigned: kill pending/canceled/copy facts and
+                    // demote `Named(T)` stack entries (they hold OLD T).
+                    pend.remove(&t);
+                    canceled.remove(&t);
+                    copymap.retain(|&k, &mut v| k != t && v != t);
+                    for e in vstack.iter_mut() {
+                        if *e == t {
+                            *e = OTHER;
+                        }
+                    }
+                    // Flush the previous unread write.
+                    if let Some(&(pi, ptee, read)) = last_write.get(&t)
+                        && !read
+                    {
+                        let dead = wmode & 4 != 0 && !loop_reads(pi, t);
+                        if dead {
+                            if ptee {
+                                dels.insert(pi);
+                            } else {
+                                drops.push(pi);
+                            }
+                        }
+                    }
+                    let popped = vstack.pop();
+                    if let Some(u) = popped
+                        && u != OTHER
+                    {
+                        copymap.insert(t, u);
+                    }
+                    if is_tee {
+                        vstack.push(t);
+                    } else if popped.is_some() {
+                        // Only a *tracked* operand can be canceled: when
+                        // `vstack` is empty the value came from an
+                        // unknown source (multi-value call results,
+                        // block params), and deleting the `set` would
+                        // leave it for the next consumer to mis-pop.
+                        pend.insert(t, (i, vstack.len(), vstack.len()));
+                    }
+                    last_write.insert(t, (i, is_tee, false));
+                }
+                WPeek::Get(t) => {
+                    // A second `get T` resurrects a canceled pair.
+                    if let Some(&(si, gi)) = canceled.get(&t) {
+                        dels.remove(&si);
+                        dels.remove(&gi);
+                        canceled.remove(&t);
+                        last_write.insert(t, (si, false, true));
+                    }
+                    // `get T; drop` — the pushed copy is discarded.
+                    // (`0x1a` decodes as `Other`, not `WPeek::Drop`.)
+                    let mut j = i + 1;
+                    while matches!(ins.get(j).map(|x| x.0), Some(WPeek::Del | WPeek::Nop(_))) {
+                        j += 1;
+                    }
+                    if wmode & 2 != 0
+                        && (matches!(ins.get(j).map(|x| x.0), Some(WPeek::Drop))
+                        || ins
+                            .get(j)
+                            .is_some_and(|x| matches!(x.0, WPeek::Other) && b[x.1] == 0x1a))
+                    {
+                        dels.insert(i);
+                        dels.insert(j);
+                        continue;
+                    }
+                    // (B) `set T` candidate: v sits at slot `dv` and
+                    // never underflowed.
+                    if wmode & 1 != 0
+                        && let Some(&(si, dv, mn)) = pend.get(&t)
+                        && vstack.len() == dv
+                        && mn >= dv
+                    {
+                        dels.insert(si);
+                        dels.insert(i);
+                        pend.remove(&t);
+                        canceled.insert(t, (si, i));
+                        last_write.insert(t, (si, false, true));
+                        // Model the would-be push so the consumer pops
+                        // the right entry — in the emitted stream it
+                        // reads the `set`'s kept value at slot `dv`.
+                        vstack.push(t);
+                        continue;
+                    }
+                    pend.remove(&t);
+                    // Copy-forward `get T` -> `get U`.
+                    let v = match copymap.get(&t) {
+                        Some(&u) if wmode & 8 != 0 => u,
+                        _ => t,
+                    };
+                    rewrites.push((i, WPeek::Get(v)));
+                    if let Some(lw) = last_write.get_mut(&v) {
+                        lw.2 = true;
+                    }
+                    vstack.push(v);
+                }
+                WPeek::Other => {
+                    let Some((pops, pushes)) = eff(ins[i].1) else {
+                        vstack.clear();
+                        pend.clear();
+                        copymap.clear();
+                        last_write.clear();
+                        continue;
+                    };
+                    for _ in 0..pops {
+                        vstack.pop();
+                    }
+                    for _ in 0..pushes {
+                        vstack.push(OTHER);
+                    }
+                }
+            }
+            // A dip below a pending set's value slot kills it — in the
+            // deleted-set world the value would have been consumed.
+            let len = vstack.len();
+            pend.retain(|_, &mut (_, dv, ref mut mn)| {
+                *mn = (*mn).min(len);
+                *mn >= dv
+            });
+        }
+        // End-of-body flush: unread writes are dead.
+        for (&t, &(pi, ptee, read)) in last_write.iter() {
+            if read {
+                continue;
+            }
+            if wmode & 4 == 0 || loop_reads(pi, t) {
+                continue;
+            }
+            if ptee {
+                dels.insert(pi);
+            } else {
+                drops.push(pi);
+            }
+        }
+        if crate::env_set("PLIRON_WASM_SFWD_DBG") {
+            eprintln!(
+                "walias: dels={:?} drops={:?} rewrites={:?}",
+                dels.iter().collect::<Vec<_>>(),
+                drops,
+                rewrites
+            );
+        }
+        // A `set` in both sets must stay `Del` — the canceled pair
+        // needs the value flowing, not dropped.
+        for i in drops {
+            if !dels.contains(&i) {
+                ins[i].0 = WPeek::Drop;
+            }
+        }
+        for i in dels {
+            ins[i].0 = WPeek::Del;
+        }
+        for (i, k) in rewrites {
+            ins[i].0 = k;
+        }
+        // Emit-model balance check: replay the rewritten stream —
+        // `Del` on a `set` keeps its value (push), on a `get` removes
+        // a push; `Drop` pops. Any underflow means a dels bug.
+        if crate::env_set("PLIRON_WASM_SFWD_DBG") {
+            let mut d = 0i32;
+            for (i, &(k, s, ..)) in ins.iter().enumerate() {
+                let (p, u) = match k {
+                    WPeek::Del | WPeek::Nop(_) => (0, 0),
+                    WPeek::Get(_) => (0, 1),
+                    WPeek::Set(_) => (1, 0),
+                    WPeek::Tee(_) => (1, 1),
+                    WPeek::Drop => (1, 0),
+                    WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => (0, 0),
+                    WPeek::Other => eff(s).unwrap_or((0, 0)),
+                };
+                d = d - p as i32 + u as i32;
+                if d < 0 {
+                    eprintln!("  walias-UNDERFLOW@{i} {k:?} op={:02x}", b[s]);
+                }
+            }
+        }
+    }
     // Store→load forwarding through a provably-stable base local: the
     // frame-resident aggregate splice leaves `get fp; get v; store +K`
     // … `get fp; load +K` — the load re-reads bytes the store just
@@ -3579,6 +3903,45 @@ mod wpeep_tests {
             .filter(|&k| out[k] == 0x36 && out[k + 1] == 0x02 && out[k + 2] == 0x00)
             .count();
         assert_eq!(cnt, 2, "store count: {out:02x?}");
+    }
+
+    #[test]
+    fn walias_body_file() {
+        let Ok(path) = std::env::var("WALIAS_BODY") else {
+            return;
+        };
+        let mut paths: Vec<_> = if std::path::Path::new(&path).is_dir() {
+            std::fs::read_dir(&path)
+                .unwrap()
+                .filter_map(|e| {
+                    let p = e.unwrap().path();
+                    p.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .ends_with("_pre.bin")
+                        .then_some(p)
+                })
+                .collect()
+        } else {
+            vec![std::path::PathBuf::from(&path)]
+        };
+        paths.sort_by_key(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_start_matches("body_")
+                .trim_end_matches("_pre.bin")
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+        });
+        for p in paths {
+            let b = std::fs::read(&p).unwrap();
+            let out = peep_body(&b, &[], &[], 0).unwrap();
+            std::fs::write(format!("{}.out", p.display()), &out).unwrap();
+            eprintln!("wrote {}.out ({} -> {} bytes)", p.display(), b.len(), out.len());
+        }
     }
 }
 
