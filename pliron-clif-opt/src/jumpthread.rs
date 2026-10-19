@@ -325,6 +325,12 @@ pub struct NonNull<'a> {
     /// `PLIRON_NN_ADDR`, read once — `pass_enabled` does a TLS-tracked
     /// lookup per call, which is too hot inside `is_deps`.
     nn_addr: bool,
+    /// `PLIRON_NN_ANYINT`: seed scalar-int params of every width, not just
+    /// i64 — wasm32 iterator pointers are i32, and a `!= 0` proof is
+    /// width-agnostic anyway (`non_zero_const` masks to the value's own
+    /// width). The i64-only seed left wasm's `Option`-niche `eqz(ptr)`
+    /// tests unfolded.
+    nn_anyint: bool,
 }
 
 impl<'a> NonNull<'a> {
@@ -339,6 +345,7 @@ impl<'a> NonNull<'a> {
             derived,
             params: FxHashSet::default(),
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
+            nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
         };
         if loads.is_empty() {
             return nn;
@@ -351,7 +358,11 @@ impl<'a> NonNull<'a> {
                         .block_params(b)
                         .iter()
                         .copied()
-                        .filter(|&p| func.dfg.value_type(p) == types::I64),
+                        .filter(|&p| {
+                            let ty = func.dfg.value_type(p);
+                            ty == types::I64
+                                || (nn.nn_anyint && ty.is_int() && ty.bits() <= 64)
+                        }),
                 );
             }
         }
@@ -4254,11 +4265,140 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::remove_dead_params;
+    use super::{NonNull, fold_null_tests, remove_dead_params};
     use cranelift_codegen::flowgraph::ControlFlowGraph;
     use cranelift_codegen::ir::condcodes::IntCC;
-    use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, types};
+    use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, InstructionData, Opcode, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    /// wasm32 `Chars::next`'s residual: the iter `ptr` is an i32 loop
+    /// param proven non-null by its `!nonnull` entry seed and the
+    /// inbounds-advance back edge, so `p == 0` (the `Option<&u8>` niche
+    /// test after `ptr == end` already branched) must fold to false.
+    /// The old `I64`-only param seed left it live at i32 width.
+    #[test]
+    fn nonnull_seed_admits_i32_params() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (p, null_test, np) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let head = builder.create_block();
+            let chk = builder.create_block();
+            let body = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(entry, types::I32); // ptr (nonnull)
+            builder.append_block_param(entry, types::I32); // end
+            builder.append_block_param(head, types::I32); // merged ptr
+
+            builder.switch_to_block(entry);
+            let v0 = builder.block_params(entry)[0];
+            builder.ins().jump(head, &[v0.into()]);
+
+            builder.switch_to_block(head);
+            let p = builder.block_params(head)[0];
+            let end = builder.block_params(entry)[1];
+            let endc = builder.ins().icmp(IntCC::Equal, p, end);
+            builder.ins().brif(endc, exit, &[], chk, &[]);
+
+            builder.switch_to_block(chk);
+            let z = builder.ins().iconst(types::I32, 0);
+            let null_test = builder.ins().icmp(IntCC::Equal, p, z);
+            builder.ins().brif(null_test, exit, &[], body, &[]);
+
+            builder.switch_to_block(body);
+            let np = builder.ins().iadd_imm_s(p, 1);
+            builder.ins().jump(head, &[np.into()]);
+
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (p, null_test, np)
+        };
+
+        // `v0` stands in for a `!nonnull`-marked value (`nnargs`-seeded
+        // `&str` data ptr); `np` is the inbounds `ptr + 1` advance.
+        let loads: FxHashSet<_> = [func.dfg.block_params(
+            func.layout.entry_block().unwrap(),
+        )[0]]
+        .into_iter()
+        .collect();
+        let derived: FxHashMap<_, _> = [(np, p)].into_iter().collect();
+        let cfg = ControlFlowGraph::with_function(&func);
+        let nn = NonNull::new(&func, &cfg, &loads, &derived);
+        assert!(nn.is(&func, p), "i32 loop param should prove non-null");
+
+        assert_eq!(fold_null_tests(&mut func, &nn), 1);
+        let di = func.dfg.value_def(null_test).inst().unwrap();
+        assert!(matches!(
+            func.dfg.insts[di],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm
+            } if imm.bits() == 0
+        ));
+    }
+
+    /// The phi form of the same niche test: `p` merges `0` (None arm)
+    /// with a non-null ptr (Some arm), so `p == 0` is the guarding
+    /// `brif c` itself.
+    #[test]
+    fn param_null_test_maps_to_guard() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (c, null_test, merge) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let none_b = builder.create_block();
+            let some_b = builder.create_block();
+            let merge = builder.create_block();
+            let cont = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(entry, types::I32); // ptr (nonnull)
+            builder.append_block_param(entry, types::I32); // end
+            builder.append_block_param(merge, types::I32); // byte_ptr
+
+            builder.switch_to_block(entry);
+            let v0 = builder.block_params(entry)[0];
+            let v1 = builder.block_params(entry)[1];
+            let c = builder.ins().icmp(IntCC::Equal, v0, v1);
+            builder.ins().brif(c, none_b, &[], some_b, &[]);
+
+            builder.switch_to_block(none_b);
+            let z = builder.ins().iconst(types::I32, 0);
+            builder.ins().jump(merge, &[z.into()]);
+
+            builder.switch_to_block(some_b);
+            builder.ins().jump(merge, &[v0.into()]);
+
+            builder.switch_to_block(merge);
+            let p = builder.block_params(merge)[0];
+            let z2 = builder.ins().iconst(types::I32, 0);
+            let null_test = builder.ins().icmp(IntCC::Equal, p, z2);
+            builder.ins().brif(null_test, exit, &[], cont, &[]);
+
+            builder.switch_to_block(cont);
+            builder.ins().return_(&[]);
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (c, null_test, merge)
+        };
+        let _ = merge;
+
+        let loads: FxHashSet<_> =
+            [func.dfg.block_params(func.layout.entry_block().unwrap())[0]]
+                .into_iter()
+                .collect();
+        let derived: FxHashMap<_, _> = Default::default();
+        let cfg = ControlFlowGraph::with_function(&func);
+        let nn = NonNull::new(&func, &cfg, &loads, &derived);
+        // `p == 0` ⟺ the `c`-true edge — the icmp aliases `c`.
+        assert_eq!(fold_null_tests(&mut func, &nn), 1);
+        assert_eq!(func.dfg.resolve_aliases(null_test), c);
+    }
+
 
     #[test]
     fn removes_cycle_only_param_and_keeps_exit_condition_param() {

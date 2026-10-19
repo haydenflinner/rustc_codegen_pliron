@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub struct PassConfig {
     /// Every `PLIRON_*` var present in the environment (raw values).
@@ -87,60 +87,111 @@ impl PassConfig {
 // level) window accumulates the union of its inner (per-step) windows.
 // Reads outside a tracking window cost a TLS borrow-check.
 thread_local! {
-    static READS: std::cell::RefCell<Vec<std::collections::BTreeMap<String, Option<String>>>> =
+    static READS: std::cell::RefCell<Vec<rustc_hash::FxHashMap<String, Option<String>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Read windows open on THIS thread. A global flag would gate on
+    /// other threads' windows: while any worker is inside a pipeline
+    /// frame, every `config()` read on every other thread (lowering,
+    /// emission) falls out of the no-window fast path and pays a TLS
+    /// borrow + frame walk — measured at ~1 s per million reads.
+    static ARMED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// How many read windows are open across all threads. When zero,
-/// `record()` skips its TLS walk entirely — the common case is every
-/// env knob read on the no-stepcache path paying this one atomic load.
-static READS_OPEN: AtomicUsize = AtomicUsize::new(0);
-
-/// True while a read-recording window is open on some thread. Callers
+/// True while a read-recording window is open on this thread. Callers
 /// memoizing an env-derived value must take the real `config()` path
 /// under this so the reads still land in the open windows.
 #[inline]
 pub fn reads_open() -> bool {
-    READS_OPEN.load(Ordering::Relaxed) != 0
+    ARMED.with(|a| a.get() != 0)
 }
 
 /// Open a read-recording frame. Always succeeds — frames nest, and each
 /// frame sees only the reads that happen inside it.
 pub fn reads_begin() -> bool {
-    READS_OPEN.fetch_add(1, Ordering::Relaxed);
+    ARMED.with(|a| a.set(a.get() + 1));
     READS.with(|r| {
         r.borrow_mut().push(Default::default());
         true
     })
 }
 
-/// Close the innermost frame and return its `(var, value)` pairs.
+/// Close the innermost frame and return its `(var, value)` pairs,
+/// sorted so equal read-sets compare equal.
 pub fn reads_take() -> std::collections::BTreeMap<String, Option<String>> {
+    if mcprof() {
+        // Merge this thread's per-key counts — a window close is the
+        // natural batch point, so the global map sees one lock per
+        // window instead of one per recorded read.
+        KEY_COUNTS.with(|m| {
+            let mut m = m.borrow_mut();
+            if !m.is_empty() {
+                let mut g = RECORD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+                for (k, n) in m.drain() {
+                    *g.entry(k).or_default() += n;
+                }
+            }
+        });
+    }
     let m = READS.with(|r| r.borrow_mut().pop());
     if m.is_some() {
-        READS_OPEN.fetch_sub(1, Ordering::Relaxed);
+        ARMED.with(|a| a.set(a.get() - 1));
     }
-    m.unwrap_or_default()
+    m.unwrap_or_default().into_iter().collect()
+}
+
+pub static RECORD_COUNT: AtomicU64 = AtomicU64::new(0);
+static RECORD_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<rustc_hash::FxHashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+thread_local! {
+    static KEY_COUNTS: std::cell::RefCell<rustc_hash::FxHashMap<String, u64>> =
+        Default::default();
+}
+// std::env, not `config()` — the recorder must not re-enter `config()`.
+fn mcprof() -> bool {
+    static PROF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PLIRON_MCPROF").is_some());
+    *PROF
 }
 
 fn record(k: &str, v: Option<&str>) {
     // Cache-machinery knobs are inputs to the cache itself, not to the
     // computation — recording them would tie variants to the cache dir
-    // or log flag rather than to the work performed.
+    // or profiling flags rather than to the work performed.
     if matches!(
         k,
-        "PLIRON_STEPCACHE" | "PLIRON_CACHE_DIR" | "PLIRON_CACHE_LOG"
+        "PLIRON_STEPCACHE" | "PLIRON_CACHE_DIR" | "PLIRON_CACHE_LOG" | "PLIRON_MCPROF"
     ) {
         return;
     }
-    if READS_OPEN.load(Ordering::Relaxed) == 0 {
+    if ARMED.with(|a| a.get() == 0) {
         return;
+    }
+    if mcprof() {
+        RECORD_COUNT.fetch_add(1, Ordering::Relaxed);
+        KEY_COUNTS.with(|m| *m.borrow_mut().entry(k.to_string()).or_default() += 1);
     }
     READS.with(|r| {
         for m in r.borrow_mut().iter_mut() {
-            m.insert(k.to_string(), v.map(str::to_string));
+            // Most calls re-record a key this frame already has — hash
+            // once and skip the String allocs.
+            if !m.contains_key(k) {
+                m.insert(k.to_string(), v.map(str::to_string));
+            }
         }
     });
+}
+
+/// PLIRON_MCPROF: top recorded keys (debug only).
+pub fn record_keys_top() -> Vec<(String, u64)> {
+    let mut v: Vec<_> = RECORD_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, n)| (k.clone(), *n))
+        .collect();
+    v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    v
 }
 
 /// `PLIRON_<PASS>=0` disables a pass at runtime (default on).

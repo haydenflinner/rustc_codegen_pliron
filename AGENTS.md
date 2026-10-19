@@ -188,6 +188,13 @@ time) in ~15 min and writes `target/parity/summary.md`.
 - `PLIRON_STEPCACHE=1` — content-addressed per-step cache
   (`~/.cache/pliron-steps`); keyed on pass sources, vendored Cranelift
   and Cargo.lock, so edits cold-miss.
+- `PLIRON_MEMCACHE=1` — in-process whole-pipeline cache sharing
+  optimization results across CGU-duplicate functions (xcgu copies,
+  shared generics). Symbol-normalized keys, `FuncId` remapping on
+  replay. `PLIRON_MEMCACHE_MB` caps it (default 1024). Both tiers turn
+  off under `PLIRON_OPT_BISECT` — a hit can't honor the consumer's
+  remaining budget. `PLIRON_MCPROF=1` prints lookup/store/record
+  counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
 - `PLIRON_VERSION=1` — print the source revision the dylib was built

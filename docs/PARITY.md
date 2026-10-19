@@ -21,7 +21,12 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
-here is `docs/performance.md`.
+here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold,
+`bench/wasm/run.sh`): **1.074** — wins `chars_alpha` −24%, `iterw` −39%,
+`matmul` −7%; residuals `chars_mixed` +50%, `chars_ascii` +35%,
+`parse_only`/`tokenize` +32%, `strwork` +24%, `hashmap`/`hmget` +20%,
+`fib` +10% — the `Chars::next`/`slice::Iter`/`Option`/`next_code_point`
+i64-decode + `Option`-niche per-char op count (see below).
 
 ## How to measure
 
@@ -118,7 +123,24 @@ Next steps, in expected-payoff order:
    the pliron-IR side, interned-sym inline maps.
 4. **xcgu copies** multiply IR-opt work per CGU (`PLIRON_XCGU=0` cut syn
    78 → 55 s) but feed the inliner. Share analyzed bodies across CGUs
-   instead of re-optimizing each copy.
+   instead of re-optimizing each copy. **CLIF-side mitigation landed
+   (opt-in)**: `PLIRON_MEMCACHE=1` is a whole-pipeline content-addressed
+   in-process cache — keys normalize `UserExternalName` indices to
+   declared symbols and canonicalize pliron region `Ptr`s in the fact
+   maps (`block_region`/`region_parent`/`scoped`/`operand_frozen`) so
+   copies key alike; hits replay func+derived+facts+stats, remap
+   `FuncId`s by symbol, and pending claims let parallel CGUs share one
+   computation instead of racing misses. regex-syntax: 882/3386 lookups
+   hit (26%), output byte-identical cached/uncached/repeated. CPU is
+   ~neutral there — hits land on small fns and the ~0.9 s key/store
+   overhead eats the replayed work — but it's the mechanism an
+   iropt-side version needs, and it costs nothing when off. Bisect
+   (`PLIRON_OPT_BISECT`) disables both cache tiers: a hit can't honor a
+   consumer's remaining budget. Read-set recording now arms only for
+   the disk tier — in-process env is fixed, so mem-tier validation is
+   vacuous and arming used to de-memoize every `config()` read on
+   armed threads (~1.5M recorded reads/compile). Remaining: the
+   pliron-IR (iropt) half of the duplicated work is untouched.
 5. ~~Glue~~ **partly done, premise revised**: the inter-step
    bookkeeping is now ~3% of phaseB CPU. `carry_aliases`/`compact_aliases`
    walk `dfg.alias_writes()` (the per-write list behind `alias_epoch`)
@@ -138,8 +160,9 @@ inliner and `wpeep` on top of the same pipeline; profile
 
 | kernel | pliron/LLVM | lead |
 |---|---|---|
-| fib | **2.01** | Recursion turned into a loop by both, but our loop body is an `if/else` + `br` with 5 locals vs LLVM's single `br_if` with 2 (`wasm2wat` the `fib3fib` function in both modules). Check what V8 makes of each before assuming the shape is the cause. |
-| chars_mixed | 1.35 | non-ASCII path; native is at parity, so look at what `clif_emit`/`wpeep` make of the rangefold output |
+| fib | **2.01** | Recursion turned into a loop by both, but our loop body is an `if/else` + `br` with 5 locals vs LLVM's single `br_if` with 2 (`wasm2wat` the `fib3fib` function in both modules). Shared cause below: the loop's `brif` lowers to `if c { get*;set*; br L } else { ret }` — the param copies sit in scratch locals inside the `if` arm where `wpeep`'s `pathcheck` (straight-line rule) can't retarget them, while LLVM updates `n`/`acc` unconditionally (`local.tee`) then `br_if`s. **DONE** (`PLIRON_WASM_BRF=0` off): `wpeep` now folds `if c { get*/set*/tee*; br L } [else { R }] end` → hoisted copies + `br_if` (depth−1), guarded by arm-purity, an operand-stack balance check (a `set`/`tee` popping the cond or a nonzero net depth rejects), no `Get`/`Nop` read of a copied local in the else arm or later, no depth-referencing/structured op in the else arm, `prel` empty. Unit tests `backedge_if_*`. NOTE: produces LLVM's shape + ~8B/fn smaller, but **V8-runtime-neutral on this box** (both control forms compile to the same work) — the residual gap is op *count*, below. |
+| chars_mixed | 1.35 | non-ASCII path; native is at parity, so look at what `clif_emit`/`wpeep` make of the rangefold output. Same `brif`→`if/else`+`br` shape as fib, PLUS `Chars::next`/`next_code_point` per char: `ptr==end` (`slice::Iter::next` bound) AND `byte_ptr==0` (the `Option<&u8>` null-niche — equivalent, kept as two checks), `i64.extend_i32_u(byte); i64.and 128; i64.ne` for `byte & 0x80` (the code-point is an `i64` local — `wty` maps `char`→I32, so the i64 is a decode/`Option`/`usize` intermediate that could demote). |
+| chars_ascii | ~1.3 | `chars().filter(is_ascii).count()` — `fold`'s per-char loop is the fib-shape `if/else`+`br`+locals plus the `Chars::next` `end`/`null`/`i64` decode overhead. |
 | parse_only | 1.31 | digit loops; native is +5% too |
 | hmget | 1.22 | hashbrown probe + SipHash; earlier inlining work closed most of it (`WASM_HOT`) |
 | strwork | 1.21 | string building / memcpy-heavy |
