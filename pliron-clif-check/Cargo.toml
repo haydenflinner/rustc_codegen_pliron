@@ -18,3 +18,5 @@ cranelift-reader = "=0.135.5"
 rustc-hash = "2"
 serde_json = "1"
 target-lexicon = "0.13"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pliron-cfg = { path = "../pliron-cfg" }

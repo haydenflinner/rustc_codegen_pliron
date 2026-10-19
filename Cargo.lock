@@ -1213,10 +1213,12 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-module",
  "cranelift-reader",
+ "pliron-cfg",
  "pliron-clif-opt",
  "rustc-hash",
  "serde_json",
  "target-lexicon",
+ "tracing-subscriber",
 ]
 
 [[package]]

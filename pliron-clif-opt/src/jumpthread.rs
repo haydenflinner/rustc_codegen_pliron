@@ -1930,7 +1930,11 @@ pub(crate) fn round<'a>(
     // `func` is only rewritten once `edits` apply below. RefCell so the
     // `&dyn Fn` `nz` closure can share it.
     let nnm = std::cell::RefCell::new(FxHashMap::<Value, bool>::default());
+    let prof_r = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let (mut n_blk, mut n_gate, mut n_edge, mut n_eval) = (0usize, 0usize, 0usize, 0usize);
     for b in func.layout.blocks() {
+        n_blk += 1;
         if Some(b) == entry || locked.contains(&b) {
             continue;
         }
@@ -1940,27 +1944,8 @@ pub(crate) fn round<'a>(
         // All but the terminator, in order — recreated on each use to
         // skip the per-block `Vec` (this loop runs every round).
         let body = || func.layout.block_insts(b).filter(|&i| i != term);
-        // `iconst`s cost nothing to evaluate through the env map; budget
-        // the real ops only (long niche-merge chains — `Option<char>`
-        // flag test + sentinel compare — otherwise exceed MAX_BODY).
-        let real = if bodyk {
-            body()
-                .filter(|&i| {
-                    !matches!(
-                        func.dfg.insts[i],
-                        InstructionData::UnaryImm {
-                            opcode: Opcode::Iconst,
-                            ..
-                        }
-                    )
-                })
-                .count()
-        } else {
-            body().count()
-        };
-        if real > MAX_BODY || !body().all(|i| pure_op(func, i)) {
-            continue;
-        }
+        // Cheapest gate first: a non-`brif` terminator rejects the block
+        // before any body scan — most blocks end in `jump`/`return`.
         let InstructionData::Brif {
             arg: cond,
             blocks: targets,
@@ -1969,6 +1954,28 @@ pub(crate) fn round<'a>(
         else {
             continue;
         };
+        // `iconst`s cost nothing to evaluate through the env map; budget
+        // the real ops only (long niche-merge chains — `Option<char>`
+        // flag test + sentinel compare — otherwise exceed MAX_BODY).
+        // Count and purity share one scan.
+        let mut real = 0usize;
+        if !body().all(|i| {
+            real += usize::from(
+                !bodyk
+                    || !matches!(
+                        func.dfg.insts[i],
+                        InstructionData::UnaryImm {
+                            opcode: Opcode::Iconst,
+                            ..
+                        }
+                    ),
+            );
+            pure_op(func, i)
+        }) || real > MAX_BODY
+        {
+            continue;
+        }
+        n_gate += 1;
         let params = func.dfg.block_params(b);
         let mut body_vals_l: Option<FxHashSet<Value>> = None;
         for pred in cfg.pred_iter(b) {
@@ -1985,6 +1992,7 @@ pub(crate) fn round<'a>(
                 if bc.block(&func.dfg.value_lists) != b {
                     continue;
                 }
+                n_edge += 1;
                 args.clear();
                 args.extend(bc.args(&func.dfg.value_lists));
                 if args.len() != params.len() {
@@ -1993,7 +2001,18 @@ pub(crate) fn round<'a>(
                 // A real candidate edge — the first one per round builds
                 // the NonNull fixpoint; blocks failing the gates above
                 // never reach it.
-                let nnr = nn.get_or_insert_with(|| NonNull::new(func, cfg, loads, derived));
+                let nnr = nn.get_or_insert_with(|| {
+                    let t = std::time::Instant::now();
+                    let r = NonNull::new(func, cfg, loads, derived);
+                    let el = t.elapsed();
+                    if pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO)
+                        && el.as_millis() > 0
+                    {
+                        tracing::info!(target: "pliron::jumpthread", "    nnnew {el:?}");
+                    }
+                    r
+                });
                 env.clear();
                 argv.clear();
                 pn.clear();
@@ -2063,6 +2082,7 @@ pub(crate) fn round<'a>(
                         env.insert(func.dfg.first_result(i), c);
                     }
                 }
+                n_eval += 1;
                 let taken = match known(func, &env, cond) {
                     Some(c) => c != 0,
                     None if nz(cond) => true,
@@ -2266,6 +2286,12 @@ pub(crate) fn round<'a>(
                 break;
             }
         }
+    }
+    if prof_r {
+        tracing::info!(target: "pliron::jumpthread",
+            "    round-scan blk={n_blk} gate={n_gate} edge={n_edge} eval={n_eval} edits={}",
+            edits.len()
+        );
     }
     // The batch's planned `pinst -> s` edges can open fresh paths that
     // bypass a def some appended edge arg relies on (an export fed

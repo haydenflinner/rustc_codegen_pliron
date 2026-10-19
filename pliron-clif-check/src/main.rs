@@ -37,6 +37,19 @@ struct Opts {
 }
 
 fn main() -> ExitCode {
+    // `PLIRON_TRACE=<env-filter>` (e.g. `pliron::jumpthread=info`) —
+    // pass-internal `tracing` prof timers stay silent without a
+    // subscriber.
+    if let Ok(filter) = std::env::var("PLIRON_TRACE") {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_new(&filter)
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+        pliron_cfg::mark_tracing_on();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut pos = Vec::new();
     let mut opts = Opts {

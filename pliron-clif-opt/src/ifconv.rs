@@ -167,12 +167,23 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
         let params = func.dfg.block_params(cur);
         // The inst cap bounds total speculation across the chain; arms
         // deeper than SPEC_NARROW additionally need `bool_merge` at the
-        // conversion site.
-        if cur_edge.len() != params.len()
-            || clone.len() + body().count() > SPEC_WIDE
-            || !cur_edge.iter().all(|a| matches!(a, BlockArg::Value(_)))
-            || !body().all(|i| crate::jumpthread::pure_op(func, i))
-        {
+        // conversion site. One fused pass: inst count for the cap, purity,
+        // and the `clone` collection — provisionally pushed, truncated if
+        // the hop is rejected.
+        let base = clone.len();
+        let mut ok = cur_edge.len() == params.len()
+            && cur_edge.iter().all(|a| matches!(a, BlockArg::Value(_)));
+        if ok {
+            for i in body() {
+                if clone.len() >= SPEC_WIDE || !crate::jumpthread::pure_op(func, i) {
+                    ok = false;
+                    break;
+                }
+                clone.push(i);
+            }
+        }
+        if !ok {
+            clone.truncate(base);
             break;
         }
         for (j, &p) in params.iter().enumerate() {
@@ -181,9 +192,9 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
             };
             psub.push((p, func.dfg.resolve_aliases(v)));
         }
-        clone.extend(body());
         chain.push(cur);
-        cur_edge = destination.args(&func.dfg.value_lists).collect();
+        cur_edge.clear();
+        cur_edge.extend(destination.args(&func.dfg.value_lists));
         cur = destination.block(&func.dfg.value_lists);
     }
     if chain.is_empty() {
@@ -808,9 +819,15 @@ pub fn run(
     // no block is ever added or removed, so the scan list is stable
     // across rounds.
     let blocks: Vec<Block> = func.layout.blocks().collect();
+    let mut scans = 0usize;
+    // Per-brif edge args — reused across blocks and rounds instead of two
+    // fresh Vecs per candidate.
+    let mut t_edge: Vec<BlockArg> = Vec::new();
+    let mut e_edge: Vec<BlockArg> = Vec::new();
     'outer: for _ in 0..8 {
         let mut rn = 0;
         for b in blocks.iter().copied() {
+            scans += 1;
             let Some(term) = func.layout.last_inst(b) else {
                 continue;
             };
@@ -845,8 +862,10 @@ pub fn run(
             if t == b || e == b {
                 continue;
             }
-            let t_edge: Vec<BlockArg> = t_bc.args(&func.dfg.value_lists).collect();
-            let e_edge: Vec<BlockArg> = e_bc.args(&func.dfg.value_lists).collect();
+            t_edge.clear();
+            t_edge.extend(t_bc.args(&func.dfg.value_lists));
+            e_edge.clear();
+            e_edge.extend(e_bc.args(&func.dfg.value_lists));
             let Some(ta) = resolve_arm(func, t, &t_edge) else {
                 continue;
             };
@@ -967,7 +986,7 @@ pub fn run(
     }
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO)
     {
-        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms", c.get() as f64 / 1e6));
+        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms scans={scans} conv={n}", c.get() as f64 / 1e6));
     }
     n
 }
