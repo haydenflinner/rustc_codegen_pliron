@@ -1322,7 +1322,7 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
     cx.st.borrow_mut().cgu = cgu_name.to_string();
     cx.st.borrow_mut().xcgufn_kill = env_is("PLIRON_XCGUFN_KILL", "1");
-    cx.st.borrow_mut().deadunopt_on = env_is("PLIRON_DEADUNOPT", "1");
+    cx.st.borrow_mut().deadunopt_on = pass_enabled("PLIRON_DEADUNOPT");
     let mono_items = cgu.items_in_deterministic_order(tcx);
     let extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
