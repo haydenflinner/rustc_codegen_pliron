@@ -20,13 +20,12 @@
 //! facts; this substitutes operands, so arithmetic and edge args on
 //! deeper blocks specialize too.
 
-use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{
-    Block, BlockArg, Function, Inst, InstructionData, Opcode, Type, Value, ValueDef,
-};
 use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::{
+    Block, Function, Inst, InstructionData, Opcode, Type, Value, ValueDef,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::pure_op;
@@ -148,9 +147,12 @@ fn leaf_subs(
             args,
         } = func.dfg.insts[i]
     {
-        // `eq` true / `ne` false pins x == y; with one side an
-        // iconst the other becomes it inside the arm.
-        let eq = (cond == IntCC::Equal) == truth;
+        // `eq` true / `ne` false pins x == y; every other cond
+        // combination proves only an inequality.
+        let eq = matches!(
+            (cond, truth),
+            (IntCC::Equal, true) | (IntCC::NotEqual, false)
+        );
         if eq {
             for (x, y) in [(args[0], args[1]), (args[1], args[0])] {
                 let x = func.dfg.resolve_aliases(x);
@@ -170,11 +172,13 @@ fn leaf_subs(
     }
 }
 
-/// `iconst ty, k` at the head of `a`, memoized per (ty, k).
+/// `iconst ty, k` at the head of `a` (before `head`, the arm's first
+/// original inst), memoized per (ty, k).
 fn mk_const(
     func: &mut Function,
     cache: &mut FxHashMap<(Type, i64), Value>,
     a: Block,
+    head: Option<Inst>,
     ty: Type,
     k: i64,
 ) -> Value {
@@ -184,7 +188,7 @@ fn mk_const(
             imm: k.into(),
         });
         func.dfg.make_inst_results(ni, ty);
-        match func.layout.first_inst(a) {
+        match head {
             Some(f) => func.layout.insert_inst(ni, f),
             None => func.layout.append_inst(ni, a),
         }
@@ -219,6 +223,7 @@ fn specialize_arm(
     dt: &DominatorTree,
     b: Block,
     a: Block,
+    head: Option<Inst>,
     bc_args: &[Value],
     subs: &FxHashMap<Value, Value>,
 ) -> usize {
@@ -252,8 +257,18 @@ fn specialize_arm(
     if region.is_empty() {
         return 0;
     }
-    let inset: FxHashSet<Block> = region.iter().copied().collect();
     let mut n = 0;
+
+    // Values read anywhere in the region — one scan, then per-candidate
+    // lookups are O(1).
+    let mut region_reads: FxHashSet<Value> = FxHashSet::default();
+    for &u in &region {
+        for ui in func.layout.block_insts(u) {
+            for w in func.dfg.inst_values(ui) {
+                region_reads.insert(func.dfg.resolve_aliases(w));
+            }
+        }
+    }
 
     // (b) push: a pure inst in `b` whose operand is pinned by the edge
     // fact recomputes inside the arm, where the pinned operand is a
@@ -273,26 +288,13 @@ fn specialize_arm(
         let v = func.dfg.resolve_aliases(func.dfg.inst_results(i)[0]);
         // Any in-region use of `v` (operand positions; an `a`-param
         // bound to `v` counts — its in-region uses retarget too).
-        let used = inset.iter().any(|&u| {
-            func.layout.block_insts(u).any(|ui| {
-                func.dfg
-                    .inst_values(ui)
-                    .any(|w| func.dfg.resolve_aliases(w) == v)
-            })
-        }) || func
-            .dfg
-            .block_params(a)
-            .iter()
-            .zip(bc_args.iter())
-            .any(|(&p, &e)| func.dfg.resolve_aliases(e) == v && {
-                inset.iter().any(|&u| {
-                    func.layout.block_insts(u).any(|ui| {
-                        func.dfg
-                            .inst_values(ui)
-                            .any(|w| func.dfg.resolve_aliases(w) == p)
-                    })
-                })
-            });
+        let used = region_reads.contains(&v)
+            || func
+                .dfg
+                .block_params(a)
+                .iter()
+                .zip(bc_args.iter())
+                .any(|(&p, &e)| func.dfg.resolve_aliases(e) == v && region_reads.contains(&p));
         if !used {
             continue;
         }
@@ -324,7 +326,7 @@ fn specialize_arm(
             );
         }
         func.dfg.insts[ni] = data;
-        match func.layout.first_inst(a) {
+        match head {
             Some(f) => func.layout.insert_inst(ni, f),
             None => func.layout.append_inst(ni, a),
         }
@@ -345,14 +347,18 @@ fn specialize_arm(
                 if ui == ni {
                     continue;
                 }
-                func.dfg.map_inst_values(ui, |w| {
-                    let r = func.dfg.resolve_aliases(w);
-                    if r == v || psubs.contains(&r) {
-                        nv
-                    } else {
-                        w
-                    }
-                });
+                let rewrite: FxHashSet<Value> = func
+                    .dfg
+                    .inst_values(ui)
+                    .filter(|&w| {
+                        let r = func.dfg.resolve_aliases(w);
+                        r == v || psubs.contains(&r)
+                    })
+                    .collect();
+                if !rewrite.is_empty() {
+                    func.dfg
+                        .map_inst_values(ui, |w| if rewrite.contains(&w) { nv } else { w });
+                }
             }
         }
         n += 1;
@@ -361,18 +367,21 @@ fn specialize_arm(
     // (a) blanket operand substitution over the region.
     for &u in &region {
         for ui in func.layout.block_insts(u).collect::<Vec<_>>() {
-            let mut hit = false;
-            func.dfg.map_inst_values(ui, |w| {
-                let p = preimage(func, a, &pmap, w);
-                if let Some(&k) = subs.get(&p)
-                    && func.dfg.value_type(k) == func.dfg.value_type(w)
-                {
-                    hit = true;
-                    return k;
-                }
-                w
-            });
-            n += hit as usize;
+            let rewrite: FxHashMap<Value, Value> = func
+                .dfg
+                .inst_values(ui)
+                .filter_map(|w| {
+                    let p = preimage(func, a, &pmap, w);
+                    subs.get(&p).and_then(|&k| {
+                        (func.dfg.value_type(k) == func.dfg.value_type(w)).then_some((w, k))
+                    })
+                })
+                .collect();
+            if !rewrite.is_empty() {
+                n += 1;
+                func.dfg
+                    .map_inst_values(ui, |w| *rewrite.get(&w).unwrap_or(&w));
+            }
         }
     }
     n
@@ -409,6 +418,9 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
             if lvs.is_empty() {
                 continue;
             }
+            // Arm head before any materialization — consts and pushed
+            // clones all insert before it, keeping def order.
+            let head = func.layout.first_inst(arm);
             let mut subs: FxHashMap<Value, Value> = FxHashMap::default();
             let mut bools: Vec<(Value, bool)> = Vec::new();
             for &(l, truth) in lvs {
@@ -417,7 +429,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
             let mut kcache: FxHashMap<(Type, i64), Value> = FxHashMap::default();
             for (l, truth) in bools {
                 let ty = func.dfg.value_type(l);
-                let k = mk_const(func, &mut kcache, arm, ty, truth as i64);
+                let k = mk_const(func, &mut kcache, arm, head, ty, truth as i64);
                 subs.entry(l).or_insert(k);
             }
             if subs.is_empty() {
@@ -428,7 +440,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
                 .args(&func.dfg.value_lists)
                 .filter_map(|a| a.as_value())
                 .collect();
-            n += specialize_arm(func, cfg, dt, b, arm, &bc_args, &subs);
+            n += specialize_arm(func, cfg, dt, b, arm, head, &bc_args, &subs);
             if n > MAX_DIAMONDS * MAX_PUSH {
                 break 'outer;
             }
@@ -445,20 +457,15 @@ mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
     use cranelift_codegen::ir::condcodes::IntCC;
-    use cranelift_codegen::ir::types::{I32, I64};
+    use cranelift_codegen::ir::types::I64;
     use cranelift_codegen::ir::{
-        AbiParam, BlockArg, Function, InstBuilder, Opcode, Signature, UserFuncName,
+        AbiParam, Function, InstBuilder, Opcode, Signature, UserFuncName,
     };
     use cranelift_codegen::isa::CallConv;
 
     fn verify(func: &Function) {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         cranelift_codegen::verify_function(func, &flags).unwrap();
-    }
-
-    fn cfg_dt(func: &Function) -> (ControlFlowGraph, DominatorTree) {
-        let c = ControlFlowGraph::with_function(func);
-        (c, DominatorTree::with_function(func, &ControlFlowGraph::with_function(func)))
     }
 
     /// `brif (icmp eq x, 5)` — inside the true arm `x` reads as `5`,

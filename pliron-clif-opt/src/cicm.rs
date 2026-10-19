@@ -17,10 +17,7 @@
 //! unobservable when it cannot trap.
 
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{
-    Block, Function, Inst, InstructionData, Value, ValueDef,
-};
+use cranelift_codegen::ir::{Block, Function, Inst, InstructionData, Value, ValueDef};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::pure_op;
@@ -218,7 +215,7 @@ fn plan(
         if pairs.len() >= MAX_HOIST {
             break;
         }
-        let mut cand = |list: &[Inst], used: &FxHashSet<Inst>, psub: &FxHashMap<Value, Value>, arm| {
+        let cand = |list: &[Inst], used: &FxHashSet<Inst>, psub: &FxHashMap<Value, Value>, arm| {
             let mut out: Vec<(Inst, Vec<R>)> = Vec::new();
             for &i in list {
                 if used.contains(&i) || !pure_op(func, i) {
@@ -237,9 +234,14 @@ fn plan(
         let mut found = false;
         't: for (it, at) in &ct {
             for (ie, ae) in &ce {
+                // Same opcode/fields and resolved operands — and same
+                // result type (`uextend.i64 x` vs `uextend.i32 x` share
+                // an operand but differ).
                 if at.len() != ae.len()
                     || !same_inst(&func.dfg.insts[*it], &func.dfg.insts[*ie])
                     || *at != *ae
+                    || func.dfg.value_type(func.dfg.inst_results(*it)[0])
+                        != func.dfg.value_type(func.dfg.inst_results(*ie)[0])
                 {
                     continue;
                 }
@@ -290,13 +292,13 @@ fn apply(func: &mut Function, b: Block, pairs: &[(Inst, Inst, Vec<R>)]) {
     }
     for (k, (it, ie, _)) in pairs.iter().enumerate() {
         let vh = hoisted[k];
-        for &i in [it, ie] {
-            let rs: Vec<Value> = func.dfg.inst_results(*i).to_vec();
-            func.dfg.detach_inst_results(*i);
+        for i in [*it, *ie] {
+            let rs: Vec<Value> = func.dfg.inst_results(i).to_vec();
+            func.dfg.detach_inst_results(i);
             for r in rs {
                 func.dfg.change_to_alias(r, vh);
             }
-            func.layout.remove_inst(*i);
+            func.layout.remove_inst(i);
         }
     }
 }
@@ -325,18 +327,13 @@ mod tests {
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
     use cranelift_codegen::ir::types::{I32, I64};
     use cranelift_codegen::ir::{
-        AbiParam, BlockArg, Function, InstBuilder, Opcode, Signature, UserFuncName,
+        AbiParam, BlockArg, Function, InstBuilder, Signature, UserFuncName,
     };
     use cranelift_codegen::isa::CallConv;
 
     fn verify(func: &Function) {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         cranelift_codegen::verify_function(func, &flags).unwrap();
-    }
-
-    fn cfg_dt(func: &Function) -> (ControlFlowGraph, DominatorTree) {
-        let c = ControlFlowGraph::with_function(func);
-        (ControlFlowGraph::with_function(func), DominatorTree::with_function(func, &c))
     }
 
     /// Both arms compute `x*2` then `+1` differently-factored — the

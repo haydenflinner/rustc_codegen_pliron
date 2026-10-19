@@ -20,16 +20,14 @@
 //! before the divisor wraps, and `band` returns the same value.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, Type, Value, ValueDef,
+    Block, BlockArg, BlockCall, Function, InstBuilder, InstructionData, Opcode, Type, Value,
+    ValueDef,
 };
-use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_hash::FxHashSet;
 
-use crate::loopidiom::{self, Edge, Info, deepest_first, edge_args, edge_dest, gather, iconst};
+use crate::loopidiom::{Edge, Info, deepest_first, edge_args, edge_dest, gather, iconst};
 
 /// Loops converted per function.
 const MAX_CONV: usize = 4;
@@ -41,11 +39,10 @@ struct Plan {
     /// them verbatim.
     entry_args: Vec<Value>,
     h: Block,
-    /// The exiting terminator + slot and its dest.
-    exit: Edge,
+    /// The exit edge's destination.
     exit_dest: Block,
-    /// Args to pass on the fast path — `p` positions already swapped
-    /// for the `lowbit` value slot marker `None`-> substituted at emit.
+    /// Args to pass on the fast path — positions reading `p` are
+    /// swapped for the computed `band` at emit.
     exit_args: Vec<Value>,
     /// The `lb` header param, the invariant dividend `n` as a value
     /// available on the entry edge, and the int type.
@@ -89,6 +86,7 @@ fn invariant(func: &Function, info: &Info, v: Value) -> bool {
             .layout
             .inst_block(i)
             .is_some_and(|b| !info.body.contains(&b)),
+        _ => false,
     }
 }
 
@@ -117,6 +115,7 @@ fn out_val(func: &Function, info: &Info, v: Value) -> Option<Value> {
                 None
             }
         }
+        _ => None,
     }
 }
 
@@ -277,7 +276,6 @@ fn plan(func: &Function, info: &Info) -> Option<Plan> {
             entry: info.entry,
             entry_args: info.entry_args.clone(),
             h: info.h,
-            exit,
             exit_dest: edge_dest(func, exit),
             exit_args,
             p,
