@@ -195,6 +195,16 @@ Next steps, in expected-payoff order:
    is diffuse across ~85 steps, no tier wins cleanly. Concentration:
    top-10 fns ≈ 50% of traced step time, top-50 ≈ 89%; <1ms fns are
    ~64% of fns but ~1% of cost — small-fn overheads are irrelevant.
+   **Incremental pass wins keep landing but are ~100-300 ms each** —
+   the corpus is uniformly well-gated/worklisted: `selfarg` 861→137 ms
+   (batch param drops + `BPARAM` gate), `callgvn` 1283→807 ms
+   (borrowed callee names, op-ptr buckets), `edgespec` SmallVec edge
+   args, `shape_of` lazy per-block maps + early exit, `dispatch_dup`
+   lazy `escaping` scan, pliron `PoolIter` for the op accessors.
+   regex-syntax user-s ~20.7→20.4; wall is saturated (~6.7x on 14
+   cores) so CPU savings don't move wall. `bound_at`'s `isub`
+   unsigned-bound was unsound (`fd0fb39`): `a - b` wraps on underflow
+   — fixed in `55707f3` with a regression test.
    **LLVM's own numbers** (`-Zllvm-time-trace` on the same compile):
    LLVM's *entire* function-pass manager is 2.2 s vs our ~14 CPU-s
    pipeline; per pass it's ~15-45x — JumpThreading 91 ms vs our
