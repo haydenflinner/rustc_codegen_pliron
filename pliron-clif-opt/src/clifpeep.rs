@@ -8405,6 +8405,12 @@ fn selord_bit(func: &mut Function, inst: Inst) -> bool {
     if func.dfg.value_type(res) != types::I8 {
         return false;
     }
+    // `bool_mask` answers *nonzero-ness*, not value: `select eq,1,2`
+    // has mask `ALL` but yields 2. The rewrite mints a 0/1 `icmp`, so
+    // both operands must actually be 0/1-valued.
+    if !is01(func, args[0], 4) || !is01(func, args[1], 4) {
+        return false;
+    }
     let Some((x, y, ma, _)) = bool_mask(func, args[0], 4) else {
         return false;
     };
@@ -8500,6 +8506,11 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
     for (a0, b0, negate_c) in [(a, b, true), (b, a, false)] {
         if iconst(pos.func, a0) != Some(0) {
             continue;
+        }
+        // The select yields `b0`'s *value*, not just its truth: `b0`
+        // must be 0/1-valued for the `icmp` rewrite to preserve it.
+        if !is01(pos.func, b0, 4) {
+            return false;
         }
         let Some((x, y, mc, _)) = bool_mask(pos.func, c, 4) else {
             return false;

@@ -702,3 +702,50 @@ block2:
     verify(&f);
     equiv(&before, &f);
 }
+
+/// Regression: `select sgt, 0, (select eq, 1, 2)` — an `Ordering`
+/// decode whose else-arm is *not* 0/1 (it yields 2). The mask of the
+/// inner select is `ALL` (it's never zero), but its value is not a
+/// bool; rewriting to `icmp sle` returned 1 where 2 was expected.
+#[test]
+fn selord_sel_three_valued_arm_kept() {
+    let src = "function %f(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp.i8 sgt v0, v1
+    v3 = icmp.i8 eq v0, v1
+    v4 = iconst.i8 0
+    v5 = iconst.i8 1
+    v6 = iconst.i8 2
+    v7 = select.i8 v3, v5, v6
+    v8 = select.i8 v2, v4, v7
+    return v8
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    verify(&f);
+    equiv(&before, &f);
+    // The select may simplify only if every surviving value is exact.
+    // Interpret a concrete probe: v0 > v1 → 0, v0 == v1 → 1, else 2.
+}
+
+/// Same bug class through `band`: `select eq,1,2` masks to ALL but is
+/// not 0/1 — `band`ing it into a single `icmp` drops the `2`.
+#[test]
+fn selord_band_three_valued_arm_kept() {
+    let src = "function %f(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
+    v2 = icmp.i8 ne v0, v1
+    v3 = icmp.i8 eq v0, v1
+    v4 = iconst.i8 1
+    v5 = iconst.i8 2
+    v6 = select.i8 v3, v4, v5
+    v7 = band.i8 v2, v6
+    return v7
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    pipeline(&mut f);
+    verify(&f);
+    equiv(&before, &f);
+}
