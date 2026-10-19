@@ -274,9 +274,10 @@ pub fn lower_to_object(
     // PLIRON_CRTFREE: the bookkeeping module emits the CRT/TLS statics; the
     // remaining piece is making the linker pull the CRT import libraries —
     // /defaultlib:msvcrt is already on rustc's line, so advertise the rest
-    // via .drectve.
+    // via .drectve. Opt-in (rust-lld + mkwinlibs only): a stock `link.exe`
+    // resolves ucrtbase from the SDK, not our synthesized lib.
     if isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
-        && pliron_cfg::pass_enabled("PLIRON_CRTFREE")
+        && pliron_cfg::env_is("PLIRON_CRTFREE", "1")
     {
         let s =
             product

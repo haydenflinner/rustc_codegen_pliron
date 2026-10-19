@@ -1064,7 +1064,10 @@ impl ExtraBackendMethods for PlironCodegenBackend {
         // slot, template boundary markers, _fltused, and the PE entry
         // thunks -- so `rust-lld` plus synthesized import libraries (see
         // tools/mkwinlibs) need nothing from a Visual Studio install.
-        let crtfree = coff && pliron_cfg::pass_enabled("PLIRON_CRTFREE");
+        // Opt-in: a stock `link.exe` + real CRT link resolves the same
+        // symbols from msvcrt.lib, so emitting the stubs unconditionally
+        // produces `__security_cookie` LNK2005/ucrtbase LNK1104 dupes.
+        let crtfree = coff && pliron_cfg::env_is("PLIRON_CRTFREE", "1");
         if crtfree {
             let i32t = cx.type_i32();
             let ptr = cx.type_ptr();
