@@ -101,17 +101,21 @@ Next steps, in expected-payoff order:
    `fsv`/`eqs`/`alts` Vecs; `webmerge_ctx`'s `eargs`/`svh`/`okey`/
    `skc`/`pk` matrices are one flat `Mat` (stride-indexed) each;
    `slp` builds `param_src` lazily on the first block that reaches the
-   plan stage.
+   plan stage. `loadfwd` carries one `NrMemo` (root_pair / norm_root-
+   na0 / bounded root_min) per phase — the fixpoint and apply scan had
+   re-walked each base pointer's ≤16-hop chain per round; `edgespec`'s
+   DFS keeps block params as slices and clones edge args only on the
+   landing `Fin` (rejections used to pay a `Vec` clone each);
+   `jumpthread::eval`'s icmp arm reads `known` once per operand.
    Left: jumpthread ~4.0 s (a ~6-phase fixpoint; `round`'s threading
    walk is the residue — `domcond` ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
    the webmerge family ~4 s (`cparm`/`sameargs*` per-block key
    matrices + per-call `facts_cfg`/`affine_nf`/`Proots` Ascent —
-   caching those across rounds needs dirty-region-safe incremental
-   facts, since `pmap` rewrites edge args outside `merge_dirty`), and
-   mergechain ~1.8 s (`edgespec::run` inside ≈ half of it; `fin_edge`
-   is the top app leaf). The next tier is mechanical-and-risky, not
-   algorithmic: `SymMap` u32 keys on the pliron-IR side,
-   interned-sym inline maps.
+   cross-round caching is unsound: `apply_param_drops` rewrites inst
+   args and detaches params, so the `aff` facts themselves move), and
+   mergechain ~1.8 s (`edgespec::run` inside ≈ half of it). The next
+   tier is mechanical-and-risky, not algorithmic: `SymMap` u32 keys on
+   the pliron-IR side, interned-sym inline maps.
 4. **xcgu copies** multiply IR-opt work per CGU (`PLIRON_XCGU=0` cut syn
    78 → 55 s) but feed the inliner. Share analyzed bodies across CGUs
    instead of re-optimizing each copy.

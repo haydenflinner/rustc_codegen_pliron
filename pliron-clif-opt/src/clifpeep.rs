@@ -917,6 +917,7 @@ fn un_not_chain(
     arg: Value,
     mut chain: Option<&mut Vec<(Value, bool)>>,
 ) -> (Value, bool) {
+    let eq01 = crate::pass_enabled("PLIRON_EQ01");
     let (mut v, mut neg) = (func.dfg.resolve_aliases(arg), false);
     for _ in 0..8 {
         if let Some(c) = chain.as_deref_mut() {
@@ -962,7 +963,7 @@ fn un_not_chain(
                         cond,
                         args,
                         ..
-                    } if crate::pass_enabled("PLIRON_EQ01")
+                    } if eq01
                         && matches!(cond, IntCC::Equal | IntCC::NotEqual) =>
                     {
                         let (x, k) = if let Some(k) =
@@ -1149,16 +1150,18 @@ pub fn brif_argspec(func: &mut Function, inst: Inst) -> usize {
 /// after `merge_chains` remerged a dispatch block into its pred.
 pub fn brif_fold(func: &mut Function) -> usize {
     let mut n = 0;
+    let argspec = crate::pass_enabled("PLIRON_ARGSPEC");
+    let brifnot = crate::pass_enabled("PLIRON_BRIFNOT");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             if pos.func.dfg.insts[inst].opcode() != Opcode::Brif {
                 continue;
             }
-            if crate::pass_enabled("PLIRON_ARGSPEC") {
+            if argspec {
                 n += brif_argspec(pos.func, inst);
             }
-            if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
+            if brifnot && brif_not(pos.func, inst) {
                 n += 1;
             }
         }
@@ -4769,13 +4772,26 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut dead_sel: Vec<(Inst, Value, Value)> = Vec::new();
     let mut adj_add: Vec<(Inst, Inst, i64)> = Vec::new();
     let mut mul_id: Vec<(Inst, Value, Value)> = Vec::new();
+    // `pass_enabled` is two string-keyed lookups — read once, not per
+    // Load inst (AGENTS.md: config once per pass).
+    let ldsel = crate::pass_enabled("PLIRON_LDSEL");
+    let argspec = crate::pass_enabled("PLIRON_ARGSPEC");
+    let brifnot = crate::pass_enabled("PLIRON_BRIFNOT");
+    let rgpair_on = crate::pass_enabled("PLIRON_RGPAIR");
+    let selnot_on = crate::pass_enabled("PLIRON_SELNOT");
+    let minmax_on = crate::pass_enabled("PLIRON_MINMAX");
+    let seladd = crate::pass_enabled("PLIRON_SELADD");
+    let vmax_on = crate::pass_enabled("PLIRON_VMAX");
+    let bittab_on = crate::pass_enabled("PLIRON_BITTAB");
+    let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
+    let divchk_on = crate::pass_enabled("PLIRON_DIVCHK");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
-            if let InstructionData::Load {
-                arg, flags, offset, ..
-            } = pos.func.dfg.insts[inst]
-                && crate::pass_enabled("PLIRON_LDSEL")
+            if ldsel
+                && let InstructionData::Load {
+                    arg, flags, offset, ..
+                } = pos.func.dfg.insts[inst]
                 && loadsel_pair(&mut pos, inst, arg, flags, offset)
             {
                 n += 1;
@@ -4784,10 +4800,10 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
             if pos.func.dfg.insts[inst].opcode() == Opcode::Brif {
                 // `brif_argspec` must see the brif's own chain before
                 // `brif_not` strips it.
-                if crate::pass_enabled("PLIRON_ARGSPEC") {
+                if argspec {
                     n += brif_argspec(pos.func, inst);
                 }
-                if crate::pass_enabled("PLIRON_BRIFNOT") && brif_not(pos.func, inst) {
+                if brifnot && brif_not(pos.func, inst) {
                     n += 1;
                 }
                 continue;
@@ -5042,7 +5058,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                 opcode: Opcode::Band,
                 args,
             } = pos.func.dfg.insts[inst]
-                && crate::pass_enabled("PLIRON_RGPAIR")
+                && rgpair_on
                 && let Some(f) = rgpair(pos.func, args[0], args[1])
             {
                 n += rgapply(&mut pos, inst, f);
@@ -5157,7 +5173,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // `Range*::contains` as one sub+compare instead of a
                     // guard branch's worth of work; under loopvec a
                     // single pcmpgtd group per lane.
-                    if crate::pass_enabled("PLIRON_RGPAIR")
+                    if rgpair_on
                         && iconst(pos.func, args[2]) == Some(0)
                         && let Some(f) = rgpair(pos.func, args[0], args[1])
                     {
@@ -5165,10 +5181,10 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                         continue;
                     }
                 }
-                if crate::pass_enabled("PLIRON_SELNOT") && sel_not(pos.func, inst) {
+                if selnot_on && sel_not(pos.func, inst) {
                     n += 1;
                 }
-                if crate::pass_enabled("PLIRON_MINMAX") && minmax(&mut pos, inst) {
+                if minmax_on && minmax(&mut pos, inst) {
                     n += 1;
                 }
                 continue;
@@ -5181,7 +5197,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
             // with the arm-fact rewrite above, which runs after this
             // inst's position in the scan.
             if !x64
-                && crate::pass_enabled("PLIRON_SELADD")
+                && seladd
                 && let InstructionData::Binary {
                     opcode: Opcode::Iadd,
                     args,
@@ -5262,7 +5278,7 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // `mx`: proven unsigned ceiling on the non-const operand;
                     // `nn`: x's range stays in the signed-positive half, so
                     // signed compares against `k` behave like unsigned ones.
-                    let (mx, nn) = if crate::pass_enabled("PLIRON_VMAX") {
+                    let (mx, nn) = if vmax_on {
                         let m = vmax(pos.func, x);
                         (m, m <= smax as u64)
                     } else {
@@ -5351,20 +5367,20 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     }
                 }
             }
-            if crate::pass_enabled("PLIRON_BITTAB")
+            if bittab_on
                 && cond == IntCC::NotEqual
                 && bittab(&mut pos, inst, args)
             {
                 n += 1;
                 continue;
             }
-            if crate::pass_enabled("PLIRON_ICMPEQFOLD")
+            if icmpeq
                 && icmp_eqfold(&mut pos, inst, cond, args, ty, &mut uses)
             {
                 n += 1;
                 continue;
             }
-            if crate::pass_enabled("PLIRON_DIVCHK")
+            if divchk_on
                 && ty.is_int()
                 && !ty.is_vector()
                 && ty.bits() <= 64
@@ -6486,12 +6502,14 @@ fn icmp_eqfold(
 pub fn sublea(func: &mut Function) -> usize {
     let mut n = 0;
     let mut uses = None;
+    // Once per pass — `pass_enabled` is two string-keyed lookups.
+    let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             // Post-punroll icmp normalization: the peeled countdowns and
             // shifted compares only exist once punroll has run.
-            if crate::pass_enabled("PLIRON_ICMPEQFOLD")
+            if icmpeq
                 && let InstructionData::IntCompare {
                     opcode: Opcode::Icmp,
                     cond,
@@ -6805,6 +6823,13 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
 /// Per-block CSE with the shared keying: later insts in a block alias
 /// the earliest equivalent def, which dominates them.
 pub fn lcse(func: &mut Function) -> usize {
+    // `pass_enabled` is two string-keyed lookups — read once per pass,
+    // not per inst/candidate.
+    let extred = crate::pass_enabled("PLIRON_EXTRED");
+    let memoff_on = crate::pass_enabled("PLIRON_MEMOFF");
+    let memoff_nest = crate::pass_enabled("PLIRON_MEMOFF_NEST");
+    let negfold = crate::pass_enabled("PLIRON_NEGFOLD");
+    let subsub = crate::pass_enabled("PLIRON_SUBSUB");
     let key = cse_key;
     type Seen = FxHashMap<CseKey, Value>;
     // `uses`/`dec`/`inc` maintain an exact use tally (`usecnt` below) —
@@ -6864,7 +6889,7 @@ pub fn lcse(func: &mut Function) -> usize {
         } = data
         {
             let a = func.dfg.resolve_aliases(arg);
-            if !crate::pass_enabled("PLIRON_EXTRED") {
+            if !extred {
                 return None;
             }
             if let Some(d) = func.dfg.value_def(a).inst()
@@ -6960,7 +6985,7 @@ pub fn lcse(func: &mut Function) -> usize {
                   seen: &mut Seen,
                   cnt: &mut FxHashMap<Value, u32>|
      -> usize {
-        if !crate::pass_enabled("PLIRON_MEMOFF") {
+        if !memoff_on {
             return 0;
         }
         let mut depth = 0;
@@ -6993,7 +7018,7 @@ pub fn lcse(func: &mut Function) -> usize {
             else {
                 break;
             };
-            if !crate::pass_enabled("PLIRON_MEMOFF_NEST") {
+            if !memoff_nest {
                 break;
             }
             let mut inner = None;
@@ -7087,7 +7112,7 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Binary {
                     opcode: Opcode::Iadd,
                     args,
-                } if crate::pass_enabled("PLIRON_NEGFOLD") => {
+                } if negfold => {
                     let ra = func.dfg.resolve_aliases(args[0]);
                     let rb = func.dfg.resolve_aliases(args[1]);
                     // `iadd (ineg a), b` → `isub b, a` — isel turns the
@@ -7221,7 +7246,7 @@ pub fn lcse(func: &mut Function) -> usize {
                     // single-use and shortening the dep chain off `e`.
                     // Each rewrite drops the result a def-level deeper in
                     // the DAG, so repeat applications terminate.
-                    if !crate::pass_enabled("PLIRON_SUBSUB") {
+                    if !subsub {
                         continue;
                     }
                     let sub_of = |func: &Function, v: Value| -> Option<(Value, Value)> {
@@ -7287,7 +7312,7 @@ pub fn lcse(func: &mut Function) -> usize {
                 n += 1;
                 continue;
             }
-            let Some(k) = key(func, i) else { continue };
+            let Some(k) = cse_key(func, i) else { continue };
             match seen.entry(k) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     // Alias eagerly so later insts in this block key on the
