@@ -339,6 +339,7 @@ pub struct NonNull<'a> {
 impl<'a> NonNull<'a> {
     pub fn new(
         func: &Function,
+        cfg: &ControlFlowGraph,
         loads: &'a FxHashSet<Value>,
         derived: &'a FxHashMap<Value, Value>,
     ) -> Self {
@@ -387,41 +388,46 @@ impl<'a> NonNull<'a> {
         // so a value feeding many edges is proven once. Cleared before the
         // eviction pass, which re-proves against the shrinking set.
         let mut memo = Some(FxHashMap::default());
-        for b in func.layout.blocks() {
-            let Some(t) = func.layout.last_inst(b) else {
+        // Only in-edges of blocks with candidate params can evict — walk
+        // those preds via the CFG instead of every edge in the function.
+        for d in func.layout.blocks() {
+            let bparams = func.dfg.block_params(d);
+            if !bparams.iter().any(|p| nn.params.contains(p)) {
                 continue;
-            };
-            for (ei, bc) in func.dfg.insts[t]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .into_iter()
-                .enumerate()
-            {
-                let d = bc.block(&func.dfg.value_lists);
-                // Most edges feed blocks with no candidate params — collect
-                // the edge args only once one matches.
-                let mut args: Option<Vec<BlockArg>> = None;
-                for (i, &p) in func.dfg.block_params(d).iter().enumerate() {
-                    if !nn.params.contains(&p) {
+            }
+            for pred in cfg.pred_iter(d) {
+                let t = pred.inst;
+                for (ei, bc) in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if bc.block(&func.dfg.value_lists) != d {
                         continue;
                     }
-                    let args = args.get_or_insert_with(|| bc.args(&func.dfg.value_lists).collect());
-                    let Some(&BlockArg::Value(v)) = args.get(i) else {
-                        evict.push(p);
-                        continue;
-                    };
-                    let v = func.dfg.resolve_aliases(v);
-                    deps.clear();
-                    if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo) {
-                        dependents_entry(&mut dependents, &deps, checks.len());
-                        checks.push(Chk {
-                            p,
-                            t,
-                            ei,
-                            v,
-                            deps: deps.iter().copied().collect(),
-                        });
-                    } else {
-                        evict.push(p);
+                    let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                    for (i, &p) in bparams.iter().enumerate() {
+                        if !nn.params.contains(&p) {
+                            continue;
+                        }
+                        let Some(&BlockArg::Value(v)) = args.get(i) else {
+                            evict.push(p);
+                            continue;
+                        };
+                        let v = func.dfg.resolve_aliases(v);
+                        deps.clear();
+                        if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo) {
+                            dependents_entry(&mut dependents, &deps, checks.len());
+                            checks.push(Chk {
+                                p,
+                                t,
+                                ei,
+                                v,
+                                deps: deps.iter().copied().collect(),
+                            });
+                        } else {
+                            evict.push(p);
+                        }
                     }
                 }
             }
@@ -1983,7 +1989,7 @@ pub(crate) fn round<'a>(
                 // A real candidate edge — the first one per round builds
                 // the NonNull fixpoint; blocks failing the gates above
                 // never reach it.
-                let nnr = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
+                let nnr = nn.get_or_insert_with(|| NonNull::new(func, cfg, loads, derived));
                 env.clear();
                 argv.clear();
                 pn.clear();
@@ -3622,7 +3628,11 @@ fn dominated_conds(
 /// the param itself) become aliases of `v`. Threading's SSA repair creates
 /// these, and Cranelift only removes them after our condition folding ran, so
 /// the same value seen through two params would not match a dominating test.
-pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Value, Value)> {
+pub fn remove_trivial_params(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+) -> Vec<(Value, Value)> {
     #[derive(Clone, Copy, PartialEq)]
     enum In {
         Unset,
@@ -3630,42 +3640,51 @@ pub fn remove_trivial_params(func: &mut Function, dt: &DominatorTree) -> Vec<(Va
         Many,
     }
     let entry = func.layout.entry_block();
+    // Only a block with params can yield a removal: visit just its
+    // in-edges (from the caller's CFG) rather than folding over every
+    // edge in the function.
     let mut inc: FxHashMap<Block, Vec<In>> = FxHashMap::default();
-    for b in func.layout.blocks() {
-        let Some(t) = func.layout.last_inst(b) else {
+    for s in func.layout.blocks() {
+        if Some(s) == entry {
             continue;
-        };
-        let fixed = matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif);
-        for bc in
-            func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-        {
-            let s = bc.block(&func.dfg.value_lists);
-            let params = func.dfg.block_params(s);
-            let st = inc
-                .entry(s)
-                .or_insert_with(|| vec![In::Unset; params.len()]);
-            if !fixed {
+        }
+        let params = func.dfg.block_params(s);
+        if params.is_empty() {
+            continue;
+        }
+        let mut st = vec![In::Unset; params.len()];
+        for pred in cfg.pred_iter(s) {
+            let t = pred.inst;
+            if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
                 st.iter_mut().for_each(|x| *x = In::Many);
-                continue;
+                break;
             }
-            for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
-                let new = match a {
-                    BlockArg::Value(v) => {
-                        let v = func.dfg.resolve_aliases(v);
-                        if v == params[i] {
-                            continue;
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                if bc.block(&func.dfg.value_lists) != s {
+                    continue;
+                }
+                for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
+                    let new = match a {
+                        BlockArg::Value(v) => {
+                            let v = func.dfg.resolve_aliases(v);
+                            if v == params[i] {
+                                continue;
+                            }
+                            In::One(v)
                         }
-                        In::One(v)
-                    }
-                    _ => In::Many,
-                };
-                st[i] = match (st[i], new) {
-                    (In::Unset, x) => x,
-                    (In::One(a), In::One(b)) if a == b => In::One(a),
-                    _ => In::Many,
-                };
+                        _ => In::Many,
+                    };
+                    st[i] = match (st[i], new) {
+                        (In::Unset, x) => x,
+                        (In::One(a), In::One(b)) if a == b => In::One(a),
+                        _ => In::Many,
+                    };
+                }
             }
         }
+        inc.insert(s, st);
     }
     let def_block = |func: &Function, v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(i, _) => func.layout.inst_block(i),
@@ -3987,19 +4006,30 @@ pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
 /// `fold_null_tests` behind a fresh `TESTC` check: every fold starts
 /// from an `icmp` on an `iconst`, so without that shape the whole call
 /// — and the `NonNull` fixpoint it needs — is dead work.
+fn cfg_dt(func: &Function) -> (ControlFlowGraph, DominatorTree) {
+    let c = ControlFlowGraph::with_function(func);
+    let d = DominatorTree::with_function(func, &c);
+    (c, d)
+}
+
 fn fnn<'a>(
     func: &mut Function,
     loads: &'a FxHashSet<Value>,
     derived: &'a FxHashMap<Value, Value>,
     nn: Option<NonNull<'a>>,
+    cd: &mut Option<(ControlFlowGraph, DominatorTree)>,
 ) -> usize {
     if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
         return 0;
     }
-    fold_null_tests(
-        func,
-        &nn.unwrap_or_else(|| NonNull::new(func, loads, derived)),
-    )
+    let nn = match nn {
+        Some(nn) => nn,
+        None => {
+            let (c, _) = cd.get_or_insert_with(|| cfg_dt(func));
+            NonNull::new(func, c, loads, derived)
+        }
+    };
+    fold_null_tests(func, &nn)
 }
 
 /// Thread until nothing changes (bounded); returns the edges retargeted.
@@ -4054,11 +4084,6 @@ pub fn run(
     // (trivp, deadp, domcond, inst sweeps) leave block adjacency intact,
     // while ifconv/bypass/round retarget edges and force a rebuild.
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
-    let cfg_dt = |func: &Function| {
-        let c = ControlFlowGraph::with_function(func);
-        let d = DominatorTree::with_function(func, &c);
-        (c, d)
-    };
     // `round` builds NonNull lazily on the first real candidate edge — a
     // quiet round never pays for the fixpoint. `derived` mutates across
     // iterations (ifconv), so the Option is per-iteration; when the loop
@@ -4078,8 +4103,8 @@ pub fn run(
         let mut changed = false;
         if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
             let v = {
-                let (_, d) = cd.get_or_insert_with(|| cfg_dt(func));
-                remove_trivial_params(func, d)
+                let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
+                remove_trivial_params(func, c, d)
             };
             changed = !v.is_empty();
             pmap.extend(v);
@@ -4180,7 +4205,7 @@ pub fn run(
         let n = dc + ic + bpn + rn;
         total += n;
         if n == 0 {
-            fnn_cur = Some(fnn(func, loads, derived, nn_opt));
+            fnn_cur = Some(fnn(func, loads, derived, nn_opt, &mut cd));
             break;
         }
         // No refresh needed: the guarded bits can only shrink inside
@@ -4194,7 +4219,7 @@ pub fn run(
     }
     let fnn = match fnn_cur {
         Some(x) => x,
-        None => fnn(func, loads, derived, None),
+        None => fnn(func, loads, derived, None, &mut cd),
     };
     if prof {
         if pliron_cfg::tracing_on() {

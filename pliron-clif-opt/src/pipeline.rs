@@ -2194,8 +2194,9 @@ fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `icmp eq (select c, 0, ptr), 0` → `c` when `ptr` is non-null — the
 // Option-niche test behind `Chars::next`'s bounds check; kills the
 // `mov 0; cmp; csel; cmp` tail sequence.
-fn s_niche(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let nn = jumpthread::NonNull::new(&p.clctx.func, p.nonnull, p.derived);
+fn s_niche(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let nn =
+        jumpthread::NonNull::new(&p.clctx.func, an.cfg_dt(&p.clctx.func).0, p.nonnull, p.derived);
     let k =
         niche::run(&mut p.clctx.func, &nn) + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
     if k > 0 {

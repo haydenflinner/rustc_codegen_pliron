@@ -88,7 +88,7 @@ pub fn run(
                     tracing::debug!(target: "pliron::unroll", "unroll: candidate {h} ({} blocks)", body.len())
                 };
             }
-            let nn = nn.get_or_insert_with(|| NonNull::new(func, loads, derived));
+            let nn = nn.get_or_insert_with(|| NonNull::new(func, cfg, loads, derived));
             match trip(func, nn, &body, h, entry.clone(), None) {
                 Some((_, _, map)) if used_out.iter().all(|v| map.contains_key(v)) => {}
                 _ => {
