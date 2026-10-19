@@ -22,13 +22,14 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
 here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold +
-`NonNull`-i32 + `dem64`, `bench/wasm/run.sh`): **1.042** — wins
-`chars_alpha` −34%, `iterw` −40%, `matmul` −8%, `eqbug` −11%;
-`chars_ascii` +35→**+9.2%** (the `Option`-niche `end`/`null` + `i64`
-demote landed); residuals `chars_mixed` +47.5%, `parse_only` +33%,
-`tokenize` +29%, `hashmap`/`hmget` +20-21%, `strwork` +19%, `fib` +9.5%,
-`nbody` +7.6% — UTF-8 multi-byte decode + `Option`/`next`/`iter`/`hash`/
-`i64`-residual op count (see below).
+`NonNull`-i32 `PLIRON_NN_ANYINT` + `dem64` + `clifpeep`
+`ext_load`/`icmpk`/`addnorm`/`icmpred`/`bitmerge`/`post_sweep`,
+`bench/wasm/run.sh`): **~1.03** — wins `chars_alpha` −34%, `iterw` −40%,
+`matmul` −8%, `eqbug` −11%; `chars_ascii` +35→**+9%**, `chars_mixed`
++50→**+40%**, `strwork` +24→**+16%**, `hashmap`/`hmget` ~+21%,
+`parse_only` ~+31%, `tokenize` ~+29%, `fib` ~+10%, `nbody` ~+8% —
+residual is `next_code_point`/UTF-8 decode + `Option`/`next`/`iter`/
+`Split`/`hash` op count + waffle-emit `local.set`/`phi` copies (below).
 
 ## How to measure
 
