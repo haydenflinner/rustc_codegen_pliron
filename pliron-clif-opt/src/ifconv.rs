@@ -22,6 +22,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 /// One branch arm resolved against a candidate merge point.
 struct Arm {
@@ -29,17 +30,17 @@ struct Arm {
     /// the target itself for a direct edge.
     m: Block,
     /// Values to feed `M`'s params, using pre-clone side-local results.
-    args: Vec<Value>,
+    args: SmallVec<[Value; 8]>,
     /// The block that edges into `M` — the last forwarder hop; `None` for
     /// a direct `b -> M` edge.
     side: Option<Block>,
     /// Every forwarder hop traversed, in order (empty for a direct arm).
-    chain: Vec<Block>,
+    chain: SmallVec<[Block; 8]>,
     /// Pure insts across the whole chain (program order) to speculate
     /// into `b`.
-    clone: Vec<Inst>,
+    clone: SmallVec<[Inst; 8]>,
     /// Chain param -> incoming edge arg (per hop, in order).
-    psub: Vec<(Value, Value)>,
+    psub: SmallVec<[(Value, Value); 16]>,
     /// `chain` went beyond one hop — gated by `flat_loop`: folding a
     /// chain inside a loop is only profitable when the loop ends up
     /// branch-free (vectorizer-bound); inside a still-branchy loop it
@@ -150,10 +151,10 @@ fn bool_merge(func: &Function, arms: &[&Arm]) -> bool {
 /// `psub`; intermediate results remap through `emit_arm`'s value map.
 fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
     let mut cur = tgt;
-    let mut cur_edge: Vec<BlockArg> = edge.to_vec();
-    let mut chain = Vec::new();
-    let mut clone = Vec::new();
-    let mut psub = Vec::new();
+    let mut cur_edge: SmallVec<[BlockArg; 8]> = SmallVec::from_slice(edge);
+    let mut chain = SmallVec::new();
+    let mut clone = SmallVec::new();
+    let mut psub = SmallVec::new();
     while chain.len() < 8 {
         let Some(jmp) = func.layout.last_inst(cur) else {
             break;
@@ -218,8 +219,7 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
         }
         return None;
     }
-    let map: FxHashMap<Value, Value> = psub.iter().copied().collect();
-    let mut args = Vec::new();
+    let mut args = SmallVec::new();
     for a in &cur_edge {
         let BlockArg::Value(v) = a else {
             return None;
@@ -227,8 +227,9 @@ fn resolve_arm(func: &Function, tgt: Block, edge: &[BlockArg]) -> Option<Arm> {
         // Resolve through the chain's param substitutions: the final edge
         // args are the last hop's own params, which are identical for every
         // arm sharing that hop. Dedup must see what each arm actually feeds
-        // `m` — the value injected at its first hop.
-        args.push(thru(&map, func.dfg.resolve_aliases(*v)));
+        // `m` — the value injected at its first hop. `psub` is small
+        // (≤8 hops × params), so a linear walk beats a map build.
+        args.push(thru_psub(&psub, func.dfg.resolve_aliases(*v)));
     }
     Some(Arm {
         m: cur,
@@ -257,6 +258,18 @@ fn thru(map: &FxHashMap<Value, Value>, mut v: Value) -> Value {
     for _ in 0..16 {
         match map.get(&v) {
             Some(&w) if w != v => v = w,
+            _ => return v,
+        }
+    }
+    v
+}
+
+/// `thru` over a small `psub` pair list — same transitive resolution,
+/// linear probe instead of hashing (psub ≤ 8 hops × params).
+fn thru_psub(psub: &[(Value, Value)], mut v: Value) -> Value {
+    for _ in 0..16 {
+        match psub.iter().find(|&&(p, _)| p == v) {
+            Some(&(_, w)) if w != v => v = w,
             _ => return v,
         }
     }
@@ -820,6 +833,8 @@ pub fn run(
     // across rounds.
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut scans = 0usize;
+    let mut nbrif = 0usize;
+    let mut nres = 0usize;
     // Per-brif edge args — reused across blocks and rounds instead of two
     // fresh Vecs per candidate.
     let mut t_edge: Vec<BlockArg> = Vec::new();
@@ -859,6 +874,7 @@ pub fn run(
                 t_bc.block(&func.dfg.value_lists),
                 e_bc.block(&func.dfg.value_lists),
             );
+            nbrif += 1;
             if t == b || e == b {
                 continue;
             }
@@ -866,6 +882,7 @@ pub fn run(
             t_edge.extend(t_bc.args(&func.dfg.value_lists));
             e_edge.clear();
             e_edge.extend(e_bc.args(&func.dfg.value_lists));
+            nres += 1;
             let Some(ta) = resolve_arm(func, t, &t_edge) else {
                 continue;
             };
@@ -986,7 +1003,7 @@ pub fn run(
     }
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO)
     {
-        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms scans={scans} conv={n}", c.get() as f64 / 1e6));
+        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms scans={scans} brif={nbrif} res={nres} conv={n}", c.get() as f64 / 1e6));
     }
     n
 }
