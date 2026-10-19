@@ -1976,7 +1976,7 @@ fn fold_guard_bands(func: &mut Function) -> usize {
 pub fn run(func: &mut Function) -> usize {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::celim", tracing::Level::INFO);
-    let t0 = std::time::Instant::now();
+    let t0 = prof.then(std::time::Instant::now);
     let guards = fold_guard_bands(func);
     if guards > 0
         && pliron_cfg::tracing_on()
@@ -1989,20 +1989,20 @@ pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
     let mut fact = edge_facts(func, &cfg, &domtree);
-    let t_setup = t0.elapsed();
-    let mut tp = std::time::Instant::now();
+    let t_setup = t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    let mut tp = prof.then(std::time::Instant::now);
     join_facts(func, &cfg, &domtree, &mut fact);
-    let t_join = tp.elapsed();
+    let t_join = tp.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut folds: Vec<(Inst, bool)> = Vec::new();
     let srcs = crate::proots::alias_map_cfg(func, &cfg);
-    tp = std::time::Instant::now();
+    tp = prof.then(std::time::Instant::now);
     for (h, fs) in induction_facts(func, &cfg, &domtree, &fact, &srcs) {
         fact.entry(h).or_default().extend(fs);
     }
-    let t_induct = tp.elapsed();
+    let t_induct = tp.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut t_scan = std::time::Duration::ZERO;
     if !fact.is_empty() {
-        tp = std::time::Instant::now();
+        tp = prof.then(std::time::Instant::now);
         for b in func.layout.blocks() {
             let fs = facts_at(&domtree, &fact, b);
             if fs.is_empty() {
@@ -2036,13 +2036,13 @@ pub fn run(func: &mut Function) -> usize {
                 }
             }
         }
-        t_scan = tp.elapsed();
+        t_scan = tp.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         for &(i, k) in &folds {
             let ty = func.dfg.value_type(func.dfg.first_result(i));
             func.replace(i).iconst(ty, i64::from(k));
         }
     }
-    tp = std::time::Instant::now();
+    tp = prof.then(std::time::Instant::now);
     if !folds.is_empty() || guards > 0 {
         // A folded check leaves a constant `brif`; retarget it so the dead
         // successor's edge args drop away for the remaining passes.
@@ -2051,13 +2051,13 @@ pub fn run(func: &mut Function) -> usize {
     if prof {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::celim", "  celim total {:?} guards={} setup={:?} join={:?} induct={:?} scan={:?} tail={:?}",
-                t0.elapsed(),
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 guards,
                 t_setup,
                 t_join,
                 t_induct,
                 t_scan,
-                tp.elapsed()
+                tp.map_or(std::time::Duration::ZERO, |t| t.elapsed())
             )
         };
     }

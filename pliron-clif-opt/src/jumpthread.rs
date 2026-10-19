@@ -2423,7 +2423,7 @@ pub(crate) fn round<'a>(
 pub fn merge_chains(func: &mut Function) {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
-    let t0 = std::time::Instant::now();
+    let t0 = prof.then(std::time::Instant::now);
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -2439,14 +2439,14 @@ pub fn merge_chains(func: &mut Function) {
                 break;
             };
             let y = destination.block(&func.dfg.value_lists);
-            let tp = std::time::Instant::now();
+            let tp = prof.then(std::time::Instant::now);
             // `take(2)`, not `count()`: a shared merge block can have one
             // predecessor list entry per dispatch arm, and counting them
             // all per arm is O(arms x preds) on giant `br_table` fns.
             if y == x || Some(y) == entry || cfg.pred_iter(y).take(2).count() != 1 {
                 break;
             }
-            t_cfg += tp.elapsed().as_nanos();
+            t_cfg += tp.map_or(0, |t| t.elapsed().as_nanos());
             let args: Vec<Value> = destination
                 .args(&func.dfg.value_lists)
                 .filter_map(|a| match a {
@@ -2467,15 +2467,15 @@ pub fn merge_chains(func: &mut Function) {
             {
                 break;
             }
-            let tp = std::time::Instant::now();
+            let tp = prof.then(std::time::Instant::now);
             let params = func.dfg.detach_block_params(y);
             let params: Vec<Value> = params.as_slice(&func.dfg.value_lists).to_vec();
             for (p, a) in params.into_iter().zip(args) {
                 func.dfg.change_to_alias(p, a);
             }
-            t_alias += tp.elapsed().as_nanos();
+            t_alias += tp.map_or(0, |t| t.elapsed().as_nanos());
             func.layout.remove_inst(term);
-            let tp = std::time::Instant::now();
+            let tp = prof.then(std::time::Instant::now);
             let insts: Vec<Inst> = func.layout.block_insts(y).collect();
             for i in insts {
                 func.layout.remove_inst(i);
@@ -2483,7 +2483,7 @@ pub fn merge_chains(func: &mut Function) {
                 moves += 1;
             }
             func.layout.remove_block(y);
-            t_move += tp.elapsed().as_nanos();
+            t_move += tp.map_or(0, |t| t.elapsed().as_nanos());
             merges += 1;
             gone.insert(y);
         }
@@ -2492,7 +2492,7 @@ pub fn merge_chains(func: &mut Function) {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
                 "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
-                t0.elapsed(),
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 t_cfg / 1_000_000,
                 t_alias / 1_000_000,
                 t_move / 1_000_000
@@ -2511,7 +2511,7 @@ pub fn merge_chains(func: &mut Function) {
 pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     // cfg/dom stay local: callers in this step mutate the CFG without
     // invalidating `an`, so its cfg/dt may be stale here. The use index
     // is safe — `an.uses` keys on `num_insts` and rebuilds when the
@@ -2524,11 +2524,11 @@ pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> us
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
                 "    rebind setup {:.3}ms",
-                t0.elapsed().as_secs_f64() * 1e3
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3
             )
         };
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let mut edits = Vec::new();
     for y in func.layout.blocks().collect::<Vec<_>>() {
         // Params then inst results — deterministic order.
@@ -2615,12 +2615,12 @@ pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> us
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::jumpthread",
                 "    rebind scan {:.3}ms (edits={})",
-                t0.elapsed().as_secs_f64() * 1e3,
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3,
                 edits.len()
             )
         };
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let n = edits.len();
     // Edge args grouped by term — a giant dispatch has an edit per arm,
     // and a full destination rescan per edit is O(arms²).
@@ -2666,7 +2666,7 @@ pub fn rebind_exports(func: &mut Function, an: &crate::pipeline::Analysis) -> us
     }
     if prof2 {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+            tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3)
         };
     }
     n
@@ -4042,7 +4042,7 @@ pub fn run(
     use crate::pipeline::shape;
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
-    let mut tp = std::time::Instant::now();
+    let mut tp = prof.then(std::time::Instant::now);
     // Sub-phase guards use the entry-time `shape` bits: no phase below
     // can create the first edge (MULTI), block param (BPARAM), or
     // conditional branch (CONDBR) — they only remove them — so an
@@ -4055,9 +4055,9 @@ pub fn run(
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
-        tp = std::time::Instant::now();
+        tp = Some(std::time::Instant::now());
     }
     let domcond = crate::pass_enabled("PLIRON_DOMCOND");
     let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
@@ -4099,7 +4099,7 @@ pub fn run(
     let mut round_quiet = false;
     let mut round_skips = 0usize;
     for _ in 0..8 {
-        let mut tp = std::time::Instant::now();
+        let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
         if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
             let v = {
@@ -4112,9 +4112,9 @@ pub fn run(
         }
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
         if deadp && sh & shape::BPARAM != 0 {
             let removed = {
@@ -4130,9 +4130,9 @@ pub fn run(
         }
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
         let dc = if domcond && sh & shape::CONDBR != 0 {
             let (c, d) = cd.get_or_insert_with(|| cfg_dt(func));
@@ -4145,9 +4145,9 @@ pub fn run(
         check(func, "domcond");
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
         // Select-diamond if-conversion feeds back: folded forwarders expose
         // new diamonds and bypass_forwarders collapses the residue. The dead
@@ -4183,9 +4183,9 @@ pub fn run(
         }
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
-            tp = std::time::Instant::now();
+            tp = Some(std::time::Instant::now());
         }
         let mut nn_opt = None;
         let rn = if sh & shape::CONDBR == 0 || (round_quiet && !changed) {
@@ -4199,7 +4199,7 @@ pub fn run(
         check(func, "round");
         if prof {
             if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.elapsed())
+                tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
             };
         }
         if rn > 0 {
@@ -4216,9 +4216,9 @@ pub fn run(
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.elapsed())
+            tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
-        tp = std::time::Instant::now();
+        tp = Some(std::time::Instant::now());
     }
     let fnn = match fnn_cur {
         Some(x) => x,
@@ -4226,7 +4226,7 @@ pub fn run(
     };
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
     (total + fnn, dead_params, dominated_folds, pmap)

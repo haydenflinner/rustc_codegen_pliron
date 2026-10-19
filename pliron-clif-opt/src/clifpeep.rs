@@ -2411,18 +2411,22 @@ pub fn webmerge_ctx(
     dirty: Option<&FxHashSet<Block>>,
 ) -> (usize, FxHashMap<Value, Value>, FxHashSet<Block>) {
     use crate::proots::Key;
-    let t0 = std::time::Instant::now();
+    // `var_os` reads /proc-level state per call — hoisted out of the
+    // per-block loop (16k lookups per webmerge round otherwise). Every
+    // clock read in this function only feeds these `wmprof` log lines,
+    // so they're all gated on it.
+    let wmprof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
+    let t0 = wmprof.then(std::time::Instant::now);
     let WmCtx { cfg, dom, edges } = ctx;
     // One edge-fact scan feeds both the web normal forms and the
     // canonical-class proots — nothing mutates between them.
     let facts = crate::proots::facts_cfg(func, cfg);
     let nf = crate::proots::web_nf_facts(func, &facts);
-    let t2 = std::time::Instant::now();
+    let t2 = wmprof.then(std::time::Instant::now);
     let canon = crate::proots::canon_map_facts(&facts);
-    let t3 = std::time::Instant::now();
-    if pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO)
-    {
+    let t3 = wmprof.then(std::time::Instant::now);
+    if let (Some(t0), Some(t2), Some(t3)) = (t0, t2, t3) {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::clifpeep", "webmerge {}: web_nf {:?} canon {:?}",
                 func.name,
@@ -2446,12 +2450,8 @@ pub fn webmerge_ctx(
     // (target block, class key, param to rebind) — emission happens after
     // the scan so `Value`s stay valid and insertions keep operand order.
     let mut inserts: Vec<(Block, Key, Value)> = vec![];
-    let twloop = std::time::Instant::now();
+    let twloop = wmprof.then(std::time::Instant::now);
     let mut tpre_sum = std::time::Duration::ZERO;
-    // `var_os` reads /proc-level state per call — hoisted out of the
-    // per-block loop (16k lookups per webmerge round otherwise).
-    let wmprof = pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
     let wm_nodiffb = pliron_cfg::env_set("PLIRON_WM_NODIFFB");
     let wm_rel = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::DEBUG);
@@ -3255,7 +3255,7 @@ pub fn webmerge_ctx(
         if no_phasec {
             continue;
         }
-        let tphasec = std::time::Instant::now();
+        let tphasec = wmprof.then(std::time::Instant::now);
         // Survivors, capped by key size: `key_rep` rebuilds a whole
         // signature tree per (slot, edge, round), so slots carrying
         // 10⁴-node expression keys make refinement quadratic-by-
@@ -3275,7 +3275,7 @@ pub fn webmerge_ctx(
             })
             .collect();
         if surv.len() >= 2 {
-            let tbis = std::time::Instant::now();
+            let tbis = wmprof.then(std::time::Instant::now);
             // Initial partition: one class per value type.
             let mut cls: FxHashMap<usize, usize> = FxHashMap::default();
             for &i in &surv {
@@ -3326,14 +3326,14 @@ pub fn webmerge_ctx(
                 }
                 cls = next;
             }
-            if wmprof && tbis.elapsed().as_micros() > 200 {
+            if tbis.is_some_and(|t| t.elapsed().as_micros() > 200) {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: bisim surv={} E={} rounds={} {:?}",
                         func.name,
                         surv.len(),
                         es.len(),
                         rounds,
-                        tbis.elapsed()
+                        tbis.unwrap().elapsed()
                     )
                 };
             }
@@ -3350,13 +3350,13 @@ pub fn webmerge_ctx(
                 }
             }
         }
-        if wmprof && tphasec.elapsed().as_micros() > 200 {
+        if tphasec.is_some_and(|t| t.elapsed().as_micros() > 200) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: phaseC P={} E={} {:?}",
                     func.name,
                     ps.len(),
                     es.len(),
-                    tphasec.elapsed()
+                    tphasec.unwrap().elapsed()
                 )
             };
         }
@@ -3364,7 +3364,7 @@ pub fn webmerge_ctx(
     if param_drops.is_empty() {
         return (0, pmap, FxHashSet::default());
     }
-    let tprep = std::time::Instant::now();
+    let tprep = wmprof.then(std::time::Instant::now);
     // Materialize each non-member class at its block's head, operands
     // before users, then insert the run before the original first inst.
     let mut orders: FxHashMap<Block, Vec<Inst>> = FxHashMap::default();
@@ -3421,21 +3421,19 @@ pub fn webmerge_ctx(
         }
     }
     let n = param_drops.len();
-    let temit = std::time::Instant::now();
+    let temit = wmprof.then(std::time::Instant::now);
     apply_param_drops(func, pmap.clone(), arg_drops, param_drops);
-    let demit = temit.elapsed();
-    if pliron_cfg::tracing_on()
-        && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO)
-    {
+    let demit = temit.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    if wmprof {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::clifpeep", "webmerge {}: total {:?} wloop {:?} pre {:?} keying {:?} ixscan {:?} prep {:?} emit {:?} blocks {}",
                 func.name,
-                t0.elapsed(),
-                twloop.elapsed(),
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+                twloop.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 tpre_sum,
                 tkeys_sum,
                 tblk_sum,
-                tprep.elapsed(),
+                tprep.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 demit,
                 nblk
             )

@@ -81,10 +81,31 @@ Next steps, in expected-payoff order:
    `creates` (superset — a clear bit certifies absence; under-admission
    is a missed opt, never a miscompile; `PLIRON_SHAPE_CHECK` catches it).
    `clif-check bench target/corpus/std`: 35.5 s → 28.7 s (~19%).
-3. **The heavy steps**: jumpthread, ifconv2, slp, loadfwd, mergechain.
-   Each is the subject of earlier rounds (see docs/performance.md); the
-   remaining cost is per-function analysis rebuilds — use the shared
-   `Analysis` cache, and see the complexity rules in AGENTS.md.
+3. ~~The heavy steps~~ **partly done**: `clif-check bench`: 28.7 →
+   **27.5 s**. `remove_trivial_params`/`NonNull::new`/`remove_dead_params`
+   now walk CFG predecessors of (candidate-)param'd blocks instead of
+   every edge — `trivp` went from the #1 leaf (3443 samples) to ~1 ms.
+   `Analysis` carries a `facts` slot (`proots::facts_cfg`) next to
+   `amap`/`iso`: `dse_inputs` and `loadfwd::run` share one edge-fact
+   build per version instead of 3-4 private scans. `webmerge_ctx`'s
+   per-block `Instant::now()`s are gated on `wmprof`; `edgespec`
+   reuses its entry cfg/dom for `splices` when nothing applied and
+   skips the second sweep pair when splices is a no-op. Every
+   diagnostics-only `Instant::now()` in the CLIF passes is now gated on
+   its tracing target (`run_step`'s two per-step reads behind
+   `pliron_cfg::step_timing_on()` — `mach_absolute_time` was ~2-3% of
+   rustc-compile leaf samples); clif-check marks the flag itself so
+   `bench`/`report` tables are unchanged.
+   Left: jumpthread ~4.0 s (a ~6-phase fixpoint; `round`'s threading
+   walk is the residue — `domcond` ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
+   the webmerge family ~4 s (`cparm`/`sameargs*` per-block key
+   matrices + per-call `facts_cfg`/`affine_nf`/`Proots` Ascent —
+   caching those across rounds needs dirty-region-safe incremental
+   facts, since `pmap` rewrites edge args outside `merge_dirty`), and
+   mergechain ~1.8 s (`edgespec::run` inside ≈ half of it; `fin_edge`
+   is the top app leaf). The next tier is mechanical-and-risky, not
+   algorithmic: flat `Vec`+stride matrices in `webmerge_ctx`,
+   `SymMap` u32 keys on the pliron-IR side, interned-sym inline maps.
 4. **xcgu copies** multiply IR-opt work per CGU (`PLIRON_XCGU=0` cut syn
    78 → 55 s) but feed the inliner. Share analyzed bodies across CGUs
    instead of re-optimizing each copy.

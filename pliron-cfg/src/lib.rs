@@ -169,6 +169,28 @@ pub fn tracing_on() -> bool {
     TRACING_ON.load(Ordering::Relaxed) || tracing::dispatcher::has_been_set()
 }
 
+/// `run_step`'s per-step `Instant::now()`s are only observable through
+/// `pliron::timing` logs or `PLIRON_TRACE_FILE` lines — harnesses that
+/// consume `Stats::timing` directly (clif-check bench) mark this.
+static STEP_TIMING: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_step_timing() {
+    STEP_TIMING.store(true, Ordering::Relaxed);
+}
+
+/// Whether per-step wall-clock reads are worth paying. Off in a plain
+/// rustc compile (no subscriber path can print `pliron::timing` and no
+/// trace file is open): ~2 clock reads per step per function saved.
+#[inline]
+pub fn step_timing_on() -> bool {
+    static DERIVED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        env_get("PLIRON_TRACE_FILE").is_some()
+            || (tracing_on()
+                && tracing::enabled!(target: "pliron::timing", tracing::Level::INFO))
+    });
+    STEP_TIMING.load(Ordering::Relaxed) || *DERIVED
+}
+
 /// `PLIRON_<X>` present — presence-flag debug knobs.
 pub fn env_set(var: &str) -> bool {
     config().set(var)

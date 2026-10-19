@@ -882,7 +882,7 @@ pub fn run(
     };
     let prof2 = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     // `cfg`/`pf`/`ps` are step-entry snapshots from `Analysis::lf_inputs`
     // (shared with dse's alias map); a rebuilt CFG after `pre` mutates
     // goes in `cfg2` below. `pf`/`ps` intentionally stay stale across
@@ -932,18 +932,18 @@ pub fn run(
     }
     if prof2 {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
+            tracing::info!(target: "pliron::loadfwd", "    lf-setup {:.3}ms", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3)
         };
     }
-    let tt = |name: &str, t0: std::time::Instant| {
-        if prof2 {
+    let tt = |name: &str, t0: Option<std::time::Instant>| {
+        if let (true, Some(t0)) = (prof2, t0) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::loadfwd", "    lf-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
             };
         }
     };
     if crate::pass_enabled("PLIRON_LOADPRE") {
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
@@ -981,7 +981,7 @@ pub fn run(
         }
         acc
     };
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let mut iters = 0;
     // Worklist over RPO order: `meet` only shrinks loc sets (a must
     // analysis), so the unique fixpoint is order-independent and a
@@ -1040,14 +1040,14 @@ pub fn run(
     if prof2 {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::loadfwd", "    lf-fxpt {:.3}ms (iters={iters})",
-                t0.elapsed().as_secs_f64() * 1e3
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3
             )
         };
     }
     if !stable {
         return 0;
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let mut fwd: Vec<(Inst, Fwd)> = Vec::new();
     for &b in &rpo {
         if let Some(mut av) = input(&out, b) {

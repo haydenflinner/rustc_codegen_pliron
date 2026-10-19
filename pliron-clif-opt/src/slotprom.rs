@@ -232,14 +232,14 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     }
     let timer = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::slotprom", tracing::Level::INFO);
-    let t0 = std::time::Instant::now();
+    let t0 = timer.then(std::time::Instant::now);
     let webs = Webs::new(func, cfg);
     if timer {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::slotprom", "slotprom: webs {:?} ({} blocks)", t0.elapsed(), nblocks)
+            tracing::info!(target: "pliron::slotprom", "slotprom: webs {:?} ({} blocks)", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()), nblocks)
         };
     }
-    let t1 = std::time::Instant::now();
+    let t1 = timer.then(std::time::Instant::now);
 
     // Reachable blocks only — dead blocks' accesses stay on memory.
     let mut reach: FxHashSet<Block> = FxHashSet::default();
@@ -403,13 +403,13 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     if timer {
         if pliron_cfg::tracing_on() {
             tracing::debug!(target: "pliron::slotprom", "slotprom: accs scan {:?} ({} poisoned={})",
-                t1.elapsed(),
+                t1.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 func.name,
                 webs.poisoned()
             )
         };
     }
-    let t2 = std::time::Instant::now();
+    let t2 = timer.then(std::time::Instant::now);
     if webs.poisoned() {
         return 0;
     }
@@ -599,12 +599,12 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     if timer {
         if pliron_cfg::tracing_on() {
             tracing::debug!(target: "pliron::slotprom", "slotprom: liveins {:?} ({} fields)",
-                t2.elapsed(),
+                t2.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                 fields.len()
             )
         };
     }
-    let t3 = std::time::Instant::now();
+    let t3 = timer.then(std::time::Instant::now);
     if kept.is_empty() {
         return 0;
     }
@@ -677,10 +677,10 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     }
     if timer {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::slotprom", "slotprom: plan {:?}", t3.elapsed())
+            tracing::info!(target: "pliron::slotprom", "slotprom: plan {:?}", t3.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let t4 = std::time::Instant::now();
+    let t4 = timer.then(std::time::Instant::now);
 
     // Rewrite: alias loads, drop stores, append reaching values on edges.
     let mut n = 0;
@@ -841,7 +841,7 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     }
     if timer {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::slotprom", "slotprom: rewrite {:?}", t4.elapsed())
+            tracing::info!(target: "pliron::slotprom", "slotprom: rewrite {:?}", t4.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
     n

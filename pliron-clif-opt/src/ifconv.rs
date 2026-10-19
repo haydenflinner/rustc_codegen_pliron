@@ -650,9 +650,11 @@ fn conv_table(
     }
     let chains: FxHashSet<Block> = arms.iter().flat_map(|a| a.chain.iter().copied()).collect();
     let mset = msets.get(m);
-    let t0 = std::time::Instant::now();
+    let t0 = EDGE_PROF.with(|c| c.get()).then(std::time::Instant::now);
     let ok = !mset.is_empty() && edge_ok(func, domtree, m, mset, &chains, term);
-    EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+    if let Some(t0) = t0 {
+        EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+    }
     if !ok {
         return false;
     }
@@ -752,6 +754,10 @@ fn conv_table(
 
 thread_local! {
     static EDGE_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    // `edge_ok` runs per candidate arm — its per-call `Instant::now` only
+    // ever feeds the `EDGE_NS` total printed at the end of `run`, so the
+    // clock reads are gated on `pliron::ifconv` INFO being live.
+    static EDGE_PROF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn run(
@@ -760,6 +766,10 @@ pub fn run(
     cd: Option<(&mut ControlFlowGraph, &mut DominatorTree)>,
 ) -> usize {
     EDGE_NS.set(0);
+    EDGE_PROF.set(
+        pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO),
+    );
     // The caller's cached cfg/dt may be reused: edge-args and values may
     // have changed since it was built, but block adjacency has not.
     let (mut cfg_l, mut dt_l);
@@ -902,9 +912,11 @@ pub fn run(
             let chains: FxHashSet<Block> =
                 ta.chain.iter().chain(ea.chain.iter()).copied().collect();
             let mset = msets.get(m);
-            let t0 = std::time::Instant::now();
+            let t0 = EDGE_PROF.with(|c| c.get()).then(std::time::Instant::now);
             let ok = !mset.is_empty() && edge_ok(func, domtree, m, mset, &chains, term);
-            EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+            if let Some(t0) = t0 {
+                EDGE_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+            }
             if !ok {
                 continue;
             }

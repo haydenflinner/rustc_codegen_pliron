@@ -722,7 +722,11 @@ impl Analysis {
         std::time::Duration,
         std::time::Duration,
     ) {
-        let t = std::time::Instant::now();
+        // `t_ps`/`t_iso` only feed `dseprof` log lines — skip the clock
+        // reads unless `pliron::dse` tracing is live.
+        let prof = crate::config::tracing_on()
+            && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
+        let t = prof.then(std::time::Instant::now);
         self.materialize(func);
         if self.facts.is_none() {
             self.facts = Some(crate::proots::facts_cfg(func, self.cfg.as_ref().unwrap()));
@@ -730,8 +734,8 @@ impl Analysis {
         if self.amap.is_none() {
             self.amap = Some(crate::proots::alias_of(self.facts.as_ref().unwrap()));
         }
-        let t_ps = t.elapsed();
-        let t = std::time::Instant::now();
+        let t_ps = t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let t = prof.then(std::time::Instant::now);
         if self.iso.as_ref().is_none_or(|&(n, _)| n != noalias.len()) {
             self.iso = Some((
                 noalias.len(),
@@ -743,7 +747,7 @@ impl Analysis {
             self.amap.as_ref().unwrap(),
             &self.iso.as_ref().unwrap().1,
             t_ps,
-            t.elapsed(),
+            t.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
         )
     }
 
@@ -1261,7 +1265,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             .entered()
     });
     let _pg = p.prof_hook.map(|h| h(s.name));
-    let t0 = std::time::Instant::now();
+    let t0 = pliron_cfg::step_timing_on().then(std::time::Instant::now);
     // A step whose required shape bits are absent cannot apply — skip it
     // before any cache lookup. Evaluated on the current state rather than
     // at selection time: earlier steps can create a later step's shape
@@ -1332,7 +1336,9 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             p.seed_derived_bits();
             an.invalidate(&p.clctx.func);
         }
-        *slot += t0.elapsed();
+        if let Some(t0) = t0 {
+            *slot += t0.elapsed();
+        }
         return;
     }
     p.cur_step = s.name;
@@ -1359,8 +1365,11 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         }
         k
     };
-    *slot += t0.elapsed();
-    trace(s.name, t0.elapsed().as_secs_f64() * 1e3, p.fname);
+    if let Some(t0) = t0 {
+        let d = t0.elapsed();
+        *slot += d;
+        trace(s.name, d.as_secs_f64() * 1e3, p.fname);
+    }
     if s.mutates {
         // Not conditional on `k`: a pass that removes blocks but
         // reports 0 would leave cfg/domtree stale for the next step.
@@ -1412,8 +1421,8 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
 fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     let prof2 = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
-    let tt = |name: &str, t0: std::time::Instant| {
-        if prof2 {
+    let tt = |name: &str, t0: Option<std::time::Instant>| {
+        if let (true, Some(t0)) = (prof2, t0) {
             if pliron_cfg::tracing_on() {
                 tracing::info!(target: "pliron::jumpthread", "    mc-{name} {:.3}ms", t0.elapsed().as_secs_f64() * 1e3)
             };
@@ -1432,14 +1441,14 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     // bits merely over-admit a no-op scan.
     let mc = an.shape_bits(&p.clctx.func);
     if crate::pass_enabled("PLIRON_CHAINMERGE") && mc & shape::JUMP != 0 {
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         jumpthread::merge_chains(&mut p.clctx.func);
         tt("chains", t0);
     }
     let cond = mc & shape::CONDBR != 0;
     let mut cd: Option<(ControlFlowGraph, DominatorTree)> = None;
     if cond && crate::pass_enabled("PLIRON_DISPATCHDUP") {
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         // Duplicating a dispatch into a jump pred rewires that pred's own
         // jump-preds onto the dispatch — run to fixpoint so multi-hop
         // chains (851/853/854 -> 388 -> 859) fully collapse.
@@ -1463,15 +1472,15 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     if cond && crate::pass_enabled("PLIRON_EDGESPEC2") {
         cd = None;
         if crate::pass_enabled("PLIRON_REBIND") {
-            let t0 = std::time::Instant::now();
+            let t0 = prof2.then(std::time::Instant::now);
             n += jumpthread::rebind_exports(&mut p.clctx.func, an);
             tt("rebind", t0);
         }
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         n += edgespec::run(&mut p.clctx.func);
         tt("espec", t0);
         if crate::pass_enabled("PLIRON_DISPATCHDUP") {
-            let t0 = std::time::Instant::now();
+            let t0 = prof2.then(std::time::Instant::now);
             // Edgespec can leave fresh jump preds on small dispatch blocks.
             for _ in 0..6 {
                 let k = {
@@ -1491,7 +1500,7 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
             tt("dup2", t0);
         }
     }
-    let t0 = std::time::Instant::now();
+    let t0 = prof2.then(std::time::Instant::now);
     let k = if cond {
         clifpeep::brif_fold(&mut p.clctx.func)
     } else {
@@ -1500,7 +1509,7 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
     tt("brifold", t0);
     n += k;
     if n > 0 {
-        let t0 = std::time::Instant::now();
+        let t0 = prof2.then(std::time::Instant::now);
         jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
         edgespec::sweep_dead(&mut p.clctx.func);
         tt("sweep", t0);
@@ -1675,7 +1684,9 @@ fn s_tailrec(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let t = std::time::Instant::now();
+    let prof = crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
+    let t = prof.then(std::time::Instant::now);
     // The dataflow only ever forwards a `load` (every `Fwd` is pushed
     // on a load arm) — without one, the CFG/RPO/proot/iso setup and
     // the fixpoint can produce nothing.
@@ -1696,30 +1707,26 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
             p.nocap,
         );
     }
-    if crate::config::tracing_on()
-        && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO)
-    {
+    if let Some(t) = t {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::loadfwd", "    lf-run {:?}", t.elapsed())
         };
     }
     if p.flags.slot_dse {
-        let prof2 = crate::config::tracing_on()
-            && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
         // A load whose only user was a removed dead store keeps its own
         // slot alive, so alternate the two until nothing changes.
         let has_store = an.shape_bits(&p.clctx.func) & shape::STORE != 0;
         for i in 0..4 {
-            let t = std::time::Instant::now();
+            let t = prof.then(std::time::Instant::now);
             if has_store {
                 p.stats.slot_dse += loadfwd::dead_slot_stores(&mut p.clctx.func);
             }
-            if prof2 {
+            if let Some(t) = t {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::loadfwd", "    lf-dss[{i}] {:?}", t.elapsed())
                 };
             }
-            let t = std::time::Instant::now();
+            let t = prof.then(std::time::Instant::now);
             let n = if config().enabled("PLIRON_DEAD_LOADS") {
                 jumpthread::remove_dead_insts(
                     &mut p.clctx.func,
@@ -1728,7 +1735,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
             } else {
                 0
             };
-            if prof2 {
+            if let Some(t) = t {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::loadfwd", "    lf-rdi[{i}] {n} {:?}", t.elapsed())
                 };

@@ -1147,7 +1147,7 @@ pub fn sweep_dead(func: &mut Function) {
 pub fn run(func: &mut Function) -> usize {
     let prof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::edgespec", tracing::Level::INFO);
-    let t0 = std::time::Instant::now();
+    let t0 = prof.then(std::time::Instant::now);
     let cfg = ControlFlowGraph::with_function(func);
     let dom = DominatorTree::with_function(func, &cfg);
     // All-pure blocks — plans are collected before any apply, so this
@@ -1162,10 +1162,10 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec setup {:?}", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     // Cones are CFG-invariant for the whole plans phase (no mutation until
     // apply); many preds land on the same dispatch blocks, so memoize.
     let cones = std::cell::RefCell::new(FxHashMap::default());
@@ -1187,10 +1187,10 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec plans({}) {:?}", plans.len(), tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     let mut n = 0;
     let lim = crate::env_get("PLIRON_EDGESPEC_LIMIT").and_then(|s| s.parse::<usize>().ok());
     for (p, t, nt) in plans {
@@ -1239,10 +1239,10 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec apply({n}) {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     if n > 0 {
         sweep_blocks(func);
         sweep_dead(func);
@@ -1265,10 +1265,10 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec splices(n={n}) {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
-    let tp = std::time::Instant::now();
+    let tp = prof.then(std::time::Instant::now);
     let d = deadbits(func);
     if d > 0 {
         crate::jumpthread::remove_dead_params(
@@ -1281,7 +1281,7 @@ pub fn run(func: &mut Function) -> usize {
     }
     if prof {
         if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.elapsed())
+            tracing::info!(target: "pliron::edgespec", "  edgespec deadbits+tail(n={n}) {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
     n

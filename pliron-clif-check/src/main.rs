@@ -327,6 +327,9 @@ fn run_one(
 /// collection), printing the per-step timing table. Pure pass code: no
 /// rustc, no sampler — the iteration loop for pipeline perf work.
 fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
+    // The per-step table below reads `Stats::timing`; the pipeline skips
+    // its per-step clock reads unless told the numbers are observable.
+    pliron_clif_opt::config::mark_step_timing();
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();
@@ -509,6 +512,9 @@ fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &s
 /// for `harness/live/` (and the gate). Never aborts on a bad function:
 /// panics, verifier errors and mismatches become rows.
 fn report_corpus(isa: &std::sync::Arc<dyn TargetIsa>, dir: &Path, out: &Path, o: &Opts) -> bool {
+    // `steps.timing` lands in the JSON's per-step table — the pipeline
+    // skips its per-step clock reads unless told they're observable.
+    pliron_clif_opt::config::mark_step_timing();
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();

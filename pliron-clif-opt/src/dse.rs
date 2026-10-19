@@ -415,7 +415,7 @@ pub fn run(
     // pass wired to `Analysis`) build these at most once per IR state.
     let (cfg, ps, iso, t_ps, t_iso) = an.dse_inputs(func, noalias, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
-    let t = std::time::Instant::now();
+    let t = prof.then(std::time::Instant::now);
     let mut order = Vec::new();
     let mut seen: SecondaryMap<Block, bool> = SecondaryMap::new();
     let mut stack = vec![entry];
@@ -433,7 +433,7 @@ pub fn run(
     // sweep then replay `Demands` ops instead of re-reading the DFG and
     // re-peeling `root` chains.
     let (ops, store_blks) = decode(func, ps, noalias, nw, eh, &order);
-    let t_dec = t.elapsed();
+    let t_dec = t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     if store_blks.is_empty() {
         // Every candidate's address failed `mem_loc` — the fixpoint and
         // sweep can only ever report `dead = []`.
@@ -546,7 +546,7 @@ pub fn run(
         }
         return 0;
     }
-    let t_fix = t.elapsed() - t_dec;
+    let t_fix = t.map_or(std::time::Duration::ZERO, |t| t.elapsed() - t_dec);
     let dump =
         pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dse", tracing::Level::INFO);
     if dump {
@@ -586,7 +586,7 @@ pub fn run(
         func.layout.remove_inst(*i);
     }
     if prof {
-        let t_sweep = t.elapsed() - t_fix - t_dec;
+        let t_sweep = t.map_or(std::time::Duration::ZERO, |t| t.elapsed() - t_fix - t_dec);
         let ninst: usize = order.iter().map(|&b| ops[b].len()).sum();
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::dse", "dseprof {step} {fname} blocks={} ops={ninst} pops={pops} ps={t_ps:?} iso={t_iso:?} dec={t_dec:?} fix={t_fix:?} sweep={t_sweep:?} dead={}",
