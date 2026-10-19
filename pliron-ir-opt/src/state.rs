@@ -418,6 +418,18 @@ pub struct State {
     /// and would emit dangling `U`s). Keeping an unused copy is only
     /// object-code bloat; stripping a referenced one breaks the link.
     pub xcgu_copies: SymSet,
+    /// `PLIRON_XCGUFN_KILL=1`: `dead_fns` may strip `xcgu_copies` entries —
+    /// the default exemption exists because copy-to-copy refs can evade
+    /// `direct_callee`.
+    pub xcgufn_kill: bool,
+    /// `PLIRON_DEADUNOPT` (default on): `xcgu_copies`-protected fns that
+    /// `dead_fns` finds callerless get the minimal (`Gate::Always`)
+    /// pipeline instead of the full opt — they still lower and emit, so
+    /// any caller `direct_callee` can't see links and runs fine, but
+    /// the ~70%% of emitted fns that are provably dead weight stop
+    /// paying for optimization.
+    pub dead_unopt: SymSet,
+    pub deadunopt_on: bool,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
     pub notrap: bool,
     /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).

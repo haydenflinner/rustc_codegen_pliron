@@ -658,7 +658,10 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     // `Gate::ok` before a step runs — a flip changes *which* steps run
     // (caught by `PipeVariant::ran`), not what a running step sees, and
     // flag reads through the config accessors land in the read-set.
-    (p.simd, p.x64, p.cmp64, p.has_eh, p.dump, p.verify_full).hash(&mut h);
+    // `p.unopt` keys *which* steps run like the flag fields — a dead-
+    // candidate fn must not replay a full-pipeline variant nor publish
+    // one (uncached output would diverge either way).
+    (p.simd, p.x64, p.cmp64, p.has_eh, p.dump, p.verify_full, p.unopt).hash(&mut h);
     let r = h.0.finalize().into();
     an.fnh = Some(r);
     r

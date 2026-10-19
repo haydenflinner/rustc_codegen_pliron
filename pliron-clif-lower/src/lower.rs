@@ -550,6 +550,8 @@ pub fn lower_module<'a>(
         err: Option<cranelift_codegen::CodegenError>,
         code: Option<cranelift_codegen::CompiledCode>,
         dump: bool,
+        /// `st.dead_unopt` member: minimal (`Gate::Always`) pipeline.
+        unopt: bool,
     }
     /// Read-only inputs shared by every job in phase (B).
     struct JobShared<'a> {
@@ -821,6 +823,7 @@ pub fn lower_module<'a>(
                     err: None,
                     code: None,
                     dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
+                    unopt: st.dead_unopt.contains(n),
                 },
             );
             m.clear_context(&mut clctx);
@@ -917,6 +920,7 @@ pub fn lower_module<'a>(
                     flags: sh.fn_flags,
                     dump: j.dump,
                     verify_full,
+                    unopt: j.unopt,
                     stats: &mut j.stats,
                     carry_log: Vec::new(),
                     prof_hook: Some(&prof_hook),
@@ -1781,6 +1785,7 @@ pub fn lower_clif_wasm(
             flags: &fn_flags,
             dump,
             verify_full: crate::env_is("PLIRON_VERIFY", "full"),
+            unopt: st.dead_unopt.contains(n),
             stats: &mut stats,
             carry_log: Vec::new(),
             prof_hook: Some(&prof_hook),

@@ -191,6 +191,10 @@ pub struct Pipe<'a> {
     pub dump: bool,
     /// `PLIRON_VERIFY=full` (or the verify-failure retry pass).
     pub verify_full: bool,
+    /// `State::dead_unopt` marked this fn: callerless `xcgu_copies`
+    /// member — emit with only the `Gate::Always` correctness
+    /// lowerings (same bail class as `giant_max`).
+    pub unopt: bool,
     pub stats: &'a mut Stats,
     /// Every `(d, w)` pair `carry_one` applied, in order — the
     /// stepcache's fact-delta record (replaying the pairs reproduces
@@ -1343,7 +1347,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
     // step can only leave the function unoptimized, never wrong.
     // Checked per step rather than once at selection: a step can grow
     // the function past the limit mid-pipeline (unroll).
-    if !matches!(s.gate, Gate::Always) && p.clctx.func.dfg.num_insts() > giant_max() {
+    if !matches!(s.gate, Gate::Always) && (p.unopt || p.clctx.func.dfg.num_insts() > giant_max()) {
         return;
     }
     // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on
@@ -3749,6 +3753,7 @@ mod tests {
             prof_hook: None,
             dump: false,
             verify_full: false,
+            unopt: false,
             stats: &mut stats,
             carry_log: Vec::new(),
             fn_names: &[],

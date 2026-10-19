@@ -559,7 +559,7 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
                 f.linkage == Linkage::Local
                     && has_body(ctx, f.op)
                     && !st.dead_fns.contains(n.as_str())
-                    && !st.xcgu_copies.contains(n.as_str())
+                    && (st.xcgufn_kill || !st.xcgu_copies.contains(n.as_str()))
                     && !taken.contains(n.as_str())
                     && !counts.contains_key(n.as_str())
             })
@@ -579,6 +579,33 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
                 st.funcs.len()
             )
         };
+    }
+    // Protected (`xcgu_copies`) fns that trip the same dead test get a
+    // cheaper sentence than stripping: `dead_unopt` emits them through
+    // only the `Gate::Always` correctness lowerings. They stay "live"
+    // for `call_counts` — an invisible caller still links and runs a
+    // correct (unoptimized) body, and their own callees keep counting.
+    if st.deadunopt_on && !st.xcgu_copies.is_empty() {
+        let counts = call_counts(ctx, st);
+        for (n, f) in st.funcs.iter() {
+            if f.linkage == Linkage::Local
+                && has_body(ctx, f.op)
+                && st.xcgu_copies.contains(n.as_str())
+                && !st.dead_fns.contains(n.as_str())
+                && !taken.contains(n.as_str())
+                && !counts.contains_key(n.as_str())
+            {
+                st.dead_unopt.insert(n.clone());
+            }
+        }
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "deadunopt {}: {} of {} fns minimal-pipelined",
+                st.cgu,
+                st.dead_unopt.len(),
+                st.funcs.len()
+            );
+        }
     }
 }
 

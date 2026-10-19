@@ -308,6 +308,7 @@ fn with_pipe<R>(
         flags: &flags,
         dump: false,
         verify_full: false,
+        unopt: false,
         stats: &mut stats,
         carry_log: Vec::new(),
         cur_step: "",
