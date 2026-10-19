@@ -969,11 +969,12 @@ pub fn run(
     if crate::pass_enabled("PLIRON_XPACK") {
         // `param_src` walks the whole function (CFG + param alias
         // facts); xpack's applies never touch block params, so one
-        // map serves every block.
-        let ps = crate::loadfwd::param_src(func);
+        // map serves every block — built on the first block that
+        // reaches the plan stage, not for every `slp` call.
+        let mut ps = None;
         for block in func.layout.blocks().collect::<Vec<_>>() {
             changed += xpack_block(
-                func, &domtree, an, na, block, &mut uses, &dead_set, &ps, x64,
+                func, &domtree, an, na, block, &mut uses, &dead_set, &mut ps, x64,
             );
         }
     }
@@ -2148,7 +2149,7 @@ fn xpack_block<'d>(
     block: Block,
     uses: &mut Option<Uses<'d>>,
     dead_set: &'d std::cell::RefCell<FxHashSet<Inst>>,
-    ps: &FxHashMap<Value, Value>,
+    ps: &mut Option<FxHashMap<Value, Value>>,
     x64: bool,
 ) -> usize {
     let mut total = 0;
@@ -2267,6 +2268,7 @@ fn xpack_block<'d>(
                         return None;
                     }
                     tried += 1;
+                    let ps = &*ps.get_or_insert_with(|| crate::loadfwd::param_src(func));
                     let plan = if is_store {
                         plan_store(
                             func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64,

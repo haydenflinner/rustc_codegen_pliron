@@ -2411,6 +2411,24 @@ pub fn webmerge_ctx(
     dirty: Option<&FxHashSet<Block>>,
 ) -> (usize, FxHashMap<Value, Value>, FxHashSet<Block>) {
     use crate::proots::Key;
+    // Flat `edges × params` matrix: `m[e]` yields the row slice, so the
+    // `m[e][ix]` indexing below reads exactly like the `Vec<Vec>` it
+    // replaced — one allocation per matrix instead of one per edge.
+    struct Mat<T> {
+        stride: usize,
+        v: Vec<T>,
+    }
+    impl<T> Mat<T> {
+        fn rows(&self) -> std::slice::ChunksExact<'_, T> {
+            self.v.chunks_exact(self.stride)
+        }
+    }
+    impl<T> std::ops::Index<usize> for Mat<T> {
+        type Output = [T];
+        fn index(&self, e: usize) -> &[T] {
+            &self.v[e * self.stride..(e + 1) * self.stride]
+        }
+    }
     // `var_os` reads /proc-level state per call — hoisted out of the
     // per-block loop (16k lookups per webmerge round otherwise). Every
     // clock read in this function only feeds these `wmprof` log lines,
@@ -2520,10 +2538,19 @@ pub fn webmerge_ctx(
         // `vhash` skips building ~10⁵-node `Key` trees for slots that
         // never merge (unrolled hash kernels reach ~877k nodes).
         let tkeys = wmprof.then(std::time::Instant::now);
-        let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
-        let mut svh: Vec<Vec<u64>> = Vec::with_capacity(es.len());
+        let mut eargs = Mat {
+            stride: ps.len(),
+            v: Vec::with_capacity(es.len() * ps.len()),
+        };
+        let mut svh = Mat {
+            stride: ps.len(),
+            v: Vec::with_capacity(es.len() * ps.len()),
+        };
         // O-payload per pseudo-arg cell for `skey_of` to reconstruct.
-        let mut okey: Vec<Vec<Option<u64>>> = Vec::with_capacity(es.len());
+        let mut okey = Mat {
+            stride: ps.len(),
+            v: Vec::with_capacity(es.len() * ps.len()),
+        };
         let mut arity_ok = true;
         for &(i, d) in es {
             let args: Vec<BlockArg> = func.dfg.insts[i]
@@ -2534,45 +2561,36 @@ pub fn webmerge_ctx(
                 arity_ok = false;
                 break;
             }
-            eargs.push(
+            eargs.v.extend(
                 args.iter()
-                    .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v)))
-                    .collect(),
+                    .map(|a| a.as_value().map(|v| func.dfg.resolve_aliases(v))),
             );
             // `(inst, tag, payload)` — same `BlockCall` arg is the same
             // value, anything else differs.
-            svh.push(
-                args.iter()
-                    .map(|a| match a {
-                        BlockArg::Value(v) => crate::proots::vhash(
-                            func,
-                            &nf,
-                            &canon,
-                            &mut vhmemo,
-                            func.dfg.resolve_aliases(*v),
-                        ),
-                        BlockArg::TryCallRet(x) => {
-                            crate::proots::ohash((i.index() as u64) << 32 | 1 << 30 | *x as u64)
-                        }
-                        BlockArg::TryCallExn(x) => {
-                            crate::proots::ohash((i.index() as u64) << 32 | 2 << 30 | *x as u64)
-                        }
-                    })
-                    .collect(),
-            );
-            okey.push(
-                args.iter()
-                    .map(|a| match a {
-                        BlockArg::Value(_) => None,
-                        BlockArg::TryCallRet(x) => {
-                            Some((i.index() as u64) << 32 | 1 << 30 | *x as u64)
-                        }
-                        BlockArg::TryCallExn(x) => {
-                            Some((i.index() as u64) << 32 | 2 << 30 | *x as u64)
-                        }
-                    })
-                    .collect(),
-            );
+            svh.v.extend(args.iter().map(|a| match a {
+                BlockArg::Value(v) => crate::proots::vhash(
+                    func,
+                    &nf,
+                    &canon,
+                    &mut vhmemo,
+                    func.dfg.resolve_aliases(*v),
+                ),
+                BlockArg::TryCallRet(x) => {
+                    crate::proots::ohash((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                }
+                BlockArg::TryCallExn(x) => {
+                    crate::proots::ohash((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                }
+            }));
+            okey.v.extend(args.iter().map(|a| match a {
+                BlockArg::Value(_) => None,
+                BlockArg::TryCallRet(x) => {
+                    Some((i.index() as u64) << 32 | 1 << 30 | *x as u64)
+                }
+                BlockArg::TryCallExn(x) => {
+                    Some((i.index() as u64) << 32 | 2 << 30 | *x as u64)
+                }
+            }));
         }
         if !arity_ok {
             continue;
@@ -2583,7 +2601,7 @@ pub fn webmerge_ctx(
         // matrices into tens of GB of keys. Cap the block's total arg
         // tree size; `vnodes` is memoized so the scan is cheap.
         let mut arg_nodes = 0usize;
-        'cap: for r in &eargs {
+        'cap: for r in eargs.rows() {
             for c in r {
                 if let Some(v) = c {
                     arg_nodes = arg_nodes.saturating_add(crate::proots::vnodes(
@@ -2607,7 +2625,7 @@ pub fn webmerge_ctx(
         {
             for (ix, _) in ps.iter().enumerate() {
                 let sz: Vec<usize> = eargs
-                    .iter()
+                    .rows()
                     .map(|r| {
                         r[ix].map_or(1, |v| {
                             crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
@@ -2628,9 +2646,12 @@ pub fn webmerge_ctx(
             ps.iter().enumerate().map(|(i, &p)| (p, i as u32)).collect();
         // Keys stay lazy: `skey_of` materializes `skc[e][ix]` on demand
         // — the hash gates above decide most slots never need one.
-        let skc: Vec<Vec<std::cell::OnceCell<Key>>> = (0..es.len())
-            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
-            .collect();
+        let skc = Mat {
+            stride: ps.len(),
+            v: (0..es.len() * ps.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        };
         let skey_of = |e: usize, ix: usize| -> &Key {
             skc[e][ix].get_or_init(|| match (eargs[e][ix], okey[e][ix]) {
                 (Some(v), _) => crate::proots::key_of(func, &nf, &canon, &mut memo.borrow_mut(), v),
@@ -2651,9 +2672,12 @@ pub fn webmerge_ctx(
         // structural `==` on a 10⁴-node key costs as much as computing
         // the hash once, so comparisons go through `pkh` first.
         let hmemo = std::cell::RefCell::new(hmemo);
-        let pk: Vec<Vec<std::cell::OnceCell<(Key, u64)>>> = (0..es.len())
-            .map(|_| (0..ps.len()).map(|_| std::cell::OnceCell::new()).collect())
-            .collect();
+        let pk = Mat {
+            stride: ps.len(),
+            v: (0..es.len() * ps.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        };
         // A materialized cell costs a `paramize`+hash over the arg's
         // def-DAG — bound the per-block matrix so a megablock's scan
         // can't go quadratic. Past the cap, cells degrade to a
@@ -2677,7 +2701,7 @@ pub fn webmerge_ctx(
                     &ps,
                     i,
                     &hmaps.get_or_init(|| {
-                        svh.iter()
+                        svh.rows()
                             .map(|row| {
                                 let mut m = FxHashMap::default();
                                 for (i, &h) in row.iter().enumerate() {

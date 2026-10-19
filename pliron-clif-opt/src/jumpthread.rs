@@ -12,6 +12,7 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
@@ -3525,17 +3526,38 @@ fn dominated_conds(
     // nearest-first (stack top = the block itself), and `env` keeps the
     // original furthest-ancestor-wins precedence — entries are only
     // filled when an ancestor didn't already set them, and an undo log
-    // restores them on exit.
-    let mut children: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+    // restores them on exit. The tree itself is CSR-built (`head`/`kids`)
+    // so this per-iteration scan doesn't pay a hashmap + Vec per edge.
+    let mut head: SecondaryMap<Block, u32> = SecondaryMap::new();
+    let mut deg: SecondaryMap<Block, u32> = SecondaryMap::new();
     for b in func.layout.blocks() {
         if let Some(p) = domtree.idom(b) {
-            children.entry(p).or_default().push(b);
+            deg[p] += 1;
+        }
+    }
+    let mut total = 0u32;
+    for b in func.layout.blocks() {
+        head[b] = total;
+        total += deg[b];
+    }
+    let mut kids = vec![Block::from_u32(0); total as usize];
+    let mut cur = head.clone();
+    for b in func.layout.blocks() {
+        if let Some(p) = domtree.idom(b) {
+            kids[cur[p] as usize] = b;
+            cur[p] += 1;
         }
     }
     let mut fs: Vec<Cmp> = Vec::new();
     let mut env: FxHashMap<Value, u64> = FxHashMap::default();
     let mut undo: Vec<Value> = Vec::new();
     let mut folds = Vec::new();
+    // Scratch reused per block — `fs`/`eqs` views and the `alts` lists
+    // were three small Vec allocs per factful block per iteration.
+    let mut fsv: Vec<Cmp> = Vec::new();
+    let mut eqs: Vec<(Value, Value)> = Vec::new();
+    let mut av: Vec<Value> = Vec::new();
+    let mut bv: Vec<Value> = Vec::new();
     // (block, fs_mark, undo_mark, exiting) — enter pushes the block's
     // own facts after recording marks, exit truncates back to them.
     let mut stack: Vec<(Block, usize, usize, bool)> = func
@@ -3564,31 +3586,33 @@ fn dominated_conds(
             }
         }
         stack.push((b, fmark, umark, true));
-        for &c in children.get(&b).into_iter().flatten() {
+        for &c in &kids[head[b] as usize..head[b] as usize + deg[b] as usize] {
             stack.push((c, 0, 0, false));
         }
         if !range2 && fs.is_empty() && env.is_empty() {
             continue;
         }
         // Nearest-ancestor-first, as `facts_at` produced.
-        let fsv: Vec<Cmp> = fs.iter().rev().copied().collect();
+        fsv.clear();
+        fsv.extend(fs.iter().rev().copied());
         let fs = fsv.as_slice();
         // `x == y` facts let a query on `y` be decided through `x`.
-        let eqs: Vec<(Value, Value)> = fs
-            .iter()
-            .filter(|f| f.0 == IntCC::Equal)
-            .map(|f| (f.1, f.2))
-            .collect();
-        let alts = |v: Value| {
-            let mut a = vec![v];
+        eqs.clear();
+        eqs.extend(
+            fs.iter()
+                .filter(|f| f.0 == IntCC::Equal)
+                .map(|f| (f.1, f.2)),
+        );
+        let alts = |scratch: &mut Vec<Value>, v: Value| {
+            scratch.clear();
+            scratch.push(v);
             for &(x, y) in &eqs {
                 if x == v {
-                    a.push(y);
+                    scratch.push(y);
                 } else if y == v {
-                    a.push(x);
+                    scratch.push(x);
                 }
             }
-            a
         };
         let decide = |q: Cmp| -> Option<bool> {
             if let Some(r) = fs.iter().find_map(|&f| implied(f, q)) {
@@ -3612,10 +3636,14 @@ fn dominated_conds(
             let Some(q) = norm_icmp(func, i) else {
                 continue;
             };
-            let r = alts(q.1)
-                .into_iter()
-                .flat_map(|a| alts(q.2).into_iter().map(move |b| (q.0, a, b)))
-                .find_map(decide);
+            alts(&mut av, q.1);
+            let r = av.iter().copied().find_map(|a| {
+                alts(&mut bv, q.2);
+                bv.iter()
+                    .copied()
+                    .map(|b| (q.0, a, b))
+                    .find_map(decide)
+            });
             if let Some(k) = r {
                 folds.push((i, k));
             }

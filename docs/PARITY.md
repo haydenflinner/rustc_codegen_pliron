@@ -96,6 +96,12 @@ Next steps, in expected-payoff order:
    `pliron_cfg::step_timing_on()` — `mach_absolute_time` was ~2-3% of
    rustc-compile leaf samples); clif-check marks the flag itself so
    `bench`/`report` tables are unchanged.
+   `dominated_conds` builds its domtree adjacency CSR (`head`/`kids`)
+   instead of `FxHashMap<Block, Vec<Block>>` and hoists the per-block
+   `fsv`/`eqs`/`alts` Vecs; `webmerge_ctx`'s `eargs`/`svh`/`okey`/
+   `skc`/`pk` matrices are one flat `Mat` (stride-indexed) each;
+   `slp` builds `param_src` lazily on the first block that reaches the
+   plan stage.
    Left: jumpthread ~4.0 s (a ~6-phase fixpoint; `round`'s threading
    walk is the residue — `domcond` ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
    the webmerge family ~4 s (`cparm`/`sameargs*` per-block key
@@ -104,8 +110,8 @@ Next steps, in expected-payoff order:
    facts, since `pmap` rewrites edge args outside `merge_dirty`), and
    mergechain ~1.8 s (`edgespec::run` inside ≈ half of it; `fin_edge`
    is the top app leaf). The next tier is mechanical-and-risky, not
-   algorithmic: flat `Vec`+stride matrices in `webmerge_ctx`,
-   `SymMap` u32 keys on the pliron-IR side, interned-sym inline maps.
+   algorithmic: `SymMap` u32 keys on the pliron-IR side,
+   interned-sym inline maps.
 4. **xcgu copies** multiply IR-opt work per CGU (`PLIRON_XCGU=0` cut syn
    78 → 55 s) but feed the inliner. Share analyzed bodies across CGUs
    instead of re-optimizing each copy.
