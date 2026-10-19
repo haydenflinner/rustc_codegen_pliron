@@ -161,6 +161,15 @@ Next steps, in expected-payoff order:
    27.5 → 27.07 s; sparse per-edge/per-block scratch stays hashed
    (dense tables pay O(entity-space) allocation, wrong for a few dozen
    entries).
+   Next: `Pipe::since_reap` gates `iconst128`'s bundled `post_sweep`
+   (three whole-function walks skipped when nothing mutated;
+   507 → 385 ms), and a `Cd` epoch box shares one cfg+domtree across
+   each fixpoint's phases — `stale()`/`get()` recompute into the same
+   storage instead of `with_function` per epoch (jumpthread, mergechain,
+   edgespec, bittab, memspec, coldrets, switchmap, loopdel). bench
+   27.07 → 26.94 s. cfg+domtree construction was already only ~1% of
+   corpus time, so the plumbing mainly removes a repeated-build class
+   rather than moving the needle.
    Left: jumpthread ~3.8 s (a ~6-phase
    fixpoint; `round`'s threading walk is the residue — `domcond`
    ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
