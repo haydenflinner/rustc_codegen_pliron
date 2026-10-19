@@ -13,8 +13,8 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **1.045** | behind; 7 kernels behind by >5% |
-| wasm module size | 2.18 (206 KiB vs 94 KiB) | behind |
+| wasm runtime (geomean, 16 kernels) | **0.977** | ahead; 8 kernels behind by >5% (all ≤+20%) |
+| wasm module size | 2.16 (210 KiB vs 97 KiB) | behind |
 | compile time: bench kernels, native | **0.87** (0.37 s vs 0.43 s) | ahead |
 | compile time: bench kernels, wasm | **1.74** (0.94 s vs 0.54 s) | behind |
 | compile time: regex-syntax (~40 kLOC) | **1.94** (2.93 s vs 1.51 s) | behind; was 6.57 before CGU jobs went parallel |
@@ -26,15 +26,20 @@ here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold +
 `ext_load`/`icmpk`/`addnorm`/`icmpred`/`bitmerge`/`post_sweep` +
 `divnarrow`/`ovfk`/`lih`/`band(uextend)` + `selord` (bool-algebra over
 compare-outcome masks + `brif`/`sel` peels) + `unroll::merge_arms`
-(`PLIRON_UNROLL_MERGE`, fixed-trip `binary_search` → `select` chain),
-`bench/wasm/run.sh`): **~0.99 — at parity** — wins `chars_alpha` −33%,
-`iterw` −41%, `matmul` −12%, `eqbug` −10%, `parse_only` −13%, `sortw`
-−2%, `contains_rng` −1%; `chars_ascii` +35→+10%, `chars_mixed`
-+50→**+7.8%**, `sieve` +1.5%. Remaining: `tokenize` ~+30% and
-`hashmap`/`hmget` ~+21% (non-inlined `next_match`/`hash_one` call
-boundaries — `pliron-ir-opt` inline scope), `strwork` +18% (memcpy/
-code size), `fib` +10%, `nbody` +7% — emission-level `local.set`/`phi`
-copies + specialization duplication (below).
+(`PLIRON_UNROLL_MERGE`, fixed-trip `binary_search` → `select` chain) +
+`PLIRON_WASM_HOT=400` (loop-body `next_match`/`hash_one` inline) +
+`wpeep` `sfwd` (`PLIRON_WASM_SFWD`, frame store→load forward — the
+spliced-callee spill/reload, ~10 mem ops/iter on `tokenize`) + `wpeep`
+`prel`-scoped `br_if` fold + else-arm structured `br`/`br_if`
+retarget (~265 `if{br}else{structured}` sites → `br_if`, module
+−1 KiB), `bench/wasm/run.sh`): **0.977 — ahead overall** — wins
+`chars_alpha` −31%, `iterw` −41%, `matmul` −11%, `parse_only` −15%,
+`eqbug` −9%, `sortw` −3%; `sieve` +1.9%, `contains_rng` +1.4% (parity).
+Remaining >5%: `strwork` +20% and `hashmap` +16%/`hmget` +14%/`tokenize`
++16% — `strwork`'s `run` inlines ~4700 lines of `push_str`/`extend`/fmt
+wrappers LLVM keeps as calls (494 lines) — `pliron-ir-opt`/`inline`
+policy; `chars_ascii` +8.5%, `chars_mixed` +8.2%, `fib` +7.7%,
+`nbody` +6% — emission-level locals churn.
 
 ## How to measure
 
