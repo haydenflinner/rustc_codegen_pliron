@@ -292,3 +292,48 @@ fn carried_slot_still_spans_the_loop() {
         "in-loop ss1 can't fold onto ss0: {sizes:?}"
     );
 }
+
+// memcpy's dst is untracked memory (the `v0` param): the copy edges only
+// link slot dsts, so the pointers inside ss0's byte image — here &ss2 —
+// leak somewhere the analysis can't follow. The copy only moves the
+// container's *bytes*, so ss0 itself stays bounded, but every contained
+// pointer must escape or a slot folded onto ss2's storage is corruptible
+// through the out-of-frame image.
+const MEMCPY_OUT: &str = "function %t(i64) -> i64 {
+    ss0 = explicit_slot 8, align = 8
+    ss1 = explicit_slot 8, align = 8
+    ss2 = explicit_slot 8, align = 8
+    ss3 = explicit_slot 8, align = 8
+    sig0 = (i64, i64, i64) -> i64
+    fn0 = %Memcpy sig0
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    v3 = stack_addr.i64 ss2
+    v4 = stack_addr.i64 ss3
+    ; ss2's only live window — early store + load
+    v5 = iconst.i64 7
+    store.i64 v5, v3
+    v6 = load.i64 v3
+    ; &ss2 lands inside ss0's bytes
+    store.i64 v3, v1
+    ; ss0's image copied to memory we can't see: &ss2 goes with it
+    v8 = call fn0(v0, v1, v5)
+    ; ss3's window opens after ss2's closes — it would fold onto ss2
+    store.i64 v6, v4
+    v7 = load.i64 v4
+    return v7
+}";
+
+#[test]
+fn memcpy_to_untracked_memory_escapes_contents() {
+    let mut f = parse(MEMCPY_OUT);
+    merge(&mut f);
+    let sizes = slot_sizes(&f);
+    let get = |name: &str| sizes.iter().find(|(s, _)| s == name).map(|x| x.1);
+    assert_eq!(
+        get("ss2"),
+        Some(8),
+        "&ss2 leaked out of frame must not fold: {sizes:?}"
+    );
+}

@@ -220,6 +220,13 @@ pub fn run(
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
     nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
+    if crate::env_set("PLIRON_SM_INFO") {
+        eprintln!(
+            "sm-info: slotmerge {} nslots={}",
+            func.name,
+            func.sized_stack_slots.len()
+        );
+    }
     if func.sized_stack_slots.len() < 2 {
         return 0;
     }
@@ -379,38 +386,80 @@ pub fn run(
     // DefIndex when escapes were exempted — so markers only contribute
     // use positions. `PLIRON_SLOTMERGE_MARK` re-enables the exemption for
     // experiments.
+    //
+    // Positions resolve eagerly because anchors recorded at lowering decay
+    // mid-pipeline: a pass can delete the anchor inst or fold its whole
+    // block. A slot is only `marked` when *every* singleton marker on it
+    // resolves — one lost end marker leaves the window unbounded, which
+    // is worse than no marker at all (the escape exemption would clip a
+    // live range the source semantics extended to function end).
+    let in_layout: FxHashSet<Block> = order.iter().copied().collect();
     let mut marked = vec![false; nslots];
+    let mut mark_lost = vec![false; nslots];
+    let mut marker_pos: Vec<Option<u32>> = Vec::new();
     if crate::env_set("PLIRON_SLOTMERGE_MARK") {
-        let (mut single, mut multi, mut none) = (0u32, 0u32, 0u32);
-        for (ds, _, _, _) in lifetimes {
+        let (mut single, mut multi, mut none, mut lost) = (0u32, 0u32, 0u32, 0u32);
+        marker_pos.reserve(lifetimes.len());
+        for (ds, anchor, b, start) in lifetimes {
+            // The marker sits right after the anchor instruction: a start
+            // marker is live from the next position, an end marker's last
+            // live point is the anchor itself. No usable anchor degrades
+            // to the block's start, and a block that left the layout
+            // resolves to nothing.
+            let pos = match anchor {
+                &Some(i) if func.layout.inst_block(i).is_some() => {
+                    if *start {
+                        (ipos[i] + 1).min(last)
+                    } else {
+                        ipos[i]
+                    }
+                }
+                _ if in_layout.contains(b) => bfirst[*b],
+                _ => u32::MAX,
+            };
+            marker_pos.push((pos != u32::MAX).then_some(pos));
             // A marker naming exactly one slot is that storage's window;
             // a unioned (phi-derived) operand can't be trusted as a
             // per-slot bound, so ambiguous markers mark nothing.
             match ds.as_slice() {
                 &[s] if s.index() < nslots => {
-                    marked[s.index()] = true;
-                    single += 1;
+                    if pos == u32::MAX {
+                        mark_lost[s.index()] = true;
+                        lost += 1;
+                    } else {
+                        marked[s.index()] = true;
+                        single += 1;
+                    }
                 }
                 [] => none += 1,
                 _ => multi += 1,
             }
         }
+        for s in 0..nslots {
+            marked[s] &= !mark_lost[s];
+        }
         if crate::env_set("PLIRON_SM_INFO") {
-            eprintln!("sm-info: markers: {single} singleton {multi} union {none} empty");
+            eprintln!(
+                "sm-info: markers: {single} singleton {multi} union {none} empty {lost} lost"
+            );
         }
     }
     // An escaped slot can never fold: its address reached an opaque
     // sink, so sharing storage with anything could flip a retained
     // pointer's identity — interval disjointness can't rule that out.
+    // `esc_seen` records escapes on marked slots too: markers widen a
+    // marked-escaped slot's interval to its declared window below.
     let mut escaped = vec![false; nslots];
+    let mut esc_seen = vec![false; nslots];
     macro_rules! escape {
         ($s:expr, $i:expr) => {{
+            esc_seen[$s.index()] = true;
             if !marked[$s.index()] {
                 iv[$s.index()].1 = u32::MAX;
                 escaped[$s.index()] = true;
-                if dbg || crate::env_set("PLIRON_SM_INFO") {
-                    esc.push(($s, $i));
-                }
+            }
+            if dbg || crate::env_set("PLIRON_SM_INFO") {
+                esc.push(($s, $i));
             }
         }};
     }
@@ -669,12 +718,16 @@ pub fn run(
                                     // but never retains them (the copy
                                     // edges are collected in the prepass).
                                     use cranelift_codegen::ir::{ExternalName, LibCall};
-                                    let nokeep = matches!(
+                                    let copier = matches!(
                                         func.dfg.ext_funcs[fr].name,
                                         ExternalName::LibCall(LibCall::Memcpy)
                                             | ExternalName::LibCall(LibCall::Memmove)
-                                            | ExternalName::LibCall(LibCall::Memset)
                                     );
+                                    let nokeep = copier
+                                        || matches!(
+                                            func.dfg.ext_funcs[fr].name,
+                                            ExternalName::LibCall(LibCall::Memset)
+                                        );
                                     for (k, &a) in cargs.iter().enumerate() {
                                         let ds = derived[func.dfg.resolve_aliases(a)].clone();
                                         for &s in &ds {
@@ -690,6 +743,21 @@ pub fn run(
                                         } else {
                                             for &s in &ds {
                                                 reads[s.index()].push(i);
+                                            }
+                                        }
+                                        // A memcpy/memmove into untracked
+                                        // memory carries the source's byte
+                                        // image — and every pointer inside
+                                        // it — somewhere we can't follow.
+                                        // The copy edges only form for
+                                        // slot dsts, so the contents escape
+                                        // here (the container's own address
+                                        // stays put, so it does not).
+                                        if copier && k == 1 && arg_slots(0).is_empty() {
+                                            for &s in &ds {
+                                                for s2 in contains[s.index()].clone() {
+                                                    escape!(s2, i);
+                                                }
                                             }
                                         }
                                         for &s in &ds {
@@ -850,31 +918,17 @@ pub fn run(
             }
         }
     }
-    // Marker positions count as uses too: they bound the validity window
-    // even where the scan saw no byte-touches (e.g. a slot only ever
-    // passed by reference). Each marker sits right after the anchor
-    // instruction recorded at lowering; if a pass deleted the anchor,
-    // fall back to the block's start, and if the block itself left the
-    // layout drop the marker — real byte-uses still bound the interval.
-    let in_layout: FxHashSet<Block> = order.iter().copied().collect();
-    for (slots, anchor, b, start) in lifetimes {
-        let pos = match anchor {
-            &Some(i) if func.layout.inst_block(i).is_some() => {
-                // The marker sits between `i` and the next inst: a start
-                // marker is live from the next position, an end marker's
-                // last live point is `i` itself.
-                if *start {
-                    (ipos[i] + 1).min(last)
-                } else {
-                    ipos[i]
-                }
-            }
-            _ if in_layout.contains(b) => bfirst[*b],
-            _ => continue,
-        };
+    // Marker positions widen a marked-escaped slot's interval to its
+    // declared window — opaque accesses through a retained pointer are
+    // covered while the marker says the storage lives. Everywhere else
+    // real uses already bound the interval; extra marker positions would
+    // just stretch it (a marker-only slot is dead storage the unused-slot
+    // sweep reclaims anyway).
+    for ((slots, _, _, _), pos) in lifetimes.iter().zip(&marker_pos) {
+        let Some(pos) = pos else { continue };
         for &s in slots {
-            if s.index() < nslots {
-                use_at(&mut iv, &mut uses, s, pos);
+            if s.index() < nslots && marked[s.index()] && esc_seen[s.index()] {
+                use_at(&mut iv, &mut uses, s, *pos);
             }
         }
     }
@@ -1066,6 +1120,22 @@ pub fn run(
         let mut opv: Vec<_> = ops.into_iter().collect();
         opv.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         eprintln!("sm-info: escape insts by opcode: {opv:?}");
+        let mut by_fn: FxHashMap<String, u32> = FxHashMap::default();
+        for &(_, i) in &esc {
+            if let InstructionData::TryCall { func_ref, .. }
+            | InstructionData::Call { func_ref, .. } = func.dfg.insts[i]
+            {
+                *by_fn
+                    .entry(format!(
+                        "{func_ref}/{:?}",
+                        func.dfg.ext_funcs[func_ref].name
+                    ))
+                    .or_default() += 1;
+            }
+        }
+        let mut fnv: Vec<_> = by_fn.into_iter().collect();
+        fnv.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        eprintln!("sm-info: escape insts by callee: {fnv:?}");
         for &(s, i) in esc.iter().take(8) {
             eprintln!(
                 "sm-info:   {s} escapes at {}: {}",
@@ -1114,6 +1184,19 @@ pub fn run(
     if crate::env_set("PLIRON_SM_INFO") {
         let ncand = rep.len();
         eprintln!("sm-info: merge: {ncand} cand -> {} regions", regions.len());
+        for s in 0..nslots {
+            let ss = StackSlot::from_u32(s as u32);
+            if iv[s].0 != u32::MAX {
+                eprintln!(
+                    "sm-info:   {ss} iv={:?} esc={} seen={} marked={} rep={:?}",
+                    iv[s],
+                    escaped[s],
+                    esc_seen[s],
+                    marked[s],
+                    rep.get(&ss)
+                );
+            }
+        }
     }
 
     // Rewrite `stack_addr`s onto representatives; grow each rep to its
@@ -1147,6 +1230,32 @@ pub fn run(
             }
             _ => {}
         }
+    }
+    if crate::env_set("PLIRON_SM_INFO") {
+        let (mut nz, mut bytes) = (0u32, 0u64);
+        let mut cat: FxHashMap<&'static str, (u32, u64)> = FxHashMap::default();
+        for s in 0..nslots {
+            let s = StackSlot::from_u32(s as u32);
+            let sz = func.sized_stack_slots[s].size as u64;
+            if sz == 0 {
+                continue;
+            }
+            nz += 1;
+            bytes += sz;
+            let k = if escaped[s.index()] {
+                "escaped"
+            } else if rep.get(&s) == Some(&s) && iv[s.index()].0 != u32::MAX {
+                "region-rep"
+            } else if iv[s.index()].0 == u32::MAX {
+                "unused-referenced"
+            } else {
+                "other"
+            };
+            let e = cat.entry(k).or_default();
+            e.0 += 1;
+            e.1 += sz;
+        }
+        eprintln!("sm-info: post: {nz} nonzero slots {bytes}B by-kind {cat:?}");
     }
     if merged > 0 {
         let insts: Vec<Inst> = order

@@ -5,8 +5,6 @@
 use std::path::Path;
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::Function;
-use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::Configurable;
 use cranelift_module::FuncId;
 use pliron_clif_opt::diffcheck::OwnedFacts;
