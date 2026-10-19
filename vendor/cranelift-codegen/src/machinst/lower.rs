@@ -214,6 +214,13 @@ pub struct Lower<'func, I: VCodeInst> {
     /// register live regardless of amode choice.
     value_non_amode_use: SecondaryMap<Value, bool>,
 
+    /// PLIRON: per SSA value, the highest live-in count of any block
+    /// the value is defined or used in — a register-pressure proxy.
+    /// Keeping a base whole in an amode spans its register across
+    /// those blocks; in high-pressure blocks the decomposed reg+reg
+    /// amode is the cheaper choice.
+    value_max_pressure: SecondaryMap<Value, u32>,
+
     /// Actual uses of each SSA value so far, incremented while lowering.
     value_lowered_uses: SecondaryMap<Value, u32>,
 
@@ -503,7 +510,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             block_end_colors[bb] = InstColor::new(cur_color);
         }
 
-        let (value_ir_uses, value_direct_uses, value_non_amode_use) =
+        let (value_ir_uses, value_direct_uses, value_non_amode_use, value_max_pressure) =
             compute_use_states(f, sret_param);
 
         Ok(Lower {
@@ -517,6 +524,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             value_ir_uses,
             value_direct_uses,
             value_non_amode_use,
+            value_max_pressure,
             value_lowered_uses: SecondaryMap::default(),
             inst_sunk: FxHashSet::default(),
             cur_scan_entry_color: None,
@@ -1378,6 +1386,7 @@ fn compute_use_states(
     SecondaryMap<Value, ValueUseState>,
     SecondaryMap<Value, u8>,
     SecondaryMap<Value, bool>,
+    SecondaryMap<Value, u32>,
 ) {
     // We perform the analysis without recursion, so we don't
     // overflow the stack on long chains of ops in the input.
@@ -1399,6 +1408,10 @@ fn compute_use_states(
     let mut value_ir_uses = SecondaryMap::with_default(ValueUseState::Unused);
     let mut value_direct_uses = SecondaryMap::with_default(0u8);
     let mut value_non_amode_use = SecondaryMap::with_default(false);
+    // PLIRON: block live-in counts — uses of values defined in a
+    // different block — as a register-pressure proxy for
+    // `amode_shareable`.
+    let mut block_liveins = SecondaryMap::with_default(0u32);
 
     if let Some(sret_param) = sret_param {
         // There's an implicit use of the struct-return parameter in each
@@ -1435,11 +1448,8 @@ fn compute_use_states(
 
     // Do a DFS through `value_ir_uses` to mark a subtree as
     // Multiple.
-    for inst in f
-        .layout
-        .blocks()
-        .flat_map(|block| f.layout.block_insts(block))
-    {
+    for block in f.layout.blocks() {
+    for inst in f.layout.block_insts(block) {
         // Iterate over all values used by all instructions, noting an
         // additional use on each operand.
         let arg_count = f.dfg.inst_args(inst).len();
@@ -1451,6 +1461,16 @@ fn compute_use_states(
             // `inst_values` appends past `inst_args`).
             if pos >= arg_count || !arg_is_mem_addr(&f.dfg.insts[inst], pos) {
                 value_non_amode_use[arg] = true;
+            }
+            // PLIRON: cross-block uses inflate the block's live-in
+            // pressure (params count as defs in their own block).
+            let def_block = match f.dfg.value_def(arg) {
+                ValueDef::Result(d, _) => f.layout.inst_block(d),
+                ValueDef::Param(b, _) => Some(b),
+                _ => None,
+            };
+            if def_block != Some(block) {
+                block_liveins[block] = block_liveins[block].saturating_add(1);
             }
             let old = value_ir_uses[arg];
             value_ir_uses[arg].inc();
@@ -1493,7 +1513,38 @@ fn compute_use_states(
         }
     }
 
-    (value_ir_uses, value_direct_uses, value_non_amode_use)
+    }
+
+    // PLIRON: roll the per-block pressure up to per-value — the kept
+    // base's register would live in its def block and every use block.
+    let mut value_max_pressure = SecondaryMap::with_default(0u32);
+    for block in f.layout.blocks() {
+        let p = block_liveins[block];
+        if p == 0 {
+            continue;
+        }
+        for inst in f.layout.block_insts(block) {
+            for arg in f.dfg.inst_values(inst) {
+                if p > value_max_pressure[arg] {
+                    value_max_pressure[arg] = p;
+                }
+            }
+            // The def side of every value produced here counts too —
+            // its register is live from this block onward.
+            for &res in f.dfg.inst_results(inst) {
+                if p > value_max_pressure[res] {
+                    value_max_pressure[res] = p;
+                }
+            }
+        }
+    }
+
+    (
+        value_ir_uses,
+        value_direct_uses,
+        value_non_amode_use,
+        value_max_pressure,
+    )
 }
 
 /// PLIRON: is the `pos`'th arg of `inst` a load/store address operand —
@@ -1918,17 +1969,32 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     /// PLIRON: may a multi-use `iadd` `val` stay whole in an amode?
     /// Sharing is free when the sum is genuinely needed as a value
     /// (at least one non-address use — e.g. a loop-carried pointer).
-    /// For all-address uses the fanout is capped: a base shared across
-    /// a dozen offset accesses (element-swap shapes) holds its
-    /// register over the whole sequence while decomposed reg+reg
-    /// amodes are free. The bound is defensive — measured benchmarks
-    /// still regressed on small-fanout all-address sharing too
-    /// (regalloc-level divergence), so the knob stays off by default.
+    /// For all-address uses the fanout is capped and the block must
+    /// not be register-starved: a base shared across several offset
+    /// accesses holds its register over the span while decomposed
+    /// reg+reg amodes are free. `value_max_pressure` is the live-in
+    /// proxy measured in `compute_use_states`;
+    /// `PLIRON_AMODESHARE_PRESS` tunes the cutoff (default 8 —
+    /// measured: keeps sieve's −5.5% win, drops the sortw/hashmap
+    /// regressions to ~noise; looser thresholds regress).
     pub fn amode_shareable(&self, val: Value) -> bool {
         if self.value_ir_uses[val] != ValueUseState::Multiple {
             return false;
         }
-        self.value_non_amode_use[val] || self.value_direct_uses[val] <= 3
+        if self.value_non_amode_use[val] {
+            return true;
+        }
+        if self.value_direct_uses[val] > 3 {
+            return false;
+        }
+        static PRESS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let max = *PRESS.get_or_init(|| {
+            std::env::var("PLIRON_AMODESHARE_PRESS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8)
+        });
+        self.value_max_pressure[val] <= max
     }
 
     /// Retrieve immediate data given a handle.

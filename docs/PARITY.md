@@ -337,18 +337,24 @@ inlining growth; `winline`'s caller-growth cap already took it from 8x.
 multi-use `iadd` base whole instead of reg-reg decomposition; opt-in,
 default-off, `vendor/cranelift-codegen` patches #55–56). Strictly
 fewer insts (−290 reg-reg loads, +30 `ldp`/`stp` across the bench
-binary), but layout-controlled medians were mixed: sieve −6%, sortw
-+5%, hashmap +2.6%, parse_only ~0. Refinement attempts falsified every
-use-shape discriminator: sharing only when the sum has a non-amode
-("real value") use fires almost nowhere (sieve's win and sortw's loss
-are both all-address sites), and capping direct-use fanout at ≤3 keeps
-sieve's −6% but leaves sortw +4% / hashmap +2.7% — the small-fanout
-all-address class contains both the win and the losses. The
-divergence is regalloc-level (kept-base live range vs surrounding
-pressure), invisible to lowering-time analysis. The committed gate
-(`amode_shareable`: non-amode use OR fanout ≤3) is the most
-conservative form and stays default-off; a fix needs RA-cost
-awareness, not a better use-count predicate.
+binary), but unbounded it was a wash: sieve −6%, sortw +5%, hashmap
++2.6%. Use-shape discriminators (non-amode use, fanout ≤3) each kept
+or lost everything together — wins and losses are in the same class.
+What finally discriminated was a **block live-in pressure proxy**
+(cross-block arg uses per block, rolled up per value): gate
+`amode_shareable` = non-amode use OR (fanout ≤3 AND
+`PLIRON_AMODESHARE_PRESS` ≤8) keeps sieve −5.5% and shrinks sortw /
+hashmap to ~+1% (noise). Still opt-in — verify on more workloads
+before default-on.
+
+`PLIRON_REASSOC` (opt-in CLIF pass) reassociates `((r+a)+b)+c`
+accumulator chains into `r+((a+b)+c)` when `r` is a block param — one
+add on the loop-carried edge instead of the whole chain (LLVM's isel
+does this free). On eqbug it produced the intended depth-1 asm but
+only ~0.8% — the serial chain was already hidden in the loop's ILP
+shadow; eqbug's ~10% residual vs LLVM is elsewhere (likely
+per-comparison `uxtb` before `cmp…,uxtb` folds and call-boundary
+extends). Wash on matmul/nbody/fib. Kept opt-in.
 
 x86-64 numbers are older (Windows box, geomean 1.028); re-measure there
 before working on x64-specific gaps.
