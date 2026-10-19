@@ -101,9 +101,11 @@ time) in ~15 min and writes `target/parity/summary.md`.
   per-step times against a baseline on every save.
 - `PLIRON_TIMING=1` — per-CGU per-step wall time for one real compile.
   `-Zself-profile` records `pliron_*` activities next to rustc's.
-- `samply record --save-only -o prof.json -- rustc ...` then
-  `samply load prof.json` — use this *first* for "where does the time
-  go" before adding instrumentation.
+- `harness/prof.py -- rustc ...` (or `-p PID`, `-a FILE`) — wraps
+  `/usr/bin/sample` and prints self-time buckets + per-thread
+  busy/idle. Use this *first* for "where does the time go" before
+  adding instrumentation; it needs no rebuild and symbolizes through
+  dSYM. (`samply` exists but captured zero samples for our dylib.)
 - Known structure of the gap (details in PARITY.md): our glue (op
   construction, side-table hashing, lowering) and IR-opt dominate, not
   Cranelift; CGUs run their IR passes serially.
