@@ -55,6 +55,13 @@ policy; `chars_ascii` +8.5%, `chars_mixed` +8.2%, `fib` +7.7%,
 - Noise: ±3% is parity on a quiet box. Criterion compares against an
   LLVM baseline measured minutes earlier; wasm uses interleaved rounds.
   Don't benchmark while the gate or another agent is building.
+  Layout bias is real: identical bytes at a different address can swing
+  a tight kernel ±10% (seen: `sieve`, +12% from a 0x740 shift — ASLR is
+  page-granular so low address bits are per-binary constants). If a
+  delta has no corresponding CLIF/asm diff in the hot path, check it
+  with `bench/layout.sh <kernel> [N]` — relinks under shuffled
+  `-order_file`s and reports the cross-layout median (~35 s for 3
+  layouts, 1 kernel).
 
 ## 1. Compile time (highest priority)
 
