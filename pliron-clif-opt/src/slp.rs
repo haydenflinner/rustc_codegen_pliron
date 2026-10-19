@@ -773,11 +773,16 @@ fn try_block<'d>(
     x64: bool,
     pos: &mut PosMap,
     taken: &mut TakenMap,
+    insts_buf: &mut Vec<Inst>,
+    stores: &mut Vec<StoreInfo>,
 ) -> usize {
-    let insts: Vec<Inst> = func.layout.block_insts(block).collect();
+    insts_buf.clear();
+    insts_buf.extend(func.layout.block_insts(block));
+    let insts = &*insts_buf;
     // Collect scalar stores.
-    let mut stores: Vec<StoreInfo> = Vec::new();
-    for &i in &insts {
+    stores.clear();
+    let stores = &mut *stores;
+    for &i in insts {
         let InstructionData::Store {
             opcode: Opcode::Store,
             args,
@@ -815,7 +820,7 @@ fn try_block<'d>(
         return 0;
     }
     pos.load(&insts);
-    for s in &mut stores {
+    for s in stores.iter_mut() {
         s.pos = pos_at(pos, s.inst);
     }
     // Group by (linear terms, elem type, flags); within each, find
@@ -823,7 +828,7 @@ fn try_block<'d>(
     // Vec-scan over the few distinct keys beats cloning every store's
     // key into a map entry.
     let mut by_key: Vec<(SmallVec<[(Value, i64); 8]>, Type, MemFlagsData, Vec<&StoreInfo>)> = Vec::new();
-    for s in &stores {
+    for s in stores.iter() {
         match by_key
             .iter_mut()
             .find(|(k, t, f, _)| *t == s.ty && *f == s.flags && *k == s.key)
@@ -1035,10 +1040,25 @@ pub fn run(
     // Per-inst dense marks shared across blocks — see `PosMap`.
     let mut pos = PosMap::new(func);
     let mut taken = TakenMap::new(func);
+    // Per-block scan buffers reused across blocks — clears keep
+    // capacity, so a corpus of store-free blocks costs no allocs.
+    let mut insts_buf: Vec<Inst> = Vec::new();
+    let mut stores_buf: Vec<StoreInfo> = Vec::new();
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
         changed += try_block(
-            func, domtree, an, &mut uses, &dead_set, na, block, x64, &mut pos, &mut taken,
+            func,
+            domtree,
+            an,
+            &mut uses,
+            &dead_set,
+            na,
+            block,
+            x64,
+            &mut pos,
+            &mut taken,
+            &mut insts_buf,
+            &mut stores_buf,
         );
     }
     // try_block's emits aren't recorded in the index (its own checks

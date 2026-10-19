@@ -4453,7 +4453,7 @@ mod tests {
     use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, InstructionData, Opcode, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use crate::vmap::VMap;
-    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_hash::FxHashSet;
 
     /// wasm32 `Chars::next`'s residual: the iter `ptr` is an i32 loop
     /// param proven non-null by its `!nonnull` entry seed and the

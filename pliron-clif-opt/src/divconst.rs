@@ -24,10 +24,9 @@ use crate::clifpeep;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode,
-    Type, Value, types,
+    ConstantData, Endianness, Function, InstBuilder, InstructionData, MemFlagsData, Opcode, Type,
+    Value, types,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
 /// `v`'s low `w` bits.

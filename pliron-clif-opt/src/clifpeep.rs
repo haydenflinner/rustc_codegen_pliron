@@ -3240,7 +3240,7 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
             let cs = const_sweep(func);
             n += cs;
             if cs > 0 {
-                wctx = WmCtx::new(func);
+                wctx.refresh(func);
                 // Folded branches change the edge list — the dirty set
                 // was computed against the old topology.
                 dirty = None;
@@ -3478,6 +3478,29 @@ impl WmCtx {
         }
         WmCtx { cfg, dom, edges }
     }
+
+    /// Rebuild in place after structural edits — `compute` keeps the
+    /// CSR/domtree backing arrays and `edges` keeps its table, so a
+    /// fixpoint round reuses capacity instead of reallocating.
+    pub fn refresh(&mut self, func: &Function) {
+        self.cfg.compute(func);
+        self.dom.compute(func, &self.cfg);
+        self.edges.clear();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for (d, bc) in func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .enumerate()
+                {
+                    self.edges
+                        .entry(bc.block(&func.dfg.value_lists))
+                        .or_default()
+                        .push((i, d));
+                }
+            }
+        }
+    }
 }
 
 /// `k`'s subtree set as `khash_m` values — the necessary-condition
@@ -3622,6 +3645,14 @@ pub fn webmerge_ctx(
     // The per-block clocks only feed `wmprof` diagnostics — don't pay
     // two syscalls per block per round when it's off.
     let el = |t: Option<std::time::Instant>| t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    // Per-block matrices reused across iterations (and across rounds of
+    // the calling fixpoint) — capacity persists, contents reset.
+    let mut eargs = Mat { stride: 0, v: Vec::new() };
+    let mut svh = Mat { stride: 0, v: Vec::new() };
+    let mut okey = Mat { stride: 0, v: Vec::new() };
+    let mut skc = Mat { stride: 0, v: Vec::new() };
+    let mut pk = Mat { stride: 0, v: Vec::new() };
+    let mut args_buf: Vec<BlockArg> = Vec::new();
     for (&b, es) in edges.iter() {
         let tb0 = wmprof.then(std::time::Instant::now);
         if dirty.is_some_and(|d| !d.contains(&b)) {
@@ -3674,25 +3705,25 @@ pub fn webmerge_ctx(
         // `vhash` skips building ~10⁵-node `Key` trees for slots that
         // never merge (unrolled hash kernels reach ~877k nodes).
         let tkeys = wmprof.then(std::time::Instant::now);
-        let mut eargs = Mat {
-            stride: ps.len(),
-            v: Vec::with_capacity(es.len() * ps.len()),
-        };
-        let mut svh = Mat {
-            stride: ps.len(),
-            v: Vec::with_capacity(es.len() * ps.len()),
-        };
+        eargs.stride = ps.len();
+        eargs.v.clear();
+        eargs.v.reserve(es.len() * ps.len());
+        svh.stride = ps.len();
+        svh.v.clear();
+        svh.v.reserve(es.len() * ps.len());
         // O-payload per pseudo-arg cell for `skey_of` to reconstruct.
-        let mut okey = Mat {
-            stride: ps.len(),
-            v: Vec::with_capacity(es.len() * ps.len()),
-        };
+        okey.stride = ps.len();
+        okey.v.clear();
+        okey.v.reserve(es.len() * ps.len());
         let mut arity_ok = true;
         for &(i, d) in es {
-            let args: Vec<BlockArg> = func.dfg.insts[i]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
-                .args(&func.dfg.value_lists)
-                .collect();
+            args_buf.clear();
+            args_buf.extend(
+                func.dfg.insts[i]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d]
+                    .args(&func.dfg.value_lists),
+            );
+            let args = &*args_buf;
             if args.len() != ps.len() {
                 arity_ok = false;
                 break;
@@ -3782,12 +3813,10 @@ pub fn webmerge_ctx(
             ps.iter().enumerate().map(|(i, &p)| (p, i as u32)).collect();
         // Keys stay lazy: `skey_of` materializes `skc[e][ix]` on demand
         // — the hash gates above decide most slots never need one.
-        let skc = Mat {
-            stride: ps.len(),
-            v: (0..es.len() * ps.len())
-                .map(|_| std::cell::OnceCell::new())
-                .collect(),
-        };
+        skc.stride = ps.len();
+        skc.v.clear();
+        skc.v.resize_with(es.len() * ps.len(), std::cell::OnceCell::new);
+        let skc = &skc;
         let skey_of = |e: usize, ix: usize| -> &Key {
             skc[e][ix].get_or_init(|| match (eargs[e][ix], okey[e][ix]) {
                 (Some(v), _) => crate::proots::key_of(func, &nf, &canon, &mut memo.borrow_mut(), v),
@@ -3808,12 +3837,10 @@ pub fn webmerge_ctx(
         // structural `==` on a 10⁴-node key costs as much as computing
         // the hash once, so comparisons go through `pkh` first.
         let hmemo = std::cell::RefCell::new(hmemo);
-        let pk = Mat {
-            stride: ps.len(),
-            v: (0..es.len() * ps.len())
-                .map(|_| std::cell::OnceCell::new())
-                .collect(),
-        };
+        pk.stride = ps.len();
+        pk.v.clear();
+        pk.v.resize_with(es.len() * ps.len(), std::cell::OnceCell::new);
+        let pk = &pk;
         // A materialized cell costs a `paramize`+hash over the arg's
         // def-DAG — bound the per-block matrix so a megablock's scan
         // can't go quadratic. Past the cap, cells degrade to a
