@@ -21,7 +21,12 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
-here is `docs/performance.md`.
+here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold,
+`bench/wasm/run.sh`): **1.074** — wins `chars_alpha` −24%, `iterw` −39%,
+`matmul` −7%; residuals `chars_mixed` +50%, `chars_ascii` +35%,
+`parse_only`/`tokenize` +32%, `strwork` +24%, `hashmap`/`hmget` +20%,
+`fib` +10% — the `Chars::next`/`slice::Iter`/`Option`/`next_code_point`
+i64-decode + `Option`-niche per-char op count (see below).
 
 ## How to measure
 
