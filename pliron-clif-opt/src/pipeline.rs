@@ -116,6 +116,9 @@ pub struct Stats {
     pub cfg_builds: usize,
     pub dt_builds: usize,
     pub la_builds: usize,
+    pub cfg_ns: u64,
+    pub dt_ns: u64,
+    pub la_ns: u64,
 }
 
 /// PLIRON_MCPROF instrumentation: ns spent in stepcache pipeline
@@ -137,6 +140,9 @@ impl Stats {
         self.cfg_builds += o.cfg_builds;
         self.dt_builds += o.dt_builds;
         self.la_builds += o.la_builds;
+        self.cfg_ns += o.cfg_ns;
+        self.dt_ns += o.dt_ns;
+        self.la_ns += o.la_ns;
         for (n, d) in &o.timing {
             *self.timing.entry(n).or_default() += *d;
         }
@@ -527,6 +533,9 @@ pub struct Analysis {
     pub(crate) cfg_builds: usize,
     pub(crate) dt_builds: usize,
     pub(crate) la_builds: usize,
+    pub(crate) cfg_ns: u64,
+    pub(crate) dt_ns: u64,
+    pub(crate) la_ns: u64,
     /// Step-cache hash chain: the previous step's output hash is this
     /// step's input hash, so cache hits never re-hash the function.
     /// `fnh` hashes the FnJob input maps once per function. `pk` is
@@ -643,7 +652,9 @@ impl Analysis {
             );
         } else {
             self.cfg_fp = Some(edge_fp(func));
+            let t = std::time::Instant::now();
             self.cfg = Some(ControlFlowGraph::with_function(func));
+            self.cfg_ns += t.elapsed().as_nanos() as u64;
             self.cfg_builds += 1;
         }
     }
@@ -652,16 +663,20 @@ impl Analysis {
     pub fn cfg_dt_la<'a>(&'a mut self, func: &Function) -> CfgDtLa<'a> {
         self.materialize(func);
         if self.dt.is_none() {
+            let t = std::time::Instant::now();
             self.dt = Some(DominatorTree::with_function(
                 func,
                 self.cfg.as_ref().unwrap(),
             ));
+            self.dt_ns += t.elapsed().as_nanos() as u64;
             self.dt_builds += 1;
         }
         if self.la.is_none() {
+            let t = std::time::Instant::now();
             let mut la = LoopAnalysis::new();
             la.compute(func, self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap());
             self.la = Some(la);
+            self.la_ns += t.elapsed().as_nanos() as u64;
             self.la_builds += 1;
         }
         CfgDtLa {
@@ -682,10 +697,12 @@ impl Analysis {
     pub fn cfg_dt<'a>(&'a mut self, func: &Function) -> (&'a ControlFlowGraph, &'a DominatorTree) {
         self.materialize(func);
         if self.dt.is_none() {
+            let t = std::time::Instant::now();
             self.dt = Some(DominatorTree::with_function(
                 func,
                 self.cfg.as_ref().unwrap(),
             ));
+            self.dt_ns += t.elapsed().as_nanos() as u64;
             self.dt_builds += 1;
         }
         (self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap())
@@ -1182,6 +1199,9 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     crate::stepcache::flush(&mut an);
     p.stats.cfg_builds += an.cfg_builds;
     p.stats.dt_builds += an.dt_builds;
+    p.stats.cfg_ns += an.cfg_ns;
+    p.stats.dt_ns += an.dt_ns;
+    p.stats.la_ns += an.la_ns;
     p.stats.la_builds += an.la_builds;
     // Hand the pipeline's cfg/domtree to the Context — still exact for
     // the final IR state (`Some` implies `cfg_fp` matched at last

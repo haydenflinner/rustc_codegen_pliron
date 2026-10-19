@@ -121,12 +121,12 @@ fn writes_impl(
 /// comes back with the same value and can't read nondeterministically.
 /// Invokes are excluded (`inv == false`): erasing one removes its unwind
 /// edge, so only moves (hoists) may carry them.
-fn dedupable(
+fn dedupable<'a>(
     ctx: &Context,
-    st: &State,
+    st: &'a State,
     op: Ptr<Operation>,
     inv: bool,
-) -> Option<(String, Vec<Value>, Value)> {
+) -> Option<(&'a str, Vec<Value>, Value)> {
     if !Operation::is_op::<CallOp>(op, ctx)
         || (!inv && st.invokes.contains(op))
         || op.deref(ctx).get_num_results() != 1
@@ -140,11 +140,11 @@ fn dedupable(
         return None;
     }
     let c = direct_callee(ctx, st, op)?;
-    if !st.nowrite.contains_key(c) || !st.willreturn.contains(c) {
+    if !st.nowrite.contains_key(c.as_str()) || !st.willreturn.contains(c.as_str()) {
         return None;
     }
     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
-    Some((c.clone(), args, op.deref(ctx).get_result(ctx, 0)))
+    Some((c.as_str(), args, op.deref(ctx).get_result(ctx, 0)))
 }
 
 /// Can `v` be made available in `ph`? Values defined outside the loop body
@@ -411,16 +411,14 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     // `dedupable` runs per op in each of the three passes below; its
     // inputs (op shape, `st` fact tables) are all pass-stable, so the
     // result is memoized per (op, invoke-allowed).
-    let mut dmemo: FxHashMap<(Ptr<Operation>, bool), Option<(String, Vec<Value>, Value)>> =
-        FxHashMap::default();
+    type Dm<'a> = Option<(&'a str, Vec<Value>, Value)>;
+    let mut dmemo: FxHashMap<(Ptr<Operation>, bool), Dm> = FxHashMap::default();
 
     // 1) Block-local dedup + dead-call elim.
-    let mut index: FxHashMap<
-        u64,
-        Vec<(String, Vec<Value>, Ptr<BasicBlock>, usize, Ptr<Operation>)>,
-    > = FxHashMap::default();
+    let mut index: FxHashMap<u64, Vec<(Ptr<Operation>, Ptr<BasicBlock>, usize)>> =
+        FxHashMap::default();
     for &b in &bs {
-        let mut seen: FxHashMap<u64, Vec<(String, Vec<Value>, Value)>> = FxHashMap::default();
+        let mut seen: FxHashMap<u64, Vec<Ptr<Operation>>> = FxHashMap::default();
         let os = &bops[&b];
         for (i, &op) in os.iter().enumerate() {
             if op_writes.get(&op).copied().unwrap_or(false) {
@@ -448,18 +446,17 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                     tracing::debug!(target: "pliron::callgvn", "callgvn   call dedupable={why}")
                 };
             }
-            let Some((c, args, res)) = dmemo
-                .entry((op, false))
-                .or_insert_with(|| dedupable(ctx, st, op, false))
-                .as_ref()
-            else {
+            if !dmemo.contains_key(&(op, false)) {
+                dmemo.insert((op, false), dedupable(ctx, st, op, false));
+            }
+            let Some((c, args, res)) = dmemo[&(op, false)].as_ref() else {
                 continue;
             };
             // Dead: nowrite + nounwind + unused result (willreturn comes
             // free through `dedupable` — LLVM's `isRemovable` triple).
             if res.uses(ctx).is_empty()
-                && st.nowrite.get(c) == Some(&true)
-                && st.funcs.get(c).is_some_and(|f| f.nounwind)
+                && st.nowrite.get(*c) == Some(&true)
+                && st.funcs.get(*c).is_some_and(|f| f.nounwind)
             {
                 gone.insert(op);
                 continue;
@@ -467,20 +464,20 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             let h = ckey(c, args);
             let prev = seen
                 .get(&h)
-                .and_then(|bkt| bkt.iter().find(|(c2, a2, _)| c2 == c && a2 == args))
-                .map(|e| e.2);
+                .and_then(|bkt| {
+                    bkt.iter().find(|&&pop| {
+                        let e = dmemo[&(pop, false)].as_ref().unwrap();
+                        e.0 == *c && e.1 == *args
+                    })
+                })
+                .map(|&pop| dmemo[&(pop, false)].as_ref().unwrap().2);
             if let Some(prev) = prev {
                 res.replace_all_uses_with(ctx, &prev);
                 gone.insert(op);
                 continue;
             }
-            seen.entry(h)
-                .or_default()
-                .push((c.clone(), args.clone(), *res));
-            index
-                .entry(h)
-                .or_default()
-                .push((c.clone(), args.clone(), b, i, op));
+            seen.entry(h).or_default().push(op);
+            index.entry(h).or_default().push((op, b, i));
         }
     }
     for &op in &gone {
@@ -495,30 +492,29 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             if gone.contains(&op) {
                 continue;
             }
-            let Some((c, args, res)) = dmemo
-                .entry((op, false))
-                .or_insert_with(|| dedupable(ctx, st, op, false))
-                .as_ref()
-            else {
+            if !dmemo.contains_key(&(op, false)) {
+                dmemo.insert((op, false), dedupable(ctx, st, op, false));
+            }
+            let Some((c, args, res)) = dmemo[&(op, false)].as_ref() else {
                 continue;
             };
             let Some(cands) = index.get(&ckey(c, args)) else {
                 continue;
             };
-            for e in cands {
-                let (c2, a2, cb, ci, cop) = e;
-                if c2 != c || a2 != args {
+            for &(cop, cb, ci) in cands {
+                let e = dmemo[&(cop, false)].as_ref().unwrap();
+                if e.0 != *c || e.1 != *args {
                     continue; // hash-collision guard
                 }
-                if gone.contains(cop) || killed.contains(cop) || cb == &b || !dom.dominates(*cb, b)
+                if gone.contains(&cop) || killed.contains(&cop) || cb == b || !dom.dominates(cb, b)
                 {
                     continue;
                 }
                 // No writes after c1 in its block, none before c2 in ours,
                 // none in any block on a c1→c2 path.
-                if writes_between(&bops[cb], *ci + 1, bops[cb].len(), &op_writes, &gone)
+                if writes_between(&bops[&cb], ci + 1, bops[&cb].len(), &op_writes, &gone)
                     || writes_between(os, 0, i, &op_writes, &gone)
-                    || !path_write_free(&preds, &writes_blk, *cb, b)
+                    || !path_write_free(&preds, &writes_blk, cb, b)
                 {
                     continue;
                 }
@@ -623,11 +619,10 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
                 // Hoists may carry invokes: the unwind edge is an
                 // `st.invokes` entry keyed on the op, so it moves with it.
-                let Some((c, args, _)) = dmemo
-                    .entry((op, true))
-                    .or_insert_with(|| dedupable(ctx, st, op, true))
-                    .as_ref()
-                else {
+                if !dmemo.contains_key(&(op, true)) {
+                    dmemo.insert((op, true), dedupable(ctx, st, op, true));
+                }
+                let Some((c, args, _)) = dmemo[&(op, true)].as_ref() else {
                     continue;
                 };
                 // Any `nowrite` entry works: a `false` callee writes only

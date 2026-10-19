@@ -388,8 +388,13 @@ fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
         println!("rep {r}: {el:.2?} over {} fns", corpus.len());
         if r + 1 == reps {
             println!(
-                "  analysis builds: cfg={} dt={} la={}",
-                stats.cfg_builds, stats.dt_builds, stats.la_builds
+                "  analysis builds: cfg={} dt={} la={} ({:.1?}+{:.1?}+{:.1?})",
+                stats.cfg_builds,
+                stats.dt_builds,
+                stats.la_builds,
+                std::time::Duration::from_nanos(stats.cfg_ns),
+                std::time::Duration::from_nanos(stats.dt_ns),
+                std::time::Duration::from_nanos(stats.la_ns),
             );
             let mut rows: Vec<_> = stats.timing.iter().collect();
             rows.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
