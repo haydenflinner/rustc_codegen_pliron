@@ -38,6 +38,7 @@ use pliron_llvm::ops::{
     AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp, FenceOp,
     InlineAsmOp, StoreOp, VAArgOp,
 };
+use pliron::cols::{ColMap, ColSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::domcheck::Dom;
@@ -156,7 +157,7 @@ fn cone_args(
     ctx: &Context,
     st: &State,
     dom: &Dom,
-    body: &FxHashSet<Ptr<BasicBlock>>,
+    body: &ColSet<Ptr<BasicBlock>>,
     ph: Ptr<BasicBlock>,
     v: Value,
     cone: &mut Vec<Ptr<Operation>>,
@@ -173,7 +174,7 @@ fn cone_args(
         // No defining block: an entry-block arg or module constant.
         return true;
     };
-    if !body.contains(&db) {
+    if !body.contains(db) {
         return db == ph || dom.dominates(db, ph);
     }
     if !seen_v.insert(v) {
@@ -248,12 +249,12 @@ fn ckey(c: &str, args: &[Value]) -> u64 {
 /// block is write-free? Backward walk from dst over preds, pruned at src —
 /// dominance guarantees every backward path ends there.
 fn path_write_free(
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
-    writes_blk: &FxHashSet<Ptr<BasicBlock>>,
+    preds: &ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
+    writes_blk: &ColSet<Ptr<BasicBlock>>,
     src: Ptr<BasicBlock>,
     dst: Ptr<BasicBlock>,
 ) -> bool {
-    let mut seen = FxHashSet::default();
+    let mut seen = ColSet::default();
     seen.insert(dst);
     seen.insert(src);
     let mut wl = vec![dst];
@@ -261,11 +262,11 @@ fn path_write_free(
         if seen.len() > 4096 {
             return false;
         }
-        for &p in preds.get(&b).into_iter().flatten() {
+        for &p in preds.get(b).into_iter().flatten() {
             if !seen.insert(p) || p == src {
                 continue;
             }
-            if writes_blk.contains(&p) {
+            if writes_blk.contains(p) {
                 return false;
             }
             wl.push(p);
@@ -278,23 +279,23 @@ fn path_write_free(
 /// dominator tree, bodies collected by backward reachability.
 fn natural_loops(
     dom: &Dom,
-    succ: &FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
-) -> Vec<(Ptr<BasicBlock>, FxHashSet<Ptr<BasicBlock>>)> {
-    let mut latched: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+    succ: &ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
+    preds: &ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>>,
+) -> Vec<(Ptr<BasicBlock>, ColSet<Ptr<BasicBlock>>)> {
+    let mut latched: ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = ColMap::default();
     for &b in &dom.order {
-        for &s in succ.get(&b).into_iter().flatten() {
+        for &s in succ.get(b).into_iter().flatten() {
             if dom.dominates(s, b) {
-                latched.entry(s).or_default().push(b);
+                latched.or_default(s).push(b);
             }
         }
     }
     let mut out = Vec::new();
-    for (h, latches) in latched {
-        let mut body = FxHashSet::default();
+    for (h, latches) in latched.iter() {
+        let mut body = ColSet::default();
         body.insert(h);
         let mut ok = true;
-        for l in latches {
+        for &l in latches {
             let mut wl = vec![l];
             while let Some(b) = wl.pop() {
                 if b == h || !body.insert(b) {
@@ -304,7 +305,7 @@ fn natural_loops(
                     ok = false;
                     break;
                 }
-                wl.extend(preds.get(&b).into_iter().flatten().copied());
+                wl.extend(preds.get(b).into_iter().flatten().copied());
             }
             if !ok {
                 break;
@@ -360,7 +361,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     let Some(dom) = Dom::new(ctx, st, fop) else {
         return;
     };
-    let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
+    let bops: ColMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
         bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     // Write-flag per block plus succ/pred edges for the path & loop walks.
     // Allocas handed to a call anywhere in the function: a callee reads
@@ -369,7 +370,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     // from `nowrite`'s callee classification.
     let mut arg_allocas = FxHashSet::default();
     for &b in &bs {
-        for &op in &bops[&b] {
+        for &op in &bops[b] {
             if Operation::is_op::<CallOp>(op, ctx) {
                 for a in op.deref(ctx).operands(ctx) {
                     if let Some(ba) = base_alloca(ctx, a) {
@@ -379,16 +380,16 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             }
         }
     }
-    let mut writes_blk = FxHashSet::default();
+    let mut writes_blk = ColSet::default();
     // Per-op write flag: `writes` is consulted per op here, again in the
     // dedup scan, and per range query in `writes_between` — cache it once
     // `arg_allocas` (its only function-global input) is complete.
     let mut op_writes: FxHashMap<Ptr<Operation>, bool> = FxHashMap::default();
-    let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
-    let mut succ: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+    let mut preds: ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = ColMap::default();
+    let mut succ: ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = ColMap::default();
     for &b in &bs {
         let mut wb = false;
-        for &op in &bops[&b] {
+        for &op in &bops[b] {
             let w = writes(ctx, st, op, &arg_allocas);
             op_writes.insert(op, w);
             wb |= w;
@@ -396,14 +397,14 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         if wb {
             writes_blk.insert(b);
         }
-        for op in &bops[&b] {
+        for op in &bops[b] {
             for s in op.deref(ctx).successors(ctx) {
-                preds.entry(s).or_default().push(b);
-                succ.entry(b).or_default().push(s);
+                preds.or_default(s).push(b);
+                succ.or_default(b).push(s);
             }
             if let Some(&(l, _)) = st.invokes.get(*op) {
-                preds.entry(l).or_default().push(b);
-                succ.entry(b).or_default().push(l);
+                preds.or_default(l).push(b);
+                succ.or_default(b).push(l);
             }
         }
     }
@@ -419,7 +420,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         FxHashMap::default();
     for &b in &bs {
         let mut seen: FxHashMap<u64, Vec<Ptr<Operation>>> = FxHashMap::default();
-        let os = &bops[&b];
+        let os = &bops[b];
         for (i, &op) in os.iter().enumerate() {
             if op_writes.get(&op).copied().unwrap_or(false) {
                 seen.clear();
@@ -487,7 +488,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     // 2) Dominated-block dedup: c1 dominates c2, write-free c1→c2 paths.
     let mut killed = FxHashSet::default();
     for &b in &bs {
-        let os = &bops[&b];
+        let os = &bops[b];
         for (i, &op) in os.iter().enumerate() {
             if gone.contains(&op) {
                 continue;
@@ -512,7 +513,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
                 // No writes after c1 in its block, none before c2 in ours,
                 // none in any block on a c1→c2 path.
-                if writes_between(&bops[&cb], ci + 1, bops[&cb].len(), &op_writes, &gone)
+                if writes_between(&bops[cb], ci + 1, bops[cb].len(), &op_writes, &gone)
                     || writes_between(os, 0, i, &op_writes, &gone)
                     || !path_write_free(&preds, &writes_blk, cb, b)
                 {
@@ -536,18 +537,18 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         if dbg {
             if pliron_cfg::tracing_on() {
                 tracing::debug!(target: "pliron::callgvn", "callgvn loop h={h:?} body={} w={:?}", body.len(),
-                body.iter().filter(|b| writes_blk.contains(b)).count())
+                body.iter().filter(|b| writes_blk.contains(*b)).count())
             };
         }
         if body.iter().any(|b| writes_blk.contains(b)) {
             continue;
         }
         let outside: Vec<Ptr<BasicBlock>> = preds
-            .get(&h)
+            .get(h)
             .into_iter()
             .flatten()
             .copied()
-            .filter(|p| !body.contains(p))
+            .filter(|p| !body.contains(*p))
             .collect();
         let [ph] = outside[..] else {
             if dbg {
@@ -562,7 +563,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         };
         // Header must dominate the whole body (reducible) for the
         // preheader to dominate it too.
-        if body.iter().any(|&b| b != h && !dom.dominates(h, b)) {
+        if body.iter().any(|b| b != h && !dom.dominates(h, b)) {
             if dbg {
                 if pliron_cfg::tracing_on() {
                     tracing::debug!(target: "pliron::callgvn", "callgvn   header doesn't dominate body")
@@ -573,8 +574,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
         // Allocas the body still writes: a hoisted cone must not read
         // them before their last store ran.
         let mut stored_allocas = FxHashSet::default();
-        for &b in &body {
-            for &op in &bops[&b] {
+        for b in body.iter() {
+            for &op in &bops[b] {
                 if gone.contains(&op) || killed.contains(&op) {
                     continue;
                 }
@@ -585,8 +586,8 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 }
             }
         }
-        for &b in &body {
-            for &op in &bops[&b] {
+        for b in body.iter() {
+            for &op in &bops[b] {
                 if gone.contains(&op) || killed.contains(&op) {
                     continue;
                 }
@@ -639,7 +640,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
                 // put: hoisting it adds a `ph → pad` edge that bypasses the
                 // header, so the header stops dominating the pad and every
                 // header-defined value used downstream of it.
-                if st.invokes.get(op).is_some_and(|&(l, _)| body.contains(&l)) {
+                if st.invokes.get(op).is_some_and(|&(l, _)| body.contains(l)) {
                     continue;
                 }
                 // Args need to reach the preheader: values defined inside
