@@ -672,3 +672,18 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `base + index` addresses. `PLIRON_AMODESHARE=1` enables
     (`Lower.value_has_multiple_uses` is exposed to ISLE for the guard;
     the gate lives in `amode_share_ok` on the aarch64 isle context).
+
+56. Liveness-aware amode sharing gate (`src/machinst/lower.rs`,
+    `src/isa/aarch64/lower/isle.rs`): the multi-use-`iadd` amode rules
+    from #55 now require `Lower::amode_shareable` — share only when
+    the sum is genuinely needed as a value (a use that cannot fold
+    into an addressing mode exists; `compute_use_states` builds a
+    `value_non_amode_use` map in the same single inst scan, with
+    `arg_is_mem_addr` identifying the address arg of plain
+    loads/stores) or when the direct-use fanout is at most 3. The
+    bound keeps the register from being held across high-fanout
+    all-address sequences (element-swap bases). Note the gate did not
+    discriminate the measured regressions — sortw/hashmap still run
+    +4%/+3% slower with it — the all-address small-fanout class
+    contains both the sieve win (−6%) and those losses, and the
+    divergence is regalloc-level. Still opt-in, default off.

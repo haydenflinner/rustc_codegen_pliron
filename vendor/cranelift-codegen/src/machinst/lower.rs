@@ -208,6 +208,12 @@ pub struct Lower<'func, I: VCodeInst> {
     /// since it is emitted exactly once either way.
     value_direct_uses: SecondaryMap<Value, u8>,
 
+    /// PLIRON: per SSA value, `true` when at least one use cannot fold
+    /// into a memory addressing mode — anything but the address operand
+    /// of a plain load/store. A value needed as a value keeps its
+    /// register live regardless of amode choice.
+    value_non_amode_use: SecondaryMap<Value, bool>,
+
     /// Actual uses of each SSA value so far, incremented while lowering.
     value_lowered_uses: SecondaryMap<Value, u32>,
 
@@ -497,7 +503,8 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             block_end_colors[bb] = InstColor::new(cur_color);
         }
 
-        let (value_ir_uses, value_direct_uses) = compute_use_states(f, sret_param);
+        let (value_ir_uses, value_direct_uses, value_non_amode_use) =
+            compute_use_states(f, sret_param);
 
         Ok(Lower {
             f,
@@ -509,6 +516,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             side_effect_inst_entry_colors,
             value_ir_uses,
             value_direct_uses,
+            value_non_amode_use,
             value_lowered_uses: SecondaryMap::default(),
             inst_sunk: FxHashSet::default(),
             cur_scan_entry_color: None,
@@ -1366,7 +1374,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 fn compute_use_states(
     f: &Function,
     sret_param: Option<Value>,
-) -> (SecondaryMap<Value, ValueUseState>, SecondaryMap<Value, u8>) {
+) -> (
+    SecondaryMap<Value, ValueUseState>,
+    SecondaryMap<Value, u8>,
+    SecondaryMap<Value, bool>,
+) {
     // We perform the analysis without recursion, so we don't
     // overflow the stack on long chains of ops in the input.
     //
@@ -1386,12 +1398,14 @@ fn compute_use_states(
 
     let mut value_ir_uses = SecondaryMap::with_default(ValueUseState::Unused);
     let mut value_direct_uses = SecondaryMap::with_default(0u8);
+    let mut value_non_amode_use = SecondaryMap::with_default(false);
 
     if let Some(sret_param) = sret_param {
         // There's an implicit use of the struct-return parameter in each
         // copy of the function epilogue, which we count here.
         value_ir_uses[sret_param] = ValueUseState::Multiple;
         value_direct_uses[sret_param] = 2;
+        value_non_amode_use[sret_param] = true;
     }
 
     // Stack of iterators over Values as we do DFS to mark
@@ -1428,8 +1442,16 @@ fn compute_use_states(
     {
         // Iterate over all values used by all instructions, noting an
         // additional use on each operand.
-        for arg in f.dfg.inst_values(inst) {
+        let arg_count = f.dfg.inst_args(inst).len();
+        for (pos, arg) in f.dfg.inst_values(inst).enumerate() {
             debug_assert!(f.dfg.value_is_real(arg));
+            // PLIRON: mark uses that cannot fold into a memory
+            // addressing mode — everything but the address operand of
+            // a plain load/store (and any branch/table arg, which
+            // `inst_values` appends past `inst_args`).
+            if pos >= arg_count || !arg_is_mem_addr(&f.dfg.insts[inst], pos) {
+                value_non_amode_use[arg] = true;
+            }
             let old = value_ir_uses[arg];
             value_ir_uses[arg].inc();
             value_direct_uses[arg] = value_direct_uses[arg].saturating_add(1);
@@ -1471,7 +1493,20 @@ fn compute_use_states(
         }
     }
 
-    (value_ir_uses, value_direct_uses)
+    (value_ir_uses, value_direct_uses, value_non_amode_use)
+}
+
+/// PLIRON: is the `pos`'th arg of `inst` a load/store address operand —
+/// the one slot that can fold an `iadd` into a reg+reg / reg+imm
+/// addressing mode? Only plain loads/stores qualify; atomic or
+/// non-memory uses are "real" uses by definition.
+fn arg_is_mem_addr(data: &InstructionData, pos: usize) -> bool {
+    use crate::ir::InstructionData::*;
+    match data {
+        Load { .. } | LoadNoOffset { .. } => pos == 0,
+        Store { .. } | StoreNoOffset { .. } => pos == 1,
+        _ => false,
+    }
 }
 
 /// Definition of a "root" instruction for the calculation of `ValueUseState`.
@@ -1878,6 +1913,22 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     /// consume a pending fusion candidate.
     pub fn value_has_multiple_uses(&self, val: Value) -> bool {
         self.value_ir_uses[val] == ValueUseState::Multiple
+    }
+
+    /// PLIRON: may a multi-use `iadd` `val` stay whole in an amode?
+    /// Sharing is free when the sum is genuinely needed as a value
+    /// (at least one non-address use — e.g. a loop-carried pointer).
+    /// For all-address uses the fanout is capped: a base shared across
+    /// a dozen offset accesses (element-swap shapes) holds its
+    /// register over the whole sequence while decomposed reg+reg
+    /// amodes are free. The bound is defensive — measured benchmarks
+    /// still regressed on small-fanout all-address sharing too
+    /// (regalloc-level divergence), so the knob stays off by default.
+    pub fn amode_shareable(&self, val: Value) -> bool {
+        if self.value_ir_uses[val] != ValueUseState::Multiple {
+            return false;
+        }
+        self.value_non_amode_use[val] || self.value_direct_uses[val] <= 3
     }
 
     /// Retrieve immediate data given a handle.

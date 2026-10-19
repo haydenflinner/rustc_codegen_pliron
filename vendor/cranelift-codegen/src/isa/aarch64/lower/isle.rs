@@ -889,13 +889,13 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     }
 
     /// PLIRON: may a multi-use `iadd` load/store base stay whole in the amode
-    /// instead of being decomposed into reg+reg? The result is materialized
-    /// for its other uses regardless, so decomposing only keeps the operands'
-    /// registers live too. Opt-in: `PLIRON_AMODESHARE=1` enables.
+    /// instead of being decomposed into reg+reg? Free when the sum is needed
+    /// as a value anyway; bounded for small all-address fanout (see
+    /// `Lower::amode_shareable`). Opt-in: `PLIRON_AMODESHARE=1` enables.
     fn amode_share_ok(&mut self, val: Value) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("PLIRON_AMODESHARE").as_deref() == Ok("1"))
-            && self.lower_ctx.value_has_multiple_uses(val)
+            && self.lower_ctx.amode_shareable(val)
     }
 
     fn test_and_compare_bit_const(&mut self, ty: Type, n: u64) -> Option<u8> {

@@ -335,12 +335,20 @@ inlining growth; `winline`'s caller-growth cap already took it from 8x.
 
 **Tried and parked** — `PLIRON_AMODESHARE` (aarch64 amode rules keep a
 multi-use `iadd` base whole instead of reg-reg decomposition; opt-in,
-default-off, `vendor/cranelift-codegen` patch #55). Strictly fewer
-insts (−290 reg-reg loads, +30 `ldp`/`stp` across the bench binary),
-but layout-controlled medians were mixed: sieve −6%, sortw +5%,
-hashmap +2.6%, parse_only ~0 — wins/losses track register-liveness
-shape, not inst count. Not enabled; revisit with a liveness-aware
-gate (same-block uses only, or max use-span) if a kernel needs it.
+default-off, `vendor/cranelift-codegen` patches #55–56). Strictly
+fewer insts (−290 reg-reg loads, +30 `ldp`/`stp` across the bench
+binary), but layout-controlled medians were mixed: sieve −6%, sortw
++5%, hashmap +2.6%, parse_only ~0. Refinement attempts falsified every
+use-shape discriminator: sharing only when the sum has a non-amode
+("real value") use fires almost nowhere (sieve's win and sortw's loss
+are both all-address sites), and capping direct-use fanout at ≤3 keeps
+sieve's −6% but leaves sortw +4% / hashmap +2.7% — the small-fanout
+all-address class contains both the win and the losses. The
+divergence is regalloc-level (kept-base live range vs surrounding
+pressure), invisible to lowering-time analysis. The committed gate
+(`amode_shareable`: non-amode use OR fanout ≤3) is the most
+conservative form and stays default-off; a fix needs RA-cost
+awareness, not a better use-count predicate.
 
 x86-64 numbers are older (Windows box, geomean 1.028); re-measure there
 before working on x64-specific gaps.
