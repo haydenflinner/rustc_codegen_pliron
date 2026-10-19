@@ -118,6 +118,11 @@ pub struct Stats {
     pub la_builds: usize,
 }
 
+/// PLIRON_MCPROF instrumentation: ns spent in stepcache pipeline
+/// lookup/store across all threads (temporary diagnostics).
+pub static MC_LOOKUP_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MC_STORE_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Stats {
     pub fn merge(&mut self, o: &Self) {
         self.threaded += o.threaded;
@@ -187,6 +192,15 @@ pub struct Pipe<'a> {
     /// stepcache's fact-delta record (replaying the pairs reproduces
     /// the inserts and lifetime rewrites exactly).
     pub carry_log: Vec<(Value, Value)>,
+    /// Module-local `FuncId` index -> declared symbol name, covering
+    /// every `UserExternalName{namespace:0, index}` this fn's params
+    /// reference. The step cache hashes those indices by symbol so
+    /// identical bodies in different CGUs (different local numbering)
+    /// share keys, and remaps a replayed variant into the consumer's
+    /// numbering. Empty outside a module context (clif-check, unit
+    /// tests) or when symbols can't be resolved — variants then carry
+    /// no names and only apply where the numbering is shared.
+    pub uen_syms: &'a FxHashMap<u32, String>,
     /// Step currently executing, for debug attribution prints.
     pub cur_step: &'static str,
     /// Self-profile hook wired by `src/` to rustc's `sess.prof`: calling
@@ -1033,17 +1047,22 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     } else {
         match crate::stepcache::pipeline_lookup(p, &mut an) {
             crate::stepcache::PipeLookup::Hit => return false,
-            crate::stepcache::PipeLookup::Miss(k) => Some(k),
+            crate::stepcache::PipeLookup::Miss(c) => Some(c),
             crate::stepcache::PipeLookup::Off => None,
         }
     };
     // The outer read window accumulates the union of every step's env
-    // reads (frames nest); `draws` records the bisect units consumed so
-    // a cache hit can replay them and keep bisect numbering identical.
-    // `pk` is only `Some` when the cache is on — off means zero
+    // reads (frames nest) — but a read set is only meaningful for the
+    // disk tier, where a variant must re-validate its env reads in a
+    // later process. The in-process tier shares one fixed `config()`,
+    // so validation there is vacuous and the recorder stays off:
+    // without this, arming a producer for its whole pipeline run
+    // turned every `config()` read on that thread into map inserts
+    // (~1.5M/compile) and bypassed all the env-value memoizations.
+    // `pk` is only `Some` when some tier is on — off means zero
     // recorder overhead for the normal path.
     let stats0 = pk.is_some().then(|| p.stats.clone());
-    let armed = pk.is_some() && reads_begin();
+    let armed = pk.is_some() && crate::stepcache::enabled() && reads_begin();
     if armed {
         // The bisect budget changes which steps run but is read through
         // a process-global `LazyLock` — it lands in this window only on
@@ -1081,9 +1100,12 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     }
     let reads = reads_take();
     let draws = bisect_count() - draws0;
-    if let (Some(k), true) = (pk, armed) {
+    // `armed` only decides whether `reads` is a real read set (disk
+    // tier) or empty (mem tier, where in-process validation is
+    // vacuous) — the claim is published either way.
+    if let Some(mut claim) = pk {
         let ran = sel.iter().map(|s| s.name);
-        crate::stepcache::pipeline_store(&k, p, stats0.as_ref().unwrap(), reads, draws, ran);
+        crate::stepcache::pipeline_store(&mut claim, p, stats0.as_ref().unwrap(), reads, draws, ran);
     }
     crate::stepcache::flush(&mut an);
     p.stats.cfg_builds += an.cfg_builds;
@@ -3639,12 +3661,14 @@ mod tests {
         let mut stats = Stats::default();
         let mut fact_bits = SecondaryMap::new();
         let flags = FnFlags::default();
+        let uen_syms = FxHashMap::default();
         let mut p = Pipe {
             fact_bits: &mut fact_bits,
             clctx: &mut clctx,
             isa: &*isa,
             fname: "carry_keeps_param_facts_scoped",
             func_id: FuncId::from_u32(0),
+            uen_syms: &uen_syms,
             nonnull: &mut nonnull,
             derived: &mut derived,
             frozen: &mut frozen,

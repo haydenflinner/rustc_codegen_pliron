@@ -226,6 +226,33 @@ impl Lowered {
     }
 }
 
+/// `FuncId` index -> declared symbol for `func`'s namespace-0
+/// `user_named_funcs` (skipped where a name can't be resolved — rare:
+/// every referenced decl exists by emit time). The step cache keys
+/// those indices by symbol and remaps replayed variants into another
+/// CGU's numbering.
+fn uen_syms_of(m: &dyn Module, func: &ir::Function) -> FxHashMap<u32, String> {
+    // The map only feeds cache keys — empty means "no table" and is
+    // what every cache-off run would build anyway.
+    if !pliron_clif_opt::stepcache::cache_on() {
+        return FxHashMap::default();
+    }
+    let decls = m.declarations();
+    let n_decl = decls.get_functions().count() as u32;
+    func.params
+        .user_named_funcs()
+        .values()
+        .filter(|n| n.namespace == 0 && n.index < n_decl)
+        .filter_map(|n| {
+            decls
+                .get_function_decl(FuncId::from_u32(n.index))
+                .name
+                .clone()
+                .map(|s| (n.index, s))
+        })
+        .collect()
+}
+
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
@@ -516,6 +543,10 @@ pub fn lower_module<'a>(
         lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>,
         nocap: FxHashSet<(ir::Inst, u32)>,
         stubs: rustc_hash::FxHashSet<&'static str>,
+        /// `FuncId` index -> declared symbol for the fn's namespace-0
+        /// `user_named_funcs` — the step cache keys those indices by
+        /// symbol and remaps replayed variants across CGUs.
+        uen_syms: FxHashMap<u32, String>,
         stats: crate::pipeline::Stats,
         err: Option<cranelift_codegen::CodegenError>,
         code: Option<cranelift_codegen::CompiledCode>,
@@ -648,6 +679,7 @@ pub fn lower_module<'a>(
                 eject: None,
                 opnds: std::mem::take(&mut scratch.opnds),
                 succs: std::mem::take(&mut scratch.succs),
+                lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
             };
             if pliron_cfg::tracing_on() {
                 tracing::debug!(target: "pliron::lower", lowerfn = %n);
@@ -709,6 +741,7 @@ pub fn lower_module<'a>(
                 opnds, succs
             );
         }
+        let uen_syms = uen_syms_of(m, &clctx.func);
         emit(idx, FnJob {
             name: n,
             id,
@@ -729,6 +762,7 @@ pub fn lower_module<'a>(
             lifetimes,
             nocap,
             stubs,
+            uen_syms,
             stats: crate::pipeline::Stats::default(),
             err: None,
             code: None,
@@ -801,6 +835,7 @@ pub fn lower_module<'a>(
                     isa: sh.isa,
                     fname: n,
                     func_id: j.id,
+                    uen_syms: &j.uen_syms,
                     nonnull: &mut j.nonnull,
                     derived: &mut j.derived,
                     frozen: &mut j.frozen,
@@ -1555,6 +1590,7 @@ pub fn lower_clif_wasm(
                 eject: None,
                 opnds: std::mem::take(&mut scratch.opnds),
                 succs: std::mem::take(&mut scratch.succs),
+                lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
             };
             fl.lower(f.op);
             fl.b.finalize(cfg);
@@ -1633,6 +1669,7 @@ pub fn lower_clif_wasm(
         let mut operand_frozen = operand_frozen;
         let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
         let mut lifetimes = lifetimes;
+        let uen_syms = uen_syms_of(&m, &clctx.func);
         let mut pipe = crate::pipeline::Pipe {
             cur_step: "",
             fact_bits: &mut fact_bits,
@@ -1640,6 +1677,7 @@ pub fn lower_clif_wasm(
             isa: &*isa,
             fname: n,
             func_id: id,
+            uen_syms: &uen_syms,
             nonnull: &mut nonnull,
             derived: &mut derived,
             frozen: &mut frozen,
@@ -2089,6 +2127,9 @@ struct FnLower<'a, 'b> {
     /// refills these instead of allocating two `Vec`s per op.
     opnds: Vec<Value>,
     succs: Vec<Ptr<BasicBlock>>,
+    /// `PLIRON_LOWERFOLD` memoized — was ~1M `config()` probes per
+    /// regex-syntax compile from the per-op site in `lower_op_inner`.
+    lowerfold: bool,
 }
 
 /// Tables `FnLower` rebuilds per function that are *not* extracted into
@@ -3620,7 +3661,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // iconst directly. rustc's mir-opts leave some constant expressions
         // unfolded (`7u128.max(1)` lowers to `select(icmp ..)`); folding
         // here also collapses their dependent Assert(cond) checks.
-        if crate::pass_enabled("PLIRON_LOWERFOLD") && self.op_int_constable(op, tid) {
+        if self.lowerfold && self.op_int_constable(op, tid) {
             let r = op.deref(ctx).get_result(ctx, 0);
             let t = self.ty_leaves(r.get_type(ctx));
             if t.len() == 1 {

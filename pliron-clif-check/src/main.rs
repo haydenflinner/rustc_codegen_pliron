@@ -251,12 +251,14 @@ fn with_pipe<R>(
         Vec::new(),
     );
     let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
+    let uen_syms = Default::default();
     let mut p = Pipe {
         fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa,
         fname: "clif-check",
         func_id,
+        uen_syms: &uen_syms,
         nonnull: &mut nonnull,
         derived: &mut derived,
         frozen: &mut frozen,

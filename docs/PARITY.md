@@ -123,7 +123,24 @@ Next steps, in expected-payoff order:
    the pliron-IR side, interned-sym inline maps.
 4. **xcgu copies** multiply IR-opt work per CGU (`PLIRON_XCGU=0` cut syn
    78 → 55 s) but feed the inliner. Share analyzed bodies across CGUs
-   instead of re-optimizing each copy.
+   instead of re-optimizing each copy. **CLIF-side mitigation landed
+   (opt-in)**: `PLIRON_MEMCACHE=1` is a whole-pipeline content-addressed
+   in-process cache — keys normalize `UserExternalName` indices to
+   declared symbols and canonicalize pliron region `Ptr`s in the fact
+   maps (`block_region`/`region_parent`/`scoped`/`operand_frozen`) so
+   copies key alike; hits replay func+derived+facts+stats, remap
+   `FuncId`s by symbol, and pending claims let parallel CGUs share one
+   computation instead of racing misses. regex-syntax: 882/3386 lookups
+   hit (26%), output byte-identical cached/uncached/repeated. CPU is
+   ~neutral there — hits land on small fns and the ~0.9 s key/store
+   overhead eats the replayed work — but it's the mechanism an
+   iropt-side version needs, and it costs nothing when off. Bisect
+   (`PLIRON_OPT_BISECT`) disables both cache tiers: a hit can't honor a
+   consumer's remaining budget. Read-set recording now arms only for
+   the disk tier — in-process env is fixed, so mem-tier validation is
+   vacuous and arming used to de-memoize every `config()` read on
+   armed threads (~1.5M recorded reads/compile). Remaining: the
+   pliron-IR (iropt) half of the duplicated work is untouched.
 5. ~~Glue~~ **partly done, premise revised**: the inter-step
    bookkeeping is now ~3% of phaseB CPU. `carry_aliases`/`compact_aliases`
    walk `dfg.alias_writes()` (the per-write list behind `alias_epoch`)

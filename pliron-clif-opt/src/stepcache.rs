@@ -36,9 +36,11 @@
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::function::{FunctionParameters, FunctionStencil};
-use cranelift_codegen::ir::{Function, Value};
+use cranelift_codegen::ir::entities::UserExternalNameRef;
+use cranelift_codegen::entity::EntityRef;
+use cranelift_codegen::ir::{Function, UserExternalName, Value};
 use cranelift_codegen::loop_analysis::LoopAnalysis;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::hash::{Hash, Hasher};
@@ -68,6 +70,10 @@ struct Variant {
     /// run's facts stayed true, unused extra facts only cost opts).
     facts: Vec<(Value, Value)>,
     stats: StatDelta,
+    /// Per-position symbol for each `user_named_funcs` entry —
+    /// lets a consumer CGU remap `FuncId` indices (empty = verbatim,
+    /// shared numbering only). See `uen_names`/`uen_remaps`.
+    names: Vec<Option<String>>,
     k: usize,
 }
 
@@ -80,7 +86,7 @@ pub(crate) struct StepEntry {
     variants: Vec<Variant>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct PipeVariant {
     reads: Vec<(String, Option<String>)>,
     /// Step names that ran, in order. Gate flips that only change
@@ -96,6 +102,8 @@ struct PipeVariant {
     /// `bisect` units this function drew — replayed on hit so
     /// `PLIRON_OPT_BISECT` numbering matches an uncached run.
     draws: u64,
+    /// Same contract as `Variant::names`.
+    names: Vec<Option<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default)]
@@ -152,13 +160,295 @@ impl StatDelta {
     }
 }
 
-fn enabled() -> bool {
+/// A bisect budget makes cache replay unsound: a hit replays the
+/// producer's `ran` list, but the consumer's remaining budget may
+/// require fewer transforms — `bisect_skip` only renumbers, it cannot
+/// un-run a step. Bisection is a debugging tool; keep it exact by
+/// turning both cache tiers off while `PLIRON_OPT_BISECT` is set.
+fn bisecting() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::config::bisect_limit().is_some());
+    *B
+}
+
+pub(crate) fn enabled() -> bool {
     // `PLIRON_STEPCACHE` is process-fixed and excluded from read
     // recording (it configures the cache, not the computation), so a
     // one-time parse is safe — called per cached step per function.
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| config().is("PLIRON_STEPCACHE", "1"));
+        std::sync::LazyLock::new(|| config().is("PLIRON_STEPCACHE", "1") && !bisecting());
     *ON
+}
+
+/// In-process whole-pipeline tier (`PLIRON_MEMCACHE=1`, opt-in):
+/// identical functions recur across CGUs in one compile — xcgu copies
+/// and rustc's own shared-generic duplicates — and each otherwise
+/// re-runs every step. Keys, variant matching and replay are exactly
+/// the disk tier's. Entries are decoded `PipeVariant`s — a disk hit
+/// promotes its freshly-decoded list and a mem-store blob could be
+/// written to disk unchanged (not done: the disk tier stays opt-in).
+/// Determinism is the disk tier's contract — a hit replays an output
+/// produced from the same `(key, reads, ran)`, and parallel CGUs make
+/// producer choice nondeterministic only over identical results.
+fn mem_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| config().is("PLIRON_MEMCACHE", "1") && !bisecting());
+    *ON
+}
+
+/// Any cache tier on — callers can skip work (like symbol-table
+/// construction) that only feeds cache keys.
+pub fn cache_on() -> bool {
+    enabled() || mem_on()
+}
+
+/// Cap on serialized bytes held in `MEM` (`PLIRON_MEMCACHE_MB`,
+/// default 1 GiB). Storing blobs keeps the accounting exact; past the
+/// cap new keys stop inserting — a partial cache is still a win, and a
+/// miss only costs the lookup.
+fn mem_cap() -> usize {
+    static CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        config()
+            .get("PLIRON_MEMCACHE_MB")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024)
+            << 20
+    });
+    *CAP
+}
+
+/// One pipeline result or an in-flight computation of it. A copy in
+/// CGU B that looks up while CGU A is still optimizing the same body
+/// waits on `Pending` instead of recomputing — without this, parallel
+/// CGUs would run the duplicates concurrently and never hit. Entries
+/// are decoded `PipeVariant`s: postcard round-trips on this tier cost
+/// more than the lookups save.
+enum MemEnt {
+    Pending(std::sync::Arc<Pending>),
+    Ready(std::sync::Arc<Vec<PipeVariant>>),
+}
+
+/// `Open` while the claim's owner computes; `Done` once it published
+/// (`Some`) or dropped without storing (`None` — waiters then produce
+/// the result themselves).
+enum Slot {
+    Open,
+    Done(Option<std::sync::Arc<Vec<PipeVariant>>>),
+}
+
+struct Pending {
+    slot: std::sync::Mutex<Slot>,
+    cv: std::sync::Condvar,
+}
+
+impl Pending {
+    fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(Slot::Open),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+static MEM: std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashMap<[u8; 32], MemEnt>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+static MEM_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Returned by `pipeline_lookup` on a miss: while held this thread
+/// owns the key's pending slot (`pend`, when it claimed one).
+/// `pipeline_store` fills it; a drop without storing wakes waiters
+/// with `None` so they compute for themselves — a dropped claim must
+/// never leave a waiter asleep.
+pub struct Claim {
+    key: [u8; 32],
+    pend: Option<std::sync::Arc<Pending>>,
+    filled: bool,
+}
+
+impl Claim {
+    /// No pending slot owned — used when a blob existed but no variant
+    /// in it matched this run.
+    fn bare(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            pend: None,
+            filled: false,
+        }
+    }
+
+    fn holding(key: [u8; 32], pend: std::sync::Arc<Pending>) -> Self {
+        Self {
+            key,
+            pend: Some(pend),
+            filled: false,
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        if let Some(p) = &self.pend {
+            let mut s = p.slot.lock().unwrap_or_else(|e| e.into_inner());
+            *s = Slot::Done(None);
+            p.cv.notify_all();
+        }
+    }
+}
+
+/// Rough per-variant byte estimate for `MEM_BYTES` accounting —
+/// decoded variants aren't measured exactly, and the cap only needs
+/// to keep this tier bounded, not precise.
+fn est_bytes(v: &PipeVariant) -> usize {
+    let (st, params) = &v.func;
+    1024 + 96 * st.dfg.num_insts()
+        + 64 * (st.layout.blocks().count()
+            + params.user_named_funcs().len()
+            + v.derived.len()
+            + v.facts.len())
+        + 16 * v.ran.len()
+}
+
+/// The Ready variant list under `k`, if any — for merges on store.
+fn mem_ready(k: &[u8; 32]) -> Option<std::sync::Arc<Vec<PipeVariant>>> {
+    match MEM.lock().ok()?.get(k) {
+        Some(MemEnt::Ready(v)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// Insert a Ready variant list under `k` if it fits the byte cap.
+/// Retention only — waiters must already have been fed by `mem_fill`.
+fn mem_retain(k: [u8; 32], vs: std::sync::Arc<Vec<PipeVariant>>) {
+    let Ok(mut m) = MEM.lock() else {
+        return;
+    };
+    let old = match m.get(&k) {
+        Some(MemEnt::Ready(v)) => v.iter().map(est_bytes).sum::<usize>(),
+        _ => 0,
+    };
+    let new: usize = vs.iter().map(est_bytes).sum();
+    let cur = MEM_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if cur + new > old + mem_cap() {
+        // Over cap: keep nothing new — later lookups just miss.
+        if matches!(m.get(&k), Some(MemEnt::Pending(_))) {
+            m.remove(&k);
+        }
+        return;
+    }
+    if new >= old {
+        MEM_BYTES.fetch_add(new - old, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        MEM_BYTES.fetch_sub(old - new, std::sync::atomic::Ordering::Relaxed);
+    }
+    m.insert(k, MemEnt::Ready(vs));
+}
+
+/// Wake the pending slot's waiters with `vs`, then retain it.
+fn mem_fill(k: [u8; 32], t: &std::sync::Arc<Pending>, vs: Vec<PipeVariant>) {
+    let vs = std::sync::Arc::new(vs);
+    {
+        let mut s = t.slot.lock().unwrap_or_else(|e| e.into_inner());
+        *s = Slot::Done(Some(vs.clone()));
+    }
+    t.cv.notify_all();
+    mem_retain(k, vs);
+}
+
+/// Per-position declared symbol for every `UserExternalName` in
+/// `params`, `None` for non-namespace-0 names. An empty vec marks a
+/// verbatim variant (no symbol table — applies only under a
+/// table-less consumer, where the raw indices are meaningful).
+/// `None` means a tabled run couldn't resolve a name — the variant
+/// is unshareable and must not be published: its indices belong to
+/// this module's numbering alone.
+fn uen_names(
+    p: &Pipe,
+    params: &FunctionParameters,
+) -> Option<Vec<Option<String>>> {
+    if p.uen_syms.is_empty() {
+        return Some(Vec::new());
+    }
+    params
+        .user_named_funcs()
+        .values()
+        .map(|n| {
+            if n.namespace != 0 {
+                Some(None)
+            } else {
+                p.uen_syms.get(&n.index).cloned().map(Some)
+            }
+        })
+        .collect()
+}
+
+/// Resolve the producer's `UserExternalName` FuncId indices into this
+/// module's numbering. `names` is the variant's per-position symbol
+/// list; an empty list means verbatim (valid only when this pipe has
+/// no table either). Every namespace-0 name must resolve here —
+/// outputs reference a subset of the input's declared callees, so a
+/// failure means the numbering differs and the variant is unusable.
+/// Returns the `(ref, name)` pairs to install.
+fn uen_remaps<'x>(
+    p: &Pipe,
+    params: &'x FunctionParameters,
+    names: &[Option<String>],
+) -> Option<Vec<(UserExternalNameRef, cranelift_codegen::ir::UserExternalName)>> {
+    if names.is_empty() {
+        // Verbatim variants carry no symbol table — a tabled consumer
+        // can't trust raw indices. Unless the params name nothing at
+        // all: an empty remap is trivially valid either way (this is
+        // also what keeps leaf functions hittable across CGUs — a
+        // tabled producer emits `names=[]` for them).
+        return (p.uen_syms.is_empty() || params.user_named_funcs().is_empty()).then(Vec::new);
+    }
+    if names.len() != params.user_named_funcs().len() {
+        return None;
+    }
+    params
+        .user_named_funcs()
+        .iter()
+        .zip(names)
+        .map(|((uref, n), sym)| {
+            if n.namespace != 0 {
+                return Some((uref, n.clone()));
+            }
+            let sym = sym.as_ref()?;
+            let (&idx, _) = p
+                .uen_syms
+                .iter()
+                .find(|(_, s)| s.as_str() == sym.as_str())?;
+            Some((
+                uref,
+                UserExternalName {
+                    namespace: 0,
+                    index: idx,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `UserExternalName` for hashing: namespace-0 indices are
+/// module-local FuncIds — substitute the declared symbol so identical
+/// bodies in different CGUs key alike. Without a table the raw index
+/// stands in; table-less contexts only see verbatim variants anyway.
+#[derive(Hash)]
+enum UKey<'x> {
+    Sym(&'x str),
+    Raw(u32, u32),
+}
+
+fn uen_key<'x>(n: &cranelift_codegen::ir::UserExternalName, p: &'x Pipe) -> UKey<'x> {
+    if n.namespace == 0
+        && let Some(sym) = p.uen_syms.get(&n.index)
+    {
+        UKey::Sym(sym)
+    } else {
+        UKey::Raw(n.namespace, n.index)
+    }
 }
 
 fn dir() -> Option<&'static Path> {
@@ -227,7 +517,7 @@ fn state_hash(p: &Pipe) -> [u8; 32] {
     let params = &p.clctx.func.params;
     params.base_srcloc().hash(&mut h);
     for name in params.user_named_funcs().values() {
-        name.hash(&mut h);
+        uen_key(name, p).hash(&mut h);
     }
     seq_hash(&mut h, p.derived.iter());
     h.0.finalize().into()
@@ -244,12 +534,78 @@ fn cur_hash(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     h
 }
 
+/// Canonical representative for each `Ptr<BasicBlock>` region label a
+/// Pipe's fact maps can observe. Copies of one body in different CGUs
+/// hold different arena indices for identical structures, so raw ptr
+/// bits must never reach the input hash — `seq_hash`'s order-free
+/// fold covers map order, not entry content. Every region referenced
+/// by `block_region`/`scoped`/`operand_frozen` gets a sequential rep
+/// in canonical first-seen order (layout blocks, then insts, then
+/// values); their `region_parent` ancestors get
+/// `(seed rep << 20 | depth)`, min over all seed walks — order-free,
+/// so `ColMap`'s raw-ordinal iteration can't leak in either.
+/// `region_parent` is only ever queried by `.get` chain from a
+/// referenced region (licm/loadfwd `in_region`), so entries
+/// unreachable from those regions are unobservable and must not be
+/// keyed: copies carry region trees iropt shaped differently, and the
+/// unreachable residue is exactly what differs.
+fn region_reps(
+    p: &Pipe,
+) -> FxHashMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, u64> {
+    let mut rep: FxHashMap<_, u64> = FxHashMap::default();
+    let seed = |rep: &mut FxHashMap<_, u64>, r| {
+        if !rep.contains_key(&r) {
+            let n = rep.len() as u64;
+            rep.insert(r, n);
+        }
+    };
+    for b in p.clctx.func.stencil.layout.blocks() {
+        if let Some(&r) = p.block_region.get(&b) {
+            seed(&mut rep, r);
+        }
+    }
+    let mut sc: Vec<_> = p.scoped.iter().collect();
+    sc.sort_by_key(|(i, _)| i.index());
+    for (_, &r) in sc {
+        seed(&mut rep, r);
+    }
+    let mut of: Vec<_> = p.operand_frozen.iter().collect();
+    of.sort_by_key(|(v, _)| v.index());
+    for (_, es) in of {
+        for (_, r) in es {
+            seed(&mut rep, *r);
+        }
+    }
+    let seeds: Vec<_> = rep.iter().map(|(&k, &v)| (k, v)).collect();
+    for (r, base) in seeds {
+        let mut cur = r;
+        for d in 1u64..(1 << 20) {
+            let Some(&par) = p.region_parent.get(cur) else {
+                break;
+            };
+            if par == cur {
+                break;
+            }
+            let cand = (base << 20) | d;
+            if rep.get(&par).is_none_or(|&x| x > cand) {
+                rep.insert(par, cand);
+            }
+            cur = par;
+        }
+    }
+    rep
+}
+
 /// Everything a step can observe besides the function: the FnLower
 /// fact maps plus target/config fields. Hashed once per function.
 fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     if let Some(h) = an.fnh {
         return h;
     }
+    let reps = region_reps(p);
+    let rep_of = |r: &pliron::context::Ptr<pliron::basic_block::BasicBlock>| -> u64 {
+        reps.get(r).copied().unwrap_or(1 << 63 | r.ord() as u64)
+    };
     let mut h = Sha(sha2::Sha256::new());
     seq_hash(&mut h, p.nonnull.iter());
     seq_hash(&mut h, p.frozen.iter());
@@ -257,20 +613,41 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     seq_hash(&mut h, p.deref.iter());
     seq_hash(&mut h, p.nowrite.iter());
     seq_hash(&mut h, p.call_frozen.iter());
-    seq_hash(&mut h, p.scoped.iter());
+    seq_hash(&mut h, p.scoped.iter().map(|(i, r)| (i.index(), rep_of(r))));
     seq_hash(&mut h, p.invariant.iter());
-    seq_hash(&mut h, p.operand_frozen.iter());
-    seq_hash(&mut h, p.block_region.iter());
-    seq_hash(&mut h, p.region_parent.iter());
+    seq_hash(
+        &mut h,
+        p.operand_frozen.iter().map(|(v, es)| {
+            (
+                v.index(),
+                es.iter().map(|(x, r)| (*x, rep_of(r))).collect::<Vec<_>>(),
+            )
+        }),
+    );
+    seq_hash(
+        &mut h,
+        p.block_region.iter().map(|(b, r)| (b.index(), rep_of(r))),
+    );
+    // Only the reachable ancestor graph is observable (see
+    // `region_reps`) — a rep'd key's parent is rep'd by construction.
+    seq_hash(
+        &mut h,
+        p.region_parent
+            .iter()
+            .filter(|(k, _)| reps.contains_key(k))
+            .map(|(k, v)| (rep_of(&k), rep_of(v))),
+    );
     seq_hash(&mut h, p.lifetimes.iter());
     seq_hash(&mut h, p.nocap.iter());
     seq_hash(&mut h, p.prof.iter());
     // Steps can observe the function's identity: `tailrec` matches
-    // self-calls on `func_id`, `loopidiom` refuses libcall-named `fname`s.
-    // Two stencils may be identical across functions — without these a
-    // hit replays a decision made for a different self.
+    // self-calls on `func_id`, `loopidiom` refuses libcall-named
+    // `fname`s. The self-call's `UserExternalName` already hashes by
+    // symbol (`uen_key`), so `func_id`'s module-local numbering only
+    // splits otherwise-identical keys — `fname` is what must not
+    // change hands: two stencils may be identical across functions and
+    // a hit must never replay a decision made for a different self.
     p.fname.hash(&mut h);
-    p.func_id.as_u32().hash(&mut h);
     (
         p.tcfg.default_call_conv,
         p.tcfg.pointer_width,
@@ -354,60 +731,196 @@ fn pipe_key(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
 
 pub enum PipeLookup {
     Hit,
-    Miss([u8; 32]),
+    Miss(Claim),
     Off,
 }
 
-/// Try to replay a whole cached pipeline. Returns the function's key
-/// on a miss so `pipeline_store` doesn't recompute it (the input hash
-/// must be captured before any step mutates the function).
-pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
-    if !enabled() {
-        return PipeLookup::Off;
-    }
-    let k = pipe_key(p, an);
-    an.pk = Some(k);
-    let Some(path) = file_path("pipe", &k) else {
-        return PipeLookup::Off;
+/// Install a variant's `(stencil, params)` into `p`, remapping the
+/// stored `FuncId` indices into this module's numbering. `false` when
+/// it can't be expressed here — nothing has been applied then.
+fn apply_named(
+    p: &mut Pipe,
+    func: (FunctionStencil, FunctionParameters),
+    derived: &[(Value, Value)],
+    names: &[Option<String>],
+) -> bool {
+    let Some(remaps) = uen_remaps(p, &func.1, names) else {
+        return false;
     };
-    let variants: Vec<PipeVariant> = load(&path);
-    let ran: Vec<&str> = crate::pipeline::selected(p, true)
-        .iter()
-        .map(|s| s.name)
-        .collect();
+    apply_func(p, func, derived);
+    for (uref, n) in remaps {
+        p.clctx.func.params.reset_user_func_name(uref, n);
+    }
+    true
+}
+
+/// Replay the variant matching this run's step list and env reads.
+/// Shared by the mem and disk tiers (the disk tier decodes first).
+fn pipe_apply(p: &mut Pipe, variants: &[PipeVariant], ran: &[&str]) -> bool {
     let Some(v) = variants
         .iter()
         .find(|v| v.ran.iter().map(String::as_str).eq(ran.iter().copied()) && reads_ok(&v.reads))
     else {
-        log("pipe-miss");
-        return PipeLookup::Miss(k);
+        return false;
     };
-    log("pipe-hit");
-    apply_func(p, v.func.clone(), &v.derived);
+    if !apply_named(p, v.func.clone(), &v.derived, &v.names) {
+        return false;
+    }
     for &(d, w) in &v.facts {
         crate::pipeline::carry_one(p, d, w);
     }
     crate::pipeline::carry_lts(p, &v.facts);
     v.stats.apply(p.stats);
     crate::config::bisect_skip(v.draws);
-    PipeLookup::Hit
+    true
+}
+
+/// Try to replay a whole cached pipeline. Returns a `Claim` on a miss
+/// so `pipeline_store` can publish under the same key (and wake any
+/// waiters); the input hash must be captured before any step mutates
+/// the function.
+pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
+    if !enabled() && !mem_on() {
+        return PipeLookup::Off;
+    }
+    struct G(Option<std::time::Instant>, &'static std::sync::atomic::AtomicU64);
+    impl Drop for G {
+        fn drop(&mut self) {
+            if let Some(t) = self.0 {
+                self.1.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+    }
+    let _g = G(
+        crate::config::env_is("PLIRON_MCPROF", "1").then(std::time::Instant::now),
+        &crate::pipeline::MC_LOOKUP_T,
+    );
+    let k = pipe_key(p, an);
+    an.pk = Some(k);
+    let ran: Vec<&str> = crate::pipeline::selected(p, true)
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    if mem_on() {
+        enum Got {
+            Ready(std::sync::Arc<Vec<PipeVariant>>),
+            Wait(std::sync::Arc<Pending>),
+            Mine(std::sync::Arc<Pending>),
+        }
+        let got = {
+            let mut m = MEM.lock().unwrap_or_else(|e| e.into_inner());
+            match m.get(&k) {
+                Some(MemEnt::Ready(v)) => Got::Ready(v.clone()),
+                Some(MemEnt::Pending(t)) => Got::Wait(t.clone()),
+                None => {
+                    let t = std::sync::Arc::new(Pending::new());
+                    m.insert(k, MemEnt::Pending(t.clone()));
+                    Got::Mine(t)
+                }
+            }
+        };
+        match got {
+            Got::Ready(v) => {
+                if pipe_apply(p, &v, &ran) {
+                    log("mem-pipe-hit");
+                    return PipeLookup::Hit;
+                }
+                // Decoded but no variant matched this run's step list
+                // or reads — the run produces; its store merges in.
+                log("pipe-miss");
+                return PipeLookup::Miss(Claim::bare(k));
+            }
+            Got::Wait(t) => {
+                let done = {
+                    let mut s = t.slot.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        match &*s {
+                            Slot::Open => {
+                                s = t.cv.wait(s).unwrap_or_else(|e| e.into_inner())
+                            }
+                            Slot::Done(r) => break r.clone(),
+                        }
+                    }
+                };
+                match done {
+                    Some(v) => {
+                        if pipe_apply(p, &v, &ran) {
+                            log("mem-pipe-hit");
+                            return PipeLookup::Hit;
+                        }
+                        log("pipe-miss");
+                        return PipeLookup::Miss(Claim::bare(k));
+                    }
+                    // Producer dropped without storing — take over as
+                    // the producer for later lookups.
+                    None => {
+                        let t = std::sync::Arc::new(Pending::new());
+                        if let Ok(mut m) = MEM.lock() {
+                            m.insert(k, MemEnt::Pending(t.clone()));
+                        }
+                        log("pipe-miss");
+                        return PipeLookup::Miss(Claim::holding(k, t));
+                    }
+                }
+            }
+            Got::Mine(t) => {
+                // The disk tier may still hold it from another process.
+                if enabled()
+                    && let Some(path) = file_path("pipe", &k)
+                    && let Ok(bytes) = std::fs::read(&path)
+                    && let Ok(vs) = postcard::from_bytes::<Vec<PipeVariant>>(&bytes)
+                    && pipe_apply(p, &vs, &ran)
+                {
+                    mem_fill(k, &t, vs);
+                    log("pipe-hit");
+                    return PipeLookup::Hit;
+                }
+                log("pipe-miss");
+                return PipeLookup::Miss(Claim::holding(k, t));
+            }
+        }
+    }
+    // Disk tier only (`PLIRON_STEPCACHE` on, mem off).
+    if enabled()
+        && let Some(path) = file_path("pipe", &k)
+        && let Ok(bytes) = std::fs::read(&path)
+        && let Ok(vs) = postcard::from_bytes::<Vec<PipeVariant>>(&bytes)
+        && pipe_apply(p, &vs, &ran)
+    {
+        log("pipe-hit");
+        return PipeLookup::Hit;
+    }
+    log("pipe-miss");
+    PipeLookup::Miss(Claim::bare(k))
 }
 
 /// Store a whole-pipeline variant after a real run. `before` is the
 /// stats snapshot taken before the pipeline ran; `ran` is the list of
-/// step names that ran.
+/// step names that ran. Fills the claim's pending slot (waking
+/// waiters) and merges the variant into the key's blob on both tiers.
 pub fn pipeline_store(
-    k: &[u8; 32],
+    claim: &mut Claim,
     p: &Pipe,
     before: &Stats,
     reads: std::collections::BTreeMap<String, Option<String>>,
     draws: u64,
     ran: impl Iterator<Item = &'static str>,
 ) {
-    let Some(path) = file_path("pipe", k) else {
-        return;
-    };
-    let variant = PipeVariant {
+    struct G(Option<std::time::Instant>);
+    impl Drop for G {
+        fn drop(&mut self) {
+            if let Some(t) = self.0 {
+                crate::pipeline::MC_STORE_T
+                    .fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let _g = G(crate::config::env_is("PLIRON_MCPROF", "1").then(std::time::Instant::now));
+    let k = claim.key;
+    let mut variant = PipeVariant {
         reads: reads.into_iter().collect(),
         ran: ran.map(str::to_string).collect(),
         func: (p.clctx.func.stencil.clone(), p.clctx.func.params.clone()),
@@ -415,16 +928,40 @@ pub fn pipeline_store(
         facts: p.carry_log.clone(),
         stats: StatDelta::delta(before, p.stats),
         draws,
+        names: Vec::new(),
     };
-    let mut variants: Vec<PipeVariant> = load(&path);
-    match variants
-        .iter_mut()
-        .find(|v| v.reads == variant.reads && v.ran == variant.ran)
+    if mem_on()
+        && let Some(names) = uen_names(p, &variant.func.1)
     {
-        Some(v) => *v = variant,
-        None => variants.push(variant),
+        variant.names = names;
+        let mut variants: Vec<PipeVariant> =
+            mem_ready(&k).map(|v| v.as_ref().clone()).unwrap_or_default();
+        match variants
+            .iter_mut()
+            .find(|v| v.reads == variant.reads && v.ran == variant.ran)
+        {
+            Some(v) => *v = variant.clone(),
+            None => variants.push(variant.clone()),
+        }
+        claim.filled = true;
+        match &claim.pend {
+            Some(t) => mem_fill(k, t, variants),
+            None => mem_retain(k, std::sync::Arc::new(variants)),
+        }
     }
-    store(&path, &variants);
+    if enabled()
+        && let Some(path) = file_path("pipe", &k)
+    {
+        let mut variants: Vec<PipeVariant> = load(&path);
+        match variants
+            .iter_mut()
+            .find(|v| v.reads == variant.reads && v.ran == variant.ran)
+        {
+            Some(v) => *v = variant,
+            None => variants.push(variant),
+        }
+        store(&path, &variants);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -446,13 +983,14 @@ pub fn lookup(p: &mut Pipe, s: &Step, an: &mut Analysis) -> Option<usize> {
         return None;
     }
     let cur = cur_hash(p, an);
-    let (func, derived, facts, stats, out_hash, k) = {
+    let (func, names, derived, facts, stats, out_hash, k) = {
         let ent = stepfile(an)?
             .iter()
             .find(|e| e.step == s.name && e.in_hash == cur)?;
         let v = ent.variants.iter().find(|v| reads_ok(&v.reads))?;
         (
             v.func.clone(),
+            v.names.clone(),
             v.derived.clone(),
             v.facts.clone(),
             v.stats,
@@ -461,7 +999,9 @@ pub fn lookup(p: &mut Pipe, s: &Step, an: &mut Analysis) -> Option<usize> {
         )
     };
     if let Some(func) = func {
-        apply_func(p, func, &derived);
+        if !apply_named(p, func, &derived, &names) {
+            return None;
+        }
     } else {
         *p.derived = derived.iter().copied().collect();
         p.seed_derived_bits();
@@ -495,6 +1035,14 @@ pub fn compute(p: &mut Pipe, s: &Step, an: &mut Analysis) -> usize {
     an.clif_hash = Some(out_hash);
     let func =
         (out_hash != in_hash).then(|| (p.clctx.func.stencil.clone(), p.clctx.func.params.clone()));
+    // A stored func needs its user names resolvable; `None` from
+    // `uen_names` means they aren't — this variant can't publish.
+    let Some(names) = (match &func {
+        Some((_, params)) => uen_names(p, params),
+        None => Some(Vec::new()),
+    }) else {
+        return k;
+    };
     let variant = Variant {
         reads: reads.into_iter().collect(),
         out_hash,
@@ -502,6 +1050,7 @@ pub fn compute(p: &mut Pipe, s: &Step, an: &mut Analysis) -> usize {
         derived: p.derived.iter().map(|(a, b)| (*a, *b)).collect(),
         facts: p.carry_log[cmark..].to_vec(),
         stats: StatDelta::delta(&before, p.stats),
+        names,
         k,
     };
     let Some(file) = stepfile(an) else {
@@ -527,6 +1076,17 @@ pub fn compute(p: &mut Pipe, s: &Step, an: &mut Analysis) -> usize {
 
 /// Write the step file back if any step stored. Called at pipeline end.
 pub fn flush(an: &mut Analysis) {
+    if crate::config::env_is("PLIRON_MCPROF", "1") {
+        eprintln!(
+            "mcprof lookup={}ms store={}ms record={}x",
+            crate::pipeline::MC_LOOKUP_T.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            crate::pipeline::MC_STORE_T.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            pliron_cfg::RECORD_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        for (k, n) in pliron_cfg::record_keys_top().into_iter().take(12) {
+            eprintln!("  {n:>8}x {k}");
+        }
+    }
     if !an.stepfile_dirty {
         return;
     }
