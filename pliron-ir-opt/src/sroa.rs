@@ -13,17 +13,17 @@ use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::{TypeHandle, Typed};
+use pliron::r#type::{TypeHandle, Typed, TypedHandle};
 use pliron::value::Value;
 use pliron_llvm::attributes::IntegerOverflowFlagsAttr;
 use pliron_llvm::op_interfaces::{
     BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
 use pliron_llvm::ops::{
-    AllocaOp, AndOp, BrOp, CallOp, GepIndex, GetElementPtrOp, ICmpOp, IntToPtrOp, LShrOp, LoadOp,
-    OrOp, PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
+    AllocaOp, AndOp, BrOp, CallIntrinsicOp, CallOp, GepIndex, GetElementPtrOp, ICmpOp, IntToPtrOp,
+    LShrOp, LoadOp, OrOp, PtrToIntOp, ShlOp, StoreOp, TruncOp, UndefOp, UnreachableOp, ZExtOp,
 };
-use pliron_llvm::types::ArrayType;
+use pliron_llvm::types::{ArrayType, FuncType};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
@@ -285,6 +285,47 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
 
 fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
     st.intrinsics.get(&op).map(|s| s.as_str())
+}
+
+/// Clone `a`'s `llvm.lifetime` markers onto escape copy `c`. The copy's
+/// bytes back a call operand: a callee retaining the pointer can only
+/// legally dereference it inside the original local's storage window —
+/// the parent's markers therefore bound the copy's escape the same way
+/// they bound `a` — without them the copy's slot reads as live to
+/// function end and poisons stack-slot coloring.
+fn inherit_markers(ctx: &mut Context, st: &mut State, a: Value, c: Value) {
+    let markers: Vec<Ptr<Operation>> = a
+        .uses(ctx)
+        .iter()
+        .map(|u| u.user_op())
+        .filter(|&m| {
+            matches!(
+                intrinsic(st, m),
+                Some("llvm.lifetime.start" | "llvm.lifetime.end")
+            ) && m.deref(ctx).operands().any(|v| v == a)
+        })
+        .collect();
+    for m in markers {
+        let name = intrinsic(st, m).unwrap().to_string();
+        let ci = Operation::get_op::<CallIntrinsicOp>(m, ctx).unwrap();
+        let iname = ci.get_attr_llvm_intrinsic_name(ctx).unwrap().clone();
+        let fty = TypedHandle::<FuncType>::from_handle(
+            ci.get_attr_llvm_intrinsic_type(ctx)
+                .unwrap()
+                .clone()
+                .into(),
+            ctx,
+        )
+        .unwrap();
+        let args: Vec<Value> = m
+            .deref(ctx)
+            .operands()
+            .map(|v| if v == a { c } else { v })
+            .collect();
+        let new = CallIntrinsicOp::new(ctx, iname, fty, args).get_operation();
+        new.insert_before(ctx, m);
+        st.intrinsics.insert(new, name);
+    }
 }
 
 /// Deepest `store *q <- p` chain the flow walk will chase (a pointer stored
@@ -1004,6 +1045,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
         // Its bytes back a live call operand — re-splitting would just
         // re-pin the same range.
         st.escape_copies.insert(v);
+        inherit_markers(ctx, st, a, v);
         Some(v)
     } else {
         None
@@ -1167,6 +1209,7 @@ fn split(ctx: &mut Context, st: &mut State, alloca: Ptr<Operation>) -> bool {
                 let tmp = tmp.deref(ctx).get_result(0);
                 st.allocas.insert(tmp, (size, align));
                 st.escape_copies.insert(tmp);
+                inherit_markers(ctx, st, a, tmp);
                 for (i, s) in sl.iter().enumerate() {
                     let l = LoadOp::new(ctx, new[i], s.ty).get_operation();
                     l.insert_before(ctx, x.op);

@@ -606,10 +606,13 @@ pub fn lower_module(
             // point in the pipeline the operand is usually long dead.
             // (This has to precede `finalize`: it moves `fl.b` and keeps
             // `clctx.func` borrowed for `fl`'s whole lifetime.)
+            let lt_dbg = crate::env_set("PLIRON_LT_DEBUG");
+            let mut lt_dropped = FxHashMap::default();
             lifetimes = std::mem::take(&mut fl.lifetimes)
                 .into_iter()
                 .filter_map(|(p, anchor, b, start)| {
-                    fl.vals
+                    let r = fl
+                        .vals
                         .get(&p)
                         .or_else(|| fl.cconst.get(&p))
                         .and_then(|vs| vs.first().copied())
@@ -620,9 +623,32 @@ pub fn lower_module(
                                 b,
                                 start,
                             )
-                        })
+                        });
+                    if lt_dbg {
+                        match &r {
+                            None => *lt_dropped.entry(format!("noval {p:?}")).or_insert(0u32) += 1,
+                            Some((ss, ..)) if ss.is_empty() => {
+                                *lt_dropped.entry(format!("empty {p:?}")).or_insert(0u32) += 1
+                            }
+                            _ => {}
+                        }
+                    }
+                    r
                 })
                 .collect();
+            if lt_dbg {
+                let n: u32 = lt_dropped.values().sum();
+                let nalloc = crate::sroa::allocas(fl.ctx, f.op).len();
+                let nslots = fl.b.func.sized_stack_slots.len();
+                eprintln!(
+                    "lt-debug {n}: dropped/empty {n} markers, kept {} — {nalloc} allocas ({} promoted), {nslots} slots",
+                    lifetimes.len(),
+                    fl.st.promoted.len(),
+                );
+                for (k, c) in lt_dropped.iter().take(40) {
+                    eprintln!("lt-debug   {c}x {k}");
+                }
+            }
             fl.b.finalize(cfg);
             asm_stubs.extend(fl.stubs.iter().copied());
             nonnull = std::mem::take(&mut fl.nonnull);
@@ -786,7 +812,14 @@ pub fn lower_module(
                     prof_hook: Some(&prof_hook),
                     fn_names: sh.fn_names,
                 };
-                crate::pipeline::run_pipeline(&mut pipe);
+                // Debug bisection: same `PLIRON_PIPEFN[X]` filter as the
+                // wasm path — the pipeline runs only on matching fns.
+                let run_pipe = crate::env_get("PLIRON_PIPEFN")
+                    .is_none_or(|f| n.contains(&f))
+                    && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f));
+                if run_pipe {
+                    crate::pipeline::run_pipeline(&mut pipe);
+                }
             }
             if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
                 clctx.set_disasm(true);
