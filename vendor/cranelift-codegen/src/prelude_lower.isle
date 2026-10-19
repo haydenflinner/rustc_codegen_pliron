@@ -270,6 +270,13 @@
 (decl pure value_is_unused (Value) bool)
 (extern constructor value_is_unused value_is_unused)
 
+;; PLIRON: returns whether the given value has more than one use (per the
+;; ValueUseState analysis). A multi-use value is materialized for its other
+;; uses anyway, so decomposing it into an amode only keeps its operands'
+;; registers live as well.
+(decl pure value_has_multiple_uses (Value) bool)
+(extern constructor value_has_multiple_uses value_has_multiple_uses)
+
 ;; Extract the first result value of the given instruction.
 (decl first_result (Value) Inst)
 (extern extractor first_result first_result)

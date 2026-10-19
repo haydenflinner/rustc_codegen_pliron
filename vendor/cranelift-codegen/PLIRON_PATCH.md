@@ -659,3 +659,16 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `inst` (a block names at most a handful of destinations, so these
     stay tiny). Output order is unchanged; `edges` still ends grouped
     by destination. CFG build time on the corpus roughly halved.
+
+55. Multi-use `iadd` amode sharing (`src/isa/aarch64/inst.isle`,
+    `src/isa/aarch64/lower/isle.rs`, `src/prelude_lower.isle`,
+    `src/machinst/isle.rs`, `src/machinst/lower.rs`): new amode rules
+    keep a multi-use `iadd` load/store base whole (`UnsignedOffset` /
+    `Unscaled` on its own register) instead of decomposing it into a
+    reg+reg amode — the sum is materialized for its other uses anyway,
+    so decomposing only kept the operands' registers live as well and
+    emitted a redundant address computation per load. Enables the
+    generic reg+imm path (and `ldp`/`stp` pairing) for shared
+    `base + index` addresses. `PLIRON_AMODESHARE=1` enables
+    (`Lower.value_has_multiple_uses` is exposed to ISLE for the guard;
+    the gate lives in `amode_share_ok` on the aarch64 isle context).

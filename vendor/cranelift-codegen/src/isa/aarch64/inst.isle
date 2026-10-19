@@ -4271,6 +4271,24 @@
         (if-let uimm12 (uimm12_scaled_nonzero_from_i64 offset ty))
         (AMode.UnsignedOffset val uimm12))
 
+;; PLIRON: a multi-use `iadd` result is materialized for its other uses
+;; anyway, so decomposing it into a reg+reg amode (rules 3-7 above) only
+;; keeps the operands' registers live as well. Keep the result whole so a
+;; shared `base + index` computes once and each load adds its own
+;; immediate. Priorities above 8 so this wins over the decompositions.
+;; Opt-in: `PLIRON_AMODESHARE=1` enables.
+(decl pure amode_share_ok (Value) bool)
+(extern constructor amode_share_ok amode_share_ok)
+
+(rule 9 (amode_no_more_iconst ty v @ (iadd _ _ _) offset)
+        (if-let true (amode_share_ok v))
+        (if-let uimm12 (uimm12_scaled_from_i64 offset ty))
+        (AMode.UnsignedOffset v uimm12))
+(rule 10 (amode_no_more_iconst ty v @ (iadd _ _ _) offset)
+         (if-let true (amode_share_ok v))
+         (if-let simm9 (simm9_from_i64 offset))
+         (AMode.Unscaled v simm9))
+
 (attr amode_reg_scaled (veri chain))
 (decl amode_reg_scaled (Reg Value) AMode)
 (rule 0 (amode_reg_scaled base index)
