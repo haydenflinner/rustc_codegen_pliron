@@ -639,3 +639,14 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `Context::egraph_pass` no longer recomputes `cfg` unconditionally
     and recomputes `domtree` only when edges actually moved — about
     1.4s of analysis rebuilds per bench build was unconditional.
+
+53. Flat CSR `ControlFlowGraph` (`src/flowgraph.rs`): the per-block
+    `bforest::Map`/`Set` edge storage is replaced by packed arrays
+    (`edges` + `succ_off`/`succs` + `pred_off`/`preds`) built by two
+    sort+dedupe passes. Iteration order is unchanged — successors in
+    block order, predecessors in branch-inst order. `compute`/`clear`
+    retain Vec capacity, so the tens of CFG rebuilds per function in
+    pliron's pipeline stop regrowing bforest node pools (the single
+    largest allocator leaf in the pipeline profile, ~3.5% of samples
+    via `visit_block_succs`/`add_edge`). `recompute_block` patches the
+    edge list and rebuilds (still O(E); nothing calls it hot).

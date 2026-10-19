@@ -562,6 +562,14 @@ pub struct Analysis {
     cfg: Option<ControlFlowGraph>,
     dt: Option<DominatorTree>,
     la: Option<LoopAnalysis>,
+    /// Recycled analysis shells. `clear` moves the live instances here
+    /// so the next rebuild's `compute` reuses their backing storage
+    /// (bforest node pools, postorder/worklist Vecs) instead of
+    /// regrowing from empty — ~60 CFG/DT rebuilds per corpus function
+    /// was a measurable allocator leaf.
+    spare_cfg: Option<ControlFlowGraph>,
+    spare_dt: Option<DominatorTree>,
+    spare_la: Option<LoopAnalysis>,
     /// Materialization counts, merged into `Stats` at pipeline end.
     pub(crate) cfg_builds: usize,
     pub(crate) dt_builds: usize,
@@ -629,9 +637,9 @@ pub struct CfgDtLa<'a> {
 impl Analysis {
     fn clear(&mut self) {
         self.cfg_fp = None;
-        self.cfg = None;
-        self.dt = None;
-        self.la = None;
+        self.spare_cfg = self.cfg.take().or_else(|| self.spare_cfg.take());
+        self.spare_dt = self.dt.take().or_else(|| self.spare_dt.take());
+        self.spare_la = self.la.take().or_else(|| self.spare_la.take());
         self.clear_values();
     }
 
@@ -686,7 +694,9 @@ impl Analysis {
         } else {
             self.cfg_fp = Some(edge_fp(func));
             let t = std::time::Instant::now();
-            self.cfg = Some(ControlFlowGraph::with_function(func));
+            let mut cfg = self.spare_cfg.take().unwrap_or_else(ControlFlowGraph::new);
+            cfg.compute(func);
+            self.cfg = Some(cfg);
             self.cfg_ns += t.elapsed().as_nanos() as u64;
             self.cfg_builds += 1;
         }
@@ -697,16 +707,15 @@ impl Analysis {
         self.materialize(func);
         if self.dt.is_none() {
             let t = std::time::Instant::now();
-            self.dt = Some(DominatorTree::with_function(
-                func,
-                self.cfg.as_ref().unwrap(),
-            ));
+            let mut dt = self.spare_dt.take().unwrap_or_else(DominatorTree::new);
+            dt.compute(func, self.cfg.as_ref().unwrap());
+            self.dt = Some(dt);
             self.dt_ns += t.elapsed().as_nanos() as u64;
             self.dt_builds += 1;
         }
         if self.la.is_none() {
             let t = std::time::Instant::now();
-            let mut la = LoopAnalysis::new();
+            let mut la = self.spare_la.take().unwrap_or_else(LoopAnalysis::new);
             la.compute(func, self.cfg.as_ref().unwrap(), self.dt.as_ref().unwrap());
             self.la = Some(la);
             self.la_ns += t.elapsed().as_nanos() as u64;
@@ -731,10 +740,9 @@ impl Analysis {
         self.materialize(func);
         if self.dt.is_none() {
             let t = std::time::Instant::now();
-            self.dt = Some(DominatorTree::with_function(
-                func,
-                self.cfg.as_ref().unwrap(),
-            ));
+            let mut dt = self.spare_dt.take().unwrap_or_else(DominatorTree::new);
+            dt.compute(func, self.cfg.as_ref().unwrap());
+            self.dt = Some(dt);
             self.dt_ns += t.elapsed().as_nanos() as u64;
             self.dt_builds += 1;
         }

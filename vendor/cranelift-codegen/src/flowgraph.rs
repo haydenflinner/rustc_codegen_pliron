@@ -20,15 +20,15 @@
 //! Here `Block1` and `Block2` would each have a single predecessor denoted as `(Block0, brif)`,
 //! while `Block3` would have a single predecessor denoted as `(Block1, jump block3)`.
 
-use crate::bforest;
-use crate::entity::SecondaryMap;
+use crate::entity::EntityRef;
 use crate::inst_predicates;
 use crate::ir::{Block, Function, Inst};
 use crate::timing;
-use core::mem;
+use alloc::vec::Vec;
 
 /// A basic block denoted by its enclosing Block and last instruction.
-#[derive(Debug, PartialEq, Eq)]
+/// PLIRON: `Copy`+`Clone` added — stored flat in the CSR arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockPredecessor {
     /// Enclosing Block key.
     pub block: Block,
@@ -43,35 +43,31 @@ impl BlockPredecessor {
     }
 }
 
-/// A container for the successors and predecessors of some Block.
-#[derive(Clone, Default)]
-struct CFGNode {
-    /// Instructions that can branch or jump to this block.
-    ///
-    /// This maps branch instruction -> predecessor block which is redundant since the block containing
-    /// the branch instruction is available from the `layout.inst_block()` method. We store the
-    /// redundant information because:
-    ///
-    /// 1. Many `pred_iter()` consumers want the block anyway, so it is handily available.
-    /// 2. The `invalidate_block_successors()` may be called *after* branches have been removed from
-    ///    their block, but we still need to remove them form the old block predecessor map.
-    ///
-    /// The redundant block stored here is always consistent with the CFG successor lists, even after
-    /// the IR has been edited.
-    pub predecessors: bforest::Map<Inst, Block>,
-
-    /// Set of blocks that are the targets of branches and jumps in this block.
-    /// The set is ordered by block number, indicated by the `()` comparator type.
-    pub successors: bforest::Set<Block>,
-}
-
 /// The Control Flow Graph maintains a mapping of blocks to their predecessors
 /// and successors where predecessors are basic blocks and successors are
 /// basic blocks.
+///
+/// PLIRON: edge storage is flat CSR (`*_off` + packed arrays) instead of
+/// the original per-block bforest maps/sets. Iteration order is preserved:
+/// successors come out sorted by block number, predecessors sorted by
+/// branch instruction — the same order the bforest comparators produced.
+/// Rebuilding reuses the Vec capacities across `compute` calls, which
+/// matters because pliron's optimizer rebuilds the CFG tens of times per
+/// function.
 pub struct ControlFlowGraph {
-    data: SecondaryMap<Block, CFGNode>,
-    pred_forest: bforest::MapForest<Inst, Block>,
-    succ_forest: bforest::SetForest<Block>,
+    /// Canonical edge list `(from, branch_inst, to)`. `build` leaves it
+    /// sorted by `(to, inst)`; `recompute_block` patches a block's
+    /// out-edges and rebuilds.
+    edges: Vec<(Block, Inst, Block)>,
+    /// CSR: `succs[succ_off[b]..succ_off[b+1]]` are `b`'s successors in
+    /// block order. Length `nblocks + 1`.
+    succ_off: Vec<u32>,
+    succs: Vec<Block>,
+    /// CSR: `preds[pred_off[b]..pred_off[b+1]]` are `b`'s predecessors in
+    /// branch-inst order. Length `nblocks + 1`.
+    pred_off: Vec<u32>,
+    preds: Vec<BlockPredecessor>,
+    nblocks: u32,
     valid: bool,
 }
 
@@ -79,18 +75,27 @@ impl ControlFlowGraph {
     /// Allocate a new blank control flow graph.
     pub fn new() -> Self {
         Self {
-            data: SecondaryMap::new(),
+            edges: Vec::new(),
+            succ_off: Vec::new(),
+            succs: Vec::new(),
+            pred_off: Vec::new(),
+            preds: Vec::new(),
+            nblocks: 0,
             valid: false,
-            pred_forest: bforest::MapForest::new(),
-            succ_forest: bforest::SetForest::new(),
         }
     }
 
     /// Clear all data structures in this control flow graph.
+    ///
+    /// PLIRON: keeps the backing Vec capacities so a following `compute`
+    /// reallocates nothing.
     pub fn clear(&mut self) {
-        self.data.clear();
-        self.pred_forest.clear();
-        self.succ_forest.clear();
+        self.edges.clear();
+        self.succ_off.clear();
+        self.succs.clear();
+        self.pred_off.clear();
+        self.preds.clear();
+        self.nblocks = 0;
         self.valid = false;
     }
 
@@ -106,33 +111,77 @@ impl ControlFlowGraph {
     /// This will clear and overwrite any information already stored in this data structure.
     pub fn compute(&mut self, func: &Function) {
         let _tt = timing::flowgraph();
-        self.clear();
-        self.data.resize(func.dfg.num_blocks());
-
+        self.edges.clear();
         for block in &func.layout {
-            self.compute_block(func, block);
+            inst_predicates::visit_block_succs(func, block, |inst, dest, _| {
+                self.edges.push((block, inst, dest));
+            });
         }
-
+        self.build(func.dfg.num_blocks() as u32);
         self.valid = true;
     }
 
-    fn compute_block(&mut self, func: &Function, block: Block) {
-        inst_predicates::visit_block_succs(func, block, |inst, dest, _| {
-            self.add_edge(block, inst, dest);
-        });
-    }
+    /// Rebuild the CSR tables from `edges`.
+    fn build(&mut self, nblocks: u32) {
+        self.nblocks = nblocks;
+        let nb = nblocks as usize;
 
-    fn invalidate_block_successors(&mut self, block: Block) {
-        // Temporarily take ownership because we need mutable access to self.data inside the loop.
-        // Unfortunately borrowck cannot see that our mut accesses to predecessors don't alias
-        // our iteration over successors.
-        let mut successors = mem::replace(&mut self.data[block].successors, Default::default());
-        for succ in successors.iter(&self.succ_forest) {
-            self.data[succ]
-                .predecessors
-                .retain(&mut self.pred_forest, |_, &mut e| e != block);
+        // Successors: sort by (from, to, inst) and drop duplicate edges —
+        // a block may name the same destination more than once (brif with
+        // identical arms, br_table repeats), matching the old Set's
+        // deduplication and block ordering.
+        self.edges.sort_unstable();
+        self.edges.dedup();
+        self.succs.clear();
+        self.succ_off.clear();
+        self.succ_off.resize(nb + 1, 0);
+        let mut prev_from = 0u32;
+        let mut seen = false;
+        for &(from, _, to) in &self.edges {
+            let fi = from.index() as u32;
+            if seen && fi != prev_from {
+                self.succ_off[prev_from as usize + 1] = self.succs.len() as u32;
+            }
+            prev_from = fi;
+            seen = true;
+            self.succs.push(to);
         }
-        successors.clear(&mut self.succ_forest);
+        if seen {
+            self.succ_off[prev_from as usize + 1] = self.succs.len() as u32;
+        }
+        // Blocks with no recorded edges keep offset 0; a forward max-fill
+        // turns those into empty ranges at the right position.
+        for i in 1..self.succ_off.len() {
+            self.succ_off[i] = self.succ_off[i].max(self.succ_off[i - 1]);
+        }
+
+        // Predecessors: sort by (to, branch_inst) and dedupe — a branch
+        // table can name a destination repeatedly through one
+        // instruction, which the old `Map<Inst, Block>` stored once.
+        // Iteration stays in branch-inst order.
+        self.edges
+            .sort_unstable_by_key(|&(_, inst, to)| (to, inst));
+        self.edges.dedup_by_key(|&mut (_, inst, to)| (to, inst));
+        self.preds.clear();
+        self.pred_off.clear();
+        self.pred_off.resize(nb + 1, 0);
+        let mut prev_to = 0u32;
+        seen = false;
+        for &(from, inst, to) in &self.edges {
+            let ti = to.index() as u32;
+            if seen && ti != prev_to {
+                self.pred_off[prev_to as usize + 1] = self.preds.len() as u32;
+            }
+            prev_to = ti;
+            seen = true;
+            self.preds.push(BlockPredecessor::new(from, inst));
+        }
+        if seen {
+            self.pred_off[prev_to as usize + 1] = self.preds.len() as u32;
+        }
+        for i in 1..self.pred_off.len() {
+            self.pred_off[i] = self.pred_off[i].max(self.pred_off[i - 1]);
+        }
     }
 
     /// Recompute the control flow graph of `block`.
@@ -141,30 +190,40 @@ impl ControlFlowGraph {
     /// from `block` while leaving edges to `block` intact. Its functionality a subset of that of the
     /// more expensive `compute`, and should be used when we know we don't need to recompute the CFG
     /// from scratch, but rather that our changes have been restricted to specific blocks.
+    ///
+    /// PLIRON: the CSR tables make single-block range patching awkward,
+    /// so this refreshes the block's out-edges in `edges` and rebuilds
+    /// the arrays — still just O(E), and nothing calls it hot.
     pub fn recompute_block(&mut self, func: &Function, block: Block) {
         debug_assert!(self.is_valid());
-        self.invalidate_block_successors(block);
-        self.compute_block(func, block);
-    }
-
-    fn add_edge(&mut self, from: Block, from_inst: Inst, to: Block) {
-        self.data[from]
-            .successors
-            .insert(to, &mut self.succ_forest, &());
-        self.data[to]
-            .predecessors
-            .insert(from_inst, from, &mut self.pred_forest, &());
+        self.edges.retain(|&(from, _, _)| from != block);
+        inst_predicates::visit_block_succs(func, block, |inst, dest, _| {
+            self.edges.push((block, inst, dest));
+        });
+        self.build(self.nblocks);
     }
 
     /// Get an iterator over the CFG predecessors to `block`.
     pub fn pred_iter(&self, block: Block) -> PredIter<'_> {
-        PredIter(self.data[block].predecessors.iter(&self.pred_forest))
+        let b = block.index();
+        if b + 1 >= self.pred_off.len() {
+            return [].iter().copied();
+        }
+        self.preds[self.pred_off[b] as usize..self.pred_off[b + 1] as usize]
+            .iter()
+            .copied()
     }
 
     /// Get an iterator over the CFG successors to `block`.
     pub fn succ_iter(&self, block: Block) -> SuccIter<'_> {
         debug_assert!(self.is_valid());
-        self.data[block].successors.iter(&self.succ_forest)
+        let b = block.index();
+        if b + 1 >= self.succ_off.len() {
+            return [].iter().copied();
+        }
+        self.succs[self.succ_off[b] as usize..self.succ_off[b + 1] as usize]
+            .iter()
+            .copied()
     }
 
     /// Get an iterator over all blocks this control-flow graph has storage for,
@@ -174,7 +233,7 @@ impl ControlFlowGraph {
     /// block that was created but never inserted, or has since been removed);
     /// such blocks have no predecessors or successors in the graph.
     pub fn blocks(&self) -> impl ExactSizeIterator<Item = Block> + '_ {
-        self.data.keys()
+        (0..self.nblocks).map(|i| Block::new(i as usize))
     }
 
     /// Get the number of blocks this control-flow graph has storage for.
@@ -183,7 +242,7 @@ impl ControlFlowGraph {
     /// computed from, and is an upper bound on the block indices appearing in
     /// the graph.
     pub fn num_blocks(&self) -> usize {
-        self.blocks().len()
+        self.nblocks as usize
     }
 
     /// Check if the CFG is in a valid state.
@@ -199,18 +258,10 @@ impl ControlFlowGraph {
 /// An iterator over block predecessors. The iterator type is `BlockPredecessor`.
 ///
 /// Each predecessor is an instruction that branches to the block.
-pub struct PredIter<'a>(bforest::MapIter<'a, Inst, Block>);
-
-impl<'a> Iterator for PredIter<'a> {
-    type Item = BlockPredecessor;
-
-    fn next(&mut self) -> Option<BlockPredecessor> {
-        self.0.next().map(|(i, e)| BlockPredecessor::new(e, i))
-    }
-}
+pub type PredIter<'a> = core::iter::Copied<core::slice::Iter<'a, BlockPredecessor>>;
 
 /// An iterator over block successors. The iterator type is `Block`.
-pub type SuccIter<'a> = bforest::SetIter<'a, Block>;
+pub type SuccIter<'a> = core::iter::Copied<core::slice::Iter<'a, Block>>;
 
 #[cfg(test)]
 mod tests {
