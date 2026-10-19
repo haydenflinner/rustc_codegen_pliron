@@ -3655,10 +3655,14 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // +2% size on wbig â€” wasm calls really are cheap and the splice's
     // optimizer doesn't recover the rest. Not a rule.
     // Loop-body callsites execute the call every iteration, so a
-    // moderately-sized callee is worth duplicating there.
+    // moderately-sized callee is worth duplicating there — a
+    // frame-spilled callee (5-field searcher/RandomState round-tripped
+    // through linear memory per call) costs ~10 memory ops/iter.
+    // 400 covers the observed `next_match` (~345) and `hash_one` (~246)
+    // loop callees; `caller_cap` bounds the per-caller growth.
     let hot_cap = crate::env_get("PLIRON_WASM_HOT")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(36);
+        .unwrap_or(400);
     // `#[inline]` (LLVM `inlinehint`) callees: LLVM's inliner gives the
     // attribute a large budget bonus â€” mirror that with a raised cap.
     // Off by default: on a real std workload (regex wbig) it added
