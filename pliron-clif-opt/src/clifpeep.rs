@@ -6963,7 +6963,15 @@ fn val_bnd(m: &BoundsMap, func: &Function, x: Value, depth: usize) -> u64 {
                     a.checked_mul(b).map_or(um, |s| s.min(um))
                 }
                 Opcode::Band => a.min(b),
-                Opcode::Isub => a,
+                // `a - b` wraps to ~um when `b > a` — `a`'s bound only
+                // carries through when `b` is provably 0.
+                Opcode::Isub => {
+                    if b == 0 {
+                        a
+                    } else {
+                        um
+                    }
+                }
                 Opcode::Ushr => {
                     if let Some(s) = iconst(func, args[1]) {
                         um >> ((s as u64) % u64::from(ty.bits()))

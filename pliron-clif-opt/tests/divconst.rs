@@ -306,6 +306,47 @@ block0(v0: i64):
     }
 }
 
+/// Regression: `isub a, b` in the dividend chain wraps to ~2^64 when
+/// `b > a`, so `a`'s edge-fact bound does not carry to the difference.
+/// `bound_at` used to return `bound(a)` and divnarrow truncated the
+/// wrapped dividend at i32 (corpus `core::ptr::align_offset`).
+#[test]
+fn narrow_rejects_isub_wrap_dividend() {
+    let src = "function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 10
+    v3 = icmp.i64 ult v0, v2
+    brif v3, block2, block3
+block2:
+    v4 = isub.i64 v0, v1
+    v5 = iconst.i64 5
+    v6 = urem.i64 v4, v5
+    return v6
+block3:
+    v7 = iconst.i64 0
+    return v7
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let k = pliron_clif_opt::divconst::run(&mut f);
+    assert_eq!(k, 1, "no expansion:\n{}", f.display());
+    assert!(no_divs(&f));
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            if let InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                ..
+            } = f.dfg.insts[i]
+            {
+                panic!("narrowed a wrapping dividend: {}", f.display());
+            }
+        }
+    }
+    if let Err(m) = check(&before, &f, &Facts::default(), &Config::default()) {
+        panic!("{m}\n{}", f.display());
+    }
+}
+
 #[test]
 fn vector_mulhi() {
     check_vec_mulhi("smulhi", "i32x4", true, 128);
