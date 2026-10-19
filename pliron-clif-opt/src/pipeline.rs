@@ -332,7 +332,9 @@ pub mod shape {
     /// More than one block — tail merge/dup, unreachable-block sweeps,
     /// and cross-block def-use passes need a second block to act on.
     pub const BLOCKS2: u32 = 1 << 13;
-    /// An `iconst` exists — `const_sweep`'s `eval`/`known` seeds.
+    /// A materialized constant exists (`iconst`/`f32const`/`f64const`/
+    /// `f128const`/`vconst`) — `const_sweep`'s `eval`/`known` seeds and
+    /// `constdedup`'s merge keys.
     pub const ICONST: u32 = 1 << 14;
     /// A stack slot is declared — `slotmerge` can merge slots no
     /// instruction references (dead decls carry no `MEM` inst).
@@ -433,7 +435,13 @@ pub(crate) fn shape_of(func: &Function) -> u32 {
                 Op::BrTable => bits |= shape::CONDBR | shape::SWITCH,
                 Op::Jump => bits |= shape::JUMP,
                 Op::Sdiv | Op::Udiv | Op::Srem | Op::Urem => bits |= shape::DIVREM,
-                Op::Iconst => bits |= shape::ICONST,
+                // Any materialized constant — `constdedup` keys on the
+                // float forms too, so the bit covers all of them (a
+                // wider bit only ever makes a `needs` gate more
+                // conservative, never unsound).
+                Op::Iconst | Op::F32const | Op::F64const | Op::F128const | Op::Vconst => {
+                    bits |= shape::ICONST
+                }
                 // `fold_null_tests` fires only on `icmp` tests where
                 // `known()` resolves an operand to an `iconst` — any
                 // `icmp` over-reports (no per-arg walk in `shape_of`)
@@ -2311,8 +2319,10 @@ fn s_frozen_loads(p: &mut Pipe, _an: &mut Analysis) -> usize {
 
 // `isub x, k` → `iadd x, -k` so x64's `lea` lowering can write a
 // call-arg/phi result non-destructively instead of `mov` + `sub`.
-fn s_sublea(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    clifpeep::sublea(&mut p.clctx.func)
+fn s_sublea(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // `ovkill` is the only `cfg` consumer; don't materialize it when off.
+    let cfg = crate::pass_enabled("PLIRON_OVKILL").then(|| an.cfg(&p.clctx.func));
+    clifpeep::sublea(&mut p.clctx.func, cfg)
 }
 
 // Constant folding for insts the loop passes emit after `clifpeep`'s
@@ -2488,8 +2498,9 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // inverse of arghoist): `count + flag` where flag merges as 1/0/ret
 // becomes per-edge `count+1` / `count+ret0` — the flag's merge slot
 // (a spill in regalloc) disappears.
-fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let (k, moved) = paramsink::run(&mut p.clctx.func);
+fn s_paramsink(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (_, dom) = an.cfg_dt(&p.clctx.func);
+    let (k, moved) = paramsink::run(&mut p.clctx.func, dom);
     if !moved.is_empty() {
         let pmap: FxHashMap<Value, Value> = moved.into_iter().collect();
         carry_pmap(p, &pmap);
@@ -2504,14 +2515,20 @@ fn s_paramsink(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Option-niche test behind `Chars::next`'s bounds check; kills the
 // `mov 0; cmp; csel; cmp` tail sequence.
 fn s_niche(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let nn = jumpthread::NonNull::new(
-        &p.clctx.func,
-        an.cfg_dt(&p.clctx.func).0,
-        p.nonnull,
-        p.derived,
-    );
-    let k =
-        niche::run(&mut p.clctx.func, &nn) + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+    // Every `fold_of` candidate is an `icmp` — without one the
+    // `NonNull` build and the pass itself can't produce a rewrite. The
+    // trailing dead-inst sweep stays unguarded.
+    let k = if an.shape_bits(&p.clctx.func) & shape::TESTC != 0 {
+        let nn = jumpthread::NonNull::new(
+            &p.clctx.func,
+            an.cfg_dt(&p.clctx.func).0,
+            p.nonnull,
+            p.derived,
+        );
+        niche::run(&mut p.clctx.func, &nn)
+    } else {
+        0
+    } + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
     if k > 0 {
         p.dump("niche");
     }
@@ -2521,9 +2538,14 @@ fn s_niche(p: &mut Pipe, an: &mut Analysis) -> usize {
 // `brif c` edge args `select(c,a,b)` collapse to an arm — the loop-tail
 // `csel` materializing `select(end?, 0, cursor)` on the edge where
 // `end?` is already known-false.
-fn s_selargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::selargs(&mut p.clctx.func)
-        + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+fn s_selargs(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // `selargs` only rewrites `brif` edge args — keep the dead-inst
+    // sweep unguarded.
+    let k = if an.shape_bits(&p.clctx.func) & shape::CONDBR != 0 {
+        clifpeep::selargs(&mut p.clctx.func)
+    } else {
+        0
+    } + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
     if k > 0 {
         p.dump("selargs");
     }
@@ -2544,8 +2566,9 @@ fn s_lcse(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // never unify. dgvn aliases the dominated copies to the
 // dominating def; sameargs then drops the now-uniform params and
 // the increment materializes once above the branch.
-fn s_dgvn(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::dgvn(&mut p.clctx.func);
+fn s_dgvn(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (_, dt) = an.cfg_dt(&p.clctx.func);
+    let k = clifpeep::dgvn(&mut p.clctx.func, dt);
     if k > 0 && p.dump {
         p.dump("dgvn");
     }
@@ -3160,8 +3183,9 @@ fn s_memcall(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // colder than the loop: mark them cold so the emitted RPO order puts
 // them last and the loop arm falls through. Runs last — it's pure
 // layout metadata, so nothing downstream needs to see it.
-fn s_coldret(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::coldrets(&mut p.clctx.func);
+fn s_coldret(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (cfg, domtree) = an.cfg_dt(&p.clctx.func);
+    let k = clifpeep::coldrets(&mut p.clctx.func, cfg, domtree);
     if k > 0 && p.dump {
         p.dump("coldrets");
     }
@@ -3244,7 +3268,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_unroll,
             site: std::sync::OnceLock::new(),
         },
-        step("unreach", "", Gate::Flag(FlagId::Unreach), s_unreach),
+        step("unreach", "", Gate::Flag(FlagId::Unreach), s_unreach).needs(shape::BLOCKS2),
         Step {
             name: "clifpeep",
             bisect: Some("clifpeep"),
@@ -3426,7 +3450,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             "constdedup",
             Gate::Env("PLIRON_CSTDEDUP"),
             s_constdedup,
-        ),
+        )
+        .needs(shape::ICONST),
         Step {
             name: "frozen_loads",
             bisect: None,
@@ -3600,7 +3625,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
         // `ishl` chains the early clifpeep round never saw (matmul's
         // `((-(-216))>>3)<<6` vector-trip bound recomputed per iteration).
-        step("csweep2", "", Gate::Env("PLIRON_CSWEEP2"), s_csweep2),
+        step("csweep2", "", Gate::Env("PLIRON_CSWEEP2"), s_csweep2).needs(shape::ICONST),
         // `jtround`/`mergechain` threading leaves `isub(isub e,a),(isub e,b)`
         // telescopes on the new edges (`end-front` vs `end-ptr'` lengths —
         // the token-len recomputes in tokenize's block303). lcse2 already
@@ -3635,12 +3660,15 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // (The old `arghoist` position was a second webmerge call right
         // after sameargs2's fixpoint — webmerge now hoists same-shape edge
         // args via phase-B `P`-keys, so nothing was left for it.)
+        // Every candidate is a use-chain rooted at an existing block
+        // param — `run` skips param-less blocks outright.
         step(
             "paramsink",
             "paramsink",
             Gate::Env("PLIRON_PARAMSINK"),
             s_paramsink,
-        ),
+        )
+        .needs(shape::BPARAM),
         // paramsink re-bases count latches to `icmp p, K` — re-point the
         // test at the `p + s` edge arg so the latch lowers to `add;cmp;jcc`
         // on one register.
@@ -3812,7 +3840,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             "constdedup",
             Gate::Env("PLIRON_CSTDEDUP"),
             s_constdedup,
-        ),
+        )
+        .needs(shape::ICONST),
         // Error/merge payloads computed in `b` but used only by one
         // `brif` edge's args (parse_only's `ParseIntError` pack on every
         // digit-validity branch) run unconditionally there — sink them
@@ -3841,7 +3870,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             verify: false,
             mutates: true,
             cached: false,
-            shape: 0,
+            // Every candidate is a `brif` arm whose target is a leaf
+            // `return` block.
+            shape: shape::CONDBR,
             any: 0,
             creates: shape::CREATED,
             gate: Gate::Env("PLIRON_COLDRET"),

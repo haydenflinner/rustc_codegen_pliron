@@ -20,7 +20,6 @@
 //! `PLIRON_PARAMSINK=0` disables it.
 
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, Type, Value, ValueDef,
 };
@@ -125,9 +124,7 @@ fn put(
 /// dropped param → its replacement param). The new param carries the
 /// sunk value, so it equals the dropped param — the pipeline carries
 /// the old param's facts across.
-pub fn run(func: &mut Function) -> (usize, Vec<(Value, Value)>) {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dom = DominatorTree::with_function(func, &cfg);
+pub fn run(func: &mut Function, dom: &DominatorTree) -> (usize, Vec<(Value, Value)>) {
     let uses = use_blocks(func);
     let mut edges: FxHashMap<Block, Vec<(Block, Inst, usize)>> = FxHashMap::default();
     for b in func.layout.blocks() {

@@ -35,7 +35,9 @@ fn swap(func: &mut Function, inst: Inst) {
 pub fn run(func: &mut Function) -> usize {
     // Count each (alias-resolved) value's argument occurrences across all
     // instructions — `inst_args` covers the whole value list, including
-    // branch destination args, so block-param (phi) uses count too.
+    // branch destination args, so block-param (phi) uses count too. A
+    // local histogram beat sharing `Uses` (measured: its CSR build is
+    // heavier and nothing else consumes it at this position).
     let mut uses = SecondaryMap::<Value, u32>::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {

@@ -11,6 +11,8 @@
 //! functions — opt in only for tests whose inputs avoid UB (loads from
 //! pointers, division, etc. can make the checker flag valid rewrites).
 
+use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::settings::{self, Flags};
 use pliron_clif_opt::clifpeep;
@@ -32,11 +34,19 @@ fn pass(name: &str) -> Pass {
         "celim" => celim::run,
         "coldargs" => clifpeep::coldargs,
         "coldedges" => clifpeep::coldedges,
-        "coldrets" => clifpeep::coldrets,
+        "coldrets" => |f| {
+            let cfg = ControlFlowGraph::with_function(f);
+            let dt = DominatorTree::with_function(f, &cfg);
+            clifpeep::coldrets(f, &cfg, &dt)
+        },
         "commute" => commute::run,
         "const_sweep" => clifpeep::const_sweep,
         "cparm" => |f| clifpeep::cparm(f).0,
-        "dgvn" => clifpeep::dgvn,
+        "dgvn" => |f| {
+            let cfg = ControlFlowGraph::with_function(f);
+            let dt = DominatorTree::with_function(f, &cfg);
+            clifpeep::dgvn(f, &dt)
+        },
         "edgefwd" => edgefwd::run,
         "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
@@ -57,8 +67,15 @@ fn pass(name: &str) -> Pass {
         "loadsel" => clifpeep::loadsel,
         "mask01" => clifpeep::mask01,
         "memcall" => clifpeep::memcall,
-        "ovkill" => clifpeep::ovkill,
-        "paramsink" => |f| paramsink::run(f).0,
+        "ovkill" => |f| {
+            let cfg = ControlFlowGraph::with_function(f);
+            clifpeep::ovkill(f, &cfg)
+        },
+        "paramsink" => |f| {
+            let cfg = ControlFlowGraph::with_function(f);
+            let dt = DominatorTree::with_function(f, &cfg);
+            paramsink::run(f, &dt).0
+        },
         "punroll" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             let prof = std::collections::HashMap::default();
@@ -74,7 +91,10 @@ fn pass(name: &str) -> Pass {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::slp::run(f, &mut an, &rustc_hash::FxHashSet::default(), true, false)
         },
-        "sublea" => clifpeep::sublea,
+        "sublea" => |f| {
+            let cfg = ControlFlowGraph::with_function(f);
+            clifpeep::sublea(f, Some(&cfg))
+        },
         "uloads32" => clifpeep::uloads32,
         "unswitch" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();

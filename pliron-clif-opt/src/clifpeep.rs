@@ -3067,7 +3067,7 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
 /// Without the copy the exit shares a return block that RPO can't always
 /// place adjacent, and every iteration pays `jcc` + `jmp`. The shared
 /// return itself is marked cold for its other preds.
-pub fn coldrets(func: &mut Function) -> usize {
+pub fn coldrets(func: &mut Function, cfg: &ControlFlowGraph, domtree: &DominatorTree) -> usize {
     fn leaf_ret(func: &Function, b: Block) -> bool {
         let mut k = 0;
         for i in func.layout.block_insts(b) {
@@ -3078,8 +3078,6 @@ pub fn coldrets(func: &mut Function) -> usize {
         }
         false
     }
-    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
-    let domtree = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
     let mut mark = Vec::new();
     for b in func.layout.blocks() {
         let Some(t) = func.layout.last_inst(b) else {
@@ -7180,9 +7178,7 @@ fn val_bnd(m: &BoundsMap, func: &Function, x: Value, depth: usize) -> u64 {
 /// `umul_overflow`/`uadd_overflow` flags, `ult (iadd a,b), a` carries, and
 /// compares vs constant the bounds decide. The peeled `acc*10+d` parse
 /// chains (`d <= 9`, <= 8 digits) can't overflow their type.
-pub fn ovkill(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-
+pub fn ovkill(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
     let mut ememo = BMap::default();
     let mut memo = BMap::default();
     let mut visiting = BSet::default();
@@ -7949,7 +7945,7 @@ fn icmp_eqfold(
 /// call arg next to loop-carried `n-2`). Runs late so the earlier loop
 /// passes keep seeing canonical `isub` IV updates — which also makes it
 /// the first icmp fold after punroll's peeled countdowns.
-pub fn sublea(func: &mut Function) -> usize {
+pub fn sublea(func: &mut Function, cfg: Option<&ControlFlowGraph>) -> usize {
     let mut n = 0;
     let mut uses = None;
     // Once per pass — `pass_enabled` is two string-keyed lookups.
@@ -7996,7 +7992,7 @@ pub fn sublea(func: &mut Function) -> usize {
     // Bound-propagated dead-check elimination — sees punroll's peeled
     // `acc*10+d` chains, which is where it pays.
     if crate::pass_enabled("PLIRON_OVKILL") {
-        let k = ovkill(func);
+        let k = ovkill(func, cfg.expect("PLIRON_OVKILL callers pass cfg"));
         if k > 0
             && pliron_cfg::tracing_on()
             && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
@@ -9465,17 +9461,12 @@ pub fn lcse(func: &mut Function) -> usize {
             ValueDef::Union(_, _) => None,
         }
     };
-    // Loop structure for the ident-alias guard at the fold site below.
-    let la = {
-        use cranelift_codegen::dominator_tree::DominatorTree;
-        use cranelift_codegen::flowgraph::ControlFlowGraph;
-        use cranelift_codegen::loop_analysis::LoopAnalysis;
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
-        la
-    };
+    // Loop structure for the ident-alias guard at the fold site below —
+    // built on first use: most calls find no `ident` candidate at all,
+    // and CFG/DT/LA construction dominates this pass's fixed cost.
+    // `lcse` only removes insts, never edges, so a lazily-built `la`
+    // sees the same CFG an eager one would.
+    let mut la: Option<cranelift_codegen::loop_analysis::LoopAnalysis> = None;
     // `x*1` / `x+0` / `x|0` / `x^0` / `x&-1` / `x<<0` / `x>>0` -> `x`: these
     // survive GVN when rustc's `index*elemsize` idiom degenerates to *1.
     let ident = |func: &Function, data: InstructionData, res_ty: Type| -> Option<Value> {
@@ -9897,7 +9888,7 @@ pub fn lcse(func: &mut Function) -> usize {
                 // forcing `x` live-through where an in-loop recompute
                 // would do (`tokenize`'s scan loop). Same-block copies
                 // still fold; `Union` defs (no single block) fold too.
-                && (la.loop_level(b).level() == 0
+                && (lcse_la(func, &mut la).loop_level(b).level() == 0
                     || matches!(def_block(func, x), Some(xb) if xb == b)
                     || def_block(func, x).is_none())
             {
@@ -9951,6 +9942,25 @@ pub fn lcse(func: &mut Function) -> usize {
     n
 }
 
+/// Lazy `LoopAnalysis` for `lcse`'s ident-alias guard — built on first
+/// use: most calls find no `ident` candidate at all, and CFG/DT/LA
+/// construction dominates the pass's fixed cost. `lcse` only removes
+/// insts, never edges, so a lazily-built `la` sees the same CFG an eager
+/// one would.
+fn lcse_la<'a>(
+    func: &Function,
+    la: &'a mut Option<cranelift_codegen::loop_analysis::LoopAnalysis>,
+) -> &'a mut cranelift_codegen::loop_analysis::LoopAnalysis {
+    la.get_or_insert_with(|| {
+        use cranelift_codegen::loop_analysis::LoopAnalysis;
+        let cfg = ControlFlowGraph::with_function(func);
+        let dt = DominatorTree::with_function(func, &cfg);
+        let mut la = LoopAnalysis::new();
+        la.compute(func, &cfg, &dt);
+        la
+    })
+}
+
 /// Dominator-scoped value numbering. `lcse` clears its table per block,
 /// so an identical pure inst in a *dominated* block never merges — a
 /// diamond that recomputes `i+1`/`p+4` on each edge keeps every copy and
@@ -9959,11 +9969,7 @@ pub fn lcse(func: &mut Function) -> usize {
 /// repeat can alias the in-scope def directly. `sameargs` then sees
 /// uniform edge args, drops the param, and the shared computation lives
 /// once above the branch instead of once per arm.
-pub fn dgvn(func: &mut Function) -> usize {
-    use cranelift_codegen::dominator_tree::DominatorTree;
-    use cranelift_codegen::flowgraph::ControlFlowGraph;
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
+pub fn dgvn(func: &mut Function, dt: &DominatorTree) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -11074,7 +11080,9 @@ mod tests {
             .return_(&[acc]);
 
         // Both the `iconst 1` copy and the `iadd` copy alias away.
-        assert_eq!(dgvn(&mut func), 2);
+        let cfg = ControlFlowGraph::with_function(&func);
+        let dt = DominatorTree::with_function(&func, &cfg);
+        assert_eq!(dgvn(&mut func, &dt), 2);
         // The dominated copy's result now resolves to `i1`.
         let arg = func.dfg.insts[func.layout.last_inst(taken).unwrap()]
             .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[0]
