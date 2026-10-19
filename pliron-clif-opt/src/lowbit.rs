@@ -1,4 +1,4 @@
-//! Hacker's Delight `lowbit` idiom (`PLIRON_LOWBIT`, opt-in).
+//! Hacker's Delight `lowbit` idiom (`PLIRON_LOWBIT=0` disables).
 //!
 //! ```text
 //! lb = 1
@@ -20,9 +20,11 @@
 //! before the divisor wraps, and `band` returns the same value.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, InstBuilder, InstructionData, Opcode, Type, Value,
+    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value,
     ValueDef,
 };
 use rustc_hash::FxHashSet;
@@ -39,16 +41,56 @@ struct Plan {
     /// them verbatim.
     entry_args: Vec<Value>,
     h: Block,
+    /// The exiting edge — needed at emit to append `p` when `exit_dest`
+    /// gets a new param.
+    exit: Edge,
     /// The exit edge's destination.
     exit_dest: Block,
     /// Args to pass on the fast path — positions reading `p` are
     /// swapped for the computed `band` at emit.
     exit_args: Vec<Value>,
+    /// Out-of-loop insts whose args read `p` (or an alias of it), all
+    /// dominated by `exit_dest`. When non-empty `exit_dest` is
+    /// single-pred and gets a new param `r`; both incoming edges pass
+    /// the lb value and these args rewrite to `r`. rustc's `while`
+    /// lowering ends the loop in `return <alias of lb>` — a direct SSA
+    /// use rather than an edge arg — so without this the idiom never
+    /// matches real code.
+    patch: Vec<(Inst, Vec<Value>)>,
     /// The `lb` header param, the invariant dividend `n` as a value
     /// available on the entry edge, and the int type.
     p: Value,
     n: Value,
     ty: Type,
+}
+
+/// Small constant evaluator for loop-entry seeds: `iconst`, or one
+/// `imul`/`ishl`/`iadd` of constants — LICM's param-splitting leaves
+/// the seeds as unfolded `imul 1, 2` / `imul m0, 2` trees.
+fn const_val(func: &Function, v: Value, depth: u8) -> Option<i64> {
+    if depth == 0 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(k) = iconst(func, v) {
+        return Some(k);
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return None;
+    };
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+        return None;
+    };
+    let a = const_val(func, args[0], depth - 1)?;
+    let b = const_val(func, args[1], depth - 1)?;
+    match opcode {
+        Opcode::Imul => Some(a.wrapping_mul(b)),
+        Opcode::Ishl => (0..64)
+            .contains(&b)
+            .then(|| a.wrapping_shl(b as u32)),
+        Opcode::Iadd => Some(a.wrapping_add(b)),
+        _ => None,
+    }
 }
 
 /// `m` as the double of `p`: `imul p, 2`, `ishl p, 1`, or `iadd p, p`.
@@ -64,8 +106,11 @@ fn is_double(func: &Function, p: Value, m: Value) -> bool {
         func.dfg.resolve_aliases(args[1]),
     );
     match opcode {
-        Opcode::Imul => (a == p && iconst(func, b) == Some(2)) || (b == p && iconst(func, a) == Some(2)),
-        Opcode::Ishl => a == p && iconst(func, b) == Some(1),
+        Opcode::Imul => {
+            (a == p && const_val(func, b, 2) == Some(2))
+                || (b == p && const_val(func, a, 2) == Some(2))
+        }
+        Opcode::Ishl => a == p && const_val(func, b, 2) == Some(1),
         Opcode::Iadd => a == p && b == p,
         _ => false,
     }
@@ -88,6 +133,34 @@ fn invariant(func: &Function, info: &Info, v: Value) -> bool {
             .is_some_and(|b| !info.body.contains(&b)),
         _ => false,
     }
+}
+
+/// `x` is a header param seeded `seed` that doubles every iteration.
+/// The latch hands back `x*2` directly, or another param carrying it —
+/// LICM splits the carry across params (`p' = m`, `m' = m2`,
+/// `m2' = m2*2`), so the chain recurses with a doubled expected seed.
+fn doubling_param(
+    func: &Function,
+    info: &Info,
+    latch_args: &[Value],
+    x: Value,
+    seed: i64,
+    seen: &mut FxHashSet<Value>,
+) -> bool {
+    let ValueDef::Param(b, idx) = func.dfg.value_def(x) else {
+        return false;
+    };
+    if b != info.h || !seen.insert(x) {
+        return false;
+    }
+    if const_val(func, info.entry_args.get(idx).copied().unwrap_or(x), 4) != Some(seed) {
+        return false;
+    }
+    let Some(&la) = latch_args.get(idx) else {
+        return false;
+    };
+    let la = func.dfg.resolve_aliases(la);
+    is_double(func, x, la) || doubling_param(func, info, latch_args, la, seed * 2, seen)
 }
 
 /// The value `v` (an exit-edge arg) reads as on the entry edge — `None`
@@ -119,7 +192,7 @@ fn out_val(func: &Function, info: &Info, v: Value) -> Option<Value> {
     }
 }
 
-fn plan(func: &Function, info: &Info) -> Option<Plan> {
+fn plan(func: &Function, info: &Info, cfg: &ControlFlowGraph, dt: &DominatorTree) -> Option<Plan> {
     if info.latches.len() != 1 {
         return None;
     }
@@ -178,16 +251,28 @@ fn plan(func: &Function, info: &Info) -> Option<Plan> {
         };
         let n = func.dfg.resolve_aliases(n0);
         let m = func.dfg.resolve_aliases(m0);
-        // The lb param: latch feeds `m` back to it and entry passes 1.
+        // The lb param `p`: entry passes 1 and the latch hands back the
+        // next double — either the divisor `m` itself or a recomputed
+        // `p*2`. The divisor in turn is `p*2` either as an inst
+        // (`imul p, 2`) or — after LICM carries it — as a doubling
+        // header param seeded 2 (then `p' = m` gives `p = 2^k`).
+        let m_is_double_of = |p: Value| -> bool {
+            is_double(func, p, m)
+                || doubling_param(func, info, &latch_args, m, 2, &mut FxHashSet::default())
+        };
         let mut found = None;
         for (idx, &p) in func.dfg.block_params(info.h).iter().enumerate() {
-            if latch_args.get(idx).copied().map(|v| func.dfg.resolve_aliases(v)) != Some(m) {
+            let Some(la) = latch_args.get(idx).copied() else {
+                continue;
+            };
+            let la = func.dfg.resolve_aliases(la);
+            if la != m && !is_double(func, p, la) {
                 continue;
             }
-            if iconst(func, info.entry_args.get(idx).copied().unwrap_or(p)) != Some(1) {
+            if const_val(func, info.entry_args.get(idx).copied().unwrap_or(p), 4) != Some(1) {
                 continue;
             }
-            if !is_double(func, p, m) {
+            if !m_is_double_of(p) {
                 continue;
             }
             found = Some((idx, p));
@@ -221,26 +306,50 @@ fn plan(func: &Function, info: &Info) -> Option<Plan> {
                 exit_args.push(out_val(func, info, a)?);
             }
         }
-        // `p` may not be used outside the loop other than on this exit
-        // edge — its def dominates only the body plus what the exit
-        // dominates; outside uses we can't rewrite would dangle.
+        let exit_dest = edge_dest(func, exit);
+        // After the rewrite the header no longer dominates `exit_dest`,
+        // so any value defined in the loop — a header param or a body
+        // inst result — read outside the body would dangle. `p` reads
+        // in blocks `exit_dest` dominates get a new `exit_dest` param
+        // (single-pred required — see `apply`); every other loop-def
+        // escape, or a `p` read we can't reach, rejects.
         let mut bad = false;
-        for b in func.layout.blocks() {
+        let mut patch: Vec<(Inst, Vec<Value>)> = Vec::new();
+        let single_pred = cfg.pred_iter(exit_dest).count() == 1;
+        'scan: for b in func.layout.blocks() {
             if info.body.contains(&b) {
                 continue;
             }
             for i in func.layout.block_insts(b) {
-                if func
-                    .dfg
-                    .inst_values(i)
-                    .any(|w| func.dfg.resolve_aliases(w) == p)
-                {
-                    bad = true;
-                    break;
+                let mut ws: Vec<Value> = Vec::new();
+                for w in func.dfg.inst_values(i) {
+                    let wr = func.dfg.resolve_aliases(w);
+                    if wr == p {
+                        ws.push(w);
+                        continue;
+                    }
+                    let loop_def = match func.dfg.value_def(wr) {
+                        ValueDef::Param(pb, _) => pb == info.h,
+                        ValueDef::Result(di, _) => func
+                            .layout
+                            .inst_block(di)
+                            .is_some_and(|db| info.body.contains(&db)),
+                        ValueDef::Union(_, _) => true,
+                    };
+                    if loop_def {
+                        bad = true;
+                        break 'scan;
+                    }
                 }
-            }
-            if bad {
-                break;
+                if ws.is_empty() {
+                    continue;
+                }
+                if single_pred && dt.dominates(exit_dest, b, &func.layout) {
+                    patch.push((i, ws));
+                } else {
+                    bad = true;
+                    break 'scan;
+                }
             }
         }
         // `p` inside the exit inst's *other* slots / non-branch args
@@ -276,8 +385,10 @@ fn plan(func: &Function, info: &Info) -> Option<Plan> {
             entry: info.entry,
             entry_args: info.entry_args.clone(),
             h: info.h,
-            exit_dest: edge_dest(func, exit),
+            exit,
+            exit_dest,
             exit_args,
+            patch,
             p,
             n: n_out,
             ty,
@@ -313,17 +424,50 @@ fn apply(func: &mut Function, pl: &Plan) {
         let hargs: Vec<BlockArg> = pl.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
         pos.ins().brif(ok, fast, &[], pl.h, &hargs);
     }
+    // `lb` read directly in `exit_dest`'s dominated region (rustc's
+    // `return <alias>` shape): `exit_dest` is single-pred, so append a
+    // param `r` — the loop edge passes `p`, the fast path `res` — and
+    // point the dominated uses at `r`.
+    let r = if pl.patch.is_empty() {
+        None
+    } else {
+        let r = func.dfg.append_block_param(pl.exit_dest, pl.ty);
+        {
+            let dfg = &mut func.dfg;
+            dfg.insts[pl.exit.inst]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                [pl.exit.slot]
+                .append_argument(BlockArg::Value(pl.p), &mut dfg.value_lists);
+        }
+        for &(i, ref ws) in &pl.patch {
+            let mut data = func.dfg.insts[i];
+            {
+                let dfg = &mut func.dfg;
+                data.map_values(
+                    &mut dfg.value_lists,
+                    &mut dfg.jump_tables,
+                    &mut dfg.exception_tables,
+                    |v| if ws.contains(&v) { r } else { v },
+                );
+            }
+            func.dfg.insts[i] = data;
+        }
+        Some(r)
+    };
     // fast: `band n, (ineg n)` then the exit edge's original args with
     // `p` positions swapped for it.
     {
         let mut pos = FuncCursor::new(func).at_bottom(fast);
         let neg = pos.ins().ineg(pl.n);
         let res = pos.ins().band(pl.n, neg);
-        let args: Vec<BlockArg> = pl
+        let mut args: Vec<BlockArg> = pl
             .exit_args
             .iter()
             .map(|&a| BlockArg::Value(if a == pl.p { res } else { a }))
             .collect();
+        if r.is_some() {
+            args.push(BlockArg::Value(res));
+        }
         pos.ins().jump(pl.exit_dest, &args);
     }
     // The entry edge now enters `chk`.
@@ -347,7 +491,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
             let Some(info) = gather(func, cfg, dt, la, lp) else {
                 continue;
             };
-            let Some(pl) = plan(func, &info) else {
+            let Some(pl) = plan(func, &info, cfg, dt) else {
                 continue;
             };
             tracing::debug!(target: "pliron::lowbit", "lowbit {:?} -> band/ineg", pl.h);
@@ -435,6 +579,79 @@ mod tests {
             })
         });
         assert!(found, "{}", func.display());
+    }
+
+    /// The shape rustc+MIR actually emits: the divisor is carried as a
+    /// second header param (`p' = m`, `m' = m*2`) and `lb` escapes as a
+    /// direct use in the single-pred exit block (`return v3`), not an
+    /// edge arg — the rewrite paramizes the exit block.
+    #[test]
+    fn converts_carried_divisor_loop() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let rem = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let out = func.dfg.make_block();
+        for bl in [entry, h, rem, latch, out] {
+            func.layout.append_block(bl);
+        }
+        let n = func.dfg.append_block_param(entry, I64);
+        let lb = func.dfg.append_block_param(h, I64);
+        let m = func.dfg.append_block_param(h, I64);
+        let m2 = func.dfg.append_block_param(h, I64);
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+            let one = cur.ins().iconst(I64, 1);
+            let two = cur.ins().iconst(I64, 2);
+            let four = cur.ins().iconst(I64, 4);
+            cur.ins().jump(
+                h,
+                &[
+                    BlockArg::Value(one),
+                    BlockArg::Value(two),
+                    BlockArg::Value(four),
+                ],
+            );
+        }
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            cur.ins().jump(rem, &[]);
+        }
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(rem);
+            let r = cur.ins().urem(n, m);
+            let z = cur.ins().iconst(I64, 0);
+            let c = cur.ins().icmp(IntCC::Equal, r, z);
+            cur.ins().brif(c, latch, &[], out, &[]);
+        }
+        {
+            // latch: `lb' = m`, `m' = m2`, `m2' = m2*2`.
+            let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+            let two = cur.ins().iconst(I64, 2);
+            let m3 = cur.ins().imul(m2, two);
+            cur.ins().jump(
+                h,
+                &[
+                    BlockArg::Value(m),
+                    BlockArg::Value(m2),
+                    BlockArg::Value(m3),
+                ],
+            );
+        }
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+            cur.ins().return_(&[lb]);
+        }
+        verify(&func);
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(run(&mut func, &mut an), 1, "{}", func.display());
+        verify(&func);
+        // `out` gained a param and its `return` reads it.
+        assert_eq!(func.dfg.num_block_params(out), 1, "{}", func.display());
     }
 
     /// `lb0 = 3` doesn't match (result isn't `n & -n`).
