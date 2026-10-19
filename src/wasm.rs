@@ -799,8 +799,8 @@ fn peep_body_opts(
                         0x41..=0x44 => (0, 1),               // consts
                         0x45 | 0x50 => (1, 1),               // eqz
                         0x46..=0x4f | 0x51..=0x66 => (2, 1), // compares
-                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => (1, 1),
-                        0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => (2, 1),
+                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => (1, 1),
+                        0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => (2, 1),
                         0xa7..=0xc4 => (1, 1), // conversions
                         0xd1 | 0xd2 => (0, 1), // ref.null / ref.func
                         _ => return None,
@@ -1675,10 +1675,10 @@ fn peep_body_opts(
                             0x41..=0x44 => (0, 1),
                             0x45 | 0x50 => (1, 1),
                             0x46..=0x4f | 0x51..=0x66 => (2, 1),
-                            0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => {
+                            0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => {
                                 (1, 1)
                             }
-                            0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => {
+                            0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => {
                                 (2, 1)
                             }
                             0xa7..=0xc4 => (1, 1),
@@ -2121,6 +2121,27 @@ fn peep_body_opts(
         }
         ins = out;
     }
+    // Materialize `prel` keep-on-stack pushes into the instruction
+    // stream so `sfwd`'s operand-stack walk sees a balanced body: each
+    // `(pos, local)` pair emits a `local.get` before the instruction at
+    // that byte position — represented here as a synthetic `Get`
+    // spliced in at the anchor's index (its `.1` keeps the anchor's
+    // byte offset, which is a producer op — never `0x0f` — so the
+    // `drop_ret` scan below can't misread it). `prel` is then emptied
+    // so the emit loop doesn't double-emit the same pushes.
+    if !prel.is_empty() {
+        let mut splices: Vec<(usize, WPeek, usize, usize, usize)> = Vec::new();
+        for &(pos, lx) in &prel {
+            if let Some(k) = ins.iter().position(|&(_, s, _, _)| s == pos) {
+                splices.push((k, WPeek::Get(lx), pos, ins[k].2, ins[k].3));
+            }
+        }
+        splices.sort_by_key(|&(k, ..)| k);
+        for (off, (k, kind, s, e, c)) in splices.into_iter().enumerate() {
+            ins.insert(k + off, (kind, s, e, c));
+        }
+        prel.clear();
+    }
     // Store→load forwarding through a provably-stable base local: the
     // frame-resident aggregate splice leaves `get fp; get v; store +K`
     // … `get fp; load +K` — the load re-reads bytes the store just
@@ -2165,6 +2186,14 @@ fn peep_body_opts(
                 _ => 4,                   // i32/f32 store, i64.store32
             }
         };
+        let lwidth = |op: u8| -> u32 {
+            match op {
+                0x2c | 0x2d | 0x30 | 0x31 => 1, // *.load8_s/u
+                0x2e | 0x2f | 0x32 | 0x33 => 2, // *.load16_s/u
+                0x29 | 0x2b => 8,             // i64/f64 load
+                _ => 4,                       // i32/f32 load, i64.load32
+            }
+        };
         let stype = |op: u8| -> u8 {
             match op {
                 0x37 => 0x7e, // i64.store -> i64 local
@@ -2173,16 +2202,30 @@ fn peep_body_opts(
                 _ => 0x7f,    // i32.store -> i32 local
             }
         };
-        // (base local, offset) -> (forwarding local, store opcode)
-        let mut fmap: FxHashMap<(u32, u32), (u32, u8)> = FxHashMap::default();
+        // (base local, offset) -> (forwarding local, store opcode,
+        // store ins, addr ins, exposed). `exposed` marks a possibly-
+        // aliasing unforwarded read of the range; an unexposed entry is
+        // overwritten by the next same-slot store, so its store is
+        // dead: `Del` the addr `get` and turn the store into `drop`
+        // (its two pushes → one pop: net-0). Forwarded loads read the
+        // captured local, not memory, so they never expose.
+        let mut fmap: FxHashMap<(u32, u32), (u32, u8, usize, usize, bool)> =
+            FxHashMap::default();
         // Rewrites are collected, not applied mid-scan: `dead` hides a
         // deleted `get B` from `prev_e`/`get_of` and `repl` respells a
         // forwarded load as the `get` it becomes, so later producer
         // lookups see the post-rewrite instruction stream.
         let dead = std::cell::RefCell::new(FxHashSet::default());
         let repl = std::cell::RefCell::new(FxHashMap::default());
+        let dropped = std::cell::RefCell::new(FxHashSet::default()); // store -> `drop`
         let mut rewrites: Vec<(usize, usize, u32)> = Vec::new(); // (get ins, load ins, L)
+        let mut store_dels: Vec<(usize, usize)> = Vec::new(); // (addr ins, store ins)
         let mut inserts: Vec<(usize, (WPeek, usize, usize, usize))> = Vec::new();
+        let dbg = crate::env_set("PLIRON_WASM_SFWD_DBG");
+        let mut n_clear = 0usize;
+        let mut n_walkfail = 0usize;
+        let mut n_exposed_set = 0usize;
+        let last_fail = std::cell::RefCell::new(String::new());
         let prev_e = |mut j: usize| -> Option<usize> {
             let dead = dead.borrow();
             loop {
@@ -2207,11 +2250,15 @@ fn peep_body_opts(
             }
         };
         // Stack effect honoring rewrites: a `repl`'d load now behaves
-        // like the `get L` it emits. None = opaque (calls, control,
-        // memory, markers) — aborts the operand walk.
+        // like the `get L` it emits, a dropped store pops one (the
+        // addr-get's push was deleted alongside). None = opaque (calls,
+        // control, memory, markers) — aborts the operand walk.
         let esf = |j: usize| -> Option<(u32, u32)> {
             if repl.borrow().contains_key(&j) {
                 return Some((0, 1));
+            }
+            if dropped.borrow().contains(&j) {
+                return Some((1, 0));
             }
             match ins[j].0 {
                 WPeek::Get(_) => Some((0, 1)),
@@ -2229,18 +2276,29 @@ fn peep_body_opts(
                         0x41..=0x44 => (0, 1),               // consts
                         0x45 | 0x50 => (1, 1),               // eqz
                         0x46..=0x4f | 0x51..=0x66 => (2, 1), // compares
-                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x8d | 0x99..=0x9b => {
+                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => {
                             (1, 1)
                         }
-                        0x6a..=0x78 | 0x7c..=0x8a | 0x8e..=0x98 | 0x9c..=0xa6 => {
+                        0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => {
                             (2, 1)
                         }
                         0xa7..=0xc4 => (1, 1), // conversions
                         0xd1 | 0xd2 => (0, 1), // ref.null / ref.func
-                        _ => return None,
+                        _ => {
+                            if dbg {
+                                *last_fail.borrow_mut() =
+                                    format!("esf op{:02x}@{j}", op);
+                            }
+                            return None;
+                        }
                     })
                 }
-                _ => None,
+                k => {
+                    if dbg {
+                        *last_fail.borrow_mut() = format!("esf {:?}@{j}", k);
+                    }
+                    None
+                }
             }
         };
         // Resolve a memory op's operand stack: walking back, `rem` is
@@ -2257,13 +2315,22 @@ fn peep_body_opts(
             let mut rem = need0;
             let mut val = None;
             let mut steps = 0;
+            let mut trace = String::new();
             loop {
-                j = prev_e(j)?;
+                let Some(nj) = prev_e(j) else {
+                    if dbg { *last_fail.borrow_mut() = format!("prev_e-empty@{j} rem={rem} [{trace}]"); }
+                    return None;
+                };
+                j = nj;
                 steps += 1;
                 if steps > 80 {
+                    if dbg { *last_fail.borrow_mut() = format!("steps80@{j} rem={rem} [{trace}]"); }
                     return None;
                 }
-                let (pops, pushes) = esf(j)?;
+                let Some((pops, pushes)) = esf(j) else { return None; };
+                if dbg && i < 200 {
+                    trace = format!("{j}:-{pops}+{pushes} {trace}");
+                }
                 let covered = pushes.min(rem);
                 if covered > 0 && rem == need0 && val.is_none() {
                     val = Some(j);
@@ -2280,9 +2347,22 @@ fn peep_body_opts(
         const MAX_SFWD_LOCALS: u32 = 48;
         for i in 0..ins.len() {
             match ins[i].0 {
-                WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => fmap.clear(),
+                WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
+                if dbg && !fmap.is_empty() {
+                    eprintln!("  ctl@{i} cleared {} entries", fmap.len());
+                }
+                n_clear += 1;
+                fmap.clear();
+            }
                 WPeek::Set(l) | WPeek::Tee(l) => {
-                    fmap.retain(|&(b2, _), &mut (v, _)| b2 != l && v != l);
+                    let pre: Vec<_> = if dbg { fmap.keys().copied().collect() } else { Vec::new() };
+                    fmap.retain(|&(b2, _), &mut e| b2 != l && e.0 != l);
+                    if dbg {
+                        let gone: Vec<_> = pre.into_iter().filter(|k| !fmap.contains_key(k)).collect();
+                        if !gone.is_empty() {
+                            eprintln!("  set@{i} l={l} killed {gone:?}");
+                        }
+                    }
                 }
                 // `Nop(l)`/`Drop`/`Del` leave locals and memory alone;
                 // `Get` is a plain read.
@@ -2290,76 +2370,181 @@ fn peep_body_opts(
                 WPeek::Other => match b[ins[i].1] {
                     // calls decode as Ctl; `memory.*`/`0xfb`-`0xfe` are
                     // opaque — atomics/SIMD/GC bail at decode anyway.
-                    0xfc => fmap.clear(),
+                    0xfc => {
+                        n_clear += 1;
+                        fmap.clear();
+                    }
                     0x36..=0x3e => {
                         let Some((sop, off)) = memop(i) else {
                             continue;
                         };
                         let w = swidth(sop);
                         let Some((a_ins, v_ins)) = operands(i, 2) else {
+                            n_walkfail += 1;
+                            if dbg {
+                                eprintln!("  walkfail store@{i} op={sop:#x} ({})", last_fail.borrow());
+                                if i < 200 {
+                                    for k in (i.saturating_sub(16))..=i {
+                                        eprintln!(
+                                            "    {k}: {:?} op={:02x} dead={}",
+                                            ins[k].0, b[ins[k].1],
+                                            dead.borrow().contains(&k)
+                                        );
+                                    }
+                                }
+                            }
                             fmap.clear();
                             continue;
                         };
                         let Some(bx) = get_of(a_ins) else {
                             // Computed address — could alias any slot.
+                            n_clear += 1;
                             fmap.clear();
                             continue;
                         };
+                        // An unexposed earlier store to the same full
+                        // slot is dead — every byte it wrote is
+                        // overwritten before any read could have seen
+                        // it (forwarded reads went through the captured
+                        // local, not memory).
+                        if let Some(&(_, sop_old, s_old, a_old, exposed)) =
+                            fmap.get(&(bx, off))
+                            && !exposed
+                            && w >= swidth(sop_old)
+                        {
+                            dead.borrow_mut().insert(a_old);
+                            dropped.borrow_mut().insert(s_old);
+                            store_dels.push((a_old, s_old));
+                            if dbg {
+                                eprintln!("  store@{i} KILL ({bx},{off})");
+                            }
+                        }
                         // Keep only same-base slots this store can't
                         // reach: a store through a *different* local
                         // could still alias — two locals may hold equal
                         // addresses.
-                        fmap.retain(|&(b2, o2), &mut (_, sop2)| {
+                        let pre: Vec<_> = if dbg {
+                            fmap.keys().copied().collect()
+                        } else { Vec::new() };
+                        fmap.retain(|&(b2, o2), &mut e| {
                             b2 == bx
-                                && (o2 + swidth(sop2) <= off
+                                && (o2 + swidth(e.1) <= off
                                     || off + w <= o2)
                         });
+                        if dbg {
+                            let gone: Vec<_> = pre.into_iter().filter(|k| !fmap.contains_key(k)).collect();
+                            if !gone.is_empty() {
+                                eprintln!("  store@{i} off={off} retain-killed {gone:?}");
+                            }
+                        }
                         if !(0x36..=0x39).contains(&sop) {
                             continue; // narrow stores forward nothing
                         }
-                        // `get V` producers forward V directly; anything
-                        // else is captured into a fresh local by a `tee`.
-                        let fwd = match v_ins.and_then(get_of) {
-                            Some(vx) => vx,
-                            None if minted < MAX_SFWD_LOCALS => {
-                                let t = next_local;
-                                next_local += 1;
-                                minted += 1;
-                                groups.push((1, stype(sop)));
-                                inserts.push((i, (WPeek::Tee(t), ins[i].1, ins[i].1, ins[i].3)));
-                                t
-                            }
-                            None => continue, // out of capture locals
-                        };
-                        fmap.insert((bx, off), (fwd, sop));
-                    }
-                    0x28..=0x2b => {
-                        let Some((lop, off)) = memop(i) else {
-                            continue;
-                        };
-                        let Some((a_ins, _)) = operands(i, 1) else {
-                            continue;
-                        };
-                        let Some(bx) = get_of(a_ins) else {
-                            continue;
-                        };
-                        let Some(&(vx, sop)) = fmap.get(&(bx, off)) else {
-                            continue;
-                        };
-                        if lop + 0x0e != sop {
-                            continue; // width/pair mismatch
+                        // `get V` producers forward V directly; a
+                        // computed value records `u32::MAX` and a
+                        // `tee T` is only minted when a load actually
+                        // forwards through this entry — killing the
+                        // store later costs no capture either way.
+                        let fwd = v_ins.and_then(get_of).unwrap_or(u32::MAX);
+                        fmap.insert((bx, off), (fwd, sop, i, a_ins, false));
+                        if dbg {
+                            eprintln!("  store@{i} insert ({bx},{off}) fwd={fwd}");
                         }
-                        dead.borrow_mut().insert(a_ins);
-                        repl.borrow_mut().insert(i, vx);
-                        rewrites.push((a_ins, i, vx));
+                    }
+                    0x28..=0x35 => {
+                        let Some((lop, off)) = memop(i) else {
+                            for e in fmap.values_mut() {
+                                e.4 = true;
+                            }
+                            continue;
+                        };
+                        let lw = lwidth(lop);
+                        // An unresolvable address could read anything.
+                        let Some((a_ins, bx)) = operands(i, 1)
+                            .and_then(|(a, _)| get_of(a).map(|bx| (a, bx)))
+                        else {
+                            n_walkfail += 1;
+                            if dbg { eprintln!("  walkfail load@{i} ({})", last_fail.borrow()); }
+                            n_exposed_set += fmap.len();
+                            for e in fmap.values_mut() {
+                                e.4 = true;
+                            }
+                            continue;
+                        };
+                        let mut forwarded = false;
+                        if (0x28..=0x2b).contains(&lop)
+                            && let Some(e) = fmap.get_mut(&(bx, off))
+                            && lop + 0x0e == e.1
+                        {
+                            let mut fwd = e.0;
+                            if fwd == u32::MAX {
+                                // First forwarded use of a computed
+                                // value — splice `tee T` before the
+                                // store now (net-0 stack: pops the
+                                // value, pushes it back, keeps it).
+                                if minted < MAX_SFWD_LOCALS {
+                                    let t = next_local;
+                                    next_local += 1;
+                                    minted += 1;
+                                    groups.push((1, stype(e.1)));
+                                    let s = e.2;
+                                    inserts.push((s, (WPeek::Tee(t), ins[s].1, ins[s].1, ins[s].3)));
+                                    e.0 = t;
+                                    fwd = t;
+                                }
+                            }
+                            if fwd != u32::MAX {
+                                dead.borrow_mut().insert(a_ins);
+                                repl.borrow_mut().insert(i, fwd);
+                                rewrites.push((a_ins, i, fwd));
+                                forwarded = true;
+                            }
+                        }
+                        // Exposure: this load reads memory. Mark every
+                        // entry whose range it may have touched — a
+                        // different base can't be proven disjoint; same
+                        // base needs a range check. The just-forwarded
+                        // entry itself read the captured local instead.
+                        for (&(b2, o2), e) in fmap.iter_mut() {
+                            if forwarded && b2 == bx && o2 == off {
+                                continue;
+                            }
+                            if b2 != bx
+                                || (o2 < off + lw && off < o2 + swidth(e.1))
+                            {
+                                if !e.4 {
+                                    n_exposed_set += 1;
+                                }
+                                e.4 = true;
+                            }
+                        }
                     }
                     _ => {}
                 },
             }
         }
+        if crate::env_set("PLIRON_WASM_SFWD_DBG") {
+            eprintln!(
+                "sfwd: len={} entries={} fwds={} kills={} mints={} exposed_live={} clear={} walkfail={} exposed={} last={}",
+                ins.len(),
+                fmap.len(),
+                rewrites.len(),
+                store_dels.len(),
+                minted,
+                fmap.values().filter(|e| e.4).count(),
+                n_clear,
+                n_walkfail,
+                n_exposed_set,
+                last_fail.borrow()
+            );
+        }
         // Rewrites first — they edit in place using the original
         // indices; `tee` splices then land at their recorded positions
         // (each insert shifts later indices by one).
+        for (a, s) in store_dels {
+            ins[a].0 = WPeek::Del; // dead store's addr `get`
+            ins[s].0 = WPeek::Drop; // pops the dangling value
+        }
         for (m, i, vx) in rewrites {
             ins[m].0 = WPeek::Del; // the `get B` addr
             ins[i].0 = WPeek::Get(vx);
@@ -2616,7 +2801,15 @@ fn wpeep(bytes: &mut Vec<u8>) {
                     eprintln!("wpeep body {k} ({bsz} bytes)");
                 }
                 let nparams = fsig.get(imp + fi as usize).map(|&(np, _)| np).unwrap_or(0);
-                peep_body(&bytes[q..be], &fsig, &tsig, nparams).unwrap_or_else(|| bytes[q..be].to_vec())
+                if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(format!("{dir}/body_{k}_pre.bin"), &bytes[q..be]);
+                }
+                let out = peep_body(&bytes[q..be], &fsig, &tsig, nparams).unwrap_or_else(|| bytes[q..be].to_vec());
+                if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
+                    let _ = std::fs::write(format!("{dir}/body_{k}_post.bin"), &out);
+                }
+                out
             } else {
                 bytes[q..be].to_vec()
             };
@@ -3129,6 +3322,86 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
         assert!(has_seq(&out, &[0x28]), "unsound fwd: {out:02x?}");
+    }
+
+    // Dead-store elimination: a second same-slot store before any read
+    // makes the first store dead — it emits as `drop` (the val push is
+    // consumed) and its addr `get` is deleted.
+    #[test]
+    fn sfwd_overwritten_store_drops() {
+        let b = body(
+            8,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x00, // get0;get2;store fp+0
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 -> get 2
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        assert!(
+            has_seq(&out, &[0x20, 0x01, 0x1a, 0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x00, 0x20, 0x02]),
+            "store1 not dropped: {out:02x?}"
+        );
+    }
+
+    // nbody's pair shape: `get B; get B; load; tee; <f64 math>; tee;
+    // store` — the store's addr is the *first* get, the load consumed
+    // the second. The second pair's val chain pushes 3 locals before
+    // the two binary ops so the addr-get still bottoms the window.
+    #[test]
+    fn sfwd_nbody_pair_shape() {
+        let b = body(
+            8,
+            &[
+                0x20, 0x00, 0x20, 0x00, 0x2b, 0x03, 0x18, // get0;get0;f64.load+24
+                0x22, 0x01, // tee 1 (v_i)
+                0x20, 0x02, 0x20, 0x03, 0xa2, 0xa0, // get2;get3;f64.mul;f64.sub
+                0x22, 0x04, // tee 4 (v_i_new)
+                0x39, 0x03, 0x18, // f64.store +24
+                // second pair re-stores the same slot
+                0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x20, 0x03, 0xa2, 0xa0, // get0;get1;get2;get3;fmul;fsub
+                0x22, 0x05, // tee 5
+                0x39, 0x03, 0x18, // f64.store +24
+                0x20, 0x00, 0x2b, 0x03, 0x18, // get0;f64.load +24 -> get T2
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        // first store -> `drop` (addr get0 deleted, no tee minted —
+        // capture is deferred until a load actually forwards).
+        assert!(
+            has_seq(&out, &[0x22, 0x04, 0x1a]),
+            "store1 not dropped: {out:02x?}"
+        );
+        // second store survives; its computed val mints `tee 8` at the
+        // store when the trailing load forwards to it.
+        assert!(
+            has_seq(&out, &[0x22, 0x05, 0x22, 0x08, 0x39, 0x03, 0x18, 0x20, 0x08]),
+            "store2/fwd wrong: {out:02x?}"
+        );
+    }
+
+    // An unforwarded read of the slot between the two stores keeps the
+    // first store alive — `i32.load8_u` at the same offset overlaps the
+    // 4-byte range and can't be forwarded.
+    #[test]
+    fn sfwd_exposed_store_survives() {
+        let b = body(
+            8,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x00, 0x2d, 0x02, 0x00, // get0;i32.load8_u fp+0 (reads!)
+                0x1a, // drop
+                0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x00, // get0;get2;store fp+0
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 -> get 2
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        assert!(has_seq(&out, &[0x2d, 0x02, 0x00]), "load8_u gone: {out:02x?}");
+        // both stores still present: two `i36 02 00` sequences
+        let cnt = (0..out.len().saturating_sub(2))
+            .filter(|&k| out[k] == 0x36 && out[k + 1] == 0x02 && out[k + 2] == 0x00)
+            .count();
+        assert_eq!(cnt, 2, "store count: {out:02x?}");
     }
 }
 
