@@ -3314,7 +3314,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         .needs(shape::LOOPS | shape::MEM)
         // `memset`/`memcpy` idiom recognition emits libcalls.
         .creates_all(),
-        step("lowbit", "lowbit", Gate::OptIn("PLIRON_LOWBIT"), s_lowbit)
+        step("lowbit", "lowbit", Gate::Env("PLIRON_LOWBIT"), s_lowbit)
             .needs(shape::LOOPS | shape::DIVREM),
         cstep(
             "ifconv2",
