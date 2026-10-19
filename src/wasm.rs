@@ -493,6 +493,10 @@ enum WPeek {
     /// analysis see the read and the reaffirming write it would otherwise
     /// lose track of.
     Nop(u32),
+    /// A `br_if` produced by the back-edge `if` fold (the loop's
+    /// `if c { copies; br L } else { .. }` restructure): emits
+    /// `0x0d` + the (already depth-adjusted) target.
+    BrIf(u32),
     Other,
 }
 
@@ -1887,6 +1891,163 @@ fn peep_body_opts(
             break;
         }
     }
+    // Loop-back-edge `if` fold: `if c { get*/set*/tee*; br L } [else { R }]
+    // end` — waffle lowers `brif` to a param'd loop edge this way, parking
+    // the bound copies in scratch locals inside the `if` arm where the
+    // copy-forward can't retarget them. LLVM keeps the loop's carried
+    // locals updated unconditionally (`local.tee`) then `br_if`s. When the
+    // arm is only local copies + `br` and the else arm reads none of the
+    // copied locals (and holds no depth-referencing/structured op), hoist
+    // the copies before `if`, emit `br_if` for the edge, drop the
+    // if/else/end wrapper. `PLIRON_WASM_BRF=0` disables. Skipped while
+    // `prel` has hoisted pushes (they emit by byte-position; the reorder
+    // would move them).
+    if crate::env_get("PLIRON_WASM_BRF") != Some("0") && prel.is_empty() {
+        let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
+        let mut i = 0;
+        'iter: while i < ins.len() {
+            let (k, s, _e, cx) = ins[i];
+            if !(matches!(k, WPeek::Ctl) && b[s] == 0x04) {
+                out.push(ins[i]);
+                i += 1;
+                continue;
+            }
+            'fold: {
+                // `I` is the if's decode index — the first inner inst's ctx.top.
+                let Some(&ix1) = ins.get(i + 1) else { break 'fold };
+                let outer = ctx[cx].len();
+                if ctx[ix1.3].len() != outer + 1 {
+                    break 'fold;
+                }
+                let Some(&(iid, _)) = ctx[ix1.3].last() else { break 'fold };
+                // arm1 = (iid,0) insts; `else`/`end` markers end it.
+                let mut arm1: Vec<usize> = Vec::new();
+                let mut arm2: Vec<usize> = Vec::new();
+                let mut writes: FxHashSet<u32> = FxHashSet::default();
+                let mut br_i: Option<usize> = None;
+                let mut bad = false;
+                let mut j = i + 1;
+                // Operand-stack depth the arm1 copies leave above the `if`'s
+                // consumed condition — a `Set`/`Tee` with nothing pushed pops
+                // the cond instead, and a nonzero final depth buries it.
+                let mut bal: i32 = 0;
+                // Non-depth, non-structured Ctl opcodes allowed in the else
+                // arm (calls/return — no label operand to retarget).
+                let safe_ctl = |op: u8| matches!(op, 0x00 | 0x01 | 0x0f | 0x10..=0x14);
+                while j < ins.len() {
+                    let (k2, s2, _e2, c2) = ins[j];
+                    let Some(&(ci, arm)) = ctx[c2].last() else { break };
+                    if ci != iid {
+                        break;
+                    }
+                    if arm == 0 {
+                        if b[s2] == 0x05 {
+                            j += 1; // `else` marker — arm2 follows
+                            continue;
+                        }
+                        if b[s2] == 0x0b {
+                            break; // `end` (no-else `if`)
+                        }
+                        arm1.push(j);
+                        match k2 {
+                            WPeek::Get(_) => bal += 1,
+                            WPeek::Set(t) => {
+                                if bal == 0 {
+                                    bad = true; // `set` would pop the cond
+                                }
+                                bal -= 1;
+                                writes.insert(t);
+                            }
+                            WPeek::Tee(t) => {
+                                if bal == 0 {
+                                    bad = true; // `tee` would pop the cond
+                                }
+                                writes.insert(t);
+                            }
+                            WPeek::Nop(t) => {
+                                writes.insert(t);
+                            }
+                            WPeek::Ctl if b[s2] == 0x0c => {
+                                if br_i.replace(j).is_some() {
+                                    bad = true; // a second `br` in arm1
+                                }
+                            }
+                            _ => bad = true,
+                        }
+                    } else {
+                        if b[s2] == 0x0b {
+                            break; // `end` closing the else arm
+                        }
+                        // else arm: no depth-referencing op, no *read* of a
+                        // hoisted dest (`Get`/`Nop` read; `Set`/`Tee`/`Drop`
+                        // only write).
+                        match k2 {
+                            WPeek::Get(t) | WPeek::Nop(t) if writes.contains(&t) => {
+                                bad = true;
+                            }
+                            WPeek::Ctl if !safe_ctl(b[s2]) => bad = true,
+                            _ => arm2.push(j),
+                        }
+                    }
+                    j += 1;
+                }
+                // The `if` region must end at a single `end` (ins[j]) —
+                // that's the wrapper we drop.
+                let valid = !bad
+                    && bal == 0
+                    && !arm1.is_empty()
+                    && br_i.is_some()
+                    && br_i == arm1.last().copied()
+                    && j < ins.len()
+                    && b[ins[j].1] == 0x0b;
+                if !valid {
+                    break 'fold;
+                }
+                // The hoisted `writes` hold the arm's (new) value on the
+                // else/exit path too — reject if anything past `end` reads
+                // one before rewriting it.
+                let mut live = writes.clone();
+                for k in (j + 1)..ins.len() {
+                    match ins[k].0 {
+                        WPeek::Get(t) | WPeek::Nop(t) if live.contains(&t) => {
+                            bad = true;
+                            break;
+                        }
+                        WPeek::Set(t) | WPeek::Tee(t) => {
+                            live.remove(&t);
+                        }
+                        _ => {}
+                    }
+                    if live.is_empty() {
+                        break;
+                    }
+                }
+                if bad {
+                    break 'fold;
+                }
+                // `br`'s label depth counts the `if` level we remove.
+                let bi = br_i.unwrap();
+                let bs = ins[bi].1;
+                let mut dp = bs + 1;
+                let Some(d) = urd(b, &mut dp) else { break 'fold };
+                if d == 0 {
+                    break 'fold; // `br` targeted the `if`'s own end
+                }
+                // Emit: arm1 copies, `br_if`, else-arm insts. Drop
+                // `if`, arm1's `br`, `else`, `end`.
+                for &x in &arm1[..arm1.len() - 1] {
+                    out.push(ins[x]);
+                }
+                out.push((WPeek::BrIf(d - 1), ins[i].1, ins[i].1, ins[i].3));
+                out.extend(arm2.iter().map(|&x| ins[x]));
+                i = j + 1; // past `end`
+                continue 'iter;
+            }
+            out.push(ins[i]);
+            i += 1;
+        }
+        ins = out;
+    }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
     for &(c, t) in &groups {
@@ -1956,6 +2117,10 @@ fn peep_body_opts(
             WPeek::Tee(n) => {
                 nb.push(0x22);
                 leb(&mut nb, n);
+            }
+            WPeek::BrIf(d) => {
+                nb.push(0x0d);
+                leb(&mut nb, d);
             }
             WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
             WPeek::Del | WPeek::Nop(_) => {}
@@ -2314,6 +2479,73 @@ mod wpeep_tests {
         let out = peep_body(&b, &[], &[]).unwrap();
         assert!(has_seq(&out, &[0x22, 0x04]), "no forward: {out:02x?}");
         assert!(!has_seq(&out, &[0x20, 0x05, 0x21, 0x04]), "copy left: {out:02x?}");
+    }
+
+    // Regression (wasm `fib`): waffle lowers the loop-backedge `brif` as
+    // `if c { param-copies; br L } else { exit }`, parking the copies in
+    // the `if` arm. When the arm is only `get`/`set`/`tee` + `br` and the
+    // else arm doesn't read the copied locals, fold to hoisted copies +
+    // `br_if` — LLVM's `tee`/`br_if` loop-back shape.
+    //
+    //   loop
+    //     i32.const 1; set 2; i32.const 0; set 3      ; producers
+    //     i32.const 5; i32.const 2; i32.ge_u          ; c
+    //     if
+    //       get 2; get 3; set 1; set 4; br 1          ; params -> loop
+    //     else
+    //       get 3; return                             ; reads only scratch
+    //     end
+    //   end
+    #[test]
+    fn backedge_if_folds_to_br_if() {
+        let b = body(
+            6,
+            &[
+                0x03, 0x40, // loop
+                0x41, 0x01, 0x21, 0x02, // i32.const 1; local.set 2
+                0x41, 0x00, 0x21, 0x03, // i32.const 0; local.set 3
+                0x41, 0x05, 0x41, 0x02, 0x4e, // i32.const 5; 2; ge_u -> c
+                0x04, 0x40, // if
+                0x20, 0x02, 0x20, 0x03, 0x21, 0x01, 0x21, 0x04, // get2;get3;set1;set4
+                0x0c, 0x01, // br 1 (-> loop)
+                0x05, // else
+                0x20, 0x03, // local.get 3
+                0x0f, // return
+                0x0b, // end (if)
+                0x0b, // end (loop)
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(
+            has_seq(&out, &[0x20, 0x02, 0x20, 0x03, 0x21, 0x01, 0x21, 0x04, 0x0d, 0x00]),
+            "no hoisted br_if: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0x0c, 0x01]), "br not folded: {out:02x?}");
+    }
+
+    // The else arm reading a copied local must NOT fold — hoisting it
+    // would make the else see the new value.
+    #[test]
+    fn backedge_if_else_read_blocks_fold() {
+        let b = body(
+            6,
+            &[
+                0x03, 0x40, // loop
+                0x41, 0x01, 0x21, 0x02, // i32.const 1; local.set 2
+                0x41, 0x05, 0x41, 0x02, 0x4e, // c
+                0x04, 0x40, // if
+                0x20, 0x02, 0x21, 0x01, // get2; set1 (copies local1)
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x20, 0x01, // local.get 1 — reads the copied local
+                0x1a, // drop
+                0x0b, // end (if)
+                0x0b, // end (loop)
+            ],
+        );
+        let out = peep_body(&b, &[], &[]).unwrap();
+        assert!(!has_seq(&out, &[0x0d]), "unsound br_if: {out:02x?}");
+        assert!(has_seq(&out, &[0x0c, 0x01]), "br still there: {out:02x?}");
     }
 }
 
