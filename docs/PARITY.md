@@ -174,6 +174,40 @@ Next steps, in expected-payoff order:
    is `in.call` cloning (~1.4 s), already linear; the remaining
    pliron-IR mass is the same 80-linear-passes-over-big-functions
    shape as the CLIF pipeline (item 5).
+   **Dedup ceiling measured — dead end on regex-syntax**
+   (`PLIRON_MCLOGFN=1` names hit/miss fns in the trace): all 861
+   memcache hits land on ~58-inst fns (~0.6 s pipeline total); every
+   >1 s pipeline fn is *unique* — the 15-35k-inst `drop_glue`/derived
+   `eq`/`parse`/`translate`/`visit_post` towers exist once per crate,
+   so whole-pipeline dedup saves ≈0 there. An earlier "53% of pipeline
+   ms on duplicate names" estimate was a name-truncation artifact.
+   **Giant-cap and diet pipelines measured — rejected**: the >5k-inst
+   fns carry ~65% of pipeline cost (`PLIRON_GIANT_MAX=5000` →
+   20.6→11.5 user-s, wall 3.05→1.97) but they're also hot:
+   GM=5000 costs ~8% runtime on a parse loop bench (2.48→2.67 s),
+   GM=2000 ~15% — and pliron is *already* ~21% behind stock's 2.05 s
+   on that bench, so the quality can't be traded. A 7-step giant
+   allowlist (`PLIRON_GIANT_STEPS=jumpthread,ifconv2,dse,loadfwd,licm,
+   indvars,clifpeep`) recovered only ~⅓ of the loss; giant-fn quality
+   is diffuse across ~85 steps, no tier wins cleanly. Concentration:
+   top-10 fns ≈ 50% of traced step time, top-50 ≈ 89%; <1ms fns are
+   ~64% of fns but ~1% of cost — small-fn overheads are irrelevant.
+   **LLVM's own numbers** (`-Zllvm-time-trace` on the same compile):
+   LLVM's *entire* function-pass manager is 2.2 s vs our ~14 CPU-s
+   pipeline; per pass it's ~15-45x — JumpThreading 91 ms vs our
+   `jumpthread` ~3.7 s, DSE 79 ms vs ~2.0 s, SLPVectorizer 56 ms vs
+   ~2.5 s, IndVarSimplify 101 ms vs `indvars` ~1.3 s. LLVM also starts
+   from MIR-opt-pre-cleaned IR (rustc runs inline/SROA-ish/GVN-ish
+   passes upstream for it; we redo that work at CLIF). The gap is
+   per-inst pass efficiency on ~20-40k-inst functions, not pass count
+   or algorithm — the remaining lever is making the top-6 steps
+   (jumpthread/ifconv2/slp/loadfwd/mergechain-family/dse, ≈13 s
+   traced) cheaper per instruction: `Uses`/alias-map reuse across the
+   mutation boundary, `an`-cached facts, and per-step worklists
+   instead of full scans. Version-skip for repeat steps (licm×3,
+   dse×3, lcse×4…) was analyzed and rejected: the big fns mutate
+   constantly, so a dirty flag almost never holds on the fns that
+   carry the time.
 5. ~~Glue~~ **partly done, premise revised**: the inter-step
    bookkeeping is now ~3% of phaseB CPU. `carry_aliases`/`compact_aliases`
    walk `dfg.alias_writes()` (the per-write list behind `alias_epoch`)

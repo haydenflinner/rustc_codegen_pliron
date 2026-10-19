@@ -1332,6 +1332,28 @@ fn giant_max_env() -> usize {
 }
 const GIANT_MAX: usize = 50_000;
 
+/// `PLIRON_GIANT_STEPS=a,b,c` — experimental allowlist: steps named in
+/// the list still run on over-`giant_max` functions. Lets A/B runs
+/// isolate which steps carry giant-function quality.
+fn giant_steps() -> Vec<String> {
+    if pliron_cfg::reads_open() {
+        return giant_steps_env();
+    }
+    static L: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(giant_steps_env);
+    L.clone()
+}
+
+fn giant_steps_env() -> Vec<String> {
+    config()
+        .get("PLIRON_GIANT_STEPS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Duration) {
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
@@ -1347,7 +1369,11 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
     // step can only leave the function unoptimized, never wrong.
     // Checked per step rather than once at selection: a step can grow
     // the function past the limit mid-pipeline (unroll).
-    if !matches!(s.gate, Gate::Always) && (p.unopt || p.clctx.func.dfg.num_insts() > giant_max()) {
+    if !matches!(s.gate, Gate::Always)
+        && (p.unopt
+            || (p.clctx.func.dfg.num_insts() > giant_max()
+                && !giant_steps().iter().any(|n| n == s.name)))
+    {
         return;
     }
     // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on

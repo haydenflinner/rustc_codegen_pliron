@@ -473,6 +473,14 @@ fn log(what: &str) {
     }
 }
 
+/// `PLIRON_MCLOGFN=1`: hit/miss rows carry the function name and size —
+/// measures which functions the cache actually dedups.
+fn log_fn(what: &str, p: &Pipe) {
+    if crate::config::env_is("PLIRON_MCLOGFN", "1") {
+        pliron_cfg::trace(what, p.clctx.func.dfg.num_insts() as f64, p.fname);
+    }
+}
+
 /// `Hasher` over `Sha256`: strong collision resistance is correctness —
 /// a wrong hit silently substitutes a different function's output.
 struct Sha(sha2::Sha256);
@@ -828,11 +836,13 @@ pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
             Got::Ready(v) => {
                 if pipe_apply(p, &v, &ran) {
                     log("mem-pipe-hit");
+                    log_fn("mem-pipe-hit", p);
                     return PipeLookup::Hit;
                 }
                 // Decoded but no variant matched this run's step list
                 // or reads — the run produces; its store merges in.
                 log("pipe-miss");
+                log_fn("pipe-miss-variant", p);
                 return PipeLookup::Miss(Claim::bare(k));
             }
             Got::Wait(t) => {
@@ -851,9 +861,11 @@ pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
                     Some(v) => {
                         if pipe_apply(p, &v, &ran) {
                             log("mem-pipe-hit");
+                            log_fn("mem-pipe-hit-wait", p);
                             return PipeLookup::Hit;
                         }
                         log("pipe-miss");
+                        log_fn("pipe-miss-variant", p);
                         return PipeLookup::Miss(Claim::bare(k));
                     }
                     // Producer dropped without storing — take over as
@@ -864,6 +876,7 @@ pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
                             m.insert(k, MemEnt::Pending(t.clone()));
                         }
                         log("pipe-miss");
+                        log_fn("pipe-miss-reclaim", p);
                         return PipeLookup::Miss(Claim::holding(k, t));
                     }
                 }
@@ -881,6 +894,7 @@ pub fn pipeline_lookup(p: &mut Pipe, an: &mut Analysis) -> PipeLookup {
                     return PipeLookup::Hit;
                 }
                 log("pipe-miss");
+                log_fn("pipe-miss-new", p);
                 return PipeLookup::Miss(Claim::holding(k, t));
             }
         }
