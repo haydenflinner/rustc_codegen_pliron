@@ -328,10 +328,19 @@ inlining growth; `winline`'s caller-growth cap already took it from 8x.
 | kernel | pliron/LLVM | lead |
 |---|---|---|
 | eqbug | 1.10 | narrow `black_box` barriers: LLVM's `*m` asm form folds the `uxtb`/`uxth` into the store/load; we pay an ALU op per barrier, plus constant remat under pressure |
-| parse_only | 1.05 | was at parity after `edgesink`; regressed — bisect with `harness/bisect.py` |
+| parse_only | 1.05 | `divnarrow` regression fixed (wasm-only narrowing now); residual vs LLVM = packed-Result `band`/`orr` juggling + `bump_hoist` remat `sub`s in the unrolled digit cascade — both measured net-positive, don't remove |
 | nbody | 1.04 | flip-flops between runs; earlier: an invariant's spill pair per iteration (regalloc pressure) |
-| sieve | 1.03 | marking loop is instruction-tight; residual is elsewhere |
+| sieve | 1.02 | marking loop is instruction-tight; residual is elsewhere |
 | chars_ascii 0.57, tokenize 0.66, iterw 0.70, contains_rng 0.78, hashmap 0.88, sortw 0.90, fib 0.95 | | ahead |
+
+**Tried and parked** — `PLIRON_AMODESHARE` (aarch64 amode rules keep a
+multi-use `iadd` base whole instead of reg-reg decomposition; opt-in,
+default-off, `vendor/cranelift-codegen` patch #55). Strictly fewer
+insts (−290 reg-reg loads, +30 `ldp`/`stp` across the bench binary),
+but layout-controlled medians were mixed: sieve −6%, sortw +5%,
+hashmap +2.6%, parse_only ~0 — wins/losses track register-liveness
+shape, not inst count. Not enabled; revisit with a liveness-aware
+gate (same-block uses only, or max use-span) if a kernel needs it.
 
 x86-64 numbers are older (Windows box, geomean 1.028); re-measure there
 before working on x64-specific gaps.
