@@ -363,7 +363,7 @@ struct FnJob {
     id: FuncId,
     func: ir::Function,
     nonnull: FxHashSet<ir::Value>,
-    derived: FxHashMap<ir::Value, ir::Value>,
+    derived: pliron_clif_opt::vmap::VMap<ir::Value>,
     frozen: FxHashMap<ir::Value, u64>,
     noalias: FxHashSet<ir::Value>,
     deref: FxHashMap<ir::Value, (u64, bool)>,
@@ -936,7 +936,7 @@ pub fn lower_module<'a>(
             let id = hot_bodies.get(n).copied().unwrap_or(id);
             clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
             let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
-            let derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>;
+            let derived: pliron_clif_opt::vmap::VMap<cranelift_codegen::ir::Value>;
             let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
             let noalias: FxHashSet<cranelift_codegen::ir::Value>;
             let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
@@ -978,7 +978,7 @@ pub fn lower_module<'a>(
                     stubs: rustc_hash::FxHashSet::default(),
                     nonnull: FxHashSet::default(),
                     bool01: std::mem::take(&mut scratch.bool01),
-                    derived: FxHashMap::default(),
+                    derived: pliron_clif_opt::vmap::VMap::default(),
                     frozen: FxHashMap::default(),
                     noalias: FxHashSet::default(),
                     deref: FxHashMap::default(),
@@ -1756,7 +1756,7 @@ pub fn lower_clif_wasm(
                 stubs: rustc_hash::FxHashSet::default(),
                 nonnull: FxHashSet::default(),
                 bool01: std::mem::take(&mut scratch.bool01),
-                derived: FxHashMap::default(),
+                derived: pliron_clif_opt::vmap::VMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
                 deref: FxHashMap::default(),
@@ -2274,7 +2274,7 @@ struct FnLower<'a, 'b> {
     /// Results of `bool` loads known to be 0 or 1.
     bool01: FxHashSet<cranelift_codegen::ir::Value>,
     /// Inbounds GEP result → base (null only if the base is).
-    derived: FxHashMap<cranelift_codegen::ir::Value, cranelift_codegen::ir::Value>,
+    derived: pliron_clif_opt::vmap::VMap<cranelift_codegen::ir::Value>,
     /// Entry params pointing at frozen memory → dereferenceable bytes.
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
     /// Entry params rustc marks `noalias`.
