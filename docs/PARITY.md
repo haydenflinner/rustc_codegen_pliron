@@ -15,9 +15,9 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
 | wasm runtime (geomean, 16 kernels) | **1.045** | behind; 7 kernels behind by >5% |
 | wasm module size | 2.18 (206 KiB vs 94 KiB) | behind |
-| compile time: bench kernels, native | **0.98** (0.42 s vs 0.43 s) | at parity |
-| compile time: bench kernels, wasm | **2.56** (1.40 s vs 0.55 s) | behind |
-| compile time: regex-syntax (~40 kLOC) | **2.03** (3.08 s vs 1.52 s) | behind; was 6.57 before CGU jobs went parallel |
+| compile time: bench kernels, native | **0.87** (0.37 s vs 0.43 s) | ahead |
+| compile time: bench kernels, wasm | **1.74** (0.94 s vs 0.54 s) | behind |
+| compile time: regex-syntax (~40 kLOC) | **1.94** (2.93 s vs 1.51 s) | behind; was 6.57 before CGU jobs went parallel |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
