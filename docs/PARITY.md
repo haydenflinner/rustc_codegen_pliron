@@ -24,14 +24,16 @@ in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
 here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold +
 `NonNull`-i32 `PLIRON_NN_ANYINT` + `dem64` + `clifpeep`
 `ext_load`/`icmpk`/`addnorm`/`icmpred`/`bitmerge`/`post_sweep` +
-`divnarrow`/`ovfk`/`lih`/`band(uextend)`, `bench/wasm/run.sh`):
-**~1.01** — wins `chars_alpha` −34%, `iterw` −40%, `matmul` −8%,
-`eqbug` −11%, **`parse_only` +33→−14%** (`udiv`/`urem.i64`→i32 +
-`umul_overflow`→`imul`+`icmp` — the digit loop `%`/`/` was ~32 wasm
-ops/iter, now ~12); `chars_ascii` +35→**+9%**, `chars_mixed` +50→+39%,
-`strwork` +24→+16%, `hashmap`/`hmget` ~+21%, `tokenize` +29%, `fib`
-+9.5%, `nbody` +8% — residual is `next_code_point`/UTF-8 decode +
-`Option`/`Split`/`hash`/`waffle-emit` op count + spill-nonnull (below).
+`divnarrow`/`ovfk`/`lih`/`band(uextend)` + `selord` (bool-algebra over
+compare-outcome masks + `brif`/`sel` peels), `bench/wasm/run.sh`):
+**~0.995 — at parity** — wins `chars_alpha` −34%, `iterw` −40%,
+`matmul` −12%, `eqbug` −10%, `parse_only` −13%, `contains_rng` −1%;
+`chars_ascii` +35→+10%, `chars_mixed` +50→**+14%** (`unicode_data::`
+`lookup_slow` `Ordering`-decode → single `icmp`), `strwork` +16%,
+`hashmap`/`hmget` ~+21%, `tokenize` +29%, `fib` +10%, `nbody` +7%,
+`sortw`→**-2%**, `sieve` +1.5% — residuals are `Split`/`next_match`/
+`hash`/`memcpy` call-boundary + decode-loop peel + spill-nonnull
+(below).
 
 ## How to measure
 
