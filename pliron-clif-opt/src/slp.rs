@@ -26,12 +26,13 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
-use cranelift_codegen::entity::{EntityRef, SecondaryMap};
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{
     Block, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot, Type,
     Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 /// `v.index() -> insts that use v` (alias-resolved at build) over the
 /// pipeline's shared `uses::Uses` CSR snapshot (`Analysis::uses`) — one
@@ -147,31 +148,104 @@ enum Pack {
     },
 }
 
-/// Sentinel for insts outside the scanned block: `SecondaryMap` can't
-/// distinguish an unset entry from one set to the default, and real
-/// positions are always < the block's inst count.
+/// Sentinel for insts outside the scanned block.
 const NO_POS: usize = usize::MAX;
-/// Dense inst → index-in-block map; queried inside `col`/`sinkable` hot
-/// loops where a hash map costs ~10x an array index.
-type PosMap = SecondaryMap<Inst, usize>;
-/// Dense inst membership set for the current block's consumed insts.
-type TakenMap = SecondaryMap<Inst, bool>;
 
-fn block_pos(insts: &[Inst]) -> PosMap {
-    let mut pos = PosMap::with_default(NO_POS);
-    for (k, &i) in insts.iter().enumerate() {
-        pos[i] = k;
+/// Dense inst → index-in-block map for the current scan, reused across
+/// blocks via a generation tag: `load` costs O(block insts) instead of
+/// re-growing a `SecondaryMap` to the function's whole inst space per
+/// block — that was O(blocks × num_insts) traffic on megafunctions.
+/// Queried inside `col`/`sinkable` hot loops where a hash map costs
+/// ~10x an array index.
+struct PosMap {
+    /// `stamp[i] == cur` marks `val[i]` valid for the current scan.
+    stamp: Vec<u32>,
+    val: Vec<u32>,
+    cur: u32,
+}
+
+/// Dense inst membership set for consumed insts — same generation
+/// trick, scoped independently (xpack's `taken` outlives the per-round
+/// `pos` reloads).
+struct TakenMap {
+    stamp: Vec<u32>,
+    cur: u32,
+}
+
+impl PosMap {
+    fn new(func: &Function) -> Self {
+        let n = func.dfg.num_insts();
+        Self {
+            stamp: vec![0; n],
+            val: vec![0; n],
+            cur: 0,
+        }
     }
-    pos
+
+    /// Fresh frame: `insts` are the current block's insts in layout
+    /// order.
+    fn load(&mut self, insts: &[Inst]) {
+        self.cur = self.cur.wrapping_add(1);
+        if self.cur == 0 {
+            self.stamp.fill(0);
+        }
+        for (k, &i) in insts.iter().enumerate() {
+            self.set(i, k);
+        }
+    }
+
+    fn set(&mut self, i: Inst, k: usize) {
+        let x = i.index();
+        if x >= self.stamp.len() {
+            self.stamp.resize(x + 1, 0);
+            self.val.resize(x + 1, 0);
+        }
+        self.stamp[x] = self.cur;
+        self.val[x] = k as u32;
+    }
+
+    fn get(&self, i: Inst) -> Option<usize> {
+        let x = i.index();
+        (self.stamp.get(x) == Some(&self.cur)).then(|| self.val[x] as usize)
+    }
+}
+
+impl TakenMap {
+    fn new(func: &Function) -> Self {
+        Self {
+            stamp: vec![0; func.dfg.num_insts()],
+            cur: 0,
+        }
+    }
+
+    /// Retire every marked inst.
+    fn reset(&mut self) {
+        self.cur = self.cur.wrapping_add(1);
+        if self.cur == 0 {
+            self.stamp.fill(0);
+        }
+    }
+
+    fn is(&self, i: Inst) -> bool {
+        self.stamp.get(i.index()) == Some(&self.cur)
+    }
+
+    fn set(&mut self, i: Inst) {
+        let x = i.index();
+        if x >= self.stamp.len() {
+            self.stamp.resize(x + 1, 0);
+        }
+        self.stamp[x] = self.cur;
+    }
 }
 
 fn pos_get(pos: &PosMap, i: Inst) -> Option<usize> {
-    (pos[i] != NO_POS).then(|| pos[i])
+    pos.get(i)
 }
 
 #[track_caller]
 fn pos_at(pos: &PosMap, i: Inst) -> usize {
-    let p = pos[i];
+    let p = pos.get(i).unwrap_or(NO_POS);
     assert_ne!(p, NO_POS, "inst {i:?} is not in the scanned block");
     p
 }
@@ -403,7 +477,7 @@ pub(crate) fn base_off(func: &Function, ptr: Value) -> (Value, i64) {
 /// (`p + (i + k)*esz` vs `p + i*esz`) land in one group. `base_off`'s
 /// `iadd(ptr, iconst)` peel misses that shape once an `imul`-by-esz
 /// wraps the varying index, which is exactly what unrolled loops emit.
-type Lin = (Vec<(Value, i64)>, i64);
+type Lin = (SmallVec<[(Value, i64); 8]>, i64);
 
 /// `lin`'s recursion budget and term cap: real address expressions are a
 /// handful of adds deep; beyond that the form isn't a linear address.
@@ -411,11 +485,11 @@ const LIN_DEPTH: usize = 12;
 const LIN_TERMS: usize = 16;
 
 fn lin(func: &Function, v: Value) -> Option<Lin> {
-    let mut terms: Vec<(Value, i64)> = Vec::new();
+    let mut terms: SmallVec<[(Value, i64); 16]> = SmallVec::new();
     let mut k = 0i64;
     lin_add(func, v, 1, &mut terms, &mut k, 0)?;
     terms.sort_unstable();
-    let mut merged: Vec<(Value, i64)> = Vec::with_capacity(terms.len());
+    let mut merged: SmallVec<[(Value, i64); 8]> = SmallVec::with_capacity(terms.len());
     for (t, c) in terms {
         match merged.last_mut() {
             Some(&mut (lt, ref mut lc)) if lt == t => {
@@ -424,7 +498,7 @@ fn lin(func: &Function, v: Value) -> Option<Lin> {
             _ => merged.push((t, c)),
         }
     }
-    merged.retain(|&(_, c)| c != 0);
+    merged.retain(|e| e.1 != 0);
     Some((merged, k))
 }
 
@@ -434,7 +508,7 @@ fn lin_add(
     func: &Function,
     v: Value,
     mul: i64,
-    terms: &mut Vec<(Value, i64)>,
+    terms: &mut SmallVec<[(Value, i64); 16]>,
     k: &mut i64,
     depth: usize,
 ) -> Option<()> {
@@ -450,7 +524,7 @@ fn lin_add(
         terms.push((v, mul));
         return Some(());
     };
-    let leaf = |terms: &mut Vec<(Value, i64)>| {
+    let leaf = |terms: &mut SmallVec<[(Value, i64); 16]>| {
         terms.push((v, mul));
         Some(())
     };
@@ -670,7 +744,7 @@ struct StoreInfo {
     /// Raw address operand (`args[1]`) — the merged store's base value.
     arg: Value,
     /// Linear terms of `arg` — the group key.
-    key: Vec<(Value, i64)>,
+    key: SmallVec<[(Value, i64); 8]>,
     /// Constant part of `arg`'s linear form plus the inst offset — the
     /// byte offset within the group.
     off: i64,
@@ -696,6 +770,8 @@ fn try_block<'d>(
     _na: &FxHashSet<Value>,
     block: Block,
     x64: bool,
+    pos: &mut PosMap,
+    taken: &mut TakenMap,
 ) -> usize {
     let insts: Vec<Inst> = func.layout.block_insts(block).collect();
     // Collect scalar stores.
@@ -737,15 +813,15 @@ fn try_block<'d>(
     if stores.len() < 2 {
         return 0;
     }
-    let pos = block_pos(&insts);
+    pos.load(&insts);
     for s in &mut stores {
-        s.pos = pos_at(&pos, s.inst);
+        s.pos = pos_at(pos, s.inst);
     }
     // Group by (linear terms, elem type, flags); within each, find
     // consecutive-offset runs of exactly `16/esz` or `8/esz` lanes. A
     // Vec-scan over the few distinct keys beats cloning every store's
     // key into a map entry.
-    let mut by_key: Vec<(Vec<(Value, i64)>, Type, MemFlagsData, Vec<&StoreInfo>)> = Vec::new();
+    let mut by_key: Vec<(SmallVec<[(Value, i64); 8]>, Type, MemFlagsData, Vec<&StoreInfo>)> = Vec::new();
     for s in &stores {
         match by_key
             .iter_mut()
@@ -756,7 +832,7 @@ fn try_block<'d>(
         }
     }
     let mut changed = 0;
-    let mut taken = TakenMap::new();
+    taken.reset();
     for (_, _, _, g) in &mut by_key {
         g.sort_by_key(|s| s.off);
         let esz = i64::from(g[0].ty.bytes());
@@ -771,7 +847,7 @@ fn try_block<'d>(
             }
             let mut run: Vec<&StoreInfo> = Vec::new();
             for &s in g.iter() {
-                if taken[s.inst] {
+                if taken.is(s.inst) {
                     continue;
                 }
                 match run.last() {
@@ -792,7 +868,7 @@ fn try_block<'d>(
                     let plan = Ctx {
                         func: &*func,
                         domtree,
-                        pos: &pos,
+                        pos,
                         insts: &insts,
                         block,
                         emit,
@@ -822,7 +898,7 @@ fn try_block<'d>(
                         }
                         changed += run.len();
                         for s in &run {
-                            taken[s.inst] = true;
+                            taken.set(s.inst);
                         }
                     }
                     run.clear();
@@ -955,9 +1031,14 @@ pub fn run(
     // Re-borrow shared so `an.uses()` can run while `domtree` is held.
     let an = &*an;
     let domtree = an.domtree();
+    // Per-inst dense marks shared across blocks — see `PosMap`.
+    let mut pos = PosMap::new(func);
+    let mut taken = TakenMap::new(func);
     let mut changed = 0;
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        changed += try_block(func, domtree, an, &mut uses, &dead_set, na, block, x64);
+        changed += try_block(
+            func, domtree, an, &mut uses, &dead_set, na, block, x64, &mut pos, &mut taken,
+        );
     }
     // try_block's emits aren't recorded in the index (its own checks
     // never consult them — lane values are scalars it could re-pack,
@@ -974,7 +1055,17 @@ pub fn run(
         let mut ps = None;
         for block in func.layout.blocks().collect::<Vec<_>>() {
             changed += xpack_block(
-                func, &domtree, an, na, block, &mut uses, &dead_set, &mut ps, x64,
+                func,
+                &domtree,
+                an,
+                na,
+                block,
+                &mut uses,
+                &dead_set,
+                &mut ps,
+                x64,
+                &mut pos,
+                &mut taken,
             );
         }
     }
@@ -1596,7 +1687,7 @@ fn plan_pair(
             return None;
         }};
     }
-    if taken[ia] || taken[ib] {
+    if taken.is(ia) || taken.is(ib) {
         return None;
     }
     let op = func.dfg.insts[ia].opcode();
@@ -1968,7 +2059,7 @@ fn plan_store(
     Vec<(Value, usize, u8)>,
     FxHashSet<Inst>,
 )> {
-    if taken[i1] || taken[i2] {
+    if taken.is(i1) || taken.is(i2) {
         return None;
     }
     let (
@@ -2151,10 +2242,12 @@ fn xpack_block<'d>(
     dead_set: &'d std::cell::RefCell<FxHashSet<Inst>>,
     ps: &mut Option<FxHashMap<Value, Value>>,
     x64: bool,
+    pos: &mut PosMap,
+    taken: &mut TakenMap,
 ) -> usize {
     let mut total = 0;
     let mut tried = 0usize;
-    let mut taken = TakenMap::new();
+    taken.reset();
     // Pairs whose plan failed, → span at failure (current-frame
     // positions, refreshed each iteration so apply-time edits compare
     // in the same frame). A rescan after each apply only ever finds new
@@ -2176,7 +2269,7 @@ fn xpack_block<'d>(
         // blocks with few same-opcode insts.
         let mut byop: FxHashMap<Opcode, Vec<usize>> = FxHashMap::default();
         for (k, &i) in insts.iter().enumerate() {
-            if taken[i] {
+            if taken.is(i) {
                 continue;
             }
             let op = func.dfg.insts[i].opcode();
@@ -2191,7 +2284,7 @@ fn xpack_block<'d>(
         if nstores < 2 && !dup {
             return total;
         }
-        let pos = block_pos(&insts);
+        pos.load(&insts);
         // The index is function-wide and shared across blocks; an apply
         // mutates the IR, so the snapshot is dropped and refetched on
         // the next iteration — `an.uses` rebuilds when `num_insts`
@@ -2202,7 +2295,7 @@ fn xpack_block<'d>(
             dead: dead_set,
         });
         if !failed.is_empty() {
-            failed.retain(|&(x, y), span| match (pos_get(&pos, x), pos_get(&pos, y)) {
+            failed.retain(|&(x, y), span| match (pos_get(pos, x), pos_get(pos, y)) {
                 (Some(a), Some(b)) => {
                     *span = (a.min(b), a.max(b));
                     true
@@ -2240,7 +2333,7 @@ fn xpack_block<'d>(
         }
         let mut applied = None;
         'scan: for (p, &ia) in insts.iter().enumerate() {
-            if taken[ia] {
+            if taken.is(ia) {
                 continue;
             }
             let op = func.dfg.insts[ia].opcode();
@@ -2271,15 +2364,15 @@ fn xpack_block<'d>(
                     let ps = &*ps.get_or_insert_with(|| crate::loadfwd::param_src(func));
                     let plan = if is_store {
                         plan_store(
-                            func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64,
+                            func, ps, na, domtree, us, &insts, pos, block, taken, a, b, x64,
                         )
                     } else {
                         plan_pair(
-                            func, ps, na, domtree, us, &insts, &pos, block, &taken, a, b, x64,
+                            func, ps, na, domtree, us, &insts, pos, block, taken, a, b, x64,
                         )
                     };
                     if plan.is_none() && !is_store {
-                        if let (Some(a1), Some(b1)) = (pos_get(&pos, a), pos_get(&pos, b)) {
+                        if let (Some(a1), Some(b1)) = (pos_get(pos, a), pos_get(pos, b)) {
                             failed.insert((a, b), (a1.min(b1), a1.max(b1)));
                         }
                     }
@@ -2289,7 +2382,7 @@ fn xpack_block<'d>(
                 // which decides whether adjacent loads merge.
                 let plan = try_plan(ia, ib).or_else(|| try_plan(ib, ia));
                 if let Some((root, vt, kept, sink, dead, extracts, keep)) = plan {
-                    let emit_at = pos_at(&pos, ib).max(pos_at(&pos, ia));
+                    let emit_at = pos_at(pos, ib).max(pos_at(pos, ia));
                     applied = Some((emit_at, root, vt, kept, sink, dead, extracts, keep));
                     break 'scan;
                 }
@@ -2317,12 +2410,12 @@ fn xpack_block<'d>(
                     }
                 }
             }
-            taken[la] = true;
-            taken[lb] = true;
+            taken.set(la);
+            taken.set(lb);
         }
         for &u in sink.iter().chain(dead.iter()) {
             changed_insts.insert(u);
-            if let Some(d) = pos_get(&pos, u) {
+            if let Some(d) = pos_get(pos, u) {
                 changed_pos.push(d);
             }
             for &v in func.dfg.inst_args(u) {

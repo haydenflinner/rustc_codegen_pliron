@@ -4161,6 +4161,15 @@ pub fn run(
     // empty. Skip the rescan; `fold_null_tests` still gets a fresh nn.
     let mut round_quiet = false;
     let mut round_skips = 0usize;
+    // The nested `ifconv` is a full-function scan per round; its own
+    // rescan-to-fixpoint already converges, so rerunning it can only
+    // find diamonds that post-ifconv edits created — a `trivp`/`deadp`
+    // param removal changes an arm's edge-arg arity, `domcond` folds a
+    // `brif` into the `jump` that makes a block a pure forwarder, and
+    // `bypass`/`round` retarget edges. Track that: `ic_dirty` is set by
+    // any edit since the last nested ifconv, including that call's own
+    // `unreach` sweep (dead-pred removal can satisfy `edge_ok`).
+    let mut ic_dirty = true;
     for _ in 0..8 {
         let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
@@ -4215,8 +4224,11 @@ pub fn run(
         // Select-diamond if-conversion feeds back: folded forwarders expose
         // new diamonds and bypass_forwarders collapses the residue. The dead
         // side blocks keep phantom CFG edges (skewing dominance checks), so
-        // sweep them once unreachable.
-        let ic = if ifconv && sh & shape::CONDBR != 0 {
+        // sweep them once unreachable. Skipped on rounds where nothing
+        // since the last run could have made a new arm pure — `changed`
+        // covers the prefix param/param-delete phases.
+        let ic = if ifconv && sh & shape::CONDBR != 0 && (ic_dirty || changed || dc > 0) {
+            ic_dirty = false;
             crate::ifconv::run(
                 func,
                 derived,
@@ -4230,6 +4242,9 @@ pub fn run(
             changed = true;
             cd = None;
             remove_unreachable_blocks(func);
+            // The sweep's dead-pred removal can satisfy `edge_ok` for a
+            // diamond ifconv's own fixpoint couldn't reach.
+            ic_dirty = true;
         }
         check(func, "unreach");
         let bpn = if sh & shape::MULTI != 0 {
@@ -4241,8 +4256,9 @@ pub fn run(
         if bpn > 0 {
             changed = true;
             // Edge retargets invalidate the cached graph before `round`
-            // reads it.
+            // reads it — and can create pure forwarders ifconv wants.
             cd = None;
+            ic_dirty = true;
         }
         if prof {
             if pliron_cfg::tracing_on() {
@@ -4267,6 +4283,7 @@ pub fn run(
         }
         if rn > 0 {
             cd = None;
+            ic_dirty = true;
         }
         let n = dc + ic + bpn + rn;
         total += n;
