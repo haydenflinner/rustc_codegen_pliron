@@ -84,6 +84,26 @@ impl Typed for BlockArgument {
     }
 }
 
+/// PLIRON: block-arg source for [`crate::operation::PoolIter`] — the
+/// `block_arg_pool` span, mapped through [`BlockArgument::as_value`].
+#[derive(Clone, Copy)]
+struct ArgVal;
+impl<'a> crate::operation::PoolSrc<'a, Ptr<BasicBlock>> for ArgVal {
+    type Item = Value;
+    #[inline]
+    fn get(
+        ctx: &'a Context,
+        blk: Ptr<BasicBlock>,
+        span: OpSpan,
+        i: usize,
+    ) -> Option<Value> {
+        ctx.block_arg_pool
+            .borrow()
+            .get(span.off as usize + i)
+            .map(|e| e.as_value(blk))
+    }
+}
+
 /// [Operation]s contained in this [BasicBlock]
 #[derive(Default)]
 pub struct OpsInBlock {
@@ -256,12 +276,11 @@ impl BasicBlock {
 
     /// Get an iterator over the arguments
     pub fn arguments<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Value> + Clone + 'a {
-        let sp = self.self_ptr;
-        self.args_slice(ctx)
-            .iter()
-            .map(|arg| arg.as_value(sp))
-            .collect::<Vec<_>>()
-            .into_iter()
+        crate::operation::PoolIter::<ArgVal, Ptr<BasicBlock>>::new(
+            ctx,
+            self.self_ptr,
+            self.args,
+        )
     }
 
     /// Add an argument to the end of the argument list, returning its index.

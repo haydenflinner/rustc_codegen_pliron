@@ -166,11 +166,11 @@ impl LinkedList for Operation {
 }
 
 /// PLIRON: source selector for [`PoolIter`] — which context pool backs
-/// the span and how an element maps to the yielded item. `op` is the
-/// owning operation (for `as_value`/`as_use`).
-pub(crate) trait PoolSrc<'a>: Clone + Copy {
+/// the span and how an element maps to the yielded item. `O` is the
+/// owning entity (an op for results/operands, a block for args).
+pub(crate) trait PoolSrc<'a, O>: Clone + Copy {
     type Item;
-    fn get(ctx: &'a Context, op: Ptr<Operation>, span: OpSpan, i: usize) -> Option<Self::Item>;
+    fn get(ctx: &'a Context, owner: O, span: OpSpan, i: usize) -> Option<Self::Item>;
 }
 
 /// PLIRON: re-borrowing iterator over an entity pool span — no
@@ -179,20 +179,28 @@ pub(crate) trait PoolSrc<'a>: Clone + Copy {
 /// the iterator yields exactly what `collect::<Vec>().into_iter()`
 /// did, even if the operation is rewritten mid-iteration.
 #[derive(Clone)]
-pub(crate) struct PoolIter<'a, S: PoolSrc<'a>> {
+pub(crate) struct PoolIter<'a, S, O>
+where
+    S: PoolSrc<'a, O>,
+    O: Clone + Copy,
+{
     ctx: &'a Context,
-    op: Ptr<Operation>,
+    owner: O,
     span: OpSpan,
     front: u32,
     back: u32,
     _s: PhantomData<S>,
 }
 
-impl<'a, S: PoolSrc<'a>> PoolIter<'a, S> {
-    fn new(ctx: &'a Context, op: Ptr<Operation>, span: OpSpan) -> Self {
+impl<'a, S, O> PoolIter<'a, S, O>
+where
+    S: PoolSrc<'a, O>,
+    O: Clone + Copy,
+{
+    pub(crate) fn new(ctx: &'a Context, owner: O, span: OpSpan) -> Self {
         PoolIter {
             ctx,
-            op,
+            owner,
             span,
             front: 0,
             back: span.len,
@@ -201,14 +209,18 @@ impl<'a, S: PoolSrc<'a>> PoolIter<'a, S> {
     }
 }
 
-impl<'a, S: PoolSrc<'a>> Iterator for PoolIter<'a, S> {
+impl<'a, S, O> Iterator for PoolIter<'a, S, O>
+where
+    S: PoolSrc<'a, O>,
+    O: Clone + Copy,
+{
     type Item = S::Item;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.front >= self.back {
             return None;
         }
-        let it = S::get(self.ctx, self.op, self.span, self.front as usize);
+        let it = S::get(self.ctx, self.owner, self.span, self.front as usize);
         self.front += 1;
         it
     }
@@ -219,25 +231,39 @@ impl<'a, S: PoolSrc<'a>> Iterator for PoolIter<'a, S> {
     }
 }
 
-impl<'a, S: PoolSrc<'a>> DoubleEndedIterator for PoolIter<'a, S> {
+impl<'a, S, O> DoubleEndedIterator for PoolIter<'a, S, O>
+where
+    S: PoolSrc<'a, O>,
+    O: Clone + Copy,
+{
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.front >= self.back {
             return None;
         }
         self.back -= 1;
-        S::get(self.ctx, self.op, self.span, self.back as usize)
+        S::get(self.ctx, self.owner, self.span, self.back as usize)
     }
 }
 
-impl<'a, S: PoolSrc<'a>> ExactSizeIterator for PoolIter<'a, S> {}
-impl<'a, S: PoolSrc<'a>> core::iter::FusedIterator for PoolIter<'a, S> {}
+impl<'a, S, O> ExactSizeIterator for PoolIter<'a, S, O>
+where
+    S: PoolSrc<'a, O>,
+    O: Clone + Copy,
+{
+}
+impl<'a, S, O> core::iter::FusedIterator for PoolIter<'a, S, O>
+where
+    S: PoolSrc<'a, O>,
+    O: Clone + Copy,
+{
+}
 
 macro_rules! pool_src {
     ($name:ident, $item:ty, $pool:ident, $elem:ty, $map:expr) => {
         #[derive(Clone, Copy)]
-        struct $name;
-        impl<'a> PoolSrc<'a> for $name {
+        pub(crate) struct $name;
+        impl<'a> PoolSrc<'a, Ptr<Operation>> for $name {
             type Item = $item;
             #[inline]
             fn get(
@@ -300,6 +326,9 @@ pool_src!(
     Operand<Ptr<BasicBlock>>,
     |e, _ctx, op| e.as_use(op)
 );
+pool_src!(RegPtr, Ptr<Region>, op_region_pool, Ptr<Region>, |e, _ctx, _op| {
+    *e
+});
 
 impl Operation {
     /// Create a new, unlinked (i.e., not in a basic block) operation.
@@ -614,7 +643,7 @@ impl Operation {
 
     /// Get an iterator over the results of this operation.
     pub fn results<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Value> + Clone + 'a {
-        PoolIter::<ResVal>::new(ctx, self.self_ptr, self.results)
+        PoolIter::<ResVal, Ptr<Operation>>::new(ctx, self.self_ptr, self.results)
     }
 
     /// Add a result to the end of the result list, returning its index.
@@ -700,7 +729,7 @@ impl Operation {
         &self,
         ctx: &'a Context,
     ) -> impl Iterator<Item = TypeHandle> + Clone + 'a {
-        PoolIter::<ResTy>::new(ctx, self.self_ptr, self.results)
+        PoolIter::<ResTy, Ptr<Operation>>::new(ctx, self.self_ptr, self.results)
     }
 
     /// Get an iterator over the operand types of this operation.
@@ -708,7 +737,7 @@ impl Operation {
         &'a self,
         ctx: &'a Context,
     ) -> impl Iterator<Item = TypeHandle> + Clone {
-        PoolIter::<OpdTy>::new(ctx, self.self_ptr, self.operands)
+        PoolIter::<OpdTy, Ptr<Operation>>::new(ctx, self.self_ptr, self.operands)
     }
 
     /// Get number of operands.
@@ -728,7 +757,7 @@ impl Operation {
 
     /// Get an iterator over the operands of this operation.
     pub fn operands<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Value> + Clone + 'a {
-        PoolIter::<OpdVal>::new(ctx, self.self_ptr, self.operands)
+        PoolIter::<OpdVal, Ptr<Operation>>::new(ctx, self.self_ptr, self.operands)
     }
 
     /// Get an iterator over the operands of this operation as [`Use<Value>`]s.
@@ -736,7 +765,7 @@ impl Operation {
         &self,
         ctx: &'a Context,
     ) -> impl Iterator<Item = Use<Value>> + 'a {
-        PoolIter::<OpdUse>::new(ctx, self.self_ptr, self.operands)
+        PoolIter::<OpdUse, Ptr<Operation>>::new(ctx, self.self_ptr, self.operands)
     }
 
     /// PLIRON: replace the whole operand list in one rewrite. Pushing `defs`
@@ -891,7 +920,7 @@ impl Operation {
         &self,
         ctx: &'a Context,
     ) -> impl Iterator<Item = Ptr<BasicBlock>> + Clone + 'a {
-        PoolIter::<SuccBlk>::new(ctx, self.self_ptr, self.successors)
+        PoolIter::<SuccBlk, Ptr<Operation>>::new(ctx, self.self_ptr, self.successors)
     }
 
     /// Get an iterator over the successors of this operation as [`Use<Ptr<BasicBlock>>`]s.
@@ -899,7 +928,7 @@ impl Operation {
         &self,
         ctx: &'a Context,
     ) -> impl Iterator<Item = Use<Ptr<BasicBlock>>> + 'a {
-        PoolIter::<SuccUse>::new(ctx, self.self_ptr, self.successors)
+        PoolIter::<SuccUse, Ptr<Operation>>::new(ctx, self.self_ptr, self.successors)
     }
 
     /// PLIRON: `ptr`'s dispatch pair from the dense `ctx.op_kind`
@@ -1024,7 +1053,7 @@ impl Operation {
         &self,
         ctx: &'a Context,
     ) -> impl Iterator<Item = Ptr<Region>> + Clone + 'a {
-        self.regions_slice(ctx).to_vec().into_iter()
+        PoolIter::<RegPtr, Ptr<Operation>>::new(ctx, self.self_ptr, self.regions)
     }
 
     /// PLIRON: raw region-id slice borrowed from the context pool
