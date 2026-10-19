@@ -149,6 +149,18 @@ Next steps, in expected-payoff order:
    `NonNull` param-proof fixpoint persists across rounds as a bare
    `FxHashSet` with per-block eviction on retargets — dropped wholesale
    only on trivp/domcond/ifconv aliasing edits (jtround 612 → 528 ms).
+   Dense-storage pass: `vmap::EMap`/`ESet` are generation-stamped dense
+   entity-keyed maps/sets (`VMap`/`IMap`/`BMap` aliases) with O(1)
+   clear and insertion-order iteration; the long-lived probe-heavy
+   `proots` tables (`nf`/`canon`/`alias`/`affine`/`memo`) and
+   `Pipe::derived` migrated, `clifpeep`'s block-keyed bounds memos are
+   `BMap`/`BSet` and its `BoundsMap` chains share `Rc`s with COW on
+   mutation, `webmerge_ctx`'s per-block matrices and `slp`'s per-block
+   insts/stores buffers reuse caller-owned storage, and `WmCtx`
+   refreshes cfg/dom/edges in place on const_sweep rounds. bench
+   27.5 → 27.07 s; sparse per-edge/per-block scratch stays hashed
+   (dense tables pay O(entity-space) allocation, wrong for a few dozen
+   entries).
    Left: jumpthread ~3.8 s (a ~6-phase
    fixpoint; `round`'s threading walk is the residue — `domcond`
    ≈0.7 s, `deadp` ≈0.3 s by knob A/B),
