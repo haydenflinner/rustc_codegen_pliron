@@ -11,7 +11,7 @@ use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, Value, ValueDef};
+use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, StackSlot, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
 use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_module::FuncId;
@@ -159,7 +159,11 @@ pub struct Pipe<'a> {
     /// Loop passes scale budgets off it; `block_count` is the read path.
     pub prof: &'a FxHashMap<Block, u64>,
     pub region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
-    pub lifetimes: &'a mut Vec<(Value, Option<Inst>, Block, bool)>,
+    /// `llvm.lifetime.{start,end}` markers as (slots, anchor inst,
+    /// block, is_start). The operand pointer is resolved to slots at
+    /// lowering/`Facts` time — by slotmerge's point in the pipeline the
+    /// operand `Value` is typically dead, so it can't ride along.
+    pub lifetimes: &'a mut Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
     pub tcfg: TargetFrontendConfig,
     pub simd: bool,
@@ -189,6 +193,9 @@ pub struct Pipe<'a> {
     /// guard records the interval when it drops. `None` in tests.
     /// Type-erased so this crate stays free of `rustc_private`.
     pub prof_hook: Option<&'a (dyn Fn(&'static str) -> Box<dyn Send + 'a> + 'a)>,
+    /// Module-wide FuncId-indexed symbol table, for `PLIRON_CORPUS` name
+    /// maps. Empty outside the real backend.
+    pub fn_names: &'a [String],
 }
 
 impl Pipe<'_> {
@@ -763,9 +770,70 @@ fn corpus_dump(p: &mut Pipe) {
         self_name: Some(p.fname.to_string()),
         derived: Some(&*p.derived),
     };
+    // Extra replay facts `diffcheck-facts` can't express: the per-callee
+    // nocapture arg positions (a `(Inst, arg)` set on `Pipe`) re-keyed by
+    // funcref so they survive the round trip, and the FuncId -> symbol
+    // map so replays can report real callee names.
+    let f = &p.clctx.func;
+    let mut nc: Vec<String> = Vec::new();
+    for &(i, a) in p.nocap.iter() {
+        use cranelift_codegen::ir::instructions::CallInfo;
+        let info = f.dfg.insts[i].analyze_call(&f.dfg.value_lists, &f.dfg.exception_tables);
+        if let CallInfo::Direct(fr, _) | CallInfo::DirectWithSig(fr, _, _) = info {
+            nc.push(format!("fn{}:{a}", fr.index()));
+        }
+    }
+    nc.sort();
+    nc.dedup();
+    let mut names: Vec<String> = Vec::new();
+    for fr in f.dfg.ext_funcs.keys() {
+        if let cranelift_codegen::ir::ExternalName::User(u) = f.dfg.ext_funcs[fr].name {
+            let un = &f.params.user_named_funcs()[u];
+            if un.namespace == 0
+                && let Some(s) = p.fn_names.get(un.index as usize).filter(|s| !s.is_empty())
+            {
+                names.push(format!("fn{}:{s}", fr.index()));
+            }
+        }
+    }
+    names.sort();
+    // `lifetimes` anchors are `Inst`s, which have no textual name — emit
+    // the anchor's ordinal in layout order; the reader re-derives it.
+    let mut ord = FxHashMap::default();
+    let mut k = 0u32;
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            ord.insert(i, k);
+            k += 1;
+        }
+    }
+    let mut bord = FxHashMap::default();
+    for (k, b) in f.layout.blocks().enumerate() {
+        bord.insert(b, k as u32);
+    }
+    let lts: Vec<String> = p
+        .lifetimes
+        .iter()
+        .map(|(slots, a, b, s)| {
+            let a = a
+                .and_then(|i| ord.get(&i).copied())
+                .map(|o| format!("i{o}"))
+                .unwrap_or_default();
+            let b = bord.get(b).map(|o| format!("b{o}")).unwrap_or_default();
+            let ss = slots
+                .iter()
+                .map(|s| format!("s{}", s.index()))
+                .collect::<Vec<_>>()
+                .join("+");
+            format!("{ss}:{a}:{b}:{}", u8::from(*s))
+        })
+        .collect();
     let text = format!(
-        "{}{}",
+        "{}; diffcheck-nocap: {}\n; diffcheck-names: {}\n; diffcheck-lifetimes: {}\n{}",
         crate::diffcheck::facts_header(&p.clctx.func, &facts),
+        nc.join(","),
+        names.join(","),
+        lts.join(","),
         crate::diffcheck::clif_text(&p.clctx.func)
     );
     let name = crate::diffcheck::safe_name(p.fname);
@@ -2245,11 +2313,6 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         let v = v.clone();
         p.operand_frozen.insert(w, v);
     }
-    for lt in p.lifetimes.iter_mut() {
-        if lt.0 == d {
-            lt.0 = w;
-        }
-    }
 }
 
 fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
@@ -2400,7 +2463,9 @@ fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
 fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let stats = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO);
-    let before: u64 = stats
+    let smdbg = crate::config::tracing_on()
+        && tracing::enabled!(target: "pliron::slotmerge", tracing::Level::DEBUG);
+    let before: u64 = (stats || smdbg)
         .then(|| {
             p.clctx
                 .func
@@ -2411,6 +2476,16 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
         })
         .unwrap_or(0);
     let k = slotmerge::run(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap);
+    if smdbg {
+        let after: u64 = p
+            .clctx
+            .func
+            .sized_stack_slots
+            .values()
+            .map(|d| d.size as u64)
+            .sum();
+        tracing::debug!(target: "pliron::slotmerge", "slotmerge-fn {} merged={k} {before}->{after}B", p.fname);
+    }
     if stats {
         let after: u64 = p
             .clctx
@@ -3125,6 +3200,7 @@ mod tests {
             verify_full: false,
             stats: &mut stats,
             carry_log: Vec::new(),
+            fn_names: &[],
             cur_step: "",
         };
         // The buggy pair: a param's guarded nonnull onto the wider-scope

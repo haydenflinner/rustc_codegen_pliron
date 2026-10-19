@@ -21,18 +21,45 @@
 //! argument (the ABI forbids the callee retaining it) and any argument to
 //! a write-free callee (`nowrite`), which has nowhere to stash a pointer.
 
+use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
     ArgumentPurpose, Block, BlockArg, FuncRef, Function, Inst, InstructionData, Opcode, StackSlot,
-    Value, instructions::CallInfo,
+    Value, ValueDef, instructions::CallInfo,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
+/// Is `v` an `iconst` of literal zero? `coldargs` disguises its cold-arg
+/// rebinds as `umulhi x, 0` — a provable 0 whose result doesn't observe
+/// the operand's address at all.
+fn iconst_zero(func: &Function, v: Value) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return false;
+    };
+    match func.dfg.insts[i] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => {
+            let bits = func.dfg.value_type(v).bits();
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            (imm.bits() as u64) & mask == 0
+        }
+        _ => false,
+    }
+}
+
 // Worklist propagation of a slot-set map over a function: branch args
-// flow into destination params (try_call payloads inherit the call
-// args' union); every other inst's results take the union of its args'
-// sets. `wl`/`inq` are the caller's initial worklist.
+// flow into destination params (a try_call's *return* payload inherits
+// the call args' union); every other inst's results take the union of
+// its args' sets. `wl`/`inq` are the caller's initial worklist.
 fn propagate(
     func: &Function,
     users: &SecondaryMap<Value, Vec<Inst>>,
@@ -40,6 +67,7 @@ fn propagate(
     mut wl: VecDeque<Inst>,
     mut inq: FxHashSet<Inst>,
     contains: Option<&Vec<FxHashSet<StackSlot>>>,
+    skip_loads: bool,
 ) {
     while let Some(i) = wl.pop_front() {
         inq.remove(&i);
@@ -77,7 +105,13 @@ fn propagate(
                 for (k, ba) in bc.args(&func.dfg.value_lists).enumerate() {
                     let src: Vec<StackSlot> = match ba {
                         BlockArg::Value(v) => map[func.dfg.resolve_aliases(v)].clone(),
-                        BlockArg::TryCallRet(_) | BlockArg::TryCallExn(_) => call_slots.clone(),
+                        // A normal-return payload can be the arg pointer
+                        // itself (`fn(&T) -> &T`). The exception payload
+                        // can't: the unwinder's object is fresh memory,
+                        // and a pointer a callee could stash inside it
+                        // already escaped via the call's own arg handling.
+                        BlockArg::TryCallRet(_) => call_slots.clone(),
+                        BlockArg::TryCallExn(_) => Vec::new(),
                     };
                     if src.is_empty() {
                         continue;
@@ -106,6 +140,23 @@ fn propagate(
                     }
                 }
             }
+            continue;
+        }
+        // `umulhi x, 0` is a provable constant (coldargs' disguised-zero
+        // rebind): the result carries no address, so the arg's slots must
+        // not flow into it — otherwise the `iadd` rebind reads as
+        // ptr + ptr and escapes the slot anyway.
+        if func.dfg.insts[i].opcode() == Opcode::Umulhi
+            && func.dfg.inst_args(i).iter().any(|&a| iconst_zero(func, a))
+        {
+            continue;
+        }
+        // A load result is the pointee's bytes, not an address derived
+        // from the input: `derived` flow through loads is set precisely
+        // by the `contains` fixpoint instead of inheriting the source
+        // slot — otherwise plain data (`ushr`/`icmp` on a loaded word)
+        // would read as observing the source slot's address.
+        if skip_loads && func.dfg.insts[i].opcode().can_load() {
             continue;
         }
         let mut acc: Vec<StackSlot> = Vec::new();
@@ -139,28 +190,90 @@ fn propagate(
     }
 }
 
+/// Resolve a lifetime-marker operand to the slots it names, chasing
+/// pointer-affine defs (`stack_addr`, `iadd` rebase, `bitcast`). Run this
+/// where the operand is still live — mid-pipeline, the marker's `Value`
+/// may already have been folded away, and `derived` at slotmerge time
+/// would resolve to nothing.
+pub fn marker_slots(func: &Function, v: Value) -> Vec<StackSlot> {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+            return Vec::new();
+        };
+        if let InstructionData::StackAddr { stack_slot, .. } = func.dfg.insts[i] {
+            return vec![stack_slot];
+        }
+        match func.dfg.insts[i].opcode() {
+            Opcode::Iadd | Opcode::Bitcast => {
+                v = func.dfg.resolve_aliases(func.dfg.inst_args(i)[0]);
+            }
+            _ => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
 pub fn run(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
-    lifetimes: &[(Value, Option<Inst>, Block, bool)],
+    lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
     nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
     if func.sized_stack_slots.len() < 2 {
         return 0;
     }
 
-    // Intervals are measured in instruction positions (layout order), so
-    // slots used at disjoint points inside one block can still merge.
-    // `bpos`/`bfirst`/`blast` give each block's position range.
+    // Intervals are measured in instruction positions over a CFG
+    // reverse-postorder walk, not the final layout: cold blocks (shared
+    // landing pads) sink to the tail in layout, which would stretch
+    // every slot unwinding into them to function end — the same window
+    // LLVM's stack coloring measures before machine sinking. The
+    // exception edges of a `try_call` are CFG successors here, so a pad
+    // measures next to the calls that can unwind to it. `bpos`/`bfirst`/
+    // `blast` give each block's position range; `order` covers every
+    // block (unreachable ones append at the end).
+    let mut succ_map: SecondaryMap<Block, Vec<Block>> = SecondaryMap::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                succ_map[b].push(bc.block(&func.dfg.value_lists));
+            }
+        }
+    }
+    let mut order: Vec<Block> = Vec::with_capacity(func.layout.blocks().count());
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    if let Some(entry) = func.layout.entry_block() {
+        seen.insert(entry);
+        let mut stack = vec![(entry, 0usize)];
+        while let Some(&(b, ci)) = stack.last() {
+            if ci < succ_map[b].len() {
+                stack.last_mut().unwrap().1 += 1;
+                let s = succ_map[b][ci];
+                if seen.insert(s) {
+                    stack.push((s, 0));
+                }
+            } else {
+                order.push(b);
+                stack.pop();
+            }
+        }
+    }
+    order.reverse();
+    for b in func.layout.blocks() {
+        if seen.insert(b) {
+            order.push(b);
+        }
+    }
     let mut bpos = SecondaryMap::<Block, u32>::new();
     let mut bfirst = SecondaryMap::<Block, u32>::new();
     let mut blast = SecondaryMap::<Block, u32>::new();
     let mut ipos = SecondaryMap::<Inst, u32>::new();
-    let mut order: Vec<Block> = Vec::new();
     let mut next = 0u32;
-    for (i, b) in func.layout.blocks().enumerate() {
+    for (i, &b) in order.iter().enumerate() {
         bpos[b] = i as u32;
-        order.push(b);
         bfirst[b] = next;
         for i2 in func.layout.block_insts(b) {
             ipos[i2] = next;
@@ -213,7 +326,7 @@ pub fn run(
             wl.push_back(i);
         }
     }
-    propagate(func, &users, &mut derived, wl, inq, None);
+    propagate(func, &users, &mut derived, wl, inq, None, true);
 
     // `from_bytes` seeds: every load's results carry the byte image of
     // the slot its address derives from — an aggregate copy moves
@@ -240,13 +353,21 @@ pub fn run(
             wl.push_back(i);
         }
     }
-    propagate(func, &users, &mut from_bytes, wl, inq, None);
+    propagate(func, &users, &mut from_bytes, wl, inq, None, false);
 
     // Per-slot use positions and live interval [lo, hi] (`u32::MAX` hi is
     // normalized to `last` afterwards).
     let nslots = func.sized_stack_slots.len();
     let mut iv: Vec<(u32, u32)> = vec![(u32::MAX, 0); nslots];
     let mut uses: Vec<Vec<u32>> = vec![Vec::new(); nslots];
+    // Per-slot byte accesses. `reads` can observe stored bytes; `writes`
+    // definitely store them. A backward-edge span must stretch the
+    // interval of a slot whose bytes can be live across trips — reads in
+    // the span not dominated by an in-span write — but a slot every
+    // in-span read of which is dominated by an in-span write is
+    // re-initialized each trip, so its plain use window already suffices.
+    let mut reads: Vec<Vec<Inst>> = vec![Vec::new(); nslots];
+    let mut writes: Vec<Vec<Inst>> = vec![Vec::new(); nslots];
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::slotmerge", tracing::Level::DEBUG);
     let mut esc: Vec<(StackSlot, Inst)> = Vec::new();
@@ -260,33 +381,46 @@ pub fn run(
     // experiments.
     let mut marked = vec![false; nslots];
     if crate::env_set("PLIRON_SLOTMERGE_MARK") {
-        for &(v, _, _, _) in lifetimes {
-            let ds = &derived[func.dfg.resolve_aliases(v)];
-            // A marker operand naming exactly one slot is that storage's
-            // window; a unioned (phi-derived) operand can't be trusted as a
+        let (mut single, mut multi, mut none) = (0u32, 0u32, 0u32);
+        for (ds, _, _, _) in lifetimes {
+            // A marker naming exactly one slot is that storage's window;
+            // a unioned (phi-derived) operand can't be trusted as a
             // per-slot bound, so ambiguous markers mark nothing.
-            if let &[s] = ds.as_slice()
-                && s.index() < nslots
-            {
-                marked[s.index()] = true;
+            match ds.as_slice() {
+                &[s] if s.index() < nslots => {
+                    marked[s.index()] = true;
+                    single += 1;
+                }
+                [] => none += 1,
+                _ => multi += 1,
             }
         }
+        if crate::env_set("PLIRON_SM_INFO") {
+            eprintln!("sm-info: markers: {single} singleton {multi} union {none} empty");
+        }
     }
+    // An escaped slot can never fold: its address reached an opaque
+    // sink, so sharing storage with anything could flip a retained
+    // pointer's identity — interval disjointness can't rule that out.
+    let mut escaped = vec![false; nslots];
     macro_rules! escape {
         ($s:expr, $i:expr) => {{
             if !marked[$s.index()] {
                 iv[$s.index()].1 = u32::MAX;
-                if dbg {
+                escaped[$s.index()] = true;
+                if dbg || crate::env_set("PLIRON_SM_INFO") {
                     esc.push(($s, $i));
                 }
             }
         }};
     }
     // Escaping a pointer to `s` exposes `s`'s bytes — including pointers
-    // stored inside it — to whoever holds the escapee. Escape the whole
-    // contains-reach.
+    // stored inside it — to whoever holds the escapee. Escape `s` and
+    // the whole contains-reach. (`contains` no longer self-seeds, so the
+    // subject is escaped explicitly here.)
     macro_rules! escape_deep {
         ($c:expr, $s:expr, $i:expr) => {{
+            escape!($s, $i);
             for s2 in $c[$s.index()].clone() {
                 escape!(s2, $i);
             }
@@ -302,11 +436,10 @@ pub fn run(
     // contained in src are now contained in dst as well.
     let mut cpy: FxHashSet<(StackSlot, StackSlot)> = FxHashSet::default();
     // contains[d] = slots a pointer reloaded out of d's bytes may name:
-    // d itself, every slot whose pointer was stored into d, and the
-    // closure through byte-copies.
-    let mut contains: Vec<FxHashSet<StackSlot>> = (0..nslots)
-        .map(|s| [StackSlot::from_u32(s as u32)].into_iter().collect())
-        .collect();
+    // every slot whose pointer was stored into d (d itself only via an
+    // actual self-store), and the closure through byte-copies.
+    let mut contains: Vec<FxHashSet<StackSlot>> =
+        (0..nslots).map(|_| FxHashSet::default()).collect();
 
     // The prepass edges are built from `derived`, and `derived` gains
     // entries once load results resolve through `contains` — a reloaded
@@ -327,10 +460,9 @@ pub fn run(
                         .unwrap_or(&[])
                 };
                 if op.is_call() {
-                    let info =
-                        d.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables);
-                    if let CallInfo::Direct(fr, cargs)
-                    | CallInfo::DirectWithSig(fr, _, cargs) = info
+                    let info = d.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables);
+                    if let CallInfo::Direct(fr, cargs) | CallInfo::DirectWithSig(fr, _, cargs) =
+                        info
                     {
                         use cranelift_codegen::ir::{ExternalName, LibCall};
                         if cargs.len() >= 2
@@ -359,9 +491,9 @@ pub fn run(
                             let dst: Vec<StackSlot> = aslot(1).to_vec();
                             for &s in aslot(0) {
                                 for &d2 in &dst {
-                                    if s != d2 {
-                                        grew += edges.insert((s, d2)) as usize;
-                                    }
+                                    // A self-store (s == d2) is real: the
+                                    // slot's bytes then name the slot.
+                                    grew += edges.insert((s, d2)) as usize;
                                 }
                             }
                             for &s in &from_bytes[func.dfg.resolve_aliases(args[0])] {
@@ -377,13 +509,10 @@ pub fn run(
                             for k in 1..args.len() {
                                 for &s in aslot(k) {
                                     for &d2 in &dst {
-                                        if s != d2 {
-                                            grew += edges.insert((s, d2)) as usize;
-                                        }
+                                        grew += edges.insert((s, d2)) as usize;
                                     }
                                 }
-                                for &s in &from_bytes[func.dfg.resolve_aliases(args[k])]
-                                {
+                                for &s in &from_bytes[func.dfg.resolve_aliases(args[k])] {
                                     for &d2 in &dst {
                                         if s != d2 {
                                             grew += cpy.insert((s, d2)) as usize;
@@ -431,11 +560,11 @@ pub fn run(
                 let Some(&a) = func.dfg.inst_args(i).first() else {
                     continue;
                 };
+                // The loaded bytes name the slots stored into the
+                // pointee — not the pointee itself, unless it was
+                // actually self-stored (`contains` doesn't self-seed).
                 let mut acc: Vec<StackSlot> = Vec::new();
                 for &s0 in &derived[func.dfg.resolve_aliases(a)] {
-                    if !acc.contains(&s0) {
-                        acc.push(s0);
-                    }
                     for &s in &contains[s0.index()] {
                         if !acc.contains(&s) {
                             acc.push(s);
@@ -462,7 +591,7 @@ pub fn run(
                 }
             }
         }
-        propagate(func, &users, &mut derived, wl2, inq2, Some(&contains));
+        propagate(func, &users, &mut derived, wl2, inq2, Some(&contains), true);
         if grew == 0 {
             break;
         }
@@ -505,6 +634,7 @@ pub fn run(
                             for k in 0..args.len() {
                                 for &s in arg_slots(k) {
                                     use_at(&mut iv, &mut uses, s, pos);
+                                    reads[s.index()].push(i);
                                     escape_deep!(contains, s, i);
                                 }
                             }
@@ -546,8 +676,23 @@ pub fn run(
                                             | ExternalName::LibCall(LibCall::Memset)
                                     );
                                     for (k, &a) in cargs.iter().enumerate() {
-                                        for &s in &derived[func.dfg.resolve_aliases(a)] {
+                                        let ds = derived[func.dfg.resolve_aliases(a)].clone();
+                                        for &s in &ds {
                                             use_at(&mut iv, &mut uses, s, pos);
+                                        }
+                                        // A mem* dst arg definitely writes
+                                        // its (single) pointee; other args
+                                        // may observe stale bytes.
+                                        if nokeep && k == 0 {
+                                            if let &[s] = ds.as_slice() {
+                                                writes[s.index()].push(i);
+                                            }
+                                        } else {
+                                            for &s in &ds {
+                                                reads[s.index()].push(i);
+                                            }
+                                        }
+                                        for &s in &ds {
                                             // rustc's captures(none): the
                                             // callee can't retain the
                                             // pointer past the call.
@@ -565,6 +710,7 @@ pub fn run(
                                     for (k, &a) in cargs.iter().enumerate() {
                                         for &s in &derived[func.dfg.resolve_aliases(a)] {
                                             use_at(&mut iv, &mut uses, s, pos);
+                                            reads[s.index()].push(i);
                                             if !nocap.contains(&(i, k as u32)) {
                                                 escape_deep!(contains, s, i);
                                             }
@@ -607,6 +753,12 @@ pub fn run(
                                     escape_deep!(contains, s, i);
                                 }
                             }
+                            // `store` through a pointer that can only
+                            // name `s` is a definite write of `s`'s
+                            // bytes; a maybe-pointer can't reinit.
+                            if let &[s] = arg_slots(1) {
+                                writes[s.index()].push(i);
+                            }
                             for &s in arg_slots(1) {
                                 use_at(&mut iv, &mut uses, s, pos);
                             }
@@ -616,6 +768,7 @@ pub fn run(
                             let dst: Vec<StackSlot> = arg_slots(0).to_vec();
                             for &s in &dst {
                                 use_at(&mut iv, &mut uses, s, pos);
+                                reads[s.index()].push(i);
                             }
                             for k in 1..args.len() {
                                 for &s in arg_slots(k) {
@@ -625,8 +778,7 @@ pub fn run(
                                     }
                                 }
                                 if dst.is_empty() {
-                                    for &s in &from_bytes[func.dfg.resolve_aliases(args[k])]
-                                    {
+                                    for &s in &from_bytes[func.dfg.resolve_aliases(args[k])] {
                                         escape_deep!(contains, s, i);
                                     }
                                 }
@@ -636,6 +788,7 @@ pub fn run(
                             for k in 0..args.len() {
                                 for &s in arg_slots(k) {
                                     use_at(&mut iv, &mut uses, s, pos);
+                                    reads[s.index()].push(i);
                                     escape!(s, i);
                                 }
                             }
@@ -644,6 +797,7 @@ pub fn run(
                 } else if op.can_load() {
                     for &s in arg_slots(0) {
                         use_at(&mut iv, &mut uses, s, pos);
+                        reads[s.index()].push(i);
                     }
                     for k in 1..args.len() {
                         for &s in arg_slots(k) {
@@ -655,6 +809,7 @@ pub fn run(
                     for k in 0..args.len() {
                         for &s in arg_slots(k) {
                             use_at(&mut iv, &mut uses, s, pos);
+                            reads[s.index()].push(i);
                             escape_deep!(contains, s, i);
                         }
                     }
@@ -677,6 +832,10 @@ pub fn run(
                         // data — an identity observation.
                         Opcode::Iadd => arg_slots(0).is_empty() || arg_slots(1).is_empty(),
                         Opcode::Isub => arg_slots(1).is_empty(),
+                        // `umulhi x, 0` is a constant — the result
+                        // doesn't observe the operand's address
+                        // (coldargs' disguised-zero rebind).
+                        Opcode::Umulhi => args.iter().any(|&a| iconst_zero(func, a)),
                         _ => false,
                     };
                     if !affine {
@@ -698,22 +857,22 @@ pub fn run(
     // fall back to the block's start, and if the block itself left the
     // layout drop the marker — real byte-uses still bound the interval.
     let in_layout: FxHashSet<Block> = order.iter().copied().collect();
-    for &(v, anchor, b, start) in lifetimes {
+    for (slots, anchor, b, start) in lifetimes {
         let pos = match anchor {
-            Some(i) if func.layout.inst_block(i).is_some() => {
+            &Some(i) if func.layout.inst_block(i).is_some() => {
                 // The marker sits between `i` and the next inst: a start
                 // marker is live from the next position, an end marker's
                 // last live point is `i` itself.
-                if start {
+                if *start {
                     (ipos[i] + 1).min(last)
                 } else {
                     ipos[i]
                 }
             }
-            _ if in_layout.contains(&b) => bfirst[b],
+            _ if in_layout.contains(b) => bfirst[*b],
             _ => continue,
         };
-        for &s in &derived[func.dfg.resolve_aliases(v)] {
+        for &s in slots {
             if s.index() < nslots {
                 use_at(&mut iv, &mut uses, s, pos);
             }
@@ -726,8 +885,11 @@ pub fn run(
         }
     }
 
-    // A backward edge lets a path re-enter an earlier region, so any slot
-    // used inside the edge's layout span stays live across the whole span.
+    // A backward edge lets a path re-enter an earlier region. A slot
+    // whose in-span reads can observe bytes written on an earlier trip —
+    // any read not dominated by an in-span write of the same slot —
+    // stays live across the whole span. Slot addresses are fixed, so a
+    // carried pointer alone doesn't force this; only stale data does.
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for &b in &order {
         for i in func.layout.block_insts(b) {
@@ -737,18 +899,50 @@ pub fn run(
                 let v = bc.block(&func.dfg.value_lists);
                 if bpos[v] < bpos[b] {
                     spans.push((bfirst[v], blast[b]));
+                    if crate::env_set("PLIRON_SM_INFO") {
+                        eprintln!(
+                            "sm-info: backedge {b}->{v} span=({},{})",
+                            bfirst[v], blast[b]
+                        );
+                    }
                 }
             }
         }
     }
-    for (s, e) in iv.iter_mut().enumerate() {
-        if marked[s] {
-            continue;
-        }
-        for &(lo, hi) in &spans {
-            if uses[s].iter().any(|&p| lo <= p && p <= hi) {
-                e.0 = e.0.min(lo);
-                e.1 = e.1.max(hi);
+    if crate::env_set("PLIRON_SM_INFO") {
+        let mut big: Vec<(u32, u32)> = spans.clone();
+        big.sort();
+        big.dedup();
+        big.sort_by_key(|&(lo, hi)| hi - lo);
+        eprintln!(
+            "sm-info: {} backedge spans, widest: {:?}",
+            spans.len(),
+            big.iter().rev().take(6).collect::<Vec<_>>()
+        );
+    }
+    if !spans.is_empty() {
+        let cfg = ControlFlowGraph::with_function(func);
+        let dt = DominatorTree::with_function(func, &cfg);
+        for (s, e) in iv.iter_mut().enumerate() {
+            if marked[s] {
+                continue;
+            }
+            for &(lo, hi) in &spans {
+                if !uses[s].iter().any(|&p| lo <= p && p <= hi) {
+                    continue;
+                }
+                let fresh = reads[s].iter().all(|&r| {
+                    let rp = ipos[r];
+                    !(lo <= rp && rp <= hi)
+                        || writes[s].iter().any(|&w| {
+                            let wp = ipos[w];
+                            lo <= wp && wp <= hi && dt.dominates(w, r, &func.layout)
+                        })
+                });
+                if !fresh {
+                    e.0 = e.0.min(lo);
+                    e.1 = e.1.max(hi);
+                }
             }
         }
     }
@@ -783,6 +977,17 @@ pub fn run(
     }
 
     if dbg {
+        let mut cc: Vec<(usize, usize)> = contains
+            .iter()
+            .enumerate()
+            .map(|(s, c)| (s, c.len()))
+            .filter(|&(_, n)| n > 4)
+            .collect();
+        cc.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::slotmerge", "slotmerge: biggest contains: {:?}",
+                cc.iter().take(8).map(|&(s, n)| (StackSlot::from_u32(s as u32), n)).collect::<Vec<_>>())
+        };
         for s in 0..nslots {
             let s = StackSlot::from_u32(s as u32);
             if pliron_cfg::tracing_on() {
@@ -801,10 +1006,78 @@ pub fn run(
             };
         }
     }
+    if crate::env_set("PLIRON_SM_INFO") {
+        let mut unbounded = 0;
+        let mut bounded = 0;
+        let mut whole = 0;
+        for e in &iv {
+            if e.0 == u32::MAX {
+                unbounded += 1;
+            } else {
+                bounded += 1;
+                if e.0 <= 1 && e.1 + 64 >= last {
+                    whole += 1;
+                }
+            }
+        }
+        eprintln!(
+            "sm-info: {nslots} slots: {bounded} bounded ({whole} whole-fn), \
+             {unbounded} unused, {} escaped, {} marked",
+            escaped.iter().filter(|&&x| x).count(),
+            marked.iter().filter(|&&x| x).count(),
+        );
+        let mut hist: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        for (s, e) in iv.iter().enumerate() {
+            if e.0 != u32::MAX && escaped[s] {
+                *hist.entry((e.0 / 5000, e.1 / 5000)).or_default() += 1;
+            }
+        }
+        let mut h: Vec<_> = hist.iter().collect();
+        h.sort_by_key(|&(_, n)| std::cmp::Reverse(*n));
+        eprintln!("sm-info: escaped-slot interval buckets (lo,hi)/5k: {h:?}");
+        let mut hist2: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut spanb = vec![0u64; 8];
+        for (s, e) in iv.iter().enumerate() {
+            if e.0 != u32::MAX && !escaped[s] {
+                *hist2.entry(e.1 - e.0).or_default() += 1;
+                let span = e.1 - e.0;
+                let b = match span {
+                    0..=63 => 0,
+                    64..=255 => 1,
+                    256..=1023 => 2,
+                    1024..=4095 => 3,
+                    4096..=16383 => 4,
+                    _ => 5,
+                };
+                spanb[b] += 1;
+            }
+        }
+        let mut h2: Vec<_> = hist2.iter().map(|(&k, &n)| (k, n)).collect();
+        h2.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        eprintln!(
+            "sm-info: bounded interval lens (top10): {:?} span-hist: {spanb:?} last={last}",
+            h2.iter().take(10).collect::<Vec<_>>()
+        );
+        let mut ops: FxHashMap<String, u32> = FxHashMap::default();
+        for &(_, i) in &esc {
+            *ops.entry(func.dfg.insts[i].opcode().to_string())
+                .or_default() += 1;
+        }
+        let mut opv: Vec<_> = ops.into_iter().collect();
+        opv.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        eprintln!("sm-info: escape insts by opcode: {opv:?}");
+        for &(s, i) in esc.iter().take(8) {
+            eprintln!(
+                "sm-info:   {s} escapes at {}: {}",
+                func.layout.inst_block(i).unwrap(),
+                func.dfg.display_inst(i)
+            );
+        }
+    }
     // Greedy interval coloring, best-fit by region size.
     let mut cand: Vec<(u32, StackSlot)> = (0..nslots)
         .map(|s| StackSlot::from_u32(s as u32))
-        .filter(|&s| iv[s.index()].0 != u32::MAX)
+        .filter(|&s| iv[s.index()].0 != u32::MAX && !escaped[s.index()])
         .map(|s| (iv[s.index()].0, s))
         .collect();
     cand.sort();
@@ -837,6 +1110,10 @@ pub fn run(
                 regions.push((hi, size, align, s));
             }
         }
+    }
+    if crate::env_set("PLIRON_SM_INFO") {
+        let ncand = rep.len();
+        eprintln!("sm-info: merge: {ncand} cand -> {} regions", regions.len());
     }
 
     // Rewrite `stack_addr`s onto representatives; grow each rep to its

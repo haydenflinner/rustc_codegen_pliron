@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cranelift_codegen::Context;
+use cranelift_codegen::entity::EntityRef as _;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::Configurable;
@@ -91,9 +92,7 @@ fn main() -> ExitCode {
             bad == 0
         }
         ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
-        ["bench", dir, reps] => {
-            bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps"))
-        }
+        ["bench", dir, reps] => bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps")),
         _ => {
             eprintln!(
                 "{}",
@@ -207,10 +206,32 @@ fn with_pipe<R>(
         rustc_hash::FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
         _,
     ) = Default::default();
-    // CLIFCHECK_NOCAP_ALL=1 marks every call operand bounded — the real
-    // nocap set comes from MIR-level attrs and isn't serializable, so
-    // replays that need it opt in explicitly.
-    if std::env::var("CLIFCHECK_NOCAP_ALL").is_ok() {
+    // A `; diffcheck-nocap:` header (PLIRON_CORPUS dumps) records the real
+    // per-callee bounded arg positions; CLIFCHECK_NOCAP_ALL=1 marks every
+    // call operand bounded for dumps without one.
+    use cranelift_codegen::ir::instructions::CallInfo;
+    if !facts.nocap.is_empty() {
+        let set: rustc_hash::FxHashSet<(u32, u32)> = facts
+            .nocap
+            .iter()
+            .map(|(r, a)| (r.index() as u32, *a))
+            .collect();
+        for b in clctx.func.layout.blocks() {
+            for i in clctx.func.layout.block_insts(b) {
+                let info = clctx.func.dfg.insts[i].analyze_call(
+                    &clctx.func.dfg.value_lists,
+                    &clctx.func.dfg.exception_tables,
+                );
+                if let CallInfo::Direct(fr, cargs) | CallInfo::DirectWithSig(fr, _, cargs) = info {
+                    for k in 0..cargs.len() {
+                        if set.contains(&(fr.index() as u32, k as u32)) {
+                            e7.insert((i, k as u32));
+                        }
+                    }
+                }
+            }
+        }
+    } else if std::env::var("CLIFCHECK_NOCAP_ALL").is_ok() {
         use cranelift_codegen::ir::Opcode;
         for b in clctx.func.layout.blocks() {
             for i in clctx.func.layout.block_insts(b) {
@@ -231,7 +252,7 @@ fn with_pipe<R>(
         facts.noalias.clone(),
         facts.deref.clone(),
         Default::default(),
-        Vec::new(),
+        facts.lifetimes(&clctx.func),
     );
     let mut p = Pipe {
         clctx: &mut clctx,
@@ -254,6 +275,7 @@ fn with_pipe<R>(
         region_parent: &e6,
         lifetimes: &mut lifetimes,
         nocap: &e7,
+        fn_names: &[],
         tcfg: isa.frontend_config(),
         simd: true,
         x64,

@@ -29,8 +29,8 @@ use std::sync::Once;
 
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{
-    self, BlockArg, ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, InstructionData,
-    LibCall, MemFlagsData, Opcode, SigRef, StackSlot, Type, Value, types,
+    self, Block, BlockArg, ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, Inst,
+    InstructionData, LibCall, MemFlagsData, Opcode, SigRef, StackSlot, Type, Value, types,
 };
 use cranelift_interpreter::address::{Address, AddressFunctionEntry, AddressRegion, AddressSize};
 use cranelift_interpreter::frame::Frame;
@@ -1132,9 +1132,7 @@ fn stub(
                     }
                     let rel = (d % s.frame_size) / 0x1000;
                     let in_off = (d % s.frame_size) % 0x1000;
-                    let Some((slot, _)) =
-                        s.func.sized_stack_slots.iter().nth(rel as usize)
-                    else {
+                    let Some((slot, _)) = s.func.sized_stack_slots.iter().nth(rel as usize) else {
                         continue;
                     };
                     let sz = s.func.sized_stack_slots[slot].size as u64;
@@ -1395,6 +1393,17 @@ pub struct OwnedFacts {
     pub nowrite: FxHashMap<FuncRef, bool>,
     pub self_name: Option<String>,
     pub derived: FxHashMap<Value, Value>,
+    /// `(FuncRef, arg-index)` pairs a `; diffcheck-nocap:` header records;
+    /// applied to every direct callsite of that callee on replay.
+    pub nocap: Vec<(FuncRef, u32)>,
+    /// `FuncRef -> callee symbol` from a `; diffcheck-names:` header.
+    pub names: Vec<(FuncRef, String)>,
+    /// `; diffcheck-lifetimes:` markers as `(slots, anchor inst
+    /// layout-ordinal, block index, is-start)`. Slots are stored as
+    /// `StackSlot` indices — the operand `Value` is resolved to slots at
+    /// dump time, before the pipeline can fold it away. Resolve inst/block
+    /// ordinals against the parsed `Function` with [`Self::lifetimes`].
+    pub lifetimes: Vec<(Vec<u32>, Option<u32>, u32, bool)>,
 }
 
 impl OwnedFacts {
@@ -1410,10 +1419,76 @@ impl OwnedFacts {
         }
     }
 
-    /// Parse the `; diffcheck-facts:` line `facts_header` writes; absent
-    /// means no facts.
+    /// Rebuild `Pipe::lifetimes` from the parsed ordinals: positions are
+    /// layout ordinals (the reader numbers entities in text order), and a
+    /// missing anchor or stale block degrades to the block fallback like a
+    /// deleted-anchor marker does.
+    pub fn lifetimes(&self, f: &Function) -> Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)> {
+        let mut iords: Vec<Inst> = Vec::new();
+        let mut bords: Vec<Block> = Vec::new();
+        for b in f.layout.blocks() {
+            bords.push(b);
+            iords.extend(f.layout.block_insts(b));
+        }
+        self.lifetimes
+            .iter()
+            .filter_map(|(ss, a, b, s)| {
+                let a = a.and_then(|o| iords.get(o as usize).copied());
+                let b = bords.get(*b as usize).copied()?;
+                let ss = ss
+                    .iter()
+                    .map(|&s| StackSlot::from_u32(s))
+                    .filter(|s| s.index() < f.sized_stack_slots.len())
+                    .collect();
+                Some((ss, a, b, *s))
+            })
+            .collect()
+    }
+
+    /// Parse the `; diffcheck-facts:` line `facts_header` writes (plus the
+    /// optional `; diffcheck-nocap:`/`; diffcheck-names:` companions a
+    /// `PLIRON_CORPUS` dump adds); absent means no facts.
     pub fn parse(text: &str) -> Self {
         let mut out = Self::default();
+        let fref = |s: &str| -> Option<FuncRef> {
+            s.strip_prefix("fn")?.parse().ok().map(FuncRef::from_u32)
+        };
+        for line in text.lines() {
+            if let Some(list) = line.strip_prefix("; diffcheck-nocap:") {
+                for item in list.split(',').filter(|x| !x.is_empty()) {
+                    if let Some((f, a)) = item.trim().split_once(':')
+                        && let (Some(r), Ok(a)) = (fref(f), a.parse())
+                    {
+                        out.nocap.push((r, a));
+                    }
+                }
+            } else if let Some(list) = line.strip_prefix("; diffcheck-names:") {
+                for item in list.split(',').filter(|x| !x.is_empty()) {
+                    if let Some((f, n)) = item.split_once(':')
+                        && let Some(r) = fref(f)
+                    {
+                        out.names.push((r, n.to_string()));
+                    }
+                }
+            } else if let Some(list) = line.strip_prefix("; diffcheck-lifetimes:") {
+                for item in list.split(',').filter(|x| !x.is_empty()) {
+                    let p: Vec<&str> = item.trim().split(':').collect();
+                    if p.len() == 4
+                        && let (Some(b), Ok(s)) = (
+                            p[2].strip_prefix('b').and_then(|n| n.parse::<u32>().ok()),
+                            p[3].parse::<u8>(),
+                        )
+                    {
+                        let ss: Vec<u32> = p[0]
+                            .split('+')
+                            .filter_map(|t| t.strip_prefix('s').and_then(|n| n.parse().ok()))
+                            .collect();
+                        let a = p[1].strip_prefix('i').and_then(|n| n.parse::<u32>().ok());
+                        out.lifetimes.push((ss, a, b, s != 0));
+                    }
+                }
+            }
+        }
         let Some(line) = text
             .lines()
             .find_map(|l| l.strip_prefix("; diffcheck-facts:"))

@@ -12,12 +12,7 @@ fn parse(src: &str) -> Function {
 }
 
 fn merge(f: &mut Function) -> usize {
-    pliron_clif_opt::slotmerge::run(
-        f,
-        &FxHashMap::default(),
-        &[],
-        &FxHashSet::default(),
-    )
+    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashSet::default())
 }
 
 fn slot_sizes(f: &Function) -> Vec<(String, u32)> {
@@ -112,8 +107,16 @@ fn ptrdiff_between_slots_never_merges() {
     merge(&mut f);
     let sizes = slot_sizes(&f);
     let get = |name: &str| sizes.iter().find(|(s, _)| s == name).map(|x| x.1);
-    assert_eq!(get("ss1"), Some(8), "ptrdiff'd ss1 must not fold: {sizes:?}");
-    assert_eq!(get("ss2"), Some(8), "ptrdiff'd ss2 must not fold: {sizes:?}");
+    assert_eq!(
+        get("ss1"),
+        Some(8),
+        "ptrdiff'd ss1 must not fold: {sizes:?}"
+    );
+    assert_eq!(
+        get("ss2"),
+        Some(8),
+        "ptrdiff'd ss2 must not fold: {sizes:?}"
+    );
 }
 
 // A pointer stored into a container slot and reloaded later must keep
@@ -199,9 +202,93 @@ block0(v0: i64):
 #[test]
 fn vector_copied_pointer_keeps_pointee_live() {
     let mut f = parse(VECTOR_COPY_HOP);
-    let k = merge(&mut f);
+    merge(&mut f);
     // The stale &ss2 is dereferenced at v10 — inside ss3's live range —
-    // so ss2's interval must cover it, making ss2/ss3 overlap and the
-    // merge illegal.
-    assert_eq!(k, 0, "merge folded a live pointee's storage: {k}");
+    // so ss2's interval must cover it. Other slots (e.g. ss3 onto ss1's
+    // disjoint range) may still legally merge; the invariant is that the
+    // reloaded pointer keeps ss2's own storage live to the deref.
+    let sizes = slot_sizes(&f);
+    let get = |name: &str| sizes.iter().find(|(s, _)| s == name).map(|x| x.1);
+    assert_eq!(get("ss2"), Some(8), "ss2 must not fold: {sizes:?}");
+}
+
+// A slot re-written every loop trip (init store dominates the reads)
+// doesn't carry data across the backedge — its tight in-loop window is
+// enough. The old rule stretched every in-loop slot over the whole
+// backedge span, which in `proc_macro::quote` pinned ~460 per-site temps
+// to a ~16k-inst interval and collapsed all merging.
+const LOOP_TEMP: &str = "function %t(i64) -> i64 {
+    ss0 = explicit_slot 8, align = 8
+    ss1 = explicit_slot 8, align = 8
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    v10 = iconst.i64 0
+    jump block1(v10)
+block1(v3: i64):
+    store.i64 v0, v1
+    v4 = load.i64 v1
+    v5 = iadd v4, v3
+    v6 = iconst.i64 100
+    v7 = icmp ult v5, v6
+    brif v7, block1(v5), block2
+block2:
+    store.i64 v0, v2
+    v8 = load.i64 v2
+    return v8
+}";
+
+#[test]
+fn per_trip_slot_inside_loop_stays_tight() {
+    let mut f = parse(LOOP_TEMP);
+    let k = merge(&mut f);
+    // ss0's store dominates its load in-trip, so it isn't loop-carried:
+    // its window is tiny and the post-loop ss1 folds onto it.
+    assert!(k > 0, "expected ss1 to fold onto ss0's disjoint window");
+    let sizes = slot_sizes(&f);
+    let get = |name: &str| sizes.iter().find(|(s, _)| s == name).map(|x| x.1);
+    assert_eq!(get("ss1"), Some(0), "ss1 should fold: {sizes:?}");
+}
+
+// A slot written only before the loop and read inside it carries data
+// across the backedge: a slot folded onto it would clobber the carried
+// bytes, so its interval must still cover the whole span.
+const LOOP_CARRIED: &str = "function %t(i64) -> i64 {
+    ss0 = explicit_slot 8, align = 8
+    ss1 = explicit_slot 8, align = 8
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    v2 = stack_addr.i64 ss1
+    store.i64 v0, v1
+    v10 = iconst.i64 0
+    jump block1(v10)
+block1(v3: i64):
+    v4 = load.i64 v1
+    v5 = iadd v4, v3
+    v6 = iconst.i64 100
+    v7 = icmp ult v5, v6
+    brif v7, block2, block3
+block2:
+    store.i64 v0, v2
+    v8 = load.i64 v2
+    v9 = iadd v8, v5
+    jump block1(v9)
+block3:
+    return v4
+}";
+
+#[test]
+fn carried_slot_still_spans_the_loop() {
+    let mut f = parse(LOOP_CARRIED);
+    merge(&mut f);
+    // ss1's in-loop window overlaps ss0's loop-span interval — neither
+    // can fold onto the other's storage.
+    let sizes = slot_sizes(&f);
+    let get = |name: &str| sizes.iter().find(|(s, _)| s == name).map(|x| x.1);
+    assert_eq!(get("ss0"), Some(8), "carried ss0 keeps storage: {sizes:?}");
+    assert_eq!(
+        get("ss1"),
+        Some(8),
+        "in-loop ss1 can't fold onto ss0: {sizes:?}"
+    );
 }

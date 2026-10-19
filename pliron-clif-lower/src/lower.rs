@@ -497,7 +497,7 @@ pub fn lower_module(
         // PGO: CLIF block -> executed count (from st.prof_bcount via
         // block_region); CLIF passes read it through Pipe.prof.
         prof: FxHashMap<ir::Block, u64>,
-        lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>,
+        lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>,
         nocap: FxHashSet<(ir::Inst, u32)>,
         stubs: rustc_hash::FxHashSet<&'static str>,
         stats: crate::pipeline::Stats,
@@ -518,6 +518,8 @@ pub fn lower_module(
         fn_flags: &'a crate::pipeline::FnFlags,
         region_parent: &'a FxHashMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
         prof: &'a dyn Prof,
+        /// FuncId-indexed symbol table for `PLIRON_CORPUS` name maps.
+        fn_names: &'a [String],
     }
     let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
     let _pglo = host.prof().activity("pliron_lowerobj", None);
@@ -548,7 +550,7 @@ pub fn lower_module(
         let operand_frozen: FxHashMap<cranelift_codegen::ir::Value, Vec<(u64, Ptr<BasicBlock>)>>;
         let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
         let prof: FxHashMap<ir::Block, u64>;
-        let lifetimes: Vec<(ir::Value, Option<ir::Inst>, ir::Block, bool)>;
+        let lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>;
         let nocap: FxHashSet<(ir::Inst, u32)>;
         let stubs: rustc_hash::FxHashSet<&'static str>;
         {
@@ -597,6 +599,30 @@ pub fn lower_module(
                 tracing::debug!(target: "pliron::lower", lowerfn = %n);
             }
             fl.lower(f.op);
+            // Resolve each marker's pointer to its CLIF value — safe now
+            // that every def has been lowered. Untranslatable pointers
+            // (promoted allocas, folded ops) just drop the marker. The
+            // value is resolved to its stack slots here: by slotmerge's
+            // point in the pipeline the operand is usually long dead.
+            // (This has to precede `finalize`: it moves `fl.b` and keeps
+            // `clctx.func` borrowed for `fl`'s whole lifetime.)
+            lifetimes = std::mem::take(&mut fl.lifetimes)
+                .into_iter()
+                .filter_map(|(p, anchor, b, start)| {
+                    fl.vals
+                        .get(&p)
+                        .or_else(|| fl.cconst.get(&p))
+                        .and_then(|vs| vs.first().copied())
+                        .map(|v| {
+                            (
+                                crate::slotmerge::marker_slots(fl.b.func, v),
+                                anchor,
+                                b,
+                                start,
+                            )
+                        })
+                })
+                .collect();
             fl.b.finalize(cfg);
             asm_stubs.extend(fl.stubs.iter().copied());
             nonnull = std::mem::take(&mut fl.nonnull);
@@ -609,19 +635,6 @@ pub fn lower_module(
             scoped = std::mem::take(&mut fl.scoped);
             invariant = std::mem::take(&mut fl.invariant);
             block_region = std::mem::take(&mut fl.block_region);
-            // Resolve each marker's pointer to its CLIF value — safe now
-            // that every def has been lowered. Untranslatable pointers
-            // (promoted allocas, folded ops) just drop the marker.
-            lifetimes = std::mem::take(&mut fl.lifetimes)
-                .into_iter()
-                .filter_map(|(p, anchor, b, start)| {
-                    fl.vals
-                        .get(&p)
-                        .or_else(|| fl.cconst.get(&p))
-                        .and_then(|vs| vs.first().copied())
-                        .map(|v| (v, anchor, b, start))
-                })
-                .collect();
             nocap = std::mem::take(&mut fl.nocap);
             // Caller-side operands of `noalias readonly` clone params, in
             // CLIF values (`State::region_frozen_op`): `*v` is immutable
@@ -672,6 +685,15 @@ pub fn lower_module(
     }
 
     drop(_sfl);
+    // FuncId -> symbol table for corpus name maps (built late: `FnLower`
+    // can declare libcall stubs mid-lower).
+    let mut fn_names: Vec<String> = Vec::new();
+    for (id, d) in m.declarations().get_functions() {
+        if fn_names.len() <= id.index() {
+            fn_names.resize(id.index() + 1, String::new());
+        }
+        fn_names[id.index()] = d.name.clone().unwrap_or_default();
+    }
     // Phase (B): CLIF pipeline + cranelift compile per function. Each job
     // is fully self-contained, so workers can run them in any order;
     // results are applied in declaration order in phase (C), keeping the
@@ -690,6 +712,7 @@ pub fn lower_module(
         fn_flags: &fn_flags,
         region_parent: &st.region_parent,
         prof: host.prof(),
+        fn_names: &fn_names,
     };
     fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
         CUR_FN.with(|c| {
@@ -761,6 +784,7 @@ pub fn lower_module(
                     stats: &mut j.stats,
                     carry_log: Vec::new(),
                     prof_hook: Some(&prof_hook),
+                    fn_names: sh.fn_names,
                 };
                 crate::pipeline::run_pipeline(&mut pipe);
             }
@@ -1394,6 +1418,13 @@ pub fn lower_clif_wasm(
         bcheck: st.bcheck,
         slp: st.slp,
     };
+    let mut decl_names: Vec<String> = Vec::new();
+    for (id, d) in m.declarations().get_functions() {
+        if decl_names.len() <= id.index() {
+            decl_names.resize(id.index() + 1, String::new());
+        }
+        decl_names[id.index()] = d.name.clone().unwrap_or_default();
+    }
     let mut out = Vec::new();
     for (n, f) in &st.funcs {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
@@ -1462,18 +1493,25 @@ pub fn lower_clif_wasm(
                 eject: None,
             };
             fl.lower(f.op);
-            fl.b.finalize(cfg);
             let lifetimes = fl
                 .lifetimes
-                .into_iter()
-                .filter_map(|(p, anchor, b, start)| {
+                .iter()
+                .filter_map(|&(p, anchor, b, start)| {
                     fl.vals
                         .get(&p)
                         .or_else(|| fl.cconst.get(&p))
                         .and_then(|vs| vs.first().copied())
-                        .map(|v| (v, anchor, b, start))
+                        .map(|v| {
+                            (
+                                crate::slotmerge::marker_slots(fl.b.func, v),
+                                anchor,
+                                b,
+                                start,
+                            )
+                        })
                 })
                 .collect();
+            fl.b.finalize(cfg);
             let mut operand_frozen = FxHashMap::default();
             for (&pv, rs) in &fl.st.region_frozen_op {
                 if let Some(&v) = fl
@@ -1569,6 +1607,7 @@ pub fn lower_clif_wasm(
             stats: &mut stats,
             carry_log: Vec::new(),
             prof_hook: Some(&prof_hook),
+            fn_names: &decl_names,
         };
         // Debug bisection: PLIRON_PIPEFN=<substr> runs the pipeline only on
         // matching functions; PLIRON_PIPEFNX=<substr> skips matches.
