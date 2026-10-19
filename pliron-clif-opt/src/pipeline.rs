@@ -2072,6 +2072,17 @@ fn s_loopidiom(p: &mut Pipe, an: &mut Analysis) -> usize {
     loopidiom::run(&mut p.clctx.func, an, p.noalias, p.tcfg, p.fname)
 }
 
+// The Hacker's Delight trailing-zeros loop `lb=1; while n%(lb*2)==0
+// {lb*=2}` is `n & -n` — a band in place of a urem per trailing zero
+// (the effectful-egraph paper's case study; LLVM and GCC both miss it).
+fn s_lowbit(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = lowbit::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("lowbit");
+    }
+    k
+}
+
 // A second ifconv round: loadfwd/egraph dedup re-loaded predicate
 // operands that made jumpthread's arm blocks non-pure, leaving
 // `filter(pred)` range-check diamonds folded only now that they're
@@ -2392,6 +2403,20 @@ fn s_celim(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = celim::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("celim");
+    }
+    k
+}
+
+// Conditional push-in: `brif (icmp eq x, k)` proves `x == k` inside the
+// taken arm — rewrite in-arm operands to `k` and clone the pure
+// predecessor insts they specialize into the arm head, where the
+// constant sweeps fold them (eggcc's push-in for `bop(const, x)`
+// if-inputs). Runs before celim so arm-local specialization folds
+// before condition folding rewrites the arm conditions.
+fn s_pushin(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = pushin::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("pushin");
     }
     k
 }
@@ -2991,6 +3016,19 @@ fn s_armmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     armmerge::run(&mut p.clctx.func)
 }
 
+// Conditional invariant code motion: an unconditional pure inst both
+// brif arms compute exists on every path through the diamond — hoist
+// one copy into the predecessor (GVNHoist; eggcc's cicm extracting
+// shared `if`-input terms). Shrinks arms toward armmerge's isomorphic
+// shape, so it runs just ahead of it.
+fn s_cicm(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = cicm::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("cicm");
+    }
+    k
+}
+
 // Loop count tests against a wide constant rematerialize it per
 // iteration; compare `(a - j0) cc (K - j0)` instead — the bound is
 // a non-constant preheader value codegen pins in a register. Runs
@@ -3267,6 +3305,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         .needs(shape::LOOPS | shape::MEM)
         // `memset`/`memcpy` idiom recognition emits libcalls.
         .creates_all(),
+        step("lowbit", "lowbit", Gate::OptIn("PLIRON_LOWBIT"), s_lowbit)
+            .needs(shape::LOOPS | shape::DIVREM),
         cstep(
             "ifconv2",
             "ifconv2",
@@ -3427,6 +3467,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         cstep("edgefwd", "edgefwd", Gate::Env("PLIRON_EDGEFWD"), s_edgefwd)
             .needs_any(shape::MULTI | shape::BLOCKS2),
         step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf).needs(shape::JUMP),
+        step("pushin", "pushin", Gate::OptIn("PLIRON_PUSHIN"), s_pushin)
+            .needs(shape::CONDBR),
         cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
         cstep(
             "ivrefold",
@@ -3727,6 +3769,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // taildup/jtr twin-arm clones (`binary_search`'s two update paths)
         // differ only in operand values — merge into one block with `select`s,
         // turning a data-dependent branch per iteration into `cmov`s.
+        cstep("cicm", "cicm", Gate::OptIn("PLIRON_CICM"), s_cicm).needs(shape::CONDBR),
         cstep(
             "armmerge",
             "armmerge",
