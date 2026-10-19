@@ -715,11 +715,11 @@ impl<'a> W<'a> {
     /// not be consumed anywhere downstream (`cone_ok`) and the carried args
     /// must not themselves be skipped defs that a re-walked binding would
     /// have refreshed.
-    fn fin_edge(&self, d: Block, args: Vec<Value>, skipped: &FxHashSet<Block>) -> Option<Edge> {
+    fn fin_edge(&self, d: Block, args: &[Value], skipped: &FxHashSet<Block>) -> Option<Edge> {
         if !self.cone_ok(d, skipped) {
             return None;
         }
-        for &a in &args {
+        for &a in args {
             let a = self.func.dfg.resolve_aliases(a);
             let db = match self.func.dfg.value_def(a) {
                 ValueDef::Param(b, _) => Some(b),
@@ -730,7 +730,9 @@ impl<'a> W<'a> {
                 return None;
             }
         }
-        Some(Edge::Fin(d, args))
+        // The Vec materializes only on the landing edge — every rejected
+        // candidate above used to pay a `clone` for nothing.
+        Some(Edge::Fin(d, args.to_vec()))
     }
 
     /// Follow an edge into `d` with `args`, folding through decided
@@ -750,14 +752,14 @@ impl<'a> W<'a> {
         skipped: &mut FxHashSet<Block>,
     ) -> Option<Edge> {
         if depth >= MAX_HOPS || !self.pure(d) {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
         if d == self.p {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
-        let params = self.func.dfg.block_params(d).to_vec();
+        let params = self.func.dfg.block_params(d);
         if params.len() != args.len() {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
         // Re-entering a walked block, or passing `d` one of its own params
         // (a loop header fed from inside the loop), would rebind a value
@@ -768,7 +770,7 @@ impl<'a> W<'a> {
                 .iter()
                 .any(|&a| params.contains(&subv(self.func, &sub, a)) || params.contains(&a))
         {
-            return self.fin_edge(d, args, skipped);
+            return self.fin_edge(d, &args, skipped);
         }
         // `env`/`sub` arrive by value; this path owns them outright.
         let mut env = env;
@@ -802,7 +804,7 @@ impl<'a> W<'a> {
                 skipped.insert(d);
                 let r = self.resolve($env, $sub, $nb, $nargs, depth + 1, split_ok, skipped);
                 skipped.remove(&d);
-                r.or_else(|| self.fin_edge(d, args.clone(), skipped))
+                r.or_else(|| self.fin_edge(d, &args, skipped))
             }};
         }
         match self.func.dfg.insts[term] {
@@ -812,7 +814,7 @@ impl<'a> W<'a> {
             }
             InstructionData::Brif { arg: c, blocks, .. } => {
                 match eval(self.func, &mut env, &sub, c, 0) {
-                    E::Unk | E::B(..) => self.fin_edge(d, args, skipped),
+                    E::Unk | E::B(..) => self.fin_edge(d, &args, skipped),
                     E::K(k) => {
                         let (nb, nargs) = self.map_call(blocks[usize::from(k == 0)], &sub)?;
                         go!(env, sub, nb, nargs)
@@ -829,12 +831,12 @@ impl<'a> W<'a> {
                             return go!(env, sub, nb, nargs);
                         };
                         if !split_ok {
-                            return self.fin_edge(d, args, skipped);
+                            return self.fin_edge(d, &args, skipped);
                         }
                         skipped.insert(d);
                         let Some(cv) = self.avail_a(cv, &sub, skipped) else {
                             skipped.remove(&d);
-                            return self.fin_edge(d, args, skipped);
+                            return self.fin_edge(d, &args, skipped);
                         };
                         let (tb, ta) = self.map_call(tbc, &sub)?;
                         let (eb, ea) = self.map_call(ebc, &sub)?;
@@ -848,7 +850,7 @@ impl<'a> W<'a> {
                                 false,
                                 skipped,
                             )
-                            .or_else(|| self.fin_edge(tb, ta, skipped));
+                            .or_else(|| self.fin_edge(tb, &ta, skipped));
                         let te = match te {
                             Some(te) => te,
                             None => {
@@ -858,7 +860,7 @@ impl<'a> W<'a> {
                         };
                         let ee = self
                             .resolve(env, sub, eb, ea.clone(), depth + 1, false, skipped)
-                            .or_else(|| self.fin_edge(eb, ea, skipped));
+                            .or_else(|| self.fin_edge(eb, &ea, skipped));
                         skipped.remove(&d);
                         Some(Edge::Br(cv, Box::new(te), Box::new(ee?)))
                     }
@@ -875,7 +877,7 @@ impl<'a> W<'a> {
                     }
                 };
                 match eval(self.func, &mut env, &sub, arg, 0) {
-                    E::Unk => self.fin_edge(d, args, skipped),
+                    E::Unk => self.fin_edge(d, &args, skipped),
                     E::K(k) => {
                         let (nb, nargs) = self.map_call(pick(k), &sub)?;
                         go!(env, sub, nb, nargs)
@@ -884,7 +886,7 @@ impl<'a> W<'a> {
                         skipped.insert(d);
                         let Some(cv) = self.avail_a(cv, &sub, skipped) else {
                             skipped.remove(&d);
-                            return self.fin_edge(d, args, skipped);
+                            return self.fin_edge(d, &args, skipped);
                         };
                         let (tb, ta) = self.map_call(pick(tv), &sub)?;
                         let (eb, ea) = self.map_call(pick(ev), &sub)?;
@@ -898,7 +900,7 @@ impl<'a> W<'a> {
                                 false,
                                 skipped,
                             )
-                            .or_else(|| self.fin_edge(tb, ta, skipped));
+                            .or_else(|| self.fin_edge(tb, &ta, skipped));
                         let te = match te {
                             Some(te) => te,
                             None => {
@@ -908,14 +910,14 @@ impl<'a> W<'a> {
                         };
                         let ee = self
                             .resolve(env, sub, eb, ea.clone(), depth + 1, false, skipped)
-                            .or_else(|| self.fin_edge(eb, ea, skipped));
+                            .or_else(|| self.fin_edge(eb, &ea, skipped));
                         skipped.remove(&d);
                         Some(Edge::Br(cv, Box::new(te), Box::new(ee?)))
                     }
-                    _ => self.fin_edge(d, args, skipped),
+                    _ => self.fin_edge(d, &args, skipped),
                 }
             }
-            _ => self.fin_edge(d, args, skipped),
+            _ => self.fin_edge(d, &args, skipped),
         }
     }
 }

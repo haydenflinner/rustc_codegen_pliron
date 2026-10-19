@@ -100,23 +100,13 @@ pub fn eval(
         } => imm.bits() as u64,
         InstructionData::IntCompare { cond, args, .. } => {
             let aw = bits(func, args[0])?;
-            let ranged = range_cmp(
-                cond,
-                known(func, env, args[0]),
-                known(func, env, args[1]),
-                rg(args[0]),
-                rg(args[1]),
-                aw,
-            );
-            match (known(func, env, args[0]), known(func, env, args[1])) {
+            let (ka, kb) = (known(func, env, args[0]), known(func, env, args[1]));
+            let ranged = range_cmp(cond, ka, kb, rg(args[0]), rg(args[1]), aw);
+            match (ka, kb) {
                 _ if ranged.is_some() => u64::from(ranged == Some(true)),
                 (Some(a), Some(b)) => icmp(cond, a, b, aw) as u64,
                 (Some(0), None) | (None, Some(0)) => {
-                    let x = if known(func, env, args[0]).is_some() {
-                        args[1]
-                    } else {
-                        args[0]
-                    };
+                    let x = if ka.is_some() { args[1] } else { args[0] };
                     match (cond, nz(x)) {
                         (IntCC::Equal, true) => 0,
                         (IntCC::NotEqual, true) => 1,
