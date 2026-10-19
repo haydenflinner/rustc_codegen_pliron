@@ -8015,7 +8015,15 @@ fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8,
                     return Some((x, y, m2, Some(z)));
                 }
             }
-            Some((args[0], args[1], cc_mask(cond), Some(v)))
+            // Canonical pair names: consumers compare pairs for equality
+            // (`sel_cmp`/`selord_bit`/`selord_sel`), and an alias spelling
+            // (`icmp ne v120, v_alias`) must not hide a shared pair.
+            Some((
+                func.dfg.resolve_aliases(args[0]),
+                func.dfg.resolve_aliases(args[1]),
+                cc_mask(cond),
+                Some(v),
+            ))
         }
         InstructionData::Ternary {
             opcode: Opcode::Select,

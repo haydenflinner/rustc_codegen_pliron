@@ -1,0 +1,212 @@
+; test iconst128
+; check: icmp ugt v128, v129
+; check: v138 -> v289
+function u0:0(i32) -> i32 system_v {
+    ss0 = explicit_slot 8, align = 4
+    ss1 = explicit_slot 4, align = 4
+    ss2 = explicit_slot 4, align = 4
+    ss3 = explicit_slot 4, align = 4
+    ss4 = explicit_slot 4, align = 4
+    gv0 = symbol colocated userextname0
+
+block0(v0: i32):
+    v3 = stack_addr.i32 ss1
+    v6 = iconst.i32 11
+    v7 = ishl v0, v6  ; v6 = 11
+    store notrap v7, v3
+    jump block8
+
+block8:
+    v11 = iconst.i32 0
+    jump block55
+
+block55:
+    v118 = iconst.i32 27
+    v121 = symbol_value.i32 gv0
+    v123 = iconst.i32 108
+    v124 = iadd v121, v123  ; v123 = 108
+    v125 = load.i32 notrap v124
+    v127 = iconst.i32 11
+    v128 = ishl v125, v127  ; v127 = 11
+    v129 = load.i32 notrap v3
+    v130 = icmp ult v128, v129
+    v131 = icmp ne v128, v129
+    v132 = iconst.i8 1
+    v133 = iconst.i8 0
+    v134 = select v131, v132, v133  ; v132 = 1, v133 = 0
+    v135 = iconst.i8 -1
+    v136 = select v130, v135, v134  ; v135 = -1
+    v137 = iconst.i8 1
+    v138 = icmp eq v136, v137  ; v137 = 1
+    v139 = stack_addr.i32 ss3
+    v140 = stack_addr.i32 ss4
+    store.i32 notrap v11, v140  ; v11 = 0
+    store notrap v118, v139  ; v118 = 27
+    v141 = iconst.i32 0
+    v142 = iconst.i32 27
+    v143 = select v138, v141, v142  ; v141 = 0, v142 = 27
+    v148 = iconst.i32 13
+    v149 = iadd v143, v148  ; v148 = 13
+    v152 = symbol_value.i32 gv0
+    v153 = iconst.i32 4
+    v154 = imul v149, v153  ; v153 = 4
+    v155 = iadd v152, v154
+    v156 = load.i32 notrap v155
+    v158 = iconst.i32 11
+    v159 = ishl v156, v158  ; v158 = 11
+    v160 = load.i32 notrap v3
+    v161 = icmp ult v159, v160
+    v162 = icmp ne v159, v160
+    v163 = iconst.i8 1
+    v164 = iconst.i8 0
+    v165 = select v162, v163, v164  ; v163 = 1, v164 = 0
+    v166 = iconst.i8 -1
+    v167 = select v161, v166, v165  ; v166 = -1
+    v168 = iconst.i8 1
+    v169 = icmp eq v167, v168  ; v168 = 1
+    v170 = stack_addr.i32 ss3
+    v171 = stack_addr.i32 ss4
+    store notrap v143, v171
+    store notrap v149, v170
+    v172 = select v169, v143, v149
+    v177 = iconst.i32 7
+    v178 = iadd v172, v177  ; v177 = 7
+    v181 = symbol_value.i32 gv0
+    v182 = iconst.i32 4
+    v183 = imul v178, v182  ; v182 = 4
+    v184 = iadd v181, v183
+    v185 = load.i32 notrap v184
+    v187 = iconst.i32 11
+    v188 = ishl v185, v187  ; v187 = 11
+    v189 = load.i32 notrap v3
+    v190 = icmp ult v188, v189
+    v191 = icmp ne v188, v189
+    v192 = iconst.i8 1
+    v193 = iconst.i8 0
+    v194 = select v191, v192, v193  ; v192 = 1, v193 = 0
+    v195 = iconst.i8 -1
+    v196 = select v190, v195, v194  ; v195 = -1
+    v197 = iconst.i8 1
+    v198 = icmp eq v196, v197  ; v197 = 1
+    v199 = stack_addr.i32 ss3
+    v200 = stack_addr.i32 ss4
+    store notrap v172, v200
+    store notrap v178, v199
+    v201 = select v198, v172, v178
+    v206 = iconst.i32 3
+    v207 = iadd v201, v206  ; v206 = 3
+    v210 = symbol_value.i32 gv0
+    v211 = iconst.i32 4
+    v212 = imul v207, v211  ; v211 = 4
+    v213 = iadd v210, v212
+    v214 = load.i32 notrap v213
+    v216 = iconst.i32 11
+    v217 = ishl v214, v216  ; v216 = 11
+    v218 = load.i32 notrap v3
+    v219 = icmp ult v217, v218
+    v220 = icmp ne v217, v218
+    v221 = iconst.i8 1
+    v222 = iconst.i8 0
+    v223 = select v220, v221, v222  ; v221 = 1, v222 = 0
+    v224 = iconst.i8 -1
+    v225 = select v219, v224, v223  ; v224 = -1
+    v226 = iconst.i8 1
+    v227 = icmp eq v225, v226  ; v226 = 1
+    v228 = stack_addr.i32 ss3
+    v229 = stack_addr.i32 ss4
+    store notrap v201, v229
+    store notrap v207, v228
+    v230 = select v227, v201, v207
+    v235 = iconst.i32 2
+    v236 = iadd v230, v235  ; v235 = 2
+    v239 = symbol_value.i32 gv0
+    v240 = iconst.i32 4
+    v241 = imul v236, v240  ; v240 = 4
+    v242 = iadd v239, v241
+    v243 = load.i32 notrap v242
+    v245 = iconst.i32 11
+    v246 = ishl v243, v245  ; v245 = 11
+    v247 = load.i32 notrap v3
+    v248 = icmp ult v246, v247
+    v249 = icmp ne v246, v247
+    v250 = iconst.i8 1
+    v251 = iconst.i8 0
+    v252 = select v249, v250, v251  ; v250 = 1, v251 = 0
+    v253 = iconst.i8 -1
+    v254 = select v248, v253, v252  ; v253 = -1
+    v255 = iconst.i8 1
+    v256 = icmp eq v254, v255  ; v255 = 1
+    v257 = stack_addr.i32 ss3
+    v258 = stack_addr.i32 ss4
+    store notrap v230, v258
+    store notrap v236, v257
+    v259 = select v256, v230, v236
+    v264 = iconst.i32 1
+    v265 = iadd v259, v264  ; v264 = 1
+    v268 = symbol_value.i32 gv0
+    v269 = iconst.i32 4
+    v270 = imul v265, v269  ; v269 = 4
+    v271 = iadd v268, v270
+    v272 = load.i32 notrap v271
+    v274 = iconst.i32 11
+    v275 = ishl v272, v274  ; v274 = 11
+    v276 = load.i32 notrap v3
+    v277 = icmp ult v275, v276
+    v278 = icmp ne v275, v276
+    v279 = iconst.i8 1
+    v280 = iconst.i8 0
+    v281 = select v278, v279, v280  ; v279 = 1, v280 = 0
+    v282 = iconst.i8 -1
+    v283 = select v277, v282, v281  ; v282 = -1
+    v284 = iconst.i8 1
+    v285 = icmp eq v283, v284  ; v284 = 1
+    v286 = stack_addr.i32 ss3
+    v287 = stack_addr.i32 ss4
+    store notrap v259, v287
+    store notrap v265, v286
+    v288 = select v285, v259, v265
+    jump block11
+
+block11:
+    v18 = symbol_value.i32 gv0
+    v19 = iconst.i32 4
+    v20 = imul.i32 v288, v19  ; v19 = 4
+    v21 = iadd v18, v20
+    v22 = load.i32 notrap v21
+    v24 = iconst.i32 11
+    v25 = ishl v22, v24  ; v24 = 11
+    v27 = load.i32 notrap v3
+    v28 = icmp ult v25, v27
+    v29 = icmp ne v25, v27
+    v30 = iconst.i8 1
+    v31 = iconst.i8 0
+    v32 = select v29, v30, v31  ; v30 = 1, v31 = 0
+    v33 = iconst.i8 -1
+    v34 = select v28, v33, v32  ; v33 = -1
+    v35 = iconst.i8 0
+    v36 = icmp eq v34, v35  ; v35 = 0
+    brif v36, block15, block16
+
+block16:
+    v41 = uextend.i32 v28
+    v43 = iadd.i32 v288, v41
+    v46 = iconst.i32 1
+    jump block9(v46, v43)  ; v46 = 1
+
+block15:
+    v51 = iconst.i32 0
+    jump block9(v51, v288)  ; v51 = 0
+
+block9(v90: i32, v91: i32):
+    v94 = ireduce.i8 v90
+    v95 = iconst.i8 1
+    v96 = band v94, v95  ; v95 = 1
+    v111 = iconst.i32 1
+    v112 = iadd v91, v111  ; v111 = 1
+    v113 = select v96, v91, v112
+    jump block4
+
+block4:
+    return v113
+}
+

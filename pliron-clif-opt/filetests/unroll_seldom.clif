@@ -1,0 +1,59 @@
+; test unroll
+; check: block55:
+; check: select v
+; check: jump block11
+function %f(i32) -> i32 {
+    gv0 = symbol colocated userextname0
+
+block0(v0: i32):
+    v6 = iconst.i32 11
+    v7 = ishl v0, v6
+    v8 = iconst.i32 54
+    v11 = iconst.i32 0
+    jump block8
+
+block8:
+    jump block12(v8, v11)
+
+block12(v114: i32, v115: i32):
+    v53 = iconst.i32 2
+    v54 = udiv v114, v53
+    v56 = iadd v115, v54
+    v57 = iconst.i32 54
+    v58 = icmp ult v56, v57
+    v59 = symbol_value.i32 gv0
+    v60 = iconst.i32 4
+    v61 = imul v56, v60
+    v62 = iadd v59, v61
+    v63 = load.i32 notrap v62
+    v66 = ishl v63, v6
+    v69 = icmp ult v66, v7
+    v70 = icmp ne v66, v7
+    v71 = iconst.i8 1
+    v72 = iconst.i8 0
+    v73 = select v70, v71, v72
+    v74 = iconst.i8 -1
+    v75 = select v69, v74, v73
+    v76 = iconst.i8 1
+    v77 = icmp eq v75, v76
+    jump block50
+
+block50:
+    v80 = iconst.i32 0
+    v83 = iadd v115, v80
+    v84 = iadd v56, v80
+    brif.i8 v77, block54(v83), block54(v84)
+
+block54(v85: i32):
+    v87 = isub.i32 v114, v54
+    jump block10(v87, v85)
+
+block10(v12: i32, v102: i32):
+    v13 = iconst.i32 1
+    v14 = icmp.i32 ugt v12, v13
+    brif v14, block12(v12, v102), block11
+
+block11:
+    v90 = iadd v102, v11
+    return v90
+}

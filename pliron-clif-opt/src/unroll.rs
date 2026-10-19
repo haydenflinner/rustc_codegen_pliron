@@ -522,11 +522,146 @@ fn trip(
                 }
             }
         }
-        let Some(d) = decide(func, &env, t) else {
+        let d = decide(func, &env, t).or_else(|| {
+            merge_arms(func, nb, &mut env, &mut map, &mut src, &mut slots, &mut insts, t)
+        });
+        let Some(d) = d else {
             return why(&format!("undecided {b} {}", func.dfg.display_inst(t)));
         };
         (b, args) = d;
     }
+}
+
+/// `brif c, B(t_args), B(f_args)` whose arms reconverge on one block: the
+/// trip doesn't need `c` decided — the merged edge binds each param of
+/// `B` to `select c, t_j, f_j`. Binary-search bodies update `base`/`size`
+/// through exactly this diamond (`Ordering`'s `cmp == Greater` pick)
+/// before `ifconv`/`armmerge` can flatten it, and the trip count doesn't
+/// depend on which arm runs — letting `trip` through unrolls
+/// `unicode_data`'s `skip_search`/`binary_search` loops into the
+/// select-chain LLVM emits.
+///
+/// Emitting: each differing param gets a real `select` appended to `nb`
+/// (right after the current block's clones, so operands dominate it).
+/// Feasibility (no `nb`): the arg maps to the param itself with its
+/// env/map/src/slot facts cleared — self-binding reads "unknown".
+///
+/// The emission `trip` is `unwrap`ed after the feasibility `trip` runs —
+/// so every check here is decided before any `select` is emitted, and
+/// the checks don't depend on `nb`: feasibility failing means emission
+/// would have failed identically (select insts still count toward
+/// `max_insts` in both modes to keep that true).
+fn merge_arms(
+    func: &mut Function,
+    nb: Option<Block>,
+    env: &mut FxHashMap<Value, u64>,
+    map: &mut FxHashMap<Value, Value>,
+    src: &mut FxHashMap<Value, Value>,
+    slots: &mut FxHashMap<Value, (StackSlot, i64)>,
+    insts: &mut usize,
+    t: Inst,
+) -> Option<(Block, Vec<Value>)> {
+    if !crate::pass_enabled("PLIRON_UNROLL_MERGE") {
+        return None;
+    }
+    let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[t] else {
+        return None;
+    };
+    let pool = &func.dfg.value_lists;
+    let dst = blocks[0].block(pool);
+    if dst != blocks[1].block(pool) {
+        return None;
+    }
+    let c = func.dfg.resolve_aliases(c);
+    let ce = *map.get(&c).unwrap_or(&c);
+    let cty = func.dfg.value_type(ce);
+    // `select`'s cond must be i8.
+    if !(cty.is_int() && cty.bits() == 8) {
+        return None;
+    }
+    let params: Vec<Value> = func.dfg.block_params(dst).to_vec();
+    let mut arms = Vec::with_capacity(2);
+    for bc in &blocks {
+        let mut v = Vec::with_capacity(params.len());
+        for a in bc.args(pool) {
+            let BlockArg::Value(x) = a else {
+                return None;
+            };
+            v.push(func.dfg.resolve_aliases(x));
+        }
+        arms.push(v);
+    }
+    let [targs, fargs] = &arms[..] else { return None };
+    if targs.len() != params.len() || fargs.len() != params.len() {
+        return None;
+    }
+    // Validate the whole merge first — a `select` emitted for an early
+    // param must not be orphaned by a later param's bail (the emitting
+    // caller cannot fail).
+    let mut plan: Vec<Value> = Vec::with_capacity(targs.len());
+    let mut picks: Vec<(usize, Value, Value)> = Vec::new();
+    for (j, (&ta, &fa)) in targs.iter().zip(fargs).enumerate() {
+        if ta == fa {
+            plan.push(ta);
+            continue;
+        }
+        let (te, fe) = (*map.get(&ta).unwrap_or(&ta), *map.get(&fa).unwrap_or(&fa));
+        if te == fe {
+            plan.push(te);
+            continue;
+        }
+        if let (Some(k), Some(k2)) = (known(func, env, ta), known(func, env, fa))
+            && k == k2
+        {
+            // Both arms fold to the same constant — keep it env-known.
+            plan.push(ta);
+            continue;
+        }
+        let ty = func.dfg.value_type(params[j]);
+        if !(ty.is_int() || ty.is_float()) {
+            return None;
+        }
+        picks.push((j, te, fe));
+        plan.push(params[j]);
+    }
+    if picks.len() > 8 {
+        // A select per param per level blows up the straight-line clone —
+        // binary-search diamonds carry a handful.
+        return None;
+    }
+    *insts += picks.len();
+    if *insts > max_insts() {
+        return None;
+    }
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG)
+    {
+        tracing::debug!(
+            target: "pliron::unroll",
+            "unroll: merge {} param(s) through brif {}",
+            picks.len(),
+            func.dfg.display_inst(t)
+        );
+    }
+    if let Some(nb) = nb {
+        for &(j, te, fe) in &picks {
+            plan[j] = FuncCursor::new(func)
+                .at_bottom(nb)
+                .ins()
+                .select(ce, te, fe);
+        }
+    } else {
+        // Self-binding: clear facts a stale trip left on the param so
+        // the bind reads it as a fresh unknown.
+        for &(j, _, _) in &picks {
+            let p = params[j];
+            env.remove(&p);
+            map.remove(&p);
+            src.remove(&p);
+            slots.remove(&p);
+        }
+    }
+    Some((dst, plan))
 }
 
 fn why<T>(r: &str) -> Option<T> {
