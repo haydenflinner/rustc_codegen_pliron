@@ -1154,7 +1154,7 @@ fn emit_args(cur: &mut FuncCursor, args: &[A]) -> Vec<BlockArg> {
 /// the backing storage persists.
 pub fn sweep_blocks(func: &mut Function, cd: &mut crate::jumpthread::Cd) {
     cd.stale();
-    let (cfg, dom) = cd.get(func);
+    let (_, dom) = cd.get(func);
     let dead: Vec<Block> = func
         .layout
         .blocks()
