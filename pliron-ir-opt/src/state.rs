@@ -429,7 +429,14 @@ pub struct State {
     /// the ~70%% of emitted fns that are provably dead weight stop
     /// paying for optimization.
     pub dead_unopt: SymSet,
+    /// The same set keyed by `FuncOp`, for `opt_body`'s per-op filter.
+    pub dead_unopt_ops: rustc_hash::FxHashSet<Ptr<Operation>>,
     pub deadunopt_on: bool,
+    /// `PLIRON_EARLYDEAD=1`: mark callerless copies as `dead_unopt` at
+    /// iropt start and after the last call-creating pass, so every
+    /// `bodied`/`opt_body` pass skips them instead of optimizing bodies
+    /// that are only emitted for link safety.
+    pub earlydead: bool,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
     pub notrap: bool,
     /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).

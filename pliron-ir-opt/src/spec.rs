@@ -28,8 +28,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     // Direct callsites per callee.
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
     let mut scratch = Vec::new();
-    for f in st.funcs.values() {
-        if !has_body(ctx, f.op) {
+    for (n, f) in st.funcs.iter() {
+        if !has_body(ctx, f.op) || st.dead_unopt.contains(n.as_str()) {
             continue;
         }
         for b in blocks(ctx, f.op) {
@@ -61,6 +61,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             || !has_body(ctx, f.op)
             || taken.contains(sym.as_str())
             || st.dead_fns.contains(sym.as_str())
+            || st.dead_unopt.contains(sym.as_str())
         {
             continue;
         }

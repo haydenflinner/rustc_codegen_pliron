@@ -17,7 +17,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | wasm module size | 2.18 (206 KiB vs 94 KiB) | behind |
 | compile time: bench kernels, native | **0.98** (0.42 s vs 0.43 s) | at parity |
 | compile time: bench kernels, wasm | **2.56** (1.40 s vs 0.55 s) | behind |
-| compile time: regex-syntax (~40 kLOC) | **2.26** (3.3 s vs 1.5 s) | behind; was 6.57 before CGU jobs went parallel |
+| compile time: regex-syntax (~40 kLOC) | **2.03** (3.08 s vs 1.52 s) | behind; was 6.57 before CGU jobs went parallel |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
@@ -141,6 +141,18 @@ Next steps, in expected-payoff order:
    vacuous and arming used to de-memoize every `config()` read on
    armed threads (~1.5M recorded reads/compile). Remaining: the
    pliron-IR (iropt) half of the duplicated work is untouched.
+   **Dead-copy mitigation landed (default-on)**: after inlining, ~73%
+   of emitted fns are callerless `xcgu` copies kept only for link
+   safety (rustc's used-lists can't see copy→copy calls, so `dead_fns`
+   can't strip them). `PLIRON_DEADUNOPT` emits them through
+   `Gate::Always` lowerings only — −3 CPU-s on regex-syntax, all
+   symbols still defined. **`PLIRON_EARLYDEAD=1` (opt-in)** marks them
+   at iropt entry and post-devirt so `bodied`/`opt_body` passes skip
+   their emit-only bodies entirely — a further ~0.5 CPU-s, but the
+   retained bodies emit rawer (object bytes differ; +~6 KB on
+   regex-syntax), so it stays off until the artifact-parity story is
+   decided. The remaining iropt duplication is live copies re-running
+   pliron-IR passes per CGU.
 5. ~~Glue~~ **partly done, premise revised**: the inter-step
    bookkeeping is now ~3% of phaseB CPU. `carry_aliases`/`compact_aliases`
    walk `dfg.alias_writes()` (the per-write list behind `alias_epoch`)

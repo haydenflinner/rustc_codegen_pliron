@@ -661,6 +661,11 @@ pub(crate) fn iropt_head(
     facts: FactsMode,
 ) {
     pliron_ir_opt::opt_skip_init(ctx, st);
+    // Copies nothing calls yet are emit-only fodder — mark them before
+    // the IPO scans so `bodied`/`opt_body` leave them alone entirely.
+    if st.earlydead {
+        pt!(prof, cgu, "earlydead", inline::mark_dead_unopt(ctx, st));
+    }
     let small = cfg.small;
     let small_limit = cfg.small_limit;
     let hot = cfg.ihot;
@@ -748,6 +753,14 @@ pub(crate) fn iropt_head(
         "domcheck:inline",
         domcheck::run(ctx, st, "inline")
     );
+    // Inlining kills most copy callsites — mark the dead ones now so
+    // spec/sroa/constload/devirt never walk their emit-only bodies.
+    // (devirt-inline below can still inline into a live caller; a copy
+    // marked here stays callerless for good: aiming a call at it needs
+    // a `Sym` const, which being untaken rules out.)
+    if st.earlydead {
+        pt!(prof, cgu, "earlydead2", inline::mark_dead_unopt(ctx, st));
+    }
     if pass_enabled("PLIRON_SPEC") {
         pt!(prof, cgu, "spec", spec::run(ctx, st));
         pt!(prof, cgu, "domcheck:spec", domcheck::run(ctx, st, "spec"));
@@ -867,6 +880,12 @@ pub(crate) fn iropt_head(
                 }
             }
         }
+    }
+    // The call graph is final after devirt-inline: every later pass only
+    // deletes calls. Mark copies inlining left callerless now so the
+    // whole tail (`nocap2`..`callgvn`, `dead_fns`' recounts) skips them.
+    if st.earlydead {
+        pt!(prof, cgu, "earlydead3", inline::mark_dead_unopt(ctx, st));
     }
     // Re-run capture inference now that devirt/constload have made
     // callee sets final: indirect calls through fn-ptr slots resolve to

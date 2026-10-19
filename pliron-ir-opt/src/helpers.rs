@@ -13,6 +13,18 @@ use crate::state::{ConstVal, State};
 /// constants that are used or sit in global/aggregate initializers, and names
 /// mentioned in asm.
 pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
+    address_taken_ex(ctx, st, false)
+}
+
+/// `skip_dead`: refs inside `dead_fns`/`dead_unopt` bodies don't count —
+/// those callers are strip/emit-only, so their references needn't keep a
+/// callee optimized (it still emits — this is only used for the
+/// `dead_unopt` mark, never for `dead_fns` stripping).
+pub fn address_taken_ex(
+    ctx: &Context,
+    st: &State,
+    skip_dead: bool,
+) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     let mut escaped: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
     for c in st.consts.values() {
@@ -31,8 +43,11 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
     // `llvm.addressof` ops produce fn-ptr values the codegen-time
     // `st.consts` never saw (they're created by iropt rewrites or fed
     // through aliases `is_used` can't see on the original const).
-    for f in st.funcs.values() {
-        if !has_body(ctx, f.op) {
+    for (n, f) in st.funcs.iter() {
+        if !has_body(ctx, f.op)
+            || (skip_dead
+                && (st.dead_fns.contains(n.as_str()) || st.dead_unopt.contains(n.as_str())))
+        {
             continue;
         }
         for b in crate::inline::blocks(ctx, f.op) {
@@ -59,8 +74,9 @@ pub fn address_taken(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String>
 
 /// `has_body` and selected by `PLIRON_OPT_FNS` — the filter for passes
 /// that rewrite a function's own body (never for call-site scans).
+/// `dead_unopt` bodies are emit-only: passes skip them like opt-out fns.
 pub fn opt_body(ctx: &Context, st: &State, f: Ptr<Operation>) -> bool {
-    has_body(ctx, f) && !st.opt_skip.contains(&f)
+    has_body(ctx, f) && !st.opt_skip.contains(&f) && !st.dead_unopt_ops.contains(&f)
 }
 
 /// Fill `st.opt_skip` from `PLIRON_OPT_FNS` (no-op when unset).
@@ -104,9 +120,10 @@ pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
 pub fn bodied(ctx: &Context, st: &State) -> Vec<String> {
     st.funcs
         .iter()
-        .filter(|(_, f)| {
+        .filter(|(n, f)| {
             (f.linkage != cranelift_module::Linkage::Preemptible || f.odr)
                 && has_body(ctx, f.op)
+                && !st.dead_unopt.contains(n.as_str())
         })
         .map(|(s, _)| s.clone())
         .collect()

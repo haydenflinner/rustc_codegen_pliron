@@ -485,6 +485,34 @@ fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
     n
 }
 
+/// Callers among *optimizable* bodies: stripped (`dead_fns`) and emit-only
+/// (`dead_unopt`) bodies don't count — a dead caller's call shouldn't keep
+/// its callee in the optimization pipeline (the callee still emits, so
+/// the emit-only call always links).
+fn live_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
+    let mut n: FxHashMap<String, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op)
+            || st.dead_fns.contains(sym)
+            || st.dead_unopt.contains(sym)
+        {
+            continue;
+        }
+        for b in blocks(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                if let Some(c) = direct_callee(ctx, st, op) {
+                    if let Some(n) = n.get_mut(c) {
+                        *n += 1;
+                    } else {
+                        n.insert(c.clone(), 1);
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
 /// Callee -> callsite-owner syms adjacency plus the `single`-inline inputs,
 /// built once and kept exact across the runs that share it: inlining
 /// `caller -> callee` removes one entry from `callers_of[callee]` and adds
@@ -503,7 +531,10 @@ impl Adj {
     fn build(ctx: &Context, st: &State) -> Self {
         let mut callers_of: FxHashMap<String, Vec<String>> = FxHashMap::default();
         for (sym, f) in &st.funcs {
-            if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
+            if !has_body(ctx, f.op)
+                || st.dead_fns.contains(sym)
+                || st.dead_unopt.contains(sym)
+            {
                 continue;
             }
             for b in blocks(ctx, f.op) {
@@ -585,28 +616,65 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
     // only the `Gate::Always` correctness lowerings. They stay "live"
     // for `call_counts` — an invisible caller still links and runs a
     // correct (unoptimized) body, and their own callees keep counting.
-    if st.deadunopt_on && !st.xcgu_copies.is_empty() {
-        let counts = call_counts(ctx, st);
-        for (n, f) in st.funcs.iter() {
-            if f.linkage == Linkage::Local
-                && has_body(ctx, f.op)
-                && st.xcgu_copies.contains(n.as_str())
-                && !st.dead_fns.contains(n.as_str())
-                && !taken.contains(n.as_str())
-                && !counts.contains_key(n.as_str())
-            {
-                st.dead_unopt.insert(n.clone());
-            }
+    mark_dead_unopt(ctx, st);
+}
+
+/// Mark `xcgu_copies` members nothing live references as `dead_unopt`:
+/// `Local` + bodied + no `live_counts` caller + not `live`-address-taken,
+/// iterated to a fixpoint (a marked caller's calls stop counting).
+///
+/// The mark only ever costs optimization, never correctness: a marked
+/// fn still emits a (raw, `Gate::Always`-lowered) body, so a caller
+/// `direct_callee` can't see — or one a later pass newly creates —
+/// still links and runs. And the mark can't become stale: a marked fn
+/// is untaken, so no `Sym` const of it exists for a later devirt/spec
+/// rewrite to aim a new call at.
+///
+/// Call sites: `dead_fns` (final catch-all) plus, under
+/// `PLIRON_EARLYDEAD`, the `iropt_head` entry and the post-devirt
+/// point — every `bodied`/`opt_body` pass after that skips the marked
+/// bodies entirely.
+pub fn mark_dead_unopt(ctx: &Context, st: &mut State) -> usize {
+    if !st.deadunopt_on || st.xcgu_copies.is_empty() {
+        return 0;
+    }
+    let before = st.dead_unopt.len();
+    loop {
+        let taken = crate::address_taken_ex(ctx, st, true);
+        let counts = live_counts(ctx, st);
+        let dead: Vec<String> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && st.xcgu_copies.contains(n.as_str())
+                    && !st.dead_fns.contains(n.as_str())
+                    && !st.dead_unopt.contains(n.as_str())
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
         }
-        if pliron_cfg::tracing_on() {
-            tracing::info!(target: "pliron::stats",
-                "deadunopt {}: {} of {} fns minimal-pipelined",
-                st.cgu,
-                st.dead_unopt.len(),
-                st.funcs.len()
-            );
+        for n in dead {
+            st.dead_unopt_ops.insert(st.funcs[&n].op);
+            st.dead_unopt.insert(n);
         }
     }
+    let marked = st.dead_unopt.len() - before;
+    if marked > 0 && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats",
+            "deadunopt {}: +{} = {} of {} fns minimal-pipelined",
+            st.cgu,
+            marked,
+            st.dead_unopt.len(),
+            st.funcs.len()
+        );
+    }
+    marked
 }
 
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
@@ -620,7 +688,10 @@ fn post_order(ctx: &Context, st: &State, filter: Option<&FxHashSet<String>>) -> 
         None => st.funcs.keys().collect(),
     };
     for root in roots {
-        if !has_body(ctx, st.funcs[root].op) || !seen.insert(root.clone()) {
+        if !has_body(ctx, st.funcs[root].op)
+            || st.dead_unopt.contains(root.as_str())
+            || !seen.insert(root.clone())
+        {
             continue;
         }
         let mut stack = vec![(root.clone(), callees(ctx, st, root), 0usize)];
@@ -775,6 +846,7 @@ pub fn run(
             .iter()
             .filter(|(_, f)| has_body(ctx, f.op))
             .filter(|(s, _)| callers.is_none_or(|c| c.contains(*s)))
+            .filter(|(s, _)| !st.dead_unopt.contains(s.as_str()))
             .map(|(s, _)| s.clone())
             .collect()
     };
