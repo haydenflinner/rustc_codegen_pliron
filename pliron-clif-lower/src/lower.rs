@@ -151,7 +151,7 @@ pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> 
 }
 
 /// Profiler hook, shared with the codegen worker threads.
-pub trait Prof: Sync {
+pub trait Prof: Send + Sync {
     /// Guard for phase/step `nm` (optionally per function `arg`).
     fn activity(&self, _nm: &'static str, _arg: Option<&str>) -> Box<dyn Send + '_> {
         Box::new(())
@@ -160,7 +160,7 @@ pub trait Prof: Sync {
 
 /// What lowering needs from its embedder: rustc's `Session`, or a JIT.
 pub trait Host {
-    fn prof(&self) -> &dyn Prof;
+    fn prof(&self) -> Arc<dyn Prof>;
     /// Clean user-facing error (capacity limits), not an ICE.
     fn fatal(&self, msg: String) -> ! {
         panic!("{msg}")
@@ -175,8 +175,8 @@ pub trait Host {
 pub struct NoHost;
 impl Prof for NoHost {}
 impl Host for NoHost {
-    fn prof(&self) -> &dyn Prof {
-        self
+    fn prof(&self) -> Arc<dyn Prof> {
+        Arc::new(NoHost)
     }
 }
 
@@ -355,6 +355,345 @@ pub fn lower_to_object(
     product.emit().unwrap()
 }
 
+/// A function's pliron→CLIF lower output plus everything the CLIF
+/// pipeline and cranelift compile need. Jobs are independent:
+/// phase (B) runs them on the shared worker pool.
+struct FnJob {
+    name: String,
+    id: FuncId,
+    func: ir::Function,
+    nonnull: FxHashSet<ir::Value>,
+    derived: FxHashMap<ir::Value, ir::Value>,
+    frozen: FxHashMap<ir::Value, u64>,
+    noalias: FxHashSet<ir::Value>,
+    deref: FxHashMap<ir::Value, (u64, bool)>,
+    nowrite: FxHashMap<FuncRef, bool>,
+    call_frozen: FxHashMap<FuncRef, u64>,
+    scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
+    invariant: FxHashSet<ir::Inst>,
+    operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    /// Dense gate for `Pipe::carry_one`'s fact probes — re-seeded
+    /// from the tables at each `Pipe` construction.
+    fact_bits: cranelift_codegen::entity::SecondaryMap<ir::Value, u8>,
+    block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
+    // PGO: CLIF block -> executed count (from st.prof_bcount via
+    // block_region); CLIF passes read it through Pipe.prof.
+    prof: FxHashMap<ir::Block, u64>,
+    lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>,
+    nocap: FxHashSet<(ir::Inst, u32)>,
+    stubs: rustc_hash::FxHashSet<&'static str>,
+    /// `FuncId` index -> declared symbol for the fn's namespace-0
+    /// `user_named_funcs` — the step cache keys those indices by
+    /// symbol and remaps replayed variants across CGUs.
+    uen_syms: FxHashMap<u32, String>,
+    /// The CGU's read-only inputs, Arc'd so a job can ride the global
+    /// pool without borrowing anything off the producer thread.
+    sh: Arc<JobShared>,
+    stats: crate::pipeline::Stats,
+    err: Option<cranelift_codegen::CodegenError>,
+    code: Option<cranelift_codegen::CompiledCode>,
+    dump: bool,
+    /// `st.dead_unopt` member: minimal (`Gate::Always`) pipeline.
+    unopt: bool,
+}
+
+/// Read-only inputs shared by every job in phase (B). Fully owned
+/// (`'static`): the global fn pool drains jobs from all live CGUs, so
+/// nothing may borrow the producing CGU's stack.
+struct JobShared {
+    isa: Arc<dyn TargetIsa>,
+    tcfg: TargetFrontendConfig,
+    simd: bool,
+    x64: bool,
+    cmp64: bool,
+    has_eh: bool,
+    verify_env: bool,
+    verify_full_env: bool,
+    fn_flags: crate::pipeline::FnFlags,
+    region_parent: crate::context::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    prof: Arc<dyn Prof>,
+    /// FuncId-indexed symbol table for `PLIRON_CORPUS` name maps.
+    fn_names: Vec<String>,
+}
+
+/// One queued function job: the declaration index (phase (C) re-orders
+/// results), the job itself, and the producing CGU's result sink.
+/// `Err` carries a `run_job` panic back to its CGU thread — the same
+/// propagation `thread::scope` used to give at join.
+struct GMsg {
+    i: usize,
+    j: FnJob,
+    done: std::sync::mpsc::Sender<(usize, std::thread::Result<FnJob>)>,
+}
+
+/// The process-wide phase-(B) pool: one `VecDeque` of `GMsg` behind a
+/// short-lock mutex + condvar, N = `PLIRON_PAR` or
+/// `available_parallelism` workers — every CGU used to scope-spawn its
+/// own N workers, so `G` concurrent CGUs ran `G×N` threads at once and
+/// each CGU's drain idled on its own tail. A shared queue fixes both:
+/// compute threads stay ≈ cores and a CGU's tail runs on whichever
+/// worker is free, whichever CGU produced it.
+///
+/// The mutex guards only the queue (pops hold it briefly) — never a
+/// blocking `recv` — because draining producers pop jobs too
+/// (work-while-you-wait, same shape as `cgupool`'s `run_until`); a
+/// `Mutex<mpsc::Receiver>` would deadlock them behind a parked worker.
+struct FPool {
+    m: std::sync::Mutex<std::collections::VecDeque<GMsg>>,
+    cv: std::sync::Condvar,
+}
+
+fn fn_pool() -> &'static FPool {
+    static POOL: std::sync::OnceLock<&'static FPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = crate::env_get("PLIRON_PAR")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1);
+        let p: &'static FPool = Box::leak(Box::new(FPool {
+            m: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            cv: std::sync::Condvar::new(),
+        }));
+        for _ in 0..n {
+            std::thread::spawn(move || fn_worker(p));
+        }
+        p
+    })
+}
+
+fn fn_pool_push(p: &FPool, m: GMsg) {
+    p.m.lock().unwrap_or_else(|e| e.into_inner()).push_back(m);
+    p.cv.notify_one();
+}
+
+fn fn_pool_pop(p: &FPool) -> Option<GMsg> {
+    p.m.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+}
+
+fn fn_worker(p: &'static FPool) {
+    let mut wcl = cranelift_codegen::Context::new();
+    loop {
+        let GMsg { i, mut j, done } = {
+            let mut q = p.m.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(m) = q.pop_front() {
+                    break m;
+                }
+                q = p.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let sh = j.sh.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_job(&mut j, &mut wcl, &sh);
+            j
+        }));
+        let _ = done.send((i, r));
+    }
+}
+
+/// Phase (B) of one function: CLIF pipeline, verify, cranelift compile.
+/// Self-contained — everything it touches is `j`/`clctx`/`sh`.
+fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
+    CUR_FN.with(|c| {
+        let mut c = c.borrow_mut();
+        c.clear();
+        c.push_str(&j.name);
+    });
+    clctx.func = std::mem::replace(&mut j.func, ir::Function::new());
+    let n = j.name.as_str();
+    if j.dump {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display())
+        };
+    }
+    let mut verify_full = sh.verify_full_env;
+    let snapshot = (sh.verify_env && !verify_full).then(|| clctx.func.clone());
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::frozen", "==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref)
+        };
+    }
+    let tron = pliron_cfg::tracing_on();
+    let _sfn = tron.then(|| tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered());
+    let tpipe = std::time::Instant::now();
+    let _spipe = tron.then(|| tracing::info_span!(target: "pliron::pipeline", "pipeline").entered());
+    let _pgpipe = sh.prof.activity("pliron_pipeline", Some(n));
+    'retry: loop {
+        {
+            // Per-step self-profile events ride `sess.prof` through
+            // this hook — `-Zself-profile` shows each step next to
+            // LLVM's `LLVM_passes` activities on the same clock.
+            // Scoped to the block so Pipe's borrow set stays per-try.
+            let prof_hook =
+                |nm: &'static str| -> Box<dyn Send + '_> { sh.prof.activity(nm, None) };
+            let mut pipe = crate::pipeline::Pipe {
+                cur_step: "",
+                clctx,
+                isa: &*sh.isa,
+                fname: n,
+                func_id: j.id,
+                uen_syms: &j.uen_syms,
+                nonnull: &mut j.nonnull,
+                derived: &mut j.derived,
+                frozen: &mut j.frozen,
+                noalias: &mut j.noalias,
+                deref: &mut j.deref,
+                nowrite: &j.nowrite,
+                call_frozen: &j.call_frozen,
+                scoped: &j.scoped,
+                invariant: &j.invariant,
+                operand_frozen: &mut j.operand_frozen,
+                fact_bits: &mut j.fact_bits,
+                block_region: &j.block_region,
+                prof: &j.prof,
+                region_parent: &sh.region_parent,
+                lifetimes: &mut j.lifetimes,
+                nocap: &j.nocap,
+                tcfg: sh.tcfg,
+                simd: sh.simd,
+                x64: sh.x64,
+                cmp64: sh.cmp64,
+                amode_scale: crate::pipeline::amode_scale(&*sh.isa),
+                has_eh: sh.has_eh,
+                flags: &sh.fn_flags,
+                dump: j.dump,
+                verify_full,
+                unopt: j.unopt,
+                stats: &mut j.stats,
+                carry_log: Vec::new(),
+                prof_hook: Some(&prof_hook),
+                fn_names: &sh.fn_names,
+            };
+            // Debug bisection: same `PLIRON_PIPEFN[X]` filter as the
+            // wasm path — the pipeline runs only on matching fns.
+            let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
+                && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
+                && pliron_cfg::fn_opt_selected(n);
+            if run_pipe {
+                pipe.seed_fact_bits();
+                crate::pipeline::run_pipeline(&mut pipe);
+            }
+        }
+        if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
+            clctx.set_disasm(true);
+        }
+        if sh.verify_env
+            && let Err(e) = cranelift_codegen::verify_function(&clctx.func, sh.isa.flags())
+        {
+            if !verify_full && let Some(snap) = &snapshot {
+                // Which pass broke it is unknown until the per-pass
+                // checks run — restore and re-run them.
+                clctx.func = snap.clone();
+                verify_full = true;
+                continue 'retry;
+            }
+            panic!("pipeline broke `{n}`: {e}\n{}", clctx.func.display());
+        }
+        break 'retry;
+    }
+    drop(_spipe);
+    // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
+    // per-function total for the tier-1 cache sizing question.
+    *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
+    pliron_cfg::trace("*pipeline*", tpipe.elapsed().as_secs_f64() * 1e3, n);
+    if j.dump {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display())
+        };
+    }
+    // Panics inside Cranelift (verifier, egraph, regalloc asserts)
+    // bypass the Err path below — catch and rethrow so the message
+    // carries the function name and final CLIF for reproduction.
+    // Narrow vectors (i8x8 from core_simd masks): ISLE lowers only
+    // 128-bit ops. When emit names an unsupported vector type,
+    // scalarize every inst touching it and retry.
+    let tcomp = std::time::Instant::now();
+    let _scomp = tron.then(|| tracing::info_span!(target: "pliron::pipeline", "compile").entered());
+    let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
+    let mut vec_retry = 0;
+    let defr = loop {
+        let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            clctx
+                .compile(&*sh.isa, &mut ControlPlane::default())
+                .map(|_| ())
+                .map_err(|e| e.inner)
+        }));
+        let msg = match &defr {
+            Ok(Err(e)) => format!("{e}"),
+            Ok(_) => break defr,
+            Err(p) => p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        };
+        // Look for a fixed vector type in the message
+        // ("`v3 = iadd.i8x8 v0, v1`", "value of type i8x8").
+        let vt = {
+            use ir::types::*;
+            let re: [(&str, ir::Type); 7] = [
+                ("i8x8", I8X8),
+                ("i16x4", I16X4),
+                ("i32x2", I32X2),
+                ("f32x2", F32X2),
+                ("i8x4", I8X4),
+                ("i16x2", I16X2),
+                ("i8x2", I8X2),
+            ];
+            re.iter()
+                .find(|(t, _)| msg.contains(&format!(".{t}")) || msg.contains(&format!(" {t}")))
+                .map(|(_, ty)| *ty)
+        };
+        if let Some(t) = vt.filter(|t| t.is_vector() && t.bits() < 128 && sh.x64) {
+            if vec_retry >= 4 || crate::veclegalize::run(&mut clctx.func, t) == 0 {
+                break defr;
+            }
+            vec_retry += 1;
+            // Seeded cfg/domtree describe the pre-legalize func.
+            clctx.cfg.clear();
+            clctx.domtree.clear();
+            continue;
+        }
+        break defr;
+    };
+    drop(_scomp);
+    *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
+    pliron_cfg::trace("*compile*", tcomp.elapsed().as_secs_f64() * 1e3, n);
+    // Cranelift's own pass profiler: `emit:<pass>` pseudo-steps show
+    // where inside `compile` (vcode lower/emit, regalloc) time goes.
+    if pliron_cfg::env_set("PLIRON_TIMING")
+        || (pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::timing", tracing::Level::INFO))
+        || pliron_cfg::env_get("PLIRON_TRACE_FILE").is_some()
+    {
+        for (d, t) in cranelift_codegen::timing::take_current().self_times() {
+            *j.stats
+                .timing
+                .entry(format!("emit:{d}").leak())
+                .or_default() += t;
+            pliron_cfg::trace(&format!("emit:{d}"), t.as_secs_f64() * 1e3, n);
+        }
+    } else {
+        let _ = cranelift_codegen::timing::take_current();
+    }
+    match defr {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => j.err = Some(e),
+        Err(e) => {
+            eprintln!("cranelift panicked in `{n}`\n{}", clctx.func.display());
+            std::panic::resume_unwind(e);
+        }
+    }
+    j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
+    j.code = clctx.take_compiled_code();
+    // `optimize` leaves cfg/domtree/loop_analysis valid for this
+    // func — drop them like `clear_context` did so the next job's
+    // compile doesn't verify against a stale cfg.
+    clctx.clear();
+}
+
 /// Declare and define every function and global of `ctx`'s module in `m`
 /// (an `ObjectModule`, a `JITModule`, ...).
 #[allow(clippy::too_many_arguments)]
@@ -515,62 +854,9 @@ pub fn lower_module<'a>(
     // actually broke.
     let verify_env = crate::env_set("PLIRON_VERIFY");
     let verify_full_env = crate::env_is("PLIRON_VERIFY", "full");
-    /// A function's pliron→CLIF lower output plus everything the CLIF
-    /// pipeline and cranelift compile need. Jobs are independent: phase
-    /// (B) below runs them on worker threads.
-    struct FnJob<'a> {
-        name: &'a str,
-        id: FuncId,
-        func: ir::Function,
-        nonnull: FxHashSet<ir::Value>,
-        derived: FxHashMap<ir::Value, ir::Value>,
-        frozen: FxHashMap<ir::Value, u64>,
-        noalias: FxHashSet<ir::Value>,
-        deref: FxHashMap<ir::Value, (u64, bool)>,
-        nowrite: FxHashMap<FuncRef, bool>,
-        call_frozen: FxHashMap<FuncRef, u64>,
-        scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
-        invariant: FxHashSet<ir::Inst>,
-        operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
-        /// Dense gate for `Pipe::carry_one`'s fact probes — re-seeded
-        /// from the tables at each `Pipe` construction.
-        fact_bits: cranelift_codegen::entity::SecondaryMap<ir::Value, u8>,
-        block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>,
-        // PGO: CLIF block -> executed count (from st.prof_bcount via
-        // block_region); CLIF passes read it through Pipe.prof.
-        prof: FxHashMap<ir::Block, u64>,
-        lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>,
-        nocap: FxHashSet<(ir::Inst, u32)>,
-        stubs: rustc_hash::FxHashSet<&'static str>,
-        /// `FuncId` index -> declared symbol for the fn's namespace-0
-        /// `user_named_funcs` — the step cache keys those indices by
-        /// symbol and remaps replayed variants across CGUs.
-        uen_syms: FxHashMap<u32, String>,
-        stats: crate::pipeline::Stats,
-        err: Option<cranelift_codegen::CodegenError>,
-        code: Option<cranelift_codegen::CompiledCode>,
-        dump: bool,
-        /// `st.dead_unopt` member: minimal (`Gate::Always`) pipeline.
-        unopt: bool,
-    }
-    /// Read-only inputs shared by every job in phase (B).
-    struct JobShared<'a> {
-        isa: &'a dyn TargetIsa,
-        tcfg: TargetFrontendConfig,
-        simd: bool,
-        x64: bool,
-        cmp64: bool,
-        has_eh: bool,
-        verify_env: bool,
-        verify_full_env: bool,
-        fn_flags: &'a crate::pipeline::FnFlags,
-        region_parent: &'a crate::context::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
-        prof: &'a dyn Prof,
-        /// FuncId-indexed symbol table for `PLIRON_CORPUS` name maps.
-        fn_names: &'a [String],
-    }
     let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
-    let _pglo = host.prof().activity("pliron_lowerobj", None);
+    let hprof = host.prof();
+    let _pglo = hprof.activity("pliron_lowerobj", None);
     // Phase (A): pliron → CLIF lowering. Serial — `FnLower` reads the
     // pliron `Context`, which is RefCell-interned and not shareable.
     // Each finished `FnJob` is fully self-contained though, so the (B)
@@ -588,7 +874,7 @@ pub fn lower_module<'a>(
             .max(1)
     };
     let _sfl = tracing::info_span!(target: "pliron::phase", "fnlower").entered();
-    let _pgfl = host.prof().activity("pliron_fnlower", None);
+    let _pgfl = hprof.activity("pliron_fnlower", None);
     let tpa = std::time::Instant::now();
     // `oi` stays the declaration index so results can be re-ordered for
     // phase (C) even though production streams biggest-first: the drain
@@ -625,7 +911,23 @@ pub fn lower_module<'a>(
         }
         fn_names[id.index()] = d.name.clone().unwrap_or_default();
     }
-    let mut produce = |emit: &mut dyn FnMut(usize, FnJob<'a>)| {
+    // Read-only job inputs, owned so `FnJob`s are `'static` and can ride
+    // the process-wide pool.
+    let shared = Arc::new(JobShared {
+        isa: isa.clone(),
+        tcfg: cfg,
+        simd,
+        x64,
+        cmp64,
+        has_eh: eh_data.is_some(),
+        verify_env,
+        verify_full_env,
+        fn_flags,
+        region_parent: st.region_parent.clone(),
+        prof: hprof.clone(),
+        fn_names,
+    });
+    let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
         for &(idx, (n, f)) in &order {
             CUR_FN.with(|c| c.borrow_mut().clone_from(n));
             let Sym::F(id, _) = ids[n] else {
@@ -799,7 +1101,7 @@ pub fn lower_module<'a>(
             emit(
                 idx,
                 FnJob {
-                    name: n,
+                    name: n.clone(),
                     id,
                     func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                     nonnull,
@@ -819,6 +1121,7 @@ pub fn lower_module<'a>(
                     nocap,
                     stubs,
                     uen_syms,
+                    sh: shared.clone(),
                     stats: crate::pipeline::Stats::default(),
                     err: None,
                     code: None,
@@ -836,224 +1139,7 @@ pub fn lower_module<'a>(
     // results are applied in declaration order in phase (C), keeping the
     // object byte-identical. Serial when `PLIRON_OPT_BISECT` is set (the
     // bisect counter must number pass applications deterministically) or
-    // `PLIRON_PAR=0` / `PLIRON_PAR=N` overrides the thread count.
-    let shared = JobShared {
-        isa: &**isa,
-        tcfg: cfg,
-        simd,
-        x64,
-        cmp64,
-        has_eh: eh_data.is_some(),
-        verify_env,
-        verify_full_env,
-        fn_flags: &fn_flags,
-        region_parent: &st.region_parent,
-        prof: host.prof(),
-        fn_names: &fn_names,
-    };
-    fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
-        CUR_FN.with(|c| {
-            let mut c = c.borrow_mut();
-            c.clear();
-            c.push_str(j.name);
-        });
-        clctx.func = std::mem::replace(&mut j.func, ir::Function::new());
-        let n = j.name;
-        if j.dump {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display())
-            };
-        }
-        let mut verify_full = sh.verify_full_env;
-        let snapshot = (sh.verify_env && !verify_full).then(|| clctx.func.clone());
-        if pliron_cfg::tracing_on()
-            && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
-        {
-            if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::frozen", "==== {n}: noalias={:?} deref={:?}", j.noalias, j.deref)
-            };
-        }
-        let tron = pliron_cfg::tracing_on();
-        let _sfn =
-            tron.then(|| tracing::info_span!(target: "pliron::fn", "fn", name = j.name).entered());
-        let tpipe = std::time::Instant::now();
-        let _spipe =
-            tron.then(|| tracing::info_span!(target: "pliron::pipeline", "pipeline").entered());
-        let _pgpipe = sh.prof.activity("pliron_pipeline", Some(n));
-        'retry: loop {
-            {
-                // Per-step self-profile events ride `sess.prof` through
-                // this hook — `-Zself-profile` shows each step next to
-                // LLVM's `LLVM_passes` activities on the same clock.
-                // Scoped to the block so Pipe's borrow set stays per-try.
-                let prof_hook =
-                    |nm: &'static str| -> Box<dyn Send + '_> { sh.prof.activity(nm, None) };
-                let mut pipe = crate::pipeline::Pipe {
-                    cur_step: "",
-                    clctx,
-                    isa: sh.isa,
-                    fname: n,
-                    func_id: j.id,
-                    uen_syms: &j.uen_syms,
-                    nonnull: &mut j.nonnull,
-                    derived: &mut j.derived,
-                    frozen: &mut j.frozen,
-                    noalias: &mut j.noalias,
-                    deref: &mut j.deref,
-                    nowrite: &j.nowrite,
-                    call_frozen: &j.call_frozen,
-                    scoped: &j.scoped,
-                    invariant: &j.invariant,
-                    operand_frozen: &mut j.operand_frozen,
-                    fact_bits: &mut j.fact_bits,
-                    block_region: &j.block_region,
-                    prof: &j.prof,
-                    region_parent: sh.region_parent,
-                    lifetimes: &mut j.lifetimes,
-                    nocap: &j.nocap,
-                    tcfg: sh.tcfg,
-                    simd: sh.simd,
-                    x64: sh.x64,
-                    cmp64: sh.cmp64,
-                    amode_scale: crate::pipeline::amode_scale(sh.isa),
-                    has_eh: sh.has_eh,
-                    flags: sh.fn_flags,
-                    dump: j.dump,
-                    verify_full,
-                    unopt: j.unopt,
-                    stats: &mut j.stats,
-                    carry_log: Vec::new(),
-                    prof_hook: Some(&prof_hook),
-                    fn_names: sh.fn_names,
-                };
-                // Debug bisection: same `PLIRON_PIPEFN[X]` filter as the
-                // wasm path — the pipeline runs only on matching fns.
-                let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
-                    && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
-                    && pliron_cfg::fn_opt_selected(n);
-                if run_pipe {
-                    pipe.seed_fact_bits();
-                    crate::pipeline::run_pipeline(&mut pipe);
-                }
-            }
-            if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
-                clctx.set_disasm(true);
-            }
-            if sh.verify_env
-                && let Err(e) = cranelift_codegen::verify_function(&clctx.func, sh.isa.flags())
-            {
-                if !verify_full && let Some(snap) = &snapshot {
-                    // Which pass broke it is unknown until the per-pass
-                    // checks run — restore and re-run them.
-                    clctx.func = snap.clone();
-                    verify_full = true;
-                    continue 'retry;
-                }
-                panic!("pipeline broke `{n}`: {e}\n{}", clctx.func.display());
-            }
-            break 'retry;
-        }
-        drop(_spipe);
-        // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
-        // per-function total for the tier-1 cache sizing question.
-        *j.stats.timing.entry("*pipeline*").or_default() += tpipe.elapsed();
-        pliron_cfg::trace("*pipeline*", tpipe.elapsed().as_secs_f64() * 1e3, n);
-        if j.dump {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display())
-            };
-        }
-        // Panics inside Cranelift (verifier, egraph, regalloc asserts)
-        // bypass the Err path below — catch and rethrow so the message
-        // carries the function name and final CLIF for reproduction.
-        // Narrow vectors (i8x8 from core_simd masks): ISLE lowers only
-        // 128-bit ops. When emit names an unsupported vector type,
-        // scalarize every inst touching it and retry.
-        let tcomp = std::time::Instant::now();
-        let _scomp =
-            tron.then(|| tracing::info_span!(target: "pliron::pipeline", "compile").entered());
-        let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
-        let mut vec_retry = 0;
-        let defr = loop {
-            let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                clctx
-                    .compile(sh.isa, &mut ControlPlane::default())
-                    .map(|_| ())
-                    .map_err(|e| e.inner)
-            }));
-            let msg = match &defr {
-                Ok(Err(e)) => format!("{e}"),
-                Ok(_) => break defr,
-                Err(p) => p
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_default(),
-            };
-            // Look for a fixed vector type in the message
-            // ("`v3 = iadd.i8x8 v0, v1`", "value of type i8x8").
-            let vt = {
-                use ir::types::*;
-                let re: [(&str, ir::Type); 7] = [
-                    ("i8x8", I8X8),
-                    ("i16x4", I16X4),
-                    ("i32x2", I32X2),
-                    ("f32x2", F32X2),
-                    ("i8x4", I8X4),
-                    ("i16x2", I16X2),
-                    ("i8x2", I8X2),
-                ];
-                re.iter()
-                    .find(|(t, _)| msg.contains(&format!(".{t}")) || msg.contains(&format!(" {t}")))
-                    .map(|(_, ty)| *ty)
-            };
-            if let Some(t) = vt.filter(|t| t.is_vector() && t.bits() < 128 && sh.x64) {
-                if vec_retry >= 4 || crate::veclegalize::run(&mut clctx.func, t) == 0 {
-                    break defr;
-                }
-                vec_retry += 1;
-                // Seeded cfg/domtree describe the pre-legalize func.
-                clctx.cfg.clear();
-                clctx.domtree.clear();
-                continue;
-            }
-            break defr;
-        };
-        drop(_scomp);
-        *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
-        pliron_cfg::trace("*compile*", tcomp.elapsed().as_secs_f64() * 1e3, n);
-        // Cranelift's own pass profiler: `emit:<pass>` pseudo-steps show
-        // where inside `compile` (vcode lower/emit, regalloc) time goes.
-        if pliron_cfg::env_set("PLIRON_TIMING")
-            || (pliron_cfg::tracing_on()
-                && tracing::enabled!(target: "pliron::timing", tracing::Level::INFO))
-            || pliron_cfg::env_get("PLIRON_TRACE_FILE").is_some()
-        {
-            for (d, t) in cranelift_codegen::timing::take_current().self_times() {
-                *j.stats
-                    .timing
-                    .entry(format!("emit:{d}").leak())
-                    .or_default() += t;
-                pliron_cfg::trace(&format!("emit:{d}"), t.as_secs_f64() * 1e3, n);
-            }
-        } else {
-            let _ = cranelift_codegen::timing::take_current();
-        }
-        match defr {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => j.err = Some(e),
-            Err(e) => {
-                eprintln!("cranelift panicked in `{n}`\n{}", clctx.func.display());
-                std::panic::resume_unwind(e);
-            }
-        }
-        j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
-        j.code = clctx.take_compiled_code();
-        // `optimize` leaves cfg/domtree/loop_analysis valid for this
-        // func — drop them like `clear_context` did so the next job's
-        // compile doesn't verify against a stale cfg.
-        clctx.clear();
-    }
+    // `PLIRON_PAR=0` overrides. `PLIRON_PAR=N` sizes the shared pool.
 
     let mut jobs: Vec<FnJob> = Vec::new();
     if nthreads <= 1 {
@@ -1068,52 +1154,77 @@ pub fn lower_module<'a>(
         }
         pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
     } else {
-        // Workers pull jobs over a channel while `produce` lowers — the
-        // serial lowering is the slower side, so the pool stays starved
-        // and arrival (FIFO) order replaces the old largest-first sort;
-        // the drain below only waits for the pipeline's tail. Results
-        // come back indexed so phase (C) sees declaration order.
-        let (tx, rx) = std::sync::mpsc::channel::<(usize, FnJob<'a>)>();
-        let (dtx, drx) = std::sync::mpsc::channel::<(usize, FnJob<'a>)>();
-        let rx = std::sync::Mutex::new(rx);
-        let shared = &shared;
-        std::thread::scope(|s| {
-            for _ in 0..nthreads {
-                let rx = &rx;
-                let dtx = dtx.clone();
-                s.spawn(move || {
-                    let mut wcl = cranelift_codegen::Context::new();
-                    loop {
-                        let got = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok((i, mut j)) = got else { break };
-                        run_job(&mut j, &mut wcl, shared);
-                        let _ = dtx.send((i, j));
-                    }
-                });
-            }
-            drop(dtx);
-            produce(&mut |i, j| {
-                let _ = tx.send((i, j));
-            });
-            drop(tx);
-            drop(_sfl);
-            drop(_pgfl);
-            pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
-            let tpb = std::time::Instant::now();
-            let mut done = std::collections::BTreeMap::new();
-            while let Ok((i, j)) = drx.recv() {
-                done.insert(i, j);
-            }
-            jobs = done.into_values().collect();
-            pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+        // Jobs stream into the process-wide pool as `produce` lowers —
+        // phase (B) work from *all* live CGUs shares one worker set, so
+        // this CGU's drain tail overlaps the next CGU's serial produce
+        // (and vice versa). Results come back indexed so phase (C) sees
+        // declaration order; a worker panic travels back as `Err` and is
+        // resumed here.
+        let (dtx, drx) =
+            std::sync::mpsc::channel::<(usize, std::thread::Result<FnJob>)>();
+        let pool = fn_pool();
+        let mut sent = 0usize;
+        produce(&mut |i, j| {
+            sent += 1;
+            fn_pool_push(
+                pool,
+                GMsg {
+                    i,
+                    j,
+                    done: dtx.clone(),
+                },
+            );
         });
+        drop(dtx);
+        drop(_sfl);
+        drop(_pgfl);
+        pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+        let tpb = std::time::Instant::now();
+        let mut done = std::collections::BTreeMap::new();
+        let mut wcl = cranelift_codegen::Context::new();
+        let mut got = 0usize;
+        while got < sent {
+            // Take a finished result if one's waiting…
+            match drx.try_recv() {
+                Ok((i, Ok(j))) => {
+                    done.insert(i, j);
+                    got += 1;
+                    continue;
+                }
+                Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                Err(_) => {}
+            }
+            // …otherwise run a queued job — any CGU's — rather than
+            // parking this core while the pool drains (the same
+            // work-while-you-wait as cgupool's `run_until`).
+            match fn_pool_pop(pool) {
+                Some(GMsg { i, mut j, done: d }) => {
+                    let sh = j.sh.clone();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job(&mut j, &mut wcl, &sh);
+                        j
+                    }));
+                    let _ = d.send((i, r));
+                }
+                None => match drx.recv() {
+                    Ok((i, Ok(j))) => {
+                        done.insert(i, j);
+                        got += 1;
+                    }
+                    Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                    Err(e) => panic!("fn pool disconnected: {e}"),
+                },
+            }
+        }
+        jobs = done.into_values().collect();
+        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
     }
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
     // compiling each function serially.
     let _spc = tracing::info_span!(target: "pliron::phase", "phasec").entered();
-    let _pgpc = host.prof().activity("pliron_phasec", None);
+    let _pgpc = hprof.activity("pliron_phasec", None);
     // x64 without SSSE3 lowers `shuffle`/`swizzle.i8x16` to an `X86Pshufb`
     // libcall; note any compiled function that references it so phase (C+)
     // can define the helper (nothing in the Rust runtime provides it).
@@ -1122,7 +1233,7 @@ pub fn lower_module<'a>(
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
         let Some(code) = &j.code else {
-            let n = j.name;
+            let n = &j.name;
             // Known capacity limits are a backend limitation, not a bug:
             // report cleanly instead of dumping a multi-MB function into
             // an ICE.
@@ -1739,7 +1850,9 @@ pub fn lower_clif_wasm(
         {
             panic!("bad clif {n}: {e}");
         }
-        let prof_hook = |nm: &'static str| -> Box<dyn Send + '_> { host.prof().activity(nm, None) };
+        let hprof = host.prof();
+        let prof_hook =
+            |nm: &'static str| -> Box<dyn Send + '_> { hprof.activity(nm, None) };
         let mut stats = crate::pipeline::Stats::default();
         let mut nonnull = nonnull;
         let mut derived = derived;

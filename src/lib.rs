@@ -374,13 +374,14 @@ pub(crate) fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> 
 /// diagnostics, and target features.
 pub(crate) struct RustcHost<'a> {
     sess: &'a Session,
-    prof: RustcProf<'a>,
+    prof: Arc<RustcProf>,
 }
 
 /// `Session` is not `Sync`; worker threads only see the profiler.
-pub(crate) struct RustcProf<'a>(pub(crate) &'a SelfProfilerRef);
+/// `SelfProfilerRef` is itself Arc-backed, so the wrapper is `'static`.
+pub(crate) struct RustcProf(pub(crate) SelfProfilerRef);
 
-impl lower::Prof for RustcProf<'_> {
+impl lower::Prof for RustcProf {
     fn activity(&self, nm: &'static str, arg: Option<&str>) -> Box<dyn Send + '_> {
         match arg {
             Some(a) => Box::new(self.0.generic_activity_with_arg(nm, a)),
@@ -390,8 +391,8 @@ impl lower::Prof for RustcProf<'_> {
 }
 
 impl lower::Host for RustcHost<'_> {
-    fn prof(&self) -> &dyn lower::Prof {
-        &self.prof
+    fn prof(&self) -> Arc<dyn lower::Prof> {
+        self.prof.clone()
     }
     fn fatal(&self, msg: String) -> ! {
         self.sess.dcx().fatal(msg)
@@ -747,7 +748,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     }
     let host = RustcHost {
         sess: cx.tcx.sess,
-        prof: RustcProf(&cx.tcx.sess.prof),
+        prof: Arc::new(RustcProf(cx.tcx.sess.prof.clone())),
     };
     let fin = cgupool::finish_b(ctx, st, cx.module, name, &cfg, &host, ir, iropt);
     PlironModule {

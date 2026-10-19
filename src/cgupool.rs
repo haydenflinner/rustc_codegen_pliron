@@ -162,17 +162,17 @@ impl CrateCfg {
 /// `lower::Host` on a worker: no `Session` — the profiler is the only
 /// live rustc handle; user-facing fatals travel as [`HostFatal`] panics
 /// and are relayed to the shared emitter by `run_until`.
-struct WorkerHost<'a> {
-    prof: RustcProf<'a>,
+struct WorkerHost {
+    prof: Arc<RustcProf>,
     sse42: bool,
 }
 
 /// Panic payload for a clean (non-ICE) `Host::fatal` raised inside a job.
 struct HostFatal(String);
 
-impl lower::Host for WorkerHost<'_> {
-    fn prof(&self) -> &dyn lower::Prof {
-        &self.prof
+impl lower::Host for WorkerHost {
+    fn prof(&self) -> Arc<dyn lower::Prof> {
+        self.prof.clone()
     }
     fn fatal(&self, msg: String) -> ! {
         std::panic::panic_any(HostFatal(msg))
@@ -391,7 +391,7 @@ fn emit_err(emitter: &SharedEmitter, msg: String) {
 
 fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
     let host = WorkerHost {
-        prof: RustcProf(prof),
+        prof: Arc::new(RustcProf(prof.clone())),
         sse42: job.cfg.sse42,
     };
     match job.step {
