@@ -1573,8 +1573,12 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     if k > 0 && config().enabled("PLIRON_UNROLL_CLEANUP") {
         let ub = jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
         let (mut dp, mut di) = (0, 0);
+        // Everything the loop runs keeps predecessor sets: param drops
+        // shrink edge args, `fold_same_target_brifs` rewrites in place,
+        // and `remove_dead_insts` can't reach terminators.
+        let ucfg = ControlFlowGraph::with_function(&p.clctx.func);
         for _ in 0..4 {
-            let p2 = jumpthread::remove_dead_params(&mut p.clctx.func)
+            let p2 = jumpthread::remove_dead_params(&mut p.clctx.func, &ucfg)
                 + jumpthread::fold_same_target_brifs(&mut p.clctx.func);
             let i = jumpthread::remove_dead_insts(&mut p.clctx.func, true);
             (dp, di) = (dp + p2, di + i);
@@ -3380,7 +3384,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         any: 0,
         creates: shape::CREATED,
         gate: Gate::Env("PLIRON_DEADP"),
-        run: |p, _an| jumpthread::remove_dead_params(&mut p.clctx.func),
+        run: |p, an| {
+            let (cfg, _) = an.cfg_dt(&p.clctx.func);
+            jumpthread::remove_dead_params(&mut p.clctx.func, cfg)
+        },
         site: std::sync::OnceLock::new(),
     }
     .needs(shape::BPARAM),

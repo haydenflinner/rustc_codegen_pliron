@@ -2465,15 +2465,18 @@ pub fn webmerge_ctx(
     } else {
         dirty
     };
+    // The per-block clocks only feed `wmprof` diagnostics — don't pay
+    // two syscalls per block per round when it's off.
+    let el = |t: Option<std::time::Instant>| t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     for (&b, es) in edges.iter() {
-        let tb0 = std::time::Instant::now();
+        let tb0 = wmprof.then(std::time::Instant::now);
         if dirty.is_some_and(|d| !d.contains(&b)) {
-            tpre_sum += tb0.elapsed();
+            tpre_sum += el(tb0);
             continue;
         }
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
-            tpre_sum += tb0.elapsed();
+            tpre_sum += el(tb0);
             continue;
         }
         // `diff_b` re-proves the same (x, y) pairs across oracle calls
@@ -2503,10 +2506,10 @@ pub fn webmerge_ctx(
             };
         }
         if es.len().saturating_mul(ps.len()) > 4_000_000 {
-            tpre_sum += tb0.elapsed();
+            tpre_sum += el(tb0);
             continue;
         }
-        tpre_sum += tb0.elapsed();
+        tpre_sum += el(tb0);
         // Per-edge resolved args: `eargs[e][ix]` for `Value` args,
         // `svh[e][ix]` for their structural hash — pseudo-args
         // (`TryCallRet`/`TryCallExn`) are `None` in `eargs` but key as
@@ -2516,7 +2519,7 @@ pub fn webmerge_ctx(
         // materializes on demand: hashing the def-DAG directly via
         // `vhash` skips building ~10⁵-node `Key` trees for slots that
         // never merge (unrolled hash kernels reach ~877k nodes).
-        let tkeys = std::time::Instant::now();
+        let tkeys = wmprof.then(std::time::Instant::now);
         let mut eargs: Vec<Vec<Option<Value>>> = Vec::with_capacity(es.len());
         let mut svh: Vec<Vec<u64>> = Vec::with_capacity(es.len());
         // O-payload per pseudo-arg cell for `skey_of` to reconstruct.
@@ -2728,8 +2731,8 @@ pub fn webmerge_ctx(
         // budget only means "unproven" (no merge), never a wrong merge.
         const DIFF_B_BLOCK_FUEL: usize = 4096;
         let dfuel_cap = (DIFF_B_BLOCK_FUEL / ps.len().max(1)).clamp(2, 96) as i32;
-        let tblk = std::time::Instant::now();
-        let dkeys = tblk - tkeys;
+        let tblk = wmprof.then(std::time::Instant::now);
+        let dkeys = tblk.and_then(|e| tkeys.map(|s| e - s)).unwrap_or_default();
         nblk += 1;
         tkeys_sum += dkeys;
         if wmprof && dkeys.as_micros() > 200 {
@@ -3182,7 +3185,7 @@ pub fn webmerge_ctx(
         // `p1`; with seeds in place the shared `stack` catches the cycle
         // and both resolve to `None`.
         if wmprof {
-            let d = tblk.elapsed();
+            let d = el(tblk);
             if d.as_micros() > 200 {
                 if pliron_cfg::tracing_on() {
                     tracing::info!(target: "pliron::clifpeep", "webmerge {} {b}: {} slots {} edges ixl {:?}",
@@ -3228,7 +3231,7 @@ pub fn webmerge_ctx(
             }
         }
 
-        let dblk = tblk.elapsed();
+        let dblk = el(tblk);
         tblk_sum += dblk;
         if wmprof && dblk.as_micros() > 200 {
             if pliron_cfg::tracing_on() {

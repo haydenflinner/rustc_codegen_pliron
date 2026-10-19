@@ -3772,26 +3772,24 @@ fn mark_live_param(
     }
 }
 
-pub fn remove_dead_params(func: &mut Function) -> usize {
+pub fn remove_dead_params(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut live: FxHashMap<Block, Vec<bool>> = blocks
         .iter()
         .map(|&block| (block, vec![false; func.dfg.num_block_params(block)]))
         .collect();
     let mut protected: FxHashSet<Block> = func.layout.entry_block().into_iter().collect();
-    // `preds[b]` = (terminator, dest-slot) pairs feeding b — args are
+    // In-edges come from the caller's CFG (`pred_iter`) instead of a
+    // per-edge (inst, dest) map built here every round. Edge args are
     // re-read on demand, so edges whose target never marks a live param
     // don't pay for a Vec<BlockArg> each.
-    let mut preds: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
     let mut work = Vec::new();
 
     for &block in &blocks {
         for inst in func.layout.block_insts(block) {
             let data = &func.dfg.insts[inst];
-            for (di, call) in data
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-                .into_iter()
-                .enumerate()
+            for call in
+                data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             {
                 let target = call.block(&func.dfg.value_lists);
                 if call
@@ -3800,7 +3798,6 @@ pub fn remove_dead_params(func: &mut Function) -> usize {
                 {
                     protected.insert(target);
                 }
-                preds.entry(target).or_default().push((inst, di));
             }
             for &value in func.dfg.inst_args(inst) {
                 mark_live_param(func, value, &mut live, &mut work);
@@ -3830,14 +3827,17 @@ pub fn remove_dead_params(func: &mut Function) -> usize {
     }
 
     while let Some((target, index)) = work.pop() {
-        let Some(incoming) = preds.get(&target) else {
-            continue;
-        };
-        for &(term, di) in incoming {
-            let bc = func.dfg.insts[term]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[di];
-            if let Some(BlockArg::Value(value)) = bc.args(&func.dfg.value_lists).nth(index) {
-                mark_live_param(func, value, &mut live, &mut work);
+        for pred in cfg.pred_iter(target) {
+            for bc in func.dfg.insts[pred.inst].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                if bc.block(&func.dfg.value_lists) != target {
+                    continue;
+                }
+                if let Some(BlockArg::Value(value)) = bc.args(&func.dfg.value_lists).nth(index) {
+                    mark_live_param(func, value, &mut live, &mut work);
+                }
             }
         }
     }
@@ -4117,7 +4117,10 @@ pub fn run(
             tp = std::time::Instant::now();
         }
         if deadp && sh & shape::BPARAM != 0 {
-            let removed = remove_dead_params(func);
+            let removed = {
+                let (c, _) = cd.get_or_insert_with(|| cfg_dt(func));
+                remove_dead_params(func, c)
+            };
             dead_params += removed;
             if removed != 0 {
                 remove_unused_notrap_loads(func);
@@ -4232,6 +4235,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::remove_dead_params;
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -4274,7 +4278,8 @@ mod tests {
             (loop_block, exit_block)
         };
 
-        assert_eq!(remove_dead_params(&mut func), 1);
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(remove_dead_params(&mut func, &cfg), 1);
         assert_eq!(func.dfg.num_block_params(loop_block), 1);
         assert_eq!(func.dfg.num_block_params(exit_block), 1);
         for block in func.layout.blocks() {

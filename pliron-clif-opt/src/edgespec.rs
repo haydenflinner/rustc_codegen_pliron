@@ -1260,7 +1260,10 @@ pub fn run(func: &mut Function) -> usize {
     let tp = std::time::Instant::now();
     let d = deadbits(func);
     if d > 0 {
-        crate::jumpthread::remove_dead_params(func);
+        crate::jumpthread::remove_dead_params(
+            func,
+            &cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func),
+        );
         sweep_dead(func);
         sweep_blocks(func);
         n += d;
