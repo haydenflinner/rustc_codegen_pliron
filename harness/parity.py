@@ -16,14 +16,31 @@ Paste summary.md's tables into docs/PARITY.md when they move.
 Noise: kernels within ±3% are parity on a quiet machine; run nothing
 else heavy meanwhile (the gate, other agents' builds) or the numbers lie.
 """
-import argparse, json, math, os, re, subprocess, sys, time
+import argparse, json, math, os, re, shutil, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "target/parity")
+
+
+def _git_bash():
+    """On Windows, subprocess finds the WSL stub (System32\\bash.exe) before
+    Git Bash. Prefer the Git install; fall back to PATH minus the stubs."""
+    cands = [r"C:\Program Files\Git\bin\bash.exe",
+             r"C:\Program Files (x86)\Git\bin\bash.exe",
+             shutil.which("bash")]
+    for c in cands:
+        if c and os.path.isfile(c) and "system32" not in c.lower() \
+                and "windowsapps" not in c.lower():
+            return c
+    return "bash"
+
+
+SH = [_git_bash()] if os.name == "nt" else []
+PY = [sys.executable, "-I"] if os.name == "nt" else []
 LEGS = {
-    "native": ["bench/run.sh"],
-    "wasm": ["bench/wasm/run.sh"],
-    "ctime": ["harness/ctime.py"],
+    "native": SH + ["bench/run.sh"],
+    "wasm": SH + ["bench/wasm/run.sh"],
+    "ctime": PY + ["harness/ctime.py"],
 }
 UNIT = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1e3}
 
@@ -83,12 +100,14 @@ def main():
         print(f"parity: running {leg} ...", flush=True)
         with open(os.path.join(OUT, f"{leg}.log"), "w") as f:
             subprocess.run(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
-    rd = lambda leg: open(os.path.join(OUT, f"{leg}.log")).read() if os.path.exists(os.path.join(OUT, f"{leg}.log")) else ""
+    rd = lambda leg: open(os.path.join(OUT, f"{leg}.log"), encoding="utf-8",
+                          errors="replace").read() \
+        if os.path.exists(os.path.join(OUT, f"{leg}.log")) else ""
     native = parse_native(rd("native"))
     wasm, sizes = parse_wasm(rd("wasm"))
     ctp = os.path.join(OUT, "ctime.json")
     ctime = json.load(open(ctp)) if os.path.exists(ctp) else None
-    rev = subprocess.run(["harness/src-rev.sh"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    rev = subprocess.run(SH + ["harness/src-rev.sh"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     host = subprocess.run(["rustc", "-vV"], cwd=ROOT, capture_output=True, text=True).stdout
     host = re.search(r"host: (\S+)", host).group(1) if "host:" in host else "?"
     md = [f"# Parity run — {time.strftime('%Y-%m-%d')}, {host}, backend {rev}", ""]
@@ -107,10 +126,12 @@ def main():
         md += ["", "## Native runtime", ""] + table(native)
     if wasm:
         md += ["", "## Wasm runtime", ""] + table(wasm)
-    open(os.path.join(OUT, "summary.md"), "w").write("\n".join(md) + "\n")
-    json.dump({"rev": rev, "host": host, "native": native, "wasm": wasm, "wasm_sizes": sizes,
-               "ctime": ctime, "native_geomean": gn, "wasm_geomean": gw},
-              open(os.path.join(OUT, "summary.json"), "w"), indent=1)
+    open(os.path.join(OUT, "summary.md"), "w", encoding="utf-8").write("\n".join(md) + "\n")
+    with open(os.path.join(OUT, "summary.json"), "w", encoding="utf-8") as jf:
+        json.dump({"rev": rev, "host": host, "native": native, "wasm": wasm, "wasm_sizes": sizes,
+                   "ctime": ctime, "native_geomean": gn, "wasm_geomean": gw}, jf, indent=1)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print("\n".join(md))
 
 

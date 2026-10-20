@@ -18,9 +18,24 @@ time goes inside one compile: rerun the pliron side with PLIRON_TIMING=1
 (per-step wall, sorted) or `samply record`; for the CLIF pipeline alone,
 `clif-check bench target/corpus/std` (no rustc). See docs/PARITY.md.
 """
-import argparse, glob, json, os, statistics, subprocess, sys, tempfile, time
+import argparse, glob, json, os, shutil, statistics, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git_bash():
+    """On Windows, bare `bash` resolves to the WSL stub (System32\\bash.exe)
+    before Git Bash. Prefer the Git install; fall back to PATH minus stubs."""
+    for c in (r"C:\Program Files\Git\bin\bash.exe",
+              r"C:\Program Files (x86)\Git\bin\bash.exe",
+              shutil.which("bash")):
+        if c and os.path.isfile(c) and "system32" not in c.lower() \
+                and "windowsapps" not in c.lower():
+            return c
+    return "bash"
+
+
+SH = [git_bash()] if os.name == "nt" else []
 SO = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
 LIB = "" if sys.platform == "win32" else "lib"
 TOOLCHAIN = open(os.path.join(ROOT, "rust-toolchain.toml")).read().split('channel = "')[1].split('"')[0]
@@ -91,7 +106,7 @@ def main():
         print(f"{name:<14} {f(res['llvm'])} {f(res['pliron'])} {ratio:6.2f}x" if ratio else
               f"{name:<14} {f(res['llvm'])} {f(res['pliron'])}       -", flush=True)
     os.makedirs(os.path.dirname(a.json), exist_ok=True)
-    rev = subprocess.run(["harness/src-rev.sh"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    rev = subprocess.run(SH + ["harness/src-rev.sh"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     json.dump({"rev": rev, "profile": prof, "runs": a.runs, "rows": rows, "when": int(time.time())},
               open(a.json, "w"), indent=1)
 
