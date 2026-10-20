@@ -6251,6 +6251,29 @@ mod clif_emit {
             match (f, t) {
                 (WT::I64, WT::I32) => self.op(O::I32WrapI64, &[v], WT::I32),
                 (WT::I32, WT::I64) => self.op(O::I64ExtendI32U, &[v], WT::I64),
+                // f64-carried pointers: the address bits ride the f64's
+                // pattern — reinterpret, then wrap/extend (`load.i32`
+                // on `pow`'s exponent-carried table pointer).
+                (WT::F64, WT::I64) => self.op(O::I64ReinterpretF64, &[v], WT::I64),
+                (WT::I64, WT::F64) => self.op(O::F64ReinterpretI64, &[v], WT::F64),
+                (WT::F32, WT::I32) => self.op(O::I32ReinterpretF32, &[v], WT::I32),
+                (WT::I32, WT::F32) => self.op(O::F32ReinterpretI32, &[v], WT::F32),
+                (WT::F64, WT::I32) => {
+                    let w = self.op(O::I64ReinterpretF64, &[v], WT::I64);
+                    self.op(O::I32WrapI64, &[w], WT::I32)
+                }
+                (WT::I32, WT::F64) => {
+                    let w = self.op(O::I64ExtendI32U, &[v], WT::I64);
+                    self.op(O::F64ReinterpretI64, &[w], WT::F64)
+                }
+                (WT::F32, WT::I64) => {
+                    let w = self.op(O::I32ReinterpretF32, &[v], WT::I32);
+                    self.op(O::I64ExtendI32U, &[w], WT::I64)
+                }
+                (WT::I64, WT::F32) => {
+                    let w = self.op(O::I32WrapI64, &[v], WT::I32);
+                    self.op(O::F32ReinterpretI32, &[w], WT::F32)
+                }
                 _ => panic!("cvt {f:?} -> {t:?}"),
             }
         }
@@ -6524,11 +6547,23 @@ mod clif_emit {
         /// `x < 0` branches (wasm `if`/`br_if`/`select` read i32). Emit
         /// `v != 0` for i64 operands instead.
         fn cond(&mut self, v: WV) -> WV {
-            if self.ty_of(v) == WT::I64 {
-                let z = self.i64c(0);
-                self.op(O::I64Ne, &[v, z], WT::I32)
-            } else {
-                self.cvt(v, WT::I32)
+            match self.ty_of(v) {
+                WT::I64 => {
+                    let z = self.i64c(0);
+                    self.op(O::I64Ne, &[v, z], WT::I32)
+                }
+                // `brif`/`if`/`select` directly on a float (libm's
+                // `if x` tests) — emit `v != 0.0`; `cvt` has no
+                // float-to-i32 path.
+                WT::F32 => {
+                    let z = self.op(O::F32Const { value: 0 }, &[], WT::F32);
+                    self.op(O::F32Ne, &[v, z], WT::I32)
+                }
+                WT::F64 => {
+                    let z = self.op(O::F64Const { value: 0 }, &[], WT::F64);
+                    self.op(O::F64Ne, &[v, z], WT::I32)
+                }
+                _ => self.cvt(v, WT::I32),
             }
         }
 
