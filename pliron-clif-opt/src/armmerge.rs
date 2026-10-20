@@ -334,7 +334,18 @@ fn plan(func: &Function, preds: &FxHashMap<Block, u32>, b: Block) -> Option<Work
     for (&it, &ie) in it_list.iter().zip(ie_list.iter()) {
         let dt_ = func.dfg.insts[it];
         let de_ = func.dfg.insts[ie];
-        if !same_shape(&dt_, &de_) {
+        // The controlling type isn't in `InstructionData`: `iconst.i8 0`
+        // and `iconst.i32 0` (or `load.i8`/`load.i32` at one offset) share
+        // a shape but not their results.
+        if !same_shape(&dt_, &de_)
+            || func.dfg.ctrl_typevar(it) != func.dfg.ctrl_typevar(ie)
+            || !func
+                .dfg
+                .inst_results(it)
+                .iter()
+                .map(|&r| func.dfg.value_type(r))
+                .eq(func.dfg.inst_results(ie).iter().map(|&r| func.dfg.value_type(r)))
+        {
             return None;
         }
         let args_t = ops_of(func, it);
