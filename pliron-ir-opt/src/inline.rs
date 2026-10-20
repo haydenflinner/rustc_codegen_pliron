@@ -1021,6 +1021,9 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    // `PLIRON_INLINE_HIST=1`: a site cloned out of an inlined body may not
+    // inline a callee already on its clone chain (`State::inline_hist`).
+    let hist = crate::env_is("PLIRON_INLINE_HIST", "1");
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
@@ -1274,6 +1277,8 @@ pub fn run(
                         "reject (eh)"
                     } else if ci.op == caller || st.calls[op].fn_ty != f.ty {
                         "reject (self/fnty)"
+                    } else if hist && on_chain(st, op, ci.op) {
+                        "reject (recursive)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
                     } else if model && !free && grown + ci.n > growth {
@@ -1334,6 +1339,18 @@ pub fn run(
     delta
 }
 
+/// Whether `callee` was already inlined somewhere on `site`'s clone chain.
+fn on_chain(st: &State, site: Ptr<Operation>, callee: Ptr<Operation>) -> bool {
+    let mut i = st.inline_hist.get(site).copied().unwrap_or(u32::MAX);
+    while let Some(&(f, p)) = st.inline_hist_nodes.get(i as usize) {
+        if f == callee {
+            return true;
+        }
+        i = p;
+    }
+    false
+}
+
 /// Indirect calls whose callee is a constant function address (a vtable slot
 /// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
 /// become direct calls. Returns the rewritten calls plus the callers owning
@@ -1383,6 +1400,9 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
                 }
                 let info = st.calls.remove(c).unwrap();
                 st.calls.insert(nc, info);
+                if let Some(h) = st.inline_hist.remove(c) {
+                    st.inline_hist.insert(nc, h);
+                }
                 if let Some(u) = st.invokes.remove(c) {
                     st.invokes.insert(nc, u);
                 }
@@ -2440,11 +2460,19 @@ fn inline_call(
             st.region_frozen_op.insert(nv, f);
         }
     }
+    // History node for calls cloned out of this body, pushed on first use.
+    let parent = st.inline_hist.get(call).copied().unwrap_or(u32::MAX);
+    let mut hist_node = None;
     for &(op, m) in &tags.ops {
         let Some(new) = map.lookup_op(op) else {
             continue;
         };
         if m & OP_CALLS != 0 {
+            let node = *hist_node.get_or_insert_with(|| {
+                st.inline_hist_nodes.push((callee, parent));
+                st.inline_hist_nodes.len() as u32 - 1
+            });
+            st.inline_hist.insert(new, node);
             st.calls.insert(new, st.calls[op].clone());
             if let Some(&(lp, catch)) = st.invokes.get(op) {
                 st.invokes
