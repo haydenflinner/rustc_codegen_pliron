@@ -463,6 +463,13 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     if fields.is_empty() || fields.len() > MAX_FIELDS {
         return 0;
     }
+    // `PLIRON_SLOTPROM_FIELDS=N` promotes only the first N fields
+    // (bisect aid — `accs` iteration is FxHash-deterministic).
+    if let Some(n) = crate::env_get("PLIRON_SLOTPROM_FIELDS")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        fields.truncate(n);
+    }
 
     let mut blk_ix: FxHashMap<Block, u32> = FxHashMap::default();
     let mut blocks_vec: Vec<Block> = Vec::new();
