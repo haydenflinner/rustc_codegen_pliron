@@ -202,13 +202,14 @@ impl<T: DefUseParticipant> DefNode<T> {
     /// This definition has a new use by `user_op`. Track it and return
     /// the corresponding [UseNode] and the use's uid, to be stored in
     /// the operand.
+    /// PLIRON: takes the `use_links` arena mutably so callers creating
+    /// many operands hold one borrow instead of one per operand.
     pub(crate) fn add_use(
         &mut self,
-        ctx: &Context,
+        links: &mut UseLinks,
         self_descr: T,
         user_op: Ptr<Operation>,
     ) -> (UseNode<T>, u64) {
-        let mut links = ctx.use_links.borrow_mut();
         let idx = links.alloc(user_op);
         let uid = links.arena[idx as usize].use_uid;
         links.arena[idx as usize].prev = self.tail;
@@ -225,8 +226,8 @@ impl<T: DefUseParticipant> DefNode<T> {
     /// Remove `use` from the underlying definition.
     /// The tail node takes the removed node's chain position, so
     /// iteration order matches `indexmap`'s `swap_remove` semantics.
-    pub(crate) fn remove_use(&mut self, ctx: &Context, r#use: &Use<T>) {
-        let mut links = ctx.use_links.borrow_mut();
+    /// PLIRON: takes the `use_links` arena mutably — see `add_use`.
+    pub(crate) fn remove_use(&mut self, links: &mut UseLinks, r#use: &Use<T>) {
         let x = (r#use.use_uid & 0xffff_ffff) as u32;
         debug_assert!(
             links.arena[x as usize].use_uid == r#use.use_uid
@@ -283,8 +284,9 @@ impl<T: DefUseParticipant> DefNode<T> {
 
         // Add r#use as a use of `other` and repoint the operand (its
         // [UseNode] and its use uid — the new list entry has a new uid).
+        let mut links = ctx.use_links.borrow_mut();
         let (new_use_node, new_uid) =
-            other.get_defnode_mut(ctx).add_use(ctx, *other, r#use.user_op);
+            other.get_defnode_mut(ctx).add_use(&mut links, *other, r#use.user_op);
         {
             let mut operand = T::get_operand_mut(r#use, ctx);
             operand.r#use = new_use_node;
@@ -292,7 +294,7 @@ impl<T: DefUseParticipant> DefNode<T> {
         }
 
         // `this` will no longer have r#use as a use.
-        this.get_defnode_mut(ctx).remove_use(ctx, r#use);
+        this.get_defnode_mut(ctx).remove_use(&mut links, r#use);
     }
 }
 

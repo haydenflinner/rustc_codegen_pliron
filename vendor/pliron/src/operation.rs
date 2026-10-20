@@ -38,7 +38,9 @@ use crate::{
     region::Region,
     result::Result,
     r#type::{TypeHandle, Typed},
-    value::{DefNode, DefTrait, DefUseParticipant, DefiningEntity, Use, UseNode, Value},
+    value::{
+        DefNode, DefTrait, DefUseParticipant, DefiningEntity, Use, UseLinks, UseNode, Value,
+    },
     verify_err, verify_error,
 };
 
@@ -354,23 +356,50 @@ impl Operation {
 
         // Create the new Operation.
         let newop = Self::alloc(ctx, f);
-        // Update the results (we can't do this easily during creation).
-        let results: Vec<OpResult> = result_types
-            .into_iter()
-            .map(|ty| OpResult::new(ctx, ty))
-            .collect();
-        newop.deref_mut(ctx).results = Self::alloc_result_span(ctx, results);
-        // Update the operands (we can't do this easily during creation).
-        let operands: Vec<Operand<Value>> = operands
-            .iter()
-            .map(|def| Operand::new(ctx, *def, newop))
-            .collect();
-        newop.deref_mut(ctx).operands = Self::alloc_operand_span(ctx, operands);
-        let successors: Vec<Operand<Ptr<BasicBlock>>> = successors
-            .iter()
-            .map(|def| Operand::new(ctx, *def, newop))
-            .collect();
-        newop.deref_mut(ctx).successors = Self::alloc_successor_span(ctx, successors);
+        // PLIRON: results/operands/successors push straight into the
+        // global pools (one borrow per kind, no intermediate Vec) and
+        // operand creation shares one `use_links` borrow per span.
+        let results_span = {
+            let mut pool = ctx.op_result_pool.borrow_mut();
+            pool.reserve(result_types.len());
+            let off = pool.len() as u32;
+            for ty in result_types {
+                pool.push(OpResult::new(ctx, ty));
+            }
+            OpSpan {
+                off,
+                len: pool.len() as u32 - off,
+            }
+        };
+        newop.deref_mut(ctx).results = results_span;
+        let operands_span = {
+            let mut pool = ctx.op_operand_pool.borrow_mut();
+            let mut links = ctx.use_links.borrow_mut();
+            pool.reserve(operands.len());
+            let off = pool.len() as u32;
+            for def in operands.iter() {
+                pool.push(Operand::new(ctx, *def, newop, &mut links));
+            }
+            OpSpan {
+                off,
+                len: pool.len() as u32 - off,
+            }
+        };
+        newop.deref_mut(ctx).operands = operands_span;
+        let successors_span = {
+            let mut pool = ctx.op_successor_pool.borrow_mut();
+            let mut links = ctx.use_links.borrow_mut();
+            pool.reserve(successors.len());
+            let off = pool.len() as u32;
+            for def in successors.iter() {
+                pool.push(Operand::new(ctx, *def, newop, &mut links));
+            }
+            OpSpan {
+                off,
+                len: pool.len() as u32 - off,
+            }
+        };
+        newop.deref_mut(ctx).successors = successors_span;
         let new_regions: Vec<Ptr<Region>> = (0..num_regions)
             .map(|_| Region::new(ctx, newop))
             .collect();
@@ -390,26 +419,6 @@ impl Operation {
     #[inline]
     pub fn attributes_mut(&mut self) -> &mut crate::attribute::AttributeDict {
         &mut self.attributes
-    }
-
-    /// PLIRON: append `items` to the global result pool, returning
-    /// the covering span.
-    fn alloc_result_span(ctx: &Context, items: Vec<OpResult>) -> OpSpan {
-        let mut pool = ctx.op_result_pool.borrow_mut();
-        let off = pool.len() as u32;
-        let len = items.len() as u32;
-        pool.extend(items);
-        OpSpan { off, len }
-    }
-
-    /// PLIRON: append `items` to the global operand pool, returning
-    /// the covering span.
-    fn alloc_operand_span(ctx: &Context, items: Vec<Operand<Value>>) -> OpSpan {
-        let mut pool = ctx.op_operand_pool.borrow_mut();
-        let off = pool.len() as u32;
-        let len = items.len() as u32;
-        pool.extend(items);
-        OpSpan { off, len }
     }
 
     /// PLIRON: raw result-node slice borrowed from the context pool
@@ -469,8 +478,9 @@ impl Operation {
         let span = ptr.deref(ctx).operands;
         {
             let pool = ctx.op_operand_pool.borrow();
+            let mut links = ctx.use_links.borrow_mut();
             for opd in &pool[span.range()] {
-                opd.drop_use(ctx, ptr);
+                opd.drop_use(ctx, ptr, &mut links);
             }
         }
         ptr.deref_mut(ctx).operands = OpSpan::default();
@@ -482,11 +492,19 @@ impl Operation {
     /// behaviour of operand mutation).
     fn rewrite_operands(ptr: Ptr<Self>, ctx: &Context, defs: Vec<Value>) {
         Self::drop_operand_uses(ptr, ctx);
-        let ops: Vec<Operand<Value>> = defs
-            .into_iter()
-            .map(|def| Operand::new(ctx, def, ptr))
-            .collect();
-        let span = Self::alloc_operand_span(ctx, ops);
+        let span = {
+            let mut pool = ctx.op_operand_pool.borrow_mut();
+            let mut links = ctx.use_links.borrow_mut();
+            pool.reserve(defs.len());
+            let off = pool.len() as u32;
+            for def in defs.into_iter() {
+                pool.push(Operand::new(ctx, def, ptr, &mut links));
+            }
+            OpSpan {
+                off,
+                len: pool.len() as u32 - off,
+            }
+        };
         ptr.deref_mut(ctx).operands = span;
     }
 
@@ -524,19 +542,6 @@ impl Operation {
         }
     }
 
-    /// PLIRON: append `items` to the global successor pool, returning
-    /// the span covering them.
-    fn alloc_successor_span(
-        ctx: &Context,
-        items: Vec<Operand<Ptr<BasicBlock>>>,
-    ) -> OpSpan {
-        let mut pool = ctx.op_successor_pool.borrow_mut();
-        let off = pool.len() as u32;
-        let len = items.len() as u32;
-        pool.extend(items);
-        OpSpan { off, len }
-    }
-
     /// PLIRON: raw successor-node slice borrowed from the context pool
     /// (crate-internal read hatch).
     #[inline]
@@ -569,8 +574,9 @@ impl Operation {
         let span = ptr.deref(ctx).successors;
         {
             let pool = ctx.op_successor_pool.borrow();
+            let mut links = ctx.use_links.borrow_mut();
             for succ in &pool[span.range()] {
-                succ.drop_use(ctx, ptr);
+                succ.drop_use(ctx, ptr, &mut links);
             }
         }
         ptr.deref_mut(ctx).successors = OpSpan::default();
@@ -582,11 +588,19 @@ impl Operation {
     /// of successor mutation).
     fn rewrite_successors(ptr: Ptr<Self>, ctx: &Context, defs: Vec<Ptr<BasicBlock>>) {
         Self::drop_successor_uses(ptr, ctx);
-        let ops: Vec<Operand<Ptr<BasicBlock>>> = defs
-            .into_iter()
-            .map(|def| Operand::new(ctx, def, ptr))
-            .collect();
-        let span = Self::alloc_successor_span(ctx, ops);
+        let span = {
+            let mut pool = ctx.op_successor_pool.borrow_mut();
+            let mut links = ctx.use_links.borrow_mut();
+            pool.reserve(defs.len());
+            let off = pool.len() as u32;
+            for def in defs.into_iter() {
+                pool.push(Operand::new(ctx, def, ptr, &mut links));
+            }
+            OpSpan {
+                off,
+                len: pool.len() as u32 - off,
+            }
+        };
         ptr.deref_mut(ctx).successors = span;
     }
 
@@ -777,13 +791,14 @@ impl Operation {
     /// Replace opd_idx'th operand of `this` with `other`. Panics on invalid index.
     /// Any [`Use<Value>`](Use) of the replaced operand will be invalidated.
     pub fn replace_operand(this: Ptr<Operation>, ctx: &Context, opd_idx: usize, other: Value) {
-        let new_operand = Operand::new(ctx, other, this);
+        let mut links = ctx.use_links.borrow_mut();
+        let new_operand = Operand::new(ctx, other, this, &mut links);
         let span = this.deref(ctx).operands;
         let old = {
             let mut pool = ctx.op_operand_pool.borrow_mut();
             core::mem::replace(&mut pool[span.range()][opd_idx], new_operand)
         };
-        old.drop_use(ctx, this);
+        old.drop_use(ctx, this, &mut links);
     }
 
     /// Insert a new operand at `opd_idx`, shifting existing operands, from `opd_idx`,
@@ -832,13 +847,14 @@ impl Operation {
         succ_idx: usize,
         other: Ptr<BasicBlock>,
     ) {
-        let new_successor = Operand::new(ctx, other, this);
+        let mut links = ctx.use_links.borrow_mut();
+        let new_successor = Operand::new(ctx, other, this, &mut links);
         let span = this.deref(ctx).successors;
         let old = {
             let mut pool = ctx.op_successor_pool.borrow_mut();
             core::mem::replace(&mut pool[span.range()][succ_idx], new_successor)
         };
-        old.drop_use(ctx, this);
+        old.drop_use(ctx, this, &mut links);
     }
 
     /// Add a new successor to the end of the successor list, returning its index.
@@ -1173,9 +1189,11 @@ impl<T: DefUseParticipant + DefTrait> Operand<T> {
     }
 
     /// Drop this use, removing self from its definition's uses list.
-    fn drop_use(&self, ctx: &Context, op: Ptr<Operation>) {
+    /// PLIRON: `links` is the caller's `use_links` borrow — span walks
+    /// drop many operands under one borrow.
+    fn drop_use(&self, ctx: &Context, op: Ptr<Operation>, links: &mut UseLinks) {
         self.get_def().get_defnode_mut(ctx).remove_use(
-            ctx,
+            links,
             &Use {
                 user_op: op,
                 use_uid: self.use_uid,
@@ -1185,10 +1203,17 @@ impl<T: DefUseParticipant + DefTrait> Operand<T> {
     }
 
     /// Create a new Operand in `user_op`.
-    fn new(ctx: &Context, def: T, user_op: Ptr<Operation>) -> Operand<T> {
+    /// PLIRON: `links` is the caller's `use_links` borrow — span
+    /// construction creates many operands under one borrow.
+    fn new(
+        ctx: &Context,
+        def: T,
+        user_op: Ptr<Operation>,
+        links: &mut UseLinks,
+    ) -> Operand<T> {
         // PLIRON: the use's uid is minted by the intrusive use list —
         // (slot_gen << 32) | slot_index, see [crate::value::UseLinks].
-        let (unode, use_uid) = def.get_defnode_mut(ctx).add_use(ctx, def, user_op);
+        let (unode, use_uid) = def.get_defnode_mut(ctx).add_use(links, def, user_op);
         Operand {
             r#use: unode,
             use_uid,
