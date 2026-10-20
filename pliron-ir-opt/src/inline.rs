@@ -1021,9 +1021,9 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
-    // `PLIRON_INLINE_HIST=1`: a site cloned out of an inlined body may not
+    // `PLIRON_INLINE_HIST=0` lets a site cloned out of an inlined body
     // inline a callee already on its clone chain (`State::inline_hist`).
-    let hist = crate::env_is("PLIRON_INLINE_HIST", "1");
+    let hist = crate::pass_enabled("PLIRON_INLINE_HIST");
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
