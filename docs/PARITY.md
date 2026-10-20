@@ -23,7 +23,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | compile time: bench kernels, wasm | **0.79** (0.45 s vs 0.57 s) | ahead (2026-10-20; was 1.48) |
 | compile time: regex-syntax (~40 kLOC) | **0.94** (1.50 s vs 1.59 s) | parity on wall (2026-10-20; was 1.89); CPU 1.5x (6.9 vs 4.7 s) |
 | compile time: regex-syntax, wasm32 (one CGU) | **1.08** (3.04 s vs 2.81 s) | near parity (2026-10-20; was 7.3) |
-| compile time: syn 2 + `full` (~50 kLOC) | **1.35** (4.57 s vs 3.40 s) | behind (2026-10-20; was 15.0); CPU 1.8x (30 vs 17 s) |
+| compile time: syn 2 + `full` (~50 kLOC) | **1.14** (5.81 s vs 5.08 s, loaded box) | behind (2026-10-20; was 15-22); CPU 1.28x (24.8 vs 19.3 s) |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
@@ -122,6 +122,20 @@ noted):
   regression tests: `clifpeep::selord_sel` minted an i8 zero for a wider
   `select` condition; `armmerge` paired twin arms ignoring the
   controlling type (`load.i8` vs `load.i16`).
+- Tier 1 at `-O` (UI corpus) then found two bugs already present at
+  `4f8018e`, both fixed with regression tests: `bool_mask` handed out a
+  `src` that didn't compute its mask (`x ^ 1`, `icmp cc z, K` peels), so
+  `selord_icmp` aliased `icmp eq 1, (c ^ 1)` to `c` (UI
+  `deriving-cmp-generic-struct-enum.rs` wrong result); and `lin_flat`
+  looped forever on an alias cycle in unreachable code (`v6 -> v15`,
+  `v15 = iadd v6, 16` — UI `test-case-on-use-item-129765.rs` hung), now
+  bounded by a visit budget. The cyclic alias itself (param removal on a
+  dead loop) is the root cause still worth fixing. Tier 1 -O: 16,517 pass;
+  the only expectation miss is `hashmap-debug-format.rs`, skipped as
+  nondeterministic (randomized `HashMap` order).
+- Tooling: `clif-check step` now replays reap-gated steps
+  (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
+  a `post_sweep` miscompile used to print "unchanged".
 
 Rejected / measured: `PLIRON_XCGU=0` (−35% CPU, but kernels lose badly
 — copies are load-bearing); an EH-cold callsite rule (callsites reachable
