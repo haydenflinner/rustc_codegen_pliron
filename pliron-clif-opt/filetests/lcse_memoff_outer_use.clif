@@ -1,0 +1,29 @@
+; lcse's memoff walk peels `v4 = v3 + 48` so the first load reads `v3`,
+; then the nested-add rewrite mutates `v3`'s def in place — legal only when
+; the memory op is `v3`'s sole user. `v4` still uses `v3` for the second
+; load, but the use tally was never told the first load's operand moved to
+; `v3`, so `uses(v3) == 1` passes on `v4`'s stale edge and `v3` silently
+; changes meaning under a live user.
+;
+; Real-world hit: wgpu-core `State::flush_bindings` — three follow-on loads
+; of the corrupted intermediate read `v1+v846+48` instead of `+288`,
+; segfaulting in `flush_bindings_helper` during compute-pass encoding.
+
+; test lcse
+; check: v3 = iadd v9, v2
+; check-not: v3 = iadd v0, v9
+; check-not: v3+288
+
+function u0:0(i64, i64) apple_aarch64 {
+block0(v0: i64, v9: i64):
+    v10 = iconst.i64 240
+    v11 = iconst.i64 48
+    v2 = iadd.i64 v0, v10
+    v3 = iadd.i64 v9, v2
+    v4 = iadd.i64 v3, v11
+    v5 = load.i64 notrap v4
+    v6 = load.i64 notrap v4
+    v7 = iadd.i64 v5, v6
+    store.i64 notrap v7, v0
+    return
+}

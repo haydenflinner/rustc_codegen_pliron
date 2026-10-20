@@ -9749,6 +9749,13 @@ pub fn lcse(func: &mut Function) -> usize {
                 match off.checked_add(k).and_then(|x| i32::try_from(x).ok()) {
                     Some(no) => {
                         *off = i64::from(no);
+                        // The peel moves the memory operand from the
+                        // folded add to its base — move the use tally
+                        // with it, or the nested rewrite below sees a
+                        // stale `uses == 1` on a value the peeled add
+                        // still reads and mutates a live def.
+                        dec(func, cnt, *v);
+                        inc(func, cnt, b);
                         *v = b;
                         depth += 1;
                         continue;
@@ -9836,8 +9843,6 @@ pub fn lcse(func: &mut Function) -> usize {
                             *arg = a;
                             *offset = (off as i32).into();
                         }
-                        dec(func, &mut usecnt, arg);
-                        inc(func, &mut usecnt, a);
                         n += 1;
                         continue;
                     }
@@ -9851,8 +9856,6 @@ pub fn lcse(func: &mut Function) -> usize {
                             args[1] = a;
                             *offset = (off as i32).into();
                         }
-                        dec(func, &mut usecnt, args[1]);
-                        inc(func, &mut usecnt, a);
                         n += 1;
                         continue;
                     }
