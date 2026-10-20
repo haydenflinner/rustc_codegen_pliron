@@ -1026,6 +1026,11 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    // `PLIRON_INLINE_LOOPCALLS=<n>`: the in-loop bonus only for callees
+    // with at most `n` calls of their own (small mode's leaf-ish rule).
+    let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
     // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
     let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
         .and_then(|s| s.parse().ok())
@@ -1245,9 +1250,10 @@ pub fn run(
                         if f.cold {
                             cost = cost.saturating_mul(COLD_W);
                         }
-                        if loops
-                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
-                            .contains(&b)
+                        if ci.ncalls <= loop_calls
+                            && loops
+                                .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                                .contains(&b)
                         {
                             // `PLIRON_INLINE_LOOP` = bonus in limit/4 units.
                             // A callsite in a loop pays the call+prologue cost
