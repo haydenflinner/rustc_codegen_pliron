@@ -127,6 +127,38 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     })
 }
 
+/// `f(0..n)` on all cores (`PLIRON_PAR` sizes it, `=0` runs inline),
+/// results in index order. For per-function work that reads only its own
+/// input — the module is assembled afterwards in the serial order.
+fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
+    let threads = if par == Some(0) {
+        1
+    } else {
+        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .clamp(1, n.max(1))
+    };
+    if threads <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<T>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    *slots[i].lock().unwrap() = Some(f(i));
+                }
+            });
+        }
+    });
+    slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+}
+
 struct FDecl {
     name: String,
     sig: Signature,
@@ -263,9 +295,12 @@ fn emit_obj(
     // callers while `Call` targets still index `o.funcs`. Callees whose
     // last call edge disappears are dropped by wasm-ld's GC â€” this is
     // the main lever on the 4x function-count gap vs stock.
+    let t0 = std::time::Instant::now();
     if crate::env_get("PLIRON_WASM_INLINE") != Some("0") {
         winline(&mut o.funcs, verbose, o.sp);
     }
+    pliron_cfg::trace("*wasm-winline*", t0.elapsed().as_secs_f64() * 1e3, name);
+    let t0 = std::time::Instant::now();
 
     // Only import functions that are actually called; GOT.func globals
     // name their targets, so they don't need an import.
@@ -288,10 +323,26 @@ fn emit_obj(
     }
     let mut decls: Vec<Option<FDecl>> =
         std::mem::take(&mut o.funcs).into_iter().map(Some).collect();
-    for &old in &order {
-        let mut d = decls[old].take().unwrap();
+    let mut decls: Vec<FDecl> = order.iter().map(|&old| decls[old].take().unwrap()).collect();
+    for d in &mut decls {
+        if let Some(b) = d.body.as_mut() {
+            for v in b.values.values_mut() {
+                if let ValueDef::Operator(O::Call { function_index }, ..) = v {
+                    *function_index = Func::new(remap[function_index.index()]);
+                }
+            }
+        }
+    }
+    // Bodies compile independently (waffle's backend reads only the body).
+    let compiled: Vec<Option<Result<Vec<u8>, String>>> = par_map(decls.len(), |i| {
+        decls[i].body.as_ref().map(|b| match guarded(|| b.compile().map_err(|e| e.to_string())) {
+            Ok(Ok(c)) => Ok(c.into_raw_body()),
+            Ok(Err(e)) | Err(e) => Err(e),
+        })
+    });
+    for (d, c) in decls.into_iter().zip(compiled) {
         let f = Func::new(o.m.funcs.len());
-        match d.body.as_mut() {
+        match c {
             None => {
                 o.m.funcs.push(FuncDecl::Import(d.sig, d.name.clone()));
                 let (module, name) = st
@@ -305,15 +356,10 @@ fn emit_obj(
                     kind: ImportKind::Func(f),
                 });
             }
-            Some(b) => {
-                for v in b.values.values_mut() {
-                    if let ValueDef::Operator(O::Call { function_index }, ..) = v {
-                        *function_index = Func::new(remap[function_index.index()]);
-                    }
-                }
-                let bytes = match guarded(|| b.compile().map_err(|e| e.to_string())) {
-                    Ok(Ok(c)) => c.into_raw_body(),
-                    Ok(Err(e)) | Err(e) => {
+            Some(r) => {
+                let bytes = match r {
+                    Ok(c) => c,
+                    Err(e) => {
                         stubs += 1;
                         if let Some(f) = crate::env_get("PLIRON_WASM_STUBLOG") {
                             let _ = std::fs::OpenOptions::new()
@@ -349,12 +395,17 @@ fn emit_obj(
             "pliron-wasm: {name}: {stubs}/{defined} functions stubbed (PLIRON_WASM_VERBOSE=1 lists them)"
         );
     }
+    pliron_cfg::trace("*wasm-compile*", t0.elapsed().as_secs_f64() * 1e3, name);
+    let t0 = std::time::Instant::now();
     let mut bytes =
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
+    pliron_cfg::trace("*wasm-bytes*", t0.elapsed().as_secs_f64() * 1e3, name);
+    let t0 = std::time::Instant::now();
     if crate::pass_enabled("PLIRON_WASM_PEEP") {
         wpeep(&mut bytes);
     }
+    pliron_cfg::trace("*wasm-peep*", t0.elapsed().as_secs_f64() * 1e3, name);
     custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
     let mut tf = Vec::new();
     leb(&mut tf, features.len() as u32);
@@ -3368,7 +3419,8 @@ fn wpeep(bytes: &mut Vec<u8>) {
         };
         leb(&mut body_out, nf);
         let imp = fsig.len().saturating_sub(nf as usize);
-        for fi in 0..nf {
+        let mut spans = Vec::with_capacity(nf as usize);
+        for _ in 0..nf {
             let Some(bsz) = urd(bytes, &mut q) else {
                 return;
             };
@@ -3376,16 +3428,27 @@ fn wpeep(bytes: &mut Vec<u8>) {
             if be > e {
                 return;
             }
-            // `PLIRON_WASM_PEEP_LIMIT=N`: peephole only the first N bodies
-            // this process emits — bisects a wpeep miscompile to one body.
-            static PEEPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let limit = crate::env_get("PLIRON_WASM_PEEP_LIMIT").and_then(|v| v.parse::<u64>().ok());
-            let k = PEEPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let nb = if limit.is_none_or(|l| k < l) {
+            spans.push((q, be));
+            q = be;
+        }
+        if q != e {
+            return; // trailing bytes inside the code section
+        }
+        // `PLIRON_WASM_PEEP_LIMIT=N`: peephole only the first N bodies
+        // this process emits — bisects a wpeep miscompile to one body.
+        // Bodies are numbered in order (one block reservation per module)
+        // and peepholed in parallel: each reads only its own bytes.
+        static PEEPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let limit = crate::env_get("PLIRON_WASM_PEEP_LIMIT").and_then(|v| v.parse::<u64>().ok());
+        let base = PEEPED.fetch_add(nf as u64, std::sync::atomic::Ordering::Relaxed);
+        let bodies = par_map(spans.len(), |fi| {
+            let (q, be) = spans[fi];
+            let k = base + fi as u64;
+            if limit.is_none_or(|l| k < l) {
                 if crate::env_set("PLIRON_WASM_PEEP_LOG") {
-                    eprintln!("wpeep body {k} ({bsz} bytes)");
+                    eprintln!("wpeep body {k} ({} bytes)", be - q);
                 }
-                let nparams = fsig.get(imp + fi as usize).map(|&(np, _)| np).unwrap_or(0);
+                let nparams = fsig.get(imp + fi).map(|&(np, _)| np).unwrap_or(0);
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(
@@ -3403,13 +3466,11 @@ fn wpeep(bytes: &mut Vec<u8>) {
                 out
             } else {
                 bytes[q..be].to_vec()
-            };
+            }
+        });
+        for nb in bodies {
             leb(&mut body_out, nb.len() as u32);
             body_out.extend_from_slice(&nb);
-            q = be;
-        }
-        if q != e {
-            return; // trailing bytes inside the code section
         }
         leb(&mut out, body_out.len() as u32);
         out.extend_from_slice(&body_out);
@@ -9080,7 +9141,10 @@ mod clif_emit {
         unwind: bool,
     ) -> Vec<u8> {
         let simd = features.iter().any(|f| f == "simd128");
+        let t0 = std::time::Instant::now();
         let mut wc = crate::lower::lower_clif_wasm(ctx, st, host, name, unwind, simd);
+        pliron_cfg::trace("*wasm-clif*", t0.elapsed().as_secs_f64() * 1e3, name);
+        let t0 = std::time::Instant::now();
         let mut m = Module::empty();
         let mem = m.memories.push(MemoryData {
             initial_pages: 0,
@@ -9173,7 +9237,11 @@ mod clif_emit {
             };
             o.funcs[i].body = Some(body);
         }
-        emit_obj(o, ctx, st, name, features, stubs, defined, verbose)
+        pliron_cfg::trace("*wasm-translate*", t0.elapsed().as_secs_f64() * 1e3, name);
+        let t0 = std::time::Instant::now();
+        let obj = emit_obj(o, ctx, st, name, features, stubs, defined, verbose);
+        pliron_cfg::trace("*wasm-emit*", t0.elapsed().as_secs_f64() * 1e3, name);
+        obj
     }
 }
 
