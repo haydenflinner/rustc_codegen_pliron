@@ -1046,7 +1046,7 @@ pub fn peel_off(k: &Key) -> (&Key, i64) {
     match k {
         Key::A(_, b, o) => {
             let (r, o2) = peel_off(b);
-            (r, o + o2)
+            (r, o.wrapping_add(o2))
         }
         _ => (k, 0),
     }
@@ -1208,7 +1208,7 @@ pub fn key_sub_h(
     let (bx, ox) = peel_off(x);
     let (by, oy) = peel_off(y);
     if heq(bx, by, hm) && (ox != 0 || oy != 0) {
-        return Some(Key::K(ty, ox - oy));
+        return Some(Key::K(ty, ox.wrapping_sub(oy)));
     }
     // Shared-operand strip: `(a + c) - (b + c) = a - b`,
     // `(a - c) - (b - c) = a - b`.
@@ -1589,5 +1589,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `A`-chain offsets wrap like the address arithmetic they model:
+    /// `peel_off` and `key_sub`'s affine cancellation must not panic on
+    /// `i64::MIN`/`MAX` sums (rustlantis seed 14 hit an `ox - oy` overflow).
+    #[test]
+    fn extreme_offsets_wrap() {
+        let base = std::rc::Rc::new(Key::P(0));
+        let x = Key::A(
+            types::I64,
+            std::rc::Rc::new(Key::A(types::I64, base.clone(), i64::MAX)),
+            i64::MAX,
+        );
+        assert_eq!(peel_off(&x), (&Key::P(0), -2));
+        // base + MIN  −  base + MAX  wraps to 1.
+        let y = Key::A(types::I64, base.clone(), i64::MIN);
+        let z = Key::A(types::I64, base, i64::MAX);
+        assert!(matches!(
+            key_sub(&y, &z, types::I64, 8),
+            Some(Key::K(_, 1))
+        ));
     }
 }

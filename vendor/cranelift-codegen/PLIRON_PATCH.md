@@ -704,3 +704,8 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     the header param to `iadd param, 16`, and the def cycle hung
     `clifpeep::lin_flat` (rustc UI `test-case-on-use-item-129765.rs`
     with `--test`). Callers only lose transforms on dead code.
+58. `iconst_bounds` reports a bad controlling type instead of
+    `unreachable!()` (`src/verifier/mod.rs`): upstream assumes every
+    `iconst` is i8..i64 and panics on anything else, which aborted the
+    per-step verifier before it could name the pass that emitted the
+    bad inst (rustlantis seeds 65/89 — `iconst.i128` out of lcse/bandk).

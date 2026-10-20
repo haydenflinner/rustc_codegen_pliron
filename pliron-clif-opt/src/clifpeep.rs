@@ -5977,8 +5977,15 @@ fn bandk(func: &mut Function) -> usize {
     let n = hits.len() + zeros.len() + bxors.len();
     for i in zeros {
         let ty = func.dfg.value_type(func.dfg.first_result(i));
-        let pos = FuncCursor::new(func).at_inst(i);
-        pos.func.replace(i).iconst(ty, 0);
+        let mut pos = FuncCursor::new(func).at_inst(i);
+        if ty.bits() > 64 {
+            // `iconst` tops out at i64 — an i128 zero is `iconcat 0, 0`.
+            let lo = pos.ins().iconst(types::I64, 0);
+            let hi = pos.ins().iconst(types::I64, 0);
+            pos.func.replace(i).iconcat(lo, hi);
+        } else {
+            pos.func.replace(i).iconst(ty, 0);
+        }
     }
     for (i, base, k, opcode, ty, w) in hits {
         if func.layout.inst_block(i).is_none() {
@@ -7524,7 +7531,7 @@ fn rgpair(func: &Function, a: Value, b: Value) -> Option<RgFold> {
                 let other = if a == args[0] { args[1] } else { args[0] };
                 let Some(k) = kof(func, a) else { continue };
                 let lb = func.dfg.value_type(other).lane_bits();
-                let lm = if lb == 64 { u64::MAX } else { (1u64 << lb) - 1 };
+                let lm = if lb >= 64 { u64::MAX } else { (1u64 << lb) - 1 };
                 if !func.dfg.value_type(v).is_vector() {
                     if k & 1 == 1 {
                         next = Some(other);
@@ -9854,15 +9861,32 @@ pub fn lcse(func: &mut Function) -> usize {
                     let mut v = func.dfg.resolve_aliases(args[0]);
                     let mut k: i64 = 0;
                     let mut folded = false;
+                    let cty = func.dfg.value_type(func.dfg.first_result(i));
                     for _ in 0..8 {
                         if v == b {
-                            func.dfg.insts[i] = InstructionData::UnaryImm {
-                                opcode: Opcode::Iconst,
-                                imm: k.into(),
-                            };
-                            dec(func, &mut usecnt, args[0]);
-                            dec(func, &mut usecnt, args[1]);
-                            folded = true;
+                            if cty.is_int() && !cty.is_vector() {
+                                if cty.bits() > 64 {
+                                    // `iconst` tops out at i64 — an i128
+                                    // const is `iconcat lo, hi`.
+                                    let mut pos = FuncCursor::new(func).at_inst(i);
+                                    let lo = pos.ins().iconst(types::I64, k);
+                                    let hi = pos.ins().iconst(types::I64, k >> 63);
+                                    pos.func.dfg.insts[i] = InstructionData::Binary {
+                                        opcode: Opcode::Iconcat,
+                                        args: [lo, hi],
+                                    };
+                                    inc(func, &mut usecnt, lo);
+                                    inc(func, &mut usecnt, hi);
+                                } else {
+                                    func.dfg.insts[i] = InstructionData::UnaryImm {
+                                        opcode: Opcode::Iconst,
+                                        imm: k.into(),
+                                    };
+                                }
+                                dec(func, &mut usecnt, args[0]);
+                                dec(func, &mut usecnt, args[1]);
+                                folded = true;
+                            }
                             break;
                         }
                         let Some(d) = func.dfg.value_def(v).inst() else {

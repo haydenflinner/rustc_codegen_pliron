@@ -135,13 +135,12 @@ noted):
   to its own latch `iadd` (cranelift PLIRON_PATCH #57). Tier 1 -O: 16,517 pass;
   the only expectation miss is `hashmap-debug-format.rs`, skipped as
   nondeterministic (randomized `HashMap` order).
-- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 89 pass, 7 fail
-  — all identical at `4f8018e` (release dylib, harness flags), so
-  pre-existing despite docs' "0-512 pass": seed 1 -O run timeout, seed 24
-  -O0 wrong hash (**fixed** `c00303c`), seed 41 -O SIGSEGV, seeds 65
-  (-O0) / 88 / 89 ICE in aarch64 emit/ISLE (debug dylib: seed 88 is a
-  `tailmerge` verifier error, f64 address into `load.i32`), seed 14 a
-  debug-only overflow panic in `proots.rs:1211` (release passes).
+- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 93 pass, 3 fail
+  after `c00303c` + the iconst.i128/proots fixes below — seed 1 -O run
+  timeout, seed 41 -O SIGSEGV, seed 88 -O `tailmerge` verifier error
+  (f64 address into `load.i32`). Seed 14's debug-only
+  `proots.rs:1211` offset-subtract overflow (release passes; fixed by
+  wrapping key arithmetic — test `proots::tests::extreme_offsets_wrap`).
   Artifacts: `target/harness/fuzz/<seed>`.
   Seed 24 root cause: not `slotprom` — it merely created the trigger
   shape (a promoted i16 block param feeding `uextend.i128` into
@@ -150,6 +149,12 @@ noted):
   `lsl`/`eor`-produced i16 values keep garbage in bits 16..32, so the
   "zero-extended" low half read 0x52FFFF instead of 0xFFFF. Fixed with
   `put_in_reg_zext64` (PLIRON_PATCH #39); regression `tests/zext128`.
+  Seeds 65/89 shared one root cause: `lcse`'s `(x+c…)-x → Σc` fold and
+  `bandk`'s `band(band x,k1),k2 → 0` fold replaced the inst with
+  `iconst` at the result's own type — `iconst.i128` is invalid (verifier
+  `unreachable`; rgmerge's lane-mask probe also overflowed reading it).
+  Both now emit `iconcat` pairs (tests/i128const.rs); the verifier
+  reports bad iconst types instead of panicking (PLIRON_PATCH #58).
 - Tooling: `clif-check step` now replays reap-gated steps
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".
