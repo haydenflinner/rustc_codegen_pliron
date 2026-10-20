@@ -834,6 +834,11 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         Ok(Err(e)) => j.err = Some(e),
         Err(e) => {
             eprintln!("cranelift panicked in `{n}`\n{}", clctx.func.display());
+            // The worker reuses `clctx` for the next job: a panic here
+            // would otherwise leave cfg/domtree/loop_analysis seeded
+            // with this function's analyses, and the next compile's
+            // `optimize` would run against stale block indices.
+            clctx.clear();
             std::panic::resume_unwind(e);
         }
     }
