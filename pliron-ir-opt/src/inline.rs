@@ -57,8 +57,13 @@ pub const WASM_HOT: usize = 3;
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
 /// Each call inside the callee costs this much on top of its own op: inlining
-/// moves the call into the caller, it doesn't remove it.
-const CALL_OP_W: usize = 3;
+/// moves the call into the caller, it doesn't remove it. LLVM charges a call
+/// roughly 5-10 instructions' worth; at 3, dispatchers like a 40-variant
+/// enum's drop glue (126 ops, 40 calls) passed the base limit and every
+/// `Option<Box<Pat>>` overwrite in syn pulled the whole tree in. 10 leaves
+/// the bench kernels' hot code unchanged and cuts syn's CPU ~22%; 20 halves
+/// it but reshapes `strwork::run` — unmeasured, see PARITY.md.
+const CALL_OP_W: usize = 10;
 /// Bonus per use a constant actual can fold (a scalar arg feeding arithmetic,
 /// compares, selects, casts, ...).
 const FOLD_USE: usize = 25;
