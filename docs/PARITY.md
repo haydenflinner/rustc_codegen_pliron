@@ -135,9 +135,9 @@ noted):
   to its own latch `iadd` (cranelift PLIRON_PATCH #57). Tier 1 -O: 16,517 pass;
   the only expectation miss is `hashmap-debug-format.rs`, skipped as
   nondeterministic (randomized `HashMap` order).
-- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 94 pass, 2 fail
-  after `c00303c` + the iconst.i128/proots/dem64 fixes below — seed 1
-  -O run timeout, seed 41 -O SIGSEGV. Seed 14's debug-only
+- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 95 pass, 1 fail
+  after `c00303c` + the iconst.i128/proots/dem64/licm fixes below — seed
+  1 -O run timeout. Seed 14's debug-only
   `proots.rs:1211` offset-subtract overflow (release passes; fixed by
   wrapping key arithmetic — test `proots::tests::extreme_offsets_wrap`).
   Artifacts: `target/harness/fuzz/<seed>`.
@@ -163,6 +163,15 @@ noted):
   `LoadNoOffset` inst (an `atomic_load` twin would have silently
   dropped atomicity too); regression
   `clifpeep::tests::dem64_loadnoffset_is_not_a_load`.
+  Seed 41's -O SIGSEGV was `licm` speculation: a `load.i128 notrap`
+  at `stack_addr ss84 + 0x2518_0084_2820_8000` sat on a loop path
+  the program never runs (so `notrap` held where it sat), and the
+  `Root::S` dereferenceability check ignored the offset entirely —
+  hoisting it to the preheader executed the wild address
+  unconditionally. Stack-slot roots are now only proven
+  dereferenceable within the slot's own bounds, in both the hoist
+  `safe` check and `promote`'s entry-store requirement; regression
+  `licm::tests::wild_offset_load_stays_in_loop`.
 - Tooling: `clif-check step` now replays reap-gated steps
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".

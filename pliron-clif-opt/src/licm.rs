@@ -225,7 +225,18 @@ fn hoists(
     // root dereferenceable unconditionally: a stack slot, a symbol or stack
     // base, or a param rustc marked `dereferenceable` covering the access.
     let safe = match loc.0 {
-        Root::S(_) => true,
+        // `ss` is unconditionally dereferenceable only within its own
+        // bounds — `ss + wild_offset` (a `notrap` load sits on a path
+        // that never runs, so its address arithmetic can point outside
+        // the frame entirely) is a speculative fault, not a stack
+        // access. Seed 41: `load.i128` at `ss84 + 0x2518_0084_2820_8000`.
+        Root::S(ss) => {
+            loc.1 >= 0
+                && loc
+                    .1
+                    .checked_add(i64::from(ty.bytes()))
+                    .is_some_and(|end| end <= i64::from(func.sized_stack_slots[ss].size))
+        }
         Root::V(v) => {
             let proven = deref
                 .get(&v)
@@ -855,9 +866,17 @@ fn promote(
             continue;
         }
         let Ok(off) = i32::try_from(o) else { continue };
-        // Dereferenceable at entry: stack slots always are; a `noalias`
+        // Dereferenceable at entry: a stack slot only within its own
+        // bounds (same wild-offset hazard as `hoists`); a `noalias`
         // root needs rustc's `dereferenceable`+writable info covering the
         // loc, or a `notrap` store to it in the header proving the write.
+        if let Root::S(ss) = r
+            && !(o >= 0
+                && o.checked_add(i64::from(ty.bytes()))
+                    .is_some_and(|end| end <= i64::from(func.sized_stack_slots[ss].size)))
+        {
+            continue;
+        }
         if let Root::V(v) = r {
             let proven = deref.get(&v).is_some_and(|&(bytes, writable)| {
                 writable && o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64
@@ -1513,6 +1532,93 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `load notrap` at `stack_addr ss + wild_offset` is not a stack
+    /// access — the address arithmetic left the slot entirely — so it
+    /// is not unconditionally dereferenceable and must not hoist out
+    /// of the loop onto the unconditional preheader path (rustlantis
+    /// seed 41 SIGSEGV: `load.i128` at `ss84 + 0x2518_0084_2820_8000`,
+    /// a load that sat on a path the program never runs).
+    /// In-bounds slot accesses still hoist.
+    #[test]
+    fn wild_offset_load_stays_in_loop() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let lbody = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, h, lbody, done] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 4));
+        let p = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let fv = cur.ins().iconst(types::I64, 5);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let wild = cur
+            .ins()
+            .iconst(types::I64, 0x2518_0084_2820_8000u64 as i64);
+        let eight = cur.ins().iconst(types::I64, 8);
+        cur.ins().jump(h, &[fv.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+        cur.ins().brif(r, lbody, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+        let wildp = cur.ins().iadd(a, wild);
+        let w = cur
+            .ins()
+            .load(types::I128, MemFlagsData::new().with_notrap(), wildp, 0);
+        let okp = cur.ins().iadd(a, eight);
+        let ok = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), okp, 0);
+        cur.ins().jump(h, &[fv.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            &FxHashMap::default(),
+        );
+        let blk = |v: Value| {
+            func.layout
+                .inst_block(func.dfg.value_def(v).inst().unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            blk(w),
+            lbody,
+            "wild-offset load left the loop:\n{}",
+            func.display()
+        );
+        assert_eq!(
+            blk(ok),
+            b0,
+            "in-bounds load failed to hoist:\n{}",
+            func.display()
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
