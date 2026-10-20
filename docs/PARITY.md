@@ -135,6 +135,13 @@ noted):
   to its own latch `iadd` (cranelift PLIRON_PATCH #57). Tier 1 -O: 16,517 pass;
   the only expectation miss is `hashmap-debug-format.rs`, skipped as
   nondeterministic (randomized `HashMap` order).
+- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 89 pass, 7 fail
+  — all identical at `4f8018e` (release dylib, harness flags), so
+  pre-existing despite docs' "0-512 pass": seed 1 -O run timeout, seed 24
+  -O0 wrong hash, seed 41 -O SIGSEGV, seeds 65 (-O0) / 88 / 89 ICE in
+  aarch64 emit/ISLE (debug dylib: seed 88 is a `tailmerge` verifier
+  error, f64 address into `load.i32`), seed 14 a debug-only overflow panic
+  in `proots.rs:1211` (release passes). Artifacts: `target/harness/fuzz/<seed>`.
 - Tooling: `clif-check step` now replays reap-gated steps
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".
