@@ -7,6 +7,11 @@ Inputs (single rustc invocations, no cargo, so nothing is cached):
   kernels         bench/wasm/lib.rs (the 16 bench kernels, ~4 kLOC) -> native rlib
   kernels-wasm    same, --target wasm32-unknown-unknown --emit obj
   regex-syntax    regex-syntax 0.8.x lib from ~/.cargo/registry (~40 kLOC) -> native rlib
+  regex-wasm      same, --target wasm32-unknown-unknown --emit obj (one CGU)
+  syn             syn 2.x (default features + full, ~50 kLOC) -> native rlib; its
+                  deps (proc-macro2, quote, unicode-ident) are prebuilt once with
+                  stock rustc into target/ctime-deps. Deep recursive AST types:
+                  the input that exposed inliner blow-ups regex-syntax hid.
 All at -O, default codegen units. Median of --runs (default 3) wall times.
 
 The backend is the release dylib (`cargo build --release`, built first):
@@ -31,6 +36,38 @@ def regex_syntax():
     return os.path.join(c[-1], "src/lib.rs") if c else None
 
 
+def latest(name, major="[0-9]"):
+    c = glob.glob(os.path.expanduser(f"~/.cargo/registry/src/*/{name}-{major}*"))
+    key = lambda p: [int(x) if x.isdigit() else x for x in p.rsplit("-", 1)[1].replace("+", ".").split(".")]
+    return max(c, key=key) if c else None
+
+
+def syn_args():
+    """rustc args for syn, prebuilding its deps with stock rustc."""
+    syn = latest("syn", "2.")
+    pm, q, ui = (latest(n) for n in ("proc-macro2", "quote", "unicode-ident"))
+    if not all((syn, pm, q, ui)):
+        return None
+    deps = os.path.join(ROOT, "target/ctime-deps")
+    os.makedirs(deps, exist_ok=True)
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)
+    def dep(crate, src, ed, *extra):
+        if not os.path.exists(os.path.join(deps, f"lib{crate}.rlib")):
+            subprocess.run(["rustc", "-O", "--crate-name", crate, "--crate-type", "rlib", "--edition", ed,
+                            "--cap-lints", "allow", "--out-dir", deps, "-L", deps, *extra, src + "/src/lib.rs"],
+                           env=env, check=True, capture_output=True)
+    dep("unicode_ident", ui, "2018")
+    dep("proc_macro2", pm, "2021", "--cfg", 'feature="proc-macro"',
+        "--extern", f"unicode_ident={deps}/libunicode_ident.rlib")
+    dep("quote", q, "2018", "--cfg", 'feature="proc-macro"', "--extern", f"proc_macro2={deps}/libproc_macro2.rlib")
+    feats = ["derive", "parsing", "printing", "clone-impls", "proc-macro", "full"]
+    return [syn + "/src/lib.rs", "--crate-name", "syn", "--crate-type", "rlib", "--edition", "2021",
+            "--cap-lints", "allow", "-L", deps,
+            "--extern", f"proc_macro2={deps}/libproc_macro2.rlib", "--extern", f"quote={deps}/libquote.rlib",
+            "--extern", f"unicode_ident={deps}/libunicode_ident.rlib"] + sum(
+        (["--cfg", f'feature="{f}"'] for f in feats), [])
+
+
 def inputs():
     k = os.path.join(ROOT, "bench/wasm/lib.rs")
     out = {
@@ -42,6 +79,10 @@ def inputs():
     if rs:
         out["regex-syntax"] = [rs, "--crate-type", "rlib", "--edition", "2021",
                                "--cfg", 'feature="std"', "--cap-lints", "allow"]
+        out["regex-wasm"] = out["regex-syntax"] + ["--target", "wasm32-unknown-unknown", "--emit", "obj"]
+    sa = syn_args()
+    if sa:
+        out["syn"] = sa
     return out
 
 
