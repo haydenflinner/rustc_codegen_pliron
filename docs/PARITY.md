@@ -153,8 +153,10 @@ noted):
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".
 
-Rejected / measured: `PLIRON_XCGU=0` (−35% CPU, but kernels lose badly
-— copies are load-bearing); an EH-cold callsite rule (callsites reachable
+Rejected / measured: `PLIRON_XCGU=0` (−35% CPU before the inliner
+changes, but kernels alternating A/B: tokenize +70%, sieve +9.5%,
+geomean +4% — copies are load-bearing; an earlier "30-180%" figure came
+from the broken A/B script and is void); an EH-cold callsite rule (callsites reachable
 only via landing pads; +27% syn CPU, because un-inlined cleanup callees
 keep `xcgu` copies alive and fully optimized); `PLIRON_INLINE_CALLER_MAX`
 8000/4000 (−5-9% CPU, runtime risk on giant hot fns).
