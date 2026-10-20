@@ -38,7 +38,8 @@ use pliron_llvm::ops::{
     AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp, FenceOp,
     InlineAsmOp, StoreOp, VAArgOp,
 };
-use pliron::cols::{ColMap, ColSet};
+// Function-local scratch: hash-backed, not CGU-ordinal-dense.
+use crate::helpers::{SparseMap as ColMap, SparseSet as ColSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::domcheck::Dom;

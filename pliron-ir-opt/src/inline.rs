@@ -10,7 +10,6 @@
 
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
-use pliron::cols::{ColMap, ColSet};
 use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::cloning::{IrMapping, clone_blocks_into};
@@ -1117,14 +1116,15 @@ pub fn run(
         // the cloned callee body) — existing blocks never gain a new CallOp
         // (branches/erase don't produce one), so each block is scanned once
         // and later rounds walk only freshly spliced blocks.
-        let mut done_blocks: ColSet<Ptr<BasicBlock>> = ColSet::default();
+        let mut done_blocks: crate::helpers::SparseSet<Ptr<BasicBlock>> = Default::default();
         // Persistent mirror of the caller's block order: inlining splices
         // the split continuation right after the callsite block and appends
         // callee clones at the region end, so a rescan can't just extend —
         // `pending` holds continuations keyed by the block they follow and
         // the scan splices them in at the same point the real list would.
         let mut blklist = blocks(ctx, caller);
-        let mut pending: ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = ColMap::default();
+        let mut pending: crate::helpers::SparseMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
+            Default::default();
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
