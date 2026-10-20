@@ -2273,11 +2273,13 @@ fn peep_body_opts(
     // `walias` — operand-stack-aware locals cancellation, phase 1
     // (straight-line spans). Four rewrites:
     //
-    //   (B) `set T … get T` where T's value never leaves the stack
-    //       (net effect 0 back to v's slot, never underflowing it) —
-    //       `Del` both: the producer's value flows to the get's
-    //       consumer without touching T. A second `get T` forces the
-    //       pair back (tracked in `canceled`).
+    //   (B) `set T … get T` where T's operand stays on the stack the
+    //       whole span — deleting the pair leaves it for the `get`'s
+    //       consumer to read. `pend[t]` records the operand's depth;
+    //       a pop to that depth consumes it (in the deleted-set world
+    //       it would be the consumer's operand), so `pend` dies at
+    //       `len <= dv`. A second `get T` forces the pair back
+    //       (tracked in `canceled`).
     //   `get T; drop` → `Del` both — the pushed copy is discarded.
     //   `set T`/`tee T` never `get` before their next write →
     //       `Drop`/`Del` (dead local write — `drop` keeps the same
@@ -2287,18 +2289,17 @@ fn peep_body_opts(
     //
     // `vstack` abstracts the operand stack — each entry is the local
     // whose value it holds (`Named`, pushed by `get`/`tee`) or `OTHER`.
-    // `pend` holds live `set T` candidates (ins idx, v's slot, running
-    // min-depth); `canceled` remembers deleted pairs so a second
+    // `pend` holds live `set T` candidates (ins idx, operand's stack
+    // depth); `canceled` remembers deleted pairs so a second
     // `get T` restores them; `last_write`/`loop_gets` feed the
     // dead-write checks (a `get` inside a containing loop reads the
     // in-loop write via the backedge).
     if crate::env_get("PLIRON_WASM_WALIAS") != Some("0") {
         // Mode bits: 1=set/get pair-cancel, 2=get;drop, 4=dead-write,
-        // 8=copy-forward. Pair-cancel is parked at 14 — its phantom-slot
-        // model still miscompiles around multi-value calls/branches.
+        // 8=copy-forward.
         let wmode: u32 = crate::env_get("PLIRON_WASM_WALIAS_MODE")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(14);
+            .unwrap_or(15);
         const OTHER: u32 = u32::MAX;
         // `None` = opaque (bail at decode anyway for the weird ops);
         // the walk treats it as a span boundary, never a miscount.
@@ -2382,7 +2383,7 @@ fn peep_body_opts(
             }
         }
         let mut vstack: Vec<u32> = Vec::new();
-        let mut pend: FxHashMap<u32, (usize, usize, usize)> = FxHashMap::default();
+        let mut pend: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
         let mut canceled: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
         let mut copymap: FxHashMap<u32, u32> = FxHashMap::default();
         // local -> (ins idx, is_tee, was-read)
@@ -2394,8 +2395,17 @@ fn peep_body_opts(
             match ins[i].0 {
                 WPeek::Del => continue,
                 WPeek::Nop(l) => {
-                    // `Nop` is a deleted `get l; set l` self-copy — a
-                    // real use of `l` for dead-write purposes.
+                    // `Nop` is a deleted `get l; set l` self-copy —
+                    // it reads *and* writes `l`, so a pending `set`/`get`
+                    // cancel can't cross it (it would read stale `l`)
+                    // and copy forwards on `l` go stale.
+                    pend.remove(&l);
+                    copymap.retain(|&k, &mut v| k != l && v != l);
+                    for e in vstack.iter_mut() {
+                        if *e == l {
+                            *e = OTHER;
+                        }
+                    }
                     if let Some(lw) = last_write.get_mut(&l) {
                         lw.2 = true;
                     }
@@ -2414,7 +2424,11 @@ fn peep_body_opts(
                     continue;
                 }
                 WPeek::Drop => {
-                    vstack.pop();
+                    if vstack.pop().is_none() {
+                        // Pop below the tracked region — may consume a
+                        // pending set's operand slot.
+                        pend.clear();
+                    }
                 }
                 WPeek::Set(t) | WPeek::Tee(t) => {
                     let is_tee = matches!(ins[i].0, WPeek::Tee(_));
@@ -2442,6 +2456,11 @@ fn peep_body_opts(
                         }
                     }
                     let popped = vstack.pop();
+                    if popped.is_none() {
+                        // Pop below the tracked region — may consume a
+                        // pending set's operand slot.
+                        pend.clear();
+                    }
                     if let Some(u) = popped
                         && u != OTHER
                     {
@@ -2455,16 +2474,25 @@ fn peep_body_opts(
                         // unknown source (multi-value call results,
                         // block params), and deleting the `set` would
                         // leave it for the next consumer to mis-pop.
-                        pend.insert(t, (i, vstack.len(), vstack.len()));
+                        pend.insert(t, (i, vstack.len()));
                     }
                     last_write.insert(t, (i, is_tee, false));
                 }
                 WPeek::Get(t) => {
-                    // A second `get T` resurrects a canceled pair.
+                    // A second `get T` resurrects a canceled pair —
+                    // the restored `set` re-emits and rewrites T, so any
+                    // pending/copy fact on T is stale.
                     if let Some(&(si, gi)) = canceled.get(&t) {
                         dels.remove(&si);
                         dels.remove(&gi);
                         canceled.remove(&t);
+                        pend.remove(&t);
+                        copymap.retain(|&k, &mut v| k != t && v != t);
+                        for e in vstack.iter_mut() {
+                            if *e == t {
+                                *e = OTHER;
+                            }
+                        }
                         last_write.insert(t, (si, false, true));
                     }
                     // `get T; drop` — the pushed copy is discarded.
@@ -2483,21 +2511,20 @@ fn peep_body_opts(
                         dels.insert(j);
                         continue;
                     }
-                    // (B) `set T` candidate: v sits at slot `dv` and
-                    // never underflowed.
+                    // (B) `set T` candidate: the operand slot `dv` sits
+                    // untouched at the current stack top — cancel both
+                    // so the consumer reads the value directly.
                     if wmode & 1 != 0
-                        && let Some(&(si, dv, mn)) = pend.get(&t)
+                        && let Some(&(si, dv)) = pend.get(&t)
                         && vstack.len() == dv
-                        && mn >= dv
                     {
                         dels.insert(si);
                         dels.insert(i);
                         pend.remove(&t);
                         canceled.insert(t, (si, i));
                         last_write.insert(t, (si, false, true));
-                        // Model the would-be push so the consumer pops
-                        // the right entry — in the emitted stream it
-                        // reads the `set`'s kept value at slot `dv`.
+                        // Model the `get`'s push — in the emitted stream
+                        // the consumer reads the kept operand at `dv`.
                         vstack.push(t);
                         continue;
                     }
@@ -2522,20 +2549,33 @@ fn peep_body_opts(
                         continue;
                     };
                     for _ in 0..pops {
-                        vstack.pop();
+                        if vstack.pop().is_none() {
+                            // Pop below the tracked region — may
+                            // consume a pending set's operand slot.
+                            pend.clear();
+                        }
                     }
                     for _ in 0..pushes {
                         vstack.push(OTHER);
                     }
                 }
             }
-            // A dip below a pending set's value slot kills it — in the
-            // deleted-set world the value would have been consumed.
+            // A pop to `len == dv` consumes the pending set's operand
+            // slot — in the deleted-set world the phantom lives there.
             let len = vstack.len();
-            pend.retain(|_, &mut (_, dv, ref mut mn)| {
-                *mn = (*mn).min(len);
-                *mn >= dv
-            });
+            pend.retain(|_, &mut (si, dv)| si == i || len > dv);
+            if crate::env_set("PLIRON_WASM_WALIAS_TRACE") {
+                eprintln!(
+                    "    walias-trace[{i}] {:?} len={} pend={:?}",
+                    ins[i].0,
+                    len,
+                    pend.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+        if crate::env_set("PLIRON_WASM_SFWD_DBG") && !dels.is_empty() {
+            let ks: Vec<_> = dels.iter().map(|&d| format!("{}:{:?}", d, ins[d].0)).collect();
+            eprintln!("  walias-delkinds: {ks:?}");
         }
         // End-of-body flush: unread writes are dead.
         for (&t, &(pi, ptee, read)) in last_write.iter() {
@@ -2559,6 +2599,7 @@ fn peep_body_opts(
                 rewrites
             );
         }
+        let orig: Vec<WPeek> = ins.iter().map(|e| e.0).collect();
         // A `set` in both sets must stay `Del` — the canceled pair
         // needs the value flowing, not dropped.
         for i in drops {
@@ -2571,6 +2612,102 @@ fn peep_body_opts(
         }
         for (i, k) in rewrites {
             ins[i].0 = k;
+        }
+        // Provenance verifier: replay orig vs edited streams tracking
+        // each stack slot's producer token; every pop in a non-deleted
+        // instr must consume the same token in both worlds. `Del`'d
+        // instrs skip; phantoms shift the edited stack freely.
+        if crate::env_set("PLIRON_WASM_WALIAS_VERIFY") {
+            let mut ost: Vec<u32> = Vec::new();
+            let mut est: Vec<u32> = Vec::new();
+            let mut olo: FxHashMap<u32, u32> = FxHashMap::default();
+            let mut elo: FxHashMap<u32, u32> = FxHashMap::default();
+            let mut bad: Option<(usize, u32, u32, WPeek, WPeek)> = None;
+            for i in 0..ins.len() {
+                let ok = orig[i];
+                let ek = ins[i].0;
+                let sim = |k: WPeek,
+                           st: &mut Vec<u32>,
+                           lo: &mut FxHashMap<u32, u32>,
+                           i: usize|
+                 -> Vec<u32> {
+                    match k {
+                        WPeek::Del => vec![],
+                        WPeek::Nop(_) => vec![],
+                        WPeek::Get(t) => {
+                            st.push(*lo.get(&t).unwrap_or(&(0x8000_0000 + t)));
+                            vec![]
+                        }
+                        WPeek::Set(t) => {
+                            let v = st.pop().unwrap_or(u32::MAX);
+                            lo.insert(t, v);
+                            vec![v]
+                        }
+                        WPeek::Tee(t) => {
+                            let v = st.pop().unwrap_or(u32::MAX);
+                            lo.insert(t, v);
+                            st.push(v);
+                            vec![v]
+                        }
+                        WPeek::Drop => vec![st.pop().unwrap_or(u32::MAX)],
+                        WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
+                            st.clear();
+                            lo.clear();
+                            vec![]
+                        }
+                        WPeek::Other => match eff(ins[i].1) {
+                            Some((p, u)) => {
+                                let mut popped = Vec::new();
+                                for _ in 0..p {
+                                    popped.push(st.pop().unwrap_or(u32::MAX));
+                                }
+                                for _ in 0..u {
+                                    st.push(i as u32);
+                                }
+                                popped
+                            }
+                            None => {
+                                st.clear();
+                                lo.clear();
+                                vec![]
+                            }
+                        },
+                    }
+                };
+                let opops = sim(ok, &mut ost, &mut olo, i);
+                let epops = sim(ek, &mut est, &mut elo, i);
+                // A `Del`'d `set`/`tee` still "pops" in the orig world —
+                // the operand stays as the phantom, so compare the slot
+                // it sat in.
+                let epops = if epops.is_empty()
+                    && matches!(ek, WPeek::Del)
+                    && matches!(ok, WPeek::Set(_) | WPeek::Tee(_))
+                    && !est.is_empty()
+                {
+                    vec![*est.last().unwrap()]
+                } else {
+                    epops
+                };
+                // `set`→`Drop` keeps one pop; dels'd instrs pop in orig
+                // only. Compare only slots both sims actually popped.
+                for j in 0..opops.len().min(epops.len()) {
+                    if bad.is_none()
+                        && opops[j] != epops[j]
+                        && opops[j] != u32::MAX
+                        && epops[j] != u32::MAX
+                    {
+                        bad = Some((i, opops[j], epops[j], ok, ek));
+                    }
+                }
+            }
+            if let Some((i, ta, tb, ok, ek)) = bad {
+                eprintln!(
+                    "  walias-VERIFY-FAIL@{i}: orig {ok:?} popped tok {ta}, edited {ek:?} popped tok {tb}"
+                );
+                for j in i.saturating_sub(8)..=i.min(ins.len() - 1) {
+                    eprintln!("    ins[{j}] {:?}->{:?} op={:02x}", orig[j], ins[j].0, b[ins[j].1]);
+                }
+            }
         }
         // Emit-model balance check: replay the rewritten stream —
         // `Del` on a `set` keeps its value (push), on a `get` removes
@@ -3251,11 +3388,17 @@ fn wpeep(bytes: &mut Vec<u8>) {
                 let nparams = fsig.get(imp + fi as usize).map(|&(np, _)| np).unwrap_or(0);
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
                     let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::fs::write(format!("{dir}/body_{k}_pre.bin"), &bytes[q..be]);
+                    let _ = std::fs::write(
+                        format!("{dir}/body_{}_{k}_pre.bin", std::process::id()),
+                        &bytes[q..be],
+                    );
                 }
                 let out = peep_body(&bytes[q..be], &fsig, &tsig, nparams).unwrap_or_else(|| bytes[q..be].to_vec());
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
-                    let _ = std::fs::write(format!("{dir}/body_{k}_post.bin"), &out);
+                    let _ = std::fs::write(
+                        format!("{dir}/body_{}_{k}_post.bin", std::process::id()),
+                        &out,
+                    );
                 }
                 out
             } else {
@@ -3938,7 +4081,9 @@ mod wpeep_tests {
         });
         for p in paths {
             let b = std::fs::read(&p).unwrap();
-            let out = peep_body(&b, &[], &[], 0).unwrap();
+            let Some(out) = peep_body(&b, &[], &[], 0) else {
+                continue;
+            };
             std::fs::write(format!("{}.out", p.display()), &out).unwrap();
             eprintln!("wrote {}.out ({} -> {} bytes)", p.display(), b.len(), out.len());
         }
