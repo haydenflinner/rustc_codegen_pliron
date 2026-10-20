@@ -1026,11 +1026,14 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
-    // `PLIRON_INLINE_LOOPCALLS=<n>`: the in-loop bonus only for callees
-    // with at most `n` calls of their own (small mode's leaf-ish rule).
+    // `PLIRON_INLINE_LOOPCALLS=<n>` (default 4): the in-loop bonus only
+    // for callees with at most `n` calls of their own — small mode's
+    // leaf-ish rule. A callee that carries many calls just moves them into
+    // the loop: parser loops (`while input.peek(..)`) took 25-call drop
+    // glues at 3x the base threshold. syn CPU -65%, kernels neutral.
     let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(usize::MAX);
+        .unwrap_or(4);
     // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
     let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
         .and_then(|s| s.parse().ok())
