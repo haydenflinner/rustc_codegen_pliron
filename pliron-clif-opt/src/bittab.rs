@@ -899,6 +899,49 @@ fn flat(func: &mut Function) -> usize {
             let x = x.unwrap();
             let xty = func.dfg.value_type(x);
             let mut cur = FuncCursor::new(func).at_inst(i);
+            // A single contiguous run `(x-a) <=u span` is strictly
+            // cheaper than the masked `ushr`: no i64 const/`select`/
+            // `uextend`. Sparse sets keep the bitmap (the `bor` chain
+            // costs more than the shift).
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            {
+                let mut b = bits;
+                let mut pos = 0u64;
+                while b != 0 {
+                    let s = b.trailing_zeros() as u64;
+                    b >>= s;
+                    pos += s;
+                    let run = (!b).trailing_zeros() as u64;
+                    runs.push((pos, pos + run - 1));
+                    b >>= run;
+                    pos += run;
+                }
+            }
+            if runs.len() == 1 && xty.bits() <= 32 {
+                let mut acc: Option<Value> = None;
+                for &(ra, rb) in &runs {
+                    let (va, vb) = (lo + ra, lo + rb);
+                    let r = if ra == rb {
+                        let c = cur.ins().iconst(xty, va as i64);
+                        cur.ins().icmp(IntCC::Equal, x, c)
+                    } else {
+                        let c = cur.ins().iconst(xty, va as i64);
+                        let d = cur.ins().isub(x, c);
+                        let w = cur.ins().iconst(xty, (vb - va) as i64);
+                        cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, d, w)
+                    };
+                    acc = Some(match acc {
+                        None => r,
+                        Some(p) => cur.ins().bor(p, r),
+                    });
+                }
+                let c = acc.unwrap();
+                func.dfg.clear_results(i);
+                func.dfg.change_to_alias(out, c);
+                func.layout.remove_inst(i);
+                n += 1;
+                continue;
+            }
             let d = if lo > 0 {
                 let c = cur.ins().iconst(xty, lo as i64);
                 cur.ins().isub(x, c)
@@ -987,6 +1030,71 @@ pub fn run(func: &mut Function) -> usize {
             break;
         };
         let xty = func.dfg.value_type(pl.x);
+        // A single contiguous accepted run `(x-a) <=u span` collapses the
+        // whole guard+bit-test pair into one compare: stays in `x`'s own
+        // type, no i64 mask const/`select`/`uextend`. Sparse unions (2+
+        // runs) lose to the bitmap — the `bor` chain costs more branch
+        // pressure than the one shift it saves.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        {
+            let mut m = pl.mask;
+            let mut pos = 0u64;
+            while m != 0 {
+                let s = m.trailing_zeros() as u64;
+                m >>= s;
+                pos += s;
+                let r = (!m).trailing_zeros() as u64;
+                runs.push((pos, pos + r - 1));
+                m >>= r;
+                pos += r;
+            }
+        }
+        if runs.len() == 1 && xty.bits() <= 32 && crate::pass_enabled("PLIRON_BITTAB_RANGE") {
+            func.layout.remove_inst(rterm);
+            let mut cur = FuncCursor::new(func).at_bottom(pl.root);
+            let emit_args = |cur: &mut FuncCursor, args: &[A]| -> Vec<BlockArg> {
+                args.iter()
+                    .map(|a| match a {
+                        A::V(v) => BlockArg::Value(*v),
+                        A::K(ty, k) if *ty == I128 => {
+                            let lo = cur.ins().iconst(I64, *k);
+                            let hi = cur.ins().iconst(I64, k >> 63);
+                            BlockArg::Value(cur.ins().iconcat(lo, hi))
+                        }
+                        A::K(ty, k) => BlockArg::Value(cur.ins().iconst(*ty, *k)),
+                    })
+                    .collect()
+            };
+            let ha = emit_args(&mut cur, &ha);
+            let ma = emit_args(&mut cur, &ma);
+            let mut acc: Option<Value> = None;
+            for &(ra, rb) in &runs {
+                let (va, vb) = (pl.lo + ra, pl.lo + rb);
+                let r = if ra == rb {
+                    let c = cur.ins().iconst(xty, va as i64);
+                    cur.ins().icmp(IntCC::Equal, pl.x, c)
+                } else {
+                    let c = cur.ins().iconst(xty, va as i64);
+                    let d = cur.ins().isub(pl.x, c);
+                    let w = cur.ins().iconst(xty, (vb - va) as i64);
+                    cur.ins().icmp(IntCC::UnsignedLessThanOrEqual, d, w)
+                };
+                acc = Some(match acc {
+                    None => r,
+                    Some(p) => cur.ins().bor(p, r),
+                });
+            }
+            cur.ins().brif(acc.unwrap(), pl.hit.0, &ha, pl.miss.0, &ma);
+            for &b in &pl.dead {
+                while let Some(i) = func.layout.first_inst(b) {
+                    func.layout.remove_inst(i);
+                }
+                func.layout.remove_block(b);
+            }
+            n += 1;
+            cd.stale();
+            continue;
+        }
         // Two branches, one per condition: `d <= msb(mask)` rejects every
         // index that cannot hit a set bit (and every `d >= 64`, which would
         // wrap the shift), so out-of-window `x` pays a single compare —
