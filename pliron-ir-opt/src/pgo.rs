@@ -25,8 +25,10 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
-use pliron_llvm::attributes::{AtomicOrderingAttr, AtomicRmwKindAttr, SyncScopeAttr};
-use pliron_llvm::op_interfaces::BinArithOp;
+use pliron_llvm::attributes::{
+    AtomicOrderingAttr, AtomicRmwKindAttr, IntegerOverflowFlagsAttr, SyncScopeAttr,
+};
+use pliron_llvm::op_interfaces::IntBinArithOpWithOverflowFlag;
 use pliron_llvm::ops::{
     AddOp, AtomicRmwOp, BrOp, CondBrOp, GlobalOp, LoadOp, ReturnOp, StoreOp, SwitchOp,
     UnreachableOp,
@@ -94,7 +96,13 @@ fn bump(ctx: &mut Context, st: &mut State, block: Ptr<BasicBlock>, ctrs: &str, i
         let l = LoadOp::new(ctx, addr, i64t).get_operation();
         let lv = l.deref(ctx).get_result(ctx, 0);
         let one = crate::sroa::mk_const(ctx, st, i64t, ConstVal::Bits(1));
-        let a = AddOp::new(ctx, lv, one).get_operation();
+        let a = AddOp::new_with_overflow_flag(
+            ctx,
+            lv,
+            one,
+            IntegerOverflowFlagsAttr::default(),
+        )
+        .get_operation();
         let av = a.deref(ctx).get_result(ctx, 0);
         let s = StoreOp::new(ctx, av, addr).get_operation();
         st.volatile.insert(l);

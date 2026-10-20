@@ -204,7 +204,7 @@ impl Dom {
     }
 
     /// `b`'s position in `order` — None when unreachable or unknown.
-    fn rpo_idx(&self, b: Ptr<BasicBlock>) -> Option<usize> {
+    pub(crate) fn rpo_idx(&self, b: Ptr<BasicBlock>) -> Option<usize> {
         let &o = self.ord.get(&b)?;
         (self.rpo_of[o] != usize::MAX).then_some(self.rpo_of[o])
     }
@@ -214,7 +214,7 @@ impl Dom {
         self.rpo_idx(b).is_some()
     }
 
-    fn dom_idx(&self, a: usize, mut b: usize) -> bool {
+    pub(crate) fn dom_idx(&self, a: usize, mut b: usize) -> bool {
         while b > a {
             b = self.idom[b];
         }

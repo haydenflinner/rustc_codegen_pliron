@@ -19,7 +19,11 @@ use pliron::{
     r#type::Typed,
     value::Value,
 };
-use pliron_llvm::{attributes::ICmpPredicateAttr as P, op_interfaces::BinArithOp, ops::*};
+use pliron_llvm::{
+    attributes::{ICmpPredicateAttr as P, IntegerOverflowFlagsAttr},
+    op_interfaces::{BinArithOp, IntBinArithOpWithOverflowFlag},
+    ops::*,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::opt_body;
@@ -445,21 +449,30 @@ fn fold_divmul(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
             }
         }
     }
-    // One `rem` per distinct (x, d) pair shared by all the matching muls;
-    // a quotient that loses its last use gets erased with the mul.
-    let mut rems: FxHashMap<(Value, Value), Value> = FxHashMap::default();
+    // One `rem` per div shared by all the matching muls; it is placed
+    // right after the div so it dominates every `sub` minted below —
+    // the muls can sit in sibling blocks, where a `rem` tied to the
+    // first mul's position would not dominate the rest. A quotient that
+    // loses its last use gets erased with the mul.
+    let mut rems: FxHashMap<Ptr<Operation>, Value> = FxHashMap::default();
     let mut divs: FxHashSet<Ptr<Operation>> = FxHashSet::default();
     for (op, x, d, signed, dop) in &hits {
-        let rem = *rems.entry((*x, *d)).or_insert_with(|| {
+        let rem = *rems.entry(*dop).or_insert_with(|| {
             let rop = if *signed {
                 SRemOp::new(ctx, *x, *d).get_operation()
             } else {
                 URemOp::new(ctx, *x, *d).get_operation()
             };
-            rop.insert_before(ctx, *op);
+            rop.insert_after(ctx, *dop);
             rop.deref(ctx).get_result(ctx, 0)
         });
-        let sub = SubOp::new(ctx, *x, rem).get_operation();
+        let sub = SubOp::new_with_overflow_flag(
+            ctx,
+            *x,
+            rem,
+            IntegerOverflowFlagsAttr::default(),
+        )
+        .get_operation();
         sub.insert_before(ctx, *op);
         let sub_r = sub.deref(ctx).get_result(ctx, 0);
         let r = op.deref(ctx).get_result(ctx, 0);
@@ -953,4 +966,75 @@ fn pk_of(ctx: &Context, op: Ptr<Operation>, nargs: usize) -> Option<(Pk, bool)> 
     };
     let want = if pk == Pk::Select { 3 } else { 2 };
     (nargs == want).then_some((pk, swap))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domcheck::Dom;
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::parsable::parse_from_str;
+    use pliron::value::DefiningEntity;
+
+    /// Two `(x/d)*d` muls in sibling blocks share the same (x, d) pair.
+    /// The rewrite mints `x - x%d`; sharing a single `rem` placed before
+    /// the first mul leaves the second block's `sub` reading a value
+    /// that does not dominate it.
+    #[test]
+    fn divmul_rem_dominates_each_use() {
+        let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <builtin.integer i64(builtin.integer i64, builtin.integer i64, builtin.integer i1) variadic = false> [] {
+          ^entry(x: builtin.integer i64, d: builtin.integer i64, c: builtin.integer i1):
+            llvm.cond_br if c ^a() else ^b()
+          ^a():
+            q1 = llvm.udiv x, d : builtin.integer i64;
+            m1 = llvm.mul q1, d <{nsw=false,nuw=false}> : builtin.integer i64;
+            llvm.return m1
+          ^b():
+            q2 = llvm.udiv x, d : builtin.integer i64;
+            m2 = llvm.mul q2, d <{nsw=false,nuw=false}> : builtin.integer i64;
+            llvm.return m2
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let st = &mut State::default();
+        let f = crate::inline::blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .unwrap();
+        assert_eq!(fold_divmul(ctx, st, f), 2);
+        // Every op operand defined by an op must dominate its use:
+        // same-block defs must precede, other-block defs must dominate.
+        let dom = Dom::new(ctx, st, f).unwrap();
+        let mut positions: FxHashMap<Ptr<Operation>, usize> = FxHashMap::default();
+        for &b in &dom.order {
+            for (i, o) in crate::inline::ops(ctx, b).iter().enumerate() {
+                positions.insert(*o, i);
+            }
+        }
+        let at = |b: Ptr<BasicBlock>| dom.rpo_idx(b).unwrap();
+        for &b in &dom.order {
+            for (i, o) in crate::inline::ops(ctx, b).iter().enumerate() {
+                for v in o.deref(ctx).operands(ctx) {
+                    if let DefiningEntity::Op(d) = v.defining_entity() {
+                        let db = d.deref(ctx).get_parent_block().unwrap();
+                        let ok = if db == b {
+                            positions[&d] < i
+                        } else {
+                            dom.dom_idx(at(db), at(b))
+                        };
+                        assert!(ok, "operand of op in {b:?} defined in {db:?} without dominance");
+                    }
+                }
+            }
+        }
+    }
 }
