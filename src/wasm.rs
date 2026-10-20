@@ -3765,6 +3765,9 @@ fn peep_body_opts(
             ins.insert(pos + k, t);
         }
     }
+    // (Local renumbering — hot-first index compaction — was tried and
+    // reverted: the `groups` regroup it forces costs more than the
+    // 1-byte-LEB savings it buys; ~+18B net on the module.)
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
     for &(c, t) in &groups {
