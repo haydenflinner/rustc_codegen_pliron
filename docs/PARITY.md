@@ -138,17 +138,18 @@ noted):
 - rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 89 pass, 7 fail
   — all identical at `4f8018e` (release dylib, harness flags), so
   pre-existing despite docs' "0-512 pass": seed 1 -O run timeout, seed 24
-  -O0 wrong hash, seed 41 -O SIGSEGV, seeds 65 (-O0) / 88 / 89 ICE in
-  aarch64 emit/ISLE (debug dylib: seed 88 is a `tailmerge` verifier
-  error, f64 address into `load.i32`), seed 14 a debug-only overflow panic
-  in `proots.rs:1211` (release passes). Artifacts: `target/harness/fuzz/<seed>`.
-  Seed 24 (-O0, wrong hash) bisects (`harness/bisect.py`, flags
-  `-Zmir-opt-level=0 -Ccodegen-units=1`) to unit 8541 = `slotprom` on
-  `fn3`; the differential checker is inconclusive there (pointer args into
-  statics), so the next step is a manual CLIF diff of `fn3` at
-  `PLIRON_OPT_BISECT=8540` vs `8541` (`PLIRON_CLIF=..fn3 PLIRON_TRACE=pliron::dump=info`).
-  Gotcha: the bisect command must pass rustc's stderr through, or
-  `bisect.py` counts 0 units.
+  -O0 wrong hash (**fixed** `c00303c`), seed 41 -O SIGSEGV, seeds 65
+  (-O0) / 88 / 89 ICE in aarch64 emit/ISLE (debug dylib: seed 88 is a
+  `tailmerge` verifier error, f64 address into `load.i32`), seed 14 a
+  debug-only overflow panic in `proots.rs:1211` (release passes).
+  Artifacts: `target/harness/fuzz/<seed>`.
+  Seed 24 root cause: not `slotprom` — it merely created the trigger
+  shape (a promoted i16 block param feeding `uextend.i128` into
+  `isub.i128`). The four PLIRON aarch64 `iadd`/`isub.i128` + `uextend`
+  fusion rules read the narrow operand's raw register (`put_in_reg`);
+  `lsl`/`eor`-produced i16 values keep garbage in bits 16..32, so the
+  "zero-extended" low half read 0x52FFFF instead of 0xFFFF. Fixed with
+  `put_in_reg_zext64` (PLIRON_PATCH #39); regression `tests/zext128`.
 - Tooling: `clif-check step` now replays reap-gated steps
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".
