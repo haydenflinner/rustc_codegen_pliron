@@ -90,8 +90,10 @@ noted):
   inline a callee in its caller's own nontrivial call-graph SCC (LLVM's
   CGSCC rule). History alone still made one lap through every distinct
   type of a wide recursive type graph.
-- **`CALL_OP_W` 3 → 10** (`PLIRON_INLINE_CALLW`): LLVM charges a call
-  5-10 instructions; at 3 a 40-call enum drop glue fit the base limit.
+- **`CALL_OP_W` 3 → 20** (`PLIRON_INLINE_CALLW`): LLVM charges a call
+  several instructions' worth; at 3 a 40-call enum drop glue fit the base
+  limit. 10 then 20 each runtime-checked (kernels geomean 1.001 for
+  10 → 20, regex driver flat); 20 took syn CPU another −25%.
 - **Loop bonus only for leaf-ish callees** (`PLIRON_INLINE_LOOPCALLS`,
   default 4 calls): parser `while` loops gave 25-call drop glues 3x the
   threshold. syn CPU −65% on its own.
@@ -136,11 +138,11 @@ binary. The object-level kernel diffs and the later alternating A/B
 Where the rest is (samply on syn, `harness/sprof.py`): flat — IR-opt
 ~27% of samples (inliner cloning ~5%, sroa ~3.5%, nocapture ~3.6%), the
 CLIF pipeline spread over ~90 steps, allocator/zone dispatch ~8%. Next:
-(1) `CALL_OP_W=20` halves syn CPU again but reshapes `strwork::run` in the
-wasm kernel copy — needs a quiet-box runtime check; (2) live `xcgu` copies
+(1) live `xcgu` copies
 whose home definition is `External` could call the home symbol instead of
 compiling a local copy (~17% of syn's pipeline time is duplicate
-instances); (3) the regex-syntax native wall is gated by the biggest
+instances; redirect before `sret2reg` gives them the internal ABI);
+(2) the regex-syntax native wall is gated by the biggest
 CGU's IR-opt before its fact publish (other CGUs' stage B parks on it).
 
 regex-syntax, one `rustc -O` (release dylib), 11.6 s wall:

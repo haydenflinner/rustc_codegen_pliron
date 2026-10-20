@@ -59,10 +59,10 @@ pub const WASM_HOT: usize = 3;
 /// moves the call into the caller, it doesn't remove it. LLVM charges a call
 /// roughly 5-10 instructions' worth; at 3, dispatchers like a 40-variant
 /// enum's drop glue (126 ops, 40 calls) passed the base limit and every
-/// `Option<Box<Pat>>` overwrite in syn pulled the whole tree in. 10 leaves
-/// the bench kernels' hot code unchanged and cuts syn's CPU ~22%; 20 halves
-/// it but reshapes `strwork::run` — unmeasured, see PARITY.md.
-const CALL_OP_W: usize = 10;
+/// `Option<Box<Pat>>` overwrite in syn pulled the whole tree in. 20: bench
+/// kernels' alternating A/B geomean 1.001 vs 10, a regex-syntax
+/// parse+translate driver flat, syn CPU −25% on top of the loop-bonus cap.
+const CALL_OP_W: usize = 20;
 /// Bonus per use a constant actual can fold (a scalar arg feeding arithmetic,
 /// compares, selects, casts, ...).
 const FOLD_USE: usize = 25;
