@@ -129,8 +129,10 @@ noted):
   `deriving-cmp-generic-struct-enum.rs` wrong result); and `lin_flat`
   looped forever on an alias cycle in unreachable code (`v6 -> v15`,
   `v15 = iadd v6, 16` — UI `test-case-on-use-item-129765.rs` hung), now
-  bounded by a visit budget. The cyclic alias itself (param removal on a
-  dead loop) is the root cause still worth fixing. Tier 1 -O: 16,517 pass;
+  bounded by a visit budget. Root cause fixed too: `try_dominates`
+  answered yes between any two unreachable blocks (default preorder
+  numbers), so `remove_trivial_params` aliased a dead loop's header param
+  to its own latch `iadd` (cranelift PLIRON_PATCH #57). Tier 1 -O: 16,517 pass;
   the only expectation miss is `hashmap-debug-format.rs`, skipped as
   nondeterministic (randomized `HashMap` order).
 - Tooling: `clif-check step` now replays reap-gated steps
