@@ -291,7 +291,7 @@ impl LivenessTq {
     /// Otherwise, returns `None`.
     fn use_blocks_in_region(&self, ctx: &Context, value: Value) -> Option<BitSet> {
         let mut use_blocks = BitSet::default();
-        for r#use in value.uses(ctx) {
+        for r#use in value.uses_iter(ctx) {
             let Some(user_block) = r#use.user_op().deref(ctx).get_parent_block() else {
                 // We don't know where the user op is, hence unanalysable
                 return None;
@@ -522,8 +522,7 @@ impl<T: RegionLiveness> Liveness<T> {
 
     fn has_use_in_region_subtree(ctx: &Context, value: Value, region: Ptr<Region>) -> bool {
         value
-            .uses(ctx)
-            .iter()
+            .uses_iter(ctx)
             .any(|r#use| find_ancestor_op_of_op_in_region(ctx, r#use.user_op(), region).is_some())
     }
 
@@ -535,8 +534,7 @@ impl<T: RegionLiveness> Liveness<T> {
             .expect("Query point must be within a block for local use check");
 
         let user_ops_in_point_block: HSet<_> = value
-            .uses(ctx)
-            .iter()
+            .uses_iter(ctx)
             .filter_map(|r#use| find_ancestor_op_of_op_in_block(ctx, r#use.user_op(), point_block))
             .collect();
 

@@ -2937,7 +2937,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             let lb = op.deref(ctx).get_parent_block()?;
             let mut stores = Vec::new();
-            for u in og(0).uses(ctx) {
+            for u in og(0).uses_iter(ctx) {
                 let uop = u.user_op();
                 let uid = Operation::op_type_id(uop, ctx);
                 // Loads read whatever the matching stores wrote; lifetime
@@ -3099,7 +3099,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let ctx = self.ctx;
         let bit = |v| self.const_bits(v, depth + 1);
         let mut arms = Vec::new();
-        for u in blk.uses(ctx) {
+        for u in blk.uses_iter(ctx) {
             let uop = u.user_op();
             let si = u.find_index(ctx);
             let o = Operation::get_op_dyn(uop, ctx);

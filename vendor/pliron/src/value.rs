@@ -430,6 +430,14 @@ impl Value {
         self.get_defnode_ref(ctx).uses(ctx).collect()
     }
 
+    /// PLIRON: lazy use iteration — [Value::uses] collects a `Vec` per
+    /// call; this walks the use list with no allocation. Prefer for
+    /// `.all()`/`.any()` queries and read-only loops. The use list must
+    /// not be mutated while iterating.
+    pub fn uses_iter<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Use<Value>> + 'a {
+        self.get_defnode_ref(ctx).uses(ctx)
+    }
+
     /// PLIRON: [`Value::uses`] into a caller-owned buffer so per-node
     /// queries in a worklist walk share one allocation. The copy is still
     /// required — the defnode sits behind a RefCell.
@@ -514,7 +522,7 @@ impl Value {
 impl Verify for Value {
     // Check that the value's uses point back to it,
     fn verify(&self, ctx: &Context) -> Result<()> {
-        for r#use in self.uses(ctx) {
+        for r#use in self.uses_iter(ctx) {
             let opd_idx = <Self as UseTrait>::try_find_index(&r#use, ctx)
                 .map_err(|_| verify_error!(self.loc(ctx), DefUseVerifyErr::OperandNotUseOfDef))?;
             let use_operand = r#use.user_op.deref(ctx).get_operand(ctx, opd_idx);
@@ -679,6 +687,14 @@ impl Ptr<BasicBlock> {
     /// Get uses (as successor operands in an Operation) of this block.
     pub fn uses(&self, ctx: &Context) -> Vec<Use<Ptr<BasicBlock>>> {
         self.deref(ctx).preds.uses(ctx).collect()
+    }
+
+    /// PLIRON: lazy use iteration — see [`Value::uses_iter`].
+    pub fn uses_iter<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> impl Iterator<Item = Use<Ptr<BasicBlock>>> + 'a {
+        self.deref(ctx).preds.uses(ctx)
     }
 
     /// Checks whether self is a successor of `pred`.

@@ -470,7 +470,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
             };
             // Dead: nowrite + nounwind + unused result (willreturn comes
             // free through `dedupable` — LLVM's `isRemovable` triple).
-            if res.uses(ctx).is_empty()
+            if !res.is_used(ctx)
                 && st.nowrite.get(*c) == Some(&true)
                 && st.funcs.get(*c).is_some_and(|f| f.nounwind)
             {

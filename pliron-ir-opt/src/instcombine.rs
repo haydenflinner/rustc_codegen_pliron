@@ -334,7 +334,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
     let (mut nc, mut nv) = (0, 0);
     for (op, r, id) in roots {
         let class = &eg[eg.find(id)];
-        if r.uses(ctx).is_empty() {
+        if !r.is_used(ctx) {
             continue;
         }
         let new = if let (_, Some(c)) = class.data {
@@ -676,7 +676,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize
     let (mut nc, mut nv) = (0, 0);
     for (i, o) in ops.iter().enumerate() {
         let r = o.result;
-        if r.uses(ctx).is_empty() {
+        if !r.is_used(ctx) {
             continue;
         }
         let k = uf.find(key(st, r, o.rw));

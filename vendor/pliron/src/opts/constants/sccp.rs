@@ -169,7 +169,7 @@ fn process_block(block: Ptr<BasicBlock>, ctx: &Context, state: &mut SccpState) {
 /// Infer (into `state`) what we can from the users of `val` given the
 /// current information in `state`.
 fn process_val(val: Value, ctx: &Context, state: &mut SccpState) {
-    for user in val.uses(ctx).into_iter().map(|u| u.user_op()) {
+    for user in val.uses_iter(ctx).map(|u| u.user_op()) {
         let user_block = user
             .deref(ctx)
             .get_parent_block()

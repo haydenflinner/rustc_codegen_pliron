@@ -17,7 +17,7 @@ use crate::state::{ArgExt, State};
 
 /// Pointer `p` only flows into address operands of loads, stores, mem intrinsics and GEPs.
 fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
-    p.uses(ctx).iter().all(|u| {
+    p.uses_iter(ctx).all(|u| {
         let o = u.user_op();
         let i = u.find_index(ctx);
         if Operation::is_op::<LoadOp>(o, ctx) {
@@ -37,7 +37,7 @@ fn non_escaping(ctx: &Context, st: &State, p: Value) -> bool {
 
 /// `p` or a GEP derived from it is an operand of `op`.
 fn touches(ctx: &Context, op: Ptr<Operation>, p: Value) -> bool {
-    p.uses(ctx).iter().any(|u| {
+    p.uses_iter(ctx).any(|u| {
         let o = u.user_op();
         o == op
             || (Operation::is_op::<GetElementPtrOp>(o, ctx)
@@ -63,8 +63,7 @@ fn try_forward(ctx: &mut Context, st: &mut State, sret_args: &[Value], m: Ptr<Op
         return false;
     }
     let uses: Vec<_> = src
-        .uses(ctx)
-        .iter()
+        .uses_iter(ctx)
         .map(|u| (u.user_op(), u.find_index(ctx)))
         .collect();
     if uses.len() != 2 {

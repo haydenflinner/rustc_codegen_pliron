@@ -433,7 +433,7 @@ fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u3
                 break;
             }
             budget -= 1;
-            for u in v.uses(ctx) {
+            for u in v.uses_iter(ctx) {
                 let o = u.user_op();
                 let ui = u.find_index(ctx);
                 if (Operation::is_op::<GetElementPtrOp>(o, ctx)

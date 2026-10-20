@@ -155,7 +155,7 @@ fn loop_private(ctx: &Context, st: &State, lset: &FxHashSet<Ptr<BasicBlock>>, a:
     let mut wl = vec![a];
     let mut fuel = MAX_ACC_WALK;
     while let Some(v) = wl.pop() {
-        for u in v.uses(ctx) {
+        for u in v.uses_iter(ctx) {
             let op = u.user_op();
             if !parent(ctx, op).is_some_and(|b| lset.contains(&b)) {
                 return false;
@@ -210,7 +210,7 @@ fn is_alloca(ctx: &Context, v: Value) -> bool {
 /// consumer just died — frees the values the chain itself consumed
 /// (the pure call results `invs` resolve to). Bounded by `fuel`.
 fn peel_dead(ctx: &mut Context, st: &State, v: Value, fuel: usize) {
-    if fuel == 0 || !v.uses(ctx).is_empty() {
+    if fuel == 0 || v.is_used(ctx) {
         return;
     }
     let Some(d) = v.defining_op() else {
@@ -463,8 +463,7 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) -> usize {
                 for r in 0..o.get_num_results() {
                     if !o
                         .get_result(ctx, r)
-                        .uses(ctx)
-                        .iter()
+                        .uses_iter(ctx)
                         .all(|u| parent(ctx, u.user_op()).is_some_and(|pb| lset.contains(&pb)))
                     {
                         ok = false;

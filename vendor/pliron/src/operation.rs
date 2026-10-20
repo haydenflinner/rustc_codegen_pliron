@@ -1281,7 +1281,7 @@ pub fn verify_value_dominance(ir: Ptr<Operation>, ctx: &Context) -> Result<()> {
         dom_info: &mut DomInfo,
         value: Value,
     ) -> WalkResult<pliron::result::Error> {
-        for r#use in value.uses(ctx) {
+        for r#use in value.uses_iter(ctx) {
             let user_op = r#use.user_op();
             if !dom_info.value_strictly_dominates_op(ctx, value, user_op) {
                 let loc = user_op.deref(ctx).loc();

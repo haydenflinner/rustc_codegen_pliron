@@ -212,8 +212,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 if !a.is_used(ctx) {
                     dead += 1;
                 } else if matches!(classify(ctx, a.get_type(ctx)), TyK::Ptr)
-                    && a.uses(ctx)
-                        .into_iter()
+                    && a
+                        .uses_iter(ctx)
                         .all(|u| Operation::is_op::<LoadOp>(u.user_op(), ctx))
                 {
                     ro += 1;

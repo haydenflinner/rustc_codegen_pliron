@@ -299,8 +299,7 @@ fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
 /// function end and poisons stack-slot coloring.
 fn inherit_markers(ctx: &mut Context, st: &mut State, a: Value, c: Value) {
     let markers: Vec<Ptr<Operation>> = a
-        .uses(ctx)
-        .iter()
+        .uses_iter(ctx)
         .map(|u| u.user_op())
         .filter(|&m| {
             matches!(
@@ -437,8 +436,7 @@ fn slot_loads_inner(
                 if matches!(classify(ctx, r.get_type(ctx)), TyK::Ptr) {
                     loads.push(r);
                 } else if r
-                    .uses(ctx)
-                    .iter()
+                    .uses_iter(ctx)
                     .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
                 {
                     // A load of the pointer bytes as an integer fed to
@@ -603,8 +601,7 @@ fn accesses_inner(
                     && op
                         .deref(ctx)
                         .get_result(ctx, 0)
-                        .uses(ctx)
-                        .iter()
+                        .uses_iter(ctx)
                         .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
                 {
                     return None;
@@ -1386,7 +1383,7 @@ fn validate(ctx: &Context, st: &mut State, a: Value) {
     let Some(&ty) = st.promoted.get(a) else {
         return;
     };
-    let ok = a.uses(ctx).iter().all(|u| {
+    let ok = a.uses_iter(ctx).all(|u| {
         let op = u.user_op();
         let idx = u.find_index(ctx);
         if Operation::is_op::<LoadOp>(op, ctx) {
@@ -1536,8 +1533,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 };
                 if Operation::is_op::<AllocaOp>(d, ctx) {
                     let uses: Vec<String> = v
-                        .uses(ctx)
-                        .iter()
+                        .uses_iter(ctx)
                         .map(|u| {
                             let o = u.user_op();
                             st.intrinsics
@@ -1681,8 +1677,7 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
                 if op
                     .deref(ctx)
                     .get_result(ctx, 0)
-                    .uses(ctx)
-                    .iter()
+                    .uses_iter(ctx)
                     .any(|u| Operation::is_op::<IntToPtrOp>(u.user_op(), ctx))
                 {
                     return "ptrtoint roundtrip".into();
@@ -1837,7 +1832,7 @@ fn forward_single_store_d(
                     } else if Operation::is_op::<GetElementPtrOp>(o, ctx)
                         && u.find_index(ctx) == 0
                         && (gep_offset(ctx, st, o) == Some(0)
-                            || o.deref(ctx).get_result(ctx, 0).uses(ctx).is_empty())
+                            || !o.deref(ctx).get_result(ctx, 0).is_used(ctx))
                     {
                         geps.push(o);
                         work.push(o.deref(ctx).get_result(ctx, 0));

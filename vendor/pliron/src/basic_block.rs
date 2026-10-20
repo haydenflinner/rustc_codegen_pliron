@@ -513,7 +513,7 @@ impl Verify for BasicBlock {
             .iter(ctx)
             .try_for_each(|(_, attr)| verify_attr(&**attr, ctx))?;
         // Check that every use is of this block.
-        for r#use in self.self_ptr.uses(ctx) {
+        for r#use in self.self_ptr.uses_iter(ctx) {
             if r#use.get_def(ctx) != self.self_ptr {
                 verify_err!(self.loc(), DefUseVerifyErr::OperandNotUseOfDef)?;
             }
