@@ -229,6 +229,26 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
         "llvm.aarch64.dsb" => return Some("    dsb ish\n    ret\n".into()),
         _ => {}
     }
+    // crc32b/h/w/x (IEEE) and crc32cb/ch/cw/cx (Castagnoli): crc in w0,
+    // data in w1 (x/cx take x1), result in w0. rsasm doesn't know the
+    // CRC32 mnemonics, so emit the encoding for `crc32* w0, w0, w1/x1`
+    // as a word: 0x1ac14000 | sz<<10 | C<<12 | sf<<31.
+    if let Some(sz) = name
+        .strip_prefix("llvm.aarch64.crc32c")
+        .or_else(|| name.strip_prefix("llvm.aarch64.crc32"))
+    {
+        let sz_i = match sz {
+            "b" => 0u32,
+            "h" => 1,
+            "w" => 2,
+            "x" => 3,
+            _ => return None,
+        };
+        let c = name.contains("crc32c") as u32;
+        let sf = (sz_i == 3) as u32;
+        let word = 0x1ac14000 | (sz_i << 10) | (c << 12) | (sf << 31);
+        return Some(format!("    .word 0x{word:08x}\n    ret\n"));
+    }
     let rest = name.strip_prefix("llvm.aarch64.neon.")?;
     let (op, ty) = rest.rsplit_once('.')?;
     // Reductions carry a scalar-type infix (`faddv.f32.v4f32`); drop it.

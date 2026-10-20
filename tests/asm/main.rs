@@ -143,6 +143,40 @@ fn clmul() {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32s() -> (u32, u32, u32, u32, u32, u32) {
+    use std::arch::aarch64::*;
+    let b8 = b"12345678";
+    let (mut c, mut r) = (!0u32, [0u32; 6]);
+    for &b in b8 {
+        c = __crc32b(c, b);
+    }
+    r[0] = c ^ !0;
+    let mut c = !0u32;
+    for w in b8.chunks(2) {
+        c = __crc32h(c, u16::from_le_bytes([w[0], w[1]]));
+    }
+    r[1] = c ^ !0;
+    let mut c = !0u32;
+    for w in b8.chunks(4) {
+        c = __crc32w(c, u32::from_le_bytes(w.try_into().unwrap()));
+    }
+    r[2] = c ^ !0;
+    let mut c = !0u32;
+    c = __crc32d(c, u64::from_le_bytes(*b8));
+    r[3] = c ^ !0;
+    let mut c = !0u32;
+    for &b in b"12345678" {
+        c = __crc32cb(c, b);
+    }
+    r[4] = c ^ !0;
+    let mut c = !0u32;
+    c = __crc32cd(c, u64::from_le_bytes(*b8));
+    r[5] = c ^ !0;
+    (r[0], r[1], r[2], r[3], r[4], r[5])
+}
+
+#[cfg(target_arch = "aarch64")]
 fn main() {
     let mut x: u64 = 40;
     unsafe { asm!("add {0}, {0}, {1}", inout(reg) x, in(reg) 2u64) };
@@ -158,4 +192,10 @@ fn main() {
     }
     let z = unsafe { pliron_ga_add(1, 2) };
     println!("{x} {y} {} {z}", std::str::from_utf8(&dst).unwrap());
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        let r = unsafe { crc32s() };
+        assert_eq!([r.0, r.1, r.2, r.3], [0x9ae0daaf; 4]);
+        assert_eq!([r.4, r.5], [0x6087809a; 2]);
+        println!("crc32 ok");
+    }
 }
