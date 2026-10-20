@@ -595,7 +595,11 @@ fn dem64_op(func: &Function, inst: Inst) -> bool {
                 | Opcode::Sload16
                 | Opcode::Sload32
         ),
-        InstructionData::LoadNoOffset { .. } => true,
+        // `LoadNoOffset` is a shared format: `bitcast` and
+        // `atomic_load` live here too. `bitcast`'s operand is not a
+        // memory address, and an `atomic_load` twin emitted as a
+        // plain `load.i32` would drop atomicity — neither demotes.
+        InstructionData::LoadNoOffset { .. } => false,
         _ => false,
     }
 }
@@ -782,10 +786,9 @@ fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) 
                 _ => pos.ins().load(types::I32, flags, arg, offset),
             }
         }
-        InstructionData::LoadNoOffset { flags, arg, .. } => {
-            let flags = pos.func.dfg.mem_flags[flags].clone();
-            pos.ins().load(types::I32, flags, arg, 0)
-        }
+        // `LoadNoOffset` insts (`bitcast`, `atomic_load`) never
+        // reach here — `dem64_op` admits none of them — and none of
+        // them could emit a plain-load twin anyway.
         _ => return,
     };
     v32.insert(v, val);
@@ -12138,6 +12141,39 @@ mod tests {
             types::I32
         );
         dem64_verify(&func, "dem64 uload tag test");
+    }
+
+    /// `bitcast` and `atomic_load` are the only opcodes in the
+    /// `LoadNoOffset` format — dem64 must not mistake either for a
+    /// load and synthesize `load.i32` from the operand (rustlantis
+    /// seed 88: `load.i32` with an f64 bitcast operand as address).
+    #[test]
+    fn dem64_loadnoffset_is_not_a_load() {
+        let mut func = dem64_func(&[types::F64, types::I64]);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let f = func.dfg.append_block_param(entry, types::F64);
+        let p = func.dfg.append_block_param(entry, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let w = cur.ins().bitcast(types::I64, MemFlagsData::new(), f);
+        let lo = cur.ins().ireduce(types::I32, w);
+        let a = cur.ins().atomic_load(types::I64, MemFlagsData::new(), p);
+        let alo = cur.ins().ireduce(types::I32, a);
+        let s = cur.ins().iadd(lo, alo);
+        let out = cur.ins().uextend(types::I64, s);
+        cur.ins().return_(&[out]);
+
+        dem64(&mut func);
+        let ops: Vec<Opcode> = func
+            .layout
+            .block_insts(entry)
+            .map(|i| func.dfg.insts[i].opcode())
+            .collect();
+        // No plain load was synthesized; the atomic stays atomic.
+        assert!(!ops.contains(&Opcode::Load), "{}", func.display());
+        assert!(ops.contains(&Opcode::AtomicLoad), "{}", func.display());
+        dem64_verify(&func, "dem64 LoadNoOffset");
     }
 
     /// `ireduce.i32 (uextend.i64 x)` narrows to `x` even when the

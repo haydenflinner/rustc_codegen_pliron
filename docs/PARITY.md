@@ -135,10 +135,9 @@ noted):
   to its own latch `iadd` (cranelift PLIRON_PATCH #57). Tier 1 -O: 16,517 pass;
   the only expectation miss is `hashmap-debug-format.rs`, skipped as
   nondeterministic (randomized `HashMap` order).
-- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 93 pass, 3 fail
-  after `c00303c` + the iconst.i128/proots fixes below — seed 1 -O run
-  timeout, seed 41 -O SIGSEGV, seed 88 -O `tailmerge` verifier error
-  (f64 address into `load.i32`). Seed 14's debug-only
+- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 94 pass, 2 fail
+  after `c00303c` + the iconst.i128/proots/dem64 fixes below — seed 1
+  -O run timeout, seed 41 -O SIGSEGV. Seed 14's debug-only
   `proots.rs:1211` offset-subtract overflow (release passes; fixed by
   wrapping key arithmetic — test `proots::tests::extreme_offsets_wrap`).
   Artifacts: `target/harness/fuzz/<seed>`.
@@ -155,6 +154,15 @@ noted):
   `unreachable`; rgmerge's lane-mask probe also overflowed reading it).
   Both now emit `iconcat` pairs (tests/i128const.rs); the verifier
   reports bad iconst types instead of panicking (PLIRON_PATCH #58).
+  Seed 88's "tailmerge broke `load.i32` on an f64 address" was also
+  misattributed — tailmerge's verify just surfaced it first (clifpeep
+  runs unverified): `dem64`'s web admission matched on the
+  `LoadNoOffset` *format*, which `bitcast` and `atomic_load` share,
+  so `bitcast.i64 (bitcast.f64 K)` was demoted and its i32 twin
+  emitted as `load.i32` of the f64 operand. `dem64_op` now admits no
+  `LoadNoOffset` inst (an `atomic_load` twin would have silently
+  dropped atomicity too); regression
+  `clifpeep::tests::dem64_loadnoffset_is_not_a_load`.
 - Tooling: `clif-check step` now replays reap-gated steps
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".
