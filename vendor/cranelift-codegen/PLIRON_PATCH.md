@@ -504,6 +504,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     them above the generic i64-pair rules; zero-hi-right outranks
     zero-hi-left so both-extended inputs resolve deterministically.
 
+    The `uextend` variants take the operand via `put_in_reg_zext64`, not
+    `put_in_reg`: narrow values live in X registers whose bits above the
+    value width are garbage (a 32-bit `lsl`/`eor` leaves them set), so
+    the raw register is not the zero-extension the `uextend` promised
+    (rustlantis seed 24 miscompiled `-65535` as `-5439487`).
+
 40. `#[inline]` on hot DFG/Layout readers (`src/ir/dfg.rs`,
     `src/ir/layout.rs`): dev-profile builds have no LTO, so every
     `value_def`/`resolve_aliases`/`inst_args`/`Insts::next` call from

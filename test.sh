@@ -86,6 +86,13 @@ t_pairfuse() {
   rustc $BE --edition 2021 -O tests/pairfuse/main.rs -o $out/pairfuse$exe && $out/pairfuse$exe
 }
 
+t_zext128() {
+  # The i128 add/sub rules fused with a uextend operand must zero-extend
+  # the narrow value — a raw W register can carry shl/eor/mul garbage in
+  # bits 16..32 (rustlantis seed 24 miscompiled -65535 as -5439487).
+  rustc $BE --edition 2021 -O tests/zext128/main.rs -o $out/zext128$exe && $out/zext128$exe
+}
+
 t_edgespec() {
   # edgespec must not thread an edge past a dispatch block whose params it
   # leaves stale — SplitWhitespace::next's cursor rebind was skipped and the
@@ -443,6 +450,7 @@ want unroll && t_unroll
 want licm && t_licm
 want loadpre && t_loadpre
 want pairfuse && t_pairfuse
+want zext128 && t_zext128
 want edgespec && t_edgespec
 want cparm && t_cparm
 want celim && t_celim
