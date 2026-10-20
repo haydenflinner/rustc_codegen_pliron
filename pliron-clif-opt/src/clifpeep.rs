@@ -8179,8 +8179,11 @@ fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8,
             }
             let (x, y, m, src) = bool_mask(func, x, depth - 1)?;
             // `b ^ 1` flips the predicate only when `b` is 0/1 — which
-            // `bool_mask`'s domain guarantees by construction.
-            Some((x, y, if inv { !m & OC_ALL } else { m }, src))
+            // `bool_mask`'s domain guarantees by construction. The inner
+            // source computes `m`, not its complement: an inverted peel
+            // has none (handing it on let `selord_icmp` alias
+            // `icmp eq 1, (c ^ 1)` straight to `c`).
+            Some((x, y, if inv { !m & OC_ALL } else { m }, if inv { None } else { src }))
         }
         InstructionData::IntCompare {
             opcode: Opcode::Icmp,
@@ -8202,7 +8205,10 @@ fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8,
                     let m2 = (if cc_eval(c2, 0, ku, zw) { !m } else { 0 }
                         | if cc_eval(c2, 1, ku, zw) { m } else { 0 })
                         & OC_ALL;
-                    return Some((x, y, m2, Some(z)));
+                    // This icmp is the 0/1 value computing `m2`; `z`
+                    // computes `m`, which differs whenever the compare
+                    // negates (`icmp eq z, 0`).
+                    return Some((x, y, m2, Some(v)));
                 }
             }
             // Canonical pair names: consumers compare pairs for equality
