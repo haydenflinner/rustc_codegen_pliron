@@ -1,3 +1,5 @@
+#![cfg_attr(target_arch = "aarch64", feature(portable_simd))]
+
 use std::arch::{asm, global_asm};
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -177,6 +179,56 @@ unsafe fn crc32s() -> (u32, u32, u32, u32, u32, u32) {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn neon_stubs() {
+    use std::arch::aarch64::*;
+    unsafe {
+        let v8 = |a: [u8; 16]| std::mem::transmute::<_, uint8x16_t>(a);
+        let v16 = |a: [u16; 8]| std::mem::transmute::<_, uint16x8_t>(a);
+        let v32 = |a: [u32; 4]| std::mem::transmute::<_, uint32x4_t>(a);
+        let i16v = |a: [i16; 8]| std::mem::transmute::<_, int16x8_t>(a);
+        let i32v = |a: [i32; 4]| std::mem::transmute::<_, int32x4_t>(a);
+        let a16 = |v: int16x4_t| std::mem::transmute::<_, [i16; 4]>(v);
+        let a8 = |v: uint8x8_t| std::mem::transmute::<_, [u8; 8]>(v);
+        // pairwise add-long: uaddlp (ret type is the wide one)
+        let lp: [u16; 8] = std::mem::transmute(vpaddlq_u8(v8([1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])));
+        assert_eq!(lp, [3, 7, 11, 15, 19, 23, 27, 31]);
+        let lp2: [u32; 4] = std::mem::transmute(vpaddlq_u16(v16([100u16, 200, 300, 400, 500, 600, 700, 800])));
+        assert_eq!(lp2, [300, 700, 1100, 1500]);
+        // saturating doubling multiply-high: sqdmulh
+        let m = i16v([0x4000i16, -0x4000, 0x7fff, -0x8000, 1, -1, 0x1234, 0x4000]);
+        let n = i16v([0x4000i16, 0x4000, 0x7fff, -0x8000, -1, -1, -0x4000, 0x2000]);
+        let dm: [i16; 8] = std::mem::transmute(vqdmulhq_s16(m, n));
+        assert_eq!(dm, [0x2000, -0x2000, 0x7ffe, 0x7fff, -1, 0, -0x91a, 0x1000]);
+        let m32 = i32v([0x4000_0000i32, -0x4000_0000, 0x7fff_ffff, -0x8000_0000i32]);
+        let dm32: [i32; 4] = std::mem::transmute(vqdmulhq_s32(m32, m32));
+        assert_eq!(dm32, [0x2000_0000, 0x2000_0000, 0x7fff_fffe, 0x7fff_ffff]);
+        // saturating narrow: sqxtn / uqxtn
+        let w = i32v([0x1234i32, 0x8_0000, -1, -0x9_0000]);
+        assert_eq!(a16(vqmovn_s32(w)), [0x1234, 0x7fff, -1, -0x8000]);
+        let usat = vqmovn_u16(v16([1u16, 0x200, 0xffff, 300, 0, 255, 256, 0x8000]));
+        assert_eq!(a8(usat), [1, 0xff, 0xff, 0xff, 0, 0xff, 0xff, 0xff]);
+        // saturating shift-right unsigned narrow: sqshrun (shift arrives as an arg)
+        let sh = i32v([0x1000i32, -1, 0x7fff_ffff, 0x4000_0000]);
+        let shr: [u16; 4] = std::mem::transmute(vqshrun_n_s32::<4>(sh));
+        assert_eq!(shr, [0x100, 0, 0xffff, 0xffff]);
+        let shr_r: [u16; 4] = std::mem::transmute(vqrshrun_n_s32::<4>(i32v([0x1080i32, -1, 0x7fff_ffff, 0x4000_0000])));
+        assert_eq!(shr_r, [0x108, 0, 0xffff, 0xffff]);
+        // pairwise add-long and accumulate: uadalp (acc v0, narrow arg v1)
+        let acc = i32v([100, 200, 300, 400]);
+        let alp: [i32; 4] = std::mem::transmute(vpadalq_s16(acc, i16v([1, 2, 3, 4, 5, 6, 7, 8])));
+        assert_eq!(alp, [103, 207, 311, 415]);
+        // generic vector intrinsics: llvm.roundeven / llvm.fptoui.sat
+        use std::simd::{f32x4, num::SimdFloat, StdFloat};
+        let r = f32x4::from_array([1.6f32, -1.6, 0.5, -0.5]).round_ties_even();
+        assert_eq!(r.to_array(), [2.0, -2.0, 0.0, -0.0]);
+        let c = f32x4::from_array([1.9f32, -1.9, 4e9, f32::NAN]).cast::<i32>();
+        assert_eq!(c.to_array(), [1, -1, 2147483647, 0]);
+        let _ = v32([0; 4]);
+    }
+    println!("neon stubs ok");
+}
+
+#[cfg(target_arch = "aarch64")]
 fn main() {
     let mut x: u64 = 40;
     unsafe { asm!("add {0}, {0}, {1}", inout(reg) x, in(reg) 2u64) };
@@ -198,4 +250,5 @@ fn main() {
         assert_eq!([r.4, r.5], [0x6087809a; 2]);
         println!("crc32 ok");
     }
+    neon_stubs();
 }

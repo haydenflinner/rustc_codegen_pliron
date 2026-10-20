@@ -249,29 +249,135 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
         let word = 0x1ac14000 | (sz_i << 10) | (c << 12) | (sf << 31);
         return Some(format!("    .word 0x{word:08x}\n    ret\n"));
     }
+    // Scalar/vector float rounding intrinsics surface as `llvm.<op>.<ty>`
+    // (e.g. `llvm.roundeven.v4f32`); each maps to one FRINT* form.
+    if let Some(s) = name.strip_prefix("llvm.") {
+        if let Some((op, ty)) = s.rsplit_once('.') {
+            let frint = match op {
+                "rint" => "frintx",
+                "nearbyint" => "frinti",
+                "floor" => "frintm",
+                "ceil" => "frintp",
+                "trunc" => "frintz",
+                "round" => "frinta",
+                "roundeven" => "frintn",
+                _ => "",
+            };
+            if !frint.is_empty() {
+                let ops = match ty {
+                    "f16" => "h0",
+                    "f32" => "s0",
+                    "f64" => "d0",
+                    "v4f16" => "v0.4h",
+                    "v8f16" => "v0.8h",
+                    "v2f32" => "v0.2s",
+                    "v4f32" => "v0.4s",
+                    "v2f64" => "v0.2d",
+                    _ => return None,
+                };
+                return Some(format!("    {frint} {ops}, {ops}\n    ret\n"));
+            }
+        }
+    }
+    let vec_suf = |ty: &str| -> Option<&'static str> {
+        Some(match ty {
+            "v16i8" => "16b",
+            "v8i8" => "8b",
+            "v8i16" => "8h",
+            "v4i16" => "4h",
+            "v4i32" => "4s",
+            "v2i32" => "2s",
+            "v2i64" => "2d",
+            "v1i64" => "1d",
+            "v4f32" => "4s",
+            "v2f32" => "2s",
+            "v2f64" => "2d",
+            "v8f16" => "8h",
+            "v4f16" => "4h",
+            _ => return None,
+        })
+    };
+    // `llvm.fptoui.sat.<ret>.<arg>` / `fptosi.sat` are saturating
+    // FCVTZU/FCVTZS; the scalar forms write a GPR while vectors stay in v0.
+    if let Some(s) = name
+        .strip_prefix("llvm.fptoui.sat.")
+        .or_else(|| name.strip_prefix("llvm.fptosi.sat."))
+    {
+        let cv = if name.contains("fptoui") { "fcvtzu" } else { "fcvtzs" };
+        let (ret, arg) = s.split_once('.')?;
+        if let Some(suf) = vec_suf(arg) {
+            return Some(format!("    {cv} v0.{suf}, v0.{suf}\n    ret\n"));
+        }
+        let (d, a) = match (ret, arg) {
+            ("i32", "f16") => ("w0", "h0"),
+            ("i32", "f32") => ("w0", "s0"),
+            ("i32", "f64") => ("w0", "d0"),
+            ("i64", "f16") => ("x0", "h0"),
+            ("i64", "f32") => ("x0", "s0"),
+            ("i64", "f64") => ("x0", "d0"),
+            _ => return None,
+        };
+        return Some(format!("    {cv} {d}, {a}\n    ret\n"));
+    }
     let rest = name.strip_prefix("llvm.aarch64.neon.")?;
     let (op, ty) = rest.rsplit_once('.')?;
-    // Reductions carry a scalar-type infix (`faddv.f32.v4f32`); drop it.
-    let op = op.split_once('.').map_or(op, |(o, _)| o);
-    let suf = match ty {
-        "v16i8" => "16b",
-        "v8i8" => "8b",
-        "v8i16" => "8h",
-        "v4i16" => "4h",
-        "v4i32" => "4s",
-        "v2i32" => "2s",
-        "v2i64" => "2d",
-        "v1i64" => "1d",
-        "v4f32" => "4s",
-        "v2f32" => "2s",
-        "v2f64" => "2d",
-        _ => return None,
+    // Reductions carry a scalar-type infix (`faddv.f32.v4f32`); widening and
+    // narrowing ops carry the *result* arrangement (`uaddlp.v8i16.v16i8`).
+    let (op, res_ty) = match op.split_once('.') {
+        Some((o, r)) => (o, Some(r)),
+        None => (op, None),
     };
+    let suf = vec_suf(ty)?;
+    // Widening pairwise ops: `uaddlp v0.8h, v0.16b` (single input in v0),
+    // `uadalp v0.4s, v1.8h` (wide accumulator v0, narrow input v1).
+    if matches!(op, "uaddlp" | "saddlp" | "uadalp" | "sadalp") {
+        let wide = vec_suf(res_ty?)?;
+        let src = if op.ends_with("alp") { "v1" } else { "v0" };
+        return Some(format!("    {op} v0.{wide}, {src}.{suf}\n    ret\n"));
+    }
+    // Saturating narrows (`sqxtn`/`uqxtn`/`sqxtun`): the name's suffix is the
+    // destination arrangement; the source lanes are twice as wide.
+    if matches!(op, "sqxtn" | "uqxtn" | "sqxtun") {
+        let (d, s) = match suf {
+            "8b" => ("8b", "8h"),
+            "4h" => ("4h", "4s"),
+            "2s" => ("2s", "2d"),
+            _ => return None,
+        };
+        return Some(format!("    {op} v0.{d}, v0.{s}\n    ret\n"));
+    }
+    // Saturating shift-right narrows (`*shrn` narrow signed, `*shrun` narrow
+    // to unsigned): the shift count is the first *integer* arg, so it lands
+    // in w0 while the vector is in v0 — integer and vector args use separate
+    // banks. Broadcast its negation and shift; SRSHL/URSHL handle the
+    // rounding variants without a bias-add overflow corner case.
+    const SHRN: &[(&str, &str, &str)] = &[
+        ("sqshrn", "sshl", "sqxtn"),
+        ("sqrshrn", "srshl", "sqxtn"),
+        ("uqshrn", "ushl", "uqxtn"),
+        ("uqrshrn", "urshl", "uqxtn"),
+        ("sqshrun", "sshl", "sqxtun"),
+        ("sqrshrun", "srshl", "sqxtun"),
+        ("uqshrun", "ushl", "uqxtn"),
+        ("uqrshrun", "urshl", "uqxtn"),
+    ];
+    if let Some(&(_, sh, xt)) = SHRN.iter().find(|(n, ..)| *n == op) {
+        let (d, s, g) = match suf {
+            "8b" => ("8b", "8h", "w0"),
+            "4h" => ("4h", "4s", "w0"),
+            "2s" => ("2s", "2d", "x0"),
+            _ => return None,
+        };
+        return Some(format!(
+            "    dup v1.{s}, {g}\n    neg v1.{s}, v1.{s}\n    {sh} v0.{s}, v0.{s}, v1.{s}\n    {xt} v0.{d}, v0.{s}\n    ret\n"
+        ));
+    }
     // 3-vector ops (elementwise and pairwise share the same encoding shape).
     const BINARY: &[&str] = &[
         "addp", "smaxp", "sminp", "umaxp", "uminp", "srhadd", "urhadd", "shadd", "uhadd", "sqadd",
         "uqadd", "sqsub", "uqsub", "sshl", "ushl", "srshl", "urshl", "sqshl", "uqshl", "sqrshl",
-        "uqrshl", "sabd", "uabd", "saba", "uaba", "mls", "mla", "pmul", "cmeq", "cmge", "cmgt",
+        "uqrshl", "sabd", "uabd", "saba", "uaba", "mls", "mla", "pmul", "sqdmulh", "sqrdmulh",
+        "cmeq", "cmge", "cmgt",
         "cmhs", "cmhi", "cmtst", "fadd", "fsub", "fmul", "fdiv", "fmla", "fmls", "fmax", "fmin",
         "fmaxnm", "fminnm", "faddp", "fmaxp", "fminp", "fmaxnmp", "fminnmp", "fcmeq", "fcmge",
         "fcmgt", "facge", "facgt", "fabd", "frecps", "frsqrts",
@@ -307,14 +413,22 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
             n + 1
         ));
     }
-    // 2-vector unary ops.
+    // 2-vector unary ops. The fcvt* converts share one arrangement between
+    // the int and fp suffixes (v4i32/v4f32 are both .4s), so the arg suffix
+    // works for both operands.
     const UNARY: &[&str] = &[
         "abs", "sqabs", "neg", "sqneg", "cls", "clz", "cnt", "rbit", "rev16", "rev32", "rev64",
         "urecpe", "ursqrte", "fabs", "fneg", "fsqrt", "frinti", "frintm", "frintn", "frintp",
-        "frintx", "frintz", "frecpe", "frsqrte",
+        "frintx", "frintz", "frecpe", "frsqrte", "fcvtas", "fcvtau", "fcvtms", "fcvtmu",
+        "fcvtns", "fcvtnu", "fcvtps", "fcvtpu", "fcvtzs", "fcvtzu",
     ];
     if UNARY.contains(&op) {
         return Some(format!("    {op} v0.{suf}, v0.{suf}\n    ret\n"));
+    }
+    // Saturating rounding doubling multiply accumulate/subtract high:
+    // acc in v0, multiplicands in v1 and v2.
+    if matches!(op, "sqrdmlah" | "sqrdmlsh") {
+        return Some(format!("    {op} v0.{suf}, v1.{suf}, v2.{suf}\n    ret\n"));
     }
     // NEON f32x4 sum; rsasm only knows the SVE `faddv`, so pairwise-add instead.
     if op == "faddv" {
