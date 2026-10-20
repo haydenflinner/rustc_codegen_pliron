@@ -1212,17 +1212,34 @@ fn addend(func: &Function, v: Value) -> Option<(Value, i64)> {
     }
 }
 
+/// Node-visit budget for [`lin_flat`]'s tree walk.
+const LIN_FLAT_VISITS: usize = 64;
+
 /// `v`'s additive decomposition `Σ sᵢ·tᵢ + K` through `iadd`/`isub`/
 /// `ineg`/`imul x,-1`/`iconst` — the `icmp eq/ne` linear fold moves the
 /// negated half to the rhs. `(terms, koff, consumed)` — `consumed` counts
 /// the op nodes folded away, so a bare operand reports 0 and callers can
 /// tell a real rewrite from a no-op. `None` past 8 tree nodes (bounded
-/// peel) — wider trees stay put.
-fn lin_flat(func: &Function, v: Value, mut koff: i64) -> Option<(Vec<(Value, i64)>, i64, usize)> {
+/// peel) — wider trees stay put — or past [`LIN_FLAT_VISITS`] visits: the
+/// 8-node bound is on *pending* nodes, and unreachable code may be cyclic
+/// (the verifier skips dominance there). A dead loop whose header param
+/// was aliased to its back-edge arg — `v6 -> v15`, `v15 = iadd v6, 16` —
+/// kept the stack at two while the walk ran forever (a 20-line `--test`
+/// UI program hung rustc here).
+pub(crate) fn lin_flat(
+    func: &Function,
+    v: Value,
+    mut koff: i64,
+) -> Option<(Vec<(Value, i64)>, i64, usize)> {
     let mut terms: Vec<(Value, i64)> = Vec::new();
     let mut consumed = 0usize;
     let mut stack = vec![(func.dfg.resolve_aliases(v), 1i64)];
+    let mut visits = 0usize;
     while let Some((x, s)) = stack.pop() {
+        visits += 1;
+        if visits > LIN_FLAT_VISITS {
+            return None;
+        }
         if let Some(k) = sconst(func, x) {
             koff = koff.wrapping_add(s.wrapping_mul(k));
         } else {
@@ -8202,8 +8219,11 @@ fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8,
             }
             let (x, y, m, src) = bool_mask(func, x, depth - 1)?;
             // `b ^ 1` flips the predicate only when `b` is 0/1 — which
-            // `bool_mask`'s domain guarantees by construction.
-            Some((x, y, if inv { !m & OC_ALL } else { m }, src))
+            // `bool_mask`'s domain guarantees by construction. The inner
+            // source computes `m`, not its complement: an inverted peel
+            // has none (handing it on let `selord_icmp` alias
+            // `icmp eq 1, (c ^ 1)` straight to `c`).
+            Some((x, y, if inv { !m & OC_ALL } else { m }, if inv { None } else { src }))
         }
         InstructionData::IntCompare {
             opcode: Opcode::Icmp,
@@ -8225,7 +8245,10 @@ fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8,
                     let m2 = (if cc_eval(c2, 0, ku, zw) { !m } else { 0 }
                         | if cc_eval(c2, 1, ku, zw) { m } else { 0 })
                         & OC_ALL;
-                    return Some((x, y, m2, Some(z)));
+                    // This icmp is the 0/1 value computing `m2`; `z`
+                    // computes `m`, which differs whenever the compare
+                    // negates (`icmp eq z, 0`).
+                    return Some((x, y, m2, Some(v)));
                 }
             }
             // Canonical pair names: consumers compare pairs for equality
@@ -8683,12 +8706,15 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
             return false;
         };
         // `select c, 1, 0` ≡ truthy(c): alias a canonical bool c, else
-        // `icmp ne/eq c, 0`.
+        // `icmp ne/eq c, 0`. `c` may be wider than the i8 result
+        // (armmerge's `select (band.i32 ..), 1, 0`): the zero takes
+        // `c`'s type and only an i8 `c` can stand in for the result.
+        let cty = pos.func.dfg.value_type(c);
         if !neg {
-            if is01(pos.func, c, 4) {
+            if cty == types::I8 && is01(pos.func, c, 4) {
                 return alias_to(pos, inst, res, c);
             }
-            let z = pos.ins().iconst(types::I8, 0);
+            let z = pos.ins().iconst(cty, 0);
             pos.func.dfg.insts[inst] = InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
                 cond: IntCC::NotEqual,
@@ -8706,7 +8732,7 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
             };
             return true;
         }
-        let z = pos.ins().iconst(types::I8, 0);
+        let z = pos.ins().iconst(cty, 0);
         pos.func.dfg.insts[inst] = InstructionData::IntCompare {
             opcode: Opcode::Icmp,
             cond: IntCC::Equal,
@@ -10667,6 +10693,47 @@ mod tests {
     use super::*;
     use cranelift_codegen::ir::{AbiParam, ExtFuncData, MemFlagsData, Signature, UserFuncName};
     use cranelift_codegen::isa::CallConv;
+
+    /// Unreachable blocks may hold cyclic defs: `trivp`-style param
+    /// removal on a dead loop aliased the header param to its own
+    /// back-edge `iadd`. `lin_flat` (feeding `icmpk`) followed `v15 = v6 +
+    /// 16 = v15 + 16 …` forever — rustc's `--test` harness for UI
+    /// `test-case-on-use-item-129765.rs` hung. The visit budget bails.
+    #[test]
+    fn lin_flat_bails_on_alias_cycle_in_dead_code() {
+        let src = "function %f() {
+        block0:
+            jump block5
+        block3:
+            v8 = iconst.i64 8
+            v13 = icmp.i64 eq v6, v8
+            brif v13, block5, block4
+        block4:
+            v14 = iconst.i64 16
+            v15 = iadd.i64 v6, v14
+            v6 -> v15
+            v16 = iconst.i64 0
+            v17 = icmp ne v15, v16
+            jump block3
+        block5:
+            return
+        }";
+        let func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        let t = std::time::Instant::now();
+        assert!(lin_flat(&func, Value::from_u32(15), 0).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_millis(100));
+        // An ordinary chain still folds: `v0 + 1 + 1`.
+        let short = "function %g(i64) -> i64 {
+        block0(v0: i64):
+            v1 = iconst.i64 1
+            v2 = iadd v0, v1
+            v3 = iadd v2, v1
+            return v3
+        }";
+        let g = cranelift_reader::parse_functions(short).unwrap().remove(0);
+        let (terms, k, consumed) = lin_flat(&g, Value::from_u32(3), 0).unwrap();
+        assert_eq!((terms, k, consumed), (vec![(Value::from_u32(0), 1)], 2, 2));
+    }
 
     /// `call %Memcpy(dst, src, iconst 8)` becomes `load.i64; store.i64`
     /// with the dst pointer aliased to the call's result.

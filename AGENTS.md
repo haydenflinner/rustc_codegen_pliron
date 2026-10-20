@@ -105,7 +105,9 @@ time) in ~15 min and writes `target/parity/summary.md`.
   `/usr/bin/sample` and prints self-time buckets + per-thread
   busy/idle. Use this *first* for "where does the time go" before
   adding instrumentation; it needs no rebuild and symbolizes through
-  dSYM. (`samply` exists but captured zero samples for our dylib.)
+  dSYM. If `sample` hangs (it can wedge system-wide), use
+  `samply record --save-only --unstable-presymbolicate -o p.json.gz --
+  rustc ...` and `harness/sprof.py p.json.gz [--under FN]`.
 - Known structure of the gap (details in PARITY.md): our glue (op
   construction, side-table hashing, lowering) and IR-opt dominate, not
   Cranelift; CGUs run their IR passes serially.

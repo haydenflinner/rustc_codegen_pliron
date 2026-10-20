@@ -357,18 +357,28 @@ impl DominatorTree {
     /// program point is no longer in the layout instead of panicking.
     /// A tombstoned inst/block cannot dominate anything; callers that
     /// hold possibly-stale captures should use this.
+    ///
+    /// Across blocks, both must be reachable in this tree: unreachable
+    /// (or newer-than-the-tree) blocks keep default preorder numbers, so
+    /// `block_dominates` said yes for any two of them — a dead loop's
+    /// latch value "dominated" its header and `remove_trivial_params`
+    /// aliased the header param to `iadd param, 16`, a def cycle that hung
+    /// alias-chasing peepholes.
     pub fn try_dominates<A, B>(&self, a: A, b: B, layout: &Layout) -> bool
     where
         A: Into<ProgramPoint>,
         B: Into<ProgramPoint>,
     {
-        let pp_in_layout = |pp: ProgramPoint| match pp {
-            ProgramPoint::Block(b) => layout.is_block_inserted(b),
-            ProgramPoint::Inst(i) => layout.inst_block(i).is_some(),
+        let pp_block = |pp: ProgramPoint| match pp {
+            ProgramPoint::Block(b) => layout.is_block_inserted(b).then_some(b),
+            ProgramPoint::Inst(i) => layout.inst_block(i),
         };
         let a = a.into();
         let b = b.into();
-        pp_in_layout(a) && pp_in_layout(b) && self.dominates(a, b, layout)
+        let (Some(ba), Some(bb)) = (pp_block(a), pp_block(b)) else {
+            return false;
+        };
+        (ba == bb || (self.is_reachable(ba) && self.is_reachable(bb))) && self.dominates(a, b, layout)
     }
 
     /// Returns `true` if `block_a` dominates `block_b`.

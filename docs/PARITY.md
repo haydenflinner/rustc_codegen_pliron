@@ -5,6 +5,10 @@ generated code (native, wasm) and compile time (native, wasm). This page
 is the current scoreboard and the ranked work list. Update it when a
 number moves (`harness/parity.py` regenerates the tables).
 
+**Compile-time rows last measured:** 2026-10-20 (branch `perf/ctime`, see
+§1 "Overnight 2026-10-20"), interleaved median of 5 against stock rustc on
+a shared box (load ~8). Runtime rows are older:
+
 **Last measured:** 2026-10-18, aarch64-apple-darwin (Apple Silicon),
 backend `40d729d` + parallel-CGU jobs (`src/cgupool.rs`), toolchain
 nightly-2026-10-06. `harness/parity.py`, nothing else running.
@@ -15,9 +19,11 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
 | wasm runtime (geomean, 16 kernels) | **0.977** | ahead; 8 kernels behind by >5% (all ≤+20%) |
 | wasm module size | 2.16 (210 KiB vs 97 KiB) | behind |
-| compile time: bench kernels, native | **0.87** (0.37 s vs 0.43 s) | ahead |
-| compile time: bench kernels, wasm | **1.74** (0.94 s vs 0.54 s) | behind |
-| compile time: regex-syntax (~40 kLOC) | **1.94** (2.93 s vs 1.51 s) | behind; was 6.57 before CGU jobs went parallel |
+| compile time: bench kernels, native | **0.56** (0.25 s vs 0.45 s) | ahead (2026-10-20) |
+| compile time: bench kernels, wasm | **0.79** (0.45 s vs 0.57 s) | ahead (2026-10-20; was 1.48) |
+| compile time: regex-syntax (~40 kLOC) | **0.94** (1.50 s vs 1.59 s) | parity on wall (2026-10-20; was 1.89); CPU 1.5x (6.9 vs 4.7 s) |
+| compile time: regex-syntax, wasm32 (one CGU) | **1.08** (3.04 s vs 2.81 s) | near parity (2026-10-20; was 7.3) |
+| compile time: syn 2 + `full` (~50 kLOC) | **1.14** (5.81 s vs 5.08 s, loaded box) | behind (2026-10-20; was 15-22); CPU 1.28x (24.8 vs 19.3 s) |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
@@ -49,7 +55,7 @@ policy; `chars_ascii` +8.5%, `chars_mixed` +8.2%, `fib` +7.7%,
 - Compile time: `harness/ctime.py [--only regex-syntax]` (release
   dylib). Inside one compile: `PLIRON_TRACE_FILE=t.txt` then sum column
   4 by column 3 (`*iropt*`, `*modgen*`, `*pipeline*`, per-step names);
-  `-Ztime-passes`; `samply`.
+  `-Ztime-passes`; `samply record --save-only --unstable-presymbolicate` + `harness/sprof.py`.
 - CLIF pipeline time without rustc: `clif-check bench target/corpus/std`,
   or the live dashboard's step-time panel (vs baseline, on every save).
 - Noise: ±3% is parity on a quiet box. Criterion compares against an
@@ -64,6 +70,115 @@ policy; `chars_ascii` +8.5%, `chars_mixed` +8.2%, `fib` +7.7%,
   layouts, 1 kernel).
 
 ## 1. Compile time (highest priority)
+
+### Overnight 2026-10-20: code size was the multiplier
+
+`syn` (now a `harness/ctime.py` input, with `regex-wasm`) was **15x** LLVM
+wall / 32x CPU — regex-syntax's 1.9x hid it. The cause was not per-op
+weight but how much code every pass ran over: pliron emitted **24.6 MB**
+of text for syn vs LLVM's 1.0 MB (regex-syntax 2.15 MB vs 0.22 MB);
+`drop_glue<Box<Expr>>` alone was 628 KB vs 684 B. Compare per-symbol sizes
+(`llvm-nm --no-llvm-bc -n` + `llvm-size -A` over rlib members) before
+tuning passes. What moved it (all gate-green; objects byte-identical where
+noted):
+
+- **Inline history** (`PLIRON_INLINE_HIST`, `State::inline_hist`): a
+  call cloned out of an inlined body may not inline a callee already on
+  its clone chain (LLVM's `InlineHistory`) — recursion through drop glue
+  and derived `eq` no longer unrolls lap after lap to the 20k-op cap.
+- **SCC rule** (`PLIRON_INLINE_SCC`): a site created by inlining may not
+  inline a callee in its caller's own nontrivial call-graph SCC (LLVM's
+  CGSCC rule). History alone still made one lap through every distinct
+  type of a wide recursive type graph.
+- **`CALL_OP_W` 3 → 20** (`PLIRON_INLINE_CALLW`): LLVM charges a call
+  several instructions' worth; at 3 a 40-call enum drop glue fit the base
+  limit. 10 then 20 each runtime-checked (kernels geomean 1.001 for
+  10 → 20, regex driver flat); 20 took syn CPU another −25%.
+- **Loop bonus only for leaf-ish callees** (`PLIRON_INLINE_LOOPCALLS`,
+  default 4 calls): parser `while` loops gave 25-call drop glues 3x the
+  threshold. syn CPU −65% on its own.
+- Together: syn text 24.6 → 2.9 MB, regex-syntax 2.15 → ~0.7 MB.
+  Runtime: kernels alternating A/B (pre-session inliner vs all four)
+  geomean 0.998, rechecked outliers within 0.5%; wasm kernels
+  byte-identical; a regex-syntax parse+translate driver flat.
+- **Hidden quadratics on CGU-wide ordinal columns**: `ColMap` (dense over
+  every op/value/block ordinal in the CGU) iterated or allocated per
+  function — lowering's `region_frozen_op` walk, callgvn's seven block
+  maps, the inliner's per-caller `done_blocks`. Fixed by probing the
+  function's own values / `helpers::SparseMap` for function-local
+  scratch. `ColMap` itself is now a sparse set (`u32` index + compact
+  entries) — inline `Option<(K, CallInfo)>` slots were ~150 B per op.
+  A hybrid hashed/dense `ColMap` index was tried and was *slower*
+  (+8% syn, +40% regex-wasm): hot CGU tables want the dense index.
+- **`PLIRON_DEFERDEAD`**: emit-only `xcgu` copies lower last and only if
+  some lowered body or data initializer references them (CLIF
+  `user_named_funcs`), else get a one-`trap` body — safe by construction
+  where IR-level stripping (`PLIRON_XCGUFN_KILL`) wasn't.
+- **wasm**: the CLIF pipeline runs on the phase-(B) job pool
+  (`run_jobs`, pipeline-only `JobShared::wasm`), and waffle's per-body
+  compile + `wpeep` per-body peepholes run via `wasm::par_map` — single-CGU
+  wasm builds were fully serial. Byte-identical.
+- Two latent miscompiles surfaced by the new code shapes, fixed with
+  regression tests: `clifpeep::selord_sel` minted an i8 zero for a wider
+  `select` condition; `armmerge` paired twin arms ignoring the
+  controlling type (`load.i8` vs `load.i16`).
+- Tier 1 at `-O` (UI corpus) then found two bugs already present at
+  `4f8018e`, both fixed with regression tests: `bool_mask` handed out a
+  `src` that didn't compute its mask (`x ^ 1`, `icmp cc z, K` peels), so
+  `selord_icmp` aliased `icmp eq 1, (c ^ 1)` to `c` (UI
+  `deriving-cmp-generic-struct-enum.rs` wrong result); and `lin_flat`
+  looped forever on an alias cycle in unreachable code (`v6 -> v15`,
+  `v15 = iadd v6, 16` — UI `test-case-on-use-item-129765.rs` hung), now
+  bounded by a visit budget. Root cause fixed too: `try_dominates`
+  answered yes between any two unreachable blocks (default preorder
+  numbers), so `remove_trivial_params` aliased a dead loop's header param
+  to its own latch `iadd` (cranelift PLIRON_PATCH #57). Tier 1 -O: 16,517 pass;
+  the only expectation miss is `hashmap-debug-format.rs`, skipped as
+  nondeterministic (randomized `HashMap` order).
+- rustlantis seeds 0-95 (`harness/run.py --suite fuzz`): 89 pass, 7 fail
+  — all identical at `4f8018e` (release dylib, harness flags), so
+  pre-existing despite docs' "0-512 pass": seed 1 -O run timeout, seed 24
+  -O0 wrong hash, seed 41 -O SIGSEGV, seeds 65 (-O0) / 88 / 89 ICE in
+  aarch64 emit/ISLE (debug dylib: seed 88 is a `tailmerge` verifier
+  error, f64 address into `load.i32`), seed 14 a debug-only overflow panic
+  in `proots.rs:1211` (release passes). Artifacts: `target/harness/fuzz/<seed>`.
+  Seed 24 (-O0, wrong hash) bisects (`harness/bisect.py`, flags
+  `-Zmir-opt-level=0 -Ccodegen-units=1`) to unit 8541 = `slotprom` on
+  `fn3`; the differential checker is inconclusive there (pointer args into
+  statics), so the next step is a manual CLIF diff of `fn3` at
+  `PLIRON_OPT_BISECT=8540` vs `8541` (`PLIRON_CLIF=..fn3 PLIRON_TRACE=pliron::dump=info`).
+  Gotcha: the bisect command must pass rustc's stderr through, or
+  `bisect.py` counts 0 units.
+- Tooling: `clif-check step` now replays reap-gated steps
+  (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
+  a `post_sweep` miscompile used to print "unchanged".
+
+Rejected / measured: `PLIRON_XCGU=0` (−35% CPU before the inliner
+changes, but kernels alternating A/B: tokenize +70%, sieve +9.5%,
+geomean +4% — copies are load-bearing; an earlier "30-180%" figure came
+from the broken A/B script and is void); an EH-cold callsite rule (callsites reachable
+only via landing pads; +27% syn CPU, because un-inlined cleanup callees
+keep `xcgu` copies alive and fully optimized); `PLIRON_INLINE_CALLER_MAX`
+8000/4000 (−5-9% CPU, runtime risk on giant hot fns).
+
+Correction: commit `bda3f63` says "bench kernels: binaries
+byte-identical" — that came from an A/B script whose `cargo clean -p
+pliron-bench` missed the bench profile, so both sides were the same
+binary. The object-level kernel diffs and the later alternating A/B
+(clean with `--profile bench`) are the real evidence.
+
+Where the rest is (samply on syn, `harness/sprof.py`): flat — IR-opt
+~27% of samples (inliner cloning ~5%, sroa ~3.5%, nocapture ~3.6%), the
+CLIF pipeline spread over ~90 steps, allocator/zone dispatch ~8%. Next:
+(1) ~17% of syn's pipeline time is functions fully optimized in more than
+one CGU, but live `xcgu` extras are only 4.5% of optimized ops — the rest
+is rustc's own per-CGU local copies (`#[inline]`, drop glue), which LLVM
+compiles per CGU too; redirecting live extras to their home symbol isn't
+worth the ABI risk (`sret2reg`). (2) `slp::xpack_block` rebuilds the
+whole-function use index after every applied pack (`Analysis::uses` keys
+on `num_insts`): 2.3% of syn's samples; an incremental append of the new
+insts' uses would remove it. (3) the regex-syntax native wall is gated by the biggest
+CGU's IR-opt before its fact publish (other CGUs' stage B parks on it).
 
 regex-syntax, one `rustc -O` (release dylib), 11.6 s wall:
 

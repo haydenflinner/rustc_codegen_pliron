@@ -391,6 +391,15 @@ pub struct State {
     /// code. Regions nest: a load tagged R may hoist anywhere in R, so a
     /// block whose own region is a descendant of R is in-region for it.
     pub region_parent: ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    /// Inline history (LLVM's `InlineHistory`): a call op cloned out of an
+    /// inlined body → its node in `inline_hist_nodes`, each node being
+    /// `(inlined callee FuncOp, parent node)` with `u32::MAX` the root. The
+    /// inliner refuses a callee already on a site's chain: inlining it
+    /// again only unrolls recursion (regex-syntax's `drop_glue<ClassSet>`
+    /// ↔ `drop_glue<ClassSetBinaryOp>` doubled each lap up to the
+    /// caller cap — 100+ KiB per drop glue LLVM emits in < 1 KiB).
+    pub inline_hist: ColMap<Ptr<Operation>, u32>,
+    pub inline_hist_nodes: Vec<(Ptr<Operation>, u32)>,
     /// Args inside inlined clones that bind any `noalias` callee param
     /// (`&mut [T]` included — `frozen` is the `readonly` subset): arg →
     /// leaf within the arg. Each becomes a DISTINCT memory root at

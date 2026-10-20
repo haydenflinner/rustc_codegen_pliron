@@ -10,7 +10,6 @@
 
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
-use pliron::cols::{ColMap, ColSet};
 use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::cloning::{IrMapping, clone_blocks_into};
@@ -57,8 +56,13 @@ pub const WASM_HOT: usize = 3;
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
 /// Each call inside the callee costs this much on top of its own op: inlining
-/// moves the call into the caller, it doesn't remove it.
-const CALL_OP_W: usize = 3;
+/// moves the call into the caller, it doesn't remove it. LLVM charges a call
+/// roughly 5-10 instructions' worth; at 3, dispatchers like a 40-variant
+/// enum's drop glue (126 ops, 40 calls) passed the base limit and every
+/// `Option<Box<Pat>>` overwrite in syn pulled the whole tree in. 20: bench
+/// kernels' alternating A/B geomean 1.001 vs 10, a regex-syntax
+/// parse+translate driver flat, syn CPU −25% on top of the loop-bonus cap.
+const CALL_OP_W: usize = 20;
 /// Bonus per use a constant actual can fold (a scalar arg feeding arithmetic,
 /// compares, selects, casts, ...).
 const FOLD_USE: usize = 25;
@@ -1029,6 +1033,30 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    // `PLIRON_INLINE_LOOPCALLS=<n>` (default 4): the in-loop bonus only
+    // for callees with at most `n` calls of their own — small mode's
+    // leaf-ish rule. A callee that carries many calls just moves them into
+    // the loop: parser loops (`while input.peek(..)`) took 25-call drop
+    // glues at 3x the base threshold. syn CPU -65%, kernels neutral.
+    let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
+    let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CALL_OP_W);
+    // `PLIRON_INLINE_HIST=0` lets a site cloned out of an inlined body
+    // inline a callee already on its clone chain (`State::inline_hist`).
+    let hist = crate::pass_enabled("PLIRON_INLINE_HIST");
+    // `PLIRON_INLINE_SCC` (`=0` disables): a site cloned out of an inlined body may not
+    // inline a callee in its caller's own (nontrivial) call-graph SCC —
+    // LLVM's CGSCC rule for edges inlining created inside an SCC. Original
+    // sites still inline one level; re-entering the recursion stops.
+    let scc: FxHashMap<String, u32> = if crate::pass_enabled("PLIRON_INLINE_SCC") {
+        scc_ids(ctx, st)
+    } else {
+        FxHashMap::default()
+    };
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
@@ -1096,14 +1124,15 @@ pub fn run(
         // the cloned callee body) — existing blocks never gain a new CallOp
         // (branches/erase don't produce one), so each block is scanned once
         // and later rounds walk only freshly spliced blocks.
-        let mut done_blocks: ColSet<Ptr<BasicBlock>> = ColSet::default();
+        let mut done_blocks: crate::helpers::SparseSet<Ptr<BasicBlock>> = Default::default();
         // Persistent mirror of the caller's block order: inlining splices
         // the split continuation right after the callsite block and appends
         // callee clones at the region end, so a rescan can't just extend —
         // `pending` holds continuations keyed by the block they follow and
         // the scan splices them in at the same point the real list would.
         let mut blklist = blocks(ctx, caller);
-        let mut pending: ColMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = ColMap::default();
+        let mut pending: crate::helpers::SparseMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
+            Default::default();
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
@@ -1214,7 +1243,7 @@ pub fn run(
                     }
                     let mut cost = ci.n;
                     if model {
-                        cost = ci.n.saturating_add(ci.ncalls.saturating_mul(CALL_OP_W));
+                        cost = ci.n.saturating_add(ci.ncalls.saturating_mul(call_w));
                         let mut save = 0usize;
                         for (i, a) in args.iter().enumerate() {
                             if const_arg(st, a) {
@@ -1232,9 +1261,10 @@ pub fn run(
                         if f.cold {
                             cost = cost.saturating_mul(COLD_W);
                         }
-                        if loops
-                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
-                            .contains(&b)
+                        if ci.ncalls <= loop_calls
+                            && loops
+                                .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                                .contains(&b)
                         {
                             // `PLIRON_INLINE_LOOP` = bonus in limit/4 units.
                             // A callsite in a loop pays the call+prologue cost
@@ -1282,6 +1312,13 @@ pub fn run(
                         "reject (eh)"
                     } else if ci.op == caller || st.calls[op].fn_ty != f.ty {
                         "reject (self/fnty)"
+                    } else if hist && on_chain(st, op, ci.op) {
+                        "reject (recursive)"
+                    } else if !scc.is_empty()
+                        && st.inline_hist.contains(op)
+                        && scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
+                    {
+                        "reject (scc)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
                     } else if model && !free && grown + ci.n > growth {
@@ -1350,6 +1387,95 @@ pub fn run(
     delta
 }
 
+/// Call-graph SCC id of every bodied function in a nontrivial SCC (two
+/// or more members; self-recursion is handled by `callee_info`).
+/// Iterative Tarjan over `callees`.
+fn scc_ids(ctx: &Context, st: &State) -> FxHashMap<String, u32> {
+    let names: Vec<&String> = st
+        .funcs
+        .iter()
+        .filter(|(n, f)| has_body(ctx, f.op) && !st.dead_unopt.contains(n.as_str()))
+        .map(|(n, _)| n)
+        .collect();
+    let ix: FxHashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let succ: Vec<Vec<usize>> = names
+        .iter()
+        .map(|n| {
+            callees(ctx, st, n)
+                .iter()
+                .filter_map(|c| ix.get(c.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    const UNSEEN: u32 = u32::MAX;
+    let n = names.len();
+    let (mut index, mut low) = (vec![UNSEEN; n], vec![0u32; n]);
+    let mut on = vec![false; n];
+    let (mut stack, mut next, mut out) = (Vec::new(), 0u32, FxHashMap::default());
+    let mut nscc = 0u32;
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut dfs = vec![(root, 0usize)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = dfs.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if index[w] == UNSEEN {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    dfs.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            dfs.pop();
+            if let Some(&(p, _)) = dfs.last() {
+                low[p] = low[p].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut members = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if members.len() > 1 {
+                    for w in members {
+                        out.insert(names[w].clone(), nscc);
+                    }
+                    nscc += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `callee` was already inlined somewhere on `site`'s clone chain.
+fn on_chain(st: &State, site: Ptr<Operation>, callee: Ptr<Operation>) -> bool {
+    let mut i = st.inline_hist.get(site).copied().unwrap_or(u32::MAX);
+    while let Some(&(f, p)) = st.inline_hist_nodes.get(i as usize) {
+        if f == callee {
+            return true;
+        }
+        i = p;
+    }
+    false
+}
+
 /// Indirect calls whose callee is a constant function address (a vtable slot
 /// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
 /// become direct calls. Returns the rewritten calls plus the callers owning
@@ -1399,6 +1525,9 @@ pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, 
                 }
                 let info = st.calls.remove(c).unwrap();
                 st.calls.insert(nc, info);
+                if let Some(h) = st.inline_hist.remove(c) {
+                    st.inline_hist.insert(nc, h);
+                }
                 if let Some(u) = st.invokes.remove(c) {
                     st.invokes.insert(nc, u);
                 }
@@ -2456,11 +2585,19 @@ fn inline_call(
             st.region_frozen_op.insert(nv, f);
         }
     }
+    // History node for calls cloned out of this body, pushed on first use.
+    let parent = st.inline_hist.get(call).copied().unwrap_or(u32::MAX);
+    let mut hist_node = None;
     for &(op, m) in &tags.ops {
         let Some(new) = map.lookup_op(op) else {
             continue;
         };
         if m & OP_CALLS != 0 {
+            let node = *hist_node.get_or_insert_with(|| {
+                st.inline_hist_nodes.push((callee, parent));
+                st.inline_hist_nodes.len() as u32 - 1
+            });
+            st.inline_hist.insert(new, node);
             st.calls.insert(new, st.calls[op].clone());
             if let Some(&(lp, catch)) = st.invokes.get(op) {
                 st.invokes

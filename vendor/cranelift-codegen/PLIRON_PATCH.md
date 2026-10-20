@@ -690,3 +690,11 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     low-pressure ones. Default on (PRESS=5): paired medians give
     sieve −5.5% / parse_only −3% wins with sortw/hashmap hot fns
     byte-identical to OFF; `PLIRON_AMODESHARE=0` disables.
+57. `DominatorTree::try_dominates` is false across blocks unless both
+    are reachable in the tree (`src/dominator_tree.rs`). Unreachable
+    and newer-than-the-tree blocks keep default preorder numbers, and
+    `block_dominates` answered yes for any two of them: a dead loop's
+    latch def "dominated" its header, `remove_trivial_params` aliased
+    the header param to `iadd param, 16`, and the def cycle hung
+    `clifpeep::lin_flat` (rustc UI `test-case-on-use-item-129765.rs`
+    with `--test`). Callers only lose transforms on dead code.

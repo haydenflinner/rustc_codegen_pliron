@@ -12,7 +12,6 @@ use crate::context::Ptr;
 use crate::operation::Operation;
 use crate::value::Value;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 
 /// Key into a [ColMap]/[ColSet] — a dense per-[Context](crate::context::Context)
 /// ordinal. `Ptr` uses its arena slot index (version excluded — stored
@@ -42,66 +41,78 @@ impl ColKey for Ptr<BasicBlock> {
 }
 
 /// Dense column replacing `FxHashMap<K, V>` where probes dominate:
-/// lookup is a bounds check + key compare, no hashing.
+/// lookup is a bounds check + an index load + key compare, no hashing.
+///
+/// Sparse-set layout: `idx` spans the whole ordinal space at 4 bytes per
+/// entity, `ents` holds only the live entries. Inline `Option<(K, V)>`
+/// slots cost `size_of::<(K, V)>()` per *entity in the Context* — a
+/// `CallInfo` column reserved ~150 B for every op although few are calls,
+/// and every growth step memmoved the lot (inlining mints fresh ordinals
+/// constantly).
 #[derive(Clone, Debug)]
 pub struct ColMap<K: ColKey, V> {
-    slots: Vec<Option<(K, V)>>,
-    live: usize,
-    _k: PhantomData<K>,
+    /// Ordinal → 1 + position in `ents`; 0 = empty. Every entry `e` is
+    /// referenced from exactly `idx[e.0.ord()]`.
+    idx: Vec<u32>,
+    ents: Vec<(K, V)>,
 }
 
 impl<K: ColKey, V> Default for ColMap<K, V> {
     fn default() -> Self {
         Self {
-            slots: Vec::new(),
-            live: 0,
-            _k: PhantomData,
+            idx: Vec::new(),
+            ents: Vec::new(),
         }
     }
 }
 
 impl<K: ColKey, V> ColMap<K, V> {
+    /// The `ents` position for ordinal `o`, if occupied (by any key).
+    #[inline]
+    fn slot(&self, o: usize) -> Option<usize> {
+        match self.idx.get(o) {
+            Some(&i) if i != 0 => Some(i as usize - 1),
+            _ => None,
+        }
+    }
     #[inline]
     pub fn get(&self, k: K) -> Option<&V> {
-        self.slots
-            .get(k.ord())
-            .and_then(Option::as_ref)
-            .filter(|(ek, _)| *ek == k)
-            .map(|(_, v)| v)
+        let e = &self.ents[self.slot(k.ord())?];
+        (e.0 == k).then_some(&e.1)
     }
     #[inline]
     pub fn get_mut(&mut self, k: K) -> Option<&mut V> {
-        self.slots
-            .get_mut(k.ord())
-            .and_then(Option::as_mut)
-            .filter(|(ek, _)| *ek == k)
-            .map(|(_, v)| v)
+        let i = self.slot(k.ord())?;
+        let e = &mut self.ents[i];
+        (e.0 == k).then_some(&mut e.1)
     }
     /// `HashMap::insert` shape: returns the previous value for the same
     /// key; a stale-keyed slot is overwritten without one.
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
         let o = k.ord();
-        if o >= self.slots.len() {
-            self.slots.resize_with(o + 1, || None);
+        if let Some(i) = self.slot(o) {
+            let (ek, ev) = core::mem::replace(&mut self.ents[i], (k, v));
+            return (ek == k).then_some(ev);
         }
-        match self.slots[o].replace((k, v)) {
-            None => {
-                self.live += 1;
-                None
-            }
-            Some((ek, ev)) if ek == k => Some(ev),
-            Some(_) => None,
+        if o >= self.idx.len() {
+            self.idx.resize(o + 1, 0);
         }
+        self.ents.push((k, v));
+        self.idx[o] = u32::try_from(self.ents.len()).expect("ColMap: > u32::MAX entries");
+        None
     }
     pub fn remove(&mut self, k: K) -> Option<V> {
         let o = k.ord();
-        let slot = self.slots.get_mut(o)?;
-        if matches!(slot, Some((ek, _)) if *ek == k) {
-            self.live -= 1;
-            slot.take().map(|(_, v)| v)
-        } else {
-            None
+        let i = self.slot(o)?;
+        if self.ents[i].0 != k {
+            return None;
         }
+        self.idx[o] = 0;
+        let (_, v) = self.ents.swap_remove(i);
+        if let Some(moved) = self.ents.get(i) {
+            self.idx[moved.0.ord()] = i as u32 + 1;
+        }
+        Some(v)
     }
     #[inline]
     pub fn contains(&self, k: K) -> bool {
@@ -109,20 +120,28 @@ impl<K: ColKey, V> ColMap<K, V> {
     }
     #[inline]
     pub fn len(&self) -> usize {
-        self.live
+        self.ents.len()
     }
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.live == 0
+        self.ents.is_empty()
+    }
+    /// Entries in ordinal order (walks the index, as the inline-slot
+    /// layout did — callers' output order depends on it).
+    fn ordered(&self) -> impl Iterator<Item = &(K, V)> {
+        self.idx
+            .iter()
+            .filter(|&&i| i != 0)
+            .map(|&i| &self.ents[i as usize - 1])
     }
     pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
-        self.slots.iter().flatten().map(|(k, v)| (*k, v))
+        self.ordered().map(|(k, v)| (*k, v))
     }
     pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
-        self.slots.iter().flatten().map(|(k, _)| *k)
+        self.ordered().map(|(k, _)| *k)
     }
     pub fn values(&self) -> impl Iterator<Item = &V> {
-        self.slots.iter().flatten().map(|(_, v)| v)
+        self.ordered().map(|(_, v)| v)
     }
     /// `entry(k).or_insert_with(f)` shape — returns the existing or
     /// freshly inserted slot's value.
@@ -203,3 +222,4 @@ impl<K: ColKey> ColSet<K> {
         self.0.keys()
     }
 }
+

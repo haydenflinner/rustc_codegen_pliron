@@ -206,3 +206,91 @@ pub fn dump_fact(analysis: &str, sym: &str, fact: &dyn std::fmt::Debug) {
         };
     }
 }
+
+/// Hash-backed stand-in for [`ColMap`](crate::state::ColMap) for
+/// function-local scratch: a `ColMap`'s index spans every ordinal in the
+/// CGU, so a per-function (or per-query) map paid an allocation, zero
+/// fill and walk proportional to the whole CGU. Same verbs; iteration is in
+/// ordinal order, as `ColMap`'s is.
+#[derive(Clone, Debug)]
+pub struct SparseMap<K: pliron::cols::ColKey + std::hash::Hash, V>(rustc_hash::FxHashMap<K, V>);
+
+impl<K: pliron::cols::ColKey + std::hash::Hash, V> Default for SparseMap<K, V> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<K: pliron::cols::ColKey + std::hash::Hash, V> SparseMap<K, V> {
+    #[inline]
+    pub fn get(&self, k: K) -> Option<&V> {
+        self.0.get(&k)
+    }
+    #[inline]
+    pub fn contains(&self, k: K) -> bool {
+        self.0.contains_key(&k)
+    }
+    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+        self.0.insert(k, v)
+    }
+    pub fn remove(&mut self, k: K) -> Option<V> {
+        self.0.remove(&k)
+    }
+    pub fn or_default(&mut self, k: K) -> &mut V
+    where
+        V: Default,
+    {
+        self.0.entry(k).or_default()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    /// Entries in ordinal order.
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
+        let mut v: Vec<(K, &V)> = self.0.iter().map(|(k, v)| (*k, v)).collect();
+        v.sort_unstable_by_key(|(k, _)| k.ord());
+        v.into_iter()
+    }
+}
+
+impl<K: pliron::cols::ColKey + std::hash::Hash, V> std::ops::Index<K> for SparseMap<K, V> {
+    type Output = V;
+    #[inline]
+    fn index(&self, k: K) -> &V {
+        &self.0[&k]
+    }
+}
+
+impl<K: pliron::cols::ColKey + std::hash::Hash, V> FromIterator<(K, V)> for SparseMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(it: I) -> Self {
+        Self(it.into_iter().collect())
+    }
+}
+
+/// Set form of [`SparseMap`].
+#[derive(Clone, Debug)]
+pub struct SparseSet<K: pliron::cols::ColKey + std::hash::Hash>(SparseMap<K, ()>);
+
+impl<K: pliron::cols::ColKey + std::hash::Hash> Default for SparseSet<K> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<K: pliron::cols::ColKey + std::hash::Hash> SparseSet<K> {
+    #[inline]
+    pub fn contains(&self, k: K) -> bool {
+        self.0.contains(k)
+    }
+    /// True if newly inserted.
+    pub fn insert(&mut self, k: K) -> bool {
+        self.0.insert(k, ()).is_none()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    /// Members in ordinal order.
+    pub fn iter(&self) -> impl Iterator<Item = K> + '_ {
+        self.0.iter().map(|(k, _)| k)
+    }
+}
