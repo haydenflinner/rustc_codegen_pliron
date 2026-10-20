@@ -436,6 +436,56 @@ struct FnJob {
     unopt: bool,
 }
 
+impl FnJob {
+    /// A job carrying a prebuilt body and no lowering facts.
+    fn stub(name: String, id: FuncId, func: ir::Function, sh: Arc<JobShared>) -> Self {
+        FnJob {
+            name,
+            id,
+            func,
+            nonnull: FxHashSet::default(),
+            derived: pliron_clif_opt::vmap::VMap::default(),
+            frozen: FxHashMap::default(),
+            noalias: FxHashSet::default(),
+            deref: FxHashMap::default(),
+            nowrite: FxHashMap::default(),
+            call_frozen: FxHashMap::default(),
+            scoped: FxHashMap::default(),
+            invariant: FxHashSet::default(),
+            operand_frozen: FxHashMap::default(),
+            fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
+            block_region: FxHashMap::default(),
+            prof: FxHashMap::default(),
+            lifetimes: Vec::new(),
+            nocap: FxHashSet::default(),
+            stubs: rustc_hash::FxHashSet::default(),
+            uen_syms: FxHashMap::default(),
+            sh,
+            stats: crate::pipeline::Stats::default(),
+            err: None,
+            code: None,
+            dump: false,
+            unopt: true,
+        }
+    }
+}
+
+/// Symbols a constant's bytes relocate against (what `write_const`
+/// records as relocs), without materializing the bytes.
+fn const_syms<'a>(st: &'a State, v: Value, out: &mut FxHashSet<&'a str>) {
+    match st.consts.get(v) {
+        Some(ConstVal::Sym { sym, .. }) => {
+            out.insert(sym.as_str());
+        }
+        Some(ConstVal::Agg(elems)) => {
+            for &e in elems {
+                const_syms(st, e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Read-only inputs shared by every job in phase (B). Fully owned
 /// (`'static`): the global fn pool drains jobs from all live CGUs, so
 /// nothing may borrow the producing CGU's stack.
@@ -453,6 +503,9 @@ struct JobShared {
     prof: Arc<dyn Prof>,
     /// FuncId-indexed symbol table for `PLIRON_CORPUS` name maps.
     fn_names: Vec<String>,
+    /// wasm (`lower_clif_wasm`): pipeline only — the optimized CLIF goes
+    /// back in `FnJob::func` for the waffle emitter, no Cranelift compile.
+    wasm: bool,
 }
 
 /// One queued function job: the declaration index (phase (C) re-orders
@@ -644,7 +697,9 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 simd: sh.simd,
                 x64: sh.x64,
                 cmp64: sh.cmp64,
-                amode_scale: crate::pipeline::amode_scale(&*sh.isa),
+                // wasm: the waffle emitter computes `base + iv*s` addresses
+                // explicitly, so indvars should produce stepped pointer IVs.
+                amode_scale: !sh.wasm && crate::pipeline::amode_scale(&*sh.isa),
                 has_eh: sh.has_eh,
                 flags: &sh.fn_flags,
                 dump: j.dump,
@@ -692,6 +747,11 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display())
         };
+    }
+    if sh.wasm {
+        j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
+        clctx.clear();
+        return;
     }
     // Panics inside Cranelift (verifier, egraph, regalloc asserts)
     // bypass the Err path below — catch and rethrow so the message
@@ -782,6 +842,107 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     // func — drop them like `clear_context` did so the next job's
     // compile doesn't verify against a stale cfg.
     clctx.clear();
+}
+
+/// Phase (B) over the jobs `produce` lowers (each emitted with its
+/// declaration index): serial when `nthreads <= 1`, else streamed into the
+/// process-wide pool with work-while-you-wait. `produced` runs once
+/// production ends. Returns the finished jobs in declaration order.
+fn run_jobs(
+    nthreads: usize,
+    name: &str,
+    produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJob)),
+    produced: &mut dyn FnMut(),
+) -> Vec<FnJob> {
+    let mut jobs: Vec<FnJob> = Vec::new();
+    if nthreads <= 1 {
+        let mut ij: Vec<(usize, FnJob)> = Vec::new();
+        produce(&mut |i, j| ij.push((i, j)));
+        // Deferred copies produce after the rest: restore declaration order.
+        ij.sort_by_key(|&(i, _)| i);
+        jobs.extend(ij.into_iter().map(|(_, j)| j));
+        produced();
+        let tpb = std::time::Instant::now();
+        let mut wcl = cranelift_codegen::Context::new();
+        for j in &mut jobs {
+            let sh = j.sh.clone();
+            run_job(j, &mut wcl, &sh);
+        }
+        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+    } else {
+        // Jobs stream into the process-wide pool as `produce` lowers —
+        // phase (B) work from *all* live CGUs shares one worker set, so
+        // this CGU's drain tail overlaps the next CGU's serial produce
+        // (and vice versa). Results come back indexed so phase (C) sees
+        // declaration order; a worker panic travels back as `Err` and is
+        // resumed here.
+        let (dtx, drx) =
+            std::sync::mpsc::channel::<(usize, std::thread::Result<FnJob>)>();
+        let pool = fn_pool();
+        let mut sent = 0usize;
+        produce(&mut |i, j| {
+            sent += 1;
+            fn_pool_push(
+                pool,
+                GMsg {
+                    i,
+                    j,
+                    done: dtx.clone(),
+                },
+            );
+        });
+        drop(dtx);
+        produced();
+        let tpb = std::time::Instant::now();
+        let mut done = std::collections::BTreeMap::new();
+        let mut wcl = cranelift_codegen::Context::new();
+        let mut got = 0usize;
+        while got < sent {
+            // Take a finished result if one's waiting…
+            match drx.try_recv() {
+                Ok((i, Ok(j))) => {
+                    done.insert(i, j);
+                    got += 1;
+                    continue;
+                }
+                Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                Err(_) => {}
+            }
+            // …otherwise run a queued job — any CGU's — rather than
+            // parking this core while the pool drains (the same
+            // work-while-you-wait as cgupool's `run_until`).
+            match fn_pool_pop(pool) {
+                Some(GMsg { i, mut j, done: d }) => {
+                    let sh = j.sh.clone();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job(&mut j, &mut wcl, &sh);
+                        j
+                    }));
+                    let _ = d.send((i, r));
+                }
+                None => {
+                    // Queue and channel both empty — a queued job can
+                    // still land (producers stream), and another CGU's
+                    // cgupool work may be runnable. Steal one before
+                    // parking on our own results.
+                    if cgu_steal() {
+                        continue;
+                    }
+                    match drx.recv() {
+                        Ok((i, Ok(j))) => {
+                            done.insert(i, j);
+                            got += 1;
+                        }
+                        Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                        Err(e) => panic!("fn pool disconnected: {e}"),
+                    }
+                }
+            }
+        }
+        jobs = done.into_values().collect();
+        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+    }
+    jobs
 }
 
 /// Declare and define every function and global of `ctx`'s module in `m`
@@ -1016,9 +1177,42 @@ pub fn lower_module<'a>(
         region_parent: st.region_parent.clone(),
         prof: hprof.clone(),
         fn_names,
+        wasm: false,
     });
+    // `PLIRON_DEFERDEAD` (`=0` disables): emit-only `xcgu` copies (`dead_unopt`: no
+    // caller `direct_callee` or `address_taken` can see) lower last, and
+    // only if a function lowered before them — or a data initializer —
+    // actually references them; the rest get a one-`trap` body (finish
+    // demands a definition for every declared local, and nothing in or
+    // out of this object can call it). Safe by construction: a reference
+    // the IR-level scans miss still shows up in the CLIF.
+    let mut deferred: Vec<(usize, (&String, &crate::iropt::state::FuncInfo))> = Vec::new();
+    if !hot && crate::pass_enabled("PLIRON_DEFERDEAD") && !st.dead_unopt.is_empty() {
+        let mut data_refs: FxHashSet<&str> = FxHashSet::default();
+        for g in st.globals.values() {
+            if let Some(init) = g.init {
+                const_syms(st, init, &mut data_refs);
+            }
+        }
+        order.retain(|e| {
+            let (n, _) = e.1;
+            let d = st.dead_unopt.contains(n.as_str())
+                && st.xcgu_copies.contains(n.as_str())
+                && !data_refs.contains(n.as_str());
+            if d {
+                deferred.push(*e);
+            }
+            !d
+        });
+    }
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
-        for &(idx, (n, f)) in &order {
+        let mut queue = std::mem::take(&mut order);
+        let live_n = queue.len();
+        let mut referenced: FxHashSet<u32> = FxHashSet::default();
+        let mut qi = 0;
+        loop {
+        while let Some(&(idx, (n, f))) = queue.get(qi) {
+            qi += 1;
             CUR_FN.with(|c| c.borrow_mut().clone_from(n));
             let Sym::F(id, _) = ids[n] else {
                 unreachable!()
@@ -1176,6 +1370,17 @@ pub fn lower_module<'a>(
                     opnds, succs
                 );
             }
+            if !deferred.is_empty() {
+                referenced.extend(
+                    clctx
+                        .func
+                        .params
+                        .user_named_funcs()
+                        .values()
+                        .filter(|u| u.namespace == 0)
+                        .map(|u| u.index),
+                );
+            }
             let uen_syms = uen_syms_of(m, &clctx.func);
             emit(
                 idx,
@@ -1210,6 +1415,48 @@ pub fn lower_module<'a>(
             );
             m.clear_context(&mut clctx);
         }
+        // Pull in the deferred copies the lowered code references; their
+        // own bodies can reference more, hence the fixpoint.
+        let before = queue.len();
+        deferred.retain(|e| {
+            let Sym::F(id, _) = ids[e.1.0] else {
+                unreachable!()
+            };
+            let hit = referenced.contains(&id.as_u32());
+            if hit {
+                queue.push(*e);
+            }
+            !hit
+        });
+        if queue.len() == before {
+            break;
+        }
+        }
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats",
+                "deferdead {name}: {} emit-only copies stubbed, {} referenced and lowered",
+                deferred.len(),
+                queue.len() - live_n
+            );
+        }
+        for &(idx, (n, f)) in &deferred {
+            let Sym::F(id, _) = ids[n] else {
+                unreachable!()
+            };
+            let mut func = ir::Function::with_name_signature(
+                ir::UserFuncName::default(),
+                make_sig(ctx, f.ty, &f.exts, cc_of(n)),
+            );
+            let b = func.dfg.make_block();
+            func.layout.append_block(b);
+            for t in func.signature.params.iter().map(|p| p.value_type).collect::<Vec<_>>() {
+                func.dfg.append_block_param(b, t);
+            }
+            use cranelift_codegen::cursor::Cursor as _;
+            let mut pos = cranelift_codegen::cursor::FuncCursor::new(&mut func).at_bottom(b);
+            pos.ins().trap(TrapCode::unwrap_user(1));
+            emit(idx, FnJob::stub(n.clone(), id, func, shared.clone()));
+        }
         pliron_cfg::trace("*pA-lower*", t_lower.as_secs_f64() * 1e3, name);
         pliron_cfg::trace("*pA-fin*", t_fin.as_secs_f64() * 1e3, name);
     };
@@ -1220,93 +1467,11 @@ pub fn lower_module<'a>(
     // bisect counter must number pass applications deterministically) or
     // `PLIRON_PAR=0` overrides. `PLIRON_PAR=N` sizes the shared pool.
 
-    let mut jobs: Vec<FnJob> = Vec::new();
-    if nthreads <= 1 {
-        produce(&mut |_, j| jobs.push(j));
-        drop(_sfl);
-        drop(_pgfl);
+    let mut spans = Some((_sfl, _pgfl));
+    let jobs = run_jobs(nthreads, name, &mut produce, &mut || {
+        spans.take();
         pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
-        let tpb = std::time::Instant::now();
-        let mut wcl = cranelift_codegen::Context::new();
-        for j in &mut jobs {
-            run_job(j, &mut wcl, &shared);
-        }
-        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
-    } else {
-        // Jobs stream into the process-wide pool as `produce` lowers —
-        // phase (B) work from *all* live CGUs shares one worker set, so
-        // this CGU's drain tail overlaps the next CGU's serial produce
-        // (and vice versa). Results come back indexed so phase (C) sees
-        // declaration order; a worker panic travels back as `Err` and is
-        // resumed here.
-        let (dtx, drx) =
-            std::sync::mpsc::channel::<(usize, std::thread::Result<FnJob>)>();
-        let pool = fn_pool();
-        let mut sent = 0usize;
-        produce(&mut |i, j| {
-            sent += 1;
-            fn_pool_push(
-                pool,
-                GMsg {
-                    i,
-                    j,
-                    done: dtx.clone(),
-                },
-            );
-        });
-        drop(dtx);
-        drop(_sfl);
-        drop(_pgfl);
-        pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
-        let tpb = std::time::Instant::now();
-        let mut done = std::collections::BTreeMap::new();
-        let mut wcl = cranelift_codegen::Context::new();
-        let mut got = 0usize;
-        while got < sent {
-            // Take a finished result if one's waiting…
-            match drx.try_recv() {
-                Ok((i, Ok(j))) => {
-                    done.insert(i, j);
-                    got += 1;
-                    continue;
-                }
-                Ok((_, Err(p))) => std::panic::resume_unwind(p),
-                Err(_) => {}
-            }
-            // …otherwise run a queued job — any CGU's — rather than
-            // parking this core while the pool drains (the same
-            // work-while-you-wait as cgupool's `run_until`).
-            match fn_pool_pop(pool) {
-                Some(GMsg { i, mut j, done: d }) => {
-                    let sh = j.sh.clone();
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_job(&mut j, &mut wcl, &sh);
-                        j
-                    }));
-                    let _ = d.send((i, r));
-                }
-                None => {
-                    // Queue and channel both empty — a queued job can
-                    // still land (producers stream), and another CGU's
-                    // cgupool work may be runnable. Steal one before
-                    // parking on our own results.
-                    if cgu_steal() {
-                        continue;
-                    }
-                    match drx.recv() {
-                        Ok((i, Ok(j))) => {
-                            done.insert(i, j);
-                            got += 1;
-                        }
-                        Ok((_, Err(p))) => std::panic::resume_unwind(p),
-                        Err(e) => panic!("fn pool disconnected: {e}"),
-                    }
-                }
-            }
-        }
-        jobs = done.into_values().collect();
-        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
-    }
+    });
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
@@ -1793,9 +1958,35 @@ pub fn lower_clif_wasm(
         }
         decl_names[id.index()] = d.name.clone().unwrap_or_default();
     }
-    let mut out = Vec::new();
+    // The per-function CLIF pipeline rides the same phase-(B) pool as
+    // native objects (pipeline only: `JobShared::wasm`); lowering and the
+    // waffle emitter stay serial. `x64`/`cmp64`/`has_eh` off as before.
+    let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
+    let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
+        1
+    } else {
+        par.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .min(st.funcs.len().max(1))
+            .max(1)
+    };
+    let shared = Arc::new(JobShared {
+        isa: isa.clone(),
+        tcfg: cfg,
+        simd,
+        x64: false,
+        cmp64: false,
+        has_eh: false,
+        verify_env: crate::env_set("PLIRON_VERIFY"),
+        verify_full_env: crate::env_is("PLIRON_VERIFY", "full"),
+        fn_flags,
+        region_parent: st.region_parent.clone(),
+        prof: host.prof().clone(),
+        fn_names: decl_names,
+        wasm: true,
+    });
     let mut scratch = FlScratch::default();
-    for (n, f) in &st.funcs {
+    let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
+    for (idx, (n, f)) in st.funcs.iter().enumerate() {
         if !has_body(ctx, f.op) || st.dead_fns.contains(n) {
             continue;
         }
@@ -1911,96 +2102,45 @@ pub fn lower_clif_wasm(
                 fl.nocap,
             )
         };
-        let dump = crate::env_get("PLIRON_CLIF").is_some_and(|s| n.contains(&s));
-        if dump {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display())
-            };
-        }
-        // Flags-only verify: the ISA-aware checks (pointer width, global
-        // value types) consult `isa.pointer_type()` — i64 on the host —
-        // while this CLIF deliberately uses i32 pointers (see `tcfg`).
-        if crate::env_set("PLIRON_VERIFY")
-            && let Err(e) = cranelift_codegen::verifier::verify_function(&clctx.func, isa.flags())
-        {
-            panic!("bad clif {n}: {e}");
-        }
-        let hprof = host.prof();
-        let prof_hook =
-            |nm: &'static str| -> Box<dyn Send + '_> { hprof.activity(nm, None) };
-        let mut stats = crate::pipeline::Stats::default();
-        let mut nonnull = nonnull;
-        let mut derived = derived;
-        let mut frozen = frozen;
-        let mut noalias = noalias;
-        let mut deref = deref;
-        let mut operand_frozen = operand_frozen;
-        let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
-        let mut lifetimes = lifetimes;
         let uen_syms = uen_syms_of(&m, &clctx.func);
-        let mut pipe = crate::pipeline::Pipe {
-            cur_step: "",
-            fact_bits: &mut fact_bits,
-            clctx: &mut clctx,
-            isa: &*isa,
-            fname: n,
-            func_id: id,
-            uen_syms: &uen_syms,
-            nonnull: &mut nonnull,
-            derived: &mut derived,
-            frozen: &mut frozen,
-            noalias: &mut noalias,
-            deref: &mut deref,
-            nowrite: &nowrite,
-            call_frozen: &call_frozen,
-            scoped: &scoped,
-            invariant: &invariant,
-            operand_frozen: &mut operand_frozen,
-            block_region: &block_region,
-            prof: &prof,
-            region_parent: &st.region_parent,
-            lifetimes: &mut lifetimes,
-            nocap: &nocap,
-            tcfg: cfg,
-            simd,
-            x64: false,
-            cmp64: false,
-            // `isa` is the host's purely for bookkeeping; the waffle
-            // emitter computes `base + iv*s` addresses explicitly, so
-            // indvars should produce stepped pointer IVs.
-            amode_scale: false,
-            has_eh: false,
-            flags: &fn_flags,
-            dump,
-            verify_full: crate::env_is("PLIRON_VERIFY", "full"),
-            since_reap: false,
-            unopt: st.dead_unopt.contains(n),
-            stats: &mut stats,
-            carry_log: Vec::new(),
-            prof_hook: Some(&prof_hook),
-            fn_names: &decl_names,
-        };
-        // Debug bisection: PLIRON_PIPEFN=<substr> runs the pipeline only on
-        // matching functions; PLIRON_PIPEFNX=<substr> skips matches.
-        let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
-            && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
-            && pliron_cfg::fn_opt_selected(n);
-        if run_pipe {
-            pipe.seed_fact_bits();
-            crate::pipeline::run_pipeline(&mut pipe);
-        }
-        drop(pipe);
-        if dump {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display())
-            };
-        }
-        out.push((
-            n.clone(),
-            std::mem::replace(&mut clctx.func, ir::Function::new()),
-        ));
+        emit(
+            idx,
+            FnJob {
+                name: n.clone(),
+                id,
+                func: std::mem::replace(&mut clctx.func, ir::Function::new()),
+                nonnull,
+                derived,
+                frozen,
+                noalias,
+                deref,
+                nowrite,
+                call_frozen,
+                scoped,
+                invariant,
+                operand_frozen,
+                fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
+                block_region,
+                prof,
+                lifetimes,
+                nocap,
+                stubs: rustc_hash::FxHashSet::default(),
+                uen_syms,
+                sh: shared.clone(),
+                stats: crate::pipeline::Stats::default(),
+                err: None,
+                code: None,
+                dump: crate::env_get("PLIRON_CLIF").is_some_and(|s| n.contains(&s)),
+                unopt: st.dead_unopt.contains(n),
+            },
+        );
         m.clear_context(&mut clctx);
     }
+    };
+    let out: Vec<(String, ir::Function)> = run_jobs(nthreads, cgu, &mut produce, &mut || {})
+        .into_iter()
+        .map(|j| (j.name, j.func))
+        .collect();
     CUR_FN.with(|c| c.borrow_mut().clear());
     // FnLower can declare more symbols mid-lower (libcalls, va_fids, lazy
     // data refs) — build the id->name tables last.

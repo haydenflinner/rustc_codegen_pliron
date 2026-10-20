@@ -12,7 +12,6 @@ use crate::context::Ptr;
 use crate::operation::Operation;
 use crate::value::Value;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 
 /// Key into a [ColMap]/[ColSet] — a dense per-[Context](crate::context::Context)
 /// ordinal. `Ptr` uses its arena slot index (version excluded — stored
