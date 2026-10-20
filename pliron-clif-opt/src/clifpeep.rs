@@ -5825,6 +5825,8 @@ pub fn loadsel(func: &mut Function) -> usize {
 fn bandk(func: &mut Function) -> usize {
     let mut hits: Vec<(Inst, Value, u128, Opcode, Type, u32)> = Vec::new();
     let mut zeros: Vec<Inst> = Vec::new();
+    // `band (bxor x,K), m` → `bxor (band x,m), K&m` entries.
+    let mut bxors: Vec<(Inst, Value, u128, u128, Type, u32)> = Vec::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
@@ -5914,6 +5916,29 @@ fn bandk(func: &mut Function) -> usize {
             else {
                 continue;
             };
+            // `band (bxor x,K), m` → `bxor (band x,m), K&m` — `band`
+            // distributes over `xor` on the masked bits. The resulting
+            // `bxor` then rides `icmp_eqfold`'s `x^K==C → x==C^K` fold
+            // (UTF8-boundary `b&0xC0==0x80` shapes), so the `bxor` lands
+            // for free inside an `icmp` rather than standing alone.
+            if opcode == Opcode::Band && o2 == Opcode::Bxor {
+                let (x, kk) = if let Some(k) = kval(func, a2[1]) {
+                    (a2[0], k)
+                } else if let Some(k) = kval(func, a2[0]) {
+                    (a2[1], k)
+                } else {
+                    continue;
+                };
+                bxors.push((
+                    i,
+                    func.dfg.resolve_aliases(x),
+                    k2,
+                    (kk & k2) & wm,
+                    ty,
+                    w,
+                ));
+                continue;
+            }
             if o2 != opcode {
                 continue;
             }
@@ -5932,7 +5957,7 @@ fn bandk(func: &mut Function) -> usize {
             }
         }
     }
-    let n = hits.len() + zeros.len();
+    let n = hits.len() + zeros.len() + bxors.len();
     for i in zeros {
         let ty = func.dfg.value_type(func.dfg.first_result(i));
         let pos = FuncCursor::new(func).at_inst(i);
@@ -5949,6 +5974,16 @@ fn bandk(func: &mut Function) -> usize {
             Opcode::Bor => pos.func.replace(i).bor(base, kv),
             _ => pos.func.replace(i).bxor(base, kv),
         };
+    }
+    for (i, x, m, km, ty, w) in bxors {
+        if func.layout.inst_block(i).is_none() {
+            continue;
+        }
+        let mut pos = FuncCursor::new(func).at_inst(i);
+        let mv = kcon(&mut pos, ty, w, m);
+        let nb = pos.ins().band(x, mv);
+        let kv = kcon(&mut pos, ty, w, km);
+        pos.func.replace(i).bxor(nb, kv);
     }
     n
 }
@@ -7918,7 +7953,12 @@ fn icmp_eqfold(
     };
     let adj = bin_k(pos.func, x0, Opcode::Iadd)
         .map(|(v, c1)| (v, k0.wrapping_sub(c1)))
-        .or_else(|| issub(x0).map(|(v, c1)| (v, k0.wrapping_add(c1))));
+        .or_else(|| issub(x0).map(|(v, c1)| (v, k0.wrapping_add(c1))))
+        // `x ^ K == C` → `x == C ^ K` — `bandk`'s `band(bxor x,K),m →
+        // bxor(band x,m),K&m` leaves exactly this shape; folding `^K`
+        // into the compare makes the `band` the operand (UTF8-boundary
+        // `b&0xC0==0x80` → `and;icmp` like LLVM emits).
+        .or_else(|| bin_k(pos.func, x0, Opcode::Bxor).map(|(v, c1)| (v, k0 ^ c1)));
     let Some((v, kk)) = adj else { return false };
     // Only shift when `x0` is dead apart from this compare — then the
     // add/sub folds away entirely. When it's still needed (e.g. a loop's
