@@ -20,7 +20,7 @@ use pliron_llvm::types::{ArrayType, FuncType, StructLayout, StructType};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::context::{ArgExt, ConstVal, State};
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks_iter, direct_callee, ops_iter};
 use crate::sroa::{mk_const, ptr_plus};
 use crate::types::{TyK, classify, size_align, struct_offsets};
 
@@ -75,8 +75,8 @@ fn call_sites(
         if !crate::has_body(ctx, f.op) {
             continue;
         }
-        for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+        for b in blocks_iter(ctx, f.op) {
+            for op in ops_iter(ctx, b) {
                 if let Some(c) = direct_callee(ctx, st, op) {
                     if internal.contains(c) {
                         sites.entry(c.clone()).or_default().push(op);
@@ -292,9 +292,8 @@ fn rewrite(
     let sret = entry.deref(ctx).get_argument(ctx, 0);
     sret.replace_all_uses_with(ctx, &slot);
     BasicBlock::remove_argument(entry, ctx, 0);
-    let rets: Vec<_> = blocks(ctx, fop)
-        .into_iter()
-        .flat_map(|b| ops(ctx, b))
+    let rets: Vec<_> = blocks_iter(ctx, fop)
+        .flat_map(|b| ops_iter(ctx, b))
         .filter(|&op| Operation::is_op::<ReturnOp>(op, ctx))
         .collect();
     for r in rets {

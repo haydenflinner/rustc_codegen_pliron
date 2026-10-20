@@ -50,7 +50,7 @@ pub fn address_taken_ex(
         {
             continue;
         }
-        for b in crate::inline::blocks(ctx, f.op) {
+        for b in crate::inline::blocks_iter(ctx, f.op) {
             for op in b.deref(ctx).iter(ctx) {
                 if let Some(a) = Operation::get_op::<AddressOfOp>(op, ctx) {
                     let id = a.get_global_name(ctx);

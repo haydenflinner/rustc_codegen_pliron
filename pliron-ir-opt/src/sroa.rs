@@ -1805,10 +1805,9 @@ fn forward_single_store_d(
         let b = o.deref(ctx).get_parent_block().unwrap();
         posm.entry(b)
             .or_insert_with(|| {
-                crate::inline::ops(ctx, b)
-                    .iter()
+                crate::inline::ops_iter(ctx, b)
                     .enumerate()
-                    .map(|(i, &x)| (x, i))
+                    .map(|(i, x)| (x, i))
                     .collect()
             })
             .get(&o)

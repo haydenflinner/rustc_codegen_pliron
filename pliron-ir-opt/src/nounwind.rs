@@ -9,7 +9,7 @@ use pliron::operation::Operation;
 use pliron_llvm::ops::CallOp;
 use rustc_hash::FxHashSet;
 
-use crate::inline::{blocks, direct_callee};
+use crate::inline::{blocks_iter, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied};
 
@@ -62,7 +62,7 @@ pub fn run(ctx: &Context, st: &mut State) {
     for s in &bodied {
         let f = ids.id(s);
         p.body.push((f,));
-        for b in blocks(ctx, st.funcs[s].op) {
+        for b in blocks_iter(ctx, st.funcs[s].op) {
             crate::inline::ops_into(ctx, b, &mut scratch);
             for &op in &scratch {
                 // `pliron.eh.rethrow` unwinds out of `f` through a

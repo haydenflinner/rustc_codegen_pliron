@@ -89,6 +89,25 @@ pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
     b.deref(ctx).iter(ctx).collect()
 }
 
+/// Lazy `ops` — no `Vec` collect for read-only scans. The iterated
+/// block's op list must not be mutated while iterating.
+pub fn ops_iter<'a>(
+    ctx: &'a Context,
+    b: Ptr<BasicBlock>,
+) -> impl Iterator<Item = Ptr<Operation>> + 'a {
+    b.deref(ctx).iter(ctx)
+}
+
+/// Lazy `blocks` — no `Vec` collect for read-only scans. The function's
+/// region-0 block list must not be mutated while iterating.
+pub fn blocks_iter<'a>(
+    ctx: &'a Context,
+    f: Ptr<Operation>,
+) -> impl Iterator<Item = Ptr<BasicBlock>> + 'a {
+    let r = f.deref(ctx).regions(ctx).next();
+    r.into_iter().flat_map(move |r| r.deref(ctx).iter(ctx))
+}
+
 /// `ops` into a caller-owned buffer so per-block walks allocate once.
 pub fn ops_into(ctx: &Context, b: Ptr<BasicBlock>, out: &mut Vec<Ptr<Operation>>) {
     out.clear();
@@ -192,7 +211,7 @@ fn callee_info(
     let (mut n, mut ncalls, mut eh) = (0, 0, false);
     let mut dvirt_tgt = Vec::new();
     let mut cond_roots = Vec::new();
-    for b in blocks(ctx, f.op) {
+    for b in blocks_iter(ctx, f.op) {
         for op in b.deref(ctx).iter(ctx) {
             n += 1;
             let intr = st.intrinsics.get(op);
@@ -238,8 +257,8 @@ fn callee_info(
     if !want {
         return Some(ci);
     }
-    let params: Vec<Value> = match blocks(ctx, f.op).first() {
-        Some(&entry) => entry.deref(ctx).arguments(ctx).collect(),
+    let params: Vec<Value> = match blocks_iter(ctx, f.op).next() {
+        Some(entry) => entry.deref(ctx).arguments(ctx).collect(),
         None => return Some(ci),
     };
     if model || bonus > 1 {
@@ -652,7 +671,7 @@ fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
         if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
             continue;
         }
-        for b in blocks(ctx, f.op) {
+        for b in blocks_iter(ctx, f.op) {
             for op in b.deref(ctx).iter(ctx) {
                 if let Some(c) = direct_callee(ctx, st, op) {
                     if let Some(n) = n.get_mut(c) {
@@ -680,7 +699,7 @@ fn live_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
         {
             continue;
         }
-        for b in blocks(ctx, f.op) {
+        for b in blocks_iter(ctx, f.op) {
             for op in b.deref(ctx).iter(ctx) {
                 if let Some(c) = direct_callee(ctx, st, op) {
                     if let Some(n) = n.get_mut(c) {
@@ -719,7 +738,7 @@ impl Adj {
             {
                 continue;
             }
-            for b in blocks(ctx, f.op) {
+            for b in blocks_iter(ctx, f.op) {
                 for op in b.deref(ctx).iter(ctx) {
                     if let Some(c) = direct_callee(ctx, st, op) {
                         callers_of.entry(c.clone()).or_default().push(sym.clone());
@@ -897,8 +916,7 @@ fn post_order(ctx: &Context, st: &State, filter: Option<&FxHashSet<String>>) -> 
 }
 
 fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
-    blocks(ctx, st.funcs[sym].op)
-        .into_iter()
+    blocks_iter(ctx, st.funcs[sym].op)
         .flat_map(|b| b.deref(ctx).iter(ctx))
         .filter_map(|op| direct_callee(ctx, st, op).cloned())
         .filter(|c| st.funcs.contains_key(c))
@@ -1048,9 +1066,8 @@ pub fn run(
         if st.opt_skip.contains(&caller) {
             continue;
         }
-        let mut size: usize = blocks(ctx, caller)
-            .iter()
-            .map(|&b| b.deref(ctx).iter(ctx).count())
+        let mut size: usize = blocks_iter(ctx, caller)
+            .map(|b| b.deref(ctx).iter(ctx).count())
             .sum();
         let mut grown = 0usize;
         // `only` (the devirt-inline pass) restricts which pre-existing
@@ -1058,9 +1075,8 @@ pub fn run(
         // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
         let pre: FxHashSet<Ptr<Operation>> = only
             .map(|_| {
-                blocks(ctx, caller)
-                    .iter()
-                    .flat_map(|&b| b.deref(ctx).iter(ctx))
+                blocks_iter(ctx, caller)
+                    .flat_map(|b| b.deref(ctx).iter(ctx))
                     .collect()
             })
             .unwrap_or_default();
@@ -1415,7 +1431,7 @@ fn left_stats(
         if !has_body(ctx, f.op) {
             continue;
         }
-        for b in blocks(ctx, f.op) {
+        for b in blocks_iter(ctx, f.op) {
             for op in b.deref(ctx).iter(ctx) {
                 let Some(cs) = direct_callee(ctx, st, op) else {
                     continue;

@@ -19,7 +19,7 @@ use pliron_llvm::ops::{CallOp, UndefOp};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
-use crate::inline::{blocks, direct_callee};
+use crate::inline::{blocks_iter, direct_callee};
 use crate::state::State;
 
 pub fn run(ctx: &mut Context, st: &mut State) {
@@ -37,7 +37,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             continue;
         }
         let dead = st.dead_unopt.contains(n.as_str()) || st.dead_fns.contains(n.as_str());
-        for b in blocks(ctx, f.op) {
+        for b in blocks_iter(ctx, f.op) {
             crate::inline::ops_into(ctx, b, &mut scratch);
             for &op in &scratch {
                 if let Some(sym) = direct_callee(ctx, st, op) {
@@ -78,7 +78,12 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         let Some(calls) = sites.get(sym) else {
             continue;
         };
-        let params: Vec<Value> = blocks(ctx, f.op)[0].deref(ctx).arguments(ctx).collect();
+        let params: Vec<Value> = blocks_iter(ctx, f.op)
+            .next()
+            .unwrap()
+            .deref(ctx)
+            .arguments(ctx)
+            .collect();
         let args: Vec<Vec<Value>> = calls
             .iter()
             .map(|&c| Operation::get_op::<CallOp>(c, ctx).unwrap().args(ctx))
@@ -122,6 +127,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inline::blocks;
     use crate::state::{ConstVal, Exts, FuncInfo};
     use cranelift_module::Linkage;
     use pliron::builtin::op_interfaces::SymbolOpInterface;

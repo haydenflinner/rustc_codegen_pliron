@@ -19,7 +19,7 @@ use pliron::value::Value;
 use pliron_llvm::ops::{CallOp, ReturnOp, SelectOp};
 use rustc_hash::FxHashMap;
 
-use crate::inline::{blocks, direct_callee};
+use crate::inline::{blocks, blocks_iter, direct_callee};
 use crate::state::State;
 use crate::{Syms, bodied, has_body};
 
@@ -109,7 +109,7 @@ pub fn run(ctx: &Context, st: &State) {
         if !has_body(ctx, f.op) || st.dead_unopt_ops.contains(&f.op) {
             continue;
         }
-        for b in blocks(ctx, f.op) {
+        for b in blocks_iter(ctx, f.op) {
             crate::inline::ops_into(ctx, b, &mut scratch);
             for &op in &scratch {
                 if !Operation::is_op::<CallOp>(op, ctx) || op.deref(ctx).get_num_results() == 0 {
