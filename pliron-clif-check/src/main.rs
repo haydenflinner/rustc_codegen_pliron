@@ -341,6 +341,11 @@ fn run_one(
 ) -> (bool, Function) {
     let before = func.clone();
     let after = with_pipe(isa, func, facts, |p| {
+        // A saved `before.clif` comes from mid-pipeline, possibly with
+        // edits the pipeline hadn't reaped yet: replay reap-gated steps
+        // (`iconst128`'s `post_sweep`) as the pipeline would have, or a
+        // diffcheck repro of them reports "unchanged".
+        p.since_reap = true;
         if pipeline::run_named(p, name).is_none() {
             eprintln!("unknown step `{name}` (see `clif-check steps`)");
             std::process::exit(2);
