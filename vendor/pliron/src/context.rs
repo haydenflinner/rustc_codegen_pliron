@@ -68,9 +68,12 @@ pub struct Context {
     /// A unique number for each `Value` in the context.
     /// Serves as a generation counter against accessing invalid `Value`s.
     pub(crate) value_counter: Cell<u64>,
-    /// A unique number for each `Use` in the context.
-    /// Serves as a generation counter against accessing invalid `Use`s.
-    pub(crate) use_counter: Cell<u64>,
+    /// PLIRON: Context-wide arena of use slots backing every
+    /// [crate::value::DefNode]'s intrusive use list (replaces the
+    /// per-def `SmallSet<Use>` hash sets). A use's uid encodes
+    /// `(slot_gen << 32) | slot_index` so a stale `Use` can never
+    /// alias a recycled slot.
+    pub(crate) use_links: RefCell<crate::value::UseLinks>,
     /// Allocation pool for [Operation]s.
     pub(crate) operations: Arena<Operation>,
     /// Allocation pool for [BasicBlock]s.
@@ -151,19 +154,16 @@ impl Context {
         uid
     }
 
-    /// Get a unique number for a new use.
-    pub(crate) fn get_new_use_uid(&self) -> u64 {
-        let uid = self.use_counter.get();
-        self.use_counter.set(uid + 1);
-        uid
-    }
+    // PLIRON: `get_new_use_uid`/`use_counter` removed — use uids now
+    // come from the `use_links` slot index + generation
+    // (see [crate::value::UseLinks]).
 }
 
 impl Default for Context {
     fn default() -> Self {
         let mut ctx = Context {
             value_counter: Cell::new(0),
-            use_counter: Cell::new(0),
+            use_links: RefCell::new(crate::value::UseLinks::new()),
             operations: Arena::default(),
             basic_blocks: Arena::default(),
             regions: Arena::default(),

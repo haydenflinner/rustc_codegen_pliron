@@ -690,7 +690,7 @@ impl Operation {
     pub fn uses<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Use<Value>> + 'a {
         self.results_slice(ctx)
             .iter()
-            .flat_map(|res| res.def.uses())
+            .flat_map(|res| res.def.uses(ctx))
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -1174,25 +1174,23 @@ impl<T: DefUseParticipant + DefTrait> Operand<T> {
 
     /// Drop this use, removing self from its definition's uses list.
     fn drop_use(&self, ctx: &Context, op: Ptr<Operation>) {
-        self.get_def().get_defnode_mut(ctx).remove_use(Use {
-            user_op: op,
-            use_uid: self.use_uid,
-            _dummy: PhantomData,
-        });
+        self.get_def().get_defnode_mut(ctx).remove_use(
+            ctx,
+            &Use {
+                user_op: op,
+                use_uid: self.use_uid,
+                _dummy: PhantomData,
+            },
+        );
     }
 
     /// Create a new Operand in `user_op`.
     fn new(ctx: &Context, def: T, user_op: Ptr<Operation>) -> Operand<T> {
-        let use_uid = ctx.get_new_use_uid();
+        // PLIRON: the use's uid is minted by the intrusive use list —
+        // (slot_gen << 32) | slot_index, see [crate::value::UseLinks].
+        let (unode, use_uid) = def.get_defnode_mut(ctx).add_use(ctx, def, user_op);
         Operand {
-            r#use: def.get_defnode_mut(ctx).add_use(
-                def,
-                Use {
-                    user_op,
-                    use_uid,
-                    _dummy: PhantomData,
-                },
-            ),
+            r#use: unode,
             use_uid,
         }
     }
@@ -1205,7 +1203,7 @@ impl<T: DefUseParticipant + DefTrait> Operand<T> {
             use_uid: self.use_uid,
             _dummy: PhantomData,
         };
-        if !def.get_defnode_ref(ctx).has_use_of(&r#use) {
+        if !def.get_defnode_ref(ctx).has_use_of(ctx, &r#use) {
             let loc = user_op.deref(ctx).loc();
             verify_err!(loc, DefUseVerifyErr::OperandNotUseOfDef)
         } else {
