@@ -2521,6 +2521,36 @@ fn emit_scalar(
     out
 }
 
+/// `entry + iters*s` at `entry`'s width — a `Step` header param
+/// advances `s` per scalar iteration in its own type, which needn't be
+/// `iv_ty` (an i64 element IV can share the header with an i32 stepped
+/// param). `iters` is a non-negative count exact in `iv_ty`; reduce or
+/// extend it into the param's width and multiply there — mod-2^n
+/// arithmetic commutes with both.
+fn step_resume(
+    pos: &mut FuncCursor,
+    iv_ty: Type,
+    entry: Value,
+    iters: Value,
+    s: i64,
+) -> Value {
+    let ty = pos.func.dfg.value_type(entry);
+    let it = match ty.bits().cmp(&iv_ty.bits()) {
+        std::cmp::Ordering::Less => pos.ins().ireduce(ty, iters),
+        std::cmp::Ordering::Greater => pos.ins().uextend(ty, iters),
+        std::cmp::Ordering::Equal => iters,
+    };
+    let sk = if ty.bits() <= 64 {
+        pos.ins().iconst(ty, s)
+    } else {
+        let lo = pos.ins().iconst(types::I64, s);
+        let hi = pos.ins().iconst(types::I64, s >> 63);
+        pos.ins().iconcat(lo, hi)
+    };
+    let m = pos.ins().imul(it, sk);
+    pos.ins().iadd(entry, m)
+}
+
 /// Emit `v` at the epilogue with each header param bound to its
 /// one-iteration-back value (`epi - s` for `Step`, `entry` for `Inv`):
 /// the deferred `bv(p(nm-1))` a lagged param's latch would have fed.
@@ -4240,10 +4270,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 epi.push(p.entry_args[j]);
             }
             Param::Step(s) => {
-                let sk = pos.ins().iconst(iv_ty, s);
-                let d = pos.ins().imul(nm, sk);
-                let v = pos.ins().iadd(p.entry_args[j], d);
-                epi.push(v);
+                epi.push(step_resume(&mut pos, iv_ty, p.entry_args[j], nm, s));
             }
             Param::Other => unreachable!(),
         }
@@ -4840,9 +4867,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 }
                 Param::Step(s) => {
                     let it = it_of(&mut pos);
-                    let sk = pos.ins().iconst(iv_ty, s);
-                    let m = pos.ins().imul(it, sk);
-                    args.push(pos.ins().iadd(p.entry_args[j], m));
+                    args.push(step_resume(&mut pos, iv_ty, p.entry_args[j], it, s));
                 }
                 Param::Other => unreachable!(),
             }
