@@ -2173,10 +2173,42 @@ fn peep_body_opts(
             }
             let mut written: FxHashSet<u32> = FxHashSet::default();
             for m in (k + 1)..e {
-                if let WPeek::Set(l) | WPeek::Tee(l) = ins[m].0 {
+                if let WPeek::Set(l) | WPeek::Tee(l) | WPeek::Nop(l) = ins[m].0 {
                     written.insert(l);
                 }
             }
+            // Invariant-chain hoisting: a contiguous self-contained run
+            // of pure ops + `get`s (all locals unwritten in the loop) +
+            // consts producing exactly one value recomputes each
+            // iteration — `hmget`'s tag broadcast
+            // (`get h2;const25;shr;wrap;and;extend;constB;mul`) is the
+            // shape. Hoist `run;set T` to the preamble, leave `get T`.
+            let pure_eff = |op: u8| -> Option<(u32, u32)> {
+                Some(match op {
+                    0x41..=0x44 => (0, 1),
+                    0x45 | 0x50 => (1, 1),
+                    0x46..=0x4f | 0x51..=0x66 => (2, 1),
+                    0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => (1, 1),
+                    0x6a..=0x6c | 0x71..=0x78 | 0x7c..=0x7e | 0x83..=0x8a
+                    | 0x92..=0x98 | 0xa0..=0xa6 => (2, 1),
+                    0xa7 | 0xac | 0xad | 0xb2..=0xbb | 0xc0..=0xc4 => (1, 1),
+                    _ => return None,
+                })
+            };
+            let chain_vt = |op: u8| -> Option<u8> {
+                Some(match op {
+                    // i32.const/eqz/cmps/i32-arith/wrap/i32-extends -> i32
+                    0x41 | 0x45 | 0x50 | 0x46..=0x4f | 0x51..=0x66 | 0x67..=0x69
+                    | 0x6a..=0x78 | 0xa7 | 0xb8 | 0xc0 | 0xc1 => 0x7f,
+                    // i64.const/i64-unary/arith/extend-i32/i64-extends/reint -> i64
+                    0x42 | 0x79..=0x8a | 0xac | 0xad | 0xb9 | 0xc2..=0xc4 => 0x7e,
+                    // f32.const/unary/arith/convert-i32/demote/reint -> f32
+                    0x43 | 0x8b..=0x98 | 0xb2 | 0xb3 | 0xb4 | 0xba => 0x7d,
+                    // f64.const/unary/arith/convert-i32/promote/reint -> f64
+                    0x44 | 0x99..=0xa6 | 0xb5 | 0xb6 | 0xb7 | 0xbb => 0x7c,
+                    _ => return None,
+                })
+            };
             let mut seen: FxHashMap<(u32, u32, u8), u32> = FxHashMap::default();
             let mut hoist: Vec<(WPeek, usize, usize, usize)> = Vec::new();
             let mut rewrites: Vec<(usize, u32)> = Vec::new();
@@ -2231,6 +2263,78 @@ fn peep_body_opts(
                 ins[m].0 = WPeek::Get(t);
                 ins[m + 1].0 = WPeek::Nop(0);
                 ins[m + 2].0 = WPeek::Nop(0);
+            }
+            let chain_on = crate::env_get("PLIRON_WASM_LICM_CHAIN") != Some("0");
+            let chain_dbg = crate::env_get("PLIRON_WASM_LICM_CHAIN") == Some("dbg");
+            let mut m2 = k + 1;
+            while m2 < e && chain_on {
+                if minted >= MAX_SFWD_LOCALS {
+                    break;
+                }
+                // Longest self-contained pure run starting at `m2` —
+                // `depth` counts net pushed values; dipping to 0 means
+                // the run consumed a below-run value (not self-contained).
+                let mut depth = 0i64;
+                let mut last = 0usize;
+                let mut j = m2;
+                while j < e {
+                    // A `prel` KOS push anchored at `ins[j].1` materializes
+                    // a `Get` at `ins[j]`'s index for `ins[j]`'s consumer —
+                    // `Nop`ing the instr orphans the push (stack leak).
+                    if prel.iter().any(|&(pp, _)| pp == ins[j].1) {
+                        break;
+                    }
+                    let (pops, pushes) = match ins[j].0 {
+                        WPeek::Get(l) => {
+                            if written.contains(&l) {
+                                break;
+                            }
+                            (0, 1)
+                        }
+                        WPeek::Other => match pure_eff(b[ins[j].1]) {
+                            Some(pe) => pe,
+                            None => break,
+                        },
+                        _ => break,
+                    };
+                    depth += pushes as i64 - pops as i64;
+                    if depth <= 0 {
+                        break;
+                    }
+                    if depth == 1 {
+                        last = j;
+                    }
+                    j += 1;
+                }
+                if last >= m2 + 3 {
+                    let Some(vt) = chain_vt(b[ins[last].1]) else {
+                        m2 += 1;
+                        continue;
+                    };
+                    if chain_dbg {
+                        eprintln!(
+                            "licm-chain k={k} {m2}..{last}: {:?}",
+                            (m2..=last)
+                                .map(|q| (ins[q].0, b.get(ins[q].1).copied()))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    let t = next_local;
+                    next_local += 1;
+                    minted += 1;
+                    groups.push((1, vt));
+                    for q in m2..=last {
+                        hoist.push((ins[q].0, ins[q].1, ins[q].2, ins[k].3));
+                    }
+                    hoist.push((WPeek::Set(t), ins[k].1, ins[k].1, ins[k].3));
+                    ins[m2].0 = WPeek::Get(t);
+                    for q in (m2 + 1)..=last {
+                        ins[q].0 = WPeek::Nop(0);
+                    }
+                    m2 = last + 1;
+                } else {
+                    m2 += 1;
+                }
             }
             if !hoist.is_empty() {
                 splices.push((k, hoist));
