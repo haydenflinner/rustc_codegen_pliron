@@ -218,6 +218,12 @@ struct Job {
     parts: Parts,
     step: Step,
     ir: String,
+    /// Stage-B wait set: participant ordinals this CGU must see
+    /// published before adopting facts — the ords that own a symbol it
+    /// declares without a body (see `Store::owners`). Under
+    /// `PLIRON_XNEED=0` it is the full ordinal prefix, the old cover
+    /// semantics. Empty for `Whole` jobs.
+    needs: Vec<u32>,
     /// Wall time spent in iropt stages A+B — the `*iropt*` timing row.
     /// Parked time between publish and adopt does not count.
     iropt: std::time::Duration,
@@ -235,12 +241,17 @@ struct Store {
     next_key: u32,
     next_ord: u32,
     ready: VecDeque<Job>,
-    /// Stage-B jobs keyed by participant ordinal, waiting on the prefix.
+    /// Stage-B jobs keyed by participant ordinal, waiting on `needs`.
     parked: BTreeMap<u32, Job>,
     /// Participant ordinals that have published.
     published: rustc_hash::FxHashSet<u32>,
-    /// Every participant ordinal `< cover` has published.
-    cover: u32,
+    /// Symbol -> ords of CGUs that submitted a body for it. A stage-B's
+    /// fact adoption only reads entries for its own bodiless decls, so
+    /// it need only wait on those owners — the full prefix is a
+    /// superset (`PLIRON_XNEED=0` restores it). Filled at `submit`,
+    /// which is ord-ordered, so an adopting CGU always sees every
+    /// owner below its own ordinal.
+    owners: rustc_hash::FxHashMap<String, Vec<u32>>,
     done: rustc_hash::FxHashMap<u32, Result<Finished, Box<dyn std::any::Any + Send>>>,
 }
 
@@ -288,6 +299,18 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
     } else {
         (u32::MAX, Step::Whole)
     };
+    pliron_cfg::mark(&format!("submit {name} ord={ord} key={key}"));
+    if ord != u32::MAX && pass_enabled("PLIRON_XNEED") {
+        // Same predicate `facts_publish` exports under: emitted bodies
+        // only. Owners can only shrink before publish (dead_fns), so
+        // this is a superset — a stale entry costs a waiter one publish
+        // it did not strictly need, never a missed dependency.
+        for (sym, f) in st.funcs.iter() {
+            if f.linkage != Linkage::Import && pliron_ir_opt::has_body(&ctx, f.op) {
+                g.owners.entry(sym.clone()).or_default().push(ord);
+            }
+        }
+    }
     g.ready.push_back(Job {
         key,
         ord,
@@ -296,6 +319,7 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
         parts: Parts { ctx, st, module },
         step,
         ir: String::new(),
+        needs: Vec::new(),
         iropt: std::time::Duration::ZERO,
     });
     CV.notify_one();
@@ -326,14 +350,38 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
         Ok(RunOut::Done { key, out }) => {
             g.done.insert(key, Ok(out));
         }
-        Ok(RunOut::Published { job }) => {
+        Ok(RunOut::Published { mut job }) => {
             g.published.insert(job.ord);
-            advance_cover(&mut g);
-            if job.ord < g.cover {
+            // Resolve the stage-B wait set now — `funcs` is final (the
+            // job parks until stage-B adopts, nothing mutates it in
+            // between). adopt only ever looks up this CGU's bodiless
+            // decls, so waiting on the ords that OWN those symbols is
+            // equivalent to the full prefix: every ord publishing a
+            // queried sym is an owner, so merged `copies` counts and
+            // `proven` checks for queried syms are unchanged; ords
+            // contributing no queried sym merge nothing an adopt reads.
+            job.needs = if pass_enabled("PLIRON_XNEED") {
+                let mut v = Vec::new();
+                for (sym, f) in job.parts.st.funcs.iter() {
+                    if pliron_ir_opt::has_body(&job.parts.ctx, f.op) {
+                        continue;
+                    }
+                    if let Some(ords) = g.owners.get(sym) {
+                        v.extend(ords.iter().copied().filter(|&o| o < job.ord));
+                    }
+                }
+                v.sort_unstable();
+                v.dedup();
+                v
+            } else {
+                (0..job.ord).collect()
+            };
+            if covered(&g.published, &job.needs) {
                 g.ready.push_back(job);
             } else {
                 g.parked.insert(job.ord, job);
             }
+            release_parked(&mut g);
         }
         Err(p) => {
             let p = match p.downcast::<HostFatal>() {
@@ -360,7 +408,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
             // conservative result, and the compile is dying anyway.
             if jord != u32::MAX {
                 g.published.insert(jord);
-                advance_cover(&mut g);
+                release_parked(&mut g);
             }
         }
     }
@@ -408,16 +456,20 @@ pub(crate) fn run_until(key: u32, prof: &SelfProfilerRef, emitter: &SharedEmitte
     out
 }
 
-/// `cover` = every participant ordinal below it has published; release
-/// parked stage-B jobs whose prefix is now complete.
-fn advance_cover(g: &mut Store) {
-    while g.published.contains(&g.cover) {
-        g.cover += 1;
-    }
-    while let Some(&o) = g.parked.keys().next() {
-        if o >= g.cover {
-            break;
-        }
+/// Every ordinal in `needs` has published.
+fn covered(published: &rustc_hash::FxHashSet<u32>, needs: &[u32]) -> bool {
+    needs.iter().all(|o| published.contains(o))
+}
+
+/// Release parked stage-B jobs whose `needs` are now fully published.
+fn release_parked(g: &mut Store) {
+    let ready: Vec<u32> = g
+        .parked
+        .iter()
+        .filter(|(_, j)| covered(&g.published, &j.needs))
+        .map(|(&o, _)| o)
+        .collect();
+    for o in ready {
         let j = g.parked.remove(&o).unwrap();
         g.ready.push_back(j);
     }
@@ -434,6 +486,7 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
     };
     match job.step {
         Step::A => {
+            pliron_cfg::mark(&format!("stageA+ {} ord={}", job.name, job.ord));
             job.ir = finish_pre(
                 &mut job.parts.ctx,
                 &mut job.parts.st,
@@ -454,9 +507,11 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
             );
             job.iropt += t.elapsed();
             job.step = Step::B;
+            pliron_cfg::mark(&format!("publish {} ord={}", job.name, job.ord));
             RunOut::Published { job }
         }
         Step::B => {
+            pliron_cfg::mark(&format!("stageB+ {} ord={}", job.name, job.ord));
             let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
             let _pgiro = prof.generic_activity("pliron_iropt");
             let t = std::time::Instant::now();
@@ -479,6 +534,7 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
                 job.ir,
                 job.iropt,
             );
+            pliron_cfg::mark(&format!("doneB {} ord={}", job.name, job.ord));
             RunOut::Done { key: job.key, out }
         }
         Step::Whole => {

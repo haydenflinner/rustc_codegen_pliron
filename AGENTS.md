@@ -199,6 +199,10 @@ time) in ~15 min and writes `target/parity/summary.md`.
   counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_XNEED=0` — stage-B release falls back to the full ordinal
+  prefix instead of waiting only on the ords that own this CGU's
+  bodiless decls (adopt's lookups only read those ords' facts, so
+  outputs are identical; the need-based wait just unblocks earlier).
 - `PLIRON_DEADUNOPT=0` — callerless retained `xcgu` copies emit through
   `Gate::Always` lowerings only. `PLIRON_EARLYDEAD=0` — also marks
   them before the iropt passes so `bodied`/`opt_body` skip them too

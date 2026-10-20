@@ -276,6 +276,26 @@ pub fn trace(step: &str, ms: f64, name: &str) {
     }
 }
 
+/// `PLIRON_TRACE_FILE=<path>`: append `mark <pid> <t_ms> <label>` — a
+/// wall-clock point event (ms since process start), for reconstructing
+/// pipeline timelines that `trace`'s durations can't express.
+pub fn mark(label: &str) {
+    let Some(path) = env_get("PLIRON_TRACE_FILE") else {
+        return;
+    };
+    use std::io::Write;
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1e3;
+    let line = format!("mark {} {t:.3} {label}\n", std::process::id());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass
 /// applications (across all passes and functions), like LLVM's
 /// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
