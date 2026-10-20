@@ -142,6 +142,13 @@ noted):
   aarch64 emit/ISLE (debug dylib: seed 88 is a `tailmerge` verifier
   error, f64 address into `load.i32`), seed 14 a debug-only overflow panic
   in `proots.rs:1211` (release passes). Artifacts: `target/harness/fuzz/<seed>`.
+  Seed 24 (-O0, wrong hash) bisects (`harness/bisect.py`, flags
+  `-Zmir-opt-level=0 -Ccodegen-units=1`) to unit 8541 = `slotprom` on
+  `fn3`; the differential checker is inconclusive there (pointer args into
+  statics), so the next step is a manual CLIF diff of `fn3` at
+  `PLIRON_OPT_BISECT=8540` vs `8541` (`PLIRON_CLIF=..fn3 PLIRON_TRACE=pliron::dump=info`).
+  Gotcha: the bisect command must pass rustc's stderr through, or
+  `bisect.py` counts 0 units.
 - Tooling: `clif-check step` now replays reap-gated steps
   (`iconst128`'s `post_sweep`) as the pipeline does — a diffcheck repro of
   a `post_sweep` miscompile used to print "unchanged".
