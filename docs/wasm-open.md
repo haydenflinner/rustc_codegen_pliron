@@ -4,12 +4,12 @@ Working ledger for "pliron must not lose to LLVM on any wasmbench
 kernel" (geomean first, then per-kernel). Update as items resolve;
 `docs/PARITY.md` holds the measured numbers.
 
-## Status snapshot (bench/wasm/run.sh, post `4756155`)
+## Status snapshot (bench/wasm/run.sh, post `8ed1b5c`)
 
-geomean pliron/llvm = **0.975** (best 0.970 pre-`walias` — swing is
-inside noise). Wins: `chars_alpha` −36%, `iterw` −41%, `parse_only`
-−14%, `matmul` −12%, `eqbug` −10%. Parity: `sieve` +2.5%, `sortw`
-+3.6%, `contains_rng` +1.3%.
+geomean pliron/llvm = **0.980** (best yet — `walias` mode 15 with
+sound pair-cancel). Wins: `chars_alpha` −33%, `iterw` −34%, `parse_only`
+−14%, `matmul` −11%, `eqbug` −9%, `contains_rng` −4%. Parity: `sieve`
++0.7%, `nbody` +0.2%.
 
 Landed since: `sfwd` v2 + intra-span DSE (`62dbebb`), `licm` bounded
 loop-invariant `get;get;binop` hoisting (`677c37b`), `bandk` in
@@ -57,20 +57,22 @@ module −5 KiB).
    convenience inline) rather than a global budget change. Deferred to
    whoever owns `pliron-ir-opt` next.
 
-2. **`hashmap` +16 / `hmget` +13 / `tokenize` +16 — locals coalescing
-   (`walias`-class).** `walias` landed (`4756155`): operand-stack-aware
-   linear scan doing `get;drop` elision, dead-`set`/`tee` → `drop`/`del`,
-   and `get T → get U` copy-forwarding within straight-line spans
-   (path-sensitive state cleared at every `Ctl`/`Br`/`BrIf`;
-   `Nop` self-copy counts as a use). `PLIRON_WASM_WALIAS_MODE` selects
-   transform bits; default 14 = all but pair-cancel. **Parked:** the
-   `set T … get T` pair-cancel bit (1) — its phantom-slot model
-   miscompiled around multi-value calls (`sin`'s `call rem_pio2`
-   returned `(f64,i32,i32,f64)`; `set3` popped an untracked operand
-   because `vstack` cleared at the `call`, so `dv=0` "matched" `get3`
-   at len 0 — fixed via `popped.is_some()` but strwork still showed a
-   `ret differs` miscompile — needs a real dominance/liveness model,
-   not linear-slot tracking).
+2. **`hashmap` +16 / `hmget` +13 / `tokenize` +12 — locals coalescing
+   (`walias`-class).** `walias` landed (`4756155`, pair-cancel landed
+   `8ed1b5c`): operand-stack-aware linear scan doing `get;drop` elision,
+   dead-`set`/`tee` → `drop`/`del`, `get T → get U` copy-forwarding,
+   and `set T … get T` pair-cancel (deletes both when T's operand stays
+   on the operand stack for the whole span — `pend[t]` tracks the
+   operand's depth `dv` and dies when `vstack.len() <= dv`). Default
+   `PLIRON_WASM_WALIAS_MODE`=15. Soundness rules: `pend` requires a
+   tracked operand (`popped.is_some()` — multi-value call results and
+   block params never cancel); pops below the tracked region clear
+   `pend`; `Nop(t)` (deleted `get t;set t` — reads+writes t) and
+   `canceled`-restored `set`s kill `pend`/`copymap`/`Named` on t;
+   `len > dv` strict. `PLIRON_WASM_WALIAS_VERIFY=1` replays orig vs
+   edited ins streams comparing popped producer tokens — 0 divergences
+   on the ~23000-body wasmbench dump. `k_strwork` matches LLVM x5.
+   **strwork +16.8%** (was +21-22).
 
 3. **`br_if` fold — arm1 pure-op relaxation.** Else-retarget landed
    (`9e75ac5`), but `if c {arith/stores;br} else {R}` still can't fold
