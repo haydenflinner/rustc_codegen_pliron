@@ -1024,6 +1024,15 @@ pub fn run(
     // `PLIRON_INLINE_HIST=0` lets a site cloned out of an inlined body
     // inline a callee already on its clone chain (`State::inline_hist`).
     let hist = crate::pass_enabled("PLIRON_INLINE_HIST");
+    // `PLIRON_INLINE_SCC=1`: a site cloned out of an inlined body may not
+    // inline a callee in its caller's own (nontrivial) call-graph SCC —
+    // LLVM's CGSCC rule for edges inlining created inside an SCC. Original
+    // sites still inline one level; re-entering the recursion stops.
+    let scc: FxHashMap<String, u32> = if crate::env_is("PLIRON_INLINE_SCC", "1") {
+        scc_ids(ctx, st)
+    } else {
+        FxHashMap::default()
+    };
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
@@ -1279,6 +1288,11 @@ pub fn run(
                         "reject (self/fnty)"
                     } else if hist && on_chain(st, op, ci.op) {
                         "reject (recursive)"
+                    } else if !scc.is_empty()
+                        && st.inline_hist.contains(op)
+                        && scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
+                    {
+                        "reject (scc)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
                     } else if model && !free && grown + ci.n > growth {
@@ -1337,6 +1351,83 @@ pub fn run(
         left_stats(ctx, st, &mut infos, model, limit, bonus, fold);
     }
     delta
+}
+
+/// Call-graph SCC id of every bodied function in a nontrivial SCC (two
+/// or more members; self-recursion is handled by `callee_info`).
+/// Iterative Tarjan over `callees`.
+fn scc_ids(ctx: &Context, st: &State) -> FxHashMap<String, u32> {
+    let names: Vec<&String> = st
+        .funcs
+        .iter()
+        .filter(|(n, f)| has_body(ctx, f.op) && !st.dead_unopt.contains(n.as_str()))
+        .map(|(n, _)| n)
+        .collect();
+    let ix: FxHashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let succ: Vec<Vec<usize>> = names
+        .iter()
+        .map(|n| {
+            callees(ctx, st, n)
+                .iter()
+                .filter_map(|c| ix.get(c.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    const UNSEEN: u32 = u32::MAX;
+    let n = names.len();
+    let (mut index, mut low) = (vec![UNSEEN; n], vec![0u32; n]);
+    let mut on = vec![false; n];
+    let (mut stack, mut next, mut out) = (Vec::new(), 0u32, FxHashMap::default());
+    let mut nscc = 0u32;
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut dfs = vec![(root, 0usize)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = dfs.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if index[w] == UNSEEN {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    dfs.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            dfs.pop();
+            if let Some(&(p, _)) = dfs.last() {
+                low[p] = low[p].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut members = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if members.len() > 1 {
+                    for w in members {
+                        out.insert(names[w].clone(), nscc);
+                    }
+                    nscc += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Whether `callee` was already inlined somewhere on `site`'s clone chain.
