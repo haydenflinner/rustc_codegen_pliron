@@ -66,6 +66,13 @@ pub fn run(ctx: &mut Context, st: &State) {
         // only shrinks an edge's operand list, never retargets edges, so
         // block adjacency can't change between fixpoint rounds.
         let bs = blocks(ctx, f);
+        // Only non-entry block args are ever removed — no args, no work.
+        if bs[1..]
+            .iter()
+            .all(|&b| b.deref(ctx).get_num_arguments() == 0)
+        {
+            continue;
+        }
         let reach = reachable(ctx, st, &bs);
         let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> =
             FxHashMap::default();

@@ -104,7 +104,9 @@ pub fn run(ctx: &Context, st: &State) {
     // Consume: a `returned(k)` call's result is the k-th operand.
     let mut folded = 0usize;
     for f in st.funcs.values() {
-        if !has_body(ctx, f.op) {
+        // `dead_unopt` copies are emit-only — folding calls inside them
+        // is pure waste.
+        if !has_body(ctx, f.op) || st.dead_unopt_ops.contains(&f.op) {
             continue;
         }
         for b in blocks(ctx, f.op) {

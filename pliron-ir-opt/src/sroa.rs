@@ -1427,6 +1427,11 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .filter(|&f| crate::opt_body(ctx, st, f))
         .collect();
     for f in funcs {
+        // No alloca anywhere: `forward_single_store`, the split rounds
+        // and the trailing cleanup all have nothing to do.
+        if allocas(ctx, f).is_empty() {
+            continue;
+        }
         // The `Dom` survives both `forward_single_store` calls — neither
         // it nor `split` moves edges; only a spliced invoke-pad
         // trampoline (flagged by `cfg_dirty`) forces a rebuild.
@@ -1784,6 +1789,11 @@ fn forward_single_store_d(
     f: Ptr<Operation>,
     dom_slot: &mut Option<crate::domcheck::Dom>,
 ) -> usize {
+    let allocs = allocas(ctx, f);
+    // No alloca → no single-store pattern anywhere; skip the domtree.
+    if allocs.is_empty() {
+        return 0;
+    }
     let dom = match dom_slot {
         Some(d) => d,
         slot @ None => match crate::domcheck::Dom::new(ctx, st, f) {
@@ -1810,7 +1820,7 @@ fn forward_single_store_d(
             .copied()
     };
     let mut n = 0;
-    for op in allocas(ctx, f) {
+    for op in allocs {
         let (mut store, mut loads, mut geps, mut ok) = (None, Vec::new(), Vec::new(), true);
         let mut work = vec![op.deref(ctx).get_result(ctx, 0)];
         let mut ubuf = Vec::new();

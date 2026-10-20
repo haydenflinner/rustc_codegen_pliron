@@ -114,6 +114,15 @@ fn fold(ctx: &Context, img: &Image, off: i64, ty: TypeHandle) -> Option<ConstVal
 }
 
 pub fn run(ctx: &mut Context, st: &mut State) {
+    // Nothing folds unless some global is a foldable const image.
+    if !st.globals.values().any(|g| {
+        !g.mutable
+            && !g.tls
+            && !matches!(g.linkage, Linkage::Import | Linkage::Preemptible)
+            && g.init.is_some()
+    }) {
+        return;
+    }
     let mut images: FxHashMap<String, Option<Image>> = FxHashMap::default();
     let fns: Vec<_> = st
         .funcs
