@@ -1021,6 +1021,10 @@ pub fn run(
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
     let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
+    let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CALL_OP_W);
     // `PLIRON_INLINE_HIST=0` lets a site cloned out of an inlined body
     // inline a callee already on its clone chain (`State::inline_hist`).
     let hist = crate::pass_enabled("PLIRON_INLINE_HIST");
@@ -1218,7 +1222,7 @@ pub fn run(
                     }
                     let mut cost = ci.n;
                     if model {
-                        cost = ci.n.saturating_add(ci.ncalls.saturating_mul(CALL_OP_W));
+                        cost = ci.n.saturating_add(ci.ncalls.saturating_mul(call_w));
                         let mut save = 0usize;
                         for (i, a) in args.iter().enumerate() {
                             if const_arg(st, a) {
