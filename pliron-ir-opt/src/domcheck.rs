@@ -39,7 +39,7 @@ fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> 
 fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
     let bs = blocks(ctx, f);
     let dom = Dom::new(ctx, st, f)?;
-    let (post, idx) = (&dom.order, &dom.idx);
+    let post = &dom.order;
     let dominates = |a: usize, b: usize| dom.dom_idx(a, b);
     let all: FxHashMap<Ptr<BasicBlock>, usize> =
         bs.iter().enumerate().map(|(i, &b)| (b, i)).collect();
@@ -61,7 +61,7 @@ fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
                 let ok = if db == b {
                     before
                 } else {
-                    idx.get(&db).is_some_and(|&d| dominates(d, bi))
+                    dom.rpo_idx(db).is_some_and(|d| dominates(d, bi))
                 };
                 if !ok {
                     let what = match v.defining_entity() {
@@ -72,8 +72,8 @@ fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
                         "`{}` in block #{} uses {what} from block #{:?} (reachable: {})",
                         Operation::get_opid(op, ctx),
                         all.get(&b).copied().unwrap_or(usize::MAX),
-                        all.get(&db),
-                        idx.contains_key(&db)
+                        dom.rpo_idx(db),
+                        dom.rpo_idx(db).is_some()
                     ));
                 }
             }
@@ -87,49 +87,82 @@ fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
 pub(crate) struct Dom {
     /// Reachable blocks in reverse post-order.
     pub order: Vec<Ptr<BasicBlock>>,
-    pub idx: FxHashMap<Ptr<BasicBlock>, usize>,
+    /// block → local ordinal (covers every `blocks` entry plus any
+    /// successor outside region 0 the DFS can still reach).
+    ord: FxHashMap<Ptr<BasicBlock>, usize>,
+    /// ordinal → position in `order` (usize::MAX = unreachable).
+    rpo_of: Vec<usize>,
     idom: Vec<usize>,
 }
 
 impl Dom {
     pub fn new(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<Dom> {
-        let bs = blocks(ctx, f);
+        let mut bs = blocks(ctx, f);
         let entry = *bs.first()?;
+        // Local ordinals keep the DFS state (seen/smap) dense — one
+        // ptr→ord map replaces a `seen` set + a `smap` hash map. A
+        // successor `blocks` didn't list (terminator pointing outside
+        // region 0) still gets a fresh ordinal, matching the old
+        // open-addressing behavior.
+        let mut ord: FxHashMap<Ptr<BasicBlock>, usize> =
+            bs.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        let mut seen: Vec<bool> = vec![false; bs.len()];
+        let mut smap: Vec<Vec<Ptr<BasicBlock>>> = vec![Vec::new(); bs.len()];
+        let get_ord = |ord: &mut FxHashMap<Ptr<BasicBlock>, usize>,
+                           bs: &mut Vec<Ptr<BasicBlock>>,
+                           seen: &mut Vec<bool>,
+                           smap: &mut Vec<Vec<Ptr<BasicBlock>>>,
+                           b: Ptr<BasicBlock>| {
+            match ord.get(&b) {
+                Some(&o) => o,
+                None => {
+                    let o = bs.len();
+                    bs.push(b);
+                    ord.insert(b, o);
+                    seen.push(false);
+                    smap.push(Vec::new());
+                    o
+                }
+            }
+        };
         // Reverse post-order over reachable blocks. Successor lists are
         // memoized: the DFS needs each block's once, and the `preds`
         // build below needs them all again — `succs` walks the block's
         // linked-list ops, so a second call doubles the pass's scan cost.
-        let mut seen = FxHashMap::default();
-        let mut post = Vec::new();
-        let mut smap: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
-        smap.insert(entry, succs(ctx, st, entry));
-        let mut stack = vec![(entry, 0usize)];
-        seen.insert(entry, ());
-        while let Some((b, i)) = stack.last_mut() {
-            let next = smap.get(b).and_then(|ss| ss.get(*i).copied());
-            match next {
+        let mut post: Vec<usize> = Vec::new();
+        let eord = get_ord(&mut ord, &mut bs, &mut seen, &mut smap, entry);
+        smap[eord] = succs(ctx, st, entry);
+        seen[eord] = true;
+        let mut stack = vec![(eord, 0usize)];
+        while let Some(&(bo, i)) = stack.last() {
+            match smap[bo].get(i).copied() {
                 Some(n) => {
-                    *i += 1;
-                    if seen.insert(n, ()).is_none() {
-                        smap.insert(n, succs(ctx, st, n));
-                        stack.push((n, 0));
+                    stack.last_mut().unwrap().1 += 1;
+                    let no = get_ord(&mut ord, &mut bs, &mut seen, &mut smap, n);
+                    if !seen[no] {
+                        seen[no] = true;
+                        smap[no] = succs(ctx, st, n);
+                        stack.push((no, 0));
                     }
                 }
                 None => {
-                    post.push(*b);
+                    post.push(bo);
                     stack.pop();
                 }
             }
         }
         post.reverse();
-        let idx: FxHashMap<Ptr<BasicBlock>, usize> =
-            post.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        let mut rpo_of = vec![usize::MAX; bs.len()];
+        for (i, &o) in post.iter().enumerate() {
+            rpo_of[o] = i;
+        }
         let mut preds = vec![Vec::new(); post.len()];
-        for (i, &b) in post.iter().enumerate() {
-            for &s in smap.get(&b).into_iter().flatten() {
-                preds[idx[&s]].push(i);
+        for (i, &o) in post.iter().enumerate() {
+            for &s in &smap[o] {
+                preds[rpo_of[ord[&s]]].push(i);
             }
         }
+        let order: Vec<Ptr<BasicBlock>> = post.iter().map(|&o| bs[o]).collect();
         let mut idom = vec![usize::MAX; post.len()];
         idom[0] = 0;
         let mut changed = true;
@@ -163,10 +196,22 @@ impl Dom {
             }
         }
         Some(Dom {
-            order: post,
-            idx,
+            order,
+            ord,
+            rpo_of,
             idom,
         })
+    }
+
+    /// `b`'s position in `order` — None when unreachable or unknown.
+    fn rpo_idx(&self, b: Ptr<BasicBlock>) -> Option<usize> {
+        let &o = self.ord.get(&b)?;
+        (self.rpo_of[o] != usize::MAX).then_some(self.rpo_of[o])
+    }
+
+    /// Whether `b` is reachable from the entry (was `idx.contains_key`).
+    pub fn contains(&self, b: Ptr<BasicBlock>) -> bool {
+        self.rpo_idx(b).is_some()
     }
 
     fn dom_idx(&self, a: usize, mut b: usize) -> bool {
@@ -178,15 +223,15 @@ impl Dom {
 
     /// Whether reachable block `a` dominates reachable block `b`.
     pub fn dominates(&self, a: Ptr<BasicBlock>, b: Ptr<BasicBlock>) -> bool {
-        match (self.idx.get(&a), self.idx.get(&b)) {
-            (Some(&a), Some(&b)) => self.dom_idx(a, b),
+        match (self.rpo_idx(a), self.rpo_idx(b)) {
+            (Some(a), Some(b)) => self.dom_idx(a, b),
             _ => false,
         }
     }
 
     /// Immediate dominator of a reachable block (None for the entry).
     pub fn idom(&self, b: Ptr<BasicBlock>) -> Option<Ptr<BasicBlock>> {
-        let &i = self.idx.get(&b)?;
+        let i = self.rpo_idx(b)?;
         (self.idom[i] != i).then(|| self.order[self.idom[i]])
     }
 }

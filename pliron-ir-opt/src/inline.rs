@@ -499,61 +499,82 @@ fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>>
 /// than one member or it has a self-edge; the quadratic per-block DFS this
 /// replaces took ~100ms per rebuild on a post-inline `main`.
 fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
-    let mut index = FxHashMap::default();
-    let mut low = FxHashMap::default();
-    let mut onstack = FxHashSet::default();
-    let mut selfedge = FxHashSet::default();
-    let mut tstack: Vec<Ptr<BasicBlock>> = Vec::new();
+    // One ptr→local-ordinal map, then the whole Tarjan state is dense
+    // Vecs — five hash structures shrank to one.
+    let mut bs = blocks(ctx, f);
+    let n = bs.len();
+    let mut ord: FxHashMap<Ptr<BasicBlock>, usize> =
+        bs.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let mut index = vec![u32::MAX; n];
+    let mut low = vec![0u32; n];
+    let mut onstack = vec![false; n];
+    let mut selfedge = vec![false; n];
+    let mut tstack: Vec<usize> = Vec::new();
     let mut out = FxHashSet::default();
     let mut next = 0u32;
-    for &root in &blocks(ctx, f) {
-        if index.contains_key(&root) {
+    for i in 0..n {
+        let ro = i;
+        if index[ro] != u32::MAX {
             continue;
         }
-        let mut work: Vec<(Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>)> = Vec::new();
-        index.insert(root, next);
-        low.insert(root, next);
+        let mut work: Vec<(usize, Vec<Ptr<BasicBlock>>)> = Vec::new();
+        index[ro] = next;
+        low[ro] = next;
         next += 1;
-        tstack.push(root);
-        onstack.insert(root);
-        work.push((root, bsuccs(ctx, st, root)));
+        tstack.push(ro);
+        onstack[ro] = true;
+        work.push((ro, bsuccs(ctx, st, bs[ro])));
         while let Some((v, succs)) = work.last_mut() {
             let v = *v;
             let Some(w) = succs.pop() else {
                 work.pop();
-                if low[&v] == index[&v] {
+                if low[v] == index[v] {
                     let mut scc = Vec::new();
                     while let Some(w) = tstack.pop() {
-                        onstack.remove(&w);
+                        onstack[w] = false;
                         scc.push(w);
                         if w == v {
                             break;
                         }
                     }
                     if scc.len() > 1 {
-                        out.extend(scc);
-                    } else if selfedge.contains(&scc[0]) {
-                        out.insert(scc[0]);
+                        out.extend(scc.iter().map(|&o| bs[o]));
+                    } else if selfedge[scc[0]] {
+                        out.insert(bs[scc[0]]);
                     }
                 }
                 if let Some(&(u, _)) = work.last() {
-                    let lv = low[&v];
-                    low.entry(u).and_modify(|l| *l = (*l).min(lv));
+                    low[u] = low[u].min(low[v]);
                 }
                 continue;
             };
-            if w == v {
-                selfedge.insert(v);
-            } else if !index.contains_key(&w) {
-                index.insert(w, next);
-                low.insert(w, next);
+            // A successor can be a block `blocks` didn't list (a
+            // terminator referencing outside region 0) — the old code
+            // treated it as a fresh node; grow the dense state to match.
+            let wo = match ord.get(&w) {
+                Some(&o) => o,
+                None => {
+                    let o = bs.len();
+                    bs.push(w);
+                    ord.insert(w, o);
+                    index.push(u32::MAX);
+                    low.push(0);
+                    onstack.push(false);
+                    selfedge.push(false);
+                    o
+                }
+            };
+            if wo == v {
+                selfedge[v] = true;
+            } else if index[wo] == u32::MAX {
+                index[wo] = next;
+                low[wo] = next;
                 next += 1;
-                tstack.push(w);
-                onstack.insert(w);
-                work.push((w, bsuccs(ctx, st, w)));
-            } else if onstack.contains(&w) {
-                let lw = low[&w];
-                low.entry(v).and_modify(|l| *l = (*l).min(lw));
+                tstack.push(wo);
+                onstack[wo] = true;
+                work.push((wo, bsuccs(ctx, st, w)));
+            } else if onstack[wo] {
+                low[v] = low[v].min(low[wo]);
             }
         }
     }

@@ -1848,12 +1848,12 @@ fn forward_single_store_d(
         let v = s.deref(ctx).get_operand(ctx, 0);
         let vt = v.get_type(ctx);
         let sb = s.deref(ctx).get_parent_block().unwrap();
-        let fwd = dom.idx.contains_key(&sb)
+        let fwd = dom.contains(sb)
             && loads.iter().all(|&l| {
                 let lb = l.deref(ctx).get_parent_block().unwrap();
                 // Unreachable loads never run (lowering traps those blocks).
                 l.deref(ctx).get_result(ctx, 0).get_type(ctx) == vt
-                    && (!dom.idx.contains_key(&lb)
+                    && (!dom.contains(lb)
                         || if lb == sb {
                             pos(ctx, s) < pos(ctx, l)
                         } else {

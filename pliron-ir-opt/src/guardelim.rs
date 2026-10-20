@@ -518,13 +518,13 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
     let mut reach: Vec<Ptr<BasicBlock>> = Vec::new();
     for &b in &bs {
-        if !dom.idx.contains_key(&b) {
+        if !dom.contains(b) {
             continue;
         }
         reach.push(b);
         for op in &bops[&b] {
             for s in op.deref(ctx).successors(ctx) {
-                if dom.idx.contains_key(&s) {
+                if dom.contains(s) {
                     preds.entry(s).or_default().push(b);
                 }
             }
@@ -730,7 +730,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
                     outt.insert(b, m);
                     for op in &bops[&b] {
                         for s in op.deref(ctx).successors(ctx) {
-                            if dom.idx.contains_key(&s) && inq.insert(s) {
+                            if dom.contains(s) && inq.insert(s) {
                                 wl.push(s);
                             }
                         }
