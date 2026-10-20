@@ -292,6 +292,12 @@ struct CalleeTags {
     blocks: Vec<(Ptr<BasicBlock>, u8)>,
     ops: Vec<(Ptr<Operation>, u16)>,
     vals: Vec<(Value, u8)>,
+    /// Min/max/count of value uids, op ords and block ords in the region-0
+    /// walk — bounds for the dense `IrMapping` (out-of-range keys spill to
+    /// hashing; counts bound the dense fill ratio).
+    vb: (usize, usize, usize),
+    ob: (usize, usize, usize),
+    bb: (usize, usize, usize),
 }
 
 fn tag_value(tags: &mut CalleeTags, st: &State, v: Value) {
@@ -322,7 +328,12 @@ fn tag_value(tags: &mut CalleeTags, st: &State, v: Value) {
 fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags {
     let src = blocks(ctx, callee);
     let mut tags = CalleeTags::default();
+    let (mut vlo, mut vhi, mut nv) = (usize::MAX, 0usize, 0usize);
+    let (mut olo, mut ohi, mut no) = (usize::MAX, 0usize, 0usize);
+    let (mut blo, mut bhi) = (usize::MAX, 0usize);
     for &b in &src {
+        blo = blo.min(b.ord());
+        bhi = bhi.max(b.ord());
         let mut bm = 0;
         if st.region_blocks.contains(b) {
             bm |= B_REGION;
@@ -337,9 +348,17 @@ fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags 
             tags.blocks.push((b, bm));
         }
         for a in b.deref(ctx).arguments(ctx) {
+            let u = a.uid() as usize;
+            vlo = vlo.min(u);
+            vhi = vhi.max(u);
+            nv += 1;
             tag_value(&mut tags, st, a);
         }
         for op in b.deref(ctx).iter(ctx) {
+            let o = op.ord();
+            olo = olo.min(o);
+            ohi = ohi.max(o);
+            no += 1;
             let mut m = 0;
             if st.calls.contains(op) {
                 m |= OP_CALLS;
@@ -378,10 +397,19 @@ fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags 
                 tags.ops.push((op, m));
             }
             for v in op.deref(ctx).results(ctx) {
+                let u = v.uid() as usize;
+                vlo = vlo.min(u);
+                vhi = vhi.max(u);
+                nv += 1;
                 tag_value(&mut tags, st, v);
             }
         }
     }
+    // usize::MAX lo means the callee had no entity of that kind — the
+    // range then wraps to nothing and every key hashes.
+    tags.vb = (vlo.min(vhi), vhi, nv);
+    tags.ob = (olo.min(ohi), ohi, no);
+    tags.bb = (blo.min(bhi), bhi, src.len());
     tags.src = src;
     tags
 }
@@ -2324,7 +2352,7 @@ fn inline_call(
     };
 
     let src = &tags.src;
-    let mut map = IrMapping::new();
+    let mut map = IrMapping::bounded(tags.vb, tags.ob, tags.bb);
     clone_blocks_into(src, region, ctx, rw, &mut map);
     // Region ids are `Ptr<BasicBlock>`s in the source's block space: every
     // record copied below must remap through `map` so a tag anchored at
