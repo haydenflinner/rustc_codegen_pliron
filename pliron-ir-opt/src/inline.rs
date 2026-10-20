@@ -1024,11 +1024,11 @@ pub fn run(
     // `PLIRON_INLINE_HIST=0` lets a site cloned out of an inlined body
     // inline a callee already on its clone chain (`State::inline_hist`).
     let hist = crate::pass_enabled("PLIRON_INLINE_HIST");
-    // `PLIRON_INLINE_SCC=1`: a site cloned out of an inlined body may not
+    // `PLIRON_INLINE_SCC` (`=0` disables): a site cloned out of an inlined body may not
     // inline a callee in its caller's own (nontrivial) call-graph SCC —
     // LLVM's CGSCC rule for edges inlining created inside an SCC. Original
     // sites still inline one level; re-entering the recursion stops.
-    let scc: FxHashMap<String, u32> = if crate::env_is("PLIRON_INLINE_SCC", "1") {
+    let scc: FxHashMap<String, u32> = if crate::pass_enabled("PLIRON_INLINE_SCC") {
         scc_ids(ctx, st)
     } else {
         FxHashMap::default()
