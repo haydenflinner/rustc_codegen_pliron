@@ -3773,6 +3773,55 @@ fn dominated_conds(
     folds
 }
 
+/// Would aliasing `p -> v` leave `v`'s def reading its own result?
+/// The dominance check in `remove_trivial_params` is block-granular: it
+/// can't see `v`'s def reading `p` (a latch `p + k` when the loop header's
+/// only surviving pred is the latch — threading can strand a loop like
+/// that). Walk `v`'s operands through aliases, and through the edge args
+/// that feed block-param defs; past the budget conservatively answers
+/// yes, which only leaves the param unremoved.
+fn reads_param(func: &Function, cfg: &ControlFlowGraph, v: Value, p: Value) -> bool {
+    let mut stack = vec![func.dfg.resolve_aliases(v)];
+    let mut seen = FxHashSet::default();
+    while let Some(w) = stack.pop() {
+        if w == p {
+            return true;
+        }
+        if !seen.insert(w) || seen.len() > 256 {
+            return true;
+        }
+        match func.dfg.value_def(w) {
+            ValueDef::Result(i, _) => stack.extend(
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .map(|&a| func.dfg.resolve_aliases(a))
+                    .collect::<Vec<_>>(),
+            ),
+            ValueDef::Param(b, _) => {
+                for t in cfg.pred_iter(b) {
+                    let i = t.inst;
+                    for bc in func.dfg.insts[i].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    ) {
+                        if bc.block(&func.dfg.value_lists) == b {
+                            stack.extend(bc.args(&func.dfg.value_lists).filter_map(|a| {
+                                match a {
+                                    BlockArg::Value(av) => Some(func.dfg.resolve_aliases(av)),
+                                    _ => None,
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Block params whose every incoming `jump`/`brif` arg is one value `v` (or
 /// the param itself) become aliases of `v`. Threading's SSA repair creates
 /// these, and Cranelift only removes them after our condition folding ran, so
@@ -3854,6 +3903,7 @@ pub fn remove_trivial_params(
                 && let Some(d) = def_block(func, v)
                 && d != b
                 && dt.try_dominates(d, b, &func.layout)
+                && !reads_param(func, cfg, v, ps[i])
             {
                 rm.push((b, i, ps[i], v));
             }
@@ -4690,6 +4740,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// security_framework `ItemAddOptions::to_dictionary`: threading
+    /// leaves a dead two-block loop whose header param's only incoming
+    /// value is the latch's `p + 16`. The latch dominates the header, so
+    /// the single-value check passes — but aliasing `p -> inc` makes the
+    /// `iadd` read its own result. `remove_trivial_params` must skip it.
+    #[test]
+    fn trivial_param_must_not_self_reference() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (head, inc) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let head = builder.create_block();
+            let latch = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(head, types::I64); // p
+
+            builder.switch_to_block(entry);
+            builder.ins().return_(&[]);
+
+            builder.switch_to_block(head);
+            let p = builder.block_params(head)[0];
+            let eight = builder.ins().iconst(types::I64, 8);
+            let c = builder.ins().icmp(IntCC::Equal, p, eight);
+            builder.ins().brif(c, exit, &[], latch, &[]);
+
+            builder.switch_to_block(latch);
+            let sixteen = builder.ins().iconst(types::I64, 16);
+            let inc = builder.ins().iadd(p, sixteen);
+            builder.ins().jump(head, &[inc.into()]);
+
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (head, inc)
+        };
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&func, &cfg);
+        let al = super::remove_trivial_params(&mut func, &cfg, &dt);
+        assert!(al.is_empty(), "self-referential param alias: {al:?}");
+        let _ = (head, inc);
+        cranelift_codegen::verify_function(
+            &func,
+            &cranelift_codegen::settings::Flags::new(
+                cranelift_codegen::settings::builder(),
+            ),
+        )
+        .expect("verifier");
     }
 }
 
