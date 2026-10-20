@@ -2294,6 +2294,33 @@ fn peep_body_opts(
     // `get T` restores them; `last_write`/`loop_gets` feed the
     // dead-write checks (a `get` inside a containing loop reads the
     // in-loop write via the backedge).
+    // Locals written inside each `loop` body (header ins idx -> set):
+    // carried facts (`copymap`/`last_write`/`fmap`) can't flow into a
+    // `loop` for locals the body rewrites — a loop-top read may see a
+    // later iteration's value, not the entry-edge one.
+    let mut loop_writes: FxHashMap<usize, FxHashSet<u32>> = FxHashMap::default();
+    {
+        let mut stk: Vec<(u8, usize)> = Vec::new();
+        for (i, &(k, ..)) in ins.iter().enumerate() {
+            match k {
+                WPeek::Ctl => match b[ins[i].1] {
+                    op @ (0x02 | 0x03 | 0x04) => stk.push((op, i)),
+                    0x0b => {
+                        stk.pop();
+                    }
+                    _ => {}
+                },
+                WPeek::Set(t) | WPeek::Tee(t) | WPeek::Nop(t) => {
+                    for &(op, hi) in &stk {
+                        if op == 0x03 {
+                            loop_writes.entry(hi).or_default().insert(t);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     if crate::env_get("PLIRON_WASM_WALIAS") != Some("0") {
         // Mode bits: 1=set/get pair-cancel, 2=get;drop, 4=dead-write,
         // 8=copy-forward.
@@ -2405,11 +2432,6 @@ fn peep_body_opts(
         // `br_table`/`return`/`unreachable` kill the fallthrough edge
         // so an `end` merge must not count it.
         let mut reach = true;
-        // Locals written inside each `loop` body (header ins idx ->
-        // set). `copymap`/`last_write` can't flow into a `loop` for
-        // locals the body writes: a `get T` at loop-top may read a
-        // *later* iteration's write, not the entry-edge value.
-        let mut loop_writes: FxHashMap<usize, FxHashSet<u32>> = FxHashMap::default();
         // `ins_span[i]` = straight-line span id: bumps at every control
         // boundary (block/loop/if/else/end/br*/ret/unreachable — not
         // calls). A `set T` may eager-delete a prior dead write only in
@@ -2417,31 +2439,11 @@ fn peep_body_opts(
         // span may be live on another path's merge.
         let mut ins_span = vec![0u32; ins.len()];
         {
-            let mut stk: Vec<(u8, usize)> = Vec::new();
             let mut span = 0u32;
             for (i, &(k, ..)) in ins.iter().enumerate() {
                 ins_span[i] = span;
                 match k {
-                    WPeek::Ctl => match b[ins[i].1] {
-                        op @ (0x02 | 0x03 | 0x04) => {
-                            stk.push((op, i));
-                            span += 1;
-                        }
-                        0x0b => {
-                            stk.pop();
-                            span += 1;
-                        }
-                        0x05 | 0x0c | 0x0d | 0x0e | 0x00 | 0x0f => span += 1,
-                        _ => {}
-                    },
-                    WPeek::Br(_) | WPeek::BrIf(_) => span += 1,
-                    WPeek::Set(t) | WPeek::Tee(t) | WPeek::Nop(t) => {
-                        for &(op, hi) in &stk {
-                            if op == 0x03 {
-                                loop_writes.entry(hi).or_default().insert(t);
-                            }
-                        }
-                    }
+                    WPeek::Ctl | WPeek::Br(_) | WPeek::BrIf(_) => span += 1,
                     _ => {}
                 }
             }
@@ -3197,8 +3199,21 @@ fn peep_body_opts(
         // dead: `Del` the addr `get` and turn the store into `drop`
         // (its two pushes → one pop: net-0). Forwarded loads read the
         // captured local, not memory, so they never expose.
-        let mut fmap: FxHashMap<(u32, u32), (u32, u8, usize, usize, bool)> =
-            FxHashMap::default();
+        type FM = FxHashMap<(u32, u32), (u32, u8, usize, usize, bool)>;
+        let mut fmap: FM = FxHashMap::default();
+        // `fmap` merges across structured control like `copymap`/`last_write`:
+        // an entry survives an `end` iff every incoming path holds the
+        // same (fwd, sop, s_ins, a_ins) — `exposed` ORs in case one path
+        // saw an unforwarded read. Loop-entry kills entries whose base
+        // or forwarding local the body rewrites; `br` to `loop`
+        // (backedge) never snapshots.
+        struct FF {
+            op: u8,
+            saved: Option<FM>,
+            snaps: Vec<FM>,
+        }
+        let mut fpath: Vec<FF> = Vec::new();
+        let mut freach = true;
         // Rewrites are collected, not applied mid-scan: `dead` hides a
         // deleted `get B` from `prev_e`/`get_of` and `repl` respells a
         // forwarded load as the `get` it becomes, so later producer
@@ -3332,11 +3347,119 @@ fn peep_body_opts(
         for i in 0..ins.len() {
             match ins[i].0 {
                 WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
-                if dbg && !fmap.is_empty() {
-                    eprintln!("  ctl@{i} cleared {} entries", fmap.len());
+                let op = match ins[i].0 {
+                    WPeek::Br(_) => 0x0c,
+                    WPeek::BrIf(_) => 0x0d,
+                    _ => b[ins[i].1],
+                };
+                let fsnap_to = |d: u32, fpath: &mut Vec<FF>, fm: &FM| {
+                    let idx = fpath.len().wrapping_sub(1 + d as usize);
+                    if let Some(f) = fpath.get_mut(idx)
+                        && f.op != 0x03
+                    {
+                        f.snaps.push(fm.clone());
+                    }
+                };
+                match op {
+                    0x02 => fpath.push(FF {
+                        op,
+                        saved: None,
+                        snaps: Vec::new(),
+                    }),
+                    0x03 => {
+                        fpath.push(FF {
+                            op,
+                            saved: None,
+                            snaps: Vec::new(),
+                        });
+                        if let Some(ws) = loop_writes.get(&i) {
+                            fmap.retain(|&(b2, _), &mut e| {
+                                !ws.contains(&b2) && !ws.contains(&e.0)
+                            });
+                        }
+                    }
+                    0x04 => fpath.push(FF {
+                        op,
+                        saved: Some(fmap.clone()),
+                        snaps: Vec::new(),
+                    }),
+                    0x05 => {
+                        if let Some(f) = fpath.last_mut() {
+                            if freach {
+                                f.snaps.push(fmap.clone());
+                            }
+                            if let Some(s) = f.saved.take() {
+                                fmap = s;
+                            }
+                        }
+                        freach = true;
+                    }
+                    0x0b => {
+                        if let Some(mut f) = fpath.pop() {
+                            let mut bags = std::mem::take(&mut f.snaps);
+                            if freach {
+                                bags.push(std::mem::take(&mut fmap));
+                            }
+                            if let Some(s) = f.saved {
+                                bags.push(s);
+                            }
+                            freach = !bags.is_empty();
+                            let mut it = bags.into_iter();
+                            let mut fm = it.next().unwrap_or_default();
+                            for c in it {
+                                fm.retain(|k, e| match c.get(k) {
+                                    Some(e2)
+                                        if e2.0 == e.0
+                                            && e2.1 == e.1
+                                            && e2.2 == e.2
+                                            && e2.3 == e.3 =>
+                                    {
+                                        e.4 |= e2.4;
+                                        true
+                                    }
+                                    _ => false,
+                                });
+                            }
+                            fmap = fm;
+                        }
+                    }
+                    0x0c | 0x0d => {
+                        if freach {
+                            let d = match ins[i].0 {
+                                WPeek::Br(d) | WPeek::BrIf(d) => d,
+                                _ => {
+                                    let mut p = ins[i].1 + 1;
+                                    urd(b, &mut p).unwrap_or(0)
+                                }
+                            };
+                            fsnap_to(d, &mut fpath, &fmap);
+                        }
+                        if op == 0x0c {
+                            freach = false;
+                        }
+                    }
+                    0x0e => {
+                        if freach {
+                            let mut p = ins[i].1 + 1;
+                            let n = urd(b, &mut p).unwrap_or(0);
+                            for _ in 0..=n {
+                                let d = urd(b, &mut p).unwrap_or(0);
+                                fsnap_to(d, &mut fpath, &fmap);
+                            }
+                        }
+                        freach = false;
+                    }
+                    0x00 | 0x0f => freach = false,
+                    // calls and misc `Ctl`s kill slot facts (a callee
+                    // may write any reachable memory).
+                    _ => {
+                        if dbg && !fmap.is_empty() {
+                            eprintln!("  ctl@{i} cleared {} entries", fmap.len());
+                        }
+                        n_clear += 1;
+                        fmap.clear();
+                    }
                 }
-                n_clear += 1;
-                fmap.clear();
             }
                 WPeek::Set(l) | WPeek::Tee(l) => {
                     let pre: Vec<_> = if dbg { fmap.keys().copied().collect() } else { Vec::new() };
@@ -4254,11 +4377,13 @@ mod wpeep_tests {
                 0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
                 0x02, 0x40, // block
                 0x0b, // end
-                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — stays
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0
             ],
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
-        assert!(has_seq(&out, &[0x20, 0x00, 0x28, 0x02, 0x00]), "unsound fwd: {out:02x?}");
+        // The store's slot fact crosses the empty block's `end` — the
+        // load forwards to the stored value's local (index 1).
+        assert!(has_seq(&out, &[0x20, 0x01]), "no fwd: {out:02x?}");
     }
 
     // A *computed* stored value (`i32.add`, not a `local.get`) is
