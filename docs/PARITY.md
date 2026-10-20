@@ -138,11 +138,14 @@ binary. The object-level kernel diffs and the later alternating A/B
 Where the rest is (samply on syn, `harness/sprof.py`): flat — IR-opt
 ~27% of samples (inliner cloning ~5%, sroa ~3.5%, nocapture ~3.6%), the
 CLIF pipeline spread over ~90 steps, allocator/zone dispatch ~8%. Next:
-(1) live `xcgu` copies
-whose home definition is `External` could call the home symbol instead of
-compiling a local copy (~17% of syn's pipeline time is duplicate
-instances; redirect before `sret2reg` gives them the internal ABI);
-(2) the regex-syntax native wall is gated by the biggest
+(1) ~17% of syn's pipeline time is functions fully optimized in more than
+one CGU, but live `xcgu` extras are only 4.5% of optimized ops — the rest
+is rustc's own per-CGU local copies (`#[inline]`, drop glue), which LLVM
+compiles per CGU too; redirecting live extras to their home symbol isn't
+worth the ABI risk (`sret2reg`). (2) `slp::xpack_block` rebuilds the
+whole-function use index after every applied pack (`Analysis::uses` keys
+on `num_insts`): 2.3% of syn's samples; an incremental append of the new
+insts' uses would remove it. (3) the regex-syntax native wall is gated by the biggest
 CGU's IR-opt before its fact publish (other CGUs' stage B parks on it).
 
 regex-syntax, one `rustc -O` (release dylib), 11.6 s wall:
