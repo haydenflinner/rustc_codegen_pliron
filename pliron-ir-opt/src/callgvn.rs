@@ -358,11 +358,26 @@ fn run_fn(ctx: &mut Context, st: &State, fop: Ptr<Operation>) {
     if bs.is_empty() {
         return;
     }
+    let bops: ColMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
+        bs.iter().map(|&b| (b, ops(ctx, b))).collect();
+    // Dedup, dead-call elim and the loop hoist all act on callsites only
+    // (`gone`/`killed` carry CallOps; hoists move them) — a call-free
+    // function can't fire anywhere, so skip the domtree + write scans.
+    let mut has_call = false;
+    'outer: for &b in &bs {
+        for &op in &bops[b] {
+            if Operation::is_op::<CallOp>(op, ctx) {
+                has_call = true;
+                break 'outer;
+            }
+        }
+    }
+    if !has_call {
+        return;
+    }
     let Some(dom) = Dom::new(ctx, st, fop) else {
         return;
     };
-    let bops: ColMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
-        bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     // Write-flag per block plus succ/pred edges for the path & loop walks.
     // Allocas handed to a call anywhere in the function: a callee reads
     // through pointer args, so a store into one of these is an observable
