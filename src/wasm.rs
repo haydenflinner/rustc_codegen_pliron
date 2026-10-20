@@ -3134,6 +3134,7 @@ fn peep_body_opts(
             ins[m].0 = WPeek::Del; // the `get B` addr
             ins[i].0 = WPeek::Get(vx);
         }
+        inserts.sort_by_key(|(pos, _)| *pos);
         for (k, (pos, t)) in inserts.into_iter().enumerate() {
             ins.insert(pos + k, t);
         }
