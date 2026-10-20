@@ -8798,15 +8798,18 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
             return false;
         };
         // `select c, 1, 0` ≡ truthy(c): alias a canonical bool c, else
-        // `icmp ne/eq c, 0`. `c` may be wider than the i8 result
-        // (armmerge's `select (band.i32 ..), 1, 0`): the zero takes
-        // `c`'s type and only an i8 `c` can stand in for the result.
-        let cty = pos.func.dfg.value_type(c);
+        // `icmp ne/eq c, 0`. `c` can be wider than the i8 result
+        // (`band.i64 x, 1` proves 0/1 through `is01`) — the alias is only
+        // same-type, and the compare's zero rides `c`'s width.
+        let ct = pos.func.dfg.value_type(c);
+        if !ct.is_int() || ct.is_vector() {
+            return false;
+        }
         if !neg {
-            if cty == types::I8 && is01(pos.func, c, 4) {
+            if ct == types::I8 && is01(pos.func, c, 4) {
                 return alias_to(pos, inst, res, c);
             }
-            let z = pos.ins().iconst(cty, 0);
+            let z = kcon(pos, ct, ct.bits(), 0);
             pos.func.dfg.insts[inst] = InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
                 cond: IntCC::NotEqual,
@@ -8824,7 +8827,7 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
             };
             return true;
         }
-        let z = pos.ins().iconst(cty, 0);
+        let z = kcon(pos, ct, ct.bits(), 0);
         pos.func.dfg.insts[inst] = InstructionData::IntCompare {
             opcode: Opcode::Icmp,
             cond: IntCC::Equal,
@@ -12661,5 +12664,44 @@ mod tests {
             func.display()
         );
         dem64_verify(&func, "iconst128 post_sweep bandk");
+    }
+
+    /// `select c, 1, 0` folds to `c` via `alias_to` — but `c` (the
+    /// condition) may be wider than the i8 result (`band.i64 x, 1`
+    /// proves 0/1 through `is01`). Aliasing an i8 result to the i64
+    /// condition is a cross-type alias; `alias_to` removes the select
+    /// first, so the skipped write strands `res`
+    /// (concurrent_queue::pop: `return v970` of a detached def).
+    /// Truthy on a wide cond is `icmp ne c, 0` at `c`'s width.
+    #[test]
+    fn post_sweep_wide_cond_select_no_cross_alias() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I8));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let p = func.dfg.append_block_param(entry, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let m = cur.ins().iconst(types::I64, 1);
+        let c = cur.ins().band(p, m);
+        let one = cur.ins().iconst(types::I8, 1);
+        let zero = cur.ins().iconst(types::I8, 0);
+        let s = cur.ins().select(c, one, zero);
+        cur.ins().return_(&[s]);
+
+        let n = iconst128(&mut func, true);
+        assert!(n > 0, "expected the select fold to fire:\n{}", func.display());
+        // The i8 result must not alias to the i64 condition.
+        dem64_verify(&func, "post_sweep wide-cond select");
+        assert!(
+            func.layout.block_insts(entry).any(|i| {
+                func.dfg.insts[i].opcode() == Opcode::Icmp
+                    || func.dfg.insts[i].opcode() == Opcode::Select
+            }),
+            "expected icmp ne or the select to survive:\n{}",
+            func.display()
+        );
     }
 }
