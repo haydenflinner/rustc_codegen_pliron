@@ -38,6 +38,45 @@ use crate::{address_taken, has_body};
 
 type Vals = SmallVec<[ir::Value; 2]>;
 
+/// `State::region_frozen_op` restricted to one function, in CLIF values.
+/// Probes the function's own lowered values: the table is a dense column
+/// over every pliron value in the CGU, so walking it once per function was
+/// O(functions × CGU values). Hits apply in key-ordinal order — the order
+/// the table walk produced — so the per-value lists come out identical.
+fn operand_frozen_of(
+    st: &State,
+    vals: &FxHashMap<Value, Vals>,
+    cconst: &FxHashMap<Value, Vals>,
+) -> FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>> {
+    let mut out = FxHashMap::default();
+    if st.region_frozen_op.is_empty() {
+        return out;
+    }
+    let mut hits: Vec<(Value, ir::Value)> = Vec::new();
+    for (&pv, vs) in vals {
+        if let Some(&v) = vs.first()
+            && st.region_frozen_op.get(pv).is_some()
+        {
+            hits.push((pv, v));
+        }
+    }
+    for (&pv, vs) in cconst {
+        if !vals.contains_key(&pv)
+            && let Some(&v) = vs.first()
+            && st.region_frozen_op.get(pv).is_some()
+        {
+            hits.push((pv, v));
+        }
+    }
+    hits.sort_unstable_by_key(|&(pv, _)| pv.uid());
+    for (pv, v) in hits {
+        out.entry(v)
+            .or_insert_with(Vec::new)
+            .extend_from_slice(&st.region_frozen_op[pv]);
+    }
+    out
+}
+
 /// Recover the scratch tables from a finished `FnLower`, clearing them
 /// for the next function — a macro rather than a `&mut FnLower` method
 /// because `fl.b.finalize`/`fl.lifetimes` leave `fl` partially moved.
@@ -1126,18 +1165,7 @@ pub fn lower_module<'a>(
                 // Caller-side operands of `noalias readonly` clone params, in
                 // CLIF values (`State::region_frozen_op`): `*v` is immutable
                 // while the binding clone runs — loadfwd's scoped immunity.
-                let mut ofz = FxHashMap::default();
-                for (pv, rs) in fl.st.region_frozen_op.iter() {
-                    if let Some(&v) = fl
-                        .vals
-                        .get(&pv)
-                        .or_else(|| fl.cconst.get(&pv))
-                        .and_then(|vs| vs.first())
-                    {
-                        ofz.entry(v).or_insert_with(Vec::new).extend_from_slice(rs);
-                    }
-                }
-                operand_frozen = ofz;
+                operand_frozen = operand_frozen_of(fl.st, &fl.vals, &fl.cconst);
                 stubs = std::mem::take(&mut fl.stubs);
                 prof = block_region
                     .iter()
@@ -1856,20 +1884,7 @@ pub fn lower_clif_wasm(
                 })
                 .collect();
             fl.b.finalize(cfg);
-            let mut operand_frozen = FxHashMap::default();
-            for (pv, rs) in fl.st.region_frozen_op.iter() {
-                if let Some(&v) = fl
-                    .vals
-                    .get(&pv)
-                    .or_else(|| fl.cconst.get(&pv))
-                    .and_then(|vs| vs.first())
-                {
-                    operand_frozen
-                        .entry(v)
-                        .or_insert_with(Vec::new)
-                        .extend_from_slice(rs);
-                }
-            }
+            let operand_frozen = operand_frozen_of(fl.st, &fl.vals, &fl.cconst);
             let prof = fl
                 .block_region
                 .iter()
