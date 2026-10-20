@@ -309,7 +309,11 @@ Next steps, in expected-payoff order:
    36/36, ~2% CPU (~19.9 vs ~20.3 user-s), wall flat. One follow-up
    measured negative and was reverted: storing the operand index in
    the use slot for O(1) `try_find_index` (−0.5% — the extra slot
-   field costs more than the small operand scans it saves). Conclusion:
+   field costs more than the small operand scans it saves). Follow-ups:
+   dense per-block scratch in `Dom::new`/`loop_blocks` (`669f623`) and
+   lazy `blocks_iter`/`ops_iter` over the intrusive op/block lists in
+   read-only scans (`c47cb77` — mutating or indexed callers keep
+   snapshot Vecs) — byte-identical again, ~0.6% user. Conclusion:
    per-use hashing was never the bottleneck — the ~20 CPU-s is
    intrinsic `RefCell`-arena access volume spread across every pass;
    LLVM does this compile in ~4.5 CPU-s, so the remaining gap is
