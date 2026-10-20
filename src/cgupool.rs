@@ -668,6 +668,21 @@ fn declare_fn_sym(
     op
 }
 
+/// `PLIRON_DUMPFN=<substr>`: dump the pliron IR of matching functions
+/// after select IR-opt phases (`pliron::dump` tracing target) — the
+/// per-function counterpart to `PLIRON_DUMP_OPT`'s whole-module dumps.
+fn dumpfn(ctx: &Context, st: &State, phase: &str) {
+    let Some(want) = env_get("PLIRON_DUMPFN") else {
+        return;
+    };
+    for (name, f) in &st.funcs {
+        if !name.contains(&want) || !pliron_ir_opt::has_body(ctx, f.op) {
+            continue;
+        }
+        tracing::info!(target: "pliron::dump", "==== {phase} {name} ====\n{}", f.op.deref(ctx).disp(ctx));
+    }
+}
+
 fn print_ir(ctx: &Context, module: Ptr<Operation>) -> String {
     module.deref(ctx).disp(ctx).to_string()
 }
@@ -907,6 +922,7 @@ pub(crate) fn iropt_head(
     if pass_enabled("PLIRON_PHISIMP") {
         pt!(prof, cgu, "phisimp", phisimp::run(ctx, st));
         pt!(prof, cgu, "domcheck:ps", domcheck::run(ctx, st, "phisimp"));
+        dumpfn(ctx, st, "phisimp");
     }
     // Run ahead of sroa: its `copyable_arg` check consults `st.nowrite`
     // and `st.nocapture` to decide which call args can take a fresh copy.
@@ -919,6 +935,7 @@ pub(crate) fn iropt_head(
     if pass_enabled("PLIRON_SROA") {
         pt!(prof, cgu, "sroa", sroa::run(ctx, st));
         pt!(prof, cgu, "domcheck:sroa", domcheck::run(ctx, st, "sroa"));
+        dumpfn(ctx, st, "sroa");
     }
     if pass_enabled("PLIRON_CONSTLOAD") {
         pt!(prof, cgu, "constload", constload::run(ctx, st));
