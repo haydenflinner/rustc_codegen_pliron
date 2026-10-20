@@ -140,3 +140,44 @@ Module size: 204KB vs LLVM 97KB — the residual is codegen density
   `PLIRON_*` flips do apply (no cargo-fingerprint staleness).
 - `PLIRON_WASM_SFWD=0`, `PLIRON_WASM_BRF=0`, `PLIRON_WASM_HOT`,
   `PLIRON_WASM_AUDIT=panic` are the wpeep knobs.
+
+## licm invariant-chain hoist (bc2e169 — geomean 0.966)
+
+Extended `licm` from `get;get;binop` triples to contiguous
+self-contained pure runs: `get`s of loop-unwritten locals, consts,
+non-trapping unary/binary ops producing one value. `hmget`'s tag
+broadcast (`get h2;const25;shr;wrap;and;extend;constB;mul`) and
+pointer/stride math hoist to `run;set T` + `get T` per iteration.
+
+Soundness notes: `depth == 1` marks a complete expression (net stack
+effect); `written` covers `Nop` (deleted get;set still writes);
+`prel` KOS anchors inside a run are barriers (a `prel`-get at a
+hoisted instr's index lands in the preamble and becomes a chain
+operand — the `spec_from_iter` `local.set` underflow).
+
+`PLIRON_WASM_LICM_CHAIN=0` / `=dbg` knob. Module +210B preamble.
+
+## Residual state (post-licm)
+
+Geomean **0.966** (was 0.971). Module 204,706B vs LLVM 97,262B.
+
+| kernel | gap | dominant |
+|---|---|---|
+| strwork | +17% | `spec_extend`/`Chars::next` codegen density — `xor;and;lt_s` UTF8-boundary ~5 ops vs LLVM `and;eqz`; `k_strwork` 2374 toks vs `strwork::run` 488 |
+| hashmap | +15% | `hashmap::run` 1863 ins — SipHash state + probe loop; `local.set` spill threading |
+| hmget | +13% | probe loop `local.set`/`get` — LLVM keeps tag/h2 in locals; computed `base+idx` addr defeats `sfwd` |
+| tokenize | +13% | `k_tokenize` 213 vs LLVM 403 — `tokenize::run` inlined differently; iter/`next` density |
+| fib | +9% | `k_fib` 29 toks — `fib` inlined? — V8 inline-cap sensitive |
+| chars_ascii | +7% | `spec_extend`/`Iter::all` — `is_ascii` `x&128==0` vs `xor;and;lt_s` |
+| chars_mixed | +6% | same iter density |
+| nbody | +4% | `advance` f64 loop — `local.set`/`get` temporaries |
+| sortw/sieve/eqbug | ±3% | noise |
+
+**Structural**: CLIF SSA→wasm-locals threading (~2x `local.*` ops vs
+LLVM operand-stack). `walias`/`copymap`/`sfwd`/`licm` handle the
+`get`-produced and store→load cases; the residual is `set(OTHER)`
+locals (arith/load results) that are legitimately loop-carried.
+
+Next candidates: `xor(x,C)^D` / `and<mask` clifpeep folds for the
+UTF8-boundary shape; `spec_extend`/`Chars::next` density is the
+shared hot path for strwork/tokenize/chars/iterw/parse.
