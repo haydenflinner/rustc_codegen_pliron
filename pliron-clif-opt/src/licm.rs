@@ -119,16 +119,27 @@ fn clobbers(
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    scoped_na: &FxHashSet<Value>,
 ) -> bool {
     // A `noalias`+`readonly` (`deref` with `!writable`) pointee is
     // exclusively read through this root for the call's duration —
     // no store or call in the loop may write it (writing through the
     // root is UB; writing through any other pointer violates
     // `noalias`). Nothing can clobber the loc.
-    // A peeled fact (`deref_fact`) only covers the param's own bytes.
+    // A peeled fact (`deref_fact`) only covers the param's own bytes. A
+    // region-scoped seed (`scoped_na`: an inlined clone's `&T` operand)
+    // is read-only only while the clone runs, not across the caller's
+    // loop (licm_scoped_na).
+    // A fact borrowed from an entry param through the peel is
+    // function-wide even when `v` itself is scoped.
     if let Root::V(v) = loc.0
         && deref_fact(func, ps, deref, v).is_some_and(|(bytes, writable, k)| {
-            !writable && (deref.contains_key(&v) || covers(bytes, k.wrapping_add(loc.1), loc.2))
+            !writable
+                && if deref.contains_key(&v) {
+                    !scoped_na.contains(&v)
+                } else {
+                    covers(bytes, k.wrapping_add(loc.1), loc.2)
+                }
         })
     {
         return false;
@@ -225,6 +236,7 @@ fn hoists(
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    scoped_na: &FxHashSet<Value>,
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
     rpar: &pliron::cols::ColMap<Region, Region>,
@@ -393,7 +405,7 @@ fn hoists(
     }
     let nw_w = writers
         .iter()
-        .filter(|&&w| clobbers(func, ps, w, loc, iso, nw, deref))
+        .filter(|&&w| clobbers(func, ps, w, loc, iso, nw, deref, scoped_na))
         .count();
     if dbg {
         if pliron_cfg::tracing_on() {
@@ -401,7 +413,7 @@ fn hoists(
         };
         for &w in writers {
             if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
-                && clobbers(func, ps, w, loc, iso, nw, deref)
+                && clobbers(func, ps, w, loc, iso, nw, deref, scoped_na)
             {
                 let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
                 if pliron_cfg::tracing_on() {
@@ -428,6 +440,7 @@ fn run_loop(
     iso: &FxHashSet<Root>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    scoped_na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
     debug: bool,
     scoped: &FxHashMap<Inst, Region>,
@@ -578,7 +591,7 @@ fn run_loop(
                     break;
                 }
                 if hoists(
-                    func, ps, na, &inv, &writers, iso, nw, deref, scoped, breg, rpar, ofz, pb, i,
+                    func, ps, na, &inv, &writers, iso, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i,
                 ) {
                     if debug {
                         if pliron_cfg::tracing_on() {
@@ -758,7 +771,7 @@ fn run_loop(
     }
     cn + n
         + promote(
-            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, nw, ofz, debug,
+            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, scoped_na, nw, ofz, debug,
         )
 }
 
@@ -777,6 +790,7 @@ fn promote(
     iso: &FxHashSet<Root>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    scoped_na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     debug: bool,
@@ -995,6 +1009,7 @@ fn promote(
             iso_l,
             nw,
             deref,
+            scoped_na,
             debug,
         );
     }
@@ -1020,6 +1035,7 @@ fn promote_loc(
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
+    scoped_na: &FxHashSet<Value>,
     debug: bool,
 ) -> usize {
     let ty = loc.2;
@@ -1243,7 +1259,7 @@ fn promote_loc(
             {
                 seed = Some(func.dfg.resolve_aliases(args[0]));
             }
-            _ if clobbers(func, ps, i, loc, iso, nw, deref) => seed = None,
+            _ if clobbers(func, ps, i, loc, iso, nw, deref, scoped_na) => seed = None,
             _ => {}
         }
     }
@@ -1406,6 +1422,7 @@ pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
     noalias: &FxHashSet<Value>,
+    scoped_na: &FxHashSet<Value>,
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
@@ -1419,7 +1436,7 @@ pub fn run(
     la.compute(func, cfg, dt);
     let ps = &loadfwd::param_src(func);
     let (iso, escapes, _) =
-        loadfwd::isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default());
+        loadfwd::isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default(), scoped_na);
     // Operand-frozen values name their own scope roots (same merged set
     // loadfwd uses): peeling past one would lose the `ofz` claim before the
     // region check can apply it.
@@ -1457,7 +1474,7 @@ pub fn run(
         let n2 = {
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
-                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, nw, debug, scoped, breg,
+                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, scoped_na, nw, debug, scoped, breg,
                 rpar, ofz,
             )
         };
@@ -1548,6 +1565,7 @@ mod tests {
             &mut func,
             &mut crate::pipeline::Analysis::default(),
             &FxHashSet::default(),
+            &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
@@ -1607,6 +1625,7 @@ mod tests {
         run(
             &mut func,
             &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
@@ -1677,6 +1696,7 @@ mod tests {
         run(
             &mut func,
             &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
@@ -1758,6 +1778,7 @@ mod tests {
         run(
             &mut func,
             &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
             &FxHashSet::default(),
             &deref,
             &FxHashMap::default(),
@@ -1845,6 +1866,7 @@ mod tests {
         run(
             &mut func,
             &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
             &FxHashSet::default(),
             &deref,
             &FxHashMap::default(),
@@ -1936,6 +1958,7 @@ mod tests {
                 &mut func,
                 &mut crate::pipeline::Analysis::default(),
                 &na,
+                &FxHashSet::default(),
                 &deref,
                 &FxHashMap::default(),
                 &FxHashMap::default(),

@@ -619,6 +619,7 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     seq_hash(&mut h, p.nonnull.iter());
     seq_hash(&mut h, p.frozen.iter());
     seq_hash(&mut h, p.noalias.iter());
+    seq_hash(&mut h, p.scoped_na.iter());
     seq_hash(&mut h, p.deref.iter());
     seq_hash(&mut h, p.nowrite.iter());
     seq_hash(&mut h, p.call_frozen.iter());

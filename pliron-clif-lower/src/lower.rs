@@ -405,6 +405,7 @@ struct FnJob {
     derived: pliron_clif_opt::vmap::VMap<ir::Value>,
     frozen: FxHashMap<ir::Value, u64>,
     noalias: FxHashSet<ir::Value>,
+    scoped_na: FxHashSet<ir::Value>,
     deref: FxHashMap<ir::Value, (u64, bool)>,
     nowrite: FxHashMap<FuncRef, bool>,
     call_frozen: FxHashMap<FuncRef, u64>,
@@ -447,6 +448,7 @@ impl FnJob {
             derived: pliron_clif_opt::vmap::VMap::default(),
             frozen: FxHashMap::default(),
             noalias: FxHashSet::default(),
+            scoped_na: FxHashSet::default(),
             deref: FxHashMap::default(),
             nowrite: FxHashMap::default(),
             call_frozen: FxHashMap::default(),
@@ -681,6 +683,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 derived: &mut j.derived,
                 frozen: &mut j.frozen,
                 noalias: &mut j.noalias,
+                scoped_na: &mut j.scoped_na,
                 deref: &mut j.deref,
                 nowrite: &j.nowrite,
                 call_frozen: &j.call_frozen,
@@ -1229,6 +1232,7 @@ pub fn lower_module<'a>(
             let derived: pliron_clif_opt::vmap::VMap<cranelift_codegen::ir::Value>;
             let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
             let noalias: FxHashSet<cranelift_codegen::ir::Value>;
+            let scoped_na: FxHashSet<cranelift_codegen::ir::Value>;
             let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
             let nowrite: FxHashMap<FuncRef, bool>;
             let call_frozen: FxHashMap<FuncRef, u64>;
@@ -1271,6 +1275,7 @@ pub fn lower_module<'a>(
                     derived: pliron_clif_opt::vmap::VMap::default(),
                     frozen: FxHashMap::default(),
                     noalias: FxHashSet::default(),
+                    scoped_na: FxHashSet::default(),
                     deref: FxHashMap::default(),
                     call_frozen: FxHashMap::default(),
                     scoped: FxHashMap::default(),
@@ -1355,6 +1360,7 @@ pub fn lower_module<'a>(
                 derived = std::mem::take(&mut fl.derived);
                 frozen = std::mem::take(&mut fl.frozen);
                 noalias = std::mem::take(&mut fl.noalias);
+                scoped_na = std::mem::take(&mut fl.scoped_na);
                 deref = std::mem::take(&mut fl.deref);
                 nowrite = std::mem::take(&mut fl.nowrite);
                 call_frozen = std::mem::take(&mut fl.call_frozen);
@@ -1398,6 +1404,7 @@ pub fn lower_module<'a>(
                     derived,
                     frozen,
                     noalias,
+                    scoped_na,
                     deref,
                     nowrite,
                     call_frozen,
@@ -2006,6 +2013,7 @@ pub fn lower_clif_wasm(
             derived,
             frozen,
             noalias,
+            scoped_na,
             deref,
             nowrite,
             call_frozen,
@@ -2044,6 +2052,7 @@ pub fn lower_clif_wasm(
                 derived: pliron_clif_opt::vmap::VMap::default(),
                 frozen: FxHashMap::default(),
                 noalias: FxHashSet::default(),
+                scoped_na: FxHashSet::default(),
                 deref: FxHashMap::default(),
                 call_frozen: FxHashMap::default(),
                 scoped: FxHashMap::default(),
@@ -2096,6 +2105,7 @@ pub fn lower_clif_wasm(
                 fl.derived,
                 fl.frozen,
                 fl.noalias,
+                fl.scoped_na,
                 fl.deref,
                 fl.nowrite,
                 fl.call_frozen,
@@ -2119,6 +2129,7 @@ pub fn lower_clif_wasm(
                 derived,
                 frozen,
                 noalias,
+                scoped_na,
                 deref,
                 nowrite,
                 call_frozen,
@@ -2501,6 +2512,11 @@ struct FnLower<'a, 'b> {
     frozen: FxHashMap<cranelift_codegen::ir::Value, u64>,
     /// Entry params rustc marks `noalias`.
     noalias: FxHashSet<cranelift_codegen::ir::Value>,
+    /// The subset of `noalias` whose claim is region-scoped (clone args
+    /// seeded from `region_frozen`/`region_noalias`): the pointee is
+    /// disjoint only while the clone runs, so they stay out of
+    /// function-wide `iso` sets.
+    scoped_na: FxHashSet<cranelift_codegen::ir::Value>,
     /// `noalias` params' (dereferenceable bytes, writable) — 0 bytes = unknown.
     deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>,
     /// FuncRefs of calls to write-free functions (nowrite.rs).
@@ -2632,6 +2648,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             };
                         }
                         self.noalias.insert(v);
+                        self.scoped_na.insert(v);
                         self.deref.insert(v, (bytes, false));
                     }
                 }
@@ -2653,6 +2670,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             };
                         }
                         self.noalias.insert(v);
+                        self.scoped_na.insert(v);
                     }
                 }
                 self.vals.insert(a, vs);

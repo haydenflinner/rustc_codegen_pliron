@@ -117,6 +117,9 @@ time) in ~15 min and writes `target/parity/summary.md`.
 
 ### Correctness
 
+- **Triage order for a miscompile**: [`docs/miscompile-triage.md`](docs/miscompile-triage.md)
+  — diffcheck first, corpus replay next (with its fidelity caveats),
+  rebuild bisects last.
 - **Corpus**: `harness/corpus.sh smoke|std|cargo DIR` records every
   function's pre-pipeline CLIF + facts into `target/corpus/<set>`.
   `clif-check report target/corpus/std out.json --check` runs the whole

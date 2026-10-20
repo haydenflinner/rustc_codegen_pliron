@@ -69,6 +69,7 @@ fn run(
         &ps,
         &[Value::from_u32(0)].into_iter().collect(),
         &FxHashSet::default(),
+        &FxHashSet::default(),
         ofz,
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),

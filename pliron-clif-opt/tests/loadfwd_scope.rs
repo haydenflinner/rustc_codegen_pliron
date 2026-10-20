@@ -32,6 +32,7 @@ fn run(f: &mut Function, noalias: FxHashSet<Value>) -> usize {
         &ps,
         &noalias,
         &FxHashSet::default(),
+        &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),

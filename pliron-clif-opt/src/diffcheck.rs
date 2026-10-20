@@ -47,6 +47,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub struct Facts<'a> {
     pub nonnull: Option<&'a FxHashSet<Value>>,
     pub noalias: Option<&'a FxHashSet<Value>>,
+    /// The region-scoped subset of `noalias` (clone args): excluded from
+    /// function-wide isolation, kept so replays feed `Pipe::scoped_na`.
+    pub scoped_na: Option<&'a FxHashSet<Value>>,
     /// Entry param → (dereferenceable bytes, writable).
     pub deref: Option<&'a FxHashMap<Value, (u64, bool)>>,
     /// Entry params pointing at memory that never changes.
@@ -1500,6 +1503,7 @@ pub fn clif_text(f: &Function) -> String {
 pub struct OwnedFacts {
     pub nonnull: FxHashSet<Value>,
     pub noalias: FxHashSet<Value>,
+    pub scoped_na: FxHashSet<Value>,
     pub deref: FxHashMap<Value, (u64, bool)>,
     pub frozen: FxHashMap<Value, u64>,
     pub nowrite: FxHashMap<FuncRef, bool>,
@@ -1523,6 +1527,7 @@ impl OwnedFacts {
         Facts {
             nonnull: Some(&self.nonnull),
             noalias: Some(&self.noalias),
+            scoped_na: Some(&self.scoped_na),
             deref: Some(&self.deref),
             frozen: Some(&self.frozen),
             nowrite: Some(&self.nowrite),
@@ -1625,6 +1630,7 @@ impl OwnedFacts {
                 match k {
                     "nonnull" => out.nonnull.extend(val(parts[0])),
                     "noalias" => out.noalias.extend(val(parts[0])),
+                    "scopedna" => out.scoped_na.extend(val(parts[0])),
                     "deref" if parts.len() == 3 => {
                         if let (Some(v), Ok(n)) = (val(parts[0]), parts[1].parse()) {
                             out.deref.insert(v, (n, parts[2] == "w"));
@@ -1692,6 +1698,7 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
             .unwrap_or_default(),
     );
     let noalias = sorted(set(facts.noalias));
+    let scopedna = sorted(set(facts.scoped_na));
     let deref = sorted(
         facts
             .deref
@@ -1727,7 +1734,7 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
     );
     let _ = write!(
         s,
-        " nonnull={nonnull} noalias={noalias} deref={deref} frozen={frozen} nowrite={nowrite} derived={derived}"
+        " nonnull={nonnull} noalias={noalias} scopedna={scopedna} deref={deref} frozen={frozen} nowrite={nowrite} derived={derived}"
     );
     if let Some(n) = &facts.self_name {
         let _ = write!(s, " self={n}");

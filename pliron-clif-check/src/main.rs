@@ -281,10 +281,11 @@ fn with_pipe<R>(
             }
         }
     }
-    let (mut nonnull, mut frozen, mut noalias, mut deref, mut e4, mut lifetimes) = (
+    let (mut nonnull, mut frozen, mut noalias, mut scoped_na, mut deref, mut e4, mut lifetimes) = (
         facts.nonnull.clone(),
         facts.frozen.clone(),
         facts.noalias.clone(),
+        facts.scoped_na.clone(),
         facts.deref.clone(),
         Default::default(),
         facts.lifetimes(&clctx.func),
@@ -302,6 +303,7 @@ fn with_pipe<R>(
         derived: &mut derived,
         frozen: &mut frozen,
         noalias: &mut noalias,
+        scoped_na: &mut scoped_na,
         deref: &mut deref,
         nowrite: &facts.nowrite,
         call_frozen: &e1,

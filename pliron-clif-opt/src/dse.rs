@@ -380,6 +380,7 @@ fn transfer(ops: &[Op], d: &mut Demands, iso: &FxHashSet<Root>, mut dead: Option
 pub fn run(
     func: &mut Function,
     noalias: &FxHashSet<Value>,
+    scoped_na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
     an: &mut crate::pipeline::Analysis,
@@ -414,7 +415,7 @@ pub fn run(
     }
     // Shared per-`ver` inputs: the three pipeline runs (and any other
     // pass wired to `Analysis`) build these at most once per IR state.
-    let (cfg, ps, iso, t_ps, t_iso) = an.dse_inputs(func, noalias, cfrozen);
+    let (cfg, ps, iso, t_ps, t_iso) = an.dse_inputs(func, noalias, scoped_na, cfrozen);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     let t = prof.then(std::time::Instant::now);
     let mut order = Vec::new();
@@ -626,6 +627,7 @@ mod tests {
     fn dse(func: &mut Function) -> usize {
         run(
             func,
+            &FxHashSet::default(),
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),

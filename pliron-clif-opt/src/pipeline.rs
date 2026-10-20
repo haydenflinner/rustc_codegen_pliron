@@ -160,6 +160,11 @@ pub struct Pipe<'a> {
     pub derived: &'a mut VMap<Value>,
     pub frozen: &'a mut FxHashMap<Value, u64>,
     pub noalias: &'a mut FxHashSet<Value>,
+    /// The subset of `noalias` whose claim is region-scoped (clone args
+    /// seeded from `region_frozen`/`region_noalias`): valid only inside
+    /// the clone's region, so `isolated*` must not treat them as
+    /// function-wide unreachable.
+    pub scoped_na: &'a mut FxHashSet<Value>,
     pub deref: &'a mut FxHashMap<Value, (u64, bool)>,
     pub nowrite: &'a FxHashMap<FuncRef, bool>,
     pub call_frozen: &'a FxHashMap<FuncRef, u64>,
@@ -634,10 +639,10 @@ pub struct Analysis {
     /// proots consumer in this version. `amap` derives from it.
     facts: Option<crate::proots::Facts>,
     /// `loadfwd::isolated` (empty-`nocap` variant) for the current `ver`,
-    /// paired with the `noalias.len()` it was computed against:
-    /// `carry_aliases` can grow `Pipe::noalias` inside a version, and the
-    /// set never shrinks.
-    iso: Option<(usize, FxHashSet<crate::loadfwd::Root>)>,
+    /// paired with the `(noalias.len(), scoped_na.len())` it was computed
+    /// against: `carry_aliases` can grow both sets inside a version, and
+    /// they never shrink.
+    iso: Option<((usize, usize), FxHashSet<crate::loadfwd::Root>)>,
     /// `Uses` index shared between passes within a version — ~10 steps
     /// need one and each used to rebuild it per fn. `Rc` so callers get
     /// the same owned-snapshot semantics as a local `Uses::new` (stale
@@ -843,13 +848,14 @@ impl Analysis {
     /// (possibly cache-hit) `amap`/`iso` build times, reported by
     /// `dseprof` as `ps`/`iso`.
     ///
-    /// `iso` keys on `noalias.len()` in addition to `ver`:
-    /// `carry_aliases` can grow `Pipe::noalias` inside a version, and
-    /// the set never shrinks.
+    /// `iso` keys on `(noalias.len(), scoped_na.len())` in addition to
+    /// `ver`: `carry_aliases` can grow both `Pipe` sets inside a version,
+    /// and they never shrink.
     pub fn dse_inputs<'a>(
         &'a mut self,
         func: &Function,
         noalias: &FxHashSet<Value>,
+        scoped_na: &FxHashSet<Value>,
         cfrozen: &FxHashMap<FuncRef, u64>,
     ) -> (
         &'a ControlFlowGraph,
@@ -872,10 +878,20 @@ impl Analysis {
         }
         let t_ps = t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         let t = prof.then(std::time::Instant::now);
-        if self.iso.as_ref().is_none_or(|&(n, _)| n != noalias.len()) {
+        if self
+            .iso
+            .as_ref()
+            .is_none_or(|&(n, _)| n != (noalias.len(), scoped_na.len()))
+        {
             self.iso = Some((
-                noalias.len(),
-                crate::loadfwd::isolated(func, noalias, self.amap.as_ref().unwrap(), cfrozen),
+                (noalias.len(), scoped_na.len()),
+                crate::loadfwd::isolated(
+                    func,
+                    noalias,
+                    self.amap.as_ref().unwrap(),
+                    cfrozen,
+                    scoped_na,
+                ),
             ));
         }
         (
@@ -1073,6 +1089,7 @@ fn corpus_dump(p: &mut Pipe) {
     let facts = crate::diffcheck::Facts {
         nonnull: Some(&*p.nonnull),
         noalias: Some(&*p.noalias),
+        scoped_na: Some(&*p.scoped_na),
         deref: Some(&*p.deref),
         frozen: Some(&*p.frozen),
         nowrite: Some(p.nowrite),
@@ -1312,6 +1329,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
     crate::diffcheck::Facts {
         nonnull: Some(p.nonnull),
         noalias: Some(p.noalias),
+        scoped_na: Some(p.scoped_na),
         deref: Some(p.deref),
         frozen: Some(p.frozen),
         nowrite: Some(p.nowrite),
@@ -1927,6 +1945,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
             pf,
             ps,
             p.noalias,
+            p.scoped_na,
             p.invariant,
             p.operand_frozen,
             p.block_region,
@@ -1982,6 +2001,7 @@ fn s_dse(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = dse::run(
         &mut p.clctx.func,
         p.noalias,
+        p.scoped_na,
         p.nowrite,
         p.call_frozen,
         an,
@@ -2052,6 +2072,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         &mut p.clctx.func,
         an,
         p.noalias,
+        p.scoped_na,
         p.deref,
         p.nowrite,
         p.call_frozen,
@@ -2631,6 +2652,7 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
         pf,
         ps,
         p.noalias,
+        p.scoped_na,
         p.invariant,
         p.operand_frozen,
         p.block_region,
@@ -2717,6 +2739,7 @@ fn s_dse2(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = dse::run(
         &mut p.clctx.func,
         p.noalias,
+        p.scoped_na,
         p.nowrite,
         p.call_frozen,
         an,
@@ -2733,6 +2756,7 @@ fn s_dse3(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = dse::run(
         &mut p.clctx.func,
         p.noalias,
+        p.scoped_na,
         p.nowrite,
         p.call_frozen,
         an,
@@ -2751,7 +2775,14 @@ fn s_dse3(p: &mut Pipe, an: &mut Analysis) -> usize {
 // and alias the load to the stored value so lcse/dse fold `store 0` +
 // `load;+1;store` into `store 1`.
 fn s_memspec(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = memspec::run(&mut p.clctx.func, an, p.noalias, p.nowrite, p.call_frozen);
+    let k = memspec::run(
+        &mut p.clctx.func,
+        an,
+        p.noalias,
+        p.scoped_na,
+        p.nowrite,
+        p.call_frozen,
+    );
     if k > 0 && p.dump {
         p.dump("memspec");
     }
@@ -2824,6 +2855,7 @@ pub(crate) mod fact_bits {
     pub const NOALIAS: u8 = 8;
     pub const DEREF: u8 = 16;
     pub const OPERAND_FROZEN: u8 = 32;
+    pub const SCOPED_NA: u8 = 64;
 }
 
 impl Pipe<'_> {
@@ -2843,6 +2875,9 @@ impl Pipe<'_> {
         }
         for &v in self.noalias.iter() {
             self.fact_bits[v] |= fact_bits::NOALIAS;
+        }
+        for &v in self.scoped_na.iter() {
+            self.fact_bits[v] |= fact_bits::SCOPED_NA;
         }
         for &v in self.deref.keys() {
             self.fact_bits[v] |= fact_bits::DEREF;
@@ -2946,6 +2981,10 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     if bits & fact_bits::NOALIAS != 0 && p.noalias.contains(&d) {
         p.noalias.insert(w);
         p.fact_bits[w] |= fact_bits::NOALIAS;
+    }
+    if bits & fact_bits::SCOPED_NA != 0 && p.scoped_na.contains(&d) {
+        p.scoped_na.insert(w);
+        p.fact_bits[w] |= fact_bits::SCOPED_NA;
     }
     if bits & fact_bits::FROZEN != 0
         && let Some(&f) = p.frozen.get(&d)
@@ -4023,6 +4062,7 @@ mod tests {
         let mut derived = VMap::default();
         let mut frozen = FxHashMap::default();
         let mut noalias = FxHashSet::default();
+        let mut scoped_na = FxHashSet::default();
         let mut deref = FxHashMap::default();
         let mut operand_frozen = FxHashMap::default();
         let mut lifetimes = Vec::new();
@@ -4041,6 +4081,7 @@ mod tests {
             derived: &mut derived,
             frozen: &mut frozen,
             noalias: &mut noalias,
+            scoped_na: &mut scoped_na,
             deref: &mut deref,
             nowrite: &nowrite,
             call_frozen: &call_frozen,

@@ -499,8 +499,9 @@ pub fn isolated(
     noalias: &FxHashSet<Value>,
     ps: &VMap<Value>,
     cfrozen: &FxHashMap<FuncRef, u64>,
+    scoped: &FxHashSet<Value>,
 ) -> FxHashSet<Root> {
-    isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default()).0
+    isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default(), scoped).0
 }
 
 /// `isolated` plus, for every rejected root, the blocks holding its
@@ -513,18 +514,29 @@ pub fn isolated(
 /// kill their locs — but stores rooted elsewhere can't reach them.
 /// Escapes are recorded for them exactly as for any other escape, so
 /// consumers reading only `(iso, escapes)` see no change.
+/// `scoped` is the subset of `noalias` whose claim is region-scoped
+/// (clone args seeded from `region_frozen`/`region_noalias`): inside
+/// the clone nothing else touches the pointee, but a caller-side access
+/// through the underlying object can still reach it, so the root is not
+/// isolated function-wide. They stay in `noalias` (scope-keyed locs and
+/// the region checks need the `root` stop) but are excluded here.
 pub fn isolated_escapes(
     func: &Function,
     noalias: &FxHashSet<Value>,
     ps: &VMap<Value>,
     _cfrozen: &FxHashMap<FuncRef, u64>,
     nocap: &FxHashSet<(Inst, u32)>,
+    scoped: &FxHashSet<Value>,
 ) -> (
     FxHashSet<Root>,
     FxHashMap<Root, Vec<Block>>,
     FxHashSet<Root>,
 ) {
-    let mut cand: FxHashSet<Root> = noalias.iter().map(|&v| Root::V(v)).collect();
+    let mut cand: FxHashSet<Root> = noalias
+        .iter()
+        .filter(|&v| !scoped.contains(v))
+        .map(|&v| Root::V(v))
+        .collect();
     if crate::pass_enabled("PLIRON_FWD_SLOTS") {
         cand.extend(func.sized_stack_slots.keys().map(Root::S));
     }
@@ -907,6 +919,7 @@ pub fn run(
     pf: &crate::proots::Facts,
     ps: &VMap<Value>,
     noalias: &FxHashSet<Value>,
+    scoped_na: &FxHashSet<Value>,
     inv_insts: &FxHashSet<Inst>,
     ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
     breg: &FxHashMap<Block, Region>,
@@ -983,7 +996,7 @@ pub fn run(
     } else {
         (&VMap::default(), &VMap::default())
     };
-    let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap);
+    let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap, scoped_na);
     if let Some(f) = crate::env_get("PLIRON_LF_DEBUG") {
         if func.name.to_string().contains(&f) {
             if pliron_cfg::tracing_on() {

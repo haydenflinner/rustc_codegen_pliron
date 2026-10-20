@@ -264,6 +264,7 @@ fn dead_pair_edge_args_not_appended() {
         &ps,
         &FxHashSet::default(),
         &FxHashSet::default(),
+        &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),

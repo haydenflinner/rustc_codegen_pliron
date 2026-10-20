@@ -5,7 +5,7 @@
 //! and the cursor never advanced (aho-corasick's `ByteClassElements::next`
 //! looped forever). Found by the differential checker.
 
-use cranelift_codegen::ir::{Function, Value};
+use cranelift_codegen::ir::Value;
 use pliron::basic_block::BasicBlock;
 use pliron::context::Context;
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
@@ -57,6 +57,7 @@ fn promotion_respects_operand_frozen_reads_of_the_same_location() {
         &mut after,
         &mut Analysis::default(),
         &noalias,
+        &FxHashSet::default(),
         &deref,
         &FxHashMap::default(),
         &FxHashMap::default(),
