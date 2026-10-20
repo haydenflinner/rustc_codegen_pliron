@@ -8,6 +8,7 @@ use pliron::basic_block::BasicBlock;
 use pliron::context::{Context, Ptr};
 use pliron::identifier::Identifier;
 use pliron::operation::Operation;
+use pliron::printable::Printable;
 use pliron::r#type::{TypeHandle, Typed};
 use pliron::value::Value;
 use pliron_llvm::attributes::AtomicRmwKindAttr;
@@ -608,32 +609,43 @@ pub fn nonnull_values(ctx: &Context, st: &State) -> Vec<(Value, u64)> {
     out
 }
 
+/// Identity of one emitted copy of a symbol: `(name, printed fn type)`.
+/// ABI-rewriting passes (`sret2reg`, `deadarg`) can leave one symbol
+/// with copies whose contracts differ — e.g. an internal reg-return
+/// `map_result` next to the sret copy a decl-only call binds. A fact
+/// like `nowrite` computed on the reg-return body must not describe the
+/// sret call's memory effects, so copies pool only with type-matching
+/// siblings. The type is printed because `TypeHandle` is context-local
+/// and CGUs hold separate `Context`s.
+type CopyKey = (String, String);
+
 /// One CGU's contribution to [`GlobalFacts`]: the merge state a single
 /// `facts_publish` call produces.
 #[derive(Default)]
 struct CguFacts {
-    /// Emitted copies seen per symbol (any bodied non-`Import` func).
-    copies: FxHashMap<String, u32>,
+    /// Emitted copies seen per (symbol, fn type).
+    copies: FxHashMap<CopyKey, u32>,
     /// Intersection of per-copy nocapture arg sets.
-    nocapture: FxHashMap<String, FxHashSet<u32>>,
+    nocapture: FxHashMap<CopyKey, FxHashSet<u32>>,
     /// Copies proving `nowrite = Some(true)` / `Some(false)` resp.
-    nowrite_strict: FxHashMap<String, u32>,
-    nowrite_relaxed: FxHashMap<String, u32>,
+    nowrite_strict: FxHashMap<CopyKey, u32>,
+    nowrite_relaxed: FxHashMap<CopyKey, u32>,
     /// Copies proving each contract.
-    nnret: FxHashMap<String, u32>,
-    willreturn: FxHashMap<String, u32>,
-    nounwind: FxHashMap<String, u32>,
+    nnret: FxHashMap<CopyKey, u32>,
+    willreturn: FxHashMap<CopyKey, u32>,
+    nounwind: FxHashMap<CopyKey, u32>,
 }
 
 /// Process-global callee-contract facts merged across codegen units
 /// (`State::share_facts` / `facts_publish` + `facts_adopt`). A call to a
 /// bodiless symbol binds whichever copy the linker picks; since contract
-/// facts are semantic properties of the function, a fact is only shared
-/// once *every* emitted copy seen so far agrees (`copies` vs per-fact
-/// counts, intersection for `nocapture`). `Import` declarations never
-/// contribute; `Preemptible` bodies that were excluded from inference
-/// (non-ODR) count as copies but bring no facts, which poisons their
-/// symbol's merge — conservative by construction.
+/// facts are semantic properties of the function *under the caller's
+/// signature*, a fact is only shared once *every* emitted type-matching
+/// copy seen so far agrees (`copies` vs per-fact counts, intersection
+/// for `nocapture`). `Import` declarations never contribute;
+/// `Preemptible` bodies that were excluded from inference (non-ODR)
+/// count as copies but bring no facts, which poisons their symbol's
+/// merge — conservative by construction.
 ///
 /// Contributions are kept per participant ordinal so an adopting CGU
 /// sees exactly the CGUs that preceded it in submission order — the
@@ -648,11 +660,12 @@ struct GlobalFacts {
 }
 
 impl CguFacts {
-    fn publish(&mut self, sym: &str, st: &State, nounwind: bool) {
-        *self.copies.entry(sym.to_string()).or_default() += 1;
+    fn publish(&mut self, ctx: &Context, sym: &str, ty: TypeHandle, st: &State, nounwind: bool) {
+        let key = (sym.to_string(), ty.disp(ctx).to_string());
+        *self.copies.entry(key.clone()).or_default() += 1;
         let nc = self
             .nocapture
-            .entry(sym.to_string())
+            .entry(key.clone())
             .or_insert_with(|| st.nocapture.get(sym).cloned().unwrap_or_default());
         if let Some(v) = st.nocapture.get(sym) {
             nc.retain(|a| v.contains(a));
@@ -660,18 +673,18 @@ impl CguFacts {
             nc.clear();
         }
         match st.nowrite.get(sym) {
-            Some(true) => *self.nowrite_strict.entry(sym.to_string()).or_default() += 1,
-            Some(false) => *self.nowrite_relaxed.entry(sym.to_string()).or_default() += 1,
+            Some(true) => *self.nowrite_strict.entry(key.clone()).or_default() += 1,
+            Some(false) => *self.nowrite_relaxed.entry(key.clone()).or_default() += 1,
             None => {}
         }
         if st.nnret.contains(sym) {
-            *self.nnret.entry(sym.to_string()).or_default() += 1;
+            *self.nnret.entry(key.clone()).or_default() += 1;
         }
         if st.willreturn.contains(sym) {
-            *self.willreturn.entry(sym.to_string()).or_default() += 1;
+            *self.willreturn.entry(key.clone()).or_default() += 1;
         }
         if nounwind {
-            *self.nounwind.entry(sym.to_string()).or_default() += 1;
+            *self.nounwind.entry(key).or_default() += 1;
         }
     }
 
@@ -698,10 +711,10 @@ impl CguFacts {
         }
     }
 
-    fn nowrite(&self, sym: &str) -> Option<bool> {
-        let n = *self.copies.get(sym)?;
-        let strict = self.nowrite_strict.get(sym).copied().unwrap_or(0);
-        let relaxed = self.nowrite_relaxed.get(sym).copied().unwrap_or(0);
+    fn nowrite(&self, key: &CopyKey) -> Option<bool> {
+        let n = *self.copies.get(key)?;
+        let strict = self.nowrite_strict.get(key).copied().unwrap_or(0);
+        let relaxed = self.nowrite_relaxed.get(key).copied().unwrap_or(0);
         if strict == n {
             Some(true)
         } else if strict + relaxed == n {
@@ -711,8 +724,12 @@ impl CguFacts {
         }
     }
 
-    fn proven(map: &FxHashMap<String, u32>, copies: &FxHashMap<String, u32>, sym: &str) -> bool {
-        match (map.get(sym), copies.get(sym)) {
+    fn proven(
+        map: &FxHashMap<CopyKey, u32>,
+        copies: &FxHashMap<CopyKey, u32>,
+        key: &CopyKey,
+    ) -> bool {
+        match (map.get(key), copies.get(key)) {
             (Some(&c), Some(&n)) => c == n,
             _ => false,
         }
@@ -755,7 +772,7 @@ impl State {
                 continue;
             }
             exported += 1;
-            cf.publish(sym, self, f.nounwind);
+            cf.publish(ctx, sym, f.ty, self, f.nounwind);
             if !filt.is_empty() && sym.contains(&filt) {
                 tracing::info!(target: "pliron::stats",
                     "xfacts {} publish {sym}", self.cgu);
@@ -789,27 +806,31 @@ impl State {
             if crate::has_body(ctx, f.op) {
                 continue;
             }
-            if !g.copies.contains_key(sym) {
+            // Only copies emitted under this decl's signature count: an
+            // ABI-divergent copy's contract says nothing about the code
+            // this call binds.
+            let key = (sym.clone(), f.ty.disp(ctx).to_string());
+            if !g.copies.contains_key(&key) {
                 continue;
             }
             let mut hit = false;
-            if let Some(v) = g.nocapture.get(sym) {
+            if let Some(v) = g.nocapture.get(&key) {
                 self.nocapture.insert(sym.clone(), v.clone());
                 hit = !v.is_empty();
             }
-            if let Some(v) = g.nowrite(sym) {
+            if let Some(v) = g.nowrite(&key) {
                 self.nowrite.insert(sym.clone(), v);
                 hit = true;
             }
-            if CguFacts::proven(&g.nnret, &g.copies, sym) {
+            if CguFacts::proven(&g.nnret, &g.copies, &key) {
                 self.nnret.insert(sym.clone());
                 hit = true;
             }
-            if CguFacts::proven(&g.willreturn, &g.copies, sym) {
+            if CguFacts::proven(&g.willreturn, &g.copies, &key) {
                 self.willreturn.insert(sym.clone());
                 hit = true;
             }
-            if CguFacts::proven(&g.nounwind, &g.copies, sym) {
+            if CguFacts::proven(&g.nounwind, &g.copies, &key) {
                 f.nounwind = true;
                 hit = true;
             }
@@ -825,5 +846,121 @@ impl State {
             tracing::info!(target: "pliron::stats",
                 "xfacts {}: imported {imported}", self.cgu);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pliron::builtin::op_interfaces::SymbolOpInterface;
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::op::Op;
+    use pliron::parsable::parse_from_str;
+
+    /// Populate `st.funcs` from a parsed module the way `cgupool` does.
+    fn state_with(ctx: &mut Context, input: &str) -> State {
+        let op =
+            parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let mut st = State::default();
+        for fop in crate::inline::blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+        {
+            let Some(f) = Operation::get_op::<FuncOp>(fop, ctx) else {
+                continue;
+            };
+            let sym = f.get_symbol_name(ctx).to_string();
+            st.ident_to_sym.insert(sym.clone(), sym.clone());
+            st.funcs.insert(
+                sym,
+                FuncInfo {
+                    op: fop,
+                    ty: f.get_type(ctx).into(),
+                    linkage: Linkage::Local,
+                    exts: Exts::default(),
+                    no_inline: false,
+                    always_inline: false,
+                    inline_hint: false,
+                    cold: false,
+                    nounwind: false,
+                    odr: false,
+                    sret_ty: None,
+                    frozen: Vec::new(),
+                    noalias: Vec::new(),
+                    nonnull: Vec::new(),
+                    nparams: 1,
+                },
+            );
+        }
+        st
+    }
+
+    /// `sret2reg` can emit two copies of one symbol with different
+    /// contracts: an internal reg-return copy that is legitimately
+    /// `nowrite` (it returns the aggregate) and the sret copy a decl-only
+    /// call binds, which writes through its hidden out-pointer. A decl
+    /// adopting the reg-return copy's fact lets `callgvn` erase a call
+    /// that stores through the sret argument — observed as a stage2
+    /// `Sender::release` SIGSEGV. Facts must not cross a type boundary.
+    #[test]
+    fn xfacts_ignore_type_divergent_copies() {
+        reset_facts();
+        let ctx = &mut Context::new();
+
+        // CGU A: sret2reg'd copy — returns the result, writes nothing.
+        let mut a = state_with(
+            ctx,
+            r#"
+            builtin.module @m {
+            ^b():
+              llvm.func @f: llvm.func <builtin.integer i32(builtin.integer i32) variadic = false> [] {
+              ^e(x: builtin.integer i32):
+                llvm.return x
+              }
+            }
+            "#,
+        );
+        a.nowrite.insert("f".to_string(), true);
+        a.facts_publish(ctx, 0);
+
+        // CGU C: decl-only sret-form contract (first arg is the
+        // out-pointer) — adopts before CGU B's sret copy publishes.
+        let mut c = state_with(
+            ctx,
+            r#"
+            builtin.module @m {
+            ^b():
+              llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), builtin.integer i32) variadic = false> []
+            }
+            "#,
+        );
+        c.facts_publish(ctx, 1);
+        c.facts_adopt(ctx, 1);
+        assert_ne!(
+            c.nowrite.get("f"),
+            Some(&true),
+            "sret-contract decl adopted nowrite from a reg-return copy"
+        );
+
+        // CGU B: the sret copy a decl-only call actually binds — writes
+        // through arg0, so `nowrite` stays unset. Publishing it late must
+        // not let an earlier adopter's fact stand either.
+        let mut b = state_with(
+            ctx,
+            r#"
+            builtin.module @m {
+            ^b():
+              llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), builtin.integer i32) variadic = false> [] {
+              ^e(p: llvm.ptr (0), x: builtin.integer i32):
+                llvm.store *p <- x ;
+                llvm.return
+              }
+            }
+            "#,
+        );
+        b.facts_publish(ctx, 2);
+        reset_facts();
     }
 }
