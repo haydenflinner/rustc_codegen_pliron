@@ -8643,12 +8643,15 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
             return false;
         };
         // `select c, 1, 0` ≡ truthy(c): alias a canonical bool c, else
-        // `icmp ne/eq c, 0`.
+        // `icmp ne/eq c, 0`. `c` may be wider than the i8 result
+        // (armmerge's `select (band.i32 ..), 1, 0`): the zero takes
+        // `c`'s type and only an i8 `c` can stand in for the result.
+        let cty = pos.func.dfg.value_type(c);
         if !neg {
-            if is01(pos.func, c, 4) {
+            if cty == types::I8 && is01(pos.func, c, 4) {
                 return alias_to(pos, inst, res, c);
             }
-            let z = pos.ins().iconst(types::I8, 0);
+            let z = pos.ins().iconst(cty, 0);
             pos.func.dfg.insts[inst] = InstructionData::IntCompare {
                 opcode: Opcode::Icmp,
                 cond: IntCC::NotEqual,
@@ -8666,7 +8669,7 @@ fn selord_sel(pos: &mut FuncCursor, inst: Inst) -> bool {
             };
             return true;
         }
-        let z = pos.ins().iconst(types::I8, 0);
+        let z = pos.ins().iconst(cty, 0);
         pos.func.dfg.insts[inst] = InstructionData::IntCompare {
             opcode: Opcode::Icmp,
             cond: IntCC::Equal,
