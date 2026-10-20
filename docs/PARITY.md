@@ -291,6 +291,29 @@ Next steps, in expected-payoff order:
    hashing is only ~6%, so dense columns are no longer the obvious win
    (DoD step 4, `docs/history/dod-steps-4-5.md` still applies to the
    pliron-IR side).
+   **Def-use arena pivot landed** (`d8dfc70`, `79b22cd`, `b73892b`):
+   `DefNode`'s `SmallSet<Use,1>` (indexmap heap-spill past a single
+   use — nearly every multi-use def paid malloc+hashing per operand
+   touch) is now a Context-wide intrusive use-slot arena
+   (`Context::use_links`: `Vec<UseSlot{user_op,use_uid,prev,next}>` +
+   free list; `use_uid = gen<<32 | slot` so stale `Use`s can't alias a
+   reused slot; removal splices the tail into the vacated chain
+   position, preserving indexmap `swap_remove` iteration order — hence
+   byte-identical output). `Operation::new`/`rewrite_*`/`drop_*` push
+   result/operand/successor spans straight into the columnar pools
+   under one `use_links`+pool borrow each — the per-op temp `Vec`s and
+   per-operand `RefCell` borrows are gone. `Value::uses_iter`/
+   `Ptr<BasicBlock>::uses_iter` give alloc-free lazy walks at ~26
+   read-only sites; `.is_empty()` queries became `is_used()`.
+   Measured: regex-syntax objects byte-identical on all 16 CGUs, gate
+   36/36, ~2% CPU (~19.9 vs ~20.3 user-s), wall flat. One follow-up
+   measured negative and was reverted: storing the operand index in
+   the use slot for O(1) `try_find_index` (−0.5% — the extra slot
+   field costs more than the small operand scans it saves). Conclusion:
+   per-use hashing was never the bottleneck — the ~20 CPU-s is
+   intrinsic `RefCell`-arena access volume spread across every pass;
+   LLVM does this compile in ~4.5 CPU-s, so the remaining gap is
+   per-access weight, not any single structure.
 
 wasm compile time (2.56x) adds the CLIF → waffle translation, the waffle
 inliner and `wpeep` on top of the same pipeline; profile
