@@ -4,25 +4,40 @@ Working ledger for "pliron must not lose to LLVM on any wasmbench
 kernel" (geomean first, then per-kernel). Update as items resolve;
 `docs/PARITY.md` holds the measured numbers.
 
-## Status snapshot (bench/wasm/run.sh, post `8ed1b5c`)
+## Status snapshot (bench/wasm/run.sh, post `c8a744d`)
 
-geomean pliron/llvm = **0.980** (best yet — `walias` mode 15 with
-sound pair-cancel). Wins: `chars_alpha` −33%, `iterw` −34%, `parse_only`
-−14%, `matmul` −11%, `eqbug` −9%, `contains_rng` −4%. Parity: `sieve`
-+0.7%, `nbody` +0.2%.
+geomean pliron/llvm = **0.967–0.971** (best band yet — `walias` +
+`sfwd` cross-block merges). Wins: `chars_alpha` −35%, `iterw` −41%,
+`parse_only` −14%, `matmul` −12%, `eqbug` −9%, `contains_rng` −3%.
+Parity: `sieve` +0.3%, `sortw` +0.6%.
 
-Landed since: `sfwd` v2 + intra-span DSE (`62dbebb`), `licm` bounded
-loop-invariant `get;get;binop` hoisting (`677c37b`), `bandk` in
-clifpeep, `wpeep` else-arm retarget, `PLIRON_UNROLL_ITERS` knob.
+Landed this round (all pushed):
+- `a0beea7` — `walias` cross-block dataflow: `copymap`/`last_write`
+  merge at `end`/`else`/`br`/`br_table` with reachability tracking,
+  `ins_span` same-straight-line eager-dead-write guard, `usize::MAX`
+  merge sentinels for divergent writes, `loop_writes` backedge kills,
+  `Nop`/`canceled`-restore soundness fixes. PHI-token verifier
+  (`PLIRON_WASM_WALIAS_VERIFY=1`): 0 divergences on 22630 dumped bodies.
+- `ec69897` — `sfwd` `fmap` cross-block merge (same machinery):
+  slot facts survive `end` iff every path agrees on (fwd,sop,si,ai),
+  `exposed` ORs, loop-entry kills body-written base/fwd locals.
+  **`hashmap::run` halved**: 2711→1277 ins, mem 203→81, locs 1745→873.
+  Also `PLIRON_INLINE_MAXDUP` knob (default off — measured: kills hot
+  paths, diagnostic only) + tee-insert sort fix (`fb74c00`).
+- `cbd1b20` — `cvt` float↔int reinterprets + `cond` F32/F64 `v!=0.0`:
+  unstubs `pow`, `asin`×2, `exp2` (were `unreachable` bodies).
+- `c8a744d` — `bittab` single-run accepts emit `(x-a)<=u span`
+  instead of guard+`ushr`-bitmap (sparse sets keep the bitmap —
+  multi-run union measured worse, `tokenize` +37%→+15% on revert).
 
-Post-snapshot landed work (uncommitted at time of writing):
-`sfwd` v2 (operand-stack `need`-walk + `local.tee` capture of
-*computed* store values into fresh locals — fires on `nbody`'s
-`v_i`/`v_j` churn and `strwork`'s frame spills), `bandk` in clifpeep
-(`band/bor/bxor` const-chain reassoc on shared inner + `band
-(stack_addr, k<align)` → `iconst 0` — killed `strwork`'s ~2.3k-line
-dead `if` arm: `strwork3run` 4781→~2410 lines merged into `k_strwork`,
-module −5 KiB).
+Knobs swept and rejected this round: `PLIRON_INLINE` 200/350/768
+(200/350 catastrophic geomean 1.07+, 768 worse 0.977 — default 512 is
+the sweet spot), `PLIRON_INLINE_MAXDUP=2` (chars_ascii +534%),
+`PLIRON_INLINE_LOOP`/`_HOT`/`_BU`/`_MODEL` variants.
+
+Module size: 204KB vs LLVM 97KB — the residual is codegen density
+(~3-5x local ops in the big bodies) not inline duplication:
+`quicksort` 300KB, `format_exact` 260KB, `rem_pio2` 139KB WAT.
 
 ## Lessons / pitfalls discovered
 
@@ -57,22 +72,20 @@ module −5 KiB).
    convenience inline) rather than a global budget change. Deferred to
    whoever owns `pliron-ir-opt` next.
 
-2. **`hashmap` +16 / `hmget` +13 / `tokenize` +12 — locals coalescing
-   (`walias`-class).** `walias` landed (`4756155`, pair-cancel landed
-   `8ed1b5c`): operand-stack-aware linear scan doing `get;drop` elision,
-   dead-`set`/`tee` → `drop`/`del`, `get T → get U` copy-forwarding,
-   and `set T … get T` pair-cancel (deletes both when T's operand stays
-   on the operand stack for the whole span — `pend[t]` tracks the
-   operand's depth `dv` and dies when `vstack.len() <= dv`). Default
-   `PLIRON_WASM_WALIAS_MODE`=15. Soundness rules: `pend` requires a
-   tracked operand (`popped.is_some()` — multi-value call results and
-   block params never cancel); pops below the tracked region clear
-   `pend`; `Nop(t)` (deleted `get t;set t` — reads+writes t) and
-   `canceled`-restored `set`s kill `pend`/`copymap`/`Named` on t;
-   `len > dv` strict. `PLIRON_WASM_WALIAS_VERIFY=1` replays orig vs
-   edited ins streams comparing popped producer tokens — 0 divergences
-   on the ~23000-body wasmbench dump. `k_strwork` matches LLVM x5.
-   **strwork +16.8%** (was +21-22).
+2. **`hashmap` +16 / `hmget` +12 / `tokenize` +15 — density residual
+   after cross-block merges.** `walias` cross-block dataflow landed
+   (`a0beea7`) + `sfwd` `fmap` merge (`ec69897`): `hashmap::run`
+   halved (2711→1277 ins) — SipHash state now stays in locals across
+   the probe-loop backedge. `hmget` ~895 vs LLVM ~263 ins remains —
+   the probe loop's tag-compare/probe-step codegen (hashbrown
+   `eqz`+`cmov` cluster) is ~3x denser in LLVM; `tokenize`'s
+   `next_match` digit/ident-scan is i64-bitmap+select chains LLVM
+   emits as `x-9>23`-style range checks. **Undecided:** the residual
+   is operand-stack local-threading (LLVM's wasm backend numbers
+   locals to minimize get/set; ours materializes per-SSA-value) —
+   `walias`/`sfwd` chip locally but can't collapse loop-carried
+   phi-moves. Would need a wasm-level copy-coalescing/SSA-minimizing
+   pass, or better local-numbering at emit.
 
 3. **`br_if` fold — arm1 pure-op relaxation.** Else-retarget landed
    (`9e75ac5`), but `if c {arith/stores;br} else {R}` still can't fold
@@ -127,3 +140,44 @@ module −5 KiB).
   `PLIRON_*` flips do apply (no cargo-fingerprint staleness).
 - `PLIRON_WASM_SFWD=0`, `PLIRON_WASM_BRF=0`, `PLIRON_WASM_HOT`,
   `PLIRON_WASM_AUDIT=panic` are the wpeep knobs.
+
+## licm invariant-chain hoist (bc2e169 — geomean 0.966)
+
+Extended `licm` from `get;get;binop` triples to contiguous
+self-contained pure runs: `get`s of loop-unwritten locals, consts,
+non-trapping unary/binary ops producing one value. `hmget`'s tag
+broadcast (`get h2;const25;shr;wrap;and;extend;constB;mul`) and
+pointer/stride math hoist to `run;set T` + `get T` per iteration.
+
+Soundness notes: `depth == 1` marks a complete expression (net stack
+effect); `written` covers `Nop` (deleted get;set still writes);
+`prel` KOS anchors inside a run are barriers (a `prel`-get at a
+hoisted instr's index lands in the preamble and becomes a chain
+operand — the `spec_from_iter` `local.set` underflow).
+
+`PLIRON_WASM_LICM_CHAIN=0` / `=dbg` knob. Module +210B preamble.
+
+## Residual state (post-licm)
+
+Geomean **0.966** (was 0.971). Module 204,706B vs LLVM 97,262B.
+
+| kernel | gap | dominant |
+|---|---|---|
+| strwork | +17% | `spec_extend`/`Chars::next` codegen density — `xor;and;lt_s` UTF8-boundary ~5 ops vs LLVM `and;eqz`; `k_strwork` 2374 toks vs `strwork::run` 488 |
+| hashmap | +15% | `hashmap::run` 1863 ins — SipHash state + probe loop; `local.set` spill threading |
+| hmget | +13% | probe loop `local.set`/`get` — LLVM keeps tag/h2 in locals; computed `base+idx` addr defeats `sfwd` |
+| tokenize | +13% | `k_tokenize` 213 vs LLVM 403 — `tokenize::run` inlined differently; iter/`next` density |
+| fib | +9% | `k_fib` 29 toks — `fib` inlined? — V8 inline-cap sensitive |
+| chars_ascii | +7% | `spec_extend`/`Iter::all` — `is_ascii` `x&128==0` vs `xor;and;lt_s` |
+| chars_mixed | +6% | same iter density |
+| nbody | +4% | `advance` f64 loop — `local.set`/`get` temporaries |
+| sortw/sieve/eqbug | ±3% | noise |
+
+**Structural**: CLIF SSA→wasm-locals threading (~2x `local.*` ops vs
+LLVM operand-stack). `walias`/`copymap`/`sfwd`/`licm` handle the
+`get`-produced and store→load cases; the residual is `set(OTHER)`
+locals (arith/load results) that are legitimately loop-carried.
+
+Next candidates: `xor(x,C)^D` / `and<mask` clifpeep folds for the
+UTF8-boundary shape; `spec_extend`/`Chars::next` density is the
+shared hot path for strwork/tokenize/chars/iterw/parse.

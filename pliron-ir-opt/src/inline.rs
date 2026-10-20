@@ -1021,6 +1021,14 @@ pub fn run(
     let hint: usize = crate::env_get("PLIRON_INLINE_HINT")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { 0 } else { 4 });
+    // Cap how many sites may inline one callee per run — a fat helper
+    // cloned into every caller duplicates its body module-wide
+    // (`PLIRON_INLINE_MAXDUP`; 0 = unbounded). `#[inline(always)]`
+    // bypasses: it's a semantic requirement.
+    let maxdup: usize = crate::env_get("PLIRON_INLINE_MAXDUP")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut dup: FxHashMap<String, usize> = FxHashMap::default();
     // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
@@ -1315,9 +1323,17 @@ pub fn run(
                         "reject (cap)"
                     } else if model && !free && grown + ci.n > growth {
                         "reject (growth)"
+                    } else if maxdup > 0
+                        && !f.always_inline
+                        && dup.get(cs).copied().unwrap_or(0) >= maxdup
+                    {
+                        "reject (dup)"
                     } else {
                         if model && !free {
                             grown += ci.n;
+                        }
+                        if maxdup > 0 {
+                            *dup.entry(cs.clone()).or_default() += 1;
                         }
                         size += ci.n;
                         sites.push((op, ci.op, cs.clone()));
