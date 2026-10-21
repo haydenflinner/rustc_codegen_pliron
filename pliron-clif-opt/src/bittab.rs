@@ -942,13 +942,13 @@ fn flat(func: &mut Function) -> usize {
                 n += 1;
                 continue;
             }
-            // A mask that fits 32 bits tests in i32 (`PLIRON_BITTAB32=1`):
+            // A mask that fits 32 bits tests in i32 (`PLIRON_BITTAB32=0` off):
             // a narrow `x` zero-extends first, so `x < lo` wraps `d` past
             // the guard exactly as the narrow subtraction did, and wasm
             // pays no i8 renormalizing `& 255` nor i64 extend/wrap.
             if bits >> 32 == 0
                 && xty.bits() <= 32
-                && crate::env_is("PLIRON_BITTAB32", "1")
+                && crate::pass_enabled("PLIRON_BITTAB32")
             {
                 let x32 = if xty == I32 { x } else { cur.ins().uextend(I32, x) };
                 let d = if lo > 0 {

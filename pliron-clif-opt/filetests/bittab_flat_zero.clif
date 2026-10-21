@@ -1,7 +1,7 @@
 ; test bittab
 ; Same fold with lo = 0 over {0,2,4,6}: no `isub`, mask uses raw bit
 ; positions (85).
-; check: iconst.i64 85
+; check: = 85
 ; check: ushr
 ; check-not: isub
 ; diffcheck

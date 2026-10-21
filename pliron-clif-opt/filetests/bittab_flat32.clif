@@ -1,0 +1,27 @@
+; test bittab
+; i8 `is_ascii_whitespace` ({9,10,12,13,32}, lo = 9, mask 0x80001b fits
+; 32 bits): the test runs in i32 on the zero-extended byte. A byte below
+; `lo` must wrap past the `< 32` guard exactly as the i8 subtraction did
+; — diffcheck covers 0..8 and 33..255 as well as the members.
+; check: uextend.i32
+; check: iconst.i32 0x0080_001b
+; check-not: iconst.i64
+; diffcheck
+function %ws(i8) -> i8 fast {
+block0(v0: i8):
+    v1 = iconst.i8 9
+    v2 = icmp eq v0, v1
+    v3 = iconst.i8 10
+    v4 = icmp eq v0, v3
+    v5 = bor v2, v4
+    v6 = iconst.i8 12
+    v7 = icmp eq v0, v6
+    v8 = bor v5, v7
+    v9 = iconst.i8 13
+    v10 = icmp eq v0, v9
+    v11 = bor v8, v10
+    v12 = iconst.i8 32
+    v13 = icmp eq v0, v12
+    v14 = bor v11, v13
+    return v14
+}

@@ -3,9 +3,10 @@
 ; must place bits at k - lo = {0,1,3,5} (43), not at the raw constants —
 ; emitting 86 with `ushr (x - 1)` accepts {2,3,5,7} instead.
 ; check: isub
-; check: iconst.i64 43
+; check: 43
 ; check: ushr
-; check-not: iconst.i64 86
+; check-not: = 86
+; check-not: iconst.i32 86
 ; diffcheck
 function %flat_lo(i32) -> i8 {
 block0(v0: i32):
