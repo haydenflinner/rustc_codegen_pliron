@@ -10,7 +10,7 @@ newest `.rlib`/`.rmeta`/`.dylib` in its `out/` dir (by `--slack` s) was
 written by an earlier session and nothing current references it.
 
   harness/objgc.py [--dry-run] [--slack SECS] [BUILD_DIR ...]
-Default BUILD_DIRs: target/*/build.
+Default BUILD_DIRs: target/*/build and target/*/deps (old layout).
 """
 import glob, os, sys
 
@@ -21,9 +21,39 @@ if "--slack" in args:
     slack = float(args[args.index("--slack") + 1])
 dirs = [a for a in args if not a.startswith("--") and not a.replace(".", "").isdigit()]
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-dirs = dirs or glob.glob("target/*/build")
+dirs = dirs or glob.glob("target/*/build") + glob.glob("target/*/deps")
 freed = n = 0
+
+
+def gc_flat(d):
+    """Old cargo layout: `deps/` holds every unit; objects are named
+    `<crate>-<hash>.<cgu>.rcgu.o` next to `lib<crate>-<hash>.rlib`."""
+    global freed, n
+    try:
+        ents = list(os.scandir(d))
+    except OSError:
+        return
+    newest = {}
+    for e in ents:
+        if e.name.endswith((".rlib", ".rmeta", ".dylib", ".so", ".a")) or "." not in e.name:
+            key = e.name.split(".")[0].removeprefix("lib")
+            newest[key] = max(newest.get(key, 0), e.stat().st_mtime)
+    for e in ents:
+        if e.name.endswith(".rcgu.o"):
+            key = e.name.split(".")[0]
+            if key in newest:
+                st = e.stat()
+                if st.st_mtime < newest[key] - slack:
+                    freed += st.st_size
+                    n += 1
+                    if not dry:
+                        os.unlink(e.path)
+
+
 for bd in dirs:
+    if os.path.basename(bd.rstrip("/")) == "deps":
+        gc_flat(bd)
+        continue
     for out in glob.glob(os.path.join(bd, "*", "*", "out")):
         try:
             ents = list(os.scandir(out))
