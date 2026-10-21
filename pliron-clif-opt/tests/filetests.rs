@@ -51,6 +51,7 @@ fn pass(name: &str) -> Pass {
         "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "zext_chain" => clifpeep::zext_chain,
+        "brif_zh" => clifpeep::brif_zh,
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,
         "iconst128" => |f| clifpeep::iconst128(f, true),
