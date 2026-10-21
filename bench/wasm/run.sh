@@ -33,12 +33,18 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WROOT=$(cygpath -m "$ROOT") ;; esac
 # rlibs hold wasm-ld objects pliron-wasm-ld cannot read, so -Zbuild-std
 # rebuilds them (same reason as tests/wasm/run.sh). Cargo does not track
 # the backend dylib, so the target dir starts fresh.
+# std crates build at one codegen unit, as rustup's prebuilt std does
+# (bootstrap's `codegen-units-std = 1`): at the release default of 16,
+# non-`#[inline]` std helpers land in other CGUs and can't inline —
+# dragon::format_exact's per-digit `Big::cmp` stayed an out-of-line
+# call, +22% vs +15% on strwork. The kernel crate keeps the default.
 rm -rf "$ROOT/target/wasm-bench"
 (cd bench/wasm &&
   CARGO_TARGET_DIR=$ROOT/target/wasm-bench \
   RUSTFLAGS="-Zcodegen-backend=$WROOT/target/debug/$lib -Clinker=$WLD" \
   cargo build -q --release --target wasm32-unknown-unknown \
-  -Zbuild-std=std,panic_abort)
+  -Zbuild-std=std,panic_abort \
+  --config 'profile.release.package."*".codegen-units=1')
 
 exec node "$ROOT/bench/wasm/run.mjs" \
   "$ROOT/target/wasm-bench-llvm/wasm32-unknown-unknown/release/wasmbench.wasm" \
