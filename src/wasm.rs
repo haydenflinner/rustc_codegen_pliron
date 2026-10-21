@@ -613,7 +613,7 @@ impl PeepOpts {
             trace: false,
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
             delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
-            bri: crate::env_get("PLIRON_WASM_BRI") == Some("1"),
+            bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
         }
     }
 }
