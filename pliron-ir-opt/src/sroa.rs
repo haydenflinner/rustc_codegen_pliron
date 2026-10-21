@@ -1426,7 +1426,8 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     for f in funcs {
         // No alloca anywhere: `forward_single_store`, the split rounds
         // and the trailing cleanup all have nothing to do.
-        if allocas(ctx, f).is_empty() {
+        let mut wl = allocas(ctx, f);
+        if wl.is_empty() {
             continue;
         }
         // The `Dom` survives both `forward_single_store` calls — neither
@@ -1445,7 +1446,6 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         // partial splits alike) is what the next round's rescan would
         // have retried, plus the ops `split` created, which sat just
         // before their parent in the scan. Order is preserved exactly.
-        let mut wl = allocas(ctx, f);
         let bname = crate::bisect_name(st, f);
         for _round in 0..3 {
             let mut changed = false;

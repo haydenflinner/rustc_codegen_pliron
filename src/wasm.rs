@@ -90,18 +90,22 @@ thread_local!(static QUIET: Cell<bool> = const { Cell::new(false) });
 
 /// Diagnose malformed targets before waffle's optimizer ICEs on
 /// them: every branch's arg count must equal the target's params.
+/// Debug-only: release skips it — it ran per splice and per function,
+/// and a real arity bug lands as malformed wasm at instantiation anyway.
 fn check_targets(b: &FunctionBody, name: &str) {
-    for bi in b.blocks.iter() {
-        b.blocks[bi].terminator.visit_targets(|t| {
-            assert_eq!(
-                t.args.len(),
-                b.blocks[t.block].params.len(),
-                "{name}: block{bi:?} -> {:?} args {} != params {}",
-                t.block,
-                t.args.len(),
-                b.blocks[t.block].params.len()
-            );
-        });
+    if cfg!(debug_assertions) {
+        for bi in b.blocks.iter() {
+            b.blocks[bi].terminator.visit_targets(|t| {
+                assert_eq!(
+                    t.args.len(),
+                    b.blocks[t.block].params.len(),
+                    "{name}: block{bi:?} -> {:?} args {} != params {}",
+                    t.block,
+                    t.args.len(),
+                    b.blocks[t.block].params.len()
+                );
+            });
+        }
     }
 }
 
