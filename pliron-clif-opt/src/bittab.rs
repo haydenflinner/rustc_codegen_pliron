@@ -40,7 +40,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
-use cranelift_codegen::ir::types::{I8, I64, I128};
+use cranelift_codegen::ir::types::{I8, I32, I64, I128};
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
@@ -936,6 +936,35 @@ fn flat(func: &mut Function) -> usize {
                     });
                 }
                 let c = acc.unwrap();
+                func.dfg.clear_results(i);
+                func.dfg.change_to_alias(out, c);
+                func.layout.remove_inst(i);
+                n += 1;
+                continue;
+            }
+            // A mask that fits 32 bits tests in i32 (`PLIRON_BITTAB32=1`):
+            // a narrow `x` zero-extends first, so `x < lo` wraps `d` past
+            // the guard exactly as the narrow subtraction did, and wasm
+            // pays no i8 renormalizing `& 255` nor i64 extend/wrap.
+            if bits >> 32 == 0
+                && xty.bits() <= 32
+                && crate::env_is("PLIRON_BITTAB32", "1")
+            {
+                let x32 = if xty == I32 { x } else { cur.ins().uextend(I32, x) };
+                let d = if lo > 0 {
+                    let c = cur.ins().iconst(I32, lo as i64);
+                    cur.ins().isub(x32, c)
+                } else {
+                    x32
+                };
+                let g = cur.ins().iconst(I32, 32);
+                let ig = cur.ins().icmp(IntCC::UnsignedLessThan, d, g);
+                let m = cur.ins().iconst(I32, bits as i64);
+                let z = cur.ins().iconst(I32, 0);
+                let mg = cur.ins().select(ig, m, z);
+                let sh = cur.ins().ushr(mg, d);
+                let bit = cur.ins().band_imm_u(sh, 1);
+                let c = cur.ins().icmp(IntCC::NotEqual, bit, z);
                 func.dfg.clear_results(i);
                 func.dfg.change_to_alias(out, c);
                 func.layout.remove_inst(i);
