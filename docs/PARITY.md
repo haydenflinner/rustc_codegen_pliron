@@ -17,7 +17,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.925** | ahead; real gaps: `strwork` +30%, `hmget` +18%, `parse_only` +9-11% |
+| wasm runtime (geomean, 16 kernels) | **0.925** | ahead; real gaps: `strwork` +30%, `hmget` +14%, `parse_only` +9-11% |
 | wasm module size | 1.93 (183.0 KiB vs 95 KiB) | behind |
 | compile time: bench kernels, native | **0.60** (0.26 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.18** (0.62 s vs 0.52 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
@@ -469,7 +469,7 @@ inliner and `wpeep` on top of the same pipeline; profile
 | chars_mixed | ~1.4 | **partially DONE**: `NonNull`-i32 (`PLIRON_NN_ANYINT`) folds `eqz`-through-`phi`/`select`/`nonnull` → the `ptr==end`+`byte_ptr==0` `Option`-niche double-check is gone; `dem64` (`PLIRON_DEM64`) demotes `Option<u32>`/`usize`/`char` low-32 i64 webs → the `i64.extend; i64.and 128; i64.ne`→`i32` per-char overhead is gone (`chars_ascii` `i64` refs 23→0, +35→+9%). Residual = `next_code_point`/UTF-8 multi-byte decode (`load offset=1..3`, `&63`, `shl`, `or`, `ge_u` branches — LLVM's `byte<0?decode:cp<128` path is tighter) + locals churn. |
 | parse_only | ~1.09 | **SwitchOp on wasm** (`PLIRON_SWITCH_WASM`, `builder.rs`): the "wasm.rs has no SwitchOp lowering" exclusion was stale — `dense_switch`→`br_table`/`ifconv` select chains work; the `from_str_radix` digit `match` became selects, +31%→+9%. |
 | tokenize | ~0.67 | ahead |
-| hmget | ~1.17 | hashbrown probe + SipHash; the probe loop's `local.*` traffic is ~1.4× LLVM's — emit-level density, below |
+| hmget | ~1.14 | **partially DONE**: `licm`'s `deref_fact` (`PLIRON_LICM_PEEL=0` off) peels a scope-named load address (`v37 = v0 + 16`, the inlined `hash_one` `&RandomState` operand) to the entry param and borrows its `dereferenceable`+readonly fact — the per-probe `k0` reload and the key-only half of the first SipHash round now hoist like LLVM's. `clobbers` keys disjointness on the concrete object so `iso` can't hide a scope-name/param overlap (`licm_frozen_region` regression). Residual: probe-loop `local.*` traffic ~1.4× LLVM's — emit-level density, below |
 | hashmap | ~1.03 | at parity |
 | strwork | ~1.26 | `dragon::format_exact` is +53% of its samples vs LLVM — emit-level density: 182 `if`/`else` pairs vs LLVM's flat `block`+`br_if` (0 `if`), 271 labels vs 124, `local.*` 1.9×. |
 | fib | ~0.96 | ahead post `br_if` fold + `dem64`/`NonNull` |
