@@ -89,6 +89,9 @@ time) in ~15 min and writes `target/parity/summary.md`.
   no rebuild — try them before editing code.
 - The live dashboard's "size movers" panel shows which corpus functions
   your edit made bigger or smaller.
+- wasm runtime under V8: `harness/v8/` (per-function and per-instruction
+  tick attribution, TurboFan listings, bench variants) — read
+  `docs/experiments.md` first for what has already been tried.
 
 ### Compile time
 

@@ -481,6 +481,8 @@ before you cut: two traps cost this session hours.
   heat), `--cpu-prof` per-function self time, a `panic_bounds_check`
   `Location` decoder over the data segments.
 
+Full tried/rejected list: `docs/experiments.md`; tools: `harness/v8/`.
+
 Landed: `punroll` deepest-first (`PLIRON_PUNROLL_DEEP`: format_exact's
 bignum `mul_small`/`sub` loops never got the 8-transform budget), waffle
 `treeify` loop guard (`PLIRON_WTREE_LOOP`: single-use invariants licm
