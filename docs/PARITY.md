@@ -17,7 +17,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.900** | ahead (2026-10-21, `--layouts=3`); gaps: `strwork` +14%, `parse_only` +10% (placement-sensitive, 9-19%), `nbody` +4%, `hmget` +2% |
+| wasm runtime (geomean, 16 kernels) | **0.898** | ahead (2026-10-21, `--layouts=3`); gaps: `strwork` +14%, `parse_only` +10% (placement-sensitive, 9-19%), `nbody` +4%, `hmget` +2% (2026-10-21) |
 | wasm module size | 1.93 (183.0 KiB vs 95 KiB) | behind |
 | compile time: bench kernels, native | **0.60** (0.26 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.18** (0.62 s vs 0.52 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
@@ -500,7 +500,7 @@ opt-in); `PLIRON_WASM_INLINE=0`/`PLIRON_WASM_PEEP=0`/`PLIRON_DEM64=0`
 | tokenize | ~0.67 | ahead |
 | hmget | ~1.02 | 2026-10-21: waffle `treeify` was re-sinking the hoisted SipHash invariants into the probe loop (`PLIRON_WTREE_LOOP`), and `dem64` left the control byte as wrap/and/extend (`PLIRON_ZXCHAIN`). Earlier, **partially DONE**: `licm`'s `deref_fact` (`PLIRON_LICM_PEEL=0` off) peels a scope-named load address (`v37 = v0 + 16`, the inlined `hash_one` `&RandomState` operand) to the entry param and borrows its `dereferenceable`+readonly fact — the per-probe `k0` reload and the key-only half of the first SipHash round now hoist like LLVM's. `clobbers` keys disjointness on the concrete object so `iso` can't hide a scope-name/param overlap (`licm_frozen_region` regression). Residual: probe-loop `local.*` traffic ~1.4× LLVM's — emit-level density, below |
 | hashmap | ~1.03 | at parity |
-| strwork | ~1.14 | Native is 0.97 — the loss is wasm-only. 2026-10-21 per-function V8 profile: `format_exact` + bignum helpers 1.44× LLVM's ticks (~85% of the gap) before the std-CGU fix; profile is flat (no instruction >1%) with ~1.4-2.9× TurboFan code per function and stack reloads (FP/int pressure). Bounds checks: 27 `bignum.rs:390` sites survive in `format_exact` vs LLVM's 4 (e.g. `mul_pow2`'s copy loop keeps `i < 40` and `i + digits < 40`). Not the GOT, not the waffle inliner, not wpeep. |
+| strwork | ~1.14 | Native is 0.97 — the loss is wasm-only. 2026-10-21 per-function V8 profile: `format_exact` + bignum helpers 1.44× LLVM's ticks (~85% of the gap) before the std-CGU fix; profile is flat (no instruction >1%) with ~1.4-2.9× TurboFan code per function and stack reloads (FP/int pressure). Bounds checks: 27 `bignum.rs:390` sites survive in `format_exact` vs LLVM's 4 (e.g. `mul_pow2`'s copy loop keeps `i < 40` and `i + digits < 40`). Not the GOT, not the waffle inliner, not wpeep. After the std-CGU fix (+14%): `Big::cmp` loops are hot by load latency but run 1-2 limbs per call — `zipiv` (`PLIRON_ZIPIV=1`, opt-in) cut their per-limb ops ~2× (one exit test, no `select`s) with no runtime change. Both `size` fields stay in memory in LLVM too. Tick-to-wasm attribution (V8 `--prof` + TurboFan source positions) is flat; no single construct explains the rest. |
 | fib | ~0.96 | ahead post `br_if` fold + `dem64`/`NonNull` |
 | nbody | ~1.04 | Fully unrolled in both; ours does *less* work (53 vs 65 `f64.add`, same final stores) but TurboFan spills (`ldr d17, [sp, #24]`): ~30 f64 values live across the 10 unrolled pairs. Ordering/pressure, not op count. |
 | sieve, sortw | ~1.0 | at/near parity post `dem64`/`NonNull` (sortw 0.9%, sieve 2.5%) |
