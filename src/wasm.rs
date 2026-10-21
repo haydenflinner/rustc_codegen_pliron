@@ -6153,6 +6153,11 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     const ALWAYS_CAP: usize = 300;
     const ROUNDS: usize = 8;
     let body_size = |b: &FunctionBody| -> usize { b.blocks.values().map(|d| d.insts.len()).sum() };
+    // Total spliced insts per caller across rounds: the per-round
+    // `cur_size` check alone can't bound the cascade — post-optimize
+    // shrinkage can drop it back under the cap every round, letting a
+    // caller grow ~cap per round for ROUNDS rounds.
+    let mut grown = vec![0usize; funcs.len()];
     let mut inlined = 0usize;
     for round in 0..ROUNDS {
         // callsite count per callee; ref.func keeps the standalone
@@ -6213,7 +6218,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048);
             let mut cur_size = body_size(funcs[ci].body.as_ref().unwrap());
-            if cur_size > caller_cap {
+            if cur_size > caller_cap || grown[ci] > caller_cap {
                 continue;
             }
             // One scan per caller: collect all eligible call values.
@@ -6281,7 +6286,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
             if !sites.is_empty() {
                 did = true;
                 for &(iv, fi) in &sites {
-                    if cur_size > caller_cap {
+                    if cur_size > caller_cap || grown[ci] > caller_cap {
                         break;
                     }
                     let callee = funcs[fi].body.clone().unwrap();
@@ -6294,7 +6299,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                     if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv) {
                         inline_site(b, blk, pos, iv, &callee, sp);
                         check_targets(b, &funcs[fi].name);
-                        cur_size += body_size(&callee);
+                        let n = body_size(&callee);
+                        cur_size += n;
+                        grown[ci] += n;
                         inlined += 1;
                     }
                 }
