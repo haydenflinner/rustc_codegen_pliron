@@ -1029,6 +1029,15 @@ pub fn run(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let mut dup: FxHashMap<String, usize> = FxHashMap::default();
+    // `PLIRON_INLINE_LOOPY=<n>` (small mode; 0/unset = off): a callee over
+    // `n` ops with loops of its own, called outside every caller loop,
+    // stays out of line unless free. Its loops amortize the call; each
+    // inlined copy only adds code (`mul_pow10` took five 414-op
+    // `mul_digits` copies under the flat `WASM_LIMIT`).
+    let loopy_min: usize = crate::env_get("PLIRON_INLINE_LOOPY")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut has_loop: FxHashMap<String, bool> = FxHashMap::default();
     // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
     // grow code on heuristics tuned for speed.
@@ -1306,8 +1315,21 @@ pub fn run(
                         && st
                             .invokes.get(op)
                             .is_some_and(|&(_, catch)| catch || !eh_invoke);
+                    let loopy = small
+                        && loopy_min > 0
+                        && !free
+                        && !f.inline_hint
+                        && ci.n > loopy_min
+                        && !loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                        && *has_loop
+                            .entry(cs.clone())
+                            .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty());
                     let why = if cost > t {
                         "reject (score)"
+                    } else if loopy {
+                        "reject (loopy)"
                     } else if eh_block {
                         "reject (eh)"
                     } else if ci.op == caller || st.calls[op].fn_ty != f.ty {
