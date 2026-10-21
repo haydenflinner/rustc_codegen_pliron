@@ -34,12 +34,11 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
 }
 
 /// `deref`'s `(bytes, writable)` fact for root `v`, plus `v`'s byte offset
-/// into the value the fact is keyed by. With `PLIRON_LICM_PEEL=1` a scope
-/// name with no fact of its own (an inlined callee's `noalias` operand,
-/// `&m.hasher` = `m + 16`) peels to the function param it sits at a
-/// constant offset into. Only entry-block params: their facts hold for the
-/// whole function, while a clone param's `region_frozen` seed holds only
-/// inside its region.
+/// into the value the fact is keyed by. A scope name with no fact of its
+/// own (an inlined callee's `noalias` operand, `&m.hasher` = `m + 16`)
+/// peels to the function param it sits at a constant offset into. Only
+/// entry-block params: their facts hold for the whole function, while a
+/// clone param's `region_frozen` seed holds only inside its region.
 fn deref_fact(
     func: &Function,
     ps: &VMap<Value>,
@@ -72,7 +71,7 @@ fn peel_on() -> bool {
         2 => return false,
         _ => {}
     }
-    pliron_cfg::env_is("PLIRON_LICM_PEEL", "1")
+    pliron_cfg::pass_enabled("PLIRON_LICM_PEEL")
 }
 
 /// `[off, off + ty.bytes())` lies inside an object of `bytes` bytes.
@@ -1880,10 +1879,10 @@ mod tests {
 
     /// A scope-name root with no `deref` fact of its own — an inlined
     /// `hash_one`'s `&RandomState` operand `q = m + 16` — borrows the
-    /// entry param's `dereferenceable`+readonly fact under
-    /// `PLIRON_LICM_PEEL=1`: `load q+0` hoists past an unrelated store
-    /// (hmget's SipHash `k0` reload), while `load q+16` (bytes 32..40 of
-    /// a 32-byte pointee) stays. Off, both stay.
+    /// entry param's `dereferenceable`+readonly fact: `load q+0` hoists
+    /// past an unrelated store (hmget's SipHash `k0` reload), while
+    /// `load q+16` (bytes 32..40 of a 32-byte pointee) stays.
+    /// `PLIRON_LICM_PEEL=0` keeps both in the loop.
     #[test]
     fn scope_name_load_borrows_param_deref() {
         let build = || {
