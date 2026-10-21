@@ -629,9 +629,15 @@ fn frozen_params(
     usize,
 ) {
     use rustc_target::callconv::{ArgAttribute as A, ArgAttributes, PassMode};
+    // `pointee_size` is also set for nullable refs (`Option<&T>`), which
+    // LLVM lowers to `dereferenceable_or_null`: only `NonNull` makes the
+    // bytes unconditionally loadable. Frozen loads become `can_move`, and
+    // `deref` licenses licm's speculative hoists — both would move a load
+    // above its null check (regex-automata `find_fwd_imp` read `*pre` with
+    // `pre == None`).
     let size = |a: &ArgAttributes| {
         let n = a.pointee_size.bytes();
-        (a.regular.contains(A::NoAlias | A::ReadOnly) && n > 0).then_some(n)
+        (a.regular.contains(A::NoAlias | A::ReadOnly | A::NonNull) && n > 0).then_some(n)
     };
     let nn = |a: Option<&ArgAttributes>| a.is_some_and(|a| a.regular.contains(A::NonNull));
     let mut v = Vec::new();
@@ -663,7 +669,10 @@ fn frozen_params(
             v.push((i, s));
         }
         if let Some(a) = a.filter(|a| a.regular.contains(A::NoAlias)) {
-            na.push((i, a.pointee_size.bytes(), !a.regular.contains(A::ReadOnly)));
+            // 0 bytes = no dereferenceability claim (nullable: see `size`);
+            // the `noalias` itself still holds when non-null.
+            let n = if a.regular.contains(A::NonNull) { a.pointee_size.bytes() } else { 0 };
+            na.push((i, n, !a.regular.contains(A::ReadOnly)));
         }
         // `nonnull` leaf attrs: direct/pair element attrs and the
         // indirect/meta pointers. Cast args are packed; skip them.

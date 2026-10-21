@@ -24,8 +24,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "target", "crates")
 TOOLCHAIN = "nightly-2026-10-06"
 
-# (name, version, extra cargo-test args, tier). Pinned 2026-10-21; bump
-# deliberately so a new failure means a compiler change, not a crate one.
+# (name, version, extra cargo-test args, tier[, git]). Pinned 2026-10-21;
+# bump deliberately so a new failure means a compiler change, not a crate
+# one. `git = (url, tag)`: the published package lacks its test data or
+# test-only path deps, so build from the tagged repo (`-p name` from its
+# root; the repo's own workspace stays intact).
+REGEX_GIT = "https://github.com/rust-lang/regex"
 CRATES = [
     ("ryu", "1.0.23", [], 1),
     ("itoa", "1.0.18", [], 1),
@@ -33,8 +37,8 @@ CRATES = [
     ("memchr", "2.8.3", [], 1),
     ("aho-corasick", "1.1.5", [], 1),
     ("regex-syntax", "0.8.11", [], 1),
-    ("regex-automata", "0.4.18", [], 1),
-    ("regex", "1.13.1", [], 1),
+    ("regex-automata", "0.4.18", [], 1, (REGEX_GIT, "regex-automata-0.4.18")),
+    ("regex", "1.13.1", [], 1, (REGEX_GIT, "1.13.1")),
     ("hashbrown", "0.17.1", [], 1),
     ("indexmap", "2.14.2", [], 1),
     ("smallvec", "1.16.3", [], 1),
@@ -43,14 +47,29 @@ CRATES = [
     ("num-bigint", "0.5.1", [], 1),
     ("libm", "0.2.16", [], 1),
     ("sha2", "0.11.1", [], 1),
-    ("blake3", "1.8.7", [], 1),
+    ("blake3", "1.8.7", [], 1, ("https://github.com/BLAKE3-team/BLAKE3", "1.8.7")),
     ("crc32fast", "1.5.3", [], 1),
     ("miniz_oxide", "0.9.1", [], 1),
     ("png", "0.18.1", [], 1),
 ]
 
-TEST_LINE = re.compile(r"^test (\S+) (?:- should panic )?\.\.\. (ok|FAILED|ignored)")
+TEST_LINE = re.compile(r"^test (.+?) (?:- should panic )?\.\.\. (ok|FAILED|ignored)$")
 RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed")
+
+
+def fetch_git(name, ver, url, tag):
+    d = os.path.join(OUT, "src", f"{name}-{ver}-git")
+    if not os.path.exists(os.path.join(d, "Cargo.toml")):
+        os.makedirs(os.path.dirname(d), exist_ok=True)
+        subprocess.run(["git", "-c", "advice.detachedHead=false", "clone", "-q", "--depth", "1",
+                        "--branch", tag, url, d], check=True)
+        # A single-crate repo has no workspace table: without one, cargo
+        # adopts it into ours (it sits under our target/).
+        manifest = os.path.join(d, "Cargo.toml")
+        if "[workspace]" not in open(manifest).read():
+            with open(manifest, "a") as f:
+                f.write("\n[workspace]\n")
+    return d
 
 
 def fetch(name, ver):
@@ -149,11 +168,15 @@ def main():
     os.makedirs(os.path.join(OUT, "logs"), exist_ok=True)
     stamp_ok(os.path.join(OUT, "target-pliron"), lib)
     rows = []
-    for name, ver, args, tier in CRATES:
+    for name, ver, args, tier, *git in CRATES:
         if tier > a.tier or (only and name not in only):
             continue
         try:
-            src = fetch(name, ver)
+            if git:
+                src = fetch_git(name, ver, *git[0])
+                args = ["-p", name] + args
+            else:
+                src = fetch(name, ver)
         except Exception as e:
             print(f"{name}: fetch failed: {e}")
             continue

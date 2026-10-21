@@ -48,7 +48,34 @@ fn check_unused(a: &Attr) -> u32 {
     }
 }
 
+// An `Option<&T>` param is `dereferenceable_or_null`: rustc sets its
+// `pointee_size` but not `NonNull`. Treating the size as an unconditional
+// `dereferenceable` let licm hoist `*pre` above the `Some` check (null
+// read — regex-automata `hybrid::search::find_fwd_imp`, ~160 regex
+// tests SIGSEGV).
+pub struct Pre {
+    k: u64,
+    #[allow(dead_code)]
+    pad: [u64; 3],
+}
+
+#[inline(never)]
+fn scan(pre: Option<&Pre>, hay: &[u8]) -> u64 {
+    let mut s = 0u64;
+    for &b in hay {
+        s += match pre {
+            Some(p) if b > 0 => p.k + u64::from(b),
+            _ => u64::from(b),
+        };
+    }
+    s
+}
+
 fn main() {
+    let hay = std::hint::black_box([1u8, 2, 0, 3]);
+    assert_eq!(scan(std::hint::black_box(None), &hay), 6);
+    let pre = Pre { k: 10, pad: [0; 3] };
+    assert_eq!(scan(Some(&pre), &hay), 36);
     // The Parsed payload is zeros — a speculative box deref reads 0+0x30.
     let p = Attr::Parsed([0, 0, 0, 0]);
     assert_eq!(check_unused(&p), 0);

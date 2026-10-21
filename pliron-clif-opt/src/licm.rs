@@ -226,8 +226,33 @@ fn split_edge(func: &mut Function, pinst: Inst, slot: usize) -> Option<Block> {
 /// write can clobber.
 type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
 
+/// `hoists_inner` plus a `PLIRON_OPT_BISECT` unit per accepted load
+/// hoist (`licm-load`): one licm run moves many loads, and a bad one
+/// needs to be told apart from the rest.
 #[allow(clippy::too_many_arguments)]
 fn hoists(
+    func: &Function,
+    ps: &VMap<Value>,
+    na: &FxHashSet<Value>,
+    inv: &dyn Fn(&Function, Value) -> bool,
+    writers: &[Inst],
+    iso: &FxHashSet<Root>,
+    nw: &FxHashMap<FuncRef, bool>,
+    deref: &FxHashMap<Value, (u64, bool)>,
+    scoped_na: &FxHashSet<Value>,
+    scoped: &FxHashMap<Inst, Region>,
+    breg: &FxHashMap<Block, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
+    ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    pb: Block,
+    i: Inst,
+) -> bool {
+    hoists_inner(func, ps, na, inv, writers, iso, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i)
+        && (!func.dfg.insts[i].opcode().can_load() || pliron_cfg::bisect("licm-load"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hoists_inner(
     func: &Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,

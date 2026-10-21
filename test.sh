@@ -70,7 +70,13 @@ t_unroll() {
 
 t_licm() {
   # LICM must not speculate enum-payload derefs past the discriminant guard.
-  rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm$exe && $out/licm$exe
+  rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm$exe && $out/licm$exe || return 1
+  # `scan`'s `Option<&Pre>` is dereferenceable_or_null: its loads must not
+  # be `can_move` (frozen) — that let them run above the null check.
+  if PLIRON_CLIF=4scan rustc $BE --edition 2021 -O tests/licm/main.rs -o $out/licm2$exe 2>&1 >/dev/null \
+      | awk '/4scan final/,0' | grep -q "can_move"; then
+    echo "nullable Option<&T> param treated as dereferenceable (can_move load)"; return 1
+  fi
 }
 
 t_loadpre() {
