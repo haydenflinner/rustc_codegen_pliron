@@ -320,6 +320,7 @@ fn with_pipe<R>(
         x64,
         cmp64: true,
         amode_scale: pipeline::amode_scale(isa),
+        wasm: false,
         has_eh: false,
         flags: &flags,
         dump: false,

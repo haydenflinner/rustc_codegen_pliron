@@ -192,6 +192,10 @@ pub struct Pipe<'a> {
     /// output computes every address explicitly — indvars then wants
     /// stepped pointer IVs rather than leaving `base + iv*s` inside.
     pub amode_scale: bool,
+    /// Emit goes through waffle to wasm rather than a register-allocated
+    /// ISA — passes whose only payoff is shaping code for regalloc
+    /// (`coldarg`'s cold-site arg rebinding) have nothing to fix.
+    pub wasm: bool,
     pub has_eh: bool,
     pub flags: &'a FnFlags,
     /// `PLIRON_CLIF=<substr>` matched this function's name.
@@ -2373,7 +2377,13 @@ fn s_wide_minmax(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // pinning lands at the cold call site instead of constraining the
 // whole hot loop's register allocation.
 fn s_coldarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::coldargs(&mut p.clctx.func);
+    // Nothing pins registers on wasm; the disguised `umulhi x, 0` zero
+    // would only cost a widened-mul expansion per cold arg.
+    let k = if p.wasm {
+        0
+    } else {
+        clifpeep::coldargs(&mut p.clctx.func)
+    };
     if k > 0 && p.dump {
         p.dump("coldargs");
     }
@@ -4019,6 +4029,7 @@ mod tests {
             x64: false,
             cmp64: true,
             amode_scale: amode_scale(&*isa),
+            wasm: false,
             has_eh: false,
             flags: &flags,
             prof_hook: None,
