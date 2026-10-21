@@ -595,6 +595,8 @@ struct PeepOpts {
     trace: bool,
     /// Dead stack-value flush (`PLIRON_WASM_DDROP`).
     ddrop: bool,
+    /// Dead-else arm flush (`PLIRON_WASM_DELSE`).
+    delse: bool,
 }
 
 impl PeepOpts {
@@ -608,6 +610,7 @@ impl PeepOpts {
             skipped: std::cell::Cell::new(0),
             trace: false,
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
+            delse: crate::env_get("PLIRON_WASM_DELSE") == Some("1"),
         }
     }
 }
@@ -2229,6 +2232,133 @@ fn peep_body_opts(
                 out.push((WPeek::BrIf(d - 1), ins[i].1, ins[i].1, ins[i].3));
                 out.extend(arm2.iter().copied());
                 i = j + 1; // past `end`
+                continue 'iter;
+            }
+            out.push(ins[i]);
+            i += 1;
+        }
+        ins = out;
+    }
+    // Dead-else: `if c { A } else { br K } end` where the `end` is
+    // followed by K enclosing `end`s — the else arm's branch lands at
+    // the same continuation the `end` fallthrough reaches, so the whole
+    // arm is dead; arm1's own trailing `br` dies on the same grounds.
+    // Arm1's other insts are kept verbatim (the `if` level stays, so
+    // its label depths are unchanged). `if c {}` reduces to `drop`: it
+    // only consumes the condition. Only the void blocktype is safe.
+    // `PLIRON_WASM_DELSE=0` off.
+    if opts.delse {
+        let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
+        let mut i = 0;
+        'iter: while i < ins.len() {
+            if !(matches!(ins[i].0, WPeek::Ctl) && b[ins[i].1] == 0x04)
+                || b.get(ins[i].1 + 1) != Some(&0x40)
+            {
+                out.push(ins[i]);
+                i += 1;
+                continue;
+            }
+            'fold: {
+                // Scan arms at rel 0: arm1 is anything, arm2 must be
+                // exactly `br K`.
+                let mut rel = 0usize;
+                let mut in_arm2 = false;
+                let mut arm1: Vec<usize> = Vec::new();
+                let mut arm2: Vec<usize> = Vec::new();
+                let mut j = i + 1;
+                let mut bad = false;
+                while j < ins.len() {
+                    let s2 = ins[j].1;
+                    match b[s2] {
+                        0x0b if rel == 0 => break, // `end` of the `if`
+                        0x0b => rel -= 1,
+                        0x05 if rel == 0 => {
+                            if in_arm2 {
+                                bad = true;
+                                break;
+                            }
+                            in_arm2 = true;
+                            j += 1;
+                            continue;
+                        }
+                        0x02 | 0x03 | 0x04 => rel += 1,
+                        _ => {}
+                    }
+                    if in_arm2 {
+                        arm2.push(j);
+                    } else {
+                        arm1.push(j);
+                    }
+                    j += 1;
+                }
+                if bad || j >= ins.len() || arm2.len() != 1 {
+                    break 'fold;
+                }
+                let a2only = arm2[0];
+                let br_of = |x: usize| -> Option<usize> {
+                    match ins[x].0 {
+                        WPeek::Br(d) => Some(d as usize),
+                        _ if b[ins[x].1] == 0x0c => {
+                            let mut dp = ins[x].1 + 1;
+                            urd(b, &mut dp).map(|d| d as usize)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(k) = br_of(a2only) else {
+                    break 'fold;
+                };
+                // Arm1's own trailing `br K'` is dead on the same
+                // grounds — the fallthrough reaches its target through
+                // K' `end`s — so drop it when those ends exist too.
+                let mut a1len = arm1.len();
+                let k1 = a1len.checked_sub(1).and_then(|x| br_of(arm1[x]));
+                let mut kmax = k.max(k1.unwrap_or(0));
+                // `br K` from inside an arm exits the `if` + K outer
+                // labels — the fallthrough lands there only when the K
+                // parent tails are empty (`end`s only).
+                let ends_clear = |n: usize| {
+                    (j + 1..j + 1 + n)
+                        .all(|x| ins.get(x).is_some_and(|&(_, s, _, _)| b[s] == 0x0b))
+                };
+                if !ends_clear(kmax) {
+                    if k1.is_some_and(|x| x > k) {
+                        // Arm1's `br` reaches further than the else's —
+                        // keep it, fold the else arm alone.
+                        kmax = k;
+                        if !ends_clear(kmax) {
+                            break 'fold;
+                        }
+                    } else {
+                        break 'fold;
+                    }
+                } else if k1.is_some() {
+                    a1len -= 1; // drop arm1's trailing `br`
+                }
+                // `prel` anchors in the deleted span (arm1's `br`, the
+                // `else` marker, arm2's `br`) lose their emit slot; it
+                // sits between the kept insts and the `end`.
+                let lo = arm1[..a1len]
+                    .last()
+                    .map(|&x| ins[x].1)
+                    .unwrap_or(ins[i].1);
+                if prel
+                    .iter()
+                    .any(|&(pp, _)| pp > lo && pp <= ins[a2only].1)
+                {
+                    break 'fold;
+                }
+                if a1len == 0 {
+                    // `if c {} else {br K}` — only consumes the cond.
+                    out.push((WPeek::Drop, ins[i].1, ins[i].1, ins[i].3));
+                } else {
+                    out.push(ins[i]);
+                    for &x in &arm1[..a1len] {
+                        out.push(ins[x]);
+                    }
+                    out.push(ins[j]);
+                }
+                i = j + 1;
                 continue 'iter;
             }
             out.push(ins[i]);
@@ -4481,12 +4611,19 @@ mod wpeep_tests {
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
             ddrop: false,
+            delse: false,
         }
     }
 
     fn opts_dd() -> PeepOpts {
         let mut o = opts(false, false);
         o.ddrop = true;
+        o
+    }
+
+    fn opts_delse() -> PeepOpts {
+        let mut o = opts(false, false);
+        o.delse = true;
         o
     }
 
@@ -4784,6 +4921,86 @@ mod wpeep_tests {
         assert!(has_seq(&out, &[0x6b, 0x21, 0x05]), "tee->set lost: {out:02x?}");
         assert!(!has_seq(&out, &[0x22]), "tee kept: {out:02x?}");
         assert!(!has_seq(&out, &[0x20, 0x03]), "dead chain kept: {out:02x?}");
+    }
+
+    // delse: `if { A; br K } else { br K }` with K empty parent tails —
+    // both arms land at the same continuation, so the else arm and
+    // arm1's `br` die.
+    #[test]
+    fn delse_br_arms_fold_to_bare_if() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block A
+                0x02, 0x40, // block B
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x41, 0x07, 0x21, 0x01, // const 7; set 1
+                0x0c, 0x01, // br 1 -> B's end
+                0x05, // else
+                0x0c, 0x01, // br 1 — same landing
+                0x0b, // end (if)
+                0x0b, // end (B)
+                0x20, 0x01, 0x0f, // get 1; return — shared tail
+                0x0b, // end (A)
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_delse()).unwrap();
+        assert!(
+            has_seq(&out, &[0x04, 0x40, 0x41, 0x07, 0x21, 0x01, 0x0b]),
+            "bare if not emitted: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0x05]), "else kept: {out:02x?}");
+        assert!(!has_seq(&out, &[0x0c, 0x01]), "br kept: {out:02x?}");
+    }
+
+    // A nonempty parent tail means `br K` skips real work the
+    // fallthrough would run — the else arm is not dead.
+    #[test]
+    fn delse_nonempty_parent_tail_keeps_else() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block A
+                0x02, 0x40, // block B
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x41, 0x07, 0x21, 0x01, // const 7; set 1
+                0x0c, 0x01, // br 1
+                0x05, // else
+                0x0c, 0x01, // br 1 — skips the set below
+                0x0b, // end (if)
+                0x41, 0x09, 0x21, 0x03, // const 9; set 3 — B tail
+                0x0b, // end (B)
+                0x20, 0x01, 0x21, 0x02, // get 1; set 2 — l1 stays live
+                0x0b, // end (A)
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_delse()).unwrap();
+        assert!(has_seq(&out, &[0x05]), "else wrongly dropped: {out:02x?}");
+    }
+
+    // `if c {} else { br 0 }` only consumes the condition — `drop`.
+    #[test]
+    fn delse_empty_if_becomes_drop() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block A
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x05, // else
+                0x0c, 0x00, // br 0 -> if's own end
+                0x0b, // end (if)
+                0x0b, // end (A)
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_delse()).unwrap();
+        // `get 0; drop` dies to the dead-local sweep — the `if`, `else`
+        // and `br` must all be gone either way.
+        assert!(!has_seq(&out, &[0x04, 0x40]), "if kept: {out:02x?}");
+        assert!(!has_seq(&out, &[0x05]), "else kept: {out:02x?}");
+        assert!(!has_seq(&out, &[0x0c]), "br kept: {out:02x?}");
     }
 
     // sfwd: `get fp; get v; store` … `get fp; load` re-reads bytes the
