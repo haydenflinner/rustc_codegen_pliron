@@ -18,7 +18,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
 | wasm runtime (geomean, 16 kernels) | **0.919** | ahead; real gaps: `strwork` +26%, `hmget` +17%, `parse_only` +9% |
-| wasm module size | 1.95 (185.3 KiB vs 95 KiB) | behind |
+| wasm module size | 1.94 (184.5 KiB vs 95 KiB) | behind |
 | compile time: bench kernels, native | **0.59** (0.25 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.17** (0.62 s vs 0.54 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
 | compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
@@ -499,9 +499,14 @@ CLIF pipeline if-converts most of them to select chains before emit),
 `i32.and`/`i32.shl` ~3.2× (incl. ~44 dead `&31`/`&63` shift masks —
 wasm shifts already mask). wpeep `ddrop` (`PLIRON_WASM_DDROP`, default
 on) removed ~480 dead `drop`s; `brf` folded ~450 `if{…;br}` sites
-(−2.5 KiB). Next levers: dead-else `if{A;brK}else{brK}`→`if{A}` (~59
-sites), deeper `if`→`br_if` restructuring in stackify, local
-coalescing parity with binaryen.
+(−2.5 KiB); `delse` (`PLIRON_WASM_DELSE`, default on) flushes dead
+else arms `if{A}else{brK}`→`if{A}` (~56 sites, −315 B); `bri`
+(`PLIRON_WASM_BRI`, default on) flattens `if{brK}else{A}`→`br_if;A`
+(~116 sites — the arm1 `br`s it catches are `WPeek::Br` markers
+synthesized by `brf`'s own retargets, which brf can't refold).
+Remaining `if`/`else` pairs ~2,515 vs LLVM's 0. Next levers: deeper
+`if`→`br_if` restructuring in stackify, local coalescing parity with
+binaryen.
 
 ## 3. Native runtime
 
