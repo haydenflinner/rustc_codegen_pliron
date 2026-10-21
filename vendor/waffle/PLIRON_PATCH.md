@@ -52,3 +52,28 @@ LLVM's destructive-update shape.
 `PLIRON_WCOAL=0` disables it (stock freelist order).
 
 All changes are marked `// PLIRON:` in the source.
+
+## `src/backend/treeify.rs` — single-use load sinking
+
+`is_movable` gains a `loads_ok` parameter so that a single-use memory
+load can be recorded as owned by its consumer's operand tree, the
+same as a pure op. Emission then places the load inline at the
+ultimate consuming root's position — LLVM's wasm backend emits this
+operand-stack shape — instead of a `local.set`/`local.get` round
+trip per load.
+
+Sinking reorders the load in program order, so a post-pass
+(`validate_load_sinks`) reverts ownership unless the consuming root
+is in the load's own block and every inst strictly between def and
+root is pure or another load:
+
+- Stores, calls, fences, divides, and any other effectful or
+  non-load trapping op between def and root block the sink — they
+  could clobber the loaded memory, diverge, or change which trap
+  fires first.
+- Other loads between are fine: loads don't write memory, and wasm
+  OOB traps are indistinguishable, so swap order is unobservable.
+- The same-block requirement prevents executing the load on CFG
+  edges that never reached its def.
+
+`PLIRON_WTREELOAD=1` enables it (off by default while validated).

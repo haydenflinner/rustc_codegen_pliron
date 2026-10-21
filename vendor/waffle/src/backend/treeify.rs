@@ -49,6 +49,8 @@ impl Trees {
         let mut owned = HashMap::default();
         let mut remat = HashSet::default();
         let mut multi_use = HashSet::default();
+        // PLIRON: read once per pass.
+        let loads_ok = std::env::var_os("PLIRON_WTREELOAD").is_some_and(|v| v == "1");
 
         for block_def in body.blocks.values() {
             for &value in &block_def.insts {
@@ -79,7 +81,7 @@ impl Trees {
                             } else if let Some(old_owner) = owner.remove(&arg) {
                                 owned.remove(&old_owner);
                                 multi_use.insert(arg);
-                            } else if Self::is_movable(body, arg) {
+                            } else if Self::is_movable(body, arg, loads_ok) {
                                 let pos = u16::try_from(i).unwrap();
                                 let value_arg = ValueArg(value, pos);
                                 owner.insert(arg, value_arg);
@@ -106,10 +108,102 @@ impl Trees {
             });
         }
 
+        // PLIRON: validate load sinking. `is_movable` admits loads so a
+        // single-use load can sit inside its consumer's operand tree,
+        // emitting at the ultimate root's position instead of a
+        // `local.set`/`local.get` round trip — the shape LLVM's wasm
+        // backend produces. That moves the load later in program
+        // order, so it is sound only when every inst strictly between
+        // the def and the consuming root is pure or another load:
+        // pure ops neither observe nor clobber memory (and cannot
+        // trap, so they cannot change which trap fires first), and
+        // reordering wasm loads is unobservable (loads don't write;
+        // OOB traps are indistinguishable). Stores, calls, fences,
+        // divides, and any other effect block the sink. The root must
+        // also be in the def's own block: sinking onto a successor's
+        // path would execute the load on edges that never reached it.
+        if loads_ok {
+            Self::validate_load_sinks(body, &mut owner, &mut owned);
+        }
+
         Trees {
             owner,
             owned,
             remat,
+        }
+    }
+
+    /// PLIRON: drop owned loads whose consumer tree would emit them in
+    /// a different block or past an effectful inst.
+    fn validate_load_sinks(
+        body: &FunctionBody,
+        owner: &mut HashMap<Value, ValueArg>,
+        owned: &mut HashMap<ValueArg, Value>,
+    ) {
+        let is_load = |v: Value| match &body.values[v] {
+            &ValueDef::Operator(op, _, _) => op.is_load(),
+            _ => false,
+        };
+        // Owned loads grouped by def block; each block's check uses a
+        // prefix count of non-(pure|load) insts so the between-query
+        // is O(1) per load.
+        let mut per_block: HashMap<crate::ir::Block, Vec<Value>> = HashMap::default();
+        let mut orphan = Vec::new();
+        for &v in owner.keys() {
+            if !is_load(v) {
+                continue;
+            }
+            let db = body.value_blocks[v];
+            if db.is_valid() {
+                per_block.entry(db).or_default().push(v);
+            } else {
+                orphan.push(v);
+            }
+        }
+        for v in orphan {
+            let slot = owner.remove(&v).unwrap();
+            owned.remove(&slot);
+        }
+        for (db, vs) in per_block {
+            // Ultimate (un-owned) root of each owned load, with its
+            // inst position. Roots outside `db` fail.
+            let insts = &body.blocks[db].insts;
+            let mut pos = HashMap::default();
+            for (i, &iv) in insts.iter().enumerate() {
+                pos.insert(iv, i);
+            }
+            // bad[i] = count of non-(pure|load) insts in insts[..i).
+            let mut bad = Vec::with_capacity(insts.len() + 1);
+            bad.push(0usize);
+            for &iv in insts.iter() {
+                let b = match &body.values[iv] {
+                    &ValueDef::Operator(op, _, _) if op.is_pure() || op.is_load() => 0,
+                    _ => 1,
+                };
+                bad.push(bad.last().unwrap() + b);
+            }
+            let mut unown = Vec::new();
+            for v in vs {
+                // Walk the owner chain to the emitting root.
+                let mut root = owner[&v].0;
+                for _ in 0..64 {
+                    match owner.get(&root) {
+                        Some(&va) => root = va.0,
+                        None => break,
+                    }
+                }
+                let (Some(&p), Some(&q)) = (pos.get(&v), pos.get(&root)) else {
+                    unown.push(v);
+                    continue;
+                };
+                if p >= q || bad[q] - bad[p + 1] != 0 {
+                    unown.push(v);
+                }
+            }
+            for v in unown {
+                let slot = owner.remove(&v).unwrap();
+                owned.remove(&slot);
+            }
         }
     }
 
@@ -120,9 +214,11 @@ impl Trees {
         }
     }
 
-    fn is_movable(body: &FunctionBody, value: Value) -> bool {
+    fn is_movable(body: &FunctionBody, value: Value, loads_ok: bool) -> bool {
         Self::is_single_output_op(body, value)
-            .map(|op| op.is_pure())
+            // PLIRON: loads are tentatively movable; unsafe sinks are
+            // reverted by `validate_load_sinks`.
+            .map(|op| op.is_pure() || (loads_ok && op.is_load()))
             .unwrap_or(false)
     }
 }
