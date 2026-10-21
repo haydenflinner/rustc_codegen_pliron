@@ -403,16 +403,27 @@ pub fn run(func: &mut Function) -> usize {
         }
         if let Some(cmp) = flip0 {
             // Swap the clone onto the second edge so it is next in emitted
-            // order: complement the (single-use) compare, swap targets.
-            let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[cmp] else {
-                continue;
-            };
-            *cond = cond.complement();
+            // order: complement the compare, swap targets. `uses` predates
+            // the clones this run minted — a clone's brif can still share
+            // the compare, so complement a private copy rather than the
+            // shared def (rustlantis seed1: the in-place `eq`→`ne` flip
+            // silently inverted the clone's own brif — loop never exited).
+            let ni = func.dfg.clone_inst(cmp);
+            if let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ni] {
+                *cond = cond.complement();
+            }
+            func.layout.insert_inst(ni, t);
+            let nv = func.dfg.first_result(ni);
             let mut data = func.dfg.insts[t];
-            let dfg = &mut func.dfg;
-            data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                .swap(0, 1);
-            dfg.insts[t] = data;
+            {
+                let dfg = &mut func.dfg;
+                if let InstructionData::Brif { arg, .. } = &mut data {
+                    *arg = nv;
+                }
+                data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    .swap(0, 1);
+            }
+            func.dfg.insts[t] = data;
         }
     }
     // Return blocks left without predecessors would fail dominance checks.
@@ -447,4 +458,81 @@ pub fn run(func: &mut Function) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::types;
+    use cranelift_codegen::ir::{AbiParam, ExternalName, Signature, UserFuncName};
+    use cranelift_codegen::ir::{Function, InstBuilder};
+    use cranelift_codegen::isa::CallConv;
+
+    /// `q`'s `jump` clones `r`'s `brif c` in place; later `r` is processed
+    /// as a pred and its edge-0 latch clone flips `c`. `uses` predates the
+    /// clone, so complementing `c` in place silently inverted `q`'s copy
+    /// (rustlantis seed1 — the flipped loop test never exited). The flip
+    /// must complement a private compare instead.
+    #[test]
+    fn flip_leaves_cloned_brif_polarity() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        let entry = func.dfg.make_block();
+        let q = func.dfg.make_block();
+        let r = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let ret_a = func.dfg.make_block();
+        let ret_b = func.dfg.make_block();
+        for b in [entry, q, r, latch, ret_a, ret_b] {
+            func.layout.append_block(b);
+        }
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins().jump(q, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(q);
+        let x = cur.ins().iconst(types::I64, 5);
+        let y = cur.ins().iconst(types::I64, 7);
+        let c = cur.ins().icmp(IntCC::Equal, x, y);
+        cur.ins().jump(r, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(r);
+        cur.ins().brif(c, latch, &[], ret_a, &[]);
+
+        // `latch` branches back to `q` — a dominator of `r` — so edge 0 of
+        // `r` is a latch clone and triggers the compare complement.
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        let c2 = cur.ins().icmp(IntCC::UnsignedLessThan, x, y);
+        cur.ins().brif(c2, q, &[], ret_b, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(ret_a);
+        cur.ins().return_(&[x]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(ret_b);
+        cur.ins().return_(&[y]);
+
+        let n = run(&mut func);
+        assert!(n >= 2, "expected both clones, ran {n}:\n{}", func.display());
+
+        // The brif cloned into `q` must still test `c == ..`, i.e. its arg's
+        // def keeps `Equal`; the in-place flip would leave `NotEqual`.
+        let qt = func.layout.last_inst(q).unwrap();
+        let InstructionData::Brif { arg, .. } = func.dfg.insts[qt] else {
+            panic!("q no longer ends in brif:\n{}", func.display());
+        };
+        let arg = func.dfg.resolve_aliases(arg);
+        let d = func.dfg.value_def(arg).inst().unwrap();
+        let InstructionData::IntCompare { cond, .. } = func.dfg.insts[d] else {
+            panic!("cloned brif arg not an icmp:\n{}", func.display());
+        };
+        assert_eq!(cond, IntCC::Equal, "flip leaked into q's clone:\n{}", func.display());
+
+        let flags = cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        );
+        cranelift_codegen::verify_function(&func, &flags).unwrap();
+    }
 }
