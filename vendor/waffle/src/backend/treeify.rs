@@ -50,7 +50,7 @@ impl Trees {
         let mut remat = HashSet::default();
         let mut multi_use = HashSet::default();
         // PLIRON: read once per pass.
-        let loads_ok = std::env::var_os("PLIRON_WTREELOAD").is_some_and(|v| v == "1");
+        let loads_ok = !std::env::var_os("PLIRON_WTREELOAD").is_some_and(|v| v == "0");
 
         for block_def in body.blocks.values() {
             for &value in &block_def.insts {

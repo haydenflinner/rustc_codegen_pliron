@@ -76,4 +76,4 @@ root is pure or another load:
 - The same-block requirement prevents executing the load on CFG
   edges that never reached its def.
 
-`PLIRON_WTREELOAD=1` enables it (off by default while validated).
+On by default; `PLIRON_WTREELOAD=0` disables it.
