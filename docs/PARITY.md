@@ -17,8 +17,8 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.919** | ahead; real gaps: `strwork` +26%, `hmget` +17%, `parse_only` +9% |
-| wasm module size | 1.94 (184.5 KiB vs 95 KiB) | behind |
+| wasm runtime (geomean, 16 kernels) | **0.917** | ahead; real gaps: `strwork` +26%, `hmget` +17%, `parse_only` +9% |
+| wasm module size | 1.93 (183.9 KiB vs 95 KiB) | behind |
 | compile time: bench kernels, native | **0.59** (0.25 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.17** (0.62 s vs 0.54 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
 | compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
@@ -503,7 +503,13 @@ on) removed ~480 dead `drop`s; `brf` folded ~450 `if{…;br}` sites
 else arms `if{A}else{brK}`→`if{A}` (~56 sites, −315 B); `bri`
 (`PLIRON_WASM_BRI`, default on) flattens `if{brK}else{A}`→`br_if;A`
 (~116 sites — the arm1 `br`s it catches are `WPeek::Br` markers
-synthesized by `brf`'s own retargets, which brf can't refold).
+synthesized by `brf`'s own retargets, which brf can't refold); `btr`
+(`PLIRON_WASM_BTR`, default on) deletes `br K` tail-branches that fall
+through their K+1 enclosing `end`s anyway, incl. unreachable `br`s
+(~570 sites, −640 B). btr's reachability model keeps three states per
+inst — dead-region-open / live / live-unknown-depth — after a
+miscompile where a boundary `end` resuming with an unknown base marked
+a live `loop` back-edge "dead" and folded it (wasmstdtest words trap).
 Remaining `if`/`else` pairs ~2,515 vs LLVM's 0. Next levers: deeper
 `if`→`br_if` restructuring in stackify, local coalescing parity with
 binaryen.
