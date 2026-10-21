@@ -6184,23 +6184,32 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 }
             }
             // Loop-member blocks of this caller, for the hot rule.
-            let mut inloop: FxHashSet<WBlock> = FxHashSet::default();
-            {
-                let b = funcs[ci].body.as_ref().unwrap();
-                let cfg = waffle::cfg::CFGInfo::new(b);
-                for (_, s) in wloops(b, &cfg) {
-                    inloop.extend(s.iter().copied());
-                }
-            }
+            // Built lazily: CFGInfo+wloops is O(body), and callers whose
+            // sites all qualify under the cheap rules never need it.
+            let mut inloop: Option<FxHashSet<WBlock>> = None;
+            let mut is_loop = |funcs: &[FDecl], ci: usize, blk: WBlock| -> bool {
+                let s = inloop.get_or_insert_with(|| {
+                    let b = funcs[ci].body.as_ref().unwrap();
+                    let cfg = waffle::cfg::CFGInfo::new(b);
+                    let mut s: FxHashSet<WBlock> = FxHashSet::default();
+                    for (_, body) in wloops(b, &cfg) {
+                        s.extend(body.iter().copied());
+                    }
+                    s
+                });
+                s.contains(&blk)
+            };
             // Cascade cap: each round's splices expose fresh callsites
             // inside the copies, so small rules can replicate a big
             // callee body tens of times (core's `quicksort` hit 344k
             // wat-lines / ~0.6 MB of one function). Past this budget a
-            // caller stays a caller.
+            // caller stays a caller. `cur_size` tracks growth across
+            // splices instead of recounting the body per site.
             let caller_cap = crate::env_get("PLIRON_WASM_INLINE_CAP")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048);
-            if body_size(funcs[ci].body.as_ref().unwrap()) > caller_cap {
+            let mut cur_size = body_size(funcs[ci].body.as_ref().unwrap());
+            if cur_size > caller_cap {
                 continue;
             }
             // One scan per caller: collect all eligible call values.
@@ -6256,7 +6265,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                                 || n <= TINY
                                 || (k == 1 && refs[fi] == 0 && n <= SOLO)
                                 || gc_done
-                                || (inloop.contains(&blk) && n <= hot_cap)
+                                || (is_loop(funcs, ci, blk) && n <= hot_cap)
                             {
                                 sites.push((iv, fi));
                             }
@@ -6268,7 +6277,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
             if !sites.is_empty() {
                 did = true;
                 for &(iv, fi) in &sites {
-                    if body_size(funcs[ci].body.as_ref().unwrap()) > caller_cap {
+                    if cur_size > caller_cap {
                         break;
                     }
                     let callee = funcs[fi].body.clone().unwrap();
@@ -6281,6 +6290,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                     if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv) {
                         inline_site(b, blk, pos, iv, &callee, sp);
                         check_targets(b, &funcs[fi].name);
+                        cur_size += body_size(&callee);
                         inlined += 1;
                     }
                 }

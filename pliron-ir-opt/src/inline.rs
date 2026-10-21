@@ -1624,20 +1624,55 @@ fn left_stats(
 /// for the clone's duration, and once a later pass forwards the entry arg
 /// to a caller value the flag would leak out of the region.
 ///
+/// Lazily-filled predecessor map for the `frozen_args` resolution walks:
+/// a block's uses *are* its incoming edges, so materializing every
+/// block's `(term, succ_idx)` list once per inline site paid O(caller)
+/// per site. Lookups fill per queried block and cache for the walk.
+struct Preds<'a> {
+    ctx: &'a Context,
+    cache: std::cell::RefCell<
+        FxHashMap<Ptr<BasicBlock>, Option<std::rc::Rc<Vec<(Ptr<Operation>, usize)>>>>,
+    >,
+}
+
+impl<'a> Preds<'a> {
+    fn new(ctx: &'a Context) -> Self {
+        Self {
+            ctx,
+            cache: std::cell::RefCell::default(),
+        }
+    }
+    /// `(terminator, successor-index)` edges into `b`; `None` when `b`
+    /// has no recorded preds — the resolution endpoint, same as the
+    /// absent entries of the eagerly-built map this replaced.
+    fn get(
+        &self,
+        b: Ptr<BasicBlock>,
+    ) -> Option<std::rc::Rc<Vec<(Ptr<Operation>, usize)>>> {
+        if let Some(v) = self.cache.borrow().get(&b) {
+            return v.clone();
+        }
+        let v: Vec<_> = b
+            .uses_iter(self.ctx)
+            .map(|u| (u.user_op(), u.find_index(self.ctx)))
+            .collect();
+        let v = (!v.is_empty()).then(|| std::rc::Rc::new(v));
+        self.cache.borrow_mut().insert(b, v.clone());
+        v
+    }
+}
+
 /// `v`'s uniform source through `b`'s predecessors: `Some` only when every
 /// pred passes the same value (self-passes on back edges ignored). `None`
 /// on any disagreement — a merged value can't be proven to carry one
 /// pointer.
 fn arg_src(
     ctx: &Context,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    preds: &Preds,
     b: Ptr<BasicBlock>,
     v: Value,
 ) -> Option<Value> {
-    let pr = preds.get(&b)?;
-    if pr.is_empty() {
-        return None;
-    }
+    let pr = preds.get(b)?;
     let i = v.try_find_index(ctx).ok()?;
     let na = b.deref(ctx).get_num_arguments();
     let mut uniq = None;
@@ -1663,7 +1698,7 @@ fn arg_src(
 /// yield `v` itself only when `sub == 0`.
 fn extract_leaf(
     ctx: &Context,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    preds: &Preds,
     mut v: Value,
     mut sub: usize,
     depth: usize,
@@ -1686,7 +1721,7 @@ fn extract_leaf(
             // Entry/edge-incomplete blocks have no recorded preds — the arg
             // itself is the resolution endpoint (it may carry a frozen
             // record).
-            let Some(pr) = preds.get(&b).filter(|p| !p.is_empty()) else {
+            let Some(pr) = preds.get(b) else {
                 return (sub == 0).then_some(v);
             };
             let Ok(i) = v.try_find_index(ctx) else {
@@ -1698,7 +1733,7 @@ fn extract_leaf(
                 return None;
             };
             let mut uniq = None;
-            for &(t, si) in pr {
+            for &(t, si) in pr.iter() {
                 let o = Operation::get_op_dyn(t, ctx);
                 let Some(ops) =
                     op_cast::<dyn BranchOpInterface>(&*o).map(|br| br.successor_operands(ctx, si))
@@ -1781,7 +1816,7 @@ fn is_alloca(ctx: &Context, v: Value) -> bool {
 fn store_src(
     ctx: &Context,
     st: &State,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    preds: &Preds,
     load: Ptr<Operation>,
     mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<Value> {
@@ -1824,7 +1859,7 @@ fn store_src(
 fn store_src_in(
     ctx: &Context,
     st: &State,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    preds: &Preds,
     lb: Value,
     ll: Option<usize>,
     loff: i64,
@@ -1937,7 +1972,7 @@ fn store_src_in(
         }
         // No decisive store here — follow the predecessors.
         let mut pr: Vec<Ptr<BasicBlock>> = Vec::new();
-        let Some(pr_ops) = preds.get(&b) else {
+        let Some(pr_ops) = preds.get(b) else {
             if scan {
                 if pliron_cfg::tracing_on() {
                     tracing::debug!(target: "pliron::frozen", "store_src: no preds {b:?} for {load:?}")
@@ -1945,7 +1980,7 @@ fn store_src_in(
             }
             return None;
         };
-        for (t, _) in pr_ops {
+        for (t, _) in pr_ops.iter() {
             let Some(p) = t.deref(ctx).get_parent_block() else {
                 continue;
             };
@@ -2014,7 +2049,7 @@ fn store_src_in(
 fn same_ptr(
     ctx: &Context,
     st: &State,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    preds: &Preds,
     v1: Value,
     v2: Value,
     mem: &mut FxHashSet<Ptr<Operation>>,
@@ -2022,7 +2057,7 @@ fn same_ptr(
     fn norm(
         ctx: &Context,
         st: &State,
-        preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+        preds: &Preds,
         mut v: Value,
         mem: &mut FxHashSet<Ptr<Operation>>,
     ) -> (Value, Option<i64>) {
@@ -2115,7 +2150,7 @@ fn same_ptr(
 fn ptr_base(
     ctx: &Context,
     st: &State,
-    preds: &FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>>,
+    preds: &Preds,
     mut v: Value,
     mem: &mut FxHashSet<Ptr<Operation>>,
 ) -> Option<(Value, Option<usize>, Option<i64>)> {
@@ -2335,18 +2370,9 @@ fn frozen_args(
     // block-arg resolution: a load's pointer (or a caller operand bound to
     // a frozen arg) is often phi-forwarded through args of *enclosing*
     // clone blocks — `partition`'s pivot reaches `lt` callsites that way.
-    let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<(Ptr<Operation>, usize)>> = FxHashMap::default();
-    if callee_frozen
-        && let Some(region) = call_block.deref(ctx).get_parent_region()
-    {
-        for b in region.deref(ctx).iter(ctx) {
-            if let Some(t) = b.deref(ctx).iter(ctx).last() {
-                for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
-                    preds.entry(s).or_default().push((t, si));
-                }
-            }
-        }
-    }
+    // Lazy: `Preds` reads a block's use list on demand instead of
+    // scanning every region terminator here.
+    let preds = Preds::new(ctx);
     // `(bytes, region)` for a base resolved at leaf `bl`: an enclosing
     // clone-arg record first; else a frozen param of the containing
     // function itself — the outermost region, anchored at its entry.

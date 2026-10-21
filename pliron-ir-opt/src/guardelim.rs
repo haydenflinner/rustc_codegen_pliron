@@ -435,21 +435,21 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
         return false;
     }
     gefn.record("blocks", bs.len());
-    let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
-        bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     // Prescan for foldable branches: a cond_br whose icmp predicate is in
     // the provable set and whose abandoned successor could be
     // unreachable-terminated. Nothing downstream can fold without one, so
     // functions with none skip the domtree, slot scan, and fixpoint.
+    // Terminators only — the full `bops` map is built once a candidate
+    // exists.
     let unterm = |d: Ptr<BasicBlock>| {
-        bops.get(&d)
-            .and_then(|os| os.last())
-            .is_some_and(|&t| Operation::is_op::<UnreachableOp>(t, ctx))
+        d.deref(ctx)
+            .get_terminator(ctx)
+            .is_some_and(|t| Operation::is_op::<UnreachableOp>(t, ctx))
     };
     let cand_terms: Vec<Ptr<Operation>> = bs
         .iter()
         .filter_map(|&b| {
-            let &term = bops[&b].last()?;
+            let term = b.deref(ctx).get_terminator(ctx)?;
             if !Operation::is_op::<CondBrOp>(term, ctx) {
                 return None;
             }
@@ -472,6 +472,8 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     if cands == 0 {
         return false;
     }
+    let bops: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<Operation>>> =
+        bs.iter().map(|&b| (b, ops(ctx, b))).collect();
     let Some(dom) = Dom::new(ctx, st, fop) else {
         return false;
     };
