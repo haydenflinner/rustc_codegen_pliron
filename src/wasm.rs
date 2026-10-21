@@ -7967,7 +7967,7 @@ mod clif_emit {
                         _ => 0,
                     };
                     let p = self.base32(args[1]);
-                    self.do_store(opcode, st, args[0], p, off as u64);
+                    self.do_store(f, opcode, st, args[0], p, off as u64);
                 }
                 ir::InstructionData::StackAddr {
                     stack_slot, offset, ..
@@ -8607,7 +8607,15 @@ mod clif_emit {
             smallvec![v]
         }
 
-        fn do_store(&mut self, op: Opcode, t: ClType, v: ir::Value, p: WV, off: u64) {
+        fn do_store(
+            &mut self,
+            f: &ir::Function,
+            op: Opcode,
+            t: ClType,
+            v: ir::Value,
+            p: WV,
+            off: u64,
+        ) {
             use Opcode as P;
             if t == clt::I128 || t == clt::F128 {
                 let (lo, hi) = self.pair(v);
@@ -8621,17 +8629,67 @@ mod clif_emit {
                 offset: off as u32,
                 memory: mem,
             };
-            match op {
-                P::Store | P::AtomicStore => self.store(t, self.get1(v), p, off),
-                P::Istore8 | P::Istore16 | P::Istore32 => {
-                    // Store the low bits; i64 carriers wrap to i32.
-                    let v = self.cvt(self.get1(v), WT::I32);
-                    let o = match op {
-                        P::Istore8 => O::I32Store8 { memory: bytes(1) },
-                        P::Istore16 => O::I32Store16 { memory: bytes(2) },
-                        _ => O::I32Store { memory: bytes(4) },
+            // `storeN`/`istoreN (ireduce x)` is x's low N bytes outright —
+            // store the reduce's source instead (`i64.storeN` writes the
+            // low N bytes of an i64), skipping the wrap.
+            let want = match op {
+                P::Istore8 => 8,
+                P::Istore16 => 16,
+                P::Istore32 => 32,
+                P::Store if t.is_int() && !t.is_vector() => t.bits(),
+                _ => 0,
+            };
+            let mut vv = f.dfg.resolve_aliases(v);
+            if want > 0 {
+                for _ in 0..4 {
+                    let Some(d) = f.dfg.value_def(vv).inst() else {
+                        break;
                     };
-                    self.op0(o, &[p, v]);
+                    let ir::InstructionData::Unary {
+                        opcode: Opcode::Ireduce,
+                        arg,
+                    } = f.dfg.insts[d]
+                    else {
+                        break;
+                    };
+                    if f.dfg.value_type(vv).bits() < want {
+                        break;
+                    }
+                    let a = f.dfg.resolve_aliases(arg);
+                    if self.get(a).len() != 1 {
+                        break;
+                    }
+                    vv = a;
+                }
+            }
+            // Narrow store of an unwrapped value: pick the store op by
+            // the source's width.
+            let narrow_store = |s: &mut Self, v: WV, bits: u32| {
+                let (v, i64) = match s.ty_of(v) {
+                    WT::I32 => (v, false),
+                    WT::I64 => (v, true),
+                    _ => (s.cvt(v, WT::I64), true),
+                };
+                let o = match (bits, i64) {
+                    (8, false) => O::I32Store8 { memory: bytes(1) },
+                    (8, true) => O::I64Store8 { memory: bytes(1) },
+                    (16, false) => O::I32Store16 { memory: bytes(2) },
+                    (16, true) => O::I64Store16 { memory: bytes(2) },
+                    (_, false) => O::I32Store { memory: bytes(4) },
+                    (_, true) => O::I64Store32 { memory: bytes(4) },
+                };
+                s.op0(o, &[p, v]);
+            };
+            match op {
+                P::Store | P::AtomicStore => {
+                    if op == P::Store && t.is_int() && !t.is_vector() && t.bits() <= 32 {
+                        narrow_store(self, self.get1(vv), t.bits())
+                    } else {
+                        self.store(t, self.get1(v), p, off)
+                    }
+                }
+                P::Istore8 | P::Istore16 | P::Istore32 => {
+                    narrow_store(self, self.get1(vv), want)
                 }
                 _ => panic!("store op {op}"),
             }
