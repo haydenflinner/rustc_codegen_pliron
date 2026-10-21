@@ -599,6 +599,8 @@ struct PeepOpts {
     delse: bool,
     /// `if {br K} else {A}` → `br_if` flush (`PLIRON_WASM_BRI`).
     bri: bool,
+    /// `br K` before its K+1 enclosing `end`s (`PLIRON_WASM_BTR`).
+    btr: bool,
 }
 
 impl PeepOpts {
@@ -614,6 +616,7 @@ impl PeepOpts {
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
             delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
             bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
+            btr: crate::env_get("PLIRON_WASM_BTR") == Some("1"),
         }
     }
 }
@@ -2568,6 +2571,296 @@ fn peep_body_opts(
             i += 1;
         }
         ins = out;
+    }
+    // Branch-tail: `br K` followed directly by the K+1 `end`s it would
+    // jump through — the fallthrough lands on the same continuation, so
+    // the branch is dead. A live fold requires an empty operand stack
+    // at the `br` (the ends execute normally once it's gone), void
+    // crossed constructs, and a non-`loop` target (a `br` to a `loop`
+    // jumps to its header). Unreachable `br`s fold unconditionally.
+    // Type-index blocktypes or unsized operands poison the body.
+    // `PLIRON_WASM_BTR=1` on.
+    if opts.btr {
+        // Per-inst state: `None` = unreachable (a dead-region marker
+        // is still open), `Some(None)` = live but stack depth unknown,
+        // `Some(Some(x))` = live at operand depth x. `dead_at`
+        // clearing past its boundary end must resume as *unknown*,
+        // never as dead — a live `br` folded under dead rules skips
+        // the loop-target check and can delete a back-edge.
+        let mut sd: Vec<Option<Option<u32>>> = Vec::with_capacity(ins.len());
+        // construct stack: (arm base, depth after this construct's end)
+        let mut cst: Vec<(Option<u32>, Option<u32>, bool, usize)> = Vec::new();
+        let mut end_op: Vec<u8> = vec![0; ins.len()]; // opener opcode per `end`
+        let mut end_r: Vec<u32> = vec![u32::MAX; ins.len()]; // result arity
+        let mut d: Option<u32> = Some(0);
+        // Dead region: `dead_at` is the cst level whose `end` resumes
+        // flow (the branch target's); `dead_pos` is the marker's ins
+        // index — an `else` of a construct open at the marker resumes
+        // flow into arm2 regardless of level.
+        let mut dead_at: Option<usize> = None;
+        let mut dead_pos: Option<usize> = None;
+        let mut ok = true;
+        let mut i = 0;
+        'model: while i < ins.len() {
+            let (k, s, _e, _c) = ins[i];
+            sd.push(if dead_at.is_some() { None } else { Some(d) });
+            match k {
+                WPeek::Del | WPeek::Nop(_) => {}
+                WPeek::Get(_) => d = d.and_then(|x| x.checked_add(1)),
+                WPeek::Set(_) | WPeek::Drop | WPeek::BrIf(_) => {
+                    d = d.and_then(|x| x.checked_sub(1))
+                }
+                WPeek::Tee(_) => {}
+                WPeek::Br(dd) => {
+                    d = None;
+                    if dead_at.is_none() {
+                        dead_at = Some(cst.len().saturating_sub(dd as usize));
+                        dead_pos = Some(i);
+                    }
+                }
+                WPeek::Other => {
+                    let pp: (u32, u32) = match b[s] {
+                        0x01 => (0, 0),
+                        0x1a => (1, 0),
+                        0x1b | 0x1c => (3, 1),
+                        0x23 => (0, 1),
+                        0x24 => (1, 0),
+                        0x25 => (1, 1),
+                        0x26 => (2, 0),
+                        0x28..=0x35 => (1, 1),
+                        0x36..=0x3e => (2, 0),
+                        0x3f => (0, 1),
+                        0x40 => (1, 1),
+                        0x41..=0x44 => (0, 1),
+                        0x45 | 0x50 => (1, 1),
+                        0x46..=0x4f | 0x51..=0x66 => (2, 1),
+                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => (1, 1),
+                        0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => (2, 1),
+                        0xa7..=0xc4 => (1, 1),
+                        0xd0 | 0xd2 => (0, 1),
+                        0xd1 => (1, 1),
+                        0xfc => match b.get(s + 1).copied().unwrap_or(0) {
+                            0..=7 => (1, 1),
+                            8 | 10 | 11 | 12 | 14 | 17 => (3, 0),
+                            9 | 13 => (0, 0),
+                            15 => (2, 1),
+                            16 => (0, 1),
+                            _ => {
+                                ok = false;
+                                break 'model;
+                            }
+                        },
+                        _ => {
+                            ok = false;
+                            break 'model;
+                        }
+                    };
+                    d = d.and_then(|x| x.checked_sub(pp.0))
+                        .and_then(|x| x.checked_add(pp.1));
+                }
+                WPeek::Ctl => match b[s] {
+                    op @ (0x02 | 0x03 | 0x04) => {
+                        // blocktype: 0x40 void, a valtype → (0 in, 1
+                        // out); anything else is a type index — the
+                        // model can't size it.
+                        let (p, r) = match b.get(s + 1).copied() {
+                            Some(0x40) => (0u32, 0u32),
+                            Some(0x6f | 0x70 | 0x78..=0x7f) => (0, 1),
+                            _ => {
+                                ok = false;
+                                break 'model;
+                            }
+                        };
+                        let pops = p + (op == 0x04) as u32;
+                        d = d.and_then(|x| x.checked_sub(pops));
+                        let base = d;
+                        let post = base.and_then(|x| x.checked_add(r));
+                        cst.push((base, post, op == 0x03, i));
+                        // result arity rides along in `end_r`'s slot:
+                        // the low 8 bits of the opener index are never
+                        // touched here — stash `r` separately below.
+                        end_r[i] = r;
+                        d = base.and_then(|x| x.checked_add(p));
+                    }
+                    0x05 => {
+                        // arm2 is reachable when this `if` was open at
+                        // the dead marker — the marker is in arm1, and
+                        // arm2 is the other path.
+                        if let Some(p) = dead_pos
+                            && matches!(cst.last(), Some(&(_, _, _, op_i)) if op_i < p)
+                        {
+                            dead_at = None;
+                            dead_pos = None;
+                        }
+                        if dead_at.is_none() {
+                            let Some(&(base, ..)) = cst.last() else {
+                                ok = false;
+                                break 'model;
+                            };
+                            d = base;
+                        }
+                    }
+                    0x0b => {
+                        if cst.is_empty() {
+                            break 'model; // the function's own `end`
+                        }
+                        if dead_at == Some(cst.len()) {
+                            dead_at = None;
+                            dead_pos = None;
+                        }
+                        let (_, post, _, op_i) = cst.pop().unwrap();
+                        end_op[i] = b[ins[op_i].1];
+                        end_r[i] = end_r[op_i];
+                        if dead_at.is_none() {
+                            d = post;
+                        }
+                    }
+                    0x0c | 0x0d => {
+                        let mut dp = s + 1;
+                        let Some(dd) = urd(b, &mut dp) else {
+                            ok = false;
+                            break 'model;
+                        };
+                        if b[s] == 0x0c {
+                            d = None;
+                            if dead_at.is_none() {
+                                dead_at =
+                                    Some(cst.len().saturating_sub(dd as usize));
+                                dead_pos = Some(i);
+                            }
+                        } else {
+                            d = d.and_then(|x| x.checked_sub(1));
+                        }
+                    }
+                    0x0e | 0x00 | 0x0f => {
+                        d = None;
+                        if dead_at.is_none() {
+                            dead_at = Some(cst.len());
+                            dead_pos = Some(i);
+                        }
+                    }
+                    0x10 => {
+                        let mut dp = s + 1;
+                        let Some(fi) = urd(b, &mut dp) else {
+                            ok = false;
+                            break 'model;
+                        };
+                        let Some(&(np, nr)) = fsig.get(fi as usize) else {
+                            ok = false;
+                            break 'model;
+                        };
+                        d = d.and_then(|x| x.checked_sub(np))
+                            .and_then(|x| x.checked_add(nr));
+                    }
+                    0x11 => {
+                        let mut dp = s + 1;
+                        let Some(ti) = urd(b, &mut dp) else {
+                            ok = false;
+                            break 'model;
+                        };
+                        let Some(&(np, nr)) = tsig.get(ti as usize) else {
+                            ok = false;
+                            break 'model;
+                        };
+                        d = d.and_then(|x| x.checked_sub(np + 1))
+                            .and_then(|x| x.checked_add(nr));
+                    }
+                    _ => {
+                        ok = false;
+                        break 'model;
+                    }
+                },
+            }
+            i += 1;
+        }
+        if ok {
+            let mut dels: Vec<(usize, bool)> = Vec::new();
+            for (i, &(k, s, ..)) in ins.iter().enumerate() {
+                // A `br_if` under the same ends is conditional — its
+                // fallthrough already lands there, so it folds to a
+                // `drop` of the condition (needs depth exactly 1).
+                let (kk, is_if) = match k {
+                    WPeek::Br(d2) => (Some(d2 as usize), false),
+                    WPeek::BrIf(d2) => (Some(d2 as usize), true),
+                    WPeek::Ctl if b[s] == 0x0c => {
+                        let mut dp = s + 1;
+                        (urd(b, &mut dp).map(|x| x as usize), false)
+                    }
+                    WPeek::Ctl if b[s] == 0x0d => {
+                        let mut dp = s + 1;
+                        (urd(b, &mut dp).map(|x| x as usize), true)
+                    }
+                    _ => (None, false),
+                };
+                let Some(kk) = kk else { continue };
+                // `None` depth = unreachable code: the stack is
+                // polymorphic there, so the ends need no arity checks —
+                // removing a dead branch changes nothing semantically.
+                let live = match sd.get(i) {
+                    Some(&Some(Some(x))) => {
+                        if x != is_if as u32 {
+                            continue;
+                        }
+                        true
+                    }
+                    Some(&None) => false,
+                    _ => continue,
+                };
+                // The next kk+1 real insts must be `end`s of void
+                // (result-arity-0) constructs; the last closes the
+                // target, which must not be a `loop`.
+                let mut c = 0usize;
+                let mut j = i + 1;
+                let mut okk = true;
+                while c <= kk {
+                    while matches!(
+                        ins.get(j).map(|x| x.0),
+                        Some(WPeek::Del | WPeek::Nop(_))
+                    ) {
+                        j += 1;
+                    }
+                    let Some(&(k2, s2, ..)) = ins.get(j) else {
+                        okk = false;
+                        break;
+                    };
+                    if !(matches!(k2, WPeek::Ctl) && b[s2] == 0x0b) {
+                        okk = false;
+                        break;
+                    }
+                    // Live code: every crossed construct must be void —
+                    // the ends execute with the empty stack the `br`
+                    // leaves behind. Dead code needs no arity check.
+                    if live && end_r[j] != 0 {
+                        okk = false;
+                        break;
+                    }
+                    // A `br` to a `loop` jumps to its header — only a
+                    // live branch's landing matters for that.
+                    if live && c == kk && end_op[j] == 0x03 {
+                        okk = false;
+                        break;
+                    }
+                    c += 1;
+                    j += 1;
+                }
+                if !okk {
+                    continue;
+                }
+                if prel.iter().any(|&(pp, _)| pp == s) {
+                    continue;
+                }
+                dels.push((i, is_if));
+            }
+            for &(i, is_if) in &dels {
+                // A live `br_if` still has to pop its condition; a dead
+                // one disappears with the rest of the dead code.
+                ins[i].0 = if is_if && sd[i] == Some(Some(1)) {
+                    WPeek::Drop
+                } else {
+                    WPeek::Del
+                };
+            }
+        }
     }
     // Fresh local index for `tee`-captured values / LICM-hoisted
     // temporaries — shared by every local-minting pass below.
@@ -4816,7 +5109,14 @@ mod wpeep_tests {
             ddrop: false,
             delse: false,
             bri: false,
+            btr: false,
         }
+    }
+
+    fn opts_btr() -> PeepOpts {
+        let mut o = opts(false, false);
+        o.btr = true;
+        o
     }
 
     fn opts_dd() -> PeepOpts {
@@ -5751,6 +6051,129 @@ mod wpeep_tests {
             std::fs::write(format!("{}.out", p.display()), &out).unwrap();
             eprintln!("wrote {}.out ({} -> {} bytes)", p.display(), b.len(), out.len());
         }
+    }
+
+    // btr: `br K` directly before the K+1 `end`s it jumps through is
+    // dead — the fallthrough lands on the same continuation.
+    #[test]
+    fn btr_removes_redundant_br() {
+        let b = body(
+            2,
+            &[
+                0x02, 0x40, // block A
+                0x02, 0x40, // block B
+                0x0c, 0x01, // br 1 -> A's end (B's end + A's end follow)
+                0x0b, // end B
+                0x0b, // end A
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(!has_seq(&out, &[0x0c]), "br kept: {out:02x?}");
+    }
+
+    // `br 2` across three void blocks folds too.
+    #[test]
+    fn btr_removes_br_2() {
+        let b = body(
+            2,
+            &[
+                0x02, 0x40, 0x02, 0x40, 0x02, 0x40, // block;block;block
+                0x0c, 0x02, // br 2
+                0x0b, 0x0b, 0x0b, // end x3
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(!has_seq(&out, &[0x0c]), "br kept: {out:02x?}");
+    }
+
+    // A `br` to a `loop` jumps to its header — not the continuation —
+    // so the same shape must not fold.
+    #[test]
+    fn btr_loop_target_kept() {
+        let b = body(
+            2,
+            &[
+                0x03, 0x40, // loop
+                0x0c, 0x00, // br 0 -> loop header
+                0x0b, // end loop
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 gone: {out:02x?}");
+    }
+
+    // Non-empty operand stack at the `br` — dropping it would leave the
+    // value dangling at a void `end`.
+    #[test]
+    fn btr_nonempty_stack_kept() {
+        let b = body(
+            2,
+            &[
+                0x02, 0x40, // block
+                0x41, 0x07, // i32.const 7
+                0x0c, 0x00, // br 0 (stack depth 1)
+                0x0b, // end
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 gone: {out:02x?}");
+    }
+
+    // A live inst between the `br` and the `end`s — not a tail branch.
+    #[test]
+    fn btr_non_end_between_kept() {
+        let b = body(
+            2,
+            &[
+                0x02, 0x40, // block
+                0x0c, 0x00, // br 0
+                0x01, // nop (dead but real)
+                0x0b, // end
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 gone: {out:02x?}");
+    }
+
+    // Live-unknown state (the depth model lost track) must not be
+    // treated as dead: a `br` in it still targets real labels — here a
+    // `loop` back-edge that dead-rules would delete. Regression test
+    // for the wasmstdtest `words(100)` trap.
+    #[test]
+    fn btr_unknown_depth_loop_br_kept() {
+        let b = body(
+            1,
+            &[
+                0x21, 0x00, // set 0 (empty stack -> depth unknown)
+                0x03, 0x40, // loop
+                0x20, 0x00, // get 0
+                0x04, 0x40, // if
+                0x0c, 0x02, // br 2 (arm1 exits the body)
+                0x05, // else — resumes into unknown-depth code
+                0x0c, 0x01, // br 1 -> loop header
+                0x0b, // end (if)
+                0x0b, // end (loop)
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(has_seq(&out, &[0x0c, 0x00]), "back-edge br 0 deleted: {out:02x?}");
+    }
+
+    // `br` last in an `if` arm — the next inst is `else`, not `end`.
+    #[test]
+    fn btr_if_arm_br_kept() {
+        let b = body(
+            2,
+            &[
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x0c, 0x00, // br 0 -> if's end
+                0x05, // else
+                0x0b, // end (if)
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
+        assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 gone: {out:02x?}");
     }
 }
 
