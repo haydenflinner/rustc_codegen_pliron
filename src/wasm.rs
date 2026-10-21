@@ -4948,6 +4948,17 @@ fn peep_body_opts(
                 continue;
             }
         }
+        // `set L; get L` is exactly `tee L` — decode fuses them, but
+        // later passes keep creating adjacent pairs; catch them here.
+        // A `prel` anchored on the `get` must not lose its emit slot.
+        if let (WPeek::Set(n), Some(&(WPeek::Get(m), gs, _, _))) = (k, ins.get(wi + 1)) {
+            if n == m && !prel.iter().any(|&(pp, _)| pp == gs) {
+                nb.push(0x22);
+                leb(&mut nb, n);
+                wi += 2;
+                continue;
+            }
+        }
         match k {
             WPeek::Get(n) => {
                 nb.push(0x20);
