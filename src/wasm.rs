@@ -556,6 +556,11 @@ enum WPeek {
     /// fold removed (else-arm control flow under the same fold): emits
     /// `0x0c` + the adjusted target.
     Br(u32),
+    /// A synthesized `i32.eqz` (`0x45`) — emitted by the `bri2` fold to
+    /// invert an `if` condition into a `br_if` test. `s`/`e` carry no
+    /// real byte range; passes that byte-decode `Other`/`Ctl` must
+    /// never see it reach those arms.
+    Eqz,
     Other,
 }
 
@@ -599,6 +604,8 @@ struct PeepOpts {
     delse: bool,
     /// `if {br K} else {A}` → `br_if` flush (`PLIRON_WASM_BRI`).
     bri: bool,
+    /// `if {A} else {br K}` → `i32.eqz; br_if` flush (`PLIRON_WASM_BRI2`).
+    bri2: bool,
     /// `br K` before its K+1 enclosing `end`s (`PLIRON_WASM_BTR=0` off).
     btr: bool,
 }
@@ -616,6 +623,7 @@ impl PeepOpts {
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
             delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
             bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
+            bri2: crate::env_get("PLIRON_WASM_BRI2") == Some("1"),
             btr: crate::env_get("PLIRON_WASM_BTR") != Some("0"),
         }
     }
@@ -632,6 +640,7 @@ fn wpeek_name(k: WPeek) -> String {
         WPeek::Br(d) => format!("br {d}"),
         WPeek::BrIf(d) => format!("br_if {d}"),
         WPeek::Ctl => "ctl".into(),
+        WPeek::Eqz => "eqz".into(),
         WPeek::Other => "other".into(),
     }
 }
@@ -2429,7 +2438,7 @@ fn peep_body_opts(
                 let Some(&a1) = ins.get(i + 1) else { break 'fold };
                 let k = match a1.0 {
                     WPeek::Br(d) => Some(d as usize),
-                    _ if b[a1.1] == 0x0c => {
+                    WPeek::Ctl if b[a1.1] == 0x0c => {
                         let mut dp = a1.1 + 1;
                         urd(b, &mut dp).map(|d| d as usize)
                     }
@@ -2611,6 +2620,8 @@ fn peep_body_opts(
                     d = d.and_then(|x| x.checked_sub(1))
                 }
                 WPeek::Tee(_) => {}
+                // pop-1/push-1: depth unchanged, underflows to unknown
+                WPeek::Eqz => d = d.and_then(|x| x.checked_sub(1)).map(|x| x + 1),
                 WPeek::Br(dd) => {
                     d = None;
                     if dead_at.is_none() {
@@ -3325,6 +3336,14 @@ fn peep_body_opts(
                     }
                     continue;
                 }
+                WPeek::Eqz => {
+                    // pop the cond, push a fresh non-local value
+                    if vstack.pop().is_none() {
+                        pend.clear();
+                    }
+                    vstack.push(OTHER);
+                    continue;
+                }
                 WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
                     // Merge `copymap`/`last_write` per ctl kind — a
                     // `set T(get U)` on every incoming arm leaves
@@ -3896,6 +3915,11 @@ fn peep_body_opts(
                             vec![v]
                         }
                         WPeek::Drop => vec![st.pop().unwrap_or(u32::MAX)],
+                        WPeek::Eqz => {
+                            let v = st.pop().unwrap_or(u32::MAX);
+                            st.push(i as u32);
+                            vec![v]
+                        }
                         WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
                             st.clear();
                             lo.clear();
@@ -3968,6 +3992,7 @@ fn peep_body_opts(
                     WPeek::Set(_) => (1, 0),
                     WPeek::Tee(_) => (1, 1),
                     WPeek::Drop => (1, 0),
+                    WPeek::Eqz => (1, 1),
                     WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => (0, 0),
                     WPeek::Other => eff(s).unwrap_or((0, 0)),
                 };
@@ -4386,9 +4411,9 @@ fn peep_body_opts(
                         }
                     }
                 }
-                // `Nop(l)`/`Drop`/`Del` leave locals and memory alone;
+                // `Nop(l)`/`Drop`/`Del`/`Eqz` leave locals and memory alone;
                 // `Get` is a plain read.
-                WPeek::Nop(_) | WPeek::Drop | WPeek::Del | WPeek::Get(_) => {}
+                WPeek::Nop(_) | WPeek::Drop | WPeek::Del | WPeek::Get(_) | WPeek::Eqz => {}
                 WPeek::Other => match b[ins[i].1] {
                     // calls decode as Ctl; `memory.*`/`0xfb`-`0xfe` are
                     // opaque — atomics/SIMD/GC bail at decode anyway.
@@ -4682,6 +4707,187 @@ fn peep_body_opts(
             ins = out;
         }
     }
+    // Mirror of `bri`: `if c { A } else { br K } end` → `i32.eqz; br_if
+    // (K-1); A`. The else arm must be a lone forward `br` (K >= 1;
+    // `br 0` is `delse`'s shape), the `if` must be void-typed, and the
+    // kept arm scans under the same rules as `bri`'s — a `br`/`br_if`
+    // to the `if`'s own end rejects, outer-crossing labels retarget
+    // -1. Runs late: `walias`/`sfwd`
+    // delete arm-local copies that often leave a lone `br` behind.
+    // `PLIRON_WASM_BRI2=1` on.
+    if opts.bri2 {
+        let safe_ctl = |op: u8| matches!(op, 0x00 | 0x01 | 0x0f | 0x10..=0x14);
+        // Each fold emits the kept arm without rescanning it, so a
+        // nested `if{A}else{br}` inside one needs another round. 8
+        // rounds is generous — each strictly removes an `if`.
+        for _round in 0..8 {
+            let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
+            let mut i = 0;
+            let mut folded = false;
+            'iter: while i < ins.len() {
+                if !(matches!(ins[i].0, WPeek::Ctl) && b[ins[i].1] == 0x04)
+                    || b.get(ins[i].1 + 1) != Some(&0x40)
+                {
+                    out.push(ins[i]);
+                    i += 1;
+                    continue;
+                }
+                'fold: {
+                    // Scan arm1 (i+1 .. j): ends at the arm's `else` or
+                    // `end` at rel 0 — an `end` means no else arm.
+                    let mut rel = 0usize;
+                    let mut arm: Vec<(WPeek, usize, usize, usize)> = Vec::new();
+                    let mut j = i + 1;
+                    let mut bad = false;
+                    let mut has_else = false;
+                    while j < ins.len() {
+                        let (k2, s2, _e2, c2) = ins[j];
+                        match k2 {
+                            WPeek::Br(d) | WPeek::BrIf(d) => {
+                                let d = d as usize;
+                                if d == rel {
+                                    bad = true;
+                                    break;
+                                }
+                                if d < rel {
+                                    arm.push(ins[j]);
+                                } else {
+                                    arm.push((
+                                        if matches!(k2, WPeek::Br(_)) {
+                                            WPeek::Br((d - 1) as u32)
+                                        } else {
+                                            WPeek::BrIf((d - 1) as u32)
+                                        },
+                                        s2,
+                                        s2,
+                                        c2,
+                                    ));
+                                }
+                            }
+                            WPeek::Ctl => match b[s2] {
+                                0x0b if rel == 0 => break, // `end` of the `if`
+                                0x0b => {
+                                    rel -= 1;
+                                    arm.push(ins[j]);
+                                }
+                                0x05 if rel == 0 => {
+                                    has_else = true;
+                                    break;
+                                }
+                                // nested `else` belongs to a nested `if`
+                                0x05 => arm.push(ins[j]),
+                                0x02 | 0x03 | 0x04 => {
+                                    rel += 1;
+                                    arm.push(ins[j]);
+                                }
+                                0x0c | 0x0d => {
+                                    let mut dp = s2 + 1;
+                                    let Some(d) = urd(b, &mut dp) else {
+                                        bad = true;
+                                        break;
+                                    };
+                                    let d = d as usize;
+                                    if d == rel {
+                                        bad = true;
+                                        break;
+                                    }
+                                    if d < rel {
+                                        arm.push(ins[j]);
+                                    } else {
+                                        arm.push((
+                                            if b[s2] == 0x0c {
+                                                WPeek::Br((d - 1) as u32)
+                                            } else {
+                                                WPeek::BrIf((d - 1) as u32)
+                                            },
+                                            s2,
+                                            s2,
+                                            c2,
+                                        ));
+                                    }
+                                }
+                                // `br_table` (0x0e) carries label operands
+                                // that would need retargeting — it isn't in
+                                // `safe_ctl`, so it rejects below.
+                                _ if !safe_ctl(b[s2]) => {
+                                    bad = true;
+                                    break;
+                                }
+                                _ => arm.push(ins[j]),
+                            },
+                            _ => arm.push(ins[j]),
+                        }
+                        j += 1;
+                    }
+                    if bad || !has_else || j + 2 >= ins.len() {
+                        break 'fold;
+                    }
+                    // The else arm must be exactly `br K` (K >= 1)
+                    // followed by the `if`'s `end`, ignoring dead
+                    // `Del`/`Nop` markers earlier passes left behind.
+                    let mut a2i = j + 1;
+                    while matches!(
+                        ins.get(a2i).map(|x| x.0),
+                        Some(WPeek::Del | WPeek::Nop(_))
+                    ) {
+                        a2i += 1;
+                    }
+                    let Some(&a2) = ins.get(a2i) else {
+                        break 'fold;
+                    };
+                    let k = match a2.0 {
+                        WPeek::Br(d) => Some(d as usize),
+                        WPeek::Ctl if b[a2.1] == 0x0c => {
+                            let mut dp = a2.1 + 1;
+                            urd(b, &mut dp).map(|d| d as usize)
+                        }
+                        _ => None,
+                    };
+                    let Some(k) = k else {
+                        break 'fold;
+                    };
+                    if k == 0 {
+                        break 'fold;
+                    }
+                    let mut e2i = a2i + 1;
+                    while matches!(
+                        ins.get(e2i).map(|x| x.0),
+                        Some(WPeek::Del | WPeek::Nop(_))
+                    ) {
+                        e2i += 1;
+                    }
+                    if !(matches!(ins.get(e2i).map(|x| x.0), Some(WPeek::Ctl))
+                        && b[ins[e2i].1] == 0x0b)
+                    {
+                        break 'fold;
+                    }
+                    // `prel` anchors on the deleted insts (the `if`,
+                    // the `else`, arm2's `br`, the `end`) lose their
+                    // emit slot; arm1's insts keep positions and depth.
+                    if prel.iter().any(|&(pp, _)| {
+                        pp == ins[i].1
+                            || pp == ins[j].1
+                            || pp == a2.1
+                            || pp == ins[e2i].1
+                    }) {
+                        break 'fold;
+                    }
+                    out.push((WPeek::Eqz, ins[i].1, ins[i].1, ins[i].3)); // i32.eqz
+                    out.push((WPeek::BrIf((k - 1) as u32), ins[i].1, ins[i].1, ins[i].3));
+                    out.extend(arm);
+                    i = e2i + 1;
+                    folded = true;
+                    continue 'iter;
+                }
+                out.push(ins[i]);
+                i += 1;
+            }
+            ins = out;
+            if !folded {
+                break;
+            }
+        }
+    }
     // (Local renumbering — hot-first index compaction — was tried and
     // reverted: the `groups` regroup it forces costs more than the
     // 1-byte-LEB savings it buys; ~+18B net on the module.)
@@ -4766,6 +4972,7 @@ fn peep_body_opts(
             WPeek::Ctl | WPeek::Other => nb.extend_from_slice(&b[s..e]),
             WPeek::Del | WPeek::Nop(_) => {}
             WPeek::Drop => nb.push(0x1a),
+            WPeek::Eqz => nb.push(0x45),
         }
         wi += 1;
     }
@@ -5109,6 +5316,7 @@ mod wpeep_tests {
             ddrop: false,
             delse: false,
             bri: false,
+            bri2: false,
             btr: false,
         }
     }
@@ -5588,6 +5796,188 @@ mod wpeep_tests {
         o.bri = true;
         let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
         assert!(has_seq(&out, &[0x04, 0x40]), "folded anyway: {out:02x?}");
+    }
+
+    // bri2: `if c { A } else { br K }` → `i32.eqz; br_if (K-1); A`.
+    #[test]
+    fn bri2_if_else_br_folds_to_eqz_br_if() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x10, 0x05, // call 5
+                0x05, // else
+                0x0c, 0x01, // br 1 -> P's end
+                0x0b, // end (if)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(
+            has_seq(&out, &[0x45, 0x0d, 0x00, 0x10, 0x05]),
+            "no eqz;br_if 0;call: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0x04, 0x40]), "if kept: {out:02x?}");
+    }
+
+    // Arm A's own `br` reaching past the removed `if` retargets -1.
+    #[test]
+    fn bri2_kept_arm_br_retargets() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x02, 0x40, // block Q
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x10, 0x05, // call 5
+                0x0c, 0x02, // br 2 -> P's end
+                0x05, // else
+                0x0c, 0x02, // br 2 -> P's end
+                0x0b, // end (if)
+                0x0b, // end (Q)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(
+            has_seq(&out, &[0x45, 0x0d, 0x01, 0x10, 0x05, 0x0c, 0x01]),
+            "no eqz;br_if 1 + call + br 1: {out:02x?}"
+        );
+    }
+
+    // A `br` inside arm A that targets the removed `if`'s own end
+    // (`d == rel`) can't be expressed flat — no fold.
+    #[test]
+    fn bri2_kept_arm_br_to_if_blocks() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x10, 0x05, // call 5
+                0x0c, 0x00, // br 0 -> if's own end
+                0x05, // else
+                0x0c, 0x01, // br 1 -> P's end
+                0x0b, // end (if)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(has_seq(&out, &[0x04, 0x40]), "folded anyway: {out:02x?}");
+    }
+
+    // `else { br 0 }` targets the `if`'s own end — `delse`'s shape, not
+    // a forward exit; no fold.
+    #[test]
+    fn bri2_else_br_0_kept() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x10, 0x05, // call 5
+                0x05, // else
+                0x0c, 0x00, // br 0 -> if's own end
+                0x0b, // end (if)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(has_seq(&out, &[0x04, 0x40]), "folded anyway: {out:02x?}");
+        assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 lost: {out:02x?}");
+    }
+
+    // A result-typed `if` can't fold — `br_if` can't carry the result.
+    #[test]
+    fn bri2_result_if_kept() {
+        let b = body(
+            4,
+            &[
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x7f, // if (result i32)
+                0x41, 0x01, // i32.const 1
+                0x05, // else
+                0x0c, 0x00, // br 0
+                0x0b, // end (if)
+                0x1a, // drop
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(has_seq(&out, &[0x04, 0x7f]), "folded anyway: {out:02x?}");
+    }
+
+    // Nested candidates: the outer fold emits arm A without rescanning,
+    // so an `if{..}else{br}` inside it needs a second round. The inner
+    // else's `br 2` (to P) is retargeted to `br 1` by the outer fold,
+    // then folds itself next round.
+    #[test]
+    fn bri2_nested_folds_over_rounds() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c0
+                0x04, 0x40, // if0
+                0x20, 0x01, // get 1 -> c1
+                0x04, 0x40, // if1
+                0x10, 0x05, // call 5
+                0x05, // else
+                0x0c, 0x02, // br 2 -> P's end
+                0x0b, // end (if1)
+                0x05, // else (if0)
+                0x0c, 0x01, // br 1 -> P's end
+                0x0b, // end (if0)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(!has_seq(&out, &[0x04, 0x40]), "if kept: {out:02x?}");
+        assert!(
+            has_seq(&out, &[0x45, 0x0d, 0x00, 0x20, 0x01, 0x45, 0x0d, 0x00, 0x10, 0x05]),
+            "no nested eqz;br_if: {out:02x?}"
+        );
+    }
+
+    // `br_table` inside arm A carries label operands the fold doesn't
+    // retarget — no fold.
+    #[test]
+    fn bri2_kept_arm_br_table_blocks() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x41, 0x00, // i32.const 0
+                0x0e, 0x01, 0x00, 0x01, // br_table 0 1
+                0x05, // else
+                0x0c, 0x01, // br 1 -> P's end
+                0x0b, // end (if)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts(false, false);
+        o.bri2 = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(has_seq(&out, &[0x04, 0x40]), "folded anyway: {out:02x?}");
+        assert!(has_seq(&out, &[0x0e]), "br_table lost: {out:02x?}");
     }
 
     // `if c {} else { br 0 }` only consumes the condition — `drop`.
@@ -6180,6 +6570,7 @@ mod wpeep_tests {
         let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
         assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 gone: {out:02x?}");
     }
+
 }
 
 /// Rebuild `succs`/`preds`/`pos_in_succ_pred`/`pos_in_pred_succ` from
