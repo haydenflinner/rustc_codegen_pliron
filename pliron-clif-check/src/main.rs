@@ -36,6 +36,9 @@ struct Opts {
     limit: usize,
 }
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     // `PLIRON_TRACE=<env-filter>` (e.g. `pliron::jumpthread=info`) —
     // pass-internal `tracing` prof timers stay silent without a
