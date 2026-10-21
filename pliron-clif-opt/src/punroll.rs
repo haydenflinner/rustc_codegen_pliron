@@ -54,6 +54,8 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// Successful unroll/jam/peel transforms per function
+/// (`PLIRON_PUNROLL_MAX=N` overrides).
 const MAX_LOOPS: usize = 8;
 const MAX_CHAIN: usize = 4;
 /// Non-terminator instructions along the whole chain, summed.
@@ -327,8 +329,11 @@ pub fn run(
     let peel_on = crate::pass_enabled("PLIRON_PEEL");
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut normed: FxHashSet<Block> = FxHashSet::default();
+    let max = crate::env_get("PLIRON_PUNROLL_MAX")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(MAX_LOOPS);
     let mut n = 0;
-    while n < MAX_LOOPS {
+    while n < max {
         let mut hit = false;
         {
             let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
@@ -387,6 +392,15 @@ pub fn run(
                         break; // cfg/la stale; rescan
                     }
                 }
+            }
+            // `PLIRON_PUNROLL_DEEP=1`: innermost loops first, so the
+            // `MAX_LOOPS` budget goes to the hot leaves (`format_exact`'s
+            // bignum `mul_small`/`sub` loops) before cold outer ones.
+            let mut loops = loops;
+            if crate::env_is("PLIRON_PUNROLL_DEEP", "1") {
+                loops.sort_by_key(|&lp| {
+                    std::cmp::Reverse(la.loop_level(la.loop_header(lp)).level())
+                });
             }
             for lp in loops {
                 if hit {
