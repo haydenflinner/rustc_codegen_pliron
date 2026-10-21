@@ -2799,17 +2799,6 @@ fn s_dem64(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
-fn s_brzh(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    if !p.wasm {
-        return 0;
-    }
-    let k = clifpeep::brif_zh(&mut p.clctx.func);
-    if k > 0 && p.dump {
-        p.dump("brzh");
-    }
-    k
-}
-
 fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     let mut k = indvars::postinc(&mut p.clctx.func, an, 1024);
     if k > 0 {
@@ -3909,10 +3898,6 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // i64->i32 low-word demotion — after the late folds so their
         // residuals demote too, before coldret so block layout is final.
         step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),
-        // wasm `if` arm order by LLVM's zero/equality heuristic — last,
-        // so no later CFG pass re-canonicalizes the swapped arms.
-        step("brzh", "brzh", Gate::OptIn("PLIRON_WASM_ZH"), s_brzh)
-            .needs(shape::CONDBR),
         Step {
             name: "coldret",
             bisect: Some("coldret"),
