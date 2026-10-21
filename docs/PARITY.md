@@ -17,13 +17,13 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.924** | ahead; real gaps: `strwork` +25%, `hmget` +19%, `parse_only` +19% |
-| wasm module size | 1.98 (188.2 KiB vs 95 KiB) | behind |
-| compile time: bench kernels, native | **0.56** (0.25 s vs 0.45 s) | ahead (2026-10-20) |
-| compile time: bench kernels, wasm | **0.79** (0.45 s vs 0.57 s) | ahead (2026-10-20; was 1.48) |
-| compile time: regex-syntax (~40 kLOC) | **0.94** (1.50 s vs 1.59 s) | parity on wall (2026-10-20; was 1.89); CPU 1.5x (6.9 vs 4.7 s) |
-| compile time: regex-syntax, wasm32 (one CGU) | **1.08** (3.04 s vs 2.81 s) | near parity (2026-10-20; was 7.3) |
-| compile time: syn 2 + `full` (~50 kLOC) | **1.14** (5.81 s vs 5.08 s, loaded box) | behind (2026-10-20; was 15-22); CPU 1.28x (24.8 vs 19.3 s) |
+| wasm runtime (geomean, 16 kernels) | **0.922** | ahead; real gaps: `strwork` +25%, `hmget` +19%, `parse_only` +19% |
+| wasm module size | 1.95 (185.6 KiB vs 95 KiB) | behind |
+| compile time: bench kernels, native | **0.59** (0.25 s vs 0.43 s) | ahead (2026-10-21) |
+| compile time: bench kernels, wasm | **1.17** (0.62 s vs 0.54 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
+| compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
+| compile time: regex-syntax, wasm32 (one CGU) | **1.08** (2.85 s vs 2.64 s) | near parity (2026-10-21) |
+| compile time: syn 2 + `full` (~50 kLOC) | **1.10** (3.46 s vs 3.14 s) | behind (2026-10-21; was 15-22) |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
