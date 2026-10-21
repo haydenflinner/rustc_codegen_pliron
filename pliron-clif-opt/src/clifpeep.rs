@@ -10440,14 +10440,13 @@ pub fn vecslot(func: &mut Function) -> usize {
                         .loads
                         .push((i, o + i64::from(offset), n));
                 }
-                InstructionData::LoadNoOffset { arg, .. } => {
-                    let p = func.dfg.resolve_aliases(arg);
-                    let Some(&(ss, o)) = slotval.get(&p) else {
-                        continue;
-                    };
-                    let n = func.dfg.value_type(func.dfg.first_result(i)).bytes() as usize;
-                    slots.entry(ss).or_default().loads.push((i, o, n));
-                }
+                // No `LoadNoOffset` arm: that format is `bitcast` +
+                // `atomic_load`, not loads — a `bitcast` reads its
+                // operand as a *value* (the slot's address escaping
+                // into an int/float, not a read of its bytes) and an
+                // `atomic_load` can't fold to a constant without
+                // dropping atomicity. Both fall to `_` and mark the
+                // slot `bad`.
                 _ => {
                     // A non-load/store inst consuming a slot-rooted value:
                     // the address escapes (unless it's an addr-chain iadd).
@@ -10473,10 +10472,19 @@ pub fn vecslot(func: &mut Function) -> usize {
     for (v, &(ss, _)) in &slotval {
         for &u in uses.get(v).into_iter().flatten() {
             let escaped = match func.dfg.insts[u] {
-                InstructionData::Load { arg, .. } | InstructionData::LoadNoOffset { arg, .. } => {
-                    func.dfg.resolve_aliases(arg) != *v
+                InstructionData::Load { arg, .. } => func.dfg.resolve_aliases(arg) != *v,
+                // `LoadNoOffset` is `bitcast`/`atomic_load`: only the
+                // atomic's `arg` is an address operand — a `bitcast`
+                // consumes the slot-derived pointer as data (it can be
+                // bitcast back to an address downstream), so any use
+                // escapes.
+                InstructionData::LoadNoOffset { opcode, arg, .. } => {
+                    opcode != Opcode::AtomicLoad || func.dfg.resolve_aliases(arg) != *v
                 }
-                InstructionData::Store { args, .. } => func.dfg.resolve_aliases(args[1]) != *v,
+                InstructionData::Store { args, .. }
+                | InstructionData::StoreNoOffset { args, .. } => {
+                    func.dfg.resolve_aliases(args[1]) != *v
+                }
                 _ => false,
             };
             if escaped {
@@ -12174,6 +12182,72 @@ mod tests {
         assert!(!ops.contains(&Opcode::Load), "{}", func.display());
         assert!(ops.contains(&Opcode::AtomicLoad), "{}", func.display());
         dem64_verify(&func, "dem64 LoadNoOffset");
+    }
+
+    /// `bitcast`/`atomic_load` share `LoadNoOffset` — `vecslot` must
+    /// not record either as a foldable slot load: a `bitcast` of a
+    /// slot's address reads the *pointer* (folding it to the slot's
+    /// contents constant yields the wrong value) and folding an
+    /// `atomic_load` to `iconst` drops atomicity. Both mark the slot
+    /// `bad`; a sibling slot's plain load still folds.
+    #[test]
+    fn vecslot_loadnoffset_is_not_a_load() {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let ss1 = func.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        let ss2 = func.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let a1 = cur.ins().stack_addr(types::I64, ss1, 0);
+        for j in 0..8i32 {
+            let k = cur.ins().iconst(types::I64, i64::from(j));
+            cur.ins().istore8(MemFlagsData::new(), k, a1, j);
+        }
+        let l1 = cur.ins().load(types::I64, MemFlagsData::new(), a1, 0);
+
+        let a2 = cur.ins().stack_addr(types::I64, ss2, 0);
+        for j in 0..8i32 {
+            let k = cur.ins().iconst(types::I64, i64::from(j));
+            cur.ins().istore8(MemFlagsData::new(), k, a2, j);
+        }
+        let b = cur.ins().bitcast(types::F64, MemFlagsData::new(), a2);
+        let al = cur.ins().atomic_load(types::I64, MemFlagsData::new(), a2);
+        cur.ins().return_(&[l1]);
+
+        let bi = func.dfg.value_def(b).inst().unwrap();
+        let ali = func.dfg.value_def(al).inst().unwrap();
+        vecslot(&mut func);
+        // Control: the plain load folded to an `iconst`.
+        assert_eq!(
+            func.dfg.insts[func
+                .dfg
+                .value_def(func.dfg.resolve_aliases(l1))
+                .inst()
+                .unwrap()]
+            .opcode(),
+            Opcode::Iconst,
+            "{}",
+            func.display()
+        );
+        // `bitcast` and `atomic_load` survive — neither folds away.
+        assert!(func.layout.inst_block(bi).is_some(), "{}", func.display());
+        assert!(func.layout.inst_block(ali).is_some(), "{}", func.display());
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("vecslot produced invalid IR: {e}\n{}", func.display());
+        }
     }
 
     /// `ireduce.i32 (uextend.i64 x)` narrows to `x` even when the

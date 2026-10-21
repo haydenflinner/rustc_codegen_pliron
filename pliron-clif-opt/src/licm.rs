@@ -238,9 +238,19 @@ fn hoists(
                     .is_some_and(|end| end <= i64::from(func.sized_stack_slots[ss].size))
         }
         Root::V(v) => {
-            let proven = deref
-                .get(&v)
-                .is_some_and(|&(bytes, _)| o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64);
+            // `loc.1`, not `o` — the peel offset alone ignores the
+            // inst's `offset` imm, so `load p+K` would check `[0,
+            // bytes)` while reading `[K, K+bytes)`: a `notrap` load on
+            // a never-taken path can sit past the `dereferenceable`
+            // bound and hoisting it speculates that read (same hazard
+            // as the `Root::S` wild offset).
+            let proven = deref.get(&v).is_some_and(|&(bytes, _)| {
+                loc.1 >= 0
+                    && loc
+                        .1
+                        .checked_add(i64::from(ty.bytes()))
+                        .is_some_and(|end| end <= bytes as i64)
+            });
             proven
                 || func.dfg.value_def(v).inst().is_some_and(|d| {
                     matches!(
@@ -879,7 +889,10 @@ fn promote(
         }
         if let Root::V(v) = r {
             let proven = deref.get(&v).is_some_and(|&(bytes, writable)| {
-                writable && o >= 0 && o + i64::from(ty.bytes()) <= bytes as i64
+                writable
+                    && o >= 0
+                    && o.checked_add(i64::from(ty.bytes()))
+                        .is_some_and(|end| end <= bytes as i64)
             });
             let ok = proven
                 || func.layout.block_insts(h).any(|i| {
@@ -1612,6 +1625,87 @@ mod tests {
             blk(w),
             lbody,
             "wild-offset load left the loop:\n{}",
+            func.display()
+        );
+        assert_eq!(
+            blk(ok),
+            b0,
+            "in-bounds load failed to hoist:\n{}",
+            func.display()
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// `load.i64 notrap p+8` against a `dereferenceable(8)` root reads
+    /// bytes 8..16 — past the proven range. The bound must cover the
+    /// access *including* the inst's `offset` imm; checking only the
+    /// peel offset would speculate a read past the marked object onto
+    /// the unconditional path (a `notrap` load on a never-taken path
+    /// can carry any offset). In-bounds accesses still hoist.
+    #[test]
+    fn offset_past_deref_bound_stays_in_loop() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let lbody = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, h, lbody, done] {
+            func.layout.append_block(b);
+        }
+        let p = func.dfg.append_block_param(h, types::I64);
+        let q = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let fv = cur.ins().iconst(types::I64, 5);
+        let ptr = cur.ins().iconst(types::I64, 0x1000);
+        cur.ins().jump(h, &[fv.into(), ptr.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+        cur.ins().brif(r, lbody, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+        let wild = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), q, 8);
+        let ok = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), q, 0);
+        cur.ins().jump(h, &[fv.into(), ptr.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        let mut deref = FxHashMap::default();
+        deref.insert(ptr, (8, false));
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
+            &deref,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            &FxHashMap::default(),
+        );
+        let blk = |v: Value| {
+            func.layout
+                .inst_block(func.dfg.value_def(v).inst().unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            blk(wild),
+            lbody,
+            "load past the dereferenceable bound left the loop:\n{}",
             func.display()
         );
         assert_eq!(
