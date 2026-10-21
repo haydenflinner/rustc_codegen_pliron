@@ -816,6 +816,69 @@ fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) 
 /// are sub-2^32 extractable even when their producers stay i64 —
 /// `icmp.i64 eq (uextend x), 0` becomes `icmp.i32 eq x, 0` with the
 /// `uextend` left for its wider consumers.
+/// wasm `if` arm order: stackify makes a `brif`'s first target the `if`
+/// then-arm, which V8 lays out as the fall-through. LLVM's zero/equality
+/// heuristic calls `x == K` unlikely, so `brif (x == K), T, F` becomes
+/// `brif (x != K), F, T` — `brif x, F, T` for `K = 0`, which also drops
+/// the `eqz`. The likely successor falls through and a cold `Err`/exit arm
+/// leaves the hot path (`from_str_radix`'s `len == 0`/`len == 1` arms cost
+/// parse_only two taken branches per word). `PLIRON_WASM_ZH=1`.
+pub fn brif_zh(func: &mut Function) -> usize {
+    let iconst = |func: &Function, v: Value| -> Option<i64> {
+        let i = func.dfg.resolved_value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Some(imm.bits()),
+            _ => None,
+        }
+    };
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        if blocks[0].block(&func.dfg.value_lists) == blocks[1].block(&func.dfg.value_lists) {
+            continue;
+        }
+        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst() else {
+            continue;
+        };
+        let InstructionData::IntCompare {
+            cond: IntCC::Equal,
+            args,
+            ..
+        } = func.dfg.insts[ci]
+        else {
+            continue;
+        };
+        let (x, kv, k) = match (iconst(func, args[0]), iconst(func, args[1])) {
+            (_, Some(k)) => (args[0], args[1], k),
+            (Some(k), None) => (args[1], args[0], k),
+            _ => continue,
+        };
+        if func.dfg.value_type(x).bits() > 64 {
+            continue;
+        }
+        let c = if k == 0 {
+            x
+        } else {
+            FuncCursor::new(func)
+                .at_inst(t)
+                .ins()
+                .icmp(IntCC::NotEqual, x, kv)
+        };
+        if let InstructionData::Brif { arg, blocks, .. } = &mut func.dfg.insts[t] {
+            *arg = c;
+            blocks.swap(0, 1);
+        }
+        n += 1;
+    }
+    n
+}
+
 /// `uextend.i64` of a narrowing chain — `ireduce`, `band` by a constant,
 /// `uextend` — back to an i64 source collapses to one `band` with the
 /// chain's combined mask: each step only keeps or clears low bits, so the
