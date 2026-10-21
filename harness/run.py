@@ -350,7 +350,14 @@ def suite_ui_wasm(args):
 # is a real bug. -Zmir-opt-level=0 keeps MIR as generated for all backends.
 GENERATE = os.environ.get(
     "PLIRON_FUZZ_GENERATOR",
-    os.path.join(ROOT, "..", "rustlantis", "target", "release", "generate"),
+    os.path.join(
+        ROOT,
+        "..",
+        "rustlantis",
+        "target",
+        "release",
+        "generate" + (".exe" if sys.platform == "win32" else ""),
+    ),
 )
 
 
