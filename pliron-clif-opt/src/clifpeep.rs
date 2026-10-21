@@ -822,7 +822,7 @@ fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) 
 /// result is `src & M`. `dem64` leaves these behind when a demoted web
 /// re-widens (hashbrown's control byte `(h >> 25) & 127`, byte-broadcast
 /// by an i64 multiply: wrap + `i32.and` + extend → one `i64.and`).
-/// `PLIRON_ZXCHAIN=1`.
+/// `PLIRON_ZXCHAIN=0` off.
 pub fn zext_chain(func: &mut Function) -> usize {
     let iconst = |func: &Function, v: Value| -> Option<u64> {
         let i = func.dfg.resolved_value_def(v).inst()?;

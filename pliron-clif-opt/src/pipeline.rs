@@ -2790,7 +2790,7 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // whole pipeline residuals are covered; clifpeep also calls it early.
 fn s_dem64(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let mut k = clifpeep::dem64(&mut p.clctx.func);
-    if crate::env_is("PLIRON_ZXCHAIN", "1") {
+    if crate::pass_enabled("PLIRON_ZXCHAIN") {
         k += clifpeep::zext_chain(&mut p.clctx.func);
     }
     if k > 0 && p.dump {
