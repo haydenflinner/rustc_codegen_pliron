@@ -4652,16 +4652,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);
             let atomic = is!(AtomicLoadOp);
-            // Volatile accesses stay plain loads/stores bracketed by fences:
-            // cranelift MemFlags has no volatile bit, and without a barrier
-            // its alias analysis can fold a volatile load to an earlier
-            // value or dead-store-eliminate a volatile store. The fences put
-            // each volatile access behind an unkillable memory version.
-            let vol = !atomic && self.st.volatile.contains(op);
+            // Volatile accesses lose `notrap` in `plain_mf`, which is the
+            // pass-level gate that keeps them from being folded, moved,
+            // or removed. Bracketing them with `fence` never saved them
+            // (the passes still folded through) and the fences — treated
+            // as clobbering every non-isolated location — blocked LICM
+            // and load forwarding for unrelated accesses.
             let mf = self.plain_mf(op);
-            if vol {
-                self.b.ins().fence();
-            }
             let r: Vals = self
                 .ty_leaves(self.res_ty(op))
                 .iter()
@@ -4679,9 +4676,6 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     }
                 })
                 .collect();
-            if vol {
-                self.b.ins().fence();
-            }
             if r.len() == 1 && self.st.nonnull.contains(op) {
                 if pliron_cfg::tracing_on()
                     && tracing::enabled!(target: "pliron::lower", tracing::Level::DEBUG)
@@ -4715,13 +4709,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let p = self.get1(opnds[1]);
             let lv = self.ty_leaves(opnds[0].get_type(ctx));
             let mf = self.plain_mf(op);
-            // Volatile store: bracket with fences so cranelift's alias
-            // analysis can never dead-store-eliminate or reorder it (see
-            // the LoadOp branch above).
-            let vol = !is!(AtomicStoreOp) && self.st.volatile.contains(op);
-            if vol {
-                self.b.ins().fence();
-            }
+            // Volatile store: no `notrap`, so no pass may kill or move it
+            // (see the LoadOp branch above) — no fence bracket needed.
             for (v, &(o, t)) in vs.into_iter().zip(lv.iter()) {
                 if is!(AtomicStoreOp) && self.needs_atomic_stub(t) {
                     self.atomic_store_stub(p, o, v);
@@ -4736,9 +4725,6 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 } else {
                     self.b.ins().store(mf, v, p, o as i32);
                 }
-            }
-            if vol {
-                self.b.ins().fence();
             }
         } else if is!(AtomicRmwOp) {
             use cranelift_codegen::ir::AtomicRmwOp as R;
