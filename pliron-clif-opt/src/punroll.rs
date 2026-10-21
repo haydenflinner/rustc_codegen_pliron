@@ -604,11 +604,15 @@ fn find_count(
     cont_args: &[Value],
 ) -> Option<Cnt> {
     for (a, b, cc) in [(x, y, cond), (y, x, cond.swap_args())] {
-        let (le, signed) = match cc {
-            IntCC::UnsignedLessThan => (false, false),
-            IntCC::UnsignedLessThanOrEqual => (true, false),
-            IntCC::SignedLessThan => (false, true),
-            IntCC::SignedLessThanOrEqual => (true, true),
+        let (le, signed, eq) = match cc {
+            IntCC::UnsignedLessThan => (false, false, false),
+            IntCC::UnsignedLessThanOrEqual => (true, false, false),
+            IntCC::SignedLessThan => (false, true, false),
+            IntCC::SignedLessThanOrEqual => (true, true, false),
+            // `p != bound` continue: same monotone-counter counting as
+            // `latch_count`'s eq form — the strict unsigned guard in
+            // `guard` keeps mid-group `== bound` exits impossible.
+            IntCC::NotEqual => (false, false, true),
             _ => continue,
         };
         let Some((pidx, d)) = affine_param(func, h, a) else {
@@ -682,7 +686,7 @@ fn find_count(
             bpidx,
             le,
             signed,
-            eq: false,
+            eq,
         });
     }
     None

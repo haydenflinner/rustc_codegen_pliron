@@ -1,0 +1,25 @@
+; test punroll
+; `p != bound` latch continue-test: a counted loop under a monotone
+; counter (same eq form latch_count accepts on the multi-block path).
+; The group unroll must fire behind the strict-unsigned trip guard
+; (`a < bound` precludes any mid-group `a == bound` hit, so the elided
+; copies cannot exit early); the rolled loop survives as remainder.
+; check: umin
+; check: icmp ne
+
+function u0:0(i64, i64) fast {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 0
+    jump block1(v2)
+
+block1(v5: i64):
+    v10 = iconst.i64 4
+    v6 = iadd v0, v5
+    store.i64 notrap v5, v6
+    v7 = iadd v5, v10
+    v8 = icmp ne v7, v1
+    brif v8, block1(v7), block2
+
+block2:
+    return
+}
