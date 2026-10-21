@@ -17,8 +17,8 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.922** | ahead; real gaps: `strwork` +25%, `hmget` +19%, `parse_only` +19% |
-| wasm module size | 1.95 (185.6 KiB vs 95 KiB) | behind |
+| wasm runtime (geomean, 16 kernels) | **0.919** | ahead; real gaps: `strwork` +26%, `hmget` +17%, `parse_only` +9% |
+| wasm module size | 1.95 (185.3 KiB vs 95 KiB) | behind |
 | compile time: bench kernels, native | **0.59** (0.25 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.17** (0.62 s vs 0.54 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
 | compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
@@ -467,13 +467,13 @@ inliner and `wpeep` on top of the same pipeline; profile
 |---|---|---|
 | fib | **2.01** | Recursion turned into a loop by both, but our loop body is an `if/else` + `br` with 5 locals vs LLVM's single `br_if` with 2 (`wasm2wat` the `fib3fib` function in both modules). Shared cause below: the loop's `brif` lowers to `if c { get*;set*; br L } else { ret }` — the param copies sit in scratch locals inside the `if` arm where `wpeep`'s `pathcheck` (straight-line rule) can't retarget them, while LLVM updates `n`/`acc` unconditionally (`local.tee`) then `br_if`s. **DONE** (`PLIRON_WASM_BRF=0` off): `wpeep` now folds `if c { get*/set*/tee*; br L } [else { R }] end` → hoisted copies + `br_if` (depth−1), guarded by arm-purity, an operand-stack balance check (a `set`/`tee` popping the cond or a nonzero net depth rejects), no `Get`/`Nop` read of a copied local in the else arm or later, no depth-referencing/structured op in the else arm, `prel` empty. Unit tests `backedge_if_*`. NOTE: produces LLVM's shape + ~8B/fn smaller, but **V8-runtime-neutral on this box** (both control forms compile to the same work) — the residual gap is op *count*, below. |
 | chars_mixed | ~1.4 | **partially DONE**: `NonNull`-i32 (`PLIRON_NN_ANYINT`) folds `eqz`-through-`phi`/`select`/`nonnull` → the `ptr==end`+`byte_ptr==0` `Option`-niche double-check is gone; `dem64` (`PLIRON_DEM64`) demotes `Option<u32>`/`usize`/`char` low-32 i64 webs → the `i64.extend; i64.and 128; i64.ne`→`i32` per-char overhead is gone (`chars_ascii` `i64` refs 23→0, +35→+9%). Residual = `next_code_point`/UTF-8 multi-byte decode (`load offset=1..3`, `&63`, `shl`, `or`, `ge_u` branches — LLVM's `byte<0?decode:cp<128` path is tighter) + locals churn. |
-| parse_only | ~1.3 | digit loops; `dem64`/`NonNull` +33→+33 (the `Split`/`iter` spill nonnull — see agent note below) |
-| tokenize | ~1.29 | `Split::next_match` `{0,2}` tag + iter-ptr spill-reload nonnull gap |
-| hmget | ~1.2 | hashbrown probe + SipHash; earlier inlining work closed most of it (`WASM_HOT`) |
-| hashmap | ~1.2 | hashbrown probe + control-word `load.i64`/`icmp eq 0` |
-| strwork | ~1.2 | string building / memcpy-heavy |
-| fib | ~1.1 | recursion; `br_if` fold landed (V8-neutral); `dem64`/`NonNull` +10→+9.5 |
-| nbody | ~1.08 | f64 math |
+| parse_only | ~1.09 | **SwitchOp on wasm** (`PLIRON_SWITCH_WASM`, `builder.rs`): the "wasm.rs has no SwitchOp lowering" exclusion was stale — `dense_switch`→`br_table`/`ifconv` select chains work; the `from_str_radix` digit `match` became selects, +31%→+9%. |
+| tokenize | ~0.67 | ahead |
+| hmget | ~1.17 | hashbrown probe + SipHash; the probe loop's `local.*` traffic is ~1.4× LLVM's — emit-level density, below |
+| hashmap | ~1.03 | at parity |
+| strwork | ~1.26 | `dragon::format_exact` is +53% of its samples vs LLVM — emit-level density: 182 `if`/`else` pairs vs LLVM's flat `block`+`br_if` (0 `if`), 271 labels vs 124, `local.*` 1.9×. |
+| fib | ~0.96 | ahead post `br_if` fold + `dem64`/`NonNull` |
+| nbody | ~1.04 | f64 math |
 | sieve, sortw | ~1.0 | at/near parity post `dem64`/`NonNull` (sortw 0.9%, sieve 2.5%) |
 | chars_alpha, iterw, matmul, eqbug, contains_rng | <1.0 | ahead |
 | tokenize 0.66, iterw 0.70, contains_rng 0.78, hashmap 0.88, sortw 0.90, fib 0.95, chars_ascii (was 0.57 → now ~0.92) | | ahead |
@@ -484,8 +484,24 @@ inliner and `wpeep` on top of the same pipeline; profile
 `black_box` on wasm is a stack store + reload under both backends (LLVM
 does the same), so it is not a source of the gap — don't "optimize" it
 to an identity; that would only make the benchmarks lie.
-Module size (2.2x) is mostly pliron-wasm-ld's weaker dead-code GC and
-inlining growth; `winline`'s caller-growth cap already took it from 8x.
+Module size (1.95x) is **op density**, not GC: the whole module runs
+~2.3× LLVM's op count (`local.get/set/tee` 3.4×/2.4×/2.9×, `br` 6.8×,
+`if`/`else` 2746 pairs vs LLVM's 0 — we emit structured `if` diamonds
+where LLVM emits flat `block`+`br_if`), and `compute/mem` itself is
+1.9×. Reachable-but-cold bodies are all data/vtable-rooted. wasm-opt
+-O3 recovers −28% (189.7→136.4 KiB); `coalesce-locals` alone −13 KiB.
+Remaining systematic anomalies vs LLVM: `global.get` 7.6× (GOT entries
+pliron-wasm-ld synthesizes — LLVM writes resolved `i32.const`
+immediates into the code section; folding ours post-link would *grow*
+the module), `return` 6.4× (early returns vs joined epilogue),
+`br_table` 0 vs 17 (SwitchOp now reaches wasm via `dense_switch`; the
+CLIF pipeline if-converts most of them to select chains before emit),
+`i32.and`/`i32.shl` ~3.2× (incl. ~44 dead `&31`/`&63` shift masks —
+wasm shifts already mask). wpeep `ddrop` (`PLIRON_WASM_DDROP`, default
+on) removed ~480 dead `drop`s; `brf` folded ~450 `if{…;br}` sites
+(−2.5 KiB). Next levers: dead-else `if{A;brK}else{brK}`→`if{A}` (~59
+sites), deeper `if`→`br_if` restructuring in stackify, local
+coalescing parity with binaryen.
 
 ## 3. Native runtime
 
