@@ -56,7 +56,7 @@ impl<'a> WasmFuncBackend<'a> {
 
     pub fn lower(&self) -> Result<wasm_encoder::Function> {
         log::debug!("CFG:\n{:?}\n", self.cfg);
-        let trees = Trees::compute(&self.body);
+        let trees = Trees::compute(&self.body, &self.cfg);
         log::debug!("Trees:\n{:?}\n", trees);
         let ctrl = StackifyContext::new(&self.body, &self.cfg)?.compute();
         log::debug!("Ctrl:\n{:?}\n", ctrl);

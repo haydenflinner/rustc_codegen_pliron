@@ -53,6 +53,15 @@ LLVM's destructive-update shape.
 
 All changes are marked `// PLIRON:` in the source.
 
+## `src/backend/treeify.rs` — loop-nest guard (`PLIRON_WTREE_LOOP=1`)
+
+`Trees::compute` takes the `CFGInfo` and, when enabled, computes natural
+loops (`LoopNest`: backward walk from each back-edge). A single-use
+value is not treeified into a consumer that sits in a loop the def is
+outside of: emission would re-run the def every iteration, undoing a
+CLIF licm hoist (hmget's SipHash key-only half-round). Such a use marks
+the value `multi_use`, so no later use can own it either.
+
 ## `src/backend/treeify.rs` — single-use load sinking
 
 `is_movable` gains a `loads_ok` parameter so that a single-use memory

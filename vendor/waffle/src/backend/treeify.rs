@@ -1,8 +1,9 @@
 //! Treeification: placing some values "under" others if only used
 //! once, to generate more AST-like Wasm code.
 
+use crate::cfg::CFGInfo;
 use crate::entity::EntityRef;
-use crate::ir::{FunctionBody, Value, ValueDef};
+use crate::ir::{Block, FunctionBody, Value, ValueDef};
 use crate::Operator;
 use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::convert::TryFrom;
@@ -44,15 +45,21 @@ fn is_remat(op: &Operator) -> bool {
 }
 
 impl Trees {
-    pub fn compute(body: &FunctionBody) -> Trees {
+    pub fn compute(body: &FunctionBody, cfg: &CFGInfo) -> Trees {
         let mut owner = HashMap::default();
         let mut owned = HashMap::default();
         let mut remat = HashSet::default();
         let mut multi_use = HashSet::default();
         // PLIRON: read once per pass.
         let loads_ok = !std::env::var_os("PLIRON_WTREELOAD").is_some_and(|v| v == "0");
+        // PLIRON: `PLIRON_WTREE_LOOP=1` keeps a tree from pulling a def
+        // into a loop it sits outside of — a single-use invariant licm
+        // hoisted would otherwise be re-emitted at its in-loop use.
+        let nest = std::env::var_os("PLIRON_WTREE_LOOP")
+            .is_some_and(|v| v == "1")
+            .then(|| LoopNest::compute(cfg));
 
-        for block_def in body.blocks.values() {
+        for (block, block_def) in body.blocks.entries() {
             for &value in &block_def.insts {
                 match &body.values[value] {
                     &ValueDef::Operator(op, args, _) => {
@@ -82,6 +89,15 @@ impl Trees {
                                 owned.remove(&old_owner);
                                 multi_use.insert(arg);
                             } else if Self::is_movable(body, arg, loads_ok) {
+                                // A use this tree can't serve still counts:
+                                // `multi_use` stops a later use owning it.
+                                if nest
+                                    .as_ref()
+                                    .is_some_and(|n| !n.encloses(cfg.def_block[arg], block))
+                                {
+                                    multi_use.insert(arg);
+                                    continue;
+                                }
                                 let pos = u16::try_from(i).unwrap();
                                 let value_arg = ValueArg(value, pos);
                                 owner.insert(arg, value_arg);
@@ -220,5 +236,64 @@ impl Trees {
             // reverted by `validate_load_sinks`.
             .map(|op| op.is_pure() || (loads_ok && op.is_load()))
             .unwrap_or(false)
+    }
+}
+
+/// PLIRON: natural-loop membership per block — the ids of every loop
+/// containing it (headers included).
+struct LoopNest {
+    loops: Vec<smallvec::SmallVec<[u32; 4]>>,
+}
+
+impl LoopNest {
+    fn compute(cfg: &CFGInfo) -> LoopNest {
+        let mut loops: Vec<smallvec::SmallVec<[u32; 4]>> = Vec::new();
+        let mut stamp: Vec<u32> = Vec::new();
+        let mut work: Vec<Block> = Vec::new();
+        let mut id = 0u32;
+        for &h in cfg.rpo.values() {
+            let latches: smallvec::SmallVec<[Block; 2]> = cfg.preds[h]
+                .iter()
+                .copied()
+                .filter(|&p| cfg.rpo_pos[p].is_some() && cfg.dominates(h, p))
+                .collect();
+            if latches.is_empty() {
+                continue;
+            }
+            id += 1;
+            let mark = |b: Block, loops: &mut Vec<smallvec::SmallVec<[u32; 4]>>, stamp: &mut Vec<u32>| {
+                let i = b.index();
+                if i >= stamp.len() {
+                    stamp.resize(i + 1, 0);
+                    loops.resize(i + 1, Default::default());
+                }
+                if stamp[i] == id {
+                    return false;
+                }
+                stamp[i] = id;
+                loops[i].push(id);
+                true
+            };
+            mark(h, &mut loops, &mut stamp);
+            work.extend(latches);
+            while let Some(b) = work.pop() {
+                if mark(b, &mut loops, &mut stamp) {
+                    work.extend(
+                        cfg.preds[b]
+                            .iter()
+                            .copied()
+                            .filter(|&p| cfg.rpo_pos[p].is_some()),
+                    );
+                }
+            }
+        }
+        LoopNest { loops }
+    }
+
+    /// Every loop containing `u` also contains `d`.
+    fn encloses(&self, d: Block, u: Block) -> bool {
+        let get = |b: Block| self.loops.get(b.index()).map_or(&[][..], |v| &v[..]);
+        let dl = get(d);
+        get(u).iter().all(|l| dl.contains(l))
     }
 }
