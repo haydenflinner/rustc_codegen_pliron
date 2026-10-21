@@ -393,11 +393,11 @@ pub fn run(
                     }
                 }
             }
-            // `PLIRON_PUNROLL_DEEP=1`: innermost loops first, so the
+            // Innermost loops first (`PLIRON_PUNROLL_DEEP=0` off), so the
             // `MAX_LOOPS` budget goes to the hot leaves (`format_exact`'s
             // bignum `mul_small`/`sub` loops) before cold outer ones.
             let mut loops = loops;
-            if crate::env_is("PLIRON_PUNROLL_DEEP", "1") {
+            if crate::pass_enabled("PLIRON_PUNROLL_DEEP") {
                 loops.sort_by_key(|&lp| {
                     std::cmp::Reverse(la.loop_level(la.loop_header(lp)).level())
                 });
