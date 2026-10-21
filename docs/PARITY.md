@@ -17,7 +17,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.925** | ahead; real gaps: `strwork` +30%, `hmget` +14%, `parse_only` +9-11% |
+| wasm runtime (geomean, 16 kernels) | **0.900** | ahead (2026-10-21, `--layouts=3`); gaps: `strwork` +14%, `parse_only` +10% (placement-sensitive, 9-19%), `nbody` +4%, `hmget` +2% |
 | wasm module size | 1.93 (183.0 KiB vs 95 KiB) | behind |
 | compile time: bench kernels, native | **0.60** (0.26 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.18** (0.62 s vs 0.52 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
@@ -463,17 +463,46 @@ inliner and `wpeep` on top of the same pipeline; profile
 
 ## 2. wasm runtime
 
+**2026-10-21** (`bench/wasm/run.mjs --layouts=3`, geomean 0.900). Measure
+before you cut: two traps cost this session hours.
+- **Code placement.** V8 lays out TurboFan code in tier-up order, and a
+  hot loop's address alone swings a tight kernel up to ±25%:
+  `chars_alpha` timed 4.0 vs 5.2 ms on byte-identical machine code
+  (`--print-wasm-code` diff). `--layouts=N` re-instantiates and tiers up
+  other kernels first; trust the median and look at the range.
+  `parse_only` ranges 9-19% on code that didn't change.
+- **std partitioning.** The LLVM column links rustup's std, built with
+  `codegen-units-std = 1`; ours came from `-Zbuild-std` at the release
+  default of 16, which leaves non-`#[inline]` helpers like `Big::cmp`
+  out of line across CGUs. `bench/wasm/run.sh` now builds std at one
+  CGU (strwork +22% → +15%).
+- Tools in the session scratchpad that are worth re-creating: V8
+  `--prof` ticks mapped onto `--print-wasm-code` listings (per-instruction
+  heat), `--cpu-prof` per-function self time, a `panic_bounds_check`
+  `Location` decoder over the data segments.
+
+Landed: `punroll` deepest-first (`PLIRON_PUNROLL_DEEP`: format_exact's
+bignum `mul_small`/`sub` loops never got the 8-transform budget), waffle
+`treeify` loop guard (`PLIRON_WTREE_LOOP`: single-use invariants licm
+hoisted were re-emitted at their in-loop use — hmget +14% → +4%),
+`bittab` i32 bit test (`PLIRON_BITTAB32`), `zext_chain`
+(`PLIRON_ZXCHAIN`: hmget +4% → +2%). Measured and rejected: GOT
+`global.get` → `i32.const` (binaryen `--simplify-globals`, flat); the
+`PLIRON_INLINE_LOOPY` size rule (libcore −13% but strwork +28%, kept
+opt-in); `PLIRON_WASM_INLINE=0`/`PLIRON_WASM_PEEP=0`/`PLIRON_DEM64=0`
+(strwork flat).
+
 | kernel | pliron/LLVM | lead |
 |---|---|---|
 | fib | **2.01** | Recursion turned into a loop by both, but our loop body is an `if/else` + `br` with 5 locals vs LLVM's single `br_if` with 2 (`wasm2wat` the `fib3fib` function in both modules). Shared cause below: the loop's `brif` lowers to `if c { get*;set*; br L } else { ret }` — the param copies sit in scratch locals inside the `if` arm where `wpeep`'s `pathcheck` (straight-line rule) can't retarget them, while LLVM updates `n`/`acc` unconditionally (`local.tee`) then `br_if`s. **DONE** (`PLIRON_WASM_BRF=0` off): `wpeep` now folds `if c { get*/set*/tee*; br L } [else { R }] end` → hoisted copies + `br_if` (depth−1), guarded by arm-purity, an operand-stack balance check (a `set`/`tee` popping the cond or a nonzero net depth rejects), no `Get`/`Nop` read of a copied local in the else arm or later, no depth-referencing/structured op in the else arm, `prel` empty. Unit tests `backedge_if_*`. NOTE: produces LLVM's shape + ~8B/fn smaller, but **V8-runtime-neutral on this box** (both control forms compile to the same work) — the residual gap is op *count*, below. |
 | chars_mixed | ~1.4 | **partially DONE**: `NonNull`-i32 (`PLIRON_NN_ANYINT`) folds `eqz`-through-`phi`/`select`/`nonnull` → the `ptr==end`+`byte_ptr==0` `Option`-niche double-check is gone; `dem64` (`PLIRON_DEM64`) demotes `Option<u32>`/`usize`/`char` low-32 i64 webs → the `i64.extend; i64.and 128; i64.ne`→`i32` per-char overhead is gone (`chars_ascii` `i64` refs 23→0, +35→+9%). Residual = `next_code_point`/UTF-8 multi-byte decode (`load offset=1..3`, `&63`, `shl`, `or`, `ge_u` branches — LLVM's `byte<0?decode:cp<128` path is tighter) + locals churn. |
-| parse_only | ~1.09 | **SwitchOp on wasm** (`PLIRON_SWITCH_WASM`, `builder.rs`): the "wasm.rs has no SwitchOp lowering" exclusion was stale — `dense_switch`→`br_table`/`ifconv` select chains work; the `from_str_radix` digit `match` became selects, +31%→+9%. |
+| parse_only | ~1.10 | 2026-10-21: TurboFan code matches LLVM's per instruction (7 per digit); the residual is ~2 extra *taken* branches per word — cold `len == 0`/`len == 1` arms sit inline so the hot path jumps around them. Needs block placement (V8 honours wasm branch hints, `--experimental-wasm-branch-hinting` is on). Earlier: **SwitchOp on wasm** (`PLIRON_SWITCH_WASM`, `builder.rs`): the "wasm.rs has no SwitchOp lowering" exclusion was stale — `dense_switch`→`br_table`/`ifconv` select chains work; the `from_str_radix` digit `match` became selects, +31%→+9%. |
 | tokenize | ~0.67 | ahead |
-| hmget | ~1.14 | **partially DONE**: `licm`'s `deref_fact` (`PLIRON_LICM_PEEL=0` off) peels a scope-named load address (`v37 = v0 + 16`, the inlined `hash_one` `&RandomState` operand) to the entry param and borrows its `dereferenceable`+readonly fact — the per-probe `k0` reload and the key-only half of the first SipHash round now hoist like LLVM's. `clobbers` keys disjointness on the concrete object so `iso` can't hide a scope-name/param overlap (`licm_frozen_region` regression). Residual: probe-loop `local.*` traffic ~1.4× LLVM's — emit-level density, below |
+| hmget | ~1.02 | 2026-10-21: waffle `treeify` was re-sinking the hoisted SipHash invariants into the probe loop (`PLIRON_WTREE_LOOP`), and `dem64` left the control byte as wrap/and/extend (`PLIRON_ZXCHAIN`). Earlier, **partially DONE**: `licm`'s `deref_fact` (`PLIRON_LICM_PEEL=0` off) peels a scope-named load address (`v37 = v0 + 16`, the inlined `hash_one` `&RandomState` operand) to the entry param and borrows its `dereferenceable`+readonly fact — the per-probe `k0` reload and the key-only half of the first SipHash round now hoist like LLVM's. `clobbers` keys disjointness on the concrete object so `iso` can't hide a scope-name/param overlap (`licm_frozen_region` regression). Residual: probe-loop `local.*` traffic ~1.4× LLVM's — emit-level density, below |
 | hashmap | ~1.03 | at parity |
-| strwork | ~1.26 | `dragon::format_exact` is +53% of its samples vs LLVM — emit-level density: 182 `if`/`else` pairs vs LLVM's flat `block`+`br_if` (0 `if`), 271 labels vs 124, `local.*` 1.9×. |
+| strwork | ~1.14 | Native is 0.97 — the loss is wasm-only. 2026-10-21 per-function V8 profile: `format_exact` + bignum helpers 1.44× LLVM's ticks (~85% of the gap) before the std-CGU fix; profile is flat (no instruction >1%) with ~1.4-2.9× TurboFan code per function and stack reloads (FP/int pressure). Bounds checks: 27 `bignum.rs:390` sites survive in `format_exact` vs LLVM's 4 (e.g. `mul_pow2`'s copy loop keeps `i < 40` and `i + digits < 40`). Not the GOT, not the waffle inliner, not wpeep. |
 | fib | ~0.96 | ahead post `br_if` fold + `dem64`/`NonNull` |
-| nbody | ~1.04 | f64 math |
+| nbody | ~1.04 | Fully unrolled in both; ours does *less* work (53 vs 65 `f64.add`, same final stores) but TurboFan spills (`ldr d17, [sp, #24]`): ~30 f64 values live across the 10 unrolled pairs. Ordering/pressure, not op count. |
 | sieve, sortw | ~1.0 | at/near parity post `dem64`/`NonNull` (sortw 0.9%, sieve 2.5%) |
 | chars_alpha, iterw, matmul, eqbug, contains_rng | <1.0 | ahead |
 | tokenize 0.66, iterw 0.70, contains_rng 0.78, hashmap 0.88, sortw 0.90, fib 0.95, chars_ascii (was 0.57 → now ~0.92) | | ahead |
