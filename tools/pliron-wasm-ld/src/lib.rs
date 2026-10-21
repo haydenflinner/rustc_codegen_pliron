@@ -587,9 +587,84 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         }
     }
-    // Is this definition emitted?
+    // Cross-object duplicate bodies: the backend may emit the same
+    // instance in several objects (xcgu copies); each object's internal
+    // references point at its own copy, so every copy stays live.
+    // Identical mangled names denote the same instance — same semantics —
+    // so keep the smallest live body and redirect the losers' references
+    // (calls, table entries, GOT, data relocs) to it through `fout`.
+    // Restricted to rustc-mangled names with identical link flags and
+    // signatures so an `export_name`/weak collision can't merge distinct
+    // definitions. Loser bodies leave `live_f` before type/function
+    // numbering so their slots are never emitted; `alias_f` records the
+    // (oi, func-index) -> (oi, func-index) redirects. PLIRON_LDEDUP=0
+    // disables.
+    let mut alias_f: HashMap<(usize, u32), (usize, u32)> = HashMap::new();
+    if std::env::var_os("PLIRON_LDEDUP").is_none_or(|v| v != "0") {
+        let mut by_name: HashMap<&str, Vec<(usize, u32)>> = HashMap::new();
+        for &oi in &included {
+            let o = &objs[oi];
+            let nimp = o.fimports.len() as u32;
+            for (n, &f) in &o.exports {
+                if f >= nimp && live_f.contains(&(oi, f - nimp)) {
+                    by_name.entry(n.as_str()).or_default().push((oi, f));
+                }
+            }
+        }
+        let info = |oi: usize, n: &str, f: u32| -> Option<(u8, Vec<wp::ValType>, Vec<wp::ValType>)> {
+            let o = &objs[oi];
+            let bi = (f - o.fimports.len() as u32) as usize;
+            let flags = o.funcs.iter().find(|(m, _)| m == n)?.1;
+            if flags & 2 != 0 {
+                return None;
+            }
+            let t = &o.types[o.ftypes[bi] as usize];
+            Some((
+                flags,
+                t.params().to_vec(),
+                t.results().to_vec(),
+            ))
+        };
+        for (n, mut copies) in by_name {
+            if copies.len() < 2
+                || !(n.starts_with("_R") || n.starts_with("_ZN") || n.starts_with("ZN"))
+            {
+                continue;
+            }
+            let Some(want) = info(copies[0].0, n, copies[0].1) else {
+                continue;
+            };
+            if copies
+                .iter()
+                .any(|&(oi, f)| info(oi, n, f).as_ref() != Some(&want))
+            {
+                continue;
+            }
+            // Smallest body wins; object order then index breaks ties.
+            copies.sort_by_key(|&(oi, f)| {
+                (
+                    objs[oi].bodies[(f - objs[oi].fimports.len() as u32) as usize]
+                        .range()
+                        .len(),
+                    oi,
+                    f,
+                )
+            });
+            let winner = copies[0];
+            for &(oi, f) in &copies[1..] {
+                live_f.remove(&(oi, f - objs[oi].fimports.len() as u32));
+                alias_f.insert((oi, f), winner);
+            }
+        }
+    }
+
+    // Is this definition emitted? Dedup losers count as live: their
+    // references redirect to the winner, which is emitted.
     let is_live = |d: Def| match d {
-        Def::Func(oi, f) => live_f.contains(&(oi, f - objs[oi].fimports.len() as u32)),
+        Def::Func(oi, f) => {
+            let (oi, f) = alias_f.get(&(oi, f)).copied().unwrap_or((oi, f));
+            live_f.contains(&(oi, f - objs[oi].fimports.len() as u32))
+        }
         Def::Data(oi, di) => live_d.contains(&(oi, di)),
     };
 
@@ -725,10 +800,13 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     let ctors_fn = next;
     let func_out = |d: Def| -> Option<u32> {
         match d {
-            Def::Func(oi, f) => match fout[&oi][(f - objs[oi].fimports.len() as u32) as usize] {
-                u32::MAX => None,
-                x => Some(x),
-            },
+            Def::Func(oi, f) => {
+                let (oi, f) = alias_f.get(&(oi, f)).copied().unwrap_or((oi, f));
+                match fout[&oi][(f - objs[oi].fimports.len() as u32) as usize] {
+                    u32::MAX => None,
+                    x => Some(x),
+                }
+            }
             Def::Data(..) => None,
         }
     };
@@ -752,7 +830,17 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                     .unwrap_or(0),
             });
         }
-        m.extend(fout[&oi].iter().map(|&f| if f == u32::MAX { 0 } else { f }));
+        let nimp = o.fimports.len() as u32;
+        m.extend(fout[&oi].iter().enumerate().map(|(bi, &f)| {
+            if let Some(&(woi, wf)) = alias_f.get(&(oi, bi as u32 + nimp)) {
+                return fout[&woi][(wf - objs[woi].fimports.len() as u32) as usize];
+            }
+            if f == u32::MAX {
+                0
+            } else {
+                f
+            }
+        }));
         fmaps.insert(oi, m);
     }
 
