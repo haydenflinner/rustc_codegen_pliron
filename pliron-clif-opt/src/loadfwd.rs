@@ -1713,6 +1713,13 @@ fn pre(
         }
     }
     for (b, loc) in pre.pending.iter().copied() {
+        // A pair that died during propagation had its param removed — its
+        // resolved args (which can be dead pairs' own params, now
+        // unattached) must not reach the edges (rustlantis seed 410:
+        // dangling `v5971` in a block10 call arg).
+        if dead.contains(&(b, loc)) {
+            continue;
+        }
         let Some(args) = resolved.get(&(b, loc)) else {
             continue;
         };

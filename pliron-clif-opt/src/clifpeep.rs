@@ -10369,7 +10369,9 @@ pub fn vecslot(func: &mut Function) -> usize {
                         for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
                             if let Some(&(ss, o)) = slotval.get(&func.dfg.resolve_aliases(a))
                                 && let Some(k) = iconst(func, b)
-                                && slotval.insert(r, (ss, o + k)).is_none()
+                                && slotval
+                                    .insert(r, (ss, o.wrapping_add(k)))
+                                    .is_none()
                             {
                                 grew = true;
                                 break;
@@ -10428,12 +10430,25 @@ pub fn vecslot(func: &mut Function) -> usize {
                         _ => s.bad = true,
                     }
                 }
-                InstructionData::Load { arg, offset, .. } => {
+                InstructionData::Load {
+                    opcode, arg, offset, ..
+                } => {
                     let p = func.dfg.resolve_aliases(arg);
                     let Some(&(ss, o)) = slotval.get(&p) else {
                         continue;
                     };
-                    let n = func.dfg.value_type(func.dfg.first_result(i)).bytes() as usize;
+                    // Narrow extending loads read fewer bytes than their
+                    // result type (rustlantis seeds 485/868: `uload8.i32`
+                    // folded a 4-byte window of neighboring slot bytes).
+                    let n = match opcode {
+                        Opcode::Uload8 | Opcode::Sload8 => 1,
+                        Opcode::Uload16 | Opcode::Sload16 => 2,
+                        Opcode::Uload32 | Opcode::Sload32 => 4,
+                        Opcode::Load => {
+                            func.dfg.value_type(func.dfg.first_result(i)).bytes() as usize
+                        }
+                        _ => continue,
+                    };
                     slots
                         .entry(ss)
                         .or_default()
@@ -10525,6 +10540,12 @@ pub fn vecslot(func: &mut Function) -> usize {
                 .iter()
                 .enumerate()
                 .fold(0u128, |acc, (j, (b, _))| acc | (*b as u128) << (j * 8));
+            // `sload*` sign-extends from the *access* width, not the
+            // result width — replicate that on the folded constant.
+            let signed = matches!(
+                func.dfg.insts[l].opcode(),
+                Opcode::Sload8 | Opcode::Sload16 | Opcode::Sload32
+            );
             let mut pos = FuncCursor::new(func).at_inst(l);
             let nv = if lty.is_int() && !lty.is_vector() {
                 if ln <= 8 {
@@ -10532,6 +10553,11 @@ pub fn vecslot(func: &mut Function) -> usize {
                         u64::MAX
                     } else {
                         (1u64 << lty.bits()) - 1
+                    };
+                    let le = if signed {
+                        ((le as u64) << (64 - ln as u32 * 8)) as i64 >> (64 - ln as u32 * 8)
+                    } else {
+                        le as i64
                     };
                     pos.ins().iconst(lty, (le as u64 & m) as i64)
                 } else if ln == 16 {
@@ -12247,6 +12273,55 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("vecslot produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Extending loads read the *access* width, not the result width:
+    /// `uload8.i32` two bytes past a `store.i64` of a constant must fold
+    /// to that byte, not a 4-byte window of neighbouring slot bytes
+    /// (rustlantis seeds 485/868). `sload8` must sign-extend from 8 bits.
+    #[test]
+    fn vecslot_narrow_load_width() {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let ss = func.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let k = cur.ins().iconst(types::I64, 0x6d82_e29b_023a_a378u64 as i64);
+        cur.ins().store(MemFlagsData::new(), k, a, 0);
+        let u = cur.ins().uload8(types::I32, MemFlagsData::new(), a, 2);
+        let s = cur.ins().sload8(types::I32, MemFlagsData::new(), a, 4);
+        let ue = cur.ins().uextend(types::I64, u);
+        let se = cur.ins().uextend(types::I64, s);
+        let r = cur.ins().iadd(ue, se);
+        cur.ins().return_(&[r]);
+
+        vecslot(&mut func);
+        let imm_of = |f: &Function, v: Value| -> i64 {
+            let v = f.dfg.resolve_aliases(v);
+            let d = f.dfg.value_def(v).inst().expect("not folded");
+            match f.dfg.insts[d] {
+                InstructionData::UnaryImm { imm, .. } => imm.bits(),
+                _ => panic!("expected iconst, got {}", f.dfg.display_inst(d)),
+            }
+        };
+        // uload8 of byte 2 (0x3a) and sload8 of byte 4 (0x9b -> -101).
+        assert_eq!(imm_of(&func, u), 0x3a, "{}", func.display());
+        assert_eq!(imm_of(&func, s), -101i64 as u32 as i64 & 0xffff_ffff, "{}", func.display());
+        let flags =
+            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("vecslot produced invalid IR: {e}
+{}", func.display());
         }
     }
 
