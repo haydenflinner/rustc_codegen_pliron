@@ -57,7 +57,7 @@ fn pass(name: &str) -> Pass {
             let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(f, &cfg);
             let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
             la.compute(f, &cfg, &dt);
-            pliron_clif_opt::zipiv::run(f, &cfg, &dt, &la)
+            pliron_clif_opt::zipiv::run(f, &cfg, &dt, &la).0
         },
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,

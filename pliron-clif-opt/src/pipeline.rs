@@ -3224,8 +3224,18 @@ fn s_indvars(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_zipiv(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let CfgDtLa { cfg, dt, la } = an.cfg_dt_la(&p.clctx.func);
-    let k = crate::zipiv::run(&mut p.clctx.func, cfg, dt, la);
+    // Each CFG-changing sweep leaves the analyses stale: recompute and
+    // sweep again (one sweep per folded loop, bounded).
+    let mut k = 0;
+    for _ in 0..16 {
+        let CfgDtLa { cfg, dt, la } = an.cfg_dt_la(&p.clctx.func);
+        let (n, changed) = crate::zipiv::run(&mut p.clctx.func, cfg, dt, la);
+        k += n;
+        if !changed {
+            break;
+        }
+        an.invalidate(&p.clctx.func);
+    }
     if k > 0 && p.dump {
         p.dump("zipiv");
     }

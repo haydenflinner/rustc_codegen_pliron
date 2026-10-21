@@ -247,12 +247,14 @@ fn edge_args(
     out
 }
 
+/// One sweep; `.1` is whether a CFG edge changed (the analyses are then
+/// stale and the caller must recompute them before sweeping again).
 pub fn run(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
-) -> usize {
+) -> (usize, bool) {
     let ps = crate::proots::alias_map_cfg(func, cfg);
     let cx = Ctx {
         ps: &ps,
@@ -276,10 +278,10 @@ pub fn run(
         n += k;
         // A folded `brif` changed the CFG: the analyses are stale.
         if cfg_changed {
-            break;
+            return (n, true);
         }
     }
-    n
+    (n, false)
 }
 
 struct Lp<'a> {
