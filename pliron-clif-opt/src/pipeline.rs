@@ -3122,6 +3122,10 @@ fn s_selfarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Runs last so nothing un-does the chains and adapters/edge
 // forwarding have already collapsed the surrounding shape.
 fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    if p.wasm {
+        // wasm has a real `br_table`; chains only add compares.
+        return 0;
+    }
     let k = brchain::run(&mut p.clctx.func);
     if k > 0 && p.dump {
         p.dump("brchain");
