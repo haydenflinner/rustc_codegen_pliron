@@ -2180,21 +2180,31 @@ fn peep_body_opts(
                 }
                 // The hoisted `writes` hold the arm's (new) value on the
                 // else/exit path too — reject if anything past `end` reads
-                // one before rewriting it.
+                // one before rewriting it. A rewrite clears a local only
+                // on the straight-line continuation at the `end`'s own
+                // depth: a `set` inside a nested block or conditional arm
+                // does not dominate later reads on other paths.
                 let mut live = writes.clone();
+                let end_ctx = ins[j].3;
+                let mut dom = true;
                 for k in (j + 1)..ins.len() {
+                    if ins[k].3 != end_ctx
+                        || matches!(ins[k].0, WPeek::Ctl | WPeek::Br(_) | WPeek::BrIf(_))
+                    {
+                        dom = false;
+                    }
                     match ins[k].0 {
                         WPeek::Get(t) | WPeek::Nop(t) if live.contains(&t) => {
                             bad = true;
                             break;
                         }
-                        WPeek::Set(t) | WPeek::Tee(t) => {
+                        WPeek::Set(t) | WPeek::Tee(t) if dom => {
                             live.remove(&t);
+                            if live.is_empty() {
+                                break;
+                            }
                         }
                         _ => {}
-                    }
-                    if live.is_empty() {
-                        break;
                     }
                 }
                 if bad {
@@ -4584,6 +4594,68 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
         assert!(has_seq(&out, &[0x04, 0x40]), "folded anyway: {out:02x?}");
+    }
+
+    // Regression (wasm std `float_fmt`, `flt2dec::decoder::decode`): the
+    // fold's stale-read scan past `end` cleared a written local on ANY
+    // `set`/`tee` — including writes inside a *conditional* arm that do
+    // not dominate later reads. Here `set 3` inside `if@C`'s taken arm
+    // wrongly clears l3's stale-read flag, letting the fold hoist
+    // `set 2`/`set 3` over an else path that reads l3's old value.
+    //
+    //   block @0
+    //     block @1
+    //       get 0; if @A
+    //         get 1; if @B
+    //           get 9; set 2; get 8; set 3; br 3   ; writes {2,3} -> @0
+    //         else
+    //           get 5; set 2; br 2                  ; -> @1
+    //         end
+    //       else
+    //       end
+    //     end
+    //     get 1; if @C
+    //       const 7; set 3; br 1                    ; conditional write
+    //     else
+    //       get 3; drop                             ; stale read of 3!
+    //     end
+    //   end
+    #[test]
+    fn backedge_if_conditional_rewrite_blocks_fold() {
+        let b = body(
+            10,
+            &[
+                0x02, 0x40, // block @0
+                0x02, 0x40, // block @1
+                0x20, 0x00, // get 0
+                0x04, 0x40, // if @A
+                0x20, 0x01, // get 1
+                0x04, 0x40, // if @B
+                0x20, 0x09, 0x21, 0x02, // get 9; set 2
+                0x20, 0x08, 0x21, 0x03, // get 8; set 3
+                0x0c, 0x03, // br 3 (-> @0)
+                0x05, // else
+                0x20, 0x05, 0x21, 0x02, // get 5; set 2
+                0x0c, 0x02, // br 2 (-> @1)
+                0x0b, // end @B
+                0x05, // else @A
+                0x0b, // end @A
+                0x0b, // end @1
+                0x20, 0x01, // get 1
+                0x04, 0x40, // if @C
+                0x41, 0x07, 0x21, 0x03, // const 7; set 3
+                0x0c, 0x01, // br 1 (-> @0)
+                0x05, // else
+                0x20, 0x03, 0x1a, // get 3; drop — stale read
+                0x0b, // end @C
+                0x0b, // end @0
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        // `br 3` must survive — folding it to `br_if 2` hoists the
+        // writes onto the else path where `get 3` reads them stale.
+        assert!(has_seq(&out, &[0x0c, 0x03]), "unsound fold: {out:02x?}");
+        assert!(!has_seq(&out, &[0x0d, 0x02]), "unsound br_if: {out:02x?}");
     }
 
     // sfwd: `get fp; get v; store` … `get fp; load` re-reads bytes the
