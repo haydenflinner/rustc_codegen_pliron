@@ -610,7 +610,7 @@ impl PeepOpts {
             skipped: std::cell::Cell::new(0),
             trace: false,
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
-            delse: crate::env_get("PLIRON_WASM_DELSE") == Some("1"),
+            delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
         }
     }
 }
@@ -4822,7 +4822,10 @@ mod wpeep_tests {
     }
 
     // A `br` in the else arm at depth == rel would target the folded
-    // `if`'s own end — unrepresentable after unwrapping, so no fold.
+    // `if`'s own end — unrepresentable after unwrapping, so brf must
+    // not fold it. (delse handles this shape separately: `br 0` lands
+    // at the `if`'s own `end`, so the else arm is dead — run this with
+    // delse off to exercise brf's reject path.)
     #[test]
     fn backedge_if_else_br_to_if_blocks() {
         let b = body(
@@ -4836,7 +4839,7 @@ mod wpeep_tests {
                 0x0b, //   end (if)
             ],
         );
-        let out = peep_body(&b, &[], &[], 0).unwrap();
+        let out = peep_body_opts(&b, &[], &[], 0, &opts(false, false)).unwrap();
         assert!(has_seq(&out, &[0x04, 0x40]), "folded anyway: {out:02x?}");
     }
 
