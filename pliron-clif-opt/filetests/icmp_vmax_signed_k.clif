@@ -1,0 +1,17 @@
+; test clifpeep
+; `x >s -1` with x = uextend (i8) in [0, 255]: always true. Narrow
+; `iconst.i32 -1` is stored zero-extended (0xffffffff), and the vmax
+; signed rules compared that raw value against x's ceiling (`k >= mx`
+; -> fold false): bevy_math's IRect::union_point kept the point's
+; negative y as the max (rect_union_pt). Signed rules must see k
+; sign-extended.
+; check: iconst.i8 1
+; check-not: iconst.i8 0
+; diffcheck
+function %sgt(i8) -> i8 fast {
+block0(v0: i8):
+    v1 = uextend.i32 v0
+    v2 = iconst.i32 -1
+    v3 = icmp sgt v1, v2
+    return v3
+}

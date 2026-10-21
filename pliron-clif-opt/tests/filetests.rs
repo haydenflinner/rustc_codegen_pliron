@@ -51,6 +51,7 @@ fn pass(name: &str) -> Pass {
         "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "zext_chain" => clifpeep::zext_chain,
+        "clifpeep" => |f| clifpeep::run(f, false),
         "zipiv" => |f| {
             let mut cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
             cfg.compute(f);

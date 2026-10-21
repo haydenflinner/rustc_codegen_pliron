@@ -6734,6 +6734,11 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     let smin = (-1i128 << (bits - 1)) as i64;
                     let smax = ((1i128 << (bits - 1)) - 1) as i64;
                     let ku = k as u64 & umax;
+                    // Narrow `iconst` immediates are stored zero-extended
+                    // (`iconst.i32 -1` reads 0xffffffff): every signed rule
+                    // below needs `k` sign-extended to the compare width
+                    // (bevy_math rect_union_pt folded `x >s -1` false).
+                    let k = sext(ku, bits);
                     // `icmp eq/ne (stack_addr ..), 0` → `0`/`1`: a stack
                     // slot's address is never null — hashbrown's
                     // `ctrl.is_null()` empty-table guard on a `&RawTable`
