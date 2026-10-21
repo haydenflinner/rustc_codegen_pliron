@@ -3218,6 +3218,14 @@ fn s_ivalign(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_ivretro(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = ivretro::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("ivretro");
+    }
+    k
+}
+
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = looprot::run(&mut p.clctx.func, an, p.derived);
     p.dump("looprot");
@@ -3689,6 +3697,16 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             "ivalign",
             Gate::Env("PLIRON_IVALIGN"),
             s_ivalign,
+        )
+        .needs(shape::LOOPS),
+        // Literal `base + arg_iv*K` backedge args indvars seeded while
+        // the loop was multi-block — collapsed latches can forward
+        // `p + s*K` instead.
+        step(
+            "ivretro",
+            "ivretro",
+            Gate::OptIn("PLIRON_IVRETRO"),
+            s_ivretro,
         )
         .needs(shape::LOOPS),
         // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`

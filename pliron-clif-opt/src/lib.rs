@@ -25,6 +25,7 @@ pub mod ifconv;
 pub mod indvars;
 pub mod ivalign;
 pub mod ivrefold;
+pub mod ivretro;
 pub mod jumpthread;
 pub mod licm;
 pub mod loadfwd;
