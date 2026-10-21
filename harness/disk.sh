@@ -14,6 +14,11 @@
 #                              its own fingerprint, so a deleted one that is
 #                              still needed just rebuilds. Dependencies are
 #                              left alone, so the next build stays warm.
+#                              Also runs --objs.
+#   harness/disk.sh --objs     delete stale `*.rcgu.o` (objects older than
+#                              their unit's current library — every
+#                              incremental session leaves its CGU objects
+#                              behind on macOS; harness/objgc.py)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WS=$(cd .. && pwd)
@@ -30,7 +35,12 @@ if [[ "${1:-}" == --sweep ]]; then
     find "$d" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} +
   done
   find target/debug/incremental -mindepth 1 -maxdepth 1 -mtime +2 -exec rm -rf {} + 2>/dev/null || true
+  harness/objgc.py
   echo "after sweep: $(du -sh target | cut -f1) in target/"
+fi
+if [[ "${1:-}" == --objs ]]; then
+  harness/objgc.py
+  echo "after objs: $(du -sh target | cut -f1) in target/"
 fi
 if [[ "${1:-}" == --prune ]]; then
   for d in target-*; do

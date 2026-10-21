@@ -55,6 +55,21 @@ opt-level = 3
 [profile.dev.package.cranelift-codegen]
 opt-level = 3
 
+# Vendored crates edited rarely (<=6 commits in two weeks, 2026-10-21):
+# an incremental session per build variant is disk for no rebuild gain.
+# cranelift-codegen/-interpreter, pliron and waffle stay incremental
+# (edited often); `harness/objgc.py` collects their stale CGU objects.
+[profile.dev.package.cranelift-reader]
+incremental = false
+[profile.dev.package.cranelift-object]
+incremental = false
+[profile.dev.package.cranelift-jit]
+incremental = false
+[profile.dev.package.cranelift-assembler-x64]
+incremental = false
+[profile.dev.package.regalloc2]
+incremental = false
+
 [package.metadata.rust-analyzer]
 rustc_private = true
 
