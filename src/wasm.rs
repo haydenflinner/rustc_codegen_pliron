@@ -607,7 +607,7 @@ impl PeepOpts {
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
             trace: false,
-            ddrop: crate::env_is("PLIRON_WASM_DDROP", "1"),
+            ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
         }
     }
 }
@@ -3966,7 +3966,7 @@ fn peep_body_opts(
     // chain back to its pushes (`get a; get b; i32.sub; drop` goes
     // away entirely). Skips any inst that is a `prel` anchor — the
     // hoisted `local.get` emits at that byte position and needs its
-    // operand-stack slot. `PLIRON_WASM_DDROP=1` enables.
+    // operand-stack slot. `PLIRON_WASM_DDROP=0` disables.
     if opts.ddrop {
         // pops for a pure popN-push1 op eligible for `op;drop -> drop^N`
         // (excludes loads/stores/calls/globals-with-memory, div/rem and
@@ -4680,7 +4680,7 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
         assert!(has_seq(&out, &[0x0d, 0x00, 0x03, 0x40]), "no fold: {out:02x?}");
-        assert!(has_seq(&out, &[0x1a, 0x0c, 0x01]), "br not retargeted: {out:02x?}");
+        assert!(has_seq(&out, &[0x03, 0x40, 0x0c, 0x01]), "br not retargeted: {out:02x?}");
         assert!(!has_seq(&out, &[0x04, 0x40]), "if left: {out:02x?}");
     }
 
@@ -4827,7 +4827,8 @@ mod wpeep_tests {
         // The dead-write flush drops `set 1` (1 is never read), so the
         // load forwards to `get 1` — the deleted write means `get 1`
         // still reads the stored value. Sound, and smaller.
-        assert!(has_seq(&out, &[0x41, 0x07, 0x1a, 0x20, 0x01]), "dead set kept: {out:02x?}");
+        assert!(has_seq(&out, &[0x20, 0x01]), "dead set kept: {out:02x?}");
+        assert!(!has_seq(&out, &[0x28]), "load left: {out:02x?}");
     }
 
     // A write of the base local kills it too — the address moves.
@@ -4946,10 +4947,10 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
         assert!(has_seq(&out, &[0x36, 0x02, 0x00]), "store gone: {out:02x?}");
-        // `set 1` is dead (1 unread) — flushed to `drop`; the load still
-        // forwards to the tee-captured `get 8`.
+        // `set 1` is dead (1 unread) — flushed away entirely (ddrop);
+        // the load still forwards to the tee-captured `get 8`.
         assert!(
-            has_seq(&out, &[0x41, 0x07, 0x1a, 0x20, 0x08]),
+            has_seq(&out, &[0x36, 0x02, 0x00, 0x20, 0x08]),
             "no forward past set1: {out:02x?}"
         );
     }
@@ -4987,8 +4988,8 @@ mod wpeep_tests {
             ],
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
-        // preamble: get0;get1;add;set8;get2;get3;sub;set9; then loop body
-        // starts with get8;get9;i32.add;drop
+        // preamble: get0;get1;add;set8;get2;get3;sub;set9; then an empty
+        // loop — the in-loop `get8;get9;add;drop` is fully dead (ddrop).
         assert!(
             has_seq(
                 &out,
@@ -4996,7 +4997,7 @@ mod wpeep_tests {
                     0x20, 0x00, 0x20, 0x01, 0x6a, 0x21, 0x08, // get0;get1;add;set8
                     0x20, 0x02, 0x20, 0x03, 0x6b, 0x21, 0x09, // get2;get3;sub;set9
                     0x03, 0x40, // loop
-                    0x20, 0x08, 0x20, 0x09, 0x6a, 0x1a, // get8;get9;add;drop
+                    0x0b, // end — loop body emptied
                 ]
             ),
             "licm hoist missing: {out:02x?}"
@@ -5038,8 +5039,10 @@ mod wpeep_tests {
             ],
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
+        // store1's addr get and its dropped val die entirely (ddrop).
         assert!(
-            has_seq(&out, &[0x20, 0x01, 0x1a, 0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x00, 0x20, 0x02]),
+            has_seq(&out, &[0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x00, 0x20, 0x02])
+                && !has_seq(&out, &[0x20, 0x01]),
             "store1 not dropped: {out:02x?}"
         );
     }
@@ -5068,10 +5071,10 @@ mod wpeep_tests {
         let out = peep_body(&b, &[], &[], 0).unwrap();
         // first store -> `drop` (addr get0 deleted, no tee minted —
         // capture is deferred until a load actually forwards). The
-        // dead-write flush also drops the now-unread `tee 4`, so the
-        // dropped val's producer `f64.sub` feeds `drop` directly.
+        // dead-write flush also drops the now-unread `tee 4`, and
+        // `f64.mul;f64.sub;drop` then dies completely (ddrop).
         assert!(
-            has_seq(&out, &[0xa2, 0xa0, 0x1a]) && !has_seq(&out, &[0x22, 0x04]),
+            !has_seq(&out, &[0x22, 0x04]) && !has_seq(&out, &[0x1a]),
             "store1 not dropped: {out:02x?}"
         );
         // second store survives; its computed val mints `tee 8` at the
