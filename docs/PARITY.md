@@ -17,8 +17,8 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.977** | ahead; 8 kernels behind by >5% (all ≤+20%) |
-| wasm module size | 2.16 (210 KiB vs 97 KiB) | behind |
+| wasm runtime (geomean, 16 kernels) | **1.00** | parity; `fib` +100% is a V8 inline-budget artifact (equal at `--wasm-inlining-factor=6`), real gaps: `strwork` +22%, `hmget` +21%, `parse_only` +19% |
+| wasm module size | 2.06 (201 KiB vs 97 KiB) | behind |
 | compile time: bench kernels, native | **0.56** (0.25 s vs 0.45 s) | ahead (2026-10-20) |
 | compile time: bench kernels, wasm | **0.79** (0.45 s vs 0.57 s) | ahead (2026-10-20; was 1.48) |
 | compile time: regex-syntax (~40 kLOC) | **0.94** (1.50 s vs 1.59 s) | parity on wall (2026-10-20; was 1.89); CPU 1.5x (6.9 vs 4.7 s) |

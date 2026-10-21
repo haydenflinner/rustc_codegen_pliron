@@ -70,7 +70,18 @@ fn clobbers(
     loc: Loc,
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
+    deref: &FxHashMap<Value, (u64, bool)>,
 ) -> bool {
+    // A `noalias`+`readonly` (`deref` with `!writable`) pointee is
+    // exclusively read through this root for the call's duration —
+    // no store or call in the loop may write it (writing through the
+    // root is UB; writing through any other pointer violates
+    // `noalias`). Nothing can clobber the loc.
+    if let Root::V(v) = loc.0
+        && deref.get(&v).is_some_and(|&(_, writable)| !writable)
+    {
+        return false;
+    }
     let op = func.dfg.insts[w].opcode();
     if op.is_call() {
         return !loadfwd::write_free(func, w, nw, false) && !iso.contains(&loc.0);
@@ -325,7 +336,7 @@ fn hoists(
     }
     let nw_w = writers
         .iter()
-        .filter(|&&w| clobbers(func, ps, na, w, loc, iso, nw))
+        .filter(|&&w| clobbers(func, ps, na, w, loc, iso, nw, deref))
         .count();
     if dbg {
         if pliron_cfg::tracing_on() {
@@ -333,7 +344,7 @@ fn hoists(
         };
         for &w in writers {
             if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
-                && clobbers(func, ps, na, w, loc, iso, nw)
+                && clobbers(func, ps, na, w, loc, iso, nw, deref)
             {
                 let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
                 if pliron_cfg::tracing_on() {
@@ -926,6 +937,7 @@ fn promote(
             off,
             iso_l,
             nw,
+            deref,
             debug,
         );
     }
@@ -950,6 +962,7 @@ fn promote_loc(
     off: i32,
     iso: &FxHashSet<Root>,
     nw: &FxHashMap<FuncRef, bool>,
+    deref: &FxHashMap<Value, (u64, bool)>,
     debug: bool,
 ) -> usize {
     let ty = loc.2;
@@ -1173,7 +1186,7 @@ fn promote_loc(
             {
                 seed = Some(func.dfg.resolve_aliases(args[0]));
             }
-            _ if clobbers(func, ps, na, i, loc, iso, nw) => seed = None,
+            _ if clobbers(func, ps, na, i, loc, iso, nw, deref) => seed = None,
             _ => {}
         }
     }
@@ -1712,6 +1725,93 @@ mod tests {
             blk(ok),
             b0,
             "in-bounds load failed to hoist:\n{}",
+            func.display()
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// A `noalias`+`readonly` pointee (`deref` with `!writable`) is only
+    /// ever read through its root — no store or call in the loop can
+    /// legally write it, so the clobber scan must not count writers
+    /// against it. Without that, a `&T` param's field loads miss
+    /// hoisting whenever the loop body contains any store at all
+    /// (the typical case). A `writable` root's overlapping load still
+    /// stays — its pointee may be written.
+    #[test]
+    fn readonly_root_load_hoists_past_store() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let lbody = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, h, lbody, done] {
+            func.layout.append_block(b);
+        }
+        let p = func.dfg.append_block_param(h, types::I64);
+        let rp = func.dfg.append_block_param(h, types::I64);
+        let wp = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let fv = cur.ins().iconst(types::I64, 5);
+        let ro = cur.ins().iconst(types::I64, 0x1000);
+        let wr = cur.ins().iconst(types::I64, 0x2000);
+        cur.ins().jump(h, &[fv.into(), ro.into(), wr.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+        cur.ins().brif(r, lbody, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+        let x = cur.ins().iconst(types::I64, 7);
+        cur.ins().store(MemFlagsData::new(), x, wp, 0);
+        let a = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), rp, 0);
+        let b = cur
+            .ins()
+            .load(types::I32, MemFlagsData::new().with_notrap(), wp, 4);
+        cur.ins().store(MemFlagsData::new(), b, wp, 8);
+        cur.ins().jump(h, &[a.into(), ro.into(), wr.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        cur.ins().return_(&[fv]);
+
+        let mut deref = FxHashMap::default();
+        deref.insert(ro, (16, false));
+        deref.insert(wr, (16, true));
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            &FxHashSet::default(),
+            &deref,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            &FxHashMap::default(),
+        );
+        let blk = |v: Value| {
+            func.layout
+                .inst_block(func.dfg.value_def(v).inst().unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            blk(a),
+            b0,
+            "readonly-root load missed the hoist past an unrelated store:\n{}",
+            func.display()
+        );
+        assert_eq!(
+            blk(b),
+            lbody,
+            "writable-root load left a loop that writes it:\n{}",
             func.display()
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());

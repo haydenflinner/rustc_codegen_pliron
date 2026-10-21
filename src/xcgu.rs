@@ -5,7 +5,7 @@
 //! from this CGU: defined here, used by this CGU's own items (so already
 //! visible), or externally linked in its home CGU.
 
-use rustc_attr_ir::{InlineAttr, Linkage};
+use rustc_attr_ir::Linkage;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags as F;
 use rustc_middle::mono::{CodegenUnit, CollectionMode, MonoItem};
@@ -34,8 +34,11 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
         | F::DEALLOCATOR
         | F::REALLOCATOR
         | F::ALLOCATOR_ZEROED;
+    // `InlineAttr::Never` fns can't feed the inliner themselves, but a
+    // copy still resolves calls made by *other* copies (LLVM's ThinLTO
+    // internalizes them the same way); `predefine_fn` marks the copy
+    // `no_inline` so the semantics hold — calls stay calls.
     if a.flags.intersects(bad)
-        || matches!(a.inline, InlineAttr::Never)
         || a.symbol_name.is_some()
         || a.linkage.is_some()
         || a.link_section.is_some()
@@ -192,7 +195,10 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
         cands.retain(|c| {
             let ok = refs.get(c).is_some_and(|us| {
                 us.iter().all(|u| {
-                    ours.contains_key(&u.node)
+                    // A dep on the candidate itself is satisfied by the
+                    // copy's own recursive call.
+                    u.node == MonoItem::Fn(*c)
+                        || ours.contains_key(&u.node)
                         || visible.contains(&u.node)
                         || accepted.contains(&u.node)
                         || !needs_body(tcx, &u.node)

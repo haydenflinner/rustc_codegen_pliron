@@ -93,10 +93,11 @@ impl CrateCfg {
         let wasm = sess.target.arch == rustc_target::spec::Arch::Wasm32;
         let opt = sess.opts.optimize;
         let optimize = opt != OptLevel::No;
-        let small = wasm || matches!(opt, OptLevel::Size | OptLevel::SizeMin);
+        let size_opt = matches!(opt, OptLevel::Size | OptLevel::SizeMin);
+        let small = wasm || size_opt;
         // wasm only: callsites in loops get WASM_HOT x the flat limit —
         // std `hash_one` into hashbrown's probe loop. -Os/-Oz stay flat.
-        let ihot = if wasm && !small {
+        let ihot = if wasm && !size_opt {
             env_get("PLIRON_INLINE_HOT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(inline::WASM_HOT)
