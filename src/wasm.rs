@@ -593,6 +593,8 @@ struct PeepOpts {
     /// `PLIRON_WASM_TRACE_BODY=<k>` matched this body: dump `ins` after
     /// each rewrite phase.
     trace: bool,
+    /// Dead stack-value flush (`PLIRON_WASM_DDROP`).
+    ddrop: bool,
 }
 
 impl PeepOpts {
@@ -605,6 +607,7 @@ impl PeepOpts {
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
             trace: false,
+            ddrop: crate::env_is("PLIRON_WASM_DDROP", "1"),
         }
     }
 }
@@ -3956,6 +3959,103 @@ fn peep_body_opts(
         }
     }
     wtrace!("sfwd", ins);
+    // Dead stack-value flush — `X; drop` where `X` purely produces the
+    // dropped value: `get`/`const` delete with the drop, `tee` keeps
+    // its write as `set`, and a pure non-trapping op rewrites to a
+    // `drop` on each of its own operands, so the fixpoint walks a dead
+    // chain back to its pushes (`get a; get b; i32.sub; drop` goes
+    // away entirely). Skips any inst that is a `prel` anchor — the
+    // hoisted `local.get` emits at that byte position and needs its
+    // operand-stack slot. `PLIRON_WASM_DDROP=1` enables.
+    if opts.ddrop {
+        // pops for a pure popN-push1 op eligible for `op;drop -> drop^N`
+        // (excludes loads/stores/calls/globals-with-memory, div/rem and
+        // trapping float->int truncations).
+        fn pure_pops(op: u8) -> Option<u32> {
+            Some(match op {
+                0x23 => 0,                        // global.get
+                0x1b => 3,                        // select
+                0x45 | 0x50 => 1,                 // i32/i64.eqz
+                0x46..=0x4f | 0x51..=0x5a => 2,   // i32/i64 compares
+                0x5b..=0x60 | 0x61..=0x66 => 2,   // f32/f64 compares
+                0x67..=0x69 => 1,                 // i32 clz/ctz/popcnt
+                0x6a..=0x6c => 2,                 // i32 add/sub/mul
+                0x71..=0x78 => 2,                 // i32 and/or/xor/shifts
+                0x79..=0x7b => 1,                 // i64 clz/ctz/popcnt
+                0x7c..=0x7e => 2,                 // i64 add/sub/mul
+                0x83..=0x8a => 2,                 // i64 and..rotr
+                0x8b..=0x91 => 1,                 // f32 unary
+                0x92..=0x98 => 2,                 // f32 binary (no traps)
+                0x99..=0x9f => 1,                 // f64 unary
+                0xa0..=0xa6 => 2,                 // f64 binary
+                0xa7 => 1,                        // i32.wrap_i64
+                0xac | 0xad => 1,                 // i64.extend_i32_{s,u}
+                0xb2..=0xbb => 1,                 // f*.convert/demote/promote
+                0xbc..=0xbf => 1,                 // reinterpret
+                _ => return None,
+            })
+        }
+        let anchored = |s: usize| prel.iter().any(|&(pp, _)| pp == s);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
+            for i in 0..ins.len() {
+                let (k, s, e, c) = ins[i];
+                let is_drop = matches!(k, WPeek::Drop)
+                    || (matches!(k, WPeek::Other) && b[s] == 0x1a);
+                if !is_drop || anchored(s) {
+                    out.push((k, s, e, c));
+                    continue;
+                }
+                // Last emitting inst in `out` — Del/Nop emit nothing.
+                let mut pi = out.len();
+                let prev = loop {
+                    if pi == 0 {
+                        break None;
+                    }
+                    pi -= 1;
+                    if !matches!(out[pi].0, WPeek::Del | WPeek::Nop(_)) {
+                        break Some(pi);
+                    }
+                };
+                let Some(pi) = prev else {
+                    out.push((k, s, e, c));
+                    continue;
+                };
+                let (pk, ps, _pe, _pc) = out[pi];
+                if anchored(ps) {
+                    out.push((k, s, e, c));
+                    continue;
+                }
+                let pop0_push1 = matches!(pk, WPeek::Get(_))
+                    || (matches!(pk, WPeek::Other) && matches!(b[ps], 0x41..=0x44));
+                if pop0_push1 {
+                    out.remove(pi);
+                    changed = true;
+                    continue;
+                }
+                if let WPeek::Tee(t) = pk {
+                    // `tee; drop` — the stack copy dies, the write stays.
+                    out[pi].0 = WPeek::Set(t);
+                    changed = true;
+                    continue;
+                }
+                if let WPeek::Other = pk {
+                    if let Some(np) = pure_pops(b[ps]) {
+                        out[pi].0 = WPeek::Del;
+                        for _ in 0..np {
+                            out.push((WPeek::Drop, s, s, c));
+                        }
+                        changed = true;
+                        continue;
+                    }
+                }
+                out.push((k, s, e, c));
+            }
+            ins = out;
+        }
+    }
     // (Local renumbering — hot-first index compaction — was tried and
     // reverted: the `groups` regroup it forces costs more than the
     // 1-byte-LEB savings it buys; ~+18B net on the module.)
@@ -4380,7 +4480,14 @@ mod wpeep_tests {
             trace: false,
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
+            ddrop: false,
         }
+    }
+
+    fn opts_dd() -> PeepOpts {
+        let mut o = opts(false, false);
+        o.ddrop = true;
+        o
     }
 
     #[test]
@@ -4656,6 +4763,27 @@ mod wpeep_tests {
         // writes onto the else path where `get 3` reads them stale.
         assert!(has_seq(&out, &[0x0c, 0x03]), "unsound fold: {out:02x?}");
         assert!(!has_seq(&out, &[0x0d, 0x02]), "unsound br_if: {out:02x?}");
+    }
+
+    // ddrop: `tee; drop` keeps the write as `set`; a dead pure chain
+    // (`get;get;sub;drop`) deletes back to its pushes.
+    #[test]
+    fn ddrop_tee_drop_becomes_set_dead_chain_dies() {
+        let b = body(
+            10,
+            &[
+                0x20, 0x01, 0x20, 0x02, 0x6b, // get1;get2;i32.sub
+                0x22, 0x05, // tee 5 — write kept, stack copy dropped
+                0x1a, // drop
+                0x20, 0x03, 0x20, 0x04, 0x6a, 0x1a, // get3;get4;sub;drop — all dead
+                0x20, 0x05, 0x20, 0x06, 0x6a, // get5;get6;add — l5 stays live
+                0x21, 0x07, // set 7
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_dd()).unwrap();
+        assert!(has_seq(&out, &[0x6b, 0x21, 0x05]), "tee->set lost: {out:02x?}");
+        assert!(!has_seq(&out, &[0x22]), "tee kept: {out:02x?}");
+        assert!(!has_seq(&out, &[0x20, 0x03]), "dead chain kept: {out:02x?}");
     }
 
     // sfwd: `get fp; get v; store` … `get fp; load` re-reads bytes the
