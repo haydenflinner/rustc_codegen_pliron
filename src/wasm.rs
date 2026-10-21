@@ -403,7 +403,7 @@ fn emit_obj(
     pliron_cfg::trace("*wasm-bytes*", t0.elapsed().as_secs_f64() * 1e3, name);
     let t0 = std::time::Instant::now();
     if crate::pass_enabled("PLIRON_WASM_PEEP") {
-        wpeep(&mut bytes);
+        wpeep(&mut bytes, name);
     }
     pliron_cfg::trace("*wasm-peep*", t0.elapsed().as_secs_f64() * 1e3, name);
     custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
@@ -566,6 +566,7 @@ enum WPeek {
 /// any opcode it can't decode. `fsig`/`tsig` give (pops, pushes) per
 /// function index and per type index so calls can take part in
 /// stack-effect tracking.
+#[cfg(test)]
 fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)], nparams: u32) -> Option<Vec<u8>> {
     peep_body_opts(b, fsig, tsig, nparams, &PeepOpts::from_env())
 }
@@ -585,6 +586,9 @@ struct PeepOpts {
     violations: std::cell::Cell<u32>,
     /// Rounds over the audit's budget, left unaudited.
     skipped: std::cell::Cell<u32>,
+    /// `PLIRON_WASM_TRACE_BODY=<k>` matched this body: dump `ins` after
+    /// each rewrite phase.
+    trace: bool,
 }
 
 impl PeepOpts {
@@ -596,7 +600,23 @@ impl PeepOpts {
             pathcheck: crate::pass_enabled("PLIRON_WASM_PEEP_PATHCHECK"),
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
+            trace: false,
         }
+    }
+}
+
+fn wpeek_name(k: WPeek) -> String {
+    match k {
+        WPeek::Get(l) => format!("get {l}"),
+        WPeek::Set(l) => format!("set {l}"),
+        WPeek::Tee(l) => format!("tee {l}"),
+        WPeek::Drop => "drop".into(),
+        WPeek::Del => "DEL".into(),
+        WPeek::Nop(l) => format!("nop {l}"),
+        WPeek::Br(d) => format!("br {d}"),
+        WPeek::BrIf(d) => format!("br_if {d}"),
+        WPeek::Ctl => "ctl".into(),
+        WPeek::Other => "other".into(),
     }
 }
 
@@ -607,6 +627,19 @@ fn peep_body_opts(
     nparams: u32,
     opts: &PeepOpts,
 ) -> Option<Vec<u8>> {
+    macro_rules! wtrace {
+        ($tag:expr, $ins:expr) => {
+            if opts.trace {
+                wdump($tag, &$ins, b);
+            }
+        };
+    }
+    fn wdump(tag: &str, ins: &[(WPeek, usize, usize, usize)], b: &[u8]) {
+        eprintln!("--- {tag} ---");
+        for (i, &(k, s, _e, _)) in ins.iter().enumerate() {
+            eprintln!("{i:4} {} @{s} [{:02x}]", wpeek_name(k), b[s]);
+        }
+    }
     // Locals prefix: vec of (count, valtype). waffle emits one group per
     // local; re-emit adjacent same-type runs as a single group. This is
     // index-preserving (merge only, never reorder), so it needs no other
@@ -770,6 +803,7 @@ fn peep_body_opts(
     if p != b.len() {
         return None; // trailing bytes after the body `end`
     }
+    wtrace!("decode", ins);
     // Coalesce adjacent pairs until none rewrite.
     loop {
         let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
@@ -816,6 +850,7 @@ fn peep_body_opts(
             break;
         }
     }
+    wtrace!("coalesce", ins);
     // Materialization forwarding: waffle's treeify only inlines pure
     // ops, so every load / non-pure result gets `P; local.set t` then a
     // later `local.get t` â€” LLVM instead keeps such values on the
@@ -850,8 +885,12 @@ fn peep_body_opts(
                         0x41..=0x44 => (0, 1),               // consts
                         0x45 | 0x50 => (1, 1),               // eqz
                         0x46..=0x4f | 0x51..=0x66 => (2, 1), // compares
-                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => (1, 1),
-                        0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => (2, 1),
+                        0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => {
+                            (1, 1)
+                        }
+                        0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => {
+                            (2, 1)
+                        }
                         0xa7..=0xc4 => (1, 1), // conversions
                         0xd1 | 0xd2 => (0, 1), // ref.null / ref.func
                         _ => return None,
@@ -1133,6 +1172,7 @@ fn peep_body_opts(
             ins = ni;
         }
     }
+    wtrace!("fwd", ins);
     // Store-forward parallel copies: waffle lowers `br blk(v1..vn)` by
     // computing the vi into scratch locals and then copying them onto
     // the block-param locals, e.g.
@@ -1679,6 +1719,7 @@ fn peep_body_opts(
             };
         }
     }
+    wtrace!("copyfwd", ins);
     // Keep-on-stack: `P; local.set t; W; local.get t` where W never
     // touches the spilled value keeps it on the operand stack instead:
     // the set becomes a tee (the write still happens, so t's reads
@@ -1947,6 +1988,7 @@ fn peep_body_opts(
             break;
         }
     }
+    wtrace!("kos", ins);
     // Loop-back-edge `if` fold: `if c { get*/set*/tee*; br L } [else { R }]
     // end` — waffle lowers `brif` to a param'd loop edge this way, parking
     // the bound copies in scratch locals inside the `if` arm where the
@@ -2425,6 +2467,7 @@ fn peep_body_opts(
         }
         prel.clear();
     }
+    wtrace!("brf", ins);
     // `walias` — operand-stack-aware locals cancellation, phase 1
     // (straight-line spans). Four rewrites:
     //
@@ -3287,6 +3330,7 @@ fn peep_body_opts(
             }
         }
     }
+    wtrace!("walias", ins);
     // Store→load forwarding through a provably-stable base local: the
     // frame-resident aggregate splice leaves `get fp; get v; store +K`
     // … `get fp; load +K` — the load re-reads bytes the store just
@@ -3348,13 +3392,18 @@ fn peep_body_opts(
             }
         };
         // (base local, offset) -> (forwarding local, store opcode,
-        // store ins, addr ins, exposed). `exposed` marks a possibly-
-        // aliasing unforwarded read of the range; an unexposed entry is
-        // overwritten by the next same-slot store, so its store is
-        // dead: `Del` the addr `get` and turn the store into `drop`
-        // (its two pushes → one pop: net-0). Forwarded loads read the
-        // captured local, not memory, so they never expose.
-        type FM = FxHashMap<(u32, u32), (u32, u8, usize, usize, bool)>;
+        // store ins, addr ins, exposed, flow). `exposed` marks a
+        // possibly-aliasing unforwarded read of the range; an unexposed
+        // entry is overwritten by the next same-slot store in the same
+        // straight-line `flow` region, so its store is dead: `Del` the
+        // addr `get` and turn the store into `drop` (its two pushes →
+        // one pop: net-0). A store in a different region (an `if` arm,
+        // after a `br`/`end`) does not dominate the old store — the old
+        // store must keep writing on paths that skip the new one.
+        // Forwarded loads read the captured local, not memory, so they
+        // never expose.
+        type FM = FxHashMap<(u32, u32), (u32, u8, usize, usize, bool, u32)>;
+        let mut flow: u32 = 0;
         let mut fmap: FM = FxHashMap::default();
         // `fmap` merges across structured control like `copymap`/`last_write`:
         // an entry survives an `end` iff every incoming path holds the
@@ -3380,6 +3429,14 @@ fn peep_body_opts(
         let mut store_dels: Vec<(usize, usize)> = Vec::new(); // (addr ins, store ins)
         let mut inserts: Vec<(usize, (WPeek, usize, usize, usize))> = Vec::new();
         let dbg = crate::env_set("PLIRON_WASM_SFWD_DBG");
+        // `PLIRON_WASM_SFWD_FWLIM=N`: allow at most N forwarded loads in
+        // this body — bisects a bad forward without disabling tracking.
+        let fwlim = crate::env_get("PLIRON_WASM_SFWD_FWLIM").and_then(|v| v.parse::<usize>().ok());
+        // `PLIRON_WASM_SFWD_FWSKIP=N`: skip only the Nth (1-based)
+        // forwarded load — pairs with FWLIM to pin one rewrite.
+        let fwskip =
+            crate::env_get("PLIRON_WASM_SFWD_FWSKIP").and_then(|v| v.parse::<usize>().ok());
+        let mut nfw = 0usize;
         let mut n_clear = 0usize;
         let mut n_walkfail = 0usize;
         let mut n_exposed_set = 0usize;
@@ -3502,125 +3559,180 @@ fn peep_body_opts(
         for i in 0..ins.len() {
             match ins[i].0 {
                 WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
-                let op = match ins[i].0 {
-                    WPeek::Br(_) => 0x0c,
-                    WPeek::BrIf(_) => 0x0d,
-                    _ => b[ins[i].1],
-                };
-                let fsnap_to = |d: u32, fpath: &mut Vec<FF>, fm: &FM| {
-                    let idx = fpath.len().wrapping_sub(1 + d as usize);
-                    if let Some(f) = fpath.get_mut(idx)
-                        && f.op != 0x03
-                    {
-                        f.snaps.push(fm.clone());
-                    }
-                };
-                match op {
-                    0x02 => fpath.push(FF {
-                        op,
-                        saved: None,
-                        snaps: Vec::new(),
-                    }),
-                    0x03 => {
-                        fpath.push(FF {
+                    flow += 1;
+                    let op = match ins[i].0 {
+                        WPeek::Br(_) => 0x0c,
+                        WPeek::BrIf(_) => 0x0d,
+                        _ => b[ins[i].1],
+                    };
+                    let fsnap_to = |d: u32, fpath: &mut Vec<FF>, fm: &FM| {
+                        let idx = fpath.len().wrapping_sub(1 + d as usize);
+                        if let Some(f) = fpath.get_mut(idx)
+                            && f.op != 0x03
+                        {
+                            f.snaps.push(fm.clone());
+                        }
+                    };
+                    match op {
+                        0x02 => fpath.push(FF {
                             op,
                             saved: None,
                             snaps: Vec::new(),
-                        });
-                        if let Some(ws) = loop_writes.get(&i) {
-                            fmap.retain(|&(b2, _), &mut e| {
-                                !ws.contains(&b2) && !ws.contains(&e.0)
+                        }),
+                        0x03 => {
+                            fpath.push(FF {
+                                op,
+                                saved: None,
+                                snaps: Vec::new(),
                             });
-                        }
-                    }
-                    0x04 => fpath.push(FF {
-                        op,
-                        saved: Some(fmap.clone()),
-                        snaps: Vec::new(),
-                    }),
-                    0x05 => {
-                        if let Some(f) = fpath.last_mut() {
-                            if freach {
-                                f.snaps.push(fmap.clone());
-                            }
-                            if let Some(s) = f.saved.take() {
-                                fmap = s;
-                            }
-                        }
-                        freach = true;
-                    }
-                    0x0b => {
-                        if let Some(mut f) = fpath.pop() {
-                            let mut bags = std::mem::take(&mut f.snaps);
-                            if freach {
-                                bags.push(std::mem::take(&mut fmap));
-                            }
-                            if let Some(s) = f.saved {
-                                bags.push(s);
-                            }
-                            freach = !bags.is_empty();
-                            let mut it = bags.into_iter();
-                            let mut fm = it.next().unwrap_or_default();
-                            for c in it {
-                                fm.retain(|k, e| match c.get(k) {
-                                    Some(e2)
-                                        if e2.0 == e.0
-                                            && e2.1 == e.1
-                                            && e2.2 == e.2
-                                            && e2.3 == e.3 =>
-                                    {
-                                        e.4 |= e2.4;
-                                        true
+                            // Backedge hazard: a load forwarded to a pre-loop
+                            // entry must hold on every iteration, but the scan
+                            // sees the body once — a store or call later in the
+                            // body rewrites memory for the *next* iteration.
+                            // Kill any entry the body can clobber: overlapping
+                            // same-base stores, an unresolvable store address,
+                            // or any call/`memory.*` clears everything.
+                            if !fmap.is_empty() {
+                                let mut kill_all = false;
+                                let mut slots: Vec<(u32, u32, u32)> = Vec::new(); // (base, off, width)
+                                let mut depth = 1usize;
+                                let mut j = i + 1;
+                                let mut scanned = 0usize;
+                                while depth > 0 && j < ins.len() && scanned < 4000 && !kill_all {
+                                    scanned += 1;
+                                    match ins[j].0 {
+                                        WPeek::Ctl => match b[ins[j].1] {
+                                            0x02 | 0x03 | 0x04 => depth += 1,
+                                            0x0b => depth -= 1,
+                                            0x10 | 0x11 => kill_all = true,
+                                            _ => {}
+                                        },
+                                        WPeek::Other if b[ins[j].1] >= 0xfb => {
+                                            kill_all = true;
+                                        }
+                                        WPeek::Other if (0x36..=0x3e).contains(&b[ins[j].1]) => {
+                                            let Some((sop, off)) = memop(j) else {
+                                                kill_all = true;
+                                                break;
+                                            };
+                                            match operands(j, 2).and_then(|(a, _)| get_of(a)) {
+                                                Some(bx) => slots.push((bx, off, swidth(sop))),
+                                                None => kill_all = true,
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    _ => false,
+                                    j += 1;
+                                }
+                                if kill_all || depth > 0 {
+                                    fmap.clear();
+                                } else if !slots.is_empty() {
+                                    fmap.retain(|&(b2, o2), e| {
+                                        slots.iter().all(|&(b3, o3, w3)| {
+                                            b3 != b2 || o3 + w3 <= o2 || o2 + swidth(e.1) <= o3
+                                        })
+                                    });
+                                }
+                            }
+                            if let Some(ws) = loop_writes.get(&i) {
+                                fmap.retain(|&(b2, _), &mut e| {
+                                    !ws.contains(&b2) && !ws.contains(&e.0)
                                 });
                             }
-                            fmap = fm;
                         }
-                    }
-                    0x0c | 0x0d => {
-                        if freach {
-                            let d = match ins[i].0 {
-                                WPeek::Br(d) | WPeek::BrIf(d) => d,
-                                _ => {
-                                    let mut p = ins[i].1 + 1;
-                                    urd(b, &mut p).unwrap_or(0)
+                        0x04 => fpath.push(FF {
+                            op,
+                            saved: Some(fmap.clone()),
+                            snaps: Vec::new(),
+                        }),
+                        0x05 => {
+                            if let Some(f) = fpath.last_mut() {
+                                if freach {
+                                    f.snaps.push(fmap.clone());
                                 }
-                            };
-                            fsnap_to(d, &mut fpath, &fmap);
+                                if let Some(s) = f.saved.take() {
+                                    fmap = s;
+                                }
+                            }
+                            freach = true;
                         }
-                        if op == 0x0c {
-                            freach = false;
-                        }
-                    }
-                    0x0e => {
-                        if freach {
-                            let mut p = ins[i].1 + 1;
-                            let n = urd(b, &mut p).unwrap_or(0);
-                            for _ in 0..=n {
-                                let d = urd(b, &mut p).unwrap_or(0);
-                                fsnap_to(d, &mut fpath, &fmap);
+                        0x0b => {
+                            if let Some(mut f) = fpath.pop() {
+                                let mut bags = std::mem::take(&mut f.snaps);
+                                if freach {
+                                    bags.push(std::mem::take(&mut fmap));
+                                }
+                                if let Some(s) = f.saved {
+                                    bags.push(s);
+                                }
+                                freach = !bags.is_empty();
+                                let mut it = bags.into_iter();
+                                let mut fm = it.next().unwrap_or_default();
+                                for c in it {
+                                    fm.retain(|k, e| match c.get(k) {
+                                        Some(e2)
+                                            if e2.0 == e.0
+                                                && e2.1 == e.1
+                                                && e2.2 == e.2
+                                                && e2.3 == e.3 =>
+                                        {
+                                            e.4 |= e2.4;
+                                            true
+                                        }
+                                        _ => false,
+                                    });
+                                }
+                                fmap = fm;
                             }
                         }
-                        freach = false;
-                    }
-                    0x00 | 0x0f => freach = false,
-                    // calls and misc `Ctl`s kill slot facts (a callee
-                    // may write any reachable memory).
-                    _ => {
-                        if dbg && !fmap.is_empty() {
-                            eprintln!("  ctl@{i} cleared {} entries", fmap.len());
+                        0x0c | 0x0d => {
+                            if freach {
+                                let d = match ins[i].0 {
+                                    WPeek::Br(d) | WPeek::BrIf(d) => d,
+                                    _ => {
+                                        let mut p = ins[i].1 + 1;
+                                        urd(b, &mut p).unwrap_or(0)
+                                    }
+                                };
+                                fsnap_to(d, &mut fpath, &fmap);
+                            }
+                            if op == 0x0c {
+                                freach = false;
+                            }
                         }
-                        n_clear += 1;
-                        fmap.clear();
+                        0x0e => {
+                            if freach {
+                                let mut p = ins[i].1 + 1;
+                                let n = urd(b, &mut p).unwrap_or(0);
+                                for _ in 0..=n {
+                                    let d = urd(b, &mut p).unwrap_or(0);
+                                    fsnap_to(d, &mut fpath, &fmap);
+                                }
+                            }
+                            freach = false;
+                        }
+                        0x00 | 0x0f => freach = false,
+                        // calls and misc `Ctl`s kill slot facts (a callee
+                        // may write any reachable memory).
+                        _ => {
+                            if dbg && !fmap.is_empty() {
+                                eprintln!("  ctl@{i} cleared {} entries", fmap.len());
+                            }
+                            n_clear += 1;
+                            fmap.clear();
+                        }
                     }
                 }
-            }
                 WPeek::Set(l) | WPeek::Tee(l) => {
-                    let pre: Vec<_> = if dbg { fmap.keys().copied().collect() } else { Vec::new() };
+                    let pre: Vec<_> = if dbg {
+                        fmap.keys().copied().collect()
+                    } else {
+                        Vec::new()
+                    };
                     fmap.retain(|&(b2, _), &mut e| b2 != l && e.0 != l);
                     if dbg {
-                        let gone: Vec<_> = pre.into_iter().filter(|k| !fmap.contains_key(k)).collect();
+                        let gone: Vec<_> =
+                            pre.into_iter().filter(|k| !fmap.contains_key(k)).collect();
                         if !gone.is_empty() {
                             eprintln!("  set@{i} l={l} killed {gone:?}");
                         }
@@ -3669,9 +3781,10 @@ fn peep_body_opts(
                         // overwritten before any read could have seen
                         // it (forwarded reads went through the captured
                         // local, not memory).
-                        if let Some(&(_, sop_old, s_old, a_old, exposed)) =
+                        if let Some(&(_, sop_old, s_old, a_old, exposed, oflow)) =
                             fmap.get(&(bx, off))
                             && !exposed
+                            && oflow == flow
                             && w >= swidth(sop_old)
                         {
                             dead.borrow_mut().insert(a_old);
@@ -3708,7 +3821,7 @@ fn peep_body_opts(
                         // forwards through this entry — killing the
                         // store later costs no capture either way.
                         let fwd = v_ins.and_then(get_of).unwrap_or(u32::MAX);
-                        fmap.insert((bx, off), (fwd, sop, i, a_ins, false));
+                        fmap.insert((bx, off), (fwd, sop, i, a_ins, false, flow));
                         if dbg {
                             eprintln!("  store@{i} insert ({bx},{off}) fwd={fwd}");
                         }
@@ -3738,8 +3851,15 @@ fn peep_body_opts(
                             && let Some(e) = fmap.get_mut(&(bx, off))
                             && lop + 0x0e == e.1
                         {
+                            nfw += 1;
                             let mut fwd = e.0;
-                            if fwd == u32::MAX {
+                            let allowed = crate::env_get("PLIRON_WASM_SFWD_FW") != Some("0")
+                                && fwlim.is_none_or(|l| nfw <= l)
+                                && fwskip != Some(nfw);
+                            if !allowed {
+                                fwd = u32::MAX;
+                            }
+                            if fwd == u32::MAX && allowed {
                                 // First forwarded use of a computed
                                 // value — splice `tee T` before the
                                 // store now (net-0 stack: pops the
@@ -3816,6 +3936,7 @@ fn peep_body_opts(
             ins.insert(pos + k, t);
         }
     }
+    wtrace!("sfwd", ins);
     // (Local renumbering — hot-first index compaction — was tried and
     // reverted: the `groups` regroup it forces costs more than the
     // 1-byte-LEB savings it buys; ~+18B net on the module.)
@@ -3909,7 +4030,7 @@ fn peep_body_opts(
 /// Module-level driver for `peep_body`: walks sections, rewrites each
 /// code-section function body. Leaves the module untouched on any
 /// malformed section layout.
-fn wpeep(bytes: &mut Vec<u8>) {
+fn wpeep(bytes: &mut Vec<u8>, name: &str) {
     if bytes.len() < 8 || &bytes[..8] != b"\0asm\x01\0\0\0" {
         return;
     }
@@ -4068,15 +4189,29 @@ fn wpeep(bytes: &mut Vec<u8>) {
         // this process emits — bisects a wpeep miscompile to one body.
         // Bodies are numbered in order (one block reservation per module)
         // and peepholed in parallel: each reads only its own bytes.
+        // `PLIRON_WASM_PEEP_MOD=<substr>` limits peepholes to modules
+        // whose name contains it; `PLIRON_WASM_PEEP_FI=N` then caps the
+        // per-module body index — both deterministic under parallel CGU
+        // finishing, which the global PEEPED counter is not.
         static PEEPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let limit = crate::env_get("PLIRON_WASM_PEEP_LIMIT").and_then(|v| v.parse::<u64>().ok());
+        let pmod = crate::env_get("PLIRON_WASM_PEEP_MOD");
+        if pmod.as_deref().is_some_and(|m| !name.contains(m)) {
+            return;
+        }
+        let limit = crate::env_get("PLIRON_WASM_PEEP_FI")
+            .or_else(|| crate::env_get("PLIRON_WASM_PEEP_LIMIT"))
+            .and_then(|v| v.parse::<u64>().ok());
         let base = PEEPED.fetch_add(nf as u64, std::sync::atomic::Ordering::Relaxed);
         let bodies = par_map(spans.len(), |fi| {
             let (q, be) = spans[fi];
-            let k = base + fi as u64;
+            let k = if pmod.is_some() {
+                fi as u64
+            } else {
+                base + fi as u64
+            };
             if limit.is_none_or(|l| k < l) {
                 if crate::env_set("PLIRON_WASM_PEEP_LOG") {
-                    eprintln!("wpeep body {k} ({} bytes)", be - q);
+                    eprintln!("wpeep body {name}#{fi} (k={k}, {} bytes)", be - q);
                 }
                 let nparams = fsig.get(imp + fi).map(|&(np, _)| np).unwrap_or(0);
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
@@ -4086,7 +4221,14 @@ fn wpeep(bytes: &mut Vec<u8>) {
                         &bytes[q..be],
                     );
                 }
-                let out = peep_body(&bytes[q..be], &fsig, &tsig, nparams).unwrap_or_else(|| bytes[q..be].to_vec());
+                let out = {
+                    let mut opts = PeepOpts::from_env();
+                    opts.trace = crate::env_get("PLIRON_WASM_TRACE_BODY")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        == Some(k);
+                    peep_body_opts(&bytes[q..be], &fsig, &tsig, nparams, &opts)
+                        .unwrap_or_else(|| bytes[q..be].to_vec())
+                };
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
                     let _ = std::fs::write(
                         format!("{dir}/body_{}_{k}_post.bin", std::process::id()),
@@ -4216,6 +4358,7 @@ mod wpeep_tests {
             audit,
             audit_panic: false,
             pathcheck,
+            trace: false,
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
         }
@@ -4753,6 +4896,85 @@ mod wpeep_tests {
             .filter(|&k| out[k] == 0x36 && out[k + 1] == 0x02 && out[k + 2] == 0x00)
             .count();
         assert_eq!(cnt, 2, "store count: {out:02x?}");
+    }
+
+    // A store inside an `if` arm does not dominate an earlier
+    // unconditional store to the same slot — the else path still reads
+    // what the first store wrote. The eager KILL dropped the first
+    // store anyway (words(100): a loop-top field store deleted by a
+    // conditional overwrite left stale memory for the else path).
+    #[test]
+    fn sfwd_arm_store_cannot_kill_dominator() {
+        let b = body(
+            8,
+            &[
+                0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // get0;get1;store fp+0
+                0x20, 0x02, 0x45, // get2;i32.eqz
+                0x04, 0x40, // if
+                0x20, 0x00, 0x20, 0x03, 0x36, 0x02, 0x00, // get0;get3;store fp+0 (arm)
+                0x0b, // end
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0
+                0x1a, // drop
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        // The first store must survive: `get1;drop` would be its
+        // deleted shape (addr get killed, store -> drop of the value).
+        assert!(
+            !has_seq(&out, &[0x20, 0x01, 0x1a]),
+            "store1 dropped: {out:02x?}"
+        );
+        assert!(has_seq(&out, &[0x36, 0x02, 0x00]), "store gone: {out:02x?}");
+    }
+
+    // A pre-loop entry forwarded to a load inside the loop must hold on
+    // every iteration — a store to the same slot later in the body
+    // rewrites it for the next iteration. (words(100): a pre-loop field
+    // init forwarded inside the drop loop while an in-loop store and a
+    // call rewrote the slot on earlier iterations.)
+    #[test]
+    fn sfwd_loop_store_blocks_backedge_forward() {
+        let b = body(
+            8,
+            &[
+                0x20, 0x00, 0x41, 0x07, 0x36, 0x02, 0x00, // get0;const7;store fp+0
+                0x03, 0x40, // loop
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — must stay a load
+                0x1a, // drop
+                0x20, 0x00, 0x41, 0x09, 0x36, 0x02, 0x00, // get0;const9;store fp+0
+                0x20, 0x01, 0x45, 0x0d, 0x00, // get1;i32.eqz;br_if 0 (backedge)
+                0x0b, // end
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        assert!(
+            has_seq(&out, &[0x28, 0x02, 0x00]),
+            "in-loop load forwarded: {out:02x?}"
+        );
+    }
+
+    // Same hazard through a call: a callee may write any memory, so a
+    // loop containing a call invalidates every pre-loop entry for loads
+    // inside the loop — even before the call in scan order.
+    #[test]
+    fn sfwd_loop_call_blocks_backedge_forward() {
+        let b = body(
+            8,
+            &[
+                0x20, 0x00, 0x41, 0x07, 0x36, 0x02, 0x00, // get0;const7;store fp+0
+                0x03, 0x40, // loop
+                0x20, 0x00, 0x28, 0x02, 0x00, // get0;load fp+0 — must stay a load
+                0x1a, // drop
+                0x10, 0x00, // call 0
+                0x20, 0x01, 0x45, 0x0d, 0x00, // get1;i32.eqz;br_if 0
+                0x0b, // end
+            ],
+        );
+        let out = peep_body(&b, &[(0, 0)], &[(0, 0)], 0).unwrap();
+        assert!(
+            has_seq(&out, &[0x28, 0x02, 0x00]),
+            "in-loop load forwarded past call: {out:02x?}"
+        );
     }
 
     #[test]

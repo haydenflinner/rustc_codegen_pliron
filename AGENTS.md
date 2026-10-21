@@ -141,7 +141,11 @@ time) in ~15 min and writes `target/parity/summary.md`.
 - **wasm-only stages** (after CLIF): the waffle inliner
   (`PLIRON_WASM_INLINE=0`), byte peepholes (`PLIRON_WASM_PEEP=0`,
   `PLIRON_WASM_PEEP_LIMIT=N` peepholes only the first N bodies — bisect
-  it), `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies,
+  it; `PLIRON_WASM_PEEP_MOD=<substr>` + `PLIRON_WASM_PEEP_FI=N` target a
+  deterministic module-local body instead — the global counter jitters
+  under parallel CGUs — and `PLIRON_WASM_TRACE_BODY=N` dumps the body
+  after each `wpeep` sub-pass, `PLIRON_WASM_BODYDUMP=<dir>` saves raw
+  pre/post bytes), `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies,
   `PLIRON_WASM_STUBLOG=<file>` lists functions that fell back to stubs.
 - **Audits**: `PLIRON_WASM_AUDIT=1|panic` checks every wpeep
   copy-forward round with a Datalog translation validator (the code and
