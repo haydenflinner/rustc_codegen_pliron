@@ -623,7 +623,7 @@ impl PeepOpts {
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
             delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
             bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
-            bri2: crate::env_get("PLIRON_WASM_BRI2") == Some("1"),
+            bri2: crate::env_get("PLIRON_WASM_BRI2") != Some("0"),
             btr: crate::env_get("PLIRON_WASM_BTR") != Some("0"),
         }
     }
@@ -4714,7 +4714,7 @@ fn peep_body_opts(
     // to the `if`'s own end rejects, outer-crossing labels retarget
     // -1. Runs late: `walias`/`sfwd`
     // delete arm-local copies that often leave a lone `br` behind.
-    // `PLIRON_WASM_BRI2=1` on.
+    // `PLIRON_WASM_BRI2=0` off.
     if opts.bri2 {
         let safe_ctl = |op: u8| matches!(op, 0x00 | 0x01 | 0x0f | 0x10..=0x14);
         // Each fold emits the kept arm without rescanning it, so a
