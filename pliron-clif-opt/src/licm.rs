@@ -33,6 +33,56 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
     }
 }
 
+/// `deref`'s `(bytes, writable)` fact for root `v`, plus `v`'s byte offset
+/// into the value the fact is keyed by. With `PLIRON_LICM_PEEL=1` a scope
+/// name with no fact of its own (an inlined callee's `noalias` operand,
+/// `&m.hasher` = `m + 16`) peels to the function param it sits at a
+/// constant offset into. Only entry-block params: their facts hold for the
+/// whole function, while a clone param's `region_frozen` seed holds only
+/// inside its region.
+fn deref_fact(
+    func: &Function,
+    ps: &VMap<Value>,
+    deref: &FxHashMap<Value, (u64, bool)>,
+    v: Value,
+) -> Option<(u64, bool, i64)> {
+    if let Some(&(bytes, w)) = deref.get(&v) {
+        return Some((bytes, w, 0));
+    }
+    if !peel_on() {
+        return None;
+    }
+    let (Root::V(b), k) = loadfwd::concrete(func, ps, v) else {
+        return None;
+    };
+    let entry = func.layout.entry_block()?;
+    if b == v || !matches!(func.dfg.value_def(b), ValueDef::Param(pb, _) if pb == entry) {
+        return None;
+    }
+    deref.get(&b).map(|&(bytes, w)| (bytes, w, k))
+}
+
+#[cfg(test)]
+thread_local!(static PEEL_TEST: std::cell::Cell<i8> = const { std::cell::Cell::new(0) });
+
+fn peel_on() -> bool {
+    #[cfg(test)]
+    match PEEL_TEST.with(|c| c.get()) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    pliron_cfg::env_is("PLIRON_LICM_PEEL", "1")
+}
+
+/// `[off, off + ty.bytes())` lies inside an object of `bytes` bytes.
+fn covers(bytes: u64, off: i64, ty: Type) -> bool {
+    off >= 0
+        && off
+            .checked_add(i64::from(ty.bytes()))
+            .is_some_and(|end| end <= bytes as i64)
+}
+
 /// Speculatable: executing it unconditionally can't trap, touch memory, or
 /// branch. Constants and frame addresses are free everywhere, so hoisting
 /// them is pure churn — skipped.
@@ -65,7 +115,6 @@ pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
 fn clobbers(
     func: &Function,
     ps: &VMap<Value>,
-    na: &FxHashSet<Value>,
     w: Inst,
     loc: Loc,
     iso: &FxHashSet<Root>,
@@ -77,14 +126,28 @@ fn clobbers(
     // no store or call in the loop may write it (writing through the
     // root is UB; writing through any other pointer violates
     // `noalias`). Nothing can clobber the loc.
+    // A peeled fact (`deref_fact`) only covers the param's own bytes.
     if let Root::V(v) = loc.0
-        && deref.get(&v).is_some_and(|&(_, writable)| !writable)
+        && deref_fact(func, ps, deref, v).is_some_and(|(bytes, writable, k)| {
+            !writable && (deref.contains_key(&v) || covers(bytes, k.wrapping_add(loc.1), loc.2))
+        })
     {
         return false;
     }
+    // A scope name is an alias class, not an object: an operand-frozen
+    // `&param.field` and a store through `param` share bytes. Key the
+    // disjointness checks on the concrete object so `iso` can't hide the
+    // overlap (licm_frozen_region).
+    let cloc: Loc = match loc.0 {
+        Root::V(v) => {
+            let (r, k) = loadfwd::concrete(func, ps, v);
+            (r, k.wrapping_add(loc.1), loc.2)
+        }
+        _ => loc,
+    };
     let op = func.dfg.insts[w].opcode();
     if op.is_call() {
-        return !loadfwd::write_free(func, w, nw, false) && !iso.contains(&loc.0);
+        return !loadfwd::write_free(func, w, nw, false) && !iso.contains(&cloc.0);
     }
     match func.dfg.insts[w] {
         // Every `store`'s address resolves through `root`, flag or not: an
@@ -92,15 +155,15 @@ fn clobbers(
         // use of such an address escapes analysis — and this store IS a use.
         InstructionData::Store { args, offset, .. } => {
             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
-            let (r2, o2) = loadfwd::norm_root(func, ps, na, args[1]);
+            let (r2, o2) = loadfwd::concrete(func, ps, args[1]);
             let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
-            !overlap_keeps((r2, o2, ty), loc, iso)
+            !overlap_keeps((r2, o2, ty), cloc, iso)
         }
         _ if op.can_store()
             || op.other_side_effects()
             || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
         {
-            !iso.contains(&loc.0)
+            !iso.contains(&cloc.0)
         }
         _ => false,
     }
@@ -255,13 +318,8 @@ fn hoists(
             // a never-taken path can sit past the `dereferenceable`
             // bound and hoisting it speculates that read (same hazard
             // as the `Root::S` wild offset).
-            let proven = deref.get(&v).is_some_and(|&(bytes, _)| {
-                loc.1 >= 0
-                    && loc
-                        .1
-                        .checked_add(i64::from(ty.bytes()))
-                        .is_some_and(|end| end <= bytes as i64)
-            });
+            let proven = deref_fact(func, ps, deref, v)
+                .is_some_and(|(bytes, _, k)| covers(bytes, k.wrapping_add(loc.1), ty));
             proven
                 || func.dfg.value_def(v).inst().is_some_and(|d| {
                     matches!(
@@ -336,7 +394,7 @@ fn hoists(
     }
     let nw_w = writers
         .iter()
-        .filter(|&&w| clobbers(func, ps, na, w, loc, iso, nw, deref))
+        .filter(|&&w| clobbers(func, ps, w, loc, iso, nw, deref))
         .count();
     if dbg {
         if pliron_cfg::tracing_on() {
@@ -344,7 +402,7 @@ fn hoists(
         };
         for &w in writers {
             if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
-                && clobbers(func, ps, na, w, loc, iso, nw, deref)
+                && clobbers(func, ps, w, loc, iso, nw, deref)
             {
                 let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
                 if pliron_cfg::tracing_on() {
@@ -1186,7 +1244,7 @@ fn promote_loc(
             {
                 seed = Some(func.dfg.resolve_aliases(args[0]));
             }
-            _ if clobbers(func, ps, na, i, loc, iso, nw, deref) => seed = None,
+            _ if clobbers(func, ps, i, loc, iso, nw, deref) => seed = None,
             _ => {}
         }
     }
@@ -1818,5 +1876,94 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("licm produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// A scope-name root with no `deref` fact of its own — an inlined
+    /// `hash_one`'s `&RandomState` operand `q = m + 16` — borrows the
+    /// entry param's `dereferenceable`+readonly fact under
+    /// `PLIRON_LICM_PEEL=1`: `load q+0` hoists past an unrelated store
+    /// (hmget's SipHash `k0` reload), while `load q+16` (bytes 32..40 of
+    /// a 32-byte pointee) stays. Off, both stay.
+    #[test]
+    fn scope_name_load_borrows_param_deref() {
+        let build = || {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let h = func.dfg.make_block();
+            let lbody = func.dfg.make_block();
+            let done = func.dfg.make_block();
+            for b in [b0, h, lbody, done] {
+                func.layout.append_block(b);
+            }
+            let m = func.dfg.append_block_param(b0, types::I64);
+            let w = func.dfg.append_block_param(b0, types::I64);
+            let p = func.dfg.append_block_param(h, types::I64);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let k = cur.ins().iconst(types::I64, 16);
+            let q = cur.ins().iadd(m, k);
+            let fv = cur.ins().iconst(types::I64, 5);
+            cur.ins().jump(h, &[fv.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let one = cur.ins().iconst(types::I64, 1);
+            let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+            cur.ins().brif(r, lbody, &[], done, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+            let x = cur.ins().iconst(types::I64, 7);
+            cur.ins().store(MemFlagsData::new(), x, w, 0);
+            let a = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), q, 0);
+            let c = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), q, 16);
+            let s = cur.ins().iadd(a, c);
+            cur.ins().jump(h, &[s.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+            cur.ins().return_(&[fv]);
+
+            let mut deref = FxHashMap::default();
+            deref.insert(m, (32, false));
+            deref.insert(w, (16, true));
+            let na: FxHashSet<Value> = [q].into_iter().collect();
+            run(
+                &mut func,
+                &mut crate::pipeline::Analysis::default(),
+                &na,
+                &deref,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
+                &FxHashMap::default(),
+            );
+            let flags =
+                cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+            if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+                panic!("licm produced invalid IR: {e}\n{}", func.display());
+            }
+            let blk = |v: Value| {
+                func.layout
+                    .inst_block(func.dfg.value_def(v).inst().unwrap())
+                    .unwrap()
+            };
+            (blk(a) == b0, blk(c) == lbody, func.display().to_string())
+        };
+        PEEL_TEST.with(|f| f.set(2));
+        let (hoisted, stayed, ir) = build();
+        assert!(!hoisted && stayed, "peel off: scope-name load moved:\n{ir}");
+        PEEL_TEST.with(|f| f.set(1));
+        let (hoisted, stayed, ir) = build();
+        PEEL_TEST.with(|f| f.set(0));
+        assert!(hoisted, "peel on: in-bounds scope-name load stayed in the loop:\n{ir}");
+        assert!(stayed, "peel on: load past the param's bytes left the loop:\n{ir}");
     }
 }
