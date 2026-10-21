@@ -229,6 +229,40 @@ fn aarch64_stub_body(name: &str) -> Option<String> {
         "llvm.aarch64.dsb" => return Some("    dsb ish\n    ret\n".into()),
         _ => {}
     }
+    // FEAT_SHA1/SHA256/SHA512/AES (`llvm.aarch64.crypto.*`): sha2's and
+    // aes's hardware paths. Operands arrive in AAPCS order — vectors in
+    // v0..v2, sha1c/p/m's scalar `e` in w0 — and each body is the
+    // instruction on those registers (rsasm doesn't know the crypto
+    // mnemonics; words from clang -march=armv8.2-a+crypto+sha3).
+    if let Some(op) = name.strip_prefix("llvm.aarch64.crypto.") {
+        let words: &[u32] = match op {
+            "sha256h" => &[0x5e024020],    // sha256h q0, q1, v2.4s
+            "sha256h2" => &[0x5e025020],   // sha256h2 q0, q1, v2.4s
+            "sha256su0" => &[0x5e282820],  // sha256su0 v0.4s, v1.4s
+            "sha256su1" => &[0x5e026020],  // sha256su1 v0.4s, v1.4s, v2.4s
+            "sha1c" => &[0x1e270010, 0x5e010200], // fmov s16, w0; sha1c q0, s16, v1.4s
+            "sha1p" => &[0x1e270010, 0x5e011200], // fmov s16, w0; sha1p q0, s16, v1.4s
+            "sha1m" => &[0x1e270010, 0x5e012200], // fmov s16, w0; sha1m q0, s16, v1.4s
+            "sha1h" => &[0x1e270000, 0x5e280800, 0x1e260000], // fmov s0, w0; sha1h s0, s0; fmov w0, s0
+            "sha1su0" => &[0x5e023020],    // sha1su0 v0.4s, v1.4s, v2.4s
+            "sha1su1" => &[0x5e281820],    // sha1su1 v0.4s, v1.4s
+            "aese" => &[0x4e284820],       // aese v0.16b, v1.16b
+            "aesd" => &[0x4e285820],       // aesd v0.16b, v1.16b
+            "aesmc" => &[0x4e286800],      // aesmc v0.16b, v0.16b
+            "aesimc" => &[0x4e287800],     // aesimc v0.16b, v0.16b
+            "sha512h" => &[0xce628020],    // sha512h q0, q1, v2.2d
+            "sha512h2" => &[0xce628420],   // sha512h2 q0, q1, v2.2d
+            "sha512su0" => &[0xcec08020],  // sha512su0 v0.2d, v1.2d
+            "sha512su1" => &[0xce628820],  // sha512su1 v0.2d, v1.2d, v2.2d
+            _ => return None,
+        };
+        let mut body = String::new();
+        for w in words {
+            body.push_str(&format!("    .word 0x{w:08x}\n"));
+        }
+        body.push_str("    ret\n");
+        return Some(body);
+    }
     // crc32b/h/w/x (IEEE) and crc32cb/ch/cw/cx (Castagnoli): crc in w0,
     // data in w1 (x/cx take x1), result in w0. rsasm doesn't know the
     // CRC32 mnemonics, so emit the encoding for `crc32* w0, w0, w1/x1`

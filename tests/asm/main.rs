@@ -229,6 +229,21 @@ fn neon_stubs() {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha2,aes")]
+unsafe fn crypto() -> (u32, [u32; 4], [u8; 16]) {
+    use std::arch::aarch64::*;
+    let h = vsha1h_u32(0x8000_0001);
+    let w03 = vld1q_u32([1u32, 2, 3, 4].as_ptr());
+    let w47 = vld1q_u32([0x8000_0000u32, 5, 6, 7].as_ptr());
+    let mut su0 = [0u32; 4];
+    vst1q_u32(su0.as_mut_ptr(), vsha256su0q_u32(w03, w47));
+    let col = [0xdbu8, 0x13, 0x53, 0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut mc = [0u8; 16];
+    vst1q_u8(mc.as_mut_ptr(), vaesmcq_u8(vld1q_u8(col.as_ptr())));
+    (h, su0, mc)
+}
+
+#[cfg(target_arch = "aarch64")]
 fn main() {
     let mut x: u64 = 40;
     unsafe { asm!("add {0}, {0}, {1}", inout(reg) x, in(reg) 2u64) };
@@ -244,6 +259,18 @@ fn main() {
     }
     let z = unsafe { pliron_ga_add(1, 2) };
     println!("{x} {y} {} {z}", std::str::from_utf8(&dst).unwrap());
+    if std::arch::is_aarch64_feature_detected!("sha2") && std::arch::is_aarch64_feature_detected!("aes") {
+        // sha2's/aes's hardware paths (llvm.aarch64.crypto.*) trapped in
+        // the stub before they had bodies (sha2 sha224_kat SIGTRAP).
+        let (h, su0, mc) = unsafe { crypto() };
+        assert_eq!(h, 0x8000_0001u32.rotate_left(30));
+        let s0 = |x: u32| x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+        let w = [1u32, 2, 3, 4, 0x8000_0000];
+        let want: Vec<u32> = (0..4).map(|i| w[i].wrapping_add(s0(w[i + 1]))).collect();
+        assert_eq!(su0.to_vec(), want);
+        assert_eq!(&mc[..4], &[0x8e, 0x4d, 0xa1, 0xbc]);
+        println!("crypto ok");
+    }
     if std::arch::is_aarch64_feature_detected!("crc") {
         let r = unsafe { crc32s() };
         assert_eq!([r.0, r.1, r.2, r.3], [0x9ae0daaf; 4]);

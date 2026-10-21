@@ -1,0 +1,196 @@
+#!/usr/bin/env -S python3 -I
+"""Run popular crates' own test suites under stock rustc and pliron; report
+pliron-only failures.
+
+  harness/crates.py [--tier 1] [--only a,b] [--debug] [--jobs N] [--timeout S]
+
+Each pinned crate's published source is fetched once from static.crates.io
+into target/crates/src/<name>-<ver>/ (a `[workspace]` stanza keeps cargo
+from adopting it into ours), then `cargo test --release --no-fail-fast` runs
+twice: stock, and with the pliron backend (RUSTFLAGS *and* RUSTDOCFLAGS, so
+doc-tests go through pliron too). Each side shares one target dir across
+crates; cargo doesn't track the backend dylib, so the pliron side is wiped
+when the dylib changes. `--release` by default: the optimizer is where
+miscompiles live (bevy_math's rect_union_pt, 2026-10-21).
+
+Outputs target/crates/report.md (+ report.json, per-crate logs). For a
+pliron-only failure, narrow it with harness/fnbisect.py using the printed
+repro (touch the crate's src/lib.rs so cargo rebuilds just that crate), then
+PLIRON_DIFFCHECK=step PLIRON_DIFFCHECK_FN=<fn> to name the pass.
+"""
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time, urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(ROOT, "target", "crates")
+TOOLCHAIN = "nightly-2026-10-06"
+
+# (name, version, extra cargo-test args, tier). Pinned 2026-10-21; bump
+# deliberately so a new failure means a compiler change, not a crate one.
+CRATES = [
+    ("ryu", "1.0.23", [], 1),
+    ("itoa", "1.0.18", [], 1),
+    ("lexical-core", "1.0.6", [], 1),
+    ("memchr", "2.8.3", [], 1),
+    ("aho-corasick", "1.1.5", [], 1),
+    ("regex-syntax", "0.8.11", [], 1),
+    ("regex-automata", "0.4.18", [], 1),
+    ("regex", "1.13.1", [], 1),
+    ("hashbrown", "0.17.1", [], 1),
+    ("indexmap", "2.14.2", [], 1),
+    ("smallvec", "1.16.3", [], 1),
+    ("bytes", "1.12.1", [], 1),
+    ("num-traits", "0.2.19", [], 1),
+    ("num-bigint", "0.5.1", [], 1),
+    ("libm", "0.2.16", [], 1),
+    ("sha2", "0.11.1", [], 1),
+    ("blake3", "1.8.7", [], 1),
+    ("crc32fast", "1.5.3", [], 1),
+    ("miniz_oxide", "0.9.1", [], 1),
+    ("png", "0.18.1", [], 1),
+]
+
+TEST_LINE = re.compile(r"^test (\S+) (?:- should panic )?\.\.\. (ok|FAILED|ignored)")
+RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed")
+
+
+def fetch(name, ver):
+    d = os.path.join(OUT, "src", f"{name}-{ver}")
+    if os.path.exists(os.path.join(d, "Cargo.toml")):
+        return d
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    url = f"https://static.crates.io/crates/{name}/{name}-{ver}.crate"
+    req = urllib.request.Request(url, headers={"User-Agent": "pliron-crates-harness"})
+    tgz = d + ".crate"
+    with urllib.request.urlopen(req, timeout=60) as r, open(tgz, "wb") as f:
+        f.write(r.read())
+    with tarfile.open(tgz) as t:
+        t.extractall(os.path.dirname(d), filter="data")
+    os.remove(tgz)
+    with open(os.path.join(d, "Cargo.toml"), "a") as f:
+        f.write("\n[workspace]\n")
+    return d
+
+
+def dylib(profile):
+    ext = "dylib" if sys.platform == "darwin" else "so"
+    return os.path.join(ROOT, "target", profile, f"librustc_codegen_pliron.{ext}")
+
+
+def stamp_ok(tdir, lib):
+    """Wipe `tdir` when the backend dylib changed since its last use."""
+    h = hashlib.sha256()
+    with open(lib, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    want = h.hexdigest()
+    sp = os.path.join(tdir, ".pliron-backend")
+    if os.path.exists(sp) and open(sp).read() == want:
+        return
+    if os.path.exists(tdir):
+        shutil.rmtree(tdir)
+    os.makedirs(tdir, exist_ok=True)
+    open(sp, "w").write(want)
+
+
+def run_tests(src, side, args, lib, jobs, timeout, release):
+    tdir = os.path.join(OUT, f"target-{side}")
+    env = dict(os.environ)
+    env["CARGO_INCREMENTAL"] = "0"
+    env.pop("RUSTFLAGS", None)
+    env.pop("RUSTDOCFLAGS", None)
+    if side == "pliron":
+        flag = f"-Zcodegen-backend={lib}"
+        env["RUSTFLAGS"] = flag
+        env["RUSTDOCFLAGS"] = flag
+        env["RUSTC_ICE"] = os.path.join(OUT, "ices")
+        os.makedirs(env["RUSTC_ICE"], exist_ok=True)
+    cmd = ["cargo", f"+{TOOLCHAIN}", "test", "--no-fail-fast", "--target-dir", tdir, "-j", str(jobs)]
+    if release:
+        cmd.append("--release")
+    cmd += args
+    t = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=src, env=env, capture_output=True, text=True, timeout=timeout)
+        log, rc = p.stdout + p.stderr, p.returncode
+    except subprocess.TimeoutExpired as e:
+        log = (e.stdout or b"").decode(errors="replace") + (e.stderr or b"").decode(errors="replace")
+        rc = "timeout"
+    res = {"rc": rc, "secs": round(time.time() - t, 1), "passed": 0, "failed": 0, "fails": [], "cmd": cmd}
+    suite = ""
+    for line in log.splitlines():
+        if line.strip().startswith(("Running ", "Doc-tests ")):
+            suite = line.strip().split(" (")[0]
+        m = TEST_LINE.match(line)
+        if m and m.group(2) == "FAILED":
+            res["fails"].append(f"{suite} :: {m.group(1)}")
+        m = RESULT.match(line)
+        if m:
+            res["passed"] += int(m.group(1))
+            res["failed"] += int(m.group(2))
+    res["build_error"] = "could not compile" in log
+    res["ice"] = any(s in log for s in ("internal compiler error", "pipeline broke", "error: the compiler unexpectedly panicked"))
+    res["fails"] = sorted(set(res["fails"]))
+    return res, log
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tier", type=int, default=1)
+    ap.add_argument("--only", default="")
+    ap.add_argument("--debug", action="store_true", help="test profile instead of --release")
+    ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--profile", default="release", help="backend dylib profile (release|debug)")
+    a = ap.parse_args()
+    only = set(filter(None, a.only.split(",")))
+    lib = dylib(a.profile)
+    if not os.path.exists(lib):
+        sys.exit(f"no backend dylib at {lib}: cargo build --{a.profile}")
+    os.makedirs(os.path.join(OUT, "logs"), exist_ok=True)
+    stamp_ok(os.path.join(OUT, "target-pliron"), lib)
+    rows = []
+    for name, ver, args, tier in CRATES:
+        if tier > a.tier or (only and name not in only):
+            continue
+        try:
+            src = fetch(name, ver)
+        except Exception as e:
+            print(f"{name}: fetch failed: {e}")
+            continue
+        row = {"crate": f"{name}-{ver}"}
+        for side in ("stock", "pliron"):
+            r, log = run_tests(src, side, args, lib, a.jobs, a.timeout, not a.debug)
+            open(os.path.join(OUT, "logs", f"{name}.{side}.log"), "w").write(log)
+            row[side] = r
+        only_p = sorted(set(row["pliron"]["fails"]) - set(row["stock"]["fails"]))
+        row["pliron_only"] = only_p
+        s, p = row["stock"], row["pliron"]
+        status = (
+            "ICE" if p["ice"] else
+            "BUILD" if p["build_error"] and not s["build_error"] else
+            "TIMEOUT" if p["rc"] == "timeout" and s["rc"] != "timeout" else
+            "FAIL" if only_p or p["passed"] < s["passed"] or p["failed"] > s["failed"] else
+            "skip" if s["build_error"] else "ok"
+        )
+        row["status"] = status
+        rows.append(row)
+        print(f"{status:8} {row['crate']:24} stock {s['passed']}/{s['failed']} ({s['secs']}s)  "
+              f"pliron {p['passed']}/{p['failed']} ({p['secs']}s)  pliron-only {len(only_p)}", flush=True)
+        for f in only_p[:10]:
+            print(f"           {f}")
+    json.dump(rows, open(os.path.join(OUT, "report.json"), "w"), indent=1)
+    with open(os.path.join(OUT, "report.md"), "w") as f:
+        f.write("| status | crate | stock pass/fail | pliron pass/fail | pliron-only |\n|---|---|---|---|---|\n")
+        for r in rows:
+            f.write(f"| {r['status']} | {r['crate']} | {r['stock']['passed']}/{r['stock']['failed']} | "
+                    f"{r['pliron']['passed']}/{r['pliron']['failed']} | {', '.join(r['pliron_only'][:5])} |\n")
+        f.write("\nRepro (pliron side): cd target/crates/src/<crate> && "
+                f"RUSTFLAGS=-Zcodegen-backend={lib} RUSTDOCFLAGS=-Zcodegen-backend={lib} "
+                f"cargo +{TOOLCHAIN} test --release --target-dir {os.path.join(OUT, 'target-pliron')}\n")
+    bad = [r for r in rows if r["status"] in ("ICE", "BUILD", "FAIL", "TIMEOUT")]
+    print(f"\n{len(rows)} crates, {len(bad)} with pliron-only problems -> {os.path.join(OUT, 'report.md')}")
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()
