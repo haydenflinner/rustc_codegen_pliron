@@ -20,7 +20,7 @@
 //! literal args: they still satisfy the invariant, they just have no
 //! `iv + s` to key the rewrite on.
 //!
-//! `PLIRON_IVRETRO=1` enables it.
+//! `PLIRON_IVRETRO=0` disables it.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{

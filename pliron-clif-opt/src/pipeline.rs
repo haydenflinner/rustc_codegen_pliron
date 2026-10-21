@@ -3705,7 +3705,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step(
             "ivretro",
             "ivretro",
-            Gate::OptIn("PLIRON_IVRETRO"),
+            Gate::Env("PLIRON_IVRETRO"),
             s_ivretro,
         )
         .needs(shape::LOOPS),
