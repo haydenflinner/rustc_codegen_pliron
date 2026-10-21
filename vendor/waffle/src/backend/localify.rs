@@ -63,6 +63,16 @@ struct Context<'a> {
     /// preference fires, the transfer's `local.get L; local.set L`
     /// degenerates to a no-op.
     preferred: HashMap<Value, SmallVec<[Value; 2]>>,
+    /// PLIRON: `arg` -> `param` steals: `arg`'s def sits in the same
+    /// block as the edge passing it to `param`, `param`'s range
+    /// outlives `arg`'s, and no use of `param` follows `arg`'s def in
+    /// that block (terminator args included). `arg` then takes
+    /// `param`'s local outright — `param`'s remaining uses are only
+    /// reachable through edges that rewrite the local, so the early
+    /// write is unobservable — instead of waiting for `param`'s local
+    /// to reach the freelist. This is what lets a loop's `i+1`
+    /// overwrite `i`'s slot before the backedge, LLVM-style.
+    steal: HashMap<Value, Value>,
 }
 
 trait Visitor {
@@ -174,6 +184,7 @@ impl<'a> Context<'a> {
             ranges: vec![usize::MAX..usize::MAX; body.values.len()],
             points: 0,
             preferred: HashMap::default(),
+            steal: HashMap::default(),
         }
     }
 
@@ -382,6 +393,145 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// PLIRON: fill `steal` — see the field's comment for the rule.
+    /// Needs `ranges` for the outlives check, so runs after
+    /// `find_ranges` (and after `compute_preferred` so a steal can be
+    /// preferred over the weaker freelist hint in `allocate`).
+    fn compute_steal(&mut self) {
+        // PLIRON: shares `PLIRON_WCOAL`'s off switch.
+        if std::env::var_os("PLIRON_WCOAL").is_some_and(|v| v == "0") {
+            return;
+        }
+        let body = self.body;
+        let trees = self.trees;
+        let mut defpos: HashMap<Value, usize> = HashMap::default();
+        for block in body.blocks.iter() {
+            defpos.clear();
+            for (i, &iv) in body.blocks[block].insts.iter().enumerate() {
+                defpos.insert(iv, i);
+            }
+            // Does `p` have a use in this block after inst `pos`?
+            // Terminator args (any edge) count as uses at the end.
+            // The use point of a treeified inst's args is the root
+            // that consumes it, and `p` can sit inside a treeified
+            // arg's subtree, so positions and args are resolved
+            // through `trees`.
+            let root_pos = |iv: Value, k: usize| -> usize {
+                if !trees.owner.contains_key(&iv) {
+                    return k;
+                }
+                let mut r = iv;
+                for _ in 0..64 {
+                    match trees.owner.get(&r) {
+                        Some(&va) => r = va.root_value(),
+                        None => break,
+                    }
+                }
+                *defpos.get(&r).unwrap_or(&k)
+            };
+            let contains_p = |u: Value, p: Value| -> bool {
+                let mut stack = vec![u];
+                for _ in 0..128 {
+                    let Some(u) = stack.pop() else {
+                        return false;
+                    };
+                    let u = body.resolve_alias(u);
+                    let u = match &body.values[u] {
+                        ValueDef::PickOutput(v2, _, _) => *v2,
+                        _ => u,
+                    };
+                    if u == p {
+                        return true;
+                    }
+                    if trees.owner.contains_key(&u) || trees.remat.contains(&u) {
+                        if let ValueDef::Operator(_, args, _) = &body.values[u] {
+                            stack.extend(body.arg_pool[*args].iter().copied());
+                        }
+                    }
+                }
+                // Depth budget exhausted: bail to "used".
+                true
+            };
+            let used_after = |pos: usize, p: Value| -> bool {
+                for (k, &iv) in body.blocks[block].insts.iter().enumerate() {
+                    if root_pos(iv, k) <= pos {
+                        continue;
+                    }
+                    if let ValueDef::Operator(_, args, _) = &body.values[iv] {
+                        for &u in &body.arg_pool[*args] {
+                            if contains_p(u, p) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                let mut hit = false;
+                body.blocks[block].terminator.visit_uses(|u| {
+                    if hit {
+                        return;
+                    }
+                    if contains_p(u, p) {
+                        hit = true;
+                    }
+                });
+                hit
+            };
+            let ranges = &self.ranges;
+            let check = |t: &BlockTarget, steal: &mut HashMap<Value, Value>| {
+                let params = &body.blocks[t.block].params;
+                for (i, &arg) in t.args.iter().enumerate() {
+                    if i >= params.len() {
+                        break;
+                    }
+                    let mut a = body.resolve_alias(arg);
+                    if let ValueDef::PickOutput(v2, _, _) = body.values[a] {
+                        a = v2;
+                    }
+                    let p = params[i].1;
+                    if a == p {
+                        continue;
+                    }
+                    let Some(&pos) = defpos.get(&a) else {
+                        continue;
+                    };
+                    // The steal aliases `a`'s uses into `p`'s local
+                    // while `p`'s range still owns it; `p` must outlive
+                    // `a` or the local could be recycled mid-flight.
+                    let ar = &ranges[a.index()];
+                    let pr = &ranges[p.index()];
+                    if ar.start == usize::MAX
+                        || pr.start == usize::MAX
+                        || ar.end > pr.end
+                    {
+                        continue;
+                    }
+                    if used_after(pos, p) {
+                        continue;
+                    }
+                    steal.insert(a, p);
+                }
+            };
+            match &body.blocks[block].terminator {
+                Terminator::Br { target } => check(target, &mut self.steal),
+                Terminator::CondBr {
+                    if_true, if_false, ..
+                } => {
+                    check(if_true, &mut self.steal);
+                    check(if_false, &mut self.steal);
+                }
+                Terminator::Select {
+                    targets, default, ..
+                } => {
+                    for t in targets {
+                        check(t, &mut self.steal);
+                    }
+                    check(default, &mut self.steal);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn allocate(&mut self) {
         // Sort values by ranges' starting points, then value to break ties.
         let mut ranges: Vec<(Value, std::ops::Range<usize>)> = self
@@ -401,6 +551,11 @@ impl<'a> Context<'a> {
         // the freelist).
         let mut range_idx = 0;
         let mut freelist: HashMap<Type, Vec<Local>> = HashMap::default();
+        // PLIRON: current range-owner of each local, for the steal
+        // check — a local may only be stolen while the candidate
+        // param's own range still owns it (never reallocated, never
+        // freed).
+        let mut owner: HashMap<Local, Value> = HashMap::default();
 
         for i in 0..self.points {
             // Process ends. (Ends are exclusive, so we do them
@@ -409,6 +564,7 @@ impl<'a> Context<'a> {
             if let Some(expiring) = expiring.remove(&i) {
                 for (ty, local) in expiring {
                     log::trace!(" -> expiring {} of type {} back to freelist", local, ty);
+                    owner.remove(&local);
                     freelist.entry(ty).or_insert_with(|| vec![]).push(local);
                 }
             }
@@ -440,20 +596,43 @@ impl<'a> Context<'a> {
                 // local on the freelist is provably dead here, so this
                 // can only merge non-overlapping ranges.
                 let cands = self.preferred.get(&value).cloned();
-                for &ty in self.body.values[value].tys(&self.body.type_pool) {
-                    let mut local = cands.as_ref().and_then(|cands| {
-                        cands.iter().find_map(|&cand| {
-                            if self.results.values[cand].len() != 1 {
-                                return None;
-                            }
-                            let l = self.results.values[cand][0];
-                            freelist.get_mut(&ty).and_then(|free| {
-                                free.iter()
-                                    .position(|&x| x == l)
-                                    .map(|pos| free.swap_remove(pos))
+                // PLIRON: a steal candidate beats the freelist hint —
+                // it turns the edge transfer into a self-copy instead
+                // of merely picking a nicer free local. Only applies
+                // to single-result values (the local list must match
+                // the param's one local) and only while `p`'s range
+                // still owns the local; ownership stays with `p`, so
+                // nothing is pushed to `expiring` for the stolen slot.
+                let tys = self.body.values[value].tys(&self.body.type_pool);
+                let steal = if tys.len() == 1 {
+                    self.steal.get(&value).and_then(|&p| {
+                        let vs = &self.results.values[p];
+                        if vs.len() == 1 && owner.get(&vs[0]) == Some(&p) {
+                            Some(vs[0])
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+                for &ty in tys {
+                    let mut local = steal.and_then(|l| (self.results.locals[l] == ty).then_some(l));
+                    if local.is_none() {
+                        local = cands.as_ref().and_then(|cands| {
+                            cands.iter().find_map(|&cand| {
+                                if self.results.values[cand].len() != 1 {
+                                    return None;
+                                }
+                                let l = self.results.values[cand][0];
+                                freelist.get_mut(&ty).and_then(|free| {
+                                    free.iter()
+                                        .position(|&x| x == l)
+                                        .map(|pos| free.swap_remove(pos))
+                                })
                             })
-                        })
-                    });
+                        });
+                    }
                     if local.is_none() {
                         local = Some(
                             freelist
@@ -467,8 +646,14 @@ impl<'a> Context<'a> {
                     }
                     let local = local.unwrap();
                     log::trace!(" -> got local {} of type {}", local, ty);
+                    let stolen = steal == Some(local);
+                    if !stolen {
+                        owner.insert(local, value);
+                    }
                     allocs.push(local);
-                    expiring.push((ty, local));
+                    if !stolen {
+                        expiring.push((ty, local));
+                    }
                 }
                 self.results.values[value] = allocs;
             }
@@ -480,6 +665,7 @@ impl<'a> Context<'a> {
         self.compute_liveness();
         self.find_ranges();
         self.compute_preferred();
+        self.compute_steal();
         self.allocate();
         self.results
     }

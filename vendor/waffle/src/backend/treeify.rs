@@ -11,6 +11,15 @@ use std::convert::TryFrom;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueArg(Value, u16);
 
+impl ValueArg {
+    /// PLIRON: the value whose arg slot this is — needed by
+    /// localify's steal analysis to walk a treeified chain to its
+    /// consuming root.
+    pub fn root_value(&self) -> Value {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Trees {
     /// Is a value placed "under" the given arg slot of the given
