@@ -424,17 +424,25 @@ pub fn kill(
     // that's the call arm's job, not the store rule's).
     let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
     av.retain(|&(r2, o2, t2), _| {
+        // Both immunities below are about stores through *other*
+        // pointers. A store through the loc's own root that overlaps it
+        // is a real write (the region tag can be stale: CFG merging left
+        // smallvec `into_iter`'s `set_len(0)` store in a block still
+        // tagged with the inlined `len(&self)` clone — double drop) or
+        // UB; killing is sound either way.
+        let own = r == r2 && !(o2 >= o + n || o >= o2 + i64::from(t2.bytes()));
         // An `!invariant.load` location holds the same value for the
-        // load's whole scope: a write to it would be UB, so no store can
-        // clobber it — not even one to the same normalized location.
-        if invs.contains(&(r2, o2, t2)) {
+        // load's whole scope: a write to it through another pointer would
+        // be UB, so such a store can't clobber it.
+        if !own && invs.contains(&(r2, o2, t2)) {
             return true;
         }
         // A region-frozen operand's pointee can't be written while the
         // clone runs — a store inside the region can't clobber it. This
         // is LLVM's scoped `!noalias`: `*pivot` survives `partition`'s
         // element swaps for the clone's whole span.
-        if let Some(cur) = cur
+        if !own
+            && let Some(cur) = cur
             && invreg
                 .get(&(r2, o2, t2))
                 .is_some_and(|rs| rs.iter().any(|&t| in_region(cur, t, rpar)))

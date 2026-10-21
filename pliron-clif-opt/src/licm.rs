@@ -347,7 +347,21 @@ fn hoists(
     // on the `pb`→`h` edge (dominated by `pb`, hence in `pb`'s region).
     // Regions nest — `pb` may sit in a deeper clone than the tagged region;
     // walk `region_parent` to check containment.
-    if let Some(&target) = scoped.get(&i) {
+    // The frozen immunities below cover stores through *other* pointers;
+    // a loop store through the loc's own root that overlaps it is a real
+    // write (stale region tag after CFG merging) or UB — never hoist past
+    // it (loadfwd_frozen_same_root_store).
+    let own_write = writers.iter().any(|&w| match func.dfg.insts[w] {
+        InstructionData::Store { args, offset, .. } => {
+            let ty2 = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
+            let (r2, o2) = loadfwd::norm_root(func, ps, na, args[1]);
+            let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
+            r2 == loc.0
+                && !(loc.1 >= o2 + i64::from(ty2.bytes()) || o2 >= loc.1 + i64::from(ty.bytes()))
+        }
+        _ => false,
+    });
+    if !own_write && let Some(&target) = scoped.get(&i) {
         let mut r = breg.get(&pb).copied();
         let mut chain = Vec::new();
         while let Some(x) = r {
@@ -380,7 +394,8 @@ fn hoists(
     // can land the load in a block whose region is the sibling's. As long
     // as the load's block and the hoist target both sit inside the
     // record's region, the hoist can't observe a write.
-    if let Root::V(rv) = r
+    if !own_write
+        && let Root::V(rv) = r
         && let Some(rs) = ofz.get(&rv)
         && let (Some(&pbreg), Some(&breg_)) = (
             breg.get(&pb),
