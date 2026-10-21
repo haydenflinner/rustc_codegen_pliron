@@ -599,7 +599,7 @@ struct PeepOpts {
     delse: bool,
     /// `if {br K} else {A}` → `br_if` flush (`PLIRON_WASM_BRI`).
     bri: bool,
-    /// `br K` before its K+1 enclosing `end`s (`PLIRON_WASM_BTR`).
+    /// `br K` before its K+1 enclosing `end`s (`PLIRON_WASM_BTR=0` off).
     btr: bool,
 }
 
@@ -616,7 +616,7 @@ impl PeepOpts {
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
             delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
             bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
-            btr: crate::env_get("PLIRON_WASM_BTR") == Some("1"),
+            btr: crate::env_get("PLIRON_WASM_BTR") != Some("0"),
         }
     }
 }
@@ -2579,7 +2579,7 @@ fn peep_body_opts(
     // crossed constructs, and a non-`loop` target (a `br` to a `loop`
     // jumps to its header). Unreachable `br`s fold unconditionally.
     // Type-index blocktypes or unsized operands poison the body.
-    // `PLIRON_WASM_BTR=1` on.
+    // `PLIRON_WASM_BTR=0` off.
     if opts.btr {
         // Per-inst state: `None` = unreachable (a dead-region marker
         // is still open), `Some(None)` = live but stack depth unknown,
@@ -5319,9 +5319,14 @@ mod wpeep_tests {
                 0x0b, // end (block)
             ],
         );
-        let out = peep_body(&b, &[], &[], 0).unwrap();
+        // btr would fold the retargeted `br 1` (it exits past the
+        // loop's `end` to @1 — a valid tail fold), so pin it off to
+        // keep exercising bri's retargeting.
+        let mut o = opts(false, false);
+        o.bri = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
         assert!(has_seq(&out, &[0x0d, 0x00, 0x03, 0x40]), "no fold: {out:02x?}");
-        assert!(has_seq(&out, &[0x03, 0x40, 0x0c, 0x01]), "br not retargeted: {out:02x?}");
+        assert!(has_seq(&out, &[0x0c, 0x01]), "br not retargeted: {out:02x?}");
         assert!(!has_seq(&out, &[0x04, 0x40]), "if left: {out:02x?}");
     }
 
