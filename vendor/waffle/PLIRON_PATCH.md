@@ -53,9 +53,9 @@ LLVM's destructive-update shape.
 
 All changes are marked `// PLIRON:` in the source.
 
-## `src/backend/treeify.rs` — loop-nest guard (`PLIRON_WTREE_LOOP=1`)
+## `src/backend/treeify.rs` — loop-nest guard (`PLIRON_WTREE_LOOP=0` off)
 
-`Trees::compute` takes the `CFGInfo` and, when enabled, computes natural
+`Trees::compute` takes the `CFGInfo` and computes natural
 loops (`LoopNest`: backward walk from each back-edge). A single-use
 value is not treeified into a consumer that sits in a loop the def is
 outside of: emission would re-run the def every iteration, undoing a

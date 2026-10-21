@@ -52,11 +52,10 @@ impl Trees {
         let mut multi_use = HashSet::default();
         // PLIRON: read once per pass.
         let loads_ok = !std::env::var_os("PLIRON_WTREELOAD").is_some_and(|v| v == "0");
-        // PLIRON: `PLIRON_WTREE_LOOP=1` keeps a tree from pulling a def
-        // into a loop it sits outside of — a single-use invariant licm
-        // hoisted would otherwise be re-emitted at its in-loop use.
-        let nest = std::env::var_os("PLIRON_WTREE_LOOP")
-            .is_some_and(|v| v == "1")
+        // PLIRON: keep a tree from pulling a def into a loop it sits
+        // outside of — a single-use invariant licm hoisted would otherwise
+        // be re-emitted at its in-loop use. `PLIRON_WTREE_LOOP=0` off.
+        let nest = (!std::env::var_os("PLIRON_WTREE_LOOP").is_some_and(|v| v == "0"))
             .then(|| LoopNest::compute(cfg));
 
         for (block, block_def) in body.blocks.entries() {
