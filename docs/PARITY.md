@@ -17,13 +17,13 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | axis | pliron / LLVM | verdict |
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
-| wasm runtime (geomean, 16 kernels) | **0.917** | ahead; real gaps: `strwork` +26%, `hmget` +17%, `parse_only` +9% |
-| wasm module size | 1.93 (183.9 KiB vs 95 KiB) | behind |
-| compile time: bench kernels, native | **0.59** (0.25 s vs 0.43 s) | ahead (2026-10-21) |
-| compile time: bench kernels, wasm | **1.17** (0.62 s vs 0.54 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
+| wasm runtime (geomean, 16 kernels) | **0.925** | ahead; real gaps: `strwork` +30%, `hmget` +18%, `parse_only` +9-11% |
+| wasm module size | 1.93 (183.0 KiB vs 95 KiB) | behind |
+| compile time: bench kernels, native | **0.60** (0.26 s vs 0.43 s) | ahead (2026-10-21) |
+| compile time: bench kernels, wasm | **1.18** (0.62 s vs 0.52 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
 | compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
-| compile time: regex-syntax, wasm32 (one CGU) | **1.08** (2.85 s vs 2.64 s) | near parity (2026-10-21) |
-| compile time: syn 2 + `full` (~50 kLOC) | **1.10** (3.46 s vs 3.14 s) | behind (2026-10-21; was 15-22) |
+| compile time: regex-syntax, wasm32 (one CGU) | **1.02** (2.65 s vs 2.60 s) | ~parity (2026-10-21) |
+| compile time: syn 2 + `full` (~50 kLOC) | **1.09** (3.49 s vs 3.21 s) | behind (2026-10-21; was 15-22) |
 
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
@@ -510,9 +510,20 @@ through their K+1 enclosing `end`s anyway, incl. unreachable `br`s
 inst — dead-region-open / live / live-unknown-depth — after a
 miscompile where a boundary `end` resuming with an unknown base marked
 a live `loop` back-edge "dead" and folded it (wasmstdtest words trap).
-Remaining `if`/`else` pairs ~2,515 vs LLVM's 0. Next levers: deeper
-`if`→`br_if` restructuring in stackify, local coalescing parity with
-binaryen.
+`bri2` (`PLIRON_WASM_BRI2`, default on) is `bri`'s mirror:
+`if{A}else{brK}`→`i32.eqz;br_if(K-1);A` (~380 sites, −882 B); the fold
+emits a synthesized `WPeek::Eqz` (pop-1/push-1 in every `ins` model)
+and re-runs to a fixpoint (≤8 rounds) because a fold's kept arm is not
+rescanned for nested candidates. The CLIF pipeline now also skips
+`brchain` on the wasm path (`p.wasm`): the compare-chain conversion
+exists because native `br_table` lowers to an indirect branch, but
+waffle emits the real wasm `br_table` — 15 tables now survive to the
+module vs 0 before. Remaining `if`/`else` pairs ~2,300 vs LLVM's 0 —
+the residual is merge-param materialization: waffle's relooper puts
+block params through scratch locals at `if`/`else` boundaries (ours:
+~36k local ops; LLVM: ~14k, its `br_if`-only shapes keep values on the
+operand stack). Next levers: deeper `if`→`br_if` restructuring in
+stackify, local coalescing parity with binaryen.
 
 ## 3. Native runtime
 
