@@ -81,3 +81,5 @@ cranelift-interpreter = { path = "vendor/cranelift-interpreter" }
 cranelift-reader = { path = "vendor/cranelift-reader" }
 # x64 call veneers for out-of-range imports; see vendor/cranelift-jit/PLIRON_PATCH.md.
 cranelift-jit = { path = "vendor/cranelift-jit" }
+# Edge-transfer local coalescing in localify; see vendor/waffle/PLIRON_PATCH.md.
+waffle = { path = "vendor/waffle" }
