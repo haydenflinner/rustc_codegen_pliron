@@ -1,0 +1,15 @@
+; test zext_chain
+; An i8 truncation in the chain caps the mask below the band constant:
+; `0x1ff` through an i8 keeps only `0xff`.
+; check: iconst.i64 255
+; check-not: = uextend
+; diffcheck
+function %trunc(i64) -> i64 fast {
+block0(v0: i64):
+    v1 = ireduce.i32 v0
+    v10 = iconst.i32 0x1ff
+    v2 = band v1, v10
+    v3 = ireduce.i8 v2
+    v4 = uextend.i64 v3
+    return v4
+}

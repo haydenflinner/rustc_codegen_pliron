@@ -2789,7 +2789,10 @@ fn s_uload32(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // wasm i64.* + i32.wrap_i64 per-iteration overhead. Runs late so the
 // whole pipeline residuals are covered; clifpeep also calls it early.
 fn s_dem64(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::dem64(&mut p.clctx.func);
+    let mut k = clifpeep::dem64(&mut p.clctx.func);
+    if crate::env_is("PLIRON_ZXCHAIN", "1") {
+        k += clifpeep::zext_chain(&mut p.clctx.func);
+    }
     if k > 0 && p.dump {
         p.dump("dem64");
     }

@@ -1,0 +1,21 @@
+; test zext_chain
+; hashbrown's control byte after dem64: `(h >> 25) & 127` demoted through
+; i32/i8 and re-widened for the i64 byte broadcast. The chain's combined
+; mask is 127, so `uextend` becomes one `band` on the i64 source.
+; check: = band v1, v
+; check: iconst.i64 127
+; check-not: = uextend
+; diffcheck
+function %ctrl(i64) -> i64 fast {
+block0(v0: i64):
+    v10 = iconst.i64 25
+    v1 = ushr v0, v10
+    v2 = ireduce.i32 v1
+    v11 = iconst.i32 127
+    v3 = band v2, v11
+    v4 = ireduce.i8 v3
+    v5 = uextend.i64 v4
+    v12 = iconst.i64 0x0101_0101_0101_0101
+    v7 = imul v5, v12
+    return v7
+}

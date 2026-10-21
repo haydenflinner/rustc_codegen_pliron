@@ -816,6 +816,88 @@ fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) 
 /// are sub-2^32 extractable even when their producers stay i64 —
 /// `icmp.i64 eq (uextend x), 0` becomes `icmp.i32 eq x, 0` with the
 /// `uextend` left for its wider consumers.
+/// `uextend.i64` of a narrowing chain — `ireduce`, `band` by a constant,
+/// `uextend` — back to an i64 source collapses to one `band` with the
+/// chain's combined mask: each step only keeps or clears low bits, so the
+/// result is `src & M`. `dem64` leaves these behind when a demoted web
+/// re-widens (hashbrown's control byte `(h >> 25) & 127`, byte-broadcast
+/// by an i64 multiply: wrap + `i32.and` + extend → one `i64.and`).
+/// `PLIRON_ZXCHAIN=1`.
+pub fn zext_chain(func: &mut Function) -> usize {
+    let iconst = |func: &Function, v: Value| -> Option<u64> {
+        let i = func.dfg.resolved_value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } => Some(imm.bits() as u64),
+            _ => None,
+        }
+    };
+    let width = |t: Type| -> u64 {
+        if t.bits() >= 64 { u64::MAX } else { (1u64 << t.bits()) - 1 }
+    };
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+            let InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let out = func.dfg.first_result(i);
+            if func.dfg.value_type(out) != types::I64 {
+                continue;
+            }
+            let mut v = func.dfg.resolve_aliases(arg);
+            let mut m = width(func.dfg.value_type(v));
+            let mut steps = 0;
+            loop {
+                let Some(d) = func.dfg.value_def(v).inst() else { break };
+                match func.dfg.insts[d] {
+                    InstructionData::Unary {
+                        opcode: Opcode::Ireduce | Opcode::Uextend,
+                        arg,
+                    } => {
+                        v = func.dfg.resolve_aliases(arg);
+                        m &= width(func.dfg.value_type(v));
+                    }
+                    InstructionData::Binary {
+                        opcode: Opcode::Band,
+                        args,
+                    } => {
+                        let (x, k) = match (iconst(func, args[0]), iconst(func, args[1])) {
+                            (_, Some(k)) => (args[0], k),
+                            (Some(k), None) => (args[1], k),
+                            _ => break,
+                        };
+                        m &= k & width(func.dfg.value_type(v));
+                        v = func.dfg.resolve_aliases(x);
+                    }
+                    _ => break,
+                }
+                steps += 1;
+                if func.dfg.value_type(v) == types::I64 {
+                    break;
+                }
+            }
+            if func.dfg.value_type(v) != types::I64 || steps < 2 {
+                continue;
+            }
+            let mut cur = FuncCursor::new(func).at_inst(i);
+            let k = cur.ins().iconst(types::I64, m as i64);
+            let r = cur.ins().band(v, k);
+            func.dfg.clear_results(i);
+            func.dfg.change_to_alias(out, r);
+            func.layout.remove_inst(i);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn dem64(func: &mut Function) -> usize {
     // Use index: inst args classified by position (a load's address is
     // a full-width use even though the load's *result* demotes), plus
