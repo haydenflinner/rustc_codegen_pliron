@@ -2029,6 +2029,7 @@ fn peep_body_opts(
                 let mut arm2: Vec<(WPeek, usize, usize, usize)> = Vec::new();
                 let mut writes: FxHashSet<u32> = FxHashSet::default();
                 let mut br_i: Option<usize> = None;
+                let mut else_s: Option<usize> = None;
                 let mut bad = false;
                 let mut j = i + 1;
                 // Operand-stack depth the arm1 copies leave above the `if`'s
@@ -2046,6 +2047,7 @@ fn peep_body_opts(
                     }
                     if arm == 0 {
                         if b[s2] == 0x05 {
+                            else_s = Some(s2);
                             j += 1; // `else` marker — arm2 follows
                             // else arm: nested structured control is
                             // allowed — `br`/`br_if` label operands that
@@ -2164,13 +2166,16 @@ fn peep_body_opts(
                 if !valid {
                     break 'fold;
                 }
-                // A `prel` anchored inside the reordered range emits at
-                // the wrong operand-stack point — outside it is
-                // untouched.
-                if prel
-                    .iter()
-                    .any(|&(pp, _)| pp >= ins[i].1 && pp <= ins[j].1)
-                {
+                // A `prel` anchored on a deleted inst (the `if`, arm1's
+                // insts, `else`, `end`) emits at the wrong operand-stack
+                // point or loses its anchor — arm2 insts keep their byte
+                // positions and stack depth, so anchors there stay valid.
+                let del_hi = ins[br_i.unwrap()].1;
+                if prel.iter().any(|&(pp, _)| {
+                    (pp >= ins[i].1 && pp <= del_hi)
+                        || Some(pp) == else_s
+                        || pp == ins[j].1
+                }) {
                     break 'fold;
                 }
                 // The hoisted `writes` hold the arm's (new) value on the
