@@ -51,6 +51,14 @@ fn pass(name: &str) -> Pass {
         "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "zext_chain" => clifpeep::zext_chain,
+        "zipiv" => |f| {
+            let mut cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
+            cfg.compute(f);
+            let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(f, &cfg);
+            let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+            la.compute(f, &cfg, &dt);
+            pliron_clif_opt::zipiv::run(f, &cfg, &dt, &la)
+        },
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,
         "iconst128" => |f| clifpeep::iconst128(f, true),

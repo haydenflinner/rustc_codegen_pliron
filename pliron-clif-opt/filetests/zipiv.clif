@@ -1,0 +1,40 @@
+; test zipiv
+; Reverse zip of two equal-length "slices" (Big::cmp's limb walk, on the
+; pointers alone): p and q step by -4 from a0 + 4n and b0 + 4n, so
+; `q == b0` holds exactly when `p == a0`, which block2's guard already
+; rules out. The b-exhausted test folds false, its select keeps q - 4.
+; check: jump block3
+; check-not: select
+; diffcheck
+function %zip(i64, i64, i64) -> i32 fast {
+block0(v0: i64, v1: i64, v2: i64):
+    v40 = iconst.i64 15
+    v41 = band v2, v40
+    v4 = iconst.i64 4
+    v3 = imul v41, v4
+    v5 = iadd v3, v0
+    v6 = iadd v3, v1
+    v7 = iconst.i32 0
+    jump block1(v5, v6, v7)
+
+block1(v10: i64, v11: i64, v12: i32):
+    v13 = icmp eq v0, v10
+    brif v13, block4(v12), block2(v10, v11, v12)
+
+block2(v20: i64, v21: i64, v22: i32):
+    v50 = iconst.i64 -4
+    v23 = iadd v20, v50
+    v24 = icmp eq v1, v21
+    v25 = iadd v21, v50
+    v26 = select v24, v21, v25
+    v51 = iconst.i32 1000
+    brif v24, block4(v51), block3
+
+block3:
+    v52 = iconst.i32 1
+    v27 = iadd v22, v52
+    jump block1(v23, v26, v27)
+
+block4(v30: i32):
+    return v30
+}

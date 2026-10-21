@@ -3223,6 +3223,15 @@ fn s_indvars(p: &mut Pipe, an: &mut Analysis) -> usize {
     indvars::run(&mut p.clctx.func, an, p.amode_scale)
 }
 
+fn s_zipiv(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let CfgDtLa { cfg, dt, la } = an.cfg_dt_la(&p.clctx.func);
+    let k = crate::zipiv::run(&mut p.clctx.func, cfg, dt, la);
+    if k > 0 && p.dump {
+        p.dump("zipiv");
+    }
+    k
+}
+
 fn s_loopdel(p: &mut Pipe, an: &mut Analysis) -> usize {
     loopdel::run(&mut p.clctx.func, an)
 }
@@ -3448,6 +3457,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // the back edge.
         .needs_any(shape::LOOPS | shape::CONDBR),
         cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
+        // Lockstep pointer IVs (`zip`/slice `cmp`/`eq`): one exit test.
+        step("zipiv", "zipiv", Gate::OptIn("PLIRON_ZIPIV"), s_zipiv).needs(shape::LOOPS),
         // Re-time rotated loops that test the pre-increment IV so the latch
         // tests `iadd p, s` directly — drops the backedge register copy.
         step("ivalign", "ivalign", Gate::Env("PLIRON_IVALIGN"), s_ivalign).needs(shape::LOOPS),
