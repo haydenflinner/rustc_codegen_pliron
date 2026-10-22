@@ -27,6 +27,8 @@ test that fails without it.
 | prql | `lto = true` rejected | no LTO; fat LTO now = `cc -r` of every object, rlibs carry a postcard payload | dc49339 |
 | `ctor`-style statics | constructors never ran | `__DATA,__mod_init_func` without a section type was `S_REGULAR` | ed986ce |
 | prql `test_append_select_multiple` | extra SQL column | slotmerge: reads through a container (closure env) didn't keep the slot live across the loop; self-loops weren't backedges | 8f9c780 |
+| nushell (nu_command `copy_on_thread`) | ICE, cranelift egraph | ops after a mid-block invoke (inliner, sroa reloads, sret2reg) were credited to the pad by block dominance → sroa-fwd into cleanup | fa11870 |
+| uiua `Shape::extend_from_slice` | stale SmallVec capacity | CLIF block merges kept an inlined `&self` helper's region tag; regions now derive from instructions | c035f52 |
 
 ## Status at the end of the run
 
