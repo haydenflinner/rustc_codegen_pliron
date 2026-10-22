@@ -4931,12 +4931,32 @@ fn peep_body_opts(
                 (0x28, 0xac) => Some((0x34, &b[s + 1..e])),
                 (0x28, 0xad) => Some((0x35, &b[s + 1..e])),
                 (0x2c, 0xac) => Some((0x30, &b[s + 1..e])),
+                (0x2d, 0xac) => Some((0x31, &b[s + 1..e])),
                 (0x2d, 0xad) => Some((0x31, &b[s + 1..e])),
                 (0x2e, 0xac) => Some((0x32, &b[s + 1..e])),
+                (0x2f, 0xac) => Some((0x33, &b[s + 1..e])),
                 (0x2f, 0xad) => Some((0x33, &b[s + 1..e])),
                 (0x29, 0xc2) => Some((0x30, &b[s + 1..e])),
                 (0x29, 0xc3) => Some((0x32, &b[s + 1..e])),
                 (0x29, 0xc4) => Some((0x34, &b[s + 1..e])),
+                // `*loadN_u; *extendN_s` fuses to the signed load (a
+                // zero-extended narrow value sign-extended is the sign
+                // load), and `*loadN_s; *extendN_s` is a no-op extend.
+                // A full-width load narrows to the access the extend
+                // needs (`i32.load; i32.extend8_s` reads only the low
+                // byte either way).
+                (0x28, 0xc0) => Some((0x2c, &b[s + 1..e])),
+                (0x28, 0xc1) => Some((0x2e, &b[s + 1..e])),
+                (0x2c, 0xc0) => Some((0x2c, &b[s + 1..e])),
+                (0x2d, 0xc0) => Some((0x2c, &b[s + 1..e])),
+                (0x2e, 0xc1) => Some((0x2e, &b[s + 1..e])),
+                (0x2f, 0xc1) => Some((0x2e, &b[s + 1..e])),
+                (0x30, 0xc2) => Some((0x30, &b[s + 1..e])),
+                (0x31, 0xc2) => Some((0x30, &b[s + 1..e])),
+                (0x32, 0xc3) => Some((0x32, &b[s + 1..e])),
+                (0x33, 0xc3) => Some((0x32, &b[s + 1..e])),
+                (0x34, 0xc4) => Some((0x34, &b[s + 1..e])),
+                (0x35, 0xc4) => Some((0x34, &b[s + 1..e])),
                 (0x41, 0x46) if b[s + 1..e] == [0x00] => Some((0x45, &b[e..e])),
                 (0x42, 0x51) if b[s + 1..e] == [0x00] => Some((0x50, &b[e..e])),
                 _ => None,
