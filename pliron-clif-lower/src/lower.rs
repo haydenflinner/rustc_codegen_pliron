@@ -697,6 +697,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 block_region: &j.block_region,
                 prof: &j.prof,
                 region_parent: &sh.region_parent,
+                inst_region: Default::default(),
                 lifetimes: &mut j.lifetimes,
                 nocap: &j.nocap,
                 tcfg: sh.tcfg,

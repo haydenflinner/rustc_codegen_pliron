@@ -314,6 +314,7 @@ fn with_pipe<R>(
         prof: &e8,
         prof_hook: None,
         region_parent: &e6,
+        inst_region: Default::default(),
         lifetimes: &mut lifetimes,
         nocap: &e7,
         fn_names: &[],

@@ -787,6 +787,10 @@ fn transfer(
                             && off0 + i64::from(ty.bytes()) <= bytes as i64
                             && cur.is_some_and(|cur| in_region(cur, reg, rpar))
                         {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::loadfwd",
+                                    "frozen: {res} loc {loc:?} region {reg:?} (cur {cur:?}, operand {rv})")
+                            };
                             invreg.entry(loc).or_default().push(reg);
                         }
                     }
@@ -878,14 +882,21 @@ fn transfer(
                         reach.insert(nm.n0(func, ps, na0, v).0);
                     }
                     av.retain(|&(r, o, t), _| {
-                        iso.contains(&r)
+                        let keep = iso.contains(&r)
                             || (ncc.contains(&r) && !reach.contains(&r))
-                            || invs.contains(&(r, o, t))
-                            || cur.is_some_and(|cur| {
+                            || invs.contains(&(r, o, t));
+                        let kreg = !keep
+                            && cur.is_some_and(|cur| {
                                 invreg
                                     .get(&(r, o, t))
                                     .is_some_and(|rs| rs.iter().any(|&t2| in_region(cur, t2, rpar)))
-                            })
+                            });
+                        if kreg && pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::loadfwd",
+                                "call {i}: region keeps {:?} (cur {cur:?}, regions {:?})",
+                                (r, o, t), invreg.get(&(r, o, t)))
+                        };
+                        keep || kreg
                     });
                 }
             }

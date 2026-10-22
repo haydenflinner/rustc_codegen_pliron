@@ -181,6 +181,11 @@ pub struct Pipe<'a> {
     /// Loop passes scale budgets off it; `block_count` is the read path.
     pub prof: &'a FxHashMap<Block, u64>,
     pub region_parent: &'a pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    /// Each lowered instruction's region (from `block_region`), taken when
+    /// the pipeline starts. Block merges keep instruction identity but not
+    /// block identity, so consumers derive block regions from this
+    /// (`live_block_region`) instead of the stale `block_region`.
+    pub inst_region: FxHashMap<Inst, Ptr<BasicBlock>>,
     /// `llvm.lifetime.{start,end}` markers as (slots, anchor inst,
     /// block, is_start). The operand pointer is resolved to slots at
     /// lowering/`Facts` time — by slotmerge's point in the pipeline the
@@ -1060,6 +1065,19 @@ const fn cstep(
 
 pub fn run_pipeline(p: &mut Pipe) {
     corpus_dump(p);
+    // `PLIRON_LIVEREGION=0` falls back to the lowering-time block regions.
+    if !p.block_region.is_empty() && crate::pass_enabled("PLIRON_LIVEREGION") {
+        let func = &p.clctx.func;
+        let mut m = FxHashMap::default();
+        for b in func.layout.blocks() {
+            if let Some(&r) = p.block_region.get(&b) {
+                for i in func.layout.block_insts(b) {
+                    m.insert(i, r);
+                }
+            }
+        }
+        p.inst_region = m;
+    }
     match crate::diffcheck::mode_for(p.fname) {
         None => {
             run_steps(p, false);
@@ -1069,6 +1087,79 @@ pub fn run_pipeline(p: &mut Pipe) {
         }
         Some(crate::diffcheck::Mode::Whole) => run_whole_checked(p),
     }
+}
+
+/// Block regions for the function as it is *now*: a block's region is the
+/// deepest region containing every instruction it holds (by `inst_region`).
+/// A block that a CLIF pass merged across a region boundary
+/// (an inlined `&self` helper's block fused with the caller's continuation)
+/// gets the outer region, so the helper's frozen-operand claim no longer
+/// covers the caller's code (uiua `Shape::extend_from_slice`: loadfwd kept
+/// a SmallVec capacity across `try_reserve`, 2026-10-22). A side-effecting
+/// instruction with no recorded region (created by a pass) leaves its block
+/// without one; new pure ones are ignored.
+pub fn live_block_region(p: &Pipe) -> FxHashMap<Block, Ptr<BasicBlock>> {
+    if p.inst_region.is_empty() {
+        // Off (`PLIRON_LIVEREGION=0`) or no regions: the static map.
+        return p.block_region.clone();
+    }
+    live_regions(&p.clctx.func, &p.inst_region, p.region_parent)
+}
+
+/// `live_block_region` over explicit inputs (see there).
+pub fn live_regions(
+    func: &Function,
+    inst_region: &FxHashMap<Inst, Ptr<BasicBlock>>,
+    rpar: &pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+) -> FxHashMap<Block, Ptr<BasicBlock>> {
+    let mut out = FxHashMap::default();
+    let lca = |a: Ptr<BasicBlock>, b: Ptr<BasicBlock>| -> Option<Ptr<BasicBlock>> {
+        let mut anc = Vec::new();
+        let mut x = Some(a);
+        while let Some(r) = x {
+            if anc.len() > 64 {
+                break;
+            }
+            anc.push(r);
+            x = rpar.get(r).copied().filter(|&q| q != r);
+        }
+        let mut y = Some(b);
+        let mut n = 0;
+        while let Some(r) = y {
+            if anc.contains(&r) {
+                return Some(r);
+            }
+            n += 1;
+            if n > 64 {
+                break;
+            }
+            y = rpar.get(r).copied().filter(|&q| q != r);
+        }
+        None
+    };
+    'blk: for b in func.layout.blocks() {
+        let mut reg: Option<Ptr<BasicBlock>> = None;
+        for i in func.layout.block_insts(b) {
+            let Some(&r) = inst_region.get(&i) else {
+                let op = func.dfg.insts[i].opcode();
+                if op.is_call() || op.can_store() || op.other_side_effects() {
+                    continue 'blk;
+                }
+                continue;
+            };
+            reg = match reg {
+                None => Some(r),
+                Some(q) => match lca(q, r) {
+                    Some(q) => Some(q),
+                    None => continue 'blk,
+                },
+            };
+        }
+        if let Some(r) = reg {
+            out.insert(b, r);
+        }
+    }
+    out
 }
 
 /// `PLIRON_CORPUS=<dir>` dumps each function's pre-pipeline CLIF (facts
@@ -1938,6 +2029,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     // on a load arm) — without one, the CFG/RPO/proot/iso setup and
     // the fixpoint can produce nothing.
     if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
+        let breg_now = live_block_region(p);
         let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
         p.stats.forwarded += loadfwd::run(
             &mut p.clctx.func,
@@ -1948,7 +2040,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
             p.scoped_na,
             p.invariant,
             p.operand_frozen,
-            p.block_region,
+            &breg_now,
             p.region_parent,
             p.nowrite,
             p.call_frozen,
@@ -2068,6 +2160,7 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let breg_now = live_block_region(p);
     let k = licm::run(
         &mut p.clctx.func,
         an,
@@ -2077,7 +2170,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.nowrite,
         p.call_frozen,
         p.scoped,
-        p.block_region,
+        &breg_now,
         p.region_parent,
         p.operand_frozen,
     );
@@ -2657,6 +2750,7 @@ fn s_seltest(p: &mut Pipe, an: &mut Analysis) -> usize {
 // `iadd` chains that `concrete` peels to exact (root, offset) locs —
 // making stores/loads that were unprovable at the early run disjoint.
 fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let breg_now = live_block_region(p);
     let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
     let k = loadfwd::run(
         &mut p.clctx.func,
@@ -2667,7 +2761,7 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.scoped_na,
         p.invariant,
         p.operand_frozen,
-        p.block_region,
+        &breg_now,
         p.region_parent,
         p.nowrite,
         p.call_frozen,
@@ -4109,6 +4203,7 @@ mod tests {
             block_region: &block_region,
             prof: &prof,
             region_parent: &region_parent,
+            inst_region: Default::default(),
             lifetimes: &mut lifetimes,
             nocap: &nocap,
             tcfg: isa.frontend_config(),
