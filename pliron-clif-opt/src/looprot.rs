@@ -29,11 +29,16 @@ pub fn run(
         if n >= MAX_ROTATIONS {
             break;
         }
-        // `rotatable` runs under the `cfg_dt` borrow; the shared use
-        // index is fetched in the gap before `rotate` re-borrows them.
+        // Layout-only checks run before the `cfg_dt` borrow: after a
+        // rotation the analysis is stale, so every later block that
+        // fails here would otherwise pay a cfg/domtree rebuild just to
+        // bail on its own shape.
+        let Some((t, s1, s2)) = rotatable_pre(func, h) else {
+            continue;
+        };
         let ok = {
             let (cfg, domtree) = an.cfg_dt(func);
-            rotatable(func, cfg, domtree, h)
+            rotatable(func, cfg, domtree, h, t, s1, s2)
         };
         if ok {
             let u = an.uses(func);
@@ -49,9 +54,58 @@ pub fn run(
     n
 }
 
+/// The `rotatable` checks that need only the layout and inst data —
+/// run before the cfg/domtree borrow so a rotation's stale-analysis
+/// rebuild isn't paid per non-candidate. Returns `(terminator, succ1,
+/// succ2)` on pass.
+fn rotatable_pre(func: &Function, h: Block) -> Option<(Inst, Block, Block)> {
+    if Some(h) == func.layout.entry_block() {
+        return None;
+    }
+    let t = func.layout.last_inst(h)?;
+    let InstructionData::Brif { blocks, .. } = &func.dfg.insts[t] else {
+        return None;
+    };
+    let pool = &func.dfg.value_lists;
+    let (s1, s2) = (blocks[0].block(pool), blocks[1].block(pool));
+    if s1 == h || s2 == h || s1 == s2 {
+        return None;
+    }
+    if blocks
+        .iter()
+        .any(|b| b.args(pool).any(|a| !matches!(a, BlockArg::Value(_))))
+    {
+        return None;
+    }
+    let mut k = 0;
+    for i in func.layout.block_insts(h) {
+        if i == t {
+            continue;
+        }
+        let op = func.dfg.insts[i].opcode();
+        if op.is_call() || op.is_branch() || op.is_terminator() {
+            return None;
+        }
+        k += 1;
+    }
+    if k > MAX_INSTS {
+        return None;
+    }
+    Some((t, s1, s2))
+}
+
 /// Header `h` with one latch ending in `jump h`, a small call-free body and a
-/// `brif` to two blocks that only `h` reaches.
-fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h: Block) -> bool {
+/// `brif` to two blocks that only `h` reaches. `t`/`s1`/`s2` come from
+/// `rotatable_pre`.
+fn rotatable(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+    h: Block,
+    _t: Inst,
+    s1: Block,
+    s2: Block,
+) -> bool {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG);
     macro_rules! bail {
@@ -62,26 +116,10 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
             return false;
         }};
     }
-    if Some(h) == func.layout.entry_block() || !domtree.is_reachable(h) {
-        bail!("entry/unreachable");
+    if !domtree.is_reachable(h) {
+        bail!("unreachable");
     }
-    let Some(t) = func.layout.last_inst(h) else {
-        bail!("no last inst");
-    };
-    let InstructionData::Brif { blocks, .. } = &func.dfg.insts[t] else {
-        return false;
-    };
     let pool = &func.dfg.value_lists;
-    let (s1, s2) = (blocks[0].block(pool), blocks[1].block(pool));
-    if s1 == h || s2 == h || s1 == s2 {
-        return false;
-    }
-    if blocks
-        .iter()
-        .any(|b| b.args(pool).any(|a| !matches!(a, BlockArg::Value(_))))
-    {
-        bail!("non-value blockarg");
-    }
     // A multi-pred successor is fine as long as no `h`-defined value is live
     // into its region (`rotate` appends params for those, which other preds
     // couldn't supply); checked there once `need` is known.
@@ -115,20 +153,6 @@ fn rotatable(func: &Function, cfg: &ControlFlowGraph, domtree: &DominatorTree, h
             }
         }
         _ => bail!("latch terminator"),
-    }
-    let mut k = 0;
-    for i in func.layout.block_insts(h) {
-        if i == t {
-            continue;
-        }
-        let op = func.dfg.insts[i].opcode();
-        if op.is_call() || op.is_branch() || op.is_terminator() {
-            bail!("header op {:?}", op);
-        }
-        k += 1;
-    }
-    if k > MAX_INSTS {
-        bail!("header size {k}");
     }
     if dbg {
         if pliron_cfg::tracing_on() {
