@@ -1,0 +1,28 @@
+; test ovkill
+; `brif v2, block1(0), block1(v9)` binds v10 to either arg. entry_b took
+; the `min` over a pred's matching edges, bounding v10 by 0, so the
+; `icmp eq v17, -1` below folded to false although v9 = -1 (an Ordering)
+; reaches it: uiua `derive_sortedness` lost every `Less` (2026-10-22).
+; check: v18 = icmp eq v17, v8
+; diffcheck
+function %f(i32, i32, i8) -> i8 {
+block0(v0: i32, v1: i32, v2: i8):
+    v3 = icmp ult v0, v1
+    v4 = icmp ne v0, v1
+    v5 = iconst.i8 1
+    v6 = iconst.i8 0
+    v7 = select v4, v5, v6
+    v8 = iconst.i8 -1
+    v9 = select v3, v8, v7
+    brif v2, block1(v6), block1(v9)
+block1(v10: i8):
+    v11 = icmp eq v10, v6
+    v12 = iconst.i8 -2
+    v13 = select v11, v12, v10
+    v14 = icmp eq v13, v12
+    v15 = select v14, v12, v13
+    v16 = icmp eq v15, v12
+    v17 = select v16, v6, v15
+    v18 = icmp eq v17, v8
+    return v18
+}

@@ -7163,10 +7163,14 @@ pub(crate) fn entry_b(
     let mut m: Rc<BoundsMap> = Rc::new(BoundsMap::default());
         let preds: Vec<_> = cfg.pred_iter(b).collect();
         if !preds.is_empty() && depth > 0 {
-            // Edge args → this block's params: `min` over a pred's matching
-            // edges, `max` over preds (an unsigned bound is an upper bound —
-            // the join must cover every incoming value). Each pred's
-            // `icmp` fact qualifies its own edge args.
+            // Edge args → this block's params: `max` over every incoming
+            // edge — a pred's matching edges included (an unsigned bound is
+            // an upper bound; the join must cover every incoming value).
+            // `brif c, b(0), b(x)` binds the param to either arg: a `min`
+            // there bounded it by 0 and ovkill2 folded `icmp eq p, -1` in
+            // uiua's `derive_sortedness` (an `Ordering` of -1, 2026-10-22).
+            // Each pred's `icmp` fact qualifies its own edge args (facts
+            // only exist for a single matching edge).
             let ebnd = |pe: &BoundsMap, f: &BoundsMap, v: Value| {
                 let v = func.dfg.resolve_aliases(v);
                 f.get(&v)
@@ -7207,7 +7211,7 @@ pub(crate) fn entry_b(
                                 })
                         })
                         .map(|v| ebnd(&pe, &fact, v))
-                        .min();
+                        .max();
                     bv = match (bv, eb) {
                         (Some(a), Some(e)) => Some(a.max(e)),
                         _ => None,
