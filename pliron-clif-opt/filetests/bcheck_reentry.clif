@@ -1,0 +1,64 @@
+; test bcheck
+; The versioned loop's exit path is cloned with it: E defines v, J returns
+; it. A is absorbed in the same round as J, so the inner loop I behind A
+; only becomes a boundary target afterwards — and I uses no region value
+; itself, so the leak walk never seeded it. The clone of A then jumped to
+; the shared I, which re-enters the *original* J, whose `v` the clone path
+; never defined ("uses value from non-dominating inst"; zopfli
+; `encode_tree_no_output` in nushell's build). A shared block re-entering
+; an absorbed block must be absorbed too.
+; check: return
+; check-not: non-dominating
+function %reentry(i64, i64, i64, i8, i8, i8, i8, i8) -> i64 {
+block0(v0: i64, v1: i64, v2: i64, v3: i8, v4: i8, v5: i8, v6: i8, v7: i8):
+    v10 = iconst.i64 0
+    v11 = iconst.i64 1
+    v12 = iconst.i64 4
+    jump block1(v10)
+
+block1(v20: i64):
+    v21 = icmp ult v20, v2
+    brif v21, block2, block5
+
+block2:
+    v22 = icmp ult v20, v1
+    brif v22, block3, block4
+
+block4 cold:
+    trap user2
+
+block3:
+    v23 = imul v20, v12
+    v24 = iadd v0, v23
+    v25 = load.i32 notrap v24
+    v26 = iadd v20, v11
+    jump block1(v26)
+
+block5:
+    v30 = iadd v20, v12
+    brif v3, block6, block10(v20)
+
+block6:
+    brif v4, block7(v20), block9(v20)
+
+block7(v40: i64):
+    brif v5, block8, block9(v40)
+
+block8:
+    v41 = isub v40, v11
+    jump block7(v41)
+
+block9(v50: i64):
+    brif v6, block11(v50), block10(v50)
+
+block11(v60: i64):
+    brif v7, block12, block10(v60)
+
+block12:
+    v61 = isub v60, v11
+    jump block11(v61)
+
+block10(v70: i64):
+    v71 = iadd v70, v30
+    return v71
+}

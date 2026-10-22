@@ -951,10 +951,24 @@ fn closed_region(
         // target's cone through an earlier absorb), so the result is a
         // superset of the old fixpoint — conservative, and may hit the
         // region cap one round sooner.
+        // A shared block with an edge back into an absorbed (non-body)
+        // block leaks too: the clone reaches it, then re-enters the
+        // *original* absorbed block, whose uses of region values the clone
+        // path never defined (zopfli `encode_tree_no_output`: an exit
+        // path's inner loop jumped back into a block reading an exit-block
+        // def). Edges into `body` are the header's entries — the guard
+        // re-chooses the version there.
+        let reenters = |x: Block| {
+            cfg.succ_iter(x)
+                .any(|s| region.contains(&s) && !body.contains(&s))
+        };
         let mut reached: FxHashSet<Block> = FxHashSet::default();
         let mut stack: Vec<Block> = Vec::new();
         for b in func.layout.blocks() {
-            if !region.contains(&b) && uses_region(func, b) && reached.insert(b) {
+            if !region.contains(&b)
+                && (uses_region(func, b) || reenters(b))
+                && reached.insert(b)
+            {
                 stack.push(b);
             }
         }
