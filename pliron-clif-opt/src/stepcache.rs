@@ -193,7 +193,7 @@ pub(crate) fn enabled() -> bool {
 /// producer choice nondeterministic only over identical results.
 fn mem_on() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| config().is("PLIRON_MEMCACHE", "1") && !bisecting());
+        std::sync::LazyLock::new(|| config().enabled("PLIRON_MEMCACHE") && !bisecting());
     *ON
 }
 
