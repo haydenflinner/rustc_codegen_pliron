@@ -53,6 +53,6 @@ llvm_bin=$(bench_bin)
 # Cargo's fingerprint does not cover the backend dylib, so without this the
 # flag-identical second build would reuse the stale artifact. `cargo rustc`
 # args are fingerprinted though, so only the bench crate itself is removed.
-cargo clean -p pliron-bench
+cargo clean -p pliron-bench --profile bench
 plir_bin=$(bench_bin -Z "codegen-backend=$PWD/target/debug/$lib")
 "$plir_bin" --bench --baseline llvm "$@"
