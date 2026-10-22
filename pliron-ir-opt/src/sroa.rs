@@ -353,7 +353,7 @@ pub(crate) struct AccMemo {
     /// `slot_loads` results per (resolved alloca, depth) — a hot temp
     /// slot otherwise re-walks its whole copy-out closure for every
     /// `store *q <- p` use.
-    loads: FxHashMap<(Value, u32), Option<Vec<Value>>>,
+    loads: FxHashMap<(Value, u32, Option<i64>), Option<Vec<Value>>>,
     /// `gep_offset` per op — a GEP re-visited under another root or
     /// depth re-decodes its index attr otherwise.
     geps: FxHashMap<Ptr<Operation>, Option<i64>>,
@@ -403,19 +403,35 @@ pub(crate) fn slot_loads(
     depth: u32,
     memo: &mut AccMemo,
 ) -> Option<Vec<Value>> {
+    slot_loads_at(ctx, st, dst, Some(0), depth, memo)
+}
+
+/// `slot_loads` with the pointer stored at `at` bytes past `dst` (None =
+/// unknown): integer loads overlapping those bytes carry it too.
+fn slot_loads_at(
+    ctx: &Context,
+    st: &State,
+    dst: Value,
+    at: Option<i64>,
+    depth: u32,
+    memo: &mut AccMemo,
+) -> Option<Vec<Value>> {
+    // `off`: where in the slot the pointer lands (None = unknown).
     let mut q = dst;
+    let mut off = at;
     while !st.allocas.contains(q) {
         let op = q.defining_op()?;
         if !Operation::is_op::<GetElementPtrOp>(op, ctx) {
             return None;
         }
+        off = off.zip(gep_offset_m(ctx, st, op, memo)).map(|(a, b)| a + b);
         q = op.deref(ctx).get_operand(ctx, 0);
     }
-    if let Some(r) = memo.loads.get(&(q, depth)) {
+    if let Some(r) = memo.loads.get(&(q, depth, off)) {
         return r.clone();
     }
-    let r = slot_loads_inner(ctx, st, q, depth, memo);
-    memo.loads.insert((q, depth), r.clone());
+    let r = slot_loads_inner(ctx, st, q, depth, off, memo);
+    memo.loads.insert((q, depth, off), r.clone());
     r
 }
 
@@ -424,6 +440,7 @@ fn slot_loads_inner(
     st: &State,
     q: Value,
     depth: u32,
+    off: Option<i64>,
     memo: &mut AccMemo,
 ) -> Option<Vec<Value>> {
     let &(qsize, _) = st.allocas.get(q)?;
@@ -433,7 +450,15 @@ fn slot_loads_inner(
         match qa.kind {
             Kind::Load => {
                 let r = qa.op.deref(ctx).get_result(ctx, 0);
-                if matches!(classify(ctx, r.get_type(ctx)), TyK::Ptr) {
+                // An integer load overlapping the pointer's bytes carries it
+                // too: stored elsewhere it is a byte copy of the pointer
+                // (`extract_if` returning `&mut self.length` through i64
+                // scratch slots, serde_json test_retain, 2026-10-21).
+                let overlaps = || {
+                    let n = size_align(ctx, r.get_type(ctx)).0 as i64;
+                    off.is_none_or(|o| (qa.off as i64) < o + 8 && o < qa.off as i64 + n)
+                };
+                if matches!(classify(ctx, r.get_type(ctx)), TyK::Ptr) || overlaps() {
                     loads.push(r);
                 } else if r
                     .uses_iter(ctx)
@@ -450,7 +475,8 @@ fn slot_loads_inner(
                 // The bytes were memcpy'd into another slot — the stored
                 // pointer may come back at the destination's loads.
                 let d = qa.op.deref(ctx).get_operand(ctx, 0);
-                loads.extend(slot_loads(ctx, st, d, depth + 1, memo)?);
+                let at = off.map(|o| o - qa.off as i64);
+                loads.extend(slot_loads_at(ctx, st, d, at, depth + 1, memo)?);
             }
             _ => return None,
         }

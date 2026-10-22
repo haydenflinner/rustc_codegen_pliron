@@ -399,3 +399,84 @@ pub fn run(ctx: &Context, st: &mut State) {
     }
     st.nocapture = nc.into_iter().collect();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Exts, FuncInfo};
+    use cranelift_module::Linkage;
+    use pliron::builtin::op_interfaces::SymbolOpInterface;
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::op::Op;
+    use pliron::parsable::parse_from_str;
+    use pliron_llvm::ops::{AllocaOp, FuncOp};
+
+    /// `p` goes through an 8-byte temp slot, comes back as an `i64` and is
+    /// stored to `out` — a byte copy of the pointer. Only pointer-typed
+    /// slot loads were tracked, so `p` came out `nocapture`; serde_json's
+    /// `BTreeMap::extract_if` (whose iterator holds `&mut self.length`)
+    /// then let callers keep the map's length across `ExtractIf::next`.
+    #[test]
+    fn int_copy_through_slot_captures() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {
+          ^e(p: llvm.ptr (0), out: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            s = llvm.alloca [builtin.integer i64 x one] : llvm.ptr (0);
+            llvm.store *s <- p;
+            w = llvm.load s : builtin.integer i64;
+            llvm.store *out <- w;
+            llvm.return
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let mut st = State::default();
+        for fop in blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+        {
+            let Some(f) = Operation::get_op::<FuncOp>(fop, ctx) else {
+                continue;
+            };
+            for b in blocks(ctx, fop) {
+                for o in crate::inline::ops(ctx, b) {
+                    if Operation::is_op::<AllocaOp>(o, ctx) {
+                        st.allocas.insert(o.deref(ctx).get_result(ctx, 0), (8, 8));
+                    }
+                }
+            }
+            let sym = f.get_symbol_name(ctx).to_string();
+            st.ident_to_sym.insert(sym.clone(), sym.clone());
+            st.funcs.insert(
+                sym,
+                FuncInfo {
+                    op: fop,
+                    ty: f.get_type(ctx).into(),
+                    linkage: Linkage::Local,
+                    exts: Exts::default(),
+                    no_inline: false,
+                    always_inline: false,
+                    inline_hint: false,
+                    cold: false,
+                    nounwind: false,
+                    odr: false,
+                    sret_ty: None,
+                    frozen: Vec::new(),
+                    noalias: Vec::new(),
+                    nonnull: Vec::new(),
+                    nparams: 2,
+                },
+            );
+        }
+        run(ctx, &mut st);
+        let nc = st.nocapture.get("f").expect("f analyzed");
+        assert!(!nc.contains(&0), "p escaped as i64 bytes but stayed nocapture");
+        assert!(nc.contains(&1), "out is only written through");
+    }
+}
