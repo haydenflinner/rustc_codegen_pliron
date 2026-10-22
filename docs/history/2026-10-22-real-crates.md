@@ -35,9 +35,32 @@ test that fails without it.
   - rapier 155/155 and rune 607/2 match stock.
   - prql 543/15 matches stock, built with its own `lto = true`.
 - Open:
-  - **uiua:** `tests/optimized.ua` fails. The only culprit is
-    `Shape::extend_from_slice` (`SmallVec<[usize; 2]>`), and a standalone
-    smallvec 1.15 program does not reproduce it.
+  - **uiua:** `tests/optimized.ua` fails. Root cause is localized, not
+    yet fixed.
+    - **Culprit:** the only culprit function is `Shape::extend_from_slice`,
+      which wraps `SmallVec<[usize; 2]>::extend_from_slice` (smallvec
+      1.15, `union` feature). The bad unit is CLIF `loadfwd`
+      (`PLIRON_OPT_BISECT=633` under
+      `PLIRON_OPT_FNS=~5Shape17extend_from_slice`).
+    - **What goes wrong:** the capacity load `v0+16` before
+      `call try_reserve(v0, n)` is forwarded to the reload after the
+      call, so the reload sees the stale pre-grow capacity.
+    - **Which path:** in `loadfwd`'s call kill (`op.is_call()` arm), the
+      location survives through the *region* retention
+      (`invreg` + `in_region(cur, …)`). Disabling only that clause fixes
+      uiua; the iso/ncc/invs clauses are innocent.
+    - **Why it isn't fixed yet:** the region-frozen claim on `self`'s
+      capacity is wrong somewhere upstream (region facts from IR:
+      `block_region`/`region_parent`/`operand_frozen`), or the call kill
+      must drop region immunity for locs whose root the call is handed.
+      That's the call-site twin of 8205c7f's same-root store rule.
+      Blanket-dropping it would also lose valid forwards across
+      read-only calls handed a frozen `&T`.
+    - **Repro:** `clif-check` replay doesn't reproduce it, because the
+      corpus header lacks the region facts. Rebuild uiua with the probe
+      in the session scratchpad (`touch src/lib.rs`, `cargo test --release
+      --lib`, `tests::suite --exact`). A standalone smallvec program
+      doesn't reproduce it either (no region facts).
   - **nushell:** ICE in cranelift's egraph ("elaborating effectful
     instructions") on `std::thread` spawn closures for
     `nu_command::filters::tee::copy_on_thread`. The CLIF that lowering
