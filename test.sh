@@ -272,9 +272,9 @@ t_xcgufnptr() {
 }
 
 t_selmul() {
-  # Late select-chain folds and the madd carry (both opt-in): output must
-  # match stock LLVM rustc's.
-  PLIRON_SELCHAIN=1 PLIRON_MULCARRY=1 rustc $BE --edition 2021 -O tests/selmul/main.rs -o $out/selmul$exe && $out/selmul$exe | diff --strip-trailing-cr - tests/selmul/expected.out
+  # Late select-chain folds, the madd carry, the stepped exit compare and
+  # same-loop remat (all opt-in): output must match stock LLVM rustc's.
+  PLIRON_SELCHAIN=1 PLIRON_MULCARRY=1 PLIRON_STEPCMP=1 PLIRON_REMATLOOP=0 rustc $BE --edition 2021 -O tests/selmul/main.rs -o $out/selmul$exe && $out/selmul$exe | diff --strip-trailing-cr - tests/selmul/expected.out
 }
 
 t_retattr() {

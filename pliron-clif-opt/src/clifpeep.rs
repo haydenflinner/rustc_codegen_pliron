@@ -2676,6 +2676,69 @@ pub fn mulcarry(func: &mut Function) -> usize {
     n
 }
 
+/// `icmp eq/ne a, b` with `s = iadd a, K` earlier in the same block and
+/// `b = iadd e, -K` (or a constant) → `icmp eq/ne s, e` (`b + K`): equality
+/// survives the shift mod 2^w, so this always holds. A pointer loop testing
+/// `p != end-1` while stepping `p + 1` then tests the stepped register and
+/// `p` dies at the load, which isel folds into a post-indexed `ldrb` —
+/// otherwise the old `p` is rebuilt (`sub x, p', #1`) for the compare
+/// (parse_only's digit loop).
+pub fn stepcmp(func: &mut Function) -> usize {
+    let mut n = 0;
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        // `a -> (s, K)` for `s = iadd a, K` seen so far in this block.
+        let mut steps: FxHashMap<Value, (Value, i64)> = FxHashMap::default();
+        let mut cur = func.layout.first_inst(b);
+        while let Some(i) = cur {
+            cur = func.layout.next_inst(i);
+            match func.dfg.insts[i] {
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args,
+                } => {
+                    let r = func.dfg.first_result(i);
+                    for j in 0..2 {
+                        if let Some(k) = iconst(func, args[j ^ 1]) {
+                            steps.entry(func.dfg.resolve_aliases(args[j])).or_insert((r, k));
+                        }
+                    }
+                }
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond: cond @ (IntCC::Equal | IntCC::NotEqual),
+                    args,
+                } => {
+                    let args = args.map(|a| func.dfg.resolve_aliases(a));
+                    let hit = (0..2).find_map(|j| {
+                        let (sv, k) = *steps.get(&args[j])?;
+                        let bv = args[j ^ 1];
+                        let di = func.dfg.value_def(bv).inst()?;
+                        if let InstructionData::Binary {
+                            opcode: Opcode::Iadd,
+                            args: [e, kv],
+                        } = func.dfg.insts[di]
+                            && iconst(func, kv).is_some_and(|k2| k2.wrapping_add(k) == 0)
+                        {
+                            return Some((sv, func.dfg.resolve_aliases(e)));
+                        }
+                        None
+                    });
+                    if let Some((sv, e)) = hit {
+                        func.dfg.insts[i] = InstructionData::IntCompare {
+                            opcode: Opcode::Icmp,
+                            cond,
+                            args: [sv, e],
+                        };
+                        n += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
 /// `select c, (x + a), (x + b)` with both adds single-use: `(x, a, b)`.
 fn sel_common_add(
     func: &Function,

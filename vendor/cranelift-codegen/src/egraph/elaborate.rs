@@ -440,6 +440,17 @@ impl<'a> Elaborator<'a> {
             {
                 return false;
             }
+            // PLIRON_REMATLOOP=0: nor into another block of the def's own
+            // loop — the def already runs every trip, so the copy is a
+            // second execution per iteration to shorten one live range
+            // (parse_only's `byte - '0'` recomputed past the digit test).
+            static REMATLOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*REMATLOOP.get_or_init(|| std::env::var_os("PLIRON_REMATLOOP").is_none_or(|v| v != "0"))
+                && let Some(lp) = loop_analysis.innermost_loop(arg.in_block)
+                && loop_analysis.innermost_loop(insert_block) == Some(lp)
+            {
+                return false;
+            }
             let new_value = match remat_copies.entry((insert_block, arg.value)) {
                 HashEntry::Occupied(o) => *o.get(),
                 HashEntry::Vacant(v) => {

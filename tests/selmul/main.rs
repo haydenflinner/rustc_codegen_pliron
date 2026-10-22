@@ -1,5 +1,5 @@
-// Late select-chain folds (PLIRON_SELCHAIN) and the madd carry
-// (PLIRON_MULCARRY): compare chains decided by a sibling compare, selects
+// Late select-chain folds (PLIRON_SELCHAIN), the madd carry
+// (PLIRON_MULCARRY) and the stepped exit compare (PLIRON_STEPCMP): compare chains decided by a sibling compare, selects
 // over adds sharing an operand, and `acc * K + d` loops in the shapes
 // rustc's parsers produce. Output must match stock rustc's (expected.out).
 use std::hint::black_box;
@@ -160,7 +160,37 @@ fn parse_only(n: u64) -> u64 {
     acc
 }
 
+// Exit tests against `end - K` and against constants, with the pointer
+// or counter stepped by K before the test (stepcmp's shift).
+#[inline(never)]
+fn step_exits(v: &[u8]) -> (u64, u64, u64) {
+    let (mut a, mut b, mut c) = (0u64, 0u64, 0u64);
+    let mut i = 0usize;
+    while i != v.len().wrapping_sub(1) && i < v.len() {
+        a = a.wrapping_mul(7).wrapping_add(v[i] as u64);
+        i += 1;
+    }
+    let mut j = 3usize;
+    while j != 3 + v.len() / 2 * 2 {
+        b = b.wrapping_add(v[j - 3] as u64 * j as u64);
+        j += 2;
+    }
+    let mut k = black_box(250u8);
+    loop {
+        c = c.wrapping_mul(3).wrapping_add(k as u64);
+        if k == 4 {
+            break;
+        }
+        k = k.wrapping_add(1);
+    }
+    (a, b, c)
+}
+
 fn main() {
+    for n in [0usize, 1, 2, 9, 64] {
+        let v: Vec<u8> = (0..n).map(|i| black_box((i * 29 % 256) as u8)).collect();
+        println!("step_exits {n} {:?}", step_exits(&v));
+    }
     println!("eqbug {}", eqbug(black_box(70_000)));
     println!("parse_only {}", parse_only(black_box(1000)));
     println!("compares {}", compares());

@@ -1998,6 +1998,10 @@ fn s_clifpeep(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_stepcmp(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::stepcmp(&mut p.clctx.func)
+}
+
 fn s_mulcarry(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::mulcarry(&mut p.clctx.func)
 }
@@ -4119,6 +4123,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             },
             site: std::sync::OnceLock::new(),
         },
+        // After everything: the `end + -1` bound and the stepped pointer
+        // only settle into one block at the end (parse_only).
+        step("stepcmp", "", Gate::OptIn("PLIRON_STEPCMP"), s_stepcmp).needs(shape::LOOPS),
     ]
 });
 
