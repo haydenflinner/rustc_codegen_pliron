@@ -70,15 +70,22 @@ fn needs_body<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
         return true;
     };
     match inst.def {
-        InstanceKind::Item(def_id) => !matches!(
-            tcx.opt_item_name(def_id),
-            Some(
-                rustc_span::sym::rotate_left
-                    | rustc_span::sym::rotate_right
-                    | rustc_span::sym::unchecked_funnel_shl
-                    | rustc_span::sym::unchecked_funnel_shr
-            )
-        ),
+        // Only the *intrinsics* by those names: `core::num::<impl
+        // usize>::rotate_left` (an ordinary `#[inline]` method) needs its
+        // body like any other callee. Matching the bare name exempted it,
+        // and a copied `FxBuildHasher::hash_one` called a `rotate_left`
+        // that was internal in its home CGU: undefined symbol at link
+        // (nushell `nu-cmd-lang` tests, 2026-10-22).
+        InstanceKind::Item(def_id) => !(tcx.intrinsic(def_id).is_some()
+            && matches!(
+                tcx.opt_item_name(def_id),
+                Some(
+                    rustc_span::sym::rotate_left
+                        | rustc_span::sym::rotate_right
+                        | rustc_span::sym::unchecked_funnel_shl
+                        | rustc_span::sym::unchecked_funnel_shr
+                )
+            )),
         InstanceKind::Shim(_) => true,
         _ => false,
     }
@@ -102,11 +109,34 @@ fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
 
 /// Instances from other CGUs to define here as internal copies.
 pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
-    if crate::pass_enabled("PLIRON_XCGU_FIXPOINT") {
+    let mut out = if crate::pass_enabled("PLIRON_XCGU_FIXPOINT") {
         copies_fixpoint(tcx, cgu)
     } else {
         copies_legacy(tcx, cgu)
+    };
+    // Debug: `PLIRON_XCGU_ONLY=@file` keeps only copies whose symbol is
+    // listed (delta-debug a copy-caused miscompile with fnbisect's `--names`;
+    // dropping a copy another one needs can fail to link);
+    // `PLIRON_XCGU_LOG=file` appends every copied symbol.
+    if let Some(only) = crate::env_get("PLIRON_XCGU_ONLY")
+        && let Some(path) = only.strip_prefix('@')
+    {
+        let keep: FxHashSet<String> = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        out.retain(|&i| keep.contains(tcx.symbol_name(i).name));
     }
+    if let Some(log) = crate::env_get("PLIRON_XCGU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+            for &i in &out {
+                let _ = writeln!(f, "{}", tcx.symbol_name(i).name);
+            }
+        }
+    }
+    out
 }
 
 fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {

@@ -259,6 +259,12 @@ t_invokeblk() {
   printf 'drop 3\n12\ndrop 1000\ncaught true\n' | diff - $out/invokeblk.out
 }
 
+t_xcgurot() {
+  # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
+  # intrinsic) must be copied too, or the link fails (undefined symbol).
+  rustc $BE --edition 2021 -Copt-level=1 -C codegen-units=16 tests/xcgurot/main.rs -o $out/xcgurot$exe && $out/xcgurot$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -519,6 +525,7 @@ want sroa && t_sroa
 want inlinecm && t_inlinecm
 want retattr && t_retattr
 want invokeblk && t_invokeblk
+want xcgurot && t_xcgurot
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute
