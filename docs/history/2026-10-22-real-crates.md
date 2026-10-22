@@ -29,61 +29,24 @@ test that fails without it.
 | prql `test_append_select_multiple` | extra SQL column | slotmerge: reads through a container (closure env) didn't keep the slot live across the loop; self-loops weren't backedges | 8f9c780 |
 | nushell (nu_command `copy_on_thread`) | ICE, cranelift egraph | ops after a mid-block invoke (inliner, sroa reloads, sret2reg) were credited to the pad by block dominance → sroa-fwd into cleanup | fa11870 |
 | uiua `Shape::extend_from_slice` | stale SmallVec capacity | CLIF block merges kept an inlined `&self` helper's region tag; regions now derive from instructions | c035f52 |
+| uiua `derive_sortedness` | `Ordering::Less` folded away | ovkill bounds took the `min` over a pred's edges to one block (`brif c, b(0), b(x)`) | 914fb36 |
+| nushell `nu-cmd-lang` tests | undefined `usize::rotate_left` at link | xcgu exempted every fn *named* `rotate_left` from needing a body | 8f7845c |
+| uiua `prim_docs` (xlsx) | `free`: pointer not allocated | xcgu copied `extern "C"` allocator callbacks that zlib-rs compares by address | b850c03 |
 
-## Status at the end of the run
+## Status (2026-10-22, 13:56)
 
-- Tiers 1 and 2: all 31 crates match stock (2026-10-21 run).
-- Tier 3:
-  - rapier 155/155 and rune 607/2 match stock.
-  - prql 543/15 matches stock, built with its own `lto = true`.
-- Open:
-  - **uiua:** `tests/optimized.ua` fails. Root cause is localized, not
-    yet fixed.
-    - **Culprit:** the only culprit function is `Shape::extend_from_slice`,
-      which wraps `SmallVec<[usize; 2]>::extend_from_slice` (smallvec
-      1.15, `union` feature). The bad unit is CLIF `loadfwd`
-      (`PLIRON_OPT_BISECT=633` under
-      `PLIRON_OPT_FNS=~5Shape17extend_from_slice`).
-    - **What goes wrong:** the capacity load `v0+16` before
-      `call try_reserve(v0, n)` is forwarded to the reload after the
-      call, so the reload sees the stale pre-grow capacity.
-    - **Which path:** in `loadfwd`'s call kill (`op.is_call()` arm), the
-      location survives through the *region* retention
-      (`invreg` + `in_region(cur, …)`). Disabling only that clause fixes
-      uiua; the iso/ncc/invs clauses are innocent.
-    - **Why it isn't fixed yet:** the region-frozen claim on `self`'s
-      capacity is wrong somewhere upstream (region facts from IR:
-      `block_region`/`region_parent`/`operand_frozen`), or the call kill
-      must drop region immunity for locs whose root the call is handed.
-      That's the call-site twin of 8205c7f's same-root store rule.
-      Blanket-dropping it would also lose valid forwards across
-      read-only calls handed a frozen `&T`.
-    - **Repro:** `clif-check` replay doesn't reproduce it, because the
-      corpus header lacks the region facts. Rebuild uiua with the probe
-      in the session scratchpad (`touch src/lib.rs`, `cargo test --release
-      --lib`, `tests::suite --exact`). A standalone smallvec program
-      doesn't reproduce it either (no region facts).
-  - **nushell:** ICE in cranelift's egraph ("elaborating effectful
-    instructions") on `std::thread` spawn closures for
-    `nu_command::filters::tee::copy_on_thread`. The CLIF that lowering
-    produces is already invalid (a use of a non-dominating value), so this
-    is another IR-level bug. Clean bisect (probes one at a time, after the
-    domcheck fix):
-    - **Culprit:** sroa-fwd unit 16899 under
-      `PLIRON_OPT_FNS=~14copy_on_thread`, a nu-command-only rebuild of
-      about 16 s.
-    - **The forward:** single-store alloca `v356845`, stored
-      `v356899 = load v357633` in `entry_block45780` (an inlined callee
-      entry). One load in `block13831` is forwarded.
-    - **Why it's puzzling:** in the IR text CFG the store block dominates
-      the load, and the value is a plain load, not an invoke result. Yet
-      the pre-pipeline CLIF has a non-dominating use, `v262` on a
-      `jump block8(...)`.
-    - **Next step:** take the IR diff between `PLIRON_OPT_BISECT=16898`
-      and `16899` (`PLIRON_DUMP_OPT=1`) and check how lowering orders or
-      places that block. A landing-pad edge into `block13831`'s cone that
-      the domtree still misses is the remaining suspect.
-  - **makepad:** the package list needed pruning; not yet run green.
+- Tiers 1 and 2: 31 crates, all match stock (2026-10-21 run). A rerun against
+  the 2026-10-22 fixes was in progress at this point.
+- Tier 3: all six apps match stock.
+
+| app | result |
+|---|---|
+| uiua | 22/0 |
+| nushell | 3504/4 |
+| rapier | 155/0 |
+| prql | 543/15, with its own `lto = true` |
+| rune | 607/2 |
+| makepad | 21/14 |
 
 ## Lessons for the next hunt
 
@@ -97,5 +60,13 @@ These are also in the agent memory notes.
 - **"First CLIF step broke the function" means the bug is earlier.**
   Verify the pre-pipeline CLIF: twice tonight it was already invalid
   coming out of IR-opt/lowering.
+- **A silent SIGABRT in a test can hide its message.** The test harness
+  swallows the malloc/abort text, so rerun with `--nocapture`, or break on
+  `abort` in lldb and walk the frame-pointer chain (lldb's own unwinder
+  stops at `__pthread_kill`). This beat a 1-hour copy bisect by about
+  50 minutes.
+- **`PLIRON_XCGU=0` fixing a bug that `PLIRON_OPT_FNS=0..0` doesn't means a
+  cross-CGU copy is at fault, not an optimization.**
+  `PLIRON_XCGU_LOG`/`PLIRON_XCGU_ONLY` let fnbisect delta-debug the copies.
 - **Avoid running two heavy probes at once.** On this machine earlyoom
   kills one, and a bisect then counts the kill as a failure.
