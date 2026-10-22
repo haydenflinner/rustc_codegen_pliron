@@ -2104,6 +2104,13 @@ fn plan(
         if !masks.contains(&cv) && !can_vec.contains(&cv) {
             why!(fname; "early cond not lane-wise {:?}", info.h);
         }
+        // A data cond's nonzero-ness must survive the lane width.
+        if !masks.contains(&cv)
+            && func.dfg.value_type(cv).bits() > elem.bits()
+            && !ubits(func, cv).is_some_and(|w| w <= elem.bits())
+        {
+            why!(fname; "early cond wider than lanes {:?}", info.h);
+        }
         if eqchain_testable(func, cv) {
             why!(fname; "early cond is a cheap scalar bit test {:?}", info.h);
         }
@@ -4631,7 +4638,19 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 cv,
                 0,
             );
-            let m = if exits_true { pos.ins().bnot(m) } else { m };
+            // A data cond (`band x, 1` of a 0/1 select) holds {0,1}-style
+            // lanes, not a mask: `bnot` would make every lane nonzero, so
+            // compare against zero instead (rayon's split_ascii_whitespace
+            // skipped whole 64-byte groups).
+            let m = if p.masks.contains(&pos.func.dfg.resolve_aliases(cv)) {
+                if exits_true { pos.ins().bnot(m) } else { m }
+            } else {
+                let mt = pos.func.dfg.value_type(m);
+                let z = pos.ins().iconst(mt.lane_type(), 0);
+                let z = pos.ins().splat(mt, z);
+                let cc = if exits_true { IntCC::Equal } else { IntCC::NotEqual };
+                pos.ins().icmp(cc, m, z)
+            };
             let ty = pos.func.dfg.value_type(m);
             match exit_accs
                 .iter_mut()
