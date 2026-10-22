@@ -2330,7 +2330,14 @@ fn parse_macho_section(section: &str) -> (&str, &str, u32) {
     let Some(sec) = parts.next() else {
         return ("", section, 0);
     };
-    let ty = parts.next().unwrap_or("regular");
+    // No type given: LLVM reuses the section MCObjectFileInfo predefined
+    // under that name, so `__DATA,__mod_init_func` (the `ctor` crate's
+    // spelling) is a constructor list dyld runs, not S_REGULAR data.
+    let ty = parts.next().unwrap_or(match (seg, sec) {
+        ("__DATA", "__mod_init_func") => "mod_init_funcs",
+        ("__DATA", "__mod_term_func") => "mod_term_funcs",
+        _ => "regular",
+    });
     let mut flags = TYPES
         .iter()
         .find(|(n, _)| *n == ty)
