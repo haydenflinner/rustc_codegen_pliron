@@ -758,7 +758,10 @@ fn dem64_emit(func: &mut Function, v32: &mut FxHashMap<Value, Value>, v: Value) 
                 let b = dem64_m32(&mut pos, v32, args[2]);
                 pos.ins().bitselect(c, a, b)
             } else {
-                let c = args[0];
+                // A demoted cond is sub-2^32 (`Dem64Use::Cond`), so its
+                // twin tests the same truth; otherwise keep the i64 cond.
+                let c = pos.func.dfg.resolve_aliases(args[0]);
+                let c = v32.get(&c).copied().unwrap_or(c);
                 let t = dem64_m32(&mut pos, v32, args[1]);
                 let f = dem64_m32(&mut pos, v32, args[2]);
                 if opcode == Opcode::Select {
@@ -918,14 +921,19 @@ pub fn dem64(func: &mut Function) -> usize {
                 func.dfg.insts[i],
                 InstructionData::Load { .. } | InstructionData::LoadNoOffset { .. }
             );
-            for &a in func.dfg.inst_args(i) {
+            let sel = matches!(op, Opcode::Select | Opcode::SelectSpectreGuard);
+            for (ai, &a) in func.dfg.inst_args(i).iter().enumerate() {
                 let a = func.dfg.resolve_aliases(a);
                 if func.dfg.value_type(a) != types::I64 {
                     continue;
                 }
                 let k = match op {
                     Opcode::Ireduce => Dem64Use::Reduce,
+                    // A select's condition is a truth test like `brif`'s,
+                    // not a low-word data read (tokio `ScheduledIo::wake`:
+                    // the demoted select kept reading the removed i64 cond).
                     Opcode::Brif => Dem64Use::Cond,
+                    _ if sel && ai == 0 => Dem64Use::Cond,
                     Opcode::Icmp => Dem64Use::Cmp(i),
                     _ if web && !is_load => Dem64Use::Web(i),
                     _ => Dem64Use::Hard,
@@ -1057,6 +1065,11 @@ pub fn dem64(func: &mut Function) -> usize {
                 {
                     sinks.push(i)
                 }
+                // A select left i64 whose cond demoted (a `Cond` use).
+                InstructionData::Ternary {
+                    opcode: Opcode::Select | Opcode::SelectSpectreGuard,
+                    args,
+                } if v32.contains_key(&func.dfg.resolve_aliases(args[0])) => sinks.push(i),
                 _ => {}
             }
         }
@@ -1077,6 +1090,13 @@ pub fn dem64(func: &mut Function) -> usize {
                     &mut pos.func.dfg.insts[u]
                 {
                     *a2 = [a, b];
+                    n += 1;
+                }
+            }
+            InstructionData::Ternary { args, .. } => {
+                let m = v32[&func.dfg.resolve_aliases(args[0])];
+                if let InstructionData::Ternary { args: a2, .. } = &mut func.dfg.insts[u] {
+                    a2[0] = m;
                     n += 1;
                 }
             }
