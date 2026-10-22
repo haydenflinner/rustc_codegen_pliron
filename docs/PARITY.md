@@ -25,6 +25,25 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 | compile time: regex-syntax, wasm32 (one CGU) | **1.02** (2.65 s vs 2.60 s) | ~parity (2026-10-21) |
 | compile time: syn 2 + `full` (~50 kLOC) | **1.09** (3.49 s vs 3.21 s) | behind (2026-10-21; was 15-22) |
 
+**Windows i7 re-measure 2026-10-22** (`dd96cb3`, box ~60% loaded —
+noisy): native geomean ~1.09 pre-fix; wasm 0.961→0.955 after `ovkill2`
+(chars_ascii +34.6→+21%, still behind; tokenize +14%, strwork +15%,
+hashmap +12%, fib +13%; parse_only/contains_rng/iterw/matmul ahead).
+ctime (release dylib): kernels 0.69, kernels-wasm 1.38, regex-syntax
+1.05, regex-wasm 0.95, **syn 1.71** (worst row — worth a profile).
+cubecl `throughput` (warm cache, extreme variance): f32 ~parity
+(422 vs 440 GOPS), f16 clif ~4x faster (LLJIT f16 broken on Windows),
+bf16 inconclusive (clif 47-620 GOPS across runs vs llvm ~280-580),
+copy 23 vs 34 GB/s, read 40 vs 14 (clif ahead), write ~parity.
+Fixed this session: `bench/run.sh`'s `cargo clean -p` needed
+`--profile bench` — Oct-16 bench binaries had survived every run
+since; and `icmp eq v, -1` decode-tree checks surviving to codegen
+(`vmax_d` `ishl`/`ireduce` arms + `ovkill2` late step: chars_ascii
+native +34% → ~parity). Open: contains_rng is a missed vectorization —
+LLVM emits SSE2 `pcmpgtd` count loops; `loopvec` analyzes the loop
+(`mems=[(Load,0)]`) but declines; sortw/nbody/parse_only +20-29% also
+unexplained (partly layout noise on a loaded box).
+
 Older measurements on the Windows i7 box (native 1.028, wasm 1.157) are
 in `docs/history/PERF-REPORT.md`; the narrative of how each kernel got
 here is `docs/performance.md`. Windows i7 wasm (post `br_if` fold +
