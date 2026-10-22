@@ -65,7 +65,22 @@ test that fails without it.
     instructions") on `std::thread` spawn closures for
     `nu_command::filters::tee::copy_on_thread`. The CLIF that lowering
     produces is already invalid (a use of a non-dominating value), so this
-    is another IR-level bug.
+    is another IR-level bug. Clean bisect (probes one at a time, after the
+    domcheck fix):
+    - **Culprit:** sroa-fwd unit 16899 under
+      `PLIRON_OPT_FNS=~14copy_on_thread`, a nu-command-only rebuild of
+      about 16 s.
+    - **The forward:** single-store alloca `v356845`, stored
+      `v356899 = load v357633` in `entry_block45780` (an inlined callee
+      entry). One load in `block13831` is forwarded.
+    - **Why it's puzzling:** in the IR text CFG the store block dominates
+      the load, and the value is a plain load, not an invoke result. Yet
+      the pre-pipeline CLIF has a non-dominating use, `v262` on a
+      `jump block8(...)`.
+    - **Next step:** take the IR diff between `PLIRON_OPT_BISECT=16898`
+      and `16899` (`PLIRON_DUMP_OPT=1`) and check how lowering orders or
+      places that block. A landing-pad edge into `block13831`'s cone that
+      the domtree still misses is the remaining suspect.
   - **makepad:** the package list needed pruning; not yet run green.
 
 ## Lessons for the next hunt
