@@ -17,7 +17,10 @@ cranelift-frontend = "0.135.5"
 cranelift-module = "0.135.5"
 cranelift-object = "0.135.5"
 target-lexicon = "0.13"
-object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf", "macho"] }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf", "macho", "archive"] }
+# The fat-LTO payload format (src/lto.rs).
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
 smallvec = "1"
 egg = "0.10"
 ascent = { version = "0.8", default-features = false }

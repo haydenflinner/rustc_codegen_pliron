@@ -391,6 +391,9 @@ pub fn lower_to_object(
         let x86 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
         crate::objmerge::assemble_into(&mut product.object, &asm, x86);
     }
+    if let Some(p) = &st.lto_payload {
+        crate::objmerge::add_lto_section(&mut product.object, p);
+    }
     product.emit().unwrap()
 }
 

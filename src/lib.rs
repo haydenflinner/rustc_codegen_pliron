@@ -29,6 +29,7 @@ mod cgupool;
 mod consts;
 mod context;
 mod intrinsic;
+mod lto;
 mod simd;
 mod type_of;
 mod types;
@@ -977,9 +978,12 @@ impl CodegenBackend for PlironCodegenBackend {
         if pliron_cfg::env_set("PLIRON_VERSION") {
             eprintln!("pliron backend {}", env!("PLIRON_SRC_REV"));
         }
-        // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
+        // No ThinLTO: rustc then never runs thin-local LTO at opt-level > 0,
+        // and `-Clto=thin` falls back to fat LTO (`lto.rs`), with a warning.
         rustc_session::CodegenBackendInit {
             thin_lto_supported: false,
+            // The fork's knob drops LTO requests entirely; the self-hosted
+            // build keeps doing that until fat LTO is verified in-tree.
             #[cfg(rustc_in_tree)]
             fat_lto_supported: false,
             ..Default::default()
@@ -1298,21 +1302,25 @@ impl ExtraBackendMethods for PlironCodegenBackend {
         &self,
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
-        _bitcode_needed: bool,
+        bitcode_needed: bool,
     ) -> (ModuleCodegen<PlironModule>, u64) {
         let start = std::time::Instant::now();
         let dep_node = tcx.codegen_unit(cgu_name).codegen_dep_node(tcx);
         let (module, _) = tcx.dep_graph.with_task(
             dep_node,
             tcx,
-            || module_codegen(tcx, cgu_name),
+            || module_codegen(tcx, cgu_name, bitcode_needed),
             Some(rustc_middle::dep_graph::hash_result),
         );
         (module, start.elapsed().as_nanos() as u64)
     }
 }
 
-fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
+fn module_codegen(
+    tcx: TyCtxt<'_>,
+    cgu_name: Symbol,
+    bitcode_needed: bool,
+) -> ModuleCodegen<PlironModule> {
     let tmod = std::time::Instant::now();
     let _smod = tracing::info_span!(target: "pliron::module", "module", cgu = %cgu_name).entered();
     let _pgmod = tcx
@@ -1322,6 +1330,9 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
     let cgu = tcx.codegen_unit(cgu_name);
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
     cx.st.borrow_mut().cgu = cgu_name.to_string();
+    // rustc wants "bitcode" in this CGU's object (an rlib a later -Clto
+    // link may read, `-Clinker-plugin-lto`, ...): embed our LTO payload.
+    cx.st.borrow_mut().lto_payload = bitcode_needed.then(lto::embedded_payload);
     cx.st.borrow_mut().xcgufn_kill = env_is("PLIRON_XCGUFN_KILL", "1");
     cx.st.borrow_mut().deadunopt_on = pass_enabled("PLIRON_DEADUNOPT");
     cx.st.borrow_mut().earlydead =
@@ -1493,15 +1504,16 @@ impl WriteBackendMethods for PlironCodegenBackend {
 
     fn optimize_and_codegen_fat_lto(
         sess: &Session,
-        _cgcx: &CodegenContext,
-        _shared_emitter: &SharedEmitter,
+        cgcx: &CodegenContext,
+        shared_emitter: &SharedEmitter,
         _tm_factory: TargetMachineFactoryFn<Self>,
+        // No internalization yet: every symbol stays as visible as it was
+        // in its own object, and the final link's dead-stripping prunes.
         _exported_symbols_for_lto: &[String],
-        _each_linked_rlib_for_lto: &[PathBuf],
-        _modules: Vec<FatLtoInput<Self>>,
+        each_linked_rlib_for_lto: &[PathBuf],
+        modules: Vec<FatLtoInput<Self>>,
     ) -> CompiledModule {
-        sess.dcx()
-            .fatal("LTO is not supported by the pliron backend")
+        lto::fat(sess, cgcx, shared_emitter, each_linked_rlib_for_lto, modules)
     }
 
     fn run_thin_lto(
@@ -1512,7 +1524,8 @@ impl WriteBackendMethods for PlironCodegenBackend {
         _each_linked_rlib_for_lto: &[PathBuf],
         _modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
-        dcx.fatal("LTO is not supported by the pliron backend")
+        // `thin_lto_supported: false` makes rustc fall back to fat LTO.
+        dcx.fatal("ThinLTO is not supported by the pliron backend")
     }
 
     fn optimize(
@@ -1538,7 +1551,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
         _tm_factory: TargetMachineFactoryFn<Self>,
         _thin: ThinModule<Self>,
     ) -> CompiledModule {
-        unimplemented!("LTO is not supported by the pliron backend")
+        unreachable!("ThinLTO is not supported by the pliron backend (no ThinModules)")
     }
 
     fn codegen(
@@ -1563,7 +1576,14 @@ impl WriteBackendMethods for PlironCodegenBackend {
     }
 
     fn serialize_module(module: PlironModule, _is_thin: bool) -> PlironBuffer {
-        PlironBuffer(module.obj)
+        // Pre-LTO module files (incremental + -Clto): the object by value.
+        PlironBuffer(
+            lto::LtoPayload::new(vec![lto::LtoObject {
+                name: String::new(),
+                bytes: module.obj,
+            }])
+            .encode(),
+        )
     }
 }
 

@@ -55,7 +55,8 @@ Developed mainly on aarch64-apple-darwin; x86_64 Linux and x86_64 Windows (MSVC,
   `examples/bevy-game/hot.sh` is the edit loop: save `src/main.rs`, the patch builds in ~1.2s and applies in ~50ms, and ECS state is kept. `tests/hot/run.sh` is a smoke test.
   Limits: x86_64 ELF only, no new thread-locals in patches, changed struct layouts need a restart.
 - Self-hosting: a pliron-built stage1 rustc builds a working stage2 compiler (`selfhost/`).
-- Not done yet: debuginfo, LTO.
+- LTO: `-Clto` / Cargo `lto = true` builds and links (`-Clto=thin` falls back to fat), but without cross-crate optimization yet: the fat-LTO module is a relocatable link (`cc -r`) of the crate's objects and every upstream rlib's (`src/lto.rs`), so the result matches a non-LTO build. Not on MSVC or wasm targets (a clear error there).
+- Not done yet: debuginfo, cross-crate (real) LTO.
 
 ## wasm32
 

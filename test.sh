@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro wasm pgo
+#   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
@@ -399,6 +399,42 @@ t_proc_macro() {
       rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user$exe && $out/pm_user$exe
 }
 
+t_lto() {
+  # Fat LTO (-Clto): rustc leaves upstream Rust objects off the link line and
+  # expects the backend's single LTO module to carry the whole crate graph
+  # (src/lto.rs). main -> mid -> base: cross-crate generics, a #[used]
+  # constructor nothing references, TLS, unwinding both ways across the
+  # boundary, std. Built at O0 and -O, without and with -Clto, plus a -Clto
+  # staticlib driven from C.
+  local d=$out/lto o lto; rm -rf $d; mkdir -p $d
+  local r="rustc $BE --edition 2024"
+  local ext="--extern base=$d/libbase.rlib --extern mid=$d/libmid.rlib -L $d"
+  for o in -Copt-level=0 -O; do
+    $r $o --crate-type rlib --crate-name base tests/lto/base.rs -o $d/libbase.rlib &&
+      $r $o --crate-type rlib --crate-name mid tests/lto/mid.rs --extern base=$d/libbase.rlib \
+        -o $d/libmid.rlib || return 1
+    for lto in -Clto=no -Clto; do
+      $r $o $lto tests/lto/main.rs $ext -o $d/main$exe &&
+        $d/main$exe | diff --strip-trailing-cr - tests/lto/expected.out ||
+        { echo "lto: main $o $lto failed" >&2; return 1; }
+    done
+  done
+  # rlib objects carry the LTO payload section; linked images never do.
+  $llvmod -h $d/libbase.rlib | grep -q pliron_lto ||
+    { echo "lto: no payload section in libbase.rlib" >&2; return 1; }
+  if $llvmod -h $d/main$exe | grep -q pliron_lto; then
+    echo "lto: payload section leaked into the executable" >&2; return 1
+  fi
+  printf '%s\n' '#[unsafe(no_mangle)]' 'pub extern "C" fn lto_entry(x: u32) -> u32 {' \
+    '    let r = std::panic::catch_unwind(|| base::checked(x)).unwrap_or(1);' \
+    '    r + mid::sums().0 as u32 + base::total(&[x as u16]) as u32' '}' > $d/slib.rs
+  printf '%s\n' '#include <stdio.h>' 'unsigned lto_entry(unsigned);' \
+    'int main(void) { printf("%u %u\n", lto_entry(2), lto_entry(9)); return 0; }' > $d/cmain.c
+  $r -O -Clto --crate-type staticlib $d/slib.rs $ext -o $d/libslib.a &&
+    cc $d/cmain.c $d/libslib.a -lpthread -ldl -lm -o $d/cmain &&
+    [[ "$($d/cmain 2>/dev/null | tail -1)" == "278 266" ]] || { echo "lto: staticlib leg failed" >&2; return 1; }
+}
+
 t_wasm_smoke() {
   # Emit pipeline only: leaf crates -> pliron wasm objects -> pliron-wasm-ld
   # -> node. No -Zbuild-std, so ~seconds; the std-through-pliron legs are
@@ -479,6 +515,8 @@ want commute && t_commute
 want xpack && t_xpack
 want loopvec && t_loopvec
 want proc_macro && t_proc_macro
+# Windows: link.exe has no relocatable link, so -Clto is a clean error there.
+[[ -z "$exe" ]] && want lto && t_lto
 want pgo && t_pgo
 [[ -n "$sysroot" ]] && want sysroot && t_sysroot
 [[ -n "$mold" ]] && want mold && t_mold

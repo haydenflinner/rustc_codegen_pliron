@@ -447,6 +447,10 @@ pub struct State {
     /// `bodied`/`opt_body` pass skips them instead of optimizing bodies
     /// that are only emitted for link safety.
     pub earlydead: bool,
+    /// Encoded LTO payload to embed in the native object (rustc asked for
+    /// "bitcode" in this module: rlibs that a later `-Clto` link reads).
+    /// `objmerge::add_lto_section` writes it; `src/lto.rs` owns the format.
+    pub lto_payload: Option<Vec<u8>>,
     /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
     pub notrap: bool,
     /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).

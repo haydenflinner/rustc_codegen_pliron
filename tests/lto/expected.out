@@ -1,0 +1,18 @@
+ctor ran = 1
+sums = (256, 70005)
+total u16 = 66600
+rect 2x3 -> 6
+shape -> 2.25
+histogram = {"brown": 1, "dog": 1, "end": 1, "fox": 1, "jumps": 1, "lazy": 1, "over": 1, "quick": 1, "the": 3}
+answer = 41259
+drop base::checked
+checked(2) = Ok(20)
+hook: base panic 7
+drop base::checked
+checked(7) caught = true
+depth inside = 2 (arg 12)
+hook: main panic at 12
+drop mid::nested
+nested caught = true, depth after = 0
+drop mid::nested
+nested ok = 13

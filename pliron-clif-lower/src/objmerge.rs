@@ -190,3 +190,39 @@ where
         }
     }
 }
+
+/// Section that carries the backend's LTO payload (`src/lto.rs`) in a
+/// native object, as `(segment, section)`. Like LLVM's embedded bitcode it
+/// is for rustc's `-Clto` step only and never reaches a linked image:
+/// Mach-O linkers drop the `__LLVM` segment (ld64 and ld-prime, `-r`
+/// included), ELF linkers drop `SHF_EXCLUDE` sections, COFF ones drop
+/// `IMAGE_SCN_LNK_REMOVE` sections.
+pub fn lto_section_name(format: BinaryFormat) -> (&'static [u8], &'static [u8]) {
+    match format {
+        BinaryFormat::MachO => (b"__LLVM", b"__pliron_lto"),
+        _ => (b"", b".pliron.lto"),
+    }
+}
+
+/// Embed `payload` in `out` (see `lto_section_name`).
+pub fn add_lto_section(out: &mut write::Object<'static>, payload: &[u8]) {
+    let format = out.format();
+    let (seg, name) = lto_section_name(format);
+    let id = out.add_section(seg.to_vec(), name.to_vec(), SectionKind::Other);
+    out.append_section_data(id, payload, 1);
+    match format {
+        BinaryFormat::Elf => {
+            out.section_mut(id).flags = object::SectionFlags::Elf {
+                sh_flags: object::elf::SHF_EXCLUDE as u64,
+            }
+        }
+        BinaryFormat::Coff => {
+            out.section_mut(id).flags = object::SectionFlags::Coff {
+                characteristics: object::pe::IMAGE_SCN_LNK_REMOVE
+                    | object::pe::IMAGE_SCN_LNK_INFO
+                    | object::pe::IMAGE_SCN_ALIGN_1BYTES,
+            }
+        }
+        _ => {}
+    }
+}
