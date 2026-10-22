@@ -782,6 +782,14 @@ pub fn deadend(func: &Function, b: Block) -> bool {
     true
 }
 
+/// `deadend` for a block of `info`'s body. A body block reaches the header,
+/// so it's a dead end only when the whole loop is — a cleanup loop on an
+/// unwind path (rayon's ZST `CollectResult` drop loop before `resume`),
+/// whose effects are observable. Such a loop has no skippable blocks.
+pub fn body_deadend(func: &Function, info: &Info, b: Block) -> bool {
+    deadend(func, b) && !deadend(func, info.h)
+}
+
 /// Exit edge `e` is never taken because its `brif` arg is a constant
 /// selecting the in-loop destination (a folded-away interior test).
 pub fn never_taken(func: &Function, e: Edge) -> bool {
@@ -1281,7 +1289,7 @@ pub fn plan(
     let mut store: Option<Inst> = None;
     let mut load: Option<Inst> = None;
     for &b in &info.body {
-        if deadend(func, b) {
+        if body_deadend(func, &info, b) {
             continue;
         }
         for i in func.layout.block_insts(b) {
@@ -1986,7 +1994,7 @@ fn plan_dead(
     let mut loads = Vec::new();
     let mut stores = Vec::new();
     for &b in &info.body {
-        if deadend(func, b) {
+        if body_deadend(func, &info, b) {
             continue;
         }
         for i in func.layout.block_insts(b) {

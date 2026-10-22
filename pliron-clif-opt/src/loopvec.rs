@@ -31,7 +31,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::loadfwd::{self, Root};
 use crate::loopidiom::{
-    Count, Edge, Info, Ins, Param, Pred, count, deadend, deepest_first, def_block, edge_args,
+    Count, Edge, Info, Ins, Param, Pred, body_deadend, count, deepest_first, def_block, edge_args,
     edge_dest, emit, gather, guard_dead, guard_pred, iconst, ins_eval, never_taken, outv,
     param_kinds, trips_idx, trips_ptr,
 };
@@ -1434,7 +1434,7 @@ fn plan(
             .body
             .iter()
             .flat_map(|&b| func.layout.block_insts(b))
-            .filter(|&i| !deadend(func, func.layout.inst_block(i).unwrap()))
+            .filter(|&i| !body_deadend(func, &info, func.layout.inst_block(i).unwrap()))
             .any(|i| {
                 if allowed.contains(&i) || !func.dfg.inst_args(i).iter().any(|&a| is_acc_arg(a)) {
                     return false;
@@ -1658,7 +1658,7 @@ fn plan(
     for b in func
         .layout
         .blocks()
-        .filter(|b| info.body.contains(b) && !deadend(func, *b))
+        .filter(|b| info.body.contains(b) && !body_deadend(func, &info, *b))
         .collect::<Vec<_>>()
     {
         for i in func.layout.block_insts(b) {
