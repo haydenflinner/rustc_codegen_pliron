@@ -43,10 +43,12 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
         if !seen.insert(b) {
             continue;
         }
-        // Only the terminator carries successor edges (invokes included).
+        // Invokes are non-terminator CallOps (see `domcheck::succs`).
+        for op in b.deref(ctx).iter(ctx) {
+            work.extend(st.invokes.get(op).map(|&(l, _)| l));
+        }
         if let Some(t) = b.deref(ctx).iter(ctx).last() {
             work.extend(t.deref(ctx).successors(ctx));
-            work.extend(st.invokes.get(t).map(|&(l, _)| l));
         }
     }
     seen

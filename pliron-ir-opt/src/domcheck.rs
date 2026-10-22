@@ -28,10 +28,16 @@ pub fn run(ctx: &Context, st: &State, pass: &str) {
 
 fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
     let mut v = Vec::new();
-    // Only the terminator carries successor edges (invokes included).
+    // An invoke is a non-terminator CallOp (`call; br then`) whose landing
+    // pad lives in `st.invokes`, so every op is looked up; successor lists
+    // live only on the terminator. Checking just the terminator left every
+    // pad "unreachable": sroa-fwd then forwarded a store into cleanup code
+    // the unwind edge reaches around it (scraper/selectors, 2026-10-22).
+    for op in b.deref(ctx).iter(ctx) {
+        v.extend(st.invokes.get(op).map(|&(l, _)| l));
+    }
     if let Some(t) = b.deref(ctx).iter(ctx).last() {
         v.extend(t.deref(ctx).successors(ctx));
-        v.extend(st.invokes.get(t).map(|&(l, _)| l));
     }
     v
 }
@@ -233,5 +239,63 @@ impl Dom {
     pub fn idom(&self, b: Ptr<BasicBlock>) -> Option<Ptr<BasicBlock>> {
         let i = self.rpo_idx(b)?;
         (self.idom[i] != i).then(|| self.order[self.idom[i]])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline::{blocks, ops};
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::op::Op;
+    use pliron::parsable::parse_from_str;
+    use pliron_llvm::ops::{CallOp, FuncOp};
+
+    /// An invoke is `call; br then` with its pad in `st.invokes` keyed by
+    /// the *call*. With only the terminator looked up, the pad and the
+    /// cleanup behind it were unreachable, and sroa-fwd forwarded a store
+    /// the unwind path bypasses into a load there (scraper in nushell's
+    /// build: "uses value from non-dominating block" after lowering).
+    #[test]
+    fn invoke_pad_is_reachable() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @callee: llvm.func <llvm.void () variadic = false> [] {
+          ^e():
+            llvm.return
+          };
+          llvm.func @f: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            c = llvm.call @callee () : llvm.func <llvm.void () variadic = false>;
+            llvm.br ^next()
+          ^next():
+            llvm.return
+          ^pad():
+            llvm.return
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let f = blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .filter(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .last()
+            .unwrap();
+        let bs = blocks(ctx, f);
+        let (entry, pad) = (bs[0], bs[2]);
+        let call = ops(ctx, entry)
+            .into_iter()
+            .find(|&o| Operation::is_op::<CallOp>(o, ctx))
+            .unwrap();
+        let mut st = State::default();
+        st.invokes.insert(call, (pad, false));
+        let dom = Dom::new(ctx, &st, f).unwrap();
+        assert!(dom.contains(pad), "landing pad of a non-terminator invoke is unreachable");
+        assert!(dom.dominates(entry, pad));
     }
 }
