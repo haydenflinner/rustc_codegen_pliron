@@ -19,6 +19,7 @@ pub mod domcheck;
 pub mod guardelim;
 pub mod inline;
 pub mod instcombine;
+pub mod lutcorr;
 pub mod memcpyopt;
 pub mod nnret;
 pub mod nocapture;

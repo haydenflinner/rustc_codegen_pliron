@@ -41,7 +41,7 @@ mod xcgu;
 pub use pliron_clif_lower::{eh, hot, lower, obj_sym, objmerge};
 pub use pliron_clif_opt::*;
 pub use pliron_ir_opt::{
-    address_taken, callgvn, constload, domcheck, guardelim, has_body, inline, instcombine,
+    address_taken, callgvn, constload, domcheck, guardelim, has_body, inline, instcombine, lutcorr,
     memcpyopt, nnret, nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
     xoridem,
 };
