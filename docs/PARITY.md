@@ -29,8 +29,13 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 noisy): native geomean ~1.09 pre-fix; wasm 0.961→0.955 after `ovkill2`
 (chars_ascii +34.6→+21%, still behind; tokenize +14%, strwork +15%,
 hashmap +12%, fib +13%; parse_only/contains_rng/iterw/matmul ahead).
-ctime (release dylib): kernels 0.69, kernels-wasm 1.38, regex-syntax
-1.05, regex-wasm 0.95, **syn 1.71** (worst row — worth a profile).
+ctime (release dylib, first run): kernels 0.69, kernels-wasm 1.38,
+regex-syntax 1.05, regex-wasm 0.95, syn 1.71. **After this session's
+compile-time fixes** (slp incremental uses 7.5→1.6s, `PLIRON_MEMCACHE`
+default-on, looprot pre-check reorder): kernels 0.55, kernels-wasm
+1.14, regex-syntax 0.98, regex-wasm 0.96, syn 1.37 (still worst;
+remaining = jumpthread/ifconv2/etc on giant parse fns — trailer_helper
+alone is ~1.8s of a 30 CPU-s corpus).
 cubecl `throughput` (warm cache, extreme variance): f32 ~parity
 (422 vs 440 GOPS), f16 clif ~4x faster (LLJIT f16 broken on Windows),
 bf16 inconclusive (clif 47-620 GOPS across runs vs llvm ~280-580),
