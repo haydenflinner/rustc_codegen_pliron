@@ -15,3 +15,14 @@ Changed:
 
 `modifier_symbols` already marked these TLS and adds
 `_GLOBAL_OFFSET_TABLE_` where needed, matching gas behavior.
+
+Pliron patch: AArch64 CRC32 instructions.
+
+`crc32{,c}{b,h,w,x}` (FEAT_CRC32) were unknown mnemonics; zlib-rs's ACLE
+path writes them in `asm!` (uiua build, 2026-10-21).
+
+Changed:
+- src/arch/aarch64/insn.rs: `crc32` encoder (two-source data-processing,
+  opcode `010 C sz`; `x` forms take Xm and set sf), listed in `handwritten`.
+- tests/aarch64.rs: `crc32` encodings checked against llvm-mc; three of the
+  mnemonics join the random-operand fuzz list.

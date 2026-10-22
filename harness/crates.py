@@ -30,6 +30,8 @@ TOOLCHAIN = "nightly-2026-10-06"
 # test-only path deps, so build from the tagged repo (`-p name` from its
 # root; the repo's own workspace stays intact).
 REGEX_GIT = "https://github.com/rust-lang/regex"
+# git spec flag: the args select packages themselves — no `-p name`.
+WS = "ws"
 CRATES = [
     ("ryu", "1.0.23", [], 1),
     ("itoa", "1.0.18", [], 1),
@@ -66,7 +68,29 @@ CRATES = [
      ("https://github.com/tokio-rs/tokio", "tokio-1.54.1")),
     ("serde_json", "1.0.154", [], 2),
     ("toml", "1.1.8+spec-1.1.0", [], 2),
+    # Tier 3: whole applications, cloned from the local checkouts at a
+    # pinned commit (never the working tree: it may hold uncommitted
+    # edits). Test commands follow each project's CI; `ver` is the commit.
+    ("uiua", "637789911eae", ["--lib"], 3,
+     (os.path.expanduser("~/code/uiua"), "637789911eae71316cd818fa81b25213724a437d", WS)),
+    ("nushell", "4c175fa99ad9", ["--workspace", "--all-targets"], 3,
+     (os.path.expanduser("~/code/nushell"), "4c175fa99ad90fc3f60b20c5935137fd17a1e7b5", WS)),
+    ("rapier", "a306004de244", [], 3,
+     (os.path.expanduser("~/code/rapier"), "a306004de2445e0f955b8568c62724ef2313f712", WS)),
+    ("prql", "28bbf13c0482", ["-p", "prqlc", "-p", "prqlc-parser"], 3,
+     (os.path.expanduser("~/code/prql"), "28bbf13c0482bd1acfa18211a1808822077c21f5", WS)),
+    ("rune", "f67a45eac99e", ["--all-targets", "--all-features"], 3,
+     (os.path.expanduser("~/code/rune"), "f67a45eac99ed609facc2b11d75352e556ffa0a0", WS)),
+    # makepad's own tests live in its vendored libs and draw/platform crates.
+    ("makepad", "e72677c88036", ["-p", "makepad-ttf-parser", "-p", "makepad-rustybuzz",
+                                 "-p", "makepad-zune-jpeg", "-p", "makepad-zune-png",
+                                 "-p", "makepad-miniz", "-p", "makepad-vector",
+                                 "-p", "makepad-live-compiler", "-p", "makepad-shader-compiler",
+                                 "-p", "makepad-draw", "-p", "makepad-script-test"], 3,
+     (os.path.expanduser("~/code/makepad-upstream"), "e72677c8803646971526bfc0caf0998c743d1efb", WS)),
 ]
+# Per-side timeouts for the applications (seconds); the rest use --timeout.
+TIMEOUTS = {"nushell": 7200, "rune": 5400, "makepad": 5400}
 
 TEST_LINE = re.compile(r"^test (.+?) (?:- should panic )?\.\.\. (ok|FAILED|ignored)$")
 RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed")
@@ -75,16 +99,22 @@ RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed")
 CRASH = re.compile(r"process didn't exit successfully: .*\((signal: \d+[^)]*)\)")
 
 
-def fetch_git(name, ver, url, tag):
+def fetch_git(name, ver, url, tag, *_):
     d = os.path.join(OUT, "src", f"{name}-{ver}-git")
     if not os.path.exists(os.path.join(d, "Cargo.toml")):
         os.makedirs(os.path.dirname(d), exist_ok=True)
-        subprocess.run(["git", "-c", "advice.detachedHead=false", "clone", "-q", "--depth", "1",
-                        "--branch", tag, url, d], check=True)
+        if re.fullmatch(r"[0-9a-f]{40}", tag):
+            # A commit (local checkout): clone, then detach at it.
+            subprocess.run(["git", "clone", "-q", "--no-checkout", url, d], check=True)
+            subprocess.run(["git", "-c", "advice.detachedHead=false", "-C", d, "checkout", "-q",
+                            tag], check=True)
+        else:
+            subprocess.run(["git", "-c", "advice.detachedHead=false", "clone", "-q", "--depth",
+                            "1", "--branch", tag, url, d], check=True)
         # A single-crate repo has no workspace table: without one, cargo
         # adopts it into ours (it sits under our target/).
         manifest = os.path.join(d, "Cargo.toml")
-        if "[workspace]" not in open(manifest).read():
+        if not re.search(r"^(\[workspace\]|workspace\.)", open(manifest).read(), re.M):
             with open(manifest, "a") as f:
                 f.write("\n[workspace]\n")
     return d
@@ -195,7 +225,8 @@ def main():
         try:
             if git:
                 src = fetch_git(name, ver, *git[0])
-                args = ["-p", name] + args
+                if WS not in git[0][2:]:
+                    args = ["-p", name] + args
             else:
                 src = fetch(name, ver)
         except Exception as e:
@@ -203,7 +234,8 @@ def main():
             continue
         row = {"crate": f"{name}-{ver}"}
         for side in ("stock", "pliron"):
-            r, log = run_tests(src, side, args, lib, a.jobs, a.timeout, not a.debug)
+            r, log = run_tests(src, side, args, lib, a.jobs, TIMEOUTS.get(name, a.timeout),
+                               not a.debug)
             open(os.path.join(OUT, "logs", f"{name}.{side}.log"), "w").write(log)
             row[side] = r
         only_p = sorted(set(row["pliron"]["fails"]) - set(row["stock"]["fails"]))

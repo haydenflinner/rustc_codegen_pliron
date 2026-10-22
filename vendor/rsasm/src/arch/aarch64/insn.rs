@@ -304,6 +304,14 @@ pub(crate) fn handwritten(mnemonic: &str) -> bool {
                 | "umsubl"
                 | "sdiv"
                 | "udiv"
+                | "crc32b"
+                | "crc32h"
+                | "crc32w"
+                | "crc32x"
+                | "crc32cb"
+                | "crc32ch"
+                | "crc32cw"
+                | "crc32cx"
                 | "rbit"
                 | "rev"
                 | "rev16"
@@ -448,6 +456,8 @@ pub fn assemble(
         }
         "madd" | "msub" | "smaddl" | "umaddl" | "smsubl" | "umsubl" => madd(cx, &i),
         "sdiv" | "udiv" => div(cx, &i),
+        "crc32b" | "crc32h" | "crc32w" | "crc32x" | "crc32cb" | "crc32ch" | "crc32cw"
+        | "crc32cx" => crc32(cx, &i),
 
         "rbit" | "rev" | "rev16" | "rev32" | "rev64" | "clz" | "cls" => dp1(cx, &i),
 
@@ -1373,6 +1383,40 @@ fn div(cx: &mut AsmCtx<'_>, i: &Insn<'_, '_>) -> Option<Vec<Variant>> {
         | 0x1ac0_0000
         | field(rm.num as u32, 16, 5)
         | field(opcode, 10, 6)
+        | field(rn.num as u32, 5, 5)
+        | field(rd.num as u32, 0, 5))
+}
+
+/// `crc32{,c}{b,h,w,x} Wd, Wn, {Wm|Xm}` (FEAT_CRC32): the two-source
+/// data-processing group, opcode `010 C sz`. Only the `x` forms take an X
+/// data register (and set `sf`); the accumulator is always W.
+fn crc32(cx: &mut AsmCtx<'_>, i: &Insn<'_, '_>) -> Option<Vec<Variant>> {
+    i.arity(cx, &[3]).then_some(())?;
+    let rd = i.gpr(cx, 0)?;
+    let rn = i.gpr(cx, 1)?;
+    let rm = i.gpr(cx, 2)?;
+    let tail = i.mnemonic.trim_start_matches("crc32");
+    let (c, sz) = match tail.strip_prefix('c') {
+        Some(t) => (1, t),
+        None => (0, tail),
+    };
+    let sz = match sz {
+        "b" => 0,
+        "h" => 1,
+        "w" => 2,
+        _ => 3,
+    };
+    let want = if sz == 3 { RegClass::X } else { RegClass::W };
+    if rd.class != RegClass::W || rn.class != RegClass::W || rm.class != want {
+        let m = if sz == 3 { "Wd, Wn, Xm" } else { "Wd, Wn, Wm" };
+        cx.error(i.span, &format!("`{}` takes {m}", i.mnemonic));
+        return None;
+    }
+    one(field(u32::from(sz == 3), 31, 1)
+        | 0x1ac0_4000
+        | field(rm.num as u32, 16, 5)
+        | field(c, 12, 1)
+        | field(sz, 10, 2)
         | field(rn.num as u32, 5, 5)
         | field(rd.num as u32, 0, 5))
 }

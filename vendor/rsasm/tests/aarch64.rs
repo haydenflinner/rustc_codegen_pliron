@@ -221,6 +221,21 @@ fn multiply_divide_and_variable_shifts() {
 }
 
 #[test]
+fn crc32() {
+    // llvm-mc -triple=aarch64 -mattr=+crc -show-encoding
+    check(&[
+        ("crc32b w0, w1, w2", "20 40 c2 1a"),
+        ("crc32h w0, w1, w2", "20 44 c2 1a"),
+        ("crc32w w0, w1, w2", "20 48 c2 1a"),
+        ("crc32x w0, w1, x2", "20 4c c2 9a"),
+        ("crc32cb w0, w1, w2", "20 50 c2 1a"),
+        ("crc32ch w0, w1, w2", "20 54 c2 1a"),
+        ("crc32cw w0, w1, w2", "20 58 c2 1a"),
+        ("crc32cx w3, w4, x5", "83 5c c5 9a"),
+    ]);
+}
+
+#[test]
 fn one_source_data_processing() {
     check(&[
         ("rbit x0, x1", "20 00 c0 da"),
@@ -923,7 +938,7 @@ fn random_operands_never_panic_or_vanish() {
         "ands", "orr", "eor", "bic", "orn", "eon", "tst", "mvn", "mov", "movz", "movn", "movk",
         "sbfm", "ubfm", "bfm", "sbfx", "ubfx", "bfxil", "sbfiz", "ubfiz", "bfi", "sxtb", "sxth",
         "sxtw", "uxtb", "uxth", "lsl", "lsr", "asr", "ror", "lslv", "extr", "mul", "madd", "msub",
-        "mneg", "smull", "umull", "smaddl", "umsubl", "smulh", "umulh", "sdiv", "udiv", "rbit",
+        "mneg", "smull", "umull", "smaddl", "umsubl", "smulh", "umulh", "sdiv", "udiv", "crc32b", "crc32x", "crc32cw", "rbit",
         "rev", "rev16", "rev32", "clz", "cls", "csel", "csinc", "csinv", "csneg", "cset", "csetm",
         "cinc", "cinv", "cneg", "ccmp", "ccmn", "b", "bl", "b.eq", "bne", "cbz", "cbnz", "tbz",
         "tbnz", "br", "blr", "ret", "eret", "adr", "adrp", "ldr", "str", "ldrb", "strb", "ldrh",

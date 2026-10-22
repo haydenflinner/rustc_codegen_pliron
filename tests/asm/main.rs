@@ -144,6 +144,22 @@ fn clmul() {
     }
 }
 
+/// zlib-rs's ACLE path spells the CRC instructions in `asm!` (uiua's build
+/// died: rsasm had no `crc32*`). Same checksums as the intrinsics.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32_asm() -> (u32, u32) {
+    let b8 = u64::from_le_bytes(*b"12345678");
+    let (mut c, mut cc) = (!0u32, !0u32);
+    unsafe {
+        std::arch::asm!("crc32x {c:w}, {c:w}, {d:x}", c = inout(reg) c, d = in(reg) b8);
+        for &b in b"12345678" {
+            std::arch::asm!("crc32cb {c:w}, {c:w}, {d:w}", c = inout(reg) cc, d = in(reg) b as u32);
+        }
+    }
+    (c ^ !0, cc ^ !0)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "crc")]
 unsafe fn crc32s() -> (u32, u32, u32, u32, u32, u32) {
@@ -275,6 +291,7 @@ fn main() {
         let r = unsafe { crc32s() };
         assert_eq!([r.0, r.1, r.2, r.3], [0x9ae0daaf; 4]);
         assert_eq!([r.4, r.5], [0x6087809a; 2]);
+        assert_eq!(unsafe { crc32_asm() }, (0x9ae0daaf, 0x6087809a));
         println!("crc32 ok");
     }
     neon_stubs();
