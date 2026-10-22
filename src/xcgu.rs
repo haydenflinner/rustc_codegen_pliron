@@ -117,7 +117,7 @@ pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<
     // Debug: `PLIRON_XCGU_ONLY=@file` keeps only copies whose symbol is
     // listed (delta-debug a copy-caused miscompile with fnbisect's `--names`;
     // dropping a copy another one needs can fail to link);
-    // `PLIRON_XCGU_LOG=file` appends every copied symbol.
+    // `PLIRON_XCGU_LOG=file` appends every copied symbol to `file.<pid>`.
     if let Some(only) = crate::env_get("PLIRON_XCGU_ONLY")
         && let Some(path) = only.strip_prefix('@')
     {
@@ -129,11 +129,16 @@ pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<
         out.retain(|&i| keep.contains(tcx.symbol_name(i).name));
     }
     if let Some(log) = crate::env_get("PLIRON_XCGU_LOG") {
+        // One file per process and one write per CGU: concurrent rustcs
+        // appending line by line interleaved names (`cat <log>.*`).
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-            for &i in &out {
-                let _ = writeln!(f, "{}", tcx.symbol_name(i).name);
-            }
+        let path = format!("{log}.{}", std::process::id());
+        let text: String = out
+            .iter()
+            .map(|&i| format!("{}\n", tcx.symbol_name(i).name))
+            .collect();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(text.as_bytes());
         }
     }
     out
