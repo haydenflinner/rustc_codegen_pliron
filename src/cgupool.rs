@@ -47,7 +47,7 @@ use rustc_span::fatal_error::FatalErrorMarker;
 
 use crate::context::{Exts, FuncInfo, State};
 use crate::pt;
-use crate::{abi, callgvn, constload, domcheck, guardelim, inline, instcombine, RustcProf};
+use crate::{abi, callgvn, constload, domcheck, guardelim, inline, instcombine, lutcorr, RustcProf};
 use crate::{env_get, env_is, env_set, wasm};
 use crate::{lower, memcpyopt, nnret, nocapture, nounwind, nowrite, pass_enabled, pgo, phisimp};
 use crate::{retarg, spec, sroa, willreturn, xoridem};
@@ -1100,6 +1100,13 @@ pub(crate) fn iropt_tail(
                 domcheck::run(ctx, st, "callgvn2")
             );
         }
+    }
+    // switch -> x*s + b + corr[x] (the corsix lookup-table-correction
+    // scheme): almost-linear switch results get a narrow correction-table
+    // load instead of a br_table jump.
+    if env_is("PLIRON_LUTCORR", "1") {
+        pt!(prof, cgu, "lutcorr", lutcorr::run(ctx, st));
+        pt!(prof, cgu, "domcheck:lc", domcheck::run(ctx, st, "lutcorr"));
     }
     pliron_clif_lower::scan::pass_flags(st);
     if pass_enabled("PLIRON_DEADFN") {
