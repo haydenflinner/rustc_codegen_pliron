@@ -82,12 +82,13 @@ CRATES = [
     ("rune", "f67a45eac99e", ["--all-targets", "--all-features"], 3,
      (os.path.expanduser("~/code/rune"), "f67a45eac99ed609facc2b11d75352e556ffa0a0", WS)),
     # makepad's own tests live in its vendored libs and draw/platform crates
-    # (not the ttf-parser/rustybuzz forks: their test targets still name the
-    # upstream crates and don't build under stock either).
+    # (not the ttf-parser/rustybuzz forks, whose test targets still name the
+    # upstream crates, nor makepad-draw, whose lib tests are stale: none of
+    # them build under stock either).
     ("makepad", "e72677c88036", ["-p", "makepad-zune-jpeg", "-p", "makepad-zune-png",
                                  "-p", "makepad-miniz", "-p", "makepad-vector",
                                  "-p", "makepad-live-compiler", "-p", "makepad-shader-compiler",
-                                 "-p", "makepad-draw", "-p", "makepad-script-test"], 3,
+                                 "-p", "makepad-script-test"], 3,
      (os.path.expanduser("~/code/makepad-upstream"), "e72677c8803646971526bfc0caf0998c743d1efb", WS)),
 ]
 # Per-side timeouts for the applications (seconds); the rest use --timeout.
