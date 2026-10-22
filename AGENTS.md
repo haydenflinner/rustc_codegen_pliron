@@ -125,11 +125,12 @@ time) in ~15 min and writes `target/parity/summary.md`.
   `clif-check report target/corpus/std out.json --check` runs the whole
   pipeline + an interpreter diff on every function in parallel (~7 s
   for std). Re-record after lowering or IR-opt changes.
-- **Real crates**: `harness/crates.py [--tier 1] [--only a,b]` runs pinned
+- **Real crates**: `harness/crates.py [--tier 1|2] [--only a,b]` runs pinned
   crates' own test suites (+ doc-tests, `--release`) under stock and
-  pliron and reports pliron-only failures (~10 min for tier 1; logs and
-  `report.md` in `target/crates/`). It found four miscompiles on its first
-  run. Narrow one with a probe script (touch the crate's `src/lib.rs`,
+  pliron and reports pliron-only failures, crashed test binaries included
+  (~10 min for tier 1, ~25 for tier 2's atomics/threads/async additions;
+  logs and `report.md` in `target/crates/`). Its first runs found seven
+  bugs. Narrow one with a probe script (touch the crate's `src/lib.rs`,
   rerun the failing test) → `harness/fnbisect.py` → `PLIRON_OPT_FNS=~fn
   PLIRON_OPT_BISECT=N` (licm load hoists are separate `licm-load` units).
 - **Live loop**: `harness/live/live.py` → http://localhost:8765. On

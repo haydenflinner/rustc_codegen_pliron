@@ -51,10 +51,28 @@ CRATES = [
     ("crc32fast", "1.5.3", [], 1),
     ("miniz_oxide", "0.9.1", [], 1),
     ("png", "0.18.1", [], 1),
+    # Tier 2: atomics, threads, async, heavier generics.
+    ("crossbeam-utils", "0.8.23", [], 2),
+    ("crossbeam-epoch", "0.9.21", [], 2),
+    ("crossbeam-deque", "0.8.8", [], 2),
+    ("crossbeam-queue", "0.3.14", [], 2),
+    ("crossbeam-channel", "0.5.17", [], 2),
+    ("parking_lot", "0.13.0", [], 2),
+    ("rayon-core", "1.13.0", [], 2),
+    ("rayon", "1.12.0", [], 2),
+    # The published package's tests don't build (tokio-test pulls a second
+    # tokio); the repo's workspace patches them to the path crate.
+    ("tokio", "1.54.1", ["--features", "full,test-util"], 2,
+     ("https://github.com/tokio-rs/tokio", "tokio-1.54.1")),
+    ("serde_json", "1.0.154", [], 2),
+    ("toml", "1.1.8+spec-1.1.0", [], 2),
 ]
 
 TEST_LINE = re.compile(r"^test (.+?) (?:- should panic )?\.\.\. (ok|FAILED|ignored)$")
 RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed")
+# A test binary killed by a signal prints no `FAILED` line for the test it
+# was running (serde_json's SIGILL), only cargo's exit report.
+CRASH = re.compile(r"process didn't exit successfully: .*\((signal: \d+[^)]*)\)")
 
 
 def fetch_git(name, ver, url, tag):
@@ -142,6 +160,9 @@ def run_tests(src, side, args, lib, jobs, timeout, release):
         m = TEST_LINE.match(line)
         if m and m.group(2) == "FAILED":
             res["fails"].append(f"{suite} :: {m.group(1)}")
+        m = CRASH.search(line)
+        if m:
+            res["fails"].append(f"{suite} :: <{m.group(1)}>")
         m = RESULT.match(line)
         if m:
             res["passed"] += int(m.group(1))
