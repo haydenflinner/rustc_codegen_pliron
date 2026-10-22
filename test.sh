@@ -265,6 +265,12 @@ t_xcgurot() {
   rustc $BE --edition 2021 -Copt-level=1 -C codegen-units=16 tests/xcgurot/main.rs -o $out/xcgurot$exe && $out/xcgurot$exe
 }
 
+t_xcgufnptr() {
+  # A non-Rust-ABI callback compared by address keeps one address under
+  # xcgu (no internal duplicate in other CGUs).
+  rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcgufnptr/main.rs -o $out/xcgufnptr$exe && $out/xcgufnptr$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -526,6 +532,7 @@ want inlinecm && t_inlinecm
 want retattr && t_retattr
 want invokeblk && t_invokeblk
 want xcgurot && t_xcgurot
+want xcgufnptr && t_xcgufnptr
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

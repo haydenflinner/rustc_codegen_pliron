@@ -45,6 +45,19 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     {
         return false;
     }
+    // Non-Rust-ABI fns are FFI entry points and callbacks, handled by
+    // address: a copy has its own address, so a pointer taken in this CGU
+    // no longer equals the one taken in the home CGU. zlib-rs picks its
+    // free path by `self.zfree == Allocator::RUST.zfree`; with
+    // `zalloc_rust`/`zfree_rust` copied, alloc and free disagreed and
+    // `deflateEnd` freed an over-aligned pointer (uiua's xlsx writer,
+    // 2026-10-22). They rarely matter to the inliner anyway.
+    if let InstanceKind::Item(def_id) = inst.def
+        && matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn)
+        && !tcx.fn_sig(def_id).skip_binder().abi().is_rustic_abi()
+    {
+        return false;
+    }
     tcx.size_estimate(inst) <= limit
 }
 
