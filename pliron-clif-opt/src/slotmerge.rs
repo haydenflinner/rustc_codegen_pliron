@@ -951,7 +951,8 @@ pub fn run(
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
             {
                 let v = bc.block(&func.dfg.value_lists);
-                if bpos[v] < bpos[b] {
+                // `<=`: a self-loop is a backedge too.
+                if bpos[v] <= bpos[b] {
                     spans.push((bfirst[v], blast[b]));
                     if crate::env_set("PLIRON_SM_INFO") {
                         eprintln!(
@@ -977,6 +978,19 @@ pub fn run(
     if !spans.is_empty() {
         let cfg = ControlFlowGraph::with_function(func);
         let dt = DominatorTree::with_function(func, &cfg);
+        // A read of a container is a read of every slot whose address it
+        // holds: the callee dereferences through it. prqlc's closure env
+        // held `&requirements`; the calls read only the env, so the
+        // once-written `requirements` slot looked fresh in the loop and
+        // `log` temps were merged onto it (2026-10-22).
+        let mut via: Vec<Vec<Inst>> = vec![Vec::new(); nslots];
+        for d in 0..nslots {
+            for &s in &contains[d] {
+                if s.index() < nslots {
+                    via[s.index()].extend(reads[d].iter().copied());
+                }
+            }
+        }
         for (s, e) in iv.iter_mut().enumerate() {
             if marked[s] {
                 continue;
@@ -985,7 +999,7 @@ pub fn run(
                 if !uses[s].iter().any(|&p| lo <= p && p <= hi) {
                     continue;
                 }
-                let fresh = reads[s].iter().all(|&r| {
+                let fresh = reads[s].iter().chain(&via[s]).all(|&r| {
                     let rp = ipos[r];
                     !(lo <= rp && rp <= hi)
                         || writes[s].iter().any(|&w| {
