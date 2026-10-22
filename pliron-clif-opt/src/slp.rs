@@ -39,25 +39,86 @@ use smallvec::SmallVec;
 /// pipeline's shared `uses::Uses` CSR snapshot (`Analysis::uses`) — one
 /// function walk serves every use-index consumer per IR version.
 /// `dead` tombstones insts this pass removed since the snapshot, so
-/// stale entries read as unused.
+/// stale entries read as unused. `extra`/`covers`/`snap` extend the
+/// snapshot incrementally across xpack applies: an apply only appends
+/// new insts, drops dead ones, and re-aliases operands, so recording
+/// the appended insts' uses plus a stale-resolution redirect keeps the
+/// index live instead of paying a whole-function rebuild per pack.
 struct Uses<'d> {
     shared: std::rc::Rc<crate::uses::Uses>,
     dead: &'d std::cell::RefCell<FxHashSet<Inst>>,
+    /// Uses recorded on insts minted since `shared` was built (inst
+    /// index >= `snap`), keyed by operand resolution at apply time.
+    extra: FxHashMap<u32, Vec<Inst>>,
+    /// `covers[q]` = resolutions whose recorded sites now resolve to
+    /// `q`: an operand re-aliased after the snapshot left its uses
+    /// under the old resolution. Chains are chased transitively by
+    /// `iter`.
+    covers: FxHashMap<u32, Vec<u32>>,
+    /// `dfg.num_insts()` when `shared` was fetched — insts at or above
+    /// this index postdate the snapshot.
+    snap: usize,
 }
 
 impl Uses<'_> {
     /// Insts using `v`, in layout order, minus tombstoned members.
+    /// `v` is a resolved value index; sites recorded under resolutions
+    /// that later re-aliased to `v` are included via `covers`.
     fn iter(&self, v: usize) -> impl Iterator<Item = Inst> + '_ {
-        self.shared
-            .sites_idx(v)
-            .iter()
-            .map(|&(_, i)| i)
-            .filter(|u| !self.dead.borrow().contains(u))
+        let dead = self.dead.borrow();
+        let mut out: Vec<Inst> = Vec::new();
+        // Resolution classes covered by `v`, chased transitively: a
+        // re-aliased operand's sites live under its snapshot class, and
+        // that class can itself be covered by a later apply.
+        let mut todo = vec![v as u32];
+        let mut i = 0;
+        while i < todo.len() {
+            let s = todo[i];
+            i += 1;
+            out.extend(self.shared.sites_idx(s as usize).iter().map(|&(_, i)| i));
+            if let Some(e) = self.extra.get(&s) {
+                out.extend(e.iter().copied());
+            }
+            if let Some(cs) = self.covers.get(&s) {
+                for &c in cs {
+                    if !todo.contains(&c) {
+                        todo.push(c);
+                    }
+                }
+            }
+        }
+        out.retain(|i| !dead.contains(i));
+        out.into_iter()
     }
 
     /// Tombstone `i` — it stays in the snapshot but reads as unused.
     fn remove(&self, i: Inst) {
         self.dead.borrow_mut().insert(i);
+    }
+
+    /// Fold one apply's edits into the index: uses on insts minted
+    /// since `snap`, plus `(old_res, new_res)` redirect entries for
+    /// operands that re-aliased (`old_res` resolved before the apply,
+    /// so its snapshot class joins `new_res`'s coverage).
+    fn note_apply(&mut self, func: &Function, re_alias: &[(u32, u32)]) {
+        let n = func.dfg.num_insts();
+        for i in self.snap..n {
+            let i = Inst::from_u32(i as u32);
+            if func.layout.inst_block(i).is_none() {
+                continue;
+            }
+            for v in func.dfg.inst_values(i) {
+                let k = func.dfg.resolve_aliases(v).index() as u32;
+                self.extra.entry(k).or_default().push(i);
+            }
+        }
+        self.snap = n;
+        for &(old, new) in re_alias {
+            if old == new {
+                continue;
+            }
+            self.covers.entry(new).or_default().push(old);
+        }
     }
 }
 
@@ -870,6 +931,9 @@ fn try_block<'d>(
                     let us = uses.get_or_insert_with(|| Uses {
                         shared: an.uses(func),
                         dead: dead_set,
+                        extra: FxHashMap::default(),
+                        covers: FxHashMap::default(),
+                        snap: func.dfg.num_insts(),
                     });
                     let plan = Ctx {
                         func: &*func,
@@ -2314,6 +2378,9 @@ fn xpack_block<'d>(
         let us = &*uses.get_or_insert_with(|| Uses {
             shared: an.uses(func),
             dead: dead_set,
+            extra: FxHashMap::default(),
+            covers: FxHashMap::default(),
+            snap: func.dfg.num_insts(),
         });
         if !failed.is_empty() {
             failed.retain(|&(x, y), span| match (pos_get(pos, x), pos_get(pos, y)) {
@@ -2448,9 +2515,19 @@ fn xpack_block<'d>(
         }
         pack_vals(&root, func, &mut changed_vals);
         let n_rows = kept.iter().map(|&(r, _)| r).max().unwrap() + 1;
+        // Snapshot resolutions of operands `apply_pair` is about to
+        // re-alias to extracts — `note_apply` redirects their recorded
+        // use sites to the extract results.
+        let mut re_alias: Vec<(u32, u32)> = extracts
+            .iter()
+            .map(|&(v, _, _)| (func.dfg.resolve_aliases(v).index() as u32, 0))
+            .collect();
         let n = apply_pair(
             func, &insts, emit_at, &root, vt, &kept, n_rows, &sink, &dead, &extracts, &keep,
         );
+        for ((_, new), &(v, _, _)) in re_alias.iter_mut().zip(&extracts) {
+            *new = func.dfg.resolve_aliases(v).index() as u32;
+        }
         // apply_pair removed the `dead` list and every non-`keep` lane
         // inst (sink stores were only repositioned — tombstoning *them*
         // would undercount real uses). Mark the removals so a stale
@@ -2520,8 +2597,12 @@ fn xpack_block<'d>(
                 !(hit(x) || hit(y))
             });
         }
-        // apply_pair moved/added insts — the shared map is stale.
-        *uses = None;
+        // apply_pair moved/added insts — extend the snapshot
+        // incrementally (new insts into `extra`, re-aliased operand
+        // classes into `covers`) instead of a whole-function rebuild.
+        if let Some(us) = uses.as_mut() {
+            us.note_apply(func, &re_alias);
+        }
     }
 }
 
