@@ -164,10 +164,6 @@ def run_tests(src, side, args, lib, jobs, timeout, release):
     tdir = os.path.join(OUT, f"target-{side}")
     env = dict(os.environ)
     env["CARGO_INCREMENTAL"] = "0"
-    # The backend has no LTO (rustc would skip upstream objects and expect
-    # their bitcode), so a workspace profile's `lto = true` (prql) is turned
-    # off -- for both sides, so they still build the same configuration.
-    env["CARGO_PROFILE_RELEASE_LTO"] = "false"
     env.pop("RUSTFLAGS", None)
     env.pop("RUSTDOCFLAGS", None)
     if side == "pliron":
