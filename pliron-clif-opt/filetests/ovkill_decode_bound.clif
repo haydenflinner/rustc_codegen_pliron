@@ -1,0 +1,40 @@
+; test ovkill
+; `icmp eq v, -1` where v is a UTF-8-style decode tree —
+; `bor (ishl (band x,7),18), (bor (ishl (band y,63),6), (band z,63))`
+; — bounds <= 0x1fffff, so the `-1` compare is dead. `vmax_d` needs
+; `ishl`/`ireduce` arms to see through it (`Chars::next`'s niche check).
+; check: iconst.i8 0
+; check-not: icmp eq
+function %dec(i32) -> i8 fast {
+block0(v0: i32):
+    v10 = iconst.i32 7
+    v11 = iconst.i32 18
+    v12 = iconst.i32 63
+    v13 = iconst.i32 6
+    v2 = band v0, v10
+    v3 = ishl v2, v11
+    v4 = band v0, v12
+    v5 = ishl v4, v13
+    v6 = band v0, v12
+    v7 = bor v5, v6
+    v8 = bor v3, v7
+    v9 = iconst.i32 -1
+    v14 = icmp eq v8, v9
+    return v14
+}
+
+; Same bound through a block param: every incoming edge arg is
+; `& 63`, so `icmp eq param, -1` folds on the join.
+; check: iconst.i8 0
+function %dec_param(i32, i32) -> i8 fast {
+block0(v0: i32, v1: i32):
+    v20 = iconst.i32 63
+    v2 = band v0, v20
+    v3 = band v1, v20
+    brif v0, block1(v2), block1(v3)
+
+block1(v4: i32):
+    v21 = iconst.i32 -1
+    v5 = icmp eq v4, v21
+    return v5
+}

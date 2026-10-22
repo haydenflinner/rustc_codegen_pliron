@@ -217,6 +217,34 @@ fn vmax_d(func: &Function, v: Value, depth: usize) -> u64 {
                     .map_or(u64::MAX, |p| p - 1),
             );
         }
+        // `a << s` shifts the bound while it stays in range — the UTF-8
+        // decode trees (`ishl (band x, 63), 6`) bound under the char
+        // ceiling, not the type's.
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args,
+        } => {
+            if let Some(s) = iconst(func, args[1]) {
+                let w = u64::from(ty.bits());
+                let s = (s as u64) % w;
+                let a = vmax_d(func, args[0], depth - 1);
+                // The shifted-out bits are lost: `x <= a` only bounds
+                // `x << s` by `a << s` while `a` has no bits at/above
+                // position `w - s`.
+                hi = hi.min(if s == 0 {
+                    a
+                } else if a < (1u64 << (w - s)) {
+                    a << s
+                } else {
+                    ty_umax
+                });
+            }
+        }
+        // Narrowing keeps the tighter of the two bounds.
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => hi = hi.min(vmax_d(func, arg, depth - 1)),
         // `select`'s ceiling is the looser arm — the pick can't grow.
         InstructionData::Ternary {
             opcode: Opcode::Select | Opcode::SelectSpectreGuard,

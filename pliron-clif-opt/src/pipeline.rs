@@ -2356,6 +2356,18 @@ fn s_csweep2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::const_sweep(&mut p.clctx.func)
 }
 
+// `sublea`'s `ovkill` runs before the niche selects collapse to params
+// (sameargs3/webmerge): one more bound-decided `icmp x, k` pass after
+// them — see the `ovkill2` step.
+fn s_ovkill2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let cfg = an.cfg(&p.clctx.func);
+    let k = clifpeep::ovkill(&mut p.clctx.func, cfg);
+    if k > 0 && p.dump {
+        p.dump("ovkill2");
+    }
+    k
+}
+
 // `brif (icmp x <u 0x80)` / `brif (icmp x <s 0)` sign-bit tests →
 // `brif (band v, 1<<b)` — see `clifpeep::sgntest`.
 fn s_sgntest(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -3865,6 +3877,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_rangefold,
         )
         .needs(shape::CONDBR),
+        // `icmp cc x, k` folds the bounds decide, round 2: the niche
+        // `select`s only collapse to params after sameargs3/webmerge, so
+        // `sublea`'s `ovkill` ran while `icmp eq (select c,x,-1), -1` still
+        // carried the unbounded arm — `Chars::next`'s `-1` decode check.
+        cstep("ovkill2", "ovkill", Gate::Env("PLIRON_OVKILL"), s_ovkill2)
+            .needs(shape::TESTC),
         // One-bit compares feeding a `brif` — `byte <u 0x80` (the UTF-8
         // ASCII/continuation test in tokenize/chars_*), `x <s 0` — become
         // `brif (band v, 1<<b)` (targets swapped for the clear-polarity
