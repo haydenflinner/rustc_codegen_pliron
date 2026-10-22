@@ -26,3 +26,26 @@ Changed:
   opcode `010 C sz`; `x` forms take Xm and set sf), listed in `handwritten`.
 - tests/aarch64.rs: `crc32` encodings checked against llvm-mc; three of the
   mnemonics join the random-operand fuzz list.
+
+Pliron patch: AArch64 table covers the scalar extensions.
+
+`tools/tables/aarch64.py` kept a scalar (GPR-only) form only when the same
+mnemonic also had a SIMD/SVE form, so the atomics and pointer auth were
+neither generated nor hand-written: portable-atomic's `asm!` (`ldar`,
+`swpp`, `.arch_extension lse`) failed rune's build. The filter now keeps
+every mnemonic the backend does not encode by hand. Regenerated with llvm-mc
+22.1.8: 5879 -> 6443 forms (LSE/LSE128 atomics, acquire/release and
+exclusive loads/stores, RCPC/RCPC3, pointer auth, RCW, MOPS-free scalar
+extras), 0 lines in the wrong form.
+
+Changed:
+- tools/tables/aarch64.py: the post-sweep filter keeps mnemonics with no
+  handwritten encoder; `crc32*`/`casp*` join HANDWRITTEN; `EXCLUDED` drops
+  `ldraa`/`ldrab` (the writeback forms' split signed offset put 8 checked
+  lines in the wrong form).
+- src/arch/aarch64/table_data.rs, tools/mc-diff/*: regenerated.
+- src/arch/aarch64/insn.rs: `casp{,a,l,al}` by hand (even/odd register pairs,
+  the second register unencoded — not a relation the fitter can measure).
+- src/arch/aarch64/mod.rs: `.arch_extension` accepted (every extension is on).
+- tests/aarch64.rs: `casp_pairs`, `atomics_from_the_table`,
+  `arch_extension_is_accepted`, against llvm-mc encodings.

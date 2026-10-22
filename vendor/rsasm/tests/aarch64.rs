@@ -221,6 +221,44 @@ fn multiply_divide_and_variable_shifts() {
 }
 
 #[test]
+fn arch_extension_is_accepted() {
+    // portable-atomic: `.arch_extension lse` ahead of an LSE atomic.
+    check(&[(".arch_extension lse\nnop", "1f 20 03 d5")]);
+}
+
+#[test]
+fn casp_pairs() {
+    // llvm-mc -triple=aarch64 -mattr=+lse -show-encoding
+    check(&[
+        ("casp w0, w1, w2, w3, [x4]", "82 7c 20 08"),
+        ("caspa x0, x1, x2, x3, [sp]", "e2 7f 60 48"),
+        ("caspl w4, w5, w6, w7, [x8]", "06 fd 24 08"),
+        ("caspal x2, x3, x6, x7, [x8]", "06 fd 62 48"),
+        ("casp x0, x1, x2, x3, [x4]", "82 7c 20 48"),
+    ]);
+}
+
+#[test]
+fn atomics_from_the_table() {
+    // Rows the widened generator added (llvm-mc 22 encodings): what
+    // portable-atomic and std-free lock code write in asm!.
+    check(&[
+        ("ldar x0, [x1]", "20 fc df c8"),
+        ("stlr w2, [x3]", "62 fc 9f 88"),
+        ("ldapr x0, [x1]", "20 c0 bf f8"),
+        ("ldaxp x4, x5, [x6]", "c4 94 7f c8"),
+        ("stlxp w7, x4, x5, [x6]", "c4 94 27 c8"),
+        ("stxr w2, w0, [x1]", "20 7c 02 88"),
+        ("casal x0, x1, [x2]", "41 fc e0 c8"),
+        ("swppal x4, x5, [x6]", "c4 80 e5 19"),
+        ("ldaddal w0, w1, [x2]", "41 00 e0 b8"),
+        ("ldiapp x0, x1, [x2]", "40 18 41 d9"),
+        ("stilp x0, x1, [x2]", "40 18 01 d9"),
+        ("xpaclri", "ff 20 03 d5"),
+    ]);
+}
+
+#[test]
 fn crc32() {
     // llvm-mc -triple=aarch64 -mattr=+crc -show-encoding
     check(&[

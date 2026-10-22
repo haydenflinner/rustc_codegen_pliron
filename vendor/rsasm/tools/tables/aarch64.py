@@ -66,7 +66,13 @@ sbfiz ubfiz bfi sxtb sxth sxtw uxtb uxth lsl lsr asr ror lslv lsrv asrv rorv
 extr mul mneg smull umull smnegl umnegl smulh umulh madd msub smaddl umaddl
 smsubl umsubl sdiv udiv rbit rev rev16 rev32 rev64 clz cls csel csinc csinv
 csneg cset csetm cinc cinv cneg ccmp ccmn
+crc32b crc32h crc32w crc32x crc32cb crc32ch crc32cw crc32cx casp caspa caspl caspal
 """.split())
+
+# Mnemonics left out entirely: the fit's form order puts some of their
+# lines in the wrong form (`ldraa`/`ldrab` writeback: the offset's sign bit
+# sits apart from its imm9), and a wrong encoding is worse than none.
+EXCLUDED = {"ldraa", "ldrab"}
 
 # The loads and stores among them, which the backend also encodes for the
 # scalar SIMD registers (`ldr q0, [x0]`).
@@ -188,7 +194,7 @@ def expand_aliases(text):
 # ---------------------------------------------------------------------------
 
 def interesting(mn, atoms, text, word):
-    if SKIP_TEXT.search(text):
+    if SKIP_TEXT.search(text) or mn in EXCLUDED:
         return False
     kinds = {a.kind[0] for a in atoms}
     if sum(1 for a in atoms if a.kind[0] in ("zlist", "vlist")) > 1:
@@ -1793,10 +1799,15 @@ def main():
             print("neighbours, round %d: %d forms" % (round_ + 1, len(groups)))
             if len(groups) == before:
                 break
+        # Kept: mnemonics with a SIMD/SVE form, and every scalar mnemonic the
+        # backend does not write by hand -- the atomics (`ldar`, `cas`,
+        # `ldadd`, `swpp`), pointer auth, rcpc3 -- so the table covers all
+        # of A64 that llvm-mc knows, not just its vector half.
         simd = {k[0] for k, (samples, _) in groups.items()
-                if {t[0] for t in k[1]} & SIMD_KINDS or any(sve_space(w) for w, _ in samples)}
+                if {t[0] for t in k[1]} & SIMD_KINDS or any(sve_space(w) for w, _ in samples)
+                or k[0] not in HANDWRITTEN}
         groups = {k: v for k, v in groups.items() if k[0] in simd}
-        print("of mnemonics with a SIMD form: %d forms" % len(groups))
+        print("of mnemonics with a SIMD form or no handwritten encoder: %d forms" % len(groups))
         groups = {k: v[0] for k, v in groups.items()}
     if args.groups and not os.path.exists(args.groups):
         with open(args.groups, "wb") as fh:

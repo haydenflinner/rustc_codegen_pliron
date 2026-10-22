@@ -203,11 +203,17 @@ impl Architecture for AArch64 {
         &self,
         cx: &mut AsmCtx<'_>,
         name: &str,
-        _cur: &mut crate::cursor::Cursor<'_>,
+        cur: &mut crate::cursor::Cursor<'_>,
     ) -> bool {
         match name {
             ".ltorg" | ".pool" => {
                 cx.requests.push(crate::arch::Request::FlushLiterals);
+                true
+            }
+            // Every extension the table knows is always on, so enabling one
+            // (`.arch_extension lse`, portable-atomic's asm!) changes nothing.
+            ".arch_extension" => {
+                cur.set_pos(cur.all().len());
                 true
             }
             _ => false,

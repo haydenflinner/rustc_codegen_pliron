@@ -312,6 +312,10 @@ pub(crate) fn handwritten(mnemonic: &str) -> bool {
                 | "crc32ch"
                 | "crc32cw"
                 | "crc32cx"
+                | "casp"
+                | "caspa"
+                | "caspl"
+                | "caspal"
                 | "rbit"
                 | "rev"
                 | "rev16"
@@ -458,6 +462,7 @@ pub fn assemble(
         "sdiv" | "udiv" => div(cx, &i),
         "crc32b" | "crc32h" | "crc32w" | "crc32x" | "crc32cb" | "crc32ch" | "crc32cw"
         | "crc32cx" => crc32(cx, &i),
+        "casp" | "caspa" | "caspl" | "caspal" => casp(cx, &i),
 
         "rbit" | "rev" | "rev16" | "rev32" | "rev64" | "clz" | "cls" => dp1(cx, &i),
 
@@ -1419,6 +1424,45 @@ fn crc32(cx: &mut AsmCtx<'_>, i: &Insn<'_, '_>) -> Option<Vec<Variant>> {
         | field(sz, 10, 2)
         | field(rn.num as u32, 5, 5)
         | field(rd.num as u32, 0, 5))
+}
+
+/// `casp{,a,l,al} Rs, Rs+1, Rt, Rt+1, [Xn|SP]` (FEAT_LSE): compare-and-swap
+/// of a register pair. Each pair is an even register and its successor, both
+/// W or both X; the table generator cannot fit the pairing, so it is here.
+fn casp(cx: &mut AsmCtx<'_>, i: &Insn<'_, '_>) -> Option<Vec<Variant>> {
+    i.arity(cx, &[5]).then_some(())?;
+    let rs = i.gpr(cx, 0)?;
+    let rs1 = i.gpr(cx, 1)?;
+    let rt = i.gpr(cx, 2)?;
+    let rt1 = i.gpr(cx, 3)?;
+    i.same_width(cx, &[rs, rs1, rt, rt1])?;
+    let pair = |a: Reg, b: Reg| a.num % 2 == 0 && a.num < 31 && b.num == a.num + 1;
+    if !pair(rs, rs1) || !pair(rt, rt1) {
+        cx.error(
+            i.span,
+            &format!("`{}` takes even/odd register pairs: Rs, Rs+1, Rt, Rt+1", i.mnemonic),
+        );
+        return None;
+    }
+    let mem = i.mem(cx, 4)?;
+    if !matches!(mem.kind, MemKind::Offset(None)) || !(mem.base.is_sp() || mem.base.class == RegClass::X)
+    {
+        cx.error(mem.span, &format!("`{}` takes a bare `[Xn|SP]` address", i.mnemonic));
+        return None;
+    }
+    let (acq, rel) = match i.mnemonic {
+        "caspa" => (1, 0),
+        "caspl" => (0, 1),
+        "caspal" => (1, 1),
+        _ => (0, 0),
+    };
+    one(field(u32::from(rs.class == RegClass::X), 30, 1)
+        | 0x0820_7c00
+        | field(acq, 22, 1)
+        | field(rs.num as u32, 16, 5)
+        | field(rel, 15, 1)
+        | field(mem.base.num as u32, 5, 5)
+        | field(rt.num as u32, 0, 5))
 }
 
 /// The one-source data-processing group: bit and byte reversal, counting.

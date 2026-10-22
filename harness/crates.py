@@ -81,9 +81,10 @@ CRATES = [
      (os.path.expanduser("~/code/prql"), "28bbf13c0482bd1acfa18211a1808822077c21f5", WS)),
     ("rune", "f67a45eac99e", ["--all-targets", "--all-features"], 3,
      (os.path.expanduser("~/code/rune"), "f67a45eac99ed609facc2b11d75352e556ffa0a0", WS)),
-    # makepad's own tests live in its vendored libs and draw/platform crates.
-    ("makepad", "e72677c88036", ["-p", "makepad-ttf-parser", "-p", "makepad-rustybuzz",
-                                 "-p", "makepad-zune-jpeg", "-p", "makepad-zune-png",
+    # makepad's own tests live in its vendored libs and draw/platform crates
+    # (not the ttf-parser/rustybuzz forks: their test targets still name the
+    # upstream crates and don't build under stock either).
+    ("makepad", "e72677c88036", ["-p", "makepad-zune-jpeg", "-p", "makepad-zune-png",
                                  "-p", "makepad-miniz", "-p", "makepad-vector",
                                  "-p", "makepad-live-compiler", "-p", "makepad-shader-compiler",
                                  "-p", "makepad-draw", "-p", "makepad-script-test"], 3,
@@ -163,6 +164,10 @@ def run_tests(src, side, args, lib, jobs, timeout, release):
     tdir = os.path.join(OUT, f"target-{side}")
     env = dict(os.environ)
     env["CARGO_INCREMENTAL"] = "0"
+    # The backend has no LTO (rustc would skip upstream objects and expect
+    # their bitcode), so a workspace profile's `lto = true` (prql) is turned
+    # off -- for both sides, so they still build the same configuration.
+    env["CARGO_PROFILE_RELEASE_LTO"] = "false"
     env.pop("RUSTFLAGS", None)
     env.pop("RUSTDOCFLAGS", None)
     if side == "pliron":
