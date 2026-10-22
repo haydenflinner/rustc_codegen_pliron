@@ -13,8 +13,12 @@ use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed, TypedHandle};
+use pliron::irbuild::inserter::OpInsertionPoint;
+use pliron::linked_list::ContainsLinkedList;
+use pliron::irbuild::listener::DummyListener;
+use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
 use pliron_llvm::ops::{
-    AllocaOp, CallOp, ExtractValueOp, FuncOp, InsertValueOp, LoadOp, ReturnOp, StoreOp,
+    AllocaOp, BrOp, CallOp, ExtractValueOp, FuncOp, InsertValueOp, LoadOp, ReturnOp, StoreOp,
 };
 use pliron_llvm::types::{ArrayType, FuncType, StructLayout, StructType};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -334,16 +338,34 @@ fn rewrite(
         .get_operation();
         nc.insert_before(ctx, c);
         let r = nc.deref(ctx).get_result(ctx, 0);
+        // The leaf stores run only when the call returns. For an invoke
+        // they go at the head of a fresh normal-edge block so the invoke
+        // still ends its block (`call; br`): ops after an invoke would be
+        // credited to its landing pad by block-level dominance, and
+        // sroa-fwd forwarded such a store into cleanup code
+        // (nu_command `copy_on_thread`, 2026-10-22).
+        let anchor = if st.invokes.get(c).is_some() {
+            let b = c.deref(ctx).get_parent_block().unwrap();
+            let mut rw = IRRewriter::<DummyListener>::default();
+            let cont = rw.split_block(ctx, b, OpInsertionPoint::AfterOperation(c), None);
+            BrOp::new(ctx, cont, vec![]).get_operation().insert_after(ctx, c);
+            if let Some(&rb) = st.region_blocks.get(b) {
+                st.region_blocks.insert(cont, rb);
+            }
+            cont.deref(ctx).iter(ctx).next().unwrap()
+        } else {
+            c
+        };
         for (i, &(off, _)) in leaves.iter().enumerate() {
             let ev = ExtractValueOp::new(ctx, r, vec![i as u32])
                 .unwrap()
                 .get_operation();
-            ev.insert_before(ctx, c);
+            ev.insert_before(ctx, anchor);
             let v = ev.deref(ctx).get_result(ctx, 0);
-            let p = ptr_plus(ctx, st, cargs[0], off, c);
+            let p = ptr_plus(ctx, st, cargs[0], off, anchor);
             StoreOp::new(ctx, v, p)
                 .get_operation()
-                .insert_before(ctx, c);
+                .insert_before(ctx, anchor);
         }
         let mut info = st.calls.remove(c).unwrap();
         info.fn_ty = nty.into();

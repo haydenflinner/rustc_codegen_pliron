@@ -17,13 +17,35 @@ pub fn run(ctx: &Context, st: &State, pass: &str) {
     }
     for (name, f) in &st.funcs {
         if has_body(ctx, f.op)
-            && let Some(e) = check(ctx, st, f.op)
+            && let Some(e) = check(ctx, st, f.op).or_else(|| mid_invoke(ctx, st, f.op))
         {
             if pliron_cfg::tracing_on() {
                 tracing::error!(target: "pliron::domcheck", "domcheck after {pass}: {name}: {e}")
             };
         }
     }
+}
+
+/// An invoke must end its block (`call; br then`): ops after it run only
+/// on the normal-return path, but block-level dominance would credit them
+/// to the landing pad too.
+fn mid_invoke(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
+    for b in blocks(ctx, f) {
+        let os = ops(ctx, b);
+        for (i, &op) in os.iter().enumerate() {
+            if st.invokes.get(op).is_some() && i + 2 != os.len() {
+                return Some(format!(
+                    "invoke {} has {} ops after it before the terminator; next: {}",
+                    pliron::operation::OpDbg { op, ctx },
+                    os.len().saturating_sub(i + 2),
+                    os.get(i + 1)
+                        .map(|&n| pliron::operation::OpDbg { op: n, ctx }.to_string())
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn succs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {

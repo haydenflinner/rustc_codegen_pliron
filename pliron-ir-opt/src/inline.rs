@@ -2550,6 +2550,34 @@ fn frozen_args(
     }
 }
 
+/// Keep the invariant that an invoke ends its block (`call; br`): ops after
+/// an invoke run only when it returns, but block-level dominance (domcheck,
+/// sroa-fwd, licm, ...) treats the landing-pad edge as leaving at the
+/// block's end and would credit them to the pad. Lowering splits there
+/// anyway. Splits `inv`'s block after it when more than a terminator
+/// follows and returns the new (normal-path) block, tagged like the old one.
+pub fn end_block_at_invoke(
+    ctx: &mut Context,
+    st: &mut State,
+    inv: Ptr<Operation>,
+) -> Option<Ptr<BasicBlock>> {
+    let b = inv.deref(ctx).get_parent_block()?;
+    let next = inv.get_next(ctx)?;
+    if Some(next) == b.deref(ctx).iter(ctx).last() {
+        return None;
+    }
+    let mut rw = IRRewriter::<DummyListener>::default();
+    let nb = rw.split_block(ctx, b, OpInsertionPoint::AfterOperation(inv), None);
+    BrOp::new(ctx, nb, vec![]).get_operation().insert_after(ctx, inv);
+    if let Some(&r) = st.region_blocks.get(b) {
+        st.region_blocks.insert(nb, r);
+    }
+    if let Some(&c) = st.prof_bcount.get(b) {
+        st.prof_bcount.insert(nb, c);
+    }
+    Some(nb)
+}
+
 /// Returns the callsite block plus the freshly created blocks in region
 /// order (`cont` follows `block`; callee clones sit at the region end), so
 /// the rescan worklist can track the list without re-walking it.
@@ -2636,6 +2664,8 @@ fn inline_call(
     // History node for calls cloned out of this body, pushed on first use.
     let parent = st.inline_hist.get(call).copied().unwrap_or(u32::MAX);
     let mut hist_node = None;
+    // Plain calls of the body that become invokes to this callsite's pad.
+    let mut fresh_invokes: Vec<Ptr<Operation>> = Vec::new();
     for &(op, m) in &tags.ops {
         let Some(new) = map.lookup_op(op) else {
             continue;
@@ -2652,6 +2682,7 @@ fn inline_call(
                     .insert(new, (map.lookup_block(lp).unwrap(), catch));
             } else if let Some(u) = unwind {
                 st.invokes.insert(new, u);
+                fresh_invokes.push(new);
             }
         }
         if m & OP_INTRINSICS != 0 {
@@ -2705,6 +2736,16 @@ fn inline_call(
     frozen_args(ctx, st, cs, caller, src, &map, &args, block);
     st.calls.remove(call);
     Operation::erase(call, ctx);
+    // An invoke ends its block (`call; br`): ops after it run only on the
+    // normal-return path, but block-level dominance (domcheck, sroa-fwd,
+    // ...) would credit them to the landing pad too. A body call that
+    // became an invoke here sits mid-block — split after it, as lowering
+    // does anyway (nu_command `copy_on_thread`: sroa-fwd forwarded a store
+    // into cleanup code, 2026-10-22).
+    let split_blocks: Vec<_> = fresh_invokes
+        .into_iter()
+        .filter_map(|n| end_block_at_invoke(ctx, st, n))
+        .collect();
     let clones = src.iter().map(|b| map.lookup_block(*b).unwrap());
-    (block, std::iter::once(cont).chain(clones).collect())
+    (block, std::iter::once(cont).chain(clones).chain(split_blocks).collect())
 }

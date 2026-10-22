@@ -250,6 +250,15 @@ EOF
   return $bad
 }
 
+t_invokeblk() {
+  # Every invoke ends its block after each IR pass (domcheck's mid-invoke
+  # check); the program must still run and unwind correctly.
+  PLIRON_CHECK_DOM=1 PLIRON_TRACE=pliron::domcheck=error rustc $BE --edition 2021 -O -C codegen-units=1 tests/invokeblk/main.rs -o $out/invokeblk$exe 2> $out/invokeblk.log || { cat $out/invokeblk.log >&2; return 1; }
+  if grep -q "domcheck after" $out/invokeblk.log; then grep "domcheck after" $out/invokeblk.log | head -3 >&2; return 1; fi
+  $out/invokeblk$exe 2>/dev/null > $out/invokeblk.out
+  printf 'drop 3\n12\ndrop 1000\ncaught true\n' | diff - $out/invokeblk.out
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -509,6 +518,7 @@ want tailrec && t_tailrec
 want sroa && t_sroa
 want inlinecm && t_inlinecm
 want retattr && t_retattr
+want invokeblk && t_invokeblk
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

@@ -1391,6 +1391,8 @@ fn split(
                 br.insert_at_back(t, ctx);
                 reload_sync(ctx, st, pa, pin_lo, &sl, &new, &ss, br);
                 st.invokes.insert(*cop, (t, catch));
+                // The normal-path reloads went right after the invoke.
+                crate::inline::end_block_at_invoke(ctx, st, *cop);
                 *cfg_dirty = true;
             }
         }
