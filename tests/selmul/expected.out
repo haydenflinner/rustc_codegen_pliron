@@ -1,0 +1,16 @@
+eqbug 697813
+parse_only 1234762600
+compares 4676622526040519011
+common_add 3462
+parses ok=6259557440016822871 err=135
+mac_seeded 0 3839381891
+mac_seeded 1 707995780
+mac_seeded 7 3394515594
+mac_seeded 4294967295 2675800706
+mac_digits "" Some(0)
+mac_digits "0" Some(0)
+mac_digits "123" Some(123)
+mac_digits "4294967295" Some(4294967295)
+mac_digits "4294967296" Some(0)
+mac_digits "12a" None
+mac_digits "999999999999" Some(3567587327)

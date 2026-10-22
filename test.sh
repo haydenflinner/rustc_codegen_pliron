@@ -271,6 +271,12 @@ t_xcgufnptr() {
   rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcgufnptr/main.rs -o $out/xcgufnptr$exe && $out/xcgufnptr$exe
 }
 
+t_selmul() {
+  # Late select-chain folds and the madd carry (both opt-in): output must
+  # match stock LLVM rustc's.
+  PLIRON_SELCHAIN=1 PLIRON_MULCARRY=1 rustc $BE --edition 2021 -O tests/selmul/main.rs -o $out/selmul$exe && $out/selmul$exe | diff --strip-trailing-cr - tests/selmul/expected.out
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -533,6 +539,7 @@ want retattr && t_retattr
 want invokeblk && t_invokeblk
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
+want selmul && t_selmul
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

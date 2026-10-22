@@ -1998,6 +1998,14 @@ fn s_clifpeep(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_mulcarry(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::mulcarry(&mut p.clctx.func)
+}
+
+fn s_selchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    clifpeep::selchain(&mut p.clctx.func)
+}
+
 fn s_tailmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = tailmerge::run(&mut p.clctx.func);
     p.stats.merged += k;
@@ -3803,6 +3811,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // the dispatch/brif work a conditional (guarded per-phase inside
         // for the CONDBR-less case the old gate used to skip wholesale).
         step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::MULTI),
+        // Select-chain folds `clifpeep` missed while the arms still sat
+        // behind block params that mergechain just merged (eqbug).
+        step("selchain", "", Gate::OptIn("PLIRON_SELCHAIN"), s_selchain),
         step(
             "jtround",
             "threaded",
@@ -4069,6 +4080,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             .needs(shape::BPARAM),
         // i64->i32 low-word demotion — after the late folds so their
         // residuals demote too, before coldret so block layout is final.
+        // Last, once sameargs/edge folds left the loop-entry arg a plain 0.
+        step("mulcarry", "", Gate::OptIn("PLIRON_MULCARRY"), s_mulcarry).needs(shape::LOOPS),
         step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),
         Step {
             name: "coldret",

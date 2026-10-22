@@ -2454,6 +2454,261 @@ pub fn brif_fold(func: &mut Function) -> usize {
 /// becomes `select (icmp cc a b) f, t`: the icmp's own flags then feed the
 /// `csel`, instead of materializing the negation with `eor`+`tst` — the
 /// shape LLVM emits for partition/insertion-sort inner loops.
+/// `select c2, .., select(c1, t, e)`: the arm reached under `c2`'s
+/// equality outcome carries the fact `x + a2 == k`, which decides a nested
+/// compare `x + a1 == k` on the same `x`/`k` — `x+3==k` and `x-5==k` can't
+/// co-hold, so `if x+3==k {a+=1} if x-5!=k {a+=2}` only ever applies `+2`.
+/// Rewrites the outer arm to the nested select's dead arm.
+fn sel_eqchain(func: &mut Function, inst: Inst, args: [Value; 3]) -> bool {
+    let Some((eq2, x2, a2, k2)) = icmp_chain(func, args[0]) else {
+        return false;
+    };
+    let arm_i = if eq2 { 1 } else { 2 };
+    let inner = func.dfg.resolve_aliases(args[arm_i]);
+    if let Some(si) = func.dfg.value_def(inner).inst()
+        && let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: sa,
+        } = func.dfg.insts[si]
+        && let Some((eq1, x1, a1, k1)) = icmp_chain(func, sa[0])
+        && func.dfg.resolve_aliases(x1) == x2
+        && let Some(v) = eq_decided(func, func.dfg.value_type(k1).bits(), a1, k1, a2, k2)
+    {
+        let arm = sa[if v == eq1 { 1 } else { 2 }];
+        if let InstructionData::Ternary { args, .. } = &mut func.dfg.insts[inst] {
+            args[arm_i] = arm;
+        }
+        return true;
+    }
+    false
+}
+
+/// Late select folds, after `mergechain` joins the blocks that kept a
+/// select's arms behind block params during `clifpeep` (jumpthread turns
+/// eqbug's `if .. {a += k}` chains into selects across blocks):
+/// `sel_eqchain`, then `select c, (x + a), (x + b)` → `x + select c, a, b`
+/// (LLVM's foldSelectOpOp) — a select on a loop-carried `acc + a` chain
+/// costs add+add+csel per trip where `acc + select` costs one add.
+pub fn selchain(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while let Some(_) = pos.next_block() {
+        while let Some(inst) = pos.next_inst() {
+            if let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args,
+            } = pos.func.dfg.insts[inst]
+                && sel_eqchain(pos.func, inst, args)
+            {
+                n += 1;
+            }
+        }
+    }
+    // Use counts after the eqchain rewrites: they free the `select c, 1, 0`
+    // that `seladd` needs single-use.
+    let mut uses = None;
+    let mut pos = FuncCursor::new(func);
+    while let Some(_) = pos.next_block() {
+        while let Some(inst) = pos.next_inst() {
+            match pos.func.dfg.insts[inst] {
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } => {
+                    if let Some((x, ra, rb)) = sel_common_add(pos.func, args, &mut uses) {
+                        let sv = pos.ins().select(args[0], ra, rb);
+                        pos.func.replace(inst).iadd(x, sv);
+                        n += 1;
+                    }
+                }
+                // `iadd (select c, k1, k2), K` → `select c, k1+K, k2+K`
+                // for a single-use select: adjacent arms lower to `csinc`.
+                InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args,
+                } => {
+                    let u = uses.get_or_insert_with(|| use_counts(pos.func));
+                    let hit = (0..2).find_map(|i| {
+                        let k = keval(pos.func, args[i ^ 1])?;
+                        let sv = pos.func.dfg.resolve_aliases(args[i]);
+                        if u.get(&sv).copied().unwrap_or(0) != 1 {
+                            return None;
+                        }
+                        let si = pos.func.dfg.value_def(sv).inst()?;
+                        let InstructionData::Ternary {
+                            opcode: Opcode::Select,
+                            args: sa,
+                        } = pos.func.dfg.insts[si]
+                        else {
+                            return None;
+                        };
+                        let (k1, k2) = (keval(pos.func, sa[1])?, keval(pos.func, sa[2])?);
+                        Some((sa[0], k1.wrapping_add(k), k2.wrapping_add(k)))
+                    });
+                    if let Some((c, a, b)) = hit {
+                        let ty = pos.func.dfg.value_type(pos.func.dfg.first_result(inst));
+                        let ka = pos.ins().iconst(ty, a);
+                        let kb = pos.ins().iconst(ty, b);
+                        pos.func.replace(inst).select(c, ka, kb);
+                        n += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+/// A block param `p` whose every incoming value is `imul x, K` (or `0`)
+/// and whose one use is `iadd p, d` carries `x` instead, with `imul p, K`
+/// recomputed right before the add. Same mul count, but the mul now sits
+/// in the add's block where isel fuses `madd`: digit parsers' rotated
+/// `acc = (acc + d) * 10` latch (core's `from_ascii_bytes_radix`) put the
+/// loop-carried chain through add+mul (4 cycles on aarch64) where `madd`
+/// takes 3 — parse_only's per-digit bound.
+pub fn mulcarry(func: &mut Function) -> usize {
+    let uses = use_counts(func);
+    // Incoming edges per block: (branch inst, dest slot). Blocks reached by
+    // anything but `jump`/`brif` (br_table, try_call) are left alone.
+    let mut edges: FxHashMap<Block, Vec<(Inst, usize)>> = FxHashMap::default();
+    let mut opaque: FxHashSet<Block> = FxHashSet::default();
+    // The sole non-branch user of each value with one use.
+    let mut user: FxHashMap<Value, Inst> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                user.insert(func.dfg.resolve_aliases(a), i);
+            }
+            let plain = matches!(func.dfg.insts[i].opcode(), Opcode::Jump | Opcode::Brif);
+            for (di, bc) in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                let d = bc.block(&func.dfg.value_lists);
+                if plain {
+                    edges.entry(d).or_default().push((i, di));
+                } else {
+                    opaque.insert(d);
+                }
+            }
+        }
+    }
+    let entry = func.layout.entry_block();
+    let mut n = 0;
+    for (b, es) in edges {
+        if Some(b) == entry || opaque.contains(&b) {
+            continue;
+        }
+        for pi in 0..func.dfg.block_params(b).len() {
+            let p = func.dfg.block_params(b)[pi];
+            let ty = func.dfg.value_type(p);
+            if !ty.is_int() || ty.is_vector() || uses.get(&p).copied() != Some(1) {
+                continue;
+            }
+            let Some(&ui) = user.get(&p) else { continue };
+            if func.dfg.insts[ui].opcode() != Opcode::Iadd {
+                continue;
+            }
+            // Each edge's arg as `x` with `arg = x * K` (`None` for 0).
+            let mut k = None;
+            let mut xs = Vec::with_capacity(es.len());
+            let ok = es.iter().all(|&(t, di)| {
+                let bc = func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[di];
+                let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(pi) else {
+                    return false;
+                };
+                let a = func.dfg.resolve_aliases(a);
+                if iconst(func, a) == Some(0) {
+                    xs.push(None);
+                    return true;
+                }
+                let Some(di2) = func.dfg.value_def(a).inst() else {
+                    return false;
+                };
+                let InstructionData::Binary {
+                    opcode: Opcode::Imul,
+                    args: [x, kv],
+                } = func.dfg.insts[di2]
+                else {
+                    return false;
+                };
+                let Some(kk) = iconst(func, kv) else { return false };
+                // The edge's mul must die with the rewrite, or the
+                // per-use mul is an extra one.
+                if uses.get(&a).copied() != Some(1) || *k.get_or_insert(kk) != kk {
+                    return false;
+                }
+                xs.push(Some(x));
+                true
+            });
+            let Some(kk) = k else { continue };
+            if !ok {
+                continue;
+            }
+            for (&(t, di), x) in es.iter().zip(&xs) {
+                let Some(x) = *x else { continue };
+                let dfg = &mut func.dfg;
+                let bc = dfg.insts[t]
+                    .branch_destination(&dfg.jump_tables, &dfg.exception_tables)[di];
+                let dest = bc.block(&dfg.value_lists);
+                let mut args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+                args[pi] = BlockArg::Value(x);
+                let nc = BlockCall::new(dest, args, &mut dfg.value_lists);
+                dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [di] = nc;
+            }
+            let mut pos = FuncCursor::new(func).at_inst(ui);
+            let kc = pos.ins().iconst(ty, kk);
+            let m = pos.ins().imul(p, kc);
+            let hit: Vec<bool> =
+                pos.func.dfg.inst_args(ui).iter().map(|&a| pos.func.dfg.resolve_aliases(a) == p).collect();
+            for (a, h) in pos.func.dfg.inst_args_mut(ui).iter_mut().zip(hit) {
+                if h {
+                    *a = m;
+                }
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `select c, (x + a), (x + b)` with both adds single-use: `(x, a, b)`.
+fn sel_common_add(
+    func: &Function,
+    args: [Value; 3],
+    uses: &mut Option<FxHashMap<Value, usize>>,
+) -> Option<(Value, Value, Value)> {
+    let ty = func.dfg.value_type(args[1]);
+    if !ty.is_int() || ty.is_vector() {
+        return None;
+    }
+    let add_of = |v: Value| -> Option<[Value; 2]> {
+        let v = func.dfg.resolve_aliases(v);
+        match func.dfg.insts[func.dfg.value_def(v).inst()?] {
+            InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } => Some(args.map(|a| func.dfg.resolve_aliases(a))),
+            _ => None,
+        }
+    };
+    let (pa, pb) = (add_of(args[1])?, add_of(args[2])?);
+    let u = uses.get_or_insert_with(|| use_counts(func));
+    for a in [args[1], args[2]] {
+        if u.get(&func.dfg.resolve_aliases(a)).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+    }
+    [(0, 0), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .find(|&(i, j)| pa[i] == pb[j])
+        .map(|(i, j)| (pa[i], pa[1 - i], pb[1 - j]))
+}
+
 fn sel_not(func: &mut Function, inst: Inst) -> bool {
     let InstructionData::Ternary {
         opcode: Opcode::Select,
@@ -6640,34 +6895,9 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
                     // `x-5==k` can't co-hold, so `if x+3==k {a+=1}
                     // if x-5!=k {a+=2}` only ever applies `+2`. Rewrite
                     // the outer arm to the nested select's dead arm.
-                    if let Some((eq2, x2, a2, k2)) = icmp_chain(pos.func, args[0]) {
-                        let arm_i = if eq2 { 1 } else { 2 };
-                        let inner = pos.func.dfg.resolve_aliases(args[arm_i]);
-                        if let Some(si) = pos.func.dfg.value_def(inner).inst()
-                            && let InstructionData::Ternary {
-                                opcode: Opcode::Select,
-                                args: sa,
-                            } = pos.func.dfg.insts[si]
-                            && let Some((eq1, x1, a1, k1)) = icmp_chain(pos.func, sa[0])
-                            && pos.func.dfg.resolve_aliases(x1) == x2
-                            && let Some(v) = eq_decided(
-                                pos.func,
-                                pos.func.dfg.value_type(k1).bits(),
-                                a1,
-                                k1,
-                                a2,
-                                k2,
-                            )
-                        {
-                            let arm = sa[if v == eq1 { 1 } else { 2 }];
-                            if let InstructionData::Ternary { args, .. } =
-                                &mut pos.func.dfg.insts[inst]
-                            {
-                                args[arm_i] = arm;
-                            }
-                            n += 1;
-                            continue;
-                        }
+                    if sel_eqchain(pos.func, inst, args) {
+                        n += 1;
+                        continue;
                     }
                     // `select (x >= lo), (x < hi), 0` → `(x - lo) <u w` —
                     // `Range*::contains` as one sub+compare instead of a
