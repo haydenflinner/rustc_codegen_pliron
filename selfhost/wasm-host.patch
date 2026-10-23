@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 71086e720..dbaf2e05f 100644
+index 634e81eaf80b..dc6426672095 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -171,9 +171,9 @@ dependencies = [
@@ -570,7 +570,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "polonius-engine"
  version = "0.13.0"
-@@ -3336,6 +3735,12 @@ dependencies = [
+@@ -3346,6 +3745,12 @@ dependencies = [
   "crossbeam-utils",
  ]
  
@@ -583,7 +583,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "redox_syscall"
  version = "0.5.18"
-@@ -3376,6 +3781,20 @@ dependencies = [
+@@ -3386,6 +3791,20 @@ dependencies = [
   "syn 2.0.117",
  ]
  
@@ -604,7 +604,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "regex"
  version = "1.12.2"
-@@ -3452,7 +3871,7 @@ checksum = "d9776093b7ca170454ab1406954f7b7d97a57c51dc6c0642957fb2ef25c2d399"
+@@ -3462,7 +3881,7 @@ checksum = "d9776093b7ca170454ab1406954f7b7d97a57c51dc6c0642957fb2ef25c2d399"
  dependencies = [
   "bytecheck",
   "bytes",
@@ -613,7 +613,7 @@ index 71086e720..dbaf2e05f 100644
   "indexmap",
   "munge",
   "ptr_meta",
-@@ -3474,6 +3893,12 @@ dependencies = [
+@@ -3484,6 +3903,12 @@ dependencies = [
   "syn 3.0.3",
  ]
  
@@ -626,7 +626,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "run_make_support"
  version = "0.0.0"
-@@ -3821,6 +4246,38 @@ dependencies = [
+@@ -3831,6 +4256,38 @@ dependencies = [
   "tracing",
  ]
  
@@ -665,7 +665,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "rustc_codegen_ssa"
  version = "0.0.0"
-@@ -3916,7 +4373,7 @@ dependencies = [
+@@ -3926,7 +4383,7 @@ dependencies = [
   "either",
   "elsa",
   "ena",
@@ -674,7 +674,7 @@ index 71086e720..dbaf2e05f 100644
   "indexmap",
   "jobserver",
   "libc",
-@@ -4276,6 +4733,7 @@ dependencies = [
+@@ -4286,6 +4743,7 @@ dependencies = [
   "rustc_borrowck",
   "rustc_builtin_macros",
   "rustc_codegen_llvm",
@@ -682,7 +682,7 @@ index 71086e720..dbaf2e05f 100644
   "rustc_codegen_ssa",
   "rustc_const_eval",
   "rustc_crate_store",
-@@ -5211,6 +5669,15 @@ version = "1.0.20"
+@@ -5223,6 +5681,15 @@ version = "1.0.20"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
  
@@ -698,7 +698,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "same-file"
  version = "1.0.6"
-@@ -5467,6 +5934,15 @@ version = "1.0.1"
+@@ -5479,6 +5946,15 @@ version = "1.0.1"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
  
@@ -714,7 +714,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "smallvec"
  version = "1.15.1"
-@@ -5494,6 +5970,15 @@ dependencies = [
+@@ -5506,6 +5982,15 @@ dependencies = [
   "color-eyre",
  ]
  
@@ -730,7 +730,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "stable_deref_trait"
  version = "1.2.1"
-@@ -5633,6 +6118,12 @@ dependencies = [
+@@ -5645,6 +6130,12 @@ dependencies = [
   "xattr",
  ]
  
@@ -743,7 +743,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "tempfile"
  version = "3.23.0"
-@@ -5754,7 +6245,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -5766,7 +6257,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "b5938a79ecf9cb8198d525ddb37cd8841f66ab98073f6a123af7ed7cdcbb73ae"
  dependencies = [
   "gimli 0.34.0",
@@ -752,7 +752,7 @@ index 71086e720..dbaf2e05f 100644
   "itertools",
   "object 0.39.1",
   "tracing",
-@@ -6041,6 +6532,15 @@ dependencies = [
+@@ -6053,6 +6544,15 @@ dependencies = [
   "tracing-subscriber",
  ]
  
@@ -768,7 +768,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "twox-hash"
  version = "1.6.3"
-@@ -6281,6 +6781,15 @@ version = "0.7.6"
+@@ -6293,6 +6793,15 @@ version = "0.7.6"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
  
@@ -784,7 +784,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "utf8-width"
  version = "0.1.7"
-@@ -6337,6 +6846,20 @@ dependencies = [
+@@ -6349,6 +6858,20 @@ dependencies = [
   "memchr",
  ]
  
@@ -805,7 +805,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "wait-timeout"
  version = "0.2.1"
-@@ -6460,6 +6983,15 @@ dependencies = [
+@@ -6472,6 +6995,15 @@ dependencies = [
   "wasmparser 0.247.0",
  ]
  
@@ -821,7 +821,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "wasm-encoder"
  version = "0.257.1"
-@@ -6493,6 +7025,16 @@ dependencies = [
+@@ -6505,6 +7037,16 @@ dependencies = [
   "semver",
  ]
  
@@ -838,7 +838,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "wasmparser"
  version = "0.257.1"
-@@ -6500,12 +7042,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -6512,12 +7054,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "d92fc335fb6d48f46bda1d8b26b69e28320c15ac3272208333833d6e217e2b4a"
  dependencies = [
   "bitflags",
@@ -862,7 +862,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "wast"
  version = "257.0.1"
-@@ -6550,6 +7102,16 @@ dependencies = [
+@@ -6562,6 +7114,16 @@ dependencies = [
   "string_cache_codegen",
  ]
  
@@ -879,7 +879,7 @@ index 71086e720..dbaf2e05f 100644
  [[package]]
  name = "winapi-util"
  version = "0.1.11"
-@@ -6932,7 +7494,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -6944,7 +7506,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "6f815340f0bb65d9775ae21e56b503b496683557b9b627b195d2766c25fb24ae"
  dependencies = [
   "anyhow",
@@ -888,20 +888,8 @@ index 71086e720..dbaf2e05f 100644
   "id-arena",
   "indexmap",
   "log",
-diff --git a/Cargo.toml b/Cargo.toml
-index 63d96ff2a..660a294c4 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -54,6 +54,7 @@ exclude = [
-   "build",
-   "compiler/rustc_codegen_cranelift",
-   "compiler/rustc_codegen_gcc",
-+  "compiler/rustc_codegen_pliron",
-   "src/bootstrap",
-   "tests/rustdoc-gui",
-   # HACK(eddyb) This hardcodes the fact that our CI uses `/checkout/obj`.
 diff --git a/compiler/rustc/Cargo.toml b/compiler/rustc/Cargo.toml
-index 19a9a7913..47e083ab5 100644
+index 19a9a7913c9e..47e083ab5e75 100644
 --- a/compiler/rustc/Cargo.toml
 +++ b/compiler/rustc/Cargo.toml
 @@ -10,7 +10,6 @@ edition = "2024"
@@ -932,7 +920,7 @@ index 19a9a7913..47e083ab5 100644
  max_level_info = ['rustc_driver_impl/max_level_info']
  rustc_randomized_layouts = ['rustc_driver_impl/rustc_randomized_layouts']
 diff --git a/compiler/rustc/build.rs b/compiler/rustc/build.rs
-index 9b5def53e..b25d7c6c2 100644
+index 9b5def53e3cb..b25d7c6c29c9 100644
 --- a/compiler/rustc/build.rs
 +++ b/compiler/rustc/build.rs
 @@ -5,6 +5,10 @@
@@ -947,7 +935,7 @@ index 9b5def53e..b25d7c6c2 100644
          set_windows_exe_options();
      } else {
 diff --git a/compiler/rustc/src/main.rs b/compiler/rustc/src/main.rs
-index 6609a19fa..373ea04f0 100644
+index 6609a19fa9e3..373ea04f00f0 100644
 --- a/compiler/rustc/src/main.rs
 +++ b/compiler/rustc/src/main.rs
 @@ -31,6 +31,9 @@
@@ -961,10 +949,10 @@ index 6609a19fa..373ea04f0 100644
  
  fn main() -> ExitCode {
 diff --git a/compiler/rustc_codegen_ssa/src/back/write.rs b/compiler/rustc_codegen_ssa/src/back/write.rs
-index 04be7956e..e90729456 100644
+index 0d7d85320d6f..82c4c5dafc4e 100644
 --- a/compiler/rustc_codegen_ssa/src/back/write.rs
 +++ b/compiler/rustc_codegen_ssa/src/back/write.rs
-@@ -1210,7 +1210,7 @@ fn start_executing_work<B: WriteBackendMethods>(
+@@ -1215,7 +1215,7 @@ fn start_executing_work<B: WriteBackendMethods>(
      allocator_config: Arc<ModuleConfig>,
      mut allocator_module: Option<ModuleCodegen<B::Module>>,
      coordinator_send: Sender<Message<B>>,
@@ -972,8 +960,8 @@ index 04be7956e..e90729456 100644
 +) -> CoordinatorHandle<Result<MaybeLtoModules<B>, ()>> {
      let sess = tcx.sess;
      let prof = sess.prof.clone();
- 
-@@ -1227,7 +1227,7 @@ fn start_executing_work<B: WriteBackendMethods>(
+     let incr_comp_session =
+@@ -1234,7 +1234,7 @@ fn start_executing_work<B: WriteBackendMethods>(
      // tokens before releasing them, so we can never accidentally release the last token
      // permanently held by rustc process.
      let parallel = match sess.opts.jobs.backend {
@@ -982,7 +970,7 @@ index 04be7956e..e90729456 100644
          _ => None,
      };
      let jobserver_helper = parallel.map(|_| {
-@@ -1642,16 +1642,22 @@ enum CodegenState {
+@@ -1644,16 +1644,22 @@ enum CodegenState {
                      {
                          helper.request_token();
                      }
@@ -1009,7 +997,7 @@ index 04be7956e..e90729456 100644
                  }
  
                  // If codegen is aborted that means translation was aborted due
-@@ -1706,9 +1712,12 @@ enum CodegenState {
+@@ -1708,9 +1714,12 @@ enum CodegenState {
  
                  Message::AddImportOnlyModule { bitcode_path, work_product } => {
                      assert_eq!(codegen_state, Ongoing);
@@ -1024,7 +1012,7 @@ index 04be7956e..e90729456 100644
                  }
              }
          }
-@@ -1777,6 +1786,9 @@ enum CodegenState {
+@@ -1780,6 +1789,9 @@ enum CodegenState {
              }),
          }))
      };
@@ -1034,7 +1022,7 @@ index 04be7956e..e90729456 100644
      return std::thread::Builder::new()
          .name("coordinator".to_owned())
          .spawn(f)
-@@ -1885,11 +1897,7 @@ fn spawn_work<'a, B: WriteBackendMethods>(
+@@ -1906,11 +1918,7 @@ fn spawn_work<'a, B: WriteBackendMethods>(
          };
          drop(coordinator_send.send(msg));
      };
@@ -1047,7 +1035,7 @@ index 04be7956e..e90729456 100644
  }
  
  fn spawn_thin_lto_work<B: WriteBackendMethods>(
-@@ -1932,11 +1940,7 @@ fn spawn_thin_lto_work<B: WriteBackendMethods>(
+@@ -1958,11 +1966,7 @@ fn spawn_thin_lto_work<B: WriteBackendMethods>(
          };
          drop(coordinator_send.send(msg));
      };
@@ -1060,7 +1048,7 @@ index 04be7956e..e90729456 100644
  }
  
  enum SharedEmitterMessage {
-@@ -2051,9 +2055,38 @@ fn check(&self, sess: &Session, blocking: bool) {
+@@ -2077,9 +2081,38 @@ fn check(&self, sess: &Session, blocking: bool) {
      }
  }
  
@@ -1100,7 +1088,7 @@ index 04be7956e..e90729456 100644
      // Only used for the Message type.
      phantom: PhantomData<B>,
  }
-@@ -2093,9 +2126,14 @@ pub fn join(
+@@ -2119,9 +2152,14 @@ pub fn join(
          incr_comp_session: Option<&IncrCompSession>,
          crate_info: &CrateInfo,
      ) -> (CompiledModules, WorkProductMap) {
@@ -1116,7 +1104,7 @@ index 04be7956e..e90729456 100644
              Ok(Ok(maybe_lto_modules)) => maybe_lto_modules,
              Ok(Err(())) => {
                  sess.dcx().abort_if_errors();
-@@ -2184,6 +2222,9 @@ pub(crate) fn check_for_errors(&self, sess: &Session) {
+@@ -2228,6 +2266,9 @@ pub(crate) fn check_for_errors(&self, sess: &Session) {
      }
  
      pub(crate) fn wait_for_signal_to_codegen_item(&self) {
@@ -1127,7 +1115,7 @@ index 04be7956e..e90729456 100644
              Ok(CguMessage) => {
                  // Ok to proceed.
 diff --git a/compiler/rustc_driver_impl/Cargo.toml b/compiler/rustc_driver_impl/Cargo.toml
-index 6dba3dff4..0477dbd3c 100644
+index 6dba3dff4732..0477dbd3c7af 100644
 --- a/compiler/rustc_driver_impl/Cargo.toml
 +++ b/compiler/rustc_driver_impl/Cargo.toml
 @@ -62,6 +62,7 @@ ctrlc = "3.4.4"
@@ -1139,10 +1127,10 @@ index 6dba3dff4..0477dbd3c 100644
  max_level_info = ['rustc_log/max_level_info']
  rustc_randomized_layouts = [
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 1ba7ce953..9e907709b 100644
+index b878affae386..90ce8c5eccd3 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
-@@ -1434,6 +1434,10 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
+@@ -1439,6 +1439,10 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
          };
          // Don't use a standard datetime format because Windows doesn't support `:` in paths
          let file_now = jiff::Zoned::now().strftime("%Y-%m-%dT%H_%M_%S");
@@ -1154,7 +1142,7 @@ index 1ba7ce953..9e907709b 100644
          path.push(format!("rustc-ice-{file_now}-{pid}.txt"));
          Some(path)
 diff --git a/compiler/rustc_interface/Cargo.toml b/compiler/rustc_interface/Cargo.toml
-index aea445679..378634aad 100644
+index aea445679283..378634aad71c 100644
 --- a/compiler/rustc_interface/Cargo.toml
 +++ b/compiler/rustc_interface/Cargo.toml
 @@ -15,6 +15,7 @@ rustc_attr_parsing = { path = "../rustc_attr_parsing" }
@@ -1173,7 +1161,7 @@ index aea445679..378634aad 100644
  llvm_offload = ['rustc_codegen_llvm/llvm_offload']
  # tidy-alphabetical-end
 diff --git a/compiler/rustc_interface/src/util.rs b/compiler/rustc_interface/src/util.rs
-index d58b7bfdd..c7393df49 100644
+index 06f354fef241..fb25c7a690a9 100644
 --- a/compiler/rustc_interface/src/util.rs
 +++ b/compiler/rustc_interface/src/util.rs
 @@ -185,6 +185,18 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
@@ -1205,7 +1193,7 @@ index d58b7bfdd..c7393df49 100644
          }
      });
 diff --git a/compiler/rustc_metadata/src/host_dylib.rs b/compiler/rustc_metadata/src/host_dylib.rs
-index 8f446d265..86db11348 100644
+index ad76eb4eb821..8f4e57d29c69 100644
 --- a/compiler/rustc_metadata/src/host_dylib.rs
 +++ b/compiler/rustc_metadata/src/host_dylib.rs
 @@ -1,7 +1,9 @@
@@ -1254,7 +1242,7 @@ index 8f446d265..86db11348 100644
      path: &Path,
      sym_name: &str,
 diff --git a/compiler/rustc_session/src/filesearch.rs b/compiler/rustc_session/src/filesearch.rs
-index 10c62d932..19e86253a 100644
+index 10c62d932ba2..19e86253afee 100644
 --- a/compiler/rustc_session/src/filesearch.rs
 +++ b/compiler/rustc_session/src/filesearch.rs
 @@ -276,6 +276,13 @@ fn current_dll_path() -> Result<PathBuf, String> {
@@ -1272,49 +1260,10 @@ index 10c62d932..19e86253a 100644
      fn default_from_rustc_driver_dll() -> Result<PathBuf, String> {
          let dll = current_dll_path()?;
 diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
-index 3aded5812..d342f5f66 100644
+index 3132fad0853c..91b0698e2541 100644
 --- a/src/bootstrap/src/core/build_steps/compile.rs
 +++ b/src/bootstrap/src/core/build_steps/compile.rs
-@@ -1817,6 +1817,38 @@ fn metadata(&self) -> Option<StepMetadata> {
-     }
- }
- 
-+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-+pub struct PlironCodegenBackend {
-+    pub compilers: RustcPrivateCompilers,
-+}
-+
-+impl Step for PlironCodegenBackend {
-+    type Output = BuildStamp;
-+
-+    fn run(self, builder: &Builder<'_>) -> Self::Output {
-+        let target = self.compilers.target();
-+        let build_compiler = self.compilers.build_compiler();
-+        let kind = CodegenBackendKind::Custom("pliron".to_string());
-+        let stamp = build_stamp::codegen_backend_stamp(builder, build_compiler, target, &kind);
-+        if builder.config.keep_stage.contains(&build_compiler.stage) {
-+            return stamp;
-+        }
-+        let mut cargo = builder::Cargo::new(
-+            builder,
-+            build_compiler,
-+            Mode::Codegen,
-+            SourceType::InTree,
-+            target,
-+            Kind::Build,
-+        );
-+        cargo.arg("--manifest-path").arg(builder.src.join("compiler/rustc_codegen_pliron/Cargo.toml"));
-+        let _guard =
-+            builder.msg(Kind::Build, "codegen backend pliron", Mode::Codegen, build_compiler, target);
-+        let files = run_cargo(builder, cargo, vec![], &stamp, vec![], ArtifactKeepMode::OnlyDylib);
-+        write_codegen_backend_stamp(stamp, files, builder.config.dry_run())
-+    }
-+}
-+
- /// Write filtered `files` into the passed build stamp and returns it.
- fn write_codegen_backend_stamp(
-     mut stamp: BuildStamp,
-@@ -2491,6 +2523,16 @@ fn run(self, builder: &Builder<'_>) -> Compiler {
+@@ -2529,6 +2529,11 @@ fn run(self, builder: &Builder<'_>) -> Compiler {
                          // library sysroots, so that they are available for cg_gcc.
                          dylib_set.install_to(builder, target_compiler);
                      }
@@ -1323,16 +1272,11 @@ index 3aded5812..d342f5f66 100644
 +                    {
 +                        continue;
 +                    }
-+                    CodegenBackendKind::Custom(name) if name == "pliron" => {
-+                        let stamp =
-+                            builder.ensure(PlironCodegenBackend { compilers: prepare_compilers() });
-+                        copy_codegen_backends_to_sysroot(builder, stamp, target_compiler);
-+                    }
-                     CodegenBackendKind::Llvm | CodegenBackendKind::Custom(_) => continue,
-                 }
-             }
+                     CodegenBackendKind::Custom(name) if name == "pliron" => {
+                         let stamp =
+                             builder.ensure(PlironCodegenBackend { compilers: prepare_compilers() });
 diff --git a/src/bootstrap/src/core/session.rs b/src/bootstrap/src/core/session.rs
-index 1808f1b88..535836cc7 100644
+index df6c8b395873..f337f25ec8d1 100644
 --- a/src/bootstrap/src/core/session.rs
 +++ b/src/bootstrap/src/core/session.rs
 @@ -699,6 +699,9 @@ pub(crate) fn rustc_features(

@@ -16,7 +16,7 @@ if [[ ! -d "$WT" ]]; then
     git -C "$RUST" worktree add --detach "$WT" "$COMMIT"
     git -C "$WT" apply "$B/selfhost/bootstrap.patch"
     # rustc-side hooks the backend needs (Session::fat_lto_supported,
-    # compiletest backend name). Lives on the rust fork's main as a commit;
+    # compiletest backend name). Lives on the rust fork's pliron-main branch;
     # mirrored here as a patch so fresh worktrees don't need it.
     git -C "$WT" apply "$B/selfhost/rustc-session.patch"
     cp "$B/selfhost/bootstrap.toml" "$WT/bootstrap.toml"
