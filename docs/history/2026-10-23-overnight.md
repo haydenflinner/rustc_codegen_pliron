@@ -239,3 +239,52 @@ Cranelift's egraph rebuilds it with a `madd` at every exit check. The
 egraph rewrote `block0`'s only out-of-loop use (`v0 == v0+v16` became
 `v16 == 0`), and elaboration then doesn't hoist it to the preheader.
 `PLIRON_COMPILE_EGRAPH=0` computes it once. Not investigated further.
+
+## Selfhost stage 2 (c29dc27)
+
+Stage 2 had been killed by earlyoom on every attempt tonight, even
+running alone. That was not memory pressure but a runaway loop:
+`rustc_hir_typeck` went from 3.7 GB to 11 GB in 2 s, with or without
+`PLIRON_CGUPAR=0`. Found with `PLIRON_TRACE_FILE`: one function,
+`FnCtxt::suggest_floating_point_literal`, was left mid-pipeline after
+`edgespec`. A `PLIRON_CLIF_STEPS` dump of it, replayed through
+`clif-check step bittab`, hit "shift right with overflow".
+
+`bittab` split the accepted mask into runs with `m >>= (!m).trailing_zeros()`.
+For an all-ones mask (64 consecutive accepted values) that shift is 64,
+and release wraps it to 0, so the loop never ends (c29dc27, test
+`bittab_top_run`). With the fix, stage 2 builds in 7m48s.
+
+UI results (`selfhost/verify.sh`):
+
+- Stage 1: 57 failures, down from 63. That is exactly the six real bugs
+  fixed earlier tonight (fn align, tail-cc byval, `01b` labels, three
+  C-variadic tests).
+- Stage 2 is **broken**. The pliron-built stage 2 `rustc` ICEs compiling
+  `core` at `rustc_expand/src/placeholders.rs:224`: `expanded_fragments`
+  is an `FxHashMap`, and its `.remove(&id).unwrap()` finds nothing. That
+  is a miscompile in the stage 2 compiler.
+- Standalone repro, a few seconds:
+  `RUSTC_BOOTSTRAP=1 build/aarch64-apple-darwin/stage2/bin/rustc --crate-name core --crate-type lib --edition 2024 library/core/src/lib.rs --emit=metadata -o /tmp/core.rmeta`
+- Each bisection step needs a stage 2 rebuild after
+  `rm -rf build/<host>/stage2-rustc`, because cargo doesn't track
+  `PLIRON_*` vars (about 8 minutes).
+- It is an optimization bug. With `PLIRON_OPT_FNS=0..0`, stage 2
+  rebuilds in 1.5 minutes and compiles `core` cleanly.
+- A function bisection was started at 08:17 on 2026-10-23 (17 or more
+  stage 2 rebuilds). Step command:
+  `rust-sh/selfhost-logs/fnbisect/cmd.sh`. Progress:
+  `rust-sh/selfhost-logs/fnbisect/fnbisect.log`. The culprit list lands in
+  `.../fnbisect/wd/culprits.txt`.
+
+## Remaining open
+
+- Stage 2 ICE above (bisection running).
+- `asm/aarch64/may_unwind.rs`: our `asm!` stubs carry no unwind info, so
+  unwinding out of `asm!` aborts. Needs CFI on the stub and an
+  `__eh_frame` splice.
+- `asm/label-operand.rs` (asm goto) is unsupported.
+- arrayvec `find_all` is still about 14% behind LLVM: see the `madd`
+  note in the `bump_hoist` section.
+- Not run tonight on current main: a crates tier 1–3 rerun, the default-on
+  decision for selchain/mulcarry/stepcmp, and fuzz seeds 4096 and up.
