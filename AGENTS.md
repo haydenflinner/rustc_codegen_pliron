@@ -60,7 +60,7 @@ and make our wasm benchmarks look better than they are.
 
 ## Build
 
-Pinned toolchain `nightly-2026-10-06` (`rust-toolchain.toml`; needs
+Pinned toolchain `nightly-2026-10-22` (`rust-toolchain.toml`; needs
 `rustc-dev`, `rust-src`, `llvm-tools-preview`).
 
 - `cargo build` → `target/debug/librustc_codegen_pliron.{dylib,so}`,

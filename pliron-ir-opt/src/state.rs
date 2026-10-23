@@ -327,6 +327,11 @@ pub struct State {
     pub strs: SymMap<Value>,
     pub counter: usize,
     pub cgu: String,
+    /// Symbol of the EH personality function. rustc mangles it as a
+    /// std-internal symbol since nightly-2026-10-22
+    /// (`_RNvCs.._7___rustc19rust_eh_personality`); empty means the
+    /// unmangled `rust_eh_personality`.
+    pub eh_personality: String,
     pub asm: String,
     /// EII symbol aliases: (alias, aliasee, weak); emitted as extra object symbols.
     pub aliases: Vec<(String, String, bool)>,

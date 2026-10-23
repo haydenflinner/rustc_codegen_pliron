@@ -7,7 +7,7 @@
 #   ./build.sh --host                           every crate incl. proc macros/build scripts via pliron (target-host/)
 B="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$(dirname "$0")"
-export RUSTUP_TOOLCHAIN=nightly-2026-10-06
+export RUSTUP_TOOLCHAIN=nightly-2026-10-22
 export RUSTFLAGS="-Zcodegen-backend=$B/target/debug/librustc_codegen_pliron.so -Clinker-features=-lld -Clink-self-contained=-linker -Zunstable-options -Clink-arg=-B$B/target/wild-ld"
 if [[ "${1:-}" == --host ]]; then
     shift

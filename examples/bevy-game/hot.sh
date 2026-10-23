@@ -7,7 +7,7 @@
 #   ./hot.sh --patch OUT.o         just build one patch object
 B="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$(dirname "$0")"
-export RUSTUP_TOOLCHAIN=nightly-2026-10-06
+export RUSTUP_TOOLCHAIN=nightly-2026-10-22
 export RUSTFLAGS="-Zcodegen-backend=$B/target/debug/librustc_codegen_pliron.so -Clinker-features=-lld -Clink-self-contained=-linker -Zunstable-options -Clink-arg=-B$B/target/wild-ld"
 CR=(cargo rustc -q --target x86_64-unknown-linux-gnu --bin pliron_bevy_game --)
 H=target/hot; mkdir -p "$H/patches"

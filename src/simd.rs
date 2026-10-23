@@ -207,7 +207,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         use rustc_codegen_ssa::diagnostics::{
             ExpectedPointerMutability, InvalidMonomorphization as IM,
         };
-        use rustc_middle::ty::{self, consts::ConstExt};
+        use rustc_middle::ty;
         let name_sym = rustc_span::Symbol::intern(name);
         macro_rules! fail {
             ($err:expr) => {{

@@ -10,7 +10,7 @@ B="$(cd "$(dirname "$0")/.." && pwd)"
 RUST="${1:-${RUST_CHECKOUT:-$B/../rust}}"
 [[ -d "$RUST/tests/ui" ]] || RUST="$HOME/work/rust"
 WT="${2:-$RUST-sh}"
-COMMIT=$(rustc +nightly-2026-10-06 -vV | sed -n 's/^commit-hash: //p')
+COMMIT=$(rustc +nightly-2026-10-22 -vV | sed -n 's/^commit-hash: //p')
 if [[ ! -d "$WT" ]]; then
     git -C "$RUST" cat-file -e "$COMMIT" 2>/dev/null || git -C "$RUST" fetch --depth=1 origin "$COMMIT"
     git -C "$RUST" worktree add --detach "$WT" "$COMMIT"

@@ -22,7 +22,7 @@ import argparse, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time, 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "target", "crates")
-TOOLCHAIN = "nightly-2026-10-06"
+TOOLCHAIN = "nightly-2026-10-22"
 
 # (name, version, extra cargo-test args, tier[, git]). Pinned 2026-10-21;
 # bump deliberately so a new failure means a compiler change, not a crate

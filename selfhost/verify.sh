@@ -33,8 +33,8 @@ ONLY="${3:-both}"
 OUT="$WT/verify-out"
 WATCHDOG_MIN=5
 
-HOST="$(rustc +nightly-2026-10-06 -vV | sed -n 's/^host: //p')"
-export PATH="$HOME/.rustup/toolchains/nightly-2026-10-06-$HOST/lib/rustlib/$HOST/bin:$PATH"
+HOST="$(rustc +nightly-2026-10-22 -vV | sed -n 's/^host: //p')"
+export PATH="$HOME/.rustup/toolchains/nightly-2026-10-22-$HOST/lib/rustlib/$HOST/bin:$PATH"
 
 mkdir -p "$OUT"
 cd "$WT"

@@ -205,7 +205,7 @@ pub fn fat(
     for rlib in each_linked_rlib_for_lto {
         let data = std::fs::read(rlib)
             .unwrap_or_else(|e| dcx.fatal(format!("reading {}: {e}", rlib.display())));
-        let link = rmeta_link::read_from_data(&data, rlib).unwrap_or_else(|| {
+        let link = rmeta_link::read_from_data(&data, rlib, sess.target.is_like_aix).unwrap_or_else(|| {
             dcx.fatal(format!("{}: no readable lib.rmeta-link member", rlib.display()))
         });
         let ar = object::read::archive::ArchiveFile::parse(&*data)

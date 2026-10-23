@@ -20,9 +20,9 @@ type_info vftable, GS-cookie shims) into symbols.o, plus .drectve
 import os, re, subprocess, sys
 
 SR = subprocess.check_output(
-    ["rustup", "run", "nightly-2026-10-06", "rustc", "--print", "sysroot"]
+    ["rustup", "run", "nightly-2026-10-22", "rustc", "--print", "sysroot"]
     if os.name == "nt" else
-    ["rustc", "+nightly-2026-10-06", "--print", "sysroot"]
+    ["rustc", "+nightly-2026-10-22", "--print", "sysroot"]
 ).decode().strip()
 BINDIR = os.path.join(SR, "lib/rustlib/x86_64-pc-windows-msvc/bin")
 RO = os.path.join(BINDIR, "llvm-readobj.exe")

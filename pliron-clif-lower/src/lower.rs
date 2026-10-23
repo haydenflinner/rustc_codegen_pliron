@@ -1080,7 +1080,12 @@ pub fn lower_module<'a>(
         None
     };
 
-    let mut eh = crate::eh::UnwindContext::new(m, true, unwind);
+    let personality = if st.eh_personality.is_empty() {
+        "rust_eh_personality"
+    } else {
+        st.eh_personality.as_str()
+    };
+    let mut eh = crate::eh::UnwindContext::new(m, true, unwind, personality);
     let cfg = m.target_config();
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();

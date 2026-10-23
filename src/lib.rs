@@ -1519,6 +1519,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
     fn run_thin_lto(
         _cgcx: &CodegenContext,
         _prof: &SelfProfilerRef,
+        _incr_comp_session: Option<&rustc_session::BorrowedIncrCompSession>,
         dcx: DiagCtxtHandle<'_>,
         _exported_symbols_for_lto: &[String],
         _each_linked_rlib_for_lto: &[PathBuf],

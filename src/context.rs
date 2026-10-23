@@ -80,7 +80,10 @@ impl<'tcx> CodegenCx<'tcx> {
             cgu_name: name.to_string(),
             pctx: RefCell::new(ctx),
             module,
-            st: RefCell::new(State::default()),
+            st: RefCell::new(State {
+                eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx),
+                ..State::default()
+            }),
             const_allocs: Default::default(),
             vtables: Default::default(),
             tcache: Default::default(),
@@ -456,7 +459,8 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn eh_personality(&self) -> Ptr<Operation> {
         let void = self.type_void();
         let ty = self.type_func(&[], void);
-        self.declare_fn_sym("rust_eh_personality", ty, Linkage::Import, Exts::default())
+        let name = self.st.borrow().eh_personality.clone();
+        self.declare_fn_sym(&name, ty, Linkage::Import, Exts::default())
     }
 
     fn sess(&self) -> &Session {
@@ -654,16 +658,9 @@ fn frozen_params(
             PassMode::Ignore => continue,
             PassMode::Direct(a) => (Some(a), 1),
             PassMode::Pair(a, _) => (Some(a), 2),
-            PassMode::Indirect {
-                meta_attrs: Some(_),
-                ..
-            } => (None, 2),
+            PassMode::IndirectUnsized { .. } => (None, 2),
             PassMode::Cast { pad_i32_count, .. } => (None, *pad_i32_count as usize + 1),
-            PassMode::Indirect {
-                attrs,
-                meta_attrs: None,
-                ..
-            } => (Some(attrs), 1),
+            PassMode::Indirect { attrs, .. } => (Some(attrs), 1),
         };
         if let Some(s) = a.and_then(size) {
             v.push((i, s));
@@ -679,9 +676,8 @@ fn frozen_params(
         let ats: [Option<&ArgAttributes>; 2] = match &arg.mode {
             PassMode::Direct(a) => [Some(a), None],
             PassMode::Pair(a, b) => [Some(a), Some(b)],
-            PassMode::Indirect {
-                attrs, meta_attrs, ..
-            } => [Some(attrs), meta_attrs.as_ref()],
+            PassMode::Indirect { attrs, .. } => [Some(attrs), None],
+            PassMode::IndirectUnsized { attrs, meta_attrs } => [Some(attrs), Some(meta_attrs)],
             _ => [None, None],
         };
         for (k, at) in ats.into_iter().enumerate() {

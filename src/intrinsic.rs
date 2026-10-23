@@ -511,6 +511,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn expect(&mut self, cond: Value, _expected: bool) -> Value {
         cond
     }
+    fn ctpop(&mut self, val: Value) -> Value {
+        let ty = self.val_ty(val);
+        let r = self.intrinsic("llvm.ctpop", ty, &[val]);
+        let i32t = self.type_i32();
+        self.intcast(r, i32t, false)
+    }
     fn type_checked_load(
         &mut self,
         _llvtable: Value,

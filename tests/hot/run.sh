@@ -4,7 +4,7 @@
 # picks it up with the static's state intact.
 set -euo pipefail
 B="$(cd "$(dirname "$0")/../.." && pwd)"
-export RUSTUP_TOOLCHAIN=nightly-2026-10-06
+export RUSTUP_TOOLCHAIN=nightly-2026-10-22
 FL="-Zcodegen-backend=$B/target/debug/librustc_codegen_pliron.so -Ccodegen-units=1"
 W="$B/target/hot-test"; rm -rf "$W"; mkdir -p "$W/patches"
 RUSTFLAGS="$FL -Clinker=$B/selfhost/cc-wild" CARGO_TARGET_DIR="$W/agent" \

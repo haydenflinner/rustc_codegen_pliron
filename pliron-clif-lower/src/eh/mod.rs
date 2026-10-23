@@ -51,7 +51,8 @@ pub struct UnwindContext {
 
 impl UnwindContext {
     /// `unwind`: reference `rust_eh_personality` and emit LSDAs (panic=unwind).
-    pub fn new(module: &mut dyn Module, pic: bool, unwind: bool) -> Self {
+    /// `personality`: the personality function's symbol.
+    pub fn new(module: &mut dyn Module, pic: bool, unwind: bool, personality: &str) -> Self {
         let endian = match module.isa().endianness() {
             Endianness::Little => RunTimeEndian::Little,
             Endianness::Big => RunTimeEndian::Big,
@@ -92,7 +93,8 @@ impl UnwindContext {
                     };
                     cie.lsda_encoding = Some(ptr_enc);
                     let pt = module.target_config().pointer_type();
-                    let personality = match module.get_name("rust_eh_personality") {
+                    let personality_name = personality;
+                    let personality = match module.get_name(personality_name) {
                         Some(FuncOrDataId::Func(id)) => id,
                         _ => {
                             let sig = Signature {
@@ -107,7 +109,7 @@ impl UnwindContext {
                                 call_conv: module.target_config().default_call_conv,
                             };
                             module
-                                .declare_function("rust_eh_personality", Linkage::Import, &sig)
+                                .declare_function(personality_name, Linkage::Import, &sig)
                                 .unwrap()
                         }
                     };
@@ -121,7 +123,7 @@ impl UnwindContext {
                         // Indirect so the personality may live in another DSO.
                         let pref = module
                             .declare_data(
-                                "DW.ref.rust_eh_personality",
+                                &format!("DW.ref.{personality_name}"),
                                 Linkage::Local,
                                 false,
                                 false,

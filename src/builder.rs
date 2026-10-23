@@ -1219,11 +1219,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 let n = match &a.mode {
                     PassMode::Ignore => 0,
                     PassMode::Pair(..) => 2,
-                    PassMode::Indirect { meta_attrs, .. } => usize::from(meta_attrs.is_some()) + 1,
+                    PassMode::Indirect { .. } => 1,
+                    PassMode::IndirectUnsized { .. } => 2,
                     PassMode::Cast { pad_i32_count, .. } => usize::from(*pad_i32_count) + 1,
                     PassMode::Direct(_) => 1,
                 };
-                let cap = matches!(a.mode, PassMode::Indirect { .. })
+                let cap = matches!(a.mode, PassMode::Indirect { .. } | PassMode::IndirectUnsized { .. })
                     && deduced
                         .get(ai + 1)
                         .is_some_and(|d| d.captures_none(self.tcx, env, a.layout.ty));
@@ -1241,7 +1242,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 // `{&RandomState}` closure envs. Raw pointers and plain
                 // scalars keep `Size(0)` and are filtered out.
                 let ext = match &a.mode {
-                    PassMode::Indirect { meta_attrs, .. } if meta_attrs.is_none() => {
+                    PassMode::Indirect { .. } => {
                         Some((a.layout.size.bytes(), a.layout.align.abi.bytes()))
                     }
                     PassMode::Direct(attrs) => {
@@ -1255,7 +1256,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 // callee cannot legally touch the pointee through a retained
                 // copy afterwards — SROA syncs pinned slices around the call.
                 let na: &[bool] = match &a.mode {
-                    PassMode::Direct(attrs) | PassMode::Indirect { attrs, .. } => &[attrs
+                    PassMode::Direct(attrs)
+                    | PassMode::Indirect { attrs, .. }
+                    | PassMode::IndirectUnsized { attrs, .. } => &[attrs
                         .regular
                         .contains(rustc_target::callconv::ArgAttribute::NoAlias)],
                     PassMode::Pair(a0, a1) => &[
@@ -1367,10 +1370,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let b = next(self);
                 OperandValue::Pair(a, b).store(self, dst);
             }
-            PassMode::Indirect {
-                meta_attrs: Some(_),
-                ..
-            } => {
+            PassMode::IndirectUnsized { .. } => {
                 let a = next(self);
                 let b = next(self);
                 OperandValue::Ref(rustc_codegen_ssa::mir::place::PlaceValue {
@@ -1381,9 +1381,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 .store(self, dst);
             }
             PassMode::Direct(_)
-            | PassMode::Indirect {
-                meta_attrs: None, ..
-            }
+            | PassMode::Indirect { .. }
             | PassMode::Cast { .. } => {
                 if let PassMode::Cast { pad_i32_count, .. } = arg_abi.mode {
                     for _ in 0..pad_i32_count {
@@ -1405,9 +1403,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         use rustc_target::callconv::PassMode;
         match &arg_abi.mode {
             PassMode::Ignore => {}
-            PassMode::Indirect {
-                meta_attrs: None, ..
-            } => {
+            PassMode::Indirect { .. } => {
                 let place = PlaceRef::new_sized(val, arg_abi.layout);
                 OperandValue::Ref(place.val).store(self, dst);
             }
