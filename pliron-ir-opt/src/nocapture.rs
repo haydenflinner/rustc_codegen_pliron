@@ -70,6 +70,10 @@ impl ascent::Lattice for Mask {
     }
 }
 
+/// A store into a slot with more loads than this flows through the slot
+/// pointer instead of to each load (see the store case in `run`).
+const SLOT_FANOUT: usize = 8;
+
 fn bits(m: Mask) -> impl Iterator<Item = u32> {
     (0..MAX_PARAMS).filter(move |i| m.0 & (1 << i) != 0)
 }
@@ -200,6 +204,8 @@ pub fn run(ctx: &Context, st: &mut State) {
     // `classify` on a value's type, memoized — the flow loop otherwise
     // re-walks the type per (result × operand) pair.
     let mut kinds: FxHashMap<Value, (bool, bool)> = FxHashMap::default();
+    // Slot pointers already linked to their loads (see the store case).
+    let mut via_slot: FxHashSet<Value> = FxHashSet::default();
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
@@ -281,8 +287,20 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // not a capture: the pointer can only come back through
                     // that slot's load results, so flow to them instead.
                     // Anything else retains — the pointer can roam.
+                    // Many loads: route through the slot pointer, stores ->
+                    // `dp` -> each load, so a slot with S stores and L loads
+                    // costs S + L flows, not S x L (1.2e9 in cranelift-
+                    // codegen's ISLE matchers after sroa; the fixpoint never
+                    // finished). Sound: a frame-confined slot pointer only
+                    // feeds loads, stores and GEPs of the same slot.
                     let (sv, dp) = (d.get_operand(ctx, 0), d.get_operand(ctx, 1));
                     match crate::sroa::slot_loads(ctx, st, dp, 0, &mut accmemo) {
+                        Some(ls) if ls.len() > SLOT_FANOUT => {
+                            p.flow.push((sv, dp));
+                            if via_slot.insert(dp) {
+                                p.flow.extend(ls.into_iter().map(|r| (dp, r)));
+                            }
+                        }
                         Some(ls) => p.flow.extend(ls.into_iter().map(|r| (sv, r))),
                         None => retain(sv),
                     }
@@ -347,6 +365,16 @@ pub fn run(ctx: &Context, st: &mut State) {
                 }
             }
         }
+    }
+    if crate::env_get("PLIRON_TRACE_FILE").is_some() {
+        let sizes = format!(
+            "nocap-sizes flow={} param={} retain={} arg={}",
+            p.flow.len(),
+            p.param.len(),
+            p.retain.len(),
+            p.arg.len()
+        );
+        pliron_cfg::trace(&sizes, 0.0, &st.cgu);
     }
     let trun = std::time::Instant::now();
     p.run();
@@ -417,22 +445,9 @@ mod tests {
     /// slot loads were tracked, so `p` came out `nocapture`; serde_json's
     /// `BTreeMap::extract_if` (whose iterator holds `&mut self.length`)
     /// then let callers keep the map's length across `ExtractIf::next`.
-    #[test]
-    fn int_copy_through_slot_captures() {
-        let input = r#"
-        builtin.module @m {
-        ^b():
-          llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {
-          ^e(p: llvm.ptr (0), out: llvm.ptr (0)):
-            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
-            s = llvm.alloca [builtin.integer i64 x one] : llvm.ptr (0);
-            llvm.store *s <- p;
-            w = llvm.load s : builtin.integer i64;
-            llvm.store *out <- w;
-            llvm.return
-          }
-        }
-        "#;
+    /// Parse `input`, register every `llvm.func` (and its allocas) in a
+    /// fresh `State`, run the pass, and return `@f`'s nocapture set.
+    fn analyze_f(input: &str, nparams: usize) -> FxHashSet<u32> {
         let ctx = &mut Context::new();
         let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
         let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
@@ -470,14 +485,73 @@ mod tests {
                     frozen: Vec::new(),
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
-                    nparams: 2,
+                    nparams,
                     tail_cc: false,
                 },
             );
         }
         run(ctx, &mut st);
-        let nc = st.nocapture.get("f").expect("f analyzed");
+        st.nocapture.get("f").expect("f analyzed").clone()
+    }
+
+    #[test]
+    fn int_copy_through_slot_captures() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {
+          ^e(p: llvm.ptr (0), out: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            s = llvm.alloca [builtin.integer i64 x one] : llvm.ptr (0);
+            llvm.store *s <- p;
+            w = llvm.load s : builtin.integer i64;
+            llvm.store *out <- w;
+            llvm.return
+          }
+        }
+        "#;
+        let nc = analyze_f(input, 2);
         assert!(!nc.contains(&0), "p escaped as i64 bytes but stayed nocapture");
         assert!(nc.contains(&1), "out is only written through");
+    }
+
+    /// A slot with more than `SLOT_FANOUT` loads routes its stores through
+    /// the slot pointer (S + L flows instead of S x L; cranelift-codegen's
+    /// ISLE matchers made 1.2e9 after sroa and the fixpoint never ended).
+    /// The routed path must still carry the stored pointer to every load:
+    /// `p` leaks through the last of twelve loads, `q` only through none.
+    #[test]
+    fn many_load_slot_still_carries_stores() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {
+          ^e(p: llvm.ptr (0), q: llvm.ptr (0), out: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            s = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            t = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            llvm.store *s <- p;
+            llvm.store *t <- q;
+            w0 = llvm.load s : llvm.ptr (0);
+            w1 = llvm.load s : llvm.ptr (0);
+            w2 = llvm.load s : llvm.ptr (0);
+            w3 = llvm.load s : llvm.ptr (0);
+            w4 = llvm.load s : llvm.ptr (0);
+            w5 = llvm.load s : llvm.ptr (0);
+            w6 = llvm.load s : llvm.ptr (0);
+            w7 = llvm.load s : llvm.ptr (0);
+            w8 = llvm.load s : llvm.ptr (0);
+            w9 = llvm.load s : llvm.ptr (0);
+            w10 = llvm.load s : llvm.ptr (0);
+            w11 = llvm.load s : llvm.ptr (0);
+            llvm.store *out <- w11;
+            llvm.return
+          }
+        }
+        "#;
+        let nc = analyze_f(input, 3);
+        assert!(!nc.contains(&0), "p reaches `out` through the slot's 12th load");
+        assert!(nc.contains(&1), "q sits in its own slot, never loaded");
+        assert!(nc.contains(&2), "out is only written through");
     }
 }
