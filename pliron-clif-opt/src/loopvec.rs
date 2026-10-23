@@ -2257,6 +2257,14 @@ fn plan(
     {
         why!(fname; "gather trip {t} below one vector group");
     }
+    // A runtime trip count a dominating guard caps below one vector group
+    // (`len <u 9` before an inline-array slice loop) never reaches the
+    // vector body: skip the clone, its dispatch and the remainder loop.
+    if let Some(m) = crate::loopidiom::count_trip_max(func, cfg, dt, info.h, &cnt)
+        && m < u64::from(vf) * UNROLL as u64
+    {
+        why!(fname; "trip <= {m} below one vector group");
+    }
     let mut preds: Vec<VPred> = extra
         .into_iter()
         .chain(it_preds)

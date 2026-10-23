@@ -312,6 +312,38 @@ fn cap_unroll(k: i64, trip: Option<u64>) -> Option<i64> {
     Some(k.min(t.next_power_of_two() as i64 / 2).max(2))
 }
 
+/// Without a profile (`trip`), cap K by the trip bound the header's
+/// dominating guards prove (`len <u 9` over an inline array): K copies only
+/// run when `rem >= K`, and the bound is a worst case, so K stays within an
+/// eighth of it — no unroll below 16 trips. `Err(bound)` when that leaves
+/// K < 2.
+fn guard_cap(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    cnt: &Cnt,
+    k: i64,
+    trip: Option<u64>,
+) -> Result<i64, u64> {
+    if trip.is_some() {
+        return Ok(k);
+    }
+    let iv0 = crate::loopidiom::entry_arg(func, cfg, dt, h, cnt.pidx);
+    let m = iv0.and_then(|iv0| crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le));
+    if debug() {
+        tracing::debug!(target: "pliron::punroll", "guard_cap block{}: iv0 {iv0:?} bound {} step {} max {m:?}", h.as_u32(), cnt.bound, cnt.step);
+    }
+    let Some(m) = m else {
+        return Ok(k);
+    };
+    let q = m / 8;
+    if q < 2 {
+        return Err(m);
+    }
+    Ok(k.min(1i64 << (63 - q.leading_zeros())))
+}
+
 pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
@@ -1296,6 +1328,10 @@ fn run_loop(
     let Some(cnt) = find_count(func, h, &body, cfg, dt, x, y, cond, &hparams, &cont_args) else {
         bail!("no counting test")
     };
+    let k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
+        Ok(k) => k,
+        Err(m) => bail!(format!("trip <= {m}")),
+    };
 
     let ity = func.dfg.value_type(hparams[cnt.pidx]);
     // `bound - a0` must not wrap: <=32-bit counters widen to i64 (signed or
@@ -2198,6 +2234,10 @@ fn run_region(
     };
     let Some(k) = cap_unroll(k, trip) else {
         bail!("measured trip below 2");
+    };
+    let k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
+        Ok(k) => k,
+        Err(m) => bail!(format!("trip <= {m}")),
     };
     let ity = func.dfg.value_type(hparams[cnt.pidx]);
     let wty = if ity.bits() <= 32 { types::I64 } else { ity };

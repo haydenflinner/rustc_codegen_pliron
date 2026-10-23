@@ -387,6 +387,291 @@ pub fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
     })
 }
 
+/// Unsigned upper bounds on values that a block's dominating guards prove:
+/// each dominator ending in `brif (icmp cc x, K)` whose successor on the
+/// way to `b` has that dominator as its only predecessor bounds `x` on that
+/// edge (`x <u K`, `x <=u K`, `x == K`, and their complements on the false
+/// edge). Feeds [`count_trip_max`]; callers use the bound as a cost input.
+pub fn dom_guards(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    b: Block,
+) -> FxHashMap<Value, u64> {
+    let mut g: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut cur = b;
+    for _ in 0..64 {
+        let Some(d) = dt.idom(cur) else { break };
+        if let Some(t) = func.layout.last_inst(d)
+            && let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t]
+        {
+            let (tb, eb) = (blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists));
+            let only_d = |s: Block| cfg.pred_iter(s).all(|p| p.block == d);
+            let taken = if tb != eb && only_d(tb) && dt.block_dominates(tb, b) {
+                Some(true)
+            } else if tb != eb && only_d(eb) && dt.block_dominates(eb, b) {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(taken) = taken
+                && let Some((x, m)) = guard_bound(func, arg, taken)
+            {
+                let e = g.entry(x).or_insert(u64::MAX);
+                *e = (*e).min(m);
+            }
+        }
+        cur = d;
+    }
+    g
+}
+
+/// The `(x, max)` an edge of `brif c` proves: `c` is `icmp cc x, K` (either
+/// operand order) and the edge is taken when `c == taken`.
+fn guard_bound(func: &Function, c: Value, taken: bool) -> Option<(Value, u64)> {
+    let ci = func.dfg.resolved_value_def(c).inst()?;
+    let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[ci] else {
+        return None;
+    };
+    let (x, k, cc) = match (iconst(func, args[0]), iconst(func, args[1])) {
+        (None, Some(k)) => (args[0], k, cond),
+        (Some(k), None) => (args[1], k, cond.swap_args()),
+        _ => return None,
+    };
+    let cc = if taken { cc } else { cc.complement() };
+    let bits = func.dfg.value_type(x).bits().min(64);
+    let k = (k as u64) & (u64::MAX >> (64 - bits));
+    let m = match cc {
+        IntCC::UnsignedLessThan => k.checked_sub(1)?,
+        IntCC::UnsignedLessThanOrEqual | IntCC::Equal => k,
+        _ => return None,
+    };
+    Some((func.dfg.resolve_aliases(x), m))
+}
+
+/// Unsigned upper bound on `v`: its type's range, tightened by `g` and
+/// through `uextend`/`iadd`/`imul`/`ishl`/`ushr`/`band`/`udiv` and
+/// `isub (a + X), a`. A block param is the max over its incoming edges,
+/// each with the guard its `brif` edge proves (loop rotation duplicates a
+/// `len <u 9` check onto every entry of the guarded block). Depth-bounded.
+pub fn val_umax(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    v: Value,
+    g: &FxHashMap<Value, u64>,
+    depth: u32,
+) -> u64 {
+    let v = func.dfg.resolve_aliases(v);
+    let bits = func.dfg.value_type(v).bits().clamp(1, 64);
+    let mut m = u64::MAX >> (64 - bits);
+    if let Some(&gm) = g.get(&v) {
+        m = m.min(gm);
+    }
+    if let Some(k) = iconst(func, v) {
+        return m.min(k as u64 & (u64::MAX >> (64 - bits)));
+    }
+    if depth == 0 {
+        return m;
+    }
+    let um = |x: Value| val_umax(func, cfg, x, g, depth - 1);
+    let kv = |x: Value| iconst(func, x).filter(|&k| k >= 0).map(|k| k as u64);
+    let d = match func.dfg.value_def(v) {
+        ValueDef::Param(b, idx) => param_umax(func, cfg, b, idx, g, depth - 1),
+        ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } => Some(um(arg)),
+            InstructionData::Binary { opcode, args: [a, b] } => match opcode {
+                Opcode::Iadd => um(a).checked_add(um(b)),
+                Opcode::Imul => um(a).checked_mul(um(b)),
+                Opcode::Ishl => kv(b)
+                    .filter(|&s| s < 64)
+                    .and_then(|s| um(a).checked_mul(1u64 << s)),
+                Opcode::Ushr => kv(b).filter(|&s| s < 64).map(|s| um(a) >> s),
+                Opcode::Band => Some(um(a).min(um(b))),
+                Opcode::Udiv => kv(b).filter(|&k| k > 0).map(|k| um(a) / k),
+                Opcode::Isub => sub_cancel(func, cfg, a, b).map(um),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    d.map_or(m, |d| m.min(d))
+}
+
+/// Max over `b`'s incoming edges of the bound on param `idx`'s argument,
+/// adding the bound the edge's own `brif` proves. `None` if any edge isn't
+/// a plain `jump`/`brif` value argument.
+fn param_umax(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    b: Block,
+    idx: usize,
+    g: &FxHashMap<Value, u64>,
+    depth: u32,
+) -> Option<u64> {
+    let mut best = 0u64;
+    let mut any = false;
+    for p in cfg.pred_iter(b) {
+        let t = p.inst;
+        let (args, edge) = match func.dfg.insts[t] {
+            InstructionData::Jump { destination, .. } => (destination, None),
+            InstructionData::Brif { arg, blocks, .. } => {
+                let (tb, eb) = (blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists));
+                if tb == eb {
+                    return None;
+                }
+                if tb == b {
+                    (blocks[0], Some((arg, true)))
+                } else {
+                    (blocks[1], Some((arg, false)))
+                }
+            }
+            _ => return None,
+        };
+        let BlockArg::Value(a) = args.args(&func.dfg.value_lists).nth(idx)? else {
+            return None;
+        };
+        let mut ge;
+        let gr = match edge.and_then(|(c, tk)| guard_bound(func, c, tk)) {
+            Some((x, mx)) => {
+                ge = g.clone();
+                let e = ge.entry(x).or_insert(u64::MAX);
+                *e = (*e).min(mx);
+                &ge
+            }
+            None => g,
+        };
+        best = best.max(val_umax(func, cfg, a, gr, depth));
+        any = true;
+    }
+    any.then_some(best)
+}
+
+/// `X` when `a` is `iadd b, X` (either order): `a - b` is exactly `X`.
+/// Params of single-predecessor blocks are followed to their argument on
+/// both sides (rotation passes a loop's start through a guard block), and
+/// non-negative constant offsets are stripped from `b` — `(y + X) - (y + c)
+/// <= X` keeps `X` an upper bound (a rotated loop starts one step in).
+fn sub_cancel(func: &Function, cfg: &ControlFlowGraph, a: Value, b: Value) -> Option<Value> {
+    let a = fwd_param(func, cfg, a);
+    let mut b = fwd_param(func, cfg, b);
+    for _ in 0..4 {
+        let Some(bi) = func.dfg.value_def(b).inst() else { break };
+        let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[bi] else {
+            break;
+        };
+        let nxt = match (iconst(func, args[0]), iconst(func, args[1])) {
+            (_, Some(k)) if k >= 0 => args[0],
+            (Some(k), _) if k >= 0 => args[1],
+            _ => break,
+        };
+        b = fwd_param(func, cfg, nxt);
+    }
+    let ai = func.dfg.value_def(a).inst()?;
+    let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[ai] else {
+        return None;
+    };
+    let args = args.map(|x| fwd_param(func, cfg, x));
+    (args[0] == b).then_some(args[1]).or((args[1] == b).then_some(args[0]))
+}
+
+/// `v`, or — while it is a param of a block with exactly one incoming edge
+/// that is a plain `jump`/`brif` — the value that edge passes (bounded).
+fn fwd_param(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Param(b, idx) = func.dfg.value_def(v) else { break };
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else { break };
+        let bc = match func.dfg.insts[p.inst] {
+            InstructionData::Jump { destination, .. } => destination,
+            InstructionData::Brif { blocks, .. } => {
+                let (tb, eb) = (blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists));
+                if tb == eb {
+                    break;
+                }
+                if tb == b { blocks[0] } else { blocks[1] }
+            }
+            _ => break,
+        };
+        let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(idx) else { break };
+        v = func.dfg.resolve_aliases(a);
+    }
+    v
+}
+
+/// Upper bound on a counted loop's trip count from the guards dominating
+/// its header: `(bound - iv0) / step` with `bound = iv0 + X` cancelled
+/// (slice loops: `end = start + len * size` behind `len <u CAP`).
+/// `PLIRON_TRIPMAX=0` disables it. A cost input only: a loose or wrong
+/// bound changes what gets vectorized/unrolled, never semantics.
+pub fn count_trip_max(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    cnt: &Count,
+) -> Option<u64> {
+    let le = matches!(
+        cnt.stay,
+        IntCC::UnsignedLessThanOrEqual | IntCC::SignedLessThanOrEqual
+    );
+    trip_max(func, cfg, dt, h, cnt.iv0, cnt.bound, cnt.step, le)
+}
+
+/// [`count_trip_max`] on raw parts: an iv entering at `iv0`, stepping by
+/// `step`, tested against `bound` (`le`: a `<=`-style test, one more trip).
+/// Rounds up by one trip so it stays an upper bound for every test shape.
+#[allow(clippy::too_many_arguments)]
+pub fn trip_max(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    iv0: Value,
+    bound: Value,
+    step: i64,
+    le: bool,
+) -> Option<u64> {
+    if !crate::pass_enabled("PLIRON_TRIPMAX") || step <= 0 {
+        return None;
+    }
+    let g = dom_guards(func, cfg, dt, h);
+    let span = match sub_cancel(func, cfg, bound, iv0) {
+        Some(x) => val_umax(func, cfg, x, &g, 8),
+        None if iconst(func, iv0) == Some(0) => val_umax(func, cfg, bound, &g, 8),
+        None => return None,
+    };
+    (span / step as u64).checked_add(u64::from(le) + 1)
+}
+
+/// The value header param `idx` of `h` takes on every edge from outside the
+/// loop (predecessors `h` doesn't dominate); `None` if they disagree.
+pub fn entry_arg(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, h: Block, idx: usize) -> Option<Value> {
+    let mut val = None;
+    for p in cfg.pred_iter(h) {
+        if dt.block_dominates(h, p.block) {
+            continue;
+        }
+        for bc in func.dfg.insts[p.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            if bc.block(&func.dfg.value_lists) != h {
+                continue;
+            }
+            let BlockArg::Value(v) = bc.args(&func.dfg.value_lists).nth(idx)? else {
+                return None;
+            };
+            let v = func.dfg.resolve_aliases(v);
+            if *val.get_or_insert(v) != v {
+                return None;
+            }
+        }
+    }
+    val
+}
+
 /// `icmp cc x, y` on evaluated operands.
 fn cmp_cc(cc: IntCC, x: i64, y: i64) -> bool {
     match cc {
