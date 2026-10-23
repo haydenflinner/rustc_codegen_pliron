@@ -1277,6 +1277,105 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                     section: None,
                 },
             );
+            if pliron_cfg::env_is("PLIRON_SEH", "0") {
+                // docs/seh-design.md: SEH personality named by .xdata
+                // EHANDLER. Handler data = {u32 n, {u32 begin, u32 end,
+                // u32 target}[n]}, fn-relative code offsets; claim when
+                // begin <= ControlPc-ImageBase < end. On claim, stash
+                // {exn, throwinfo, base} into __pliron_eh at +8/+16/+24,
+                // set dc->TargetIp, return ExceptionExecuteHandler(4).
+                let i32t = cx.type_i32();
+                let ptr = cx.type_ptr();
+                let sty = cx.type_func(&[ptr, ptr, ptr, ptr], i32t);
+                let f = cx.declare_fn_sym(
+                    "__pliron_seh_personality",
+                    sty,
+                    Linkage::Export,
+                    Exts::default(),
+                );
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                let isz = cx.type_isize();
+                let i8t = cx.type_i8();
+                let a1 = rustc_abi::Align::ONE;
+                let rec = bx.get_param(0);
+                let est = bx.get_param(1);
+                let dc = bx.get_param(3);
+                let _ = est;
+                let decline = bx.append_sibling_block("decline");
+                let fla = bx.gep(i8t, rec, &[bx.const_uint(isz, 4)]);
+                let fl = bx.load(i32t, fla, a1);
+                let m = bx.and(fl, bx.const_uint(i32t, 0x26));
+                let isunw = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntNE, m, bx.const_uint(i32t, 0));
+                let search = bx.append_sibling_block("search");
+                bx.cond_br(isunw, decline, search);
+                bx.switch_to_block(search);
+                let cd = bx.load(i32t, rec, a1);
+                let ismsc =
+                    bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntEQ, cd, bx.const_uint(i32t, 0xE06D7363u64));
+                let body = bx.append_sibling_block("body");
+                bx.cond_br(ismsc, body, decline);
+                bx.switch_to_block(body);
+                let pcp = bx.gep(i8t, dc, &[bx.const_uint(isz, 0)]);
+                let pcload = bx.load(isz, pcp, a1);
+                let bpp = bx.gep(i8t, dc, &[bx.const_uint(isz, 8)]);
+                let base = bx.load(isz, bpp, a1);
+                let pc = bx.sub(pcload, base);
+                let hdp = bx.gep(i8t, dc, &[bx.const_uint(isz, 56)]);
+                let hd = bx.load(isz, hdp, a1);
+                // loop vars in allocas: remaining count, record cursor
+                let nv = bx.alloca(rustc_abi::Size::from_bytes(4), rustc_abi::Align::EIGHT);
+                let pv = bx.alloca(rustc_abi::Size::from_bytes(8), rustc_abi::Align::EIGHT);
+                let n0 = bx.load(i32t, hd, a1);
+                bx.store(n0, nv, a1);
+                let p0 = bx.gep(i8t, hd, &[bx.const_uint(isz, 4)]);
+                bx.store(p0, pv, a1);
+                let scan = bx.append_sibling_block("scan");
+                bx.br(scan);
+                bx.switch_to_block(scan);
+                let n = bx.load(i32t, nv, a1);
+                let done = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntEQ, n, bx.const_uint(i32t, 0));
+                let go = bx.append_sibling_block("go");
+                bx.cond_br(done, decline, go);
+                bx.switch_to_block(go);
+                let p = bx.load(ptr, pv, a1);
+                let b32v = bx.load(i32t, p, a1);
+                let b64 = bx.zext(b32v, isz);
+                let ep = bx.gep(i8t, p, &[bx.const_uint(isz, 4)]);
+                let e32v = bx.load(i32t, ep, a1);
+                let e64 = bx.zext(e32v, isz);
+                let lo = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntULE, b64, pc);
+                let hi = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntULT, pc, e64);
+                let inr = bx.and(lo, hi);
+                let hit = bx.append_sibling_block("hit");
+                let next = bx.append_sibling_block("next");
+                bx.cond_br(inr, hit, next);
+                bx.switch_to_block(hit);
+                let x1 = bx.gep(i8t, rec, &[bx.const_uint(isz, 40)]);
+                let exn = bx.load(isz, x1, a1);
+                let x2 = bx.gep(i8t, rec, &[bx.const_uint(isz, 48)]);
+                let ti = bx.load(isz, x2, a1);
+                let tls = cx.sym_addr("__pliron_eh");
+                for (o, v) in [(8u64, exn), (16, ti), (24, base)] {
+                    let d = bx.gep(i8t, tls, &[bx.const_uint(isz, o)]);
+                    bx.store(v, d, a1);
+                }
+                let tp = bx.gep(i8t, p, &[bx.const_uint(isz, 8)]);
+                let t32 = bx.load(i32t, tp, a1);
+                let t64 = bx.zext(t32, isz);
+                let tip = bx.add(base, t64);
+                let dip = bx.gep(i8t, dc, &[bx.const_uint(isz, 32)]);
+                bx.store(tip, dip, a1);
+                bx.ret(bx.const_uint(i32t, 4));
+                bx.switch_to_block(next);
+                let np = bx.gep(i8t, p, &[bx.const_uint(isz, 12)]);
+                bx.store(np, pv, a1);
+                let n1 = bx.sub(n, bx.const_uint(i32t, 1));
+                bx.store(n1, nv, a1);
+                bx.br(scan);
+                bx.switch_to_block(decline);
+                bx.ret(bx.const_uint(i32t, 1));
+            }
         }
         if cgupool::enabled(tcx) {
             // The allocator shim is created ahead of every CGU, so its
