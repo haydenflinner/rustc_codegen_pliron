@@ -313,6 +313,13 @@ t_slpsplat() {
   rustc $BE --edition 2021 -O tests/slpsplat/main.rs -o $out/slpsplat$exe && $out/slpsplat$exe
 }
 
+t_applestackargs() {
+  # apple_aarch64 packs narrow stack args (u16 at +8, i8 at +0xa): an
+  # extended one is stored/loaded at its own width, not the word (-O0,
+  # where internal calls use the Apple convention).
+  rustc $BE --edition 2021 tests/applestackargs/main.rs -o $out/applestackargs$exe && $out/applestackargs$exe | diff --strip-trailing-cr - tests/applestackargs/expected.out
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -581,6 +588,7 @@ want unwindmem && t_unwindmem
 want unwindstd && t_unwindstd
 want mirshapes && t_mirshapes
 want slpsplat && t_slpsplat
+want applestackargs && t_applestackargs
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

@@ -1666,7 +1666,16 @@ impl<M: ABIMachineSpec> Callee<M> {
                 } => {
                     // However, we have to respect the extension mode for stack
                     // slots, or else we grab the wrong bytes on big-endian.
-                    let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
+                    // PLIRON: Apple-packed argument slots are only `ty` wide
+                    // (a `u16` at +8, an `i8` at +0xa): a word-sized load
+                    // would read the neighbouring arguments' bytes as the
+                    // "extension".
+                    let cc = sigs[self.sig].call_conv;
+                    let ext = if cc == isa::CallConv::AppleAarch64 {
+                        ArgumentExtension::None
+                    } else {
+                        M::get_ext_mode(cc, extension)
+                    };
                     let ty =
                         if ext != ArgumentExtension::None && M::word_bits() > ty_bits(ty) as u32 {
                             M::word_type()
@@ -1961,6 +1970,15 @@ impl<M: ABIMachineSpec> Callee<M> {
                         // or sign-extension that is required by the ABI.
                         let (ty, extension) = match *slot {
                             ABIArgSlot::Reg { ty, extension, .. } => (ty, extension),
+                            // PLIRON: an Apple-packed stack argument slot is
+                            // only `ty` wide; widening to the word and storing
+                            // 8 bytes clobbered the next arguments and the
+                            // caller's frame above the outgoing area (an `i8
+                            // uext` at sp+0xa zeroed two bytes of a by-ref
+                            // array copy at sp+0x10: rustlantis seed 2598).
+                            ABIArgSlot::Stack { ty, .. } if call_conv == isa::CallConv::AppleAarch64 => {
+                                (ty, ir::ArgumentExtension::None)
+                            }
                             ABIArgSlot::Stack { ty, extension, .. } => (ty, extension),
                         };
                         let ext = M::get_ext_mode(call_conv, extension);
