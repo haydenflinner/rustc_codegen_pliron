@@ -591,6 +591,8 @@ mod wpeep_audit;
 struct PeepOpts {
     audit: bool,
     audit_panic: bool,
+    /// Module#body tag for audit diagnostics (set by the caller).
+    tag: String,
     pathcheck: bool,
     violations: std::cell::Cell<u32>,
     /// Rounds over the audit's budget, left unaudited.
@@ -616,6 +618,7 @@ impl PeepOpts {
         PeepOpts {
             audit: a.is_some_and(|v| v != "0"),
             audit_panic: a == Some("panic"),
+            tag: String::new(),
             pathcheck: crate::pass_enabled("PLIRON_WASM_PEEP_PATHCHECK"),
             violations: std::cell::Cell::new(0),
             skipped: std::cell::Cell::new(0),
@@ -971,6 +974,14 @@ fn peep_body_opts(
                     matches!(ins[k].0, WPeek::Ctl) && matches!(b[ins[k].1], 0x0c | 0x0d | 0x0e)
                 })
         };
+        // Shared enclosing `loop`: a back-edge inside it can carry a
+        // value between sibling if-arms on the next iteration, so
+        // arm-divergence does not make positions unreachable across one.
+        let shr_lp = |a: usize, b2: usize| {
+            ctx[ins[a].3]
+                .iter()
+                .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[b2].3].contains(e))
+        };
         let fwd = |i: usize, del: &[bool]| -> Option<(u32, usize)> {
             let WPeek::Set(t) = ins[i].0 else { return None };
             if del[i] || !defs.get(&t).map(|v| v.contains(&i)).unwrap_or(false) {
@@ -982,16 +993,7 @@ fn peep_body_opts(
             // can never be moved backwards to it).
             if uses
                 .get(&t)
-                .map(|v| {
-                    v.iter().any(|&u| {
-                        u < i
-                            && !del[u]
-                            && !arm_div(i, u)
-                            && ctx[ins[i].3]
-                                .iter()
-                                .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[u].3].contains(e))
-                    })
-                })
+                .map(|v| v.iter().any(|&u| u < i && !del[u] && shr_lp(i, u)))
                 .unwrap_or(false)
             {
                 return None;
@@ -1008,7 +1010,7 @@ fn peep_body_opts(
                     v.iter()
                         .copied()
                         .filter(|&u| {
-                            if del[u] || u <= i || arm_div(i, u) {
+                            if del[u] || u <= i || (arm_div(i, u) && !shr_lp(i, u)) {
                                 return false;
                             }
                             !defs
@@ -1418,7 +1420,12 @@ fn peep_body_opts(
         // shared-loop back-edge.
         let reaches = |dl: &[usize], extra: &[usize], d: usize, u: usize, gone: &dyn Fn(usize) -> bool| -> bool {
             if arm_div(d, u) {
-                return false;
+                // Sibling arms are disjoint on straight-line flow, but a
+                // back-edge inside one arm re-enters the enclosing loop
+                // and lands in the other arm on the next iteration
+                // (core cgu.08#42: a `set x` in the then-arm reached
+                // renamed else-arm reads via `br` to the loop head).
+                return backedge(dl, extra, d, u, gone);
             }
             if d < u {
                 !dl.iter().chain(extra.iter()).any(|&d2| {
@@ -1676,7 +1683,11 @@ fn peep_body_opts(
                 && !v.is_empty()
             {
                 opts.violations.set(opts.violations.get() + v.len() as u32);
-                let msg = format!("wpeep audit: copy-forward round rejected\n  {}", v.join("\n  "));
+                let msg = format!(
+                    "wpeep audit: copy-forward round rejected in {}\n  {}",
+                    opts.tag,
+                    v.join("\n  ")
+                );
                 if opts.audit_panic {
                     panic!("{msg}");
                 }
@@ -5288,6 +5299,7 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                 }
                 let out = {
                     let mut opts = PeepOpts::from_env();
+                    opts.tag = format!("{name}#{fi}");
                     opts.trace = crate::env_get("PLIRON_WASM_TRACE_BODY")
                         .and_then(|v| v.parse::<u64>().ok())
                         == Some(k);
@@ -5477,6 +5489,7 @@ mod wpeep_tests {
         PeepOpts {
             audit,
             audit_panic: false,
+            tag: String::new(),
             pathcheck,
             trace: false,
             violations: std::cell::Cell::new(0),
@@ -6737,6 +6750,99 @@ mod wpeep_tests {
         );
         let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
         assert!(has_seq(&out, &[0x0c, 0x00]), "br 0 gone: {out:02x?}");
+    }
+
+    // Regression: a def of the copy target `x` in a sibling if-arm past
+    // the copy window reaches reads in the other arm through the
+    // enclosing loop's back-edge (core cgu.08#42: `set x` in the
+    // then-arm, renamed `get x` reads in the else-arm). `reaches` used
+    // to treat any arm-diverged pair as unreachable, so the pass
+    // renamed `get t` -> `get x` reads that could observe the later
+    // `set x` — a miscompile the audit rejected every build. The
+    // candidate must now be refused up front.
+    #[test]
+    fn copyfwd_arm_diverged_backedge_def_rejects() {
+        // t = 1 (sole producer `tee 1`), x = 2; `get 1; set 2` copy
+        // before a loop that rewrites x in its then-arm and reads t in
+        // the else-arm.
+        let b = body(
+            2,
+            &[
+                0x41, 0x00, // i32.const 0
+                0x22, 0x01, // tee 1   (producer p1)
+                0x20, 0x01, // get 1   (copy-get)
+                0x21, 0x02, // set 2   (copy-set)
+                0x03, 0x40, // loop
+                0x20, 0x00, //   get 0 (if cond)
+                0x04, 0x40, //   if
+                0x20, 0x02, //     get 2 (loop var read)
+                0x41, 0x02, //     i32.const 2
+                0x6a, //           i32.add
+                0x21, 0x02, //     set 2 (x-def in then-arm, past the window)
+                0x0c, 0x01, //     br 1  (back-edge to the loop)
+                0x05, //         else
+                0x20, 0x00, //     get 0 (store addr)
+                0x20, 0x01, //     get 1 (pre-fix renamed -> read the loop write)
+                0x36, 0x00, 0x00, // i32.store
+                0x0b, //         end if
+                0x0b, //       end loop
+            ],
+        );
+        let o = opts(true, false);
+        let r = peep_body_opts(&b, &[], &[], 1, &o).unwrap();
+        assert_eq!(o.violations.get(), 0);
+        // The else-arm `get 1` must survive: retargeting it to `get 2`
+        // is unsound while the loop's `set 2` can re-enter via the
+        // back-edge.
+        assert!(has_seq(&r, &[0x20, 0x01, 0x36, 0x00, 0x00])); // get 1; i32.store
+    }
+
+    // `PLIRON_WASM_BDSCAN=<dir>`: run every PLIRON_WASM_BODYDUMP pre-body
+    // under the audited copy-forward and print violations with the file
+    // and the nparams that reproduces them.
+    #[test]
+    fn audit_scan_dumped_bodies() {
+        let Ok(dir) = std::env::var("PLIRON_WASM_BDSCAN") else {
+            return;
+        };
+        let mut o = opts(true, true);
+        o.ddrop = true;
+        o.delse = true;
+        o.bri = true;
+        o.bri2 = true;
+        o.btr = true;
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_str().is_some_and(|s| s.ends_with("_pre.bin")))
+            .collect();
+        paths.sort();
+        // `call` decode needs (pops, pushes) per target — unknown in a
+        // bare body dump, so sweep a few plausible shapes too.
+        let sigs: Vec<Vec<(u32, u32)>> = [
+            (0u32, 1u32),
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (0, 0),
+            (1, 0),
+        ]
+        .iter()
+        .map(|&s| vec![s; 256])
+        .collect();
+        for p in paths {
+            let b = std::fs::read(&p).unwrap();
+            'outer: for (si, fsig) in sigs.iter().enumerate() {
+                for np in 0..=20u32 {
+                    o.violations.set(0);
+                    peep_body_opts(&b, fsig, fsig, np, &o);
+                    if o.violations.get() > 0 {
+                        eprintln!("VIOL {} nparams={np} sig={si}", p.display());
+                        break 'outer;
+                    }
+                }
+            }
+        }
     }
 
 }
