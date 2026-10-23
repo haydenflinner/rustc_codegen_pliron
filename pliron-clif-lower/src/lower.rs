@@ -412,6 +412,7 @@ struct FnJob {
     deref: FxHashMap<ir::Value, (u64, bool)>,
     nowrite: FxHashMap<FuncRef, bool>,
     call_frozen: FxHashMap<FuncRef, u64>,
+    nounwind: FxHashSet<FuncRef>,
     scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
     invariant: FxHashSet<ir::Inst>,
     operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
@@ -455,6 +456,7 @@ impl FnJob {
             deref: FxHashMap::default(),
             nowrite: FxHashMap::default(),
             call_frozen: FxHashMap::default(),
+            nounwind: FxHashSet::default(),
             scoped: FxHashMap::default(),
             invariant: FxHashSet::default(),
             operand_frozen: FxHashMap::default(),
@@ -690,6 +692,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 deref: &mut j.deref,
                 nowrite: &j.nowrite,
                 call_frozen: &j.call_frozen,
+                nounwind: &j.nounwind,
                 scoped: &j.scoped,
                 invariant: &j.invariant,
                 operand_frozen: &mut j.operand_frozen,
@@ -1245,6 +1248,7 @@ pub fn lower_module<'a>(
             let deref: FxHashMap<cranelift_codegen::ir::Value, (u64, bool)>;
             let nowrite: FxHashMap<FuncRef, bool>;
             let call_frozen: FxHashMap<FuncRef, u64>;
+            let nounwind: FxHashSet<FuncRef>;
             let scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>;
             let invariant: FxHashSet<ir::Inst>;
             let operand_frozen: FxHashMap<
@@ -1291,6 +1295,7 @@ pub fn lower_module<'a>(
                     invariant: FxHashSet::default(),
                     block_region: FxHashMap::default(),
                     nowrite: FxHashMap::default(),
+                    nounwind: FxHashSet::default(),
                     lifetimes: Vec::new(),
                     nocap: FxHashSet::default(),
                     va_buf: None,
@@ -1373,6 +1378,7 @@ pub fn lower_module<'a>(
                 deref = std::mem::take(&mut fl.deref);
                 nowrite = std::mem::take(&mut fl.nowrite);
                 call_frozen = std::mem::take(&mut fl.call_frozen);
+                nounwind = std::mem::take(&mut fl.nounwind);
                 scoped = std::mem::take(&mut fl.scoped);
                 invariant = std::mem::take(&mut fl.invariant);
                 block_region = std::mem::take(&mut fl.block_region);
@@ -1417,6 +1423,7 @@ pub fn lower_module<'a>(
                     deref,
                     nowrite,
                     call_frozen,
+                    nounwind,
                     scoped,
                     invariant,
                     operand_frozen,
@@ -2026,6 +2033,7 @@ pub fn lower_clif_wasm(
             deref,
             nowrite,
             call_frozen,
+            nounwind,
             scoped,
             invariant,
             operand_frozen,
@@ -2068,6 +2076,7 @@ pub fn lower_clif_wasm(
                 invariant: FxHashSet::default(),
                 block_region: FxHashMap::default(),
                 nowrite: FxHashMap::default(),
+                nounwind: FxHashSet::default(),
                 lifetimes: Vec::new(),
                 nocap: FxHashSet::default(),
                 va_buf: None,
@@ -2118,6 +2127,7 @@ pub fn lower_clif_wasm(
                 fl.deref,
                 fl.nowrite,
                 fl.call_frozen,
+                fl.nounwind,
                 fl.scoped,
                 fl.invariant,
                 operand_frozen,
@@ -2142,6 +2152,7 @@ pub fn lower_clif_wasm(
                 deref,
                 nowrite,
                 call_frozen,
+                nounwind,
                 scoped,
                 invariant,
                 operand_frozen,
@@ -2540,6 +2551,9 @@ struct FnLower<'a, 'b> {
     /// FuncRefs of calls → bitmask of arg positions bound to a callee param
     /// rustc marks `noalias readonly`: the callee can't write the pointee.
     call_frozen: FxHashMap<FuncRef, u64>,
+    /// FuncRefs of calls to functions that can't unwind (`FuncInfo::nounwind`,
+    /// asm stubs): every other plain call may unwind to our caller.
+    nounwind: FxHashSet<FuncRef>,
     /// CLIF load inst → inlined-clone region id (`State::frozen_loads`):
     /// the load reads a `noalias readonly` pointee for the clone's
     /// duration, so LICM may hoist it to an in-region preheader without
@@ -5599,6 +5613,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     Some(Sym::F(fid, declty)) if declty == fn_ty && !var_arg => {
                         let nw = self.st.nowrite.get(sym).copied();
                         let fr = self.call_fref(fid);
+                        if !maythrow {
+                            self.nounwind.insert(fr);
+                        }
                         if let Some(strict) = nw {
                             self.nowrite.insert(fr, strict);
                         }

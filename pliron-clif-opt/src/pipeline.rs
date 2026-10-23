@@ -168,6 +168,9 @@ pub struct Pipe<'a> {
     pub deref: &'a mut FxHashMap<Value, (u64, bool)>,
     pub nowrite: &'a FxHashMap<FuncRef, bool>,
     pub call_frozen: &'a FxHashMap<FuncRef, u64>,
+    /// Callees that can't unwind; any other plain call may unwind to the
+    /// caller, exposing memory the caller can see (dse).
+    pub nounwind: &'a FxHashSet<FuncRef>,
     pub scoped: &'a FxHashMap<Inst, Ptr<BasicBlock>>,
     pub invariant: &'a FxHashSet<Inst>,
     pub operand_frozen: &'a mut FxHashMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
@@ -2108,6 +2111,7 @@ fn s_dse(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.scoped_na,
         p.nowrite,
         p.call_frozen,
+        p.nounwind,
         an,
         p.cur_step,
         p.fname,
@@ -2860,6 +2864,7 @@ fn s_dse2(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.scoped_na,
         p.nowrite,
         p.call_frozen,
+        p.nounwind,
         an,
         p.cur_step,
         p.fname,
@@ -2877,6 +2882,7 @@ fn s_dse3(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.scoped_na,
         p.nowrite,
         p.call_frozen,
+        p.nounwind,
         an,
         p.cur_step,
         p.fname,
@@ -4182,6 +4188,7 @@ mod tests {
         let mut clctx = Context::for_function(func);
         let nowrite: FxHashMap<FuncRef, bool> = Default::default();
         let call_frozen: FxHashMap<FuncRef, u64> = Default::default();
+        let nounwind: FxHashSet<FuncRef> = Default::default();
         let scoped: FxHashMap<Inst, Ptr<BasicBlock>> = Default::default();
         let invariant: FxHashSet<Inst> = Default::default();
         let block_region: FxHashMap<Block, Ptr<BasicBlock>> = Default::default();
@@ -4217,6 +4224,7 @@ mod tests {
             deref: &mut deref,
             nowrite: &nowrite,
             call_frozen: &call_frozen,
+            nounwind: &nounwind,
             scoped: &scoped,
             invariant: &invariant,
             operand_frozen: &mut operand_frozen,

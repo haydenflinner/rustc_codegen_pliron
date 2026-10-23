@@ -176,6 +176,17 @@ impl Demands {
         }
     }
 
+    /// A call that may unwind ([`Op::Exit`]): the caller can read every
+    /// `Root::V` once the frame unwinds, and no later store in this
+    /// function runs on that path, so their coverage of `Root::V` bytes
+    /// doesn't satisfy it. Stack-slot coverage stays: slots die with the
+    /// frame.
+    fn exit(&mut self) {
+        self.top_non_stack = true;
+        self.cov.retain(|r, _| !matches!(r, Root::V(_)));
+        self.ncov = self.cov.values().map(Vec::len).sum();
+    }
+
     /// A may-read barrier (call/atomic/other side effect): observes any
     /// reachable memory, so coverage a later store provides is no help to
     /// earlier non-isolated stores — the barrier's own reads see the
@@ -275,6 +286,20 @@ enum Op {
     ReadAll,
     /// `barrier` — reads and may write everything reachable.
     RwAll,
+    /// A plain call that may unwind: the unwind leaves this frame like a
+    /// `return`, so the caller (e.g. one that catches the panic) can read
+    /// every `Root::V` — including isolated noalias params like `&mut
+    /// self` that calls can't otherwise reach. `try_call`s don't need it:
+    /// their unwind edge stays in this function and reaches the resume
+    /// call, which is itself a plain call.
+    Exit,
+}
+
+/// `PLIRON_DSE_UNWIND=0`: treat calls as never unwinding (the pre-fix,
+/// unsound behavior) — only for measuring what the unwind exits cost.
+fn no_unwind_env() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| pliron_cfg::env_is("PLIRON_DSE_UNWIND", "0"))
 }
 
 /// Resolve every inst's demand effect in `order`'s reachable blocks.
@@ -285,6 +310,7 @@ fn decode(
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
+    nounwind: &FxHashSet<FuncRef>,
     eh: bool,
     order: &[Block],
 ) -> (SecondaryMap<Block, Vec<Op>>, Vec<Block>) {
@@ -327,6 +353,14 @@ fn decode(
                         } else {
                             Op::RwAll
                         });
+                        let unwinds = match func.dfg.insts[i] {
+                            InstructionData::Call { func_ref, .. } => !nounwind.contains(&func_ref),
+                            InstructionData::CallIndirect { .. } => true,
+                            _ => false,
+                        };
+                        if unwinds && !no_unwind_env() {
+                            v.push(Op::Exit);
+                        }
                     } else if op.can_load()
                         || op.can_store()
                         || op.other_side_effects()
@@ -353,6 +387,7 @@ fn transfer(ops: &[Op], d: &mut Demands, iso: &FxHashSet<Root>, mut dead: Option
         match *op {
             Op::Read((r, o, w)) => d.demand(r, o, w),
             Op::ReadAll => d.read_barrier(iso),
+            Op::Exit => d.exit(),
             Op::RwAll => d.barrier(iso),
             Op::Store(i, (r, o, w), killable) => {
                 // A dead store hides nothing: demands pass through it to
@@ -383,6 +418,7 @@ pub fn run(
     scoped_na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
+    nounwind: &FxHashSet<FuncRef>,
     an: &mut crate::pipeline::Analysis,
     step: &str,
     fname: &str,
@@ -434,7 +470,7 @@ pub fn run(
     // Decode each inst's demand effect once: the fixpoint and the kill
     // sweep then replay `Demands` ops instead of re-reading the DFG and
     // re-peeling `root` chains.
-    let (ops, store_blks) = decode(func, ps, noalias, nw, eh, &order);
+    let (ops, store_blks) = decode(func, ps, noalias, nw, nounwind, eh, &order);
     let t_dec = t.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     if store_blks.is_empty() {
         // Every candidate's address failed `mem_loc` — the fixpoint and
@@ -625,16 +661,68 @@ mod tests {
     }
 
     fn dse(func: &mut Function) -> usize {
+        dse_with(func, &FxHashSet::default(), &FxHashSet::default())
+    }
+
+    fn dse_with(func: &mut Function, noalias: &FxHashSet<Value>, nounwind: &FxHashSet<FuncRef>) -> usize {
         run(
             func,
-            &FxHashSet::default(),
+            noalias,
             &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            nounwind,
             &mut crate::pipeline::Analysis::default(),
             "dse",
             "t",
         )
+    }
+
+    /// `fn(p noalias)`: `st p; call f(); st p; ret`. Returns the function,
+    /// the param and `f`'s FuncRef.
+    fn store_call_store() -> (Function, Value, FuncRef) {
+        use cranelift_codegen::ir::{ExtFuncData, ExternalName, UserExternalNameRef};
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let sref = func.import_signature(Signature::new(CallConv::Fast));
+        let fr = func.import_function(ExtFuncData {
+            name: ExternalName::user(UserExternalNameRef::from_u32(0)),
+            signature: sref,
+            colocated: false,
+            patchable: false,
+        });
+        let entry = func.dfg.make_block();
+        func.layout.append_block(entry);
+        let p = func.dfg.append_block_param(entry, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let one = cur.ins().iconst(types::I64, 1);
+        let two = cur.ins().iconst(types::I64, 2);
+        cur.ins().store(MemFlagsData::new().with_notrap(), one, p, 0);
+        cur.ins().call(fr, &[]);
+        cur.ins().store(MemFlagsData::new().with_notrap(), two, p, 0);
+        cur.ins().return_(&[]);
+        (func, p, fr)
+    }
+
+    /// A call that may unwind exits to the caller, which can read `*p`
+    /// (noalias, so the call itself can't): the first store stays even
+    /// though the second rewrites it on the normal path.
+    #[test]
+    fn store_before_unwinding_call_stays() {
+        let (mut func, p, _) = store_call_store();
+        let na: FxHashSet<Value> = [p].into_iter().collect();
+        assert_eq!(dse_with(&mut func, &na, &FxHashSet::default()), 0);
+    }
+
+    /// The same shape with a callee known not to unwind: the call can't
+    /// see `*p` and can't leave, so the first store is dead.
+    #[test]
+    fn store_before_nounwind_call_dies() {
+        let (mut func, p, fr) = store_call_store();
+        let na: FxHashSet<Value> = [p].into_iter().collect();
+        let nu: FxHashSet<FuncRef> = [fr].into_iter().collect();
+        assert_eq!(dse_with(&mut func, &na, &nu), 1);
     }
 
     /// `st p; st p; ret`: the second store's coverage satisfies the

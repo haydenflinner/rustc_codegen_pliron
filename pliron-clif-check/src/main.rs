@@ -307,6 +307,8 @@ fn with_pipe<R>(
         deref: &mut deref,
         nowrite: &facts.nowrite,
         call_frozen: &e1,
+        // Not in the facts header: every call may unwind (conservative).
+        nounwind: &Default::default(),
         scoped: &e2,
         invariant: &e3,
         operand_frozen: &mut e4,

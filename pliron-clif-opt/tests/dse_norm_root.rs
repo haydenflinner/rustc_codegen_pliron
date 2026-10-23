@@ -22,6 +22,7 @@ fn dse(f: &mut Function, na: &FxHashSet<Value>) -> usize {
         &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
+        &FxHashSet::default(),
         &mut pliron_clif_opt::pipeline::Analysis::default(),
         "dse",
         "t",
