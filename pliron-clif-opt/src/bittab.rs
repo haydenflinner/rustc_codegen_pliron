@@ -913,7 +913,9 @@ fn flat(func: &mut Function) -> usize {
                     pos += s;
                     let run = (!b).trailing_zeros() as u64;
                     runs.push((pos, pos + run - 1));
-                    b >>= run;
+                    // `run == 64` when the run reaches bit 63 (see the
+                    // mask-run split below): `>> 64` would overflow.
+                    b = b.checked_shr(run as u32).unwrap_or(0);
                     pos += run;
                 }
             }
@@ -1074,7 +1076,12 @@ pub fn run(func: &mut Function) -> usize {
                 pos += s;
                 let r = (!m).trailing_zeros() as u64;
                 runs.push((pos, pos + r - 1));
-                m >>= r;
+                // A run reaching bit 63 has `r == 64`: `m >> 64` overflows
+                // (release wraps the amount to 0, leaving `m` unchanged —
+                // an endless loop growing `runs` until the process is
+                // OOM-killed; rustc_hir_typeck's
+                // `suggest_floating_point_literal` at selfhost stage 2).
+                m = m.checked_shr(r as u32).unwrap_or(0);
                 pos += r;
             }
         }
