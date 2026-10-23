@@ -623,6 +623,10 @@ pub(crate) fn precreated(segment: &str, section: &str) -> Option<(u32, u32)> {
         ("__TEXT", "__literal8") => (S_8BYTE_LITERALS, 0),
         ("__TEXT", "__literal16") => (S_16BYTE_LITERALS, 0),
         ("__TEXT", "__const") => (S_REGULAR, 0),
+        ("__TEXT", "__eh_frame") => (
+            S_COALESCED,
+            S_ATTR_NO_TOC | S_ATTR_STRIP_STATIC_SYMS | S_ATTR_LIVE_SUPPORT,
+        ),
         ("__DATA", "__data") => (S_REGULAR, 0),
         ("__DATA", "__const") => (S_REGULAR, 0),
         ("__DATA", "__bss") => (S_ZEROFILL, 0),

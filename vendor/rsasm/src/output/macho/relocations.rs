@@ -109,6 +109,48 @@ impl Assembler {
             );
             return Vec::new();
         }
+        // arm64 has no PC-relative data relocation: llvm-mc writes `sym - .`
+        // in data (an `.eh_frame` FDE's `pc_begin`, a 4-byte pcrel field) as
+        // the pair `UNSIGNED sym` + `SUBTRACTOR <here>`. Name "here" by a
+        // local label at the start of this fragment, folding the field's
+        // distance from it into the addend; the writer maps the label to its
+        // atom or `ltmpN` like any other subtracted local.
+        // Data only (`Whole` fields): an `adr`'s pcrel immediate has no
+        // such pair and stays refused.
+        if arm64
+            && desc.class == RelocClass::Plain
+            && desc.pcrel
+            && matches!(desc.size, 4 | 8)
+            && matches!(kind.encoding, crate::section::FieldEncoding::Whole)
+            && v.plus.is_some()
+            && v.minus.is_none()
+        {
+            let frag_off = self.section(section).frags.get(fi).map_or(at, |f| f.offset);
+            let n = self.symbols.len();
+            let name = self.interner.intern(&format!(".L\u{0}pcrel.{n}"));
+            let id = self.symbols.intern(name, span);
+            let sym = self.symbols.get_mut(id);
+            sym.value = crate::symbol::SymbolValue::Label { section, frag: fi as u32 };
+            sym.def_span = span;
+            self.symbols.mark_defined(id);
+            v.minus = Some(id);
+            v.addend -= (at - frag_off) as i64;
+            desc.pcrel = false;
+            desc.subtrahend = Some(id);
+            let r = Relocation {
+                section,
+                offset: at,
+                symbol: v.plus,
+                addend: v.addend,
+                kind: kind.reloc,
+                desc,
+            };
+            if let Some(p) = v.plus {
+                self.symbols.get_mut(p).used = true;
+            }
+            self.symbols.get_mut(id).used = true;
+            return vec![r];
+        }
         match (v.plus, v.minus) {
             (Some(_), Some(minus)) => {
                 // A pair names both symbols. On x86-64 neither may be left

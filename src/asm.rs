@@ -58,6 +58,7 @@ impl<'tcx> CodegenCx<'tcx> {
                         .span_fatal(span, "unsupported asm symbol operand")
                 };
                 let off = o + off.bytes() as i64;
+                let sym = self.asm_sym(&sym);
                 if off != 0 {
                     format!("{sym}{off:+}")
                 } else {
@@ -68,10 +69,18 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     fn asm_tls_sym(&self, def_id: DefId) -> String {
-        self.tcx
-            .symbol_name(Instance::mono(self.tcx, def_id))
-            .name
-            .to_string()
+        self.asm_sym(self.tcx.symbol_name(Instance::mono(self.tcx, def_id)).name)
+    }
+
+    /// A symbol as asm source names it: with the object format's global
+    /// prefix (`_` on Mach-O), as LLVM's MC names are. `objmerge` maps
+    /// such raw names back onto the object writer's unprefixed ones.
+    pub(crate) fn asm_sym(&self, name: &str) -> String {
+        if self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::MachO {
+            format!("_{name}")
+        } else {
+            name.to_string()
+        }
     }
 
     pub fn push_global_asm(

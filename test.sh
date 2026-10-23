@@ -370,6 +370,12 @@ t_narrowlsr() {
   rustc $BE --edition 2021 -O tests/narrowlsr/main.rs -o $out/narrowlsr$exe && $out/narrowlsr$exe
 }
 
+t_asmcfi() {
+  # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
+  [ "$(uname -m)" = arm64 ] || return 0
+  rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -652,6 +658,7 @@ want asmlabels && t_asmlabels
 # t_cvariadic) rather than being skipped.
 want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
+want asmcfi && t_asmcfi
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

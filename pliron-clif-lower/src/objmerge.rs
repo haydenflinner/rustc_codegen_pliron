@@ -40,6 +40,13 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     } else {
         rsasm::output::elf::build(&a).unwrap()
     };
+    // `PLIRON_ASMOBJ_DUMP=<dir>`: keep each assembled object (before it is
+    // spliced) for inspection with objdump.
+    if let Some(dir) = crate::env_get("PLIRON_ASMOBJ_DUMP") {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::write(format!("{dir}/asm-{}-{n}.o", std::process::id()), &*bytes);
+    }
     if macho {
         let f = object::read::macho::MachOFile64::<object::Endianness>::parse(&*bytes).unwrap();
         splice(&f, out, x86);
@@ -109,7 +116,12 @@ where
     let mut syms: FxHashMap<SymbolIndex, SymbolId> = FxHashMap::default();
     for sym in f.symbols() {
         match sym.kind() {
-            SymbolKind::Section => {
+            // Mach-O has no section symbols: what reads as one is an asm
+            // section label (`ltmpN`). A relocation through the writer's
+            // section symbol becomes non-external, whose field must hold an
+            // absolute address — but the asm field holds `target - label`,
+            // so keep the label as a real local symbol (external reloc).
+            SymbolKind::Section if out.format() != BinaryFormat::MachO => {
                 if let Some(&sid) = sym.section_index().and_then(|i| secs.get(&i)) {
                     syms.insert(sym.index(), out.section_symbol(sid));
                 }
@@ -118,10 +130,25 @@ where
             SymbolKind::File => continue,
             _ => {}
         }
-        let name = sym.name_bytes().unwrap();
-        if name.is_empty() {
+        let raw = sym.name_bytes().unwrap();
+        if raw.is_empty() {
             continue;
         }
+        // Mach-O asm names are raw (`_foo` is C's `foo`), while the writer
+        // takes unprefixed names and adds `_` itself. Our own stubs
+        // (`__pliron_asm_*`) are declared under their asm spelling, so an
+        // exact match wins; otherwise drop one `_`. A raw name without the
+        // prefix keeps its spelling (fixed up after `add_symbol`).
+        let macho = out.format() == BinaryFormat::MachO;
+        let mut keep_raw = false;
+        let name: &[u8] = if !macho || sym.is_local() || out.symbol_id(raw).is_some() {
+            raw
+        } else if let Some(stripped) = raw.strip_prefix(b"_") {
+            stripped
+        } else {
+            keep_raw = true;
+            raw
+        };
         // Read gives the symbol's address; write wants an offset within its
         // section. Mach-O object sections have addresses, ELF ones are zero.
         let (section, value) = match sym.section() {
@@ -145,7 +172,14 @@ where
         let new = write::Symbol {
             name: name.to_vec(),
             size: sym.size(),
-            kind: sym.kind(),
+            kind: match sym.kind() {
+                // The Mach-O writer only takes Text/Data/Tls symbols.
+                SymbolKind::Section => match sym.section_index().map(|i| f.section_by_index(i)) {
+                    Some(Ok(s)) if s.kind() == SectionKind::Text => SymbolKind::Text,
+                    _ => SymbolKind::Data,
+                },
+                k => k,
+            },
             scope: sym.scope(),
             weak: sym.is_weak(),
             section,
@@ -158,13 +192,24 @@ where
                 if matches!(s.section, SymbolSection::Undefined)
                     && !matches!(section, SymbolSection::Undefined)
                 {
+                    // Keep the existing spelling: `name` may be the raw asm
+                    // name with its Mach-O `_` dropped.
+                    let keep = std::mem::take(&mut s.name);
                     *s = new;
+                    s.name = keep;
                 }
                 syms.insert(sym.index(), id);
                 continue;
             }
         }
-        syms.insert(sym.index(), out.add_symbol(new));
+        let id = out.add_symbol(new);
+        if keep_raw {
+            let n = &mut out.symbol_mut(id).name;
+            if n.len() == raw.len() + 1 && n.ends_with(raw) {
+                n.remove(0);
+            }
+        }
+        syms.insert(sym.index(), id);
     }
 
     for s in f.sections() {
@@ -177,7 +222,12 @@ where
                 RelocationTarget::Section(i) => out.section_symbol(secs[&i]),
                 t => panic!("unsupported relocation target {t:?} in asm object"),
             };
-            out.add_relocation(
+            // A Mach-O `A - B` field is a SUBTRACTOR+UNSIGNED pair, which
+            // the reader folds into one relocation with `subtractor() = B`;
+            // dropping B leaves the field read as an absolute address
+            // (rsasm's `.cfi_*` FDEs: "address not in any section").
+            let sub = r.subtractor().map(|i| syms[&i]);
+            out.add_relocation_with_subtractor(
                 to,
                 Relocation {
                     offset,
@@ -185,6 +235,7 @@ where
                     addend: r.addend(),
                     flags: r.flags(),
                 },
+                sub,
             )
             .unwrap();
         }

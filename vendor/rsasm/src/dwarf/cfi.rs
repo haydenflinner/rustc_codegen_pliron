@@ -471,7 +471,14 @@ impl Assembler {
                 alloc: true,
                 ..SectionFlags::default()
             };
-            self.dwarf_section(".eh_frame", flags, 0, align)
+            // Mach-O names it by segment; `precreated` gives it the
+            // section type and attributes llvm-mc uses.
+            let name = if self.options.format == crate::output::Format::MachO {
+                "__TEXT,__eh_frame"
+            } else {
+                ".eh_frame"
+            };
+            self.dwarf_section(name, flags, 0, align)
         } else {
             self.dwarf_section(".debug_frame", SectionFlags::default(), 0, align)
         }

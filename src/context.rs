@@ -603,7 +603,8 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn mangled_name(&self, instance: Instance<'tcx>) -> String {
-        self.tcx.symbol_name(instance).name.to_string()
+        // Naked functions' labels: raw asm names, like `asm_const` syms.
+        self.asm_sym(self.tcx.symbol_name(instance).name)
     }
 }
 

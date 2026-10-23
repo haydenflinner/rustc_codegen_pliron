@@ -58,3 +58,19 @@ invalid octal literal: the local-ref path skipped runs with a leading zero.
 src/lexer.rs `lex_number` now takes such runs as a reference to the label
 with the run's octal value, which is how GAS reads it and how the `01:`
 definition lexes.
+
+Pliron patch: Mach-O call frame information.
+
+`.cfi_*` in an object for Mach-O (wasmtime-internal-fiber's stack-switch
+functions) was refused: "DWARF and call frame information are not written
+to Mach-O objects yet". Changed:
+- src/dwarf/cfi.rs `frame_section`: the `.eh_frame` table is named
+  `__TEXT,__eh_frame` for Mach-O output.
+- src/output/macho.rs `precreated`: `__TEXT,__eh_frame` gets llvm-mc's
+  `S_COALESCED` + `no_toc|strip_static_syms|live_support`.
+- src/output/macho/relocations.rs: an arm64 PC-relative *data* field to
+  another atom (an FDE's 4-byte `pc_begin`) has no relocation of its own;
+  write it as `sym - <here>` — `UNSIGNED sym` + `SUBTRACTOR` of a local
+  label at the start of the fixup's fragment, with the field's distance
+  from it folded into the addend — as llvm-mc does. Instruction fields
+  (`adr`) stay refused.
