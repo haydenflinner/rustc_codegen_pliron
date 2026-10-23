@@ -344,8 +344,24 @@ t_asmlabels() {
 
 t_cvariadic() {
   # C-variadic defs: va_list layout per target; VaList forwarded to libc.
-  rustc $BE --edition 2024 tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe && \
-  rustc $BE --edition 2024 -O tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe
+  if [[ -z "$exe" ]]; then
+    rustc $BE --edition 2024 tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe && \
+    rustc $BE --edition 2024 -O tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe
+    return
+  fi
+  # Windows: `vsnprintf` isn't in the MSVC import libs here — msvcrt.lib
+  # weak-aliases it to `_vsnprintf`, which lives only in the WinSDK's
+  # legacy_stdio_definitions.lib (absent on this box), and ucrt.lib has
+  # no import entry at all. The DLL itself exports it, so link CRT-free
+  # against mkwinlibs' synthesized implibs instead.
+  local libs=target/winlibs
+  if [[ ! -f $libs/msvcrt.lib ]]; then
+    uv run --no-project tools/mkwinlibs/mkwinlibs.py $libs \
+      || python tools/mkwinlibs/mkwinlibs.py $libs \
+      || py -3 tools/mkwinlibs/mkwinlibs.py $libs
+  fi
+  PLIRON_CRTFREE=1 rustc $BE --edition 2024 -Clinker=rust-lld -Lnative=$libs tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe && \
+  PLIRON_CRTFREE=1 rustc $BE --edition 2024 -O -Clinker=rust-lld -Lnative=$libs tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe
 }
 
 t_narrowlsr() {
@@ -631,9 +647,10 @@ want fnalign && t_fnalign
 # panic-catch half is cfg'd out under pliron_stock_seh.
 want rusttailcc && t_rusttailcc
 want asmlabels && t_asmlabels
-# cvariadic: mkwinlibs' msvcrt .def has no vsnprintf import (LNK2019) —
-# infra gap, not codegen; regenerate tools/mkwinlibs to cover it.
-[[ -z "$exe" ]] && want cvariadic && t_cvariadic
+# cvariadic: on Windows the test links CRT-free against mkwinlibs
+# implibs (this box's MSVC libs can't resolve vsnprintf — see
+# t_cvariadic) rather than being skipped.
+want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want facts && t_facts
 want loopalign && t_loopalign
