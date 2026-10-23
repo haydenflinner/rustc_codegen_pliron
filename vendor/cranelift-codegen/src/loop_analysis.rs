@@ -207,8 +207,12 @@ impl LoopAnalysis {
     // and thus is a loop header.
     fn is_block_loop_header(block: Block, cfg: &ControlFlowGraph, domtree: &DominatorTree) -> bool {
         // A block is a loop header if it dominates any of its predecessors.
+        // PLIRON: only reachable predecessors — pliron's pipeline computes
+        // loop analysis mid-pipeline, where steps can leave unreachable
+        // blocks jumping into loops (Cranelift's own pipeline strips them
+        // first). Dominance against an unreachable block is meaningless.
         cfg.pred_iter(block)
-            .any(|pred| domtree.block_dominates(block, pred.block))
+            .any(|pred| domtree.is_reachable(pred.block) && domtree.block_dominates(block, pred.block))
     }
 
     // Traverses the CFG in reverse postorder and create a loop object for every block having a
@@ -237,7 +241,8 @@ impl LoopAnalysis {
                 cfg.pred_iter(self.loops[lp].header)
                     .filter(|pred| {
                         // We follow the back edges
-                        domtree.block_dominates(self.loops[lp].header, pred.block)
+                        domtree.is_reachable(pred.block)
+                            && domtree.block_dominates(self.loops[lp].header, pred.block)
                     })
                     .map(|pred| pred.block),
             );
@@ -285,7 +290,16 @@ impl LoopAnalysis {
                 // Now we have handled the popped node and need to continue the DFS by adding the
                 // predecessors of that node
                 if let Some(continue_dfs) = continue_dfs {
-                    stack.extend(cfg.pred_iter(continue_dfs).map(|pred| pred.block));
+                    // PLIRON: don't climb into unreachable predecessors
+                    // (see `is_block_loop_header`): their loop/parent links
+                    // can close a cycle, and `assign_loop_levels` /
+                    // the parent chase above then never terminate
+                    // (rustlantis seed 1776 hung in postinc2's analysis).
+                    stack.extend(
+                        cfg.pred_iter(continue_dfs)
+                            .map(|pred| pred.block)
+                            .filter(|&b| domtree.is_reachable(b)),
+                    );
                 }
             }
         }

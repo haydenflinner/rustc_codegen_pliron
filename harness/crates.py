@@ -248,7 +248,11 @@ def main():
             "BUILD" if p["build_error"] and not s["build_error"] else
             "TIMEOUT" if p["rc"] == "timeout" and s["rc"] != "timeout" else
             "FAIL" if only_p or p["passed"] < s["passed"] or p["failed"] > s["failed"] else
-            "skip" if s["build_error"] else "ok"
+            "skip" if s["build_error"] else
+            # The stock baseline itself timed out (tokio under nightly-2026-10-22
+            # stalled at 518/2310): pliron isn't worse, but the comparison is
+            # partial — don't report it as a plain pass.
+            "STOCKTO" if s["rc"] == "timeout" else "ok"
         )
         row["status"] = status
         rows.append(row)
