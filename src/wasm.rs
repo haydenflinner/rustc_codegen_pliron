@@ -2608,9 +2608,66 @@ fn peep_body_opts(
         // flow into arm2 regardless of level.
         let mut dead_at: Option<usize> = None;
         let mut dead_pos: Option<usize> = None;
+        // Forward branches land *inside* the span a marker makes dead
+        // (a match's `br_table` picks an arm the previous arm already
+        // branched over). Precompute every branch's landing point —
+        // the `end` of a targeted block/if, the inst after a targeted
+        // `loop` opener — and resume liveness when the scan passes it.
+        let mut resume: rustc_hash::FxHashSet<usize> = Default::default();
+        {
+            let mut ost: Vec<usize> = Vec::new();
+            let mut end_of = vec![usize::MAX; ins.len()];
+            let mut resolved: Vec<usize> = Vec::new();
+            for (i, &(k, s, ..)) in ins.iter().enumerate() {
+                macro_rules! land {
+                    ($dd:expr) => {
+                        if ($dd as usize) < ost.len() {
+                            resolved.push(ost[ost.len() - 1 - $dd as usize]);
+                        }
+                    };
+                }
+                match k {
+                    WPeek::Br(dd) | WPeek::BrIf(dd) => land!(dd),
+                    WPeek::Ctl if b[s] == 0x0c || b[s] == 0x0d => {
+                        let mut dp = s + 1;
+                        if let Some(dd) = urd(b, &mut dp) {
+                            land!(dd);
+                        }
+                    }
+                    WPeek::Ctl if b[s] == 0x0e => {
+                        let mut dp = s + 1;
+                        if let Some(n) = urd(b, &mut dp) {
+                            for _ in 0..=n {
+                                if let Some(dd) = urd(b, &mut dp) {
+                                    land!(dd);
+                                }
+                            }
+                        }
+                    }
+                    WPeek::Ctl if matches!(b[s], 0x02 | 0x03 | 0x04) => ost.push(i),
+                    WPeek::Ctl if b[s] == 0x0b => {
+                        if let Some(o) = ost.pop() {
+                            end_of[o] = i;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for o in resolved {
+                if b[ins[o].1] == 0x03 {
+                    resume.insert(o + 1);
+                } else if end_of[o] != usize::MAX {
+                    resume.insert(end_of[o]);
+                }
+            }
+        }
         let mut ok = true;
         let mut i = 0;
         'model: while i < ins.len() {
+            if resume.contains(&i) {
+                dead_at = None;
+                dead_pos = None;
+            }
             let (k, s, _e, _c) = ins[i];
             sd.push(if dead_at.is_some() { None } else { Some(d) });
             match k {
@@ -2804,19 +2861,26 @@ fn peep_body_opts(
                     _ => (None, false),
                 };
                 let Some(kk) = kk else { continue };
-                // `None` depth = unreachable code: the stack is
+                // `sd` `None` = unreachable code: the stack is
                 // polymorphic there, so the ends need no arity checks —
                 // removing a dead branch changes nothing semantically.
-                let live = match sd.get(i) {
+                // `Some(None)` is *live* code whose operand depth the
+                // model lost track of — the structural checks below
+                // (void crossed ends, non-`loop` target) still apply:
+                // a `br` to a `loop` jumps to its header, and deleting
+                // it turns a back-edge into an exit.
+                let dead = match sd.get(i) {
+                    Some(&None) => true,
+                    Some(&Some(None)) => false,
                     Some(&Some(Some(x))) => {
                         if x != is_if as u32 {
                             continue;
                         }
-                        true
+                        false
                     }
-                    Some(&None) => false,
                     _ => continue,
                 };
+                let live = !dead;
                 // The next kk+1 real insts must be `end`s of void
                 // (result-arity-0) constructs; the last closes the
                 // target, which must not be a `loop`.
@@ -2862,16 +2926,28 @@ fn peep_body_opts(
                 }
                 dels.push((i, is_if));
             }
+            let mut dels = dels;
+            if let Some(n) = crate::env_get("PLIRON_WASM_BTR_LIM")
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                dels.truncate(n);
+            }
+            if let Some(x) = crate::env_get("PLIRON_WASM_BTR_SKIP")
+                .and_then(|v| usize::from_str_radix(&v, 16).ok().or(v.parse().ok()))
+            {
+                dels.retain(|&(i, _)| ins[i].1 != x);
+            }
             for &(i, is_if) in &dels {
                 // A live `br_if` still has to pop its condition; a dead
                 // one disappears with the rest of the dead code.
-                ins[i].0 = if is_if && sd[i] == Some(Some(1)) {
+                ins[i].0 = if is_if && sd[i].is_some() {
                     WPeek::Drop
                 } else {
                     WPeek::Del
                 };
             }
         }
+        wtrace!("btr", ins);
     }
     // Fresh local index for `tee`-captured values / LICM-hoisted
     // temporaries — shared by every local-minting pass below.
@@ -5178,14 +5254,20 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
         // finishing, which the global PEEPED counter is not.
         static PEEPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let pmod = crate::env_get("PLIRON_WASM_PEEP_MOD");
-        if pmod.as_deref().is_some_and(|m| !name.contains(m)) {
+        if pmod
+            .as_deref()
+            .is_some_and(|m| !m.split(',').any(|p| name.contains(p)))
+        {
             return;
         }
         let limit = crate::env_get("PLIRON_WASM_PEEP_FI")
             .or_else(|| crate::env_get("PLIRON_WASM_PEEP_LIMIT"))
             .and_then(|v| v.parse::<u64>().ok());
         let base = PEEPED.fetch_add(nf as u64, std::sync::atomic::Ordering::Relaxed);
-        let bodies = par_map(spans.len(), |fi| {
+        // PLIRON: `PLIRON_WPEEP_PAR=0` forces this map serial —
+        // bisects races inside peep_body_opts.
+        let serial = crate::env_get("PLIRON_WPEEP_PAR").as_deref() == Some("0");
+        let one = |fi: usize| {
             let (q, be) = spans[fi];
             let k = if pmod.is_some() {
                 fi as u64
@@ -5200,7 +5282,7 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(
-                        format!("{dir}/body_{}_{k}_pre.bin", std::process::id()),
+                        format!("{dir}/body_{}_{name}_{fi}_pre.bin", std::process::id()),
                         &bytes[q..be],
                     );
                 }
@@ -5214,7 +5296,7 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                 };
                 if let Some(dir) = crate::env_get("PLIRON_WASM_BODYDUMP") {
                     let _ = std::fs::write(
-                        format!("{dir}/body_{}_{k}_post.bin", std::process::id()),
+                        format!("{dir}/body_{}_{name}_{fi}_post.bin", std::process::id()),
                         &out,
                     );
                 }
@@ -5222,7 +5304,12 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
             } else {
                 bytes[q..be].to_vec()
             }
-        });
+        };
+        let bodies: Vec<Vec<u8>> = if serial {
+            (0..spans.len()).map(&one).collect()
+        } else {
+            par_map(spans.len(), one)
+        };
         for nb in bodies {
             leb(&mut body_out, nb.len() as u32);
             body_out.extend_from_slice(&nb);
@@ -5249,6 +5336,56 @@ mod wpeep_tests {
 
     fn has_seq(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // Regression: the `btr` dead-region model must resume liveness at a
+    // forward branch's landing point — a `br_table` arm selects code
+    // past a `br` that the linear scan marks dead (pulldown-cmark's
+    // Parser::next match dispatch). Without the resume, a `br` to a
+    // `loop` header inside that span folds unconditionally, turning a
+    // back-edge into a fallthrough exit.
+    //
+    //   block T
+    //     block W
+    //       block X
+    //         global.get 0; br_table [X.end, W.end]
+    //       end
+    //       br 1                    ; -> T.end: dead until T.end
+    //     end                     ; <- arm1 lands here: live again
+    //     loop C
+    //       if { if { br 2 } }    ; -> C header (back-edge)
+    //     end
+    //   end
+    #[test]
+    fn dead_region_resumes_at_branch_landing() {
+        let b = body(
+            1,
+            &[
+                0x02, 0x40, // block T
+                0x02, 0x40, //   block W
+                0x02, 0x40, //     block X
+                0x23, 0x00, //       global.get 0
+                0x0e, 0x01, 0x00, 0x01, // br_table [0], default 1
+                0x0b, //            end X
+                0x0c, 0x01, //     br 1 -> T (dead marker)
+                0x0b, //          end W   <- arm1 lands here
+                0x03, 0x40, //   loop C
+                0x23, 0x00, //     global.get 0
+                0x04, 0x40, //     if
+                0x23, 0x00, //       global.get 0
+                0x04, 0x40, //       if
+                0x0c, 0x02, //         br 2 -> C (back-edge)
+                0x0b, //         end
+                0x0b, //       end
+                0x0b, //     end C
+                0x0b, //   end T
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        assert!(
+            has_seq(&out, &[0x0c, 0x02]) || has_seq(&out, &[0x0d, 0x01]),
+            "back-edge folded to fallthrough: {out:02x?}"
+        );
     }
 
     // Regression: a `local.get x; local.set x` no-op pair inside one arm
@@ -7863,10 +8000,21 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 }
                 sites
             };
-            if !sites.is_empty() {
+            // PLIRON: `PLIRON_WASM_INLINE_LIMIT=N` performs at most N
+            // splices total — bisects a miscompile to one splice.
+            let inline_limit = crate::env_get("PLIRON_WASM_INLINE_LIMIT")
+                .and_then(|v| v.parse::<usize>().ok());
+            // PLIRON: `PLIRON_WASM_INLINE_SKIP=<substr>` never inlines
+            // into callers whose name contains it — bisects by caller.
+            let inline_skip = crate::env_get("PLIRON_WASM_INLINE_SKIP")
+                .is_some_and(|s| s.split(',').any(|p| funcs[ci].name.contains(p)));
+            if !sites.is_empty() && !inline_skip {
                 did = true;
                 for &(iv, fi) in &sites {
-                    if cur_size > caller_cap || grown[ci] > caller_cap {
+                    if cur_size > caller_cap
+                        || grown[ci] > caller_cap
+                        || inline_limit.is_some_and(|l| inlined >= l)
+                    {
                         break;
                     }
                     let callee = funcs[fi].body.clone().unwrap();
@@ -7877,6 +8025,13 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                         continue;
                     }
                     if let Some(pos) = b.blocks[blk].insts.iter().position(|&i| i == iv) {
+                        // PLIRON: index each splice for INLINE_LIMIT bisects.
+                        if crate::env_get("PLIRON_WASM_INLINE_LOG").is_some() {
+                            eprintln!(
+                                "inl {} {} <- {}",
+                                inlined, funcs[ci].name, funcs[fi].name
+                            );
+                        }
                         inline_site(b, blk, pos, iv, &callee, sp);
                         check_targets(b, &funcs[fi].name);
                         let n = body_size(&callee);
