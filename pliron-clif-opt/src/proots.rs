@@ -573,13 +573,16 @@ pub fn key_of(
 /// value-walks instead of building 10⁵-node trees that never merge.
 /// Because it is by-construction the `khash_m` of the key, `hmap`
 /// probes inside `paramize` stay consistent.
-pub fn vhash(
+/// `vhash` + `vnodes` fused into one memoized walk — the two functions
+/// traversed the same resolve→canon→nf→def-DAG structure, so the edge-arg
+/// scan pays one pass per cell instead of two. Returns (hash, nodes).
+pub fn vhn(
     func: &Function,
     nf: &VMap< (Value, i64)>,
     canon: &VMap< Value>,
-    memo: &mut VMap< u64>,
+    memo: &mut VMap< (u64, usize)>,
     v: Value,
-) -> u64 {
+) -> (u64, usize) {
     use std::hash::{Hash, Hasher};
     fn hv(v: Value) -> u64 {
         // khash_m's leaf arm: discriminant + fields.
@@ -599,49 +602,49 @@ pub fn vhash(
         func: &Function,
         nf: &VMap< (Value, i64)>,
         canon: &VMap< Value>,
-        memo: &mut VMap< u64>,
+        memo: &mut VMap< (u64, usize)>,
         v: Value,
         d: usize,
-    ) -> u64 {
+    ) -> (u64, usize) {
         let v = func.dfg.resolve_aliases(v);
         let v = canon.get(&v).copied().unwrap_or(v);
         if d > 64 {
-            return hv(v);
+            return (hv(v), 1);
         }
-        if let Some(&h) = memo.get(&v) {
-            return h;
+        if let Some(&r) = memo.get(&v) {
+            return r;
         }
-        let h = go_uncached(func, nf, canon, memo, v, d);
-        memo.insert(v, h);
-        h
+        let r = unc(func, nf, canon, memo, v, d);
+        memo.insert(v, r);
+        r
     }
-    fn go_uncached(
+    fn unc(
         func: &Function,
         nf: &VMap< (Value, i64)>,
         canon: &VMap< Value>,
-        memo: &mut VMap< u64>,
+        memo: &mut VMap< (u64, usize)>,
         v: Value,
         d: usize,
-    ) -> u64 {
+    ) -> (u64, usize) {
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
         if let Some(&(r, k)) = nf.get(&v)
             && r != v
         {
-            let rh = go(func, nf, canon, memo, r, d + 1);
+            let (rh, rn) = go(func, nf, canon, memo, r, d + 1);
             let ty = func.dfg.value_type(v);
             if k == 0 {
-                return rh;
+                return (rh, rn);
             }
             // Key::A arm
             0u8.hash(&mut h);
             ty.hash(&mut h);
             rh.hash(&mut h);
             k.hash(&mut h);
-            return h.finish();
+            return (h.finish(), rn.saturating_add(1));
         }
         let Some(di) = func.dfg.value_def(v).inst() else {
-            return hv(v);
+            return (hv(v), 1);
         };
         let rty = func.dfg.value_type(v);
         let op = func.dfg.insts[di].opcode();
@@ -663,193 +666,112 @@ pub fn vhash(
                         || op.other_side_effects()
                         || op.can_store())))
         {
-            return hv(v);
+            return (hv(v), 1);
         }
         // Key::N arm: 1u8 + op + ty + args + extra — args are value
-        // hashes followed by `K` immediates (each carrying its key type).
-        let mut n = |extra: u64, vals: &[Value], imms: &[(cranelift_codegen::ir::Type, i64)]| {
-            1u8.hash(&mut h);
-            op.hash(&mut h);
-            rty.hash(&mut h);
-            for &a in vals {
-                let a = func.dfg.resolve_aliases(a);
-                go(func, nf, canon, memo, a, d + 1).hash(&mut h);
-            }
-            for &(t, i) in imms {
-                hk(t, i).hash(&mut h);
-            }
-            extra.hash(&mut h);
-            h.finish()
-        };
+        // hashes followed by `K` immediates (each carrying its key type
+        // and counting as one node).
         let i64t = cranelift_codegen::ir::types::I64;
         let i32t = cranelift_codegen::ir::types::I32;
-        match func.dfg.insts[di] {
+        // (tag, arg vals, K immediates, node count): the tag carries
+        // the variant + inline imm bits; `ncnt` counts self + K-imm
+        // pseudo-nodes + children.
+        let mut vals = [Value::from_bits(0); 3];
+        let mut nvals = 0usize;
+        let mut nimms = 0usize;
+        let mut imms = [(i32t, 0i64); 1];
+        let (tag, mut ncnt): (u64, usize) = match func.dfg.insts[di] {
             InstructionData::UnaryImm {
                 opcode: Opcode::Iconst,
                 imm,
-            } => hk(rty, imm.bits()),
-            InstructionData::Binary { args: a, .. } => n(tag::BIN, &a, &[]),
-            InstructionData::Unary { arg, .. } => n(tag::UNARY, &[arg], &[]),
-            InstructionData::Ternary { args: a, .. } => n(tag::TERN, &a, &[]),
+            } => return (hk(rty, imm.bits()), 1),
+            InstructionData::Binary { args: a, .. } => {
+                vals[..2].copy_from_slice(&a);
+                nvals = 2;
+                (tag::BIN, 1)
+            }
+            InstructionData::Unary { arg, .. } => {
+                vals[0] = arg;
+                nvals = 1;
+                (tag::UNARY, 1)
+            }
+            InstructionData::Ternary { args: a, .. } => {
+                vals.copy_from_slice(&a);
+                nvals = 3;
+                (tag::TERN, 1)
+            }
             InstructionData::BinaryImm8 { arg, imm, .. } => {
-                n(tag::BIMM8 | (imm as u64) << 8, &[arg], &[])
+                vals[0] = arg;
+                nvals = 1;
+                (tag::BIMM8 | (imm as u64) << 8, 1)
             }
             InstructionData::IntCompare { args: a, cond, .. } => {
-                n(tag::ICMP | (cond as u64) << 8, &a, &[])
+                vals[..2].copy_from_slice(&a);
+                nvals = 2;
+                (tag::ICMP | (cond as u64) << 8, 1)
             }
             InstructionData::FloatCompare { args: a, cond, .. } => {
-                n(tag::FCMP | (cond as u64) << 8, &a, &[])
+                vals[..2].copy_from_slice(&a);
+                nvals = 2;
+                (tag::FCMP | (cond as u64) << 8, 1)
             }
             InstructionData::StackAddr {
                 stack_slot, offset, ..
-            } => n(
-                tag::SADDR | (stack_slot.as_u32() as u64) << 8,
-                &[],
-                &[(i32t, i32::from(offset) as i64)],
-            ),
+            } => {
+                imms[0] = (i32t, i32::from(offset) as i64);
+                nimms = 1;
+                (tag::SADDR | (stack_slot.as_u32() as u64) << 8, 2)
+            }
             InstructionData::Load {
                 arg, flags, offset, ..
-            } => n(
-                tag::LOAD | (flags.as_u32() as u64) << 8,
-                &[arg],
-                &[(i32t, i32::from(offset) as i64)],
-            ),
+            } => {
+                vals[0] = arg;
+                nvals = 1;
+                imms[0] = (i32t, i32::from(offset) as i64);
+                nimms = 1;
+                (tag::LOAD | (flags.as_u32() as u64) << 8, 2)
+            }
             InstructionData::LoadNoOffset { arg, flags, .. } => {
-                n(tag::LOADNOFF | (flags.as_u32() as u64) << 8, &[arg], &[])
+                vals[0] = arg;
+                nvals = 1;
+                (tag::LOADNOFF | (flags.as_u32() as u64) << 8, 1)
             }
             InstructionData::UnaryIeee16 { imm, .. } => {
-                n(tag::UIEEE, &[], &[(i64t, imm.bits() as i64)])
+                imms[0] = (i64t, imm.bits() as i64);
+                nimms = 1;
+                (tag::UIEEE, 2)
             }
             InstructionData::UnaryIeee32 { imm, .. } => {
-                n(tag::UIEEE, &[], &[(i64t, imm.bits() as i64)])
+                imms[0] = (i64t, imm.bits() as i64);
+                nimms = 1;
+                (tag::UIEEE, 2)
             }
             InstructionData::UnaryIeee64 { imm, .. } => {
-                n(tag::UIEEE, &[], &[(i64t, imm.bits() as i64)])
+                imms[0] = (i64t, imm.bits() as i64);
+                nimms = 1;
+                (tag::UIEEE, 2)
             }
-            _ => hv(v),
+            _ => return (hv(v), 1),
+        };
+        1u8.hash(&mut h);
+        op.hash(&mut h);
+        rty.hash(&mut h);
+        for &a in &vals[..nvals] {
+            let a = func.dfg.resolve_aliases(a);
+            let (ah, an) = go(func, nf, canon, memo, a, d + 1);
+            ah.hash(&mut h);
+            ncnt = ncnt.saturating_add(an);
         }
+        for &(t, i) in &imms[..nimms] {
+            hk(t, i).hash(&mut h);
+        }
+        tag.hash(&mut h);
+        (h.finish(), ncnt)
     }
     go(func, nf, canon, memo, v, 0)
 }
 
-/// `k`'s node count were it built — `nodes(key_of(v))` without the
-/// allocation. Same traversal as `vhash`: the `within` caps that gate
-/// relational probing must see the key's size, not the def-DAG's.
-pub fn vnodes(
-    func: &Function,
-    nf: &VMap< (Value, i64)>,
-    canon: &VMap< Value>,
-    memo: &mut VMap< usize>,
-    v: Value,
-) -> usize {
-    fn go(
-        func: &Function,
-        nf: &VMap< (Value, i64)>,
-        canon: &VMap< Value>,
-        memo: &mut VMap< usize>,
-        v: Value,
-        d: usize,
-    ) -> usize {
-        let v = func.dfg.resolve_aliases(v);
-        let v = canon.get(&v).copied().unwrap_or(v);
-        if d > 64 {
-            return 1;
-        }
-        if let Some(&n) = memo.get(&v) {
-            return n;
-        }
-        let n = unc(func, nf, canon, memo, v, d);
-        memo.insert(v, n);
-        n
-    }
-    fn unc(
-        func: &Function,
-        nf: &VMap< (Value, i64)>,
-        canon: &VMap< Value>,
-        memo: &mut VMap< usize>,
-        v: Value,
-        d: usize,
-    ) -> usize {
-        if let Some(&(r, k)) = nf.get(&v)
-            && r != v
-        {
-            let n = go(func, nf, canon, memo, r, d + 1);
-            return if k == 0 { n } else { n.saturating_add(1) };
-        }
-        let Some(di) = func.dfg.value_def(v).inst() else {
-            return 1;
-        };
-        let op = func.dfg.insts[di].opcode();
-        let pure_load = match func.dfg.insts[di] {
-            InstructionData::Load { flags, .. } | InstructionData::LoadNoOffset { flags, .. } => {
-                let f = func.dfg.mem_flags[flags];
-                f.readonly() && f.notrap() && f.can_move()
-            }
-            _ => false,
-        };
-        if func.dfg.inst_results(di).len() != 1
-            || !(pure_load
-                || (!op.can_load()
-                    && !(op.is_call()
-                        || op.is_branch()
-                        || op.is_terminator()
-                        || op.is_return()
-                        || op.can_trap()
-                        || op.other_side_effects()
-                        || op.can_store())))
-        {
-            return 1;
-        }
-        match func.dfg.insts[di] {
-            InstructionData::UnaryImm {
-                opcode: Opcode::Iconst,
-                ..
-            } => 1,
-            InstructionData::Binary { args, .. }
-            | InstructionData::IntCompare { args, .. }
-            | InstructionData::FloatCompare { args, .. } => {
-                let a0 = func.dfg.resolve_aliases(args[0]);
-                let a1 = func.dfg.resolve_aliases(args[1]);
-                1usize
-                    .saturating_add(go(func, nf, canon, memo, a0, d + 1))
-                    .saturating_add(go(func, nf, canon, memo, a1, d + 1))
-            }
-            InstructionData::Ternary { args, .. } => {
-                let a0 = func.dfg.resolve_aliases(args[0]);
-                let a1 = func.dfg.resolve_aliases(args[1]);
-                let a2 = func.dfg.resolve_aliases(args[2]);
-                1usize
-                    .saturating_add(go(func, nf, canon, memo, a0, d + 1))
-                    .saturating_add(go(func, nf, canon, memo, a1, d + 1))
-                    .saturating_add(go(func, nf, canon, memo, a2, d + 1))
-            }
-            InstructionData::Unary { arg, .. } | InstructionData::BinaryImm8 { arg, .. } => {
-                let a = func.dfg.resolve_aliases(arg);
-                1usize.saturating_add(go(func, nf, canon, memo, a, d + 1))
-            }
-            // `K` imm pseudo-args each count as a node.
-            InstructionData::StackAddr { .. }
-            | InstructionData::UnaryIeee16 { .. }
-            | InstructionData::UnaryIeee32 { .. }
-            | InstructionData::UnaryIeee64 { .. } => 2,
-            InstructionData::Load { arg, .. } => {
-                let a = func.dfg.resolve_aliases(arg);
-                2usize.saturating_add(go(func, nf, canon, memo, a, d + 1))
-            }
-            InstructionData::LoadNoOffset { arg, .. } => {
-                let a = func.dfg.resolve_aliases(arg);
-                1usize.saturating_add(go(func, nf, canon, memo, a, d + 1))
-            }
-            _ => 1,
-        }
-    }
-    go(func, nf, canon, memo, v, 0)
-}
-
-/// `Key::N`'s `extra` low byte — which `InstructionData` variant the
-/// node was. `emit_key` needs the exact variant to rebuild; fields that
-/// don't fit in args (cond codes, mem flags, lane indices) ride in the
-/// remaining bits.
+/// `vhash`/`vnodes` were one traversal; `vhn` returns both.
 pub mod tag {
     pub const BIN: u64 = 0;
     pub const UNARY: u64 = 1;
@@ -1566,8 +1488,7 @@ mod tests {
         let nf = web_nf(&func);
         let canon = canon_map(&func);
         let mut km: VMap< Key> = VMap::default();
-        let mut hm: VMap< u64> = VMap::default();
-        let mut nm: VMap< usize> = VMap::default();
+        let mut hnm: VMap< (u64, usize)> = VMap::default();
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
                 for v in func.dfg.inst_values(i) {
@@ -1576,16 +1497,13 @@ mod tests {
                     // `k` is a stack temp — `khash_m`'s pointer-keyed
                     // memo would alias its reused address, so hash with
                     // a fresh memo (children's `Rc` targets are stable).
+                    let (h, n) = vhn(&func, &nf, &canon, &mut hnm, v);
                     assert_eq!(
-                        vhash(&func, &nf, &canon, &mut hm, v),
+                        h,
                         khash_m(&k, &mut FxHashMap::default()),
-                        "vhash drifted from key_of on {v}"
+                        "vhn hash drifted from key_of on {v}"
                     );
-                    assert_eq!(
-                        vnodes(&func, &nf, &canon, &mut nm, v),
-                        nodes(&k),
-                        "vnodes drifted on {v}"
-                    );
+                    assert_eq!(n, nodes(&k), "vhn nodes drifted on {v}");
                 }
             }
         }

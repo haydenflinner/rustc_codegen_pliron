@@ -4094,8 +4094,7 @@ pub fn webmerge_ctx(
     // `RefCell` because `skey_of`/`pk_of` materialize lazily from inside
     // immutable borrows of the cell matrices.
     let memo = std::cell::RefCell::new(VMap::<crate::proots::Key>::default());
-    let mut vhmemo: VMap<u64> = VMap::default();
-    let vnmemo = std::cell::RefCell::new(VMap::<usize>::default());
+    let vhnmemo = std::cell::RefCell::new(VMap::<(u64, usize)>::default());
     let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut param_drops: Vec<Value> = vec![];
     let mut drop_ixs: FxHashMap<(Inst, usize), Vec<usize>> = FxHashMap::default();
@@ -4213,13 +4212,14 @@ pub fn webmerge_ctx(
             // `(inst, tag, payload)` — same `BlockCall` arg is the same
             // value, anything else differs.
             svh.v.extend(args.iter().map(|a| match a {
-                BlockArg::Value(v) => crate::proots::vhash(
+                BlockArg::Value(v) => crate::proots::vhn(
                     func,
                     &nf,
                     &canon,
-                    &mut vhmemo,
+                    &mut vhnmemo.borrow_mut(),
                     func.dfg.resolve_aliases(*v),
-                ),
+                )
+                .0,
                 BlockArg::TryCallRet(x) => {
                     crate::proots::ohash((i.index() as u64) << 32 | 1 << 30 | *x as u64)
                 }
@@ -4249,13 +4249,9 @@ pub fn webmerge_ctx(
         'cap: for r in eargs.rows() {
             for c in r {
                 if let Some(v) = c {
-                    arg_nodes = arg_nodes.saturating_add(crate::proots::vnodes(
-                        func,
-                        &nf,
-                        &canon,
-                        &mut vnmemo.borrow_mut(),
-                        *v,
-                    ));
+                    arg_nodes = arg_nodes.saturating_add(
+                        crate::proots::vhn(func, &nf, &canon, &mut vhnmemo.borrow_mut(), *v).1,
+                    );
                     if arg_nodes > 2_000_000 {
                         break 'cap;
                     }
@@ -4273,7 +4269,7 @@ pub fn webmerge_ctx(
                     .rows()
                     .map(|r| {
                         r[ix].map_or(1, |v| {
-                            crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                            crate::proots::vhn(func, &nf, &canon, &mut vhnmemo.borrow_mut(), v).1
                         })
                     })
                     .collect();
@@ -4482,7 +4478,7 @@ pub fn webmerge_ctx(
             const REL_PROBES_CAP: usize = 2048;
             if !(0..es.len()).all(|e| {
                 eargs[e][ix].is_none_or(|v| {
-                    crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                    crate::proots::vhn(func, &nf, &canon, &mut vhnmemo.borrow_mut(), v).1
                         <= REL_PROBES_CAP
                 })
             }) {
@@ -4648,7 +4644,7 @@ pub fn webmerge_ctx(
                     // the result can't preempt.
                     let vwithin = |v: Option<Value>| {
                         v.is_some_and(|v| {
-                            crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                            crate::proots::vhn(func, &nf, &canon, &mut vhnmemo.borrow_mut(), v).1
                                 <= REL_KEY_CAP
                         })
                     };
@@ -4933,7 +4929,7 @@ pub fn webmerge_ctx(
                     && !param_drops.contains(&ps[i])
                     && (0..es.len()).all(|e| {
                         eargs[e][i].is_some_and(|v| {
-                            crate::proots::vnodes(func, &nf, &canon, &mut vnmemo.borrow_mut(), v)
+                            crate::proots::vhn(func, &nf, &canon, &mut vhnmemo.borrow_mut(), v).1
                                 <= BISIM_KEY_CAP
                         })
                     })

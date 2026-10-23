@@ -801,6 +801,7 @@ thread_local! {
     static EDGE_PROF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+
 pub fn run(
     func: &mut Function,
     derived: &mut VMap<Value>,
@@ -852,11 +853,16 @@ pub fn run(
     let mut scans = 0usize;
     let mut nbrif = 0usize;
     let mut nres = 0usize;
+    let mut nbt = 0usize;
+    let mut nch = 0usize;
+    let mut nrc = 0usize;
+    let mut rounds = 0usize;
     // Per-brif edge args — reused across blocks and rounds instead of two
     // fresh Vecs per candidate.
     let mut t_edge: Vec<BlockArg> = Vec::new();
     let mut e_edge: Vec<BlockArg> = Vec::new();
     'outer: for _ in 0..8 {
+        rounds += 1;
         let mut rn = 0;
         for b in blocks.iter().copied() {
             scans += 1;
@@ -864,8 +870,9 @@ pub fn run(
                 continue;
             };
             let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
-                if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
-                    && conv_table(
+                if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. }) {
+                    nbt += 1;
+                    if conv_table(
                         func,
                         cfg,
                         domtree,
@@ -876,9 +883,9 @@ pub fn run(
                         b,
                         term,
                         derived,
-                    )
-                {
-                    n += 1;
+                    ) {
+                        n += 1;
+                    }
                 }
                 continue;
             };
@@ -950,7 +957,9 @@ pub fn run(
             // Multi-hop arms only pay off when the fold leaves its loop
             // branch-free (see `flat_loop`).
             if ta.chained || ea.chained {
+                nch += 1;
                 if dirty {
+                    nrc += 1;
                     cfg.compute(func);
                     domtree.compute(func, cfg);
                     msets.recompute(func, domtree);
@@ -1020,7 +1029,7 @@ pub fn run(
     }
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::ifconv", tracing::Level::INFO)
     {
-        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms scans={scans} brif={nbrif} res={nres} conv={n}", c.get() as f64 / 1e6));
+        EDGE_NS.with(|c| tracing::info!(target: "pliron::ifconv", "ifconv edge_ok {:.1}ms scans={scans} brif={nbrif} res={nres} conv={n} bt={nbt} ch={nch} rc={nrc} rounds={rounds}", c.get() as f64 / 1e6));
     }
     n
 }
