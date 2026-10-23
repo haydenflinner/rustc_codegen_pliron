@@ -101,11 +101,17 @@ enum Sym {
 pub static RET_NOEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Cranelift implements `StructArgument` (byval) only on x86-64: arm64
-/// panics on it. `lower_module` clears this for such targets, and a
-/// byval argument (rustc's `IndirectMode::OnStack`, e.g. the `extern
-/// "tail"` ABI's large aggregates) is then passed as a plain pointer, like
-/// every other indirect argument — both ends are pliron code, and rustc
-/// already hands the callee its own copy for by-move indirect args.
+/// panics on it, and on Windows the caller's copy-out calls `memcpy` with
+/// argument registers picked from the *callee signature's* convention —
+/// `Tail` means SysV order (rdi/rsi/rdx) while the win64 `memcpy` is
+/// fastcall (rcx/rdx/r8), so the copy writes through a garbage pointer
+/// (`machinst::abi::gen_call_args` → `CallConv::for_libcall` with
+/// `libcall_call_conv = isa_default`). `lower_module` clears this for
+/// such targets, and a byval argument (rustc's `IndirectMode::OnStack`,
+/// e.g. the `extern "tail"` ABI's large aggregates) is then passed as a
+/// plain pointer, like every other indirect argument — both ends are
+/// pliron code, and rustc already hands the callee its own copy for
+/// by-move indirect args.
 static STRUCT_ARG_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
@@ -989,7 +995,8 @@ pub fn lower_module<'a>(
     let macho = isa.triple().binary_format == target_lexicon::BinaryFormat::Macho;
     let cc = isa.default_call_conv();
     STRUCT_ARG_OK.store(
-        isa.triple().architecture == target_lexicon::Architecture::X86_64,
+        isa.triple().architecture == target_lexicon::Architecture::X86_64
+            && isa.triple().operating_system != target_lexicon::OperatingSystem::Windows,
         std::sync::atomic::Ordering::Relaxed,
     );
     let mut internal = internal_fns(ctx, st);

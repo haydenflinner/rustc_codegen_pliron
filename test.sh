@@ -330,9 +330,10 @@ t_fnalign() {
 }
 
 t_rusttailcc() {
-  # extern "tail" with byval (OnStack) aggregates: no StructArgument on arm64.
-  rustc $BE --edition 2021 --cfg aarch64 tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1 && \
-  rustc $BE --edition 2021 --cfg aarch64 -O tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1
+  # extern "tail" with byval (OnStack) aggregates: StructArgument exists
+  # only on SysV x86-64; arm64 and Windows pass them as plain pointers.
+  rustc $BE $stockcfg --edition 2021 --cfg aarch64 tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1 && \
+  rustc $BE $stockcfg --edition 2021 --cfg aarch64 -O tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1
 }
 
 t_asmlabels() {
@@ -625,11 +626,10 @@ want mirshapes && t_mirshapes
 want slpsplat && t_slpsplat
 want applestackargs && t_applestackargs
 want fnalign && t_fnalign
-# rusttailcc: SEGFAULTS on Windows x64 even without the panic path —
-# extern "tail" byval (StructArgument) arg passing is broken there
-# (x86-64 StructArgument lowering is SysV-flavored). Real bug, gated
-# until fixed; also needs catch_unwind for the panic half.
-[[ -z "$exe" ]] && want rusttailcc && t_rusttailcc
+# rusttailcc: byval args pass as plain pointers on Windows (x64
+# StructArgument's copy-out calls memcpy with SysV-ordered regs); the
+# panic-catch half is cfg'd out under pliron_stock_seh.
+want rusttailcc && t_rusttailcc
 want asmlabels && t_asmlabels
 # cvariadic: mkwinlibs' msvcrt .def has no vsnprintf import (LNK2019) —
 # infra gap, not codegen; regenerate tools/mkwinlibs to cover it.

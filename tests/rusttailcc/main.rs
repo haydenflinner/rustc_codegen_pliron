@@ -19,8 +19,16 @@ extern "tail" fn oven_explosion() {
 
 #[inline(never)]
 fn bite_into(yummy: u64) -> u64 {
-    let did_it_actually = std::panic::catch_unwind(move || oven_explosion());
-    assert!(did_it_actually.is_err());
+    // Against a stock (LLVM-built) std on Windows, `panic!` is a real SEH
+    // throw the emulated-EH invoke path can't intercept — only exercise the
+    // catch with a backend-built std (`-Zbuild-std`) or elsewhere.
+    #[cfg(not(pliron_stock_seh))]
+    {
+        let did_it_actually = std::panic::catch_unwind(move || oven_explosion());
+        assert!(did_it_actually.is_err());
+    }
+    #[cfg(pliron_stock_seh)]
+    let _ = oven_explosion as extern "tail" fn();
     yummy - 25
 }
 
