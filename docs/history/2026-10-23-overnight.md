@@ -120,7 +120,10 @@ that reports a change; several steps don't dump on their own.
 
 Open:
 
-- **2598, mismatch at -O0, not an optimization bug.** `PLIRON_OPT_BISECT=0`
+- **2598: fixed by 23bb4c8** (Apple-packed stack arguments: Cranelift
+  stored/loaded them at the slot width, not their own; test
+  `applestackargs`). Old notes follow.
+- **(old notes) 2598, mismatch at -O0, not an optimization bug.** `PLIRON_OPT_BISECT=0`
   still fails. A logging hasher showed one `[isize; 8]` element of
   `fn8`'s by-value param arriving as `0xffff_ffff_ffff_0000` instead of
   -1. The `--debug` build of the same seed (values printed, not hashed)
@@ -143,7 +146,9 @@ Open:
   differs, and rolling back that one unit fixes it. That points at
   Cranelift lowering/regalloc of the post-merge shape. Next step: a
   native-vs-interpreter runner (JIT) in clif-check.
-- **2187: compile timeout.** Not investigated yet.
+- **2187: compile timeout, gone.** It compiles in 3 s at -O on current
+  main and matches stock (likely the loop-analysis fix a678d9a). It stays
+  in `fuzzreg`.
 
 ## Crates on nightly-2026-10-22
 
