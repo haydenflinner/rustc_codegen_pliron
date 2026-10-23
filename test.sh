@@ -307,6 +307,12 @@ t_mirshapes() {
   done
 }
 
+t_slpsplat() {
+  # slp xpack: two loads of one address splat only when nothing writes it
+  # between them (rustlantis seeds 538/683/730).
+  rustc $BE --edition 2021 -O tests/slpsplat/main.rs -o $out/slpsplat$exe && $out/slpsplat$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -574,6 +580,7 @@ want dseunwind && t_dseunwind
 want unwindmem && t_unwindmem
 want unwindstd && t_unwindstd
 want mirshapes && t_mirshapes
+want slpsplat && t_slpsplat
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

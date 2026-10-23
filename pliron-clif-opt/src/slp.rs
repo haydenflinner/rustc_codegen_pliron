@@ -1430,6 +1430,16 @@ impl X<'_> {
             let fb = self.func.dfg.mem_flags[self.func.dfg.insts[ib].memflags().unwrap()];
             if fa == fb && fa.notrap() && ra.0 == rb.0 && ra.2 == rb.2 {
                 if ra.1 == rb.1 {
+                    // Same address is the same value only if nothing
+                    // writes those bytes between the two loads: record
+                    // the footprint so the ld-order writer check covers
+                    // it (fuzz seed 538: a store to `*p` between two
+                    // `load p` lanes became `splat(first load)`).
+                    self.min_load = self
+                        .min_load
+                        .min(pos_at(self.pos, ia))
+                        .min(pos_at(self.pos, ib));
+                    self.loads.push(ra);
                     self.splats += 1;
                     return Some(Pack::Splat(a));
                 }
