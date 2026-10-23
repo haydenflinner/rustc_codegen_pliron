@@ -1,5 +1,5 @@
 diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
-index f068aaa584d..24aa34cff7b 100644
+index ad866eb5b28a..80abb1f2aedd 100644
 --- a/compiler/rustc_session/src/session.rs
 +++ b/compiler/rustc_session/src/session.rs
 @@ -447,6 +447,9 @@ pub struct CodegenBackendInit {
@@ -22,7 +22,7 @@ index f068aaa584d..24aa34cff7b 100644
      /// Global per-session counter for MIR optimization pass applications.
      ///
      /// Used by `-Zmir-opt-bisect-limit` to assign an index to each
-@@ -993,6 +999,10 @@ pub fn lto(&self) -> config::Lto {
+@@ -998,6 +1004,10 @@ pub fn lto(&self) -> config::Lto {
          // If the user specified something, return that. If they only said `-C
          // lto` and we've for whatever reason forced off ThinLTO via the CLI,
          // then ensure we can't use a ThinLTO.
@@ -33,7 +33,7 @@ index f068aaa584d..24aa34cff7b 100644
          match self.opts.cg.lto {
              config::LtoCli::Unspecified => {
                  // The compiler was invoked without the `-Clto` flag. Fall
-@@ -1489,6 +1499,7 @@ pub fn build_session(
+@@ -1494,6 +1504,7 @@ pub fn build_session(
          replaced_intrinsics,
          fallback_intrinsics,
          thin_lto_supported,
@@ -41,7 +41,7 @@ index f068aaa584d..24aa34cff7b 100644
      } = codegen_backend_init;
  
      let sess = Session {
-@@ -1521,6 +1532,7 @@ pub fn build_session(
+@@ -1526,6 +1537,7 @@ pub fn build_session(
          replaced_intrinsics: FxHashSet::from_iter(replaced_intrinsics),
          fallback_intrinsics: FxHashSet::from_iter(fallback_intrinsics),
          thin_lto_supported,
@@ -50,7 +50,7 @@ index f068aaa584d..24aa34cff7b 100644
          removed_rustc_main_attr: AtomicBool::new(false),
          pointer_auth_config,
 diff --git a/src/tools/compiletest/src/common.rs b/src/tools/compiletest/src/common.rs
-index 5d0750ddb92..c3219b1213b 100644
+index a60b657e96ab..a20f8b4846dd 100644
 --- a/src/tools/compiletest/src/common.rs
 +++ b/src/tools/compiletest/src/common.rs
 @@ -228,6 +228,7 @@ pub(crate) enum CodegenBackend {
@@ -74,6 +74,18 @@ index 5d0750ddb92..c3219b1213b 100644
              Self::Gcc => "gcc",
              Self::Llvm => "llvm",
 +            Self::Pliron => "pliron",
+         }
+     }
+ 
+diff --git a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+index 0bc6363d075b..ba398934a48a 100644
+--- a/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
++++ b/compiler/rustc_codegen_llvm/src/back/llvm_backend.rs
+@@ -259,6 +259,7 @@ fn init(&mut self, sess: &EarlySession) -> CodegenBackendInit {
+             replaced_intrinsics,
+             fallback_intrinsics,
+             thin_lto_supported: true,
++            fat_lto_supported: true,
          }
      }
  
