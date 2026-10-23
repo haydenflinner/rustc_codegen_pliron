@@ -156,7 +156,7 @@ def main():
     # generator; the job reports a skip without it).
     if want("fuzzreg"):
         seeds = ",".join(str(s) for s in FUZZ_REGRESS)
-        jobs.append(("fuzzreg", lambda: run("fuzzreg", ["python3", "-I", "harness/run.py", "--suite", "fuzz",
+        jobs.append(("fuzzreg", lambda: run("fuzzreg", [sys.executable, "-I", "harness/run.py", "--suite", "fuzz",
                                                         "--no-build", "--fuzz-seeds", seeds])))
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
