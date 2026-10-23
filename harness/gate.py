@@ -41,7 +41,7 @@ BASH = shutil.which("bash") or shutil.which("sh")
 # offset+width overflow in loadfwd/dse range math (2542), slp treating an
 # escaped slot as disjoint from untracked pointers (3938) and cparm chasing a
 # replacement cycle forever (2187, compile timeout), 2026-10-22.
-FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 2187, 2542, 2598, 3938]
+FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938]
 
 
 def shell(cmd):

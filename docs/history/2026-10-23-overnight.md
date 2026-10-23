@@ -125,7 +125,18 @@ Open:
   `fn8`'s by-value param arriving as `0xffff_ffff_ffff_0000` instead of
   -1. The `--debug` build of the same seed (values printed, not hashed)
   matches stock, so the program reduces only with a UB-safe oracle.
-- **1939 and 3441, mismatch at -O.** Both are after a param-merging step
+- **1939 and 3441: fixed.** Root cause: Cranelift isel, not the passes.
+  Our aarch64 `iadd_ushr_*` rules (add-with-`lsr` fold, a47132a) matched
+  i8/i16, where the register has garbage above the value's width and
+  `lsr #k` shifts it into the sum. The param-merging steps only made the
+  shift amount a constant, which is why the interpreter saw no difference.
+  Found by building rustlantis' `--debug` variant (it prints values, and
+  unlike 2598 it reproduced). One printed field differed only in its high
+  byte. That pointed to an inlined, self-contained `fn18`, which reduced
+  to a 548-line program that `harness/bisect.py` could narrow. Test:
+  `narrowlsr` (pinned checksum: the inline reference computation goes
+  through the same rule). Both seeds are now in `fuzzreg`.
+- **(old notes) 1939 and 3441, mismatch at -O.** Both are after a param-merging step
   (`cparm`'s `const_sweep`, `sameargs`). Every fold checked by hand is
   correct, and the interpreter finds before/after equivalent, even with
   non-zero stack fills (`PLIRON_DIFFCHECK_FILL`, new). Yet native output
@@ -162,8 +173,8 @@ the fix:
 |---|---|---|
 | `attributes/fn-align-dyn.rs` | `#[rustc_align(N)]` ignored: functions and their `dyn` shims got Cranelift's code alignment only | e7b9eb2 (`fnalign`) |
 | `abi/rust-tail-cc.rs` | ICE: rustc passes `extern "tail"` large aggregates OnStack (byval); Cranelift has no `StructArgument` on arm64 | 27dc9de: plain pointer off x86-64 (`rusttailcc`) |
-| `asm/binary_asm_labels_allowed.rs` | vendored rsasm rejected the local label ref `01b` as a bad octal literal | rsasm lexer (`asmlabels`) |
-| `c-variadic/copy.rs`, `consts/const-eval/c-variadic.rs`, `abi/variadic-ffi.rs` | every C-variadic definition crashed on aarch64-apple: `va_start` wrote a 24-byte SysV `__va_list_tag` into an 8-byte `VaList` | `va_start`/`va_arg` follow the target's `va_list` (SysV / AAPCS64 / pointer) (`cvariadic`) |
+| `asm/binary_asm_labels_allowed.rs` | vendored rsasm rejected the local label ref `01b` as a bad octal literal | f631f23: rsasm lexer (`asmlabels`) |
+| `c-variadic/copy.rs`, `consts/const-eval/c-variadic.rs`, `abi/variadic-ffi.rs` | every C-variadic definition crashed on aarch64-apple: `va_start` wrote a 24-byte SysV `__va_list_tag` into an 8-byte `VaList` | ccd395e: `va_start`/`va_arg` follow the target's `va_list` (SysV / AAPCS64 / pointer) (`cvariadic`) |
 
 Not reproduced: `thread-local/tls.rs` (`assert_ne!` of a TLS address
 seen from two threads) failed once in the run; 200 runs with stock and

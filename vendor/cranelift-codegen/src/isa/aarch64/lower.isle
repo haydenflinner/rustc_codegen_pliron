@@ -121,12 +121,14 @@
       (if-let amt (lshl_from_imm64 ty k))
       (add_shift ty y x amt))
 
-;; Same for a logical right shift by a constant.
-(rule iadd_ushr_right 20 (lower (iadd (ty_int_ref_scalar_64_extract ty) x (ushr _ y (u8_from_iconst k))))
+;; Same for a logical right shift by a constant. i32/i64 only: an i8/i16
+;; value's register has unspecified bits above its width, which `lsr`
+;; would shift into the result (`ushr` lowering zero-extends first).
+(rule iadd_ushr_right 20 (lower (iadd (ty_32_or_64 ty) x (ushr _ y (u8_from_iconst k))))
       (if-let amt (lshr_from_u64 ty k))
       (add_shift ty x y amt))
 
-(rule iadd_ushr_left 21 (lower (iadd (ty_int_ref_scalar_64_extract ty) (ushr _ x (u8_from_iconst k)) y))
+(rule iadd_ushr_left 21 (lower (iadd (ty_32_or_64 ty) (ushr _ x (u8_from_iconst k)) y))
       (if-let amt (lshr_from_u64 ty k))
       (add_shift ty y x amt))
 

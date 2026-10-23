@@ -344,6 +344,12 @@ t_cvariadic() {
   rustc $BE --edition 2024 -O tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe
 }
 
+t_narrowlsr() {
+  # aarch64 add-with-lsr fold on i8/i16 operands (fuzz 1939/3441).
+  rustc $BE --edition 2021 tests/narrowlsr/main.rs -o $out/narrowlsr$exe && $out/narrowlsr$exe && \
+  rustc $BE --edition 2021 -O tests/narrowlsr/main.rs -o $out/narrowlsr$exe && $out/narrowlsr$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -617,6 +623,7 @@ want fnalign && t_fnalign
 want rusttailcc && t_rusttailcc
 want asmlabels && t_asmlabels
 want cvariadic && t_cvariadic
+want narrowlsr && t_narrowlsr
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

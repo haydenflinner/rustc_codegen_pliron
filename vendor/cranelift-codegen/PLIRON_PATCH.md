@@ -709,3 +709,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `iconst` is i8..i64 and panics on anything else, which aborted the
     per-step verifier before it could name the pass that emitted the
     bad inst (rustlantis seeds 65/89 — `iconst.i128` out of lcse/bandk).
+
+Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
+a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's
+register has unspecified bits above its width, which `lsr #k` shifts into
+the sum; plain `ushr` lowering zero-extends first. They now require
+`ty_32_or_64`, like the `band`/`bxor` shifted-operand rules (fuzz seeds
+1939 and 3441; tests/narrowlsr).
