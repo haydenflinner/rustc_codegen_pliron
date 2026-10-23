@@ -25,6 +25,10 @@ if [[ ! -d "$WT" ]]; then
         printf '[target.x86_64-unknown-linux-gnu]\nlinker = "%s"\n' "$B/selfhost/cc-wild" >> "$WT/bootstrap.toml"
     fi
 fi
+# A worktree made by hand (e.g. from the fork's main, which already carries
+# the patches) still needs the bootstrap config: without it bootstrap
+# silently builds the default LLVM-backed compiler.
+[[ -f "$WT/bootstrap.toml" ]] || cp "$B/selfhost/bootstrap.toml" "$WT/bootstrap.toml"
 # -c, no -t: changed files get a fresh mtime, so cargo rebuilds the backend even
 # when the edit is older than the last build artifact.
 rsync -rlpc --delete --exclude 'target*' --exclude rust-toolchain.toml --exclude examples --exclude .git \
