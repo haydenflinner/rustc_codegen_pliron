@@ -37,8 +37,9 @@ BASH = shutil.which("bash") or shutil.which("sh")
 
 # rustlantis seeds that exposed real bugs: slp same-address splat
 # (538, 683, 730), loadfwd's dead-pair poisoning (810, 1276) and loop
-# analysis hanging on unreachable preds (1776, compile timeout), 2026-10-22.
-FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776]
+# analysis hanging on unreachable preds (1776, compile timeout), and
+# offset+width overflow in loadfwd/dse range math (2542), 2026-10-22.
+FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 2542]
 
 
 def shell(cmd):

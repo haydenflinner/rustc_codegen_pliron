@@ -430,7 +430,7 @@ pub fn kill(
         // smallvec `into_iter`'s `set_len(0)` store in a block still
         // tagged with the inlined `len(&self)` clone — double drop) or
         // UB; killing is sound either way.
-        let own = r == r2 && !(o2 >= o + n || o >= o2 + i64::from(t2.bytes()));
+        let own = r == r2 && !(o2 >= o.saturating_add(n) || o >= o2.saturating_add(i64::from(t2.bytes())));
         // An `!invariant.load` location holds the same value for the
         // load's whole scope: a write to it through another pointer would
         // be UB, so such a store can't clobber it.
@@ -450,12 +450,12 @@ pub fn kill(
             return true;
         }
         match (r, r2) {
-            _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
+            _ if r == r2 => o2 >= o.saturating_add(n) || o >= o2.saturating_add(i64::from(t2.bytes())),
             (Root::S(_), Root::S(_)) => true,
             _ => {
                 shel(&r)
                     || shel(&r2)
-                    || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes()))
+                    || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2.saturating_add(i64::from(t2.bytes())))
             }
         }
     });
@@ -784,7 +784,7 @@ fn transfer(
                 {
                     for &(bytes, reg) in rs {
                         if off0 >= 0
-                            && off0 + i64::from(ty.bytes()) <= bytes as i64
+                            && off0.saturating_add(i64::from(ty.bytes())) <= bytes as i64
                             && cur.is_some_and(|cur| in_region(cur, reg, rpar))
                         {
                             if pliron_cfg::tracing_on() {
@@ -1267,12 +1267,12 @@ fn kill_st(
     // `end_val`'s `St::In` lookup finds a loc `st` dropped.
     let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
     st.retain(|&(r2, o2, t2), _| match (r, r2) {
-        _ if r == r2 => o2 >= o + n || o >= o2 + i64::from(t2.bytes()),
+        _ if r == r2 => o2 >= o.saturating_add(n) || o >= o2.saturating_add(i64::from(t2.bytes())),
         (Root::S(_), Root::S(_)) => true,
         _ => {
             shel(&r)
                 || shel(&r2)
-                || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes()))
+                || ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2.saturating_add(i64::from(t2.bytes())))
         }
     });
 }
@@ -1284,9 +1284,9 @@ pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     let (r, o, ty) = w;
     let (r2, o2, t2) = l;
     match (r, r2) {
-        _ if r == r2 => !(o2 >= o + i64::from(ty.bytes()) || o >= o2 + i64::from(t2.bytes())),
+        _ if r == r2 => !(o2 >= o.saturating_add(i64::from(ty.bytes())) || o >= o2.saturating_add(i64::from(t2.bytes()))),
         (Root::S(_), Root::S(_)) => false,
-        _ => !ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2 + i64::from(t2.bytes())),
+        _ => !ms.is_some_and(|(mr, mo)| mr == r2 && mo >= o2.saturating_add(i64::from(t2.bytes()))),
     }
 }
 

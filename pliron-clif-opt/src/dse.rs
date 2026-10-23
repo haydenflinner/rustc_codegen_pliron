@@ -49,7 +49,8 @@ fn rput(v: &mut Ranges, o: i64, w: i64) -> bool {
 /// Drop entries covered by a write of `[o, o+w)`; returns how many went.
 fn rkill(v: &mut Ranges, o: i64, w: i64) -> usize {
     let n = v.len();
-    v.retain(|&(o2, w2)| o2 < o || o2 + w2 > o + w);
+    // End offsets in i128: generated code can use offsets near i64::MAX.
+    v.retain(|&(o2, w2)| o2 < o || o2 as i128 + w2 as i128 > o as i128 + w as i128);
     n - v.len()
 }
 
@@ -130,7 +131,11 @@ impl Demands {
 
     /// Does some live read demand a byte of `[o, o+w)` on root `r`?
     fn read(&self, r: Root, o: i64, w: i64, iso: &FxHashSet<Root>) -> bool {
-        let overlap = |v: &Ranges| v.iter().any(|&(o2, w2)| o < o2 + w2 && o2 < o + w);
+        let (o_, e_) = (o as i128, o as i128 + w as i128);
+        let overlap = |v: &Ranges| {
+            v.iter()
+                .any(|&(o2, w2)| o_ < o2 as i128 + w2 as i128 && (o2 as i128) < e_)
+        };
         // Same-root ranges need the byte check; a non-isolated `r` also
         // may-aliases any demand on another non-isolated root.
         let hit = self.locs.get(&r).is_some_and(overlap)
@@ -142,7 +147,10 @@ impl Demands {
             && !self
                 .cov
                 .get(&r)
-                .is_some_and(|v| v.iter().any(|&(o2, w2)| o2 <= o && o + w <= o2 + w2))
+                .is_some_and(|v| {
+                    v.iter()
+                        .any(|&(o2, w2)| o2 <= o && e_ <= o2 as i128 + w2 as i128)
+                })
     }
 
     /// A write of `[o, o+w)` on `r` satisfies the demands it provably
