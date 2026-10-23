@@ -332,6 +332,12 @@ t_rusttailcc() {
   rustc $BE --edition 2021 --cfg aarch64 -O tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1
 }
 
+t_asmlabels() {
+  # GAS numeric local labels with a leading zero (`01b`); aarch64 only.
+  [ "$(uname -m)" = arm64 ] || return 0
+  rustc $BE --edition 2021 tests/asmlabels/main.rs -o $out/asmlabels$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -603,6 +609,7 @@ want slpsplat && t_slpsplat
 want applestackargs && t_applestackargs
 want fnalign && t_fnalign
 want rusttailcc && t_rusttailcc
+want asmlabels && t_asmlabels
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

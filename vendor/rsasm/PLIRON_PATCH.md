@@ -49,3 +49,12 @@ Changed:
 - src/arch/aarch64/mod.rs: `.arch_extension` accepted (every extension is on).
 - tests/aarch64.rs: `casp_pairs`, `atomics_from_the_table`,
   `arch_extension_is_accepted`, against llvm-mc encodings.
+
+Pliron patch: leading-zero local label references.
+
+`01b` (GAS numeric local label `01`, as rust-lang/rust
+tests/ui/asm/binary_asm_labels_allowed.rs writes it) was rejected as an
+invalid octal literal: the local-ref path skipped runs with a leading zero.
+src/lexer.rs `lex_number` now takes such runs as a reference to the label
+with the run's octal value, which is how GAS reads it and how the `01:`
+definition lexes.

@@ -1170,10 +1170,12 @@ impl<'a> Lexer<'a> {
                 && !is_ident_cont(self.bytes.get(p + 1).copied().unwrap_or(0))
             {
                 let digits = &self.src[self.pos..p];
-                // Only plain decimal runs are local labels; `0x1f` is a number.
-                if (!digits.starts_with('0') || digits.len() == 1)
-                    && let Ok(n) = digits.parse::<u32>()
-                {
+                // `0x1f` never reaches here (`x` follows the run). A run with a
+                // leading zero names the label by its octal value, as GAS
+                // reads it and as `01:` lexes (rust-lang/rust
+                // tests/ui/asm/binary_asm_labels_allowed.rs: `01: bl 01b`).
+                let radix = if digits.len() > 1 && digits.starts_with('0') { 8 } else { 10 };
+                if let Ok(n) = u32::from_str_radix(digits, radix) {
                     let dir = if after == b'f' {
                         LocalDir::Forward
                     } else {
