@@ -289,6 +289,12 @@ t_unwindmem() {
   rustc $BE --edition 2021 -O tests/unwindmem/main.rs -o $out/unwindmem$exe && $out/unwindmem$exe | diff --strip-trailing-cr - tests/unwindmem/expected.out
 }
 
+t_unwindstd() {
+  # std's unwind-safety guards (SetLenOnDrop, sort holes, RefCell flags,
+  # drop order, ...) under a panic at each of 12 points vs stock rustc.
+  rustc $BE --edition 2021 -O tests/unwindstd/main.rs -o $out/unwindstd$exe && $out/unwindstd$exe | diff --strip-trailing-cr - tests/unwindstd/expected.out
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -554,6 +560,7 @@ want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul
 want dseunwind && t_dseunwind
 want unwindmem && t_unwindmem
+want unwindstd && t_unwindstd
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute
