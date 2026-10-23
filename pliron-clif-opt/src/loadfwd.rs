@@ -1718,8 +1718,16 @@ fn pre(
     // A pair dies if it failed to resolve or if an arg is a dead pair's
     // param; propagate the latter to fixpoint (dep order is not guaranteed).
     let mut dead_vals: FxHashSet<Value> = FxHashSet::default();
-    let param_of: FxHashMap<Value, (Block, Loc)> =
-        pre.start.iter().map(|(&k, &v)| (v, k)).collect();
+    // Only pending pairs own the param they map to: `start_val` also
+    // records single-pred pass-throughs (`(b, loc)` -> the pred's param),
+    // and inverting all of `start` let such an alias shadow the owning
+    // pair, so a dead pair's param slipped onto an edge unpoisoned
+    // (rustlantis seeds 810/1276: "argument v14720 is not attached").
+    let param_of: FxHashMap<Value, (Block, Loc)> = pre
+        .pending
+        .iter()
+        .filter_map(|&k| pre.start.get(&k).map(|&v| (v, k)))
+        .collect();
     loop {
         let mut grown = false;
         for (k, args) in &resolved {

@@ -35,6 +35,11 @@ CLIF_CHECK = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "cl
 BASH = shutil.which("bash") or shutil.which("sh")
 
 
+# rustlantis seeds that exposed real bugs: slp same-address splat
+# (538, 683, 730) and loadfwd's dead-pair poisoning (810, 1276), 2026-10-22.
+FUZZ_REGRESS = [538, 683, 730, 810, 1276]
+
+
 def shell(cmd):
     """Prefix `bash`/`sh` for `.sh` commands on Windows (no shebang exec)."""
     if WIN and cmd and cmd[0].endswith(".sh"):
@@ -143,6 +148,12 @@ def main():
     if (a.full or "wasm" in only) and "wasm" not in skip:
         jobs.append(("wasm", lambda: run("wasm", shell(["./test.sh", "--only=wasm"]),
                                          {"TEST_NOBUILD": "1"})))
+    # rustlantis seeds that found miscompiles (needs the sibling rustlantis
+    # generator; the job reports a skip without it).
+    if want("fuzzreg"):
+        seeds = ",".join(str(s) for s in FUZZ_REGRESS)
+        jobs.append(("fuzzreg", lambda: run("fuzzreg", ["python3", "-I", "harness/run.py", "--suite", "fuzz",
+                                                        "--no-build", "--fuzz-seeds", seeds])))
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
         if want(f"corpus:{d}"):

@@ -431,8 +431,11 @@ def suite_fuzz(args):
     if not os.path.exists(GENERATE):
         print(f"fuzz: no generator at {GENERATE}; build rustlantis or set PLIRON_FUZZ_GENERATOR")
         return {}
-    a, _, b = args.fuzz_seeds.partition(":")
-    seeds = range(int(a), int(b or int(a) + 32))
+    # `A:B` (half-open), a single seed `A`, or a comma list of either.
+    seeds = []
+    for part in args.fuzz_seeds.split(","):
+        a, sep, b = part.partition(":")
+        seeds.extend(range(int(a), int(b)) if sep else [int(a)])
     seeds = [s for s in seeds if args.filter in f"seed{s}"]
     import functools
     one = functools.partial(fuzz_one, matrix=args.matrix)
@@ -519,7 +522,7 @@ def main():
     ap.add_argument("--filter", default="", help="only tests whose name contains this")
     ap.add_argument("--matrix", action="store_true",
                     help="fuzz: also rerun each seed with every -O pass disabled")
-    ap.add_argument("--fuzz-seeds", default="0:32", metavar="START:END",
+    ap.add_argument("--fuzz-seeds", default="0:32", metavar="START:END[,SEED...]",
                     help="seed range for the fuzz suite (default 0:32)")
     ap.add_argument("--rust", help="rust checkout for the ui suite (default: ../rust or ~/work/rust)")
     ap.add_argument("--no-build", action="store_true", help="skip `cargo build` of the backend")
