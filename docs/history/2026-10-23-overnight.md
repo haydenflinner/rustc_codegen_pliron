@@ -107,4 +107,42 @@ custom MIR each, too big to check in.
 `PLIRON_CLIF_STEPS=1` (with `PLIRON_CLIF`) now dumps after every step
 that reports a change; several steps don't dump on their own.
 
-Seed 1776 (pliron compile timeout, stock fine) is not investigated yet.
+### Seeds 2048:4096 and the rest of 776:2048
+
+| seed | bug | fix |
+|---|---|---|
+| 1776 | compile hang: Cranelift's `LoopAnalysis` consulted dominance for unreachable predecessors (17 dead blocks jumping into loops after paramsink); loop parent links closed a cycle and `compute()` spun in postinc2 | a678d9a: skip unreachable preds (vendored `loop_analysis.rs`) |
+| 2542 | ICE: `o + n` overflowed in loadfwd's store-kill overlap test; in release a wrapped end can call a real overlap disjoint | 2f74fad: loadfwd saturates, dse uses i128 |
+| 3938 | slp `may_overlap` called every (slot, untracked pointer) pair disjoint; a loop-carried param `param_src` couldn't resolve still pointed into the slot | 0fa0839: disjoint only for `loadfwd::isolated` slots |
+
+`PLIRON_XPACK_LIMIT=N` was the tool for 3938: bisect over N, with
+`PLIRON_OPT_FNS` naming one function, finds the bad pack (#79).
+
+Open:
+
+- **2598, mismatch at -O0, not an optimization bug.** `PLIRON_OPT_BISECT=0`
+  still fails. A logging hasher showed one `[isize; 8]` element of
+  `fn8`'s by-value param arriving as `0xffff_ffff_ffff_0000` instead of
+  -1. The `--debug` build of the same seed (values printed, not hashed)
+  matches stock, so the program reduces only with a UB-safe oracle.
+- **1939 and 3441, mismatch at -O.** Both are after a param-merging step
+  (`cparm`'s `const_sweep`, `sameargs`). Every fold checked by hand is
+  correct, and the interpreter finds before/after equivalent, even with
+  non-zero stack fills (`PLIRON_DIFFCHECK_FILL`, new). Yet native output
+  differs, and rolling back that one unit fixes it. That points at
+  Cranelift lowering/regalloc of the post-merge shape. Next step: a
+  native-vs-interpreter runner (JIT) in clif-check.
+- **2187: compile timeout.** Not investigated yet.
+
+## Crates on nightly-2026-10-22
+
+Tiers 1–3 (37 crates, at 7f8474f): all match stock except nushell's
+`nu_plugin_polars` `selector_signed_integer` / `selector_unsigned_integer`.
+In those tests `polars select (polars selector signed-integer)` returns
+no columns. This still reproduces with tonight's later fixes. The
+`DataType` predicates and polars-plan's `Selector::into_columns` are
+correct in a standalone crate with default polars features, so the next
+repro uses nushell's full polars feature set.
+
+Stock tokio stalls at 518/2310 tests under this nightly. `crates.py` now
+reports a stock-side timeout as `STOCKTO` instead of `ok`.
