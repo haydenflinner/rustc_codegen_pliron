@@ -1137,7 +1137,7 @@ pub fn run(
         // facts); xpack's applies never touch block params, so one
         // map serves every block — built on the first block that
         // reaches the plan stage, not for every `slp` call.
-        let mut ps: Option<VMap<Value>> = None;
+        let mut ps: Option<(VMap<Value>, FxHashSet<crate::loadfwd::Root>)> = None;
         for block in func.layout.blocks().collect::<Vec<_>>() {
             changed += xpack_block(
                 func,
@@ -1158,6 +1158,13 @@ pub fn run(
         crate::jumpthread::remove_dead_insts(func, false);
     }
     changed
+}
+
+static XPACK_APPLIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn xpack_limit() -> Option<usize> {
+    static L: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *L.get_or_init(|| crate::env_get("PLIRON_XPACK_LIMIT").and_then(|v| v.parse().ok()))
 }
 
 // ============================ xpack ============================
@@ -1208,11 +1215,22 @@ fn mem_range(
 }
 
 /// Whether two `(root, offset, size)` footprints may alias.
-fn may_overlap(a: (crate::loadfwd::Root, i64, u32), b: (crate::loadfwd::Root, i64, u32)) -> bool {
+fn may_overlap(
+    a: (crate::loadfwd::Root, i64, u32),
+    b: (crate::loadfwd::Root, i64, u32),
+    iso: &FxHashSet<crate::loadfwd::Root>,
+) -> bool {
     use crate::loadfwd::Root;
     match (a.0, b.0) {
         (Root::S(sa), Root::S(sb)) if sa != sb => return false,
-        (Root::S(_), Root::V(_)) | (Root::V(_), Root::S(_)) => return false,
+        // A slot is disjoint from an untracked pointer only if its address
+        // never escapes (`loadfwd::isolated`): a loop-carried block param
+        // that `param_src` can't resolve may still point into it
+        // (rustlantis seed 3938: xpack moved loads of `ss18` past stores
+        // through such a param).
+        (Root::S(_), Root::V(_)) if iso.contains(&a.0) => return false,
+        (Root::V(_), Root::S(_)) if iso.contains(&b.0) => return false,
+        (Root::S(_), Root::V(_)) | (Root::V(_), Root::S(_)) => return true,
         (Root::V(va), Root::V(vb)) if va != vb => return true,
         _ => {}
     }
@@ -1229,6 +1247,8 @@ struct X<'a> {
     func: &'a Function,
     ps: &'a VMap<Value>,
     na: &'a FxHashSet<Value>,
+    /// Roots whose address never escapes (`loadfwd::isolated`).
+    iso: &'a FxHashSet<crate::loadfwd::Root>,
     domtree: &'a DominatorTree,
     pos: &'a PosMap,
     insts: &'a [Inst],
@@ -1685,7 +1705,7 @@ fn sinkable(x: &X<'_>, u: Inst, dead: &FxHashSet<Inst>, sink: &FxHashSet<Inst>) 
     }
     // The merged vector loads execute at the emit point; `u` must not write
     // their bytes after they've been read.
-    if x.loads.iter().any(|&lr| may_overlap(ur, lr)) {
+    if x.loads.iter().any(|&lr| may_overlap(ur, lr, x.iso)) {
         return None;
     }
     let pu = pos_at(x.pos, u);
@@ -1699,7 +1719,7 @@ fn sinkable(x: &X<'_>, u: Inst, dead: &FxHashSet<Inst>, sink: &FxHashSet<Inst>) 
             return None;
         }
         if let Some(r2) = mem_range(x.func, x.ps, x.na, i2)
-            && may_overlap(ur, r2)
+            && may_overlap(ur, r2, x.iso)
         {
             return None;
         }
@@ -1733,7 +1753,7 @@ fn store_dead(
         let Some(r2) = mem_range(x.func, x.ps, x.na, i2) else {
             continue;
         };
-        if !may_overlap(ur, r2) {
+        if !may_overlap(ur, r2, x.iso) {
             continue;
         }
         if o2 == Opcode::Store && r2.1 <= ur.1 && ur.1 + i64::from(ur.2) <= r2.1 + i64::from(r2.2) {
@@ -1750,6 +1770,7 @@ fn plan_pair(
     func: &Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    iso: &FxHashSet<crate::loadfwd::Root>,
     domtree: &DominatorTree,
     uses: &Uses,
     insts: &[Inst],
@@ -1804,6 +1825,7 @@ fn plan_pair(
         func,
         ps: &ps,
         na,
+        iso,
         domtree,
         pos,
         insts,
@@ -2003,7 +2025,7 @@ fn finish_plan(
             }
             if o2.can_store() || o2.other_side_effects() || o2.can_trap() {
                 match mem_range(x.func, x.ps, x.na, i2) {
-                    Some(r2) if x.loads.iter().all(|&lr| !may_overlap(lr, r2)) => {}
+                    Some(r2) if x.loads.iter().all(|&lr| !may_overlap(lr, r2, x.iso)) => {}
                     _ => bail!("ld-order"),
                 }
             }
@@ -2136,6 +2158,7 @@ fn plan_store(
     func: &Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    iso: &FxHashSet<crate::loadfwd::Root>,
     domtree: &DominatorTree,
     uses: &Uses,
     insts: &[Inst],
@@ -2218,7 +2241,7 @@ fn plan_store(
             return None;
         }
         match mem_range(func, ps, na, i2) {
-            Some(rx) if may_overlap(r_first, rx) => return None,
+            Some(rx) if may_overlap(r_first, rx, iso) => return None,
             Some(_) => {}
             None if o2.can_store() || o2.other_side_effects() || o2.can_trap() => return None,
             None => {}
@@ -2228,6 +2251,7 @@ fn plan_store(
         func,
         ps: &ps,
         na,
+        iso,
         domtree,
         pos,
         insts,
@@ -2335,7 +2359,7 @@ fn xpack_block<'d>(
     block: Block,
     uses: &mut Option<Uses<'d>>,
     dead_set: &'d std::cell::RefCell<FxHashSet<Inst>>,
-    ps: &mut Option<VMap<Value>>,
+    ps: &mut Option<(VMap<Value>, FxHashSet<crate::loadfwd::Root>)>,
     x64: bool,
     pos: &mut PosMap,
     taken: &mut TakenMap,
@@ -2459,14 +2483,27 @@ fn xpack_block<'d>(
                         return None;
                     }
                     tried += 1;
-                    let ps = &*ps.get_or_insert_with(|| crate::loadfwd::param_src(func));
+                    let (ps, iso) = {
+                        let e = ps.get_or_insert_with(|| {
+                            let m = crate::loadfwd::param_src(func);
+                            let iso = crate::loadfwd::isolated(
+                                func,
+                                na,
+                                &m,
+                                &FxHashMap::default(),
+                                &FxHashSet::default(),
+                            );
+                            (m, iso)
+                        });
+                        (&e.0, &e.1)
+                    };
                     let plan = if is_store {
                         plan_store(
-                            func, ps, na, domtree, us, &insts, pos, block, taken, a, b, x64,
+                            func, ps, na, iso, domtree, us, &insts, pos, block, taken, a, b, x64,
                         )
                     } else {
                         plan_pair(
-                            func, ps, na, domtree, us, &insts, pos, block, taken, a, b, x64,
+                            func, ps, na, iso, domtree, us, &insts, pos, block, taken, a, b, x64,
                         )
                     };
                     if plan.is_none() && !is_store {
@@ -2532,6 +2569,14 @@ fn xpack_block<'d>(
             .iter()
             .map(|&(v, _, _)| (func.dfg.resolve_aliases(v).index() as u32, 0))
             .collect();
+        // `PLIRON_XPACK_LIMIT=N` (debug): apply only the first N xpack
+        // packs process-wide — with `PLIRON_OPT_FNS` naming one function,
+        // a bisect over N finds the one bad pack.
+        if let Some(lim) = xpack_limit()
+            && XPACK_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= lim
+        {
+            return total;
+        }
         let n = apply_pair(
             func, &insts, emit_at, &root, vt, &kept, n_rows, &sink, &dead, &extracts, &keep,
         );
