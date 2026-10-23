@@ -3780,23 +3780,92 @@ fn dominated_conds(
 /// that). Walk `v`'s operands through aliases, and through the edge args
 /// that feed block-param defs; past the budget conservatively answers
 /// yes, which only leaves the param unremoved.
-fn reads_param(func: &Function, cfg: &ControlFlowGraph, v: Value, p: Value) -> bool {
-    let mut stack = vec![func.dfg.resolve_aliases(v)];
-    let mut seen = FxHashSet::default();
-    while let Some(w) = stack.pop() {
-        if w == p {
-            return true;
+///
+/// `v`'s operand cone — `remove_trivial_params` evaluates ~1k `(v, p)`
+/// pairs per round, some sharing `v`, so the walk runs once per distinct
+/// `v` and membership answers the rest. `Overflow` = the walk hit its
+/// budget (or a revisit) — the conservative "may read" marker, so a
+/// failed cone is never re-walked.
+enum Cone {
+    Overflow,
+    Full(FxHashSet<Value>),
+}
+
+/// Tarjan over the *pred* relation — SCC partitions are symmetric under
+/// reversal, and `remove_trivial_params` only asks "same component?".
+/// Iterative because corpus functions run to tens of thousands of blocks.
+fn scc_ids(func: &Function, cfg: &ControlFlowGraph) -> SecondaryMap<Block, u32> {
+    let mut idx_of = SecondaryMap::<Block, u32>::new();
+    let mut low = SecondaryMap::<Block, u32>::new();
+    let mut comp = SecondaryMap::<Block, u32>::new();
+    let mut on = SecondaryMap::<Block, bool>::new();
+    let mut s: Vec<Block> = Vec::new();
+    let mut call: Vec<(Block, Vec<Block>, usize)> = Vec::new();
+    let mut next = 1u32;
+    let mut ncomp = 0u32;
+    for b in func.layout.blocks() {
+        if idx_of[b] != 0 {
+            continue;
         }
+        idx_of[b] = next;
+        low[b] = next;
+        next += 1;
+        s.push(b);
+        on[b] = true;
+        call.push((b, cfg.pred_iter(b).map(|p| p.block).collect(), 0));
+        while let Some((w, ps, i)) = call.last_mut() {
+            let w = *w;
+            if *i < ps.len() {
+                let u = ps[*i];
+                *i += 1;
+                if idx_of[u] == 0 {
+                    idx_of[u] = next;
+                    low[u] = next;
+                    next += 1;
+                    s.push(u);
+                    on[u] = true;
+                    call.push((u, cfg.pred_iter(u).map(|p| p.block).collect(), 0));
+                } else if on[u] {
+                    low[w] = low[w].min(idx_of[u]);
+                }
+            } else {
+                call.pop();
+                if let Some((p, _, _)) = call.last() {
+                    let p = *p;
+                    low[p] = low[p].min(low[w]);
+                }
+                if low[w] == idx_of[w] {
+                    ncomp += 1;
+                    while let Some(t) = s.pop() {
+                        on[t] = false;
+                        comp[t] = ncomp;
+                        if t == w {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    comp
+}
+
+fn reads_param_cone(func: &Function, cfg: &ControlFlowGraph, v: Value, cone: &mut Cone) {
+    if !matches!(cone, Cone::Overflow) {
+        return;
+    }
+    let mut seen: FxHashSet<Value> = FxHashSet::default();
+    let mut stack = vec![func.dfg.resolve_aliases(v)];
+    while let Some(w) = stack.pop() {
         if !seen.insert(w) || seen.len() > 256 {
-            return true;
+            return;
         }
         match func.dfg.value_def(w) {
             ValueDef::Result(i, _) => stack.extend(
                 func.dfg
                     .inst_args(i)
                     .iter()
-                    .map(|&a| func.dfg.resolve_aliases(a))
-                    .collect::<Vec<_>>(),
+                    .map(|&a| func.dfg.resolve_aliases(a)),
             ),
             ValueDef::Param(b, _) => {
                 for t in cfg.pred_iter(b) {
@@ -3819,99 +3888,298 @@ fn reads_param(func: &Function, cfg: &ControlFlowGraph, v: Value, p: Value) -> b
             _ => {}
         }
     }
-    false
+    *cone = Cone::Full(seen);
 }
 
-/// Block params whose every incoming `jump`/`brif` arg is one value `v` (or
-/// the param itself) become aliases of `v`. Threading's SSA repair creates
-/// these, and Cranelift only removes them after our condition folding ran, so
-/// the same value seen through two params would not match a dominating test.
-pub fn remove_trivial_params(
+#[derive(Clone, Copy, PartialEq)]
+enum In {
+    Unset,
+    One(Value),
+    /// `One` evaluated-and-rejected on the *definition* side (`v`'s def
+    /// is `b` itself, unattached, or fails to dominate `b`). `Value` is
+    /// the resolved carrier at eval time; while it still resolves to
+    /// itself the cheap `def_block`+`try_dominates` check is redone each
+    /// round — retargeted edges strengthen dominance and can enable a
+    /// removal this round's scan missed.
+    ChkD(Value),
+    /// `One` rejected because `p` is inside `v`'s operand cone
+    /// (`reads_param`). Skipped while the carrier resolves to itself —
+    /// a stale rejection is sound; at worst a shrinking cone leaves a
+    /// removable param.
+    ChkR(Value),
+    Many,
+}
+
+/// The per-block incoming-arg fold `remove_trivial_params` scans, kept
+/// across `run`'s fixpoint so a quiet round recomputes only blocks whose
+/// in-edges or param lists were rewritten (`dirty`). A stale entry is a
+/// fold over a *superset* of the real in-edges — edge losses go unmarked
+/// (`bypass`/`round` evict only the retarget's destination) — and "every
+/// in-edge passes `v`" over a superset still holds over the subset, so a
+/// stale `One(v)` stays sound; a stale `Many` merely hides a removal.
+/// Carriers are re-resolved at use: new `change_to_alias` chains (this
+/// pass, `domcond`'s iconst folds) extend chains only at their ends, so
+/// args that all resolved to `v` still all resolve to `resolve(v)`.
+#[derive(Default)]
+pub(crate) struct TrivpInc {
+    inc: FxHashMap<Block, Vec<In>>,
+    /// Blocks whose in-edges or params changed since their fold — they
+    /// refold, but unchanged slots keep their `Chk*` verdicts.
+    dirty: FxHashSet<Block>,
+}
+
+impl TrivpInc {
+    /// Mark blocks whose in-edges or params changed since the scan.
+    fn dirty(&mut self, bs: impl IntoIterator<Item = Block>) {
+        self.dirty.extend(bs);
+    }
+    /// `ifconv`/`unreach` rewrite edges too entangled for per-block
+    /// eviction — rescan everything.
+    fn clear(&mut self) {
+        self.inc.clear();
+        self.dirty.clear();
+    }
+}
+
+/// One block's `inc` fold: every in-edge's arg for each param position.
+fn trivp_fold(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    s: Block,
+    params: &[Value],
+) -> Vec<In> {
+    let mut st = vec![In::Unset; params.len()];
+    for pred in cfg.pred_iter(s) {
+        let t = pred.inst;
+        if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
+            st.iter_mut().for_each(|x| *x = In::Many);
+            break;
+        }
+        for bc in func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            if bc.block(&func.dfg.value_lists) != s {
+                continue;
+            }
+            for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
+                let new = match a {
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        if v == params[i] {
+                            continue;
+                        }
+                        In::One(v)
+                    }
+                    _ => In::Many,
+                };
+                st[i] = match (st[i], new) {
+                    (In::Unset, x) => x,
+                    (In::One(a), In::One(b)) if a == b => In::One(a),
+                    _ => In::Many,
+                };
+            }
+        }
+    }
+    st
+}
+
+fn remove_trivial_params_inc(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
+    inc: &mut TrivpInc,
 ) -> Vec<(Value, Value)> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum In {
-        Unset,
-        One(Value),
-        Many,
-    }
+    let TrivpInc { inc, dirty } = inc;
     let entry = func.layout.entry_block();
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let t_scan = prof.then(std::time::Instant::now);
+    let mut n_scan = 0usize;
     // Only a block with params can yield a removal: visit just its
     // in-edges (from the caller's CFG) rather than folding over every
-    // edge in the function.
-    let mut inc: FxHashMap<Block, Vec<In>> = FxHashMap::default();
+    // edge in the function. Entries from the previous round survive;
+    // dirty blocks refold — a slot whose carrier still resolves to the
+    // checked value keeps its verdict.
     for s in func.layout.blocks() {
-        if Some(s) == entry {
-            continue;
-        }
         let params = func.dfg.block_params(s);
         if params.is_empty() {
+            inc.remove(&s);
+            dirty.remove(&s);
             continue;
         }
-        let mut st = vec![In::Unset; params.len()];
-        for pred in cfg.pred_iter(s) {
-            let t = pred.inst;
-            if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
-                st.iter_mut().for_each(|x| *x = In::Many);
-                break;
-            }
-            for bc in func.dfg.insts[t]
-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            {
-                if bc.block(&func.dfg.value_lists) != s {
-                    continue;
-                }
-                for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
-                    let new = match a {
-                        BlockArg::Value(v) => {
-                            let v = func.dfg.resolve_aliases(v);
-                            if v == params[i] {
-                                continue;
-                            }
-                            In::One(v)
-                        }
-                        _ => In::Many,
-                    };
-                    st[i] = match (st[i], new) {
-                        (In::Unset, x) => x,
-                        (In::One(a), In::One(b)) if a == b => In::One(a),
-                        _ => In::Many,
-                    };
-                }
-            }
+        let is_dirty = dirty.remove(&s);
+        if Some(s) == entry || (!is_dirty && inc.contains_key(&s)) {
+            continue;
         }
-        inc.insert(s, st);
+        let st = trivp_fold(func, cfg, s, params);
+        n_scan += 1;
+        if let Some(old) = inc.get_mut(&s) {
+            // Reconcile: `Chk*` verdicts ride out the refold when the
+            // slot still records the same resolved carrier.
+            if old.len() == st.len() {
+                for (o, n) in old.iter_mut().zip(&st) {
+                    match (*o, *n) {
+                        (In::ChkD(v) | In::ChkR(v), In::One(v0))
+                            if func.dfg.try_resolve_aliases(v0) == Some(v) => {}
+                        _ => *o = *n,
+                    }
+                }
+            } else {
+                *old = st;
+            }
+        } else {
+            inc.insert(s, st);
+        }
     }
-    let def_block = |func: &Function, v: Value| match func.dfg.value_def(v) {
-        ValueDef::Result(i, _) => func.layout.inst_block(i),
-        ValueDef::Param(b, _) => Some(b),
+    let el_scan = t_scan.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    let t_cand = prof.then(std::time::Instant::now);
+    let mut n_one = 0usize;
+    let mut n_rp = 0usize;
+    let def_block = |func: &Function, v: Value| match func.dfg.try_value_def(v) {
+        Some(ValueDef::Result(i, _)) => func.layout.inst_block(i),
+        Some(ValueDef::Param(b, _)) => Some(b),
         _ => None,
     };
     // `v` must dominate `b`: an edge passing the param itself (e.g. a loop
     // latch) does not constrain `v`'s position, so without this check the
     // alias can put `v` in scopes its def doesn't dominate.
     let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
-    for (&b, st) in &inc {
+    // Carriers whose defs vanished between scans (a param `deadp`
+    // removed feeding nothing else, an inst swept since) can't alias a
+    // live param; pinning the slot `Many` keeps the entry instead of
+    // rescans re-recording the same dead carrier every round.
+    let mut kill: Vec<(Block, usize)> = Vec::new();
+    // `v`'s operand cone per distinct carrier — `Overflow` entries
+    // answer "may read" to every query.
+    let mut cones: FxHashMap<Value, Cone> = FxHashMap::default();
+    // `p ∈ cone(v)` needs `b` to reach `d = def_block(v)` through the
+    // param-feed chain; with `d` dominating `b` that's exactly "same
+    // SCC". Outside it the reads check is a free "no" — computed lazily
+    // since quiet rounds need no walk at all.
+    let mut scc: Option<SecondaryMap<Block, u32>> = None;
+    // Slots evaluated this call that stayed `One` — upgraded to `Chk*`
+    // afterwards (`true` = def/dom reject → `ChkD`, `false` = reads_param
+    // reject → `ChkR`) so quiet rounds skip or cheapen re-evaluation.
+    let mut mark: Vec<(Block, usize, Value, bool)> = Vec::new();
+    for (&b, st) in inc.iter() {
         if Some(b) == entry {
             continue;
         }
         let ps = func.dfg.block_params(b);
+        if ps.len() != st.len() {
+            // Arity changed without a `dirty` mark — defensive; drop so
+            // the next call refolds.
+            kill.push((b, usize::MAX));
+            continue;
+        }
         for (i, s) in st.iter().enumerate() {
-            if let In::One(v) = *s
-                && let Some(d) = def_block(func, v)
-                && d != b
-                && dt.try_dominates(d, b, &func.layout)
-                && !reads_param(func, cfg, v, ps[i])
-            {
-                rm.push((b, i, ps[i], v));
+            let v0 = match *s {
+                In::One(v0) => v0,
+                In::ChkR(v) => {
+                    if func.dfg.try_resolve_aliases(v) == Some(v)
+                        && func.dfg.value_is_attached(v)
+                    {
+                        continue;
+                    }
+                    v
+                }
+                In::ChkD(v) => {
+                    if func.dfg.try_resolve_aliases(v) == Some(v)
+                        && func.dfg.value_is_attached(v)
+                    {
+                        // Carrier stable — redo just the check that
+                        // rejected it; dominance may have strengthened.
+                        match def_block(func, v) {
+                            Some(d) if d != b && dt.try_dominates(d, b, &func.layout) => v,
+                            _ => continue,
+                        }
+                    } else {
+                        v
+                    }
+                }
+                _ => continue,
+            };
+            let v = func
+                .dfg
+                .try_resolve_aliases(v0)
+                .filter(|&v| func.dfg.value_is_attached(v));
+            match v {
+                Some(v) => {
+                    n_one += 1;
+                    match def_block(func, v) {
+                        Some(d) if d != b && dt.try_dominates(d, b, &func.layout) => {
+                            let sm = scc.get_or_insert_with(|| scc_ids(func, cfg));
+                            // Different SCCs: `b` can't reach `d`, so `p` is
+                            // provably outside `v`'s cone — no walk needed.
+                            let reads = if sm[b] == sm[d] {
+                                n_rp += 1;
+                                let cone = cones.entry(v).or_insert(Cone::Overflow);
+                                reads_param_cone(func, cfg, v, cone);
+                                match cone {
+                                    Cone::Full(seen) => seen.contains(&ps[i]),
+                                    Cone::Overflow => true,
+                                }
+                            } else {
+                                false
+                            };
+                            if reads {
+                                mark.push((b, i, v, false));
+                            } else {
+                                rm.push((b, i, ps[i], v));
+                            }
+                        }
+                        _ => mark.push((b, i, v, true)),
+                    }
+                }
+                None => kill.push((b, i)),
             }
         }
     }
-    // No alias chains between params removed together (avoids alias loops).
+    if prof {
+        tracing::info!(target: "pliron::jumpthread",
+            "    trivp-fill {el_scan:?}({n_scan}) cand {:?}({n_one}/{n_rp} cones={} rm={} of {})",
+            t_cand.unwrap().elapsed(), cones.len(), rm.len(), inc.len());
+    }
+    for (b, i) in kill {
+        if i == usize::MAX {
+            inc.remove(&b);
+        } else if let Some(st) = inc.get_mut(&b) {
+            st[i] = In::Many;
+        }
+    }
+    for (b, i, v, dom) in mark {
+        if let Some(st) = inc.get_mut(&b) {
+            st[i] = if dom { In::ChkD(v) } else { In::ChkR(v) };
+        }
+    }
+    // No alias chains between params removed together (avoids alias
+    // loops) — collapse them instead: a carrier `v` that is itself being
+    // removed (`v -> w` in this round's map) hands `w` onward, so
+    // `p -> v -> … -> r` becomes `p -> r` in one round. Soundness comes
+    // free: `def(r) dom b` is transitive along the chain (each link's
+    // own check passed), and each intermediate carrier lies in the
+    // previous one's operand cone (`r ∈ cone(v)`), so `cone(r) ⊆
+    // cone(v)` keeps `p ∉ cone(r)` — the `reads_param` gate — already
+    // proven. A cycle (v → … → v) drops the whole cycle, matching the
+    // old filter's reject for chainless carriers.
     let gone: FxHashSet<Value> = rm.iter().map(|r| r.2).collect();
-    rm.retain(|r| !gone.contains(&r.3));
+    if rm.iter().any(|r| gone.contains(&r.3)) {
+        let rmap: FxHashMap<Value, Value> = rm.iter().map(|r| (r.2, r.3)).collect();
+        let mut seen = FxHashSet::default();
+        for r in &mut rm {
+            let mut v = r.3;
+            seen.clear();
+            while gone.contains(&v) {
+                if !seen.insert(v) {
+                    v = Value::reserved_value();
+                    break;
+                }
+                v = rmap[&v];
+            }
+            r.3 = v;
+        }
+        rm.retain(|r| r.3 != Value::reserved_value());
+    }
     if rm.is_empty() {
         return Vec::new();
     }
@@ -3922,19 +4190,27 @@ pub fn remove_trivial_params(
     for v in idx.values_mut() {
         v.sort_unstable_by(|a, b| b.cmp(a));
     }
-    let blocks: Vec<Block> = func.layout.blocks().collect();
-    for b in blocks {
-        let Some(t) = func.layout.last_inst(b) else {
-            continue;
-        };
-        if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
-            continue;
-        }
-        let dfg = &mut func.dfg;
-        for bc in
-            dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-        {
-            if let Some(is) = idx.get(&bc.block(&dfg.value_lists)) {
+    // Strip the removed arg slots on each in-edge to a touched block —
+    // `pred_iter` reaches the same terminators a full layout scan did
+    // (dedup: a brif with two dests to `b` lists its inst twice).
+    let mut pins: FxHashSet<Inst> = FxHashSet::default();
+    for (&b, is) in &idx {
+        pins.clear();
+        for pred in cfg.pred_iter(b) {
+            let t = pred.inst;
+            if !pins.insert(t)
+                || !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif)
+            {
+                continue;
+            }
+            let dfg = &mut func.dfg;
+            for bc in dfg
+                .insts[t]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            {
+                if bc.block(&dfg.value_lists) != b {
+                    continue;
+                }
                 for &i in is {
                     bc.remove(i, &mut dfg.value_lists);
                 }
@@ -3946,7 +4222,25 @@ pub fn remove_trivial_params(
         func.dfg.remove_block_param(p);
         func.dfg.change_to_alias(p, v);
     }
+    // Arity on `b`'s in-edges shifted — rescan it next round. Other
+    // blocks' carriers just gained a `p -> v` hop; the lazy resolve
+    // above already follows those.
+    for &b in idx.keys() {
+        inc.remove(&b);
+    }
     aliases
+}
+
+/// Block params whose every incoming `jump`/`brif` arg is one value `v` (or
+/// the param itself) become aliases of `v`. Threading's SSA repair creates
+/// these, and Cranelift only removes them after our condition folding ran, so
+/// the same value seen through two params would not match a dominating test.
+pub fn remove_trivial_params(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+) -> Vec<(Value, Value)> {
+    remove_trivial_params_inc(func, cfg, dt, &mut TrivpInc::default())
 }
 
 fn mark_live_param(
@@ -3972,6 +4266,16 @@ fn mark_live_param(
 }
 
 pub fn remove_dead_params(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
+    remove_dead_params_bl(func, cfg, None)
+}
+
+/// `touched` collects the blocks that lost params — `run` rescans their
+/// `TrivpInc` entries since in-edge arg arity shifted.
+pub(crate) fn remove_dead_params_bl(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    mut touched: Option<&mut FxHashSet<Block>>,
+) -> usize {
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut live: FxHashMap<Block, Vec<bool>> = blocks
         .iter()
@@ -4082,6 +4386,9 @@ pub fn remove_dead_params(func: &mut Function, cfg: &ControlFlowGraph) -> usize 
             let param = func.dfg.block_params(block)[index];
             func.dfg.remove_block_param(param);
         }
+    }
+    if let Some(t) = touched.as_deref_mut() {
+        t.extend(dead.keys().copied());
     }
     removed
 }
@@ -4353,13 +4660,19 @@ pub fn run(
     // `Option<NonNull>` itself can't outlive a round: `ifconv` needs
     // `&mut *derived` while `NonNull` holds it shared.
     let mut nn_params: Option<FxHashSet<Value>> = None;
+    // `trivp`'s in-edge fold survives rounds the same way: entries stay
+    // valid under edge loss and gain `dirty` blocks on retargets/param
+    // removals; `ifconv`+`unreach` clear it wholesale.
+    let mut trivp_inc = TrivpInc::default();
+    let mut trivp_dirty: FxHashSet<Block> = FxHashSet::default();
     for _ in 0..8 {
         let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
         if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
+            trivp_inc.dirty(trivp_dirty.drain());
             let v = {
                 let (c, d) = cd.get(func);
-                remove_trivial_params(func, c, d)
+                remove_trivial_params_inc(func, c, d, &mut trivp_inc)
             };
             // Removed params become aliases — an edge arg that named
             // one now resolves to its carrier, so kept `NonNull` proofs
@@ -4380,7 +4693,7 @@ pub fn run(
         if deadp && sh & shape::BPARAM != 0 {
             let removed = {
                 let (c, _) = cd.get(func);
-                remove_dead_params(func, c)
+                remove_dead_params_bl(func, c, Some(&mut trivp_dirty))
             };
             dead_params += removed;
             if removed != 0 {
@@ -4442,6 +4755,8 @@ pub fn run(
             // Conversions splice selects and retarget merge edges —
             // too entangled for per-block eviction.
             nn_params = None;
+            trivp_inc.clear();
+            trivp_dirty.clear();
         }
         check(func, "unreach");
         let bpn = if sh & shape::MULTI != 0 {
@@ -4459,6 +4774,7 @@ pub fn run(
                     )
                 });
             }
+            trivp_dirty.extend(ev.iter().copied());
             k
         } else {
             0
@@ -4507,6 +4823,7 @@ pub fn run(
                     )
                 });
             }
+            trivp_dirty.extend(evict.iter().copied());
             rn
         };
         round_quiet = rn == 0;
