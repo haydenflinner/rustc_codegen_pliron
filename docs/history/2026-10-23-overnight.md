@@ -71,3 +71,40 @@ How the passes use it:
 | push_iter | 2184 | 2165 | **1880** |
 
 The bound is a cost input only. `PLIRON_TRIPMAX=0` turns it off.
+
+## Fuzzing (rustlantis, nightly-2026-10-22)
+
+| seeds | result |
+|---|---|
+| 520:776 (with selchain/mulcarry/stepcmp on) | 3 output mismatches, all on by default too |
+| 776:2048 | 1268 pass, 2 ICEs, 1 mismatch, 1 compile timeout |
+
+Fixed:
+
+| seeds | bug | commit |
+|---|---|---|
+| 538, 683, 730 | slp xpack turned two loads of one address into `splat(first load)` without checking for a writer between them (`a = *p; f(p); b = *p`) | b0860b3 |
+| 810, 1276 | loadfwd's dead-pair poisoning inverted all of `pre.start`, so single-pred pass-through aliases shadowed the owning pending pair. A removed param was then appended to an edge ("argument v14720 is not attached") | 12deef9 |
+
+`gate.py`'s `fuzzreg` job replays these seeds. They're about 450 KB of
+custom MIR each, too big to check in.
+
+### Open: seed 1939 (output mismatch at -O)
+
+- It reproduces with only `fn13` optimized
+  (`PLIRON_OPT_FNS=@fn13`); bisect unit 363 is step `ifconv2`.
+- Within that step it is `cparm`'s `const_sweep`: `PLIRON_CSWEEP=0` fixes
+  the fn13-only build but not the full build.
+- The interpreter finds the pre- and post-`cparm` CLIF equivalent (400
+  trials), and the final CLIFs too.
+- The one fold examined, `v2665 -> i64::MAX - 1`, is correct for its
+  input: every SSA path into the param carries `i64::MAX`.
+- So the divergence is in a fold the interpreter shares, or in
+  memory/uninitialized-read behavior it doesn't model.
+- Next step: reduce the program (only `fn13` matters), or diff `fn13`'s
+  disassembly at units 362/363.
+
+`PLIRON_CLIF_STEPS=1` (with `PLIRON_CLIF`) now dumps after every step
+that reports a change; several steps don't dump on their own.
+
+Seed 1776 (pliron compile timeout, stock fine) is not investigated yet.

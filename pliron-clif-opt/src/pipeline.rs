@@ -280,6 +280,9 @@ impl Pipe<'_> {
     }
 }
 
+static CLIF_STEPS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_CLIF_STEPS", "1"));
+
 #[derive(Clone, Copy)]
 pub enum Gate {
     /// Correctness lowering, not a knob — always runs.
@@ -1712,6 +1715,11 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         let d = t0.elapsed();
         *slot += d;
         trace(s.name, d.as_secs_f64() * 1e3, p.fname);
+    }
+    // `PLIRON_CLIF_STEPS=1` (with `PLIRON_CLIF`): dump after every step that
+    // reports a change, including the steps that don't dump themselves.
+    if k > 0 && p.dump && *CLIF_STEPS {
+        p.dump(&format!("{} [step]", s.name));
     }
     if s.mutates {
         // Not conditional on `k`: a pass that removes blocks but
