@@ -3687,14 +3687,26 @@ pub fn cparm(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
         let (k, pm, merged) = webmerge_ctx(func, &mut wctx, dirty.as_ref());
         dirty = Some(merge_dirty(&wctx, &merged));
         n += k;
+        // Chase replacements to a fixed point, stopping on a revisit:
+        // `pm`/`pmap` can hold a cycle (`a -> b` in one block, `b -> a` in
+        // another — `apply_param_drops` keeps such params), and an
+        // unbounded chase spun forever (rustlantis seed 2187).
         for v in pmap.values_mut() {
+            let mut seen = FxHashSet::default();
             while let Some(&w) = pm.get(v) {
+                if !seen.insert(w) {
+                    break;
+                }
                 *v = w;
             }
         }
         for (&x, &v) in &pm {
             let mut v = v;
+            let mut seen = FxHashSet::default();
             while let Some(&w) = pm.get(&v).or_else(|| pmap.get(&v)) {
+                if !seen.insert(w) {
+                    break;
+                }
                 v = w;
             }
             pmap.insert(x, v);
