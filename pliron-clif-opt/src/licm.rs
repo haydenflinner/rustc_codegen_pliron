@@ -482,6 +482,7 @@ fn run_loop(
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
+    nounwind: &FxHashSet<FuncRef>,
     debug: bool,
     scoped: &FxHashMap<Inst, Region>,
     breg: &FxHashMap<Block, Region>,
@@ -811,7 +812,7 @@ fn run_loop(
     }
     cn + n
         + promote(
-            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, scoped_na, nw, ofz, debug,
+            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, scoped_na, nw, nounwind, ofz, debug,
         )
 }
 
@@ -832,6 +833,7 @@ fn promote(
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
     nw: &FxHashMap<FuncRef, bool>,
+    nounwind: &FxHashSet<FuncRef>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     debug: bool,
 ) -> usize {
@@ -878,6 +880,8 @@ fn promote(
     // normalized to a concrete slot: `Root::V` groups could overlap it,
     // `Root::S` groups can't (see the `ofz` note in the scan below).
     let mut ofz_access = false;
+    // The loop holds a plain call that may unwind (see the candidate loop).
+    let mut unwind_call = false;
     for &b in &body {
         for i in func.layout.block_insts(b) {
             // `(is_store, ty, width, addr)`: extending loads (`uload8` etc.)
@@ -921,6 +925,14 @@ fn promote(
                         _ => return 0,
                     };
                     (true, ty, w, (args[1], i32::from(offset)))
+                }
+                InstructionData::Call { func_ref, .. } => {
+                    unwind_call |= !nounwind.contains(&func_ref);
+                    continue;
+                }
+                InstructionData::CallIndirect { .. } => {
+                    unwind_call = true;
+                    continue;
                 }
                 _ => {
                     let op = func.dfg.insts[i].opcode();
@@ -981,6 +993,14 @@ fn promote(
     }
     for ((r, o), (ty, has_store, uniform, _)) in ks {
         if !uniform || !has_store || bad.contains(&r) || n >= MAX_MOVES {
+            continue;
+        }
+        // A plain call that may unwind leaves the loop without passing an
+        // exit edge's flush, and the caller (one that catches the panic)
+        // reads caller memory: a `V` root must stay in memory. Stack slots
+        // die with the frame; `try_call` unwind edges are exit edges and
+        // get the flush.
+        if unwind_call && matches!(r, Root::V(_)) {
             continue;
         }
         // An unresolved operand-frozen access may shadow a `V` loc;
@@ -1466,6 +1486,7 @@ pub fn run(
     deref: &FxHashMap<Value, (u64, bool)>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
+    nounwind: &FxHashSet<FuncRef>,
     scoped: &FxHashMap<Inst, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     breg: &FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     rpar: &pliron::cols::ColMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
@@ -1514,8 +1535,8 @@ pub fn run(
         let n2 = {
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
-                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, scoped_na, nw, debug, scoped, breg,
-                rpar, ofz,
+                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, scoped_na, nw, nounwind, debug,
+                scoped, breg, rpar, ofz,
             )
         };
         n += n2;
@@ -1609,6 +1630,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
@@ -1670,6 +1692,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
@@ -1741,6 +1764,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
@@ -1823,6 +1847,7 @@ mod tests {
             &deref,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
@@ -1911,6 +1936,7 @@ mod tests {
             &deref,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
@@ -2002,6 +2028,7 @@ mod tests {
                 &deref,
                 &FxHashMap::default(),
                 &FxHashMap::default(),
+                &FxHashSet::default(),
                 &FxHashMap::default(),
                 &FxHashMap::default(),
                 &pliron::cols::ColMap::default(),

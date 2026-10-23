@@ -71,6 +71,7 @@ fn scoped_noalias_root_is_not_function_wide_isolated() {
         &deref,
         &FxHashMap::default(),
         &FxHashMap::default(),
+        &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),

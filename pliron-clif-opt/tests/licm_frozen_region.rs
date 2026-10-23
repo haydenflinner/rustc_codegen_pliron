@@ -61,6 +61,7 @@ fn promotion_respects_operand_frozen_reads_of_the_same_location() {
         &deref,
         &FxHashMap::default(),
         &FxHashMap::default(),
+        &FxHashSet::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),

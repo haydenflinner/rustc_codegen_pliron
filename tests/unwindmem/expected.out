@@ -1,0 +1,9 @@
+at=0 ok=falsefalsefalsetrue e=Some(42) x=2730 y=42 v=[10, 0, 0, 0]
+at=1 ok=falsetruefalsefalse e=None x=19 y=41 v=[110, 11, 0, 0]
+at=3 ok=falsetruefalsefalse e=Some(42) x=342 y=42 v=[110, 111, 112, 13]
+at=99 ok=truetruetruetrue e=Some(42) x=13665 y=42 v=[110, 111, 112, 113]
+at=0 falsetruefalsefalse v=[0] c=(8,31) f=111 arr=[2, 1, 3, 4] t=None o=None
+at=1 falsefalsetruefalse v=[0, 3] c=(2,4) f=1111 arr=[2, 3, 1, 4] t=Some(8) o=Some(8)
+at=2 falsefalsetruefalse v=[0, 3, 6] c=(7,25) f=1111 arr=[2, 3, 4, 1] t=Some(8) o=Some(8)
+at=5 falsefalsetruetrue v=[0, 3, 6, 9, 12, 15] c=(5,14) f=1111 arr=[2, 3, 4, 1] t=Some(8) o=Some(8)
+at=99 truetruetruetrue v=[0, 3, 6, 9, 12, 15, 18, 21] c=(8,31) f=1111 arr=[2, 3, 4, 1] t=Some(8) o=Some(8)

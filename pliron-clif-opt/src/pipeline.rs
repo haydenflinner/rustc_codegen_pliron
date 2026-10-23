@@ -2185,6 +2185,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.deref,
         p.nowrite,
         p.call_frozen,
+        p.nounwind,
         p.scoped,
         &breg_now,
         p.region_parent,

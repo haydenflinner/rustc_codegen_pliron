@@ -283,6 +283,12 @@ t_dseunwind() {
   rustc $BE --edition 2021 -O tests/dseunwind/main.rs -o $out/dseunwind$exe && $out/dseunwind$exe
 }
 
+t_unwindmem() {
+  # Caller memory a `catch_unwind` caller reads after a panic: no pass may
+  # hold it in registers or drop stores across a call that may unwind.
+  rustc $BE --edition 2021 -O tests/unwindmem/main.rs -o $out/unwindmem$exe && $out/unwindmem$exe | diff --strip-trailing-cr - tests/unwindmem/expected.out
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -547,6 +553,7 @@ want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul
 want dseunwind && t_dseunwind
+want unwindmem && t_unwindmem
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute
