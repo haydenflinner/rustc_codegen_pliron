@@ -34,6 +34,10 @@ semantics, fine for Rust.
 
 ## Pieces
 
+Status: **`__pliron_seh_personality` landed** (0ffd64e, built in pliron
+IR in codegen_allocator behind `PLIRON_SEH=1`, unused until #1 and #4
+land). Remaining:
+
 1. **`.xdata` EHANDLER + scope table** (`pliron-clif-lower/src/eh/mod.rs`,
    `emit_coff`): for functions whose `code.buffer.call_sites()` have
    exception handlers, set `UNW_FLAG_EHANDLER` in the emitted UNWIND_INFO,
