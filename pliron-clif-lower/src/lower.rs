@@ -100,6 +100,14 @@ enum Sym {
 /// (`PLIRON_RET_NOEXT`).
 pub static RET_NOEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Cranelift implements `StructArgument` (byval) only on x86-64: arm64
+/// panics on it. `lower_module` clears this for such targets, and a
+/// byval argument (rustc's `IndirectMode::OnStack`, e.g. the `extern
+/// "tail"` ABI's large aggregates) is then passed as a plain pointer, like
+/// every other indirect argument — both ends are pliron code, and rustc
+/// already hands the callee its own copy for by-move indirect args.
+static STRUCT_ARG_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
     let TyK::Func(ret, args, var_arg) = classify(ctx, fn_ty) else {
         panic!("not a function type")
@@ -115,7 +123,7 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
         // a sane ceiling (huge `repr(align)` types exceed Cranelift's
         // implementation limits) drop the marker and pass the leaves.
         ArgExt::ByVal(n) => {
-            if n <= (1 << 20) {
+            if n <= (1 << 20) && STRUCT_ARG_OK.load(std::sync::atomic::Ordering::Relaxed) {
                 AbiParam::special(t, ArgumentPurpose::StructArgument(n.next_multiple_of(8)))
             } else {
                 p
@@ -980,6 +988,10 @@ pub fn lower_module<'a>(
 ) -> Lowered {
     let macho = isa.triple().binary_format == target_lexicon::BinaryFormat::Macho;
     let cc = isa.default_call_conv();
+    STRUCT_ARG_OK.store(
+        isa.triple().architecture == target_lexicon::Architecture::X86_64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut internal = internal_fns(ctx, st);
     if matches!(
         isa.triple().architecture,

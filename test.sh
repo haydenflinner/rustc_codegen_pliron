@@ -326,6 +326,12 @@ t_fnalign() {
   rustc $BE --edition 2021 -O tests/fnalign/main.rs -o $out/fnalign$exe && $out/fnalign$exe
 }
 
+t_rusttailcc() {
+  # extern "tail" with byval (OnStack) aggregates: no StructArgument on arm64.
+  rustc $BE --edition 2021 --cfg aarch64 tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1 && \
+  rustc $BE --edition 2021 --cfg aarch64 -O tests/rusttailcc/main.rs -o $out/rusttailcc$exe && $out/rusttailcc$exe >/dev/null 2>&1
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -596,6 +602,7 @@ want mirshapes && t_mirshapes
 want slpsplat && t_slpsplat
 want applestackargs && t_applestackargs
 want fnalign && t_fnalign
+want rusttailcc && t_rusttailcc
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute
