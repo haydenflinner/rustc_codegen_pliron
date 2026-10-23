@@ -35,6 +35,8 @@ case "$(uname -s)" in
   *)                   lib=librustc_codegen_pliron.so;    exe= ;;
 esac
 BE="-Zcodegen-backend=$PWD/target/debug/$lib"
+# Extra rustc flags for every stanza (experiments, e.g. -Zmir-move-elimination).
+BE="$BE ${PLIRON_TEST_RUSTFLAGS:-}"
 if [[ "$(uname -s)" == Linux ]] && command -v wild >/dev/null; then
   # gcc 11 has no --ld-path, so point its -B search dir at an `ld` that is wild.
   # ELF-only: wild must never be picked up for a native Mach-O link on macOS.
@@ -293,6 +295,16 @@ t_unwindstd() {
   # std's unwind-safety guards (SetLenOnDrop, sort holes, RefCell flags,
   # drop order, ...) under a panic at each of 12 points vs stock rustc.
   rustc $BE --edition 2021 -O tests/unwindstd/main.rs -o $out/unwindstd$exe && $out/unwindstd$exe | diff --strip-trailing-cr - tests/unwindstd/expected.out
+}
+
+t_mirshapes() {
+  # Hand-written MIR in the shapes rustc's MoveElimination produces
+  # (interior sret, escaping return place, no storage markers) and odd
+  # StorageLive/Dead placement: output must match stock rustc's
+  # (docs/history/2026-10-22-mir-move-elimination.md).
+  for f in mirshapes markers; do
+    rustc $BE --edition 2021 -O tests/mirshapes/$f.rs -o $out/$f$exe && $out/$f$exe | diff --strip-trailing-cr - tests/mirshapes/$f.expected.out || return 1
+  done
 }
 
 t_retattr() {
@@ -561,6 +573,7 @@ want selmul && t_selmul
 want dseunwind && t_dseunwind
 want unwindmem && t_unwindmem
 want unwindstd && t_unwindstd
+want mirshapes && t_mirshapes
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute
