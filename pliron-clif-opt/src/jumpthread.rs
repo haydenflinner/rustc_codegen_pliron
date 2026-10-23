@@ -4665,6 +4665,10 @@ pub fn run(
     // removals; `ifconv`+`unreach` clear it wholesale.
     let mut trivp_inc = TrivpInc::default();
     let mut trivp_dirty: FxHashSet<Block> = FxHashSet::default();
+    // `deadp`'s liveness scan only *shrinks* its live set — a clean
+    // scan stays clean until an edit rewrites edge args/params/inst
+    // operands (`changed` + `rn` cover every mutator in the loop).
+    let mut deadp_stale = true;
     for _ in 0..8 {
         let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
@@ -4690,12 +4694,13 @@ pub fn run(
             };
             tp = Some(std::time::Instant::now());
         }
-        if deadp && sh & shape::BPARAM != 0 {
+        if deadp && deadp_stale && sh & shape::BPARAM != 0 {
             let removed = {
                 let (c, _) = cd.get(func);
                 remove_dead_params_bl(func, c, Some(&mut trivp_dirty))
             };
             dead_params += removed;
+            deadp_stale = removed != 0;
             if removed != 0 {
                 remove_unused_notrap_loads(func);
                 changed = true;
@@ -4838,6 +4843,7 @@ pub fn run(
             ic_dirty = true;
         }
         let n = dc + ic + bpn + rn;
+        deadp_stale |= changed || rn > 0;
         total += n;
         if n == 0 {
             // `fold_null_tests` on the converged function — a fresh
