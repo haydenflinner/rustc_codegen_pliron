@@ -533,6 +533,9 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         }
         self.mark_attrs(symbol_name, instance, fn_abi);
         let attrs = self.tcx.codegen_instance_attrs(instance.def);
+        if let Some(a) = attrs.alignment {
+            self.st.borrow_mut().fn_align.insert(symbol_name.to_string(), a.bytes());
+        }
         self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
     }
 }

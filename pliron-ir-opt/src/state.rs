@@ -327,6 +327,10 @@ pub struct State {
     pub strs: SymMap<Value>,
     pub counter: usize,
     pub cgu: String,
+    /// `#[rustc_align(N)]` / `-Cmin-function-alignment` per function symbol
+    /// (rustc's `codegen_instance_attrs(..).alignment`, which also covers
+    /// shims): the definition's minimum alignment in bytes.
+    pub fn_align: FxHashMap<String, u64>,
     /// Symbol of the EH personality function. rustc mangles it as a
     /// std-internal symbol since nightly-2026-10-22
     /// (`_RNvCs.._7___rustc19rust_eh_personality`); empty means the

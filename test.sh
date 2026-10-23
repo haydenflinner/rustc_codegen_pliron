@@ -320,6 +320,12 @@ t_applestackargs() {
   rustc $BE --edition 2021 tests/applestackargs/main.rs -o $out/applestackargs$exe && $out/applestackargs$exe | diff --strip-trailing-cr - tests/applestackargs/expected.out
 }
 
+t_fnalign() {
+  # #[rustc_align(N)] reaches the object: plain fns and dyn shims.
+  rustc $BE --edition 2021 tests/fnalign/main.rs -o $out/fnalign$exe && $out/fnalign$exe && \
+  rustc $BE --edition 2021 -O tests/fnalign/main.rs -o $out/fnalign$exe && $out/fnalign$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -589,6 +595,7 @@ want unwindstd && t_unwindstd
 want mirshapes && t_mirshapes
 want slpsplat && t_slpsplat
 want applestackargs && t_applestackargs
+want fnalign && t_fnalign
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

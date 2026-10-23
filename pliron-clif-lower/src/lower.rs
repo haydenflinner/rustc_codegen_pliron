@@ -403,6 +403,9 @@ pub fn lower_to_object(
 struct FnJob {
     name: String,
     id: FuncId,
+    /// Minimum alignment of the definition in bytes (`State::fn_align`:
+    /// `#[rustc_align]`, which rustc also applies to shims), 0 = none.
+    align: u64,
     func: ir::Function,
     nonnull: FxHashSet<ir::Value>,
     derived: pliron_clif_opt::vmap::VMap<ir::Value>,
@@ -447,6 +450,7 @@ impl FnJob {
         FnJob {
             name,
             id,
+            align: 0,
             func,
             nonnull: FxHashSet::default(),
             derived: pliron_clif_opt::vmap::VMap::default(),
@@ -1414,6 +1418,7 @@ pub fn lower_module<'a>(
                 FnJob {
                     name: n.clone(),
                     id,
+                    align: st.fn_align.get(n.as_str()).copied().unwrap_or(0),
                     func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                     nonnull,
                     derived,
@@ -1555,7 +1560,7 @@ pub fn lower_module<'a>(
             .collect();
         m.define_function_bytes(
             j.id,
-            u64::from(code.buffer.alignment),
+            u64::from(code.buffer.alignment).max(j.align),
             code.buffer.data(),
             &relocs,
         )
@@ -2143,6 +2148,7 @@ pub fn lower_clif_wasm(
             FnJob {
                 name: n.clone(),
                 id,
+                align: st.fn_align.get(n.as_str()).copied().unwrap_or(0),
                 func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                 nonnull,
                 derived,
