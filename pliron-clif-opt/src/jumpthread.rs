@@ -4668,7 +4668,10 @@ pub fn run(
     // `deadp`'s liveness scan only *shrinks* its live set — a clean
     // scan stays clean until an edit rewrites edge args/params/inst
     // operands (`changed` + `rn` cover every mutator in the loop).
+    // `bypass` is a pure function of the current func: a quiet call
+    // rescans identically until an edit lands.
     let mut deadp_stale = true;
+    let mut bypass_stale = true;
     for _ in 0..8 {
         let mut tp = prof.then(std::time::Instant::now);
         let mut changed = false;
@@ -4764,13 +4767,14 @@ pub fn run(
             trivp_dirty.clear();
         }
         check(func, "unreach");
-        let bpn = if sh & shape::MULTI != 0 {
+        let bpn = if bypass_stale && sh & shape::MULTI != 0 {
             let mut ev = FxHashSet::default();
             let k = bypass_forwarders(
                 func,
                 cd.as_ref(),
                 Some(&mut ev),
             );
+            bypass_stale = k != 0;
             if let Some(ps) = &mut nn_params {
                 ps.retain(|&p| {
                     !matches!(
@@ -4844,6 +4848,7 @@ pub fn run(
         }
         let n = dc + ic + bpn + rn;
         deadp_stale |= changed || rn > 0;
+        bypass_stale |= changed || rn > 0;
         total += n;
         if n == 0 {
             // `fold_null_tests` on the converged function — a fresh
