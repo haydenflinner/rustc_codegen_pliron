@@ -502,6 +502,22 @@ impl Flat {
     }
 }
 
+/// Two resolved `br_table` targets feed `M` the same values. `args` alone
+/// isn't enough: `thru_psub` only renames chain params, so an arg that is
+/// a result computed inside a shared chain (`v22 = band v20, 1` in a hop
+/// both arms pass through) is the same `Value` for both arms even when
+/// the param it reads (`v20`) arrives with a different value per arm. Equal
+/// chains with equal param substitutions make the cloned computations
+/// identical. (polars-plan's dtype selector: a `matches!` table's hit and
+/// default arms merged, so the filter rejected every column.)
+fn same_arm(prev: &Arm, a: &Arm) -> bool {
+    prev.m == a.m
+        && prev.side == a.side
+        && prev.args == a.args
+        && prev.chain == a.chain
+        && prev.psub == a.psub
+}
+
 /// `br_table` if-conversion: every target resolving (through pure
 /// forwarders) to one merge `M` with per-arm args collapses to cloned side
 /// computations plus `select(hit, arm_val, sel)` chains in `b`. The mask for
@@ -576,12 +592,12 @@ fn conv_table(
         if arms.len() >= 8
             && !arms
                 .iter()
-                .any(|prev| prev.m == a.m && prev.side == a.side && prev.args == a.args)
+                .any(|prev| same_arm(prev, &a))
         {
             return false;
         }
         for (ai, prev) in arms.iter().enumerate() {
-            if prev.m == a.m && prev.side == a.side && prev.args == a.args {
+            if same_arm(prev, &a) {
                 arm_of.push(ai);
                 continue 'dests;
             }

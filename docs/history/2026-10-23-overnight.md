@@ -150,6 +150,34 @@ Open:
   main and matches stock (likely the loop-analysis fix a678d9a). It stays
   in `fuzzreg`.
 
+## nushell polars selector: ifconv `br_table` arm dedup
+
+The last crates failure (`nu_plugin_polars` `selector_signed_integer` /
+`selector_unsigned_integer` returning no columns) was a miscompile in
+polars-plan, not nushell. It was found by bisecting:
+
+1. Crates: pliron only for a subset, the rest stock. That took 14 builds
+   of about 8 minutes each and named `polars_plan`. LTO was not involved:
+   an all-pliron build without LTO failed too.
+2. Functions: `harness/fnbisect.py` with each step rebuilding only
+   `polars_plan` and its dependents (about 2 minutes). It named the
+   `filter_fold` closure of `DataTypeSelector::into_columns`.
+3. Units: `harness/bisect.py` with `PLIRON_OPT_FNS` set to that function.
+   Unit 80 is `jumpthread`, and `PLIRON_IFCONV=0` alone fixes it.
+
+The cause is in `ifconv`'s `br_table` conversion. The arm dedup compared
+`(m, side, args)`, but an arg that is a result computed inside a shared
+forwarder hop (`v22 = band v20, 1`) is the same `Value` for every arm,
+even though the hop's param `v20` gets a different value per arm. A
+`matches!` table (in-range indices give 1, the default gives 0) collapsed
+to the default, so the filter rejected everything. Arms now also need
+equal chains and param substitutions.
+
+The step's diffcheck missed it twice. The function calls externs, and
+the interpreter can't run those. In the reduced CLIF, the bad path took
+5 of 256 tag values and the default 16 trials never hit it. Test:
+`pliron-clif-opt/tests/ifconv_table_chain.rs` (fails without the fix).
+
 ## Crates on nightly-2026-10-22
 
 Tiers 1–3 (37 crates, at 7f8474f): all match stock except nushell's
