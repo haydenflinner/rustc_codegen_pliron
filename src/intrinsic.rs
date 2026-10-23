@@ -527,19 +527,36 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     }
     fn va_start(&mut self, val: Value) {
         // The variadic-argument buffer pointer, delivered by the lowering as the
-        // hidden extra parameter of a C-variadic function. The VaList place gets
-        // a real SysV `__va_list_tag`: gp/fp offsets exhausted so every va_arg
-        // (ours and a forwarded foreign callee's alike) walks `overflow_arg_area`,
-        // which points at the packed buffer.
+        // hidden extra parameter of a C-variadic function. The VaList place is
+        // initialized as the platform's `va_list` with every register area
+        // exhausted, so every va_arg (ours and a forwarded foreign callee's
+        // alike) walks the stack cursor, which points at the packed buffer.
         let buf = self.intrinsic("pliron.va.buf", self.type_ptr(), &[]);
-        if self.tcx.sess.target.is_like_wasm {
-            // wasm's va_list is a single opaque pointer: the place itself is
-            // the cursor into the packed buffer.
-            self.store(buf, val, Align::from_bytes(4).unwrap());
-            return;
-        }
         let i8t = self.type_i8();
         let i32t = self.type_i32();
+        match crate::builder::va_kind(self.tcx) {
+            crate::builder::VaKind::Ptr => {
+                // A single opaque pointer (wasm, Apple arm64, Windows, ...):
+                // the place itself is the cursor. Writing more overruns it.
+                let al = Align::from_bytes(self.tcx.data_layout.pointer_size().bytes()).unwrap();
+                self.store(buf, val, al);
+                return;
+            }
+            crate::builder::VaKind::Aapcs64 => {
+                // `{ __stack, __gr_top, __vr_top, __gr_offs, __vr_offs }`:
+                // offsets >= 0 send va_arg to `__stack`.
+                self.store(buf, val, Align::EIGHT);
+                let zero = self.const_int(i32t, 0);
+                let p24 = self.gep(i8t, val, &[self.const_usize(24)]);
+                self.store(zero, p24, Align::from_bytes(4).unwrap());
+                let p28 = self.gep(i8t, val, &[self.const_usize(28)]);
+                self.store(zero, p28, Align::from_bytes(4).unwrap());
+                return;
+            }
+            crate::builder::VaKind::SysV => {}
+        }
+        // SysV `__va_list_tag`: gp/fp offsets exhausted, the cursor is
+        // `overflow_arg_area` (+8).
         let gp = self.const_int(i32t, 48);
         self.store(gp, val, Align::from_bytes(4).unwrap());
         let p4 = self.gep(i8t, val, &[self.const_usize(4)]);

@@ -928,8 +928,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let ptr = self.type_ptr();
         let isize = self.type_isize();
         let i8t = self.type_i8();
-        // wasm's va_list is an opaque pointer: the place itself is the cursor.
-        let cur_off = if wasm { 0 } else { 8 };
+        // The cursor's offset in the platform va_list (see `va_start`).
+        let cur_off = if va_kind(self.tcx()) == VaKind::SysV { 8 } else { 0 };
         let cur_slot = if cur_off == 0 {
             list
         } else {
@@ -1509,5 +1509,28 @@ impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> StaticBuilderMethods for Builder<'a, 'tcx> {
     fn get_static(&mut self, def_id: rustc_hir::def_id::DefId) -> Value {
         self.cx.get_static_addr(def_id)
+    }
+}
+
+/// The platform `va_list` shape (core's `VaListInner` for the target), as
+/// `va_start` initializes it and `va_arg` finds the stack cursor in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VaKind {
+    /// x86-64 SysV `__va_list_tag`; cursor `overflow_arg_area` at +8.
+    SysV,
+    /// AAPCS64 `va_list`; cursor `__stack` at +0.
+    Aapcs64,
+    /// A bare pointer that is itself the cursor.
+    Ptr,
+}
+
+pub(crate) fn va_kind(tcx: rustc_middle::ty::TyCtxt<'_>) -> VaKind {
+    let t = &tcx.sess.target;
+    use rustc_target::spec::{Arch, Os};
+    let plain = !t.is_like_windows && t.os != Os::Uefi;
+    match t.arch {
+        Arch::X86_64 if plain => VaKind::SysV,
+        Arch::AArch64 if plain && !t.is_like_darwin => VaKind::Aapcs64,
+        _ => VaKind::Ptr,
     }
 }

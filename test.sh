@@ -338,6 +338,12 @@ t_asmlabels() {
   rustc $BE --edition 2021 tests/asmlabels/main.rs -o $out/asmlabels$exe
 }
 
+t_cvariadic() {
+  # C-variadic defs: va_list layout per target; VaList forwarded to libc.
+  rustc $BE --edition 2024 tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe && \
+  rustc $BE --edition 2024 -O tests/cvariadic/main.rs -o $out/cvariadic$exe && $out/cvariadic$exe
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -610,6 +616,7 @@ want applestackargs && t_applestackargs
 want fnalign && t_fnalign
 want rusttailcc && t_rusttailcc
 want asmlabels && t_asmlabels
+want cvariadic && t_cvariadic
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

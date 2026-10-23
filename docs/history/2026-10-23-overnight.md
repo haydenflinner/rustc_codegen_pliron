@@ -146,3 +146,32 @@ repro uses nushell's full polars feature set.
 
 Stock tokio stalls at 518/2310 tests under this nightly. `crates.py` now
 reports a stock-side timeout as `STOCKTO` instead of `ok`.
+
+## Selfhost UI run (stage 1, backend 0fa0839)
+
+`tests/ui` with the pliron-built stage 1 compiler: 63 failures (the old
+baseline was 102). Most are expected: `codegen` (24, LLVM-specific output),
+`sanitizer`, `scalable-vectors`, `lto`, `target_modifiers`, `darwin-objc`,
+backtrace/debuginfo, LLVM pass flags. The stage 2 build was killed by
+earlyoom while other jobs ran, so there is no stage 1/2 comparison yet.
+
+Real bugs found and fixed, each with a gate stanza that fails without
+the fix:
+
+| UI test | bug | fix |
+|---|---|---|
+| `attributes/fn-align-dyn.rs` | `#[rustc_align(N)]` ignored: functions and their `dyn` shims got Cranelift's code alignment only | e7b9eb2 (`fnalign`) |
+| `abi/rust-tail-cc.rs` | ICE: rustc passes `extern "tail"` large aggregates OnStack (byval); Cranelift has no `StructArgument` on arm64 | 27dc9de: plain pointer off x86-64 (`rusttailcc`) |
+| `asm/binary_asm_labels_allowed.rs` | vendored rsasm rejected the local label ref `01b` as a bad octal literal | rsasm lexer (`asmlabels`) |
+| `c-variadic/copy.rs`, `consts/const-eval/c-variadic.rs`, `abi/variadic-ffi.rs` | every C-variadic definition crashed on aarch64-apple: `va_start` wrote a 24-byte SysV `__va_list_tag` into an 8-byte `VaList` | `va_start`/`va_arg` follow the target's `va_list` (SysV / AAPCS64 / pointer) (`cvariadic`) |
+
+Not reproduced: `thread-local/tls.rs` (`assert_ne!` of a TLS address
+seen from two threads) failed once in the run; 200 runs with stock and
+stage 1 builds pass.
+
+Left: `asm/label-operand.rs` (asm goto unsupported),
+`asm/aarch64/may_unwind.rs` (unwinding out of `asm!`),
+`statics/const_generics.rs#opt` (we keep a separate copy of `&FOO` where
+LLVM merges it; status-quo test, not a bug),
+`traits/next-solver/...-129372.rs#old` (expects a compile error our
+backend does not hit).
