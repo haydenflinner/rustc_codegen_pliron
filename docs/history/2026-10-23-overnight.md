@@ -219,3 +219,23 @@ Left: `asm/label-operand.rs` (asm goto unsupported),
 LLVM merges it; status-quo test, not a bug),
 `traits/next-solver/...-129372.rs#old` (expects a compile error our
 backend does not hit).
+
+## Tried and dropped: gating `bump_hoist` phase 2
+
+arrayvec `find_all` (pliron +14% vs LLVM) has `sub x9, x11, #36` in every
+element block of its unrolled search. The vendored Cranelift `bump_hoist`
+(context.rs) phase 2 rewrites every later use of the pre-bump pointer
+into `q - 36` so the base dies at the header load. But that load is at
+offset 32, so the post-index fusion it enables can't happen. Gating
+phase 2 on a zero-offset access, and on no rewritten use inside the
+header's own loop, removed all 10 subs. The element path became LLVM's
+5-instruction sequence, at the cost of one back-edge `mov`. The full
+kernel A/B (3 interleaved rounds, gate on vs `=0`) was neutral: every
+kernel within ±1.6%, arrayvec −0.3% in favor of the old code. The core
+absorbs the extra `sub`, so the change was not landed.
+
+The remaining `find_all` difference is the loop end pointer `v0 + n*36`:
+Cranelift's egraph rebuilds it with a `madd` at every exit check. The
+egraph rewrote `block0`'s only out-of-loop use (`v0 == v0+v16` became
+`v16 == 0`), and elaboration then doesn't hoist it to the preheader.
+`PLIRON_COMPILE_EGRAPH=0` computes it once. Not investigated further.
