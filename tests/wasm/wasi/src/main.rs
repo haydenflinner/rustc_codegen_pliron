@@ -102,7 +102,41 @@ fn main() {
         scan(std::hint::black_box(b"(x)".as_slice())) == (3, 0)
             && scan(std::hint::black_box(b"u) b".as_slice())) == (1, 0),
     );
+    // Per-function `#[target_feature(enable = "simd128")]` with no global
+    // `+simd128`: vector signatures scalarize to per-lane params/results,
+    // so the `llvm.wasm.*` intrinsic emit packs lanes into v128 and
+    // extracts them back (hex-simd panicked binding 1 value to 16
+    // results and emitted `unreachable` stubs).
+    {
+        let a = [0xabu8; 16];
+        let b = [0xcdu8; 16];
+        let mut m = [0u8; 16];
+        for i in 0..16 {
+            m[i] = if i % 3 == 0 { 0xff } else { 0 };
+        }
+        let (r, t) = unsafe { bitselect_check(&a, &b, &m) };
+        check(
+            "v128 bitselect",
+            r.iter().enumerate().all(|(i, &x)| {
+                x == if i % 3 == 0 { 0xab } else { 0xcd }
+            }) && t,
+        );
+    }
     eprintln!("wasi std OK");
+}
+
+#[target_feature(enable = "simd128")]
+unsafe fn bitselect_check(a: &[u8; 16], b: &[u8; 16], m: &[u8; 16]) -> ([u8; 16], bool) {
+    use std::arch::wasm32::{v128_any_true, v128_bitselect, v128_load, v128_store};
+    let (a, b, m) = (
+        v128_load(a.as_ptr().cast()),
+        v128_load(b.as_ptr().cast()),
+        v128_load(m.as_ptr().cast()),
+    );
+    let r = v128_bitselect(a, b, m);
+    let mut out = [0u8; 16];
+    v128_store(out.as_mut_ptr().cast(), r);
+    (out, v128_any_true(r))
 }
 
 #[inline(never)]

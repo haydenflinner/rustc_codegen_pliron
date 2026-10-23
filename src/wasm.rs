@@ -9800,9 +9800,39 @@ mod clif_emit {
                         }
                         if let Some((o, n, rt)) = vw_intrinsic(&name) {
                             let wargs = self.call_args(&sig, &args);
-                            let v = self.op(o, &wargs[..n], rt);
-                            self.bind_call(f, i, smallvec![v]);
-                            return;
+                            let rs = f.dfg.inst_results(i);
+                            // `simd128` only enabled per-function
+                            // (`#[target_feature]`, the stdarch dispatch
+                            // pattern) leaves `NATIVE_SIMD` off, so vectors
+                            // scalarize to per-lane signature params and
+                            // results. Pack each operand's lanes into one
+                            // v128 and extract the result lanes back out.
+                            if wargs.len() == n && rs.len() <= 1 {
+                                let v = self.op(o, &wargs[..n], rt);
+                                self.bind_call(f, i, smallvec![v]);
+                                return;
+                            }
+                            if n > 0 && wargs.len() % n == 0 {
+                                let lanes = wargs.len() / n;
+                                let at = sig.params[0].value_type;
+                                let mut wv: Vec<WV> = Vec::with_capacity(n);
+                                for c in wargs.chunks(lanes) {
+                                    wv.push(self.pack_lanes(at, c));
+                                }
+                                let v = self.op(o, &wv, rt);
+                                let vs: Vals = if rs.len() <= 1 {
+                                    smallvec![v]
+                                } else {
+                                    let lt = self.vty(f, rs[0]);
+                                    (0..rs.len())
+                                        .map(|k| self.extract_lane_v(lt, v, k as u8))
+                                        .collect()
+                                };
+                                self.bind_call(f, i, vs);
+                                return;
+                            }
+                            // Lane counts that do not divide evenly fall
+                            // through to a normal call to the trap stub.
                         }
                     }
                     // FnLower::libcall fabricates `(...)->i128/f128` call sigs
@@ -11637,6 +11667,43 @@ mod clif_emit {
                 l => panic!("insertlane {l}"),
             };
             self.op(o, &[a, v], WT::V128)
+        }
+
+        /// Build a v128 from scalarized per-lane wasm values (`splat` the
+        /// first lane, then `replace_lane` the rest).
+        fn pack_lanes(&mut self, lane: ClType, vs: &[WV]) -> WV {
+            let splat = vl!(lane; I8 => I8x16Splat, I16 => I16x8Splat,
+                    I32 => I32x4Splat, I64 => I64x2Splat,
+                    F32 => F32x4Splat, F64 => F64x2Splat);
+            let first = self.cvt(vs[0], wty(lane));
+            let mut v = self.op(splat, &[first], WT::V128);
+            for (k, &x) in vs.iter().enumerate().skip(1) {
+                let (x, o) = match lane {
+                    clt::I8 => (self.cvt(x, WT::I32), O::I8x16ReplaceLane { lane: k as u8 }),
+                    clt::I16 => (self.cvt(x, WT::I32), O::I16x8ReplaceLane { lane: k as u8 }),
+                    clt::I32 => (self.cvt(x, WT::I32), O::I32x4ReplaceLane { lane: k as u8 }),
+                    clt::I64 => (self.cvt(x, WT::I64), O::I64x2ReplaceLane { lane: k as u8 }),
+                    clt::F32 => (self.cvt(x, WT::F32), O::F32x4ReplaceLane { lane: k as u8 }),
+                    clt::F64 => (self.cvt(x, WT::F64), O::F64x2ReplaceLane { lane: k as u8 }),
+                    l => panic!("pack_lanes {l}"),
+                };
+                v = self.op(o, &[v, x], WT::V128);
+            }
+            v
+        }
+
+        /// `extractlane` on a wasm value already in hand (the `ir::Value`
+        /// variant above resolves `arg` first).
+        fn extract_lane_v(&mut self, lane: ClType, a: WV, k: u8) -> WV {
+            match lane {
+                clt::I8 => self.op(O::I8x16ExtractLaneU { lane: k }, &[a], WT::I32),
+                clt::I16 => self.op(O::I16x8ExtractLaneU { lane: k }, &[a], WT::I32),
+                clt::I32 => self.op(O::I32x4ExtractLane { lane: k }, &[a], WT::I32),
+                clt::I64 => self.op(O::I64x2ExtractLane { lane: k }, &[a], WT::I64),
+                clt::F32 => self.op(O::F32x4ExtractLane { lane: k }, &[a], WT::F32),
+                clt::F64 => self.op(O::F64x2ExtractLane { lane: k }, &[a], WT::F64),
+                l => panic!("extract_lane_v {l}"),
+            }
         }
 
         /// i128 binary ops on (lo,hi) pairs.
