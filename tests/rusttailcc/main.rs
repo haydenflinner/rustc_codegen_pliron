@@ -4,6 +4,26 @@
 // backend now passes them as plain pointers there (both ends are ours).
 
 #![feature(rust_tail_cc)]
+#![feature(explicit_tail_calls)]
+#![allow(incomplete_features)]
+
+// An exported `extern "tail"` fn is not internal: its convention is the
+// source ABI's `CallConv::Tail`, not the platform default. Before
+// `FuncInfo::tail_cc`, non-local tail fns silently got the platform ABI —
+// callers agreed by luck, but `become`/`return_call` and fn pointers were
+// off-convention.
+#[no_mangle]
+extern "tail" fn exported_bite(x: u64) -> u64 {
+    x * 3 + 1
+}
+
+extern "tail" fn tail_become(x: u64) -> u64 {
+    become exported_bite(x)
+}
+
+extern "tail" fn local_tail(x: u64) -> u64 {
+    x + 7
+}
 
 struct CrateOf<'a> {
     mcintosh: f64,
@@ -82,4 +102,9 @@ fn main() {
         &[],
     );
     assert_eq!(pie, (2292, 403.64201234, 50, 160));
+    assert_eq!(tail_become(10), 31);
+    let p: extern "tail" fn(u64) -> u64 = local_tail;
+    assert_eq!(p(5), 12);
+    let q: extern "tail" fn(u64) -> u64 = exported_bite;
+    assert_eq!(q(5), 16);
 }

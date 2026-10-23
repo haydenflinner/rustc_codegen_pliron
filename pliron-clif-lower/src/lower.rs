@@ -203,6 +203,21 @@ pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> 
         .collect()
 }
 
+/// A function whose Rust ABI is `extern "tail"` must be `CallConv::Tail`
+/// even when it is not internal (exported, imported, address-taken, or
+/// reached by an invoke) — its convention is fixed by the source ABI,
+/// unlike `internal_fns`, which merely elects our faster internal ABI.
+/// aarch64 still keeps sret fns on the platform ABI: its tail CC has no
+/// StructReturn (same carve-out as `lower_module`).
+fn is_tail_fn(
+    triple: &target_lexicon::Triple,
+    f: &crate::iropt::state::FuncInfo,
+) -> bool {
+    f.tail_cc
+        && !(matches!(triple.architecture, target_lexicon::Architecture::Aarch64(_))
+            && f.exts.params.contains(&crate::context::ArgExt::SRet))
+}
+
 /// Profiler hook, shared with the codegen worker threads.
 pub trait Prof: Send + Sync {
     /// Guard for phase/step `nm` (optionally per function `arg`).
@@ -1014,7 +1029,7 @@ pub fn lower_module<'a>(
         });
     }
     let cc_of = |n: &str| {
-        if internal.contains(n) {
+        if internal.contains(n) || is_tail_fn(isa.triple(), &st.funcs[n]) {
             CallConv::Tail
         } else {
             cc
@@ -1301,7 +1316,7 @@ pub fn lower_module<'a>(
                     cc,
                     tcfg: cfg,
                     internal: &internal,
-                    own_tail: internal.contains(n),
+                    own_tail: internal.contains(n) || is_tail_fn(isa.triple(), f),
                     wasm: false,
                     exn: None,
                     vars: std::mem::take(&mut scratch.vars),
@@ -1939,7 +1954,7 @@ pub fn lower_clif_wasm(
     let cc = CallConv::SystemV;
     let internal = internal_fns(ctx, st);
     let cc_of = |n: &str| {
-        if internal.contains(n) {
+        if internal.contains(n) || is_tail_fn(isa.triple(), &st.funcs[n]) {
             CallConv::Tail
         } else {
             cc
@@ -2083,7 +2098,7 @@ pub fn lower_clif_wasm(
                 cc,
                 tcfg,
                 internal: &internal,
-                own_tail: internal.contains(n),
+                own_tail: internal.contains(n) || is_tail_fn(isa.triple(), f),
                 wasm: true,
                 exn: None,
                 vars: std::mem::take(&mut scratch.vars),
@@ -5414,12 +5429,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let info = &self.st.calls[op];
         let fn_ty = info.fn_ty;
         let cc = match call.callee(ctx) {
-            CallOpCallable::Direct(id)
-                if self
-                    .internal
-                    .contains(&self.st.ident_to_sym[&id.to_string()]) =>
-            {
-                CallConv::Tail
+            CallOpCallable::Direct(id) => {
+                let sym = &self.st.ident_to_sym[&id.to_string()];
+                if self.internal.contains(sym)
+                    || self
+                        .st
+                        .funcs
+                        .get(sym)
+                        .is_some_and(|f| is_tail_fn(self.m.isa().triple(), f))
+                {
+                    CallConv::Tail
+                } else {
+                    self.cc
+                }
             }
             _ => self.cc,
         };

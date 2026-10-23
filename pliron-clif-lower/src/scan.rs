@@ -223,6 +223,7 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
                     nparams,
+                    tail_cc: false,
                 },
             );
             st.ident_to_sym.insert(name.clone(), name.clone());

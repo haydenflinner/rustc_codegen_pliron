@@ -663,6 +663,7 @@ fn declare_fn_sym(
             noalias: Vec::new(),
             nonnull: Vec::new(),
             nparams: 0,
+            tail_cc: false,
         },
     );
     op

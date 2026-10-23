@@ -1179,6 +1179,7 @@ mod tests {
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
                     nparams: 1,
+                    tail_cc: false,
                 },
             );
             // `llvm.constant` results -> st.consts entries.

@@ -1177,6 +1177,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
             _ => (false, None),
         };
+        // `extern "tail"` calls — including indirect ones through tail fn
+        // pointers, where the callee is unknown — use Cranelift's tail CC.
+        let cc = cc.or_else(|| {
+            fn_abi
+                .is_some_and(|a| a.conv == rustc_abi::CanonAbi::RustTail)
+                .then_some(cranelift_codegen::isa::CallConv::Tail)
+        });
         // Per-operand `captures(none)` deduced from the callee's MIR — the
         // same `DeducedParamAttrs` data rustc applies to `PassMode::Indirect`
         // params for LLVM. It is only sound for by-value (Indirect) params:

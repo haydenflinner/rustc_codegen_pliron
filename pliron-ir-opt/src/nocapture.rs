@@ -471,6 +471,7 @@ mod tests {
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
                     nparams: 2,
+                    tail_cc: false,
                 },
             );
         }

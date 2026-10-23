@@ -194,6 +194,7 @@ mod tests {
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
                     nparams: 1,
+                    tail_cc: false,
                 },
             );
             // `llvm.constant` args become `st.consts` entries; `live` and

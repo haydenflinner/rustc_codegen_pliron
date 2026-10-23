@@ -252,6 +252,11 @@ pub struct FuncInfo {
     /// Params rustc marks `nonnull`, by the same backend index as `frozen`.
     pub nonnull: Vec<usize>,
     pub nparams: usize,
+    /// The Rust ABI is `extern "tail"` (`FnAbi::conv == RustTail`): the
+    /// signature must use `CallConv::Tail` even when the function is not
+    /// local/internal (exported, imported, or address-taken), so callers
+    /// and `return_call` agree with its real ABI.
+    pub tail_cc: bool,
 }
 
 pub struct GlobalInfo {
@@ -904,6 +909,7 @@ mod tests {
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
                     nparams: 1,
+                    tail_cc: false,
                 },
             );
         }

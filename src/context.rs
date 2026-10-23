@@ -183,6 +183,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 noalias: Vec::new(),
                 nonnull: Vec::new(),
                 nparams: 0,
+                tail_cc: false,
             },
         );
         op
@@ -258,6 +259,7 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
             f.nounwind |= !fn_abi.can_unwind;
+            f.tail_cc |= fn_abi.conv == rustc_abi::CanonAbi::RustTail;
             (f.frozen, f.noalias, f.nonnull, f.nparams) = frozen_params(fn_abi);
         }
         if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
