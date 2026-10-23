@@ -460,6 +460,7 @@ pub fn val_umax(
     v: Value,
     g: &FxHashMap<Value, u64>,
     depth: u32,
+    budget: &std::cell::Cell<u32>,
 ) -> u64 {
     let v = func.dfg.resolve_aliases(v);
     let bits = func.dfg.value_type(v).bits().clamp(1, 64);
@@ -470,13 +471,16 @@ pub fn val_umax(
     if let Some(k) = iconst(func, v) {
         return m.min(k as u64 & (u64::MAX >> (64 - bits)));
     }
-    if depth == 0 {
+    // `budget` bounds total work: param recursion fans out over every
+    // incoming edge, so depth alone is exponential on wide joins.
+    if depth == 0 || budget.get() == 0 {
         return m;
     }
-    let um = |x: Value| val_umax(func, cfg, x, g, depth - 1);
+    budget.set(budget.get() - 1);
+    let um = |x: Value| val_umax(func, cfg, x, g, depth - 1, budget);
     let kv = |x: Value| iconst(func, x).filter(|&k| k >= 0).map(|k| k as u64);
     let d = match func.dfg.value_def(v) {
-        ValueDef::Param(b, idx) => param_umax(func, cfg, b, idx, g, depth - 1),
+        ValueDef::Param(b, idx) => param_umax(func, cfg, b, idx, g, depth - 1, budget),
         ValueDef::Result(i, _) => match func.dfg.insts[i] {
             InstructionData::Unary {
                 opcode: Opcode::Uextend,
@@ -511,6 +515,7 @@ fn param_umax(
     idx: usize,
     g: &FxHashMap<Value, u64>,
     depth: u32,
+    budget: &std::cell::Cell<u32>,
 ) -> Option<u64> {
     let mut best = 0u64;
     let mut any = false;
@@ -544,7 +549,7 @@ fn param_umax(
             }
             None => g,
         };
-        best = best.max(val_umax(func, cfg, a, gr, depth));
+        best = best.max(val_umax(func, cfg, a, gr, depth, budget));
         any = true;
     }
     any.then_some(best)
@@ -640,9 +645,10 @@ pub fn trip_max(
         return None;
     }
     let g = dom_guards(func, cfg, dt, h);
+    let budget = std::cell::Cell::new(256);
     let span = match sub_cancel(func, cfg, bound, iv0) {
-        Some(x) => val_umax(func, cfg, x, &g, 8),
-        None if iconst(func, iv0) == Some(0) => val_umax(func, cfg, bound, &g, 8),
+        Some(x) => val_umax(func, cfg, x, &g, 8, &budget),
+        None if iconst(func, iv0) == Some(0) => val_umax(func, cfg, bound, &g, 8, &budget),
         None => return None,
     };
     (span / step as u64).checked_add(u64::from(le) + 1)
