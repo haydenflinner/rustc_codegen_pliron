@@ -34,7 +34,12 @@ transfer arg `a` → param `p`, it records `a -> p` in `steal` when:
 - `p`'s live range outlives `a`'s (`a.end <= p.end`), so `p`'s local
   cannot be recycled while `a` still needs it, and
 - no use of `p` follows `a`'s def in that block — instruction args
-  and all terminator args (every edge, including `cond`).
+  and all terminator args (every edge, including `cond`), and
+- `p` is not live-out of the block: `a`'s write lands before the
+  branch and dominates every outgoing edge, but only the edge to
+  `p`'s own block rewrites the local — a sibling edge reading the
+  old `p` would observe the clobber (br_table to a shared
+  loop-header block vs a `)`-handler edge that still reads `i`).
 
 In `allocate`, a single-typed value with a steal candidate whose
 param's local is still owned by `p`'s range (`owner` map) takes that
@@ -42,9 +47,10 @@ local outright; nothing is pushed to `expiring` for the slot since
 `p`'s range continues to own it.
 
 Soundness: `p`'s uses outside this block can only be reached through
-edges into `p`'s block, which rewrite the local, so writing it early
-inside the block is unobservable; within the block the no-late-use
-scan rules out a stale read. This is the loop-carried update case:
+edges into `p`'s block, which rewrite the local — and the live-out
+check rejects any `p` another successor edge could still read —
+so writing it early inside the block is unobservable; within the
+block the no-late-use scan rules out a stale read. This is the loop-carried update case:
 `i+1` computed in the latch takes `i`'s local before the backedge,
 turning `get i; iadd; tee tmp; set i` into `get i; iadd; set i` —
 LLVM's destructive-update shape.

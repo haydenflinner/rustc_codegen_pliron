@@ -477,6 +477,11 @@ impl<'a> Context<'a> {
                 hit
             };
             let ranges = &self.ranges;
+            // PLIRON: hoisted field refs — the closure below must not
+            // capture `self` (edition-2018 whole-`self` capture would
+            // fight the `&mut self.steal` argument).
+            let bel = &self.block_end_live[block];
+            let cbs = &self.cross_blocks;
             let check = |t: &BlockTarget, steal: &mut HashMap<Value, Value>| {
                 let params = &body.blocks[t.block].params;
                 for (i, &arg) in t.args.iter().enumerate() {
@@ -506,6 +511,29 @@ impl<'a> Context<'a> {
                         continue;
                     }
                     if used_after(pos, p) {
+                        continue;
+                    }
+                    // PLIRON: `a`'s write lands before the branch, so
+                    // it dominates every outgoing edge — but only the
+                    // edge to `t.block` rewrites `p`'s local. If `p` is
+                    // live-out of this block, some sibling edge can
+                    // still observe `p`'s old value after the clobber,
+                    // so the steal is unsound. (`t.block` itself can't
+                    // be the witness: `p` is its param, i.e. redefined
+                    // at entry, so it is never live-in there.)
+                    let mut pr = p;
+                    if let ValueDef::PickOutput(v2, _, _) = body.values[pr] {
+                        pr = v2;
+                    }
+                    pr = body.resolve_alias(pr);
+                    let p_liveout = bel.iter().any(|id| {
+                        let mut lv = cbs.value(CrossBlockId::new(id));
+                        if let ValueDef::PickOutput(v2, _, _) = body.values[lv] {
+                            lv = v2;
+                        }
+                        body.resolve_alias(lv) == pr
+                    });
+                    if p_liveout {
                         continue;
                     }
                     steal.insert(a, p);

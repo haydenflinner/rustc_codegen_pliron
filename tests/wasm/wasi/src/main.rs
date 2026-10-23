@@ -87,7 +87,44 @@ fn main() {
         let bb = std::hint::black_box(b"abcde".as_slice());
         check("slice lt", b < bb && bb > b);
     }
+    // localify steal regression (pulldown-cmark miscompile): the
+    // br_table below sends two edges to the loop-header block with
+    // different arg tuples and a third to the `)` handler, which still
+    // reads the pre-increment `i` on its exit edge. Letting the shared
+    // `i+1` arg steal `i`'s local clobbers the value the `)` exit reads
+    // (scan returned i+1 on break).
+    check(
+        "br_table edge args",
+        scan(std::hint::black_box(b"(x))y".as_slice())) == (3, 0),
+    );
+    check(
+        "br_table edge args 2",
+        scan(std::hint::black_box(b"(x)".as_slice())) == (3, 0)
+            && scan(std::hint::black_box(b"u) b".as_slice())) == (1, 0),
+    );
     eprintln!("wasi std OK");
+}
+
+#[inline(never)]
+fn scan(bytes: &[u8]) -> (usize, u32) {
+    let mut i = 0usize;
+    let mut nest = 0u32;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x0..=0x20 => break,
+            b'(' => nest += 1,
+            b')' => {
+                if nest == 0 {
+                    break;
+                }
+                nest -= 1;
+            }
+            b'\\' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (i, nest)
 }
 
 unsafe extern "C" fn vsum(n: i32, mut ap: ...) -> f64 {
