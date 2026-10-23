@@ -478,7 +478,13 @@ impl World {
             regions,
             args,
             seed,
-            stack_fill: 0,
+            // `PLIRON_DIFFCHECK_FILL=<byte>`: fill fresh frames with it
+            // from the start — a step that introduces an uninitialized
+            // read is invisible under the zero fill when the right value
+            // happens to be 0.
+            stack_fill: crate::config::env_get("PLIRON_DIFFCHECK_FILL")
+                .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0),
             nonnull: facts.nonnull.cloned().unwrap_or_default(),
         }
     }
