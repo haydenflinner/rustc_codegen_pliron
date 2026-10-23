@@ -2,6 +2,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
 
+mod arrayvec;
 mod chars_alpha;
 mod chars_ascii;
 mod chars_mixed;
@@ -18,6 +19,7 @@ mod sieve;
 mod sortw;
 mod strwork;
 mod tokenize;
+mod varint;
 
 // Crash probe (windows): vectored handler prints faulting RIP before dying.
 #[cfg(windows)]
@@ -165,6 +167,13 @@ fn install_crash_probe() {
 #[cfg(not(windows))]
 fn install_crash_probe() {}
 
+fn bench_arrayvec(c: &mut Criterion) {
+    c.bench_function("arrayvec", |b| {
+        let v = arrayvec::setup();
+        b.iter(|| arrayvec::run(black_box(&v)))
+    });
+}
+
 fn bench_chars_alpha(c: &mut Criterion) {
     install_crash_probe();
     c.bench_function("chars_alpha", |b| {
@@ -269,15 +278,30 @@ fn bench_tokenize(c: &mut Criterion) {
     });
 }
 
+fn bench_varint(c: &mut Criterion) {
+    c.bench_function("varint", |b| {
+        let buf = varint::setup();
+        b.iter(|| varint::run(black_box(&buf)))
+    });
+}
+
+fn bench_varint_postcard(c: &mut Criterion) {
+    c.bench_function("varint_postcard", |b| {
+        let buf = varint::setup_postcard();
+        b.iter(|| varint::run_postcard(black_box(&buf)))
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = bench_chars_alpha, bench_chars_ascii, bench_chars_mixed,
+    targets = bench_arrayvec, bench_chars_alpha, bench_chars_ascii, bench_chars_mixed,
         bench_contains_rng, bench_eqbug, bench_fib, bench_hashmap, bench_hmget,
         bench_iterw, bench_matmul, bench_nbody, bench_parse_only, bench_sieve,
-        bench_sortw, bench_strwork, bench_tokenize
+        bench_sortw, bench_strwork, bench_tokenize, bench_varint,
+        bench_varint_postcard
 }
 
 criterion_main!(benches);

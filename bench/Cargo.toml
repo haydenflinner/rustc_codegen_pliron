@@ -11,6 +11,9 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false }
+# varint_postcard kernel; same versions as the backend's own (src/lto.rs).
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
 
 [[bench]]
 name = "kernels"

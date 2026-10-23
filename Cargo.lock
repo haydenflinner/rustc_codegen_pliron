@@ -1214,6 +1214,8 @@ name = "pliron-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
