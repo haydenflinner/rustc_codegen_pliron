@@ -203,11 +203,17 @@ where
             }
         }
         let id = out.add_symbol(new);
+        let n = &mut out.symbol_mut(id).name;
         if keep_raw {
-            let n = &mut out.symbol_mut(id).name;
             if n.len() == raw.len() + 1 && n.ends_with(raw) {
                 n.remove(0);
             }
+        } else if macho && n.as_slice() == name && name.len() + 1 == raw.len() {
+            // `add_symbol` only prefixes Text/Data/Tls symbols: an asm
+            // reference to an undefined C symbol (`bl _malloc`, kind
+            // Unknown) kept the stripped `malloc` and failed to link
+            // (tests/ui/allocator/regression-abort-on-free-issue-150898).
+            *n = raw.to_vec();
         }
         syms.insert(sym.index(), id);
     }

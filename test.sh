@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   asmcfi debuginfo
+#   asmcfi asmextern debuginfo
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
@@ -379,6 +379,13 @@ t_asmcfi() {
   rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
 }
 
+t_asmextern() {
+  # asm! calling C by raw Mach-O name (`bl _malloc`): the undefined
+  # reference must keep its `_` through objmerge's splice.
+  [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || return 0
+  rustc $BE --edition 2021 -Copt-level=1 tests/asmextern/main.rs -o $out/asmextern$exe && $out/asmextern$exe
+}
+
 t_debuginfo() {
   # -g: line tables and inlined frames, checked through std's own panic
   # backtrace (it reads the DWARF) at O0 and O2; variables at O0 (lldb);
@@ -734,6 +741,7 @@ want asmlabels && t_asmlabels
 want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want asmcfi && t_asmcfi
+want asmextern && t_asmextern
 want debuginfo && t_debuginfo
 want facts && t_facts
 want loopalign && t_loopalign
