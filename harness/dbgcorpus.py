@@ -1,7 +1,8 @@
 #!/usr/bin/env -S python3 -I
 """lldb on optimized and unoptimized code: stock rustc vs pliron, variable by variable.
 
-  harness/dbgcorpus.py [--opt 0,2] [--only a,b] [--lldb PATH] [--be DYLIB] [-v]
+  harness/dbgcorpus.py [--opt 0,2] [--only a,b] [--lldb PATH] [--be DYLIB]
+                       [--target TRIPLE] [-v]
 
 Each program in harness/dbgcorpus/*.rs is built with `-g -Copt-level=N` by
 stock rustc and by pliron, then run under lldb (harness/dbgcorpus/drive.py)
@@ -37,6 +38,8 @@ def build(a, prog, side, opt, d):
            os.path.join(SRC, prog + ".rs"), "-o", exe]
     if side == "pliron":
         cmd.insert(4, f"-Zcodegen-backend={a.be}")
+    if a.target:
+        cmd += ["--target", a.target]
     env = dict(os.environ, RUSTC_ICE=os.path.join(d, "ices"))
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True)
     open(os.path.join(d, prog + ".build.log"), "w").write(r.stdout)
@@ -113,6 +116,8 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--lldb", default=XCODE_LLDB if os.path.exists(XCODE_LLDB) else (shutil.which("lldb") or "lldb"))
     ap.add_argument("--be", default=os.path.join(ROOT, "target", "debug", "librustc_codegen_pliron.dylib"))
+    ap.add_argument("--target", default="", help="e.g. x86_64-apple-darwin (runs under Rosetta; "
+                    "the dylib must be built with cranelift-codegen's `x86` feature)")
     ap.add_argument("-v", action="store_true", help="print every difference")
     a = ap.parse_args()
     sysroot = subprocess.run(["rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot"],
@@ -129,7 +134,7 @@ def main():
         for prog in progs:
             res = {}
             for side in ("stock", "pliron"):
-                d = os.path.join(OUT, f"O{opt}", side)
+                d = os.path.join(OUT, a.target or "host", f"O{opt}", side)
                 os.makedirs(d, exist_ok=True)
                 exe = build(a, prog, side, opt, d)
                 res[side] = run(a, prog, exe, d) if exe else None
@@ -147,7 +152,7 @@ def main():
                     print("    " + x)
         print(f"{'total':14} " + " ".join(f"{tot[k]:>7}" for k in keys))
         summary[f"O{opt}"] = tot
-    json.dump(summary, open(os.path.join(OUT, "summary.json"), "w"), indent=1)
+    json.dump(summary, open(os.path.join(OUT, a.target or "host", "summary.json"), "w"), indent=1)
 
 
 if __name__ == "__main__":
