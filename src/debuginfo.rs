@@ -168,6 +168,9 @@ impl<'tcx> CodegenCx<'tcx> {
         span: Span,
     ) -> u32 {
         let (file, line, _) = self.dbg_pos(span.lo());
+        // A layout error ("too big for the target architecture") must carry
+        // the variable's span, as with LLVM: `dbg_type` asks spanless.
+        let _ = self.spanned_layout_of(ty, span);
         let ty = self.dbg_type(ty);
         let arg = match kind {
             VariableKind::ArgumentVariable(i) => i as u32,
