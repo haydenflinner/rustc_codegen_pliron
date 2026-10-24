@@ -1,11 +1,10 @@
 //! rustc side of `-g`: turns the scopes and spans `rustc_codegen_ssa`
 //! hands the Builder into the per-CGU tables of `pliron_ir_opt::dbg`
-//! (see there for the pipeline). `DIScope` is a subprogram id and
-//! `DILocation` a location id; lexical blocks collapse into their
-//! function, which line tables and inlined frames don't need.
+//! (see there for the pipeline). `DIScope` is a scope id — a
+//! (subprogram, lexical block) pair — and `DILocation` a location id.
 
 use pliron::value::Value;
-use pliron_ir_opt::dbg::{DbgInfo, Decl, Field, Loc, Sub, Type, Var};
+use pliron_ir_opt::dbg::{DbgInfo, Decl, Field, Loc, Sub, Type, Var, Variant};
 use rustc_abi::{FieldIdx, Size, TagEncoding, Variants};
 use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind;
@@ -103,19 +102,27 @@ impl<'tcx> CodegenCx<'tcx> {
             self.dbg_insts.borrow_mut().insert(instance, s);
             s
         });
+        let mut st = self.st.borrow_mut();
+        let d = st.dbg.as_mut().unwrap();
         if defined {
-            let mut st = self.st.borrow_mut();
-            let d = st.dbg.as_mut().unwrap();
             let sym = d.subs[s as usize].linkage.clone();
             d.fn_sub.insert(sym, s);
         }
-        s
+        d.scope(s, 0)
+    }
+
+    /// `dbg_create_lexical_block`: a block in `parent` (a scope id).
+    pub fn dbg_block(&self, parent: u32) -> u32 {
+        self.st.borrow_mut().dbg.as_mut().unwrap().new_block(parent)
     }
 
     pub fn dbg_loc(&self, scope: u32, inlined_at: Option<u32>, span: Span) -> u32 {
         let (file, line, col) = self.dbg_pos(span.lo());
-        let l = Loc { file, line, col, scope, inlined_at: inlined_at.unwrap_or(0) };
-        self.st.borrow_mut().dbg.as_mut().unwrap().loc(l)
+        let mut st = self.st.borrow_mut();
+        let d = st.dbg.as_mut().unwrap();
+        let (sub, block) = d.scopes[scope as usize];
+        let l = Loc { file, line, col, scope: sub, inlined_at: inlined_at.unwrap_or(0), block };
+        d.loc(l)
     }
 
     pub fn dbg_var(
@@ -134,7 +141,8 @@ impl<'tcx> CodegenCx<'tcx> {
         };
         let mut st = self.st.borrow_mut();
         let d = st.dbg.as_mut().unwrap();
-        d.vars.push(Var { name: name.to_string(), ty, scope, arg, file, line });
+        let (scope, block) = d.scopes[scope as usize];
+        d.vars.push(Var { name: name.to_string(), ty, scope, block, arg, file, line });
         d.vars.len() as u32 - 1
     }
 
@@ -186,8 +194,50 @@ impl<'tcx> CodegenCx<'tcx> {
         };
         self.dbg_types.borrow_mut().insert(ty, id);
         let t = self.dbg_type_desc(ty, l, name, size);
-        self.st.borrow_mut().dbg.as_mut().unwrap().types[id as usize] = t;
+        let tparams = if matches!(t, Type::Struct { .. } | Type::Enum { .. }) {
+            self.dbg_tparams(ty)
+        } else {
+            Vec::new()
+        };
+        let mut st = self.st.borrow_mut();
+        let d = st.dbg.as_mut().unwrap();
+        d.types[id as usize] = t;
+        if !tparams.is_empty() {
+            d.tparams.insert(id, tparams);
+        }
         id
+    }
+
+    /// `ty`'s type parameters, named as declared (rustc_codegen_llvm's
+    /// `build_generic_type_param_di_nodes`): lifetimes and consts left out.
+    fn dbg_tparams(&self, ty: Ty<'tcx>) -> Vec<(String, u32)> {
+        let ty::Adt(def, args) = *ty.kind() else {
+            return Vec::new();
+        };
+        if args.types().next().is_none() {
+            return Vec::new();
+        }
+        let tcx = self.tcx;
+        let generics = tcx.generics_of(def.did());
+        let mut names = Vec::new();
+        let mut g = Some(generics);
+        // Parent generics come first in `args`.
+        let mut chain = Vec::new();
+        while let Some(x) = g {
+            chain.push(x);
+            g = x.parent.map(|p| tcx.generics_of(p));
+        }
+        for x in chain.into_iter().rev() {
+            names.extend(x.own_params.iter().map(|p| p.name.to_string()));
+        }
+        args.iter()
+            .zip(names)
+            .filter_map(|(a, n)| {
+                let t = a.as_type()?;
+                let t = tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), Unnormalized::new_wip(t));
+                Some((n, self.dbg_type(t)))
+            })
+            .collect()
     }
 
     fn dbg_type_desc(
@@ -277,6 +327,49 @@ impl<'tcx> CodegenCx<'tcx> {
                             Some(f) if !tuple => f.name.to_string(),
                             _ => format!("__{i}"),
                         }))
+                    }
+                    Variants::Multiple { tag, tag_encoding, tag_field, variants } => {
+                        let tag_size = tag.primitive().size(self).bytes();
+                        let mask = if tag_size >= 16 { u128::MAX } else { (1u128 << (tag_size * 8)) - 1 };
+                        let vs = variants
+                            .indices()
+                            .map(|vi| {
+                                let discr = match tag_encoding {
+                                    TagEncoding::Direct => {
+                                        ty.discriminant_for_variant(tcx, vi).map(|d| (d.val & mask) as u64)
+                                    }
+                                    TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                                        let inr = vi >= niche_variants.start && vi <= niche_variants.last;
+                                        (vi != *untagged_variant && inr).then(|| {
+                                            let rel = (vi.as_u32() - niche_variants.start.as_u32()) as u128;
+                                            (rel.wrapping_add(*niche_start) & mask) as u64
+                                        })
+                                    }
+                                };
+                                let v = def.variant(vi);
+                                let vl = l.for_variant(self, vi);
+                                let tuple = v.ctor_kind() == Some(rustc_hir::def::CtorKind::Fn);
+                                let fields = (0..vl.fields.count())
+                                    .map(|i| Field {
+                                        name: match v.fields.get(FieldIdx::from_usize(i)) {
+                                            Some(f) if !tuple => f.name.to_string(),
+                                            _ => format!("__{i}"),
+                                        },
+                                        ty: self.dbg_type(vl.field(self, i).ty),
+                                        offset: vl.fields.offset(i).bytes() as u32,
+                                    })
+                                    .collect();
+                                Variant { name: v.name.to_string(), discr, fields }
+                            })
+                            .collect();
+                        let tag_off = l.fields.offset(tag_field.as_usize()).bytes() as u32;
+                        Type::Enum {
+                            name,
+                            size,
+                            align: l.align.abi.bytes() as u32,
+                            tag: (tag_off, tag_size as u32),
+                            variants: vs,
+                        }
                     }
                     _ => Type::Opaque { name, size },
                 }

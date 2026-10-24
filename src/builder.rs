@@ -1467,7 +1467,7 @@ impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         self.cx.dbg_scope_fn(instance, llfn.is_some())
     }
     fn dbg_create_lexical_block(&mut self, _pos: rustc_span::BytePos, parent: u32) -> u32 {
-        parent
+        self.cx.dbg_block(parent)
     }
     fn dbg_location_clone_with_discriminator(&mut self, loc: u32, _d: u32) -> Option<u32> {
         Some(loc)

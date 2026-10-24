@@ -126,6 +126,9 @@ struct Inst {
     kids: Vec<(InstKey, Inst)>,
     /// Its `DW_TAG_inlined_subroutine`, once written.
     die: Option<UnitEntryId>,
+    /// This instance's lexical blocks with code: their ranges (a block's
+    /// include its sub-blocks') and, once written, their DIEs.
+    blocks: FxHashMap<u32, (Vec<(u32, u32)>, Option<UnitEntryId>)>,
 }
 
 impl Inst {
@@ -147,6 +150,37 @@ impl Inst {
         self.kids[i].1.add(rest, s, e);
     }
 
+    fn find_mut(&mut self, path: &[InstKey]) -> Option<&mut Inst> {
+        let Some((k, rest)) = path.split_first() else {
+            return Some(self);
+        };
+        self.kids.iter_mut().find(|(kk, _)| kk == k)?.1.find_mut(rest)
+    }
+
+    /// Code `[s, e)` runs in block `b` (and so in each enclosing block).
+    fn add_block(&mut self, d: &DbgInfo, mut b: u32, s: u32, e: u32) {
+        while b != 0 {
+            let rs = &mut self.blocks.entry(b).or_default().0;
+            match rs.last_mut() {
+                Some(r) if r.1 == s => r.1 = e,
+                _ => rs.push((s, e)),
+            }
+            b = d.blocks[b as usize].parent;
+        }
+    }
+
+    /// The DIE variables of block `b` go in: the innermost enclosing
+    /// block that has code, else the instance itself.
+    fn block_die(&self, d: &DbgInfo, mut b: u32, inst_die: UnitEntryId) -> UnitEntryId {
+        while b != 0 {
+            if let Some((_, Some(die))) = self.blocks.get(&b) {
+                return *die;
+            }
+            b = d.blocks[b as usize].parent;
+        }
+        inst_die
+    }
+
     fn find(&self, path: &[InstKey]) -> Option<&Inst> {
         let Some((k, rest)) = path.split_first() else {
             return Some(self);
@@ -162,6 +196,7 @@ struct Cx<'a> {
     dirs: FxHashMap<String, DirectoryId>,
     abstract_subs: FxHashMap<u32, UnitEntryId>,
     types: FxHashMap<u32, UnitEntryId>,
+    tag_types: FxHashMap<u32, UnitEntryId>,
 }
 
 impl Cx<'_> {
@@ -179,7 +214,7 @@ impl Cx<'_> {
             Type::Base { .. } => gimli::DW_TAG_base_type,
             Type::Ptr { .. } => gimli::DW_TAG_pointer_type,
             Type::Struct { union: true, .. } => gimli::DW_TAG_union_type,
-            Type::Struct { .. } | Type::Opaque { .. } => gimli::DW_TAG_structure_type,
+            Type::Struct { .. } | Type::Opaque { .. } | Type::Enum { .. } => gimli::DW_TAG_structure_type,
             Type::Array { .. } => gimli::DW_TAG_array_type,
             Type::CEnum { .. } => gimli::DW_TAG_enumeration_type,
         };
@@ -209,16 +244,7 @@ impl Cx<'_> {
                 e.set(gimli::DW_AT_name, str(&name));
                 e.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size as u64));
                 e.set(gimli::DW_AT_alignment, AttributeValue::Udata(align as u64));
-                for f in fields {
-                    let ft = self.ty(f.ty);
-                    let m = self.dw.unit.add(die, gimli::DW_TAG_member);
-                    let e = self.dw.unit.get_mut(m);
-                    e.set(gimli::DW_AT_name, str(&f.name));
-                    if let Some(ft) = ft {
-                        e.set(gimli::DW_AT_type, AttributeValue::UnitRef(ft));
-                    }
-                    e.set(gimli::DW_AT_data_member_location, AttributeValue::Udata(f.offset as u64));
-                }
+                self.members(die, &fields);
             }
             Type::Array { name, elem, len, size } => {
                 let et = self.ty(elem);
@@ -243,13 +269,99 @@ impl Cx<'_> {
                     e.set(gimli::DW_AT_const_value, v);
                 }
             }
+            Type::Enum { name, size, align, tag, variants } => {
+                let e = self.dw.unit.get_mut(die);
+                e.set(gimli::DW_AT_name, str(&name));
+                e.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size as u64));
+                e.set(gimli::DW_AT_alignment, AttributeValue::Udata(align as u64));
+                let vp = self.dw.unit.add(die, gimli::DW_TAG_variant_part);
+                let tt = self.tag_type(tag.1);
+                let m = self.dw.unit.add(vp, gimli::DW_TAG_member);
+                {
+                    let e = self.dw.unit.get_mut(m);
+                    e.set(gimli::DW_AT_type, AttributeValue::UnitRef(tt));
+                    e.set(gimli::DW_AT_data_member_location, AttributeValue::Udata(tag.0 as u64));
+                    e.set(gimli::DW_AT_artificial, AttributeValue::Flag(true));
+                }
+                self.dw.unit.get_mut(vp).set(gimli::DW_AT_discr, AttributeValue::UnitRef(m));
+                for v in variants {
+                    // The variant's struct is nested in the enum, so a
+                    // debugger names it `Enum::Variant`.
+                    let st = self.dw.unit.add(die, gimli::DW_TAG_structure_type);
+                    {
+                        let e = self.dw.unit.get_mut(st);
+                        e.set(gimli::DW_AT_name, str(&v.name));
+                        e.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size as u64));
+                        e.set(gimli::DW_AT_alignment, AttributeValue::Udata(align as u64));
+                    }
+                    self.members(st, &v.fields);
+                    // LLVM puts an enum's type parameters on its variants.
+                    self.tparams(st, t);
+                    let vd = self.dw.unit.add(vp, gimli::DW_TAG_variant);
+                    if let Some(d) = v.discr {
+                        self.dw.unit.get_mut(vd).set(gimli::DW_AT_discr_value, AttributeValue::Udata(d));
+                    }
+                    let vm = self.dw.unit.add(vd, gimli::DW_TAG_member);
+                    let e = self.dw.unit.get_mut(vm);
+                    e.set(gimli::DW_AT_name, str(&v.name));
+                    e.set(gimli::DW_AT_type, AttributeValue::UnitRef(st));
+                    e.set(gimli::DW_AT_data_member_location, AttributeValue::Udata(0));
+                }
+            }
             Type::Opaque { name, size } => {
                 let e = self.dw.unit.get_mut(die);
                 e.set(gimli::DW_AT_name, str(&name));
                 e.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size as u64));
             }
         }
+        if !matches!(self.d.types[t as usize], Type::Enum { .. }) {
+            self.tparams(die, t);
+        }
         Some(die)
+    }
+
+    fn members(&mut self, die: UnitEntryId, fields: &[pliron_ir_opt::dbg::Field]) {
+        for f in fields {
+            let ft = self.ty(f.ty);
+            let m = self.dw.unit.add(die, gimli::DW_TAG_member);
+            let e = self.dw.unit.get_mut(m);
+            e.set(gimli::DW_AT_name, AttributeValue::String(f.name.as_bytes().to_vec()));
+            if let Some(ft) = ft {
+                e.set(gimli::DW_AT_type, AttributeValue::UnitRef(ft));
+            }
+            e.set(gimli::DW_AT_data_member_location, AttributeValue::Udata(f.offset as u64));
+        }
+    }
+
+    /// Type `t`'s `DW_TAG_template_type_parameter`s, under `die`.
+    fn tparams(&mut self, die: UnitEntryId, t: u32) {
+        let Some(ps) = self.d.tparams.get(&t) else {
+            return;
+        };
+        for (n, pt) in ps.clone() {
+            let pt = self.ty(pt);
+            let p = self.dw.unit.add(die, gimli::DW_TAG_template_type_parameter);
+            let e = self.dw.unit.get_mut(p);
+            e.set(gimli::DW_AT_name, AttributeValue::String(n.into_bytes()));
+            if let Some(pt) = pt {
+                e.set(gimli::DW_AT_type, AttributeValue::UnitRef(pt));
+            }
+        }
+    }
+
+    /// An unsigned base type of `size` bytes, for enum tags.
+    fn tag_type(&mut self, size: u32) -> UnitEntryId {
+        if let Some(&e) = self.tag_types.get(&size) {
+            return e;
+        }
+        let root = self.dw.unit.root();
+        let die = self.dw.unit.add(root, gimli::DW_TAG_base_type);
+        let e = self.dw.unit.get_mut(die);
+        e.set(gimli::DW_AT_name, AttributeValue::String(format!("u{}", size * 8).into_bytes()));
+        e.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size as u64));
+        e.set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
+        self.tag_types.insert(size, die);
+        die
     }
 
     fn file(&mut self, f: u32) -> FileId {
@@ -347,7 +459,7 @@ impl Cx<'_> {
     /// The DIE a variable declared at `loc` belongs under: the subprogram
     /// `die` or one of its inlined instances; `None` when `loc` belongs to
     /// another function or to an instance with no code.
-    fn var_parent(&self, die: UnitEntryId, sub: u32, tree: &Inst, loc: u32) -> Option<UnitEntryId> {
+    fn var_parent(&self, die: UnitEntryId, sub: u32, tree: &Inst, loc: u32, block: u32) -> Option<UnitEntryId> {
         let mut path = Vec::new();
         let mut x = self.d.locs[loc as usize];
         while x.inlined_at != 0 {
@@ -358,7 +470,29 @@ impl Cx<'_> {
             return None;
         }
         path.reverse();
-        if path.is_empty() { Some(die) } else { tree.find(&path).and_then(|i| i.die) }
+        let i = tree.find(&path)?;
+        let idie = if path.is_empty() { die } else { i.die? };
+        Some(i.block_die(self.d, block, idie))
+    }
+
+    /// The `DW_TAG_lexical_block`s of `inst` (whose DIE is `die`) and of
+    /// every instance inlined into it, each under its enclosing block.
+    fn blocks(&mut self, die: UnitEntryId, sym: usize, inst: &mut Inst) {
+        let mut bs: Vec<u32> = inst.blocks.keys().copied().collect();
+        // Parents before children: a parent's id is always smaller.
+        bs.sort_unstable();
+        for b in bs {
+            let parent = inst.block_die(self.d, self.d.blocks[b as usize].parent, die);
+            let bd = self.dw.unit.add(parent, gimli::DW_TAG_lexical_block);
+            let rs = inst.blocks[&b].0.clone();
+            self.ranges_attr(bd, sym, &rs);
+            inst.blocks.get_mut(&b).unwrap().1 = Some(bd);
+        }
+        for (_, k) in &mut inst.kids {
+            if let Some(kd) = k.die {
+                self.blocks(kd, sym, k);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -378,7 +512,8 @@ impl Cx<'_> {
         for &(g, fp_off) in vars {
             for &di in &self.d.groups[g as usize] {
                 let decl = &self.d.decls[di as usize];
-                let Some(parent) = self.var_parent(die, sub, tree, decl.loc) else {
+                let vb = self.d.vars[decl.var as usize].block;
+                let Some(parent) = self.var_parent(die, sub, tree, decl.loc, vb) else {
                     continue;
                 };
                 if !seen.insert((parent, decl.var)) {
@@ -407,7 +542,8 @@ impl Cx<'_> {
                 let Some(&pc) = tab.list.get(l as usize) else {
                     continue;
                 };
-                let Some(parent) = self.var_parent(die, sub, tree, pc.loc) else {
+                let vb = self.d.vars[pc.var as usize].block;
+                let Some(parent) = self.var_parent(die, sub, tree, pc.loc, vb) else {
                     continue;
                 };
                 if seen.contains(&(parent, pc.var)) {
@@ -579,6 +715,7 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
         dirs: FxHashMap::default(),
         abstract_subs: FxHashMap::default(),
         types: FxHashMap::default(),
+        tag_types: FxHashMap::default(),
     };
     let root = cx.dw.unit.root();
     {
@@ -657,6 +794,11 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
             }
             path.reverse();
             tree.add(&path, s, e);
+            if loc.block != 0
+                && let Some(i) = tree.find_mut(&path)
+            {
+                i.add_block(d, loc.block, s, e);
+            }
             let key = (loc.file, loc.line, loc.col);
             if key != cur || prologue {
                 let fid = cx.file(loc.file);
@@ -674,6 +816,7 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
         }
         cx.dw.unit.line_program.end_sequence(f.size as u64);
         cx.inlined(die, k, &mut tree.kids);
+        cx.blocks(die, k, &mut tree);
         let cs: Vec<(u32, [(u32, u32, ValLoc); 1])> = sub_consts
             .get(&sub)
             .map_or(&[][..], |v| &v[..])

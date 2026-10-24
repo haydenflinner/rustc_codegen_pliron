@@ -40,6 +40,19 @@ fn sum(v: &[u32], k: u32) -> u32 {
     acc
 }
 
+/// Data-carrying enums (`DW_TAG_variant_part`) and a shadowed name in a
+/// lexical block: lldb must show the inner `n`.
+#[inline(never)]
+fn shapes(n: u32) -> u32 {
+    let o: Option<u32> = Some(n + 1);
+    let r: Result<u8, i16> = Err(-9);
+    {
+        let n = n * 10;
+        sink(n); // L:shapes
+    }
+    o.unwrap_or(0) + r.unwrap_or(0) as u32
+}
+
 #[inline(never)]
 fn sink(x: u32) {
     std::hint::black_box(x);
@@ -50,7 +63,7 @@ fn main() {
     let p = Pair { a: std::env::args().count() as u32 + 4, b: -7 };
     let s = String::from("hi");
     let w = vec![7u8, 8];
-    println!("{} {} {}", s.len(), w.len(), sum(&v, p.a)); // L:main2
+    println!("{} {} {} {}", s.len(), w.len(), sum(&v, p.a), shapes(p.a)); // L:main2
     // Panics (index 6): the backtrace test.
     println!("{}", top(&v, p)); // L:main
 }

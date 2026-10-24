@@ -27,6 +27,17 @@ pub struct Loc {
     /// The function this position belongs to: a [`DbgInfo::subs`] index.
     pub scope: u32,
     pub inlined_at: u32,
+    /// The lexical block within `scope`: a [`DbgInfo::blocks`] index, 0 for
+    /// the function body itself.
+    pub block: u32,
+}
+
+/// A lexical block (`DW_TAG_lexical_block`): a `{ ... }` scope whose
+/// variables a debugger shows only while the pc is in its code.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Block {
+    /// The enclosing block; 0 = the function body.
+    pub parent: u32,
 }
 
 /// A function as debug info names it (`DW_TAG_subprogram`).
@@ -55,6 +66,19 @@ pub enum Type {
     CEnum { name: String, size: u32, signed: bool, variants: Vec<(String, i128)> },
     /// Anything not described yet: just a name and a size.
     Opaque { name: String, size: u32 },
+    /// Enum with data (LLVM's non-MSVC shape: a struct holding a
+    /// `DW_TAG_variant_part`). `tag`: the discriminant's (offset, size).
+    /// Each variant: its discriminant value (`None` for a niche layout's
+    /// untagged variant — the default) and its fields, at offsets from the
+    /// enum's start, as a struct named after the variant.
+    Enum { name: String, size: u32, align: u32, tag: (u32, u32), variants: Vec<Variant> },
+}
+
+#[derive(Clone, Debug)]
+pub struct Variant {
+    pub name: String,
+    pub discr: Option<u64>,
+    pub fields: Vec<Field>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +94,8 @@ pub struct Var {
     pub name: String,
     pub ty: u32,
     pub scope: u32,
+    /// Its lexical block ([`Loc::block`]).
+    pub block: u32,
     /// 1-based argument index; 0 for a local.
     pub arg: u32,
     pub file: u32,
@@ -134,11 +160,19 @@ pub struct DbgInfo {
     pub files: Vec<String>,
     file_ids: FxHashMap<String, u32>,
     pub subs: Vec<Sub>,
+    pub blocks: Vec<Block>,
+    /// The Builder's `DIScope`s: (subprogram, block) pairs.
+    pub scopes: Vec<(u32, u32)>,
+    scope_ids: FxHashMap<(u32, u32), u32>,
     pub locs: Vec<Loc>,
     loc_ids: FxHashMap<Loc, u32>,
     /// Defined function symbol → its own subprogram.
     pub fn_sub: FxHashMap<String, u32>,
     pub types: Vec<Type>,
+    /// A generic struct/enum type's type parameters (name, type id) —
+    /// `DW_TAG_template_type_parameter`s, which rust-lldb's formatters
+    /// read element types from (`HashMap<K, V>`, `Vec<(A, B)>`).
+    pub tparams: FxHashMap<u32, Vec<(String, u32)>>,
     pub vars: Vec<Var>,
     pub decls: Vec<Decl>,
     /// Alloca result → its decl group: the [`DbgInfo::groups`] index
@@ -167,6 +201,8 @@ impl DbgInfo {
             producer,
             files: vec![String::new()],
             subs: vec![Sub::default()],
+            blocks: vec![Block::default()],
+            scopes: vec![(0, 0)],
             locs: vec![Loc::default()],
             types: vec![Type::Opaque { name: "void".into(), size: 0 }],
             ..Default::default()
@@ -188,6 +224,22 @@ impl DbgInfo {
         self.subs.len() as u32 - 1
     }
 
+    /// The scope id of block `block` of subprogram `sub`.
+    pub fn scope(&mut self, sub: u32, block: u32) -> u32 {
+        *self.scope_ids.entry((sub, block)).or_insert_with(|| {
+            self.scopes.push((sub, block));
+            self.scopes.len() as u32 - 1
+        })
+    }
+
+    /// A new lexical block inside scope `parent`; returns its scope id.
+    pub fn new_block(&mut self, parent: u32) -> u32 {
+        let (sub, pb) = self.scopes[parent as usize];
+        self.blocks.push(Block { parent: pb });
+        let b = self.blocks.len() as u32 - 1;
+        self.scope(sub, b)
+    }
+
     pub fn loc(&mut self, l: Loc) -> u32 {
         if let Some(&i) = self.loc_ids.get(&l) {
             return i;
@@ -205,6 +257,7 @@ impl DbgInfo {
             | Type::Struct { size, .. }
             | Type::Array { size, .. }
             | Type::CEnum { size, .. }
+            | Type::Enum { size, .. }
             | Type::Opaque { size, .. } => *size,
             Type::Ptr { .. } => 8,
         }
