@@ -85,6 +85,13 @@ struct Access {
     flow: bool,
 }
 
+/// The function op an alloca sits in (debug output only).
+fn alloca_fn(ctx: &Context, alloca: Ptr<Operation>) -> Ptr<Operation> {
+    let b = alloca.deref(ctx).get_parent_block().unwrap();
+    let r = b.deref(ctx).get_parent_region().unwrap();
+    r.deref(ctx).get_parent_op()
+}
+
 struct Slice {
     off: u64,
     size: u64,
@@ -268,6 +275,17 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     if let Some(&(pad, _)) = st.invokes.get(op)
         && pad.deref(ctx).arguments(ctx).next().is_some()
     {
+        return false;
+    }
+    // Invokes are retaining unless `PLIRON_SROA_SYNC_INVOKE=1`: syncing a
+    // pinned slot across a `try_call` miscompiled cranelift-codegen's
+    // `constructor_simplify` (the 24-byte `ContextIter::next` result read
+    // back stale on the normal edge; sightglass-cli's
+    // `instrumented_component_validates` crashed). The IR after the split
+    // reads correct and the trampoline isn't involved; the defect is
+    // downstream of sroa and not yet found — see
+    // docs/history/2026-10-24-cranelift-sightglass.md.
+    if st.invokes.contains(op) && !crate::env_is("PLIRON_SROA_SYNC_INVOKE", "1") {
         return false;
     }
     let ai = idx - usize::from(!direct);
@@ -1058,6 +1076,33 @@ fn split(
     let syncable: Vec<bool> = (0..sl.len())
         .map(|i| sl[i].pinned && covered[i] && !bad[i])
         .collect();
+    // `PLIRON_SROA_DEBUG=<fn substr>`: the access list and slices of each
+    // split attempted in matching functions (eprintln, for bisect repros).
+    if let Some(want) = crate::env_get("PLIRON_SROA_DEBUG")
+        && crate::bisect_name(st, alloca_fn(ctx, alloca)).contains(want)
+    {
+        let kinds: Vec<String> = acc
+            .iter()
+            .map(|x| {
+                let k = match x.kind {
+                    Kind::Load => "load".to_string(),
+                    Kind::Store => "store".to_string(),
+                    Kind::Pin { idx, n } => format!("pin(arg{idx},n={n})"),
+                    Kind::Copy { n, .. } => format!("copy(n={n})"),
+                    Kind::Set { n, .. } => format!("set(n={n})"),
+                    _ => "other".to_string(),
+                };
+                let w = access_ty(ctx, x).map(|t| size_align(ctx, t).0).unwrap_or(0);
+                format!("{}@{}w{}{}", k, x.off, w, if x.flow { "F" } else { "" })
+            })
+            .collect();
+        let sls: Vec<String> = sl
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("[{}+{} pin={} sync={}]", s.off, s.size, s.pinned, syncable[i]))
+            .collect();
+        eprintln!("SROADBG size={size} acc={} slices={}", kinds.join(" "), sls.join(" "));
+    }
 
     let count = alloca.deref(ctx).get_operand(ctx, 0);
     let i8t: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();

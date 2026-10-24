@@ -420,6 +420,37 @@ pub fn run(ctx: &Context, st: &mut State) {
             )
         };
     }
+    // Delta-debugging a bad fact: `PLIRON_NOCAP_LOG=<file>` appends every
+    // function with a non-empty set (one symbol per line, per pid), and
+    // `PLIRON_NOCAP_ONLY=@<file>` keeps facts only for the listed symbols.
+    if let Some(log) = crate::env_get("PLIRON_NOCAP_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{log}.{}", std::process::id()))
+        {
+            for (s, set) in &nc {
+                if !set.is_empty() {
+                    let _ = writeln!(f, "{s}");
+                }
+            }
+        }
+    }
+    if let Some(only) = crate::env_get("PLIRON_NOCAP_ONLY")
+        && let Some(path) = only.strip_prefix('@')
+    {
+        let keep: FxHashSet<String> = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        for (s, set) in nc.iter_mut() {
+            if !keep.contains(s) {
+                set.clear();
+            }
+        }
+    }
     for (s, set) in &nc {
         let mut v: Vec<_> = set.iter().collect();
         v.sort();
