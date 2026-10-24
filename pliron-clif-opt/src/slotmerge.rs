@@ -1050,16 +1050,26 @@ pub fn run(
                 if !uses[s].iter().any(|&p| lo <= p && p <= hi) {
                     continue;
                 }
+                // A read after the span sees bytes any trip may have
+                // written: partial in-loop writes accumulate across trips
+                // (smallsort's bidirectional merge fills its scratch one
+                // element per trip at each end; the copy-back after the
+                // loop reads it all), so they are live across the back
+                // edge — unless a whole-slot write in or after the span
+                // dominates the read and supersedes them.
                 let fresh = reads[s].iter().chain(&via[s]).all(|&r| {
                     let rp = ipos[r];
-                    !(lo <= rp && rp <= hi)
-                        || writes[s].iter().any(|&w| {
-                            let wp = ipos[w];
-                            lo <= wp
-                                && wp <= hi
-                                && covers_slot(func, w, StackSlot::from_u32(s as u32))
-                                && dt.dominates(w, r, &func.layout)
-                        })
+                    if rp < lo {
+                        return true;
+                    }
+                    let after = rp > hi;
+                    writes[s].iter().any(|&w| {
+                        let wp = ipos[w];
+                        lo <= wp
+                            && (after || wp <= hi)
+                            && covers_slot(func, w, StackSlot::from_u32(s as u32))
+                            && dt.dominates(w, r, &func.layout)
+                    })
                 });
                 if !fresh {
                     e.0 = e.0.min(lo);

@@ -15,6 +15,15 @@
 //!   `compute_use_states`, sightglass-cli). Spans now close over any
 //!   span whose header lies inside them.
 //!
+//! - **Partial writes read after the loop** (2026-10-24). A slot whose only
+//!   in-loop accesses are writes looked dead across the back edge, since
+//!   only in-loop reads were checked. But each trip may write different
+//!   bytes, and a read after the loop sees all of them: core's
+//!   `small_sort_network` fills its scratch one element per trip at each
+//!   end and copies it back afterwards (wasm32 `sort_check` under
+//!   `PLIRON_SM_POISON`). Now a read after the span needs a whole-slot
+//!   write in or after it that dominates the read.
+//!
 //! Each case asserts the temp is NOT folded onto the long-lived slot.
 
 use cranelift_codegen::ir::{Function, InstructionData, StackSlot, Value};
@@ -106,4 +115,45 @@ fn nested_body_past_outer_latch_keeps_slot_live() {
     let long = slot_of(&f, Value::from_u32(4));
     let tmp = slot_of(&f, Value::from_u32(6));
     assert_ne!(long, tmp, "the inner-body temp was folded onto the outer-header slot:\n{}", f.display());
+}
+
+/// ss0 (16 bytes) gets one 8-byte half per trip and is only read after
+/// the loop; ss1 is a temp, fully rewritten (one 16-byte store) and read
+/// in each trip before that write. Folding
+/// ss1 onto ss0 lets trip 2's temp clobber trip 1's half.
+const ACCUM: &str = "function %t(i64) -> i64 {
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 16, align = 8
+block0(v0: i64):
+    v2 = stack_addr.i64 ss0
+    v20 = iconst.i64 0
+    jump block1(v20)
+block1(v3: i64):
+    v4 = stack_addr.i64 ss1
+    v30 = splat.i64x2 v3
+    store v30, v4
+    v5 = load.i64 v4
+    v6 = iconst.i64 3
+    v7 = ishl v3, v6
+    v8 = iadd v2, v7
+    store.i64 v5, v8
+    v9 = iconst.i64 1
+    v10 = iadd v3, v9
+    v11 = iconst.i64 2
+    v12 = icmp ult v10, v11
+    brif v12, block1(v10), block2
+block2:
+    v13 = load.i64 v2
+    v14 = load.i64 v2+8
+    v15 = iadd v13, v14
+    return v15
+}";
+
+#[test]
+fn partial_loop_writes_read_after_loop_keep_slot_live() {
+    let mut f = parse(ACCUM);
+    run(&mut f);
+    let acc = slot_of(&f, Value::from_u32(2));
+    let tmp = slot_of(&f, Value::from_u32(4));
+    assert_ne!(acc, tmp, "the loop temp was folded onto the accumulating slot:\n{}", f.display());
 }
