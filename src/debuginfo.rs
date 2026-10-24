@@ -303,6 +303,11 @@ impl<'tcx> CodegenCx<'tcx> {
         match *ty.kind() {
             K::Bool => base(name, gimli_ate::Ate::Boolean),
             K::Char => base(name, gimli_ate::Ate::Utf),
+            // `usize`/`isize` are typedefs of the same-size integer, as in
+            // rustc_codegen_llvm (lldb then shows `usize`, and LLDB keeps
+            // `S<u64>` and `S<usize>` apart).
+            K::Int(ty::IntTy::Isize) => Type::Typedef { name, base: self.dbg_type(Ty::new_int(tcx, ty::IntTy::I64)) },
+            K::Uint(ty::UintTy::Usize) => Type::Typedef { name, base: self.dbg_type(Ty::new_uint(tcx, ty::UintTy::U64)) },
             K::Int(_) => base(name, gimli_ate::Ate::Signed),
             K::Uint(_) => base(name, gimli_ate::Ate::Unsigned),
             K::Float(_) => base(name, gimli_ate::Ate::Float),

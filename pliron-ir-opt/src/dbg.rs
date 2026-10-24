@@ -60,6 +60,8 @@ pub enum Type {
     /// `DW_TAG_base_type`; `enc` is a `DW_ATE_*` value.
     Base { name: String, size: u32, enc: u8 },
     Ptr { name: String, pointee: u32 },
+    /// `DW_TAG_typedef` (`usize` = `u64`, as LLVM describes it).
+    Typedef { name: String, base: u32 },
     /// Structs, tuples, closures, unions (all fields at offset 0), and
     /// the fat-pointer pairs.
     Struct { name: String, size: u32, align: u32, fields: Vec<Field>, union: bool },
@@ -278,6 +280,7 @@ impl DbgInfo {
             | Type::Enum { size, .. }
             | Type::Opaque { size, .. } => *size,
             Type::Ptr { .. } => 8,
+            Type::Typedef { base, .. } => self.type_size(*base),
         }
     }
 

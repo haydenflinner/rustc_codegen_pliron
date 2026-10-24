@@ -395,39 +395,43 @@ t_debuginfo() {
         { echo "debuginfo O$o: no frame main::$f at main.rs:$l" >&2; echo "$bt" >&2; exit 1; }
     done
   done
+  # lldb runs under a time limit: a wedged debugserver (task_for_pid stuck
+  # after a Rosetta process hung, 2026-10-24) must fail this, not hang it.
+  local tmo; tmo=$(command -v gtimeout || command -v timeout || true)
+  lldbt() { ${tmo:+$tmo 120} lldb "$@"; }
   # Variables, through line breakpoints, when lldb is around: at O0 from
   # their slots (std types too: `NonNull`'s pattern-typed pointer, `Cap`'s
   # `__0`); at O2 from location lists (`acc` is loop-carried).
   if command -v lldb >/dev/null; then
     l=$(grep -n "// L:top\$" $src | cut -d: -f1)
-    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable p v" \
+    lldbt --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable p v" \
       -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q "p = (a = 5, b = -7)" $out/debuginfo.lldb && grep -q "length = 3" $out/debuginfo.lldb ||
       { echo "debuginfo: lldb shows no p/v at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:main2\$" $src | cut -d: -f1)
-    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable s w" \
+    lldbt --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable s w" \
       -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q 'pointer = "hi"' $out/debuginfo.lldb && grep -q "__0 = 2" $out/debuginfo.lldb ||
       { echo "debuginfo: lldb shows no String/Vec at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:shapes\$" $src | cut -d: -f1)
-    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable n o r" \
+    lldbt --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable n o r" \
       -o "frame variable main::LIMIT" -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q "(unsigned int) n = 50" $out/debuginfo.lldb && grep -q "__0 = 6" $out/debuginfo.lldb &&
       grep -q "__0 = -9" $out/debuginfo.lldb && grep -q "main::LIMIT = 77" $out/debuginfo.lldb ||
       { echo "debuginfo: lldb shows no inner n / enum payloads / static at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:steps\$" $src | cut -d: -f1)
-    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o next -o "frame select" \
+    lldbt --batch -o "breakpoint set --file main.rs --line $l" -o run -o next -o "frame select" \
       -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q -- "-> .*L:steps2" $out/debuginfo.lldb ||
       { echo "debuginfo: next from main.rs:$l stopped elsewhere" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     # Function breakpoints by bare name (subprograms live in namespaces).
-    lldb --batch -o "breakpoint set --name top" -o "breakpoint set --name shapes" \
+    lldbt --batch -o "breakpoint set --name top" -o "breakpoint set --name shapes" \
       -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     [[ $(grep -c "where = .*main::\(top\|shapes\)" $out/debuginfo.lldb) == 2 ]] ||
       { echo "debuginfo: lldb can't break on top/shapes by name" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:sum\$" $src | cut -d: -f1)
     # `x` is dead by then, but its register still holds it.
-    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable k acc x" \
+    lldbt --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable k acc x" \
       -- $out/debuginfo2$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q "k = 5" $out/debuginfo.lldb && grep -q "acc = 15" $out/debuginfo.lldb &&
       grep -q "x = 2" $out/debuginfo.lldb ||

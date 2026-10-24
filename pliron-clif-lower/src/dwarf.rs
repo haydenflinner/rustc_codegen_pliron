@@ -214,6 +214,7 @@ impl Cx<'_> {
         let tag = match &ty {
             Type::Base { .. } => gimli::DW_TAG_base_type,
             Type::Ptr { .. } => gimli::DW_TAG_pointer_type,
+            Type::Typedef { .. } => gimli::DW_TAG_typedef,
             Type::Struct { union: true, .. } => gimli::DW_TAG_union_type,
             Type::Struct { .. } | Type::Opaque { .. } | Type::Enum { .. } => gimli::DW_TAG_structure_type,
             Type::Array { .. } => gimli::DW_TAG_array_type,
@@ -230,6 +231,14 @@ impl Cx<'_> {
                 e.set(gimli::DW_AT_name, str(&name));
                 e.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size as u64));
                 e.set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DwAte(enc)));
+            }
+            Type::Typedef { name, base } => {
+                let b = self.ty(base);
+                let e = self.dw.unit.get_mut(die);
+                e.set(gimli::DW_AT_name, str(&name));
+                if let Some(b) = b {
+                    e.set(gimli::DW_AT_type, AttributeValue::UnitRef(b));
+                }
             }
             Type::Ptr { name, pointee } => {
                 let p = self.ty(pointee);
