@@ -8691,8 +8691,19 @@ fn bool_mask(func: &Function, v: Value, depth: u32) -> Option<(Value, Value, u8,
                 iconst(func, args[0]).map(|k| (cond.swap_args(), args[1], k))
             };
             if let Some((c2, z, k)) = pick {
-                if let Some((x, y, m, _)) = bool_mask(func, z, depth - 1) {
-                    let zw = func.dfg.value_type(z).bits();
+                // `z`'s mask is only its nonzero-ness: `select c, 2, -1`
+                // is "always nonzero" yet never 1. The `cc(0,K)`/`cc(1,K)`
+                // table needs `z` to be 0/1; `eq`/`ne` against 0 is the
+                // truth test, valid for any `z`. Otherwise this compare is
+                // a predicate on its own pair (below). Stage-2 rustc's
+                // `collect_and_apply` read `uextend(select c,2,-1) == 1` as
+                // `true` and kept NLL vars in opaque keys (2026-10-24).
+                let zw = func.dfg.value_type(z).bits();
+                let zmask = if zw >= 64 { u64::MAX } else { (1u64 << zw) - 1 };
+                let truth = (k as u64) & zmask == 0 && matches!(c2, IntCC::Equal | IntCC::NotEqual);
+                if (truth || is01(func, z, depth - 1))
+                    && let Some((x, y, m, _)) = bool_mask(func, z, depth - 1)
+                {
                     let ku = k as u64;
                     let m2 = (if cc_eval(c2, 0, ku, zw) { !m } else { 0 }
                         | if cc_eval(c2, 1, ku, zw) { m } else { 0 })
