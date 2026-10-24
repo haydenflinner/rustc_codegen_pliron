@@ -561,6 +561,8 @@ fn const_syms<'a>(st: &'a State, v: Value, out: &mut FxHashSet<&'a str>) {
 /// (`'static`): the global fn pool drains jobs from all live CGUs, so
 /// nothing may borrow the producing CGU's stack.
 struct JobShared {
+    /// `-g`: functions carry source locations (see `dbg_const_srclocs`).
+    dbg: bool,
     isa: Arc<dyn TargetIsa>,
     tcfg: TargetFrontendConfig,
     simd: bool,
@@ -840,6 +842,9 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
     if clctx.func.dfg.values_labels.is_some() {
         dbg_phi_labels(&mut clctx.func);
+    }
+    if sh.dbg {
+        dbg_const_srclocs(&mut clctx.func);
     }
     let mut vec_retry = 0;
     let defr = loop {
@@ -1260,6 +1265,7 @@ pub fn lower_module<'a>(
     // Read-only job inputs, owned so `FnJob`s are `'static` and can ride
     // the process-wide pool.
     let shared = Arc::new(JobShared {
+        dbg: st.dbg.is_some(),
         isa: isa.clone(),
         tcfg: cfg,
         simd,
@@ -1872,6 +1878,52 @@ fn dbg_label_ranges(
     out
 }
 
+/// `-g`: a constant takes the source location of its first user. Lowering
+/// shares one per block and passes hoist and dedupe them, so a constant's
+/// own srcloc is that of whichever statement created it first; wherever
+/// its `mov` lands it would start a row for that statement — at O0,
+/// `next` then stopped on a line already passed. (Clearing it instead
+/// loses statements whose only code is a constant, like `return Ok(())`.)
+fn dbg_const_srclocs(func: &mut ir::Function) {
+    use cranelift_codegen::ir::{BlockArg, Opcode};
+    let is_const = |func: &ir::Function, i: ir::Inst| {
+        matches!(
+            func.dfg.insts[i].opcode(),
+            Opcode::Iconst | Opcode::F16const | Opcode::F32const | Opcode::F64const | Opcode::F128const | Opcode::Vconst
+        )
+    };
+    let mut done: FxHashSet<ir::Inst> = FxHashSet::default();
+    let mut set: Vec<(ir::Inst, ir::SourceLoc)> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let loc = func.srcloc(i);
+            if loc.is_default() || is_const(func, i) {
+                continue;
+            }
+            let dfg = &func.dfg;
+            let mut args: Vec<ir::Value> = dfg.inst_args(i).to_vec();
+            for bc in dfg.insts[i].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                args.extend(bc.args(&dfg.value_lists).filter_map(|a| match a {
+                    BlockArg::Value(v) => Some(v),
+                    _ => None,
+                }));
+            }
+            for a in args {
+                let a = dfg.resolve_aliases(a);
+                if let ir::ValueDef::Result(d, _) = dfg.value_def(a)
+                    && is_const(func, d)
+                    && done.insert(d)
+                {
+                    set.push((d, loc));
+                }
+            }
+        }
+    }
+    for (i, l) in set {
+        func.set_srcloc(i, l);
+    }
+}
+
 /// `-g`: a block param every incoming value of which carries label `L`
 /// holds that variable piece too (a merge of its assignments — what
 /// LLVM's mem2reg marks on the phis it inserts). Lowering labels only the
@@ -2258,6 +2310,7 @@ pub fn lower_clif_wasm(
             .max(1)
     };
     let shared = Arc::new(JobShared {
+        dbg: st.dbg.is_some(),
         isa: isa.clone(),
         tcfg: cfg,
         simd,

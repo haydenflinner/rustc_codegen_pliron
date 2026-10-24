@@ -56,6 +56,28 @@ fn shapes(n: u32) -> u32 {
     o.unwrap_or(0) + r.unwrap_or(0) as u32 + std::hint::black_box(&LIMIT)
 }
 
+/// Stepping (O0), rustc's basic-stepping: `next` from `let d` must land
+/// on `let h` — the lines between have no code of their own, and a
+/// constant created by an earlier statement must not start a row for it.
+#[inline(never)]
+#[allow(unused_assignments, unused_variables)]
+fn steps() -> usize {
+    let a = ();
+    let b: [i32; 0] = [];
+    let mut c = 27;
+    let d = c = 99; // L:steps
+    let e = "hi bob";
+    let f = b"hi bob";
+    let g = b'9';
+    let h = ["whatever"; 8]; // L:steps2
+    let i = [1, 2, 3, 4];
+    let j = (23, "hi");
+    let k = 2..3;
+    let l = &i[k];
+    let m: *const () = &a;
+    l.len()
+}
+
 #[inline(never)]
 fn sink(x: u32) {
     std::hint::black_box(x);
@@ -66,7 +88,7 @@ fn main() {
     let p = Pair { a: std::env::args().count() as u32 + 4, b: -7 };
     let s = String::from("hi");
     let w = vec![7u8, 8];
-    println!("{} {} {} {}", s.len(), w.len(), sum(&v, p.a), shapes(p.a)); // L:main2
+    println!("{} {} {} {} {}", s.len(), w.len(), sum(&v, p.a), shapes(p.a), steps()); // L:main2
     // Panics (index 6): the backtrace test.
     println!("{}", top(&v, p)); // L:main
 }

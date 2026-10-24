@@ -415,6 +415,11 @@ t_debuginfo() {
     grep -q "(unsigned int) n = 50" $out/debuginfo.lldb && grep -q "__0 = 6" $out/debuginfo.lldb &&
       grep -q "__0 = -9" $out/debuginfo.lldb && grep -q "main::LIMIT = 77" $out/debuginfo.lldb ||
       { echo "debuginfo: lldb shows no inner n / enum payloads / static at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
+    l=$(grep -n "// L:steps\$" $src | cut -d: -f1)
+    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o next -o "frame select" \
+      -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
+    grep -q -- "-> .*L:steps2" $out/debuginfo.lldb ||
+      { echo "debuginfo: next from main.rs:$l stopped elsewhere" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     # Function breakpoints by bare name (subprograms live in namespaces).
     lldb --batch -o "breakpoint set --name top" -o "breakpoint set --name shapes" \
       -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
