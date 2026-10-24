@@ -159,6 +159,16 @@ fn propagate(
         if skip_loads && func.dfg.insts[i].opcode().can_load() {
             continue;
         }
+        // `PLIRON_SM_PRECISE`: a compare's result is a bool — it carries
+        // no address and no byte image (see the pure-op rule in `run`).
+        if precise()
+            && matches!(
+                func.dfg.insts[i].opcode(),
+                Opcode::Icmp | Opcode::Fcmp
+            )
+        {
+            continue;
+        }
         let mut acc: Vec<StackSlot> = Vec::new();
         for &a in func.dfg.inst_args(i) {
             for &s in &map[func.dfg.resolve_aliases(a)] {
@@ -212,6 +222,15 @@ pub fn marker_slots(func: &Function, v: Value) -> Vec<StackSlot> {
         }
     }
     Vec::new()
+}
+
+/// `PLIRON_SM_PRECISE=1` (default off until validated): pure (non-memory,
+/// non-call) ops on a slot address are uses, not escapes, and a byte image
+/// stored to untracked memory escapes only the pointers it carries, not
+/// the slot it was read from.
+fn precise() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_is("PLIRON_SM_PRECISE", "1"))
 }
 
 fn sm_take() -> bool {
@@ -842,11 +861,23 @@ pub fn run(
                             }
                             if dst.is_empty() {
                                 // A stored byte image leaks every pointer
-                                // it carried — the container itself is
-                                // only a use when the image lands in a
-                                // tracked slot (copy edge covers it).
+                                // it carried, not the container's own
+                                // address — that is in the image only if
+                                // the slot holds a pointer to itself, and
+                                // then `contains[s]` names it (self-stores
+                                // are recorded). Escaping `s` too pinned
+                                // every `x = f()` result slot whose bytes
+                                // were later copied to the heap: stage-2
+                                // rustc's AST walkers kept 76 112-byte
+                                // slots apart (9 KB frames vs LLVM's
+                                // 384 B), overflowing the stack.
                                 for &s in &from_bytes[func.dfg.resolve_aliases(args[0])] {
-                                    escape_deep!(contains, s, i);
+                                    if !precise() {
+                                        escape!(s, i);
+                                    }
+                                    for s2 in contains[s.index()].clone() {
+                                        escape!(s2, i);
+                                    }
                                 }
                             }
                             // `store` through a pointer that can only
@@ -874,8 +905,15 @@ pub fn run(
                                     }
                                 }
                                 if dst.is_empty() {
+                                    // As for `store`: the image's pointers
+                                    // escape, not the container.
                                     for &s in &from_bytes[func.dfg.resolve_aliases(args[k])] {
-                                        escape_deep!(contains, s, i);
+                                        if !precise() {
+                                            escape!(s, i);
+                                        }
+                                        for s2 in contains[s.index()].clone() {
+                                            escape!(s2, i);
+                                        }
                                     }
                                 }
                             }
@@ -935,10 +973,24 @@ pub fn run(
                         _ => false,
                     };
                     if !affine {
+                        // `PLIRON_SM_PRECISE=1`: a pure op is a use, not an
+                        // escape. Its result inherits the operands' slots
+                        // (`derived`, except compares: bools carry none), so
+                        // every later use extends their intervals and a real
+                        // sink (untracked store, capturing call) escapes them
+                        // there. Any observation combining two slots'
+                        // addresses then happens where both are live — they
+                        // never fold. Escaping here instead pinned every
+                        // slot whose address met an `icmp`/`band`/`isub`
+                        // (stage-2 rustc's parser: 2.5-9x LLVM's frames,
+                        // deep-recursion UI tests overflowed the stack).
+                        let pu = precise();
                         for k in 0..args.len() {
                             for &s in arg_slots(k) {
                                 use_at(&mut iv, &mut uses, s, pos);
-                                escape_deep!(contains, s, i);
+                                if !pu {
+                                    escape_deep!(contains, s, i);
+                                }
                             }
                         }
                     }
