@@ -167,6 +167,13 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(&i) = self.dbg_types.borrow().get(&ty) {
             return i;
         }
+        // A pattern type is its base type to a debugger (as rustc_codegen_llvm
+        // describes it): `NonNull`'s `pointer`, `Cap`'s `usize`.
+        if let ty::Pat(base, _) = *ty.kind() {
+            let id = self.dbg_type(base);
+            self.dbg_types.borrow_mut().insert(ty, id);
+            return id;
+        }
         let l = self.layout_of(ty);
         let name = type_names::compute_debuginfo_type_name(self.tcx, ty, true);
         let size = l.size.bytes() as u32;
@@ -234,7 +241,12 @@ impl<'tcx> CodegenCx<'tcx> {
             }
             K::Adt(def, _) if def.is_struct() || def.is_union() => {
                 let v = def.non_enum_variant();
-                let fields = fields_of(&|i| v.fields[FieldIdx::from_usize(i)].name.to_string());
+                // Tuple structs' fields are `__0`, `__1`, ... (LLVM's names,
+                // which rust-lldb's formatters expect).
+                let tuple = v.ctor_kind() == Some(rustc_hir::def::CtorKind::Fn);
+                let fields = fields_of(&|i| {
+                    if tuple { format!("__{i}") } else { v.fields[FieldIdx::from_usize(i)].name.to_string() }
+                });
                 if def.is_union() {
                     Type::Struct { name, size, align: l.align.abi.bytes() as u32, fields, union: true }
                 } else {
@@ -259,8 +271,10 @@ impl<'tcx> CodegenCx<'tcx> {
                     }
                     &Variants::Single { index } if l.fields.count() > 0 => {
                         let v = def.variant(index);
-                        strukt(fields_of(&|i| {
-                            v.fields.get(FieldIdx::from_usize(i)).map_or(format!("__{i}"), |f| f.name.to_string())
+                        let tuple = v.ctor_kind() == Some(rustc_hir::def::CtorKind::Fn);
+                        strukt(fields_of(&|i| match v.fields.get(FieldIdx::from_usize(i)) {
+                            Some(f) if !tuple => f.name.to_string(),
+                            _ => format!("__{i}"),
                         }))
                     }
                     _ => Type::Opaque { name, size },

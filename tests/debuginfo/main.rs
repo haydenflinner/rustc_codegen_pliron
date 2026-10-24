@@ -28,5 +28,9 @@ fn top(v: &[u32], p: Pair) -> u32 {
 fn main() {
     let v = vec![1, 2, 3];
     let p = Pair { a: std::env::args().count() as u32 + 4, b: -7 };
+    let s = String::from("hi");
+    let w = vec![7u8, 8];
+    println!("{} {}", s.len(), w.len()); // L:main2
+    // Panics (index 6): the backtrace test.
     println!("{}", top(&v, p)); // L:main
 }

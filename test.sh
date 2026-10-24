@@ -395,13 +395,19 @@ t_debuginfo() {
         { echo "debuginfo O$o: no frame main::$f at main.rs:$l" >&2; echo "$bt" >&2; exit 1; }
     done
   done
-  # Variables at O0, through a line breakpoint, when lldb is around.
+  # Variables at O0, through line breakpoints, when lldb is around (std
+  # types too: `NonNull`'s pattern-typed pointer, `Cap`'s `__0`).
   if command -v lldb >/dev/null; then
     l=$(grep -n "// L:top\$" $src | cut -d: -f1)
     lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable p v" \
       -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q "p = (a = 5, b = -7)" $out/debuginfo.lldb && grep -q "length = 3" $out/debuginfo.lldb ||
       { echo "debuginfo: lldb shows no p/v at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
+    l=$(grep -n "// L:main2\$" $src | cut -d: -f1)
+    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable s w" \
+      -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
+    grep -q 'pointer = "hi"' $out/debuginfo.lldb && grep -q "__0 = 2" $out/debuginfo.lldb ||
+      { echo "debuginfo: lldb shows no String/Vec at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
   fi
   rustc $BE --edition 2021 -g -O -Ccodegen-units=1 --emit obj $src -o $out/debuginfo-g.o
   rustc $BE --edition 2021 -O -Ccodegen-units=1 --emit obj $src -o $out/debuginfo-nog.o
