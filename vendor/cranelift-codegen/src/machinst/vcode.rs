@@ -1783,6 +1783,7 @@ impl<I: VCodeInst> VCode<I> {
         // Locations of interest, and where each is overwritten: `kills[k]`
         // = allocations invalid from instruction `k` on.
         let mut interest: crate::FxHashSet<Allocation> = Default::default();
+        interest.reserve(raw.len().min(64));
         for r in &raw {
             interest.insert(r.3);
         }
@@ -1862,23 +1863,42 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
             }
+            // Pending assignment ends and, per location, the labels in it:
+            // each instruction looks only at what can end there.
+            let mut ends: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+            let mut by_alloc: FxHashMap<Allocation, Vec<u32>> = FxHashMap::default();
+            for (&l, &(a, bd, _, _)) in &st {
+                ends.entry(bd).or_default().push(l);
+                by_alloc.entry(a).or_default().push(l);
+            }
+            let close = |st: &mut St, out: &mut Vec<_>, l: u32, i: usize| {
+                if let Some((a, _, _, since)) = st.remove(&l)
+                    && since < i
+                {
+                    out.push((l, since, i, a));
+                }
+            };
             for i in s0..e0 {
-                let close = |st: &mut St, out: &mut Vec<_>, l: u32, i: usize| {
-                    if let Some((a, _, _, since)) = st.remove(&l)
-                        && since < i
-                    {
-                        out.push((l, since, i, a));
+                if let Some(ls) = ends.remove(&i) {
+                    for l in ls {
+                        if st.get(&l).is_some_and(|v| v.1 <= i) {
+                            close(&mut st, &mut out, l, i);
+                        }
                     }
-                };
-                if !kills[i].is_empty() || !st.is_empty() {
-                    let dead: Vec<u32> = st
-                        .iter()
-                        .filter(|(_, v)| v.1 <= i || (v.2 <= i && kills[i].contains(&v.0)))
-                        .map(|(&l, _)| l)
-                        .collect();
-                    for l in dead {
-                        close(&mut st, &mut out, l, i);
-                    }
+                }
+                for a in &kills[i] {
+                    let Some(ls) = by_alloc.get_mut(a) else { continue };
+                    ls.retain(|&l| match st.get(&l) {
+                        Some(v) if v.0 == *a => {
+                            if v.2 <= i {
+                                close(&mut st, &mut out, l, i);
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        _ => false,
+                    });
                 }
                 if let Some(ss) = starts.get(&i) {
                     for &(l, a, t) in ss {
@@ -1888,6 +1908,8 @@ impl<I: VCodeInst> VCode<I> {
                                 close(&mut st, &mut out, l, i);
                                 let bd = bound_of(l, i).max(t);
                                 st.insert(l, (a, bd, t, i));
+                                ends.entry(bd).or_default().push(l);
+                                by_alloc.entry(a).or_default().push(l);
                             }
                         }
                     }
