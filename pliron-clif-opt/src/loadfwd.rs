@@ -1307,8 +1307,14 @@ const MAX_INSERTS: usize = 64;
 /// — and the load's address operand must dominate it (a pointer computed
 /// in `b` can't be reloaded upstream). Callers guarantee nothing in `b`
 /// before the load may write `loc`, so the value the load sees equals the
-/// memory state at end of every pred. `notrap` loads are speculatable
-/// (invalid memory is UB), so running them on `p`'s sibling edges is safe.
+/// memory state at end of every pred. A pred that can also branch elsewhere
+/// (a critical edge) would run the load on that other path too, where the
+/// address need not be valid — `notrap` only holds where the load was. So
+/// such a pred needs a `can_move` (dereferenceable) load: btree's
+/// `search_tree_for_bifurcation` loads a `Bound` key through a pointer that
+/// is null for `Unbounded`, and the compensating load ran on the
+/// `Unbounded` arm of the pred's `br_table` (wasmtime's GC free list
+/// segfaulted in `BTreeMap::range`, 2026-10-24).
 fn edge_pre(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -1350,6 +1356,7 @@ fn edge_pre(
         return None;
     };
     let arg = func.dfg.resolve_aliases(arg);
+    let speculatable = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move());
     for &(p, pinst) in &missing {
         if func.layout.last_inst(p) != Some(pinst)
             || !matches!(
@@ -1357,6 +1364,13 @@ fn edge_pre(
                 Opcode::Jump | Opcode::Brif | Opcode::BrTable
             )
         {
+            return None;
+        }
+        let only_b = func.dfg.insts[pinst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .iter()
+            .all(|c| c.block(&func.dfg.value_lists) == b);
+        if !only_b && !speculatable {
             return None;
         }
         if dom.is_none() {
