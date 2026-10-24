@@ -187,3 +187,55 @@ not landed.
 - **`PLIRON_XCGU_SIZE=300`:** hashmap goes from +45% to +25% instructions,
   binaries grow 3%. SipHash's `hash_one` sits in another CGU, beyond the
   native copy limit of 50. Compile time not yet measured.
+
+## 7. Stage-2 self-host and fuzz: five more miscompiles
+
+The stage-2 compiler (pliron-built rustc) ICEd compiling `core`.
+Probing method:
+
+- Rebuild only one stage-2 crate per step: invalidate
+  `build/<host>/stage2-rustc/<host>/release/build/<crate>/*/fingerprint`
+  and `./x build --stage 2 compiler`. That takes 40 s–2 min per step, not
+  8.5 minutes for a full rebuild.
+- `PLIRON_OPT_FNS='!~<len><crate>'` shows which crate's symbols are
+  needed. `fnbisect --names` over those symbols, then `bisect.py`.
+- Scripts: `rust-sh/selfhost-logs/s2tp/cmd.sh` and `s2op/cmd.sh`.
+
+The bugs, in order of appearance:
+
+1. **webroot `other` (5a3ca02):** as_place.rs:258 "could not resolve local".
+   - A function argument, or a `try_call` result, had an empty pointer web
+     in the block-refined query, so `select(arg, &slot)` looked like an
+     exact slot address.
+   - slotprom then promoted `resolved.as_ref().unwrap_or(self)` and read
+     the stale `resolved` when it was `None`.
+2. **slotmerge, partial loop writes read after the loop (3071348):**
+   - Found by `PLIRON_SM_POISON` (wasm32 `sort_check`): core's
+     smallsort scratch.
+   - The gate now runs ten stanzas under poison (`poison:*`, 08e9343).
+3. **selord (903eed6):** 28 bogus "non-defining use of `impl Trait`"
+   errors.
+   - `bool_mask` re-based `icmp eq (uextend z), 1` through `z`'s pair as
+     if `z` were 0/1, but `z = select c, 2, -1` (an `Option<Ordering>`
+     niche).
+   - `collect_and_apply` then kept NLL region vars.
+   - `bisect.py` blamed `sameargs2`, because `post_sweep` runs uncounted
+     inside the `Gate::Always` `iconst128` step. `PLIRON_POSTSWEEP=0` and
+     then `PLIRON_SELORD=0` found it.
+4. **slp (a9fb1f8):** fuzz seed 4940.
+   - `plan_store` re-issues the earlier store at the later one's
+     position, and let a `uload32` (not a `mem_range` access) sit in
+     between.
+5. **slp/loopvec overflow ICEs (778a921):** seeds 4895, 5042, 5542.
+
+Stage 2 now gets through typeck and borrowck of `core` and panics in
+`rustc_monomorphize/src/partitioning.rs:349` ("the len is 110 but the
+index is 15": the bounds check itself is wrong). That is the next one.
+
+Fuzz: seeds 4096–6143 (2048 programs), 2043 matched, plus the
+four above.
+
+Tooling note: an lldb session on an x86_64 binary under Rosetta left
+processes in uninterruptible state and wedged every later lldb launch
+(`task_for_pid`). It needs a reboot; until then the gate's `debuginfo`
+stanza fails (it has a 120 s limit and no longer hangs).
