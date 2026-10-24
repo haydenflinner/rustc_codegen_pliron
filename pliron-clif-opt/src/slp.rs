@@ -1753,7 +1753,13 @@ fn store_dead(
         if o2.is_terminator() || o2.is_branch() || o2.is_call() {
             return false;
         }
+        // An access `mem_range` can't describe (a narrow `uload32`, an
+        // atomic) may read the bytes, so the store stays live — the same
+        // hole `plan_store` had (fuzz seed 4940).
         let Some(r2) = mem_range(x.func, x.ps, x.na, i2) else {
+            if o2.can_load() || o2.can_store() || o2.other_side_effects() {
+                return false;
+            }
             continue;
         };
         if !may_overlap(ur, r2, x.iso) {
@@ -2252,7 +2258,12 @@ fn plan_store(
         match mem_range(func, ps, na, i2) {
             Some(rx) if may_overlap(r_first, rx, iso) => return None,
             Some(_) => {}
-            None if o2.can_store() || o2.other_side_effects() || o2.can_trap() => return None,
+            // An access `mem_range` can't describe — a narrow `uload32`
+            // too — may read the first store's bytes before they move to
+            // `last` (fuzz seed 4940: `uload32 v371` read the old word).
+            None if o2.can_load() || o2.can_store() || o2.other_side_effects() || o2.can_trap() => {
+                return None;
+            }
             None => {}
         }
     }

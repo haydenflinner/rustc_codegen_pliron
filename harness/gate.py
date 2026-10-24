@@ -45,8 +45,9 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # escaped slot as disjoint from untracked pointers (3938) and cparm chasing a
 # replacement cycle forever (2187, compile timeout), 2026-10-22; slp offset
 # adds and loopvec's coefficient negation overflowing at the i64 edge
-# (5042, 5542, 4895), 2026-10-24.
-FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 5042, 5542]
+# (5042, 5542, 4895), and slp moving a store past a narrow `uload32` of its
+# bytes (4940), 2026-10-24.
+FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542]
 
 
 def shell(cmd):
