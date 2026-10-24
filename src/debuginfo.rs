@@ -43,6 +43,7 @@ pub fn cu_info(tcx: ty::TyCtxt<'_>, cgu: &str) -> Option<Box<DbgInfo>> {
     d.keep_slots = tcx.sess.opts.debuginfo == DebugInfo::Full
         && tcx.sess.opts.optimize == rustc_session::config::OptLevel::No;
     d.values = pliron_cfg::pass_enabled("PLIRON_DBGVALS");
+    d.optimized = tcx.sess.opts.optimize != rustc_session::config::OptLevel::No;
     Some(Box::new(d))
 }
 
@@ -89,7 +90,8 @@ impl<'tcx> CodegenCx<'tcx> {
             let def_id = instance.def_id();
             let (file, line, _) = self.dbg_pos(tcx.def_span(def_id).lo());
             let mut name = String::with_capacity(64);
-            type_names::push_item_name(tcx, def_id, true, &mut name);
+            type_names::push_item_name(tcx, def_id, false, &mut name);
+            let ns = self.dbg_namespace(def_id);
             let generics = tcx.generics_of(tcx.typeck_root_def_id(def_id));
             let args = instance.args.truncate_to(tcx, generics);
             let args = tcx.normalize_erasing_regions(
@@ -98,7 +100,7 @@ impl<'tcx> CodegenCx<'tcx> {
             );
             type_names::push_generic_args(tcx, args, &mut name);
             let linkage = tcx.symbol_name(instance).name.to_string();
-            let s = self.st.borrow_mut().dbg.as_mut().unwrap().sub(Sub { name, linkage, file, line });
+            let s = self.st.borrow_mut().dbg.as_mut().unwrap().sub(Sub { name, ns, linkage, file, line });
             self.dbg_insts.borrow_mut().insert(instance, s);
             s
         });
@@ -119,9 +121,28 @@ impl<'tcx> CodegenCx<'tcx> {
         let ty = self.dbg_type(ty);
         let (file, line, _) = self.dbg_pos(tcx.def_span(def_id).lo());
         let mut name = String::new();
-        type_names::push_item_name(tcx, def_id, true, &mut name);
-        let g = Global { name, sym: sym.to_string(), ty, file, line };
+        type_names::push_item_name(tcx, def_id, false, &mut name);
+        let ns = self.dbg_namespace(def_id);
+        let g = Global { name, ns, sym: sym.to_string(), ty, file, line };
         self.st.borrow_mut().dbg.as_mut().unwrap().globals.push(g);
+    }
+
+    /// The namespaces enclosing `def_id`, outermost (the crate) first, as
+    /// rustc_codegen_llvm's `item_namespace` names them (`{impl#0}` for an
+    /// impl, the function for a closure).
+    fn dbg_namespace(&self, def_id: rustc_hir::def_id::DefId) -> Vec<String> {
+        let tcx = self.tcx;
+        let mut v = Vec::new();
+        let mut k = tcx.def_key(def_id).parent;
+        while let Some(p) = k {
+            let id = rustc_hir::def_id::DefId { krate: def_id.krate, index: p };
+            let mut s = String::new();
+            type_names::push_item_name(tcx, id, false, &mut s);
+            v.push(s);
+            k = tcx.def_key(id).parent;
+        }
+        v.reverse();
+        v
     }
 
     /// `dbg_create_lexical_block`: a block in `parent` (a scope id).
@@ -406,7 +427,23 @@ impl<'tcx> CodegenCx<'tcx> {
             ty::Str => (Ty::new_imm_ptr(tcx, tcx.types.u8), usize_t, "length"),
             _ => {
                 let vt = Ty::new_imm_ptr(tcx, Ty::new_array(tcx, tcx.types.usize, 3));
-                (Ty::new_imm_ptr(tcx, tcx.types.unit), self.dbg_type(vt), "vtable")
+                // The data pointer points at the `dyn Trait` itself: an
+                // unsized struct named after it, as LLVM describes it.
+                let pname = type_names::compute_debuginfo_type_name(tcx, pointee, true);
+                let dynt = {
+                    let mut st = self.st.borrow_mut();
+                    let d = st.dbg.as_mut().unwrap();
+                    d.types.push(Type::Opaque { name: pname.clone(), size: 0 });
+                    let o = d.types.len() as u32 - 1;
+                    d.types.push(Type::Ptr { name: format!("*const {pname}"), pointee: o });
+                    d.types.len() as u32 - 1
+                };
+                let vtable = self.dbg_type(vt);
+                let fields = vec![
+                    Field { name: "pointer".into(), ty: dynt, offset: 0 },
+                    Field { name: "vtable".into(), ty: vtable, offset: 8 },
+                ];
+                return Type::Struct { name, size: l.size.bytes() as u32, align: 8, fields, union: false };
             }
         };
         let data_name = if meta_name == "length" { "data_ptr" } else { "pointer" };

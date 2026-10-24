@@ -43,8 +43,10 @@ pub struct Block {
 /// A function as debug info names it (`DW_TAG_subprogram`).
 #[derive(Clone, Debug, Default)]
 pub struct Sub {
-    /// Path with generic args, e.g. `alloc::vec::Vec<u8>::push`.
+    /// Name with generic args, e.g. `push<u8>` (LLVM's: the path is `ns`).
     pub name: String,
+    /// Enclosing namespaces, outermost first (`alloc`, `vec`, `{impl#1}`).
+    pub ns: Vec<String>,
     /// The mangled symbol, for debuggers that key frames on it.
     pub linkage: String,
     pub file: u32,
@@ -105,8 +107,9 @@ pub struct Var {
 /// A `static` (`DW_TAG_variable` at CU level, located by its symbol).
 #[derive(Clone, Debug)]
 pub struct Global {
-    /// Path, e.g. `my_crate::COUNTER`.
+    /// Name, e.g. `COUNTER`, in namespaces `ns` (`my_crate`).
     pub name: String,
+    pub ns: Vec<String>,
     /// The data symbol it lives at.
     pub sym: String,
     pub ty: u32,
@@ -196,6 +199,8 @@ pub struct DbgInfo {
     /// `-O0` with full debuginfo: keep variable slots in memory (slotprom
     /// skips them) so every local has a location, as LLVM's allocas do.
     pub keep_slots: bool,
+    /// Optimizing: subprograms get `DW_AT_APPLE_optimized` (lldb's `[opt]`).
+    pub optimized: bool,
     /// Variable pieces held in SSA values (see [`Piece`]). Behind a lock
     /// because lowering (which only borrows `State`) interns the pieces of
     /// stores into promoted allocas.

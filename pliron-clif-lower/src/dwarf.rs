@@ -389,6 +389,31 @@ impl Cx<'_> {
         id
     }
 
+    /// The `DW_TAG_namespace` for path `ns` (the root for an empty one).
+    fn namespace(&mut self, ns: &[String]) -> UnitEntryId {
+        let mut parent = self.dw.unit.root();
+        for k in 0..ns.len() {
+            let path = ns[..=k].join("::");
+            parent = match self.namespaces.get(&path) {
+                Some(&n) => n,
+                None => {
+                    let n = self.dw.unit.add(parent, gimli::DW_TAG_namespace);
+                    self.dw.unit.get_mut(n).set(gimli::DW_AT_name, AttributeValue::String(ns[k].as_bytes().to_vec()));
+                    self.namespaces.insert(path, n);
+                    n
+                }
+            };
+        }
+        parent
+    }
+
+    /// A subprogram DIE for `sub`, in its namespace.
+    fn sub_die(&mut self, sub: u32) -> UnitEntryId {
+        let ns = self.d.subs[sub as usize].ns.clone();
+        let parent = self.namespace(&ns);
+        self.dw.unit.add(parent, gimli::DW_TAG_subprogram)
+    }
+
     fn name_attrs(&mut self, die: UnitEntryId, sub: u32) {
         let s = &self.d.subs[sub as usize];
         let (name, linkage, file, line) = (s.name.clone(), s.linkage.clone(), s.file, s.line);
@@ -407,8 +432,7 @@ impl Cx<'_> {
         if let Some(&e) = self.abstract_subs.get(&sub) {
             return e;
         }
-        let root = self.dw.unit.root();
-        let die = self.dw.unit.add(root, gimli::DW_TAG_subprogram);
+        let die = self.sub_die(sub);
         self.name_attrs(die, sub);
         self.dw
             .unit
@@ -761,13 +785,16 @@ pub fn emit(
         }
         let addr = |o: u32| Address::Symbol { symbol: k, addend: o as i64 };
         cu_ranges.push(Range::StartLength { begin: addr(0), length: f.size as u64 });
-        let die = cx.dw.unit.add(root, gimli::DW_TAG_subprogram);
+        let die = cx.sub_die(sub);
         cx.name_attrs(die, sub);
         {
             let e = cx.dw.unit.get_mut(die);
             e.set(gimli::DW_AT_low_pc, AttributeValue::Address(addr(0)));
             e.set(gimli::DW_AT_high_pc, AttributeValue::Udata(f.size as u64));
             e.set(gimli::DW_AT_external, AttributeValue::Flag(true));
+            if d.optimized {
+                e.set(gimli::DW_AT_APPLE_optimized, AttributeValue::Flag(true));
+            }
             let mut fb = Expression::new();
             fb.op_reg(gimli::Register(fp_reg));
             e.set(gimli::DW_AT_frame_base, AttributeValue::Exprloc(fb));
@@ -842,21 +869,8 @@ pub fn emit(
         let fid = cx.file(g.file);
         // In namespaces, as LLVM does: lldb then finds `TEST` and
         // `krate::m::TEST` alike.
-        let mut parts: Vec<&str> = g.name.split("::").collect();
-        let base = parts.pop().unwrap_or("");
-        let mut parent = root;
-        for (k, _) in parts.iter().enumerate() {
-            let path = parts[..=k].join("::");
-            parent = match cx.namespaces.get(&path) {
-                Some(&n) => n,
-                None => {
-                    let n = cx.dw.unit.add(parent, gimli::DW_TAG_namespace);
-                    cx.dw.unit.get_mut(n).set(gimli::DW_AT_name, AttributeValue::String(parts[k].as_bytes().to_vec()));
-                    cx.namespaces.insert(path, n);
-                    n
-                }
-            };
-        }
+        let base = g.name.as_str();
+        let parent = cx.namespace(&g.ns);
         let vd = cx.dw.unit.add(parent, gimli::DW_TAG_variable);
         let mut loc = Expression::new();
         loc.op_addr(Address::Symbol { symbol: fns.len() + dsyms.len(), addend: 0 });
