@@ -1095,9 +1095,10 @@ pub fn run(
             }
         }
         for (s, e) in iv.iter_mut().enumerate() {
-            if marked[s] {
-                continue;
-            }
+            // Marked slots too: a marker window is measured in the same RPO
+            // positions, so a loop body placed past the exit still needs
+            // the span (selmul `parse_only`'s `black_box(&mut acc)` under
+            // PLIRON_SLOTMERGE_MARK + poison).
             for &(lo, hi) in &spans {
                 if !uses[s].iter().any(|&p| lo <= p && p <= hi) {
                     continue;
@@ -1266,7 +1267,11 @@ pub fn run(
         let mut fnv: Vec<_> = by_fn.into_iter().collect();
         fnv.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         eprintln!("sm-info: escape insts by callee: {fnv:?}");
-        for &(s, i) in esc.iter().take(8) {
+        // `PLIRON_SM_INFO=all`: the first escape of every slot, not just
+        // the first 8 overall.
+        let all = crate::env_is("PLIRON_SM_INFO", "all");
+        let mut shown = FxHashSet::default();
+        for &(s, i) in esc.iter().filter(|&&(s, _)| !all || shown.insert(s)).take(if all { usize::MAX } else { 8 }) {
             eprintln!(
                 "sm-info:   {s} escapes at {}: {}",
                 func.layout.inst_block(i).unwrap(),

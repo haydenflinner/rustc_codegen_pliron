@@ -6257,6 +6257,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // slot's writeback/reload sync. Only true no-capture flags the
         // CLIF arg a bounded use: no usable alias outlives the call.
         let own = callee_sym.as_ref().and_then(|s| self.st.nocapture.get(&s));
+        // `PLIRON_SM_DROPNC=1`: drop glue ends its pointee's life — a pointer
+        // it retained can't legally be used afterwards (LLVM's
+        // lifetime-based stack coloring assumes the same), so its argument
+        // is a bounded use for slotmerge/slotprom. Kept out of
+        // `CallInfo::nocap`: SROA must not hand drop glue a copy.
+        if pliron_cfg::env_is("PLIRON_SM_DROPNC", "1")
+            && callee_sym.as_deref().is_some_and(|s| s.contains("4core3ptr9drop_glue"))
+        {
+            for (k, &s) in csrc.iter().enumerate() {
+                if s == 0 {
+                    self.nocap.insert((inst, k as u32));
+                }
+            }
+        }
         if info.nocap.is_some() || own.is_some() {
             for (k, &s) in csrc.iter().enumerate() {
                 let flagged = s != usize::MAX
