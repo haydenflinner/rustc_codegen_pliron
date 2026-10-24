@@ -118,6 +118,7 @@ fn main() {
         region_parent: &e6,
         lifetimes: &mut lifetimes,
         nocap: &e7,
+        dbg_slots: &Default::default(),
         tcfg: isa.frontend_config(),
         simd: true,
         x64,

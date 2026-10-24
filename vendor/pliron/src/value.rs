@@ -472,6 +472,13 @@ impl Value {
     /// Replace all uses of the underlying definition with `other`.
     pub fn replace_all_uses_with(&self, ctx: &Context, other: &Value) {
         self.replace_some_uses_with(ctx, |_, _| true, other);
+        // PLIRON: the debug-info notes follow the value (`Context::dbg_notes`).
+        let mut notes = ctx.dbg_notes.borrow_mut();
+        if !notes.is_empty() && self != other {
+            if let Some(n) = notes.remove(self) {
+                notes.entry(*other).or_default().extend(n);
+            }
+        }
     }
 
     /// Replace the given use of `this` [Value] with `other`.

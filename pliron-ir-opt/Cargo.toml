@@ -13,5 +13,6 @@ cranelift-module = "=0.135.5"
 indexmap = "2"
 egg = "0.10"
 rustc-hash = "2"
+smallvec = "1"
 ascent = { version = "0.8", default-features = false }
 tracing = "0.1"

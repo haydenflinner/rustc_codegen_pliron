@@ -1316,6 +1316,7 @@ dependencies = [
  "pliron-cfg",
  "pliron-llvm",
  "rustc-hash",
+ "smallvec",
  "tracing",
 ]
 

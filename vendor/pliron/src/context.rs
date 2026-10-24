@@ -133,6 +133,13 @@ pub struct Context {
     /// `deref_mut` mutation may not change hash/layout-relevant contents),
     /// so the result is exact for the Context's lifetime.
     pub ty_size_align: RefCell<HMap<crate::r#type::TypeHandle, (u64, u64)>>,
+    /// PLIRON: debug-info notes on values (`-g` when optimizing): opaque
+    /// ids the owner attaches to a [crate::value::Value]. They are not
+    /// uses — no pass sees them — but [crate::value::Value::replace_all_uses_with]
+    /// moves a value's notes onto its replacement, so a note follows the
+    /// value through rewrites (LLVM's `ValueAsMetadata` RAUW). Uids are
+    /// never reused, so notes left on erased values are inert.
+    pub dbg_notes: RefCell<rustc_hash::FxHashMap<crate::value::Value, smallvec::SmallVec<[u32; 2]>>>,
 }
 
 impl Context {
@@ -182,6 +189,7 @@ impl Default for Context {
             aux_data: SlotMap::with_key(),
             aux_data_map: HMap::default(),
             ty_size_align: RefCell::new(HMap::default()),
+            dbg_notes: RefCell::new(Default::default()),
         };
 
         // Verify that all dictionary keys are unique.

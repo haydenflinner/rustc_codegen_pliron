@@ -43,6 +43,7 @@ pub fn cu_info(tcx: ty::TyCtxt<'_>, cgu: &str) -> Option<Box<DbgInfo>> {
     let mut d = DbgInfo::new(name.to_string_lossy().into_owned(), dir, producer);
     d.keep_slots = tcx.sess.opts.debuginfo == DebugInfo::Full
         && tcx.sess.opts.optimize == rustc_session::config::OptLevel::No;
+    d.values = pliron_cfg::pass_enabled("PLIRON_DBGVALS");
     Some(Box::new(d))
 }
 

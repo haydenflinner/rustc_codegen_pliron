@@ -223,12 +223,16 @@ fn undef(func: &mut Function, b: Block, ty: Type) -> Value {
 }
 
 /// `keep_keyed`: leave slots carrying a `StackSlotKey` (variable slots
-/// under `-g -O0`) in memory, for the debugger.
+/// under `-g -O0`) in memory, for the debugger. Otherwise a promoted
+/// field of such a slot hands its variable over to the SSA values: they
+/// get the field's labels from `dbg_slots` (`dbglabel`), and the slot
+/// loses its key — its memory no longer holds the whole variable.
 pub fn run(
     func: &mut Function,
     cfg: &ControlFlowGraph,
     nocap: &FxHashSet<(Inst, u32)>,
     keep_keyed: bool,
+    dbg_slots: &crate::dbglabel::DbgSlots,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
@@ -660,6 +664,22 @@ pub fn run(
         }
     }
 
+    // `-g`: each kept field's variable labels; its slot drops its key.
+    let field_labels: Vec<&[u32]> = kept
+        .iter()
+        .map(|&fi| {
+            let f = fields[fi];
+            func.sized_stack_slots[f.slot]
+                .key
+                .and_then(|k| dbg_slots.get(&(k.bits(), f.off, f.bytes as u32)))
+                .map_or(&[][..], |v| &v[..])
+        })
+        .collect();
+    let mut dbg: Vec<(Value, u32)> = Vec::new();
+    for &fi in &kept {
+        func.sized_stack_slots[fields[fi].slot].key = None;
+    }
+
     // New params: every reachable livein block gets one per kept field
     // (entry gets a materialized undef instead — it has no preds).
     let mut params: Vec<FxHashMap<u32, Value>> = vec![FxHashMap::default(); kept.len()];
@@ -672,7 +692,9 @@ pub fn run(
             let v = if b == entry {
                 undef(func, b, fields[fi].ty)
             } else {
-                func.dfg.append_block_param(b, fields[fi].ty)
+                let p = func.dfg.append_block_param(b, fields[fi].ty);
+                dbg.extend(field_labels[ki].iter().map(|&l| (p, l)));
+                p
             };
             params[ki].insert(ix as u32, v);
         }
@@ -727,11 +749,9 @@ pub fn run(
                 let sa = *sas
                     .entry(f.slot)
                     .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
-                cur[ki] =
-                    Some(
-                        pos.ins()
-                            .load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32),
-                    );
+                let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
+                dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                cur[ki] = Some(v);
             }
         }
         for i in insts {
@@ -767,12 +787,9 @@ pub fn run(
                         let sa = *sas
                             .entry(f.slot)
                             .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
-                        cur[ki] = Some(pos.ins().load(
-                            f.ty,
-                            MemFlagsData::new().with_notrap(),
-                            sa,
-                            f.off as i32,
-                        ));
+                        let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
+                        dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                        cur[ki] = Some(v);
                     }
                 }
             }
@@ -808,7 +825,9 @@ pub fn run(
                         && fields[fi].ty == ty
                         && let Some(&ki) = kept_ix.get(&fi)
                     {
-                        cur[ki] = Some(func.dfg.resolve_aliases(args[0]));
+                        let v = func.dfg.resolve_aliases(args[0]);
+                        dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                        cur[ki] = Some(v);
                         func.layout.remove_inst(i);
                         n += 1;
                     }
@@ -861,6 +880,7 @@ pub fn run(
             tracing::info!(target: "pliron::slotprom", "slotprom: rewrite {:?}", t4.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
         };
     }
+    crate::dbglabel::add(&mut func.dfg, &dbg);
     n
 }
 
@@ -942,7 +962,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
         assert!(n > 0, "expected promotion");
         assert_eq!(memops(&func), 0, "no plain load/store should remain");
         assert!(func.dfg.num_block_params(h) >= 1);
@@ -951,6 +971,58 @@ mod tests {
     }
 
     /// Two disjoint fields (i64 at +0, i32 at +8) promote independently.
+    #[test]
+    fn keyed_slot_hands_its_variable_to_the_values() {
+        // `-g`: a keyed (variable) slot's promoted field labels what was
+        // stored in it — both stores and the merge param — and the slot
+        // loses its key, since its memory no longer holds the variable.
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let b1 = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, b1, done] {
+            func.layout.append_block(b);
+        }
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let ss = func.create_sized_stack_slot(StackSlotData::new_with_key(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+            cranelift_codegen::ir::StackSlotKey::new(5),
+        ));
+        let flags = MemFlagsData::new();
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let one = cur.ins().iconst(types::I64, 1);
+        cur.ins().store(flags, one, a, 0);
+        cur.ins().brif(x, b1, &[], done, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
+        cur.ins().store(flags, x, a, 0);
+        cur.ins().jump(done, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let mut dbg = crate::dbglabel::DbgSlots::default();
+        dbg.insert((5, 0, 8), vec![7]);
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert!(run(&mut func, &cfg, &empty_nocap(), false, &dbg) > 0);
+        verify(&func);
+        assert!(func.sized_stack_slots[ss].key.is_none(), "key kept:\n{func}");
+        let labelled = |v| match func.dfg.values_labels.as_ref().and_then(|l| l.get(&v)) {
+            Some(cranelift_codegen::ir::ValueLabelAssignments::Starts(s)) => {
+                s.iter().any(|s| s.label.as_u32() == 7)
+            }
+            _ => false,
+        };
+        assert!(labelled(one) && labelled(x), "stores not labelled:\n{func}");
+        let p = *func.dfg.block_params(done).last().unwrap();
+        assert!(labelled(p), "merge param not labelled:\n{func}");
+    }
+
     #[test]
     fn promotes_disjoint_fields() {
         let mut sig = Signature::new(CallConv::Fast);
@@ -981,7 +1053,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
         assert!(n >= 4, "two stores + two loads should fold, got {n}");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -1018,7 +1090,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
     }
@@ -1056,7 +1128,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0));
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &nocap, false);
+        let n = run(&mut func, &cfg, &nocap, false, &Default::default());
         assert!(n > 0, "expected promotion");
         // Only the sync pair (writeback store + reload) remains.
         assert_eq!(memops(&func), 2);
@@ -1105,7 +1177,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0));
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
         // The callee must see arg0 in *a: writeback store + post-call
         // reload — if the store is silently dropped the callee reads
         // uninitialized slot memory.
@@ -1159,7 +1231,7 @@ mod tests {
         nocap.insert((call, 0));
         nocap.insert((call, 1));
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
         // Each arg's bytes reach the callee through memory: two
         // writebacks before the call, two reloads after.
         assert_eq!(memops(&func), 4, "missing writeback/reload pairs");
@@ -1195,7 +1267,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
         verify(&func);
     }
 
@@ -1230,7 +1302,7 @@ mod tests {
         cur.ins().return_(&[w]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &empty_nocap(), false);
+        run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
         // The i32 field overlaps the byte load; it must stay in memory
         // (its store + the uload8 itself = 2 memory ops). The i64 field
         // at +0 is disjoint and promotes away its store.
@@ -1282,7 +1354,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
         assert!(n > 0, "guarded load through nullable param should promote");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -1339,7 +1411,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
         assert!(n > 0, "correlated sibling store must not escape the slot");
         // Only the real heap store remains.
         assert_eq!(memops(&func), 1);
@@ -1396,7 +1468,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
         verify(&func);
     }
 
@@ -1465,7 +1537,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 1));
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
         // The callee reads ss29 through `a`: 4 writeback stores before
         // the call plus 4 reloads after it — none may be dropped.
         assert_eq!(memops(&func), 8, "missing writeback/reload pairs:\n{func}");
@@ -1504,7 +1576,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
     }

@@ -120,7 +120,7 @@ pub fn const_int(ctx: &Context, st: &State, v: Value) -> Option<i128> {
 }
 
 /// Constant byte offset of a GEP, if all indices are constant.
-pub(crate) fn gep_offset(ctx: &Context, st: &State, op: Ptr<Operation>) -> Option<i64> {
+pub fn gep_offset(ctx: &Context, st: &State, op: Ptr<Operation>) -> Option<i64> {
     let gep = Operation::get_op::<GetElementPtrOp>(op, ctx)?;
     let mut cur = gep.src_elem_type(ctx);
     let mut off: i64 = 0;

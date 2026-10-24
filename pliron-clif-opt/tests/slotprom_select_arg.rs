@@ -32,7 +32,7 @@ block2:
 fn select_with_argument_is_not_a_slot_address() {
     let mut f = cranelift_reader::parse_functions(SRC).unwrap().remove(0);
     let cfg = ControlFlowGraph::with_function(&f);
-    pliron_clif_opt::slotprom::run(&mut f, &cfg, &FxHashSet::default(), false);
+    pliron_clif_opt::slotprom::run(&mut f, &cfg, &FxHashSet::default(), false, &Default::default());
     let b1 = Block::from_u32(1);
     let loads = f.layout.block_insts(b1).filter(|&i| f.dfg.insts[i].opcode() == Opcode::Load).count();
     assert_eq!(loads, 1, "the load through select(arg, &ss0) was promoted:\n{}", f.display());

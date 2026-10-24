@@ -396,7 +396,8 @@ pub fn lower_to_object(
             target_lexicon::Architecture::X86_64 => 6,
             _ => 29,
         };
-        crate::dwarf::emit(&mut product, d, &dbg_fns, fp);
+        let consts = dbg_const_pieces(ctx, st);
+        crate::dwarf::emit(&mut product, d, &dbg_fns, fp, &consts);
     }
     for (alias, target, weak) in &st.aliases {
         let tsym = match ids.get(target).copied() {
@@ -450,6 +451,8 @@ pub fn lower_to_object(
 struct FnJob {
     name: String,
     id: FuncId,
+    /// `-g`: variable slots' pieces, for slotprom (`dbglabel::DbgSlots`).
+    dbg_slots: pliron_clif_opt::dbglabel::DbgSlots,
     /// Minimum alignment of the definition in bytes (`State::fn_align`:
     /// `#[rustc_align]`, which rustc also applies to shims), 0 = none.
     align: u64,
@@ -497,6 +500,7 @@ impl FnJob {
         FnJob {
             name,
             id,
+            dbg_slots: Default::default(),
             align: 0,
             func,
             nonnull: FxHashSet::default(),
@@ -754,6 +758,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 inst_region: Default::default(),
                 lifetimes: &mut j.lifetimes,
                 nocap: &j.nocap,
+                dbg_slots: &j.dbg_slots,
                 tcfg: sh.tcfg,
                 simd: sh.simd,
                 x64: sh.x64,
@@ -824,6 +829,9 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     let tcomp = std::time::Instant::now();
     let _scomp = tron.then(|| tracing::info_span!(target: "pliron::pipeline", "compile").entered());
     let _pgcomp = sh.prof.activity("pliron_compile", Some(n));
+    if clctx.func.dfg.values_labels.is_some() {
+        dbg_phi_labels(&mut clctx.func);
+    }
     let mut vec_retry = 0;
     let defr = loop {
         let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1316,6 +1324,7 @@ pub fn lower_module<'a>(
             let prof: FxHashMap<ir::Block, u64>;
             let lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>;
             let nocap: FxHashSet<(ir::Inst, u32)>;
+            let dbg_slots: pliron_clif_opt::dbglabel::DbgSlots;
             let stubs: rustc_hash::FxHashSet<&'static str>;
             {
                 let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
@@ -1363,6 +1372,7 @@ pub fn lower_module<'a>(
                     opnds: std::mem::take(&mut scratch.opnds),
                     succs: std::mem::take(&mut scratch.succs),
                     lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
+                    dbg_slots: Default::default(),
                 };
                 if pliron_cfg::tracing_on() {
                     tracing::debug!(target: "pliron::lower", lowerfn = %n);
@@ -1440,6 +1450,7 @@ pub fn lower_module<'a>(
                 invariant = std::mem::take(&mut fl.invariant);
                 block_region = std::mem::take(&mut fl.block_region);
                 nocap = std::mem::take(&mut fl.nocap);
+                dbg_slots = std::mem::take(&mut fl.dbg_slots);
                 // Caller-side operands of `noalias readonly` clone params, in
                 // CLIF values (`State::region_frozen_op`): `*v` is immutable
                 // while the binding clone runs — loadfwd's scoped immunity.
@@ -1471,6 +1482,7 @@ pub fn lower_module<'a>(
                 FnJob {
                     name: n.clone(),
                     id,
+                    dbg_slots,
                     align: st.fn_align.get(n.as_str()).copied().unwrap_or(0),
                     func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                     nonnull,
@@ -1632,6 +1644,7 @@ pub fn lower_module<'a>(
                     .map(|r| (r.start, r.end, r.loc.bits()))
                     .collect(),
                 vars: dbg_slot_vars(&j.func, code),
+                labels: dbg_label_ranges(&**isa, code),
             });
         }
         eh.add_function(m, j.id, code);
@@ -1797,6 +1810,134 @@ fn dbg_slot_vars(func: &ir::Function, code: &cranelift_codegen::CompiledCode) ->
             (k as u32 - 1, off)
         })
         .collect()
+}
+
+/// `-g`: variable pieces held by constants (`State::consts` values carrying
+/// `Context::dbg_notes`): piece id → bits. Constants have no code, so they
+/// get no value label; a piece only constants hold reads as that constant
+/// over its whole function (the DWARF writer drops it when some value
+/// computed at run time holds it too). Pieces two constants disagree on
+/// are left out.
+fn dbg_const_pieces(ctx: &Context, st: &State) -> FxHashMap<u32, u64> {
+    let mut out: FxHashMap<u32, Option<u64>> = FxHashMap::default();
+    for (v, ids) in ctx.dbg_notes.borrow().iter() {
+        let bits = match st.consts.get(*v) {
+            Some(ConstVal::Bits(b)) if *b <= u64::MAX as u128 => *b as u64,
+            Some(ConstVal::Zero) => 0,
+            _ => continue,
+        };
+        for &id in ids {
+            let e = out.entry(id).or_insert(Some(bits));
+            if *e != Some(bits) {
+                *e = None;
+            }
+        }
+    }
+    out.into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
+}
+
+/// `-g`: each value label's machine-code ranges, registers as DWARF numbers.
+fn dbg_label_ranges(
+    isa: &dyn TargetIsa,
+    code: &cranelift_codegen::CompiledCode,
+) -> Vec<(u32, Vec<(u32, u32, crate::dwarf::ValLoc)>)> {
+    use cranelift_codegen::LabelValueLoc;
+    let mut out: Vec<_> = code
+        .value_labels_ranges
+        .iter()
+        .map(|(l, rs)| {
+            let rs = rs
+                .iter()
+                .filter_map(|r| {
+                    let loc = match r.loc {
+                        LabelValueLoc::Reg(reg) => crate::dwarf::ValLoc::Reg(isa.map_regalloc_reg_to_dwarf(reg).ok()?),
+                        LabelValueLoc::CFAOffset(o) => crate::dwarf::ValLoc::Cfa(o),
+                    };
+                    (r.start < r.end).then_some((r.start, r.end, loc))
+                })
+                .collect();
+            (l.as_u32(), rs)
+        })
+        .collect();
+    out.sort_by_key(|x| x.0);
+    out
+}
+
+/// `-g`: a block param every incoming value of which carries label `L`
+/// holds that variable piece too (a merge of its assignments — what
+/// LLVM's mem2reg marks on the phis it inserts). Lowering labels only the
+/// values stores wrote, so without this a loop-carried variable has no
+/// location inside the loop. Iterated (a param fed by another param) to a
+/// fixpoint, at most 8 rounds; it only adds labels, never touches code.
+fn dbg_phi_labels(func: &mut ir::Function) {
+    use cranelift_codegen::ir::BlockArg;
+    let dfg = &func.dfg;
+    let Some(vl) = dfg.values_labels.as_ref() else {
+        return;
+    };
+    // Labels by resolved value (an alias's labels are its original's).
+    let mut labs: FxHashMap<ir::Value, Vec<ir::ValueLabel>> = FxHashMap::default();
+    for (&v, a) in vl {
+        if let ir::ValueLabelAssignments::Starts(st) = a {
+            let r = dfg.resolve_aliases(v);
+            labs.entry(r).or_default().extend(st.iter().map(|s| s.label));
+        }
+    }
+    if labs.is_empty() {
+        return;
+    }
+    // Incoming values per block param; `None` once one isn't a plain value.
+    let mut inc: FxHashMap<(ir::Block, usize), Option<Vec<ir::Value>>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        for bc in dfg.insts[t].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+            let dest = bc.block(&dfg.value_lists);
+            for (k, a) in bc.args(&dfg.value_lists).enumerate() {
+                let e = inc.entry((dest, k)).or_insert_with(|| Some(Vec::new()));
+                match (e.as_mut(), a) {
+                    (Some(vs), BlockArg::Value(v)) => vs.push(dfg.resolve_aliases(v)),
+                    _ => *e = None,
+                }
+            }
+        }
+    }
+    let mut keys: Vec<(ir::Block, usize)> = inc.keys().copied().collect();
+    keys.sort_unstable();
+    let mut added: Vec<(ir::Value, ir::ValueLabel)> = Vec::new();
+    for _ in 0..8 {
+        let mut changed = false;
+        for &(b, k) in &keys {
+            let Some(Some(vs)) = inc.get(&(b, k)) else { continue };
+            let Some(&p) = dfg.block_params(b).get(k) else { continue };
+            let mut common: Option<Vec<ir::ValueLabel>> = None;
+            for &v in vs.iter().filter(|&&v| v != p) {
+                let l = labs.get(&v).map_or(&[][..], |l| &l[..]);
+                common = Some(match common {
+                    None => l.to_vec(),
+                    Some(c) => c.into_iter().filter(|x| l.contains(x)).collect(),
+                });
+            }
+            let Some(common) = common else { continue };
+            let have = labs.entry(p).or_default();
+            for l in common {
+                if !have.contains(&l) {
+                    have.push(l);
+                    added.push((p, l));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let added: Vec<(ir::Value, u32)> = added.into_iter().map(|(v, l)| (v, l.as_u32())).collect();
+    dbg_label(&mut func.dfg, &added);
+}
+
+/// Attach value labels `(value, label)` (see `FnLower::dbg_value_labels`).
+fn dbg_label(dfg: &mut ir::DataFlowGraph, labels: &[(ir::Value, u32)]) {
+    pliron_clif_opt::dbglabel::add(dfg, labels)
 }
 
 /// Define `__cranelift_x86_pshufb` in `m` as a private function.
@@ -2196,6 +2337,7 @@ pub fn lower_clif_wasm(
                 opnds: std::mem::take(&mut scratch.opnds),
                 succs: std::mem::take(&mut scratch.succs),
                 lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
+                dbg_slots: Default::default(),
             };
             fl.lower(f.op);
             let lifetimes = fl
@@ -2252,6 +2394,7 @@ pub fn lower_clif_wasm(
             FnJob {
                 name: n.clone(),
                 id,
+                dbg_slots: Default::default(),
                 align: st.fn_align.get(n.as_str()).copied().unwrap_or(0),
                 func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                 nonnull,
@@ -2704,6 +2847,8 @@ struct FnLower<'a, 'b> {
     /// `PLIRON_LOWERFOLD` memoized — was ~1M `config()` probes per
     /// regex-syntax compile from the per-op site in `lower_op_inner`.
     lowerfold: bool,
+    /// `-g`: see `FnJob::dbg_slots`.
+    dbg_slots: pliron_clif_opt::dbglabel::DbgSlots,
 }
 
 /// Tables `FnLower` rebuilds per function that are *not* extracted into
@@ -2916,7 +3061,109 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let rets: Vec<ir::Value> = tys.into_iter().map(|t| self.iconst_any(t, 0)).collect();
             self.b.ins().return_(&rets);
         }
+        self.dbg_value_labels();
         self.b.seal_all_blocks();
+    }
+
+    /// `-g` when optimizing: the pieces of keyed variable slot `k` (alloca
+    /// `a`) each store into it writes, by (key, offset, leaf size) — what
+    /// slotprom labels a promoted field's values with.
+    fn dbg_slot_labels(&mut self, a: Value, k: u64) {
+        let Some(d) = self.st.dbg.as_deref().filter(|d| d.values && !d.keep_slots) else {
+            return;
+        };
+        let g = (k - 1) as u32;
+        let ctx = self.ctx;
+        let mut sites: Vec<(i64, Value)> = Vec::new();
+        for u in a.uses(ctx) {
+            let op = u.user_op();
+            if Operation::get_op::<StoreOp>(op, ctx).is_some() && u.find_index(ctx) == 1 {
+                sites.push((0, op.deref(ctx).get_operand(ctx, 0)));
+            } else if Operation::get_op::<GetElementPtrOp>(op, ctx).is_some()
+                && u.find_index(ctx) == 0
+                && let Some(off) = pliron_ir_opt::sroa::gep_offset(ctx, self.st, op)
+            {
+                let r = op.deref(ctx).get_result(ctx, 0);
+                for u2 in r.uses(ctx) {
+                    let o2 = u2.user_op();
+                    if Operation::get_op::<StoreOp>(o2, ctx).is_some() && u2.find_index(ctx) == 1 {
+                        sites.push((off, o2.deref(ctx).get_operand(ctx, 0)));
+                    }
+                }
+            }
+        }
+        let mut pcs = Vec::new();
+        let mut tab = d.pieces.lock().unwrap();
+        for (off, v) in sites {
+            for &(lo, t) in self.st.leaves(ctx, v.get_type(ctx)).iter() {
+                let at = off + lo as i64;
+                let key = (k, at, t.bytes());
+                if at < 0 || self.dbg_slots.contains_key(&key) {
+                    continue;
+                }
+                pcs.clear();
+                d.group_pieces(g, at as u64, t.bytes() as u64, &mut pcs);
+                let ids: Vec<u32> = pcs.iter().map(|&pc| tab.id(pc)).collect();
+                tab.labelled.extend(ids.iter().copied());
+                self.dbg_slots.insert(key, ids);
+            }
+        }
+    }
+
+    /// `-g` when optimizing: label each CLIF value whose pliron value holds
+    /// variable pieces (`Context::dbg_notes`, see `pliron_ir_opt::dbg::Piece`)
+    /// with the piece ids; a multi-leaf value labels each leaf with its
+    /// sub-piece. Labels ride along through the CLIF passes and come back
+    /// from regalloc as machine-code ranges (`CompiledCode::value_labels_ranges`).
+    fn dbg_value_labels(&mut self) {
+        let notes = self.ctx.dbg_notes.borrow();
+        if notes.is_empty() {
+            return;
+        }
+        let Some(d) = self.st.dbg.as_deref() else {
+            return;
+        };
+        let mut out: Vec<(ir::Value, u32)> = Vec::new();
+        let mut tab = d.pieces.lock().unwrap();
+        for (v, cvs) in &self.vals {
+            let Some(ids) = notes.get(v) else {
+                continue;
+            };
+            if let [cv] = cvs[..] {
+                out.extend(ids.iter().map(|&id| (cv, id)));
+                continue;
+            }
+            let lv = self.st.leaves(self.ctx, v.get_type(self.ctx));
+            if lv.len() != cvs.len() {
+                continue;
+            }
+            for &id in ids {
+                let pc = tab.list[id as usize];
+                for (&cv, &(o, t)) in cvs.iter().zip(lv.iter()) {
+                    let sz = t.bytes();
+                    if o + sz as u64 <= pc.size as u64 {
+                        let sub = pliron_ir_opt::dbg::Piece { offset: pc.offset + o as u32, size: sz, ..pc };
+                        out.push((cv, tab.id(sub)));
+                    }
+                }
+            }
+        }
+        tab.labelled.extend(out.iter().map(|&(_, l)| l));
+        drop(tab);
+        drop(notes);
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dbg", tracing::Level::DEBUG) {
+            let tab = d.pieces.lock().unwrap();
+            let names: Vec<String> = out
+                .iter()
+                .map(|&(v, l)| {
+                    let pc = tab.list[l as usize];
+                    format!("{v}={}[{}+{}]", d.vars[pc.var as usize].name, pc.offset, pc.size)
+                })
+                .collect();
+            let fname = CUR_FN.with(|c| c.borrow().clone());
+            tracing::debug!(target: "pliron::dbg", "{fname}: value labels {}", names.join(" "));
+        }
+        dbg_label(&mut self.b.func.dfg, &out);
     }
 
     /// Address of `__pliron_eh`, the TLS slot driving emulated EH on COFF:
@@ -4805,14 +5052,32 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(StoreOp) && self.vars.contains_key(&opnds[1]) {
             let vs = self.get(opnds[0]);
             let vars = self.vars[&opnds[1]].clone();
-            for (x, (var, vt)) in vs.into_iter().zip(vars) {
+            // `-g`: a promoted alloca's variables live in what it stores.
+            let group = self.st.dbg.as_deref().filter(|d| d.values).and_then(|d| d.alloca_decls.get(&opnds[1]).copied());
+            let lv = group.map(|_| self.ty_leaves(self.st.promoted[opnds[1]]));
+            let mut labels = Vec::new();
+            for (k, (x, (var, vt))) in vs.into_iter().zip(vars).enumerate() {
                 let x = if self.b.func.dfg.value_type(x) == vt {
                     x
                 } else {
                     self.bitcast_to(vt, x)
                 };
+                if let (Some(g), Some(lv)) = (group, &lv)
+                    && let Some(&(o, t)) = lv.get(k)
+                {
+                    let d = self.st.dbg.as_deref().unwrap();
+                    let mut pcs = Vec::new();
+                    d.group_pieces(g, o, t.bytes() as u64, &mut pcs);
+                    let mut tab = d.pieces.lock().unwrap();
+                    for pc in pcs {
+                        let id = tab.id(pc);
+                        tab.labelled.insert(id);
+                        labels.push((x, id));
+                    }
+                }
                 self.b.def_var(var, x);
             }
+            dbg_label(&mut self.b.func.dfg, &labels);
         } else if is!(AllocaOp) {
             let res = op.deref(ctx).get_result(ctx, 0);
             let (size, align) = self.st.allocas[res];
@@ -4826,6 +5091,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             });
             let p = match key {
                 Some(k) => {
+                    self.dbg_slot_labels(res, k);
                     let ss = self.b.create_sized_stack_slot(StackSlotData::new_with_key(
                         StackSlotKind::ExplicitSlot,
                         size as u32,

@@ -665,9 +665,34 @@ impl DataFlowGraph {
         // - `signatures` and `ext_funcs` have no values.
 
         if let Some(values_labels) = &mut self.values_labels {
-            // Debug info is best-effort. If any is attached to value aliases,
-            // just discard it.
-            values_labels.retain(|&k, _| !matches!(self.values[k].into(), ValueData::Alias { .. }));
+            // PLIRON: labels on an alias move to the value it stands for
+            // (upstream discards them). A pass that replaces a value with
+            // an alias keeps the variable it holds.
+            let moved: Vec<(Value, ValueLabelAssignments)> = values_labels
+                .iter()
+                .filter(|&(&k, _)| matches!(self.values[k].into(), ValueData::Alias { .. }))
+                .map(|(&k, a)| (k, a.clone()))
+                .collect();
+            for (k, a) in moved {
+                values_labels.remove(&k);
+                let (ValueData::Alias { original, .. }, ValueLabelAssignments::Starts(starts)) =
+                    (self.values[k].into(), a)
+                else {
+                    continue;
+                };
+                if !self.values.is_valid(original)
+                    || matches!(self.values[original].into(), ValueData::Alias { .. })
+                {
+                    continue;
+                }
+                match values_labels
+                    .entry(original)
+                    .or_insert_with(|| ValueLabelAssignments::Starts(Vec::new()))
+                {
+                    ValueLabelAssignments::Starts(to) => to.extend(starts),
+                    ValueLabelAssignments::Alias { .. } => {}
+                }
+            }
 
             // If debug-info says a value should have the same labels as another
             // value, then make sure that target is not a value alias.

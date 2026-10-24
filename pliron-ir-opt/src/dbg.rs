@@ -10,6 +10,7 @@
 
 use pliron::context::Context;
 use pliron::operation::Operation;
+use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::ops::{GetElementPtrOp, StoreOp};
 use rustc_hash::FxHashMap;
@@ -89,6 +90,40 @@ pub struct Decl {
     pub size: u64,
 }
 
+/// Bytes `[offset, offset + size)` of variable `var`, in the instance
+/// whose declaration location is `loc` (so an inlined copy is a different
+/// piece). A value carrying the piece's id in `Context::dbg_notes` holds
+/// those bytes from its definition on; lowering turns each id into a
+/// Cranelift value label, and the DWARF writer the label's machine-code
+/// ranges into the variable's location list. One id per piece, not per
+/// assignment: Cranelift ends a label's range where the next value with
+/// the same label is defined, which is what a reassignment means.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Piece {
+    pub var: u32,
+    pub loc: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+#[derive(Default)]
+pub struct Pieces {
+    pub list: Vec<Piece>,
+    ids: FxHashMap<Piece, u32>,
+    /// Pieces lowering gave a value label: some value holding them is
+    /// computed at run time (as opposed to only constants).
+    pub labelled: rustc_hash::FxHashSet<u32>,
+}
+
+impl Pieces {
+    pub fn id(&mut self, p: Piece) -> u32 {
+        *self.ids.entry(p).or_insert_with(|| {
+            self.list.push(p);
+            self.list.len() as u32 - 1
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct DbgInfo {
     /// `DW_AT_name` / `DW_AT_comp_dir` / `DW_AT_producer` of the CU.
@@ -114,6 +149,14 @@ pub struct DbgInfo {
     /// `-O0` with full debuginfo: keep variable slots in memory (slotprom
     /// skips them) so every local has a location, as LLVM's allocas do.
     pub keep_slots: bool,
+    /// Variable pieces held in SSA values (see [`Piece`]). Behind a lock
+    /// because lowering (which only borrows `State`) interns the pieces of
+    /// stores into promoted allocas.
+    pub pieces: std::sync::Mutex<Pieces>,
+    /// Track variables through SSA values (pieces); `PLIRON_DBGVALS=0`
+    /// turns it off (the dropped spills' variables then read as
+    /// unavailable).
+    pub values: bool,
 }
 
 impl DbgInfo {
@@ -155,6 +198,34 @@ impl DbgInfo {
         i
     }
 
+    /// The byte size of type `t`.
+    pub fn type_size(&self, t: u32) -> u32 {
+        match &self.types[t as usize] {
+            Type::Base { size, .. }
+            | Type::Struct { size, .. }
+            | Type::Array { size, .. }
+            | Type::CEnum { size, .. }
+            | Type::Opaque { size, .. } => *size,
+            Type::Ptr { .. } => 8,
+        }
+    }
+
+    /// The pieces of the variables `group` (an alloca's decls) puts at
+    /// `[at, at + size)` of the alloca: one per decl the range falls in.
+    pub fn group_pieces(&self, group: u32, at: u64, size: u64, out: &mut Vec<Piece>) {
+        for &di in &self.groups[group as usize] {
+            let d = &self.decls[di as usize];
+            if !d.derefs.is_empty() || at < d.offset as u64 {
+                continue;
+            }
+            let off = at - d.offset as u64;
+            let vsize = self.type_size(self.vars[d.var as usize].ty) as u64;
+            if off + size <= vsize && size > 0 {
+                out.push(Piece { var: d.var, loc: d.loc, offset: off as u32, size: size as u32 });
+            }
+        }
+    }
+
     /// Record `decl` as naming `alloca`.
     pub fn declare(&mut self, alloca: Value, decl: Decl) {
         self.decls.push(decl);
@@ -193,13 +264,18 @@ impl DbgInfo {
 /// spills SSA locals into fresh allocas just to give them a location
 /// (`spill_operand_to_stack`); left in, they skew inlining costs, slot
 /// counts and load forwarding, so `-g` would change the code (it must
-/// not; test.sh `debuginfo`). Their variables then read as unavailable,
-/// as LLVM's often do once optimized. (A declared argument slot that is
-/// never read goes too — no build reads it either.)
+/// not; test.sh `debuginfo`). Instead each stored value carries its
+/// variable pieces as `Context::dbg_notes` — not uses, so no pass sees
+/// them — and the variables get location lists from wherever the values
+/// end up. (A declared argument slot that is never read goes too — no
+/// build reads it either.)
 pub fn drop_spills(ctx: &mut Context, st: &mut State) {
-    let Some(d) = st.dbg.as_deref_mut() else {
+    // Out of `st` for the walk: `gep_offset` reads the rest of it.
+    let Some(mut d) = st.dbg.take() else {
         return;
     };
+    ctx.dbg_notes.get_mut().clear();
+    let mut pieces = Vec::new();
     let is_store_into = |ctx: &Context, u: &pliron::value::Use<Value>| {
         Operation::get_op::<StoreOp>(u.user_op(), ctx).is_some() && u.find_index(ctx) == 1
     };
@@ -230,6 +306,37 @@ pub fn drop_spills(ctx: &mut Context, st: &mut State) {
         if !ok || stores.is_empty() {
             continue;
         }
+        // The stored values now carry the variables (as LLVM turns a
+        // promoted `dbg.declare` into `dbg.value`s of the stores).
+        let g = d.alloca_decls[&a];
+        for &op in stores.iter().filter(|_| d.values) {
+            let o = op.deref(ctx);
+            let p = o.get_operand(ctx, 1);
+            let at = if p == a {
+                Some(0)
+            } else {
+                p.defining_op().and_then(|g| crate::sroa::gep_offset(ctx, st, g))
+            };
+            let Some(at) = at.filter(|&x| x >= 0) else {
+                continue;
+            };
+            let v = o.get_operand(ctx, 0);
+            let size = crate::types::size_align(ctx, v.get_type(ctx)).0;
+            pieces.clear();
+            d.group_pieces(g, at as u64, size, &mut pieces);
+            if pieces.is_empty() {
+                continue;
+            }
+            let tab = d.pieces.get_mut().unwrap();
+            let mut notes = ctx.dbg_notes.borrow_mut();
+            let e = notes.entry(v).or_default();
+            for &pc in &pieces {
+                e.push(tab.id(pc));
+                if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::dbg", tracing::Level::DEBUG) {
+                    tracing::debug!(target: "pliron::dbg", "spill: {} [{}+{}] = v{}", d.vars[pc.var as usize].name, pc.offset, pc.size, v.uid());
+                }
+            }
+        }
         // Each store and GEP uses the pointer once, so there are no repeats.
         for op in stores.into_iter().chain(geps) {
             Operation::erase(op, ctx);
@@ -241,4 +348,5 @@ pub fn drop_spills(ctx: &mut Context, st: &mut State) {
         d.alloca_decls.remove(&a);
         st.allocas.remove(a);
     }
+    st.dbg = Some(d);
 }

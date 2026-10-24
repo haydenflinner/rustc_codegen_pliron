@@ -10,6 +10,7 @@ pub mod bcheck;
 pub mod bittab;
 pub mod brchain;
 pub mod celim;
+pub mod dbglabel;
 pub mod cicm;
 pub mod clifpeep;
 pub mod commute;

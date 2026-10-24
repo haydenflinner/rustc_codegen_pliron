@@ -25,12 +25,32 @@ fn top(v: &[u32], p: Pair) -> u32 {
     w * 3 + p.b as u32
 }
 
+/// Optimized builds: variables live in registers, found through location
+/// lists (pliron-clif-lower/src/dwarf.rs) — the loop-carried `acc` through
+/// its loop header's block param.
+#[inline(never)]
+fn sum(v: &[u32], k: u32) -> u32 {
+    let mut acc = 0;
+    for &x in v {
+        acc += x * k;
+        if acc > 6 {
+            sink(acc); // L:sum
+        }
+    }
+    acc
+}
+
+#[inline(never)]
+fn sink(x: u32) {
+    std::hint::black_box(x);
+}
+
 fn main() {
     let v = vec![1, 2, 3];
     let p = Pair { a: std::env::args().count() as u32 + 4, b: -7 };
     let s = String::from("hi");
     let w = vec![7u8, 8];
-    println!("{} {}", s.len(), w.len()); // L:main2
+    println!("{} {} {}", s.len(), w.len(), sum(&v, p.a)); // L:main2
     // Panics (index 6): the backtrace test.
     println!("{}", top(&v, p)); // L:main
 }

@@ -197,6 +197,8 @@ pub struct Pipe<'a> {
     /// operand `Value` is typically dead, so it can't ride along.
     pub lifetimes: &'a mut Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
+    /// `-g`: variable slots' pieces (`dbglabel`), for slotprom.
+    pub dbg_slots: &'a crate::dbglabel::DbgSlots,
     pub tcfg: TargetFrontendConfig,
     pub simd: bool,
     pub x64: bool,
@@ -1341,7 +1343,10 @@ fn gate_sel(p: &Pipe) -> Vec<&'static Step> {
 /// execute.
 fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     let mut an = Analysis::default();
-    let pk = if check_each {
+    // `-g` value labels name this CGU's variable pieces, and cache keys
+    // don't see them: a hit would replay another function's labels.
+    let labelled = p.clctx.func.dfg.values_labels.is_some();
+    let pk = if check_each || labelled {
         None
     } else {
         match crate::stepcache::pipeline_lookup(p, &mut an) {
@@ -1700,7 +1705,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             };
         }
     }
-    let k = if s.cached {
+    let k = if s.cached && p.clctx.func.dfg.values_labels.is_none() {
         match crate::stepcache::lookup(p, s, an) {
             Some(k) => k,
             None => crate::stepcache::compute(p, s, an),
@@ -1951,7 +1956,7 @@ fn s_constbr(p: &mut Pipe, _an: &mut Analysis) -> usize {
 
 fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
     let (cfg, _) = an.cfg_dt(&p.clctx.func);
-    let k = slotprom::run(&mut p.clctx.func, cfg, p.nocap, p.flags.keep_dbg_slots);
+    let k = slotprom::run(&mut p.clctx.func, cfg, p.nocap, p.flags.keep_dbg_slots, p.dbg_slots);
     p.dump("slotprom");
     k
 }
@@ -4249,6 +4254,7 @@ mod tests {
             inst_region: Default::default(),
             lifetimes: &mut lifetimes,
             nocap: &nocap,
+            dbg_slots: &Default::default(),
             tcfg: isa.frontend_config(),
             simd: true,
             x64: false,

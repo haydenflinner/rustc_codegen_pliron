@@ -1317,6 +1317,9 @@ pub fn run(
                 let sd = &func.sized_stack_slots[s];
                 grown.push((r, sd.size, sd.align_shift));
                 func.sized_stack_slots[s].size = 0;
+                // `-g`: `r`'s bytes now hold `s`'s data part of the time,
+                // so it no longer locates `r`'s variable.
+                func.sized_stack_slots[r].key = None;
             }
             _ => {}
         }

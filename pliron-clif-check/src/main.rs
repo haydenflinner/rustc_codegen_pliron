@@ -320,6 +320,7 @@ fn with_pipe<R>(
         inst_region: Default::default(),
         lifetimes: &mut lifetimes,
         nocap: &e7,
+        dbg_slots: &Default::default(),
         fn_names: &[],
         tcfg: isa.frontend_config(),
         simd: true,

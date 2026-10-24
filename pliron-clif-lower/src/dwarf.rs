@@ -14,12 +14,12 @@ use cranelift_module::FuncId;
 use cranelift_object::ObjectProduct;
 use gimli::write::{
     Address, AttributeValue, DirectoryId, DwarfUnit, EndianVec, Expression, FileId, LineProgram,
-    LineString, Range, RangeList, Sections, UnitEntryId, Writer,
+    LineString, Location, LocationList, Range, RangeList, Sections, UnitEntryId, Writer,
 };
 use gimli::{Encoding, Format, LineEncoding, RunTimeEndian, SectionId};
 use object::write::{Relocation, SymbolSection};
 use object::{BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
-use pliron_ir_opt::dbg::{DbgInfo, Type};
+use pliron_ir_opt::dbg::{DbgInfo, Piece, Type};
 use rustc_hash::FxHashMap;
 
 /// One compiled function: srcloc ranges `(start, end, loc id)` relative to
@@ -31,6 +31,20 @@ pub struct FnLines {
     pub ranges: Vec<(u32, u32, u32)>,
     /// Variable-holding slots: (decl group, offset from the frame pointer).
     pub vars: Vec<(u32, i64)>,
+    /// Value labels (`pliron_ir_opt::dbg::Piece` ids) and where each one
+    /// lives: `(start, end, location)` code ranges, sorted by start.
+    pub labels: Vec<(u32, Vec<(u32, u32, ValLoc)>)>,
+}
+
+/// Where a value label is, over one code range.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValLoc {
+    /// A DWARF register number.
+    Reg(u16),
+    /// A spill slot: this offset from the canonical frame address.
+    Cfa(i64),
+    /// A constant (no storage).
+    Const(u64),
 }
 
 #[derive(Clone)]
@@ -330,29 +344,42 @@ impl Cx<'_> {
     /// The function's variables, each under the subprogram or the inlined
     /// instance its declaration's location chain names; parameters first,
     /// in argument order.
-    fn vars(&mut self, die: UnitEntryId, sub: u32, tree: &Inst, vars: &[(u32, i64)], fp_reg: u16) {
-        let mut out: Vec<(UnitEntryId, u32, u32, Expression)> = Vec::new();
+    /// The DIE a variable declared at `loc` belongs under: the subprogram
+    /// `die` or one of its inlined instances; `None` when `loc` belongs to
+    /// another function or to an instance with no code.
+    fn var_parent(&self, die: UnitEntryId, sub: u32, tree: &Inst, loc: u32) -> Option<UnitEntryId> {
+        let mut path = Vec::new();
+        let mut x = self.d.locs[loc as usize];
+        while x.inlined_at != 0 {
+            path.push((x.inlined_at, x.scope));
+            x = self.d.locs[x.inlined_at as usize];
+        }
+        if loc != 0 && x.scope != sub {
+            return None;
+        }
+        path.reverse();
+        if path.is_empty() { Some(die) } else { tree.find(&path).and_then(|i| i.die) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn vars(
+        &mut self,
+        die: UnitEntryId,
+        sub: u32,
+        sym: usize,
+        tree: &Inst,
+        vars: &[(u32, i64)],
+        labels: &[(u32, Vec<(u32, u32, ValLoc)>)],
+        consts: &[(u32, [(u32, u32, ValLoc); 1])],
+        fp_reg: u16,
+    ) {
+        let mut out: Vec<(UnitEntryId, u32, u32, AttributeValue)> = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
         for &(g, fp_off) in vars {
             for &di in &self.d.groups[g as usize] {
                 let decl = &self.d.decls[di as usize];
-                let mut path = Vec::new();
-                let mut x = self.d.locs[decl.loc as usize];
-                while x.inlined_at != 0 {
-                    path.push((x.inlined_at, x.scope));
-                    x = self.d.locs[x.inlined_at as usize];
-                }
-                if decl.loc != 0 && x.scope != sub {
+                let Some(parent) = self.var_parent(die, sub, tree, decl.loc) else {
                     continue;
-                }
-                path.reverse();
-                let parent = if path.is_empty() {
-                    die
-                } else {
-                    match tree.find(&path).and_then(|i| i.die) {
-                        Some(p) => p,
-                        None => continue,
-                    }
                 };
                 if !seen.insert((parent, decl.var)) {
                     continue;
@@ -365,8 +392,41 @@ impl Cx<'_> {
                         loc.op_plus_uconst(o as u64);
                     }
                 }
-                out.push((parent, decl.var, self.d.vars[decl.var as usize].arg, loc));
+                out.push((parent, decl.var, self.d.vars[decl.var as usize].arg, AttributeValue::Exprloc(loc)));
             }
+        }
+        // Variables held in values: group the labels' pieces by variable
+        // instance, then one location list per instance.
+        let mut inst: FxHashMap<(UnitEntryId, u32), Vec<(Piece, &[(u32, u32, ValLoc)])>> = FxHashMap::default();
+        let mut keys = Vec::new();
+        {
+            let tab = self.d.pieces.lock().unwrap();
+            let lab = labels.iter().map(|(l, rs)| (*l, &rs[..]));
+            let cst = consts.iter().filter(|(l, _)| !tab.labelled.contains(l)).map(|(l, r)| (*l, &r[..]));
+            for (l, rs) in lab.chain(cst) {
+                let Some(&pc) = tab.list.get(l as usize) else {
+                    continue;
+                };
+                let Some(parent) = self.var_parent(die, sub, tree, pc.loc) else {
+                    continue;
+                };
+                if seen.contains(&(parent, pc.var)) {
+                    continue;
+                }
+                let e = inst.entry((parent, pc.var)).or_default();
+                if e.is_empty() {
+                    keys.push((parent, pc.var));
+                }
+                e.push((pc, rs));
+            }
+        }
+        for k in keys {
+            let pcs = &inst[&k];
+            let vsize = self.d.type_size(self.d.vars[k.1 as usize].ty);
+            let list = loc_list(sym, vsize, pcs, fp_reg);
+            seen.insert(k);
+            let id = self.dw.unit.locations.add(LocationList(list));
+            out.push((k.0, k.1, self.d.vars[k.1 as usize].arg, AttributeValue::LocationListRef(id)));
         }
         // Parameters (arg > 0) in order, then locals in declaration order.
         out.sort_by_key(|&(_, v, arg, _)| if arg > 0 { (0, arg, v) } else { (1, 0, v) });
@@ -383,13 +443,117 @@ impl Cx<'_> {
             }
             e.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(fid)));
             e.set(gimli::DW_AT_decl_line, AttributeValue::Udata(var.line as u64));
-            e.set(gimli::DW_AT_location, AttributeValue::Exprloc(loc));
+            e.set(gimli::DW_AT_location, loc);
         }
     }
 }
 
+/// One variable's location list from its pieces' label ranges: split the
+/// code at every range boundary; in each segment, compose the located
+/// pieces with `DW_OP_piece`, or use the plain location when one piece
+/// covers the whole variable. Segments where some byte has no location
+/// are left out (the variable reads as unavailable there).
+fn loc_list(sym: usize, vsize: u32, pcs: &[(Piece, &[(u32, u32, ValLoc)])], fp_reg: u16) -> Vec<Location> {
+    let mut cuts: Vec<u32> = pcs.iter().flat_map(|(_, rs)| rs.iter().flat_map(|r| [r.0, r.1])).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut order: Vec<usize> = (0..pcs.len()).collect();
+    order.sort_by_key(|&i| (pcs[i].0.offset, std::cmp::Reverse(pcs[i].0.size)));
+    let mut out: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+    let mut cur = vec![0usize; pcs.len()];
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let mut e = Vec::new();
+        let mut at = 0u32;
+        for &i in &order {
+            let (pc, rs) = &pcs[i];
+            if pc.offset < at {
+                continue;
+            }
+            while cur[i] < rs.len() && rs[cur[i]].1 <= a {
+                cur[i] += 1;
+            }
+            let Some(&(_, _, loc)) = rs.get(cur[i]).filter(|r| r.0 <= a) else {
+                continue;
+            };
+            if pc.offset > at {
+                break;
+            }
+            match loc {
+                ValLoc::Reg(r) if r < 32 => e.push(gimli::DW_OP_reg0.0 + r as u8),
+                ValLoc::Reg(r) => {
+                    e.push(gimli::DW_OP_regx.0);
+                    uleb(&mut e, r as u64);
+                }
+                // Every frame with spill slots has a frame pointer, 16
+                // bytes below the CFA (aarch64 and x86_64 alike).
+                ValLoc::Cfa(o) => {
+                    e.push(gimli::DW_OP_breg0.0 + fp_reg as u8);
+                    sleb(&mut e, o + 16);
+                }
+                ValLoc::Const(c) => {
+                    e.push(gimli::DW_OP_constu.0);
+                    uleb(&mut e, c);
+                    e.push(gimli::DW_OP_stack_value.0);
+                }
+            }
+            if pc.offset == 0 && pc.size >= vsize {
+                at = vsize;
+                break;
+            }
+            op_piece(&mut e, pc.size);
+            at = pc.offset + pc.size;
+        }
+        // Only whole variables: lldb reads a missing piece as zero bytes,
+        // so a half-known `&str` would show a null pointer, not "unknown".
+        if e.is_empty() || at < vsize {
+            continue;
+        }
+        match out.last_mut() {
+            Some(l) if l.1 == a && l.2 == e => l.1 = b,
+            _ => out.push((a, b, e)),
+        }
+    }
+    out.into_iter()
+        .map(|(a, b, bytes)| Location::StartLength {
+            begin: Address::Symbol { symbol: sym, addend: a as i64 },
+            length: (b - a) as u64,
+            data: Expression::raw(bytes),
+        })
+        .collect()
+}
+
+fn op_piece(e: &mut Vec<u8>, n: u32) {
+    e.push(gimli::DW_OP_piece.0);
+    uleb(e, n as u64);
+}
+
+fn uleb(e: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            e.push(b);
+            return;
+        }
+        e.push(b | 0x80);
+    }
+}
+
+fn sleb(e: &mut Vec<u8>, mut v: i64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0) {
+            e.push(b);
+            return;
+        }
+        e.push(b | 0x80);
+    }
+}
+
 /// Write the debug sections for `fns` into `product`'s object.
-pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u16) {
+pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u16, consts: &FxHashMap<u32, u64>) {
     let obj = &product.object;
     let macho = obj.format() == BinaryFormat::MachO;
     if !matches!(obj.format(), BinaryFormat::MachO | BinaryFormat::Elf) {
@@ -424,6 +588,22 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
         r.set(gimli::DW_AT_name, AttributeValue::String(d.cu_name.as_bytes().to_vec()));
         r.set(gimli::DW_AT_comp_dir, AttributeValue::String(dir.as_bytes().to_vec()));
         r.set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
+    }
+    // Constant pieces by the function they belong to (their location
+    // chain's outermost scope).
+    let mut sub_consts: FxHashMap<u32, Vec<(u32, u64)>> = FxHashMap::default();
+    {
+        let tab = d.pieces.lock().unwrap();
+        for (&id, &c) in consts {
+            let mut x = d.locs[tab.list[id as usize].loc as usize];
+            while x.inlined_at != 0 {
+                x = d.locs[x.inlined_at as usize];
+            }
+            sub_consts.entry(x.scope).or_default().push((id, c));
+        }
+    }
+    for v in sub_consts.values_mut() {
+        v.sort_unstable();
     }
     let mut cu_ranges = Vec::new();
     for (k, f) in fns.iter().enumerate() {
@@ -494,7 +674,13 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
         }
         cx.dw.unit.line_program.end_sequence(f.size as u64);
         cx.inlined(die, k, &mut tree.kids);
-        cx.vars(die, sub, &tree, &f.vars, fp_reg);
+        let cs: Vec<(u32, [(u32, u32, ValLoc); 1])> = sub_consts
+            .get(&sub)
+            .map_or(&[][..], |v| &v[..])
+            .iter()
+            .map(|&(id, c)| (id, [(0, f.size, ValLoc::Const(c))]))
+            .collect();
+        cx.vars(die, sub, k, &tree, &f.vars, &f.labels, &cs, fp_reg);
     }
     if cu_ranges.is_empty() {
         return;

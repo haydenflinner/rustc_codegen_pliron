@@ -709,6 +709,11 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `iconst` is i8..i64 and panics on anything else, which aborted the
     per-step verifier before it could name the pass that emitted the
     bad inst (rustlantis seeds 65/89 — `iconst.i128` out of lcse/bandk).
+59. `DataFlowGraph::resolve_all_aliases` moves value labels from an alias
+    onto the value it resolves to instead of dropping them
+    (`src/ir/dfg.rs`). Our CLIF passes replace values by aliasing them, so
+    upstream's rule lost most variables' labels (`-g` at `-O`, see
+    `pliron-clif-lower/src/dwarf.rs`). Labels never affect code.
 
 Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
 a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's

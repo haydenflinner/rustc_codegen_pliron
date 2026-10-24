@@ -300,6 +300,8 @@ const V_CONSTS: u8 = 1 << 2;
 const V_RFROZEN: u8 = 1 << 3;
 const V_RNOALIAS: u8 = 1 << 4;
 const V_RFROZEN_OP: u8 = 1 << 5;
+/// Carries debug-info variable pieces (`Context::dbg_notes`).
+const V_DBGNOTE: u8 = 1 << 6;
 
 const B_REGION: u8 = 1;
 const B_PARENT: u8 = 1 << 1;
@@ -324,8 +326,12 @@ struct CalleeTags {
     bb: (usize, usize, usize),
 }
 
-fn tag_value(tags: &mut CalleeTags, st: &State, v: Value) {
+fn tag_value(tags: &mut CalleeTags, st: &State, notes: Option<&FxHashMap<Value, NoteIds>>, v: Value) {
+    // (`notes`: `Context::dbg_notes`, when there are any.)
     let mut m = 0;
+    if notes.is_some_and(|n| n.contains_key(&v)) {
+        m |= V_DBGNOTE;
+    }
     if st.allocas.contains(v) {
         m |= V_ALLOCAS;
     }
@@ -349,8 +355,12 @@ fn tag_value(tags: &mut CalleeTags, st: &State, v: Value) {
     }
 }
 
+type NoteIds = smallvec::SmallVec<[u32; 2]>;
+
 fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags {
     let src = blocks(ctx, callee);
+    let notes_ref = ctx.dbg_notes.borrow();
+    let notes = (!notes_ref.is_empty()).then_some(&*notes_ref);
     let mut tags = CalleeTags::default();
     let (mut vlo, mut vhi, mut nv) = (usize::MAX, 0usize, 0usize);
     let (mut olo, mut ohi, mut no) = (usize::MAX, 0usize, 0usize);
@@ -376,7 +386,7 @@ fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags 
             vlo = vlo.min(u);
             vhi = vhi.max(u);
             nv += 1;
-            tag_value(&mut tags, st, a);
+            tag_value(&mut tags, st, notes, a);
         }
         for op in b.deref(ctx).iter(ctx) {
             let o = op.ord();
@@ -425,7 +435,7 @@ fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags 
                 vlo = vlo.min(u);
                 vhi = vhi.max(u);
                 nv += 1;
-                tag_value(&mut tags, st, v);
+                tag_value(&mut tags, st, notes, v);
             }
         }
     }
@@ -2667,6 +2677,23 @@ fn inline_call(
                     dc.loc = d.inline_at(dc.loc, site, &mut dbg_memo);
                     d.declare(nv, dc);
                 }
+            }
+        }
+        if m & V_DBGNOTE != 0
+            && let Some(d) = st.dbg.as_deref_mut()
+        {
+            // The clone holds the inlined instance's pieces.
+            let mut notes = ctx.dbg_notes.borrow_mut();
+            if let Some(ids) = notes.get(&v).cloned() {
+                let mut nids = NoteIds::new();
+                for id in ids {
+                    let mut pc = d.pieces.get_mut().unwrap().list[id as usize];
+                    if site != 0 {
+                        pc.loc = d.inline_at(pc.loc, site, &mut dbg_memo);
+                    }
+                    nids.push(d.pieces.get_mut().unwrap().id(pc));
+                }
+                notes.entry(nv).or_default().extend(nids);
             }
         }
         if m & V_PROMOTED != 0 {
