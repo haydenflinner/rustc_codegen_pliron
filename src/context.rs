@@ -47,6 +47,12 @@ pub struct CodegenCx<'tcx> {
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), Value>>,
     pub tcache: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), TypeHandle>>,
     pub scache: RefCell<FxHashMap<Ty<'tcx>, TypeHandle>>,
+    /// `-g`: the location `set_dbg_loc` made current (0 = none), stamped
+    /// on every op the Builder emits; see `debuginfo.rs`.
+    pub dbg_cur: std::cell::Cell<u32>,
+    pub dbg_insts: RefCell<FxHashMap<Instance<'tcx>, u32>>,
+    pub dbg_files: RefCell<FxHashMap<rustc_span::BytePos, u32>>,
+    pub dbg_types: RefCell<FxHashMap<Ty<'tcx>, u32>>,
     /// CGU symbol this codegen context is building (set at construction;
     /// read-only afterwards — tracing uses it without borrowing `st`).
     pub cgu_name: String,
@@ -82,12 +88,17 @@ impl<'tcx> CodegenCx<'tcx> {
             module,
             st: RefCell::new(State {
                 eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx),
+                dbg: crate::debuginfo::cu_info(tcx, name),
                 ..State::default()
             }),
             const_allocs: Default::default(),
             vtables: Default::default(),
             tcache: Default::default(),
             scache: Default::default(),
+            dbg_cur: Default::default(),
+            dbg_insts: Default::default(),
+            dbg_files: Default::default(),
+            dbg_types: Default::default(),
         }
     }
 
@@ -364,9 +375,9 @@ impl<'tcx> BackendTypes for CodegenCx<'tcx> {
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
-    type DIScope = ();
-    type DILocation = ();
-    type DIVariable = ();
+    type DIScope = u32;
+    type DILocation = u32;
+    type DIVariable = u32;
 }
 
 impl<'tcx> HasTyCtxt<'tcx> for CodegenCx<'tcx> {

@@ -332,6 +332,8 @@ pub struct State {
     pub strs: SymMap<Value>,
     pub counter: usize,
     pub cgu: String,
+    /// Debug-location tables (`-g`); `None` without debuginfo.
+    pub dbg: Option<Box<crate::dbg::DbgInfo>>,
     /// `#[rustc_align(N)]` / `-Cmin-function-alignment` per function symbol
     /// (rustc's `codegen_instance_attrs(..).alignment`, which also covers
     /// shims): the definition's minimum alignment in bytes.

@@ -59,9 +59,9 @@ impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
-    type DIScope = ();
-    type DILocation = ();
-    type DIVariable = ();
+    type DIScope = u32;
+    type DILocation = u32;
+    type DIVariable = u32;
 }
 
 impl<'a, 'tcx> HasTyCtxt<'tcx> for Builder<'a, 'tcx> {
@@ -109,6 +109,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn push(&mut self, op: Ptr<Operation>) -> Option<Value> {
         let ctx = self.cx.pctx.borrow();
         op.insert_at_back(self.block, &ctx);
+        let l = self.cx.dbg_cur.get();
+        if l != 0 {
+            use pliron::location::Located;
+            op.deref_mut(&ctx).set_loc(pliron::location::Location::Dbg(l));
+        }
         let o = op.deref(&ctx);
         (o.get_num_results() > 0).then(|| o.get_result(&ctx, 0))
     }
@@ -303,6 +308,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let mut ctx = cx.pctx.borrow_mut();
         let f = Operation::get_op::<FuncOp>(llfn, &ctx).unwrap();
         if f.get_entry_block(&ctx).is_none() {
+            // A new body: until rustc sets one, its ops have no location
+            // (not the previous function's).
+            cx.dbg_cur.set(0);
             return f.get_or_create_entry_block(&mut ctx);
         }
         let region = llfn.deref(&ctx).get_region(&ctx, 0);
@@ -1452,48 +1460,61 @@ impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn dbg_scope_fn(
         &mut self,
-        _instance: Instance<'tcx>,
+        instance: Instance<'tcx>,
         _fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-        _llfn: Option<Ptr<Operation>>,
-    ) {
+        llfn: Option<Ptr<Operation>>,
+    ) -> u32 {
+        self.cx.dbg_scope_fn(instance, llfn.is_some())
     }
-    fn dbg_create_lexical_block(&mut self, _pos: rustc_span::BytePos, _parent: ()) {}
-    fn dbg_location_clone_with_discriminator(&mut self, _loc: (), _d: u32) -> Option<()> {
-        Some(())
+    fn dbg_create_lexical_block(&mut self, _pos: rustc_span::BytePos, parent: u32) -> u32 {
+        parent
     }
-    fn dbg_loc(&mut self, _scope: (), _inlined_at: Option<()>, _span: Span) {}
-    fn extend_scope_to_file(&mut self, _scope: (), _file: &rustc_span::SourceFile) {}
+    fn dbg_location_clone_with_discriminator(&mut self, loc: u32, _d: u32) -> Option<u32> {
+        Some(loc)
+    }
+    fn dbg_loc(&mut self, scope: u32, inlined_at: Option<u32>, span: Span) -> u32 {
+        self.cx.dbg_loc(scope, inlined_at, span)
+    }
+    fn extend_scope_to_file(&mut self, scope: u32, _file: &rustc_span::SourceFile) -> u32 {
+        scope
+    }
     fn create_dbg_var(
         &mut self,
-        _name: rustc_span::Symbol,
-        _ty: Ty<'tcx>,
-        _scope: (),
-        _kind: rustc_codegen_ssa::mir::debuginfo::VariableKind,
-        _span: Span,
-    ) {
+        name: rustc_span::Symbol,
+        ty: Ty<'tcx>,
+        scope: u32,
+        kind: rustc_codegen_ssa::mir::debuginfo::VariableKind,
+        span: Span,
+    ) -> u32 {
+        self.cx.dbg_var(name, ty, scope, kind, span)
     }
     fn dbg_var_addr(
         &mut self,
-        _dbg_var: (),
-        _dbg_loc: (),
-        _variable_alloca: Value,
-        _direct_offset: Size,
-        _indirect_offsets: &[Size],
-        _fragment: &Option<std::ops::Range<Size>>,
+        dbg_var: u32,
+        dbg_loc: u32,
+        variable_alloca: Value,
+        direct_offset: Size,
+        indirect_offsets: &[Size],
+        fragment: &Option<std::ops::Range<Size>>,
     ) {
+        self.cx.dbg_declare(dbg_var, dbg_loc, variable_alloca, direct_offset, indirect_offsets, fragment)
     }
     fn dbg_var_value(
         &mut self,
-        _dbg_var: (),
-        _dbg_loc: (),
+        _dbg_var: u32,
+        _dbg_loc: u32,
         _value: Value,
         _direct_offset: Size,
         _indirect_offsets: &[Size],
         _fragment: &Option<std::ops::Range<Size>>,
     ) {
     }
-    fn set_dbg_loc(&mut self, _dbg_loc: ()) {}
-    fn clear_dbg_loc(&mut self) {}
+    fn set_dbg_loc(&mut self, dbg_loc: u32) {
+        self.cx.dbg_cur.set(dbg_loc);
+    }
+    fn clear_dbg_loc(&mut self) {
+        self.cx.dbg_cur.set(0);
+    }
     fn insert_reference_to_gdb_debug_scripts_section_global(&mut self) {}
     fn set_var_name(&mut self, _value: Value, _name: &str) {}
 }

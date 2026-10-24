@@ -45,6 +45,7 @@ fn main() {
         loopvec: true,
         bcheck: true,
         slp: true,
+        keep_dbg_slots: false,
     };
     let func_id = facts
         .self_name

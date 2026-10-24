@@ -408,6 +408,15 @@ impl Operation {
         newop
     }
 
+    /// PLIRON: the op's [`Location::Dbg`] index, 0 when it has none.
+    #[inline]
+    pub fn dbg_loc(&self) -> u32 {
+        match self.loc {
+            Location::Dbg(i) => i,
+            _ => 0,
+        }
+    }
+
     /// PLIRON: attribute dictionary accessor. Prefer this over direct
     /// `.attributes` field reads so the backing store can change shape.
     #[inline]

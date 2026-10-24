@@ -2,6 +2,7 @@
 //! the embedder (the rustc backend, a JIT) supplies a [`lower::Host`] and
 //! a `cranelift_module::Module`.
 
+pub mod dwarf;
 pub mod eh;
 pub mod hot;
 pub mod lower;

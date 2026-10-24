@@ -26,6 +26,7 @@ mod abi;
 mod asm;
 mod builder;
 mod cgupool;
+mod debuginfo;
 mod consts;
 mod context;
 mod intrinsic;

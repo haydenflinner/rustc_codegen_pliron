@@ -707,6 +707,9 @@ pub(crate) fn finish_pre(
     if env_set("PLIRON_DUMP") && pliron_cfg::tracing_on() {
         tracing::info!(target: "pliron::dump", "==== {name} ====\n{ir}")
     }
+    if cfg.optimize {
+        pliron_ir_opt::dbg::drop_spills(ctx, st);
+    }
     if !cfg.optimize && pass_enabled("PLIRON_ALWAYS_INLINE") {
         inline::run(
             ctx,

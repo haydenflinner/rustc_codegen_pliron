@@ -54,6 +54,8 @@ pub struct FnFlags {
     pub loopvec: bool,
     pub bcheck: bool,
     pub slp: bool,
+    /// `-g -O0`: slotprom leaves variable (keyed) slots in memory.
+    pub keep_dbg_slots: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1949,7 +1951,7 @@ fn s_constbr(p: &mut Pipe, _an: &mut Analysis) -> usize {
 
 fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
     let (cfg, _) = an.cfg_dt(&p.clctx.func);
-    let k = slotprom::run(&mut p.clctx.func, cfg, p.nocap);
+    let k = slotprom::run(&mut p.clctx.func, cfg, p.nocap, p.flags.keep_dbg_slots);
     p.dump("slotprom");
     k
 }
@@ -3311,6 +3313,10 @@ fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Merge disjoint-lifetime explicit slots — last, so slot references
 // cloned by earlier passes are all accounted for before sharing.
 fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    // `-g -O0`: every variable keeps its own slot for the debugger.
+    if p.flags.keep_dbg_slots {
+        return 0;
+    }
     let stats = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO);
     let smdbg = crate::config::tracing_on()

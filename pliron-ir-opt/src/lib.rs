@@ -15,6 +15,7 @@ pub use helpers::{Syms, address_taken, address_taken_ex, bisect_name, bodied, du
 
 pub mod callgvn;
 pub mod constload;
+pub mod dbg;
 pub mod domcheck;
 pub mod guardelim;
 pub mod inline;

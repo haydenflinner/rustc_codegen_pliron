@@ -10,6 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   asmcfi debuginfo
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
@@ -376,6 +377,44 @@ t_asmcfi() {
   rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
 }
 
+t_debuginfo() {
+  # -g: line tables and inlined frames, checked through std's own panic
+  # backtrace (it reads the DWARF) at O0 and O2; variables at O0 (lldb);
+  # the DWARF verifies; and -g changes no optimized code (identical text
+  # with and without it).
+  local src=tests/debuginfo/main.rs o bt l
+  [[ -n "$exe" ]] && return 0
+  for o in 0 2; do
+    rustc $BE --edition 2021 -g -Copt-level=$o -Ccodegen-units=1 $src -o $out/debuginfo$o$exe
+    bt=$(RUST_BACKTRACE=1 $out/debuginfo$o$exe 2>&1 || true)
+    for f in leaf mid top main; do
+      l=$(grep -n "// L:$f\$" $src | cut -d: -f1)
+      echo "$bt" | grep -A1 -E "main::$f\$" | grep -q "main.rs:$l:" ||
+        { echo "debuginfo O$o: no frame main::$f at main.rs:$l" >&2; echo "$bt" >&2; exit 1; }
+    done
+  done
+  # Variables at O0, through a line breakpoint, when lldb is around.
+  if command -v lldb >/dev/null; then
+    l=$(grep -n "// L:top\$" $src | cut -d: -f1)
+    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable p v" \
+      -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
+    grep -q "p = (a = 5, b = -7)" $out/debuginfo.lldb && grep -q "length = 3" $out/debuginfo.lldb ||
+      { echo "debuginfo: lldb shows no p/v at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
+  fi
+  rustc $BE --edition 2021 -g -O -Ccodegen-units=1 --emit obj $src -o $out/debuginfo-g.o
+  rustc $BE --edition 2021 -O -Ccodegen-units=1 --emit obj $src -o $out/debuginfo-nog.o
+  # rustup ships no llvm-dwarfdump; use one from PATH or Homebrew's LLVM.
+  local dd; dd=$(command -v llvm-dwarfdump || echo /opt/homebrew/opt/llvm/bin/llvm-dwarfdump)
+  if [[ -x "$dd" ]]; then
+    "$dd" --verify $out/debuginfo-g.o > $out/debuginfo.verify ||
+      { cat $out/debuginfo.verify >&2; exit 1; }
+  fi
+  local sec=.text; [[ "$(uname -s)" == Darwin ]] && sec=__TEXT,__text
+  "$llvmoc" --dump-section "$sec=$out/debuginfo-g.text" $out/debuginfo-g.o /dev/null
+  "$llvmoc" --dump-section "$sec=$out/debuginfo-nog.text" $out/debuginfo-nog.o /dev/null
+  cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
+}
+
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -659,6 +698,7 @@ want asmlabels && t_asmlabels
 want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want asmcfi && t_asmcfi
+want debuginfo && t_debuginfo
 want facts && t_facts
 want loopalign && t_loopalign
 want commute && t_commute

@@ -5,7 +5,8 @@ are-we-fast-yet is cloned to `~/code/purerust/are-we-fast-yet`, with its
 suites of both workspaces ran under stock rustc and under pliron. The
 `awfy` workspace matched (114 tests). `sightglass` pulls in all of
 Wasmtime and Cranelift, and its tests run wasm benchmarks through a
-pliron-compiled Wasmtime. It found four problems.
+pliron-compiled Wasmtime. It found five problems; debugging the last
+one is what debug info (section 5) was built for.
 
 ## 1. `global_asm!` with `.cfi_*` on Mach-O (a94897e)
 
@@ -98,6 +99,81 @@ Under poison the gate's stanzas pass except:
 - slotmerge's own unit tests, which expect merges;
 - the `pgo` wasm leg's `sort_check` (core's sort built for wasm32): open,
   likely another interval bug.
+
+## 5. Debug info (`-g`): line tables, inlined frames, variables
+
+Until now the backend wrote no DWARF, so every pliron frame in lldb or a
+panic backtrace was `fn + offset`. It now writes it for ELF and Mach-O
+objects. The pipeline:
+
+- **Builder** (`src/debuginfo.rs`): rustc's scopes and spans become a per-CGU
+  table (`pliron-ir-opt/src/dbg.rs`) of interned locations
+  `(file, line, col, scope, inlined_at)`. Every op the Builder emits carries
+  the current one as `Location::Dbg(id)`, a copy-sized variant added to
+  pliron's `Location`.
+- **pliron inliner**: the clones' locations get their inlined-at chain
+  extended with the call site, so pliron's inlining shows up as inlined
+  frames too, not only rustc's MIR inlining.
+- **Lowering**: the id becomes the CLIF srcloc. Cranelift reports each
+  function's machine-code ranges per srcloc, and phase C collects them.
+- **Writer** (`pliron-clif-lower/src/dwarf.rs`, gimli):
+  - a CU per object;
+  - a line table, with an op that has no location continuing the previous
+    row;
+  - a `DW_TAG_subprogram` per function, with `DW_TAG_inlined_subroutine`
+    trees rebuilt from the inlined-at chains.
+- **Relocations** follow clang:
+  - ELF: symbol relocations;
+  - Mach-O: section-relative addresses, patched after layout, which ld64,
+    dsymutil and lldb all accept.
+- **Variables**:
+  - `dbg_var_addr` on an alloca tags its stack slot with a `StackSlotKey`;
+  - after compilation the frame layout gives each slot's FP offset, which
+    becomes `DW_OP_breg29`/`breg6`;
+  - types come from the layout: base types, thin and fat pointers, structs,
+    tuples, closures, unions, arrays, C-like enums; other enums are opaque
+    for now.
+- **At `-g -O0`**, slotprom and slotmerge leave variable slots alone, so
+  lldb shows every local, as with LLVM.
+- **At `-O`**, the alloca spills rustc adds only for debug info are erased
+  before the passes (`dbg::drop_spills`). Otherwise they skewed inlining and
+  load forwarding, and `-g` changed the generated code.
+
+`PLIRON_DWARF=0` drops the sections. Checked by test.sh `debuginfo`:
+
+- std's own panic backtrace at O0 and O2 shows the inlined chain
+  `leaf → mid → top` with the right lines;
+- lldb shows the variables at a line breakpoint;
+- `llvm-dwarfdump --verify` is clean;
+- the optimized text is byte-identical with and without `-g`.
+
+## 6. Miscompile: loadfwd PRE speculated a load onto a critical edge
+
+The new line tables found this one. sightglass-cli's
+`pca_metrics_succeeds_on_all_benchmarks` segfaulted on `ocaml-raytrace`,
+and the backtrace now read:
+
+> `BTreeMap::range` ← `FreeList::dealloc` (free_list.rs:275) ←
+> `add_capacity` ← `DrcHeap::replace_memory` (Wasmtime's GC heap growth)
+
+The bisection:
+
+- `fnbisect` with pliron on `wasmtime` only (26 runs): one function,
+  btree's `search_tree_for_bifurcation::<u32, (Bound<u32>, Bound<u32>)>`.
+- A 20-line `BTreeMap<u32, u32>` range program reproduces it standalone.
+- `bisect.py` on that program: CLIF step `loadfwd2`.
+
+`edge_pre` (partial-availability PRE) made a load available on every
+incoming edge by copying it to the end of each predecessor that lacked
+it. Its soundness note claimed `notrap` loads are speculatable. They are
+not: `notrap` only holds where the load was. Here the load read the
+`Bound` key through a pointer that is null for `Unbounded`. The copy sat
+before a `br_table` whose `Unbounded` arm never loaded.
+
+Now a predecessor that can also branch elsewhere (a critical edge) needs
+a `can_move` load. Splitting the edge, as LLVM does, would keep these
+redundancies; not done. Test: `pliron-clif-opt/tests/loadfwd_critical_edge.rs`
+fails without the fix.
 
 ## Performance notes from the same session
 

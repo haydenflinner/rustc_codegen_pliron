@@ -269,6 +269,8 @@ pub struct Lowered {
     custom_secs: Vec<CustomSec>,
     asm_stubs: rustc_hash::FxHashSet<&'static str>,
     hot_asm: String,
+    /// `-g`: each defined function's srcloc ranges (`State::dbg`).
+    pub dbg_fns: Vec<crate::dwarf::FnLines>,
 }
 
 impl Lowered {
@@ -344,6 +346,7 @@ pub fn lower_to_object(
         ids,
         verbatim_syms,
         custom_secs,
+        dbg_fns,
         ..
     } = lw;
     // `\x01name` is LLVM's no-mangle marker: `obj_sym` already removed it at
@@ -384,6 +387,17 @@ pub fn lower_to_object(
         );
     }
     eh.emit(&mut product);
+    // `PLIRON_DWARF=0`: drop the debug sections (the -g tables still build).
+    let dbg = st.dbg.as_deref().filter(|_| pliron_cfg::pass_enabled("PLIRON_DWARF"));
+    let dwarf = dbg.is_some();
+    if let Some(d) = dbg {
+        // The frame pointer's DWARF number: x29 / rbp.
+        let fp = match isa.triple().architecture {
+            target_lexicon::Architecture::X86_64 => 6,
+            _ => 29,
+        };
+        crate::dwarf::emit(&mut product, d, &dbg_fns, fp);
+    }
     for (alias, target, weak) in &st.aliases {
         let tsym = match ids.get(target).copied() {
             Some(Sym::F(id, _)) => product.function_symbol(id),
@@ -423,7 +437,11 @@ pub fn lower_to_object(
     if let Some(p) = &st.lto_payload {
         crate::objmerge::add_lto_section(&mut product.object, p);
     }
-    product.emit().unwrap()
+    let mut bytes = product.emit().unwrap();
+    if macho && dwarf {
+        crate::dwarf::fix_macho_text_addrs(&mut bytes);
+    }
+    bytes
 }
 
 /// A function's pliron→CLIF lower output plus everything the CLIF
@@ -1148,6 +1166,7 @@ pub fn lower_module<'a>(
         loopvec: st.loopvec,
         bcheck: st.bcheck,
         slp: st.slp,
+        keep_dbg_slots: st.dbg.as_ref().is_some_and(|d| d.keep_slots),
     };
     let simd = matches!(
         isa.triple().architecture,
@@ -1550,6 +1569,7 @@ pub fn lower_module<'a>(
     // libcall; note any compiled function that references it so phase (C+)
     // can define the helper (nothing in the Rust runtime provides it).
     let mut needs_pshufb = false;
+    let mut dbg_fns = Vec::new();
     for j in &jobs {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
@@ -1599,6 +1619,21 @@ pub fn lower_module<'a>(
             &relocs,
         )
         .unwrap_or_else(|e| panic!("define {}: {e}", j.name));
+        if st.dbg.is_some() {
+            dbg_fns.push(crate::dwarf::FnLines {
+                id: j.id,
+                sym: j.name.clone(),
+                size: code.buffer.data().len() as u32,
+                ranges: code
+                    .buffer
+                    .get_srclocs_sorted()
+                    .iter()
+                    .filter(|r| !r.loc.is_default())
+                    .map(|r| (r.start, r.end, r.loc.bits()))
+                    .collect(),
+                vars: dbg_slot_vars(&j.func, code),
+            });
+        }
         eh.add_function(m, j.id, code);
     }
 
@@ -1727,7 +1762,41 @@ pub fn lower_module<'a>(
         custom_secs,
         asm_stubs,
         hot_asm,
+        dbg_fns,
     }
+}
+
+/// `-g`: (decl group, offset from FP) of each variable-holding stack slot
+/// (see the `AllocaOp` lowering) the final code still addresses. A slot
+/// slotmerge folded away keeps its frame space but not its contents.
+fn dbg_slot_vars(func: &ir::Function, code: &cranelift_codegen::CompiledCode) -> Vec<(u32, i64)> {
+    let Some(fl) = code.buffer.frame_layout() else {
+        return Vec::new();
+    };
+    let keyed: Vec<_> = func
+        .sized_stack_slots
+        .iter()
+        .filter_map(|(ss, d)| Some((ss, d.key?.bits())))
+        .collect();
+    if keyed.is_empty() {
+        return Vec::new();
+    }
+    let mut used = FxHashSet::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if let Some(ss) = func.dfg.insts[i].stack_slot() {
+                used.insert(ss);
+            }
+        }
+    }
+    keyed
+        .into_iter()
+        .filter(|(ss, _)| used.contains(ss))
+        .map(|(ss, k)| {
+            let off = fl.stackslots[ss].offset as i64 - fl.frame_to_fp_offset as i64;
+            (k as u32 - 1, off)
+        })
+        .collect()
 }
 
 /// Define `__cranelift_x86_pshufb` in `m` as a private function.
@@ -2018,6 +2087,7 @@ pub fn lower_clif_wasm(
         loopvec: st.loopvec,
         bcheck: st.bcheck,
         slp: st.slp,
+        keep_dbg_slots: st.dbg.as_ref().is_some_and(|d| d.keep_slots),
     };
     let mut decl_names: Vec<String> = Vec::new();
     for (id, d) in m.declarations().get_functions() {
@@ -4117,6 +4187,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
         succs.clear();
         {
             let o = op.deref(self.ctx);
+            // `-g`: an op with no location (pass-made) keeps the previous
+            // op's, as its code usually belongs to the same statement.
+            let l = o.dbg_loc();
+            if l != 0 {
+                self.b.set_srcloc(ir::SourceLoc::new(l));
+            }
             o.operand_defs_into(self.ctx, &mut opnds);
             o.successor_defs_into(self.ctx, &mut succs);
         }
@@ -4740,7 +4816,26 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(AllocaOp) {
             let res = op.deref(ctx).get_result(ctx, 0);
             let (size, align) = self.st.allocas[res];
-            let p = self.slot(size, align);
+            // `-g`: tag a slot that holds variables with their decl group
+            // (key = group + 1), so its frame offset can be found after
+            // compilation. Over-aligned slots have no fixed frame offset.
+            let key = self.st.dbg.as_deref().and_then(|d| {
+                let g = *d.alloca_decls.get(&res)?;
+                let ok = align <= 16 && d.groups[g as usize].iter().all(|&i| d.decls[i as usize].size == size);
+                ok.then_some(g as u64 + 1)
+            });
+            let p = match key {
+                Some(k) => {
+                    let ss = self.b.create_sized_stack_slot(StackSlotData::new_with_key(
+                        StackSlotKind::ExplicitSlot,
+                        size as u32,
+                        align.max(1).trailing_zeros() as u8,
+                        ir::StackSlotKey::new(k),
+                    ));
+                    self.b.ins().stack_addr(self.tcfg.pointer_type(), ss, 0)
+                }
+                None => self.slot(size, align),
+            };
             self.set1(op, p);
         } else if is!(LoadOp) || is!(AtomicLoadOp) {
             let p = self.get1(opnds[0]);

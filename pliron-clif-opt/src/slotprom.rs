@@ -222,7 +222,14 @@ fn undef(func: &mut Function, b: Block, ty: Type) -> Value {
     }
 }
 
-pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst, u32)>) -> usize {
+/// `keep_keyed`: leave slots carrying a `StackSlotKey` (variable slots
+/// under `-g -O0`) in memory, for the debugger.
+pub fn run(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    nocap: &FxHashSet<(Inst, u32)>,
+    keep_keyed: bool,
+) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -253,6 +260,9 @@ pub fn run(func: &mut Function, cfg: &ControlFlowGraph, nocap: &FxHashSet<(Inst,
     // Per-slot access lists; `bad` = escaped slots.
     let mut accs: FxHashMap<StackSlot, Vec<Acc>> = FxHashMap::default();
     let mut bad: FxHashSet<StackSlot> = FxHashSet::default();
+    if keep_keyed {
+        bad.extend(func.sized_stack_slots.iter().filter(|(_, d)| d.key.is_some()).map(|(ss, _)| ss));
+    }
     // Slot → call insts whose operand is a bounded (`nocap`) use of the
     // slot's address — promoted fields sync around them.
     let mut sync_calls: FxHashMap<StackSlot, Vec<Inst>> = FxHashMap::default();
@@ -932,7 +942,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap());
+        let n = run(&mut func, &cfg, &empty_nocap(), false);
         assert!(n > 0, "expected promotion");
         assert_eq!(memops(&func), 0, "no plain load/store should remain");
         assert!(func.dfg.num_block_params(h) >= 1);
@@ -971,7 +981,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap());
+        let n = run(&mut func, &cfg, &empty_nocap(), false);
         assert!(n >= 4, "two stores + two loads should fold, got {n}");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -1008,7 +1018,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
     }
@@ -1046,7 +1056,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0));
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &nocap);
+        let n = run(&mut func, &cfg, &nocap, false);
         assert!(n > 0, "expected promotion");
         // Only the sync pair (writeback store + reload) remains.
         assert_eq!(memops(&func), 2);
@@ -1095,7 +1105,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0));
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap);
+        run(&mut func, &cfg, &nocap, false);
         // The callee must see arg0 in *a: writeback store + post-call
         // reload — if the store is silently dropped the callee reads
         // uninitialized slot memory.
@@ -1149,7 +1159,7 @@ mod tests {
         nocap.insert((call, 0));
         nocap.insert((call, 1));
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap);
+        run(&mut func, &cfg, &nocap, false);
         // Each arg's bytes reach the callee through memory: two
         // writebacks before the call, two reloads after.
         assert_eq!(memops(&func), 4, "missing writeback/reload pairs");
@@ -1185,7 +1195,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
         verify(&func);
     }
 
@@ -1220,7 +1230,7 @@ mod tests {
         cur.ins().return_(&[w]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &empty_nocap());
+        run(&mut func, &cfg, &empty_nocap(), false);
         // The i32 field overlaps the byte load; it must stay in memory
         // (its store + the uload8 itself = 2 memory ops). The i64 field
         // at +0 is disjoint and promotes away its store.
@@ -1272,7 +1282,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap());
+        let n = run(&mut func, &cfg, &empty_nocap(), false);
         assert!(n > 0, "guarded load through nullable param should promote");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -1329,7 +1339,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap());
+        let n = run(&mut func, &cfg, &empty_nocap(), false);
         assert!(n > 0, "correlated sibling store must not escape the slot");
         // Only the real heap store remains.
         assert_eq!(memops(&func), 1);
@@ -1386,7 +1396,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
         verify(&func);
     }
 
@@ -1455,7 +1465,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 1));
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap);
+        run(&mut func, &cfg, &nocap, false);
         // The callee reads ss29 through `a`: 4 writeback stores before
         // the call plus 4 reloads after it — none may be dropped.
         assert_eq!(memops(&func), 8, "missing writeback/reload pairs:\n{func}");
@@ -1494,7 +1504,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
     }

@@ -169,6 +169,10 @@ pub enum Location {
     /// Location unknown.
     /// See [UnknownLoc](https://mlir.llvm.org/docs/Dialects/Builtin/#unknownloc).
     Unknown,
+    /// PLIRON: an index into a debug-location table the embedder keeps
+    /// (rustc_codegen_pliron's per-CGU `State::dbg`). Copy-sized, so
+    /// stamping every op with it costs no allocation.
+    Dbg(u32),
 }
 
 impl Location {
@@ -205,7 +209,7 @@ impl Location {
                     sources(callee, res);
                     sources(caller, res);
                 }
-                Location::Unknown => (),
+                Location::Unknown | Location::Dbg(_) => (),
             }
         }
         sources(self, &mut res);
@@ -261,6 +265,7 @@ impl Printable for Location {
                 )
             }
             Self::Unknown => write!(f, "?"),
+            Self::Dbg(i) => write!(f, "dbg#{i}"),
         }
     }
 }

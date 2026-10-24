@@ -29,6 +29,7 @@ use pliron_llvm::ops::{
     UnreachableOp,
 };
 use pliron_llvm::types::FuncType;
+use pliron::location::Located;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::has_body;
@@ -2612,6 +2613,26 @@ fn inline_call(
     let src = &tags.src;
     let mut map = IrMapping::bounded(tags.vb, tags.ob, tags.bb);
     clone_blocks_into(src, region, ctx, rw, &mut map);
+    // Debug info: the clones now run inlined at the call, so their
+    // inlined-at chains continue at its location.
+    let site = call.deref(ctx).dbg_loc();
+    let mut dbg_memo = FxHashMap::default();
+    if site != 0
+        && let Some(d) = st.dbg.as_deref_mut()
+    {
+        let memo = &mut dbg_memo;
+        for &b in src {
+            let nb = map.lookup_block(b).unwrap();
+            let ops: Vec<Ptr<Operation>> = nb.deref(ctx).iter(ctx).collect();
+            for op in ops {
+                let l = op.deref(ctx).dbg_loc();
+                if l != 0 {
+                    let n = d.inline_at(l, site, memo);
+                    op.deref_mut(ctx).set_loc(pliron::location::Location::Dbg(n));
+                }
+            }
+        }
+    }
     // Region ids are `Ptr<BasicBlock>`s in the source's block space: every
     // record copied below must remap through `map` so a tag anchored at
     // the callee's own entry (or a nested clone's) resolves inside the
@@ -2636,6 +2657,17 @@ fn inline_call(
         };
         if m & V_ALLOCAS != 0 {
             st.allocas.insert(nv, st.allocas[v]);
+            // The clone's variables are the inlined instance's.
+            if site != 0
+                && let Some(d) = st.dbg.as_deref_mut()
+                && let Some(&g) = d.alloca_decls.get(&v)
+            {
+                for di in d.groups[g as usize].clone() {
+                    let mut dc = d.decls[di as usize].clone();
+                    dc.loc = d.inline_at(dc.loc, site, &mut dbg_memo);
+                    d.declare(nv, dc);
+                }
+            }
         }
         if m & V_PROMOTED != 0 {
             st.promoted.insert(nv, st.promoted[v]);
