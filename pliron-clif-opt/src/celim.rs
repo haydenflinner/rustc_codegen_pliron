@@ -1668,11 +1668,18 @@ fn decide_d(
                         return Some(r);
                     }
                 } else if (fx, fy) == (qy, qx) {
-                    let cc = f.0.swap_args();
-                    if let Some(r) = off_implied(cc, qd2 - fd2, qd1 - fd1, q.0.swap_args()) {
+                    // Restate the query in the fact's operand order,
+                    // `(qy + qd2) swap(qc) (qx + qd1)`, and keep the fact
+                    // as is. Swapping the fact's cc as well (with the
+                    // offsets paired crosswise) read a dominating
+                    // `len > max` as deciding `max - 1 < len` false —
+                    // stage-2 rustc's partition loop then failed its
+                    // `cgus[max - 1]` bounds check (2026-10-24).
+                    let qc = q.0.swap_args();
+                    if let Some(r) = off_implied(f.0, qd2 - fd1, qd1 - fd2, qc) {
                         return Some(r);
                     }
-                    if let Some(r) = fact_off_implied(cc, fd2 - qd2, fd1 - qd1, q.0.swap_args()) {
+                    if let Some(r) = fact_off_implied(f.0, fd1 - qd2, fd2 - qd1, qc) {
                         return Some(r);
                     }
                 }
