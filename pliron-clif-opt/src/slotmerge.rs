@@ -214,6 +214,15 @@ pub fn marker_slots(func: &Function, v: Value) -> Vec<StackSlot> {
     Vec::new()
 }
 
+fn sm_take() -> bool {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    match *LIMIT.get_or_init(|| crate::env_get("PLIRON_SM_LIMIT").and_then(|v| v.parse().ok())) {
+        None => true,
+        Some(n) => USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < n,
+    }
+}
+
 pub fn run(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
@@ -770,6 +779,19 @@ pub fn run(
                                                 && !nocap.contains(&(i, k as u32))
                                             {
                                                 escape_deep!(contains, s, i);
+                                            } else if !nokeep && !(sret && k == 0) {
+                                                // ...but only that pointer:
+                                                // one the callee loads *out
+                                                // of* the pointee is fair
+                                                // game — it can hand it back
+                                                // (cranelift's
+                                                // `compute_use_states`
+                                                // closure returns an iterator
+                                                // built from `*env`), so the
+                                                // contained slots escape.
+                                                for s2 in contains[s.index()].clone() {
+                                                    escape!(s2, i);
+                                                }
                                             }
                                         }
                                     }
@@ -781,6 +803,12 @@ pub fn run(
                                             reads[s.index()].push(i);
                                             if !nocap.contains(&(i, k as u32)) {
                                                 escape_deep!(contains, s, i);
+                                            } else {
+                                                // As for direct calls: the
+                                                // pointee's pointers escape.
+                                                for s2 in contains[s.index()].clone() {
+                                                    escape!(s2, i);
+                                                }
                                             }
                                         }
                                     }
@@ -964,6 +992,29 @@ pub fn run(
             }
         }
     }
+    // A span is (header start, back-edge source end) in RPO positions,
+    // but RPO doesn't keep a loop's blocks contiguous: a nested loop
+    // whose header lies inside span A can have its body (and back edges)
+    // placed past A's end, and paths through that body still return to
+    // A's header. cranelift's `compute_use_states` lost a 72-byte
+    // iterator slot that way (`PLIRON_SM_POISON` found it). Close the
+    // spans: A grows to cover any span whose header sits inside it.
+    loop {
+        let mut grew = false;
+        for a in 0..spans.len() {
+            for b in 0..spans.len() {
+                let (alo, ahi) = spans[a];
+                let (blo, bhi) = spans[b];
+                if alo <= blo && blo <= ahi && bhi > ahi {
+                    spans[a].1 = bhi;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
     if crate::env_set("PLIRON_SM_INFO") {
         let mut big: Vec<(u32, u32)> = spans.clone();
         big.sort();
@@ -1004,7 +1055,10 @@ pub fn run(
                     !(lo <= rp && rp <= hi)
                         || writes[s].iter().any(|&w| {
                             let wp = ipos[w];
-                            lo <= wp && wp <= hi && dt.dominates(w, r, &func.layout)
+                            lo <= wp
+                                && wp <= hi
+                                && covers_slot(func, w, StackSlot::from_u32(s as u32))
+                                && dt.dominates(w, r, &func.layout)
                         })
                 });
                 if !fresh {
@@ -1158,6 +1212,15 @@ pub fn run(
             );
         }
     }
+    // `PLIRON_SM_POISON=1`: a use-after-scope check for this analysis.
+    // Merge nothing; instead overwrite each slot that coloring would have
+    // considered with 0xA5 bytes wherever the analysis says it is dead —
+    // so a wrong interval reads garbage at its first stale access, in
+    // every run, whether or not a merge would have reused the bytes.
+    if crate::env_set("PLIRON_SM_POISON") {
+        return poison_dead(func, &order, &bfirst, &blast, &succ_map, &iv, &escaped);
+    }
+
     // Greedy interval coloring, best-fit by region size.
     let mut cand: Vec<(u32, StackSlot)> = (0..nslots)
         .map(|s| StackSlot::from_u32(s as u32))
@@ -1184,6 +1247,9 @@ pub fn run(
                 best = Some(r);
             }
         }
+        // `PLIRON_SM_LIMIT=n`: accept only the first n merges in this
+        // process (delta-debug a bad merge; pair with PLIRON_OPT_FNS).
+        let best = best.filter(|_| sm_take());
         match best {
             Some(r) => {
                 rep.insert(s, regions[r].3);
@@ -1290,4 +1356,159 @@ pub fn run(
         }
     }
     merged
+}
+
+/// Bytes of each slot `poison_dead` overwrites (the rest stay as they are:
+/// a wrong interval still trips on the first 256 bytes in practice).
+const POISON_MAX: u32 = 256;
+
+/// See `PLIRON_SM_POISON` in `run`. A slot's interval `[lo, hi]` is in the
+/// same RPO positions coloring uses; outside it the bytes are claimed
+/// dead. Poison right after the instruction at `hi` (unless it ends its
+/// block) and at the head of every block lying wholly outside the
+/// interval that is entered from a block overlapping it: any path that
+/// leaves the live range and comes back without rewriting the slot then
+/// reads 0xA5..., exactly what a merged neighbour's write could have left.
+fn poison_dead(
+    func: &mut Function,
+    order: &[Block],
+    bfirst: &SecondaryMap<Block, u32>,
+    blast: &SecondaryMap<Block, u32>,
+    succ_map: &SecondaryMap<Block, Vec<Block>>,
+    iv: &[(u32, u32)],
+    escaped: &[bool],
+) -> usize {
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::{InstBuilder, types};
+    let mut pos_inst: Vec<Inst> = Vec::new();
+    for &b in order {
+        pos_inst.extend(func.layout.block_insts(b));
+    }
+    let overlaps = |b: Block, lo: u32, hi: u32| bfirst[b] <= hi && blast[b] >= lo;
+    // `PLIRON_SM_POISON_SLOTS=a..b`: poison only slot indices in [a, b)
+    // (bisect which slot's interval is wrong).
+    let range: Option<(usize, usize)> = crate::env_get("PLIRON_SM_POISON_SLOTS").and_then(|r| {
+        let (a, b) = r.split_once("..")?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    });
+    let mut sites: Vec<(StackSlot, Option<Block>, Option<Inst>)> = Vec::new();
+    for s in 0..iv.len() {
+        let (lo, hi) = iv[s];
+        if lo == u32::MAX || escaped[s] || range.is_some_and(|(a, b)| s < a || s >= b) {
+            continue;
+        }
+        let ss = StackSlot::from_u32(s as u32);
+        if crate::env_set("PLIRON_SM_INFO") {
+            eprintln!("sm-info: poison {ss} iv=({lo}, {hi}) at-hi={:?}", pos_inst.get(hi as usize));
+        }
+        if let Some(&i) = pos_inst.get(hi as usize)
+            && !func.dfg.insts[i].opcode().is_terminator()
+        {
+            sites.push((ss, None, Some(i)));
+        }
+        let mut heads: FxHashSet<Block> = FxHashSet::default();
+        for &b in order {
+            if !overlaps(b, lo, hi) {
+                continue;
+            }
+            for &t in &succ_map[b] {
+                if !overlaps(t, lo, hi) {
+                    heads.insert(t);
+                }
+            }
+        }
+        sites.extend(heads.into_iter().map(|t| (ss, Some(t), None)));
+    }
+    // `PLIRON_SM_POISON_SITES=a..b`: keep only sites a..b (in the order
+    // `PLIRON_SM_INFO` lists them) — bisect which exit path is wrong.
+    if let Some((a, b)) = crate::env_get("PLIRON_SM_POISON_SITES").and_then(|r| {
+        let (a, b) = r.split_once("..")?;
+        Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+    }) {
+        sites = sites.into_iter().enumerate().filter(|(k, _)| *k >= a && *k < b).map(|(_, x)| x).collect();
+    }
+    if crate::env_set("PLIRON_SM_INFO") {
+        for (k, (ss, head, after)) in sites.iter().enumerate() {
+            let span = head.map(|b| (bfirst[b], blast[b]));
+            eprintln!("sm-info: poison site {k}: {ss} head={head:?} pos={span:?} after={after:?}");
+        }
+    }
+    let n = sites.len();
+    // The pointer type `stack_store` needs: whatever this function's
+    // `stack_addr`s produce (i32 on wasm32).
+    let pty = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .find(|&i| matches!(func.dfg.insts[i], InstructionData::StackAddr { .. }))
+        .map(|i| func.dfg.value_type(func.dfg.first_result(i)))
+        .unwrap_or(types::I64);
+    for (ss, head, after) in sites {
+        let size = func.sized_stack_slots[ss].size.min(POISON_MAX);
+        let mut cur = FuncCursor::new(func);
+        match (head, after) {
+            (Some(b), _) => {
+                let Some(first) = cur.func.layout.first_inst(b) else {
+                    continue;
+                };
+                cur = cur.at_inst(first);
+            }
+            (None, Some(i)) => {
+                cur = cur.after_inst(i);
+            }
+            _ => continue,
+        }
+        let w = cur.ins().iconst(types::I64, 0xA5A5_A5A5_A5A5_A5A5u64 as i64);
+        let mut off = 0u32;
+        while off + 8 <= size {
+            cur.ins().stack_store(pty, w, ss, off as i32);
+            off += 8;
+        }
+        if off < size {
+            let b8 = cur.ins().iconst(types::I8, 0xA5);
+            while off < size {
+                cur.ins().stack_store(pty, b8, ss, off as i32);
+                off += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Does write `w` (a store or a `memset`/`memcpy` libcall recorded in
+/// `writes`) overwrite all of `s`? Only then does it make the slot fresh
+/// for a loop trip: an 8-byte store to an array iterator's counter left
+/// the array bytes behind it live across the back edge (tests/loopvec,
+/// caught by `PLIRON_SM_POISON`), so a merge there could clobber them.
+fn covers_slot(func: &Function, w: Inst, s: StackSlot) -> bool {
+    let size = func.sized_stack_slots[s].size as i64;
+    // `v` = `stack_addr s+off` (through aliases): `off`.
+    let base_off = |v: Value| -> Option<i64> {
+        let v = func.dfg.resolve_aliases(v);
+        let i = func.dfg.value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::StackAddr { stack_slot, offset, .. } if stack_slot == s => {
+                Some(i64::from(offset))
+            }
+            _ => None,
+        }
+    };
+    match func.dfg.insts[w] {
+        InstructionData::Store { args, offset, .. } => {
+            let bytes = i64::from(func.dfg.value_type(args[0]).bytes());
+            base_off(args[1]).is_some_and(|o| o + i64::from(offset) == 0 && bytes >= size)
+        }
+        _ => {
+            // mem* libcall: (dst, src|byte, len).
+            let a = func.dfg.inst_args(w);
+            let len = a.get(2).and_then(|&l| {
+                let i = func.dfg.value_def(func.dfg.resolve_aliases(l)).inst()?;
+                match func.dfg.insts[i] {
+                    InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits()),
+                    _ => None,
+                }
+            });
+            a.first().and_then(|&d| base_off(d)) == Some(0) && len.is_some_and(|n| n >= size)
+        }
+    }
 }
