@@ -314,6 +314,8 @@ fn specialize_arm(
     }
     for (i, args) in pushes {
         let ni = func.dfg.clone_inst(i);
+        // `-g`: the copy is the same source operation.
+        func.set_srcloc(ni, func.srcloc(i));
         let mut data = func.dfg.insts[ni];
         let mut it = args.iter();
         {

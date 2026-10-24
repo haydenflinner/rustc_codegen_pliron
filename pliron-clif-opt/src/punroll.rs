@@ -199,6 +199,7 @@ fn emit_cone_clone(
             };
             let ni = func.dfg.make_inst(data);
             let ctv = func.dfg.ctrl_typevar(ii);
+            func.set_srcloc(ni, func.srcloc(ii));
             func.dfg.make_inst_results(ni, ctv);
             func.layout.append_inst(ni, nb);
             for (&o, &nv) in func
@@ -1567,6 +1568,7 @@ fn run_loop(
                 };
                 let ni = func.dfg.make_inst(data);
                 let ctv = func.dfg.ctrl_typevar(ii);
+                func.set_srcloc(ni, func.srcloc(ii));
                 func.dfg.make_inst_results(ni, ctv);
                 func.layout.append_inst(ni, curseg);
                 for (&o, &nv) in func
@@ -2305,6 +2307,7 @@ fn run_region(
                 };
                 let ni = func.dfg.make_inst(data);
                 let ctv = func.dfg.ctrl_typevar(ii);
+                func.set_srcloc(ni, func.srcloc(ii));
                 func.dfg.make_inst_results(ni, ctv);
                 func.layout.append_inst(ni, nb);
                 for (&o, &nv) in func
@@ -2768,6 +2771,8 @@ fn run_peel(
                     continue;
                 }
                 let ni = func.dfg.clone_inst(ii);
+                // `-g`: the copy is the same source operation.
+                func.set_srcloc(ni, func.srcloc(ii));
                 let srcs: Vec<Value> = func.dfg.inst_values(ni).collect();
                 let vals: Vec<Value> = srcs.iter().map(|&v| matv(func, nb, &mut smap, v)).collect();
                 func.dfg.overwrite_inst_values(ni, vals.into_iter());
@@ -3750,6 +3755,7 @@ fn run_jam(
             };
             let ni = func.dfg.make_inst(data);
             let ctv = func.dfg.ctrl_typevar(ii);
+            func.set_srcloc(ni, func.srcloc(ii));
             func.dfg.make_inst_results(ni, ctv);
             func.layout.append_inst(ni, ojh);
             for (&o, &nv) in func
@@ -5339,6 +5345,7 @@ fn run_jam_chooser(
             };
             let ni = func.dfg.make_inst(data);
             let ctv = func.dfg.ctrl_typevar(ii);
+            func.set_srcloc(ni, func.srcloc(ii));
             func.dfg.make_inst_results(ni, ctv);
             func.layout.append_inst(ni, ojh);
             for (&o, &nv) in func
@@ -5384,6 +5391,7 @@ fn run_jam_chooser(
                 };
                 let ni = func.dfg.make_inst(data);
                 let ctv = func.dfg.ctrl_typevar(ii);
+                func.set_srcloc(ni, func.srcloc(ii));
                 func.dfg.make_inst_results(ni, ctv);
                 func.layout.append_inst(ni, ojh);
                 for (&o, &nv) in func
@@ -6005,6 +6013,7 @@ fn clone_inst_into(
     };
     let ni = func.dfg.make_inst(data);
     let ctv = func.dfg.ctrl_typevar(ii);
+    func.set_srcloc(ni, func.srcloc(ii));
     func.dfg.make_inst_results(ni, ctv);
     func.layout.append_inst(ni, dst);
     ni

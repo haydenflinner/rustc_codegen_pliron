@@ -271,6 +271,8 @@ fn apply(func: &mut Function, b: Block, pairs: &[(Inst, Inst, Vec<R>)]) {
     let mut hoisted: Vec<Value> = Vec::with_capacity(pairs.len());
     for (it, _, args) in pairs {
         let ni = func.dfg.clone_inst(*it);
+        // `-g`: the copy is the same source operation.
+        func.set_srcloc(ni, func.srcloc(*it));
         let mut data = func.dfg.insts[ni];
         let mut it2 = args.iter();
         {

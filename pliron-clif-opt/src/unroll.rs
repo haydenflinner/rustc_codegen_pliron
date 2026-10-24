@@ -506,6 +506,8 @@ fn trip(
             }
             if let Some(nb) = nb {
                 let ni = func.dfg.clone_inst(i);
+                // `-g`: the copy is the same source operation.
+                func.set_srcloc(ni, func.srcloc(i));
                 let vals: Vec<Value> = func
                     .dfg
                     .inst_values(ni)

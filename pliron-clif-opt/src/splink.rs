@@ -203,6 +203,7 @@ pub fn run(func: &mut Function, la: &LoopAnalysis, x64: bool) -> usize {
             let data = func.dfg.insts[d];
             let ni = func.dfg.make_inst(data);
             let ctv = func.dfg.ctrl_typevar(d);
+            func.set_srcloc(ni, func.srcloc(d));
             func.dfg.make_inst_results(ni, ctv);
             match func.layout.first_inst(b) {
                 Some(first) => func.layout.insert_inst(ni, first),

@@ -290,6 +290,8 @@ fn emit_arm(
         let mut pos = FuncCursor::new(func).at_inst(term);
         for &i in &arm.clone {
             let ni = pos.func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            pos.func.set_srcloc(ni, pos.func.srcloc(i));
             let vals: Vec<Value> = pos
                 .func
                 .dfg

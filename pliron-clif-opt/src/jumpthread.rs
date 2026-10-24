@@ -1823,6 +1823,8 @@ fn emit_arg(func: &mut Function, pinst: Inst, a: &Arg) -> Value {
         Arg::R(di, subs) => {
             let vals: Vec<Value> = subs.iter().map(|s| emit_arg(func, pinst, s)).collect();
             let ni = func.dfg.clone_inst(*di);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(*di));
             func.dfg.overwrite_inst_values(ni, vals.into_iter());
             func.layout.insert_inst(ni, pinst);
             func.dfg.first_result(ni)
@@ -2905,6 +2907,8 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
         };
         for &i in body {
             let ni = func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(i));
             let vals: Vec<Value> = func
                 .dfg
                 .inst_values(ni)

@@ -400,6 +400,8 @@ pub fn run(
             .collect();
         for i in body {
             let ni = func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(i));
             let dfg = &mut func.dfg;
             let mut data = dfg.insts[ni];
             for d in data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {

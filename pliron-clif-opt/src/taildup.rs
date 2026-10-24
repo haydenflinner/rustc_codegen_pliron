@@ -350,6 +350,8 @@ pub fn run(func: &mut Function) -> usize {
             let mut new_insts = Vec::with_capacity(body.len());
             for i in body {
                 let ni = func.dfg.clone_inst(i);
+                // `-g`: the copy is the same source operation.
+                func.set_srcloc(ni, func.srcloc(i));
                 let dfg = &mut func.dfg;
                 let mut data = dfg.insts[ni];
                 for d in
@@ -409,6 +411,8 @@ pub fn run(func: &mut Function) -> usize {
             // shared def (rustlantis seed1: the in-place `eq`→`ne` flip
             // silently inverted the clone's own brif — loop never exited).
             let ni = func.dfg.clone_inst(cmp);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(cmp));
             if let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ni] {
                 *cond = cond.complement();
             }
@@ -501,6 +505,7 @@ mod tests {
         cur.ins().jump(r, &[]);
 
         let mut cur = FuncCursor::new(&mut func).at_bottom(r);
+        cur.set_srcloc(cranelift_codegen::ir::SourceLoc::new(42));
         cur.ins().brif(c, latch, &[], ret_a, &[]);
 
         // `latch` branches back to `q` — a dominator of `r` — so edge 0 of
@@ -529,6 +534,9 @@ mod tests {
             panic!("cloned brif arg not an icmp:\n{}", func.display());
         };
         assert_eq!(cond, IntCC::Equal, "flip leaked into q's clone:\n{}", func.display());
+        // `-g`: the clone is the same source operation, so it keeps the
+        // source location (else its code joins the previous line's row).
+        assert_eq!(func.srcloc(qt), cranelift_codegen::ir::SourceLoc::new(42));
 
         let flags = cranelift_codegen::settings::Flags::new(
             cranelift_codegen::settings::builder(),

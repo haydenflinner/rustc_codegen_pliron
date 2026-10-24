@@ -3610,6 +3610,8 @@ pub fn coldrets(func: &mut Function, cfg: &ControlFlowGraph, domtree: &Dominator
         func.layout.insert_block_after(nt, b);
         for i in insts {
             let ni = func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(i));
             let dfg = &mut func.dfg;
             let mut d = dfg.insts[ni];
             for dst in d.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {

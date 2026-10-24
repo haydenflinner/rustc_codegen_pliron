@@ -788,6 +788,8 @@ fn run_loop(
                     // would sink on only some exits and lose the write.
                     let nb = split_edge(func, t, slot).expect("exit checked splittable");
                     let ni = func.dfg.clone_inst(s);
+                    // `-g`: the copy is the same source operation.
+                    func.set_srcloc(ni, func.srcloc(s));
                     // The cloned store's address/value are the invariant
                     // values already computed outside the loop.
                     let j = func.layout.last_inst(nb).unwrap();

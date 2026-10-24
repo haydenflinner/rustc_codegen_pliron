@@ -438,6 +438,8 @@ fn apply(func: &mut Function, w: Work) {
         }
         for (it, _ie, ops) in &w.insts {
             let ni = pos.func.dfg.clone_inst(*it);
+            // `-g`: the copy is the same source operation.
+            pos.func.set_srcloc(ni, pos.func.srcloc(*it));
             let mut data = pos.func.dfg.insts[ni];
             let mut it2 = ops.iter().copied();
             {

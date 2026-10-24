@@ -480,6 +480,7 @@ fn remat_guard(
         };
         let ni = func.dfg.make_inst(nd);
         let ctv = func.dfg.ctrl_typevar(i);
+        func.set_srcloc(ni, func.srcloc(i));
         func.dfg.make_inst_results(ni, ctv);
         func.layout.append_inst(ni, g);
         vmap.insert(
@@ -1092,6 +1093,7 @@ fn clone_region(
             };
             let ni = func.dfg.make_inst(data);
             let ctv = func.dfg.ctrl_typevar(i);
+            func.set_srcloc(ni, func.srcloc(i));
             func.dfg.make_inst_results(ni, ctv);
             func.layout.append_inst(ni, nb);
             for (&o, &n) in func

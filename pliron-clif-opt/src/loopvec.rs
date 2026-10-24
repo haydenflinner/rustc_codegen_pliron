@@ -2521,6 +2521,8 @@ fn emit_scalar(
                 unreachable!("side-effecting inst used as scalar invariant")
             }
             let ni = pos.func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            pos.func.set_srcloc(ni, pos.func.srcloc(i));
             let args: Vec<Value> = pos.func.dfg.inst_args(ni).to_vec();
             let vals: Vec<Value> = args
                 .into_iter()
@@ -2618,6 +2620,8 @@ fn emit_deferred(
                 unreachable!("side-effecting inst in lagged feed")
             }
             let ni = pos.func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            pos.func.set_srcloc(ni, pos.func.srcloc(i));
             let args: Vec<Value> = pos.func.dfg.inst_args(ni).to_vec();
             let vals: Vec<Value> = args
                 .into_iter()
@@ -4397,6 +4401,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             let mut cmap: FxHashMap<Value, Value> = FxHashMap::default();
             for i in xb_insts {
                 let ni = pos.func.dfg.clone_inst(i);
+                // `-g`: the copy is the same source operation.
+                pos.func.set_srcloc(ni, pos.func.srcloc(i));
                 let olds = pos.func.dfg.inst_results(i).to_vec();
                 let news = pos.func.dfg.inst_results(ni).to_vec();
                 for (o, n) in olds.into_iter().zip(news) {

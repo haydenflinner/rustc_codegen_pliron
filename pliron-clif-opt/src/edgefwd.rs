@@ -487,6 +487,7 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
                     let data = func.dfg.insts[i];
                     let ctv = func.dfg.ctrl_typevar(i);
                     let ni = func.dfg.make_inst(data);
+                    func.set_srcloc(ni, func.srcloc(i));
                     func.dfg.make_inst_results(ni, ctv);
                     func.layout.insert_inst(ni, pinst);
                     let nargs: Vec<Value> = func

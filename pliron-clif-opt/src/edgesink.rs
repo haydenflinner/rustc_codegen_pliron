@@ -258,6 +258,7 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
             let ty = func.dfg.ctrl_typevar(i);
             for &u in &ubs {
                 let ni = func.dfg.make_inst(data);
+                func.set_srcloc(ni, func.srcloc(i));
                 func.dfg.make_inst_results(ni, ty);
                 match func.layout.first_inst(u) {
                     Some(first) => func.layout.insert_inst(ni, first),

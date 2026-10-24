@@ -730,6 +730,8 @@ pub fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
                         | Opcode::FuncAddr
                 ) {
                 let ni = pos.func.dfg.clone_inst(i);
+                // `-g`: the copy is the same source operation.
+                pos.func.set_srcloc(ni, pos.func.srcloc(i));
                 pos.insert_inst(ni);
                 pos.func.dfg.inst_results(ni)[0]
             } else {
