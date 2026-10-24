@@ -44,7 +44,9 @@ if [[ "$(uname -s)" == Linux ]] && command -v wild >/dev/null; then
   mkdir -p target/wild-ld && ln -sf "$(command -v wild)" target/wild-ld/ld
   BE="$BE -Clinker-features=-lld -Clink-self-contained=-linker -Zunstable-options -Clink-arg=-B$PWD/target/wild-ld"
 fi
-out=target/tests; mkdir -p $out
+# TEST_OUT: a separate output dir, so a variant run (gate.py's poison:*
+# jobs) can run a stanza concurrently with its plain run.
+out=${TEST_OUT:-target/tests}; mkdir -p $out
 llvmbin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
 llvmod="$llvmbin/llvm-objdump$exe"
 # llvm-ar/nm/objcopy behave identically on every platform; the system

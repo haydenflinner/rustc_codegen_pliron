@@ -35,6 +35,9 @@ CLIF_CHECK = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "cl
 BASH = shutil.which("bash") or shutil.which("sh")
 
 
+# test.sh stanzas the gate also runs under PLIRON_SM_POISON (`poison:*`).
+POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "inlinecm", "unroll", "sroa", "licm"]
+
 # rustlantis seeds that exposed real bugs: slp same-address splat
 # (538, 683, 730), loadfwd's dead-pair poisoning (810, 1276) and loop
 # analysis hanging on unreachable preds (1776, compile timeout), and
@@ -147,6 +150,17 @@ def main():
     for n in order:
         if want(n):
             jobs.append((n, lambda n=n: run(n, shell(["./test.sh", f"--only={n}"]), {"TEST_NOBUILD": "1"})))
+    # The same stanzas under `PLIRON_SM_POISON=1`: slotmerge merges nothing
+    # and overwrites every slot it would consider with 0xA5 outside its
+    # computed live interval, so a wrong interval fails at the first stale
+    # read even where no merge would have reused the bytes. It found four
+    # real slotmerge liveness bugs (docs/history/2026-10-24-*). Slot-heavy
+    # stanzas only; each in its own TEST_OUT so it can't race its plain run.
+    for n in POISON_STANZAS:
+        if want(f"poison:{n}") and n in order:
+            jobs.append((f"poison:{n}", lambda n=n: run(f"poison:{n}", shell(["./test.sh", f"--only={n}"]),
+                         {"TEST_NOBUILD": "1", "PLIRON_SM_POISON": "1",
+                          "TEST_OUT": f"target/tests-poison/{n}"})))
     # The wasm sysroot leg is opt-in: four -Zbuild-std builds per backend
     # change makes it ~10x every other job. wasm_smoke covers emit->link->run.
     if (a.full or "wasm" in only) and "wasm" not in skip:
