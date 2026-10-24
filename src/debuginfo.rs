@@ -4,7 +4,7 @@
 //! (subprogram, lexical block) pair — and `DILocation` a location id.
 
 use pliron::value::Value;
-use pliron_ir_opt::dbg::{DbgInfo, Decl, Field, Loc, Sub, Type, Var, Variant};
+use pliron_ir_opt::dbg::{DbgInfo, Decl, Field, Global, Loc, Sub, Type, Var, Variant};
 use rustc_abi::{FieldIdx, Size, TagEncoding, Variants};
 use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind;
@@ -109,6 +109,19 @@ impl<'tcx> CodegenCx<'tcx> {
             d.fn_sub.insert(sym, s);
         }
         d.scope(s, 0)
+    }
+
+    /// `static` `def_id` (symbol `sym`), as rustc_codegen_llvm's
+    /// `build_global_var_di_node` describes it.
+    pub fn dbg_static(&self, def_id: rustc_hir::def_id::DefId, instance: Instance<'tcx>, sym: &str) {
+        let tcx = self.tcx;
+        let ty = instance.ty(tcx, ty::TypingEnv::fully_monomorphized());
+        let ty = self.dbg_type(ty);
+        let (file, line, _) = self.dbg_pos(tcx.def_span(def_id).lo());
+        let mut name = String::new();
+        type_names::push_item_name(tcx, def_id, true, &mut name);
+        let g = Global { name, sym: sym.to_string(), ty, file, line };
+        self.st.borrow_mut().dbg.as_mut().unwrap().globals.push(g);
     }
 
     /// `dbg_create_lexical_block`: a block in `parent` (a scope id).

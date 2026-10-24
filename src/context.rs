@@ -592,6 +592,9 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
         let ty = self.ty_of(init);
         let instance = Instance::mono(self.tcx, def_id);
         let sym = self.tcx.symbol_name(instance).name;
+        if self.st.borrow().dbg.is_some() && !self.tcx.is_thread_local_static(def_id) {
+            self.dbg_static(def_id, instance, sym);
+        }
         let mut st = self.st.borrow_mut();
         let g = st.globals.get_mut(sym).expect("static was not predefined");
         g.ty = ty;

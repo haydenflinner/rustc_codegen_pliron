@@ -102,6 +102,18 @@ pub struct Var {
     pub line: u32,
 }
 
+/// A `static` (`DW_TAG_variable` at CU level, located by its symbol).
+#[derive(Clone, Debug)]
+pub struct Global {
+    /// Path, e.g. `my_crate::COUNTER`.
+    pub name: String,
+    /// The data symbol it lives at.
+    pub sym: String,
+    pub ty: u32,
+    pub file: u32,
+    pub line: u32,
+}
+
 /// "Variable `var` lives `offset` bytes into an alloca" (rustc's
 /// `dbg_var_addr`), as seen at `loc`. `derefs`: then follow a pointer,
 /// adding each offset (by-reference captures and arguments).
@@ -174,6 +186,7 @@ pub struct DbgInfo {
     /// read element types from (`HashMap<K, V>`, `Vec<(A, B)>`).
     pub tparams: FxHashMap<u32, Vec<(String, u32)>>,
     pub vars: Vec<Var>,
+    pub globals: Vec<Global>,
     pub decls: Vec<Decl>,
     /// Alloca result → its decl group: the [`DbgInfo::groups`] index
     /// lowering tags the alloca's stack slot with.

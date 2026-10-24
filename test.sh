@@ -411,10 +411,10 @@ t_debuginfo() {
       { echo "debuginfo: lldb shows no String/Vec at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:shapes\$" $src | cut -d: -f1)
     lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable n o r" \
-      -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
+      -o "frame variable main::LIMIT" -- $out/debuginfo0$exe > $out/debuginfo.lldb 2>&1 || true
     grep -q "(unsigned int) n = 50" $out/debuginfo.lldb && grep -q "__0 = 6" $out/debuginfo.lldb &&
-      grep -q "__0 = -9" $out/debuginfo.lldb ||
-      { echo "debuginfo: lldb shows no inner n / enum payloads at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
+      grep -q "__0 = -9" $out/debuginfo.lldb && grep -q "main::LIMIT = 77" $out/debuginfo.lldb ||
+      { echo "debuginfo: lldb shows no inner n / enum payloads / static at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:sum\$" $src | cut -d: -f1)
     # `x` is dead by then, but its register still holds it.
     lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable k acc x" \

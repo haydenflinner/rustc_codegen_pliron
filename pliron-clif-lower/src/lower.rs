@@ -397,7 +397,16 @@ pub fn lower_to_object(
             _ => 29,
         };
         let consts = dbg_const_pieces(ctx, st);
-        crate::dwarf::emit(&mut product, d, &dbg_fns, fp, &consts);
+        // Statics: their data symbols, when this object defines them.
+        let gsyms: Vec<Option<object::write::SymbolId>> = d
+            .globals
+            .iter()
+            .map(|g| match ids.get(&g.sym) {
+                Some(Sym::D(id, _)) => Some(product.data_symbol(*id)),
+                _ => None,
+            })
+            .collect();
+        crate::dwarf::emit(&mut product, d, &dbg_fns, fp, &consts, &gsyms);
     }
     for (alias, target, weak) in &st.aliases {
         let tsym = match ids.get(target).copied() {

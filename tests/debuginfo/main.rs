@@ -3,6 +3,9 @@
 //! chain leaf → mid → top with each frame's source line. The `// L:`
 //! markers are what test.sh greps the expected lines from.
 
+/// A static: a CU-level variable lldb finds by its path.
+static LIMIT: u32 = 77;
+
 #[derive(Clone, Copy)]
 struct Pair {
     a: u32,
@@ -50,7 +53,7 @@ fn shapes(n: u32) -> u32 {
         let n = n * 10;
         sink(n); // L:shapes
     }
-    o.unwrap_or(0) + r.unwrap_or(0) as u32
+    o.unwrap_or(0) + r.unwrap_or(0) as u32 + std::hint::black_box(&LIMIT)
 }
 
 #[inline(never)]

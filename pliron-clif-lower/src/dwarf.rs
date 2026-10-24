@@ -197,6 +197,7 @@ struct Cx<'a> {
     abstract_subs: FxHashMap<u32, UnitEntryId>,
     types: FxHashMap<u32, UnitEntryId>,
     tag_types: FxHashMap<u32, UnitEntryId>,
+    namespaces: FxHashMap<String, UnitEntryId>,
 }
 
 impl Cx<'_> {
@@ -689,7 +690,14 @@ fn sleb(e: &mut Vec<u8>, mut v: i64) {
 }
 
 /// Write the debug sections for `fns` into `product`'s object.
-pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u16, consts: &FxHashMap<u32, u64>) {
+pub fn emit(
+    product: &mut ObjectProduct,
+    d: &DbgInfo,
+    fns: &[FnLines],
+    fp_reg: u16,
+    consts: &FxHashMap<u32, u64>,
+    gsyms: &[Option<object::write::SymbolId>],
+) {
     let obj = &product.object;
     let macho = obj.format() == BinaryFormat::MachO;
     if !matches!(obj.format(), BinaryFormat::MachO | BinaryFormat::Elf) {
@@ -716,6 +724,7 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
         abstract_subs: FxHashMap::default(),
         types: FxHashMap::default(),
         tag_types: FxHashMap::default(),
+        namespaces: FxHashMap::default(),
     };
     let root = cx.dw.unit.root();
     {
@@ -825,6 +834,47 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
             .collect();
         cx.vars(die, sub, k, &tree, &f.vars, &f.labels, &cs, fp_reg);
     }
+    // Statics: `Address::Symbol` indices past the functions' name them.
+    let mut dsyms = Vec::new();
+    for (g, sym) in d.globals.iter().zip(gsyms) {
+        let Some(sym) = *sym else { continue };
+        let t = cx.ty(g.ty);
+        let fid = cx.file(g.file);
+        // In namespaces, as LLVM does: lldb then finds `TEST` and
+        // `krate::m::TEST` alike.
+        let mut parts: Vec<&str> = g.name.split("::").collect();
+        let base = parts.pop().unwrap_or("");
+        let mut parent = root;
+        for (k, _) in parts.iter().enumerate() {
+            let path = parts[..=k].join("::");
+            parent = match cx.namespaces.get(&path) {
+                Some(&n) => n,
+                None => {
+                    let n = cx.dw.unit.add(parent, gimli::DW_TAG_namespace);
+                    cx.dw.unit.get_mut(n).set(gimli::DW_AT_name, AttributeValue::String(parts[k].as_bytes().to_vec()));
+                    cx.namespaces.insert(path, n);
+                    n
+                }
+            };
+        }
+        let vd = cx.dw.unit.add(parent, gimli::DW_TAG_variable);
+        let mut loc = Expression::new();
+        loc.op_addr(Address::Symbol { symbol: fns.len() + dsyms.len(), addend: 0 });
+        dsyms.push(sym);
+        let e = cx.dw.unit.get_mut(vd);
+        e.set(gimli::DW_AT_name, AttributeValue::String(base.as_bytes().to_vec()));
+        if let Some(t) = t {
+            e.set(gimli::DW_AT_type, AttributeValue::UnitRef(t));
+        }
+        e.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(fid)));
+        e.set(gimli::DW_AT_decl_line, AttributeValue::Udata(g.line as u64));
+        e.set(gimli::DW_AT_location, AttributeValue::Exprloc(loc));
+        // lldb names a global by its demangled linkage name: that is what
+        // `v krate::m::NAME` matches (not the namespace path).
+        if g.sym != base {
+            e.set(gimli::DW_AT_linkage_name, AttributeValue::String(g.sym.as_bytes().to_vec()));
+        }
+    }
     if cu_ranges.is_empty() {
         return;
     }
@@ -836,7 +886,7 @@ pub fn emit(product: &mut ObjectProduct, d: &DbgInfo, fns: &[FnLines], fp_reg: u
 
     // Section ids first (relocations may target any of them), then data.
     let mut ids: FxHashMap<SectionId, object::write::SectionId> = FxHashMap::default();
-    let fsyms: Vec<_> = fns.iter().map(|f| product.function_symbol(f.id)).collect();
+    let fsyms: Vec<_> = fns.iter().map(|f| product.function_symbol(f.id)).chain(dsyms).collect();
     let obj = &mut product.object;
     sections
         .for_each(|id, w| -> Result<(), ()> {
