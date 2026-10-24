@@ -592,7 +592,13 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
         let ty = self.ty_of(init);
         let instance = Instance::mono(self.tcx, def_id);
         let sym = self.tcx.symbol_name(instance).name;
-        if self.st.borrow().dbg.is_some() && !self.tcx.is_thread_local_static(def_id) {
+        // A nested static (the allocation behind `static S: &[T] = &[..]`)
+        // is a synthetic def with no type of its own; cg_llvm skips it too.
+        let nested = matches!(
+            self.tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::Static { nested: true, .. }
+        );
+        if self.st.borrow().dbg.is_some() && !nested && !self.tcx.is_thread_local_static(def_id) {
             self.dbg_static(def_id, instance, sym);
         }
         let mut st = self.st.borrow_mut();

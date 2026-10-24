@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   asmcfi asmextern debuginfo
+#   asmcfi asmextern debuginfo dbgnested
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
@@ -379,6 +379,12 @@ t_asmcfi() {
   rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
 }
 
+t_dbgnested() {
+  # -g on a `static mut` whose initializer borrows `&mut [..]`: the nested
+  # static it interns is a synthetic def and gets no debug info.
+  rustc $BE --edition 2021 -g tests/dbgnested/main.rs -o $out/dbgnested$exe && [[ "$($out/dbgnested$exe)" == "10 4" ]]
+}
+
 t_asmextern() {
   # asm! calling C by raw Mach-O name (`bl _malloc`): the undefined
   # reference must keep its `_` through objmerge's splice.
@@ -742,6 +748,7 @@ want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern
+want dbgnested && t_dbgnested
 want debuginfo && t_debuginfo
 want facts && t_facts
 want loopalign && t_loopalign
