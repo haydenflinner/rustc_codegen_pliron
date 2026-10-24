@@ -19,8 +19,9 @@
 //! - `other` — the value may be something else entirely.
 //!
 //! A value with `slots` empty is provably not slot-derived; a value with
-//! *no* flags and no slots is opaque-absent (unreachable or unknown —
-//! callers treat it as non-slot).
+//! *no* flags and no slots is opaque-absent (unreachable — callers treat
+//! it as non-slot). An unknown value is `other`: that includes the
+//! function's arguments and `try_call` results.
 //!
 //! Two layers on top of the raw sets:
 //!
@@ -302,6 +303,20 @@ impl Webs {
         // a web and oscillate; joining is monotone and keeps slot
         // members once seen (over-approximation is sound — `other`
         // never counts as a slot escape).
+        //
+        // A param no edge defines is an unknown pointer, i.e. `other`: the
+        // function's own arguments (entry params), and `try_call` result
+        // payloads (edge arg `None`). An empty web would read as "provably
+        // not slot-derived", so `select(arg, &slot)` would look like an
+        // exact slot address — slotprom then promoted stage2 rustc's
+        // `resolved.as_ref().unwrap_or(self)` and read `resolved`'s stale
+        // fields when it was `None` (`PlaceBuilder::try_to_place`,
+        // as_place.rs:258 "could not resolve local", 2026-10-24).
+        if let Some(e) = func.layout.entry_block() {
+            for &p in func.dfg.block_params(e) {
+                w.pw.insert(p, Web::other());
+            }
+        }
         let mut rounds = 0;
         loop {
             rounds += 1;
@@ -310,8 +325,9 @@ impl Webs {
                 for (k, &p) in func.dfg.block_params(*b).iter().enumerate() {
                     let mut nw = w.pw.get(&p).cloned().unwrap_or_default();
                     for e in es {
-                        if let Some(Some(a)) = e.args.get(k) {
-                            nw.join(&w.eval(func, *a, 0), &w.poisoned);
+                        match e.args.get(k) {
+                            Some(Some(a)) => nw.join(&w.eval(func, *a, 0), &w.poisoned),
+                            _ => nw.join(&Web::other(), &w.poisoned),
                         }
                     }
                     if w.pw.get(&p) != Some(&nw) {
@@ -464,10 +480,13 @@ impl Webs {
                     .clone()
             };
             if eps.is_empty() {
-                return self.pw.get(&v).cloned().unwrap_or_default();
+                return self.pw.get(&v).cloned().unwrap_or_else(Web::other);
             }
+            let Some(es) = self.edges.get(&blk) else {
+                return self.pw.get(&v).cloned().unwrap_or_else(Web::other);
+            };
             let mut out = Web::default();
-            if let Some(es) = self.edges.get(&blk) {
+            {
                 'e: for e in es {
                     for (j, eb) in eps.iter() {
                         if !eb.iter().any(|&e| self.dt.try_dominates(e, b, &func.layout)) {
@@ -480,8 +499,9 @@ impl Webs {
                             continue 'e;
                         }
                     }
-                    if let Some(&Some(a)) = e.args.get(idx) {
-                        out.join(&self.eval(func, a, 0), &self.poisoned);
+                    match e.args.get(idx) {
+                        Some(&Some(a)) => out.join(&self.eval(func, a, 0), &self.poisoned),
+                        _ => out.join(&Web::other(), &self.poisoned),
                     }
                 }
             }
