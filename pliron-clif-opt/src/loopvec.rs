@@ -598,7 +598,9 @@ fn param_coeffs(
                     }
                     Opcode::Isub => {
                         param_coeffs(func, ps, info, kinds, a, mul, out, d)?;
-                        param_coeffs(func, ps, info, kinds, b, -mul, out, d)
+                        // Modular like the `imul` arm: `-i64::MIN` (fuzz seed
+                        // 4895) wraps to itself, as the CLIF value does.
+                        param_coeffs(func, ps, info, kinds, b, mul.wrapping_neg(), out, d)
                     }
                     Opcode::Imul => {
                         if let Some(k) = iconst(func, b) {

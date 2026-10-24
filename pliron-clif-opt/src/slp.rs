@@ -919,7 +919,9 @@ fn try_block<'d>(
                 }
                 match run.last() {
                     None => run.push(s),
-                    Some(&last) if s.off == last.off + esz => run.push(s),
+                    // Checked: an offset at the top of the i64 range has no
+                    // adjacent next lane (fuzz seeds 5042/5542 overflowed).
+                    Some(&last) if last.off.checked_add(esz) == Some(s.off) => run.push(s),
                     Some(&last) if s.off == last.off => continue, // overwritten
                     _ => {
                         run.clear();
@@ -1234,7 +1236,8 @@ fn may_overlap(
         (Root::V(va), Root::V(vb)) if va != vb => return true,
         _ => {}
     }
-    a.1 < b.1 + i64::from(b.2) && b.1 < a.1 + i64::from(a.2)
+    // Saturating: an overflowing end can only report more overlap.
+    a.1 < b.1.saturating_add(i64::from(b.2)) && b.1 < a.1.saturating_add(i64::from(a.2))
 }
 
 /// `v` is the single result of an inst at `pos` in the block's inst list.
@@ -1463,7 +1466,7 @@ impl X<'_> {
                     self.splats += 1;
                     return Some(Pack::Splat(a));
                 }
-                if rb.1 == ra.1 + i64::from(ra.2) && (ra.2 == 4 || ra.2 == 8) {
+                if ra.1.checked_add(i64::from(ra.2)) == Some(rb.1) && (ra.2 == 4 || ra.2 == 8) {
                     self.min_load = self
                         .min_load
                         .min(pos_at(self.pos, ia))
@@ -1756,7 +1759,13 @@ fn store_dead(
         if !may_overlap(ur, r2, x.iso) {
             continue;
         }
-        if o2 == Opcode::Store && r2.1 <= ur.1 && ur.1 + i64::from(ur.2) <= r2.1 + i64::from(r2.2) {
+        if o2 == Opcode::Store
+            && r2.1 <= ur.1
+            && matches!(
+                (ur.1.checked_add(i64::from(ur.2)), r2.1.checked_add(i64::from(r2.2))),
+                (Some(ue), Some(re)) if ue <= re
+            )
+        {
             return true; // fully covered by a later store
         }
         return false; // a read or partial write of the bytes
@@ -2198,13 +2207,13 @@ fn plan_store(
     let (r1, r2) = (mem_range(func, ps, na, i1)?, mem_range(func, ps, na, i2)?);
     let (sa, sb) = if r1.0 == r2.0
         && r1.2 == r2.2
-        && r1.1 + i64::from(r1.2) == r2.1
+        && r1.1.checked_add(i64::from(r1.2)) == Some(r2.1)
         && matches!(r1.2, 4 | 8)
     {
         (i1, i2)
     } else if r1.0 == r2.0
         && r1.2 == r2.2
-        && r2.1 + i64::from(r2.2) == r1.1
+        && r2.1.checked_add(i64::from(r2.2)) == Some(r1.1)
         && matches!(r1.2, 4 | 8)
     {
         (i2, i1)
