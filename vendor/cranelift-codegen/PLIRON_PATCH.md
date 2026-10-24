@@ -714,6 +714,13 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     (`src/ir/dfg.rs`). Our CLIF passes replace values by aliasing them, so
     upstream's rule lost most variables' labels (`-g` at `-O`, see
     `pliron-clif-lower/src/dwarf.rs`). Labels never affect code.
+60. `VCode::extend_debug_locations` (`src/machinst/vcode.rs`): value-label
+    ranges continue past the end of the vreg's liveness until the location
+    is overwritten (a def, a call clobber or a regalloc move into it), the
+    label's next assignment, or the block end; a block whose predecessors
+    all precede it in layout starts with the locations they agree on.
+    LLVM's LiveDebugValues, roughly: a dead value's register still holds
+    it. Debug info only. `PLIRON_DBGEXT=0` restores upstream ranges.
 
 Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
 a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's

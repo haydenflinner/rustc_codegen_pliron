@@ -1652,16 +1652,20 @@ impl<I: VCodeInst> VCode<I> {
         }
 
         let mut value_labels_ranges: ValueLabelsRanges = HashMap::new();
-        for &(label, from, to, alloc) in &regalloc.debug_locations {
+        let prog_point_to_inst = |prog_point: ProgPoint| {
+            let mut inst = prog_point.inst();
+            if prog_point.pos() == InstPosition::After {
+                inst = inst.next();
+            }
+            inst.index()
+        };
+        // PLIRON: regalloc reports a label only while its vreg is live;
+        // `extend_debug_locations` keeps it until the location is
+        // overwritten, as LLVM's LiveDebugValues does.
+        let locs = self.extend_debug_locations(regalloc, &prog_point_to_inst);
+        for (label, from_inst_index, to_inst_index, alloc) in locs {
             let label = ValueLabel::from_u32(label);
             let ranges = value_labels_ranges.entry(label).or_insert_with(|| vec![]);
-            let prog_point_to_inst = |prog_point: ProgPoint| {
-                let mut inst = prog_point.inst();
-                if prog_point.pos() == InstPosition::After {
-                    inst = inst.next();
-                }
-                inst.index()
-            };
             let inst_to_offset = |inst_index: usize| {
                 // Skip over cold blocks.
                 for offset in &inst_offsets[inst_index..] {
@@ -1671,8 +1675,6 @@ impl<I: VCodeInst> VCode<I> {
                 }
                 func_body_len
             };
-            let from_inst_index = prog_point_to_inst(from);
-            let to_inst_index = prog_point_to_inst(to);
             let from_offset = inst_to_offset(from_inst_index);
             let to_offset = inst_to_offset(to_inst_index);
 
@@ -1728,6 +1730,178 @@ impl<I: VCodeInst> VCode<I> {
         }
 
         value_labels_ranges
+    }
+
+    /// PLIRON: regalloc's debug locations as `(label, from, to, alloc)`
+    /// instruction ranges, each extended past the end of its vreg's
+    /// liveness for as long as nothing overwrites the location: a dead
+    /// value's register still holds it (LLVM's LiveDebugValues). Within a
+    /// block a location ends at an instruction that defines it, clobbers
+    /// it (calls) or moves into it (regalloc edits), and at the end of the
+    /// label's assignment (the next value with that label in linear
+    /// order, `debug_value_labels`). A block entered only from blocks
+    /// before it in layout order starts with the locations all of them
+    /// end with (a back edge, unvisited yet, gives none). `PLIRON_DBGEXT=0`
+    /// keeps regalloc's ranges as they are. Debug info only: no code
+    /// changes.
+    fn extend_debug_locations(
+        &self,
+        regalloc: &regalloc2::Output,
+        pp: &dyn Fn(ProgPoint) -> usize,
+    ) -> Vec<(u32, usize, usize, regalloc2::Allocation)> {
+        use regalloc2::Allocation;
+        static EXT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let raw: Vec<(u32, usize, usize, Allocation)> = regalloc
+            .debug_locations
+            .iter()
+            .map(|&(l, f, t, a)| (l, pp(f), pp(t), a))
+            .filter(|r| r.1 < r.2)
+            .collect();
+        if !*EXT.get_or_init(|| std::env::var("PLIRON_DBGEXT").as_deref() != Ok("0")) {
+            return raw;
+        }
+        let n = self.num_insts();
+        // Each label's assignment intervals, sorted (`debug_value_labels`
+        // is sorted by vreg; re-sort per label by start).
+        let mut assign: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+        for &(_, from, to, l) in &self.debug_value_labels {
+            assign.entry(l).or_default().push((from.index(), to.index()));
+        }
+        for v in assign.values_mut() {
+            v.sort_unstable();
+        }
+        let bound_of = |l: u32, i: usize| -> usize {
+            let Some(v) = assign.get(&l) else { return i };
+            match v.partition_point(|&(f, _)| f <= i) {
+                0 => i,
+                k => {
+                    let (f, t) = v[k - 1];
+                    if f <= i && i < t { t } else { i }
+                }
+            }
+        };
+        // Locations of interest, and where each is overwritten: `kills[k]`
+        // = allocations invalid from instruction `k` on.
+        let mut interest: crate::FxHashSet<Allocation> = Default::default();
+        for r in &raw {
+            interest.insert(r.3);
+        }
+        let mut kills: Vec<smallvec::SmallVec<[Allocation; 2]>> = vec![Default::default(); n + 1];
+        for i in 0..n {
+            let inst = InsnIndex::new(i);
+            for (op, &a) in self.inst_operands(inst).iter().zip(regalloc.inst_allocs(inst)) {
+                if op.kind() == OperandKind::Def && interest.contains(&a) {
+                    kills[i + 1].push(a);
+                }
+            }
+            let cl = self.inst_clobbers(inst);
+            if cl != PRegSet::default() {
+                for &a in &interest {
+                    if let Some(r) = a.as_reg()
+                        && cl.contains(r)
+                    {
+                        kills[i + 1].push(a);
+                    }
+                }
+            }
+        }
+        for &(p, ref e) in &regalloc.edits {
+            let Edit::Move { to, .. } = e;
+            if interest.contains(to) {
+                let k = if p.pos() == InstPosition::After { p.inst().index() + 1 } else { p.inst().index() };
+                kills[k.min(n)].push(*to);
+            }
+        }
+        // Regalloc's ranges as starts: at their first instruction and again
+        // at each block start they cover.
+        let nb = self.num_blocks();
+        let bstart: Vec<usize> = (0..nb).map(|b| self.block_insns(BlockIndex::new(b)).first().index()).collect();
+        let mut starts: FxHashMap<usize, Vec<(u32, Allocation, usize)>> = FxHashMap::default();
+        for &(l, f, t, a) in &raw {
+            starts.entry(f).or_default().push((l, a, t));
+            let k0 = bstart.partition_point(|&s| s <= f);
+            for &s in &bstart[k0..] {
+                if s >= t {
+                    break;
+                }
+                starts.entry(s).or_default().push((l, a, t));
+            }
+        }
+        // label -> (alloc, assignment end, regalloc range end, open since)
+        type St = FxHashMap<u32, (Allocation, usize, usize, usize)>;
+        let mut out = Vec::new();
+        let mut outs: Vec<Option<Vec<(u32, Allocation, usize)>>> = vec![None; nb];
+        for b in 0..nb {
+            let bi = BlockIndex::new(b);
+            let r = self.block_insns(bi);
+            let (s0, e0) = (r.first().index(), r.last().index() + 1);
+            let mut st: St = St::default();
+            let preds = self.block_preds(bi);
+            if !preds.is_empty() && preds.iter().all(|p| p.index() < b) {
+                let mut first = true;
+                let mut acc: FxHashMap<u32, (Allocation, usize)> = FxHashMap::default();
+                for p in preds {
+                    let o = outs[p.index()].as_deref().unwrap_or(&[]);
+                    if first {
+                        acc = o.iter().map(|&(l, a, bd)| (l, (a, bd))).collect();
+                        first = false;
+                    } else {
+                        let m: FxHashMap<u32, (Allocation, usize)> = o.iter().map(|&(l, a, bd)| (l, (a, bd))).collect();
+                        acc.retain(|l, v| match m.get(l) {
+                            Some(&(a, bd)) if a == v.0 => {
+                                v.1 = v.1.min(bd);
+                                true
+                            }
+                            _ => false,
+                        });
+                    }
+                }
+                for (l, (a, bd)) in acc {
+                    if s0 < bd {
+                        st.insert(l, (a, bd, 0, s0));
+                    }
+                }
+            }
+            for i in s0..e0 {
+                let close = |st: &mut St, out: &mut Vec<_>, l: u32, i: usize| {
+                    if let Some((a, _, _, since)) = st.remove(&l)
+                        && since < i
+                    {
+                        out.push((l, since, i, a));
+                    }
+                };
+                if !kills[i].is_empty() || !st.is_empty() {
+                    let dead: Vec<u32> = st
+                        .iter()
+                        .filter(|(_, v)| v.1 <= i || (v.2 <= i && kills[i].contains(&v.0)))
+                        .map(|(&l, _)| l)
+                        .collect();
+                    for l in dead {
+                        close(&mut st, &mut out, l, i);
+                    }
+                }
+                if let Some(ss) = starts.get(&i) {
+                    for &(l, a, t) in ss {
+                        match st.get_mut(&l) {
+                            Some(v) if v.0 == a => v.2 = v.2.max(t),
+                            _ => {
+                                close(&mut st, &mut out, l, i);
+                                let bd = bound_of(l, i).max(t);
+                                st.insert(l, (a, bd, t, i));
+                            }
+                        }
+                    }
+                }
+            }
+            for (&l, &(a, _, _, since)) in &st {
+                if since < e0 {
+                    out.push((l, since, e0, a));
+                }
+            }
+            outs[b] = Some(st.into_iter().map(|(l, (a, bd, _, _))| (l, a, bd)).collect());
+        }
+        out.sort_unstable_by_key(|&(l, f, _, _)| (l, f));
+        out
     }
 
     fn log_value_labels_ranges(&self, regalloc: &regalloc2::Output, inst_offsets: &[CodeOffset]) {

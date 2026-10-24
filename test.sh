@@ -416,10 +416,12 @@ t_debuginfo() {
       grep -q "__0 = -9" $out/debuginfo.lldb ||
       { echo "debuginfo: lldb shows no inner n / enum payloads at main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
     l=$(grep -n "// L:sum\$" $src | cut -d: -f1)
-    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable k acc" \
+    # `x` is dead by then, but its register still holds it.
+    lldb --batch -o "breakpoint set --file main.rs --line $l" -o run -o "frame variable k acc x" \
       -- $out/debuginfo2$exe > $out/debuginfo.lldb 2>&1 || true
-    grep -q "k = 5" $out/debuginfo.lldb && grep -q "acc = 15" $out/debuginfo.lldb ||
-      { echo "debuginfo: lldb shows no k/acc at O2 main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
+    grep -q "k = 5" $out/debuginfo.lldb && grep -q "acc = 15" $out/debuginfo.lldb &&
+      grep -q "x = 2" $out/debuginfo.lldb ||
+      { echo "debuginfo: lldb shows no k/acc/x at O2 main.rs:$l" >&2; cat $out/debuginfo.lldb >&2; exit 1; }
   fi
   rustc $BE --edition 2021 -g -O -Ccodegen-units=1 --emit obj $src -o $out/debuginfo-g.o
   rustc $BE --edition 2021 -O -Ccodegen-units=1 --emit obj $src -o $out/debuginfo-nog.o
