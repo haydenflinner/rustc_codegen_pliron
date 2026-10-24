@@ -228,9 +228,33 @@ The bugs, in order of appearance:
      between.
 5. **slp/loopvec overflow ICEs (778a921):** seeds 4895, 5042, 5542.
 
-Stage 2 now gets through typeck and borrowck of `core` and panics in
-`rustc_monomorphize/src/partitioning.rs:349` ("the len is 110 but the
-index is 15": the bounds check itself is wrong). That is the next one.
+6. **celim (410ce76):** partitioning.rs:349, "the len is 110 but the
+   index is 15".
+   - A fact whose operands were the query's reversed was handled by
+     swapping both condition codes, with the offsets paired crosswise.
+   - So `len > max` "decided" `max - 1 < len` false, and
+     `cgus[max - 1]` always panicked.
+   - Found with a crate probe on `rustc_monomorphize`, then
+     `PLIRON_TRACE=pliron::celim=debug`.
+
+With that, the pliron-built stage 2 compiles `core` and std and runs
+rustc's whole UI suite. Results (`selfhost/verify.sh --stage2-only`,
+backend 410ce76):
+
+- 21704 passed, 65 failed. Stage 1 (LLVM-built rustc): 57 failed.
+- 11 stage-2-only failures:
+  - **4 `#full-debuginfo` limit tests: fixed in 6f70b1f.** The new DWARF
+    path asked for the variable's layout without its span, so the
+    "too big for the target architecture" error had no span.
+  - **1 allocator test: fixed in ac34adf.** `asm!` calling
+    `bl _malloc` lost the `_` in objmerge's splice.
+  - **6 open, all SIGBUS on deep recursion.** These are
+    expr-stack-overflow, survive-peano-lesson-queue,
+    deep-try-chain-issue-153583, issue-93775 ×2 and
+    StackColoring-not-blowup-stack-issue-40883. pliron's frames are
+    larger than LLVM's, so the stage-2 compiler overruns rustc's
+    stack red zone between `ensure_sufficient_stack` checks. That is
+    frame size, a separate workstream.
 
 Fuzz: seeds 4096–6143 (2048 programs), 2043 matched, plus the
 four above.
