@@ -1416,6 +1416,14 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
                 let b = p.clctx.func.layout.inst_block(t);
                 eprintln!("sm-info:   edge kill {s} on {t} (in {b:?}) dest {k}");
             }
+            let f = &p.clctx.func;
+            for fr in f.dfg.ext_funcs.keys() {
+                if let cranelift_codegen::ir::ExternalName::User(u) = f.dfg.ext_funcs[fr].name {
+                    let un = &f.params.user_named_funcs()[u];
+                    let name = p.fn_names.get(un.index as usize).map_or("?", |s| s.as_str());
+                    eprintln!("sm-info:   {fr} = {name}");
+                }
+            }
         }
     }
     lt_probe(p, "start");

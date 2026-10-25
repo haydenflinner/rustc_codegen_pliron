@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   asmcfi asmextern debuginfo dbgnested
+#   asmcfi asmextern debuginfo dbgnested nocapfields stackmove
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
@@ -377,6 +377,24 @@ t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
   rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
+}
+
+t_stackmove() {
+  # PLIRON_SM_COALESCE with the slot-liveness stack: a local moved whole
+  # into another (and dropped on an unwind path) shares its slot; the
+  # program, which panics through it once, must match stock rustc.
+  PLIRON_SM_COALESCE=1 PLIRON_NOCAP_FIELDS=1 PLIRON_SLOTMERGE_MARK=1 PLIRON_SM_MARKFLOW=1 PLIRON_SM_PRECISE=1 \
+    rustc $BE --edition 2021 -O tests/stackmove/main.rs -o $out/stackmove$exe \
+    && [[ "$($out/stackmove$exe 2>/dev/null)" == "5 11130 true" ]]
+}
+
+t_nocapfields() {
+  # PLIRON_NOCAP_FIELDS: a field read from an aggregate carries only what
+  # was inserted there (enumerate's index doesn't capture the slice).
+  PLIRON_NOCAP_FIELDS=1 PLIRON_FACTS=fx_ rustc $BE --edition 2021 -O -C codegen-units=1 tests/nocapfields/main.rs -o $out/nocapfields$exe 2> $out/nocapfields.txt && [[ "$($out/nocapfields$exe)" == "135" ]] || return 1
+  sed -E 's/_RNvCs[A-Za-z0-9]+_4main[0-9]+//' $out/nocapfields.txt > $out/nocapfields.got
+  grep -qxF "nocapture fx_enum: [0]" $out/nocapfields.got && grep -qxF "nocapture fx_enum_leak: [1]" $out/nocapfields.got \
+    && grep -qxF "nocapture fx_pair: [0]" $out/nocapfields.got && grep -qxF "nocapture fx_grow: [0]" $out/nocapfields.got
 }
 
 t_dbgnested() {
@@ -749,6 +767,8 @@ want narrowlsr && t_narrowlsr
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern
 want dbgnested && t_dbgnested
+want nocapfields && t_nocapfields
+want stackmove && t_stackmove
 want debuginfo && t_debuginfo
 want facts && t_facts
 want loopalign && t_loopalign

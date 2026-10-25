@@ -25,8 +25,9 @@ use pliron::operation::{OpDbg, Operation};
 use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::ops::{
-    AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp, FCmpOp,
-    GetElementPtrOp, ICmpOp, InlineAsmOp, IntToPtrOp, LoadOp, PtrToIntOp, ReturnOp, StoreOp,
+    AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp,
+    ExtractValueOp, FCmpOp, GetElementPtrOp, ICmpOp, InlineAsmOp, InsertValueOp, IntToPtrOp, LoadOp,
+    PtrToIntOp, ReturnOp, StoreOp,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -190,11 +191,58 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
     Some(syms)
 }
 
+/// `__rust_alloc`, `__rust_alloc_zeroed`, `__rust_realloc`,
+/// `__rust_dealloc` (plain or v0-mangled under `__rustc`).
+fn alloc_shim(sym: &str) -> bool {
+    ["__rust_alloc", "__rust_alloc_zeroed", "__rust_realloc", "__rust_dealloc"]
+        .iter()
+        .any(|n| sym == *n || sym.ends_with(&format!("_{n}")))
+}
+
+/// `PLIRON_NOCAP_FIELDS`: (may hold a pointer, may hold an integer) for a
+/// value of type `ty` — a pointer or function is the first, an integer the
+/// second, an aggregate the union over its leaves. Floats and anything
+/// else count as both: a pointer can reach a float through int bitcasts.
+fn carriers(ctx: &Context, ty: pliron::r#type::TypeHandle, depth: u32) -> (bool, bool) {
+    match classify(ctx, ty) {
+        TyK::Ptr | TyK::Func(..) => (true, false),
+        TyK::Int(_) => (false, true),
+        TyK::Struct(fs, _) if depth < 8 => fs.iter().fold((false, false), |(p, i), &f| {
+            let (fp, fi) = carriers(ctx, f, depth + 1);
+            (p || fp, i || fi)
+        }),
+        TyK::Array(e, _) | TyK::Vector(e, _) if depth < 8 => carriers(ctx, e, depth + 1),
+        _ => (true, true),
+    }
+}
+
+/// The value `extract_value` reads: walk the `insert_value` chain under
+/// its aggregate to the insert of the same index path. `None` when the
+/// chain ends first (block arg, load, call) or an insert overlaps the path
+/// only partly — the caller then flows the whole aggregate.
+fn extract_src(ctx: &Context, op: pliron::context::Ptr<Operation>) -> Option<Value> {
+    let idx = Operation::get_op::<ExtractValueOp>(op, ctx)?.indices(ctx);
+    let mut agg = op.deref(ctx).get_operand(ctx, 0);
+    for _ in 0..64 {
+        let ins = agg.defining_op().filter(|&o| Operation::is_op::<InsertValueOp>(o, ctx))?;
+        let iidx = Operation::get_op::<InsertValueOp>(ins, ctx)?.indices(ctx);
+        if iidx == idx {
+            return Some(ins.deref(ctx).get_operand(ctx, 1));
+        }
+        if iidx.starts_with(&idx) || idx.starts_with(&iidx) {
+            return None;
+        }
+        agg = ins.deref(ctx).get_operand(ctx, 0);
+    }
+    None
+}
+
 pub fn run(ctx: &Context, st: &mut State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();
     let mut p = Capture::default();
     let dbg = crate::env_get("PLIRON_NOCAPDBG");
+    let fields = crate::env_get("PLIRON_NOCAP_FIELDS") == Some("1");
     let mut dbgrets: Vec<(String, Value, String)> = Vec::new();
     let mut dbgargs: Vec<(String, Value, String)> = Vec::new();
     // `slot_loads`'s nested `accesses` walks — one memo for the whole
@@ -238,6 +286,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // can't be the ptr arg (no `store i8 (hash)` capture).
                     let mut pk = |v: Value| -> (bool, bool) {
                         *kinds.entry(v).or_insert_with(|| {
+                            if fields {
+                                return carriers(ctx, v.get_type(ctx), 0);
+                            }
                             let k = classify(ctx, v.get_type(ctx));
                             (
                                 matches!(k, TyK::Ptr | TyK::Func(..)),
@@ -246,11 +297,32 @@ pub fn run(ctx: &Context, st: &mut State) {
                         })
                     };
                     let bridge = is!(PtrToIntOp) || is!(IntToPtrOp);
+                    // A field read back from an aggregate carries only what
+                    // was inserted at that index, not the whole aggregate's
+                    // mask: `Enumerate::next`'s `{i64 index, ptr}` pair made
+                    // every loop index "derive" from the iterated pointer, so
+                    // `*w = seed * (i + 1)` captured the slice's owner.
+                    // `PLIRON_NOCAP_FIELDS=1` (default off for now).
+                    let field = (fields && is!(ExtractValueOp)).then(|| extract_src(ctx, op)).flatten();
+                    // An allocator shim's result is a fresh allocation, not
+                    // derived from its args (`__rust_realloc` only ever sees a
+                    // heap pointer in a valid program).
+                    let fresh = fields && is!(CallOp) && direct_callee(ctx, st, op).is_some_and(|c| alloc_shim(c));
                     for r in d.results(ctx) {
                         let (rp, ri) = pk(r);
-                        for v in d.operands(ctx) {
+                        let srcs: Vec<Value> = match field {
+                            _ if fresh => Vec::new(),
+                            Some(v) => vec![v],
+                            None => d.operands(ctx).collect(),
+                        };
+                        for v in srcs {
                             let (vp, vi) = pk(v);
-                            if bridge || !(vp && ri) && !(vi && rp) {
+                            // Scalars: no ptr <-> int flow but through a
+                            // bridge. `PLIRON_NOCAP_FIELDS`: by what each
+                            // type's leaves can hold, so an all-int struct
+                            // a call returns can't carry its ptr operand.
+                            let ok = if fields { vp && rp || vi && ri } else { !(vp && ri) && !(vi && rp) };
+                            if bridge || ok {
                                 p.flow.push((v, r));
                             }
                         }
@@ -313,6 +385,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                 } else if is!(CallOp) {
                     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
                     match direct_callee(ctx, st, op) {
+                        // The allocator shims retain no argument: the old block
+                        // of a realloc/dealloc is dead once they return.
+                        Some(c) if fields && alloc_shim(c) => {}
                         Some(c) => {
                             let c = ids.id(c);
                             for (k, a) in args.into_iter().enumerate() {

@@ -6258,6 +6258,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // slot's writeback/reload sync. Only true no-capture flags the
         // CLIF arg a bounded use: no usable alias outlives the call.
         let own = callee_sym.as_ref().and_then(|s| self.st.nocapture.get(&s));
+        // `PLIRON_NOCAP_CALLDBG=<callee substring>`: what this call's nocap
+        // flags are built from.
+        if let Some(want) = pliron_cfg::env_get("PLIRON_NOCAP_CALLDBG")
+            && callee_sym.as_deref().is_some_and(|s| s.contains(want))
+        {
+            eprintln!(
+                "nocap-calldbg: {:?} own={own:?} info.nocap={:?} csrc={csrc:?}",
+                callee_sym.as_deref().map(|s| &s[..s.len().min(60)]),
+                info.nocap
+            );
+        }
         // `PLIRON_SM_DROPNC=1`: drop glue ends its pointee's life — a pointer
         // it retained can't legally be used afterwards (LLVM's
         // lifetime-based stack coloring assumes the same), so its argument

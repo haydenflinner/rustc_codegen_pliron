@@ -411,6 +411,199 @@ fn quiet(func: &Function, i: Inst) -> bool {
         || op.is_terminator())
 }
 
+/// `(slot, byte offset)` an address points at: `stack_addr` under
+/// constant adds, through block params every predecessor feeds the same
+/// value (`same_in`; lowering threads a `try_call`'s slot operand into its
+/// successors that way).
+fn slot_at(func: &Function, same_in: &FxHashMap<Value, Value>, v: Value, imm: i64) -> Option<(StackSlot, i64)> {
+    let mut v = v;
+    let mut off = imm;
+    for _ in 0..8 {
+        v = func.dfg.resolve_aliases(v);
+        if let Some(&x) = same_in.get(&v) {
+            v = x;
+            continue;
+        }
+        let i = func.dfg.value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::StackAddr { stack_slot, offset, .. } => {
+                return Some((stack_slot, off + i64::from(i32::from(offset))));
+            }
+            InstructionData::Binary { opcode: Opcode::Iadd, args } => {
+                let k = |x: Value| crate::jumpthread::known(func, &FxHashMap::default(), x);
+                if let Some(c) = k(args[1]) {
+                    off += c as i64;
+                    v = args[0];
+                } else if let Some(c) = k(args[0]) {
+                    off += c as i64;
+                    v = args[1];
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `PLIRON_SM_COALESCE`: whole or partial copies `v = load S+k; store v,
+/// D+k` (v used only by the store) whose source dies and destination is
+/// born inside the copy. Keyed by D: (S, the window's positions, its
+/// (load, store) pairs). A group qualifies when its pairs cover disjoint
+/// bytes, nothing else in the window can touch S or D (no calls; no
+/// memory op whose address may derive from either — any memory op at all
+/// if either escaped), and S's and D's live sets meet only in the window.
+#[allow(clippy::too_many_arguments)]
+fn copy_groups(
+    func: &Function,
+    order: &[Block],
+    ipos: &SecondaryMap<Inst, u32>,
+    users: &SecondaryMap<Value, Vec<Inst>>,
+    derived: &SecondaryMap<Value, Vec<StackSlot>>,
+    iv: &[(u32, u32)],
+    segs: &[Option<Vec<(u32, u32)>>],
+    escaped: &[bool],
+    esc_seen: &[bool],
+) -> FxHashMap<StackSlot, (StackSlot, (u32, u32), Vec<(Inst, Inst)>)> {
+    let nslots = iv.len();
+    let mut out = FxHashMap::default();
+    let mut taken: FxHashSet<StackSlot> = FxHashSet::default();
+    // Block param -> the one value all its incoming edges pass.
+    let mut incoming: FxHashMap<Value, Option<Value>> = FxHashMap::default();
+    for &b in order {
+        for i in func.layout.block_insts(b) {
+            for bc in func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                let dst = bc.block(&func.dfg.value_lists);
+                let params = func.dfg.block_params(dst);
+                for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    let Some(&p) = params.get(k) else { break };
+                    let a = match a {
+                        BlockArg::Value(a) => Some(func.dfg.resolve_aliases(a)),
+                        _ => None,
+                    };
+                    incoming
+                        .entry(p)
+                        .and_modify(|e| {
+                            if *e != a {
+                                *e = None;
+                            }
+                        })
+                        .or_insert(a);
+                }
+            }
+        }
+    }
+    let same_in: FxHashMap<Value, Value> =
+        incoming.into_iter().filter_map(|(p, a)| Some((p, a?))).filter(|(p, a)| p != a).collect();
+    for &b in order {
+        // (S, D) -> [(load, store, offset, bytes)]
+        let mut groups: FxHashMap<(StackSlot, StackSlot), Vec<(Inst, Inst, i64, i64)>> = FxHashMap::default();
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Store { opcode: Opcode::Store, args: [v, da], offset: doff, .. } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let v = func.dfg.resolve_aliases(v);
+            let Some(l) = func.dfg.value_def(v).inst() else { continue };
+            let InstructionData::Load { opcode: Opcode::Load, arg: sa, offset: soff, .. } = func.dfg.insts[l] else {
+                continue;
+            };
+            if func.layout.inst_block(l) != Some(b) || ipos[l] > ipos[i] || users[v].as_slice() != [i] {
+                continue;
+            }
+            let (Some((s, ks)), Some((d, kd))) =
+                (slot_at(func, &same_in, sa, i64::from(i32::from(soff))), slot_at(func, &same_in, da, i64::from(i32::from(doff))))
+            else {
+                continue;
+            };
+            if s == d || ks != kd || s.index() >= nslots || d.index() >= nslots {
+                continue;
+            }
+            let n = i64::from(func.dfg.value_type(v).bytes());
+            groups.entry((s, d)).or_default().push((l, i, ks, n));
+        }
+        for ((s, d), mut ps) in groups {
+            if escaped[s.index()] || escaped[d.index()] || iv[s.index()].0 == u32::MAX || iv[d.index()].0 == u32::MAX
+                || taken.contains(&d)
+            {
+                continue;
+            }
+            ps.sort_by_key(|p| p.2);
+            if ps.windows(2).any(|w| w[0].2 + w[0].3 > w[1].2) {
+                continue;
+            }
+            let lo = ps.iter().map(|p| ipos[p.0].min(ipos[p.1])).min().unwrap();
+            let hi = ps.iter().map(|p| ipos[p.0].max(ipos[p.1])).max().unwrap();
+            let mine: FxHashSet<Inst> = ps.iter().flat_map(|p| [p.0, p.1]).collect();
+            let either_escaped = esc_seen[s.index()] || esc_seen[d.index()];
+            let touches = |x: Value| derived[func.dfg.resolve_aliases(x)].iter().any(|&t| t == s || t == d);
+            let clean = func.layout.block_insts(b).filter(|&x| (lo..=hi).contains(&ipos[x]) && !mine.contains(&x)).all(|x| {
+                let op = func.dfg.insts[x].opcode();
+                if op.is_call() {
+                    return false;
+                }
+                if op.can_load() || op.can_store() {
+                    return !either_escaped && !func.dfg.inst_args(x).iter().any(|&a| touches(a));
+                }
+                true
+            });
+            if !clean {
+                continue;
+            }
+            let ls = segs[s.index()].clone().unwrap_or_else(|| vec![iv[s.index()]]);
+            let ld = segs[d.index()].clone().unwrap_or_else(|| vec![iv[d.index()]]);
+            if !seg_isect(&ls, &ld).iter().all(|&(a, z)| lo <= a && z <= hi) {
+                continue;
+            }
+            taken.insert(d);
+            out.insert(d, (s, (lo, hi), ps.iter().map(|p| (p.0, p.1)).collect()));
+        }
+    }
+    out
+}
+
+/// `a` minus `b`, both sorted disjoint segment lists.
+fn seg_sub(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for &(mut lo, hi) in a {
+        for &(bl, bh) in b {
+            if bh < lo || bl > hi {
+                continue;
+            }
+            if bl > lo {
+                out.push((lo, bl - 1));
+            }
+            lo = bh.saturating_add(1);
+            if lo > hi {
+                break;
+            }
+        }
+        if lo <= hi {
+            out.push((lo, hi));
+        }
+    }
+    out
+}
+
+/// Intersection of two sorted disjoint segment lists.
+fn seg_isect(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+        let (lo, hi) = (a[i].0.max(b[j].0), a[i].1.min(b[j].1));
+        if lo <= hi {
+            out.push((lo, hi));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
 /// `PLIRON_SM_MARKFLOW`: the live region of a marked, escaped slot.
 /// Storage is live from any use (a pointer to it only exists after its
 /// `stack_addr` is used) until a StorageDead kill on every path; the
@@ -1781,10 +1974,20 @@ pub fn run_with(
         let all = info_on() && crate::env_is("PLIRON_SM_INFO", "all");
         let mut shown = FxHashSet::default();
         for &(s, i) in esc.iter().filter(|&&(s, _)| !all || shown.insert(s)).take(if all { usize::MAX } else { 8 }) {
+            // Which args carry the slot, and whether each is nocap.
+            let how: Vec<String> = func
+                .dfg
+                .inst_args(i)
+                .iter()
+                .enumerate()
+                .filter(|&(_, &a)| derived[func.dfg.resolve_aliases(a)].contains(&s))
+                .map(|(k, _)| format!("arg{k}{}", if nocap.contains(&(i, k as u32)) { ":nocap" } else { "" }))
+                .collect();
             eprintln!(
-                "sm-info:   {s} escapes at {}: {}",
+                "sm-info:   {s} escapes at {}: {} [{}]",
                 func.layout.inst_block(i).unwrap(),
-                func.dfg.display_inst(i)
+                func.dfg.display_inst(i),
+                if how.is_empty() { "contained".to_string() } else { how.join(",") }
             );
         }
     }
@@ -1797,6 +2000,14 @@ pub fn run_with(
         return poison_dead(func, &order, &bfirst, &blast, &succ_map, &iv, &segs, &escaped);
     }
 
+    // `PLIRON_SM_COALESCE=1`: copy coalescing (LLVM MemCpyOpt's stack
+    // move). D -> (S, copy window, the window's (load, store) pairs).
+    let coalesce = crate::env_is("PLIRON_SM_COALESCE", "1");
+    let coal = if coalesce {
+        copy_groups(func, &order, &ipos, &users, &derived, &iv, &segs, &escaped, &esc_seen)
+    } else {
+        FxHashMap::default()
+    };
     // Greedy interval coloring, best-fit by region size.
     let mut cand: Vec<(u32, StackSlot)> = (0..nslots)
         .map(|s| StackSlot::from_u32(s as u32))
@@ -1811,6 +2022,10 @@ pub fn run_with(
     // convex members taken in `lo` order it equals `..=end`).
     let mut occ: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut rep: FxHashMap<StackSlot, StackSlot> = FxHashMap::default();
+    // Region index of each region's representative slot, and the copy
+    // destinations that joined their source's region.
+    let mut reg_of: FxHashMap<StackSlot, usize> = FxHashMap::default();
+    let mut coalesced: Vec<StackSlot> = Vec::new();
     for (_, s) in cand {
         let (lo, hi) = iv[s.index()];
         let mine: Vec<(u32, u32)> = segs[s.index()].clone().unwrap_or_else(|| vec![(lo, hi)]);
@@ -1819,6 +2034,27 @@ pub fn run_with(
             (d.size, d.align_shift)
         };
         let mut best: Option<usize> = None;
+        // A copy destination joins its source's region when they overlap
+        // only inside the copy window: the copy then rewrites bytes with
+        // themselves and goes away.
+        if let Some((src, w, _)) = coal.get(&s)
+            && let Some(&r) = rep.get(src).and_then(|x| reg_of.get(x))
+            && regions[r].1 >= size
+            && regions[r].2 >= align
+        {
+            let sseg: Vec<(u32, u32)> = segs[src.index()].clone().unwrap_or_else(|| vec![iv[src.index()]]);
+            let others = seg_sub(&occ[r], &sseg);
+            let inside = seg_isect(&mine, &sseg).iter().all(|&(a, b)| w.0 <= a && b <= w.1);
+            if inside && !segs_overlap(&others, &mine) && sm_take() {
+                rep.insert(s, regions[r].3);
+                regions[r].0 = regions[r].0.max(hi);
+                for g in mine {
+                    add_seg(&mut occ[r], g);
+                }
+                coalesced.push(s);
+                continue;
+            }
+        }
         for (r, &(end, rsize, ralign, _)) in regions.iter().enumerate() {
             let free = if markflow { !segs_overlap(&occ[r], &mine) } else { end < lo };
             if free
@@ -1836,7 +2072,7 @@ pub fn run_with(
             Some(r) => {
                 rep.insert(s, regions[r].3);
                 regions[r].0 = regions[r].0.max(hi);
-                if markflow {
+                if markflow || coalesce {
                     for g in mine {
                         add_seg(&mut occ[r], g);
                     }
@@ -1844,8 +2080,9 @@ pub fn run_with(
             }
             None => {
                 rep.insert(s, s);
+                reg_of.insert(s, regions.len());
                 regions.push((hi, size, align, s));
-                occ.push(if markflow { mine } else { Vec::new() });
+                occ.push(if markflow || coalesce { mine } else { Vec::new() });
             }
         }
     }
@@ -1964,6 +2201,19 @@ pub fn run_with(
             let rd = &mut func.sized_stack_slots[r];
             rd.size = rd.size.max(size);
             rd.align_shift = rd.align_shift.max(align);
+        }
+        // Each coalesced pair now loads a location and stores the value
+        // straight back, with nothing else touching either in the window.
+        let mut gone = 0usize;
+        for d in &coalesced {
+            for &(l, st) in &coal[d].2 {
+                func.layout.remove_inst(st);
+                func.layout.remove_inst(l);
+                gone += 1;
+            }
+        }
+        if info_on() {
+            eprintln!("sm-info: coalesced {} copies, {gone} load/store pairs removed", coalesced.len());
         }
     }
     merged
