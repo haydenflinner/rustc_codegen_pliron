@@ -1336,12 +1336,36 @@ fn gate_sel(p: &Pipe) -> Vec<&'static Step> {
     DEFAULT.iter().filter(|s| s.gate.ok(p)).collect()
 }
 
+/// `PLIRON_LT_PROBE=1` (or `=<symbol substring>`): after pipeline entry
+/// and every step, print `ltprobe <fn> <step> <anchor gone> <lost>
+/// <markers>` — lifetime markers whose anchor inst left the layout, and of
+/// those the ones whose block did too (unresolvable for slotmerge). Diff
+/// consecutive lines of one function to see which steps drop markers.
+fn lt_probe(p: &Pipe, step: &str) {
+    static ON: std::sync::LazyLock<Option<&'static str>> =
+        std::sync::LazyLock::new(|| crate::env_get("PLIRON_LT_PROBE"));
+    let Some(sel) = *ON else { return };
+    if sel != "1" && !p.fname.contains(sel) {
+        return;
+    }
+    let f = &p.clctx.func;
+    let (mut gone, mut lost) = (0, 0);
+    for (_, anc, blk, _) in p.lifetimes.iter() {
+        if !anc.is_some_and(|i| f.layout.inst_block(i).is_some()) {
+            gone += 1;
+            lost += usize::from(!f.layout.is_block_inserted(*blk));
+        }
+    }
+    eprintln!("ltprobe {} {step} {gone} {lost} {}", p.fname, p.lifetimes.len());
+}
+
 /// Runs the selected steps. With `check_each`, every step that changes
 /// the function is differentially checked against its input; returns
 /// whether any check reported a mismatch. The step-cache only engages
 /// on the normal path — a checked run must see the pipeline actually
 /// execute.
 fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
+    lt_probe(p, "start");
     let mut an = Analysis::default();
     // `-g` value labels name this CGU's variable pieces, and cache keys
     // don't see them: a hit would replay another function's labels.
@@ -1723,6 +1747,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         *slot += d;
         trace(s.name, d.as_secs_f64() * 1e3, p.fname);
     }
+    lt_probe(p, s.name);
     // `PLIRON_CLIF_STEPS=1` (with `PLIRON_CLIF`): dump after every step that
     // reports a change, including the steps that don't dump themselves.
     if k > 0 && p.dump && *CLIF_STEPS {
@@ -3336,6 +3361,9 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
                 .sum()
         })
         .unwrap_or(0);
+    if env_set("PLIRON_SM_INFO_FN") {
+        slotmerge::CUR_FN.with(|c| *c.borrow_mut() = p.fname.to_string());
+    }
     let k = slotmerge::run(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap);
     if smdbg {
         let after: u64 = p

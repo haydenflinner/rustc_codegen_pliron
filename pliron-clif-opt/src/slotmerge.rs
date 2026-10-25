@@ -242,13 +242,234 @@ fn sm_take() -> bool {
     }
 }
 
+/// `PLIRON_SM_MARKFLOW`: the live region of a marked, escaped slot.
+/// Storage is live from any use (a pointer to it only exists after its
+/// `stack_addr` is used) until a StorageDead kill on every path; the
+/// slot's live set is that region as position segments (`segs`) — not a
+/// hull: MIR has no StorageDead on unwind paths, so most slots reach the
+/// cleanup blocks at the end of RPO, and a hull would span everything in
+/// between. `iv` keeps the hull for the convex consumers. Missing markers can
+/// only extend it: a pass that deleted or duplicated a marker's block
+/// leaves paths without a kill, which then stay live to the return. A
+/// kill whose anchor didn't survive sits at its block's end, and is
+/// dropped when the block also uses the slot (a new life may start after
+/// the true marker).
+#[allow(clippy::too_many_arguments)]
+fn mark_flow(
+    func: &Function,
+    order: &[Block],
+    bfirst: &SecondaryMap<Block, u32>,
+    blast: &SecondaryMap<Block, u32>,
+    kills: &[(StackSlot, Block, u32, bool)],
+    marked: &[bool],
+    esc_seen: &[bool],
+    uses: &[Vec<u32>],
+    iv: &mut [(u32, u32)],
+    segs: &mut [Option<Vec<(u32, u32)>>],
+) {
+    let nslots = marked.len();
+    let mut tid = vec![usize::MAX; nslots];
+    let mut tracked = Vec::new();
+    for s in 0..nslots {
+        if marked[s] && esc_seen[s] {
+            tid[s] = tracked.len();
+            tracked.push(s);
+        }
+    }
+    if tracked.is_empty() {
+        return;
+    }
+    let nb = order.len();
+    let mut bidx = SecondaryMap::<Block, usize>::with_default(usize::MAX);
+    for (k, &b) in order.iter().enumerate() {
+        bidx[b] = k;
+    }
+    let block_of = |p: u32| order.partition_point(|&b| bfirst[b] <= p) - 1;
+    // Events per block: (pos, kill?, tracked id). A use at a kill's exact
+    // anchor precedes it (`false < true`).
+    let mut ev: Vec<Vec<(u32, bool, usize)>> = vec![Vec::new(); nb];
+    for (t, &s) in tracked.iter().enumerate() {
+        for &p in &uses[s] {
+            ev[block_of(p)].push((p, false, t));
+        }
+    }
+    for &(s, b, p, exact) in kills {
+        let t = tid[s.index()];
+        if t == usize::MAX || bidx[b] == usize::MAX {
+            continue;
+        }
+        let k = bidx[b];
+        if !exact && ev[k].iter().any(|&(_, kill, t2)| !kill && t2 == t) {
+            continue;
+        }
+        ev[k].push((p, true, t));
+    }
+    for e in &mut ev {
+        e.sort_unstable();
+    }
+    let w = tracked.len().div_ceil(64);
+    let get = |v: &[u64], t: usize| v[t / 64] >> (t % 64) & 1 != 0;
+    // gen/kill summary: the last event per slot decides its live-out.
+    let mut gen_b = vec![0u64; nb * w];
+    let mut kill_b = vec![0u64; nb * w];
+    for k in 0..nb {
+        for &(_, kill, t) in &ev[k] {
+            let (g, x) = (&mut gen_b[k * w..][..w], &mut kill_b[k * w..][..w]);
+            if kill {
+                x[t / 64] |= 1 << (t % 64);
+                g[t / 64] &= !(1 << (t % 64));
+            } else {
+                g[t / 64] |= 1 << (t % 64);
+                x[t / 64] &= !(1 << (t % 64));
+            }
+        }
+    }
+    let cfg = ControlFlowGraph::with_function(func);
+    let mut live_in = vec![0u64; nb * w];
+    let mut live_out = vec![0u64; nb * w];
+    loop {
+        let mut changed = false;
+        for k in 0..nb {
+            let mut inn = vec![0u64; w];
+            for pr in cfg.pred_iter(order[k]) {
+                let pk = bidx[pr.block];
+                if pk != usize::MAX {
+                    for j in 0..w {
+                        inn[j] |= live_out[pk * w + j];
+                    }
+                }
+            }
+            for j in 0..w {
+                let o = inn[j] & !kill_b[k * w + j] | gen_b[k * w + j];
+                if o != live_out[k * w + j] || inn[j] != live_in[k * w + j] {
+                    changed = true;
+                    live_out[k * w + j] = o;
+                    live_in[k * w + j] = inn[j];
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Walk the blocks in position order: `open[t]` is the start of the
+    // segment slot t is live in, if any.
+    let mut out: Vec<Vec<(u32, u32)>> = vec![Vec::new(); tracked.len()];
+    let mut open: Vec<Option<u32>> = vec![None; tracked.len()];
+    for k in 0..nb {
+        let b = order[k];
+        for t in 0..tracked.len() {
+            open[t] = get(&live_in[k * w..][..w], t).then_some(bfirst[b]);
+        }
+        for &(p, kill, t) in &ev[k] {
+            if kill {
+                if let Some(lo) = open[t].take() {
+                    add_seg(&mut out[t], (lo, p));
+                }
+            } else if open[t].is_none() {
+                open[t] = Some(p);
+            }
+        }
+        for t in 0..tracked.len() {
+            if let Some(lo) = open[t] {
+                add_seg(&mut out[t], (lo, blast[b]));
+            }
+        }
+    }
+    for (t, &s) in tracked.iter().enumerate() {
+        let sg = std::mem::take(&mut out[t]);
+        if let (Some(f), Some(l)) = (sg.first(), sg.last()) {
+            iv[s] = (f.0, l.1);
+        }
+        segs[s] = Some(sg);
+    }
+}
+
+/// Union `(lo, hi)` into the sorted, disjoint segment list `v`, merging
+/// overlapping and adjacent segments.
+fn add_seg(v: &mut Vec<(u32, u32)>, (lo, hi): (u32, u32)) {
+    let a = v.partition_point(|&(_, h)| h.saturating_add(1) < lo);
+    let mut b = a;
+    let (mut lo2, mut hi2) = (lo, hi);
+    while b < v.len() && v[b].0 <= hi.saturating_add(1) {
+        lo2 = lo2.min(v[b].0);
+        hi2 = hi2.max(v[b].1);
+        b += 1;
+    }
+    v.splice(a..b, [(lo2, hi2)]);
+}
+
+/// Whether two sorted, disjoint segment lists share a position.
+fn segs_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].1 < b[j].0 {
+            i += 1;
+        } else if b[j].1 < a[i].0 {
+            j += 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+thread_local! {
+    /// The symbol of the function the pipeline is running slotmerge on
+    /// (`PLIRON_SM_INFO_FN` filtering; CLIF names are only `u0:N`).
+    pub static CUR_FN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// `PLIRON_SM_INFO` reporting, narrowed by `PLIRON_SM_INFO_FN=<substr>` to
+/// matching symbols — parallel CGU threads interleave the lines otherwise.
+fn info_on() -> bool {
+    crate::env_set("PLIRON_SM_INFO")
+        && crate::env_get("PLIRON_SM_INFO_FN").is_none_or(|f| CUR_FN.with(|c| c.borrow().contains(f)))
+}
+
+/// `PLIRON_NOCAP_CALLEE=1`: `nocap` is keyed by the call insts lowering
+/// made, and passes that duplicate or rebuild a call (jumpthread, taildup,
+/// unroll, ...) make new insts without the fact — 3 of `lower_item_kind`'s
+/// 7 calls passing a 352-byte by-value arg indirectly survived only as
+/// copies, each then an escape. Every source of the fact is a property of
+/// the direct callee (its ABI's `captures(none)`/`noalias`, our
+/// `nocapture` inference, drop glue), so carry it to every current direct
+/// call of that callee at the same arg index. A removed inst keeps its
+/// data, so the original's callee is still readable.
+fn nocap_by_callee(func: &Function, nocap: &FxHashSet<(Inst, u32)>) -> Option<FxHashSet<(Inst, u32)>> {
+    if nocap.is_empty() || !pliron_cfg::env_is("PLIRON_NOCAP_CALLEE", "1") {
+        return None;
+    }
+    let callee = |i: Inst| match func.dfg.insts[i].analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
+        CallInfo::Direct(fr, _) | CallInfo::DirectWithSig(fr, _, _) => Some(fr),
+        _ => None,
+    };
+    let facts: FxHashSet<(FuncRef, u32)> =
+        nocap.iter().filter_map(|&(i, k)| Some((callee(i)?, k))).collect();
+    let mut out = nocap.clone();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if let Some(fr) = callee(i) {
+                for k in 0..func.dfg.inst_args(i).len() as u32 {
+                    if facts.contains(&(fr, k)) {
+                        out.insert((i, k));
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 pub fn run(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
     nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
-    if crate::env_set("PLIRON_SM_INFO") {
+    let wide = nocap_by_callee(func, nocap);
+    let nocap = wide.as_ref().unwrap_or(nocap);
+    if info_on() {
         eprintln!(
             "sm-info: slotmerge {} nslots={}",
             func.name,
@@ -425,8 +646,14 @@ pub fn run(
     let mut marked = vec![false; nslots];
     let mut mark_lost = vec![false; nslots];
     let mut marker_pos: Vec<Option<u32>> = Vec::new();
+    // `PLIRON_SM_MARKFLOW=1` (with MARK): only end markers count, as kills
+    // — (slot, block, position, exact anchor) — and a forward dataflow
+    // from every use decides where an escaped slot is live (`mark_flow`).
+    let markflow = crate::env_set("PLIRON_SLOTMERGE_MARK") && pliron_cfg::env_is("PLIRON_SM_MARKFLOW", "1");
+    let mut kills: Vec<(StackSlot, Block, u32, bool)> = Vec::new();
     if crate::env_set("PLIRON_SLOTMERGE_MARK") {
         let (mut single, mut multi, mut none, mut lost) = (0u32, 0u32, 0u32, 0u32);
+        let mut lost_start = 0u32;
         marker_pos.reserve(lifetimes.len());
         for (ds, anchor, b, start) in lifetimes {
             // The marker sits right after the anchor instruction: a start
@@ -454,6 +681,7 @@ pub fn run(
                     if pos == u32::MAX {
                         mark_lost[s.index()] = true;
                         lost += 1;
+                        lost_start += u32::from(*start);
                     } else {
                         marked[s.index()] = true;
                         single += 1;
@@ -463,12 +691,27 @@ pub fn run(
                 _ => multi += 1,
             }
         }
-        for s in 0..nslots {
-            marked[s] &= !mark_lost[s];
+        if markflow {
+            // Flow mode: a slot is tracked when any end marker naming it
+            // alone still has its block. Lost markers only drop kills.
+            marked.fill(false);
+            for ((ds, anchor, b, start), pos) in lifetimes.iter().zip(&marker_pos) {
+                if let (&[s], false, Some(_)) = (ds.as_slice(), *start, pos)
+                    && s.index() < nslots
+                {
+                    marked[s.index()] = true;
+                    let exact = anchor.is_some_and(|i| func.layout.inst_block(i) == Some(*b));
+                    kills.push((s, *b, if exact { ipos[anchor.unwrap()] } else { blast[*b] }, exact));
+                }
+            }
+        } else {
+            for s in 0..nslots {
+                marked[s] &= !mark_lost[s];
+            }
         }
-        if crate::env_set("PLIRON_SM_INFO") {
+        if info_on() {
             eprintln!(
-                "sm-info: markers: {single} singleton {multi} union {none} empty {lost} lost"
+                "sm-info: markers: {single} singleton {multi} union {none} empty {lost} lost ({lost_start} start)"
             );
         }
     }
@@ -486,7 +729,7 @@ pub fn run(
                 iv[$s.index()].1 = u32::MAX;
                 escaped[$s.index()] = true;
             }
-            if dbg || crate::env_set("PLIRON_SM_INFO") {
+            if dbg || info_on() {
                 esc.push(($s, $i));
             }
         }};
@@ -1004,11 +1247,17 @@ pub fn run(
     // real uses already bound the interval; extra marker positions would
     // just stretch it (a marker-only slot is dead storage the unused-slot
     // sweep reclaims anyway).
+    // `Some` for the slots `mark_flow` tracks: their live set, which the
+    // convex `iv` only bounds.
+    let mut segs: Vec<Option<Vec<(u32, u32)>>> = vec![None; nslots];
+    if markflow {
+        mark_flow(func, &order, &bfirst, &blast, &kills, &marked, &esc_seen, &uses, &mut iv, &mut segs);
+    }
     for ((slots, _, _, _), pos) in lifetimes.iter().zip(&marker_pos) {
-        let Some(pos) = pos else { continue };
+        let Some(pos) = pos.filter(|_| !markflow) else { continue };
         for &s in slots {
             if s.index() < nslots && marked[s.index()] && esc_seen[s.index()] {
-                use_at(&mut iv, &mut uses, s, *pos);
+                use_at(&mut iv, &mut uses, s, pos);
             }
         }
     }
@@ -1034,7 +1283,7 @@ pub fn run(
                 // `<=`: a self-loop is a backedge too.
                 if bpos[v] <= bpos[b] {
                     spans.push((bfirst[v], blast[b]));
-                    if crate::env_set("PLIRON_SM_INFO") {
+                    if info_on() {
                         eprintln!(
                             "sm-info: backedge {b}->{v} span=({},{})",
                             bfirst[v], blast[b]
@@ -1067,7 +1316,7 @@ pub fn run(
             break;
         }
     }
-    if crate::env_set("PLIRON_SM_INFO") {
+    if info_on() {
         let mut big: Vec<(u32, u32)> = spans.clone();
         big.sort();
         big.dedup();
@@ -1098,7 +1347,11 @@ pub fn run(
             // Marked slots too: a marker window is measured in the same RPO
             // positions, so a loop body placed past the exit still needs
             // the span (selmul `parse_only`'s `black_box(&mut acc)` under
-            // PLIRON_SLOTMERGE_MARK + poison).
+            // PLIRON_SLOTMERGE_MARK + poison). A flow-tracked slot's
+            // liveness already went round every back edge.
+            if segs[s].is_some() {
+                continue;
+            }
             for &(lo, hi) in &spans {
                 if !uses[s].iter().any(|&p| lo <= p && p <= hi) {
                     continue;
@@ -1143,6 +1396,22 @@ pub fn run(
         for d in 0..nslots {
             let (dlo, dhi) = iv[d];
             for &s in &contains[d] {
+                if s.index() < nslots && dlo != u32::MAX && iv[s.index()].0 != u32::MAX {
+                    if let Some(ds) = segs[d].clone().or(segs[s.index()].as_ref().map(|_| vec![(dlo, dhi)]))
+                        && let Some(sv) = &mut segs[s.index()]
+                    {
+                        let n0: u32 = sv.iter().map(|&(a, b)| b - a + 1).sum();
+                        for g in ds {
+                            add_seg(sv, g);
+                        }
+                        let n1: u32 = sv.iter().map(|&(a, b)| b - a + 1).sum();
+                        if n1 != n0 {
+                            changed = true;
+                            iv[s.index()] = (sv[0].0, sv[sv.len() - 1].1);
+                        }
+                        continue;
+                    }
+                }
                 let e = &mut iv[s.index()];
                 if e.0 != u32::MAX {
                     if e.0 > dlo {
@@ -1191,7 +1460,7 @@ pub fn run(
             };
         }
     }
-    if crate::env_set("PLIRON_SM_INFO") {
+    if info_on() {
         let mut unbounded = 0;
         let mut bounded = 0;
         let mut whole = 0;
@@ -1269,7 +1538,7 @@ pub fn run(
         eprintln!("sm-info: escape insts by callee: {fnv:?}");
         // `PLIRON_SM_INFO=all`: the first escape of every slot, not just
         // the first 8 overall.
-        let all = crate::env_is("PLIRON_SM_INFO", "all");
+        let all = info_on() && crate::env_is("PLIRON_SM_INFO", "all");
         let mut shown = FxHashSet::default();
         for &(s, i) in esc.iter().filter(|&&(s, _)| !all || shown.insert(s)).take(if all { usize::MAX } else { 8 }) {
             eprintln!(
@@ -1285,7 +1554,7 @@ pub fn run(
     // so a wrong interval reads garbage at its first stale access, in
     // every run, whether or not a merge would have reused the bytes.
     if crate::env_set("PLIRON_SM_POISON") {
-        return poison_dead(func, &order, &bfirst, &blast, &succ_map, &iv, &escaped);
+        return poison_dead(func, &order, &bfirst, &blast, &succ_map, &iv, &segs, &escaped);
     }
 
     // Greedy interval coloring, best-fit by region size.
@@ -1297,16 +1566,22 @@ pub fn run(
     cand.sort();
     // (region end, region size, region align_shift, representative)
     let mut regions: Vec<(u32, u32, u8, StackSlot)> = Vec::new();
+    // With flow-tracked slots a region's occupancy has holes: its members'
+    // positions as one sorted, disjoint segment list (flow mode only — for
+    // convex members taken in `lo` order it equals `..=end`).
+    let mut occ: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut rep: FxHashMap<StackSlot, StackSlot> = FxHashMap::default();
     for (_, s) in cand {
         let (lo, hi) = iv[s.index()];
+        let mine: Vec<(u32, u32)> = segs[s.index()].clone().unwrap_or_else(|| vec![(lo, hi)]);
         let (size, align) = {
             let d = &func.sized_stack_slots[s];
             (d.size, d.align_shift)
         };
         let mut best: Option<usize> = None;
         for (r, &(end, rsize, ralign, _)) in regions.iter().enumerate() {
-            if end < lo
+            let free = if markflow { !segs_overlap(&occ[r], &mine) } else { end < lo };
+            if free
                 && rsize >= size
                 && ralign >= align
                 && best.is_none_or(|b| regions[b].1 > rsize)
@@ -1320,27 +1595,44 @@ pub fn run(
         match best {
             Some(r) => {
                 rep.insert(s, regions[r].3);
-                regions[r].0 = hi;
+                regions[r].0 = regions[r].0.max(hi);
+                if markflow {
+                    for g in mine {
+                        add_seg(&mut occ[r], g);
+                    }
+                }
             }
             None => {
                 rep.insert(s, s);
                 regions.push((hi, size, align, s));
+                occ.push(if markflow { mine } else { Vec::new() });
             }
         }
     }
-    if crate::env_set("PLIRON_SM_INFO") {
+    if info_on() {
         let ncand = rep.len();
         eprintln!("sm-info: merge: {ncand} cand -> {} regions", regions.len());
+        // Per slot: singleton markers naming it, (start, end) x (resolved, lost).
+        let mut mk = vec![[0u32; 4]; nslots];
+        for ((ds, _, _, start), pos) in lifetimes.iter().zip(&marker_pos) {
+            if let &[s] = ds.as_slice()
+                && s.index() < nslots
+            {
+                mk[s.index()][2 * usize::from(!*start) + usize::from(pos.is_none())] += 1;
+            }
+        }
         for s in 0..nslots {
             let ss = StackSlot::from_u32(s as u32);
             if iv[s].0 != u32::MAX {
+                let [sr, sl, er, el] = mk[s];
                 eprintln!(
-                    "sm-info:   {ss} iv={:?} esc={} seen={} marked={} rep={:?}",
+                    "sm-info:   {ss} iv={:?} esc={} seen={} marked={} rep={:?} size={} markers start={sr}+{sl}lost end={er}+{el}lost",
                     iv[s],
                     escaped[s],
                     esc_seen[s],
                     marked[s],
-                    rep.get(&ss)
+                    rep.get(&ss),
+                    func.sized_stack_slots[ss].size,
                 );
             }
         }
@@ -1381,7 +1673,7 @@ pub fn run(
             _ => {}
         }
     }
-    if crate::env_set("PLIRON_SM_INFO") {
+    if info_on() {
         let (mut nz, mut bytes) = (0u32, 0u64);
         let mut cat: FxHashMap<&'static str, (u32, u64)> = FxHashMap::default();
         for s in 0..nslots {
@@ -1446,6 +1738,7 @@ fn poison_dead(
     blast: &SecondaryMap<Block, u32>,
     succ_map: &SecondaryMap<Block, Vec<Block>>,
     iv: &[(u32, u32)],
+    segs: &[Option<Vec<(u32, u32)>>],
     escaped: &[bool],
 ) -> usize {
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
@@ -1468,21 +1761,28 @@ fn poison_dead(
             continue;
         }
         let ss = StackSlot::from_u32(s as u32);
-        if crate::env_set("PLIRON_SM_INFO") {
+        if info_on() {
             eprintln!("sm-info: poison {ss} iv=({lo}, {hi}) at-hi={:?}", pos_inst.get(hi as usize));
         }
-        if let Some(&i) = pos_inst.get(hi as usize)
-            && !func.dfg.insts[i].opcode().is_terminator()
-        {
-            sites.push((ss, None, Some(i)));
+        // A flow-tracked slot is dead in its segments' holes too: poison
+        // after every segment's end and at every block entered from live
+        // code that its segments miss.
+        let sg: Vec<(u32, u32)> = segs[s].clone().unwrap_or_else(|| vec![(lo, hi)]);
+        let live = |b: Block| sg.iter().any(|&(l, h)| overlaps(b, l, h));
+        for &(_, h) in &sg {
+            if let Some(&i) = pos_inst.get(h as usize)
+                && !func.dfg.insts[i].opcode().is_terminator()
+            {
+                sites.push((ss, None, Some(i)));
+            }
         }
         let mut heads: FxHashSet<Block> = FxHashSet::default();
         for &b in order {
-            if !overlaps(b, lo, hi) {
+            if !live(b) {
                 continue;
             }
             for &t in &succ_map[b] {
-                if !overlaps(t, lo, hi) {
+                if !live(t) {
                     heads.insert(t);
                 }
             }
@@ -1497,7 +1797,7 @@ fn poison_dead(
     }) {
         sites = sites.into_iter().enumerate().filter(|(k, _)| *k >= a && *k < b).map(|(_, x)| x).collect();
     }
-    if crate::env_set("PLIRON_SM_INFO") {
+    if info_on() {
         for (k, (ss, head, after)) in sites.iter().enumerate() {
             let span = head.map(|b| (bfirst[b], blast[b]));
             eprintln!("sm-info: poison site {k}: {ss} head={head:?} pos={span:?} after={after:?}");
