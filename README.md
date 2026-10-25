@@ -55,6 +55,9 @@ Developed mainly on aarch64-apple-darwin; x86_64 Linux and x86_64 Windows (MSVC,
   `examples/bevy-game/hot.sh` is the edit loop: save `src/main.rs`, the patch builds in ~1.2s and applies in ~50ms, and ECS state is kept. `tests/hot/run.sh` is a smoke test.
   Limits: x86_64 ELF only, no new thread-locals in patches, changed struct layouts need a restart.
 - Self-hosting: a pliron-built stage1 rustc builds a working stage2 compiler (`selfhost/`).
+  The stage2 compiler builds core and std, and passes rustc's UI suite except for 6 tests more than stage1 fails (21710 pass, `selfhost/verify.sh --stage2-only`).
+  Those 6 are deep-recursion tests that overflow the stack: pliron's frames are still 2–10× LLVM's in rustc's parser and AST lowering.
+- Wasmtime: [sightglass](https://github.com/bytecodealliance/sightglass)'s test suites (all of Wasmtime and Cranelift, running wasm benchmarks through a pliron-compiled Wasmtime) pass, 16 of 16, as with stock rustc.
 - LTO: `-Clto` / Cargo `lto = true` builds and links (`-Clto=thin` falls back to fat), but without cross-crate optimization yet: the fat-LTO module is a relocatable link (`cc -r`) of the crate's objects and every upstream rlib's (`src/lto.rs`), so the result matches a non-LTO build. Not on MSVC or wasm targets (a clear error there).
 - Debug info (`-g`, ELF and Mach-O): line tables, inlined frames (rustc's and pliron's own inlining), lexical blocks, statics, and variables with their types — data-carrying enums, generics' type parameters and `usize` as LLVM describes them, so rust-lldb's formatters work. Optimized builds track variables through SSA values to location lists (registers, spill slots, constants). lldb and std's panic backtraces read it (gdb untested); optimized code is byte-identical with and without `-g`. `harness/dbgsuite.py` (rustc's tests/debuginfo) and `harness/dbgcorpus.py` measure lldb against stock. `PLIRON_DWARF=0` drops it.
 - Not done yet: cross-crate (real) LTO.
