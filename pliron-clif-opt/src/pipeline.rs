@@ -197,6 +197,11 @@ pub struct Pipe<'a> {
     /// operand `Value` is typically dead, so it can't ride along.
     pub lifetimes: &'a mut Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
+    /// `PLIRON_SM_MARKFLOW`: end markers re-expressed at pipeline entry as
+    /// kills on incoming edges, (slot, terminator, destination index) —
+    /// they survive passes that delete the marker's block (see
+    /// `slotmerge::entry_kills`).
+    pub edge_kills: Vec<(StackSlot, Inst, u32)>,
     /// `-g`: variable slots' pieces (`dbglabel`), for slotprom.
     pub dbg_slots: &'a crate::dbglabel::DbgSlots,
     pub tcfg: TargetFrontendConfig,
@@ -1338,7 +1343,7 @@ fn gate_sel(p: &Pipe) -> Vec<&'static Step> {
 
 /// `PLIRON_LT_PROBE=1` (or `=<symbol substring>`): after pipeline entry
 /// and every step, print `ltprobe <fn> <step> <anchor gone> <lost>
-/// <markers>` — lifetime markers whose anchor inst left the layout, and of
+/// <markers> <lost end markers>` — lifetime markers whose anchor inst left the layout, and of
 /// those the ones whose block did too (unresolvable for slotmerge). Diff
 /// consecutive lines of one function to see which steps drop markers.
 fn lt_probe(p: &Pipe, step: &str) {
@@ -1349,14 +1354,26 @@ fn lt_probe(p: &Pipe, step: &str) {
         return;
     }
     let f = &p.clctx.func;
-    let (mut gone, mut lost) = (0, 0);
-    for (_, anc, blk, _) in p.lifetimes.iter() {
+    let (mut gone, mut lost, mut lost_end, mut lost_end_top) = (0, 0, 0, 0);
+    for (_, anc, blk, start) in p.lifetimes.iter() {
         if !anc.is_some_and(|i| f.layout.inst_block(i).is_some()) {
             gone += 1;
-            lost += usize::from(!f.layout.is_block_inserted(*blk));
+            if !f.layout.is_block_inserted(*blk) {
+                lost += 1;
+                lost_end += usize::from(!*start);
+                lost_end_top += usize::from(!*start && anc.is_none());
+            }
         }
     }
-    eprintln!("ltprobe {} {step} {gone} {lost} {}", p.fname, p.lifetimes.len());
+    let ends = p.lifetimes.iter().filter(|l| !l.3).count();
+    let ends_top = p.lifetimes.iter().filter(|l| !l.3 && l.1.is_none()).count();
+    let ek_gone = p.edge_kills.iter().filter(|e| f.layout.inst_block(e.1).is_none()).count();
+    eprintln!(
+        "ltprobe {} {step} {gone} {lost} {} {lost_end} {lost_end_top} {ends} {ends_top} {ek_gone}/{}",
+        p.fname,
+        p.lifetimes.len(),
+        p.edge_kills.len()
+    );
 }
 
 /// Runs the selected steps. With `check_each`, every step that changes
@@ -1365,6 +1382,19 @@ fn lt_probe(p: &Pipe, step: &str) {
 /// on the normal path — a checked run must see the pipeline actually
 /// execute.
 fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
+    if env_set("PLIRON_SLOTMERGE_MARK") && env_is("PLIRON_SM_MARKFLOW", "1") && !env_is("PLIRON_SM_EDGEKILL", "0") {
+        p.edge_kills = slotmerge::entry_kills(&p.clctx.func, p.lifetimes);
+        if env_is("PLIRON_SM_INFO", "all")
+            && crate::env_get("PLIRON_SM_INFO_FN").is_none_or(|f| p.fname.contains(f))
+        {
+            let ends = p.lifetimes.iter().filter(|l| !l.3).count();
+            eprintln!("sm-info: entry kills {} for {ends} end markers in {}", p.edge_kills.len(), p.fname);
+            for &(s, t, k) in &p.edge_kills {
+                let b = p.clctx.func.layout.inst_block(t);
+                eprintln!("sm-info:   edge kill {s} on {t} (in {b:?}) dest {k}");
+            }
+        }
+    }
     lt_probe(p, "start");
     let mut an = Analysis::default();
     // `-g` value labels name this CGU's variable pieces, and cache keys
@@ -3364,7 +3394,7 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if env_set("PLIRON_SM_INFO_FN") {
         slotmerge::CUR_FN.with(|c| *c.borrow_mut() = p.fname.to_string());
     }
-    let k = slotmerge::run(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap);
+    let k = slotmerge::run_with(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap, &p.edge_kills);
     if smdbg {
         let after: u64 = p
             .clctx
@@ -4282,6 +4312,7 @@ mod tests {
             inst_region: Default::default(),
             lifetimes: &mut lifetimes,
             nocap: &nocap,
+            edge_kills: Vec::new(),
             dbg_slots: &Default::default(),
             tcfg: isa.frontend_config(),
             simd: true,

@@ -242,6 +242,147 @@ fn sm_take() -> bool {
     }
 }
 
+/// `PLIRON_SM_MARKFLOW`, at pipeline entry while every marker resolves:
+/// an end marker that is effectively at its block's entry — first in the
+/// block, or preceded only by instructions that touch no memory — becomes
+/// a kill on each incoming `jump` and `try_call` normal-return edge, keyed
+/// by (terminator, destination index; `NORMAL_RETURN` for a `try_call`). Passes that delete the block
+/// (jumpthread threading past it, edgefwd dropping a forwarding block)
+/// retarget those terminators in place, so the kill still sits on the
+/// path that used to run the marker; in tests/std, about half the lost
+/// end markers were at block entry. `brif`/`br_table` arms are skipped: a
+/// pass may swap them in place. Every end marker also gets a `BEFORE_INST`
+/// kill on the call/store/terminator right after it, which survives
+/// `merge_chains` folding the block into its predecessor.
+/// Edge-kill index of a `try_call`'s normal return: the last
+/// destination, wherever handler edits leave it.
+const NORMAL_RETURN: u32 = u32::MAX;
+/// Not an edge: the slot is dead just before this inst.
+const BEFORE_INST: u32 = u32::MAX - 1;
+
+fn dest_index(n: usize, k: u32) -> Option<usize> {
+    match k {
+        NORMAL_RETURN => n.checked_sub(1),
+        k => ((k as usize) < n).then_some(k as usize),
+    }
+}
+
+pub fn entry_kills(
+    func: &Function,
+    lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
+) -> Vec<(StackSlot, Inst, u32)> {
+    let mut out = Vec::new();
+    let cfg = ControlFlowGraph::with_function(func);
+    for (ds, anchor, b, start) in lifetimes {
+        let (&[s], false) = (ds.as_slice(), *start) else { continue };
+        if !func.layout.is_block_inserted(*b) {
+            continue;
+        }
+        // The inst right after the marker, when no pass moves it earlier:
+        // block merges keep its identity, so "dead just before it" outlives
+        // the marker's block. (Loads are out: LICM hoists them.)
+        // Quiet insts in between are skipped unless one touches `s`'s
+        // address (a new life starting before the kill point).
+        let mut next = match *anchor {
+            None => func.layout.first_inst(*b),
+            Some(a) if func.layout.inst_block(a) == Some(*b) => func.layout.next_inst(a),
+            Some(_) => None,
+        };
+        for _ in 0..16 {
+            let Some(n) = next else { break };
+            if quiet(func, n) && !func.dfg.inst_values(n).any(|v| addr_of_slot(func, v, s))
+                && !matches!(func.dfg.insts[n], InstructionData::StackAddr { stack_slot, .. } if stack_slot == s)
+            {
+                next = func.layout.next_inst(n);
+                continue;
+            }
+            let op = func.dfg.insts[n].opcode();
+            if (op.is_call() || op.can_store() || op.is_terminator() || op.can_trap()) && !op.can_load() {
+                out.push((s, n, BEFORE_INST));
+            }
+            break;
+        }
+        if let Some(a) = *anchor {
+            if func.layout.inst_block(a) != Some(*b) {
+                continue;
+            }
+            if !func.layout.block_insts(*b).take_while(|&i| i != a).chain([a]).all(|i| quiet(func, i)) {
+                continue;
+            }
+        }
+        // Entering a quiet block that only jumps on to `b` is entering `b`:
+        // walk back through such forwarding chains (jumpthread and edgefwd
+        // collapse them, deleting every jump in them) and kill on their
+        // in-edges too.
+        let mut work = vec![*b];
+        let mut seen: FxHashSet<Block> = FxHashSet::default();
+        while let Some(x) = work.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            for pr in cfg.pred_iter(x) {
+                let d = &func.dfg.insts[pr.inst];
+                let k = match d.opcode() {
+                    Opcode::Jump => 0,
+                    Opcode::TryCall | Opcode::TryCallIndirect => NORMAL_RETURN,
+                    _ => continue,
+                };
+                let dests = d.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                if !dest_index(dests.len(), k)
+                    .is_some_and(|k| dests[k].block(&func.dfg.value_lists) == x)
+                {
+                    continue;
+                }
+                out.push((s, pr.inst, k));
+                if d.opcode() == Opcode::Jump
+                    && func.layout.block_insts(pr.block).all(|i| i == pr.inst || quiet(func, i))
+                {
+                    work.push(pr.block);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `v` may be an address into `s` through pure ops. Conservative:
+/// block params (they can carry anything) and a search past 64 values
+/// both answer yes. A worklist with a visited set, since address
+/// arithmetic is a DAG and a plain recursion is exponential on it.
+fn addr_of_slot(func: &Function, v: Value, s: StackSlot) -> bool {
+    let mut work = vec![v];
+    let mut seen: FxHashSet<Value> = FxHashSet::default();
+    while let Some(v) = work.pop() {
+        let v = func.dfg.resolve_aliases(v);
+        if !seen.insert(v) {
+            continue;
+        }
+        if seen.len() > 64 {
+            return true;
+        }
+        let ValueDef::Result(i, _) = func.dfg.value_def(v) else { return true };
+        match func.dfg.insts[i] {
+            InstructionData::StackAddr { stack_slot, .. } if stack_slot == s => return true,
+            InstructionData::StackAddr { .. } => {}
+            _ if quiet(func, i) => work.extend(func.dfg.inst_args(i).iter().copied()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Touches no memory and can't leave the block: an end marker after a run
+/// of these is effectively at the block's entry.
+fn quiet(func: &Function, i: Inst) -> bool {
+    let op = func.dfg.insts[i].opcode();
+    !(op.is_call()
+        || op.can_load()
+        || op.can_store()
+        || op.other_side_effects()
+        || op.can_trap()
+        || op.is_terminator())
+}
+
 /// `PLIRON_SM_MARKFLOW`: the live region of a marked, escaped slot.
 /// Storage is live from any use (a pointer to it only exists after its
 /// `stack_addr` is used) until a StorageDead kill on every path; the
@@ -260,7 +401,9 @@ fn mark_flow(
     order: &[Block],
     bfirst: &SecondaryMap<Block, u32>,
     blast: &SecondaryMap<Block, u32>,
+    ipos: &SecondaryMap<Inst, u32>,
     kills: &[(StackSlot, Block, u32, bool)],
+    edge_kills: &[(StackSlot, Inst, u32)],
     marked: &[bool],
     esc_seen: &[bool],
     uses: &[Vec<u32>],
@@ -285,12 +428,23 @@ fn mark_flow(
         bidx[b] = k;
     }
     let block_of = |p: u32| order.partition_point(|&b| bfirst[b] <= p) - 1;
-    // Events per block: (pos, kill?, tracked id). A use at a kill's exact
-    // anchor precedes it (`false < true`).
-    let mut ev: Vec<Vec<(u32, bool, usize)>> = vec![Vec::new(); nb];
+    // Events per block: (pos, order, tracked id), order 0 = kill just
+    // before the inst at pos (`BEFORE_INST` kills), 1 = use, 2 = kill
+    // just after it (an exact anchor's).
+    let mut ev: Vec<Vec<(u32, u8, usize)>> = vec![Vec::new(); nb];
     for (t, &s) in tracked.iter().enumerate() {
         for &p in &uses[s] {
-            ev[block_of(p)].push((p, false, t));
+            ev[block_of(p)].push((p, 1, t));
+        }
+    }
+    for &(s, n, k) in edge_kills {
+        let t = tid.get(s.index()).copied().unwrap_or(usize::MAX);
+        if k == BEFORE_INST
+            && t != usize::MAX
+            && let Some(b) = func.layout.inst_block(n)
+            && bidx[b] != usize::MAX
+        {
+            ev[bidx[b]].push((ipos[n], 0, t));
         }
     }
     for &(s, b, p, exact) in kills {
@@ -299,10 +453,10 @@ fn mark_flow(
             continue;
         }
         let k = bidx[b];
-        if !exact && ev[k].iter().any(|&(_, kill, t2)| !kill && t2 == t) {
+        if !exact && ev[k].iter().any(|&(_, o, t2)| o == 1 && t2 == t) {
             continue;
         }
-        ev[k].push((p, true, t));
+        ev[k].push((p, 2, t));
     }
     for e in &mut ev {
         e.sort_unstable();
@@ -313,9 +467,9 @@ fn mark_flow(
     let mut gen_b = vec![0u64; nb * w];
     let mut kill_b = vec![0u64; nb * w];
     for k in 0..nb {
-        for &(_, kill, t) in &ev[k] {
+        for &(_, o, t) in &ev[k] {
             let (g, x) = (&mut gen_b[k * w..][..w], &mut kill_b[k * w..][..w]);
-            if kill {
+            if o != 1 {
                 x[t / 64] |= 1 << (t % 64);
                 g[t / 64] &= !(1 << (t % 64));
             } else {
@@ -325,6 +479,41 @@ fn mark_flow(
         }
     }
     let cfg = ControlFlowGraph::with_function(func);
+    // Edge kills: (terminator, destination block) -> slots dead on entry
+    // through that terminator. A slot is masked only if every destination
+    // index of the terminator that reaches the block kills it (a `brif`
+    // with both arms to one block, one killed, still carries it).
+    let mut emask: FxHashMap<(Inst, Block), Vec<u64>> = FxHashMap::default();
+    {
+        let mut by_term: FxHashMap<Inst, Vec<(u32, usize)>> = FxHashMap::default();
+        for &(s, term, k) in edge_kills {
+            let t = tid.get(s.index()).copied().unwrap_or(usize::MAX);
+            if t != usize::MAX && k != BEFORE_INST && func.layout.inst_block(term).is_some() {
+                by_term.entry(term).or_default().push((k, t));
+            }
+        }
+        for (term, ks) in by_term {
+            let dests: Vec<Block> = func.dfg.insts[term]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .map(|bc| bc.block(&func.dfg.value_lists))
+                .collect();
+            for &d in &dests {
+                let mut m = vec![0u64; w];
+                for t in 0..tracked.len() {
+                    let all = dests.iter().enumerate().filter(|&(_, &x)| x == d).all(|(k, _)| {
+                        ks.iter().any(|&(k2, t2)| dest_index(dests.len(), k2) == Some(k) && t2 == t)
+                    });
+                    if all {
+                        m[t / 64] |= 1 << (t % 64);
+                    }
+                }
+                if m.iter().any(|&x| x != 0) {
+                    emask.insert((term, d), m);
+                }
+            }
+        }
+    }
     let mut live_in = vec![0u64; nb * w];
     let mut live_out = vec![0u64; nb * w];
     loop {
@@ -334,8 +523,9 @@ fn mark_flow(
             for pr in cfg.pred_iter(order[k]) {
                 let pk = bidx[pr.block];
                 if pk != usize::MAX {
+                    let m = emask.get(&(pr.inst, order[k]));
                     for j in 0..w {
-                        inn[j] |= live_out[pk * w + j];
+                        inn[j] |= live_out[pk * w + j] & !m.map_or(0, |m| m[j]);
                     }
                 }
             }
@@ -361,10 +551,15 @@ fn mark_flow(
         for t in 0..tracked.len() {
             open[t] = get(&live_in[k * w..][..w], t).then_some(bfirst[b]);
         }
-        for &(p, kill, t) in &ev[k] {
-            if kill {
-                if let Some(lo) = open[t].take() {
-                    add_seg(&mut out[t], (lo, p));
+        for &(p, o, t) in &ev[k] {
+            if o != 1 {
+                // A kill before the inst at p leaves p itself dead (an
+                // empty segment when it opens there: nothing to add).
+                let hi = if o == 0 { p.checked_sub(1) } else { Some(p) };
+                if let Some(lo) = open[t].take()
+                    && let Some(hi) = hi.filter(|&h| h >= lo)
+                {
+                    add_seg(&mut out[t], (lo, hi));
                 }
             } else if open[t].is_none() {
                 open[t] = Some(p);
@@ -466,6 +661,17 @@ pub fn run(
     nowrite: &FxHashMap<FuncRef, bool>,
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
     nocap: &FxHashSet<(Inst, u32)>,
+) -> usize {
+    run_with(func, nowrite, lifetimes, nocap, &[])
+}
+
+/// `run` plus `entry_kills`' edge kills (`PLIRON_SM_MARKFLOW`).
+pub fn run_with(
+    func: &mut Function,
+    nowrite: &FxHashMap<FuncRef, bool>,
+    lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
+    nocap: &FxHashSet<(Inst, u32)>,
+    edge_kills: &[(StackSlot, Inst, u32)],
 ) -> usize {
     let wide = nocap_by_callee(func, nocap);
     let nocap = wide.as_ref().unwrap_or(nocap);
@@ -702,6 +908,11 @@ pub fn run(
                     marked[s.index()] = true;
                     let exact = anchor.is_some_and(|i| func.layout.inst_block(i) == Some(*b));
                     kills.push((s, *b, if exact { ipos[anchor.unwrap()] } else { blast[*b] }, exact));
+                }
+            }
+            for &(s, term, _) in edge_kills {
+                if s.index() < nslots && func.layout.inst_block(term).is_some() {
+                    marked[s.index()] = true;
                 }
             }
         } else {
@@ -1251,7 +1462,7 @@ pub fn run(
     // convex `iv` only bounds.
     let mut segs: Vec<Option<Vec<(u32, u32)>>> = vec![None; nslots];
     if markflow {
-        mark_flow(func, &order, &bfirst, &blast, &kills, &marked, &esc_seen, &uses, &mut iv, &mut segs);
+        mark_flow(func, &order, &bfirst, &blast, &ipos, &kills, edge_kills, &marked, &esc_seen, &uses, &mut iv, &mut segs);
     }
     for ((slots, _, _, _), pos) in lifetimes.iter().zip(&marker_pos) {
         let Some(pos) = pos.filter(|_| !markflow) else { continue };
@@ -1621,18 +1832,27 @@ pub fn run(
                 mk[s.index()][2 * usize::from(!*start) + usize::from(pos.is_none())] += 1;
             }
         }
+        let mut ek = vec![(0u32, 0u32); nslots];
+        for &(s, term, _) in edge_kills {
+            if s.index() < nslots {
+                ek[s.index()].0 += 1;
+                ek[s.index()].1 += u32::from(func.layout.inst_block(term).is_some());
+            }
+        }
         for s in 0..nslots {
             let ss = StackSlot::from_u32(s as u32);
             if iv[s].0 != u32::MAX {
                 let [sr, sl, er, el] = mk[s];
+                let (ekn, eka) = ek[s];
                 eprintln!(
-                    "sm-info:   {ss} iv={:?} esc={} seen={} marked={} rep={:?} size={} markers start={sr}+{sl}lost end={er}+{el}lost",
+                    "sm-info:   {ss} iv={:?} esc={} seen={} marked={} rep={:?} size={} markers start={sr}+{sl}lost end={er}+{el}lost edge-kills={eka}/{ekn} segs={:?}",
                     iv[s],
                     escaped[s],
                     esc_seen[s],
                     marked[s],
                     rep.get(&ss),
                     func.sized_stack_slots[ss].size,
+                    segs[s].as_ref().map(|v| v.iter().take(8).collect::<Vec<_>>()),
                 );
             }
         }
