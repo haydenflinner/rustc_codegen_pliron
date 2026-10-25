@@ -290,3 +290,37 @@ block1:
     pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &kills);
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "ss0 stayed live past its merged-away marker:\n{}", f.display());
 }
+
+/// A new life of ss0 starts between its end marker and the next call
+/// (`v2 = stack_addr ss0` feeds the call): a kill just before the call
+/// would cut that life, so `entry_kills` must not place one; it still
+/// may for ss1, whose address the skipped inst doesn't touch.
+#[test]
+fn no_kill_before_across_a_new_life() {
+    let src = "function %t() {
+    ss0 = explicit_slot 64, align = 8
+    ss1 = explicit_slot 64, align = 8
+    sig0 = (i64)
+    fn0 = %sink sig0
+block0:
+    v1 = stack_addr.i64 ss0
+    v9 = stack_addr.i64 ss1
+    call fn0(v1)
+    call fn0(v9)
+    jump block1
+block1:
+    v2 = stack_addr.i64 ss0
+    v4 = iconst.i64 8
+    v3 = iadd v2, v4
+    call fn0(v3)
+    return
+}";
+    let f = cranelift_reader::parse_functions(src).unwrap().remove(0);
+    let b1 = Block::from_u32(1);
+    let (ss0, ss1) = (StackSlot::from_u32(0), StackSlot::from_u32(1));
+    let lifetimes: Lifetimes = vec![(vec![ss0], None, b1, false), (vec![ss1], None, b1, false)];
+    let kills = pliron_clif_opt::slotmerge::entry_kills(&f, &lifetimes);
+    let before = |s| kills.iter().any(|k| k.0 == s && k.2 == u32::MAX - 1);
+    assert!(!before(ss0), "{kills:?}");
+    assert!(before(ss1), "{kills:?}");
+}

@@ -272,7 +272,11 @@ pub fn entry_kills(
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
 ) -> Vec<(StackSlot, Inst, u32)> {
     let mut out = Vec::new();
+    if lifetimes.iter().all(|l| l.3) {
+        return out;
+    }
     let cfg = ControlFlowGraph::with_function(func);
+    let addrs = slot_addrs(func);
     for (ds, anchor, b, start) in lifetimes {
         let (&[s], false) = (ds.as_slice(), *start) else { continue };
         if !func.layout.is_block_inserted(*b) {
@@ -290,7 +294,10 @@ pub fn entry_kills(
         };
         for _ in 0..16 {
             let Some(n) = next else { break };
-            if quiet(func, n) && !func.dfg.inst_values(n).any(|v| addr_of_slot(func, v, s))
+            if quiet(func, n)
+                && !func.dfg.inst_values(n).any(|v| {
+                    addrs[func.dfg.resolve_aliases(v)].as_ref().is_none_or(|x| x.contains(&s))
+                })
                 && !matches!(func.dfg.insts[n], InstructionData::StackAddr { stack_slot, .. } if stack_slot == s)
             {
                 next = func.layout.next_inst(n);
@@ -345,30 +352,48 @@ pub fn entry_kills(
     out
 }
 
-/// Whether `v` may be an address into `s` through pure ops. Conservative:
-/// block params (they can carry anything) and a search past 64 values
-/// both answer yes. A worklist with a visited set, since address
-/// arithmetic is a DAG and a plain recursion is exponential on it.
-fn addr_of_slot(func: &Function, v: Value, s: StackSlot) -> bool {
-    let mut work = vec![v];
-    let mut seen: FxHashSet<Value> = FxHashSet::default();
-    while let Some(v) = work.pop() {
-        let v = func.dfg.resolve_aliases(v);
-        if !seen.insert(v) {
-            continue;
-        }
-        if seen.len() > 64 {
-            return true;
-        }
-        let ValueDef::Result(i, _) = func.dfg.value_def(v) else { return true };
-        match func.dfg.insts[i] {
-            InstructionData::StackAddr { stack_slot, .. } if stack_slot == s => return true,
-            InstructionData::StackAddr { .. } => {}
-            _ if quiet(func, i) => work.extend(func.dfg.inst_args(i).iter().copied()),
-            _ => {}
+/// Which slots each value may hold an address into, through quiet ops —
+/// what `entry_kills` asks of the insts it skips. One pass in reverse
+/// postorder (a def's block precedes its uses' blocks, and inst order
+/// within a block), so each query is a lookup. `None` = may be anything:
+/// block params, and sets grown past 8 slots. Loads and call results are
+/// `Some([])`: a pointer reloaded from memory was taken before the marker,
+/// so it can't begin a new life of the slot.
+fn slot_addrs(func: &Function) -> SecondaryMap<Value, Option<Vec<StackSlot>>> {
+    let mut m: SecondaryMap<Value, Option<Vec<StackSlot>>> = SecondaryMap::with_default(None);
+    let mut dt = DominatorTree::new();
+    dt.compute(func, &ControlFlowGraph::with_function(func));
+    for &b in dt.cfg_postorder().iter().rev() {
+        for i in func.layout.block_insts(b) {
+            let set = match func.dfg.insts[i] {
+                InstructionData::StackAddr { stack_slot, .. } => Some(vec![stack_slot]),
+                _ if quiet(func, i) => {
+                    let mut acc = Some(Vec::new());
+                    for &a in func.dfg.inst_args(i) {
+                        let a = func.dfg.resolve_aliases(a);
+                        // An arg defined later in this order (unreachable or
+                        // irreducible flow) reads as `None` = anything.
+                        match (&mut acc, &m[a]) {
+                            (Some(v), Some(x)) => {
+                                for &s in x {
+                                    if !v.contains(&s) {
+                                        v.push(s);
+                                    }
+                                }
+                            }
+                            _ => acc = None,
+                        }
+                    }
+                    acc.filter(|v| v.len() <= 8)
+                }
+                _ => Some(Vec::new()),
+            };
+            for &r in func.dfg.inst_results(i) {
+                m[r] = set.clone();
+            }
         }
     }
-    false
+    m
 }
 
 /// Touches no memory and can't leave the block: an end marker after a run
