@@ -225,6 +225,8 @@ struct Job {
     /// `PLIRON_XNEED=0` it is the full ordinal prefix, the old cover
     /// semantics. Empty for `Whole` jobs.
     needs: Vec<u32>,
+    /// Two-phase facts (`hold`): stage B adopts from every participant.
+    adopt_all: bool,
     /// Wall time spent in iropt stages A+B — the `*iropt*` timing row.
     /// Parked time between publish and adopt does not count.
     iropt: std::time::Duration,
@@ -254,6 +256,15 @@ struct Store {
     /// owner below its own ordinal.
     owners: rustc_hash::FxHashMap<String, Vec<u32>>,
     done: rustc_hash::FxHashMap<u32, Result<Finished, Box<dyn std::any::Any + Send>>>,
+    /// Two-phase facts (`PLIRON_XFACTS_ALL=1` under rustc's thin-local
+    /// LTO): a published job waits here, keyed by its `done` key, instead
+    /// of parking on lower ordinals. `optimize` returns with the module
+    /// still pending; rustc runs `run_thin_lto` only after every module's
+    /// `optimize`, so by `finish_held` every CGU has published and the
+    /// adopt set is the same however the workers were scheduled. No
+    /// worker ever waits on the barrier — rustc's coordinator owns it.
+    hold: bool,
+    held: rustc_hash::FxHashMap<u32, Job>,
 }
 
 static STORE: LazyLock<Mutex<Store>> = LazyLock::new(Default::default);
@@ -280,7 +291,23 @@ pub(crate) fn begin(tcx: TyCtxt<'_>) {
     let cfg = Arc::new(CrateCfg::new(tcx));
     CRATE_CFG.with(|c| *c.borrow_mut() = Some(cfg));
     pliron_ir_opt::state::reset_facts();
-    *STORE.lock().unwrap() = Store::default();
+    *STORE.lock().unwrap() = Store {
+        hold: two_phase(tcx),
+        ..Store::default()
+    };
+}
+
+/// `PLIRON_XFACTS_ALL=1` and rustc chose thin-local LTO for this crate
+/// (multi-CGU, optimizing): stage B moves behind the LTO barrier.
+pub(crate) fn two_phase(tcx: TyCtxt<'_>) -> bool {
+    pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1")
+        && enabled(tcx)
+        && tcx.sess.lto() == rustc_session::config::Lto::ThinLocal
+}
+
+/// Whether this compile holds published jobs for `finish_held`.
+pub(crate) fn holding() -> bool {
+    STORE.lock().unwrap().hold
 }
 
 /// Hand a finished-define CGU to the pool; returns the `done` key the
@@ -321,6 +348,7 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
         step,
         ir: String::new(),
         needs: Vec::new(),
+        adopt_all: false,
         iropt: std::time::Duration::ZERO,
     });
     CV.notify_one();
@@ -350,6 +378,10 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
     match r {
         Ok(RunOut::Done { key, out }) => {
             g.done.insert(key, Ok(out));
+        }
+        Ok(RunOut::Published { job }) if g.hold => {
+            g.published.insert(job.ord);
+            g.held.insert(job.key, job);
         }
         Ok(RunOut::Published { mut job }) => {
             g.published.insert(job.ord);
@@ -415,6 +447,52 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
     }
     CV.notify_all();
     true
+}
+
+/// Two-phase `optimize`: work jobs until module `key` has published
+/// (`None`: held for `finish_held`) or finished outright (a
+/// non-participant job).
+pub(crate) fn run_until_published(
+    key: u32,
+    prof: &SelfProfilerRef,
+    emitter: &SharedEmitter,
+) -> Option<Finished> {
+    let mut g = STORE.lock().unwrap();
+    loop {
+        if g.held.contains_key(&key) {
+            return None;
+        }
+        if let Some(r) = g.done.remove(&key) {
+            return Some(match r {
+                Ok(f) => f,
+                Err(p) => resume_unwind(p),
+            });
+        }
+        drop(g);
+        if step_once(prof, emitter) {
+            g = STORE.lock().unwrap();
+            continue;
+        }
+        g = STORE.lock().unwrap();
+        if !g.done.contains_key(&key) && !g.held.contains_key(&key) && g.ready.is_empty() {
+            g = CV.wait(g).unwrap();
+        }
+    }
+}
+
+/// Two-phase stage B: run held module `key` (adopting every CGU's facts)
+/// and return its output. Called from `optimize_and_codegen_thin`.
+/// `all = false` keeps prefix adoption — for a module rustc codegens
+/// outside the LTO barrier (the allocator shim, optimized first).
+pub(crate) fn finish_held(key: u32, all: bool, prof: &SelfProfilerRef, emitter: &SharedEmitter) -> Finished {
+    {
+        let mut g = STORE.lock().unwrap();
+        let mut job = g.held.remove(&key).expect("finish_held: module not held");
+        job.adopt_all = all;
+        g.ready.push_front(job);
+        CV.notify_all();
+    }
+    run_until(key, prof, emitter)
 }
 
 pub(crate) fn run_until(key: u32, prof: &SelfProfilerRef, emitter: &SharedEmitter) -> Finished {
@@ -522,7 +600,7 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
                 prof,
                 &job.name,
                 &job.cfg,
-                Some(job.ord),
+                Some((job.ord, job.adopt_all)),
             );
             job.iropt += t.elapsed();
             let out = finish_b(
@@ -1077,10 +1155,12 @@ pub(crate) fn iropt_tail(
     prof: &SelfProfilerRef,
     cgu: &str,
     _cfg: &CrateCfg,
-    adopt_ord: Option<u32>,
+    adopt_ord: Option<(u32, bool)>,
 ) {
-    if let Some(ord) = adopt_ord {
-        pt!(prof, cgu, "xfacts-adopt", st.facts_adopt(ctx, ord));
+    match adopt_ord {
+        Some((ord, true)) => pt!(prof, cgu, "xfacts-adopt", st.facts_adopt_all(ctx, ord)),
+        Some((ord, false)) => pt!(prof, cgu, "xfacts-adopt", st.facts_adopt(ctx, ord)),
+        None => {}
     }
     // Dead-call elim + readonly call dedup + loop-call hoist, on the
     // final post-inline call set.

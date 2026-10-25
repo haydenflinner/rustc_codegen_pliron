@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   asmcfi asmextern debuginfo dbgnested nocapfields stackmove
+#   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 set -euo pipefail
@@ -377,6 +377,15 @@ t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
   rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
+}
+
+t_xfactsall() {
+  # PLIRON_XFACTS_ALL: two-phase cross-CGU facts behind rustc's thin-local
+  # LTO barrier. The first-submitted CGU (ordinal-prefix adoption sees
+  # nothing) must import facts from later ones, and the program must run.
+  PLIRON_XFACTS_ALL=1 PLIRON_TRACE=pliron::stats=info rustc $BE --edition 2021 -O -C codegen-units=4 tests/std/main.rs -o $out/xfactsall$exe 2> $out/xfactsall.txt \
+    && $out/xfactsall$exe > /dev/null 2>&1 \
+    && grep -qE "cgu\.0: imported [1-9]" $out/xfactsall.txt
 }
 
 t_stackmove() {
@@ -769,6 +778,7 @@ want asmextern && t_asmextern
 want dbgnested && t_dbgnested
 want nocapfields && t_nocapfields
 want stackmove && t_stackmove
+want xfactsall && t_xfactsall
 want debuginfo && t_debuginfo
 want facts && t_facts
 want loopalign && t_loopalign

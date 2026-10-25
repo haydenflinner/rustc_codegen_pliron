@@ -813,12 +813,26 @@ impl State {
     /// scheduler the caller parks until that prefix is complete, giving
     /// the same adopt set serial codegen produces.
     pub fn facts_adopt(&mut self, ctx: &Context, ord: u32) {
+        self.facts_adopt_from(ctx, ord, false)
+    }
+
+    /// `PLIRON_XFACTS_ALL` (two-phase facts): adopt from every other
+    /// participant, not just the lower ordinals. Only deterministic once
+    /// every CGU has published — the caller runs it behind rustc's
+    /// thin-local LTO barrier, after every module's `optimize`.
+    pub fn facts_adopt_all(&mut self, ctx: &Context, ord: u32) {
+        self.facts_adopt_from(ctx, ord, true)
+    }
+
+    fn facts_adopt_from(&mut self, ctx: &Context, ord: u32, all: bool) {
         let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
         let mut g = CguFacts::default();
         {
             let global = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
-            for (_, cf) in global.by_ord.range(..ord) {
-                g.merge(cf);
+            for (&o, cf) in global.by_ord.iter() {
+                if o < ord || (all && o != ord) {
+                    g.merge(cf);
+                }
             }
         }
         let mut imported = 0usize;

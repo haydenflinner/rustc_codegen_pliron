@@ -94,6 +94,15 @@ pub struct PlironModule {
 
 pub struct PlironBuffer(Vec<u8>);
 
+/// `serialize_module` of a module whose stage B `cgupool` holds
+/// (`PLIRON_XFACTS_ALL`): this prefix, then the pool key (LE u32).
+const PENDING_MAGIC: &[u8] = b"pliron-held\0";
+
+fn pending_key(data: &[u8]) -> Option<u32> {
+    let k = data.strip_prefix(PENDING_MAGIC)?;
+    Some(u32::from_le_bytes(k.try_into().ok()?))
+}
+
 impl ModuleBufferMethods for PlironBuffer {
     fn data(&self) -> &[u8] {
         &self.0
@@ -982,7 +991,12 @@ impl CodegenBackend for PlironCodegenBackend {
         // No ThinLTO: rustc then never runs thin-local LTO at opt-level > 0,
         // and `-Clto=thin` falls back to fat LTO (`lto.rs`), with a warning.
         rustc_session::CodegenBackendInit {
-            thin_lto_supported: false,
+            // `PLIRON_XFACTS_ALL=1`: accept thin-local LTO, whose barrier
+            // (`run_thin_lto` runs once every module is optimized) is the
+            // two-phase facts split — `optimize` publishes, the thin step
+            // adopts from every CGU and lowers. Real cross-crate ThinLTO
+            // stays unsupported (`run_thin_lto` rejects it).
+            thin_lto_supported: pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1"),
             // The fork's knob drops LTO requests entirely; the self-hosted
             // build keeps doing that until fat LTO is verified in-tree.
             #[cfg(rustc_in_tree)]
@@ -1622,11 +1636,31 @@ impl WriteBackendMethods for PlironCodegenBackend {
         _incr_comp_session: Option<&rustc_session::BorrowedIncrCompSession>,
         dcx: DiagCtxtHandle<'_>,
         _exported_symbols_for_lto: &[String],
-        _each_linked_rlib_for_lto: &[PathBuf],
-        _modules: Vec<ThinLtoInput<Self>>,
+        each_linked_rlib_for_lto: &[PathBuf],
+        modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
-        // `thin_lto_supported: false` makes rustc fall back to fat LTO.
-        dcx.fatal("ThinLTO is not supported by the pliron backend")
+        // Only thin-local, as the two-phase facts barrier
+        // (`PLIRON_XFACTS_ALL`): each module goes through unchanged, and
+        // `optimize_and_codegen_thin` runs its held stage B.
+        if !each_linked_rlib_for_lto.is_empty() {
+            dcx.fatal("cross-crate ThinLTO is not supported by the pliron backend (PLIRON_XFACTS_ALL only uses thin-local LTO)");
+        }
+        let mut bufs = Vec::new();
+        let mut names = Vec::new();
+        for m in modules {
+            match m {
+                ThinLtoInput::Red { name, buffer } => {
+                    names.push(std::ffi::CString::new(name).expect("module name"));
+                    bufs.push(buffer);
+                }
+                ThinLtoInput::Green { .. } => dcx.fatal(
+                    "PLIRON_XFACTS_ALL does not support incremental thin-local LTO (reused modules)",
+                ),
+            }
+        }
+        let shared = Arc::new(rustc_codegen_ssa::back::lto::ThinShared { data: (), modules: bufs, module_names: names });
+        let n = shared.modules.len();
+        ((0..n).map(|idx| ThinModule { shared: shared.clone(), idx }).collect(), Vec::new())
     }
 
     fn optimize(
@@ -1639,20 +1673,55 @@ impl WriteBackendMethods for PlironCodegenBackend {
         let Some(key) = module.module_llvm.pending.take() else {
             return;
         };
-        let fin = cgupool::run_until(key, prof, shared_emitter);
+        let fin = if cgupool::holding() {
+            // Two-phase facts: stop after publish; the thin step finishes.
+            // The allocator shim is codegened outside the LTO barrier (and
+            // optimized before any CGU), so it finishes here, on prefix
+            // facts.
+            match cgupool::run_until_published(key, prof, shared_emitter) {
+                Some(f) => f,
+                None if module.kind == rustc_codegen_ssa::ModuleKind::Allocator => {
+                    cgupool::finish_held(key, false, prof, shared_emitter)
+                }
+                None => {
+                    module.module_llvm.pending = Some(key);
+                    return;
+                }
+            }
+        } else {
+            cgupool::run_until(key, prof, shared_emitter)
+        };
         module.module_llvm.obj = fin.obj;
         module.module_llvm.ir = fin.ir;
         module.module_llvm.asm = fin.asm;
     }
 
     fn optimize_and_codegen_thin(
-        _cgcx: &CodegenContext,
-        _prof: &SelfProfilerRef,
-        _shared_emitter: &SharedEmitter,
+        cgcx: &CodegenContext,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
         _tm_factory: TargetMachineFactoryFn<Self>,
-        _thin: ThinModule<Self>,
+        thin: ThinModule<Self>,
     ) -> CompiledModule {
-        unreachable!("ThinLTO is not supported by the pliron backend (no ThinModules)")
+        use rustc_codegen_ssa::back::lto::SerializedModule;
+        let data = match &thin.shared.modules[thin.idx] {
+            SerializedModule::Local(b) => b.0.as_slice(),
+            _ => unreachable!("thin-local LTO hands back only this crate's own modules"),
+        };
+        let module = if let Some(key) = pending_key(data) {
+            let fin = cgupool::finish_held(key, true, prof, shared_emitter);
+            PlironModule { obj: fin.obj, ir: fin.ir, asm: fin.asm, pending: None }
+        } else {
+            // Finished outright (not a pool participant): its object.
+            let p = lto::LtoPayload::decode(data).expect("thin-local module payload");
+            let obj = p.objects.into_iter().next().map(|o| o.bytes).unwrap_or_default();
+            PlironModule { obj, ir: String::new(), asm: String::new(), pending: None }
+        };
+        if pliron_cfg::env_set("PLIRON_THIN_DEBUG") {
+            eprintln!("thin: {} held={} obj={}B", thin.name(), pending_key(data).is_some(), module.obj.len());
+        }
+        let m = ModuleCodegen::new_regular(thin.name(), module);
+        Self::codegen(cgcx, prof, shared_emitter, m, &cgcx.module_config)
     }
 
     fn codegen(
@@ -1677,6 +1746,12 @@ impl WriteBackendMethods for PlironCodegenBackend {
     }
 
     fn serialize_module(module: PlironModule, _is_thin: bool) -> PlironBuffer {
+        // Two-phase facts: a module held after publish travels as its key.
+        if let Some(key) = module.pending {
+            let mut b = PENDING_MAGIC.to_vec();
+            b.extend(key.to_le_bytes());
+            return PlironBuffer(b);
+        }
         // Pre-LTO module files (incremental + -Clto): the object by value.
         PlironBuffer(
             lto::LtoPayload::new(vec![lto::LtoObject {
