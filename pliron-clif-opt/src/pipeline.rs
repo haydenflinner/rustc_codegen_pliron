@@ -1384,6 +1384,29 @@ fn lt_probe(p: &Pipe, step: &str) {
 fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     if env_set("PLIRON_SLOTMERGE_MARK") && env_is("PLIRON_SM_MARKFLOW", "1") && !env_is("PLIRON_SM_EDGEKILL", "0") {
         p.edge_kills = slotmerge::entry_kills(&p.clctx.func, p.lifetimes);
+        // Every slot dies as `_Unwind_Resume` takes the unwind out of this
+        // frame: MIR emits no StorageDead on cleanup paths, so without this
+        // every slot that can unwind stays live into the shared resume
+        // tail, and they all overlap there.
+        let f = &p.clctx.func;
+        for b in f.layout.blocks() {
+            for i in f.layout.block_insts(b) {
+                use cranelift_codegen::ir::instructions::CallInfo;
+                let (CallInfo::Direct(fr, _) | CallInfo::DirectWithSig(fr, _, _)) =
+                    f.dfg.insts[i].analyze_call(&f.dfg.value_lists, &f.dfg.exception_tables)
+                else {
+                    continue;
+                };
+                if let cranelift_codegen::ir::ExternalName::User(u) = f.dfg.ext_funcs[fr].name {
+                    let un = &f.params.user_named_funcs()[u];
+                    if un.namespace == 0
+                        && p.fn_names.get(un.index as usize).is_some_and(|s| s == "_Unwind_Resume")
+                    {
+                        p.edge_kills.push((StackSlot::from_u32(u32::MAX - 1), i, slotmerge::KILL_ALL));
+                    }
+                }
+            }
+        }
         if env_is("PLIRON_SM_INFO", "all")
             && crate::env_get("PLIRON_SM_INFO_FN").is_none_or(|f| p.fname.contains(f))
         {

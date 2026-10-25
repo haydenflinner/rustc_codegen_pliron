@@ -259,6 +259,9 @@ fn sm_take() -> bool {
 const NORMAL_RETURN: u32 = u32::MAX;
 /// Not an edge: the slot is dead just before this inst.
 const BEFORE_INST: u32 = u32::MAX - 1;
+/// Every slot is dead just before this inst (the slot field is unused):
+/// the pipeline's `_Unwind_Resume` calls.
+pub const KILL_ALL: u32 = u32::MAX - 2;
 
 fn dest_index(n: usize, k: u32) -> Option<usize> {
     match k {
@@ -463,12 +466,13 @@ fn mark_flow(
         }
     }
     for &(s, n, k) in edge_kills {
+        let Some(b) = func.layout.inst_block(n).filter(|&b| bidx[b] != usize::MAX) else { continue };
+        if k == KILL_ALL {
+            ev[bidx[b]].extend((0..tracked.len()).map(|t| (ipos[n], 0, t)));
+            continue;
+        }
         let t = tid.get(s.index()).copied().unwrap_or(usize::MAX);
-        if k == BEFORE_INST
-            && t != usize::MAX
-            && let Some(b) = func.layout.inst_block(n)
-            && bidx[b] != usize::MAX
-        {
+        if k == BEFORE_INST && t != usize::MAX {
             ev[bidx[b]].push((ipos[n], 0, t));
         }
     }
@@ -513,7 +517,7 @@ fn mark_flow(
         let mut by_term: FxHashMap<Inst, Vec<(u32, usize)>> = FxHashMap::default();
         for &(s, term, k) in edge_kills {
             let t = tid.get(s.index()).copied().unwrap_or(usize::MAX);
-            if t != usize::MAX && k != BEFORE_INST && func.layout.inst_block(term).is_some() {
+            if t != usize::MAX && k != BEFORE_INST && k != KILL_ALL && func.layout.inst_block(term).is_some() {
                 by_term.entry(term).or_default().push((k, t));
             }
         }

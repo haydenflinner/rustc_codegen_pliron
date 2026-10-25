@@ -324,3 +324,50 @@ block1:
     assert!(!before(ss0), "{kills:?}");
     assert!(before(ss1), "{kills:?}");
 }
+
+/// MIR has no StorageDead on unwind paths, so ss0 and ss1, disjoint on
+/// the normal path, both stay live into the shared resume block. A
+/// `KILL_ALL` before the `_Unwind_Resume` call (the pipeline adds one per
+/// such call: the unwind leaves the frame there) ends both lives, and
+/// they share storage.
+#[test]
+fn kill_all_before_resume() {
+    let src = "function %t() {
+    ss0 = explicit_slot 64, align = 8
+    ss1 = explicit_slot 64, align = 8
+    sig0 = (i64)
+    fn0 = %sink sig0
+    fn1 = %_Unwind_Resume sig0
+block0:
+    v1 = stack_addr.i64 ss0
+    try_call fn0(v1), sig0, block1(), [ default: block3(exn0) ]
+block1:
+    v2 = stack_addr.i64 ss1
+    try_call fn0(v2), sig0, block2(), [ default: block3(exn0) ]
+block2:
+    return
+block3(v9: i64):
+    call fn1(v9)
+    trap user1
+}";
+    let (ss0, ss1) = (StackSlot::from_u32(0), StackSlot::from_u32(1));
+    // SAFETY: same values as every other test here.
+    unsafe {
+        std::env::set_var("PLIRON_SLOTMERGE_MARK", "1");
+        std::env::set_var("PLIRON_SM_MARKFLOW", "1");
+    }
+    let (b1, b2, b3) = (Block::from_u32(1), Block::from_u32(2), Block::from_u32(3));
+    let lifetimes: Lifetimes = vec![(vec![ss0], None, b1, false), (vec![ss1], None, b2, false)];
+    let mut merged = Vec::new();
+    for kill_all in [false, true] {
+        let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        let mut kills = pliron_clif_opt::slotmerge::entry_kills(&f, &lifetimes);
+        if kill_all {
+            let resume = f.layout.first_inst(b3).unwrap();
+            kills.push((StackSlot::from_u32(u32::MAX - 1), resume, pliron_clif_opt::slotmerge::KILL_ALL));
+        }
+        pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &kills);
+        merged.push(slot_of(&f, 1) == slot_of(&f, 2));
+    }
+    assert_eq!(merged, [false, true], "overlap only in the resume block should block merging until KILL_ALL");
+}
