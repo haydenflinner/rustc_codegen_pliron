@@ -279,6 +279,15 @@ t_resumehoist() {
   $out/resumehoist$exe 2>/dev/null | diff --strip-trailing-cr - tests/resumehoist/expected.out
 }
 
+t_inlinerec() {
+  # A big single-caller helper stays a call from a recursive visitor
+  # (PLIRON_INLINE_RECSTACK: every recursion level would carry its frame);
+  # output matches stock rustc's.
+  PLIRON_INLINE_RECSTACK=1 PLIRON_TRACE=pliron::inline=debug rustc $BE --edition 2021 -O tests/inlinerec/main.rs -o $out/inlinerec$exe 2> $out/inlinerec.log || { tail -20 $out/inlinerec.log >&2; return 1; }
+  if grep -qE '5check: n=[0-9]+ .*accept' $out/inlinerec.log; then echo "inlinerec: check inlined into the recursive visit" >&2; return 1; fi
+  $out/inlinerec$exe | diff --strip-trailing-cr - tests/inlinerec/expected.out
+}
+
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
@@ -764,6 +773,7 @@ want inlinecm && t_inlinecm
 want retattr && t_retattr
 want invokeblk && t_invokeblk
 want resumehoist && t_resumehoist
+want inlinerec && t_inlinerec
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul

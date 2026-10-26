@@ -1072,7 +1072,24 @@ pub fn run(
     // inline a callee in its caller's own (nontrivial) call-graph SCC —
     // LLVM's CGSCC rule for edges inlining created inside an SCC. Original
     // sites still inline one level; re-entering the recursion stops.
-    let scc: FxHashMap<String, u32> = if crate::pass_enabled("PLIRON_INLINE_SCC") {
+    let recstack = crate::env_is("PLIRON_INLINE_RECSTACK", "1");
+    let once1 = crate::env_is("PLIRON_INLINE_ONCE1", "1");
+    let scc_limit = crate::env_is("PLIRON_INLINE_SCCLIMIT", "1");
+    let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
+    let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
+    let mut free_used: FxHashSet<String> = FxHashSet::default();
+    // Self-recursive functions (`scc` keeps only multi-function cycles).
+    let self_rec: FxHashSet<String> = if recstack {
+        st.funcs
+            .iter()
+            .filter(|(n, f)| has_body(ctx, f.op) && callees(ctx, st, n).iter().any(|c| c == *n))
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
+    let scc_rule = crate::pass_enabled("PLIRON_INLINE_SCC");
+    let scc: FxHashMap<String, u32> = if scc_rule || recstack || scc_limit {
         scc_ids(ctx, st)
     } else {
         FxHashMap::default()
@@ -1126,6 +1143,9 @@ pub fn run(
             .map(|b| b.deref(ctx).iter(ctx).count())
             .sum();
         let mut grown = 0usize;
+        // `PLIRON_INLINE_DUPCOST`: copies of each callee inlined into this
+        // caller so far.
+        let mut copies: FxHashMap<String, usize> = FxHashMap::default();
         // `only` (the devirt-inline pass) restricts which pre-existing
         // callsites may inline; ops this run itself splices in are fair game —
         // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
@@ -1156,6 +1176,7 @@ pub fn run(
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
+            let mut doomed: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut bi = 0;
             while let Some(&b) = blklist.get(bi) {
                 bi += 1;
@@ -1214,7 +1235,27 @@ pub fn run(
                     }
                     // Free inlines: the out-of-line copy disappears
                     // (single-callsite locals) or rustc demanded it.
-                    let free = f.always_inline || (once && single.contains(cs));
+                    // `PLIRON_INLINE_RECSTACK=1`: no single-site bonus into
+                    // a caller on a recursion cycle the callee isn't on.
+                    // The out-of-line copy still dies, but every level of
+                    // the recursion now carries the callee's frame — stage
+                    // 2 `walk_expr::<TailCallCkVisitor>` got `check_tail_call`
+                    // through its 27 `visit_expr` copies (1,936-byte frame;
+                    // LLVM, which keeps it out of line, 80).
+                    let rec_caller = recstack
+                        && (scc.get(&sym).is_some_and(|c| scc.get(cs) != Some(c))
+                            || self_rec.contains(sym.as_str()) && !scc.contains_key(&sym));
+                    // `PLIRON_INLINE_ONCE1=1`: the bonus at most once per
+                    // callee per run. `single` (one calling function) is
+                    // computed at run start; a single-caller callee's call
+                    // can be cloned into other bodies after that (27 copies
+                    // of `check_tail_call`'s through `visit_expr`), and only
+                    // one of those inlines is free.
+                    let free = f.always_inline
+                        || (once
+                            && single.contains(cs)
+                            && !rec_caller
+                            && !(once1 && free_used.contains(cs.as_str())));
                     let mut t = if free {
                         limit.saturating_mul(10)
                     } else {
@@ -1337,6 +1378,33 @@ pub fn run(
                         && *has_loop
                             .entry(cs.clone())
                             .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty());
+                    // `PLIRON_INLINE_SCCLIMIT=1`: a callee on the caller's own
+                    // recursion cycle gets the base limit and no bonuses.
+                    // Every level of the recursion pays the inlined body's
+                    // frame: `walk_expr` took `visit_expr` (with
+                    // `check_tail_call` already inside) at 27 sites.
+                    if scc_limit && !f.always_inline && scc.get(&sym).is_some_and(|c| scc.get(cs) == Some(c)) {
+                        t = t.min(limit);
+                        cost = cost.max(ci.n);
+                    }
+                    // `PLIRON_INLINE_DUPCOST=1`: the k-th copy of one callee in
+                    // one caller costs k times its size, so a fat callee
+                    // isn't pasted at every site of a big `match`. Callees
+                    // no bigger than a call are exempt.
+                    if dupcost && !f.always_inline && ci.n > limit / 8 {
+                        cost = cost.saturating_mul(copies.get(cs).copied().unwrap_or(0) + 1);
+                    }
+                    // `PLIRON_INLINE_COLD=1`: a site in a block that can't
+                    // reach a `return` (panics, diverging calls, unwinding)
+                    // gets LLVM's cold-callsite ratio (45 of 225) of the
+                    // limit: it runs at most once per frame, and its body
+                    // would grow the frame on every path.
+                    if cold_sites
+                        && !f.always_inline
+                        && doomed.get_or_insert_with(|| doomed_blocks(ctx, st, caller)).contains(&b)
+                    {
+                        t = t.min(limit / 5);
+                    }
                     let why = if cost > t {
                         "reject (score)"
                     } else if loopy {
@@ -1347,7 +1415,7 @@ pub fn run(
                         "reject (self/fnty)"
                     } else if hist && on_chain(st, op, ci.op) {
                         "reject (recursive)"
-                    } else if !scc.is_empty()
+                    } else if scc_rule
                         && st.inline_hist.contains(op)
                         && scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
                     {
@@ -1367,6 +1435,12 @@ pub fn run(
                         }
                         if maxdup > 0 {
                             *dup.entry(cs.clone()).or_default() += 1;
+                        }
+                        if once1 && free && !f.always_inline {
+                            free_used.insert(cs.clone());
+                        }
+                        if dupcost {
+                            *copies.entry(cs.clone()).or_default() += 1;
                         }
                         size += ci.n;
                         sites.push((op, ci.op, cs.clone()));
@@ -1423,6 +1497,36 @@ pub fn run(
 /// Call-graph SCC id of every bodied function in a nontrivial SCC (two
 /// or more members; self-recursion is handled by `callee_info`).
 /// Iterative Tarjan over `callees`.
+/// Blocks of `f` that can't reach a `return` or a loop: every path from
+/// them ends in `unreachable`, a diverging call or a resume
+/// (`PLIRON_INLINE_COLD`).
+fn doomed_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+    let bs = blocks(ctx, f);
+    let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+    let mut work = Vec::new();
+    for &b in &bs {
+        for w in bsuccs(ctx, st, b) {
+            preds.entry(w).or_default().push(b);
+        }
+        if b.deref(ctx).iter(ctx).last().is_some_and(|t| Operation::is_op::<ReturnOp>(t, ctx)) {
+            work.push(b);
+        }
+    }
+    // Blocks that can reach a loop count as live too: a function that
+    // never returns (a `loop {}` server) has no `return` to reach, and
+    // its hot loop must not look cold.
+    work.extend(loop_blocks(ctx, st, f));
+    let mut live: FxHashSet<Ptr<BasicBlock>> = work.iter().copied().collect();
+    while let Some(b) = work.pop() {
+        for &p in preds.get(&b).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if live.insert(p) {
+                work.push(p);
+            }
+        }
+    }
+    bs.into_iter().filter(|b| !live.contains(b)).collect()
+}
+
 fn scc_ids(ctx: &Context, st: &State) -> FxHashMap<String, u32> {
     let names: Vec<&String> = st
         .funcs
