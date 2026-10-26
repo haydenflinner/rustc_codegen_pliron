@@ -33,6 +33,8 @@ fn run(src: &str, lt: impl Fn(&Function) -> Lifetimes) -> Function {
     unsafe {
         std::env::set_var("PLIRON_SLOTMERGE_MARK", "1");
         std::env::set_var("PLIRON_SM_MARKFLOW", "1");
+        std::env::set_var("PLIRON_SM_AFTERKILL", "0");
+        std::env::set_var("PLIRON_SM_STARTS", "0");
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let lifetimes = lt(&f);
@@ -180,6 +182,8 @@ block3(v9: i64):
     unsafe {
         std::env::set_var("PLIRON_SLOTMERGE_MARK", "1");
         std::env::set_var("PLIRON_SM_MARKFLOW", "1");
+        std::env::set_var("PLIRON_SM_AFTERKILL", "0");
+        std::env::set_var("PLIRON_SM_STARTS", "0");
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let (b0, b1, b2) = (Block::from_u32(0), Block::from_u32(1), Block::from_u32(2));
@@ -231,6 +235,8 @@ block3:
     unsafe {
         std::env::set_var("PLIRON_SLOTMERGE_MARK", "1");
         std::env::set_var("PLIRON_SM_MARKFLOW", "1");
+        std::env::set_var("PLIRON_SM_AFTERKILL", "0");
+        std::env::set_var("PLIRON_SM_STARTS", "0");
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let (b0, b1, b2, b3) = (Block::from_u32(0), Block::from_u32(1), Block::from_u32(2), Block::from_u32(3));
@@ -278,6 +284,8 @@ block1:
     unsafe {
         std::env::set_var("PLIRON_SLOTMERGE_MARK", "1");
         std::env::set_var("PLIRON_SM_MARKFLOW", "1");
+        std::env::set_var("PLIRON_SM_AFTERKILL", "0");
+        std::env::set_var("PLIRON_SM_STARTS", "0");
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let (b0, b1) = (Block::from_u32(0), Block::from_u32(1));
@@ -359,6 +367,8 @@ block3(v9: i64):
     unsafe {
         std::env::set_var("PLIRON_SLOTMERGE_MARK", "1");
         std::env::set_var("PLIRON_SM_MARKFLOW", "1");
+        std::env::set_var("PLIRON_SM_AFTERKILL", "0");
+        std::env::set_var("PLIRON_SM_STARTS", "0");
     }
     let (b1, b2, b3) = (Block::from_u32(1), Block::from_u32(2), Block::from_u32(3));
     let lifetimes: Lifetimes = vec![(vec![ss0], None, b1, false), (vec![ss1], None, b2, false)];

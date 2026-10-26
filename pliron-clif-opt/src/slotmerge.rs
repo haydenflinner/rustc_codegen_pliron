@@ -262,6 +262,9 @@ const BEFORE_INST: u32 = u32::MAX - 1;
 /// Every slot is dead just before this inst (the slot field is unused):
 /// the pipeline's `_Unwind_Resume` calls.
 pub const KILL_ALL: u32 = u32::MAX - 2;
+/// Not an edge: the slot is dead just after this inst (a call that only
+/// quiet insts and jumps separate from the end marker).
+const AFTER_INST: u32 = u32::MAX - 3;
 
 fn dest_index(n: usize, k: u32) -> Option<usize> {
     match k {
@@ -280,6 +283,7 @@ pub fn entry_kills(
     }
     let cfg = ControlFlowGraph::with_function(func);
     let addrs = slot_addrs(func);
+    let afterkill = crate::env_is("PLIRON_SM_AFTERKILL", "1");
     for (ds, anchor, b, start) in lifetimes {
         let (&[s], false) = (ds.as_slice(), *start) else { continue };
         if !func.layout.is_block_inserted(*b) {
@@ -344,10 +348,35 @@ pub fn entry_kills(
                     continue;
                 }
                 out.push((s, pr.inst, k));
-                if d.opcode() == Opcode::Jump
-                    && func.layout.block_insts(pr.block).all(|i| i == pr.inst || quiet(func, i))
-                {
+                if d.opcode() != Opcode::Jump {
+                    continue;
+                }
+                if func.layout.block_insts(pr.block).all(|i| i == pr.inst || quiet(func, i)) {
                     work.push(pr.block);
+                    continue;
+                }
+                // `PLIRON_SM_AFTERKILL=1`: the jump dies too when the
+                // chain collapses (jumpthread merges the drop call's block
+                // with its forwarding successors), but the call or store
+                // before it keeps its identity — kill just after that,
+                // if only quiet insts away from `s` sit in between. Calls
+                // only: store sinking can move a store past a later use.
+                if !afterkill {
+                    continue;
+                }
+                let mut x = func.layout.prev_inst(pr.inst);
+                while let Some(i) = x
+                    && quiet(func, i)
+                    && !func.dfg.inst_values(i).any(|v| addrs[func.dfg.resolve_aliases(v)].as_ref().is_none_or(|a| a.contains(&s)))
+                    && !matches!(func.dfg.insts[i], InstructionData::StackAddr { stack_slot, .. } if stack_slot == s)
+                {
+                    x = func.layout.prev_inst(i);
+                }
+                if let Some(i) = x {
+                    let op = func.dfg.insts[i].opcode();
+                    if op.is_call() && !op.is_terminator() {
+                        out.push((s, i, AFTER_INST));
+                    }
                 }
             }
         }
@@ -668,6 +697,9 @@ fn mark_flow(
         if k == BEFORE_INST && t != usize::MAX {
             ev[bidx[b]].push((ipos[n], 0, t));
         }
+        if k == AFTER_INST && t != usize::MAX {
+            ev[bidx[b]].push((ipos[n], 2, t));
+        }
     }
     for &(s, b, p, exact) in kills {
         let t = tid[s.index()];
@@ -710,7 +742,7 @@ fn mark_flow(
         let mut by_term: FxHashMap<Inst, Vec<(u32, usize)>> = FxHashMap::default();
         for &(s, term, k) in edge_kills {
             let t = tid.get(s.index()).copied().unwrap_or(usize::MAX);
-            if t != usize::MAX && k != BEFORE_INST && k != KILL_ALL && func.layout.inst_block(term).is_some() {
+            if t != usize::MAX && k != BEFORE_INST && k != AFTER_INST && k != KILL_ALL && func.layout.inst_block(term).is_some() {
                 by_term.entry(term).or_default().push((k, t));
             }
         }
@@ -978,10 +1010,10 @@ fn use_flow(
         let Some(k) = func.layout.inst_block(n).map(|b| bidx[b]).filter(|&k| k != usize::MAX) else { continue };
         if kk == KILL_ALL {
             ev[k].extend((0..tracked.len()).map(|t| (t, ipos[n], 0, false, true)));
-        } else if kk == BEFORE_INST
+        } else if (kk == BEFORE_INST || kk == AFTER_INST)
             && let Some(&t) = tid.get(s.index()).filter(|&&t| t != usize::MAX)
         {
-            ev[k].push((t, ipos[n], 0, false, true));
+            ev[k].push((t, ipos[n], if kk == AFTER_INST { 2 } else { 0 }, false, true));
         }
     }
     for e in &mut ev {
@@ -1043,7 +1075,7 @@ fn use_flow(
     let mut by_term: FxHashMap<Inst, Vec<(u32, usize)>> = FxHashMap::default();
     for &(s, term, kk) in edge_kills {
         let t = tid.get(s.index()).copied().unwrap_or(usize::MAX);
-        if t != usize::MAX && kk != BEFORE_INST && kk != KILL_ALL && func.layout.inst_block(term).is_some() {
+        if t != usize::MAX && kk != BEFORE_INST && kk != AFTER_INST && kk != KILL_ALL && func.layout.inst_block(term).is_some() {
             by_term.entry(term).or_default().push((kk, t));
         }
     }
@@ -1256,6 +1288,8 @@ fn stale_markers(
             continue; // nothing in this frame runs after `_Unwind_Resume`
         } else if kk == BEFORE_INST {
             ev[k].push((ipos[n], 0, 0, s.index()));
+        } else if kk == AFTER_INST {
+            ev[k].push((ipos[n], 2, 0, s.index()));
         } else {
             by_term.entry(n).or_default().push((kk, s.index()));
         }
@@ -2739,6 +2773,24 @@ pub fn run_with(
     // positions as one sorted, disjoint segment list (flow mode only — for
     // convex members taken in `lo` order it equals `..=end`).
     let mut occ: Vec<Vec<(u32, u32)>> = Vec::new();
+    // `PLIRON_SM_STARTS=1` (with segments): LLVM StackColoring's
+    // interference test. Two slots are in use together only if one starts
+    // being in use while the other is live, so they conflict iff a start
+    // of one lies in the other's live set — not wherever both sets
+    // overlap. A shared cleanup tail where every arm's slots are live (MIR
+    // has no StorageDead on unwind paths), reached from different arms,
+    // then no longer chains them all together (lower_item_kind: two
+    // 328-byte slots per arm, none merged). A slot only starts being in
+    // use at an access, so its recorded uses are its starts. `ost[r]`:
+    // every member's starts, sorted.
+    let starts_on = segs_on && crate::env_is("PLIRON_SM_STARTS", "1");
+    let mut ost: Vec<Vec<u32>> = Vec::new();
+    let pts_in = |pts: &[u32], sg: &[(u32, u32)]| {
+        pts.iter().any(|&p| {
+            let k = sg.partition_point(|&(_, b)| b < p);
+            sg.get(k).is_some_and(|&(a, _)| a <= p)
+        })
+    };
     let mut rep: FxHashMap<StackSlot, StackSlot> = FxHashMap::default();
     // Region index of each region's representative slot, and the copy
     // destinations that joined their source's region.
@@ -2747,6 +2799,14 @@ pub fn run_with(
     for (_, _, s) in cand {
         let (lo, hi) = iv[s.index()];
         let mine: Vec<(u32, u32)> = segs[s.index()].clone().unwrap_or_else(|| vec![(lo, hi)]);
+        let my_starts: Vec<u32> = if starts_on {
+            let mut v = uses[s.index()].clone();
+            v.sort_unstable();
+            v.dedup();
+            v
+        } else {
+            Vec::new()
+        };
         let (size, align) = {
             let d = &func.sized_stack_slots[s];
             (d.size, d.align_shift)
@@ -2773,12 +2833,22 @@ pub fn run_with(
                 for g in mine.into_iter().chain(win) {
                     add_seg(&mut occ[r], g);
                 }
+                if starts_on {
+                    ost[r].extend(&my_starts);
+                    ost[r].sort_unstable();
+                }
                 coalesced.push(s);
                 continue;
             }
         }
         for (r, &(end, rsize, ralign, _)) in regions.iter().enumerate() {
-            let free = if markflow || bysize || flowiv { !segs_overlap(&occ[r], &mine) } else { end < lo };
+            let free = if starts_on {
+                !pts_in(&my_starts, &occ[r]) && !pts_in(&ost[r], &mine)
+            } else if markflow || bysize || flowiv {
+                !segs_overlap(&occ[r], &mine)
+            } else {
+                end < lo
+            };
             // Largest-first, a member's stricter alignment just raises the
             // rep's (the rewrite below grows size and alignment alike).
             if free
@@ -2802,12 +2872,17 @@ pub fn run_with(
                         add_seg(&mut occ[r], g);
                     }
                 }
+                if starts_on {
+                    ost[r].extend(&my_starts);
+                    ost[r].sort_unstable();
+                }
             }
             None => {
                 rep.insert(s, s);
                 reg_of.insert(s, regions.len());
                 regions.push((hi, size, align, s));
                 occ.push(if segs_on { mine } else { Vec::new() });
+                ost.push(my_starts);
             }
         }
     }
