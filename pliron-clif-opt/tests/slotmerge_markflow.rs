@@ -114,7 +114,10 @@ block3:
 
 /// ss0 lives twice (block0 and block2), killed in between: its live set
 /// has a hole over block1 that ss1 can use, though the hull of ss0's
-/// positions covers ss1 entirely.
+/// positions covers ss1 entirely. The second life opens with its
+/// StorageLive (start marker): without it, the call taking ss0's address
+/// after an end marker contradicts the markers and `stale_markers` drops
+/// them.
 #[test]
 fn second_life_leaves_a_hole() {
     let src = "function %t() {
@@ -140,6 +143,7 @@ block2:
         vec![
             (vec![ss0], inst(f, 0, 1), Block::from_u32(0), false),
             (vec![ss1], inst(f, 1, 1), Block::from_u32(1), false),
+            (vec![ss0], None, Block::from_u32(2), true),
             (vec![ss0], inst(f, 2, 1), Block::from_u32(2), false),
         ]
     });

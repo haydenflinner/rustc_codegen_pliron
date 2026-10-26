@@ -24,7 +24,7 @@ use pliron::r#type::{Typed, TypedHandle};
 use pliron::value::Value;
 use pliron_llvm::ops::{
     AddrSpaceCastOp, AllocaOp, AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp,
-    BitcastOp, BrOp, CallOp, CondBrOp, ExtractValueOp, FreezeOp, FuncOp, GetElementPtrOp,
+    BitcastOp, BrOp, CallIntrinsicOp, CallOp, CondBrOp, ExtractValueOp, FreezeOp, FuncOp, GetElementPtrOp,
     IndirectBrOp, InsertValueOp, LoadOp, PoisonOp, ReturnOp, StoreOp, SwitchOp, UndefOp,
     UnreachableOp,
 };
@@ -2589,6 +2589,45 @@ pub fn end_block_at_invoke(
     Some(nb)
 }
 
+/// Under `PLIRON_SM_MARKFLOW`: the inlined callee's `_Unwind_Resume`,
+/// now an invoke of the callsite's pad, still leaves the callee's frame —
+/// every one of its locals dies there. Slotmerge can no longer treat that
+/// resume as the end of every slot (the unwind lands in this frame's pad,
+/// which reads the caller's), so say which ones: an `llvm.lifetime.end`
+/// before it for each local that has one elsewhere (cloned from it, so
+/// size and intrinsic type match). `PLIRON_INLINE_RESUME_ENDS=0` skips it.
+fn resume_ends(ctx: &mut Context, st: &mut State, invokes: &[Ptr<Operation>], locals: &[Value]) {
+    if !crate::env_is("PLIRON_SM_MARKFLOW", "1") || !crate::pass_enabled("PLIRON_INLINE_RESUME_ENDS") {
+        return;
+    }
+    let resumes: Vec<Ptr<Operation>> = invokes
+        .iter()
+        .copied()
+        .filter(|&op| direct_callee(ctx, st, op).is_some_and(|c| c == "_Unwind_Resume"))
+        .collect();
+    if resumes.is_empty() {
+        return;
+    }
+    for &a in locals {
+        let Some(m) = a.uses_iter(ctx).map(|u| u.user_op()).find(|&m| {
+            st.intrinsics.get(m).is_some_and(|n| n == "llvm.lifetime.end")
+                && m.deref(ctx).operands(ctx).any(|v| v == a)
+        }) else {
+            continue;
+        };
+        let ci = Operation::get_op::<CallIntrinsicOp>(m, ctx).unwrap();
+        let iname = ci.get_attr_llvm_intrinsic_name(ctx).unwrap().clone();
+        let fty = TypedHandle::<FuncType>::from_handle(ci.get_attr_llvm_intrinsic_type(ctx).unwrap().clone().into(), ctx)
+            .unwrap();
+        let args: Vec<Value> = m.deref(ctx).operands(ctx).collect();
+        for &r in &resumes {
+            let new = CallIntrinsicOp::new(ctx, iname.clone(), fty, args.clone()).get_operation();
+            new.insert_before(ctx, r);
+            st.intrinsics.insert(new, "llvm.lifetime.end".to_string());
+        }
+    }
+}
+
 /// Returns the callsite block plus the freshly created blocks in region
 /// order (`cont` follows `block`; callee clones sit at the region end), so
 /// the rescan worklist can track the list without re-walking it.
@@ -2661,12 +2700,15 @@ fn inline_call(
             st.prof_bcount.insert(nb, scale(st.prof_bcount[b]));
         }
     }
+    // The clone's own locals (for `resume_ends`).
+    let mut locals: Vec<Value> = Vec::new();
     for &(v, m) in &tags.vals {
         let Some(nv) = map.lookup_value(v) else {
             continue;
         };
         if m & V_ALLOCAS != 0 {
             st.allocas.insert(nv, st.allocas[v]);
+            locals.push(nv);
             // The clone's variables are the inlined instance's.
             if site != 0
                 && let Some(d) = st.dbg.as_deref_mut()
@@ -2779,6 +2821,13 @@ fn inline_call(
             br.insert_before(ctx, new);
             Operation::erase(new, ctx);
         }
+    }
+    if unwind.is_some() {
+        // Only locals of the clone's entry, which dominates every resume
+        // (SROA's escape copies sit next to their calls).
+        let entry = map.lookup_block(src[0]);
+        locals.retain(|v| v.defining_op().and_then(|o| o.deref(ctx).get_parent_block()) == entry);
+        resume_ends(ctx, st, &fresh_invokes, &locals);
     }
     if let Some(res) = res {
         let ty = res.get_type(ctx);
