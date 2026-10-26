@@ -1858,6 +1858,18 @@ pub fn run_with(
                     }
                 }
             }
+            // `PLIRON_SM_ESCFLOW=1`: every slot, markers or not. Passes
+            // lose markers wholesale (jumpthread dropped 895 of stage-2
+            // `lower_item_kind`'s 2,324, leaving six 328-byte slots with
+            // neither start nor end), and an escaped slot is still only
+            // in use from its first access: `mark_flow` keeps it live from
+            // there to the frame's exits. Under `PLIRON_SM_STARTS` two such
+            // slots share storage only if no path touches both, so no
+            // run can see both addresses. Slots a tail call or stack
+            // switch receives stay escaped (`hard_esc` below).
+            if crate::env_is("PLIRON_SM_ESCFLOW", "1") {
+                marked.fill(true);
+            }
         } else {
             for s in 0..nslots {
                 marked[s] &= !mark_lost[s];
@@ -1875,6 +1887,9 @@ pub fn run_with(
     // `esc_seen` records escapes on marked slots too: markers widen a
     // marked-escaped slot's interval to its declared window below.
     let mut escaped = vec![false; nslots];
+    // Slots whose address outlives the frame (tail calls, stack
+    // switches): escaped whatever their markers say.
+    let mut hard_esc: Vec<StackSlot> = Vec::new();
     let mut esc_seen = vec![false; nslots];
     macro_rules! escape {
         ($s:expr, $i:expr) => {{
@@ -2110,6 +2125,8 @@ pub fn run_with(
                                     use_at(&mut iv, &mut uses, s, pos);
                                     reads[s.index()].push(i);
                                     escape_deep!(contains, s, i);
+                                    hard_esc.push(s);
+                                    hard_esc.extend(contains[s.index()].iter().copied());
                                 }
                             }
                         }
@@ -2403,6 +2420,13 @@ pub fn run_with(
     // sweep reclaims anyway).
     // `Some` for the slots `mark_flow` tracks: their live set, which the
     // convex `iv` only bounds.
+    for &s in &hard_esc {
+        if s.index() < nslots {
+            marked[s.index()] = false;
+            escaped[s.index()] = true;
+            iv[s.index()].1 = u32::MAX;
+        }
+    }
     let mut segs: Vec<Option<Vec<(u32, u32)>>> = vec![None; nslots];
     let flowiv = crate::env_is("PLIRON_SM_FLOWIV", "1");
     // Exactly placed start markers: dead just after the anchor, or just

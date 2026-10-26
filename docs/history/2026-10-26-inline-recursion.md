@@ -129,3 +129,30 @@ deep-try 11. The stage-2 UI suite has 54 failures. The only stage-2-only
 one is StackColoring-40883, which builds its program with default flags.
 Gate passes with every flag and with defaults (71 jobs). Fuzz 8200–8599
 with every flag passes.
+
+## 6. `PLIRON_SM_ESCFLOW=1`
+
+`PLIRON_FRAME_INFO` on stage-2 `lower_item_kind` showed 3,280 B of slots,
+784 of spills and 80 of callee saves. Its 12 merged regions were only
+1,004 B. The other 2,240 B was 38 escaped slots, among them six 328-byte
+slots that had lost both start and end markers. `PLIRON_LT_PROBE` put the
+loss in jumpthread, which dropped 895 of the function's 2,324 markers and
+2,064 of its 3,602 edge kills. Later passes lost a few hundred more.
+
+Rather than teach every pass to carry markers, `ESCFLOW` treats every
+escaped slot, markers or not, as live from its first access to the
+frame's exits (`mark_flow` with only the frame-leaving kills). Under
+`STARTS`, two such slots share storage only if no path touches both, so
+no run can see both addresses. A slot passed to a tail call or stack
+switch outlives the frame, so it is still escaped (`hard_esc`).
+
+Clean stage 2, every flag plus this: `lower_item_kind` 4,208 → 1,968 B
+(LLVM 1,264), `lower_expr_mut` 912 → 816, expr-stack-overflow 12 → 11 MiB.
+regex-syntax −0.3% (few such slots there). Fuzz 8600–8999 with every flag
+found seed 8631, a slotprom overflow that also fails with default flags
+(fixed in `50dce72`). Tests (`slotmerge_starts.rs`):
+`markerless_escaped_slots_on_disjoint_paths_merge` (fails with the flag
+off), `markerless_escaped_slot_stays_live`, and
+`tail_called_slot_never_merges` (fails without `hard_esc`). The stage-2
+UI suite has 54 failures. The only stage-2-only one is
+StackColoring-40883 (default flags).

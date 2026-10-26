@@ -5,6 +5,8 @@
 //! that call, which survives jumpthread collapsing the jumps.
 //! `PLIRON_SM_STARTONLY=1`: a slot with a start marker and no end marker
 //! is live from its first access to the frame's exits.
+//! `PLIRON_SM_ESCFLOW=1`: so is every escaped slot, markers or not
+//! (passes lose them wholesale); a slot a tail call receives never merges.
 //! Stage-2 `lower_item_kind` had two 328-byte slots per `match` arm that
 //! never merged: their end markers were lost to jumpthread, and every arm's
 //! slots were live together in the shared panic-in-cleanup tail.
@@ -31,6 +33,7 @@ fn setup() {
         std::env::set_var("PLIRON_SM_AFTERKILL", "1");
         std::env::set_var("PLIRON_SM_STARTS", "1");
         std::env::set_var("PLIRON_SM_STARTONLY", "1");
+        std::env::set_var("PLIRON_SM_ESCFLOW", "1");
     }
 }
 
@@ -265,4 +268,76 @@ block0:
         None,
     );
     assert_ne!(slot_of(&f, 1), slot_of(&f, 2), "a start-only slot died before the frame did:\n{}", f.display());
+}
+
+/// Escaped slots with no markers at all (jumpthread lost them) on two
+/// disjoint paths: no run touches both, so they share storage.
+#[test]
+fn markerless_escaped_slots_on_disjoint_paths_merge() {
+    let src = "function %t(i8) {
+    ss0 = explicit_slot 32, align = 8
+    ss1 = explicit_slot 32, align = 8
+    sig0 = (i64)
+    fn0 = %sink sig0
+block0(v0: i8):
+    brif v0, block1, block2
+block1:
+    v1 = stack_addr.i64 ss0
+    call fn0(v1)
+    jump block3
+block2:
+    v2 = stack_addr.i64 ss1
+    call fn0(v2)
+    jump block3
+block3:
+    return
+}";
+    let f = run(src, |_| Vec::new(), None);
+    assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "disjoint marker-less slots stayed apart:\n{}", f.display());
+}
+
+/// A marker-less escaped slot, then another on the same path: the first
+/// may still be read through its escaped pointer.
+#[test]
+fn markerless_escaped_slot_stays_live() {
+    let src = "function %t() {
+    ss0 = explicit_slot 32, align = 8
+    ss1 = explicit_slot 32, align = 8
+    sig0 = (i64)
+    sig1 = ()
+    fn0 = %sink sig0
+    fn1 = %other sig1
+block0:
+    v1 = stack_addr.i64 ss0
+    call fn0(v1)
+    v2 = stack_addr.i64 ss1
+    call fn0(v2)
+    call fn1()
+    return
+}";
+    let f = run(src, |_| Vec::new(), None);
+    assert_ne!(slot_of(&f, 1), slot_of(&f, 2), "a live escaped slot was shared:\n{}", f.display());
+}
+
+/// A slot a tail call receives outlives this frame: never merged, even on
+/// a path disjoint from the other slot's.
+#[test]
+fn tail_called_slot_never_merges() {
+    let src = "function %t(i8) tail {
+    ss0 = explicit_slot 32, align = 8
+    ss1 = explicit_slot 32, align = 8
+    sig0 = (i64) tail
+    fn0 = %sink sig0
+block0(v0: i8):
+    brif v0, block1, block2
+block1:
+    v1 = stack_addr.i64 ss0
+    return_call fn0(v1)
+block2:
+    v2 = stack_addr.i64 ss1
+    call fn0(v2)
+    return
+}";
+    let f = run(src, |_| Vec::new(), None);
+    assert_ne!(slot_of(&f, 1), slot_of(&f, 2), "a tail-called slot was shared:\n{}", f.display());
 }
