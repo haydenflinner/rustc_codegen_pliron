@@ -251,6 +251,12 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         self.ctx.func.dfg.value_type(val)
     }
 
+    fn pliron_remat_saddr(&mut self) -> Option<()> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("PLIRON_REMAT_SADDR").as_deref() == Ok("1"))
+            .then_some(())
+    }
+
     fn resolve_jump_table_entry(&mut self, table: JumpTable, index: u64) -> BlockCall {
         let jt_data = &self.ctx.func.dfg.jump_tables[table];
         let entries = jt_data.as_slice();

@@ -57,3 +57,10 @@
       (remat x))
 (rule (simplify x @ (splat _ (f64const _ _)))
       (remat x))
+;; PLIRON: `PLIRON_REMAT_SADDR=1`: a frame address is one `add rd, sp,
+;; #off`; recompute it in each block that uses it rather than hold it
+;; across calls in a callee-saved register or a spill slot (LLVM's RA
+;; rematerializes frame indices the same way).
+(rule (simplify x @ (stack_addr _ _ _))
+      (if (pliron_remat_saddr))
+      (remat x))

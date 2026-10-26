@@ -42,6 +42,10 @@
 (decl pure resolve_jump_table_entry (JumpTable u64) BlockCall)
 (extern constructor resolve_jump_table_entry resolve_jump_table_entry)
 
+;; PLIRON: `PLIRON_REMAT_SADDR=1` gates rematerializing `stack_addr`.
+(decl pure partial pliron_remat_saddr () Unit)
+(extern constructor pliron_remat_saddr pliron_remat_saddr)
+
 ;; Get the destination block of a block call.
 (decl pure block_call_block (BlockCall) Block)
 (extern constructor block_call_block block_call_block)

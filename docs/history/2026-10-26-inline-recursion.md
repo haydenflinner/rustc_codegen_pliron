@@ -156,3 +156,24 @@ off), `markerless_escaped_slot_stays_live`, and
 `tail_called_slot_never_merges` (fails without `hard_esc`). The stage-2
 UI suite has 54 failures. The only stage-2-only one is
 StackColoring-40883 (default flags).
+
+## 7. `PLIRON_REMAT_SADDR=1`
+
+In regex-syntax's worst spiller (`NestLimiter::check`: 632 B of spills,
+1,552 disassembly lines against LLVM's 416) the same few spill slots are
+reloaded before nearly every call. Most are long-lived values: `self`,
+and the function's own indirect-result pointer in `x8`. All ten
+callee-saved registers are already in use, so that part comes from the
+larger inlined body, not from the allocator. The vendored regalloc2
+spill-weight patch already favors such values. Frame addresses were a
+smaller cheap part: GVN merges a function's `stack_addr`s into one value
+that then lives across calls. LLVM's register allocator rematerializes
+frame indices instead. A gated e-graph remat rule (`remat.isle`, extern
+`pliron_remat_saddr`) now recomputes `stack_addr` in each block that
+uses it.
+
+regex-syntax: stack loads 7,322 → 6,942 (−5%), spill bytes −1.5%, text
+−0.3%. Native bench geomean pliron/LLVM 0.917 → 0.910; no kernel more
+than 1% worse (chars_alpha −7.2%, tokenize −3.4%, strwork −3.3%, all near
+noise). Gate passes with every flag and with defaults; fuzz 9000–9299
+with every flag passes.
