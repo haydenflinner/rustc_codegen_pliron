@@ -288,6 +288,13 @@ t_inlinerec() {
   $out/inlinerec$exe | diff --strip-trailing-cr - tests/inlinerec/expected.out
 }
 
+t_xfactsplugin() {
+  # Two-phase facts must not hold modules when rustc skips the thin step
+  # (-Clinker-plugin-lto, as cargo passes to an lto=true build's deps):
+  # held modules were written as empty objects and the archive failed.
+  PLIRON_XFACTS_ALL=1 rustc $BE --edition 2021 -O -C codegen-units=4 -C linker-plugin-lto --crate-type rlib tests/xfactsplugin/lib.rs -o $out/libxfactsplugin.rlib
+}
+
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
@@ -774,6 +781,7 @@ want retattr && t_retattr
 want invokeblk && t_invokeblk
 want resumehoist && t_resumehoist
 want inlinerec && t_inlinerec
+want xfactsplugin && t_xfactsplugin
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul

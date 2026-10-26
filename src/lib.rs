@@ -1726,12 +1726,22 @@ impl WriteBackendMethods for PlironCodegenBackend {
 
     fn codegen(
         cgcx: &CodegenContext,
-        _prof: &SelfProfilerRef,
-        _shared_emitter: &SharedEmitter,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
         module: ModuleCodegen<PlironModule>,
         config: &ModuleConfig,
     ) -> CompiledModule {
         let outs = &cgcx.output_filenames;
+        let mut module = module;
+        // A module still held for the two-phase barrier (rustc skipped the
+        // thin step): finish it on the facts published so far, as the
+        // allocator shim is, rather than write its empty object.
+        if let Some(key) = module.module_llvm.pending.take() {
+            let fin = cgupool::finish_held(key, false, prof, shared_emitter);
+            module.module_llvm.obj = fin.obj;
+            module.module_llvm.ir = fin.ir;
+            module.module_llvm.asm = fin.asm;
+        }
         let emit_obj = config.emit_obj != EmitObj::None;
         if emit_obj {
             let path = outs.temp_path_for_cgu(OutputType::Object, &module.name);

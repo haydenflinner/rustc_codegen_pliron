@@ -298,11 +298,16 @@ pub(crate) fn begin(tcx: TyCtxt<'_>) {
 }
 
 /// `PLIRON_XFACTS_ALL=1` and rustc chose thin-local LTO for this crate
-/// (multi-CGU, optimizing): stage B moves behind the LTO barrier.
+/// (multi-CGU, optimizing): stage B moves behind the LTO barrier. Not
+/// under `-Clinker-plugin-lto`: rustc then skips the thin step, and the
+/// held modules reached `codegen` unfinished — cargo passes it to the
+/// dependencies of an `lto = true` build (prql, nushell: every rlib got
+/// an empty object).
 pub(crate) fn two_phase(tcx: TyCtxt<'_>) -> bool {
     pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1")
         && enabled(tcx)
         && tcx.sess.lto() == rustc_session::config::Lto::ThinLocal
+        && !tcx.sess.opts.cg.linker_plugin_lto.enabled()
 }
 
 /// Whether this compile holds published jobs for `finish_held`.
