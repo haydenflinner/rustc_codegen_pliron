@@ -1058,6 +1058,17 @@ impl core::ops::Index<Sig> for SigSet {
     }
 }
 
+std::thread_local! {
+    static PLIRON_LAST_FRAME: core::cell::Cell<[u32; 5]> = const { core::cell::Cell::new([0; 5]) };
+}
+
+/// PLIRON: the frame of the last function this thread compiled:
+/// `[stack slots, spill slots, clobber saves, outgoing args, fixed
+/// storage (slots + spills, aligned)]` in bytes.
+pub fn pliron_last_frame() -> [u32; 5] {
+    PLIRON_LAST_FRAME.with(|c| c.get())
+}
+
 /// Structure describing the layout of a function's stack frame.
 #[derive(Clone, Debug, Default)]
 pub struct FrameLayout {
@@ -2325,6 +2336,17 @@ impl<M: ABIMachineSpec> Callee<M> {
         if Self::frame_layout_exceeds_limit(&frame_layout, M::maximum_frame_size()) {
             return Err(CodegenError::ImplLimitExceeded);
         }
+
+        // PLIRON: remember this frame's breakdown for `pliron_last_frame`.
+        PLIRON_LAST_FRAME.with(|c| {
+            c.set([
+                self.stackslots_size,
+                bytes * spillslots as u32,
+                frame_layout.clobber_size,
+                frame_layout.outgoing_args_size,
+                frame_layout.fixed_frame_storage_size,
+            ])
+        });
 
         self.frame_layout = Some(frame_layout);
         Ok(())

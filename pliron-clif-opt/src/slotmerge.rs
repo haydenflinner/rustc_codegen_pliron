@@ -498,6 +498,7 @@ fn copy_groups(
     let nslots = iv.len();
     let mut out = FxHashMap::default();
     let mut taken: FxHashSet<StackSlot> = FxHashSet::default();
+    let coalcall = crate::env_is("PLIRON_SM_COALCALL", "1");
     // Block param -> the one value all its incoming edges pass.
     let mut incoming: FxHashMap<Value, Option<Value>> = FxHashMap::default();
     for &b in order {
@@ -587,6 +588,52 @@ fn copy_groups(
             }
             taken.insert(d);
             out.insert(d, (s, (lo, hi), ps.iter().map(|p| (p.0, p.1)).collect()));
+        }
+        // `PLIRON_SM_COALCALL=1`: a whole-slot `memcpy(D, S, size)` call is
+        // the same copy in one inst (a `Drop` value built in a temporary,
+        // then moved into its binding). Recorded as the pair (call, call).
+        if !coalcall {
+            continue;
+        }
+        for i in func.layout.block_insts(b) {
+            use cranelift_codegen::ir::{ExternalName, LibCall};
+            let CallInfo::Direct(fr, cargs) = func.dfg.insts[i].analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables)
+            else {
+                continue;
+            };
+            if !matches!(func.dfg.ext_funcs[fr].name, ExternalName::LibCall(LibCall::Memcpy)) || cargs.len() != 3 {
+                continue;
+            }
+            let len = func.dfg.value_def(func.dfg.resolve_aliases(cargs[2])).inst().and_then(|l| match func.dfg.insts[l] {
+                InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits()),
+                _ => None,
+            });
+            let (Some((d, 0)), Some((s, 0)), Some(n)) =
+                (slot_at(func, &same_in, cargs[0], 0), slot_at(func, &same_in, cargs[1], 0), len)
+            else {
+                continue;
+            };
+            if s == d
+                || s.index() >= nslots
+                || d.index() >= nslots
+                || n != i64::from(func.sized_stack_slots[s].size)
+                || n != i64::from(func.sized_stack_slots[d].size)
+                || escaped[s.index()]
+                || escaped[d.index()]
+                || iv[s.index()].0 == u32::MAX
+                || iv[d.index()].0 == u32::MAX
+                || taken.contains(&d)
+            {
+                continue;
+            }
+            let p = ipos[i];
+            let ls = segs[s.index()].clone().unwrap_or_else(|| vec![iv[s.index()]]);
+            let ld = segs[d.index()].clone().unwrap_or_else(|| vec![iv[d.index()]]);
+            if !seg_isect(&ls, &ld).iter().all(|&(a, z)| p <= a && z <= p) {
+                continue;
+            }
+            taken.insert(d);
+            out.insert(d, (s, (p, p), vec![(i, i)]));
         }
     }
     out
@@ -2803,6 +2850,10 @@ pub fn run_with(
     // every member's starts, sorted.
     let starts_on = segs_on && crate::env_is("PLIRON_SM_STARTS", "1");
     let mut ost: Vec<Vec<u32>> = Vec::new();
+    // Each region's members, for the coalescing test under `starts_on`
+    // (members' live sets may overlap there, so the source's segments
+    // can't simply be subtracted from `occ`).
+    let mut members: Vec<Vec<StackSlot>> = Vec::new();
     let pts_in = |pts: &[u32], sg: &[(u32, u32)]| {
         pts.iter().any(|&p| {
             let k = sg.partition_point(|&(_, b)| b < p);
@@ -2842,10 +2893,27 @@ pub fn run_with(
             && regions[r].2 >= align
         {
             let sseg: Vec<(u32, u32)> = segs[src.index()].clone().unwrap_or_else(|| vec![iv[src.index()]]);
-            let others = seg_sub(&occ[r], &sseg);
             let inside = seg_isect(&mine, &sseg).iter().all(|&(a, b)| w.0 <= a && b <= w.1);
             let win = (!crate::env_is("PLIRON_SM_COALWIN", "0")).then_some(*w);
-            if inside && !segs_overlap(&others, &mine) && !win.is_some_and(|w| segs_overlap(&others, &[w])) && sm_take() {
+            let free = if starts_on {
+                // The other members' live sets and starts, rebuilt: the
+                // source may overlap them where no one starts.
+                let (mut ol, mut os) = (Vec::new(), Vec::new());
+                for &m in members[r].iter().filter(|&&m| m != *src) {
+                    for &g in segs[m.index()].as_deref().unwrap_or(&[iv[m.index()]]) {
+                        add_seg(&mut ol, g);
+                    }
+                    os.extend(&uses[m.index()]);
+                }
+                os.sort_unstable();
+                !pts_in(&my_starts, &ol)
+                    && !pts_in(&os, &mine)
+                    && !win.is_some_and(|w| segs_overlap(&ol, &[w]) || pts_in(&os, &[w]))
+            } else {
+                let others = seg_sub(&occ[r], &sseg);
+                !segs_overlap(&others, &mine) && !win.is_some_and(|w| segs_overlap(&others, &[w]))
+            };
+            if inside && free && sm_take() {
                 rep.insert(s, regions[r].3);
                 regions[r].0 = regions[r].0.max(hi);
                 for g in mine.into_iter().chain(win) {
@@ -2855,6 +2923,7 @@ pub fn run_with(
                     ost[r].extend(&my_starts);
                     ost[r].sort_unstable();
                 }
+                members[r].push(s);
                 coalesced.push(s);
                 continue;
             }
@@ -2894,6 +2963,7 @@ pub fn run_with(
                     ost[r].extend(&my_starts);
                     ost[r].sort_unstable();
                 }
+                members[r].push(s);
             }
             None => {
                 rep.insert(s, s);
@@ -2901,6 +2971,7 @@ pub fn run_with(
                 regions.push((hi, size, align, s));
                 occ.push(if segs_on { mine } else { Vec::new() });
                 ost.push(my_starts);
+                members.push(vec![s]);
             }
         }
     }
@@ -3025,6 +3096,18 @@ pub fn run_with(
         let mut gone = 0usize;
         for d in &coalesced {
             for &(l, st) in &coal[d].2 {
+                if l == st {
+                    // A coalesced `memcpy(D, S, n)` call: memcpy returns D.
+                    let dst = func.dfg.inst_args(l)[0];
+                    let res: Vec<Value> = func.dfg.inst_results(l).to_vec();
+                    func.dfg.detach_inst_results(l);
+                    for r in res {
+                        func.dfg.change_to_alias(r, dst);
+                    }
+                    func.layout.remove_inst(l);
+                    gone += 1;
+                    continue;
+                }
                 func.layout.remove_inst(st);
                 func.layout.remove_inst(l);
                 gone += 1;

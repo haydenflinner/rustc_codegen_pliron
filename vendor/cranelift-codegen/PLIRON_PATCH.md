@@ -728,3 +728,7 @@ register has unspecified bits above its width, which `lsr #k` shifts into
 the sum; plain `ushr` lowering zero-extends first. They now require
 `ty_32_or_64`, like the `band`/`bxor` shifted-operand rules (fuzz seeds
 1939 and 3441; tests/narrowlsr).
+
+- `src/machinst/abi.rs`: `pliron_last_frame()` returns the frame breakdown
+  (stack slots, spill slots, clobber saves, outgoing args) of the last
+  function the thread compiled, for `PLIRON_FRAME_INFO`. Debug aid only.

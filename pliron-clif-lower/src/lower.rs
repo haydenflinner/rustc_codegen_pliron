@@ -857,7 +857,17 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         }));
         let msg = match &defr {
             Ok(Err(e)) => format!("{e}"),
-            Ok(_) => break defr,
+            Ok(_) => {
+                // `PLIRON_FRAME_INFO=<symbol substring>`: where the frame
+                // goes (stack slots, spills, callee saves, outgoing args).
+                if let Some(f) = crate::env_get("PLIRON_FRAME_INFO")
+                    && n.contains(f)
+                {
+                    let [slots, spills, clobber, out, fixed] = cranelift_codegen::pliron_last_frame();
+                    eprintln!("frame-info {n}: slots={slots} spills={spills} clobber={clobber} outgoing={out} fixed={fixed}");
+                }
+                break defr;
+            }
             Err(p) => p
                 .downcast_ref::<String>()
                 .cloned()

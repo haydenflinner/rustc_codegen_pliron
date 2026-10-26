@@ -48,6 +48,8 @@ include!(concat!(env!("ISLE_DIR"), "/isle_numerics.rs"));
 
 #[macro_use]
 mod machinst;
+// PLIRON: frame breakdown of the last compiled function (debug aid).
+pub use crate::machinst::pliron_last_frame;
 
 pub mod binemit;
 pub mod cfg_printer;
