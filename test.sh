@@ -411,7 +411,7 @@ t_xfactsall() {
   # PLIRON_XFACTS_ALL: two-phase cross-CGU facts behind rustc's thin-local
   # LTO barrier. The first-submitted CGU (ordinal-prefix adoption sees
   # nothing) must import facts from later ones, and the program must run.
-  PLIRON_XFACTS_ALL=1 PLIRON_TRACE=pliron::stats=info rustc $BE --edition 2021 -O -C codegen-units=4 tests/std/main.rs -o $out/xfactsall$exe 2> $out/xfactsall.txt \
+  PLIRON_XFACTS_ALL=1 PLIRON_TRACE=pliron::stats=info rustc $BE $stockcfg --edition 2021 -O -C codegen-units=4 tests/std/main.rs -o $out/xfactsall$exe 2> $out/xfactsall.txt \
     && $out/xfactsall$exe > /dev/null 2>&1 \
     && grep -qE "cgu\.0: imported [1-9]" $out/xfactsall.txt
 }
@@ -779,7 +779,11 @@ want sroa && t_sroa
 want inlinecm && t_inlinecm
 want retattr && t_retattr
 want invokeblk && t_invokeblk
-want resumehoist && t_resumehoist
+# resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
+# resumes lower to `pliron.eh.rethrow` via cleanup_ret (funclet path), so
+# the hoist counter can never fire — and catch_unwind can't catch stock-std
+# SEH throws anyway.
+[[ -z "$exe" ]] && want resumehoist && t_resumehoist
 want inlinerec && t_inlinerec
 want xfactsplugin && t_xfactsplugin
 want xcgurot && t_xcgurot
@@ -808,7 +812,9 @@ want asmcfi && t_asmcfi
 want asmextern && t_asmextern
 want dbgnested && t_dbgnested
 want nocapfields && t_nocapfields
-want stackmove && t_stackmove
+# stackmove's expected output requires catch_unwind to intercept a panic —
+# impossible against the stock-std SEH throw on Windows.
+[[ -z "$exe" ]] && want stackmove && t_stackmove
 want xfactsall && t_xfactsall
 want debuginfo && t_debuginfo
 want facts && t_facts
