@@ -1,0 +1,21 @@
+drop callee guard sum=8
+drop callee guard sum=16
+drop caller after sum=72
+drop caller keep sum=80
+caller(1) = 18
+drop callee guard sum=24
+drop caller keep sum=240
+caller(3) panicked
+drop callee guard sum=32
+drop caller keep sum=320
+caller(4) panicked
+drop callee guard sum=64
+drop callee guard sum=72
+drop caller after sum=216
+drop caller keep sum=640
+caller(8) = 60
+drop callee guard sum=72
+drop callee guard sum=80
+drop caller after sum=264
+drop caller keep sum=720
+caller(9) = 66

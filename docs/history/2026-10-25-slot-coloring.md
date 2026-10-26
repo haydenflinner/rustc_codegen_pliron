@@ -1,4 +1,4 @@
-# Stack frames: two-phase facts, largest-first coloring, flow liveness, and stale lifetime markers
+# Stack frames: two-phase facts, largest-first coloring, flow liveness, stale lifetime markers, and inlined-resume ends
 
 Stage-2 rustc (pliron-built) overflowed the stack on six deep-recursion UI
 tests. Its frames were 2.5–12× LLVM's. This session measured where the
@@ -178,6 +178,58 @@ block, such as SROA's escape copies next to their calls, need not
 dominate the resume; including them broke `erase_unreachable`. Result:
 peano and deep-try 28, expr-stack-overflow 49, issue-93775 16 (passes).
 
+### 5d. Ending the inlined callee's other locals (2026-10-26)
+
+Rebuilding only `rustc_hir_typeck` with `PLIRON_SM_RESUMETRY=0` and `=1`
+put the whole peano/deep-try loss in one frame: `check_expr_kind`, 4,848
+→ 7,744 bytes, times about 2,000 levels of the check_expr recursion. Its
+`PLIRON_SM_INFO` dump showed 95 marker-tracked slots (6.2 KB) live into
+block200, the function's shared cleanup tail. The `try_call
+_Unwind_Resume` of an inlined callee's pad leads there. The slots are all
+`esc_seen` (their address reached an opaque call), so only the marker
+window is sound for them, and with the end marker missing on the unwind
+path the window ran on to the function's exits.
+
+The entry-block rule was the gap. The new `PLIRON_INLINE_RESUME_INFO=
+<caller substr>` counts, per inline, which callee locals got an end at
+the resume. On regex-syntax 843 locals are in the callee's entry block
+and 2,927 elsewhere. In check_expr_kind's inlines most are elsewhere:
+`check_expr_assign_op` 91 with an end marker, `check_expr_break` 42.
+
+Two default-off steps, both in `resume_ends`:
+
+- `PLIRON_INLINE_RESUME_DOM=1`: a non-entry local also ends at each resume
+  its block dominates. The dominator tree (Cooper–Harvey–Kennedy) is built
+  once per inline over the clone's blocks, counting invoke pad edges. A
+  first version used a reachability search per block. It counted resumes
+  in dead blocks an earlier inline left in the callee as dominated, so it
+  put ends there without a dominating def. Resumes the clone entry can't
+  reach now get no end. Alone this gave check_expr_kind 7,488 and peano 27
+  MiB: branch locals rarely dominate the one resume.
+- `PLIRON_INLINE_RESUME_HOIST=1` (with DOM): a local that misses a live
+  resume moves to the front of the clone entry, with its size constant if
+  the clone defines it, and then ends at every live resume. Every alloca
+  lowers to a static stack slot wherever it sits (`scan.rs` panics on a
+  dynamic size), so the move matters only to SSA.
+
+An end marker whose other operands don't dominate the resume is skipped
+(a size operand next to the original end).
+
+Clean stage 2, every flag plus both:
+
+| test | before 5c | 5c | + DOM | + HOIST |
+|---|---|---|---|---|
+| issue-93775 | 16 MiB | 16 | 16 | 16 |
+| peano | 22 | 28 | 27 | 22 |
+| deep-try | 22 | 28 | 27 | 21 |
+| expr-stack-overflow | 46 | 49 | 42 | 42 |
+
+check_expr_kind 4,832, `lower_to_hir` 8,352 → 4,352, `parse_local`
+3,088 → 2,672. regex-syntax frame bytes don't move (77,072 → 77,088);
+5c had cost it only 0.4%. Test: `tests/resumehoist` (test.sh
+`resumehoist`). It builds with both modes on under `PLIRON_CHECK_DOM`,
+needs at least one hoist, and matches stock rustc's output.
+
 ## 6. Tooling used
 
 - `fsz.py`/`frames.py`/`frametot.py` (session scratch,
@@ -188,6 +240,16 @@ peano and deep-try 28, expr-stack-overflow 49, issue-93775 16 (passes).
 - `clifflow.py`: every use of a value through block params in a CLIF dump.
 
 ## Checks at the end
+
+After 5d (every flag, DOM and HOIST): the stage-2 UI suite has 53
+failures. Six of them are cross-crate ThinLTO tests that `XFACTS_ALL`
+refuses by design; the flags were exported for the whole run, so the
+UI programs themselves also built with every flag. The only real
+stage-2-only failures are `expr-stack-overflow` and `deep-try-chain`;
+StackColoring-40883 now passes. The gate passes with defaults and with
+every flag.
+
+Before 5d:
 
 - Stage 2, clean build, every flag: 56 UI failures (the stage-1 baseline
   is 57). Three fail only at stage 2, all of them older:
@@ -206,10 +268,9 @@ peano and deep-try 28, expr-stack-overflow 49, issue-93775 16 (passes).
   4,864, `lower_item_kind` 9,056 vs 1,264. `NestLimiter::check` shows the
   next lever: with slots at 280 B the rest of its 1,008 B frame is spills
   and callee saves.
-- The 5c fix still costs peano and deep-try 6 MiB of the 7 the bogus
-  kill had saved. Next step: compare per-function frames of
-  `rustc_hir_typeck` built with `PLIRON_SM_RESUMETRY=0` and with `=1`, to
-  find which inlined locals still lack an end at their resume.
+- Callee locals with no end marker at all get no end at the resume
+  (regex-syntax: 126 in entry blocks, 455 elsewhere). Synthesizing one
+  needs a template for the intrinsic and a check that the slot is marked.
 - `XFACTS_ALL` memory: compute facts in a separate first pass instead of
   holding every CGU's IR.
 - Deciding defaults for the whole slotmerge flag set needs a crates

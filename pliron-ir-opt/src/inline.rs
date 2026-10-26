@@ -24,7 +24,7 @@ use pliron::r#type::{Typed, TypedHandle};
 use pliron::value::Value;
 use pliron_llvm::ops::{
     AddrSpaceCastOp, AllocaOp, AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp,
-    BitcastOp, BrOp, CallIntrinsicOp, CallOp, CondBrOp, ExtractValueOp, FreezeOp, FuncOp, GetElementPtrOp,
+    BitcastOp, BrOp, CallIntrinsicOp, CallOp, CondBrOp, ConstantOp, ExtractValueOp, FreezeOp, FuncOp, GetElementPtrOp,
     IndirectBrOp, InsertValueOp, LoadOp, PoisonOp, ReturnOp, StoreOp, SwitchOp, UndefOp,
     UnreachableOp,
 };
@@ -2596,7 +2596,24 @@ pub fn end_block_at_invoke(
 /// which reads the caller's), so say which ones: an `llvm.lifetime.end`
 /// before it for each local that has one elsewhere (cloned from it, so
 /// size and intrinsic type match). `PLIRON_INLINE_RESUME_ENDS=0` skips it.
-fn resume_ends(ctx: &mut Context, st: &mut State, invokes: &[Ptr<Operation>], locals: &[Value]) {
+///
+/// A local of the clone's entry (`clones[0]`) dominates every resume.
+/// One defined elsewhere — SROA's escape copies sit next to their calls,
+/// an earlier inline's locals in its clone — gets an end only at the
+/// resumes its block dominates within the clone, under
+/// `PLIRON_INLINE_RESUME_DOM=1`; a use it doesn't dominate is invalid SSA
+/// (`erase_unreachable`/`guardelim` panicked). `PLIRON_INLINE_RESUME_INFO=
+/// <caller substr>` counts what each inline covered.
+#[allow(clippy::too_many_arguments)]
+fn resume_ends(
+    ctx: &mut Context,
+    st: &mut State,
+    invokes: &[Ptr<Operation>],
+    locals: &[Value],
+    clones: &[Ptr<BasicBlock>],
+    caller: &str,
+    cs: &str,
+) {
     if !crate::env_is("PLIRON_SM_MARKFLOW", "1") || !crate::pass_enabled("PLIRON_INLINE_RESUME_ENDS") {
         return;
     }
@@ -2608,23 +2625,180 @@ fn resume_ends(ctx: &mut Context, st: &mut State, invokes: &[Ptr<Operation>], lo
     if resumes.is_empty() {
         return;
     }
+    let entry = clones[0];
+    let def_block = |ctx: &Context, v: Value| v.defining_op().and_then(|o| o.deref(ctx).get_parent_block());
+    let dom = crate::env_is("PLIRON_INLINE_RESUME_DOM", "1");
+    // Resumes each non-entry local's block dominates, by the clone's dominator
+    // tree (Cooper-Harvey-Kennedy over its RPO; the entry is the root, edges
+    // leaving the clone are exits).
+    let mut dominated: FxHashMap<Value, Vec<Ptr<Operation>>> = FxHashMap::default();
+    // Resumes the clone entry reaches (the rest sit in dead code an
+    // earlier inline left: no end needed there).
+    let mut live_resumes: Vec<Ptr<Operation>> = resumes.clone();
+    let in_clone: FxHashSet<Ptr<BasicBlock>> = clones.iter().copied().collect();
+    if dom && locals.iter().any(|&a| def_block(ctx, a).is_some_and(|x| x != entry)) {
+        let idx: FxHashMap<Ptr<BasicBlock>, usize> = clones.iter().enumerate().map(|(k, &b)| (b, k)).collect();
+        let succ: Vec<Vec<usize>> =
+            clones.iter().map(|&b| bsuccs(ctx, st, b).into_iter().filter_map(|w| idx.get(&w).copied()).collect()).collect();
+        let n = clones.len();
+        let (mut rpo, mut seen, mut work) = (Vec::with_capacity(n), vec![false; n], vec![(0usize, 0usize)]);
+        seen[0] = true;
+        while let Some((v, k)) = work.last_mut() {
+            if let Some(&w) = succ[*v].get(*k) {
+                *k += 1;
+                if !seen[w] {
+                    seen[w] = true;
+                    work.push((w, 0));
+                }
+            } else {
+                rpo.push(*v);
+                work.pop();
+            }
+        }
+        rpo.reverse();
+        let mut num = vec![usize::MAX; n];
+        for (k, &v) in rpo.iter().enumerate() {
+            num[v] = k;
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &v in &rpo {
+            for &w in &succ[v] {
+                preds[w].push(v);
+            }
+        }
+        let mut idom = vec![usize::MAX; n];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &v in &rpo[1..] {
+                let mut new = usize::MAX;
+                for &p in preds[v].iter().filter(|&&p| idom[p] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        let (mut x, mut y) = (p, new);
+                        while x != y {
+                            while num[x] > num[y] {
+                                x = idom[x];
+                            }
+                            while num[y] > num[x] {
+                                y = idom[y];
+                            }
+                        }
+                        x
+                    };
+                }
+                if new != idom[v] {
+                    idom[v] = new;
+                    changed = true;
+                }
+            }
+        }
+        live_resumes.retain(|r| idx.get(&r.deref(ctx).get_parent_block().unwrap()).is_some_and(|&ri| num[ri] != usize::MAX));
+        let dominates = |x: usize, mut r: usize| {
+            if num[r] == usize::MAX {
+                return false;
+            }
+            while r != x && r != 0 {
+                r = idom[r];
+            }
+            r == x
+        };
+        for &a in locals {
+            let Some(x) = def_block(ctx, a).filter(|&x| x != entry) else { continue };
+            let Some(&xi) = idx.get(&x) else { continue };
+            let ord = |o: Ptr<Operation>| x.deref(ctx).iter(ctx).position(|p| p == o);
+            let d: Vec<Ptr<Operation>> = resumes
+                .iter()
+                .copied()
+                .filter(|&r| {
+                    let rb = r.deref(ctx).get_parent_block().unwrap();
+                    if rb == x {
+                        a.defining_op().and_then(ord) < ord(r)
+                    } else {
+                        idx.get(&rb).is_some_and(|&ri| dominates(xi, ri))
+                    }
+                })
+                .collect();
+            dominated.insert(a, d);
+        }
+    }
+    // `PLIRON_INLINE_RESUME_HOIST=1` (with DOM): a local whose block
+    // misses a live resume moves to the clone entry first — every alloca
+    // lowers to a static slot wherever it sits, so only SSA cares — and
+    // then ends at every live resume. Its size must be a constant (moved
+    // along when the clone defines it) or a value from outside the clone.
+    let hoist = dom && crate::env_is("PLIRON_INLINE_RESUME_HOIST", "1");
+    // A value defined where it dominates the clone entry.
+    let above = |ctx: &Context, v: Value| def_block(ctx, v).is_none_or(|b| b == entry || !in_clone.contains(&b));
+    // (entry, entry without an end, other, other without an end, other ended, hoisted)
+    let mut n = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for &a in locals {
+        let at_entry = def_block(ctx, a) == Some(entry);
         let Some(m) = a.uses_iter(ctx).map(|u| u.user_op()).find(|&m| {
             st.intrinsics.get(m).is_some_and(|n| n == "llvm.lifetime.end")
                 && m.deref(ctx).operands(ctx).any(|v| v == a)
         }) else {
+            if at_entry { n.1 += 1 } else { n.3 += 1 }
             continue;
+        };
+        let at: Vec<Ptr<Operation>> = if at_entry {
+            n.0 += 1;
+            resumes.clone()
+        } else {
+            n.2 += 1;
+            let mut at = dominated.remove(&a).unwrap_or_default();
+            if hoist
+                && at.len() < live_resumes.len()
+                && let Some(al) = a.defining_op()
+                && in_clone.contains(&al.deref(ctx).get_parent_block().unwrap())
+            {
+                let sz = al.deref(ctx).get_operand(ctx, 0);
+                let szop = sz.defining_op().filter(|_| !above(ctx, sz));
+                if szop.is_none_or(|c| Operation::is_op::<ConstantOp>(c, ctx)) {
+                    al.unlink(ctx);
+                    al.insert_at_front(entry, ctx);
+                    if let Some(c) = szop {
+                        c.unlink(ctx);
+                        c.insert_at_front(entry, ctx);
+                    }
+                    at = live_resumes.clone();
+                    n.5 += 1;
+                }
+            }
+            n.4 += !at.is_empty() as usize;
+            at
         };
         let ci = Operation::get_op::<CallIntrinsicOp>(m, ctx).unwrap();
         let iname = ci.get_attr_llvm_intrinsic_name(ctx).unwrap().clone();
         let fty = TypedHandle::<FuncType>::from_handle(ci.get_attr_llvm_intrinsic_type(ctx).unwrap().clone().into(), ctx)
             .unwrap();
         let args: Vec<Value> = m.deref(ctx).operands(ctx).collect();
-        for &r in &resumes {
+        // A size operand next to the original end needn't dominate a resume.
+        if args.iter().any(|&v| v != a && !above(ctx, v)) {
+            continue;
+        }
+        for r in at {
             let new = CallIntrinsicOp::new(ctx, iname.clone(), fty, args.clone()).get_operation();
             new.insert_before(ctx, r);
             st.intrinsics.insert(new, "llvm.lifetime.end".to_string());
         }
+    }
+    if let Some(f) = crate::env_get("PLIRON_INLINE_RESUME_INFO")
+        && caller.contains(f)
+    {
+        eprintln!(
+            "inline-resume: {caller} <- {cs}: resumes={} live={} entry={} entry-noend={} other={} other-noend={} other-ended={} hoisted={}",
+            resumes.len(),
+            live_resumes.len(),
+            n.0,
+            n.1,
+            n.2,
+            n.3,
+            n.4,
+            n.5
+        );
     }
 }
 
@@ -2823,11 +2997,8 @@ fn inline_call(
         }
     }
     if unwind.is_some() {
-        // Only locals of the clone's entry, which dominates every resume
-        // (SROA's escape copies sit next to their calls).
-        let entry = map.lookup_block(src[0]);
-        locals.retain(|v| v.defining_op().and_then(|o| o.deref(ctx).get_parent_block()) == entry);
-        resume_ends(ctx, st, &fresh_invokes, &locals);
+        let clones: Vec<Ptr<BasicBlock>> = src.iter().map(|b| map.lookup_block(*b).unwrap()).collect();
+        resume_ends(ctx, st, &fresh_invokes, &locals, &clones, caller, cs);
     }
     if let Some(res) = res {
         let ty = res.get_type(ctx);

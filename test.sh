@@ -267,6 +267,18 @@ t_invokeblk() {
   printf 'drop 3\n12\ndrop 1000\ncaught true\n' | diff - $out/invokeblk.out
 }
 
+t_resumehoist() {
+  # An inlined callee's resume (an invoke of the caller's pad) ends the
+  # callee's locals, branch-local ones moved to the clone entry first;
+  # every IR pass must still see defs dominate uses, and the caller's
+  # locals its pad drops must survive (output matches stock rustc's).
+  PLIRON_SM_MARKFLOW=1 PLIRON_SLOTMERGE_MARK=1 PLIRON_INLINE_RESUME_DOM=1 PLIRON_INLINE_RESUME_HOIST=1 PLIRON_INLINE_RESUME_INFO=caller PLIRON_CHECK_DOM=1 PLIRON_TRACE=pliron::domcheck=error rustc $BE --edition 2021 -O tests/resumehoist/main.rs -o $out/resumehoist$exe 2> $out/resumehoist.log || { cat $out/resumehoist.log >&2; return 1; }
+  if grep -q "domcheck after" $out/resumehoist.log; then grep "domcheck after" $out/resumehoist.log | head -3 >&2; return 1; fi
+  grep -q "hoisted=[1-9]" $out/resumehoist.log || { echo "resumehoist: nothing hoisted" >&2; grep inline-resume $out/resumehoist.log >&2; return 1; }
+  [[ -n "$exe" ]] && return 0
+  $out/resumehoist$exe 2>/dev/null | diff --strip-trailing-cr - tests/resumehoist/expected.out
+}
+
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
@@ -751,6 +763,7 @@ want sroa && t_sroa
 want inlinecm && t_inlinecm
 want retattr && t_retattr
 want invokeblk && t_invokeblk
+want resumehoist && t_resumehoist
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul
