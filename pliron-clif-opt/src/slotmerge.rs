@@ -1793,6 +1793,24 @@ pub fn run_with(
                     marked[s.index()] = true;
                 }
             }
+            // `PLIRON_SM_STARTONLY=1`: a slot with a start marker and no
+            // end marker (MIR's StorageLive of a temporary passed to a
+            // diverging call — `format_args!` pieces for `bug!`, 110 of
+            // them in stage-2 `walk_expr::<TailCallCkVisitor>`) is in
+            // scope from that start to the frame's exit, and in use only
+            // from its first access: `mark_flow`'s live set with no kills
+            // but the frame-leaving ones. LLVM's StackColoring treats it
+            // the same way; a slot with no marker at all stays in scope
+            // throughout and is never merged.
+            if crate::env_is("PLIRON_SM_STARTONLY", "1") {
+                for ((ds, _, _, start), pos) in lifetimes.iter().zip(&marker_pos) {
+                    if let (&[s], true, Some(_)) = (ds.as_slice(), *start, pos)
+                        && s.index() < nslots
+                    {
+                        marked[s.index()] = true;
+                    }
+                }
+            }
         } else {
             for s in 0..nslots {
                 marked[s] &= !mark_lost[s];

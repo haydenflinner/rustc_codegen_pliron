@@ -3,6 +3,8 @@
 //! other is live. `PLIRON_SM_AFTERKILL=1`: an end marker that only quiet
 //! insts and jumps separate from a preceding call also kills just after
 //! that call, which survives jumpthread collapsing the jumps.
+//! `PLIRON_SM_STARTONLY=1`: a slot with a start marker and no end marker
+//! is live from its first access to the frame's exits.
 //! Stage-2 `lower_item_kind` had two 328-byte slots per `match` arm that
 //! never merged: their end markers were lost to jumpthread, and every arm's
 //! slots were live together in the shared panic-in-cleanup tail.
@@ -28,6 +30,7 @@ fn setup() {
         std::env::set_var("PLIRON_SM_MARKFLOW", "1");
         std::env::set_var("PLIRON_SM_AFTERKILL", "1");
         std::env::set_var("PLIRON_SM_STARTS", "1");
+        std::env::set_var("PLIRON_SM_STARTONLY", "1");
     }
 }
 
@@ -195,4 +198,71 @@ block3:
     let without: Vec<_> = kills.iter().copied().filter(|k| k.2 != u32::MAX - 3).collect();
     pliron_clif_opt::slotmerge::run_with(&mut g, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &without);
     assert_ne!(slot_of(&g, 1), slot_of(&g, 2), "test lost its point: another kill survived");
+}
+
+/// `format_args!` temporaries for two diverging calls on separate cold
+/// paths: each has a start marker and no end marker. Each is live only
+/// from its access to its `trap`, so the two share storage.
+#[test]
+fn start_only_slots_on_diverging_paths_merge() {
+    let src = "function %t(i8) {
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 16, align = 8
+    sig0 = (i64)
+    fn0 = %panic_fmt sig0
+block0(v0: i8):
+    brif v0, block1, block2
+block1:
+    v1 = stack_addr.i64 ss0
+    call fn0(v1)
+    trap user1
+block2:
+    v2 = stack_addr.i64 ss1
+    call fn0(v2)
+    trap user1
+}";
+    let f = run(
+        src,
+        |_| {
+            vec![
+                (vec![StackSlot::from_u32(0)], None, Block::from_u32(1), true),
+                (vec![StackSlot::from_u32(1)], None, Block::from_u32(2), true),
+            ]
+        },
+        None,
+    );
+    assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "start-only slots on disjoint paths stayed apart:\n{}", f.display());
+}
+
+/// A start-only slot escapes, then another slot starts on the same path:
+/// the first may still be accessed through its escaped pointer (no end
+/// marker), so they interfere.
+#[test]
+fn start_only_slot_stays_live_to_exit() {
+    let src = "function %t() {
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 16, align = 8
+    sig0 = (i64)
+    sig1 = ()
+    fn0 = %sink sig0
+    fn1 = %other sig1
+block0:
+    v1 = stack_addr.i64 ss0
+    call fn0(v1)
+    v2 = stack_addr.i64 ss1
+    call fn0(v2)
+    call fn1()
+    return
+}";
+    let f = run(
+        src,
+        |f| {
+            vec![
+                (vec![StackSlot::from_u32(0)], None, Block::from_u32(0), true),
+                (vec![StackSlot::from_u32(1)], f.layout.block_insts(Block::from_u32(0)).nth(3), Block::from_u32(0), false),
+            ]
+        },
+        None,
+    );
+    assert_ne!(slot_of(&f, 1), slot_of(&f, 2), "a start-only slot died before the frame did:\n{}", f.display());
 }

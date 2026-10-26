@@ -85,6 +85,29 @@ and a dead store; both must stay unmerged. `slotmerge_markflow.rs` pins
 both flags off: its resume and forwarding-chain tests assert the old
 behavior.
 
+## 5. `PLIRON_SM_STARTONLY=1`
+
+`walk_expr::<TailCallCkVisitor>` (1,936 B; LLVM 80): 487 candidates
+packed into 15 regions, but 110 escaped slots (1,312 B) never merged.
+They are `format_args!`-style temporaries on cold error paths. Each gets
+a start marker, escapes to a call (mostly diverging: `bug!`, `span_bug`)
+and has no end marker. In flow mode a slot was tracked only through an end
+marker or edge kill, so these fell back to escaped for the whole function.
+Now a resolved start marker also makes the slot tracked. `mark_flow` then
+keeps it live from its first access to the frame's exits, with no kills
+except the frame-leaving ones. LLVM treats such a slot the same way (L1,
+L2 and first-use in `StackColoring.cpp`). A slot with no marker at all
+stays in scope throughout and still never merges.
+
+Reproducer (four `panic!("…{}…")` arms): 272 → 112 B (LLVM 144).
+regex-syntax frame bytes 75,408 → 73,552 (−2.5%), none worse. Clean stage
+2: `walk_expr` 1,936 → 640, expr-stack-overflow 20 → 16 MiB, peano 16 →
+15. The stage-2 UI suite has 54 failures. The only one at stage 2 alone is
+StackColoring-40883, which runs on default flags; **expr-stack-overflow
+now passes**. Fuzz 7800–8199 with every flag passes. Tests:
+`start_only_slots_on_diverging_paths_merge` (fails with the flag off) and
+`start_only_slot_stays_live_to_exit` in `slotmerge_starts.rs`.
+
 ## Checks
 
 - Gate passes with every flag plus both.
@@ -102,5 +125,6 @@ behavior.
 - `memcpy` copies into a fresh slot: extend copy coalescing to the call
   (drop it, alias its result to the destination).
 - `lower_item_kind` is still 3.4x LLVM.
-- `walk_expr::<TailCallCkVisitor>`: 110 escaped `format_args!`-style
-  temporaries with a start marker but no end marker (1,312 B).
+- `walk_expr::<TailCallCkVisitor>` is still 640 B against 80, and
+  `walk_pat` 1,520. Our inliner pastes `visit_expr`, with `check_tail_call`
+  inside, at every one of `walk_expr`'s 27 sites. LLVM calls it.
