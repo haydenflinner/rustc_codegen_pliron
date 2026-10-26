@@ -410,7 +410,11 @@ pub fn run(
         }
     }
     for (ss, list) in &accs {
-        if list.len() > MAX_ACCS {
+        // An access outside the slot (dead code with a wild constant
+        // offset; fuzz seed 8631 overflowed `off + bytes` below) can't be
+        // a field: the slot stays in memory.
+        let size = i64::from(func.sized_stack_slots[*ss].size);
+        if list.len() > MAX_ACCS || list.iter().any(|a| a.off < 0 || a.off.checked_add(a.bytes).is_none_or(|e| e > size)) {
             bad.insert(*ss);
         }
     }
