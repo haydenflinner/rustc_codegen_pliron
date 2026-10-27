@@ -292,7 +292,13 @@ t_xfactsplugin() {
   # Two-phase facts must not hold modules when rustc skips the thin step
   # (-Clinker-plugin-lto, as cargo passes to an lto=true build's deps):
   # held modules were written as empty objects and the archive failed.
-  PLIRON_XFACTS_ALL=1 rustc $BE --edition 2021 -O -C codegen-units=4 -C linker-plugin-lto --crate-type rlib tests/xfactsplugin/lib.rs -o $out/libxfactsplugin.rlib
+  PLIRON_XFACTS_ALL=1 rustc $BE --edition 2021 -O -C codegen-units=4 -C linker-plugin-lto --crate-type rlib tests/xfactsplugin/lib.rs -o $out/libxfactsplugin.rlib || return 1
+  # Cross-crate `-Clto=thin` (cargo's lto = "thin") falls back to fat LTO
+  # instead of the fatal "cross-crate ThinLTO is not supported".
+  PLIRON_XFACTS_ALL=1 rustc $BE --edition 2021 -O -C codegen-units=4 --crate-type rlib --crate-name xfactsplugin tests/xfactsplugin/lib.rs -o $out/libxfactsplugin2.rlib || return 1
+  PLIRON_XFACTS_ALL=1 rustc $BE --edition 2021 -O -C lto=thin tests/xfactsplugin/main.rs --extern xfactsplugin=$out/libxfactsplugin2.rlib -o $out/xfactsplugin$exe 2> $out/xfactsplugin.log || { cat $out/xfactsplugin.log >&2; return 1; }
+  [[ -n "$exe" ]] && return 0
+  $out/xfactsplugin$exe | diff --strip-trailing-cr - tests/xfactsplugin/expected.out
 }
 
 t_xcgurot() {

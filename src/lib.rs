@@ -981,7 +981,10 @@ impl CodegenBackend for PlironCodegenBackend {
         "pliron"
     }
 
-    fn init(&mut self, _sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
+    // `Session::lto` doesn't exist yet: `init` sees only the early
+    // session, so it reads `-Clto` from the options directly.
+    #[cfg_attr(rustc_in_tree, allow(rustc::bad_opt_access))]
+    fn init(&mut self, sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
         tracing_init();
         // Which source tree built this dylib (harness/src-rev.sh) — check it
         // before trusting a self-host or bisect result.
@@ -995,8 +998,12 @@ impl CodegenBackend for PlironCodegenBackend {
             // (`run_thin_lto` runs once every module is optimized) is the
             // two-phase facts split — `optimize` publishes, the thin step
             // adopts from every CGU and lowers. Real cross-crate ThinLTO
-            // stays unsupported (`run_thin_lto` rejects it).
-            thin_lto_supported: pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1"),
+            // stays unsupported: under an explicit `-Clto=thin` (cargo's
+            // `lto = "thin"`, nushell) we claim no ThinLTO, so rustc falls
+            // back to fat LTO as without the flag instead of reaching
+            // `run_thin_lto` with other crates' rlibs.
+            thin_lto_supported: pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1")
+                && sess.opts.cg.lto != rustc_session::config::LtoCli::Thin,
             // The fork's knob drops LTO requests entirely; the self-hosted
             // build keeps doing that until fat LTO is verified in-tree.
             #[cfg(rustc_in_tree)]

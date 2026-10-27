@@ -177,3 +177,21 @@ regex-syntax: stack loads 7,322 → 6,942 (−5%), spill bytes −1.5%, text
 than 1% worse (chars_alpha −7.2%, tokenize −3.4%, strwork −3.3%, all near
 noise). Gate passes with every flag and with defaults; fuzz 9000–9299
 with every flag passes.
+
+## 8. Crates tiers 1–3 with every flag
+
+`harness/crates.py` runs each crate's own tests built by stock rustc and by
+pliron with every flag on: all slot flags, ONCE1/RECSTACK/SCCLIMIT,
+COALCALL, ESCFLOW and REMAT_SADDR.
+
+- Tier 1 (20 crates, about 4,500 tests: ryu, memchr, regex, hashbrown,
+  bytes, num-bigint, blake3, png, …): no pliron-only failures.
+- Tiers 2–3 (17 crates: crossbeam, rayon, tokio 2,310 tests, serde_json,
+  uiua, rapier, rune, makepad, …): 15 clean. prql and nushell failed to
+  build on the pliron side, in a second each. `XFACTS_ALL` bug, fixed in
+  `be81acb`: both workspaces set `lto`, cargo then builds their
+  dependencies with `-Clinker-plugin-lto`, and rustc skips thin-local
+  LTO. Modules held for the two-phase barrier reached `codegen`
+  unfinished and every object came out empty. `two_phase` now requires
+  linker-plugin-lto off, and `codegen` finishes any module still held.
+  Test: `tests/xfactsplugin`.
