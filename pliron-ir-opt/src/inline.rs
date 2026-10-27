@@ -1053,7 +1053,25 @@ pub fn run(
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
     let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
-    if once || callers.is_some() || st.deadfree {
+    // `PLIRON_INLINE_FANIN=<m>` (0 = off): a callee is inlined at a plain
+    // site only while `its size x its remaining call sites <= m x the
+    // site's threshold` — a fat helper called from everywhere stays one
+    // out-of-line body instead of a copy per site (syn pasted
+    // `drop_glue<Vec<Attribute>>`, 110 ops, at 1,308 sites). Sites in
+    // loops, `#[inline(always)]` and single-site callees are exempt.
+    let fanin: usize = if always_only {
+        0
+    } else {
+        crate::env_get("PLIRON_INLINE_FANIN")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    // `PLIRON_INLINE_CLEAN=1`: DCE + block merge on each caller once its
+    // inlining is done, before it is cloned into its own callers.
+    let pure = (!always_only && crate::env_is("PLIRON_INLINE_CLEAN", "1"))
+        .then(crate::cleanup::Pure::new);
+    let mut cleaned = crate::cleanup::Cleaned::default();
+    if once || callers.is_some() || st.deadfree || fanin > 0 {
         adj.get_or_insert_with(|| Adj::build(ctx, st));
     }
     let single: FxHashSet<String> = if once {
@@ -1504,6 +1522,18 @@ pub fn run(
                         "reject (small-scc)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
+                    } else if fanin > 0
+                        && !free
+                        && !f.always_inline
+                        && adj
+                            .as_ref()
+                            .and_then(|a| a.callers_of.get(cs.as_str()))
+                            .is_some_and(|v| ci.n.saturating_mul(v.len()) > t.saturating_mul(fanin))
+                        && !loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                    {
+                        "reject (fanin)"
                     } else if model && !free && grown + ci.n > growth {
                         "reject (growth)"
                     } else if maxdup > 0
@@ -1605,6 +1635,16 @@ pub fn run(
         if bottom_up {
             add_info!(&sym);
         }
+        // Clean a caller that received code, before its own callers clone
+        // it. After `add_info!`: the score keeps counting the uncleaned
+        // body, so the cleanup changes no inlining verdict.
+        if let Some(p) = &pure
+            && delta.callers.contains(&sym)
+        {
+            let c = crate::cleanup::clean_fn(ctx, st, p, caller);
+            cleaned.ops += c.ops;
+            cleaned.blocks += c.blocks;
+        }
         tagcache.remove(&caller);
     }
     if freed_ops > 0 {
@@ -1613,6 +1653,9 @@ pub fn run(
     }
     if freed_total > 0 && pliron_cfg::tracing_on() {
         tracing::info!(target: "pliron::stats", "deadfree {}: inliner freed {freed_total} ops", st.cgu);
+    }
+    if (cleaned.ops > 0 || cleaned.blocks > 0) && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "clean {}: inliner erased {} ops, merged {} blocks", st.cgu, cleaned.ops, cleaned.blocks);
     }
     pliron_cfg::trace("in.scan", t_scan, &st.cgu);
     pliron_cfg::trace("in.call", t_call, &st.cgu);

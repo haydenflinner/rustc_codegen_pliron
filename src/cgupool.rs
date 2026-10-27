@@ -992,6 +992,12 @@ pub(crate) fn iropt_head(
     let small = cfg.small;
     let small_limit = cfg.small_limit;
     let hot = cfg.ihot;
+    // `PLIRON_INLINE_CLEAN=1`: DCE + block merge on every body before the
+    // inliner clones them (and again per caller inside `inline::run`).
+    // Before the frozen-region tags, which pin blocks.
+    if env_is("PLIRON_INLINE_CLEAN", "1") {
+        pt!(prof, cgu, "clean", pliron_ir_opt::cleanup::clean_all(ctx, st));
+    }
     if pass_enabled("PLIRON_FROZEN") {
         pt!(
             prof,
@@ -1021,6 +1027,7 @@ pub(crate) fn iropt_head(
                 .collect()
         );
     }
+    pliron_ir_opt::irstat::report(ctx, st, "pre-inline");
     let mut adj = None;
     let d1 = pt!(
         prof,
@@ -1076,6 +1083,7 @@ pub(crate) fn iropt_head(
         "domcheck:inline",
         domcheck::run(ctx, st, "inline")
     );
+    pliron_ir_opt::irstat::report(ctx, st, "post-inline");
     // Inlining kills most copy callsites — mark the dead ones now so
     // spec/sroa/constload/devirt never walk their emit-only bodies.
     // (devirt-inline below can still inline into a live caller; a copy
@@ -1344,6 +1352,7 @@ pub(crate) fn iropt_tail(
     if pass_enabled("PLIRON_DEADFN") {
         inline::dead_fns(ctx, st);
     }
+    pliron_ir_opt::irstat::report(ctx, st, "final");
 }
 
 /// Post-iropt: the `*iropt*` timing line, the `PLIRON_DUMP_OPT` print,

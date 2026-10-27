@@ -14,12 +14,14 @@ mod helpers;
 pub use helpers::{Syms, address_taken, address_taken_ex, bisect_name, bodied, dump_fact, has_body, opt_body, opt_skip_init};
 
 pub mod callgvn;
+pub mod cleanup;
 pub mod constload;
 pub mod dbg;
 pub mod domcheck;
 pub mod guardelim;
 pub mod inline;
 pub mod instcombine;
+pub mod irstat;
 pub mod lutcorr;
 pub mod memcpyopt;
 pub mod nnret;
