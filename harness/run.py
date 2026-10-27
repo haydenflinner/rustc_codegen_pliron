@@ -348,17 +348,25 @@ def suite_ui_wasm(args):
 # rustlantis `generate` binary; built outside this repo. Programs are
 # custom-MIR, terminating, UB-free and deterministic: any backend divergence
 # is a real bug. -Zmir-opt-level=0 keeps MIR as generated for all backends.
-GENERATE = os.environ.get(
-    "PLIRON_FUZZ_GENERATOR",
-    os.path.join(
-        ROOT,
-        "..",
-        "rustlantis",
-        "target",
-        "release",
-        "generate" + (".exe" if sys.platform == "win32" else ""),
-    ),
-)
+def _find_generator():
+    """The sibling `../rustlantis` of this checkout, or of the main checkout
+    when this is a git worktree (agent worktrees live under the main
+    checkout's `.claude/worktrees/`, which has no sibling rustlantis)."""
+    rel = os.path.join("rustlantis", "target", "release",
+                       "generate" + (".exe" if sys.platform == "win32" else ""))
+    roots = [ROOT]
+    try:
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        if common:
+            roots.append(os.path.dirname(common))
+    except OSError:
+        pass
+    cands = [os.path.join(r, "..", rel) for r in roots]
+    return next((c for c in cands if os.path.exists(c)), cands[0])
+
+
+GENERATE = os.environ.get("PLIRON_FUZZ_GENERATOR") or _find_generator()
 
 
 def fuzz_build_run(src, exe, opt, backend, env=None):
