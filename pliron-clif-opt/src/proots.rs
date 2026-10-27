@@ -818,12 +818,23 @@ pub fn paramize<'k>(
     // `Rc` addresses can only miss a match, never make a wrong one.
     // `slotk` materializes sibling keys lazily — a hit is the only
     // point they're needed.
-    paramize_r(k, nslots, slotk, ps, skip, hmap, vmap, hmemo).unwrap_or_else(|| k.clone())
+    let mut memo = FxHashMap::default();
+    paramize_r(k, nslots, slotk, ps, skip, hmap, vmap, hmemo, &mut memo)
+        .unwrap_or_else(|| k.clone())
 }
 
 /// `paramize` returning `Some` only when the key changed — unchanged
 /// subtrees stay `Rc`-shared instead of being rebuilt, which also keeps
 /// `hmemo`'s address-keyed hashes warm.
+///
+/// `memo` caches the result per inner node (by address) for the span of
+/// one `paramize` call: a key is a DAG (`key_of` shares `Rc` subtrees
+/// through its memo), and without it the walk is tree-sized —
+/// exponential in the sharing depth. The result of a node depends only
+/// on its content and the call's fixed `hmap`/`vmap`/`skip`, so a
+/// memoized answer is structurally the one the walk would have rebuilt;
+/// every node stays alive through `k`/`slotk` for the call, so no
+/// address is recycled while the memo lives.
 fn paramize_r<'k>(
     k: &Key,
     nslots: usize,
@@ -833,6 +844,29 @@ fn paramize_r<'k>(
     hmap: &FxHashMap<u64, u32>,
     vmap: &FxHashMap<Value, u32>,
     hmemo: &mut FxHashMap<*const Key, u64>,
+    memo: &mut FxHashMap<*const Key, Option<Key>>,
+) -> Option<Key> {
+    let inner = matches!(k, Key::A(..) | Key::N(..));
+    if inner && let Some(r) = memo.get(&(k as *const Key)) {
+        return r.clone();
+    }
+    let r = paramize_node(k, nslots, slotk, ps, skip, hmap, vmap, hmemo, memo);
+    if inner {
+        memo.insert(k as *const Key, r.clone());
+    }
+    r
+}
+
+fn paramize_node<'k>(
+    k: &Key,
+    nslots: usize,
+    slotk: &dyn Fn(usize) -> &'k Key,
+    ps: &[Value],
+    skip: usize,
+    hmap: &FxHashMap<u64, u32>,
+    vmap: &FxHashMap<Value, u32>,
+    hmemo: &mut FxHashMap<*const Key, u64>,
+    memo: &mut FxHashMap<*const Key, Option<Key>>,
 ) -> Option<Key> {
     if let Some(&i) = hmap.get(&khash_m(k, hmemo)) {
         let mut i = i as usize;
@@ -854,12 +888,12 @@ fn paramize_r<'k>(
         return Some(Key::Q(i));
     }
     match k {
-        Key::A(t, rk, off) => paramize_r(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo)
+        Key::A(t, rk, off) => paramize_r(rk, nslots, slotk, ps, skip, hmap, vmap, hmemo, memo)
             .map(|nk| Key::A(*t, std::rc::Rc::new(nk), *off)),
         Key::N(op, t, args, extra) => {
             let mut news: Option<Vec<Key>> = None;
             for (i, a) in args.iter().enumerate() {
-                match paramize_r(a, nslots, slotk, ps, skip, hmap, vmap, hmemo) {
+                match paramize_r(a, nslots, slotk, ps, skip, hmap, vmap, hmemo, memo) {
                     Some(nk) => news
                         .get_or_insert_with(|| args[..i].to_vec())
                         .push(nk),
@@ -1528,5 +1562,36 @@ mod tests {
             key_sub(&y, &z, types::I64, 8),
             Some(Key::K(_, 1))
         ));
+    }
+
+    /// `paramize` walks a key DAG in DAG size: a 48-deep chain of
+    /// `iadd(x, x)` over one shared leaf is 2^48 nodes as a tree, and
+    /// every leaf still rewrites to `P(0)` (the leaf is slot 0's key).
+    #[test]
+    fn paramize_shared_dag_is_linear() {
+        let leaf = Key::V(Value::from_u32(7));
+        let mut k = leaf.clone();
+        for _ in 0..48 {
+            k = Key::N(Opcode::Iadd, types::I64, std::rc::Rc::from(vec![k.clone(), k]), 0);
+        }
+        let mut hmemo = FxHashMap::default();
+        let slot1 = Key::K(types::I64, 3);
+        let slots = [leaf.clone(), slot1];
+        let mut hmap = FxHashMap::default();
+        hmap.insert(khash_m(&leaf, &mut hmemo), 0u32);
+        let vmap = FxHashMap::default();
+        let ps = [Value::from_u32(100), Value::from_u32(101)];
+        let slotk = |i: usize| -> &Key { &slots[i] };
+        let r = paramize(&k, 2, &slotk, &ps, 1, &hmap, &vmap, &mut hmemo);
+        let mut d = &r;
+        let mut depth = 0;
+        while let Key::N(Opcode::Iadd, _, args, _) = d {
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], args[1]);
+            d = &args[0];
+            depth += 1;
+        }
+        assert_eq!(depth, 48);
+        assert_eq!(*d, Key::P(0));
     }
 }
