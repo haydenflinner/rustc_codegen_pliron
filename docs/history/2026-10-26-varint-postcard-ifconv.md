@@ -45,6 +45,24 @@ needs a predictability signal (PGO or a better static proxy) to flip.
 
 ## Alternatives not tried
 
-- Bounded full-unroll of the varint loops (LLVM's approach; the Oct-22
-  doc ranked it #2 and measured −17–19% potential on varint shapes).
 - PGO-guided ifconv gating (the project has PGO plumbing).
+
+## Follow-up: `bunroll` (bounded full unroll, ea80617)
+
+Implemented LLVM's `unroll-max-upperbound` shape as an opt-in pass
+(`PLIRON_BUNROLL=1`): K clones of a `0..K` loop's body, early exits kept
+per copy, back-edges chained to the next copy, original loop left as the
+post-bound tail. Handles the rotated-latch shape (IV resolved through
+relay latch params, incl. delayed-copy params). Verified on a
+postcard-shaped `for i in 0..5` decode loop — unrolls, verifies, corpus
+clean (12,457 fns).
+
+**It does not fire on `sum_postcard`'s actual varint loops**: they bail
+on the LCSSA cone check. Earlier passes (jumpthread/cparm) leave value
+aliases (`v588 -> v544`) that let post-exit merge blocks reference
+loop-defined values as free vars; the clone paths aren't dominated by
+the original header, so folding would leave those uses def-less (the
+verifier caught exactly this before the check existed — `iadd v544`
+non-dominating in `Rec::serialize`). Making the loops eligible needs
+exit-cone cloning (punroll's `analyze_exit_cone` machinery) or LCSSA
+canonicalization before bunroll.
