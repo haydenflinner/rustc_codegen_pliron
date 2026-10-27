@@ -132,7 +132,10 @@ Phase 2 consumers (design only for now):
 - **Unroll / loop passes**: edge counts give real trip-count histograms.
 - **Switch lowering**: value profiles order jump-table lookups by hit
   frequency; indirect-call target profiles enable checked speculative
-  devirtualization (the `dv` hooks inline.rs already has).
+  devirtualization (the `dv` hooks inline.rs already has). A first cut
+  using block counts exists behind `PLIRON_JT_SHAPE=1` (brchain orders
+  chain tests hottest first and peels a dominant case ahead of the table;
+  history/2026-10-27-jump-tables).
 - **Frequency-weighted e-graph extraction**: cost × block frequency as
   the extraction cost model — pick the variant that's fastest on the
   hot path, not uniformly smallest.
