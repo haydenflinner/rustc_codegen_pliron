@@ -275,6 +275,13 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 // lower to a bare identity in `clif_emit`, which V8 folds
                 // through — a cheaper, weaker barrier than LLVM's would
                 // skew every wasm benchmark in our favour.
+                //
+                // Measured and rejected (2026-10-27-slow-kernels.md): a
+                // narrow (i8/i16) scalar through the stack round trip on
+                // native too, LLVM's `*m` shape with a clean `ldrb`
+                // reload instead of a `uxtb` per barrier result. eqbug
+                // 0.1219 → 0.1254 ms: the store→load pair costs more
+                // than the extend it replaces.
                 let clif_bb = !self.tcx.sess.target.is_like_wasm;
                 if layout.is_zst() {
                     if clif_bb {

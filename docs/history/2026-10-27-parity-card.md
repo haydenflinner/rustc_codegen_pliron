@@ -78,6 +78,10 @@ Per input (time / peak RSS / machine code):
    - LOWERFREE, JEARENA, ACAP, NARROWEXT (fixed in c689c75), LTUNDEF
      (memory fixed in 922d8f7), NORETTRAP, EDGEMERGE, EPIMERGE: crates
      tiers 1–3 and stage-2 UI with each change.
+   - New candidates from 2026-10-27-slow-kernels.md: SELCHAIN, MULCARRY,
+     STEPCMP, REMATLOOP=0 (parse_only 1.17 → 1.02, eqbug 1.21 → 1.09 on
+     criterion; sieve layout-checked). ELABLOOPS stays out until its
+     strwork pressure cost is handled.
 4. slotprom/regalloc2 work (−7 KB) is committed but **not on main**:
    fa68d6a and e83e4b2 on branch `worktree-agent-a60fd0dd88e78e28d`.
    Its gate and fuzz runs didn't finish.

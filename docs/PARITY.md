@@ -618,8 +618,8 @@ stackify, local coalescing parity with binaryen.
 
 | kernel | pliron/LLVM | lead |
 |---|---|---|
-| eqbug | 1.10 | narrow `black_box` barriers: LLVM's `*m` asm form folds the `uxtb`/`uxth` into the store/load; we pay an ALU op per barrier, plus constant remat under pressure |
-| parse_only | 1.05 | `divnarrow` regression fixed (wasm-only narrowing now); residual vs LLVM = packed-Result `band`/`orr` juggling + `bump_hoist` remat `sub`s in the unrolled digit cascade — both measured net-positive, don't remove |
+| eqbug | 1.22 → **1.09** with `SELCHAIN` (2026-10-27-slow-kernels.md) | the rest is five `uxtb`/`uxth` on narrow `black_box` results; LLVM's stack round trip (`*m` asm) was built and measured slower here, so the fix would be compare lowering (hoisted constant + `cmp wk, w, uxtb`) |
+| parse_only | 1.33 → **1.05** standalone with `SELCHAIN MULCARRY STEPCMP REMATLOOP=0 ELABLOOPS` (2026-10-27-slow-kernels.md) | digit loop is LLVM's 7 instructions; the late steps are still opt-in — flip them; `ELABLOOPS` (vendored patch 66, egraph LICM loses loop entries on domtree order) costs strwork 4–6% from pressure, so it waits |
 | nbody | 1.04 | flip-flops between runs; earlier: an invariant's spill pair per iteration (regalloc pressure) |
 | sieve | 1.02 | marking loop is instruction-tight; residual is elsewhere |
 | chars_ascii 0.57, tokenize 0.66, iterw 0.70, contains_rng 0.78, hashmap 0.88, sortw 0.90, fib 0.95 | | ahead |

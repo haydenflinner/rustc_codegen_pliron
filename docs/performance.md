@@ -465,6 +465,23 @@ VEX-128 forms on for the ops that have `use_avx*` rules).
 - Compile time: run `slp` only where vectorizable shapes exist, or add an
   applicability check that skips passes that cannot fire.
 
+### The four slow kernels (2026-10-27, docs/history/2026-10-27-slow-kernels.md)
+
+- `parse_only`: 1.33 → 1.05 standalone. Three instructions per digit too
+  many: the opt-in late steps `SELCHAIN`/`MULCARRY`/`STEPCMP` were never
+  flipped (`madd` carry, stepped exit compare); the egraph elaborator lost
+  the loop's end pointer because it pops a loop's stack entry when the
+  domtree preorder visits the exit block before the body
+  (`PLIRON_ELABLOOPS=1`, vendored patch 66); and the `byte - '0'` remat
+  (`PLIRON_REMATLOOP=0`). With all three the digit loop is LLVM's 7
+  instructions.
+- `eqbug`: 1.22 → 1.09 with `SELCHAIN`. The rest is five `uxtb`/`uxth` on
+  `black_box` results. LLVM's stack round trip (`*m` asm) was built and
+  measured: slower (0.1219 → 0.1254 ms), removed.
+- `varint`, `strwork`: at parity standalone (0.97, 1.00); their card
+  ratios were load noise. `ELABLOOPS` costs strwork 2–3% (more spills in
+  `main` from hoisting out of short inner loops), varint −1–2%.
+
 ### DoD step 5 landed (62eafb7, 2026-10-16)
 
 All op list fields + BasicBlock.args now OpSpan into Context-global
