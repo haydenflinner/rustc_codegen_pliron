@@ -26,7 +26,7 @@ use crate::trace;
 use crate::{LabelValueLoc, ValueLocRange};
 use crate::{machinst::*, trace_log_enabled};
 use regalloc2::{
-    Edit, Function as RegallocFunction, InstOrEdit, InstPosition, InstRange, Operand,
+    Allocation, Edit, Function as RegallocFunction, InstOrEdit, InstPosition, InstRange, Operand,
     OperandConstraint, OperandKind, PReg, PRegSet, ProgPoint, RegClass,
 };
 
@@ -37,6 +37,18 @@ use core::fmt::{self, Write};
 use core::mem::take;
 use core::ops::Range;
 use cranelift_entity::{Keys, entity_impl};
+
+/// PLIRON: `PLIRON_EDGEMERGE` key (see `VCode::edge_merge_key`).
+type EdgeKey = (SmallVec<[(Allocation, Allocation); 4]>, BlockIndex, bool);
+
+/// PLIRON: a `PLIRON_*` mode knob: unset or `0` is 0, a digit is itself,
+/// anything else is 1.
+fn pliron_mode(var: &str) -> u8 {
+    match std::env::var(var) {
+        Err(_) => 0,
+        Ok(v) => v.parse::<u8>().unwrap_or(1),
+    }
+}
 
 /// Index referring to an instruction in VCode.
 pub type InsnIndex = regalloc2::Inst;
@@ -984,8 +996,82 @@ impl<I: VCodeInst> VCode<I> {
             self.noreturn_dead_blocks()
         };
 
+        // PLIRON: edge-block tail merging (`PLIRON_EDGEMERGE=1`). A block
+        // that is only regalloc edits (moves, spills, reloads) and an
+        // operand-less jump — typically a split critical edge — emits
+        // exactly the same code as any other such block with the same
+        // edits and the same successor. Keep the first one in emission
+        // order and alias the others' labels to it, so their predecessors
+        // branch there (MachBuffer then folds `b.c L; b dup; L:` into
+        // `b.!c canon`). rustc's drop/unwind fan-in produces long runs of
+        // identical `ldr x8, [sp, #a]; ldr x27, [sp, #b]; b merge` edges.
+        // A dropped block's jump keeps NO_INST_OFFSET, like a cold-block
+        // inst, so value-label ranges skip it and `-g` changes no code.
+        // `machine_code_cfg_info` needs every block's start, so it is off
+        // there.
+        // `=1` keeps a dup that its predecessor falls into, or that falls
+        // into its own successor, unless it is cold: merging it would put
+        // that path on an extra taken branch. `=2` merges every dup.
+        static EDGEMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let edgemerge = *EDGEMERGE.get_or_init(|| pliron_mode("PLIRON_EDGEMERGE"));
+        let mut merged = vec![false; self.num_blocks()];
+        if edgemerge > 0 && !flags.machine_code_cfg_info() {
+            let mut canon: FxHashMap<EdgeKey, BlockIndex> = FxHashMap::default();
+            // The last block kept for emission.
+            let mut prev: Option<BlockIndex> = None;
+            for (oi, &block) in final_order.iter().enumerate() {
+                // A `noret_dead` block emits nothing, so it must be neither
+                // a copy that others alias to nor a dropped dup.
+                let dead = noret_dead.as_ref().is_some_and(|d| d[block.index()]);
+                let dup = (!dead)
+                    .then(|| self.edge_merge_key(regalloc, block, &loop_head, &ra_edits_per_block))
+                    .flatten()
+                    .and_then(|key| match canon.entry(key) {
+                        Entry::Occupied(e) => Some(*e.get()),
+                        Entry::Vacant(e) => {
+                            e.insert(block);
+                            None
+                        }
+                    })
+                    .filter(|_| {
+                        edgemerge >= 2
+                            || self.block_order.is_cold(block)
+                            || (!prev.is_some_and(|p| self.block_preds(block).contains(&p))
+                                && final_order.get(oi + 1)
+                                    != self.block_succs(block).first())
+                    });
+                if let Some(c) = dup {
+                    merged[block.index()] = true;
+                    buffer.alias_label(MachLabel::from_block(block), MachLabel::from_block(c));
+                } else if !dead && (ra_edits_per_block[block.index()] != 0
+                    || self.block_ranges.get(block.index()).len() != 1
+                    || self.block_succs(block).len() != 1
+                    || self.insts[self.block_ranges.get(block.index()).start].is_term()
+                        != MachTerminator::Branch)
+                {
+                    // A bare jump with no edits emits nothing (MachBuffer
+                    // aliases its label to the target), so it is not
+                    // anyone's layout predecessor: a brif's empty split edge
+                    // sits between the brif and its other, non-empty one.
+                    prev = Some(block);
+                }
+            }
+        }
+
+        // PLIRON: `PLIRON_EPIMERGE` emits the epilogue once per function and
+        // every later `return` jumps to it, for epilogues of 3+ insts. `=1`
+        // keeps a hot return's own copy unless the epilogue is 5+ insts
+        // (a hot leaf like `fib`'s base case pays a taken branch); `=2`
+        // merges every return.
+        static EPIMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE"));
+        let mut epi_label: Option<MachLabel> = None;
+
         let t_loop0 = std::time::Instant::now();
         for (oi, &block) in final_order.iter().enumerate() {
+            if merged[block.index()] {
+                continue;
+            }
             trace!("emitting block {:?}", block);
             if jt_narrow {
                 buffer.set_jt_tail_bound(Some(jt_suffix[oi]));
@@ -1559,8 +1645,31 @@ impl<I: VCodeInst> VCode<I> {
                         // epilogue will contain it).
                         if self.insts[iix.index()].is_term() == MachTerminator::Ret {
                             log::trace!("emitting epilogue");
-                            for inst in self.abi.gen_epilogue() {
-                                do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                            let epi = self.abi.gen_epilogue();
+                            // PLIRON: shared epilogue (`PLIRON_EPIMERGE`).
+                            let epi_ok = match epimerge {
+                                0 => false,
+                                1 => {
+                                    epi.len() >= 5
+                                        || (epi.len() >= 3 && self.block_order.is_cold(block))
+                                }
+                                _ => epi.len() >= 3,
+                            };
+                            if epi_ok {
+                                if let Some(l) = epi_label {
+                                    do_emit(&I::gen_jump(l), &mut disasm, &mut buffer, &mut state);
+                                } else {
+                                    let l = buffer.get_label();
+                                    buffer.bind_label(l, state.ctrl_plane_mut());
+                                    epi_label = Some(l);
+                                    for inst in epi {
+                                        do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                                    }
+                                }
+                            } else {
+                                for inst in epi {
+                                    do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                                }
                             }
                         } else {
                             if !applied[iix.index()] {
@@ -1745,6 +1854,47 @@ impl<I: VCodeInst> VCode<I> {
             disasm: if want_disasm { Some(disasm) } else { None },
             value_labels_ranges,
         })
+    }
+
+    /// PLIRON: the `PLIRON_EDGEMERGE` key of a block that is only regalloc
+    /// edits and an operand-less jump: (edits, successor, indirect-target
+    /// flag). Two blocks with one key emit the same code. `None` for any
+    /// other block, the entry, and loop heads.
+    fn edge_merge_key(
+        &self,
+        regalloc: &regalloc2::Output,
+        block: BlockIndex,
+        loop_head: &[bool],
+        ra_edits_per_block: &[u32],
+    ) -> Option<EdgeKey> {
+        let bi = block.index();
+        if block == self.entry || loop_head[bi] || ra_edits_per_block[bi] == 0 {
+            return None;
+        }
+        let range = self.block_ranges.get(bi);
+        if range.end != range.start + 1 {
+            return None;
+        }
+        let iix = InsnIndex::new(range.start);
+        let succs = self.block_succs(block);
+        if succs.len() != 1
+            || self.insts[iix.index()].is_term() != MachTerminator::Branch
+            || !regalloc.inst_allocs(iix).is_empty()
+        {
+            return None;
+        }
+        let mut moves: SmallVec<[(Allocation, Allocation); 4]> = smallvec![];
+        for it in regalloc.block_insts_and_edits(self, block) {
+            match it {
+                InstOrEdit::Edit(Edit::Move { from, to }) => moves.push((*from, *to)),
+                InstOrEdit::Inst(i) if i == iix => {}
+                _ => return None,
+            }
+        }
+        if moves.is_empty() {
+            return None;
+        }
+        Some((moves, succs[0], self.block_order.is_indirect_branch_target(block)))
     }
 
     fn monotonize_inst_offsets(&self, inst_offsets: &mut [CodeOffset], func_body_len: u32) {

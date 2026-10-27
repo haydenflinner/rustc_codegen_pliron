@@ -514,6 +514,19 @@ t_noret() {
   (( n1 < n0 )) || { echo "noret: traps $n0 -> $n1, none dropped" >&2; return 1; }
 }
 
+t_edgemerge() {
+  # PLIRON_EDGEMERGE (shared regalloc edge blocks, jump-table arms aliased
+  # to them) and PLIRON_EPIMERGE (one epilogue per function): off, the
+  # placement-aware mode 1 and the merge-everything mode 2.
+  rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe && \
+  $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
+  local m
+  for m in 1 2; do
+    PLIRON_EDGEMERGE=$m PLIRON_EPIMERGE=$m rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe &&
+    $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
+  done
+}
+
 t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
@@ -929,6 +942,7 @@ want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want narrowext && t_narrowext
 want cmp3 && t_cmp3
+want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern
 want dbgnested && t_dbgnested

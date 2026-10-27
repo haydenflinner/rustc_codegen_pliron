@@ -763,6 +763,34 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     edge); repeated successors carry no args. The jump table itself keeps
     one entry per case, now pointing at the shared label.
 
+66. Edge-block tail merging, `PLIRON_EDGEMERGE=1|2` (default off;
+    `src/machinst/vcode.rs` `emit` and `edge_merge_key`, plus
+    `MachBuffer::alias_label` in `src/machinst/buffer.rs`). Before
+    emission, every block that is only regalloc edits (moves, spills,
+    reloads) and an operand-less jump is keyed by (edits, successor,
+    indirect-target flag). The first block in emission order with a key is
+    emitted. A later block with the same key (a dup) is not emitted, and
+    its label becomes an alias of the first copy's label. Predecessor
+    branches and jump-table entries resolve through the alias, and
+    MachBuffer folds `b.c L; b dup; L:` into `b.!c canon`. With `=1`, a
+    hot dup is kept when its predecessor is the block emitted just before
+    it (the dup is that block's fallthrough) or when its successor comes
+    next: merging it would add a taken branch on that path (+9% on
+    `tokenize`). `=2` merges every dup. The entry block and loop heads are
+    never merged. Merging is off under `machine_code_cfg_info`, which
+    needs every block's start offset. Under `-g` merging stays on: the
+    jump of a dropped block has no offset, like a cold-block inst, so `-g`
+    changes no code. On regex-syntax, `=1` removes 1,291 `b`s and 14.7 KB
+    of `__text`, and `=2` removes 1,716 `b`s and 20.4 KB
+    (docs/history/2026-10-27-branches.md).
+67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default off;
+    `src/machinst/vcode.rs`). The first `return` that merges binds a label
+    in front of its epilogue. Each later merging `return` jumps to that
+    label in place of its own copy. `=2` merges every epilogue of 3 or more
+    insts. `=1` merges an epilogue of 5 or more insts, or any epilogue in a
+    cold block: `fib`'s 3-inst base-case return is hot (+8% when merged).
+    Frameless `ret` stays inline, and return calls are not changed.
+
 Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
 a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's
 register has unspecified bits above its width, which `lsr #k` shifts into

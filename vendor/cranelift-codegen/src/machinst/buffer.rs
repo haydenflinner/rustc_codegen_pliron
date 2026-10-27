@@ -850,6 +850,18 @@ impl<I: VCodeInst> MachBuffer<I> {
         // Post-invariant: by `optimize_branches()` (see argument there).
     }
 
+    /// PLIRON: make `label`, which is never bound, resolve to wherever
+    /// `target` resolves. Used to drop a block whose code would repeat
+    /// another block's exactly (`PLIRON_EDGEMERGE`). An alias is never in
+    /// a labels-at-tail or labels-at-branch list, so the invariants above
+    /// hold; `target` must not resolve back to `label`.
+    pub fn alias_label(&mut self, label: MachLabel, target: MachLabel) {
+        debug_assert_eq!(self.label_offsets[label.0 as usize], UNKNOWN_LABEL_OFFSET);
+        debug_assert_eq!(self.label_aliases[label.0 as usize], UNKNOWN_LABEL);
+        debug_assert_ne!(label, target);
+        self.label_aliases[label.0 as usize] = target;
+    }
+
     /// Lazily clear `labels_at_tail` if the tail offset has moved beyond the
     /// offset that it applies to.
     fn lazily_clear_labels_at_tail(&mut self) {
