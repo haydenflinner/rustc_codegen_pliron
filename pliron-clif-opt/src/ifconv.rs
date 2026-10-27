@@ -448,6 +448,10 @@ fn reachable(func: &Function, cfg: &ControlFlowGraph) -> FxHashSet<Block> {
 /// changed edges (`dirty`), not per candidate.
 struct Flat {
     ok: bool,
+    /// `PLIRON_IFCONV_FLATALL=1` — the branch-free gate applies to every
+    /// fold, not only ones with a multi-hop arm: inside a still-branchy
+    /// loop a single-hop diamond's selects are always paid too.
+    all: bool,
     la: LoopAnalysis,
     interior: FxHashMap<Loop, FxHashSet<Block>>,
 }
@@ -653,8 +657,9 @@ fn conv_table(
         }
     }
     // Multi-hop arms only pay off when the fold leaves its loop
-    // branch-free (see `flat_loop`).
-    if arms.iter().any(|a| a.chained) {
+    // branch-free (see `flat_loop`). `PLIRON_IFCONV_FLATALL` extends
+    // the gate to every fold.
+    if flat.all || arms.iter().any(|a| a.chained) {
         if *dirty {
             cfg.compute(func);
             domtree.compute(func, &cfg);
@@ -827,6 +832,7 @@ pub fn run(
     };
     let mut flat = Flat {
         ok: false,
+        all: pliron_cfg::env_is("PLIRON_IFCONV_FLATALL", "1"),
         la: LoopAnalysis::new(),
         interior: FxHashMap::default(),
     };
@@ -957,8 +963,9 @@ pub fn run(
                 continue;
             }
             // Multi-hop arms only pay off when the fold leaves its loop
-            // branch-free (see `flat_loop`).
-            if ta.chained || ea.chained {
+            // branch-free (see `flat_loop`). `PLIRON_IFCONV_FLATALL`
+            // extends the gate to every fold.
+            if flat.all || ta.chained || ea.chained {
                 nch += 1;
                 if dirty {
                     nrc += 1;
@@ -1134,6 +1141,7 @@ mod tests {
         let domtree = DominatorTree::with_function(&func, &cfg);
         let mut flat = Flat {
             ok: false,
+            all: false,
             la: LoopAnalysis::new(),
             interior: FxHashMap::default(),
         };
