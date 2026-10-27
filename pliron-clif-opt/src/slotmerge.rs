@@ -2878,6 +2878,8 @@ pub fn run_with(
     // (members' live sets may overlap there, so the source's segments
     // can't simply be subtracted from `occ`).
     let mut members: Vec<Vec<StackSlot>> = Vec::new();
+    // Each region's coalesced copy windows (see the coalescing test).
+    let mut wins: Vec<Vec<(u32, u32)>> = Vec::new();
     let pts_in = |pts: &[u32], sg: &[(u32, u32)]| {
         pts.iter().any(|&p| {
             let k = sg.partition_point(|&(_, b)| b < p);
@@ -2933,6 +2935,13 @@ pub fn run_with(
                 !pts_in(&my_starts, &ol)
                     && !pts_in(&os, &mine)
                     && !win.is_some_and(|w| segs_overlap(&ol, &[w]) || pts_in(&os, &[w]))
+                    // `ol` is rebuilt from the members' own segments, so
+                    // it misses the copy windows of pairs coalesced
+                    // earlier: their bytes must stay put across the window
+                    // (seed 13475: a later dest's dead stores landed inside
+                    // one and clobbered the value the removed copy carried).
+                    && !segs_overlap(&wins[r], &mine)
+                    && !win.is_some_and(|w| segs_overlap(&wins[r], &[w]))
             } else {
                 let others = seg_sub(&occ[r], &sseg);
                 !segs_overlap(&others, &mine) && !win.is_some_and(|w| segs_overlap(&others, &[w]))
@@ -2942,6 +2951,9 @@ pub fn run_with(
                 regions[r].0 = regions[r].0.max(hi);
                 for g in mine.into_iter().chain(win) {
                     add_seg(&mut occ[r], g);
+                }
+                if let Some(w) = win {
+                    add_seg(&mut wins[r], w);
                 }
                 if starts_on {
                     ost[r].extend(&my_starts);
@@ -2954,7 +2966,9 @@ pub fn run_with(
         }
         for (r, &(end, rsize, ralign, _)) in regions.iter().enumerate() {
             let free = if starts_on {
-                !pts_in(&my_starts, &occ[r]) && !pts_in(&ost[r], &mine)
+                // A coalesced pair's window has no starts in `ost`, but its
+                // bytes are live across it.
+                !pts_in(&my_starts, &occ[r]) && !pts_in(&ost[r], &mine) && !segs_overlap(&wins[r], &mine)
             } else if markflow || bysize || flowiv {
                 !segs_overlap(&occ[r], &mine)
             } else {
@@ -2996,6 +3010,7 @@ pub fn run_with(
                 occ.push(if segs_on { mine } else { Vec::new() });
                 ost.push(my_starts);
                 members.push(vec![s]);
+                wins.push(Vec::new());
             }
         }
     }
