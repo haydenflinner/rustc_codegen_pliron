@@ -51,6 +51,8 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_INLINE_SCCLIMIT",
     // Memory (2026-10-26-memory.md).
     "PLIRON_DEADFREE",
+    // Cold-call args as plain copies (2026-10-27-exact-div.md).
+    "PLIRON_COLDCOPY",
 ];
 
 pub fn config() -> &'static PassConfig {
