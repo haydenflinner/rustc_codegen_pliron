@@ -16,6 +16,7 @@ use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
@@ -2777,14 +2778,53 @@ pub fn rebind_exports(
     n
 }
 
+/// `PLIRON_REDUCIBLE=1`: block-cloning transforms (`dispatch_dup`,
+/// `taildup`) refuse a clone that would create a loop side entrance.
+pub fn keep_reducible() -> bool {
+    pliron_cfg::env_is("PLIRON_REDUCIBLE", "1")
+}
+
+/// Would giving `p` a copy of `y`'s terminator create a loop side
+/// entrance? The copy gives `p` direct edges to `y`'s successors; an edge
+/// from `p` into a loop `p` is not in, landing anywhere but the header,
+/// makes the CFG irreducible. Cranelift doesn't mind, but waffle's wasm
+/// backend turns an irreducible CFG reducible by block duplication that is
+/// exponential in loop nesting (regex-syntax's `Seq::cross_reverse`
+/// compiled at 3x its instruction count's bytes; spliced into a caller's
+/// loops, 10x — docs/history/2026-10-27-wasm-size.md). `la` must be
+/// current for `func`.
+pub(crate) fn side_enters(func: &Function, la: &LoopAnalysis, p: Block, y: Block) -> bool {
+    let Some(t) = func.layout.last_inst(y) else {
+        return false;
+    };
+    func.dfg.insts[t]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .iter()
+        .any(|bc| {
+            let s = bc.block(&func.dfg.value_lists);
+            let mut lp = la.innermost_loop(s);
+            while let Some(l) = lp {
+                if la.loop_header(l) != s && !la.is_in_loop(p, l) {
+                    return true;
+                }
+                lp = la.loop_parent(l);
+            }
+            false
+        })
+}
+
 /// Clone a small pure dispatch block into a `jump` predecessor — the pred's
 /// edge then carries the dispatch's test and branch args itself (the
 /// `select→icmp` discriminant in the pred folds against the clone to a
 /// raw `brif`). Legal only while every def of `y` is used inside `y` —
 /// `rebind_exports` creates exactly that shape by moving shared uses
 /// onto successor params.
-pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
+pub fn dispatch_dup(func: &mut Function, cfg: &ControlFlowGraph, dom: &DominatorTree) -> usize {
     let entry = func.layout.entry_block();
+    // `PLIRON_REDUCIBLE`: loop forest for the side-entrance test, built on
+    // the first surviving candidate.
+    let reducible = keep_reducible();
+    let mut la: Option<LoopAnalysis> = None;
     // Values with any use outside their def block: a `y` whose defs all
     // stay internal can be cloned without stranding downstream uses.
     // Built lazily — the whole-function scan only pays when a dispatch
@@ -2892,6 +2932,16 @@ pub fn dispatch_dup(func: &mut Function, dom: &DominatorTree) -> usize {
                 }
             }
             if params.iter().any(|pv| esc.contains(pv)) {
+                ok = false;
+            }
+        }
+        if ok && reducible {
+            let la = la.get_or_insert_with(|| {
+                let mut la = LoopAnalysis::new();
+                la.compute(func, cfg, dom);
+                la
+            });
+            if side_enters(func, la, p, y) {
                 ok = false;
             }
         }

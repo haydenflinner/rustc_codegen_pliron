@@ -13,6 +13,7 @@ use cranelift_codegen::ir::condcodes::CondCode;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, Value, ValueDef,
 };
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 4;
@@ -162,9 +163,25 @@ pub(crate) fn outer_dominate(func: &Function, domtree: &DominatorTree, r: Block,
     })
 }
 
+/// Is the CFG irreducible: a retreating edge (in RPO) whose target does not
+/// dominate its source? Rebuilds the CFG and domtree — diagnostics only.
+pub fn irreducible(func: &Function) -> bool {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let mut rpo: FxHashMap<Block, usize> = FxHashMap::default();
+    for (i, &b) in domtree.cfg_rpo().enumerate() {
+        rpo.insert(b, i);
+    }
+    func.layout.blocks().filter(|&b| domtree.is_reachable(b)).any(|b| {
+        cfg.succ_iter(b)
+            .any(|s| rpo[&s] <= rpo[&b] && !domtree.block_dominates(s, b))
+    })
+}
+
 /// Returns the number of jumps replaced by a copy of the return block.
 pub fn run(func: &mut Function) -> usize {
     let edge_on = crate::pass_enabled("PLIRON_TAILDUP_EDGE");
+    let reducible = crate::jumpthread::keep_reducible();
     let entry = func.layout.entry_block();
     let mut cfg = ControlFlowGraph::with_function(func);
     let mut domtree = DominatorTree::with_function(func, &cfg);
@@ -184,6 +201,16 @@ pub fn run(func: &mut Function) -> usize {
         }
         cfg = ControlFlowGraph::with_function(func);
         domtree = DominatorTree::with_function(func, &cfg);
+    }
+    let mut la = LoopAnalysis::new();
+    if reducible {
+        la.compute(func, &cfg, &domtree);
+    }
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+        && irreducible(func)
+    {
+        tracing::debug!(target: "pliron::taildup", "taildup: IRREDUCIBLE at entry (fn {})", func.name);
     }
     let uses = use_blocks(func, &domtree);
     let rets: FxHashSet<Block> = func
@@ -267,6 +294,8 @@ pub fn run(func: &mut Function) -> usize {
                 "unreachable"
             } else if !outer_dominate(func, &domtree, r, p) {
                 "outer-dom"
+            } else if reducible && crate::jumpthread::side_enters(func, &la, p, r) {
+                "irreducible"
             } else {
                 ""
             };

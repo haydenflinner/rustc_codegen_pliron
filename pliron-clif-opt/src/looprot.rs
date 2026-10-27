@@ -9,6 +9,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::CondCode;
 use cranelift_codegen::ir::{Block, BlockArg, BlockCall, Function, Inst, InstructionData, Value};
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -23,6 +24,7 @@ pub fn run(
     // Each block is evaluated once, in layout order: re-scanning let cloned
     // headers created by earlier rotations starve late-layout loops (e.g.
     // bcheck clones appended at the end) of the rotation budget.
+    let reducible = crate::jumpthread::keep_reducible();
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for h in blocks {
@@ -39,6 +41,27 @@ pub fn run(
         let ok = {
             let (cfg, domtree) = an.cfg_dt(func);
             rotatable(func, cfg, domtree, h, t, s1, s2)
+                && (!reducible || {
+                    // `PLIRON_REDUCIBLE`: the latch takes a copy of `h`'s
+                    // `brif`; refuse when one of its edges would be a loop
+                    // side entrance (see `jumpthread::side_enters`).
+                    let l = cfg
+                        .pred_iter(h)
+                        .find(|p| domtree.block_dominates(h, p.block))
+                        .unwrap()
+                        .block;
+                    let mut la = LoopAnalysis::new();
+                    la.compute(func, cfg, domtree);
+                    // Both arms inside the loop (the header is a dispatch,
+                    // not an exit test): after the copy the loop is
+                    // entered at `s1` from `h` and at `s2` from `h` as
+                    // well — two entries, no header (regex-syntax's
+                    // `escape_into`). One arm must leave the loop.
+                    let both_in = la.is_loop_header(h).is_some_and(|lh| {
+                        la.is_in_loop(s1, lh) && la.is_in_loop(s2, lh)
+                    });
+                    !both_in && !crate::jumpthread::side_enters(func, &la, l, h)
+                })
         };
         if ok {
             let u = an.uses(func);

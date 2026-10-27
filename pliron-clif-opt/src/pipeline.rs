@@ -1696,6 +1696,11 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
     {
         return;
     }
+    // `PLIRON_CHECK_REDUCIBLE=1`: name the step that first makes a
+    // function's CFG irreducible (waffle's backend duplicates blocks for
+    // those — docs/history/2026-10-27-wasm-size.md). Diagnostic only.
+    let check_red = crate::config::env_set("PLIRON_CHECK_REDUCIBLE");
+    let red_before = check_red && !crate::taildup::irreducible(&p.clctx.func);
     // `PLIRON_TRACE=pliron::step` prints `time.busy` per step×function on
     // span close; the step's real name is the span name (see trace.rs).
     let _s = crate::config::tracing_on().then(|| {
@@ -1843,6 +1848,9 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         }
     }
     p.log(s.stat, k);
+    if red_before && crate::taildup::irreducible(&p.clctx.func) {
+        eprintln!("pliron: {} made `{}` irreducible", s.name, p.fname);
+    }
     if s.verify
         && p.verify_full
         && let Err(e) = cranelift_codegen::verify_function(&p.clctx.func, p.isa.flags())
@@ -1901,8 +1909,8 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
         // chains (851/853/854 -> 388 -> 859) fully collapse.
         for _ in 0..6 {
             let k = {
-                let (_, d) = cd.get(&p.clctx.func);
-                jumpthread::dispatch_dup(&mut p.clctx.func, d)
+                let (c, d) = cd.get(&p.clctx.func);
+                jumpthread::dispatch_dup(&mut p.clctx.func, c, d)
             };
             n += k;
             if k == 0 {
@@ -1927,8 +1935,8 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
             // Edgespec can leave fresh jump preds on small dispatch blocks.
             for _ in 0..6 {
                 let k = {
-                    let (_, d) = cd.get(&p.clctx.func);
-                    jumpthread::dispatch_dup(&mut p.clctx.func, d)
+                    let (c, d) = cd.get(&p.clctx.func);
+                    jumpthread::dispatch_dup(&mut p.clctx.func, c, d)
                 };
                 n += k;
                 if k == 0 {
