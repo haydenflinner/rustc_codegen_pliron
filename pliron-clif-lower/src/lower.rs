@@ -690,8 +690,71 @@ struct GMsg {
 /// (work-while-you-wait, same shape as `cgupool`'s `run_until`); a
 /// `Mutex<mpsc::Receiver>` would deadlock them behind a parked worker.
 struct FPool {
-    m: std::sync::Mutex<std::collections::VecDeque<GMsg>>,
+    m: std::sync::Mutex<FQueue>,
     cv: std::sync::Condvar,
+}
+
+/// A queued job with its scheduling key: largest function first
+/// (`insts`), FIFO (`seq`) among equals. Longest-processing-time-first:
+/// jobs stream in declaration order from every live CGU, and a parser
+/// megafunction queued behind two thousand small ones used to start
+/// only once the pool had drained them — its ~0.5 s pipeline then ran
+/// alone on one core as the compile's tail. Picking the largest queued
+/// job first keeps that work overlapped with the small ones. Phase (C)
+/// applies results in declaration order, so the pop order never
+/// reaches the output (docs/determinism.md R3). `PLIRON_FNLPT=0`
+/// restores plain FIFO.
+struct FItem {
+    insts: u32,
+    seq: u64,
+    m: GMsg,
+}
+
+impl PartialEq for FItem {
+    fn eq(&self, o: &Self) -> bool {
+        self.seq == o.seq
+    }
+}
+impl Eq for FItem {}
+impl PartialOrd for FItem {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for FItem {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        // Max-heap: bigger first, then the earlier `seq`.
+        self.insts
+            .cmp(&o.insts)
+            .then_with(|| o.seq.cmp(&self.seq))
+    }
+}
+
+struct FQueue {
+    lpt: bool,
+    seq: u64,
+    heap: std::collections::BinaryHeap<FItem>,
+    fifo: std::collections::VecDeque<GMsg>,
+}
+
+impl FQueue {
+    fn push(&mut self, m: GMsg) {
+        if self.lpt {
+            let insts = m.j.func.dfg.num_insts().min(u32::MAX as usize) as u32;
+            self.seq += 1;
+            self.heap.push(FItem { insts, seq: self.seq, m });
+        } else {
+            self.fifo.push_back(m);
+        }
+    }
+
+    fn pop(&mut self) -> Option<GMsg> {
+        if self.lpt {
+            self.heap.pop().map(|it| it.m)
+        } else {
+            self.fifo.pop_front()
+        }
+    }
 }
 
 fn fn_pool() -> &'static FPool {
@@ -702,7 +765,12 @@ fn fn_pool() -> &'static FPool {
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
             .max(1);
         let p: &'static FPool = Box::leak(Box::new(FPool {
-            m: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            m: std::sync::Mutex::new(FQueue {
+                lpt: crate::pass_enabled("PLIRON_FNLPT"),
+                seq: 0,
+                heap: std::collections::BinaryHeap::new(),
+                fifo: std::collections::VecDeque::new(),
+            }),
             cv: std::sync::Condvar::new(),
         }));
         for _ in 0..n {
@@ -713,12 +781,12 @@ fn fn_pool() -> &'static FPool {
 }
 
 fn fn_pool_push(p: &FPool, m: GMsg) {
-    p.m.lock().unwrap_or_else(|e| e.into_inner()).push_back(m);
+    p.m.lock().unwrap_or_else(|e| e.into_inner()).push(m);
     p.cv.notify_one();
 }
 
 fn fn_pool_pop(p: &FPool) -> Option<GMsg> {
-    p.m.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+    p.m.lock().unwrap_or_else(|e| e.into_inner()).pop()
 }
 
 fn fn_worker(p: &'static FPool) {
@@ -728,7 +796,7 @@ fn fn_worker(p: &'static FPool) {
         let GMsg { i, mut j, done } = {
             let mut q = p.m.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(m) = q.pop_front() {
+                if let Some(m) = q.pop() {
                     break m;
                 }
                 q = p.cv.wait(q).unwrap_or_else(|e| e.into_inner());
