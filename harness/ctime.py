@@ -18,7 +18,9 @@ The backend is the release dylib (`cargo build --release`, built first):
 the debug dylib's O1 pass code inflates compile time ~1.3x and would
 make every ratio look worse than it is. --debug-dylib measures it anyway.
 
-Results print as a table and go to target/parity/ctime.json. Where the
+Results print as a table and go to target/parity/ctime.json, which also
+records each side's peak RSS (median, from `wait4`) and machine-code bytes
+(text sections of every object written, via `llvm-size`). Where the
 time goes inside one compile: rerun the pliron side with PLIRON_TIMING=1
 (per-step wall, sorted) or `samply record`; for the CLIF pipeline alone,
 `clif-check bench target/corpus/std` (no rustc). See docs/PARITY.md.
@@ -107,11 +109,37 @@ def time_one(args, backend, tmp):
         cmd.append(f"-Zcodegen-backend={backend}")
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RUSTC_ICE=os.path.join(ROOT, "target/ices"))
     t = time.time()
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    # `wait4` gives this child's own peak RSS (KiB on Linux, bytes on
+    # macOS); `communicate` would reap it and lose the rusage.
+    err = p.stderr.read()
+    _, status, ru = os.wait4(p.pid, 0)
+    p.returncode = os.waitstatus_to_exitcode(status)
     dt = time.time() - t
-    if r.returncode != 0:
-        return None, r.stderr[-800:]
-    return dt, ""
+    if p.returncode != 0:
+        return None, None, None, err[-800:]
+    rss = ru.ru_maxrss if sys.platform == "darwin" else ru.ru_maxrss * 1024
+    # Machine-code bytes: the text sections of every object written (an
+    # rlib's members included). Whole-file size would count LLVM's
+    # embedded bitcode and both sides' metadata.
+    size = text_bytes([os.path.join(tmp, f) for f in os.listdir(tmp)])
+    return dt, rss, size, ""
+
+
+LLVM_SIZE = shutil.which("llvm-size") or "/opt/homebrew/opt/llvm/bin/llvm-size"
+
+
+def text_bytes(paths):
+    """Sum of `.text`/`__text`/wasm `CODE` section sizes across `paths`
+    (archives too)."""
+    tot = 0
+    for p in paths:
+        r = subprocess.run([LLVM_SIZE, "-A", p], capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            f = line.split()
+            if len(f) >= 2 and f[0] in (".text", "__text", "CODE") and f[1].isdigit():
+                tot += int(f[1])
+    return tot or None
 
 
 def main():
@@ -126,23 +154,30 @@ def main():
     backend = os.path.join(ROOT, f"target/{prof}/{LIB}rustc_codegen_pliron.{SO}")
     only = set(filter(None, a.only.split(",")))
     rows = []
-    print(f"{'input':<14} {'LLVM':>9} {'pliron':>9} {'ratio':>7}   ({prof} dylib, median of {a.runs})")
+    print(f"{'input':<14} {'LLVM':>9} {'pliron':>9} {'ratio':>7}   ({prof} dylib, median of {a.runs}; peak RSS and output size go to the JSON)")
     for name, args in inputs().items():
         if only and name not in only:
             continue
-        res = {}
+        res, rss, size = {}, {}, {}
         for side, be in (("llvm", None), ("pliron", backend)):
-            ts = []
+            ts, rs = [], []
             for _ in range(a.runs):
                 with tempfile.TemporaryDirectory() as tmp:
-                    dt, err = time_one(args, be, tmp)
+                    dt, mem, sz, err = time_one(args, be, tmp)
                 if dt is None:
                     print(f"{name}: {side} failed:\n{err}", file=sys.stderr)
                     break
                 ts.append(dt)
-            res[side] = statistics.median(ts) if len(ts) == a.runs else None
+                rs.append(mem)
+                size[side] = sz
+            ok = len(ts) == a.runs
+            res[side] = statistics.median(ts) if ok else None
+            rss[side] = statistics.median(rs) if ok else None
         ratio = res["pliron"] / res["llvm"] if res["llvm"] and res["pliron"] else None
-        rows.append({"input": name, "llvm_s": res["llvm"], "pliron_s": res["pliron"], "ratio": ratio})
+        q = lambda d: d["pliron"] / d["llvm"] if d.get("llvm") and d.get("pliron") else None
+        rows.append({"input": name, "llvm_s": res["llvm"], "pliron_s": res["pliron"], "ratio": ratio,
+                     "llvm_rss": rss.get("llvm"), "pliron_rss": rss.get("pliron"), "rss_ratio": q(rss),
+                     "llvm_bytes": size.get("llvm"), "pliron_bytes": size.get("pliron"), "size_ratio": q(size)})
         f = lambda s: f"{s * 1000:8.0f}ms" if s else "   failed"
         print(f"{name:<14} {f(res['llvm'])} {f(res['pliron'])} {ratio:6.2f}x" if ratio else
               f"{name:<14} {f(res['llvm'])} {f(res['pliron'])}       -", flush=True)

@@ -71,10 +71,34 @@ wrappers LLVM keeps as calls (494 lines) — `pliron-ir-opt`/`inline`
 policy; `chars_ascii` +8.5%, `chars_mixed` +8.2%, `fib` +7.7%,
 `nbody` +6% — emission-level locals churn.
 
+## The parity card
+
+`harness/parity.py` opens its summary with one rating per category and an
+overall, FIFA-style. Each category reduces to a ratio r = pliron / LLVM
+(lower is better) and rates **100 + 50·log2(1/r)**, clamped to 0–150:
+100 is parity, 150 twice as good, 50 half as good. The overall is the
+weighted mean of the ratings, which is a weighted geomean of the ratios,
+so 2x better on one axis exactly offsets 2x worse on another of equal
+weight.
+
+| code | category | ratio from | weight |
+|---|---|---|---|
+| SPD | runtime speed | geomean of the native and wasm bench geomeans | 30 |
+| CMP | compile time | `ctime.py` geomean | 15 |
+| MEM | compile memory | `ctime.py` peak RSS geomean | 10 |
+| SIZ | code size | `ctime.py` machine-code bytes (text / wasm `CODE` sections), plus the wasm bench module | 10 |
+| STK | stack frames | `harness/frames.py`: frame bytes summed over the functions both backends define in regex-syntax | 15 |
+| COR | correctness | per suite (pliron failures + 1) / (LLVM failures + 1), geomean: UI stage-2-only vs stage-1-only, crates pliron-only tests vs 0, fuzz failing seeds vs 0 | 20 |
+
+Correctness is an attribute, not a gate: it can be traded for a while,
+at a visible price (one pliron-only crate failure rates COR 50). The
+script doesn't rerun the slow correctness suites; the card shows the age
+of each saved result. Weights live in `CARD` in `harness/parity.py`.
+
 ## How to measure
 
-- Everything: `harness/parity.py` (~15 min; `--skip native,wasm,ctime`,
-  `--from-logs`). Writes `target/parity/summary.md`.
+- Everything: `harness/parity.py` (~20 min; `--skip native,wasm,ctime,stack`,
+  `--from-logs`). Writes `target/parity/summary.md`, card first.
 - One kernel's runtime: `bench/run.sh <name>` / `bench/wasm/run.sh <name>`.
 - Compile time: `harness/ctime.py [--only regex-syntax]` (release
   dylib). Inside one compile: `PLIRON_TRACE_FILE=t.txt` then sum column
