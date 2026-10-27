@@ -27,7 +27,7 @@ use crate::{
         printers::{iter_with_sep, iter_with_sep_by},
     },
     linked_list::{ContainsLinkedList, LinkedList, private},
-    location::{Located, Location},
+    location::{CompactLoc, Located, Location},
     op::op_impls,
     operation::{DefUseVerifyErr, OpDbg, Operation, OperationParserConfig},
     parsable::{self, IntoParseResult, Parsable, ParseResult},
@@ -133,7 +133,8 @@ pub struct BasicBlock {
     region_links: RegionLinks,
     /// A dictionary of attributes.
     pub attributes: AttributeDict,
-    loc: Location,
+    /// PLIRON: compact (see [CompactLoc]); `Located` converts.
+    loc: CompactLoc,
 }
 
 impl Named for BasicBlock {
@@ -160,7 +161,7 @@ impl BasicBlock {
             preds: DefNode::new(),
             region_links: RegionLinks::default(),
             attributes: AttributeDict::default(),
-            loc: Location::Unknown,
+            loc: CompactLoc::Unknown,
         };
         let newblock = Self::alloc(ctx, f);
         // Let's update the args of the new block. Easier to do it here than during creation.
@@ -425,11 +426,11 @@ impl BasicBlock {
 
 impl Located for BasicBlock {
     fn loc(&self) -> Location {
-        self.loc.clone()
+        self.loc.to_loc()
     }
 
     fn set_loc(&mut self, loc: Location) {
-        self.loc = loc;
+        self.loc = CompactLoc::from_loc(loc);
     }
 }
 

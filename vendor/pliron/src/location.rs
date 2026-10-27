@@ -175,6 +175,50 @@ pub enum Location {
     Dbg(u32),
 }
 
+/// PLIRON: the location as stored on an [Operation](crate::operation::Operation)
+/// and a [BasicBlock](crate::basic_block::BasicBlock). `Unknown` and `Dbg`
+/// are the only shapes rustc_codegen_pliron ever stamps and fit inline; any
+/// other [Location] is boxed. 16 bytes against `Location`'s 48, so an
+/// `Operation` arena slot shrinks by 32 bytes. A representation only:
+/// [Located] still takes and returns a [Location].
+#[derive(Clone, Debug)]
+pub(crate) enum CompactLoc {
+    Unknown,
+    Dbg(u32),
+    Other(Box<Location>),
+}
+
+const _: () = assert!(core::mem::size_of::<CompactLoc>() == 16);
+
+impl CompactLoc {
+    #[inline]
+    pub(crate) fn from_loc(loc: Location) -> Self {
+        match loc {
+            Location::Unknown => CompactLoc::Unknown,
+            Location::Dbg(i) => CompactLoc::Dbg(i),
+            other => CompactLoc::Other(Box::new(other)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_loc(&self) -> Location {
+        match self {
+            CompactLoc::Unknown => Location::Unknown,
+            CompactLoc::Dbg(i) => Location::Dbg(*i),
+            CompactLoc::Other(b) => (**b).clone(),
+        }
+    }
+
+    /// The `Dbg` index, 0 when there is none.
+    #[inline]
+    pub(crate) fn dbg(&self) -> u32 {
+        match self {
+            CompactLoc::Dbg(i) => *i,
+            _ => 0,
+        }
+    }
+}
+
 impl Location {
     /// If the location is from exactly one source, get that source.
     pub fn source(&self) -> Option<Source> {

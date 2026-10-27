@@ -31,7 +31,7 @@ use crate::{
         parsers::{list_parser, location, spaced},
     },
     linked_list::{LinkedList, private},
-    location::{Located, Location},
+    location::{CompactLoc, Located, Location},
     op::{ConcreteOpInfo, Op, OpId, OpObj, op_impls},
     parsable::{self, Parsable, ParseResult, StateStream},
     printable::{self, Printable},
@@ -139,8 +139,9 @@ pub struct Operation {
     /// `Context::op_region_pool` (PLIRON, DoD step 5). Most ops hold a
     /// zero-length span.
     pub(crate) regions: OpSpan,
-    /// Source location of this operation.
-    loc: Location,
+    /// Source location of this operation. PLIRON: compact (16 bytes, see
+    /// [CompactLoc]); `Located` converts.
+    loc: CompactLoc,
 }
 
 impl PartialEq for Operation {
@@ -351,7 +352,7 @@ impl Operation {
             block_links: BlockLinks::default(),
             attributes: AttributeDict::default(),
             regions: OpSpan::default(),
-            loc: Location::Unknown,
+            loc: CompactLoc::Unknown,
         };
 
         // Create the new Operation.
@@ -411,10 +412,7 @@ impl Operation {
     /// PLIRON: the op's [`Location::Dbg`] index, 0 when it has none.
     #[inline]
     pub fn dbg_loc(&self) -> u32 {
-        match self.loc {
-            Location::Dbg(i) => i,
-            _ => 0,
-        }
+        self.loc.dbg()
     }
 
     /// PLIRON: attribute dictionary accessor. Prefer this over direct
@@ -1368,7 +1366,7 @@ impl Verify for Operation {
             if op_impls::<dyn IsTerminatorInterface>(op)
                 && opr.self_ptr.get_next(ctx).is_some()
             {
-                let loc = opr.loc.clone();
+                let loc = opr.loc.to_loc();
                 let parent_block = opr
                     .get_parent_block()
                     .expect("There's a next operation, so there must be a parent block");
@@ -1409,11 +1407,11 @@ impl Printable for Operation {
 
 impl Located for Operation {
     fn loc(&self) -> Location {
-        self.loc.clone()
+        self.loc.to_loc()
     }
 
     fn set_loc(&mut self, loc: Location) {
-        self.loc = loc;
+        self.loc = CompactLoc::from_loc(loc);
     }
 }
 
