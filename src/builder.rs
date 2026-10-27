@@ -250,6 +250,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 arg_noalias: None,
                 bb: false,
                 callee: callee_sym,
+                noret: false,
             },
         );
         self.st.borrow_mut().last_call = Some(p);
@@ -1012,6 +1013,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn resume(&mut self, exn0: Value, _exn1: Value) {
         let void = self.type_void();
         self.call_sym("_Unwind_Resume", void, &[exn0]);
+        // Declared noreturn by every unwinder (libgcc, libunwind).
+        {
+            let mut st = self.st.borrow_mut();
+            if let Some(p) = st.last_call {
+                st.calls.get_mut(p).unwrap().noret = true;
+            }
+        }
         self.unreachable();
     }
     // Wasm funclets map onto our emulated EH (see wasm.rs): an unwind in
@@ -1313,6 +1321,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             info.nocap = any_nc.then(|| nc.into_boxed_slice());
             info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
             info.arg_noalias = any_nal.then(|| nals.into_boxed_slice());
+            // rustc's `noreturn` (rustc_codegen_llvm `apply_attrs_llfn`): the
+            // return layout is uninhabited, so the call cannot come back.
+            info.noret = fn_abi.is_some_and(|a| a.ret.layout.is_uninhabited());
         }
         v
     }

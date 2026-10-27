@@ -138,6 +138,7 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
                     arg_noalias: None,
                     bb: false,
                     callee,
+                    noret: false,
                 },
             );
         } else if let Some(c) = Operation::get_op::<CallIntrinsicOp>(op, ctx) {

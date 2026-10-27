@@ -660,6 +660,49 @@ impl<I: VCodeInst> VCode<I> {
         self.block_ranges.len()
     }
 
+    /// PLIRON: blocks that only the normal-return edge of a noreturn
+    /// `try_call` reaches (`MachInst::noreturn_continuation`: its lone
+    /// `NORETURN_CALL` trap is emitted inline or elided, so the call never
+    /// branches there) — the continuation block itself, or the split-edge
+    /// block in front of it. `None` when the function has no such edge.
+    /// One forward walk from the entry over the other edges.
+    fn noreturn_dead_blocks(&self) -> Option<Vec<bool>> {
+        let n = self.num_blocks();
+        let dead_succ = |b: usize| -> Option<BlockIndex> {
+            let r = self.block_ranges.get(b);
+            if r.end == r.start {
+                return None;
+            }
+            let l = self.insts[r.end - 1].noreturn_continuation()?;
+            let mut hit = None;
+            for &s in &self.block_succs[self.block_succ_range.get(b)] {
+                if MachLabel::from_block(s) == l {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(s);
+                }
+            }
+            hit
+        };
+        let dead: Vec<Option<BlockIndex>> = (0..n).map(dead_succ).collect();
+        if dead.iter().all(|d| d.is_none()) {
+            return None;
+        }
+        let mut live = vec![false; n];
+        let mut stack = vec![self.entry];
+        live[self.entry.index()] = true;
+        while let Some(b) = stack.pop() {
+            for &s in &self.block_succs[self.block_succ_range.get(b.index())] {
+                if Some(s) != dead[b.index()] && !live[s.index()] {
+                    live[s.index()] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        Some(live.into_iter().map(|l| !l).collect())
+    }
+
     /// The number of lowered instructions.
     pub fn num_insts(&self) -> usize {
         self.insts.len()
@@ -932,6 +975,15 @@ impl<I: VCodeInst> VCode<I> {
             Vec::new()
         };
 
+        // PLIRON: see `noreturn_dead_blocks`. A dead block emits nothing
+        // (only its label is bound) unless it is the last block, so the
+        // function still ends in code.
+        let noret_dead = if flags.machine_code_cfg_info() {
+            None
+        } else {
+            self.noreturn_dead_blocks()
+        };
+
         let t_loop0 = std::time::Instant::now();
         for (oi, &block) in final_order.iter().enumerate() {
             trace!("emitting block {:?}", block);
@@ -941,6 +993,14 @@ impl<I: VCodeInst> VCode<I> {
 
             // Call the new block hook for state
             state.on_new_block();
+
+            if oi + 1 < final_order.len()
+                && block != self.entry
+                && noret_dead.as_ref().is_some_and(|d| d[block.index()])
+            {
+                buffer.bind_label(MachLabel::from_block(block), state.ctrl_plane_mut());
+                continue;
+            }
 
             // Emit NOPs to align the block.
             let mut new_offset = I::align_basic_block(buffer.cur_offset());
@@ -1364,6 +1424,10 @@ impl<I: VCodeInst> VCode<I> {
             }
 
             t_fuse += ti.elapsed();
+            // PLIRON: code follows this block, so a call that cannot
+            // return needs no trap after it (`TrapCode::NORETURN_CALL`).
+            let code_follows = oi + 1 < final_order.len();
+            let brange = self.block_ranges.get(block.index());
             let mut k = 0usize;
             while k < items.len() {
                 match items[k].clone() {
@@ -1377,6 +1441,22 @@ impl<I: VCodeInst> VCode<I> {
                         // loop header is dropped; the header's pad emitted
                         // at this block's end carries the fallthrough.
                         if Some(iix) == skip_jmp {
+                            k += 1;
+                            continue;
+                        }
+                        // PLIRON: drop a `NORETURN_CALL` trap that sits at
+                        // the return address of the call just before it
+                        // (no regalloc edit, pad or island in between),
+                        // as LLVM's `NoTrapAfterNoreturn` does. The last
+                        // block keeps it so the return address stays
+                        // inside the function.
+                        if code_follows
+                            && self.insts[iix.index()].trap_code()
+                                == Some(crate::ir::TrapCode::NORETURN_CALL)
+                            && iix.index() > brange.start
+                            && self.insts[iix.index() - 1].call_type() == CallType::Regular
+                            && buffer.last_call_ret_addr() == Some(buffer.cur_offset())
+                        {
                             k += 1;
                             continue;
                         }
@@ -1488,6 +1568,13 @@ impl<I: VCodeInst> VCode<I> {
                                 apply_allocs(&mut self.insts, &mut preg_ops, iix);
                                 t_allocs += ti.elapsed();
                                 applied[iix.index()] = true;
+                            }
+
+                            // PLIRON: a `try_call` into a noreturn callee
+                            // whose continuation is a lone `NORETURN_CALL`
+                            // trap emits nothing after the call.
+                            if code_follows {
+                                self.insts[iix.index()].elide_noreturn_continuation();
                             }
 
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);

@@ -725,6 +725,7 @@ macro_rules! isle_lower_prelude_methods {
             Some(TryCallInfo {
                 continuation,
                 continuation_trap,
+                continuation_elide: false,
                 exception_handlers,
             })
         }

@@ -1055,6 +1055,38 @@ impl MachInst for Inst {
         }
     }
 
+    fn trap_code(&self) -> Option<crate::ir::TrapCode> {
+        match self {
+            Inst::Udf { trap_code } => Some(*trap_code),
+            _ => None,
+        }
+    }
+
+    fn noreturn_continuation(&self) -> Option<MachLabel> {
+        let tci = match self {
+            Inst::Call { info, .. } => info.try_call_info.as_ref(),
+            Inst::CallInd { info, .. } => info.try_call_info.as_ref(),
+            _ => None,
+        }?;
+        (tci.continuation_trap == Some(crate::ir::TrapCode::NORETURN_CALL))
+            .then_some(tci.continuation)
+    }
+
+    fn elide_noreturn_continuation(&mut self) -> bool {
+        let tci = match self {
+            Inst::Call { info, .. } => info.try_call_info.as_mut(),
+            Inst::CallInd { info, .. } => info.try_call_info.as_mut(),
+            _ => None,
+        };
+        match tci {
+            Some(t) if t.continuation_trap == Some(crate::ir::TrapCode::NORETURN_CALL) => {
+                t.continuation_elide = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn call_type(&self) -> CallType {
         match self {
             Inst::Call { .. }

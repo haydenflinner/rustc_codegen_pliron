@@ -814,3 +814,31 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     forces a minimum width (tests). Tests: `pliron-clif-opt/tests/jt_narrow*.rs`
     (run the machine code; x86-64 under Rosetta with
     `--target x86_64-apple-darwin`).
+
+65. No trap after a noreturn call (`TrapCode::NORETURN_CALL`, user code
+    250; only pliron's lowering emits it, under `PLIRON_NORETTRAP=1`, so
+    this is inert otherwise; docs/history/2026-10-27-noreturn-trap.md).
+    `src/ir/trapcode.rs`: the constant. `src/machinst/mod.rs`: provided
+    `MachInst::{trap_code, elide_noreturn_continuation,
+    noreturn_continuation}`, implemented for aarch64 (`Udf`, `Call`,
+    `CallInd`) and x64 (`ud2`, `CallKnown`, `CallUnknown`).
+    `src/machinst/buffer.rs`: `last_call_ret_addr`. `src/machinst/abi.rs`
+    + `isle.rs`: `TryCallInfo::continuation_elide`; both ISA emitters
+    skip the inline continuation trap when it is set.
+    `src/machinst/vcode.rs` (`emit`), each only when another block follows
+    in emission order (the last block keeps its trap, so a return address
+    never points past the function; LLVM drops these traps under
+    `NoTrapAfterNoreturn` and likewise keeps one where the call would end
+    the function):
+    - a `NORETURN_CALL` trap whose previous inst in its block is a regular
+      call, and which sits exactly at that call's return address (no
+      regalloc edit, pad or island in between), is not emitted;
+    - a `try_call` whose continuation is a lone `NORETURN_CALL` trap gets
+      `continuation_elide`: nothing after the `bl`/`call`;
+    - `noreturn_dead_blocks`: blocks reached only through such a
+      `try_call`'s normal-return edge (the lone trap block, or the
+      split-edge block in front of it; one forward walk from the entry)
+      bind their label and emit nothing. Off under
+      `machine_code_cfg_info`.
+    Tests: `pliron-clif-opt/tests/noret_trap.rs` (trap and call-site
+    records; x86-64 under Rosetta with `--target x86_64-apple-darwin`).

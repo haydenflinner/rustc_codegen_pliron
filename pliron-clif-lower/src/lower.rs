@@ -1318,6 +1318,7 @@ pub fn lower_module<'a>(
     // actually broke.
     let verify_env = crate::env_set("PLIRON_VERIFY");
     let verify_full_env = crate::env_is("PLIRON_VERIFY", "full");
+    let noret_trap = crate::env_is("PLIRON_NORETTRAP", "1");
     let _slo = tracing::info_span!(target: "pliron::phase", "lowerobj", cgu = name).entered();
     let hprof = host.prof();
     let _pglo = hprof.activity("pliron_lowerobj", None);
@@ -1477,6 +1478,9 @@ pub fn lower_module<'a>(
                     tcfg: cfg,
                     internal: &internal,
                     own_tail: internal.contains(n) || is_tail_fn(isa.triple(), f),
+                    noret_trap,
+                    noret_next: 0,
+                    noret_last: 0,
                     wasm: false,
                     exn: None,
                     vars: std::mem::take(&mut scratch.vars),
@@ -2505,6 +2509,9 @@ pub fn lower_clif_wasm(
                 tcfg,
                 internal: &internal,
                 own_tail: internal.contains(n) || is_tail_fn(isa.triple(), f),
+                noret_trap: false,
+                noret_next: 0,
+                noret_last: 0,
                 wasm: true,
                 exn: None,
                 vars: std::mem::take(&mut scratch.vars),
@@ -2971,6 +2978,15 @@ struct FnLower<'a, 'b> {
     /// This function's own convention is `CallConv::Tail` (it is internal), so
     /// `return_call`/`return_call_indirect` are legal in its body.
     own_tail: bool,
+    /// `PLIRON_NORETTRAP=1`: the `unreachable` after a call to a noreturn
+    /// callee (`CallInfo::noret`) traps with `TrapCode::NORETURN_CALL`,
+    /// which Cranelift's emission drops when code follows.
+    noret_trap: bool,
+    /// The op just lowered was a noreturn call: 1 = plain call, 2 = invoke
+    /// (`try_call`); 0 otherwise. `noret_last` is the value for the
+    /// previous op while the current one lowers.
+    noret_next: u8,
+    noret_last: u8,
     /// Lowering for the wasm backend (i32 pointers, wasm32 C ABI): 128-bit
     /// libcall results go through a hidden sret pointer arg.
     wasm: bool,
@@ -4654,6 +4670,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             o.operand_defs_into(self.ctx, &mut opnds);
             o.successor_defs_into(self.ctx, &mut succs);
         }
+        self.noret_last = std::mem::take(&mut self.noret_next);
         self.lower_op_inner(op, &opnds, &succs);
         self.opnds = opnds;
         self.succs = succs;
@@ -4734,12 +4751,32 @@ impl<'a, 'b> FnLower<'a, 'b> {
             self.b.ins().return_(&vs);
             self.terminated = true;
         } else if is!(UnreachableOp) {
-            self.b.ins().trap(TrapCode::unwrap_user(2));
+            // Right after a noreturn call (in the same block, or as an
+            // invoke's normal-return block): a trap emission may drop.
+            let code = if self.noret_last != 0 {
+                TrapCode::NORETURN_CALL
+            } else {
+                TrapCode::unwrap_user(2)
+            };
+            self.b.ins().trap(code);
             self.terminated = true;
         } else if is!(BrOp) {
-            let d = self.blocks[&succs[0]];
-            let a = self.block_args(opnds);
-            self.b.ins().jump(d, &a);
+            // An invoke of a noreturn callee: its normal-return edge goes to
+            // `unreachable`, so the continuation is a droppable trap.
+            if self.noret_last == 2
+                && opnds.is_empty()
+                && succs[0]
+                    .deref(ctx)
+                    .iter(ctx)
+                    .next()
+                    .is_some_and(|o| Operation::is_op::<UnreachableOp>(o, ctx))
+            {
+                self.b.ins().trap(TrapCode::NORETURN_CALL);
+            } else {
+                let d = self.blocks[&succs[0]];
+                let a = self.block_args(opnds);
+                self.b.ins().jump(d, &a);
+            }
             self.terminated = true;
         } else if is!(SwitchOp) {
             let sw = Operation::get_op::<SwitchOp>(op, ctx).unwrap();
@@ -6373,6 +6410,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
             };
             self.terminated = true;
             return;
+        }
+        if self.noret_trap && info.noret {
+            self.noret_next = if self.st.invokes.get(op).is_some() { 2 } else { 1 };
         }
         let (inst, rs): (ir::Inst, Vals) = if let Some(&(catch, is_catch)) = self.st.invokes.get(op)
         {

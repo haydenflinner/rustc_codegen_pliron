@@ -674,6 +674,11 @@ pub struct TryCallInfo {
     /// the jump never becomes a fallthrough; emitting the trap in place
     /// is both smaller and one fewer branch.
     pub continuation_trap: Option<crate::ir::TrapCode>,
+    /// PLIRON: emit nothing for the normal-return edge. Set at emission
+    /// (`MachInst::elide_noreturn_continuation`) only when
+    /// `continuation_trap` is `TrapCode::NORETURN_CALL` and more code
+    /// follows in the function.
+    pub continuation_elide: bool,
     /// Exception tags to catch and corresponding destination labels.
     pub exception_handlers: Box<[TryCallHandler]>,
 }

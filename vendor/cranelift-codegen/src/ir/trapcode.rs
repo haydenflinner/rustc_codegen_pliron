@@ -47,6 +47,15 @@ impl TrapCode {
     /// Failed float-to-int conversion.
     pub const BAD_CONVERSION_TO_INTEGER: TrapCode = TrapCode::reserved(4);
 
+    /// PLIRON: the `unreachable` right after a call whose callee is
+    /// guaranteed not to return (an uninhabited return type, or a known
+    /// noreturn runtime function such as `_Unwind_Resume`). Emission drops
+    /// such a trap when it directly follows the call's return address and
+    /// more code follows in the function (LLVM's `NoTrapAfterNoreturn`);
+    /// otherwise it is an ordinary trap. A user code, so the text format
+    /// spells it `user250`.
+    pub const NORETURN_CALL: TrapCode = TrapCode::unwrap_user(250);
+
     /// Create a user-defined trap code.
     ///
     /// Returns `None` if `code` is zero or too large and is reserved by

@@ -466,7 +466,10 @@ pub(crate) fn emit(
             // If this is a try-call, jump to the continuation
             // (normal-return) block.
             if let Some(try_call) = call_info.try_call_info.as_ref() {
-                if let Some(code) = try_call.continuation_trap {
+                if try_call.continuation_elide {
+                    // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                    // and code follows: no trap, no jump.
+                } else if let Some(code) = try_call.continuation_trap {
                     // The continuation is a lone `trap`: emit it inline
                     // (`callq; ud2`) instead of jumping to a cold block.
                     asm::inst::ud2_zo::new(code).emit(sink, info, state);
@@ -552,7 +555,10 @@ pub(crate) fn emit(
             );
 
             if let Some(try_call) = call_info.try_call_info.as_ref() {
-                if let Some(code) = try_call.continuation_trap {
+                if try_call.continuation_elide {
+                    // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                    // and code follows: no trap, no jump.
+                } else if let Some(code) = try_call.continuation_trap {
                     // The continuation is a lone `trap`: emit it inline
                     // (`callq; ud2`) instead of jumping to a cold block.
                     asm::inst::ud2_zo::new(code).emit(sink, info, state);

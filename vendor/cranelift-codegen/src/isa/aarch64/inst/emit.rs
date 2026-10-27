@@ -3150,7 +3150,10 @@ impl MachInstEmit for Inst {
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    if let Some(trap_code) = try_call.continuation_trap {
+                    if try_call.continuation_elide {
+                        // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                        // and code follows: no trap, no jump.
+                    } else if let Some(trap_code) = try_call.continuation_trap {
                         // The continuation is a lone `trap`: emit it
                         // inline (`bl; udf`) instead of jumping to a
                         // cold block.
@@ -3205,7 +3208,10 @@ impl MachInstEmit for Inst {
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    if let Some(trap_code) = try_call.continuation_trap {
+                    if try_call.continuation_elide {
+                        // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                        // and code follows: no trap, no jump.
+                    } else if let Some(trap_code) = try_call.continuation_trap {
                         // The continuation is a lone `trap`: emit it
                         // inline (`bl; udf`) instead of jumping to a
                         // cold block.

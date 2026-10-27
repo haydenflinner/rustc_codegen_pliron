@@ -312,6 +312,12 @@ pub struct CallInfo {
     /// can't go stale; `direct_callee` reads this instead of the attr
     /// dict, and ops without a `calls` entry still fall back to it.
     pub callee: Option<String>,
+    /// The callee is guaranteed not to return: the call site's ABI return
+    /// layout is uninhabited (`-> !`, an empty enum), or it is a runtime
+    /// function declared noreturn (`_Unwind_Resume`). A return would be UB,
+    /// so lowering marks the `unreachable` after it `TrapCode::NORETURN_CALL`
+    /// (`PLIRON_NORETTRAP=1`), which emission drops.
+    pub noret: bool,
 }
 
 #[derive(Default)]

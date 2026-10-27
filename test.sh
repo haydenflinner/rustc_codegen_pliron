@@ -494,6 +494,26 @@ t_cmp3() {
   PLIRON_CMP3=1 rustc $BE --edition 2021 tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]]
 }
 
+t_noret() {
+  # PLIRON_NORETTRAP=1: no trap after a call that cannot return (panics,
+  # `-> !`, uninhabited returns, `_Unwind_Resume`) when code follows it.
+  # Unwinding (-O and -O0) and -Cpanic=abort output match stock rustc's,
+  # and the flag must actually drop traps (fewer udf/ud2 in the object).
+  local m o i=0
+  for m in "" "-O" "-O -Cpanic=abort"; do
+    i=$((i + 1)); o=$out/noret$i
+    rustc --edition 2021 ${m} tests/noret/main.rs -o $o-stock$exe || return 1
+    PLIRON_NORETTRAP=1 rustc $BE --edition 2021 ${m} -C codegen-units=1 tests/noret/main.rs -o $o$exe || return 1
+    diff <($o-stock$exe 2>/dev/null) <($o$exe 2>/dev/null) || { echo "noret: output differs (${m})" >&2; return 1; }
+  done
+  local n0 n1
+  rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret0.o || return 1
+  PLIRON_NORETTRAP=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret1.o || return 1
+  n0=$("$llvmod" -d $out/noret0.o | grep -cE '\b(udf|ud2)\b' || true)
+  n1=$("$llvmod" -d $out/noret1.o | grep -cE '\b(udf|ud2)\b' || true)
+  (( n1 < n0 )) || { echo "noret: traps $n0 -> $n1, none dropped" >&2; return 1; }
+}
+
 t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
@@ -886,6 +906,8 @@ want lowerfree && t_lowerfree
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul
+# catch_unwind can't intercept stock-std SEH throws on Windows (see `unwind`).
+[[ -z "$exe" ]] && want noret && t_noret
 # Same stock-std SEH limitation as `unwind` above: every check here is a
 # caught panic, which our emulated-EH catch can't see on Windows.
 [[ -z "$exe" ]] && want dseunwind && t_dseunwind

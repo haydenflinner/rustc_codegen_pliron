@@ -1854,6 +1854,11 @@ impl<I: VCodeInst> MachBuffer<I> {
         });
     }
 
+    /// PLIRON: the return address of the most recent call-site record.
+    pub fn last_call_ret_addr(&self) -> Option<CodeOffset> {
+        self.call_sites.last().map(|c| c.ret_addr)
+    }
+
     /// Add a call-site record at the current offset.
     pub fn add_call_site(&mut self) {
         self.add_try_call_site(None, core::iter::empty());

@@ -298,6 +298,28 @@ pub trait MachInst: Clone + Debug {
     /// for tail calls that don't return to the caller.
     fn call_type(&self) -> CallType;
 
+    /// PLIRON: the trap code of an unconditional trap (`is_trap`), if the
+    /// backend records one. Used to find `TrapCode::NORETURN_CALL` traps
+    /// that emission may drop.
+    fn trap_code(&self) -> Option<crate::ir::TrapCode> {
+        None
+    }
+
+    /// PLIRON: if this is a `try_call` whose normal-return continuation is
+    /// a lone `TrapCode::NORETURN_CALL` trap emitted inline after the call,
+    /// mark it to emit nothing there instead and return true.
+    fn elide_noreturn_continuation(&mut self) -> bool {
+        false
+    }
+
+    /// PLIRON: the continuation label of a `try_call` whose normal-return
+    /// destination is a lone `TrapCode::NORETURN_CALL` trap. That trap is
+    /// emitted inline after the call (or elided), so the call never
+    /// branches to the label: the edge is dead.
+    fn noreturn_continuation(&self) -> Option<MachLabel> {
+        None
+    }
+
     /// Should this instruction's clobber-list be included in the
     /// clobber-set?
     fn is_included_in_clobbers(&self) -> bool;
