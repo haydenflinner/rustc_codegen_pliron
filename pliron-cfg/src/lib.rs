@@ -24,8 +24,8 @@ pub struct PassConfig {
 /// value: the table is the single source of the default, and the kill
 /// switch reaches every site by construction. Read with `env_is`/`get`,
 /// never `env_set` (presence would count `=0` as on). The vendored
-/// Cranelift reads `PLIRON_REMAT_SADDR` itself and defaults it the same
-/// way. Validation: docs/history/2026-10-27-defaults.md.
+/// Cranelift reads `PLIRON_REMAT_SADDR` and `PLIRON_REMATCALL` itself and
+/// defaults them the same way. Validation: docs/history/2026-10-27-defaults.md.
 pub const DEFAULT_ON: &[&str] = &[
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).

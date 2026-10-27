@@ -773,7 +773,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
   2026-10-27; `PLIRON_REMAT_SADDR=0` turns it off)
   block, as LLVM's RA does for frame indices, instead of keeping one
   GVN'd frame address live across calls.
-- `PLIRON_REMATCALL=1` (default off; `src/egraph/elaborate.rs`,
+- `PLIRON_REMATCALL` (default on since 2026-10-27, `=0` turns it off; `src/egraph/elaborate.rs`,
   `src/opts/remat.isle`, `pliron_remat_call` in `prelude_opt.isle` and
   `opts.rs`; `egraph::elaborate` made `pub(crate)` for the switch): marks
   one-instruction `iconst`s (`imm64_remat_cheap`) for remat again, and the

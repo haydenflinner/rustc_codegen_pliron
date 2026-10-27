@@ -17,11 +17,11 @@ use cranelift_control::ControlPlane;
 use cranelift_entity::{EntitySet, SecondaryMap, packed_option::ReservedValue};
 use smallvec::{SmallVec, smallvec};
 
-/// PLIRON: `PLIRON_REMATCALL=1` (default off) — see `Elaborator::call_loops`
-/// and the `iconst` rule in `opts/remat.isle`.
+/// PLIRON: `PLIRON_REMATCALL` (default on; `=0` turns it off) — see
+/// `Elaborator::call_loops` and the `iconst` rule in `opts/remat.isle`.
 pub(crate) fn remat_call_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_REMATCALL").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_REMATCALL").as_deref() != Ok("0"))
 }
 
 pub(crate) struct Elaborator<'a> {
