@@ -71,6 +71,14 @@ cap) and memory knobs only reorder work. With the cap unset, 8 and 1, all 16
 regex-syntax objects are byte-identical (`DEADFREE` on), as they are with
 `PLIRON_PAR=1`.
 
+The memory knobs of 2026-10-27 (docs/history/2026-10-27-memory2.md) are in
+this class: `PLIRON_LOWERFREE` frees a CGU's IR earlier, `PLIRON_JEARENA`
+changes which jemalloc arena holds an allocation and when freed pages go
+back to the OS, and `PLIRON_CGU_ACAP=N` delays the start of stage A. None
+may change a byte. `detcheck.py`'s `memfree` and `acap2` variants check it,
+and `test.sh lowerfree` compares every CGU object of tests/std with the
+flags-off build.
+
 ### R4. No output order from unordered iteration
 
 - `std::collections::HashMap`/`HashSet` use a randomly seeded hasher, so
