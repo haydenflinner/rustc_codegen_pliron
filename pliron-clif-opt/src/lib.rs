@@ -14,6 +14,7 @@ pub mod celim;
 pub mod dbglabel;
 pub mod cicm;
 pub mod clifpeep;
+pub mod cmp3;
 pub mod commute;
 pub mod config;
 pub mod constdedup;

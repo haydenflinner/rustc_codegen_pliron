@@ -8912,7 +8912,7 @@ fn sel_cmp(func: &mut Function, c: Value, ea: CmpVal, eb: CmpVal) -> Option<CmpV
 /// the domtree for the dominance check. An Ordering decode repeats the
 /// same compares in every sibling block — reuse avoids minting a second
 /// `icmp ne` next to the one it replaced.
-struct CmpReuse {
+pub(crate) struct CmpReuse {
     imap: FxHashMap<(IntCC, Value, Value), Vec<Inst>>,
     dt: DominatorTree,
 }
@@ -9011,7 +9011,7 @@ fn mkcmp(
 
 /// `icmp cc x, K` where `x` is a bool chain or a `select` of
 /// evaluable arms — rewrite/alias to the collapsed form.
-fn selord_icmp(
+pub(crate) fn selord_icmp(
     pos: &mut FuncCursor,
     inst: Inst,
     cond: IntCC,

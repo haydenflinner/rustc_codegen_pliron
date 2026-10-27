@@ -2761,6 +2761,15 @@ fn s_rangefold(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // inverse of arghoist): `count + flag` where flag merges as 1/0/ret
 // becomes per-edge `count+1` / `count+ret0` — the flag's merge slot
 // (a spill in regalloc) disappears.
+fn s_cmp3(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (_, dom) = an.cfg_dt(&p.clctx.func);
+    let k = cmp3::run(&mut p.clctx.func, dom);
+    if k > 0 {
+        p.dump("cmp3");
+    }
+    k
+}
+
 fn s_paramsink(p: &mut Pipe, an: &mut Analysis) -> usize {
     let (_, dom) = an.cfg_dt(&p.clctx.func);
     let (k, moved) = paramsink::run(&mut p.clctx.func, dom);
@@ -3942,6 +3951,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Everything inside needs an edge: `merge_chains` a `jump` chain,
         // the dispatch/brif work a conditional (guarded per-phase inside
         // for the CONDBR-less case the old gate used to skip wholesale).
+        // `Ordering` tests on a join param: value-set folds (`== -2` None
+        // niche on a {-1,0,1} value) and compares pushed into the edges,
+        // where selord collapses `(a <=> b) < 0` to `a <u b`. Before
+        // jtround so the edge constants thread.
+        step("cmp3", "cmp3", Gate::OptIn("PLIRON_CMP3"), s_cmp3).needs(shape::TESTC),
         step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::MULTI),
         // Select-chain folds `clifpeep` missed while the arms still sat
         // behind block params that mergechain just merged (eqbug).

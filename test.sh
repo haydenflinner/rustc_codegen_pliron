@@ -484,6 +484,16 @@ t_narrowext() {
   PLIRON_NARROWEXT=1 PLIRON_EDGEDEDUP=1 rustc $BE --edition 2021 tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null
 }
 
+t_cmp3() {
+  # Ordering / Option<Ordering> tests folded through three-way-compare
+  # joins (PLIRON_CMP3): every test form, int/float boundaries, derived
+  # lexicographic structs, sort/binary_search. Checksum pinned from stock.
+  local want=6973952887107744103
+  rustc $BE --edition 2021 -O tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]] && \
+  PLIRON_CMP3=1 rustc $BE --edition 2021 -O tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]] && \
+  PLIRON_CMP3=1 rustc $BE --edition 2021 tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]]
+}
+
 t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
@@ -896,6 +906,7 @@ want asmlabels && t_asmlabels
 want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want narrowext && t_narrowext
+want cmp3 && t_cmp3
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern
 want dbgnested && t_dbgnested
