@@ -2090,6 +2090,15 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_bunroll(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = bunroll::run(&mut p.clctx.func, an);
+    if k > 0 {
+        an.invalidate(&mut p.clctx.func);
+    }
+    p.dump("bunroll");
+    k
+}
+
 fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = unreach::run(&mut p.clctx.func);
     p.stats.unreached += k;
@@ -3584,6 +3593,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_unroll,
             site: std::sync::OnceLock::new(),
         },
+        step("bunroll", "bunroll", Gate::Env("PLIRON_BUNROLL"), s_bunroll).needs(shape::LOOPS),
         step("unreach", "", Gate::Flag(FlagId::Unreach), s_unreach).needs(shape::BLOCKS2),
         Step {
             name: "clifpeep",
