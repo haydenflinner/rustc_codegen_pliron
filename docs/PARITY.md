@@ -90,6 +90,11 @@ weight.
 | STK | stack frames | `harness/frames.py`: frame bytes summed over the functions both backends define in regex-syntax | 15 |
 | COR | correctness | per suite (pliron failures + 1) / (LLVM failures + 1), geomean: UI stage-2-only vs stage-1-only, crates pliron-only tests vs 0, fuzz failing seeds vs 0 | 20 |
 
+**Latest (2026-10-27, docs/history/2026-10-27-parity-card.md): 92
+overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 122),
+**95 with the candidate flags** (MEM 59, SIZ 40). The weakest categories
+are code size (wasm32 regex-syntax is 5.7x LLVM) and memory.
+
 Correctness is an attribute, not a gate: it can be traded for a while,
 at a visible price (one pliron-only crate failure rates COR 50). The
 script doesn't rerun the slow correctness suites; the card shows the age
