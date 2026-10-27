@@ -288,13 +288,27 @@ pub fn target_features(
 /// (A) is done (pure functions of the `Context` and `State`, which
 /// lowering doesn't change: the bytes are the same either way).
 struct ModTail {
-    link: Vec<u8>,
+    /// `pliron.link` function entries `(name, flags)`; serialized at emit
+    /// time so `PLIRON_WASM_GC` can leave dropped functions out.
+    link_funcs: Vec<(String, u8)>,
+    /// `pliron.link` data entries, already serialized (count first).
+    link_data: Vec<u8>,
+    /// `PLIRON_WASM_GC`: functions whose address escapes at the IR level
+    /// (`address_taken`: `Sym` consts in global initializers — the data
+    /// relocations above — and `llvm.addressof` ops). Empty when off.
+    taken: FxHashSet<String>,
     custom: Vec<(String, Vec<u8>)>,
 }
 
 impl ModTail {
     fn new(ctx: &Context, st: &State) -> Self {
-        let link = link_section(ctx, st);
+        let link_funcs = link_funcs(ctx, st);
+        let link_data = link_data(ctx, st);
+        let taken = if pliron_cfg::env_is("PLIRON_WASM_GC", "1") {
+            pliron_ir_opt::address_taken(ctx, st)
+        } else {
+            FxHashSet::default()
+        };
         // `#[link_section = "name"]` statics are wasm custom sections, which
         // the linker concatenates (wasm-bindgen's `__wasm_bindgen_unstable`
         // metadata).
@@ -312,7 +326,29 @@ impl ModTail {
                 custom.push((sec.to_string(), data));
             }
         }
-        ModTail { link, custom }
+        ModTail {
+            link_funcs,
+            link_data,
+            taken,
+            custom,
+        }
+    }
+
+    /// The `pliron.link` payload without the functions in `dropped`.
+    fn link(&self, dropped: &FxHashSet<String>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let fs: Vec<_> = self
+            .link_funcs
+            .iter()
+            .filter(|(n, _)| !dropped.contains(n))
+            .collect();
+        put_u32(&mut out, fs.len() as u32);
+        for (n, flags) in fs {
+            put_str(&mut out, n);
+            out.push(*flags);
+        }
+        out.extend_from_slice(&self.link_data);
+        out
     }
 }
 
@@ -340,6 +376,16 @@ fn emit_obj(
     pliron_cfg::trace("*wasm-winline*", t0.elapsed().as_secs_f64() * 1e3, name);
     pliron_cfg::mark(&format!("wasm-winline {name}"));
     let t0 = std::time::Instant::now();
+    // `PLIRON_WASM_GC=1`: drop `Local` functions nothing in this module
+    // references any more — mostly callees `winline` spliced into every
+    // caller. LLVM's GlobalDCE removes these before the object is
+    // written; without it the object (and an rlib's members) carries
+    // bodies the final link's GC drops anyway.
+    let dropped = if pliron_cfg::env_is("PLIRON_WASM_GC", "1") {
+        wgc(&mut o, &tail.taken, st, name)
+    } else {
+        FxHashSet::default()
+    };
 
     // Only import functions that are actually called; GOT.func globals
     // name their targets, so they don't need an import.
@@ -379,6 +425,16 @@ fn emit_obj(
             Ok(Err(e)) | Err(e) => Err(e),
         })
     });
+    // `PLIRON_WASM_SIZELOG=1`: one `wsize <insts> <bytes> <name>` line per
+    // body on stderr — waffle IR size against emitted bytes.
+    if crate::env_set("PLIRON_WASM_SIZELOG") {
+        for (d, c) in decls.iter().zip(&compiled) {
+            if let (Some(b), Some(Ok(bytes))) = (d.body.as_ref(), c) {
+                let insts: usize = b.blocks.values().map(|d| d.insts.len()).sum();
+                eprintln!("wsize {insts} {} {}", bytes.len(), d.name);
+            }
+        }
+    }
     for (d, c) in decls.into_iter().zip(compiled) {
         let f = Func::new(o.m.funcs.len());
         match c {
@@ -448,7 +504,7 @@ fn emit_obj(
     }
     pliron_cfg::trace("*wasm-peep*", t0.elapsed().as_secs_f64() * 1e3, name);
     pliron_cfg::mark(&format!("wasm-peep {name}"));
-    custom_section(&mut bytes, "pliron.link", &tail.link);
+    custom_section(&mut bytes, "pliron.link", &tail.link(&dropped));
     let mut tf = Vec::new();
     leb(&mut tf, features.len() as u32);
     for f in features {
@@ -7972,6 +8028,98 @@ fn wsel(b: &mut FunctionBody) -> bool {
 /// single-callsite callee at most `SOLO` insts. Once a callee's last
 /// call edge is gone the linker's mark-sweep GC drops its standalone
 /// body, which is where the code-size win lands.
+/// Does `b` have irreducible control flow (an RPO retreating edge whose
+/// target doesn't dominate its source — waffle's `Reducifier` test)?
+/// `succs` must be current (`fixup_edges`).
+fn wirreducible(b: &FunctionBody) -> bool {
+    let cfg = waffle::cfg::CFGInfo::new(b);
+    for (rpo, &block) in cfg.rpo.entries() {
+        for &succ in &b.blocks[block].succs {
+            let Some(sr) = cfg.rpo_pos[succ] else { continue };
+            if sr.index() <= rpo.index() && !cfg.dominates(succ, block) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Memoized `wirreducible` of `funcs[i]` (see `PLIRON_WASM_NOIRRED`).
+fn irred_at(funcs: &[FDecl], cache: &mut [Option<bool>], i: usize) -> bool {
+    *cache[i].get_or_insert_with(|| funcs[i].body.as_ref().is_some_and(wirreducible))
+}
+
+/// Strongly connected components of the direct call graph over `funcs`
+/// (`call` operands only; body-less imports are singleton nodes). Returns
+/// one component id per function index. Iterative Tarjan, linear in
+/// bodies + edges.
+fn call_sccs(funcs: &[FDecl]) -> Vec<u32> {
+    let n = funcs.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, f) in funcs.iter().enumerate() {
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        for v in f.body.iter().flat_map(|b| b.values.values()) {
+            if let ValueDef::Operator(O::Call { function_index }, ..) = v {
+                let t = function_index.index();
+                if seen.insert(t) {
+                    succ[i].push(t);
+                }
+            }
+        }
+    }
+    const UNVISITED: u32 = u32::MAX;
+    let mut index = vec![UNVISITED; n];
+    let mut low = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut comp = vec![UNVISITED; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let (mut next, mut ncomp) = (0u32, 0u32);
+    for root in 0..n {
+        if index[root] != UNVISITED {
+            continue;
+        }
+        // (node, next successor position)
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut pos)) = work.last_mut() {
+            if *pos < succ[v].len() {
+                let w = succ[v][*pos];
+                *pos += 1;
+                if index[w] == UNVISITED {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(p, _)) = work.last() {
+                    low[p] = low[p].min(low[v]);
+                }
+                if low[v] == index[v] {
+                    while let Some(w) = stack.pop() {
+                        on_stack[w] = false;
+                        comp[w] = ncomp;
+                        if w == v {
+                            break;
+                        }
+                    }
+                    ncomp += 1;
+                }
+            }
+        }
+    }
+    comp
+}
+
 fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     const TINY: usize = 12;
     const SOLO: usize = 300;
@@ -8008,7 +8156,32 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // caller grow ~cap per round for ROUNDS rounds.
     let mut grown = vec![0usize; funcs.len()];
     let mut inlined = 0usize;
+    // `PLIRON_WASM_NOREC=1`: the loop rule skips callees in the caller's
+    // call-graph SCC. In a recursive mesh (drop glue of a recursive
+    // enum, a recursive-descent visitor) every member is a loop callsite
+    // of another member, so each round splices bodies that the previous
+    // round already grew; every member then fills `caller_cap`. In
+    // regex-syntax's wasm object ~100 drop-glue bodies reached 17 KB each
+    // (LLVM's: 0.4-1.3 KB) and `Extractor::extract` 114 KB (LLVM 6 KB).
+    // LLVM's inliner inlines bottom-up once per site and never into a
+    // recursive cycle. A callee outside the SCC (hashbrown's `hash_one`
+    // in a probe loop) is unaffected.
+    let norec = pliron_cfg::env_is("PLIRON_WASM_NOREC", "1");
+    // `PLIRON_WASM_NOIRRED=1`: never splice a callee with irreducible
+    // control flow, nor into a caller that has it. waffle's backend
+    // makes such a CFG reducible by context-sensitive block duplication
+    // ("EXPONENTIAL BLOWUP POTENTIAL", backend/reducify.rs); a few
+    // CLIF-optimized bodies (regex-syntax's `Seq::cross_reverse`,
+    // `escape_into`) come out of lowering irreducible and compile at
+    // 20-40 B per waffle inst instead of ~8. Spliced into a caller's
+    // loops, the duplication compounds: `Extractor::extract_repetition`
+    // compiled to 160 KB from 2,174 insts (74 B/inst), and the eight
+    // such bodies were 458 KB of regex-syntax's 1.19 MB object.
+    let noirred = pliron_cfg::env_is("PLIRON_WASM_NOIRRED", "1");
     for round in 0..ROUNDS {
+        // Per-round irreducibility cache: a body only changes as a
+        // caller, and a caller never splices after its own check.
+        let mut irred: Vec<Option<bool>> = vec![None; funcs.len()];
         // callsite count per callee; ref.func keeps the standalone
         // body alive, so inlining one only duplicates code.
         let mut calls = vec![0u32; funcs.len()];
@@ -8026,6 +8199,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 }
             }
         }
+        let scc = if norec { call_sccs(funcs) } else { Vec::new() };
         let mut did = false;
         for ci in 0..funcs.len() {
             if funcs[ci].body.is_none() {
@@ -8070,6 +8244,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
             if cur_size > caller_cap || grown[ci] > caller_cap {
                 continue;
             }
+            if noirred && irred_at(funcs, &mut irred, ci) {
+                continue;
+            }
             // One scan per caller: collect all eligible call values.
             // Positions are resolved per-site at splice time (the tail
             // split keeps every other call's identity valid).
@@ -8089,6 +8266,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // `#[inline(never)]` is a hard no â€”
                             // LLVM refuses to inline it too.
                             if funcs[fi].no_inline {
+                                continue;
+                            }
+                            if noirred && irred_at(funcs, &mut irred, fi) {
                                 continue;
                             }
                             let Some(cb) = funcs[fi].body.as_ref() else {
@@ -8123,7 +8303,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                                 || n <= TINY
                                 || (k == 1 && refs[fi] == 0 && n <= SOLO)
                                 || gc_done
-                                || (is_loop(funcs, ci, blk) && n <= hot_cap)
+                                || (n <= hot_cap
+                                    && (!norec || scc[fi] != scc[ci])
+                                    && is_loop(funcs, ci, blk))
                             {
                                 sites.push((iv, fi));
                             }
@@ -8142,6 +8324,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 .is_some_and(|s| s.split(',').any(|p| funcs[ci].name.contains(p)));
             if !sites.is_empty() && !inline_skip {
                 did = true;
+                let irred_log = crate::env_get("PLIRON_WASM_INLINE_LOG").is_some();
+                let mut was_irred =
+                    irred_log && wirreducible(funcs[ci].body.as_ref().unwrap());
                 for &(iv, fi) in &sites {
                     if cur_size > caller_cap
                         || grown[ci] > caller_cap
@@ -8170,12 +8355,29 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                         cur_size += n;
                         grown[ci] += n;
                         inlined += 1;
+                        if irred_log && !was_irred {
+                            fixup_edges(b);
+                            if wirreducible(b) {
+                                was_irred = true;
+                                eprintln!(
+                                    "irred {} <- {} (callee irred {})",
+                                    funcs[ci].name,
+                                    funcs[fi].name,
+                                    wirreducible(&callee)
+                                );
+                            }
+                        }
                     }
                 }
                 let b = funcs[ci].body.as_mut().unwrap();
                 fixup_edges(b);
                 check_targets(b, &funcs[ci].name);
                 b.optimize(&waffle::OptOptions::default());
+                if irred_log && !was_irred && wirreducible(b) {
+                    eprintln!("irred-opt {}", funcs[ci].name);
+                }
+                // The body changed: re-test it when it is a callee later.
+                irred[ci] = None;
             }
         }
         if !did {
@@ -8187,6 +8389,65 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
             tracing::debug!(target: "pliron::wasm","pliron-wasm: inlined {inlined} callsites")
         };
     }
+}
+
+/// `PLIRON_WASM_GC=1`: module-level dead-function elimination after
+/// `winline` (LLVM's GlobalDCE for the object). Roots are every defined
+/// function that is not `Local`, every function whose address escapes
+/// (`address_taken`: `Sym` consts in global initializers — the
+/// `pliron.link` data relocations — and `llvm.addressof` ops) and every
+/// `GOT.func.<sym>` global this module imported. Edges are `call` and
+/// `ref.func` operands of live bodies. Unmarked bodies are dropped
+/// (`body = None` with no caller: never imported, never emitted) and
+/// their names returned so `link_section` leaves them out too. Mirrors
+/// the roots/edges of `pliron-wasm-ld`'s GC, so this only removes what
+/// the final link would have removed anyway.
+fn wgc(o: &mut Obj, taken: &FxHashSet<String>, st: &State, name: &str) -> FxHashSet<String> {
+    let n = o.funcs.len();
+    let mut live = vec![false; n];
+    let mut wl: Vec<usize> = Vec::new();
+    let mut defined = 0usize;
+    for (i, f) in o.funcs.iter().enumerate() {
+        if f.body.is_none() {
+            continue;
+        }
+        defined += 1;
+        let local = st
+            .funcs
+            .get(&f.name)
+            .is_some_and(|fi| fi.linkage == Linkage::Local);
+        if !local || taken.contains(&f.name) || o.got.contains_key(&(true, f.name.clone())) {
+            live[i] = true;
+            wl.push(i);
+        }
+    }
+    while let Some(i) = wl.pop() {
+        let Some(b) = o.funcs[i].body.as_ref() else {
+            continue;
+        };
+        for v in b.values.values() {
+            let t = match v {
+                ValueDef::Operator(O::Call { function_index }, ..) => function_index.index(),
+                ValueDef::Operator(O::RefFunc { func_index }, ..) => func_index.index(),
+                _ => continue,
+            };
+            if !live[t] {
+                live[t] = true;
+                wl.push(t);
+            }
+        }
+    }
+    let mut dropped = FxHashSet::default();
+    for (i, f) in o.funcs.iter_mut().enumerate() {
+        if f.body.is_some() && !live[i] {
+            f.body = None;
+            dropped.insert(f.name.clone());
+        }
+    }
+    if pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "wasmgc {name}: dropped {} of {defined} fns", dropped.len());
+    }
+    dropped
 }
 
 fn leb(out: &mut Vec<u8>, mut v: u32) {
@@ -8239,23 +8500,24 @@ fn link_flags(l: Linkage) -> u8 {
 /// for defined data objects. Flags: bit 0 global, bit 1 preemptible, bit 2 an
 /// `.init_array` entry (constructor pointers the linker calls from
 /// `__wasm_call_ctors`), bit 3 `#[used(linker)]` (GC root).
-fn link_section(ctx: &Context, st: &State) -> Vec<u8> {
-    let mut out = Vec::new();
-    let fs: Vec<_> = st
-        .funcs
+fn link_funcs(ctx: &Context, st: &State) -> Vec<(String, u8)> {
+    st.funcs
         .iter()
         .filter(|(n, f)| has_body(ctx, f.op) && !st.dead_fns.contains(*n))
-        .collect();
-    put_u32(&mut out, fs.len() as u32);
-    for (n, f) in fs {
-        put_str(&mut out, n);
-        let l = if f.linkage == Linkage::Import {
-            Linkage::Export
-        } else {
-            f.linkage
-        };
-        out.push(link_flags(l));
-    }
+        .map(|(n, f)| {
+            let l = if f.linkage == Linkage::Import {
+                Linkage::Export
+            } else {
+                f.linkage
+            };
+            (n.clone(), link_flags(l))
+        })
+        .collect()
+}
+
+/// The data half of `pliron.link` (count first), see `link_funcs`.
+fn link_data(ctx: &Context, st: &State) -> Vec<u8> {
+    let mut out = Vec::new();
     let gs: Vec<_> = st
         .globals
         .iter()

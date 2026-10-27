@@ -93,7 +93,12 @@ weight.
 **Latest (2026-10-27, docs/history/2026-10-27-parity-card.md): 88
 overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 100),
 **91 with the candidate flags** (MEM 59, SIZ 40). The weakest categories
-are code size (wasm32 regex-syntax is 5.7x LLVM) and memory.
+are code size (wasm32 regex-syntax is 5.7x LLVM) and memory. The wasm
+size gap is attributed in docs/history/2026-10-27-wasm-size.md: 77% is
+the waffle inliner, half of that waffle's reducifier duplicating
+irreducible callees it spliced; `PLIRON_WASM_NOIRRED=1` +
+`PLIRON_WASM_NOREC=1` + `PLIRON_WASM_GC=1` (default off) take regex-wasm
+from 5.73x to 3.38x.
 
 Correctness is an attribute, not a gate: it can be traded for a while,
 at a visible price (one pliron-only crate failure rates COR 50). The
