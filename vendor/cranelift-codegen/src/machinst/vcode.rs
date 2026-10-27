@@ -874,9 +874,70 @@ impl<I: VCodeInst> VCode<I> {
         let mut t_fuse = std::time::Duration::ZERO;
         let mut n_islands = 0u32;
 
+        // PLIRON: `PLIRON_JT_NARROW=1` lets the ISA defer jump tables to the
+        // end of the buffer (narrow entries, `MachDeferredJumpTable`). The
+        // deferred table and the dispatch's base address must stay in
+        // pc-relative range, so give the buffer, per block in emission order,
+        // a sound upper bound on everything still to come: every inst and
+        // regalloc edit at its worst-case size plus a veneer, a constant
+        // re-emission and an island jump-around; epilogues; one 4-byte table
+        // entry per CFG edge; alignment padding.
+        static JT_NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let jt_narrow = *JT_NARROW
+            .get_or_init(|| std::env::var("PLIRON_JT_NARROW").as_deref() == Ok("1"));
+        let jt_suffix: Vec<u64> = if jt_narrow {
+            let per_inst = u64::from(I::worst_case_size())
+                + u64::from(I::LabelUse::worst_case_veneer_size())
+                + 52;
+            let epi = self.abi.gen_epilogue().len() as u64 * u64::from(I::worst_case_size());
+            let prologue = self.abi.gen_prologue().len() as u64 * per_inst;
+            let mut suffix = vec![0u64; final_order.len() + 1];
+            for (oi, &b) in final_order.iter().enumerate().rev() {
+                let range = self.block_ranges.get(b.index());
+                let mut bytes = (range.len() as u64 + u64::from(ra_edits_per_block[b.index()]))
+                    * per_inst
+                    + 4 * (self.block_succs(b).len() as u64 + 2)
+                    + 16
+                    + u64::from(I::LabelUse::ALIGN)
+                    + bb_padding.len() as u64;
+                for i in range.clone() {
+                    if matches!(
+                        self.insts[i].is_term(),
+                        MachTerminator::Ret | MachTerminator::RetCall
+                    ) {
+                        bytes += epi;
+                    }
+                }
+                if b == self.entry {
+                    bytes += prologue;
+                }
+                suffix[oi] = suffix[oi + 1] + bytes;
+            }
+            let consts: u64 = self
+                .constants
+                .iter()
+                .map(|(_, d)| d.as_slice().len() as u64 + u64::from(d.alignment()))
+                .sum();
+            // Tables deferred by *earlier* blocks are written ahead of this
+            // block's at the end, so every block's distance to its table
+            // includes all of them: count every edge's entry everywhere.
+            let tables: u64 = (0..self.num_blocks())
+                .map(|b| 4 * (self.block_succs(BlockIndex::new(b)).len() as u64 + 2))
+                .sum();
+            for s in &mut suffix {
+                *s += consts + tables + 64;
+            }
+            suffix
+        } else {
+            Vec::new()
+        };
+
         let t_loop0 = std::time::Instant::now();
         for (oi, &block) in final_order.iter().enumerate() {
             trace!("emitting block {:?}", block);
+            if jt_narrow {
+                buffer.set_jt_tail_bound(Some(jt_suffix[oi]));
+            }
 
             // Call the new block hook for state
             state.on_new_block();

@@ -3378,52 +3378,110 @@ impl MachInstEmit for Inst {
                     Inst::Csdb.emit(sink, emit_info, state);
                 }
 
-                // Load address of jump table
-                let inst = Inst::Adr { rd: rtmp1, off: 16 };
-                inst.emit(sink, emit_info, state);
-                // Load value out of jump table
-                let inst = Inst::SLoad32 {
-                    rd: rtmp2,
-                    mem: AMode::reg_plus_reg_scaled_extended(
-                        rtmp1.to_reg(),
-                        rtmp2.to_reg(),
-                        ExtendOp::UXTW,
-                    ),
-                    flags: MemFlagsData::trusted(),
-                };
-                inst.emit(sink, emit_info, state);
-                // Add base of jump table to jump-table-sourced block offset
-                let inst = Inst::AluRRR {
-                    alu_op: ALUOp::Add,
-                    size: OperandSize::Size64,
-                    rd: rtmp1,
-                    rn: rtmp1.to_reg(),
-                    rm: rtmp2.to_reg(),
-                };
-                inst.emit(sink, emit_info, state);
-                // Branch to computed address. (`targets` here is only used for successor queries
-                // and is not needed for emission.)
-                let inst = Inst::IndirectBr {
-                    rn: rtmp1.to_reg(),
-                    targets: vec![],
-                };
-                inst.emit(sink, emit_info, state);
-                // Emit jump table (table of 32-bit offsets).
-                let jt_off = sink.cur_offset();
-                for &target in targets.iter() {
-                    let word_off = sink.cur_offset();
-                    // off_into_table is an addend here embedded in the label to be later patched
-                    // at the end of codegen. The offset is initially relative to this jump table
-                    // entry; with the extra addend, it'll be relative to the jump table's start,
-                    // after patching.
-                    let off_into_table = word_off - jt_off;
-                    sink.use_label_at_offset(word_off, target, LabelUse::PCRel32);
-                    sink.put4(off_into_table);
-                }
+                // PLIRON: deferred narrow table (`PLIRON_JT_NARROW=1`). The
+                // table goes after all code; `MachBuffer::finish` picks 1-,
+                // 2- or 4-byte entries holding (target - lowest target) / 4
+                // and patches the three placeholders below:
+                //   adr  rtmp1, table
+                //   ldr{b,h,} wtmp2, [rtmp1, wtmp2, uxtw #{0,1,2}]
+                //   adr  rtmp1, lowest_target
+                //   add  rtmp1, rtmp1, rtmp2, lsl #2
+                //   br   rtmp1
+                'jt: {
+                    if sink.can_defer_jump_table(LabelUse::Adr21) {
+                        let (r1, r2) = (rtmp1.to_reg(), rtmp2.to_reg());
+                        let uxtw = Some(ExtendOp::UXTW);
+                        let enc = |op: u32, scaled: bool| -> SmallVec<[u8; 8]> {
+                            SmallVec::from_slice(
+                                &enc_ldst_reg(op, r1, r2, scaled, uxtw, r2).to_le_bytes(),
+                            )
+                        };
+                        let load_enc = [
+                            enc(0b0011100001, false),
+                            enc(0b0111100001, true),
+                            enc(0b1011100001, true),
+                        ];
+                        let table_off = sink.cur_offset();
+                        sink.put4(enc_adr(0, rtmp1));
+                        let load_off = sink.cur_offset();
+                        sink.put_data(&load_enc[2]);
+                        let base_off = sink.cur_offset();
+                        sink.put4(enc_adr(0, rtmp1));
+                        Inst::AluRRRShift {
+                            alu_op: ALUOp::Add,
+                            size: OperandSize::Size64,
+                            rd: rtmp1,
+                            rn: r1,
+                            rm: r2,
+                            shiftop: ShiftOpAndAmt::new(
+                                ShiftOp::LSL,
+                                ShiftOpShiftImm::maybe_from_shift(2).unwrap(),
+                            ),
+                        }
+                        .emit(sink, emit_info, state);
+                        Inst::IndirectBr {
+                            rn: r1,
+                            targets: vec![],
+                        }
+                        .emit(sink, emit_info, state);
+                        sink.defer_jump_table(MachDeferredJumpTable {
+                            targets: targets.iter().copied().collect(),
+                            table_use: (table_off, LabelUse::Adr21),
+                            base_use: (base_off, LabelUse::Adr21),
+                            load_off,
+                            load_enc,
+                            scale: 4,
+                        });
+                        break 'jt;
+                    }
 
-                // Lowering produces an EmitIsland before using a JTSequence, so we can safely
-                // disable the worst-case-size check in this case.
-                start_off = sink.cur_offset();
+                    // Load address of jump table
+                    let inst = Inst::Adr { rd: rtmp1, off: 16 };
+                    inst.emit(sink, emit_info, state);
+                    // Load value out of jump table
+                    let inst = Inst::SLoad32 {
+                        rd: rtmp2,
+                        mem: AMode::reg_plus_reg_scaled_extended(
+                            rtmp1.to_reg(),
+                            rtmp2.to_reg(),
+                            ExtendOp::UXTW,
+                        ),
+                        flags: MemFlagsData::trusted(),
+                    };
+                    inst.emit(sink, emit_info, state);
+                    // Add base of jump table to jump-table-sourced block offset
+                    let inst = Inst::AluRRR {
+                        alu_op: ALUOp::Add,
+                        size: OperandSize::Size64,
+                        rd: rtmp1,
+                        rn: rtmp1.to_reg(),
+                        rm: rtmp2.to_reg(),
+                    };
+                    inst.emit(sink, emit_info, state);
+                    // Branch to computed address. (`targets` here is only used for successor queries
+                    // and is not needed for emission.)
+                    let inst = Inst::IndirectBr {
+                        rn: rtmp1.to_reg(),
+                        targets: vec![],
+                    };
+                    inst.emit(sink, emit_info, state);
+                    // Emit jump table (table of 32-bit offsets).
+                    let jt_off = sink.cur_offset();
+                    for &target in targets.iter() {
+                        let word_off = sink.cur_offset();
+                        // off_into_table is an addend here embedded in the label to be later patched
+                        // at the end of codegen. The offset is initially relative to this jump table
+                        // entry; with the extra addend, it'll be relative to the jump table's start,
+                        // after patching.
+                        let off_into_table = word_off - jt_off;
+                        sink.use_label_at_offset(word_off, target, LabelUse::PCRel32);
+                        sink.put4(off_into_table);
+                    }
+
+                    // Lowering produces an EmitIsland before using a JTSequence, so we can safely
+                    // disable the worst-case-size check in this case.
+                    start_off = sink.cur_offset();
+                }
             }
             &Inst::LoadExtNameGot { rd, ref name } => {
                 // See this CE Example for the variations of this with and without BTI & PAUTH

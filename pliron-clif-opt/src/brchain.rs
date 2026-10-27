@@ -512,7 +512,80 @@ fn select_dispatch(
 }
 
 pub fn run(func: &mut Function) -> usize {
+    run_with(func, None, false)
+}
+
+/// Clusters a `br_table` may have and still become a range-test chain
+/// under `PLIRON_JT_SHAPE` (cluster = maximal run of consecutive indices
+/// with one non-default target). A range test is `isub`+`icmp`+`brif`;
+/// with narrow tables (`PLIRON_JT_NARROW`) the table dispatch is about
+/// eight instructions plus one byte per entry, so four clusters is
+/// roughly size-neutral, and every branch becomes direct.
+const MAX_CLUSTERS: usize = 4;
+
+/// Hot-case peeling (`PLIRON_JT_SHAPE` with a profile): the hottest
+/// target must take at least this share of the dispatch block's count,
+/// over at least `PEEL_MIN_COUNT` executions, and cost at most
+/// `PEEL_MAX_CLUSTERS` range tests.
+const PEEL_SHARE: f64 = 0.6;
+const PEEL_MIN_COUNT: u64 = 64;
+const PEEL_MAX_CLUSTERS: usize = 2;
+
+/// One test of a chain: indices `lo..=hi` go to the destination.
+type Test = (u64, u64, (Block, Vec<BlockArg>));
+
+/// The non-default runs of a table, in index order.
+fn clusters(func: &Function, entries: &[BlockCall], dflt: BlockCall) -> Vec<Test> {
+    let mut out: Vec<Test> = Vec::new();
+    let mut prev: Option<BlockCall> = None;
+    for (i, &e) in entries.iter().enumerate() {
+        let i = i as u64;
+        if same_target(func, e, dflt) {
+            prev = None;
+            continue;
+        }
+        match (prev, out.last_mut()) {
+            (Some(p), Some(last)) if same_target(func, p, e) && last.1 + 1 == i => last.1 = i,
+            _ => out.push((i, i, dest(func, e))),
+        }
+        prev = Some(e);
+    }
+    out
+}
+
+/// Profile count of the edge `from -> t`: `t`'s block count when `from`
+/// is its only predecessor, else unknown.
+fn edge_count(
+    prof: &FxHashMap<Block, u64>,
+    cfg: &ControlFlowGraph,
+    from: Block,
+    t: Block,
+) -> Option<u64> {
+    let mut preds = cfg.pred_iter(t);
+    match (preds.next(), preds.next()) {
+        (Some(p), None) if p.block == from => prof.get(&t).copied(),
+        _ => None,
+    }
+}
+
+/// What to do with one `br_table`.
+enum Plan {
+    /// Range tests, then the default edge.
+    Chain(Vec<Test>),
+    /// Range tests for the hot target, then the original table.
+    Peel(Vec<Test>),
+}
+
+/// `run`, plus the `PLIRON_JT_SHAPE` policy when `shape` is set: tables
+/// with at most `MAX_CLUSTERS` clusters become range-test chains (not
+/// only ones with at most `MAX_ENTRIES` live entries); with a profile,
+/// chains test the hottest targets first, and a table whose profile
+/// says one target dominates (`PEEL_SHARE`) tests that target first and
+/// keeps the table for the rest.
+pub fn run_with(func: &mut Function, prof: Option<&FxHashMap<Block, u64>>, shape: bool) -> usize {
+    let prof = prof.filter(|p| shape && !p.is_empty());
     let mut todo = Vec::new();
+    let mut cfg_lazy: Option<ControlFlowGraph> = None;
     for b in func.layout.blocks() {
         let Some(term) = func.layout.last_inst(b) else {
             continue;
@@ -522,23 +595,54 @@ pub fn run(func: &mut Function) -> usize {
         };
         let jt = &func.dfg.jump_tables[table];
         let dflt = jt.default_block();
+        let entries: Vec<BlockCall> = jt.as_slice().to_vec();
         // Live entries: drop ones equal to the default — those indices
         // fold into the default edge.
-        let mut live = Vec::new();
-        for (i, &entry) in jt.as_slice().iter().enumerate() {
+        let mut live: Vec<Test> = Vec::new();
+        for (i, &entry) in entries.iter().enumerate() {
             if !same_target(func, entry, dflt) {
-                live.push((i as u64, dest(func, entry)));
+                live.push((i as u64, i as u64, dest(func, entry)));
             }
         }
-        if live.is_empty() {
-            // Every index lands on the default: plain jump.
-            todo.push((b, term, arg, live, dest(func, dflt)));
-            continue;
+        let mut plan = if live.len() <= MAX_ENTRIES {
+            Some(Plan::Chain(live))
+        } else if shape {
+            let cl = clusters(func, &entries, dflt);
+            (cl.len() <= MAX_CLUSTERS).then_some(Plan::Chain(cl))
+        } else {
+            None
+        };
+        if let Some(prof) = prof {
+            let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+            let count = |t: &Test| edge_count(prof, cfg, b, t.2.0);
+            match &mut plan {
+                // Hottest first (stable: unknown counts keep index order).
+                Some(Plan::Chain(tests)) => {
+                    tests.sort_by_key(|t| std::cmp::Reverse(count(t).unwrap_or(0)))
+                }
+                Some(Plan::Peel(_)) => unreachable!(),
+                None => {
+                    let total = prof.get(&b).copied().unwrap_or(0);
+                    let cl = clusters(func, &entries, dflt);
+                    let hot = cl
+                        .iter()
+                        .filter_map(|t| Some((t.2.0, count(t)?)))
+                        .max_by_key(|&(_, c)| c);
+                    if let Some((hot, c)) = hot {
+                        let tests: Vec<Test> = cl.into_iter().filter(|t| t.2.0 == hot).collect();
+                        if total >= PEEL_MIN_COUNT
+                            && c as f64 >= PEEL_SHARE * total as f64
+                            && tests.len() <= PEEL_MAX_CLUSTERS
+                        {
+                            plan = Some(Plan::Peel(tests));
+                        }
+                    }
+                }
+            }
         }
-        if live.len() > MAX_ENTRIES {
-            continue;
+        if let Some(plan) = plan {
+            todo.push((b, term, arg, table, plan, dest(func, dflt)));
         }
-        todo.push((b, term, arg, live, dest(func, dflt)));
     }
     // `param_dispatch` duplicates the dispatch block per edge; on
     // tokenize's `state = if ws {0} else {1}` shape it measured a
@@ -547,8 +651,8 @@ pub fn run(func: &mut Function) -> usize {
     // this corpus. Opt-in until the profitability guard is fixed.
     let pdispatch = crate::config::config().is("PLIRON_PDISPATCH", "1");
     let mut n = 0;
-    let mut cfg_lazy = None;
-    for (b, term, arg, live, (db, dargs)) in todo {
+    cfg_lazy = None;
+    for (b, term, arg, table, plan, (db, dargs)) in todo {
         let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
         if pdispatch && let Some(k) = param_dispatch(func, cfg, term) {
             n += k;
@@ -569,13 +673,18 @@ pub fn run(func: &mut Function) -> usize {
             cfg_lazy = None;
             continue;
         }
+        let (tests, keep_table) = match plan {
+            Plan::Chain(t) => (t, false),
+            Plan::Peel(t) => (t, true),
+        };
         let ty = func.dfg.value_type(arg);
         func.layout.remove_inst(term);
         let mut cur = b;
-        for (pos, (index, (eb, eargs))) in live.iter().enumerate() {
-            // Last live test's else edge is the default; earlier tests
-            // chain through a fresh compare block.
-            let next = if pos + 1 == live.len() {
+        for (pos, (lo, hi, (eb, eargs))) in tests.iter().enumerate() {
+            // The last test's else edge is the default (or, when peeling,
+            // a block holding the original table); earlier tests chain
+            // through a fresh compare block.
+            let next = if pos + 1 == tests.len() && !keep_table {
                 None
             } else {
                 let nb = func.dfg.make_block();
@@ -584,8 +693,20 @@ pub fn run(func: &mut Function) -> usize {
             };
             {
                 let mut pos_c = FuncCursor::new(func).at_bottom(cur);
-                let k = pos_c.ins().iconst(ty, *index as i64);
-                let c = pos_c.ins().icmp(IntCC::Equal, arg, k);
+                // `lo <= x <= hi` as one unsigned compare of `x - lo`.
+                let c = if lo == hi {
+                    let k = pos_c.ins().iconst(ty, *lo as i64);
+                    pos_c.ins().icmp(IntCC::Equal, arg, k)
+                } else {
+                    let t = if *lo == 0 {
+                        arg
+                    } else {
+                        let k = pos_c.ins().iconst(ty, *lo as i64);
+                        pos_c.ins().isub(arg, k)
+                    };
+                    let k = pos_c.ins().iconst(ty, (hi - lo) as i64);
+                    pos_c.ins().icmp(IntCC::UnsignedLessThanOrEqual, t, k)
+                };
                 match next {
                     Some(nb) => pos_c.ins().brif(c, *eb, eargs, nb, &[]),
                     None => pos_c.ins().brif(c, *eb, eargs, db, &dargs),
@@ -595,7 +716,10 @@ pub fn run(func: &mut Function) -> usize {
                 cur = nb;
             }
         }
-        if live.is_empty() {
+        if keep_table {
+            FuncCursor::new(func).at_bottom(cur).ins().br_table(arg, table);
+        } else if tests.is_empty() {
+            // Every index lands on the default: plain jump.
             let mut pos_c = FuncCursor::new(func).at_bottom(b);
             pos_c.ins().jump(db, &dargs);
         }

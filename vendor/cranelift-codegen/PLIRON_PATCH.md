@@ -785,3 +785,27 @@ the sum; plain `ushr` lowering zero-extends first. They now require
   slot: regex-syntax reloaded spilled 0/1/-1/element sizes 778 times (with
   `PLIRON_COLDCOPY=1`; 1,319 without).
   Call-free hot loops keep the old rules. docs/history/2026-10-27-spills.md.
+
+64. Deferred narrow jump tables (`PLIRON_JT_NARROW=1`, default off;
+    docs/history/2026-10-27-jump-tables.md). `src/machinst/buffer.rs`:
+    `MachDeferredJumpTable` records, `can_defer_jump_table`,
+    `defer_jump_table`, and `emit_deferred_jump_tables`, which `finish`
+    runs after the last island — every label is bound and nothing can move
+    — to write each table at the end of the function with 1-, 2- or 4-byte
+    unsigned entries `(target - lowest target) / unit`, the narrowest that
+    fits, then patch the dispatch's table address, base address and entry
+    load. Labels go through `resolve_label_offset`, so aliased (jump-only)
+    targets resolve to their final block. `src/machinst/vcode.rs`: per
+    block in emission order, a sound bound on everything still to come
+    (every inst and regalloc edit at worst-case size plus a veneer,
+    constant re-emission and island jump; epilogues; 4 bytes per CFG edge;
+    padding), so deferral happens only where both placeholders provably
+    stay in pc-relative range; otherwise the stock inline table is used.
+    `isa/aarch64/inst/emit.rs` (`JTSequence`): `adr; ldr{b,h,} [uxtw];
+    adr; add lsl #2; br`, one instruction more than the stock sequence,
+    table out of `__text`'s hot path. `isa/x64/inst/emit.rs`
+    (`JmpTableSeq`): `lea; movz{bl,wl}/movl (NOP-padded); lea; add; jmp`,
+    unit 1, the default as the last entry as before. `PLIRON_JT_WIDTH=2|4`
+    forces a minimum width (tests). Tests: `pliron-clif-opt/tests/jt_narrow*.rs`
+    (run the machine code; x86-64 under Rosetta with
+    `--target x86_64-apple-darwin`).

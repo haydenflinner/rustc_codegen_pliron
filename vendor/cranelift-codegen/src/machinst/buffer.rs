@@ -360,6 +360,12 @@ pub struct MachBuffer<I: VCodeInst> {
     /// containing a function body, this allows interpretation of
     /// runtime state given a view of an active stack frame.
     frame_layout: Option<MachBufferFrameLayout>,
+    /// PLIRON: jump tables to write at `finish` (see `MachDeferredJumpTable`).
+    deferred_jts: Vec<MachDeferredJumpTable<I>>,
+    /// PLIRON: upper bound on the bytes the rest of the function (code,
+    /// islands, deferred tables) can add after the current block starts;
+    /// `None` when jump-table deferral is off. Set by `VCode::emit`.
+    jt_tail_bound: Option<u64>,
 }
 
 impl MachBufferFinalized<Stencil> {
@@ -530,6 +536,103 @@ impl<I: VCodeInst> MachBuffer<I> {
             used_constants: Default::default(),
             open_patchable: false,
             frame_layout: None,
+            deferred_jts: Vec::new(),
+            jt_tail_bound: None,
+        }
+    }
+
+    /// PLIRON: set the bound on what the rest of the function can still emit
+    /// (see `jt_tail_bound`); `None` turns jump-table deferral off.
+    pub fn set_jt_tail_bound(&mut self, bound: Option<u64>) {
+        self.jt_tail_bound = bound;
+    }
+
+    /// PLIRON: may the ISA emit a deferred jump table here, whose two
+    /// address placeholders use `kind`? True when every target and the
+    /// table (written after everything else) are provably in `kind`'s range
+    /// from anywhere in the function emitted so far or still to come.
+    pub fn can_defer_jump_table(&self, kind: I::LabelUse) -> bool {
+        let Some(tail) = self.jt_tail_bound else {
+            return false;
+        };
+        let reach = u64::from(kind.max_pos_range().min(kind.max_neg_range()));
+        u64::from(self.cur_offset()) + tail < reach
+    }
+
+    /// PLIRON: the bytes emitted so far (scratch-buffer encodings).
+    pub fn emitted_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// PLIRON: record a deferred jump table (see `MachDeferredJumpTable`).
+    pub fn defer_jump_table(&mut self, jt: MachDeferredJumpTable<I>) {
+        debug_assert!(jt.load_enc.iter().all(|e| e.len() == jt.load_enc[0].len()));
+        self.deferred_jts.push(jt);
+    }
+
+    /// PLIRON: write the deferred jump tables at the end of the buffer and
+    /// patch their dispatch sequences. Runs after the last island: every
+    /// label is bound and no branch can be chomped or moved any more.
+    fn emit_deferred_jump_tables(&mut self) {
+        static FORCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        // `PLIRON_JT_WIDTH=2|4`: minimum entry width (tests drive every encoding).
+        let min_w = *FORCE.get_or_init(|| {
+            std::env::var("PLIRON_JT_WIDTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
+        for jt in mem::take(&mut self.deferred_jts) {
+            let offs: SmallVec<[CodeOffset; 16]> = jt
+                .targets
+                .iter()
+                .map(|&l| {
+                    let o = self.resolve_label_offset(l);
+                    assert_ne!(o, UNKNOWN_LABEL_OFFSET, "jump-table target never bound");
+                    o
+                })
+                .collect();
+            let base = offs.iter().copied().min().unwrap_or(0);
+            let max_unit = offs
+                .iter()
+                .map(|&o| {
+                    assert_eq!((o - base) % jt.scale, 0, "misaligned jump-table target");
+                    (o - base) / jt.scale
+                })
+                .max()
+                .unwrap_or(0);
+            let (w, wi) = if max_unit <= 0xff && min_w <= 1 {
+                (1u32, 0)
+            } else if max_unit <= 0xffff && min_w <= 2 {
+                (2, 1)
+            } else {
+                (4, 2)
+            };
+            self.align_to(w);
+            let tab = self.cur_offset();
+            for &o in &offs {
+                let u = (o - base) / jt.scale;
+                match w {
+                    1 => self.put1(u as u8),
+                    2 => self.put2(u as u16),
+                    _ => self.put4(u),
+                }
+            }
+            let enc = &jt.load_enc[wi];
+            self.data[jt.load_off as usize..][..enc.len()].copy_from_slice(enc);
+            for (off, kind, target) in [
+                (jt.table_use.0, jt.table_use.1, tab),
+                (jt.base_use.0, jt.base_use.1, base),
+            ] {
+                let ok = if target >= off {
+                    target - off <= kind.max_pos_range()
+                } else {
+                    off - target <= kind.max_neg_range()
+                };
+                assert!(ok, "deferred jump table out of {kind:?} range");
+                let end = (off + kind.patch_size()) as usize;
+                kind.patch(&mut self.data[off as usize..end], off, target);
+            }
         }
     }
 
@@ -1632,6 +1735,8 @@ impl<I: VCodeInst> MachBuffer<I> {
         let _tt = timing::vcode_emit_finish();
 
         self.finish_emission_maybe_forcing_veneers(ForceVeneers::No, ctrl_plane);
+        // PLIRON: after the last island (nothing left to place or move).
+        self.emit_deferred_jump_tables();
 
         let alignment = self.finish_constants(constants);
 
@@ -2087,6 +2192,31 @@ struct MachLabelTrap {
     code: TrapCode,
     /// An optional source location to assign for this trap.
     loc: Option<RelSourceLoc>,
+}
+
+/// PLIRON: a jump table whose entries are written after all code and islands
+/// (`PLIRON_JT_NARROW=1`), when every target's final offset is known, so each
+/// table gets the narrowest entry width its target span allows.
+///
+/// The dispatch sequence (emitted by the ISA) has three placeholders the
+/// buffer patches at `finish`: the table-address instruction (`table_use`,
+/// patched as a label use to the table's start), the entry load (`load_off`,
+/// overwritten with `load_enc[w]` for width 1/2/4), and the base-address
+/// instruction (`base_use`, patched to the lowest target). Entry `i` holds
+/// `(target_i - base) / scale`, unsigned.
+pub struct MachDeferredJumpTable<I: VCodeInst> {
+    /// Target labels, in index order.
+    pub targets: SmallVec<[MachLabel; 16]>,
+    /// Offset and kind of the label use that materializes the table address.
+    pub table_use: (CodeOffset, I::LabelUse),
+    /// Offset and kind of the label use that materializes the base address.
+    pub base_use: (CodeOffset, I::LabelUse),
+    /// Offset of the entry load.
+    pub load_off: CodeOffset,
+    /// The entry-load encodings for 1-, 2- and 4-byte entries; all the same length.
+    pub load_enc: [SmallVec<[u8; 8]>; 3],
+    /// The unit entries count in (instruction alignment).
+    pub scale: CodeOffset,
 }
 
 /// A fixup to perform on the buffer once code is emitted. Fixups always refer

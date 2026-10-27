@@ -1277,6 +1277,7 @@ dependencies = [
  "cranelift-interpreter",
  "cranelift-module",
  "cranelift-reader",
+ "libc",
  "pliron",
  "pliron-cfg",
  "postcard",

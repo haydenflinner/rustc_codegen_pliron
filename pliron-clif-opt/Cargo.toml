@@ -24,3 +24,4 @@ sha2 = "0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cranelift-reader = "=0.135.5"
 cranelift-frontend = "=0.135.5"
+libc = "0.2"
