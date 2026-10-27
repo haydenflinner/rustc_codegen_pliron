@@ -1780,9 +1780,9 @@ pub fn run_with(
     // `PLIRON_SM_MARKFLOW=1` (with MARK): only end markers count, as kills
     // — (slot, block, position, exact anchor) — and a forward dataflow
     // from every use decides where an escaped slot is live (`mark_flow`).
-    let markflow = crate::env_set("PLIRON_SLOTMERGE_MARK") && pliron_cfg::env_is("PLIRON_SM_MARKFLOW", "1");
+    let markflow = crate::env_is("PLIRON_SLOTMERGE_MARK", "1") && pliron_cfg::env_is("PLIRON_SM_MARKFLOW", "1");
     let mut kills: Vec<(StackSlot, Block, u32, bool)> = Vec::new();
-    if crate::env_set("PLIRON_SLOTMERGE_MARK") {
+    if crate::env_is("PLIRON_SLOTMERGE_MARK", "1") {
         let (mut single, mut multi, mut none, mut lost) = (0u32, 0u32, 0u32, 0u32);
         let mut lost_start = 0u32;
         marker_pos.reserve(lifetimes.len());

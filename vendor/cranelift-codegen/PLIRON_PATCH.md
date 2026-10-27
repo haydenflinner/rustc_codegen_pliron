@@ -733,6 +733,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
   (stack slots, spill slots, clobber saves, outgoing args) of the last
   function the thread compiled, for `PLIRON_FRAME_INFO`. Debug aid only.
 - `src/opts/remat.isle` (+ `pliron_remat_saddr` in `prelude_opt.isle` and
-  `opts.rs`): `PLIRON_REMAT_SADDR=1` rematerializes `stack_addr` per use
+  `opts.rs`): rematerializes `stack_addr` per use (default on since
+  2026-10-27; `PLIRON_REMAT_SADDR=0` turns it off)
   block, as LLVM's RA does for frame indices, instead of keeping one
   GVN'd frame address live across calls.

@@ -253,7 +253,7 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
 
     fn pliron_remat_saddr(&mut self) -> Option<()> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| std::env::var("PLIRON_REMAT_SADDR").as_deref() == Ok("1"))
+        ON.get_or_init(|| std::env::var("PLIRON_REMAT_SADDR").as_deref() != Ok("0"))
             .then_some(())
     }
 

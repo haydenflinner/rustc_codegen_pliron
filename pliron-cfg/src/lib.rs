@@ -16,6 +16,41 @@ pub struct PassConfig {
     pub pipeline: Option<Vec<String>>,
 }
 
+/// Opt-in flags that are on by default: an unset variable reads as `1`.
+/// `PLIRON_X=0` (any value but `1`) turns one off. Applied once, when the
+/// config is parsed, so every `env_is(X, "1")` read site sees the same
+/// value: the table is the single source of the default, and the kill
+/// switch reaches every site by construction. Read with `env_is`/`get`,
+/// never `env_set` (presence would count `=0` as on). The vendored
+/// Cranelift reads `PLIRON_REMAT_SADDR` itself and defaults it the same
+/// way. Validation: docs/history/2026-10-27-defaults.md.
+pub const DEFAULT_ON: &[&str] = &[
+    // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
+    // 2026-10-26-slot-interference.md).
+    "PLIRON_SLOTMERGE_MARK",
+    "PLIRON_SM_MARKFLOW",
+    "PLIRON_SM_COALESCE",
+    "PLIRON_SM_PRECISE",
+    "PLIRON_SM_DROPNC",
+    "PLIRON_SM_BYSIZE",
+    "PLIRON_SM_FLOWIV",
+    "PLIRON_SM_AFTERKILL",
+    "PLIRON_SM_STARTS",
+    "PLIRON_SM_STARTONLY",
+    "PLIRON_SM_ESCFLOW",
+    "PLIRON_SM_COALCALL",
+    "PLIRON_NOCAP_FIELDS",
+    "PLIRON_NOCAP_CALLEE",
+    // Inliner (2026-10-26-inline-recursion.md).
+    "PLIRON_INLINE_RESUME_DOM",
+    "PLIRON_INLINE_RESUME_HOIST",
+    "PLIRON_INLINE_ONCE1",
+    "PLIRON_INLINE_RECSTACK",
+    "PLIRON_INLINE_SCCLIMIT",
+    // Memory (2026-10-26-memory.md).
+    "PLIRON_DEADFREE",
+];
+
 pub fn config() -> &'static PassConfig {
     static CONFIG: LazyLock<PassConfig> = LazyLock::new(PassConfig::parse);
     &CONFIG
@@ -30,6 +65,9 @@ impl PassConfig {
             {
                 values.insert(k.to_string(), v.to_string_lossy().into_owned());
             }
+        }
+        for k in DEFAULT_ON {
+            values.entry(k.to_string()).or_insert_with(|| "1".to_string());
         }
         let pipeline = values.get("PLIRON_PIPELINE").map(|s| {
             s.split(',')

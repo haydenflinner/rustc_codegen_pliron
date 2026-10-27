@@ -1382,7 +1382,7 @@ fn lt_probe(p: &Pipe, step: &str) {
 /// on the normal path — a checked run must see the pipeline actually
 /// execute.
 fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
-    if env_set("PLIRON_SLOTMERGE_MARK") && env_is("PLIRON_SM_MARKFLOW", "1") && !env_is("PLIRON_SM_EDGEKILL", "0") {
+    if env_is("PLIRON_SLOTMERGE_MARK", "1") && env_is("PLIRON_SM_MARKFLOW", "1") && !env_is("PLIRON_SM_EDGEKILL", "0") {
         p.edge_kills = slotmerge::entry_kills(&p.clctx.func, p.lifetimes);
         // Every slot dies as `_Unwind_Resume` takes the unwind out of this
         // frame: MIR emits no StorageDead on cleanup paths, so without this

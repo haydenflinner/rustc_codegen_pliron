@@ -42,7 +42,7 @@
 (decl pure resolve_jump_table_entry (JumpTable u64) BlockCall)
 (extern constructor resolve_jump_table_entry resolve_jump_table_entry)
 
-;; PLIRON: `PLIRON_REMAT_SADDR=1` gates rematerializing `stack_addr`.
+;; PLIRON: `PLIRON_REMAT_SADDR=0` turns off rematerializing `stack_addr` (default on).
 (decl pure partial pliron_remat_saddr () Unit)
 (extern constructor pliron_remat_saddr pliron_remat_saddr)
 
