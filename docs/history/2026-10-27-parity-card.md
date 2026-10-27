@@ -64,8 +64,10 @@ Per input (time / peak RSS / machine code):
 
 ## Open, in priority order
 
-1. **Seed 13475**: a slot-merging miscompile in the *defaults* at `-O0`
-   (2026-10-27-batch.md). Kill switch: `PLIRON_SLOTMERGE=0`.
+1. ~~Seed 13475~~: a slot-merging miscompile in the defaults at `-O0`.
+   **Fixed in f68d323** (starts-mode coalescing ignored earlier copy
+   windows; 2026-10-27-batch.md). The seed is in the gate's `FUZZ_REGRESS`.
+   Rerun crates and stage-2 UI on the fix.
 2. Wasm code size (above).
 3. Flip what's ready after the missing checks:
    - EDGEDEDUP, JT_SHAPE, CMP3: a quiet bench A/B.
