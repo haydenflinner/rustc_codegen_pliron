@@ -721,6 +721,14 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     all precede it in layout starts with the locations they agree on.
     LLVM's LiveDebugValues, roughly: a dead value's register still holds
     it. Debug info only. `PLIRON_DBGEXT=0` restores upstream ranges.
+61. Cold-arg rebind copy (`src/isa/aarch64/lower.isle`
+    `iadd_coldcopy_*`, `umulhi_zero`, `src/isa/aarch64/inst/emit.rs`):
+    `iadd x, (umulhi 0, 1)` lowers to a 64-bit `Inst::Mov` into a fresh
+    vreg, a bare `umulhi 0, 1` to `mov #0`, and emitting a 64-bit `Mov`
+    with `rd == rm` writes no bytes. pliron's
+    `coldargs` emits that form under `PLIRON_COLDCOPY=1`, replacing the
+    `umulh` + `add` per cold call arg with a `mov` that regalloc often
+    makes a self-move.
 
 Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
 a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's

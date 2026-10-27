@@ -1430,7 +1430,12 @@ impl MachInstEmit for Inst {
                         // should never MOV to XZR.
                         assert!(rd.to_reg() != stack_reg());
 
-                        if rm == stack_reg() {
+                        if rd.to_reg() == rm {
+                            // PLIRON: a 64-bit self-move is a no-op. ISLE's
+                            // `pliron_copy64` (coldargs' rebind copy) leaves
+                            // one whenever regalloc puts both sides in the
+                            // same register.
+                        } else if rm == stack_reg() {
                             // We can't use ORR here, so use an `add rd, sp, #0` instead.
                             let imm12 = Imm12::maybe_from_u64(0).unwrap();
                             sink.put4(enc_arith_rr_imm12(

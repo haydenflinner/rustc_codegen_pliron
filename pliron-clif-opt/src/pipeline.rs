@@ -2635,7 +2635,7 @@ fn s_coldarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = if p.wasm {
         0
     } else {
-        clifpeep::coldargs(&mut p.clctx.func)
+        clifpeep::coldargs(&mut p.clctx.func, pliron_cfg::env_is("PLIRON_COLDCOPY", "1"))
     };
     if k > 0 && p.dump {
         p.dump("coldargs");

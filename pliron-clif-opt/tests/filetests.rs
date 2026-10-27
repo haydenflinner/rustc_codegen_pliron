@@ -32,7 +32,8 @@ fn pass(name: &str) -> Pass {
         "bittab" => pliron_clif_opt::bittab::run,
         "brif_fold" => clifpeep::brif_fold,
         "celim" => celim::run,
-        "coldargs" => clifpeep::coldargs,
+        "coldargs" => |f| clifpeep::coldargs(f, false),
+        "coldargs_copy" => |f| clifpeep::coldargs(f, true),
         "coldedges" => clifpeep::coldedges,
         "coldrets" => |f| {
             let cfg = ControlFlowGraph::with_function(f);

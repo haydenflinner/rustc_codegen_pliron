@@ -8,7 +8,7 @@
 # Links with the pure-Rust `wild` linker when it is on PATH (cargo install wild-linker).
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
-#   punroll icmpfold coldargs bcheck unswitch slotmerge bittab polsw tailrec
+#   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
@@ -149,6 +149,17 @@ t_coldargs() {
   # coldargs' i128 arg rebind must build the zero via iconcat — iconst has
   # no i128 form (verifier unreachable; jiff overflow_add_duration hit it).
   rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldargs/main.rs -o $out/coldargs$exe && $out/coldargs$exe
+}
+
+t_coldcopy() {
+  # PLIRON_COLDCOPY=1: coldargs' rebinds lower to register copies (aarch64
+  # `iadd x, (umulhi 0, 1)` -> mov). Cold calls with every int width,
+  # boundary constants, zeros, pointers and stack args: output matches
+  # stock rustc's.
+  rustc --edition 2021 -O tests/coldcopy/main.rs -o $out/coldcopy-stock$exe || return 1
+  PLIRON_COLDCOPY=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldcopy/main.rs -o $out/coldcopy$exe || return 1
+  [[ -n "$exe" ]] && return 0
+  diff <($out/coldcopy-stock$exe) <($out/coldcopy$exe)
 }
 
 t_bcheck() {
@@ -788,6 +799,7 @@ want punroll && t_punroll
 want icmpfold && t_icmpfold
 want rangefold && t_rangefold
 want coldargs && t_coldargs
+want coldcopy && t_coldcopy
 want bcheck && t_bcheck
 want unswitch && t_unswitch
 want slotmerge && t_slotmerge

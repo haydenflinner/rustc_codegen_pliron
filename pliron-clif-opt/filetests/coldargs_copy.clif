@@ -1,0 +1,25 @@
+; test coldargs_copy
+; PLIRON_COLDCOPY=1: each hot int arg of a cold call is rebound as
+; `iadd x, (umulhi 0, 1)` (the aarch64 backend lowers that to a copy). The
+; default `umulhi x, 0` form must not appear; the cold-block constant is
+; not rebound.
+; check: = iconst.i64 1
+; check: = umulhi v
+; check-not: umulhi v3,
+; check-not: umulhi v2,
+; check: , v5)
+function %f(i64, i32) -> i64 {
+    sig0 = (i64, i32, i64)
+    fn0 = %sink sig0
+block0(v1: i64, v2: i32):
+    v3 = iadd v1, v1
+    brif v1, block1, block2
+
+block2:
+    return v3
+
+block1 cold:
+    v5 = iconst.i64 9
+    call fn0(v3, v2, v5)
+    return v1
+}

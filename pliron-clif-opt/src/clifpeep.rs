@@ -2933,7 +2933,16 @@ pub fn coldedges(func: &mut Function) -> usize {
 /// every arg rebinds as `iadd x, z`, a single flagless `add` where the
 /// old `sadd_overflow` scheme paid `adds` + a dead flag materialization
 /// (`cset`/`seto`) per arg.
-pub fn coldargs(func: &mut Function) -> usize {
+///
+/// `copy` (`PLIRON_COLDCOPY=1`) builds the zero as `umulhi 0, 1` instead.
+/// The aarch64 backend lowers `iadd x, (umulhi 0, 1)` to a plain
+/// register copy into a fresh vreg (`mov`, dropped at emission when
+/// regalloc gives both sides the same register), so neither the `umulh`
+/// nor the `add` reaches the object: on regex-syntax these were 1,394 of
+/// pliron's 1,427 `umulh`s. Other ISAs lower it like the `umulhi a, 0`
+/// form, at the same cost. The `1` (rather than a second `0`) keeps the
+/// pattern distinct from the default form when `a` is itself a zero.
+pub fn coldargs(func: &mut Function, copy: bool) -> usize {
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         if !func.layout.is_cold(b) {
@@ -2980,7 +2989,12 @@ pub fn coldargs(func: &mut Function) -> usize {
                             Some(&z) => z,
                             None => {
                                 let c0 = pos.ins().iconst(ty, 0);
-                                let z = pos.ins().umulhi(a, c0);
+                                let z = if copy {
+                                    let c1 = pos.ins().iconst(ty, 1);
+                                    pos.ins().umulhi(c0, c1)
+                                } else {
+                                    pos.ins().umulhi(a, c0)
+                                };
                                 zeros.insert(ty, z);
                                 z
                             }

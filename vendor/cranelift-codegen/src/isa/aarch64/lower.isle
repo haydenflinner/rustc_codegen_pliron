@@ -3760,6 +3760,33 @@
       (side_effect
        (a64_sequence_point)))
 
+;; PLIRON: `iadd x, (umulhi 0, 1)` is `x`. pliron's `coldargs`
+;; (`PLIRON_COLDCOPY=1`) uses it to rebind a cold call's argument to a new
+;; value that the egraph can't fold back into `x`. Lower it to a 64-bit `mov`
+;; into a fresh vreg. That is a real copy, so the call's fixed-register use
+;; stays at the cold site and does not pin `x`'s live range. The `umulhi` and
+;; its zeros then have no lowered uses and emit nothing. `emit` drops the
+;; `mov` when regalloc gives both sides the same register. A 64-bit copy is
+;; correct for every int type up to 64 bits: high bits above the type's width
+;; are undefined either way.
+(decl pliron_copy64 (Reg) Reg)
+(rule (pliron_copy64 x)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.Mov (OperandSize.Size64) dst x))))
+        dst))
+(rule iadd_coldcopy_right 30 (lower (iadd (ty_int_ref_scalar_64_extract _) x
+                                     (umulhi _ (u64_from_iconst 0) (u64_from_iconst 1))))
+      (pliron_copy64 x))
+(rule iadd_coldcopy_left 29 (lower (iadd (ty_int_ref_scalar_64_extract _)
+                                    (umulhi _ (u64_from_iconst 0) (u64_from_iconst 1)) x))
+      (pliron_copy64 x))
+;; PLIRON: ...and where a later CLIF pass folded the rebind away (an arg
+;; that was itself a zero: `iadd 0, z` -> `z`), the leftover `umulhi 0, 1` is
+;; a `mov #0`, not a `umulh` of two materialized constants. The `1` keeps both
+;; rules off the `umulhi x, 0` form that `coldargs` emits without the flag.
+(rule umulhi_zero 3 (lower (umulhi (fits_in_64 ty) (u64_from_iconst 0) (u64_from_iconst 1)))
+      (imm ty (ImmExtend.Zero) 0))
+
 ;; PLIRON: `black_box` is a pure optimization barrier — alias the result vreg
 ;; to the input's and emit no machine code (like a same-class `bitcast`).
 (rule (lower (black_box _ x))
