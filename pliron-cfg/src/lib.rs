@@ -5,6 +5,8 @@
 //! Semantics match the old inline reads exactly: gate vars default on
 //! unless `=0`, debug flags are presence-checked, opt-ins compare `=1`.
 
+pub mod jearena;
+
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -764,7 +764,7 @@ fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
         sess: cx.tcx.sess,
         prof: Arc::new(RustcProf(cx.tcx.sess.prof.clone())),
     };
-    let fin = cgupool::finish_b(ctx, st, cx.module, name, &cfg, &host, ir, iropt);
+    let fin = cgupool::finish_b(lower::CtxSlot::Ref(ctx), st, cx.module, name, &cfg, &host, ir, iropt);
     PlironModule {
         obj: fin.obj,
         ir: fin.ir,

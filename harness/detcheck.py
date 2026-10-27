@@ -2,7 +2,7 @@
 """Output invariance across execution strategies (docs/determinism.md).
 
   harness/detcheck.py [--inputs regex-syntax,syn,smoke] [--config NAME=ENV ...]
-                      [--variants again,par1,inflight1,serial] [--cgus 16]
+                      [--variants again,par1,inflight1,serial,memfree,acap2] [--cgus 16]
                       [--self-test]
 
 For each input and each configuration (a set of PLIRON_* flags), build the
@@ -14,6 +14,9 @@ byte-identical objects. Variants:
   par1       PLIRON_PAR=1: serial per-function CLIF lowering inside a CGU
   inflight1  PLIRON_CGU_INFLIGHT=1: one CGU in the pool at a time
   serial     PLIRON_CGUPAR=0: no CGU pool at all (rustc's own serial order)
+  memfree    PLIRON_LOWERFREE=1 PLIRON_JEARENA=1: free each CGU's IR after
+             lowering, purge freed pages at once (memory knobs only)
+  acap2      PLIRON_CGU_ACAP=2: at most two CGUs past the start of stage A
 
 A mismatch names the differing objects and, per object, the functions whose
 disassembly differs. A known exception is reported as `expected`, not a
@@ -36,6 +39,9 @@ VARIANTS = {
     "par1": {"PLIRON_PAR": "1"},
     "inflight1": {"PLIRON_CGU_INFLIGHT": "1"},
     "serial": {"PLIRON_CGUPAR": "0"},
+    # Memory knobs (R3): they only free earlier or purge, never change bytes.
+    "memfree": {"PLIRON_LOWERFREE": "1", "PLIRON_JEARENA": "1"},
+    "acap2": {"PLIRON_CGU_ACAP": "2"},
 }
 
 

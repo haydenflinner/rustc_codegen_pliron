@@ -99,7 +99,7 @@ fn main() {
     iropt::sroa::run(&mut ctx, &mut st);
     iropt::constload::run(&mut ctx, &mut st);
 
-    let object = lower::lower_to_object(false, false, &ctx, &st, isa, &name, &lower::NoHost);
+    let object = lower::lower_to_object(false, false, lower::CtxSlot::Ref(&ctx), &st, isa, &name, &lower::NoHost);
     std::fs::write(&output, object).expect("write output");
     eprintln!("wrote {output}");
 }

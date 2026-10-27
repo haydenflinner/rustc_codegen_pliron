@@ -322,10 +322,47 @@ fn uen_syms_of(m: &dyn Module, func: &ir::Function) -> FxHashMap<u32, String> {
         .collect()
 }
 
+/// The pliron `Context` handed to [`lower_to_object`]: borrowed, or owned
+/// through a slot so `PLIRON_LOWERFREE` can drop it once phase (A) has
+/// lowered every function (see [`lowerfree`]).
+pub enum CtxSlot<'c> {
+    Ref(&'c Context),
+    Own(&'c mut Option<Context>),
+}
+
+impl CtxSlot<'_> {
+    pub fn get(&self) -> &Context {
+        match self {
+            CtxSlot::Ref(c) => c,
+            CtxSlot::Own(o) => o.as_ref().expect("pliron Context used after LOWERFREE released it"),
+        }
+    }
+
+    /// Drop an owned `Context` (a borrowed one stays with its owner).
+    fn release(&mut self) {
+        if let CtxSlot::Own(o) = self {
+            **o = None;
+        }
+    }
+}
+
+/// `PLIRON_LOWERFREE=1`: a CGU's lowering keeps only what phase (B)/(C)
+/// read. The pliron `Context` is dropped as soon as phase (A) has lowered
+/// every function (data initializers are serialized first), instead of
+/// staying resident until the object is written while the shared fn pool
+/// drains; and a compiled `FnJob` sheds its CLIF body and lowering facts,
+/// keeping only the code, the external-name table its relocations
+/// resolve through, and its stats. Native objects without `-g` only (the
+/// DWARF writer reads both afterwards). Only frees: the object bytes are
+/// unchanged (docs/determinism.md R3).
+fn lowerfree() -> bool {
+    crate::env_is("PLIRON_LOWERFREE", "1")
+}
+
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
-    ctx: &Context,
+    ctx: CtxSlot<'_>,
     st: &State,
     isa: Arc<dyn TargetIsa>,
     name: &str,
@@ -338,7 +375,8 @@ pub fn lower_to_object(
     b.per_function_section(!macho);
     b.per_data_object_section(!macho);
     let mut m = ObjectModule::new(b);
-    let lw = lower_module(&mut m, unwind, hot, ctx, st, &isa, name, host);
+    let mut ctx = ctx;
+    let lw = lower_module(&mut m, unwind, hot, &mut ctx, st, &isa, name, host);
     let mut product = m.finish();
     let asm = lw.pending_asm(st, macho);
     let Lowered {
@@ -396,7 +434,7 @@ pub fn lower_to_object(
             target_lexicon::Architecture::X86_64 => 6,
             _ => 29,
         };
-        let consts = dbg_const_pieces(ctx, st);
+        let consts = dbg_const_pieces(ctx.get(), st);
         // Statics: their data symbols, when this object defines them.
         let gsyms: Vec<Option<object::write::SymbolId>> = d
             .globals
@@ -504,6 +542,33 @@ struct FnJob {
 }
 
 impl FnJob {
+    /// After a successful native compile: drop the CLIF body (phase (C)
+    /// reads only `func.params`, the external-name table relocations
+    /// resolve through) and every lowering-fact table (pipeline inputs).
+    fn shed(&mut self, params: ir::function::FunctionParameters) {
+        self.func = ir::Function::new();
+        self.func.params = params;
+        self.dbg_slots = Default::default();
+        self.nonnull = Default::default();
+        self.derived = Default::default();
+        self.frozen = Default::default();
+        self.noalias = Default::default();
+        self.scoped_na = Default::default();
+        self.deref = Default::default();
+        self.nowrite = Default::default();
+        self.call_frozen = Default::default();
+        self.nounwind = Default::default();
+        self.scoped = Default::default();
+        self.invariant = Default::default();
+        self.operand_frozen = Default::default();
+        self.fact_bits = Default::default();
+        self.block_region = Default::default();
+        self.prof = Default::default();
+        self.lifetimes = Default::default();
+        self.nocap = Default::default();
+        self.uen_syms = Default::default();
+    }
+
     /// A job carrying a prebuilt body and no lowering facts.
     fn stub(name: String, id: FuncId, func: ir::Function, sh: Arc<JobShared>) -> Self {
         FnJob {
@@ -579,6 +644,9 @@ struct JobShared {
     /// wasm (`lower_clif_wasm`): pipeline only — the optimized CLIF goes
     /// back in `FnJob::func` for the waffle emitter, no Cranelift compile.
     wasm: bool,
+    /// `PLIRON_LOWERFREE` (native, no `-g`): a compiled job keeps only
+    /// what phase (C) reads (see [`FnJob::shed`]).
+    shed: bool,
 }
 
 /// One queued function job: the declaration index (phase (C) re-orders
@@ -636,6 +704,7 @@ fn fn_pool_pop(p: &FPool) -> Option<GMsg> {
 }
 
 fn fn_worker(p: &'static FPool) {
+    pliron_cfg::jearena::bind_thread();
     let mut wcl = cranelift_codegen::Context::new();
     loop {
         let GMsg { i, mut j, done } = {
@@ -936,8 +1005,12 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
             std::panic::resume_unwind(e);
         }
     }
-    j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
     j.code = clctx.take_compiled_code();
+    if sh.shed && j.code.is_some() {
+        j.shed(std::mem::replace(&mut clctx.func.params, ir::function::FunctionParameters::new()));
+    } else {
+        j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
+    }
     // `optimize` leaves cfg/domtree/loop_analysis valid for this
     // func — drop them like `clear_context` did so the next job's
     // compile doesn't verify against a stale cfg.
@@ -954,28 +1027,38 @@ fn run_jobs(
     produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJob)),
     produced: &mut dyn FnMut(),
 ) -> Vec<FnJob> {
-    let mut jobs: Vec<FnJob> = Vec::new();
+    let p = start_jobs(nthreads, produce);
+    produced();
+    finish_jobs(p, name)
+}
+
+/// Phase (B) jobs produced but not yet run (serial) or not yet collected
+/// (pool): [`start_jobs`] ends phase (A), [`finish_jobs`] drains.
+enum Pending {
+    Serial(Vec<FnJob>),
+    Pool {
+        drx: std::sync::mpsc::Receiver<(usize, std::thread::Result<FnJob>)>,
+        sent: usize,
+    },
+}
+
+/// Phase (A): run `produce`, queueing each job (pool) or collecting it in
+/// declaration order (serial).
+fn start_jobs(nthreads: usize, produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJob))) -> Pending {
     if nthreads <= 1 {
         let mut ij: Vec<(usize, FnJob)> = Vec::new();
         produce(&mut |i, j| ij.push((i, j)));
         // Deferred copies produce after the rest: restore declaration order.
         ij.sort_by_key(|&(i, _)| i);
-        jobs.extend(ij.into_iter().map(|(_, j)| j));
-        produced();
-        let tpb = std::time::Instant::now();
-        let mut wcl = cranelift_codegen::Context::new();
-        for j in &mut jobs {
-            let sh = j.sh.clone();
-            run_job(j, &mut wcl, &sh);
-        }
-        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
+        Pending::Serial(ij.into_iter().map(|(_, j)| j).collect())
     } else {
         // Jobs stream into the process-wide pool as `produce` lowers —
         // phase (B) work from *all* live CGUs shares one worker set, so
         // this CGU's drain tail overlaps the next CGU's serial produce
         // (and vice versa). Results come back indexed so phase (C) sees
         // declaration order; a worker panic travels back as `Err` and is
-        // resumed here.
+        // resumed in `finish_jobs`.
+        pliron_cfg::jearena::bind_thread();
         let (dtx, drx) =
             std::sync::mpsc::channel::<(usize, std::thread::Result<FnJob>)>();
         let pool = fn_pool();
@@ -992,56 +1075,74 @@ fn run_jobs(
             );
         });
         drop(dtx);
-        produced();
-        let tpb = std::time::Instant::now();
-        let mut done = std::collections::BTreeMap::new();
-        let mut wcl = cranelift_codegen::Context::new();
-        let mut got = 0usize;
-        while got < sent {
-            // Take a finished result if one's waiting…
-            match drx.try_recv() {
-                Ok((i, Ok(j))) => {
-                    done.insert(i, j);
-                    got += 1;
-                    continue;
-                }
-                Ok((_, Err(p))) => std::panic::resume_unwind(p),
-                Err(_) => {}
+        Pending::Pool { drx, sent }
+    }
+}
+
+/// Phase (B)'s rest: run (serial) or collect (pool) every job; returns them
+/// in declaration order.
+fn finish_jobs(p: Pending, name: &str) -> Vec<FnJob> {
+    let tpb = std::time::Instant::now();
+    let jobs = match p {
+        Pending::Serial(mut jobs) => {
+            let mut wcl = cranelift_codegen::Context::new();
+            for j in &mut jobs {
+                let sh = j.sh.clone();
+                run_job(j, &mut wcl, &sh);
             }
-            // …otherwise run a queued job — any CGU's — rather than
-            // parking this core while the pool drains (the same
-            // work-while-you-wait as cgupool's `run_until`).
-            match fn_pool_pop(pool) {
-                Some(GMsg { i, mut j, done: d }) => {
-                    let sh = j.sh.clone();
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_job(&mut j, &mut wcl, &sh);
-                        j
-                    }));
-                    let _ = d.send((i, r));
-                }
-                None => {
-                    // Queue and channel both empty — a queued job can
-                    // still land (producers stream), and another CGU's
-                    // cgupool work may be runnable. Steal one before
-                    // parking on our own results.
-                    if cgu_steal() {
+            jobs
+        }
+        Pending::Pool { drx, sent } => {
+            let pool = fn_pool();
+            let mut done = std::collections::BTreeMap::new();
+            let mut wcl = cranelift_codegen::Context::new();
+            let mut got = 0usize;
+            while got < sent {
+                // Take a finished result if one's waiting…
+                match drx.try_recv() {
+                    Ok((i, Ok(j))) => {
+                        done.insert(i, j);
+                        got += 1;
                         continue;
                     }
-                    match drx.recv() {
-                        Ok((i, Ok(j))) => {
-                            done.insert(i, j);
-                            got += 1;
+                    Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                    Err(_) => {}
+                }
+                // …otherwise run a queued job — any CGU's — rather than
+                // parking this core while the pool drains (the same
+                // work-while-you-wait as cgupool's `run_until`).
+                match fn_pool_pop(pool) {
+                    Some(GMsg { i, mut j, done: d }) => {
+                        let sh = j.sh.clone();
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_job(&mut j, &mut wcl, &sh);
+                            j
+                        }));
+                        let _ = d.send((i, r));
+                    }
+                    None => {
+                        // Queue and channel both empty — a queued job can
+                        // still land (producers stream), and another CGU's
+                        // cgupool work may be runnable. Steal one before
+                        // parking on our own results.
+                        if cgu_steal() {
+                            continue;
                         }
-                        Ok((_, Err(p))) => std::panic::resume_unwind(p),
-                        Err(e) => panic!("fn pool disconnected: {e}"),
+                        match drx.recv() {
+                            Ok((i, Ok(j))) => {
+                                done.insert(i, j);
+                                got += 1;
+                            }
+                            Ok((_, Err(p))) => std::panic::resume_unwind(p),
+                            Err(e) => panic!("fn pool disconnected: {e}"),
+                        }
                     }
                 }
             }
+            done.into_values().collect()
         }
-        jobs = done.into_values().collect();
-        pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
-    }
+    };
+    pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
     jobs
 }
 
@@ -1052,12 +1153,13 @@ pub fn lower_module<'a>(
     m: &mut dyn Module,
     unwind: bool,
     hot: bool,
-    ctx: &Context,
+    ctx_slot: &mut CtxSlot<'_>,
     st: &'a State,
     isa: &Arc<dyn TargetIsa>,
     name: &str,
     host: &dyn Host,
 ) -> Lowered {
+    let ctx: &Context = ctx_slot.get();
     let macho = isa.triple().binary_format == target_lexicon::BinaryFormat::Macho;
     let cc = isa.default_call_conv();
     STRUCT_ARG_OK.store(
@@ -1273,6 +1375,9 @@ pub fn lower_module<'a>(
         }
         fn_names[id.index()] = d.name.clone().unwrap_or_default();
     }
+    // `PLIRON_LOWERFREE`: everything below phase (A) that reads `ctx` or a
+    // job's CLIF body is `-g`-only.
+    let free_ctx = lowerfree() && st.dbg.is_none();
     // Read-only job inputs, owned so `FnJob`s are `'static` and can ride
     // the process-wide pool.
     let shared = Arc::new(JobShared {
@@ -1290,6 +1395,7 @@ pub fn lower_module<'a>(
         prof: hprof.clone(),
         fn_names,
         wasm: false,
+        shed: free_ctx,
     });
     // `PLIRON_DEFERDEAD` (`=0` disables): emit-only `xcgu` copies (`dead_unopt`: no
     // caller `direct_callee` or `address_taken` can see) lower last, and
@@ -1594,11 +1700,36 @@ pub fn lower_module<'a>(
     // bisect counter must number pass applications deterministically) or
     // `PLIRON_PAR=0` overrides. `PLIRON_PAR=N` sizes the shared pool.
 
-    let mut spans = Some((_sfl, _pgfl));
-    let jobs = run_jobs(nthreads, name, &mut produce, &mut || {
-        spans.take();
-        pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
-    });
+    let pending = start_jobs(nthreads, &mut produce);
+    drop((_sfl, _pgfl));
+    pliron_cfg::trace("*phaseA*", tpa.elapsed().as_secs_f64() * 1e3, name);
+    // Data initializers, serialized now: they are the last readers of the
+    // pliron `Context`. Defined after phase (C), in this order, as before.
+    // `_tls_start` must land at the head of .tls — the merged section is
+    // input-ordered, so emit it before every other TLS datum.
+    let mut globals: Vec<_> = st.globals.iter().collect();
+    globals.sort_by_key(|(n, _)| usize::from(n.as_str() != "_tls_start"));
+    let mut gdata = Vec::new();
+    for (n, g) in globals {
+        let Some(init) = g.init else { continue };
+        let Some(Sym::D(id, _)) = ids.get(n).copied() else {
+            continue;
+        };
+        let (size, _) = size_align(ctx, init.get_type(ctx));
+        let mut bytes = vec![0u8; size as usize];
+        let mut relocs = Vec::new();
+        write_const(ctx, st, init, 0, &mut bytes, &mut relocs);
+        gdata.push((n, g, id, size, bytes, relocs));
+    }
+    if free_ctx {
+        let t = std::time::Instant::now();
+        ctx_slot.release();
+        pliron_cfg::trace("*lowerfree*", t.elapsed().as_secs_f64() * 1e3, name);
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "lowerfree {name}: pliron Context released after phase (A)");
+        }
+    }
+    let jobs = finish_jobs(pending, name);
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
@@ -1727,19 +1858,7 @@ pub fn lower_module<'a>(
     }
     // (name, bytes, align, relocs, writable, used, section name, linkage)
     let mut custom_secs: Vec<CustomSec> = Vec::new();
-    // `_tls_start` must land at the head of .tls — the merged section is
-    // input-ordered, so emit it before every other TLS datum.
-    let mut globals: Vec<_> = st.globals.iter().collect();
-    globals.sort_by_key(|(n, _)| usize::from(n.as_str() != "_tls_start"));
-    for (n, g) in globals {
-        let Some(init) = g.init else { continue };
-        let Some(Sym::D(id, _)) = ids.get(n).copied() else {
-            continue;
-        };
-        let (size, _) = size_align(ctx, init.get_type(ctx));
-        let mut bytes = vec![0u8; size as usize];
-        let mut relocs = Vec::new();
-        write_const(ctx, st, init, 0, &mut bytes, &mut relocs);
+    for (n, g, id, size, bytes, relocs) in gdata {
         if macho && g.section.is_some() {
             // cranelift-object calls add_section per data object, and it never
             // merges same-named sections, so N linkme/#[link_section] statics
@@ -2337,6 +2456,7 @@ pub fn lower_clif_wasm(
         prof: host.prof().clone(),
         fn_names: decl_names,
         wasm: true,
+        shed: false,
     });
     let mut scratch = FlScratch::default();
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {

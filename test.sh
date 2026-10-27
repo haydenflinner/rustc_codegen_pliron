@@ -347,6 +347,29 @@ t_deadfree() {
   diff <($out/deadfree-stock$exe 2>&1 | sed -E "$tid") <($out/deadfree$exe 2>&1 | sed -E "$tid")
 }
 
+t_lowerfree() {
+  # PLIRON_LOWERFREE drops each CGU's pliron Context once phase (A) has
+  # lowered it (and compiled jobs' CLIF bodies); PLIRON_JEARENA moves the
+  # backend's threads to immediately-purging jemalloc arenas. Both only
+  # free: every CGU object must be byte-identical to the flags-off build,
+  # the program must print what stock rustc's build prints, and the
+  # Context must actually go (a late reader panics: "used after
+  # LOWERFREE released it").
+  local f
+  rm -rf $out/lowerfree-off $out/lowerfree-on
+  rustc $BE --edition 2024 -O -C codegen-units=8 --emit obj --out-dir $out/lowerfree-off tests/std/main.rs || return 1
+  PLIRON_LOWERFREE=1 PLIRON_JEARENA=1 PLIRON_TRACE=pliron::stats=info rustc $BE --edition 2024 -O -C codegen-units=8 --emit obj --out-dir $out/lowerfree-on tests/std/main.rs 2> $out/lowerfree.log || { grep -E "error|panicked" $out/lowerfree.log | head -5 >&2; return 1; }
+  grep -q "lowerfree .*Context released" $out/lowerfree.log || { echo "lowerfree: nothing released" >&2; return 1; }
+  for f in $out/lowerfree-off/*.o; do
+    cmp $f $out/lowerfree-on/${f##*/} || { echo "lowerfree: ${f##*/} differs from the flags-off build" >&2; return 1; }
+  done
+  PLIRON_LOWERFREE=1 PLIRON_JEARENA=1 rustc $BE --edition 2024 -O -C codegen-units=8 tests/std/main.rs -o $out/lowerfree$exe || return 1
+  [[ -n "$exe" ]] && return 0
+  rustc --edition 2024 -O -C codegen-units=8 tests/std/main.rs -o $out/lowerfree-stock$exe || return 1
+  local tid="s/thread '([^']+)' \([0-9]+\)/thread '\1'/"
+  diff <($out/lowerfree-stock$exe 2>&1 | sed -E "$tid") <($out/lowerfree$exe 2>&1 | sed -E "$tid")
+}
+
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
@@ -849,6 +872,7 @@ want invokeblk && t_invokeblk
 want inlinerec && t_inlinerec
 want xfactsplugin && t_xfactsplugin
 want deadfree && t_deadfree
+want lowerfree && t_lowerfree
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul

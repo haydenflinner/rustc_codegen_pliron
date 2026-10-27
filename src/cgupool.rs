@@ -267,6 +267,45 @@ struct Store {
     held: rustc_hash::FxHashMap<u32, Job>,
     /// Jobs submitted and not yet done (`PLIRON_CGU_INFLIGHT`).
     inflight: u32,
+    /// CGUs whose first step (A or Whole) has started and that are not
+    /// done yet (`PLIRON_CGU_ACAP`).
+    started: u32,
+}
+
+/// `PLIRON_CGU_ACAP=N`: at most N CGUs between the start of their first
+/// step and done. Unlike `PLIRON_CGU_INFLIGHT` the main thread keeps
+/// defining (rustc's serial front half stays off the critical path) and
+/// only the IR growth of stage A (the inliner) waits; a worker with no
+/// admissible job lends itself to the shared fn pool. Stage A starts in
+/// ordinal order, so the started set is closed downwards and its stage-B
+/// waits are always satisfiable: no deadlock. Off while holding for the
+/// two-phase barrier. Scheduling only (docs/determinism.md R3).
+fn acap() -> u32 {
+    static C: LazyLock<u32> = LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_CGU_ACAP").and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    *C
+}
+
+impl Store {
+    fn admissible(&self, j: &Job) -> bool {
+        let cap = acap();
+        cap == 0 || self.hold || matches!(j.step, Step::B) || self.started < cap
+    }
+
+    fn has_runnable(&self) -> bool {
+        self.ready.iter().any(|j| self.admissible(j))
+    }
+
+    /// The first admissible job in queue order.
+    fn pop_runnable(&mut self) -> Option<Job> {
+        let i = self.ready.iter().position(|j| self.admissible(j))?;
+        let j = self.ready.remove(i)?;
+        if !matches!(j.step, Step::B) {
+            self.started += 1;
+        }
+        Some(j)
+    }
 }
 
 static STORE: LazyLock<Mutex<Store>> = LazyLock::new(Default::default);
@@ -401,8 +440,9 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
 /// drain, so a thread parked on either queue can lend its core to the
 /// other.
 fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
+    pliron_cfg::jearena::bind_thread();
     let mut g = STORE.lock().unwrap();
-    let Some(job) = g.ready.pop_front() else {
+    let Some(job) = g.pop_runnable() else {
         return false;
     };
     let jkey = job.key;
@@ -414,6 +454,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
         Ok(RunOut::Done { key, out }) => {
             g.done.insert(key, Ok(out));
             g.inflight = g.inflight.saturating_sub(1);
+            g.started = g.started.saturating_sub(1);
             CV.notify_all();
         }
         Ok(RunOut::Published { job }) if g.hold => {
@@ -471,6 +512,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
             };
             g.done.insert(jkey, Err(p));
             g.inflight = g.inflight.saturating_sub(1);
+            g.started = g.started.saturating_sub(1);
             CV.notify_all();
             // A job that never reached publish would stall every
             // higher-ordinal parked job (and the coordinator, which
@@ -513,7 +555,7 @@ pub(crate) fn run_until_published(
             continue;
         }
         g = STORE.lock().unwrap();
-        if !g.done.contains_key(&key) && !g.held.contains_key(&key) && g.ready.is_empty() {
+        if !g.done.contains_key(&key) && !g.held.contains_key(&key) && !g.has_runnable() {
             g = CV.wait(g).unwrap();
         }
     }
@@ -567,7 +609,7 @@ pub(crate) fn run_until(key: u32, prof: &SelfProfilerRef, emitter: &SharedEmitte
             continue;
         }
         g = STORE.lock().unwrap();
-        if !g.done.contains_key(&key) && g.ready.is_empty() {
+        if !g.done.contains_key(&key) && !g.has_runnable() {
             g = CV.wait(g).unwrap();
         }
     };
@@ -684,8 +726,10 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
                 Some((job.ord, job.adopt_all)),
             );
             job.iropt += t.elapsed();
+            // Owned, so `PLIRON_LOWERFREE` can drop it mid-lowering.
+            let mut ctx = Some(job.parts.ctx);
             let out = finish_b(
-                &job.parts.ctx,
+                lower::CtxSlot::Own(&mut ctx),
                 &mut job.parts.st,
                 job.parts.module,
                 &job.name,
@@ -727,8 +771,9 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
                 );
                 job.iropt += t.elapsed();
             }
+            let mut ctx = Some(job.parts.ctx);
             let out = finish_b(
-                &job.parts.ctx,
+                lower::CtxSlot::Own(&mut ctx),
                 &mut job.parts.st,
                 job.parts.module,
                 &job.name,
@@ -1294,7 +1339,7 @@ pub(crate) fn iropt_tail(
 /// Post-iropt: the `*iropt*` timing line, the `PLIRON_DUMP_OPT` print,
 /// then CLIF lowering (native object or wasm module).
 pub(crate) fn finish_b(
-    ctx: &Context,
+    ctx: lower::CtxSlot<'_>,
     st: &mut State,
     module: Ptr<Operation>,
     name: &str,
@@ -1305,10 +1350,10 @@ pub(crate) fn finish_b(
 ) -> Finished {
     pliron_cfg::trace("*iropt*", iropt.as_secs_f64() * 1e3, name);
     if env_set("PLIRON_DUMP_OPT") && pliron_cfg::tracing_on() {
-        tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", print_ir(ctx, module))
+        tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", print_ir(ctx.get(), module))
     }
     let obj = if cfg.wasm {
-        wasm::lower_to_wasm_clif(ctx, st, host, name, &cfg.wasm_features, cfg.unwind)
+        wasm::lower_to_wasm_clif(ctx.get(), st, host, name, &cfg.wasm_features, cfg.unwind)
     } else {
         lower::lower_to_object(
             cfg.unwind,
