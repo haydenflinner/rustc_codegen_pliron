@@ -793,11 +793,31 @@ impl<'a, F: Function> Env<'a, F> {
             to: ProgPoint,
         ) {
             // If we cross a block boundary, clear and return.
-            if this.cfginfo.insn_block[from.inst().index()]
-                != this.cfginfo.insn_block[to.inst().index()]
-            {
-                redundant_moves.clear();
-                return;
+            // PLIRON: `PLIRON_RA2_XBLOCK=1` keeps the state across the
+            // boundary into a block whose only predecessor is the block
+            // right before it (a call's return block): the instructions in
+            // between still clear what they define or clobber below.
+            let (fb, tb) = (
+                this.cfginfo.insn_block[from.inst().index()],
+                this.cfginfo.insn_block[to.inst().index()],
+            );
+            if fb != tb {
+                #[cfg(feature = "std")]
+                let xblock = {
+                    static XBLOCK: ::std::sync::OnceLock<bool> = ::std::sync::OnceLock::new();
+                    *XBLOCK.get_or_init(|| {
+                        ::std::env::var("PLIRON_RA2_XBLOCK").is_ok_and(|v| v == "1")
+                    })
+                };
+                #[cfg(not(feature = "std"))]
+                let xblock = false;
+                if !(xblock
+                    && tb.index() == fb.index() + 1
+                    && this.func.block_preds(tb) == [fb])
+                {
+                    redundant_moves.clear();
+                    return;
+                }
             }
 
             let start_inst = if from.pos() == InstPosition::Before {

@@ -11,3 +11,16 @@ references 292 -> 91; stage2 regex-syntax instructions -0.2% / -0.3%.
 
 TODO: once proven out, submit upstream (bytecodealliance/regalloc2) and drop
 this copy plus the `[patch.crates-io]` entry in the root Cargo.toml.
+
+## `PLIRON_RA2_XBLOCK=1` (runtime, default off): redundant moves across a call's return
+
+`src/ion/moves.rs`: the redundant-move eliminator clears its state at
+every block boundary. Under the flag it keeps the state when the next
+block's only predecessor is the block right before it (Cranelift's
+`try_call` return blocks); the instructions in between still clear what
+they define or clobber. That elides a reload's store back into its own
+spill slot after the call, and other moves whose source and destination
+already hold the same value. `src/lib.rs` links `std` under the default
+`std` feature for the env read. regex-syntax: `__text` -2,272 B,
+spill stores -115 (docs/history/2026-10-27-spills2.md). Checked with
+`PLIRON_RA_CHECK=1` (the regalloc2 checker).

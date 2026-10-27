@@ -14,7 +14,8 @@
 #![allow(clippy::all)]
 #![no_std]
 
-#[cfg(feature = "fuzzing")]
+// PLIRON: also under `std`, for the runtime `PLIRON_RA2_*` knobs.
+#[cfg(any(feature = "fuzzing", feature = "std"))]
 extern crate std;
 
 extern crate alloc;

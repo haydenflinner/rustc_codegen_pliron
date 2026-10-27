@@ -257,9 +257,9 @@ t_slotpromlt() {
   # through `&mut` calls and an `Ast::fmt`-shaped heap-stack visitor must
   # print the same under every combination; `walk`'s spill bytes must
   # drop under SYNCCOST.
-  PLIRON_FRAME_INFO=4walk rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl0$exe 2> $out/spl0.fi &&
+  PLIRON_SLOTPROM_LT=0 PLIRON_SLOTPROM_SYNCCOST=0 PLIRON_RA2_XBLOCK=0 PLIRON_FRAME_INFO=4walk rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl0$exe 2> $out/spl0.fi &&
       $out/spl0$exe > $out/spl.out
-  PLIRON_SLOTPROM_LT=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl1$exe &&
+  PLIRON_SLOTPROM_LT=1 PLIRON_SLOTPROM_SYNCCOST=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl1$exe &&
       $out/spl1$exe | diff --strip-trailing-cr - $out/spl.out
   PLIRON_SLOTPROM_LT=1 PLIRON_SLOTPROM_SYNCCOST=1 PLIRON_FRAME_INFO=4walk rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl2$exe 2> $out/spl2.fi &&
       $out/spl2$exe | diff --strip-trailing-cr - $out/spl.out
@@ -268,6 +268,18 @@ t_slotpromlt() {
   s2=$(sed -nE 's/^frame-info .*4walk: .*spills=([0-9]+).*/\1/p' $out/spl2.fi)
   if [[ -z "$s0" || -z "$s2" || "$s2" -ge "$s0" ]]; then
     echo "slotpromlt: walk spill bytes $s0 -> $s2 under PLIRON_SLOTPROM_SYNCCOST (want a drop)"; return 1
+  fi
+  # PLIRON_RA2_XBLOCK (vendored regalloc2: redundant-move state survives into
+  # a call's return block): same output under the regalloc2 checker, and
+  # the reload/store-back pairs it drops must make the code smaller.
+  PLIRON_RA2_XBLOCK=1 PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl3$exe &&
+      $out/spl3$exe | diff --strip-trailing-cr - $out/spl.out
+  PLIRON_RA2_XBLOCK=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  PLIRON_RA2_XBLOCK=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  local z0 z3
+  z0=$(wc -c < $out/spl0.o); z3=$(wc -c < $out/spl3.o)
+  if [[ "$z3" -ge "$z0" ]]; then
+    echo "slotpromlt: object $z0 -> $z3 bytes under PLIRON_RA2_XBLOCK (want a drop)"; return 1
   fi
 }
 
