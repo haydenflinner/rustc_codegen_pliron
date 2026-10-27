@@ -1674,7 +1674,7 @@
 
 ;; General rule for extending input to an output which fits in a single
 ;; register.
-(rule uextend -2 (lower (uextend (fits_in_64 out) x @ (value_type in)))
+(rule uextend -3 (lower (uextend (fits_in_64 out) x @ (value_type in)))
       (extend x false (ty_bits in) (ty_bits out)))
 
 ;; PLIRON: `icmp`/`fcmp` materialize as `cset`/`fcset`, which already write a
@@ -1682,6 +1682,14 @@
 (rule uextend_icmp 0 (lower (uextend (fits_in_64 _) x @ (icmp _ _ _ _)))
       (put_in_reg x))
 (rule uextend_fcmp 0 (lower (uextend (fits_in_64 _) x @ (fcmp _ _ _ _)))
+      (put_in_reg x))
+
+;; PLIRON (`PLIRON_NARROWEXT=1`): any i8/i16 whose register is already
+;; zero-extended (`val_already_extended`) needs no `uxtb`/`uxth`. Below the
+;; load-fusing rules, which already fold the extension into `ldrb`/`ldrh`.
+(rule uextend_clean -2 (lower (uextend (fits_in_64 _) x @ (value_type (fits_in_16 _))))
+      (if-let true (narrowext_on))
+      (if-let true (val_already_extended (ArgumentExtension.Uext) x))
       (put_in_reg x))
 
 ;; Extraction of a vector lane automatically extends as necessary, so we can
@@ -1830,6 +1838,16 @@
 ;;;; Rules for `band` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule band_fits_in_64 -5 (lower (band (fits_in_64 (ty_int ty)) x y))
+      (alu_rs_imm_logic_commutative (ALUOp.And) ty x y))
+
+;; PLIRON (`PLIRON_NARROWEXT=1`): `band (ireduce x) k` with a canonical
+;; narrow `k` masks `x`'s register directly — the `uxtb`/`uxth` the
+;; `ireduce` would materialize is dead under the mask. The result is still
+;; clean (bits above `k` are zero), as `narrow_uext_clean` assumes.
+(rule band_ireduce_imm 30 (lower (band (fits_in_16 ty) (ireduce _ x @ (value_type (fits_in_64 _)))
+                                      y @ (iconst _ (u64_from_imm64 k))))
+      (if-let true (narrowext_on))
+      (if-let true (u64_lt_eq k (ty_mask ty)))
       (alu_rs_imm_logic_commutative (ALUOp.And) ty x y))
 
 (rule -4 (lower (band (fits_in_64 (ty_scalar_float ty)) x y))

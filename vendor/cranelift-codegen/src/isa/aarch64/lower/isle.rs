@@ -67,6 +67,76 @@ pub(crate) fn lower_branch(
     generated_code::constructor_lower_branch(&mut isle_ctx, branch, targets)
 }
 
+/// PLIRON: the `val_already_extended` oracle for `Uext`, from Rust.
+pub(crate) fn val_uext_clean(lower_ctx: &mut Lower<MInst>, backend: &AArch64Backend, val: Value) -> bool {
+    let mut isle_ctx = IsleContext { lower_ctx, backend };
+    generated_code::constructor_val_already_extended(&mut isle_ctx, &ArgumentExtension::Uext, val)
+        == Some(true)
+}
+
+/// PLIRON: `PLIRON_NARROWEXT=1` turns on the extra narrow-int cleanliness
+/// facts (`narrowext_clean`) and the rules that consume them: skipping the
+/// return-value `uxtb`/`uxth`, `uextend` passthrough, `cbnz` on a clean
+/// narrow `brif`, and `band (ireduce x) k` reading `x` directly.
+pub(crate) fn narrowext_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_NARROWEXT").as_deref() == Ok("1"))
+}
+
+/// PLIRON: is the register of `v` (an i8/i16 value) zero-extended through
+/// all 64 bits? Covers the producers `val_already_extended` leaves out:
+/// canonical narrow `iconst` (materialized by `movz` or a masked constant
+/// load), `band` with a clean operand, `bor`/`bxor` with two clean operands
+/// (all three lower to exact 32-bit `and`/`orr`/`eor`; the `bic`/`orn`/`eon`
+/// forms only match through a `bnot` operand, which is never clean), plus
+/// the existing leaf cases so the recursion sees through them. `budget`
+/// bounds the walk; running out answers "dirty".
+pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let ty = dfg.value_type(v);
+    let mask: u64 = match ty {
+        I8 => 0xff,
+        I16 => 0xffff,
+        _ => return false,
+    };
+    let Some(inst) = dfg.value_def(v).inst() else {
+        return false;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) <= mask,
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => true,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Ireduce | Opcode::BlackBox,
+            ..
+        } => true,
+        InstructionData::Load {
+            opcode: Opcode::Load | Opcode::Uload8,
+            ..
+        } => true,
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let [a, b] = *args;
+            narrow_uext_clean(dfg, b, budget) || narrow_uext_clean(dfg, a, budget)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            let [a, b] = *args;
+            narrow_uext_clean(dfg, a, budget) && narrow_uext_clean(dfg, b, budget)
+        }
+        _ => false,
+    }
+}
+
 pub struct ExtendedValue {
     val: Value,
     extend: ExtendOp,
@@ -897,6 +967,15 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("PLIRON_AMODESHARE").as_deref() != Ok("0"))
             && self.lower_ctx.amode_shareable(val)
+    }
+
+    fn narrowext_on(&mut self) -> bool {
+        narrowext_enabled()
+    }
+
+    fn narrowext_clean(&mut self, val: Value) -> bool {
+        let mut budget = 16;
+        narrowext_enabled() && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
     }
 
     fn test_and_compare_bit_const(&mut self, ty: Type, n: u64) -> Option<u8> {

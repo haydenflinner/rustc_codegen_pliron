@@ -1754,6 +1754,9 @@ impl<M: ABIMachineSpec> Callee<M> {
         idx: usize,
         from_regs: ValueRegs<Reg>,
         vregs: &mut VRegAllocator<M::I>,
+        // PLIRON: the value is known zero-extended already; a register
+        // `uext` slot then takes it as-is (see `Lower::gen_return`).
+        skip_uext: bool,
     ) -> (SmallVec<[RetPair; 2]>, SmallInstVec<M::I>) {
         let mut reg_pairs = smallvec![];
         let mut ret = smallvec![];
@@ -1769,6 +1772,11 @@ impl<M: ABIMachineSpec> Callee<M> {
                             let from_bits = ty_bits(ty) as u8;
                             let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
                             let vreg = match (ext, from_bits) {
+                                (ir::ArgumentExtension::Uext, n)
+                                    if n < word_bits && skip_uext && n <= 16 =>
+                                {
+                                    from_reg
+                                }
                                 (ir::ArgumentExtension::Uext, n)
                                 | (ir::ArgumentExtension::Sext, n)
                                     if n < word_bits =>

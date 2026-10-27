@@ -63,7 +63,7 @@
 use crate::dominator_tree::DominatorTree;
 use crate::entity::SecondaryMap;
 use crate::inst_predicates::visit_block_succs;
-use crate::ir::{Block, Function, Inst, Opcode};
+use crate::ir::{Block, BlockArg, Function, Inst, Opcode};
 use crate::{FxHashMap, FxHashSet};
 use crate::{machinst::*, trace};
 
@@ -341,16 +341,48 @@ impl BlockLoweringOrder {
                 // elimination.
                 let succs = ctrl_plane.shuffled(block_succs[range].iter_mut().enumerate());
 
+                // PLIRON: `br_table` entries that pass the same block call
+                // (same target, same args) share one split-edge block
+                // instead of one identical `mov*; b` block each. The
+                // duplicates' table entries point at the shared block; its
+                // jump takes the first entry's args (equal by construction).
+                // `Lower::lower_branch_blockparam_args` keeps the vcode CFG
+                // free of the repeated successor. `PLIRON_EDGEDEDUP=1` enables.
+                let dedup_dests = if edge_dedup_enabled() {
+                    f.layout.last_inst(block).and_then(|inst| {
+                        let data = &f.dfg.insts[inst];
+                        (data.opcode() == Opcode::BrTable).then(|| {
+                            data.branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+                        })
+                    })
+                } else {
+                    None
+                };
+                let mut seen_calls: FxHashMap<(Block, SmallVec<[BlockArg; 4]>), LoweredBlock> =
+                    FxHashMap::default();
+
                 for (succ_ix, lb) in succs {
                     let succ = lb.orig_block().unwrap();
                     if block_in_count[succ] > 1 {
                         // Mutate the successor to be a critical edge, as `block` has multiple
                         // edges leaving it, and `succ` has multiple edges entering it.
-                        *lb = LoweredBlock::CriticalEdge {
+                        let edge = LoweredBlock::CriticalEdge {
                             pred: block,
                             succ,
                             succ_idx: succ_ix as u32,
                         };
+                        if let Some(dests) = dedup_dests {
+                            let call = &dests[succ_ix];
+                            let pool = &f.dfg.value_lists;
+                            debug_assert_eq!(call.block(pool), succ);
+                            let key = (succ, call.args(pool).collect());
+                            if let Some(&shared) = seen_calls.get(&key) {
+                                *lb = shared;
+                                continue;
+                            }
+                            seen_calls.insert(key, edge);
+                        }
+                        *lb = edge;
                         lowered_order.push(*lb);
                     }
                 }
@@ -630,4 +662,11 @@ mod test {
         assert!(order.lowered_order[8].in_edge().is_none());
         assert!(order.lowered_order[8].out_edge().is_none());
     }
+}
+
+/// PLIRON: `PLIRON_EDGEDEDUP=1` shares one split-edge block among the
+/// `br_table` entries that pass the same block call.
+pub(crate) fn edge_dedup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_EDGEDEDUP").as_deref() == Ok("1"))
 }

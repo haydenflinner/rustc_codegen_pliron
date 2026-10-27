@@ -635,7 +635,9 @@ macro_rules! isle_lower_prelude_methods {
 
         /// Generate the return instruction.
         fn gen_return(&mut self, rets: &ValueRegsVec) {
-            self.lower_ctx.gen_return(rets);
+            let backend = self.backend;
+            self.lower_ctx
+                .gen_return(rets, &mut |ctx, v| backend.narrow_ret_uext_clean(ctx, v));
         }
 
         fn gen_call_output(&mut self, sig_ref: SigRef) -> ValueRegsVec {

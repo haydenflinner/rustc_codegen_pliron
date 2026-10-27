@@ -148,6 +148,13 @@ pub trait LowerBackend {
     fn maybe_pinned_reg(&self) -> Option<Reg> {
         None
     }
+
+    /// PLIRON: does the register of narrow (i8/i16) return operand `val`
+    /// already hold its zero-extended form, so a `uext` return slot needs
+    /// no extension instruction? Default: never.
+    fn narrow_ret_uext_clean(&self, _ctx: &mut Lower<Self::MInst>, _val: Value) -> bool {
+        false
+    }
 }
 
 /// Machine-independent lowering driver / machine-instruction container. Maintains a correspondence
@@ -591,7 +598,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Generate the return instruction.
-    pub fn gen_return(&mut self, rets: &[ValueRegs<Reg>]) {
+    ///
+    /// PLIRON: `uext_clean(self, v)` answers whether narrow return operand
+    /// `v`'s register is already zero-extended (`LowerBackend::
+    /// narrow_ret_uext_clean`); such operands skip the slot's `uext`
+    /// extension.
+    pub fn gen_return(
+        &mut self,
+        rets: &[ValueRegs<Reg>],
+        uext_clean: &mut dyn FnMut(&mut Self, Value) -> bool,
+    ) {
         let mut out_rets = vec![];
 
         let mut rets = rets.into_iter();
@@ -626,11 +642,22 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 regs = self.ret_copy_regs(regs, val.unwrap());
             }
 
+            let skip_uext = match val {
+                Some(v)
+                    if ret.extension == crate::ir::ArgumentExtension::Uext
+                        && ret.value_type.is_int()
+                        && ret.value_type.bits() <= 16 =>
+                {
+                    uext_clean(self, v)
+                }
+                _ => false,
+            };
             let (regs, insns) = self.vcode.abi().gen_copy_regs_to_retval(
                 self.vcode.sigs(),
                 i,
                 regs,
                 &mut self.vregs,
+                skip_uext,
             );
             out_rets.extend(regs);
             for insn in insns {
@@ -1171,7 +1198,23 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let mut branch_arg_vregs: SmallVec<[Reg; 16]> = smallvec![];
 
         // TODO: why not make `block_order` public?
-        for succ_idx in 0..self.vcode.block_order().succ_indices(block).1.len() {
+        let (branch, succs) = self.vcode.block_order().succ_indices(block);
+        let n_succs = succs.len();
+        let is_table = branch.is_some_and(|i| self.f.dfg.insts[i].opcode() == crate::ir::Opcode::BrTable);
+        // PLIRON: deduplicated `br_table` edges (`PLIRON_EDGEDEDUP`) repeat
+        // a split-edge successor; regalloc2 must see each CFG edge once (a
+        // repeated one reads as a critical edge). Such successors carry no
+        // args — those sit on the edge block's own jump.
+        let mut seen_succs: Option<FxHashSet<BlockIndex>> = (is_table
+            && crate::machinst::blockorder::edge_dedup_enabled())
+        .then(FxHashSet::default);
+        for succ_idx in 0..n_succs {
+            if let Some(seen) = seen_succs.as_mut() {
+                let succ = self.vcode.block_order().succ_indices(block).1[succ_idx];
+                if !seen.insert(succ) {
+                    continue;
+                }
+            }
             branch_arg_vregs.clear();
             let (succ, args) = self.collect_block_call(block, succ_idx, &mut branch_arg_vregs);
             self.vcode.add_succ(succ, args);

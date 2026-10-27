@@ -3959,6 +3959,17 @@
 (rule 1 (val_already_extended op (black_box _ x)) (val_already_extended op x))
 (rule 2 (val_already_extended (ArgumentExtension.Uext) (black_box _ x @ (value_type (fits_in_16 _)))) true)
 
+;; PLIRON (`PLIRON_NARROWEXT=1`): canonical narrow `iconst`s and
+;; `band`/`bor`/`bxor` trees over clean operands (see `narrow_uext_clean`).
+(rule 3 (val_already_extended (ArgumentExtension.Uext) v @ (value_type (fits_in_16 _)))
+      (if-let true (narrowext_clean v))
+      true)
+
+(decl pure narrowext_on () bool)
+(extern constructor narrowext_on narrowext_on)
+(decl pure narrowext_clean (Value) bool)
+(extern constructor narrowext_clean narrowext_clean)
+
 ;; Place a `Value` into a register, sign extending it to 32-bits
 (attr put_in_reg_sext32 (veri chain))
 (attr put_in_reg_sext32 (veri chain))
@@ -5152,6 +5163,12 @@
           (CondResult.NotZero (orr $I64 lo hi) (OperandSize.Size64))))
 (rule 3 (is_nonzero val @ (value_type $I8))
   (CondResult.Cond (tst_imm $I32 val (u64_into_imm_logic $I32 255)) (Cond.Ne)))
+;; PLIRON (`PLIRON_NARROWEXT=1`): a narrow value whose register is already
+;; zero-extended tests as-is — `cbnz w` instead of `tst #0xff` / `uxth`.
+(rule 4 (is_nonzero val @ (value_type (fits_in_16 _)))
+  (if-let true (narrowext_on))
+  (if-let true (val_already_extended (ArgumentExtension.Uext) val))
+  (CondResult.NotZero val (OperandSize.Size32)))
 
 (attr emit_icmp (veri chain))
 (decl emit_icmp (IntCC Value Value) CondResult)

@@ -453,6 +453,14 @@ t_narrowlsr() {
   rustc $BE --edition 2021 -O tests/narrowlsr/main.rs -o $out/narrowlsr$exe && $out/narrowlsr$exe
 }
 
+t_narrowext() {
+  # aarch64 clean-narrow-int facts (PLIRON_NARROWEXT) and shared br_table
+  # edge blocks (PLIRON_EDGEDEDUP), plain and with both knobs on.
+  rustc $BE --edition 2021 -O tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null && \
+  PLIRON_NARROWEXT=1 PLIRON_EDGEDEDUP=1 rustc $BE --edition 2021 -O tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null && \
+  PLIRON_NARROWEXT=1 PLIRON_EDGEDEDUP=1 rustc $BE --edition 2021 tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null
+}
+
 t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
@@ -863,6 +871,7 @@ want asmlabels && t_asmlabels
 # t_cvariadic) rather than being skipped.
 want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
+want narrowext && t_narrowext
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern
 want dbgnested && t_dbgnested

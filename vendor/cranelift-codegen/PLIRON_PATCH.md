@@ -730,6 +730,34 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `umulh` + `add` per cold call arg with a `mov` that regalloc often
     makes a self-move.
 
+62. aarch64 clean narrow ints (`PLIRON_NARROWEXT=1`, default off;
+    `src/isa/aarch64/{inst.isle,lower.isle,lower.rs,lower/isle.rs}`,
+    `src/machinst/{lower.rs,isle.rs,abi.rs}`). `narrow_uext_clean` (Rust,
+    budget 16) extends the `val_already_extended` oracle (patch 36) to
+    canonical narrow `iconst`s, `band` with one clean operand, and
+    `bor`/`bxor` of two clean operands (all exact 32-bit `and`/`orr`/`eor`;
+    the `bic`/`orn`/`eon` forms need a `bnot` operand, never clean). Users:
+    - `Lower::gen_return` asks the new `LowerBackend::narrow_ret_uext_clean`
+      for each i8/i16 `uext` return and passes `skip_uext` to
+      `gen_copy_regs_to_retval`, dropping the ABI `uxtb`/`uxth` (309 of
+      381 on regex-syntax were after `and #k`, `mov #k` or `cset`);
+    - `uextend_clean` (priority -2; the general `uextend` rule moved to -3):
+      `uextend` of a clean narrow value is a passthrough;
+    - `is_nonzero` rule 4: a clean i8/i16 tests with `cbnz w` instead of
+      `tst #0xff` / `uxth`;
+    - `band_ireduce_imm` (priority 30): `band (ireduce x) k`, canonical `k`,
+      masks `x`'s register directly, so the `ireduce`'s `uxtb` (patch 36)
+      is not materialized.
+
+63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP=1`, default
+    off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table
+    entries passing the same block call (target and args) map to one
+    `CriticalEdge` lowered block instead of one identical `mov*; b` block
+    each. `lower_branch_blockparam_args` skips the repeated successor so
+    regalloc2 sees each CFG edge once (a repeat would read as a critical
+    edge); repeated successors carry no args. The jump table itself keeps
+    one entry per case, now pointing at the shared label.
+
 Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
 a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's
 register has unspecified bits above its width, which `lsr #k` shifts into
