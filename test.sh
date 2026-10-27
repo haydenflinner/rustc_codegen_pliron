@@ -460,6 +460,14 @@ t_selmul() {
   PLIRON_SELCHAIN=1 PLIRON_MULCARRY=1 PLIRON_STEPCMP=1 PLIRON_REMATLOOP=0 rustc $BE --edition 2021 -O tests/selmul/main.rs -o $out/selmul$exe && $out/selmul$exe | diff --strip-trailing-cr - tests/selmul/expected.out
 }
 
+t_elabloops() {
+  # Egraph loop stacks by loop nest (PLIRON_ELABLOOPS, vendored Cranelift
+  # patch 66) with the late parse steps, on selmul's eqbug/parse shapes:
+  # output must match stock rustc's, at -O and unoptimized.
+  PLIRON_ELABLOOPS=1 PLIRON_SELCHAIN=1 PLIRON_MULCARRY=1 PLIRON_STEPCMP=1 rustc $BE --edition 2021 -O tests/selmul/main.rs -o $out/elabloops$exe && $out/elabloops$exe | diff --strip-trailing-cr - tests/selmul/expected.out && \
+  PLIRON_ELABLOOPS=1 rustc $BE --edition 2021 tests/selmul/main.rs -o $out/elabloops$exe && $out/elabloops$exe | diff --strip-trailing-cr - tests/selmul/expected.out
+}
+
 t_dseunwind() {
   # Stores through `&mut self` before a call that unwinds stay: the caller
   # that catches the panic reads them (dse unwind exits).
@@ -579,7 +587,9 @@ t_noret() {
     diff <($o-stock$exe 2>/dev/null) <($o$exe 2>/dev/null) || { echo "noret: output differs (${m})" >&2; return 1; }
   done
   local n0 n1
-  rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret0.o || return 1
+  # `=0` explicitly: a gate run with the candidate flags exported sets
+  # PLIRON_NORETTRAP=1 ambiently, and both objects would have the same count.
+  PLIRON_NORETTRAP=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret0.o || return 1
   PLIRON_NORETTRAP=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret1.o || return 1
   n0=$("$llvmod" -d $out/noret0.o | grep -cE '\b(udf|ud2)\b' || true)
   n1=$("$llvmod" -d $out/noret1.o | grep -cE '\b(udf|ud2)\b' || true)
@@ -994,6 +1004,7 @@ want lowerfree-wasm && t_lowerfree_wasm
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul
+want elabloops && t_elabloops
 # catch_unwind can't intercept stock-std SEH throws on Windows (see `unwind`).
 [[ -z "$exe" ]] && want noret && t_noret
 # Same stock-std SEH limitation as `unwind` above: every check here is a

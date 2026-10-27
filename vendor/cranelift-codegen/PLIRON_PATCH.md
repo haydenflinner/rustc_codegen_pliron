@@ -870,3 +870,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
       `machine_code_cfg_info`.
     Tests: `pliron-clif-opt/tests/noret_trap.rs` (trap and call-site
     records; x86-64 under Rosetta with `--target x86_64-apple-darwin`).
+
+66. Egraph elaboration: loop stack by loop nest (`PLIRON_ELABLOOPS=1`,
+    opt-in; `src/egraph/elaborate.rs`, `Elaborator::start_block`). The
+    elaborator pops a loop's `LoopStackEntry` as soon as the domtree
+    preorder visits a block outside that loop. A loop's exit block is
+    dominated by the header, so it can come before the rest of the body
+    among the header's domtree children; every body block visited after
+    it then sees no entry for its own loop and its invariants are placed
+    in the body instead of the hoist block (parse_only's `ptr + len` end
+    pointer recomputed per digit: 9 instructions per digit instead of 8).
+    Under the knob, `start_block` rebuilds `loop_stack` from the block's
+    loop nest (`innermost_loop` → `loop_parent`), using the entry
+    recorded when each header was visited (`loop_entries`; headers
+    dominate their bodies, so the entry exists, and the hoist block still
+    dominates the body, so the scope depth it carries is still open).
+    Test: `pliron-clif-opt/tests/elabloops.rs`.

@@ -24,6 +24,14 @@ pub(crate) fn remat_call_on() -> bool {
     *ON.get_or_init(|| std::env::var("PLIRON_REMATCALL").as_deref() != Ok("0"))
 }
 
+/// PLIRON: `PLIRON_ELABLOOPS=1` (opt-in) — rebuild the loop stack from
+/// the loop nest of each block instead of popping entries when the
+/// domtree preorder leaves a loop. See `Elaborator::start_block`.
+pub(crate) fn elab_loops_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABLOOPS").as_deref() == Ok("1"))
+}
+
 pub(crate) struct Elaborator<'a> {
     func: &'a mut Function,
     domtree: &'a DominatorTree,
@@ -56,6 +64,10 @@ pub(crate) struct Elaborator<'a> {
     value_to_best_value: SecondaryMap<Value, BestEntry>,
     /// Stack of blocks and loops in current elaboration path.
     loop_stack: SmallVec<[LoopStackEntry; 8]>,
+    /// PLIRON (`PLIRON_ELABLOOPS=1`): the stack entry of every loop
+    /// whose header has been visited, so `start_block` can rebuild
+    /// `loop_stack` from a block's loop nest.
+    loop_entries: FxHashMap<Loop, LoopStackEntry>,
     /// The current block into which we are elaborating.
     cur_block: Block,
     /// Values that opt rules have indicated should be rematerialized
@@ -195,6 +207,7 @@ impl<'a> Elaborator<'a> {
             value_to_elaborated_value: ScopedHashMap::with_capacity(num_values),
             value_to_best_value,
             loop_stack: smallvec![],
+            loop_entries: FxHashMap::default(),
             cur_block: Block::reserved_value(),
             remat_values,
             elab_stack: vec![],
@@ -215,6 +228,45 @@ impl<'a> Elaborator<'a> {
             self.loop_stack.len(),
             self.value_to_elaborated_value.depth()
         );
+
+        // PLIRON_ELABLOOPS=1: the loop stack is the loop nest of `block`.
+        // The pop-on-leave rule below drops a loop's entry as soon as the
+        // domtree preorder visits a block outside the loop — and a loop's
+        // exit block is dominated by its header, so it can come before the
+        // rest of the body among the header's domtree children. Every
+        // later body block then sees no entry for its own loop, and its
+        // invariants are placed in the body (parse_only's `ptr + len` end
+        // pointer recomputed per digit). Headers are visited before their
+        // bodies (they dominate them), so the entry recorded at the header
+        // is always available; the hoist block still dominates every body
+        // block, so the scoped-map depth it carries is still open.
+        if elab_loops_on() {
+            self.loop_stack.clear();
+            let mut chain: SmallVec<[Loop; 8]> = smallvec![];
+            let mut lp = self.loop_analysis.innermost_loop(block);
+            while let Some(l) = lp {
+                chain.push(l);
+                lp = self.loop_analysis.loop_parent(l);
+            }
+            for &l in chain.iter().rev() {
+                if self.loop_analysis.loop_header(l) == block {
+                    if let Some(idom) = idom {
+                        let e = LoopStackEntry {
+                            lp: l,
+                            hoist_block: idom,
+                            scope_depth: (self.value_to_elaborated_value.depth() - 1) as u32,
+                        };
+                        self.loop_entries.insert(l, e.clone());
+                        self.loop_stack.push(e);
+                    }
+                } else if let Some(e) = self.loop_entries.get(&l) {
+                    self.loop_stack.push(e.clone());
+                }
+            }
+            trace!("block {}: loop stack is {:?}", block, self.loop_stack);
+            self.cur_block = block;
+            return;
+        }
 
         // Pop any loop levels we're no longer in.
         while let Some(inner_loop) = self.loop_stack.last() {
