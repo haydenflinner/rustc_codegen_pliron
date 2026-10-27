@@ -45,6 +45,9 @@
 ;; PLIRON: `PLIRON_REMAT_SADDR=0` turns off rematerializing `stack_addr` (default on).
 (decl pure partial pliron_remat_saddr () Unit)
 (extern constructor pliron_remat_saddr pliron_remat_saddr)
+;; PLIRON: `PLIRON_REMATCALL=1` (default off) marks cheap `iconst`s for remat.
+(decl pure partial pliron_remat_call () Unit)
+(extern constructor pliron_remat_call pliron_remat_call)
 
 ;; Get the destination block of a block call.
 (decl pure block_call_block (BlockCall) Block)

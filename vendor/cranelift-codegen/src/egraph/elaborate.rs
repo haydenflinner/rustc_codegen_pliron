@@ -17,6 +17,13 @@ use cranelift_control::ControlPlane;
 use cranelift_entity::{EntitySet, SecondaryMap, packed_option::ReservedValue};
 use smallvec::{SmallVec, smallvec};
 
+/// PLIRON: `PLIRON_REMATCALL=1` (default off) — see `Elaborator::call_loops`
+/// and the `iconst` rule in `opts/remat.isle`.
+pub(crate) fn remat_call_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_REMATCALL").as_deref() == Ok("1"))
+}
+
 pub(crate) struct Elaborator<'a> {
     func: &'a mut Function,
     domtree: &'a DominatorTree,
@@ -63,6 +70,12 @@ pub(crate) struct Elaborator<'a> {
     block_stack: Vec<BlockStackEntry>,
     /// Copies of values that have been rematerialized.
     remat_copies: FxHashMap<(Block, Value), Value>,
+    /// PLIRON: under `PLIRON_REMATCALL=1`, the loops whose body (inner
+    /// loops included) contains a call. A remat clone into such a loop
+    /// costs one cheap instruction per iteration next to a call, while
+    /// the hoisted value it replaces lives across that call in a
+    /// callee-saved register or a spill slot.
+    call_loops: FxHashSet<Loop>,
     /// Stats for various events during egraph processing, to help
     /// with optimization of this infrastructure.
     stats: &'a mut Stats,
@@ -150,6 +163,31 @@ impl<'a> Elaborator<'a> {
         let mut value_to_best_value =
             SecondaryMap::with_default(BestEntry(Cost::infinity(), Value::reserved_value()));
         value_to_best_value.resize(num_values);
+        let mut call_loops = FxHashSet::default();
+        if remat_call_on() {
+            for block in func.layout.blocks() {
+                let Some(mut lp) = loop_analysis.innermost_loop(block) else {
+                    continue;
+                };
+                if call_loops.contains(&lp)
+                    || !func
+                        .layout
+                        .block_insts(block)
+                        .any(|i| func.dfg.insts[i].opcode().is_call())
+                {
+                    continue;
+                }
+                loop {
+                    if !call_loops.insert(lp) {
+                        break;
+                    }
+                    match loop_analysis.loop_parent(lp) {
+                        Some(p) => lp = p,
+                        None => break,
+                    }
+                }
+            }
+        }
         Self {
             func,
             domtree,
@@ -163,6 +201,7 @@ impl<'a> Elaborator<'a> {
             elab_result_stack: vec![],
             block_stack: vec![],
             remat_copies: FxHashMap::default(),
+            call_loops,
             stats,
             ctrl_plane,
         }
@@ -417,6 +456,7 @@ impl<'a> Elaborator<'a> {
         func: &mut Function,
         remat_copies: &mut FxHashMap<(Block, Value), Value>,
         loop_analysis: &LoopAnalysis,
+        call_loops: &FxHashSet<Loop>,
         insert_block: Block,
         before: Inst,
         arg: &mut ElaboratedValue,
@@ -435,8 +475,16 @@ impl<'a> Elaborator<'a> {
             // matter how cheap the materialization (a radix constant
             // deduped above the word loop got re-sunk into every
             // per-digit block).
-            if loop_analysis.loop_level(insert_block).level()
-                > loop_analysis.loop_level(arg.in_block).level()
+            //
+            // PLIRON_REMATCALL=1: both loop rules give way when the use's
+            // loop contains a call — an extra cheap op per iteration next
+            // to a call beats the value's trip across it.
+            let callful = loop_analysis
+                .innermost_loop(insert_block)
+                .is_some_and(|l| call_loops.contains(&l));
+            if !callful
+                && loop_analysis.loop_level(insert_block).level()
+                    > loop_analysis.loop_level(arg.in_block).level()
             {
                 return false;
             }
@@ -445,7 +493,8 @@ impl<'a> Elaborator<'a> {
             // second execution per iteration to shorten one live range
             // (parse_only's `byte - '0'` recomputed past the digit test).
             static REMATLOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if !*REMATLOOP.get_or_init(|| std::env::var_os("PLIRON_REMATLOOP").is_none_or(|v| v != "0"))
+            if !callful
+                && !*REMATLOOP.get_or_init(|| std::env::var_os("PLIRON_REMATLOOP").is_none_or(|v| v != "0"))
                 && let Some(lp) = loop_analysis.innermost_loop(arg.in_block)
                 && loop_analysis.innermost_loop(insert_block) == Some(lp)
             {
@@ -662,6 +711,7 @@ impl<'a> Elaborator<'a> {
                             &mut self.func,
                             &mut self.remat_copies,
                             self.loop_analysis,
+                            &self.call_loops,
                             insert_block,
                             before,
                             arg_value,
@@ -810,6 +860,7 @@ impl<'a> Elaborator<'a> {
                     &mut self.func,
                     &mut self.remat_copies,
                     self.loop_analysis,
+                    &self.call_loops,
                     block,
                     inst,
                     &mut new_arg,

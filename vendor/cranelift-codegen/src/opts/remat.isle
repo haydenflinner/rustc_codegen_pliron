@@ -44,6 +44,15 @@
 ;; strictly more work than pinning it in a vreg, and under real
 ;; register pressure regalloc spills either way. (Was: remat only
 ;; when `imm64_remat_cheap`, i.e. one-instruction immediates.)
+;; PLIRON_REMATCALL=1 brings back the one-instruction ones: the elaborator
+;; then clones them only into blocks outside loops or inside loops that
+;; contain a call, where the pinned constant would cross that call in a
+;; callee-saved register or a spill slot (regex-syntax: 778 reloads
+;; of spilled 0/1/-1/sizes).
+(rule (simplify x @ (iconst ty k))
+      (if (pliron_remat_call))
+      (if (imm64_remat_cheap ty k))
+      (remat x))
 (rule (simplify x @ (f32const _ _))
       (remat x))
 (rule (simplify x @ (f64const _ _))

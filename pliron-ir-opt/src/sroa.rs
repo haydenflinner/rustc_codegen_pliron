@@ -1106,6 +1106,15 @@ fn split(
 
     let count = alloca.deref(ctx).get_operand(ctx, 0);
     let i8t: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
+    // `PLIRON_LTUNDEF=1`: each promoted slice keeps the parent's
+    // `llvm.lifetime` markers, which lowering turns into "contents
+    // undefined" defs of the slice's variables. Without them a slice's
+    // value reaches around a loop to the next iteration: a `Result<(),
+    // E>` local whose `Ok` writes only the niche word carries E's other
+    // fields as loop-carried block params from one iteration's `Err` to
+    // the next, which spill in call-heavy loops (NestLimiter::check:
+    // 45 such params, 624 B of spill slots).
+    let ltundef = crate::env_is("PLIRON_LTUNDEF", "1");
     // All pinned slices share one stack object: a callee handed a pointer
     // into the pin range may legally roam the whole extent, and per-slice
     // allocas aren't guaranteed to sit contiguously. The object covers
@@ -1182,6 +1191,9 @@ fn split(
             };
             st.allocas.insert(v, (s.size, al.max(1)));
             st.promoted.insert(v, s.ty);
+            if ltundef {
+                inherit_markers(ctx, st, a, v);
+            }
             v
         })
         .collect();
@@ -1886,6 +1898,11 @@ fn forward_single_store_d(
             .get(&o)
             .copied()
     };
+    // `PLIRON_LTUNDEF=1`: lifetime markers touch no bytes, so they don't
+    // block forwarding (the slices `split` gives markers would otherwise
+    // never forward). Sound: a load past a `lifetime.start` reads undefined
+    // bytes, which the single stored value refines.
+    let skip_markers = crate::env_is("PLIRON_LTUNDEF", "1");
     let mut n = 0;
     for op in allocs {
         let (mut store, mut loads, mut geps, mut ok) = (None, Vec::new(), Vec::new(), true);
@@ -1910,7 +1927,11 @@ fn forward_single_store_d(
                         work.push(o.deref(ctx).get_result(ctx, 0));
                         true
                     } else {
-                        false
+                        skip_markers
+                            && matches!(
+                                intrinsic(st, o),
+                                Some("llvm.lifetime.start" | "llvm.lifetime.end")
+                            )
                     };
             }
         }

@@ -257,6 +257,10 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
             .then_some(())
     }
 
+    fn pliron_remat_call(&mut self) -> Option<()> {
+        crate::egraph::elaborate::remat_call_on().then_some(())
+    }
+
     fn resolve_jump_table_entry(&mut self, table: JumpTable, index: u64) -> BlockCall {
         let jt_data = &self.ctx.func.dfg.jump_tables[table];
         let entries = jt_data.as_slice();

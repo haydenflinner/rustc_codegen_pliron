@@ -27,7 +27,7 @@ use cranelift_entity::{EntitySet, SecondaryMap};
 use smallvec::SmallVec;
 
 mod cost;
-mod elaborate;
+pub(crate) mod elaborate;
 
 /// An iterator that yields blocks in a depth-first pre-order traversal of the
 /// dominator tree, where each node's children are visited in order of

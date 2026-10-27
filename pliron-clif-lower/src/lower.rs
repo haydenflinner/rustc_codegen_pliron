@@ -1398,6 +1398,8 @@ pub fn lower_module<'a>(
                     opnds: std::mem::take(&mut scratch.opnds),
                     succs: std::mem::take(&mut scratch.succs),
                     lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
+                    ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
+                    ltzero: FxHashSet::default(),
                     dbg_slots: Default::default(),
                 };
                 if pliron_cfg::tracing_on() {
@@ -2410,6 +2412,8 @@ pub fn lower_clif_wasm(
                 opnds: std::mem::take(&mut scratch.opnds),
                 succs: std::mem::take(&mut scratch.succs),
                 lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
+                ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
+                ltzero: FxHashSet::default(),
                 dbg_slots: Default::default(),
             };
             fl.lower(f.op);
@@ -2920,6 +2924,15 @@ struct FnLower<'a, 'b> {
     /// `PLIRON_LOWERFOLD` memoized — was ~1M `config()` probes per
     /// regex-syntax compile from the per-op site in `lower_op_inner`.
     lowerfold: bool,
+    /// `PLIRON_LTUNDEF=1`: a lifetime marker on a promoted alloca redefines
+    /// its variables as zero (see the marker arm of `lower_intrinsic`).
+    ltundef: bool,
+    /// The zeros `ltundef` emits at markers. They are skipped when a later
+    /// marker picks its anchor: a zero no read uses dies in the pipeline,
+    /// and a marker anchored on a dead inst falls back to its whole block,
+    /// blurring slotmerge's lifetimes (NestLimiter's error-kind temps
+    /// stopped sharing a slot).
+    ltzero: FxHashSet<ir::Inst>,
     /// `-g`: see `FnJob::dbg_slots`.
     dbg_slots: pliron_clif_opt::dbglabel::DbgSlots,
 }
@@ -6726,6 +6739,31 @@ impl<'a, 'b> FnLower<'a, 'b> {
             return self.set1(op, r);
         }
         if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
+            // `PLIRON_LTUNDEF=1`: outside its lifetime a local's bytes are
+            // undefined, so a promoted alloca's variables restart at zero
+            // here. That ends the previous value's live range: it no longer
+            // flows around a loop into the next iteration's join, where it
+            // would sit in a block param (and, across calls, a spill slot)
+            // that no read can legally observe.
+            if self.ltundef
+                && let Some(vars) = self.vars.get(&opnds[1]).cloned()
+                && self.b.current_block().is_some()
+            {
+                for (var, t) in vars {
+                    let z = self.iconst_any(t, 0);
+                    self.b.def_var(var, z);
+                    if let Some(i) = self.b.func.dfg.value_def(z).inst() {
+                        // `iconcat` for i128: its two iconsts too.
+                        self.ltzero.insert(i);
+                        for &a in self.b.func.dfg.inst_args(i) {
+                            if let Some(ai) = self.b.func.dfg.value_def(a).inst() {
+                                self.ltzero.insert(ai);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             // Not code — a storage-liveness marker. Record where it lands:
             // the instruction just emitted before it is the anchor (the
             // marker sits between it and whatever comes next), and the
@@ -6734,7 +6772,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // inlined alloca may not be lowered yet, and materializing it
             // here would panic.
             if let Some(b) = self.b.current_block() {
-                let anchor = self.b.func.layout.block_insts(b).last();
+                let mut anchor = self.b.func.layout.last_inst(b);
+                while let Some(i) = anchor.filter(|i| self.ltzero.contains(i)) {
+                    anchor = self.b.func.layout.prev_inst(i);
+                }
                 self.lifetimes
                     .push((opnds[1], anchor, b, name == "llvm.lifetime.start"));
             }

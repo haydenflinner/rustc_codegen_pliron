@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   sroa spills inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -225,6 +225,28 @@ t_sroa() {
   # fields live, and multiple pinned args on one call retarget
   # independently (two Pins on one op must not trip the self-copy guard).
   rustc $BE --edition 2021 -O -C codegen-units=1 tests/sroa/main.rs -o $out/sroa$exe && $out/sroa$exe
+}
+
+t_spills() {
+  # Spill-cutting flags (docs/history/2026-10-27-spills.md) must not change
+  # what tests/spills computes. PLIRON_LTUNDEF restarts SROA-promoted locals
+  # at zero at their lifetime markers: locals whose storage window sits
+  # inside a loop (a `Result<(), E>` per iteration, an inlined inner visitor
+  # loop) and one carried across iterations must print the same either way.
+  # PLIRON_REMATCALL rematerializes cheap constants into loops that contain
+  # calls: `ltu_visit`'s spill area must also shrink under it.
+  PLIRON_LTUNDEF=0 PLIRON_REMATCALL=0 PLIRON_FRAME_INFO=ltu_visit rustc $BE --edition 2021 -O -C codegen-units=1 tests/spills/main.rs -o $out/spills0$exe 2> $out/spills0.fi &&
+      $out/spills0$exe > $out/spills.out
+  PLIRON_LTUNDEF=1 PLIRON_REMATCALL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/spills/main.rs -o $out/spills1$exe &&
+      $out/spills1$exe | diff --strip-trailing-cr - $out/spills.out
+  PLIRON_REMATCALL=1 PLIRON_LTUNDEF=1 PLIRON_FRAME_INFO=ltu_visit rustc $BE --edition 2021 -O -C codegen-units=1 tests/spills/main.rs -o $out/spills2$exe 2> $out/spills2.fi &&
+      $out/spills2$exe | diff --strip-trailing-cr - $out/spills.out
+  local s0 s2
+  s0=$(sed -nE 's/^frame-info .*ltu_visit: .*spills=([0-9]+).*/\1/p' $out/spills0.fi)
+  s2=$(sed -nE 's/^frame-info .*ltu_visit: .*spills=([0-9]+).*/\1/p' $out/spills2.fi)
+  if [[ -z "$s0" || -z "$s2" || "$s2" -ge "$s0" ]]; then
+    echo "spills: ltu_visit spill bytes $s0 -> $s2 under PLIRON_REMATCALL (want a drop)"; return 1
+  fi
 }
 
 t_inlinecm() {
@@ -808,6 +830,7 @@ want polsw && t_polsw
 want tailrec && t_tailrec
 want sroa && t_sroa
 want inlinecm && t_inlinecm
+want spills && t_spills
 want retattr && t_retattr
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
