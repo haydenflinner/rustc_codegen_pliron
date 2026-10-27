@@ -180,6 +180,10 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                 info.arg_noalias = (v.len() == cargs.len())
                     .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
+            if let Some(v) = info.arg_byval_ro.take() {
+                info.arg_byval_ro = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
             st.calls.insert(nc, info);
             if let Some(u) = st.invokes.remove(c) {
                 st.invokes.insert(nc, u);
@@ -380,6 +384,9 @@ fn rewrite(
         }
         if let Some(v) = info.arg_noalias.take() {
             info.arg_noalias = (v.len() == cargs.len()).then(|| v[1..].into());
+        }
+        if let Some(v) = info.arg_byval_ro.take() {
+            info.arg_byval_ro = (v.len() == cargs.len()).then(|| v[1..].into());
         }
         st.calls.insert(nc, info);
         if let Some(u) = st.invokes.remove(c) {

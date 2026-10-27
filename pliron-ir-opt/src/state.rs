@@ -304,6 +304,11 @@ pub struct CallInfo {
     /// copy can never be legally used to touch the pointee afterwards —
     /// SROA treats such pins as non-escaping and syncs around them.
     pub arg_noalias: Option<Box<[bool]>>,
+    /// Per-operand (indexed like `nocap`): a by-value `Indirect` param the
+    /// callee never writes through — rustc's deduced `readonly`
+    /// (`DeducedParamAttrs::read_only`). memcpyopt passes the caller's
+    /// own local instead of a copy of it (`PLIRON_BYVALHOME`).
+    pub arg_byval_ro: Option<Box<[bool]>>,
     /// `black_box` barrier: the callee is a never-defined `__pliron_bb*`
     /// symbol; lowering emits the CLIF `black_box` op instead of a call.
     pub bb: bool,
@@ -341,6 +346,11 @@ pub struct State {
     pub lt_root: ColMap<Value, Value>,
     /// Fresh copies SROA makes for a diverging call; never split again.
     pub escape_copies: ColSet<Value>,
+    /// `PLIRON_BYVALHOME=1`: allocas memcpyopt handed to a call by value
+    /// in place of an argument copy (`memcpyopt::try_byval`). SROA leaves
+    /// them one stack object: split, every other access would scalarize
+    /// and the call would get a fresh copy of the scalars again.
+    pub homes: ColSet<Value>,
     pub calls: ColMap<Ptr<Operation>, CallInfo>,
     pub intrinsics: ColMap<Ptr<Operation>, String>,
     pub rmw: ColMap<Ptr<Operation>, AtomicRmwKindAttr>,

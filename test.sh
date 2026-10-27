@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa spills slotpromlt inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -280,6 +280,29 @@ t_slotpromlt() {
   z0=$(wc -c < $out/spl0.o); z3=$(wc -c < $out/spl3.o)
   if [[ "$z3" -ge "$z0" ]]; then
     echo "slotpromlt: object $z0 -> $z3 bytes under PLIRON_RA2_XBLOCK (want a drop)"; return 1
+  fi
+}
+
+t_byvalhome() {
+  # PLIRON_BYVALHOME: a by-value argument copy of a local (`memcpy(tmp,
+  # local); call f(tmp)`) becomes the local itself when the local gets a
+  # whole new value before anything reads it again, and the local then
+  # stays one stack object through SROA (docs/history/2026-10-27-spills3.md).
+  # A parser-shaped loop that moves a 72-byte aggregate through `?` calls
+  # and rebuilds it from their results must print the same with the flag
+  # off and on (the output also matches stock rustc), and `parse`'s frame
+  # must shrink (the temps and the scalarized local's spills go away).
+  PLIRON_BYVALHOME=0 PLIRON_FRAME_INFO=5parse rustc $BE --edition 2021 -O -C codegen-units=1 tests/byval_home/main.rs -o $out/bvh0$exe 2> $out/bvh0.fi &&
+      $out/bvh0$exe > $out/bvh.out
+  PLIRON_BYVALHOME=1 PLIRON_FRAME_INFO=5parse rustc $BE --edition 2021 -O -C codegen-units=1 tests/byval_home/main.rs -o $out/bvh1$exe 2> $out/bvh1.fi &&
+      $out/bvh1$exe | diff --strip-trailing-cr - $out/bvh.out
+  PLIRON_BYVALHOME=1 rustc $BE --edition 2021 tests/byval_home/main.rs -o $out/bvh2$exe &&
+      $out/bvh2$exe | diff --strip-trailing-cr - $out/bvh.out
+  local s0 s1
+  s0=$(sed -nE 's/^frame-info .*5parse[^:]*: .*fixed=([0-9]+).*/\1/p' $out/bvh0.fi | head -1)
+  s1=$(sed -nE 's/^frame-info .*5parse[^:]*: .*fixed=([0-9]+).*/\1/p' $out/bvh1.fi | head -1)
+  if [[ -z "$s0" || -z "$s1" || "$s1" -ge "$s0" ]]; then
+    echo "byvalhome: parse frame bytes $s0 -> $s1 under PLIRON_BYVALHOME (want a drop)"; return 1
   fi
 }
 
@@ -955,6 +978,7 @@ want sroa && t_sroa
 want inlinecm && t_inlinecm
 want spills && t_spills
 want slotpromlt && t_slotpromlt
+want byvalhome && t_byvalhome
 want retattr && t_retattr
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR

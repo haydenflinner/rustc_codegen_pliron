@@ -980,7 +980,12 @@ fn split(
     let Some(&(size, align)) = st.allocas.get(a) else {
         return false;
     };
-    if st.escape_copies.contains(a) {
+    // `homes`: a local memcpyopt passes to a call by value in place of an
+    // argument copy (`PLIRON_BYVALHOME`). Split, every other access would
+    // scalarize and the call would get a fresh copy of the scalars again
+    // (`Kind::Escape`/`Pin` below) — nine loop-carried SSA values for
+    // regex-syntax's `concat = self.push_group(concat)?`.
+    if st.escape_copies.contains(a) || st.homes.contains(a) {
         return false;
     }
     if st.promoted.contains(a) {

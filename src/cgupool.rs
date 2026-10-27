@@ -1148,6 +1148,15 @@ pub(crate) fn iropt_head(
     if pass_enabled("PLIRON_NOCAP") {
         pt!(prof, cgu, "nocap", nocapture::run(ctx, st));
     }
+    // `PLIRON_BYVALHOME=1`: a by-value argument copy of a local becomes
+    // the local itself (memcpyopt::try_byval); the local then stays one
+    // stack object through sroa (`State::homes`). After phisimp (no block
+    // args carry the local's address) and nocap (the home's other call
+    // operands must be non-captured).
+    if pass_enabled("PLIRON_SROA") && env_is("PLIRON_BYVALHOME", "1") {
+        pt!(prof, cgu, "byvalhome", memcpyopt::run_byval(ctx, st));
+        pt!(prof, cgu, "domcheck:bv", domcheck::run(ctx, st, "byvalhome"));
+    }
     if pass_enabled("PLIRON_SROA") {
         pt!(prof, cgu, "sroa", sroa::run(ctx, st));
         pt!(prof, cgu, "domcheck:sroa", domcheck::run(ctx, st, "sroa"));

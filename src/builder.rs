@@ -248,6 +248,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 nocap: None,
                 arg_extent: None,
                 arg_noalias: None,
+                arg_byval_ro: None,
                 bb: false,
                 callee: callee_sym,
                 noret: false,
@@ -1224,7 +1225,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let mut nc = vec![false; full.len()];
         let mut exts = vec![(0u64, 0u64); full.len()];
         let mut nals = vec![false; full.len()];
-        let (mut any_nc, mut any_ex, mut any_nal) = (false, false, false);
+        let mut ros = vec![false; full.len()];
+        let (mut any_nc, mut any_ex, mut any_nal, mut any_ro) = (false, false, false, false);
         if let Some(abi) = fn_abi {
             use rustc_target::callconv::PassMode;
             let mut j = usize::from(return_slot.is_indirect());
@@ -1251,6 +1253,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     && deduced
                         .get(ai + 1)
                         .is_some_and(|d| d.captures_none(self.tcx, env, a.layout.ty));
+                // A by-value (Indirect, Rust ABI) param the callee never
+                // writes through — what LLVM gets as `readonly`. memcpyopt
+                // may then pass the caller's local itself instead of the
+                // argument copy (`PLIRON_BYVALHOME`).
+                let ro = matches!(a.mode, PassMode::Indirect { mode: rustc_target::callconv::IndirectMode::Pointer, .. })
+                    && deduced
+                        .get(ai + 1)
+                        .is_some_and(|d| d.read_only(self.tcx, env, a.layout.ty));
                 // The `(size, align)` range the callee may legally reach
                 // through this operand: a ref's pointee layout, or the
                 // whole arg for Indirect. Raw pointers are excluded —
@@ -1305,10 +1315,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     if na.get(k).copied().unwrap_or(false) {
                         nals[j + k] = true;
                     }
+                    if ro {
+                        ros[j + k] = true;
+                    }
                 }
                 any_nc |= cap;
                 any_ex |= ext.is_some_and(|e| e.0 > 0);
                 any_nal |= na.iter().any(|b| *b);
+                any_ro |= ro;
                 j += n;
             }
         }
@@ -1321,6 +1335,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             info.nocap = any_nc.then(|| nc.into_boxed_slice());
             info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
             info.arg_noalias = any_nal.then(|| nals.into_boxed_slice());
+            info.arg_byval_ro = any_ro.then(|| ros.into_boxed_slice());
             // rustc's `noreturn` (rustc_codegen_llvm `apply_attrs_llfn`): the
             // return layout is uninhabited, so the call cannot come back.
             info.noret = fn_abi.is_some_and(|a| a.ret.layout.is_uninhabited());
