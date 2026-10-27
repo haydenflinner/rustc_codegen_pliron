@@ -8,8 +8,12 @@ noise. Memory, code size and stack don't depend on load.
 
 | | SPD | CMP | MEM | SIZ | STK | COR | **overall** |
 |---|---|---|---|---|---|---|---|
-| A: defaults | 106 | 107 | 36 | 37 | 87 | 122 | **92** |
-| B: A + candidates | 107 | 105 | 59 | 40 | 88 | 122 | **95** |
+| A: defaults | 106 | 107 | 36 | 37 | 87 | 100 | **88** |
+| B: A + candidates | 107 | 105 | 59 | 40 | 88 | 100 | **91** |
+
+(Corrected 11:20: the first version of this page scored COR 122, so 92 and
+95 overall. See "COR is overstated" below; the card now caps the UI ratio
+at parity and these are the recomputed numbers from the same runs.)
 
 B adds the candidate flags that are clean so far: `EDGEDEDUP JT_SHAPE
 LOWERFREE JEARENA CGU_ACAP=8 CMP3 LTUNDEF NORETTRAP EDGEMERGE=1 EPIMERGE=1
@@ -53,14 +57,14 @@ Per input (time / peak RSS / machine code):
 - **SPD:** B's native geomean is 0.888 vs 0.914. Within the noise, but no
   sign of a regression. Kernels still behind LLVM in both cards:
   parse_only, strwork, varint and eqbug, plus chars_alpha in B.
-- **COR is overstated.** It rates 122 partly because the UI input
-  counts 4 stage-1-only failures (environment flakes on the LLVM-built
-  compiler) in pliron's favour. The fuzz and crates inputs read the last
-  saved result files, which were a one-seed and a one-crate rerun.
-  Their ratios happen to match the full overnight runs on the defaults:
-  1 failing seed (13475) in about 400 gives r = 2, and 37 of 37 crates
-  clean. Follow-up: have the card read the newest *full* run of each
-  suite, and cap the UI ratio at 1.
+- **COR was overstated** in the first version of this page (122). The UI
+  input counted 4 stage-1-only failures (environment flakes on the
+  LLVM-built compiler: dsymutil, backtraces) in pliron's favour, and the
+  fuzz and crates inputs read the last saved result files, which were a
+  one-seed and a one-crate rerun. `parity.py` now caps the UI ratio at
+  parity and ignores result files from fewer than 100 seeds or 10
+  crates. With fuzz at 1 failing seed (13475, since fixed) in 400 and 37
+  of 37 crates clean, COR is 100 either way.
 
 ## Open, in priority order
 

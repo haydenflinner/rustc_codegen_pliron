@@ -120,23 +120,26 @@ def age(path):
 def correctness():
     """{suite: (ratio, detail)} from the latest saved runs. Each suite's ratio
     is (pliron failures + 1) / (LLVM failures + 1): the +1 keeps a clean run
-    finite, and one failure against none rates 50."""
+    finite, and one failure against none rates 50. Never below parity for
+    the UI suite, and small reruns don't count."""
     out = {}
     s1, s2 = lines(os.path.join(VERIFY, "stage1.failures")), lines(os.path.join(VERIFY, "stage2.failures"))
     if s1 is not None and s2 is not None and not os.path.exists(os.path.join(VERIFY, "stage2.incomplete")):
         only2, only1 = set(s2) - set(s1), set(s1) - set(s2)
-        out["ui"] = ((len(only2) + 1) / (len(only1) + 1),
+        # Capped at parity: stage-1-only failures on this box are
+        # environment issues (dsymutil, backtraces), not LLVM codegen.
+        out["ui"] = (max(1.0, (len(only2) + 1) / (len(only1) + 1)),
                      f"{len(only2)} stage-2-only vs {len(only1)} stage-1-only "
                      f"({age(os.path.join(VERIFY, 'stage2.failures'))})")
     cp = os.path.join(ROOT, "target/crates/report.json")
-    if os.path.exists(cp):
-        rows = json.load(open(cp))
+    # A `--only` rerun or a one-seed bisect overwrites the same result
+    # files; only a run of real size counts.
+    if os.path.exists(cp) and len(rows := json.load(open(cp))) >= 10:
         bad = sum(max(len(r.get("pliron_only", [])), r["status"] in ("ICE", "BUILD", "FAIL", "TIMEOUT"))
                   for r in rows)
         out["crates"] = (bad + 1, f"{bad} pliron-only across {len(rows)} crates ({age(cp)})")
     fp = os.path.join(ROOT, "target/harness/fuzz/results.json")
-    if os.path.exists(fp):
-        res = json.load(open(fp))
+    if os.path.exists(fp) and len(res := json.load(open(fp))) >= 100:
         bad = sum(v[0] != "pass" for v in res.values())
         out["fuzz"] = (bad + 1, f"{bad} of {len(res)} seeds ({age(fp)})")
     return out
