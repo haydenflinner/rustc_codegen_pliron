@@ -2938,7 +2938,7 @@ pub fn coldedges(func: &mut Function) -> usize {
 /// The aarch64 backend lowers `iadd x, (umulhi 0, 1)` to a plain
 /// register copy into a fresh vreg (`mov`, dropped at emission when
 /// regalloc gives both sides the same register), so neither the `umulh`
-/// nor the `add` reaches the object: on regex-syntax these were 1,394 of
+/// nor the `add` reaches the object: on regex-syntax these were 1,396 of
 /// pliron's 1,427 `umulh`s. Other ISAs lower it like the `umulhi a, 0`
 /// form, at the same cost. The `1` (rather than a second `0`) keeps the
 /// pattern distinct from the default form when `a` is itself a zero.
