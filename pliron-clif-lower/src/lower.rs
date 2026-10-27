@@ -352,9 +352,12 @@ impl CtxSlot<'_> {
 /// staying resident until the object is written while the shared fn pool
 /// drains; and a compiled `FnJob` sheds its CLIF body and lowering facts,
 /// keeping only the code, the external-name table its relocations
-/// resolve through, and its stats. Native objects without `-g` only (the
-/// DWARF writer reads both afterwards). Only frees: the object bytes are
-/// unchanged (docs/determinism.md R3).
+/// resolve through, and its stats. No `-g` (the DWARF writer reads both
+/// afterwards). On wasm ([`lower_clif_wasm`]) the `Context` goes at the
+/// same point — the emitter serialized its link section and custom
+/// sections beforehand — and a job sheds its facts but keeps the
+/// optimized CLIF the waffle translation reads. Only frees: the object
+/// bytes are unchanged (docs/determinism.md R3).
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
 }
@@ -548,6 +551,13 @@ impl FnJob {
     fn shed(&mut self, params: ir::function::FunctionParameters) {
         self.func = ir::Function::new();
         self.func.params = params;
+        self.shed_facts();
+    }
+
+    /// After the pipeline: drop every lowering-fact table (pipeline
+    /// inputs). The wasm path keeps `func`, the optimized CLIF the waffle
+    /// emitter translates, and sheds only these.
+    fn shed_facts(&mut self) {
         self.dbg_slots = Default::default();
         self.nonnull = Default::default();
         self.derived = Default::default();
@@ -644,8 +654,9 @@ struct JobShared {
     /// wasm (`lower_clif_wasm`): pipeline only — the optimized CLIF goes
     /// back in `FnJob::func` for the waffle emitter, no Cranelift compile.
     wasm: bool,
-    /// `PLIRON_LOWERFREE` (native, no `-g`): a compiled job keeps only
-    /// what phase (C) reads (see [`FnJob::shed`]).
+    /// `PLIRON_LOWERFREE` (no `-g`): a compiled job keeps only what phase
+    /// (C) reads (see [`FnJob::shed`]); a wasm job keeps only its CLIF
+    /// ([`FnJob::shed_facts`]).
     shed: bool,
 }
 
@@ -899,6 +910,9 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     if sh.wasm {
         j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
         clctx.clear();
+        if sh.shed {
+            j.shed_facts();
+        }
         return;
     }
     // Panics inside Cranelift (verifier, egraph, regalloc asserts)
@@ -1019,21 +1033,10 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
 
 /// Phase (B) over the jobs `produce` lowers (each emitted with its
 /// declaration index): serial when `nthreads <= 1`, else streamed into the
-/// process-wide pool with work-while-you-wait. `produced` runs once
-/// production ends. Returns the finished jobs in declaration order.
-fn run_jobs(
-    nthreads: usize,
-    name: &str,
-    produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJob)),
-    produced: &mut dyn FnMut(),
-) -> Vec<FnJob> {
-    let p = start_jobs(nthreads, produce);
-    produced();
-    finish_jobs(p, name)
-}
-
-/// Phase (B) jobs produced but not yet run (serial) or not yet collected
-/// (pool): [`start_jobs`] ends phase (A), [`finish_jobs`] drains.
+/// process-wide pool with work-while-you-wait. [`start_jobs`] ends phase
+/// (A) and [`finish_jobs`] drains, returning the finished jobs in
+/// declaration order; the caller frees what phase (B) no longer reads in
+/// between (`PLIRON_LOWERFREE`).
 enum Pending {
     Serial(Vec<FnJob>),
     Pool {
@@ -2320,14 +2323,22 @@ pub struct WasmClif {
 /// checks (`verify_is_address`, `global_type`) don't apply, so
 /// `PLIRON_VERIFY` verifies with flags only, same as the pipeline's
 /// per-step checks.
+///
+/// The `Context` comes through a slot: under `PLIRON_LOWERFREE` an owned
+/// one is dropped once phase (A) has lowered every function, before the
+/// pipeline drains (see [`lowerfree`]). The caller must have read
+/// everything it needs from the `Context` beforehand.
 pub fn lower_clif_wasm(
-    ctx: &Context,
+    ctx_slot: &mut CtxSlot<'_>,
     st: &State,
     host: &dyn Host,
     cgu: &str,
     unwind: bool,
     simd: bool,
 ) -> WasmClif {
+    let ctx: &Context = ctx_slot.get();
+    // `PLIRON_LOWERFREE`: nothing below phase (A) reads `ctx`.
+    let free_ctx = lowerfree() && st.dbg.is_none();
     // wasm32 is not a Cranelift target; the bookkeeping ObjectModule and
     // FnLower run on the *host* ISA (see the doc comment). The ISA is never
     // used to emit machine code, so flags/features do not matter beyond
@@ -2461,7 +2472,7 @@ pub fn lower_clif_wasm(
         prof: host.prof().clone(),
         fn_names: decl_names,
         wasm: true,
-        shed: false,
+        shed: free_ctx,
     });
     let mut scratch = FlScratch::default();
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
@@ -2632,10 +2643,22 @@ pub fn lower_clif_wasm(
         m.clear_context(&mut clctx);
     }
     };
-    let out: Vec<(String, ir::Function)> = run_jobs(nthreads, cgu, &mut produce, &mut || {})
+    let pending = start_jobs(nthreads, &mut produce);
+    pliron_cfg::mark(&format!("wasm-pA {cgu}"));
+    if free_ctx {
+        // Phase (A) was the last reader of the pliron `Context`.
+        let t = std::time::Instant::now();
+        ctx_slot.release();
+        pliron_cfg::trace("*lowerfree*", t.elapsed().as_secs_f64() * 1e3, cgu);
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "lowerfree {cgu}: pliron Context released after phase (A)");
+        }
+    }
+    let out: Vec<(String, ir::Function)> = finish_jobs(pending, cgu)
         .into_iter()
         .map(|j| (j.name, j.func))
         .collect();
+    pliron_cfg::mark(&format!("wasm-pB {cgu}"));
     CUR_FN.with(|c| c.borrow_mut().clear());
     // FnLower can declare more symbols mid-lower (libcalls, va_fids, lazy
     // data refs) — build the id->name tables last.

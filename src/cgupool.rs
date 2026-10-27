@@ -1353,7 +1353,7 @@ pub(crate) fn finish_b(
         tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", print_ir(ctx.get(), module))
     }
     let obj = if cfg.wasm {
-        wasm::lower_to_wasm_clif(ctx.get(), st, host, name, &cfg.wasm_features, cfg.unwind)
+        wasm::lower_to_wasm_clif(ctx, st, host, name, &cfg.wasm_features, cfg.unwind)
     } else {
         lower::lower_to_object(
             cfg.unwind,

@@ -282,12 +282,46 @@ pub fn target_features(
     f
 }
 
+/// What the module tail reads from the pliron `Context`: the `pliron.link`
+/// section and the `#[link_section]` custom sections. Serialized before
+/// CLIF lowering so `PLIRON_LOWERFREE` can drop the `Context` once phase
+/// (A) is done (pure functions of the `Context` and `State`, which
+/// lowering doesn't change: the bytes are the same either way).
+struct ModTail {
+    link: Vec<u8>,
+    custom: Vec<(String, Vec<u8>)>,
+}
+
+impl ModTail {
+    fn new(ctx: &Context, st: &State) -> Self {
+        let link = link_section(ctx, st);
+        // `#[link_section = "name"]` statics are wasm custom sections, which
+        // the linker concatenates (wasm-bindgen's `__wasm_bindgen_unstable`
+        // metadata).
+        let mut custom = Vec::new();
+        for (n, g) in &st.globals {
+            if let (Some(sec), Some(init)) = (custom_section_name(g), g.init) {
+                let (size, _) = size_align(ctx, init.get_type(ctx));
+                let mut data = vec![0u8; size as usize];
+                let mut relocs = Vec::new();
+                write_const(ctx, st, init, 0, &mut data, &mut relocs);
+                assert!(
+                    relocs.is_empty(),
+                    "pliron-wasm: {n}: relocations in custom section {sec}"
+                );
+                custom.push((sec.to_string(), data));
+            }
+        }
+        ModTail { link, custom }
+    }
+}
+
 /// Module tail: waffle-IR inlining, function
 /// index remap (imports first), per-body wasm emit with stub fallback,
 /// exports, and the `pliron.link`/`target_features`/custom sections.
 fn emit_obj(
     mut o: Obj,
-    ctx: &Context,
+    tail: ModTail,
     st: &State,
     name: &str,
     features: &[String],
@@ -304,6 +338,7 @@ fn emit_obj(
         winline(&mut o.funcs, verbose, o.sp);
     }
     pliron_cfg::trace("*wasm-winline*", t0.elapsed().as_secs_f64() * 1e3, name);
+    pliron_cfg::mark(&format!("wasm-winline {name}"));
     let t0 = std::time::Instant::now();
 
     // Only import functions that are actually called; GOT.func globals
@@ -400,17 +435,20 @@ fn emit_obj(
         );
     }
     pliron_cfg::trace("*wasm-compile*", t0.elapsed().as_secs_f64() * 1e3, name);
+    pliron_cfg::mark(&format!("wasm-compile {name}"));
     let t0 = std::time::Instant::now();
     let mut bytes =
         o.m.to_wasm_bytes()
             .unwrap_or_else(|e| panic!("pliron-wasm: {name}: {e}"));
     pliron_cfg::trace("*wasm-bytes*", t0.elapsed().as_secs_f64() * 1e3, name);
+    pliron_cfg::mark(&format!("wasm-bytes {name}"));
     let t0 = std::time::Instant::now();
     if crate::pass_enabled("PLIRON_WASM_PEEP") {
         wpeep(&mut bytes, name);
     }
     pliron_cfg::trace("*wasm-peep*", t0.elapsed().as_secs_f64() * 1e3, name);
-    custom_section(&mut bytes, "pliron.link", &link_section(ctx, st));
+    pliron_cfg::mark(&format!("wasm-peep {name}"));
+    custom_section(&mut bytes, "pliron.link", &tail.link);
     let mut tf = Vec::new();
     leb(&mut tf, features.len() as u32);
     for f in features {
@@ -419,20 +457,8 @@ fn emit_obj(
         tf.extend_from_slice(f.as_bytes());
     }
     custom_section(&mut bytes, "target_features", &tf);
-    // `#[link_section = "name"]` statics are wasm custom sections, which the
-    // linker concatenates (wasm-bindgen's `__wasm_bindgen_unstable` metadata).
-    for (n, g) in &st.globals {
-        if let (Some(sec), Some(init)) = (custom_section_name(g), g.init) {
-            let (size, _) = size_align(ctx, init.get_type(ctx));
-            let mut data = vec![0u8; size as usize];
-            let mut relocs = Vec::new();
-            write_const(ctx, st, init, 0, &mut data, &mut relocs);
-            assert!(
-                relocs.is_empty(),
-                "pliron-wasm: {n}: relocations in custom section {sec}"
-            );
-            custom_section(&mut bytes, sec, &data);
-        }
+    for (sec, data) in &tail.custom {
+        custom_section(&mut bytes, sec, data);
     }
     bytes
 }
@@ -12023,8 +12049,14 @@ mod clif_emit {
     /// The wasm path: lower_clif_wasm gives each defined function's
     /// optimized CLIF + FuncId/DataId symbol tables; CX translates them to
     /// waffle; `emit_obj` finishes the module.
+    ///
+    /// Everything read from the pliron `Context` (the signatures, the link
+    /// and custom sections) is taken before lowering, so under
+    /// `PLIRON_LOWERFREE` `lower_clif_wasm` can drop an owned `Context` as
+    /// soon as phase (A) is done, and each function's CLIF is dropped as
+    /// soon as it is translated.
     pub(crate) fn lower_to_wasm_clif(
-        ctx: &Context,
+        mut ctx: crate::lower::CtxSlot<'_>,
         st: &State,
         host: &dyn crate::lower::Host,
         name: &str,
@@ -12032,10 +12064,6 @@ mod clif_emit {
         unwind: bool,
     ) -> Vec<u8> {
         let simd = features.iter().any(|f| f == "simd128");
-        let t0 = std::time::Instant::now();
-        let mut wc = crate::lower::lower_clif_wasm(ctx, st, host, name, unwind, simd);
-        pliron_cfg::trace("*wasm-clif*", t0.elapsed().as_secs_f64() * 1e3, name);
-        let t0 = std::time::Instant::now();
         let mut m = Module::empty();
         let mem = m.memories.push(MemoryData {
             initial_pages: 0,
@@ -12070,30 +12098,46 @@ mod clif_emit {
         };
         o.sp = o.import_global("env", "__stack_pointer", true);
 
-        for (n, f) in &st.funcs {
-            if st.dead_fns.contains(n) {
-                continue;
+        // Last reads of the pliron `Context` before lowering: the
+        // signatures and the module tail's sections.
+        let tail = {
+            let c = ctx.get();
+            for (n, f) in &st.funcs {
+                if st.dead_fns.contains(n) {
+                    continue;
+                }
+                // Declare the signature from the pliron leaf-flattening; the
+                // CLIF sig is the same leaf set in the same order.
+                let sig = o.sig(wsig(c, f.ty));
+                o.funcs.push(FDecl {
+                    name: n.clone(),
+                    sig,
+                    body: None,
+                    always: f.always_inline,
+                    hint: f.inline_hint,
+                    no_inline: f.no_inline,
+                });
+                o.fidx.insert(n.clone(), o.funcs.len() - 1);
             }
-            // Declare the signature from the pliron leaf-flattening; the
-            // CLIF sig is the same leaf set in the same order.
-            let sig = o.sig(wsig(ctx, f.ty));
-            o.funcs.push(FDecl {
-                name: n.clone(),
-                sig,
-                body: None,
-                always: f.always_inline,
-                hint: f.inline_hint,
-                no_inline: f.no_inline,
-            });
-            o.fidx.insert(n.clone(), o.funcs.len() - 1);
-        }
+            ModTail::new(c, st)
+        };
+        let t0 = std::time::Instant::now();
+        let wc = crate::lower::lower_clif_wasm(&mut ctx, st, host, name, unwind, simd);
+        pliron_cfg::trace("*wasm-clif*", t0.elapsed().as_secs_f64() * 1e3, name);
+        let t0 = std::time::Instant::now();
+        let crate::lower::WasmClif {
+            funcs,
+            fn_names,
+            data_names,
+        } = wc;
         let verbose = pliron_cfg::tracing_on()
             && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
         let mut stubs = 0;
         let mut defined = 0;
-        for (n, cf) in &mut wc.funcs {
+        // By value: a function's CLIF is dropped once translated.
+        for (n, mut cf) in funcs {
             defined += 1;
-            let i = o.fidx[n];
+            let i = o.fidx[&n];
             let sig = o.funcs[i].sig;
             if verbose {
                 if pliron_cfg::tracing_on() {
@@ -12101,9 +12145,9 @@ mod clif_emit {
                 };
             }
             let body = match guarded(|| {
-                let mut cx = CX::new(&mut o, sig, &wc.fn_names, &wc.data_names);
+                let mut cx = CX::new(&mut o, sig, &fn_names, &data_names);
                 cx.name = n.clone();
-                cx.translate(cf)
+                cx.translate(&mut cf)
             }) {
                 Ok(b) => b,
                 Err(e) => {
@@ -12129,8 +12173,10 @@ mod clif_emit {
             o.funcs[i].body = Some(body);
         }
         pliron_cfg::trace("*wasm-translate*", t0.elapsed().as_secs_f64() * 1e3, name);
+        drop((fn_names, data_names));
+        pliron_cfg::mark(&format!("wasm-translate {name}"));
         let t0 = std::time::Instant::now();
-        let obj = emit_obj(o, ctx, st, name, features, stubs, defined, verbose);
+        let obj = emit_obj(o, tail, st, name, features, stubs, defined, verbose);
         pliron_cfg::trace("*wasm-emit*", t0.elapsed().as_secs_f64() * 1e3, name);
         obj
     }

@@ -23,8 +23,8 @@ disassembly differs. A known exception is reported as `expected`, not a
 failure: `serial` under PLIRON_XFACTS_ALL, whose two-phase facts exist only in
 the pool (the serial path compiles as if the flag were off).
 
-Inputs: `regex-syntax`/`syn` (harness/ctime.py's commands) and `smoke` (each
-harness smoke program). Default configs: `default` (no flags) and, with
+Inputs: `regex-syntax`/`syn`/`kernels-wasm`/`regex-wasm` (harness/ctime.py's
+commands) and `smoke` (each harness smoke program). Default configs: `default` (no flags) and, with
 --config, any NAME=ENV ("all=PLIRON_XFACTS_ALL=1 PLIRON_SM_STARTS=1 ...").
 Exit status 1 on any unexpected mismatch. Builds into target/detcheck/.
 """
@@ -62,9 +62,10 @@ def load(name):
 def inputs(names):
     out = {}
     want = set(names)
-    if want & {"regex-syntax", "syn"}:
+    ct_names = ("regex-syntax", "syn", "kernels-wasm", "regex-wasm")
+    if want & set(ct_names):
         ct = load("ctime").inputs()
-        for k in ("regex-syntax", "syn"):
+        for k in ct_names:
             if k in want and k in ct:
                 out[k] = ct[k]
     if "smoke" in want:

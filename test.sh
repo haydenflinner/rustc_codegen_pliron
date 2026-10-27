@@ -404,6 +404,21 @@ t_lowerfree() {
   diff <($out/lowerfree-stock$exe 2>&1 | sed -E "$tid") <($out/lowerfree$exe 2>&1 | sed -E "$tid")
 }
 
+t_lowerfree_wasm() {
+  # The wasm path of PLIRON_LOWERFREE: the emitter reads its signatures and
+  # link/custom sections from the Context before lowering, so the Context
+  # goes at phase (A)'s end as on native. Every CGU object must be
+  # byte-identical to the flags-off build and the Context must actually go.
+  local f w="--target wasm32-unknown-unknown --emit obj --crate-type rlib --edition 2021 -O -C codegen-units=8"
+  rm -rf $out/lowerfree-wasm-off $out/lowerfree-wasm-on
+  rustc $BE $w --out-dir $out/lowerfree-wasm-off bench/wasm/lib.rs || return 1
+  PLIRON_LOWERFREE=1 PLIRON_JEARENA=1 PLIRON_TRACE=pliron::stats=info rustc $BE $w --out-dir $out/lowerfree-wasm-on bench/wasm/lib.rs 2> $out/lowerfree-wasm.log || { grep -E "error|panicked" $out/lowerfree-wasm.log | head -5 >&2; return 1; }
+  grep -q "lowerfree .*Context released" $out/lowerfree-wasm.log || { echo "lowerfree-wasm: nothing released" >&2; return 1; }
+  for f in $out/lowerfree-wasm-off/*.o; do
+    cmp $f $out/lowerfree-wasm-on/${f##*/} || { echo "lowerfree-wasm: ${f##*/} differs from the flags-off build" >&2; return 1; }
+  done
+}
+
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
@@ -951,6 +966,7 @@ want inlinerec && t_inlinerec
 want xfactsplugin && t_xfactsplugin
 want deadfree && t_deadfree
 want lowerfree && t_lowerfree
+want lowerfree-wasm && t_lowerfree_wasm
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul
