@@ -324,6 +324,15 @@ pub struct State {
     pub allocas: ColMap<Value, (u64, u64)>,
     /// Allocas lowered as Cranelift variables (see sroa.rs), with their value type.
     pub promoted: ColMap<Value, TypeHandle>,
+    /// `PLIRON_LTUNDEF=1`: a split alloca that keeps `llvm.lifetime`
+    /// markers -> its promoted slices. Lowering restarts the slices'
+    /// variables at a marker on the parent. A side table rather than
+    /// cloned markers: one marker op per (marker, slice) cost syn +280 MiB.
+    pub lt_slices: ColMap<Value, Vec<Value>>,
+    /// Slice -> the `lt_slices` key whose markers bound it, so a slice
+    /// that loses promotion and is split again hands its pieces the same
+    /// bounds.
+    pub lt_root: ColMap<Value, Value>,
     /// Fresh copies SROA makes for a diverging call; never split again.
     pub escape_copies: ColSet<Value>,
     pub calls: ColMap<Ptr<Operation>, CallInfo>,
@@ -544,6 +553,8 @@ impl State {
         self.consts.retain(lv);
         self.allocas.retain(lv);
         self.promoted.retain(lv);
+        self.lt_slices.retain(lv);
+        self.lt_root.retain(lv);
         self.escape_copies.retain(lv);
         self.frozen.retain(lv);
         self.noalias.retain(lv);

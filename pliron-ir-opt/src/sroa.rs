@@ -1106,15 +1106,28 @@ fn split(
 
     let count = alloca.deref(ctx).get_operand(ctx, 0);
     let i8t: TypeHandle = IntegerType::get(ctx, 8, Signedness::Signless).into();
-    // `PLIRON_LTUNDEF=1`: each promoted slice keeps the parent's
-    // `llvm.lifetime` markers, which lowering turns into "contents
-    // undefined" defs of the slice's variables. Without them a slice's
+    // `PLIRON_LTUNDEF=1`: the parent's `llvm.lifetime` markers also bound
+    // its promoted slices (`State::lt_slices`); lowering turns them into
+    // "contents undefined" defs of the slices' variables. Without them a slice's
     // value reaches around a loop to the next iteration: a `Result<(),
     // E>` local whose `Ok` writes only the niche word carries E's other
     // fields as loop-carried block params from one iteration's `Err` to
     // the next, which spill in call-heavy loops (NestLimiter::check:
     // 45 such params, 624 B of spill slots).
-    let ltundef = crate::env_is("PLIRON_LTUNDEF", "1");
+    let lt_root = if !crate::env_is("PLIRON_LTUNDEF", "1") {
+        None
+    } else if a.uses_iter(ctx).any(|u| {
+        matches!(
+            intrinsic(st, u.user_op()),
+            Some("llvm.lifetime.start" | "llvm.lifetime.end")
+        )
+    }) {
+        Some(a)
+    } else {
+        st.lt_root.get(a).copied()
+    };
+    let ltundef = lt_root.is_some();
+    let mut lt_new = Vec::new();
     // All pinned slices share one stack object: a callee handed a pointer
     // into the pin range may legally roam the whole extent, and per-slice
     // allocas aren't guaranteed to sit contiguously. The object covers
@@ -1192,11 +1205,21 @@ fn split(
             st.allocas.insert(v, (s.size, al.max(1)));
             st.promoted.insert(v, s.ty);
             if ltundef {
-                inherit_markers(ctx, st, a, v);
+                lt_new.push(v);
             }
             v
         })
         .collect();
+    if let Some(r) = lt_root
+        && !lt_new.is_empty()
+    {
+        for &v in &lt_new {
+            st.lt_root.insert(v, r);
+        }
+        let mut all = st.lt_slices.remove(r).unwrap_or_default();
+        all.extend(lt_new);
+        st.lt_slices.insert(r, all);
+    }
     let find = |off: u64| {
         sl.iter()
             .position(|s| s.off <= off && off < s.off + s.size)
@@ -1899,9 +1922,8 @@ fn forward_single_store_d(
             .copied()
     };
     // `PLIRON_LTUNDEF=1`: lifetime markers touch no bytes, so they don't
-    // block forwarding (the slices `split` gives markers would otherwise
-    // never forward). Sound: a load past a `lifetime.start` reads undefined
-    // bytes, which the single stored value refines.
+    // block forwarding. Sound: a load past a `lifetime.start` reads
+    // undefined bytes, which the single stored value refines.
     let skip_markers = crate::env_is("PLIRON_LTUNDEF", "1");
     let mut n = 0;
     for op in allocs {

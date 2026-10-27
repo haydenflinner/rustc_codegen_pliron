@@ -305,6 +305,9 @@ const V_RNOALIAS: u8 = 1 << 4;
 const V_RFROZEN_OP: u8 = 1 << 5;
 /// Carries debug-info variable pieces (`Context::dbg_notes`).
 const V_DBGNOTE: u8 = 1 << 6;
+/// Has `State::lt_slices` (`PLIRON_LTUNDEF`): the clone's entry lists the
+/// clones of its slices.
+const V_LTSLICES: u8 = 1 << 7;
 
 const B_REGION: u8 = 1;
 const B_PARENT: u8 = 1 << 1;
@@ -343,6 +346,9 @@ fn tag_value(tags: &mut CalleeTags, st: &State, notes: Option<&FxHashMap<Value, 
     }
     if st.consts.contains(v) {
         m |= V_CONSTS;
+    }
+    if st.lt_slices.contains(v) {
+        m |= V_LTSLICES;
     }
     if st.region_frozen.contains(v) {
         m |= V_RFROZEN;
@@ -3126,6 +3132,10 @@ fn inline_call(
         }
         if m & V_PROMOTED != 0 {
             st.promoted.insert(nv, st.promoted[v]);
+        }
+        if m & V_LTSLICES != 0 {
+            let sl: Vec<Value> = st.lt_slices[v].iter().filter_map(|&x| map.lookup_value(x)).collect();
+            st.lt_slices.insert(nv, sl);
         }
         if m & V_CONSTS != 0 {
             st.consts.insert(nv, st.consts[v].clone());

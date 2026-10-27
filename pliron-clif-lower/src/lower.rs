@@ -6865,24 +6865,43 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // flows around a loop into the next iteration's join, where it
             // would sit in a block param (and, across calls, a spill slot)
             // that no read can legally observe.
-            if self.ltundef
-                && let Some(vars) = self.vars.get(&opnds[1]).cloned()
-                && self.b.current_block().is_some()
-            {
-                for (var, t) in vars {
-                    let z = self.iconst_any(t, 0);
-                    self.b.def_var(var, z);
-                    if let Some(i) = self.b.func.dfg.value_def(z).inst() {
-                        // `iconcat` for i128: its two iconsts too.
-                        self.ltzero.insert(i);
-                        for &a in self.b.func.dfg.inst_args(i) {
-                            if let Some(ai) = self.b.func.dfg.value_def(a).inst() {
-                                self.ltzero.insert(ai);
-                            }
+            if self.ltundef && self.b.current_block().is_some() {
+                // The marker's own alloca when it was promoted whole, and
+                // the promoted slices SROA split off it (`lt_slices`). One
+                // zero per type serves every variable the marker restarts.
+                let own = self.vars.get(&opnds[1]).cloned();
+                let mut vars = own.clone().unwrap_or_default();
+                if let Some(sl) = self.st.lt_slices.get(opnds[1]) {
+                    for s in sl {
+                        if let Some(vs) = self.vars.get(s) {
+                            vars.extend(vs.iter().copied());
                         }
                     }
                 }
-                return;
+                let mut zeros: SmallVec<[(ClType, ir::Value); 4]> = SmallVec::new();
+                for (var, t) in vars {
+                    let z = match zeros.iter().find(|(zt, _)| *zt == t) {
+                        Some(&(_, z)) => z,
+                        None => {
+                            let z = self.iconst_any(t, 0);
+                            zeros.push((t, z));
+                            if let Some(i) = self.b.func.dfg.value_def(z).inst() {
+                                // `iconcat` for i128: its two iconsts too.
+                                self.ltzero.insert(i);
+                                for &a in self.b.func.dfg.inst_args(i) {
+                                    if let Some(ai) = self.b.func.dfg.value_def(a).inst() {
+                                        self.ltzero.insert(ai);
+                                    }
+                                }
+                            }
+                            z
+                        }
+                    };
+                    self.b.def_var(var, z);
+                }
+                if own.is_some() {
+                    return;
+                }
             }
             // Not code — a storage-liveness marker. Record where it lands:
             // the instruction just emitted before it is the anchor (the
