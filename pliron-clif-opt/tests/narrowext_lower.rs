@@ -148,6 +148,29 @@ block0(v0: i32, v1: i64):
     assert_eq!(count(&a, "uxtb"), 0, "{a}");
 }
 
+/// `band (ireduce (ishl.i64 y 34)) 63` is 0: the `ireduce`'s wide source
+/// must not be folded as a shifted operand of the narrow `and`, which masks
+/// the shift amount by the i8 width (`and w, w, w, LSL 2`) instead of 64. Rustlantis
+/// seed 12309.
+#[test]
+fn band_ireduce_of_wide_shift() {
+    let a = asm("
+function %f(i64, i64) -> i8 uext apple_aarch64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 34
+    v3 = ishl v0, v2
+    store notrap v3, v1
+    v4 = ireduce.i8 v3
+    v5 = iconst.i8 63
+    v6 = band v4, v5
+    return v6
+}");
+    assert!(
+        !a.lines().any(|l| l.trim_start().starts_with("and ") && l.contains("LSL")),
+        "shift folded into the narrow and with its amount masked to i8:\n{a}"
+    );
+}
+
 /// `uextend` of a clean narrow value is a passthrough.
 #[test]
 fn uextend_clean_passthrough() {

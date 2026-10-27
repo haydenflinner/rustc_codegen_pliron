@@ -3965,7 +3965,7 @@
       (if-let true (narrowext_clean v))
       true)
 
-(decl pure narrowext_on () bool)
+(decl pure narrowext_on (u64) bool)
 (extern constructor narrowext_on narrowext_on)
 (decl pure narrowext_clean (Value) bool)
 (extern constructor narrowext_clean narrowext_clean)
@@ -5166,7 +5166,7 @@
 ;; PLIRON (`PLIRON_NARROWEXT=1`): a narrow value whose register is already
 ;; zero-extended tests as-is — `cbnz w` instead of `tst #0xff` / `uxth`.
 (rule 4 (is_nonzero val @ (value_type (fits_in_16 _)))
-  (if-let true (narrowext_on))
+  (if-let true (narrowext_on 8))
   (if-let true (val_already_extended (ArgumentExtension.Uext) val))
   (CondResult.NotZero val (OperandSize.Size32)))
 

@@ -83,6 +83,22 @@ pub(crate) fn narrowext_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("PLIRON_NARROWEXT").as_deref() == Ok("1"))
 }
 
+/// PLIRON: one `PLIRON_NARROWEXT` user, by bit, for bisecting:
+/// 1 = the extra cleanliness facts, 2 = return extension, 4 = `uextend`
+/// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`.
+/// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
+pub(crate) fn narrowext_part(bit: u64) -> bool {
+    static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    narrowext_enabled()
+        && *MASK.get_or_init(|| {
+            std::env::var("PLIRON_NARROWEXT_MASK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX)
+        }) & bit
+            != 0
+}
+
 /// PLIRON: is the register of `v` (an i8/i16 value) zero-extended through
 /// all 64 bits? Covers the producers `val_already_extended` leaves out:
 /// canonical narrow `iconst` (materialized by `movz` or a masked constant
@@ -969,13 +985,13 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             && self.lower_ctx.amode_shareable(val)
     }
 
-    fn narrowext_on(&mut self) -> bool {
-        narrowext_enabled()
+    fn narrowext_on(&mut self, bit: u64) -> bool {
+        narrowext_part(bit)
     }
 
     fn narrowext_clean(&mut self, val: Value) -> bool {
         let mut budget = 16;
-        narrowext_enabled() && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
+        narrowext_part(1) && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
     }
 
     fn test_and_compare_bit_const(&mut self, ty: Type, n: u64) -> Option<u8> {

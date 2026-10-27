@@ -397,6 +397,6 @@ impl LowerBackend for AArch64Backend {
     /// oracle. Every clean producer writes a W register (or a full-width
     /// 0/1), so 32-bit-clean narrow values are zero through all 64 bits.
     fn narrow_ret_uext_clean(&self, ctx: &mut Lower<Inst>, val: Value) -> bool {
-        isle::narrowext_enabled() && isle::val_uext_clean(ctx, self, val)
+        isle::narrowext_part(2) && isle::val_uext_clean(ctx, self, val)
     }
 }

@@ -1688,7 +1688,7 @@
 ;; zero-extended (`val_already_extended`) needs no `uxtb`/`uxth`. Below the
 ;; load-fusing rules, which already fold the extension into `ldrb`/`ldrh`.
 (rule uextend_clean -2 (lower (uextend (fits_in_64 _) x @ (value_type (fits_in_16 _))))
-      (if-let true (narrowext_on))
+      (if-let true (narrowext_on 4))
       (if-let true (val_already_extended (ArgumentExtension.Uext) x))
       (put_in_reg x))
 
@@ -1844,11 +1844,22 @@
 ;; narrow `k` masks `x`'s register directly — the `uxtb`/`uxth` the
 ;; `ireduce` would materialize is dead under the mask. The result is still
 ;; clean (bits above `k` are zero), as `narrow_uext_clean` assumes.
+;;
+;; `x` goes in as a plain register: `alu_rs_imm_logic_commutative` would
+;; fold an `ishl y, s` defining `x` into a shifted operand with `s` masked
+;; by the narrow `ty` (mod 8/16), not by `x`'s own width — `(y << 10) as u8
+;; & k` became `(y << 2) & k` (rustlantis seed 12309).
 (rule band_ireduce_imm 30 (lower (band (fits_in_16 ty) (ireduce _ x @ (value_type (fits_in_64 _)))
-                                      y @ (iconst _ (u64_from_imm64 k))))
-      (if-let true (narrowext_on))
-      (if-let true (u64_lt_eq k (ty_mask ty)))
-      (alu_rs_imm_logic_commutative (ALUOp.And) ty x y))
+                                      (iconst _ k @ (u64_from_imm64 kk))))
+      (if-let true (narrowext_on 16))
+      (if-let true (u64_lt_eq kk (ty_mask ty)))
+      (if-let imm (imm_logic_from_imm64 ty k))
+      (alu_rr_imm_logic (ALUOp.And) ty (put_in_reg x) imm))
+(rule band_ireduce_reg 29 (lower (band (fits_in_16 ty) (ireduce _ x @ (value_type (fits_in_64 _)))
+                                      y @ (iconst _ (u64_from_imm64 kk))))
+      (if-let true (narrowext_on 16))
+      (if-let true (u64_lt_eq kk (ty_mask ty)))
+      (alu_rrr (ALUOp.And) ty (put_in_reg x) (put_in_reg y)))
 
 (rule -4 (lower (band (fits_in_64 (ty_scalar_float ty)) x y))
       (and_vec x y (float_vector_size_in_64 ty)))

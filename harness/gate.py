@@ -47,7 +47,7 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # adds and loopvec's coefficient negation overflowing at the i64 edge
 # (5042, 5542, 4895), and slp moving a store past a narrow `uload32` of its
 # bytes (4940), 2026-10-24.
-FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631]
+FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309]
 
 
 def shell(cmd):

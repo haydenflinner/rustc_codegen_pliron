@@ -747,7 +747,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
       `tst #0xff` / `uxth`;
     - `band_ireduce_imm` (priority 30): `band (ireduce x) k`, canonical `k`,
       masks `x`'s register directly, so the `ireduce`'s `uxtb` (patch 36)
-      is not materialized.
+      is not materialized. `x` goes in as a plain register (`alu_rr_imm_logic`
+      / `alu_rrr`): through `alu_rs_imm_logic_commutative` an `ishl.i64 y, 34`
+      defining `x` folded into `and w, w, w, lsl #2`, its amount masked by the
+      narrow type (rustlantis seed 12309, fixed 2026-10-27).
+    `PLIRON_NARROWEXT_MASK=<bits>` (default all) keeps only some users live,
+    for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`.
 
 63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP=1`, default
     off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table
