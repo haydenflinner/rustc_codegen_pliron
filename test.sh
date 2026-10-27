@@ -301,6 +301,19 @@ t_xfactsplugin() {
   $out/xfactsplugin$exe | diff --strip-trailing-cr - tests/xfactsplugin/expected.out
 }
 
+t_deadfree() {
+  # PLIRON_DEADFREE frees dead local bodies (xcgu copies inlining used
+  # up) during inlining instead of emitting them unoptimized: the program
+  # must still link (a missed caller fails lowering loudly) and print
+  # what stock rustc's build prints; something must actually be freed.
+  rustc --edition 2024 -O -C codegen-units=8 tests/std/main.rs -o $out/deadfree-stock$exe || return 1
+  PLIRON_DEADFREE=1 PLIRON_TRACE=pliron::stats=info rustc $BE --edition 2024 -O -C codegen-units=8 tests/std/main.rs -o $out/deadfree$exe 2> $out/deadfree.log || { grep -E "error|panicked" $out/deadfree.log | head -5 >&2; return 1; }
+  grep -q "deadfree .*inliner freed" $out/deadfree.log || { echo "deadfree: nothing freed" >&2; return 1; }
+  [[ -n "$exe" ]] && return 0
+  local tid="s/thread '([^']+)' \([0-9]+\)/thread '\1'/"
+  diff <($out/deadfree-stock$exe 2>&1 | sed -E "$tid") <($out/deadfree$exe 2>&1 | sed -E "$tid")
+}
+
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
@@ -792,6 +805,7 @@ want invokeblk && t_invokeblk
 [[ -z "$exe" ]] && want resumehoist && t_resumehoist
 want inlinerec && t_inlinerec
 want xfactsplugin && t_xfactsplugin
+want deadfree && t_deadfree
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
 want selmul && t_selmul

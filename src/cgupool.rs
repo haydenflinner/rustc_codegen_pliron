@@ -265,6 +265,8 @@ struct Store {
     /// worker ever waits on the barrier — rustc's coordinator owns it.
     hold: bool,
     held: rustc_hash::FxHashMap<u32, Job>,
+    /// Jobs submitted and not yet done (`PLIRON_CGU_INFLIGHT`).
+    inflight: u32,
 }
 
 static STORE: LazyLock<Mutex<Store>> = LazyLock::new(Default::default);
@@ -310,6 +312,10 @@ pub(crate) fn two_phase(tcx: TyCtxt<'_>) -> bool {
         && !tcx.sess.opts.cg.linker_plugin_lto.enabled()
 }
 
+fn inflight_cap() -> u32 {
+    pliron_cfg::env_get("PLIRON_CGU_INFLIGHT").and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 /// Whether this compile holds published jobs for `finish_held`.
 pub(crate) fn holding() -> bool {
     STORE.lock().unwrap().hold
@@ -323,6 +329,19 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
         .expect("cgupool::begin must run before submit");
     let participates = cfg.optimize && cfg.xfacts;
     let mut g = STORE.lock().unwrap();
+    // `PLIRON_CGU_INFLIGHT=N`: block the main thread while N CGUs are
+    // submitted and unfinished. Lowering outruns the workers, so without a
+    // cap every CGU's IR is resident at once: syn peaked at 2.4 GB in
+    // parallel against 0.8 GB serial (LLVM 0.6 GB; rustc's coordinator
+    // throttles its own codegen the same way). Done jobs only need lower
+    // ordinals, all submitted already, so the cap can't deadlock. Not
+    // while holding for the two-phase barrier, which needs every CGU
+    // published before any finishes.
+    let cap = inflight_cap();
+    while cap > 0 && !g.hold && g.inflight >= cap {
+        g = CV.wait(g).unwrap();
+    }
+    g.inflight += 1;
     let key = g.next_key;
     g.next_key += 1;
     let (ord, step) = if participates {
@@ -332,7 +351,18 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
     } else {
         (u32::MAX, Step::Whole)
     };
-    pliron_cfg::mark(&format!("submit {name} ord={ord} key={key}"));
+    pliron_cfg::mark(&format!("submit {name} ord={ord} key={key} ir={:?}", ctx.ir_stats()));
+    if pliron_cfg::env_set("PLIRON_MEM_MARK") && key == 0 {
+        use std::mem::size_of;
+        pliron_cfg::mark(&format!(
+            "sizes Operation={} RefCell<Operation>={} BasicBlock={} Value={} Ptr={}",
+            size_of::<pliron::operation::Operation>(),
+            size_of::<std::cell::RefCell<pliron::operation::Operation>>(),
+            size_of::<pliron::basic_block::BasicBlock>(),
+            size_of::<pliron::value::Value>(),
+            size_of::<Ptr<Operation>>()
+        ));
+    }
     if ord != u32::MAX && pass_enabled("PLIRON_XNEED") {
         // Same predicate `facts_publish` exports under: emitted bodies
         // only. Owners can only shrink before publish (dead_fns), so
@@ -383,6 +413,8 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
     match r {
         Ok(RunOut::Done { key, out }) => {
             g.done.insert(key, Ok(out));
+            g.inflight = g.inflight.saturating_sub(1);
+            CV.notify_all();
         }
         Ok(RunOut::Published { job }) if g.hold => {
             g.published.insert(job.ord);
@@ -438,6 +470,8 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
                 }
             };
             g.done.insert(jkey, Err(p));
+            g.inflight = g.inflight.saturating_sub(1);
+            CV.notify_all();
             // A job that never reached publish would stall every
             // higher-ordinal parked job (and the coordinator, which
             // joins workers on abort). Count the ordinal as covered:
@@ -591,7 +625,49 @@ fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
             );
             job.iropt += t.elapsed();
             job.step = Step::B;
-            pliron_cfg::mark(&format!("publish {} ord={}", job.name, job.ord));
+            pliron_cfg::mark(&format!("publish {} ord={} ir={:?}", job.name, job.ord, job.parts.ctx.ir_stats()));
+            if pliron_cfg::env_set("PLIRON_MEM_MARK") {
+                pliron_cfg::mark(&format!("ctxmem {} {}", job.name, job.parts.ctx.mem_report()));
+                // Ops per function with a body, and what is unreachable
+                // from the CGU's own emitted (non-local or used) symbols.
+                let ctx = &job.parts.ctx;
+                let st = &job.parts.st;
+                let mut per: Vec<(usize, String, String)> = st
+                    .funcs
+                    .iter()
+                    .filter(|(_, f)| pliron_ir_opt::has_body(ctx, f.op))
+                    .map(|(n, f)| {
+                        let k = pliron_ir_opt::inline::blocks(ctx, f.op)
+                            .into_iter()
+                            .map(|b| pliron_ir_opt::inline::ops(ctx, b).len())
+                            .sum::<usize>();
+                        (k, format!("{:?}", f.linkage), n.clone())
+                    })
+                    .collect();
+                per.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                let tot: usize = per.iter().map(|p| p.0).sum();
+                let mut by_link: rustc_hash::FxHashMap<String, (usize, usize)> = Default::default();
+                for (k, l, _) in &per {
+                    let e = by_link.entry(l.clone()).or_default();
+                    e.0 += 1;
+                    e.1 += k;
+                }
+                pliron_cfg::mark(&format!("fnmem {} bodies={} ops-in-bodies={tot} by-linkage={by_link:?}", job.name, per.len()));
+                if pliron_cfg::env_set("PLIRON_MEM_DEADPROBE") {
+                    let before: rustc_hash::FxHashSet<String> = per.iter().filter(|p| st.dead_fns.contains(p.2.as_str())).map(|p| p.2.clone()).collect();
+                    let nb = st.dead_fns.len();
+                    let st = &mut job.parts.st;
+                    pliron_ir_opt::inline::dead_fns(ctx, st);
+                    let dead_ops: usize = per.iter().filter(|p| st.dead_fns.contains(p.2.as_str()) && !before.contains(&p.2)).map(|p| p.0).sum();
+                    let ndead = st.dead_fns.len() - nb;
+                    let pre_ops: usize = per.iter().filter(|p| before.contains(&p.2)).map(|p| p.0).sum();
+                    let unopt_ops: usize = per.iter().filter(|p| st.dead_unopt.contains(p.2.as_str())).map(|p| p.0).sum();
+                    pliron_cfg::mark(&format!("deadprobe {} {ndead} new, {dead_ops} ops; already dead {} fns {pre_ops} ops ({}%); dead_unopt {unopt_ops} ops", job.name, before.len(), pre_ops * 100 / tot.max(1)));
+                }
+                for (k, l, n) in per.iter().take(8) {
+                    pliron_cfg::mark(&format!("fnmem-top {} {k} {l} {n}", job.name));
+                }
+            }
             RunOut::Published { job }
         }
         Step::B => {
@@ -861,7 +937,11 @@ pub(crate) fn iropt_head(
     // Copies nothing calls yet are emit-only fodder — mark them before
     // the IPO scans so `bodied`/`opt_body` leave them alone entirely.
     if st.earlydead {
-        pt!(prof, cgu, "earlydead", inline::mark_dead_unopt(ctx, st));
+        if st.deadfree {
+            pt!(prof, cgu, "earlydead-free", inline::free_dead(ctx, st).1);
+        } else {
+            pt!(prof, cgu, "earlydead", inline::mark_dead_unopt(ctx, st));
+        }
     }
     let small = cfg.small;
     let small_limit = cfg.small_limit;
@@ -956,7 +1036,11 @@ pub(crate) fn iropt_head(
     // marked here stays callerless for good: aiming a call at it needs
     // a `Sym` const, which being untaken rules out.)
     if st.earlydead {
-        pt!(prof, cgu, "earlydead2", inline::mark_dead_unopt(ctx, st));
+        if st.deadfree {
+            pt!(prof, cgu, "earlydead2-free", inline::free_dead(ctx, st).1);
+        } else {
+            pt!(prof, cgu, "earlydead2", inline::mark_dead_unopt(ctx, st));
+        }
     }
     if pass_enabled("PLIRON_SPEC") {
         pt!(prof, cgu, "spec", spec::run(ctx, st));
@@ -1084,7 +1168,11 @@ pub(crate) fn iropt_head(
     // deletes calls. Mark copies inlining left callerless now so the
     // whole tail (`nocap2`..`callgvn`, `dead_fns`' recounts) skips them.
     if st.earlydead {
-        pt!(prof, cgu, "earlydead3", inline::mark_dead_unopt(ctx, st));
+        if st.deadfree {
+            pt!(prof, cgu, "earlydead3-free", inline::free_dead(ctx, st).1);
+        } else {
+            pt!(prof, cgu, "earlydead3", inline::mark_dead_unopt(ctx, st));
+        }
     }
     // Re-run capture inference now that devirt/constload have made
     // callee sets final: indirect calls through fn-ptr slots resolve to

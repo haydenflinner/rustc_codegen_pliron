@@ -3987,7 +3987,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .ids
             .get(&sym)
             .copied()
-            .unwrap_or_else(|| panic!("unknown symbol {sym}"))
+            .unwrap_or_else(|| {
+                if self.st.dead_fns.contains(&sym) {
+                    panic!("reference to dead-stripped local fn {sym}: dead_fns/PLIRON_DEADFREE missed a caller")
+                }
+                panic!("unknown symbol {sym}")
+            })
         {
             Sym::F(id, _) => {
                 let fr = self.fref(id);

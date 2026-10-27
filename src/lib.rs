@@ -732,6 +732,9 @@ macro_rules! pt {
         let _t = std::time::Instant::now();
         let _r = $e;
         pliron_cfg::trace($n, _t.elapsed().as_secs_f64() * 1e3, $cgu);
+        if pliron_cfg::env_set("PLIRON_MEM_MARK") {
+            pliron_cfg::mark(concat!("pass ", $n));
+        }
         _r
     }};
 }
@@ -1427,12 +1430,14 @@ impl ExtraBackendMethods for PlironCodegenBackend {
     ) -> (ModuleCodegen<PlironModule>, u64) {
         let start = std::time::Instant::now();
         let dep_node = tcx.codegen_unit(cgu_name).codegen_dep_node(tcx);
+        pliron_cfg::mark(&format!("define+ {cgu_name}"));
         let (module, _) = tcx.dep_graph.with_task(
             dep_node,
             tcx,
             || module_codegen(tcx, cgu_name, bitcode_needed),
             Some(rustc_middle::dep_graph::hash_result),
         );
+        pliron_cfg::mark(&format!("define- {cgu_name}"));
         (module, start.elapsed().as_nanos() as u64)
     }
 }
@@ -1456,6 +1461,7 @@ fn module_codegen(
     cx.st.borrow_mut().lto_payload = bitcode_needed.then(lto::embedded_payload);
     cx.st.borrow_mut().xcgufn_kill = env_is("PLIRON_XCGUFN_KILL", "1");
     cx.st.borrow_mut().deadunopt_on = pass_enabled("PLIRON_DEADUNOPT");
+    cx.st.borrow_mut().deadfree = env_is("PLIRON_DEADFREE", "1");
     cx.st.borrow_mut().earlydead =
         pass_enabled("PLIRON_EARLYDEAD") && env_get("PLIRON_OPT_FNS").is_none();
     let mono_items = cgu.items_in_deterministic_order(tcx);

@@ -279,6 +279,25 @@ pub fn trace(step: &str, ms: f64, name: &str) {
 /// `PLIRON_TRACE_FILE=<path>`: append `mark <pid> <t_ms> <label>` — a
 /// wall-clock point event (ms since process start), for reconstructing
 /// pipeline timelines that `trace`'s durations can't express.
+/// The process's current physical footprint in MiB (macOS; 0 elsewhere).
+pub fn footprint_mib() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+        }
+        // rusage_info_v0: 16-byte uuid, then u64s; phys_footprint is the
+        // eighth (user, system, pkg_idle, interrupt, pageins, wired,
+        // resident, phys_footprint, ...).
+        let mut buf = [0u64; 2 + 11];
+        // SAFETY: a buffer as large as rusage_info_v0, flavor 0 (V0).
+        if unsafe { proc_pid_rusage(std::process::id() as i32, 0, buf.as_mut_ptr()) } == 0 {
+            return buf[2 + 7] >> 20;
+        }
+    }
+    0
+}
+
 pub fn mark(label: &str) {
     let Some(path) = env_get("PLIRON_TRACE_FILE") else {
         return;
@@ -286,7 +305,12 @@ pub fn mark(label: &str) {
     use std::io::Write;
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1e3;
-    let line = format!("mark {} {t:.3} {label}\n", std::process::id());
+    // `PLIRON_MEM_MARK=1`: the process's current memory footprint too.
+    let line = if env_set("PLIRON_MEM_MARK") {
+        format!("mark {} {t:.3} {label} mem={}MiB\n", std::process::id(), footprint_mib())
+    } else {
+        format!("mark {} {t:.3} {label}\n", std::process::id())
+    };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

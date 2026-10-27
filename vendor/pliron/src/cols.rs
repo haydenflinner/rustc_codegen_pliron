@@ -118,6 +118,23 @@ impl<K: ColKey, V> ColMap<K, V> {
     pub fn contains(&self, k: K) -> bool {
         self.get(k).is_some()
     }
+    /// PLIRON: keep only the entries whose key `f` accepts (a sweep after
+    /// bulk erasure: `State::purge_dead`).
+    pub fn retain(&mut self, mut f: impl FnMut(&K) -> bool) {
+        let mut i = 0;
+        while i < self.ents.len() {
+            if f(&self.ents[i].0) {
+                i += 1;
+                continue;
+            }
+            let o = self.ents[i].0.ord();
+            self.idx[o] = 0;
+            self.ents.swap_remove(i);
+            if let Some(moved) = self.ents.get(i) {
+                self.idx[moved.0.ord()] = i as u32 + 1;
+            }
+        }
+    }
     #[inline]
     pub fn len(&self) -> usize {
         self.ents.len()
@@ -209,6 +226,10 @@ impl<K: ColKey> ColSet<K> {
     }
     pub fn remove(&mut self, k: K) -> bool {
         self.0.remove(k).is_some()
+    }
+    /// PLIRON: keep only the keys `f` accepts.
+    pub fn retain(&mut self, f: impl FnMut(&K) -> bool) {
+        self.0.retain(f)
     }
     #[inline]
     pub fn len(&self) -> usize {

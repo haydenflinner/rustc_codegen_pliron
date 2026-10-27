@@ -106,7 +106,14 @@ fn update_links<T: private::LinkedList>(
         links.resize(i + 1, NodeLinks::default());
     }
     let links = &mut links[i];
-    links.tag = ptr.idx.ffi();
+    // A previous occupant's entry (tag mismatch) is stale: start from the
+    // default, or a one-field update (`prev` only) would inherit the
+    // other field. Ops freed while still linked — a block erased whole,
+    // its ops deallocated in place — leave exactly such entries.
+    if links.tag != ptr.idx.ffi() {
+        *links = NodeLinks::default();
+        links.tag = ptr.idx.ffi();
+    }
     f(links);
 }
 

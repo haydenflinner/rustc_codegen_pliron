@@ -463,6 +463,9 @@ pub struct State {
     /// `bodied`/`opt_body` pass skips them instead of optimizing bodies
     /// that are only emitted for link safety.
     pub earlydead: bool,
+    /// `PLIRON_DEADFREE=1`: the `earlydead` points free dead bodies
+    /// (`inline::free_dead`) instead of marking copies emit-only.
+    pub deadfree: bool,
     /// Encoded LTO payload to embed in the native object (rustc asked for
     /// "bitcode" in this module: rlibs that a later `-Clto` link reads).
     /// `objmerge::add_lto_section` writes it; `src/lto.rs` owns the format.
@@ -528,6 +531,54 @@ pub struct State {
 }
 
 impl State {
+    /// Drop every side-table entry whose op, block or value no longer
+    /// exists — after bulk erasure (`inline::free_dead`), which frees whole
+    /// bodies without the per-op `remove`s a pass erasing one op does.
+    /// Passes iterate these tables' keys (`nounwind` walks `invokes`,
+    /// `address_taken` asks every `consts` value `is_used`), so a stale
+    /// key would deref a freed node.
+    pub fn purge_dead(&mut self, ctx: &Context) {
+        let lv = |v: &Value| v.is_live(ctx);
+        let lo = |p: &Ptr<Operation>| p.is_live(ctx);
+        let lb = |p: &Ptr<BasicBlock>| p.is_live(ctx);
+        self.consts.retain(lv);
+        self.allocas.retain(lv);
+        self.promoted.retain(lv);
+        self.escape_copies.retain(lv);
+        self.frozen.retain(lv);
+        self.noalias.retain(lv);
+        self.region_frozen.retain(lv);
+        self.region_frozen_op.retain(lv);
+        self.region_noalias.retain(lv);
+        self.nnargs.retain(lv);
+        self.calls.retain(lo);
+        self.intrinsics.retain(lo);
+        self.rmw.retain(lo);
+        self.invokes.retain(lo);
+        self.volatile.retain(lo);
+        self.nonnull.retain(lo);
+        self.bool01.retain(lo);
+        self.frozen_loads.retain(lo);
+        self.invariant.retain(lo);
+        self.inline_hist.retain(lo);
+        self.inbounds.retain(lo);
+        self.expect.retain(lo);
+        self.prof.retain(lo);
+        self.prof_edges.retain(lo);
+        self.opt_skip.retain(lo);
+        self.dead_unopt_ops.retain(lo);
+        self.region_blocks.retain(lb);
+        self.region_parent.retain(lb);
+        self.prof_bcount.retain(lb);
+        if self.last_call.is_some_and(|c| !c.is_live(ctx)) {
+            self.last_call = None;
+        }
+        if let Some(d) = self.dbg.as_deref_mut() {
+            d.alloca_decls.retain(|v, _| v.is_live(ctx));
+        }
+        ctx.dbg_notes.borrow_mut().retain(|v, _| v.is_live(ctx));
+    }
+
     /// `crate::types::leaves` through the per-CGU memo.
     pub fn leaves(
         &self,
@@ -797,6 +848,11 @@ impl State {
                 tracing::info!(target: "pliron::stats",
                     "xfacts {} publish {sym}", self.cgu);
             }
+        }
+        if pliron_cfg::env_set("PLIRON_MEM_MARK") {
+            let maps = [cf.copies.len(), cf.nocapture.len(), cf.nowrite_strict.len(), cf.nowrite_relaxed.len(), cf.nnret.len(), cf.willreturn.len(), cf.nounwind.len()];
+            let kb: usize = cf.copies.keys().map(|(a, b)| a.len() + b.len()).sum();
+            pliron_cfg::mark(&format!("facts {} ord={ord} exported={exported} entries={maps:?} copy-key-bytes={kb}", self.cgu));
         }
         g.by_ord.insert(ord, cf);
         if pliron_cfg::tracing_on() {

@@ -352,6 +352,16 @@ pub struct Value {
     pub(crate) defining_entity: DefiningEntity,
 }
 
+impl Value {
+    /// PLIRON: whether this value's defining op or block still exists.
+    pub fn is_live(&self, ctx: &Context) -> bool {
+        match self.defining_entity {
+            DefiningEntity::Op(p) => p.is_live(ctx),
+            DefiningEntity::Block(p) => p.is_live(ctx),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValueError {
     #[error("Invalid Value: Defining operation has no result corresponding to this value")]

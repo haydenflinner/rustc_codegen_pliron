@@ -143,6 +143,37 @@ pub struct Context {
 }
 
 impl Context {
+    /// PLIRON: (live operations, live blocks, values ever allocated) —
+    /// for memory accounting (`PLIRON_MEM_MARK`).
+    pub fn ir_stats(&self) -> (usize, usize, u64) {
+        (self.operations.len(), self.basic_blocks.len(), self.value_counter.get())
+    }
+
+    /// PLIRON: bytes reserved by each big container (capacity x element
+    /// size), and live element counts for the pools — `PLIRON_MEM_MARK`.
+    pub fn mem_report(&self) -> alloc::string::String {
+        use core::mem::size_of;
+        fn v<T>(name: &str, x: &Vec<T>) -> alloc::string::String {
+            format!("{name}={}MB/{}", (x.capacity() * size_of::<T>()) >> 20, x.len())
+        }
+        let ops = self.operations.capacity() * (size_of::<core::cell::RefCell<Operation>>() + 8);
+        let blks = self.basic_blocks.capacity() * (size_of::<core::cell::RefCell<BasicBlock>>() + 8);
+        [
+            format!("ops={}MB/{}", ops >> 20, self.operations.len()),
+            format!("blocks={}MB/{}", blks >> 20, self.basic_blocks.len()),
+            v("use_links", &self.use_links.borrow().arena),
+            v("op_links", &self.op_links.borrow()),
+            v("block_links", &self.block_links.borrow()),
+            v("op_kind", &self.op_kind.borrow()),
+            v("operands", &self.op_operand_pool.borrow()),
+            v("results", &self.op_result_pool.borrow()),
+            v("succs", &self.op_successor_pool.borrow()),
+            v("bargs", &self.block_arg_pool.borrow()),
+            v("regions", &self.op_region_pool.borrow()),
+        ]
+        .join(" ")
+    }
+
     pub fn new() -> Context {
         Self::default()
     }
@@ -270,6 +301,14 @@ impl<T: ArenaObj> core::fmt::Debug for Ptr<T> {
 #[derive(Debug, thiserror::Error)]
 #[error("Attempt to dereference a dangling Ptr")]
 pub struct DanglingPtrDerefError;
+
+impl<T: ArenaObj> Ptr<T> {
+    /// PLIRON: whether the object this points to still exists (same slot
+    /// and version) — false after it was erased, even if the slot was reused.
+    pub fn is_live(&self, ctx: &Context) -> bool {
+        T::get_arena(ctx).contains_key(self.idx)
+    }
+}
 
 impl<'a, T: ArenaObj> Ptr<T> {
     /// Borrow the inner [RefCell] and return a [Ref] to the pointee.

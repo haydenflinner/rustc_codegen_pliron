@@ -37,6 +37,9 @@ use crate::state::{ConstVal, State, leaf_arg};
 use crate::types::{leaf_range, size_align};
 
 const DEFAULT_LIMIT: usize = 320;
+/// `PLIRON_DEADFREE`: purge `State` side tables after this many freed ops
+/// (a purge is linear in the tables, so not after every free).
+const FREE_PURGE: usize = 20_000;
 pub const SMALL_LIMIT: usize = 40;
 /// The `small` limit for wasm: still the flat no-bonus rules, but the
 /// 40-op cap left iterator/UTF-8 helpers out of line in every hot loop —
@@ -893,6 +896,61 @@ pub fn mark_dead_unopt(ctx: &Context, st: &mut State) -> usize {
     marked
 }
 
+/// Unlink and free every block of `f`'s body; returns the op count freed.
+/// The `llvm.func` op itself stays, bodiless (a declaration as far as
+/// `has_body` goes) — callers must also mark it in `dead_fns` so lowering
+/// never declares or emits it.
+pub fn erase_body(ctx: &mut Context, f: Ptr<Operation>) -> usize {
+    let bs = blocks(ctx, f);
+    let n: usize = bs.iter().map(|&b| b.deref(ctx).iter(ctx).count()).sum();
+    for &b in &bs {
+        BasicBlock::drop_all_uses(b, ctx);
+    }
+    for b in bs {
+        BasicBlock::erase(b, ctx);
+    }
+    n
+}
+
+/// `PLIRON_DEADFREE=1`: free, not just mark, the `Local` fns nothing
+/// references — no direct caller in any remaining body (`call_counts`),
+/// address not taken — xcgu copies included (`PLIRON_XCGUFN_KILL`'s
+/// rule; the counting blindspot that made it unsafe was fixed in
+/// `indirect_callee`, and the historical repro links byte-identical).
+/// Iterated: a freed body's calls stop counting. In syn about 43% of the
+/// ops a CGU holds at publish were such bodies (mostly xcgu copies
+/// inlining had used up), kept until the CGU dropped; freed arena slots
+/// are reused by later clones instead of growing the arena.
+/// Returns (fns, ops) freed.
+pub fn free_dead(ctx: &mut Context, st: &mut State) -> (usize, usize) {
+    let (mut fns, mut ops) = (0usize, 0usize);
+    loop {
+        let taken = crate::address_taken(ctx, st);
+        let counts = call_counts(ctx, st);
+        let dead: Vec<(String, Ptr<Operation>)> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, f)| (n.clone(), f.op))
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for (n, op) in dead {
+            ops += erase_body(ctx, op);
+            fns += 1;
+            st.dead_fns.insert(n);
+        }
+        st.purge_dead(ctx);
+    }
+    (fns, ops)
+}
+
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
 /// `filter` restricts both the roots and which callees the DFS descends
 /// into — a restricted run still orders its callees before their callers.
@@ -989,7 +1047,7 @@ pub fn run(
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
     let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
-    if once || callers.is_some() {
+    if once || callers.is_some() || st.deadfree {
         adj.get_or_insert_with(|| Adj::build(ctx, st));
     }
     let single: FxHashSet<String> = if once {
@@ -1134,6 +1192,8 @@ pub fn run(
     // entry is dropped when that function's own body is rewritten below
     // (it may be inlined again afterwards with the new body).
     let mut tagcache: FxHashMap<Ptr<Operation>, CalleeTags> = FxHashMap::default();
+    // `PLIRON_DEADFREE`: ops freed since the last side-table purge, and in all.
+    let (mut freed_ops, mut freed_total) = (0usize, 0usize);
     for sym in order {
         let caller = st.funcs[&sym].op;
         if st.opt_skip.contains(&caller) {
@@ -1473,6 +1533,47 @@ pub fn run(
                 if let Some(a) = adj.as_mut() {
                     a.inlined(ctx, st, &sym, &cs);
                 }
+                // `PLIRON_DEADFREE=1`: a local callee whose last call was
+                // just inlined is freed now, as LLVM's inliner deletes it,
+                // so the clones still to come reuse its arena slots instead
+                // of growing the arena (syn's CGUs were 4x their lowered
+                // size at publish, 43% of it bodies nothing called).
+                // Its own calls stop counting, which can free its callees.
+                if st.deadfree
+                    && let Some(a) = adj.as_mut()
+                {
+                    let mut work = vec![cs.clone()];
+                    while let Some(c) = work.pop() {
+                        if c == sym
+                            || a.taken.contains(c.as_str())
+                            || a.callers_of.get(c.as_str()).is_some_and(|v| !v.is_empty())
+                            || st.dead_fns.contains(c.as_str())
+                        {
+                            continue;
+                        }
+                        let Some(f) = st.funcs.get(c.as_str()) else { continue };
+                        if f.linkage != Linkage::Local || !has_body(ctx, f.op) {
+                            continue;
+                        }
+                        let fop = f.op;
+                        for m in callees(ctx, st, &c) {
+                            if let Some(v) = a.callers_of.get_mut(m.as_str())
+                                && let Some(p) = v.iter().position(|x| *x == c)
+                            {
+                                v.swap_remove(p);
+                            }
+                            work.push(m);
+                        }
+                        tagcache.remove(&fop);
+                        freed_ops += erase_body(ctx, fop);
+                        st.dead_fns.insert(c);
+                    }
+                    if freed_ops >= FREE_PURGE {
+                        st.purge_dead(ctx);
+                        freed_total += freed_ops;
+                        freed_ops = 0;
+                    }
+                }
                 delta.callers.insert(sym.clone());
                 delta.callees.insert(cs);
             }
@@ -1483,6 +1584,13 @@ pub fn run(
             add_info!(&sym);
         }
         tagcache.remove(&caller);
+    }
+    if freed_ops > 0 {
+        st.purge_dead(ctx);
+        freed_total += freed_ops;
+    }
+    if freed_total > 0 && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "deadfree {}: inliner freed {freed_total} ops", st.cgu);
     }
     pliron_cfg::trace("in.scan", t_scan, &st.cgu);
     pliron_cfg::trace("in.call", t_call, &st.cgu);
