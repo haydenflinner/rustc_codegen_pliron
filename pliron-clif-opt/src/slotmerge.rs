@@ -224,6 +224,44 @@ pub fn marker_slots(func: &Function, v: Value) -> Vec<StackSlot> {
     Vec::new()
 }
 
+/// Whether a marker on `v` with byte `size` (`None` or negative: the
+/// whole object) covers all of the one slot [`marker_slots`] finds: `v`
+/// is that slot's `stack_addr` at offset 0, and `size` reaches its end.
+/// A marker on part of a slot (a field address, from a pass that put one
+/// local inside another) says nothing about the slot's other bytes.
+pub fn marker_whole(func: &Function, v: Value, size: Option<i128>) -> bool {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+            return false;
+        };
+        match func.dfg.insts[i] {
+            InstructionData::StackAddr { stack_slot, offset, .. } => {
+                let n = i128::from(func.sized_stack_slots[stack_slot].size);
+                return i32::from(offset) == 0 && size.is_none_or(|s| s < 0 || s >= n);
+            }
+            _ if func.dfg.insts[i].opcode() == Opcode::Bitcast => {
+                v = func.dfg.resolve_aliases(func.dfg.inst_args(i)[0]);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// [`marker_slots`] for lowering's records. Under `PLIRON_SLOTPROM_LT=1`
+/// a marker that covers only part of its slot ([`marker_whole`]) is
+/// recorded with the slot listed twice: ambiguous to every consumer
+/// (slotmerge and slotprom read singleton markers only), since a kill
+/// of the whole slot would cut the other bytes' live ranges too.
+pub fn marker_slots_lt(func: &Function, v: Value, size: Option<i128>, lt: bool) -> Vec<StackSlot> {
+    let ss = marker_slots(func, v);
+    if lt && let &[s] = ss.as_slice() && !marker_whole(func, v, size) {
+        return vec![s, s];
+    }
+    ss
+}
+
 /// `PLIRON_SM_PRECISE=1` (default off until validated): pure (non-memory,
 /// non-call) ops on a slot address are uses, not escapes, and a byte image
 /// stored to untracked memory escapes only the pointers it carries, not

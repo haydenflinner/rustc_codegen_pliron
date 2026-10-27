@@ -1529,9 +1529,10 @@ pub fn lower_module<'a>(
                 // `clctx.func` borrowed for `fl`'s whole lifetime.)
                 let lt_dbg = crate::env_set("PLIRON_LT_DEBUG");
                 let mut lt_dropped = FxHashMap::default();
+                let slotprom_lt = crate::env_is("PLIRON_SLOTPROM_LT", "1");
                 lifetimes = std::mem::take(&mut fl.lifetimes)
                     .into_iter()
-                    .filter_map(|(p, anchor, b, start)| {
+                    .filter_map(|(p, size, anchor, b, start)| {
                         let r = fl
                             .vals
                             .get(&p)
@@ -1539,7 +1540,7 @@ pub fn lower_module<'a>(
                             .and_then(|vs| vs.first().copied())
                             .map(|v| {
                                 (
-                                    crate::slotmerge::marker_slots(fl.b.func, v),
+                                    crate::slotmerge::marker_slots_lt(fl.b.func, v, size, slotprom_lt),
                                     anchor,
                                     b,
                                     start,
@@ -2547,14 +2548,14 @@ pub fn lower_clif_wasm(
             let lifetimes = fl
                 .lifetimes
                 .iter()
-                .filter_map(|&(p, anchor, b, start)| {
+                .filter_map(|&(p, size, anchor, b, start)| {
                     fl.vals
                         .get(&p)
                         .or_else(|| fl.cconst.get(&p))
                         .and_then(|vs| vs.first().copied())
                         .map(|v| {
                             (
-                                crate::slotmerge::marker_slots(fl.b.func, v),
+                                crate::slotmerge::marker_slots_lt(fl.b.func, v, size, crate::env_is("PLIRON_SLOTPROM_LT", "1")),
                                 anchor,
                                 b,
                                 start,
@@ -3037,7 +3038,10 @@ struct FnLower<'a, 'b> {
     /// CLIF form is resolved after lowering since an inlined alloca may
     /// lower after its marker. slotmerge turns these into use positions
     /// for the slot's live interval (MIR StorageLive/Dead).
-    lifetimes: Vec<(Value, Option<ir::Inst>, ir::Block, bool)>,
+    /// The marker's byte size (`None` when not a constant) follows the
+    /// pointer: under `PLIRON_SLOTPROM_LT` a partial-slot marker is
+    /// recorded as ambiguous (`slotmerge::marker_slots_lt`).
+    lifetimes: Vec<(Value, Option<i128>, Option<ir::Inst>, ir::Block, bool)>,
     /// (call inst, arg index) pairs whose callee param rustc deduced
     /// `captures(none)` for — the pointer can't outlive the call, so
     /// slotmerge bounds the use instead of escaping the slot to
@@ -6955,8 +6959,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 while let Some(i) = anchor.filter(|i| self.ltzero.contains(i)) {
                     anchor = self.b.func.layout.prev_inst(i);
                 }
+                let size = self.const_int(opnds[0]);
                 self.lifetimes
-                    .push((opnds[1], anchor, b, name == "llvm.lifetime.start"));
+                    .push((opnds[1], size, anchor, b, name == "llvm.lifetime.start"));
             }
             return;
         }

@@ -2041,8 +2041,36 @@ fn s_constbr(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // `PLIRON_SLOTPROM_LT=1`: promoted fields end at their slot's
+    // lifetime markers.
+    let kills = if env_is("PLIRON_SLOTPROM_LT", "1") {
+        slotprom::kills_of(&p.clctx.func, p.lifetimes)
+    } else {
+        Vec::new()
+    };
+    // `PLIRON_SLOTPROM_SYNCCOST=1`: block-frequency estimate for the
+    // sync cost check, 8x per loop level (to 512x), /8 in cold blocks.
+    let weight = env_is("PLIRON_SLOTPROM_SYNCCOST", "1").then(|| {
+        let a = an.cfg_dt_la(&p.clctx.func);
+        let f = &p.clctx.func;
+        f.layout
+            .blocks()
+            .map(|b| {
+                let w = 1u32 << (3 * a.la.loop_level(b).level().min(3));
+                (b, if f.layout.is_cold(b) { (w / 8).max(1) } else { w })
+            })
+            .collect::<rustc_hash::FxHashMap<Block, u32>>()
+    });
     let (cfg, _) = an.cfg_dt(&p.clctx.func);
-    let k = slotprom::run(&mut p.clctx.func, cfg, p.nocap, p.flags.keep_dbg_slots, p.dbg_slots);
+    let k = slotprom::run_lt(
+        &mut p.clctx.func,
+        cfg,
+        p.nocap,
+        p.flags.keep_dbg_slots,
+        p.dbg_slots,
+        &kills,
+        weight.as_ref(),
+    );
     p.dump("slotprom");
     k
 }

@@ -234,6 +234,65 @@ pub fn run(
     keep_keyed: bool,
     dbg_slots: &crate::dbglabel::DbgSlots,
 ) -> usize {
+    run_lt(func, cfg, nocap, keep_keyed, dbg_slots, &[], None)
+}
+
+/// A lifetime marker slotprom may cut a promoted field's live range at:
+/// the slot's bytes are undefined right after `anchor` in `block` (at its
+/// top when `anchor` is `None`). Built by [`kills_of`].
+#[derive(Clone, Copy, Debug)]
+pub struct Kill {
+    pub slot: StackSlot,
+    pub anchor: Option<Inst>,
+    pub block: Block,
+}
+
+/// `PLIRON_SLOTPROM_LT=1`: the markers of `lifetimes` (lowering's
+/// `llvm.lifetime.{start,end}` records) whose position is still exact:
+/// a marker on exactly one slot (under the flag, lowering records a marker
+/// that covers only part of a slot as ambiguous: `marker_slots_lt`), with
+/// the anchor inst still in the marker's block (or no anchor, and the block still in the layout).
+/// Both kinds count: past an end marker and past a start marker alike
+/// the slot's bytes are undefined until the next store. A marker whose
+/// anchor moved or died is dropped; a dropped kill only leaves a live
+/// range longer, never wrong.
+pub fn kills_of(
+    func: &Function,
+    lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
+) -> Vec<Kill> {
+    let mut out = Vec::new();
+    for (ds, anchor, b, _start) in lifetimes {
+        let &[s] = ds.as_slice() else { continue };
+        let exact = match *anchor {
+            Some(a) => func.layout.inst_block(a) == Some(*b),
+            None => func.layout.is_block_inserted(*b),
+        };
+        if exact && func.sized_stack_slots.is_valid(s) {
+            out.push(Kill {
+                slot: s,
+                anchor: *anchor,
+                block: *b,
+            });
+        }
+    }
+    out
+}
+
+/// [`run`], with lifetime kills and an optional block-frequency estimate
+/// (`weight`, for the sync cost check). A promoted field is not live
+/// across a kill of its slot. A kill acts as a store of "undefined": liveness
+/// stops there (so no block param carries a dead value around a loop
+/// into the next iteration), and a read after it, before any store, sees
+/// the field's undef value.
+pub fn run_lt(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    nocap: &FxHashSet<(Inst, u32)>,
+    keep_keyed: bool,
+    dbg_slots: &crate::dbglabel::DbgSlots,
+    kills: &[Kill],
+    weight: Option<&FxHashMap<Block, u32>>,
+) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
     };
@@ -549,6 +608,30 @@ pub fn run(
         }
     }
 
+    // Lifetime kills of slots with fields: at a block's top, or right
+    // after an inst.
+    let mut kill_top: FxHashMap<Block, Vec<StackSlot>> = FxHashMap::default();
+    let mut kill_after: FxHashMap<Inst, Vec<StackSlot>> = FxHashMap::default();
+    for k in kills {
+        if !slot_fields.contains_key(&k.slot) {
+            continue;
+        }
+        match k.anchor {
+            None => kill_top.entry(k.block).or_default().push(k.slot),
+            Some(a) => kill_after.entry(a).or_default().push(k.slot),
+        }
+    }
+    // A kill counts as a store for liveness: the field's bytes are dead
+    // above it.
+    let kill_def = |slots: &[StackSlot], ix: usize, stored: &mut [bool], defs: &mut [Vec<bool>]| {
+        for ss in slots {
+            for &fi in &slot_fields[ss] {
+                stored[fi] = true;
+                defs[fi][ix] = true;
+            }
+        }
+    };
+
     // Per field: upward-exposed use (ue) and any-store (def) per block,
     // then livein[b] = ue[b] | (liveout[b] & !def[b]) to a fixpoint.
     let mut ues: Vec<Vec<bool>> = vec![vec![false; nblocks]; fields.len()];
@@ -557,7 +640,16 @@ pub fn run(
     for b in func.layout.blocks() {
         let ix = blk_ix[&b] as usize;
         stored.fill(false);
+        if let Some(slots) = kill_top.get(&b) {
+            kill_def(slots, ix, &mut stored, &mut defs);
+        }
+        // The kill after the previous inst (the loop body `continue`s).
+        let mut pending: Option<&Vec<StackSlot>> = None;
         for i in func.layout.block_insts(b) {
+            if let Some(slots) = pending.take() {
+                kill_def(slots, ix, &mut stored, &mut defs);
+            }
+            pending = kill_after.get(&i);
             if let Some(slots) = sync_inst_slots.get(&i) {
                 for &ss in slots {
                     if let Some(fis) = slot_fields.get(&ss) {
@@ -630,6 +722,66 @@ pub fn run(
         };
     }
     let t3 = timer.then(std::time::Instant::now);
+    // `PLIRON_SLOTPROM_SYNCCOST=1`: a slot whose bounded calls cost more
+    // sync traffic than promotion removes stays in memory. Each bounded
+    // call stores every kept field of its slot before it and reloads them
+    // all after it; promotion removes the field's own loads and stores.
+    // Both sides are weighted by the estimated block frequency (`weight`).
+    // `Ast::fmt`'s heap-visitor stack (two `Vec` headers, six fields,
+    // pushed and popped through `&mut` calls) went from 99 to 213 memory
+    // ops this way.
+    if let Some(weight) = weight
+        && !sync_calls.is_empty()
+    {
+        let w = |b: Option<Block>| b.map_or(0, |b| u64::from(weight.get(&b).copied().unwrap_or(1)));
+        let mut benefit: FxHashMap<StackSlot, u64> = FxHashMap::default();
+        let mut nkept: FxHashMap<StackSlot, u64> = FxHashMap::default();
+        let kept_set: FxHashSet<usize> = kept.iter().copied().collect();
+        for &fi in &kept {
+            *nkept.entry(fields[fi].slot).or_default() += 1;
+        }
+        for (&i, &(s, _)) in &sites {
+            if let Some((ss, off)) = s
+                && let Some(&fi) = field_ix.get(&(ss, off))
+                && kept_set.contains(&fi)
+                && reach.contains(&func.layout.inst_block(i).unwrap_or(entry))
+            {
+                *benefit.entry(ss).or_default() += w(func.layout.inst_block(i));
+            }
+        }
+        let mut drop_slots: FxHashSet<StackSlot> = FxHashSet::default();
+        for (slot, insts) in &sync_calls {
+            let Some(&nk) = nkept.get(slot) else { continue };
+            let mut cost = 0u64;
+            for &i in insts {
+                let dfg = &func.dfg;
+                let reload = match dfg.insts[i].opcode() {
+                    Opcode::TryCall | Opcode::TryCallIndirect => dfg.insts[i]
+                        .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                        .iter()
+                        .map(|bc| w(Some(bc.block(&dfg.value_lists))))
+                        .sum(),
+                    _ => w(func.layout.inst_block(i)),
+                };
+                cost += nk * (w(func.layout.inst_block(i)) + reload);
+            }
+            if cost >= benefit.get(slot).copied().unwrap_or(0) {
+                drop_slots.insert(*slot);
+            }
+        }
+        if !drop_slots.is_empty() {
+            let mut k2 = Vec::new();
+            let mut l2 = Vec::new();
+            for (fi, l) in kept.drain(..).zip(liveins.drain(..)) {
+                if !drop_slots.contains(&fields[fi].slot) {
+                    k2.push(fi);
+                    l2.push(l);
+                }
+            }
+            kept = k2;
+            liveins = l2;
+        }
+    }
     if kept.is_empty() {
         return 0;
     }
@@ -758,7 +910,22 @@ pub fn run(
                 cur[ki] = Some(v);
             }
         }
+        // A kill forgets the field's value: reads and edges after it
+        // take the undef fallback until the next store.
+        let forget = |slots: &[StackSlot], cur: &mut [Option<Value>]| {
+            for ss in slots {
+                for fi in &slot_fields[ss] {
+                    if let Some(&ki) = kept_ix.get(fi) {
+                        cur[ki] = None;
+                    }
+                }
+            }
+        };
+        if let Some(slots) = kill_top.get(&b) {
+            forget(slots, &mut cur);
+        }
         for i in insts {
+            let ka = kill_after.get(&i);
             if let Some(kis) = sync.get(&i) {
                 // Writeback before the call: the callee reads the
                 // operand's memory, so promoted fields become stores.
@@ -837,6 +1004,9 @@ pub fn run(
                     }
                 }
                 _ => {}
+            }
+            if let Some(slots) = ka {
+                forget(slots, &mut cur);
             }
         }
         let Some(term) = func.layout.last_inst(b) else {
@@ -1583,5 +1753,265 @@ mod tests {
         assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
+    }
+
+    /// `i` loop whose body reads the field on one path before any store
+    /// (`body -> ld`) and stores it on the other: without a kill the field
+    /// is live into `body`, so the loop header carries it as a param from
+    /// one iteration into the next. A lifetime kill at the top of `body`
+    /// (MIR's StorageLive per iteration) ends that range: the header keeps
+    /// only `i`, and the unstored read takes the undef value.
+    fn kill_loop(kill: bool) -> (Function, Block) {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let [b0, h, body, st, ld, done] = std::array::from_fn(|_| func.dfg.make_block());
+        for b in [b0, h, body, st, ld, done] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let i = func.dfg.append_block_param(h, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().jump(h, &[z.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let c = cur.ins().icmp_imm_u(IntCC::UnsignedLessThan, i, 10);
+        cur.ins().brif(c, body, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let odd = cur.ins().band_imm_u(i, 1);
+        cur.ins().brif(odd, st, &[], ld, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(st);
+        cur.ins().store(flags, i, a, 0);
+        cur.ins().jump(ld, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(ld);
+        let x = cur.ins().load(types::I64, flags, a, 0);
+        let n = cur.ins().iadd(i, x);
+        cur.ins().jump(h, &[n.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        cur.ins().return_(&[i]);
+
+        let kills = [Kill {
+            slot: ss,
+            anchor: None,
+            block: body,
+        }];
+        let cfg = ControlFlowGraph::with_function(&func);
+        let k: &[Kill] = if kill { &kills } else { &[] };
+        let n = run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), k, None);
+        assert!(n > 0, "expected promotion");
+        assert_eq!(memops(&func), 0);
+        verify(&func);
+        (func, h)
+    }
+
+    #[test]
+    fn lifetime_kill_ends_loop_carried_field() {
+        let (f, h) = kill_loop(false);
+        assert_eq!(f.dfg.num_block_params(h), 2, "no kill: the field rides the header\n{f}");
+        let (f, h) = kill_loop(true);
+        assert_eq!(f.dfg.num_block_params(h), 1, "kill at body top: header keeps only `i`\n{f}");
+    }
+
+    /// A kill after an inst forgets the value only from there on: the
+    /// load before it still reads the store, the one after it reads undef
+    /// (here: not the stored argument).
+    #[test]
+    fn lifetime_kill_after_anchor() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let x = cur.ins().load(types::I64, flags, a, 0);
+        let anchor = cur.ins().iadd_imm_s(x, 1);
+        let y = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[x, y]);
+        let anchor = func.dfg.value_def(anchor).unwrap_inst();
+        let kills = [Kill {
+            slot: ss,
+            anchor: Some(anchor),
+            block: b0,
+        }];
+        let cfg = ControlFlowGraph::with_function(&func);
+        run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &kills, None);
+        assert_eq!(memops(&func), 0);
+        assert_eq!(func.dfg.resolve_aliases(x), arg0, "{func}");
+        assert_ne!(func.dfg.resolve_aliases(y), arg0, "{func}");
+        verify(&func);
+    }
+
+    /// `kills_of` keeps exact singleton markers only: a lost anchor, an
+    /// anchor that left its block, and an ambiguous (two-slot) record all
+    /// drop out.
+    #[test]
+    fn kills_of_keeps_exact_markers() {
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+        let b0 = func.dfg.make_block();
+        let b1 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        func.layout.append_block(b1);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let dead = cur.ins().iadd_imm_s(a, 0);
+        cur.ins().jump(b1, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
+        cur.ins().return_(&[]);
+        let ai = func.dfg.value_def(a).unwrap_inst();
+        let di = func.dfg.value_def(dead).unwrap_inst();
+        func.layout.remove_inst(di);
+        let lts = vec![
+            (vec![ss], Some(ai), b0, true),
+            (vec![ss], None, b1, false),
+            (vec![ss], Some(di), b0, false),
+            (vec![ss], Some(ai), b1, false),
+            (vec![ss, ss], Some(ai), b0, false),
+        ];
+        let k = kills_of(&func, &lts);
+        assert_eq!(k.len(), 2);
+        assert_eq!((k[0].anchor, k[0].block), (Some(ai), b0));
+        assert_eq!((k[1].anchor, k[1].block), (None, b1));
+    }
+
+    /// A marker covers its whole slot only on the slot's own address with
+    /// a size that reaches its end.
+    #[test]
+    fn marker_whole_needs_the_base_and_full_size() {
+        use crate::slotmerge::{marker_slots_lt, marker_whole};
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let a8 = cur.ins().iadd_imm_s(a, 8);
+        let ao = cur.ins().stack_addr(types::I64, ss, 8);
+        cur.ins().return_(&[]);
+        assert!(marker_whole(&func, a, None));
+        assert!(marker_whole(&func, a, Some(-1)));
+        assert!(marker_whole(&func, a, Some(16)));
+        assert!(!marker_whole(&func, a, Some(8)));
+        assert!(!marker_whole(&func, a8, None));
+        assert!(!marker_whole(&func, ao, None));
+        assert_eq!(marker_slots_lt(&func, a8, None, false), vec![ss]);
+        assert_eq!(marker_slots_lt(&func, a8, None, true), vec![ss, ss]);
+        assert_eq!(marker_slots_lt(&func, a, None, true), vec![ss]);
+    }
+
+    /// `PLIRON_SLOTPROM_SYNCCOST`: a field whose only uses sit next to a
+    /// bounded call (the writeback and reload would replace exactly the
+    /// store and load promotion removes) stays in memory; behind a cold
+    /// call in a loop that reads and writes it every iteration it is
+    /// promoted.
+    #[test]
+    fn sync_cost_weighs_calls_against_accesses() {
+        fn build(in_loop: bool) -> (Function, Inst) {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+            let esig = func.import_signature(sig.clone());
+            let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+                name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+                signature: esig,
+                colocated: false,
+                patchable: false,
+            });
+            let ss =
+                func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let flags = MemFlagsData::new();
+            let b0 = func.dfg.make_block();
+            func.layout.append_block(b0);
+            let arg0 = func.dfg.append_block_param(b0, types::I64);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let a = cur.ins().stack_addr(types::I64, ss, 0);
+            cur.ins().store(flags, arg0, a, 0);
+            if !in_loop {
+                let call = cur.ins().call(ext, &[a]);
+                let r = cur.ins().load(types::I64, flags, a, 0);
+                cur.ins().return_(&[r]);
+                return (func, call);
+            }
+            let [h, cold, latch, done] = std::array::from_fn(|_| func.dfg.make_block());
+            for b in [h, cold, latch, done] {
+                func.layout.append_block(b);
+            }
+            func.layout.set_cold(cold);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            cur.ins().jump(h, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let x = cur.ins().load(types::I64, flags, a, 0);
+            let x1 = cur.ins().iadd_imm_s(x, 1);
+            cur.ins().store(flags, x1, a, 0);
+            let c = cur.ins().icmp_imm_u(IntCC::Equal, x1, 1000);
+            cur.ins().brif(c, cold, &[], latch, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(cold);
+            let call = cur.ins().call(ext, &[a]);
+            cur.ins().jump(latch, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+            let y = cur.ins().load(types::I64, flags, a, 0);
+            let c2 = cur.ins().icmp_imm_u(IntCC::UnsignedLessThan, y, 5000);
+            cur.ins().brif(c2, h, &[], done, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+            cur.ins().return_(&[y]);
+            (func, call)
+        }
+        // Block weights as `s_slotprom` computes them.
+        fn weights(func: &Function) -> FxHashMap<Block, u32> {
+            let cfg = ControlFlowGraph::with_function(func);
+            let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+            let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+            la.compute(func, &cfg, &dt);
+            func.layout
+                .blocks()
+                .map(|b| {
+                    let w = 1u32 << (3 * la.loop_level(b).level().min(3));
+                    (b, if func.layout.is_cold(b) { (w / 8).max(1) } else { w })
+                })
+                .collect()
+        }
+        for (in_loop, want) in [(false, false), (true, true)] {
+            let (mut func, call) = build(in_loop);
+            let before = memops(&func);
+            let mut nocap = empty_nocap();
+            nocap.insert((call, 0));
+            let w = weights(&func);
+            let cfg = ControlFlowGraph::with_function(&func);
+            let n = run_lt(&mut func, &cfg, &nocap, false, &Default::default(), &[], Some(&w));
+            assert_eq!(n > 0, want, "in_loop={in_loop}:\n{func}");
+            if !want {
+                assert_eq!(memops(&func), before);
+            }
+            verify(&func);
+            // Without the cost check both promote.
+            let (mut func, call) = build(in_loop);
+            let mut nocap = empty_nocap();
+            nocap.insert((call, 0));
+            let cfg = ControlFlowGraph::with_function(&func);
+            assert!(run(&mut func, &cfg, &nocap, false, &Default::default()) > 0);
+        }
     }
 }

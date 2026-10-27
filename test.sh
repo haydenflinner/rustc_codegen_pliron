@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa spills inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   sroa spills slotpromlt inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -246,6 +246,28 @@ t_spills() {
   s2=$(sed -nE 's/^frame-info .*ltu_visit: .*spills=([0-9]+).*/\1/p' $out/spills2.fi)
   if [[ -z "$s0" || -z "$s2" || "$s2" -ge "$s0" ]]; then
     echo "spills: ltu_visit spill bytes $s0 -> $s2 under PLIRON_REMATCALL (want a drop)"; return 1
+  fi
+}
+
+t_slotpromlt() {
+  # PLIRON_SLOTPROM_LT ends slotprom-promoted fields at their slot's
+  # lifetime markers; PLIRON_SLOTPROM_SYNCCOST keeps a slot in memory when
+  # its `&mut` calls' writebacks and reloads outweigh what promotion saves
+  # (docs/history/2026-10-27-spills2.md). Per-iteration locals filled
+  # through `&mut` calls and an `Ast::fmt`-shaped heap-stack visitor must
+  # print the same under every combination; `walk`'s spill bytes must
+  # drop under SYNCCOST.
+  PLIRON_FRAME_INFO=4walk rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl0$exe 2> $out/spl0.fi &&
+      $out/spl0$exe > $out/spl.out
+  PLIRON_SLOTPROM_LT=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl1$exe &&
+      $out/spl1$exe | diff --strip-trailing-cr - $out/spl.out
+  PLIRON_SLOTPROM_LT=1 PLIRON_SLOTPROM_SYNCCOST=1 PLIRON_FRAME_INFO=4walk rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl2$exe 2> $out/spl2.fi &&
+      $out/spl2$exe | diff --strip-trailing-cr - $out/spl.out
+  local s0 s2
+  s0=$(sed -nE 's/^frame-info .*4walk: .*spills=([0-9]+).*/\1/p' $out/spl0.fi)
+  s2=$(sed -nE 's/^frame-info .*4walk: .*spills=([0-9]+).*/\1/p' $out/spl2.fi)
+  if [[ -z "$s0" || -z "$s2" || "$s2" -ge "$s0" ]]; then
+    echo "slotpromlt: walk spill bytes $s0 -> $s2 under PLIRON_SLOTPROM_SYNCCOST (want a drop)"; return 1
   fi
 }
 
@@ -905,6 +927,7 @@ want tailrec && t_tailrec
 want sroa && t_sroa
 want inlinecm && t_inlinecm
 want spills && t_spills
+want slotpromlt && t_slotpromlt
 want retattr && t_retattr
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
