@@ -67,8 +67,18 @@ value whose true range sits only in such a hole then gets a fresh
 local. The pass rebuilds a local-interference graph from precise
 per-block SSA liveness and greedily recolors same-type locals
 (entry-param indices stay fixed). On kernels-wasm: 764→636 locals
-(−17%), CODE −345 B. `PLIRON_WCOAL=0` disables it with preferred/steal;
-default off per the new-pass rule.
+(−17%), CODE −345 B. Default on; `PLIRON_WCOAL_HOLES=0` or
+`PLIRON_WCOAL=0` kills.
+
+## `src/backend/stackify.rs` — if→br_if rewrite (`PLIRON_WBRIF=1`)
+
+Experimental: rewrite `WasmBlock::If` into nested `block`+`BrIf`.
+Clears the if/else inventory but **grows** CODE ~16% (breaks wpeep's
+if-based folds). Kept opt-in for further work.
+
+## `src/backend/mod.rs` — BlockParams identity skip
+
+Skip `get L; set L` identity blockparam transfers at emit.
 
 All changes are marked `// PLIRON:` in the source.
 

@@ -33,6 +33,9 @@ pub enum WasmBlock<'a> {
     Leaf { block: Block },
     /// A translated unconditional branch.
     Br { target: WasmLabel },
+    /// PLIRON: conditional branch (`br_if`), used when rewriting
+    /// `If` into the LLVM-style `block`+`br_if` shape.
+    BrIf { cond: Value, target: WasmLabel },
     /// A translated conditional.
     If {
         cond: Value,
@@ -224,7 +227,14 @@ impl<'a, 'b> Context<'a, 'b> {
         while let Some(top) = self.process_stack.pop() {
             self.process(top);
         }
-        self.result.pop().unwrap()
+        let mut out = self.result.pop().unwrap();
+        // PLIRON: rewrite `if`/`else` into `block`+`br_if` (LLVM's
+        // shape). Cuts the if/else inventory that forces merge-param
+        // scratch locals. Opt-in: `PLIRON_WBRIF=1`.
+        if std::env::var_os("PLIRON_WBRIF").is_some_and(|v| v == "1") {
+            rewrite_ifs_to_brif(&mut out);
+        }
+        out
     }
 
     fn process(&mut self, entry: StackEntry<'a>) {
@@ -470,5 +480,124 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
         }
+    }
+}
+
+/// PLIRON: bump every `Br`/`BrIf` label by `extra` (wrapping new
+/// `block`s around an arm shifts relative depths).
+fn bump_br_labels<'a>(body: &mut [WasmBlock<'a>], extra: u32) {
+    for b in body {
+        match b {
+            WasmBlock::Br { target } | WasmBlock::BrIf { target, .. } => {
+                target.0 = target.0.saturating_add(extra);
+            }
+            WasmBlock::Block { body, .. } | WasmBlock::Loop { body, .. } => {
+                bump_br_labels(body, extra);
+            }
+            WasmBlock::If {
+                if_true, if_false, ..
+            } => {
+                bump_br_labels(if_true, extra);
+                bump_br_labels(if_false, extra);
+            }
+            WasmBlock::Select { targets, default, .. } => {
+                for t in targets {
+                    t.0 = t.0.saturating_add(extra);
+                }
+                default.0 = default.0.saturating_add(extra);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether the arm's final branch already leaves the (old) `if` to a
+/// label at depth ≥ 1 — i.e. it does not rely on falling through the
+/// `if`'s own end. Trailing `br 0` is fallthrough-equivalent.
+fn arm_exits_past_if(arm: &[WasmBlock<'_>]) -> bool {
+    match arm.last() {
+        Some(WasmBlock::Br { target }) if target.index() >= 1 => true,
+        Some(WasmBlock::Return { .. }) | Some(WasmBlock::Unreachable) => true,
+        _ => false,
+    }
+}
+
+/// Strip a trailing `br 0` (fallthrough to the old `if` end).
+fn strip_trailing_br0<'a>(arm: &mut Vec<WasmBlock<'a>>) {
+    if let Some(WasmBlock::Br { target }) = arm.last() {
+        if target.index() == 0 {
+            arm.pop();
+        }
+    }
+}
+
+/// PLIRON: `If { cond, T, F }` →
+/// ```text
+/// block          ;; outer join (= old if end)
+///   block        ;; skip-false when cond
+///     br_if 0    ;; cond true → true arm
+///     F'         ;; false arm (labels +1)
+///     br 1       ;; to outer, if F' would fall through
+///   end
+///   T'           ;; true arm (labels unchanged vs old if)
+/// end
+/// ```
+fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>) {
+    let mut i = 0;
+    while i < body.len() {
+        // Recurse first so nested Ifs rewrite bottom-up.
+        match &mut body[i] {
+            WasmBlock::Block { body: inner, .. } | WasmBlock::Loop { body: inner, .. } => {
+                rewrite_ifs_to_brif(inner);
+            }
+            WasmBlock::If {
+                if_true, if_false, ..
+            } => {
+                rewrite_ifs_to_brif(if_true);
+                rewrite_ifs_to_brif(if_false);
+            }
+            _ => {}
+        }
+        let Some((cond, mut if_true, mut if_false)) = (match &mut body[i] {
+            WasmBlock::If {
+                cond,
+                if_true,
+                if_false,
+            } => Some((*cond, std::mem::take(if_true), std::mem::take(if_false))),
+            _ => None,
+        }) else {
+            i += 1;
+            continue;
+        };
+        let false_exits = arm_exits_past_if(&if_false);
+        strip_trailing_br0(&mut if_false);
+        strip_trailing_br0(&mut if_true);
+        bump_br_labels(&mut if_false, 1);
+        let mut inner_body = Vec::with_capacity(if_false.len() + 2);
+        inner_body.push(WasmBlock::BrIf {
+            cond,
+            target: WasmLabel(0),
+        });
+        inner_body.append(&mut if_false);
+        if !false_exits {
+            // Skip the true arm: branch to the outer block's end.
+            inner_body.push(WasmBlock::Br {
+                target: WasmLabel(1),
+            });
+        }
+        let outer = WasmBlock::Block {
+            body: {
+                let mut v = Vec::with_capacity(if_true.len() + 1);
+                v.push(WasmBlock::Block {
+                    body: inner_body,
+                    out: Block::invalid(),
+                });
+                v.append(&mut if_true);
+                v
+            },
+            out: Block::invalid(),
+        };
+        body[i] = outer;
+        i += 1;
     }
 }

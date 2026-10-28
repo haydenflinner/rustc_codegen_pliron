@@ -167,11 +167,18 @@ impl<'a> WasmFuncBackend<'a> {
         func: &mut wasm_encoder::Function,
     ) {
         match block {
-            WasmBlock::Block { .. } | WasmBlock::Loop { .. } | WasmBlock::If { .. } => {
+            WasmBlock::Block { .. }
+            | WasmBlock::Loop { .. }
+            | WasmBlock::If { .. } => {
                 unreachable!("nested blocks are lowered by lower_block")
             }
             WasmBlock::Br { target } => {
                 func.instruction(&wasm_encoder::Instruction::Br(target.index()));
+            }
+            // PLIRON: `br_if` from the if→block rewrite in stackify.
+            WasmBlock::BrIf { cond, target } => {
+                self.lower_value(ctx, *cond, func);
+                func.instruction(&wasm_encoder::Instruction::BrIf(target.index()));
             }
             WasmBlock::Select {
                 selector,
@@ -203,23 +210,34 @@ impl<'a> WasmFuncBackend<'a> {
             }
             WasmBlock::BlockParams { from, to } => {
                 debug_assert_eq!(from.len(), to.len());
+                // PLIRON: skip identity transfers (same local) — they
+                // would emit `get L; set L` that wpeep deletes, but
+                // skipping here also shrinks pre-wpeep bodies and
+                // avoids reordering hazards in multi-param packs.
+                let mut needed: Vec<(Value, Type, Value)> = Vec::new();
                 for (&from, &(to_ty, to)) in from.iter().zip(to.iter()) {
                     if ctx.locals.values[to].is_empty() {
                         continue;
                     }
-                    let from_ty = self.body.values[self.body.resolve_alias(from)]
+                    let from_r = self.body.resolve_alias(from);
+                    let from_ty = self.body.values[from_r]
                         .ty(&self.body.type_pool)
                         .unwrap();
                     assert_eq!(from_ty, to_ty);
-                    if ctx.locals.values[from].len() == 1 {
-                        assert_eq!(from_ty, ctx.locals.locals[ctx.locals.values[from][0]]);
-                    }
-                    self.lower_value(ctx, from, func);
-                }
-                for &(to_ty, to) in to.iter().rev() {
-                    if ctx.locals.values[to].is_empty() {
+                    let fl = &ctx.locals.values[from_r];
+                    let tl = &ctx.locals.values[to];
+                    if fl.len() == 1 && tl.len() == 1 && fl[0] == tl[0] {
                         continue;
                     }
+                    if fl.len() == 1 {
+                        assert_eq!(from_ty, ctx.locals.locals[fl[0]]);
+                    }
+                    needed.push((from_r, to_ty, to));
+                }
+                for &(from, _, _) in &needed {
+                    self.lower_value(ctx, from, func);
+                }
+                for &(_, to_ty, to) in needed.iter().rev() {
                     if ctx.locals.values[to].len() == 1 {
                         assert_eq!(to_ty, ctx.locals.locals[ctx.locals.values[to][0]]);
                     }

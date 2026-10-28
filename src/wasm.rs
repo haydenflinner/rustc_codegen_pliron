@@ -5057,6 +5057,11 @@ fn peep_body_opts(
             }
         }
     }
+    // Residual if/else→br_if: stackify `PLIRON_WBRIF=1` rewrites If
+    // nodes but grows CODE (~16%) by defeating wpeep's if-based folds.
+    // A late bytecode ibrk was tried and corrupted bodies (2026-10-28).
+    // Next: emit br_if shapes from stackify CondBr in a wpeep-friendly
+    // form, or port bri/brf to block+br_if.
     // (Local renumbering — hot-first index compaction — was tried and
     // reverted: the `groups` regroup it forces costs more than the
     // 1-byte-LEB savings it buys; ~+18B net on the module.)

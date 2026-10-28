@@ -713,10 +713,10 @@ impl<'a> Context<'a> {
     /// their indices. `PLIRON_WCOAL_HOLES=1` enables; `PLIRON_WCOAL=0`
     /// disables together with preferred/steal.
     fn coalesce_holes(&mut self) {
-        if std::env::var_os("PLIRON_WCOAL").is_some_and(|v| v == "0") {
-            return;
-        }
-        if !std::env::var_os("PLIRON_WCOAL_HOLES").is_some_and(|v| v == "1") {
+        // Default on; `PLIRON_WCOAL_HOLES=0` or `PLIRON_WCOAL=0` kills.
+        if std::env::var_os("PLIRON_WCOAL").is_some_and(|v| v == "0")
+            || std::env::var_os("PLIRON_WCOAL_HOLES").is_some_and(|v| v == "0")
+        {
             return;
         }
         let n = self.results.locals.len();
