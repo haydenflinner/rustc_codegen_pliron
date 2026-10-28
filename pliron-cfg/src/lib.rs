@@ -59,6 +59,11 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_LTUNDEF",
     // Cold-call args as plain copies (2026-10-27-exact-div.md).
     "PLIRON_COLDCOPY",
+    // parse_only / eqbug digit-loop shape (2026-10-27-slow-kernels.md):
+    // madd form, pointer step compare, select-chain peels.
+    "PLIRON_SELCHAIN",
+    "PLIRON_MULCARRY",
+    "PLIRON_STEPCMP",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

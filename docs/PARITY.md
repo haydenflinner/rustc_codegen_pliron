@@ -92,8 +92,10 @@ weight.
 
 **Latest (2026-10-27, docs/history/2026-10-27-parity-card.md): 88
 overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 100),
-**91 with the candidate flags** (MEM 59, SIZ 40). The weakest categories
-are code size (wasm32 regex-syntax is 5.7x LLVM) and memory. The wasm
+**91 with the candidate flags** (MEM 59, SIZ 40). As of 2026-10-28 overnight,
+`LOWERFREE`/`JEARENA`/`LTUNDEF`/`CGU_ACAP=8` and `SELCHAIN`/`MULCARRY`/`STEPCMP`
+are default-on (kill with `=0`); expect MEM closer to the candidate card.
+The weakest remaining category is code size (wasm32 regex-syntax). The wasm
 size gap is attributed in docs/history/2026-10-27-wasm-size.md: 77% is
 the waffle inliner, half of that waffle's reducifier duplicating
 irreducible callees it spliced; `PLIRON_WASM_NOIRRED=1` +

@@ -55,3 +55,6 @@ Agents in flight: MEM flip, SPD selchain, SIZ hotleaf, COR fuzz.
 
 ## 23:08 ET — landing MEM defaults
 LOWERFREE/JEARENA/LTUNDEF + CGU_ACAP=8 via DEFAULT_ON/DEFAULT_VALUES; lowerfree(+wasm)/wasm_smoke/nostd green.
+
+## 23:14 ET — SPD defaults
+SELCHAIN+MULCARRY+STEPCMP → DEFAULT_ON (parse_only/eqbug digit loop). Fast legs green. ELABLOOPS stays opt-in.
