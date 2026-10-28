@@ -780,7 +780,8 @@ fn restore_trailing_params<'a>(
 /// PLIRON: `If` whose arms both end in `BlockParams` to the same
 /// merge → typed `if (result …)` leaving the edge args on the stack,
 /// then one `local.set` after the if (+ the shared `br` if any).
-/// Saves one arm's worth of `local.set`s. Single-param only.
+/// Saves one arm's worth of `local.set`s. Multi-param uses a module
+/// functype (`BlockTypeIntern`).
 fn promote_if_results<'a>(body: &mut Vec<WasmBlock<'a>>) {
     let mut i = 0;
     while i < body.len() {
@@ -817,14 +818,25 @@ fn promote_if_results<'a>(body: &mut Vec<WasmBlock<'a>>) {
                     return None;
                 }
             };
-            // Same single-param `to`; matching exit br (or both none/br0).
+            // Same `to` merge (any arity); matching exit br (or both
+            // none/br0). Multi-param needs a module functype — only
+            // while `compile_with_block_types` allows it.
             let br_ok = match (br_t, br_f) {
                 (None, None) => true,
                 (Some(a), Some(b)) if a.index() == b.index() => true,
                 (Some(a), None) | (None, Some(a)) if a.index() == 0 => true,
                 _ => false,
             };
-            if to_t.as_ptr() != to_f.as_ptr() || to_t.len() != 1 || !br_ok {
+            // Multi-param typed if: opt-in (`PLIRON_WIFRET_MULTI=1`) and
+            // only when `compile_with_block_types` is active. Default off
+            // — even all-moves sites grew regex-wasm CODE (gets + typeidx
+            // LEBs outweighed the saved arm sets; 2026-10-28).
+            let multi = to_t.len() > 1
+                && super::allow_multi_wifret()
+                && std::env::var_os("PLIRON_WIFRET_MULTI")
+                    .is_some_and(|v| v != "0" && v != "false");
+            let arity_ok = to_t.len() == 1 || multi;
+            if to_t.as_ptr() != to_f.as_ptr() || to_t.is_empty() || !br_ok || !arity_ok {
                 restore_trailing_params(if_true, from_t, to_t, br_t);
                 restore_trailing_params(if_false, from_f, to_f, br_f);
                 return None;

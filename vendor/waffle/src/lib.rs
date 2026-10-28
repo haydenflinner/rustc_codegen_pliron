@@ -20,6 +20,8 @@ pub use wasmparser;
 pub use wasm_encoder;
 
 mod backend;
+/// PLIRON: multi-value `if` blocktype intern (see `FunctionBody::compile_with_block_types`).
+pub use backend::BlockTypeIntern;
 pub mod cfg;
 pub mod entity;
 mod errors;

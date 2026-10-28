@@ -90,6 +90,8 @@ Pure single-use edge-only values rematerialize at the use instead of
 uses also remat (`PLIRON_WTREEREMAT_UNARY=0` off). Regex-wasm CODE
 404→385 KiB (−19 KiB); with SOLO=15+TINY=6 → 376 KiB; +`WIFRET` typed
 single-param if results → 375 KiB (1.79×). `PLIRON_WIFRET=0` off.
+Multi-param typed if (`PLIRON_WIFRET_MULTI=1` + `BlockTypeIntern`) is
+wired but default-off — grew regex-wasm CODE in 2026-10-28 trials.
 `PLIRON_WBRIF=exit` rewrites only both-exit Ifs to block+br_if (still
 grows CODE vs off; full `=1` grows more).
 

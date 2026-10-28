@@ -8,7 +8,20 @@ use anyhow::Result;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::sync::Mutex;
+
+thread_local! {
+    /// PLIRON: `promote_if_results` may emit multi-param typed `if` only
+    /// while `compile_with_block_types` is on the stack (intern is live).
+    static ALLOW_MULTI_WIFRET: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn allow_multi_wifret() -> bool {
+    ALLOW_MULTI_WIFRET.with(|c| c.get())
+}
 
 pub(crate) mod bitset;
 pub(crate) mod cross_block_ids;
@@ -27,10 +40,46 @@ pub struct WasmFuncBackend<'a> {
     cfg: CFGInfo,
 }
 
-struct CompileContext<'a> {
+/// PLIRON: intern empty-param functypes used as multi-value `block`/`if`
+/// blocktypes. `base` is the next free type-section index (usually
+/// `module.signatures.len()`); after all functions compile, append
+/// [`BlockTypeIntern::into_types`] to the module's signatures in order.
+pub struct BlockTypeIntern {
+    base: u32,
+    map: HashMap<Vec<Type>, u32>,
+    order: Vec<Vec<Type>>,
+}
+
+impl BlockTypeIntern {
+    pub fn new(base: u32) -> Self {
+        Self {
+            base,
+            map: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    pub fn intern(&mut self, tys: &[Type]) -> u32 {
+        if let Some(&i) = self.map.get(tys) {
+            return i;
+        }
+        let i = self.base + self.order.len() as u32;
+        self.order.push(tys.to_vec());
+        self.map.insert(tys.to_vec(), i);
+        i
+    }
+
+    pub fn into_types(self) -> Vec<Vec<Type>> {
+        self.order
+    }
+}
+
+struct CompileContext<'a, 'bt> {
     trees: Trees,
     ctrl: Vec<WasmBlock<'a>>,
     locals: Localifier,
+    /// PLIRON: shared multi-value blocktype allocator (optional).
+    block_types: Option<&'bt Mutex<BlockTypeIntern>>,
 }
 
 macro_rules! op {
@@ -41,6 +90,15 @@ macro_rules! op {
 
 impl<'a> WasmFuncBackend<'a> {
     pub fn compile(body: &'a FunctionBody) -> Result<wasm_encoder::Function> {
+        Self::compile_with_block_types(body, None)
+    }
+
+    /// PLIRON: like [`compile`], but interns multi-value `if` blocktypes
+    /// into `block_types` (indices are `base + order`).
+    pub fn compile_with_block_types(
+        body: &'a FunctionBody,
+        block_types: Option<&Mutex<BlockTypeIntern>>,
+    ) -> Result<wasm_encoder::Function> {
         body.validate()?;
         log::debug!("Backend compiling:\n{}\n", body.display_verbose("| ", None));
         // For ownership reasons (to avoid a self-referential struct
@@ -51,10 +109,16 @@ impl<'a> WasmFuncBackend<'a> {
         let body = Reducifier::new(body).run();
         let cfg = CFGInfo::new(&body);
         let state = WasmFuncBackend { body, cfg };
-        state.lower()
+        ALLOW_MULTI_WIFRET.with(|c| c.set(block_types.is_some()));
+        let r = state.lower(block_types);
+        ALLOW_MULTI_WIFRET.with(|c| c.set(false));
+        r
     }
 
-    pub fn lower(&self) -> Result<wasm_encoder::Function> {
+    pub fn lower(
+        &self,
+        block_types: Option<&Mutex<BlockTypeIntern>>,
+    ) -> Result<wasm_encoder::Function> {
         log::debug!("CFG:\n{:?}\n", self.cfg);
         let trees = Trees::compute(&self.body, &self.cfg);
         log::debug!("Trees:\n{:?}\n", trees);
@@ -67,6 +131,7 @@ impl<'a> WasmFuncBackend<'a> {
             trees,
             ctrl,
             locals,
+            block_types,
         };
 
         let mut func = wasm_encoder::Function::new(
@@ -101,7 +166,7 @@ impl<'a> WasmFuncBackend<'a> {
 
     fn lower_block(
         &self,
-        ctx: &CompileContext<'_>,
+        ctx: &CompileContext<'_, '_>,
         block: &WasmBlock<'_>,
         func: &mut wasm_encoder::Function,
     ) {
@@ -149,8 +214,18 @@ impl<'a> WasmFuncBackend<'a> {
                         Some([(ty, _)]) => {
                             wasm_encoder::BlockType::Result(wasm_encoder::ValType::from(*ty))
                         }
-                        // Multi-value needs a module func type; promotion
-                        // only keeps single-param merges (see stackify).
+                        // PLIRON: multi-value typed if — intern empty-param
+                        // functype and reference it (needs `block_types`).
+                        Some(rets) if !rets.is_empty() => {
+                            let tys: Vec<Type> = rets.iter().map(|(t, _)| *t).collect();
+                            match ctx.block_types {
+                                Some(bt) => {
+                                    let idx = bt.lock().unwrap().intern(&tys);
+                                    wasm_encoder::BlockType::FunctionType(idx)
+                                }
+                                None => wasm_encoder::BlockType::Empty,
+                            }
+                        }
                         _ => wasm_encoder::BlockType::Empty,
                     };
                     func.instruction(&wasm_encoder::Instruction::If(bt));
@@ -169,7 +244,7 @@ impl<'a> WasmFuncBackend<'a> {
     /// Emit a `WasmBlock` with no nested blocks.
     fn lower_leaf_block(
         &self,
-        ctx: &CompileContext<'_>,
+        ctx: &CompileContext<'_, '_>,
         block: &WasmBlock<'_>,
         func: &mut wasm_encoder::Function,
     ) {
@@ -327,7 +402,7 @@ impl<'a> WasmFuncBackend<'a> {
 
     fn lower_value(
         &self,
-        ctx: &CompileContext<'_>,
+        ctx: &CompileContext<'_, '_>,
         value: Value,
         func: &mut wasm_encoder::Function,
     ) {
@@ -349,7 +424,7 @@ impl<'a> WasmFuncBackend<'a> {
 
     fn lower_set_value(
         &self,
-        ctx: &CompileContext<'a>,
+        ctx: &CompileContext<'a, '_>,
         value: Value,
         func: &mut wasm_encoder::Function,
     ) {
@@ -365,7 +440,7 @@ impl<'a> WasmFuncBackend<'a> {
 
     fn lower_inst(
         &self,
-        ctx: &CompileContext<'a>,
+        ctx: &CompileContext<'a, '_>,
         value: Value,
         root: bool,
         func: &mut wasm_encoder::Function,
