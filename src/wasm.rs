@@ -8156,6 +8156,27 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // caller grow ~cap per round for ROUNDS rounds.
     let mut grown = vec![0usize; funcs.len()];
     let mut inlined = 0usize;
+    // `PLIRON_WASM_HOTLEAF=N` (default off; `1` means 2): the loop rule
+    // only for callees with at most N calls of their own — the IR
+    // inliner's `PLIRON_INLINE_LOOPCALLS` leaf rule. A callee that
+    // carries many calls just moves that call traffic into the loop, and
+    // every splice exposes them as fresh loop callsites: regex-syntax's
+    // `parser::parse` went from 135 to 1,930 insts (LLVM: 760 B) and
+    // `Ast::drop` from 737 to 2,070 under the rule; the hashmap kernels'
+    // `hash_one` (SipHash, a leaf) is what the rule exists for.
+    let hot_leaf: Option<u32> = match crate::env_get("PLIRON_WASM_HOTLEAF") {
+        None | Some("0") => None,
+        Some("1") => Some(2),
+        Some(v) => v.parse().ok(),
+    };
+    // `PLIRON_WASM_HOTCAP=N` (default `caller_cap`): insts a caller may
+    // absorb through the loop rule alone. The hot callers above all ended
+    // at `caller_cap` (2,048) — the shared cascade cap is the only thing
+    // stopping the loop rule, so it fills it.
+    let hot_cap_total: usize = crate::env_get("PLIRON_WASM_HOTCAP")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    let mut hot_grown = vec![0usize; funcs.len()];
     // `PLIRON_WASM_NOREC=1`: the loop rule skips callees in the caller's
     // call-graph SCC. In a recursive mesh (drop glue of a recursive
     // enum, a recursive-descent visitor) every member is a loop callsite
@@ -8186,11 +8207,14 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
         // body alive, so inlining one only duplicates code.
         let mut calls = vec![0u32; funcs.len()];
         let mut refs = vec![0u32; funcs.len()];
-        for f in funcs.iter() {
+        // Calls *inside* each body (`PLIRON_WASM_HOTLEAF`'s leaf test).
+        let mut ncalls = vec![0u32; funcs.len()];
+        for (fi, f) in funcs.iter().enumerate() {
             for v in f.body.iter().flat_map(|b| b.values.values()) {
                 match v {
                     ValueDef::Operator(O::Call { function_index }, ..) => {
                         calls[function_index.index()] += 1;
+                        ncalls[fi] += 1;
                     }
                     ValueDef::Operator(O::RefFunc { func_index }, ..) => {
                         refs[func_index.index()] += 1;
@@ -8250,7 +8274,8 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
             // One scan per caller: collect all eligible call values.
             // Positions are resolved per-site at splice time (the tail
             // split keeps every other call's identity valid).
-            let sites: Vec<(WV, usize)> = {
+            // (call value, callee, admitted by the loop rule alone)
+            let sites: Vec<(WV, usize, bool)> = {
                 let b = funcs[ci].body.as_ref().unwrap();
                 let mut sites = Vec::new();
                 for blk in b.blocks.iter() {
@@ -8298,16 +8323,19 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // inside fresh splice copies and blows up
                             // compile time; LLVM inlines bottom-up
                             // once per site instead.
-                            if (funcs[fi].always && n <= ALWAYS_CAP)
+                            let other = (funcs[fi].always && n <= ALWAYS_CAP)
                                 || (round == 0 && funcs[fi].hint && n <= hint_cap)
                                 || n <= TINY
                                 || (k == 1 && refs[fi] == 0 && n <= SOLO)
-                                || gc_done
-                                || (n <= hot_cap
-                                    && (!norec || scc[fi] != scc[ci])
-                                    && is_loop(funcs, ci, blk))
+                                || gc_done;
+                            if other {
+                                sites.push((iv, fi, false));
+                            } else if n <= hot_cap
+                                && (!norec || scc[fi] != scc[ci])
+                                && hot_leaf.is_none_or(|m| ncalls[fi] <= m)
+                                && is_loop(funcs, ci, blk)
                             {
-                                sites.push((iv, fi));
+                                sites.push((iv, fi, true));
                             }
                         }
                     }
@@ -8327,12 +8355,15 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 let irred_log = crate::env_get("PLIRON_WASM_INLINE_LOG").is_some();
                 let mut was_irred =
                     irred_log && wirreducible(funcs[ci].body.as_ref().unwrap());
-                for &(iv, fi) in &sites {
+                for &(iv, fi, via_hot) in &sites {
                     if cur_size > caller_cap
                         || grown[ci] > caller_cap
                         || inline_limit.is_some_and(|l| inlined >= l)
                     {
                         break;
+                    }
+                    if via_hot && hot_grown[ci] + body_size(funcs[fi].body.as_ref().unwrap()) > hot_cap_total {
+                        continue;
                     }
                     let callee = funcs[fi].body.clone().unwrap();
                     check_targets(&callee, &funcs[fi].name);
@@ -8354,6 +8385,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                         let n = body_size(&callee);
                         cur_size += n;
                         grown[ci] += n;
+                        if via_hot {
+                            hot_grown[ci] += n;
+                        }
                         inlined += 1;
                         if irred_log && !was_irred {
                             fixup_edges(b);

@@ -1139,11 +1139,21 @@ pub fn run(
     let recstack = crate::env_is("PLIRON_INLINE_RECSTACK", "1");
     let once1 = crate::env_is("PLIRON_INLINE_ONCE1", "1");
     let scc_limit = crate::env_is("PLIRON_INLINE_SCCLIMIT", "1");
+    // `PLIRON_INLINE_SMALLSCC=1` (small mode only): no inlining at all
+    // along a call-graph cycle — a callee in the caller's own SCC (or a
+    // self-recursive caller) stays a call. On wasm the flat 512-op
+    // limit lets each member of a recursive drop-glue mesh (`Ast::drop`
+    // -> `drop_glue<Vec<Ast>>` -> `Vec::drop` -> `drop_glue<Ast>` ...)
+    // take one full level of the whole mesh: regex-syntax's `Ast::drop`
+    // 7,240 B against LLVM's 1,275. The original-site-one-level rule
+    // (`PLIRON_INLINE_SCC`) is what LLVM does for speed; size-sensitive
+    // output can't afford it.
+    let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
     let mut free_used: FxHashSet<String> = FxHashSet::default();
     // Self-recursive functions (`scc` keeps only multi-function cycles).
-    let self_rec: FxHashSet<String> = if recstack {
+    let self_rec: FxHashSet<String> = if recstack || smallscc {
         st.funcs
             .iter()
             .filter(|(n, f)| has_body(ctx, f.op) && callees(ctx, st, n).iter().any(|c| c == *n))
@@ -1153,7 +1163,7 @@ pub fn run(
         FxHashSet::default()
     };
     let scc_rule = crate::pass_enabled("PLIRON_INLINE_SCC");
-    let scc: FxHashMap<String, u32> = if scc_rule || recstack || scc_limit {
+    let scc: FxHashMap<String, u32> = if scc_rule || recstack || scc_limit || smallscc {
         scc_ids(ctx, st)
     } else {
         FxHashMap::default()
@@ -1486,6 +1496,12 @@ pub fn run(
                         && scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
                     {
                         "reject (scc)"
+                    } else if smallscc
+                        && !f.always_inline
+                        && (scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
+                            || self_rec.contains(cs))
+                    {
+                        "reject (small-scc)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
                     } else if model && !free && grown + ci.n > growth {

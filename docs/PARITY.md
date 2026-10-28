@@ -98,7 +98,12 @@ size gap is attributed in docs/history/2026-10-27-wasm-size.md: 77% is
 the waffle inliner, half of that waffle's reducifier duplicating
 irreducible callees it spliced; `PLIRON_WASM_NOIRRED=1` +
 `PLIRON_WASM_NOREC=1` + `PLIRON_WASM_GC=1` (default off) take regex-wasm
-from 5.73x to 3.38x.
+from 5.73x to 3.38x; `PLIRON_REDUCIBLE=1` (CLIF passes keep CFGs
+reducible) and `PLIRON_WASM_HOTLEAF=1` (the loop rule only for leaf
+callees) to 2.17x; `PLIRON_INLINE_SMALLSCC=1` fixes the recursive
+drop-glue meshes (`Ast::drop` at LLVM's size). Flip of HOTLEAF is
+deferred to a nightly (gate + kernels-wasm runtime); day-to-day stays
+on the default gate's fast legs.
 
 Correctness is an attribute, not a gate: it can be traded for a while,
 at a visible price (one pliron-only crate failure rates COR 50). The
