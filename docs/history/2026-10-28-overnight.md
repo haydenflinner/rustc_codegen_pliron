@@ -252,3 +252,6 @@ pre-flip base; plain defaults match the A/B-on object. Known ~1% SPD on
 the regex parse probe (2026-10-27-jump-tables.md); SIZ card priority.
 
 Fast legs: `jt_narrow`/`jt_shape` unit tests; `wasm_smoke,nostd,std,noret,narrowext`.
+`harness/gate.py`: **83/83** @ `d41f892` (first attempt failed `poison:pgo`
+only because `CARGO_TARGET_DIR` redirected the tools crates; rebuilt
+`pliron-prof{,-rt}` locally and re-ran clean). Pushed to main.
