@@ -617,7 +617,10 @@ the residual is merge-param materialization: waffle's relooper puts
 block params through scratch locals at `if`/`else` boundaries (ours:
 ~36k local ops; LLVM: ~14k, its `br_if`-only shapes keep values on the
 operand stack). Next levers: deeper `if`→`br_if` restructuring in
-stackify, local coalescing parity with binaryen.
+stackify; bytecode-level coalesce-locals (binaryen's −13 KiB) —
+IR-level `PLIRON_WCOAL_HOLES=1` already recolors linearized-range
+lifetime holes (kernels-wasm locals 764→636, CODE −345 B) but does
+not yet see post-stackify get/set ranges.
 
 ## 3. Native runtime
 

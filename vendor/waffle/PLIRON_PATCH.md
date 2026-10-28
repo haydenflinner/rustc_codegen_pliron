@@ -57,6 +57,19 @@ LLVM's destructive-update shape.
 
 `PLIRON_WCOAL=0` disables it (stock freelist order).
 
+## `src/backend/localify.rs` — lifetime-hole recolor (`PLIRON_WCOAL_HOLES=1`)
+
+`coalesce_holes()` runs after `allocate`. The freelist colors
+linearized reverse-RPO intervals, so a value live in B_early and
+B_late looks live through every block between them in that order
+even when `block_end_live` says it is dead there — a short-lived
+value whose true range sits only in such a hole then gets a fresh
+local. The pass rebuilds a local-interference graph from precise
+per-block SSA liveness and greedily recolors same-type locals
+(entry-param indices stay fixed). On kernels-wasm: 764→636 locals
+(−17%), CODE −345 B. `PLIRON_WCOAL=0` disables it with preferred/steal;
+default off per the new-pass rule.
+
 All changes are marked `// PLIRON:` in the source.
 
 ## `src/backend/treeify.rs` — loop-nest guard (`PLIRON_WTREE_LOOP=0` off)
