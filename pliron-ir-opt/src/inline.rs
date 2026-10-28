@@ -1352,10 +1352,23 @@ pub fn run(
                             && single.contains(cs)
                             && !rec_caller
                             && !(once1 && free_used.contains(cs.as_str())));
+                    // `PLIRON_INLINE_WASM_COLD=<n>` (small mode only; unset =
+                    // `limit`): flat non-loop threshold. Loop-site `hot`x still
+                    // uses `limit` so `hash_one` (~926) keeps inlining at
+                    // `WASM_LIMIT=512` while cold helpers stop growing
+                    // regex-wasm. Measured: flat INLINE=384 kills tokenize
+                    // (+43%); a cold/hot split is the candidate (2026-10-28-solo50.md).
+                    let cold = if small {
+                        crate::env_get("PLIRON_INLINE_WASM_COLD")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(limit)
+                    } else {
+                        limit
+                    };
                     let mut t = if free {
                         limit.saturating_mul(10)
                     } else {
-                        limit
+                        cold
                     };
                     // `args` only feeds the bonus/fold/model scoring below —
                     // collect the operand Vec lazily so plain candidates skip
