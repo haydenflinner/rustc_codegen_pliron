@@ -91,3 +91,13 @@ regex-wasm CODE under plain defaults: **444,300** (2.14x LLVM 207,914).
 Was 1,191,906 (5.73x). reducible_dup_off now uses `=0`. Fast legs green.
 Fuzzreg + unit tests from agents: pass.
 INLINE_CLEAN/FANIN landed default-off as `b2de35e` (iropt cleanup).
+
+## 23:22 ET — INLINE_CLEAN spot-check
+
+`PLIRON_INLINE_CLEAN=1` on syn (1 run): text 1,951,488 → 1,929,224 (−1.1%),
+RSS 1,113 → 1,053 MiB; wall 7.1s → 15.6s (noisy/expensive — **leave opt-in**).
+FANIN not flipped. Agent smoke with CLEAN+FANIN: wasm_smoke+nostd green.
+Fuzz 14200:14500 agent reported success.
+
+## 23:23 ET — gates
+MEM-defaults gate: 83/83 pass. Tip gate once failed `debuginfo` (-g text); re-ran twice green (likely mid-rebuild flake). CLEAN+FANIN gate reported green by agent; CLEAN stays opt-in (wall).
