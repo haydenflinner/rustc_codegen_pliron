@@ -55,6 +55,32 @@ Agents in flight: MEM flip, SPD selchain, SIZ hotleaf, COR fuzz.
 
 ## 23:08 ET — landing MEM defaults
 LOWERFREE/JEARENA/LTUNDEF + CGU_ACAP=8 via DEFAULT_ON/DEFAULT_VALUES; lowerfree(+wasm)/wasm_smoke/nostd green.
+Landed as `e63e878` on main (parallel MEM agent; same patch shape as
+worktree `overnight/mem-defaults`).
 
 ## 23:14 ET — SPD defaults
 SELCHAIN+MULCARRY+STEPCMP → DEFAULT_ON (parse_only/eqbug digit loop). Fast legs green. ELABLOOPS stays opt-in.
+
+## 23:15 ET — MEM agent independent validation (`overnight/mem-defaults`)
+
+Same flip as `e63e878`, validated before noticing main already had it:
+
+- `cargo build --release` + debug; `cargo test -p pliron-cfg -p pliron-ir-opt
+  -p pliron-clif-opt` green; `TEST_NOBUILD=1 ./test.sh --only=wasm_smoke,nostd,std,lowerfree,lowerfree-wasm,spills` green
+  (default-on fires `lowerfree … Context released` with no `PLIRON_*` set;
+  kill-switch `=0` keeps byte-identical objects).
+- `harness/gate.py` (default, not `--full`): **83 jobs passed** in 232 s
+  on the dirty worktree tip.
+- A/B peak RSS via `ctime.py --only regex-syntax,syn --runs 3` (release
+  dylib; ON = defaults including LTUNDEF; OFF =
+  `LOWERFREE=0 JEARENA=0 CGU_ACAP=0 LTUNDEF=0`):
+
+| input | OFF | ON | RSS ratio |
+|---|---|---|---|
+| regex-syntax | 789 MiB (2.77x LLVM) | 462 MiB (1.63x) | ×0.59 |
+| syn | 1,723 MiB (2.93x) | 1,067 MiB (1.85x) | ×0.62 |
+
+Two-input RSS geomean 2.85 → 1.74 (≈ MEM rating 25 → 60; full five-input
+card B was 59). Crates tiers 1–3 / stage-2 UI still deferred.
+Branch `overnight/mem-defaults` tracks main + this log; no second code
+commit (already on main).
