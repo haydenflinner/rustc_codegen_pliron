@@ -347,7 +347,7 @@ impl BlockLoweringOrder {
                 // duplicates' table entries point at the shared block; its
                 // jump takes the first entry's args (equal by construction).
                 // `Lower::lower_branch_blockparam_args` keeps the vcode CFG
-                // free of the repeated successor. `PLIRON_EDGEDEDUP=1` enables.
+                // free of the repeated successor. `PLIRON_EDGEDEDUP` (default on).
                 let dedup_dests = if edge_dedup_enabled() {
                     f.layout.last_inst(block).and_then(|inst| {
                         let data = &f.dfg.insts[inst];
@@ -664,9 +664,9 @@ mod test {
     }
 }
 
-/// PLIRON: `PLIRON_EDGEDEDUP=1` shares one split-edge block among the
-/// `br_table` entries that pass the same block call.
+/// PLIRON: `PLIRON_EDGEDEDUP` (default on; `=0` off) shares one split-edge
+/// block among the `br_table` entries that pass the same block call.
 pub(crate) fn edge_dedup_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_EDGEDEDUP").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_EDGEDEDUP").as_deref() != Ok("0"))
 }

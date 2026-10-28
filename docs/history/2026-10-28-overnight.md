@@ -141,3 +141,37 @@ bench/wasm full suite (noisy box; LLVM baselines swung hard between runs):
 pliron-only on/off geomean across kernels ~see log; hashmap leaf path OK under ON.
 Size win on bench module −8.8 KiB. Keep HOTLEAF default-on.
 CLEAN vs FANIN debuginfo bisect: agent reported success (CLEAN stays opt-in).
+
+## 23:28 ET — COR validation (overnight/cor-fixes)
+
+No miscompiles found; no code fix commit. Tip under test moved during the
+session as MEM/SPD/SIZ flips landed (`e63e878` → `5ae7b88` → `378026e` →
+`dcf8093` / later `a82cdb2`). Candidate set exercised:
+
+`LOWERFREE JEARENA CGU_ACAP=8 LTUNDEF SELCHAIN MULCARRY STEPCMP
+WASM_NOIRRED WASM_HOTLEAF` (env-on before flips; DEFAULT_ON after).
+
+| leg | result |
+|---|---|
+| gate default @ bfef76a (pre-flips) | **86/86 pass** (316 s) |
+| gate default @ dcf8093 (all flips) | **86/86 pass** (130 s) |
+| fuzzreg @ defaults (gate) | **19/19** |
+| fuzzreg + candidate env flags | **19/19** |
+| fuzzreg @ tip defaults post-flip | **19/19** |
+| fuzz 14000:14200 + flags | **200/200** |
+| fuzz 14200:14500 + flags | **300/300** |
+| fuzz 14500:14700 tip defaults | **200/200** |
+| debuginfo isolated (×2) | **pass** |
+| miscompile fixes | **none** |
+
+Spurious `debuginfo: -g changed the code` once under overlapping gates
+sharing `target/tests` — not reproduced in isolation (`TEST_OUT` separate).
+Residual: no crates.py / stage-2 UI; concurrent gates on one checkout race
+`TEST_OUT`; keep watching fuzzreg when more DEFAULT_ON lands.
+
+## 23:28 ET — card-B leftovers default-on
+
+JT_SHAPE, CMP3, NORETTRAP → DEFAULT_ON; EDGEMERGE/EPIMERGE → DEFAULT_VALUES 1;
+vendored EDGEDEDUP/NARROWEXT/EDGEMERGE/EPIMERGE default on unless =0.
+HOTLEAF wasm A/B: bench module −8.8 KiB; pliron on/off geomean ~0.80 (noisy).
+Unit narrowext/noret/jt_shape/cmp3 + stanzas + wasm_smoke green.

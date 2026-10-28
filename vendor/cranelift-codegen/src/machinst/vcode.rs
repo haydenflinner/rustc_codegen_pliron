@@ -41,11 +41,12 @@ use cranelift_entity::{Keys, entity_impl};
 /// PLIRON: `PLIRON_EDGEMERGE` key (see `VCode::edge_merge_key`).
 type EdgeKey = (SmallVec<[(Allocation, Allocation); 4]>, BlockIndex, bool);
 
-/// PLIRON: a `PLIRON_*` mode knob: unset or `0` is 0, a digit is itself,
-/// anything else is 1.
+/// PLIRON: a `PLIRON_*` mode knob for EDGEMERGE/EPIMERGE. Unset defaults
+/// to mode `1` (placement-aware merge); `0` is off; a digit is itself;
+/// anything else is 1. Matches `pliron_cfg::DEFAULT_VALUES`.
 fn pliron_mode(var: &str) -> u8 {
     match std::env::var(var) {
-        Err(_) => 0,
+        Err(_) => 1,
         Ok(v) => v.parse::<u8>().unwrap_or(1),
     }
 }

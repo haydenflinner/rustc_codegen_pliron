@@ -3448,8 +3448,8 @@ fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
         // wasm has a real `br_table`; chains only add compares.
         return 0;
     }
-    // `PLIRON_JT_SHAPE=1`: cluster-aware chains, profile-ordered tests,
-    // hot-case peeling (brchain::run_with).
+    // `PLIRON_JT_SHAPE` (default on): cluster-aware chains, profile-ordered
+    // tests, hot-case peeling (brchain::run_with). `=0` is the kill switch.
     let shape = crate::config::config().is("PLIRON_JT_SHAPE", "1");
     let k = brchain::run_with(&mut p.clctx.func, Some(p.prof), shape);
     if k > 0 && p.dump {

@@ -3002,8 +3002,8 @@ struct FnLower<'a, 'b> {
     /// This function's own convention is `CallConv::Tail` (it is internal), so
     /// `return_call`/`return_call_indirect` are legal in its body.
     own_tail: bool,
-    /// `PLIRON_NORETTRAP=1`: the `unreachable` after a call to a noreturn
-    /// callee (`CallInfo::noret`) traps with `TrapCode::NORETURN_CALL`,
+    /// `PLIRON_NORETTRAP` (default on): the `unreachable` after a call to a
+    /// noreturn callee (`CallInfo::noret`) traps with `TrapCode::NORETURN_CALL`,
     /// which Cranelift's emission drops when code follows.
     noret_trap: bool,
     /// The op just lowered was a noreturn call: 1 = plain call, 2 = invoke

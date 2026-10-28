@@ -93,12 +93,14 @@ weight.
 **Latest (2026-10-27, docs/history/2026-10-27-parity-card.md): 88
 overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 100),
 **91 with the candidate flags** (MEM 59, SIZ 40). As of 2026-10-28 overnight
-(`e63e878` / `5ae7b88` / wasm-size defaults): `LOWERFREE`/`JEARENA`/
-`LTUNDEF`/`CGU_ACAP=8`, `SELCHAIN`/`MULCARRY`/`STEPCMP`, and the wasm size
-stack (`NOIRRED`/`NOREC`/`GC`/`REDUCIBLE`/`HOTLEAF`/`SMALLSCC`) are
-default-on (kill with `=0`). Spot-check MEM A/B: peak-RSS geomean 2.85 →
-1.74 (~MEM 25 → ~60 on regex-syntax+syn). regex-wasm CODE **2.14x** LLVM
-(was 5.73x). Attribution: docs/history/2026-10-27-wasm-size.md.
+(`e63e878` / `5ae7b88` / wasm-size defaults / card-B leftovers):
+`LOWERFREE`/`JEARENA`/`LTUNDEF`/`CGU_ACAP=8`, `SELCHAIN`/`MULCARRY`/
+`STEPCMP`, the wasm size stack (`NOIRRED`/`NOREC`/`GC`/`REDUCIBLE`/
+`HOTLEAF`/`SMALLSCC`), and the remaining card-B set (`EDGEDEDUP`/
+`JT_SHAPE`/`CMP3`/`NORETTRAP`/`EDGEMERGE=1`/`EPIMERGE=1`/`NARROWEXT`)
+are default-on (kill with `=0`). Spot-check MEM A/B: peak-RSS geomean
+2.85 → 1.74 (~MEM 25 → ~60 on regex-syntax+syn). regex-wasm CODE
+**2.14x** LLVM (was 5.73x). Attribution: docs/history/2026-10-27-wasm-size.md.
 
 Correctness is an attribute, not a gate: it can be traded for a while,
 at a visible price (one pliron-only crate failure rates COR 50). The

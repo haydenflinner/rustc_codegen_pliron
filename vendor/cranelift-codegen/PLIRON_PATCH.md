@@ -730,7 +730,7 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `umulh` + `add` per cold call arg with a `mov` that regalloc often
     makes a self-move.
 
-62. aarch64 clean narrow ints (`PLIRON_NARROWEXT=1`, default off;
+62. aarch64 clean narrow ints (`PLIRON_NARROWEXT`, default on, `=0` off;
     `src/isa/aarch64/{inst.isle,lower.isle,lower.rs,lower/isle.rs}`,
     `src/machinst/{lower.rs,isle.rs,abi.rs}`). `narrow_uext_clean` (Rust,
     budget 16) extends the `val_already_extended` oracle (patch 36) to
@@ -754,8 +754,8 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `PLIRON_NARROWEXT_MASK=<bits>` (default all) keeps only some users live,
     for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`.
 
-63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP=1`, default
-    off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table
+63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP`, default on,
+    `=0` off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table
     entries passing the same block call (target and args) map to one
     `CriticalEdge` lowered block instead of one identical `mov*; b` block
     each. `lower_branch_blockparam_args` skips the repeated successor so
@@ -763,8 +763,8 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     edge); repeated successors carry no args. The jump table itself keeps
     one entry per case, now pointing at the shared label.
 
-66. Edge-block tail merging, `PLIRON_EDGEMERGE=1|2` (default off;
-    `src/machinst/vcode.rs` `emit` and `edge_merge_key`, plus
+66. Edge-block tail merging, `PLIRON_EDGEMERGE=1|2` (default mode `1`,
+    `=0` off; `src/machinst/vcode.rs` `emit` and `edge_merge_key`, plus
     `MachBuffer::alias_label` in `src/machinst/buffer.rs`). Before
     emission, every block that is only regalloc edits (moves, spills,
     reloads) and an operand-less jump is keyed by (edits, successor,
@@ -783,7 +783,7 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     changes no code. On regex-syntax, `=1` removes 1,291 `b`s and 14.7 KB
     of `__text`, and `=2` removes 1,716 `b`s and 20.4 KB
     (docs/history/2026-10-27-branches.md).
-67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default off;
+67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default mode `1`, `=0` off;
     `src/machinst/vcode.rs`). The first `return` that merges binds a label
     in front of its epilogue. Each later merging `return` jumps to that
     label in place of its own copy. `=2` merges every epilogue of 3 or more
@@ -844,8 +844,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `--target x86_64-apple-darwin`).
 
 65. No trap after a noreturn call (`TrapCode::NORETURN_CALL`, user code
-    250; only pliron's lowering emits it, under `PLIRON_NORETTRAP=1`, so
-    this is inert otherwise; docs/history/2026-10-27-noreturn-trap.md).
+    250; only pliron's lowering emits it, under `PLIRON_NORETTRAP`
+    (default on; `=0` off); docs/history/2026-10-27-noreturn-trap.md).
     `src/ir/trapcode.rs`: the constant. `src/machinst/mod.rs`: provided
     `MachInst::{trap_code, elide_noreturn_continuation,
     noreturn_continuation}`, implemented for aarch64 (`Udf`, `Call`,

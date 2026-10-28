@@ -8121,8 +8121,17 @@ fn call_sccs(funcs: &[FDecl]) -> Vec<u32> {
 }
 
 fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
-    const TINY: usize = 12;
-    const SOLO: usize = 300;
+    // `PLIRON_WASM_TINY=N` / `PLIRON_WASM_SOLO=N` (defaults 12 / 300):
+    // always-inline and single-callsite caps. On top of the HOTLEAF stack
+    // these rules still hold ~52 KB of regex-wasm (WASM_INLINE=0 →
+    // 391 KB vs 444 KB); tighter SOLO is a size lever that needs a
+    // kernels-wasm runtime check before any default flip.
+    let tiny: usize = crate::env_get("PLIRON_WASM_TINY")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let solo: usize = crate::env_get("PLIRON_WASM_SOLO")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     // Mid-size (<=64) multi-callsite inlining measured ~1% runtime for
     // +2% size on wbig â€” wasm calls really are cheap and the splice's
     // optimizer doesn't recover the rest. Not a rule.
@@ -8325,8 +8334,8 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                             // once per site instead.
                             let other = (funcs[fi].always && n <= ALWAYS_CAP)
                                 || (round == 0 && funcs[fi].hint && n <= hint_cap)
-                                || n <= TINY
-                                || (k == 1 && refs[fi] == 0 && n <= SOLO)
+                                || n <= tiny
+                                || (k == 1 && refs[fi] == 0 && n <= solo)
                                 || gc_done;
                             if other {
                                 sites.push((iv, fi, false));

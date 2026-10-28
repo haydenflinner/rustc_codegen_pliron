@@ -559,37 +559,40 @@ t_narrowlsr() {
 
 t_narrowext() {
   # aarch64 clean-narrow-int facts (PLIRON_NARROWEXT) and shared br_table
-  # edge blocks (PLIRON_EDGEDEDUP), plain and with both knobs on.
+  # edge blocks (PLIRON_EDGEDEDUP): both default-on; also force-on and
+  # kill-switch (=0) legs.
   rustc $BE --edition 2021 -O tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null && \
   PLIRON_NARROWEXT=1 PLIRON_EDGEDEDUP=1 rustc $BE --edition 2021 -O tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null && \
+  PLIRON_NARROWEXT=0 PLIRON_EDGEDEDUP=0 rustc $BE --edition 2021 -O tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null && \
   PLIRON_NARROWEXT=1 PLIRON_EDGEDEDUP=1 rustc $BE --edition 2021 tests/narrowext/main.rs -o $out/narrowext$exe && $out/narrowext$exe >/dev/null
 }
 
 t_cmp3() {
   # Ordering / Option<Ordering> tests folded through three-way-compare
-  # joins (PLIRON_CMP3): every test form, int/float boundaries, derived
-  # lexicographic structs, sort/binary_search. Checksum pinned from stock.
+  # joins (PLIRON_CMP3, default on): every test form, int/float boundaries,
+  # derived lexicographic structs, sort/binary_search. Checksum pinned from
+  # stock. Legs: defaults, force-on, kill-switch.
   local want=6973952887107744103
   rustc $BE --edition 2021 -O tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]] && \
   PLIRON_CMP3=1 rustc $BE --edition 2021 -O tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]] && \
+  PLIRON_CMP3=0 rustc $BE --edition 2021 -O tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]] && \
   PLIRON_CMP3=1 rustc $BE --edition 2021 tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]]
 }
 
 t_noret() {
-  # PLIRON_NORETTRAP=1: no trap after a call that cannot return (panics,
-  # `-> !`, uninhabited returns, `_Unwind_Resume`) when code follows it.
-  # Unwinding (-O and -O0) and -Cpanic=abort output match stock rustc's,
+  # PLIRON_NORETTRAP (default on): no trap after a call that cannot return
+  # (panics, `-> !`, uninhabited returns, `_Unwind_Resume`) when code follows
+  # it. Unwinding (-O and -O0) and -Cpanic=abort output match stock rustc's,
   # and the flag must actually drop traps (fewer udf/ud2 in the object).
   local m o i=0
   for m in "" "-O" "-O -Cpanic=abort"; do
     i=$((i + 1)); o=$out/noret$i
     rustc --edition 2021 ${m} tests/noret/main.rs -o $o-stock$exe || return 1
-    PLIRON_NORETTRAP=1 rustc $BE --edition 2021 ${m} -C codegen-units=1 tests/noret/main.rs -o $o$exe || return 1
+    rustc $BE --edition 2021 ${m} -C codegen-units=1 tests/noret/main.rs -o $o$exe || return 1
     diff <($o-stock$exe 2>/dev/null) <($o$exe 2>/dev/null) || { echo "noret: output differs (${m})" >&2; return 1; }
   done
   local n0 n1
-  # `=0` explicitly: a gate run with the candidate flags exported sets
-  # PLIRON_NORETTRAP=1 ambiently, and both objects would have the same count.
+  # Kill switch vs force-on: defaults alone would make both legs identical.
   PLIRON_NORETTRAP=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret0.o || return 1
   PLIRON_NORETTRAP=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/noret/main.rs -o $out/noret1.o || return 1
   n0=$("$llvmod" -d $out/noret0.o | grep -cE '\b(udf|ud2)\b' || true)
@@ -598,13 +601,13 @@ t_noret() {
 }
 
 t_edgemerge() {
-  # PLIRON_EDGEMERGE (shared regalloc edge blocks, jump-table arms aliased
-  # to them) and PLIRON_EPIMERGE (one epilogue per function): off, the
-  # placement-aware mode 1 and the merge-everything mode 2.
+  # PLIRON_EDGEMERGE / PLIRON_EPIMERGE (default mode 1; =0 off, =2 merge-all):
+  # shared regalloc edge blocks and one epilogue per function. Plain defaults,
+  # then explicit mode 1 and merge-everything mode 2.
   rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe && \
   $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
   local m
-  for m in 1 2; do
+  for m in 0 1 2; do
     PLIRON_EDGEMERGE=$m PLIRON_EPIMERGE=$m rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe &&
     $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
   done

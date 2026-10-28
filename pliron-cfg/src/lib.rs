@@ -24,9 +24,11 @@ pub struct PassConfig {
 /// value: the table is the single source of the default, and the kill
 /// switch reaches every site by construction. Read with `env_is`/`get`,
 /// never `env_set` (presence would count `=0` as on). The vendored
-/// Cranelift reads `PLIRON_REMAT_SADDR` and `PLIRON_REMATCALL` itself and
-/// defaults them the same way. Validation: docs/history/2026-10-27-defaults.md,
-/// 2026-10-28-overnight.md (LOWERFREE / JEARENA / LTUNDEF / CGU_ACAP).
+/// Cranelift reads `PLIRON_REMAT_SADDR`, `PLIRON_REMATCALL`,
+/// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE` and
+/// `PLIRON_EPIMERGE` itself and defaults them the same way (booleans on
+/// unless `=0`; EDGEMERGE/EPIMERGE mode `1` when unset). Validation:
+/// docs/history/2026-10-27-defaults.md, 2026-10-28-overnight.md.
 pub const DEFAULT_ON: &[&str] = &[
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).
@@ -72,6 +74,11 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_WASM_GC",
     "PLIRON_REDUCIBLE",
     "PLIRON_INLINE_SMALLSCC",
+    // Parity card B leftovers (2026-10-27-parity-card.md): jump-table
+    // shape, Ordering folds through joins, drop trap after noreturn.
+    "PLIRON_JT_SHAPE",
+    "PLIRON_CMP3",
+    "PLIRON_NORETTRAP",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
@@ -86,6 +93,10 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // Waffle loop-rule leaf filter (`1` ⇒ ≤2 calls in the callee).
     // 5.73x → 2.17x on regex-wasm CODE; hash_one-style leaves still inline.
     ("PLIRON_WASM_HOTLEAF", "1"),
+    // Edge/epilogue merge modes (vendored Cranelift `pliron_mode` also
+    // defaults unset → 1; `=0` off, `=2` merge-everything).
+    ("PLIRON_EDGEMERGE", "1"),
+    ("PLIRON_EPIMERGE", "1"),
 ];
 
 pub fn config() -> &'static PassConfig {

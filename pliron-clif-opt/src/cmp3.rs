@@ -1,5 +1,5 @@
 //! Three-way-compare / `Ordering` folds across block params
-//! (`PLIRON_CMP3=1`, opt-in; `PLIRON_CMP3=0` is the kill switch).
+//! (`PLIRON_CMP3`, default on; `PLIRON_CMP3=0` is the kill switch).
 //!
 //! rustc's `Ord::cmp` lowers to `select lt, -1, (select ne, 1, 0)` (the
 //! `BinOp::Cmp` fallback in `rustc_codegen_ssa`), and a derived

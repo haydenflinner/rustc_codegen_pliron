@@ -74,13 +74,14 @@ pub(crate) fn val_uext_clean(lower_ctx: &mut Lower<MInst>, backend: &AArch64Back
         == Some(true)
 }
 
-/// PLIRON: `PLIRON_NARROWEXT=1` turns on the extra narrow-int cleanliness
-/// facts (`narrowext_clean`) and the rules that consume them: skipping the
-/// return-value `uxtb`/`uxth`, `uextend` passthrough, `cbnz` on a clean
-/// narrow `brif`, and `band (ireduce x) k` reading `x` directly.
+/// PLIRON: `PLIRON_NARROWEXT` (default on; `=0` off) turns on the extra
+/// narrow-int cleanliness facts (`narrowext_clean`) and the rules that
+/// consume them: skipping the return-value `uxtb`/`uxth`, `uextend`
+/// passthrough, `cbnz` on a clean narrow `brif`, and `band (ireduce x) k`
+/// reading `x` directly.
 pub(crate) fn narrowext_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_NARROWEXT").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_NARROWEXT").as_deref() != Ok("0"))
 }
 
 /// PLIRON: one `PLIRON_NARROWEXT` user, by bit, for bisecting:
