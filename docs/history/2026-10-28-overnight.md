@@ -101,3 +101,43 @@ Fuzz 14200:14500 agent reported success.
 
 ## 23:23 ET — gates
 MEM-defaults gate: 83/83 pass. Tip gate once failed `debuginfo` (-g text); re-ran twice green (likely mid-rebuild flake). CLEAN+FANIN gate reported green by agent; CLEAN stays opt-in (wall).
+
+## 23:25 ET — SIZ agent independent check (tip after `378026e`)
+
+Re-measured on release dylib; confirms the flip and adds HOTLEAF runtime.
+
+### regex-wasm CODE (cgu=1)
+| config | CODE | vs LLVM |
+|---|---|---|
+| kill-switch all six `=0` | 1,184,130 | 5.70x |
+| plain defaults (post-flip) | **444,300** | **2.14x** |
+| explicit GC+NOREC+NOIRRED+REDUCIBLE | 699,200 | 3.36x |
+| + HOTLEAF=1 | 451,110 | 2.17x |
+| + INLINE_SMALLSCC | 447,128 | 2.15x |
+| LLVM | 207,914 | 1.00x |
+
+(Plain defaults slightly under the stacked env run: other DEFAULT_ON
+passes already in the tip interact.)
+
+### HOTLEAF=1 vs HOTLEAF=0 runtime (`bench/wasm/run.mjs --layouts=3`)
+Modules: hotleaf0 183,475 B / hotleaf1 175,159 B. Ratio = on/off
+(negative change = HOTLEAF faster). Load ~47 — noisy absolutes, but
+median-of-layout ratios consistent:
+
+| kernel | HOTLEAF=1 / HOTLEAF=0 | range |
+|---|---|---|
+| hashmap | **0.944 (−5.6%)** | −12.7% .. −4.5% |
+| tokenize | **0.945 (−5.5%)** | −8.6% .. +1.6% |
+| hmget | **0.976 (−2.4%)** | −15.5% .. −0.4% |
+
+All ≤+3% threshold (actually wins). Flipping HOTLEAF with the rest was
+correct. `reducible_dup{,_off}` + `wasm_smoke` green on tip.
+
+## 23:24 ET — HOTLEAF wasm runtime A/B (agent)
+
+bench/wasm full suite (noisy box; LLVM baselines swung hard between runs):
+- HOTLEAF on:  module 176,580 B, geomean vs LLVM 0.915
+- HOTLEAF off: module 185,383 B, geomean vs LLVM 0.812
+pliron-only on/off geomean across kernels ~see log; hashmap leaf path OK under ON.
+Size win on bench module −8.8 KiB. Keep HOTLEAF default-on.
+CLEAN vs FANIN debuginfo bisect: agent reported success (CLEAN stays opt-in).
