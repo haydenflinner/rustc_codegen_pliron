@@ -36,11 +36,14 @@ pub enum WasmBlock<'a> {
     /// PLIRON: conditional branch (`br_if`), used when rewriting
     /// `If` into the LLVM-style `block`+`br_if` shape.
     BrIf { cond: Value, target: WasmLabel },
-    /// A translated conditional.
+    /// A translated conditional. `results`, when set, is the merge
+    /// param list both arms produce on the operand stack instead of
+    /// via `BlockParams`+`local.set` (LLVM's typed-`if` shape).
     If {
         cond: Value,
         if_true: Vec<WasmBlock<'a>>,
         if_false: Vec<WasmBlock<'a>>,
+        results: Option<&'a [(Type, Value)]>,
     },
     /// A translated select (switch).
     Select {
@@ -79,7 +82,9 @@ impl<'a> Drop for WasmBlock<'a> {
                     out.append(body);
                 }
                 WasmBlock::If {
-                    if_true, if_false, ..
+                    if_true,
+                    if_false,
+                    ..
                 } => {
                     out.append(if_true);
                     out.append(if_false);
@@ -246,6 +251,12 @@ impl<'a, 'b> Context<'a, 'b> {
             Some("1") => rewrite_ifs_to_brif(&mut out, /* only_exits */ false),
             Some("exit") => rewrite_ifs_to_brif(&mut out, /* only_exits */ true),
             _ => {}
+        }
+        // PLIRON: promote If arms that both end in the same BlockParams
+        // into a typed if (values on stack, one set after). Default on;
+        // `PLIRON_WIFRET=0` disables.
+        if !std::env::var_os("PLIRON_WIFRET").is_some_and(|v| v == "0") {
+            promote_if_results(&mut out);
         }
         out
     }
@@ -439,6 +450,7 @@ impl<'a, 'b> Context<'a, 'b> {
             cond,
             if_true: if_body,
             if_false: else_body,
+            results: None,
         });
     }
 
@@ -596,7 +608,9 @@ fn bump_br_labels<'a>(body: &mut [WasmBlock<'a>], extra: u32) {
                 bump_br_labels(body, extra);
             }
             WasmBlock::If {
-                if_true, if_false, ..
+                if_true,
+                if_false,
+                ..
             } => {
                 bump_br_labels(if_true, extra);
                 bump_br_labels(if_false, extra);
@@ -659,12 +673,18 @@ fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
             }
             _ => {}
         }
-        let Some((cond, mut if_true, mut if_false)) = (match &mut body[i] {
+        let Some((cond, mut if_true, mut if_false, results)) = (match &mut body[i] {
             WasmBlock::If {
                 cond,
                 if_true,
                 if_false,
-            } => Some((*cond, std::mem::take(if_true), std::mem::take(if_false))),
+                results,
+            } => Some((
+                *cond,
+                std::mem::take(if_true),
+                std::mem::take(if_false),
+                *results,
+            )),
             _ => None,
         }) else {
             i += 1;
@@ -678,10 +698,12 @@ fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
                 cond,
                 if_true,
                 if_false,
+                results,
             };
             i += 1;
             continue;
         }
+        let _ = results; // WBRIF drops typed results (arms become br_if bodies).
         strip_trailing_br0(&mut if_false);
         strip_trailing_br0(&mut if_true);
         bump_br_labels(&mut if_false, 1);
@@ -711,5 +733,140 @@ fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
         };
         body[i] = outer;
         i += 1;
+    }
+}
+
+/// Strip a trailing `BlockParams` (+ optional trailing `Br`) from an
+/// if arm. Returns `(from, to, br_target)`.
+fn take_trailing_params<'a>(
+    arm: &mut Vec<WasmBlock<'a>>,
+) -> Option<(&'a [Value], &'a [(Type, Value)], Option<WasmLabel>)> {
+    let br = match arm.last() {
+        Some(WasmBlock::Br { target }) => {
+            let t = *target;
+            arm.pop();
+            Some(t)
+        }
+        _ => None,
+    };
+    match arm.last() {
+        Some(WasmBlock::BlockParams { from, to }) => {
+            let from = *from;
+            let to = *to;
+            arm.pop();
+            Some((from, to, br))
+        }
+        _ => {
+            if let Some(t) = br {
+                arm.push(WasmBlock::Br { target: t });
+            }
+            None
+        }
+    }
+}
+
+fn restore_trailing_params<'a>(
+    arm: &mut Vec<WasmBlock<'a>>,
+    from: &'a [Value],
+    to: &'a [(Type, Value)],
+    br: Option<WasmLabel>,
+) {
+    arm.push(WasmBlock::BlockParams { from, to });
+    if let Some(t) = br {
+        arm.push(WasmBlock::Br { target: t });
+    }
+}
+
+/// PLIRON: `If` whose arms both end in `BlockParams` to the same
+/// merge → typed `if (result …)` leaving the edge args on the stack,
+/// then one `local.set` after the if (+ the shared `br` if any).
+/// Saves one arm's worth of `local.set`s. Single-param only.
+fn promote_if_results<'a>(body: &mut Vec<WasmBlock<'a>>) {
+    let mut i = 0;
+    while i < body.len() {
+        match &mut body[i] {
+            WasmBlock::Block { body: inner, .. } | WasmBlock::Loop { body: inner, .. } => {
+                promote_if_results(inner);
+            }
+            WasmBlock::If {
+                if_true, if_false, ..
+            } => {
+                promote_if_results(if_true);
+                promote_if_results(if_false);
+            }
+            _ => {}
+        }
+        let promoted = (|| {
+            let WasmBlock::If {
+                if_true,
+                if_false,
+                results,
+                ..
+            } = &mut body[i]
+            else {
+                return None;
+            };
+            if results.is_some() {
+                return None;
+            }
+            let (from_t, to_t, br_t) = take_trailing_params(if_true)?;
+            let (from_f, to_f, br_f) = match take_trailing_params(if_false) {
+                Some(x) => x,
+                None => {
+                    restore_trailing_params(if_true, from_t, to_t, br_t);
+                    return None;
+                }
+            };
+            // Same single-param `to`; matching exit br (or both none/br0).
+            let br_ok = match (br_t, br_f) {
+                (None, None) => true,
+                (Some(a), Some(b)) if a.index() == b.index() => true,
+                (Some(a), None) | (None, Some(a)) if a.index() == 0 => true,
+                _ => false,
+            };
+            if to_t.as_ptr() != to_f.as_ptr() || to_t.len() != 1 || !br_ok {
+                restore_trailing_params(if_true, from_t, to_t, br_t);
+                restore_trailing_params(if_false, from_f, to_f, br_f);
+                return None;
+            }
+            if_true.push(WasmBlock::BlockParams {
+                from: from_t,
+                to: &[],
+            });
+            if_false.push(WasmBlock::BlockParams {
+                from: from_f,
+                to: &[],
+            });
+            *results = Some(to_t);
+            // Shared exit: prefer the non-zero depth; br 0 is fallthrough.
+            let br = match (br_t, br_f) {
+                (Some(a), _) if a.index() > 0 => Some(a),
+                (_, Some(b)) if b.index() > 0 => Some(b),
+                _ => None,
+            };
+            Some((to_t, br))
+        })();
+        if let Some((to, br)) = promoted {
+            let mut insert_at = i + 1;
+            body.insert(
+                insert_at,
+                WasmBlock::BlockParams {
+                    from: &[],
+                    to,
+                },
+            );
+            insert_at += 1;
+            if let Some(t) = br {
+                // Labels were relative to inside the if; after the if
+                // they are one depth shallower.
+                let t = WasmLabel(t.index().saturating_sub(1));
+                body.insert(insert_at, WasmBlock::Br { target: t });
+                i = insert_at + 1;
+            } else {
+                i = insert_at;
+            }
+        } else {
+            i += 1;
+        }
     }
 }

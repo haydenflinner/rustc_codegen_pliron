@@ -88,7 +88,8 @@ Skip `get L; set L` identity blockparam transfers at emit. Lower
 Pure single-use edge-only values rematerialize at the use instead of
 `local.set`+`local.get`. Cheap unary ops (eqz/wrap/extend/…) with ≤2
 uses also remat (`PLIRON_WTREEREMAT_UNARY=0` off). Regex-wasm CODE
-404→385 KiB (−19 KiB); with SOLO=15+TINY=6 → 376 KiB (1.79×).
+404→385 KiB (−19 KiB); with SOLO=15+TINY=6 → 376 KiB; +`WIFRET` typed
+single-param if results → 375 KiB (1.79×). `PLIRON_WIFRET=0` off.
 `PLIRON_WBRIF=exit` rewrites only both-exit Ifs to block+br_if (still
 grows CODE vs off; full `=1` grows more).
 

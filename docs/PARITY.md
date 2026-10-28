@@ -18,7 +18,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
 | wasm runtime (geomean, 16 kernels) | **0.898** | ahead (2026-10-21, `--layouts=3`); gaps: `strwork` +14%, `parse_only` +10% (placement-sensitive, 9-19%), `nbody` +4%, `hmget` +2% (2026-10-21) |
-| wasm module size | ~1.79 regex-wasm CODE (WTREEREMAT+SOLO=15+TINY=6; was 1.80/1.93) | behind |
+| wasm module size | ~1.79 regex-wasm CODE (WIFRET+SOLO=15+TINY=6; was 1.80/1.93) | behind |
 | compile time: bench kernels, native | **0.60** (0.26 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.18** (0.62 s vs 0.52 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
 | compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
@@ -100,8 +100,9 @@ overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 100),
 `JT_SHAPE`/`CMP3`/`NORETTRAP`/`EDGEMERGE=1`/`EPIMERGE=1`/`NARROWEXT`),
 and `JT_NARROW` (deferred narrow jump tables) are default-on (kill with
 `=0`). Spot-check MEM A/B: peak-RSS geomean 2.85 → 1.74 (~MEM 25 → ~60
-on regex-syntax+syn). regex-wasm CODE **~1.79x** LLVM (376 KiB with edge remat + SOLO=15 + TINY=6;
-was 1.80x/378 KiB; was 1.93x / 401 KiB; was 5.73x). Native cgu=1: regex-syntax `__text`
+on regex-syntax+syn). regex-wasm CODE **~1.79x** LLVM (375 KiB with WIFRET typed-if
+results + edge remat + SOLO=15 + TINY=6; was 1.80x/378 KiB; was 1.93x / 401 KiB;
+was 5.73x). Native cgu=1: regex-syntax `__text`
 −5.6 KiB / syn −8.4 KiB with `JT_NARROW`. Attribution:
 docs/history/2026-10-27-wasm-size.md, 2026-10-27-jump-tables.md.
 
@@ -620,12 +621,12 @@ operand stack). Next levers: deeper `if`→`br_if` restructuring in
 stackify `if`→`br_if` (LLVM has 0 if/else vs our ~5.7k; naive rewrite
 grows CODE — needs wpeep-aware emission). `PLIRON_WCOAL_HOLES` is
 default-on (kernels locals 764→636). Opcode gap on regex-wasm: local.set
-5×, local.get 2.3×; no-inline floor ~1.25× LLVM post-WTREEREMAT.
-Lowering `WASM_LIMIT` 512→128 shrinks to ~1.40× but regresses
-`chars_ascii`/`parse_only`/`fib` unless `INLINE_ONCE` is on — and once
-at 512 grows size; the runtime cliff sits near limit 450. Next levers:
-denser CondBr emit (typed `if` results / wpeep-friendly br_if), not a
-blunter inline cap.
+~5×, local.get ~2.3×; no-inline floor ~1.25× LLVM post-WTREEREMAT.
+`PLIRON_WIFRET` (default on) promotes same-merge `BlockParams` if-arms
+to typed `if (result T)` + one post-if set (−1.1 KiB). Lowering
+`WASM_LIMIT` 512→128 shrinks to ~1.40× but regresses chars/parse/fib.
+Next: multi-value if results; wpeep-friendly CondBr→br_if; block-typed
+merges for Br-depth arms.
 
 ## 3. Native runtime
 

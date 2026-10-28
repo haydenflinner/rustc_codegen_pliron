@@ -142,11 +142,18 @@ impl<'a> WasmFuncBackend<'a> {
                     cond,
                     if_true,
                     if_false,
+                    results,
                 } => {
                     self.lower_value(ctx, *cond, func);
-                    func.instruction(&wasm_encoder::Instruction::If(
-                        wasm_encoder::BlockType::Empty,
-                    ));
+                    let bt = match results {
+                        Some([(ty, _)]) => {
+                            wasm_encoder::BlockType::Result(wasm_encoder::ValType::from(*ty))
+                        }
+                        // Multi-value needs a module func type; promotion
+                        // only keeps single-param merges (see stackify).
+                        _ => wasm_encoder::BlockType::Empty,
+                    };
+                    func.instruction(&wasm_encoder::Instruction::If(bt));
                     work.push(Work::End);
                     if if_false.len() > 0 {
                         work.extend(if_false.iter().rev().map(Work::Block));
@@ -209,6 +216,25 @@ impl<'a> WasmFuncBackend<'a> {
                 }
             }
             WasmBlock::BlockParams { from, to } => {
+                // PLIRON: `from` empty → pop typed-if results into `to`
+                // (stack already holds one value per param). `to` empty
+                // → push `from` only (typed-if arm, no set).
+                if from.is_empty() && !to.is_empty() {
+                    for &(_, to_v) in to.iter().rev() {
+                        if !ctx.locals.values[to_v].is_empty() {
+                            self.lower_set_value(ctx, to_v, func);
+                        } else {
+                            func.instruction(&wasm_encoder::Instruction::Drop);
+                        }
+                    }
+                    return;
+                }
+                if to.is_empty() {
+                    for &from_v in from.iter() {
+                        self.lower_value(ctx, self.body.resolve_alias(from_v), func);
+                    }
+                    return;
+                }
                 debug_assert_eq!(from.len(), to.len());
                 // PLIRON: skip identity transfers (same local) — they
                 // would emit `get L; set L` that wpeep deletes, but
