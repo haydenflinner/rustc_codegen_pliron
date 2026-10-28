@@ -238,10 +238,14 @@ impl<'a, 'b> Context<'a, 'b> {
         }
         let mut out = self.result.pop().unwrap();
         // PLIRON: rewrite `if`/`else` into `block`+`br_if` (LLVM's
-        // shape). Cuts the if/else inventory that forces merge-param
-        // scratch locals. Opt-in: `PLIRON_WBRIF=1`.
-        if std::env::var_os("PLIRON_WBRIF").is_some_and(|v| v == "1") {
-            rewrite_ifs_to_brif(&mut out);
+        // shape). `PLIRON_WBRIF=1` rewrites every If (grows CODE —
+        // defeats wpeep). `=exit` only rewrites Ifs whose both arms
+        // already exit past the if (no fallthrough) — denser and
+        // wpeep-friendlier. Default off.
+        match std::env::var_os("PLIRON_WBRIF").as_deref().and_then(|v| v.to_str()) {
+            Some("1") => rewrite_ifs_to_brif(&mut out, /* only_exits */ false),
+            Some("exit") => rewrite_ifs_to_brif(&mut out, /* only_exits */ true),
+            _ => {}
         }
         out
     }
@@ -639,19 +643,19 @@ fn strip_trailing_br0<'a>(arm: &mut Vec<WasmBlock<'a>>) {
 ///   T'           ;; true arm (labels unchanged vs old if)
 /// end
 /// ```
-fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>) {
+fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
     let mut i = 0;
     while i < body.len() {
         // Recurse first so nested Ifs rewrite bottom-up.
         match &mut body[i] {
             WasmBlock::Block { body: inner, .. } | WasmBlock::Loop { body: inner, .. } => {
-                rewrite_ifs_to_brif(inner);
+                rewrite_ifs_to_brif(inner, only_exits);
             }
             WasmBlock::If {
                 if_true, if_false, ..
             } => {
-                rewrite_ifs_to_brif(if_true);
-                rewrite_ifs_to_brif(if_false);
+                rewrite_ifs_to_brif(if_true, only_exits);
+                rewrite_ifs_to_brif(if_false, only_exits);
             }
             _ => {}
         }
@@ -667,6 +671,17 @@ fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>) {
             continue;
         };
         let false_exits = arm_exits_past_if(&if_false);
+        let true_exits = arm_exits_past_if(&if_true);
+        if only_exits && !(false_exits && true_exits) {
+            // Put the If back; only_exits skips fallthrough diamonds.
+            body[i] = WasmBlock::If {
+                cond,
+                if_true,
+                if_false,
+            };
+            i += 1;
+            continue;
+        }
         strip_trailing_br0(&mut if_false);
         strip_trailing_br0(&mut if_true);
         bump_br_labels(&mut if_false, 1);

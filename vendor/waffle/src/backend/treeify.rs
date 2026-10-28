@@ -67,6 +67,7 @@ fn is_cheap_unary(op: &Operator) -> bool {
     )
 }
 
+
 impl Trees {
     pub fn compute(body: &FunctionBody, cfg: &CFGInfo) -> Trees {
         let mut owner = HashMap::default();
@@ -172,6 +173,8 @@ impl Trees {
                     }
                 });
             }
+            let unary_ok = !std::env::var_os("PLIRON_WTREEREMAT_UNARY")
+                .is_some_and(|x| x == "0");
             for (v, def) in body.values.entries() {
                 if remat.contains(&v) || owner.contains_key(&v) {
                     continue;
@@ -179,25 +182,20 @@ impl Trees {
                 let iu = inst_uses.get(v.index()).copied().unwrap_or(0);
                 let tu = term_uses.get(v.index()).copied().unwrap_or(0);
                 let total = iu.saturating_add(tu);
-                if let &ValueDef::Operator(op, _, tys) = def {
-                    if tys.len() != 1 || !op.is_pure() {
-                        continue;
-                    }
-                    // Single edge-only use: always remat.
-                    if iu == 0 && tu == 1 {
-                        remat.insert(v);
-                        continue;
-                    }
-                    // Cheap unary, ≤2 uses total: remat beats a local.
-                    // `PLIRON_WTREEREMAT_UNARY=0` disables this arm.
-                    if total > 0
-                        && total <= 2
-                        && is_cheap_unary(&op)
-                        && !std::env::var_os("PLIRON_WTREEREMAT_UNARY")
-                            .is_some_and(|x| x == "0")
-                    {
-                        remat.insert(v);
-                    }
+                let &ValueDef::Operator(op, _, tys) = def else {
+                    continue;
+                };
+                if tys.len() != 1 || !op.is_pure() || total == 0 {
+                    continue;
+                }
+                // Single edge-only use: always remat.
+                if iu == 0 && tu == 1 {
+                    remat.insert(v);
+                    continue;
+                }
+                // Cheap unary, ≤2 uses total.
+                if total <= 2 && unary_ok && is_cheap_unary(&op) {
+                    remat.insert(v);
                 }
             }
         }
