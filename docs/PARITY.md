@@ -18,7 +18,7 @@ Ratio = pliron / LLVM: **below 1 means pliron is better.**
 |---|---|---|
 | native runtime (geomean, 16 kernels) | **0.900** | ahead; 4 kernels still behind |
 | wasm runtime (geomean, 16 kernels) | **0.898** | ahead (2026-10-21, `--layouts=3`); gaps: `strwork` +14%, `parse_only` +10% (placement-sensitive, 9-19%), `nbody` +4%, `hmget` +2% (2026-10-21) |
-| wasm module size | ~1.84 regex-wasm CODE (WTREEREMAT; was 1.93) | behind |
+| wasm module size | ~1.80 regex-wasm CODE (WTREEREMAT+SOLO=25; was 1.93) | behind |
 | compile time: bench kernels, native | **0.60** (0.26 s vs 0.43 s) | ahead (2026-10-21) |
 | compile time: bench kernels, wasm | **1.18** (0.62 s vs 0.52 s) | behind (2026-10-21; tiny input, rustc-latency-dominated) |
 | compile time: regex-syntax (~40 kLOC) | **0.93** (1.37 s vs 1.48 s) | parity on wall (2026-10-21) |
@@ -100,9 +100,9 @@ overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 100),
 `JT_SHAPE`/`CMP3`/`NORETTRAP`/`EDGEMERGE=1`/`EPIMERGE=1`/`NARROWEXT`),
 and `JT_NARROW` (deferred narrow jump tables) are default-on (kill with
 `=0`). Spot-check MEM A/B: peak-RSS geomean 2.85 → 1.74 (~MEM 25 → ~60
-on regex-syntax+syn). regex-wasm CODE **~1.84x** LLVM (385 KiB with edge remat; was 1.93x /
-401 KiB; was 5.73x). Native cgu=1: regex-syntax `__text` −5.6 KiB /
-syn −8.4 KiB with `JT_NARROW`. Attribution:
+on regex-syntax+syn). regex-wasm CODE **~1.80x** LLVM (378 KiB with edge remat + SOLO=25;
+was 1.93x / 401 KiB; was 5.73x). Native cgu=1: regex-syntax `__text`
+−5.6 KiB / syn −8.4 KiB with `JT_NARROW`. Attribution:
 docs/history/2026-10-27-wasm-size.md, 2026-10-27-jump-tables.md.
 
 Correctness is an attribute, not a gate: it can be traded for a while,

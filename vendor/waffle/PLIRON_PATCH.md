@@ -85,9 +85,10 @@ Skip `get L; set L` identity blockparam transfers at emit. Lower
 
 ## `src/backend/treeify.rs` — edge-arg remat (`PLIRON_WTREEREMAT=0` off)
 
-Pure single-use values used only as a terminator/edge arg rematerialize
-at the use instead of `local.set`+`local.get`. Regex-wasm CODE
-404→385 KiB (−19 KiB, 1.93→1.84×).
+Pure single-use edge-only values rematerialize at the use instead of
+`local.set`+`local.get`. Cheap unary ops (eqz/wrap/extend/…) with ≤2
+uses also remat (`PLIRON_WTREEREMAT_UNARY=0` off). Regex-wasm CODE
+404→385 KiB (−19 KiB); with SOLO=25 → 378 KiB (1.80×).
 
 All changes are marked `// PLIRON:` in the source.
 

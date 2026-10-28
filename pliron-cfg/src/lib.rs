@@ -101,9 +101,9 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // Cap inlining of high-fan-in callees (2026-10-27-ir-size.md). lockf
     // ctime: FANIN=8 cut syn text 1.94→1.46x / RSS 1.81→1.52x. `=0` off.
     ("PLIRON_INLINE_FANIN", "8"),
-    // Waffle single-callsite inline cap (src/wasm.rs). 100: regex-wasm
-    // CODE 440→401 KiB; hashmap/tokenize runtime neutral. Prior unwrap 300.
-    ("PLIRON_WASM_SOLO", "100"),
+    // Waffle single-callsite inline cap (src/wasm.rs). 25: regex-wasm
+    // CODE 385→378 KiB post-WTREEREMAT; 10 is a wash. Prior 100.
+    ("PLIRON_WASM_SOLO", "25"),
 ];
 
 pub fn config() -> &'static PassConfig {
