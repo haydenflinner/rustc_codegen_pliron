@@ -209,3 +209,8 @@ Cranelift `maybe_remat_arg` no longer remats into the def's own loop unless
 `PLIRON_REMATLOOP=1`. Completes the parse_only digit-loop set with
 SELCHAIN/MULCARRY/STEPCMP (slow-kernels: 1.14 → 1.05 standalone). ELABLOOPS
 stays opt-in. Worktree overnight/spd-selchain.
+
+## 23:47 ET — WASM_SOLO=100 default
+
+regex-wasm CODE 440,009 → 401,100. hashmap +5.4% vs +4.9% LLVM (noise);
+tokenize −30% either way. TINY left at 12.
