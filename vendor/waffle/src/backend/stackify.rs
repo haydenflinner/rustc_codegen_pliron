@@ -53,6 +53,15 @@ pub enum WasmBlock<'a> {
         from: &'a [Value],
         to: &'a [(Type, Value)],
     },
+    /// PLIRON: same-join CondBr — for each param, `select` between the
+    /// true/false edge args then `local.set`, instead of an `if`/`else`
+    /// with BlockParams in each arm. Matches LLVM's diamond shape.
+    SelectJoin {
+        cond: Value,
+        if_true: &'a [Value],
+        if_false: &'a [Value],
+        to: &'a [(Type, Value)],
+    },
     /// A function return instruction.
     Return { values: &'a [Value] },
     /// An unreachable instruction.
@@ -456,14 +465,39 @@ impl<'a, 'b> Context<'a, 'b> {
                     ref if_true,
                     ref if_false,
                 } => {
-                    self.ctrl_stack.push(CtrlEntry::IfThenElse);
-                    self.process_stack.push(StackEntry::FinishIf(cond));
-                    self.process_stack
-                        .push(StackEntry::DoBranch(block, if_false));
-                    self.process_stack.push(StackEntry::Else);
-                    self.process_stack
-                        .push(StackEntry::DoBranch(block, if_true));
-                    self.result.push(vec![]); // if-body
+                    // PLIRON: avoid `if`/`else` when both arms are labeled
+                    // branches (merge/backedge). Same join → select-merge;
+                    // different joins → `block`+`br_if` fork. `PLIRON_WSEL=0`
+                    // / `PLIRON_WBFORK=0` revert each to stock IfThenElse.
+                    let t_ctrl = self.is_stack_target(block, if_true);
+                    let f_ctrl = self.is_stack_target(block, if_false);
+                    if !std::env::var_os("PLIRON_WSEL").is_some_and(|v| v == "0")
+                        && t_ctrl
+                        && f_ctrl
+                        && if_true.block == if_false.block
+                        && if_true.args.len() == if_false.args.len()
+                        && if_true.args.len()
+                            == self.body.blocks[if_true.block].params.len()
+                    {
+                        self.emit_select_join(cond, if_true, if_false);
+                    } else if std::env::var_os("PLIRON_WBFORK").is_some_and(|v| v == "1")
+                        && t_ctrl
+                        && f_ctrl
+                        && if_true.block != if_false.block
+                    {
+                        // Opt-in: removes if/else but grows CODE (~+7 KiB
+                        // regex) — extra block/br and denser local traffic.
+                        self.emit_brif_fork(cond, if_true, if_false);
+                    } else {
+                        self.ctrl_stack.push(CtrlEntry::IfThenElse);
+                        self.process_stack.push(StackEntry::FinishIf(cond));
+                        self.process_stack
+                            .push(StackEntry::DoBranch(block, if_false));
+                        self.process_stack.push(StackEntry::Else);
+                        self.process_stack
+                            .push(StackEntry::DoBranch(block, if_true));
+                        self.result.push(vec![]); // if-body
+                    }
                 }
                 &Terminator::Select {
                     value,
@@ -480,6 +514,69 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
         }
+    }
+
+    /// Target is reached by a labeled `br` (merge node or backedge),
+    /// not by inlining a dominated subtree.
+    fn is_stack_target(&self, source: Block, t: &BlockTarget) -> bool {
+        self.merge_nodes.contains(&t.block)
+            || self.cfg.rpo_pos[t.block] <= self.cfg.rpo_pos[source]
+    }
+
+    /// PLIRON: `brif c, B(args_t), B(args_f)` → select each arg, `br B`.
+    fn emit_select_join(&mut self, cond: Value, if_true: &'a BlockTarget, if_false: &'a BlockTarget) {
+        let into = self.result.last_mut().unwrap();
+        let params = &self.body.blocks[if_true.block].params;
+        into.push(WasmBlock::SelectJoin {
+            cond,
+            if_true: &if_true.args[..],
+            if_false: &if_false.args[..],
+            to: params,
+        });
+        let index = Self::resolve_target(&self.ctrl_stack[..], if_true.block);
+        into.push(WasmBlock::Br { target: index });
+    }
+
+    /// PLIRON: `brif c, T, F` (T≠F, both labeled) →
+    /// ```text
+    /// block          ;; false-skip
+    ///   br_if 0      ;; cond true → skip false arm
+    ///   params_F; br F+1
+    /// end
+    /// params_T; br T
+    /// ```
+    fn emit_brif_fork(
+        &mut self,
+        cond: Value,
+        if_true: &'a BlockTarget,
+        if_false: &'a BlockTarget,
+    ) {
+        let t_lab = Self::resolve_target(&self.ctrl_stack[..], if_true.block);
+        let f_lab = Self::resolve_target(&self.ctrl_stack[..], if_false.block);
+        let mut false_body = Vec::new();
+        false_body.push(WasmBlock::BrIf {
+            cond,
+            target: WasmLabel(0),
+        });
+        Self::do_blockparam_transfer(
+            &if_false.args[..],
+            &self.body.blocks[if_false.block].params[..],
+            &mut false_body,
+        );
+        false_body.push(WasmBlock::Br {
+            target: f_lab.add(1),
+        });
+        let into = self.result.last_mut().unwrap();
+        into.push(WasmBlock::Block {
+            body: false_body,
+            out: Block::invalid(),
+        });
+        Self::do_blockparam_transfer(
+            &if_true.args[..],
+            &self.body.blocks[if_true.block].params[..],
+            into,
+        );
+        into.push(WasmBlock::Br { target: t_lab });
     }
 }
 

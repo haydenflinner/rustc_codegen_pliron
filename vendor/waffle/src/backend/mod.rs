@@ -244,6 +244,49 @@ impl<'a> WasmFuncBackend<'a> {
                     self.lower_set_value(ctx, to, func);
                 }
             }
+            // PLIRON: same-join CondBr — one `select` per differing param.
+            WasmBlock::SelectJoin {
+                cond,
+                if_true,
+                if_false,
+                to,
+            } => {
+                debug_assert_eq!(if_true.len(), if_false.len());
+                debug_assert_eq!(if_true.len(), to.len());
+                for ((&vt, &vf), &(to_ty, vp)) in
+                    if_true.iter().zip(if_false.iter()).zip(to.iter())
+                {
+                    if ctx.locals.values[vp].is_empty() {
+                        continue;
+                    }
+                    let vt = self.body.resolve_alias(vt);
+                    let vf = self.body.resolve_alias(vf);
+                    let same = vt == vf
+                        || (ctx.locals.values[vt].len() == 1
+                            && ctx.locals.values[vf].len() == 1
+                            && ctx.locals.values[vt][0] == ctx.locals.values[vf][0]);
+                    if same {
+                        let fl = &ctx.locals.values[vt];
+                        let tl = &ctx.locals.values[vp];
+                        if fl.len() == 1 && tl.len() == 1 && fl[0] == tl[0] {
+                            continue;
+                        }
+                        self.lower_value(ctx, vt, func);
+                        self.lower_set_value(ctx, vp, func);
+                        let _ = to_ty;
+                        continue;
+                    }
+                    // select: val1 if cond!=0 else val2 → true arm first.
+                    self.lower_value(ctx, vt, func);
+                    self.lower_value(ctx, vf, func);
+                    self.lower_value(ctx, *cond, func);
+                    func.instruction(&wasm_encoder::Instruction::Select);
+                    if ctx.locals.values[vp].len() == 1 {
+                        assert_eq!(to_ty, ctx.locals.locals[ctx.locals.values[vp][0]]);
+                    }
+                    self.lower_set_value(ctx, vp, func);
+                }
+            }
             WasmBlock::Return { values } => {
                 for &value in &values[..] {
                     self.lower_value(ctx, value, func);

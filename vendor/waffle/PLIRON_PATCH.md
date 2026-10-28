@@ -70,15 +70,24 @@ per-block SSA liveness and greedily recolors same-type locals
 (−17%), CODE −345 B. Default on; `PLIRON_WCOAL_HOLES=0` or
 `PLIRON_WCOAL=0` kills.
 
-## `src/backend/stackify.rs` — if→br_if rewrite (`PLIRON_WBRIF=1`)
+## `src/backend/stackify.rs` — SelectJoin / brif-fork / WBRIF
 
-Experimental: rewrite `WasmBlock::If` into nested `block`+`BrIf`.
-Clears the if/else inventory but **grows** CODE ~16% (breaks wpeep's
-if-based folds). Kept opt-in for further work.
+- `PLIRON_WSEL` (default on, `=0` off): same-join CondBr →
+  `SelectJoin` (per-param `select` + `br`) instead of `if`/`else`.
+- `PLIRON_WBFORK=1`: different-join CondBr → `block`+`br_if` fork.
+  Removes if/else but **grows** CODE (~+7 KiB regex); opt-in only.
+- `PLIRON_WBRIF=1`: post-pass If→block+br_if; also grows CODE ~16%.
 
-## `src/backend/mod.rs` — BlockParams identity skip
+## `src/backend/mod.rs` — BlockParams identity skip + SelectJoin
 
-Skip `get L; set L` identity blockparam transfers at emit.
+Skip `get L; set L` identity blockparam transfers at emit. Lower
+`SelectJoin` as true/false/`select`/`set` per param.
+
+## `src/backend/treeify.rs` — edge-arg remat (`PLIRON_WTREEREMAT=0` off)
+
+Pure single-use values used only as a terminator/edge arg rematerialize
+at the use instead of `local.set`+`local.get`. Regex-wasm CODE
+404→385 KiB (−19 KiB, 1.93→1.84×).
 
 All changes are marked `// PLIRON:` in the source.
 
