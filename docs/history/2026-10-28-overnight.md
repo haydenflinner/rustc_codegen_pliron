@@ -202,3 +202,10 @@ lockf ctime matrix (regex-syntax + syn): FANIN=8 alone size 2.04/1.94 → 1.76/1
 RSS 1.62/1.81 → 1.60/1.52; wall mixed. CLEAN alone hurts wall — stays opt-in.
 Agents: regex-wasm CODE still 444,300 under plain defaults; clif-opt suite green;
 fuzzreg + 14000–14700 windows clean; debuginfo isolated green.
+
+## 23:34 ET — REMATLOOP default off (SPD)
+
+Cranelift `maybe_remat_arg` no longer remats into the def's own loop unless
+`PLIRON_REMATLOOP=1`. Completes the parse_only digit-loop set with
+SELCHAIN/MULCARRY/STEPCMP (slow-kernels: 1.14 → 1.05 standalone). ELABLOOPS
+stays opt-in. Worktree overnight/spd-selchain.

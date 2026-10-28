@@ -540,13 +540,18 @@ impl<'a> Elaborator<'a> {
             {
                 return false;
             }
-            // PLIRON_REMATLOOP=0: nor into another block of the def's own
-            // loop — the def already runs every trip, so the copy is a
-            // second execution per iteration to shorten one live range
-            // (parse_only's `byte - '0'` recomputed past the digit test).
+            // PLIRON_REMATLOOP (default off; `=1` restores): remat into
+            // another block of the def's own loop. The def already runs
+            // every trip, so the copy is a second execution per iteration
+            // to shorten one live range (parse_only's `byte - '0'`
+            // recomputed past the digit test). Default-off: parse_only
+            // 1.14 → 1.05 with SELCHAIN/MULCARRY/STEPCMP; sieve layout-
+            // checked clean (2026-10-27-slow-kernels.md).
             static REMATLOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if !callful
-                && !*REMATLOOP.get_or_init(|| std::env::var_os("PLIRON_REMATLOOP").is_none_or(|v| v != "0"))
+                && !*REMATLOOP.get_or_init(|| {
+                    std::env::var("PLIRON_REMATLOOP").as_deref() == Ok("1")
+                })
                 && let Some(lp) = loop_analysis.innermost_loop(arg.in_block)
                 && loop_analysis.innermost_loop(insert_block) == Some(lp)
             {
