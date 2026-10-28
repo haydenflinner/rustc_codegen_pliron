@@ -219,3 +219,8 @@ tokenize −30% either way. TINY left at 12.
 
 Earlier commits 05783e4 / c639357 only wrote the overnight note. Code now
 sets both in `pliron_cfg::DEFAULT_VALUES` (+ wasm.rs SOLO unwrap_or 100).
+
+## 23:49 ET — FANIN native-only
+
+FANIN=8 + SOLO=100 plain defaults grew regex-wasm to 461 KiB (FANIN alone
+to 489). Skip FANIN when `small`/wasm; SOLO=100 remains. Expect ~401 KiB.

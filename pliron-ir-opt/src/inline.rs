@@ -1053,13 +1053,15 @@ pub fn run(
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
     let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
-    // `PLIRON_INLINE_FANIN=<m>` (0 = off): a callee is inlined at a plain
-    // site only while `its size x its remaining call sites <= m x the
-    // site's threshold` — a fat helper called from everywhere stays one
-    // out-of-line body instead of a copy per site (syn pasted
-    // `drop_glue<Vec<Attribute>>`, 110 ops, at 1,308 sites). Sites in
-    // loops, `#[inline(always)]` and single-site callees are exempt.
-    let fanin: usize = if always_only {
+    // `PLIRON_INLINE_FANIN=<m>` (0 = off; default 8 via DEFAULT_VALUES):
+    // a callee is inlined at a plain site only while `its size x its
+    // remaining call sites <= m x the site's threshold` — a fat helper
+    // called from everywhere stays one out-of-line body (syn's
+    // `drop_glue<Vec<Attribute>>`). Sites in loops, `#[inline(always)]`
+    // and single-site callees are exempt. Skipped in `small`/wasm mode:
+    // keeping helpers out of line there grew regex-wasm CODE
+    // (440→489 KiB with FANIN=8); the waffle inliner re-duplicates them.
+    let fanin: usize = if always_only || small {
         0
     } else {
         crate::env_get("PLIRON_INLINE_FANIN")
