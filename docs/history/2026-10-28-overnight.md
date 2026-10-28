@@ -175,3 +175,30 @@ JT_SHAPE, CMP3, NORETTRAP → DEFAULT_ON; EDGEMERGE/EPIMERGE → DEFAULT_VALUES 
 vendored EDGEDEDUP/NARROWEXT/EDGEMERGE/EPIMERGE default on unless =0.
 HOTLEAF wasm A/B: bench module −8.8 KiB; pliron on/off geomean ~0.80 (noisy).
 Unit narrowext/noret/jt_shape/cmp3 + stanzas + wasm_smoke green.
+
+### Gating (for the flip)
+
+| flag | was | flip |
+|---|---|---|
+| JT_SHAPE | `config().is(..., "1")` in `s_brchain` | DEFAULT_ON |
+| CMP3 | `Gate::OptIn` | DEFAULT_ON |
+| NORETTRAP | `env_is(..., "1")` in lower | DEFAULT_ON |
+| EDGEDEDUP | vendored `== Ok("1")` | `!= Ok("0")` |
+| NARROWEXT | vendored `== Ok("1")` | `!= Ok("0")` |
+| EDGEMERGE / EPIMERGE | vendored `pliron_mode` unset→0 | unset→1 + DEFAULT_VALUES `"1"` |
+
+INLINE_CLEAN not flipped (syn wall). Crates/UI not run (overnight brief).
+
+### Fast validation (`3104d38`)
+
+- `cargo test -p pliron-cfg --lib` green
+- `cargo test -p pliron-clif-opt` green (incl. cmp3, jt_shape, noret_trap, narrowext_lower)
+- `TEST_NOBUILD=1 ./test.sh --only=wasm_smoke,nostd,std,narrowext,edgemerge,noret,cmp3` green
+  (edgemerge now also exercises `=0`; noret kill-switch vs force-on unchanged)
+
+## 23:30 ET — INLINE_FANIN=8 default
+
+lockf ctime matrix (regex-syntax + syn): FANIN=8 alone size 2.04/1.94 → 1.76/1.46,
+RSS 1.62/1.81 → 1.60/1.52; wall mixed. CLEAN alone hurts wall — stays opt-in.
+Agents: regex-wasm CODE still 444,300 under plain defaults; clif-opt suite green;
+fuzzreg + 14000–14700 windows clean; debuginfo isolated green.
