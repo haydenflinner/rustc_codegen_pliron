@@ -818,6 +818,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
   slot: regex-syntax reloaded spilled 0/1/-1/element sizes 778 times (with
   `PLIRON_COLDCOPY=1`; 1,319 without).
   Call-free hot loops keep the old rules. docs/history/2026-10-27-spills.md.
+- `PLIRON_REMATLOOP` (default off since 2026-10-28, `=1` restores; same
+  `maybe_remat_arg`): rematerializing into another block of the def's own
+  loop. Default-off avoids a second per-trip copy of e.g. `byte - '0'`
+  past the digit test (parse_only); sieve layout-checked
+  (docs/history/2026-10-27-slow-kernels.md).
 
 64. Deferred narrow jump tables (`PLIRON_JT_NARROW=1`, default off;
     docs/history/2026-10-27-jump-tables.md). `src/machinst/buffer.rs`:
