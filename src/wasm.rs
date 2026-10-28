@@ -8121,16 +8121,16 @@ fn call_sccs(funcs: &[FDecl]) -> Vec<u32> {
 }
 
 fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
-    // `PLIRON_WASM_TINY=N` / `PLIRON_WASM_SOLO=N` (defaults 12 / 100 via
+    // `PLIRON_WASM_TINY=N` / `PLIRON_WASM_SOLO=N` (defaults 12 / 50 via
     // `pliron_cfg::DEFAULT_VALUES` for SOLO): always-inline and
-    // single-callsite caps. SOLO 300→100: regex-wasm −39 KiB, hashmap/
-    // tokenize runtime neutral (2026-10-28-overnight.md).
+    // single-callsite caps. SOLO 300→100→50: regex-wasm −39 then −6.4 KiB;
+    // layouts=3 runtime still flat (2026-10-28-solo50.md).
     let tiny: usize = crate::env_get("PLIRON_WASM_TINY")
         .and_then(|v| v.parse().ok())
         .unwrap_or(12);
     let solo: usize = crate::env_get("PLIRON_WASM_SOLO")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(50);
     // Mid-size (<=64) multi-callsite inlining measured ~1% runtime for
     // +2% size on wbig â€” wasm calls really are cheap and the splice's
     // optimizer doesn't recover the rest. Not a rule.
