@@ -214,3 +214,8 @@ stays opt-in. Worktree overnight/spd-selchain.
 
 regex-wasm CODE 440,009 → 401,100. hashmap +5.4% vs +4.9% LLVM (noise);
 tokenize −30% either way. TINY left at 12.
+
+## 23:47 ET — actually land FANIN=8 and SOLO=100 in DEFAULT_VALUES
+
+Earlier commits 05783e4 / c639357 only wrote the overnight note. Code now
+sets both in `pliron_cfg::DEFAULT_VALUES` (+ wasm.rs SOLO unwrap_or 100).
