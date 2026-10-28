@@ -280,6 +280,7 @@ struct Store {
 /// ordinal order, so the started set is closed downwards and its stage-B
 /// waits are always satisfiable: no deadlock. Off while holding for the
 /// two-phase barrier. Scheduling only (docs/determinism.md R3).
+/// Default 8 via `pliron_cfg::DEFAULT_VALUES`; `=0` disables.
 fn acap() -> u32 {
     static C: LazyLock<u32> = LazyLock::new(|| {
         pliron_cfg::env_get("PLIRON_CGU_ACAP").and_then(|v| v.parse().ok()).unwrap_or(0)

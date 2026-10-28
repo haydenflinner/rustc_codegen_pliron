@@ -1,4 +1,5 @@
-//! `PLIRON_JEARENA=1`: backend-owned jemalloc arenas with immediate purging.
+//! `PLIRON_JEARENA` (default on; `=0` off): backend-owned jemalloc arenas
+//! with immediate purging.
 //!
 //! rustc links jemalloc (exported as `_rjem_mallctl`), whose default
 //! arenas keep freed pages dirty for 10 s (`dirty_decay_ms`) and then

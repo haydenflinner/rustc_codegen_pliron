@@ -25,7 +25,8 @@ pub struct PassConfig {
 /// switch reaches every site by construction. Read with `env_is`/`get`,
 /// never `env_set` (presence would count `=0` as on). The vendored
 /// Cranelift reads `PLIRON_REMAT_SADDR` and `PLIRON_REMATCALL` itself and
-/// defaults them the same way. Validation: docs/history/2026-10-27-defaults.md.
+/// defaults them the same way. Validation: docs/history/2026-10-27-defaults.md,
+/// 2026-10-28-overnight.md (LOWERFREE / JEARENA / LTUNDEF / CGU_ACAP).
 pub const DEFAULT_ON: &[&str] = &[
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).
@@ -49,10 +50,26 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_INLINE_ONCE1",
     "PLIRON_INLINE_RECSTACK",
     "PLIRON_INLINE_SCCLIMIT",
-    // Memory (2026-10-26-memory.md).
+    // Memory (2026-10-26-memory.md, 2026-10-27-memory2.md, memory3.md).
     "PLIRON_DEADFREE",
+    "PLIRON_LOWERFREE",
+    "PLIRON_JEARENA",
+    // Lifetime-undef on SROA-promoted locals (2026-10-27-spills.md;
+    // side-table form in 922d8f7 keeps RSS flat).
+    "PLIRON_LTUNDEF",
     // Cold-call args as plain copies (2026-10-27-exact-div.md).
     "PLIRON_COLDCOPY",
+];
+
+/// Valued defaults: an unset variable reads as the given string.
+/// `PLIRON_X=0` (or any other explicit value) overrides. Used for caps
+/// that are not boolean `=1` gates — `env_get` sites see the default
+/// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
+/// usually `=0` (off).
+pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // At most 8 CGUs past the start of stage A (2026-10-27-memory2.md).
+    // Tuned on a 14-core Mac; `=0` disables the cap.
+    ("PLIRON_CGU_ACAP", "8"),
 ];
 
 pub fn config() -> &'static PassConfig {
@@ -72,6 +89,9 @@ impl PassConfig {
         }
         for k in DEFAULT_ON {
             values.entry(k.to_string()).or_insert_with(|| "1".to_string());
+        }
+        for &(k, v) in DEFAULT_VALUES {
+            values.entry(k.to_string()).or_insert_with(|| v.to_string());
         }
         let pipeline = values.get("PLIRON_PIPELINE").map(|s| {
             s.split(',')
