@@ -1,7 +1,8 @@
-//! The hazard `PLIRON_REDUCIBLE` guards against, shown on the default
-//! path: `dispatch_dup` clones the loop header into its `jump` pred and the
-//! CFG becomes irreducible (see reducible_dup.rs for the same input with the
-//! flag on). If this stops reproducing, the positive test proves nothing.
+//! The hazard `PLIRON_REDUCIBLE` guards against, shown with the kill
+//! switch (`=0`; the flag is default-on): `dispatch_dup` clones the loop
+//! header into its `jump` pred and the CFG becomes irreducible (see
+//! reducible_dup.rs for the same input with the flag on). If this stops
+//! reproducing, the positive test proves nothing.
 
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -34,7 +35,7 @@ const SRC: &str = "function %f(i32, i32) -> i32 {
 
 #[test]
 fn dispatch_dup_without_the_flag_makes_a_side_entrance() {
-    unsafe { std::env::remove_var("PLIRON_REDUCIBLE") };
+    unsafe { std::env::set_var("PLIRON_REDUCIBLE", "0") };
     assert!(!pliron_clif_opt::jumpthread::keep_reducible());
     let mut f = parse(SRC);
     let cfg = ControlFlowGraph::with_function(&f);

@@ -64,6 +64,14 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_SELCHAIN",
     "PLIRON_MULCARRY",
     "PLIRON_STEPCMP",
+    // Wasm size (2026-10-27-wasm-size.md): refuse irreducible/recursive
+    // loop-rule splices, GC dead locals, keep CLIF CFGs reducible, and
+    // stop IR inlining along call-graph cycles in small/wasm mode.
+    "PLIRON_WASM_NOIRRED",
+    "PLIRON_WASM_NOREC",
+    "PLIRON_WASM_GC",
+    "PLIRON_REDUCIBLE",
+    "PLIRON_INLINE_SMALLSCC",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
@@ -75,6 +83,9 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // At most 8 CGUs past the start of stage A (2026-10-27-memory2.md).
     // Tuned on a 14-core Mac; `=0` disables the cap.
     ("PLIRON_CGU_ACAP", "8"),
+    // Waffle loop-rule leaf filter (`1` ⇒ ≤2 calls in the callee).
+    // 5.73x → 2.17x on regex-wasm CODE; hash_one-style leaves still inline.
+    ("PLIRON_WASM_HOTLEAF", "1"),
 ];
 
 pub fn config() -> &'static PassConfig {

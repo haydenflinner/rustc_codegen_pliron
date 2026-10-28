@@ -82,5 +82,12 @@ Same flip as `e63e878`, validated before noticing main already had it:
 
 Two-input RSS geomean 2.85 → 1.74 (≈ MEM rating 25 → 60; full five-input
 card B was 59). Crates tiers 1–3 / stage-2 UI still deferred.
-Branch `overnight/mem-defaults` tracks main + this log; no second code
-commit (already on main).
+
+## 23:18 ET — wasm size defaults
+
+DEFAULT_ON: WASM_NOIRRED/NOREC/GC, REDUCIBLE, INLINE_SMALLSCC;
+DEFAULT_VALUES: WASM_HOTLEAF=1.
+regex-wasm CODE under plain defaults: **444,300** (2.14x LLVM 207,914).
+Was 1,191,906 (5.73x). reducible_dup_off now uses `=0`. Fast legs green.
+Fuzzreg + unit tests from agents: pass.
+INLINE_CLEAN/FANIN landed default-off as `b2de35e` (iropt cleanup).
