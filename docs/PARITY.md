@@ -100,7 +100,7 @@ overall on defaults** (SPD 106, CMP 107, MEM 36, SIZ 37, STK 87, COR 100),
 `JT_SHAPE`/`CMP3`/`NORETTRAP`/`EDGEMERGE=1`/`EPIMERGE=1`/`NARROWEXT`)
 are default-on (kill with `=0`). Spot-check MEM A/B: peak-RSS geomean
 2.85 → 1.74 (~MEM 25 → ~60 on regex-syntax+syn). regex-wasm CODE
-**2.14x** LLVM (was 5.73x). Attribution: docs/history/2026-10-27-wasm-size.md.
+**1.93x** LLVM (401 KiB; was 5.73x). Attribution: docs/history/2026-10-27-wasm-size.md.
 
 Correctness is an attribute, not a gate: it can be traded for a while,
 at a visible price (one pliron-only crate failure rates COR 50). The
