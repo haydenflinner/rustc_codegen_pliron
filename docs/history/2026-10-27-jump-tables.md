@@ -1,7 +1,9 @@
 # Jump tables: narrow deferred tables and a table/chain policy
 
 Follow-up to 2026-10-27-code-size, which counted "about 16 KB" of inline
-jump tables in regex-syntax's `__text`. Both flags below are default off.
+jump tables in regex-syntax's `__text`. Both flags are default on as of
+2026-10-28 (`JT_SHAPE` with card-B leftovers; `JT_NARROW` overnight);
+`=0` kills either.
 
 ## Correction: 9.3 KB of tables, not 16 KB
 
@@ -61,7 +63,7 @@ Entry width needed, by encoding (bytes of entries):
 Two separate decisions: how a table is encoded, and whether a switch is a
 table at all.
 
-**Encoding (`PLIRON_JT_NARROW=1`, vendored Cranelift).** The problem with
+**Encoding (`PLIRON_JT_NARROW`, vendored Cranelift; default on, `=0` off).** The problem with
 narrow entries in Cranelift is that the emitter does not know forward
 target offsets when it reaches the dispatch. Instead of estimating or
 emitting twice, the table is *deferred*: the dispatch is emitted with
@@ -196,12 +198,12 @@ test.
 
 ## Next
 
-1. Flip `PLIRON_JT_SHAPE` (smaller, runtime-neutral) after a crates run.
-   `PLIRON_JT_NARROW` is the size win but costs ~1% here. To win that
-   back, flush a table at the first island or block boundary after its
-   dispatch's targets are all bound, rather than at the function end
-   (same deferral, earlier flush point; tables near hot code), or keep
-   profile-hot dispatches inline.
+1. ~~Flip `PLIRON_JT_SHAPE` / `PLIRON_JT_NARROW`.~~ Done (2026-10-28
+   overnight). To win back the ~1% `JT_NARROW` probe cost, flush a table
+   at the first island or block boundary after its dispatch's targets
+   are all bound, rather than at the function end (same deferral,
+   earlier flush point; tables near hot code), or keep profile-hot
+   dispatches inline.
 2. Traps after noreturn calls: drop the `udf` unless the call ends the
    function (LLVM's `NoTrapAfterNoreturn`), ~6 KB here.
 3. `dense_switch` sees clusters too: emit range tests at lowering instead

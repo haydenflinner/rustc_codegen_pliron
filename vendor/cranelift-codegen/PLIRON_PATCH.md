@@ -824,8 +824,9 @@ the sum; plain `ushr` lowering zero-extends first. They now require
   past the digit test (parse_only); sieve layout-checked
   (docs/history/2026-10-27-slow-kernels.md).
 
-64. Deferred narrow jump tables (`PLIRON_JT_NARROW=1`, default off;
-    docs/history/2026-10-27-jump-tables.md). `src/machinst/buffer.rs`:
+64. Deferred narrow jump tables (`PLIRON_JT_NARROW`, default on since
+    2026-10-28, `=0` off; docs/history/2026-10-27-jump-tables.md).
+    `src/machinst/buffer.rs`:
     `MachDeferredJumpTable` records, `can_defer_jump_table`,
     `defer_jump_table`, and `emit_deferred_jump_tables`, which `finish`
     runs after the last island — every label is bound and nothing can move

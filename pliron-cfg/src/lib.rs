@@ -25,10 +25,11 @@ pub struct PassConfig {
 /// switch reaches every site by construction. Read with `env_is`/`get`,
 /// never `env_set` (presence would count `=0` as on). The vendored
 /// Cranelift reads `PLIRON_REMAT_SADDR`, `PLIRON_REMATCALL`,
-/// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE` and
-/// `PLIRON_EPIMERGE` itself and defaults them the same way (booleans on
-/// unless `=0`; EDGEMERGE/EPIMERGE mode `1` when unset). Validation:
-/// docs/history/2026-10-27-defaults.md, 2026-10-28-overnight.md.
+/// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE`,
+/// `PLIRON_EPIMERGE` and `PLIRON_JT_NARROW` itself and defaults them the
+/// same way (booleans on unless `=0`; EDGEMERGE/EPIMERGE mode `1` when
+/// unset). Validation: docs/history/2026-10-27-defaults.md,
+/// 2026-10-28-overnight.md.
 pub const DEFAULT_ON: &[&str] = &[
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).

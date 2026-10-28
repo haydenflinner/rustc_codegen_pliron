@@ -224,3 +224,31 @@ sets both in `pliron_cfg::DEFAULT_VALUES` (+ wasm.rs SOLO unwrap_or 100).
 
 FANIN=8 + SOLO=100 plain defaults grew regex-wasm to 461 KiB (FANIN alone
 to 489). Skip FANIN when `small`/wasm; SOLO=100 remains. Expect ~401 KiB.
+
+## 23:56 ET — JT_NARROW default-on (SIZ native)
+
+Worktree `overnight/spd-selchain` @ 81924c2. Evaluated remaining
+default-off size knobs from jump-tables + overnight/PARITY open lists.
+Did **not** flip `ELABLOOPS` or `INLINE_CLEAN`.
+
+### A/B (release dylib, `-O -Ccodegen-units=1`)
+
+| input | base (plain tip) | `JT_NARROW=1` | Δ |
+|---|---|---|---|
+| regex-syntax `__text` | 334,988 | 329,388 | **−5,600 (−1.67%)** |
+| syn `__text` | 1,175,212 | 1,166,828 | **−8,384 (−0.71%)** |
+| regex-wasm `CODE` | 401,431 (1.93× LLVM 207,914) | 401,431 | 0 (native-only) |
+
+LLVM: regex-syntax 184,780; syn 645,140. Spills2/3 stack
+(`SLOTPROM_SYNCCOST`/`SLOTPROM_LT`/`RA2_XBLOCK`/`BYVALHOME`) is
+**byte-identical** to tip defaults on both crates — earlier −7 KB was on
+an older tip; leave opt-in.
+
+### Flip
+
+Vendored Cranelift `vcode.rs`: `PLIRON_JT_NARROW` now `!= Ok("0")`
+(same pattern as `EDGEDEDUP`/`NARROWEXT`). Kill `=0` digests match the
+pre-flip base; plain defaults match the A/B-on object. Known ~1% SPD on
+the regex parse probe (2026-10-27-jump-tables.md); SIZ card priority.
+
+Fast legs: `jt_narrow`/`jt_shape` unit tests; `wasm_smoke,nostd,std,noret,narrowext`.

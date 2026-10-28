@@ -930,17 +930,17 @@ impl<I: VCodeInst> VCode<I> {
         let mut t_fuse = std::time::Duration::ZERO;
         let mut n_islands = 0u32;
 
-        // PLIRON: `PLIRON_JT_NARROW=1` lets the ISA defer jump tables to the
-        // end of the buffer (narrow entries, `MachDeferredJumpTable`). The
-        // deferred table and the dispatch's base address must stay in
-        // pc-relative range, so give the buffer, per block in emission order,
-        // a sound upper bound on everything still to come: every inst and
-        // regalloc edit at its worst-case size plus a veneer, a constant
-        // re-emission and an island jump-around; epilogues; one 4-byte table
-        // entry per CFG edge; alignment padding.
+        // PLIRON: `PLIRON_JT_NARROW` (default on; `=0` off) lets the ISA defer
+        // jump tables to the end of the buffer (narrow entries,
+        // `MachDeferredJumpTable`). The deferred table and the dispatch's base
+        // address must stay in pc-relative range, so give the buffer, per
+        // block in emission order, a sound upper bound on everything still to
+        // come: every inst and regalloc edit at its worst-case size plus a
+        // veneer, a constant re-emission and an island jump-around; epilogues;
+        // one 4-byte table entry per CFG edge; alignment padding.
         static JT_NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let jt_narrow = *JT_NARROW
-            .get_or_init(|| std::env::var("PLIRON_JT_NARROW").as_deref() == Ok("1"));
+            .get_or_init(|| std::env::var("PLIRON_JT_NARROW").as_deref() != Ok("0"));
         let jt_suffix: Vec<u64> = if jt_narrow {
             let per_inst = u64::from(I::worst_case_size())
                 + u64::from(I::LabelUse::worst_case_veneer_size())
