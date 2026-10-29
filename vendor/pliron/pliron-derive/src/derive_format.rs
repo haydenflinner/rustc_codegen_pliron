@@ -480,7 +480,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             }
             if let Elem::UnnamedVar(UnnamedVar { index, .. }) = &d.args[0] {
                 Ok(quote! {
-                    let reg = self.get_operation().deref(ctx).get_region(#index);
+                    let reg = self.get_operation().deref(ctx).get_region(ctx, #index);
                     ::pliron::printable::Printable::fmt(&reg, ctx, state, fmt)?;
                 })
             } else {
@@ -590,7 +590,7 @@ impl PrintableBuilder<OpPrinterState> for DeriveOpPrintable {
             let sep = directive_to_list_separator(sep, input.ident.span())?;
             Ok(quote! {
                 let op = self.get_operation().deref(ctx);
-                let regions = op.regions();
+                let regions = op.regions(ctx);
                 let regions = ::pliron::irfmt::printers::iter_with_sep(regions, #sep);
                 ::pliron::printable::Printable::fmt(&regions, ctx, state, fmt)?;
             })
