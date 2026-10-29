@@ -11,6 +11,7 @@ pliron = { path = "../vendor/pliron", default-features = false, features = ["std
 cranelift-codegen = { version = "=0.135.5", default-features = false, features = ["std", "incremental-cache"] }
 cranelift-module = "=0.135.5"
 cranelift-interpreter = "=0.135.5"
+cranelift-frontend = "=0.135.5"
 target-lexicon = "0.13"
 rustc-hash = "2"
 smallvec = "1"
@@ -23,5 +24,4 @@ sha2 = "0.11"
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cranelift-reader = "=0.135.5"
-cranelift-frontend = "=0.135.5"
 libc = "0.2"
