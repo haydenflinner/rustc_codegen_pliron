@@ -21,6 +21,10 @@ V = re.compile(r"\bv(\d+)\b")
 
 
 def parse(fn_text):
+    # stop at the closing brace of the function
+    fn_text = "\n".join(l for l in fn_text.splitlines())
+    end = fn_text.find("\n}")
+    if end > 0: fn_text = fn_text[:end]
     blocks = {}          # name -> list of (defs, uses, succs)
     params = {}          # name -> [v]
     order = []

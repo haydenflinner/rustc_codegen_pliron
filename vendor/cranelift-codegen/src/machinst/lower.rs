@@ -1386,6 +1386,30 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             }
         }
 
+        // PLIRON: `PLIRON_VREGMAP=<substr>` dumps the CLIF Value -> vcode
+        // vreg map (correlates `PLIRON_RA2_EDITS` decisions back to CLIF
+        // vregs); `all` matches every function.
+        if std::env::var("PLIRON_VREGMAP")
+            .ok()
+            .map(|pat| {
+                pat == "all" || (!pat.is_empty() && format!("{}", self.f.name).contains(&pat))
+            })
+            .unwrap_or(false)
+        {
+            let mut out = alloc::string::String::new();
+            for (v, regs) in self.value_regs.iter() {
+                if regs.is_invalid() {
+                    continue;
+                }
+                out.push_str(&format!("{}:", v));
+                for r in regs.regs() {
+                    out.push_str(&format!(" {:?}", r));
+                }
+                out.push('\n');
+            }
+            eprintln!("==== vregmap {} ====\n{}", self.f.name, out);
+        }
+
         // Now that we've emitted all instructions into the
         // VCodeBuilder, let's build the VCode.
         trace!(

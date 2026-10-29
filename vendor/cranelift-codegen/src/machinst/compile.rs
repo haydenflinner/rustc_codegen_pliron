@@ -160,6 +160,29 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             }
             eprintln!("==== ra2edits end ====");
         }
+        // PLIRON: `PLIRON_RA2_ALLOC=1` dumps each vreg that regalloc2
+        // assigned a stack slot at least once (the actual spilled set).
+        if prevcode_match && std::env::var_os("PLIRON_RA2_ALLOC").is_some() {
+            use regalloc2::Function as _;
+            let mut spilled = std::collections::BTreeMap::new();
+            for i in 0..vcode.num_insts() {
+                let inst = regalloc2::Inst::new(i);
+                for (k, o) in vcode.inst_operands(inst).iter().enumerate() {
+                    if let Some(a) = regalloc_ctx.output.inst_allocs(inst).get(k) {
+                        if a.is_stack() {
+                            spilled
+                                .entry(o.vreg().vreg())
+                                .or_insert_with(|| format!("{:?}", a));
+                        }
+                    }
+                }
+            }
+            eprintln!("==== ra2alloc {} ====", f.name);
+            for (v, a) in &spilled {
+                eprintln!("  v{v} {a}");
+            }
+            eprintln!("==== ra2alloc end ====");
+        }
     }
 
     // Run the regalloc checker, if requested.
