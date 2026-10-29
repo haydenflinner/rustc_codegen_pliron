@@ -2059,6 +2059,13 @@ pub(crate) fn round<'a>(
                 argv.clear();
                 pn.clear();
                 let mut ok = true;
+                // The args are values of the *pred's* scope. On a back edge
+                // into a loop header they can be the header's own params
+                // (the previous iteration's bindings), so they must not be
+                // looked up in `env`, which holds this edge's new
+                // bindings (`known(.., &env, v)` read arg `v1019` as the
+                // freshly bound `v1019 = 0`).
+                let outer: FxHashMap<Value, u64> = FxHashMap::default();
                 for (&p, a) in params.iter().zip(&args) {
                     let BlockArg::Value(v) = *a else {
                         ok = false;
@@ -2066,7 +2073,7 @@ pub(crate) fn round<'a>(
                     };
                     let v = func.dfg.resolve_aliases(v);
                     argv.insert(p, v);
-                    if let Some(c) = known(func, &env, v) {
+                    if let Some(c) = known(func, &outer, v) {
                         env.insert(p, c);
                     } else if nnr.is_m(func, v, &mut nnm.borrow_mut()) {
                         pn.insert(p);
@@ -2081,7 +2088,7 @@ pub(crate) fn round<'a>(
                     let none = FxHashMap::default();
                     for (&p, &v) in &argv {
                         if !env.contains_key(&p) {
-                            let k = kbits(func, &env, &none, v, 0);
+                            let k = kbits(func, &outer, &none, v, 0);
                             if k != (0, 0) {
                                 kenv.insert(p, k);
                             }
