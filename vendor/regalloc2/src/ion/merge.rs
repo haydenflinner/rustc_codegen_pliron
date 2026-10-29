@@ -362,7 +362,38 @@ impl<'a, F: Function> Env<'a, F> {
         }
 
         // Attempt to merge blockparams with their inputs.
-        for i in 0..self.blockparam_outs.len() {
+        // PLIRON: `PLIRON_RA2_MERGEDEPTH=1` (default off): merge the
+        // blockparam edges of the deepest loops first, so a loop-carried
+        // value shares the param's register and the move lands on the
+        // preheader edge instead of the back edge.
+        static MD: ::std::sync::OnceLock<u8> = ::std::sync::OnceLock::new();
+        let mut order: crate::Vec<usize> = (0..self.blockparam_outs.len()).collect();
+        let md = *MD.get_or_init(|| {
+            ::std::env::var("PLIRON_RA2_MERGEDEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        if md > 0 {
+            let depth = &self.ctx.cfginfo.approx_loop_depth;
+            let span = |v: VRegIndex| {
+                let r = &self.vregs[v].ranges;
+                match (r.first(), r.last()) {
+                    (Some(a), Some(b)) => b.range.to.inst().index().saturating_sub(a.range.from.inst().index()),
+                    _ => 0,
+                }
+            };
+            order.sort_by_key(|&i| {
+                let o = &self.blockparam_outs[i];
+                let d = ::core::cmp::Reverse(depth[o.from_block.index()]);
+                match md {
+                    1 => (d, 0i64),
+                    2 => (d, span(o.from_vreg) as i64),
+                    _ => (d, -(span(o.from_vreg) as i64)),
+                }
+            });
+        }
+        for i in order {
             let BlockparamOut {
                 from_vreg, to_vreg, ..
             } = self.blockparam_outs[i];
