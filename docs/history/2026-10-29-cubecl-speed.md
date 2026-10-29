@@ -69,3 +69,24 @@ an older worktree of this repo, so it measures the Oct-29 lowering) with
   `fpromote`d f16 into an f32 vector that is immediately `fvdemote_f16_pair`ed
   becomes one `splat.f16x8` of the original scalar (-> `dup.8h`); then re-look at
   the loop's spills (hoist the index math, `PLIRON_PUNROLL` budget).
+
+## 3. PLIRON_F16SPLAT (default off) and IR tests (`7bf8c12`, `f81efa5`)
+
+- `scalarize::promote` wraps each promoted f16 lane op (insertelement, splat
+  shufflevector) in fpext/fptrunc. With `PLIRON_F16SPLAT=1`, `fpext(fptrunc(w))`
+  reuses `w` when every lane of `w` is exact in the narrow type (fpext of it,
+  zero/undef/poison, through insert/extract/shuffle; depth 8), and a one-lane
+  broadcast `shufflevector` of 32-bit lanes into 128-bit leaves becomes
+  `pliron.vsplat` (`dup`) instead of an insert chain.
+- `pliron-clif-lower/tests/ir_peeps.rs` (builds pliron IR by API, no rustc):
+  `vselect_fuse` fuses 6 fcmp + 10 icmp predicates and erases the dead compare;
+  keeps the compare when it has a second user; leaves ord/uno/u*/ueq/one, f64x2
+  and f32x2 selects alone. F16SPLAT tests fail with `PLIRON_F16SPLAT=0`, fuse
+  tests fail with `PLIRON_VSELECT=0`.
+- NOT measured: the GEMM kernel object/throughput (needs cubek/cubecl rebuilt
+  against this tree, see `cubecl-burn.md` "Cargo wiring"). To check: dump
+  objects with `CUBECL_PLIRON_DUMP_OBJ`, run `PLIRON_F16SPLAT=1`, look for
+  `dup.8h` and the loss of the `fcvtn/fcvtl/mov.s` run in the `fmla.8h` loop.
+- Index math / spills in the loop (item 3) not analysed: the reloads from the
+  frame are regalloc pressure (another agent owns regalloc2); the `madd/lsr/and`
+  per-iteration index math needs the kernel's CLIF (`PLIRON_CLIF=<kernel>`).
