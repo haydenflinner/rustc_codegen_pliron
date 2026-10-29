@@ -12,7 +12,14 @@ Read it before picking a task.
 
 ## Rules
 
-1. **Run `harness/gate.py` before merging to main** (~40 s — the wasm
+1. **Iterate with `harness/quick.py`** (tier 1 default, ~2 min, or
+   `--tier 0`, seconds when warm): it reads `git diff`, builds, runs only the
+   touched crates' unit tests, replays the CLIF corpora, runs the
+   `test.sh` stanzas those paths select, `wasm_smoke`, and the fuzz
+   regression seeds plus a rolling window of fresh ones, then prints what
+   it skipped and the slow command that completes the proof. Green quick
+   is ~90% confidence, not a merge licence.
+   **Run `harness/gate.py` before merging to main** (~40 s — the wasm
    sysroot leg is off by default; `--full` or `--only wasm` adds it for
    wasm/wpeep/linker changes. `wasm_smoke`, always on, covers
    emit->link->run in ~1 s). main stays green: a red gate is fixed
