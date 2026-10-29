@@ -1,0 +1,34 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 5103a81a..d960b732 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -97,16 +97,17 @@ opt-level = 3
+ pliron = { version = "0.19" }
+ pliron-derive = { version = "0.19" }
+ 
++# LOCAL (pliron/kernel-jit): paths point at one rustc_codegen_pliron checkout (docs/cubecl-burn.md)
+ [patch.crates-io]
+-pliron = { path = "../purerust/rustc_codegen_pliron/vendor/pliron" }
+-pliron-llvm = { path = "../purerust/rustc_codegen_pliron/vendor/pliron/pliron-llvm" }
+-pliron-derive = { path = "../purerust/rustc_codegen_pliron/vendor/pliron/pliron-derive" }
+-regalloc2 = { path = "../purerust/rustc_codegen_pliron/vendor/regalloc2" }
+-cranelift-codegen = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-codegen" }
+-cranelift-codegen-meta = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-codegen-meta" }
+-cranelift-object = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-object" }
+-cranelift-assembler-x64 = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-assembler-x64" }
+-cranelift-assembler-x64-meta = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-assembler-x64-meta" }
+-cranelift-interpreter = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-interpreter" }
+-cranelift-reader = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-reader" }
+-rsasm = { path = "../purerust/rustc_codegen_pliron/vendor/rsasm" }
++pliron = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron" }
++pliron-llvm = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron/pliron-llvm" }
++pliron-derive = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron/pliron-derive" }
++regalloc2 = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/regalloc2" }
++cranelift-codegen = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-codegen" }
++cranelift-codegen-meta = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-codegen-meta" }
++cranelift-object = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-object" }
++cranelift-assembler-x64 = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-assembler-x64" }
++cranelift-assembler-x64-meta = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-assembler-x64-meta" }
++cranelift-interpreter = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-interpreter" }
++cranelift-reader = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-reader" }
++rsasm = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/rsasm" }

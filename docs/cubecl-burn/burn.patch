@@ -1,0 +1,371 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 20a6b7355..3b1b28a67 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -123,7 +123,7 @@ tracing-subscriber = "0.3.23"
+ # builds and the eventual `0.8.x`, and `turso::Error` is reachable from the public
+ # `SqliteDatasetError`. The pin only covers this facade crate; turso's own `turso_core` and
+ # `turso_sdk_kit` deps use caret ranges, so keep this on the same `pre` as they resolve to.
+-turso = { version = "=0.8.0-pre.8", default-features = false }
++turso = { version = "=0.8.2", default-features = false }
+ wasm-bindgen = "0.2"
+ wasm-bindgen-futures = "0.4"
+ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+@@ -231,17 +231,17 @@ burn-wgpu = { path = "crates/burn-wgpu", version = "=0.22.0-pre.4", default-feat
+ pytorch-reader = { path = "crates/pytorch-reader", version = "=0.22.0-pre.4" }
+ 
+ ### For the main burn branch. ###
+-cubecl = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
+-cubecl-common = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
+-cubecl-environment = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
+-cubecl-zspace = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
+-cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, rev = "a8207f822e07eaaed1480965c55c5b8864339e1b" }
++# cubecl = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
++# cubecl-common = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
++# cubecl-environment = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
++# cubecl-zspace = { git = "https://github.com/tracel-ai/cubecl", default-features = false, rev = "5e521ef4ee786b1b8bcb1f487cdbd093c1d5d670" }
++# cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false, rev = "a8207f822e07eaaed1480965c55c5b8864339e1b" }
+ ### For local development. ###
+-# cubecl = { path = "../cubecl/crates/cubecl", default-features = false }
+-# cubecl-common = { path = "../cubecl/crates/cubecl-common", default-features = false }
+-# cubecl-environment = { path = "../cubecl/crates/cubecl-environment", default-features = false }
+-# cubecl-zspace = { path = "../cubecl/crates/cubecl-zspace", default-features = false }
+-# cubek = { path = "../cubek/crates/cubek", default-features = false }
++cubecl = { path = "/Users/wow/code/cubecl/crates/cubecl", default-features = false }
++cubecl-common = { path = "/Users/wow/code/cubecl/crates/cubecl-common", default-features = false }
++cubecl-environment = { path = "/Users/wow/code/cubecl/crates/cubecl-environment", default-features = false }
++cubecl-zspace = { path = "/Users/wow/code/cubecl/crates/cubecl-zspace", default-features = false }
++cubek = { path = "/Users/wow/code/cubek/crates/cubek", default-features = false }
+ ### For the release. ###
+ # cubecl = { version = "=0.11.0-pre.4", default-features = false }
+ # cubecl-common = { version = "=0.11.0-pre.4", default-features = false }
+@@ -251,3 +251,27 @@ cubek = { git = "https://github.com/tracel-ai/cubek", default-features = false,
+ 
+ [profile.dev]
+ debug = 1 # Speed up compilation time and not necessary.
++
++# pliron-spirv pins upstream pliron; point it at the same pliron as the rest of the workspace.
++[patch."https://github.com/pliron-org/pliron.git"]
++pliron = { version = "0.19" }
++pliron-derive = { version = "0.19" }
++
++# Route everything through rustc_codegen_pliron's vendored forks so the same
++# `pliron`/`cranelift` types unify with `pliron-clif-lower` (CUBECL_PLIRON_CLIF
++# JIT path in cubecl-llvm). Vendored crates carry perf patches on top of the
++# same upstream revs; APIs are unchanged.
++# LOCAL (pliron/kernel-jit): paths below point at one rustc_codegen_pliron checkout (docs/cubecl-burn.md)
++[patch.crates-io]
++pliron = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron" }
++pliron-llvm = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron/pliron-llvm" }
++pliron-derive = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron/pliron-derive" }
++regalloc2 = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/regalloc2" }
++cranelift-codegen = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-codegen" }
++cranelift-codegen-meta = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-codegen-meta" }
++cranelift-object = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-object" }
++cranelift-assembler-x64 = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-assembler-x64" }
++cranelift-assembler-x64-meta = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-assembler-x64-meta" }
++cranelift-interpreter = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-interpreter" }
++cranelift-reader = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-reader" }
++rsasm = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/rsasm" }
+diff --git a/crates/burn-cubecl-fusion/src/engine/codegen/view.rs b/crates/burn-cubecl-fusion/src/engine/codegen/view.rs
+index 7247b0331..060886552 100644
+--- a/crates/burn-cubecl-fusion/src/engine/codegen/view.rs
++++ b/crates/burn-cubecl-fusion/src/engine/codegen/view.rs
+@@ -316,7 +316,7 @@ impl<E: CubePrimitive> ViewOperationsMutExpand<E, Coords1d> for FusedOutputExpan
+         _scope: &Scope,
+         _shared_memory: &SliceExpand<E>,
+         _pos: NativeExpand<usize>,
+-    ) {
++    ) -> PendingExpand<()> {
+         panic!("Not a tensor map")
+     }
+ }
+diff --git a/crates/burn-cubecl/src/kernel/conv/deform_conv2d.rs b/crates/burn-cubecl/src/kernel/conv/deform_conv2d.rs
+index 98efaae3e..64044539b 100644
+--- a/crates/burn-cubecl/src/kernel/conv/deform_conv2d.rs
++++ b/crates/burn-cubecl/src/kernel/conv/deform_conv2d.rs
+@@ -141,14 +141,14 @@ pub(crate) fn bilinear_interpolate<F: Float>(
+     let stride_y = input.stride(2);
+     let stride_x = input.stride(3);
+ 
+-    let mut result = F::new(0.0_f32);
++    let mut result = F::new(0.0_f64);
+     if y > -1.0f32 && height as f32 > y && x > -1.0f32 && width as f32 > x {
+         let y_low = y.floor();
+         let x_low = x.floor();
+         let y_high = (y_low + 1.) as usize;
+         let x_high = (x_low + 1.) as usize;
+ 
+-        let zero = F::new(0.0_f32);
++        let zero = F::new(0.0_f64);
+         let v1: F = if y_low >= 0. && x_low >= 0. {
+             input[offset + y_low as usize * stride_y + x_low as usize * stride_x]
+         } else {
+diff --git a/crates/burn-cubecl/src/kernel/conv/deform_conv_transpose2d.rs b/crates/burn-cubecl/src/kernel/conv/deform_conv_transpose2d.rs
+index 876da9bcb..530e229f8 100644
+--- a/crates/burn-cubecl/src/kernel/conv/deform_conv_transpose2d.rs
++++ b/crates/burn-cubecl/src/kernel/conv/deform_conv_transpose2d.rs
+@@ -328,8 +328,8 @@ fn deform_col2img_coord_kernel<F: Float>(
+     let kernel_w = args.kernel_width;
+     let kernel_h = args.kernel_height;
+ 
+-    let mut grad_offset_val = F::new(0.0_f32);
+-    let mut grad_mask_val = F::new(0.0_f32);
++    let mut grad_offset_val = F::new(0.0_f64);
++    let mut grad_mask_val = F::new(0.0_f64);
+ 
+     let (_, pos) = decompose_linear(ABSOLUTE_POS, &pos_shape);
+     let [batch, offset_group, kernel_y, kernel_x, dir, out_y, out_x] = *pos else {
+@@ -369,7 +369,7 @@ fn deform_col2img_coord_kernel<F: Float>(
+                 + out_x * mask.stride(3);
+             mask[mask_idx]
+         }
+-        ComptimeOption::None => F::new(1.0_f32),
++        ComptimeOption::None => F::new(1.0_f64),
+     };
+ 
+     let is_y_direction = dir == 0;
+@@ -442,32 +442,32 @@ fn get_coordinate_weight<F: Float>(
+     let bottom_left = if valid_y_low && valid_x_low {
+         input[offset + y_low as usize * stride_y + x_low as usize * stride_x]
+     } else {
+-        F::new(0.0_f32)
++        F::new(0.0_f64)
+     };
+     let bottom_right = if valid_y_low && valid_x_high {
+         input[offset + y_low as usize * stride_y + x_high as usize * stride_x]
+     } else {
+-        F::new(0.0_f32)
++        F::new(0.0_f64)
+     };
+     let top_left = if valid_y_high && valid_x_low {
+         input[offset + y_high as usize * stride_y + x_low as usize * stride_x]
+     } else {
+-        F::new(0.0_f32)
++        F::new(0.0_f64)
+     };
+     let top_right = if valid_y_high && valid_x_high {
+         input[offset + y_high as usize * stride_y + x_high as usize * stride_x]
+     } else {
+-        F::new(0.0_f32)
++        F::new(0.0_f64)
+     };
+ 
+     if is_y_direction {
+         let delta_x = F::cast_from(x - x_low);
+         delta_x * (top_right - bottom_right)
+-            + (F::new(1.0_f32) - delta_x) * (top_left - bottom_left)
++            + (F::new(1.0_f64) - delta_x) * (top_left - bottom_left)
+     } else {
+         let delta_y = F::cast_from(y - y_low);
+         delta_y * (top_right - top_left)
+-            + (F::new(1.0_f32) - delta_y) * (bottom_right - bottom_left)
++            + (F::new(1.0_f64) - delta_y) * (bottom_right - bottom_left)
+     }
+ }
+ 
+@@ -622,7 +622,7 @@ fn deform_col2img_kernel<F: Float, FP: Float, FAdd: FloatAtomicAddFamily>(
+                 + out_y * mask.stride(2)
+                 + out_x * mask.stride(3)]
+         }
+-        ComptimeOption::None => F::new(1.0_f32),
++        ComptimeOption::None => F::new(1.0_f64),
+     };
+ 
+     let y = F::cast_from(out_y * args.stride_h + kernel_y * args.dilation_h)
+@@ -638,12 +638,12 @@ fn deform_col2img_kernel<F: Float, FP: Float, FAdd: FloatAtomicAddFamily>(
+             let yp = y.floor() + F::cast_from(dy);
+             let xp = x.floor() + F::cast_from(dx);
+ 
+-            if yp >= F::new(0.0_f32)
++            if yp >= F::new(0.0_f64)
+                 && yp < F::cast_from(height)
+-                && xp >= F::new(0.0_f32)
++                && xp >= F::new(0.0_f64)
+                 && xp < F::cast_from(width)
+-                && F::abs(y - yp) < F::new(1.0_f32)
+-                && F::abs(x - xp) < F::new(1.0_f32)
++                && F::abs(y - yp) < F::new(1.0_f64)
++                && F::abs(x - xp) < F::new(1.0_f64)
+             {
+                 let gradient_pos = batch * grad_input.stride(0)
+                     + in_channel * grad_input.stride(1)
+@@ -651,7 +651,7 @@ fn deform_col2img_kernel<F: Float, FP: Float, FAdd: FloatAtomicAddFamily>(
+                     + usize::cast_from(xp) * grad_input.stride(3);
+ 
+                 let weight =
+-                    (F::new(1.0_f32) - F::abs(y - yp)) * (F::new(1.0_f32) - F::abs(x - xp));
++                    (F::new(1.0_f64) - F::abs(y - yp)) * (F::new(1.0_f64) - F::abs(x - xp));
+ 
+                 let value = mask_value * F::cast_from(weight) * columns.read(ABSOLUTE_POS);
+ 
+diff --git a/crates/burn-cubecl/src/kernel/ctc.rs b/crates/burn-cubecl/src/kernel/ctc.rs
+index 825fcf610..f0f543fb7 100644
+--- a/crates/burn-cubecl/src/kernel/ctc.rs
++++ b/crates/burn-cubecl/src/kernel/ctc.rs
+@@ -102,9 +102,9 @@ fn finalize_nll<F: Float>(
+         mn = last_blank;
+     }
+     if mx < unreachable_threshold {
+-        (F::new(1000.0_f32) * F::cast_from(target_len as u32)).exp()
++        (F::new(1000.0_f64) * F::cast_from(target_len as u32)).exp()
+     } else {
+-        F::new(0.0_f32) - (mx + (one + (mn - mx).exp()).ln())
++        F::new(0.0_f64) - (mx + (one + (mn - mx).exp()).ln())
+     }
+ }
+ 
+@@ -114,9 +114,9 @@ fn finalize_nll<F: Float>(
+ #[cube]
+ fn empty_input_nll<F: Float>(target_len: usize) -> F {
+     if target_len == 0 {
+-        F::new(0.0_f32)
++        F::new(0.0_f64)
+     } else {
+-        (F::new(1000.0_f32) * F::cast_from(target_len as u32)).exp()
++        (F::new(1000.0_f64) * F::cast_from(target_len as u32)).exp()
+     }
+ }
+ 
+@@ -187,9 +187,9 @@ fn ctc_loss_kernel<F: Float, I: Numeric>(
+     // (log(2) per step when both log_sum_exp inputs sit at the sentinel),
+     // which is why the recurrence compares against a threshold instead of
+     // checking `== neg_inf`. See `log_sum_exp2` for the long-sequence caveat.
+-    let neg_inf = F::new(-6.0e4_f32);
+-    let unreachable_threshold = F::new(-1.0e4_f32);
+-    let one = F::new(1.0_f32);
++    let neg_inf = F::new(-6.0e4_f64);
++    let unreachable_threshold = F::new(-1.0e4_f64);
++    let one = F::new(1.0_f64);
+ 
+     // Initialize alpha at t = 0 for s < l_prime_len; positions beyond that
+     // are never read by the recurrence (s < l_prime_len in every read) so
+@@ -415,9 +415,9 @@ fn ctc_alpha_beta_kernel<F: Float, I: Numeric>(
+     // Sentinel for unreachable states. See ctc_loss_kernel for the full
+     // rationale: f16's 65504 magnitude cap forces the -6e4 floor, WGSL
+     // rejects f32(-inf) literals, and the threshold catches sentinel drift.
+-    let neg_inf = F::new(-6.0e4_f32);
+-    let unreachable_threshold = F::new(-1.0e4_f32);
+-    let one = F::new(1.0_f32);
++    let neg_inf = F::new(-6.0e4_f64);
++    let unreachable_threshold = F::new(-1.0e4_f64);
++    let one = F::new(1.0_f64);
+ 
+     // Alpha phase (forward).
+     //
+diff --git a/crates/burn-cubecl/src/kernel/grid_sample/base.rs b/crates/burn-cubecl/src/kernel/grid_sample/base.rs
+index 3b94e175f..af6b470ed 100644
+--- a/crates/burn-cubecl/src/kernel/grid_sample/base.rs
++++ b/crates/burn-cubecl/src/kernel/grid_sample/base.rs
+@@ -75,7 +75,7 @@ pub(crate) fn fetch_with_zeros<F: Float>(
+     let x_clamped = clamp(x, 0, w - 1) as usize;
+     let y_clamped = clamp(y, 0, h - 1) as usize;
+     let idx = base + y_clamped * stride_h + x_clamped * stride_w;
+-    select(in_bounds, input[idx], F::new(0.0_f32))
++    select(in_bounds, input[idx], F::new(0.0_f64))
+ }
+ 
+ /// Fetch value with border padding (clamp to edge).
+@@ -135,9 +135,9 @@ fn reflect_coord_bounded(idx: i32, size: i32) -> usize {
+ pub(crate) fn reflect_coord<F: Float>(coord: F, size: u32, #[comptime] align_corners: bool) -> F {
+     let size_f = F::cast_from(size);
+     if align_corners {
+-        reflect_float_impl::<F>(coord, F::new(0.0_f32), size_f - F::new(1.0_f32))
++        reflect_float_impl::<F>(coord, F::new(0.0_f64), size_f - F::new(1.0_f64))
+     } else {
+-        reflect_float_impl::<F>(coord, F::new(-0.5_f32), size_f - F::new(0.5_f32))
++        reflect_float_impl::<F>(coord, F::new(-0.5_f64), size_f - F::new(0.5_f64))
+     }
+ }
+ 
+@@ -146,11 +146,11 @@ pub(crate) fn reflect_coord<F: Float>(coord: F, size: u32, #[comptime] align_cor
+ fn reflect_float_impl<F: Float>(coord: F, min_val: F, max_val: F) -> F {
+     let span = max_val - min_val;
+ 
+-    let is_valid = span > F::new(0.0_f32);
+-    let safe_span = select(is_valid, span, F::new(1.0_f32));
++    let is_valid = span > F::new(0.0_f64);
++    let safe_span = select(is_valid, span, F::new(1.0_f64));
+ 
+     // Triangle wave formula: span - |((x mod 2*span) - span)| + min_val
+-    let period = safe_span * F::new(2.0_f32);
++    let period = safe_span * F::new(2.0_f64);
+     let x = (coord - min_val).abs();
+     let x_mod = x - (x / period).floor() * period;
+     let reflected = safe_span - (x_mod - safe_span).abs() + min_val;
+diff --git a/crates/burn-cubecl/src/kernel/grid_sample/bilinear.rs b/crates/burn-cubecl/src/kernel/grid_sample/bilinear.rs
+index 8e9911f6d..96a8cb7cc 100644
+--- a/crates/burn-cubecl/src/kernel/grid_sample/bilinear.rs
++++ b/crates/burn-cubecl/src/kernel/grid_sample/bilinear.rs
+@@ -45,14 +45,14 @@ fn grid_sample_bilinear_kernel<F: Float>(
+ 
+     // Convert normalized coordinates to pixel coordinates
+     let (px, py) = if align_corners {
+-        let px = (gx + F::new(1.0_f32)) * F::cast_from((w_in - 1) as f32) / F::new(2.0_f32);
+-        let py = (gy + F::new(1.0_f32)) * F::cast_from((h_in - 1) as f32) / F::new(2.0_f32);
++        let px = (gx + F::new(1.0_f64)) * F::cast_from((w_in - 1) as f32) / F::new(2.0_f64);
++        let py = (gy + F::new(1.0_f64)) * F::cast_from((h_in - 1) as f32) / F::new(2.0_f64);
+         (px, py)
+     } else {
+         let px =
+-            (gx + F::new(1.0_f32)) * F::cast_from(w_in as f32) / F::new(2.0_f32) - F::new(0.5_f32);
++            (gx + F::new(1.0_f64)) * F::cast_from(w_in as f32) / F::new(2.0_f64) - F::new(0.5_f64);
+         let py =
+-            (gy + F::new(1.0_f32)) * F::cast_from(h_in as f32) / F::new(2.0_f32) - F::new(0.5_f32);
++            (gy + F::new(1.0_f64)) * F::cast_from(h_in as f32) / F::new(2.0_f64) - F::new(0.5_f64);
+         (px, py)
+     };
+ 
+@@ -69,14 +69,14 @@ fn grid_sample_bilinear_kernel<F: Float>(
+     // Compute floor and ceil indices
+     let x0_f = px.floor();
+     let y0_f = py.floor();
+-    let x1_f = x0_f + F::new(1.0_f32);
+-    let y1_f = y0_f + F::new(1.0_f32);
++    let x1_f = x0_f + F::new(1.0_f64);
++    let y1_f = y0_f + F::new(1.0_f64);
+ 
+     // Compute interpolation weights
+     let wx = px - x0_f;
+     let wy = py - y0_f;
+-    let wx_ = F::new(1.0_f32) - wx;
+-    let wy_ = F::new(1.0_f32) - wy;
++    let wx_ = F::new(1.0_f64) - wx;
++    let wy_ = F::new(1.0_f64) - wy;
+ 
+     // Convert to integers for indexing
+     let x0 = i32::cast_from(x0_f);
+diff --git a/crates/burn-cubecl/src/kernel/unary_float.rs b/crates/burn-cubecl/src/kernel/unary_float.rs
+index 4dbb6d223..ff8b2a6ba 100644
+--- a/crates/burn-cubecl/src/kernel/unary_float.rs
++++ b/crates/burn-cubecl/src/kernel/unary_float.rs
+@@ -166,7 +166,7 @@ pub(crate) mod unary_basic {
+                 BasicFloatUnaryKind::Sign => {
+                     let zero = Vector::zero();
+                     let one = Vector::one();
+-                    let minus_one = Vector::new(F::new(-1.0_f32));
++                    let minus_one = Vector::new(F::new(-1.0_f64));
+ 
+                     let is_positive = input.greater_than(&zero);
+                     let is_negative = input.less_than(&zero);
+diff --git a/crates/burn-std/src/tensor/quantization.rs b/crates/burn-std/src/tensor/quantization.rs
+index bd2690057..c904ef864 100644
+--- a/crates/burn-std/src/tensor/quantization.rs
++++ b/crates/burn-std/src/tensor/quantization.rs
+@@ -15,7 +15,15 @@ pub const QPARAM_ALIGN: usize = core::mem::align_of::<f32>();
+ use alloc::vec::Vec;
+ use core::any::TypeId;
+ use cubecl_common::e4m3;
+-use cubecl_common::quant::scheme::{f32_to_ue8m0, ue8m0_to_f32};
++use cubecl_common::ue8m0;
++
++fn f32_to_ue8m0(s: f32) -> u8 {
++    ue8m0::from_f32(s).to_bits()
++}
++
++fn ue8m0_to_f32(b: u8) -> f32 {
++    ue8m0::from_bits(b).to_f32()
++}
+ use num_traits::PrimInt;
+ use serde::{Deserialize, Serialize};
+ 

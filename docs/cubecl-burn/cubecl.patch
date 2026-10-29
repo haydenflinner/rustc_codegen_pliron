@@ -1,0 +1,2358 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b49b0b4c..783e6995 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -269,16 +269,17 @@ pliron-derive = { version = "0.19" }
+ # `pliron`/`cranelift` types unify with `pliron-clif-lower` (CUBECL_PLIRON_CLIF
+ # JIT path in cubecl-llvm). Vendored crates carry perf patches on top of the
+ # same upstream revs; APIs are unchanged.
++# LOCAL (pliron/kernel-jit): paths below point at one rustc_codegen_pliron checkout (docs/cubecl-burn.md)
+ [patch.crates-io]
+-pliron = { path = "../purerust/rustc_codegen_pliron/vendor/pliron" }
+-pliron-llvm = { path = "../purerust/rustc_codegen_pliron/vendor/pliron/pliron-llvm" }
+-pliron-derive = { path = "../purerust/rustc_codegen_pliron/vendor/pliron/pliron-derive" }
+-regalloc2 = { path = "../purerust/rustc_codegen_pliron/vendor/regalloc2" }
+-cranelift-codegen = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-codegen" }
+-cranelift-codegen-meta = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-codegen-meta" }
+-cranelift-object = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-object" }
+-cranelift-assembler-x64 = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-assembler-x64" }
+-cranelift-assembler-x64-meta = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-assembler-x64-meta" }
+-cranelift-interpreter = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-interpreter" }
+-cranelift-reader = { path = "../purerust/rustc_codegen_pliron/vendor/cranelift-reader" }
+-rsasm = { path = "../purerust/rustc_codegen_pliron/vendor/rsasm" }
++pliron = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron" }
++pliron-llvm = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron/pliron-llvm" }
++pliron-derive = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/pliron/pliron-derive" }
++regalloc2 = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/regalloc2" }
++cranelift-codegen = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-codegen" }
++cranelift-codegen-meta = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-codegen-meta" }
++cranelift-object = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-object" }
++cranelift-assembler-x64 = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-assembler-x64" }
++cranelift-assembler-x64-meta = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-assembler-x64-meta" }
++cranelift-interpreter = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-interpreter" }
++cranelift-reader = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/cranelift-reader" }
++rsasm = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/vendor/rsasm" }
+diff --git a/crates/cubecl-core/src/frontend/cmma.rs b/crates/cubecl-core/src/frontend/cmma.rs
+index f50f3137..6d4d0c2d 100644
+--- a/crates/cubecl-core/src/frontend/cmma.rs
++++ b/crates/cubecl-core/src/frontend/cmma.rs
+@@ -1426,9 +1426,9 @@ pub mod execute_elementwise_op {
+         let func = FuncOp::new(scope.ctx_mut(), func_name.clone(), func_ty);
+         let func_body = func.get_entry_block(scope.ctx());
+ 
+-        let row = func_body.deref(scope.ctx()).get_argument(0);
+-        let col = func_body.deref(scope.ctx()).get_argument(1);
+-        let elem = func_body.deref(scope.ctx()).get_argument(2);
++        let row = func_body.deref(scope.ctx()).get_argument(scope.ctx(), 0);
++        let col = func_body.deref(scope.ctx()).get_argument(scope.ctx(), 1);
++        let elem = func_body.deref(scope.ctx()).get_argument(scope.ctx(), 2);
+ 
+         let mut closure_scope = scope.func_child(OpInserter::new_at_block_end(func_body));
+         let return_value = op(&mut closure_scope, row.into(), col.into(), elem.into()).value(scope);
+diff --git a/crates/cubecl-core/src/post_processing/saturating.rs b/crates/cubecl-core/src/post_processing/saturating.rs
+index ffd821ba..85941360 100644
+--- a/crates/cubecl-core/src/post_processing/saturating.rs
++++ b/crates/cubecl-core/src/post_processing/saturating.rs
+@@ -69,8 +69,8 @@ impl MatchRewrite for LowerSaturatingArithmetic {
+         op: Ptr<Operation>,
+     ) -> Result<()> {
+         let scope = Scope::from_context_and_inserter(ctx, rewriter);
+-        let lhs = op.deref(ctx).get_operand(0);
+-        let rhs = op.deref(ctx).get_operand(1);
++        let lhs = op.deref(ctx).get_operand(ctx, 0);
++        let rhs = op.deref(ctx).get_operand(ctx, 1);
+ 
+         let dyn_op = op.dyn_op(ctx);
+         let sat_op = op_cast::<dyn SaturatingOp>(&*dyn_op).unwrap();
+diff --git a/crates/cubecl-core/src/post_processing/unroll.rs b/crates/cubecl-core/src/post_processing/unroll.rs
+index 117ed744..9ac7df65 100644
+--- a/crates/cubecl-core/src/post_processing/unroll.rs
++++ b/crates/cubecl-core/src/post_processing/unroll.rs
+@@ -239,7 +239,7 @@ impl CustomUnrollOp for CompositeInsertOp {
+                     CopyOp::new(ctx, *vector).get_operation()
+                 };
+                 op.insert_before(ctx, self.get_operation());
+-                op.deref(ctx).get_result(0)
++                op.deref(ctx).get_result(ctx, 0)
+             });
+             let new_results = new_results.collect();
+             state.mappings.insert(self.get_result(ctx), new_results);
+@@ -589,7 +589,7 @@ impl Pass for UnrollPass {
+             let next = state
+                 .to_erase
+                 .iter()
+-                .position(|it| !it.deref(ctx).has_use())
++                .position(|it| !it.deref(ctx).has_use(ctx))
+                 .expect("Erased ops should only have uses in other erased ops");
+             let op = state.to_erase.remove(next);
+             state.rewriter.erase_operation(ctx, op);
+@@ -613,7 +613,7 @@ impl UnrollPass {
+             if should_unroll(ctx, arg, self.max_vector_size) {
+                 let new_ty = unroll_ty(ctx, arg, self.max_vector_size);
+                 new_func_inputs.push(new_ty);
+-                let block_arg = entry_block.deref(ctx).get_argument(i);
++                let block_arg = entry_block.deref(ctx).get_argument(ctx, i);
+                 block_arg.set_type(ctx, new_ty);
+             } else {
+                 new_func_inputs.push(arg);
+@@ -648,14 +648,14 @@ fn unroll_default(ctx: &mut Context, state: &mut UnrollState, op: Ptr<Operation>
+         });
+         let attrs = op.deref(ctx).attributes.clone();
+         let new_op = rematerialize.materialize(ctx, new_out_ty.clone(), opds.collect(), attrs);
+-        new_results.extend(new_op.deref(ctx).results());
++        new_results.extend(new_op.deref(ctx).results(ctx));
+         new_op.insert_before(ctx, op);
+     }
+ 
+     if !new_results.is_empty() {
+         state
+             .mappings
+-            .insert(op.deref(ctx).get_result(0), new_results);
++            .insert(op.deref(ctx).get_result(ctx, 0), new_results);
+     }
+     state.to_erase.push(op);
+ }
+diff --git a/crates/cubecl-cpp/src/cuda/ptx/asm.rs b/crates/cubecl-cpp/src/cuda/ptx/asm.rs
+index 4abeb1d6..de208a0e 100644
+--- a/crates/cubecl-cpp/src/cuda/ptx/asm.rs
++++ b/crates/cubecl-cpp/src/cuda/ptx/asm.rs
+@@ -104,10 +104,8 @@ impl InlinePtxOp {
+             .collect()
+     }
+ 
+-    pub fn raw_ptx<'a>(&self, ctx: &'a Context) -> Ref<'a, str> {
+-        Ref::map(self.get_attr_cuda_inline_ptx_ptx(ctx).unwrap(), |it| {
+-            it.as_str()
+-        })
++    pub fn raw_ptx<'a>(&self, ctx: &'a Context) -> &'a str {
++        self.get_attr_cuda_inline_ptx_ptx(ctx).unwrap().as_str()
+     }
+ 
+     pub fn is_volatile(&self, ctx: &Context) -> bool {
+@@ -115,11 +113,11 @@ impl InlinePtxOp {
+     }
+ 
+     pub fn inputs(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().collect()
++        self.get_operation().deref(ctx).operands(ctx).collect()
+     }
+ 
+     pub fn result(&self, ctx: &Context) -> Option<Value> {
+-        self.get_operation().deref(ctx).results().next()
++        self.get_operation().deref(ctx).results(ctx).next()
+     }
+ }
+ 
+diff --git a/crates/cubecl-cpp/src/cuda/signature.rs b/crates/cubecl-cpp/src/cuda/signature.rs
+index a5f4a8eb..daccae01 100644
+--- a/crates/cubecl-cpp/src/cuda/signature.rs
++++ b/crates/cubecl-cpp/src/cuda/signature.rs
+@@ -64,7 +64,7 @@ cuda_op!(FuncOp, |op, ctx| {
+     let entry_block = op.get_entry_block(ctx);
+ 
+     let block = entry_block.deref(ctx);
+-    let params = block.arguments().enumerate();
++    let params = block.arguments(ctx).enumerate();
+     let params = params.map(|(i, arg)| gen_param(ctx, op, i, arg)).join(", ");
+ 
+     let body = block_to_cpp(ctx, entry_block);
+diff --git a/crates/cubecl-cpp/src/hip/signature.rs b/crates/cubecl-cpp/src/hip/signature.rs
+index 4e6eae02..60b835a5 100644
+--- a/crates/cubecl-cpp/src/hip/signature.rs
++++ b/crates/cubecl-cpp/src/hip/signature.rs
+@@ -42,7 +42,7 @@ hip_op!(FuncOp, |op, ctx| {
+     let entry_block = op.get_entry_block(ctx);
+ 
+     let block = entry_block.deref(ctx);
+-    let params = block.arguments();
++    let params = block.arguments(ctx);
+     let params = params.map(|arg| gen_param(ctx, arg)).join(", ");
+ 
+     let body = block_to_cpp(ctx, entry_block);
+diff --git a/crates/cubecl-cpp/src/metal/builtin.rs b/crates/cubecl-cpp/src/metal/builtin.rs
+index a94b0312..0fa976ae 100644
+--- a/crates/cubecl-cpp/src/metal/builtin.rs
++++ b/crates/cubecl-cpp/src/metal/builtin.rs
+@@ -117,7 +117,7 @@ pub fn append_msl_builtins(ctx: &mut Context, entry_func: FuncOp) {
+             let i = entry_func.push_argument(ctx, attr.ty(ctx));
+             entry_func.set_arg_attr(ctx, i, &ATTR_BUILTIN_ATTRIBUTE, Box::new(attr));
+             set_block_arg_name(ctx, entry, i, Some(ident(attr.to_string())));
+-            let value = entry.deref(ctx).get_argument(i);
++            let value = entry.deref(ctx).get_argument(ctx, i);
+             (attr, value)
+         })
+         .collect::<HashMap<_, _>>();
+diff --git a/crates/cubecl-cpp/src/metal/signature.rs b/crates/cubecl-cpp/src/metal/signature.rs
+index 341ce40a..ee39ee72 100644
+--- a/crates/cubecl-cpp/src/metal/signature.rs
++++ b/crates/cubecl-cpp/src/metal/signature.rs
+@@ -55,7 +55,7 @@ metal_op!(FuncOp, |op, ctx| {
+     let entry_block = op.get_entry_block(ctx);
+ 
+     let block = entry_block.deref(ctx);
+-    let params = block.arguments().enumerate();
++    let params = block.arguments(ctx).enumerate();
+     let params = params.map(|(i, arg)| gen_param(ctx, op, i, arg)).join(", ");
+ 
+     let body = block_to_cpp(ctx, entry_block);
+diff --git a/crates/cubecl-cpp/src/shared/metadata.rs b/crates/cubecl-cpp/src/shared/metadata.rs
+index e738db51..579b766b 100644
+--- a/crates/cubecl-cpp/src/shared/metadata.rs
++++ b/crates/cubecl-cpp/src/shared/metadata.rs
+@@ -108,7 +108,7 @@ impl Pass for LowerInfoPass {
+                 let index_ptr = UniformPointerType::get(ctx, usize);
+                 let id = func.push_argument(ctx, index_ptr.to_handle());
+                 insert_block_arg_name(ctx, entry_block, id, Some(dyn_meta_name));
+-                let value = entry_block.deref(ctx).get_argument(id);
++                let value = entry_block.deref(ctx).get_argument(ctx, id);
+                 dyn_meta = Some(value);
+             }
+ 
+@@ -116,7 +116,7 @@ impl Pass for LowerInfoPass {
+                 let id = func.push_argument(ctx, InfoStructType::get(ctx).into());
+                 func.set_arg_attr_unit(ctx, id, &ATTR_GRID_CONSTANT);
+                 insert_block_arg_name(ctx, entry_block, id, Some(info_name));
+-                let value = entry_block.deref(ctx).get_argument(id);
++                let value = entry_block.deref(ctx).get_argument(ctx, id);
+                 info_st = Some(value);
+             }
+         } else if has_info {
+@@ -124,7 +124,7 @@ impl Pass for LowerInfoPass {
+             let info_ptr = UniformPointerType::get(ctx, info_st_ty);
+             let id = func.push_argument(ctx, info_ptr.to_handle());
+ 
+-            let ptr = entry_block.deref(ctx).get_argument(id);
++            let ptr = entry_block.deref(ctx).get_argument(ctx, id);
+ 
+             let load_info = LoadInfoOp::new(ctx, ptr);
+             info_st = Some(load_info.get_result(ctx));
+diff --git a/crates/cubecl-cpp/src/shared/signature.rs b/crates/cubecl-cpp/src/shared/signature.rs
+index da99b303..7ac34193 100644
+--- a/crates/cubecl-cpp/src/shared/signature.rs
++++ b/crates/cubecl-cpp/src/shared/signature.rs
+@@ -142,7 +142,7 @@ impl Pass for DeclareVectorTypesPass {
+                 match node {
+                     IRNode::Operation(op) if let Some(res) = op.opt_result(ctx) => ins(res),
+                     IRNode::BasicBlock(ptr) => {
+-                        for arg in ptr.deref(ctx).arguments() {
++                        for arg in ptr.deref(ctx).arguments(ctx) {
+                             ins(arg);
+                         }
+                     }
+@@ -300,7 +300,7 @@ impl<T: CppTarget> Pass for CollectIncludesPass<T> {
+                         }
+                     }
+                     IRNode::BasicBlock(ptr) => {
+-                        for arg in ptr.deref(ctx).arguments() {
++                        for arg in ptr.deref(ctx).arguments(ctx) {
+                             ins(arg);
+                         }
+                     }
+diff --git a/crates/cubecl-cpp/src/shared/ty.rs b/crates/cubecl-cpp/src/shared/ty.rs
+index 4965c847..0acf52b3 100644
+--- a/crates/cubecl-cpp/src/shared/ty.rs
++++ b/crates/cubecl-cpp/src/shared/ty.rs
+@@ -240,7 +240,7 @@ fn find_global_constness(ctx: &Context, idx: usize) -> bool {
+     let num_args = func.get_entry_block(ctx).deref(ctx).get_num_arguments();
+     let arg_pos = (0..num_args)
+         .filter_map(|i| Some((i, func.get_arg_attr(ctx, i, &ATTR_BUFFER_BINDING)?)))
+-        .find(|(_, binding): &(_, Ref<'_, BufferBindingAttr>)| binding.buffer_pos == idx)
++        .find(|(_, binding): &(_, &BufferBindingAttr)| binding.buffer_pos == idx)
+         .expect("Should exist");
+     let io = func.get_arg_attr::<BufferIOAttr>(ctx, arg_pos.0, &ATTR_BUFFER_IO);
+     !io.expect("Should have IO attribute").is_writable()
+diff --git a/crates/cubecl-cpu/src/runtime.rs b/crates/cubecl-cpu/src/runtime.rs
+index c27edd83..ef8f7999 100644
+--- a/crates/cubecl-cpu/src/runtime.rs
++++ b/crates/cubecl-cpu/src/runtime.rs
+@@ -117,8 +117,11 @@ fn host_cpu_name(system: &System) -> String {
+ pub fn host_device_fingerprint(f16_evaluation: F16Evaluation) -> String {
+     let (cpu_name, cpu_features) = cubecl_llvm::host_cpu_target();
+     let features_hash = cubecl_common::hash::StableHasher::hash_one(&cpu_features);
++    // The pliron -> Cranelift path (`CUBECL_PLIRON_CLIF`) emits different objects than LLVM:
++    // never share a persistent cache between the two.
++    let path = if std::env::var_os("CUBECL_PLIRON_CLIF").is_some() { "-clif" } else { "" };
+     format!(
+-        "{}-{}-{features_hash:032x}-f16_{f16_evaluation}",
++        "{}-{}-{features_hash:032x}-f16_{f16_evaluation}{path}",
+         std::env::consts::ARCH,
+         cpu_name
+     )
+diff --git a/crates/cubecl-ir/src/attributes/entrypoint.rs b/crates/cubecl-ir/src/attributes/entrypoint.rs
+index 96d345d6..97be5b44 100644
+--- a/crates/cubecl-ir/src/attributes/entrypoint.rs
++++ b/crates/cubecl-ir/src/attributes/entrypoint.rs
+@@ -1,9 +1,7 @@
+-use core::cell::{Ref, RefMut};
+-
+ use alloc::boxed::Box;
+ use derive_new::new;
+ use pliron::{
+-    attribute::{AttrObj, Attribute, AttributeDict},
++    attribute::{AttrObj, Attribute},
+     builtin::{
+         attributes::{DictAttr, UnitAttr, VecAttr},
+         ops::FuncOp,
+@@ -104,7 +102,7 @@ pub trait EntrypointInterface {
+         let self_op = self.get_operation().deref(ctx);
+         let s_attr = self_op
+             .attributes
+-            .get::<EntrypointAbiAttr>(&ATTR_KEY_ENTRY_POINT);
++            .get::<EntrypointAbiAttr>(ctx, &ATTR_KEY_ENTRY_POINT);
+         s_attr.cloned()
+     }
+ 
+@@ -113,7 +111,7 @@ pub trait EntrypointInterface {
+         let mut self_op = self.get_operation().deref_mut(ctx);
+         self_op
+             .attributes
+-            .set(ATTR_KEY_ENTRY_POINT.clone(), entry_point_abi);
++            .set(ctx, ATTR_KEY_ENTRY_POINT.clone(), entry_point_abi);
+     }
+ }
+ 
+@@ -131,13 +129,10 @@ dict_key!(ATTR_KEY_RES_ATTRS, "res_attrs");
+ /// | arg_attrs | [ATTR_KEY_ARG_ATTRS] | [VecAttr](pliron::builtin::attributes::VecAttr) |
+ /// | res_attrs | [ATTR_KEY_RES_ATTRS] | [VecAttr](pliron::builtin::attributes::VecAttr) |
+ pub trait FuncInterface: Op {
+-    fn get_arg_attrs<'a>(&self, ctx: &'a Context, arg_idx: usize) -> Option<Ref<'a, DictAttr>> {
++    fn get_arg_attrs<'a>(&self, ctx: &'a Context, arg_idx: usize) -> Option<&'a DictAttr> {
+         let self_op = self.get_operation().deref(ctx);
+-        Ref::filter_map(self_op, |self_op| {
+-            let args_attrs = self_op.attributes.get::<VecAttr>(&ATTR_KEY_ARG_ATTRS)?;
+-            args_attrs.0.get(arg_idx)?.downcast_ref()
+-        })
+-        .ok()
++        let args_attrs = self_op.attributes.get::<VecAttr>(ctx, &ATTR_KEY_ARG_ATTRS)?;
++        args_attrs.0.get(arg_idx)?.downcast_ref()
+     }
+ 
+     fn get_arg_attr<'a, T: Attribute>(
+@@ -145,33 +140,20 @@ pub trait FuncInterface: Op {
+         ctx: &'a Context,
+         arg_idx: usize,
+         key: &Identifier,
+-    ) -> Option<Ref<'a, T>> {
++    ) -> Option<&'a T> {
+         let arg_attrs = self.get_arg_attrs(ctx, arg_idx)?;
+-        Ref::filter_map(arg_attrs, |arg_attrs| {
+-            arg_attrs.lookup(key).and_then(|attr| attr.downcast_ref())
+-        })
+-        .ok()
++        arg_attrs.0.get_obj(ctx, key).and_then(|attr| attr.downcast_ref())
+     }
+ 
+     fn has_arg_attr(&self, ctx: &Context, arg_idx: usize, key: &Identifier) -> bool {
+         self.get_arg_attrs(ctx, arg_idx)
+-            .is_some_and(|arg_attrs| arg_attrs.lookup(key).is_some())
+-    }
+-
+-    fn get_arg_attrs_mut<'a>(&self, ctx: &'a Context, arg_idx: usize) -> RefMut<'a, DictAttr> {
+-        let self_op = self.get_operation().deref_mut(ctx);
+-        RefMut::map(self_op, |self_op| {
+-            get_arg_or_init_mut(&mut self_op.attributes, arg_idx)
+-        })
++            .is_some_and(|arg_attrs| arg_attrs.0.get_obj(ctx, key).is_some())
+     }
+ 
+-    fn get_res_attrs<'a>(&self, ctx: &'a Context, res_idx: usize) -> Option<Ref<'a, DictAttr>> {
++    fn get_res_attrs<'a>(&self, ctx: &'a Context, res_idx: usize) -> Option<&'a DictAttr> {
+         let self_op = self.get_operation().deref(ctx);
+-        Ref::filter_map(self_op, |self_op| {
+-            let res_attrs = self_op.attributes.get::<VecAttr>(&ATTR_KEY_RES_ATTRS)?;
+-            res_attrs.0.get(res_idx)?.downcast_ref()
+-        })
+-        .ok()
++        let res_attrs = self_op.attributes.get::<VecAttr>(ctx, &ATTR_KEY_RES_ATTRS)?;
++        res_attrs.0.get(res_idx)?.downcast_ref()
+     }
+ 
+     fn get_res_attr<'a, T: Attribute>(
+@@ -179,61 +161,82 @@ pub trait FuncInterface: Op {
+         ctx: &'a Context,
+         res_idx: usize,
+         key: &Identifier,
+-    ) -> Option<Ref<'a, T>> {
++    ) -> Option<&'a T> {
+         let res_attrs = self.get_res_attrs(ctx, res_idx)?;
+-        Ref::filter_map(res_attrs, |res_attrs| {
+-            res_attrs.lookup(key).and_then(|attr| attr.downcast_ref())
+-        })
+-        .ok()
++        res_attrs.0.get_obj(ctx, key).and_then(|attr| attr.downcast_ref())
+     }
+ 
+     fn has_res_attr(&self, ctx: &Context, res_idx: usize, key: &Identifier) -> bool {
+         self.get_res_attrs(ctx, res_idx)
+-            .is_some_and(|res_attrs| res_attrs.lookup(key).is_some())
+-    }
+-
+-    fn get_res_attrs_mut<'a>(&self, ctx: &'a Context, res_idx: usize) -> RefMut<'a, DictAttr> {
+-        let self_op = self.get_operation().deref_mut(ctx);
+-        RefMut::map(self_op, |self_op| {
+-            get_res_or_init_mut(&mut self_op.attributes, res_idx)
+-        })
++            .is_some_and(|res_attrs| res_attrs.0.get_obj(ctx, key).is_some())
+     }
+ 
+     fn set_arg_attrs(&self, ctx: &Context, arg_idx: usize, dict: DictAttr) {
+-        *self.get_arg_attrs_mut(ctx, arg_idx) = dict;
++        modify_dict(self.get_operation(), ctx, &ATTR_KEY_ARG_ATTRS, arg_idx, |d| *d = dict);
+     }
+ 
+     fn set_arg_attr(&self, ctx: &Context, arg_idx: usize, key: &Identifier, value: AttrObj) {
+-        self.get_arg_attrs_mut(ctx, arg_idx).insert(key, value);
++        modify_dict(self.get_operation(), ctx, &ATTR_KEY_ARG_ATTRS, arg_idx, |d| {
++            d.0.set_obj(ctx, key.clone(), value)
++        });
+     }
+ 
+     fn set_arg_attr_unit(&self, ctx: &Context, arg_idx: usize, key: &Identifier) {
+-        self.get_arg_attrs_mut(ctx, arg_idx)
+-            .insert(key, Box::new(UnitAttr::new()));
++        self.set_arg_attr(ctx, arg_idx, key, Box::new(UnitAttr::new()));
+     }
+ 
+     fn remove_arg_attr(&self, ctx: &Context, arg_idx: usize, key: &Identifier) {
+-        self.get_arg_attrs_mut(ctx, arg_idx).remove(key);
++        modify_dict(self.get_operation(), ctx, &ATTR_KEY_ARG_ATTRS, arg_idx, |d| {
++            d.0.remove(key);
++        });
+     }
+ 
+     fn set_res_attrs(&self, ctx: &Context, res_idx: usize, dict: DictAttr) {
+-        *self.get_res_attrs_mut(ctx, res_idx) = dict;
++        modify_dict(self.get_operation(), ctx, &ATTR_KEY_RES_ATTRS, res_idx, |d| *d = dict);
+     }
+ 
+     fn set_res_attr(&self, ctx: &Context, res_idx: usize, key: &Identifier, value: AttrObj) {
+-        self.get_res_attrs_mut(ctx, res_idx).insert(key, value);
++        modify_dict(self.get_operation(), ctx, &ATTR_KEY_RES_ATTRS, res_idx, |d| {
++            d.0.set_obj(ctx, key.clone(), value)
++        });
+     }
+ 
+     fn remove_res_attr(&self, ctx: &Context, res_idx: usize, key: &Identifier) {
+-        self.get_res_attrs_mut(ctx, res_idx).remove(key);
++        modify_dict(self.get_operation(), ctx, &ATTR_KEY_RES_ATTRS, res_idx, |d| {
++            d.0.remove(key);
++        });
+     }
+ 
+     fn set_res_attr_unit(&self, ctx: &Context, res_idx: usize, key: &Identifier) {
+-        self.get_res_attrs_mut(ctx, res_idx)
+-            .insert(key, Box::new(UnitAttr::new()));
++        self.set_res_attr(ctx, res_idx, key, Box::new(UnitAttr::new()));
+     }
+ }
+ 
++impl FuncInterface for FuncOp {}
++
++/// Attributes are interned and immutable: read the `VecAttr` under `key`,
++/// edit the `idx`-th `DictAttr` of a copy (creating it and any lower slots
++/// empty), and store the copy back.
++fn modify_dict(
++    op: Ptr<Operation>,
++    ctx: &Context,
++    key: &Identifier,
++    idx: usize,
++    f: impl FnOnce(&mut DictAttr),
++) {
++    let mut op = op.deref_mut(ctx);
++    let mut vec = op
++        .attributes
++        .get::<VecAttr>(ctx, key)
++        .cloned()
++        .unwrap_or_else(|| VecAttr::new(vec![]));
++    while vec.0.len() <= idx {
++        vec.0.push(Box::new(DictAttr::new(ctx, vec![])));
++    }
++    f(vec.0[idx].downcast_mut::<DictAttr>().expect("Should be `DictAttr`"));
++    op.attributes.set(ctx, key.clone(), vec);
++}
++
+ /// The per-buffer IO the visibility pass stamped on `func`'s arguments,
+ /// indexed by buffer position — the vector a compiled kernel carries to the
+ /// launch site.
+@@ -265,41 +268,3 @@ pub fn buffer_io_by_position(ctx: &Context, func: FuncOp) -> alloc::vec::Vec<Buf
+     }
+     io
+ }
+-
+-fn get_arg_or_init_mut(dict: &mut AttributeDict, arg_idx: usize) -> &mut DictAttr {
+-    let args_attrs = attr_get_or_insert_mut(dict, &ATTR_KEY_ARG_ATTRS, || VecAttr::new(vec![]))
+-        .expect("Should be `VecAttr`");
+-    vec_get_or_insert_mut(args_attrs, arg_idx, || DictAttr::new(vec![]))
+-        .expect("Should be `DictAttr`")
+-}
+-
+-fn get_res_or_init_mut(dict: &mut AttributeDict, arg_idx: usize) -> &mut DictAttr {
+-    let res_attrs = attr_get_or_insert_mut(dict, &ATTR_KEY_RES_ATTRS, || VecAttr::new(vec![]))
+-        .expect("Should be `VecAttr`");
+-    vec_get_or_insert_mut(res_attrs, arg_idx, || DictAttr::new(vec![]))
+-        .expect("Should be `DictAttr`")
+-}
+-
+-fn attr_get_or_insert_mut<'a, T: Attribute>(
+-    dict: &'a mut AttributeDict,
+-    key: &Identifier,
+-    init: impl FnOnce() -> T,
+-) -> Option<&'a mut T> {
+-    if !dict.0.contains_key(key) {
+-        dict.set(key.clone(), init());
+-    }
+-    dict.get_mut(key)
+-}
+-
+-fn vec_get_or_insert_mut<T: Attribute>(
+-    vec: &mut VecAttr,
+-    idx: usize,
+-    mut init: impl FnMut() -> T,
+-) -> Option<&mut T> {
+-    if vec.0.len() <= idx {
+-        vec.0.resize_with(idx + 1, || Box::new(init()));
+-    }
+-    vec.0[idx].downcast_mut()
+-}
+-
+-impl FuncInterface for FuncOp {}
+diff --git a/crates/cubecl-ir/src/convert.rs b/crates/cubecl-ir/src/convert.rs
+index 26542de1..cfb832b7 100644
+--- a/crates/cubecl-ir/src/convert.rs
++++ b/crates/cubecl-ir/src/convert.rs
+@@ -38,7 +38,7 @@ pub fn lift_closure(ctx: &Context, func: &FuncOp) -> Vec<Value> {
+ 
+     for capture in captures.iter() {
+         let id = func.push_argument(ctx, capture.get_type(ctx));
+-        let arg_value = entry.deref(ctx).get_argument(id);
++        let arg_value = entry.deref(ctx).get_argument(ctx, id);
+         capture.replace_some_uses_with(
+             ctx,
+             |ctx, r#use| op_is_in_func(ctx, func_op, r#use.user_op()),
+diff --git a/crates/cubecl-ir/src/dialect/asm.rs b/crates/cubecl-ir/src/dialect/asm.rs
+index 40c323e6..841b8404 100644
+--- a/crates/cubecl-ir/src/dialect/asm.rs
++++ b/crates/cubecl-ir/src/dialect/asm.rs
+@@ -1,4 +1,3 @@
+-use core::cell::Ref;
+ use std::string::String;
+ 
+ use derive_more::From;
+@@ -105,7 +104,7 @@ impl InlineAsmOp {
+         this
+     }
+ 
+-    pub fn asm<'a>(&self, ctx: &'a Context) -> Ref<'a, StringAttr> {
++    pub fn asm<'a>(&self, ctx: &'a Context) -> &'a StringAttr {
+         self.get_attr_cube_asm_asm(ctx).unwrap()
+     }
+ 
+@@ -125,11 +124,8 @@ impl InlineAsmOp {
+         self.set_attr_cube_asm_pure(ctx, UnitAttr::new());
+     }
+ 
+-    pub fn memory_clobbers<'a>(&self, ctx: &'a Context) -> Ref<'a, MemoryClobbers> {
+-        Ref::map(
+-            self.get_attr_cube_asm_memory_clobbers(ctx).unwrap(),
+-            |attr| &attr.0,
+-        )
++    pub fn memory_clobbers<'a>(&self, ctx: &'a Context) -> &'a MemoryClobbers {
++        &self.get_attr_cube_asm_memory_clobbers(ctx).unwrap().0
+     }
+ 
+     pub fn out_specs(&self, ctx: &Context) -> Vec<RegSpec> {
+diff --git a/crates/cubecl-ir/src/dialect/base.rs b/crates/cubecl-ir/src/dialect/base.rs
+index 9b9ffdde..ada22992 100644
+--- a/crates/cubecl-ir/src/dialect/base.rs
++++ b/crates/cubecl-ir/src/dialect/base.rs
+@@ -29,7 +29,7 @@ pub trait OperationPtrExt: Sized {
+     fn regions(self, ctx: &Context) -> Vec<Ptr<Region>>;
+     fn result_names(self, ctx: &Context) -> Vec<Option<Identifier>>;
+     fn opt_result(self, ctx: &Context) -> Option<Value>;
+-    fn get_attr<'a, T: Attribute>(self, ctx: &'a Context, key: &Identifier) -> Option<Ref<'a, T>>;
++    fn get_attr<'a, T: Attribute>(self, ctx: &'a Context, key: &Identifier) -> Option<&'a T>;
+     fn set_attr<T: Attribute>(self, ctx: &Context, key: &Identifier, value: T);
+     fn parent_module(self, ctx: &Context) -> ModuleOp;
+ 
+@@ -66,43 +66,43 @@ impl OperationPtrExt for Ptr<Operation> {
+         TraitOp::try_from_op(self, ctx)
+     }
+     fn operand(self, ctx: &Context, idx: usize) -> Value {
+-        Operation::get_operand(&self.deref(ctx), idx)
++        Operation::get_operand(&self.deref(ctx), ctx, idx)
+     }
+     fn operand_as_use(self, ctx: &Context, idx: usize) -> Use<Value> {
+-        Operation::get_operand_as_use(&self.deref(ctx), idx)
++        Operation::get_operand_as_use(&self.deref(ctx), ctx, idx)
+     }
+     fn operands(self, ctx: &Context) -> Vec<Value> {
+-        self.deref(ctx).operands().collect()
++        self.deref(ctx).operands(ctx).collect()
+     }
+     fn operands_as_uses(self, ctx: &Context) -> Vec<Use<Value>> {
+-        self.deref(ctx).operands_as_uses().collect()
++        self.deref(ctx).operands_as_uses(ctx).collect()
+     }
+     fn result(self, ctx: &Context) -> Value {
+-        Operation::get_result(&self.deref(ctx), 0)
++        Operation::get_result(&self.deref(ctx), ctx, 0)
+     }
+     fn results(self, ctx: &Context) -> Vec<Value> {
+-        self.deref(ctx).results().collect()
++        self.deref(ctx).results(ctx).collect()
+     }
+     fn result_types(self, ctx: &Context) -> Vec<TypeHandle> {
+-        self.deref(ctx).result_types().collect()
++        self.deref(ctx).result_types(ctx).collect()
+     }
+     fn regions(self, ctx: &Context) -> Vec<Ptr<Region>> {
+-        self.deref(ctx).regions().collect()
++        self.deref(ctx).regions(ctx).collect()
+     }
+     fn result_names(self, ctx: &Context) -> Vec<Option<Identifier>> {
+         self.deref(ctx)
+-            .results()
++            .results(ctx)
+             .map(|it| it.given_name(ctx))
+             .collect()
+     }
+     fn opt_result(self, ctx: &Context) -> Option<Value> {
+-        self.deref(ctx).results().next()
++        self.deref(ctx).results(ctx).next()
+     }
+-    fn get_attr<'a, T: Attribute>(self, ctx: &'a Context, key: &Identifier) -> Option<Ref<'a, T>> {
+-        Ref::filter_map(self.deref(ctx), |op| op.attributes.get(key)).ok()
++    fn get_attr<'a, T: Attribute>(self, ctx: &'a Context, key: &Identifier) -> Option<&'a T> {
++        self.deref(ctx).attributes.get(ctx, key)
+     }
+     fn set_attr<T: Attribute>(self, ctx: &Context, key: &Identifier, value: T) {
+-        self.deref_mut(ctx).attributes.set(key.clone(), value);
++        self.deref_mut(ctx).attributes.set(ctx, key.clone(), value);
+     }
+     fn parent_module(self, ctx: &Context) -> ModuleOp {
+         if self.is_op::<ModuleOp>(ctx) {
+@@ -131,7 +131,7 @@ impl OperationPtrExt for Ptr<Operation> {
+ 
+ impl OperationExt for Operation {
+     fn immediately_nested_ops(&self, ctx: &Context) -> impl Iterator<Item = Ptr<Operation>> {
+-        self.regions()
++        self.regions(ctx)
+             .flat_map(|region| region.deref(ctx).iter(ctx))
+             .flat_map(|block| block.deref(ctx).iter(ctx))
+     }
+@@ -139,7 +139,7 @@ impl OperationExt for Operation {
+ 
+ impl BlockPtrExt for Ptr<BasicBlock> {
+     fn arguments(self, ctx: &Context) -> Vec<Value> {
+-        self.deref(ctx).arguments().collect()
++        self.deref(ctx).arguments(ctx).collect()
+     }
+ 
+     fn is_empty(&self, ctx: &Context) -> bool {
+diff --git a/crates/cubecl-ir/src/dialect/branch.rs b/crates/cubecl-ir/src/dialect/branch.rs
+index 4d183f07..9ee18740 100644
+--- a/crates/cubecl-ir/src/dialect/branch.rs
++++ b/crates/cubecl-ir/src/dialect/branch.rs
+@@ -81,13 +81,13 @@ impl Verify for YieldOp {
+ 
+         let expected_types: Vec<_> = parent_op
+             .deref(ctx)
+-            .results()
++            .results(ctx)
+             .map(|r| r.get_type(ctx))
+             .collect();
+         let actual_types: Vec<_> = self
+             .get_operation()
+             .deref(ctx)
+-            .operands()
++            .operands(ctx)
+             .map(|o| o.get_type(ctx))
+             .collect();
+ 
+@@ -122,12 +122,12 @@ impl ConditionOp {
+     }
+ 
+     pub fn forward_values(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().skip(1).collect()
++        self.get_operation().deref(ctx).operands(ctx).skip(1).collect()
+     }
+ 
+     pub fn forward_value_uses(&self, ctx: &Context) -> Vec<Use<Value>> {
+         let op = self.get_operation().deref(ctx);
+-        op.operands_as_uses().skip(1).collect()
++        op.operands_as_uses(ctx).skip(1).collect()
+     }
+ }
+ 
+@@ -139,7 +139,7 @@ impl Verify for ConditionOp {
+ 
+         let expected_types: Vec<_> = parent_op
+             .deref(ctx)
+-            .results()
++            .results(ctx)
+             .map(|r| r.get_type(ctx))
+             .collect();
+         let actual_types: Vec<_> = self
+@@ -168,7 +168,7 @@ impl RegionBranchTerminatorOpInterface for ConditionOp {
+         operands: &[Option<AttrObj>],
+     ) -> Vec<RegionSuccessor> {
+         let while_op = self.get_operation().deref(ctx).get_parent_op(ctx).unwrap();
+-        let after_region = while_op.deref(ctx).get_region(1).into();
++        let after_region = while_op.deref(ctx).get_region(ctx, 1).into();
+         let Some(attr) = operands[0].as_ref() else {
+             return vec![after_region, RegionSuccessor::AfterOp];
+         };
+@@ -226,7 +226,7 @@ impl ReturnOp {
+     }
+ 
+     pub fn value(&self, ctx: &Context) -> Option<Value> {
+-        self.get_operation().deref(ctx).results().next()
++        self.get_operation().deref(ctx).results(ctx).next()
+     }
+ }
+ 
+@@ -262,11 +262,11 @@ impl IfOp {
+             2,
+         );
+ 
+-        let then_region = op.deref_mut(ctx).get_region(0);
++        let then_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let then_body = BasicBlock::new(ctx, Some("then".try_into().unwrap()), vec![]);
+         then_body.insert_at_front(then_region, ctx);
+ 
+-        let else_region = op.deref_mut(ctx).get_region(1);
++        let else_region = op.deref_mut(ctx).get_region(ctx, 1);
+         let else_body = BasicBlock::new(ctx, Some("else".try_into().unwrap()), vec![]);
+         else_body.insert_at_front(else_region, ctx);
+ 
+@@ -274,11 +274,11 @@ impl IfOp {
+     }
+ 
+     pub fn condition(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn then_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn then_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -286,7 +286,7 @@ impl IfOp {
+     }
+ 
+     pub fn else_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(1)
++        self.get_operation().deref(ctx).get_region(ctx, 1)
+     }
+ 
+     pub fn else_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -457,7 +457,7 @@ impl SwitchOp {
+             1,
+         );
+ 
+-        let default_region = op.deref_mut(ctx).get_region(0);
++        let default_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let default_body = BasicBlock::new(ctx, Some("default".try_into().unwrap()), vec![]);
+         default_body.insert_at_front(default_region, ctx);
+ 
+@@ -465,11 +465,11 @@ impl SwitchOp {
+     }
+ 
+     pub fn value(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn default_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn default_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -497,7 +497,7 @@ impl SwitchOp {
+         let cases = self.get_attr_branch_switch_cases(ctx).unwrap().clone().0;
+         let out = (0..cases.len()).map(|i| {
+             let value = cases[i].clone();
+-            let block = self.get_operation().deref(ctx).get_region(i + 1);
++            let block = self.get_operation().deref(ctx).get_region(ctx, i + 1);
+             (value, block)
+         });
+         out.collect()
+@@ -509,7 +509,7 @@ impl SwitchOp {
+ 
+     pub fn get_case_destinations(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
+         let op = self.get_operation().deref(ctx);
+-        (1..op.regions().count())
++        (1..op.regions(ctx).count())
+             .map(|i| self.get_body(ctx, i))
+             .collect()
+     }
+@@ -592,7 +592,7 @@ impl RegionBranchOpInterface for SwitchOp {
+         match pred {
+             RegionPredecessor::Parent => {
+                 let op = self.get_operation().deref(ctx);
+-                op.regions().map(Into::into).collect()
++                op.regions(ctx).map(Into::into).collect()
+             }
+             RegionPredecessor::Terminator(_) => {
+                 vec![RegionSuccessor::AfterOp]
+@@ -667,7 +667,7 @@ impl RangeLoopOp {
+             1,
+         );
+ 
+-        let body_region = op.deref_mut(ctx).get_region(0);
++        let body_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let body = BasicBlock::new(ctx, Some("body".try_into().unwrap()), vec![iter_ty]);
+         body.insert_at_front(body_region, ctx);
+ 
+@@ -675,19 +675,19 @@ impl RangeLoopOp {
+     }
+ 
+     pub fn iter_var(&self, ctx: &Context) -> Value {
+-        self.loop_body(ctx).deref(ctx).get_argument(0)
++        self.loop_body(ctx).deref(ctx).get_argument(ctx, 0)
+     }
+ 
+     pub fn start(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn end(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn step(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(2)
++        self.get_operation().deref(ctx).get_operand(ctx, 2)
+     }
+ 
+     pub fn constant_step(&self, ctx: &Context) -> Option<APInt> {
+@@ -695,7 +695,7 @@ impl RangeLoopOp {
+     }
+ 
+     pub fn loop_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn loop_body(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -800,11 +800,11 @@ impl WhileOp {
+     pub fn new(ctx: &mut Context) -> Self {
+         let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 2);
+ 
+-        let before_region = op.deref_mut(ctx).get_region(0);
++        let before_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let before = BasicBlock::new(ctx, Some("before".try_into().unwrap()), vec![]);
+         before.insert_at_front(before_region, ctx);
+ 
+-        let after_region = op.deref_mut(ctx).get_region(1);
++        let after_region = op.deref_mut(ctx).get_region(ctx, 1);
+         let after = BasicBlock::new(ctx, Some("after".try_into().unwrap()), vec![]);
+         after.insert_at_front(after_region, ctx);
+ 
+diff --git a/crates/cubecl-ir/src/dialect/cf.rs b/crates/cubecl-ir/src/dialect/cf.rs
+index 8e20cf4c..e915b29b 100644
+--- a/crates/cubecl-ir/src/dialect/cf.rs
++++ b/crates/cubecl-ir/src/dialect/cf.rs
+@@ -153,13 +153,13 @@ impl Printable for BranchConditionalOp {
+             "{} if {} ^{}({}) else ^{}({})",
+             Self::get_opid_static(),
+             condition.print(ctx, state),
+-            op.get_successor(0).deref(ctx).unique_name(ctx),
++            op.get_successor(ctx, 0).deref(ctx).unique_name(ctx),
+             iter_with_sep(
+                 true_dest_opds.iter(),
+                 pliron::printable::ListSeparator::CharSpace(',')
+             )
+             .print(ctx, state),
+-            op.get_successor(1).deref(ctx).unique_name(ctx),
++            op.get_successor(ctx, 1).deref(ctx).unique_name(ctx),
+             iter_with_sep(
+                 false_dest_opds.iter(),
+                 pliron::printable::ListSeparator::CharSpace(',')
+@@ -352,7 +352,7 @@ impl Printable for SwitchOp {
+         let value = self.get_operand_value(ctx);
+ 
+         let default_successor = op
+-            .successors()
++            .successors(ctx)
+             .next()
+             .expect("SwitchOp must have at least one successor");
+         let num_total_successors = op.get_num_successors();
+@@ -491,7 +491,7 @@ impl SwitchOp {
+ 
+         let op = self.get_operation().deref(ctx);
+         // Skip the first one, which is the default successor.
+-        let successors = op.successors().skip(1);
++        let successors = op.successors(ctx).skip(1);
+ 
+         successors
+             .zip(case_values.0.iter())
+@@ -510,7 +510,7 @@ impl SwitchOp {
+ 
+     /// Get the default destination of this switch operation.
+     pub fn default_dest(&self, ctx: &Context) -> Ptr<BasicBlock> {
+-        self.get_operation().deref(ctx).get_successor(0)
++        self.get_operation().deref(ctx).get_successor(ctx, 0)
+     }
+ 
+     /// Get the operands to pass to the default destination.
+@@ -570,7 +570,7 @@ impl Verify for SwitchOp {
+ #[op_interface_impl]
+ impl BranchOpFoldInterface for BranchOp {
+     fn check_fold(&self, ctx: &Context, _operands: &[Option<AttrObj>]) -> Vec<Ptr<BasicBlock>> {
+-        self.get_operation().deref(ctx).successors().collect()
++        self.get_operation().deref(ctx).successors(ctx).collect()
+     }
+     fn fold_in_place(
+         &self,
+@@ -589,13 +589,13 @@ impl BranchConditionalOp {
+         operands: &[Option<AttrObj>],
+     ) -> Vec<usize> {
+         let Some(cond_attr) = operands.first().unwrap().as_ref() else {
+-            let num_successors = self.get_operation().deref(ctx).successors().count();
++            let num_successors = self.get_operation().deref(ctx).successors(ctx).count();
+             return (0..num_successors).collect();
+         };
+         let zero = cond_attr.downcast_ref::<ZeroAttr>().map(|_| false);
+         let bool = cond_attr.downcast_ref::<BoolAttr>().map(|it| it.0);
+         let Some(const_cond) = zero.or(bool) else {
+-            let num_successors = self.get_operation().deref(ctx).successors().count();
++            let num_successors = self.get_operation().deref(ctx).successors(ctx).count();
+             return (0..num_successors).collect();
+         };
+         let taken = if const_cond { 0 } else { 1 };
+@@ -607,7 +607,7 @@ impl BranchConditionalOp {
+ impl BranchOpFoldInterface for BranchConditionalOp {
+     fn check_fold(&self, ctx: &Context, operands: &[Option<AttrObj>]) -> Vec<Ptr<BasicBlock>> {
+         let successors: Vec<Ptr<BasicBlock>> =
+-            self.get_operation().deref(ctx).successors().collect();
++            self.get_operation().deref(ctx).successors(ctx).collect();
+ 
+         self.possible_successor_indices(ctx, operands)
+             .iter()
+@@ -629,7 +629,7 @@ impl BranchOpFoldInterface for BranchConditionalOp {
+ impl BranchOpFoldInterface for SwitchOp {
+     fn check_fold(&self, ctx: &Context, operands: &[Option<AttrObj>]) -> Vec<Ptr<BasicBlock>> {
+         let successors: Vec<Ptr<BasicBlock>> =
+-            self.get_operation().deref(ctx).successors().collect();
++            self.get_operation().deref(ctx).successors(ctx).collect();
+         let Some(cond_attr) = operands.first().and_then(|o| o.as_ref()) else {
+             return successors;
+         };
+diff --git a/crates/cubecl-ir/src/dialect/general.rs b/crates/cubecl-ir/src/dialect/general.rs
+index 895f1020..d73f9e7f 100644
+--- a/crates/cubecl-ir/src/dialect/general.rs
++++ b/crates/cubecl-ir/src/dialect/general.rs
+@@ -1,4 +1,3 @@
+-use core::cell::Ref;
+ 
+ use alloc::string::String;
+ 
+@@ -370,11 +369,11 @@ impl PrintfOp {
+         op
+     }
+ 
+-    pub fn format_string<'a>(&self, ctx: &'a Context) -> Ref<'a, StringAttr> {
++    pub fn format_string<'a>(&self, ctx: &'a Context) -> &'a StringAttr {
+         self.get_attr_cube_printf_format_string(ctx).unwrap()
+     }
+ 
+     pub fn args(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().collect()
++        self.get_operation().deref(ctx).operands(ctx).collect()
+     }
+ }
+diff --git a/crates/cubecl-ir/src/dialect/matrix.rs b/crates/cubecl-ir/src/dialect/matrix.rs
+index 0787af82..16c9cab6 100644
+--- a/crates/cubecl-ir/src/dialect/matrix.rs
++++ b/crates/cubecl-ir/src/dialect/matrix.rs
+@@ -423,7 +423,7 @@ impl ElementwiseOp {
+     }
+ 
+     pub fn closure_captures(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().skip(2).collect()
++        self.get_operation().deref(ctx).operands(ctx).skip(2).collect()
+     }
+ }
+ 
+diff --git a/crates/cubecl-ir/src/dialect/scf.rs b/crates/cubecl-ir/src/dialect/scf.rs
+index 9d6a2960..09d788d2 100644
+--- a/crates/cubecl-ir/src/dialect/scf.rs
++++ b/crates/cubecl-ir/src/dialect/scf.rs
+@@ -73,11 +73,11 @@ impl IfOp {
+             2,
+         );
+ 
+-        let then_region = op.deref_mut(ctx).get_region(0);
++        let then_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let then_body = BasicBlock::new(ctx, Some("then".try_into().unwrap()), vec![]);
+         then_body.insert_at_front(then_region, ctx);
+ 
+-        let else_region = op.deref_mut(ctx).get_region(1);
++        let else_region = op.deref_mut(ctx).get_region(ctx, 1);
+         let else_body = BasicBlock::new(ctx, Some("else".try_into().unwrap()), vec![]);
+         else_body.insert_at_front(else_region, ctx);
+ 
+@@ -85,11 +85,11 @@ impl IfOp {
+     }
+ 
+     pub fn condition(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn then_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn then_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -97,7 +97,7 @@ impl IfOp {
+     }
+ 
+     pub fn else_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(1)
++        self.get_operation().deref(ctx).get_region(ctx, 1)
+     }
+ 
+     pub fn else_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -105,7 +105,7 @@ impl IfOp {
+     }
+ 
+     pub fn get_result(&self, ctx: &Context, res_idx: usize) -> Value {
+-        self.get_operation().deref(ctx).get_result(res_idx)
++        self.get_operation().deref(ctx).get_result(ctx, res_idx)
+     }
+ 
+     pub fn results(&self, ctx: &Context) -> Vec<Value> {
+@@ -394,7 +394,7 @@ impl SwitchOp {
+             1,
+         );
+ 
+-        let default_region = op.deref_mut(ctx).get_region(0);
++        let default_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let default_body = BasicBlock::new(ctx, Some("default".try_into().unwrap()), vec![]);
+         default_body.insert_at_front(default_region, ctx);
+ 
+@@ -402,11 +402,11 @@ impl SwitchOp {
+     }
+ 
+     pub fn value(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn default_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn default_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -414,7 +414,7 @@ impl SwitchOp {
+     }
+ 
+     pub fn case_regions(&self, ctx: &Context) -> Vec<Ptr<Region>> {
+-        self.get_operation().deref(ctx).regions().skip(1).collect()
++        self.get_operation().deref(ctx).regions(ctx).skip(1).collect()
+     }
+ 
+     pub fn case_blocks(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
+@@ -445,7 +445,7 @@ impl SwitchOp {
+         let cases = self.get_attr_scf_switch_cases(ctx).unwrap().clone().0;
+         let out = (0..cases.len()).map(|i| {
+             let value = cases[i].clone();
+-            let block = self.get_operation().deref(ctx).get_region(i + 1);
++            let block = self.get_operation().deref(ctx).get_region(ctx, i + 1);
+             (value, block)
+         });
+         out.collect()
+@@ -457,7 +457,7 @@ impl SwitchOp {
+ 
+     pub fn get_case_destinations(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
+         let op = self.get_operation().deref(ctx);
+-        (1..op.regions().count())
++        (1..op.regions(ctx).count())
+             .map(|i| self.get_body(ctx, i))
+             .collect()
+     }
+@@ -543,7 +543,7 @@ impl PromotableRegionOpInterface for SwitchOp {
+         }
+ 
+         let res_idx = Operation::push_result(self.get_operation(), ctx, alloc.ty);
+-        self.get_operation().deref(ctx).get_result(res_idx)
++        self.get_operation().deref(ctx).get_result(ctx, res_idx)
+     }
+ }
+ 
+@@ -620,7 +620,7 @@ impl RegionBranchOpInterface for SwitchOp {
+         match pred {
+             RegionPredecessor::Parent => {
+                 let op = self.get_operation().deref(ctx);
+-                op.regions().map(Into::into).collect()
++                op.regions(ctx).map(Into::into).collect()
+             }
+             RegionPredecessor::Terminator(_) => {
+                 vec![RegionSuccessor::AfterOp]
+@@ -767,19 +767,19 @@ impl ForOp {
+     }
+ 
+     pub fn iter_var(&self, ctx: &Context) -> Value {
+-        self.loop_body(ctx).deref(ctx).get_argument(0)
++        self.loop_body(ctx).deref(ctx).get_argument(ctx, 0)
+     }
+ 
+     pub fn start(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn end(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn step(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(2)
++        self.get_operation().deref(ctx).get_operand(ctx, 2)
+     }
+ 
+     pub fn initial_carried_values(&self, ctx: &Context) -> Vec<Value> {
+@@ -795,11 +795,11 @@ impl ForOp {
+     }
+ 
+     pub fn carried_values(&self, ctx: &Context) -> Vec<Value> {
+-        self.loop_body(ctx).deref(ctx).arguments().skip(1).collect()
++        self.loop_body(ctx).deref(ctx).arguments(ctx).skip(1).collect()
+     }
+ 
+     pub fn get_carried_value(&self, ctx: &Context, arg_idx: usize) -> Value {
+-        self.loop_body(ctx).deref(ctx).get_argument(arg_idx + 1)
++        self.loop_body(ctx).deref(ctx).get_argument(ctx, arg_idx + 1)
+     }
+ 
+     pub fn push_carried_value(&self, ctx: &mut Context, ty: TypeHandle) -> usize {
+@@ -811,7 +811,7 @@ impl ForOp {
+     }
+ 
+     pub fn loop_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn loop_body(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -972,7 +972,7 @@ impl PromotableRegionOpInterface for ForOp {
+ 
+         self.push_initial_carried_value(ctx, reaching_def);
+         let idx = BasicBlock::push_argument(self.loop_body(ctx), ctx, alloc.ty);
+-        let new_arg = self.loop_body(ctx).deref(ctx).get_argument(idx);
++        let new_arg = self.loop_body(ctx).deref(ctx).get_argument(ctx, idx);
+         regions_to_process.insert(body_region, new_arg);
+     }
+ 
+@@ -996,7 +996,7 @@ impl PromotableRegionOpInterface for ForOp {
+         );
+ 
+         let idx = Operation::push_result(self.get_operation(), ctx, alloc.ty);
+-        self.get_operation().deref(ctx).get_result(idx)
++        self.get_operation().deref(ctx).get_result(ctx, idx)
+     }
+ }
+ 
+@@ -1134,7 +1134,7 @@ impl WhileOp {
+             2,
+         );
+ 
+-        let before_region = op.deref_mut(ctx).get_region(0);
++        let before_region = op.deref_mut(ctx).get_region(ctx, 0);
+         let before_block = BasicBlock::new(
+             ctx,
+             Some("before".try_into().unwrap()),
+@@ -1142,7 +1142,7 @@ impl WhileOp {
+         );
+         before_block.insert_at_front(before_region, ctx);
+ 
+-        let after_region = op.deref_mut(ctx).get_region(1);
++        let after_region = op.deref_mut(ctx).get_region(ctx, 1);
+         let after_block = BasicBlock::new(ctx, Some("after".try_into().unwrap()), carried_types);
+         after_block.insert_at_front(after_region, ctx);
+ 
+@@ -1162,7 +1162,7 @@ impl WhileOp {
+     }
+ 
+     pub fn get_before_carried_value(&self, ctx: &Context, arg_idx: usize) -> Value {
+-        self.before_block(ctx).deref(ctx).get_argument(arg_idx)
++        self.before_block(ctx).deref(ctx).get_argument(ctx, arg_idx)
+     }
+ 
+     pub fn push_before_carried_value(&self, ctx: &mut Context, ty: TypeHandle) -> usize {
+@@ -1174,7 +1174,7 @@ impl WhileOp {
+     }
+ 
+     pub fn get_after_carried_value(&self, ctx: &Context, arg_idx: usize) -> Value {
+-        self.after_block(ctx).deref(ctx).get_argument(arg_idx)
++        self.after_block(ctx).deref(ctx).get_argument(ctx, arg_idx)
+     }
+ 
+     pub fn push_after_carried_value(&self, ctx: &mut Context, ty: TypeHandle) -> usize {
+@@ -1186,7 +1186,7 @@ impl WhileOp {
+     }
+ 
+     pub fn before_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(0)
++        self.get_operation().deref(ctx).get_region(ctx, 0)
+     }
+ 
+     pub fn before_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -1194,7 +1194,7 @@ impl WhileOp {
+     }
+ 
+     pub fn after_region(&self, ctx: &Context) -> Ptr<Region> {
+-        self.get_operation().deref(ctx).get_region(1)
++        self.get_operation().deref(ctx).get_region(ctx, 1)
+     }
+ 
+     pub fn after_block(&self, ctx: &Context) -> Ptr<BasicBlock> {
+@@ -1259,11 +1259,11 @@ impl PromotableRegionOpInterface for WhileOp {
+         self.push_initial_carried_value(ctx, reaching_def);
+ 
+         let idx = BasicBlock::push_argument(self.before_block(ctx), ctx, alloc.ty);
+-        let new_arg = self.before_block(ctx).deref(ctx).get_argument(idx);
++        let new_arg = self.before_block(ctx).deref(ctx).get_argument(ctx, idx);
+         regions_to_process.insert(before_region, new_arg);
+ 
+         let idx = BasicBlock::push_argument(self.after_block(ctx), ctx, alloc.ty);
+-        let new_arg = self.after_block(ctx).deref(ctx).get_argument(idx);
++        let new_arg = self.after_block(ctx).deref(ctx).get_argument(ctx, idx);
+         regions_to_process.insert(after_region, new_arg);
+     }
+ 
+@@ -1280,15 +1280,15 @@ impl PromotableRegionOpInterface for WhileOp {
+         }
+ 
+         let before = self.before_block(ctx);
+-        let last_arg = before.deref(ctx).arguments().last();
++        let last_arg = before.deref(ctx).arguments(ctx).last();
+         update_terminator::<ConditionOp>(ctx, before, last_arg.unwrap(), reaching_at_block_end);
+ 
+         let after = self.after_block(ctx);
+-        let last_arg = after.deref(ctx).arguments().last();
++        let last_arg = after.deref(ctx).arguments(ctx).last();
+         update_terminator::<YieldOp>(ctx, after, last_arg.unwrap(), reaching_at_block_end);
+ 
+         let idx = Operation::push_result(self.get_operation(), ctx, alloc.ty);
+-        self.get_operation().deref(ctx).get_result(idx)
++        self.get_operation().deref(ctx).get_result(ctx, idx)
+     }
+ }
+ 
+@@ -1358,7 +1358,7 @@ impl MemorySSARegionOpInterface for WhileOp {
+ #[op_interface_impl]
+ impl RegionBranchOpInterface for WhileOp {
+     fn entry_successor_operands(&self, ctx: &Context, _: RegionSuccessor) -> Vec<Use<Value>> {
+-        self.get_operation().deref(ctx).operands_as_uses().collect()
++        self.get_operation().deref(ctx).operands_as_uses(ctx).collect()
+     }
+ 
+     fn successor_regions(&self, ctx: &Context, pred: RegionPredecessor) -> Vec<RegionSuccessor> {
+diff --git a/crates/cubecl-ir/src/dialect/spirv.rs b/crates/cubecl-ir/src/dialect/spirv.rs
+index ff8cdf67..b9d24187 100644
+--- a/crates/cubecl-ir/src/dialect/spirv.rs
++++ b/crates/cubecl-ir/src/dialect/spirv.rs
+@@ -39,17 +39,17 @@ impl LoadTensorOp {
+     }
+ 
+     pub fn buffer(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn layout(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn view(&self, ctx: &Context) -> Option<Value> {
+         let op = self.get_operation().deref(ctx);
+         if op.get_num_operands() > 2 {
+-            Some(op.get_operand(2))
++            Some(op.get_operand(ctx, 2))
+         } else {
+             None
+         }
+@@ -82,21 +82,21 @@ impl StoreTensorOp {
+     }
+ 
+     pub fn buffer(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn matrix(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn layout(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(2)
++        self.get_operation().deref(ctx).get_operand(ctx, 2)
+     }
+ 
+     pub fn view(&self, ctx: &Context) -> Option<Value> {
+         let op = self.get_operation().deref(ctx);
+         if op.get_num_operands() > 3 {
+-            Some(op.get_operand(3))
++            Some(op.get_operand(ctx, 3))
+         } else {
+             None
+         }
+@@ -136,14 +136,14 @@ impl CreateLayoutOp {
+     pub fn shape(&self, ctx: &Context) -> Vec<Value> {
+         let rank = self.rank(ctx);
+         let op = self.get_operation().deref(ctx);
+-        op.operands().take(rank).collect()
++        op.operands(ctx).take(rank).collect()
+     }
+ 
+     pub fn strides(&self, ctx: &Context) -> Option<Vec<Value>> {
+         let rank = self.rank(ctx);
+         let op = self.get_operation().deref(ctx);
+         if op.get_num_operands() > rank {
+-            Some(op.operands().skip(rank).collect())
++            Some(op.operands(ctx).skip(rank).collect())
+         } else {
+             None
+         }
+@@ -189,7 +189,7 @@ impl SliceOp {
+     }
+ 
+     pub fn layout(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn offsets(&self, ctx: &Context) -> Vec<Value> {
+diff --git a/crates/cubecl-ir/src/dialect/ssa_matrix.rs b/crates/cubecl-ir/src/dialect/ssa_matrix.rs
+index 7c2cff59..cd118ed4 100644
+--- a/crates/cubecl-ir/src/dialect/ssa_matrix.rs
++++ b/crates/cubecl-ir/src/dialect/ssa_matrix.rs
+@@ -225,7 +225,7 @@ impl ElementwiseOp {
+     }
+ 
+     pub fn closure_captures(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().skip(1).collect()
++        self.get_operation().deref(ctx).operands(ctx).skip(1).collect()
+     }
+ }
+ 
+diff --git a/crates/cubecl-ir/src/dialect/tma.rs b/crates/cubecl-ir/src/dialect/tma.rs
+index 5ee2e8d2..d4e6191a 100644
+--- a/crates/cubecl-ir/src/dialect/tma.rs
++++ b/crates/cubecl-ir/src/dialect/tma.rs
+@@ -67,19 +67,19 @@ impl TmaLoadOp {
+     }
+ 
+     pub fn barrier(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn tensor_map(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn destination(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(2)
++        self.get_operation().deref(ctx).get_operand(ctx, 2)
+     }
+ 
+     pub fn indices(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().skip(3).collect()
++        self.get_operation().deref(ctx).operands(ctx).skip(3).collect()
+     }
+ 
+     pub fn rank(&self, ctx: &Context) -> usize {
+@@ -158,22 +158,22 @@ impl TmaLoadIm2colOp {
+     }
+ 
+     pub fn barrier(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn tensor_map(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn destination(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(2)
++        self.get_operation().deref(ctx).get_operand(ctx, 2)
+     }
+ 
+     pub fn indices(&self, ctx: &Context) -> Vec<Value> {
+         let rank = self.get_attr_tma_load_im2col_rank(ctx).unwrap().0;
+         self.get_operation()
+             .deref(ctx)
+-            .operands()
++            .operands(ctx)
+             .skip(3)
+             .take(rank)
+             .collect()
+@@ -183,7 +183,7 @@ impl TmaLoadIm2colOp {
+         let rank = self.get_attr_tma_load_im2col_rank(ctx).unwrap().0;
+         self.get_operation()
+             .deref(ctx)
+-            .operands()
++            .operands(ctx)
+             .skip(3 + rank)
+             .collect()
+     }
+@@ -256,15 +256,15 @@ impl TmaStoreOp {
+     }
+ 
+     pub fn source(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(0)
++        self.get_operation().deref(ctx).get_operand(ctx, 0)
+     }
+ 
+     pub fn tensor_map(&self, ctx: &Context) -> Value {
+-        self.get_operation().deref(ctx).get_operand(1)
++        self.get_operation().deref(ctx).get_operand(ctx, 1)
+     }
+ 
+     pub fn indices(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().skip(2).collect()
++        self.get_operation().deref(ctx).operands(ctx).skip(2).collect()
+     }
+ 
+     pub fn rank(&self, ctx: &Context) -> usize {
+diff --git a/crates/cubecl-ir/src/dialect/vector.rs b/crates/cubecl-ir/src/dialect/vector.rs
+index 81b5c5b6..761bd0ac 100644
+--- a/crates/cubecl-ir/src/dialect/vector.rs
++++ b/crates/cubecl-ir/src/dialect/vector.rs
+@@ -50,7 +50,7 @@ impl CompositeConstructOp {
+     }
+ 
+     pub fn values(&self, ctx: &Context) -> Vec<Value> {
+-        self.get_operation().deref(ctx).operands().collect()
++        self.get_operation().deref(ctx).operands(ctx).collect()
+     }
+ }
+ 
+diff --git a/crates/cubecl-ir/src/interfaces/aliasing.rs b/crates/cubecl-ir/src/interfaces/aliasing.rs
+index f094b945..78e7b876 100644
+--- a/crates/cubecl-ir/src/interfaces/aliasing.rs
++++ b/crates/cubecl-ir/src/interfaces/aliasing.rs
+@@ -26,8 +26,8 @@ pub trait PointerExt {
+     fn get_root_value(&self, ctx: &Context) -> Value {
+         let index = self.find_root_index(ctx);
+         match self.get_root_defining_entity(ctx) {
+-            DefiningEntity::Op(op) => op.deref(ctx).get_result(index),
+-            DefiningEntity::Block(block) => block.deref(ctx).get_argument(index),
++            DefiningEntity::Op(op) => op.deref(ctx).get_result(ctx, index),
++            DefiningEntity::Block(block) => block.deref(ctx).get_argument(ctx, index),
+         }
+     }
+ }
+diff --git a/crates/cubecl-ir/src/interfaces/control_flow.rs b/crates/cubecl-ir/src/interfaces/control_flow.rs
+index 28001ef2..84137e40 100644
+--- a/crates/cubecl-ir/src/interfaces/control_flow.rs
++++ b/crates/cubecl-ir/src/interfaces/control_flow.rs
+@@ -426,7 +426,7 @@ impl dyn RegionBranchOpInterface {
+ 
+ pub fn all_region_predecessors(op: Ptr<Operation>, ctx: &Context) -> Vec<RegionPredecessor> {
+     let mut predecessors = vec![RegionPredecessor::Parent];
+-    for region in op.deref(ctx).regions() {
++    for region in op.deref(ctx).regions(ctx) {
+         for block in region.deref(ctx).iter(ctx) {
+             if let Some(term) = block.deref(ctx).get_terminator(ctx)
+                 && let Some(term) =
+diff --git a/crates/cubecl-ir/src/interfaces/traits.rs b/crates/cubecl-ir/src/interfaces/traits.rs
+index a80b5060..a5cc0b68 100644
+--- a/crates/cubecl-ir/src/interfaces/traits.rs
++++ b/crates/cubecl-ir/src/interfaces/traits.rs
+@@ -129,7 +129,7 @@ macro_rules! ReturnLike {
+         #[::pliron::derive::op_interface_impl]
+         impl $crate::interfaces::control_flow::RegionBranchTerminatorOpInterface for $ty {
+             fn successor_operands(&self, ctx: &Context, _: RegionSuccessor) -> Vec<Use<Value>> {
+-                self.get_operation().deref(ctx).operands_as_uses().collect()
++                self.get_operation().deref(ctx).operands_as_uses(ctx).collect()
+             }
+         }
+ 
+@@ -232,7 +232,7 @@ macro_rules! SymbolVisibility {
+                 let op = self.get_operation().deref(ctx);
+                 let attr: Option<&$crate::attributes::SymbolVisibilityAttr> = op
+                     .attributes
+-                    .get(&$crate::interfaces::traits::ATTR_KEY_SYM_VISIBILITY);
++                    .get(ctx, &$crate::interfaces::traits::ATTR_KEY_SYM_VISIBILITY);
+                 attr.map(|it| it.0)
+                     .unwrap_or($crate::interfaces::control_flow::SymbolVisibility::Public)
+             }
+@@ -245,6 +245,7 @@ macro_rules! SymbolVisibility {
+                 use $crate::pliron::op::Op;
+                 let mut op = self.get_operation().deref_mut(ctx);
+                 op.attributes.set(
++                    ctx,
+                     $crate::interfaces::traits::ATTR_KEY_SYM_VISIBILITY.clone(),
+                     $crate::attributes::SymbolVisibilityAttr(visibility),
+                 );
+diff --git a/crates/cubecl-ir/src/interfaces/uniformity.rs b/crates/cubecl-ir/src/interfaces/uniformity.rs
+index efa83e3c..7495e721 100644
+--- a/crates/cubecl-ir/src/interfaces/uniformity.rs
++++ b/crates/cubecl-ir/src/interfaces/uniformity.rs
+@@ -45,7 +45,7 @@ pub trait UniformRegionTerminatorOpInterface: RegionBranchTerminatorOpInterface
+         let operands = self
+             .get_operation()
+             .deref(ctx)
+-            .operands()
++            .operands(ctx)
+             .map(|_| None)
+             .collect::<SmallVec<[_; 8]>>();
+         self.successor_regions(ctx, &operands)
+diff --git a/crates/cubecl-ir/src/rewrite.rs b/crates/cubecl-ir/src/rewrite.rs
+index a1e95463..47e59490 100644
+--- a/crates/cubecl-ir/src/rewrite.rs
++++ b/crates/cubecl-ir/src/rewrite.rs
+@@ -138,7 +138,7 @@ pub fn const_operand<T: Attribute>(ctx: &Context, op: Ptr<Operation>, idx: usize
+ 
+ pub fn const_operands(ctx: &Context, op: Ptr<Operation>) -> Vec<Option<AttrObj>> {
+     op.deref(ctx)
+-        .operands()
++        .operands(ctx)
+         .map(|opd| {
+             Some(
+                 opd.defining_op()?
+@@ -451,7 +451,7 @@ pub(crate) fn operand_range_to_uses(
+     range: Range<usize>,
+ ) -> Vec<Use<Value>> {
+     let op = op.deref(ctx);
+-    range.map(|idx| op.get_operand_as_use(idx)).collect()
++    range.map(|idx| op.get_operand_as_use(ctx, idx)).collect()
+ }
+ 
+ #[macro_export]
+diff --git a/crates/cubecl-ir/src/scope.rs b/crates/cubecl-ir/src/scope.rs
+index 309c0cd9..345d52ba 100644
+--- a/crates/cubecl-ir/src/scope.rs
++++ b/crates/cubecl-ir/src/scope.rs
+@@ -286,9 +286,9 @@ impl FuncOpExt for FuncOp {
+         let new_func_ty = FunctionType::get(ctx, arg_types, res_types).to_handle();
+         self.set_attr_builtin_func_type(ctx, new_func_ty.into());
+         let mut op = self.get_operation().deref_mut(ctx);
+-        let arg_attrs = op.attributes.0.get_mut(&ATTR_KEY_ARG_ATTRS);
+-        if let Some(arg_attrs) = arg_attrs.and_then(|attr| attr.downcast_mut::<VecAttr>()) {
++        if let Some(mut arg_attrs) = op.attributes.get::<VecAttr>(ctx, &ATTR_KEY_ARG_ATTRS).cloned() {
+             arg_attrs.0.truncate(last_idx);
++            op.attributes.set(ctx, ATTR_KEY_ARG_ATTRS.clone(), arg_attrs);
+         }
+     }
+ 
+@@ -306,9 +306,11 @@ impl FuncOpExt for FuncOp {
+         self.set_attr_builtin_func_type(ctx, new_func_ty.into());
+ 
+         let mut op = self.get_operation().deref_mut(ctx);
+-        let arg_attrs = op.attributes.0.get_mut(&ATTR_KEY_ARG_ATTRS);
+-        if let Some(arg_attrs) = arg_attrs.and_then(|attr| attr.downcast_mut::<VecAttr>()) {
+-            arg_attrs.0.remove(arg_idx);
++        if let Some(mut arg_attrs) = op.attributes.get::<VecAttr>(ctx, &ATTR_KEY_ARG_ATTRS).cloned() {
++            if arg_idx < arg_attrs.0.len() {
++                arg_attrs.0.remove(arg_idx);
++            }
++            op.attributes.set(ctx, ATTR_KEY_ARG_ATTRS.clone(), arg_attrs);
+         }
+     }
+ 
+@@ -896,7 +898,7 @@ impl Scope {
+             Box::new(BufferBindingAttr::new(buffer_pos, ext_meta_pos)),
+         );
+ 
+-        entry_func.get_entry_block(ctx).deref(ctx).get_argument(id)
++        entry_func.get_entry_block(ctx).deref(ctx).get_argument(ctx, id)
+     }
+ 
+     /// Obtain the index-th tensor map
+@@ -913,12 +915,12 @@ impl Scope {
+             &ATTR_BUFFER_BINDING,
+             Box::new(BufferBindingAttr::new(buffer_pos, Some(ext_meta_pos))),
+         );
+-        entry_func.get_entry_block(ctx).deref(ctx).get_argument(id)
++        entry_func.get_entry_block(ctx).deref(ctx).get_argument(ctx, id)
+     }
+ 
+     pub fn kernel_arg(&self, idx: usize) -> Value {
+         let entry_block = self.state().entry_func.get_entry_block(self.ctx());
+-        entry_block.deref(self.ctx()).get_argument(idx)
++        entry_block.deref(self.ctx()).get_argument(self.ctx(), idx)
+     }
+ 
+     pub fn extract_field(&self, aggregate: Value, field: usize) -> Value {
+diff --git a/crates/cubecl-llvm/Cargo.toml b/crates/cubecl-llvm/Cargo.toml
+index 9d9ec621..68e426c0 100644
+--- a/crates/cubecl-llvm/Cargo.toml
++++ b/crates/cubecl-llvm/Cargo.toml
+@@ -49,7 +49,8 @@ llvm-sys = { workspace = true }
+ 
+ # Cranelift codegen path (CUBECL_PLIRON_CLIF=1): pliron LLVM dialect straight
+ # to a native object, bypassing LLVM IR entirely.
+-pliron-clif-lower = { path = "../../../purerust/rustc_codegen_pliron/pliron-clif-lower" }
++# LOCAL (pliron/kernel-jit): absolute path to the rustc_codegen_pliron checkout; see docs/cubecl-burn.md
++pliron-clif-lower = { path = "/Users/wow/code/purerust/rustc_codegen_pliron/.claude/worktrees/agent-a5b6f3bbe42f9acb7/pliron-clif-lower" }
+ cranelift-codegen = { version = "=0.135.5", default-features = false, features = [
+     "std",
+     "host-arch",
+diff --git a/crates/cubecl-llvm/src/cpu/abi.rs b/crates/cubecl-llvm/src/cpu/abi.rs
+index a375ce15..9627c3c9 100644
+--- a/crates/cubecl-llvm/src/cpu/abi.rs
++++ b/crates/cubecl-llvm/src/cpu/abi.rs
+@@ -40,7 +40,7 @@ impl EntryArgLayout for TableArgs {
+         if !buffers.is_empty() || !shared.is_empty() {
+             let table_ty = table_ty(ctx);
+             BasicBlock::insert_argument(entry, ctx, 0, table_ty);
+-            let buffer_ptrs = entry.deref(ctx).get_argument(0);
++            let buffer_ptrs = entry.deref(ctx).get_argument(ctx, 0);
+             let terminator = entry
+                 .deref(ctx)
+                 .get_terminator(ctx)
+diff --git a/crates/cubecl-llvm/src/cpu/entrypoint.rs b/crates/cubecl-llvm/src/cpu/entrypoint.rs
+index 5737e8cf..3055465a 100644
+--- a/crates/cubecl-llvm/src/cpu/entrypoint.rs
++++ b/crates/cubecl-llvm/src/cpu/entrypoint.rs
+@@ -77,7 +77,7 @@ impl Pass for InsertConstantEmulationPass {
+             let u32_ty = u32::__expand_as_type(&scope);
+             for builtin in CPU_RUNTIME_BUILTINS {
+                 let arg = func.push_argument(scope.ctx(), u32_ty);
+-                let value = entry_block.deref(scope.ctx()).get_argument(arg);
++                let value = entry_block.deref(scope.ctx()).get_argument(ctx, arg);
+                 builtins.set(builtin, value);
+             }
+ 
+@@ -123,7 +123,7 @@ pub fn runtime_arg(ctx: &Context, func: FuncOp, key: &Identifier) -> Value {
+     let num_args = entry.deref(ctx).get_num_arguments();
+     (0..num_args)
+         .find(|idx| func.has_arg_attr(ctx, *idx, key))
+-        .map(|idx| entry.deref(ctx).get_argument(idx))
++        .map(|idx| entry.deref(ctx).get_argument(ctx, idx))
+         .unwrap_or_else(|| panic!("entry point must carry the '{key}' argument"))
+ }
+ 
+diff --git a/crates/cubecl-llvm/src/cpu/f16_evaluation.rs b/crates/cubecl-llvm/src/cpu/f16_evaluation.rs
+index 268f3f2b..d1160ea4 100644
+--- a/crates/cubecl-llvm/src/cpu/f16_evaluation.rs
++++ b/crates/cubecl-llvm/src/cpu/f16_evaluation.rs
+@@ -105,7 +105,7 @@ fn is_f16_arithmetic(ctx: &Context, op: Ptr<Operation>) -> bool {
+         || op.is_op::<RsqrtOp>(ctx)
+         || op.is_op::<RecipOp>(ctx);
+ 
+-    promotable && op.deref(ctx).get_num_results() == 1 && is_f16(ctx, op.deref(ctx).get_result(0))
++    promotable && op.deref(ctx).get_num_results() == 1 && is_f16(ctx, op.deref(ctx).get_result(ctx, 0))
+ }
+ 
+ fn is_f16(ctx: &Context, value: impl Typed) -> bool {
+@@ -124,7 +124,7 @@ fn promote(
+     rewriter: &mut PassRewriter,
+     op: Ptr<Operation>,
+ ) {
+-    let result = op.deref(ctx).get_result(0);
++    let result = op.deref(ctx).get_result(ctx, 0);
+     let narrow_ty = result.get_type(ctx);
+     let wide_ty = widen_ty(ctx, narrow_ty);
+ 
+@@ -140,7 +140,7 @@ fn promote(
+     let wide_op = rematerialize.materialize(ctx, vec![wide_ty], operands, attributes);
+     wide_op.insert_before(ctx, op);
+ 
+-    let wide_result = wide_op.deref(ctx).get_result(0);
++    let wide_result = wide_op.deref(ctx).get_result(ctx, 0);
+     let narrowed = CastOp::new(ctx, narrow_ty, wide_result);
+     narrowed.get_operation().insert_before(ctx, op);
+ 
+@@ -384,7 +384,7 @@ fn hold_in_f32(
+ 
+         for r#use in widening {
+             let cast = r#use.user_op();
+-            let wide = cast.deref(ctx).get_result(0);
++            let wide = cast.deref(ctx).get_result(ctx, 0);
+             wide.replace_all_uses_with(ctx, &loaded);
+             rewriter.erase_operation(ctx, cast);
+         }
+@@ -442,7 +442,7 @@ fn loop_depth(ctx: &Context, op: Ptr<Operation>) -> usize {
+ fn is_widening(ctx: &Context, op: Ptr<Operation>) -> bool {
+     op.is_op::<CastOp>(ctx)
+         && is_f16(ctx, op.operand(ctx, 0))
+-        && scalar_is::<Float32Type>(ctx, op.deref(ctx).get_result(0))
++        && scalar_is::<Float32Type>(ctx, op.deref(ctx).get_result(ctx, 0))
+ }
+ 
+ fn widen_ty(ctx: &mut Context, ty: TypeHandle) -> TypeHandle {
+diff --git a/crates/cubecl-llvm/src/cpu/jit/engine.rs b/crates/cubecl-llvm/src/cpu/jit/engine.rs
+index 691d37ef..c0de9c09 100644
+--- a/crates/cubecl-llvm/src/cpu/jit/engine.rs
++++ b/crates/cubecl-llvm/src/cpu/jit/engine.rs
+@@ -158,6 +158,7 @@ impl PlironEngine {
+             return Self::compile_clif(ctx, module, kernel_name, requirements, io, keep_object);
+         }
+ 
++        let t_start = std::time::Instant::now();
+         let llvm_ctx = LLVMContext::default();
+         let llvm_module = to_llvm_ir::convert_module(ctx, &llvm_ctx, module)?;
+         #[cfg(feature = "pliron-dump")]
+@@ -192,10 +193,12 @@ impl PlironEngine {
+             let _ = std::fs::write(dir.join("kernel.o"), &object_bytes);
+         }
+ 
++        let t_codegen = t_start.elapsed();
+         let engine = Self::from_object(&object_bytes, kernel_name, requirements, io)
+             .unwrap_or_else(|err| {
+                 panic!("failed to load compiled object for '{kernel_name}': {err}")
+             });
++        jit_log("llvm", kernel_name, &object_bytes, t_codegen, t_start.elapsed());
+ 
+         if keep_object {
+             *engine.0.object_bytes.lock().unwrap() = Some(Bytes::from_bytes_vec(object_bytes));
+@@ -214,6 +217,7 @@ impl PlironEngine {
+         keep_object: bool,
+     ) -> pliron::result::Result<Self> {
+         use pliron_clif_lower::{iropt, lower, scan};
++        let t_start = std::time::Instant::now();
+ 
+         use pliron::{op::Op as _, printable::Printable as _};
+         #[cfg(feature = "pliron-dump")]
+@@ -267,6 +271,7 @@ impl PlironEngine {
+             &mut st,
+             false,
+             iropt::inline::SMALL_LIMIT,
++            0,
+             None,
+             false,
+             None,
+@@ -281,13 +286,14 @@ impl PlironEngine {
+         let object_bytes = lower::lower_to_object(
+             false,
+             false,
+-            ctx,
++            lower::CtxSlot::Ref(ctx),
+             &st,
+             isa,
+             kernel_name,
+             &lower::NoHost,
+         );
+ 
++        let t_codegen = t_start.elapsed();
+         let engine = Self::from_object(&object_bytes, kernel_name, requirements, io)
+             .map_err(|err| {
+                 pliron::arg_error_noloc!(
+@@ -295,6 +301,7 @@ impl PlironEngine {
+                 )
+             })?;
+ 
++        jit_log("clif", kernel_name, &object_bytes, t_codegen, t_start.elapsed());
+         if keep_object {
+             *engine.0.object_bytes.lock().unwrap() = Some(Bytes::from_bytes_vec(object_bytes));
+         }
+@@ -379,6 +386,34 @@ impl Display for PlironEngine {
+     }
+ }
+ 
++/// `CUBECL_PLIRON_LOG=1`: one stderr line per compiled kernel naming the
++/// path that built it (`clif` = pliron -> Cranelift, `llvm` = LLVM), the
++/// object size, and codegen / codegen+load wall time in microseconds.
++///
++/// `CUBECL_PLIRON_LOG=<anything but 1>` appends the line to that file instead
++/// (test harnesses capture stderr). `CUBECL_PLIRON_DUMP_OBJ=<dir>` also writes
++/// `<dir>/<kernel>.<path>.o` for `llvm-objdump -d`.
++fn jit_log(path: &str, kernel: &str, object: &[u8], codegen: std::time::Duration, total: std::time::Duration) {
++    if let Some(v) = std::env::var_os("CUBECL_PLIRON_LOG") {
++        let line = format!(
++            "[cubecl-pliron] path={path} kernel={kernel} obj_bytes={} codegen_us={} total_us={}",
++            object.len(),
++            codegen.as_micros(),
++            total.as_micros()
++        );
++        if v == "1" {
++            eprintln!("{line}");
++        } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&v) {
++            use std::io::Write;
++            let _ = writeln!(f, "{line}");
++        }
++    }
++    if let Some(dir) = std::env::var_os("CUBECL_PLIRON_DUMP_OBJ") {
++        let _ = std::fs::create_dir_all(&dir);
++        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{kernel}.{path}.o")), object);
++    }
++}
++
+ /// Host ISA for the Cranelift path: native feature detection, max speed.
+ fn clif_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
+     use cranelift_codegen::settings::{self, Configurable};
+diff --git a/crates/cubecl-llvm/src/shared/branch.rs b/crates/cubecl-llvm/src/shared/branch.rs
+index e5468340..237bea0c 100644
+--- a/crates/cubecl-llvm/src/shared/branch.rs
++++ b/crates/cubecl-llvm/src/shared/branch.rs
+@@ -218,7 +218,7 @@ impl LowerCpuCF for SwitchOp {
+         let (pre, merge) = split_join_block(ctx, rewriter, op, "switch_merge");
+ 
+         let case_regions: Vec<Ptr<Region>> = (0..cases.len())
+-            .map(|i| op.deref(ctx).get_region(i + 1))
++            .map(|i| op.deref(ctx).get_region(ctx, i + 1))
+             .collect();
+ 
+         let default_term = terminator(ctx, default_block);
+diff --git a/crates/cubecl-llvm/src/shared/intrinsic.rs b/crates/cubecl-llvm/src/shared/intrinsic.rs
+index 4597777d..47b8082c 100644
+--- a/crates/cubecl-llvm/src/shared/intrinsic.rs
++++ b/crates/cubecl-llvm/src/shared/intrinsic.rs
+@@ -89,5 +89,5 @@ pub fn resize_int(
+         },
+     };
+     rw.insert_operation(ctx, op);
+-    Some(op.deref(ctx).get_result(0))
++    Some(op.deref(ctx).get_result(ctx, 0))
+ }
+diff --git a/crates/cubecl-llvm/src/shared/metadata.rs b/crates/cubecl-llvm/src/shared/metadata.rs
+index 8157164b..aecfde0c 100644
+--- a/crates/cubecl-llvm/src/shared/metadata.rs
++++ b/crates/cubecl-llvm/src/shared/metadata.rs
+@@ -83,7 +83,7 @@ impl Pass for LowerEntryAbiPass {
+                 func.get_arg_attr::<BufferBindingAttr>(ctx, i, &ATTR_BUFFER_BINDING)
+             {
+                 let pos = binding.buffer_pos;
+-                buffers.push((i, pos, entry.deref(ctx).get_argument(i)));
++                buffers.push((i, pos, entry.deref(ctx).get_argument(ctx, i)));
+             }
+         }
+ 
+@@ -142,10 +142,10 @@ impl Pass for LowerEntryAbiPass {
+         let grid_constants = ctx.grid_constants();
+         let dyn_meta = (grid_constants && self.info.has_dynamic_meta).then(|| {
+             let idx = BasicBlock::push_argument(entry, ctx, info_ty);
+-            entry.deref(ctx).get_argument(idx)
++            entry.deref(ctx).get_argument(ctx, idx)
+         });
+         let meta_idx = BasicBlock::push_argument(entry, ctx, info_ty);
+-        let info = entry.deref(ctx).get_argument(meta_idx);
++        let info = entry.deref(ctx).get_argument(ctx, meta_idx);
+ 
+         let static_base = elem_index(
+             self.info.sized_meta.map_or(0, |field| field.offset),
+@@ -211,7 +211,7 @@ impl Pass for LowerEntryAbiPass {
+ 
+ pub(crate) fn rebuild_func_type(ctx: &mut Context, func: FuncOp) {
+     let entry = func.get_entry_block(ctx);
+-    let arg_values: Vec<Value> = entry.deref(ctx).arguments().collect();
++    let arg_values: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
+     let arg_types: Vec<TypeHandle> = arg_values
+         .iter()
+         .map(|arg| cube_type_to_llvm(ctx, arg.get_type(ctx)))
+diff --git a/crates/cubecl-llvm/src/shared/to_llvm/general.rs b/crates/cubecl-llvm/src/shared/to_llvm/general.rs
+index 0b1f5457..9d3dbcea 100644
+--- a/crates/cubecl-llvm/src/shared/to_llvm/general.rs
++++ b/crates/cubecl-llvm/src/shared/to_llvm/general.rs
+@@ -66,7 +66,7 @@ fn cast_int_to_int(
+ fn insert_zero(ctx: &mut Context, rewriter: &mut DialectConversionRewriter, value: Value) -> Value {
+     let zero = constant_op(ctx, ZeroAttr::new(value.get_type(ctx)).into());
+     rewriter.insert_op(ctx, &*zero.dyn_op(ctx));
+-    zero.deref(ctx).get_result(0)
++    zero.deref(ctx).get_result(ctx, 0)
+ }
+ 
+ fn cast_float_to_int(
+@@ -439,7 +439,7 @@ pub(crate) fn convert_float(
+         }
+     };
+     rewriter.insert_operation(ctx, op);
+-    op.deref(ctx).get_result(0)
++    op.deref(ctx).get_result(ctx, 0)
+ }
+ 
+ /// The width of an LLVM float type's lanes.
+diff --git a/crates/cubecl-macros-internal/src/generate/cube_op.rs b/crates/cubecl-macros-internal/src/generate/cube_op.rs
+index ae3e7d3b..58fc1c9a 100644
+--- a/crates/cubecl-macros-internal/src/generate/cube_op.rs
++++ b/crates/cubecl-macros-internal/src/generate/cube_op.rs
+@@ -176,11 +176,11 @@ impl CubeOp {
+             quote! {
+                 #vis fn #ident(&self, ctx: &::pliron::context::Context) -> #ty {
+                     use ::pliron::op::Op;
+-                    self.get_operation().deref(ctx).get_operand(#idx)
++                    self.get_operation().deref(ctx).get_operand(ctx, #idx)
+                 }
+                 #vis fn #use_ident(&self, ctx: &::pliron::context::Context) -> ::pliron::value::Use<#ty> {
+                     use ::pliron::op::Op;
+-                    self.get_operation().deref(ctx).get_operand_as_use(#idx)
++                    self.get_operation().deref(ctx).get_operand_as_use(ctx, #idx)
+                 }
+             }
+         });
+@@ -188,7 +188,7 @@ impl CubeOp {
+             let CubeOpArg { vis, ident, ty, .. } = arg;
+             let inner_accessor = format_ident!("get_attr_{}", args.qualified_name(ident));
+             quote! {
+-                #vis fn #ident<'a>(&self, ctx: &'a ::pliron::context::Context) -> core::cell::Ref<'a, #ty> {
++                #vis fn #ident<'a>(&self, ctx: &'a ::pliron::context::Context) -> &'a #ty {
+                     self.#inner_accessor(ctx).unwrap()
+                 }
+             }
+@@ -204,7 +204,7 @@ impl CubeOp {
+                 }
+             } else {
+                 quote! {
+-                    #vis fn #ident<'a>(&self, ctx: &'a ::pliron::context::Context) -> Option<core::cell::Ref<'a, #ty>> {
++                    #vis fn #ident<'a>(&self, ctx: &'a ::pliron::context::Context) -> Option<&'a #ty> {
+                         self.#inner_accessor(ctx)
+                     }
+                 }
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/control_flow_uniformity.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/control_flow_uniformity.rs
+index f6ad2d4e..5ae13682 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/control_flow_uniformity.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/control_flow_uniformity.rs
+@@ -114,7 +114,7 @@ impl BlockUniformityAnalysis {
+         ctx: &Context,
+         op: Ptr<Operation>,
+     ) {
+-        for region in op.deref(ctx).regions() {
++        for region in op.deref(ctx).regions(ctx) {
+             for block in region.deref(ctx).iter(ctx) {
+                 let state = solver.get_or_create_mut::<BlockUniformity>(block);
+                 solver.update_state(ctx, &state, |it| it.join(Uniformity::None));
+@@ -201,7 +201,7 @@ impl BlockUniformityAnalysis {
+             .value();
+ 
+         let mut operand_uniformity = SmallPtrVec::with_capacity(op.deref(ctx).get_num_operands());
+-        for operand in op.deref(ctx).operands() {
++        for operand in op.deref(ctx).operands(ctx) {
+             let lattice = solver.get_or_create::<StrictUniformityLattice>(operand);
+             lattice.deref().use_def_subscribe::<Self>();
+             operand_uniformity.push(lattice.deref().value().0);
+@@ -272,7 +272,7 @@ impl BlockUniformityAnalysis {
+             .value();
+ 
+         let mut operand_uniformity = SmallPtrVec::with_capacity(op.deref(ctx).get_num_operands());
+-        for operand in op.deref(ctx).operands() {
++        for operand in op.deref(ctx).operands(ctx) {
+             let lattice = solver.get_or_create::<StrictUniformityLattice>(operand);
+             lattice.deref().use_def_subscribe::<Self>();
+             operand_uniformity.push(lattice.deref().value().0);
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/dead_code.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/dead_code.rs
+index 2038d952..7c87cfa9 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/dead_code.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/dead_code.rs
+@@ -488,7 +488,7 @@ impl DeadCodeAnalysis {
+         op: Ptr<Operation>,
+     ) -> Option<SmallVec<[Option<AttrObj>; 8]>> {
+         let mut operands = SmallVec::with_capacity(op.deref(ctx).get_num_operands());
+-        for operand in op.deref(ctx).operands() {
++        for operand in op.deref(ctx).operands(ctx) {
+             let cv = solver.get_or_create::<ConstantLattice>(operand);
+             cv.deref().use_def_subscribe::<Self>();
+             // Not yet initialized, skip until SCCP runs
+@@ -718,7 +718,7 @@ impl DataflowAnalysis for DeadCodeAnalysis {
+                 self.visit_branch_operation(solver, ctx, branch);
+                 // Otherwise, conservatively mark all successors as executable.
+             } else {
+-                for successor in op.deref(ctx).successors() {
++                for successor in op.deref(ctx).successors(ctx) {
+                     let block = op.deref(ctx).get_parent_block().unwrap();
+                     self.mark_edge_live(solver, ctx, block, successor);
+                 }
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/dense.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/dense.rs
+index abd1158e..a013e143 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/dense.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/dense.rs
+@@ -217,7 +217,7 @@ impl<T: DenseForwardDataflowAnalysis> DataflowAnalysis for DenseForward<T> {
+     ) -> Result<()> {
+         self.process_operation(solver, ctx, root)?;
+ 
+-        for region in root.deref(ctx).regions() {
++        for region in root.deref(ctx).regions(ctx) {
+             for block in region.deref(ctx).iter(ctx) {
+                 self.visit_block(solver, ctx, block);
+                 for op in block.deref(ctx).iter(ctx) {
+@@ -742,7 +742,7 @@ impl<T: DenseBackwardDataflowAnalysis> DataflowAnalysis for DenseBackward<T> {
+     ) -> Result<()> {
+         self.process_operation(solver, ctx, root)?;
+ 
+-        for region in root.deref(ctx).regions() {
++        for region in root.deref(ctx).regions(ctx) {
+             for block in region.deref(ctx).iter(ctx) {
+                 self.visit_block(solver, ctx, block)?;
+                 for op in block.deref(ctx).iter(ctx).rev() {
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/pre.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/pre.rs
+index 430a4fd9..4f052879 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/pre.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/pre.rs
+@@ -106,7 +106,7 @@ impl ComputesAnalysis {
+         }
+ 
+         let mut values = SparseBitSet::new();
+-        for res in op.deref(ctx).results() {
++        for res in op.deref(ctx).results(ctx) {
+             let value = solver.get_or_create_for::<Self, ValueNumberLattice>(point, res);
+             match value.deref().value().value() {
+                 Some(value) => values.insert(value as usize),
+@@ -278,7 +278,7 @@ pub(crate) fn collect_memory_kill_sets(
+             // reasons, but that makes `Chain` not `Clone` and `reduce` requires `Clone`...
+             let dependents = op
+                 .deref(ctx)
+-                .results()
++                .results(ctx)
+                 .filter_map(|res| solver.lookup_state::<DependentsLattice>(res))
+                 .collect::<SmallVec<[_; 4]>>();
+             let mut dependents = dependents
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/sparse.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/sparse.rs
+index 6e4d4d3a..18a8489d 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/sparse.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/sparse.rs
+@@ -336,7 +336,7 @@ impl<T: SparseForwardDataflowAnalysis> SparseForward<T> {
+         }
+ 
+         let mut result_lattices = SmallPtrVec::with_capacity(op.deref(ctx).get_num_results());
+-        for result in op.deref(ctx).results() {
++        for result in op.deref(ctx).results(ctx) {
+             result_lattices.push(self.get_lattice_element_mut(solver, result));
+         }
+ 
+@@ -355,7 +355,7 @@ impl<T: SparseForwardDataflowAnalysis> SparseForward<T> {
+         }
+ 
+         let mut operand_lattices = SmallPtrVec::with_capacity(op.deref(ctx).get_num_operands());
+-        for operand in op.deref(ctx).operands() {
++        for operand in op.deref(ctx).operands(ctx) {
+             let operand_lattice = self.get_lattice_element(solver, operand);
+             operand_lattice.deref().use_def_subscribe::<Self>();
+             operand_lattices.push(operand_lattice);
+@@ -391,7 +391,7 @@ impl<T: SparseForwardDataflowAnalysis> SparseForward<T> {
+         }
+ 
+         let mut arg_lattices = SmallPtrVec::with_capacity(block.deref(ctx).get_num_arguments());
+-        for argument in block.deref(ctx).arguments() {
++        for argument in block.deref(ctx).arguments(ctx) {
+             arg_lattices.push(self.get_lattice_element_mut(solver, argument));
+         }
+ 
+@@ -499,7 +499,7 @@ impl<T: SparseForwardDataflowAnalysis> SparseForward<T> {
+             return Ok(());
+         }
+         for &predecessor in predecessors.deref().known_predecessors() {
+-            for (operand, res_lattice) in predecessor.deref(ctx).operands().zip(result_lattices) {
++            for (operand, res_lattice) in predecessor.deref(ctx).operands(ctx).zip(result_lattices) {
+                 let current = self.get_lattice_element_for(solver, after_call, operand);
+                 self.join(solver, ctx, res_lattice, &current)
+             }
+@@ -727,7 +727,7 @@ pub trait SparseBackwardDataflowAnalysis: Sized + 'static {
+     ) {
+         let _ = (argument_lattices, result_lattices);
+         let op = call.get_operation();
+-        for operand in op.deref(ctx).operands_as_uses() {
++        for operand in op.deref(ctx).operands_as_uses(ctx) {
+             Self::visit_call_operand(this, solver, ctx, operand);
+         }
+     }
+@@ -854,7 +854,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+     ) -> Result<()> {
+         self.visit_operation(solver, ctx, op)?;
+ 
+-        for region in op.deref(ctx).regions() {
++        for region in op.deref(ctx).regions(ctx) {
+             for block in region.deref(ctx).iter(ctx) {
+                 let executable = solver
+                     .get_or_create::<Executable>(ProgramPoint::at_block_start(ctx, block).into());
+@@ -889,8 +889,8 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+ 
+         let point = ProgramPoint::after_op(ctx, op);
+ 
+-        let operand_lattices = self.get_lattice_elements_mut(solver, op.deref(ctx).operands());
+-        let result_lattices = self.get_lattice_elements_for(solver, point, op.deref(ctx).results());
++        let operand_lattices = self.get_lattice_elements_mut(solver, op.deref(ctx).operands(ctx));
++        let result_lattices = self.get_lattice_elements_for(solver, point, op.deref(ctx).results(ctx));
+ 
+         // Block arguments of region branch operations flow back into the operands
+         // of the parent op
+@@ -902,13 +902,13 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+         if let Some(branch) = op.cast::<dyn BranchOpInterface>(ctx) {
+             let mut unaccounted = vec![true; op.deref(ctx).get_num_operands()];
+ 
+-            for (index, block) in op.deref(ctx).successors().enumerate() {
++            for (index, block) in op.deref(ctx).successors(ctx).enumerate() {
+                 let successor_operands = branch.successor_operand_range(ctx, index);
+                 if !successor_operands.is_empty() {
+                     for (arg_idx, opd_idx) in successor_operands.enumerate() {
+                         unaccounted[opd_idx] = false;
+-                        let operand = op.deref(ctx).get_operand(opd_idx);
+-                        let block_arg = block.deref(ctx).get_argument(arg_idx);
++                        let operand = op.deref(ctx).get_operand(ctx, opd_idx);
++                        let block_arg = block.deref(ctx).get_argument(ctx, arg_idx);
+                         let opd_lattice = self.get_lattice_element_mut(solver, operand);
+                         let arg_lattice = self.get_lattice_element_for(solver, point, block_arg);
+                         self.meet(solver, ctx, &opd_lattice, &arg_lattice);
+@@ -918,7 +918,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+             // Operands not forwarded to successor blocks are typically parameters
+             // of the branch operation itself (for example the boolean for if/else).
+             for (index, _) in unaccounted.iter().enumerate().filter(|(_, val)| **val) {
+-                let operand = op.deref(ctx).get_operand_as_use(index);
++                let operand = op.deref(ctx).get_operand_as_use(ctx, index);
+                 T::visit_branch_operand(self, solver, ctx, operand);
+             }
+             return Ok(());
+@@ -957,7 +957,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+             // Otherwise, propagate information from the entry point of the function
+             // back to operands whenever possible.
+             let block = region.deref(ctx).get_entry_block().unwrap();
+-            for (block_arg, arg_operand) in block.deref(ctx).arguments().zip(arg_operands) {
++            for (block_arg, arg_operand) in block.deref(ctx).arguments(ctx).zip(arg_operands) {
+                 let arg_lattice = self.get_lattice_element_for(solver, point, block_arg);
+                 let opd_lattice = self.get_lattice_element_mut(solver, arg_operand.get_def(ctx));
+                 self.meet(solver, ctx, &opd_lattice, &arg_lattice);
+@@ -967,7 +967,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+             // Handle the operands of the call op that aren't forwarded to any
+             // arguments.
+             for (index, _) in unaccounted.iter().enumerate().filter(|(_, val)| **val) {
+-                let operand = op.deref(ctx).get_operand_as_use(index);
++                let operand = op.deref(ctx).get_operand_as_use(ctx, index);
+                 T::visit_call_operand(self, solver, ctx, operand);
+             }
+             return Ok(());
+@@ -1026,7 +1026,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+         if callsites.deref().all_predecessors_known() {
+             for call in callsites.deref().known_predecessors() {
+                 let call_result_lattices =
+-                    self.get_lattice_elements_for(solver, point, call.deref(ctx).results());
++                    self.get_lattice_elements_for(solver, point, call.deref(ctx).results(ctx));
+                 for (opd, result) in operand_lattices.iter().zip(call_result_lattices) {
+                     self.meet(solver, ctx, opd, &result);
+                 }
+@@ -1073,7 +1073,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+         // All operands not forwarded to regions are typically parameters of the
+         // branch operation itself (for example the boolean for if/else).
+         for (index, _) in unaccounted.iter().enumerate().filter(|(_, val)| **val) {
+-            let operand = op.deref(ctx).get_operand_as_use(index);
++            let operand = op.deref(ctx).get_operand_as_use(ctx, index);
+             T::visit_branch_operand(self, solver, ctx, operand);
+         }
+     }
+@@ -1106,7 +1106,7 @@ impl<T: SparseBackwardDataflowAnalysis> SparseBackward<T> {
+         // Visit operands of the branch op not forwarded to the next region.
+         // (Like e.g. the boolean of `scf.condition`)
+         for (index, _) in unaccounted.iter().enumerate().filter(|(_, val)| **val) {
+-            let operand = term_op.deref(ctx).get_operand_as_use(index);
++            let operand = term_op.deref(ctx).get_operand_as_use(ctx, index);
+             T::visit_branch_operand(self, solver, ctx, operand);
+         }
+     }
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/value_numbering.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/value_numbering.rs
+index 139505a0..0c8e3a1d 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/value_numbering.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/value_numbering.rs
+@@ -170,7 +170,7 @@ impl SparseForwardDataflowAnalysis for ValueClasses {
+ 
+         let result = &results[0];
+         let mut operand_values = Vec::with_capacity(operands.len());
+-        for operand in op.deref(ctx).operands() {
++        for operand in op.deref(ctx).operands(ctx) {
+             match this.get_value_number(solver, operand) {
+                 None => return Ok(()),
+                 Some(value) => operand_values.push(ExpressionValue::new(value)),
+@@ -270,12 +270,12 @@ impl DataflowAnalysis for ValueNumberingAnalysis {
+ 
+     fn visit(&self, solver: &DataflowSolver, ctx: &Context, point: ProgramPoint) -> Result<()> {
+         if let Some(op) = point.prev_op(ctx) {
+-            for result in op.deref(ctx).results() {
++            for result in op.deref(ctx).results(ctx) {
+                 self.update_value(solver, ctx, point, result);
+             }
+         } else {
+             let block = point.block().unwrap();
+-            for arg in block.deref(ctx).arguments() {
++            for arg in block.deref(ctx).arguments(ctx) {
+                 self.update_value(solver, ctx, point, arg);
+             }
+         }
+diff --git a/crates/cubecl-opt/src/analyses/dataflow_solver/value_uniformity.rs b/crates/cubecl-opt/src/analyses/dataflow_solver/value_uniformity.rs
+index 0abc3660..b65e9233 100644
+--- a/crates/cubecl-opt/src/analyses/dataflow_solver/value_uniformity.rs
++++ b/crates/cubecl-opt/src/analyses/dataflow_solver/value_uniformity.rs
+@@ -79,7 +79,7 @@ impl SparseForwardDataflowAnalysis for DynamicValueUniformity {
+         results: &[WriteRef<SparseLattice<Self::LatticeValue>>],
+     ) -> Result<()> {
+         let mut operands_sanitized = SmallPtrVec::with_capacity(operands.len());
+-        for (operand, lattice) in op.deref(ctx).operands().zip(operands) {
++        for (operand, lattice) in op.deref(ctx).operands(ctx).zip(operands) {
+             match operand.defining_block() {
+                 // We can't properly analyze multi-block regions, so treat all non-entry block args
+                 // as non-uniform
+@@ -133,7 +133,7 @@ impl SparseForwardDataflowAnalysis for DynamicValueUniformity {
+         let result_uniformity = match op_cast::<dyn UniformRegionOpInterface>(branch) {
+             Some(branch) => {
+                 let op = branch.get_operation().deref(ctx);
+-                let operand_lattices = op.operands().map(|operand| {
++                let operand_lattices = op.operands(ctx).map(|operand| {
+                     let lattice = this.get_lattice_element(solver, operand);
+                     lattice.deref().use_def_subscribe::<SparseForward<Self>>();
+                     lattice.deref().value().0
+@@ -194,7 +194,7 @@ impl SparseForwardDataflowAnalysis for StrictValueUniformity {
+         );
+         let block_uniformity = block_lattice.deref().value();
+ 
+-        for (result, lattice) in op.deref(ctx).results().zip(results) {
++        for (result, lattice) in op.deref(ctx).results(ctx).zip(results) {
+             let dynamic = solver
+                 .get_or_create_for::<SparseForward<Self>, DynamicUniformityLattice>(
+                     ProgramPoint::after_op(ctx, op),
+@@ -239,7 +239,7 @@ impl SparseForwardDataflowAnalysis for StrictValueUniformity {
+         let result_uniformity = match op_cast::<dyn UniformRegionOpInterface>(branch) {
+             Some(branch) => {
+                 let op = branch.get_operation().deref(ctx);
+-                let operand_lattices = op.operands().map(|operand| {
++                let operand_lattices = op.operands(ctx).map(|operand| {
+                     let lattice = this.get_lattice_element(solver, operand);
+                     lattice.deref().use_def_subscribe::<SparseForward<Self>>();
+                     lattice.deref().value().0
+diff --git a/crates/cubecl-opt/src/analyses/memory_ssa.rs b/crates/cubecl-opt/src/analyses/memory_ssa.rs
+index 94d1e389..e968326c 100644
+--- a/crates/cubecl-opt/src/analyses/memory_ssa.rs
++++ b/crates/cubecl-opt/src/analyses/memory_ssa.rs
+@@ -82,7 +82,7 @@ impl MemoryOpAnalyzer<'_> {
+         defining_blocks: &mut DefiningBlocks,
+         regions_to_analyze: &mut IMap<Ptr<Region>, RegionMemoryInfo>,
+     ) {
+-        let root_region = self.root.deref(ctx).get_region(0);
++        let root_region = self.root.deref(ctx).get_region(ctx, 0);
+ 
+         let mut regions_with_direct_def = RegionSet::new();
+         let mut regions_with_direct_use = RegionSet::new();
+@@ -571,7 +571,7 @@ impl<'a> MemorySSAGraphBuilder<'a> {
+     }
+ 
+     fn analyze_root(&mut self, ctx: &Context) {
+-        let root_region = self.root.deref(ctx).get_region(0);
++        let root_region = self.root.deref(ctx).get_region(ctx, 0);
+         // Build MemorySSA recursively through nested regions. The initial reaching
+         // memory definition is the live-on-entry value.
+         //
+@@ -634,7 +634,7 @@ impl Printable for MemorySSA {
+         f.write_str("MemorySSA {")?;
+         {
+             let _indent = state.indent();
+-            for region in self.root.deref(ctx).regions() {
++            for region in self.root.deref(ctx).regions(ctx) {
+                 for block in region.deref(ctx).iter(ctx) {
+                     print_block(ctx, state, &self.nodes, block, f)?;
+                 }
+@@ -685,7 +685,7 @@ fn print_op(
+     if op.deref(ctx).num_regions() > 0 {
+         {
+             let _indent = state.indent();
+-            for region in op.deref(ctx).regions() {
++            for region in op.deref(ctx).regions(ctx) {
+                 for block in region.deref(ctx).iter(ctx) {
+                     print_block(ctx, state, nodes, block, f)?;
+                 }
+diff --git a/crates/cubecl-opt/src/analyses/pointer_source.rs b/crates/cubecl-opt/src/analyses/pointer_source.rs
+index b7e726a8..ed8b6101 100644
+--- a/crates/cubecl-opt/src/analyses/pointer_source.rs
++++ b/crates/cubecl-opt/src/analyses/pointer_source.rs
+@@ -50,7 +50,7 @@ impl Analysis for Resources {
+                     }
+                 }
+                 IRNode::BasicBlock(block) => {
+-                    for arg in block.deref(ctx).arguments() {
++                    for arg in block.deref(ctx).arguments(ctx) {
+                         this.analyze_block_arg(ctx, arg);
+                     }
+                 }
+diff --git a/crates/cubecl-opt/src/lib.rs b/crates/cubecl-opt/src/lib.rs
+index c6ad4709..ddaf0356 100644
+--- a/crates/cubecl-opt/src/lib.rs
++++ b/crates/cubecl-opt/src/lib.rs
+@@ -76,5 +76,5 @@ pub(crate) fn operand_range_to_uses(
+     range: Range<usize>,
+ ) -> SmallVec<[Use<Value>; 4]> {
+     let op = op.deref(ctx);
+-    range.map(|idx| op.get_operand_as_use(idx)).collect()
++    range.map(|idx| op.get_operand_as_use(ctx, idx)).collect()
+ }
+diff --git a/crates/cubecl-opt/src/passes/mem2reg.rs b/crates/cubecl-opt/src/passes/mem2reg.rs
+index 12e91f07..53d78c98 100644
+--- a/crates/cubecl-opt/src/passes/mem2reg.rs
++++ b/crates/cubecl-opt/src/passes/mem2reg.rs
+@@ -426,7 +426,7 @@ impl<'a> AllocPromoter<'a> {
+         while let Some((block, mut reaching_def)) = dfs_stack.pop_back() {
+             if self.info.merge_points.contains(&block) {
+                 let arg_idx = BasicBlock::push_argument(block, ctx, self.alloc.ty);
+-                reaching_def = Some(block.deref(ctx).get_argument(arg_idx));
++                reaching_def = Some(block.deref(ctx).get_argument(ctx, arg_idx));
+             }
+ 
+             reaching_def = self.promote_in_block(ctx, block, reaching_def);
+@@ -499,7 +499,7 @@ impl<'a> AllocPromoter<'a> {
+         let mut merge_point_args_unused = SmallSet::<_, 8>::new();
+         let mut merge_point_args_to_process = Vec::new();
+         for merge_point in self.info.merge_points.iter() {
+-            let arg = merge_point.deref(ctx).arguments().last().unwrap();
++            let arg = merge_point.deref(ctx).arguments(ctx).last().unwrap();
+             if !arg.is_used(ctx) {
+                 merge_point_args_unused.insert(arg);
+             } else {
+diff --git a/crates/cubecl-opt/src/passes/sccp.rs b/crates/cubecl-opt/src/passes/sccp.rs
+index 66880cf2..a5059d33 100644
+--- a/crates/cubecl-opt/src/passes/sccp.rs
++++ b/crates/cubecl-opt/src/passes/sccp.rs
+@@ -26,7 +26,7 @@ fn const_operands(
+     op: Ptr<Operation>,
+ ) -> SmallPtrVec<Option<AttrObj>> {
+     let mut out = SmallVec::with_capacity(op.deref(ctx).get_num_operands());
+-    for operand in op.deref(ctx).operands() {
++    for operand in op.deref(ctx).operands(ctx) {
+         out.push(const_value(solver, operand));
+     }
+     out
+@@ -38,7 +38,7 @@ fn const_results(
+     op: Ptr<Operation>,
+ ) -> SmallVec<[(Value, AttrObj); 4]> {
+     let mut out = SmallVec::with_capacity(op.deref(ctx).get_num_operands());
+-    for result in op.deref(ctx).results() {
++    for result in op.deref(ctx).results(ctx) {
+         let Some(value) = const_value(solver, result) else {
+             continue;
+         };
+diff --git a/crates/cubecl-opt/src/passes/simple_cse.rs b/crates/cubecl-opt/src/passes/simple_cse.rs
+index d094840b..261c854d 100644
+--- a/crates/cubecl-opt/src/passes/simple_cse.rs
++++ b/crates/cubecl-opt/src/passes/simple_cse.rs
+@@ -58,7 +58,7 @@ impl ExpressionKey {
+         let op_id = op.dyn_op(ctx).get_opid();
+         let operands = op.operands(ctx);
+         let attributes = op.deref(ctx).attributes.clone_skip_outlined(ctx);
+-        let result_types = op.deref(ctx).result_types().collect();
++        let result_types = op.deref(ctx).result_types(ctx).collect();
+         Self {
+             op_id,
+             operands,
+@@ -157,7 +157,7 @@ fn cse_op(
+     }
+ 
+     let mut status = IRStatus::Unchanged;
+-    let regions = op.deref(ctx).regions().collect::<Vec<_>>();
++    let regions = op.deref(ctx).regions(ctx).collect::<Vec<_>>();
+     for region in regions {
+         if region.deref(ctx).iter(ctx).count() > 1 {
+             let loc = op.deref(ctx).loc();
+diff --git a/crates/cubecl-wgpu/src/compiler/wgsl/builtin.rs b/crates/cubecl-wgpu/src/compiler/wgsl/builtin.rs
+index 0e49e98d..232ff6ea 100644
+--- a/crates/cubecl-wgpu/src/compiler/wgsl/builtin.rs
++++ b/crates/cubecl-wgpu/src/compiler/wgsl/builtin.rs
+@@ -119,7 +119,7 @@ impl RewriteBuiltins {
+         } else {
+             let ctx = scope.ctx();
+             let id = func.push_argument(ctx, builtin_ty(ctx, builtin));
+-            let value = func.get_entry_block(ctx).deref(ctx).get_argument(id);
++            let value = func.get_entry_block(ctx).deref(ctx).get_argument(ctx, id);
+             if func.get_entrypoint_abi(ctx).is_some() {
+                 func.set_arg_attr(ctx, id, &ATTR_BUILTIN, Box::new(BuiltInAttr(builtin)));
+             }

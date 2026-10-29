@@ -63,7 +63,7 @@ def categories(meas, tests):
         spd = {k: v["llvm"] / v["clif"] for k, v in meas.get("spd", {}).items()
                if v.get("llvm") and v.get("clif")}
         if spd:
-            out["SPD"] = (geomean(spd.values()), f"{len(spd)} kernels (clif/LLVM time ratio, higher rate = faster)")
+            out["SPD"] = (geomean(spd.values()), f"{len(spd)} rows, geomean of LLVM rate / CLIF rate")
         cmp_ = {k: v["clif_us"] / v["llvm_us"] for k, v in meas.get("cmp", {}).items()
                 if v.get("llvm_us") and v.get("clif_us")}
         if cmp_:

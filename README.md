@@ -61,6 +61,7 @@ Developed mainly on aarch64-apple-darwin; x86_64 Linux and x86_64 Windows (MSVC,
 - LTO: `-Clto` / Cargo `lto = true` builds and links (`-Clto=thin` falls back to fat), but without cross-crate optimization yet: the fat-LTO module is a relocatable link (`cc -r`) of the crate's objects and every upstream rlib's (`src/lto.rs`), so the result matches a non-LTO build. Not on MSVC or wasm targets (a clear error there).
 - Debug info (`-g`, ELF and Mach-O): line tables, inlined frames (rustc's and pliron's own inlining), lexical blocks, statics, and variables with their types — data-carrying enums, generics' type parameters and `usize` as LLVM describes them, so rust-lldb's formatters work. Optimized builds track variables through SSA values to location lists (registers, spill slots, constants). lldb and std's panic backtraces read it (gdb untested); optimized code is byte-identical with and without `-g`. `harness/dbgsuite.py` (rustc's tests/debuginfo) and `harness/dbgcorpus.py` measure lldb against stock. `PLIRON_DWARF=0` drops it.
 - Not done yet: cross-crate (real) LTO.
+- CubeCL / Burn CPU kernels: `CUBECL_PLIRON_CLIF=1` makes CubeCL's CPU runtime JIT its kernels through pliron -> Cranelift instead of LLVM, in the same binary as the LLVM path. cubecl-cpu's 1068 runtime tests and Burn's `burn-backend-tests` (cpu, 2366 tests) pass on both; kernel JIT is ~2x faster than LLVM, kernel throughput ~1.4x behind (geomean). Recipe, numbers and the CubeCL parity card: [`docs/cubecl-burn.md`](docs/cubecl-burn.md).
 
 ## wasm32
 
