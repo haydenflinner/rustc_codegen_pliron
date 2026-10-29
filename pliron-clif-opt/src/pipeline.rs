@@ -3402,6 +3402,17 @@ fn s_armmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // one copy into the predecessor (GVNHoist; eggcc's cicm extracting
 // shared `if`-input terms). Shrinks arms toward armmerge's isomorphic
 // shape, so it runs just ahead of it.
+fn s_copypair(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    if !p.simd || p.x64 {
+        return 0;
+    }
+    let k = copypair::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("copypair");
+    }
+    k
+}
+
 fn s_cicm(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = cicm::run(&mut p.clctx.func, an);
     if k > 0 && p.dump {
@@ -4265,6 +4276,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Last, once sameargs/edge folds left the loop-entry arg a plain 0.
         step("mulcarry", "", Gate::OptIn("PLIRON_MULCARRY"), s_mulcarry).needs(shape::LOOPS),
         step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),
+        // Interleaved `ld; st` copy runs -> `ldp`/`stp`-fusable groups
+        // (aarch64): by-value aggregate moves, 4 insns per 16 B before.
+        step("copypair", "copypair", Gate::OptIn("PLIRON_COPYPAIR"), s_copypair)
+            .needs(shape::STORE),
         Step {
             name: "coldret",
             bisect: Some("coldret"),
