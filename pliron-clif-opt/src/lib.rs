@@ -18,6 +18,7 @@ pub mod cmp3;
 pub mod commute;
 pub mod config;
 pub mod constdedup;
+pub mod copypair;
 pub mod diffcheck;
 pub mod divconst;
 pub mod dse;

@@ -869,7 +869,14 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str>
     if typed.is_empty() {
         return Err("no typed slices");
     }
-    if typed.len() > MAX_SLICES {
+    // `PLIRON_SROA_MAXSLICES=N` (default 64): refuse to scalarize an alloca
+    // with more typed slices than N — a by-value aggregate split into a
+    // dozen scalars is then moved slice by slice (and spilled/moved slice
+    // by slice at every block edge) instead of staying one memcpy.
+    let max_slices = crate::env_get("PLIRON_SROA_MAXSLICES")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_SLICES);
+    if typed.len() > max_slices {
         return Err("too many slices");
     }
     Ok(typed)
