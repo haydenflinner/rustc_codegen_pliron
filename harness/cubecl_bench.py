@@ -167,7 +167,7 @@ def main():
         old["load"]["end"] = res["load"]["end"]
         res = old
     json.dump(res, open(path, "w"), indent=1)
-    print(f"wrote {os.path.join(OUT, 'cubecl-measure.json')}: {len(res['spd'])} throughput rows, "
+    print(f"wrote {path}: {len(res['spd'])} throughput rows, "
           f"{len(res['cmp'])} kernels, load {res['load']['start']} -> {res['load']['end']}")
 
 

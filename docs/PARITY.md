@@ -36,7 +36,7 @@ default-on, looprot pre-check reorder): kernels 0.55, kernels-wasm
 1.14, regex-syntax 0.98, regex-wasm 0.96, syn 1.37 (still worst;
 remaining = jumpthread/ifconv2/etc on giant parse fns — trailer_helper
 alone is ~1.8s of a 30 CPU-s corpus).
-**CubeCL kernels (CPU runtime through our Cranelift path, aarch64, 2026-10-29): see [`cubecl-burn.md`](cubecl-burn.md) for the recipe and the CubeCL parity card (`harness/cubecl_card.py`): overall 103 = SPD 76 / CMP 148 / COR 100 / MEM 101; kernel JIT 0.52x LLVM's time, throughput geomean 1.39x slower (pooling, bf16 and f16 GEMM worst), cubecl-cpu 1068/1068 and Burn cpu 2366/2366 tests pass.** The line below is the older, x64-era note.
+**CubeCL kernels (CPU runtime through our Cranelift path, aarch64, 2026-10-29): see [`cubecl-burn.md`](cubecl-burn.md) for the recipe and the CubeCL parity card (`harness/cubecl_card.py`): overall 103 = SPD 78 / CMP 148 / COR 100 / MEM 101 (107 with the opt-in `PLIRON_VSELECT=1 PLIRON_FMINMAX=1`); kernel JIT 0.51x LLVM's time, throughput geomean 1.35x slower (max-pool and f16 GEMM worst), cubecl-cpu 1068/1068 and Burn cpu 2366/2366 tests pass.** The line below is the older, x64-era note.
 cubecl `throughput` (warm cache, extreme variance): f32 ~parity
 (422 vs 440 GOPS), f16 clif ~4x faster (LLJIT f16 broken on Windows),
 bf16 inconclusive (clif 47-620 GOPS across runs vs llvm ~280-580),

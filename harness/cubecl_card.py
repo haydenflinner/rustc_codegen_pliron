@@ -2,7 +2,7 @@
 """The CubeCL parity card: CubeCL's CPU runtime compiling its kernels
 through pliron -> Cranelift (CUBECL_PLIRON_CLIF=1) vs through LLVM.
 
-Usage: harness/cubecl_card.py [--measure FILE] [--tests FILE]
+Usage: harness/cubecl_card.py [--measure FILE] [--tests FILE] [--out NAME]
 
 Inputs (both written by harness/cubecl_bench.py; see docs/cubecl-burn.md):
   target/parity/cubecl-measure.json
@@ -76,6 +76,8 @@ def categories(meas, tests):
         only_c = only_l = both = total = 0
         parts = []
         for suite, t in sorted(tests.items()):
+            if "llvm" not in t or "clif" not in t:  # a one-path run (e.g. with opt-in flags) is not a comparison
+                continue
             lf, cf = set(t["llvm"]["failed"]), set(t["clif"]["failed"])
             only_c += len(cf - lf)
             only_l += len(lf - cf)
@@ -91,6 +93,7 @@ def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("--measure", default=os.path.join(OUT, "cubecl-measure.json"))
     ap.add_argument("--tests", default=os.path.join(OUT, "cubecl-tests.json"))
+    ap.add_argument("--out", default="cubecl.json", help="file name under target/parity (e.g. cubecl-flags.json)")
     a = ap.parse_args()
     meas, tests = load(a.measure), load(a.tests)
     cats = categories(meas, tests)
@@ -115,7 +118,7 @@ def main():
         if sizes:
             print(f"  object size clif/LLVM geomean {geomean(sizes):.2f} over {len(sizes)} kernels (not rated)")
     os.makedirs(OUT, exist_ok=True)
-    with open(os.path.join(OUT, "cubecl.json"), "w") as f:
+    with open(os.path.join(OUT, a.out), "w") as f:
         json.dump({"host": (meas or {}).get("host"), "load": (meas or {}).get("load"),
                    "card": {"overall": ovr,
                             "categories": {c: {"weight": w, "ratio": r, "rating": rating(r), "detail": d}
