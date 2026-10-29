@@ -1016,6 +1016,35 @@ impl<I: VCodeInst> VCode<I> {
         static EDGEMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let edgemerge = *EDGEMERGE.get_or_init(|| pliron_mode("PLIRON_EDGEMERGE"));
         let mut merged = vec![false; self.num_blocks()];
+        // `PLIRON_EDGEMERGE=3`: like 2 (merge every duplicate) except for
+        // blocks inside a loop, approximated as the emission-order interval
+        // from a back-edge target to its source: a merged dup there would put
+        // an extra taken branch on a path that can run every iteration.
+        let mut in_loop = vec![false; if edgemerge == 3 { final_order.len() } else { 0 }];
+        if edgemerge == 3 {
+            let mut order_of = vec![usize::MAX; self.num_blocks()];
+            for (i, &b) in final_order.iter().enumerate() {
+                order_of[b.index()] = i;
+            }
+            let mut diff = vec![0i32; final_order.len() + 1];
+            for (pred, range) in self.block_succ_range.iter() {
+                for succ in &self.block_succs[range] {
+                    let sidx = succ.index();
+                    if sidx < self.num_blocks()
+                        && order_of[sidx] <= order_of[pred]
+                        && self.block_order.is_back_edge_target(BlockIndex::new(sidx))
+                    {
+                        diff[order_of[sidx]] += 1;
+                        diff[order_of[pred] + 1] -= 1;
+                    }
+                }
+            }
+            let mut run = 0;
+            for (i, d) in diff.iter().take(final_order.len()).enumerate() {
+                run += d;
+                in_loop[i] = run > 0;
+            }
+        }
         if edgemerge > 0 && !flags.machine_code_cfg_info() {
             let mut canon: FxHashMap<EdgeKey, BlockIndex> = FxHashMap::default();
             // The last block kept for emission.
@@ -1035,7 +1064,9 @@ impl<I: VCodeInst> VCode<I> {
                         }
                     })
                     .filter(|_| {
-                        edgemerge >= 2
+                        edgemerge == 2
+                            || (edgemerge == 3 && !in_loop[oi])
+                            || edgemerge > 3
                             || self.block_order.is_cold(block)
                             || (!prev.is_some_and(|p| self.block_preds(block).contains(&p))
                                 && final_order.get(oi + 1)
