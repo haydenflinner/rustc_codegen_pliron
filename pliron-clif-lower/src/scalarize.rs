@@ -4,7 +4,7 @@
 //! use `<N x T>` ops directly (CubeCL) go through here first. Lanes are
 //! extract/insertelement with constant indices, which lower to lane moves.
 
-use pliron::builtin::attributes::IntegerAttr;
+use pliron::builtin::attributes::{IntegerAttr, StringAttr};
 use pliron::builtin::types::{BF16Type, FP16Type, FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::cloning::{IrMapping, clone_operation};
@@ -17,7 +17,8 @@ use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
 use pliron_llvm::op_interfaces::CastOpInterface;
 use pliron_llvm::ops::*;
-use pliron_llvm::types::{VectorType, VectorTypeKind};
+use pliron_llvm::attributes::{FCmpPredicateAttr, ICmpPredicateAttr};
+use pliron_llvm::types::{FuncType, VectorType, VectorTypeKind};
 use cranelift_codegen::ir::types as clt;
 
 fn vec_of(ctx: &Context, t: TypeHandle) -> Option<(TypeHandle, u32)> {
@@ -40,6 +41,10 @@ fn elementwise(ctx: &Context, op: Ptr<Operation>) -> bool {
     }
     if let Some(c) = Operation::get_op::<CallIntrinsicOp>(op, ctx) {
         let n = String::from(c.get_attr_llvm_intrinsic_name(ctx).unwrap().clone());
+        // `pliron.v*` (see `vselect_fuse`) are lowered per native leaf.
+        if n.starts_with("pliron.v") {
+            return false;
+        }
         return ![
             "reduce",
             "masked",
@@ -116,6 +121,7 @@ fn leafwise_kind(ctx: &Context, op: Ptr<Operation>) -> bool {
         LEAFWISE_INTRINSICS.iter().any(|k| {
             n.strip_prefix(k)
                 .is_some_and(|r| r.is_empty() || r.starts_with('.'))
+                && (!matches!(*k, "llvm.minnum" | "llvm.maxnum") || crate::lower::fminmax_on())
         })
     })
 }
@@ -148,7 +154,7 @@ fn bf16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
 }
 
 /// Float intrinsics `lower_intrinsic` maps over SIMD leaves.
-pub const LEAFWISE_INTRINSICS: [&str; 10] = [
+pub const LEAFWISE_INTRINSICS: [&str; 12] = [
     "llvm.fma",
     "llvm.fmuladd",
     "llvm.sqrt",
@@ -159,6 +165,10 @@ pub const LEAFWISE_INTRINSICS: [&str; 10] = [
     "llvm.roundeven",
     "llvm.minimum",
     "llvm.maximum",
+    // `PLIRON_FMINMAX=1` only (see `lower.rs::fminmax_num`): otherwise a vector
+    // `maxnum` is split per lane into scalar `fmaxf` calls.
+    "llvm.minnum",
+    "llvm.maxnum",
 ];
 
 fn idx(ctx: &mut Context, i: u32, before: Ptr<Operation>) -> pliron::value::Value {
@@ -396,8 +406,123 @@ pub fn promote(ctx: &mut Context, func: Ptr<Operation>) {
     }
 }
 
+/// 128-bit SIMD leaves only (no 64-bit leaves, no planned-wide ymm/zmm ones).
+fn leaves128(ctx: &Context, t: TypeHandle) -> bool {
+    let l = crate::types::leaves(ctx, t);
+    !l.is_empty() && l.iter().all(|x| x.1.is_vector() && x.1.bits() == 128)
+}
+
+fn is32(ctx: &Context, e: TypeHandle) -> bool {
+    e.deref(ctx).is::<FP32Type>()
+        || e.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|i| i.width() == 32)
+}
+
+/// `PLIRON_VSELECT=1`: `select(fcmp/icmp(a, b), x, y)` on vectors of 32-bit lanes
+/// that are all 128-bit native leaves becomes `pliron.vcmp.<cc>.<f|s|u>` +
+/// `pliron.vbitselect`, applied per leaf by the lowerer (vector `fcmp`/`icmp`
+/// + `bitselect`). Without it a `<N x i1>` mask has no vector leaf, so the
+/// compare and the select are split into N scalar `fcmp` + `select` pairs
+/// (CubeCL's max-pool running max/argmax: 4x slower than LLVM). The scalar
+/// compare stays for any other user and is erased when this was the only one.
+fn vselect_fuse(ctx: &mut Context, func: Ptr<Operation>) {
+    if !crate::env_is("PLIRON_VSELECT", "1") {
+        return;
+    }
+    let mut sels = Vec::new();
+    let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();
+    for r in regions {
+        for b in r.deref(ctx).iter(ctx) {
+            for op in b.deref(ctx).iter(ctx) {
+                if Operation::get_op::<SelectOp>(op, ctx).is_some()
+                    && vec_of(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).is_some()
+                {
+                    sels.push(op);
+                }
+            }
+        }
+    }
+    for sel in sels {
+        let o: Vec<_> = sel.deref(ctx).operands(ctx).collect();
+        let (c, x, y) = (o[0], o[1], o[2]);
+        let Some(cmp) = c.defining_op() else { continue };
+        let (a, b, name, int_elem) = if let Some(f) = Operation::get_op::<FCmpOp>(cmp, ctx) {
+            use FCmpPredicateAttr as P;
+            let p = match f.predicate(ctx) {
+                P::OEQ => "eq",
+                P::UNE => "ne",
+                P::OLT => "lt",
+                P::OLE => "le",
+                P::OGT => "gt",
+                P::OGE => "ge",
+                _ => continue,
+            };
+            let co: Vec<_> = cmp.deref(ctx).operands(ctx).collect();
+            (co[0], co[1], format!("pliron.vcmp.{p}.f"), None)
+        } else if let Some(f) = Operation::get_op::<ICmpOp>(cmp, ctx) {
+            use ICmpPredicateAttr as P;
+            let p = match f.predicate(ctx) {
+                P::EQ => "eq.s",
+                P::NE => "ne.s",
+                P::SLT => "lt.s",
+                P::SLE => "le.s",
+                P::SGT => "gt.s",
+                P::SGE => "ge.s",
+                P::ULT => "lt.u",
+                P::ULE => "le.u",
+                P::UGT => "gt.u",
+                P::UGE => "ge.u",
+            };
+            let co: Vec<_> = cmp.deref(ctx).operands(ctx).collect();
+            let Some((e, _)) = vec_of(ctx, co[0].get_type(ctx)) else {
+                continue;
+            };
+            (co[0], co[1], format!("pliron.vcmp.{p}"), Some(e))
+        } else {
+            continue;
+        };
+        let (ta, tx, ty) = (a.get_type(ctx), x.get_type(ctx), y.get_type(ctx));
+        let (Some((ea, n)), Some((ex, nx))) = (vec_of(ctx, ta), vec_of(ctx, tx)) else {
+            continue;
+        };
+        if n != nx || ty != tx || b.get_type(ctx) != ta || !is32(ctx, ea) || !is32(ctx, ex) {
+            continue;
+        }
+        let mask_elem: TypeHandle = match int_elem {
+            Some(e) => e,
+            None => IntegerType::get(ctx, 32, Signedness::Signless).into(),
+        };
+        let mask_ty: TypeHandle = VectorType::get(ctx, mask_elem, n, VectorTypeKind::Fixed).into();
+        if ![ta, tx, mask_ty].iter().all(|&t| leaves128(ctx, t)) {
+            continue;
+        }
+        let fty = FuncType::get(ctx, mask_ty, vec![ta, ta], false);
+        let m = CallIntrinsicOp::new(ctx, StringAttr::new(name), fty, vec![a, b]).get_operation();
+        m.insert_before(ctx, sel);
+        let mv = m.deref(ctx).get_result(ctx, 0);
+        let fty = FuncType::get(ctx, tx, vec![mask_ty, tx, tx], false);
+        let s = CallIntrinsicOp::new(
+            ctx,
+            StringAttr::new("pliron.vbitselect".to_string()),
+            fty,
+            vec![mv, x, y],
+        )
+        .get_operation();
+        s.insert_before(ctx, sel);
+        let old = sel.deref(ctx).get_result(ctx, 0);
+        let new = s.deref(ctx).get_result(ctx, 0);
+        old.replace_all_uses_with(ctx, &new);
+        Operation::erase(sel, ctx);
+        if cmp.deref(ctx).get_result(ctx, 0).num_uses(ctx) == 0 {
+            Operation::erase(cmp, ctx);
+        }
+    }
+}
+
 pub fn run(ctx: &mut Context, func: Ptr<Operation>) {
     promote(ctx, func);
+    vselect_fuse(ctx, func);
     let mut todo = Vec::new();
     let mut shuffles = Vec::new();
     let regions: Vec<_> = func.deref(ctx).regions(ctx).collect();

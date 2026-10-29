@@ -362,6 +362,13 @@ fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
 }
 
+/// `PLIRON_FMINMAX=1`: `llvm.minnum`/`llvm.maxnum` on f32/f64 (and per native
+/// leaf on vectors) lower inline as `fmin`/`fmax` plus NaN selects instead of
+/// one `fminf`/`fmaxf` libcall per lane. Off by default.
+pub fn fminmax_on() -> bool {
+    crate::env_is("PLIRON_FMINMAX", "1")
+}
+
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
@@ -5818,6 +5825,42 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
+    /// IEEE `minNum`/`maxNum` on a scalar or a native vector leaf: `fmin`/`fmax`
+    /// propagate NaN, so pick the other operand where one side is NaN.
+    fn fminmax_num(&mut self, max: bool, a: ir::Value, b: ir::Value) -> ir::Value {
+        let t = self.b.func.dfg.value_type(a);
+        if t.is_vector() && t.bits() < 128 {
+            // 64-bit vectors (f32x2): no `bitselect` lowering; go lane by lane.
+            let mut r = None;
+            for i in 0..t.lane_count() {
+                let x = self.b.ins().extractlane(a, i as u8);
+                let y = self.b.ins().extractlane(b, i as u8);
+                let l = self.fminmax_num(max, x, y);
+                r = Some(match r {
+                    None => self.b.ins().splat(t, l),
+                    Some(v) => self.b.ins().insertlane(v, l, i as u8),
+                });
+            }
+            return r.unwrap();
+        }
+        let m = if max {
+            self.b.ins().fmax(a, b)
+        } else {
+            self.b.ins().fmin(a, b)
+        };
+        let an = self.b.ins().fcmp(FloatCC::Unordered, a, a);
+        let bn = self.b.ins().fcmp(FloatCC::Unordered, b, b);
+        if t.is_vector() {
+            let an = self.bitcast_to(t, an);
+            let bn = self.bitcast_to(t, bn);
+            let r = self.b.ins().bitselect(bn, a, m);
+            self.b.ins().bitselect(an, b, r)
+        } else {
+            let r = self.b.ins().select(bn, a, m);
+            self.b.ins().select(an, b, r)
+        }
+    }
+
     fn spill_vec(&mut self, v: Value, a: &Vals) -> (ir::Value, u64) {
         let (sz, al) = size_align(self.ctx, v.get_type(self.ctx));
         let p = self.slot(sz, al);
@@ -6988,7 +7031,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             return;
         }
-        if crate::scalarize::LEAFWISE_INTRINSICS.contains(&name) {
+        if crate::scalarize::LEAFWISE_INTRINSICS.contains(&name)
+            && (!matches!(name, "llvm.minnum" | "llvm.maxnum") || fminmax_on())
+        {
             let ls: Vec<Vals> = opnds.iter().map(|v| self.get(*v)).collect();
             if ls[0]
                 .iter()
@@ -6997,6 +7042,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let r: Vals = (0..ls[0].len())
                     .map(|j| {
                         let x: Vec<_> = ls.iter().map(|l| l[j]).collect();
+                        if matches!(name, "llvm.minnum" | "llvm.maxnum") {
+                            return self.fminmax_num(name == "llvm.maxnum", x[0], x[1]);
+                        }
                         let i = self.b.ins();
                         match name {
                             "llvm.fma" | "llvm.fmuladd" => i.fma(x[0], x[1], x[2]),
@@ -7311,6 +7359,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
             {
                 // No Cranelift instruction: call libm, like cg_llvm does on x86.
                 let t = self.b.func.dfg.value_type(a[0]);
+                if fminmax_on() && matches!(n, "llvm.minnum" | "llvm.maxnum") {
+                    if t == clt::F16 {
+                        let (x, y) = (self.h2f(a[0]), self.h2f(a[1]));
+                        let m = self.fminmax_num(n == "llvm.maxnum", x, y);
+                        let r = self.f2h(m);
+                        return self.set1(op, r);
+                    }
+                    if matches!(t.lane_type(), clt::F32 | clt::F64) {
+                        let r = self.fminmax_num(n == "llvm.maxnum", a[0], a[1]);
+                        return self.set1(op, r);
+                    }
+                }
                 let base = match &n["llvm.".len()..] {
                     "minnum" => "fmin",
                     "maxnum" => "fmax",

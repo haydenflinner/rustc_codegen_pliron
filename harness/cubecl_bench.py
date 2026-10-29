@@ -37,6 +37,9 @@ ROW = re.compile(r"^\s+(\S+)\s+(.+?)\s+([\d.]+)\s*(GOPS/s|Gbytes/s|GB/s|TOPS/s|M
 RSS = re.compile(r"(\d+)\s+maximum resident set size")
 
 
+CLIF_ENV = {}
+
+
 def run(cmd, cwd, clif, extra_env=None):
     """One process under /usr/bin/time -l; returns (stdout+stderr, kernels, rss_kb, seconds)."""
     fd, logf = tempfile.mkstemp(prefix="cubecl-pliron-", suffix=".log")
@@ -45,6 +48,7 @@ def run(cmd, cwd, clif, extra_env=None):
     env.pop("CUBECL_PLIRON_CLIF", None)
     if clif:
         env["CUBECL_PLIRON_CLIF"] = "1"
+        env.update(CLIF_ENV)
     t0 = time.time()
     p = subprocess.run(["/usr/bin/time", "-l"] + cmd, cwd=cwd, env=env, capture_output=True, text=True,
                        errors="replace")
@@ -73,9 +77,12 @@ def main():
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--cubek-bench", action="append", default=[], metavar="NAME=EXE")
     ap.add_argument("--cubek-samples", default="5")
+    ap.add_argument("--clif-env", default="", help="extra env for the CLIF runs, K=V,K=V (e.g. PLIRON_VSELECT=1,PLIRON_FMINMAX=1)")
+    ap.add_argument("--tag", default="", help="write cubecl-measure-<tag>.json instead")
     ap.add_argument("--only-cubek", action="store_true", help="skip the examples and the test-binary RSS run")
     ap.add_argument("--update", action="store_true", help="merge into an existing cubecl-measure.json")
     a = ap.parse_args()
+    CLIF_ENV.update(dict(kv.split("=", 1) for kv in a.clif_env.split(",") if kv))
     ex_dir = os.path.join(a.cubecl, "target/release/examples")
     work = tempfile.mkdtemp(prefix="cubecl-bench-")
     open(os.path.join(work, "cubecl.toml"), "w").write("[throughput]\ndisable_cache = true\n")
@@ -135,7 +142,7 @@ def main():
     res = {"host": subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
                                   text=True).stdout.strip() or os.uname().machine,
            "load": {"start": round(load0, 1), "end": round(os.getloadavg()[0], 1)},
-           "reps": a.reps, "spd": {}, "cmp": {}, "cmp_codegen": {}, "cold": {}, "mem": {}, "size": {}}
+           "reps": a.reps, "clif_env": CLIF_ENV, "spd": {}, "cmp": {}, "cmp_codegen": {}, "cold": {}, "mem": {}, "size": {}}
     for k, v in spd.items():
         if "llvm" in v and "clif" in v:
             res["spd"][k] = {"llvm": med([x for x, _ in v["llvm"]]), "clif": med([x for x, _ in v["clif"]]),
@@ -152,7 +159,7 @@ def main():
         if "llvm" in v and "clif" in v:
             res["mem"][k] = {"llvm_kb": med(v["llvm"]), "clif_kb": med(v["clif"])}
     os.makedirs(OUT, exist_ok=True)
-    path = os.path.join(OUT, "cubecl-measure.json")
+    path = os.path.join(OUT, f"cubecl-measure-{a.tag}.json" if a.tag else "cubecl-measure.json")
     if a.update and os.path.exists(path):
         old = json.load(open(path))
         for k in ("spd", "cmp", "cmp_codegen", "cold", "mem", "size"):
