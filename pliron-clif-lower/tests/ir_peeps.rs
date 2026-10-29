@@ -220,3 +220,23 @@ fn f16_splat_folds_ext_of_trunc() {
     assert_eq!(ext_of_trunc, 0, "fpext(fptrunc(exact)) not folded");
     assert_eq!(f.count::<ShuffleVectorOp>(), 1);
 }
+
+/// A one-lane broadcast of f32 lanes into 128-bit leaves is a `pliron.vsplat`
+/// (one `dup` per leaf), not an insertelement chain. Goes through the full
+/// `scalarize::run`.
+#[test]
+fn f32_splat_shuffle_becomes_vsplat() {
+    let mut f = F::new(|ctx| {
+        let e: TypeHandle = FP32Type::get(ctx).into();
+        let v = vec(ctx, e, 8);
+        (vec![v], v)
+    });
+    let a = f.arg(0);
+    let sh = ShuffleVectorOp::new(&mut f.ctx, a, a, vec![0; 8]).get_operation();
+    let sh = f.push(sh);
+    f.ret(sh);
+    scalarize::run(&mut f.ctx, f.func);
+    assert!(f.intrinsics().iter().any(|n| n == "pliron.vsplat"), "{:?}", f.intrinsics());
+    assert_eq!(f.count::<InsertElementOp>(), 0, "lane inserts left");
+    assert_eq!(f.count::<ShuffleVectorOp>(), 0);
+}

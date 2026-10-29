@@ -220,6 +220,31 @@ fn shuffle(ctx: &mut Context, op: Ptr<Operation>) {
     };
     let na = vec_of(ctx, a.get_type(ctx)).unwrap().1 as i32;
     let vty = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
+    // `PLIRON_F16SPLAT=1`: a broadcast of one lane of 32-bit elements into
+    // all-native 128-bit leaves is one `pliron.vsplat` (`dup`), not N lane
+    // inserts (4 `mov.s` per f32x4 leaf).
+    if crate::env_is("PLIRON_F16SPLAT", "1")
+        && mask[0] >= 0
+        && mask.iter().all(|&m| m == mask[0])
+        && vec_of(ctx, vty).is_some_and(|(e, _)| is32(ctx, e))
+        && leaves128(ctx, vty)
+    {
+        let m = mask[0];
+        let (src, j) = if m < na { (a, m) } else { (b, m - na) };
+        let jx = idx(ctx, j as u32, op);
+        let e = ExtractElementOp::new(ctx, src, jx).get_operation();
+        e.insert_before(ctx, op);
+        let lane = e.deref(ctx).get_result(ctx, 0);
+        let fty = FuncType::get(ctx, vty, vec![lane.get_type(ctx)], false);
+        let sp = CallIntrinsicOp::new(ctx, StringAttr::new("pliron.vsplat".to_string()), fty, vec![lane])
+            .get_operation();
+        sp.insert_before(ctx, op);
+        let old = op.deref(ctx).get_result(ctx, 0);
+        let new = sp.deref(ctx).get_result(ctx, 0);
+        old.replace_all_uses_with(ctx, &new);
+        Operation::erase(op, ctx);
+        return;
+    }
     let p = PoisonOp::new(ctx, vty).get_operation();
     p.insert_before(ctx, op);
     let mut acc = p.deref(ctx).get_result(ctx, 0);
