@@ -393,21 +393,64 @@ MATRIX_PASSES = [
 ]
 
 
-def fuzz_one(seed, matrix=False):
+_STOCK_SIG = None
+
+
+def _stock_sig():
+    """Cache key for stock-side fuzz results: the generator binary and the
+    pinned rustc. Both are fixed between most runs, so the stock half of a
+    seed (generate + 2 stock compiles + 2 runs, half its cost) is computed
+    once per seed and reused by every later run, gate and quick alike."""
+    global _STOCK_SIG
+    if _STOCK_SIG is None:
+        st = os.stat(GENERATE) if os.path.exists(GENERATE) else None
+        rv = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
+        _STOCK_SIG = hashlib.sha256(
+            f"{st.st_size if st else 0}:{int(st.st_mtime) if st else 0}:{rv}".encode()).hexdigest()[:16]
+    return _STOCK_SIG
+
+
+def _tup(x):
+    return (x[0], x[1], tuple(x[2]) if x[2] is not None else None)
+
+
+def _fuzz_one(seed, matrix=False):
     name = f"seed{seed}"
     d = os.path.join(OUT, "fuzz", str(seed))
     os.makedirs(d, exist_ok=True)
     src = os.path.join(d, "p.rs")
-    # `generate` reads config.toml from its cwd, i.e. the rustlantis root.
-    g = sh([GENERATE, str(seed)], 120, cwd=os.path.dirname(os.path.dirname(os.path.dirname(GENERATE))))
-    if g is None or g.returncode != 0:
-        return name, "generate-error", (g.stderr if g else "timeout")[-300:]
-    with open(src, "w") as f:
-        f.write(g.stdout)
-    refs = {}
-    for tag, opt, backend in (("stock0", "O0", False), ("stockO", "O", False),
-                              ("pliron0", "O0", True), ("plironO", "O", True)):
-        refs[tag] = fuzz_build_run(src, os.path.join(d, f"p.{tag}"), opt, backend)
+    cpath = os.path.join(OUT, "fuzz-stock", f"{seed}.json")
+    cached = None
+    if not os.environ.get("PLIRON_FUZZ_NOCACHE"):
+        try:
+            cached = json.load(open(cpath))
+            if cached.get("sig") != _stock_sig():
+                cached = None
+        except (OSError, ValueError):
+            cached = None
+    if cached:
+        with open(src, "w") as f:
+            f.write(cached["src"])
+        refs = {"stock0": _tup(cached["stock0"]), "stockO": _tup(cached["stockO"])}
+    else:
+        # `generate` reads config.toml from its cwd, i.e. the rustlantis root.
+        g = sh([GENERATE, str(seed)], 120, cwd=os.path.dirname(os.path.dirname(os.path.dirname(GENERATE))))
+        if g is None or g.returncode != 0:
+            return name, "generate-error", (g.stderr if g else "timeout")[-300:]
+        with open(src, "w") as f:
+            f.write(g.stdout)
+        refs = {}
+        for tag, opt in (("stock0", "O0"), ("stockO", "O")):
+            refs[tag] = fuzz_build_run(src, os.path.join(d, f"p.{tag}"), opt, False)
+        # Only cache complete references (a stock timeout is not a reference).
+        if refs["stock0"][2] is not None and refs["stockO"][2] is not None:
+            os.makedirs(os.path.dirname(cpath), exist_ok=True)
+            tmp = f"{cpath}.{os.getpid()}"
+            json.dump({"sig": _stock_sig(), "src": g.stdout, "stock0": refs["stock0"],
+                       "stockO": refs["stockO"]}, open(tmp, "w"))
+            os.replace(tmp, cpath)
+    for tag, opt in (("pliron0", "O0"), ("plironO", "O")):
+        refs[tag] = fuzz_build_run(src, os.path.join(d, f"p.{tag}"), opt, True)
     s0, sO, p0, pO = refs["stock0"], refs["stockO"], refs["pliron0"], refs["plironO"]
     if s0[2] is None or sO[2] is None:
         return name, "env-compile-error", f"stock O0: {s0[0]}, stock -O: {sO[0]} | {s0[1] or sO[1]}"
@@ -435,6 +478,15 @@ def fuzz_one(seed, matrix=False):
     return name, "pass", ""
 
 
+def fuzz_one(seed, matrix=False):
+    """Run one seed; a seed dir (4 binaries + source, ~4 MB) is kept only for real
+    failures. 11k kept dirs once filled the disk. PLIRON_FUZZ_KEEP=1 keeps all."""
+    r = _fuzz_one(seed, matrix)
+    if (r[1] == "pass" or r[1].startswith("env-")) and not os.environ.get("PLIRON_FUZZ_KEEP"):
+        shutil.rmtree(os.path.join(OUT, "fuzz", str(seed)), ignore_errors=True)
+    return r
+
+
 def suite_fuzz(args):
     if not os.path.exists(GENERATE):
         print(f"fuzz: no generator at {GENERATE}; build rustlantis or set PLIRON_FUZZ_GENERATOR")
@@ -447,7 +499,8 @@ def suite_fuzz(args):
     seeds = [s for s in seeds if args.filter in f"seed{s}"]
     import functools
     one = functools.partial(fuzz_one, matrix=args.matrix)
-    with cf.ThreadPoolExecutor(min(8, os.cpu_count())) as ex:
+    jobs = int(os.environ.get("PLIRON_FUZZ_JOBS", min(8, os.cpu_count())))
+    with cf.ThreadPoolExecutor(jobs) as ex:
         return {n: [st, msg] for n, st, msg in ex.map(one, seeds)}
 
 
