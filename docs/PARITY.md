@@ -113,6 +113,10 @@ at a visible price (one pliron-only crate failure rates COR 50). The
 script doesn't rerun the slow correctness suites; the card shows the age
 of each saved result. Weights live in `CARD` in `harness/parity.py`.
 
+Burn/CubeCL host-build suites (per-suite pliron-only vs stock failures, for
+the COR input): [`cubecl-burn-host.md`](cubecl-burn-host.md); 2026-10-29: 0
+pliron-only failures across 8.2k tests after two fixes.
+
 ## How to measure
 
 - Everything: `harness/parity.py` (~20 min; `--skip native,wasm,ctime,stack`,
