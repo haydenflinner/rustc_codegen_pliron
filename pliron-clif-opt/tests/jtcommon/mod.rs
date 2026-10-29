@@ -102,8 +102,13 @@ pub fn compile(src: &str) -> Code {
 }
 
 pub fn compile_func(func: cranelift_codegen::ir::Function) -> Code {
+    compile_func_opt(func, "none")
+}
+
+/// `opt_level`: `none`, `speed`, `speed_and_size`.
+pub fn compile_func_opt(func: cranelift_codegen::ir::Function, opt_level: &str) -> Code {
     let mut fb = settings::builder();
-    fb.set("opt_level", "none").unwrap();
+    fb.set("opt_level", opt_level).unwrap();
     let isa = isa::lookup(target_lexicon::Triple::host())
         .unwrap()
         .finish(settings::Flags::new(fb))
