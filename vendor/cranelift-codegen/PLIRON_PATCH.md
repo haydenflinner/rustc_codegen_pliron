@@ -905,3 +905,10 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     f16 widen/narrow produced garbage (the vcode text still said `fcvt`).
     Test: `pliron-clif-opt/tests/aarch64_f16_cvt_encoding.rs` (checks the
     emitted words).
+
+70. aarch64 `brif (band (ireduce y), 2^k)` / `brif (icmp eq (band (ireduce y), 2^k), 0)`
+    (`src/isa/aarch64/lower.isle`, `PLIRON_TBNZ_IREDUCE=1`, opt-in): `tbnz`/`tbz`
+    on `y`'s own register. The i8/i16 `ireduce` rule (patch 36) materializes
+    `uxtb`/`uxth`, which only clears bits a single-bit test never reads
+    (`bl f; uxtb w3,w2; tbnz w3,#0`, 149 sites in regex-syntax; -172 `uxtb`).
+    Test: `pliron-clif-opt/tests/tbnz_ireduce.rs` (two fail with the knob off).
