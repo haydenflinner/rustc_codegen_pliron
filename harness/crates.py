@@ -161,13 +161,35 @@ def stamp_ok(tdir, lib):
     open(sp, "w").write(want)
 
 
-def run_tests(src, side, args, lib, jobs, timeout, release):
-    tdir = os.path.join(OUT, f"target-{side}")
+def ws_wrapper(lib):
+    """rustc wrapper that adds the backend to *workspace members only* (cargo's
+    RUSTC_WORKSPACE_WRAPPER skips registry/git deps). The path embeds the dylib
+    hash, so cargo's fingerprint rebuilds just the members when the backend
+    changes while the stock-built deps stay cached (`--deps stock`)."""
+    h = hashlib.sha256(open(lib, "rb").read()).hexdigest()[:12]
+    w = os.path.join(OUT, f"wrap-{h}.sh")
+    if not os.path.exists(w):
+        os.makedirs(OUT, exist_ok=True)
+        with open(w, "w") as f:
+            f.write('#!/bin/sh\nrustc="$1"; shift\ncase " $* " in *" --crate-name "*) '
+                    f'exec "$rustc" "$@" -Zcodegen-backend={lib};; esac\nexec "$rustc" "$@"\n')
+        os.chmod(w, 0o755)
+    return w
+
+
+def run_tests(src, side, args, lib, jobs, timeout, release, deps_stock=False):
+    tdir = os.path.join(OUT, f"target-{side}" + ("-ws" if deps_stock and side == "pliron" else ""))
     env = dict(os.environ)
     env["CARGO_INCREMENTAL"] = "0"
     env.pop("RUSTFLAGS", None)
     env.pop("RUSTDOCFLAGS", None)
-    if side == "pliron":
+    if side == "pliron" and deps_stock:
+        # Fast mode: only the crate's own code goes through the backend (deps and
+        # doc-tests stay stock). Weaker than the full run, several times quicker.
+        env["RUSTC_WORKSPACE_WRAPPER"] = ws_wrapper(lib)
+        env["RUSTC_ICE"] = os.path.join(OUT, "ices")
+        os.makedirs(env["RUSTC_ICE"], exist_ok=True)
+    elif side == "pliron":
         flag = f"-Zcodegen-backend={lib}"
         env["RUSTFLAGS"] = flag
         env["RUSTDOCFLAGS"] = flag
@@ -212,6 +234,9 @@ def main():
     ap.add_argument("--debug", action="store_true", help="test profile instead of --release")
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--deps", choices=("pliron", "stock"), default="pliron",
+                    help="stock: build dependencies with stock rustc (cached across backend changes) "
+                         "and only the workspace members with pliron; no doc-tests through pliron")
     ap.add_argument("--profile", default="release", help="backend dylib profile (release|debug)")
     a = ap.parse_args()
     only = set(filter(None, a.only.split(",")))
@@ -219,7 +244,8 @@ def main():
     if not os.path.exists(lib):
         sys.exit(f"no backend dylib at {lib}: cargo build --{a.profile}")
     os.makedirs(os.path.join(OUT, "logs"), exist_ok=True)
-    stamp_ok(os.path.join(OUT, "target-pliron"), lib)
+    if a.deps == "pliron":
+        stamp_ok(os.path.join(OUT, "target-pliron"), lib)
     rows = []
     for name, ver, args, tier, *git in CRATES:
         if tier > a.tier or (only and name not in only):
@@ -237,7 +263,7 @@ def main():
         row = {"crate": f"{name}-{ver}"}
         for side in ("stock", "pliron"):
             r, log = run_tests(src, side, args, lib, a.jobs, TIMEOUTS.get(name, a.timeout),
-                               not a.debug)
+                               not a.debug, a.deps == "stock")
             open(os.path.join(OUT, "logs", f"{name}.{side}.log"), "w").write(log)
             row[side] = r
         only_p = sorted(set(row["pliron"]["fails"]) - set(row["stock"]["fails"]))
