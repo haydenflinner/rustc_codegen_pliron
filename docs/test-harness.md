@@ -20,6 +20,31 @@ Entry point: `harness/run.py` (see `harness/run.py --help`).
 | 8 | target matrix (x86_64-linux, aarch64-darwin, wasm32 via node, qemu/docker) | partial: expectations keyed by host; `ui-wasm` suite runs the UI corpus under wasm32-wasip1 (node WASI) differentially vs stock |
 | 9 | crate corpus (`compatibility.md` rows) as a harness suite | todo |
 
+## Fast inner loop: `harness/quick.py`
+
+`harness/quick.py [--tier 0|1] [--base REF] [--files a,b] [--seeds N] [--dry]`.
+Default base is `HEAD` (uncommitted + untracked; a clean tree uses
+`HEAD~1..HEAD`; `--base main` for the whole branch). `--dry` prints the plan.
+
+| tier | does | warm cost (loaded machine) |
+|---|---|---|
+| 0 | build clif-check (dylib too if rustc glue changed), unit tests of touched crates only (CLIF pass `x.rs`: lib tests + `tests/x*.rs`), corpus replay (smoke + std; falls back to the main checkout's `target/corpus` read-only, marked `*`) | 5-20 s |
+| 1 | tier 0 + dylib + stanzas chosen from changed paths (+ SM_POISON twins for slotmerge/slotprom) + `wasm_smoke` + all `FUZZ_REGRESS` seeds + 24 fresh seeds (rolling window in `target/quick/state.json`) | ~2 min |
+
+Selection: pass stem == stanza name, `tests/<dir>`, `PLIRON_<STEM>` mentions
+in `test.sh`, plus the `ALIAS` table in `quick.py`; unmapped paths fall back
+to CORE stanzas. The first run after a change compiles test binaries (60-100 s
+for pliron-clif-opt cold); later runs are seconds. It refuses to start below
+15 GB free.
+
+Supporting changes: the fuzz suite caches the stock half of every seed
+(`target/harness/fuzz-stock/<seed>.json`, keyed on generator + rustc; 40%
+less per seed), prunes passing seed dirs (`PLIRON_FUZZ_KEEP=1` keeps them,
+`PLIRON_FUZZ_NOCACHE=1` recomputes stock, `PLIRON_FUZZ_JOBS=N`), and
+`harness/crates.py --deps stock` builds dependencies with stock rustc
+(cargo `RUSTC_WORKSPACE_WRAPPER`, deps cached across backend changes) and
+sends only workspace members through the backend (no doc-tests).
+
 ## What existed before
 
 - `test.sh` — ~6 smoke programs; exit code only (except `unroll`, which diffs
