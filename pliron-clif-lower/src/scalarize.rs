@@ -419,7 +419,7 @@ fn is32(ctx: &Context, e: TypeHandle) -> bool {
             .is_some_and(|i| i.width() == 32)
 }
 
-/// `PLIRON_VSELECT=1`: `select(fcmp/icmp(a, b), x, y)` on vectors of 32-bit lanes
+/// `PLIRON_VSELECT` (default on, `=0` off): `select(fcmp/icmp(a, b), x, y)` on vectors of 32-bit lanes
 /// that are all 128-bit native leaves becomes `pliron.vcmp.<cc>.<f|s|u>` +
 /// `pliron.vbitselect`, applied per leaf by the lowerer (vector `fcmp`/`icmp`
 /// + `bitselect`). Without it a `<N x i1>` mask has no vector leaf, so the

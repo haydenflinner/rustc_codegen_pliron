@@ -362,9 +362,9 @@ fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
 }
 
-/// `PLIRON_FMINMAX=1`: `llvm.minnum`/`llvm.maxnum` on f32/f64 (and per native
-/// leaf on vectors) lower inline as `fmin`/`fmax` plus NaN selects instead of
-/// one `fminf`/`fmaxf` libcall per lane. Off by default.
+/// `PLIRON_FMINMAX` (default on, `=0` off): `llvm.minnum`/`llvm.maxnum` on
+/// f32/f64 (and per native leaf on vectors) lower inline as `fmin`/`fmax` plus
+/// NaN selects instead of one `fminf`/`fmaxf` libcall per lane.
 pub fn fminmax_on() -> bool {
     crate::env_is("PLIRON_FMINMAX", "1")
 }
