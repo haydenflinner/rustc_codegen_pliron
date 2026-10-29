@@ -59,7 +59,9 @@ def run(cmd, cwd, env, timeout):
 
 
 def one_path(bins, clif, threads, timeout):
-    env = {**os.environ, "CUBECL_PLIRON_LOG": "1", "RUST_BACKTRACE": "0"}
+    import tempfile
+    logf = tempfile.mktemp(prefix="cubecl-pliron-", suffix=".log")
+    env = {**os.environ, "CUBECL_PLIRON_LOG": logf, "RUST_BACKTRACE": "0"}
     env.pop("CUBECL_PLIRON_CLIF", None)
     if clif:
         env["CUBECL_PLIRON_CLIF"] = "1"
@@ -71,8 +73,6 @@ def one_path(bins, clif, threads, timeout):
             continue
         rc, so, se = run([exe, "--test-threads", str(threads)], cwd, env, timeout)
         res = {m.group(1): m.group(2) for m in LINE.finditer(so)}
-        for k in ("clif", "llvm"):
-            kernels[k] += len(re.findall(rf"\[cubecl-pliron\] path={k} ", se + so))
         todo = [t for t in listed if t not in res]
         if todo:
             print(f"  {name}: exit {rc}, {len(todo)} unfinished tests rerun singly", flush=True)
@@ -81,14 +81,11 @@ def one_path(bins, clif, threads, timeout):
                 rc, so, se = run([exe, "--exact", t, "--test-threads", "1"], cwd, env, 300)
                 ok = rc == 0 and re.search(r"test \S+ \.\.\. ok", so) is not None
                 ig = rc == 0 and "ignored" in so
-                n = {k: len(re.findall(rf"\[cubecl-pliron\] path={k} ", se + so)) for k in ("clif", "llvm")}
-                return t, "ok" if ok else ("ignored" if ig else "FAILED"), n
+                return t, "ok" if ok else ("ignored" if ig else "FAILED")
 
             with ThreadPoolExecutor(max_workers=threads) as ex:
-                for t, st, n in ex.map(single, todo):
+                for t, st in ex.map(single, todo):
                     res[t] = st
-                    for k in n:
-                        kernels[k] += n[k]
         for t, st in res.items():
             full = f"{name}::{t}"
             if st == "ok":
@@ -97,6 +94,11 @@ def one_path(bins, clif, threads, timeout):
                 ignored += 1
             else:
                 failed.append(full)
+    if os.path.exists(logf):
+        txt = open(logf).read()
+        for k in ("clif", "llvm"):
+            kernels[k] = len(re.findall(rf"\[cubecl-pliron\] path={k} ", txt))
+        os.unlink(logf)
     other = "llvm" if clif else "clif"
     return {"passed": passed, "failed": sorted(failed), "ignored": ignored,
             "kernels": kernels["clif" if clif else "llvm"], "kernels_on_other_path": kernels[other]}

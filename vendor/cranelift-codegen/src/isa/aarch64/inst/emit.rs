@@ -1903,14 +1903,15 @@ impl MachInstEmit for Inst {
                     // PLIRON: fcvt s<d>, h<n> / fcvt h<d>, s<n>. The ftype
                     // field (bits 23:22) names the *source* precision and is
                     // injected below from `size`; opc (bits 16:15) names the
-                    // destination (00 = s, 11 = h).
+                    // destination: bits 20:15 are `0001` + opc (00 = s, 11 = h), the same
+                    // layout as Cvt64To32 (000100) / Cvt32To64 (000101).
                     FPUOp1::Cvt16To32 => {
                         debug_assert_eq!(size, ScalarSize::Size16);
-                        0b000_11110_00_1_000000_10000
+                        0b000_11110_00_1_000100_10000
                     }
                     FPUOp1::Cvt32To16 => {
                         debug_assert_eq!(size, ScalarSize::Size32);
-                        0b000_11110_00_1_000011_10000
+                        0b000_11110_00_1_000111_10000
                     }
                 };
                 let top22 = top22 | size.ftype() << 12;

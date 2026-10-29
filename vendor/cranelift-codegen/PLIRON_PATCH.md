@@ -898,3 +898,10 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     4-lane f16 lines are an `F16X4` leaf under `types::NATIVE_F16`; without
     the rule every such kernel panicked in the JIT ("should be implemented
     in ISLE"). Test: `pliron-clif-opt/tests/f16x4_demote_aarch64.rs`.
+
+69. aarch64 scalar f16<->f32 `fcvt` encoding (`src/isa/aarch64/inst/emit.rs`):
+    #44's `FPUOp1::Cvt16To32`/`Cvt32To16` had bits 20:15 = 000000/000011
+    (`fmov h,h` / `fsqrt s,s`) instead of 000100/000111, so every scalar
+    f16 widen/narrow produced garbage (the vcode text still said `fcvt`).
+    Test: `pliron-clif-opt/tests/aarch64_f16_cvt_encoding.rs` (checks the
+    emitted words).
