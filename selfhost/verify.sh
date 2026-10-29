@@ -59,8 +59,32 @@ watchdog() {
     while :; do sleep 60; kill_stragglers; done
 }
 
+# Result cache (2026-10-29, untested: needs a stage-2 checkout). A stage's
+# failure list depends only on (rustc binary, suite tree, suite args). Stage 1
+# is the LLVM baseline and rarely changes, so its share of the wall time is
+# skipped whenever the key matches; stage 2 is reused only when the very same
+# binary is re-verified (resumed run, harness-only change).
+# VERIFY_NOCACHE=1 disables it. Entries: $OUT/cache/stage<N>-<key>.{failures,done}.
+stage_key() {
+    local bin="$WT/build/$HOST/stage$1/bin/rustc"
+    [ -x "$bin" ] || return 1
+    local tree
+    tree=$(git -C "$WT" rev-parse "HEAD:${SUITE}" 2>/dev/null) || return 1
+    # A dirty suite tree means no cache.
+    [ -z "$(git -C "$WT" status --porcelain -- "$SUITE")" ] || return 1
+    echo "$(shasum -a 256 "$bin" | cut -c1-16)-$(echo "$tree-$SUITE" | shasum -a 256 | cut -c1-12)"
+}
+
 run_stage() {
-    local st="$1"
+    local st="$1" key=""
+    mkdir -p "$OUT/cache"
+    if [ -z "${VERIFY_NOCACHE:-}" ] && key=$(stage_key "$st") && [ -s "$OUT/cache/stage$st-$key.done" ]; then
+        cp "$OUT/cache/stage$st-$key.failures" "$OUT/stage$st.failures"
+        rm -f "$OUT/stage$st.incomplete"
+        echo "stage$st: $(wc -l < "$OUT/stage$st.failures" | tr -d ' ') failures (CACHED, key $key; VERIFY_NOCACHE=1 to rerun)"
+        return
+    fi
+    key=$(stage_key "$st") || key=""
     watchdog & local wd=$!
     ./x test "$SUITE" --stage "$st" --force-rerun > "$OUT/stage$st.log" 2>&1
     local rc=$?
@@ -75,6 +99,9 @@ run_stage() {
     else
         rm -f "$OUT/stage$st.incomplete"
         echo "stage$st: $(wc -l < "$OUT/stage$st.failures" | tr -d ' ') failures (x exit $rc)"
+        if [ -n "$key" ]; then   # only complete runs are cached
+            cp "$OUT/stage$st.failures" "$OUT/cache/stage$st-$key.failures" && echo "$rc" > "$OUT/cache/stage$st-$key.done"
+        fi
     fi
 }
 

@@ -74,12 +74,14 @@ ALIAS = {
     "debuginfo": ["debuginfo", "dbgnested"],
     "dbg": ["debuginfo", "dbgnested"],
 }
+# Fuzz seeds by historical bug yield (newest / subtlest first).
+FUZZ_YIELD = [13475, 12309, 1939, 3441, 8631, 2598, 4940, 4895, 5042, 5542, 3938, 2542, 2187, 1776, 1276, 810, 730, 683, 538]
 # Slow commands that finish the proof, by area touched.
 SLOW = {
     "gate": "harness/gate.py",
     "wasm": "harness/gate.py --full   # adds the -Zbuild-std wasm sysroot legs (~4 min)",
     "fuzz": "harness/run.py --suite fuzz --no-build --fuzz-seeds A:B   # 400 seeds; stock refs cached after the first pass",
-    "crates": "harness/crates.py --tier 1   # real crate test suites (~10 min)",
+    "crates": "harness/crates.py --tier 1 --deps pliron   # real crate suites, deps through pliron too (~10 min); fast form: quick.py --crates NAME",
     "stage2": "selfhost/verify.sh   # stage-2 rustc UI suite (66-96 min); only for flag flips / big lowering changes",
     "parity": "harness/parity.py   # perf card (~12 min); only when moving a PARITY number",
 }
@@ -146,6 +148,8 @@ class Plan:
     def _stem_stanzas(self, stem):
         s = stem.lower()
         hits = [n for n in self.stanza_all if n == s or n.replace("_", "") == s.replace("_", "")]
+        if s in ALIAS:  # a curated entry replaces the body-grep heuristic (it over-selects, e.g. wasm -> pgo)
+            return hits + ALIAS[s]
         src = self.g.ROOT and open(os.path.join(ROOT, "test.sh")).read()
         for n, body in re.findall(r"^t_(\w+)\(\) \{\n(.*?)^\}", src, re.M | re.S):
             if re.search(rf"PLIRON_{re.escape(s.upper())}\b", body) or f"tests/{s}/" in body:
@@ -304,8 +308,12 @@ class Runner:
         except (OSError, ValueError):
             st = {}
         nxt = st.get("fuzz_next", 20000)
-        seeds = list(g.FUZZ_REGRESS) + list(range(nxt, nxt + nfresh))
-        cmd = [sys.executable, "-I", "harness/run.py", "--suite", "fuzz", "--no-build",
+        # Highest-yield seeds first (recent, subtle bugs: slotmerge, NARROWEXT, jumpthread
+        # rounds), then the rest of the regress bank, then fresh seeds; --fail-fast stops
+        # at the first failure so a real bug costs seconds, not the whole bank.
+        first = [s for s in FUZZ_YIELD if s in g.FUZZ_REGRESS]
+        seeds = first + [s for s in g.FUZZ_REGRESS if s not in first] + list(range(nxt, nxt + nfresh))
+        cmd = [sys.executable, "-I", "harness/run.py", "--suite", "fuzz", "--no-build", "--fail-fast",
                "--fuzz-seeds", ",".join(map(str, seeds))]
         r = self.sh("fuzz", cmd, env={"PLIRON_FUZZ_JOBS": str(self.a.jobs)})
         if r["ok"]:
@@ -324,10 +332,22 @@ def main():
     ap.add_argument("--seeds", type=int, default=24, help="fresh fuzz seeds (tier 1)")
     ap.add_argument("--files", default="", help="comma list instead of git diff")
     ap.add_argument("--dry", action="store_true", help="print the plan only")
+    ap.add_argument("--crates", default="", help="comma list of crates.py crates: run just those (stock results cached, "
+                    "stock-built deps) instead of the diff-driven plan")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--keep-going", action="store_true")
     a = ap.parse_args()
     g = load_gate()
+    if a.crates:
+        if not a.no_build:
+            subprocess.run(["cargo", "build", "-p", "rustc_codegen_pliron"], cwd=ROOT, check=True)
+        t = time.time()
+        rc = subprocess.run([sys.executable, "-I", "harness/crates.py", "--tier", "3", "--only", a.crates,
+                             "--profile", "debug", "--deps", "stock"], cwd=ROOT).returncode
+        print(f"quick: crates {a.crates} {'ok' if rc == 0 else 'FAILED'} in {time.time() - t:.0f}s "
+              f"(only the crate's own code went through pliron; completes with: harness/crates.py --tier 3 "
+              f"--only {a.crates} --deps pliron --profile release)")
+        return rc
     import shutil
     free = shutil.disk_usage(ROOT).free / 2**30
     if free < 15:

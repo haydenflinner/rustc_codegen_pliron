@@ -183,6 +183,11 @@ def run_tests(src, side, args, lib, jobs, timeout, release, deps_stock=False):
     env["CARGO_INCREMENTAL"] = "0"
     env.pop("RUSTFLAGS", None)
     env.pop("RUSTDOCFLAGS", None)
+    if deps_stock:
+        # Stock-built deps must be native objects: a profile with `lto` makes stock
+        # emit LLVM bitcode rlibs that the backend cannot link (prql's release
+        # profile did exactly this). Both sides use the same profile override.
+        env["CARGO_PROFILE_RELEASE_LTO"] = "off"
     if side == "pliron" and deps_stock:
         # Fast mode: only the crate's own code goes through the backend (deps and
         # doc-tests stay stock). Weaker than the full run, several times quicker.
@@ -227,6 +232,29 @@ def run_tests(src, side, args, lib, jobs, timeout, release, deps_stock=False):
     return res, log
 
 
+def stock_key(name, ver, args, release):
+    """Cache key for a crate's stock-side result: it only depends on the crate
+    source (name+version, or the pinned commit), cargo args, profile and the
+    stock toolchain, never on the backend."""
+    rv = subprocess.run(["rustc", f"+{TOOLCHAIN}", "-vV"], capture_output=True, text=True).stdout
+    return hashlib.sha256(json.dumps([name, ver, args, release, rv, "lto-off-v1"]).encode()).hexdigest()[:20]
+
+
+def stock_cached(key, fresh):
+    """(res, log) from target/crates/stock-cache/<key>.json, or run `fresh()` and store it.
+    A timed-out or build-error stock run is not cached."""
+    path = os.path.join(OUT, "stock-cache", key + ".json")
+    if not os.environ.get("PLIRON_CRATES_NOCACHE") and os.path.exists(path):
+        d = json.load(open(path))
+        d["res"]["cached"] = True
+        return d["res"], d["log"]
+    res, log = fresh()
+    if res["rc"] != "timeout" and not res["build_error"]:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        json.dump({"res": res, "log": log}, open(path, "w"))
+    return res, log
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier", type=int, default=1)
@@ -234,7 +262,7 @@ def main():
     ap.add_argument("--debug", action="store_true", help="test profile instead of --release")
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--timeout", type=int, default=1800)
-    ap.add_argument("--deps", choices=("pliron", "stock"), default="pliron",
+    ap.add_argument("--deps", choices=("pliron", "stock"), default="stock",
                     help="stock: build dependencies with stock rustc (cached across backend changes) "
                          "and only the workspace members with pliron; no doc-tests through pliron")
     ap.add_argument("--profile", default="release", help="backend dylib profile (release|debug)")
@@ -262,8 +290,12 @@ def main():
             continue
         row = {"crate": f"{name}-{ver}"}
         for side in ("stock", "pliron"):
-            r, log = run_tests(src, side, args, lib, a.jobs, TIMEOUTS.get(name, a.timeout),
-                               not a.debug, a.deps == "stock")
+            go = lambda: run_tests(src, side, args, lib, a.jobs, TIMEOUTS.get(name, a.timeout),
+                                   not a.debug, a.deps == "stock")
+            if side == "stock":
+                r, log = stock_cached(stock_key(name, ver, args, not a.debug), go)
+            else:
+                r, log = go()
             open(os.path.join(OUT, "logs", f"{name}.{side}.log"), "w").write(log)
             row[side] = r
         only_p = sorted(set(row["pliron"]["fails"]) - set(row["stock"]["fails"]))
@@ -282,7 +314,7 @@ def main():
         )
         row["status"] = status
         rows.append(row)
-        print(f"{status:8} {row['crate']:24} stock {s['passed']}/{s['failed']} ({s['secs']}s)  "
+        print(f"{status:8} {row['crate']:24} stock {s['passed']}/{s['failed']} ({s['secs']}s{' cached' if s.get('cached') else ''})  "
               f"pliron {p['passed']}/{p['failed']} ({p['secs']}s)  pliron-only {len(only_p)}", flush=True)
         for f in only_p[:10]:
             print(f"           {f}")
