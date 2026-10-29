@@ -74,3 +74,12 @@ to Mach-O objects yet". Changed:
   label at the start of the fixup's fragment, with the field's distance
   from it folded into the addend — as llvm-mc does. Instruction fields
   (`adr`) stay refused.
+
+Pliron patch: Mach-O `.pushsection`.
+
+`.pushsection __DATA,__ctor_force,regular,no_dead_strip` (emitted by the
+`ctor`/`linktime` crates for every static constructor) failed with "expected a
+string of section flags": the generic table's `.pushsection` only parses the
+ELF operand form. src/output/macho/directives.rs `macho_directive` now handles
+`.pushsection` itself (push the section stack, then the Mach-O `SEG,SECT,..`
+parse of `.section`). Test: tests/macho.rs `pushsection_takes_the_mach_o_operand_form`.

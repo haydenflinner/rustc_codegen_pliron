@@ -657,3 +657,37 @@ fn x86_64_differences_name_defined_symbols() {
     let err = macho_for("x86-64", "\t.long _ext - _f\n_f: ret\n").expect_err("should be refused");
     assert!(err.contains("only subtract symbols defined"), "{err}");
 }
+
+/// PLIRON: `.pushsection SEG,SECT,type,attr` / `.popsection` (what the `ctor`
+/// and `linktime` crates emit) takes the Mach-O operand form and restores the
+/// previous section; it matches the `.section` spelling byte for byte.
+#[test]
+fn pushsection_takes_the_mach_o_operand_form() {
+    let pushed = "\
+.text
+.globl _f
+_f:
+    ret
+.pushsection __DATA,__ctor_force,regular,no_dead_strip
+.p2align 3
+.quad _f
+.popsection
+_g:
+    ret
+";
+    let sectioned = "\
+.text
+.globl _f
+_f:
+    ret
+.section __DATA,__ctor_force,regular,no_dead_strip
+.p2align 3
+.quad _f
+.text
+_g:
+    ret
+";
+    let a = macho_for("aarch64", pushed).unwrap_or_else(|e| panic!("pushsection failed:\n{e}"));
+    let b = macho_for("aarch64", sectioned).unwrap();
+    assert_eq!(a, b);
+}

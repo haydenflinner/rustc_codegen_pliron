@@ -102,6 +102,13 @@ impl Assembler {
     pub(crate) fn macho_directive(&mut self, text: &str, cur: &mut Cursor<'_>, span: Span) -> bool {
         match text {
             ".section" => self.macho_dir_section(cur, span),
+            // PLIRON: Mach-O `.pushsection SEG,SECT[,type[,attrs]]` (the
+            // `ctor`/`linktime` crates emit `__DATA,__ctor_force,regular,..`);
+            // the generic table only knows the ELF operand form.
+            ".pushsection" => {
+                self.push_section_stack();
+                self.macho_dir_section(cur, span)
+            }
             ".zerofill" => self.macho_dir_zerofill(cur, span),
             ".lcomm" => self.macho_dir_lcomm(cur, span),
             ".comm" => self.macho_dir_comm(cur, span),
