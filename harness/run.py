@@ -500,8 +500,19 @@ def suite_fuzz(args):
     import functools
     one = functools.partial(fuzz_one, matrix=args.matrix)
     jobs = int(os.environ.get("PLIRON_FUZZ_JOBS", min(8, os.cpu_count())))
+    # Seeds run in the order given (put the highest-yield ones first: quick.py
+    # does). --fail-fast cancels the queued seeds at the first real failure
+    # (env-* statuses are not failures); seeds already running finish.
+    out = {}
     with cf.ThreadPoolExecutor(jobs) as ex:
-        return {n: [st, msg] for n, st, msg in ex.map(one, seeds)}
+        futs = [ex.submit(one, s) for s in seeds]
+        for f in cf.as_completed(futs):
+            n, st, msg = f.result()
+            out[n] = [st, msg]
+            if getattr(args, "fail_fast", False) and st != "pass" and not st.startswith("env-"):
+                print(f"fuzz: {n} {st}: stopping early ({sum(1 for x in futs if x.cancel())} queued seeds cancelled)")
+                break
+    return out
 
 
 # --------------------------------------------------------- expectations
@@ -586,6 +597,7 @@ def main():
     ap.add_argument("--fuzz-seeds", default="0:32", metavar="START:END[,SEED...]",
                     help="seed range for the fuzz suite (default 0:32)")
     ap.add_argument("--rust", help="rust checkout for the ui suite (default: ../rust or ~/work/rust)")
+    ap.add_argument("--fail-fast", action="store_true", help="fuzz: stop at the first failing seed")
     ap.add_argument("--no-build", action="store_true", help="skip `cargo build` of the backend")
     args = ap.parse_args()
     if not args.no_build:
