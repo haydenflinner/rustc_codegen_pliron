@@ -344,6 +344,59 @@ fn f16_vec_promotable(ctx: &mut Context, op: Ptr<Operation>) -> bool {
     }
 }
 
+/// `PLIRON_F16SPLAT=1`: `fpext(fptrunc(w))` is just `w` when every lane of `w`
+/// is already exactly representable in the narrow element type `narrow`
+/// (lanes that came from `fpext` of `narrow`, zero/undef/poison, through
+/// `insertelement`/`extractelement`/`shufflevector`). Promoted f16 lane ops
+/// (CubeCL builds an f16 line by inserting then splatting through f32) wrap
+/// every step in a narrow + widen; without this fold a scalar broadcast costs
+/// ~13 NEON instructions instead of one `dup.8h`.
+fn exact_in(ctx: &Context, v: pliron::value::Value, narrow: TypeHandle, depth: u32) -> bool {
+    let Some(d) = v.defining_op() else {
+        return false;
+    };
+    if depth == 0 {
+        return false;
+    }
+    let operand = |i: usize| d.deref(ctx).get_operand(ctx, i);
+    if Operation::get_op::<FPExtOp>(d, ctx).is_some() {
+        let t = operand(0).get_type(ctx);
+        let e = vec_of(ctx, t).map_or(t, |x| x.0);
+        return e == narrow;
+    }
+    if Operation::get_op::<ZeroOp>(d, ctx).is_some()
+        || Operation::get_op::<UndefOp>(d, ctx).is_some()
+        || Operation::get_op::<PoisonOp>(d, ctx).is_some()
+    {
+        return true;
+    }
+    if Operation::get_op::<InsertElementOp>(d, ctx).is_some() {
+        return exact_in(ctx, operand(0), narrow, depth - 1)
+            && exact_in(ctx, operand(1), narrow, depth - 1);
+    }
+    if Operation::get_op::<ExtractElementOp>(d, ctx).is_some() {
+        return exact_in(ctx, operand(0), narrow, depth - 1);
+    }
+    if Operation::get_op::<ShuffleVectorOp>(d, ctx).is_some() {
+        return exact_in(ctx, operand(0), narrow, depth - 1)
+            && exact_in(ctx, operand(1), narrow, depth - 1);
+    }
+    false
+}
+
+/// The `w` of `v = fptrunc(w)` when `fpext(v)` back to `w`'s type is exact.
+pub fn fold_ext_of_trunc(ctx: &Context, v: pliron::value::Value) -> Option<pliron::value::Value> {
+    if !crate::env_is("PLIRON_F16SPLAT", "1") {
+        return None;
+    }
+    let d = v.defining_op()?;
+    Operation::get_op::<FPTruncOp>(d, ctx)?;
+    let w = d.deref(ctx).get_operand(ctx, 0);
+    let nt = v.get_type(ctx);
+    let narrow = vec_of(ctx, nt).map_or(nt, |x| x.0);
+    exact_in(ctx, w, narrow, 8).then_some(w)
+}
+
 fn promote_with(
     ctx: &mut Context,
     op: Ptr<Operation>,
@@ -356,6 +409,10 @@ fn promote_with(
         let t = v.get_type(ctx);
         if has_bf16(ctx, t) {
             let f32t = widen_bf16(ctx, t);
+            if let Some(w) = fold_ext_of_trunc(ctx, v).filter(|w| w.get_type(ctx) == f32t) {
+                map.map_value(v, w);
+                continue;
+            }
             let e = FPExtOp::new(ctx, v, f32t).get_operation();
             e.insert_before(ctx, op);
             map.map_value(v, e.deref(ctx).get_result(ctx, 0));
@@ -426,7 +483,7 @@ fn is32(ctx: &Context, e: TypeHandle) -> bool {
 /// compare and the select are split into N scalar `fcmp` + `select` pairs
 /// (CubeCL's max-pool running max/argmax: 4x slower than LLVM). The scalar
 /// compare stays for any other user and is erased when this was the only one.
-fn vselect_fuse(ctx: &mut Context, func: Ptr<Operation>) {
+pub fn vselect_fuse(ctx: &mut Context, func: Ptr<Operation>) {
     if !crate::env_is("PLIRON_VSELECT", "1") {
         return;
     }
