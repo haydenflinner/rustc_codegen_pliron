@@ -892,3 +892,9 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     dominate their bodies, so the entry exists, and the hoist block still
     dominates the body, so the scope depth it carries is still open).
     Test: `pliron-clif-opt/tests/elabloops.rs`.
+
+68. aarch64 `fvdemote_f16` to a 64-bit `f16x4` (`src/isa/aarch64/lower.isle`):
+    one `fcvtn v.4h, v.4s` (matching x64's `(multi_lane 16 4)` arm). CubeCL's
+    4-lane f16 lines are an `F16X4` leaf under `types::NATIVE_F16`; without
+    the rule every such kernel panicked in the JIT ("should be implemented
+    in ISLE"). Test: `pliron-clif-opt/tests/f16x4_demote_aarch64.rs`.

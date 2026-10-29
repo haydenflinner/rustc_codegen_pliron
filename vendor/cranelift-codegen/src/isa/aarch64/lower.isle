@@ -3716,6 +3716,11 @@
 (rule (lower (fvpromote_f16_hi $F32X4 x))
       (vec_rr_long (VecRRLongOp.Fcvtl16) x true))
 
+;; One f32x4 -> f16x4 (a 64-bit leaf: CubeCL's 4-lane f16 lines). `fcvtn` writes
+;; the low 64 bits of the destination and zeroes the rest.
+(rule (lower (fvdemote_f16 (multi_lane 16 4) x))
+      (fcvtn x (ScalarSize.Size32)))
+
 (rule (lower (fvdemote_f16_pair $F16X8 x y))
       (let ((low Reg (fcvtn x (ScalarSize.Size32)))
             (result Reg (fcvtn2 low y (ScalarSize.Size32))))
