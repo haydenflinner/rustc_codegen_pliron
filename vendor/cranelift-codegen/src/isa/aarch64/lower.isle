@@ -3719,11 +3719,11 @@
 ;; One f32x4 -> f16x4 (a 64-bit leaf: CubeCL's 4-lane f16 lines). `fcvtn` writes
 ;; the low 64 bits of the destination and zeroes the rest.
 (rule (lower (fvdemote_f16 (multi_lane 16 4) x))
-      (fcvtn x (ScalarSize.Size32)))
+      (fcvtn x (ScalarSize.Size16)))
 
 (rule (lower (fvdemote_f16_pair $F16X8 x y))
-      (let ((low Reg (fcvtn x (ScalarSize.Size32)))
-            (result Reg (fcvtn2 low y (ScalarSize.Size32))))
+      (let ((low Reg (fcvtn x (ScalarSize.Size16)))
+            (result Reg (fcvtn2 low y (ScalarSize.Size16))))
         result))
 
 ;;; Rules for `brif` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
