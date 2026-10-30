@@ -28,9 +28,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use waffle::entity::EntityRef;
 use waffle::{
-    Block as WBlock, BlockTarget, Export, ExportKind, Func, FuncDecl, FunctionBody, Global,
-    GlobalData, Import, ImportKind, Memory, MemoryArg, MemoryData, Module, Operator as O,
-    Signature, SignatureData, Table, TableData, Terminator, Type as WT, Value as WV, ValueDef,
+    Block as WBlock, BlockTarget, BlockTypeIntern, Export, ExportKind, Func, FuncDecl,
+    FunctionBody, Global, GlobalData, Import, ImportKind, Memory, MemoryArg, MemoryData, Module,
+    Operator as O, Signature, SignatureData, Table, TableData, Terminator, Type as WT,
+    Value as WV, ValueDef,
 };
 
 use crate::context::State;
@@ -419,10 +420,25 @@ fn emit_obj(
         }
     }
     // Bodies compile independently (waffle's backend reads only the body).
+    // Multi-value typed-`if` (`PLIRON_WIFRET_MULTI=1`): intern blocktypes
+    // and append them to `signatures` before `to_wasm_bytes`.
+    let wifret_multi = crate::env_get("PLIRON_WIFRET_MULTI")
+        .is_some_and(|v| v != "0" && v != "false");
+    let block_types = std::sync::Mutex::new(BlockTypeIntern::new(o.m.signatures.len() as u32));
     let compiled: Vec<Option<Result<Vec<u8>, String>>> = par_map(decls.len(), |i| {
-        decls[i].body.as_ref().map(|b| match guarded(|| b.compile().map_err(|e| e.to_string())) {
-            Ok(Ok(c)) => Ok(c.into_raw_body()),
-            Ok(Err(e)) | Err(e) => Err(e),
+        decls[i].body.as_ref().map(|b| {
+            let r = guarded(|| {
+                if wifret_multi {
+                    b.compile_with_block_types(&block_types)
+                        .map_err(|e| e.to_string())
+                } else {
+                    b.compile().map_err(|e| e.to_string())
+                }
+            });
+            match r {
+                Ok(Ok(c)) => Ok(c.into_raw_body()),
+                Ok(Err(e)) | Err(e) => Err(e),
+            }
         })
     });
     // `PLIRON_WASM_SIZELOG=1`: one `wsize <insts> <bytes> <name>` line per
@@ -433,6 +449,18 @@ fn emit_obj(
                 let insts: usize = b.blocks.values().map(|d| d.insts.len()).sum();
                 eprintln!("wsize {insts} {} {}", bytes.len(), d.name);
             }
+        }
+    }
+    if wifret_multi {
+        for returns in block_types
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .into_types()
+        {
+            o.m.signatures.push(SignatureData {
+                params: Vec::new(),
+                returns,
+            });
         }
     }
     for (d, c) in decls.into_iter().zip(compiled) {
@@ -664,6 +692,8 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)], nparams: u32) -
 
 #[path = "wpeep_audit.rs"]
 mod wpeep_audit;
+#[path = "wpeep_elide.rs"]
+mod wpeep_elide;
 
 /// `wpeep` switches. `from_env`: `PLIRON_WASM_AUDIT=1` audits every
 /// copy-forward round with the Datalog checker in `wpeep_audit` and
@@ -692,6 +722,9 @@ struct PeepOpts {
     bri2: bool,
     /// `br K` before its K+1 enclosing `end`s (`PLIRON_WASM_BTR=0` off).
     btr: bool,
+    /// Unused-`block`/`loop` elision (`PLIRON_WASM_ELIDEBLK=0` off);
+    /// fact-audited and reverted on a broken assumption.
+    elideblk: bool,
 }
 
 impl PeepOpts {
@@ -710,6 +743,9 @@ impl PeepOpts {
             bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
             bri2: crate::env_get("PLIRON_WASM_BRI2") != Some("0"),
             btr: crate::env_get("PLIRON_WASM_BTR") != Some("0"),
+            // Default on: −1.5 KiB regex-wasm CODE (11415→10917 blocks);
+            // `=0` off. Fact-audited; bad rounds revert (`wpeep_elide`).
+            elideblk: crate::env_get("PLIRON_WASM_ELIDEBLK") != Some("0"),
         }
     }
 }
@@ -5057,9 +5093,25 @@ fn peep_body_opts(
             }
         }
     }
+    // Residual if/else→br_if: stackify `PLIRON_WBRIF=1` rewrites If
+    // nodes but grows CODE (~16%) by defeating wpeep's if-based folds.
+    // A late bytecode ibrk was tried and corrupted bodies (2026-10-28).
+    // Next: emit br_if shapes from stackify CondBr in a wpeep-friendly
+    // form, or port bri/brf to block+br_if.
     // (Local renumbering — hot-first index compaction — was tried and
     // reverted: the `groups` regroup it forces costs more than the
     // 1-byte-LEB savings it buys; ~+18B net on the module.)
+    //
+    // Unused-`block`/`loop` elision (`PLIRON_WASM_ELIDEBLK=0` off):
+    // fact-audited — assume_untargeted + assume_empty_type +
+    // assume_wellformed; a failed fact reverts the round (`wpeep_elide`).
+    if opts.elideblk {
+        for _ in 0..8 {
+            if wpeep_elide::elide_round(b, &mut ins, opts.audit_panic, &opts.tag) == 0 {
+                break;
+            }
+        }
+    }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
     for &(c, t) in &groups {
@@ -5581,6 +5633,7 @@ mod wpeep_tests {
             bri: false,
             bri2: false,
             btr: false,
+            elideblk: false,
         }
     }
 
@@ -8121,16 +8174,15 @@ fn call_sccs(funcs: &[FDecl]) -> Vec<u32> {
 }
 
 fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
-    // `PLIRON_WASM_TINY=N` / `PLIRON_WASM_SOLO=N` (defaults 12 / 50 via
-    // `pliron_cfg::DEFAULT_VALUES` for SOLO): always-inline and
-    // single-callsite caps. SOLO 300→100→50: regex-wasm −39 then −6.4 KiB;
-    // layouts=3 runtime still flat (2026-10-28-solo50.md).
+    // `PLIRON_WASM_TINY=N` / `PLIRON_WASM_SOLO=N` (defaults 6 / 15 via
+    // `pliron_cfg::DEFAULT_VALUES`): always-inline and single-callsite
+    // caps. SOLO 100→25→15 and TINY 12→6: regex-wasm 1.84→1.79×.
     let tiny: usize = crate::env_get("PLIRON_WASM_TINY")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(12);
+        .unwrap_or(6);
     let solo: usize = crate::env_get("PLIRON_WASM_SOLO")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
+        .unwrap_or(15);
     // Mid-size (<=64) multi-callsite inlining measured ~1% runtime for
     // +2% size on wbig â€” wasm calls really are cheap and the splice's
     // optimizer doesn't recover the rest. Not a rule.

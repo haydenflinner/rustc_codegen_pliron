@@ -57,6 +57,44 @@ LLVM's destructive-update shape.
 
 `PLIRON_WCOAL=0` disables it (stock freelist order).
 
+## `src/backend/localify.rs` — lifetime-hole recolor (`PLIRON_WCOAL_HOLES=1`)
+
+`coalesce_holes()` runs after `allocate`. The freelist colors
+linearized reverse-RPO intervals, so a value live in B_early and
+B_late looks live through every block between them in that order
+even when `block_end_live` says it is dead there — a short-lived
+value whose true range sits only in such a hole then gets a fresh
+local. The pass rebuilds a local-interference graph from precise
+per-block SSA liveness and greedily recolors same-type locals
+(entry-param indices stay fixed). On kernels-wasm: 764→636 locals
+(−17%), CODE −345 B. Default on; `PLIRON_WCOAL_HOLES=0` or
+`PLIRON_WCOAL=0` kills.
+
+## `src/backend/stackify.rs` — SelectJoin / brif-fork / WBRIF
+
+- `PLIRON_WSEL` (default on, `=0` off): same-join CondBr →
+  `SelectJoin` (per-param `select` + `br`) instead of `if`/`else`.
+- `PLIRON_WBFORK=1`: different-join CondBr → `block`+`br_if` fork.
+  Removes if/else but **grows** CODE (~+7 KiB regex); opt-in only.
+- `PLIRON_WBRIF=1`: post-pass If→block+br_if; also grows CODE ~16%.
+
+## `src/backend/mod.rs` — BlockParams identity skip + SelectJoin
+
+Skip `get L; set L` identity blockparam transfers at emit. Lower
+`SelectJoin` as true/false/`select`/`set` per param.
+
+## `src/backend/treeify.rs` — edge-arg remat (`PLIRON_WTREEREMAT=0` off)
+
+Pure single-use edge-only values rematerialize at the use instead of
+`local.set`+`local.get`. Cheap unary ops (eqz/wrap/extend/…) with ≤2
+uses also remat (`PLIRON_WTREEREMAT_UNARY=0` off). Regex-wasm CODE
+404→385 KiB (−19 KiB); with SOLO=15+TINY=6 → 376 KiB; +`WIFRET` typed
+single-param if results → 375 KiB (1.79×). `PLIRON_WIFRET=0` off.
+Multi-param typed if (`PLIRON_WIFRET_MULTI=1` + `BlockTypeIntern`) is
+wired but default-off — grew regex-wasm CODE in 2026-10-28 trials.
+`PLIRON_WBRIF=exit` rewrites only both-exit Ifs to block+br_if (still
+grows CODE vs off; full `=1` grows more).
+
 All changes are marked `// PLIRON:` in the source.
 
 ## `src/backend/treeify.rs` — loop-nest guard (`PLIRON_WTREE_LOOP=0` off)

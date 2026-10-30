@@ -629,6 +629,16 @@ impl FunctionBody {
     pub fn compile(&self) -> Result<wasm_encoder::Function> {
         WasmFuncBackend::compile(self)
     }
+
+    /// PLIRON: compile while interning multi-value `if` blocktypes into
+    /// `block_types` (append its `into_types()` to the module signatures
+    /// before `to_wasm_bytes`).
+    pub fn compile_with_block_types(
+        &self,
+        block_types: &std::sync::Mutex<crate::backend::BlockTypeIntern>,
+    ) -> Result<wasm_encoder::Function> {
+        WasmFuncBackend::compile_with_block_types(self, Some(block_types))
+    }
 }
 
 #[derive(Clone, Debug, Default)]

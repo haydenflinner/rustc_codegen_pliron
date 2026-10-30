@@ -44,6 +44,30 @@ fn is_remat(op: &Operator) -> bool {
     }
 }
 
+/// PLIRON: unary ops cheap enough that rematting ≤2 uses beats a local.
+fn is_cheap_unary(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::I32Eqz
+            | Operator::I64Eqz
+            | Operator::I32WrapI64
+            | Operator::I64ExtendI32U
+            | Operator::I64ExtendI32S
+            | Operator::I32Extend8S
+            | Operator::I32Extend16S
+            | Operator::I64Extend8S
+            | Operator::I64Extend16S
+            | Operator::I64Extend32S
+            | Operator::I32Clz
+            | Operator::I32Ctz
+            | Operator::I32Popcnt
+            | Operator::I64Clz
+            | Operator::I64Ctz
+            | Operator::I64Popcnt
+    )
+}
+
+
 impl Trees {
     pub fn compute(body: &FunctionBody, cfg: &CFGInfo) -> Trees {
         let mut owner = HashMap::default();
@@ -121,6 +145,59 @@ impl Trees {
                     owned.remove(&old_owner);
                 }
             });
+        }
+
+        // PLIRON: pure values used *only* as terminator/edge args
+        // (ownership was purged above) rematerialize at each edge
+        // instead of `local.set` + `local.get`s — LLVM's shape for
+        // throwaway arithmetic on branches. Inst-uses keep the local.
+        // `PLIRON_WTREEREMAT=0` disables.
+        if !std::env::var_os("PLIRON_WTREEREMAT").is_some_and(|v| v == "0") {
+            let mut inst_uses = vec![0u32; body.values.len()];
+            let mut term_uses = vec![0u32; body.values.len()];
+            for block in body.blocks.values() {
+                for &iv in &block.insts {
+                    if let &ValueDef::Operator(_, args, _) = &body.values[iv] {
+                        for &a in &body.arg_pool[args] {
+                            let a = body.resolve_alias(a);
+                            if let Some(slot) = inst_uses.get_mut(a.index()) {
+                                *slot = slot.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                block.terminator.visit_uses(|u| {
+                    let u = body.resolve_alias(u);
+                    if let Some(slot) = term_uses.get_mut(u.index()) {
+                        *slot = slot.saturating_add(1);
+                    }
+                });
+            }
+            let unary_ok = !std::env::var_os("PLIRON_WTREEREMAT_UNARY")
+                .is_some_and(|x| x == "0");
+            for (v, def) in body.values.entries() {
+                if remat.contains(&v) || owner.contains_key(&v) {
+                    continue;
+                }
+                let iu = inst_uses.get(v.index()).copied().unwrap_or(0);
+                let tu = term_uses.get(v.index()).copied().unwrap_or(0);
+                let total = iu.saturating_add(tu);
+                let &ValueDef::Operator(op, _, tys) = def else {
+                    continue;
+                };
+                if tys.len() != 1 || !op.is_pure() || total == 0 {
+                    continue;
+                }
+                // Single edge-only use: always remat.
+                if iu == 0 && tu == 1 {
+                    remat.insert(v);
+                    continue;
+                }
+                // Cheap unary, ≤2 uses total.
+                if total <= 2 && unary_ok && is_cheap_unary(&op) {
+                    remat.insert(v);
+                }
+            }
         }
 
         // PLIRON: validate load sinking. `is_movable` admits loads so a

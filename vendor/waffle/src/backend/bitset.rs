@@ -20,6 +20,13 @@ impl Bitset {
         new
     }
 
+    /// Whether bit `i` is set.
+    pub fn contains(&self, i: u32) -> bool {
+        let word = usize::try_from(i / 64).unwrap();
+        let bit = 1u64 << (i % 64);
+        self.words.get(word).is_some_and(|w| w & bit != 0)
+    }
+
     /// Iterate over all set bit-indices.
     pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         self.words.iter().enumerate().flat_map(|(wi, &w)| {
@@ -56,6 +63,19 @@ mod tests {
         assert!(b.insert(64));
         assert!(!b.insert(63));
         assert!(!b.insert(64));
+    }
+
+    #[test]
+    fn contains_matches_insert() {
+        let mut b = Bitset::default();
+        assert!(!b.contains(0));
+        assert!(!b.contains(100));
+        b.insert(0);
+        b.insert(100);
+        assert!(b.contains(0));
+        assert!(b.contains(100));
+        assert!(!b.contains(1));
+        assert!(!b.contains(99));
     }
 
     #[test]

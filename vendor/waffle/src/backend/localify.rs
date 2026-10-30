@@ -15,7 +15,7 @@ use crate::backend::treeify::Trees;
 use crate::cfg::CFGInfo;
 use crate::entity::{EntityRef, EntityVec, PerEntity};
 use crate::ir::{Block, BlockTarget, FunctionBody, Local, Terminator, Type, Value, ValueDef};
-use fxhash::FxHashMap as HashMap;
+use fxhash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::{smallvec, SmallVec};
 use std::ops::Range;
 
@@ -695,6 +695,221 @@ impl<'a> Context<'a> {
         self.compute_preferred();
         self.compute_steal();
         self.allocate();
+        self.coalesce_holes();
         self.results
     }
+
+    /// PLIRON: merge locals that the linearized-range freelist kept
+    /// apart because of lifetime holes. `find_ranges` assigns each
+    /// value a single interval in reverse-RPO point space, so a value
+    /// live in B_early and B_late looks live through every block
+    /// between them in that order — even when precise
+    /// `block_end_live` says it is dead there. Another value whose
+    /// true range sits only in a hole then gets a fresh local.
+    ///
+    /// Walk each block with SSA liveness (seeded from
+    /// `block_end_live`) to build a local-interference graph, then
+    /// greedily recolor same-type locals. Entry-param locals keep
+    /// their indices. `PLIRON_WCOAL_HOLES=1` enables; `PLIRON_WCOAL=0`
+    /// disables together with preferred/steal.
+    fn coalesce_holes(&mut self) {
+        // Default on; `PLIRON_WCOAL_HOLES=0` or `PLIRON_WCOAL=0` kills.
+        if std::env::var_os("PLIRON_WCOAL").is_some_and(|v| v == "0")
+            || std::env::var_os("PLIRON_WCOAL_HOLES").is_some_and(|v| v == "0")
+        {
+            return;
+        }
+        let n = self.results.locals.len();
+        if n <= 1 {
+            return;
+        }
+        let n_params = self.body.blocks[self.body.entry].params.len();
+        let mut inter = vec![Bitset::default(); n];
+
+        for &block in self.cfg.rpo.values() {
+            let mut state = HoleLive::default();
+            for id in self.block_end_live[block].iter() {
+                let v = self
+                    .body
+                    .resolve_alias(self.cross_blocks.value(CrossBlockId::new(id)));
+                state.add_val(&mut inter, &self.results, v);
+            }
+            let mut term_uses = Vec::new();
+            self.body.blocks[block]
+                .terminator
+                .visit_uses(|u| term_uses.push(u));
+            for u in term_uses {
+                for_each_local_value(self.body, self.trees, u, |v| {
+                    state.add_val(&mut inter, &self.results, v);
+                });
+            }
+            for &inst in self.body.blocks[block].insts.iter().rev() {
+                if is_tree_or_remat(inst, self.trees) {
+                    continue;
+                }
+                state.mark_against_live(&mut inter, &self.results, inst);
+                state.del_val(&self.results, inst);
+                if let ValueDef::Operator(_, args, _) = &self.body.values[inst] {
+                    for &arg in &self.body.arg_pool[*args] {
+                        for_each_local_value(self.body, self.trees, arg, |v| {
+                            state.add_val(&mut inter, &self.results, v);
+                        });
+                    }
+                }
+            }
+            for &(_, param) in self.body.blocks[block].params.iter().rev() {
+                state.mark_against_live(&mut inter, &self.results, param);
+                state.del_val(&self.results, param);
+            }
+        }
+
+        let mut mapping: Vec<Local> = (0..n).map(Local::new).collect();
+        for i in 0..n {
+            if i < n_params {
+                mapping[i] = Local::new(i);
+                continue;
+            }
+            let ty = self.results.locals[Local::new(i)];
+            let mut blocked = Bitset::default();
+            for j in inter[i].iter() {
+                blocked.insert(mapping[j as usize].index() as u32);
+            }
+            let mut chosen = Local::new(i);
+            for k in 0..n {
+                if self.results.locals[Local::new(k)] != ty {
+                    continue;
+                }
+                if blocked.contains(k as u32) {
+                    continue;
+                }
+                chosen = Local::new(k);
+                break;
+            }
+            mapping[i] = chosen;
+        }
+
+        if mapping.iter().enumerate().all(|(i, &m)| m.index() == i) {
+            return;
+        }
+
+        let mut new_of_rep: Vec<Option<Local>> = vec![None; n];
+        let mut new_locals: EntityVec<Local, Type> = EntityVec::default();
+        for i in 0..n_params {
+            new_of_rep[i] = Some(new_locals.push(self.results.locals[Local::new(i)]));
+        }
+        for i in 0..n {
+            let rep = mapping[i].index();
+            if new_of_rep[rep].is_some() {
+                continue;
+            }
+            if !(0..n).any(|j| mapping[j].index() == rep) {
+                continue;
+            }
+            new_of_rep[rep] = Some(new_locals.push(self.results.locals[Local::new(rep)]));
+        }
+
+        for v in self.body.values.iter() {
+            for l in self.results.values[v].iter_mut() {
+                let rep = mapping[l.index()];
+                *l = new_of_rep[rep.index()].expect("rep used by a value");
+            }
+        }
+        log::trace!(
+            "localify: coalesce_holes {} -> {} locals",
+            n,
+            new_locals.len()
+        );
+        self.results.locals = new_locals;
+    }
+}
+
+/// Live-local refcounts for one block's interference walk.
+#[derive(Default)]
+struct HoleLive {
+    vals: HashSet<Value>,
+    local_refs: HashMap<Local, u32>,
+    locals: HashSet<Local>,
+}
+
+impl HoleLive {
+    fn mark_pair(inter: &mut [Bitset], a: Local, b: Local) {
+        if a != b {
+            inter[a.index()].insert(b.index() as u32);
+            inter[b.index()].insert(a.index() as u32);
+        }
+    }
+
+    fn add_local(&mut self, inter: &mut [Bitset], l: Local) {
+        let c = self.local_refs.entry(l).or_insert(0);
+        *c += 1;
+        if *c == 1 {
+            for &o in &self.locals {
+                Self::mark_pair(inter, l, o);
+            }
+            self.locals.insert(l);
+        }
+    }
+
+    fn del_local(&mut self, l: Local) {
+        if let Some(c) = self.local_refs.get_mut(&l) {
+            *c -= 1;
+            if *c == 0 {
+                self.local_refs.remove(&l);
+                self.locals.remove(&l);
+            }
+        }
+    }
+
+    fn add_val(&mut self, inter: &mut [Bitset], results: &Localifier, v: Value) {
+        if !self.vals.insert(v) {
+            return;
+        }
+        for &l in &results.values[v] {
+            self.add_local(inter, l);
+        }
+    }
+
+    fn del_val(&mut self, results: &Localifier, v: Value) {
+        if !self.vals.remove(&v) {
+            return;
+        }
+        for &l in &results.values[v] {
+            self.del_local(l);
+        }
+    }
+
+    fn mark_against_live(&self, inter: &mut [Bitset], results: &Localifier, v: Value) {
+        for &l in &results.values[v] {
+            for &o in &self.locals {
+                Self::mark_pair(inter, l, o);
+            }
+        }
+    }
+}
+
+/// Invoke `f` for every non-treeified Value under `value` (tree/remat
+/// ops are expanded to their operands, matching `BlockVisitor`).
+fn for_each_local_value(
+    body: &FunctionBody,
+    trees: &Trees,
+    value: Value,
+    mut f: impl FnMut(Value),
+) {
+    fn walk(body: &FunctionBody, trees: &Trees, value: Value, f: &mut dyn FnMut(Value)) {
+        let value = body.resolve_alias(value);
+        if let ValueDef::PickOutput(v, _, _) = body.values[value] {
+            walk(body, trees, v, f);
+            return;
+        }
+        if is_tree_or_remat(value, trees) {
+            if let ValueDef::Operator(_, args, _) = &body.values[value] {
+                for &arg in &body.arg_pool[*args] {
+                    walk(body, trees, arg, f);
+                }
+            }
+            return;
+        }
+        f(value);
+    }
+    walk(body, trees, value, &mut f);
 }
