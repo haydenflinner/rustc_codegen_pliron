@@ -160,6 +160,51 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             }
             eprintln!("==== ra2edits end ====");
         }
+        // PLIRON: `PLIRON_RA2_STATS=1` prints one line per function with
+        // the regalloc-inserted edits classified by kind and position
+        // (`RA2STAT <fn> insts rr_term rr_entry rr_mid st_term st_entry
+        // st_mid ld_term ld_entry ld_mid ss nslots`): rr = reg->reg,
+        // st = spill store, ld = reload, ss = stack->stack; term = at the
+        // block's last inst (edge / block-param moves), entry = before its
+        // first inst, mid = anywhere else (call ABI, splits).
+        if std::env::var_os("PLIRON_RA2_STATS").is_some() {
+            use regalloc2::Function as _;
+            let n = vcode.num_insts();
+            let mut first = alloc::vec![false; n];
+            let mut last = alloc::vec![false; n];
+            for b in 0..vcode.num_blocks() {
+                let r = vcode.block_insns(regalloc2::Block::new(b));
+                if r.len() > 0 {
+                    first[r.first().index()] = true;
+                    last[r.last().index()] = true;
+                }
+            }
+            let mut c = [[0u32; 3]; 4];
+            for (pp, edit) in &regalloc_ctx.output.edits {
+                let regalloc2::Edit::Move { from, to } = edit;
+                let k = match (from.is_stack(), to.is_stack()) {
+                    (false, false) => 0,
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    (true, true) => 3,
+                };
+                let i = pp.inst().index();
+                let pos = if last[i] {
+                    0
+                } else if first[i] && pp.pos() == regalloc2::InstPosition::Before {
+                    1
+                } else {
+                    2
+                };
+                c[k][pos] += 1;
+            }
+            let nslots = regalloc_ctx.output.num_spillslots;
+            eprintln!(
+                "RA2STAT {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                f.name, n, c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0],
+                c[2][1], c[2][2], c[3][0] + c[3][1] + c[3][2], nslots, 0
+            );
+        }
         // PLIRON: `PLIRON_RA2_ALLOC=1` dumps each vreg that regalloc2
         // assigned a stack slot at least once (the actual spilled set).
         if prevcode_match && std::env::var_os("PLIRON_RA2_ALLOC").is_some() {

@@ -601,14 +601,15 @@ t_noret() {
 }
 
 t_edgemerge() {
-  # PLIRON_EDGEMERGE / PLIRON_EPIMERGE (default mode 1; =0 off, =2 merge-all):
+  # PLIRON_EDGEMERGE / PLIRON_EPIMERGE (default mode 1; =0 off, =2 merge-all, =3 merge outside loops; mode 3 also runs with
+  # PLIRON_LIBCALL_DIRECT=1):
   # shared regalloc edge blocks and one epilogue per function. Plain defaults,
   # then explicit mode 1 and merge-everything mode 2.
   rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe && \
   $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
   local m
-  for m in 0 1 2; do
-    PLIRON_EDGEMERGE=$m PLIRON_EPIMERGE=$m rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe &&
+  for m in 0 1 2 3; do
+    PLIRON_LIBCALL_DIRECT=$(( m == 3 )) PLIRON_EDGEMERGE=$m PLIRON_EPIMERGE=$m rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe &&
     $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
   done
 }
