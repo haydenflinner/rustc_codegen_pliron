@@ -72,6 +72,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             || st.dead_fns.contains(sym.as_str())
             || st.dead_unopt.contains(sym.as_str())
             || dead_called.contains(sym.as_str())
+            || (st.spec_skip_copies && st.xcgu_copies.contains(sym.as_str()))
         {
             continue;
         }
@@ -222,6 +223,99 @@ mod tests {
         assert!(
             p.is_used(ctx),
             "spec specialized a callee a dead copy calls differently"
+        );
+    }
+
+    /// wasm: `pliron-wasm-ld` folds same-mangled-name bodies across objects
+    /// and keeps the smallest. An xcgu copy specialized on its own CGU's
+    /// callsites is smaller than the generic copies elsewhere and would
+    /// replace them (hashbrown `fallible_with_capacity`: a 128-bucket,
+    /// 16-byte-element table reached the `(&str, u32)` map, whose dealloc
+    /// then trapped). With `spec_skip_copies`, copies stay generic.
+    #[test]
+    fn wasm_xcgu_copy_not_specialized() {
+        let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @callee: llvm.func <builtin.integer i32(builtin.integer i32) variadic = false> [] {
+          ^entry_block_1_0(x: builtin.integer i32):
+            llvm.return x
+          };
+          llvm.func @live: llvm.func <llvm.void () variadic = false> [] {
+          ^entry_block_2_0():
+            five = llvm.constant <builtin.integer <5: i32>> : builtin.integer i32;
+            r = llvm.call @callee (five) : llvm.func <builtin.integer i32(builtin.integer i32) variadic = false>;
+            llvm.return
+          };
+          llvm.func @dead: llvm.func <llvm.void () variadic = false> [] {
+          ^entry_block_3_0():
+            seven = llvm.constant <builtin.integer <7: i32>> : builtin.integer i32;
+            r = llvm.call @callee (seven) : llvm.func <builtin.integer i32(builtin.integer i32) variadic = false>;
+            llvm.return
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let st = &mut State::default();
+        for fop in crate::inline::blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+        {
+            let Some(f) = Operation::get_op::<FuncOp>(fop, ctx) else {
+                continue;
+            };
+            let sym = f.get_symbol_name(ctx).to_string();
+            st.ident_to_sym.insert(sym.clone(), sym.clone());
+            st.funcs.insert(
+                sym.clone(),
+                FuncInfo {
+                    op: fop,
+                    ty: f.get_type(ctx).into(),
+                    linkage: Linkage::Local,
+                    exts: Exts::default(),
+                    no_inline: false,
+                    always_inline: false,
+                    inline_hint: false,
+                    cold: false,
+                    nounwind: false,
+                    odr: false,
+                    sret_ty: None,
+                    frozen: Vec::new(),
+                    noalias: Vec::new(),
+                    nonnull: Vec::new(),
+                    nparams: 1,
+                    tail_cc: false,
+                },
+            );
+            // `llvm.constant` args become `st.consts` entries; `live` and
+            // `dead` pass the callee different values.
+            let bits = 5u128;
+            for b in blocks(ctx, fop) {
+                for op in crate::inline::ops(ctx, b) {
+                    if let Some(c) = Operation::get_op::<CallOp>(op, ctx)
+                        && let Some(&a) = c.args(ctx).first()
+                    {
+                        st.consts.insert(a, ConstVal::Bits(bits));
+                    }
+                }
+            }
+        }
+        // Every visible callsite passes 5: specializing would be
+        // "legal" locally, but `callee` is an xcgu copy.
+        st.xcgu_copies.insert("callee".to_string());
+        st.spec_skip_copies = true;
+        run(ctx, st);
+        let callee = st.funcs["callee"].op;
+        let p = blocks(ctx, callee)[0]
+            .deref(ctx)
+            .arguments(ctx)
+            .next()
+            .unwrap();
+        assert!(
+            p.is_used(ctx),
+            "spec specialized an xcgu copy the wasm linker may fold with generic copies"
         );
     }
 }

@@ -483,6 +483,12 @@ pub struct State {
     /// The same set keyed by `FuncOp`, for `opt_body`'s per-op filter.
     pub dead_unopt_ops: rustc_hash::FxHashSet<Ptr<Operation>>,
     pub deadunopt_on: bool,
+    /// wasm: `spec` leaves `xcgu_copies` alone. `pliron-wasm-ld` folds
+    /// same-mangled-name bodies across objects (smallest wins), so every
+    /// copy of an instance must keep the generic semantics; a copy
+    /// specialized on its own CGU's callsites is smaller and would win
+    /// the fold for callers in other CGUs. `PLIRON_SPEC_COPIES=1` allows it.
+    pub spec_skip_copies: bool,
     /// `PLIRON_EARLYDEAD=1`: mark callerless copies as `dead_unopt` at
     /// iropt start and after the last call-creating pass, so every
     /// `bodied`/`opt_body` pass skips them instead of optimizing bodies

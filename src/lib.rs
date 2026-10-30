@@ -1461,6 +1461,8 @@ fn module_codegen(
     cx.st.borrow_mut().lto_payload = bitcode_needed.then(lto::embedded_payload);
     cx.st.borrow_mut().xcgufn_kill = env_is("PLIRON_XCGUFN_KILL", "1");
     cx.st.borrow_mut().deadunopt_on = pass_enabled("PLIRON_DEADUNOPT");
+    cx.st.borrow_mut().spec_skip_copies =
+        tcx.sess.target.is_like_wasm && !pliron_cfg::env_is("PLIRON_SPEC_COPIES", "1");
     cx.st.borrow_mut().deadfree = env_is("PLIRON_DEADFREE", "1");
     cx.st.borrow_mut().earlydead =
         pass_enabled("PLIRON_EARLYDEAD") && env_get("PLIRON_OPT_FNS").is_none();
