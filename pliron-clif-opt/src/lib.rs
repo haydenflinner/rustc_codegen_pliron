@@ -60,6 +60,7 @@ pub(crate) mod trace;
 pub mod unreach;
 pub mod unroll;
 pub(crate) mod uses;
+pub mod vecsel;
 pub mod veclegalize;
 pub mod vmap;
 pub mod webroot;

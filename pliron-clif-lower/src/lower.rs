@@ -362,9 +362,9 @@ fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
 }
 
-/// `PLIRON_FMINMAX=1`: `llvm.minnum`/`llvm.maxnum` on f32/f64 (and per native
-/// leaf on vectors) lower inline as `fmin`/`fmax` plus NaN selects instead of
-/// one `fminf`/`fmaxf` libcall per lane. Off by default.
+/// `PLIRON_FMINMAX` (default on, `=0` off): `llvm.minnum`/`llvm.maxnum` on
+/// f32/f64 (and per native leaf on vectors) lower inline as `fmin`/`fmax` plus
+/// NaN selects instead of one `fminf`/`fmaxf` libcall per lane.
 pub fn fminmax_on() -> bool {
     crate::env_is("PLIRON_FMINMAX", "1")
 }
@@ -5846,48 +5846,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.resize(m, t, false)
             }
             "pliron.vbitselect" => {
-                let t = self.b.func.dfg.value_type(a[1]);
-                let m = if self.b.func.dfg.value_type(a[0]) == t {
-                    a[0]
-                } else {
-                    self.bitcast_to(t, a[0])
-                };
-                self.b.ins().bitselect(m, a[1], a[2])
+                pliron_clif_opt::vecsel::vbitselect(&mut self.b, a[0], a[1], a[2])
             }
             n if n.starts_with("pliron.vcmp.") => {
                 let (p, k) = n["pliron.vcmp.".len()..].split_once('.').unwrap();
-                if k == "f" {
-                    let cc = match p {
-                        "eq" => FloatCC::Equal,
-                        "ne" => FloatCC::NotEqual,
-                        "lt" => FloatCC::LessThan,
-                        "le" => FloatCC::LessThanOrEqual,
-                        "gt" => FloatCC::GreaterThan,
-                        _ => FloatCC::GreaterThanOrEqual,
-                    };
-                    let m = self.b.ins().fcmp(cc, a[0], a[1]);
-                    let t = rt;
-                    if self.b.func.dfg.value_type(m) == t {
-                        m
-                    } else {
-                        self.bitcast_to(t, m)
-                    }
-                } else {
-                    let s = k == "s";
-                    let cc = match p {
-                        "eq" => IntCC::Equal,
-                        "ne" => IntCC::NotEqual,
-                        "lt" if s => IntCC::SignedLessThan,
-                        "le" if s => IntCC::SignedLessThanOrEqual,
-                        "gt" if s => IntCC::SignedGreaterThan,
-                        "ge" if s => IntCC::SignedGreaterThanOrEqual,
-                        "lt" => IntCC::UnsignedLessThan,
-                        "le" => IntCC::UnsignedLessThanOrEqual,
-                        "gt" => IntCC::UnsignedGreaterThan,
-                        _ => IntCC::UnsignedGreaterThanOrEqual,
-                    };
-                    self.b.ins().icmp(cc, a[0], a[1])
-                }
+                pliron_clif_opt::vecsel::vcmp(&mut self.b, p, k, a[0], a[1], rt)
             }
             n => unreachable!("{n}"),
         }
@@ -5896,37 +5859,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// IEEE `minNum`/`maxNum` on a scalar or a native vector leaf: `fmin`/`fmax`
     /// propagate NaN, so pick the other operand where one side is NaN.
     fn fminmax_num(&mut self, max: bool, a: ir::Value, b: ir::Value) -> ir::Value {
-        let t = self.b.func.dfg.value_type(a);
-        if t.is_vector() && t.bits() < 128 {
-            // 64-bit vectors (f32x2): no `bitselect` lowering; go lane by lane.
-            let mut r = None;
-            for i in 0..t.lane_count() {
-                let x = self.b.ins().extractlane(a, i as u8);
-                let y = self.b.ins().extractlane(b, i as u8);
-                let l = self.fminmax_num(max, x, y);
-                r = Some(match r {
-                    None => self.b.ins().splat(t, l),
-                    Some(v) => self.b.ins().insertlane(v, l, i as u8),
-                });
-            }
-            return r.unwrap();
-        }
-        let m = if max {
-            self.b.ins().fmax(a, b)
-        } else {
-            self.b.ins().fmin(a, b)
-        };
-        let an = self.b.ins().fcmp(FloatCC::Unordered, a, a);
-        let bn = self.b.ins().fcmp(FloatCC::Unordered, b, b);
-        if t.is_vector() {
-            let an = self.bitcast_to(t, an);
-            let bn = self.bitcast_to(t, bn);
-            let r = self.b.ins().bitselect(bn, a, m);
-            self.b.ins().bitselect(an, b, r)
-        } else {
-            let r = self.b.ins().select(bn, a, m);
-            self.b.ins().select(an, b, r)
-        }
+        pliron_clif_opt::vecsel::fminmax_num(&mut self.b, max, a, b)
     }
 
     fn spill_vec(&mut self, v: Value, a: &Vals) -> (ir::Value, u64) {

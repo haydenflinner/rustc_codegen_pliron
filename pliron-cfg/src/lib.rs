@@ -80,6 +80,12 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_JT_SHAPE",
     "PLIRON_CMP3",
     "PLIRON_NORETTRAP",
+    // Vector select(fcmp/icmp) fusion and inline llvm.minnum/maxnum
+    // (docs/history/2026-10-29-cubecl-speed.md; semantics pinned by
+    // pliron-clif-opt/tests/vecsel_native.rs). `=0` restores the scalar
+    // per-lane select and the fminf/fmaxf libcalls.
+    "PLIRON_VSELECT",
+    "PLIRON_FMINMAX",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
