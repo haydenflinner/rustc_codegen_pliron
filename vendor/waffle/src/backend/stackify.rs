@@ -33,11 +33,17 @@ pub enum WasmBlock<'a> {
     Leaf { block: Block },
     /// A translated unconditional branch.
     Br { target: WasmLabel },
-    /// A translated conditional.
+    /// PLIRON: conditional branch (`br_if`), used when rewriting
+    /// `If` into the LLVM-style `block`+`br_if` shape.
+    BrIf { cond: Value, target: WasmLabel },
+    /// A translated conditional. `results`, when set, is the merge
+    /// param list both arms produce on the operand stack instead of
+    /// via `BlockParams`+`local.set` (LLVM's typed-`if` shape).
     If {
         cond: Value,
         if_true: Vec<WasmBlock<'a>>,
         if_false: Vec<WasmBlock<'a>>,
+        results: Option<&'a [(Type, Value)]>,
     },
     /// A translated select (switch).
     Select {
@@ -48,6 +54,15 @@ pub enum WasmBlock<'a> {
     /// Blockparam transfer.
     BlockParams {
         from: &'a [Value],
+        to: &'a [(Type, Value)],
+    },
+    /// PLIRON: same-join CondBr — for each param, `select` between the
+    /// true/false edge args then `local.set`, instead of an `if`/`else`
+    /// with BlockParams in each arm. Matches LLVM's diamond shape.
+    SelectJoin {
+        cond: Value,
+        if_true: &'a [Value],
+        if_false: &'a [Value],
         to: &'a [(Type, Value)],
     },
     /// A function return instruction.
@@ -67,7 +82,9 @@ impl<'a> Drop for WasmBlock<'a> {
                     out.append(body);
                 }
                 WasmBlock::If {
-                    if_true, if_false, ..
+                    if_true,
+                    if_false,
+                    ..
                 } => {
                     out.append(if_true);
                     out.append(if_false);
@@ -224,7 +241,24 @@ impl<'a, 'b> Context<'a, 'b> {
         while let Some(top) = self.process_stack.pop() {
             self.process(top);
         }
-        self.result.pop().unwrap()
+        let mut out = self.result.pop().unwrap();
+        // PLIRON: rewrite `if`/`else` into `block`+`br_if` (LLVM's
+        // shape). `PLIRON_WBRIF=1` rewrites every If (grows CODE —
+        // defeats wpeep). `=exit` only rewrites Ifs whose both arms
+        // already exit past the if (no fallthrough) — denser and
+        // wpeep-friendlier. Default off.
+        match std::env::var_os("PLIRON_WBRIF").as_deref().and_then(|v| v.to_str()) {
+            Some("1") => rewrite_ifs_to_brif(&mut out, /* only_exits */ false),
+            Some("exit") => rewrite_ifs_to_brif(&mut out, /* only_exits */ true),
+            _ => {}
+        }
+        // PLIRON: promote If arms that both end in the same BlockParams
+        // into a typed if (values on stack, one set after). Default on;
+        // `PLIRON_WIFRET=0` disables.
+        if !std::env::var_os("PLIRON_WIFRET").is_some_and(|v| v == "0") {
+            promote_if_results(&mut out);
+        }
+        out
     }
 
     fn process(&mut self, entry: StackEntry<'a>) {
@@ -416,6 +450,7 @@ impl<'a, 'b> Context<'a, 'b> {
             cond,
             if_true: if_body,
             if_false: else_body,
+            results: None,
         });
     }
 
@@ -446,14 +481,39 @@ impl<'a, 'b> Context<'a, 'b> {
                     ref if_true,
                     ref if_false,
                 } => {
-                    self.ctrl_stack.push(CtrlEntry::IfThenElse);
-                    self.process_stack.push(StackEntry::FinishIf(cond));
-                    self.process_stack
-                        .push(StackEntry::DoBranch(block, if_false));
-                    self.process_stack.push(StackEntry::Else);
-                    self.process_stack
-                        .push(StackEntry::DoBranch(block, if_true));
-                    self.result.push(vec![]); // if-body
+                    // PLIRON: avoid `if`/`else` when both arms are labeled
+                    // branches (merge/backedge). Same join → select-merge;
+                    // different joins → `block`+`br_if` fork. `PLIRON_WSEL=0`
+                    // / `PLIRON_WBFORK=0` revert each to stock IfThenElse.
+                    let t_ctrl = self.is_stack_target(block, if_true);
+                    let f_ctrl = self.is_stack_target(block, if_false);
+                    if !std::env::var_os("PLIRON_WSEL").is_some_and(|v| v == "0")
+                        && t_ctrl
+                        && f_ctrl
+                        && if_true.block == if_false.block
+                        && if_true.args.len() == if_false.args.len()
+                        && if_true.args.len()
+                            == self.body.blocks[if_true.block].params.len()
+                    {
+                        self.emit_select_join(cond, if_true, if_false);
+                    } else if std::env::var_os("PLIRON_WBFORK").is_some_and(|v| v == "1")
+                        && t_ctrl
+                        && f_ctrl
+                        && if_true.block != if_false.block
+                    {
+                        // Opt-in: removes if/else but grows CODE (~+7 KiB
+                        // regex) — extra block/br and denser local traffic.
+                        self.emit_brif_fork(cond, if_true, if_false);
+                    } else {
+                        self.ctrl_stack.push(CtrlEntry::IfThenElse);
+                        self.process_stack.push(StackEntry::FinishIf(cond));
+                        self.process_stack
+                            .push(StackEntry::DoBranch(block, if_false));
+                        self.process_stack.push(StackEntry::Else);
+                        self.process_stack
+                            .push(StackEntry::DoBranch(block, if_true));
+                        self.result.push(vec![]); // if-body
+                    }
                 }
                 &Terminator::Select {
                     value,
@@ -469,6 +529,356 @@ impl<'a, 'b> Context<'a, 'b> {
                     into.push(WasmBlock::Unreachable);
                 }
             }
+        }
+    }
+
+    /// Target is reached by a labeled `br` (merge node or backedge),
+    /// not by inlining a dominated subtree.
+    fn is_stack_target(&self, source: Block, t: &BlockTarget) -> bool {
+        self.merge_nodes.contains(&t.block)
+            || self.cfg.rpo_pos[t.block] <= self.cfg.rpo_pos[source]
+    }
+
+    /// PLIRON: `brif c, B(args_t), B(args_f)` → select each arg, `br B`.
+    fn emit_select_join(&mut self, cond: Value, if_true: &'a BlockTarget, if_false: &'a BlockTarget) {
+        let into = self.result.last_mut().unwrap();
+        let params = &self.body.blocks[if_true.block].params;
+        into.push(WasmBlock::SelectJoin {
+            cond,
+            if_true: &if_true.args[..],
+            if_false: &if_false.args[..],
+            to: params,
+        });
+        let index = Self::resolve_target(&self.ctrl_stack[..], if_true.block);
+        into.push(WasmBlock::Br { target: index });
+    }
+
+    /// PLIRON: `brif c, T, F` (T≠F, both labeled) →
+    /// ```text
+    /// block          ;; false-skip
+    ///   br_if 0      ;; cond true → skip false arm
+    ///   params_F; br F+1
+    /// end
+    /// params_T; br T
+    /// ```
+    fn emit_brif_fork(
+        &mut self,
+        cond: Value,
+        if_true: &'a BlockTarget,
+        if_false: &'a BlockTarget,
+    ) {
+        let t_lab = Self::resolve_target(&self.ctrl_stack[..], if_true.block);
+        let f_lab = Self::resolve_target(&self.ctrl_stack[..], if_false.block);
+        let mut false_body = Vec::new();
+        false_body.push(WasmBlock::BrIf {
+            cond,
+            target: WasmLabel(0),
+        });
+        Self::do_blockparam_transfer(
+            &if_false.args[..],
+            &self.body.blocks[if_false.block].params[..],
+            &mut false_body,
+        );
+        false_body.push(WasmBlock::Br {
+            target: f_lab.add(1),
+        });
+        let into = self.result.last_mut().unwrap();
+        into.push(WasmBlock::Block {
+            body: false_body,
+            out: Block::invalid(),
+        });
+        Self::do_blockparam_transfer(
+            &if_true.args[..],
+            &self.body.blocks[if_true.block].params[..],
+            into,
+        );
+        into.push(WasmBlock::Br { target: t_lab });
+    }
+}
+
+/// PLIRON: bump every `Br`/`BrIf` label by `extra` (wrapping new
+/// `block`s around an arm shifts relative depths).
+fn bump_br_labels<'a>(body: &mut [WasmBlock<'a>], extra: u32) {
+    for b in body {
+        match b {
+            WasmBlock::Br { target } | WasmBlock::BrIf { target, .. } => {
+                target.0 = target.0.saturating_add(extra);
+            }
+            WasmBlock::Block { body, .. } | WasmBlock::Loop { body, .. } => {
+                bump_br_labels(body, extra);
+            }
+            WasmBlock::If {
+                if_true,
+                if_false,
+                ..
+            } => {
+                bump_br_labels(if_true, extra);
+                bump_br_labels(if_false, extra);
+            }
+            WasmBlock::Select { targets, default, .. } => {
+                for t in targets {
+                    t.0 = t.0.saturating_add(extra);
+                }
+                default.0 = default.0.saturating_add(extra);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether the arm's final branch already leaves the (old) `if` to a
+/// label at depth ≥ 1 — i.e. it does not rely on falling through the
+/// `if`'s own end. Trailing `br 0` is fallthrough-equivalent.
+fn arm_exits_past_if(arm: &[WasmBlock<'_>]) -> bool {
+    match arm.last() {
+        Some(WasmBlock::Br { target }) if target.index() >= 1 => true,
+        Some(WasmBlock::Return { .. }) | Some(WasmBlock::Unreachable) => true,
+        _ => false,
+    }
+}
+
+/// Strip a trailing `br 0` (fallthrough to the old `if` end).
+fn strip_trailing_br0<'a>(arm: &mut Vec<WasmBlock<'a>>) {
+    if let Some(WasmBlock::Br { target }) = arm.last() {
+        if target.index() == 0 {
+            arm.pop();
+        }
+    }
+}
+
+/// PLIRON: `If { cond, T, F }` →
+/// ```text
+/// block          ;; outer join (= old if end)
+///   block        ;; skip-false when cond
+///     br_if 0    ;; cond true → true arm
+///     F'         ;; false arm (labels +1)
+///     br 1       ;; to outer, if F' would fall through
+///   end
+///   T'           ;; true arm (labels unchanged vs old if)
+/// end
+/// ```
+fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
+    let mut i = 0;
+    while i < body.len() {
+        // Recurse first so nested Ifs rewrite bottom-up.
+        match &mut body[i] {
+            WasmBlock::Block { body: inner, .. } | WasmBlock::Loop { body: inner, .. } => {
+                rewrite_ifs_to_brif(inner, only_exits);
+            }
+            WasmBlock::If {
+                if_true, if_false, ..
+            } => {
+                rewrite_ifs_to_brif(if_true, only_exits);
+                rewrite_ifs_to_brif(if_false, only_exits);
+            }
+            _ => {}
+        }
+        let Some((cond, mut if_true, mut if_false, results)) = (match &mut body[i] {
+            WasmBlock::If {
+                cond,
+                if_true,
+                if_false,
+                results,
+            } => Some((
+                *cond,
+                std::mem::take(if_true),
+                std::mem::take(if_false),
+                *results,
+            )),
+            _ => None,
+        }) else {
+            i += 1;
+            continue;
+        };
+        let false_exits = arm_exits_past_if(&if_false);
+        let true_exits = arm_exits_past_if(&if_true);
+        if only_exits && !(false_exits && true_exits) {
+            // Put the If back; only_exits skips fallthrough diamonds.
+            body[i] = WasmBlock::If {
+                cond,
+                if_true,
+                if_false,
+                results,
+            };
+            i += 1;
+            continue;
+        }
+        let _ = results; // WBRIF drops typed results (arms become br_if bodies).
+        strip_trailing_br0(&mut if_false);
+        strip_trailing_br0(&mut if_true);
+        bump_br_labels(&mut if_false, 1);
+        let mut inner_body = Vec::with_capacity(if_false.len() + 2);
+        inner_body.push(WasmBlock::BrIf {
+            cond,
+            target: WasmLabel(0),
+        });
+        inner_body.append(&mut if_false);
+        if !false_exits {
+            // Skip the true arm: branch to the outer block's end.
+            inner_body.push(WasmBlock::Br {
+                target: WasmLabel(1),
+            });
+        }
+        let outer = WasmBlock::Block {
+            body: {
+                let mut v = Vec::with_capacity(if_true.len() + 1);
+                v.push(WasmBlock::Block {
+                    body: inner_body,
+                    out: Block::invalid(),
+                });
+                v.append(&mut if_true);
+                v
+            },
+            out: Block::invalid(),
+        };
+        body[i] = outer;
+        i += 1;
+    }
+}
+
+/// Strip a trailing `BlockParams` (+ optional trailing `Br`) from an
+/// if arm. Returns `(from, to, br_target)`.
+fn take_trailing_params<'a>(
+    arm: &mut Vec<WasmBlock<'a>>,
+) -> Option<(&'a [Value], &'a [(Type, Value)], Option<WasmLabel>)> {
+    let br = match arm.last() {
+        Some(WasmBlock::Br { target }) => {
+            let t = *target;
+            arm.pop();
+            Some(t)
+        }
+        _ => None,
+    };
+    match arm.last() {
+        Some(WasmBlock::BlockParams { from, to }) => {
+            let from = *from;
+            let to = *to;
+            arm.pop();
+            Some((from, to, br))
+        }
+        _ => {
+            if let Some(t) = br {
+                arm.push(WasmBlock::Br { target: t });
+            }
+            None
+        }
+    }
+}
+
+fn restore_trailing_params<'a>(
+    arm: &mut Vec<WasmBlock<'a>>,
+    from: &'a [Value],
+    to: &'a [(Type, Value)],
+    br: Option<WasmLabel>,
+) {
+    arm.push(WasmBlock::BlockParams { from, to });
+    if let Some(t) = br {
+        arm.push(WasmBlock::Br { target: t });
+    }
+}
+
+/// PLIRON: `If` whose arms both end in `BlockParams` to the same
+/// merge → typed `if (result …)` leaving the edge args on the stack,
+/// then one `local.set` after the if (+ the shared `br` if any).
+/// Saves one arm's worth of `local.set`s. Multi-param uses a module
+/// functype (`BlockTypeIntern`).
+fn promote_if_results<'a>(body: &mut Vec<WasmBlock<'a>>) {
+    let mut i = 0;
+    while i < body.len() {
+        match &mut body[i] {
+            WasmBlock::Block { body: inner, .. } | WasmBlock::Loop { body: inner, .. } => {
+                promote_if_results(inner);
+            }
+            WasmBlock::If {
+                if_true, if_false, ..
+            } => {
+                promote_if_results(if_true);
+                promote_if_results(if_false);
+            }
+            _ => {}
+        }
+        let promoted = (|| {
+            let WasmBlock::If {
+                if_true,
+                if_false,
+                results,
+                ..
+            } = &mut body[i]
+            else {
+                return None;
+            };
+            if results.is_some() {
+                return None;
+            }
+            let (from_t, to_t, br_t) = take_trailing_params(if_true)?;
+            let (from_f, to_f, br_f) = match take_trailing_params(if_false) {
+                Some(x) => x,
+                None => {
+                    restore_trailing_params(if_true, from_t, to_t, br_t);
+                    return None;
+                }
+            };
+            // Same `to` merge (any arity); matching exit br (or both
+            // none/br0). Multi-param needs a module functype — only
+            // while `compile_with_block_types` allows it.
+            let br_ok = match (br_t, br_f) {
+                (None, None) => true,
+                (Some(a), Some(b)) if a.index() == b.index() => true,
+                (Some(a), None) | (None, Some(a)) if a.index() == 0 => true,
+                _ => false,
+            };
+            // Multi-param typed if: opt-in (`PLIRON_WIFRET_MULTI=1`) and
+            // only when `compile_with_block_types` is active. Default off
+            // — even all-moves sites grew regex-wasm CODE (gets + typeidx
+            // LEBs outweighed the saved arm sets; 2026-10-28).
+            let multi = to_t.len() > 1
+                && super::allow_multi_wifret()
+                && std::env::var_os("PLIRON_WIFRET_MULTI")
+                    .is_some_and(|v| v != "0" && v != "false");
+            let arity_ok = to_t.len() == 1 || multi;
+            if to_t.as_ptr() != to_f.as_ptr() || to_t.is_empty() || !br_ok || !arity_ok {
+                restore_trailing_params(if_true, from_t, to_t, br_t);
+                restore_trailing_params(if_false, from_f, to_f, br_f);
+                return None;
+            }
+            if_true.push(WasmBlock::BlockParams {
+                from: from_t,
+                to: &[],
+            });
+            if_false.push(WasmBlock::BlockParams {
+                from: from_f,
+                to: &[],
+            });
+            *results = Some(to_t);
+            // Shared exit: prefer the non-zero depth; br 0 is fallthrough.
+            let br = match (br_t, br_f) {
+                (Some(a), _) if a.index() > 0 => Some(a),
+                (_, Some(b)) if b.index() > 0 => Some(b),
+                _ => None,
+            };
+            Some((to_t, br))
+        })();
+        if let Some((to, br)) = promoted {
+            let mut insert_at = i + 1;
+            body.insert(
+                insert_at,
+                WasmBlock::BlockParams {
+                    from: &[],
+                    to,
+                },
+            );
+            insert_at += 1;
+            if let Some(t) = br {
+                // Labels were relative to inside the if; after the if
+                // they are one depth shallower.
+                let t = WasmLabel(t.index().saturating_sub(1));
+                body.insert(insert_at, WasmBlock::Br { target: t });
+                i = insert_at + 1;
+            } else {
+                i = insert_at;
+            }
+        } else {
+            i += 1;
         }
     }
 }
