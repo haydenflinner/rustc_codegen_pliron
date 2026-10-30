@@ -3763,6 +3763,29 @@
   (if-let bit (test_and_compare_bit_const ty n))
   (emit_side_effect (tbz taken not_taken x bit)))
 
+;; PLIRON (`PLIRON_TBNZ_IREDUCE=1`, opt-in): `brif (band (ireduce y), 2^k)` with
+;; k inside the narrow type tests bit k of `y`'s own register: the `uxtb`/`uxth`
+;; the `ireduce` rule materializes only clears bits `tbnz` never reads
+;; (`bl f; uxtb w3,w2; tbnz w3,#0` x149 in regex-syntax).
+(rule 2 (lower_branch (brif (band (fits_in_16 ty) (ireduce _ y @ (value_type (fits_in_64 _)))
+                                  (u64_from_iconst n)) _ _)
+                     (two_targets taken not_taken))
+  (if-let true (tbnz_ireduce_on 1))
+  (if-let bit (test_and_compare_bit_const ty n))
+  (emit_side_effect (tbnz taken not_taken y bit)))
+
+(rule 2 (lower_branch (brif (icmp _ (IntCC.Equal)
+                                  (band (fits_in_16 ty) (ireduce _ y @ (value_type (fits_in_64 _)))
+                                        (u64_from_iconst n))
+                                  (u64_from_iconst 0)) _ _)
+                     (two_targets taken not_taken))
+  (if-let true (tbnz_ireduce_on 1))
+  (if-let bit (test_and_compare_bit_const ty n))
+  (emit_side_effect (tbz taken not_taken y bit)))
+
+(decl pure tbnz_ireduce_on (u64) bool)
+(extern constructor tbnz_ireduce_on tbnz_ireduce_on)
+
 (decl pure partial test_and_compare_bit_const (Type u64) u8)
 (extern constructor test_and_compare_bit_const test_and_compare_bit_const)
 
