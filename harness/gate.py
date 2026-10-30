@@ -49,7 +49,7 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # bytes (4940), 2026-10-24; slotmerge's starts-mode coalescing ignoring an
 # earlier pair's copy window (13475, -O0), 2026-10-27.
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309,
-                13475]
+                13475, 17028]
 
 
 def shell(cmd):
