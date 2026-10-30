@@ -237,3 +237,34 @@ fn loop_carried_sets() {
     let (f, g, _) = opt(LOOP);
     check2(&f, &g, 2);
 }
+
+/// Fuzz seed 17028: the loop header's only use of `p` is `c = icmp eq p, 0`
+/// and the back edge passes `c`. Minting the query on that edge arg
+/// (`icmp eq c, 0`) collapses through selord onto `icmp ne p, 0`, which
+/// reads `p` itself; dropping `p` then left a detached value in the new
+/// compare (verifier: "argument is not attached"). The push must bail.
+const LOOP_ARG_READS_PARAM: &str = "function %t(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v5 = icmp slt v0, v1
+    v7 = iconst.i8 1
+    v10 = iconst.i8 -1
+    v11 = select v5, v10, v7
+    v12 = iconst.i64 3
+    jump block1(v11, v12)
+
+block1(v20: i8, v21: i64):
+    v22 = iconst.i64 1
+    v23 = isub v21, v22
+    v24 = iconst.i8 0
+    v25 = icmp eq v20, v24
+    brif v23, block1(v25, v23), block2(v25)
+
+block2(v30: i8):
+    return v30
+}";
+
+#[test]
+fn loop_arg_reads_param() {
+    let (f, g, _) = opt(LOOP_ARG_READS_PARAM);
+    check2(&f, &g, 2);
+}
