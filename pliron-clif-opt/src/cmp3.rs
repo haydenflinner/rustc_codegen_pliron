@@ -627,6 +627,35 @@ fn push_through(
     n
 }
 
+/// Whether `p` is in the (bounded) operand cone of `a`. Budgeted, so a
+/// huge cone answers "yes" (the caller then skips the push).
+fn reaches(func: &Function, a: Value, p: Value) -> bool {
+    let mut stack = vec![(a, 0u32)];
+    let mut seen: FxHashSet<Value> = FxHashSet::default();
+    while let Some((v, depth)) = stack.pop() {
+        let v = func.dfg.resolve_aliases(v);
+        if v == p {
+            return true;
+        }
+        if !seen.insert(v) {
+            continue;
+        }
+        if seen.len() > 64 {
+            return true;
+        }
+        let Some(i) = func.dfg.value_def(v).inst() else {
+            continue;
+        };
+        if depth >= 8 {
+            continue;
+        }
+        for x in func.dfg.inst_values(i) {
+            stack.push((x, depth + 1));
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_push(
     func: &mut Function,
@@ -674,6 +703,12 @@ fn try_push(
             .args(&func.dfg.value_lists)
             .any(|x| x.as_value().is_some_and(|x| func.dfg.resolve_aliases(x) == p))
         {
+            return false;
+        }
+        // A loop-carried arg computed from `p` (`c = icmp eq p, 0`, back
+        // edge passes `c`): the per-edge query on `c` collapses through
+        // selord onto `p` itself, which is about to die.
+        if reaches(func, a, p) {
             return false;
         }
         let s = narrow(func, sets.get(func, a), a, t, d);
