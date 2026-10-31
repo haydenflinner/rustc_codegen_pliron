@@ -707,6 +707,10 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
     fb.set("preserve_frame_pointers", "true").unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.set("tls_model", "macho").unwrap();
+    // `PLIRON_RA_ALGO=single_pass`: Cranelift's other allocator, to compare.
+    if let Ok(a) = std::env::var("PLIRON_RA_ALGO") {
+        fb.set("regalloc_algorithm", &a).unwrap();
+    }
     let flags = cranelift_codegen::settings::Flags::new(fb);
     cranelift_codegen::isa::lookup_by_name("aarch64-apple-darwin")
         .expect("aarch64 ISA")

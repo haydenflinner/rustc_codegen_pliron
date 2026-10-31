@@ -4065,6 +4065,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_jtround,
         )
         .needs(shape::CONDBR),
+        // Membership trees the late threading assembled (serde_json's
+        // whitespace skip `x - 9 in {0, 1, 4, 23}` only becomes one chain
+        // after brchain/mergechain/jtround).
+        cstep("bittab2", "bittab", Gate::OptIn("PLIRON_BITTAB2"), s_bittab).needs(shape::CONDBR),
         cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
         step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
         // Fold constants any earlier pass left behind — late value folds

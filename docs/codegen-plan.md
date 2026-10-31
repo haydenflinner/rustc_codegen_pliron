@@ -340,6 +340,29 @@ service), then spills. Item 1 below stays, but behind frame cost.
    it remembers. Then the losses get found by a checker, not by
    benchmarks: a debug mode that recomputes what it can and reports facts
    a pass dropped.
+   Concrete consumers found on 2026-10-31, in the order to build them:
+   - *Dereferenceable params* reach loadfwd now (`run_deref`): they make
+     PRE loads speculatable. Upward PRE on top of that took regex from
+     1.34x to 1.25x. Done.
+   - *Exact slice ends*: rustc's `ptr.add(len)` for a slice end is
+     inbounds, so `end - begin` is a multiple of the element size and
+     `begin <= end`. With it, a pointer IV's `p == end` exit is `p >= end`,
+     two exits fold to `p >= umin(a, b)`, and the trip count is exact
+     (LLVM's IndVarSimplify + LFTR). num-bigint-dig's zip loops in
+     blind-sig: +196 excess compare samples, 3 branches per limb against
+     LLVM's one down-counter.
+   - *Non-null at the first jump threading*: the `Option<&T>` niche test
+     zip/enumerate produce (num-bigint-dig's zip in blind-sig, brotli's
+     match loop) merges the pointer from the "has next" path with `0`;
+     folding it needs the pointer known non-null when jumpthread first
+     runs. Carrying `derived` across indvars' IV rewrite (tried) does not
+     reach it: the test is decided earlier. Find which fact is missing
+     there (the iterator's `NonNull` field loads, `ptr.add(1)`'s inbounds
+     mark) before building a general replace-value hook.
+   - *Flow-sensitive capture*: `iso` needs a root to never escape; LLVM
+     asks whether it escaped *before* the access (EarliestEscapeAnalysis).
+     `ncc` (nocapture-only escapes) covered today's case; a real
+     escape on a cold path still disables everything.
 3. **Canonical loops and one licm with a pressure model.** LoopSimplify
    form maintained (`invparam` is the first piece); constants stay at
    their uses for the allocator to rematerialize.

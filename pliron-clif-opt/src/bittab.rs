@@ -311,7 +311,13 @@ fn try_tree(
             _ => continue,
         }
         for db in arms {
-            if seen.insert(db) && db != root && cand_ok(func, db) {
+            // Only glue jumps and tests of the same `x` can fold; a test of
+            // another value is a leaf. Exploring past it filled the
+            // candidate budget with the miss path's later dispatch
+            // (serde_json's `has_next_key`: `x - 9 in {0, 1, 4, 23}`, then
+            // tests for `}` and `"` on the raw byte) and gave up.
+            let same_x = test_of(func, db).is_none_or(|(_, _, y, _)| func.dfg.resolve_aliases(y) == x);
+            if seen.insert(db) && db != root && same_x && cand_ok(func, db) {
                 cand.insert(db);
                 work.push(db);
             }
