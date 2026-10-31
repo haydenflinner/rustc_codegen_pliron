@@ -331,8 +331,13 @@ Evening (2026-10-31):
   under `INLINENN` + `BRIFSEL` + edge-sunk loads is still 1.580 vs 1.276. The
   hot loop is index-addressed (about 17 instructions per limb vs LLVM's
   11 with post-increment loads and a down-counter), and 54 functions
-  changed. Profile both builds next; the loop itself needs LSR-style
-  pointer IVs (W2). Tried and
+  changed. The profile puts all of it in montgomery (+148 of +156
+  samples). Its two inner loops are 16 vs 17 instructions but take about
+  40% more samples: the base addresses through a pointer IV (`ldr [x10]`,
+  `add x10, x10, #8`), while the folded version recomputes both
+  addresses from the index each trip (`add x14, x15, x10, lsl #3` after
+  a `mov` from `i + 1`). LSR-style pointer IVs (W2) come first, before
+  INLINENN can be on. Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
