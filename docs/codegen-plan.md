@@ -293,10 +293,20 @@ Evening (2026-10-31):
 - **blind-sig's `montgomery` still tests `q == 0` per limb.** The
   remaining compare in the inner `mac_digit` loop is the zip's niche test
   on the *second* slice's pointer, rewritten as `p == 0 - D` (with
-  `q = p + D`). Its start pointer is a SmallVec data pointer, which
-  nothing marks non-null. LLVM gets this from `inbounds` GEP non-nullness:
-  `PLIRON_INBOUNDSNN` again (W1). The next step is to find why it cost
-  tokenize 8% and turn it on.
+  `q = p + D`). LLVM's IR shows how it avoids it: the loop is
+  `add_mul_vvw(z: &mut [u64], x: &[u64], ..)`, a real call at codegen with
+  `nonnull` slice params, and LLVM simplifies callees with their own
+  param attributes *before* inlining them (bottom-up CGSCC). Our IR
+  inliner drops the callee's param facts. Marking the clone's entry-block
+  params (region-scoped: they exist only inside the inlined body) works
+  at inline time (`add_mul_vvw`: leaves 0 and 2), but a later IR pass merges
+  the single-pred clone entry and replaces those params with the caller's
+  args, and the fact is gone. Moving it to the args is unsound (the
+  `carry_keeps_param_facts_scoped` bug). Needed: a region-scoped carrier
+  IR passes keep, or a dominance-checked transfer when a param is
+  replaced; plus `PLIRON_INBOUNDSNN` for the `q + 8` advance. Tried and
+  not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
+  `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
   byte-set scans over constant tables (pulldown's `escape_html_scalar`
   -2.2% on dense input; 3.5x on a sparse repro), with table bytes from
