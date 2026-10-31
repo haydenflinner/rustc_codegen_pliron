@@ -263,6 +263,10 @@ t_spills() {
       $out/spills0$exe > $out/spills.out
   PLIRON_LTUNDEF=1 PLIRON_REMATCALL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/spills/main.rs -o $out/spills1$exe &&
       $out/spills1$exe | diff --strip-trailing-cr - $out/spills.out
+  # PLIRON_LTUNDEF_ALL: zeros at every marker, not only in call or
+  # high-pressure loops (docs/history/2026-10-31-tokenize.md).
+  PLIRON_LTUNDEF=1 PLIRON_LTUNDEF_ALL=1 PLIRON_REMATCALL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/spills/main.rs -o $out/spills3$exe &&
+      $out/spills3$exe | diff --strip-trailing-cr - $out/spills.out
   PLIRON_REMATCALL=1 PLIRON_LTUNDEF=1 PLIRON_FRAME_INFO=ltu_visit rustc $BE --edition 2021 -O -C codegen-units=1 tests/spills/main.rs -o $out/spills2$exe 2> $out/spills2.fi &&
       $out/spills2$exe | diff --strip-trailing-cr - $out/spills.out
   local s0 s2

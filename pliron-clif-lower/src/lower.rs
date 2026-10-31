@@ -1615,6 +1615,7 @@ pub fn lower_module<'a>(
                     lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
                     ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                     ltzero: FxHashSet::default(),
+                    ltloops: FxHashSet::default(),
                     dbg_slots: Default::default(),
                 };
                 if pliron_cfg::tracing_on() {
@@ -2656,6 +2657,7 @@ pub fn lower_clif_wasm(
                 lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
                 ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                 ltzero: FxHashSet::default(),
+                ltloops: FxHashSet::default(),
                 dbg_slots: Default::default(),
             };
             fl.lower(f.op);
@@ -3195,6 +3197,8 @@ struct FnLower<'a, 'b> {
     /// `PLIRON_LTUNDEF=1`: a lifetime marker on a promoted alloca redefines
     /// its variables as zero (see the marker arm of `lower_intrinsic`).
     ltundef: bool,
+    /// The blocks where `ltundef` emits its zeros (`lt_loop_blocks`).
+    ltloops: FxHashSet<Ptr<BasicBlock>>,
     /// The zeros `ltundef` emits at markers. They are skipped when a later
     /// marker picks its anchor: a zero no read uses dies in the pipeline,
     /// and a marker anchored on a dead inst falls back to its whole block,
@@ -3328,6 +3332,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .collect();
                 self.vars.insert(a, vs);
             }
+        }
+        if self.ltundef && !crate::env_is("PLIRON_LTUNDEF_ALL", "1") {
+            self.ltloops = lt_loop_blocks(ctx, self.st, &pblocks, &self.vars);
+        } else if self.ltundef {
+            self.ltloops = pblocks.iter().copied().collect();
         }
         let params = self.b.block_params(entry).to_vec();
         let mut i = 0;
@@ -7014,7 +7023,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // here. That ends the previous value's live range: it no longer
             // flows around a loop into the next iteration's join, where it
             // would sit in a block param (and, across calls, a spill slot)
-            // that no read can legally observe.
+            // that no read can legally observe. Only in loops where that
+            // costs something (`lt_loop_blocks`: a call, or more restarted
+            // variables than registers): elsewhere the carried value costs
+            // at most a register, while the zero is a new input at the join
+            // that can keep jump threading from removing a test
+            // (`tokenize`'s per-char `None` check, 5.02 -> 5.88 ms;
+            // docs/history/2026-10-31-tokenize.md). `PLIRON_LTUNDEF_ALL=1`
+            // restores zeros at every marker.
+            let in_lt_loop = op
+                .deref(self.ctx)
+                .get_parent_block()
+                .is_some_and(|pb| self.ltloops.contains(&pb));
             if self.ltundef && self.b.current_block().is_some() {
                 // The marker's own alloca when it was promoted whole, and
                 // the promoted slices SROA split off it (`lt_slices`). One
@@ -7027,6 +7047,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             vars.extend(vs.iter().copied());
                         }
                     }
+                }
+                if !in_lt_loop {
+                    vars.clear();
                 }
                 let mut zeros: SmallVec<[(ClType, ir::Value); 4]> = SmallVec::new();
                 for (var, t) in vars {
@@ -7462,6 +7485,126 @@ impl<'a, 'b> FnLower<'a, 'b> {
         };
         self.set1(op, r);
     }
+}
+
+/// `lt_loop_blocks`' default: distinct restarted variables that make a
+/// call-free loop worth the zeros. Below about the allocatable integer
+/// registers (28 on aarch64) the carried values sit in registers anyway;
+/// `tokenize`'s loop restarts 18, `sum_postcard`'s serde decode loop 58
+/// (docs/history/2026-10-31-tokenize.md).
+const LT_PRESSURE: usize = 24;
+
+/// Where `PLIRON_LTUNDEF`'s zeros pay: blocks of a CFG cycle (successor
+/// edges plus invoke landing pads; strongly connected components by an
+/// iterative Tarjan walk) that holds a call, or whose lifetime markers
+/// restart at least `PLIRON_LTUNDEF_PRESSURE` distinct promoted variables.
+fn lt_loop_blocks(
+    ctx: &Context,
+    st: &State,
+    pblocks: &[Ptr<BasicBlock>],
+    vars: &FxHashMap<Value, Vec<(cranelift_frontend::Variable, ClType)>>,
+) -> rustc_hash::FxHashSet<Ptr<BasicBlock>> {
+    let pressure: usize = crate::env_get("PLIRON_LTUNDEF_PRESSURE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LT_PRESSURE);
+    // Distinct variables each block's markers restart.
+    let restarts = |b: Ptr<BasicBlock>, out: &mut FxHashSet<usize>| {
+        for op in b.deref(ctx).iter(ctx) {
+            if !st
+                .intrinsics
+                .get(op)
+                .is_some_and(|n| matches!(n.as_str(), "llvm.lifetime.start" | "llvm.lifetime.end"))
+            {
+                continue;
+            }
+            let p = op.deref(ctx).get_operand(ctx, 1);
+            let slices = st.lt_slices.get(p).map(|v| v.as_slice()).unwrap_or(&[]);
+            for a in std::iter::once(&p).chain(slices) {
+                if let Some(vs) = vars.get(a) {
+                    for &(v, _) in vs {
+                        out.insert(v.index());
+                    }
+                }
+            }
+        }
+    };
+    let idx: FxHashMap<Ptr<BasicBlock>, usize> =
+        pblocks.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let n = pblocks.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut call = vec![false; n];
+    for (i, &b) in pblocks.iter().enumerate() {
+        for op in b.deref(ctx).iter(ctx) {
+            if Operation::is_op::<CallOp>(op, ctx) {
+                call[i] = true;
+                if let Some(&(pad, _)) = st.invokes.get(op)
+                    && let Some(&j) = idx.get(&pad)
+                {
+                    succ[i].push(j);
+                }
+            }
+        }
+        if let Some(t) = b.deref(ctx).iter(ctx).last() {
+            succ[i].extend(t.deref(ctx).successors(ctx).filter_map(|d| idx.get(&d).copied()));
+        }
+    }
+    let mut out = rustc_hash::FxHashSet::default();
+    const UNSEEN: usize = usize::MAX;
+    let (mut index, mut low) = (vec![UNSEEN; n], vec![0usize; n]);
+    let mut on = vec![false; n];
+    let (mut stack, mut next) = (Vec::new(), 0usize);
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut dfs = vec![(root, 0usize)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = dfs.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if index[w] == UNSEEN {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    dfs.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            dfs.pop();
+            if let Some(&(u, _)) = dfs.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let at = stack.iter().rposition(|&x| x == v).unwrap();
+                let scc = stack.split_off(at);
+                for &x in &scc {
+                    on[x] = false;
+                }
+                // A cycle: more than one block, or a self-edge.
+                let cyclic = scc.len() > 1 || succ[v].contains(&v);
+                let hot = cyclic
+                    && (scc.iter().any(|&x| call[x]) || {
+                        let mut vs = FxHashSet::default();
+                        for &x in &scc {
+                            restarts(pblocks[x], &mut vs);
+                        }
+                        vs.len() >= pressure
+                    });
+                if hot {
+                    out.extend(scc.iter().map(|&x| pblocks[x]));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Reverse postorder from the entry block, then any unreachable blocks, so
