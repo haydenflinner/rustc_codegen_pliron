@@ -57,6 +57,34 @@ pub const WASM_LIMIT: usize = 512;
 /// is where most of the `bench/wasm` hashmap gap lives. Kept off for
 /// -Os/-Oz, where growth is the point of `small`.
 pub const WASM_HOT: usize = 3;
+/// Above this size, cold callsites under `PLIRON_INLINE_WASM_COLDKEEP`
+/// (default off, `=1` on) only give allowlisted callees (hash/num/str/ast-parse)
+/// the full `WASM_LIMIT`; everything else uses this flat cold cap — same
+/// cliff as `PLIRON_INLINE_WASM_COLD=384`, but tokenize/parse helpers in
+/// the band still inline. Denylist experiments (fmt-junk, alloc/math/sort)
+/// each grew CODE ~1 KiB. (docs/history/2026-10-28-solo50.md).
+pub const WASM_COLDKEEP_THRESH: usize = 384;
+
+/// Callees tokenize/parse_only need above the cold cap. Keep patterns
+/// tight: bare `3num` matched `fmt::num` (+19 KiB); `7unicode` is too wide.
+pub fn wasm_cold_keep(sym: &str) -> bool {
+    // Path fragments in v0 mangling — crate/module boundaries only.
+    sym.contains("4core4hash")
+        || sym.contains("4hash3sip")
+        || sym.contains("4hash6Hasher")
+        || sym.contains("4hash11BuildHasher")
+        || sym.contains("std4hash")
+        || sym.contains("4core3num")
+        || sym.contains("6bignum")
+        || sym.contains("7dec2flt")
+        || sym.contains("from_ascii")
+        || sym.contains("4core3str")
+        || sym.contains("3str11validations")
+        || sym.contains("4core4char")
+        // regex-syntax tokenize: Parser::bump/char_at/peek, utf8_decode.
+        || sym.contains("ast5parse")
+        || sym.contains("11utf8_decode")
+}
 
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
@@ -1182,6 +1210,11 @@ pub fn run(
     let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
+    // `PLIRON_INLINE_WASM_COLDKEEP=1` (small mode; default off): non-keep
+    // callees use `WASM_COLDKEEP_THRESH` as the flat cold cap; keep-list
+    // (hash/num/str/ast-parse) keeps `limit`.
+    let coldkeep = small && crate::env_is("PLIRON_INLINE_WASM_COLDKEEP", "1");
+    let keep_thresh: usize = WASM_COLDKEEP_THRESH;
     let mut free_used: FxHashSet<String> = FxHashSet::default();
     // Self-recursive functions (`scc` keeps only multi-function cycles).
     let self_rec: FxHashSet<String> = if recstack || smallscc {
@@ -1369,10 +1402,24 @@ pub fn run(
                     // `WASM_LIMIT=512` while cold helpers stop growing
                     // regex-wasm. Measured: flat INLINE=384 kills tokenize
                     // (+43%); a cold/hot split is the candidate (2026-10-28-solo50.md).
+                    // `COLDKEEP=1`: same as COLD=keep_thresh for non-allowlisted
+                    // callees, full `limit` for hash/num/str/parse. Applied here
+                    // (not a post-hoc reject) so loop sites with ncalls>2 that
+                    // miss the hot× bonus still see the cold cap — a separate
+                    // reject that exempted all loop blocks left Parser::bump
+                    // through at t=512 and grew CODE +19 KiB.
                     let cold = if small {
-                        crate::env_get("PLIRON_INLINE_WASM_COLD")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(limit)
+                        let explicit = crate::env_get("PLIRON_INLINE_WASM_COLD")
+                            .and_then(|s| s.parse().ok());
+                        if coldkeep {
+                            if wasm_cold_keep(cs) {
+                                explicit.unwrap_or(limit)
+                            } else {
+                                explicit.unwrap_or(keep_thresh)
+                            }
+                        } else {
+                            explicit.unwrap_or(limit)
+                        }
                     } else {
                         limit
                     };
@@ -3337,4 +3384,51 @@ fn inline_call(
         .collect();
     let clones = src.iter().map(|b| map.lookup_block(*b).unwrap());
     (block, std::iter::once(cont).chain(clones).chain(split_blocks).collect())
+}
+
+#[cfg(test)]
+mod coldkeep_tests {
+    use super::wasm_cold_keep;
+
+    #[test]
+    fn keep_matches_hash_num_str_parse() {
+        assert!(wasm_cold_keep(
+            "_RNvXs3_NtNtCsew6TSQKploy_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsE"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvMsB_NtCsew6TSQKploy_4core3numm27from_ascii_bytes_radix_impl"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvMs2_NtNtNtCsew6TSQKploy_4core3num3imp6bignumNtB5_8Big32x4010mul_digits"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvNtNtCsew6TSQKploy_4core3str11validations19run_utf8_validation"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvXNtNtCsew6TSQKploy_4core4char6decodeINtB2_11DecodeUtf16"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvMs2_NtNtCslyoFghIStgp_3lib3ast5parseINtB5_7ParserIQNtB5_6ParserE4bumpB9_"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvNtCslyoFghIStgp_3lib5debug11utf8_decode"
+        ));
+    }
+
+    #[test]
+    fn keep_rejects_fmt_num_alloc_math() {
+        // `fmt::num` must NOT match via a bare `3num` substring.
+        assert!(!wasm_cold_keep(
+            "_RNvXsX_NtNtCsew6TSQKploy_4core3fmt3numyNtB7_5Debug3fmt"
+        ));
+        assert!(!wasm_cold_keep(
+            "_RNvMsa_NtCsew6TSQKploy_4core3fmtNtB5_9Formatter9write_fmt"
+        ));
+        assert!(!wasm_cold_keep(
+            "_RNvMs8_NtCseNTGQnV141q_5alloc7raw_vecNtB5_11RawVecInner11finish_grow"
+        ));
+        assert!(!wasm_cold_keep(
+            "_RNvNtNtNtCsf5r1dCIKy5h_17compiler_builtins4math9libm_math6scalbn6scalbn"
+        ));
+    }
 }
