@@ -1143,7 +1143,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let a = |i: usize| args[i].immediate();
         match name {
             "llvm.x86.ssse3.pshuf.b.128" | "llvm.x86.avx2.pshuf.b" => {
-                // r[i] = b[i] & 0x80 ? 0 : a[16 * (i / 16) + (b[i] & 15)]
+                // out[i] = b[i] & 0x80 ? 0 : a[16 * (i / 16) + (b[i] & 15)]
                 let (n, _) = self.elem_of(ret_rty);
                 let one = rustc_abi::Align::ONE;
                 let slot = self.alloca(rustc_abi::Size::from_bytes(n), one);
