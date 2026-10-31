@@ -341,8 +341,14 @@ Evening (2026-10-31):
   `p + s`. With INLINENN + BRIFSEL + IVPTR + edge-sunk loads the hot
   loop is LLVM's shape (13 instructions, post-increment loads and
   stores). blind-sig is at 1.329, from 1.58 (base 1.273): montgomery
-  +44 samples, mac_digit +11. Left: a `ldr x, [p], #0` writeback the
-  post-increment pass pairs with the store's +8, and the outer loop. Tried and
+  +44 samples, mac_digit +11. The `ldr x, [p], #0` writeback was the
+  emit-time post-index sweep (fixed, patch 90, neutral alone). With
+  `BRIFSEL` limited to selects only the branch uses, blind-sig is **1.209
+  vs default 1.274**. pulldown regresses 1.305 -> 1.550 under the same
+  flags: `parse_block` 200 -> 442 samples, only with the INLINENN facts
+  (a facts-free replay shows no BRIFSEL change). Next: put `region_nn`
+  in the `PLIRON_CORPUS` dump so clif-check can replay it, then find
+  what BRIFSEL does to parse_block. Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes

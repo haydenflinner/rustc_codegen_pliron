@@ -26,18 +26,38 @@ fn sel_on(func: &Function, v: Value, c: Value) -> Option<(Value, Value)> {
 }
 
 pub fn run(func: &mut Function) -> usize {
+    // Uses per value: a select with users beyond the branch stays live, and
+    // rewriting the edge would keep its arms alive next to it (pulldown's
+    // parser lost 20% that way).
+    let mut uses: rustc_hash::FxHashMap<Value, u32> = rustc_hash::FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                *uses.entry(func.dfg.resolve_aliases(v)).or_default() += 1;
+            }
+        }
+    }
     let mut n = 0;
     let blocks: Vec<_> = func.layout.blocks().collect();
     for b in blocks {
         let Some(t) = func.layout.last_inst(b) else { continue };
         let InstructionData::Brif { arg, blocks: dests, .. } = func.dfg.insts[t] else { continue };
         let c = func.dfg.resolve_aliases(arg);
+        // Uses of each value by this branch alone.
+        let mut here: rustc_hash::FxHashMap<Value, u32> = rustc_hash::FxHashMap::default();
+        for v in func.dfg.inst_values(t) {
+            *here.entry(func.dfg.resolve_aliases(v)).or_default() += 1;
+        }
         for (k, bc) in dests.iter().enumerate() {
             let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
             let mut new = args.clone();
             let mut hit = false;
             for (slot, a) in new.iter_mut().enumerate() {
                 let BlockArg::Value(v) = args[slot] else { continue };
+                let v = func.dfg.resolve_aliases(v);
+                if uses.get(&v) != here.get(&v) {
+                    continue;
+                }
                 if let Some((x, y)) = sel_on(func, v, c) {
                     *a = BlockArg::Value(if k == 0 { x } else { y });
                     hit = true;
