@@ -367,6 +367,8 @@ impl CtxSlot<'_> {
 /// `PLIRON_RETNN=1`: rustc's `nonnull` return attributes become facts on
 /// call results (opt-in until measured; see `FuncInfo::ret_nonnull`).
 static RETNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_RETNN", "1"));
+/// `PLIRON_INLINENN=1`: see `inline::nonnull_args`.
+static INLINENN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_INLINENN", "1"));
 
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
@@ -3308,9 +3310,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .into_iter()
                     .map(|(_, t)| self.b.append_block_param(cb, t))
                     .collect();
-                // An inlined call's result (`inline_call`): the callee's
-                // `nonnull` return leaves.
-                if let Some(&mask) = self.st.nnargs.get(a) {
+                // An inlined call's result or clone entry param
+                // (`inline_call`, opt-in `PLIRON_RETNN` / `PLIRON_INLINENN`):
+                // the callee's `nonnull` leaves.
+                if (*RETNN || *INLINENN)
+                    && let Some(&mask) = self.st.nnargs.get(a)
+                {
                     for (k, &p) in vs.iter().enumerate().take(64) {
                         if mask & (1 << k) != 0 {
                             self.nonnull.insert(p);

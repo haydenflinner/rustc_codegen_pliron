@@ -304,7 +304,14 @@ Evening (2026-10-31):
   args, and the fact is gone. Moving it to the args is unsound (the
   `carry_keeps_param_facts_scoped` bug). Needed: a region-scoped carrier
   IR passes keep, or a dominance-checked transfer when a param is
-  replaced; plus `PLIRON_INBOUNDSNN` for the `q + 8` advance. Tried and
+  replaced; plus `PLIRON_INBOUNDSNN` for the `q + 8` advance. Now opt-in
+  (`PLIRON_INLINENN=1`, with `phisimp` keeping `nnargs` params): the facts
+  reach CLIF (montgomery's non-null set grows from 11 to 46 values), but
+  the zip's niche test (`v1729 == 0`, single incoming `v23 + 8i`) still
+  doesn't fold. By the time `fold_null_tests` sees it, `v23` (the clone's
+  param) has become an instruction result without its fact. Next: find
+  the step that rewrites it (jtround's param eviction is a suspect).
+  Montgomery is 944 instructions with it, 859 without. Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes

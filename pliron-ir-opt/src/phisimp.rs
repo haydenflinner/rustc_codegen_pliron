@@ -56,6 +56,7 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
 
 // r[impl iropt.phisimp]
 pub fn run(ctx: &mut Context, st: &State) {
+    let pin_nn = pliron_cfg::env_is("PLIRON_INLINENN", "1") || pliron_cfg::env_is("PLIRON_RETNN", "1");
     let landing: FxHashSet<Ptr<BasicBlock>> = st.invokes.values().map(|&(b, _)| b).collect();
     let fns: Vec<_> = st
         .funcs
@@ -113,6 +114,14 @@ pub fn run(ctx: &mut Context, st: &State) {
                     let Some(v) = uniq.filter(|&v| ok && !defined_in(ctx, v, b)) else {
                         continue;
                     };
+                    // A region-scoped `nnargs` fact on `arg` (an inlined
+                    // clone's entry param or result, `PLIRON_INLINENN` /
+                    // `PLIRON_RETNN`) holds only inside the clone; `v` would
+                    // lose it. An alloca's address needs no fact (and must
+                    // not block SROA).
+                    if pin_nn && st.nnargs.contains(arg) && !st.allocas.contains(v) {
+                        continue;
+                    }
                     arg.replace_all_uses_with(ctx, &v);
                     for &(t, si) in ps {
                         let o = Operation::get_op_dyn(t, ctx);

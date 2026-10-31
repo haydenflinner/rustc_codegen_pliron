@@ -2691,6 +2691,43 @@ fn frozen_of(
 ///   the region to Cranelift blocks.
 /// `readonly can_move` load flags would be wrong here: the freeze holds
 /// only inside the clone, and a function-wide flag would escape the region.
+/// The callee's `nonnull` params (`FuncInfo::nonnull`) hold for the
+/// clone's entry-block params: they exist only inside the inlined region,
+/// which the call dominates, so the fact can't leak to the caller's other
+/// uses of the same args (unlike marking the args themselves). LLVM gets
+/// this by simplifying callees with their own param attributes before
+/// inlining them (num-bigint-dig's `add_mul_vvw` zip loses its per-limb
+/// null test that way). `cleanup` and `phisimp` keep such params (pinned).
+/// Opt-in: `PLIRON_INLINENN=1`.
+fn nonnull_args(ctx: &Context, st: &mut State, callee: &str, src: &[Ptr<BasicBlock>], map: &IrMapping) {
+    if !pliron_cfg::env_is("PLIRON_INLINENN", "1") {
+        return;
+    }
+    let Some(entry) = src.first().and_then(|b| map.lookup_block(*b)) else {
+        return;
+    };
+    let Some(f) = st.funcs.get(callee) else {
+        return;
+    };
+    // The leaf indices describe the declared ABI; a rewritten signature
+    // (`deadarg`, `sret2reg`) would shift them.
+    let nleaves: usize = entry
+        .deref(ctx)
+        .arguments(ctx)
+        .map(|a| crate::types::leaves(ctx, a.get_type(ctx)).len())
+        .sum();
+    if f.nonnull.is_empty() || nleaves != f.nparams {
+        return;
+    }
+    let marks: Vec<(Value, usize)> = f.nonnull.iter().filter_map(|&i| crate::state::leaf_arg(ctx, entry, i)).collect();
+    for (a, off) in marks {
+        if off < 64 {
+            let m = st.nnargs.get(a).copied().unwrap_or(0);
+            st.nnargs.insert(a, m | 1 << off);
+        }
+    }
+}
+
 fn frozen_args(
     ctx: &Context,
     st: &mut State,
@@ -3378,6 +3415,7 @@ fn inline_call(
     let br = BrOp::new(ctx, entry, args.clone()).get_operation();
     br.insert_before(ctx, call);
     frozen_args(ctx, st, cs, caller, src, &map, &args, block);
+    nonnull_args(ctx, st, cs, src, &map);
     st.calls.remove(call);
     Operation::erase(call, ctx);
     // An invoke ends its block (`call; br`): ops after it run only on the
