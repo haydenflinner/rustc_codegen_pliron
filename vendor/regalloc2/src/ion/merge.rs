@@ -395,8 +395,11 @@ impl<'a, F: Function> Env<'a, F> {
         }
         for i in order {
             let BlockparamOut {
-                from_vreg, to_vreg, ..
+                from_vreg, to_vreg, to_block, ..
             } = self.blockparam_outs[i];
+            if self.func.no_param_merge(to_block) {
+                continue;
+            }
             trace!(
                 "trying to merge blockparam v{} with input v{}",
                 to_vreg.index(),

@@ -1323,6 +1323,12 @@ pub trait Function {
         false
     }
 
+    /// PLIRON: blockparams of this block are not merged with their inputs
+    /// (shrink-wrapping's live-range split at the save block).
+    fn no_param_merge(&self, _block: Block) -> bool {
+        false
+    }
+
     // --------------
     // Spills/reloads
     // --------------

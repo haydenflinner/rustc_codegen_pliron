@@ -140,6 +140,7 @@ impl Context {
             let _tt = timing::compile();
 
             self.verify_if(isa)?;
+            crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(None));
             self.optimize(isa, ctrl_plane)?;
             // PLIRON: debug hook — dump the CLIF in its final pre-isel form.
             if *PRECOMPILE.get_or_init(|| std::env::var_os("PLIRON_PRECOMPILE").is_some()) {
@@ -229,6 +230,7 @@ impl Context {
         self.remat_sink(isa.triple().architecture == target_lexicon::Architecture::X86_64);
         if matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)) {
             self.const_sink();
+            self.shrink_split();
         }
 
         // PLIRON: reorder pure insts so a shared operand's last use lands
@@ -926,6 +928,261 @@ impl Context {
         // Originals left without uses are dropped by later DCE-free
         // lowering anyway (an unused pure def emits nothing).
         let _ = n;
+    }
+
+    /// PLIRON: live-range split for shrink-wrapping (`PLIRON_SHRINKWRAP=1`,
+    /// aarch64). The save point (VCode `pliron_shrink_wrap`) can only move
+    /// below the entry if no earlier block holds a value in a callee-saved
+    /// register; but a value loaded early and used past a call is allocated
+    /// one for its whole range (serde_json's `skip_to_escape` loaded the
+    /// cursor and length into x20/x21 in its entry block). Here the likely
+    /// save block `S` (the nearest common dominator of blocks with calls or
+    /// stack-slot operations, outside every loop) takes each value live into
+    /// its dominance region as a block parameter, so the early range ends at
+    /// the edge and the callee-saved copy starts inside `S`; constants are
+    /// cloned into `S` instead.
+    fn shrink_split(&mut self) {
+        use crate::ir::{BlockArg, InstBuilder, InstructionData, Opcode, Value};
+        use crate::cursor::{Cursor, FuncCursor};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(None));
+        if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() == Ok("1")) {
+            return;
+        }
+        const MAX_LIVEIN: usize = 16;
+        let Some(entry) = self.func.layout.entry_block() else { return };
+        let frame_op = |op: Opcode| {
+            op.is_call()
+                || matches!(op, Opcode::StackAddr | Opcode::TlsValue | Opcode::DynamicStackAddr
+                    | Opcode::GetFramePointer | Opcode::GetStackPointer | Opcode::GetReturnAddress)
+        };
+        let fblocks: Vec<crate::ir::Block> = self
+            .func
+            .layout
+            .blocks()
+            .filter(|&b| self.func.layout.block_insts(b).any(|i| frame_op(self.func.dfg.insts[i].opcode())))
+            .collect();
+        if fblocks.is_empty() {
+            return;
+        }
+        self.compute_cfg();
+        self.compute_domtree();
+        self.compute_loop_analysis();
+        // Nearest common dominator: walk `idom` up from each block until a
+        // block dominating the next one is found.
+        let mut sb = fblocks[0];
+        for &b in &fblocks[1..] {
+            while !self.domtree.block_dominates(sb, b) {
+                match self.domtree.idom(sb) {
+                    Some(d) => sb = d,
+                    None => return,
+                }
+            }
+        }
+        let dbg = std::env::var_os("PLIRON_SHRINKWRAP_DEBUG").is_some();
+        if dbg {
+            eprintln!(
+                "shrink_split {}: frame blocks {:?} -> S {sb} (entry {}, in loop {})",
+                self.func.name,
+                fblocks,
+                sb == entry,
+                self.loop_analysis.innermost_loop(sb).is_some()
+            );
+        }
+        // Out of loops: the save runs once, before the outermost loop.
+        while sb != entry && self.loop_analysis.innermost_loop(sb).is_some() {
+            match self.domtree.idom(sb) {
+                Some(d) => sb = d,
+                None => return,
+            }
+        }
+        // Closed region: every block reachable from S must be dominated by
+        // S (a small return block excepted: it is duplicated below), or a
+        // value used past S's region stays live across S's calls and keeps
+        // its callee-saved register from the entry on (pulldown's
+        // `scan_nextline`: the end pointer, used after the SIMD loop rejoins).
+        let small_ret = |f: &crate::ir::Function, b: crate::ir::Block| {
+            f.layout.last_inst(b).is_some_and(|t| f.dfg.insts[t].opcode().is_return())
+                && f.layout.block_insts(b).count() <= 4
+        };
+        let mut climbs = 0;
+        loop {
+            if sb == entry || climbs > 32 {
+                return;
+            }
+            let mut seen: crate::FxHashSet<crate::ir::Block> = crate::FxHashSet::default();
+            let mut wl: Vec<crate::ir::Block> = self.cfg.succ_iter(sb).collect();
+            let mut closed = true;
+            while let Some(b) = wl.pop() {
+                if !seen.insert(b) {
+                    continue;
+                }
+                if !self.domtree.block_dominates(sb, b) {
+                    if small_ret(&self.func, b) {
+                        continue;
+                    }
+                    closed = false;
+                    break;
+                }
+                wl.extend(self.cfg.succ_iter(b));
+            }
+            if closed {
+                break;
+            }
+            match self.domtree.idom(sb) {
+                Some(d) => sb = d,
+                None => return,
+            }
+            climbs += 1;
+        }
+        if dbg {
+            eprintln!("shrink_split: closed save block {sb} after {climbs} climbs");
+        }
+        // A small return block reached from both sides of S gets a copy for
+        // the edges from outside S's region, so every return reachable
+        // from S is dominated by it (VCode's shrink-wrap condition).
+        let rets: Vec<crate::ir::Block> = self
+            .func
+            .layout
+            .blocks()
+            .filter(|&b| {
+                !self.domtree.block_dominates(sb, b)
+                    && self.func.layout.last_inst(b).is_some_and(|t| self.func.dfg.insts[t].opcode().is_return())
+                    && self.func.layout.block_insts(b).count() <= 4
+            })
+            .collect();
+        let mut cloned = false;
+        for r in rets {
+            let preds: Vec<crate::flowgraph::BlockPredecessor> = self.cfg.pred_iter(r).collect();
+            let (inside, outside): (Vec<crate::flowgraph::BlockPredecessor>, Vec<crate::flowgraph::BlockPredecessor>) =
+                preds.iter().copied().partition(|p| self.domtree.block_dominates(sb, p.block));
+            if inside.is_empty()
+                || outside.is_empty()
+                || outside.iter().any(|p| !matches!(self.func.dfg.insts[p.inst], InstructionData::Jump { .. } | InstructionData::Brif { .. }))
+            {
+                continue;
+            }
+            let nr = self.func.dfg.make_block();
+            self.func.layout.insert_block_after(nr, r);
+            let mut vmap: crate::FxHashMap<Value, Value> = crate::FxHashMap::default();
+            for &p in self.func.dfg.block_params(r).to_vec().iter() {
+                let ty = self.func.dfg.value_type(p);
+                let np = self.func.dfg.append_block_param(nr, ty);
+                vmap.insert(p, np);
+            }
+            for i in self.func.layout.block_insts(r).collect::<Vec<_>>() {
+                let ni = self.func.dfg.clone_inst(i);
+                for (o, n) in self.func.dfg.inst_results(i).to_vec().into_iter().zip(self.func.dfg.inst_results(ni).to_vec()) {
+                    vmap.insert(o, n);
+                }
+                let m = vmap.clone();
+                self.func.dfg.map_inst_values(ni, |v| m.get(&v).copied().unwrap_or(v));
+                self.func.layout.append_inst(ni, nr);
+            }
+            for p in outside {
+                let dfg = &mut self.func.dfg;
+                for bc in dfg.insts[p.inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+                    if bc.block(&dfg.value_lists) == r {
+                        bc.set_block(nr, &mut dfg.value_lists);
+                    }
+                }
+            }
+            cloned = true;
+        }
+        if cloned {
+            self.compute_cfg();
+            self.compute_domtree();
+            self.compute_loop_analysis();
+        }
+
+        // Every edge into S must be a plain jump or brif (args appendable).
+        let preds: Vec<crate::ir::Inst> = self.cfg.pred_iter(sb).map(|p| p.inst).collect();
+        if preds.is_empty()
+            || preds.iter().any(|&i| !matches!(self.func.dfg.insts[i], InstructionData::Jump { .. } | InstructionData::Brif { .. }))
+        {
+            return;
+        }
+        let region: Vec<crate::ir::Block> =
+            self.func.layout.blocks().filter(|&b| self.domtree.block_dominates(sb, b)).collect();
+        let in_region = |f: &crate::ir::Function, dt: &crate::dominator_tree::DominatorTree, v: Value| -> bool {
+            match f.dfg.value_def(v) {
+                crate::ir::ValueDef::Result(i, _) => f.layout.inst_block(i).is_some_and(|b| dt.block_dominates(sb, b)),
+                crate::ir::ValueDef::Param(b, _) => dt.block_dominates(sb, b),
+                _ => true,
+            }
+        };
+        let mut liveins: Vec<Value> = Vec::new();
+        for &b in &region {
+            for i in self.func.layout.block_insts(b) {
+                for v in self.func.dfg.inst_values(i) {
+                    let v = self.func.dfg.resolve_aliases(v);
+                    if !in_region(&self.func, &self.domtree, v) && !liveins.contains(&v) {
+                        liveins.push(v);
+                    }
+                }
+            }
+        }
+        if dbg {
+            eprintln!("shrink_split: {} live-ins into {sb}", liveins.len());
+        }
+        if liveins.is_empty() || liveins.len() > MAX_LIVEIN {
+            return;
+        }
+        crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(Some(sb)));
+        let mut map: crate::FxHashMap<Value, Value> = crate::FxHashMap::default();
+        for &v in &liveins {
+            let konst = match self.func.dfg.value_def(v) {
+                crate::ir::ValueDef::Result(i, _) => matches!(
+                    self.func.dfg.insts[i].opcode(),
+                    Opcode::Iconst | Opcode::F32const | Opcode::F64const
+                ).then_some(i),
+                _ => None,
+            };
+            let nv = match konst {
+                Some(i) => {
+                    let data = self.func.dfg.insts[i];
+                    let ni = self.func.dfg.make_inst(data);
+                    let ctv = self.func.dfg.ctrl_typevar(i);
+                    self.func.dfg.make_inst_results(ni, ctv);
+                    let mut pos = FuncCursor::new(&mut self.func).at_top(sb);
+                    pos.next_inst();
+                    match pos.current_inst() {
+                        Some(first) => pos.func.layout.insert_inst(ni, first),
+                        None => pos.func.layout.append_inst(ni, sb),
+                    }
+                    let _ = pos.ins();
+                    self.func.dfg.first_result(ni)
+                }
+                None => {
+                    let ty = self.func.dfg.value_type(v);
+                    let p = self.func.dfg.append_block_param(sb, ty);
+                    for &bi in &preds {
+                        let dfg = &mut self.func.dfg;
+                        for bc in dfg.insts[bi].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+                            if bc.block(&dfg.value_lists) == sb {
+                                bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
+                            }
+                        }
+                    }
+                    p
+                }
+            };
+            map.insert(v, nv);
+        }
+        for &b in &region {
+            for i in self.func.layout.block_insts(b).collect::<Vec<_>>() {
+                let f = &mut self.func.dfg;
+                let hits = f.inst_values(i).any(|v| map.contains_key(&f.resolve_aliases(v)));
+                if hits {
+                    let m = map.clone();
+                    let resolved: Vec<(Value, Value)> =
+                        f.inst_values(i).map(|v| (v, f.resolve_aliases(v))).collect();
+                    let rmap: crate::FxHashMap<Value, Value> =
+                        resolved.into_iter().filter_map(|(v, r)| m.get(&r).map(|&n| (v, n))).collect();
+                    f.map_inst_values(i, |v| rmap.get(&v).copied().unwrap_or(v));
+                }
+            }
+        }
     }
 
     fn remat_sink(&mut self, x64: bool) {

@@ -101,6 +101,13 @@ impl<I: MachInst + MachInstEmit> VCodeInst for I {}
 /// modify the vcode, but produces an `EmitResult`, which contains the
 /// machine code itself, and the associated disassembly and/or
 /// metadata as requested.
+std::thread_local! {
+    /// PLIRON: the CLIF block `Context::shrink_split` split live ranges at,
+    /// for the function this thread is compiling (read before regalloc).
+    pub(crate) static PLIRON_SPLIT_BLOCK: core::cell::Cell<Option<crate::ir::Block>> =
+        const { core::cell::Cell::new(None) };
+}
+
 pub struct VCode<I: VCodeInst> {
     /// VReg IR-level types.
     vreg_types: Vec<Type>,
@@ -110,6 +117,10 @@ pub struct VCode<I: VCodeInst> {
     /// bundles down (`RegallocFunction::is_remat`). Filled by
     /// `compute_remat_vregs` (opt-in, `PLIRON_RA2_REMATW=1`).
     remat_vregs: Vec<bool>,
+
+    /// PLIRON: the lowered block whose blockparams regalloc2 must not merge
+    /// with their inputs (`PLIRON_SPLIT_BLOCK`).
+    no_merge_block: Option<BlockIndex>,
 
     /// Lowered machine instructions in order corresponding to the original IR.
     insts: Vec<I>,
@@ -632,8 +643,230 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 const NO_INST_OFFSET: CodeOffset = u32::MAX;
 
 impl<I: VCodeInst> VCode<I> {
-    /// PLIRON: fill `remat_vregs` (see the field) before regalloc.
+    /// PLIRON: shrink-wrapping (`PLIRON_SHRINKWRAP=1`). The callee saves
+    /// and frame allocation move from the entry block to the save block
+    /// `S`, the nearest common dominator of every block that needs them; a
+    /// return that `S` does not dominate tears down only the frame record.
+    /// serde_json's `skip_to_escape` and pulldown-cmark's scanners return
+    /// early through a ten-register save on most calls; LLVM's ShrinkWrap
+    /// saves on the slow path only.
+    ///
+    /// A block needs the frame if it has an instruction that is not
+    /// `pliron_frame_free` (calls, stack slots, `sp`/`fp`/`lr`), or an
+    /// operand or regalloc move in a stack slot or a clobbered callee-saved
+    /// register. `S` must not be the entry, must not sit on a cycle, must
+    /// come before every block it dominates in emission order (unwind info
+    /// is cumulative by address), and no return outside `S`'s dominance may
+    /// be reachable from `S`. Returns `S` and, per block, whether a return
+    /// there gets the full epilogue.
+    fn pliron_shrink_wrap(&self, ra: &regalloc2::Output, order: &[BlockIndex]) -> Option<(BlockIndex, Vec<bool>)> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() == Ok("1")) {
+            return None;
+        }
+        let fl = self.abi.frame_layout();
+        if fl.clobber_size == 0 && fl.fixed_frame_storage_size + fl.outgoing_args_size == 0 {
+            return None;
+        }
+        if fl.tail_args_size != fl.incoming_args_size || !self.abi.pliron_no_stack_checks() {
+            return None;
+        }
+        let clob: crate::FxHashSet<regalloc2::PReg> =
+            fl.clobbered_callee_saves.iter().map(|r| regalloc2::PReg::from(r.to_reg())).collect();
+        let bad = |a: regalloc2::Allocation| a.is_stack() || a.as_reg().is_some_and(|r| clob.contains(&r));
+        let nb = self.num_blocks();
+        let mut needs = vec![false; nb];
+        let mut rets = vec![false; nb];
+        let mut insn_block = vec![0usize; self.insts.len()];
+        for b in 0..nb {
+            let r = self.block_ranges.get(b);
+            for i in r.start..r.end {
+                insn_block[i] = b;
+                let inst = &self.insts[i];
+                match inst.is_term() {
+                    MachTerminator::Ret => {
+                        rets[b] = true;
+                        continue;
+                    }
+                    MachTerminator::RetCall => return None,
+                    _ => {}
+                }
+                if !inst.pliron_frame_free() || ra.inst_allocs(InsnIndex::new(i)).iter().any(|&a| bad(a)) {
+                    needs[b] = true;
+                }
+            }
+        }
+        for (pp, Edit::Move { from, to }) in &ra.edits {
+            if bad(*from) || bad(*to) {
+                needs[insn_block[pp.inst().index()]] = true;
+            }
+        }
+        let entry = self.entry.index();
+        let dbg = std::env::var_os("PLIRON_SHRINKWRAP_DEBUG").is_some();
+        if dbg {
+            let nl: Vec<usize> = (0..nb).filter(|&b| needs[b]).collect();
+            eprintln!("shrink_wrap: needing blocks {:?} (entry needs: {})", &nl[..nl.len().min(20)], needs[entry]);
+        }
+        if needs[entry] || !needs.iter().any(|&x| x) {
+            return None;
+        }
+        let succs = |b: usize| self.block_succs[self.block_succ_range.get(b)].iter().map(|s| s.index());
+        // Reverse postorder from the entry, then iterative dominators.
+        let mut rpo = Vec::with_capacity(nb);
+        let mut seen = vec![false; nb];
+        let mut stack = vec![(entry, false)];
+        while let Some((b, done)) = stack.pop() {
+            if done {
+                rpo.push(b);
+                continue;
+            }
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            stack.push((b, true));
+            for s in succs(b) {
+                if !seen[s] {
+                    stack.push((s, false));
+                }
+            }
+        }
+        rpo.reverse();
+        let mut rpo_ix = vec![usize::MAX; nb];
+        for (k, &b) in rpo.iter().enumerate() {
+            rpo_ix[b] = k;
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for &b in &rpo {
+            for s in succs(b) {
+                preds[s].push(b);
+            }
+        }
+        let mut idom = vec![usize::MAX; nb];
+        idom[entry] = entry;
+        let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while rpo_ix[a] > rpo_ix[b] {
+                    a = idom[a];
+                }
+                while rpo_ix[b] > rpo_ix[a] {
+                    b = idom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in rpo.iter().skip(1) {
+                let mut new = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] != usize::MAX {
+                        new = if new == usize::MAX { p } else { intersect(&idom, p, new) };
+                    }
+                }
+                if new != usize::MAX && idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        let mut sblk: Option<usize> = None;
+        for b in 0..nb {
+            if needs[b] && seen[b] {
+                sblk = Some(match sblk {
+                    None => b,
+                    Some(x) => intersect(&idom, x, b),
+                });
+            }
+        }
+        let mut sb = sblk?;
+        // Reachability from S; S on a cycle climbs the dominator tree until
+        // it is not (the save runs once, before the loop).
+        let reach_from = |sb: usize| {
+            let mut reach = vec![false; nb];
+            let mut wl: Vec<usize> = succs(sb).collect();
+            while let Some(b) = wl.pop() {
+                if reach[b] {
+                    continue;
+                }
+                reach[b] = true;
+                wl.extend(succs(b));
+            }
+            reach
+        };
+        let mut reach = reach_from(sb);
+        let mut climb = 0;
+        let dom_by = |idom: &[usize], s: usize, mut b: usize| loop {
+            if b == s {
+                return true;
+            }
+            if b == entry || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        };
+        // Off cycles, and closed: every block reachable from S dominated by
+        // it (shrink_split duplicated the shared returns).
+        while sb != entry
+            && climb < 32
+            && (reach[sb] || (0..nb).any(|b| reach[b] && !dom_by(&idom, sb, b)))
+        {
+            sb = idom[sb];
+            reach = reach_from(sb);
+            climb += 1;
+        }
+        if dbg {
+            eprintln!("shrink_wrap: save block {sb} (climbed {climb})");
+        }
+        if sb == entry {
+            return None;
+        }
+        let dominated = |mut b: usize| loop {
+            if b == sb {
+                return true;
+            }
+            if b == entry || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        };
+        // An outside return reachable from S rules it out.
+        if reach[sb] {
+            if dbg {
+                eprintln!("shrink_wrap: save block on a cycle");
+            }
+            return None;
+        }
+        let mut full = vec![false; nb];
+        for b in 0..nb {
+            if rets[b] {
+                if dominated(b) {
+                    full[b] = true;
+                } else if reach[b] {
+                    if dbg {
+                        eprintln!("shrink_wrap: return block {b} reachable from S but not dominated");
+                    }
+                    return None;
+                }
+            }
+        }
+        // Emission order: S before every block it dominates.
+        let pos_s = order.iter().position(|b| b.index() == sb)?;
+        for (k, b) in order.iter().enumerate() {
+            if k < pos_s && b.index() != sb && seen[b.index()] && dominated(b.index()) {
+                return None;
+            }
+        }
+        Some((BlockIndex::new(sb), full))
+    }
+
+    /// PLIRON: fill `remat_vregs` (see the field) before regalloc, and
+    /// pick up shrink-wrapping's split block.
     pub fn compute_remat_vregs(&mut self) {
+        self.no_merge_block = PLIRON_SPLIT_BLOCK
+            .with(|c| c.get())
+            .and_then(|b| self.block_order.lowered_index_for_block(b));
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_REMATW").as_deref() == Ok("1"))
             || std::env::var("PLIRON_REMAT").as_deref() == Ok("0")
@@ -676,6 +909,7 @@ impl<I: VCodeInst> VCode<I> {
             sigs,
             vreg_types: vec![],
             remat_vregs: vec![],
+            no_merge_block: None,
             insts: Vec::with_capacity(10 * n_blocks),
             user_stack_maps: FxHashMap::default(),
             debug_tags: FxHashMap::default(),
@@ -1210,6 +1444,7 @@ impl<I: VCodeInst> VCode<I> {
         static EPIMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE"));
         let mut epi_label: Option<MachLabel> = None;
+        let shrink = self.pliron_shrink_wrap(regalloc, &final_order);
 
         let t_loop0 = std::time::Instant::now();
         for (oi, &block) in final_order.iter().enumerate() {
@@ -1318,7 +1553,8 @@ impl<I: VCodeInst> VCode<I> {
             if block == self.entry {
                 trace!(" -> entry block");
                 buffer.start_srcloc(Default::default());
-                for inst in &self.abi.gen_prologue() {
+                let pro = if shrink.is_some() { self.abi.gen_prologue_setup() } else { self.abi.gen_prologue() };
+                for inst in &pro {
                     do_emit(&inst, &mut disasm, &mut buffer, &mut state);
                 }
                 buffer.end_srcloc();
@@ -1356,6 +1592,16 @@ impl<I: VCodeInst> VCode<I> {
                 }
                 bb_starts.push(Some(cur_offset));
                 last_offset = Some(cur_offset);
+            }
+
+            // PLIRON: shrink-wrapping's save point: the callee saves and
+            // frame allocation, before this block's regalloc moves.
+            if shrink.as_ref().is_some_and(|(sb, _)| *sb == block) {
+                buffer.start_srcloc(Default::default());
+                for inst in &self.abi.gen_prologue_body() {
+                    do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                }
+                buffer.end_srcloc();
             }
 
             if let Some(block_start) = I::gen_block_start(
@@ -1828,7 +2074,16 @@ impl<I: VCodeInst> VCode<I> {
                         // a return, place an epilogue at this point
                         // (and don't emit the return; the actual
                         // epilogue will contain it).
-                        if self.insts[iix.index()].is_term() == MachTerminator::Ret {
+                        if self.insts[iix.index()].is_term() == MachTerminator::Ret
+                            && shrink.as_ref().is_some_and(|(_, full)| !full[block.index()])
+                        {
+                            // PLIRON: a return before shrink-wrapping's
+                            // save point: frame record only, never the
+                            // shared (full) epilogue.
+                            for inst in &self.abi.gen_epilogue_frame_only() {
+                                do_emit(inst, &mut disasm, &mut buffer, &mut state);
+                            }
+                        } else if self.insts[iix.index()].is_term() == MachTerminator::Ret {
                             log::trace!("emitting epilogue");
                             let epi = self.abi.gen_epilogue();
                             // PLIRON: shared epilogue (`PLIRON_EPIMERGE`).
@@ -2656,6 +2911,10 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
 
     fn is_remat(&self, vreg: usize) -> bool {
         self.remat_vregs.get(vreg).copied().unwrap_or(false)
+    }
+
+    fn no_param_merge(&self, block: BlockIndex) -> bool {
+        self.no_merge_block == Some(block)
     }
 
     fn num_blocks(&self) -> usize {

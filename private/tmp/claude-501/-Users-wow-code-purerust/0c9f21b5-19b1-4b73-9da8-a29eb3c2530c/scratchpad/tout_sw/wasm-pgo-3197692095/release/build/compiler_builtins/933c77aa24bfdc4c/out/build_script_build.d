@@ -1,0 +1,6 @@
+/Users/wow/code/purerust/rcp-tune//private/tmp/claude-501/-Users-wow-code-purerust/0c9f21b5-19b1-4b73-9da8-a29eb3c2530c/scratchpad/tout_sw/wasm-pgo-3197692095/release/build/compiler_builtins/933c77aa24bfdc4c/out/build_script_build.d: /Users/wow/.rustup/toolchains/nightly-2026-10-22-aarch64-apple-darwin/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/build.rs /Users/wow/.rustup/toolchains/nightly-2026-10-22-aarch64-apple-darwin/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/../libm/configure.rs
+
+/Users/wow/code/purerust/rcp-tune//private/tmp/claude-501/-Users-wow-code-purerust/0c9f21b5-19b1-4b73-9da8-a29eb3c2530c/scratchpad/tout_sw/wasm-pgo-3197692095/release/build/compiler_builtins/933c77aa24bfdc4c/out/build_script_build: /Users/wow/.rustup/toolchains/nightly-2026-10-22-aarch64-apple-darwin/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/build.rs /Users/wow/.rustup/toolchains/nightly-2026-10-22-aarch64-apple-darwin/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/../libm/configure.rs
+
+/Users/wow/.rustup/toolchains/nightly-2026-10-22-aarch64-apple-darwin/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/build.rs:
+/Users/wow/.rustup/toolchains/nightly-2026-10-22-aarch64-apple-darwin/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/../libm/configure.rs:

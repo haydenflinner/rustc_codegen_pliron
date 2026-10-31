@@ -1042,3 +1042,18 @@ the sum; plain `ushr` lowering zero-extends first. They now require
 83. vcode disassembly names the CLIF block (or critical edge) each block
     lowers (`block7: ; block158`), so `clif-check codegen` can weight code
     by CLIF loop depth.
+
+84. Opt-in shrink-wrapping (`PLIRON_SHRINKWRAP=1`, aarch64):
+    `VCode::pliron_shrink_wrap` picks the save block (nearest common
+    dominator of blocks that need the frame, climbed off cycles until every
+    block reachable from it is dominated by it); the frame record stays at
+    entry, callee saves and frame allocation move to that block
+    (`Callee::gen_prologue_setup`/`gen_prologue_body`), and a return outside
+    it gets `gen_epilogue_frame_only`. `MachInst::pliron_frame_free`
+    (aarch64 whitelist) marks instructions that may run before the saves.
+    `Context::shrink_split` (CLIF, before lowering) makes the save block's
+    live-ins block params, clones constants into it and duplicates small
+    shared return blocks; the vendored regalloc2 `Function::no_param_merge`
+    keeps those params from merging back with their inputs. Correct on the
+    full test suite; applies to 2 of 26 hot functions; neutral in two
+    held-out A/Bs, so off.

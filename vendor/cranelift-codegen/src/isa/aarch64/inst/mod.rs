@@ -1265,6 +1265,59 @@ impl MachInst for Inst {
         }
     }
 
+    fn pliron_frame_free(&self) -> bool {
+        let ok = |r: &Reg| *r != stack_reg() && *r != fp_reg() && *r != link_reg();
+        let am = |m: &AMode| match m {
+            AMode::RegReg { rn, .. }
+            | AMode::RegScaled { rn, .. }
+            | AMode::RegScaledExtended { rn, .. }
+            | AMode::RegExtended { rn, .. }
+            | AMode::Unscaled { rn, .. }
+            | AMode::UnsignedOffset { rn, .. } => ok(rn),
+            _ => false,
+        };
+        match self {
+            Inst::Nop0 | Inst::Nop4 | Inst::Jump { .. } | Inst::CondBr { .. } | Inst::TestBitAndBranch { .. } => true,
+            Inst::TrapIf { .. } | Inst::Udf { .. } | Inst::Csdb | Inst::JTSequence { .. } => true,
+            // Pseudo-instructions with no code of their own (argument
+            // definitions are fixed-register operands, checked by the
+            // allocation scan).
+            Inst::Args { .. } | Inst::DummyUse { .. } | Inst::SequencePoint { .. } => true,
+            Inst::AluRRR { rn, rm, .. } | Inst::AluRRRShift { rn, rm, .. } | Inst::AluRRRExtend { rn, rm, .. } => {
+                ok(rn) && ok(rm)
+            }
+            Inst::AluRRRR { rn, rm, ra, .. } => ok(rn) && ok(rm) && ok(ra),
+            Inst::AluRRImm12 { rn, .. } | Inst::AluRRImmLogic { rn, .. } | Inst::AluRRImmShift { rn, .. } => ok(rn),
+            Inst::BitRR { rn, .. } | Inst::Extend { rn, .. } => ok(rn),
+            Inst::Mov { rm, .. } => ok(rm),
+            Inst::MovWide { .. } | Inst::MovK { .. } | Inst::CSet { .. } | Inst::CSetm { .. } => true,
+            Inst::CSel { rn, rm, .. } | Inst::CSNeg { rn, rm, .. } | Inst::CSInc { rn, rm, .. } => ok(rn) && ok(rm),
+            Inst::CCmp { rn, rm, .. } => ok(rn) && ok(rm),
+            Inst::CCmpImm { rn, .. } => ok(rn),
+            Inst::LoadExtNameGot { .. } | Inst::LoadExtNameNear { .. } => true,
+            Inst::VecDupImm { .. } | Inst::VecDupFPImm { .. } | Inst::FpuMoveFPImm { .. } => true,
+            Inst::ULoad8 { mem, .. }
+            | Inst::SLoad8 { mem, .. }
+            | Inst::ULoad16 { mem, .. }
+            | Inst::SLoad16 { mem, .. }
+            | Inst::ULoad32 { mem, .. }
+            | Inst::SLoad32 { mem, .. }
+            | Inst::ULoad64 { mem, .. }
+            | Inst::Store8 { mem, .. }
+            | Inst::Store16 { mem, .. }
+            | Inst::Store32 { mem, .. }
+            | Inst::Store64 { mem, .. }
+            | Inst::FpuLoad64 { mem, .. }
+            | Inst::FpuStore64 { mem, .. }
+            | Inst::FpuLoad128 { mem, .. }
+            | Inst::FpuStore128 { mem, .. } => am(mem),
+            Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => {
+                matches!(mem, PairAMode::SignedOffset { reg, .. } if ok(reg))
+            }
+            _ => false,
+        }
+    }
+
     fn worst_case_size() -> CodeOffset {
         // The maximum size, in bytes, of any `Inst`'s emitted code. We have at least one case of
         // an 8-instruction sequence (saturating int-to-float conversions) with three embedded

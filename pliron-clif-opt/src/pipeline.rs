@@ -2211,7 +2211,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
         let breg_now = live_block_region(p);
         let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
-        p.stats.forwarded += loadfwd::run(
+        p.stats.forwarded += loadfwd::run_deref(
             &mut p.clctx.func,
             cfg,
             pf,
@@ -2225,6 +2225,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
             p.nowrite,
             p.call_frozen,
             p.nocap,
+            p.deref,
         );
     }
     if let Some(t) = t {
@@ -2943,7 +2944,7 @@ fn s_seltest(p: &mut Pipe, an: &mut Analysis) -> usize {
 fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
     let breg_now = live_block_region(p);
     let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
-    let k = loadfwd::run(
+    let k = loadfwd::run_deref(
         &mut p.clctx.func,
         cfg,
         pf,
@@ -2957,6 +2958,7 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.nowrite,
         p.call_frozen,
         p.nocap,
+        p.deref,
     );
     if k > 0 && p.dump {
         p.dump("loadfwd2");

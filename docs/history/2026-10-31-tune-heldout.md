@@ -167,3 +167,39 @@ until regalloc work.
 Per-program after this (pliron/LLVM): blake3 1.21, blind-sig 1.24,
 pulldown 1.40, regex 1.33, compression 1.42, html 1.33, json 1.30,
 protobuf 1.00. Geomean 1.27x.
+
+## Measuring the gap dynamically (suite 1.27x -> 1.25x)
+
+The census counts instructions statically, and its stack-traffic numbers
+pointed at register allocation. `bench/heldout/dynstack.py` classifies
+every profile sample by instruction class instead (pliron minus LLVM):
+allocator spills were a small share; prologue/epilogue cost and loads
+LLVM avoids were the big ones. Stack accesses explained 3 of regex's 226
+extra samples; prologue/epilogue 171 of pulldown's 535 and 114 of
+serde_json's 347. The dev loop for this is `racorpus.py` + `clif-check
+codegen` (hot functions' pre-pipeline CLIF, scored in seconds).
+
+What changed, each A/B'd on the held-out suite (interleaved variants):
+
+- **Flat callee saves** (Cranelift patch 82): one `sub sp` and stores at
+  offsets instead of pre-indexed pushes chaining through `sp`.
+  1.292 -> 1.269.
+- **slotprom container fields**: a slot written whole and read by
+  narrower loads is promoted; regex's six-bool flags argument went
+  through memory and then spilled. 1.289 -> 1.269.
+- **Latch speculation**: a latch of at most three pure instructions folds
+  into its predecessor's `brif`, one taken branch per iteration
+  (pulldown's escape scan took two). 1.274 -> 1.250.
+- **Vector-immediate rematerialization**: q registers are caller-saved,
+  so splat constants spilled across calls.
+- **Shrink-wrapping** (opt-in, `PLIRON_SHRINKWRAP=1`): saves move to the
+  nearest closed dominator of the blocks that need them, with a
+  live-range split at that block (no regalloc2 blockparam merge there)
+  and duplicated shared returns. Correct (full test suite) but it
+  applies to 2 of 26 hot functions; neutral in two A/Bs, so it stays off.
+- **Upward load PRE**: a load below a loop header whose location is
+  available on the back edges but not on entry is PRE'd at the header
+  when the address is dereferenceable (rustc's `dereferenceable`, now
+  passed to loadfwd). regex's `follow_epsilons` reloaded its `&mut
+  SparseSet`'s buffer pointer and length every iteration; LLVM keeps them
+  in registers.

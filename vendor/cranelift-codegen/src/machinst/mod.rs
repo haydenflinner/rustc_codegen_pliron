@@ -399,6 +399,13 @@ pub trait MachInst: Clone + Debug {
         None
     }
 
+    /// PLIRON: whether this instruction can run before the callee saves
+    /// and frame allocation (shrink-wrapping): it touches no stack slot,
+    /// `sp`, `fp` or `lr`, and is not a call. Conservative default.
+    fn pliron_frame_free(&self) -> bool {
+        false
+    }
+
     /// PLIRON: the size of every instruction when the encoding is fixed
     /// (aarch64: 4), so emission can estimate a loop's byte size from its
     /// instruction count. `None` for variable-length encodings.

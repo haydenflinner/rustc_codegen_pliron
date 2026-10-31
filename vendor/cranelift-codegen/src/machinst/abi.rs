@@ -2384,16 +2384,41 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// This should include any stack frame or other setup necessary to use the
     /// other methods (`load_arg`, `store_retval`, and spillslot accesses.)
     pub fn gen_prologue(&self) -> SmallInstVec<M::I> {
+        let mut insts = self.gen_prologue_setup();
+        insts.extend(self.gen_prologue_body());
+        insts
+    }
+
+    /// PLIRON: the frame-record half of the prologue (shrink-wrapping
+    /// emits it at entry and `gen_prologue_body` at the save point).
+    pub fn gen_prologue_setup(&self) -> SmallInstVec<M::I> {
+        M::gen_prologue_frame_setup(self.call_conv, &self.flags, &self.isa_flags, self.frame_layout())
+    }
+
+    /// PLIRON: an epilogue for a return before the save point: tear down
+    /// the frame record and return, no callee-save restores.
+    pub fn gen_epilogue_frame_only(&self) -> SmallInstVec<M::I> {
+        let frame_layout = self.frame_layout();
+        let mut insts: SmallInstVec<M::I> =
+            M::gen_epilogue_frame_restore(self.call_conv, &self.flags, &self.isa_flags, frame_layout);
+        insts.extend(M::gen_return(self.call_conv, &self.isa_flags, frame_layout));
+        insts
+    }
+
+    /// PLIRON: whether the stack check / probe sequence would be empty
+    /// (shrink-wrapping does not move them).
+    pub fn pliron_no_stack_checks(&self) -> bool {
+        let fl = self.frame_layout();
+        let total = fl.clobber_size + fl.fixed_frame_storage_size + fl.outgoing_args_size + fl.setup_area_size;
+        self.stack_limit.is_none()
+            && (!self.flags.enable_probestack() || total < (1 << self.flags.probestack_size_log2()))
+    }
+
+    /// The prologue after the frame record: stack checks, callee saves,
+    /// frame allocation.
+    pub fn gen_prologue_body(&self) -> SmallInstVec<M::I> {
         let frame_layout = self.frame_layout();
         let mut insts = smallvec![];
-
-        // Set up frame.
-        insts.extend(M::gen_prologue_frame_setup(
-            self.call_conv,
-            &self.flags,
-            &self.isa_flags,
-            &frame_layout,
-        ));
 
         // The stack limit check needs to cover all the stack adjustments we
         // might make, up to the next stack limit check in any function we

@@ -1001,6 +1001,7 @@ fn meet(acc: &mut Option<Avail>, x: &Avail) {
 /// params — `*v` is immutable for the clone's region (`breg`/`rpar`
 /// scope the immunity, like LLVM's `!alias.scope`/`!noalias`).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -1015,6 +1016,28 @@ pub fn run(
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
     nocap: &FxHashSet<(Inst, u32)>,
+) -> usize {
+    run_deref(func, cfg, pf, ps, noalias, scoped_na, inv_insts, ofrozen, breg, rpar, nw, cfrozen, nocap, &FxHashMap::default())
+}
+
+/// `run` with the dereferenceable-parameter facts (`Pipe::deref`), which
+/// make critical-edge PRE loads from those parameters speculatable.
+#[allow(clippy::too_many_arguments)]
+pub fn run_deref(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    pf: &crate::proots::Facts,
+    ps: &VMap<Value>,
+    noalias: &FxHashSet<Value>,
+    scoped_na: &FxHashSet<Value>,
+    inv_insts: &FxHashSet<Inst>,
+    ofrozen: &FxHashMap<Value, Vec<(u64, Region)>>,
+    breg: &FxHashMap<Block, Region>,
+    rpar: &pliron::cols::ColMap<Region, Region>,
+    nw: &FxHashMap<FuncRef, bool>,
+    cfrozen: &FxHashMap<FuncRef, u64>,
+    nocap: &FxHashSet<(Inst, u32)>,
+    deref: &FxHashMap<Value, (u64, bool)>,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
@@ -1110,8 +1133,11 @@ pub fn run(
         // which retains a loc across a store to a different root only when
         // one side is isolated — an empty set would drop every loc at the
         // first unrelated store.
+        if *LOADPRE_DEBUG {
+            eprintln!("loadpre {}: iso {:?} ncc {:?} escapes {:?}", func.name, iso, ncc, _escapes.keys().collect::<Vec<_>>());
+        }
         n += pre(
-            func, ps, &stop, noalias, cfg, &rpo, entry, &iso, &ncc, pbnd, ppm,
+            func, ps, &stop, noalias, cfg, &rpo, entry, &iso, &ncc, pbnd, ppm, deref,
         );
         tt("pre", t0);
         if n > 0 {
@@ -1359,6 +1385,11 @@ pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     }
 }
 
+static LOADPRE_DEBUG: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("PLIRON_LOADPRE_DEBUG").is_some());
+static LOADPRE_UP: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_LOADPRE_UP", "0"));
+
 /// Bound on compensating loads `edge_pre` inserts per function.
 const MAX_INSERTS: usize = 64;
 
@@ -1394,6 +1425,8 @@ fn edge_pre(
     b: Block,
     i: Inst,
     loc: Loc,
+    deref: &FxHashMap<Value, (u64, bool)>,
+    preserves: Option<&dyn Fn(&Function, Block, Loc) -> bool>,
 ) -> Option<Value> {
     let mut avail = false;
     let mut missing: Vec<(Block, Inst)> = Vec::new();
@@ -1409,6 +1442,53 @@ fn edge_pre(
     }
     missing.sort_unstable();
     missing.dedup();
+    // Upward (`PLIRON_LOADPRE_UP=0` disables): the load's block has one
+    // predecessor and the loc is available at none of its ends, but higher
+    // up a merge block has it on some in-edges (a loop header: available
+    // on the back edges, not on entry). If every block on the single-pred
+    // chain from that merge down to `b` keeps the loc (`preserves`), PRE
+    // at the merge and use its value here: it dominates the chain. The
+    // merge's compensating loads run on paths that never reach this load,
+    // so the load must be speculatable. regex's `follow_epsilons` reloaded
+    // its `&mut SparseSet`'s buffer pointer and length every iteration.
+    if !avail && missing.len() == 1 && *LOADPRE_UP {
+        let Some(preserves) = preserves else { return None };
+        let off = match func.dfg.insts[i] {
+            InstructionData::Load { offset, .. } => i64::from(i32::from(offset)),
+            _ => return None,
+        };
+        let arg0 = func.dfg.resolve_aliases(func.dfg.inst_args(i)[0]);
+        let size = i64::from(func.dfg.value_type(func.dfg.first_result(i)).bytes());
+        let spec = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move())
+            || deref.get(&arg0).is_some_and(|&(bytes, _)| off >= 0 && off + size <= bytes as i64);
+        if !spec {
+            return None;
+        }
+        let mut m = missing[0].0;
+        let mut chain: Vec<Block> = Vec::new();
+        loop {
+            if m == b || chain.contains(&m) || !reach.contains(&m) || !preserves(func, m, loc) {
+                return None;
+            }
+            chain.push(m);
+            let ps = pred_blocks(cfg, m);
+            if ps.len() == 1 {
+                m = ps[0];
+                continue;
+            }
+            break;
+        }
+        if chain.len() > 16 {
+            return None;
+        }
+        if *LOADPRE_DEBUG {
+            eprintln!("edge_pre {b} {i} {loc:?}: upward to {m} via {chain:?}");
+        }
+        return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None);
+    }
+    if *LOADPRE_DEBUG {
+        eprintln!("edge_pre {b} {i} {loc:?}: avail={avail} missing={}", missing.len());
+    }
     // `missing` empty is the fully-available case (`st` would have hit);
     // `avail` false is plain hoisting, not redundancy elimination; a self
     // back-edge among the missing would read memory past the load itself.
@@ -1425,7 +1505,20 @@ fn edge_pre(
         return None;
     };
     let arg = func.dfg.resolve_aliases(arg);
-    let speculatable = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move());
+    // Speculatable: `can_move`, or inside a dereferenceable parameter's
+    // range (`deref`, from rustc's `dereferenceable`: a reference stays
+    // valid for the whole call). regex's `follow_epsilons` reloaded its
+    // `&mut SparseSet`'s buffer pointer and length at an inner-loop header
+    // with ten critical in-edges.
+    let in_deref = || {
+        let off = match func.dfg.insts[i] {
+            InstructionData::Load { offset, .. } => i64::from(i32::from(offset)),
+            _ => return false,
+        };
+        let size = i64::from(func.dfg.value_type(func.dfg.first_result(i)).bytes());
+        deref.get(&arg).is_some_and(|&(bytes, _)| off >= 0 && off + size <= bytes as i64)
+    };
+    let speculatable = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move()) || in_deref();
     for &(p, pinst) in &missing {
         if func.layout.last_inst(p) != Some(pinst)
             || !matches!(
@@ -1493,6 +1586,7 @@ fn pre(
     ncc: &FxHashSet<Root>,
     bnd: &VMap<u64>,
     pm: &VMap<(Root, i64)>,
+    deref: &FxHashMap<Value, (u64, bool)>,
 ) -> usize {
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let eh = false;
@@ -1606,6 +1700,34 @@ fn pre(
     };
     let mut dom: Option<DominatorTree> = None;
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
+    // Would block `x` keep `loc` if it were available at its start (the
+    // same transfer as the `out` fixpoint)? For `edge_pre`'s upward walk.
+    let preserves = |f: &Function, x: Block, loc: Loc| -> bool {
+        let mut av: Avail = std::iter::once((loc, Value::reserved_value())).collect();
+        transfer(
+            f,
+            ps,
+            na,
+            na0,
+            x,
+            &mut av,
+            None,
+            iso,
+            ncc,
+            &FxHashSet::default(),
+            &mut FxHashSet::default(),
+            None,
+            &FxHashMap::default(),
+            &mut FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            nw,
+            bnd,
+            pm,
+            eh,
+            &nm,
+        );
+        av.contains_key(&loc)
+    };
     // `nm` covers the apply scan too — `func` mutates only through
     // `edge_pre`'s add-only inserts and the `fwd` rewrites below.
     for &b in rpo {
@@ -1649,7 +1771,7 @@ fn pre(
                     } else if !clobbered
                         && writes.iter().all(|&(w, ms)| !may_write(w, ms, loc))
                         && let Some(v) =
-                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc)
+                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves))
                     {
                         fwd.push((i, v));
                         st.insert(loc, St::Local(v));

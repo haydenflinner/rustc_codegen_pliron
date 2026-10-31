@@ -52,3 +52,9 @@ reloads (cranelift-codegen PLIRON_PATCH 76).
 rematerializable takes `total / prio / 2` as its spill weight (capped
 like the others) instead of the long-range sqrt normalization, as LLVM
 halves the weight of rematerializable intervals.
+
+## `Function::no_param_merge` (Cranelift shrink-wrapping, opt-in)
+
+`src/lib.rs` hook (default `false`), `src/ion/merge.rs`: blockparams of
+the named block are not merged with their inputs, so the live-range
+split Cranelift's `shrink_split` makes at the save block survives.
