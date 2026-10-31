@@ -4750,6 +4750,13 @@ pub fn run(
     // threading rewrites args to `iconst`), but nothing below consumes
     // a stale-false JUMP and `fnn` checks TESTC fresh when it runs.
     let mut cd = Cd::new();
+    // Null tests on block params first, before `merge_chains`/`trivp`/
+    // `deadp` dissolve single-source params into their incoming values: an
+    // inlined clone's entry param carries its callee's `nonnull` fact
+    // (`PLIRON_INLINENN`), which must not move to the caller's value.
+    if pliron_cfg::env_is("PLIRON_INLINENN", "1") {
+        fnn(func, loads, derived, None, &mut cd);
+    }
     if sh & shape::JUMP != 0 {
         merge_chains(func, &mut cd);
     }

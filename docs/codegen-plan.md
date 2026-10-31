@@ -308,10 +308,14 @@ Evening (2026-10-31):
   (`PLIRON_INLINENN=1`, with `phisimp` keeping `nnargs` params): the facts
   reach CLIF (montgomery's non-null set grows from 11 to 46 values), but
   the zip's niche test (`v1729 == 0`, single incoming `v23 + 8i`) still
-  doesn't fold. By the time `fold_null_tests` sees it, `v23` (the clone's
-  param) has become an instruction result without its fact. Next: find
-  the step that rewrites it (jtround's param eviction is a suspect).
-  Montgomery is 944 instructions with it, 859 without. Tried and
+  only folds once `jumpthread` runs its null folds before `merge_chains`
+  (which merged the clone entry away). With that, the per-limb test goes
+  (montgomery's inner loops 106 -> 52 instructions) but blind-sig gets
+  slower, 1.278 -> 1.681 of LLVM: what's left is the zip's
+  `TrustedRandomAccess` index loop (`base + i*8` recomputed, a per-limb
+  reload of the SmallVec length, latch spills). Needed next: index ->
+  pointer strength reduction (W2), and the callee's `noalias` on `z`
+  kept the same region-scoped way so the length load hoists. Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
