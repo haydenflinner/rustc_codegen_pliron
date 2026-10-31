@@ -4124,7 +4124,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         .needs(shape::LOOPS),
         // `p + d == e` exit tests with `d`, `e` invariant: `p == e - d`.
         // After ivretro, which rewrites a second IV as `p + d`.
-        step("ivcmp", "ivcmp", Gate::OptIn("PLIRON_IVCMP"), s_ivcmp).needs(shape::LOOPS),
+        step("ivcmp", "ivcmp", Gate::Env("PLIRON_IVCMP"), s_ivcmp).needs(shape::LOOPS),
         // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
         // — are phase-D relational merges; the later sameargs3/webmerge
         // positions cover anything this extra call found.)

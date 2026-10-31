@@ -1,4 +1,4 @@
-//! Offset exit tests (`PLIRON_IVCMP=1`).
+//! Offset exit tests (`PLIRON_IVCMP=0` disables).
 //!
 //! `icmp eq|ne (iadd x, a), b` in a loop, with `a` and `b` defined outside
 //! it, becomes `icmp eq|ne x, (b - a)`, the subtraction emitted once at the

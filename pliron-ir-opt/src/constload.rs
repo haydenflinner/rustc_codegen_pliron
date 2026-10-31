@@ -178,7 +178,7 @@ fn const_copy(ctx: &Context, st: &State, a: Value) -> Option<(Ptr<Operation>, Ve
 /// `MSG_SCHEDULE[round]`: an 896-byte table copied to the stack, then a
 /// row of it copied again, and every message index loaded back and bounds
 /// checked). Iterates: replacing one copy's alloca makes copies out of it
-/// copies from the global. `PLIRON_CONSTCOPY=1` enables (default off).
+/// copies from the global. `PLIRON_CONSTCOPY=0` disables.
 // r[impl iropt.constload.copy]
 pub fn forward_copies(ctx: &mut Context, st: &mut State) {
     let fns: Vec<_> = st

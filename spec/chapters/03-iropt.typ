@@ -527,20 +527,21 @@ the parallel chapter; this chapter only names the point where they plug in.
   #refr("iropt.devirt").
 ]
 
-#r("iropt.constload.copy", title: "Copies of constant globals are the global", level: "may",
+#r("iropt.constload.copy", title: "Copies of constant globals are the global", level: "should",
    refines: ("model.equiv", "model.parity"),
    checked: "test.sh t_constcopy")[
-  With `PLIRON_CONSTCOPY=1`, an alloca whose only write is one
+  An alloca whose only write is one
   non-volatile `llvm.memcpy` of its whole size from a foldable global (as
   for #refr("iropt.constload")), and whose other uses are non-volatile
-  loads, GEPs, lifetime markers and copy sources, MAY be replaced by the
-  global's address; the copy and the markers are erased. Any other use (a
+  loads, GEPs, lifetime markers and copy sources, SHOULD be replaced by the
+  global's address (`PLIRON_CONSTCOPY=0` disables); the copy and the
+  markers are erased. Any other use (a
   store, a call argument, a second write) MUST keep the alloca. Loads
   before the copy read undefined memory, so reading the global there is a
   refinement. Runs before SROA, to a fixpoint per function.
 ]
 
-#llvm(kind: "gap", summary: [The copy-of-constant rewrite is opt-in; LLVM always does it.])[
+#llvm(kind: "choice", summary: [Copies of constant globals become the global before SROA, as LLVM's InstCombine does.])[
   LLVM's InstCombine does this unconditionally
   (`isOnlyCopiedFromConstantMemory`). rustc materializes `const` arrays
   as a stack copy, so without it a constant-index read of a `const`

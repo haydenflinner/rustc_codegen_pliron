@@ -1153,7 +1153,7 @@ pub(crate) fn iropt_head(
             domcheck::run(ctx, st, "memcpyopt")
         );
     }
-    if pass_enabled("PLIRON_CONSTLOAD") && env_is("PLIRON_CONSTCOPY", "1") {
+    if pass_enabled("PLIRON_CONSTLOAD") && pass_enabled("PLIRON_CONSTCOPY") {
         pt!(prof, cgu, "constcopy", constload::forward_copies(ctx, st));
         pt!(prof, cgu, "domcheck:cc", domcheck::run(ctx, st, "constcopy"));
     }
