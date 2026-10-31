@@ -7,6 +7,8 @@
 # Extra args are forwarded to both criterion binaries, e.g.
 #   bench/run.sh tokenize        # run a subset by name filter
 #   bench/run.sh --verbose
+# r[impl verify.perf.runtime]
+# r[verify verify.perf.runtime]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

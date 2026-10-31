@@ -1,4 +1,7 @@
 #!/usr/bin/env -S python3 -I
+# r[verify native.dbg.vars]
+# r[verify native.dbg.types]
+# r[verify verify.dbg.vs-stock]
 """lldb on optimized and unoptimized code: stock rustc vs pliron, variable by variable.
 
   harness/dbgcorpus.py [--opt 0,2] [--only a,b] [--lldb PATH] [--be DYLIB]

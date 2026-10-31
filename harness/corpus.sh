@@ -10,6 +10,8 @@
 #
 # OUT=<dir> overrides the destination. The backend is target/debug's dylib
 # (build it first). Re-recording replaces the set.
+# r[impl verify.corpus.record]
+# r[verify verify.corpus.record]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD

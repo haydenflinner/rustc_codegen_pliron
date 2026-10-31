@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# r[verify model.equiv]
+# r[verify model.det]
+# r[verify clif.verify]
+# r[verify wasm.peep.equiv]
+# r[verify wasm.eh.check]
+# r[verify wasm.libc.pure]
+# r[verify par.det.order]
+# r[verify verify.diff.stock]
+# r[verify verify.diff.suites]
+# r[verify verify.diff.ratchet]
+# r[verify verify.fuzz.seeds]
+# r[verify verify.fuzz.matrix]
 """Test harness: runs suites and compares the results with checked-in expectations.
 
 Usage: harness/run.py [--tier N | --suite NAME ...] [--accept] [--opt] [--no-build]
@@ -105,6 +117,7 @@ def smoke_cases():
 TID = re.compile(r"thread '([^']+)' \(\d+\) panicked")
 
 
+# r[impl verify.diff.stock]
 def build_and_run(src, flags, exe, backend):
     """Returns (status, message, (rc, stdout, stderr)) for one build + run."""
     c = sh(["rustc", os.path.join(ROOT, src), "-o", exe] + flags + (backend_flags() if backend else []), 300)
@@ -177,6 +190,7 @@ def proc_macro_case():
     return "proc_macro", "pass", ""
 
 
+# r[impl verify.diff.suites]
 def suite_smoke(args):
     os.makedirs(os.path.join(OUT, "smoke/bin"), exist_ok=True)
     cases = [c for c in smoke_cases() if args.filter in c[0]]
@@ -487,6 +501,8 @@ def fuzz_one(seed, matrix=False):
     return r
 
 
+# r[impl verify.fuzz.seeds]
+# r[impl verify.fuzz.matrix]
 def suite_fuzz(args):
     if not os.path.exists(GENERATE):
         print(f"fuzz: no generator at {GENERATE}; build rustlantis or set PLIRON_FUZZ_GENERATOR")
@@ -538,6 +554,7 @@ def ok(st):
     return st in ("pass", "noref")
 
 
+# r[impl verify.diff.ratchet]
 def compare(suite, res, args):
     """Prints the comparison; returns the number of failing differences."""
     path = expect_path(suite, args)

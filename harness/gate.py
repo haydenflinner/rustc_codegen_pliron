@@ -1,4 +1,14 @@
 #!/usr/bin/env -S python3 -I
+# r[verify clif.check]
+# r[verify verify.gate.green]
+# r[verify verify.gate.legs]
+# r[verify verify.gate.stanzas]
+# r[verify verify.gate.vacuous]
+# r[verify verify.gate.hosts]
+# r[verify verify.poison]
+# r[verify verify.corpus.replay]
+# r[verify verify.corpus.known]
+# r[verify verify.fuzz.regress]
 """Merge gate: everything a change must pass before it lands, in parallel.
 
 Usage: harness/gate.py [--jobs N] [--skip unit,wasm,...] [--only a,b]
@@ -27,6 +37,7 @@ import argparse, concurrent.futures as cf, json, os, re, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "target/gate")
+# r[impl verify.corpus.known]
 KNOWN = os.path.join(ROOT, "harness/expectations/corpus-known.txt")
 WIN = os.name == "nt"
 CLIF_CHECK = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "clif-check")
@@ -59,6 +70,7 @@ def shell(cmd):
     return cmd
 
 
+# r[impl verify.gate.stanzas]
 def stanzas():
     src = open(os.path.join(ROOT, "test.sh")).read()
     names = re.findall(r"want (\w+) && t_\w+", src)
@@ -96,6 +108,7 @@ def corpus_job(dirname):
     return res
 
 
+# r[impl verify.gate.green]
 def install_hook():
     hooks = subprocess.check_output(["git", "rev-parse", "--git-common-dir"], cwd=ROOT, text=True).strip()
     path = os.path.join(ROOT, hooks, "hooks", "pre-push")
@@ -106,6 +119,8 @@ def install_hook():
     print(f"gate: installed {path}")
 
 
+# r[impl verify.gate.legs]
+# r[impl verify.gate.hosts]
 def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) // 2))
@@ -173,6 +188,8 @@ def main():
                                          {"TEST_NOBUILD": "1"})))
     # rustlantis seeds that found miscompiles (needs the sibling rustlantis
     # generator; the job reports a skip without it).
+    # r[impl verify.fuzz.regress]
+    # r[impl verify.gate.vacuous]
     if want("fuzzreg"):
         seeds = ",".join(str(s) for s in FUZZ_REGRESS)
         jobs.append(("fuzzreg", lambda: run("fuzzreg", [sys.executable, "-I", "harness/run.py", "--suite", "fuzz",

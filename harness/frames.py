@@ -1,4 +1,5 @@
 #!/usr/bin/env -S python3 -I
+# r[verify verify.perf.ctime]
 """Stack-frame bytes per function, LLVM vs pliron, for the parity card.
 
   harness/frames.py [--json OUT] [--input regex-syntax]

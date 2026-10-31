@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # wasm32 smoke test: core + compiler_builtins + tests/wasm all go through the
 # pliron backend, are linked by tools/pliron-wasm-ld (no wasm-ld/LLVM), and run in node.
+# r[verify model.unwind]
+# r[verify wasm.pipeline]
+# r[verify wasm.peep.equiv]
+# r[verify wasm.audit.copyfwd]
+# r[verify wasm.ld.args]
+# r[verify wasm.ld.layout]
+# r[verify wasm.eh.check]
+# r[verify wasm.eh.intrinsics]
+# r[verify wasm.eh.libc]
+# r[verify wasm.libc.pure]
+# r[verify verify.audit.wasm]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD

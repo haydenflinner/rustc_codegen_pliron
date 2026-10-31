@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# r[verify clif.bisect]
+# r[verify verify.bisect.unit]
 """Find the first optimization unit that makes a test fail.
 
 Usage: harness/bisect.py [--max N] -- <command...>

@@ -969,6 +969,7 @@ fn pk_of(ctx: &Context, op: Ptr<Operation>, nargs: usize) -> Option<(Pk, bool)> 
     (nargs == want).then_some((pk, swap))
 }
 
+// r[verify iropt.instcombine]
 #[cfg(test)]
 mod tests {
     use super::*;

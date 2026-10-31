@@ -4,6 +4,7 @@
 //! and `fsqrt s,s`: every f16<->f32 scalar conversion silently produced
 //! garbage (CubeCL's f16 kernels on the pliron->Cranelift JIT, 70+ failing
 //! tests). The vcode text printed `fcvt` either way, so check the bytes.
+// r[verify clif.vendor.isel]
 
 #![cfg(target_arch = "aarch64")]
 

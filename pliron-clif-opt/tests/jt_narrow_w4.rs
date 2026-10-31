@@ -2,6 +2,7 @@
 //! 4-byte encodings run even on tables whose span would fit a byte (a
 //! real 4-byte deferred table needs a >256 KB span, which the reach bound
 //! never allows). Separate binary: the width knob is read once per process.
+// r[verify clif.vendor.jt]
 #![cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux")

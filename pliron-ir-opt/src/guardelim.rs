@@ -921,6 +921,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
     }
 }
 
+// r[verify iropt.guardelim]
 #[cfg(test)]
 mod tests {
     use super::*;

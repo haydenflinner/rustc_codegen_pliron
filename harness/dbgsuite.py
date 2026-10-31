@@ -1,4 +1,6 @@
 #!/usr/bin/env -S python3 -I
+# r[verify native.dbg.types]
+# r[verify verify.dbg.vs-stock]
 """rustc's lldb debuginfo suite (tests/debuginfo) under stock rustc and pliron.
 
   harness/dbgsuite.py [--suite DIR] [--opt 0,2] [--side stock,pliron]
@@ -219,6 +221,7 @@ def run_case(a, name, path, rev, side, opt):
                 checks=len(p["checks"]), missing=len(missing))
 
 
+# r[impl verify.dbg.vs-stock]
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--suite", default=DEF_SUITE)

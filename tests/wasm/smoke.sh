@@ -4,6 +4,7 @@
 # emit pipeline (waffle, wpeep + audit, serialization, reloc/link, run) in
 # seconds. The std-through-pliron legs stay in tests/wasm/run.sh (gate:
 # --only wasm / --full).
+# r[verify verify.audit.wasm]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
@@ -16,6 +17,7 @@ case "$(uname -s)" in
 esac
 cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml
 # Keep the wpeep Datalog audit on the smoke bodies too.
+# r[impl verify.audit.wasm]
 export PLIRON_WASM_AUDIT=${PLIRON_WASM_AUDIT:-panic}
 BE="-Zcodegen-backend=${BACKEND:-$ROOT/target/debug/$lib}"
 LD=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe

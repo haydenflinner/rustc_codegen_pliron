@@ -1,4 +1,8 @@
 #!/usr/bin/env -S python3 -I
+# r[verify model.parity]
+# r[verify wasm.size]
+# r[verify verify.card.rating]
+# r[verify verify.card.attribute]
 """Measure LLVM parity on every axis and write one summary.
 
 Usage: harness/parity.py [--skip native,wasm,ctime,stack] [--from-logs]
@@ -56,6 +60,8 @@ LEGS = {
 # the weighted overall a weighted geomean of the ratios, so 2x better on
 # one axis exactly offsets 2x worse on another of equal weight. Weights
 # are a judgement call; change them here.
+# r[impl verify.card.rating]
+# r[impl verify.card.attribute]
 CARD = [
     # code, name, weight
     ("SPD", "runtime speed", 30),

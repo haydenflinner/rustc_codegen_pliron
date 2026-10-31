@@ -1,4 +1,5 @@
 #!/usr/bin/env -S python3 -I
+# r[verify verify.perf.ctime]
 """Compile-time parity: stock rustc (LLVM) vs the pliron backend on fixed inputs.
 
 Usage: harness/ctime.py [--runs N] [--debug-dylib] [--only a,b] [--json OUT]
@@ -142,6 +143,7 @@ def text_bytes(paths):
     return tot or None
 
 
+# r[impl verify.perf.ctime]
 def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("--runs", type=int, default=3)

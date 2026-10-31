@@ -13,6 +13,10 @@
 #   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
+# r[verify model.abi]
+# r[verify verify.stanza.layout]
+# r[verify verify.stanza.oracle]
+# r[verify verify.oracle.llvm-tools]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,6 +29,7 @@ for a in "$@"; do
     *) echo "test.sh: unknown flag '$a' (want --sysroot|--mold|--only=a,b,c)" >&2; exit 2 ;;
   esac
 done
+# r[impl verify.stanza.layout]
 want() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
 
 # TEST_NOBUILD=1: the caller (harness/gate.py) already built the backend.
@@ -48,6 +53,7 @@ fi
 # jobs) can run a stanza concurrently with its plain run.
 out=${TEST_OUT:-target/tests}; mkdir -p $out
 llvmbin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
+# r[impl verify.oracle.llvm-tools]
 llvmod="$llvmbin/llvm-objdump$exe"
 # llvm-ar/nm/objcopy behave identically on every platform; the system
 # tools (BSD ar/nm on macOS, none on Windows) don't.
@@ -64,8 +70,24 @@ t_nostd() {
   rustc $BE --edition 2024 -Cpanic=abort ${lc:+-Clink-arg=$lc} tests/nostd/main.rs -o $out/nostd$exe && $out/nostd$exe
 }
 
+# r[verify front.entry]
+# r[verify native.obj.writer]
+# r[verify native.link.rustc]
+# r[verify native.link.wild]
 t_std() { rustc $BE $stockcfg --edition 2024 tests/std/main.rs -o $out/std$exe && $out/std$exe; }
+# r[verify model.unwind]
+# r[verify front.eh.invoke]
+# r[verify front.eh.catch-unwind]
+# r[verify clif.lower.invoke]
+# r[verify native.eh.frames]
+# r[verify native.eh.try-call]
+# r[verify native.eh.lsda]
+# r[verify native.eh.personality]
 t_unwind() { rustc $BE $stockcfg --edition 2024 tests/unwind/main.rs -o $out/unwind$exe && $out/unwind$exe; }
+# r[verify front.intrinsic.llvm]
+# r[verify front.asm.wrapper]
+# r[verify native.asm.inproc]
+# r[verify native.asm.wrapper]
 t_asm() { rustc $BE --edition 2024 tests/asm/main.rs -o $out/asm$exe && $out/asm$exe; }
 
 t_unroll() {
@@ -91,6 +113,7 @@ t_loadpre() {
   rustc $BE --edition 2021 -O -C codegen-units=1 tests/loadpre/main.rs -o $out/loadpre$exe && $out/loadpre$exe
 }
 
+# r[verify clif.vendor.isel]
 t_pairfuse() {
   # Post-alloc pair fusion must not pair a load with a load that uses its
   # result as an address (pointer-chase + closure-env dependent loads).
@@ -218,6 +241,7 @@ t_tailrec() {
   rustc $BE --edition 2021 -O -C codegen-units=1 tests/tailrec/main.rs -o $out/tailrec$exe && $out/tailrec$exe
 }
 
+# r[verify iropt.sroa]
 t_sroa() {
   # sroa pin: a non-copyable call arg with a known pointee extent pins only
   # that byte range into shared `pin_a` memory — the callee's writes and
@@ -306,6 +330,7 @@ t_byvalhome() {
   fi
 }
 
+# r[verify iropt.inline.model]
 t_inlinecm() {
   # inlinecm: the cost model must accept the constant-mode dispatch the fixed
   # thresholds reject (and reject call-dense bodies they'd take); recursive
@@ -316,6 +341,11 @@ t_inlinecm() {
       $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
 }
 
+# r[verify iropt.ipo.datalog]
+# r[verify iropt.ipo.nowrite]
+# r[verify iropt.ipo.nocapture]
+# r[verify iropt.ipo.nounwind]
+# r[verify iropt.ipo.willreturn]
 t_facts() {
   # Bottom-up summaries: the facts PLIRON_FACTS prints for tests/facts must
   # match the expectations in its comments, and the program must still run.
@@ -345,6 +375,8 @@ EOF
   return $bad
 }
 
+# r[verify iropt.order]
+# r[verify iropt.inline.eh]
 t_invokeblk() {
   # Every invoke ends its block after each IR pass (domcheck's mid-invoke
   # check); the program must still run and unwind correctly.
@@ -369,6 +401,7 @@ t_resumehoist() {
   $out/resumehoist$exe 2>/dev/null | diff --strip-trailing-cr - tests/resumehoist/expected.out
 }
 
+# r[verify iropt.inline.recursion]
 t_inlinerec() {
   # A big single-caller helper stays a call from a recursive visitor
   # (PLIRON_INLINE_RECSTACK: every recursion level would carry its frame);
@@ -378,6 +411,7 @@ t_inlinerec() {
   $out/inlinerec$exe | diff --strip-trailing-cr - tests/inlinerec/expected.out
 }
 
+# r[verify par.facts.thin-claim]
 t_xfactsplugin() {
   # Two-phase facts must not hold modules when rustc skips the thin step
   # (-Clinker-plugin-lto, as cargo passes to an lto=true build's deps):
@@ -391,6 +425,8 @@ t_xfactsplugin() {
   $out/xfactsplugin$exe | diff --strip-trailing-cr - tests/xfactsplugin/expected.out
 }
 
+# r[verify iropt.inline.dead]
+# r[verify par.xcgu.deadfree]
 t_deadfree() {
   # PLIRON_DEADFREE frees dead local bodies (xcgu copies inlining used
   # up) during inlining instead of emitting them unoptimized: the program
@@ -404,6 +440,9 @@ t_deadfree() {
   diff <($out/deadfree-stock$exe 2>&1 | sed -E "$tid") <($out/deadfree$exe 2>&1 | sed -E "$tid")
 }
 
+# r[verify par.mem.lowerfree]
+# r[verify par.det.throttle]
+# r[verify verify.stanza.off-side]
 t_lowerfree() {
   # PLIRON_LOWERFREE drops each CGU's pliron Context once phase (A) has
   # lowered it (and compiled jobs' CLIF bodies); PLIRON_JEARENA moves the
@@ -443,12 +482,14 @@ t_lowerfree_wasm() {
   done
 }
 
+# r[verify par.xcgu.closed]
 t_xcgurot() {
   # xcgu copies carry their callees' bodies: `usize::rotate_left` (not the
   # intrinsic) must be copied too, or the link fails (undefined symbol).
   rustc $BE --edition 2021 -Copt-level=1 -C codegen-units=16 tests/xcgurot/main.rs -o $out/xcgurot$exe && $out/xcgurot$exe
 }
 
+# r[verify par.xcgu.eligible]
 t_xcgufnptr() {
   # A non-Rust-ABI callback compared by address keeps one address under
   # xcgu (no internal duplicate in other CGUs).
@@ -510,12 +551,18 @@ t_applestackargs() {
   rustc $BE --edition 2021 tests/applestackargs/main.rs -o $out/applestackargs$exe && $out/applestackargs$exe | diff --strip-trailing-cr - tests/applestackargs/expected.out
 }
 
+# r[verify front.fn.attrs]
+# r[verify native.obj.align]
 t_fnalign() {
   # #[rustc_align(N)] reaches the object: plain fns and dyn shims.
   rustc $BE --edition 2021 tests/fnalign/main.rs -o $out/fnalign$exe && $out/fnalign$exe && \
   rustc $BE --edition 2021 -O tests/fnalign/main.rs -o $out/fnalign$exe && $out/fnalign$exe
 }
 
+# r[verify front.abi.internal]
+# r[verify clif.lower.tailcc]
+# r[verify clif.lower.tailcc.except]
+# r[verify clif.lower.byval]
 t_rusttailcc() {
   # extern "tail" with byval (OnStack) aggregates: StructArgument exists
   # only on SysV x86-64; arm64 and Windows pass them as plain pointers.
@@ -529,6 +576,8 @@ t_asmlabels() {
   rustc $BE --edition 2021 tests/asmlabels/main.rs -o $out/asmlabels$exe
 }
 
+# r[verify front.abi.variadic]
+# r[verify native.win.crtfree]
 t_cvariadic() {
   # C-variadic defs: va_list layout per target; VaList forwarded to libc.
   if [[ -z "$exe" ]]; then
@@ -557,6 +606,7 @@ t_narrowlsr() {
   rustc $BE --edition 2021 -O tests/narrowlsr/main.rs -o $out/narrowlsr$exe && $out/narrowlsr$exe
 }
 
+# r[verify clif.vendor.jt]
 t_narrowext() {
   # aarch64 clean-narrow-int facts (PLIRON_NARROWEXT) and shared br_table
   # edge blocks (PLIRON_EDGEDEDUP): both default-on; also force-on and
@@ -579,6 +629,7 @@ t_cmp3() {
   PLIRON_CMP3=1 rustc $BE --edition 2021 tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]]
 }
 
+# r[verify clif.vendor.noret]
 t_noret() {
   # PLIRON_NORETTRAP (default on): no trap after a call that cannot return
   # (panics, `-> !`, uninhabited returns, `_Unwind_Resume`) when code follows
@@ -614,12 +665,15 @@ t_edgemerge() {
   done
 }
 
+# r[verify native.asm.splice]
+# r[verify native.asm.cfi]
 t_asmcfi() {
   # global_asm with .cfi_*: Mach-O __eh_frame + raw `_name` symbols; aarch64.
   [ "$(uname -m)" = arm64 ] || return 0
   rustc $BE --edition 2021 tests/asmcfi/main.rs -o $out/asmcfi$exe && $out/asmcfi$exe
 }
 
+# r[verify par.facts.two-phase]
 t_xfactsall() {
   # PLIRON_XFACTS_ALL: two-phase cross-CGU facts behind rustc's thin-local
   # LTO barrier. The first-submitted CGU (ordinal-prefix adoption sees
@@ -660,6 +714,15 @@ t_asmextern() {
   rustc $BE --edition 2021 -Copt-level=1 tests/asmextern/main.rs -o $out/asmextern$exe && $out/asmextern$exe
 }
 
+# r[impl verify.dbg.neutral]
+# r[verify model.dbg-neutral]
+# r[verify iropt.dbg]
+# r[verify native.dbg.format]
+# r[verify native.dbg.inline]
+# r[verify native.dbg.vars]
+# r[verify native.dbg.types]
+# r[verify native.dbg.neutral]
+# r[verify verify.dbg.neutral]
 t_debuginfo() {
   # -g: line tables and inlined frames, checked through std's own panic
   # backtrace (it reads the DWARF) at O0 and O2; variables at O0 (lldb);
@@ -732,6 +795,7 @@ t_debuginfo() {
   cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
 }
 
+# r[verify iropt.ipo.ret]
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
   # inferred nonnull-return or returned-arg folds these null/equality checks
@@ -742,6 +806,8 @@ t_retattr() {
   grep -Eq 'retarg .*: [0-9]+ returned-arg bodies, [1-9][0-9]* call results folded' $out/retattr.stats || { echo "retarg folded nothing" >&2; exit 1; }
 }
 
+# r[verify clif.vendor.align]
+# r[verify native.obj.loopalign]
 t_loopalign() {
   # Loop headers are 16-byte aligned (vcode marks back-edge targets in
   # emission order and pads before their labels — LLVM's `.p2align 4` loop
@@ -805,6 +871,8 @@ t_loopvec() {
   fi
 }
 
+# r[verify iropt.inline.hot]
+# r[verify native.pgo.ctor]
 t_pgo() {
   # gen -> run -> use -> verify (docs/pgo.md): an instrumented build dumps
   # a .prof at exit, the pliron-prof CLI reads it, and a PGO_USE build
@@ -881,6 +949,8 @@ t_proc_macro() {
       rustc --edition 2021 tests/proc_macro/main.rs --extern pm=$out/libpm.$so -o $out/pm_user$exe && $out/pm_user$exe
 }
 
+# r[verify native.lto.fat]
+# r[verify native.lto.payload]
 t_lto() {
   # Fat LTO (-Clto): rustc leaves upstream Rust objects off the link line and
   # expects the backend's single LTO module to carry the whole crate graph
@@ -917,6 +987,14 @@ t_lto() {
     [[ "$($d/cmain 2>/dev/null | tail -1)" == "278 266" ]] || { echo "lto: staticlib leg failed" >&2; return 1; }
 }
 
+# r[verify wasm.pipeline]
+# r[verify wasm.obj.module]
+# r[verify wasm.obj.imports]
+# r[verify wasm.obj.link]
+# r[verify wasm.audit.copyfwd]
+# r[verify wasm.ld.args]
+# r[verify wasm.ld.gc]
+# r[verify wasm.ld.layout]
 t_wasm_smoke() {
   # Emit pipeline only: leaf crates -> pliron wasm objects -> pliron-wasm-ld
   # -> node. No -Zbuild-std, so ~seconds; the std-through-pliron legs are
@@ -927,6 +1005,8 @@ t_wasm_smoke() {
   tests/wasm/smoke.sh
 }
 
+# r[verify native.win.stock-std]
+# r[verify native.win.emulated]
 t_sysroot() {
   (cd tests/sysroot && export RUSTFLAGS="$BE" CARGO_TARGET_DIR=../../target/sysroot &&
     T="$(rustc -vV | sed -n 's/host: //p')" &&

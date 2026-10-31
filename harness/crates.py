@@ -1,4 +1,7 @@
 #!/usr/bin/env -S python3 -I
+# r[verify model.equiv]
+# r[verify verify.crates.pliron-only]
+# r[verify verify.crates.modes]
 """Run popular crates' own test suites under stock rustc and pliron; report
 pliron-only failures.
 
@@ -255,6 +258,7 @@ def stock_cached(key, fresh):
     return res, log
 
 
+# r[impl verify.crates.pliron-only]
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier", type=int, default=1)
@@ -262,6 +266,7 @@ def main():
     ap.add_argument("--debug", action="store_true", help="test profile instead of --release")
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--timeout", type=int, default=1800)
+    # r[impl verify.crates.modes]
     ap.add_argument("--deps", choices=("pliron", "stock"), default="stock",
                     help="stock: build dependencies with stock rustc (cached across backend changes) "
                          "and only the workspace members with pliron; no doc-tests through pliron")

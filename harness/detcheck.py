@@ -1,4 +1,14 @@
 #!/usr/bin/env -S python3 -I
+# r[verify model.det]
+# r[verify clif.lower.phases]
+# r[verify wasm.emit.par]
+# r[verify par.pool.throttle]
+# r[verify par.pool.lower-threads]
+# r[verify par.facts.prefix]
+# r[verify par.det.schedule]
+# r[verify par.det.strategy]
+# r[verify par.det.throttle]
+# r[verify par.det.order]
 """Output invariance across execution strategies (docs/determinism.md).
 
   harness/detcheck.py [--inputs regex-syntax,syn,smoke] [--config NAME=ENV ...]

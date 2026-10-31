@@ -1,4 +1,5 @@
 #!/usr/bin/env -S python3 -I
+# r[verify verify.live]
 """Live loop: rerun the CLIF pipeline over the recorded corpora on every save.
 
 Usage: harness/live/live.py [--port 8765] [--no-check] [--corpus smoke,std]
@@ -139,6 +140,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+# r[impl verify.live]
 def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("--port", type=int, default=8765)

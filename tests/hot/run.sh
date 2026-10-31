@@ -2,6 +2,10 @@
 # Hot-patch smoke test: run a PLIRON_HOT base binary, recompile `value()` to read
 # a static, drop the object into PLIRON_HOT_DIR and check the running process
 # picks it up with the static's state intact.
+# r[verify native.link.wild]
+# r[verify native.hot.slot]
+# r[verify native.hot.loader]
+# r[verify native.hot.limits]
 set -euo pipefail
 B="$(cd "$(dirname "$0")/../.." && pwd)"
 export RUSTUP_TOOLCHAIN=nightly-2026-10-22

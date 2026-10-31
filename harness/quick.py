@@ -1,4 +1,6 @@
 #!/usr/bin/env -S python3 -I
+# r[verify verify.quick.licence]
+# r[verify verify.quick.tiers]
 """Fast inner loop: validate a change in seconds to ~3 minutes, chosen from `git diff`.
 
 Usage: harness/quick.py [--tier 0|1] [--base REF] [--jobs N] [--seeds N]
@@ -322,6 +324,8 @@ class Runner:
         return seeds
 
 
+# r[impl verify.quick.tiers]
+# r[impl verify.quick.licence]
 def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("--tier", type=int, default=1, choices=(0, 1))

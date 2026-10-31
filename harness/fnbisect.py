@@ -1,4 +1,5 @@
 #!/usr/bin/env -S python3 -I
+# r[verify verify.bisect.fn]
 """Find which functions' optimization breaks a program (PLIRON_OPT_FNS).
 
 Usage: harness/fnbisect.py [--workdir DIR] [--names FILE] -- CMD...

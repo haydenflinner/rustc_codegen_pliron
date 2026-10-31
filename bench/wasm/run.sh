@@ -4,6 +4,7 @@
 # pliron backend (+ pliron-wasm-ld) — then timed in node by run.mjs.
 #   bench/wasm/run.sh            # all kernels
 #   bench/wasm/run.sh tokenize   # subset by name filter
+# r[verify verify.perf.runtime]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD

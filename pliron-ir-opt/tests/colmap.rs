@@ -1,6 +1,7 @@
 //! `pliron::cols::ColMap` sparse-set layout: stale-key semantics, O(1)
 //! swap-remove with index fix-up, and ordinal-order iteration (callers'
 //! output order depends on it).
+// r[verify iropt.state]
 
 use pliron::cols::{ColKey, ColMap, ColSet};
 

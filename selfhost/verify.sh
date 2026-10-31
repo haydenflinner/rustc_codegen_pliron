@@ -23,6 +23,10 @@
 #   demangling a backtrace). A background watchdog kills rustc processes
 #   from this worktree that idle >WATCHDOG_MIN minutes; the stragglers then
 #   show up as ordinary failures to investigate.
+# r[impl verify.selfhost.stage2]
+# r[verify model.equiv]
+# r[verify verify.selfhost.stage2]
+# r[verify verify.selfhost.watchdog]
 set -uo pipefail
 B="$(cd "$(dirname "$0")/.." && pwd)"
 RUST="${RUST_CHECKOUT:-$B/../rust}"
@@ -55,6 +59,7 @@ kill_stragglers() {
     ' | xargs -I{} kill -9 {} 2>/dev/null
 }
 
+# r[impl verify.selfhost.watchdog]
 watchdog() {
     while :; do sleep 60; kill_stragglers; done
 }

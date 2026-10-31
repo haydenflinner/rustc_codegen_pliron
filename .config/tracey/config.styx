@@ -3,7 +3,9 @@
 // rustc_codegen_pliron specification -- see spec/README.md.
 //
 // The spec is Typst (spec/chapters/*.typ); requirements are `#r("id", ..)[..]`.
-// Code cites them as `// r[impl id]` and tests as `// r[verify id]`.
+// Code cites them as `// r[impl id]` and tests as `// r[verify id]`; the
+// Python and shell harness uses `# r[..]`. test.sh stanzas carry
+// `# r[verify id]` for each requirement whose `checked:` names them.
 // vendor/ is excluded: patches there are cited from the PLIRON_PATCH.md
 // notes, not annotated in place.
 specs (
@@ -24,10 +26,20 @@ specs (
                     tests/**/*.rs
                     pliron-ir-opt/tests/**/*.rs
                     pliron-clif-opt/tests/**/*.rs
+                    harness/*.py
+                    harness/**/*.py
+                    harness/*.sh
+                    test.sh
+                    tests/**/*.sh
+                    selfhost/*.sh
+                    bench/*.sh
+                    bench/**/*.sh
                 )
                 exclude (
                     **/target/**
                     vendor/**
+                    **/__pycache__/**
+                    **/node_modules/**
                 )
                 test_include (
                     tests/**/*.rs

@@ -5,6 +5,7 @@
 //! env gates are bypassed since listing a step is the explicit request).
 //! `Gate::Always` steps are correctness lowerings, not optimizations:
 //! they run even under a custom pipeline, appended in table order.
+// r[verify verify.diffcheck.modes]
 
 use cranelift_codegen::Context;
 use cranelift_codegen::control::ControlPlane;

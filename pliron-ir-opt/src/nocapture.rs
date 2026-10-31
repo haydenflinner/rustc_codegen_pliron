@@ -535,6 +535,7 @@ pub fn run(ctx: &Context, st: &mut State) {
     st.nocapture = nc.into_iter().collect();
 }
 
+// r[verify iropt.ipo.nocapture]
 #[cfg(test)]
 mod tests {
     use super::*;
