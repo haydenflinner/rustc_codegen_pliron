@@ -426,6 +426,10 @@ pub struct State {
     /// on clone args, while operands are ordinary caller values that
     /// outlive the clone and must not claim function-wide `noalias`.
     pub region_frozen_op: ColMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    /// Caller-side operands bound to an inlined callee's `nonnull` params:
+    /// (leaf mask, clone entry = region). Non-null only inside that region
+    /// (`PLIRON_INLINENN`; lowered into `Pipe::region_nn`).
+    pub region_nn_op: ColMap<Value, Vec<(u64, Ptr<BasicBlock>)>>,
     /// Load ops inside inlined clones whose address provably derives from a
     /// `region_frozen` arg at a constant offset inside the pointee: op →
     /// region id (the clone's entry block). At lowering these seed

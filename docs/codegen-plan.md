@@ -322,10 +322,17 @@ Evening (2026-10-31):
   reload sunk (`PLIRON_EDGESINK_LOADS`). blind-sig still 1.566 vs 1.270:
   `phisimp` keeping the clone's `nnargs` params alive blocks IR
   simplification wholesale (100 functions change; der's
-  `Header::decode` 330 -> 850 instructions). The carrier design is wrong.
-  Put the fact on the incoming value, scoped to the clone's region
-  (`st.region_blocks`), and have `fold_null_tests` check the test's
-  block is inside it. Tried and
+  `Header::decode` 330 -> 850 instructions). That carrier design was
+  wrong and is replaced: the fact now sits on the caller's operand with
+  the clone's region (`State::region_nn_op` -> `Pipe::region_nn` ->
+  `jumpthread::RegionNN`, checked against the test's block region, like
+  `operand_frozen`). Functions now shrink (montgomery -69, add2 -32,
+  sub_sign -32) and `INBOUNDSNN` alone is neutral (1.273). But blind-sig
+  under `INLINENN` + `BRIFSEL` + edge-sunk loads is still 1.580 vs 1.276. The
+  hot loop is index-addressed (about 17 instructions per limb vs LLVM's
+  11 with post-increment loads and a down-counter), and 54 functions
+  changed. Profile both builds next; the loop itself needs LSR-style
+  pointer IVs (W2). Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes

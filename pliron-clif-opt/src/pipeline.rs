@@ -157,6 +157,9 @@ impl Stats {
 /// An empty `Pipe::const_tables` for embedders without data access.
 pub static EMPTY_TABLES: std::sync::LazyLock<FxHashMap<u32, std::sync::Arc<[u8]>>> =
     std::sync::LazyLock::new(FxHashMap::default);
+/// An empty `Pipe::region_nn`.
+pub static EMPTY_RNN: std::sync::LazyLock<FxHashMap<Value, Vec<Ptr<BasicBlock>>>> =
+    std::sync::LazyLock::new(FxHashMap::default);
 
 pub struct Pipe<'a> {
     pub clctx: &'a mut Context,
@@ -164,6 +167,9 @@ pub struct Pipe<'a> {
     /// `DataId` index (the `UserExternalName` index of a `symbol_value`):
     /// constant tables passes may read (`bytescan`). Empty when unknown.
     pub const_tables: &'a FxHashMap<u32, std::sync::Arc<[u8]>>,
+    /// Region-scoped non-null facts (see `jumpthread::RegionNN`): CLIF
+    /// value -> the inlined regions inside which it is non-null.
+    pub region_nn: &'a FxHashMap<Value, Vec<Ptr<BasicBlock>>>,
     pub isa: &'a dyn TargetIsa,
     pub fname: &'a str,
     pub func_id: FuncId,
@@ -2066,7 +2072,12 @@ fn s_mergejump(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
     let sh = an.shape_bits(&p.clctx.func);
-    let (n, dead, folds, pmap) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived, sh);
+    let rnn = (!p.region_nn.is_empty()).then(|| jumpthread::RegionNN {
+        facts: p.region_nn,
+        block_region: p.block_region,
+        region_parent: p.region_parent,
+    });
+    let (n, dead, folds, pmap) = jumpthread::run_rnn(&mut p.clctx.func, p.nonnull, p.derived, sh, rnn.as_ref());
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }

@@ -101,6 +101,7 @@ fn main() {
     let mut scoped_na = Default::default();
     let mut p = Pipe {
         const_tables: &pipeline::EMPTY_TABLES,
+        region_nn: &pipeline::EMPTY_RNN,
         fact_bits: &mut fact_bits,
         uen_syms: &uen_syms,
         scoped_na: &mut scoped_na,

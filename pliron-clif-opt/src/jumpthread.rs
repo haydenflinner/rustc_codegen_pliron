@@ -1098,6 +1098,42 @@ fn ne_params(
     cand
 }
 
+/// Region-scoped non-null facts (`PLIRON_INLINENN`): a value is non-null
+/// inside the listed inlined regions (an inlined callee's `nonnull`
+/// param, bound to the caller's value only within the clone). A block's
+/// region comes from `block_region`, nesting from `region_parent`; a
+/// `derived` value inherits its base's facts.
+pub struct RegionNN<'a> {
+    pub facts: &'a FxHashMap<Value, Vec<pliron::context::Ptr<pliron::basic_block::BasicBlock>>>,
+    pub block_region: &'a FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
+    pub region_parent: &'a pliron::cols::ColMap<
+        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    >,
+}
+
+impl RegionNN<'_> {
+    /// `v` is non-null at instructions of block `b`.
+    pub fn holds(&self, func: &Function, derived: &VMap<Value>, v: Value, b: Block) -> bool {
+        let mut v = func.dfg.resolve_aliases(v);
+        for _ in 0..8 {
+            if let Some(rs) = self.facts.get(&v) {
+                let mut r = self.block_region.get(&b).copied();
+                for _ in 0..64 {
+                    let Some(x) = r else { break };
+                    if rs.contains(&x) {
+                        return true;
+                    }
+                    r = self.region_parent.get(x).copied();
+                }
+            }
+            let Some(&base) = derived.get(&v) else { return false };
+            v = func.dfg.resolve_aliases(base);
+        }
+        false
+    }
+}
+
 /// `icmp eq/ne x, 0` with `x` known non-null → constant. Also the
 /// `Option<NonNull>`-niche tests `icmp eq/ne (select c, 0, X), 0` (a
 /// select is null exactly when `c` picks the zero arm) and the block-param
@@ -1107,7 +1143,7 @@ fn ne_params(
 /// The same select shape with a non-zero sentinel (`icmp eq/ne
 /// (select c, X, K), K` with `X` provably `!= K`, e.g. `Option<char>`'s
 /// `-1`) reduces to `!c`.
-fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
+fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) -> usize {
     let none = FxHashMap::default();
     enum Fold {
         Const(i64),
@@ -1241,7 +1277,8 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                     x = a;
                 }
             }
-            if nn.is_m(func, x, &mut nnm) {
+            let ib = func.layout.inst_block(inst);
+            if nn.is_m(func, x, &mut nnm) || rnn.zip(ib).is_some_and(|(r, ib)| r.holds(func, nn.derived, x, ib)) {
                 hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
                 continue;
             }
@@ -1286,7 +1323,11 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                         match known(func, &none, arg) {
                             Some(0) => edges.push((arm, true)),
                             Some(_) => edges.push((arm, false)),
-                            None if nn.is_m(func, arg, &mut nnm) => edges.push((arm, false)),
+                            None if nn.is_m(func, arg, &mut nnm)
+                                || rnn.is_some_and(|r| r.holds(func, nn.derived, arg, pred.block)) =>
+                            {
+                                edges.push((arm, false))
+                            }
                             _ => {
                                 ok = false;
                                 break;
@@ -4717,6 +4758,7 @@ fn fnn<'a>(
     derived: &'a VMap<Value>,
     nn: Option<NonNull<'a>>,
     cd: &mut Cd,
+    rnn: Option<&RegionNN>,
 ) -> usize {
     if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
         return 0;
@@ -4728,7 +4770,7 @@ fn fnn<'a>(
             NonNull::new(func, c, loads, derived)
         }
     };
-    fold_null_tests(func, &nn)
+    fold_null_tests(func, &nn, rnn)
 }
 
 /// Thread until nothing changes (bounded); returns the edges retargeted.
@@ -4737,6 +4779,17 @@ pub fn run(
     loads: &FxHashSet<Value>,
     derived: &mut VMap<Value>,
     sh: u32,
+) -> (usize, usize, usize, FxHashMap<Value, Value>) {
+    run_rnn(func, loads, derived, sh, None)
+}
+
+/// [`run`] with region-scoped non-null facts for the null-test folds.
+pub fn run_rnn(
+    func: &mut Function,
+    loads: &FxHashSet<Value>,
+    derived: &mut VMap<Value>,
+    sh: u32,
+    rnn: Option<&RegionNN>,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
     use crate::pipeline::shape;
     let prof = pliron_cfg::tracing_on()
@@ -4755,7 +4808,7 @@ pub fn run(
     // inlined clone's entry param carries its callee's `nonnull` fact
     // (`PLIRON_INLINENN`), which must not move to the caller's value.
     if pliron_cfg::env_is("PLIRON_INLINENN", "1") {
-        fnn(func, loads, derived, None, &mut cd);
+        fnn(func, loads, derived, None, &mut cd, rnn);
     }
     if sh & shape::JUMP != 0 {
         merge_chains(func, &mut cd);
@@ -5015,7 +5068,7 @@ pub fn run(
         if n == 0 {
             // `fold_null_tests` on the converged function — a fresh
             // `NonNull` matches the proofs a rebuild would produce.
-            fnn_cur = Some(fnn(func, loads, derived, None, &mut cd));
+            fnn_cur = Some(fnn(func, loads, derived, None, &mut cd, rnn));
             break;
         }
         // No refresh needed: the guarded bits can only shrink inside
@@ -5029,7 +5082,7 @@ pub fn run(
     }
     let fnn = match fnn_cur {
         Some(x) => x,
-        None => fnn(func, loads, derived, None, &mut cd),
+        None => fnn(func, loads, derived, None, &mut cd, rnn),
     };
     if prof {
         if pliron_cfg::tracing_on() {
@@ -5106,7 +5159,7 @@ mod tests {
         let nn = NonNull::new(&func, &cfg, &loads, &derived);
         assert!(nn.is(&func, p), "i32 loop param should prove non-null");
 
-        assert_eq!(fold_null_tests(&mut func, &nn), 1);
+        assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
         let di = func.dfg.value_def(null_test).inst().unwrap();
         assert!(matches!(
             func.dfg.insts[di],
@@ -5172,7 +5225,7 @@ mod tests {
         let cfg = ControlFlowGraph::with_function(&func);
         let nn = NonNull::new(&func, &cfg, &loads, &derived);
         // `p == 0` ⟺ the `c`-true edge — the icmp aliases `c`.
-        assert_eq!(fold_null_tests(&mut func, &nn), 1);
+        assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
         assert_eq!(func.dfg.resolve_aliases(null_test), c);
     }
 

@@ -77,6 +77,36 @@ fn operand_frozen_of(
     out
 }
 
+/// `State::region_nn_op` in CLIF values: each recorded operand's masked
+/// leaves -> the regions inside which they are non-null (`Pipe::region_nn`).
+fn region_nn_of(
+    st: &State,
+    vals: &FxHashMap<Value, Vals>,
+    cconst: &FxHashMap<Value, Vals>,
+) -> FxHashMap<ir::Value, Vec<Ptr<BasicBlock>>> {
+    let mut out: FxHashMap<ir::Value, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+    if st.region_nn_op.is_empty() {
+        return out;
+    }
+    let mut hits: Vec<(Value, &Vals)> = Vec::new();
+    for (&pv, vs) in vals.iter().chain(cconst.iter().filter(|(k, _)| !vals.contains_key(*k))) {
+        if st.region_nn_op.get(pv).is_some() {
+            hits.push((pv, vs));
+        }
+    }
+    hits.sort_unstable_by_key(|&(pv, _)| pv.uid());
+    for (pv, vs) in hits {
+        for &(mask, r) in &st.region_nn_op[pv] {
+            for (k, &v) in vs.iter().enumerate().take(64) {
+                if mask & (1 << k) != 0 {
+                    out.entry(v).or_default().push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Recover the scratch tables from a finished `FnLower`, clearing them
 /// for the next function — a macro rather than a `&mut FnLower` method
 /// because `fl.b.finalize`/`fl.lifetimes` leave `fl` partially moved.
@@ -367,8 +397,6 @@ impl CtxSlot<'_> {
 /// `PLIRON_RETNN=1`: rustc's `nonnull` return attributes become facts on
 /// call results (opt-in until measured; see `FuncInfo::ret_nonnull`).
 static RETNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_RETNN", "1"));
-/// `PLIRON_INLINENN=1`: see `inline::nonnull_args`.
-static INLINENN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_INLINENN", "1"));
 
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
@@ -542,6 +570,8 @@ struct FnJob {
     scoped: FxHashMap<ir::Inst, Ptr<BasicBlock>>,
     invariant: FxHashSet<ir::Inst>,
     operand_frozen: FxHashMap<ir::Value, Vec<(u64, Ptr<BasicBlock>)>>,
+    /// See `Pipe::region_nn`.
+    region_nn: FxHashMap<ir::Value, Vec<Ptr<BasicBlock>>>,
     /// Dense gate for `Pipe::carry_one`'s fact probes — re-seeded
     /// from the tables at each `Pipe` construction.
     fact_bits: cranelift_codegen::entity::SecondaryMap<ir::Value, u8>,
@@ -594,6 +624,7 @@ impl FnJob {
         self.scoped = Default::default();
         self.invariant = Default::default();
         self.operand_frozen = Default::default();
+        self.region_nn = Default::default();
         self.fact_bits = Default::default();
         self.block_region = Default::default();
         self.prof = Default::default();
@@ -622,6 +653,7 @@ impl FnJob {
             scoped: FxHashMap::default(),
             invariant: FxHashSet::default(),
             operand_frozen: FxHashMap::default(),
+            region_nn: FxHashMap::default(),
             fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
             block_region: FxHashMap::default(),
             prof: FxHashMap::default(),
@@ -920,6 +952,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 |nm: &'static str| -> Box<dyn Send + '_> { sh.prof.activity(nm, None) };
             let mut pipe = crate::pipeline::Pipe {
                 const_tables: &sh.const_tables,
+                region_nn: &j.region_nn,
                 cur_step: "",
                 clctx,
                 isa: &*sh.isa,
@@ -1568,6 +1601,7 @@ pub fn lower_module<'a>(
                 cranelift_codegen::ir::Value,
                 Vec<(u64, Ptr<BasicBlock>)>,
             >;
+            let region_nn: FxHashMap<cranelift_codegen::ir::Value, Vec<Ptr<BasicBlock>>>;
             let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
             let prof: FxHashMap<ir::Block, u64>;
             let lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>;
@@ -1710,6 +1744,7 @@ pub fn lower_module<'a>(
                 // CLIF values (`State::region_frozen_op`): `*v` is immutable
                 // while the binding clone runs — loadfwd's scoped immunity.
                 operand_frozen = operand_frozen_of(fl.st, &fl.vals, &fl.cconst);
+                region_nn = region_nn_of(fl.st, &fl.vals, &fl.cconst);
                 stubs = std::mem::take(&mut fl.stubs);
                 prof = block_region
                     .iter()
@@ -1752,6 +1787,7 @@ pub fn lower_module<'a>(
                     scoped,
                     invariant,
                     operand_frozen,
+                    region_nn,
                     fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
                     block_region,
                     prof,
@@ -2741,6 +2777,7 @@ pub fn lower_clif_wasm(
                 scoped,
                 invariant,
                 operand_frozen,
+                region_nn: FxHashMap::default(),
                 fact_bits: cranelift_codegen::entity::SecondaryMap::new(),
                 block_region,
                 prof,
@@ -3310,10 +3347,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .into_iter()
                     .map(|(_, t)| self.b.append_block_param(cb, t))
                     .collect();
-                // An inlined call's result or clone entry param
-                // (`inline_call`, opt-in `PLIRON_RETNN` / `PLIRON_INLINENN`):
-                // the callee's `nonnull` leaves.
-                if (*RETNN || *INLINENN)
+                // An inlined call's result (`inline_call`, opt-in
+                // `PLIRON_RETNN`): the callee's `nonnull` return leaves.
+                if *RETNN
                     && let Some(&mask) = self.st.nnargs.get(a)
                 {
                     for (k, &p) in vs.iter().enumerate().take(64) {

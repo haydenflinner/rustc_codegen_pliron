@@ -339,6 +339,7 @@ fn with_pipe<R>(
     let uen_syms = Default::default();
     let mut p = Pipe {
         const_tables: &pipeline::EMPTY_TABLES,
+        region_nn: &pipeline::EMPTY_RNN,
         fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa,

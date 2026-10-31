@@ -2692,14 +2692,21 @@ fn frozen_of(
 /// `readonly can_move` load flags would be wrong here: the freeze holds
 /// only inside the clone, and a function-wide flag would escape the region.
 /// The callee's `nonnull` params (`FuncInfo::nonnull`) hold for the
-/// clone's entry-block params: they exist only inside the inlined region,
-/// which the call dominates, so the fact can't leak to the caller's other
-/// uses of the same args (unlike marking the args themselves). LLVM gets
-/// this by simplifying callees with their own param attributes before
-/// inlining them (num-bigint-dig's `add_mul_vvw` zip loses its per-limb
-/// null test that way). `cleanup` and `phisimp` keep such params (pinned).
-/// Opt-in: `PLIRON_INLINENN=1`.
-fn nonnull_args(ctx: &Context, st: &mut State, callee: &str, src: &[Ptr<BasicBlock>], map: &IrMapping) {
+/// caller's operands bound to them, but only inside the clone (the call
+/// dominates it; elsewhere the same value may be null). Recorded per
+/// operand with the clone entry as its region (`State::region_nn_op`),
+/// like `frozen_args`' `region_frozen_op`, so it survives the clone's
+/// entry params being merged away. LLVM gets this by simplifying callees
+/// with their own param attributes before inlining them (num-bigint-dig's
+/// `add_mul_vvw` zip). Opt-in: `PLIRON_INLINENN=1`.
+fn nonnull_args(
+    ctx: &Context,
+    st: &mut State,
+    callee: &str,
+    src: &[Ptr<BasicBlock>],
+    map: &IrMapping,
+    call_args: &[Value],
+) {
     if !pliron_cfg::env_is("PLIRON_INLINENN", "1") {
         return;
     }
@@ -2709,22 +2716,23 @@ fn nonnull_args(ctx: &Context, st: &mut State, callee: &str, src: &[Ptr<BasicBlo
     let Some(f) = st.funcs.get(callee) else {
         return;
     };
+    let eargs: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
     // The leaf indices describe the declared ABI; a rewritten signature
     // (`deadarg`, `sret2reg`) would shift them.
-    let nleaves: usize = entry
-        .deref(ctx)
-        .arguments(ctx)
-        .map(|a| crate::types::leaves(ctx, a.get_type(ctx)).len())
-        .sum();
-    if f.nonnull.is_empty() || nleaves != f.nparams {
+    let nleaves: usize = eargs.iter().map(|a| crate::types::leaves(ctx, a.get_type(ctx)).len()).sum();
+    if f.nonnull.is_empty() || nleaves != f.nparams || eargs.len() != call_args.len() {
         return;
     }
-    let marks: Vec<(Value, usize)> = f.nonnull.iter().filter_map(|&i| crate::state::leaf_arg(ctx, entry, i)).collect();
-    for (a, off) in marks {
+    let mut marks: Vec<(Value, u64)> = Vec::new();
+    for &i in &f.nonnull {
+        let Some((a, off)) = crate::state::leaf_arg(ctx, entry, i) else { continue };
+        let Some(k) = eargs.iter().position(|&e| e == a) else { continue };
         if off < 64 {
-            let m = st.nnargs.get(a).copied().unwrap_or(0);
-            st.nnargs.insert(a, m | 1 << off);
+            marks.push((call_args[k], 1 << off));
         }
+    }
+    for (v, m) in marks {
+        st.region_nn_op.or_default(v).push((m, entry));
     }
 }
 
@@ -3415,7 +3423,7 @@ fn inline_call(
     let br = BrOp::new(ctx, entry, args.clone()).get_operation();
     br.insert_before(ctx, call);
     frozen_args(ctx, st, cs, caller, src, &map, &args, block);
-    nonnull_args(ctx, st, cs, src, &map);
+    nonnull_args(ctx, st, cs, src, &map, &args);
     st.calls.remove(call);
     Operation::erase(call, ctx);
     // An invoke ends its block (`call; br`): ops after it run only on the
