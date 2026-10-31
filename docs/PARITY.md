@@ -277,9 +277,12 @@ in the scoreboard and in the linked history files.
 
 Ranked by expected card gain per effort. Each item links its evidence.
 
-1. **Profile the held-out programs** (`bench/heldout/run.py`, 1.57x):
-   start with blake3-scalar (3.1x) and blind-sig (2.1x), whose hot loops
-   are small. Gains there are real gains, not tuning to our own kernels.
+1. **Runtime parity on held-out programs** (`bench/heldout/run.py`,
+   1.31x after 2026-10-31's fixes): the phased plan, with the LLVM and GCC
+   frameworks we lack (SCEV/LFTR, value ranges, regalloc
+   rematerialization, block placement, isel idiom mining), is
+   [`codegen-plan.md`](codegen-plan.md). Phase 0 is a per-function gap
+   census.
 2. **Validate and flip the pending size flags.** `PLIRON_COPYPAIR=1`,
    `PLIRON_TBNZ_IREDUCE=1`, `PLIRON_SROA_MAXSLICES=18`
    (`history/2026-10-29-ir-excess.md` §5) and `PLIRON_LIBCALL_DIRECT=1`,
