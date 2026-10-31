@@ -2988,6 +2988,14 @@ fn s_edgespec(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_invparam(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::invparam::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("invparam");
+    }
+    k
+}
+
 fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgesink::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -4282,6 +4290,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_constdedup,
         )
         .needs(shape::ICONST),
+        // Loop-invariant header params onto a preheader (no back-edge
+        // param webs for regalloc2 to spill around; serde_json's escape scan).
+        step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one
         // `brif` edge's args (parse_only's `ParseIntError` pack on every
         // digit-validity branch) run unconditionally there — sink them
