@@ -281,6 +281,29 @@ What the census (`bench/heldout/census.py`, W0) showed, and what was done:
 - Two old miscompiles surfaced in a new fuzz window (seeds 16782,
   16787); they predate this work.
 
+Evening (2026-10-31):
+
+- **Second-level `Option` niche folds** (`fold_null_tests` through
+  `select (a != 0), a, 0` and single-edge params, on by default): removes
+  the per-element null test in slice zip/enumerate loops. Held-out
+  neutral (1.232 vs 1.231). It exposed a latent jump-threading miscompile
+  (a back edge threaded past a merge block kept that block's stale
+  params; indexmap `erase_indices`), fixed in `jumpthread::round`
+  (docs/history/2026-10-31-jt-backedge-stale.md).
+- **blind-sig's `montgomery` still tests `q == 0` per limb.** The
+  remaining compare in the inner `mac_digit` loop is the zip's niche test
+  on the *second* slice's pointer, rewritten as `p == 0 - D` (with
+  `q = p + D`). Its start pointer is a SmallVec data pointer, which
+  nothing marks non-null. LLVM gets this from `inbounds` GEP non-nullness:
+  `PLIRON_INBOUNDSNN` again (W1). The next step is to find why it cost
+  tokenize 8% and turn it on.
+- **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
+  byte-set scans over constant tables (pulldown's `escape_html_scalar`
+  -2.2% on dense input; 3.5x on a sparse repro), with table bytes from
+  rustc's evaluation of imported statics (`State::extern_bytes`) and a new
+  aarch64 `shrn` movemask (Cranelift patch 89). Next: top-tested index
+  loops, and runtime tables (pulldown's `LookupTable`, shufti-style).
+
 ## Sequencing (revised 2026-10-31, after the census)
 
 The census reordered the plan: register allocation (W4) and the fact
