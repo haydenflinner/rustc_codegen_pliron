@@ -853,7 +853,17 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             IntSLT => ICmpPredicateAttr::SLT,
             IntSLE => ICmpPredicateAttr::SLE,
         };
-        self.mk(|c| ICmpOp::new(c, p, a, b))
+        let r = self.mk(|c| ICmpOp::new(c, p, a, b));
+        // `x != null` for a later `assume` (rustc's `assume_nonnull`, e.g.
+        // building a `NonNull`): see `ne_null` and `assume`.
+        if matches!(op, IntNE) {
+            let zero = |v: Value| self.cx.const_to_opt_uint(v) == Some(0);
+            let x = if zero(b) { Some(a) } else if zero(a) { Some(b) } else { None };
+            if let (Some(x), Some(cop)) = (x, r.defining_op()) {
+                self.st.borrow_mut().ne_null.insert(cop, x);
+            }
+        }
+        r
     }
     fn fcmp(&mut self, op: RealPredicate, a: Value, b: Value) -> Value {
         use RealPredicate::*;

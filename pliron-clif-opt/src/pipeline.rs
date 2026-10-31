@@ -2040,6 +2040,22 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     total
 }
 
+fn s_mergejump(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Static block regions (no per-inst map): only merge within one; live
+    // regions recompute from the instructions, which is conservative.
+    let k = if p.inst_region.is_empty() {
+        let br = &p.block_region;
+        crate::mergejump::run(&mut p.clctx.func, &|b, c| br.get(&b) == br.get(&c))
+    } else {
+        crate::mergejump::run(&mut p.clctx.func, &|_, _| true)
+    };
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("mergejump");
+    }
+    k
+}
+
 fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
     let sh = an.shape_bits(&p.clctx.func);
     let (n, dead, folds, pmap) = jumpthread::run(&mut p.clctx.func, p.nonnull, p.derived, sh);
@@ -3663,6 +3679,9 @@ const JT: Gate = Gate::Flag(FlagId::Jumpthread);
 // r[impl clif.step.order]
 pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(|| {
     vec![
+        // Straight-line `jump` pairs merge first, so jumpthread sees a
+        // param block and the `brif` it feeds as one (see `mergejump`).
+        step("mergejump", "mergejump", Gate::OptIn("PLIRON_MERGEJUMP"), s_mergejump).needs(shape::MULTI),
         Step {
             name: "jumpthread",
             bisect: Some("jumpthread"),

@@ -9,6 +9,7 @@ pub mod armmerge;
 pub mod bcheck;
 pub mod bunroll;
 pub mod latchspec;
+pub mod mergejump;
 pub mod bittab;
 pub mod brchain;
 pub mod celim;

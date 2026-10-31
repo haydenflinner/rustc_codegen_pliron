@@ -508,6 +508,30 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     }
     // r[impl front.intrinsic.hints]
     fn assume(&mut self, val: Value) {
+        // `assume(x != null)` right after `x` is computed (rustc's
+        // `assume_nonnull` when it builds a `NonNull` or a reference from a
+        // raw pointer): `x` is non-null. Only when `x`'s op, the compare and
+        // this call are adjacent, so every use of `x` is reached through the
+        // assumption. Opt-in (`PLIRON_ASSUMENN=1`): sound, but no measured
+        // win yet (the zip niche tests it was aimed at need a fact from
+        // elsewhere; see docs/codegen-plan.md, facts service).
+        if crate::env_is("PLIRON_ASSUMENN", "1")
+            && let Some(cop) = val.defining_op()
+        {
+            let x = self.st.borrow().ne_null.get(cop).copied();
+            if let Some(x) = x
+                && let Some(xop) = x.defining_op()
+            {
+                let adjacent = {
+                    let ctx = self.cx.pctx.borrow();
+                    cop.get_prev(&ctx) == Some(xop) && cop.get_next(&ctx).is_none()
+                };
+                if adjacent {
+                    self.st.borrow_mut().nonnull.insert(xop);
+                }
+
+            }
+        }
         // `assume(false)` marks the rest of the block unreachable (e.g. the
         // `unreachable_unchecked` UB-check path); `unreach` then drops the
         // branch into it.

@@ -379,8 +379,12 @@ pub struct State {
     pub llvm_stubs: SymSet,
     /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
     pub volatile: ColSet<Ptr<Operation>>,
-    /// Loads whose (pointer) result rustc marked `!nonnull`.
+    /// Loads whose (pointer) result rustc marked `!nonnull`, and ops whose
+    /// result an adjacent `assume(x != null)` covers (`ne_null`).
     pub nonnull: ColSet<Ptr<Operation>>,
+    /// `icmp ne x, null` ops the builder made, with `x`: an `assume` of one
+    /// marks `x` non-null when nothing separates the three.
+    pub ne_null: ColMap<Ptr<Operation>, Value>,
     /// Entry params of local functions that point at frozen memory, with
     /// their dereferenceable size (see `FuncInfo::frozen`).
     pub frozen: ColMap<Value, u64>,

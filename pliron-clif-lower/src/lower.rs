@@ -4891,6 +4891,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn set1(&mut self, op: Ptr<Operation>, v: ir::Value) {
+        // Non-null facts on any single-result op (loads mark their own;
+        // `assume(x != null)` marks `x`'s op, see `State::ne_null`).
+        if self.st.nonnull.contains(op) {
+            self.nonnull.insert(v);
+        }
         self.set(op, smallvec![v]);
     }
 
