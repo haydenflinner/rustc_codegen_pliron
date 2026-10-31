@@ -336,8 +336,13 @@ Evening (2026-10-31):
   40% more samples: the base addresses through a pointer IV (`ldr [x10]`,
   `add x10, x10, #8`), while the folded version recomputes both
   addresses from the index each trip (`add x14, x15, x10, lsl #3` after
-  a `mov` from `i + 1`). LSR-style pointer IVs (W2) come first, before
-  INLINENN can be on. Tried and
+  a `mov` from `i + 1`). First LSR-style piece, opt-in `ivptr`: rewrite
+  `p' = B + s*i` (with `i' = i + 1`, entry `p0 = B + s*(i0-1)`) to
+  `p + s`. With INLINENN + BRIFSEL + IVPTR + edge-sunk loads the hot
+  loop is LLVM's shape (13 instructions, post-increment loads and
+  stores). blind-sig is at 1.329, from 1.58 (base 1.273): montgomery
+  +44 samples, mac_digit +11. Left: a `ldr x, [p], #0` writeback the
+  post-increment pass pairs with the store's +8, and the outer loop. Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes

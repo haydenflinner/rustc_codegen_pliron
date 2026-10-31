@@ -3687,6 +3687,14 @@ fn s_ivretro(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::ivptr::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("ivptr");
+    }
+    k
+}
+
 fn s_brifsel(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = crate::brifsel::run(&mut p.clctx.func);
     if k > 0 {
@@ -4138,6 +4146,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // folded away) can rotate now: top test + `jump` back becomes one
         // bottom `brif`.
         step("looprot2", "looprot", Gate::OptIn("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
+        // `p' = B + s*i` with `i' = i + 1` and a matching entry: `p + s`
+        // (late: the loop must be rotated and its addresses simplified).
+        step("ivptr", "ivptr", Gate::OptIn("PLIRON_IVPTR"), s_ivptr).needs(shape::LOOPS),
         cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
         step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
         // Fold constants any earlier pass left behind — late value folds
