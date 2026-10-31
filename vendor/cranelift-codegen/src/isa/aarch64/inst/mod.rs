@@ -1249,6 +1249,10 @@ impl MachInst for Inst {
                 Some(Inst::LoadExtNameNear { rd: dst, name: name.clone(), offset: *offset })
             }
             Inst::LoadExtNameGot { name, .. } => Some(Inst::LoadExtNameGot { rd: dst, name: name.clone() }),
+            // A bitmask immediate: `orr rd, xzr, #imm`.
+            Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size, rn, imml, .. } if *rn == zero_reg() => {
+                Some(Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size: *size, rd: dst, rn: *rn, imml: *imml })
+            }
             _ => None,
         }
     }

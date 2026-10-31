@@ -227,6 +227,9 @@ impl Context {
         // only uses sit in, buying it a loop-spanning live range (and
         // regalloc2 boundary moves on every region crossing).
         self.remat_sink(isa.triple().architecture == target_lexicon::Architecture::X86_64);
+        if matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)) {
+            self.const_sink();
+        }
 
         // PLIRON: reorder pure insts so a shared operand's last use lands
         // on a destructive two-address op; elaboration's DFS arg order can
@@ -762,6 +765,169 @@ impl Context {
     /// aarch64 it is `adrp` + `add` per loop iteration (pulldown-cmark's
     /// per-byte escape scan; LLVM hoists). `PLIRON_REMATSINK=1` sinks on
     /// every target, `=0` nowhere.
+    /// PLIRON: sink one-instruction constants into the loops that use them
+    /// when the loop contains a call (`PLIRON_CONSTSINK=1`, aarch64).
+    ///
+    /// pliron's licm hoists every constant out of every loop, and the
+    /// egraph places them at the loop-invariant point too. Across a loop
+    /// with a call, each one then needs a callee-saved register or a spill
+    /// slot for the whole loop: regex's `Utf8Sequences::next` defined ~40
+    /// masks and bounds in its entry block and spilled most of them (472
+    /// bytes of spill slots). A `movz`/`movn`/`orr` at the use is cheaper.
+    /// Loops without calls keep hoisted constants (SipHash's magics).
+    fn const_sink(&mut self) {
+        use crate::ir::{InstructionData, Opcode, Value};
+        use crate::{FxHashMap, FxHashSet};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK").as_deref() == Ok("1")) {
+            return;
+        }
+        // One aarch64 instruction: `movz`/`movn` (one non-zero halfword in
+        // `v` or `!v`) or `orr` with a bitmask immediate.
+        fn one_inst(v: u64, bits: u32) -> bool {
+            let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let halves = |x: u64| (0..4).filter(|k| (x >> (16 * k)) & 0xffff != 0).count() <= 1;
+            halves(v & m)
+                || halves(!v & m)
+                || crate::isa::aarch64::inst::ImmLogic::maybe_from_u64(
+                    v & m,
+                    if bits > 32 { crate::ir::types::I64 } else { crate::ir::types::I32 },
+                )
+                .is_some()
+        }
+        let mut cands: Vec<crate::ir::Inst> = Vec::new();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                if let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = self.func.dfg.insts[i] {
+                    let ty = self.func.dfg.ctrl_typevar(i);
+                    if ty.is_int() && ty.bits() <= 64 && one_inst(imm.bits() as u64, ty.bits()) {
+                        cands.push(i);
+                    }
+                }
+            }
+        }
+        if cands.is_empty() {
+            return;
+        }
+        self.compute_cfg();
+        self.compute_loop_analysis();
+        // Loops that contain a call (in any nested block).
+        let mut calls: FxHashSet<crate::loop_analysis::Loop> = FxHashSet::default();
+        for b in self.func.layout.blocks() {
+            if !self.func.layout.block_insts(b).any(|i| self.func.dfg.insts[i].opcode().is_call()) {
+                continue;
+            }
+            let mut lp = self.loop_analysis.innermost_loop(b);
+            while let Some(l) = lp {
+                calls.insert(l);
+                lp = self.loop_analysis.loop_parent(l);
+            }
+        }
+        if calls.is_empty() {
+            return;
+        }
+        let cset: FxHashSet<crate::ir::Inst> = cands.iter().copied().collect();
+        // Where a constant used in `b` should live: walk out from `b`'s
+        // innermost loop to the first loop holding the def; if a calling
+        // loop lies between, the copy goes just inside the outermost such
+        // calling loop -- in `b` itself, or in the preheader of the
+        // call-free loop that `b` sits in within it (a hot inner scan keeps
+        // its constant hoisted).
+        let target = |this: &Self, db: crate::ir::Block, b: crate::ir::Block| -> Option<crate::ir::Block> {
+            let mut chain = Vec::new();
+            let mut lp = this.loop_analysis.innermost_loop(b);
+            while let Some(l) = lp {
+                if this.loop_analysis.is_in_loop(db, l) {
+                    break;
+                }
+                chain.push(l);
+                lp = this.loop_analysis.loop_parent(l);
+            }
+            let j = chain.iter().rposition(|l| calls.contains(l))?;
+            if j == 0 {
+                return Some(b);
+            }
+            // Preheader of chain[j - 1]: its header's single outside pred,
+            // ending in a plain jump.
+            let inner = chain[j - 1];
+            let h = this.loop_analysis.loop_header(inner);
+            let mut outside = this
+                .cfg
+                .pred_iter(h)
+                .filter(|p| !this.loop_analysis.is_in_loop(p.block, inner));
+            let p = outside.next()?;
+            if outside.next().is_some()
+                || !matches!(this.func.dfg.insts[p.inst], InstructionData::Jump { .. })
+            {
+                return None;
+            }
+            Some(p.block)
+        };
+        // (const inst, target block) -> the use blocks it serves.
+        let mut sink: FxHashMap<(crate::ir::Inst, crate::ir::Block), Vec<crate::ir::Block>> =
+            FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            if self.loop_analysis.innermost_loop(b).is_none() {
+                continue;
+            }
+            for i in self.func.layout.block_insts(b) {
+                for v in self.func.dfg.inst_values(i) {
+                    let v = self.func.dfg.resolve_aliases(v);
+                    let Some(d) = self.func.dfg.value_def(v).inst() else {
+                        continue;
+                    };
+                    if !cset.contains(&d) {
+                        continue;
+                    }
+                    let Some(db) = self.func.layout.inst_block(d) else {
+                        continue;
+                    };
+                    if db == b {
+                        continue;
+                    }
+                    let Some(t) = target(self, db, b) else {
+                        continue;
+                    };
+                    let e = sink.entry((d, t)).or_default();
+                    if !e.contains(&b) {
+                        e.push(b);
+                    }
+                }
+            }
+        }
+        let mut n = 0;
+        for ((d, t), bs) in sink {
+            let old = self.func.dfg.first_result(d);
+            let data = self.func.dfg.insts[d];
+            let ni = self.func.dfg.make_inst(data);
+            let ctv = self.func.dfg.ctrl_typevar(d);
+            self.func.dfg.make_inst_results(ni, ctv);
+            // At the top: `t` may itself be one of the use blocks.
+            match self.func.layout.first_inst(t) {
+                Some(first) => self.func.layout.insert_inst(ni, first),
+                None => self.func.layout.append_inst(ni, t),
+            }
+            let nv = self.func.dfg.first_result(ni);
+            for b in bs {
+                for i in self.func.layout.block_insts(b).collect::<Vec<_>>() {
+                    if i == ni {
+                        continue;
+                    }
+                    let f = &mut self.func.dfg;
+                    let raw: Vec<Value> =
+                        f.inst_values(i).filter(|&v| f.resolve_aliases(v) == old).collect();
+                    if !raw.is_empty() {
+                        f.map_inst_values(i, |v| if raw.contains(&v) { nv } else { v });
+                    }
+                }
+            }
+            n += 1;
+        }
+        // Originals left without uses are dropped by later DCE-free
+        // lowering anyway (an unused pure def emits nothing).
+        let _ = n;
+    }
+
     fn remat_sink(&mut self, x64: bool) {
         use crate::ir::{Inst, InstructionData, Opcode, Value};
         use crate::{FxHashMap, FxHashSet};

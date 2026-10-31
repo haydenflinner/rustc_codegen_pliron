@@ -356,6 +356,29 @@ impl<'a, F: Function> Env<'a, F> {
                 // `RA2_LINEAR` at build time restores upstream; `RA2_SQRT4` restores the
                 // original uncapped tweak.
                 let prio = self.ctx.bundles[bundle].prio;
+                // PLIRON: a rematerializable bundle (every range's vreg is
+                // a constant or address) costs one instruction per reload:
+                // no long-range favor, and half weight (LLVM's
+                // `weightCalcHelper`). Hoisted constants otherwise held
+                // callee-saved registers across regex's whole
+                // `Utf8Sequences::next` and evicted its real values.
+                let remat = self.ctx.bundles[bundle].ranges.iter().all(|e| {
+                    let v = self.ctx.ranges[e.index].vreg;
+                    v.is_valid() && self.func.is_remat(v.index())
+                });
+                if remat {
+                    let final_weight =
+                        core::cmp::min(BUNDLE_MAX_NORMAL_SPILL_WEIGHT, (total.to_f32() as u32) / prio / 2);
+                    trace!(" -> rematerializable; final weight {}", final_weight);
+                    self.ctx.bundles[bundle].set_cached_spill_weight_and_props(
+                        final_weight,
+                        minimal,
+                        fixed,
+                        fixed_def,
+                        stack,
+                    );
+                    return;
+                }
                 let div = if option_env!("RA2_LINEAR").is_some() {
                     prio
                 } else if option_env!("RA2_SQRT4").is_some() {

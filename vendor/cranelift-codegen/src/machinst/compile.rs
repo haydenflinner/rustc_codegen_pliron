@@ -30,7 +30,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         crate::machinst::Lower::new(f, abi, emit_info, block_order, sigs, b.flags().clone())?;
 
     // Lower the IR.
-    let vcode = {
+    let mut vcode = {
         log::debug!(
             "Number of CLIF instructions to lower: {}",
             f.dfg.num_insts()
@@ -84,6 +84,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             RegallocAlgorithm::SinglePass => Algorithm::Fastalloc,
         };
 
+        vcode.compute_remat_vregs();
         regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
             .map_err(|err| {
                 log::error!(

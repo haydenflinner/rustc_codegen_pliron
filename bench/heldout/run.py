@@ -58,7 +58,7 @@ def build(name, binary, side, env):
     """Build one side; returns the binary path or None (with the log saved)."""
     src = os.path.join(OUT, "src", name)
     tdir = os.path.join(OUT, side, name)
-    if side == "pliron":
+    if side.startswith("pliron"):
         # Cargo's fingerprint ignores the backend dylib: start clean.
         shutil.rmtree(tdir, ignore_errors=True)
     cmd = ["cargo", "build", "--release", "--target-dir", tdir,
@@ -96,6 +96,9 @@ def main():
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--backend", default=os.path.join(ROOT, "target", "debug", DYLIB))
     ap.add_argument("--json", default=os.path.join(OUT, "results.json"))
+    ap.add_argument("--variant", action="append", default=[],
+                    help="NAME:K=V,K=V -- another pliron build with extra backend env, "
+                         "measured interleaved with the others (ratio vs LLVM each)")
     a = ap.parse_args()
     benches = [b for b in BENCHES if not a.only or b[0] in a.only.split(",")]
     os.makedirs(os.path.join(OUT, "src"), exist_ok=True)
@@ -104,6 +107,10 @@ def main():
     base.pop("RUSTFLAGS", None)
     envs = {"llvm": base,
             "pliron": dict(base, RUSTFLAGS=f"-Zcodegen-backend={a.backend}")}
+    for v in a.variant:
+        vname, _, kvs = v.partition(":")
+        envs[f"pliron-{vname}"] = dict(envs["pliron"], **dict(kv.split("=", 1) for kv in kvs.split(",") if kv))
+    allsides = list(envs)
     exes = {}
     for name, binary, update in benches:
         dst = os.path.join(OUT, "src", name)
@@ -113,7 +120,7 @@ def main():
                             ignore=shutil.ignore_patterns("target", "*.wasm"))
             for c in update:
                 sh(["cargo", "update", "-q", "-p", c], cwd=os.path.join(dst, CRATE), env=base)
-        for side in ("llvm", "pliron"):
+        for side in allsides:
             if a.skip_build:
                 exe = os.path.join(OUT, side, name, "release", binary)
                 exes[(name, side)] = exe if os.path.exists(exe) else None
@@ -123,10 +130,10 @@ def main():
 
     res = {}
     for name, _, _ in benches:
-        sides = [s for s in ("llvm", "pliron") if exes.get((name, s))]
-        if len(sides) < 2:
+        sides = [s for s in allsides if exes.get((name, s))]
+        if len(sides) < len(allsides):
             res[name] = {"status": "build failed: " + ",".join(
-                s for s in ("llvm", "pliron") if not exes.get((name, s)))}
+                s for s in allsides if not exes.get((name, s)))}
             continue
         t = {s: [] for s in sides}
         bad = None
@@ -144,17 +151,23 @@ def main():
             print(f"  {name}: {bad}")
             continue
         med = {s: statistics.median(t[s]) for s in sides}
+        for s in sides[2:]:
+            res.setdefault("variants", {}).setdefault(s, {})[name] = med[s] / med["llvm"]
         res[name] = {"status": "ok", "llvm_ms": med["llvm"] / 1e6, "pliron_ms": med["pliron"] / 1e6,
                      "ratio": med["pliron"] / med["llvm"],
                      "llvm_runs_ms": [x / 1e6 for x in t["llvm"]],
                      "pliron_runs_ms": [x / 1e6 for x in t["pliron"]]}
         print(f"  {name:20} llvm {med['llvm']/1e6:9.2f} ms  pliron {med['pliron']/1e6:9.2f} ms"
-              f"  {med['pliron']/med['llvm']:.3f}", flush=True)
+              f"  {med['pliron']/med['llvm']:.3f}"
+              + "".join(f"  {s[7:]} {med[s]/med['llvm']:.3f}" for s in sides[2:]), flush=True)
 
     rs = [v["ratio"] for v in res.values() if v.get("status") == "ok"]
     gm = math.exp(sum(map(math.log, rs)) / len(rs)) if rs else None
     print(f"geomean pliron/llvm over {len(rs)} of {len(benches)}: "
           + (f"{gm:.3f}" if gm else "n/a"))
+    for s, by in res.get("variants", {}).items():
+        vs = list(by.values())
+        print(f"geomean {s}/llvm over {len(vs)}: {math.exp(sum(map(math.log, vs)) / len(vs)):.3f}")
     with open(a.json, "w") as f:
         json.dump({"rounds": a.rounds, "geomean": gm, "benches": res}, f, indent=1)
 

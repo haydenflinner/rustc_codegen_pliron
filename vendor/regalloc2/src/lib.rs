@@ -1315,6 +1315,14 @@ pub trait Function {
         &[]
     }
 
+    /// PLIRON: whether `vreg`'s value can be recomputed at any reload for
+    /// the price of one instruction (a constant or symbol address); its
+    /// bundles get a lower spill weight, as LLVM's rematerializable
+    /// intervals do.
+    fn is_remat(&self, _vreg: usize) -> bool {
+        false
+    }
+
     // --------------
     // Spills/reloads
     // --------------

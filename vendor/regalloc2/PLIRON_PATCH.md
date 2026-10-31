@@ -44,3 +44,11 @@ resolver already knows `to_vreg` for each resolved move; it is now kept
 in `Output::edit_vregs` alongside `edits` (empty from the fast
 allocator). Cranelift uses it to rematerialize constant and address
 reloads (cranelift-codegen PLIRON_PATCH 76).
+
+## `Function::is_remat` (opt-in through Cranelift's `PLIRON_RA2_REMATW=1`)
+
+`src/lib.rs` (trait hook, default `false`), `src/ion/process.rs`
+`recompute_bundle_properties`: a bundle whose every range's vreg is
+rematerializable takes `total / prio / 2` as its spill weight (capped
+like the others) instead of the long-range sqrt normalization, as LLVM
+halves the weight of rematerializable intervals.

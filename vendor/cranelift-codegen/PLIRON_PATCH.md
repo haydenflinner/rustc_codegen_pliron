@@ -983,3 +983,40 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     table address was reloaded from the stack every byte; with 75 the loop
     has no stack traffic (42 -> 32 in the function). Test for 75 and 76:
     `pliron-clif-opt/tests/ra_callarg_remat.rs` (fails with either off).
+
+77. Dead spill stores of rematerialized values (`src/machinst/vcode.rs`
+    `dead_slots`; `PLIRON_REMAT_STORE=0` keeps them), plus `orr rd, xzr,
+    #imm` (bitmask immediates) in aarch64 `rematerialize`. With 76 a
+    constant's reloads re-execute its definition, but its spill store at
+    the definition stayed. A slot whose every read is a rematerialized
+    reload (no plain reload, no instruction operand in it; checked per
+    slot because regalloc2 shares a slot across a spillset's vregs) gets
+    no stores. Off when debug value labels exist (they may name the slot).
+    regex's `Utf8Sequences::next`: 136 -> 111 spill stores; held-out
+    geomean 1.280 -> 1.264 (5 rounds, interleaved). Test:
+    `pliron-clif-opt/tests/ra_callarg_remat.rs` `no_stores_into_remat_only_slots`.
+
+78. Opt-in constant sinking into calling loops (`src/context.rs`
+    `const_sink`, aarch64, `PLIRON_CONSTSINK=1`): a one-instruction
+    constant used in a loop that contains a call, but defined outside
+    it, gets a copy just inside the outermost such loop (the use block,
+    or the preheader of the call-free loop the use sits in). pliron's
+    licm hoists every constant out of every loop; across a call each
+    then needs a callee-saved register or a spill slot. Held-out A/B
+    (5 rounds): 1.274 vs 1.264 without; stays off.
+
+79. Opt-in rematerialization-aware spill weights (`PLIRON_RA2_REMATW=1`;
+    `VCode::compute_remat_vregs`, vendored regalloc2 `Function::is_remat`):
+    a bundle whose vregs are all single-def rematerializable values gets
+    upstream's linear weight, halved (LLVM `weightCalcHelper`), instead
+    of pliron's long-range sqrt favor. Held-out A/B: 1.271 vs 1.264
+    without (and 1.283 combined with 78 and `PLIRON_CSTDEDUP=0`); stays off.
+
+80. 64-bit integer vector shifts on aarch64 (`src/isa/aarch64/lower.isle`):
+    upstream's `ishl`/`ushr`/`sshr` vector rules match only 128-bit types,
+    so `ushr.i32x2` (zmij's `vshr_n_u32`) failed with "should be
+    implemented in ISLE". The same rules now also match `ty_vec64_int`
+    (I8X8, I16X4, I32X2) on the `.8b/.4h/.2s` arrangements; the emitter
+    already set the Q bit from the size. Priorities -10..-12: ISLE cannot
+    prove the two extern type extractors disjoint. Test: simdshift's
+    `neon` (`ushr.2s`), `narrow` and `varshift` (`dup` + `ushl`/`sshl`).

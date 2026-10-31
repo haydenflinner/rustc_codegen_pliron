@@ -105,6 +105,12 @@ pub struct VCode<I: VCodeInst> {
     /// VReg IR-level types.
     vreg_types: Vec<Type>,
 
+    /// PLIRON: vregs defined by a single rematerializable instruction
+    /// (`MachInst::rematerialize`), by vreg index; regalloc2 weights their
+    /// bundles down (`RegallocFunction::is_remat`). Filled by
+    /// `compute_remat_vregs` (opt-in, `PLIRON_RA2_REMATW=1`).
+    remat_vregs: Vec<bool>,
+
     /// Lowered machine instructions in order corresponding to the original IR.
     insts: Vec<I>,
 
@@ -626,6 +632,36 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 const NO_INST_OFFSET: CodeOffset = u32::MAX;
 
 impl<I: VCodeInst> VCode<I> {
+    /// PLIRON: fill `remat_vregs` (see the field) before regalloc.
+    pub fn compute_remat_vregs(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_REMATW").as_deref() == Ok("1"))
+            || std::env::var("PLIRON_REMAT").as_deref() == Ok("0")
+        {
+            return;
+        }
+        let probe = Writable::from_reg(Reg::from(regalloc2::PReg::new(0, regalloc2::RegClass::Int)));
+        let mut defs = vec![0u8; self.vreg_types.len()];
+        let mut remat = vec![false; self.vreg_types.len()];
+        for (i, inst) in self.insts.iter().enumerate() {
+            let ops = &self.operands[self.operand_ranges.get(i)];
+            let r = inst.rematerialize(probe).is_some();
+            for op in ops {
+                if op.kind() == regalloc2::OperandKind::Def {
+                    let v = op.vreg().vreg();
+                    if v < defs.len() {
+                        defs[v] = defs[v].saturating_add(1);
+                        remat[v] = r && ops.len() == 1;
+                    }
+                }
+            }
+        }
+        for (v, r) in remat.iter_mut().enumerate() {
+            *r &= defs[v] == 1;
+        }
+        self.remat_vregs = remat;
+    }
+
     /// New empty VCode.
     fn new(
         sigs: SigSet,
@@ -639,6 +675,7 @@ impl<I: VCodeInst> VCode<I> {
         VCode {
             sigs,
             vreg_types: vec![],
+            remat_vregs: vec![],
             insts: Vec::with_capacity(10 * n_blocks),
             user_stack_maps: FxHashMap::default(),
             debug_tags: FxHashMap::default(),
@@ -911,6 +948,50 @@ impl<I: VCodeInst> VCode<I> {
             } else {
                 None
             };
+        // PLIRON: spill slots whose every read is a rematerialized reload:
+        // stores into them are dead (`PLIRON_REMAT_STORE=0` keeps them).
+        // A slot can be shared by several vregs (a spillset), so the test
+        // is per slot: any plain reload or instruction operand in the slot
+        // keeps all its stores. Debug value labels may name spill slots.
+        static REMAT_STORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dead_slots: crate::FxHashSet<usize> = match &remat_def {
+            Some(m)
+                if self.debug_value_labels.is_empty()
+                    && *REMAT_STORE
+                        .get_or_init(|| std::env::var("PLIRON_REMAT_STORE").as_deref() != Ok("0")) =>
+            {
+                let mut written = crate::FxHashSet::default();
+                let mut read = crate::FxHashSet::default();
+                let probe = Writable::from_reg(Reg::from(regalloc2::PReg::new(0, regalloc2::RegClass::Int)));
+                for (ei, (_, Edit::Move { from, to })) in regalloc.edits.iter().enumerate() {
+                    if let Some(sl) = to.as_stack() {
+                        written.insert(sl.index());
+                    }
+                    if let Some(sl) = from.as_stack() {
+                        let remat = to.is_reg()
+                            && regalloc
+                                .edit_vregs
+                                .get(ei)
+                                .copied()
+                                .flatten()
+                                .and_then(|v| m.get(&v.vreg()))
+                                .is_some_and(|&di| self.insts[di].rematerialize(probe).is_some());
+                        if !remat {
+                            read.insert(sl.index());
+                        }
+                    }
+                }
+                for i in 0..self.insts.len() {
+                    for a in regalloc.inst_allocs(InsnIndex::new(i)) {
+                        if let Some(sl) = a.as_stack() {
+                            read.insert(sl.index());
+                        }
+                    }
+                }
+                written.difference(&read).copied().collect()
+            }
+            _ => Default::default(),
+        };
         let mut squashed = vec![false; self.insts.len()];
         let mut applied = vec![false; self.insts.len()];
 
@@ -1821,9 +1902,11 @@ impl<I: VCodeInst> VCode<I> {
                             (Some(from), None) => {
                                 // Spill from register to spillslot.
                                 let to = to.as_stack().unwrap();
-                                let from_rreg = RealReg::from(from);
-                                let spill = self.abi.gen_spill(to, from_rreg);
-                                do_emit(&spill, &mut disasm, &mut buffer, &mut state);
+                                if !dead_slots.contains(&to.index()) {
+                                    let from_rreg = RealReg::from(from);
+                                    let spill = self.abi.gen_spill(to, from_rreg);
+                                    do_emit(&spill, &mut disasm, &mut buffer, &mut state);
+                                }
                             }
                             (None, Some(to)) => {
                                 // Load from spillslot to register.
@@ -2559,6 +2642,10 @@ impl<I: VCodeInst> core::ops::Index<InsnIndex> for VCode<I> {
 impl<I: VCodeInst> RegallocFunction for VCode<I> {
     fn num_insts(&self) -> usize {
         self.insts.len()
+    }
+
+    fn is_remat(&self, vreg: usize) -> bool {
+        self.remat_vregs.get(vreg).copied().unwrap_or(false)
     }
 
     fn num_blocks(&self) -> usize {
