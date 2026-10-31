@@ -88,6 +88,7 @@ pub(crate) struct CrateCfg {
 }
 
 impl CrateCfg {
+    // r[impl iropt.inline.small]
     pub fn new(tcx: TyCtxt<'_>) -> Self {
         let sess = tcx.sess;
         let wasm = sess.target.arch == rustc_target::spec::Arch::Wasm32;
@@ -281,6 +282,7 @@ struct Store {
 /// waits are always satisfiable: no deadlock. Off while holding for the
 /// two-phase barrier. Scheduling only (docs/determinism.md R3).
 /// Default 8 via `pliron_cfg::DEFAULT_VALUES`; `=0` disables.
+// r[impl par.pool.throttle]
 fn acap() -> u32 {
     static C: LazyLock<u32> = LazyLock::new(|| {
         pliron_cfg::env_get("PLIRON_CGU_ACAP").and_then(|v| v.parse().ok()).unwrap_or(0)
@@ -321,6 +323,7 @@ thread_local! {
 /// that must keep a deterministic *order of operations* across CGUs —
 /// opt-bisect's global counter, or a parallel-frontend pre-compile that
 /// scrambles submission order — takes the serial path instead.
+// r[impl par.pool.serial]
 pub(crate) fn enabled(tcx: TyCtxt<'_>) -> bool {
     pass_enabled("PLIRON_CGUPAR")
         && pliron_cfg::bisect_limit().is_none()
@@ -329,6 +332,7 @@ pub(crate) fn enabled(tcx: TyCtxt<'_>) -> bool {
 
 /// Called once at the top of `codegen_crate`: captures the crate-level
 /// cfg, clears the facts table and any leftovers from a previous compile.
+// r[impl par.det.fresh]
 pub(crate) fn begin(tcx: TyCtxt<'_>) {
     let cfg = Arc::new(CrateCfg::new(tcx));
     CRATE_CFG.with(|c| *c.borrow_mut() = Some(cfg));
@@ -345,6 +349,7 @@ pub(crate) fn begin(tcx: TyCtxt<'_>) {
 /// held modules reached `codegen` unfinished — cargo passes it to the
 /// dependencies of an `lto = true` build (prql, nushell: every rlib got
 /// an empty object).
+// r[impl par.facts.two-phase]
 pub(crate) fn two_phase(tcx: TyCtxt<'_>) -> bool {
     pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1")
         && enabled(tcx)
@@ -352,6 +357,7 @@ pub(crate) fn two_phase(tcx: TyCtxt<'_>) -> bool {
         && !tcx.sess.opts.cg.linker_plugin_lto.enabled()
 }
 
+// r[impl par.pool.throttle]
 fn inflight_cap() -> u32 {
     pliron_cfg::env_get("PLIRON_CGU_INFLIGHT").and_then(|v| v.parse().ok()).unwrap_or(0)
 }
@@ -363,6 +369,7 @@ pub(crate) fn holding() -> bool {
 
 /// Hand a finished-define CGU to the pool; returns the `done` key the
 /// owning module waits on in `optimize`.
+// r[impl par.pool.ordinal]
 pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operation>) -> u32 {
     let cfg = CRATE_CFG
         .with(|c| c.borrow().clone())
@@ -440,6 +447,7 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
 /// wait loop and — through `lower`'s `CGU_STEAL` slot — the phase-(B)
 /// drain, so a thread parked on either queue can lend its core to the
 /// other.
+// r[impl par.pool.xneed]
 fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
     pliron_cfg::jearena::bind_thread();
     let mut g = STORE.lock().unwrap();
@@ -577,6 +585,7 @@ pub(crate) fn finish_held(key: u32, all: bool, prof: &SelfProfilerRef, emitter: 
     run_until(key, prof, emitter)
 }
 
+// r[impl par.pool.live]
 pub(crate) fn run_until(key: u32, prof: &SelfProfilerRef, emitter: &SharedEmitter) -> Finished {
     // The phase-(B) drain inside `finish_b` parks on its own result
     // channel when the fn pool is momentarily empty — install this
@@ -623,6 +632,7 @@ fn covered(published: &rustc_hash::FxHashSet<u32>, needs: &[u32]) -> bool {
 }
 
 /// Release parked stage-B jobs whose `needs` are now fully published.
+// r[impl par.pool.release]
 fn release_parked(g: &mut Store) {
     let ready: Vec<u32> = g
         .parked
@@ -640,6 +650,7 @@ fn emit_err(emitter: &SharedEmitter, msg: String) {
     DiagCtxt::new(Box::new(emitter.clone())).handle().err(msg);
 }
 
+// r[impl par.pool.stages]
 fn run_job(mut job: Job, prof: &SelfProfilerRef) -> RunOut {
     let host = WorkerHost {
         prof: Arc::new(RustcProf(prof.clone())),
@@ -897,6 +908,7 @@ fn print_ir(ctx: &Context, module: Ptr<Operation>) -> String {
 
 /// Everything before IR-opt proper: the `--emit llvm-asm`/`PLIRON_DUMP`
 /// print, the O0 always-inline round, PGO instrument/load.
+// r[impl iropt.o0]
 pub(crate) fn finish_pre(
     ctx: &mut Context,
     st: &mut State,
@@ -971,6 +983,7 @@ pub(crate) fn finish_pre(
 
 /// IR-opt through the xfacts point. `facts` picks the merge mode; a
 /// `Publish` job then parks until its ordinal prefix has published.
+// r[impl iropt.order]
 pub(crate) fn iropt_head(
     ctx: &mut Context,
     st: &mut State,
@@ -1305,6 +1318,7 @@ pub(crate) fn iropt_head(
 /// The post-facts tail: adopt (when `adopt_ord`), dead-call elim +
 /// readonly dedup + loop-call hoist, the xor idiom fold, and the
 /// lowering-side flag scan + dead-fn sweep.
+// r[impl iropt.order.steps]
 pub(crate) fn iropt_tail(
     ctx: &mut Context,
     st: &mut State,

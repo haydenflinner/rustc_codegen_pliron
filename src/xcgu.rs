@@ -13,6 +13,7 @@ use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use rustc_span::Spanned;
 
+// r[impl par.xcgu.eligible]
 fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool {
     // Items and shims (drop glue, closure-once, reify/fnptr, ...) all have
     // MIR bodies LLVM can inline across CGUs; other kinds (virtual,
@@ -121,6 +122,7 @@ fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
 }
 
 /// Instances from other CGUs to define here as internal copies.
+// r[impl par.xcgu.copy]
 pub fn copies<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
     let mut out = if crate::pass_enabled("PLIRON_XCGU_FIXPOINT") {
         copies_fixpoint(tcx, cgu)
@@ -312,6 +314,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     out
 }
 
+// r[impl par.xcgu.closed]
 fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instance<'tcx>> {
     let limit = size_limit(tcx);
     // Frontier rounds of mono-item use-chains to descend. The emitted set

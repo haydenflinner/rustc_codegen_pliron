@@ -326,6 +326,8 @@ pub struct CallInfo {
 }
 
 #[derive(Default)]
+// r[impl front.ir.sidetables]
+// r[impl iropt.state]
 pub struct State {
     pub consts: ColMap<Value, ConstVal>,
     pub funcs: SymMap<FuncInfo>,
@@ -847,6 +849,7 @@ static GLOBAL_FACTS: std::sync::LazyLock<std::sync::Mutex<GlobalFacts>> =
 /// per-crate ordinals never collide with a previous crate's leftovers
 /// (a rustc process normally compiles one crate; this keeps embedded
 /// drivers correct too).
+// r[impl par.det.fresh]
 pub fn reset_facts() {
     *GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner()) = GlobalFacts::default();
 }
@@ -866,6 +869,7 @@ impl State {
 
     /// Publish this CGU's emitted bodies to [`GLOBAL_FACTS`] under
     /// participant ordinal `ord`.
+    // r[impl par.facts.publish]
     pub fn facts_publish(&mut self, ctx: &Context, ord: u32) {
         let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
         let mut g = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -901,6 +905,7 @@ impl State {
     /// covers exactly participant ordinals `< ord` — under the parallel
     /// scheduler the caller parks until that prefix is complete, giving
     /// the same adopt set serial codegen produces.
+    // r[impl par.facts.prefix]
     pub fn facts_adopt(&mut self, ctx: &Context, ord: u32) {
         self.facts_adopt_from(ctx, ord, false)
     }
@@ -913,6 +918,7 @@ impl State {
         self.facts_adopt_from(ctx, ord, true)
     }
 
+    // r[impl par.facts.agree]
     fn facts_adopt_from(&mut self, ctx: &Context, ord: u32, all: bool) {
         let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
         let mut g = CguFacts::default();
@@ -1028,6 +1034,7 @@ mod tests {
     /// adopting the reg-return copy's fact lets `callgvn` erase a call
     /// that stores through the sret argument — observed as a stage2
     /// `Sender::release` SIGSEGV. Facts must not cross a type boundary.
+    // r[verify par.facts.agree]
     #[test]
     fn xfacts_ignore_type_divergent_copies() {
         reset_facts();

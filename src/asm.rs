@@ -83,6 +83,7 @@ impl<'tcx> CodegenCx<'tcx> {
         }
     }
 
+    // r[impl front.asm.syntax]
     pub fn push_global_asm(
         &self,
         template: &[InlineAsmTemplatePiece],
@@ -131,6 +132,7 @@ impl<'tcx> CodegenCx<'tcx> {
     /// `link_name = "llvm.*"` intrinsics used by `core::arch`/`std_detect`.
     /// A few are implemented in assembly; the rest become weak stubs that
     /// trap if they're ever executed, so crates still build.
+    // r[impl front.intrinsic.stub]
     pub fn llvm_intrinsic_stub(&self, name: &str) -> String {
         let mut st = self.st.borrow_mut();
         let san: String = name
@@ -785,6 +787,7 @@ impl Gen<'_, '_> {
         }
     }
 
+    // r[impl native.asm.wrapper]
     fn wrapper(&self, name: &str) -> String {
         let fmt = self.tcx.sess.target.options.binary_format;
         let macho = fmt == rustc_target::spec::BinaryFormat::MachO;
@@ -895,6 +898,8 @@ impl Gen<'_, '_> {
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
+    // r[impl front.asm.wrapper]
+    // r[impl front.asm.limits]
     pub fn inline_asm(
         &mut self,
         template: &[InlineAsmTemplatePiece],

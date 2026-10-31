@@ -90,6 +90,7 @@ block6:
 }
 
 #[test]
+// r[verify clif.vendor.noret]
 fn noreturn_trap_dropped_when_code_follows() {
     let o = compile(&three_sites("user250"));
     let n = o.count(TrapCode::NORETURN_CALL);

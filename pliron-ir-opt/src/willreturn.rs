@@ -71,6 +71,7 @@ ascent::ascent! {
     diverge(f) <-- call(f, c, _), diverge(c);
 }
 
+// r[impl iropt.ipo.willreturn]
 pub fn run(ctx: &Context, st: &mut State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();

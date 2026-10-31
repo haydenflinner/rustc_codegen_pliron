@@ -57,6 +57,7 @@ fn check_runs(code: &Code, n: usize, k: impl Fn(usize) -> i64) {
 }
 
 #[test]
+// r[verify clif.vendor.jt]
 fn width_steps_from_1_to_2_bytes_exactly_at_255_units() {
     narrow_on();
     let n = 6;

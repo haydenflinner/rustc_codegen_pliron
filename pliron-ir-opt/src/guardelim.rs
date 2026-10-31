@@ -898,6 +898,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, fop: Ptr<Operation>) -> bool {
     !folds.is_empty()
 }
 
+// r[impl iropt.guardelim]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let mut n = 0usize;
     for s in bodied(ctx, st) {

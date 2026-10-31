@@ -237,6 +237,7 @@ impl Obj<'_> {
     }
 }
 
+// r[impl wasm.ld.got]
 struct Mapper<'m> {
     funcs: &'m [u32],
     globals: &'m [u32],
@@ -305,6 +306,7 @@ fn val_type(t: wp::ValType) -> we::ValType {
 
 /// Links with wasm-ld style `args` (without argv[0]). Also called in-process by rustc.wasm,
 /// which cannot spawn a linker.
+// r[impl wasm.ld.args]
 pub fn link(args: Vec<String>) -> Result<(), String> {
     STACK_SIZE.store(1 << 20, std::sync::atomic::Ordering::Relaxed);
     let mut out = None;
@@ -367,6 +369,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         objs.push(parse(n.clone(), b).map_err(|e| format!("{n}: {e}"))?);
     }
 
+    // r[impl wasm.ld.resolve]
     // Resolve: pull archive members until no undefined symbol can be satisfied.
     let mut provider: HashMap<&str, usize> = HashMap::new();
     for (oi, o) in objs.iter().enumerate() {
@@ -446,6 +449,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // its `global.get`/`global.set` of GOT.mem/GOT.func imports; a live
     // data object's relocation targets. Everything unmarked is dropped
     // from the function/code/data/table sections.
+    // r[impl wasm.ld.gc]
     let mut live_f: HashSet<(usize, u32)> = HashSet::new();
     let mut live_d: HashSet<(usize, usize)> = HashSet::new();
     // Function imports touched by a live body's reachable code; only
@@ -599,6 +603,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // numbering so their slots are never emitted; `alias_f` records the
     // (oi, func-index) -> (oi, func-index) redirects. PLIRON_LDEDUP=0
     // disables.
+    // r[impl wasm.ld.dedup]
     let mut alias_f: HashMap<(usize, u32), (usize, u32)> = HashMap::new();
     if std::env::var_os("PLIRON_LDEDUP").is_none_or(|v| v != "0") {
         let mut by_name: HashMap<&str, Vec<(usize, u32)>> = HashMap::new();
@@ -698,6 +703,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     // Does the output still need this import? `env` imports that resolve
     // to a definition (or `__wasm_call_ctors`) are linked, not imported.
+    // r[impl wasm.ld.imports]
     let imp_used = |oi: usize, i: usize| -> bool {
         let (m, n, _) = &objs[oi].fimports[i];
         (used_imp.contains(&(oi, i as u32)))
@@ -844,6 +850,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         fmaps.insert(oi, m);
     }
 
+    // r[impl wasm.ld.layout]
     // Data layout: live objects only.
     let mut addr: HashMap<(usize, usize), u32> = HashMap::new();
     let mut cur = 1024 + stack();
@@ -885,6 +892,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     };
     // `__pliron_eh`: flag (+0) and exception pointer (+4) for the backend's
     // emulated unwinding; zero-initialized, so no segment is emitted.
+    // r[impl wasm.eh.word]
     let eh = cur.next_multiple_of(8);
     cur = eh + 8;
     let data_end = cur;
@@ -1015,6 +1023,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         segs.push((prof_tab, b));
     }
 
+    // r[impl wasm.ld.ctors]
     // Constructors: every pointer in an `.init_array` entry, in link order.
     let mut ctors: Vec<u32> = Vec::new();
     for &oi in &included {
@@ -1044,6 +1053,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
 
     // Like LLVM's FixFunctionBitcasts: a no-arg `main` gets a C `main(argc, argv)`
     // wrapper, which is the entry point wasm-bindgen and other hosts look for.
+    // r[impl wasm.ld.main]
     let main_void = match defs.get("main").copied() {
         Some(d @ Def::Func(oi, f)) => func_out(d).filter(|_| {
             let t = &types[tmaps[&oi][objs[oi]
@@ -1272,6 +1282,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         );
     }
     module.section(&ds);
+    // r[impl wasm.ld.sections]
     let mut customs: Vec<(&str, Vec<u8>)> = Vec::new();
     for &oi in &included {
         for (n, d) in &objs[oi].customs {

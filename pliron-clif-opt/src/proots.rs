@@ -37,6 +37,7 @@ pub fn facts(func: &Function) -> Facts {
 
 /// `facts` over a caller-built CFG — passes that already compute one
 /// (`dse`, `celim`) shouldn't pay for a second `with_function`.
+// r[impl clif.phiweb]
 pub fn facts_cfg(func: &Function, cfg: &ControlFlowGraph) -> Facts {
     let Some(entry) = func.layout.entry_block() else {
         return Facts {

@@ -15,6 +15,7 @@ pub fn body_name(n: &str) -> String {
     format!("{n}.hot")
 }
 
+// r[impl native.hot.slot]
 pub fn thunk_asm(n: &str, l: Linkage) -> String {
     let bind = match l {
         Linkage::Preemptible => format!(".weak {n}\n"),

@@ -28,7 +28,9 @@ fn equivalent_rewrite_passes() {
     assert_eq!(s.compared, 32);
 }
 
+// r[verify verify.diffcheck.observe]
 #[test]
+// r[verify clif.diffcheck.observe]
 fn wrong_constant_is_caught() {
     let a = parse(
         "function %f(i32) -> i32 { block0(v0: i32): v9 = iconst.i32 2 v1 = iadd v0, v9 return v1 }",
@@ -76,7 +78,9 @@ fn load_forwarded_across_clobbering_call_is_caught() {
     assert!(check(&a, &b, &Facts::default(), &cfg()).is_err());
 }
 
+// r[verify verify.diffcheck.inconclusive]
 #[test]
+// r[verify clif.diffcheck.sound]
 fn trapping_original_is_not_a_mismatch() {
     let a = parse("function %f(i32) -> i32 { block0(v0: i32): trap user1 }");
     let b = parse("function %f(i32) -> i32 { block0(v0: i32): v1 = iconst.i32 0 return v1 }");
@@ -169,6 +173,7 @@ fn self_recursion_runs_for_real() {
 }
 
 #[test]
+// r[verify clif.vendor.interp]
 fn vector_built_from_i128_matches_stack_roundtrip() {
     // vecslot's rewrite: spill bytes to a slot and reload as i64x2, versus
     // building the vector with iconcat + bitcast. Equal.
@@ -275,6 +280,7 @@ fn nonnull_load_fact_is_honored() {
     check(&a, &b, &facts, &cfg).unwrap();
 }
 
+// r[verify verify.diffcheck.inconclusive]
 #[test]
 fn uninit_slot_bytes_may_reshuffle() {
     // slotmerge folds an output slot onto a live one: bytes the original

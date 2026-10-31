@@ -1,3 +1,4 @@
+// r[verify native.dbg.neutral]
 //! `-g` (src/debuginfo.rs, pliron-clif-lower/src/dwarf.rs): std's own
 //! panic backtrace — which reads our DWARF — must show the inlined
 //! chain leaf → mid → top with each frame's source line. The `// L:`

@@ -230,6 +230,7 @@ type Region = pliron::context::Ptr<pliron::basic_block::BasicBlock>;
 /// hoist (`licm-load`): one licm run moves many loads, and a bad one
 /// needs to be told apart from the rest.
 #[allow(clippy::too_many_arguments)]
+// r[impl clif.bisect]
 fn hoists(
     func: &Function,
     ps: &VMap<Value>,

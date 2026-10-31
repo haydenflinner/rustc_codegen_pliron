@@ -30,6 +30,7 @@ pub struct PassConfig {
 /// same way (booleans on unless `=0`; EDGEMERGE/EPIMERGE mode `1` when
 /// unset). Validation: docs/history/2026-10-27-defaults.md,
 /// 2026-10-28-overnight.md.
+// r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).
@@ -115,6 +116,7 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     ("PLIRON_WASM_TINY", "6"),
 ];
 
+// r[impl par.cfg.once]
 pub fn config() -> &'static PassConfig {
     static CONFIG: LazyLock<PassConfig> = LazyLock::new(PassConfig::parse);
     &CONFIG
@@ -300,6 +302,7 @@ pub fn record_keys_top() -> Vec<(String, u64)> {
 }
 
 /// `PLIRON_<PASS>=0` disables a pass at runtime (default on).
+// r[impl par.cfg.accessors]
 pub fn pass_enabled(var: &str) -> bool {
     config().enabled(var)
 }
@@ -435,9 +438,11 @@ pub fn bisect(name: &str) -> bool {
     bisect_in(name, "")
 }
 
+// r[impl verify.bisect.unit]
 /// [`bisect`] for a unit inside function `func`, which the debug log names
 /// (`bisect <n> <pass> run|skip <func>`) so `harness/bisect.py` can say
 /// which function the first bad unit touched.
+// r[impl par.cfg.bisect]
 pub fn bisect_in(name: &str, func: &str) -> bool {
     let Some(limit) = bisect_limit() else {
         return true;
@@ -463,6 +468,7 @@ pub fn bisect_in(name: &str, func: &str) -> bool {
 /// The `PLIRON_OPT_BISECT` budget, parsed once. When `Some`, pass
 /// applications must run in a deterministic order — the counter numbers
 /// each `bisect` call, which is what makes bisection reproducible.
+// r[impl par.det.numbering]
 pub fn bisect_limit() -> Option<u64> {
     static LIMIT: LazyLock<Option<u64>> =
         LazyLock::new(|| env_get("PLIRON_OPT_BISECT").and_then(|v| v.parse().ok()));
@@ -536,6 +542,7 @@ fn parse_fn_sel(spec: &str) -> Option<(bool, FnSel)> {
     Some((neg, sel))
 }
 
+// r[impl verify.bisect.fn]
 /// `PLIRON_OPT_FNS=<sel>`: optimize only the selected functions — the
 /// rest keep their unoptimized body through the per-function pliron-IR
 /// transforms and skip the CLIF pipeline. Interprocedural rewrites
@@ -547,6 +554,7 @@ fn parse_fn_sel(spec: &str) -> Option<(bool, FnSel)> {
 /// `PLIRON_OPT_FNS_LOG=<path>` appends `<hash>\t<name>` for every
 /// selected function — `harness/fnbisect.py` reads it to name the
 /// culprits once the range is narrow.
+// r[impl par.cfg.opt-fns]
 pub fn fn_opt_selected(name: &str) -> bool {
     static SEL: LazyLock<Option<(bool, FnSel)>> = LazyLock::new(|| {
         let spec = env_get("PLIRON_OPT_FNS")?;
@@ -605,6 +613,7 @@ mod fn_sel_tests {
         assert_ne!(fn_hash("main"), fn_hash("mains"));
     }
 
+    // r[verify par.cfg.opt-fns]
     #[test]
     fn selectors_parse() {
         assert!(matches!(parse_fn_sel("0..0x100000000"), Some((false, FnSel::Range(0, 0x1_0000_0000)))));

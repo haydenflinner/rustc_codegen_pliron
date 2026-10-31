@@ -293,8 +293,10 @@ static CLIF_STEPS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_CLIF_STEPS", "1"));
 
 #[derive(Clone, Copy)]
+// r[impl clif.step.gate]
 pub enum Gate {
     /// Correctness lowering, not a knob — always runs.
+    // r[impl clif.step.always]
     Always,
     /// `PLIRON_<V>` unset or `!= "0"`.
     Env(&'static str),
@@ -594,6 +596,7 @@ fn edge_fp(func: &Function) -> u64 {
 /// also assert the fingerprint — a read after an un-`invalidate`d
 /// structural mutation panics instead of silently serving stale data.
 #[derive(Default)]
+// r[impl clif.analysis]
 pub struct Analysis {
     ver: u64,
     /// `edge_fp` of the function state `cfg` describes; `Some` iff
@@ -838,6 +841,7 @@ impl Analysis {
     /// like a local `Uses::new`: it does not track later mutation —
     /// refetch (or `refresh_uses`) at the points a local map would be
     /// rebuilt.
+    // r[impl clif.analysis.uses]
     pub fn uses(&self, func: &Function) -> std::rc::Rc<crate::uses::Uses> {
         let mut slot = self.uses.borrow_mut();
         let shape = func.dfg.num_insts();
@@ -971,6 +975,7 @@ impl Analysis {
     }
 }
 
+// r[impl clif.step]
 pub struct Step {
     /// `PLIRON_PIPELINE` name (unique per entry).
     pub name: &'static str,
@@ -1283,6 +1288,7 @@ fn corpus_dump(p: &mut Pipe) {
 /// miss even when every recorded env read happens to match. `quiet`
 /// suppresses the unknown-name diagnostic for that read-only
 /// evaluation.
+// r[impl clif.step.pipeline]
 pub(crate) fn selected(p: &Pipe, quiet: bool) -> Vec<&'static Step> {
     if let Some(list) = &config().pipeline {
         let mut out = Vec::new();
@@ -1322,6 +1328,7 @@ fn flags_key(f: &FnFlags) -> u64 {
         | (f.slp as u64) << 14
 }
 
+// r[impl clif.step.select]
 fn gate_sel(p: &Pipe) -> Vec<&'static Step> {
     thread_local! {
         /// Env gates are process-fixed, so a flags key decides the same
@@ -1530,6 +1537,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
 
 /// `PLIRON_DIFFCHECK=1`: check the whole pipeline once per function, and
 /// only on a mismatch replay it step by step to name the guilty step.
+// r[impl verify.diffcheck.modes]
 fn run_whole_checked(p: &mut Pipe) {
     let initial = p.clctx.func.clone();
     let derived0 = p.derived.clone();
@@ -1674,6 +1682,8 @@ fn giant_steps_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+// r[impl clif.step.giant]
+// r[impl clif.step.shape]
 fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Duration) {
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
@@ -1840,6 +1850,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             // per-inst resolves multiply by the depth. Every alias write
             // bumps `alias_epoch`, so no bump since the last compaction
             // means nothing can be deeper than a hop.
+            // r[impl clif.alias]
             if p.clctx.func.dfg.alias_epoch() != an.compact_epoch {
                 p.clctx.func.dfg.compact_aliases();
                 an.compact_epoch = p.clctx.func.dfg.alias_epoch();
@@ -3610,6 +3621,7 @@ fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 const JT: Gate = Gate::Flag(FlagId::Jumpthread);
 
+// r[impl clif.step.order]
 pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(|| {
     vec![
         Step {

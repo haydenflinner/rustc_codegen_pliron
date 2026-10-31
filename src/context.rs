@@ -58,6 +58,8 @@ pub struct CodegenCx<'tcx> {
     pub cgu_name: String,
 }
 
+// r[impl front.ir.symbols]
+// r[impl native.obj.linkage]
 pub fn map_linkage(l: RLinkage, vis: Visibility) -> Linkage {
     match l {
         RLinkage::Internal => Linkage::Local,
@@ -102,6 +104,7 @@ impl<'tcx> CodegenCx<'tcx> {
         }
     }
 
+    // r[impl front.ir.consts]
     pub fn new_value(&self, ty: TypeHandle, cv: ConstVal) -> Value {
         let v = {
             let mut ctx = self.pctx.borrow_mut();
@@ -128,6 +131,7 @@ impl<'tcx> CodegenCx<'tcx> {
         IntegerType::get(&mut self.pctx.borrow_mut(), w, Signedness::Signless).into()
     }
 
+    // r[impl front.det.names]
     pub fn ident(&self, sym: &str) -> Identifier {
         let mut st = self.st.borrow_mut();
         if let Some(i) = st.sym_to_ident.get(sym) {
@@ -526,6 +530,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
     }
 
+    // r[impl front.fn.attrs]
     fn predefine_fn(
         &mut self,
         instance: Instance<'tcx>,
@@ -554,6 +559,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
 }
 
 impl<'tcx> CodegenCx<'tcx> {
+    // r[impl native.obj.alias]
     fn add_aliases(
         &self,
         aliasee: &str,
@@ -650,6 +656,7 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
 
 /// Frozen pointer params of `fn_abi` by backend param index (the layout of
 /// `fn_decl_backend_type`), and the backend param count.
+// r[impl front.abi.facts]
 fn frozen_params(
     fn_abi: &FnAbi<'_, Ty<'_>>,
 ) -> (

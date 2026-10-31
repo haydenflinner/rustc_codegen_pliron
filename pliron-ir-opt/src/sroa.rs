@@ -976,6 +976,7 @@ fn trivially_promotable(
 /// Split one alloca into slices; `made` collects the ops it creates —
 /// all `insert_before(alloca)`, so pushing them in creation order keeps
 /// a caller-maintained alloca list in exact body-scan order.
+// r[impl iropt.sroa]
 fn split(
     ctx: &mut Context,
     st: &mut State,
@@ -1536,6 +1537,7 @@ pub fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
         .collect()
 }
 
+// r[impl iropt.bisect]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let funcs: Vec<Ptr<Operation>> = st
         .funcs
@@ -1898,6 +1900,7 @@ fn forward_single_store(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usi
 /// `forward_single_store` over a caller-held `Dom` — `sroa::run` calls
 /// this before and after its split rounds, and the dominator tree only
 /// needs rebuilding when a split spliced in a trampoline block.
+// r[impl iropt.sroa.fwd]
 fn forward_single_store_d(
     ctx: &mut Context,
     st: &State,

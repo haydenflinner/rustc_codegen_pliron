@@ -189,6 +189,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     /// Returns `None` for SIMD intrinsics that aren't implemented yet.
+    // r[impl front.simd.native]
     pub fn simd_intrinsic(
         &mut self,
         name: &str,

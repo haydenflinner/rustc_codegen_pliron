@@ -75,6 +75,7 @@ pub fn address_taken_ex(
 /// `has_body` and selected by `PLIRON_OPT_FNS` — the filter for passes
 /// that rewrite a function's own body (never for call-site scans).
 /// `dead_unopt` bodies are emit-only: passes skip them like opt-out fns.
+// r[impl iropt.optfns]
 pub fn opt_body(ctx: &Context, st: &State, f: Ptr<Operation>) -> bool {
     has_body(ctx, f) && !st.opt_skip.contains(&f) && !st.dead_unopt_ops.contains(&f)
 }
@@ -117,6 +118,7 @@ pub fn has_body(ctx: &Context, f: Ptr<Operation>) -> bool {
 /// bodies (`f.odr`) are the exception: every emitted copy of the symbol
 /// is semantically identical, so facts inferred here apply to whichever
 /// copy a call binds.
+// r[impl iropt.ipo.datalog]
 pub fn bodied(ctx: &Context, st: &State) -> Vec<String> {
     st.funcs
         .iter()

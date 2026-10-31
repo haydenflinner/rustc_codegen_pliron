@@ -1,3 +1,4 @@
+// r[verify native.asm.splice]
 //! `asm!` calling C functions by their raw Mach-O names (`bl _malloc`).
 //! objmerge strips one `_` from raw asm names on Mach-O and relies on the
 //! object writer to add it back, which it only does for Text/Data/Tls

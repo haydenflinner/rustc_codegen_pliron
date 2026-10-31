@@ -1,3 +1,4 @@
+// r[verify native.obj.loopalign]
 #[inline(never)]
 fn spin(n: u64, mut a: u64) -> u64 {
     let mut i = n;

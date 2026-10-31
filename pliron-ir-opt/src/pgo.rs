@@ -458,6 +458,7 @@ pub fn instrument(
 /// `None` there. `__pliron_prof_register` is declared as a normal import
 /// by the caller so the splice resolves it (Mach-O included, where it
 /// links as `___pliron_prof_register`).
+// r[impl native.pgo.ctor]
 pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<String> {
     let asm = match fmt {
         ObjFmt::Elf => {

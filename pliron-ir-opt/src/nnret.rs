@@ -75,6 +75,7 @@ ascent::ascent! {
     ret_null(f) <-- ret_void(f);
 }
 
+// r[impl iropt.ipo.ret]
 pub fn run(ctx: &Context, st: &mut State) {
     let cand: Vec<String> = bodied(ctx, st)
         .into_iter()

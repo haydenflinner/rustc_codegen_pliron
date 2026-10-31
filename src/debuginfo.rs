@@ -277,6 +277,7 @@ impl<'tcx> CodegenCx<'tcx> {
             .collect()
     }
 
+    // r[impl native.dbg.types]
     fn dbg_type_desc(
         &self,
         ty: Ty<'tcx>,

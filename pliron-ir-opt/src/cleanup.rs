@@ -113,6 +113,7 @@ pub struct Cleaned {
 
 /// Erase unused side-effect-free ops of `f`, then merge single-`br`-pred
 /// blocks. Does nothing under `-g` (debug info keeps block-level maps).
+// r[impl iropt.cleanup]
 pub fn clean_fn(ctx: &mut Context, st: &mut State, pure: &Pure, f: Ptr<Operation>) -> Cleaned {
     let mut c = Cleaned::default();
     if st.dbg.is_some() {

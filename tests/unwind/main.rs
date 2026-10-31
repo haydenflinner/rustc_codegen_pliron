@@ -1,3 +1,4 @@
+// r[verify native.eh.frames]
 use std::panic;
 
 struct D(&'static str);
@@ -16,6 +17,7 @@ fn boom(n: u32) -> u32 {
     n
 }
 
+// r[verify front.eh.catch-unwind]
 fn main() {
     panic::set_hook(Box::new(|i| {
         println!(

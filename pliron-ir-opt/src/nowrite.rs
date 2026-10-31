@@ -117,6 +117,7 @@ ascent::ascent! {
     on_return(f) <-- callr(f, c, false, false), on_return(c);
 }
 
+// r[impl iropt.ipo.nowrite]
 pub fn run(ctx: &Context, st: &mut State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();

@@ -298,6 +298,7 @@ fn retarget_past(
 
 /// Run one audited elision round. Returns how many pairs were removed.
 /// On audit failure the round is reverted (`ins` restored).
+// r[impl wasm.audit.elide]
 pub(super) fn elide_round(
     b: &[u8],
     ins: &mut Vec<(WPeek, usize, usize, usize)>,
@@ -449,6 +450,7 @@ mod tests {
         assert!(matches!(ins[1].0, WPeek::Ctl));
     }
 
+    // r[verify wasm.audit.elide]
     #[test]
     fn elide_keeps_targeted_block() {
         let b = vec![0x02, 0x40, 0x0c, 0x00, 0x0b, 0x0b];

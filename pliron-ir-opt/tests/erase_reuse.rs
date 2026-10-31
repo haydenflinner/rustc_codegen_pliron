@@ -57,6 +57,7 @@ fn funcs(ctx: &Context, m: Ptr<Operation>) -> Vec<Ptr<Operation>> {
         .collect()
 }
 
+// r[verify iropt.inline.dead]
 #[test]
 fn freed_body_slots_are_reused_cleanly() {
     let ctx = &mut Context::new();

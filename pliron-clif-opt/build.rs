@@ -37,6 +37,7 @@ fn hash_tree(h: &mut impl Hasher, dir: &str) {
     }
 }
 
+// r[impl par.cache.key]
 fn main() {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_dir(&mut h, "src");

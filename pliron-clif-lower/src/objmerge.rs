@@ -12,6 +12,7 @@ use rsasm::assembler::{Assembler, Options};
 use rsasm::lexer::Dialect;
 use rustc_hash::FxHashMap;
 
+// r[impl native.asm.inproc]
 pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     let macho = out.format() == BinaryFormat::MachO;
     let coff = out.format() == BinaryFormat::Coff;
@@ -60,6 +61,7 @@ pub fn assemble_into(out: &mut write::Object<'static>, asm: &str, x86: bool) {
     }
 }
 
+// r[impl native.asm.splice]
 fn splice<'d, O>(f: &O, out: &mut write::Object<'static>, x86: bool)
 where
     O: object::Object<'d>,
@@ -262,6 +264,7 @@ pub fn lto_section_name(format: BinaryFormat) -> (&'static [u8], &'static [u8]) 
 }
 
 /// Embed `payload` in `out` (see `lto_section_name`).
+// r[impl native.lto.payload]
 pub fn add_lto_section(out: &mut write::Object<'static>, payload: &[u8]) {
     let format = out.format();
     let (seg, name) = lto_section_name(format);

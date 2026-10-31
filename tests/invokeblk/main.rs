@@ -1,3 +1,5 @@
+// r[verify iropt.inline.eh]
+// r[verify native.eh.try-call]
 // An invoke must end its block. Inlining `fill` at a callsite with a
 // cleanup pad (the `Guard` drop) turns its body's calls into invokes to
 // that pad; with ops after them in the same block, block-level dominance

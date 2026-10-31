@@ -27,6 +27,7 @@ fn may_throw(flag: bool) -> Result<u32, Box<dyn std::any::Any + Send>> {
     catch_unwind(AssertUnwindSafe(|| if flag { deep(3) } else { 7 }))
 }
 
+// r[verify wasm.eh.intrinsics]
 fn main() {
     check("no panic returns ok", may_throw(false).ok() == Some(7));
     let r = may_throw(true);

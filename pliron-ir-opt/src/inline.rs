@@ -36,6 +36,7 @@ use crate::has_body;
 use crate::state::{ConstVal, State, leaf_arg};
 use crate::types::{leaf_range, size_align};
 
+// r[impl iropt.inline.knobs]
 const DEFAULT_LIMIT: usize = 320;
 /// `PLIRON_DEADFREE`: purge `State` side tables after this many freed ops
 /// (a purge is linear in the tables, so not after every free).
@@ -199,6 +200,7 @@ struct CInfo {
 /// def-chain DFSs they feed stay per-feature). The fixed thresholds only
 /// profile callees a devirt/fold multiplier could rescue (as the old `dv` map
 /// did); the model profiles every plausibly inlinable body.
+// r[impl iropt.inline.scope]
 fn callee_info(
     ctx: &Context,
     st: &State,
@@ -804,6 +806,7 @@ pub struct Delta {
 /// Marks local fns that nothing references any more (typically fully inlined)
 /// so lowering skips them. Iterates because a dead fn's calls don't count.
 /// `PLIRON_DEADFN=0` disables it.
+// r[impl iropt.inline.dead]
 pub fn dead_fns(ctx: &Context, st: &mut State) {
     let taken = crate::address_taken(ctx, st);
     loop {
@@ -859,6 +862,7 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
 /// `PLIRON_EARLYDEAD`, the `iropt_head` entry and the post-devirt
 /// point — every `bodied`/`opt_body` pass after that skips the marked
 /// bodies entirely.
+// r[impl par.xcgu.keep]
 pub fn mark_dead_unopt(ctx: &Context, st: &mut State) -> usize {
     if !st.deadunopt_on || st.xcgu_copies.is_empty() {
         return 0;
@@ -928,6 +932,7 @@ pub fn erase_body(ctx: &mut Context, f: Ptr<Operation>) -> usize {
 /// inlining had used up), kept until the CGU dropped; freed arena slots
 /// are reused by later clones instead of growing the arena.
 /// Returns (fns, ops) freed.
+// r[impl par.xcgu.deadfree]
 pub fn free_dead(ctx: &mut Context, st: &mut State) -> (usize, usize) {
     let (mut fns, mut ops) = (0usize, 0usize);
     loop {
@@ -960,6 +965,7 @@ pub fn free_dead(ctx: &mut Context, st: &mut State) -> (usize, usize) {
 /// Functions with bodies, callees before callers (cycles broken arbitrarily).
 /// `filter` restricts both the roots and which callees the DFS descends
 /// into — a restricted run still orders its callees before their callers.
+// r[impl iropt.inline.order]
 fn post_order(ctx: &Context, st: &State, filter: Option<&FxHashSet<String>>) -> Vec<String> {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut out = Vec::new();
@@ -1030,6 +1036,11 @@ fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
 /// may go. `adj` is the callsite adjacency, reused across back-to-back
 /// rounds; pass an empty `Option` to force a rebuild when other passes ran
 /// in between. Returns the `Delta` the next round's filter is built from.
+// r[impl iropt.inline.model]
+// r[impl iropt.inline.budget]
+// r[impl iropt.inline.free]
+// r[impl iropt.inline.fanin]
+// r[impl iropt.inline.hot]
 pub fn run(
     ctx: &mut Context,
     st: &mut State,
@@ -1790,6 +1801,7 @@ fn scc_ids(ctx: &Context, st: &State) -> FxHashMap<String, u32> {
 }
 
 /// Whether `callee` was already inlined somewhere on `site`'s clone chain.
+// r[impl iropt.inline.recursion]
 fn on_chain(st: &State, site: Ptr<Operation>, callee: Ptr<Operation>) -> bool {
     let mut i = st.inline_hist.get(site).copied().unwrap_or(u32::MAX);
     while let Some(&(f, p)) = st.inline_hist_nodes.get(i as usize) {
@@ -1805,6 +1817,7 @@ fn on_chain(st: &State, site: Ptr<Operation>, callee: Ptr<Operation>) -> bool {
 /// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
 /// become direct calls. Returns the rewritten calls plus the callers owning
 /// them, so the next inline round can restrict itself to those callers.
+// r[impl iropt.devirt]
 pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, FxHashSet<String>) {
     let mut out = FxHashSet::default();
     let mut owners = FxHashSet::default();
@@ -3097,6 +3110,7 @@ fn resume_ends(
 /// Returns the callsite block plus the freshly created blocks in region
 /// order (`cont` follows `block`; callee clones sit at the region end), so
 /// the rescan worklist can track the list without re-walking it.
+// r[impl iropt.inline.eh]
 fn inline_call(
     ctx: &mut Context,
     st: &mut State,

@@ -1,3 +1,4 @@
+// r[verify native.lto.fat]
 // Fat LTO (-Clto) across two rlibs: main -> mid -> base, plus std.
 // test.sh builds it with and without -Clto and diffs against expected.out.
 use std::panic;

@@ -1,3 +1,4 @@
+// r[verify native.obj.align]
 // `#[rustc_align(N)]` sets a function's minimum alignment — on the
 // function and on the `dyn` shims rustc codegens for it
 // (codegen_instance_attrs(..).alignment). The backend defined every
@@ -20,6 +21,7 @@ fn plain(x: u32) -> u32 {
     x.wrapping_mul(3)
 }
 
+// r[verify front.fn.attrs]
 fn main() {
     assert_eq!((<dyn Test>::foo as fn(_) as usize & !1) % 4096, 0);
     assert_eq!((<dyn Test>::foo1 as fn(_) as usize & !1) % 4096, 0);

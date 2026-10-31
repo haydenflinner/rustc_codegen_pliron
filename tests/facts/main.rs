@@ -1,3 +1,4 @@
+// r[verify iropt.ipo.datalog]
 // Bottom-up summaries (nowrite, nocapture, nnret, retarg, nounwind): test.sh
 // checks the facts printed by PLIRON_FACTS=fx_ against the comments here, and
 // main checks that code relying on them still behaves.

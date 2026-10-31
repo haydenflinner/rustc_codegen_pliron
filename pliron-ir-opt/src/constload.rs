@@ -113,6 +113,7 @@ fn fold(ctx: &Context, img: &Image, off: i64, ty: TypeHandle) -> Option<ConstVal
     }
 }
 
+// r[impl iropt.constload]
 pub fn run(ctx: &mut Context, st: &mut State) {
     // Nothing folds unless some global is a foldable const image.
     if !st.globals.values().any(|g| {

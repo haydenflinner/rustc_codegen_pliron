@@ -343,6 +343,7 @@ impl DbgInfo {
 /// them — and the variables get location lists from wherever the values
 /// end up. (A declared argument slot that is never read goes too — no
 /// build reads it either.)
+// r[impl iropt.dbg]
 pub fn drop_spills(ctx: &mut Context, st: &mut State) {
     // Out of `st` for the walk: `gep_offset` reads the rest of it.
     let Some(mut d) = st.dbg.take() else {

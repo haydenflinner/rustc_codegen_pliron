@@ -39,6 +39,7 @@ struct Opts {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// r[impl clif.check]
 fn main() -> ExitCode {
     // `PLIRON_TRACE=<env-filter>` (e.g. `pliron::jumpthread=info`) —
     // pass-internal `tracing` prof timers stay silent without a
@@ -497,6 +498,7 @@ fn size_of(f: &Function) -> (usize, usize) {
     (n, b)
 }
 
+// r[impl verify.corpus.replay]
 /// Pipeline (and with `--check`, diffcheck) one corpus file. Status:
 /// `ok` (checked equal or unchecked), `inconclusive` (checker couldn't
 /// compare any trial), `mismatch`, `verifier`, `panic`, `parse`.

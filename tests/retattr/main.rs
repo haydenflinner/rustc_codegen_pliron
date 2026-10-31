@@ -1,3 +1,4 @@
+// r[verify iropt.ipo.ret]
 // Return-value IPO attributes (PLIRON_NNRET / PLIRON_RETARG).
 //
 // nnret: a body whose returns are all provably non-null marks its callers'

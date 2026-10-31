@@ -52,6 +52,7 @@ pub struct UnwindContext {
 impl UnwindContext {
     /// `unwind`: reference `rust_eh_personality` and emit LSDAs (panic=unwind).
     /// `personality`: the personality function's symbol.
+    // r[impl native.eh.personality]
     pub fn new(module: &mut dyn Module, pic: bool, unwind: bool, personality: &str) -> Self {
         let endian = match module.isa().endianness() {
             Endianness::Little => RunTimeEndian::Little,
@@ -154,6 +155,8 @@ impl UnwindContext {
         }
     }
 
+    // r[impl native.eh.frames]
+    // r[impl native.eh.lsda]
     pub fn add_function(&mut self, module: &mut dyn Module, func_id: FuncId, code: &CompiledCode) {
         if self.coff {
             let info = code.create_unwind_info(module.isa()).unwrap();
@@ -247,6 +250,7 @@ impl UnwindContext {
     /// No exception handler is registered (UNW_FLAG_NHANDLER): real SEH can
     /// unwind through our frames but cannot catch in them — catching is done
     /// by the emulated-EH path in lower.rs under panic=unwind.
+    // r[impl native.win.pdata]
     pub fn emit_coff(self, product: &mut ObjectProduct) {
         if self.pdata.is_empty() {
             return;
@@ -299,6 +303,7 @@ impl UnwindContext {
         }
     }
 
+    // r[impl native.eh.macho-x64]
     pub fn emit(self, product: &mut ObjectProduct) {
         if self.coff {
             return self.emit_coff(product);

@@ -118,6 +118,7 @@ const CASES: &[(&str, &str, u32)] = &[
 /// `CodegenError`, never silently truncated machine code.
 #[cfg(not(target_arch = "x86_64"))]
 #[test]
+// r[verify clif.vendor.isel]
 fn wide_ops_fail_loudly() {
     let isa = host_isa();
     for &(name, clif, _) in CASES {

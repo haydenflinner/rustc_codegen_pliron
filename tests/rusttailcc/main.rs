@@ -84,6 +84,7 @@ extern "tail" fn lotsa_apples(
     )
 }
 
+// r[verify front.abi.internal]
 fn main() {
     let pie = lotsa_apples(
         220,

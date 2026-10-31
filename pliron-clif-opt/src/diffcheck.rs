@@ -146,7 +146,10 @@ fn describe(o: &Outcome) -> String {
     }
 }
 
+// r[impl verify.diffcheck.observe]
+// r[impl verify.diffcheck.inconclusive]
 /// Compare `before` and `after` on `cfg.trials` random inputs.
+// r[impl clif.diffcheck.observe]
 pub fn check(
     before: &Function,
     after: &Function,
@@ -279,6 +282,7 @@ fn same(a: &Outcome, b: &Outcome) -> bool {
 /// determined by the source program, and `a` may show anything there.
 /// True when `a` differs from `b0` only on such bytes (or the original's
 /// whole behavior is fill-dependent, which leaves nothing to check).
+// r[impl clif.diffcheck.sound]
 fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
     let (
         Outcome::Returned {
@@ -557,6 +561,7 @@ struct PtrInfo {
 
 /// Entry params treated as pointers: those the facts describe, plus any
 /// that (through adds and block params) reach a memory access address.
+// r[impl clif.diffcheck.limits]
 fn pointer_params(f: &Function, facts: &Facts) -> FxHashMap<Value, PtrInfo> {
     let mut out: FxHashMap<Value, PtrInfo> = FxHashMap::default();
     let Some(entry) = f.layout.entry_block() else {
@@ -1368,7 +1373,9 @@ pub enum Mode {
     PerStep,
 }
 
+// r[impl verify.diffcheck.modes]
 /// The mode for function `fname`, honoring `PLIRON_DIFFCHECK_FN=<substr>`.
+// r[impl clif.diffcheck.modes]
 pub fn mode_for(fname: &str) -> Option<Mode> {
     let mode = match crate::config::env_get("PLIRON_DIFFCHECK")? {
         "0" => return None,
@@ -1426,6 +1433,7 @@ pub(crate) fn safe_name(fname: &str) -> String {
         .collect()
 }
 
+// r[impl verify.diffcheck.repro]
 /// Write `before.clif` / `after.clif` / `report.txt` under
 /// `PLIRON_DIFFCHECK_DIR` (default `pliron-diffcheck/`) and log one line.
 /// `PLIRON_DIFFCHECK_PANIC=1` turns the report into a panic.
@@ -1506,6 +1514,7 @@ pub fn clif_text(f: &Function) -> String {
 
 /// Facts in a form that survives a round trip through a `.clif` file.
 #[derive(Default, Debug)]
+// r[impl clif.check.fidelity]
 pub struct OwnedFacts {
     pub nonnull: FxHashSet<Value>,
     pub noalias: FxHashSet<Value>,

@@ -3201,6 +3201,7 @@ pub fn run_with(
 /// a wrong interval still trips on the first 256 bytes in practice).
 const POISON_MAX: u32 = 256;
 
+// r[impl verify.poison]
 /// See `PLIRON_SM_POISON` in `run`. A slot's interval `[lo, hi]` is in the
 /// same RPO positions coloring uses; outside it the bytes are claimed
 /// dead. Poison right after the instruction at `hi` (unless it ends its

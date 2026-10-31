@@ -51,6 +51,7 @@ ascent::ascent! {
     returned(f, k) <-- nrets(f, n), upto(f, n - 1, k);
 }
 
+// r[impl iropt.ipo.ret]
 pub fn run(ctx: &Context, st: &State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();

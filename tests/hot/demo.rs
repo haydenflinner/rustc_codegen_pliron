@@ -1,3 +1,4 @@
+// r[verify native.hot.loader]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static TICKS: AtomicU32 = AtomicU32::new(0);

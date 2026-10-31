@@ -48,6 +48,7 @@ fn func(ctx: &Context, m: Ptr<Operation>) -> Ptr<Operation> {
         .unwrap()
 }
 
+// r[verify iropt.cleanup]
 #[test]
 fn dead_ops_go_and_single_br_pred_blocks_merge() {
     let ctx = &mut Context::new();

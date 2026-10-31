@@ -185,6 +185,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     /// Integer op that carries (empty) overflow flags, as the printer requires.
+    // r[impl front.ir.noflags]
     fn binf<T: pliron_llvm::op_interfaces::IntBinArithOpWithOverflowFlag>(
         &mut self,
         a: Value,
@@ -356,6 +357,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    // r[impl front.ir.switch]
     fn switch(
         &mut self,
         v: Value,
@@ -412,6 +414,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    // r[impl front.eh.invoke]
     fn invoke(
         &mut self,
         llty: TypeHandle,
@@ -599,6 +602,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    // r[impl front.ir.align]
     fn alloca(&mut self, size: Size, align: Align) -> Value {
         let arr = self.type_array(self.type_i8(), size.bytes());
         let one = self.const_i32(1);
@@ -922,6 +926,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| SelectOp::new(c, cond, then_val, else_val))
     }
 
+    // r[impl front.abi.va-layout]
     fn va_arg(&mut self, list: Value, ty: TypeHandle) -> Value {
         // SysV `__va_list_tag`: the cursor lives in `overflow_arg_area` (+8);
         // gp/fp offsets are exhausted so every type takes the overflow path.
@@ -1062,6 +1067,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         *funclet
     }
 
+    // r[impl front.ir.atomics]
     fn atomic_cmpxchg(
         &mut self,
         dst: Value,
@@ -1145,6 +1151,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     // StorageLive/Dead reach us as lifetime markers; slotmerge consumes them
     // for exact stack-slot intervals (they emit no machine code).
+    // r[impl front.ir.lifetime]
     fn lifetime_start(&mut self, ptr: Value, size: Size) {
         let n = self.const_usize(size.bytes());
         self.intrinsic("llvm.lifetime.start", self.type_void(), &[n, ptr]);
@@ -1475,6 +1482,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
+    // r[impl front.ignored]
     fn add_coverage(
         &mut self,
         _instance: Instance<'tcx>,

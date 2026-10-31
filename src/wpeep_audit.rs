@@ -97,6 +97,7 @@ fn stale(v: u32, j: u32) -> u32 {
     if v == j { STALE } else { v }
 }
 
+// r[impl wasm.audit.model]
 ascent::ascent! {
     struct Audit;
     relation entry(u32);
@@ -283,6 +284,7 @@ pub(super) struct Claim {
 /// Returns human-readable violations (empty: the round preserved every
 /// read's value on every path and every assumption held), or `None` when
 /// the round is over `BUDGET` and was not audited.
+// r[impl wasm.audit.budget]
 pub(super) fn audit(
     b: &[u8],
     old: &[(WPeek, usize, usize, usize)],

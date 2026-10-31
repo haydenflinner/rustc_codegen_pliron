@@ -1,3 +1,4 @@
+// r[verify iropt.sroa]
 #![feature(portable_simd)]
 
 // PLIRON_SROA_PIN: a non-copyable call arg (callee writes through it or

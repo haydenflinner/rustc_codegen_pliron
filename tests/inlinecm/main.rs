@@ -1,3 +1,4 @@
+// r[verify iropt.inline.model]
 // Inline cost-model coverage (`PLIRON_INLINE_MODEL`, on by default).
 //
 // `dispatch` is larger than the fixed op budget, but a constant `mode`

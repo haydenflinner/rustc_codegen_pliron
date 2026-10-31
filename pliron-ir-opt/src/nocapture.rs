@@ -237,6 +237,7 @@ fn extract_src(ctx: &Context, op: pliron::context::Ptr<Operation>) -> Option<Val
     None
 }
 
+// r[impl iropt.ipo.nocapture]
 pub fn run(ctx: &Context, st: &mut State) {
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();

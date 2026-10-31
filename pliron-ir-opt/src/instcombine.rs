@@ -381,6 +381,7 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
     (nc, nv)
 }
 
+// r[impl iropt.instcombine]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let egg = crate::env_get("PLIRON_INSTCOMBINE").as_deref() == Some("egg");
     let (mut nc, mut nv) = (0, 0);

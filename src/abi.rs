@@ -203,6 +203,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
     }
 }
 
+// r[impl front.abi.sret2reg]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);

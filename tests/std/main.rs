@@ -84,6 +84,7 @@ fn main() {
         // On Windows against a stock (LLVM-built) std, panics are real SEH
         // throws the emulated-EH invoke path can't intercept — these asserts
         // only hold with a backend-built std (`-Zbuild-std`).
+        // r[verify native.win.stock-std]
         #[cfg(not(pliron_stock_seh))]
         {
             let r =

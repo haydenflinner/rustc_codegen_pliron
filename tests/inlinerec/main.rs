@@ -1,3 +1,4 @@
+// r[verify iropt.inline.recursion]
 // A recursive visitor (`visit` <-> `walk`) whose `visit` calls a big
 // single-caller helper (`check`). Inlining `check` into `visit` is "free"
 // in code size, but every level of the recursion then carries its frame:

@@ -1,3 +1,4 @@
+// r[verify native.asm.cfi]
 // global_asm functions with .cfi_* directives (wasmtime-fiber style) on
 // aarch64 Mach-O. Four things broke on the way: rsasm wrote no Mach-O
 // `__eh_frame` at all, had no relocation for an FDE's pcrel `pc_begin`

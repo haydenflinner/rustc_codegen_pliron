@@ -1,3 +1,4 @@
+// r[verify native.pgo.ctor]
 #[inline(never)]
 fn hot(n: u64) -> u64 {
     let mut x = 0;

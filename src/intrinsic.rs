@@ -60,6 +60,7 @@ fn eq_bytes<'a, 'tcx>(
 }
 
 impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
+    // r[impl front.intrinsic.rust]
     fn codegen_intrinsic_call(
         &mut self,
         instance: Instance<'tcx>,
@@ -257,6 +258,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 };
                 self.select(of, sat, r)
             }
+            // r[impl front.intrinsic.blackbox]
             sym::black_box => {
                 let layout = args[0].layout;
                 // Opaque optimization barrier — LLVM's
@@ -282,6 +284,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 // reload instead of a `uxtb` per barrier result. eqbug
                 // 0.1219 → 0.1254 ms: the store→load pair costs more
                 // than the extend it replaces.
+                // r[impl wasm.bb]
                 let clif_bb = !self.tcx.sess.target.is_like_wasm;
                 if layout.is_zst() {
                     if clif_bb {
@@ -355,6 +358,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 args[1].val.volatile_store(self, dst);
                 return IntrinsicResult::Operand(OperandValue::ZeroSized);
             }
+            // r[impl front.eh.catch-unwind]
             sym::catch_unwind => {
                 let (try_fn, data, catch_fn) = (a(0), a(1), a(2));
                 let ptr = self.type_ptr();
@@ -469,6 +473,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         imm(r)
     }
 
+    // r[impl front.intrinsic.llvm]
     fn codegen_llvm_intrinsic_call(
         &mut self,
         instance: Instance<'tcx>,
@@ -501,6 +506,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         let v = self.type_void();
         self.intrinsic("llvm.trap", v, &[]);
     }
+    // r[impl front.intrinsic.hints]
     fn assume(&mut self, val: Value) {
         // `assume(false)` marks the rest of the block unreachable (e.g. the
         // `unreachable_unchecked` UB-check path); `unreach` then drops the
@@ -532,6 +538,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         panic!("type_checked_load is not supported by the pliron backend")
     }
+    // r[impl front.abi.variadic]
     fn va_start(&mut self, val: Value) {
         // The variadic-argument buffer pointer, delivered by the lowering as the
         // hidden extra parameter of a C-variadic function. The VaList place is
@@ -580,6 +587,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 /// is declared `fn(T) -> T`; the per-type suffix keeps each signature's
 /// FuncOp decl distinct (`declare_fn_sym` dedups by name). `lower.rs`
 /// turns the call into the CLIF `black_box` op, so this is zero-cost.
+// r[impl front.intrinsic.blackbox.names]
 fn bb_val(b: &mut Builder<'_, '_>, v: Value) -> Value {
     let ty = b.ty_of(v);
     let sym = format!("__pliron_bbv_{}", bb_ty_tag(b, ty));

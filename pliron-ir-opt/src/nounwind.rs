@@ -46,6 +46,7 @@ ascent::ascent! {
     may_unwind(f) <-- call(f, c), may_unwind(c);
 }
 
+// r[impl iropt.ipo.nounwind]
 pub fn run(ctx: &Context, st: &mut State) {
     let bodied: Vec<String> = bodied(ctx, st)
         .into_iter()

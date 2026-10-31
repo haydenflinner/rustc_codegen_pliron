@@ -171,6 +171,11 @@ fn native_feat(sess: &Session, feature: &str) -> bool {
 fn native_feat(_sess: &Session, _feature: &str) -> bool {
     false
 }
+// r[impl front.target.isa]
+// r[impl front.target.settings]
+// r[impl front.target.fp]
+// r[impl native.obj.pic-tls]
+// r[impl native.obj.fp]
 pub(crate) fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
     // COFF has no GOT: is_pic would emit sym@GOTPCREL loads that read the
@@ -434,6 +439,7 @@ impl lower::Host for RustcHost<'_> {
 /// enables that target at that level, so `PLIRON_JT_PROF=1` keeps
 /// printing jumpthread phase timings (now as `INFO pliron::jumpthread`).
 /// Print-gating knobs only; behavioral knobs stay `env_set` reads.
+// r[impl front.trace]
 const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
     ("PLIRON_STATS", "pliron::stats", tracing::Level::INFO),
     ("PLIRON_STATS_OPS", "pliron::stats", tracing::Level::INFO),
@@ -675,6 +681,7 @@ const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
     ("PLIRON_WASM_VERBOSE", "pliron::wasm", tracing::Level::DEBUG),
 ];
 
+// r[impl par.cfg.trace]
 fn tracing_init() {
     let mut filter = String::new();
     if let Ok(t) = std::env::var("PLIRON_TRACE") {
@@ -740,6 +747,7 @@ macro_rules! pt {
 }
 pub(crate) use pt;
 
+// r[impl front.finish]
 fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
     let cfg = cgupool::CrateCfg::new(cx.tcx);
     let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
@@ -850,6 +858,7 @@ fn native_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool
 /// rustc `-Ctarget-cpu` names → feature sets, for the cpus whose properties
 /// feed cranelift lowering. Only entries we can state confidently go here;
 /// anything else falls back to the spec baseline.
+// r[impl front.target.cpu]
 fn cpu_features(cpu: &str) -> &'static [&'static str] {
     // x86-64 psABI levels: each arm lists entry-point features only —
     // `internal_target_features` expands the implied closure
@@ -943,6 +952,8 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
     }
 }
 impl CodegenBackend for PlironCodegenBackend {
+    // r[impl front.target.features]
+    // r[impl front.target.f16]
     fn target_config(&self, sess: &rustc_session::EarlySession) -> TargetConfig {
         types::PTR32.store(
             sess.target.pointer_width == 32,
@@ -987,6 +998,9 @@ impl CodegenBackend for PlironCodegenBackend {
     // `Session::lto` doesn't exist yet: `init` sees only the early
     // session, so it reads `-Clto` from the options directly.
     #[cfg_attr(rustc_in_tree, allow(rustc::bad_opt_access))]
+    // r[impl front.lto]
+    // r[impl native.lto.thin]
+    // r[impl par.cfg.version]
     fn init(&mut self, sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
         tracing_init();
         // Which source tree built this dylib (harness/src-rev.sh) — check it
@@ -1048,6 +1062,8 @@ impl CodegenBackend for PlironCodegenBackend {
 impl ExtraBackendMethods for PlironCodegenBackend {
     type Module = PlironModule;
 
+    // r[impl front.alloc-shim]
+    // r[impl native.win.crtfree]
     fn codegen_allocator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1442,6 +1458,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
     }
 }
 
+// r[impl front.cgu.order]
 fn module_codegen(
     tcx: TyCtxt<'_>,
     cgu_name: Symbol,
@@ -1645,6 +1662,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
         lto::fat(sess, cgcx, shared_emitter, each_linked_rlib_for_lto, modules)
     }
 
+    // r[impl par.facts.thin-claim]
     fn run_thin_lto(
         _cgcx: &CodegenContext,
         _prof: &SelfProfilerRef,
@@ -1739,6 +1757,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
         Self::codegen(cgcx, prof, shared_emitter, m, &cgcx.module_config)
     }
 
+    // r[impl front.emit]
     fn codegen(
         cgcx: &CodegenContext,
         prof: &SelfProfilerRef,
@@ -1789,6 +1808,7 @@ impl WriteBackendMethods for PlironCodegenBackend {
 }
 
 /// Entry point loaded by `-Zcodegen-backend=path/to/librustc_codegen_pliron.so`.
+// r[impl front.entry]
 #[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(PlironCodegenBackend)

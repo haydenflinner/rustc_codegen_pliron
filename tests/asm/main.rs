@@ -13,6 +13,8 @@ unsafe extern "C" {
 }
 
 #[cfg(target_arch = "x86_64")]
+// r[verify front.intrinsic.llvm]
+// r[verify front.asm.wrapper]
 fn main() {
     let mut x: u64 = 40;
     unsafe { asm!("add {0}, {1}", inout(reg) x, in(reg) 2u64) };
@@ -260,6 +262,8 @@ unsafe fn crypto() -> (u32, [u32; 4], [u8; 16]) {
 }
 
 #[cfg(target_arch = "aarch64")]
+// r[verify front.intrinsic.llvm]
+// r[verify front.asm.wrapper]
 fn main() {
     let mut x: u64 = 40;
     unsafe { asm!("add {0}, {0}, {1}", inout(reg) x, in(reg) 2u64) };

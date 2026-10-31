@@ -1,5 +1,6 @@
 //! The slice of wasi-libc that std's `wasm32-wasip1` backend links against,
 //! written in Rust on top of the `wasip1` syscall bindings. Single-threaded.
+// r[impl wasm.libc.pure]
 #![no_std]
 #![allow(clippy::missing_safety_doc, static_mut_refs, non_upper_case_globals)]
 
@@ -46,6 +47,7 @@ unsafe extern "C" {
     fn __main_void() -> c_int;
 }
 
+// r[impl wasm.libc.start]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     unsafe { __wasm_call_ctors() };
@@ -1295,6 +1297,7 @@ unsafe extern "C" {
     static __pliron_eh: u64;
 }
 
+// r[impl wasm.eh.libc]
 unsafe fn eh_raise(exn: *mut u8) {
     let p = &raw const __pliron_eh as *mut u8;
     unsafe {

@@ -121,6 +121,7 @@ impl Writer for W {
 type InstKey = (u32, u32);
 
 #[derive(Default)]
+// r[impl native.dbg.inline]
 struct Inst {
     ranges: Vec<(u32, u32)>,
     kids: Vec<(InstKey, Inst)>,
@@ -623,6 +624,7 @@ impl Cx<'_> {
 /// pieces with `DW_OP_piece`, or use the plain location when one piece
 /// covers the whole variable. Segments where some byte has no location
 /// are left out (the variable reads as unavailable there).
+// r[impl native.dbg.vars]
 fn loc_list(sym: usize, vsize: u32, pcs: &[(Piece, &[(u32, u32, ValLoc)])], fp_reg: u16) -> Vec<Location> {
     let mut cuts: Vec<u32> = pcs.iter().flat_map(|(_, rs)| rs.iter().flat_map(|r| [r.0, r.1])).collect();
     cuts.sort_unstable();
@@ -723,6 +725,7 @@ fn sleb(e: &mut Vec<u8>, mut v: i64) {
 }
 
 /// Write the debug sections for `fns` into `product`'s object.
+// r[impl native.dbg.format]
 pub fn emit(
     product: &mut ObjectProduct,
     d: &DbgInfo,

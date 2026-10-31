@@ -548,6 +548,7 @@ fn try_byval(ctx: &mut Context, st: &mut State, m: Ptr<Operation>) -> bool {
     true
 }
 
+// r[impl iropt.memcpyopt]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let mut n = 0;
     let funcs: Vec<_> = st

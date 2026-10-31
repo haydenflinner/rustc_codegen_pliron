@@ -30,10 +30,11 @@ requirements stated here, and nothing here refines anything above it.
   assembly is assembled in-process by #term("rsasm"); wasm objects are linked
   by #term("pliron-wasm-ld"), not `wasm-ld`. The only external program in the
   native path is the system linker (or #term("wild")) that rustc itself
-  invokes.
+  invokes; `-Clto` additionally runs that same linker with `-r` to merge
+  objects.
 ]
 
-#llvm(kind: "choice", summary: [No LLVM in the dylib or the toolchain path: no `llvm-sys`, no GNU `as`, no `ld -r`, no `wasm-ld`.])[
+#llvm(kind: "choice", summary: [No LLVM in the dylib or the toolchain path: no `llvm-sys`, no GNU `as`, no `wasm-ld`; asm needs no `ld -r`.])[
   Stock rustc links `librustc_codegen_llvm`, which carries all of LLVM. Here
   the instruction selector and register allocator are #term("cranelift")'s,
   `asm!` goes through rsasm, and wasm structuring goes through

@@ -43,6 +43,7 @@ type Vals = SmallVec<[WV; 2]>;
 
 /// Scalar leaves for wasm: `leaves`, with 128-bit values split into (lo, hi)
 /// i64 pairs and f16 as raw i16 bits.
+// r[impl wasm.emit.repr]
 pub fn wleaves(ctx: &Context, ty: TypeHandle) -> Vec<(u64, ClType)> {
     let mut out = Vec::new();
     for (o, t) in leaves(ctx, ty) {
@@ -135,6 +136,7 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
 /// `f(0..n)` on all cores (`PLIRON_PAR` sizes it, `=0` runs inline),
 /// results in index order. For per-function work that reads only its own
 /// input — the module is assembled afterwards in the serial order.
+// r[impl wasm.emit.par]
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
     let threads = if par == Some(0) {
@@ -177,6 +179,7 @@ struct FDecl {
     no_inline: bool,
 }
 
+// r[impl wasm.obj.module]
 struct Obj {
     m: Module<'static>,
     sigs: FxHashMap<(Vec<WT>, Vec<WT>), Signature>,
@@ -216,6 +219,7 @@ impl Obj {
     /// `GOT.func.<sym>` (table index) or `GOT.mem.<sym>` (address); the
     /// func/data class comes from the reference namespace even when the
     /// name isn't in st.funcs (`\x01` verbatim syms, libcalls, extern data).
+    // r[impl wasm.obj.imports]
     fn got_at(&mut self, func: bool, sym: &str) -> Global {
         if let Some(g) = self.got.get(&(func, sym.to_string())) {
             return *g;
@@ -247,6 +251,7 @@ impl Obj {
 
 /// LLVM's `generic` wasm CPU features, adjusted by `-Ctarget-cpu=mvp` and
 /// `-Ctarget-feature`. Tools like wasm-bindgen read them from `target_features`.
+// r[impl wasm.obj.features]
 pub fn target_features(
     target: &rustc_target::spec::Target,
     opts: &rustc_session::config::Options,
@@ -302,6 +307,7 @@ struct ModTail {
 }
 
 impl ModTail {
+    // r[impl wasm.obj.custom]
     fn new(ctx: &Context, st: &State) -> Self {
         let link_funcs = link_funcs(ctx, st);
         let link_data = link_data(ctx, st);
@@ -356,6 +362,7 @@ impl ModTail {
 /// Module tail: waffle-IR inlining, function
 /// index remap (imports first), per-body wasm emit with stub fallback,
 /// exports, and the `pliron.link`/`target_features`/custom sections.
+// r[impl wasm.obj.exports]
 fn emit_obj(
     mut o: Obj,
     tail: ModTail,
@@ -551,6 +558,7 @@ fn custom_section_name(g: &crate::context::GlobalInfo) -> Option<&str> {
     g.section.as_deref().filter(|s| !s.starts_with('.'))
 }
 
+// r[impl wasm.emit.stub]
 fn stub(m: &Module, sig: Signature) -> FunctionBody {
     let mut b = FunctionBody::new(m, sig);
     let e = b.entry;
@@ -766,6 +774,8 @@ fn wpeek_name(k: WPeek) -> String {
     }
 }
 
+// r[impl wasm.peep.passes]
+// r[impl wasm.peep.budget]
 fn peep_body_opts(
     b: &[u8],
     fsig: &[(u32, u32)],
@@ -1409,6 +1419,7 @@ fn peep_body_opts(
             // (A `br` out of an `if` arm between them kept a frame-slot
             // address in x on the exit path; the retarget overwrote it
             // with a finish_grow result — wasm std `words` miscompile.)
+            // r[impl wasm.peep.pathcheck]
             if opts.pathcheck
                 && (ctx[ins[p1].3] != ctx[ins[si].3]
                 || (p1..si).any(|i| {
@@ -1788,6 +1799,7 @@ fn peep_body_opts(
             }
             changed = true;
         }
+        // r[impl wasm.audit.copyfwd]
         if changed && let Some(old) = before {
             let v = wpeep_audit::audit(b, &old, &ins, &claims);
             if v.is_none() {
@@ -5234,6 +5246,7 @@ fn peep_body_opts(
 /// Module-level driver for `peep_body`: walks sections, rewrites each
 /// code-section function body. Leaves the module untouched on any
 /// malformed section layout.
+// r[impl wasm.peep.scope]
 fn wpeep(bytes: &mut Vec<u8>, name: &str) {
     if bytes.len() < 8 || &bytes[..8] != b"\0asm\x01\0\0\0" {
         return;
@@ -5655,6 +5668,7 @@ mod wpeep_tests {
         o
     }
 
+    // r[verify wasm.peep.pathcheck]
     #[test]
     fn branch_past_copy_blocks_producer_retarget() {
         let b = branch_past_copy_body();
@@ -5682,6 +5696,7 @@ mod wpeep_tests {
         );
     }
 
+    // r[verify wasm.audit.copyfwd]
     #[test]
     fn audit_rejects_branch_past_copy() {
         let o = opts(true, false);
@@ -5737,6 +5752,7 @@ mod wpeep_tests {
     //       get 3; return                             ; reads only scratch
     //     end
     //   end
+    // r[verify wasm.peep.equiv]
     #[test]
     fn backedge_if_folds_to_br_if() {
         let b = body(
@@ -8173,6 +8189,8 @@ fn call_sccs(funcs: &[FDecl]) -> Vec<u32> {
     comp
 }
 
+// r[impl wasm.inline.rules]
+// r[impl wasm.inline.budgets]
 fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // `PLIRON_WASM_TINY=N` / `PLIRON_WASM_SOLO=N` (defaults 6 / 15 via
     // `pliron_cfg::DEFAULT_VALUES`): always-inline and single-callsite
@@ -8496,6 +8514,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
 /// their names returned so `link_section` leaves them out too. Mirrors
 /// the roots/edges of `pliron-wasm-ld`'s GC, so this only removes what
 /// the final link would have removed anyway.
+// r[impl wasm.obj.gc]
 fn wgc(o: &mut Obj, taken: &FxHashSet<String>, st: &State, name: &str) -> FxHashSet<String> {
     let n = o.funcs.len();
     let mut live = vec![false; n];
@@ -8594,6 +8613,7 @@ fn link_flags(l: Linkage) -> u8 {
 /// for defined data objects. Flags: bit 0 global, bit 1 preemptible, bit 2 an
 /// `.init_array` entry (constructor pointers the linker calls from
 /// `__wasm_call_ctors`), bit 3 `#[used(linker)]` (GC root).
+// r[impl wasm.obj.link]
 fn link_funcs(ctx: &Context, st: &State) -> Vec<(String, u8)> {
     st.funcs
         .iter()
@@ -8661,6 +8681,7 @@ fn link_data(ctx: &Context, st: &State) -> Vec<u8> {
 /// fp/mask producer chain rooted at `roots` â€” the callee's own SP is never
 /// touched, so nothing needs restoring. A stray consumer of the dead
 /// values cancels the whole rewrite (defensive).
+// r[impl wasm.emit.frame]
 fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
     let mut dead: FxHashSet<WV> = roots.into_iter().collect();
     let mut wl: Vec<WV> = dead.iter().copied().collect();
@@ -12411,6 +12432,7 @@ mod clif_emit {
     /// `PLIRON_LOWERFREE` `lower_clif_wasm` can drop an owned `Context` as
     /// soon as phase (A) is done, and each function's CLIF is dropped as
     /// soon as it is translated.
+    // r[impl wasm.pipeline]
     pub(crate) fn lower_to_wasm_clif(
         mut ctx: crate::lower::CtxSlot<'_>,
         st: &State,

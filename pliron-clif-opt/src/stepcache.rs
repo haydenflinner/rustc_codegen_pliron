@@ -166,6 +166,7 @@ impl StatDelta {
 /// require fewer transforms — `bisect_skip` only renumbers, it cannot
 /// un-run a step. Bisection is a debugging tool; keep it exact by
 /// turning both cache tiers off while `PLIRON_OPT_BISECT` is set.
+// r[impl par.cache.bypass]
 fn bisecting() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| crate::config::bisect_limit().is_some());
@@ -191,6 +192,7 @@ pub(crate) fn enabled() -> bool {
 /// Determinism is the disk tier's contract — a hit replays an output
 /// produced from the same `(key, reads, ran)`, and parallel CGUs make
 /// producer choice nondeterministic only over identical results.
+// r[impl par.cache.mem]
 fn mem_on() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| config().enabled("PLIRON_MEMCACHE") && !bisecting());
@@ -392,6 +394,7 @@ fn uen_names(
 /// outputs reference a subset of the input's declared callees, so a
 /// failure means the numbering differs and the variant is unusable.
 /// Returns the `(ref, name)` pairs to install.
+// r[impl par.cache.remap]
 fn uen_remaps<'x>(
     p: &Pipe,
     params: &'x FunctionParameters,
@@ -497,6 +500,7 @@ impl Hasher for Sha {
 
 /// Maps are iterated in nondeterministic order; hash each entry
 /// separately, sort, then fold so iteration order can't split keys.
+// r[impl par.det.order]
 fn seq_hash<I: Hash>(h: &mut Sha, items: impl IntoIterator<Item = I>) {
     let mut es: Vec<u64> = items
         .into_iter()
@@ -558,6 +562,7 @@ fn cur_hash(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
 /// unreachable from those regions are unobservable and must not be
 /// keyed: copies carry region trees iropt shaped differently, and the
 /// unreachable residue is exactly what differs.
+// r[impl par.det.no-addr]
 fn region_reps(
     p: &Pipe,
 ) -> FxHashMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, u64> {
@@ -678,6 +683,7 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     r
 }
 
+// r[impl par.cache.layout]
 fn file_path(kind: &str, k: &[u8; 32]) -> Option<PathBuf> {
     let hex: String = k.iter().map(|b| format!("{b:02x}")).collect();
     Some(dir()?.join(kind).join(&hex[..2]).join(format!("{hex}.bin")))
@@ -702,6 +708,7 @@ fn store<T: Serialize>(path: &PathBuf, variants: &[T]) {
     }
 }
 
+// r[impl par.cache.read-set]
 fn reads_ok(reads: &[(String, Option<String>)]) -> bool {
     reads
         .iter()
@@ -734,6 +741,7 @@ fn apply_func(
 /// The pipeline key covers the input state plus the custom pipeline
 /// list (`PLIRON_PIPELINE`) — everything else is captured by variants.
 /// Also addresses the function's step file.
+// r[impl par.cache.key]
 fn pipe_key(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     let mut h = Sha(sha2::Sha256::new());
     env!("PLIRON_BUILD_ID").hash(&mut h);

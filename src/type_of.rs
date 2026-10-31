@@ -142,6 +142,7 @@ impl<'tcx> CodegenCx<'tcx> {
         t
     }
 
+    // r[impl front.types.layout]
     fn uncached_layout_type(&self, layout: TyAndLayout<'tcx>) -> TypeHandle {
         match layout.backend_repr {
             BackendRepr::Scalar(_) => unreachable!(),
@@ -347,6 +348,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         args.extend((0..rest_count).map(|_| unit));
         self.type_struct(&args, false)
     }
+    // r[impl front.abi.fnsig]
     fn fn_decl_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> TypeHandle {
         let mut args = Vec::new();
         let ret = match &fn_abi.ret.mode {

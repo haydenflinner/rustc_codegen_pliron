@@ -54,6 +54,7 @@ fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr
     seen
 }
 
+// r[impl iropt.phisimp]
 pub fn run(ctx: &mut Context, st: &State) {
     let landing: FxHashSet<Ptr<BasicBlock>> = st.invokes.values().map(|&(b, _)| b).collect();
     let fns: Vec<_> = st

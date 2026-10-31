@@ -125,6 +125,7 @@ fn object_payload(obj: &[u8], what: &dyn std::fmt::Display) -> Result<Option<Lto
 
 /// `optimize_and_codegen_fat_lto`: one relocatable object holding the
 /// local modules and every LTO-participating upstream rlib's Rust objects.
+// r[impl native.lto.fat]
 pub fn fat(
     sess: &Session,
     cgcx: &CodegenContext,
@@ -135,6 +136,7 @@ pub fn fat(
     let _prof = sess.prof.generic_activity("pliron_fat_lto");
     let dcx = sess.dcx();
     let target = &sess.target;
+    // r[impl wasm.obj.nolto]
     if target.is_like_wasm {
         dcx.fatal("fat LTO (-Clto) is not supported by the pliron backend on wasm targets");
     }
@@ -297,6 +299,7 @@ fn file_name(s: &str) -> String {
 
 /// A relocatable-link command (`-o out inputs...` still to append) for the
 /// session's linker: the cc driver or ld rustc itself would link with.
+// r[impl native.lto.refuse]
 fn partial_link_cmd(sess: &Session) -> Result<Command, String> {
     let (linker, flavor) = rustc_codegen_ssa::back::link::linker_and_flavor(sess);
     let target = &sess.target;

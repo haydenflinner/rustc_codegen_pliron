@@ -319,6 +319,7 @@ fn natural_loops(
     out
 }
 
+// r[impl iropt.callgvn]
 pub fn run(ctx: &mut Context, st: &State) {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::callgvn", tracing::Level::DEBUG);

@@ -112,8 +112,10 @@ pub static RET_NOEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// plain pointer, like every other indirect argument — both ends are
 /// pliron code, and rustc already hands the callee its own copy for
 /// by-move indirect args.
+// r[impl clif.lower.byval]
 static STRUCT_ARG_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+// r[impl clif.lower.ext]
 pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> Signature {
     let TyK::Func(ret, args, var_arg) = classify(ctx, fn_ty) else {
         panic!("not a function type")
@@ -177,6 +179,8 @@ pub fn make_sig(ctx: &Context, fn_ty: TypeHandle, exts: &Exts, cc: CallConv) -> 
 /// Local, non-variadic functions whose address never escapes and that are
 /// never invoked: only called directly from this module, so they may use Cranelift's `tail` ABI (up to
 /// 8 int + 8 float return registers instead of SysV's 2+2).
+// r[impl front.abi.internal]
+// r[impl clif.lower.tailcc]
 pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> {
     use rustc_hash::FxHashSet;
     if !crate::pass_enabled("PLIRON_TAILCC") {
@@ -209,6 +213,7 @@ pub fn internal_fns(ctx: &Context, st: &State) -> rustc_hash::FxHashSet<String> 
 /// unlike `internal_fns`, which merely elects our faster internal ABI.
 /// aarch64 still keeps sret fns on the platform ABI: its tail CC has no
 /// StructReturn (same carve-out as `lower_module`).
+// r[impl clif.lower.tailcc.except]
 fn is_tail_fn(
     triple: &target_lexicon::Triple,
     f: &crate::iropt::state::FuncInfo,
@@ -358,6 +363,7 @@ impl CtxSlot<'_> {
 /// sections beforehand — and a job sheds its facts but keeps the
 /// optimized CLIF the waffle translation reads. Only frees: the object
 /// bytes are unchanged (docs/determinism.md R3).
+// r[impl par.mem.lowerfree]
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
 }
@@ -369,6 +375,9 @@ pub fn fminmax_on() -> bool {
     crate::env_is("PLIRON_FMINMAX", "1")
 }
 
+// r[impl native.obj.writer]
+// r[impl native.obj.order]
+// r[impl native.obj.sections]
 pub fn lower_to_object(
     unwind: bool,
     hot: bool,
@@ -505,6 +514,7 @@ pub fn lower_to_object(
 /// A function's pliron→CLIF lower output plus everything the CLIF
 /// pipeline and cranelift compile need. Jobs are independent:
 /// phase (B) runs them on the shared worker pool.
+// r[impl clif.lower.facts]
 struct FnJob {
     name: String,
     id: FuncId,
@@ -757,6 +767,7 @@ impl FQueue {
     }
 }
 
+// r[impl par.pool.lower-threads]
 fn fn_pool() -> &'static FPool {
     static POOL: std::sync::OnceLock<&'static FPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -876,6 +887,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
             tracing::info!(target: "pliron::dump", "==== clif {n} ====\n{}", clctx.func.display())
         };
     }
+    // r[impl clif.verify]
     let mut verify_full = sh.verify_full_env;
     let snapshot = (sh.verify_env && !verify_full).then(|| clctx.func.clone());
     if pliron_cfg::tracing_on()
@@ -947,6 +959,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
             };
             // Debug bisection: same `PLIRON_PIPEFN[X]` filter as the
             // wasm path — the pipeline runs only on matching fns.
+            // r[impl clif.optfns]
             let run_pipe = crate::env_get("PLIRON_PIPEFN").is_none_or(|f| n.contains(&f))
                 && crate::env_get("PLIRON_PIPEFNX").is_none_or(|f| !n.contains(&f))
                 && pliron_cfg::fn_opt_selected(n);
@@ -1015,6 +1028,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     if sh.dbg {
         dbg_const_srclocs(&mut clctx.func);
     }
+    // r[impl clif.lower.vecretry]
     let mut vec_retry = 0;
     let defr = loop {
         let defr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1169,6 +1183,7 @@ fn start_jobs(nthreads: usize, produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJ
 
 /// Phase (B)'s rest: run (serial) or collect (pool) every job; returns them
 /// in declaration order.
+// r[impl clif.lower.phases]
 fn finish_jobs(p: Pending, name: &str) -> Vec<FnJob> {
     let tpb = std::time::Instant::now();
     let jobs = match p {
@@ -1237,6 +1252,7 @@ fn finish_jobs(p: Pending, name: &str) -> Vec<FnJob> {
 /// Declare and define every function and global of `ctx`'s module in `m`
 /// (an `ObjectModule`, a `JITModule`, ...).
 #[allow(clippy::too_many_arguments)]
+// r[impl native.obj.align]
 pub fn lower_module<'a>(
     m: &mut dyn Module,
     unwind: bool,
@@ -1418,6 +1434,7 @@ pub fn lower_module<'a>(
     // and phase (B)'s wall hides behind phase (A)'s serial walk. Serial
     // when `PLIRON_OPT_BISECT` is set (the bisect counter must number
     // pass applications deterministically) or `PLIRON_PAR` overrides.
+    // r[impl clif.lower.serial]
     let par = crate::env_get("PLIRON_PAR").and_then(|v| v.parse::<usize>().ok());
     let nthreads = if crate::config::bisect_limit().is_some() || par == Some(0) {
         1
@@ -1973,6 +1990,7 @@ pub fn lower_module<'a>(
         desc.define(bytes.into_boxed_slice());
         // LLVM places constants in 16-byte-capped mergeable/aligned sections;
         // crates that reinterpret `&[u8]` statics rely on that by accident.
+        // r[impl front.const.align]
         let mut align = g.align.max(1);
         if !g.mutable && g.section.is_none() {
             let pref = if size > 16 {
@@ -2773,6 +2791,7 @@ pub fn lower_clif_wasm(
 /// share a `#[link_section]`/`linkme` name must land in one section. The
 /// module already declared their symbols (undefined); define them here in a
 /// single section per name.
+// r[impl native.obj.macho-ordinals]
 fn emit_merged_custom_sections(
     obj: &mut object::write::Object<'_>,
     globals: Vec<(
@@ -3060,6 +3079,7 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
     }
 }
 
+// r[impl clif.lower.leaves]
 struct FnLower<'a, 'b> {
     ctx: &'a Context,
     st: &'a State,
@@ -3527,6 +3547,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// After a possibly-throwing call, `__pliron_eh.flag != 0` means a
     /// "throw" is in flight: branch to the `catch` funclet block for an
     /// invoke, or to the shared early-return block to keep propagating.
+    // r[impl native.win.emulated]
+    // r[impl wasm.eh.check]
     fn eh_check(&mut self, catch: Option<Ptr<BasicBlock>>) {
         let tls = self.eh_tls();
         let f = self.b.ins().load(clt::I32, MemFlagsData::new(), tls, 0);
@@ -3653,6 +3675,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// One `br_table` over `[min, max]` (holes go to `d`) when the cases are
     /// at least 10% dense (LLVM's `-O` jump-table density). Cranelift's
     /// `Switch` splits on every hole and binary-searches between the runs.
+    // r[impl clif.lower.switch]
     fn dense_switch(
         &mut self,
         x: ir::Value,
@@ -4273,6 +4296,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
+    // r[impl clif.lower.libcall]
     fn libcall(
         &mut self,
         name: &str,
@@ -6038,6 +6062,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     /// An `invoke`: `try_call` whose exception edge stores the exception
     /// pointer in `self.exn` and jumps to the landing block.
+    // r[impl native.eh.try-call]
+    // r[impl clif.lower.invoke]
     fn try_call(
         &mut self,
         target: Result<FuncRef, (ir::Value, ir::SigRef)>,
@@ -6113,6 +6139,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         (inst, rs)
     }
 
+    // r[impl native.win.throw]
     fn lower_call(&mut self, op: Ptr<Operation>) {
         let ctx = self.ctx;
         let call = Operation::get_op::<CallOp>(op, ctx).unwrap();
@@ -6176,6 +6203,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .is_some_and(|s| s.starts_with("__pliron_bb")),
                 _ => false,
             };
+        // r[impl clif.lower.blackbox]
         if bb {
             let mut rs = Vals::new();
             for &a in &cargs {
@@ -6423,6 +6451,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // {flag@0, exn@4} word the linker synthesizes (FL::call).
                 let tls = self.eh_tls();
                 let mf = MemFlagsData::new();
+                // r[impl wasm.eh.intrinsics]
                 if sym == "llvm.wasm.throw" || sym == "__pliron_llvm_wasm_throw" {
                     self.b.ins().store(mf, cargs[1], tls, 4);
                     self.eh_raise();

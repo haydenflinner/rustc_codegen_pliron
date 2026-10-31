@@ -48,6 +48,7 @@ unsafe extern "C" fn fmt(out: *mut c_char, len: usize, f: *const c_char, ap: ...
     unsafe { vsnprintf(out, len, f, ap) }
 }
 
+// r[verify front.abi.variadic]
 fn main() {
     unsafe {
         assert_eq!(none(2, 3), 32);

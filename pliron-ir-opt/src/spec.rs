@@ -22,6 +22,7 @@ use crate::has_body;
 use crate::inline::{blocks_iter, direct_callee};
 use crate::state::State;
 
+// r[impl iropt.spec]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::spec", tracing::Level::DEBUG);
@@ -141,6 +142,7 @@ mod tests {
     /// A `dead_unopt` body still emits its calls verbatim, so its callsites
     /// must veto specialization: specializing the callee on the surviving
     /// (live) callsites alone would change what the emitted call observes.
+    // r[verify iropt.spec]
     #[test]
     fn dead_body_callsite_vetoes_specialization() {
         let input = r#"
