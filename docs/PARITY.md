@@ -42,7 +42,74 @@ The CubeCL CPU-kernel path has its own card (`harness/cubecl_card.py`,
 ## Scoreboard
 
 <!-- SCOREBOARD:BEGIN -->
-(being re-measured 2026-10-30)
+**Last measured 2026-10-30**, aarch64-apple-darwin, backend `3c43d21`,
+nightly-2026-10-22, load 7–9 (SPD and CMP ±3–5%). Full run, per-input
+tables and the comparison with the previous card:
+[`history/2026-10-30-parity-card.md`](history/2026-10-30-parity-card.md).
+
+**Overall 95** (2026-10-27: 88).
+
+| SPD | CMP | MEM | SIZ | STK | COR |
+|---|---|---|---|---|---|
+| **106** | **112** | **68** | **64** | **92** | **100** |
+
+| category | weight | pliron/LLVM | rating | from |
+|---|---|---|---|---|
+| SPD runtime speed | 30 | 0.918 | 106 | native 0.917 · wasm 0.919 |
+| CMP compile time | 15 | 0.853 | 112 | 5 inputs |
+| MEM compile memory | 10 | 1.556 | 68 | peak RSS, 5 inputs |
+| SIZ code size | 10 | 1.655 | 64 | machine code, 5 inputs + wasm module 1.71 |
+| STK stack frames | 15 | 1.124 | 92 | regex-syntax, 327 shared fns |
+| COR correctness | 20 | 1.000 | 100 | ui: 0 stage-2-only vs 3 stage-1-only (3 d old) · crates: 0 pliron-only across 20 crates (0 h old) · fuzz: 0 of 200 seeds (0 h old) |
+
+Correctness inputs: crates tier 1 run in the default `--deps stock` mode
+(the crates' own code only); the UI input is the 2026-10-27 stage-2
+self-host run. x86-64 was last measured 2026-10-22.
+
+**Native kernels** (criterion, pliron vs an LLVM baseline taken minutes earlier):
+
+| kernel | LLVM | pliron | pliron/LLVM |
+|---|---|---|---|
+| arrayvec | 5.576 ms | 5.150 ms | 0.924 ◄ faster |
+| chars_alpha | 2.094 ms | 2.014 ms | 0.962 ◄ faster |
+| chars_ascii | 2.185 ms | 1.301 ms | 0.595 ◄ faster |
+| chars_mixed | 15.527 ms | 15.371 ms | 0.990 |
+| contains_rng | 2.189 ms | 1.720 ms | 0.786 ◄ faster |
+| eqbug | 0.112 ms | 0.122 ms | 1.089 ▲ slower |
+| fib | 14.395 ms | 13.072 ms | 0.908 ◄ faster |
+| hashmap | 71.040 ms | 64.149 ms | 0.903 ◄ faster |
+| hmget | 14.369 ms | 12.822 ms | 0.892 ◄ faster |
+| iterw | 19.584 ms | 13.856 ms | 0.708 ◄ faster |
+| matmul | 8.495 ms | 8.529 ms | 1.004 |
+| nbody | 113.523 ms | 90.536 ms | 0.798 ◄ faster |
+| parse_only | 367.568 ms | 391.640 ms | 1.065 ▲ slower |
+| sieve | 12.320 ms | 11.887 ms | 0.965 ◄ faster |
+| sortw | 6.841 ms | 6.368 ms | 0.931 ◄ faster |
+| strwork | 13.876 ms | 13.951 ms | 1.005 |
+| tokenize | 5.913 ms | 7.264 ms | 1.229 ▲ slower |
+| varint | 6.372 ms | 6.448 ms | 1.012 |
+| varint_postcard | 5.920 ms | 5.187 ms | 0.876 ◄ faster |
+
+**wasm kernels** (node, interleaved rounds):
+
+| kernel | LLVM | pliron | pliron/LLVM |
+|---|---|---|---|
+| chars_alpha | 4.635 ms | 4.008 ms | 0.866 ◄ faster |
+| chars_ascii | 2.319 ms | 2.316 ms | 0.999 |
+| chars_mixed | 18.381 ms | 18.227 ms | 0.993 |
+| contains_rng | 4.924 ms | 3.939 ms | 0.804 ◄ faster |
+| eqbug | 0.136 ms | 0.119 ms | 0.877 ◄ faster |
+| fib | 9.352 ms | 8.862 ms | 0.940 ◄ faster |
+| hashmap | 66.195 ms | 70.189 ms | 1.061 ▲ slower |
+| hmget | 11.473 ms | 11.509 ms | 1.003 |
+| iterw | 66.800 ms | 53.491 ms | 0.802 ◄ faster |
+| matmul | 30.773 ms | 21.701 ms | 0.705 ◄ faster |
+| nbody | 84.100 ms | 87.151 ms | 1.036 ▲ slower |
+| parse_only | 380.972 ms | 389.002 ms | 1.021 |
+| sieve | 13.941 ms | 14.024 ms | 1.006 |
+| sortw | 6.042 ms | 5.630 ms | 0.930 ◄ faster |
+| strwork | 17.729 ms | 19.087 ms | 1.078 ▲ slower |
+| tokenize | 7.674 ms | 5.495 ms | 0.714 ◄ faster |
 <!-- SCOREBOARD:END -->
 
 ## Known gaps by axis
@@ -242,7 +309,8 @@ Ranked by expected card gain per effort. Each item links its evidence.
 
 ## History
 
-- Scoreboards and card snapshots: `history/2026-10-22-parity-scoreboard.md`
+- Scoreboards and card snapshots: `history/2026-10-30-parity-card.md`
+  (the current scoreboard's full run), `history/2026-10-22-parity-scoreboard.md`
   (2026-10-18 to 10-22, incl. Windows i7), `history/2026-10-27-parity-card.md`
   (first full cards), `history/2026-10-28-parity-card-snapshot.md`.
 - Former PARITY sections: `history/2026-10-20-compile-time-worklist.md`,
