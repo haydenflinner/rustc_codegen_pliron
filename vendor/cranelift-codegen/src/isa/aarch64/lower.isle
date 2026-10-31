@@ -3536,6 +3536,57 @@
             (multi_reg_to_pair_and_single result)))
 )
 
+;; PLIRON: the unsigned-carry idiom `x + (a + b <u a ? 1 : 0)` (`b` may
+;; stand for `a` too; the flag as a 1/0 `select` or a `uextend`) is
+;; `cmn a, b; cinc x, hs` -- LLVM's `adds`/`cinc` -- instead of
+;; `add; cmp; cset; add`. The sum itself is lowered by its own `iadd` for
+;; its other uses. In a multi-word add the carry is loop-carried
+;; (num-bigint-dig's `add_mul_vvw`): the chain drops from four dependent
+;; instructions to two. `PLIRON_CARRYCINC=0` disables.
+(decl cmn (OperandSize Reg Reg) ProducesFlags)
+(rule (cmn size src1 src2)
+      (ProducesFlags.ProducesFlagsSideEffect
+       (MInst.AluRRR (ALUOp.AddS) size (writable_zero_reg) src1 src2)))
+(decl pure carry_cinc_on () bool)
+(extern constructor carry_cinc_on carry_cinc_on)
+(decl carry_cinc (Type Value Value Value) InstOutput)
+(rule (carry_cinc ty x a b)
+      (let ((rx Reg (put_in_reg x)))
+        (output_reg (with_flags_reg (cmn (operand_size ty) (put_in_reg a) (put_in_reg b))
+                                    (csinc (Cond.Lo) rx rx)))))
+(rule iadd_carry_sel_a 77 (lower (iadd (ty_32_or_64 ty) x
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a) (u64_from_iconst 1) (u64_from_iconst 0))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_sel_b 76 (lower (iadd (ty_32_or_64 ty) x
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b) (u64_from_iconst 1) (u64_from_iconst 0))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_sel_a_l 75 (lower (iadd (ty_32_or_64 ty)
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a) (u64_from_iconst 1) (u64_from_iconst 0)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_sel_b_l 74 (lower (iadd (ty_32_or_64 ty)
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b) (u64_from_iconst 1) (u64_from_iconst 0)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_a 73 (lower (iadd (ty_32_or_64 ty) x
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_b 72 (lower (iadd (ty_32_or_64 ty) x
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_a_l 71 (lower (iadd (ty_32_or_64 ty)
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_b_l 70 (lower (iadd (ty_32_or_64 ty)
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+
 ;;;; Rules for `uadd_overflow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; For values smaller than a register, we do a normal `add` with both arguments

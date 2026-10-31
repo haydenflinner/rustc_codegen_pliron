@@ -930,3 +930,14 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     (docs/history/2026-10-31-tune-heldout.md). Test:
     `pliron-clif-opt/tests/rorfold_multi_use.rs` (the multi-use case fails
     with the old rule).
+
+72. aarch64 unsigned-carry idiom (`src/isa/aarch64/lower.isle`
+    `iadd_carry_*`, `carry_cinc_on` in `src/isa/aarch64/lower/isle.rs`;
+    `PLIRON_CARRYCINC=0` disables): `iadd x, (select (icmp ult (iadd a b), a|b), 1, 0)`
+    and the `uextend` form lower to `cmn a, b; cinc x, hs` (LLVM's
+    `adds`/`cinc`) instead of `add; cmp; cset; add`. The sum keeps its own
+    `add` for other uses. In a multi-word add the carry is loop-carried, so
+    the chain drops from four dependent instructions to two:
+    num-bigint-dig's Montgomery loop, blind-sig 0.88 s -> 0.67 s (LLVM
+    0.54 s). Test: `pliron-clif-opt/tests/carry_cinc.rs` (fails with the
+    rule off).

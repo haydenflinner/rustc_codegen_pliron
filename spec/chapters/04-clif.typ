@@ -249,7 +249,7 @@ only the consumer of the optimized CLIF differs.
     `brchain`, `splink`, `taildup2`, `cmp3`, `mergechain`, `selchain`,
     `jtround`, `slotmerge`, `memcall`, `csweep2`, `lcse3`.
   + *Late parameter webs and cleanup*: `sameargs2`, `paramsink`,
-    `postinc2`, `ivalign2`, `ivretro`, `nfold`, `selargs`, `seltest`,
+    `postinc2`, `ivalign2`, `ivretro`, `ivcmp`, `nfold`, `selargs`, `seltest`,
     `rgmerge`, `sameargs3`, `deadp`, `webmerge`, `rangefold`, `ovkill2`,
     `sgntest`, `memspec`, `lcse4`, `dse3`, `taildup3`, `webmerge2`, `cicm`,
     `armmerge`, `constdedup2`, `edgesink`, `reassoc`, `mulcarry`, `dem64`,
@@ -640,10 +640,11 @@ only the consumer of the optimized CLIF differs.
 
 #r("clif.vendor.isel", title: "Instruction-selection additions", level: "should",
    tier: 2, refines: "model.parity",
-   checked: ("pliron-clif-opt/tests/widevec_gate.rs", "pliron-clif-opt/tests/aarch64_f16_cvt_encoding.rs", "test.sh pairfuse"))[
+   checked: ("pliron-clif-opt/tests/widevec_gate.rs", "pliron-clif-opt/tests/aarch64_f16_cvt_encoding.rs", "pliron-clif-opt/tests/rorfold_multi_use.rs", "pliron-clif-opt/tests/carry_cinc.rs", "test.sh pairfuse"))[
   The vendored Cranelift SHOULD lower the shapes our passes emit to the
   instructions LLVM uses for them: on aarch64, `udot`, `mla`/`mls`,
-  `smlal`/`umlal`, widening adds, shifted-operand logic and adds,
+  `smlal`/`umlal`, widening adds, shifted-operand logic and adds (a
+  rotate only when it has one use), `adds`/`cinc` for an unsigned carry,
   `ext`/`rev64` lane permutes and `ldp`/`stp` pair fusion at emission; on
   x64, `psadbw`, wide (256/512-bit) vector operations, VSIB gathers and
   scatters, and memory-operand compares. A vector type wider than the

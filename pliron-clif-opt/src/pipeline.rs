@@ -3594,6 +3594,19 @@ fn s_zipiv(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_ivcmp(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let CfgDtLa { dt, la, .. } = an.cfg_dt_la(&p.clctx.func);
+    let k = crate::ivcmp::run(&mut p.clctx.func, dt, la);
+    if k > 0 {
+        // New insts: drop the cached use lists (the CFG is unchanged).
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("ivcmp");
+        }
+    }
+    k
+}
+
 fn s_loopdel(p: &mut Pipe, an: &mut Analysis) -> usize {
     loopdel::run(&mut p.clctx.func, an)
 }
@@ -4109,6 +4122,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_ivretro,
         )
         .needs(shape::LOOPS),
+        // `p + d == e` exit tests with `d`, `e` invariant: `p == e - d`.
+        // After ivretro, which rewrites a second IV as `p + d`.
+        step("ivcmp", "ivcmp", Gate::OptIn("PLIRON_IVCMP"), s_ivcmp).needs(shape::LOOPS),
         // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
         // — are phase-D relational merges; the later sameargs3/webmerge
         // positions cover anything this extra call found.)

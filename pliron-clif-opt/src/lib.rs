@@ -66,5 +66,6 @@ pub mod veclegalize;
 pub mod vmap;
 pub mod webroot;
 pub mod zipiv;
+pub mod ivcmp;
 
 pub use config::{bisect, env_get, env_is, env_set, pass_enabled};

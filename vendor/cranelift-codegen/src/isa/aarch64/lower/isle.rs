@@ -986,6 +986,12 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             && self.lower_ctx.amode_shareable(val)
     }
 
+    /// PLIRON: `PLIRON_CARRYCINC` (default on), see `lower.isle`.
+    fn carry_cinc_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_CARRYCINC").as_deref() != Ok("0"))
+    }
+
     /// PLIRON: may a constant rotate be folded into a logic op's shifted
     /// operand? Only when it has a single use (see `rot_fold_ok` in
     /// `lower.isle`); `PLIRON_RORFOLD_MULTI=1` folds multi-use rotates too.
