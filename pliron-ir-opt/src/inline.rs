@@ -2727,6 +2727,11 @@ fn nonnull_args(
     for &i in &f.nonnull {
         let Some((a, off)) = crate::state::leaf_arg(ctx, entry, i) else { continue };
         let Some(k) = eargs.iter().position(|&e| e == a) else { continue };
+        // `nonnull` only describes pointers: a non-pointer leaf here means
+        // the ABI leaf index and the IR param layout disagree.
+        if !crate::types::leaf_is_ptr(ctx, a.get_type(ctx)).get(off).copied().unwrap_or(false) {
+            continue;
+        }
         if off < 64 {
             marks.push((call_args[k], 1 << off));
         }
@@ -3413,7 +3418,12 @@ fn inline_call(
         if let Some(m) = st.funcs.get(cs).map(|f| f.ret_nonnull).filter(|&m| m != 0)
             && pliron_cfg::env_is("PLIRON_RETNN", "1")
         {
-            st.nnargs.insert(arg, m);
+            // Only pointer leaves (a mismatch means the ABI and IR disagree).
+            let ptrs = crate::types::leaf_is_ptr(ctx, ty);
+            let m = (0..ptrs.len().min(64)).filter(|&k| ptrs[k] && m & (1 << k) != 0).fold(0u64, |a, k| a | 1 << k);
+            if m != 0 {
+                st.nnargs.insert(arg, m);
+            }
         }
     }
     // Create the branch to the clone before `frozen_args` so its

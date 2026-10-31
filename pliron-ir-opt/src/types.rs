@@ -211,6 +211,38 @@ fn leaves_into(ctx: &Context, ty: TypeHandle, base: u64, out: &mut Vec<(u64, ClT
     }
 }
 
+/// Whether each of `leaves(ctx, ty)` is a pointer, in the same order.
+pub fn leaf_is_ptr(ctx: &Context, ty: TypeHandle) -> Vec<bool> {
+    fn go(ctx: &Context, ty: TypeHandle, out: &mut Vec<bool>) {
+        match classify(ctx, ty) {
+            TyK::Ptr => out.push(true),
+            TyK::Int(_) | TyK::F16 | TyK::F32 | TyK::F64 | TyK::F128 => out.push(false),
+            TyK::Void | TyK::Func(..) | TyK::Other => {}
+            TyK::Array(e, n) => {
+                for _ in 0..n {
+                    go(ctx, e, out);
+                }
+            }
+            TyK::Vector(e, n) => {
+                if let Some((_, k)) = vec_parts(ctx, e, n as u64) {
+                    return out.extend((0..k).map(|_| false));
+                }
+                for _ in 0..n as u64 {
+                    go(ctx, e, out);
+                }
+            }
+            TyK::Struct(fs, _) => {
+                for f in fs.iter() {
+                    go(ctx, *f, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(ctx, ty, &mut out);
+    out
+}
+
 /// 64/128-bit int/float vectors are one native Cranelift SIMD leaf; other
 /// vectors are flattened lane-wise. `PLIRON_SIMD=0` flattens everything.
 /// (64-bit matters for hashbrown's `Group<u64>`: `cmeq.8b` + `fmov x, d`.)
