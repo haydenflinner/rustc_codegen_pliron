@@ -281,19 +281,59 @@ What the census (`bench/heldout/census.py`, W0) showed, and what was done:
 - Two old miscompiles surfaced in a new fuzz window (seeds 16782,
   16787); they predate this work.
 
-## Sequencing
+## Sequencing (revised 2026-10-31, after the census)
 
-| phase | contents | target (held-out native, aarch64) |
-|---|---|---|
-| 0 (now, days) | W0 census, more held-out programs, x86-64 and wasm numbers | baseline per cause |
-| 1 (weeks) | W6 idiom mining, W5 placement, W1 facts | 1.31 -> ~1.15 |
-| 2 (1-2 months) | W2 SCEV/LFTR/LSR, W3 ranges; retire subsumed passes | ~1.05 |
-| 3 (1-2 months) | W4 regalloc remat/splitting, W7 inlining | ~1.0 |
-| 4 | W8 scheduling, W9 memory, W10 vectors | below 1.0 on the check set |
+The census reordered the plan: register allocation (W4) and the fact
+infrastructure (W1) come first, ahead of new idioms.
 
-Targets are guesses to check against the census; revise after phase 0.
-Compile time is the constraint: CMP is 0.85x LLVM today, and frameworks
-cost time. Each phase should leave the step count lower than it found it.
+LLVM and GCC both run mostly fixed pipelines (`passes.def`,
+`buildPerModuleDefaultPipeline`); what they do differently is the
+contract between passes. Analyses (SCEV, ranges, alias, MemorySSA)
+are queried, cached and invalidated, not recorded in side maps every
+pass must carry by hand; passes assume canonical forms (LoopSimplify,
+LCSSA) instead of matching around variants; large transforms scan,
+plan against a cost model, then rewrite (SROA slices, LSR formulae,
+VPlan). Our failures today were all contract failures: indvars dropped
+the `derived` facts jumpthread needed; licm hoists every constant on a
+rematerialization bet regalloc2 did not take; constdedup2 undid the
+egraph's constant placement.
+
+**Phase 1, parity (1.27 -> ~1.0):**
+
+1. **Register allocation (W4).** Hot functions carry 5-40x LLVM's stack
+   traffic, mostly spills (pulldown's `parse_block`: 22% of its
+   instructions touch the stack). Done: call-arg detach, rematerialized
+   reloads, dead remat-slot stores. Next: split live ranges around calls
+   (a value crossing a call goes to a callee-saved register or to memory
+   *around the call*, not for its whole range), loop-aware splitting
+   (no reload inside a loop for a value untouched in it), profile and
+   block-frequency weights. If regalloc2's bundle model resists, a
+   greedy allocator in LLVM's style is the fallback.
+2. **Facts as a service (W1).** One API for nonnull / derived (inbounds
+   offset of) / range / bool facts, queried by passes and preserved by
+   construction: every value replacement or clone goes through one hook
+   that carries facts, instead of each pass calling `prop_derived` when
+   it remembers. Then the losses get found by a checker, not by
+   benchmarks: a debug mode that recomputes what it can and reports facts
+   a pass dropped.
+3. **Canonical loops and one licm with a pressure model.** LoopSimplify
+   form maintained (`invparam` is the first piece); constants stay at
+   their uses for the allocator to rematerialize.
+4. **Pure rewrites into the egraph.** `clifpeep` rules that are pure
+   value rewrites become ISLE rules, so they compose instead of being
+   ordered; nothing after the egraph may undo its placement.
+5. **Inlining (W7)** per the census' LLVM-heavy rows (regex
+   `follow_epsilons`: LLVM 227 insts vs our 1064 after different
+   inlining).
+
+**Phase 2, past LLVM:** facts LLVM loses (borrow-checked noalias, slice
+`len <= isize::MAX` and in-bounds offsets, iterator niche facts, cold
+panics, discriminant ranges), Apple M-series tuning (alignment moved
+chars_ascii 1.77x; fusion pairs; NEON idioms), PGO-directed effort on
+hot functions, specialization from knowing every monomorphized instance.
+
+Each phase should leave the step count lower than it found it. Compile
+time stays the constraint (CMP 0.85x LLVM today).
 
 ## Not doing
 
