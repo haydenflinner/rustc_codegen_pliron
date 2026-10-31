@@ -219,3 +219,31 @@ What changed, each A/B'd on the held-out suite (interleaved variants):
   else; that is the facts-service work's first open question.
 - A pre-existing O0 miscompile surfaced in fuzz window 18800-19199 (seed
   18889; reproduces at this morning's commit).
+
+## Evening: niche folds, a threading miscompile, facts through inlining
+
+- **Second-level `Option` niche folds** (`PLIRON_NULLSRC=1`, opt-in):
+  `fold_null_tests` looks through `select (a != 0), a, 0` and single-edge
+  params. Removes zip/enumerate per-element null tests, but in two A/Bs
+  regex lost ~5% and compression gained ~4% (geomean 1.222 on vs 1.213
+  off), so it stays off.
+- **Jump-threading miscompile** (found by crates: indexmap `drain_range`,
+  exposed by that fold): a loop back edge threaded past a merge block
+  kept that block's own params, which the threaded path no longer
+  rebinds. Fixed in `jumpthread::round` (docs/history/2026-10-31-jt-backedge-stale.md).
+- **`bytescan`** (opt-in): 16-byte NEON scans for byte-set loops over
+  constant tables, with table bytes from rustc's evaluation of imported
+  statics and an aarch64 `shrn` movemask (patch 89). pulldown -2.2%.
+- **Facts through inlining** (opt-in, all needed together):
+  `PLIRON_RETNN` (rustc's `nonnull` return attributes), `PLIRON_INLINENN`
+  (an inlined callee's `nonnull` params on the caller's operands, scoped
+  to the clone's region, with null folds before `merge_chains`),
+  `PLIRON_BRIFSEL` (`brif c` args `select c, a, b` per edge),
+  `PLIRON_IVPTR` (index-rebuilt pointers back to `p + s`),
+  `PLIRON_EDGESINK_LOADS` (exit-only loads onto the exit edge).
+  montgomery's zip loop goes from two exit tests and pointer
+  recomputation to LLVM's 13-instruction post-increment shape. blind-sig
+  went 1.69 -> 1.33 under the facts, but is not yet below the default
+  1.27 (docs/codegen-plan.md). A first, pinned-param INLINENN design
+  miscompiled regex and html-rewriter in the A/B; the region-scoped
+  design replaced it, and pointer-only leaf marking was added.
