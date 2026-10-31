@@ -25,7 +25,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{
-    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Value, ValueDef,
+    Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
 use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -56,18 +56,48 @@ fn use_counts(func: &Function) -> FxHashMap<Value, u32> {
 }
 
 /// `v`'s defining inst if it lives in `b`, is pure, and has a single
-/// result.
+/// result. With `PLIRON_EDGESINK_LOADS=1`, also a non-trapping load
+/// with nothing that may write memory between it and `b`'s terminator:
+/// on the edge, memory is what it was at the load (a loop's length
+/// reload used only by its exit edge, num-bigint-dig's montgomery).
 fn sinkable_def(func: &Function, b: Block, v: Value) -> Option<Inst> {
     match func.dfg.value_def(v) {
         ValueDef::Result(d, _)
             if func.layout.inst_block(d) == Some(b)
                 && func.dfg.inst_results(d).len() == 1
-                && pure_op(func, d) =>
+                && (pure_op(func, d) || quiet_load(func, d)) =>
         {
             Some(d)
         }
         _ => None,
     }
+}
+
+/// A `notrap` load followed in its block only by instructions that
+/// neither write memory nor have other side effects.
+fn quiet_load(func: &Function, d: Inst) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_EDGESINK_LOADS", "1"));
+    if !*ON {
+        return false;
+    }
+    let InstructionData::Load { opcode, flags, .. } = func.dfg.insts[d] else {
+        return false;
+    };
+    if !matches!(opcode, Opcode::Load | Opcode::Uload8 | Opcode::Sload8 | Opcode::Uload16 | Opcode::Sload16 | Opcode::Uload32 | Opcode::Sload32)
+        // Volatile accesses are lowered without `notrap`.
+        || !func.dfg.mem_flags[flags].notrap()
+    {
+        return false;
+    }
+    let mut cur = func.layout.next_inst(d);
+    while let Some(i) = cur {
+        let op = func.dfg.insts[i].opcode();
+        if !op.is_terminator() && (op.can_store() || op.is_call() || op.other_side_effects() || op.can_trap()) {
+            return false;
+        }
+        cur = func.layout.next_inst(i);
+    }
+    true
 }
 
 /// The set of `b`-insts movable onto edge `edge` of terminator `t`,
