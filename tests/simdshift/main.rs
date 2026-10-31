@@ -40,12 +40,48 @@ fn movemask(v: u8x16) -> u64 {
     u64::from_le_bytes(n.to_array())
 }
 
+/// 64-bit vectors: Cranelift's aarch64 backend shifts only 128-bit ones,
+/// so these go lane by lane (zmij's `u32x2 >> 9` was rejected outright).
+#[inline(never)]
+fn narrow(p: u32x2, q: i16x4, r: u8x8) -> u64 {
+    let a = p >> u32x2::splat(9);
+    let b = q >> i16x4::splat(3);
+    let c = r << u8x8::splat(2);
+    let d: u16x2 = p.cast();
+    let mut h = (a[0] as u64) << 32 | a[1] as u64;
+    for l in b.to_array() {
+        h = h.rotate_left(11) ^ l as u16 as u64;
+    }
+    h ^= u64::from_le_bytes(c.to_array()).rotate_left(3);
+    h ^ ((d[0] as u64) << 16 | d[1] as u64)
+}
+
+/// The NEON-intrinsic form: `vshr_n_u32` is `simd_shr(a, vdup_n_u32(N))`,
+/// a splat lowering only sees after inlining (zmij's float formatting).
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn neon(p: u32x2) -> u32x2 {
+    use std::arch::aarch64::*;
+    unsafe { std::mem::transmute(vshr_n_u32::<9>(std::mem::transmute(p))) }
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(never)]
+fn neon(p: u32x2) -> u32x2 {
+    p >> u32x2::splat(9)
+}
+
 fn main() {
     let x = black_box(u16x8::from_array([0xffff, 0x1234, 0x8001, 7, 0x00ff, 0xff00, 0x7fff, 0x8000]));
     let y = black_box(i16x8::from_array([-1, -32768, 32767, -100, 100, 0, -2, 1]));
     let k = black_box(u16x8::from_array([0, 1, 2, 3, 15, 8, 4, 12]));
     let z = black_box(u32x4::from_array([0xffff_ffff, 0x1234_5678, 0x8000_0000, 99]));
     println!("{:016x}", shifts(x, y, k, z));
+    let p = black_box(u32x2::from_array([0xdead_beef, 0x0000_ffff]));
+    let q = black_box(i16x4::from_array([-32768, -9, 77, 32767]));
+    let r = black_box(u8x8::from_array([0xff, 0x81, 1, 0x40, 0x3f, 0, 0x80, 7]));
+    println!("{:016x}", narrow(p, q, r));
+    let n = neon(p);
+    println!("{:08x}{:08x}", n[0], n[1]);
     let mut s = [b'a'; 16];
     s[3] = b'"';
     s[12] = b'"';

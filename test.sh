@@ -816,10 +816,13 @@ t_simdshift() {
   # Native vector shifts (splat and per-lane amounts) and narrowing casts
   # must match stock; on aarch64 memchr's movemask must stay in vector
   # registers (ushr.8h + sqxtun), not go lane by lane.
+  # 64-bit vectors (and NEON's `vshr_n_u32`) must not reach Cranelift as
+  # vector shifts: its aarch64 backend rejects them (zmij ICEd five crates).
+  local want=$'3fe0259ce64e21d9\ne00617d9b4226fe0\n006f56df0000007f'
   rustc $BE --edition 2021 -O tests/simdshift/main.rs -o $out/simdshift$exe &&
-      [[ "$($out/simdshift$exe)" == 3fe0259ce64e21d9 ]] &&
+      [[ "$($out/simdshift$exe | tr -d '\r')" == "$want" ]] &&
   rustc $BE --edition 2021 tests/simdshift/main.rs -o $out/simdshift0$exe &&
-      [[ "$($out/simdshift0$exe)" == 3fe0259ce64e21d9 ]] || return 1
+      [[ "$($out/simdshift0$exe | tr -d '\r')" == "$want" ]] || return 1
   if [[ -x "$llvmod" && "$(uname -m)" == arm64 ]]; then
     rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/simdshift/main.rs -o $out/simdshift.o
     "$llvmod" -d --no-show-raw-insn $out/simdshift.o > $out/simdshift.dis

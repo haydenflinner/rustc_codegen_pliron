@@ -3851,7 +3851,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             },
         };
         let r: Vals = match splat {
-            Some(k) => x.iter().map(|&v| ins(&mut self.b, v, k)).collect(),
+            Some(k) => x.iter().map(|&v| vshift(&mut self.b, kind, v, k)).collect(),
             None => {
                 let y = self.get(opnds[1]);
                 x.iter()
@@ -6056,9 +6056,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 pliron_clif_opt::vecsel::vcmp(&mut self.b, p, k, a[0], a[1], rt)
             }
             // Vector shifted by one scalar amount (`src/simd.rs` splats).
-            "pliron.vshl" => self.b.ins().ishl(a[0], a[1]),
-            "pliron.vshr.u" => self.b.ins().ushr(a[0], a[1]),
-            "pliron.vshr.s" => self.b.ins().sshr(a[0], a[1]),
+            "pliron.vshl" => vshift(&mut self.b, 0, a[0], a[1]),
+            "pliron.vshr.u" => vshift(&mut self.b, 1, a[0], a[1]),
+            "pliron.vshr.s" => vshift(&mut self.b, 2, a[0], a[1]),
             // Truncate each lane to half width: mask to the low half (so
             // the saturating `unarrow` is exact), narrow into a 128-bit
             // vector, keep its low 64 bits (`rt` is a 64-bit vector).
@@ -8011,4 +8011,26 @@ fn magicu128(d: u128) -> (u128, u32, bool) {
         }
     }
     (q2.wrapping_add(1), p - 128 - u32::from(add), add)
+}
+
+/// A vector shifted by one scalar amount `k` (`kind`: 0 shl, 1 ushr, 2
+/// sshr). Cranelift's aarch64 backend shifts only 128-bit vectors (zmij's
+/// `ushr.i32x2` was rejected); narrower ones go lane by lane.
+fn vshift(b: &mut FunctionBuilder, kind: u8, x: ir::Value, k: ir::Value) -> ir::Value {
+    let ins = |b: &mut FunctionBuilder, x: ir::Value, k: ir::Value| match kind {
+        0 => b.ins().ishl(x, k),
+        1 => b.ins().ushr(x, k),
+        _ => b.ins().sshr(x, k),
+    };
+    let t = b.func.dfg.value_type(x);
+    if t.bits() == 128 {
+        return ins(b, x, k);
+    }
+    let mut acc = x;
+    for l in 0..t.lane_count() as u8 {
+        let e = b.ins().extractlane(x, l);
+        let s = ins(b, e, k);
+        acc = b.ins().insertlane(acc, s, l);
+    }
+    acc
 }

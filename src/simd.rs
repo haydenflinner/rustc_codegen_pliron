@@ -1196,7 +1196,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     && self.native(ret)
                 {
                     let (fw, tw) = (self.elem_bits(self.element_type(src)), self.elem_bits(et));
-                    if (fw == 16 || fw == 32) && tw * 2 == fw {
+                    // The lowering narrows a 128-bit vector to a 64-bit one.
+                    let full = matches!(self.cx.kind(src), crate::types::TyK::Vector(_, n) if n as u32 * fw == 128);
+                    if full && (fw == 16 || fw == 32) && tw * 2 == fw {
                         return Some(self.intrinsic("pliron.vtrunc", ret, &[a(0)]));
                     }
                 }
