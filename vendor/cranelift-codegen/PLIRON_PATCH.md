@@ -960,3 +960,26 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     line, and the function asks for 64-byte alignment so the offset is
     absolute. The kernel A/B saw chars_ascii at 1.77x with byte-identical
     code whose 36-byte loop crossed a 64-byte boundary.
+
+75. Call arguments detached from the ABI's fixed registers
+    (`src/machinst/lower.rs` `arg_detach`; `PLIRON_ARGCOPY=0` disables):
+    the call-side twin of `ret_detach`. An argument whose value has other
+    uses (or is a block param) is copied into a fresh vreg before the call.
+    Otherwise regalloc2 merges the value into a bundle whose requirement
+    is the argument register everywhere (`compute_requirement` ->
+    `FixedReg`); every call clobbers it, so the bundle splits into minimal
+    pieces with the gaps on the stack. serde_json's `serialize_str` stored
+    and reloaded its string base every byte of the escape loop because the
+    base was also `memcpy`'s `x1`; 64 -> 42 stack accesses in the function.
+    LLVM gets this from a `COPY` to the physical register at the call.
+
+76. Rematerialization at reloads (`src/machinst/vcode.rs` `remat_def`,
+    `MachInst::rematerialize`; aarch64 `MovWide`, `LoadExtNameNear`,
+    `LoadExtNameGot`; `PLIRON_REMAT=0` disables): a reload of a vreg whose
+    definition is a single register-free instruction (a constant or a
+    symbol address) re-executes that definition into the target register
+    instead of loading the spill slot. Needs the destination vreg of each
+    edit (vendored regalloc2 `Output::edit_vregs`). serde_json's escape
+    table address was reloaded from the stack every byte; with 75 the loop
+    has no stack traffic (42 -> 32 in the function). Test for 75 and 76:
+    `pliron-clif-opt/tests/ra_callarg_remat.rs` (fails with either off).

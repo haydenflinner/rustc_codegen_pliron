@@ -883,6 +883,34 @@ impl<I: VCodeInst> VCode<I> {
         // Inst indices replaced by a zero-size nop via pair fusion;
         // `applied` tracks insts whose regalloc results were already
         // written back by lookahead.
+        // PLIRON: vreg -> its defining inst, for single-def insts that can
+        // be re-executed at a reload (`MachInst::rematerialize`): constants
+        // and symbol addresses. A spilled one is rematerialized where
+        // regalloc2 would load it (cheaper on the address/dep chain than a
+        // load, and it frees the hoisting decisions from spill risk).
+        // `PLIRON_REMAT=0` disables.
+        static REMAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let remat_def: Option<crate::FxHashMap<usize, usize>> =
+            if *REMAT.get_or_init(|| std::env::var("PLIRON_REMAT").as_deref() != Ok("0"))
+                && !regalloc.edit_vregs.is_empty()
+            {
+                let mut m = crate::FxHashMap::default();
+                let probe = Writable::from_reg(Reg::from(regalloc2::PReg::new(0, regalloc2::RegClass::Int)));
+                for (i, inst) in self.insts.iter().enumerate() {
+                    if inst.rematerialize(probe).is_none() {
+                        continue;
+                    }
+                    let ops = &self.operands[self.operand_ranges.get(i)];
+                    if let [op] = ops
+                        && op.kind() == regalloc2::OperandKind::Def
+                    {
+                        m.insert(op.vreg().vreg(), i);
+                    }
+                }
+                Some(m)
+            } else {
+                None
+            };
         let mut squashed = vec![false; self.insts.len()];
         let mut applied = vec![false; self.insts.len()];
 
@@ -1771,7 +1799,7 @@ impl<I: VCodeInst> VCode<I> {
                         }
                     }
 
-                    InstOrEdit::Edit(Edit::Move { from, to }) => {
+                    InstOrEdit::Edit(edit @ Edit::Move { from, to }) => {
                         // Create a move/spill/reload instruction and
                         // immediately emit it.
                         match (from.as_reg(), to.as_reg()) {
@@ -1795,8 +1823,25 @@ impl<I: VCodeInst> VCode<I> {
                                 // Load from spillslot to register.
                                 let from = from.as_stack().unwrap();
                                 let to_rreg = Writable::from_reg(RealReg::from(to));
-                                let reload = self.abi.gen_reload(to_rreg, from);
-                                do_emit(&reload, &mut disasm, &mut buffer, &mut state);
+                                // PLIRON: a reload of a constant or symbol
+                                // address re-executes its definition
+                                // instead (see `remat_def`).
+                                let remat = remat_def.as_ref().and_then(|m| {
+                                    let base = regalloc.edits.as_ptr() as usize;
+                                    let at = (edit as *const Edit) as usize;
+                                    let sz = core::mem::size_of::<(regalloc2::ProgPoint, Edit)>();
+                                    let off = core::mem::offset_of!((regalloc2::ProgPoint, Edit), 1);
+                                    let ei = (at - base - off) / sz;
+                                    let v = regalloc.edit_vregs.get(ei).copied().flatten()?;
+                                    let &di = m.get(&v.vreg())?;
+                                    self.insts[di].rematerialize(Writable::from_reg(Reg::from(to)))
+                                });
+                                if let Some(r) = remat {
+                                    do_emit(&r, &mut disasm, &mut buffer, &mut state);
+                                } else {
+                                    let reload = self.abi.gen_reload(to_rreg, from);
+                                    do_emit(&reload, &mut disasm, &mut buffer, &mut state);
+                                }
                             }
                             (None, None) => {
                                 panic!("regalloc2 should have eliminated stack-to-stack moves!");

@@ -1583,6 +1583,11 @@ pub struct Output {
     /// program point.
     pub edits: Vec<(ProgPoint, Edit)>,
 
+    /// PLIRON: for each entry of `edits`, the vreg its destination holds,
+    /// when the allocator knows it (moves the parallel-move resolver adds
+    /// through a scratch location have none). Empty from the fast allocator.
+    pub edit_vregs: Vec<Option<VReg>>,
+
     /// Allocations for each operand. Mapping from instruction to
     /// allocations provided by `inst_alloc_offsets` below.
     pub allocs: Vec<Allocation>,

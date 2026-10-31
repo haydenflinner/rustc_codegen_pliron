@@ -998,7 +998,7 @@ impl<'a, F: Function> Env<'a, F> {
                     trace!("  resolved: {} -> {} ({:?})", src, dst, to_vreg);
                     let action = redundant_moves.process_move(src, dst, to_vreg);
                     if !action.elide {
-                        edits.add(pos_prio, src, dst);
+                        edits.add_for(pos_prio, src, dst, to_vreg);
                     } else {
                         trace!("    -> redundant move elided");
                     }

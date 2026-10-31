@@ -1242,6 +1242,17 @@ impl MachInst for Inst {
         Some(4)
     }
 
+    fn rematerialize(&self, dst: Writable<Reg>) -> Option<Inst> {
+        match self {
+            Inst::MovWide { op, imm, size, .. } => Some(Inst::MovWide { op: *op, rd: dst, imm: *imm, size: *size }),
+            Inst::LoadExtNameNear { name, offset, .. } => {
+                Some(Inst::LoadExtNameNear { rd: dst, name: name.clone(), offset: *offset })
+            }
+            Inst::LoadExtNameGot { name, .. } => Some(Inst::LoadExtNameGot { rd: dst, name: name.clone() }),
+            _ => None,
+        }
+    }
+
     fn worst_case_size() -> CodeOffset {
         // The maximum size, in bytes, of any `Inst`'s emitted code. We have at least one case of
         // an 8-instruction sequence (saturating int-to-float conversions) with three embedded

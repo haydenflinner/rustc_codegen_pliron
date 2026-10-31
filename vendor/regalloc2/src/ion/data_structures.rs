@@ -886,6 +886,8 @@ impl InsertedMoves {
 #[derive(Clone, Debug, Default)]
 pub struct Edits {
     edits: Vec<(PosWithPrio, Edit)>,
+    /// PLIRON: the vreg each edit's destination holds (`Output::edit_vregs`).
+    vregs: Vec<Option<VReg>>,
 }
 
 impl Edits {
@@ -893,6 +895,7 @@ impl Edits {
     pub fn with_capacity(n: usize) -> Self {
         Self {
             edits: Vec::with_capacity(n),
+            vregs: Vec::with_capacity(n),
         }
     }
 
@@ -911,19 +914,36 @@ impl Edits {
         self.edits.drain(..).map(|(pos, edit)| (pos.pos, edit))
     }
 
+    /// PLIRON: the destination vregs, in edit order (take before draining).
+    pub fn take_vregs(&mut self) -> Vec<Option<VReg>> {
+        core::mem::take(&mut self.vregs)
+    }
+
     /// Sort edits by the combination of their program position and priority. This is a stable sort
     /// to preserve the order of the moves the parallel move resolver inserts.
     #[inline(always)]
     pub fn sort(&mut self) {
-        self.edits.sort_by_key(|&(pos_prio, _)| pos_prio.key());
+        // Keep `vregs` paired: sort indices (stable), then permute both.
+        let mut idx: Vec<usize> = (0..self.edits.len()).collect();
+        idx.sort_by_key(|&i| self.edits[i].0.key());
+        let edits: Vec<_> = idx.iter().map(|&i| self.edits[i].clone()).collect();
+        let vregs: Vec<_> = idx.iter().map(|&i| self.vregs.get(i).copied().flatten()).collect();
+        self.edits = edits;
+        self.vregs = vregs;
     }
 
     pub fn add(&mut self, pos_prio: PosWithPrio, from: Allocation, to: Allocation) {
+        self.add_for(pos_prio, from, to, None);
+    }
+
+    /// PLIRON: `add`, recording the vreg the destination holds.
+    pub fn add_for(&mut self, pos_prio: PosWithPrio, from: Allocation, to: Allocation, vreg: Option<VReg>) {
         if from != to {
             if from.is_reg() && to.is_reg() {
                 debug_assert_eq!(from.as_reg().unwrap().class(), to.as_reg().unwrap().class());
             }
             self.edits.push((pos_prio, Edit::Move { from, to }));
+            self.vregs.push(vreg);
         }
     }
 }

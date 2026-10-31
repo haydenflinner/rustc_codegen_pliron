@@ -715,6 +715,55 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         }
     }
 
+    /// PLIRON: the call-side twin of `ret_detach`. A call argument whose
+    /// value has other uses is copied into a fresh vreg, so the ABI's
+    /// fixed-register use binds only the copy. Without it regalloc2 merges
+    /// the value into a bundle that *requires* that register everywhere
+    /// (`compute_requirement` -> `FixedReg`), the register is clobbered by
+    /// every call, and the bundle splits into minimal pieces with the gaps
+    /// on the stack: serde_json's escape scan stored and reloaded its
+    /// string base every byte because the base was also `memcpy`'s `x1`.
+    /// LLVM gets the same effect from a `COPY` into the physical register
+    /// at the call. `PLIRON_ARGCOPY=0` disables.
+    fn arg_detach(&mut self, args: &[ValueRegs<Reg>]) -> Option<Vec<ValueRegs<Reg>>> {
+        static ARGCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ARGCOPY.get_or_init(|| std::env::var_os("PLIRON_ARGCOPY").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        let inst = self.cur_inst?;
+        let mut multi: SmallVec<[Reg; 8]> = smallvec![];
+        let mut tys: SmallVec<[(Reg, Value); 8]> = smallvec![];
+        for &v in self.f.dfg.inst_args(inst) {
+            let v = self.f.dfg.resolve_aliases(v);
+            let multi_use = match self.f.dfg.value_def(v) {
+                ValueDef::Result(..) => self.value_ir_uses[v] == ValueUseState::Multiple,
+                // Block params are live from the block start: detach them
+                // too (as `ret_detach` does).
+                ValueDef::Param(..) => true,
+                _ => false,
+            };
+            if multi_use {
+                for &r in self.value_regs[v].regs() {
+                    multi.push(r);
+                    tys.push((r, v));
+                }
+            }
+        }
+        if multi.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(args.len());
+        for regs in args {
+            if !regs.regs().iter().any(|r| multi.contains(r)) {
+                out.push(*regs);
+                continue;
+            }
+            let v = tys.iter().find(|(r, _)| regs.regs().contains(r)).unwrap().1;
+            out.push(self.ret_copy_regs(*regs, v));
+        }
+        Some(out)
+    }
+
     /// PLIRON: copy `regs` into fresh vregs, emitting the moves. Gives
     /// `ret_detach`d return operands a minimal-range vreg so the
     /// fixed-return-reg constraint stays local to the copy.
@@ -756,6 +805,8 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     /// Set up arguments values `args` for a call with signature `sig`.
     pub fn gen_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+        let copied = self.arg_detach(args);
+        let args: &[ValueRegs<Reg>] = copied.as_deref().unwrap_or(args);
         let (uses, insts) = self.vcode.abi().gen_call_args(
             self.vcode.sigs(),
             sig,

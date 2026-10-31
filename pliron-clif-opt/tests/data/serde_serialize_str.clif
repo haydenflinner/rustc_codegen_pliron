@@ -1,0 +1,522 @@
+function u0:0(i64, i64, i64) -> i64 tail {
+ss0 = explicit_slot 0, align = 8
+ss1 = explicit_slot 0, align = 8
+ss2 = explicit_slot 0, align = 8
+ss3 = explicit_slot 0, align = 8
+ss4 = explicit_slot 0, align = 8
+ss5 = explicit_slot 0, align = 8
+ss6 = explicit_slot 0, align = 8
+ss7 = explicit_slot 0, align = 8
+ss8 = explicit_slot 0, align = 8
+ss9 = explicit_slot 0
+ss10 = explicit_slot 6
+ss11 = explicit_slot 0, align = 8
+ss12 = explicit_slot 0, align = 8
+ss13 = explicit_slot 0, align = 8
+gv0 = symbol colocated userextname0
+gv1 = symbol colocated userextname1
+gv2 = symbol colocated userextname2
+gv3 = symbol colocated userextname5
+gv4 = symbol colocated userextname7
+gv5 = symbol userextname9
+gv6 = symbol colocated userextname10
+gv7 = symbol colocated userextname11
+gv8 = symbol colocated userextname12
+gv9 = symbol colocated userextname13
+gv10 = symbol colocated userextname14
+gv11 = symbol colocated userextname15
+gv12 = symbol colocated userextname16
+gv13 = symbol colocated userextname17
+gv14 = symbol userextname18
+gv15 = symbol colocated userextname19
+sig0 = (i64, i64, i64) apple_aarch64
+sig1 = (i64, i64, i64, i64, i64) apple_aarch64
+sig2 = (i64, i64, i64) -> i64 apple_aarch64
+sig3 = (i64, i64, i64) -> i64 apple_aarch64
+sig4 = (i64) apple_aarch64
+sig5 = (i64, i64, i64) apple_aarch64
+sig6 = (i64, i64, i64) -> i64 apple_aarch64
+sig7 = (i64, i64, i64) -> i64 apple_aarch64
+sig8 = (i64, i64, i64) -> i64 apple_aarch64
+sig9 = (i64, i64, i64) -> i64 apple_aarch64
+sig10 = (i64) -> i64 apple_aarch64
+fn0 = colocated u0:21 sig0
+fn1 = colocated u0:24 sig1
+fn2 = %Memcpy sig2
+fn3 = %Memcpy sig3
+fn4 = colocated u0:12 sig4
+fn5 = colocated u0:13 sig5
+fn6 = %Memcpy sig6
+fn7 = %Memcpy sig7
+fn8 = %Memcpy sig8
+fn9 = %Memcpy sig9
+fn10 = colocated u0:16 sig10
+
+block0(v0: i64, v1: i64, v2: i64):
+v7 = load.i64 notrap v0
+v16 = symbol_value.i64 gv0
+v19 = iconst.i64 1
+v916 -> v19
+v917 -> v19
+v923 -> v19
+v925 -> v19
+v20 = iadd v16, v19  ; v19 = 1
+v40 = symbol_value.i64 gv0
+v41 = isub v20, v40
+v46 = symbol_value.i64 gv0
+v49 = load.i64 notrap v7+16
+v50 = load.i64 notrap v7
+v52 = isub v50, v49
+v53 = icmp ugt v41, v52
+brif v53, block44, block43(v49)
+
+block44 cold:
+v835 = iconst.i64 0
+v837 = umulhi v835, v19  ; v835 = 0, v19 = 1
+v838 = iadd.i64 v7, v837
+v839 = iadd.i64 v49, v837
+v840 = iadd.i64 v41, v837
+v841 = iadd.i64 v19, v837  ; v19 = 1
+call fn1(v838, v839, v840, v841, v841)
+v889 = load.i64 notrap v7+16
+jump block43(v889)
+
+block43(v888: i64):
+v828 = iconst.i64 0
+v952 -> v828
+v953 -> v828
+v954 -> v828
+v955 -> v828
+v956 -> v828
+v957 -> v828
+v958 -> v828
+v1079 = iconst.i64 1
+v1080 = iadd.i64 v16, v1079  ; v1079 = 1
+v62 = icmp ne v1080, v40
+brif v62, block38, block285
+
+block285:
+v1039 = iadd.i64 v888, v41
+jump block37(v1039)
+
+block38:
+v65 = load.i64 notrap v7+8
+v73 = iconst.i64 -16
+v74 = iadd.i64 v41, v73  ; v73 = -16
+v789 = iconst.i64 17
+v76 = icmp ult v74, v789  ; v789 = 17
+brif v76, block257, block258
+
+block257:
+v1054 = iadd.i64 v65, v888
+v77 = iadd.i64 v41, v46
+v78 = iadd.i64 v41, v1054
+v79 = load.i8x16 notrap v46
+v80 = load.i8x16 notrap v77-16
+store notrap v79, v1054
+store notrap v80, v78-16
+v891 = load.i64 notrap v7+16
+v1040 = iadd v891, v41
+jump block37(v1040)
+
+block258:
+v1055 = iadd.i64 v65, v888
+v81 = call fn2(v1055, v46, v41)
+v892 = load.i64 notrap v7+16
+v1041 = iadd v892, v41
+jump block37(v1041)
+
+block37(v1042: i64):
+store notrap v1042, v7+16
+v479 = iconst.i64 -16
+v981 -> v479
+v801 = iconst.i64 17
+v967 -> v801
+v386 = symbol_value.i64 gv14
+v398 = symbol_value.i64 gv14
+v210 = symbol_value.i64 gv5
+jump block46
+
+block46:
+v104 = icmp.i64 ult v828, v2  ; v828 = 0
+v962 = iconst.i8 116
+v935 = iconst.i8 98
+v964 = iconst.i8 3
+v946 = iconst.i8 4
+v947 = iconst.i8 48
+v932 = iconst.i64 6
+v931 -> v932
+v934 -> v932
+v930 = iconst.i8 117
+v1076 = iconst.i8 15
+v866 = umulhi.i64 v958, v925  ; v958 = 0, v925 = 1
+v867 = iadd.i64 v7, v866
+v869 = iadd v934, v866  ; v934 = 6
+v870 = iadd.i64 v925, v866  ; v925 = 1
+v928 = iconst.i8 114
+v973 = iconst.i64 2
+v976 -> v973
+v977 -> v973
+v982 = iconst.i8 102
+v874 = umulhi.i64 v952, v917  ; v952 = 0, v917 = 1
+v875 = iadd.i64 v7, v874
+v877 = iadd v976, v874  ; v976 = 2
+v878 = iadd.i64 v917, v874  ; v917 = 1
+v971 = iconst.i8 92
+v939 = iconst.i8 0
+v937 -> v939
+v938 -> v939
+v940 -> v939
+v941 -> v939
+v942 -> v939
+v830 = iconst.i64 -1
+v949 = iconst.i8 110
+v948 = iconst.i8 5
+v945 = iconst.i8 4
+v943 = iconst.i8 6
+v980 = iconst.i8 102
+v972 = iconst.i8 92
+v969 -> v972
+v970 -> v972
+v963 = iconst.i8 116
+v960 = iconst.i8 47
+v950 = iconst.i8 110
+v944 = iconst.i8 34
+v936 = iconst.i8 98
+v929 = iconst.i8 114
+v1073 = iconst.i8 15
+v968 = iconst.i8 8
+v966 = iconst.i8 -116
+v959 = iconst.i8 7
+v914 = iconst.i32 1
+v853 = umulhi.i64 v956, v923  ; v956 = 0, v923 = 1
+v854 = iadd.i64 v7, v853
+v857 = iadd.i64 v923, v853  ; v923 = 1
+v979 = iconst.i8 102
+brif v104, block48(v828, v1, v2, v1042), block47(v1, v2, v1042)  ; v828 = 0
+
+block47(v995: i64, v996: i64, v997: i64):
+v108 = icmp eq v996, v828  ; v828 = 0
+brif v108, block11(v997), block50
+
+block50:
+v147 = load.i64 notrap v7
+v149 = isub v147, v997
+v150 = icmp.i64 ugt v996, v149
+brif v150, block117, block116
+
+block117 cold:
+v845 = umulhi.i64 v828, v19  ; v828 = 0, v19 = 1
+v846 = iadd.i64 v7, v845
+v847 = iadd.i64 v997, v845
+v848 = iadd.i64 v996, v845
+v849 = iadd.i64 v19, v845  ; v19 = 1
+call fn1(v846, v847, v848, v849, v849)
+v895 = load.i64 notrap v7+16
+v1020 = icmp.i64 ne v996, v828  ; v828 = 0
+brif v1020, block111(v895), block286
+
+block286:
+v1029 = iadd.i64 v895, v996
+jump block110(v1029)
+
+block116:
+v159 = icmp.i64 ne v996, v828  ; v828 = 0
+brif v159, block111(v997), block287
+
+block287:
+v1030 = iadd.i64 v997, v996
+jump block110(v1030)
+
+block111(v998: i64):
+v162 = load.i64 notrap v7+8
+v171 = iadd.i64 v996, v479  ; v479 = -16
+v173 = icmp ult v171, v801  ; v801 = 17
+brif v173, block260, block261
+
+block260:
+v1058 = iadd.i64 v162, v998
+v1056 = iadd.i64 v996, v995
+v175 = iadd.i64 v996, v1058
+v176 = load.i8x16 notrap v995
+v177 = load.i8x16 notrap v1056-16
+store notrap v176, v1058
+store notrap v177, v175-16
+v897 = load.i64 notrap v7+16
+v1031 = iadd v897, v996
+jump block110(v1031)
+
+block261:
+v1057 = iadd.i64 v162, v998
+v178 = call fn3(v1057, v995, v996)
+v898 = load.i64 notrap v7+16
+v1032 = iadd v898, v996
+jump block110(v1032)
+
+block110(v1033: i64):
+store notrap v1033, v7+16
+jump block11(v1033)
+
+block48(v991: i64, v992: i64, v993: i64, v994: i64):
+v195 = iadd v991, v992
+v196 = isub v993, v991
+v786 = uload8.i64 notrap v195
+v213 = iadd.i64 v210, v786
+v214 = load.i8 notrap v213
+v1049 = icmp ne v214, v939  ; v939 = 0
+brif v1049, block60, block284
+
+block284:
+v1064 = iadd.i64 v991, v916  ; v916 = 1
+v1048 = icmp ult v1064, v993
+brif v1048, block48(v1064, v992, v993, v994), block47(v992, v993, v994)
+
+block60:
+v222 = icmp.i64 eq v991, v954  ; v954 = 0
+brif v222, block63, block61
+
+block61:
+v262 = load.i64 notrap v7
+v264 = isub v262, v994
+v266 = icmp.i64 ugt v991, v264
+brif v266, block148, block147
+
+block148 cold:
+v855 = iadd.i64 v994, v853
+v856 = iadd.i64 v991, v853
+call fn1(v854, v855, v856, v857, v857)
+v906 = load.i64 notrap v7+16
+v1022 = icmp.i64 ne v991, v956  ; v956 = 0
+brif v1022, block142(v906), block288
+
+block288:
+v1034 = iadd.i64 v906, v991
+jump block141(v1034)
+
+block147:
+v275 = icmp.i64 ne v991, v953  ; v953 = 0
+brif v275, block142(v994), block289
+
+block289:
+v1035 = iadd.i64 v994, v991
+jump block141(v1035)
+
+block142(v1007: i64):
+v278 = load.i64 notrap v7+8
+v287 = iadd.i64 v991, v981  ; v981 = -16
+v289 = icmp ult v287, v967  ; v967 = 17
+brif v289, block263, block264
+
+block263:
+v1066 = iadd.i64 v278, v1007
+v291 = iadd.i64 v991, v1066
+v292 = load.i8x16 notrap v992
+v293 = load.i8x16 notrap v195-16
+store notrap v292, v1066
+store notrap v293, v291-16
+v908 = load.i64 notrap v7+16
+v1036 = iadd v908, v991
+jump block141(v1036)
+
+block264:
+v1065 = iadd.i64 v278, v1007
+v294 = call fn6(v1065, v992, v991)
+v909 = load.i64 notrap v7+16
+v1037 = iadd v909, v991
+jump block141(v1037)
+
+block141(v1038: i64):
+store notrap v1038, v7+16
+v983 = icmp.i8 uge v214, v982  ; v982 = 102
+brif v983, block267, block266
+
+block63:
+v312 = icmp.i8 uge v214, v979  ; v979 = 102
+brif v312, block267, block266
+
+block267:
+v314 = icmp.i8 uge v214, v928  ; v928 = 114
+brif v314, block269, block268
+
+block269:
+v316 = icmp.i8 uge v214, v962  ; v962 = 116
+brif v316, block271, block290
+
+block290:
+jump block76(v943, v937)  ; v943 = 6, v937 = 0
+
+block271:
+v1063 = ireduce.i8 v786
+v318 = iadd.i8 v214, v966  ; v966 = -116
+v319 = uextend.i32 v318
+v915 = icmp eq v319, v914  ; v914 = 1
+v1050 = select.i8 v915, v968, v959  ; v968 = 8, v959 = 7
+v1051 = select v915, v1063, v942  ; v942 = 0
+jump block76(v1050, v1051)
+
+block268:
+v323 = icmp.i8 eq v214, v949  ; v949 = 110
+v1052 = select.i8 v323, v948, v945  ; v948 = 5, v945 = 4
+jump block76(v1052, v940)  ; v940 = 0
+
+block266:
+v327 = icmp.i8 eq v214, v935  ; v935 = 98
+brif v327, block291, block273
+
+block291:
+jump block76(v964, v941)  ; v964 = 3, v941 = 0
+
+block273:
+v329 = icmp.i8 eq v214, v971  ; v971 = 92
+v1053 -> v329
+jump block76(v1053, v938)  ; v938 = 0
+
+block76(v368: i8, v369: i8):
+v1074 = band v368, v1073  ; v1073 = 15
+v1075 = uextend.i32 v1074
+v375 -> v1075
+br_table v375, block160(v944), [block160(v944), block160(v972), block160(v960), block160(v936), block160(v980), block160(v950), block160(v929), block160(v963), block159, block160(v944), block160(v944), block160(v944), block160(v944), block160(v944), block160(v944), block160(v944)]  ; v944 = 34, v944 = 34, v972 = 92, v960 = 47, v936 = 98, v980 = 102, v950 = 110, v929 = 114, v963 = 116, v944 = 34, v944 = 34, v944 = 34, v944 = 34, v944 = 34, v944 = 34, v944 = 34
+
+block159:
+v1069 = stack_addr.i64 ss10
+v380 = ushr.i8 v369, v946  ; v946 = 4
+v381 = uextend.i64 v380
+v389 = iadd.i64 v386, v381
+v390 = load.i8 notrap v389
+v1077 = band.i8 v369, v1076  ; v1076 = 15
+v1078 = uextend.i64 v1077
+v393 -> v1078
+v401 = iadd.i64 v398, v393
+v402 = load.i8 notrap v401
+store.i8 notrap v970, v1069  ; v970 = 92
+store.i8 notrap v930, v1069+1  ; v930 = 117
+store.i8 notrap v947, v1069+2  ; v947 = 48
+store.i8 notrap v947, v1069+3  ; v947 = 48
+store notrap v390, v1069+4
+store notrap v402, v1069+5
+v453 = load.i64 notrap v7+16
+v455 = load.i64 notrap v7
+v457 = isub v455, v453
+v459 = icmp.i64 ugt v932, v457  ; v932 = 6
+brif v459, block225, block224(v453)
+
+block225 cold:
+v868 = iadd.i64 v453, v866
+call fn1(v867, v868, v869, v870, v870)
+v911 = load.i64 notrap v7+16
+jump block224(v911)
+
+block224(v910: i64):
+v1070 = stack_addr.i64 ss10
+v1062 = iadd.i64 v196, v830  ; v830 = -1
+v1060 = iadd.i64 v195, v916  ; v916 = 1
+v471 = load.i64 notrap v7+8
+v476 = iadd v471, v910
+v1026 = load.i32 v1070
+v1027 = load.i16 v1070+4
+store v1026, v476
+store v1027, v476+4
+v492 = load.i64 notrap v7+16
+v493 = iadd v492, v931  ; v931 = 6
+store notrap v493, v7+16
+v1023 = icmp.i64 ult v957, v1062  ; v957 = 0
+brif v1023, block48(v957, v1060, v1062, v493), block47(v1060, v1062, v493)  ; v957 = 0
+
+block160(v504: i8):
+v1067 = stack_addr.i64 ss10
+store.i8 notrap v969, v1067  ; v969 = 92
+store notrap v504, v1067+1
+v543 = load.i64 notrap v7+16
+v545 = load.i64 notrap v7
+v547 = isub v545, v543
+v549 = icmp.i64 ugt v973, v547  ; v973 = 2
+brif v549, block196, block195(v543)
+
+block196 cold:
+v876 = iadd.i64 v543, v874
+call fn1(v875, v876, v877, v878, v878)
+v913 = load.i64 notrap v7+16
+jump block195(v913)
+
+block195(v912: i64):
+v1068 = stack_addr.i64 ss10
+v1061 = iadd.i64 v196, v830  ; v830 = -1
+v1059 = iadd.i64 v195, v916  ; v916 = 1
+v561 = load.i64 notrap v7+8
+v566 = iadd v561, v912
+v1028 = load.i16 v1068
+store v1028, v566
+v582 = load.i64 notrap v7+16
+v583 = iadd v582, v977  ; v977 = 2
+store notrap v583, v7+16
+v1024 = icmp.i64 ult v955, v1061  ; v955 = 0
+brif v1024, block48(v955, v1059, v1061, v583), block47(v1059, v1061, v583)  ; v955 = 0
+
+block11(v899: i64):
+v613 = symbol_value.i64 gv0
+v617 = iadd v613, v19  ; v19 = 1
+v637 = symbol_value.i64 gv0
+v638 = isub v617, v637
+v643 = symbol_value.i64 gv0
+v647 = load.i64 notrap v7
+v649 = isub v647, v899
+v650 = icmp ugt v638, v649
+brif v650, block256, block255
+
+block256 cold:
+v882 = umulhi.i64 v828, v19  ; v828 = 0, v19 = 1
+v883 = iadd.i64 v7, v882
+v884 = iadd.i64 v899, v882
+v885 = iadd.i64 v638, v882
+v886 = iadd.i64 v19, v882  ; v19 = 1
+call fn1(v883, v884, v885, v886, v886)
+v901 = load.i64 notrap v7+16
+v1081 = iconst.i64 1
+v1082 = iadd.i64 v613, v1081  ; v1081 = 1
+v1025 = icmp ne v1082, v637
+brif v1025, block250(v901), block292
+
+block292:
+v1043 = iadd.i64 v901, v638
+jump block249(v1043)
+
+block255:
+v1083 = iconst.i64 1
+v1084 = iadd.i64 v613, v1083  ; v1083 = 1
+v659 = icmp ne v1084, v637
+brif v659, block250(v899), block293
+
+block293:
+v1044 = iadd.i64 v899, v638
+jump block249(v1044)
+
+block250(v1017: i64):
+v662 = load.i64 notrap v7+8
+v671 = iadd.i64 v638, v479  ; v479 = -16
+v673 = icmp ult v671, v801  ; v801 = 17
+brif v673, block281, block282
+
+block281:
+v1071 = iadd.i64 v662, v1017
+v674 = iadd.i64 v638, v643
+v675 = iadd.i64 v638, v1071
+v676 = load.i8x16 notrap v643
+v677 = load.i8x16 notrap v674-16
+store notrap v676, v1071
+store notrap v677, v675-16
+v903 = load.i64 notrap v7+16
+v1045 = iadd v903, v638
+jump block249(v1045)
+
+block282:
+v1072 = iadd.i64 v662, v1017
+v678 = call fn9(v1072, v643, v638)
+v904 = load.i64 notrap v7+16
+v1046 = iadd v904, v638
+jump block249(v1046)
+
+block249(v1047: i64):
+store notrap v1047, v7+16
+return v828  ; v828 = 0
+}
+

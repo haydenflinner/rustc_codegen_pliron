@@ -390,6 +390,15 @@ pub trait MachInst: Clone + Debug {
         offset
     }
 
+    /// PLIRON: a copy of this instruction writing `dst` instead, if it is
+    /// a cheap, side-effect-free, single-instruction definition with no
+    /// register inputs (a constant or a symbol address). Emission uses it
+    /// to rematerialize a spilled value at a reload instead of loading it
+    /// from its spill slot (regalloc2 cannot rematerialize).
+    fn rematerialize(&self, _dst: Writable<Reg>) -> Option<Self> {
+        None
+    }
+
     /// PLIRON: the size of every instruction when the encoding is fixed
     /// (aarch64: 4), so emission can estimate a loop's byte size from its
     /// instruction count. `None` for variable-length encodings.

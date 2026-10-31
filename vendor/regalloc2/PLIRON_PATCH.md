@@ -35,3 +35,12 @@ Under the flag it merges the edges of the deepest loops first (by
 first, `3` longest first), so a loop-carried value
 shares the parameter's register and the remaining move lands on the
 preheader edge instead of the back edge.
+
+## `Output::edit_vregs` (always on): the vreg each edit's destination holds
+
+`src/ion/data_structures.rs` (`Edits::add_for`, `take_vregs`, paired sort),
+`src/ion/moves.rs`, `src/ion/mod.rs`, `src/lib.rs`: the parallel-move
+resolver already knows `to_vreg` for each resolved move; it is now kept
+in `Output::edit_vregs` alongside `edits` (empty from the fast
+allocator). Cranelift uses it to rematerialize constant and address
+reloads (cranelift-codegen PLIRON_PATCH 76).

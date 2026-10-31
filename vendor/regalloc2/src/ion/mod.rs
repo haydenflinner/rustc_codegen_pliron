@@ -128,6 +128,7 @@ pub fn run<F: Function>(
         env.dump_results();
     }
 
+    ctx.output.edit_vregs = edits.take_vregs();
     ctx.output.edits.extend(edits.drain_edits());
 
     Ok(())
