@@ -96,8 +96,20 @@ fn main() {
         Default::default(),
         facts.lifetimes(&clctx.func),
     );
+    let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
+    let uen_syms = Default::default();
+    let mut scoped_na = Default::default();
     let mut p = Pipe {
         const_tables: &pipeline::EMPTY_TABLES,
+        fact_bits: &mut fact_bits,
+        uen_syms: &uen_syms,
+        scoped_na: &mut scoped_na,
+        nounwind: &Default::default(),
+        inst_region: Default::default(),
+        edge_kills: Vec::new(),
+        wasm: false,
+        since_reap: false,
+        unopt: false,
         clctx: &mut clctx,
         isa: &*isa,
         fname: Path::new(&path).file_name().unwrap().to_str().unwrap(),
@@ -133,6 +145,7 @@ fn main() {
         carry_log: Vec::new(),
         cur_step: "",
     };
+    p.seed_fact_bits();
 
     let um = |p: &Pipe| -> usize {
         p.clctx
