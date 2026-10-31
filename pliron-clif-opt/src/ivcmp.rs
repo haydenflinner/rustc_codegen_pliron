@@ -11,7 +11,8 @@
 //! pointer `p` and tests `p < x_end` and `p + (z - x) == z_end` every
 //! limb: two `add`s, a `cmp` and a `b.eq` per iteration where LLVM has a
 //! single counter. `zipiv` handles two lockstep header params; here the
-//! second pointer is already `p + delta`.
+//! second pointer is already `p + delta`. Only when the sum's other uses
+//! are memory addresses (otherwise the add stays and the move adds work).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
@@ -29,6 +30,29 @@ fn def_block(func: &Function, v: Value) -> Option<Block> {
 
 pub fn run(func: &mut Function, dt: &DominatorTree, la: &LoopAnalysis) -> usize {
     let mut n = 0;
+    // Non-address uses per value. The rewrite pays when the sum's other
+    // uses are load/store addresses (they fold `p + d` into a reg+reg
+    // amode for free; num-bigint-dig's `z` pointer). When the sum is also
+    // the loop's carried pointer (parse_only's post-incremented digit
+    // pointer goes to the back edge), the add stays and the moved test
+    // only adds work. So: the compare must be the one non-address use.
+    let mut nonaddr: rustc_hash::FxHashMap<Value, u32> = rustc_hash::FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let addr = match func.dfg.insts[i] {
+                InstructionData::Load { arg, .. } => Some(arg),
+                InstructionData::Store { args, .. } => Some(args[1]),
+                _ => None,
+            };
+            let vals: Vec<Value> = func.dfg.inst_values(i).collect();
+            for (k, &v) in vals.iter().enumerate() {
+                let is_addr = addr == Some(v) && !(matches!(func.dfg.insts[i], InstructionData::Store { .. }) && k == 0);
+                if !is_addr {
+                    *nonaddr.entry(func.dfg.resolve_aliases(v)).or_default() += 1;
+                }
+            }
+        }
+    }
     let loops: Vec<Loop> = la.loops().collect();
     for lp in loops {
         let h = la.loop_header(lp);
@@ -71,8 +95,17 @@ pub fn run(func: &mut Function, dt: &DominatorTree, la: &LoopAnalysis) -> usize 
                     let InstructionData::Binary { opcode: Opcode::Iadd, args: ia } = func.dfg.insts[d] else {
                         continue;
                     };
+                    if nonaddr.get(&s).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
                     for (x, a) in [(ia[0], ia[1]), (ia[1], ia[0])] {
-                        if inv(func, a) && !inv(func, x) {
+                        // `x` must be an induction variable (a loop block
+                        // param): moving the test onto a derived value
+                        // (`-p`, `p + k`) cascades and hides the plain
+                        // pointer compare later passes form (parse_only).
+                        let x_iv = matches!(func.dfg.value_def(func.dfg.resolve_aliases(x)),
+                            ValueDef::Param(pb, _) if la.is_in_loop(pb, lp));
+                        if x_iv && inv(func, a) {
                             hit = Some((x, a, other));
                             break;
                         }

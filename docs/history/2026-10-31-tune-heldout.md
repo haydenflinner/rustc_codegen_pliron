@@ -77,3 +77,49 @@ into the chunk loop.
   fails with `PLIRON_RORFOLD_MULTI=1`); `test.sh t_constcopy` (a
   blake3-shaped table, a copy written afterwards, a copy that escapes;
   pinned outputs; requires the pass to fire).
+
+## blind-sig (2.08x)
+
+Driver: 300 iterations of the benchmark's blind/sign/finalize. 87% of
+both sides' time in num-bigint-dig's `montgomery` (4,647 vs 2,477
+samples). Its inner loop is `add_mul_vvw`: a u64 x u64 -> u128
+multiply-accumulate over a zip of two slices. LLVM: 11 instructions per
+limb. pliron: 19, from three causes.
+
+1. **i128 shift by a constant** (`clif.lower.shift128k`). `(z >> 64) as
+   u64` reached Cranelift as `ushr.i128 z, (uextend.i128 (iconst 64))`:
+   rustc's i128 shift amount is an i128, Cranelift has no i128 `iconst`,
+   and the aarch64 rules only fold a plain `iconst` amount. So the high
+   half was a nine-instruction variable shift (`lsr; lsr; mvn; lsl; lsl;
+   orr; tst #0x40; csel; csel`). Lowering now splits a constant-amount
+   i128 shift into its 64-bit halves (`PLIRON_SHIFT128K=0` disables), and
+   `const_bits` (which had no cast handling) folds `zext`/`sext`/`trunc`.
+   1.20 s -> 0.89 s (LLVM 0.53 s).
+2. **The zip's second end test** (`ivcmp`). After `ivretro` the loop
+   walked one pointer and tested `p < x_end` and `p + (z - x) == z_end`.
+   `ivcmp` rewrites `icmp eq|ne (iadd p, d), e` with `d`, `e` invariant or
+   constant into `p == e - d` computed before the loop. Two instructions
+   per limb; about 2% (the core hid most of it).
+3. **The carry chain** (PLIRON_PATCH 72). `c = z1 + (z0 + c <u z0)` was
+   `add; cmp; cset; add`, four dependent instructions on the loop-carried
+   carry, against LLVM's `adds; cinc`. An aarch64 rule lowers `x + (a + b
+   <u a ? 1 : 0)` (and the `uextend` form) to `cmn a, b; cinc x, hs`.
+   0.88 s -> 0.67 s.
+
+blind-sig driver: 1.20 s -> 0.67 s against LLVM's 0.53-0.54 s (about
+1.24x, from 2.08x).
+
+## pulldown-cmark (1.53x)
+
+The escape scan (`escape_html_scalar`, `position` over a 256-byte table)
+rebuilt the table's address (`adrp` + `add`) every byte. Three places put
+it there: `licm` skipped `symbol_value` as free, and `splink` plus the
+post-egraph `remat_sink` (PLIRON_PATCH 73) clone addresses into loops on
+purpose, from an x86-64 measurement where the clone is one `lea`. On
+aarch64 it is two instructions. licm now hoists them; both cloners run on
+x86-64 only.
+
+The driver time did not move (2.09 s vs LLVM's 1.25 s): pulldown-cmark's
+gap is broad (first pass 1.86x, HTML writer 1.65x, escape 1.40x of LLVM's
+inclusive samples) and needs per-function work on branchy parsing code.
+Left for later.

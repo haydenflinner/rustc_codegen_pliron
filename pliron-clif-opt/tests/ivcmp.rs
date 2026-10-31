@@ -127,3 +127,53 @@ block2(v14: i64):
     );
     assert_eq!(run(&mut f), 0, "{}", f.display());
 }
+
+/// The sum is also the loop's pointer (parse_only's post-incremented load
+/// address): the add stays, so moving the test would only add work.
+#[test]
+fn multi_use_sum_stays() {
+    let mut f = parse(
+        "
+function %f(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64):
+    jump block1(v0)
+
+block1(v5: i64):
+    v8 = iadd v5, v2
+    v9 = icmp eq v8, v1
+    v10 = uload8.i64 notrap v8
+    brif v9, block2(v10), block1(v8)
+
+block2(v14: i64):
+    return v14
+}",
+    );
+    assert_eq!(run(&mut f), 0, "{}", f.display());
+}
+
+/// The moved-to operand must be an induction variable: `(-p) + d == e`
+/// would put the test on a derived value (parse_only's digit loop, where
+/// later passes form a plain `p == end` compare instead).
+#[test]
+fn derived_operand_stays() {
+    let mut f = parse(
+        "
+function %f(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64):
+    jump block1(v0)
+
+block1(v5: i64):
+    v6 = iconst.i64 -1
+    v7 = imul v5, v6
+    v8 = iadd v7, v2
+    v9 = icmp ne v8, v1
+    v12 = iconst.i64 1
+    v13 = iadd v5, v12
+    brif v9, block1(v13), block2(v5)
+
+block2(v14: i64):
+    return v14
+}",
+    );
+    assert_eq!(run(&mut f), 0, "{}", f.display());
+}
