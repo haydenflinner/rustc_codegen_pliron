@@ -1932,11 +1932,14 @@ impl<I: VCodeInst> VCode<I> {
                 if wbs.len() != n {
                     continue;
                 }
-                for (m, &(ix, _, _)) in chain.iter().enumerate() {
-                    // PLIRON: a zero step (a load and a store at the same
-                    // offset) is the plain access; post-index `#0` would
-                    // only add a writeback.
-                    if wbs[m] == 0 {
+                for (m, &(ix, off, _)) in chain.iter().enumerate() {
+                    // PLIRON: a zero step at offset 0 (a load and a store at
+                    // the base before the bump) is the plain access;
+                    // post-index `#0` would only add a writeback. Only at
+                    // offset 0: the chain's offsets are from the original
+                    // base, which the writebacks before `m` have already
+                    // advanced by `off` (cmp3 caught `off != 0`).
+                    if wbs[m] == 0 && off == 0 {
                         continue;
                     }
                     self.insts[ix.index()].set_post_index(wbs[m]);

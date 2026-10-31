@@ -1099,6 +1099,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     mov` (pliron's `bytescan`).
 
 90. Emit-time post-index sweep (`machinst/vcode.rs`): a chain element
-    whose writeback step is 0 (a load and a store at the same offset
+    at offset 0 whose writeback step is 0 (a load and a store at the base
     before `add base, base, #c`) stays a plain access instead of
-    `ldr x, [base], #0` (a writeback micro-op for nothing).
+    `ldr x, [base], #0` (a writeback micro-op for nothing). Not at a
+    nonzero offset: chain offsets are from the original base, which
+    earlier writebacks have advanced by that offset.
