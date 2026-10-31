@@ -224,6 +224,7 @@ pub fn scan(ctx: &mut Context, module: Ptr<Operation>) -> State {
                     frozen: Vec::new(),
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
+                    ret_nonnull: 0,
                     nparams,
                     tail_cc: false,
                 },

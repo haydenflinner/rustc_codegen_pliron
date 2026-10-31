@@ -364,6 +364,10 @@ impl CtxSlot<'_> {
 /// optimized CLIF the waffle translation reads. Only frees: the object
 /// bytes are unchanged (docs/determinism.md R3).
 // r[impl par.mem.lowerfree]
+/// `PLIRON_RETNN=1`: rustc's `nonnull` return attributes become facts on
+/// call results (opt-in until measured; see `FuncInfo::ret_nonnull`).
+static RETNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_RETNN", "1"));
+
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
 }
@@ -3304,6 +3308,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .into_iter()
                     .map(|(_, t)| self.b.append_block_param(cb, t))
                     .collect();
+                // An inlined call's result (`inline_call`): the callee's
+                // `nonnull` return leaves.
+                if let Some(&mask) = self.st.nnargs.get(a) {
+                    for (k, &p) in vs.iter().enumerate().take(64) {
+                        if mask & (1 << k) != 0 {
+                            self.nonnull.insert(p);
+                        }
+                    }
+                }
                 // A cloned arg bound to a `noalias readonly` callee param
                 // (`inline::frozen_args`): the freeze holds only inside the
                 // clone, so seed `noalias`/`deref` — licm's hoists stay
@@ -6770,6 +6783,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .is_some_and(|s| self.st.nnret.contains(s))
         {
             self.nonnull.insert(rs[0]);
+        }
+        // rustc's `nonnull` return attribute, per result leaf (a `&[T]`
+        // pair's data pointer too, which `nnret` doesn't cover).
+        if let Some(m) = callee_sym.as_deref().and_then(|s| self.st.funcs.get(s)).map(|f| f.ret_nonnull)
+            && m != 0
+            && *RETNN
+        {
+            for (k, &r) in rs.iter().enumerate().take(64) {
+                if m & (1 << k) != 0 {
+                    self.nonnull.insert(r);
+                }
+            }
         }
         // `info.nocap` carries rustc's `captures(none)` (Indirect params);
         // `st.nocapture` is our body-level inference, which also covers

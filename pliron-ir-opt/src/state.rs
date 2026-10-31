@@ -251,6 +251,9 @@ pub struct FuncInfo {
     pub noalias: Vec<(usize, u64, bool)>,
     /// Params rustc marks `nonnull`, by the same backend index as `frozen`.
     pub nonnull: Vec<usize>,
+    /// Return leaves rustc marks `nonnull` (bit k = leaf k: a `&T`/`Box`
+    /// return, or the data pointer of a `&[T]`/`&str` pair).
+    pub ret_nonnull: u64,
     pub nparams: usize,
     /// The Rust ABI is `extern "tail"` (`FnAbi::conv == RustTail`): the
     /// signature must use `CallConv::Tail` even when the function is not
@@ -462,7 +465,8 @@ pub struct State {
     pub region_noalias: ColMap<Value, Vec<u32>>,
     /// Entry params rustc marks `nonnull` (`&T`/`&str` data ptrs, `Box`,
     /// `NonNull`): a bitmask over the arg's leaf indices (see
-    /// `FuncInfo::nonnull`).
+    /// `FuncInfo::nonnull`). Also the continuation-block arg an inlined
+    /// call's result becomes, from the callee's `FuncInfo::ret_nonnull`.
     pub nnargs: ColMap<Value, u64>,
     /// `inbounds` GEPs: null only if their base is.
     pub inbounds: ColSet<Ptr<Operation>>,
@@ -1027,6 +1031,7 @@ mod tests {
                     frozen: Vec::new(),
                     noalias: Vec::new(),
                     nonnull: Vec::new(),
+                    ret_nonnull: 0,
                     nparams: 1,
                     tail_cc: false,
                 },

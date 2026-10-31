@@ -197,6 +197,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 frozen: Vec::new(),
                 noalias: Vec::new(),
                 nonnull: Vec::new(),
+                ret_nonnull: 0,
                 nparams: 0,
                 tail_cc: false,
             },
@@ -276,6 +277,7 @@ impl<'tcx> CodegenCx<'tcx> {
             f.nounwind |= !fn_abi.can_unwind;
             f.tail_cc |= fn_abi.conv == rustc_abi::CanonAbi::RustTail;
             (f.frozen, f.noalias, f.nonnull, f.nparams) = frozen_params(fn_abi);
+            f.ret_nonnull = ret_nonnull(fn_abi);
         }
         if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
             let t = self.backend_type(fn_abi.ret.layout);
@@ -678,6 +680,17 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
         _ => None,
     };
     (l.ty, v)
+}
+
+/// Return leaves rustc marks `nonnull` (see `FuncInfo::ret_nonnull`).
+fn ret_nonnull(fn_abi: &FnAbi<'_, Ty<'_>>) -> u64 {
+    use rustc_target::callconv::{ArgAttribute as A, PassMode};
+    let nn = |a: &rustc_target::callconv::ArgAttributes| a.regular.contains(A::NonNull);
+    match &fn_abi.ret.mode {
+        PassMode::Direct(a) => u64::from(nn(a)),
+        PassMode::Pair(a, b) => u64::from(nn(a)) | u64::from(nn(b)) << 1,
+        _ => 0,
+    }
 }
 
 /// Frozen pointer params of `fn_abi` by backend param index (the layout of

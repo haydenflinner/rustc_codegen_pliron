@@ -878,6 +878,7 @@ fn declare_fn_sym(
             frozen: Vec::new(),
             noalias: Vec::new(),
             nonnull: Vec::new(),
+            ret_nonnull: 0,
             nparams: 0,
             tail_cc: false,
         },

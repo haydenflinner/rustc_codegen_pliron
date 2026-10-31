@@ -3362,6 +3362,14 @@ fn inline_call(
         BasicBlock::push_argument(cont, ctx, ty);
         let arg = cont.deref(ctx).get_argument(ctx, 0);
         res.replace_all_uses_with(ctx, &arg);
+        // Every `ret` of the clone feeds `arg`: rustc's `nonnull` return
+        // attribute holds for it (LLVM's inliner keeps return attributes
+        // the same way). Opt-in: `PLIRON_RETNN=1`.
+        if let Some(m) = st.funcs.get(cs).map(|f| f.ret_nonnull).filter(|&m| m != 0)
+            && pliron_cfg::env_is("PLIRON_RETNN", "1")
+        {
+            st.nnargs.insert(arg, m);
+        }
     }
     // Create the branch to the clone before `frozen_args` so its
     // predecessor map sees the callsite edge — the clone entry's sole pred
