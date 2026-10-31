@@ -73,7 +73,7 @@ def shell(cmd):
 # r[impl verify.gate.stanzas]
 def stanzas():
     src = open(os.path.join(ROOT, "test.sh")).read()
-    names = re.findall(r"want (\w+) && t_\w+", src)
+    names = re.findall(r"want ([\w-]+) && t_\w+", src)  # stanza names may hold `-`
     return [n for n in names if n not in ("sysroot", "mold")]
 
 
