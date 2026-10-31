@@ -123,3 +123,47 @@ The driver time did not move (2.09 s vs LLVM's 1.25 s): pulldown-cmark's
 gap is broad (first pass 1.86x, HTML writer 1.65x, escape 1.40x of LLVM's
 inclusive samples) and needs per-function work on branchy parsing code.
 Left for later.
+
+## Census, then serde_json and memchr (suite 1.31x -> 1.27x)
+
+`bench/heldout/census.py` profiles both binaries of every program under
+samply and attributes the gap per function, with static counts beside
+it. Hot functions had 2-7x LLVM's instructions and 5-40x its stack
+accesses; `PLIRON_FRAME_INFO` showed the stack traffic is register
+allocator spills (regex `Utf8Sequences::next`: 464 B of spills),
+not locals kept in memory.
+
+1. **memchr's movemask ran lane by lane.** `src/simd.rs` scalarized
+   portable-SIMD shifts and narrowing casts; memchr's `vshrn_n_u16`
+   emulation (serde_json, regex, lol_html) was 1,322 instructions in
+   serde's `skip_to_escape` against LLVM's 181. Shifts by a splat now
+   lower to one vector shift, half-width casts to `unarrow`
+   (`clif.lower.simdshift`). Two follow-ups the batch caught:
+   portable-simd masks the amount (`band(splat 4, splat 15)`), which hid
+   the splat until lowering read through it; and Cranelift's aarch64
+   backend shifts only 128-bit vectors, so zmij's `vshr_n_u32` ICEd five
+   crates until 64-bit vectors went lane by lane.
+2. **Loop placement.** chars_ascii ran 1.77x slower with identical code
+   when its loop straddled a 64-byte line. Small loops are now aligned
+   (patch 74), except loops with a call: fib's tail-recursion loop is
+   entered once per call and paid 10 NOPs each time (+16%).
+3. **A call argument pinned a loop value to a clobbered register**
+   (patch 75, `PLIRON_ARGCOPY`). serde's string base was also `memcpy`'s
+   `x1`; regalloc2's bundle got a fixed-register requirement for its whole
+   range and split around every call, so the escape loop stored and
+   reloaded the base every byte. A copy at the call fixes it, as LLVM's
+   `COPY` to the physical register does.
+4. **No rematerialization** (patch 76, `PLIRON_REMAT`, regalloc2
+   `Output::edit_vregs`): the escape table's address was reloaded from a
+   spill slot every byte; it is now re-executed (`adrp` + `add`). With 3,
+   serde's escape loop has no stack traffic; the function went from 64 to
+   32 stack accesses.
+
+Also `invparam` (opt-in): LoopSimplify-style separation of loops whose
+back edges disagree, moving inner-loop invariants off the header. It did
+not help on its own (regalloc2 still splits the web), so it stays off
+until regalloc work.
+
+Per-program after this (pliron/LLVM): blake3 1.21, blind-sig 1.24,
+pulldown 1.40, regex 1.33, compression 1.42, html 1.33, json 1.30,
+protobuf 1.00. Geomean 1.27x.

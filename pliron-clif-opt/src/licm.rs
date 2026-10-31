@@ -387,8 +387,9 @@ fn hoists_inner(
             let ty2 = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
             let (r2, o2) = loadfwd::norm_root(func, ps, na, args[1]);
             let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
-            r2 == loc.0
-                && !(loc.1 >= o2 + i64::from(ty2.bytes()) || o2 >= loc.1 + i64::from(ty.bytes()))
+            // i128: offsets near i64::MAX (fuzz seed 16980) must not wrap.
+            let (l, o) = (i128::from(loc.1), i128::from(o2));
+            r2 == loc.0 && !(l >= o + i128::from(ty2.bytes()) || o >= l + i128::from(ty.bytes()))
         }
         _ => false,
     });

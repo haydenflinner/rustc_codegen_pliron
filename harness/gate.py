@@ -63,7 +63,7 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # (16782, hang) and sroa leaving a flow-reached by-value call arg unpinned
 # (16787, segfault), 2026-10-31.
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309,
-                13475, 16782, 16787, 17028]
+                13475, 16782, 16787, 16980, 17028]
 
 
 def shell(cmd):
