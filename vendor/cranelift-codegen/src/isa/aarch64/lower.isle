@@ -3343,6 +3343,16 @@
 
 ;;; Rules for `bitcast` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; PLIRON: the low 64 bits of a vector, as a 64-bit vector, are the same
+;; register: `bitcast.i8x8 (extractlane.i64 (bitcast.i64x2 v) 0)` was
+;; `mov x, v.d[0]; fmov d, x` (memchr's movemask, via pliron's `vtrunc`).
+(rule 8 (lower (bitcast (ty_vec64_int _) _ (extractlane $I64 (bitcast $I64X2 _ x @ (value_type (ty_vec128 _))) (u8_from_uimm8 0))))
+      x)
+;; ... and when that vector is an `unarrow`, only its low half is needed:
+;; one `sqxtun`, no `sqxtun2`.
+(rule 9 (lower (bitcast (ty_vec64_int _) _ (extractlane $I64 (bitcast $I64X2 _ (unarrow (ty_vec128_int nty) a _)) (u8_from_uimm8 0))))
+      (sqxtun a (lane_size nty)))
+
 ; SIMD&FP <=> SIMD&FP
 (rule 7 (lower (bitcast (ty_float_or_vec _) _ x @ (value_type (ty_float_or_vec _))))
       x)

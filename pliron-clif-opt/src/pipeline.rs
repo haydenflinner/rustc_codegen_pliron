@@ -4088,6 +4088,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // whitespace skip `x - 9 in {0, 1, 4, 23}` only becomes one chain
         // after brchain/mergechain/jtround).
         cstep("bittab2", "bittab", Gate::OptIn("PLIRON_BITTAB2"), s_bittab).needs(shape::CONDBR),
+        // Loops the late threading simplified (an `Option` niche test
+        // folded away) can rotate now: top test + `jump` back becomes one
+        // bottom `brif`.
+        step("looprot2", "looprot", Gate::OptIn("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
         step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
         // Fold constants any earlier pass left behind — late value folds

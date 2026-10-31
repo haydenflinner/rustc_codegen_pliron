@@ -1082,3 +1082,10 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     blake3's `compress_pre`: 67 -> 11 stack loads, 16 -> 10 stores, but no
     runtime change (its time is the round functions' dependency chains,
     not the spill traffic the profile samples land on), so it stays off.
+
+88. aarch64 low-half vector extracts (`src/isa/aarch64/lower.isle` bitcast
+    rules 8, 9): `bitcast.<64-bit vec> (extractlane.i64 (bitcast.i64x2 v)
+    0)` is `v`'s register (no `mov x, v.d[0]; fmov d, x`), and when `v`
+    is an `unarrow` only its low half is narrowed (`sqxtun`, no
+    `sqxtun2`). memchr's movemask through pliron's `vtrunc`: 8 -> 4
+    instructions.

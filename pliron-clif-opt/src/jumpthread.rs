@@ -320,6 +320,45 @@ const MAX_WALK: usize = 4096;
 /// Values known non-null: `!nonnull` loads, inbounds offsets of non-null
 /// pointers, and block params whose every incoming argument is non-null
 /// (greatest fixpoint).
+/// `c` computes `a != 0` (`Some((a, true))`) or `a == 0` (`Some((a,
+/// false))`) as a 0/1 value, through the wrappers Rust's bool lowering
+/// leaves: `select c', 0, 1` / `select c', 1, 0`, `ireduce`, `uextend`,
+/// `band _, 1`.
+fn nz_test_of(func: &Function, c: Value, depth: u32) -> Option<(Value, bool)> {
+    if depth > 6 {
+        return None;
+    }
+    let none = FxHashMap::default();
+    let c = func.dfg.resolve_aliases(c);
+    let i = func.dfg.value_def(c).inst()?;
+    match func.dfg.insts[i] {
+        InstructionData::IntCompare { cond, args, .. } if matches!(cond, IntCC::Equal | IntCC::NotEqual) => {
+            let ne = cond == IntCC::NotEqual;
+            match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (None, Some(0)) => Some((func.dfg.resolve_aliases(args[0]), ne)),
+                (Some(0), None) => Some((func.dfg.resolve_aliases(args[1]), ne)),
+                _ => None,
+            }
+        }
+        InstructionData::Ternary { opcode: Opcode::Select, args } => {
+            match (known(func, &none, args[1]), known(func, &none, args[2])) {
+                (Some(0), Some(1)) => nz_test_of(func, args[0], depth + 1).map(|(a, ne)| (a, !ne)),
+                (Some(1), Some(0)) => nz_test_of(func, args[0], depth + 1),
+                _ => None,
+            }
+        }
+        InstructionData::Unary { opcode: Opcode::Ireduce | Opcode::Uextend, arg } => nz_test_of(func, arg, depth + 1),
+        InstructionData::Binary { opcode: Opcode::Band, args } => {
+            match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (None, Some(1)) => nz_test_of(func, args[0], depth + 1),
+                (Some(1), None) => nz_test_of(func, args[1], depth + 1),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub struct NonNull<'a> {
     loads: &'a FxHashSet<Value>,
     derived: &'a VMap<Value>,
@@ -1087,6 +1126,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
     };
     let sentinel = crate::pass_enabled("PLIRON_SENTINEL");
     let paramnull = crate::pass_enabled("PLIRON_PARAMNULL");
+    let single_src = crate::pass_enabled("PLIRON_NULLSRC");
     let mut hits = Vec::new();
     let mut cfg_lazy: Option<ControlFlowGraph> = None;
     let mut dt_lazy: Option<DominatorTree> = None;
@@ -1161,11 +1201,49 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
                 hits.push((inst, f));
                 continue;
             }
+            // A param with exactly one incoming edge is that edge's arg
+            // (earlier folds leave the `Option` merge's second level with a
+            // single `jump` in): look through it, a few levels deep.
+            let mut x = func.dfg.resolve_aliases(x);
+            if single_src {
+                let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                for _ in 0..4 {
+                    // `select (a != 0), a, 0` is `a` (and `select (a == 0), 0, a`):
+                    // the second level of an `Option` merge after if-conversion.
+                    if let Some(i) = func.dfg.value_def(x).inst()
+                        && let InstructionData::Ternary { opcode: Opcode::Select, args: sa } = func.dfg.insts[i]
+                    {
+                        let (c, t, f) = (sa[0], func.dfg.resolve_aliases(sa[1]), func.dfg.resolve_aliases(sa[2]));
+                        let z = |v: Value| known(func, &none, v) == Some(0);
+                        match nz_test_of(func, c, 0) {
+                            Some((a, true)) if a == t && z(f) => {
+                                x = t;
+                                continue;
+                            }
+                            Some((a, false)) if a == f && z(t) => {
+                                x = f;
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let ValueDef::Param(d, pidx) = func.dfg.value_def(x) else { break };
+                    let mut preds = cfg.pred_iter(d);
+                    let (Some(p), None) = (preds.next(), preds.next()) else { break };
+                    let InstructionData::Jump { destination, .. } = func.dfg.insts[p.inst] else { break };
+                    let Some(BlockArg::Value(a)) = destination.args(&func.dfg.value_lists).nth(pidx) else { break };
+                    let a = func.dfg.resolve_aliases(a);
+                    if a == x {
+                        break;
+                    }
+                    x = a;
+                }
+            }
             if nn.is_m(func, x, &mut nnm) {
                 hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
                 continue;
             }
-            let x = func.dfg.resolve_aliases(x);
+
             // A block param is the other form Rust's niche layout takes
             // after SROA: `p` merges the `Some` pointer with the `None`
             // zero. `p == 0` iff a zero edge was taken; when every edge
@@ -2018,6 +2096,7 @@ pub(crate) fn round<'a>(
             continue;
         }
         n_gate += 1;
+
         let params = func.dfg.block_params(b);
         let mut body_vals_l: Option<FxHashSet<Value>> = None;
         for pred in cfg.pred_iter(b) {
