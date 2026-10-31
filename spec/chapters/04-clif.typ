@@ -93,6 +93,25 @@ only the consumer of the optimized CLIF differs.
   x86-64 returns (where the SysV ABI leaves them undefined).
 ]
 
+#r("clif.lower.shift128k", title: "Constant i128 shifts split into halves", level: "should",
+   refines: ("model.equiv", "model.parity"),
+   checked: "test.sh t_shift128k")[
+  An `shl`/`lshr`/`ashr` of a scalar `i128` whose amount is a constant in
+  `0..128` (after folding casts of constants) SHOULD lower to 64-bit
+  operations on the two halves (`isplit`/`iconcat`): a shift by 64 is a
+  register move. Out-of-range amounts keep the generic shift.
+  `PLIRON_SHIFT128K=0` disables.
+]
+
+#llvm(kind: "choice", summary: [i128 constant shifts are split in lowering because Cranelift only folds a plain `iconst` amount.])[
+  rustc gives an i128 shift an i128 amount, which reaches Cranelift as
+  `uextend.i128 (iconst k)`; Cranelift has no i128 `iconst` and its aarch64
+  rules only recognize a plain one, so `(x as u128 * y as u128) >> 64` became
+  a nine-instruction variable shift (num-bigint-dig's Montgomery loop,
+  docs/history/2026-10-31-tune-heldout.md). LLVM's legalizer splits a
+  constant i128 shift into its halves.
+]
+
 #r("clif.lower.byval", title: "By-value aggregates", level: "must",
    refines: "model.abi", checked: "test.sh rusttailcc")[
   A by-value (`byval`) argument MUST be lowered as a Cranelift

@@ -3777,6 +3777,62 @@ impl<'a, 'b> FnLower<'a, 'b> {
         x[0]
     }
 
+    /// An i128 shift by a constant amount, as 64-bit halves (`kind`: 0 shl,
+    /// 1 lshr, 2 ashr). rustc's i128 shift amount is itself an i128, which
+    /// reaches Cranelift as `uextend.i128 (iconst)`: the backends only fold
+    /// a plain `iconst` amount, so `(x as u128 * y as u128) >> 64` lowered
+    /// as a generic 128-bit variable shift (nine instructions on aarch64
+    /// where the high half is one register; num-bigint-dig's Montgomery
+    /// loop). Out-of-range amounts (poison) keep the generic path.
+    /// `PLIRON_SHIFT128K=0` disables.
+    // r[impl clif.lower.shift128k]
+    fn shift_i128_const(&mut self, op: Ptr<Operation>, opnds: &[Value], kind: u8) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| crate::pass_enabled("PLIRON_SHIFT128K")) {
+            return false;
+        }
+        let Some(k) = self.const_int(opnds[1]).filter(|&k| (0..128).contains(&k)) else {
+            return false;
+        };
+        let x = self.get(opnds[0]);
+        if x.len() != 1 || self.b.func.dfg.value_type(x[0]) != clt::I128 {
+            return false;
+        }
+        let k = k as i64;
+        let (lo, hi) = self.b.ins().isplit(x[0]);
+        let (rlo, rhi) = match (kind, k) {
+            (_, 0) => (lo, hi),
+            (0, 1..=63) => {
+                let a = self.b.ins().ishl_imm(hi, k);
+                let c = self.b.ins().ushr_imm(lo, 64 - k);
+                let h = self.b.ins().bor(a, c);
+                (self.b.ins().ishl_imm(lo, k), h)
+            }
+            (0, _) => {
+                let h = if k == 64 { lo } else { self.b.ins().ishl_imm(lo, k - 64) };
+                (self.b.ins().iconst(clt::I64, 0), h)
+            }
+            (_, 1..=63) => {
+                let a = self.b.ins().ushr_imm(lo, k);
+                let c = self.b.ins().ishl_imm(hi, 64 - k);
+                let l = self.b.ins().bor(a, c);
+                let h = if kind == 1 { self.b.ins().ushr_imm(hi, k) } else { self.b.ins().sshr_imm(hi, k) };
+                (l, h)
+            }
+            (1, _) => {
+                let l = if k == 64 { hi } else { self.b.ins().ushr_imm(hi, k - 64) };
+                (l, self.b.ins().iconst(clt::I64, 0))
+            }
+            _ => {
+                let l = if k == 64 { hi } else { self.b.ins().sshr_imm(hi, k - 64) };
+                (l, self.b.ins().sshr_imm(hi, 63))
+            }
+        };
+        let r = self.b.ins().iconcat(rlo, rhi);
+        self.set1(op, r);
+        true
+    }
+
     fn const_int(&self, v: Value) -> Option<i128> {
         let (b, w) = self.const_bits(v, 0)?;
         Some(if w < 128 && (b >> (w - 1)) & 1 == 1 {
@@ -3972,6 +4028,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             } else {
                 return None;
             }
+        } else if tid == core::any::TypeId::of::<ZExtOp>()
+            || tid == core::any::TypeId::of::<TruncOp>()
+        {
+            // The result width masks (`mask` below); a zext's high bits are
+            // already zero in the operand's masked pattern.
+            bit(og(0))?.0
+        } else if tid == core::any::TypeId::of::<SExtOp>() {
+            sext(bit(og(0))?) as u128
         } else {
             if op.deref(ctx).get_num_operands() == 0 {
                 return None;
@@ -4020,7 +4084,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
             };
             mask(v, wa)
         };
-        Some((r, int_ty(v)))
+        let w = int_ty(v);
+        Some((mask(r, w), w))
     }
 
     /// The constant bit pattern forwarded to argument `ai` of `blk` —
@@ -5174,11 +5239,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(XorOp) {
             binop!(bxor)
         } else if is!(ShlOp) {
-            binop!(ishl)
+            if !self.shift_i128_const(op, opnds, 0) {
+                binop!(ishl)
+            }
         } else if is!(LShrOp) {
-            binop!(ushr)
+            if !self.shift_i128_const(op, opnds, 1) {
+                binop!(ushr)
+            }
         } else if is!(AShrOp) {
-            binop!(sshr)
+            if !self.shift_i128_const(op, opnds, 2) {
+                binop!(sshr)
+            }
         } else if is!(UDivOp) {
             self.int_divrem(op, opnds, "__udivti3", true, false)
         } else if is!(SDivOp) {

@@ -799,6 +799,26 @@ t_debuginfo() {
   cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
 }
 
+# r[verify clif.lower.shift128k]
+t_shift128k() {
+  # i128 shifts by a constant lower as 64-bit halves; the generic path
+  # (PLIRON_SHIFT128K=0) must compute the same. On aarch64 `mulhi`'s
+  # `(x * y) >> 64` must not use the variable-shift sequence (`tst #0x40`).
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/shift128k/main.rs -o $out/shift128k$exe &&
+      $out/shift128k$exe | grep -qx 'shift128k ok' &&
+  PLIRON_SHIFT128K=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/shift128k/main.rs -o $out/shift128k0$exe &&
+      $out/shift128k0$exe | grep -qx 'shift128k ok' || return 1
+  if [[ -x "$llvmod" && "$(uname -m)" == arm64 ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/shift128k/main.rs -o $out/shift128k.o
+    "$llvmod" -d --no-show-raw-insn $out/shift128k.o > $out/shift128k.dis
+    awk '/mulhi.*>:$/{p=1;next} /^$/{p=0} p' $out/shift128k.dis > $out/shift128k.mulhi
+    grep -q 'umulh' $out/shift128k.mulhi || { echo "shift128k: mulhi not found or no umulh" >&2; return 1; }
+    if grep -q '#0x40' $out/shift128k.mulhi; then
+      echo "shift128k: mulhi's >> 64 used the variable 128-bit shift" >&2; return 1
+    fi
+  fi
+}
+
 # r[verify iropt.constload.copy]
 t_constcopy() {
   # PLIRON_CONSTCOPY replaces an alloca copied from a constant global with
@@ -1114,6 +1134,7 @@ want byvalhome && t_byvalhome
 want retattr && t_retattr
 want willret && t_willret
 want constcopy && t_constcopy
+want shift128k && t_shift128k
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
 # resumes lower to `pliron.eh.rethrow` via cleanup_ret (funclet path), so
