@@ -1259,7 +1259,7 @@ impl<I: VCodeInst> VCode<I> {
                             let r = self.block_ranges.get(lb.index());
                             est += (r.end - r.start) as u32 + ra_edits_per_block[lb.index()];
                             calls |= (r.start..r.end)
-                                .any(|i| self.insts[i as usize].call_type() != CallType::None);
+                                .any(|i| self.insts[i].call_type() != CallType::None);
                         }
                     }
                     let bytes = est * sz;

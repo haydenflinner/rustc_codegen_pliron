@@ -70,6 +70,11 @@ struct Field {
     ty: Type,
 }
 
+/// `PLIRON_SLOTPROM_CONTAINER=0`: keep fields read by narrower loads in
+/// memory (the pre-container behaviour).
+static CONTAINER: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_SLOTPROM_CONTAINER", "0"));
+
 /// One memory access against a slot's bytes.
 #[derive(Clone, Copy)]
 struct Acc {
@@ -79,6 +84,8 @@ struct Acc {
     /// `ty`); `None` for narrow/atomic accesses that pin bytes to memory
     /// without being promotable.
     ty: Option<Type>,
+    /// A plain `load` (a narrower one can read out of a container field).
+    load: bool,
 }
 
 /// Memory bytes each opcode touches when the address is slot-derived.
@@ -137,6 +144,7 @@ fn access(
             off: o.wrapping_add(off),
             bytes,
             ty,
+            load: func.dfg.insts[i].opcode() == Opcode::Load,
         }),
         None => {
             for &(ss, o) in &w.slots {
@@ -147,6 +155,7 @@ fn access(
                         off: o.wrapping_add(off),
                         bytes,
                         ty: None,
+                        load: false,
                     });
                 }
             }
@@ -509,11 +518,22 @@ pub fn run_lt(
             }
         }
         for &(off, bytes) in &ranges {
-            if ranges
-                .iter()
-                .any(|&(o2, b2)| (o2, b2) != (off, bytes) && o2 < off + bytes && off < o2 + b2)
-            {
-                continue;
+            let overlaps = |&&(o2, b2): &&(i64, i64)| (o2, b2) != (off, bytes) && o2 < off + bytes && off < o2 + b2;
+            if ranges.iter().any(|r| overlaps(&r)) {
+                // A container field (LLVM SROA's integer widening, read
+                // side): every overlapping access is a plain integer load
+                // strictly inside this range, and no wider range holds it.
+                // The narrow loads become shifts of the field's value:
+                // regex's `follow_epsilons` stored its six-bool flags arg
+                // (one i64) to a slot and read each bool back as a byte.
+                let inside = |a: &Acc| off <= a.off && a.off + a.bytes <= off + bytes;
+                let container = *CONTAINER
+                    && list.iter().filter(|a| overlaps(&&(a.off, a.bytes))).all(|a| {
+                        inside(a) && a.load && a.ty.is_some_and(|t| t.is_int())
+                    });
+                if !container {
+                    continue;
+                }
             }
             let mut ty = None;
             let mut good = true;
@@ -526,6 +546,11 @@ pub fn run_lt(
                         break;
                     }
                 }
+            }
+            let wide_int = ty.is_some_and(|t| t.is_int() && i64::from(t.bytes()) == bytes);
+            let has_inner = ranges.iter().any(|&(o2, b2)| (o2, b2) != (off, bytes) && o2 < off + bytes && off < o2 + b2);
+            if has_inner && !wide_int {
+                good = false;
             }
             if good && let Some(ty) = ty {
                 fields.push(Field {
@@ -601,6 +626,29 @@ pub fn run_lt(
     for (fi, f) in fields.iter().enumerate() {
         slot_fields.entry(f.slot).or_default().push(fi);
     }
+    // Narrow loads inside a container field: inst → (field, byte delta).
+    let mut contained: FxHashMap<Inst, (usize, i64)> = FxHashMap::default();
+    for (&i, &(s, st)) in &sites {
+        let Some((ss, off)) = s else { continue };
+        if st {
+            continue;
+        }
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        // A load at the field's own offset is contained when narrower (it
+        // shares the field's `(slot, off)` key; the whole-field rewrite
+        // skips it on the width check).
+        if field_ix.get(&(ss, off)).is_some_and(|&fi| fields[fi].bytes == i64::from(ty.bytes())) {
+            continue;
+        }
+        if let Some(&fi) = slot_fields.get(&ss).and_then(|fs| {
+            fs.iter().find(|&&fi| {
+                let f = &fields[fi];
+                f.ty.is_int() && ty.is_int() && f.off <= off && off + i64::from(ty.bytes()) <= f.off + f.bytes
+            })
+        }) {
+            contained.insert(i, (fi, off - fields[fi].off));
+        }
+    }
     let mut sync_inst_slots: FxHashMap<Inst, Vec<StackSlot>> = FxHashMap::default();
     for (slot, insts) in &sync_insts {
         for &i in insts {
@@ -664,7 +712,7 @@ pub fn run_lt(
             let Some(&(Some((ss, off)), st)) = sites.get(&i) else {
                 continue;
             };
-            let Some(&fi) = field_ix.get(&(ss, off)) else {
+            let Some(fi) = field_ix.get(&(ss, off)).copied().or_else(|| contained.get(&i).map(|c| c.0)) else {
                 continue;
             };
             if st {
@@ -742,7 +790,7 @@ pub fn run_lt(
         }
         for (&i, &(s, _)) in &sites {
             if let Some((ss, off)) = s
-                && let Some(&fi) = field_ix.get(&(ss, off))
+                && let Some(fi) = field_ix.get(&(ss, off)).copied().or_else(|| contained.get(&i).map(|c| c.0))
                 && kept_set.contains(&fi)
                 && reach.contains(&func.layout.inst_block(i).unwrap_or(entry))
             {
@@ -981,6 +1029,20 @@ pub fn run_lt(
                         func.layout.remove_inst(i);
                         func.dfg.clear_results(i);
                         func.dfg.change_to_alias(res, cv);
+                        n += 1;
+                    } else if let Some(&(fi, delta)) = contained.get(&i)
+                        && let Some(&ki) = kept_ix.get(&fi)
+                    {
+                        // Little-endian: byte `delta` of the field is bits
+                        // `8*delta..`.
+                        let cv = cur[ki].unwrap_or(fallback[ki]);
+                        let res = func.dfg.first_result(i);
+                        let mut pos = FuncCursor::new(func).at_inst(i);
+                        let sh = if delta > 0 { pos.ins().ushr_imm_s(cv, delta * 8) } else { cv };
+                        let nv = if ty.bits() < fields[fi].ty.bits() { pos.ins().ireduce(ty, sh) } else { sh };
+                        func.layout.remove_inst(i);
+                        func.dfg.clear_results(i);
+                        func.dfg.change_to_alias(res, nv);
                         n += 1;
                     }
                 }

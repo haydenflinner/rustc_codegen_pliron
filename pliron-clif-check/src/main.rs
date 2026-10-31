@@ -10,6 +10,13 @@
 //!   clif-check bench <dir> [reps]          time `run_pipeline` over the corpus
 //!   clif-check report <dir> <out.json>     pipeline over the corpus in parallel;
 //!                                          per-fn size/time/verdict as JSON
+//!   clif-check vcode <file> [--print]      one file: its allocated vcode
+//!                                          (--print: the CLIF first)
+//!   clif-check codegen <dir> <out.json>    pipeline + Cranelift (aarch64-apple,
+//!                                          the backend's flags) over the corpus;
+//!                                          per-fn instructions and stack accesses,
+//!                                          also weighted 8^loop-depth (the
+//!                                          register-allocation score)
 //!                                          (--check: also diffcheck each fn,
 //!                                          --jobs N, --limit N)
 //!   clif-check steps                       list step names
@@ -127,6 +134,25 @@ fn main() -> ExitCode {
             bad == 0
         }
         ["report", dir, out] => report_corpus(&isa, Path::new(dir), Path::new(out), &opts),
+        ["codegen", dir, out] => codegen_corpus(Path::new(dir), Path::new(out), &opts),
+        ["vcode", file] => {
+            // One corpus file through the pipeline and Cranelift; print the
+            // allocated vcode (what `codegen` scores).
+            let isa = backend_isa();
+            let (f, facts) = load(Path::new(file));
+            let after = with_pipe(&*isa, f, &facts, |p| {
+                pipeline::run_pipeline(p);
+                p.clctx.func.clone()
+            });
+            if opts.print {
+                println!("{}", after.display());
+            }
+            let mut ctx = Context::for_function(after);
+            ctx.set_disasm(true);
+            let c = ctx.compile(&*isa, &mut cranelift_codegen::control::ControlPlane::default()).expect("compile");
+            println!("{}", c.vcode.clone().unwrap_or_default());
+            true
+        }
         ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
         ["bench", dir, reps] => bench_corpus(&*isa, Path::new(dir), reps.parse().expect("reps")),
         _ => {
@@ -631,6 +657,176 @@ fn report_corpus(isa: &std::sync::Arc<dyn TargetIsa>, dir: &Path, out: &Path, o:
         "report: {} fns in {wall:.2?} ({} jobs) — {counts:?} -> {}",
         rows.len(),
         o.jobs,
+        out.display()
+    );
+    bad == 0
+}
+
+/// One function's machine-code shape in `codegen`.
+#[derive(Default)]
+struct CgRow {
+    file: String,
+    status: &'static str,
+    insts: usize,
+    stack: usize,
+    /// Each instruction (stack access) counted 8^depth, depth capped at 3:
+    /// a static stand-in for dynamic counts.
+    winsts: u64,
+    wstack: u64,
+    /// Frame bytes: explicit stack slots, and regalloc spill slots.
+    slots: u32,
+    spills: u32,
+    /// Loop-weighted stack accesses into spill slots (the rest of `wstack`
+    /// is explicit stack slots: locals kept in memory).
+    wspill: u64,
+}
+
+/// The backend's Cranelift flags for aarch64-apple-darwin (`src/lib.rs`).
+fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
+    let mut fb = cranelift_codegen::settings::builder();
+    fb.set("is_pic", "true").unwrap();
+    fb.set("opt_level", "speed").unwrap();
+    fb.set("preserve_frame_pointers", "true").unwrap();
+    fb.set("enable_llvm_abi_extensions", "true").unwrap();
+    fb.set("tls_model", "macho").unwrap();
+    let flags = cranelift_codegen::settings::Flags::new(fb);
+    cranelift_codegen::isa::lookup_by_name("aarch64-apple-darwin")
+        .expect("aarch64 ISA")
+        .finish(flags)
+        .expect("ISA flags")
+}
+
+/// Score vcode text: `blockN:` labels in emission order, branches to
+/// `labelM`. A branch from block i back to block j <= i makes blocks j..=i
+/// a loop; a block's depth is the number of such spans holding it.
+/// Prologue/epilogue pushes and pops (`[sp, #-16]!`, `[sp], #16`) are not
+/// counted as stack accesses.
+fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64) {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut ids: Vec<usize> = Vec::new();
+    for l in v.lines() {
+        let t = l.trim();
+        if let Some(n) = t.strip_prefix("block").and_then(|r| r.strip_suffix(':')) {
+            ids.push(n.parse().unwrap_or(usize::MAX));
+            blocks.push(Vec::new());
+        } else if !t.is_empty() && !blocks.is_empty() {
+            blocks.last_mut().unwrap().push(t);
+        }
+    }
+    let pos: std::collections::HashMap<usize, usize> = ids.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let mut depth = vec![0u32; blocks.len()];
+    for (i, insts) in blocks.iter().enumerate() {
+        for t in insts {
+            for w in t.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if let Some(&j) = w.strip_prefix("label").and_then(|n| n.parse::<usize>().ok()).and_then(|n| pos.get(&n)) {
+                    if j <= i {
+                        for d in &mut depth[j..=i] {
+                            *d += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (i, insts) in blocks.iter().enumerate() {
+        let w = 8u64.pow(depth[i].min(3));
+        for t in insts {
+            row.insts += 1;
+            row.winsts += w;
+            if t.contains("[sp") && !t.contains("]!") && !t.contains("], #") {
+                row.stack += 1;
+                row.wstack += w;
+                let off = t.split("[sp").nth(1).and_then(|r| {
+                    let r = r.trim_start_matches(", #").trim_start_matches(',').trim();
+                    let num: String = r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+                    if num.is_empty() {
+                        Some(0)
+                    } else if let Some(h) = num.strip_prefix("0x") {
+                        i64::from_str_radix(h, 16).ok()
+                    } else {
+                        num.parse().ok()
+                    }
+                });
+                if off.is_some_and(|o| o >= spill_from) {
+                    row.wspill += w;
+                }
+            }
+        }
+    }
+}
+
+fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
+    let mut row = CgRow { file: file.strip_prefix(root).unwrap_or(file).display().to_string(), status: "ok", ..Default::default() };
+    let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
+        let mut fs = cranelift_reader::parse_functions(&text).ok()?;
+        (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
+    });
+    let Some((func, facts)) = loaded else {
+        row.status = "parse";
+        return row;
+    };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let after = with_pipe(isa, func, &facts, |p| {
+            pipeline::run_pipeline(p);
+            p.clctx.func.clone()
+        });
+        let mut ctx = Context::for_function(after);
+        ctx.set_disasm(true);
+        ctx.compile(isa, &mut cranelift_codegen::control::ControlPlane::default())
+            .ok()
+            .and_then(|c| c.vcode.clone())
+    }));
+    match r {
+        Ok(Some(v)) => {
+            let [slots, spills, _, out, _] = cranelift_codegen::pliron_last_frame();
+            (row.slots, row.spills) = (slots, spills);
+            score_vcode(&v, &mut row, i64::from(out) + i64::from(slots));
+        }
+        Ok(None) => row.status = "compile",
+        Err(_) => row.status = "panic",
+    }
+    row
+}
+
+/// `codegen <dir> <out.json>`: see the usage text.
+fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
+    let isa = backend_isa();
+    let mut files = Vec::new();
+    collect_clif(dir, &mut files);
+    files.sort();
+    files.truncate(o.limit);
+    std::panic::set_hook(Box::new(|_| {}));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let rows = std::sync::Mutex::new(Vec::with_capacity(files.len()));
+    std::thread::scope(|s| {
+        for _ in 0..o.jobs {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(f) = files.get(i) else { break };
+                let r = codegen_one(&*isa, dir, f);
+                rows.lock().unwrap().push(r);
+            });
+        }
+    });
+    let _ = std::panic::take_hook();
+    let mut rows = rows.into_inner().unwrap();
+    rows.sort_by(|a, b| a.file.cmp(&b.file));
+    let sum = |f: fn(&CgRow) -> u64| rows.iter().map(f).sum::<u64>();
+    let json = serde_json::json!({
+        "corpus": dir.display().to_string(),
+        "insts": sum(|r| r.insts as u64), "stack": sum(|r| r.stack as u64),
+        "winsts": sum(|r| r.winsts), "wstack": sum(|r| r.wstack), "wspill": sum(|r| r.wspill),
+        "functions": rows.iter().map(|r| serde_json::json!({
+            "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
+            "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
+        })).collect::<Vec<_>>(),
+    });
+    std::fs::write(out, serde_json::to_string(&json).unwrap()).expect("write codegen report");
+    let bad = rows.iter().filter(|r| r.status != "ok").count();
+    println!(
+        "codegen: {} fns ({bad} failed): insts {} stack {} | weighted insts {} stack {} -> {}",
+        rows.len(),
+        json["insts"], json["stack"], json["winsts"], json["wstack"],
         out.display()
     );
     bad == 0

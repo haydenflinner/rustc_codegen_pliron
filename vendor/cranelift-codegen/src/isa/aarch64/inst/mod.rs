@@ -1249,6 +1249,14 @@ impl MachInst for Inst {
                 Some(Inst::LoadExtNameNear { rd: dst, name: name.clone(), offset: *offset })
             }
             Inst::LoadExtNameGot { name, .. } => Some(Inst::LoadExtNameGot { rd: dst, name: name.clone() }),
+            // Vector and FP immediates (`movi`/`mvni`/`fmov #imm`): the
+            // escape-scan splats serde_json and memchr spill across calls
+            // (every q register is caller-saved).
+            Inst::VecDupImm { imm, invert, size, .. } => {
+                Some(Inst::VecDupImm { rd: dst, imm: *imm, invert: *invert, size: *size })
+            }
+            Inst::VecDupFPImm { imm, size, .. } => Some(Inst::VecDupFPImm { rd: dst, imm: *imm, size: *size }),
+            Inst::FpuMoveFPImm { imm, size, .. } => Some(Inst::FpuMoveFPImm { rd: dst, imm: *imm, size: *size }),
             // A bitmask immediate: `orr rd, xzr, #imm`.
             Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size, rn, imml, .. } if *rn == zero_reg() => {
                 Some(Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size: *size, rd: dst, rn: *rn, imml: *imml })

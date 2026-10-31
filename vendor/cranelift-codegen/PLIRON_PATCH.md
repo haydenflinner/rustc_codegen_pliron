@@ -1020,3 +1020,9 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     already set the Q bit from the size. Priorities -10..-12: ISLE cannot
     prove the two extern type extractors disjoint. Test: simdshift's
     `neon` (`ushr.2s`), `narrow` and `varshift` (`dup` + `ushl`/`sshl`).
+
+81. aarch64 `rematerialize` also takes vector and FP immediates
+    (`VecDupImm` = `movi`/`mvni`, `VecDupFPImm`, `FpuMoveFPImm`). Every q
+    register is caller-saved, so a splat constant live across a call
+    spilled: serde_json's `skip_to_escape` stored its three escape-scan
+    masks and reloaded them in every scan block (28 -> 8 stack accesses).

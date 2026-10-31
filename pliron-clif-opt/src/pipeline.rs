@@ -1274,7 +1274,14 @@ fn corpus_dump(p: &mut Pipe) {
         lts.join(","),
         crate::diffcheck::clif_text(&p.clctx.func)
     );
-    let name = crate::diffcheck::safe_name(p.fname);
+    // `safe_name` keeps 80 chars, and mangled generic names share long
+    // prefixes (regex's eleven `ExecNoSync` methods): a truncated name gets
+    // its full name's FNV-1a hash so corpus files map back to one symbol.
+    let mut name = crate::diffcheck::safe_name(p.fname);
+    if p.fname.len() > 80 {
+        let h = p.fname.bytes().fold(0x811c9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x01000193));
+        name.push_str(&format!("_{h:08x}"));
+    }
     let path = std::path::Path::new(dir).join(format!("{name}.{n}.clif"));
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(path, text);
