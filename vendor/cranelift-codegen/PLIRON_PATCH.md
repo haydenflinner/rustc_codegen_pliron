@@ -1074,3 +1074,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `base + index` whose loaded value has two uses read `Multiple` and was
     kept whole (`add x5, x19, x27; ldurb w5, [x5]` instead of
     `ldrb w5, [x19, x27]`).
+
+87. Opt-in load rematerialization (`src/context.rs` `load_remat`,
+    `PLIRON_LOADREMAT=1`, `PLIRON_LOADREMAT_DIST`): a `notrap` load is
+    re-issued before a use more than DIST instructions after the previous
+    copy, within one block, when no store/call/side effect intervenes.
+    blake3's `compress_pre`: 67 -> 11 stack loads, 16 -> 10 stores, but no
+    runtime change (its time is the round functions' dependency chains,
+    not the spill traffic the profile samples land on), so it stays off.

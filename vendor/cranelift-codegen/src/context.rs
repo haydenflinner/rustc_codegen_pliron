@@ -231,6 +231,7 @@ impl Context {
         if matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)) {
             self.const_sink();
             self.exit_const_sink();
+            self.load_remat();
             self.shrink_split();
         }
 
@@ -1033,6 +1034,79 @@ impl Context {
             self.compute_cfg();
             self.compute_domtree();
             self.compute_loop_analysis();
+        }
+    }
+
+    /// PLIRON: re-issue a load near a distant use instead of keeping its
+    /// value live (`PLIRON_LOADREMAT=1`, opt-in; `PLIRON_LOADREMAT_DIST`
+    /// instructions, default 48). Within one block, when nothing between the
+    /// previous copy and the use can write memory (no store, call, atomic
+    /// or fence), the same `notrap` load reads the same value. blake3's
+    /// `compress_pre` loads its 16 message words once, uses each once per
+    /// round for 7 rounds, and with 16 state words also live spilled and
+    /// reloaded them (67 stack loads and 16 stores; LLVM 44 and 21). A
+    /// fresh load from the input block costs what a reload costs and needs
+    /// no spill store.
+    fn load_remat(&mut self) {
+        use crate::ir::{InstructionData, Opcode, Value};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static DIST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_LOADREMAT").as_deref() == Ok("1")) {
+            return;
+        }
+        let dist = *DIST.get_or_init(|| {
+            std::env::var("PLIRON_LOADREMAT_DIST").ok().and_then(|s| s.parse().ok()).unwrap_or(48)
+        });
+        let blocks: Vec<crate::ir::Block> = self.func.layout.blocks().collect();
+        for b in blocks {
+            let insts: Vec<crate::ir::Inst> = self.func.layout.block_insts(b).collect();
+            if insts.len() < 2 * dist {
+                continue;
+            }
+            // Position of the latest memory writer before each index.
+            let writes = |op: Opcode| op.can_store() || op.is_call() || op.other_side_effects();
+            let mut last_write = vec![usize::MAX; insts.len() + 1];
+            let mut lw = usize::MAX;
+            for (k, &i) in insts.iter().enumerate() {
+                last_write[k] = lw;
+                if writes(self.func.dfg.insts[i].opcode()) {
+                    lw = k;
+                }
+            }
+            for (k, &l) in insts.iter().enumerate() {
+                let InstructionData::Load { opcode, .. } = self.func.dfg.insts[l] else { continue };
+                let notrap = self.func.dfg.insts[l].memflags_data(&self.func.dfg).is_some_and(|f| f.notrap());
+                if !matches!(opcode, Opcode::Load | Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32
+                    | Opcode::Sload8 | Opcode::Sload16 | Opcode::Sload32)
+                    || !notrap
+                {
+                    continue;
+                }
+                let v = self.func.dfg.first_result(l);
+                // In-block uses, in order.
+                let mut uses: Vec<(usize, crate::ir::Inst)> = insts[k + 1..]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, u)| self.func.dfg.inst_values(**u).any(|x| self.func.dfg.resolve_aliases(x) == v))
+                    .map(|(j, &u)| (k + 1 + j, u))
+                    .collect();
+                uses.sort_unstable();
+                let mut cur: (usize, Value) = (k, v);
+                for (uk, u) in uses {
+                    // The value is fresh enough, or a writer intervenes.
+                    if uk - cur.0 <= dist || (last_write[uk] != usize::MAX && last_write[uk] >= k) {
+                        continue;
+                    }
+                    let ni = self.func.dfg.clone_inst(l);
+                    self.func.layout.insert_inst(ni, u);
+                    let nv = self.func.dfg.first_result(ni);
+                    let old = cur.1;
+                    let f = &mut self.func.dfg;
+                    let raw: Vec<Value> = f.inst_values(u).filter(|&x| f.resolve_aliases(x) == v || x == old).collect();
+                    f.map_inst_values(u, |x| if raw.contains(&x) { nv } else { x });
+                    cur = (uk, nv);
+                }
+            }
         }
     }
 
