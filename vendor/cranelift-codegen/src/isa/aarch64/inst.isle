@@ -2094,6 +2094,9 @@
     (Ushr)
     ;; Signed shift right
     (Sshr)
+    ;; PLIRON: shift right narrow (`shrn`, low half): `size` is the
+    ;; destination arrangement, the source lanes are twice as wide.
+    (Shrn)
 ))
 
 ;; Destructive shift-by-immediate operation on each lane of a vector.

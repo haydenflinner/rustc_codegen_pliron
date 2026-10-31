@@ -154,8 +154,16 @@ impl Stats {
 }
 
 /// Everything a step needs beyond `&mut Function`.
+/// An empty `Pipe::const_tables` for embedders without data access.
+pub static EMPTY_TABLES: std::sync::LazyLock<FxHashMap<u32, std::sync::Arc<[u8]>>> =
+    std::sync::LazyLock::new(FxHashMap::default);
+
 pub struct Pipe<'a> {
     pub clctx: &'a mut Context,
+    /// Bytes of small immutable, relocation-free data objects by
+    /// `DataId` index (the `UserExternalName` index of a `symbol_value`):
+    /// constant tables passes may read (`bytescan`). Empty when unknown.
+    pub const_tables: &'a FxHashMap<u32, std::sync::Arc<[u8]>>,
     pub isa: &'a dyn TargetIsa,
     pub fname: &'a str,
     pub func_id: FuncId,
@@ -3668,6 +3676,18 @@ fn s_ivretro(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // aarch64 only: the movemask lowering (`ushr`/`unarrow`) is tuned there.
+    if !p.simd || p.x64 || p.wasm {
+        return 0;
+    }
+    let k = crate::bytescan::run(&mut p.clctx.func, an, p.const_tables);
+    if k > 0 {
+        p.dump("bytescan");
+    }
+    k
+}
+
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = looprot::run(&mut p.clctx.func, an, p.derived);
     p.dump("looprot");
@@ -3883,6 +3903,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Re-time rotated loops that test the pre-increment IV so the latch
         // tests `iadd p, s` directly — drops the backedge register copy.
         step("ivalign", "ivalign", Gate::Env("PLIRON_IVALIGN"), s_ivalign).needs(shape::LOOPS),
+        // Byte-set scans over a constant table: 16 bytes per step (before
+        // punroll, which would unroll the scalar scan instead).
+        step("bytescan", "", Gate::OptIn("PLIRON_BYTESCAN"), s_bytescan).needs(shape::LOOPS),
         // Scalar unroll of linear counted loops (e.g. ordered float
         // reductions that can't vectorize): K bodies per branch.
         cstep(
@@ -4440,6 +4463,82 @@ mod tests {
         return v4
     }";
 
+    /// A `Pipe` over `func` with no facts but `nonnull`, for unit tests.
+    fn with_test_pipe<R>(name: &str, func: Function, nonnull: FxHashSet<Value>, f: impl FnOnce(&mut Pipe) -> R) -> R {
+    let isa = host_isa();
+    let mut clctx = Context::for_function(func);
+    let nowrite: FxHashMap<FuncRef, bool> = Default::default();
+    let call_frozen: FxHashMap<FuncRef, u64> = Default::default();
+    let nounwind: FxHashSet<FuncRef> = Default::default();
+    let scoped: FxHashMap<Inst, Ptr<BasicBlock>> = Default::default();
+    let invariant: FxHashSet<Inst> = Default::default();
+    let block_region: FxHashMap<Block, Ptr<BasicBlock>> = Default::default();
+    let prof: FxHashMap<Block, u64> = Default::default();
+    let region_parent: pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>> =
+        Default::default();
+    let nocap: FxHashSet<(Inst, u32)> = Default::default();
+    let mut nonnull = nonnull;
+    let mut derived = VMap::default();
+    let mut frozen = FxHashMap::default();
+    let mut noalias = FxHashSet::default();
+    let mut scoped_na = FxHashSet::default();
+    let mut deref = FxHashMap::default();
+    let mut operand_frozen = FxHashMap::default();
+    let mut lifetimes = Vec::new();
+    let mut stats = Stats::default();
+    let mut fact_bits = SecondaryMap::new();
+    let flags = FnFlags::default();
+    let uen_syms = FxHashMap::default();
+    let mut p = Pipe {
+        const_tables: &EMPTY_TABLES,
+        fact_bits: &mut fact_bits,
+        clctx: &mut clctx,
+        isa: &*isa,
+        fname: name,
+        func_id: FuncId::from_u32(0),
+        uen_syms: &uen_syms,
+        nonnull: &mut nonnull,
+        derived: &mut derived,
+        frozen: &mut frozen,
+        noalias: &mut noalias,
+        scoped_na: &mut scoped_na,
+        deref: &mut deref,
+        nowrite: &nowrite,
+        call_frozen: &call_frozen,
+        nounwind: &nounwind,
+        scoped: &scoped,
+        invariant: &invariant,
+        operand_frozen: &mut operand_frozen,
+        block_region: &block_region,
+        prof: &prof,
+        region_parent: &region_parent,
+        inst_region: Default::default(),
+        lifetimes: &mut lifetimes,
+        nocap: &nocap,
+        edge_kills: Vec::new(),
+        dbg_slots: &Default::default(),
+        tcfg: isa.frontend_config(),
+        simd: true,
+        x64: false,
+        cmp64: true,
+        amode_scale: amode_scale(&*isa),
+        wasm: false,
+        has_eh: false,
+        flags: &flags,
+        prof_hook: None,
+        dump: false,
+        verify_full: false,
+        unopt: false,
+        since_reap: false,
+        stats: &mut stats,
+        carry_log: Vec::new(),
+        fn_names: &[],
+        cur_step: "",
+    };
+        p.seed_fact_bits();
+        f(&mut p)
+    }
+
     /// A block param's `nonnull` is true only on paths into its block;
     /// a uniform-feed merge (`pmap[param] = carrier`) makes the carrier
     /// the param's value *at those merge points*, not on paths that
@@ -4458,93 +4557,26 @@ mod tests {
         assert!(matches!(func.dfg.value_def(v2), ValueDef::Result(..)));
         assert!(matches!(func.dfg.value_def(v4), ValueDef::Param(..)));
 
-        let isa = host_isa();
-        let mut clctx = Context::for_function(func);
-        let nowrite: FxHashMap<FuncRef, bool> = Default::default();
-        let call_frozen: FxHashMap<FuncRef, u64> = Default::default();
-        let nounwind: FxHashSet<FuncRef> = Default::default();
-        let scoped: FxHashMap<Inst, Ptr<BasicBlock>> = Default::default();
-        let invariant: FxHashSet<Inst> = Default::default();
-        let block_region: FxHashMap<Block, Ptr<BasicBlock>> = Default::default();
-        let prof: FxHashMap<Block, u64> = Default::default();
-        let region_parent: pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>> =
-            Default::default();
-        let nocap: FxHashSet<(Inst, u32)> = Default::default();
         let mut nonnull = FxHashSet::default();
         nonnull.insert(v4);
-        let mut derived = VMap::default();
-        let mut frozen = FxHashMap::default();
-        let mut noalias = FxHashSet::default();
-        let mut scoped_na = FxHashSet::default();
-        let mut deref = FxHashMap::default();
-        let mut operand_frozen = FxHashMap::default();
-        let mut lifetimes = Vec::new();
-        let mut stats = Stats::default();
-        let mut fact_bits = SecondaryMap::new();
-        let flags = FnFlags::default();
-        let uen_syms = FxHashMap::default();
-        let mut p = Pipe {
-            fact_bits: &mut fact_bits,
-            clctx: &mut clctx,
-            isa: &*isa,
-            fname: "carry_keeps_param_facts_scoped",
-            func_id: FuncId::from_u32(0),
-            uen_syms: &uen_syms,
-            nonnull: &mut nonnull,
-            derived: &mut derived,
-            frozen: &mut frozen,
-            noalias: &mut noalias,
-            scoped_na: &mut scoped_na,
-            deref: &mut deref,
-            nowrite: &nowrite,
-            call_frozen: &call_frozen,
-            nounwind: &nounwind,
-            scoped: &scoped,
-            invariant: &invariant,
-            operand_frozen: &mut operand_frozen,
-            block_region: &block_region,
-            prof: &prof,
-            region_parent: &region_parent,
-            inst_region: Default::default(),
-            lifetimes: &mut lifetimes,
-            nocap: &nocap,
-            edge_kills: Vec::new(),
-            dbg_slots: &Default::default(),
-            tcfg: isa.frontend_config(),
-            simd: true,
-            x64: false,
-            cmp64: true,
-            amode_scale: amode_scale(&*isa),
-            wasm: false,
-            has_eh: false,
-            flags: &flags,
-            prof_hook: None,
-            dump: false,
-            verify_full: false,
-            unopt: false,
-            since_reap: false,
-            stats: &mut stats,
-            carry_log: Vec::new(),
-            fn_names: &[],
-            cur_step: "",
-        };
-        p.seed_fact_bits();
-        // The buggy pair: a param's guarded nonnull onto the wider-scope
-        // call result — must not transfer (different blocks: v4's site
-        // doesn't cover v1's def).
-        carry_one(&mut p, v4, v1);
-        assert!(
-            !p.nonnull.contains(&v1),
-            "param-scoped nonnull poisoned the merge carrier"
-        );
-        // Dedup carries still work: a result's mark reaches its
-        // later-defined twin in the same block.
-        p.nonnull.insert(v1);
-        p.fact_bits[v1] |= fact_bits::NONNULL;
-        carry_one(&mut p, v1, v2);
-        assert!(
-            p.nonnull.contains(&v2),
-            "same-block result->result carry dropped a covered fact"
-        );
+        with_test_pipe("carry_keeps_param_facts_scoped", func, nonnull, |p| {
+            // The buggy pair: a param's guarded nonnull onto the wider-scope
+            // call result — must not transfer (different blocks: v4's site
+            // doesn't cover v1's def).
+            carry_one(p, v4, v1);
+            assert!(
+                !p.nonnull.contains(&v1),
+                "param-scoped nonnull poisoned the merge carrier"
+            );
+            // Dedup carries still work: a result's mark reaches its
+            // later-defined twin in the same block.
+            p.nonnull.insert(v1);
+            p.fact_bits[v1] |= fact_bits::NONNULL;
+            carry_one(p, v1, v2);
+            assert!(
+                p.nonnull.contains(&v2),
+                "same-block result->result carry dropped a covered fact"
+            );
+        });
     }
 }

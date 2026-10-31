@@ -562,6 +562,15 @@ t_pairret() {
   done
 }
 
+t_bytescan() {
+  # Byte-set scans over a constant table (opt-in `PLIRON_BYTESCAN`, gate job
+  # `optin:bytescan`): output must match stock rustc's. codegen-units=8
+  # puts the table in another CGU (its bytes come from rustc's evaluation).
+  for o in "-C codegen-units=1" "-C codegen-units=8"; do
+    rustc $BE --edition 2021 -O $o tests/bytescan/main.rs -o $out/bytescan$exe && $out/bytescan$exe | diff --strip-trailing-cr - tests/bytescan/expected.out || return 1
+  done
+}
+
 t_slpsplat() {
   # slp xpack: two loads of one address splat only when nothing writes it
   # between them (rustlantis seeds 538/683/730).
@@ -1205,6 +1214,7 @@ want elabloops && t_elabloops
 [[ -z "$exe" ]] && want unwindstd && t_unwindstd
 want mirshapes && t_mirshapes
 want pairret && t_pairret
+want bytescan && t_bytescan
 want slpsplat && t_slpsplat
 want applestackargs && t_applestackargs
 want fnalign && t_fnalign

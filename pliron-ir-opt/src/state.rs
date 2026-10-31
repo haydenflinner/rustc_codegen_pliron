@@ -332,6 +332,10 @@ pub struct State {
     pub consts: ColMap<Value, ConstVal>,
     pub funcs: SymMap<FuncInfo>,
     pub globals: SymMap<GlobalInfo>,
+    /// Bytes of immutable, `Freeze`, relocation-free statics this CGU only
+    /// imports (defined in another CGU or crate), from rustc's evaluation
+    /// of their initializer: constant tables CLIF passes may read.
+    pub extern_bytes: FxHashMap<String, std::sync::Arc<[u8]>>,
     pub ident_to_sym: FxHashMap<String, String>,
     pub sym_to_ident: FxHashMap<String, Identifier>,
     pub allocas: ColMap<Value, (u64, u64)>,

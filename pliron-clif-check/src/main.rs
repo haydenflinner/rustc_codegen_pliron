@@ -338,6 +338,7 @@ fn with_pipe<R>(
     let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
     let uen_syms = Default::default();
     let mut p = Pipe {
+        const_tables: &pipeline::EMPTY_TABLES,
         fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa,

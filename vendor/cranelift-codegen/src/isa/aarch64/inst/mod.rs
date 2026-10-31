@@ -2799,13 +2799,14 @@ impl Inst {
                 size,
                 imm,
             } => {
-                let op = match op {
-                    VecShiftImmOp::Shl => "shl",
-                    VecShiftImmOp::Ushr => "ushr",
-                    VecShiftImmOp::Sshr => "sshr",
+                let (op, nsize) = match op {
+                    VecShiftImmOp::Shl => ("shl", size),
+                    VecShiftImmOp::Ushr => ("ushr", size),
+                    VecShiftImmOp::Sshr => ("sshr", size),
+                    VecShiftImmOp::Shrn => ("shrn", VectorSize::from_lane_size(size.lane_size().widen(), true)),
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), size);
-                let rn = pretty_print_vreg_vector(rn, size);
+                let rn = pretty_print_vreg_vector(rn, nsize);
                 format!("{op} {rd}, {rn}, #{imm}")
             }
             &Inst::VecShiftImmMod {

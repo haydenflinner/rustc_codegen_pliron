@@ -2175,6 +2175,9 @@ impl MachInstEmit for Inst {
                     VecShiftImmOp::Ushr => (true, 0b_001_011110_0000_000_000001_00000_00000_u32),
                     VecShiftImmOp::Sshr => (true, 0b_000_011110_0000_000_000001_00000_00000_u32),
                     VecShiftImmOp::Shl => (false, 0b_000_011110_0000_000_010101_00000_00000_u32),
+                    // immh selects the destination lane size; the shift is
+                    // encoded like a right shift on that size.
+                    VecShiftImmOp::Shrn => (true, 0b_000_011110_0000_000_100001_00000_00000_u32),
                 };
                 if size.is_128bits() {
                     template |= 0b1 << 30;

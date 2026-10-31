@@ -3390,6 +3390,15 @@
 
 ;; extractlane with lane 0 can pass through the value unchanged; upper
 ;; bits are undefined when a narrower type is in a wider register.
+;; PLIRON: the 4-bits-per-byte movemask of a byte-compare mask `m`
+;; (`ushr.i16x8 m, 4`, keep the low byte of each lane, narrow, take the low
+;; 64 bits) is `shrn v.8b, m.8h, #4; fmov x, d` (pliron's `bytescan`).
+(rule 4 (lower (extractlane $I64 (bitcast $I64X2 _ (unarrow $I8X16 (band $I16X8 (ushr $I16X8 x (iconst _ (u64_from_imm64 4))) (splat $I16X8 (iconst _ (u64_from_imm64 255)))) _)) (u8_from_uimm8 0)))
+      (mov_from_vec (vec_shift_imm (VecShiftImmOp.Shrn) 4 x (VectorSize.Size8x8)) 0 (ScalarSize.Size64)))
+;; ... with the mask constant folded to a `vconst` by the egraph.
+(rule 4 (lower (extractlane $I64 (bitcast $I64X2 _ (unarrow $I8X16 (band $I16X8 (ushr $I16X8 x (iconst _ (u64_from_imm64 4))) (vconst $I16X8 (u128_from_constant 0x00ff_00ff_00ff_00ff_00ff_00ff_00ff_00ff))) _)) (u8_from_uimm8 0)))
+      (mov_from_vec (vec_shift_imm (VecShiftImmOp.Shrn) 4 x (VectorSize.Size8x8)) 0 (ScalarSize.Size64)))
+
 (rule 2 (lower (extractlane (ty_scalar_float _) val (u8_from_uimm8 0)))
       val)
 

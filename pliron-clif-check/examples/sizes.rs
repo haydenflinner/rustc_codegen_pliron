@@ -97,6 +97,7 @@ fn main() {
         facts.lifetimes(&clctx.func),
     );
     let mut p = Pipe {
+        const_tables: &pipeline::EMPTY_TABLES,
         clctx: &mut clctx,
         isa: &*isa,
         fname: Path::new(&path).file_name().unwrap().to_str().unwrap(),

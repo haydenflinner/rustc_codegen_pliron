@@ -675,6 +675,8 @@ struct JobShared {
     /// (C) reads (see [`FnJob::shed`]); a wasm job keeps only its CLIF
     /// ([`FnJob::shed_facts`]).
     shed: bool,
+    /// See `Pipe::const_tables`.
+    const_tables: FxHashMap<u32, Arc<[u8]>>,
 }
 
 /// One queued function job: the declaration index (phase (C) re-orders
@@ -911,6 +913,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
             let prof_hook =
                 |nm: &'static str| -> Box<dyn Send + '_> { sh.prof.activity(nm, None) };
             let mut pipe = crate::pipeline::Pipe {
+                const_tables: &sh.const_tables,
                 cur_step: "",
                 clctx,
                 isa: &*sh.isa,
@@ -1502,6 +1505,7 @@ pub fn lower_module<'a>(
         fn_names,
         wasm: false,
         shed: free_ctx,
+        const_tables: const_tables(ctx, st, &ids),
     });
     // `PLIRON_DEFERDEAD` (`=0` disables): emit-only `xcgu` copies (`dead_unopt`: no
     // caller `direct_callee` or `address_taken` can see) lower last, and
@@ -2577,6 +2581,7 @@ pub fn lower_clif_wasm(
         fn_names: decl_names,
         wasm: true,
         shed: free_ctx,
+        const_tables: FxHashMap::default(),
     });
     let mut scratch = FlScratch::default();
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
@@ -3002,6 +3007,32 @@ fn atomic_stub_asm(name: &str, macho: bool) -> String {
             ".section .text.{name},\"ax\",@progbits\n.globl {name}\n.hidden {name}\n.type {name},@function\n{name}:\n{body}.size {name}, .-{name}\n.text\n"
         )
     }
+}
+
+/// Immutable, relocation-free data objects of 16..=4096 bytes, by `DataId`
+/// index (see `Pipe::const_tables`).
+fn const_tables(ctx: &Context, st: &State, ids: &FxHashMap<String, Sym>) -> FxHashMap<u32, Arc<[u8]>> {
+    let mut out = FxHashMap::default();
+    for (n, g) in st.globals.iter() {
+        let (Some(init), false, false) = (g.init, g.mutable, g.tls) else { continue };
+        let Some(Sym::D(id, _)) = ids.get(n).copied() else { continue };
+        let (size, _) = size_align(ctx, init.get_type(ctx));
+        if !(16..=4096).contains(&size) {
+            continue;
+        }
+        let mut bytes = vec![0u8; size as usize];
+        let mut relocs = Vec::new();
+        write_const(ctx, st, init, 0, &mut bytes, &mut relocs);
+        if relocs.is_empty() {
+            out.insert(id.as_u32(), Arc::from(bytes));
+        }
+    }
+    for (n, b) in &st.extern_bytes {
+        if let Some(Sym::D(id, false)) = ids.get(n).copied() {
+            out.entry(id.as_u32()).or_insert_with(|| b.clone());
+        }
+    }
+    out
 }
 
 pub fn write_const(

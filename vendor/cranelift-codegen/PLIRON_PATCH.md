@@ -1089,3 +1089,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     is an `unarrow` only its low half is narrowed (`sqxtun`, no
     `sqxtun2`). memchr's movemask through pliron's `vtrunc`: 8 -> 4
     instructions.
+
+89. aarch64 `shrn` (`VecShiftImmOp::Shrn`, `inst.isle`/`emit.rs`/`mod.rs`,
+    encoding test in `emit_tests.rs`): shift right narrow, low half; `size`
+    is the destination arrangement. `lower.isle` extractlane rule 4: the
+    4-bits-per-byte movemask `extractlane.i64 (bitcast.i64x2 (unarrow
+    (band (ushr m, 4) 0x00ff..) _)) 0` (splat or `vconst` mask) is `shrn
+    v.8b, m.8h, #4; fmov x, d` instead of `ushr; and; sqxtun; sqxtun2;
+    mov` (pliron's `bytescan`).

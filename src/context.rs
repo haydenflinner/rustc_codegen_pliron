@@ -348,6 +348,7 @@ impl<'tcx> CodegenCx<'tcx> {
         }
         if !self.st.borrow().globals.contains_key(sym) {
             let ty = self.type_i8();
+            let tls = self.tcx.is_thread_local_static(def_id);
             self.declare_global(
                 sym,
                 GlobalInfo {
@@ -355,14 +356,39 @@ impl<'tcx> CodegenCx<'tcx> {
                     init: None,
                     align: 1,
                     mutable: true,
-                    tls: self.tcx.is_thread_local_static(def_id),
+                    tls,
                     linkage: Linkage::Import,
                     used: false,
                     section: None,
                 },
             );
+            if !tls && !self.tcx.is_foreign_item(def_id) && let Some(b) = self.static_bytes(def_id) {
+                self.st.borrow_mut().extern_bytes.insert(sym.to_string(), b);
+            }
         }
         self.sym_addr(sym)
+    }
+
+    /// The bytes of an immutable, `Freeze` static's initializer when they
+    /// are fully initialized, pointer-free and 16..=4096 long (a lookup
+    /// table): rustc evaluates initializers of statics from other CGUs and
+    /// crates too. Writing such a static is UB, so the bytes are fixed.
+    fn static_bytes(&self, def_id: rustc_hir::def_id::DefId) -> Option<std::sync::Arc<[u8]>> {
+        // A `#[linkage]` (weak) definition can be replaced at link time.
+        if self.tcx.static_mutability(def_id) != Some(rustc_ast::Mutability::Not)
+            || self.tcx.codegen_fn_attrs(def_id).linkage.is_some()
+        {
+            return None;
+        }
+        let alloc = self.tcx.eval_static_initializer(def_id).ok()?;
+        let a = alloc.inner();
+        let len = a.len();
+        if a.mutability.is_mut() || !(16..=4096).contains(&len) || !a.provenance().ptrs().is_empty() {
+            return None;
+        }
+        let range = rustc_middle::mir::interpret::alloc_range(rustc_abi::Size::ZERO, a.size());
+        a.init_mask().is_range_initialized(range).ok()?;
+        Some(std::sync::Arc::from(a.inspect_with_uninit_and_ptr_outside_interpreter(0..len)))
     }
 
     pub fn print_ir(&self) -> String {

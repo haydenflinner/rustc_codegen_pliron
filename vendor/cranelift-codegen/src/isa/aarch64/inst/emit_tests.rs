@@ -5389,6 +5389,17 @@ fn test_aarch64_binemit() {
 
     insns.push((
         Inst::VecShiftImm {
+            op: VecShiftImmOp::Shrn,
+            rd: writable_vreg(0),
+            rn: vreg(1),
+            size: VectorSize::Size8x8,
+            imm: 4,
+        },
+        "20840C0F",
+        "shrn v0.8b, v1.8h, #4",
+    ));
+    insns.push((
+        Inst::VecShiftImm {
             op: VecShiftImmOp::Shl,
             rd: writable_vreg(27),
             rn: vreg(5),
