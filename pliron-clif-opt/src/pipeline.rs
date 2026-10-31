@@ -3676,6 +3676,14 @@ fn s_ivretro(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_brifsel(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::brifsel::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("brifsel");
+    }
+    k
+}
+
 fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
     // aarch64 only: the movemask lowering (`ushr`/`unarrow`) is tuned there.
     if !p.simd || p.x64 || p.wasm {
@@ -3898,6 +3906,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // the back edge.
         .needs_any(shape::LOOPS | shape::CONDBR),
         cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
+        // `brif c` args that are `select c, a, b`: `a`/`b` per edge (the
+        // TrustedRandomAccess zip's if-converted index update becomes
+        // affine before the IV passes below).
+        step("brifsel", "brifsel", Gate::OptIn("PLIRON_BRIFSEL"), s_brifsel).needs(shape::CONDBR),
         // Lockstep pointer IVs (`zip`/slice `cmp`/`eq`): one exit test.
         step("zipiv", "zipiv", Gate::OptIn("PLIRON_ZIPIV"), s_zipiv).needs(shape::LOOPS),
         // Re-time rotated loops that test the pre-increment IV so the latch

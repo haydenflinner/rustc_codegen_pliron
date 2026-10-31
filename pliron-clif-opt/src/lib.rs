@@ -11,6 +11,7 @@ pub mod bunroll;
 pub mod latchspec;
 pub mod mergejump;
 pub mod bittab;
+pub mod brifsel;
 pub mod bytescan;
 pub mod brchain;
 pub mod celim;

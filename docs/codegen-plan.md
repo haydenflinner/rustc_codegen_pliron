@@ -315,7 +315,17 @@ Evening (2026-10-31):
   `TrustedRandomAccess` index loop (`base + i*8` recomputed, a per-limb
   reload of the SmallVec length, latch spills). Needed next: index ->
   pointer strength reduction (W2), and the callee's `noalias` on `z`
-  kept the same region-scoped way so the length load hoists. Tried and
+  kept the same region-scoped way so the length load hoists. Follow-ups
+  tried: opt-in `brifsel` (a `brif c` arg `select c, a, b` is `a`/`b`
+  per edge) makes the zip index affine. Inner loop 52 -> 39
+  instructions, no spills, one exit test, plus the exit-only length
+  reload sunk (`PLIRON_EDGESINK_LOADS`). blind-sig still 1.566 vs 1.270:
+  `phisimp` keeping the clone's `nnargs` params alive blocks IR
+  simplification wholesale (100 functions change; der's
+  `Header::decode` 330 -> 850 instructions). The carrier design is wrong.
+  Put the fact on the incoming value, scoped to the clone's region
+  (`st.region_blocks`), and have `fold_null_tests` check the test's
+  block is inside it. Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
