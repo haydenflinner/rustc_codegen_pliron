@@ -10,7 +10,7 @@
 //!
 //! Seeds (mirroring LLVM's per-instruction check for a function without
 //! `mustprogress`):
-//! - a cycle in the CFG — any loop may run forever (LLVM would accept a
+//! - a cycle in the CFG reachable from the entry — any loop may run forever (LLVM would accept a
 //!   loop with a SCEV-bounded trip count; we have no trip-count proof);
 //! - a cycle in the call graph — recursion may not bottom out. Every cycle
 //!   holds a DFS back edge; seeding the back edge's caller reaches each
@@ -38,13 +38,14 @@
 //! come back *and* behave deterministically; everyone else may loop
 //! forever or observe differently.
 
-use pliron::context::Context;
+use pliron::basic_block::BasicBlock;
+use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
 use pliron_llvm::ops::{
     AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp, CallIntrinsicOp, CallOp, FenceOp,
     InlineAsmOp, UnreachableOp,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::inline::{blocks_iter, direct_callee};
 use crate::state::State;
@@ -95,12 +96,20 @@ pub fn run(ctx: &Context, st: &mut State) {
         p.known.push((ids.id(s),));
     }
     let mut os = Vec::new();
+    // The CFG is gathered during the same op walk: block ordinals, and
+    // (block, successor) edges from terminators and invoke landing pads.
+    let mut ord: FxHashMap<Ptr<BasicBlock>, u32> = FxHashMap::default();
+    let mut raw: Vec<(u32, Ptr<BasicBlock>)> = Vec::new();
+    let mut edges: Vec<(u32, u32)> = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
-        if !crate::inline::loop_blocks(ctx, st, st.funcs[s].op).is_empty() {
-            p.cyclic.push((f,));
-        }
-        for b in blocks_iter(ctx, st.funcs[s].op) {
+        // Already diverging from an op seed: the cycle check can't add to it.
+        let mut seeded = false;
+        ord.clear();
+        raw.clear();
+        for (i, b) in blocks_iter(ctx, st.funcs[s].op).enumerate() {
+            let i = i as u32;
+            ord.insert(b, i);
             crate::inline::ops_into(ctx, b, &mut os);
             for (k, &op) in os.iter().enumerate() {
                 macro_rules! is {
@@ -109,6 +118,10 @@ pub fn run(ctx: &Context, st: &mut State) {
                     };
                 }
                 if is!(CallOp) {
+                    // Invokes are CallOps: their landing pad is a CFG edge.
+                    if let Some(&(pad, _)) = st.invokes.get(op) {
+                        raw.push((i, pad));
+                    }
                     // A tail call *is* the caller's exit: `unreachable`
                     // after it can't let an unknown callee off the hook.
                     let tail = st.calls.get(op).is_some_and(|ci| ci.tail);
@@ -118,7 +131,10 @@ pub fn run(ctx: &Context, st: &mut State) {
                             .is_some_and(|&n| Operation::is_op::<UnreachableOp>(n, ctx));
                     match direct_callee(ctx, st, op) {
                         Some(c) => p.call.push((f, ids.id(c), unr)),
-                        None => p.icall.push((f, unr)),
+                        None => {
+                            seeded |= !unr;
+                            p.icall.push((f, unr))
+                        }
                     }
                 } else if st.volatile.contains(op)
                     || is!(AtomicRmwOp)
@@ -130,8 +146,21 @@ pub fn run(ctx: &Context, st: &mut State) {
                     || (is!(CallIntrinsicOp)
                         && st.intrinsics.get(op).is_some_and(|n| n.contains("trap")))
                 {
+                    seeded = true;
                     p.side_fx.push((f,));
                 }
+            }
+            if let Some(&t) = os.last() {
+                for d in t.deref(ctx).successors(ctx) {
+                    raw.push((i, d));
+                }
+            }
+        }
+        if !seeded {
+            edges.clear();
+            edges.extend(raw.iter().filter_map(|&(a, d)| ord.get(&d).map(|&j| (a, j))));
+            if cfg_has_cycle(ord.len(), &mut edges) {
+                p.cyclic.push((f,));
             }
         }
     }
@@ -165,6 +194,45 @@ pub fn run(ctx: &Context, st: &mut State) {
         crate::dump_fact("willreturn", s, &wr.contains(s));
     }
     st.willreturn = wr.into_iter().collect();
+}
+
+/// Whether the CFG reachable from the entry block (ordinal 0) has a cycle:
+/// an iterative DFS that stops at the first back edge. `edges` are
+/// (from, to) ordinals, sorted in place into per-block runs.
+fn cfg_has_cycle(n: usize, edges: &mut [(u32, u32)]) -> bool {
+    if n == 0 {
+        return false;
+    }
+    edges.sort_unstable();
+    let mut start = vec![0u32; n + 1];
+    for &(a, _) in edges.iter() {
+        start[a as usize + 1] += 1;
+    }
+    for i in 0..n {
+        start[i + 1] += start[i];
+    }
+    // 0 = unseen, 1 = on the DFS stack, 2 = done
+    let mut state = vec![0u8; n];
+    state[0] = 1;
+    let mut dfs = vec![(0usize, start[0])];
+    while let Some(&mut (v, ref mut k)) = dfs.last_mut() {
+        if *k < start[v + 1] {
+            let w = edges[*k as usize].1 as usize;
+            *k += 1;
+            match state[w] {
+                0 => {
+                    state[w] = 1;
+                    dfs.push((w, start[w]));
+                }
+                1 => return true,
+                _ => {}
+            }
+            continue;
+        }
+        state[v] = 2;
+        dfs.pop();
+    }
+    false
 }
 
 /// Callers of the back edges of an iterative DFS over the direct-call

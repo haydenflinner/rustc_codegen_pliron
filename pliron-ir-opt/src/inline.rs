@@ -543,7 +543,7 @@ fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>>
 /// code is worth it). One Tarjan pass — a block loops iff its SCC has more
 /// than one member or it has a self-edge; the quadratic per-block DFS this
 /// replaces took ~100ms per rebuild on a post-inline `main`.
-pub(crate) fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
     // One ptr→local-ordinal map, then the whole Tarjan state is dense
     // Vecs — five hash structures shrank to one.
     let mut bs = blocks(ctx, f);
