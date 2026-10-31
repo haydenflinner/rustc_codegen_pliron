@@ -226,7 +226,7 @@ impl Context {
         // `tls_value`/`symbol_value`/`func_addr` out of the loop its
         // only uses sit in, buying it a loop-spanning live range (and
         // regalloc2 boundary moves on every region crossing).
-        self.remat_sink();
+        self.remat_sink(isa.triple().architecture == target_lexicon::Architecture::X86_64);
 
         // PLIRON: reorder pure insts so a shared operand's last use lands
         // on a destructive two-address op; elaboration's DFS arg order can
@@ -758,15 +758,23 @@ impl Context {
     /// `__pliron_eh` check path). The pliron-side `splink` pass does this
     /// for the CLIF pipeline, but the egraph elaborator re-hoists these
     /// ops as loop-invariant — so repeat the sinking here, post-egraph.
-    fn remat_sink(&mut self) {
+    /// x86-64 only (`x64`): there the clone is one RIP-relative `lea`; on
+    /// aarch64 it is `adrp` + `add` per loop iteration (pulldown-cmark's
+    /// per-byte escape scan; LLVM hoists). `PLIRON_REMATSINK=1` sinks on
+    /// every target, `=0` nowhere.
+    fn remat_sink(&mut self, x64: bool) {
         use crate::ir::{Inst, InstructionData, Opcode, Value};
         use crate::{FxHashMap, FxHashSet};
 
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // `Some(on)` forced by `PLIRON_REMATSINK=0|1`, `None` = by target.
+        static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
         static REMATSINK_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| {
-            std::env::var_os("PLIRON_REMATSINK").is_none_or(|v| v != "0")
-        }) {
+        let mode = *MODE.get_or_init(|| match std::env::var("PLIRON_REMATSINK").as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        });
+        if !mode.unwrap_or(x64) {
             return;
         }
 

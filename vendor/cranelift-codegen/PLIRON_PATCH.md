@@ -941,3 +941,13 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     num-bigint-dig's Montgomery loop, blind-sig 0.88 s -> 0.67 s (LLVM
     0.54 s). Test: `pliron-clif-opt/tests/carry_cinc.rs` (fails with the
     rule off).
+
+73. `remat_sink` (`src/context.rs`, the post-egraph clone of
+    `symbol_value`/`func_addr`/`tls_value` into loop use blocks) now runs on
+    x86-64 only: there the clone is one RIP-relative `lea`, on aarch64 it is
+    `adrp` + `add` per iteration (pulldown-cmark's escape-table scan; LLVM
+    hoists). `PLIRON_REMATSINK=1` sinks on every target, `=0` nowhere. The
+    pliron-side `splink` address cloning and `licm`'s skip of symbol
+    addresses changed the same way (`PLIRON_SPLINK_ADDR=1`,
+    `PLIRON_LICM_SYM=0`). Test: `pliron-clif-opt/tests/symaddr_loop.rs`
+    (fails with `PLIRON_REMATSINK=1`).

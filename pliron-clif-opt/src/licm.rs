@@ -84,7 +84,10 @@ fn covers(bytes: u64, off: i64, ty: Type) -> bool {
 
 /// Speculatable: executing it unconditionally can't trap, touch memory, or
 /// branch. Constants and frame addresses are free everywhere, so hoisting
-/// them is pure churn — skipped.
+/// them is pure churn — skipped. Symbol and function addresses are not
+/// free (`adrp` + `add`, or a GOT load, on aarch64): they hoist like any
+/// other invariant (pulldown-cmark's escape scan rebuilt its table address
+/// every byte; `PLIRON_LICM_SYM=0` restores skipping them).
 pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
     let op = func.dfg.insts[i].opcode();
     if func.dfg.inst_results(i).is_empty()
@@ -97,6 +100,10 @@ pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
     {
         return false;
     }
+    if matches!(op, Opcode::FuncAddr | Opcode::SymbolValue) {
+        static SYM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *SYM.get_or_init(|| crate::pass_enabled("PLIRON_LICM_SYM"));
+    }
     !matches!(
         op,
         Opcode::Iconst
@@ -105,8 +112,6 @@ pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
             | Opcode::Vconst
             | Opcode::StackAddr
             | Opcode::GetStackPointer
-            | Opcode::FuncAddr
-            | Opcode::SymbolValue
     )
 }
 

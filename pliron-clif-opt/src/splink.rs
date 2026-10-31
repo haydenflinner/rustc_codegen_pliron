@@ -69,7 +69,10 @@ fn scalar_const(func: &Function, i: Inst) -> bool {
 /// moves on every back edge (count_alpha's `mov %rbp,%rdx`/`mov %rdx,%rbp`
 /// shuffles), while a per-use clone is a few cheap insts in the use
 /// block. `addr_of_symbol` in jumpthread.rs already treats them as
-/// deterministic.
+/// deterministic. x64 only: there the clone is one RIP-relative `lea`; on
+/// aarch64 it is `adrp` + `add` per use, which put two instructions in
+/// pulldown-cmark's per-byte escape scan that LLVM hoists.
+/// `PLIRON_SPLINK_ADDR=1` clones them on every target.
 fn remat_addr(func: &Function, i: Inst) -> bool {
     matches!(
         func.dfg.insts[i],
@@ -162,6 +165,10 @@ fn cheap_scalar(func: &Function, d: Inst, x64: bool) -> bool {
 }
 
 pub fn run(func: &mut Function, la: &LoopAnalysis, x64: bool) -> usize {
+    let addr_remat = x64 || {
+        static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ALL.get_or_init(|| std::env::var("PLIRON_SPLINK_ADDR").as_deref() == Ok("1"))
+    };
     if func.layout.blocks().count() > MAX_BLOCKS {
         return 0;
     }
@@ -189,7 +196,7 @@ pub fn run(func: &mut Function, la: &LoopAnalysis, x64: bool) -> usize {
                 if let (Some(lp), Some(db)) = (lb, func.layout.inst_block(d))
                     && !la.is_in_loop(db, lp)
                     && ((scalar_const(func, d) && cheap_scalar(func, d, x64))
-                        || remat_addr(func, d))
+                        || (addr_remat && remat_addr(func, d)))
                 {
                     uses.entry(d).or_default().insert(b);
                 }
