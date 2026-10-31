@@ -2020,6 +2020,7 @@ pub(crate) fn round<'a>(
     let kb_on = crate::pass_enabled("PLIRON_KBITS");
     let range2 = crate::pass_enabled("PLIRON_RANGE2");
     let bodyk = crate::pass_enabled("PLIRON_BODYK");
+    let stale_chk = crate::pass_enabled("PLIRON_JTSTALE");
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
     let def_block = |v: Value| match func.dfg.value_def(v) {
@@ -2151,6 +2152,18 @@ pub(crate) fn round<'a>(
                         break;
                     };
                     let v = func.dfg.resolve_aliases(v);
+                    // A back-edge arg defined in `b` itself (another of its
+                    // params, or a body value) is this trip's binding: the
+                    // threaded edge skips `b`, so from the next trip on it
+                    // would carry the value `b` last bound — the entry's.
+                    // indexmap's `erase_indices` zip rotated `old`/`new`
+                    // through the merge block's params and looped on
+                    // `start + 1` forever. A param passed back to itself
+                    // is the one safe case (`b` would rebind it unchanged).
+                    if stale_chk && v != p && def_block(v) == Some(b) {
+                        ok = false;
+                        break;
+                    }
                     argv.insert(p, v);
                     if let Some(c) = known(func, &outer, v) {
                         env.insert(p, c);

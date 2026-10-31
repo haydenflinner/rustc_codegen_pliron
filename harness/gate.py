@@ -62,6 +62,8 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # loc named by an operand-frozen stop across a store through the plain name
 # (16782, hang) and sroa leaving a flow-reached by-value call arg unpinned
 # (16787, segfault), 2026-10-31.
+# Stanzas re-run with a default-off pass enabled (`optin:<stanza>` jobs).
+OPTIN_STANZAS = {"bytescan": {"PLIRON_BYTESCAN": "1"}}
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309,
                 13475, 16782, 16787, 16980, 17028, 18889]
 
@@ -167,7 +169,8 @@ def main():
     jobs = []
     if want("unit"):
         jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", "-p", "pliron-cfg", "-p",
-                                                  "pliron-clif-opt", "-p", "pliron-ir-opt"])))
+                                                  "pliron-clif-opt", "-p", "pliron-ir-opt", "-p",
+                                                  "pliron-clif-check"])))
     # Slowest first so the pool's tail is short.
     order = sorted(stanzas(), key=lambda n: n not in ("pgo", "std", "unwind"))
     for n in order:
@@ -184,6 +187,12 @@ def main():
             jobs.append((f"poison:{n}", lambda n=n: run(f"poison:{n}", shell(["./test.sh", f"--only={n}"]),
                          {"TEST_NOBUILD": "1", "PLIRON_SM_POISON": "1",
                           "TEST_OUT": f"target/tests-poison/{n}"})))
+    # Opt-in passes over the stanzas written for them, each in its own
+    # TEST_OUT: a default-off pass still gets a regression run per gate.
+    for n, env in OPTIN_STANZAS.items():
+        if want(f"optin:{n}") and n in order:
+            jobs.append((f"optin:{n}", lambda n=n, env=env: run(f"optin:{n}", shell(["./test.sh", f"--only={n}"]),
+                         {"TEST_NOBUILD": "1", **env, "TEST_OUT": f"target/tests-optin/{n}"})))
     # The wasm sysroot leg is opt-in: four -Zbuild-std builds per backend
     # change makes it ~10x every other job. wasm_smoke covers emit->link->run.
     if (a.full or "wasm" in only) and "wasm" not in skip:
