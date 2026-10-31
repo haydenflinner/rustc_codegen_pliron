@@ -4525,6 +4525,7 @@ mod tests {
     let uen_syms = FxHashMap::default();
     let mut p = Pipe {
         const_tables: &EMPTY_TABLES,
+        region_nn: &EMPTY_RNN,
         fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa: &*isa,
