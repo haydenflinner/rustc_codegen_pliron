@@ -1057,3 +1057,20 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     keeps those params from merging back with their inputs. Correct on the
     full test suite; applies to 2 of 26 hot functions; neutral in two
     held-out A/Bs, so off.
+
+85. Loop-exit constants on the exit edge (`src/context.rs`
+    `exit_const_sink`, post-egraph; `PLIRON_EXITCONST=0` disables). The
+    egraph rematerializes a constant in the block that uses it; a branch
+    argument's user is the branch, so a loop latch passing `(255, 0, 0, 0)`
+    to its exit block materialized them every iteration. A constant whose
+    every use is an argument of one exit edge (target outside the source
+    block's innermost loop) moves into a new edge block that jumps to the
+    target. pulldown-cmark's `parse_block` scan: latch `add; cmp; b.lo`
+    instead of five instructions. Test: `pliron-clif-opt/tests/loop_exit_codegen.rs`.
+
+86. Shared amodes need two direct uses (`src/machinst/lower.rs`
+    `amode_shareable`; `PLIRON_AMODESHARE_DIRECT=0` restores the old test).
+    `value_ir_uses` is propagated through results, so a single-use
+    `base + index` whose loaded value has two uses read `Multiple` and was
+    kept whole (`add x5, x19, x27; ldurb w5, [x5]` instead of
+    `ldrb w5, [x19, x27]`).

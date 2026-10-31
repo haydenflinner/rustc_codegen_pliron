@@ -230,6 +230,7 @@ impl Context {
         self.remat_sink(isa.triple().architecture == target_lexicon::Architecture::X86_64);
         if matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)) {
             self.const_sink();
+            self.exit_const_sink();
             self.shrink_split();
         }
 
@@ -928,6 +929,111 @@ impl Context {
         // Originals left without uses are dropped by later DCE-free
         // lowering anyway (an unused pure def emits nothing).
         let _ = n;
+    }
+
+    /// PLIRON: constants that are only branch arguments on a loop exit
+    /// edge move onto that edge (`PLIRON_EXITCONST=0` disables). The
+    /// egraph rematerializes constants in the block that uses them, and for
+    /// a branch argument that is the latch: pulldown-cmark's `parse_block`
+    /// scan loop materialized the exit path's `(255, 0, 0, 0)` on every
+    /// byte. A new edge block holds them and jumps to the exit target.
+    fn exit_const_sink(&mut self) {
+        use crate::ir::{BlockArg, BlockCall, InstBuilder, InstructionData, Opcode, Value};
+        use crate::cursor::{Cursor, FuncCursor};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_EXITCONST").as_deref() != Ok("0")) {
+            return;
+        }
+        // Only worth the analyses when some brif passes a constant.
+        let mut any = false;
+        'scan: for b in self.func.layout.blocks() {
+            if let Some(t) = self.func.layout.last_inst(b)
+                && let InstructionData::Brif { blocks, .. } = self.func.dfg.insts[t]
+            {
+                for bc in blocks {
+                    for a in bc.args(&self.func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a
+                            && let Some(i) = self.func.dfg.value_def(v).inst()
+                            && self.func.dfg.insts[i].opcode() == Opcode::Iconst
+                        {
+                            any = true;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        if !any {
+            return;
+        }
+        self.compute_cfg();
+        self.compute_domtree();
+        self.compute_loop_analysis();
+        let mut uses: crate::FxHashMap<Value, u32> = crate::FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                for v in self.func.dfg.inst_values(i) {
+                    *uses.entry(self.func.dfg.resolve_aliases(v)).or_default() += 1;
+                }
+            }
+        }
+        let blocks: Vec<crate::ir::Block> = self.func.layout.blocks().collect();
+        let mut n = 0;
+        for b in blocks {
+            let Some(lp) = self.loop_analysis.innermost_loop(b) else { continue };
+            let Some(t) = self.func.layout.last_inst(b) else { continue };
+            let InstructionData::Brif { blocks: [e0, e1], .. } = self.func.dfg.insts[t] else { continue };
+            if e0.block(&self.func.dfg.value_lists) == e1.block(&self.func.dfg.value_lists) {
+                continue;
+            }
+            for slot in 0..2 {
+                let InstructionData::Brif { blocks, .. } = self.func.dfg.insts[t] else { unreachable!() };
+                let bc = blocks[slot];
+                let target = bc.block(&self.func.dfg.value_lists);
+                if self.loop_analysis.is_in_loop(target, lp) {
+                    continue;
+                }
+                let args: Vec<BlockArg> = bc.args(&self.func.dfg.value_lists).collect();
+                // Every use of the constant is an argument of this edge (a
+                // zero passed for three fields is one value used thrice).
+                let in_args = |f: &crate::ir::Function, v: Value| {
+                    args.iter().filter(|a| matches!(a, BlockArg::Value(x) if f.dfg.resolve_aliases(*x) == v)).count() as u32
+                };
+                let movable = |f: &crate::ir::Function, a: &BlockArg| -> Option<crate::ir::Inst> {
+                    let BlockArg::Value(v) = *a else { return None };
+                    let v = f.dfg.resolve_aliases(v);
+                    let i = f.dfg.value_def(v).inst()?;
+                    (f.dfg.insts[i].opcode() == Opcode::Iconst
+                        && f.layout.inst_block(i) == Some(b)
+                        && uses.get(&v).copied() == Some(in_args(f, v)))
+                    .then_some(i)
+                };
+                let mut moves: Vec<crate::ir::Inst> = args.iter().filter_map(|a| movable(&self.func, a)).collect();
+                moves.sort_unstable();
+                moves.dedup();
+                if moves.is_empty() {
+                    continue;
+                }
+                let e = self.func.dfg.make_block();
+                self.func.layout.append_block(e);
+                for &i in &moves {
+                    self.func.layout.remove_inst(i);
+                    self.func.layout.append_inst(i, e);
+                }
+                FuncCursor::new(&mut self.func).at_bottom(e).ins().jump(target, &args);
+                let dfg = &mut self.func.dfg;
+                let dests = dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+                dests[slot] = BlockCall::new(e, core::iter::empty(), &mut dfg.value_lists);
+                n += 1;
+            }
+        }
+        // The cached analyses describe the old CFG; the verifier and later
+        // passes read them.
+        if n > 0 {
+            self.compute_cfg();
+            self.compute_domtree();
+            self.compute_loop_analysis();
+        }
     }
 
     /// PLIRON: live-range split for shrink-wrapping (`PLIRON_SHRINKWRAP=1`,

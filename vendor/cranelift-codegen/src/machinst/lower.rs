@@ -2097,7 +2097,13 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     /// sortw/hashmap hot functions stay byte-identical to OFF; looser
     /// thresholds regress).
     pub fn amode_shareable(&self, val: Value) -> bool {
-        if self.value_ir_uses[val] != ValueUseState::Multiple {
+        // `value_ir_uses` is propagated: a single-use address whose loaded
+        // value has two uses reads `Multiple` too. Only a value used by more
+        // than one instruction is shared (pulldown's `parse_block` scan kept
+        // `add x5, x19, x27; ldurb w5, [x5]` instead of `ldrb w5, [x19, x27]`).
+        static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let direct = *DIRECT.get_or_init(|| std::env::var("PLIRON_AMODESHARE_DIRECT").as_deref() != Ok("0"));
+        if self.value_ir_uses[val] != ValueUseState::Multiple || (direct && self.value_direct_uses[val] <= 1) {
             return false;
         }
         if self.value_non_amode_use[val] {
