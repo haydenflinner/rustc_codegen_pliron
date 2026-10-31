@@ -47,7 +47,8 @@ fn fx_maybe(p: &i32, b: bool) -> *const i32 {
     if b { p } else { std::ptr::null() }
 }
 
-/// Recursion with no calls out: can't unwind, write-free.
+/// Recursion with no calls out: can't unwind, write-free; not willreturn
+/// (termination needs a proof that `n / 2` reaches 0, which we never try).
 #[inline(never)]
 fn fx_depth(n: u32) -> u32 {
     if n == 0 { 0 } else { 1 + fx_depth(n / 2) }

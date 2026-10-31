@@ -23,8 +23,9 @@
 //! second call comes back with the same value, on the same exit — without
 //! the fact it could diverge or read differently where the first returned.
 //! Speculation (hoist of a call the loop might not run) is equally safe:
-//! an infinite loop with no observable interaction is UB under rustc's
-//! `mustprogress`, so a willreturn callee may only diverge via UB.
+//! `willreturn` excludes every callee with a loop or a recursive call
+//! (Rust defines `loop {}`; rustc emits no `mustprogress`), so a willreturn
+//! callee comes back, or unwinds, or is UB.
 
 use pliron::{
     basic_block::BasicBlock,

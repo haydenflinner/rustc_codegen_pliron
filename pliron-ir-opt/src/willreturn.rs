@@ -2,12 +2,19 @@
 //! `Instruction::willReturn` applied per-op): every execution of the
 //! function either returns, unwinds out, tail-calls out, or is UB — control
 //! can't stay inside forever *and* can't observe the outside differently on
-//! a re-execution. rustc marks Rust fns `mustprogress`: an infinite
-//! loop/recursion with no observable interaction is UB, so the only
-//! executions that may legitimately never come back are the ones seeded
-//! below, propagated over the call graph as a least fixpoint.
+//! a re-execution. Rust has no forward-progress rule: `loop {}` is defined,
+//! and rustc emits no `mustprogress`, so a loop or a recursion with no
+//! observable interaction may legitimately never come back. The executions
+//! that may never come back are the ones seeded below, propagated over the
+//! call graph as a least fixpoint.
 //!
-//! Seeds (mirroring LLVM's per-instruction check):
+//! Seeds (mirroring LLVM's per-instruction check for a function without
+//! `mustprogress`):
+//! - a cycle in the CFG — any loop may run forever (LLVM would accept a
+//!   loop with a SCEV-bounded trip count; we have no trip-count proof);
+//! - a cycle in the call graph — recursion may not bottom out. Every cycle
+//!   holds a DFS back edge; seeding the back edge's caller reaches each
+//!   member through the `call` propagation rule;
 //! - a volatile op — LLVM's `willReturn` is false on volatile accesses
 //!   (they're legal fuel for an infinite loop *and* nondeterministic, so a
 //!   dedup'd or speculated call could produce a different value);
@@ -62,10 +69,14 @@ ascent::ascent! {
     /// a re-execution may observe differently (or that can fuel a legal
     /// infinite loop): volatile, atomic, asm, trap.
     relation side_fx(u32);
+    /// `f` has a loop in its CFG, or makes the back-edge call of a cycle in
+    /// the call graph: it may keep control forever without side effects.
+    relation cyclic(u32);
 
     /// `f` may keep control forever or behave nondeterministically.
     relation diverge(u32);
     diverge(f) <-- side_fx(f);
+    diverge(f) <-- cyclic(f);
     diverge(f) <-- icall(f, false);
     diverge(f) <-- call(f, c, false), !known(c);
     diverge(f) <-- call(f, c, _), diverge(c);
@@ -86,6 +97,9 @@ pub fn run(ctx: &Context, st: &mut State) {
     let mut os = Vec::new();
     for s in &bodied {
         let f = ids.id(s);
+        if !crate::inline::loop_blocks(ctx, st, st.funcs[s].op).is_empty() {
+            p.cyclic.push((f,));
+        }
         for b in blocks_iter(ctx, st.funcs[s].op) {
             crate::inline::ops_into(ctx, b, &mut os);
             for (k, &op) in os.iter().enumerate() {
@@ -121,6 +135,9 @@ pub fn run(ctx: &Context, st: &mut State) {
             }
         }
     }
+    for f in back_edge_callers(&p.call) {
+        p.cyclic.push((f,));
+    }
     p.run();
     let diverge: FxHashSet<u32> = p.diverge.iter().map(|&(f,)| f).collect();
     let wr: FxHashSet<String> = LIBC
@@ -148,4 +165,42 @@ pub fn run(ctx: &Context, st: &mut State) {
         crate::dump_fact("willreturn", s, &wr.contains(s));
     }
     st.willreturn = wr.into_iter().collect();
+}
+
+/// Callers of the back edges of an iterative DFS over the direct-call
+/// graph: at least one per cycle (self-calls included), in one linear walk.
+/// Roots are taken in ascending id order, so the result is deterministic.
+fn back_edge_callers(calls: &[(u32, u32, bool)]) -> Vec<u32> {
+    let n = calls.iter().map(|&(f, c, _)| f.max(c) as usize + 1).max().unwrap_or(0);
+    let mut succ: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(f, c, _) in calls {
+        succ[f as usize].push(c);
+    }
+    // 0 = unseen, 1 = on the DFS stack, 2 = done
+    let mut state = vec![0u8; n];
+    let mut out = Vec::new();
+    for root in 0..n {
+        if state[root] != 0 {
+            continue;
+        }
+        state[root] = 1;
+        let mut dfs = vec![(root, 0usize)];
+        while let Some(&mut (v, ref mut k)) = dfs.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                match state[w as usize] {
+                    0 => {
+                        state[w as usize] = 1;
+                        dfs.push((w as usize, 0));
+                    }
+                    1 => out.push(v as u32),
+                    _ => {}
+                }
+                continue;
+            }
+            state[v] = 2;
+            dfs.pop();
+        }
+    }
+    out
 }

@@ -695,32 +695,32 @@ the parallel chapter; this chapter only names the point where they plug in.
 
 #r("iropt.ipo.willreturn", title: "willreturn: comes back deterministically", level: "must",
    refines: "model.equiv",
-   checked: "test.sh facts")[
+   checked: ("test.sh willret", "test.sh facts"))[
   A function MUST NOT be summarized `willreturn` when it contains a
   volatile access, an atomic op or fence, inline asm, a trap, an indirect
   call or a call to a function with no table entry that is not directly
   followed by `unreachable`, or a call to a function that is not
-  `willreturn`. Loops and recursion do not, by themselves, deny the fact:
-  the inference treats an infinite loop with no observable interaction as
-  undefined.
+  `willreturn`. It MUST NOT be summarized `willreturn` when its CFG has a
+  cycle or when it lies on a cycle of the direct-call graph: Rust defines
+  an infinite loop with no observable interaction (`loop {}` runs
+  forever), and rustc emits no `mustprogress`.
 ]
 
-#note[
-  The code justifies the loop rule by saying rustc marks functions
-  `mustprogress`. Stock rustc's LLVM backend emits no `mustprogress`, and
-  Rust defines `loop {}` as running forever. A side-effect-free
-  non-terminating function is therefore summarized `willreturn`, write-free
-  and nounwind, and #refr("iropt.callgvn") may erase an unused call to it
-  or hoist it into a loop preheader the loop never reaches. This is an open
-  correctness question for #refr("model.equiv"), not a guarantee.
+#resolved[
+  Until 2026-10-30 loops and recursion did not deny the fact; the code
+  assumed rustc marks functions `mustprogress`. A side-effect-free function
+  that never returns was summarized `willreturn`, and #refr("iropt.callgvn")
+  erased unused calls to it (`tests/willret`). Every CFG cycle and every
+  call-graph cycle now seeds divergence.
 ]
 
-#llvm(kind: "choice", summary: [`willreturn` ignores loops (assumes forward progress); LLVM proves loops finite with SCEV before inferring it.])[
-  LLVM's FunctionAttrs infers `willreturn` only when every instruction
-  will return and the function has no cycle that might be unbounded, which
-  needs a SCEV-computed maximum trip count unless the function is
-  `mustprogress`. The rule here is weaker in what it demands and so infers
-  the fact more often; see the note above for what that costs.
+#llvm(kind: "gap", summary: [`willreturn` is denied to every function with a loop or recursion; LLVM also accepts loops with a SCEV-bounded trip count.])[
+  LLVM's FunctionAttrs infers `willreturn` for a function without
+  `mustprogress` only when every instruction will return and every cycle
+  has a SCEV-computed maximum trip count; recursive SCCs are excluded.
+  Here no trip count is computed, so any loop denies the fact. Calls to
+  pure functions with bounded loops are therefore kept where LLVM could
+  erase or speculate them.
 ]
 
 #r("iropt.ipo.ret", title: "Return-value summaries", level: "must",

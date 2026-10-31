@@ -369,7 +369,7 @@ nnret fx_maybe: false
 retarg fx_second: Some(1)
 nounwind fx_depth: true
 willreturn fx_sum: true
-willreturn fx_depth: true
+willreturn fx_depth: false
 willreturn fx_vread: false
 EOF
   return $bad
@@ -795,6 +795,25 @@ t_debuginfo() {
   cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
 }
 
+# r[verify iropt.ipo.willreturn]
+t_willret() {
+  # willreturn must deny loops and recursion (Rust has no forward-progress
+  # rule): the program checks that a call to a spinning fn is not erased,
+  # and the dumped facts must match.
+  PLIRON_FACTS=wr_ rustc $BE --edition 2021 -O -C codegen-units=1 tests/willret/main.rs -o $out/willret$exe 2> $out/willret.txt && $out/willret$exe
+  sed -E 's/_RNvCs[A-Za-z0-9]+_4main[0-9]+//' $out/willret.txt > $out/willret.got
+  local bad=0
+  while read -r want; do
+    grep -qxF "$want" $out/willret.got || { echo "willret: missing '$want'" >&2; bad=1; }
+  done <<'EOF'
+willreturn wr_spin: false
+willreturn wr_ping: false
+willreturn wr_pong: false
+willreturn wr_leaf: true
+EOF
+  return $bad
+}
+
 # r[verify iropt.ipo.ret]
 t_retattr() {
   # nnret/retarg must both fire (stats) and never lie (asserts): a wrongly
@@ -1075,6 +1094,7 @@ want spills && t_spills
 want slotpromlt && t_slotpromlt
 want byvalhome && t_byvalhome
 want retattr && t_retattr
+want willret && t_willret
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
 # resumes lower to `pliron.eh.rethrow` via cleanup_ret (funclet path), so
