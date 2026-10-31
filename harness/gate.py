@@ -58,9 +58,12 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # adds and loopvec's coefficient negation overflowing at the i64 edge
 # (5042, 5542, 4895), and slp moving a store past a narrow `uload32` of its
 # bytes (4940), 2026-10-24; slotmerge's starts-mode coalescing ignoring an
-# earlier pair's copy window (13475, -O0), 2026-10-27.
+# earlier pair's copy window (13475, -O0), 2026-10-27; loadfwd keeping a
+# loc named by an operand-frozen stop across a store through the plain name
+# (16782, hang) and sroa leaving a flow-reached by-value call arg unpinned
+# (16787, segfault), 2026-10-31.
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309,
-                13475, 17028]
+                13475, 16782, 16787, 17028]
 
 
 def shell(cmd):

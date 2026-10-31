@@ -687,9 +687,19 @@ fn accesses_inner(
                     kind,
                     flow,
                 });
-            } else if (diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx))
+            } else if !flow
+                && (diverging_arg(ctx, op, p) || copyable_arg(ctx, st, op, p, idx))
                 && in_range(base, 0)
             {
+                // Not for a `flow` operand (one reached through a loaded-back
+                // pointer): the rewrite below skips flow accesses, so no
+                // fresh copy would ever be made — the callee would get the
+                // `pin_a` address, and an Escape pins no bytes, so `pin_a`
+                // would hold only the slices other flow accesses happened
+                // to touch. A by-value `Adt22` (176 B) moved through
+                // `*(&mut _5)` got a 32-byte `pin_a`; the callee wrote the
+                // rest into the caller's frame (fuzz seed 16787). A flow
+                // operand pins its extent below instead, or blocks the split.
                 out.push(Access {
                     op,
                     off: base as u64,

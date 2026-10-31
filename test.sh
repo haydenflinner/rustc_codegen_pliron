@@ -248,7 +248,11 @@ t_sroa() {
   # pointers retained past the call must land where the caller's promoted
   # fields live, and multiple pinned args on one call retarget
   # independently (two Pins on one op must not trip the self-copy guard).
-  rustc $BE --edition 2021 -O -C codegen-units=1 tests/sroa/main.rs -o $out/sroa$exe && $out/sroa$exe
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/sroa/main.rs -o $out/sroa$exe && $out/sroa$exe &&
+  # A by-value arg moved through a stored `&mut` (a flow operand) pins its
+  # whole extent; an unpinned Escape left the callee reading past `pin_a`
+  # (fuzz seed 16787).
+  rustc $BE --edition 2021 -O -C codegen-units=1 -Zmir-opt-level=0 tests/sroa/flowpin.rs -o $out/sroa_flowpin$exe && $out/sroa_flowpin$exe
 }
 
 t_spills() {

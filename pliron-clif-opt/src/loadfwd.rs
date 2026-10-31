@@ -461,6 +461,53 @@ pub fn kill(
     });
 }
 
+/// The other half of the dual-name rule: a loc keyed under an `ofrozen`
+/// stop name `V(x)` (`x` in `na` but not in `na0`) is memory that also
+/// has a plain name, `n0(x)` — the store arms' extra `na0` kill covers a
+/// store made through the stop name, not a loc kept under it. `kill`
+/// compares the loc's stop root with the store's plain root, finds them
+/// different and keeps the loc whenever the plain root is `iso`/`ncc`.
+/// But `iso` only rules out *untracked* pointers, and `x` is derived from
+/// that same root: `store 7 -> v32; store 3 -> v6+24; load v32`, with
+/// `v32 = v6 + 24` an operand-frozen operand, forwarded 7 (fuzz seed
+/// 16782, an infinite loop). Translate each such loc into its plain name
+/// and test it against the store's plain footprint `w`. The same object
+/// through two names is the store's own write: no immunity applies, as
+/// for `kill`'s `own`. Otherwise the loc keeps the immunities `imm`
+/// grants (`!invariant.load`, region-frozen) and `kill`'s root rules.
+/// `stop0(x)` is `Some(n0(x))` exactly for stop-only names.
+fn kill_stops<T>(
+    av: &mut FxHashMap<Loc, T>,
+    w: Loc,
+    stop0: &dyn Fn(Value) -> Option<(Root, i64)>,
+    iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
+    imm: &dyn Fn(&Loc) -> bool,
+) {
+    let (r, o, ty) = w;
+    let n = i64::from(ty.bytes());
+    let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
+    av.retain(|&(r2, o2, t2), _| {
+        let Root::V(x) = r2 else {
+            return true;
+        };
+        let Some((rx, ox)) = stop0(x) else {
+            return true;
+        };
+        let ot = ox.wrapping_add(o2);
+        if rx == r {
+            return ot >= o.saturating_add(n) || o >= ot.saturating_add(i64::from(t2.bytes()));
+        }
+        if imm(&(r2, o2, t2)) {
+            return true;
+        }
+        match (r, rx) {
+            (Root::S(_), Root::S(_)) => true,
+            _ => shel(&r) || shel(&rx),
+        }
+    });
+}
+
 /// A direct call to a function that writes no memory before returning
 /// normally; across `try_call` it must not write at all unless `eh`, where
 /// [`unwind_edge`] clears the exception edges instead (nowrite.rs).
@@ -723,6 +770,9 @@ fn transfer(
     nm: &NrMemo,
 ) {
     let mut rw = rw;
+    // `na` is `na0` plus the `ofrozen` stop names (`run`'s `stop`): any
+    // extra member means a loc can be keyed under a stop name.
+    let has_stops = na.len() > na0.len();
     // A proven `(root, min offset)` for an address `root` left opaque —
     // `root_min` through bounded addends, then a `pm` hop through a
     // solved param (a `base + 8` cursor posing as `base`). Lets `kill`
@@ -833,6 +883,22 @@ fn transfer(
                 if r0 != r || o0 != o {
                     kill(av, r0, o0, ty, None, iso, ncc, invs, cur, invreg, rpar);
                 }
+                // Locs kept under an `ofrozen` stop name (`kill_stops`).
+                let stop0 = |x: Value| {
+                    (has_stops && na.contains(&x) && !na0.contains(&x))
+                        .then(|| nm.n0(func, ps, na0, x))
+                };
+                let imm = |l: &Loc| {
+                    invs.contains(l)
+                        || cur.is_some_and(|cur| {
+                            invreg
+                                .get(l)
+                                .is_some_and(|rs| rs.iter().any(|&t| in_region(cur, t, rpar)))
+                        })
+                };
+                if has_stops {
+                    kill_stops(av, (r0, o0, ty), &stop0, iso, ncc, &imm);
+                }
                 // A store through `select c, pa, pb` may write either
                 // arm's location — kill both so kept locs don't forward
                 // stale values (the select's own root is opaque `V`).
@@ -855,6 +921,9 @@ fn transfer(
                         let oa0 = oa0.wrapping_add(o);
                         if ra0 != ra || oa0 != oa {
                             kill(av, ra0, oa0, ty, None, iso, ncc, invs, cur, invreg, rpar);
+                        }
+                        if has_stops {
+                            kill_stops(av, (ra0, oa0, ty), &stop0, iso, ncc, &imm);
                         }
                     }
                 }
@@ -1427,6 +1496,7 @@ fn pre(
 ) -> usize {
     let nw: &FxHashMap<FuncRef, bool> = &FxHashMap::default();
     let eh = false;
+    let has_stops = na.len() > na0.len();
     let reach: FxHashSet<Block> = rpo.iter().copied().collect();
     let mut out: FxHashMap<Block, FxHashSet<Loc>> = FxHashMap::default();
     let input = |out: &FxHashMap<Block, FxHashSet<Loc>>, b: Block| -> Option<FxHashSet<Loc>> {
@@ -1626,6 +1696,15 @@ fn pre(
                         kill_st(&mut st, r0, o0, ty, None, &iso, ncc);
                         writes.push(((r0, o0, ty), None));
                     }
+                    // Stop-named locs, as in `transfer` (no immunities
+                    // here, matching the empty sets the fixpoint used).
+                    let stop0 = |x: Value| {
+                        (has_stops && na.contains(&x) && !na0.contains(&x))
+                            .then(|| nm.n0(func, ps, na0, x))
+                    };
+                    if has_stops {
+                        kill_stops(&mut st, (r0, o0, ty), &stop0, &iso, ncc, &|_| false);
+                    }
                     // A store through `select c, pa, pb` may write either
                     // arm's location — kill both, mirroring `transfer` (a
                     // stale `St` here would forward values the store
@@ -1653,6 +1732,9 @@ fn pre(
                                 let a0 = (ra0, oa0, ty);
                                 kill_st(&mut st, a0.0, a0.1, a0.2, None, &iso, ncc);
                                 writes.push((a0, None));
+                            }
+                            if has_stops {
+                                kill_stops(&mut st, (ra0, oa0, ty), &stop0, &iso, ncc, &|_| false);
                             }
                         }
                     }
