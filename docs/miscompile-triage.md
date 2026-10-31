@@ -117,8 +117,10 @@ prefix length. Two traps:
 
 `harness/bisect.py -- <check.sh>` automates the same oracle over
 `PLIRON_OPT_BISECT=N` at finer granularity (one unit = one pass application,
-across IR and CLIF passes). Keep `PLIRON_PAR=0` / `-C codegen-units=1` for
-deterministic numbering.
+across IR and CLIF passes). The numbering is deterministic without extra
+flags: under `PLIRON_OPT_BISECT` the backend runs CGUs and lowering
+serially by itself (`cgupool::enabled`, `lower.rs`) and turns the step and
+pipeline caches off.
 
 ## 5. Inside the step
 

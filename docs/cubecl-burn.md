@@ -19,7 +19,7 @@ Status, 2026-10-29, Apple M3 Max (aarch64, macOS):
   kernel of a process 0.44). Peak RSS is parity.
 - Kernel throughput is **behind**: geomean 1.35x slower over 45 rows
   (f32 compute and memory parity; max-pool forward ~2.7-3x, f16 GEMM ~2x slower).
-  Two lowering flags (`PLIRON_VSELECT`, `PLIRON_FMINMAX`, below; measured as opt-in, **default-on on branch `burst/cubecl-speed` pending the gate**, `=0` kills) bring it
+  Two lowering flags (`PLIRON_VSELECT`, `PLIRON_FMINMAX`, below; measured while opt-in, default-on since 08dd5ae, `=0` turns each off) bring it
   to 1.23x. Objects are 1.7x larger.
 - CubeCL parity card ([`harness/cubecl_card.py`](../harness/cubecl_card.py)):
   **103 overall** (SPD 78, CMP 148, COR 100, MEM 101); **107** with the two flags
@@ -214,21 +214,24 @@ The pool rows are two lowering gaps, found by diffing the objects
 (`CUBECL_PLIRON_DUMP_OBJ`, `llvm-objdump`; details in
 [`history/2026-10-29-cubecl-kernels.md`](history/2026-10-29-cubecl-kernels.md)):
 a `<16 x f32>` `select(fcmp ogt ..)` was split into 16 scalar `fcmp`+`csel`, and
-`llvm.maxnum` became one `fmaxf` libcall per lane. Both now have an opt-in fix,
-default off like any new transform:
+`llvm.maxnum` became one `fmaxf` libcall per lane. Both now have a fix. They
+landed default-off and are default-on since 08dd5ae (`DEFAULT_ON` in
+`pliron-cfg/src/lib.rs`):
 
 | flag | what |
 |---|---|
-| `PLIRON_VSELECT` (default on on the burst branch; `=0` off) | fuse `select(fcmp/icmp(a, b), x, y)` on vectors of 32-bit lanes (all 128-bit native leaves) into the existing `pliron.vcmp.*` + `pliron.vbitselect`, per leaf (vector `fcmp` + `bitselect`) |
-| `PLIRON_FMINMAX` (default on on the burst branch; `=0` off) | `llvm.minnum`/`maxnum` inline (`fmin`/`fmax` + NaN selects) instead of `fminf`/`fmaxf` calls; per native leaf on vectors, lane by lane on 64-bit ones |
+| `PLIRON_VSELECT` (default on; `=0` off) | fuse `select(fcmp/icmp(a, b), x, y)` on vectors of 32-bit lanes (all 128-bit native leaves) into the existing `pliron.vcmp.*` + `pliron.vbitselect`, per leaf (vector `fcmp` + `bitselect`) |
+| `PLIRON_FMINMAX` (default on; `=0` off) | `llvm.minnum`/`maxnum` inline (`fmin`/`fmax` + NaN selects) instead of `fminf`/`fmaxf` calls; per native leaf on vectors, lane by lane on 64-bit ones |
 
 With both on (3 reps, load 9-10): max-pool forward 1.46 / 1.16 (from 2.7 / 3.0),
 `avg_pool2d_backward` 1.14, geomean **1.23** (card SPD 85, overall 107); f16 GEMM
 is now the biggest gap (1.7-2.0x). cubecl-cpu passes 1068/1068 under CLIF with
 both flags on. Their semantics are pinned by native tests (`pliron-clif-opt/tests/vecsel_native.rs`: special values, every predicate) and IR tests (`pliron-clif-lower/tests/ir_peeps.rs`), see [`history/2026-10-29-cubecl-speed.md`](history/2026-10-29-cubecl-speed.md). They are aarch64-tested only; `fcmp uno`/`bitselect` on 64-bit
 vectors are not lowered by the vendored aarch64 ISLE (hence the lane-by-lane
-path), x64 was not run. Enable them for CubeCL with
-`CUBECL_PLIRON_CLIF=1` (the flags are on by default on the burst branch; before the flip add `PLIRON_VSELECT=1 PLIRON_FMINMAX=1`). Before merging the flip they need the rustc-corpus gate (`llvm.maxnum` is also `f32::max`). Opt-in `PLIRON_F16SPLAT=1` (f16 broadcast fold for GEMM, unmeasured) is on the same branch.
+path), x64 was not run. `CUBECL_PLIRON_CLIF=1` gets them by default; set `PLIRON_VSELECT=0` /
+`PLIRON_FMINMAX=0` to reproduce the default-row numbers. `llvm.maxnum` is also
+`f32::max`, so the rustc paths use them too. Opt-in `PLIRON_F16SPLAT=1` (f16
+broadcast fold for GEMM, `pliron-clif-lower/src/scalarize.rs`) is unmeasured.
 
 Previous PARITY line ("f16 clif ~4x faster, bf16 inconclusive") predates the
 two aarch64 f16 encoding fixes and was measured on a different host; on this
@@ -251,8 +254,8 @@ kernels; median 1132 vs 712 B). Not rated on the card.
 
 | config | SPD | CMP | COR | MEM | overall |
 |---|---|---|---|---|---|
-| default | **78** | **148** | **100** | **101** | **103** |
-| `PLIRON_VSELECT=1 PLIRON_FMINMAX=1` | 85 | 150 | 100 | 101 | 107 |
+| flags off (the default on 2026-10-29) | **78** | **148** | **100** | **101** | **103** |
+| `PLIRON_VSELECT=1 PLIRON_FMINMAX=1` (the default since 08dd5ae) | 85 | 150 | 100 | 101 | 107 |
 
 weights SPD 40, CMP 25, COR 25, MEM 10. COR = (CLIF-only failures + 1) /
 (LLVM-only failures + 1) over both suites = 1 (3434 tests, no failure on either
@@ -263,8 +266,10 @@ geomean, MEM the nine-run RSS geomean. Reproduce with the commands under
 ## What is next
 
 - f16 GEMM (~2x slower: per-leaf widen/narrow where LLVM keeps packed ops) is the
-  largest remaining gap; flip `PLIRON_VSELECT`/`PLIRON_FMINMAX` on once the rustc
-  corpus is clean ([`history/2026-10-29-cubecl-kernels.md`](history/2026-10-29-cubecl-kernels.md)).
+  largest remaining gap ([`history/2026-10-29-cubecl-kernels.md`](history/2026-10-29-cubecl-kernels.md));
+  `PLIRON_F16SPLAT=1` is the unmeasured first step.
+- Re-measure the card on current defaults (the second card row was measured
+  with the flags set by hand, before the flip).
 - x86_64 has not been run at all (this was an aarch64 Mac): the f16 bugs above
   were aarch64-only, x64 has separate ISLE rules, so expect a different set.
 - Burn's own pinned cubecl (`5e521ef`) is not supported by this port; moving

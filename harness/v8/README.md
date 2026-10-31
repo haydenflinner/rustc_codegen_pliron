@@ -1,6 +1,6 @@
 # harness/v8 — wasm runtime triage under node/V8
 
-Tools from the 2026-10-21 wasm parity work (`docs/experiments.md` lists
+Tools from the 2026-10-21 wasm parity work (`docs/history/2026-10-21-wasm-experiments.md` lists
 what they found). All take a built module (`bench/wasm/run.sh` output, or
 `variant.sh`), a `k_<kernel>` export, and a function-name substring.
 

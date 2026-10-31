@@ -156,9 +156,11 @@ requested.
 
 - f128 on aarch64-darwin: LLVM lowers to `long double` libcalls but
   `long double` is 64-bit there — stock rustc returns wrong values, pliron
-  is *more* correct (`accepted` harness status; see test-harness.md).
+  is *more* correct (`accepted` harness status; see
+  `history/2026-10-18-test-harness-findings.md`).
 - rustlantis-found upstream bugs: dozens in rustc, LLVM, Cranelift
-  (see testing-overview.md "What the tests found").
+  (see `testing-overview.md` "What the tests found", a note kept
+  outside this repo).
 - Backend-visible `captures(none)` / `nonnull` arg attrs from rustc feed
   jumpthread/slotmerge — useful hints, but deduced at fn-ABI granularity,
   so call rewrites (sret2reg, dead_args) must re-index them or they

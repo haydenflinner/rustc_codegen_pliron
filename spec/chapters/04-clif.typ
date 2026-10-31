@@ -251,7 +251,7 @@ only the consumer of the optimized CLIF differs.
   reductions it was taught, and `slp` pairs adjacent stores. The parity
   notes record loops that `loopvec` analyzes but declines (a compare-count
   loop LLVM turns into SSE2 `pcmpgtd`), and narrow (`<128`-bit) vector
-  throughput below LLVM's (`docs/narrow-vec-gaps.md`).
+  throughput below LLVM's (`docs/history/2026-10-16-narrow-vec-gaps.md`).
 ]
 
 #r("clif.step.select", title: "Selection is a pure function", level: "must",

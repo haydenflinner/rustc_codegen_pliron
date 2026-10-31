@@ -1,6 +1,8 @@
 # Performance of rustc_codegen_pliron
 
 > Narrative history of the performance work, oldest measurements first.
+> It records what was measured when; it is not updated when the code
+> changes, so a mechanism described here may have changed since.
 > **Current numbers and the work list are in [`PARITY.md`](PARITY.md).**
 
 We measured the pliron code generator against the LLVM code generator in
@@ -395,7 +397,13 @@ backend (`-O`).
 The last row is `callgvn`: LLVM proves the callee pure and eliminates all
 100 calls; we now infer the same facts (`nowrite` + `nounwind` +
 `willreturn`) and dedup, hoist and dead-eliminate calls in
-`pliron-ir-opt`. The hoist also moves the operand cone (loop-invariant
+`pliron-ir-opt`. (Since a8f0b06, 2026-10-30, `willreturn` is denied to
+any function that contains a loop or sits on a call-graph cycle: Rust defines
+`loop {}` and rustc emits no `mustprogress`. A callee with a loop, like
+`dotprod` below, is no longer `willreturn`. The chain described below
+needs `willreturn` at two steps (`xoridem` and `callgvn2`), so expect
+this row to lose its call elimination; it has not been re-measured. See
+`pliron-ir-opt/src/willreturn.rs`.) The hoist also moves the operand cone (loop-invariant
 loads/GEPs) and carries invokes — an unwind edge is keyed on the op, so
 it moves with it. `willreturn` (like LLVM's, plus determinism —
 volatile/atomic/asm/indirect callees seed the complement) now backs the

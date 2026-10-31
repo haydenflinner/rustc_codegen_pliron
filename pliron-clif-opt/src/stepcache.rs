@@ -182,7 +182,7 @@ pub(crate) fn enabled() -> bool {
     *ON
 }
 
-/// In-process whole-pipeline tier (`PLIRON_MEMCACHE=1`, opt-in):
+/// In-process whole-pipeline tier (`PLIRON_MEMCACHE`, default on; `=0` off):
 /// identical functions recur across CGUs in one compile — xcgu copies
 /// and rustc's own shared-generic duplicates — and each otherwise
 /// re-runs every step. Keys, variant matching and replay are exactly

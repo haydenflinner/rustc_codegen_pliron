@@ -910,6 +910,8 @@ impl ObjectModule {
                     r_type: object::elf::R_X86_64_TLSGD,
                 }
             }
+            // PLIRON: initial-exec TLS (`tls_model = "elf_ie"`), see
+            // cranelift-codegen PLIRON_PATCH.md item 3.
             Reloc::ElfX86_64GotTpOff => {
                 assert_eq!(
                     self.object.format(),

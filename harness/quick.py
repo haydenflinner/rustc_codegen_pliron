@@ -9,6 +9,7 @@ Usage: harness/quick.py [--tier 0|1] [--base REF] [--jobs N] [--seeds N]
   tier 0 (<30 s warm)  build clif-check (+ the dylib when rustc glue changed),
                        unit tests of only the touched crates (for a CLIF pass:
                        its lib tests + the integration tests named after it),
+                       and, when a CLIF pass, pliron-cfg or vendor/ changed,
                        corpus replay (`clif-check report --check`: whole CLIF
                        pipeline + interpreter diff over every recorded function).
   tier 1 (<3 min)      tier 0 + the test.sh stanzas the changed paths select

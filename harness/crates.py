@@ -10,8 +10,10 @@ pliron-only failures.
 Each pinned crate's published source is fetched once from static.crates.io
 into target/crates/src/<name>-<ver>/ (a `[workspace]` stanza keeps cargo
 from adopting it into ours), then `cargo test --release --no-fail-fast` runs
-twice: stock, and with the pliron backend (RUSTFLAGS *and* RUSTDOCFLAGS, so
-doc-tests go through pliron too). Each side shares one target dir across
+twice: stock, and with the pliron backend. With `--deps pliron` that is
+RUSTFLAGS *and* RUSTDOCFLAGS, so dependencies and doc-tests go through pliron
+too; the default `--deps stock` builds dependencies with stock rustc and only
+the crate's own code with pliron (doc-tests stay stock). Each side shares one target dir across
 crates; cargo doesn't track the backend dylib, so the pliron side is wiped
 when the dylib changes. `--release` by default: the optimizer is where
 miscompiles live (bevy_math's rect_union_pt, 2026-10-21).

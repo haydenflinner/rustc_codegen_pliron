@@ -44,7 +44,7 @@ script that carries each one.
    checked: "harness/gate.py --install-hook")[
   A change MUST NOT merge to `main` unless `harness/gate.py` exits 0 on it.
   A red gate on `main` MUST be fixed before new work lands. `--install-hook`
-  installs a git `pre-push` hook that runs the gate; a push that bypasses
+  installs a git `pre-push` hook that runs the gate (it is opt-in per clone); a push that bypasses
   it with `git push --no-verify` MUST say so in its commit message.
 ]
 
@@ -83,13 +83,12 @@ script that carries each one.
   with no further change. The quick check uses the same discovery.
 ]
 
-#drift[
-  `gate.py`'s docstring says it runs "every `./test.sh` stanza". The
-  pattern's `\w+` does not match a hyphen, so the `lowerfree-wasm` stanza
-  (`want lowerfree-wasm && t_lowerfree_wasm`) is never discovered: neither
-  the gate nor the quick check runs it. The `wasm` leg is dispatched by an
-  `if want wasm` block, which the pattern also misses; that one is
-  deliberate (#refr("verify.gate.legs")).
+#resolved[
+  Until 2026-10-30 the stanza pattern was `want (\w+)`, which does not match
+  a hyphen, so the `lowerfree-wasm` stanza never ran in the gate or the
+  quick check. The pattern is now `want ([\w-]+)`, and the stanza passes.
+  The `wasm` leg is still dispatched by an `if want wasm` block that the
+  pattern misses on purpose (#refr("verify.gate.legs")).
 ]
 
 #r("verify.gate.vacuous", title: "Missing tools make legs pass", level: "must",
@@ -502,7 +501,8 @@ script that carries each one.
 
 #drift[
   `docs/test-harness.md` plans tier 0 for "every commit" and tier 1 "before
-  push". Nothing enforces either: the pre-push hook runs the gate, and the
+  push". Nothing enforces either: the pre-push hook (`--install-hook`, not
+  installed by default) runs only the gate, and the
   gate runs only the `fuzz` suite (`fuzzreg`) from `run.py`.
 ]
 

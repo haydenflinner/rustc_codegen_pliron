@@ -75,9 +75,15 @@ The memory knobs of 2026-10-27 (docs/history/2026-10-27-memory2.md) are in
 this class: `PLIRON_LOWERFREE` frees a CGU's IR earlier, `PLIRON_JEARENA`
 changes which jemalloc arena holds an allocation and when freed pages go
 back to the OS, and `PLIRON_CGU_ACAP=N` delays the start of stage A. None
-may change a byte. `detcheck.py`'s `memfree` and `acap2` variants check it,
-and `test.sh lowerfree` compares every CGU object of tests/std with the
-flags-off build.
+may change a byte. `test.sh lowerfree` compares every CGU object of
+tests/std built with `PLIRON_LOWERFREE=0 PLIRON_JEARENA=0` against the
+default build; the `lowerfree-wasm` stanza does the same for the wasm
+bench kernels (run it by name: the gate's stanza scan does not match the
+hyphen, so neither the gate nor `quick.py` runs it). `detcheck.py`'s `acap2`
+variant checks the CGU cap. Its `memfree` variant sets
+`PLIRON_LOWERFREE=1 PLIRON_JEARENA=1`, which are now the defaults
+(`pliron-cfg` `DEFAULT_ON`), so it compares the default build with itself
+and checks nothing.
 
 ### R4. No output order from unordered iteration
 
@@ -136,15 +142,18 @@ counter whose value reaches output must do the same.
 
 ## Checks
 
-- `harness/run.py --suite determinism` (gate tier 0): each smoke program
+- `harness/run.py --suite determinism` (`run.py` tier 0; not part of
+  `harness/gate.py`): each smoke program
   built twice at one CGU must be byte-identical.
 - `harness/detcheck.py`: each input built per configuration (default, or
   `--config NAME="PLIRON_X=1 ..."`) as a reference, then once per variant
   that must not matter (`again`, `par1`, `inflight1`, `serial`).
   Objects must be byte-identical. A mismatch lists, per object, the
   functions that changed (disassembly with relocations, addresses stripped)
-  and those present on one side only. `--self-test` makes sure a real
-  change (`PLIRON_DEADFREE`) is caught.
+  and those present on one side only. `--self-test` sets
+  `PLIRON_DEADFREE=1` and expects a difference; `DEADFREE` is now on by
+  default, so the self-test no longer sees one and needs a different
+  change.
 - `stepcache`'s contract is its own check: a hit replays bytes produced
   from the same `(key, reads, ran)`.
 

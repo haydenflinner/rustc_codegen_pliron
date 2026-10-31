@@ -353,7 +353,7 @@ a function computes.
 ]
 
 #drift[
-  `docs/seh-design.md`, `docs/seh-handoff.md` and the commit that added the
+  `docs/seh-design.md`, `docs/history/2026-10-23-seh-handoff.md` and the commit that added the
   stub say it is built behind `PLIRON_SEH=1`. The code in
   `codegen_allocator` tests `env_is("PLIRON_SEH", "0")`, so it is built only
   when `PLIRON_SEH=0`. Also, `docs/platforms.md` places the unwind emitter

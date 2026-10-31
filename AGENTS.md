@@ -14,7 +14,8 @@ Read it before picking a task.
 
 1. **Iterate with `harness/quick.py`** (tier 1 default, ~2 min, or
    `--tier 0`, seconds when warm): it reads `git diff`, builds, runs only the
-   touched crates' unit tests, replays the CLIF corpora, runs the
+   touched crates' unit tests, replays the CLIF corpora (when
+   `pliron-clif-opt`, `pliron-cfg` or `vendor/` changed), runs the
    `test.sh` stanzas those paths select, `wasm_smoke`, and the fuzz
    regression seeds plus a rolling window of fresh ones, then prints what
    it skipped and the slow command that completes the proof. Green quick
@@ -22,12 +23,14 @@ Read it before picking a task.
    **Run `harness/gate.py` before merging to main** (~40 s — the wasm
    sysroot leg is off by default; `--full` or `--only wasm` adds it for
    wasm/wpeep/linker changes. `wasm_smoke`, always on, covers
-   emit->link->run in ~1 s). main stays green: a red gate is fixed
-   before new work lands.
+   emit->link->run in ~1 s; `--install-hook` makes the gate a git
+   pre-push hook). main stays green: a red gate is fixed before new work
+   lands.
 2. **New passes and new transforms land default-off**
    (`env_is("PLIRON_X", "1")`), then flip on in a separate commit once
-   the gate and the corpus are clean. Every pass keeps a
-   `PLIRON_<PASS>=0` off switch.
+   the gate and the corpus are clean, by adding the name to
+   `DEFAULT_ON` (or a value to `DEFAULT_VALUES`) in `pliron-cfg/src/lib.rs`.
+   Every pass keeps a `PLIRON_<PASS>=0` off switch.
 3. **A miscompile fix ships with a regression test**, and the test must
    fail without the fix (check it). Pass unit tests live next to the
    pass or in `pliron-clif-opt/tests/`; end-to-end ones are `test.sh`
@@ -45,17 +48,17 @@ Read it before picking a task.
 
 | path | what |
 |---|---|
-| `src/` | rustc glue (needs `rustc_private`): `lib.rs` (driver, pass order in `finish_module`), `builder.rs`/`intrinsic.rs`/`simd.rs`/`abi.rs`, `wasm.rs` (CLIF→waffle emit, waffle inliner, `wpeep` byte peepholes), `xcgu.rs` (cross-CGU body copies) |
+| `src/` | rustc glue (needs `rustc_private`): `lib.rs` (driver; `finish_module` is the serial path), `cgupool.rs` (CGU job pool and the IR pass order: `finish_pre` → `iropt_head` → `iropt_tail` → `finish_b`), `builder.rs`/`intrinsic.rs`/`simd.rs`/`abi.rs`, `asm.rs` (`asm!` wrappers), `lto.rs` (fat LTO as a relocatable link), `wasm.rs` (CLIF→waffle emit, waffle inliner, `wpeep` byte peepholes) with `wpeep_audit.rs`/`wpeep_elide.rs`, `xcgu.rs` (cross-CGU body copies) |
 | `pliron-ir-opt/` | pliron-IR passes: inline, sroa, memcpyopt, spec, phisimp, instcombine, constload, guardelim, callgvn, IPO summaries (nowrite/nocapture/nnret/retarg/nounwind/willreturn as `ascent!` Datalog), `State` side tables. Stable Rust. |
-| `pliron-clif-lower/` | pliron IR → CLIF (`lower.rs`), parallel per-function lowering |
-| `pliron-clif-opt/` | all CLIF passes (~80 steps; order in `pipeline.rs::DEFAULT`), the differential checker (`diffcheck.rs`), step cache. Stable Rust, `cargo test -p pliron-clif-opt` needs no rustc. |
+| `pliron-clif-lower/` | pliron IR → CLIF (`lower.rs`), parallel per-function lowering; `scalarize.rs` (vector legalization), `eh/` (`.eh_frame`/LSDA, COFF `.pdata`/`.xdata`), `objmerge.rs` (rsasm output spliced into the object), `hot.rs` (`PLIRON_HOT`), `dwarf.rs` |
+| `pliron-clif-opt/` | all CLIF passes (the step list and order are `pipeline.rs::DEFAULT`), the differential checker (`diffcheck.rs`), the step and in-process pipeline caches (`stepcache.rs`). Stable Rust, `cargo test -p pliron-clif-opt` needs no rustc. |
 | `pliron-clif-check/` | `clif-check`: run/check/time CLIF passes on saved functions, no rustc |
-| `pliron-cfg/` | the one-shot `PLIRON_*` env parse (`pass_enabled`, `env_*`, bisect counters, `PLIRON_OPT_FNS`) |
-| `vendor/` | patched Cranelift, regalloc2, pliron, rsasm; every change marked `PLIRON:` and listed in each `PLIRON_PATCH.md` |
+| `pliron-cfg/` | the one-shot `PLIRON_*` env parse (`pass_enabled`, `env_*`, bisect counters, `PLIRON_OPT_FNS`); `DEFAULT_ON`/`DEFAULT_VALUES` are the single list of opt-in knobs that are on by default |
+| `vendor/` | patched Cranelift, regalloc2, pliron, rsasm, waffle; changes are marked `PLIRON:` in the source and listed in the crate's `PLIRON_PATCH.md` (`vendor/PLIRON_REV` pins pliron's upstream revision) |
 | `harness/` | gate, corpus, live dashboard, bisectors, compile-time and disk tools |
 | `bench/` | runtime kernels (criterion native, `bench/wasm/` node) |
 | `tests/` | `test.sh` programs (one dir per stanza) |
-| `docs/` | `PARITY.md` (start here), `audit.md` (Datalog rewrite audits), `performance.md` (narrative history of the perf work), `test-harness.md`, `phi-web.md`, `pgo.md`, `rustc-thorns.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `history/` |
+| `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `seh-design.md` (planned real SEH catch), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
 
 `black_box` is a real optimization barrier: a call to a never-defined
 `__pliron_bb*` symbol (opaque to every IR pass) that `lower.rs` turns
@@ -81,7 +84,8 @@ Pinned toolchain `nightly-2026-10-22` (`rust-toolchain.toml`; needs
 ## Pick the loop for your task
 
 `harness/parity.py` measures all of it (native + wasm runtime, compile
-time) in ~15 min and writes `target/parity/summary.md`.
+time, memory, code size, stack frames) in ~20 min and writes
+`target/parity/summary.md`.
 
 ### Speed of generated code (runtime parity)
 
@@ -98,13 +102,15 @@ time) in ~15 min and writes `target/parity/summary.md`.
   your edit made bigger or smaller.
 - wasm runtime under V8: `harness/v8/` (per-function and per-instruction
   tick attribution, TurboFan listings, bench variants) — read
-  `docs/experiments.md` first for what has already been tried.
+  `docs/history/2026-10-21-wasm-experiments.md` first for what has
+  already been tried.
 
 ### Compile time
 
 - `harness/ctime.py` — stock vs pliron (release dylib) on the bench
-  kernels (native and wasm) and regex-syntax; median of 3, ratios.
-  This is the number in PARITY.md.
+  kernels (native and wasm), regex-syntax (native and wasm) and syn;
+  median of 3, ratios, plus peak RSS and machine-code bytes. These are
+  the card's CMP, MEM and SIZ inputs.
 - `clif-check bench target/corpus/std [reps]` — the CLIF pipeline alone
   over ~15k real functions, per-step time table, no rustc. The fastest
   loop for pass compile-time work; the live dashboard shows the same
@@ -118,28 +124,37 @@ time) in ~15 min and writes `target/parity/summary.md`.
   dSYM. If `sample` hangs (it can wedge system-wide), use
   `samply record --save-only --unstable-presymbolicate -o p.json.gz --
   rustc ...` and `harness/sprof.py p.json.gz [--under FN]`.
-- Known structure of the gap (details in PARITY.md): our glue (op
-  construction, side-table hashing, lowering) and IR-opt dominate, not
-  Cranelift; CGUs run their IR passes serially.
+- Known structure of the gap (details in PARITY.md): per-instruction
+  cost of our passes on giant functions and IR-opt dominate, not
+  Cranelift's own codegen. CGUs run IR-opt and lowering in parallel on
+  the `src/cgupool.rs` job pool; the MIR → pliron front half is still
+  serial on the main thread.
 
 ### Correctness
 
 - **Triage order for a miscompile**: [`docs/miscompile-triage.md`](docs/miscompile-triage.md)
-  — diffcheck first, corpus replay next (with its fidelity caveats),
-  rebuild bisects last.
+  — set up the oracle, then `PLIRON_DIFFCHECK=step` first, then
+  `harness/fnbisect.py` (which function), then corpus replay (fast but
+  lossy: a clean replay clears nothing), then `PLIRON_PIPELINE` prefix /
+  `PLIRON_OPT_BISECT` bisects (rebuild per probe), then
+  `PLIRON_TRACE=pliron::<step>` inside the named step.
 - **Corpus**: `harness/corpus.sh smoke|std|cargo DIR` records every
   function's pre-pipeline CLIF + facts into `target/corpus/<set>`.
   `clif-check report target/corpus/std out.json --check` runs the whole
   pipeline + an interpreter diff on every function in parallel (~7 s
   for std). Re-record after lowering or IR-opt changes.
-- **Real crates**: `harness/crates.py [--tier 1|2] [--only a,b]` runs pinned
-  crates' own test suites (+ doc-tests, `--release`) under stock and
-  pliron and reports pliron-only failures, crashed test binaries included
-  (~10 min for tier 1, ~25 for tier 2's atomics/threads/async additions;
-  logs and `report.md` in `target/crates/`). Its first runs found seven
-  bugs. Narrow one with a probe script (touch the crate's `src/lib.rs`,
-  rerun the failing test) → `harness/fnbisect.py` → `PLIRON_OPT_FNS=~fn
-  PLIRON_OPT_BISECT=N` (licm load hoists are separate `licm-load` units).
+- **Real crates**: `harness/crates.py [--tier 1|2|3] [--only a,b]
+  [--deps stock|pliron]` runs pinned crates' own test suites
+  (`--release`) under stock and pliron and reports pliron-only failures,
+  crashed test binaries included (tier 2 adds atomics/threads/async
+  crates, tier 3 large applications; logs and `report.md` in
+  `target/crates/`). The default `--deps stock` builds dependencies with
+  stock rustc and sends only the crates' own code through the backend
+  (no doc-tests); `--deps pliron` compiles dependencies and doc-tests
+  with pliron too. Narrow a failure with a probe script (touch the
+  crate's `src/lib.rs`, rerun the failing test) → `harness/fnbisect.py`
+  → `PLIRON_OPT_FNS=~fn PLIRON_OPT_BISECT=N` (licm load hoists are
+  separate `licm-load` units).
 - **Live loop**: `harness/live/live.py` → http://localhost:8765. On
   every save to a pass it rebuilds `clif-check`, replays the corpora and
   shows new failures (with repro commands), size movers and step times.
@@ -147,13 +162,19 @@ time) in ~15 min and writes `target/parity/summary.md`.
   delta-debugs `PLIRON_OPT_FNS` (optimize only selected symbols; stable
   across CGUs, processes, rebuilds). `<cmd>` exits nonzero when broken
   and must recompile. Beware: it accepts *any* failure, so check the
-  minimized set reproduces the original symptom.
+  minimized set reproduces the original symptom. Also, a few
+  interprocedural rewrites still touch unselected bodies (`spec` rewrites
+  a callee's parameter uses, `retarg` folds call results everywhere,
+  `nounwind` turns invokes into calls everywhere), so a selected
+  function can be blamed for a change made in an unselected one.
 - **Which transform?** `PLIRON_OPT_BISECT=N` allows only the first N
   pass applications (CLIF steps, sroa splits/forwards, constload folds);
   `PLIRON_OPT_BISECT_DEBUG=1 PLIRON_TRACE=pliron::cfg=debug` names each
-  unit. Deterministic under `-C codegen-units=1` or `PLIRON_PAR=0`.
-  `harness/bisect.py -- <cmd>` automates it when `<cmd>`'s stderr is
-  passed through.
+  unit. The numbering is deterministic: under `PLIRON_OPT_BISECT` the
+  backend itself takes the serial paths (no CGU job pool, serial
+  lowering; `cgupool::enabled`, `lower.rs`). The step and pipeline caches
+  also turn off. `harness/bisect.py -- <cmd>` automates it when
+  `<cmd>`'s stderr is passed through.
 - **Is that step wrong?** `PLIRON_DIFFCHECK=1` (`=step` for every step)
   interprets CLIF before/after on random inputs and saves
   `before.clif`/`after.clif` on a mismatch; `clif-check step <step>
@@ -168,11 +189,14 @@ time) in ~15 min and writes `target/parity/summary.md`.
   after each `wpeep` sub-pass, `PLIRON_WASM_BODYDUMP=<dir>` saves raw
   pre/post bytes), `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies,
   `PLIRON_WASM_STUBLOG=<file>` lists functions that fell back to stubs.
-- **Audits**: `PLIRON_WASM_AUDIT=1|panic` checks every wpeep
-  copy-forward round with a Datalog translation validator (the code and
-  the rewrite's assumptions as one fact stream; `docs/audit.md`) and
-  reverts rounds that fail. On in `tests/wasm/run.sh` and `smoke.sh`
-  (so in the gate).
+- **Audits** (`docs/audit.md`): `PLIRON_WASM_AUDIT=1|panic` checks
+  every wpeep copy-forward round with a Datalog translation validator
+  (the code and the rewrite's assumptions as one fact stream) and
+  reverts rounds that fail; `tests/wasm/run.sh` and `tests/wasm/smoke.sh`
+  set `=panic` (so it is in the gate). Unused-`block`/`loop` elision
+  (`PLIRON_WASM_ELIDEBLK`, default on) checks its own assumptions on
+  every round, audit flag or not, and reverts on failure (`=panic`
+  panics instead). The other wpeep rewrites are not audited.
 - `harness/run.py --tier 0|1` — smoke/determinism/UI suites diffed
   against stock rustc, ratcheted in `harness/expectations/`
   (`docs/test-harness.md`). `selfhost/verify.sh` runs rustc's own UI
@@ -201,6 +225,10 @@ time) in ~15 min and writes `target/parity/summary.md`.
 ## Knob reference
 
 - `PLIRON_<PASS>=0` — disable a pass (most default on); no rebuild.
+  Opt-in knobs that are on by default are listed in `pliron-cfg/src/lib.rs`
+  (`DEFAULT_ON`, `DEFAULT_VALUES`); the vendored Cranelift and waffle
+  read a few of their own the same way (named in the `DEFAULT_ON` doc
+  comment and the `PLIRON_PATCH.md` files).
 - `PLIRON_PIPELINE=a,b,c` — explicit CLIF step list (`clif-check steps`).
 - `PLIRON_OPT_FNS=lo..hi|~substr|@file` (`!` inverts),
   `PLIRON_OPT_FNS_LOG=<file>` — per-function optimization selection.
@@ -214,16 +242,16 @@ time) in ~15 min and writes `target/parity/summary.md`.
   targets `pliron::<pass>`, `pliron::stats`, `pliron::timing`,
   `pliron::dump`). Old `PLIRON_*_DEBUG`/`_PROF` knobs map onto it
   (`KNOB_TARGETS` in `src/lib.rs`).
-- `PLIRON_STEPCACHE=1` — content-addressed per-step cache
-  (`~/.cache/pliron-steps`); keyed on pass sources, vendored Cranelift
-  and Cargo.lock, so edits cold-miss.
-- `PLIRON_MEMCACHE=1` — in-process whole-pipeline cache sharing
-  optimization results across CGU-duplicate functions (xcgu copies,
-  shared generics). Symbol-normalized keys, `FuncId` remapping on
-  replay. `PLIRON_MEMCACHE_MB` caps it (default 1024). Both tiers turn
-  off under `PLIRON_OPT_BISECT` — a hit can't honor the consumer's
-  remaining budget. `PLIRON_MCPROF=1` prints lookup/store/record
-  counters per CGU.
+- `PLIRON_STEPCACHE=1` (opt-in) — content-addressed on-disk per-step
+  cache (`~/.cache/pliron-steps`); keyed on pass sources, vendored
+  Cranelift and Cargo.lock, so edits cold-miss.
+- `PLIRON_MEMCACHE` (default on; `=0` off) — in-process whole-pipeline
+  cache sharing optimization results across CGU-duplicate functions
+  (xcgu copies, shared generics). Symbol-normalized keys, `FuncId`
+  remapping on replay. `PLIRON_MEMCACHE_MB` caps it (default 1024).
+  Both tiers turn off under `PLIRON_OPT_BISECT` — a hit can't honor the
+  consumer's remaining budget. `PLIRON_MCPROF=1` prints
+  lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
 - `PLIRON_XNEED=0` — stage-B release falls back to the full ordinal

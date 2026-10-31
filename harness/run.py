@@ -49,7 +49,8 @@ ARCH = platform.machine()
 
 os.environ["RUSTUP_TOOLCHAIN"] = TOOLCHAIN
 os.environ["RUSTC_ICE"] = ICES
-# Verify CLIF after every pass; stock rustc ignores PLIRON_* anyway.
+# Verify CLIF once after the pipeline (`=full` would verify after every
+# step); stock rustc ignores PLIRON_* anyway.
 os.environ.setdefault("PLIRON_VERIFY", "1")
 
 

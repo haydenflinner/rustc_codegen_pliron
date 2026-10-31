@@ -797,5 +797,5 @@ result differs from what stock rustc + LLVM produce for the same targets.
   GOT reads that do not fold stay `global.get`. #term("wpeep") and the
   waffle patches recover part of it. Size matters for speed too: V8's own
   wasm inlining has a per-module budget, so growth anywhere in a module can
-  turn off inlining in a hot kernel (`docs/wasm-open.md`).
+  turn off inlining in a hot kernel (`docs/history/2026-10-20-wasm-open.md`).
 ]

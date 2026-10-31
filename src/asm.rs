@@ -4,8 +4,9 @@
 //! register/stack-slot allocator and wrapper generator are adapted here,
 //! MIT/Apache-2.0): every `asm!` becomes an out-of-line function that loads
 //! its inputs from a stack buffer, runs the template and stores the outputs
-//! back. The module's asm text is assembled by the system assembler and merged
-//! into the CGU object (see `lib.rs`).
+//! back. The module's asm text is assembled in-process by rsasm and merged
+//! into the CGU object (`pliron-clif-lower/src/objmerge.rs`); no external
+//! assembler runs.
 
 use std::fmt::Write;
 

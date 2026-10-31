@@ -8234,7 +8234,7 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
     // caller grow ~cap per round for ROUNDS rounds.
     let mut grown = vec![0usize; funcs.len()];
     let mut inlined = 0usize;
-    // `PLIRON_WASM_HOTLEAF=N` (default off; `1` means 2): the loop rule
+    // `PLIRON_WASM_HOTLEAF=N` (default on as `1`, which means 2; `=0` off): the loop rule
     // only for callees with at most N calls of their own — the IR
     // inliner's `PLIRON_INLINE_LOOPCALLS` leaf rule. A callee that
     // carries many calls just moves that call traffic into the loop, and

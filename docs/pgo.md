@@ -50,8 +50,10 @@ files can be concatenated by `pliron-prof merge`.
 
 ## Instrumentation (`PLIRON_PGO=<dir>`)
 
-Runs in `optimize_cgu` right after the always-inline round and before
-the main IR pipeline, so counters attribute to *source-level* functions.
+Runs in `finish_pre` (`src/cgupool.rs`), before IR-opt (`iropt_head`)
+and, at `-O0`, after the always-inline round, so counters attribute to
+*source-level* functions. The instrumentation itself is
+`pliron-ir-opt/src/pgo.rs`.
 The inliner clones counter ops during the profiled build, so hot
 executions inside inlined clones still accrue to the source function's
 counters — same attribution model as LLVM.
@@ -85,8 +87,8 @@ and loop trip counts.
 
 ## Runtime (`tools/pliron-prof`)
 
-Pure Rust, `no_std`, ~150 lines, libc externs only
-(`tools/pliron-prof-rt`). It must not link std: the archive is pulled
+The runtime is `tools/pliron-prof-rt` (pure Rust, `no_std`, libc
+externs only); `tools/pliron-prof` is the host-side CLI. It must not link std: the archive is pulled
 into links that already carry a Rust std (rustc itself, proc-macro
 .so's) and bundled std objects collide on `__rdl_*`/`__rust_*` symbols
 — the same reason it can't reference `core`/`compiler_builtins`
@@ -108,34 +110,40 @@ the archive to the runtime object before linking it under
 
 ## Consumption (`PLIRON_PGO_USE=<file>`)
 
-Loaded in `optimize_cgu` before the pipeline; each function's record is
-matched by `(sym_hash, fingerprint)` and stored in `st.prof`. Per-block
-counts land in `st.prof_bcount` and per-successor edge counts in
-`st.prof_edges`; the inliner's clone path scales both into clones.
+Loaded in `finish_pre` (`src/cgupool.rs`), before IR-opt
+(`pgo::load`); each function's record is matched by
+`(sym_hash, fingerprint)` and stored in `st.prof`. Per-block counts land
+in `st.prof_bcount` and per-successor edge counts in `st.prof_edges`;
+the inliner's clone path scales both into clones by callsite count /
+callee entry count. Lowering copies block counts onto CLIF blocks
+(`Pipe::prof`) for the CLIF passes.
 
-Consumers, roughly in win-per-line order:
+Consumers:
 
-1. **Cold layout** (lower.rs `cold_blocks`): a reachable block with a
+1. **Cold layout** (`lower.rs` `cold_blocks`): a reachable block with a
    recorded count of 0 is cold — joins the existing
    `#[cold]`/`expect`/unreachable rules and feeds `set_cold_block`, so
    cold code moves out of line on native.
-2. **Inlining** (inline.rs): callsite hotness scales the score threshold
-   — hot sites get a multiplier, zero-count sites are treated like
-   `#[cold]` callers. This is the single biggest PGO win in LLVM too.
-3. **Branch polarity / fallthrough ordering**: edge counts bias the
-   successor order used for block layout so hot edges fall through
-   (fewer taken branches), and seed `st.expect` on `cond_br`s so all
-   existing expect-consumers behave as if the user annotated them.
+2. **Inlining** (`pliron-ir-opt/src/inline.rs`): a callsite whose block
+   count is 0 is rejected outright (unless the callee is
+   `#[inline(always)]`); a callsite with count >= 4 adds twice the base
+   limit to its threshold.
+3. **Branch expectations** (`pgo::load`): a two-way `cond_br` with at
+   least 8 samples and a 4:1 or stronger bias seeds `st.expect`, so the
+   existing expect-consumers behave as if the user annotated it.
+4. **Loops** (`pliron-clif-opt`): `unroll` skips loops whose header
+   count is 0; `punroll` estimates the trip count from header vs entry
+   counts to pick its width; `loopvec` also reads the counts.
+   `PLIRON_PGO_LOOP=0` hides the profile from these passes.
+5. **Switch lowering** (`brchain.rs`, under `PLIRON_JT_SHAPE`, default
+   on): chain tests are ordered hottest first and a dominant case is
+   peeled ahead of the table (`history/2026-10-27-jump-tables.md`).
 
-Phase 2 consumers (design only for now):
+Possible later consumers (design only):
 
-- **Unroll / loop passes**: edge counts give real trip-count histograms.
-- **Switch lowering**: value profiles order jump-table lookups by hit
-  frequency; indirect-call target profiles enable checked speculative
-  devirtualization (the `dv` hooks inline.rs already has). A first cut
-  using block counts exists behind `PLIRON_JT_SHAPE=1` (brchain orders
-  chain tests hottest first and peels a dominant case ahead of the table;
-  history/2026-10-27-jump-tables).
+- **Value and indirect-call profiles**: order jump-table lookups by hit
+  frequency; checked speculative devirtualization (the `dv` hooks
+  `inline.rs` already has).
 - **Frequency-weighted e-graph extraction**: cost × block frequency as
   the extraction cost model — pick the variant that's fastest on the
   hot path, not uniformly smallest.
@@ -176,6 +184,7 @@ differs is how counts leave the guest:
 | `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |
 | `PLIRON_PGO_COUNTERS=block` | block counters only (edge counters are additive); default is block+edge |
 | `PLIRON_PGO_ATOMIC=1` | `atomicrmw` counter ops instead of load/add/store (races lose counts by default, same as LLVM) |
+| `PLIRON_PGO_LOOP=0` | the CLIF loop passes ignore the profile (ablation) |
 
 ## Non-goals (for now)
 

@@ -34,9 +34,15 @@ semantics, fine for Rust.
 
 ## Pieces
 
-Status: **`__pliron_seh_personality` landed** (0ffd64e, built in pliron
-IR in codegen_allocator behind `PLIRON_SEH=1`, unused until #1 and #4
-land). Remaining:
+Status (checked against the code 2026-10-30): only piece 2 exists.
+`__pliron_seh_personality` (0ffd64e) is built in pliron IR in
+`codegen_allocator` (`src/lib.rs`), not as an asm stub. Nothing
+references it. Note the gate: the code builds it only when `PLIRON_SEH=0`
+is set explicitly (`env_is("PLIRON_SEH", "0")`), not under `PLIRON_SEH=1`
+as first written; the rest of the plan below still says `PLIRON_SEH=1`.
+Pieces 1, 3, 4 and 5 are not started. The 2026-10-23 pick-up notes, with
+line-level pointers, are in `history/2026-10-23-seh-handoff.md`.
+Remaining:
 
 1. **`.xdata` EHANDLER + scope table** (`pliron-clif-lower/src/eh/mod.rs`,
    `emit_coff`): for functions whose `code.buffer.call_sites()` have

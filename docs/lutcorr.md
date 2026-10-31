@@ -58,5 +58,5 @@ jump tables — rustc flattens `a..=b` match ranges into icmp+cond_br
 chains before `llvm.switch` sees them, so range-clustering LUTs are
 not reachable at this layer.
 
-Gate: `harness/gate.py` — `lto` and `slotmerge` legs fail identically
-on clean `main` (preexisting); all other legs pass.
+Landed default-off in a25fc1f (2026-10-22); the measurements above are
+from that commit.

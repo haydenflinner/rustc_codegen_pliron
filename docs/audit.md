@@ -1,10 +1,19 @@
 # Auditing rewrites with Datalog
 
-`src/wpeep_audit.rs` checks every copy-forward round of the wasm
-peephole pass (`wpeep`) with a small `ascent` program. It is the
-prototype of a general tool: **write the program and the rewrite's
-assumptions into one stream of facts, and let Datalog decide whether the
-rewrite preserved meaning.**
+Two `wpeep` (wasm byte peephole, `src/wasm.rs`) rewrites check their own
+output before it is kept:
+
+| rewrite | checker | when it runs | on failure |
+|---|---|---|---|
+| copy-forward | `src/wpeep_audit.rs`, an `ascent` Datalog program | only under `PLIRON_WASM_AUDIT=1` or `=panic`; `tests/wasm/run.sh` and `tests/wasm/smoke.sh` set `=panic`, so the gate runs it | the round is reverted (`=panic`: panic) |
+| unused-`block`/`loop` elision (`PLIRON_WASM_ELIDEBLK`, default on) | `src/wpeep_elide.rs`, a separate re-derivation walk | always, whenever elision runs | the round is reverted (`PLIRON_WASM_AUDIT=panic`: panic) |
+
+No other `wpeep` rewrite is audited (see Limits).
+
+The copy-forward audit is the prototype of a general tool: **write the
+program and the rewrite's assumptions into one stream of facts, and let
+Datalog decide whether the rewrite preserved meaning.** Most of this page
+describes it; the elision check is at the end.
 
 ## Why
 
@@ -117,13 +126,16 @@ no longer triggers anywhere in the wasm test leg.
   The operand stack isn't modelled (copy-forward only deletes
   stack-neutral `get; set` pairs). A rewrite that reorders stack values
   needs stack facts first.
-- It audits what a rewrite emits. Uninstrumented rewrites (the
-  keep-on-stack and dead-write passes in `wpeep`) aren't covered yet.
+- It audits what a rewrite emits. Only copy-forward and block elision
+  are instrumented. The other `wpeep` rewrites — keep-on-stack (`KOS`),
+  the dead-write sweep, store forwarding (`sfwd`), `walias`, the
+  `br_if` folds (`brf`, `bri`, `bri2`), `btr`, `delse`, `ddrop` and the
+  loop-invariant chain hoist — are not audited.
 
 ## Where to apply it next
 
-1. **The rest of `wpeep`**: keep-on-stack (`KOS`) and the dead-write
-   sweep, with a few stack facts.
+1. **The rest of `wpeep`**: keep-on-stack (`KOS`), the dead-write
+   sweep, `sfwd` and the `br_if` folds, with a few stack facts.
 2. **CLIF code motion**: `loadfwd`, `licm`, `jumpthread`, `edgespec`.
    Same pattern over CLIF: blocks and edges as `succ`, `def`/`use` of
    SSA values, memory as named locations. Each rewrite emits its claim:
@@ -134,3 +146,22 @@ no longer triggers anywhere in the wasm test leg.
    the IR they describe after each pass. That is the class behind stage2
    miscompile #3 (an argument array that went stale after an ABI
    rewrite).
+
+## Block elision (always on)
+
+`wpeep_elide` deletes a `block`/`loop` … `end` pair whose label no branch
+targets, and decrements the labels of branches inside it that point past
+it. Before a round is kept it checks three assumptions against the
+rewritten bytes, sharing no analysis with the candidate picker:
+
+- `assume_untargeted`: no `br`/`br_if`/`br_table` inside targets this
+  construct (re-derived from the bytes);
+- `assume_empty_type`: the blocktype is empty (`0x40`), so no values are
+  dropped;
+- `assume_wellformed`: after the delete and the label fix, the control
+  stack still parses (a separate walk).
+
+This is not Datalog, but it follows the same rule: the rewrite states
+its assumptions and an independent check decides. It runs whenever
+elision runs (`PLIRON_WASM_ELIDEBLK=0` turns both off), not only under
+`PLIRON_WASM_AUDIT`.

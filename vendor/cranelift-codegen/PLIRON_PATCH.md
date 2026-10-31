@@ -4,11 +4,15 @@ Vendored (like `vendor/regalloc2`) only for small x64 backend changes we want
 tight control over; each is marked `PLIRON:` in the source. Submit upstream
 once proven out on the stage2 benchmark, then drop this copy.
 
-1. `src/isa/x64/abi.rs`: leaf functions with no calls, clobbers, stack slots
-   or stack arguments get no `push rbp; mov rbp, rsp` / `mov rsp, rbp; pop rbp`
-   (aarch64 already omits the frame this way). Skipped when
-   `preserve_frame_pointers` is set, i.e. `PLIRON_OMIT_FP=0` or a target that
-   requires frame pointers.
+1. `src/isa/x64/abi.rs`: every x64 function, not only leaves, gets no
+   `push rbp; mov rbp, rsp` / `mov rsp, rbp; pop rbp` and addresses its frame
+   RSP-relative (as LLVM does with frame pointers off). `machine_env_inner`
+   then frees RBP as an allocatable callee-saved register
+   (`PLIRON_NO_FREE_RBP` keeps it reserved). A frame is still built for a tail
+   call with more stack args than incoming args, and when
+   `pliron_force_fp()` asks for one; the frame pad keeps RSP 16-aligned at
+   call sites. Skipped entirely when `preserve_frame_pointers` is set, i.e.
+   `PLIRON_OMIT_FP=0` or a target that requires frame pointers.
 2. `src/isa/x64/lower.isle` (+ `jump_table_size` made `pure` in
    `src/prelude_lower.isle`): a `br_table` whose index is `band x, k` with
    `k < table size` skips the `cmp; cmov` bounds clamp. Our `dense_switch`
@@ -151,7 +155,8 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     `compile_function`/isel consumes, unlike the backend-side `PLIRON_CLIF`
     `final` dump which precedes `remove_constant_phis`/egraph.
 
-16. x64 loop-header 16-byte alignment (`src/machinst/vcode.rs`): blocks
+16. Loop-header 16-byte alignment (`src/machinst/vcode.rs`, every ISA, not
+    only x64): blocks
     targeted by back-edges in the final emission order get `gen_nop`
     padding before their label binds, like LLVM's `.p2align 4` loop tops.
     `PLIRON_ALIGN=0` disables. A companion fix lives in vendored

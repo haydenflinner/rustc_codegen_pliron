@@ -1,6 +1,6 @@
 # Platform notes
 
-Target-specific details moved out of AGENTS.md. Nothing here changes day to day.
+Target-specific details: MSVC-free Windows links, target quirks, cross-compiling and self-hosting.
 
 ## MSVC-free Windows links (PLIRON_CRTFREE)
 
@@ -34,7 +34,7 @@ builds and runs with zero VS inputs.
 ## Targets, cross-compiling, self-hosting
 
 - windows-msvc (x86_64): `is_pic=false`, Cranelift `tls_model="coff"`.
-  `src/eh/mod.rs` emits `.pdata`/`.xdata` (serialized `UNWIND_INFO` +
+  `pliron-clif-lower/src/eh/mod.rs` emits `.pdata`/`.xdata` (serialized `UNWIND_INFO` +
   `RUNTIME_FUNCTION`, `RelocationKind::ImageOffset` → `ADDR32NB`) instead of
   `.eh_frame`. Unwinding is *emulated* like the wasm backend: TLS `__pliron_eh`
   state word, flag checks after calls, `pliron.eh.exn`/`rethrow`, and
@@ -43,13 +43,15 @@ builds and runs with zero VS inputs.
   `test.sh --sysroot`); with stock std, real SEH throws unwind *through* our
   frames (correct `.pdata`) but our `catch_unwind` can't intercept them —
   `tests/std/main.rs` gates those asserts on `--cfg pliron_stock_seh`.
+  The planned fix, a real SEH personality with scope tables (not landed),
+  is in `docs/seh-design.md`.
 
   MSVC i128/f128 libcall ABI: args byval through pointers, return in xmm0 —
-  `libcall()` in lower.rs adapts (`__udivti3`, `__floattisf`, `__rust_i128_*`).
+  `libcall()` in `pliron-clif-lower/src/lower.rs` adapts (`__udivti3`, `__floattisf`, `__rust_i128_*`).
   rsasm COFF: `.linkonce`, `.seh_*`, `3f@IMGREL` local-label modifiers; LLVM
   `$$` escapes become `$` (AT&T) or nothing (Intel syntax). Compiler-stub
   symbols (`__pliron_llvm_*`) get per-CGU-unique names on COFF (no weak syms).
-- aarch64: `CallConv::Tail` can't take sret params; lower.rs keeps sret
+- aarch64: `CallConv::Tail` can't take sret params; `lower.rs` keeps sret
   functions on the platform ABI. `ArgumentPurpose::StructArgument` (byval) is
   unsupported by cranelift-aarch64, but rustc never emits on-stack indirect
   args for AAPCS64.
@@ -59,7 +61,7 @@ builds and runs with zero VS inputs.
   `error: cranelift: Support for this target is disabled`. Flip to
   `all-arch` to cross-compile (x86_64-apple-darwin links via ld64 and runs
   under Rosetta; x86_64-macho `__eh_frame` uses SUBTRACTOR+UNSIGNED pairs,
-  see src/eh/mod.rs). Still needs the target std component and a target
+  see `pliron-clif-lower/src/eh/mod.rs`). Still needs the target std component and a target
   linker (mold for ELF).
 - Self-hosting: `selfhost/setup.sh [RUST_CHECKOUT] [WORKTREE]` creates a
   worktree at the pinned nightly commit, applies `bootstrap.patch`, and
