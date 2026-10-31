@@ -986,6 +986,15 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             && self.lower_ctx.amode_shareable(val)
     }
 
+    /// PLIRON: may a constant rotate be folded into a logic op's shifted
+    /// operand? Only when it has a single use (see `rot_fold_ok` in
+    /// `lower.isle`); `PLIRON_RORFOLD_MULTI=1` folds multi-use rotates too.
+    fn rot_fold_ok(&mut self, val: Value) -> bool {
+        static MULTI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MULTI.get_or_init(|| std::env::var("PLIRON_RORFOLD_MULTI").as_deref() == Ok("1"))
+            || !self.lower_ctx.value_has_multiple_uses(val)
+    }
+
     /// PLIRON: `PLIRON_TBNZ_IREDUCE=1` (opt-in), see `lower.isle`.
     fn tbnz_ireduce_on(&mut self, _bit: u64) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

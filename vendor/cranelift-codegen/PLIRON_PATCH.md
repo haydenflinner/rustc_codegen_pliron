@@ -917,3 +917,16 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `uxtb`/`uxth`, which only clears bits a single-bit test never reads
     (`bl f; uxtb w3,w2; tbnz w3,#0`, 149 sites in regex-syntax; -172 `uxtb`).
     Test: `pliron-clif-opt/tests/tbnz_ireduce.rs` (two fail with the knob off).
+
+71. aarch64 rotate folding into logic ops only for single-use rotates
+    (`src/isa/aarch64/lower.isle` `*_ror_op`/`*_rol_op`, `rot_fold_ok` in
+    `src/isa/aarch64/lower/isle.rs`; `PLIRON_RORFOLD_MULTI=1` restores the
+    old rule). Upstream folds `bxor/band x, (rotr y, k)` into `eor/and x, y,
+    ror #k` whatever the rotate's other uses; with another use the `ror` is
+    emitted anyway, so the fold duplicates it and puts a shifted-operand op
+    (2-cycle latency on Apple cores, 1 for the plain op) on the dependency
+    chain. LLVM folds only single-use shifts (`isWorthFoldingALU`).
+    blake3's compression: 1.39x -> 1.13x LLVM's
+    (docs/history/2026-10-31-tune-heldout.md). Test:
+    `pliron-clif-opt/tests/rorfold_multi_use.rs` (the multi-use case fails
+    with the old rule).

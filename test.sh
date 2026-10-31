@@ -799,6 +799,20 @@ t_debuginfo() {
   cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
 }
 
+# r[verify iropt.constload.copy]
+t_constcopy() {
+  # PLIRON_CONSTCOPY replaces an alloca copied from a constant global with
+  # the global (blake3's MSG_SCHEDULE[round]); copies that are written
+  # afterwards or escape must stay. Outputs are pinned by asserts, and the
+  # pass must fire.
+  rustc $BE --edition 2021 -O tests/constcopy/main.rs -o $out/constcopy0$exe &&
+      $out/constcopy0$exe | grep -qx 'constcopy ok' &&
+  PLIRON_CONSTCOPY=1 PLIRON_TRACE=pliron::stats rustc $BE --edition 2021 -O tests/constcopy/main.rs -o $out/constcopy1$exe 2> $out/constcopy.txt &&
+      $out/constcopy1$exe | grep -qx 'constcopy ok' || return 1
+  grep -qE 'constcopy .*: [1-9][0-9]* allocas' $out/constcopy.txt ||
+    { echo "constcopy: no alloca replaced under PLIRON_CONSTCOPY=1" >&2; return 1; }
+}
+
 # r[verify iropt.ipo.willreturn]
 t_willret() {
   # willreturn must deny loops and recursion (Rust has no forward-progress
@@ -1099,6 +1113,7 @@ want slotpromlt && t_slotpromlt
 want byvalhome && t_byvalhome
 want retattr && t_retattr
 want willret && t_willret
+want constcopy && t_constcopy
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
 # resumes lower to `pliron.eh.rethrow` via cleanup_ret (funclet path), so

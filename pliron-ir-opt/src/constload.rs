@@ -113,6 +113,115 @@ fn fold(ctx: &Context, img: &Image, off: i64, ty: TypeHandle) -> Option<ConstVal
     }
 }
 
+/// A foldable global's initializer size, if `sym` is one: immutable, not
+/// thread-local, defined here, with a known initializer.
+fn const_global_size(ctx: &Context, st: &State, sym: &str) -> Option<u64> {
+    let g = st.globals.get(sym)?;
+    if g.mutable || g.tls || matches!(g.linkage, Linkage::Import | Linkage::Preemptible) {
+        return None;
+    }
+    Some(size_align(ctx, g.init?.get_type(ctx)).0)
+}
+
+/// The uses of alloca `a` if it is only written by one whole-object
+/// `llvm.memcpy` from constant memory and otherwise only read: returns the
+/// copy and the lifetime markers (to erase) and the source address.
+fn const_copy(ctx: &Context, st: &State, a: Value) -> Option<(Ptr<Operation>, Vec<Ptr<Operation>>, (String, i64))> {
+    let size = st.allocas.get(a)?.0;
+    let mut init = None;
+    let mut markers = Vec::new();
+    // (pointer, is the alloca itself)
+    let mut work = vec![(a, true)];
+    while let Some((p, root)) = work.pop() {
+        for u in p.uses_iter(ctx) {
+            let o = u.user_op();
+            let i = u.find_index(ctx);
+            if Operation::is_op::<LoadOp>(o, ctx) {
+                if st.volatile.contains(o) {
+                    return None;
+                }
+            } else if Operation::is_op::<GetElementPtrOp>(o, ctx) {
+                if i != 0 {
+                    return None;
+                }
+                work.push((o.deref(ctx).get_result(ctx, 0), false));
+            } else {
+                match st.intrinsics.get(o).map(|s| s.as_str()) {
+                    Some("llvm.lifetime.start" | "llvm.lifetime.end") if root => markers.push(o),
+                    // Read as a copy source.
+                    Some("llvm.memcpy" | "llvm.memmove") if i == 1 && !st.volatile.contains(o) => {}
+                    // The one write: the whole object, from constant memory.
+                    Some("llvm.memcpy") if i == 0 && root && init.is_none() && !st.volatile.contains(o) => {
+                        let src = o.deref(ctx).get_operand(ctx, 1);
+                        let n = crate::sroa::const_int(ctx, st, o.deref(ctx).get_operand(ctx, 2))?;
+                        let (sym, off) = sym_off(ctx, st, src)?;
+                        let gsize = const_global_size(ctx, st, &sym)?;
+                        if n != size as i128 || off < 0 || off as u64 + size > gsize {
+                            return None;
+                        }
+                        init = Some((o, (sym, off)));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    let (m, src) = init?;
+    Some((m, markers, src))
+}
+
+/// LLVM's `isOnlyCopiedFromConstantMemory`: an alloca whose only write is
+/// a whole-object `memcpy` from an immutable global is the global. Reads
+/// before the copy were undefined, so reading the global there is a
+/// refinement. Uses become the global's address, so `run` can fold the
+/// loads; rustc materializes `const` arrays this way (blake3's
+/// `MSG_SCHEDULE[round]`: an 896-byte table copied to the stack, then a
+/// row of it copied again, and every message index loaded back and bounds
+/// checked). Iterates: replacing one copy's alloca makes copies out of it
+/// copies from the global. `PLIRON_CONSTCOPY=1` enables (default off).
+// r[impl iropt.constload.copy]
+pub fn forward_copies(ctx: &mut Context, st: &mut State) {
+    let fns: Vec<_> = st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| opt_body(ctx, st, f))
+        .collect();
+    let mut n = 0;
+    for f in fns {
+        loop {
+            let mut changed = false;
+            for al in crate::sroa::allocas(ctx, f) {
+                let a = al.deref(ctx).get_result(ctx, 0);
+                let Some((m, markers, (sym, off))) = const_copy(ctx, st, a) else {
+                    continue;
+                };
+                if !crate::bisect_in("constcopy", "") {
+                    continue;
+                }
+                for o in std::iter::once(m).chain(markers) {
+                    st.intrinsics.remove(o);
+                    Operation::erase(o, ctx);
+                }
+                let g = mk_const(ctx, st, a.get_type(ctx), ConstVal::Sym { sym, off });
+                a.replace_all_uses_with(ctx, &g);
+                st.allocas.remove(a);
+                st.promoted.remove(a);
+                Operation::erase(al, ctx);
+                n += 1;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        tracing::info!(target: "pliron::stats", "constcopy {}: {n} allocas", st.cgu)
+    }
+}
+
 // r[impl iropt.constload]
 pub fn run(ctx: &mut Context, st: &mut State) {
     // Nothing folds unless some global is a foldable const image.
