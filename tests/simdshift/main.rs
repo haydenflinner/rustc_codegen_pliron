@@ -70,6 +70,20 @@ fn neon(p: u32x2) -> u32x2 {
     p >> u32x2::splat(9)
 }
 
+/// A runtime amount on 64-bit vectors: `dup` + `ushl`/`sshl` (a negated
+/// amount for right shifts).
+#[inline(never)]
+fn varshift(p: u32x2, q: i16x4, r: u8x8, k: u32) -> u64 {
+    let a = p >> u32x2::splat(k);
+    let b = q >> i16x4::splat(k as i16);
+    let c = r << u8x8::splat(k as u8 & 7);
+    let mut h = (a[0] as u64) << 32 | a[1] as u64;
+    for l in b.to_array() {
+        h = h.rotate_left(13) ^ l as u16 as u64;
+    }
+    h ^ u64::from_le_bytes(c.to_array()).rotate_left(9)
+}
+
 fn main() {
     let x = black_box(u16x8::from_array([0xffff, 0x1234, 0x8001, 7, 0x00ff, 0xff00, 0x7fff, 0x8000]));
     let y = black_box(i16x8::from_array([-1, -32768, 32767, -100, 100, 0, -2, 1]));
@@ -82,6 +96,7 @@ fn main() {
     println!("{:016x}", narrow(p, q, r));
     let n = neon(p);
     println!("{:08x}{:08x}", n[0], n[1]);
+    println!("{:016x}", varshift(p, q, r, black_box(5)));
     let mut s = [b'a'; 16];
     s[3] = b'"';
     s[12] = b'"';

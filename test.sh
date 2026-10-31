@@ -816,9 +816,10 @@ t_simdshift() {
   # Native vector shifts (splat and per-lane amounts) and narrowing casts
   # must match stock; on aarch64 memchr's movemask must stay in vector
   # registers (ushr.8h + sqxtun), not go lane by lane.
-  # 64-bit vectors (and NEON's `vshr_n_u32`) must not reach Cranelift as
-  # vector shifts: its aarch64 backend rejects them (zmij ICEd five crates).
-  local want=$'3fe0259ce64e21d9\ne00617d9b4226fe0\n006f56df0000007f'
+  # 64-bit vectors (and NEON's `vshr_n_u32`): upstream Cranelift's aarch64
+  # backend rejected them (zmij ICEd five crates); vendored rules shift the
+  # `.2s/.4h/.8b` arrangements natively (checked below).
+  local want=$'3fe0259ce64e21d9\ne00617d9b4226fe0\n006f56df0000007f\n7f8faca96331823f'
   rustc $BE --edition 2021 -O tests/simdshift/main.rs -o $out/simdshift$exe &&
       [[ "$($out/simdshift$exe | tr -d '\r')" == "$want" ]] &&
   rustc $BE --edition 2021 tests/simdshift/main.rs -o $out/simdshift0$exe &&
@@ -830,6 +831,8 @@ t_simdshift() {
     grep -q 'ushr.8h' $out/simdshift.mm && grep -q 'sqxtun' $out/simdshift.mm &&
       ! grep -q 'umov.h' $out/simdshift.mm ||
       { echo "simdshift: movemask not vectorized" >&2; return 1; }
+    awk '/main4neon.*>:$/{p=1;next} /^$/{p=0} p' $out/simdshift.dis | grep -q 'ushr.2s' ||
+      { echo "simdshift: vshr_n_u32 not a native .2s shift" >&2; return 1; }
   fi
 }
 

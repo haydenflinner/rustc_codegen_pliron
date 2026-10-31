@@ -2123,6 +2123,16 @@
         (sshl x shift size)))
 (rule -2 (lower (ishl (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
         (ushl_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
+;; PLIRON: 64-bit integer vectors (I8X8, I16X4, I32X2) take the same
+;; instructions on the `.8b/.4h/.2s` arrangements; upstream only matched
+;; 128-bit types and rejected zmij's `ushr.i32x2` outright.
+(rule -11 (lower (ishl (ty_vec64_int ty) x y))
+      (let ((size VectorSize (vector_size ty))
+            (masked_shift_amt Reg (and_imm $I32 (lo_reg y) (shift_mask ty)))
+            (shift Reg (vec_dup masked_shift_amt size)))
+        (sshl x shift size)))
+(rule -10 (lower (ishl (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
+        (ushl_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
 
 (decl pure shift_masked_imm (Type u64) u8)
 (extern constructor shift_masked_imm shift_masked_imm)
@@ -2197,6 +2207,17 @@
 (rule -2 (lower (ushr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
           (if-let 0 (shift_masked_imm ty n))
           x)
+;; PLIRON: 64-bit integer vectors, as for `ishl`.
+(rule -12 (lower (ushr (ty_vec64_int ty) x y))
+      (let ((size VectorSize (vector_size ty))
+            (masked_shift_amt Reg (and_imm $I32 (lo_reg y) (shift_mask ty)))
+            (shift Reg (vec_dup (sub $I64 (zero_reg) masked_shift_amt) size)))
+        (ushl x shift size)))
+(rule -11 (lower (ushr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
+         (ushr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
+(rule -10 (lower (ushr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
+          (if-let 0 (shift_masked_imm ty n))
+          x)
 
 ;;     lsr       lo_rshift, src_lo, amt
 ;;     lsr       hi_rshift, src_hi, amt
@@ -2253,6 +2274,17 @@
 (rule -2 (lower (sshr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
           (sshr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
 (rule -1 (lower (sshr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
+          (if-let 0 (shift_masked_imm ty n))
+          x)
+;; PLIRON: 64-bit integer vectors, as for `ishl`.
+(rule -12 (lower (sshr (ty_vec64_int ty) x y))
+      (let ((size VectorSize (vector_size ty))
+            (masked_shift_amt Reg (and_imm $I32 (lo_reg y) (shift_mask ty)))
+            (shift Reg (vec_dup (sub $I64 (zero_reg) masked_shift_amt) size)))
+        (sshl x shift size)))
+(rule -11 (lower (sshr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
+          (sshr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
+(rule -10 (lower (sshr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
           (if-let 0 (shift_masked_imm ty n))
           x)
 
