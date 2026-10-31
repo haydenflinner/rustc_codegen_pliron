@@ -13,6 +13,12 @@ use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::settings::{self, Configurable};
 
+/// A vcode block label: `block3:`, optionally followed by `; <clif block>`.
+fn is_label(l: &str) -> bool {
+    let t = l.trim();
+    t.starts_with("block") && t.split(';').next().is_some_and(|h| h.trim_end().ends_with(':'))
+}
+
 fn asm(clif: &str) -> String {
     asm_at(clif, "speed")
 }
@@ -43,10 +49,10 @@ fn serde_escape_loop_has_no_stack_traffic() {
     let lines: Vec<&str> = a.lines().collect();
     let mut found = false;
     for (i, l) in lines.iter().enumerate() {
-        if !l.trim_end().ends_with(':') {
+        if !is_label(l) {
             continue;
         }
-        let body: Vec<&str> = lines[i + 1..].iter().take_while(|x| !x.trim_end().ends_with(':')).copied().collect();
+        let body: Vec<&str> = lines[i + 1..].iter().take_while(|x| !is_label(x)).copied().collect();
         let loads = body.iter().filter(|x| x.contains("ldurb") || x.contains("ldrb")).count();
         if loads == 2 && body.iter().any(|x| x.contains("cbnz")) && body.len() <= 10 {
             found = true;

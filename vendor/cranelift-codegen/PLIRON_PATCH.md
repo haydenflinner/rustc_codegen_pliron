@@ -1026,3 +1026,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     register is caller-saved, so a splat constant live across a call
     spilled: serde_json's `skip_to_escape` stored its three escape-scan
     masks and reloaded them in every scan block (28 -> 8 stack accesses).
+
+82. aarch64 callee saves at fixed offsets after one `sp` adjustment
+    (`src/isa/aarch64/abi.rs` `flat_save_slots`; `PLIRON_A64_FLATSAVE=0`
+    keeps upstream's pushes). Upstream pushes each pair with
+    `stp ..., [sp, #-16]!` and pops with `ldp ..., [sp], #16`: every one
+    writes `sp` back, a serial chain through `sp` on every call. Same
+    frame layout and unwind offsets; used when the frame record is set up
+    (FP-based CFA) and the incoming-arg area is not resized for tail calls;
+    the clobber area and fixed frame share one `sub` when all slots stay
+    in `stp`'s +504 range. Measured (dynstack.py): prologue/epilogue was
+    the largest excess sample class (pulldown +171, serde_json +114);
+    held-out geomean 1.292 -> 1.269.
+
+83. vcode disassembly names the CLIF block (or critical edge) each block
+    lowers (`block7: ; block158`), so `clif-check codegen` can weight code
+    by CLIF loop depth.

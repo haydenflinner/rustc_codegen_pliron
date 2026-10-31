@@ -2995,6 +2995,14 @@ fn s_edgespec(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_latchspec(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::latchspec::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("latchspec");
+    }
+    k
+}
+
 fn s_invparam(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::invparam::run(&mut p.clctx.func, an);
     if k > 0 && p.dump {
@@ -4323,6 +4331,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Last, once sameargs/edge folds left the loop-entry arg a plain 0.
         step("mulcarry", "", Gate::OptIn("PLIRON_MULCARRY"), s_mulcarry).needs(shape::LOOPS),
         step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),
+        // Fold a loop latch's few pure instructions into its predecessor's
+        // `brif` so the back edge is one branch (pulldown's escape scan).
+        step("latchspec", "latchspec", Gate::Env("PLIRON_LATCHSPEC"), s_latchspec).needs(shape::LOOPS),
         // Interleaved `ld; st` copy runs -> `ldp`/`stp`-fusable groups
         // (aarch64): by-value aggregate moves, 4 insns per 16 B before.
         step("copypair", "copypair", Gate::OptIn("PLIRON_COPYPAIR"), s_copypair)

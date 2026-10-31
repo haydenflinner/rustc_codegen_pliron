@@ -150,7 +150,24 @@ fn main() -> ExitCode {
             let mut ctx = Context::for_function(after);
             ctx.set_disasm(true);
             let c = ctx.compile(&*isa, &mut cranelift_codegen::control::ControlPlane::default()).expect("compile");
-            println!("{}", c.vcode.clone().unwrap_or_default());
+            let v = c.vcode.clone().unwrap_or_default();
+            let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&ctx.func);
+            let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&ctx.func, &cfg);
+            let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+            la.compute(&ctx.func, &cfg, &dt);
+            let depth = |b: &str| {
+                ctx.func.layout.blocks().find(|x| x.to_string() == b).map_or(0, |x| la.loop_level(x).level())
+            };
+            // Labels gain the CLIF loop depth: `block3: ; block7 depth=2`.
+            for l in v.lines() {
+                match l.split_once("; ") {
+                    Some((h, c)) if h.trim_start().starts_with("block") => {
+                        let d = c.split("->").map(|b| depth(b.trim())).max().unwrap_or(0);
+                        println!("{h}; {c} depth={d}");
+                    }
+                    _ => println!("{l}"),
+                }
+            }
             true
         }
         ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
@@ -358,7 +375,8 @@ fn with_pipe<R>(
         wasm: false,
         has_eh: false,
         flags: &flags,
-        dump: false,
+        // `PLIRON_CLIF=<substr of the file's self name>` dumps steps.
+        dump: std::env::var("PLIRON_CLIF").is_ok_and(|f| facts.self_name.as_deref().is_some_and(|n| n.contains(&f))),
         verify_full: false,
         since_reap: false,
         unopt: false,
@@ -696,36 +714,22 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
         .expect("ISA flags")
 }
 
-/// Score vcode text: `blockN:` labels in emission order, branches to
-/// `labelM`. A branch from block i back to block j <= i makes blocks j..=i
-/// a loop; a block's depth is the number of such spans holding it.
-/// Prologue/epilogue pushes and pops (`[sp, #-16]!`, `[sp], #16`) are not
-/// counted as stack accesses.
-fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64) {
+/// Score vcode text. Each `blockN: ; <clif block>` label (vendored
+/// Cranelift names the CLIF block, or `a->b` for a critical edge, which
+/// takes the deeper end) takes that block's loop depth from Cranelift's
+/// loop analysis of the compiled function. Prologue/epilogue pushes and
+/// pops (`[sp, #-16]!`, `[sp], #16`) are not stack accesses.
+fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64, depth_of: &dyn Fn(&str) -> u32) {
     let mut blocks: Vec<Vec<&str>> = Vec::new();
-    let mut ids: Vec<usize> = Vec::new();
+    let mut depth: Vec<u32> = Vec::new();
     for l in v.lines() {
         let t = l.trim();
-        if let Some(n) = t.strip_prefix("block").and_then(|r| r.strip_suffix(':')) {
-            ids.push(n.parse().unwrap_or(usize::MAX));
+        let (head, clif) = t.split_once(';').map_or((t, ""), |(h, c)| (h.trim(), c.trim()));
+        if head.starts_with("block") && head.ends_with(':') {
             blocks.push(Vec::new());
+            depth.push(clif.split("->").map(|b| depth_of(b.trim())).max().unwrap_or(0));
         } else if !t.is_empty() && !blocks.is_empty() {
             blocks.last_mut().unwrap().push(t);
-        }
-    }
-    let pos: std::collections::HashMap<usize, usize> = ids.iter().enumerate().map(|(i, &b)| (b, i)).collect();
-    let mut depth = vec![0u32; blocks.len()];
-    for (i, insts) in blocks.iter().enumerate() {
-        for t in insts {
-            for w in t.split(|c: char| !c.is_ascii_alphanumeric()) {
-                if let Some(&j) = w.strip_prefix("label").and_then(|n| n.parse::<usize>().ok()).and_then(|n| pos.get(&n)) {
-                    if j <= i {
-                        for d in &mut depth[j..=i] {
-                            *d += 1;
-                        }
-                    }
-                }
-            }
         }
     }
     for (i, insts) in blocks.iter().enumerate() {
@@ -772,15 +776,27 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
         });
         let mut ctx = Context::for_function(after);
         ctx.set_disasm(true);
-        ctx.compile(isa, &mut cranelift_codegen::control::ControlPlane::default())
+        let v = ctx.compile(isa, &mut cranelift_codegen::control::ControlPlane::default())
             .ok()
-            .and_then(|c| c.vcode.clone())
+            .and_then(|c| c.vcode.clone())?;
+        // Loop depth per CLIF block of the function as compiled.
+        let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&ctx.func);
+        let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&ctx.func, &cfg);
+        let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+        la.compute(&ctx.func, &cfg, &dt);
+        let depths: std::collections::HashMap<String, u32> = ctx
+            .func
+            .layout
+            .blocks()
+            .map(|b| (b.to_string(), la.loop_level(b).level() as u32))
+            .collect();
+        Some((v, depths))
     }));
     match r {
-        Ok(Some(v)) => {
+        Ok(Some((v, depths))) => {
             let [slots, spills, _, out, _] = cranelift_codegen::pliron_last_frame();
             (row.slots, row.spills) = (slots, spills);
-            score_vcode(&v, &mut row, i64::from(out) + i64::from(slots));
+            score_vcode(&v, &mut row, i64::from(out) + i64::from(slots), &|b| depths.get(b).copied().unwrap_or(0));
         }
         Ok(None) => row.status = "compile",
         Err(_) => row.status = "panic",

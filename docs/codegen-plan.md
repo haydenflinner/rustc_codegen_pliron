@@ -298,7 +298,31 @@ the `derived` facts jumpthread needed; licm hoists every constant on a
 rematerialization bet regalloc2 did not take; constdedup2 undid the
 egraph's constant placement.
 
+**Measured, not static (same day, `bench/heldout/dynstack.py`).** The
+census counted instructions statically; most spills it found sit on
+cold paths. Classifying every profile sample by instruction class,
+pliron minus LLVM, per program:
+
+| program | extra samples | stack accesses | prologue/epilogue | non-stack loads |
+|---|---|---|---|---|
+| pulldown-cmark | 535 | +85 | +171 | +214 |
+| rust-json | 347 | -22 | +114 | +150 |
+| regex | 346 | +69 | +40 | +115 |
+| blake3 | 127 | +101 | +79 | +17 |
+| blind-sig | 92 | +9 | +9 | +10 (compares +167) |
+
+So for runtime the order is: call and frame cost (prologue/epilogue
+shape, shrink-wrapping, and inlining of what LLVM inlines), then loads
+LLVM avoids (aliasing facts, load forwarding and hoisting: the facts
+service), then spills. Item 1 below stays, but behind frame cost.
+
 **Phase 1, parity (1.27 -> ~1.0):**
+
+0. **Frame cost.** Cranelift's aarch64 saves callee-saved registers with
+   pre-indexed pushes, a serial chain through `sp` (LLVM: one `sub sp`,
+   stores at offsets; `PLIRON_A64_FLATSAVE`), and saves them at entry on
+   every path (LLVM shrink-wraps: serde's `skip_to_escape` and
+   pulldown's scanners return early through a ten-register save).
 
 1. **Register allocation (W4).** Hot functions carry 5-40x LLVM's stack
    traffic, mostly spills (pulldown's `parse_block`: 22% of its

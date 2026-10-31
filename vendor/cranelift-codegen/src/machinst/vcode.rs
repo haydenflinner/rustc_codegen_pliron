@@ -1329,7 +1329,17 @@ impl<I: VCodeInst> VCode<I> {
             buffer.bind_label(MachLabel::from_block(block), state.ctrl_plane_mut());
 
             if want_disasm {
-                writeln!(&mut disasm, "block{}:", block.index()).unwrap();
+                // PLIRON: name the CLIF block (or edge) this lowers, so
+                // tools can weight code by CLIF loop depth.
+                match self.block_order.lowered_order().get(block.index()) {
+                    Some(crate::machinst::blockorder::LoweredBlock::Orig { block: cb }) => {
+                        writeln!(&mut disasm, "block{}: ; {cb}", block.index()).unwrap()
+                    }
+                    Some(crate::machinst::blockorder::LoweredBlock::CriticalEdge { pred, succ, .. }) => {
+                        writeln!(&mut disasm, "block{}: ; {pred}->{succ}", block.index()).unwrap()
+                    }
+                    None => writeln!(&mut disasm, "block{}:", block.index()).unwrap(),
+                }
             }
 
             if flags.machine_code_cfg_info() {
