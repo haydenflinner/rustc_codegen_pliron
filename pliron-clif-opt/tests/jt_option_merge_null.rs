@@ -54,6 +54,8 @@ fn icmp_on(f: &Function, v: Value) -> bool {
 
 #[test]
 fn second_level_option_null_test_folds() {
+    // The fold is opt-in; this test binary holds only this test.
+    unsafe { std::env::set_var("PLIRON_NULLSRC", "1") };
     let before = cranelift_reader::parse_functions(SRC).unwrap().remove(0);
     let mut after = before.clone();
     let v0 = Value::from_u32(0);

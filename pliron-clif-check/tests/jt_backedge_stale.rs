@@ -17,6 +17,8 @@ fn erase_indices_backedge_carries_counters() {
     let out = Command::new(env!("CARGO_BIN_EXE_clif-check"))
         .args(["vcode", data])
         .env("PLIRON_PRECOMPILE", "1")
+        // The (opt-in) second-level niche fold makes the edge threadable.
+        .env("PLIRON_NULLSRC", "1")
         .output()
         .expect("run clif-check");
     let err = String::from_utf8_lossy(&out.stderr);

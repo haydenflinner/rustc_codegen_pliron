@@ -1126,7 +1126,9 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull) -> usize {
     };
     let sentinel = crate::pass_enabled("PLIRON_SENTINEL");
     let paramnull = crate::pass_enabled("PLIRON_PARAMNULL");
-    let single_src = crate::pass_enabled("PLIRON_NULLSRC");
+    // Opt-in: removes the zip/enumerate per-element null test, but the
+    // threading it enables costs regex ~5% (compression gains ~4%).
+    let single_src = pliron_cfg::env_is("PLIRON_NULLSRC", "1");
     let mut hits = Vec::new();
     let mut cfg_lazy: Option<ControlFlowGraph> = None;
     let mut dt_lazy: Option<DominatorTree> = None;
