@@ -1097,3 +1097,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     (band (ushr m, 4) 0x00ff..) _)) 0` (splat or `vconst` mask) is `shrn
     v.8b, m.8h, #4; fmov x, d` instead of `ushr; and; sqxtun; sqxtun2;
     mov` (pliron's `bytescan`).
+
+90. Emit-time post-index sweep (`machinst/vcode.rs`): a chain element
+    whose writeback step is 0 (a load and a store at the same offset
+    before `add base, base, #c`) stays a plain access instead of
+    `ldr x, [base], #0` (a writeback micro-op for nothing).

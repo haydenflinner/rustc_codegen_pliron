@@ -1933,6 +1933,12 @@ impl<I: VCodeInst> VCode<I> {
                     continue;
                 }
                 for (m, &(ix, _, _)) in chain.iter().enumerate() {
+                    // PLIRON: a zero step (a load and a store at the same
+                    // offset) is the plain access; post-index `#0` would
+                    // only add a writeback.
+                    if wbs[m] == 0 {
+                        continue;
+                    }
                     self.insts[ix.index()].set_post_index(wbs[m]);
                     preg_ops[ix.index()].1.push(base);
                 }
