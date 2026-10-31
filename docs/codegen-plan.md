@@ -246,6 +246,41 @@ loops (blake3's add/xor/rotate chain; the carry chain).
   recently) and SLP coverage for byte classification tables.
 - wasm SIMD for the wasm held-out suite (W0).
 
+## Progress (2026-10-31)
+
+Held-out geomean 1.57x (morning) -> 1.27x (`bench/heldout`, 8 programs,
+current stack). The check set moved too (lol_html 1.45 -> 1.33, flate2
+1.47 -> 1.42), so most of it is general.
+
+What the census (`bench/heldout/census.py`, W0) showed, and what was done:
+
+- **Stack traffic is mostly allocator spills**, not memory-resident locals
+  (`PLIRON_FRAME_INFO`: regex `Utf8Sequences::next` 464 B spills vs 24 B
+  slots; serde `skip_to_escape` 112 vs 0). W4 is the top lever.
+  - Fixed-register call arguments pinned whole bundles to a
+    call-clobbered register (`PLIRON_ARGCOPY`, Cranelift patch 75).
+  - No rematerialization: constant and address reloads now re-execute
+    their definition (`PLIRON_REMAT`, patch 76).
+  - Still open: loop-aware splitting (a use-free gap inside a loop goes
+    to the stack); a first heuristic (keep in-loop gaps with the register
+    piece) made serde worse and was reverted.
+- **NEON fidelity (W10) was a hidden factor**: `src/simd.rs` scalarized
+  portable-SIMD shifts and narrowing casts, so memchr's movemask (serde,
+  regex, lol_html) ran lane by lane (`clif.lower.simdshift`).
+- **Placement (W5)**: 64-byte loop alignment for small loops (patch 74);
+  identical code across a 64-byte line cost chars_ascii 1.77x.
+- **Isel idioms (W6)**: rotate folds (patch 71), `adds`/`cinc` carries
+  (patch 72), constant i128 shifts (`clif.lower.shift128k`).
+- **IV forms (W2 groundwork)**: `ivcmp` (offset exit tests, only on IVs
+  whose sum is otherwise an address: the batch caught it regressing
+  parse_only on a carried pointer), `invparam` (LoopSimplify-style
+  separation of loops whose back edges disagree; opt-in until W4).
+- **Facts (W1)**: `PLIRON_INBOUNDSNN` (inbounds GEP of a nonnull base is
+  nonnull) exists but is off; brotli's `FindMatchLengthWithLimit` pays a
+  null check per byte and pointer materialization because of it.
+- Two old miscompiles surfaced in a new fuzz window (seeds 16782,
+  16787); they predate this work.
+
 ## Sequencing
 
 | phase | contents | target (held-out native, aarch64) |

@@ -98,6 +98,30 @@ def self_samples(path, proc_substr="benchmark"):
     return selfc, total
 
 
+def mnemonic_mix(exe, fns):
+    """Demangled function -> Counter of mnemonics, for the functions in `fns`."""
+    txt = subprocess.run([objdump(), "-d", "-C", "--no-show-raw-insn", exe],
+                         capture_output=True, text=True).stdout
+    out, cur = {}, None
+    for line in txt.splitlines():
+        m = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
+        if m:
+            k = demangle_key(m.group(1))
+            cur = k if k in fns else None
+            if cur:
+                out[cur] = collections.Counter()
+            continue
+        if cur and line.strip():
+            parts = line.split("\t")
+            if len(parts) > 1:
+                mn = parts[1].strip()
+                ops = parts[2] if len(parts) > 2 else ""
+                if "[sp" in ops or "[x29" in ops:
+                    mn += "(stack)"
+                out[cur][mn] += 1
+    return out
+
+
 def static_counts(exe):
     """Demangled function -> (insts, stack mem ops, cond branches, calls)."""
     txt = subprocess.run([objdump(), "-d", "-C", "--no-show-raw-insn", exe],
@@ -135,9 +159,12 @@ def main():
     ap.add_argument("--runs", type=int, default=150)
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--json", default=os.path.join(OUT, "census.json"))
+    ap.add_argument("--idioms", action="store_true",
+                    help="aggregate the mnemonic mix of functions both sides define, weighted by pliron samples")
     a = ap.parse_args()
     progs = [p for p in PROGS if not a.only or p in a.only.split(",")]
     report = {}
+    idiom = collections.Counter()
     for prog in progs:
         cwd = os.path.join(OUT, "src", prog)
         sides = {}
@@ -172,6 +199,26 @@ def main():
         for d, fn, p, l in reversed(neg):
             print(f"{d:6d} {'':>6} {p:7d} {l:6d}  {'':>11} {'':>9} {'':>7}  {fn[:90]}  (LLVM-heavy)")
         report[prog] = {"pliron_samples": pt, "llvm_samples": lt, "rows": res}
+        if a.idioms:
+            both = {fn for fn in pc if fn in lc and pc[fn] >= 20}
+            pm = mnemonic_mix(os.path.join(OUT, "pliron", prog, "release", "benchmark"), both)
+            lm = mnemonic_mix(os.path.join(OUT, "llvm", prog, "release", "benchmark"), both)
+            for fn in both:
+                if fn not in pm or fn not in lm:
+                    continue
+                pn, ln = sum(pm[fn].values()), sum(lm[fn].values())
+                w = pc[fn] / max(pt, 1)
+                for mn in set(pm[fn]) | set(lm[fn]):
+                    # Share of the function's instructions, ours minus LLVM's,
+                    # weighted by the function's share of pliron's time.
+                    idiom[mn] += w * (pm[fn][mn] / max(pn, 1) - lm[fn][mn] / max(ln, 1))
+    if a.idioms:
+        print("\n== mnemonics we over-use (+) and under-use (-) vs LLVM, time-weighted")
+        for mn, v in idiom.most_common(15):
+            print(f"  {v:+.4f}  {mn}")
+        print("  ...")
+        for mn, v in sorted(idiom.items(), key=lambda kv: kv[1])[:15]:
+            print(f"  {v:+.4f}  {mn}")
     with open(a.json, "w") as f:
         json.dump(report, f, indent=1)
 
