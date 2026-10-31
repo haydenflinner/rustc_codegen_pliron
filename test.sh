@@ -803,6 +803,25 @@ t_debuginfo() {
   cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
 }
 
+# r[verify clif.lower.simdshift]
+t_simdshift() {
+  # Native vector shifts (splat and per-lane amounts) and narrowing casts
+  # must match stock; on aarch64 memchr's movemask must stay in vector
+  # registers (ushr.8h + sqxtun), not go lane by lane.
+  rustc $BE --edition 2021 -O tests/simdshift/main.rs -o $out/simdshift$exe &&
+      [[ "$($out/simdshift$exe)" == 3fe0259ce64e21d9 ]] &&
+  rustc $BE --edition 2021 tests/simdshift/main.rs -o $out/simdshift0$exe &&
+      [[ "$($out/simdshift0$exe)" == 3fe0259ce64e21d9 ]] || return 1
+  if [[ -x "$llvmod" && "$(uname -m)" == arm64 ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/simdshift/main.rs -o $out/simdshift.o
+    "$llvmod" -d --no-show-raw-insn $out/simdshift.o > $out/simdshift.dis
+    awk '/movemask.*>:$/{p=1;next} /^$/{p=0} p' $out/simdshift.dis > $out/simdshift.mm
+    grep -q 'ushr.8h' $out/simdshift.mm && grep -q 'sqxtun' $out/simdshift.mm &&
+      ! grep -q 'umov.h' $out/simdshift.mm ||
+      { echo "simdshift: movemask not vectorized" >&2; return 1; }
+  fi
+}
+
 # r[verify clif.lower.shift128k]
 t_shift128k() {
   # i128 shifts by a constant lower as 64-bit halves; the generic path
@@ -1139,6 +1158,7 @@ want retattr && t_retattr
 want willret && t_willret
 want constcopy && t_constcopy
 want shift128k && t_shift128k
+want simdshift && t_simdshift
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR
 # resumes lower to `pliron.eh.rethrow` via cleanup_ret (funclet path), so

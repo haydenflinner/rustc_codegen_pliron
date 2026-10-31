@@ -3785,6 +3785,63 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// where the high half is one register; num-bigint-dig's Montgomery
     /// loop). Out-of-range amounts (poison) keep the generic path.
     /// `PLIRON_SHIFT128K=0` disables.
+    // r[impl clif.lower.simdshift]
+    /// A shift of native vector leaves (`src/simd.rs` emits these for
+    /// `simd_shl`/`simd_shr`). Cranelift shifts a vector by one scalar, so a
+    /// splat amount (`pliron.vsplat`, or a constant with equal lanes) passes
+    /// its lane; any other amount shifts lane by lane.
+    fn shift_vec(&mut self, op: Ptr<Operation>, opnds: &[Value], kind: u8) -> bool {
+        let x = self.get(opnds[0]);
+        if x.is_empty() || !x.iter().all(|&v| self.b.func.dfg.value_type(v).is_vector()) {
+            return false;
+        }
+        let ins = |b: &mut FunctionBuilder, x: ir::Value, k: ir::Value| match kind {
+            0 => b.ins().ishl(x, k),
+            1 => b.ins().ushr(x, k),
+            _ => b.ins().sshr(x, k),
+        };
+        let lane_ty = self.b.func.dfg.value_type(x[0]).lane_type();
+        let splat = match opnds[1].defining_op() {
+            Some(d) if self.st.intrinsics.get(d).map(|s| s.as_str()) == Some("pliron.vsplat") => {
+                Some(self.get1(d.deref(self.ctx).get_operand(self.ctx, 0)))
+            }
+            _ => match self.st.consts.get(opnds[1]) {
+                Some(ConstVal::Agg(es)) => {
+                    let bits: Vec<_> = es.iter().map(|&e| self.const_bits(e, 0).map(|b| b.0)).collect();
+                    match bits.first() {
+                        Some(Some(k)) if bits.iter().all(|b| *b == Some(*k)) => {
+                            Some(self.b.ins().iconst(lane_ty, *k as i64))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        };
+        let r: Vals = match splat {
+            Some(k) => x.iter().map(|&v| ins(&mut self.b, v, k)).collect(),
+            None => {
+                let y = self.get(opnds[1]);
+                x.iter()
+                    .zip(y.iter())
+                    .map(|(&xv, &yv)| {
+                        let t = self.b.func.dfg.value_type(xv);
+                        let mut acc = xv;
+                        for l in 0..t.lane_count() as u8 {
+                            let a = self.b.ins().extractlane(xv, l);
+                            let k = self.b.ins().extractlane(yv, l);
+                            let e = ins(&mut self.b, a, k);
+                            acc = self.b.ins().insertlane(acc, e, l);
+                        }
+                        acc
+                    })
+                    .collect()
+            }
+        };
+        self.set(op, r);
+        true
+    }
+
     // r[impl clif.lower.shift128k]
     fn shift_i128_const(&mut self, op: Ptr<Operation>, opnds: &[Value], kind: u8) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5239,15 +5296,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(XorOp) {
             binop!(bxor)
         } else if is!(ShlOp) {
-            if !self.shift_i128_const(op, opnds, 0) {
+            if !self.shift_i128_const(op, opnds, 0) && !self.shift_vec(op, opnds, 0) {
                 binop!(ishl)
             }
         } else if is!(LShrOp) {
-            if !self.shift_i128_const(op, opnds, 1) {
+            if !self.shift_i128_const(op, opnds, 1) && !self.shift_vec(op, opnds, 1) {
                 binop!(ushr)
             }
         } else if is!(AShrOp) {
-            if !self.shift_i128_const(op, opnds, 2) {
+            if !self.shift_i128_const(op, opnds, 2) && !self.shift_vec(op, opnds, 2) {
                 binop!(sshr)
             }
         } else if is!(UDivOp) {
@@ -5965,6 +6022,25 @@ impl<'a, 'b> FnLower<'a, 'b> {
             n if n.starts_with("pliron.vcmp.") => {
                 let (p, k) = n["pliron.vcmp.".len()..].split_once('.').unwrap();
                 pliron_clif_opt::vecsel::vcmp(&mut self.b, p, k, a[0], a[1], rt)
+            }
+            // Vector shifted by one scalar amount (`src/simd.rs` splats).
+            "pliron.vshl" => self.b.ins().ishl(a[0], a[1]),
+            "pliron.vshr.u" => self.b.ins().ushr(a[0], a[1]),
+            "pliron.vshr.s" => self.b.ins().sshr(a[0], a[1]),
+            // Truncate each lane to half width: mask to the low half (so
+            // the saturating `unarrow` is exact), narrow into a 128-bit
+            // vector, keep its low 64 bits (`rt` is a 64-bit vector).
+            "pliron.vtrunc" => {
+                let st = self.b.func.dfg.value_type(a[0]);
+                let lane = st.lane_type();
+                let mask = (1u64 << (lane.bits() / 2)) - 1;
+                let k = self.b.ins().iconst(lane, mask as i64);
+                let m = self.b.ins().splat(st, k);
+                let x = self.b.ins().band(a[0], m);
+                let n = self.b.ins().unarrow(x, x);
+                let q = self.b.ins().bitcast(clt::I64X2, MemFlagsData::new().with_endianness(ir::Endianness::Little), n);
+                let lo = self.b.ins().extractlane(q, 0);
+                self.b.ins().bitcast(rt, MemFlagsData::new().with_endianness(ir::Endianness::Little), lo)
             }
             n => unreachable!("{n}"),
         }

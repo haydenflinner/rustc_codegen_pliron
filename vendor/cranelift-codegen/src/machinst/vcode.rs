@@ -834,8 +834,10 @@ impl<I: VCodeInst> VCode<I> {
         let align_loops =
             *ALIGN.get_or_init(|| std::env::var("PLIRON_ALIGN").map_or(true, |v| v != "0"));
         let mut loop_head = vec![false; self.num_blocks()];
+        // Emission position of each loop head's last back-edge source.
+        let mut loop_end = vec![0usize; self.num_blocks()];
+        let mut order_of = vec![usize::MAX; self.num_blocks()];
         if align_loops {
-            let mut order_of = vec![usize::MAX; self.num_blocks()];
             for (i, &b) in final_order.iter().enumerate() {
                 order_of[b.index()] = i;
             }
@@ -847,6 +849,7 @@ impl<I: VCodeInst> VCode<I> {
                         && self.block_order.is_back_edge_target(BlockIndex::new(s))
                     {
                         loop_head[s] = true;
+                        loop_end[s] = loop_end[s].max(order_of[pred]);
                     }
                 }
             }
@@ -1125,6 +1128,31 @@ impl<I: VCodeInst> VCode<I> {
             // PLIRON: loop headers get 16-byte alignment.
             if loop_head[block.index()] {
                 new_offset = new_offset.max((buffer.cur_offset() + 15) & !15);
+                // PLIRON: with fixed-size instructions, a loop that fits in
+                // one 64-byte line must not straddle two: the hot loop is
+                // then one fetch block per iteration (chars_ascii ran 1.77x
+                // slower with an identical 36-byte loop across a 64-byte
+                // boundary). The function asks for 64-byte alignment so
+                // offsets are absolute. `PLIRON_ALIGN64=0` disables.
+                static ALIGN64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if let Some(sz) = I::fixed_inst_size()
+                    && *ALIGN64.get_or_init(|| std::env::var("PLIRON_ALIGN64").as_deref() != Ok("0"))
+                {
+                    let bi = block.index();
+                    let (from, to) = (order_of[bi], loop_end[bi]);
+                    let mut est: u32 = 0;
+                    if from <= to && to < final_order.len() {
+                        for &lb in &final_order[from..=to] {
+                            let r = self.block_ranges.get(lb.index());
+                            est += (r.end - r.start) as u32 + ra_edits_per_block[lb.index()];
+                        }
+                    }
+                    let bytes = est * sz;
+                    if bytes > 0 && bytes <= 64 && (new_offset % 64) + bytes > 64 {
+                        new_offset = (new_offset + 63) & !63;
+                        buffer.require_alignment(64);
+                    }
+                }
             }
             while new_offset > buffer.cur_offset() {
                 // Pad with NOPs up to the aligned block offset.

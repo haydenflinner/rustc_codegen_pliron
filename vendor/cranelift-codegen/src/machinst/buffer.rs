@@ -696,6 +696,12 @@ impl<I: VCodeInst> MachBuffer<I> {
         // Post-invariant: as for `put1()`.
     }
 
+    /// PLIRON: require the whole function to start at a multiple of
+    /// `align` (so intra-function offsets map to absolute cache lines).
+    pub fn require_alignment(&mut self, align: u32) {
+        self.min_alignment = self.min_alignment.max(align);
+    }
+
     /// Align up to the given alignment.
     pub fn align_to(&mut self, align_to: CodeOffset) {
         trace!("MachBuffer: align to {}", align_to);

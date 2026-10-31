@@ -390,6 +390,13 @@ pub trait MachInst: Clone + Debug {
         offset
     }
 
+    /// PLIRON: the size of every instruction when the encoding is fixed
+    /// (aarch64: 4), so emission can estimate a loop's byte size from its
+    /// instruction count. `None` for variable-length encodings.
+    fn fixed_inst_size() -> Option<CodeOffset> {
+        None
+    }
+
     /// What is the worst-case instruction size emitted by this instruction type?
     fn worst_case_size() -> CodeOffset;
 

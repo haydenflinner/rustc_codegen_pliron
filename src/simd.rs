@@ -31,6 +31,35 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         )
     }
 
+    /// The scalar lane of a splat: a `pliron.vsplat`, or a constant vector
+    /// whose lanes are all equal.
+    fn splat_lane(&self, v: Value) -> Option<Value> {
+        if let Some(ConstVal::Agg(ids)) = self.cval(v) {
+            let first = self.const_to_opt_u128(*ids.first()?, false)?;
+            return ids
+                .iter()
+                .all(|&i| self.const_to_opt_u128(i, false) == Some(first))
+                .then_some(ids[0]);
+        }
+        let op = v.defining_op()?;
+        if self.st.borrow().intrinsics.get(op).map(|s| s.as_str()) != Some("pliron.vsplat") {
+            return None;
+        }
+        Some(op.deref(&self.cx.pctx.borrow()).get_operand(&self.cx.pctx.borrow(), 0))
+    }
+
+    fn aarch64(&self) -> bool {
+        self.tcx.sess.target.arch == rustc_target::spec::Arch::AArch64
+    }
+
+    /// Bit width of an integer element type (0 otherwise).
+    fn elem_bits(&self, t: TypeHandle) -> u32 {
+        match self.cx.kind(t) {
+            crate::types::TyK::Int(w) => w,
+            _ => 0,
+        }
+    }
+
     /// Whether `ty` lowers to native Cranelift SIMD values.
     pub(crate) fn native(&self, ty: TypeHandle) -> bool {
         match self.cx.kind(ty) {
@@ -732,6 +761,30 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     "maximum_number_nsz" => "fmax",
                     o => o,
                 };
+                // Native integer vector shifts by a splat amount: Cranelift
+                // shifts a vector by one scalar, so pass the splat's lane.
+                // Per-lane emulation of memchr's `vshrn_n_u16` (a shift
+                // then a narrowing cast) dominated serde_json's escape
+                // scan (`skip_to_escape`: 1,322 instructions vs LLVM's 181).
+                if self.native(ret) && !e.float && matches!(op, "shl" | "shr") && self.aarch64() {
+                    if let Some(k) = self.splat_lane(a(1)) {
+                        let name = match (op, e.signed) {
+                            ("shl", _) => "pliron.vshl",
+                            ("shr", true) => "pliron.vshr.s",
+                            _ => "pliron.vshr.u",
+                        };
+                        return Some(self.intrinsic(name, ret, &[a(0), k]));
+                    }
+                    // Not visibly a splat yet (`vdupq_n_u16` is a call until
+                    // inlining): a whole-vector shift; lowering finds the
+                    // splat then, or shifts lane by lane.
+                    let (x, y) = (a(0), a(1));
+                    return Some(match (op, e.signed) {
+                        ("shl", _) => self.shl(x, y),
+                        ("shr", true) => self.ashr(x, y),
+                        _ => self.lshr(x, y),
+                    });
+                }
                 if self.native(ret) {
                     let (x, y) = (a(0), a(1));
                     let r = match (op, e.float) {
@@ -1119,6 +1172,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             "cast" | "as" => {
                 let (_, to) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);
+                // Native int vector truncated to half-width lanes (memchr's
+                // movemask: i16x8 -> i8x8): one native narrow, not lanes.
+                let src = self.val_ty(a(0));
+                if !e.float
+                    && !to.float
+                    && self.aarch64()
+                    && self.native(src)
+                    && self.native(ret)
+                {
+                    let (fw, tw) = (self.elem_bits(self.element_type(src)), self.elem_bits(et));
+                    if (fw == 16 || fw == 32) && tw * 2 == fw {
+                        return Some(self.intrinsic("pliron.vtrunc", ret, &[a(0)]));
+                    }
+                }
                 let xs = self.arg_lanes(&args[0]);
                 let out = xs
                     .into_iter()

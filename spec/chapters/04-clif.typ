@@ -112,6 +112,25 @@ only the consumer of the optimized CLIF differs.
   constant i128 shift into its halves.
 ]
 
+#r("clif.lower.simdshift", title: "Native vector shifts and narrowing", level: "should",
+   refines: ("model.equiv", "model.parity"),
+   checked: "test.sh t_simdshift")[
+  On aarch64, `simd_shl`/`simd_shr` of a native integer vector SHOULD lower
+  to vector shifts: by the scalar lane when the amount is a splat (a
+  `pliron.vsplat` or a constant with equal lanes), lane by lane in CLIF
+  otherwise. A `simd_cast` of a native integer vector to half-width lanes
+  SHOULD lower to a mask, `unarrow` and the low 64 bits (`pliron.vtrunc`).
+]
+
+#llvm(kind: "gap", summary: [Narrowing is mask + `sqxtun` + lane move where LLVM emits one `shrn`/`xtn`.])[
+  Rust's portable SIMD intrinsics (and `core::arch` functions built on
+  them, like `vshrn_n_u16`) used to be scalarized lane by lane; memchr's
+  movemask became ~60 scalar instructions in serde_json's escape scan.
+  Now it is `ushr.8h; and; sqxtun; sqxtun2; mov` against LLVM's
+  `shrn; fmov`; an ISLE fold of `unarrow (band (ushr x k) m)` into `shrn`
+  would close the rest.
+]
+
 #r("clif.lower.byval", title: "By-value aggregates", level: "must",
    refines: "model.abi", checked: "test.sh rusttailcc")[
   A by-value (`byval`) argument MUST be lowered as a Cranelift

@@ -1238,6 +1238,10 @@ impl MachInst for Inst {
         }
     }
 
+    fn fixed_inst_size() -> Option<CodeOffset> {
+        Some(4)
+    }
+
     fn worst_case_size() -> CodeOffset {
         // The maximum size, in bytes, of any `Inst`'s emitted code. We have at least one case of
         // an 8-instruction sequence (saturating int-to-float conversions) with three embedded

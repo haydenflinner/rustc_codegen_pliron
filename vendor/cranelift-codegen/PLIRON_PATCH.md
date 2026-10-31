@@ -951,3 +951,12 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     addresses changed the same way (`PLIRON_SPLINK_ADDR=1`,
     `PLIRON_LICM_SYM=0`). Test: `pliron-clif-opt/tests/symaddr_loop.rs`
     (fails with `PLIRON_REMATSINK=1`).
+
+74. aarch64 64-byte loop placement (`src/machinst/vcode.rs`,
+    `MachInst::fixed_inst_size`, `MachBuffer::require_alignment`;
+    `PLIRON_ALIGN64=0` disables): with fixed-size instructions, a loop
+    whose estimated size (instructions + regalloc edits) fits in 64 bytes
+    and would straddle a 64-byte line gets its head padded to the next
+    line, and the function asks for 64-byte alignment so the offset is
+    absolute. The kernel A/B saw chars_ascii at 1.77x with byte-identical
+    code whose 36-byte loop crossed a 64-byte boundary.
