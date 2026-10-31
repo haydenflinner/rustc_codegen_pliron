@@ -1,0 +1,8 @@
+[package]
+name = "sightglass-api"
+version = "0.1.0"
+edition = "2021"
+description = "Stand-in for sightglass-api: times start()..end() with the host clock (bench/heldout)."
+publish = false
+
+[workspace]

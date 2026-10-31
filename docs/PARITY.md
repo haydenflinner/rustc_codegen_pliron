@@ -112,6 +112,28 @@ self-host run. x86-64 was last measured 2026-10-22.
 | tokenize | 7.674 ms | 5.495 ms | 0.714 ◄ faster |
 <!-- SCOREBOARD:END -->
 
+### Held-out runtime (not in the card)
+
+SPD is measured on the kernels above, which the backend has been tuned
+against for weeks. On real programs it was never tuned on, native code is
+**1.57x slower** than LLVM (geomean of 8; 2026-10-31, `59589ee`, 11
+interleaved rounds, `bench/heldout/run.py`):
+
+| program (sightglass) | LLVM | pliron | pliron/LLVM |
+|---|---|---|---|
+| blake3-scalar | 4.13 ms | 13.00 ms | 3.149 |
+| blind-sig | 1.87 ms | 4.02 ms | 2.148 |
+| pulldown-cmark | 5.38 ms | 8.24 ms | 1.531 |
+| rust-compression | 3.36 ms | 4.90 ms | 1.457 |
+| rust-html-rewriter | 7.00 ms | 10.07 ms | 1.438 |
+| regex | 3.89 ms | 5.12 ms | 1.315 |
+| rust-json | 4.58 ms | 5.87 ms | 1.282 |
+| rust-protobuf | 8.68 ms | 8.68 ms | 0.999 |
+
+Treat the kernel geomean as "parity on code shapes we have worked on", not
+as generated-code speed in general.
+[`history/2026-10-31-heldout.md`](history/2026-10-31-heldout.md).
+
 ## Known gaps by axis
 
 Each entry names the mechanism and where to look. Numbers for these live
@@ -119,6 +141,10 @@ in the scoreboard and in the linked history files.
 
 ### Runtime speed
 
+- **Held-out programs: 1.57x.** The largest runtime gap is outside the
+  card (table above): blake3's compression rounds (3.1x), blind-sig's
+  bignum arithmetic (2.1x), and 1.3-1.5x across parsers and compressors.
+  Nothing there has been profiled yet.
 - **wasm local traffic.** CLIF SSA values become wasm locals; waffle's
   relooper passes block params through scratch locals at `if`/`else`
   boundaries, and we emit structured `if` diamonds where LLVM emits
@@ -251,35 +277,38 @@ in the scoreboard and in the linked history files.
 
 Ranked by expected card gain per effort. Each item links its evidence.
 
-1. **Validate and flip the pending size flags.** `PLIRON_COPYPAIR=1`,
+1. **Profile the held-out programs** (`bench/heldout/run.py`, 1.57x):
+   start with blake3-scalar (3.1x) and blind-sig (2.1x), whose hot loops
+   are small. Gains there are real gains, not tuning to our own kernels.
+2. **Validate and flip the pending size flags.** `PLIRON_COPYPAIR=1`,
    `PLIRON_TBNZ_IREDUCE=1`, `PLIRON_SROA_MAXSLICES=18`
    (`history/2026-10-29-ir-excess.md` §5) and `PLIRON_LIBCALL_DIRECT=1`,
    `PLIRON_EDGEMERGE=3`/`PLIRON_EPIMERGE=2`
    (`history/2026-10-29-code-size.md`) still need a bench A/B,
    `harness/gate.py --full`, crates and stage-2 UI.
-2. **Size/cold gates on duplicating passes**: `punroll`, peeling,
+3. **Size/cold gates on duplicating passes**: `punroll`, peeling,
    `jumpthread`, `looprot` and the `MEMFAST` fast path, gated on cold
    loops (bodies that lead to a panic) or huge functions. Bench every
    kernel.
-3. **Aggregate copies as memcpy**: a principled "do not split an alloca
+4. **Aggregate copies as memcpy**: a principled "do not split an alloca
    whose only accesses are whole-object copies" rule in place of the
    `SROA_MAXSLICES` threshold; memcpy-chain forwarding for copy-only
    allocas (also a stack-frame lever).
-4. **wasm local traffic**: wpeep-friendly `CondBr` → `br_if` emission,
+5. **wasm local traffic**: wpeep-friendly `CondBr` → `br_if` emission,
    block-typed merges for branch arms, make multi-value `WIFRET`
    (`PLIRON_WIFRET_MULTI`) shrink code instead of growing it.
-5. **wasm memory hump**: translate each function to waffle inside its
+6. **wasm memory hump**: translate each function to waffle inside its
    pipeline job.
-6. **Pressure-aware loop-invariant hoisting**, so `PLIRON_ELABLOOPS` can
+7. **Pressure-aware loop-invariant hoisting**, so `PLIRON_ELABLOOPS` can
    be default-on.
-7. **`eqbug` compare lowering**, and `uxtb` after `zeroext` bool call
+8. **`eqbug` compare lowering**, and `uxtb` after `zeroext` bool call
    results (trust the callee's extension on Apple arm64).
-8. **Compile time on giant functions**: per-instruction cost of the top
+9. **Compile time on giant functions**: per-instruction cost of the top
    CLIF steps; sharing pliron-IR results for live `xcgu` copies.
-9. **Correctness debt**: real SEH catch on windows-msvc; audit
+10. **Correctness debt**: real SEH catch on windows-msvc; audit
    callee-side IPO on `xcgu` copies for wasm; serialize the remaining
    fact tables in the corpus header.
-10. **Re-measure x86-64** (Windows and Linux), native and CubeCL.
+11. **Re-measure x86-64** (Windows and Linux), native and CubeCL.
 
 ## How to measure
 
@@ -287,6 +316,9 @@ Ranked by expected card gain per effort. Each item links its evidence.
   native,wasm,ctime,stack`, `--from-logs`). Writes
   `target/parity/summary.md`, card first. Run nothing else heavy
   meanwhile.
+- Held-out runtime: `bench/heldout/run.py [--rounds N] [--only a,b]`
+  (sightglass's Rust programs, native, interleaved; needs the
+  `are-we-fast-yet` checkout next to this repo).
 - One kernel's runtime: `bench/run.sh <name>` / `bench/wasm/run.sh
   <name>`. Placement check: `bench/layout.sh <kernel> [N]` (relinks under
   shuffled symbol orders, reports the cross-layout median) and
