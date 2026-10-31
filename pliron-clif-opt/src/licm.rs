@@ -194,7 +194,11 @@ fn overlap_keeps(
     let (r, o, ty) = loc;
     let (r2, o2, ty2) = w;
     match (r, r2) {
-        _ if r == r2 => o >= o2 + i64::from(ty2.bytes()) || o2 >= o + i64::from(ty.bytes()),
+        _ if r == r2 => {
+            // i128: offsets near i64::MAX (fuzz seed 16980) must not wrap.
+            let (o, o2) = (i128::from(o), i128::from(o2));
+            o >= o2 + i128::from(ty2.bytes()) || o2 >= o + i128::from(ty.bytes())
+        }
         (Root::S(_), Root::S(_)) => true,
         _ => iso.contains(&r) || iso.contains(&r2),
     }
@@ -437,7 +441,7 @@ fn hoists_inner(
         let off = o.wrapping_add(i64::from(i32::from(offset)));
         for &(bytes, reg) in rs {
             if off >= 0
-                && off + i64::from(ty.bytes()) <= bytes as i64
+                && i128::from(off) + i128::from(ty.bytes()) <= i128::from(bytes)
                 && in_region(pbreg, reg, rpar)
                 && in_region(breg_, reg, rpar)
             {
