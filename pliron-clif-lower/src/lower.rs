@@ -3790,6 +3790,36 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// `simd_shl`/`simd_shr`). Cranelift shifts a vector by one scalar, so a
     /// splat amount (`pliron.vsplat`, or a constant with equal lanes) passes
     /// its lane; any other amount shifts lane by lane.
+    /// The lane of a CLIF vector that is a `splat` or a `vconst` with equal
+    /// lanes, as a scalar of `lane_ty`.
+    fn clif_splat(&mut self, y: ir::Value, lane_ty: ir::Type) -> Option<ir::Value> {
+        let dfg = &self.b.func.dfg;
+        let i = dfg.value_def(dfg.resolve_aliases(y)).inst()?;
+        match dfg.insts[i] {
+            ir::InstructionData::Unary { opcode: ir::Opcode::Splat, arg } => Some(arg),
+            // portable-simd masks the amount to the lane width
+            // (`rhs & splat(BITS - 1)`).
+            ir::InstructionData::Binary { opcode: ir::Opcode::Band, args: [p, q] } => {
+                let a = self.clif_splat(p, lane_ty)?;
+                let b = self.clif_splat(q, lane_ty)?;
+                Some(self.b.ins().band(a, b))
+            }
+            ir::InstructionData::UnaryConst { opcode: ir::Opcode::Vconst, constant_handle } => {
+                let b = dfg.constants.get(constant_handle).as_slice().to_vec();
+                let w = lane_ty.bytes() as usize;
+                if w == 0 || w > 8 || b.len() % w != 0 {
+                    return None;
+                }
+                let lane = |k: usize| b[k * w..(k + 1) * w].iter().rev().fold(0u64, |a, &x| a << 8 | x as u64);
+                let first = lane(0);
+                (1..b.len() / w)
+                    .all(|k| lane(k) == first)
+                    .then(|| self.b.ins().iconst(lane_ty.as_int(), first as i64))
+            }
+            _ => None,
+        }
+    }
+
     fn shift_vec(&mut self, op: Ptr<Operation>, opnds: &[Value], kind: u8) -> bool {
         let x = self.get(opnds[0]);
         if x.is_empty() || !x.iter().all(|&v| self.b.func.dfg.value_type(v).is_vector()) {
@@ -3815,7 +3845,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         _ => None,
                     }
                 }
-                _ => None,
+                // Any other constant (`ConstVal::Bytes` from a MIR-folded
+                // `Simd::splat`) or a splat: read the lowered value.
+                _ => self.get(opnds[1]).first().and_then(|&y| self.clif_splat(y, lane_ty)),
             },
         };
         let r: Vals = match splat {

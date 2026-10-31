@@ -41,6 +41,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 .all(|&i| self.const_to_opt_u128(i, false) == Some(first))
                 .then_some(ids[0]);
         }
+        // Constant vectors from MIR (`Simd::splat(4)` folded at -O) arrive
+        // as raw little-endian lane bytes.
+        if let Some(ConstVal::Bytes(b)) = self.cval(v) {
+            let crate::types::TyK::Vector(e, n) = self.cx.kind(self.cx.ty_of(v)) else {
+                return None;
+            };
+            let w = (self.elem_bits(e) / 8) as usize;
+            if w == 0 || b.len() != w * n as usize {
+                return None;
+            }
+            let lane = |k: usize| b[k * w..(k + 1) * w].iter().rev().fold(0u128, |a, &x| a << 8 | x as u128);
+            let first = lane(0);
+            return (1..n as usize).all(|k| lane(k) == first).then(|| self.const_uint_big(e, first));
+        }
         let op = v.defining_op()?;
         if self.st.borrow().intrinsics.get(op).map(|s| s.as_str()) != Some("pliron.vsplat") {
             return None;
