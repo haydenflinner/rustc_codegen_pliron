@@ -554,6 +554,14 @@ t_mirshapes() {
   done
 }
 
+t_pairret() {
+  # A `PassMode::Pair` return with a bool half reaches the caller as an i1
+  # immediate (`immediate_backend_type`), so `!p.1` stays 0/1 (fuzz seed 18889).
+  for o in -Zmir-opt-level=0 -O; do
+    rustc $BE --edition 2021 $o -C codegen-units=1 tests/pairret/main.rs -o $out/pairret$exe && $out/pairret$exe || return 1
+  done
+}
+
 t_slpsplat() {
   # slp xpack: two loads of one address splat only when nothing writes it
   # between them (rustlantis seeds 538/683/730).
@@ -1196,6 +1204,7 @@ want elabloops && t_elabloops
 [[ -z "$exe" ]] && want unwindmem && t_unwindmem
 [[ -z "$exe" ]] && want unwindstd && t_unwindstd
 want mirshapes && t_mirshapes
+want pairret && t_pairret
 want slpsplat && t_slpsplat
 want applestackargs && t_applestackargs
 want fnalign && t_fnalign

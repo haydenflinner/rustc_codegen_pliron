@@ -412,6 +412,17 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> TypeHandle {
         match layout.backend_repr {
             BackendRepr::Scalar(s) if s.is_bool() => self.type_i1(),
+            // Like cg_llvm's `immediate_llvm_type`: an immediate pair holds
+            // the two *immediate* element types, so a bool half is i1. A
+            // `PassMode::Pair` return is built and unpacked with this type
+            // (`immediate_or_packed_pair` / `from_immediate_or_packed_pair`,
+            // which don't truncate), so the memory type `{i8, i8}` handed
+            // an i8 bool to the caller and `!b` became `b ^ 0xff`.
+            BackendRepr::ScalarPair { .. } => {
+                let a = self.scalar_pair_element_backend_type(layout, 0, true);
+                let b = self.scalar_pair_element_backend_type(layout, 1, true);
+                self.type_struct(&[a, b], false)
+            }
             _ => self.layout_type(layout),
         }
     }
