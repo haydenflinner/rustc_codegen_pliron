@@ -203,3 +203,19 @@ What changed, each A/B'd on the held-out suite (interleaved variants):
   passed to loadfwd). regex's `follow_epsilons` reloaded its `&mut
   SparseSet`'s buffer pointer and length every iteration; LLVM keeps them
   in registers.
+- **bittab exploration**: membership trees explore only their own value's
+  tests; serde_json's whitespace skip followed by the parser's dispatch
+  had exhausted the eight-candidate budget. A second late bittab run
+  (after jtround) is opt-in: neutral at 15 rounds.
+- **Loop-exit constants** (Cranelift patch 85): constants used only as
+  arguments of a loop-exit edge move onto that edge instead of being
+  materialized in the latch each iteration.
+- **Shared amodes need two direct uses** (patch 86): the propagated use
+  state kept single-use `base + index` addresses whole (`add; ldurb [x]`
+  instead of `ldrb [base, index]`). Held-out 1.243 -> 1.236.
+- Tried and kept opt-in (sound, no measured win): straight-line block
+  merging before jumpthread, `assume(x != null)` facts. The zip niche
+  null test (num-bigint-dig, brotli) needs a non-null fact from somewhere
+  else; that is the facts-service work's first open question.
+- A pre-existing O0 miscompile surfaced in fuzz window 18800-19199 (seed
+  18889; reproduces at this morning's commit).
