@@ -1169,14 +1169,20 @@ impl<I: VCodeInst> VCode<I> {
                     let bi = block.index();
                     let (from, to) = (order_of[bi], loop_end[bi]);
                     let mut est: u32 = 0;
+                    // A loop with a call is not fetch-bound, and its pad
+                    // runs on every entry: fib's tail-recursion loop is
+                    // entered once per call (10 NOPs per call: +16%).
+                    let mut calls = false;
                     if from <= to && to < final_order.len() {
                         for &lb in &final_order[from..=to] {
                             let r = self.block_ranges.get(lb.index());
                             est += (r.end - r.start) as u32 + ra_edits_per_block[lb.index()];
+                            calls |= (r.start..r.end)
+                                .any(|i| self.insts[i as usize].call_type() != CallType::None);
                         }
                     }
                     let bytes = est * sz;
-                    if bytes > 0 && bytes <= 64 && (new_offset % 64) + bytes > 64 {
+                    if !calls && bytes > 0 && bytes <= 64 && (new_offset % 64) + bytes > 64 {
                         new_offset = (new_offset + 63) & !63;
                         buffer.require_alignment(64);
                     }
