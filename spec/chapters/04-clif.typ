@@ -186,9 +186,10 @@ only the consumer of the optimized CLIF differs.
   narrowing, keeping the `unreachable` block as the table's default
   (`PLIRON_SWITCH_RAW`). Passes that redirect edges into unreachable code
   SHOULD leave such a default in place, and a compare chain built from the
-  table SHOULD treat it as a don't-care (`PLIRON_SWITCH_KEEPDEAD`). With
-  `PLIRON_SWITCH_CHAIN` (opt-in), a switch with at most four cases SHOULD
-  instead be lowered to a compare chain on the value itself.
+  table SHOULD treat it as a don't-care (`PLIRON_SWITCH_KEEPDEAD`). A switch
+  with at most four cases SHOULD instead be lowered to a compare chain on the
+  value itself (`PLIRON_SWITCH_CHAIN`), so the case values reach the compared
+  value's facts.
 ]
 
 #llvm(kind: "choice", summary: [Dense switches use LLVM's 10% density rule; an unreachable default stays the table's default, and the table drops its bounds check.])[

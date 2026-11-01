@@ -98,6 +98,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // Cranelift reads PLIRON_SWITCH_KEEPDEAD itself, `!= "0"`).
     "PLIRON_SWITCH_RAW",
     "PLIRON_SWITCH_KEEPDEAD",
+    // Switches of at most four cases as compare chains on the value
+    // (regex-syntax's `from_encoded_range` bounds checks; bittab reads
+    // the chain's offset range tests).
+    "PLIRON_SWITCH_CHAIN",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
