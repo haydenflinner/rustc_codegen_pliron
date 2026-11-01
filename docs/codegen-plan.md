@@ -10,8 +10,8 @@ how to tell whether it worked.
 | suite | pliron / LLVM | note |
 |---|---|---|
 | our 19 kernels, native | ~0.91 | tuned against for three weeks |
-| 8 held-out programs, native (`bench/heldout`) | **1.17** | 1.57 on 2026-10-31 morning, 1.31 that evening |
-| of which tuned on | blake3 1.15, blind-sig 1.09, pulldown-cmark 1.20, regex 1.20, serde_json 1.16 | 2026-11-01 |
+| 8 held-out programs, native (`bench/heldout`) | **1.15** | 1.57 on 2026-10-31 morning, 1.31 that evening |
+| of which tuned on | blake3 1.05, blind-sig 1.09, pulldown-cmark 1.19, regex 1.21, serde_json 1.17 | 2026-11-01 |
 | of which kept untouched | lol_html 1.21, flate2 1.34, prost 1.05 | the check set |
 
 The held-out number is the one that matters. The kernels say we can match
@@ -445,6 +445,12 @@ Evening (2026-10-31):
   1.181 in the batch A/B; pulldown -1.5%, json -0.8% interleaved.
   `PLIRON_AMODESPLIT=1` (opt-in) gives serde's escape loop LLVM's six
   instructions but is neutral to negative elsewhere.
+- **Height reassociation** (2026-11-01, `PLIRON_HREASSOC`, on): blake3's
+  G computes `a + b + m` with `b` fresh off a rotate; `(a + b) + m` put
+  two adds on `b`'s path per `a` update (LLVM ranks operands and adds the
+  message word first). Found by elimination: same ALU mix, stack traffic
+  removal (LOADREMAT) and LLVM without its schedulers changed nothing.
+  blake3 1.156 -> 1.051; held-out 1.166 -> 1.153 (batch 36).
 - **Next for pulldown: callee simplification before costing.** Its
   `Tree::append_text` (89 samples, LLVM 4) and `scanners::scan_nextline`
   (75, LLVM 0) stay calls. `append_text` lives in another CGU and needs

@@ -441,3 +441,18 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   callee that measures smaller gets inlined where LLVM keeps it out.
   Lower base limits (240, 200) with SIMP are worse everywhere. Not a
   win; left off. Default codegen is byte-identical after the refactors.
+- **blake3 by elimination, then height reassociation**
+  (`pliron-clif-opt/src/hreassoc.rs`, on). `compress_in_place` has
+  LLVM's ALU mix; on a 10x input the gap holds (15.7%), so it is steady
+  compute. Not stack traffic (`PLIRON_LOADREMAT=1` takes stack refs 85 ->
+  18, no change), not instruction order (LLVM with
+  `-enable-misched=false -enable-post-misched=false` stays 1.01x). The
+  difference is association: G's `a = a + b + m` with `b` just rotated.
+  Per block, chains `(x op y) op z` with a single-use inner op move the
+  deepest operand last when it is 4+ levels deeper (iadd, imul, band,
+  bor, bxor). Guards from the first A/B: no NOT leaf (memchr's SWAR
+  `(x - LO) & !x & HI` lost 20 `bic`s, regex +1.5%), no load/store
+  address result, and the 4-level minimum (regex's shallow index chains
+  only churned registers). Batch 36: blake3 1.156 -> 1.051, geomean
+  1.166 -> 1.153, others within noise. `PLIRON_INLINE_LOOPY_NATIVE=1`
+  (wasm's looping-callee rule for native) measured mixed, left off.
