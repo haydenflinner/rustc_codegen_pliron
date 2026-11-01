@@ -280,3 +280,53 @@ What changed, each A/B'd on the held-out suite (interleaved variants):
 - Not pursued: regex's `Utf8Sequences::next` (976 vs 321 instructions,
   spill reloads) and blake3's message-word reloads (91 loads vs 56 with
   `ldp`): both are the register-allocation work (W1).
+
+## Early morning (11-01): load PRE, narrowing, a constant-folder miscompile
+
+Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
+(`#[inline(always)]`, cold xcgu promotion) -> 1.171 (load PRE fix).
+
+- **Load PRE clobber check** (e499f46): upward PRE now uses the same
+  iso/ncc-aware clobber test as forwarding (`may_write_iso`), and
+  rebuilds an in-loop address from a dominating base (`peel_const`).
+  regex's `follow_epsilons` keeps the `SparseSet` fields in registers
+  across the inner loop: regex 1.343 -> 1.205.
+- **Small fixes** (batch 28: gate, crates, fuzz 24200:24600 clean): slotprom skips the
+  write-back before a call that takes the slot as its sret argument;
+  memcmpk takes the length from a dominating `len == K` guard (serde's
+  derived field visitors); bytescan treats header params passed
+  unchanged as loop-invariant (`PLIRON_BYTESCAN_PASS=0`); loadfwd
+  forwards narrower and extending loads from a wider store
+  (`PLIRON_LOADFWD_NARROW=0`; regex `cached_state`'s u32 reload).
+- **Miscompile, fuzz seed 24242** (e46f7ad): `clifpeep::ceval` masked an
+  `ireduce` to its source width, so the high bits survived into a later
+  `sshr`. `bitmerge` then folded a field insert to 0x2e655 instead of 5.
+  Every `ceval` result is now masked to its own type. Found by batch 27's
+  fuzz; `harness/bisect.py` pointed at jumpthread (the first unit whose
+  output differed), and the step checker then named clifpeep. A
+  temporary hit limit inside `bitmerge` found the single bad fold.
+- **Escapes in unreachable blocks** (`PLIRON_ESC_REACH=0` off):
+  `isolated_escapes` scanned every layout block. regex's
+  `SparseSet::insert` asserts `len < capacity` before its push, so the
+  `Vec` grow call is dead once the branch folds (looprot/licm2), but the
+  dead block stayed in the layout until edgefwd's sweep and kept `qcur`
+  escaped through licm3. Only blocks reachable from the entry count now;
+  licm3 hoists the set's four header loads out of the insert loop
+  (regex 1.218 -> 1.200, interleaved).
+- **Split the batch's regression per flag first**: batch 28 read 1.176
+  vs 1.172 with narrowing and bytescan pass-through off. Per flag,
+  bytescan pass-through changes no held-out binary and narrowing is
+  neutral (regex 1.228 vs 1.226, json 1.165 vs 1.171): the gap was noise.
+- **Measured, left off**: emit-time reload forwarding (a `ldr` from a
+  spill slot already held in a register becomes a `mov`) removed only
+  17 of 778 stack loads in pulldown's `parse_block`: the redundant
+  reloads sit across calls or register redefinitions, so the fix belongs
+  in regalloc's splitting (W4). `PLIRON_INLINE_COLDONCE` (protobuf
+  +1.5%), `PLIRON_XCGU_PROMOTE=1` (regex +3%), SHRINKWRAP (noisy). Not counting
+  calls in a callee's doomed blocks toward the inline score would inline
+  serde_json's `parse_object_colon` (json -1%), but it also inlines
+  `follow_epsilons` into `next_state`, and the two cost 40% more together
+  (regex +14%). licm hoists that see roots uncaptured until after the
+  loop as isolated (`promote`'s rule) changed nothing on regex, and a
+  loop-load pass that reloads after cold clobbering calls never fired
+  there either (both shelved): the clobber was the dead grow call above.

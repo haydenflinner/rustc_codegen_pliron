@@ -10,9 +10,9 @@ how to tell whether it worked.
 | suite | pliron / LLVM | note |
 |---|---|---|
 | our 19 kernels, native | ~0.91 | tuned against for three weeks |
-| 8 held-out programs, native (`bench/heldout`) | **1.31** | 1.57 this morning |
-| of which tuned on today | blake3 1.19, blind-sig 1.21, pulldown-cmark 1.51, regex 1.33, serde_json 1.28-1.38 | |
-| of which kept untouched | lol_html 1.45, flate2 1.47, prost 1.01 | the check set |
+| 8 held-out programs, native (`bench/heldout`) | **1.17** | 1.57 on 2026-10-31 morning, 1.31 that evening |
+| of which tuned on | blake3 1.15, blind-sig 1.09, pulldown-cmark 1.20, regex 1.20, serde_json 1.16 | 2026-11-01 |
+| of which kept untouched | lol_html 1.21, flate2 1.34, prost 1.05 | the check set |
 
 The held-out number is the one that matters. The kernels say we can match
 LLVM on code shapes we have looked at; the held-out programs say how much
@@ -406,8 +406,10 @@ Evening (2026-10-31):
   around the inner loop and inserts them in its preheader, the block
   after the outer header, but never reconsiders the loads it inserted,
   so the outer header's upward PRE doesn't see them (the `Vec` grow call
-  that clobbers them is `nocapture`, `v2` is in `ncc`). Next: iterate
-  PRE over its own inserted loads (outer loops, innermost first). Also from the same profile:
+  that clobbers them is `nocapture`, `v2` is in `ncc`). Fixed by giving
+  upward PRE forwarding's iso/ncc-aware clobber test and rebuilding
+  in-loop addresses from a dominating base (regex 1.343 -> 1.205).
+  Also from the same profile:
   punroll unrolled a constant 3-trip loop x8 (`trip_max` now knows
   constant bounds; peeling caps at the bound).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
@@ -416,6 +418,19 @@ Evening (2026-10-31):
   rustc's evaluation of imported statics (`State::extern_bytes`) and a new
   aarch64 `shrn` movemask (Cranelift patch 89). Next: top-tested index
   loops, and runtime tables (pulldown's `LookupTable`, shufti-style).
+
+- **Escape analysis and dead code** (2026-11-01): `isolated_escapes`
+  skips blocks the entry can't reach. A folded branch's dead arm (the
+  `Vec` grow call behind `SparseSet::insert`'s capacity assert) kept a
+  `&mut` param escaped through the last licm; regex 1.218 -> 1.200.
+  Remaining regex gap: `cached_state` dispatches on a `band 7` tag that
+  Cranelift's `remat.isle` re-emits in each block of the compare
+  cascade, and inlining `follow_epsilons` into `next_state` (which a
+  looser call count does) costs 40%: the inline model needs a reason to
+  keep a large looping callee out of line beyond its op count.
+- **Miscompile found by fuzz** (2026-11-01, seed 24242): `clifpeep::ceval`
+  kept an `ireduce`'s high bits; `bitmerge` folded a wrong field
+  constant. Fixed with a regression test.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
