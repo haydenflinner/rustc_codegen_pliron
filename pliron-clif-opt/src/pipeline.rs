@@ -1280,8 +1280,52 @@ fn corpus_dump(p: &mut Pipe) {
             format!("{ss}:{a}:{b}:{}", u8::from(*s))
         })
         .collect();
+    // Region-scoped facts (`jumpthread::RegionNN`): regions are pliron
+    // blocks, so number them `r<k>` in first-seen order; blocks are layout
+    // ordinals like `lifetimes`' anchors.
+    let mut rord: FxHashMap<Ptr<BasicBlock>, u32> = FxHashMap::default();
+    fn rid(rord: &mut FxHashMap<Ptr<BasicBlock>, u32>, r: Ptr<BasicBlock>) -> u32 {
+        let n = rord.len() as u32;
+        *rord.entry(r).or_insert(n)
+    }
+    let mut breg: Vec<String> = Vec::new();
+    for b in f.layout.blocks() {
+        if let Some(&r) = p.block_region.get(&b) {
+            breg.push(format!("b{}=r{}", bord[&b], rid(&mut rord, r)));
+        }
+    }
+    let mut rnn: Vec<(u32, String)> = Vec::new();
+    for (&v, rs) in p.region_nn.iter() {
+        let rs: Vec<String> = rs.iter().map(|&r| format!("r{}", rid(&mut rord, r))).collect();
+        rnn.push((v.as_u32(), format!("v{}:{}", v.as_u32(), rs.join("+"))));
+    }
+    rnn.sort();
+    // Parents of every region seen so far, to the root.
+    let mut rpar: Vec<String> = Vec::new();
+    let mut todo: Vec<Ptr<BasicBlock>> = rord.keys().copied().collect();
+    let mut seen: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
+    while let Some(r) = todo.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        if let Some(&q) = p.region_parent.get(r) {
+            rpar.push(format!("r{}<r{}", rid(&mut rord, r), rid(&mut rord, q)));
+            todo.push(q);
+        }
+    }
+    rpar.sort();
+    let regions = if breg.is_empty() && rnn.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; diffcheck-bregion: {}\n; diffcheck-rparent: {}\n; diffcheck-rnn: {}\n",
+            breg.join(","),
+            rpar.join(","),
+            rnn.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(",")
+        )
+    };
     let text = format!(
-        "{}; diffcheck-nocap: {}\n; diffcheck-names: {}\n; diffcheck-lifetimes: {}\n{}",
+        "{}; diffcheck-nocap: {}\n; diffcheck-names: {}\n; diffcheck-lifetimes: {}\n{regions}{}",
         crate::diffcheck::facts_header(&p.clctx.func, &facts),
         nc.join(","),
         names.join(","),

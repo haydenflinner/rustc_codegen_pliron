@@ -277,15 +277,43 @@ fn with_pipe<R>(
         .map(FuncId::from_u32)
         .unwrap_or(FuncId::from_u32(0));
     let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
-    let (e1, e2, e3, e5, e6, mut e7, e8): (
+    let (e1, e2, e3, mut e5, mut e6, mut e7, e8): (
         _,
         _,
         _,
-        _,
-        _,
+        rustc_hash::FxHashMap<_, _>,
+        pliron::cols::ColMap<_, _>,
         rustc_hash::FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
         _,
     ) = Default::default();
+    // Region-scoped facts (`; diffcheck-bregion/rparent/rnn:`): regions
+    // are pliron blocks in the pipeline, so stand fresh ones in for the
+    // numbered regions (they are only compared).
+    let mut pctx = pliron::context::Context::new();
+    let nreg = facts
+        .block_region
+        .iter()
+        .map(|&(_, r)| r)
+        .chain(facts.region_parent.iter().flat_map(|&(r, q)| [r, q]))
+        .chain(facts.region_nn.iter().flat_map(|(_, rs)| rs.iter().copied()))
+        .max()
+        .map_or(0, |m| m + 1);
+    let regs: Vec<_> =
+        (0..nreg).map(|_| pliron::basic_block::BasicBlock::new(&mut pctx, None, vec![])).collect();
+    let bords: Vec<_> = clctx.func.layout.blocks().collect();
+    for &(b, r) in &facts.block_region {
+        if let Some(&b) = bords.get(b as usize) {
+            e5.insert(b, regs[r as usize]);
+        }
+    }
+    for &(r, q) in &facts.region_parent {
+        e6.insert(regs[r as usize], regs[q as usize]);
+    }
+    let region_nn: rustc_hash::FxHashMap<_, Vec<_>> = facts
+        .region_nn
+        .iter()
+        .map(|(v, rs)| (*v, rs.iter().map(|&r| regs[r as usize]).collect()))
+        .collect();
     // A `; diffcheck-nocap:` header (PLIRON_CORPUS dumps) records the real
     // per-callee bounded arg positions; CLIFCHECK_NOCAP_ALL=1 marks every
     // call operand bounded for dumps without one.
@@ -339,7 +367,7 @@ fn with_pipe<R>(
     let uen_syms = Default::default();
     let mut p = Pipe {
         const_tables: &pipeline::EMPTY_TABLES,
-        region_nn: &pipeline::EMPTY_RNN,
+        region_nn: &region_nn,
         fact_bits: &mut fact_bits,
         clctx: &mut clctx,
         isa,

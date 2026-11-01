@@ -73,11 +73,23 @@ fn sinkable_def(func: &Function, b: Block, v: Value) -> Option<Inst> {
     }
 }
 
+fn quiet_loads_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_EDGESINK_LOADS", "1"));
+    *ON
+}
+
+/// Edge `edge` of `b`'s terminator leaves `b`'s innermost loop.
+fn exits_loop(func: &Function, la: &LoopAnalysis, b: Block, edge: usize) -> bool {
+    let Some(lp) = la.innermost_loop(b) else { return false };
+    let t = func.layout.last_inst(b).unwrap();
+    let calls = func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+    !la.is_in_loop(calls[edge].block(&func.dfg.value_lists), lp)
+}
+
 /// A `notrap` load followed in its block only by instructions that
 /// neither write memory nor have other side effects.
 fn quiet_load(func: &Function, d: Inst) -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_EDGESINK_LOADS", "1"));
-    if !*ON {
+    if !quiet_loads_on() {
         return false;
     }
     let InstructionData::Load { opcode, flags, .. } = func.dfg.insts[d] else {
@@ -339,6 +351,21 @@ fn push_to_use_blocks(func: &mut Function) -> usize {
 pub fn run(func: &mut Function) -> usize {
     let uses = use_counts(func);
     let mut changed = 0;
+    // A load on the edge saves work only when the edge leaves a loop
+    // (the per-iteration reload becomes one at exit) from a block with
+    // no call. Anywhere else it runs as often as before, and the new
+    // block reshapes the live ranges around it: after a call (slot
+    // reloads of its out-params) pulldown's `parse_block` lost the
+    // register for its byte-scan index across the call, +19%. The
+    // analysis is computed only when loads may sink; edge blocks added
+    // below are never queried.
+    let la = quiet_loads_on().then(|| {
+        let cfg = ControlFlowGraph::with_function(func);
+        let dt = DominatorTree::with_function(func, &cfg);
+        let mut la = LoopAnalysis::new();
+        la.compute(func, &cfg, &dt);
+        la
+    });
     // Snapshot: edge blocks we add end in `jump` and are never
     // rescanned, so in-place iteration is safe but needlessly fuzzy.
     for b in func.layout.blocks().collect::<Vec<_>>() {
@@ -352,6 +379,13 @@ pub fn run(func: &mut Function) -> usize {
             let Some(set) = sink_set(func, &uses, b, edge) else {
                 continue;
             };
+            if let Some(la) = &la
+                && set.iter().any(|&d| !pure_op(func, d))
+                && (!exits_loop(func, la, b, edge)
+                    || func.layout.block_insts(b).any(|i| func.dfg.insts[i].opcode().is_call()))
+            {
+                continue;
+            }
             if apply(func, b, edge, &set) {
                 changed += set.len();
             }

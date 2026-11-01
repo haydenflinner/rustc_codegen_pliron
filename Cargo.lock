@@ -1234,6 +1234,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-reader",
  "mimalloc",
+ "pliron",
  "pliron-cfg",
  "pliron-clif-opt",
  "rustc-hash",

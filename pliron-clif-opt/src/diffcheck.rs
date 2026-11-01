@@ -1535,6 +1535,13 @@ pub struct OwnedFacts {
     /// dump time, before the pipeline can fold it away. Resolve inst/block
     /// ordinals against the parsed `Function` with [`Self::lifetimes`].
     pub lifetimes: Vec<(Vec<u32>, Option<u32>, u32, bool)>,
+    /// Region-scoped facts (`jumpthread::RegionNN`) from the
+    /// `; diffcheck-bregion/rparent/rnn:` headers, regions numbered:
+    /// (block layout ordinal, region), (region, parent), and value ->
+    /// regions it is non-null in.
+    pub block_region: Vec<(u32, u32)>,
+    pub region_parent: Vec<(u32, u32)>,
+    pub region_nn: Vec<(Value, Vec<u32>)>,
 }
 
 impl OwnedFacts {
@@ -1585,6 +1592,7 @@ impl OwnedFacts {
         let fref = |s: &str| -> Option<FuncRef> {
             s.strip_prefix("fn")?.parse().ok().map(FuncRef::from_u32)
         };
+        let num = |s: &str, c: char| -> Option<u32> { s.trim().strip_prefix(c)?.parse().ok() };
         for line in text.lines() {
             if let Some(list) = line.strip_prefix("; diffcheck-nocap:") {
                 for item in list.split(',').filter(|x| !x.is_empty()) {
@@ -1600,6 +1608,31 @@ impl OwnedFacts {
                         && let Some(r) = fref(f)
                     {
                         out.names.push((r, n.to_string()));
+                    }
+                }
+            } else if let Some(list) = line.strip_prefix("; diffcheck-bregion:") {
+                for item in list.split(',').filter(|x| !x.trim().is_empty()) {
+                    if let Some((b, r)) = item.trim().split_once('=')
+                        && let (Some(b), Some(r)) = (num(b, 'b'), num(r, 'r'))
+                    {
+                        out.block_region.push((b, r));
+                    }
+                }
+            } else if let Some(list) = line.strip_prefix("; diffcheck-rparent:") {
+                for item in list.split(',').filter(|x| !x.trim().is_empty()) {
+                    if let Some((r, q)) = item.trim().split_once('<')
+                        && let (Some(r), Some(q)) = (num(r, 'r'), num(q, 'r'))
+                    {
+                        out.region_parent.push((r, q));
+                    }
+                }
+            } else if let Some(list) = line.strip_prefix("; diffcheck-rnn:") {
+                for item in list.split(',').filter(|x| !x.trim().is_empty()) {
+                    if let Some((v, rs)) = item.trim().split_once(':')
+                        && let Some(v) = num(v, 'v')
+                    {
+                        let rs = rs.split('+').filter_map(|r| num(r, 'r')).collect();
+                        out.region_nn.push((Value::from_u32(v), rs));
                     }
                 }
             } else if let Some(list) = line.strip_prefix("; diffcheck-lifetimes:") {
