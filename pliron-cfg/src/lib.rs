@@ -87,6 +87,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // per-lane select and the fminf/fmaxf libcalls.
     "PLIRON_VSELECT",
     "PLIRON_FMINMAX",
+    // Height reassociation of straight-line chains (blake3's G:
+    // 1.158 -> 1.057; docs/history/2026-10-31-tune-heldout.md).
+    "PLIRON_HREASSOC",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
