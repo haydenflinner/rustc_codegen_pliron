@@ -4253,6 +4253,92 @@ impl MachInstEmit for Inst {
         }
     }
 
+    fn flag_twin_candidate(&self) -> bool {
+        match self {
+            Inst::AluRRR { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. }
+            | Inst::AluRRImm12 { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. } => {
+                rd.to_reg() != zero_reg()
+            }
+            _ => false,
+        }
+    }
+
+    fn flag_twin(&self, later: &Self) -> Option<Self> {
+        let flags_op = |op: ALUOp| match op {
+            ALUOp::Add => Some(ALUOp::AddS),
+            ALUOp::Sub => Some(ALUOp::SubS),
+            _ => None,
+        };
+        match (self, later) {
+            (
+                &Inst::AluRRR { alu_op, size, rd, rn, rm },
+                &Inst::AluRRR { alu_op: op2, size: size2, rd: rd2, rn: rn2, rm: rm2 },
+            ) if rd2.to_reg() == zero_reg() && size2 == size && Some(op2) == flags_op(alu_op) => {
+                // Addition commutes (the carry of `a + b` is that of
+                // `b + a`); subtraction's operands must match in order.
+                let same = (rn2, rm2) == (rn, rm) || (alu_op == ALUOp::Add && (rn2, rm2) == (rm, rn));
+                same.then_some(Inst::AluRRR { alu_op: op2, size, rd, rn, rm })
+            }
+            (
+                &Inst::AluRRImm12 { alu_op, size, rd, rn, imm12 },
+                &Inst::AluRRImm12 { alu_op: op2, size: size2, rd: rd2, rn: rn2, imm12: imm2 },
+            ) if rd2.to_reg() == zero_reg()
+                && size2 == size
+                && rn2 == rn
+                && (imm2.bits, imm2.shift12) == (imm12.bits, imm12.shift12)
+                && Some(op2) == flags_op(alu_op) =>
+            {
+                Some(Inst::AluRRImm12 { alu_op: op2, size, rd, rn, imm12 })
+            }
+            _ => None,
+        }
+    }
+
+    fn nzcv_free(&self) -> bool {
+        let quiet = |op: ALUOp| {
+            !matches!(
+                op,
+                ALUOp::AddS | ALUOp::SubS | ALUOp::AndS | ALUOp::Adc | ALUOp::AdcS | ALUOp::Sbc | ALUOp::SbcS
+            )
+        };
+        match self {
+            Inst::AluRRR { alu_op, .. }
+            | Inst::AluRRImm12 { alu_op, .. }
+            | Inst::AluRRImmLogic { alu_op, .. }
+            | Inst::AluRRImmShift { alu_op, .. }
+            | Inst::AluRRRShift { alu_op, .. }
+            | Inst::AluRRRExtend { alu_op, .. } => quiet(*alu_op),
+            Inst::AluRRRR { .. }
+            | Inst::BitRR { .. }
+            | Inst::Mov { .. }
+            | Inst::MovWide { .. }
+            | Inst::MovK { .. }
+            | Inst::Extend { .. }
+            | Inst::Nop0
+            | Inst::Nop4
+            | Inst::ULoad8 { .. }
+            | Inst::SLoad8 { .. }
+            | Inst::ULoad16 { .. }
+            | Inst::SLoad16 { .. }
+            | Inst::ULoad32 { .. }
+            | Inst::SLoad32 { .. }
+            | Inst::ULoad64 { .. }
+            | Inst::Store8 { .. }
+            | Inst::Store16 { .. }
+            | Inst::Store32 { .. }
+            | Inst::Store64 { .. }
+            | Inst::StoreP64 { .. }
+            | Inst::LoadP64 { .. }
+            | Inst::FpuLoad32 { .. }
+            | Inst::FpuLoad64 { .. }
+            | Inst::FpuLoad128 { .. }
+            | Inst::FpuStore32 { .. }
+            | Inst::FpuStore64 { .. }
+            | Inst::FpuStore128 { .. } => true,
+            _ => false,
+        }
+    }
+
     fn self_add_imm(&self) -> Option<(Reg, i64)> {
         match self {
             Inst::AluRRImm12 {

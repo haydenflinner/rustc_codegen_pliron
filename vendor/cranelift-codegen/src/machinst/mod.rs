@@ -635,6 +635,26 @@ pub trait MachInstEmit: MachInst {
     fn self_add_imm(&self) -> Option<(Reg, i64)> {
         None
     }
+
+    /// PLIRON: this instruction computes a value whose flags a later
+    /// instruction might recompute (see `flag_twin`).
+    fn flag_twin_candidate(&self) -> bool {
+        false
+    }
+
+    /// PLIRON: if `later` sets exactly the flags this instruction's
+    /// operation would set, on the same operands, and writes no
+    /// register, the flag-setting form of this instruction (which then
+    /// replaces both). Register hazards are checked by the caller.
+    fn flag_twin(&self, _later: &Self) -> Option<Self> {
+        None
+    }
+
+    /// PLIRON: this instruction neither reads nor writes the condition
+    /// flags, and has no control flow (conservative: `false`).
+    fn nzcv_free(&self) -> bool {
+        false
+    }
 }
 
 /// A trait describing the emission state carried between MachInsts when

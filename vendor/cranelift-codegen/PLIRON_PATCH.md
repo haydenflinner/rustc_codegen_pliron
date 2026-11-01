@@ -1104,3 +1104,16 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `ldr x, [base], #0` (a writeback micro-op for nothing). Not at a
     nonzero offset: chain offsets are from the original base, which
     earlier writebacks have advanced by that offset.
+
+91. Flag twins (`machinst/vcode.rs` emit-time sweep, before pair fusion;
+    `MachInst::flag_twin_candidate`/`flag_twin`/`nzcv_free`, aarch64 in
+    `inst/emit.rs`; `PLIRON_FLAGTWIN=0` disables). `add d, a, b` followed
+    in its block by `adds xzr, a, b` (or `sub`/`subs xzr` with the same
+    operand order, and the `#imm12` forms) becomes `adds d, a, b` and the
+    compare is squashed. Lowering cannot keep flags live across
+    instructions, so a sum stored as a value and tested for its carry
+    computed twice: num-bigint-dig's `mac_with_carry` in montgomery's
+    inner loop, `add; str; cmn; csinc` -> `adds; str; csinc`. Every inst
+    in between must be `nzcv_free` (no flag reads or writes) and not
+    write `a`/`b`; `d` may not be `a` or `b`; no regalloc edit in between.
+    Test: `pliron-clif-opt/tests/flag_twin_codegen.rs`.

@@ -1690,6 +1690,55 @@ impl<I: VCodeInst> VCode<I> {
             t_apply += ti.elapsed();
             let ti = std::time::Instant::now();
 
+            // PLIRON: flag twins (`PLIRON_FLAGTWIN=0` disables). `add d,
+            // a, b` followed in the block by `adds xzr, a, b` (`cmn`, the
+            // carry test of the same sum) becomes `adds d, a, b`, and the
+            // later compare goes: lowering can't keep flags live across
+            // instructions, so a sum used both as a value and for its
+            // carry computes twice (num-bigint-dig's `mac_with_carry` in
+            // montgomery's inner loop: `add; str; cmn; cinc`). Every inst
+            // in between must neither read nor write flags, nor write
+            // `a`/`b`; `d` must not be `a` or `b`; no regalloc edit may
+            // sit between them.
+            static FLAGTWIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let flagtwin = *FLAGTWIN
+                .get_or_init(|| std::env::var("PLIRON_FLAGTWIN").as_deref() != Ok("0"));
+            for k in 0..items.len() {
+                if !flagtwin {
+                    break;
+                }
+                let InstOrEdit::Inst(iix) = items[k] else {
+                    continue;
+                };
+                if squashed[iix.index()] || !self.insts[iix.index()].flag_twin_candidate() {
+                    continue;
+                }
+                let (au, ad) = preg_ops[iix.index()].clone();
+                if ad.iter().any(|r| au.contains(r)) {
+                    continue;
+                }
+                for j in k + 1..(k + 16).min(items.len()) {
+                    let InstOrEdit::Inst(nix) = items[j] else {
+                        break;
+                    };
+                    if squashed[nix.index()] {
+                        break;
+                    }
+                    if let Some(fused) =
+                        self.insts[iix.index()].flag_twin(&self.insts[nix.index()])
+                    {
+                        self.insts[iix.index()] = fused;
+                        self.insts[nix.index()] = I::gen_nop(0);
+                        squashed[nix.index()] = true;
+                        break;
+                    }
+                    let (_, gd) = &preg_ops[nix.index()];
+                    if !self.insts[nix.index()].nzcv_free() || gd.iter().any(|r| au.contains(r)) {
+                        break;
+                    }
+                }
+            }
+
             // Pair fusion (e.g. `ldp`/`stp`): the partner must follow
             // with no regalloc edit between them — a move there could
             // clobber either inst's registers. A gap of pure-ALU insts
