@@ -515,6 +515,41 @@ pub fn run(func: &mut Function) -> usize {
     run_with(func, None, false)
 }
 
+/// A default that is pliron's `unreachable` trap (`PLIRON_SWITCH_KEEPDEAD`
+/// keeps it, so a table that stays one drops its bounds clamp) is a don't-
+/// care for a chain: an out-of-range index is UB. The chain's else edge
+/// takes the most common entry target instead, which also drops that
+/// target's tests.
+fn effective_default(func: &Function, dflt: BlockCall, entries: &[BlockCall]) -> BlockCall {
+    if !*crate::unreach::KEEP_DEFAULT {
+        return dflt;
+    }
+    let b = dflt.block(&func.dfg.value_lists);
+    let mut it = func.layout.block_insts(b);
+    let dead = match (it.next(), it.next()) {
+        (Some(i), None) => matches!(
+            func.dfg.insts[i],
+            InstructionData::Trap { code, .. }
+                if code == cranelift_codegen::ir::TrapCode::unwrap_user(crate::unreach::UNREACHABLE)
+        ),
+        _ => false,
+    };
+    if !dead {
+        return dflt;
+    }
+    let mut best: Option<(BlockCall, usize)> = None;
+    for &e in entries {
+        if same_target(func, e, dflt) {
+            continue;
+        }
+        let n = entries.iter().filter(|&&o| same_target(func, o, e)).count();
+        if best.is_none_or(|(_, m)| n > m) {
+            best = Some((e, n));
+        }
+    }
+    best.map_or(dflt, |(e, _)| e)
+}
+
 /// Clusters a `br_table` may have and still become a range-test chain
 /// under `PLIRON_JT_SHAPE` (cluster = maximal run of consecutive indices
 /// with one non-default target). A range test is `isub`+`icmp`+`brif`;
@@ -594,8 +629,8 @@ pub fn run_with(func: &mut Function, prof: Option<&FxHashMap<Block, u64>>, shape
             continue;
         };
         let jt = &func.dfg.jump_tables[table];
-        let dflt = jt.default_block();
         let entries: Vec<BlockCall> = jt.as_slice().to_vec();
+        let dflt = effective_default(func, jt.default_block(), &entries);
         // Live entries: drop ones equal to the default — those indices
         // fold into the default edge.
         let mut live: Vec<Test> = Vec::new();

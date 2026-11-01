@@ -1117,3 +1117,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     in between must be `nzcv_free` (no flag reads or writes) and not
     write `a`/`b`; `d` may not be `a` or `b`; no regalloc edit in between.
     Test: `pliron-clif-opt/tests/flag_twin_codegen.rs`.
+92. Unchecked jump tables (`PLIRON_SWITCH_KEEPDEAD=1`; extern
+    `jump_table_default_dead` in `prelude_lower.isle`/`machinst/isle.rs`,
+    rules in `x64/lower.isle` and `aarch64/lower.isle`, `checked` field on
+    aarch64 `JTSequence`): a `br_table` whose default block starts with
+    `trap user2` (pliron's `unreachable`) has an out-of-range index as UB,
+    so it skips the bounds clamp (x64 `cmp; cmov`; aarch64 `cmp; b.hs;
+    csel; csdb`, replaced by one `mov`). Test:
+    `pliron-clif-opt/tests/switch_dead_default.rs`.

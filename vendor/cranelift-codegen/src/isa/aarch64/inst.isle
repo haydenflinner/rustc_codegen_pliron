@@ -953,7 +953,10 @@
         (targets BoxVecMachLabel)
         (ridx Reg)
         (rtmp1 WritableReg)
-        (rtmp2 WritableReg))
+        (rtmp2 WritableReg)
+        ;; PLIRON: false when the default is unreachable: no bounds branch
+        ;; or Spectre clamp, the index is used as is.
+        (checked bool))
 
        ;; Load an inline symbol reference.
        (LoadExtNameGot
@@ -5526,7 +5529,15 @@
       (let ((rtmp1 WritableReg (temp_writable_reg $I64))
             (rtmp2 WritableReg (temp_writable_reg $I64)))
        (ConsumesFlags.ConsumesFlagsSideEffect
-        (MInst.JTSequence default targets ridx rtmp1 rtmp2))))
+        (MInst.JTSequence default targets ridx rtmp1 rtmp2 true))))
+
+;; PLIRON: the sequence without its bounds check (`jump_table_default_dead`).
+(decl jt_sequence_unchecked (Reg MachLabel BoxVecMachLabel) SideEffectNoResult)
+(rule (jt_sequence_unchecked ridx default targets)
+      (let ((rtmp1 WritableReg (temp_writable_reg $I64))
+            (rtmp2 WritableReg (temp_writable_reg $I64)))
+       (SideEffectNoResult.Inst
+        (MInst.JTSequence default targets ridx rtmp1 rtmp2 false))))
 
 ;; Helpers for emitting `MInst.CondBr` instructions.
 ;; Chainable helper terms: handled via chaining (inlined into specified

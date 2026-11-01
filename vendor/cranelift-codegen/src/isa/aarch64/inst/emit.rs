@@ -3353,13 +3353,20 @@ impl MachInstEmit for Inst {
                 rtmp2,
                 default,
                 ref targets,
-                ..
+                checked,
             } => {
+                if !checked {
+                    // PLIRON: unreachable default. The index is in range,
+                    // so just copy it into rtmp2 (32-bit: `ridx` is
+                    // zero-extended).
+                    Inst::Mov { size: OperandSize::Size32, rd: rtmp2, rm: ridx }.emit(sink, emit_info, state);
+                }
                 // This sequence is *one* instruction in the vcode, and is expanded only here at
                 // emission time, because we cannot allow the regalloc to insert spills/reloads in
                 // the middle; we depend on hardcoded PC-rel addressing below.
 
                 // Branch to default when condition code from prior comparison indicates.
+                if checked {
                 let br =
                     enc_conditional_br(BranchTarget::Label(default), CondBrKind::Cond(Cond::Hs));
 
@@ -3386,6 +3393,7 @@ impl MachInstEmit for Inst {
                     && emit_info.isa_flags.use_csdb()
                 {
                     Inst::Csdb.emit(sink, emit_info, state);
+                }
                 }
 
                 // PLIRON: deferred narrow table (`PLIRON_JT_NARROW=1`). The

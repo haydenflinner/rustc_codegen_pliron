@@ -3789,8 +3789,45 @@ impl<'a, 'b> FnLower<'a, 'b> {
         if span > 4096 || span > vals.len() as u128 * 10 {
             return false;
         }
-        // A default that can't happen (enum discriminants): pad the table to a
-        // power of two and mask the index, so Cranelift needs no bounds clamp.
+        // A default that can't happen (enum discriminants), `PLIRON_SWITCH_RAW`:
+        // dispatch on the raw tag, with no mask and no out-of-range branch
+        // before narrowing (out-of-range is UB). The fact lives on the switch:
+        // its default is the `unreachable` trap block (with
+        // `PLIRON_SWITCH_KEEPDEAD`, unreach keeps it and vendored Cranelift
+        // drops the `br_table` bounds clamp). A mask value instead
+        // outlived the table: `brchain` turned it into a compare cascade, and
+        // each cascade block rematerialized the `and` (regex `cached_state`).
+        static RAW: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_RAW", "1"));
+        if dead_default && *RAW {
+            let mut idx = if lo == 0 {
+                x
+            } else {
+                self.b.ins().iadd_imm_s(x, (lo as i64).wrapping_neg())
+            };
+            if ty.bits() > 32 {
+                idx = self.b.ins().ireduce(clt::I32, idx);
+            } else if ty.bits() < 32 {
+                idx = self.b.ins().uextend(clt::I32, idx);
+            }
+            let mut table = vec![d; span as usize];
+            for &(v, b) in vals {
+                table[(v - lo) as usize] = b;
+            }
+            let pool = &mut self.b.func.dfg.value_lists;
+            let def = ir::BlockCall::new(d, std::iter::empty(), pool);
+            let entries: Vec<ir::BlockCall> = table
+                .iter()
+                .map(|&b| ir::BlockCall::new(b, std::iter::empty(), pool))
+                .collect();
+            let jt = self
+                .b
+                .create_jump_table(ir::JumpTableData::new(def, &entries));
+            self.b.ins().br_table(idx, jt);
+            return true;
+        }
+        // Older encoding of the same fact: pad the table to a power of two
+        // and mask the index, so x64 Cranelift needs no bounds clamp.
         static MASK: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_SWITCH_MASK"));
         if dead_default && *MASK {

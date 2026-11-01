@@ -830,6 +830,21 @@ macro_rules! isle_lower_prelude_methods {
             targets.len() as u32
         }
 
+        fn jump_table_default_dead(&mut self, jt: JumpTable) -> bool {
+            static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var("PLIRON_SWITCH_KEEPDEAD").is_ok_and(|v| v == "1")
+            });
+            if !*ON {
+                return false;
+            }
+            let f = self.lower_ctx.f;
+            let b = f.dfg.jump_tables[jt].default_block().block(&f.dfg.value_lists);
+            f.layout.first_inst(b).is_some_and(|i| {
+                matches!(f.dfg.insts[i], InstructionData::Trap { code, .. }
+                    if code == crate::ir::TrapCode::unwrap_user(2))
+            })
+        }
+
         fn value_is_unused(&mut self, val: Value) -> bool {
             self.lower_ctx.value_is_unused(val)
         }

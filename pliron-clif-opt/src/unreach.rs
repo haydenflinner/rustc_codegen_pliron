@@ -54,6 +54,12 @@ fn dead_blocks(func: &Function) -> FxHashSet<Block> {
     }
 }
 
+/// `PLIRON_SWITCH_KEEPDEAD=1`: `br_table`s keep an `unreachable` default
+/// (only their entries are redirected), so a table that reaches Cranelift
+/// drops its bounds clamp; brchain treats such a default as a don't-care.
+pub static KEEP_DEFAULT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_KEEPDEAD", "1"));
+
 /// Returns the number of edges removed.
 pub fn run(func: &mut Function) -> usize {
     let dead = dead_blocks(func);
@@ -104,7 +110,9 @@ pub fn run(func: &mut Function) -> usize {
                 let live = live.deep_clone(&mut func.dfg.value_lists);
                 let dfg = &mut func.dfg;
                 let pool = &mut dfg.value_lists;
-                for bc in dfg.jump_tables[table].all_branches_mut() {
+                let jt = &mut dfg.jump_tables[table];
+                let branches = if *KEEP_DEFAULT { jt.as_mut_slice() } else { jt.all_branches_mut() };
+                for bc in branches {
                     if dead.contains(&bc.block(pool)) {
                         *bc = live.deep_clone(pool);
                         n += 1;

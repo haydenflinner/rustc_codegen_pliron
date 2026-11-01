@@ -3939,6 +3939,12 @@
       (let ((idx_reg Gpr (extend_to_gpr idx $I64 (ExtendKind.Zero))))
       (emit_side_effect (jmp_table_seq ty idx_reg default_target jt_targets))))
 
+;; PLIRON: no clamp when the default is unreachable (`PLIRON_SWITCH_KEEPDEAD`).
+(rule 2 (lower_branch (br_table idx @ (value_type ty) jt) (jump_table_targets default_target jt_targets))
+      (if-let true (jump_table_default_dead jt))
+      (let ((idx_reg Gpr (extend_to_gpr idx $I64 (ExtendKind.Zero))))
+      (emit_side_effect (jmp_table_seq ty idx_reg default_target jt_targets))))
+
 ;; Rules for `select_spectre_guard` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (select_spectre_guard _ cond x y))

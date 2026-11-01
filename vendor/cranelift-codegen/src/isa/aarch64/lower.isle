@@ -3925,6 +3925,14 @@
             (ridx Reg (put_in_reg_zext32 idx)))
        (br_table_impl jt_size ridx default targets)))
 
+;; PLIRON: no bounds check when the default is unreachable (`PLIRON_SWITCH_KEEPDEAD`).
+(rule 1 (lower_branch (br_table idx jt) (jump_table_targets default targets))
+      (if-let true (jump_table_default_dead jt))
+      (let ((_ InstOutput (side_effect
+                  (emit_island (targets_jt_space targets))))
+            (ridx Reg (put_in_reg_zext32 idx)))
+       (emit_side_effect (jt_sequence_unchecked ridx default targets))))
+
 ;; Rules for `get_exception_handler_address` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (get_exception_handler_address _ block (u64_from_imm64 idx)))

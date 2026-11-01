@@ -3100,26 +3100,27 @@ impl Inst {
                 ridx,
                 rtmp1,
                 rtmp2,
-                ..
+                checked,
             } => {
                 let ridx = pretty_print_reg(ridx);
                 let rtmp1 = pretty_print_reg(rtmp1.to_reg());
                 let rtmp2 = pretty_print_reg(rtmp2.to_reg());
                 let default_target = BranchTarget::Label(default).pretty_print(0);
+                let guard = if checked {
+                    format!("b.hs {default_target} ; csel {rtmp2}, xzr, {ridx}, hs ; csdb ; ")
+                } else {
+                    format!("mov {rtmp2}, {ridx} ; ")
+                };
                 format!(
                     concat!(
-                        "b.hs {} ; ",
-                        "csel {}, xzr, {}, hs ; ",
-                        "csdb ; ",
+                        "{}",
                         "adr {}, pc+16 ; ",
                         "ldrsw {}, [{}, {}, uxtw #2] ; ",
                         "add {}, {}, {} ; ",
                         "br {} ; ",
                         "jt_entries {:?}"
                     ),
-                    default_target,
-                    rtmp2,
-                    ridx,
+                    guard,
                     rtmp1,
                     rtmp2,
                     rtmp1,
