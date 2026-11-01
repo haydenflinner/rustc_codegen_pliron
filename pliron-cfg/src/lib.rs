@@ -93,6 +93,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // Late null-test fold for cursors whose inbounds marks were lost
     // (regex's varint loop; docs/history/2026-10-31-tune-heldout.md).
     "PLIRON_NFOLD2",
+    // Dead-default switches dispatch on the raw tag; tables keep the
+    // `unreachable` default and drop their bounds clamp (vendored
+    // Cranelift reads PLIRON_SWITCH_KEEPDEAD itself, `!= "0"`).
+    "PLIRON_SWITCH_RAW",
+    "PLIRON_SWITCH_KEEPDEAD",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

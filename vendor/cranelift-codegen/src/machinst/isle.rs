@@ -832,7 +832,7 @@ macro_rules! isle_lower_prelude_methods {
 
         fn jump_table_default_dead(&mut self, jt: JumpTable) -> bool {
             static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-                std::env::var("PLIRON_SWITCH_KEEPDEAD").is_ok_and(|v| v == "1")
+                std::env::var("PLIRON_SWITCH_KEEPDEAD").as_deref() != Ok("0")
             });
             if !*ON {
                 return false;

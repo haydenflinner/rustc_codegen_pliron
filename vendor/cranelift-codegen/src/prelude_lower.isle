@@ -222,7 +222,7 @@
 (decl pure jump_table_size (BoxVecMachLabel) u32)
 (extern constructor jump_table_size jump_table_size)
 
-;; PLIRON (`PLIRON_SWITCH_KEEPDEAD=1`): the table's default block starts with
+;; PLIRON (`PLIRON_SWITCH_KEEPDEAD`, `=0` disables): the table's default block starts with
 ;; `trap user2`, pliron's `unreachable`. An out-of-range index is UB, so
 ;; the bounds clamp can go.
 (decl pure jump_table_default_dead (JumpTable) bool)
