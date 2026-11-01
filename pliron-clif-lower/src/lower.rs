@@ -3893,6 +3893,66 @@ impl<'a, 'b> FnLower<'a, 'b> {
         true
     }
 
+    /// `PLIRON_SWITCH_CHAIN`: a switch with at most four cases becomes a
+    /// compare chain on `x` itself, with consecutive values that share a
+    /// target tested as one range (`x - lo <=u hi - lo`). Cranelift's
+    /// `Switch` turns every contiguous run into a guarded `br_table` on
+    /// `ireduce(x - lo)` (`x >= lo`, `x - lo <= u32::MAX`). brchain then
+    /// cascaded the table on that derived index, so the case values never
+    /// reached `x`: regex-syntax's `from_encoded_range` (`match len { 2 |
+    /// 3 | 4 }`) kept its `start[2]`/`start[3]` bounds checks in the
+    /// `len == 4` arm. A dead default drops the last test: its block takes
+    /// the final else edge.
+    fn small_switch(
+        &mut self,
+        x: ir::Value,
+        vals: &[(u128, Block)],
+        d: Block,
+        dead_default: bool,
+    ) -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_CHAIN", "1"));
+        let ty = self.b.func.dfg.value_type(x);
+        if !*ON || vals.is_empty() || vals.len() > 4 || ty.bits() > 64 {
+            return false;
+        }
+        let mask = if ty.bits() >= 64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
+        let mut sorted: Vec<(u64, Block)> = vals.iter().map(|&(v, b)| (v as u64 & mask, b)).collect();
+        sorted.sort_by_key(|p| p.0);
+        // (lo, hi, target) runs.
+        let mut runs: Vec<(u64, u64, Block)> = Vec::new();
+        for (v, b) in sorted {
+            match runs.last_mut() {
+                Some(r) if r.2 == b && r.1.checked_add(1) == Some(v) => r.1 = v,
+                _ => runs.push((v, v, b)),
+            }
+        }
+        let n = runs.len();
+        for (i, &(lo, hi, b)) in runs.iter().enumerate() {
+            if dead_default && i + 1 == n {
+                self.b.ins().jump(b, &[]);
+                break;
+            }
+            let c = if lo == hi {
+                self.b.ins().icmp_imm_u(IntCC::Equal, x, lo as i64)
+            } else {
+                let off = self.b.ins().iadd_imm_s(x, (lo as i64).wrapping_neg());
+                self.b
+                    .ins()
+                    .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, (hi - lo) as i64)
+            };
+            if i + 1 == n {
+                self.b.ins().brif(c, b, &[], d, &[]);
+            } else {
+                let next = self.b.create_block();
+                self.b.ins().brif(c, b, &[], next, &[]);
+                self.b.seal_block(next);
+                self.b.switch_to_block(next);
+            }
+        }
+        true
+    }
+
     fn get1(&mut self, v: Value) -> ir::Value {
         let x = self.get(v);
         assert_eq!(x.len(), 1, "expected a scalar");
@@ -5224,7 +5284,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .iter(ctx)
                 .next()
                 .is_some_and(|o| Operation::is_op::<UnreachableOp>(o, ctx));
-            if !self.dense_switch(x, &vals, d, dead_default) {
+            if !self.small_switch(x, &vals, d, dead_default)
+                && !self.dense_switch(x, &vals, d, dead_default)
+            {
                 if self.b.func.dfg.value_type(x) == clt::I128 {
                     // `Switch::emit` subtracts a case cluster's minimum via
                     // `iadd_imm_s(val, (min as i64).wrapping_neg())`, which is
