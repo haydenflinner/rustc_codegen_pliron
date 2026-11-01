@@ -3945,7 +3945,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm).needs(shape::LOOPS),
         // Multi-exit affine loops get a counted pre-loop of umin(trips)
         // iterations, which loopidiom/loopvec can then take.
-        step("mintrip", "mintrip", Gate::OptIn("PLIRON_MINTRIP"), s_mintrip).needs(shape::LOOPS),
+        step("mintrip", "mintrip", Gate::Env("PLIRON_MINTRIP"), s_mintrip).needs(shape::LOOPS),
         step(
             "loopidiom",
             "idiom",

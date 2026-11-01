@@ -1,4 +1,4 @@
-//! Counted pre-loops for multi-exit loops (`PLIRON_MINTRIP`).
+//! Counted pre-loops for multi-exit loops (`PLIRON_MINTRIP`, `=0` disables).
 //!
 //! `SmallVec::extend(repeat(0).take(n))` fills with two exits per element
 //! (`len < cap`, iterator not exhausted). LLVM folds them into one
