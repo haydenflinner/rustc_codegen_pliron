@@ -1500,21 +1500,6 @@ pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     }
 }
 
-/// `may_write` under `kill_st`'s full keep rule: a store to another root
-/// can't reach an isolated or bounded-escape (`ncc`) root's memory, nor
-/// can a store to such a root reach anything else. PRE's "clobbered
-/// earlier in this block?" check must agree with the availability sets
-/// it was computed against, or a store to an unrelated `Vec` header
-/// (`v25+152` in regex's `follow_epsilons`) blocks PRE of a `noalias`
-/// param's fields.
-fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>, ncc: &FxHashSet<Root>) -> bool {
-    let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
-    if w.0 != l.0 && (shel(&w.0) || shel(&l.0)) {
-        return false;
-    }
-    may_write(w, ms, l)
-}
-
 /// `PLIRON_LOADFWD_NARROW=0` disables forwarding a narrower or extending
 /// load from a wider stored value.
 static NARROW: std::sync::LazyLock<bool> =
@@ -1959,7 +1944,7 @@ fn pre(
                             }
                         }
                     } else if !clobbered
-                        && writes.iter().all(|&(w, ms)| !may_write_iso(w, ms, loc, iso, ncc))
+                        && writes.iter().all(|&(w, ms)| !may_write(w, ms, loc))
                         && let Some(v) =
                             edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves))
                     {

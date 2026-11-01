@@ -1,12 +1,12 @@
 //! Upward load PRE out of a loop body block (regex's `follow_epsilons`:
 //! a `&mut SparseSet`'s fields reloaded every outer iteration). The body
 //! block first stores through an unrelated pointer, then loads `v0 + 24`
-//! through an address computed in the body. With `v0` noalias and
-//! isolated, the store can't reach it (PRE's clobber check now follows
-//! `kill_st`'s rule), and the compensating load in the preheader rebuilds
-//! the address from `v0` with the offset folded in (the in-loop `iadd`
-//! doesn't dominate it). The body's load is forwarded from the header.
-//! Differentially checked.
+//! through an address computed in the body. PRE's "clobbered earlier in
+//! this block" check briefly treated stores to other roots as harmless
+//! for an isolated `v0` (`kill_st`'s rule); fuzz seed 27992 miscompiled
+//! under it and the plain `may_write` check is back, so the store blocks
+//! this PRE again. The rewrite, if any, must stay sound: differentially
+//! checked.
 
 use cranelift_codegen::ir::{Block, Function, Opcode};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
@@ -38,7 +38,7 @@ fn loads_in(f: &Function, b: u32) -> usize {
 }
 
 #[test]
-fn field_load_leaves_the_loop_body() {
+fn field_load_pre_is_sound() {
     let before = cranelift_reader::parse_functions(SRC).unwrap().remove(0);
     let mut f = before.clone();
     let noalias: FxHashSet<_> = [cranelift_codegen::ir::Value::from_u32(0)].into_iter().collect();
@@ -60,7 +60,8 @@ fn field_load_leaves_the_loop_body() {
         &FxHashMap::default(),
         &FxHashSet::default(),
     );
-    assert_eq!(loads_in(&f, 2), 0, "load stayed in the body:\n{}", f.display());
+    // The plain check keeps the body's load (an unrelated store precedes it).
+    assert_eq!(loads_in(&f, 2), 1, "{}", f.display());
     let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
     cranelift_codegen::verify_function(&f, &flags).unwrap_or_else(|e| panic!("{e}\n{}", f.display()));
     let facts = Facts { noalias: Some(&noalias), ..Facts::default() };
