@@ -338,6 +338,13 @@ pub fn run_lt(
     // Slot → call insts whose operand is a bounded (`nocap`) use of the
     // slot's address — promoted fields sync around them.
     let mut sync_calls: FxHashMap<StackSlot, Vec<Inst>> = FxHashMap::default();
+    // Bounded calls that take a slot (from its start) as their `sret`
+    // argument: a return place is uninitialized at callee entry (reading
+    // it before writing is UB), so the writeback before such a call is
+    // dead; only the reload after it is needed. pulldown's `Parser::next`
+    // stored the previous event's 64 bytes into `item_to_event`'s sret
+    // temp before every call.
+    let mut sret_sync: FxHashSet<(Inst, StackSlot)> = FxHashSet::default();
     for b in func.layout.blocks() {
         if !reach.contains(&b) {
             continue;
@@ -436,7 +443,17 @@ pub fn run_lt(
                                 data.opcode(),
                                 Opcode::TryCall | Opcode::TryCallIndirect
                             ) || single_pred_dests(func, cfg, i));
-                        for &(ss, _) in &w.slots {
+                        let sret = k.checked_sub(adj).is_some_and(|ai| {
+                            func.dfg.call_signature(i).is_some_and(|sig| {
+                                func.dfg.signatures[sig].params.get(ai).is_some_and(|p| {
+                                    p.purpose == cranelift_codegen::ir::ArgumentPurpose::StructReturn
+                                })
+                            })
+                        });
+                        for &(ss, so) in &w.slots {
+                            if bounded && sret && so == 0 {
+                                sret_sync.insert((i, ss));
+                            }
                             if bounded {
                                 let ss_ = sync_calls.entry(ss).or_default();
                                 if !ss_.contains(&i) {
@@ -887,6 +904,11 @@ pub fn run_lt(
     // New params: every reachable livein block gets one per kept field
     // (entry gets a materialized undef instead — it has no preds).
     let mut params: Vec<FxHashMap<u32, Value>> = vec![FxHashMap::default(); kept.len()];
+    // Every materialized undef: a sync writeback of one stores undefined
+    // bytes over undefined memory, a no-op (an sret temp passed to its
+    // callee got 64 bytes of zeroing before each call: pulldown's
+    // `Parser::next` -> `item_to_event`).
+    let mut undefs: FxHashSet<Value> = FxHashSet::default();
     for (ki, &fi) in kept.iter().enumerate() {
         for b in func.layout.blocks().collect::<Vec<_>>() {
             let ix = blk_ix[&b] as usize;
@@ -894,7 +916,9 @@ pub fn run_lt(
                 continue;
             }
             let v = if b == entry {
-                undef(func, b, fields[fi].ty)
+                let u = undef(func, b, fields[fi].ty);
+                undefs.insert(u);
+                u
             } else {
                 let p = func.dfg.append_block_param(b, fields[fi].ty);
                 dbg.extend(field_labels[ki].iter().map(|&l| (p, l)));
@@ -911,6 +935,7 @@ pub fn run_lt(
         .iter()
         .map(|&fi| undef(func, entry, fields[fi].ty))
         .collect();
+    undefs.extend(fallback.iter().copied());
 
     // field index → kept index: the per-inst site check can't afford
     // linear `position` scans.
@@ -987,7 +1012,10 @@ pub fn run_lt(
                         let sa = *sas
                             .entry(f.slot)
                             .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
-                        if let Some(v) = cur[ki] {
+                        if let Some(v) = cur[ki]
+                            && !undefs.contains(&v)
+                            && !sret_sync.contains(&(i, f.slot))
+                        {
                             pos.ins()
                                 .store(MemFlagsData::new().with_notrap(), v, sa, f.off as i32);
                         }
@@ -1418,6 +1446,52 @@ mod tests {
         // reload — if the store is silently dropped the callee reads
         // uninitialized slot memory.
         assert_eq!(memops(&func), 2, "missing writeback/reload pair");
+        verify(&func);
+    }
+
+    /// The same shape with the slot passed as the callee's `sret`
+    /// argument: a return place is uninitialized at callee entry, so the
+    /// writeback is dead. Only the reload after the call remains.
+    #[test]
+    fn sret_arg_skips_writeback() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let mut csig = Signature::new(CallConv::Fast);
+        csig.params.push(AbiParam::special(types::I64, cranelift_codegen::ir::ArgumentPurpose::StructReturn));
+        let esig = func.import_signature(csig);
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let call = cur.ins().call(ext, &[a]);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 0));
+        let cfg = ControlFlowGraph::with_function(&func);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
+        let stores = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .filter(|&i| func.dfg.insts[i].opcode() == Opcode::Store)
+            .count();
+        assert_eq!(stores, 0, "writeback before an sret call:\n{}", func.display());
+        assert_eq!(memops(&func), 1, "the reload after the call must stay:\n{}", func.display());
         verify(&func);
     }
 
