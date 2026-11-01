@@ -1211,6 +1211,7 @@ pub fn run(
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
     let cold_once = crate::env_is("PLIRON_INLINE_COLDONCE", "1");
+    let always_all = crate::pass_enabled("PLIRON_INLINE_ALWAYS");
     // `PLIRON_INLINE_WASM_COLDKEEP=1` (small mode; default off): non-keep
     // callees use `WASM_COLDKEEP_THRESH` as the flat cold cap; keep-list
     // (hash/num/str/ast-parse) keeps `limit`.
@@ -1582,7 +1583,13 @@ pub fn run(
                     {
                         t = t.min(limit / 5);
                     }
-                    let why = if cost > t {
+                    // `#[inline(always)]` skips the score like LLVM's
+                    // AlwaysInliner (`PLIRON_INLINE_ALWAYS=0` restores it; the
+                    // caller `cap` and the recursion/EH rules still apply).
+                    // blake3's 9k-op `compress_pre` scored past even the free
+                    // x10 threshold, so `compress_in_place` called it and
+                    // spilled the whole state through memory every block.
+                    let why = if cost > t && !(always_all && f.always_inline) {
                         "reject (score)"
                     } else if loopy {
                         "reject (loopy)"
