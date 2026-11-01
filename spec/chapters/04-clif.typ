@@ -181,18 +181,27 @@ only the consumer of the optimized CLIF differs.
   A switch with at least four cases over an integer of at most 64 bits whose
   cases cover at least a tenth of a span of at most 4096 values SHOULD be lowered to one
   `br_table` over the span, holes going to the default
-  (`PLIRON_SWITCH_DENSE`). When the default is unreachable, the table SHOULD
-  be padded to a power of two and the index masked with `band`, so that no
-  bounds check is emitted (`PLIRON_SWITCH_MASK`).
+  (`PLIRON_SWITCH_DENSE`). When the default is unreachable, the switch SHOULD
+  dispatch on the raw value with no mask and no range branch before
+  narrowing, keeping the `unreachable` block as the table's default
+  (`PLIRON_SWITCH_RAW`). Passes that redirect edges into unreachable code
+  SHOULD leave such a default in place, and a compare chain built from the
+  table SHOULD treat it as a don't-care (`PLIRON_SWITCH_KEEPDEAD`). With
+  `PLIRON_SWITCH_CHAIN` (opt-in), a switch with at most four cases SHOULD
+  instead be lowered to a compare chain on the value itself.
 ]
 
-#llvm(kind: "choice", summary: [Dense switches use LLVM's 10% density rule, but an unreachable default gives a masked power-of-two table with no bounds check.])[
+#llvm(kind: "choice", summary: [Dense switches use LLVM's 10% density rule; an unreachable default stays the table's default, and the table drops its bounds check.])[
   Cranelift's own `Switch` splits at every hole and binary-searches between
   runs; lowering bypasses it with LLVM's jump-table density threshold. For
-  an unreachable default (enum discriminants) LLVM keeps a range check or
-  relies on `unreachable` metadata; here the index is masked and the table
-  padded, and the vendored x64 lowering skips its bounds clamp for that form
-  (#refr("clif.vendor.jt")).
+  an unreachable default (enum discriminants) LLVM omits the range check of
+  a table with an unreachable default. Here the fact stays on the switch
+  (its default block), not in a value: the vendored lowering skips the
+  bounds clamp of a table whose default is the `unreachable` trap
+  (#refr("clif.vendor.jt")). The earlier encoding, a padded table and a
+  masked index (`PLIRON_SWITCH_MASK`, now superseded by
+  `PLIRON_SWITCH_RAW`), outlived the table: once brchain turned it into
+  compares, the mask was rematerialized in every compare block.
 ]
 
 #r("clif.lower.facts", title: "Facts handed to the pipeline", level: "must",
@@ -578,9 +587,11 @@ only the consumer of the optimized CLIF differs.
 
 #r("clif.vendor.jt", title: "Jump-table forms", level: "must",
    tier: 2, refines: "model.parity", depends: "clif.lower.switch",
-   checked: ("pliron-clif-opt/tests/jt_narrow.rs", "pliron-clif-opt/tests/jt_narrow_w4.rs", "test.sh narrowext"))[
+   checked: ("pliron-clif-opt/tests/jt_narrow.rs", "pliron-clif-opt/tests/jt_narrow_w4.rs", "pliron-clif-opt/tests/switch_dead_default.rs", "test.sh narrowext"))[
   The vendored Cranelift MUST: skip the x64 `br_table` bounds clamp when the
-  index is `band x, k` with `k` below the table size; share one split-edge
+  index is `band x, k` with `k` below the table size; skip the bounds clamp
+  on x64 and aarch64 when the table's default block starts with the
+  `unreachable` trap (`trap user2`, `PLIRON_SWITCH_KEEPDEAD`); share one split-edge
   block among `br_table` entries with the same target and arguments
   (`PLIRON_EDGEDEDUP`); and, where a sound size bound proves both
   placeholders stay in pc-relative range, write each jump table after the

@@ -452,6 +452,35 @@ Evening (2026-10-31):
   removal (LOADREMAT) and LLVM without its schedulers changed nothing.
   blake3 1.156 -> 1.051; held-out 1.166 -> 1.153 (batch 36). Fuzz
   35800:38600 (2800 seeds) clean.
+- **Late null-test fold** (2026-11-01, `PLIRON_NFOLD2`, on): regex's
+  `InstPtrs` varint loop tested its byte cursor against null on every
+  byte (the `Option<&u8>` niche of `slice::Iter`). The test only becomes
+  a bare `p == 0` once webmerge collapses `select c, p, 0` late. By then
+  sameargs had rebuilt `p + 1` without its inbounds mark, and the
+  `p + nread` advance's recorded base was gone. Step `nfold2`, after
+  webmerge, uses two proofs that don't depend on those marks: an edge's
+  `x + k` after `x` was dereferenced on every path to it, and either
+  operand of an inbounds `iadd` whose base is a tombstone. Regex
+  1.223 -> 1.179 in batch 37; the rest within noise.
+- **Switch facts on the switch, not in a value** (2026-11-01,
+  `PLIRON_SWITCH_RAW`, `PLIRON_SWITCH_KEEPDEAD`, on):
+  `PLIRON_SWITCH_MASK` encoded "out-of-range is UB" as a padded table
+  and `band x, 2^k-1`. That was an x64-only clamp elision; aarch64 paid
+  the `and` and kept its clamp. After brchain turned a table into a
+  compare cascade, Cranelift rematerialized the `and` in each cascade
+  block (regex `cached_state`: four per element). Now a dead-default
+  switch dispatches on the raw tag. unreach keeps the `unreachable`
+  default of a `br_table`, redirecting only dead entries. brchain treats
+  that default as a don't-care: the chain's else edge takes the first
+  entry's target, and choosing the most common target instead cost regex
+  2.3% by testing its hot arm last. Vendored Cranelift drops the clamp of
+  a table whose default is `trap user2` (aarch64: `cmp; b.hs; csel;
+  csdb` -> `mov`). Regex: 1016 fewer instructions, 44 of 94 clamps gone;
+  timing neutral on all held-out programs (held-out 1.153 -> 1.150 in
+  batch 38). Fuzz 39400:42200 clean.
+  Lesson: the mask had to be undone by every pass that reshaped the
+  table. Encoding the fact where it belongs (the switch's default) made
+  each consumer simple.
 - **Next for pulldown: callee simplification before costing.** Its
   `Tree::append_text` (89 samples, LLVM 4) and `scanners::scan_nextline`
   (75, LLVM 0) stay calls. `append_text` lives in another CGU and needs

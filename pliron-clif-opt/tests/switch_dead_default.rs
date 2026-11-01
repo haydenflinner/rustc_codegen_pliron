@@ -27,6 +27,7 @@ fn table(n: usize, entries: &[usize]) -> String {
     s
 }
 
+// r[verify clif.vendor.jt]
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn unreachable_default_drops_the_clamp() {
