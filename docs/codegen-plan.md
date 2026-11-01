@@ -433,8 +433,8 @@ Evening (2026-10-31):
   constant; seeds 26212/26694, slotprom skipped the writeback before an
   sret call whose return value covers only part of the slot (reverted);
   seed 27004, celim's signed nowrap test for a downward offset; seed
-  27992, load PRE's iso-aware in-block clobber check (reverted to the
-  plain check; root cause open). All fixed with regression tests or
+  27992, upward load PRE trusting a block that overwrote and reloaded
+  the location (`preserves` now requires the entry value to survive). All fixed with regression tests or
   gate seeds. A batch's 400 seeds are too few for
   memory-pass changes: sweep 2000.
 

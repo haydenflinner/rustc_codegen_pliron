@@ -318,14 +318,19 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   Seed 27004: celim's `snnowrap` checked a downward offset as
   `l - d >= smin` (always true), so `x s< x - 94` under `x == i64::MIN`
   folded to false; fixed (`l + d`), with a test. Seed 27992: upward load
-  PRE of an isolated `&` param's 16-byte load past stores to other roots
-  changed control flow. It needs e499f46's iso-aware "clobbered earlier
-  in this block" check. The plain check is back at no measured cost
-  (regex 1.200 vs 1.201); the root cause is not identified, and every
-  piece (in-block stores, the merge block's preservation, each in-edge
-  value) reads as sound. A lead for later: the seed's corpus dump
-  (`PLIRON_CORPUS`) replays it, and `XUP_LIM`-style counting on upward
-  hits isolates the single PRE at block35 -> block27. All five seeds of
+  PRE's `preserves(block, loc)` asked only whether `loc` was still
+  available at the block's end. block27 stores to an `&` param `v6` and
+  then reloads it, so `loc` came out available under the new value and
+  block27 read as preserving. The `out` fixpoint had dropped that reload
+  at `MAX_ENTRIES`, so block35's load (single pred block27) went upward
+  and got block27's entry value, the bytes from before the store. Now
+  the entry placeholder itself must survive (01b6433). A first
+  mitigation (707d434) had disabled the iso-aware in-block check that
+  let the PRE be attempted; it is restored, and the seed fails without
+  the real fix. Found by replaying the seed's corpus dump, counting
+  upward hits to isolate the one bad PRE, and diffing loadfwd's output
+  with and without it: block35's load became block27's entry value in
+  one and block27's own mid-block reload in the other. All five seeds of
   the night are in the gate's `FUZZ_REGRESS`.
 - **Knob sweeps on the five tuned benches** (interleaved, 8 rounds):
   `PLIRON_INLINE_DUPCOST=1` and `PLIRON_INLINE_COLD=1` both give json
