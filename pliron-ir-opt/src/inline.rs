@@ -1210,6 +1210,7 @@ pub fn run(
     let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
+    let cold_once = crate::env_is("PLIRON_INLINE_COLDONCE", "1");
     // `PLIRON_INLINE_WASM_COLDKEEP=1` (small mode; default off): non-keep
     // callees use `WASM_COLDKEEP_THRESH` as the flat cold cap; keep-list
     // (hash/num/str/ast-parse) keeps `limit`.
@@ -1391,10 +1392,19 @@ pub fn run(
                     // can be cloned into other bodies after that (27 copies
                     // of `check_tail_call`'s through `visit_expr`), and only
                     // one of those inlines is free.
+                    // `PLIRON_INLINE_COLDONCE=1`: a `#[cold]` callee never
+                    // inlines for free. Its one copy would land in a hot
+                    // caller: `RawVec::reserve` took its cold
+                    // `do_reserve_and_handle` (grow + realloc), outgrew its
+                    // own callers' limit and paid a full prologue on the
+                    // no-grow path (pulldown's `Vec<u8>::reserve`). LLVM
+                    // keeps it out of line (rustc shares the instance from
+                    // `alloc`, so no last-call bonus applies).
                     let free = f.always_inline
                         || (once
                             && single.contains(cs)
                             && !rec_caller
+                            && !(cold_once && f.cold && !f.inline_hint)
                             && !(once1 && free_used.contains(cs.as_str())));
                     // `PLIRON_INLINE_WASM_COLD=<n>` (small mode only; unset =
                     // `limit`): flat non-loop threshold. Loop-site `hot`x still
