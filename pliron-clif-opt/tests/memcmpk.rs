@@ -101,3 +101,33 @@ block0(v0: i64, v1: i64):
     assert!(s.compared > 0);
     assert!(check(&before, &after, &Facts::default(), &cfg).is_err(), "the stub should disagree");
 }
+
+/// serde's derived field visitors: `len == 5` guards
+/// `memcmp(s, "title", len)` with the variable length. The guard pins it.
+#[test]
+fn length_pinned_by_dominating_guard() {
+    let src = "function %f(i64, i64, i64) -> i8 {
+    sig0 = (i64, i64, i64) -> i32
+    fn0 = %Memcmp sig0
+block0(v0: i64, v1: i64, v20: i64):
+    v21 = iconst.i64 7
+    v2 = band v20, v21
+    v3 = iconst.i64 5
+    v4 = icmp eq v2, v3
+    brif v4, block1, block2
+block1:
+    v5 = call fn0(v0, v1, v2)
+    v6 = iconst.i32 0
+    v7 = icmp eq v5, v6
+    return v7
+block2:
+    v8 = iconst.i8 0
+    return v8
+}";
+    let before = cranelift_reader::parse_functions(src).unwrap().remove(0);
+    let mut after = before.clone();
+    assert_eq!(pliron_clif_opt::memcmpk::run(&mut after, &[], "f"), 1, "{}", after.display());
+    let s = check(&before, &after, &Facts::default(), &Config { trials: 256, ..Config::default() })
+        .unwrap_or_else(|m| panic!("{m}\n{}", after.display()));
+    assert!(s.compared > 0);
+}

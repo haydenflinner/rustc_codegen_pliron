@@ -19,6 +19,8 @@ use cranelift_codegen::ir::{
     BlockArg, ExternalName, FuncRef, Function, Inst, InstBuilder, InstructionData, LibCall, MemFlagsData,
     Opcode, Value, types,
 };
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::Block;
 use rustc_hash::FxHashMap;
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
@@ -101,7 +103,38 @@ fn expand(pos: &mut FuncCursor, a: Value, b: Value, n: u64, exact: bool) -> Valu
     pos.ins().uextend(types::I32, ne)
 }
 
+/// A constant `n` must equal on entry to `b`: the edge into `b`'s single-
+/// predecessor chain is the equal arm of `brif (icmp eq n, K)` (or the
+/// unequal arm of `ne`). serde's derived field visitors compare the
+/// length against each name's and call `memcmp(s, "title", len)` with the
+/// variable length on the equal arm.
+fn pinned_by_guard(func: &Function, cfg: &ControlFlowGraph, mut b: Block, n: Value) -> Option<i64> {
+    let n = func.dfg.resolve_aliases(n);
+    for _ in 0..8 {
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else { return None };
+        if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[p.inst]
+            && let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()
+            && let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[ci]
+        {
+            let (a0, a1) = (func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1]));
+            let k = if a0 == n { iconst(func, a1) } else if a1 == n { iconst(func, a0) } else { None };
+            let taken_true = blocks[0].block(&func.dfg.value_lists) == b;
+            let taken_false = blocks[1].block(&func.dfg.value_lists) == b;
+            if let Some(k) = k
+                && taken_true != taken_false
+                && ((cond == IntCC::Equal && taken_true) || (cond == IntCC::NotEqual && taken_false))
+            {
+                return Some(k);
+            }
+        }
+        b = p.block;
+    }
+    None
+}
+
 pub fn run(func: &mut Function, fn_names: &[String], fname: &str) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
     if ["memcmp", "bcmp"].iter().any(|s| fname.contains(s)) {
         return 0;
     }
@@ -130,7 +163,11 @@ pub fn run(func: &mut Function, fn_names: &[String], fname: &str) -> usize {
             }
             let args = func.dfg.inst_args(i).to_vec();
             let [a, b2, len] = args[..] else { continue };
-            let Some(n) = iconst(func, len).and_then(|k| u64::try_from(k).ok()).filter(|n| (1..=16).contains(n)) else {
+            let Some(n) = iconst(func, len)
+                .or_else(|| pinned_by_guard(func, &cfg, b, len))
+                .and_then(|k| u64::try_from(k).ok())
+                .filter(|n| (1..=16).contains(n))
+            else {
                 continue;
             };
             // The value carrying the result: the call's own, or the normal
