@@ -232,6 +232,7 @@ impl Context {
             self.const_sink();
             self.exit_const_sink();
             self.load_remat();
+            self.amode_split();
             self.shrink_split();
         }
 
@@ -1105,6 +1106,114 @@ impl Context {
                     let raw: Vec<Value> = f.inst_values(u).filter(|&x| f.resolve_aliases(x) == v || x == old).collect();
                     f.map_inst_values(u, |x| if raw.contains(&x) { nv } else { x });
                     cur = (uk, nv);
+                }
+            }
+        }
+    }
+
+    /// PLIRON: give a loop's shared `base + index` address a copy per
+    /// outside use block (`PLIRON_AMODESPLIT=1`, opt-in). Lowering folds
+    /// `p = iadd a, b` into a load's `[a, b]` amode only when the load is
+    /// its one direct use (patch 86). serde_json's escape scan loads each
+    /// byte through `p = s + i` and also uses `p` on its exit and escape
+    /// paths, so the loop materialized `p` every byte (`add; ldurb [p]`,
+    /// LLVM `ldrb [s, i]`). When `p`'s one use in its own block is a
+    /// zero-offset load or store address and its other uses sit in blocks
+    /// of no deeper loop, each of those blocks gets its own `iadd`.
+    fn amode_split(&mut self) {
+        use crate::ir::{InstructionData, Opcode, Value};
+        use crate::{FxHashMap, FxHashSet};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_AMODESPLIT").as_deref() == Ok("1")) {
+            return;
+        }
+        fn others_dominated(
+            dt: &crate::dominator_tree::DominatorTree,
+            x: crate::ir::Block,
+            all: &[crate::ir::Block],
+        ) -> usize {
+            all.iter().filter(|&&y| dt.block_dominates(x, y)).count()
+        }
+        let mut uses: FxHashMap<Value, Vec<(crate::ir::Inst, crate::ir::Block)>> = FxHashMap::default();
+        let mut adds = vec![];
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                if let InstructionData::Binary { opcode: Opcode::Iadd, .. } = self.func.dfg.insts[i]
+                    && self.func.dfg.ctrl_typevar(i) == crate::ir::types::I64
+                {
+                    adds.push((i, b));
+                }
+                for v in self.func.dfg.inst_values(i) {
+                    uses.entry(self.func.dfg.resolve_aliases(v)).or_default().push((i, b));
+                }
+            }
+        }
+        if adds.is_empty() {
+            return;
+        }
+        self.compute_loop_analysis();
+        let mut cands = vec![];
+        for (i, b) in adds {
+            if self.loop_analysis.innermost_loop(b).is_none() {
+                continue;
+            }
+            let v = self.func.dfg.first_result(i);
+            let Some(us) = uses.get(&v) else { continue };
+            let mut local = 0;
+            let mut others: FxHashSet<crate::ir::Block> = FxHashSet::default();
+            for &(u, ub) in us {
+                if ub != b {
+                    others.insert(ub);
+                    continue;
+                }
+                let r = |x: Value| self.func.dfg.resolve_aliases(x) == v;
+                local += match self.func.dfg.insts[u] {
+                    InstructionData::Load { arg, offset, .. } if r(arg) && i32::from(offset) == 0 => 1,
+                    InstructionData::Store { args: [x, a], offset, .. }
+                        if r(a) && !r(x) && i32::from(offset) == 0 =>
+                    {
+                        1
+                    }
+                    _ => 2,
+                };
+            }
+            let lvl = self.loop_analysis.loop_level(b).level();
+            if local != 1
+                || others.is_empty()
+                || others.len() > 4
+                || others.iter().any(|&ub| self.loop_analysis.loop_level(ub).level() > lvl)
+            {
+                continue;
+            }
+            cands.push((i, v, others));
+        }
+        for (i, v, others) in cands {
+            // A use block under another one's copy reuses it: dominators
+            // first, so a path through several use blocks adds once.
+            let all: Vec<crate::ir::Block> = others.into_iter().collect();
+            let mut others = all.clone();
+            others.sort_by_key(|&x| core::cmp::Reverse(others_dominated(&self.domtree, x, &all)));
+            let mut made: Vec<(crate::ir::Block, Value)> = vec![];
+            for ub in others {
+                let nv = match made.iter().find(|&&(c, _)| self.domtree.block_dominates(c, ub)) {
+                    Some(&(_, nv)) => nv,
+                    None => {
+                        let ni = self.func.dfg.clone_inst(i);
+                        let Some(first) = self.func.layout.first_inst(ub) else { continue };
+                        self.func.layout.insert_inst(ni, first);
+                        let nv = self.func.dfg.first_result(ni);
+                        made.push((ub, nv));
+                        nv
+                    }
+                };
+                let insts: Vec<crate::ir::Inst> =
+                    self.func.layout.block_insts(ub).filter(|&u| self.func.dfg.inst_results(u) != [nv]).collect();
+                for u in insts {
+                    let f = &mut self.func.dfg;
+                    let raw: Vec<Value> = f.inst_values(u).filter(|&x| f.resolve_aliases(x) == v).collect();
+                    if !raw.is_empty() {
+                        f.map_inst_values(u, |x| if raw.contains(&x) { nv } else { x });
+                    }
                 }
             }
         }

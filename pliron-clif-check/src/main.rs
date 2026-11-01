@@ -155,6 +155,9 @@ fn main() -> ExitCode {
                 // The function as Cranelift lowered it (after its egraph).
                 println!("{}", ctx.func.display());
             }
+            if let Err(e) = cranelift_codegen::verify_function(&ctx.func, &*isa) {
+                eprintln!("post-egraph verifier errors:\n{e}");
+            }
             let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&ctx.func);
             let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&ctx.func, &cfg);
             let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
