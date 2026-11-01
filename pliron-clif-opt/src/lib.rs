@@ -12,6 +12,7 @@ pub mod latchspec;
 pub mod mergejump;
 pub mod bittab;
 pub mod brifsel;
+pub mod demand;
 pub mod ivdown;
 pub mod ivptr;
 pub mod memcmpk;

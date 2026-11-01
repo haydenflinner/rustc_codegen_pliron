@@ -3644,6 +3644,14 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `call %Mem{cpy,move,set}(dst, src, iconst n)` for small n becomes inline
 // unaligned load/store chunks — rustc's element-wise copy intrinsics reach
 // CLIF with a runtime len that only folds to `iconst` here.
+fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::demand::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("demand");
+    }
+    k
+}
+
 fn s_memcmpk(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = crate::memcmpk::run(&mut p.clctx.func, p.fn_names, p.fname);
     if k > 0 {
@@ -4219,6 +4227,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("ivdown", "ivdown", Gate::Env("PLIRON_IVDOWN"), s_ivdown).needs(shape::LOOPS),
         cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
         step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
+        // Xor constants under a constant mask that only reads bits the
+        // constant sets (or clears) become `bnot`/the value (SWAR scans);
+        // the compile-time egraph then factors the shared operand.
+        step("demand", "demand", Gate::OptIn("PLIRON_DEMAND"), s_demand),
         // Fold constants any earlier pass left behind — late value folds
         // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
         // `ishl` chains the early clifpeep round never saw (matmul's

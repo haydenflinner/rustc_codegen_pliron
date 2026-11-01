@@ -96,7 +96,7 @@ fn expand(pos: &mut FuncCursor, a: Value, b: Value, n: u64, exact: bool) -> Valu
         rem -= sz;
         off += sz as i32;
     }
-    let ne = pos.ins().icmp_imm(IntCC::NotEqual, acc.unwrap(), 0);
+    let ne = pos.ins().icmp_imm_u(IntCC::NotEqual, acc.unwrap(), 0);
     pos.ins().uextend(types::I32, ne)
 }
 
