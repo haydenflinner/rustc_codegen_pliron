@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   asmcfi asmextern debuginfo dbgnested nocapfields stackmove xfactsall
+#   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
 # r[verify model.abi]
@@ -828,6 +828,26 @@ t_debuginfo() {
   cmp -s $out/debuginfo-g.text $out/debuginfo-nog.text || { echo "debuginfo: -g changed the code" >&2; exit 1; }
 }
 
+t_dbgextpath() {
+  # -g: a generic from another crate, compiled in its own directory from a
+  # relative `src/lib.rs`, instantiated here. The line table must name the
+  # file under that crate's root, not `src/lib.rs` against our comp_dir
+  # (pulldown-cmark's escape.rs resolved to a nonexistent
+  # `<bench>/src/escape.rs`).
+  [[ -n "$exe" ]] && return 0
+  local dd; dd=$(command -v llvm-dwarfdump || echo /opt/homebrew/opt/llvm/bin/llvm-dwarfdump)
+  [[ -x "$dd" ]] || return 0
+  local d; d=$(cd $out && pwd)/dbgextpath
+  rm -rf $d; mkdir -p $d/dep/src $d/app
+  printf '#[inline]\npub fn twice<T: Copy + core::ops::Add<Output = T>>(x: T) -> T {\n    x + x\n}\n' > $d/dep/src/lib.rs
+  printf 'fn main() {\n    println!("{}", dep::twice(std::hint::black_box(21u32)));\n}\n' > $d/app/main.rs
+  (cd $d/dep && rustc $BE --edition 2021 -g -O --crate-type rlib --crate-name dep src/lib.rs -o libdep.rlib)
+  (cd $d/app && rustc $BE --edition 2021 -g -O -Ccodegen-units=1 --emit obj --extern dep=../dep/libdep.rlib main.rs -o main.o)
+  "$dd" --debug-line $d/app/main.o > $d/lines.txt
+  grep -q "\"$d/dep/src\"" $d/lines.txt ||
+    { echo "dbgextpath: dep's src/lib.rs not under $d/dep in the line table" >&2; cat $d/lines.txt >&2; exit 1; }
+}
+
 # r[verify clif.lower.simdshift]
 t_simdshift() {
   # Native vector shifts (splat and per-lane amounts) and narrowing casts
@@ -1234,6 +1254,7 @@ want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern
 want dbgnested && t_dbgnested
+want dbgextpath && t_dbgextpath
 want nocapfields && t_nocapfields
 # stackmove's expected output requires catch_unwind to intercept a panic —
 # impossible against the stock-std SEH throw on Windows.

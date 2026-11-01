@@ -52,14 +52,21 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(&i) = self.dbg_files.borrow().get(&sf.start_pos) {
             return i;
         }
-        // rustc_codegen_llvm's naming: relative to the working directory
-        // (the CU's comp_dir) when under it, else the remapped path.
+        // Relative to this CU's comp_dir (our working directory) when under
+        // it, else absolute. `embeddable_name` gives the path against the
+        // file's *own* compilation directory: for code from another crate
+        // (a registry dependency's generic inlined here) that is the other
+        // crate's root, so a relative `src/escape.rs` must be resolved there
+        // first, not against our comp_dir (it named a nonexistent
+        // `<bench>/src/escape.rs`).
         let name = match &sf.name {
             FileName::Real(f) => {
                 let (wd, p) = f.embeddable_name(RemapPathScopeComponents::DEBUGINFO);
-                match p.strip_prefix(wd) {
+                let abs = if p.is_absolute() { p.to_path_buf() } else { wd.join(p) };
+                let cu = self.tcx.sess.source_map().working_dir().path(RemapPathScopeComponents::DEBUGINFO);
+                match abs.strip_prefix(cu) {
                     Ok(rel) => rel.to_string_lossy().into_owned(),
-                    Err(_) => p.to_string_lossy().into_owned(),
+                    Err(_) => abs.to_string_lossy().into_owned(),
                 }
             }
             other => other.display(RemapPathScopeComponents::DEBUGINFO).to_string(),
