@@ -377,3 +377,35 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   loop as isolated (`promote`'s rule) changed nothing on regex, and a
   loop-load pass that reloads after cold clobbering calls never fired
   there either (both shelved): the clobber was the dead grow call above.
+
+## Late morning (11-01): reload PRE, amode split
+
+- **Reload PRE** (Cranelift emission, `PLIRON_RELOADPRE=0` off,
+  `PLIRON_RELOADPRE_ROUNDS`, default 3): regalloc2 puts a spilled value's
+  reload right before each use. serde_json's `serialize_str` spilled its
+  escape-table address across the escape path's calls and rebuilt it
+  (`adrp` + `add`, the rematerialized reload) on every byte, although its
+  register survived the hot path. After allocation, a reload `R <- [S]`
+  in block B with nothing earlier in B touching R or writing S is
+  redundant along a predecessor that ends with R holding the value
+  (greatest fixpoint over the blocks behind it; for remat vregs the fact
+  is "R last written with V"). When one predecessor has it, the reload
+  moves to the others' ends: with several predecessors they are
+  single-successor blocks, so no path runs more loads. Many reloads are
+  redundant on every edge and just go (blind-sig's montgomery: 107
+  moved, 9 inserted; pulldown's `parse_block` 1187 -> 1034 stack
+  accesses). `PLIRON_RELOADPRE_CHECK=1` runs regalloc2's checker on the
+  rewritten allocation; it rejects a deliberately broken variant, and the
+  hot corpus, all eight held-out programs, crates tier 1 and the batch's
+  fuzz window compile clean under it.
+- **amode split** (opt-in, `PLIRON_AMODESPLIT=1`): lowering folds
+  `p = iadd a, b` into `[a, b]` only when the load is `p`'s one direct
+  use. The same loop also used `p = s + i` on its exit and escape paths,
+  so it materialized `p` per byte. After the egraph, those other blocks
+  (no deeper loop; one copy per dominating use block) get their own
+  `iadd`; the loop becomes LLVM's six instructions.
+- **slotmerge `slot_at` overflow** (seed 31625, ICE in debug builds):
+  wrapped pointer arithmetic in dead code overflowed the offset sum. The
+  sum is checked and out-of-slot offsets are no known address.
+- Fuzz 31000:33000: that ICE, and one compile error that was earlyoom
+  killing rustc during a concurrent build (passes on rerun).

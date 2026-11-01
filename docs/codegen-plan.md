@@ -436,7 +436,15 @@ Evening (2026-10-31):
   27992, upward load PRE trusting a block that overwrote and reloaded
   the location (`preserves` now requires the entry value to survive). All fixed with regression tests or
   gate seeds. A batch's 400 seeds are too few for
-  memory-pass changes: sweep 2000.
+  memory-pass changes: sweep 2000. Seed 31625 (31000:33000 sweep):
+  slotmerge's `slot_at` overflowed on wrapped dead-code offsets (ICE).
+- **Reload PRE** (2026-11-01, W4's "no reload inside a loop" in its
+  narrowest form): at emission, a reload whose register already holds
+  the value on some in-edges moves to the others (`PLIRON_RELOADPRE`,
+  checker-validated with `PLIRON_RELOADPRE_CHECK=1`). Held-out 1.187 ->
+  1.181 in the batch A/B; pulldown -1.5%, json -0.8% interleaved.
+  `PLIRON_AMODESPLIT=1` (opt-in) gives serde's escape loop LLVM's six
+  instructions but is neutral to negative elsewhere.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
@@ -484,7 +492,7 @@ service), then spills. Item 1 below stays, but behind frame cost.
 1. **Register allocation (W4).** Hot functions carry 5-40x LLVM's stack
    traffic, mostly spills (pulldown's `parse_block`: 22% of its
    instructions touch the stack). Done: call-arg detach, rematerialized
-   reloads, dead remat-slot stores. Next: split live ranges around calls
+   reloads, dead remat-slot stores, reload PRE. Next: split live ranges around calls
    (a value crossing a call goes to a callee-saved register or to memory
    *around the call*, not for its whole range), loop-aware splitting
    (no reload inside a loop for a value untouched in it), profile and
