@@ -861,7 +861,7 @@ impl<I: VCodeInst> VCode<I> {
         Some((BlockIndex::new(sb), full))
     }
 
-    /// PLIRON: reload PRE (`PLIRON_RELOADPRE=1`). regalloc2 puts
+    /// PLIRON: reload PRE (`PLIRON_RELOADPRE=0` disables). regalloc2 puts
     /// a spilled value's reload right before each use, so a value spilled
     /// across a loop's cold path (a call) is reloaded on every trip around
     /// the hot path even when its register survives the trip (serde_json's
@@ -876,7 +876,7 @@ impl<I: VCodeInst> VCode<I> {
     pub(crate) fn reload_pre(&self, ra: &regalloc2::Output) -> Option<regalloc2::Output> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_RELOADPRE").as_deref() == Ok("1"))
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RELOADPRE").as_deref() != Ok("0"))
             || !self.debug_value_labels.is_empty()
             || ra.edits.is_empty()
         {

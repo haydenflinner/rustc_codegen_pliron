@@ -20,7 +20,6 @@ fn is_label(l: &str) -> bool {
 fn asm(clif: &str) -> String {
     // SAFETY: tests in this binary only read the variable.
     unsafe { std::env::set_var("PLIRON_RELOADPRE_CHECK", "1") };
-    unsafe { std::env::set_var("PLIRON_RELOADPRE", "1") };
     let mut b = settings::builder();
     b.set("opt_level", "speed").unwrap();
     b.set("is_pic", "true").unwrap();
