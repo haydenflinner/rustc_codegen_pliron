@@ -254,6 +254,27 @@ fn cand_ok(func: &Function, b: Block) -> bool {
     }
 }
 
+/// `v` through block params of single-predecessor blocks: jump threading
+/// leaves `brif c, hit, next(x)` / `next(x'): icmp eq x', k` chains
+/// (serde_json's `has_next_element`: `x - 9` passed on to the `{1, 4, 23}`
+/// tests), where `x'` is `x` on the only edge in.
+fn canon(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Param(b, k) = func.dfg.value_def(v) else { break };
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else { break };
+        let dests = func.dfg.insts[p.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let mut ins = dests.iter().filter(|bc| bc.block(&func.dfg.value_lists) == b);
+        let (Some(bc), None) = (ins.next(), ins.next()) else { break };
+        match bc.args(&func.dfg.value_lists).nth(k) {
+            Some(BlockArg::Value(a)) => v = func.dfg.resolve_aliases(a),
+            _ => break,
+        }
+    }
+    v
+}
+
 struct Plan {
     root: Block,
     x: Value,
@@ -272,7 +293,7 @@ fn try_tree(
     root: Block,
 ) -> Option<Plan> {
     let (_, _, x0, _) = test_of(func, root)?;
-    let x = func.dfg.resolve_aliases(x0);
+    let x = canon(func, cfg, x0);
     let ty = func.dfg.value_type(x);
     if !ty.is_int() || ty.bits() > 64 {
         return None;
@@ -316,7 +337,7 @@ fn try_tree(
             // candidate budget with the miss path's later dispatch
             // (serde_json's `has_next_key`: `x - 9 in {0, 1, 4, 23}`, then
             // tests for `}` and `"` on the raw byte) and gave up.
-            let same_x = test_of(func, db).is_none_or(|(_, _, y, _)| func.dfg.resolve_aliases(y) == x);
+            let same_x = test_of(func, db).is_none_or(|(_, _, y, _)| canon(func, cfg, y) == x);
             if seen.insert(db) && db != root && same_x && cand_ok(func, db) {
                 cand.insert(db);
                 work.push(db);
@@ -404,7 +425,7 @@ fn try_tree(
                 let Some((_, cc, bx, k)) = test_of(func, b) else {
                     return None;
                 };
-                if func.dfg.resolve_aliases(bx) != x {
+                if canon(func, cfg, bx) != x {
                     return None;
                 }
                 let s = sat(cc, k, bits);
