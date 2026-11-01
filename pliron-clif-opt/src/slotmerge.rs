@@ -481,7 +481,8 @@ fn quiet(func: &Function, i: Inst) -> bool {
 /// `(slot, byte offset)` an address points at: `stack_addr` under
 /// constant adds, through block params every predecessor feeds the same
 /// value (`same_in`; lowering threads a `try_call`'s slot operand into its
-/// successors that way).
+/// successors that way). `None` for an offset outside the slot: wrapped
+/// address arithmetic in dead code overflowed the sum (fuzz seed 31625).
 fn slot_at(func: &Function, same_in: &FxHashMap<Value, Value>, v: Value, imm: i64) -> Option<(StackSlot, i64)> {
     let mut v = v;
     let mut off = imm;
@@ -494,15 +495,17 @@ fn slot_at(func: &Function, same_in: &FxHashMap<Value, Value>, v: Value, imm: i6
         let i = func.dfg.value_def(v).inst()?;
         match func.dfg.insts[i] {
             InstructionData::StackAddr { stack_slot, offset, .. } => {
-                return Some((stack_slot, off + i64::from(i32::from(offset))));
+                let off = off.checked_add(i64::from(i32::from(offset)))?;
+                let size = func.sized_stack_slots.get(stack_slot).map_or(0, |d| i64::from(d.size));
+                return (0..=size).contains(&off).then_some((stack_slot, off));
             }
             InstructionData::Binary { opcode: Opcode::Iadd, args } => {
                 let k = |x: Value| crate::jumpthread::known(func, &FxHashMap::default(), x);
                 if let Some(c) = k(args[1]) {
-                    off += c as i64;
+                    off = off.checked_add(c as i64)?;
                     v = args[0];
                 } else if let Some(c) = k(args[0]) {
-                    off += c as i64;
+                    off = off.checked_add(c as i64)?;
                     v = args[1];
                 } else {
                     return None;

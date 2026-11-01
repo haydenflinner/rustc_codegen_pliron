@@ -66,11 +66,13 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # whose return value covers only part of the slot (26212, 26694), and load
 # PRE's iso-aware "clobbered earlier in this block" check (27992), and
 # celim's signed nowrap test for a downward offset (27004), and webmerge
-# closing a cycle in its param map (30177, compile hang), 2026-11-01.
+# closing a cycle in its param map (30177, compile hang), and slotmerge's
+# `slot_at` overflowing on a wrapped offset (31625, ICE), 2026-11-01.
 # Stanzas re-run with a default-off pass enabled (`optin:<stanza>` jobs).
 OPTIN_STANZAS = {"bytescan": {"PLIRON_BYTESCAN": "1"}}
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309,
-                13475, 16782, 16787, 16980, 17028, 18889, 24242, 26212, 26694, 27004, 27992, 30177]
+                13475, 16782, 16787, 16980, 17028, 18889, 24242, 26212, 26694, 27004, 27992, 30177,
+                31625]
 
 
 def shell(cmd):

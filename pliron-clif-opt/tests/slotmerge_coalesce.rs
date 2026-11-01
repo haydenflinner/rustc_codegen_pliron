@@ -116,3 +116,29 @@ block1(v9: i64):
 }");
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "not coalesced:\n{}", f.display());
 }
+
+/// Wrapped address arithmetic (dead in the source program) overflows the
+/// offset sum: no panic, and the pair stays (fuzz seed 31625).
+#[test]
+fn overflowing_offset_is_not_a_copy() {
+    let f = run("function %t(i64) {
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 16, align = 8
+    sig0 = (i64)
+    fn0 = %use sig0
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    store.i64 v0, v1
+    store.i64 v0, v1+8
+    call fn0(v1)
+    v2 = stack_addr.i64 ss1
+    v5 = iconst.i64 0x7fff_ffff_ffff_fff8
+    v6 = iadd v1, v5
+    v3 = load.i64 v6+8
+    v7 = iadd v2, v5
+    store.i64 v3, v7+8
+    call fn0(v2)
+    return
+}");
+    assert_eq!(mem_ops(&f), 4, "copy through a wrapped offset removed:\n{}", f.display());
+}
