@@ -39,6 +39,12 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     // copy still resolves calls made by *other* copies (LLVM's ThinLTO
     // internalizes them the same way); `predefine_fn` marks the copy
     // `no_inline` so the semantics hold — calls stay calls.
+    // `#[cold]` fns are copied too, like `InlineAttr::Never` ones: a copy
+    // resolves calls made by other copies (`Vec::reserve` calls the cold
+    // `do_reserve_and_handle`, internal to its home CGU, so `reserve`
+    // itself was uncoverable). The inliner still charges cold callees
+    // double. Opt-in: `PLIRON_XCGU_COLD=1`.
+    let bad = if crate::env_is("PLIRON_XCGU_COLD", "1") { bad - F::COLD } else { bad };
     if a.flags.intersects(bad)
         || a.symbol_name.is_some()
         || a.linkage.is_some()
@@ -119,6 +125,59 @@ fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
                 50
             },
         )
+}
+
+/// `PLIRON_XCGU_PROMOTE=1`: symbols of Internal fns defined in exactly
+/// one CGU (not local copies) that some copyable fn calls but that can't
+/// be copied themselves (too big, `#[cold]` chains, ...). Their home CGU
+/// defines them hidden-external instead, ThinLTO's promotion of imported
+/// functions' locals, so copies elsewhere bind to them: `Vec::reserve`
+/// was uncoverable because `do_reserve_and_handle` -> `grow_amortized`
+/// were internal to one CGU, and pulldown's `HtmlWriter::run` called it
+/// at 30 sites. Computed once per crate.
+pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
+    static P: std::sync::OnceLock<FxHashSet<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let mut out = FxHashSet::default();
+        if !crate::env_is("PLIRON_XCGU_PROMOTE", "1") {
+            return out;
+        }
+        let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+        if parts.len() <= 1 {
+            return out;
+        }
+        let limit = size_limit(tcx);
+        // item -> (linkage, inlined, partitions holding it)
+        let mut home: FxHashMap<MonoItem<'tcx>, (Linkage, bool, u32)> = FxHashMap::default();
+        for p in parts {
+            for (&item, data) in p.items() {
+                let e = home.entry(item).or_insert((data.linkage, data.inlined, 0));
+                e.2 += 1;
+            }
+        }
+        for p in parts {
+            for &item in p.items().keys() {
+                let MonoItem::Fn(c) = item else { continue };
+                if !copyable(tcx, c, limit) {
+                    continue;
+                }
+                for u in used(tcx, c).unwrap_or(&[]) {
+                    let MonoItem::Fn(d) = u.node else { continue };
+                    if matches!(home.get(&u.node), Some((Linkage::Internal, false, 1)))
+                        && needs_body(tcx, &u.node)
+                        && !copyable(tcx, d, limit)
+                    {
+                        out.insert(tcx.symbol_name(d).name.to_string());
+                    }
+                }
+            }
+        }
+        out
+    })
+}
+
+fn is_promoted<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
+    matches!(m, MonoItem::Fn(i) if promoted(tcx).contains(tcx.symbol_name(*i).name))
 }
 
 /// Instances from other CGUs to define here as internal copies.
@@ -407,7 +466,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             other
                 .items()
                 .iter()
-                .filter(|(_, data)| matches!(data.linkage, Linkage::External))
+                .filter(|(item, data)| matches!(data.linkage, Linkage::External) || is_promoted(tcx, item))
                 .map(|(&item, _)| item)
         })
         .collect();
@@ -458,7 +517,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         for other in parts {
             for m in &needed {
                 if let Some(d) = other.items().get(m)
-                    && matches!(d.linkage, Linkage::External)
+                    && (matches!(d.linkage, Linkage::External) || is_promoted(tcx, m))
                 {
                     visible.insert(*m);
                 }

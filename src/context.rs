@@ -568,6 +568,14 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
     ) {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
+        // Promoted for other CGUs' local copies (`xcgu::promoted`).
+        let (linkage, visibility) = if matches!(linkage, RLinkage::Internal)
+            && crate::xcgu::promoted(self.tcx).contains(symbol_name)
+        {
+            (RLinkage::External, Visibility::Hidden)
+        } else {
+            (linkage, visibility)
+        };
         self.declare_fn_sym(symbol_name, ty, map_linkage(linkage, visibility), exts);
         use rustc_attr_ir::InlineAttr;
         let inline = self.tcx.codegen_instance_attrs(instance.def).inline.clone();
