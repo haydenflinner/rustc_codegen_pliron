@@ -12,7 +12,7 @@ use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::FuncRef;
 use cranelift_codegen::ir::{
-    Block, Function, Inst, InstructionData, Opcode, StackSlot, Type, Value, ValueDef,
+    Block, Function, Inst, InstBuilder, InstructionData, Opcode, StackSlot, Type, Value, ValueDef, types,
 };
 use crate::vmap::VMap;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -29,6 +29,27 @@ const MAX_ITERS: usize = 32;
 enum Fwd {
     V(Value),
     Sel { c: Value, t: Value, e: Value },
+    /// Bits `shift..shift + bits(mty)` of a wider stored integer `v`,
+    /// extended to the load's result type when it differs (`uloadN`/
+    /// `sloadN`, `signed` for the latter). Little-endian.
+    Narrow { v: Value, shift: u32, mty: Type, signed: bool },
+}
+
+/// An available integer covering `[off, off + bytes)` of root `r` from a
+/// wider store: `(value, bit shift)`. regex's `cached_state` stored an
+/// `ip: usize` to a stack slot and reloaded its low half (`u32::try_from`).
+fn narrow_src(func: &Function, av: &Avail, r: Root, off: i64, bytes: u32) -> Option<(Value, u32)> {
+    av.iter().find_map(|(&(r2, o2, t2), &v)| {
+        (r2 == r
+            && t2.is_int()
+            && !t2.is_vector()
+            && t2.bits() <= 64
+            && t2.bytes() > bytes
+            && func.dfg.value_type(v) == t2
+            && o2 <= off
+            && off + i64::from(bytes) <= o2 + i64::from(t2.bytes()))
+        .then(|| (v, ((off - o2) * 8) as u32))
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -849,6 +870,14 @@ fn transfer(
                     if let Some(rw) = rw.as_deref_mut() {
                         rw.push((i, Fwd::V(v)));
                     }
+                } else if *NARROW
+                    && ty.is_int()
+                    && !ty.is_vector()
+                    && let Some(rw) = rw.as_deref_mut()
+                    && let Some((v, shift)) = narrow_src(func, av, r, off, ty.bytes())
+                {
+                    rw.push((i, Fwd::Narrow { v, shift, mty: ty, signed: false }));
+                    av.insert(loc, res);
                 } else if let Some(s) = rw
                     .is_some()
                     .then(|| sel_split(func, ps, na, av, arg, off, ty))
@@ -857,6 +886,30 @@ fn transfer(
                     rw.as_deref_mut().unwrap().push((i, s));
                 } else if av.len() < MAX_ENTRIES {
                     av.insert(loc, res);
+                }
+            }
+            // `uloadN`/`sloadN` of an available value (exact width, or the
+            // low/high part of a wider store): extract and extend.
+            InstructionData::Load { opcode: lop, arg, offset, .. }
+                if *NARROW
+                    && rw.is_some()
+                    && notrap(func, i)
+                    && matches!(
+                        lop,
+                        Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32 | Opcode::Sload8 | Opcode::Sload16 | Opcode::Sload32
+                    ) =>
+            {
+                let mty = match lop {
+                    Opcode::Uload8 | Opcode::Sload8 => types::I8,
+                    Opcode::Uload16 | Opcode::Sload16 => types::I16,
+                    _ => types::I32,
+                };
+                let signed = matches!(lop, Opcode::Sload8 | Opcode::Sload16 | Opcode::Sload32);
+                let (r, o) = nm.pair(func, ps, na, arg).1;
+                let off = o.wrapping_add(i64::from(i32::from(offset)));
+                let hit = av.get(&(r, off, mty)).map(|&v| (v, 0)).or_else(|| narrow_src(func, av, r, off, mty.bytes()));
+                if let Some((v, shift)) = hit {
+                    rw.as_deref_mut().unwrap().push((i, Fwd::Narrow { v, shift, mty, signed }));
                 }
             }
             InstructionData::Store {
@@ -1304,6 +1357,22 @@ pub fn run_deref(
                 func.layout.insert_inst(sel, i);
                 func.dfg.first_result(sel)
             }
+            Fwd::Narrow { v, shift, mty, signed } => {
+                let rty = func.dfg.value_type(r);
+                let mut pos = cranelift_codegen::cursor::FuncCursor::new(func).at_inst(i);
+                use cranelift_codegen::cursor::Cursor;
+                let mut x = v;
+                if shift > 0 {
+                    x = pos.ins().ushr_imm_s(x, i64::from(shift));
+                }
+                if pos.func.dfg.value_type(x) != mty {
+                    x = pos.ins().ireduce(mty, x);
+                }
+                if rty != mty {
+                    x = if signed { pos.ins().sextend(rty, x) } else { pos.ins().uextend(rty, x) };
+                }
+                x
+            }
         };
         func.layout.remove_inst(i);
         func.dfg.clear_results(i);
@@ -1420,6 +1489,11 @@ fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>,
     }
     may_write(w, ms, l)
 }
+
+/// `PLIRON_LOADFWD_NARROW=0` disables forwarding a narrower or extending
+/// load from a wider stored value.
+static NARROW: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_LOADFWD_NARROW", "0"));
 
 static LOADPRE_DEBUG: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("PLIRON_LOADPRE_DEBUG").is_some());
