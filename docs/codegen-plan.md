@@ -370,7 +370,11 @@ Evening (2026-10-31):
   `stp q0, q0` x2 per trip; we unroll x8 with a test per copy. Needed:
   multi-exit trip counts (a counted pre-loop of `umin(...)` trips that
   falls into the original loop for the last exit), then loopidiom or
-  loopvec on the single-exit pre-loop.
+  loopvec on the single-exit pre-loop. Done (2026-11-01): `mintrip`
+  builds that pre-loop (umin of per-exit lower bounds, rotated, counted
+  on a unit-step param, exit values rebuilt as `p0 + s*T`), and
+  loopidiom/loopvec address by any lockstep param; the fill is a
+  2 x i64 loopvec loop and blind-sig 1.113 -> 1.081.
 - **Small memcmp** (opt-in `memcmpk`, after `ifconv2`): `memcmp`/`bcmp`
   with a constant `n <= 16` inline (exact sign for 1/2/4/8 via
   byte-swapped loads; others under zero tests only). pulldown's
@@ -381,7 +385,14 @@ Evening (2026-10-31):
   other CGUs still see `reserve` as an import with no body: the xcgu
   copier can't copy it because `do_reserve_and_handle` is `#[cold]`
   (excluded) and internal to its home CGU; allowing cold copies wasn't
-  enough on its own (still 45 calls), not chased further.
+  enough on its own (still 45 calls), not chased further. memcmpk,
+  `bittab2` (with `bittab` looking through single-pred params) and
+  `demand` (xor constants under demanded-bits masks, serde_json's SWAR
+  scan) went default in c9c6b6d with bytescan: held-out 1.211 -> 1.192
+  (pulldown 1.303 -> 1.228, rust-json 1.245 -> 1.167; compression, a
+  check-set bench, 1.322 -> 1.344). diffcheck now runs user-symbol
+  `memcmp` like the libcall (`Facts::memcmp`): before, every memcmpk
+  expansion of a `compare_bytes` call replayed as a false mismatch.
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
   byte-set scans over constant tables (pulldown's `escape_html_scalar`
   -2.2% on dense input; 3.5x on a sparse repro), with table bytes from
