@@ -1136,15 +1136,36 @@ pub fn run_deref(
         if *LOADPRE_DEBUG {
             eprintln!("loadpre {}: iso {:?} ncc {:?} escapes {:?}", func.name, iso, ncc, _escapes.keys().collect::<Vec<_>>());
         }
-        n += pre(
-            func, ps, &stop, noalias, cfg, &rpo, entry, &iso, &ncc, pbnd, ppm, deref,
-        );
-        tt("pre", t0);
-        if n > 0 {
+        // Later rounds see the loads earlier ones inserted: PRE around an
+        // inner loop leaves them in its preheader, below the outer header,
+        // and only another round carries them around the outer loop
+        // (regex's `follow_epsilons` reloaded its `&mut SparseSet`'s
+        // fields every outer iteration). `PLIRON_LOADPRE_ROUNDS`, default 1.
+        let rounds: usize = crate::env_get("PLIRON_LOADPRE_ROUNDS").and_then(|r| r.parse().ok()).unwrap_or(1);
+        for _ in 0..rounds.max(1) {
+            let k = pre(
+                func,
+                ps,
+                &stop,
+                noalias,
+                cfg2.as_ref().unwrap_or(cfg),
+                &rpo,
+                entry,
+                &iso,
+                &ncc,
+                pbnd,
+                ppm,
+                deref,
+            );
+            n += k;
+            if k == 0 {
+                break;
+            }
             let c = ControlFlowGraph::with_function(func);
             rpo = rpo_of(&c);
             cfg2 = Some(c);
         }
+        tt("pre", t0);
     }
     let cfg: &ControlFlowGraph = cfg2.as_ref().unwrap_or(cfg);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
@@ -1385,6 +1406,21 @@ pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     }
 }
 
+/// `may_write` under `kill_st`'s full keep rule: a store to another root
+/// can't reach an isolated or bounded-escape (`ncc`) root's memory, nor
+/// can a store to such a root reach anything else. PRE's "clobbered
+/// earlier in this block?" check must agree with the availability sets
+/// it was computed against, or a store to an unrelated `Vec` header
+/// (`v25+152` in regex's `follow_epsilons`) blocks PRE of a `noalias`
+/// param's fields.
+fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>, ncc: &FxHashSet<Root>) -> bool {
+    let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
+    if w.0 != l.0 && (shel(&w.0) || shel(&l.0)) {
+        return false;
+    }
+    may_write(w, ms, l)
+}
+
 static LOADPRE_DEBUG: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("PLIRON_LOADPRE_DEBUG").is_some());
 static LOADPRE_UP: std::sync::LazyLock<bool> =
@@ -1496,6 +1532,9 @@ fn edge_pre(
         return None;
     }
     if pre.inserted.len() + missing.len() > MAX_INSERTS {
+        if *LOADPRE_DEBUG {
+            eprintln!("  bail: MAX_INSERTS ({})", pre.inserted.len());
+        }
         return None;
     }
     let InstructionData::Load {
@@ -1526,6 +1565,9 @@ fn edge_pre(
                 Opcode::Jump | Opcode::Brif | Opcode::BrTable
             )
         {
+            if *LOADPRE_DEBUG {
+                eprintln!("  bail: {p} terminator {:?}", func.dfg.insts[pinst].opcode());
+            }
             return None;
         }
         let only_b = func.dfg.insts[pinst]
@@ -1533,17 +1575,29 @@ fn edge_pre(
             .iter()
             .all(|c| c.block(&func.dfg.value_lists) == b);
         if !only_b && !speculatable {
+            if *LOADPRE_DEBUG {
+                eprintln!("  bail: {p} not only-b and not speculatable");
+            }
             return None;
         }
         if dom.is_none() {
             *dom = Some(DominatorTree::with_function(func, cfg));
         }
-        let ok = match func.dfg.value_def(arg) {
+        let dominates = |v: Value| match func.dfg.value_def(v) {
             ValueDef::Result(di, _) => dom.as_ref().unwrap().try_dominates(di, pinst, &func.layout),
             ValueDef::Param(db, _) => dom.as_ref().unwrap().try_dominates(db, pinst, &func.layout),
             _ => false,
         };
+        // The address may be `base + k` computed inside the loop: rebuild
+        // it from a dominating `base` in the inserted load's offset.
+        let ok = dominates(arg) || {
+            let (base, k) = peel_const(func, arg);
+            dominates(base) && i32::try_from(k + i64::from(i32::from(offset))).is_ok()
+        };
         if !ok {
+            if *LOADPRE_DEBUG {
+                eprintln!("  bail: address doesn't dominate {p}");
+            }
             return None;
         }
     }
@@ -1557,6 +1611,18 @@ fn edge_pre(
         }
     };
     for &(p, pinst) in &missing {
+        let d = dom.as_ref().unwrap();
+        let dom_arg = match func.dfg.value_def(arg) {
+            ValueDef::Result(di, _) => d.try_dominates(di, pinst, &func.layout),
+            ValueDef::Param(db, _) => d.try_dominates(db, pinst, &func.layout),
+            _ => false,
+        };
+        let (arg, offset) = if dom_arg {
+            (arg, offset)
+        } else {
+            let (base, k) = peel_const(func, arg);
+            (base, cranelift_codegen::ir::immediates::Offset32::new(i32::try_from(k + i64::from(i32::from(offset))).unwrap()))
+        };
         let li = func.dfg.make_inst(InstructionData::Load {
             opcode: Opcode::Load,
             arg,
@@ -1568,6 +1634,31 @@ fn edge_pre(
         pre.inserted.insert((b, loc, p), func.dfg.first_result(li));
     }
     Some(v)
+}
+
+/// `v` as `base + k` through `iadd` by constants (either operand order).
+fn peel_const(func: &Function, v: Value) -> (Value, i64) {
+    let (mut v, mut k) = (func.dfg.resolve_aliases(v), 0i64);
+    for _ in 0..8 {
+        let Some(i) = func.dfg.value_def(v).inst() else { break };
+        let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] else { break };
+        let c = |x: Value| match func.dfg.value_def(func.dfg.resolve_aliases(x)).inst().map(|j| &func.dfg.insts[j]) {
+            Some(InstructionData::UnaryImm { opcode: Opcode::Iconst, imm }) => Some(imm.bits()),
+            _ => None,
+        };
+        match (c(args[0]), c(args[1])) {
+            (_, Some(n)) => {
+                k = k.wrapping_add(n);
+                v = func.dfg.resolve_aliases(args[0]);
+            }
+            (Some(n), _) => {
+                k = k.wrapping_add(n);
+                v = func.dfg.resolve_aliases(args[1]);
+            }
+            _ => break,
+        }
+    }
+    (v, k)
 }
 
 /// Load forwarding with PRE at joins (LLVM GVN's load PRE / LICM scalar
@@ -1769,7 +1860,7 @@ fn pre(
                             }
                         }
                     } else if !clobbered
-                        && writes.iter().all(|&(w, ms)| !may_write(w, ms, loc))
+                        && writes.iter().all(|&(w, ms)| !may_write_iso(w, ms, loc, iso, ncc))
                         && let Some(v) =
                             edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves))
                     {
