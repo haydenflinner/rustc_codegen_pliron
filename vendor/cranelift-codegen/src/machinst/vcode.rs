@@ -861,6 +861,266 @@ impl<I: VCodeInst> VCode<I> {
         Some((BlockIndex::new(sb), full))
     }
 
+    /// PLIRON: reload PRE (`PLIRON_RELOADPRE=1`). regalloc2 puts
+    /// a spilled value's reload right before each use, so a value spilled
+    /// across a loop's cold path (a call) is reloaded on every trip around
+    /// the hot path even when its register survives the trip (serde_json's
+    /// escape scan rebuilt its table address per byte). A reload `R <- [S]`
+    /// in block B, with nothing earlier in B touching R or writing S, is
+    /// redundant along a predecessor that already ends with R holding the
+    /// value. When at least one predecessor does, the reload moves to the
+    /// ends of the others. Those are single-successor blocks (a block with
+    /// several predecessors has no critical in-edges), so each runs at most
+    /// as often as B and no path executes more loads. Returns the rewritten
+    /// allocation, or `None` when nothing moved.
+    pub(crate) fn reload_pre(&self, ra: &regalloc2::Output) -> Option<regalloc2::Output> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RELOADPRE").as_deref() == Ok("1"))
+            || !self.debug_value_labels.is_empty()
+            || ra.edits.is_empty()
+        {
+            return None;
+        }
+        #[derive(Clone, Copy)]
+        enum It {
+            I(usize),
+            E(usize),
+        }
+        let nb = self.num_blocks();
+        let mut items: Vec<Vec<It>> = Vec::with_capacity(nb);
+        for b in 0..nb {
+            let r = self.block_ranges.get(b);
+            let mut v = Vec::with_capacity(r.len() + 4);
+            let mut e = ra
+                .edits
+                .partition_point(|&(p, _)| p < ProgPoint::before(InsnIndex::new(r.start)));
+            for i in r.clone() {
+                let ii = InsnIndex::new(i);
+                while e < ra.edits.len() && ra.edits[e].0 <= ProgPoint::before(ii) {
+                    v.push(It::E(e));
+                    e += 1;
+                }
+                v.push(It::I(i));
+                while e < ra.edits.len() && ra.edits[e].0 <= ProgPoint::after(ii) {
+                    v.push(It::E(e));
+                    e += 1;
+                }
+            }
+            items.push(v);
+        }
+        // Vregs whose reload is a rematerialization (see `remat_def` in
+        // `emit`): any copy of one holds the same value, so the fact to
+        // track is "R was last written with V", whatever happens to S.
+        let mut remat = crate::FxHashSet::default();
+        if std::env::var("PLIRON_REMAT").as_deref() != Ok("0") && !ra.edit_vregs.is_empty() {
+            let probe = Writable::from_reg(Reg::from(regalloc2::PReg::new(0, regalloc2::RegClass::Int)));
+            for (i, inst) in self.insts.iter().enumerate() {
+                if inst.rematerialize(probe).is_none() {
+                    continue;
+                }
+                if let [op] = &self.operands[self.operand_ranges.get(i)]
+                    && op.kind() == OperandKind::Def
+                {
+                    remat.insert(op.vreg().vreg());
+                }
+            }
+        }
+        let vreg_of = |e: usize| ra.edit_vregs.get(e).copied().flatten();
+        let ops = |i: usize| {
+            self.operands[self.operand_ranges.get(i)]
+                .iter()
+                .zip(ra.inst_allocs(InsnIndex::new(i)))
+        };
+        let inst_writes = |i: usize, r: Option<PReg>, s: Option<regalloc2::SpillSlot>| {
+            (r.is_some_and(|r| self.inst_clobbers(InsnIndex::new(i)).contains(r)))
+                || ops(i).any(|(op, a)| {
+                    op.kind() == OperandKind::Def
+                        && ((r.is_some() && a.as_reg() == r) || (s.is_some() && a.as_stack() == s))
+                })
+        };
+        // What `b` does to the fact, scanning back from its end: `Some(true)`
+        // establishes it, `Some(false)` kills it, `None` passes it through.
+        let local = |b: usize, r: PReg, s: regalloc2::SpillSlot, v: Option<VReg>| -> Option<bool> {
+            let rm = v.filter(|v| remat.contains(&v.vreg()));
+            for &it in items[b].iter().rev() {
+                match it {
+                    It::E(e) => {
+                        let Edit::Move { from, to } = ra.edits[e].1;
+                        if let Some(v) = rm {
+                            if to.as_reg() == Some(r) {
+                                return Some(vreg_of(e) == Some(v));
+                            }
+                        } else if to.as_reg() == Some(r) {
+                            return Some(from.as_stack() == Some(s));
+                        } else if to.as_stack() == Some(s) {
+                            return Some(from.as_reg() == Some(r));
+                        }
+                    }
+                    It::I(i) => {
+                        if let Some(v) = rm {
+                            if inst_writes(i, Some(r), None) {
+                                let def_v = ops(i).any(|(op, a)| {
+                                    op.kind() == OperandKind::Def && a.as_reg() == Some(r) && op.vreg() == v
+                                });
+                                return Some(
+                                    def_v && !self.inst_clobbers(InsnIndex::new(i)).contains(r),
+                                );
+                            }
+                        } else if inst_writes(i, Some(r), Some(s)) {
+                            return Some(false);
+                        }
+                    }
+                }
+            }
+            None
+        };
+        const REGION: usize = 64;
+        let mut dead = crate::FxHashSet::default();
+        let mut added: Vec<(ProgPoint, Edit, Option<VReg>)> = vec![];
+        let mut budget = 512usize;
+        for b in 0..nb {
+            let preds = self.block_preds(BlockIndex::new(b));
+            if BlockIndex::new(b) == self.entry || preds.is_empty() {
+                continue;
+            }
+            let mut touched = PRegSet::empty();
+            let mut wslots = crate::FxHashSet::default();
+            for &it in &items[b] {
+                match it {
+                    It::E(e) => {
+                        let Edit::Move { from, to } = ra.edits[e].1;
+                        if let (Some(s), Some(r)) = (from.as_stack(), to.as_reg())
+                            && !touched.contains(r)
+                            && !wslots.contains(&s)
+                            && budget > 0
+                        {
+                            budget -= 1;
+                            let v = vreg_of(e);
+                            // Greatest fixpoint of "R holds it at the end"
+                            // over the blocks reachable backward from the
+                            // predecessors through pass-through blocks.
+                            let mut val: crate::FxHashMap<usize, bool> = crate::FxHashMap::default();
+                            let mut work: Vec<usize> = preds.iter().map(|p| p.index()).collect();
+                            let mut through = vec![];
+                            let mut ok = true;
+                            while let Some(x) = work.pop() {
+                                if val.contains_key(&x) {
+                                    continue;
+                                }
+                                if val.len() >= REGION {
+                                    ok = false;
+                                    break;
+                                }
+                                match local(x, r, s, v) {
+                                    Some(g) => {
+                                        val.insert(x, g);
+                                    }
+                                    None => {
+                                        let xp = self.block_preds(BlockIndex::new(x));
+                                        let entry = BlockIndex::new(x) == self.entry || xp.is_empty();
+                                        val.insert(x, !entry);
+                                        if !entry {
+                                            through.push(x);
+                                            work.extend(xp.iter().map(|p| p.index()));
+                                        }
+                                    }
+                                }
+                            }
+                            if ok {
+                                loop {
+                                    let mut changed = false;
+                                    for &x in &through {
+                                        if val[&x]
+                                            && self
+                                                .block_preds(BlockIndex::new(x))
+                                                .iter()
+                                                .any(|p| !val[&p.index()])
+                                        {
+                                            val.insert(x, false);
+                                            changed = true;
+                                        }
+                                    }
+                                    if !changed {
+                                        break;
+                                    }
+                                }
+                                let have: Vec<bool> = preds.iter().map(|p| val[&p.index()]).collect();
+                                let movable = have.iter().any(|&h| h)
+                                    && preds.iter().zip(&have).all(|(p, &h)| {
+                                        h || {
+                                            let pr = self.block_ranges.get(p.index());
+                                            let t = pr.end - 1;
+                                            self.block_succs(*p).len() == 1
+                                                && self.insts[t].is_term() == MachTerminator::Branch
+                                                && !ops(t).any(|(_, a)| a.as_reg() == Some(r))
+                                        }
+                                    });
+                                if movable {
+                                    dead.insert(e);
+                                    for (p, &h) in preds.iter().zip(&have) {
+                                        if !h {
+                                            let t = self.block_ranges.get(p.index()).end - 1;
+                                            added.push((
+                                                ProgPoint::before(InsnIndex::new(t)),
+                                                Edit::Move { from, to },
+                                                v,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(r) = from.as_reg() {
+                            touched.add(r);
+                        }
+                        if let Some(r) = to.as_reg() {
+                            touched.add(r);
+                        }
+                        if let Some(s) = to.as_stack() {
+                            wslots.insert(s);
+                        }
+                    }
+                    It::I(i) => {
+                        touched.union_from(self.inst_clobbers(InsnIndex::new(i)));
+                        for (op, a) in ops(i) {
+                            if let Some(r) = a.as_reg() {
+                                touched.add(r);
+                            }
+                            if op.kind() == OperandKind::Def
+                                && let Some(s) = a.as_stack()
+                            {
+                                wslots.insert(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if dead.is_empty() {
+            return None;
+        }
+        if *DEBUG.get_or_init(|| std::env::var_os("PLIRON_RELOADPRE_DEBUG").is_some()) {
+            eprintln!("reload_pre: moved {} reloads, {} inserted", dead.len(), added.len());
+        }
+        let has_v = !ra.edit_vregs.is_empty();
+        let mut all: Vec<(ProgPoint, Edit, Option<VReg>)> = ra
+            .edits
+            .iter()
+            .enumerate()
+            .filter(|(e, _)| !dead.contains(e))
+            .map(|(e, (p, ed))| (*p, ed.clone(), vreg_of(e)))
+            .collect();
+        all.extend(added);
+        // Stable: an inserted reload lands after the edits already at the
+        // predecessor's end (its edge moves).
+        all.sort_by_key(|x| x.0);
+        let mut out = ra.clone();
+        out.edits = all.iter().map(|(p, ed, _)| (*p, ed.clone())).collect();
+        out.edit_vregs = if has_v { all.iter().map(|x| x.2).collect() } else { vec![] };
+        Some(out)
+    }
+
     /// PLIRON: fill `remat_vregs` (see the field) before regalloc, and
     /// pick up shrink-wrapping's split block.
     pub fn compute_remat_vregs(&mut self) {
@@ -1071,6 +1331,14 @@ impl<I: VCodeInst> VCode<I> {
         I: VCodeInst,
     {
         let _tt = timing::vcode_emit();
+        let pre_out;
+        let regalloc = match self.reload_pre(regalloc) {
+            Some(o) => {
+                pre_out = o;
+                &pre_out
+            }
+            None => regalloc,
+        };
         let mut buffer = MachBuffer::new();
         buffer.set_log2_min_function_alignment(self.log2_min_function_alignment);
         let mut bb_starts: Vec<Option<CodeOffset>> = vec![];

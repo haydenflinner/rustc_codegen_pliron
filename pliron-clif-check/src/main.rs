@@ -151,6 +151,10 @@ fn main() -> ExitCode {
             ctx.set_disasm(true);
             let c = ctx.compile(&*isa, &mut cranelift_codegen::control::ControlPlane::default()).expect("compile");
             let v = c.vcode.clone().unwrap_or_default();
+            if std::env::var_os("CLIF_CHECK_POST_EGRAPH").is_some() {
+                // The function as Cranelift lowered it (after its egraph).
+                println!("{}", ctx.func.display());
+            }
             let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&ctx.func);
             let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&ctx.func, &cfg);
             let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();

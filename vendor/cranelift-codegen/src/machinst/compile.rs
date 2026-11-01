@@ -244,6 +244,17 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             })
             .expect("register allocation checker");
     }
+    // PLIRON: `PLIRON_RELOADPRE_CHECK=1` runs the checker on the
+    // allocation as `reload_pre` rewrites it at emission.
+    if std::env::var_os("PLIRON_RELOADPRE_CHECK").is_some()
+        && let Some(out) = vcode.reload_pre(&regalloc_ctx.output)
+    {
+        let mut checker = regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env());
+        checker.prepare(&out);
+        if let Err(err) = checker.run() {
+            panic!("reload_pre: checker errors in {}:\n{err:?}", f.name);
+        }
+    }
 
     Ok(vcode)
 }
