@@ -409,3 +409,12 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   sum is checked and out-of-slot offsets are no known address.
 - Fuzz 31000:33000: that ICE, and one compile error that was earlyoom
   killing rustc during a concurrent build (passes on rerun).
+- Fuzz 33800:35800 with `PLIRON_RELOADPRE_CHECK=1`: 2000/2000 pass.
+- **pulldown's `scan_nextline`** (opt-in knobs, 583aff9):
+  `PLIRON_INLINE_FREEMAX=512` keeps memchr's 809-op search closure out
+  of `search_slice_with_raw` (as LLVM does), and `PLIRON_XCGU_ALWAYS=1`
+  lets inline(always) bodies be cross-CGU copies at any size; together
+  pulldown has no `scan_nextline` calls left. Interleaved (7 rounds):
+  pulldown 1.195 -> 1.184 median but equal minimum, json -0.2%, blind-sig
+  and regex noisy, blake3 equal. Not a clear win; both stay off.
+  `append_text` needs the callee-simplification work (codegen-plan).
