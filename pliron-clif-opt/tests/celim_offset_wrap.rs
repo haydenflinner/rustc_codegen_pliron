@@ -74,3 +74,32 @@ block2:
     });
     assert!(folded, "expected `y + 1 <=u x` folded to true:\n{}", f.display());
 }
+
+/// Signed self-compare `x s< x - 94` under `x == i64::MIN`: `x - 94`
+/// wraps to a large positive value, so the compare is true. `snnowrap`
+/// checked the downward offset as `l - d >= smin` (always true for
+/// `d < 0`) and celim folded it to false (fuzz seed 27004).
+#[test]
+fn signed_self_compare_with_wrapping_decrement_is_not_folded() {
+    let src = "function %t(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 0x8000_0000_0000_0000
+    v3 = icmp eq v0, v2
+    brif v3, block1, block2
+block1:
+    v4 = iconst.i64 -94
+    v5 = iadd v0, v4
+    v6 = icmp slt v0, v5
+    return v6
+block2:
+    v7 = iconst.i8 7
+    return v7
+}";
+    let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
+    let cases = [(i64::MIN, 0), (5, 0)];
+    let before: Vec<i8> = cases.iter().map(|&(x, y)| eval(&f, x, y)).collect();
+    assert_eq!(before[0], 1);
+    pliron_clif_opt::celim::run(&mut f);
+    let after: Vec<i8> = cases.iter().map(|&(x, y)| eval(&f, x, y)).collect();
+    assert_eq!(after, before, "celim changed the result:\n{}", f.display());
+}

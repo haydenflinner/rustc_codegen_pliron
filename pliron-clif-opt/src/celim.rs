@@ -1398,10 +1398,13 @@ fn snnowrap(func: &Function, fs: &[&Cmp], v: Value, d: i64) -> bool {
         (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
     };
     let (l, h) = srange(func, fs, v, 0).unwrap_or((smin, smax));
+    // `d < 0` moves down: `l + d` must stay at or above `smin` (fuzz seed
+    // 27004: `x == i64::MIN` passed as `x - 94` not wrapping, folding
+    // `x s< x - 94` to false).
     if d > 0 {
         (h as i128) + (d as i128) <= smax as i128
     } else {
-        (l as i128) - (d as i128) >= smin as i128
+        (l as i128) + (d as i128) >= smin as i128
     }
 }
 
