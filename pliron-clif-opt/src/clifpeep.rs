@@ -4055,6 +4055,22 @@ fn merge_dirty(ctx: &WmCtx, merged: &FxHashSet<Block>) -> FxHashSet<Block> {
     d
 }
 
+/// Following `pmap` from `w` reaches `p` (bounded: `pmap` is acyclic by
+/// construction, so more steps than entries means a cycle).
+fn resolves_to(pmap: &FxHashMap<Value, Value>, w: Value, p: Value) -> bool {
+    let mut x = w;
+    for _ in 0..=pmap.len() {
+        if x == p {
+            return true;
+        }
+        match pmap.get(&x) {
+            Some(&c) => x = c,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// `dirty`, when `Some`, restricts the scan to those blocks — used by
 /// the fixpoint callers with `merge_dirty`. A merge at `b` rewrites
 /// only values dominated by `b` (SSA scoping bounds every use of a
@@ -4468,6 +4484,12 @@ pub fn webmerge_ctx(
             if let Some(se) = seed.filter(|_| uniform) {
                 let key = skey_of(se, ix);
                 match member {
+                    // A carrier that already resolves back to `p` through
+                    // earlier merges would close a cycle in `pmap`, and
+                    // every walk of it (phase C's `leaf`, the alias
+                    // rewrite) would spin forever (fuzz seed 30177 hung
+                    // the compile).
+                    Some(w) if resolves_to(&pmap, w, p) => continue,
                     Some(w) => {
                         pmap.insert(p, w);
                     }
@@ -4973,8 +4995,14 @@ pub fn webmerge_ctx(
                 rounds += 1;
                 let leaf = |w: Value| -> Value {
                     let mut w = w;
+                    let mut steps = 0;
                     while let Some(&c) = pmap.get(&w) {
                         w = c;
+                        steps += 1;
+                        debug_assert!(steps <= pmap.len(), "pmap cycle");
+                        if steps > pmap.len() {
+                            break;
+                        }
                     }
                     vmap.get(&w)
                         .and_then(|&i| cls.get(&(i as usize)))
@@ -11341,7 +11369,9 @@ mod tests {
     /// `a`'s: dropping both maps each param onto the other, a replacement
     /// cycle with no survivor — the old chase left `w` on a dropped param
     /// and `remove_block_param` detached it under the icmp uses (stage2
-    /// ICE'd `argument v… is not attached` on rustc_middle et al).
+    /// ICE'd `argument v… is not attached` on rustc_middle et al). Phase A
+    /// now refuses the second mapping (`resolves_to`, seed 30177), so one
+    /// param merges into the other and exactly one survives.
     #[test]
     fn cyclic_param_drops_keep_a_survivor() {
         let mut sig = Signature::new(CallConv::Fast);
@@ -11371,8 +11401,12 @@ mod tests {
         cur.ins().jump(a, &[pb.into()]);
 
         sameargs(&mut func);
-        assert_eq!(func.dfg.block_params(a).len(), 1);
-        assert_eq!(func.dfg.block_params(b).len(), 1);
+        assert_eq!(
+            func.dfg.block_params(a).len() + func.dfg.block_params(b).len(),
+            1,
+            "{}",
+            func.display()
+        );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("sameargs produced invalid IR: {e}\n{}", func.display());

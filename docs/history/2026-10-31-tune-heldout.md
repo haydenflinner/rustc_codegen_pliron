@@ -332,6 +332,13 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   with and without it: block35's load became block27's entry value in
   one and block27's own mid-block reload in the other. All five seeds of
   the night are in the gate's `FUZZ_REGRESS`.
+- **Third 2000-seed sweep** (29000:31000, on 01b6433): no
+  miscompile; one compile hang (seed 30177, stock compiles in 1 s).
+  lldb on the stuck rustc showed `sameargs` -> `webmerge_ctx` spinning
+  in phase C's `pmap` walk: phase A mapped a param to an edge-arg
+  carrier that already resolved back to it, closing a cycle. Phase A
+  now refuses such a carrier (`resolves_to`), and the walk is bounded
+  with a debug assertion. The seed compiles in 3 s with the stock output.
 - **Knob sweeps on the five tuned benches** (interleaved, 8 rounds):
   `PLIRON_INLINE_DUPCOST=1` and `PLIRON_INLINE_COLD=1` both give json
   -2.7% and pulldown +5%; `SCCLIMIT`/`ONCE1` change no binary. Not
