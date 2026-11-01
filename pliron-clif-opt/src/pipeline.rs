@@ -2868,6 +2868,16 @@ fn s_reassoc(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// `(a ⊕ deep) ⊕ shallow` -> `(a ⊕ shallow) ⊕ deep` inside a block, so
+// the most recently computed operand waits for one op (blake3's G).
+fn s_hreassoc(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = hreassoc::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("hreassoc");
+    }
+    k
+}
+
 // Refold loop-carried affine params (i' = i+s on every back
 // edge) onto one anchor IV: `p` becomes `bp + r*i` computed in
 // the loop body instead of a regalloc parallel copy plus an
@@ -4522,6 +4532,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // final chain shapes.
         step("reassoc", "reassoc", Gate::OptIn("PLIRON_REASSOC"), s_reassoc)
             .needs(shape::BPARAM),
+        step("hreassoc", "hreassoc", Gate::OptIn("PLIRON_HREASSOC"), s_hreassoc),
         // i64->i32 low-word demotion — after the late folds so their
         // residuals demote too, before coldret so block layout is final.
         // Last, once sameargs/edge folds left the loop-entry arg a plain 0.

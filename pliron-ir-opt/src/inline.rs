@@ -1179,6 +1179,11 @@ pub fn run(
     let loopy_min: usize = crate::env_get("PLIRON_INLINE_LOOPY")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // `PLIRON_INLINE_LOOPY_NATIVE=1` (opt-in): the same rule outside small
+    // mode. A looping callee pasted into a non-loop site moves its loop
+    // into a bigger frame (serde's escape loop in `serialize_field`, regex's
+    // `follow_epsilons` in `next_state`) and saves only the one call.
+    let loopy_native = crate::env_is("PLIRON_INLINE_LOOPY_NATIVE", "1");
     let mut has_loop: FxHashMap<String, bool> = FxHashMap::default();
     // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
@@ -1560,7 +1565,7 @@ pub fn run(
                         && st
                             .invokes.get(op)
                             .is_some_and(|&(_, catch)| catch || !eh_invoke);
-                    let loopy = small
+                    let loopy = (small || loopy_native)
                         && loopy_min > 0
                         && !free
                         && !f.inline_hint
