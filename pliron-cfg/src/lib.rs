@@ -90,6 +90,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // Height reassociation of straight-line chains (blake3's G:
     // 1.158 -> 1.057; docs/history/2026-10-31-tune-heldout.md).
     "PLIRON_HREASSOC",
+    // Late null-test fold for cursors whose inbounds marks were lost
+    // (regex's varint loop; docs/history/2026-10-31-tune-heldout.md).
+    "PLIRON_NFOLD2",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
