@@ -247,3 +247,36 @@ What changed, each A/B'd on the held-out suite (interleaved variants):
   1.27 (docs/codegen-plan.md). A first, pinned-param INLINENN design
   miscompiled regex and html-rewriter in the A/B; the region-scoped
   design replaced it, and pointer-only leaf marking was added.
+
+## Night: replaying region facts, the real pulldown culprit, LLVM's montgomery loop
+
+- **Region facts in the corpus**: `PLIRON_CORPUS` headers gain
+  `diffcheck-bregion/rparent/rnn` and clif-check replays them with
+  stand-in pliron blocks; it also maps the header's callee names back
+  into `fn_names`.
+- **pulldown regression root cause**: `EDGESINK_LOADS`, not BRIFSEL (the
+  1.550 BRIFSEL figure predated the BRIFSEL restriction; a four-way
+  build split showed EDGESINK_LOADS alone 1.295 -> 1.537). Slot reloads
+  after a call in parse_block's byte-scan loop moved onto the loop exit
+  edge; regalloc then kept the scan index in a stack slot (ldr/add/str
+  per byte, 308 -> 667 samples). Loads now sink only onto edges leaving
+  the source block's innermost loop, from blocks without a call.
+- **`ivdown`**: an index used only by its step and an eq/ne exit test
+  counts down to zero; the counter is the brif condition (`sub; cbnz`).
+  Exact under wrapping. Mutation-checked tests; 15,694 corpus functions
+  diffchecked per step with no mismatch.
+- **Default flip** (92bf1ac, batch 20: gate, crates, fuzz 21200:21600):
+  INLINENN, BRIFSEL, IVPTR, EDGESINK_LOADS, IVDOWN. Held-out geomean
+  1.208 vs 1.230 off; blind-sig 1.275 -> 1.156.
+- **Flag twins** (Cranelift patch 91): `add d, a, b` ... `adds xzr, a, b`
+  -> `adds d, a, b`. montgomery's inner loop is LLVM's 11 instructions;
+  blind-sig 1.160 -> 1.113.
+- **Opt-in, measured on one bench each**: `memcmpk` (small constant
+  memcmp inline; pulldown 1.309 -> 1.260), `PLIRON_INLINE_COLDONCE`
+  (no free inlining of single-site `#[cold]` callees), `bittab` through
+  single-pred params plus `PLIRON_BITTAB2` (rust-json 1.261 -> 1.187),
+  `demand` (xor constants under demanded-bits masks; rust-json
+  1.195 -> 1.179).
+- Not pursued: regex's `Utf8Sequences::next` (976 vs 321 instructions,
+  spill reloads) and blake3's message-word reloads (91 loads vs 56 with
+  `ldp`): both are the register-allocation work (W1).
