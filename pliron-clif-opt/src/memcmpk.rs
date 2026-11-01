@@ -1,4 +1,5 @@
-//! Small constant-length `memcmp`/`bcmp` calls inline (`PLIRON_MEMCMPK`).
+//! Small constant-length `memcmp`/`bcmp` calls inline (`PLIRON_MEMCMPK`,
+//! `=0` disables).
 //!
 //! `<[u8]>::eq` and `str::ends_with(char)` reach `memcmp(a, b, len)` with
 //! `len` a runtime value at the intrinsic; the slice-length test makes it

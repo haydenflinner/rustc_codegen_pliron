@@ -3940,7 +3940,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // length by now (`ifconv2`'s const sweep); `loadfwd2`/`dse2`
         // later forward and drop a stack slot holding the compared bytes
         // (`ends_with(char)`).
-        step("memcmpk", "memcmpk", Gate::OptIn("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
+        step("memcmpk", "memcmpk", Gate::Env("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
         cstep(
             "unswitch",
             "unswitch",
@@ -4009,7 +4009,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("ivalign", "ivalign", Gate::Env("PLIRON_IVALIGN"), s_ivalign).needs(shape::LOOPS),
         // Byte-set scans over a constant table: 16 bytes per step (before
         // punroll, which would unroll the scalar scan instead).
-        step("bytescan", "", Gate::OptIn("PLIRON_BYTESCAN"), s_bytescan).needs(shape::LOOPS),
+        step("bytescan", "", Gate::Env("PLIRON_BYTESCAN"), s_bytescan).needs(shape::LOOPS),
         // Scalar unroll of linear counted loops (e.g. ordered float
         // reductions that can't vectorize): K bodies per branch.
         cstep(
@@ -4214,7 +4214,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Membership trees the late threading assembled (serde_json's
         // whitespace skip `x - 9 in {0, 1, 4, 23}` only becomes one chain
         // after brchain/mergechain/jtround).
-        cstep("bittab2", "bittab", Gate::OptIn("PLIRON_BITTAB2"), s_bittab).needs(shape::CONDBR),
+        cstep("bittab2", "bittab", Gate::Env("PLIRON_BITTAB2"), s_bittab).needs(shape::CONDBR),
         // Loops the late threading simplified (an `Option` niche test
         // folded away) can rotate now: top test + `jump` back becomes one
         // bottom `brif`.
@@ -4230,7 +4230,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Xor constants under a constant mask that only reads bits the
         // constant sets (or clears) become `bnot`/the value (SWAR scans);
         // the compile-time egraph then factors the shared operand.
-        step("demand", "demand", Gate::OptIn("PLIRON_DEMAND"), s_demand),
+        step("demand", "demand", Gate::Env("PLIRON_DEMAND"), s_demand),
         // Fold constants any earlier pass left behind — late value folds
         // (dgvn/sameargs) can materialize `iconst`s under `ineg`/`ushr`/
         // `ishl` chains the early clifpeep round never saw (matmul's

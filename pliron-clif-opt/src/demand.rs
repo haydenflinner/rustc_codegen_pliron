@@ -1,4 +1,5 @@
-//! Demanded-bits simplification of xor constants (`PLIRON_DEMAND`).
+//! Demanded-bits simplification of xor constants (`PLIRON_DEMAND`, `=0`
+//! disables).
 //!
 //! SWAR byte scans test only each byte's top bit: serde_json's
 //! `skip_to_escape` builds `(c - 0x20) & !c | (q - 1) & !q | (b - 1) & !b`

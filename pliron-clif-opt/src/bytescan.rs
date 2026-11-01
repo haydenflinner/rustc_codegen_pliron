@@ -1,4 +1,4 @@
-//! Byte-set scan vectorization (`PLIRON_BYTESCAN=1`, aarch64).
+//! Byte-set scan vectorization (`PLIRON_BYTESCAN`, `=0` disables; aarch64).
 //!
 //! `iter().position(|&c| TABLE[c as usize] != 0)` over a constant 256-entry
 //! table whose non-zero entries are a handful of bytes (HTML escaping stops
