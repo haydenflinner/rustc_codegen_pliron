@@ -2971,6 +2971,21 @@ fn s_niche(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// `PLIRON_NFOLD2`: the plain null tests webmerge exposes (regex's
+// `InstPtrs` varint loop tests its byte cursor against null per byte).
+fn s_nfold2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if an.shape_bits(&p.clctx.func) & shape::TESTC == 0 {
+        return 0;
+    }
+    let nn = jumpthread::NonNull::new_ext(&p.clctx.func, an.cfg_dt(&p.clctx.func).0, p.nonnull, p.derived, true);
+    let k = niche::run_with(&mut p.clctx.func, &nn, true);
+    if k > 0 {
+        jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+        p.dump("nfold2");
+    }
+    k
+}
+
 // `brif c` edge args `select(c,a,b)` collapse to an arm — the loop-tail
 // `csel` materializing `select(end?, 0, cursor)` on the edge where
 // `end?` is already known-false.
@@ -4422,6 +4437,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_webmerge,
         )
         .needs(shape::MULTI | shape::BPARAM),
+        step("nfold2", "nfold2", Gate::OptIn("PLIRON_NFOLD2"), s_nfold2),
         // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
         // range unions `(x|d)-k_hi u<w` — rustc's char classification
         // (a-z|A-Z) lands as a 4-branch chain; the offset form is one

@@ -8,7 +8,9 @@
 //! `x <u 0` / `x >=u 0` which need no proof — the whole compare
 //! collapses to `c`, `!c`, or a constant and the select dies.
 //!
-//! `PLIRON_NFOLD=0` disables it.
+//! `PLIRON_NFOLD=0` disables it. `run_with(.., plain)` also folds the bare
+//! `icmp eq/ne p, 0` left once webmerge collapsed such a select to `p`
+//! (step `nfold2`, `PLIRON_NFOLD2`).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -107,20 +109,25 @@ fn canonical_bool(func: &Function, v: Value) -> bool {
     }
 }
 
-fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
+fn fold_of(func: &Function, nn: &NonNull, i: Inst, plain: bool) -> Option<Fold> {
     let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] else {
         return None;
     };
     let (sv, kv) = (args[0], args[1]);
     let k = const64(func, kv)?;
     let bits = func.dfg.value_type(sv).bits();
-    let si = func.dfg.resolved_value_def(sv).inst()?;
-    let InstructionData::Ternary {
-        opcode: Opcode::Select,
-        args: sa,
-    } = func.dfg.insts[si]
-    else {
-        return None;
+    let sel = func.dfg.resolved_value_def(sv).inst().and_then(|si| match func.dfg.insts[si] {
+        InstructionData::Ternary { opcode: Opcode::Select, args } => Some(args),
+        _ => None,
+    });
+    let Some(sa) = sel else {
+        // `plain`: the select already collapsed to its live arm (webmerge
+        // folds `select c, p, 0` to `p` when `p` is 0 exactly on `!c`), so
+        // the compare is the bare null test of a non-null pointer.
+        if !plain || const64(func, sv).is_some() || !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+            return None;
+        }
+        return provable_cmp(func, nn, cond, func.dfg.resolve_aliases(sv), k).map(|r| Fold::K(r as u64));
     };
     let (c, t, f) = (
         func.dfg.resolve_aliases(sa[0]),
@@ -200,11 +207,17 @@ fn fold_of(func: &Function, nn: &NonNull, i: Inst) -> Option<Fold> {
 }
 
 pub fn run(func: &mut Function, nn: &NonNull) -> usize {
+    run_with(func, nn, false)
+}
+
+/// `plain`: also fold `icmp eq/ne p, 0` of a non-null `p` with no select
+/// in between (`PLIRON_NFOLD2`, after webmerge).
+pub fn run_with(func: &mut Function, nn: &NonNull, plain: bool) -> usize {
     let mut n = 0;
     let mut rewrites: Vec<(Inst, Fold)> = Vec::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
-            if let Some(f) = fold_of(func, nn, i) {
+            if let Some(f) = fold_of(func, nn, i, plain) {
                 rewrites.push((i, f));
             }
         }

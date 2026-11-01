@@ -372,6 +372,10 @@ pub struct NonNull<'a> {
     /// width). The i64-only seed left wasm's `Option`-niche `eqz(ptr)`
     /// tests unfolded.
     nn_anyint: bool,
+    /// `new_ext` only: per block, the `(address, offset)` pairs a load or
+    /// store dereferenced in it or its unique-predecessor chain. See
+    /// `deref_step`.
+    deref: Option<FxHashMap<Block, Vec<(Value, i64)>>>,
 }
 
 impl<'a> NonNull<'a> {
@@ -381,12 +385,27 @@ impl<'a> NonNull<'a> {
         loads: &'a FxHashSet<Value>,
         derived: &'a VMap<Value>,
     ) -> Self {
+        Self::new_ext(func, cfg, loads, derived, false)
+    }
+
+    /// `ext` adds two proofs that survive passes which drop `derived`
+    /// marks (`PLIRON_NFOLD2`): an edge's `x + k` after `x` was
+    /// dereferenced on every path to it, and either operand of an
+    /// inbounds `iadd` whose recorded base is gone.
+    pub fn new_ext(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        loads: &'a FxHashSet<Value>,
+        derived: &'a VMap<Value>,
+        ext: bool,
+    ) -> Self {
         let mut nn = NonNull {
             loads,
             derived,
             params: FxHashSet::default(),
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
             nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
+            deref: ext.then(|| deref_chains(func, cfg)),
         };
         if loads.is_empty() {
             return nn;
@@ -524,6 +543,7 @@ impl<'a> NonNull<'a> {
             params,
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
             nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
+            deref: None,
         }
     }
 
@@ -620,7 +640,19 @@ impl<'a> NonNull<'a> {
                         v = b;
                         continue;
                     }
-                    _ => return false,
+                    None => {
+                        // The base was deleted and both operands are
+                        // values: the base is one of them, and an
+                        // inbounds offset from null by a non-zero
+                        // amount is UB, so either operand non-null
+                        // suffices.
+                        if let Some((a, b)) = self.tomb_pair(func, v)
+                            && (self.is_deps(func, a, deps) || self.is_deps(func, b, deps))
+                        {
+                            continue 'terms;
+                        }
+                        return false;
+                    }
                 }
             }
             // Derived chain too deep to prove.
@@ -747,6 +779,9 @@ impl NonNull<'_> {
         if self.is_deps_m(func, v, deps, memo.as_mut()) {
             return true;
         }
+        if self.deref_step(func, t, v) {
+            return true;
+        }
         if d > 6 {
             return false;
         }
@@ -833,6 +868,62 @@ impl NonNull<'_> {
         false
     }
 
+    /// `ext` only: the two value operands of an inbounds `iadd` whose
+    /// recorded base is a tombstone.
+    fn tomb_pair(&self, func: &Function, v: Value) -> Option<(Value, Value)> {
+        self.deref.as_ref()?;
+        let mut b = *self.derived.get(&v)?;
+        for _ in 0..16 {
+            match func.dfg.value_alias_dest_for_serialization(b) {
+                Some(d) if d != Value::reserved_value() => b = d,
+                _ => break,
+            }
+        }
+        if func.dfg.value_is_real(b) {
+            return None;
+        }
+        let i = func.dfg.value_def(v).inst()?;
+        let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] else {
+            return None;
+        };
+        if is_iconst(func, args[0]) || is_iconst(func, args[1]) {
+            return None;
+        }
+        Some((func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1])))
+    }
+
+    /// `ext` only: on the edge leaving terminator `t`, `v = x + k` (i64,
+    /// `0 < k < 2^31`) is non-null when `x + off` (`0 <= off <= k`) was
+    /// dereferenced in `t`'s block or the unique-predecessor chain above
+    /// it: that address is a valid, hence non-null, user-space address
+    /// below 2^63, so `x + k` neither wraps nor is 0. sameargs rebuilds a
+    /// loop's `p + 1` cursor without its inbounds mark (regex's
+    /// `InstPtrs` varint loop).
+    fn deref_step(&self, func: &Function, t: Inst, v: Value) -> bool {
+        let Some(deref) = &self.deref else { return false };
+        if func.dfg.value_type(v) != types::I64 {
+            return false;
+        }
+        let Some(i) = func.dfg.value_def(v).inst() else { return false };
+        let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] else {
+            return false;
+        };
+        let none = FxHashMap::default();
+        let (x, k) = match (known(func, &none, args[0]), known(func, &none, args[1])) {
+            (None, Some(k)) => (args[0], k),
+            (Some(k), None) => (args[1], k),
+            _ => return false,
+        };
+        if k == 0 || k >= 1 << 31 {
+            return false;
+        }
+        let x = func.dfg.resolve_aliases(x);
+        let Some(b) = func.layout.inst_block(t) else { return false };
+        deref
+            .get(&b)
+            .is_some_and(|l| l.iter().any(|&(a, off)| a == x && off >= 0 && off <= k as i64))
+    }
+
     /// `derived[v]` with a live base: entries go stale as passes alias
     /// or delete the recorded base — resolve it, and when the target is
     /// a tombstone recover positionally from the def: an inbounds
@@ -867,6 +958,41 @@ impl NonNull<'_> {
         };
         Some(func.dfg.resolve_aliases(b0))
     }
+}
+
+/// Per block, the `(address, offset)` pairs loads and stores dereference in
+/// it and in its unique-predecessor chain (up to 8 blocks up).
+fn deref_chains(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<(Value, i64)>> {
+    let mut own: FxHashMap<Block, Vec<(Value, i64)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let (a, off) = match func.dfg.insts[i] {
+                InstructionData::Load { arg, offset, .. } => (arg, i64::from(i32::from(offset))),
+                InstructionData::Store { args, offset, .. } => (args[1], i64::from(i32::from(offset))),
+                _ => continue,
+            };
+            own.entry(b).or_default().push((func.dfg.resolve_aliases(a), off));
+        }
+    }
+    let mut out = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let mut l: Vec<(Value, i64)> = Vec::new();
+        let mut cur = b;
+        for _ in 0..8 {
+            if let Some(o) = own.get(&cur) {
+                l.extend_from_slice(o);
+            }
+            let mut ps = cfg.pred_iter(cur);
+            match (ps.next(), ps.next()) {
+                (Some(p), None) if p.block != b => cur = p.block,
+                _ => break,
+            }
+        }
+        if !l.is_empty() {
+            out.insert(b, l);
+        }
+    }
+    out
 }
 
 /// Addresses of symbols, thread-locals and stack slots are never null.
