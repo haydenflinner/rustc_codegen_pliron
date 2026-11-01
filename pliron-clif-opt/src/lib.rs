@@ -14,6 +14,7 @@ pub mod bittab;
 pub mod brifsel;
 pub mod ivdown;
 pub mod ivptr;
+pub mod memcmpk;
 pub mod bytescan;
 pub mod brchain;
 pub mod celim;

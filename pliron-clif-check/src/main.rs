@@ -363,6 +363,24 @@ fn with_pipe<R>(
         Default::default(),
         facts.lifetimes(&clctx.func),
     );
+    // `; diffcheck-names:` (FuncRef -> symbol) back into the module's
+    // symbol table by user-name index, so name-keyed steps (`memcmpk`)
+    // see their callees on replay.
+    let mut fn_names: Vec<String> = Vec::new();
+    for (fr, name) in &facts.names {
+        if let Some(ef) = clctx.func.dfg.ext_funcs.get(*fr)
+            && let cranelift_codegen::ir::ExternalName::User(u) = ef.name
+        {
+            let un = &clctx.func.params.user_named_funcs()[u];
+            if un.namespace == 0 {
+                let k = un.index as usize;
+                if fn_names.len() <= k {
+                    fn_names.resize(k + 1, String::new());
+                }
+                fn_names[k] = name.clone();
+            }
+        }
+    }
     let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
     let uen_syms = Default::default();
     let mut p = Pipe {
@@ -396,7 +414,7 @@ fn with_pipe<R>(
         nocap: &e7,
         edge_kills: Vec::new(),
         dbg_slots: &Default::default(),
-        fn_names: &[],
+        fn_names: &fn_names,
         tcfg: isa.frontend_config(),
         simd: true,
         x64,

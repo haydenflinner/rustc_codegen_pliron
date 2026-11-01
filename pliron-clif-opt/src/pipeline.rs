@@ -3644,6 +3644,14 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `call %Mem{cpy,move,set}(dst, src, iconst n)` for small n becomes inline
 // unaligned load/store chunks — rustc's element-wise copy intrinsics reach
 // CLIF with a runtime len that only folds to `iconst` here.
+fn s_memcmpk(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::memcmpk::run(&mut p.clctx.func, p.fn_names, p.fname);
+    if k > 0 {
+        p.dump("memcmpk");
+    }
+    k
+}
+
 fn s_memcall(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::memcall(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -3920,6 +3928,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `ifconv` needs the diamond (CONDBR+JUMP — checked inside); `cparm`
         // runs `webmerge` (BPARAM) + a brif const-sweep (CONDBR).
         .needs_any(shape::CONDBR | shape::BPARAM),
+        // Constant-length memcmp inline: the slice-length test pins the
+        // length by now (`ifconv2`'s const sweep); `loadfwd2`/`dse2`
+        // later forward and drop a stack slot holding the compared bytes
+        // (`ends_with(char)`).
+        step("memcmpk", "memcmpk", Gate::OptIn("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
         cstep(
             "unswitch",
             "unswitch",
