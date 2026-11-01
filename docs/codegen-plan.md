@@ -478,6 +478,33 @@ Evening (2026-10-31):
   csdb` -> `mov`). Regex: 1016 fewer instructions, 44 of 94 clamps gone;
   timing neutral on all held-out programs (held-out 1.153 -> 1.150 in
   batch 38). Fuzz 39400:42200 clean.
+- **Small switches as compare chains** (2026-11-01, `PLIRON_SWITCH_CHAIN`,
+  on): Cranelift's `Switch` (and dense_switch from four cases) turns
+  every contiguous case run into a guarded `br_table` on `ireduce(x -
+  lo)`. brchain then turned tables with at most four live entries into
+  compares on that derived index, so case values never reached `x`. Up
+  to four cases now lower to a chain on `x`, with consecutive values as
+  `x - lo <=u w`; bittab reads that offset form. regex-syntax's
+  `Utf8Sequences::next` went from 572 to 443 instructions (LLVM 376), its
+  bounds checks are gone and its `for i in 1..4` loops unroll. Held-out
+  1.157 -> 1.150 (batch 39); regex 1.214 -> 1.169, compression 1.336 ->
+  1.289.
+- **pulldown, per source line** (2026-11-01): with the debuginfo path fix,
+  both compilers' line tables let samples be compared per pulldown source
+  line despite different inlining (`scratchpad lines.py`). The first pass's
+  special-byte loop (`parse.rs:2839-2840`) is as tight as LLVM's. The
+  difference is the out-of-line `parse_line::{closure#0}` on every special
+  byte: register spills, a 40-byte zeroed result slot and a memory return.
+  The closure (n=4594) misses the single-site cap (10x limit). Raising it
+  (`ONCEX` 16/24) inlines it, but then the grown scan function stays out
+  of line (n=6582) and its epilogue costs as much (`parse.rs:2853`, 63
+  samples). Net pulldown -0.4%, regex +1%, so not kept. Also measured and
+  dropped: `FANIN=0` (pulldown -0.5%, regex +4%), and sizing callees
+  without free ops (their share is 20-38%, too uniform to change
+  decisions). LLVM gets the whole nest into `parse_line` because it sizes
+  callees after simplification. That is the remaining lever: per-callsite
+  specialized costing, or callee simplification calibrated against
+  thresholds.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.

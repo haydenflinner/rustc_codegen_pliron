@@ -1670,8 +1670,11 @@ pub fn run(
                     };
                     if verbose {
                         if pliron_cfg::tracing_on() {
-                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why}",
-                                st.cgu, ci.n, ci.ncalls
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",
+                                st.cgu, ci.n, ci.ncalls, single.contains(cs), f.linkage == Linkage::Local,
+                                adj.as_ref().is_some_and(|a| a.taken.contains(cs.as_str())),
+                                adj.as_ref().and_then(|a| a.callers_of.get(cs.as_str())).map_or(0, |v| v.len()),
+                                rec_caller, free_used.contains(cs.as_str())
                             )
                         };
                     }
