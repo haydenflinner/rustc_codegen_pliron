@@ -431,8 +431,11 @@ Evening (2026-10-31):
 - **Miscompiles found by fuzz** (2026-11-01): seed 24242, `clifpeep::ceval`
   kept an `ireduce`'s high bits and `bitmerge` folded a wrong field
   constant; seeds 26212/26694, slotprom skipped the writeback before an
-  sret call whose return value covers only part of the slot (reverted).
-  Both fixed with regression tests. A batch's 400 seeds are too few for
+  sret call whose return value covers only part of the slot (reverted);
+  seed 27004, celim's signed nowrap test for a downward offset; seed
+  27992, load PRE's iso-aware in-block clobber check (reverted to the
+  plain check; root cause open). All fixed with regression tests or
+  gate seeds. A batch's 400 seeds are too few for
   memory-pass changes: sweep 2000.
 
 ## Sequencing (revised 2026-10-31, after the census)

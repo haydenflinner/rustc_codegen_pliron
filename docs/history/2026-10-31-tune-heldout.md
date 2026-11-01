@@ -314,6 +314,29 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   doesn't carry the return size) with a unit test that fails on the old
   code. Batch 28's 400 seeds had missed it: memory-pass changes now get a
   2000-seed sweep.
+- **Second 2000-seed sweep** (27000:29000, on 55f1e4b): two more.
+  Seed 27004: celim's `snnowrap` checked a downward offset as
+  `l - d >= smin` (always true), so `x s< x - 94` under `x == i64::MIN`
+  folded to false; fixed (`l + d`), with a test. Seed 27992: upward load
+  PRE of an isolated `&` param's 16-byte load past stores to other roots
+  changed control flow. It needs e499f46's iso-aware "clobbered earlier
+  in this block" check. The plain check is back at no measured cost
+  (regex 1.200 vs 1.201); the root cause is not identified, and every
+  piece (in-block stores, the merge block's preservation, each in-edge
+  value) reads as sound. A lead for later: the seed's corpus dump
+  (`PLIRON_CORPUS`) replays it, and `XUP_LIM`-style counting on upward
+  hits isolates the single PRE at block35 -> block27. All five seeds of
+  the night are in the gate's `FUZZ_REGRESS`.
+- **Knob sweeps on the five tuned benches** (interleaved, 8 rounds):
+  `PLIRON_INLINE_DUPCOST=1` and `PLIRON_INLINE_COLD=1` both give json
+  -2.7% and pulldown +5%; `SCCLIMIT`/`ONCE1` change no binary. Not
+  remat'ing `band x, k` (Cranelift `remat.isle`) shortens regex's
+  dispatch cascade (4 `and #7` -> 1) yet times json -1.4%, regex +1.7%,
+  pulldown +1.5%. blind-sig's montgomery inner loops match LLVM's
+  instruction for instruction; its 7% is outer-loop SmallVec handling.
+  blake3's compress has LLVM's exact ALU mix (337 add, 232 eor, 220 ror)
+  with ~21 more spill reloads and fewer `ldp` pairs: register
+  allocation.
 - **Escapes in unreachable blocks** (`PLIRON_ESC_REACH=0` off):
   `isolated_escapes` scanned every layout block. regex's
   `SparseSet::insert` asserts `len < capacity` before its push, so the
