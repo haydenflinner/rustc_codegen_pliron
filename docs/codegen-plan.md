@@ -393,6 +393,22 @@ Evening (2026-10-31):
   check-set bench, 1.322 -> 1.344). diffcheck now runs user-symbol
   `memcmp` like the libcall (`Facts::memcmp`): before, every memcmpk
   expansion of a `compare_bytes` call replayed as a false mismatch.
+- **Inlining reach** (2026-11-01): `#[inline(always)]` now skips the size
+  score like LLVM's AlwaysInliner (blake3's 9k-op `compress_pre` was
+  called out of line: 1.190 -> 1.160). Cross-CGU copies can now bind to
+  promoted deps: `#[cold]` Internal fns a copyable fn needs are defined
+  hidden-external in their home CGU (ThinLTO's promotion), so
+  `Vec::reserve` reaches other CGUs and inlines (pulldown 1.246 -> 1.209).
+  Promoting every uncopyable dep (`PLIRON_XCGU_PROMOTE=1`) also helps
+  json but reshuffles regex's inlining (+4%): with more inlined into
+  `follow_epsilons`, the `&mut SparseSet`'s fields are reloaded every
+  outer iteration. They sit in the block after the outer header (not
+  the join), so join-PRE never sees them; the `Vec` grow call that
+  clobbers them is `nocapture`. Next: hoist speculatable
+  (dereferenceable) loads into the header when nothing in between may
+  write them, then let PRE carry them. Also from the same profile:
+  punroll unrolled a constant 3-trip loop x8 (`trip_max` now knows
+  constant bounds; peeling caps at the bound).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
   byte-set scans over constant tables (pulldown's `escape_html_scalar`
   -2.2% on dense input; 3.5x on a sparse repro), with table bytes from
