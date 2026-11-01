@@ -1681,12 +1681,25 @@ pub fn plan(
                 };
             }
         }
-        let (base, k) = scaled_addr(func, cnt.iv, a)?;
-        if k * cnt.step != size {
-            return None;
+        if let Some((base, k)) = scaled_addr(func, cnt.iv, a)
+            && k * cnt.step == size
+        {
+            let base = outv(func, &info, &kinds, base)?;
+            return Some((start_expr(cnt.iv0, base, k), base));
         }
-        let base = outv(func, &info, &kinds, base)?;
-        Some((start_expr(cnt.iv0, base, k), base))
+        // `base + p*K` on another param stepping in lockstep with the
+        // count (a `mintrip` pre-loop counts with its own `j`; the fill's
+        // address still indexes by `len`).
+        for (j, &p) in params.iter().enumerate() {
+            let Param::Step(sj) = kinds[j] else { continue };
+            if let Some((base, k)) = scaled_addr(func, p, a)
+                && k * sj == size
+            {
+                let base = outv(func, &info, &kinds, base)?;
+                return Some((start_expr(info.entry_args[j], base, k), base));
+            }
+        }
+        None
     };
     let Some((dst0, dbase)) = affine(func, addr) else {
         why!("dst affine: {:?}", la.loop_header(lp));
