@@ -1209,6 +1209,12 @@ pub fn run(
     // output can't afford it.
     let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
+    // `PLIRON_INLINE_FREEMAX=<n>` (opt-in): a single-site callee over n ops
+    // gets no "free" threshold. memchr's 809-op search closure, inlined
+    // into its one site in `search_slice_with_raw`, made pulldown's
+    // `scan_nextline` too big to inline into its callers; LLVM keeps the
+    // closure out of line.
+    let freemax: Option<usize> = crate::env_get("PLIRON_INLINE_FREEMAX").and_then(|s| s.parse().ok());
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
     let cold_once = crate::env_is("PLIRON_INLINE_COLDONCE", "1");
     let always_all = crate::pass_enabled("PLIRON_INLINE_ALWAYS");
@@ -1406,7 +1412,8 @@ pub fn run(
                             && single.contains(cs)
                             && !rec_caller
                             && !(cold_once && f.cold && !f.inline_hint)
-                            && !(once1 && free_used.contains(cs.as_str())));
+                            && !(once1 && free_used.contains(cs.as_str()))
+                            && freemax.is_none_or(|m| ci.n <= m));
                     // `PLIRON_INLINE_WASM_COLD=<n>` (small mode only; unset =
                     // `limit`): flat non-loop threshold. Loop-site `hot`x still
                     // uses `limit` so `hash_one` (~926) keeps inlining at

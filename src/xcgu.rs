@@ -65,7 +65,16 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     {
         return false;
     }
+    // `PLIRON_XCGU_ALWAYS=1` (opt-in): `#[inline(always)]` bodies are
+    // copyable at any size; they inline wherever they land, so a copy
+    // costs IR-opt time, not code. memchr's `search_slice_with_raw` kept
+    // pulldown's 7-statement `scan_nextline` from reaching its callers.
     tcx.size_estimate(inst) <= limit
+        || (crate::env_is("PLIRON_XCGU_ALWAYS", "1")
+            && matches!(
+                a.inline,
+                rustc_attr_ir::InlineAttr::Always | rustc_attr_ir::InlineAttr::Force { .. }
+            ))
 }
 
 fn used<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>) -> Option<&'tcx [Spanned<MonoItem<'tcx>>]> {
