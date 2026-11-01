@@ -3,8 +3,8 @@
 //! - vendored Cranelift drops the bounds clamp (aarch64 `cmp; b.hs; csel;
 //!   csdb` becomes one `mov`);
 //! - brchain treats the default as a don't-care. The chain's else edge
-//!   takes the most common entry target, so a table with five live entries
-//!   but three distinct non-majority targets still becomes a chain.
+//!   takes the first entry's target, so a table with six entries over
+//!   four targets still becomes a chain.
 //!
 //! Each test sets the knob before anything reads it (it is read once).
 
@@ -61,7 +61,7 @@ fn unreachable_default_drops_the_clamp() {
 #[test]
 fn unreachable_default_is_a_chain_dont_care() {
     keepdead();
-    // Targets 0,1,0,2,0,3: three tests and an else edge to arm 0.
+    // Targets 0,1,0,2,0,3: tests for arms 1-3, the else edge to arm 0.
     let src = table(4, &[0, 1, 0, 2, 0, 3]);
     let before = cranelift_reader::parse_functions(&src).unwrap().remove(0);
     let mut after = before.clone();

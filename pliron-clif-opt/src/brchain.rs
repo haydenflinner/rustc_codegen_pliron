@@ -518,8 +518,10 @@ pub fn run(func: &mut Function) -> usize {
 /// A default that is pliron's `unreachable` trap (`PLIRON_SWITCH_KEEPDEAD`
 /// keeps it, so a table that stays one drops its bounds clamp) is a don't-
 /// care for a chain: an out-of-range index is UB. The chain's else edge
-/// takes the most common entry target instead, which also drops that
-/// target's tests.
+/// takes the first entry's target instead (what unreach redirects a dead
+/// default to without the knob), which also drops that target's tests.
+/// The most common target instead made regex's hot `Save`/`Split` arm the
+/// chain's last else (+2.3%).
 fn effective_default(func: &Function, dflt: BlockCall, entries: &[BlockCall]) -> BlockCall {
     if !*crate::unreach::KEEP_DEFAULT {
         return dflt;
@@ -537,17 +539,7 @@ fn effective_default(func: &Function, dflt: BlockCall, entries: &[BlockCall]) ->
     if !dead {
         return dflt;
     }
-    let mut best: Option<(BlockCall, usize)> = None;
-    for &e in entries {
-        if same_target(func, e, dflt) {
-            continue;
-        }
-        let n = entries.iter().filter(|&&o| same_target(func, o, e)).count();
-        if best.is_none_or(|(_, m)| n > m) {
-            best = Some((e, n));
-        }
-    }
-    best.map_or(dflt, |(e, _)| e)
+    entries.iter().copied().find(|&e| !same_target(func, e, dflt)).unwrap_or(dflt)
 }
 
 /// Clusters a `br_table` may have and still become a range-test chain
