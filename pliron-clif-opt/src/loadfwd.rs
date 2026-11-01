@@ -637,7 +637,32 @@ pub fn isolated_escapes(
             .entry(v)
             .or_insert_with(|| norm_root(func, ps, noalias, v))
     };
+    // Blocks no path from the entry reaches can't escape anything: a pass
+    // that folds a branch (looprot, licm2) leaves the dead arm in the layout
+    // until the next unreachable sweep, and its call kept regex's `qcur`
+    // escaped through licm3 (`PLIRON_ESC_REACH=0` scans every block).
+    static REACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reach: Option<FxHashSet<Block>> = REACH
+        .get_or_init(|| crate::pass_enabled("PLIRON_ESC_REACH"))
+        .then(|| {
+            let mut seen = FxHashSet::default();
+            let mut stack: Vec<Block> = func.layout.entry_block().into_iter().collect();
+            while let Some(b) = stack.pop() {
+                if !seen.insert(b) {
+                    continue;
+                }
+                if let Some(t) = func.layout.last_inst(b) {
+                    for c in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                        stack.push(c.block(&func.dfg.value_lists));
+                    }
+                }
+            }
+            seen
+        });
     for b in func.layout.blocks() {
+        if reach.as_ref().is_some_and(|r| !r.contains(&b)) {
+            continue;
+        }
         for i in func.layout.block_insts(b) {
             let data = &func.dfg.insts[i];
             let nargs = func.dfg.inst_args(i).len();
