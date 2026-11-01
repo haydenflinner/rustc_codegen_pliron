@@ -101,6 +101,11 @@ struct Shape {
     others: Vec<(usize, Value)>,
     /// `p'` in `c`.
     pnext: Value,
+    /// Params the back edge passes unchanged (`PLIRON_BYTESCAN_PASS`): loop-
+    /// invariant per entry, but not defined outside the loop. serde_json's
+    /// `format_escaped_str` scan has several entries, so its start, base and
+    /// end stay header params; the vector header takes them as params too.
+    pass: Vec<usize>,
 }
 
 /// `v` is built only from `pnext`, constants, values from outside the loop
@@ -244,14 +249,30 @@ fn find(func: &Function, an: &mut Analysis, tables: &FxHashMap<u32, std::sync::A
             cranelift_codegen::ir::ValueDef::Param(b, _) => !la.is_in_loop(b, lp),
             _ => false,
         };
+        let pass_on = !pliron_cfg::env_is("PLIRON_BYTESCAN_PASS", "0");
+        // Whether param `k`'s back-edge arg (on `c`'s edge to `h`) is an
+        // `iadd k, 1`: the stepping iv, not a pass-through base.
+        let back_arg = |k: usize| -> Option<bool> {
+            let ct = func.layout.last_inst(c)?;
+            let InstructionData::Brif { blocks: cb, .. } = func.dfg.insts[ct] else { return None };
+            let bc = cb.iter().find(|bc| bc.block(pool) == h)?;
+            let BlockArg::Value(a) = bc.args(pool).nth(k)? else { return None };
+            Some(func.dfg.resolve_aliases(a) != func.dfg.block_params(h)[k])
+        };
         let (pi, base) = if let Some(pi) = param_of(p) {
             (pi, None)
         } else {
             let Some(xi) = func.dfg.value_def(p).inst() else { continue };
             let InstructionData::Binary { opcode: Opcode::Iadd, args: xa } = func.dfg.insts[xi] else { continue };
+            // A header param as base is checked once the back edge is known:
+            // it must be passed unchanged. With two params, the iv is the one
+            // stepping (`bargs[pi] == pnext`), so try both orders.
+            let inv = |v: Value| invariant(v) || (pass_on && param_of(v).is_some());
             match (param_of(xa[0]), param_of(xa[1])) {
-                (Some(k), _) if invariant(xa[1]) => (k, Some(func.dfg.resolve_aliases(xa[1]))),
-                (_, Some(k)) if invariant(xa[0]) => (k, Some(func.dfg.resolve_aliases(xa[0]))),
+                (Some(k), _) if inv(xa[1]) && !(param_of(xa[1]).is_some() && back_arg(k) != Some(true)) => {
+                    (k, Some(func.dfg.resolve_aliases(xa[1])))
+                }
+                (_, Some(k)) if inv(xa[0]) => (k, Some(func.dfg.resolve_aliases(xa[0]))),
                 _ => continue,
             }
         };
@@ -294,7 +315,7 @@ fn find(func: &Function, an: &mut Analysis, tables: &FxHashMap<u32, std::sync::A
             cranelift_codegen::ir::ValueDef::Param(b, _) => !la.is_in_loop(b, lp),
             _ => false,
         };
-        if !end_out {
+        if !end_out && !(pass_on && param_of(end).is_some()) {
             continue;
         }
         // Back-edge args: the pointer param gets p'; others f(p').
@@ -309,9 +330,15 @@ fn find(func: &Function, an: &mut Analysis, tables: &FxHashMap<u32, std::sync::A
             continue;
         }
         let mut others = Vec::new();
+        let mut pass = Vec::new();
         let mut ok = true;
+        let hparams: Vec<Value> = func.dfg.block_params(h).to_vec();
         for (k, &v) in bargs.iter().enumerate() {
             if k == pi {
+                continue;
+            }
+            if pass_on && v == hparams[k] {
+                pass.push(k);
                 continue;
             }
             if !expr_ok(func, v, c, &blocks, pnext, 0) {
@@ -319,6 +346,16 @@ fn find(func: &Function, an: &mut Analysis, tables: &FxHashMap<u32, std::sync::A
                 break;
             }
             others.push((k, v));
+        }
+        // A param used as base or end must be one passed unchanged, and the
+        // other params' expressions (re-emitted after the vector loop, where
+        // `h`'s params aren't defined) must not read pass-through params.
+        let is_pass = |v: Value| param_of(v).is_some_and(|k| pass.contains(&k));
+        if base.is_some_and(|b| param_of(b).is_some() && !is_pass(b)) || (param_of(end).is_some() && !is_pass(end)) {
+            continue;
+        }
+        if others.iter().any(|&(_, f)| reads_any(func, f, c, &pass.iter().map(|&k| hparams[k]).collect::<Vec<_>>())) {
+            continue;
         }
         if !ok {
             continue;
@@ -366,7 +403,7 @@ fn find(func: &Function, an: &mut Analysis, tables: &FxHashMap<u32, std::sync::A
         if !ok {
             continue;
         }
-        return Some(Shape { h, c, pi, base, end, set, others, pnext });
+        return Some(Shape { h, c, pi, base, end, set, others, pnext, pass });
     }
     None
 }
@@ -384,6 +421,20 @@ fn is_chain(func: &Function, h: Block, tb: Block, b: Block) -> bool {
         let Some(t) = func.layout.last_inst(x) else { return false };
         let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else { return false };
         x = destination.block(&func.dfg.value_lists);
+    }
+}
+
+/// `v`, or a `c`-defined operand of it (recursively), is one of `vals`.
+fn reads_any(func: &Function, v: Value, c: Block, vals: &[Value]) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if vals.contains(&v) {
+        return true;
+    }
+    match func.dfg.value_def(v) {
+        cranelift_codegen::ir::ValueDef::Result(i, _) if func.layout.inst_block(i) == Some(c) => {
+            func.dfg.inst_args(i).iter().any(|&a| reads_any(func, a, c, vals))
+        }
+        _ => false,
     }
 }
 
@@ -429,6 +480,18 @@ fn rewrite(func: &mut Function, an: &mut Analysis, s: &Shape) {
         func.layout.insert_block(b, s.h);
     }
     let vp = func.dfg.append_block_param(vh, ptr);
+    // Pass-through params ride along on VH (VH dominates the other new
+    // blocks): `rep` maps `h`'s param to VH's.
+    let hparams: Vec<Value> = func.dfg.block_params(s.h).to_vec();
+    let mut rep: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut vpass = Vec::new();
+    for &k in &s.pass {
+        let ty = func.dfg.value_type(hparams[k]);
+        let v = func.dfg.append_block_param(vh, ty);
+        rep.insert(hparams[k], v);
+        vpass.push(v);
+    }
+    let rp = |v: Value| rep.get(&v).copied().unwrap_or(v);
     let fp = func.dfg.append_block_param(vf, ptr);
     let fbits = func.dfg.append_block_param(vf, types::I64);
     let tp = func.dfg.append_block_param(toh, ptr);
@@ -436,23 +499,23 @@ fn rewrite(func: &mut Function, an: &mut Analysis, s: &Shape) {
     for (inst, k) in entries {
         let dfg = &mut func.dfg;
         let bc = &mut dfg.insts[inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[k];
-        let p0 = match bc.args(&dfg.value_lists).nth(s.pi) {
-            Some(BlockArg::Value(v)) => v,
-            _ => unreachable!(),
-        };
-        *bc = cranelift_codegen::ir::BlockCall::new(vh, [BlockArg::Value(p0)], &mut dfg.value_lists);
+        let eargs: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+        let BlockArg::Value(p0) = eargs[s.pi] else { unreachable!() };
+        let mut nargs = vec![BlockArg::Value(p0)];
+        nargs.extend(s.pass.iter().map(|&k| eargs[k]));
+        *bc = cranelift_codegen::ir::BlockCall::new(vh, nargs, &mut dfg.value_lists);
     }
     // In bounds (more than 16 bytes left), not necessarily aligned.
     let flags = MemFlagsData::new().with_notrap();
     let mut cur = FuncCursor::new(func).at_bottom(vh);
     // VH: more than 16 bytes left?
-    let rem = cur.ins().isub(s.end, vp);
+    let rem = cur.ins().isub(rp(s.end), vp);
     let more = cur.ins().icmp_imm_u(IntCC::UnsignedGreaterThan, rem, 16);
     cur.ins().brif(more, vb, &[], toh, &[BlockArg::Value(vp)]);
     // VB: 16 bytes vs each stop byte -> 4 bits per byte.
     cur.goto_bottom(vb);
     let addr = match s.base {
-        Some(b) => cur.ins().iadd(vp, b),
+        Some(b) => cur.ins().iadd(vp, rp(b)),
         None => vp,
     };
     let v = cur.ins().load(types::I8X16, flags, addr, 0);
@@ -481,7 +544,9 @@ fn rewrite(func: &mut Function, an: &mut Analysis, s: &Shape) {
     // VN: no stop byte in these 16.
     cur.goto_bottom(vn);
     let vp2 = cur.ins().iadd_imm_s(vp, 16);
-    cur.ins().jump(vh, &[BlockArg::Value(vp2)]);
+    let mut back = vec![BlockArg::Value(vp2)];
+    back.extend(vpass.iter().map(|&v| BlockArg::Value(v)));
+    cur.ins().jump(vh, &back);
     // VF: the first stop byte is at lane ctz(bits) / 4.
     cur.goto_bottom(vf);
     let tz = cur.ins().ctz(fbits);
@@ -496,6 +561,9 @@ fn rewrite(func: &mut Function, an: &mut Analysis, s: &Shape) {
     let mut memo = FxHashMap::default();
     for &(k, f) in &s.others {
         args[k] = clone_expr(func, f, s.c, s.pnext, tp, j, &mut memo);
+    }
+    for (&k, &v) in s.pass.iter().zip(&vpass) {
+        args[k] = v;
     }
     let dfg = &mut func.dfg;
     let bc = &mut dfg.insts[j].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[0];

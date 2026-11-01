@@ -79,3 +79,47 @@ fn loop_with_store_is_left_alone() {
     let mut f = cranelift_reader::parse_functions(&src).unwrap().remove(0);
     assert_eq!(pliron_clif_opt::bytescan::run(&mut f, &mut Analysis::default(), &tables()), 0, "{}", f.display());
 }
+
+/// serde_json's `format_escaped_str` scan: an index loop with two entries,
+/// so its base and end stay header params the back edge passes unchanged.
+/// The vector header takes them as params of its own and re-enters the
+/// scalar loop with them.
+const PASS: &str = "function %f(i64, i64, i64) -> i64 {
+    gv0 = symbol colocated u1:0
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = symbol_value.i64 gv0
+    v4 = iconst.i64 0
+    v5 = icmp eq v2, v4
+    brif v5, block1(v4, v0, v1), block6
+block6:
+    v6 = iconst.i64 1
+    brif v1, block1(v6, v0, v1), block5
+block1(v10: i64, v11: i64, v12: i64):
+    v13 = iadd v11, v10
+    v14 = uload8.i64 notrap v13
+    v16 = iadd.i64 v3, v14
+    v17 = load.i8 notrap v16
+    v18 = iconst.i8 0
+    v19 = icmp ne v17, v18
+    brif v19, block4(v10), block3
+block3:
+    v20 = iconst.i64 1
+    v21 = iadd v10, v20
+    v22 = icmp ult v21, v12
+    brif v22, block1(v21, v11, v12), block5
+block4(v30: i64):
+    return v30
+block5:
+    v31 = iconst.i64 -1
+    return v31
+}";
+
+#[test]
+fn pass_through_params_get_vector_preloop() {
+    let mut f = cranelift_reader::parse_functions(PASS).unwrap().remove(0);
+    let n = pliron_clif_opt::bytescan::run(&mut f, &mut Analysis::default(), &tables());
+    assert_eq!(n, 1, "not vectorized:\n{}", f.display());
+    let flags = settings::Flags::new(settings::builder());
+    cranelift_codegen::verify_function(&f, &flags).unwrap_or_else(|e| panic!("{e}\n{}", f.display()));
+    assert_eq!(count(&f, Opcode::Uload8), 1, "scalar loop changed:\n{}", f.display());
+}
