@@ -127,7 +127,7 @@ fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
         )
 }
 
-/// `PLIRON_XCGU_PROMOTE=1`: symbols of Internal fns defined in exactly
+/// `PLIRON_XCGU_PROMOTE` (default `cold`): symbols of Internal fns defined in exactly
 /// one CGU (not local copies) that some copyable fn calls but that can't
 /// be copied themselves (too big, `#[cold]` chains, ...). Their home CGU
 /// defines them hidden-external instead, ThinLTO's promotion of imported
@@ -139,7 +139,13 @@ pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
     static P: std::sync::OnceLock<FxHashSet<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
         let mut out = FxHashSet::default();
-        if !crate::env_is("PLIRON_XCGU_PROMOTE", "1") {
+        // `=cold` promotes only `#[cold]` deps: enough for `reserve` (its
+        // one blocker is the cold `do_reserve_and_handle`) without
+        // unlocking every other copy (`=1` reshuffled regex's inlining).
+        // Default `cold`; `=1` promotes every uncopyable dep, `=0` none.
+        let mode = crate::env_get("PLIRON_XCGU_PROMOTE");
+        let cold_only = mode.is_none_or(|m| m == "cold");
+        if mode == Some("0") {
             return out;
         }
         let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
@@ -165,7 +171,11 @@ pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
                     let MonoItem::Fn(d) = u.node else { continue };
                     if matches!(home.get(&u.node), Some((Linkage::Internal, false, 1)))
                         && needs_body(tcx, &u.node)
-                        && !copyable(tcx, d, limit)
+                        && (if cold_only {
+                            tcx.codegen_instance_attrs(d.def).flags.contains(F::COLD)
+                        } else {
+                            !copyable(tcx, d, limit)
+                        })
                     {
                         out.insert(tcx.symbol_name(d).name.to_string());
                     }
