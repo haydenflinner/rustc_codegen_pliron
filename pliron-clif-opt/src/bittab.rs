@@ -258,7 +258,7 @@ fn cand_ok(func: &Function, b: Block) -> bool {
 /// leaves `brif c, hit, next(x)` / `next(x'): icmp eq x', k` chains
 /// (serde_json's `has_next_element`: `x - 9` passed on to the `{1, 4, 23}`
 /// tests), where `x'` is `x` on the only edge in.
-fn canon(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value {
+pub(crate) fn canon(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value {
     let mut v = func.dfg.resolve_aliases(v);
     for _ in 0..8 {
         let ValueDef::Param(b, k) = func.dfg.value_def(v) else { break };

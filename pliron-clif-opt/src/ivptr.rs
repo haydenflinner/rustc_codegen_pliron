@@ -25,13 +25,13 @@ use crate::pipeline::{Analysis, CfgDtLa};
 
 /// `k + sum(coef * leaf)`, leaves sorted.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Lin {
-    k: i64,
-    t: Vec<(Value, i64)>,
+pub(crate) struct Lin {
+    pub(crate) k: i64,
+    pub(crate) t: Vec<(Value, i64)>,
 }
 
 impl Lin {
-    fn add(&self, o: &Lin, sign: i64) -> Lin {
+    pub(crate) fn add(&self, o: &Lin, sign: i64) -> Lin {
         let mut m: FxHashMap<Value, i64> = self.t.iter().copied().collect();
         for &(v, c) in &o.t {
             *m.entry(v).or_insert(0) = m.get(&v).copied().unwrap_or(0).wrapping_add(c.wrapping_mul(sign));
@@ -53,7 +53,7 @@ fn iconst_of(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
-fn lin(func: &Function, v: Value, depth: u32) -> Lin {
+pub(crate) fn lin(func: &Function, v: Value, depth: u32) -> Lin {
     let v = func.dfg.resolve_aliases(v);
     let leaf = Lin { k: 0, t: vec![(v, 1)] };
     if let Some(k) = iconst_of(func, v) {

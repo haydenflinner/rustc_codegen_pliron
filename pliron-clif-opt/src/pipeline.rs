@@ -1221,6 +1221,8 @@ fn corpus_dump(p: &mut Pipe) {
         nowrite: Some(p.nowrite),
         self_name: Some(p.fname.to_string()),
         derived: Some(&*p.derived),
+        // Rebuilt from the names header on replay.
+        memcmp: Default::default(),
     };
     // Extra replay facts `diffcheck-facts` can't express: the per-callee
     // nocapture arg positions (a `(Inst, arg)` set on `Pipe`) re-keyed by
@@ -1598,7 +1600,24 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
         // `cranelift_module` names a declared function `u0:<FuncId>`.
         self_name: Some(format!("u0:{}", p.func_id.as_u32())),
         derived: Some(&*p.derived),
+        memcmp: memcmp_refs(&p.clctx.func, p.fn_names),
     }
+}
+
+/// Callees that are libc's `memcmp`/`bcmp` by the module's symbol table.
+fn memcmp_refs(f: &Function, fn_names: &[String]) -> FxHashSet<FuncRef> {
+    f.dfg
+        .ext_funcs
+        .keys()
+        .filter(|&fr| match f.dfg.ext_funcs[fr].name {
+            cranelift_codegen::ir::ExternalName::User(u) => {
+                let un = &f.params.user_named_funcs()[u];
+                un.namespace == 0
+                    && fn_names.get(un.index as usize).is_some_and(|s| s == "memcmp" || s == "bcmp")
+            }
+            _ => false,
+        })
+        .collect()
 }
 
 /// `PLIRON_DIFFCHECK=1`: check the whole pipeline once per function, and
@@ -3644,6 +3663,14 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // `call %Mem{cpy,move,set}(dst, src, iconst n)` for small n becomes inline
 // unaligned load/store chunks — rustc's element-wise copy intrinsics reach
 // CLIF with a runtime len that only folds to `iconst` here.
+fn s_mintrip(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::mintrip::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("mintrip");
+    }
+    k
+}
+
 fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = crate::demand::run(&mut p.clctx.func);
     if k > 0 {
@@ -3916,6 +3943,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             .needs(shape::LOOPS)
             .creates_all(),
         step("revnorm", "revnorm", Gate::Env("PLIRON_REVNORM"), s_revnorm).needs(shape::LOOPS),
+        // Multi-exit affine loops get a counted pre-loop of umin(trips)
+        // iterations, which loopidiom/loopvec can then take.
+        step("mintrip", "mintrip", Gate::OptIn("PLIRON_MINTRIP"), s_mintrip).needs(shape::LOOPS),
         step(
             "loopidiom",
             "idiom",

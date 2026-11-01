@@ -1012,7 +1012,7 @@ fn closed_region(
 /// defs precede their uses. Insts in `fold` (mapped to a branch-dest
 /// slot) become an unconditional `jump` to that destination in the
 /// clone. Returns the block map; `bmap[h]` is the clone's header.
-fn clone_region(
+pub(crate) fn clone_region(
     func: &mut Function,
     h: Block,
     region: &FxHashSet<Block>,

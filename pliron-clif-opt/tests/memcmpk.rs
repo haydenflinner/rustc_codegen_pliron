@@ -71,3 +71,33 @@ fn odd_size_with_sign_use_stays() {
 fn large_size_stays() {
     assert_eq!(calls(&expanded(&src(17, ZERO))), 1);
 }
+
+/// `memcmp` reached through a user symbol (how rustc's `compare_bytes`
+/// lowers: `u0:N` named `memcmp` in the module's table). The checker runs
+/// it as the libcall only with `Facts::memcmp`; without it the call is an
+/// opaque stub and the expansion looks like a mismatch (what the corpus
+/// replay reported before the fact existed).
+#[test]
+fn user_symbol_memcmp_checks_against_the_libcall() {
+    let src = "function %f(i64, i64) -> i8, i8 {
+    sig0 = (i64, i64, i64) -> i32
+    fn0 = u0:5 sig0
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 4
+    v3 = call fn0(v0, v1, v2)
+    v4 = iconst.i32 0
+    v5 = icmp slt v3, v4
+    v6 = icmp sgt v3, v4
+    return v5, v6
+}";
+    let before = cranelift_reader::parse_functions(src).unwrap().remove(0);
+    let mut after = before.clone();
+    let names: Vec<String> = (0..6).map(|i| if i == 5 { "memcmp".into() } else { String::new() }).collect();
+    assert_eq!(pliron_clif_opt::memcmpk::run(&mut after, &names, "f"), 1);
+    let cfg = Config { trials: 128, ..Config::default() };
+    let fr = cranelift_codegen::ir::FuncRef::from_u32(0);
+    let facts = Facts { memcmp: [fr].into_iter().collect(), ..Facts::default() };
+    let s = check(&before, &after, &facts, &cfg).unwrap_or_else(|m| panic!("{m}\n{}", after.display()));
+    assert!(s.compared > 0);
+    assert!(check(&before, &after, &Facts::default(), &cfg).is_err(), "the stub should disagree");
+}

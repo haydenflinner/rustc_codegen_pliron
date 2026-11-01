@@ -16,6 +16,7 @@ pub mod demand;
 pub mod ivdown;
 pub mod ivptr;
 pub mod memcmpk;
+pub mod mintrip;
 pub mod bytescan;
 pub mod brchain;
 pub mod celim;

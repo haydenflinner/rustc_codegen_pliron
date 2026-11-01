@@ -63,6 +63,10 @@ pub struct Facts<'a> {
     /// Derived pointer → its base, as the pipeline tracks them. Not used by
     /// the check; saved in repros so `clif-check` replays a step faithfully.
     pub derived: Option<&'a VMap<Value>>,
+    /// Callees that are libc's `memcmp`/`bcmp` under a user symbol: run
+    /// like the `Memcmp` libcall, not stubbed, so expanding one inline
+    /// (`memcmpk`) compares like for like.
+    pub memcmp: FxHashSet<FuncRef>,
 }
 
 pub struct Config {
@@ -421,6 +425,8 @@ struct World {
     /// Values the optimizer may assume nonzero (`!nonnull` loads too): a
     /// load that yields 0 into one is undefined behavior, so the run stops.
     nonnull: FxHashSet<Value>,
+    /// `Facts::memcmp` callees as call names spell them.
+    memcmp: FxHashSet<String>,
 }
 
 impl World {
@@ -490,6 +496,12 @@ impl World {
                 .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0),
             nonnull: facts.nonnull.cloned().unwrap_or_default(),
+            memcmp: facts
+                .memcmp
+                .iter()
+                .filter_map(|fr| f.dfg.ext_funcs.get(*fr))
+                .map(|d| d.name.display(Some(&f.params)).to_string())
+                .collect(),
         }
     }
 }
@@ -691,6 +703,7 @@ struct Sandbox<'a> {
     calls: Vec<(String, Vec<DataValue>)>,
     nowrite: &'a FxHashSet<String>,
     nonnull: &'a FxHashSet<Value>,
+    memcmp: &'a FxHashSet<String>,
     seed: u64,
     stack_fill: u8,
     pinned: DataValue,
@@ -1031,6 +1044,7 @@ fn run_inner(
         } else {
             &no_facts
         },
+        memcmp: &world.memcmp,
         seed: world.seed,
         stack_fill: world.stack_fill,
         pinned: DataValue::I64(0),
@@ -1187,6 +1201,10 @@ fn do_call(s: &mut Sandbox, i: ir::Inst, left: &mut u64) -> Result<Vec<DataValue
                 return libcall(s, lc, &all, &rets);
             }
             let name = ext.name.display(Some(&f.params)).to_string();
+            if s.memcmp.contains(&name) {
+                let rets: Vec<Type> = f.dfg.signatures[ext.signature].returns.iter().map(|r| r.value_type).collect();
+                return libcall(s, LibCall::Memcmp, &all, &rets);
+            }
             if name == s.self_name {
                 if s.frames.len() >= MAX_DEPTH {
                     return Err(Stop::Unsupported("recursion too deep".into()));
@@ -1555,6 +1573,12 @@ impl OwnedFacts {
             nowrite: Some(&self.nowrite),
             self_name: self.self_name.clone(),
             derived: Some(&self.derived),
+            memcmp: self
+                .names
+                .iter()
+                .filter(|(_, n)| n == "memcmp" || n == "bcmp")
+                .map(|(r, _)| *r)
+                .collect(),
         }
     }
 
