@@ -56,7 +56,7 @@ fn use_counts(func: &Function) -> FxHashMap<Value, u32> {
 }
 
 /// `v`'s defining inst if it lives in `b`, is pure, and has a single
-/// result. With `PLIRON_EDGESINK_LOADS=1`, also a non-trapping load
+/// result. Also (`PLIRON_EDGESINK_LOADS=0` disables) a non-trapping load
 /// with nothing that may write memory between it and `b`'s terminator:
 /// on the edge, memory is what it was at the load (a loop's length
 /// reload used only by its exit edge, num-bigint-dig's montgomery).
@@ -74,7 +74,7 @@ fn sinkable_def(func: &Function, b: Block, v: Value) -> Option<Inst> {
 }
 
 fn quiet_loads_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_EDGESINK_LOADS", "1"));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::pass_enabled("PLIRON_EDGESINK_LOADS"));
     *ON
 }
 
@@ -356,16 +356,11 @@ pub fn run(func: &mut Function) -> usize {
     // no call. Anywhere else it runs as often as before, and the new
     // block reshapes the live ranges around it: after a call (slot
     // reloads of its out-params) pulldown's `parse_block` lost the
-    // register for its byte-scan index across the call, +19%. The
-    // analysis is computed only when loads may sink; edge blocks added
-    // below are never queried.
-    let la = quiet_loads_on().then(|| {
-        let cfg = ControlFlowGraph::with_function(func);
-        let dt = DominatorTree::with_function(func, &cfg);
-        let mut la = LoopAnalysis::new();
-        la.compute(func, &cfg, &dt);
-        la
-    });
+    // register for its byte-scan index across the call, +19%.
+    // Computed on the first load candidate. Edge blocks split edges, so
+    // earlier and later ones leave the original blocks' loops as they
+    // were; only original blocks are queried.
+    let mut la: Option<LoopAnalysis> = None;
     // Snapshot: edge blocks we add end in `jump` and are never
     // rescanned, so in-place iteration is safe but needlessly fuzzy.
     for b in func.layout.blocks().collect::<Vec<_>>() {
@@ -379,12 +374,19 @@ pub fn run(func: &mut Function) -> usize {
             let Some(set) = sink_set(func, &uses, b, edge) else {
                 continue;
             };
-            if let Some(la) = &la
-                && set.iter().any(|&d| !pure_op(func, d))
-                && (!exits_loop(func, la, b, edge)
-                    || func.layout.block_insts(b).any(|i| func.dfg.insts[i].opcode().is_call()))
-            {
-                continue;
+            if set.iter().any(|&d| !pure_op(func, d)) {
+                let la = la.get_or_insert_with(|| {
+                    let cfg = ControlFlowGraph::with_function(func);
+                    let dt = DominatorTree::with_function(func, &cfg);
+                    let mut la = LoopAnalysis::new();
+                    la.compute(func, &cfg, &dt);
+                    la
+                });
+                if !exits_loop(func, la, b, edge)
+                    || func.layout.block_insts(b).any(|i| func.dfg.insts[i].opcode().is_call())
+                {
+                    continue;
+                }
             }
             if apply(func, b, edge, &set) {
                 changed += set.len();

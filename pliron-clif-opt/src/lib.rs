@@ -12,6 +12,7 @@ pub mod latchspec;
 pub mod mergejump;
 pub mod bittab;
 pub mod brifsel;
+pub mod ivdown;
 pub mod ivptr;
 pub mod bytescan;
 pub mod brchain;

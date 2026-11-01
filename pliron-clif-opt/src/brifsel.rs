@@ -1,5 +1,5 @@
 //! Branch-argument selects on the branch's own condition
-//! (`PLIRON_BRIFSEL=1`).
+//! (`PLIRON_BRIFSEL`, `=0` disables).
 //!
 //! `brif c, T(.., select c, a, b, ..), E(.., select c, a, b, ..)`: on the
 //! edge to `T` the select is `a`, on the edge to `E` it is `b`. The

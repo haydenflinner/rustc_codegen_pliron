@@ -4807,7 +4807,7 @@ pub fn run_rnn(
     // `deadp` dissolve single-source params into their incoming values: an
     // inlined clone's entry param carries its callee's `nonnull` fact
     // (`PLIRON_INLINENN`), which must not move to the caller's value.
-    if pliron_cfg::env_is("PLIRON_INLINENN", "1") {
+    if pliron_cfg::pass_enabled("PLIRON_INLINENN") {
         fnn(func, loads, derived, None, &mut cd, rnn);
     }
     if sh & shape::JUMP != 0 {

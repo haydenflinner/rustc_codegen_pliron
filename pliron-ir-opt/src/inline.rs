@@ -2698,7 +2698,7 @@ fn frozen_of(
 /// like `frozen_args`' `region_frozen_op`, so it survives the clone's
 /// entry params being merged away. LLVM gets this by simplifying callees
 /// with their own param attributes before inlining them (num-bigint-dig's
-/// `add_mul_vvw` zip). Opt-in: `PLIRON_INLINENN=1`.
+/// `add_mul_vvw` zip). `PLIRON_INLINENN=0` disables.
 fn nonnull_args(
     ctx: &Context,
     st: &mut State,
@@ -2707,7 +2707,7 @@ fn nonnull_args(
     map: &IrMapping,
     call_args: &[Value],
 ) {
-    if !pliron_cfg::env_is("PLIRON_INLINENN", "1") {
+    if !pliron_cfg::pass_enabled("PLIRON_INLINENN") {
         return;
     }
     let Some(entry) = src.first().and_then(|b| map.lookup_block(*b)) else {

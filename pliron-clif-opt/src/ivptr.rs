@@ -1,4 +1,5 @@
-//! Index-derived pointers back to pointer increments (`PLIRON_IVPTR=1`).
+//! Index-derived pointers back to pointer increments (`PLIRON_IVPTR`,
+//! `=0` disables).
 //!
 //! The `TrustedRandomAccess` zip addresses elements as `base + i * s`:
 //! once the per-element `Option` test folds (`PLIRON_INLINENN`) and its

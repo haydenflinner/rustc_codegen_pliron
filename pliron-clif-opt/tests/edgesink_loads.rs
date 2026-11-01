@@ -1,4 +1,4 @@
-//! `PLIRON_EDGESINK_LOADS=1`: a `notrap` load used only by one `brif`
+//! `PLIRON_EDGESINK_LOADS` (default on): a `notrap` load used only by one `brif`
 //! edge (a loop's length reload feeding only its exit) sinks onto that
 //! edge, unless something after it in the block may write memory.
 //! Differentially checked.

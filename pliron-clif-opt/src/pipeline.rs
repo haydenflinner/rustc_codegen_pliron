@@ -3739,6 +3739,14 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_ivdown(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::ivdown::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("ivdown");
+    }
+    k
+}
+
 fn s_brifsel(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = crate::brifsel::run(&mut p.clctx.func);
     if k > 0 {
@@ -3972,7 +3980,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `brif c` args that are `select c, a, b`: `a`/`b` per edge (the
         // TrustedRandomAccess zip's if-converted index update becomes
         // affine before the IV passes below).
-        step("brifsel", "brifsel", Gate::OptIn("PLIRON_BRIFSEL"), s_brifsel).needs(shape::CONDBR),
+        step("brifsel", "brifsel", Gate::Env("PLIRON_BRIFSEL"), s_brifsel).needs(shape::CONDBR),
         // Lockstep pointer IVs (`zip`/slice `cmp`/`eq`): one exit test.
         step("zipiv", "zipiv", Gate::OptIn("PLIRON_ZIPIV"), s_zipiv).needs(shape::LOOPS),
         // Re-time rotated loops that test the pre-increment IV so the latch
@@ -4192,7 +4200,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("looprot2", "looprot", Gate::OptIn("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         // `p' = B + s*i` with `i' = i + 1` and a matching entry: `p + s`
         // (late: the loop must be rotated and its addresses simplified).
-        step("ivptr", "ivptr", Gate::OptIn("PLIRON_IVPTR"), s_ivptr).needs(shape::LOOPS),
+        step("ivptr", "ivptr", Gate::Env("PLIRON_IVPTR"), s_ivptr).needs(shape::LOOPS),
+        // An index left only as a trip counter (after `ivptr`) counts
+        // down to zero: `sub; cbnz` instead of `add; cmp; b.ne`.
+        step("ivdown", "ivdown", Gate::Env("PLIRON_IVDOWN"), s_ivdown).needs(shape::LOOPS),
         cstep("slotmerge", "", Gate::Env("PLIRON_SLOTMERGE"), s_slotmerge).needs(shape::SLOT),
         step("memcall", "memcall", Gate::Env("PLIRON_MEMCALL"), s_memcall).needs(shape::CALL),
         // Fold constants any earlier pass left behind — late value folds
