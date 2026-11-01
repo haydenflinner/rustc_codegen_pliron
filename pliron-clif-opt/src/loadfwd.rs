@@ -1500,6 +1500,21 @@ pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
     }
 }
 
+/// `may_write` under `kill_st`'s full keep rule: a store to another root
+/// can't reach an isolated or bounded-escape (`ncc`) root's memory, nor
+/// can a store to such a root reach anything else. PRE's "clobbered
+/// earlier in this block?" check must agree with the availability sets
+/// it was computed against, or a store to an unrelated `Vec` header
+/// (`v25+152` in regex's `follow_epsilons`) blocks PRE of a `noalias`
+/// param's fields.
+fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>, ncc: &FxHashSet<Root>) -> bool {
+    let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
+    if w.0 != l.0 && (shel(&w.0) || shel(&l.0)) {
+        return false;
+    }
+    may_write(w, ms, l)
+}
+
 /// `PLIRON_LOADFWD_NARROW=0` disables forwarding a narrower or extending
 /// load from a wider stored value.
 static NARROW: std::sync::LazyLock<bool> =
@@ -1877,6 +1892,12 @@ fn pre(
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
     // Would block `x` keep `loc` if it were available at its start (the
     // same transfer as the `out` fixpoint)? For `edge_pre`'s upward walk.
+    // The entry value must survive, not just the key: a block that
+    // overwrites `loc` and then reloads it ends with `loc` available under
+    // a new value, and PRE would hand the chain the stale entry value
+    // (fuzz seed 27992: block27 stored to `v6` and reloaded it; the
+    // `out` fixpoint had dropped the reload at `MAX_ENTRIES`, so PRE
+    // went upward through block27).
     let preserves = |f: &Function, x: Block, loc: Loc| -> bool {
         let mut av: Avail = std::iter::once((loc, Value::reserved_value())).collect();
         transfer(
@@ -1901,7 +1922,7 @@ fn pre(
             eh,
             &nm,
         );
-        av.contains_key(&loc)
+        av.get(&loc) == Some(&Value::reserved_value())
     };
     // `nm` covers the apply scan too — `func` mutates only through
     // `edge_pre`'s add-only inserts and the `fwd` rewrites below.
@@ -1944,7 +1965,7 @@ fn pre(
                             }
                         }
                     } else if !clobbered
-                        && writes.iter().all(|&(w, ms)| !may_write(w, ms, loc))
+                        && writes.iter().all(|&(w, ms)| !may_write_iso(w, ms, loc, iso, ncc))
                         && let Some(v) =
                             edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves))
                     {
