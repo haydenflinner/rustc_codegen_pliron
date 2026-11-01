@@ -346,11 +346,42 @@ Evening (2026-10-31):
   `BRIFSEL` limited to selects only the branch uses, blind-sig is **1.209
   vs default 1.274**. pulldown regresses 1.305 -> 1.550 under the same
   flags: `parse_block` 200 -> 442 samples, only with the INLINENN facts
-  (a facts-free replay shows no BRIFSEL change). Next: put `region_nn`
-  in the `PLIRON_CORPUS` dump so clif-check can replay it, then find
-  what BRIFSEL does to parse_block. Tried and
+  (a facts-free replay shows no BRIFSEL change). Tried and
   not enough alone: INBOUNDSNN, ASSUMENN, RETNN (MIR inlining removed
   `deref`'s call; smallvec 1.10's heap pointer is a raw `*mut T`).
+  Resolved (2026-10-31 night): `PLIRON_CORPUS` headers now carry the
+  region facts (`diffcheck-bregion/rparent/rnn`) and clif-check replays
+  them. The pulldown regression was `EDGESINK_LOADS`, not BRIFSEL (that
+  1.550 predates the BRIFSEL restriction): slot reloads after a call in
+  `parse_block`'s byte-scan loop moved onto the loop's exit edge, and the
+  scan index lost its register across the call (`ldr/add/str` per byte,
+  parse_block 308 -> 667 samples). Loads now sink only onto edges leaving
+  the block's innermost loop, from call-free blocks. New `ivdown`: an
+  index left only as a trip counter after `ivptr` counts down to zero,
+  the counter itself the `brif` condition (`sub; cbnz`); and Cranelift
+  patch 91 (flag twins) fuses montgomery's `add` + `cmn` into one
+  `adds`. Montgomery's inner loop is now LLVM's 11 instructions. All of
+  INLINENN, BRIFSEL, IVPTR, EDGESINK_LOADS and IVDOWN are default since
+  92bf1ac (batch 20: gate, crates, fuzz 21200:21600; held-out geomean
+  1.208 vs 1.230 with them off; blind-sig 1.275 -> 1.156). With flag
+  twins blind-sig is 1.113 (interleaved). Left on blind-sig: SmallVec's
+  `extend(repeat(0).take(n))` (28 vs 4 samples): LLVM folds its two exits
+  (`len < cap`, iterator left) into one `umin` trip count and stores
+  `stp q0, q0` x2 per trip; we unroll x8 with a test per copy. Needed:
+  multi-exit trip counts (a counted pre-loop of `umin(...)` trips that
+  falls into the original loop for the last exit), then loopidiom or
+  loopvec on the single-exit pre-loop.
+- **Small memcmp** (opt-in `memcmpk`, after `ifconv2`): `memcmp`/`bcmp`
+  with a constant `n <= 16` inline (exact sign for 1/2/4/8 via
+  byte-swapped loads; others under zero tests only). pulldown's
+  `HtmlWriter::run` made ~30 `memcmp(.., .., 1)` try_calls
+  (`ends_with('\n')`): 1.309 -> 1.260. Also opt-in
+  `PLIRON_INLINE_COLDONCE` (no free single-site inlining of `#[cold]`
+  callees: `Vec::reserve` had swallowed its grow path). Its callers in
+  other CGUs still see `reserve` as an import with no body: the xcgu
+  copier can't copy it because `do_reserve_and_handle` is `#[cold]`
+  (excluded) and internal to its home CGU; allowing cold copies wasn't
+  enough on its own (still 45 calls), not chased further.
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
   byte-set scans over constant tables (pulldown's `escape_html_scalar`
   -2.2% on dense input; 3.5x on a sparse repro), with table bytes from
