@@ -199,10 +199,32 @@ fn iconst_bits(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
-/// The `(icmp inst, cc, x, k)` a block's `brif` tests, with the constant
-/// normalized to the right-hand side. `None` unless the terminator is `brif`
-/// on an in-block `icmp`.
-fn test_of(func: &Function, b: Block) -> Option<(Inst, IntCC, Value, u64)> {
+/// `s` shifted by `-d` mod 2^bits: the `x` set where `x + d` is in `s`.
+fn shift(s: &ISet, d: u64, bits: u32) -> ISet {
+    let d = mask(d, bits);
+    if d == 0 {
+        return s.clone();
+    }
+    let max = mask(u64::MAX, bits);
+    let mut out: ISet = Vec::new();
+    for &(a, b) in s {
+        let (na, nb) = (mask(a.wrapping_sub(d), bits), mask(b.wrapping_sub(d), bits));
+        if na <= nb {
+            union(&mut out, &vec![(na, nb)]);
+        } else {
+            union(&mut out, &vec![(0, nb)]);
+            union(&mut out, &vec![(na, max)]);
+        }
+    }
+    out
+}
+
+/// The `(icmp inst, cc, x, k, d)` a block's `brif` tests: `x + d` against
+/// `k`, with the constant normalized to the right-hand side. `x + d` is an
+/// in-block `iadd x, d` (`d` = 0 without one): `PLIRON_SWITCH_CHAIN` and
+/// brchain test a run of cases as `x - lo <=u hi - lo`. `None` unless the
+/// terminator is `brif` on an in-block `icmp`.
+fn test_of(func: &Function, b: Block) -> Option<(Inst, IntCC, Value, u64, u64)> {
     let t = func.layout.last_inst(b)?;
     let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
         return None;
@@ -220,14 +242,33 @@ fn test_of(func: &Function, b: Block) -> Option<(Inst, IntCC, Value, u64)> {
         return None;
     };
     let (a, b2) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b2));
-    if let Some(k) = iconst_bits(func, b2) {
-        Some((ci, cond, a, k as u64))
+    let (cond, v, k) = if let Some(k) = iconst_bits(func, b2) {
+        (cond, a, k as u64)
     } else {
-        iconst_bits(func, a).map(|k| (ci, cond.swap_args(), b2, k as u64))
+        (cond.swap_args(), b2, iconst_bits(func, a)? as u64)
+    };
+    // `v = iadd x, d` in this block (with `PLIRON_SWITCH_CHAIN`, which emits
+    // that form).
+    if *OFF_IADD
+        && let Some(ai) = func.dfg.value_def(v).inst()
+        && func.layout.inst_block(ai) == Some(b)
+        && let InstructionData::Binary { opcode: Opcode::Iadd, args: [p, q] } = func.dfg.insts[ai]
+    {
+        if let Some(d) = iconst_bits(func, q) {
+            return Some((ci, cond, func.dfg.resolve_aliases(p), k, d as u64));
+        }
+        if let Some(d) = iconst_bits(func, p) {
+            return Some((ci, cond, func.dfg.resolve_aliases(q), k, d as u64));
+        }
     }
+    Some((ci, cond, v, k, 0))
 }
 
-/// `b` may join the fold region: every inst is `iconst`/`icmp`/`brif`/`jump`;
+static OFF_IADD: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_CHAIN", "1"));
+
+/// `b` may join the fold region: every inst is `iconst`/`icmp`/`brif`/`jump`
+/// (and, with `PLIRON_SWITCH_CHAIN`, the `iadd` of an offset test);
 /// a `brif` must test an in-block `icmp`, and a `jump` (pure glue) must have
 /// an empty arg list so sets propagate unchanged.
 fn cand_ok(func: &Function, b: Block) -> bool {
@@ -235,7 +276,8 @@ fn cand_ok(func: &Function, b: Block) -> bool {
         if !matches!(
             func.dfg.insts[i].opcode(),
             Opcode::Iconst | Opcode::Icmp | Opcode::Brif | Opcode::Jump
-        ) {
+        ) && !(*OFF_IADD && func.dfg.insts[i].opcode() == Opcode::Iadd)
+        {
             return false;
         }
     }
@@ -292,7 +334,7 @@ fn try_tree(
     ublocks: &FxHashMap<Value, FxHashSet<Block>>,
     root: Block,
 ) -> Option<Plan> {
-    let (_, _, x0, _) = test_of(func, root)?;
+    let (_, _, x0, _, _) = test_of(func, root)?;
     let x = canon(func, cfg, x0);
     let ty = func.dfg.value_type(x);
     if !ty.is_int() || ty.bits() > 64 {
@@ -337,7 +379,7 @@ fn try_tree(
             // candidate budget with the miss path's later dispatch
             // (serde_json's `has_next_key`: `x - 9 in {0, 1, 4, 23}`, then
             // tests for `}` and `"` on the raw byte) and gave up.
-            let same_x = test_of(func, db).is_none_or(|(_, _, y, _)| canon(func, cfg, y) == x);
+            let same_x = test_of(func, db).is_none_or(|(_, _, y, _, _)| canon(func, cfg, y) == x);
             if seen.insert(db) && db != root && same_x && cand_ok(func, db) {
                 cand.insert(db);
                 work.push(db);
@@ -422,13 +464,13 @@ fn try_tree(
                 out.push((db, dargs, iset));
             }
             InstructionData::Brif { blocks, .. } => {
-                let Some((_, cc, bx, k)) = test_of(func, b) else {
+                let Some((_, cc, bx, k, d)) = test_of(func, b) else {
                     return None;
                 };
                 if canon(func, cfg, bx) != x {
                     return None;
                 }
-                let s = sat(cc, k, bits);
+                let s = shift(&sat(cc, k, bits), d, bits);
                 let c = complement(&s, bits);
                 for (i, bc) in blocks.iter().enumerate() {
                     let eset = meet(&iset, if i == 0 { &s } else { &c });
