@@ -124,6 +124,202 @@ pub fn clean_fn(ctx: &mut Context, st: &mut State, pure: &Pure, f: Ptr<Operation
     c
 }
 
+/// The constant bits of `v` (a `Bits` or `Zero` constant).
+fn const_bits(st: &State, v: Value) -> Option<u128> {
+    match st.consts.get(v)? {
+        crate::state::ConstVal::Bits(b) => Some(*b),
+        crate::state::ConstVal::Zero => Some(0),
+        _ => None,
+    }
+}
+
+/// `PLIRON_INLINE_SIMP`: a `cond_br` or `switch` on a constant becomes a
+/// `br` to the taken edge, and the blocks no longer reachable go
+/// (`erase_unreachable`). Returns the number of folded branches.
+pub fn fold_branches(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> usize {
+    use pliron::r#type::Typed;
+    let mut folds: Vec<(Ptr<Operation>, Ptr<BasicBlock>, Vec<Value>)> = vec![];
+    for b in blocks(ctx, f) {
+        let Some(term) = b.deref(ctx).get_terminator(ctx) else { continue };
+        if let Some(cb) = Operation::get_op::<CondBrOp>(term, ctx) {
+            let Some(k) = const_bits(st, term.deref(ctx).get_operand(ctx, 0)) else { continue };
+            let (i, ods) = if k & 1 != 0 {
+                (0, cb.get_true_dest_operands(ctx))
+            } else {
+                (1, cb.get_false_dest_operands(ctx))
+            };
+            folds.push((term, term.deref(ctx).get_successor(ctx, i), ods));
+        } else if let Some(sw) = Operation::get_op::<SwitchOp>(term, ctx) {
+            let c = term.deref(ctx).get_operand(ctx, 0);
+            let Some(k) = const_bits(st, c) else { continue };
+            let crate::types::TyK::Int(w) = crate::types::classify(ctx, c.get_type(ctx)) else { continue };
+            if w == 0 || w > 128 {
+                continue;
+            }
+            let m = if w == 128 { u128::MAX } else { (1u128 << w) - 1 };
+            let cases = sw.cases(ctx);
+            match cases.iter().position(|x| x.value.value().to_u128() & m == k & m) {
+                Some(j) => folds.push((term, cases[j].dest, cases[j].dest_opds.clone())),
+                None => folds.push((term, sw.default_dest(ctx), sw.default_dest_operands(ctx))),
+            }
+        }
+    }
+    let n = folds.len();
+    for (term, dst, ods) in folds {
+        let br = BrOp::new(ctx, dst, ods).get_operation();
+        br.insert_before(ctx, term);
+        Operation::erase(term, ctx);
+    }
+    if n > 0 {
+        let bs = blocks(ctx, f);
+        let om: FxHashMap<_, _> = bs.iter().map(|&b| (b, b.deref(ctx).iter(ctx).collect::<Vec<_>>())).collect();
+        crate::helpers::erase_unreachable(ctx, st, &bs, &|b| om[&b].clone());
+    }
+    n
+}
+
+/// `PLIRON_INLINE_SIMP`: integer casts and compares of constants become
+/// constants (instcombine covers only two- and three-operand arithmetic).
+fn fold_const_ops(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> usize {
+    use crate::types::{TyK, classify};
+    use pliron::r#type::Typed;
+    use pliron_llvm::attributes::ICmpPredicateAttr as P;
+    let width = |ctx: &Context, v: Value| match classify(ctx, v.get_type(ctx)) {
+        TyK::Int(w) if (1..=128).contains(&w) => Some(w),
+        _ => None,
+    };
+    let mask = |w: u32| if w == 128 { u128::MAX } else { (1u128 << w) - 1 };
+    let sext = |b: u128, w: u32| -> i128 { ((b << (128 - w)) as i128) >> (128 - w) };
+    let mut n = 0;
+    for b in blocks(ctx, f) {
+        let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+        for op in ops {
+            if op.deref(ctx).get_num_results() != 1 {
+                continue;
+            }
+            let r = op.deref(ctx).get_result(ctx, 0);
+            let Some(rw) = width(ctx, r) else { continue };
+            let args: Vec<Value> = op.deref(ctx).operands(ctx).collect();
+            let k = if Operation::is_op::<ZExtOp>(op, ctx) || Operation::is_op::<TruncOp>(op, ctx) {
+                let ([a], Some(w)) = (args.as_slice(), args.first().and_then(|&a| width(ctx, a))) else { continue };
+                let Some(x) = const_bits(st, *a) else { continue };
+                (x & mask(w)) & mask(rw)
+            } else if Operation::is_op::<SExtOp>(op, ctx) {
+                let ([a], Some(w)) = (args.as_slice(), args.first().and_then(|&a| width(ctx, a))) else { continue };
+                let Some(x) = const_bits(st, *a) else { continue };
+                (sext(x & mask(w), w) as u128) & mask(rw)
+            } else if let Some(ic) = Operation::get_op::<ICmpOp>(op, ctx) {
+                let ([a, c], Some(w)) = (args.as_slice(), args.first().and_then(|&a| width(ctx, a))) else { continue };
+                let (Some(x), Some(y)) = (const_bits(st, *a), const_bits(st, *c)) else { continue };
+                let (x, y) = (x & mask(w), y & mask(w));
+                let (sx, sy) = (sext(x, w), sext(y, w));
+                u128::from(match ic.predicate(ctx) {
+                    P::EQ => x == y,
+                    P::NE => x != y,
+                    P::ULT => x < y,
+                    P::ULE => x <= y,
+                    P::UGT => x > y,
+                    P::UGE => x >= y,
+                    P::SLT => sx < sy,
+                    P::SLE => sx <= sy,
+                    P::SGT => sx > sy,
+                    P::SGE => sx >= sy,
+                })
+            } else {
+                continue;
+            };
+            let kv = crate::sroa::mk_const(ctx, st, r.get_type(ctx), crate::state::ConstVal::Bits(k));
+            r.replace_all_uses_with(ctx, &kv);
+            Operation::erase(op, ctx);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Whether `f`'s CFG has a cycle (a back edge in a DFS from the entry).
+pub fn has_loop(ctx: &Context, f: Ptr<Operation>) -> bool {
+    let bs = blocks(ctx, f);
+    let Some(&entry) = bs.first() else { return false };
+    // 1 = on the DFS stack, 2 = done.
+    let mut state: FxHashMap<Ptr<BasicBlock>, u8> = FxHashMap::default();
+    let succs = |b: Ptr<BasicBlock>| -> Vec<Ptr<BasicBlock>> {
+        b.deref(ctx).get_terminator(ctx).map(|t| t.deref(ctx).successors(ctx).collect()).unwrap_or_default()
+    };
+    let mut stack: Vec<(Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>)> = vec![(entry, succs(entry))];
+    state.insert(entry, 1);
+    while let Some((b, rest)) = stack.last_mut() {
+        match rest.pop() {
+            Some(s) => match state.get(&s) {
+                Some(1) => return true,
+                Some(_) => {}
+                None => {
+                    state.insert(s, 1);
+                    let ss = succs(s);
+                    stack.push((s, ss));
+                }
+            },
+            None => {
+                state.insert(*b, 2);
+                stack.pop();
+            }
+        }
+    }
+    false
+}
+
+/// `PLIRON_INLINE_SIMP=1`: simplify a function the bottom-up inliner has
+/// finished with, before its callers score it: SROA, const-global loads,
+/// instcombine, constant branches, DCE and block merge. LLVM runs its
+/// function simplification pipeline on each SCC before the callers' inline
+/// decisions; scoring the unsimplified body charged pulldown's
+/// `append_text` for all of a derived `PartialEq::eq` that folds to one
+/// compare against its constant operand.
+pub fn simplify_fn(
+    ctx: &mut Context,
+    st: &mut State,
+    pure: &Pure,
+    images: &mut crate::constload::ImageCache,
+    f: Ptr<Operation>,
+) {
+    if st.dbg.is_some() {
+        return;
+    }
+    // `PLIRON_SIMP_PARTS` (debug bisect mask, default all): 1 phisimp,
+    // 2 sroa, 4 constload, 8 const casts/compares, 16 instcombine,
+    // 32 constant branches, 64 DCE + block merge.
+    let parts: u32 = crate::env_get("PLIRON_SIMP_PARTS").and_then(|v| v.parse().ok()).unwrap_or(127);
+    if parts & 1 != 0 {
+        crate::phisimp::run_fn(ctx, st, f);
+    }
+    if parts & 2 != 0 {
+        crate::sroa::run_fn(ctx, st, f);
+    }
+    for _ in 0..2 {
+        let mut changed = 0;
+        if parts & 4 != 0 {
+            changed += crate::constload::run_fn(ctx, st, f, images);
+        }
+        if parts & 8 != 0 {
+            changed += fold_const_ops(ctx, st, f);
+        }
+        if parts & 16 != 0 {
+            changed += crate::instcombine::run_one(ctx, st, f);
+        }
+        let folded = if parts & 32 != 0 { fold_branches(ctx, st, f) } else { 0 };
+        changed += folded;
+        if folded > 0 && parts & 1 != 0 {
+            changed += crate::phisimp::run_fn(ctx, st, f);
+        }
+        if changed == 0 {
+            break;
+        }
+    }
+    if parts & 64 != 0 {
+        clean_fn(ctx, st, pure, f);
+    }
+}
+
 /// `clean_fn` over every optimizable body of the module.
 pub fn clean_all(ctx: &mut Context, st: &mut State) -> Cleaned {
     let pure = Pure::new();

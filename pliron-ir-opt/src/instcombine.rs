@@ -382,6 +382,13 @@ fn run_fn_egg(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, u
 }
 
 // r[impl iropt.instcombine]
+/// One function's instcombine (the module pass's per-function body,
+/// without the egg variant): the inliner's callee simplification.
+pub fn run_one(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> usize {
+    let (c, v) = run_fn(ctx, st, f);
+    c + v + fold_divmul(ctx, st, f)
+}
+
 pub fn run(ctx: &mut Context, st: &mut State) {
     let egg = crate::env_get("PLIRON_INSTCOMBINE").as_deref() == Some("egg");
     let (mut nc, mut nv) = (0, 0);

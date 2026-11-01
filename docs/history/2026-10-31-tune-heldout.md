@@ -418,3 +418,26 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   pulldown 1.195 -> 1.184 median but equal minimum, json -0.2%, blind-sig
   and regex noisy, blake3 equal. Not a clear win; both stay off.
   `append_text` needs the callee-simplification work (codegen-plan).
+- **Callee simplification before scoring** (`PLIRON_INLINE_SIMP`,
+  opt-in; per-pass `run_fn`s for phisimp, sroa, constload, instcombine,
+  plus constant cast/compare and branch folding in `cleanup.rs`). The
+  inlined `eq`'s clone entry took `&ItemBody::Text` as a block param, so
+  constload saw nothing until phisimp forwarded single-pred params; then
+  `zext` of the folded discriminant needed a cast folder before the
+  switch folded. `append_text` went n=313 -> 99. Interleaved at load ~5
+  (7 rounds, ratio to LLVM):
+
+  | variant | pulldown | json | regex | blind-sig |
+  |---|---|---|---|---|
+  | current | 1.193 | 1.147 | 1.217 | 1.088 |
+  | SIMP=1 | 1.317-1.336 | 1.206-1.213 | 1.228 | 1.105-1.143 |
+  | SIMP=2 (score before simplifying) | 1.278-1.321 | 1.216-1.247 | 1.213 | 1.095 |
+  | SIMP=3 (loop-free only) | 1.171 | 1.175 | 1.227 | 1.121 |
+  | SIMP=3 + XCGU_SIZE=200 (`append_text` fully inlined) | 1.193 | 1.174 | 1.282 | 1.222 |
+
+  Parts bisect under SIMP=2: early SROA alone is pulldown's +10%; DCE +
+  block merge is json's. SIMP=1 with constant folding only puts serde's
+  escape loop into `Compound::serialize_field` (json +18%): a looping
+  callee that measures smaller gets inlined where LLVM keeps it out.
+  Lower base limits (240, 200) with SIMP are worse everywhere. Not a
+  win; left off. Default codegen is byte-identical after the refactors.

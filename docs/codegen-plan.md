@@ -457,6 +457,16 @@ Evening (2026-10-31):
   before its callers inline it). Ours scores the unfolded body, and
   `PLIRON_INLINE_CLEAN` (DCE + block merge, uncounted) does not fold
   constant loads or switches.
+  Tried (2026-11-01, `PLIRON_INLINE_SIMP`, opt-in): the bottom-up
+  inliner simplifies each finished caller before scoring it (phisimp,
+  SROA, const-global loads, const casts/compares, instcombine, constant
+  branches, DCE). `append_text` drops to n=99 and inlines at all 19
+  sites (with `PLIRON_XCGU_SIZE=200`), yet pulldown does not speed up:
+  its call overhead was not the cost. Globally it reshuffles inlining
+  (serde's escape loop lands in `serialize_field`, json +8-18%; early
+  SROA alone costs pulldown +10%); `=3` (loop-free callers only) is
+  pulldown -2%, json/regex/blind-sig +1-3%. Left off; the pieces
+  (`run_fn` per pass, `PLIRON_SIMP_PARTS` bisect mask) remain.
 
 ## Sequencing (revised 2026-10-31, after the census)
 

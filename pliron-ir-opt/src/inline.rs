@@ -1131,6 +1131,14 @@ pub fn run(
     };
     // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
     let bottom_up = !always_only && crate::pass_enabled("PLIRON_INLINE_BU");
+    let simp_late = crate::env_is("PLIRON_INLINE_SIMP", "2");
+    // `=3`: only loop-free callers (a looping body that measures smaller
+    // gets inlined into its callers: serde's escape loop into
+    // `serialize_field`, +8% json).
+    let simp_noloop = crate::env_is("PLIRON_INLINE_SIMP", "3");
+    let mut simp = (bottom_up && (crate::env_is("PLIRON_INLINE_SIMP", "1") || simp_late || simp_noloop))
+        .then(|| (crate::cleanup::Pure::new(), crate::constload::ImageCache::default()));
+    let mut simp_n = 0usize;
     // EH-invoke inlining grows code ~14% (regex-syntax), so size-sensitive output skips it.
     let eh_invoke = crate::env_get("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
     let cap: usize = crate::env_get("PLIRON_INLINE_CALLER_MAX")
@@ -1729,7 +1737,28 @@ pub fn run(
             t_call += t0.elapsed().as_secs_f64() * 1e3;
             t0 = std::time::Instant::now();
         }
-        if bottom_up {
+        // `PLIRON_INLINE_SIMP=1`: simplify a caller that received code
+        // before scoring it as a callee (`cleanup::simplify_fn`); `=2`
+        // simplifies after scoring (same verdicts, isolates the rewrite).
+        if simp_late && bottom_up {
+            add_info!(&sym);
+        }
+        if let Some((p, images)) = &mut simp
+            && delta.callers.contains(&sym)
+            && !st.opt_skip.contains(&caller)
+            && !(simp_noloop && crate::cleanup::has_loop(ctx, caller))
+        {
+            let dump = crate::env_get("PLIRON_DUMPFN").is_some_and(|w| sym.contains(w)) && pliron_cfg::tracing_on();
+            if dump {
+                tracing::info!(target: "pliron::dump", "==== pre-simp {sym} ====\n{}", pliron::printable::Printable::disp(&*caller.deref(ctx), ctx));
+            }
+            crate::cleanup::simplify_fn(ctx, st, p, images, caller);
+            if dump {
+                tracing::info!(target: "pliron::dump", "==== post-simp {sym} ====\n{}", pliron::printable::Printable::disp(&*caller.deref(ctx), ctx));
+            }
+            simp_n += 1;
+        }
+        if bottom_up && !simp_late {
             add_info!(&sym);
         }
         // Clean a caller that received code, before its own callers clone
@@ -1747,6 +1776,9 @@ pub fn run(
     if freed_ops > 0 {
         st.purge_dead(ctx);
         freed_total += freed_ops;
+    }
+    if simp_n > 0 && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "inline-simp {}: simplified {simp_n} callers", st.cgu);
     }
     if freed_total > 0 && pliron_cfg::tracing_on() {
         tracing::info!(target: "pliron::stats", "deadfree {}: inliner freed {freed_total} ops", st.cgu);

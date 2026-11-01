@@ -1548,6 +1548,72 @@ pub fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
 }
 
 // r[impl iropt.bisect]
+/// SROA on one function (the module pass's per-function body; also the
+/// inliner's callee simplification, `PLIRON_INLINE_SIMP`).
+pub fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) {
+    // No alloca anywhere: `forward_single_store`, the split rounds
+    // and the trailing cleanup all have nothing to do.
+    let mut wl = allocas(ctx, f);
+    if wl.is_empty() {
+        return;
+    }
+    // The `Dom` survives both `forward_single_store` calls — neither
+    // it nor `split` moves edges; only a spliced invoke-pad
+    // trampoline (flagged by `cfg_dirty`) forces a rebuild.
+    let mut dom: Option<crate::domcheck::Dom> = None;
+    let mut dom_stale = false;
+    // Again after `phisimp`: loads that went through trivial block args
+    // now name the slot directly.
+    if crate::pass_enabled("PLIRON_SROA_FWD") {
+        forward_single_store_d(ctx, st, f, &mut dom);
+    }
+    // Retry worklist instead of rescanning the body each round:
+    // `split` erases its alloca only when the rewrite left it
+    // unused — anything still in `st.allocas` (failed splits and
+    // partial splits alike) is what the next round's rescan would
+    // have retried, plus the ops `split` created, which sat just
+    // before their parent in the scan. Order is preserved exactly.
+    let bname = crate::bisect_name(st, f);
+    for _round in 0..3 {
+        let mut changed = false;
+        let mut retry = Vec::new();
+        let mut made = Vec::new();
+        for op in wl.drain(..) {
+            let a = op.deref(ctx).get_result(ctx, 0);
+            let mut cfg_dirty = false;
+            // One PLIRON_OPT_BISECT unit per split attempt.
+            changed |= crate::bisect_in("sroa", &bname)
+                && split(ctx, st, op, &mut made, &mut cfg_dirty);
+            dom_stale |= cfg_dirty;
+            retry.extend(made.drain(..));
+            if st.allocas.contains(a) {
+                retry.push(op);
+            }
+        }
+        if !changed {
+            break;
+        }
+        wl = retry;
+    }
+    // And after splitting: a slice left holding one stored value.
+    if crate::pass_enabled("PLIRON_SROA_FWD") {
+        if dom_stale {
+            dom = None;
+        }
+        forward_single_store_d(ctx, st, f, &mut dom);
+    }
+    for op in allocas(ctx, f) {
+        let a = op.deref(ctx).get_result(ctx, 0);
+        if !a.is_used(ctx) {
+            st.allocas.remove(a);
+            st.promoted.remove(a);
+            Operation::erase(op, ctx);
+            continue;
+        }
+        validate(ctx, st, a);
+    }
+}
+
 pub fn run(ctx: &mut Context, st: &mut State) {
     let funcs: Vec<Ptr<Operation>> = st
         .funcs
@@ -1556,67 +1622,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .filter(|&f| crate::opt_body(ctx, st, f))
         .collect();
     for f in funcs {
-        // No alloca anywhere: `forward_single_store`, the split rounds
-        // and the trailing cleanup all have nothing to do.
-        let mut wl = allocas(ctx, f);
-        if wl.is_empty() {
-            continue;
-        }
-        // The `Dom` survives both `forward_single_store` calls — neither
-        // it nor `split` moves edges; only a spliced invoke-pad
-        // trampoline (flagged by `cfg_dirty`) forces a rebuild.
-        let mut dom: Option<crate::domcheck::Dom> = None;
-        let mut dom_stale = false;
-        // Again after `phisimp`: loads that went through trivial block args
-        // now name the slot directly.
-        if crate::pass_enabled("PLIRON_SROA_FWD") {
-            forward_single_store_d(ctx, st, f, &mut dom);
-        }
-        // Retry worklist instead of rescanning the body each round:
-        // `split` erases its alloca only when the rewrite left it
-        // unused — anything still in `st.allocas` (failed splits and
-        // partial splits alike) is what the next round's rescan would
-        // have retried, plus the ops `split` created, which sat just
-        // before their parent in the scan. Order is preserved exactly.
-        let bname = crate::bisect_name(st, f);
-        for _round in 0..3 {
-            let mut changed = false;
-            let mut retry = Vec::new();
-            let mut made = Vec::new();
-            for op in wl.drain(..) {
-                let a = op.deref(ctx).get_result(ctx, 0);
-                let mut cfg_dirty = false;
-                // One PLIRON_OPT_BISECT unit per split attempt.
-                changed |= crate::bisect_in("sroa", &bname)
-                    && split(ctx, st, op, &mut made, &mut cfg_dirty);
-                dom_stale |= cfg_dirty;
-                retry.extend(made.drain(..));
-                if st.allocas.contains(a) {
-                    retry.push(op);
-                }
-            }
-            if !changed {
-                break;
-            }
-            wl = retry;
-        }
-        // And after splitting: a slice left holding one stored value.
-        if crate::pass_enabled("PLIRON_SROA_FWD") {
-            if dom_stale {
-                dom = None;
-            }
-            forward_single_store_d(ctx, st, f, &mut dom);
-        }
-        for op in allocas(ctx, f) {
-            let a = op.deref(ctx).get_result(ctx, 0);
-            if !a.is_used(ctx) {
-                st.allocas.remove(a);
-                st.promoted.remove(a);
-                Operation::erase(op, ctx);
-                continue;
-            }
-            validate(ctx, st, a);
-        }
+        run_fn(ctx, st, f);
     }
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
     {

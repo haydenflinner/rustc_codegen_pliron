@@ -223,17 +223,68 @@ pub fn forward_copies(ctx: &mut Context, st: &mut State) {
 }
 
 // r[impl iropt.constload]
-pub fn run(ctx: &mut Context, st: &mut State) {
-    // Nothing folds unless some global is a foldable const image.
-    if !st.globals.values().any(|g| {
+/// Const-global byte images, built on first use and shared across the
+/// functions a caller folds (`run`, the inliner's callee simplification).
+#[derive(Default)]
+pub struct ImageCache(FxHashMap<String, Option<Image>>);
+
+/// Whether any global could fold at all.
+pub fn any_foldable(st: &State) -> bool {
+    st.globals.values().any(|g| {
         !g.mutable
             && !g.tls
             && !matches!(g.linkage, Linkage::Import | Linkage::Preemptible)
             && g.init.is_some()
-    }) {
+    })
+}
+
+/// Fold `f`'s loads from immutable globals; returns how many folded.
+pub fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>, images: &mut ImageCache) -> usize {
+    let mut n = 0;
+    let ops: Vec<Ptr<Operation>> = f
+        .deref(ctx)
+        .get_region(ctx, 0)
+        .deref(ctx)
+        .iter(ctx)
+        .flat_map(|b| b.deref(ctx).iter(ctx).collect::<Vec<_>>())
+        .collect();
+    for op in ops {
+        if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(op) {
+            continue;
+        }
+        let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0)) else {
+            continue;
+        };
+        let img = images.0.entry(sym.clone()).or_insert_with(|| {
+            let g = st.globals.get(&sym)?;
+            if g.mutable || g.tls || matches!(g.linkage, Linkage::Import | Linkage::Preemptible) {
+                return None;
+            }
+            let mut img = Image::default();
+            image(ctx, st, g.init?, &mut img)?;
+            Some(img)
+        });
+        let r = op.deref(ctx).get_result(ctx, 0);
+        let Some(cv) = img.as_ref().and_then(|img| fold(ctx, img, off, r.get_type(ctx))) else {
+            continue;
+        };
+        if !crate::bisect_in("constload", "") {
+            continue;
+        }
+        let k = mk_const(ctx, st, r.get_type(ctx), cv);
+        r.replace_all_uses_with(ctx, &k);
+        Operation::erase(op, ctx);
+        n += 1;
+    }
+    n
+}
+
+pub fn run(ctx: &mut Context, st: &mut State) {
+    // Nothing folds unless some global is a foldable const image.
+    if !any_foldable(st) {
         return;
     }
-    let mut images: FxHashMap<String, Option<Image>> = FxHashMap::default();
+    let mut images = ImageCache::default();
     let fns: Vec<_> = st
         .funcs
         .values()
@@ -242,45 +293,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         .collect();
     let mut n = 0;
     for f in fns {
-        let ops: Vec<Ptr<Operation>> = f
-            .deref(ctx)
-            .get_region(ctx, 0)
-            .deref(ctx)
-            .iter(ctx)
-            .flat_map(|b| b.deref(ctx).iter(ctx).collect::<Vec<_>>())
-            .collect();
-        for op in ops {
-            if !Operation::is_op::<LoadOp>(op, ctx) || st.volatile.contains(op) {
-                continue;
-            }
-            let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0)) else {
-                continue;
-            };
-            let img = images.entry(sym.clone()).or_insert_with(|| {
-                let g = st.globals.get(&sym)?;
-                if g.mutable || g.tls || matches!(g.linkage, Linkage::Import | Linkage::Preemptible)
-                {
-                    return None;
-                }
-                let mut img = Image::default();
-                image(ctx, st, g.init?, &mut img)?;
-                Some(img)
-            });
-            let r = op.deref(ctx).get_result(ctx, 0);
-            let Some(cv) = img
-                .as_ref()
-                .and_then(|img| fold(ctx, img, off, r.get_type(ctx)))
-            else {
-                continue;
-            };
-            if !crate::bisect_in("constload", "") {
-                continue;
-            }
-            let k = mk_const(ctx, st, r.get_type(ctx), cv);
-            r.replace_all_uses_with(ctx, &k);
-            Operation::erase(op, ctx);
-            n += 1;
-        }
+        n += run_fn(ctx, st, f, &mut images);
     }
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
     {
