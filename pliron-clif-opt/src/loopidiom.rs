@@ -644,6 +644,15 @@ pub fn trip_max(
     if !crate::pass_enabled("PLIRON_TRIPMAX") || step <= 0 {
         return None;
     }
+    // Constant start and bound (`for i in 1..MAX_UTF8_BYTES`): punroll
+    // otherwise unrolled regex-syntax's 3-trip `Utf8Sequences::next` loop
+    // x8, a copy that can never run but doubled the function's spills.
+    if let (Some(a), Some(b)) = (iconst(func, iv0), iconst(func, bound))
+        && 0 <= a
+        && a <= b
+    {
+        return ((b - a) as u64 / step as u64).checked_add(u64::from(le) + 1);
+    }
     let g = dom_guards(func, cfg, dt, h);
     let budget = std::cell::Cell::new(256);
     let span = match sub_cancel(func, cfg, bound, iv0) {

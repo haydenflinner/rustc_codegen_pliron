@@ -2442,6 +2442,40 @@ fn matv(func: &mut Function, nb: Block, smap: &mut FxHashMap<Value, Seed>, v: Va
     }
 }
 
+/// The trip bound `trip_max` proves for the latch's counting test, if
+/// the latch is a `brif` continuing to `h` on a counted test.
+fn peel_trip_cap(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    latch: Block,
+    body: &FxHashSet<Block>,
+) -> Option<u64> {
+    let t = func.layout.last_inst(latch)?;
+    let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else { return None };
+    let cpos = blocks.iter().position(|bc| bc.block(&func.dfg.value_lists) == h)?;
+    let ci = func.dfg.resolved_value_def(arg).inst()?;
+    let InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args: [x, y] } = func.dfg.insts[ci] else {
+        return None;
+    };
+    let cond = if cpos == 0 { cond } else { cond.complement() };
+    let hparams = func.dfg.block_params(h).to_vec();
+    let cont_args: Vec<Value> = blocks[cpos]
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if cont_args.len() != hparams.len() {
+        return None;
+    }
+    let cnt = find_count(func, h, body, cfg, dt, x, y, cond, &hparams, &cont_args)?;
+    let iv0 = crate::loopidiom::entry_arg(func, cfg, dt, h, cnt.pidx)?;
+    crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le)
+}
+
 /// Loop peeling: emit K sequential clones of the chain ahead of the
 /// residual loop — LLVM's bounded-trip unroll shape (`movzbl k(p)`, one
 /// `cmp` per digit, straight-line through `parse` digit loops). Affine
@@ -2508,7 +2542,12 @@ fn run_peel(
     // sites the straight-line copies predict worse than the rolled loop
     // they replace (measured on strwork's variable-length parse).
     let exits = mid_exits.len() + 1;
-    let k = kmax.min(16 / exits.max(1)).max(1);
+    let mut k = kmax.min(16 / exits.max(1)).max(1);
+    // Copies past the loop's trip bound never run (`for i in 1..4` got
+    // eight): peel at most that many, which unrolls it fully.
+    if let Some(m) = peel_trip_cap(func, cfg, dt, h, latch, &body) {
+        k = k.min(usize::try_from(m).unwrap_or(usize::MAX)).max(1);
+    }
     for &b in &chain {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for &i in &insts[..insts.len() - 1] {
