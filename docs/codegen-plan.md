@@ -450,7 +450,8 @@ Evening (2026-10-31):
   two adds on `b`'s path per `a` update (LLVM ranks operands and adds the
   message word first). Found by elimination: same ALU mix, stack traffic
   removal (LOADREMAT) and LLVM without its schedulers changed nothing.
-  blake3 1.156 -> 1.051; held-out 1.166 -> 1.153 (batch 36).
+  blake3 1.156 -> 1.051; held-out 1.166 -> 1.153 (batch 36). Fuzz
+  35800:38600 (2800 seeds) clean.
 - **Next for pulldown: callee simplification before costing.** Its
   `Tree::append_text` (89 samples, LLVM 4) and `scanners::scan_nextline`
   (75, LLVM 0) stay calls. `append_text` lives in another CGU and needs
