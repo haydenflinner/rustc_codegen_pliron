@@ -402,11 +402,12 @@ Evening (2026-10-31):
   Promoting every uncopyable dep (`PLIRON_XCGU_PROMOTE=1`) also helps
   json but reshuffles regex's inlining (+4%): with more inlined into
   `follow_epsilons`, the `&mut SparseSet`'s fields are reloaded every
-  outer iteration. They sit in the block after the outer header (not
-  the join), so join-PRE never sees them; the `Vec` grow call that
-  clobbers them is `nocapture`. Next: hoist speculatable
-  (dereferenceable) loads into the header when nothing in between may
-  write them, then let PRE carry them. Also from the same profile:
+  outer iteration: load PRE (`PLIRON_LOADPRE_DEBUG`) carries them
+  around the inner loop and inserts them in its preheader, the block
+  after the outer header, but never reconsiders the loads it inserted,
+  so the outer header's upward PRE doesn't see them (the `Vec` grow call
+  that clobbers them is `nocapture`, `v2` is in `ncc`). Next: iterate
+  PRE over its own inserted loads (outer loops, innermost first). Also from the same profile:
   punroll unrolled a constant 3-trip loop x8 (`trip_max` now knows
   constant bounds; peeling caps at the bound).
 - **Early-exit vectorization (W10), first piece**: opt-in `bytescan` vectorizes
