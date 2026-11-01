@@ -445,6 +445,18 @@ Evening (2026-10-31):
   1.181 in the batch A/B; pulldown -1.5%, json -0.8% interleaved.
   `PLIRON_AMODESPLIT=1` (opt-in) gives serde's escape loop LLVM's six
   instructions but is neutral to negative elsewhere.
+- **Next for pulldown: callee simplification before costing.** Its
+  `Tree::append_text` (89 samples, LLVM 4) and `scanners::scan_nextline`
+  (75, LLVM 0) stay calls. `append_text` lives in another CGU and needs
+  the derived `ItemBody::eq` (124 MIR statements, over
+  `PLIRON_XCGU_SIZE`=50); at 200 it is copied, but the inliner scores it
+  n=313 ops (t=320 at a plain site) because `ItemBody::Text == body`
+  inlined the whole `eq`. With `self` a promoted constant, the
+  discriminant load and the variant match fold to one compare; LLVM
+  sees the folded callee (SROA/instcombine/simplifycfg run on a callee
+  before its callers inline it). Ours scores the unfolded body, and
+  `PLIRON_INLINE_CLEAN` (DCE + block merge, uncounted) does not fold
+  constant loads or switches.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
