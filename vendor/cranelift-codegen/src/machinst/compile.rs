@@ -247,7 +247,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     // PLIRON: `PLIRON_RELOADPRE_CHECK=1` runs the checker on the
     // allocation as `reload_pre` rewrites it at emission.
     if std::env::var_os("PLIRON_RELOADPRE_CHECK").is_some()
-        && let Some(out) = vcode.reload_pre(&regalloc_ctx.output)
+        && let Some(out) = vcode.reload_pre_rounds(&regalloc_ctx.output)
     {
         let mut checker = regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env());
         checker.prepare(&out);

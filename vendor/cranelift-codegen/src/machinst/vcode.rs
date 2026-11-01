@@ -861,6 +861,24 @@ impl<I: VCodeInst> VCode<I> {
         Some((BlockIndex::new(sb), full))
     }
 
+    /// PLIRON: `reload_pre` repeated while it moves something, up to
+    /// `PLIRON_RELOADPRE_ROUNDS` (default 3) times: a reload moved into a
+    /// preheader that is itself in a loop can move again.
+    pub(crate) fn reload_pre_rounds(&self, ra: &regalloc2::Output) -> Option<regalloc2::Output> {
+        static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let n = *ROUNDS.get_or_init(|| {
+            std::env::var("PLIRON_RELOADPRE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+        });
+        let mut cur = self.reload_pre(ra)?;
+        for _ in 1..n {
+            match self.reload_pre(&cur) {
+                Some(o) => cur = o,
+                None => break,
+            }
+        }
+        Some(cur)
+    }
+
     /// PLIRON: reload PRE (`PLIRON_RELOADPRE=0` disables). regalloc2 puts
     /// a spilled value's reload right before each use, so a value spilled
     /// across a loop's cold path (a call) is reloaded on every trip around
@@ -1332,7 +1350,7 @@ impl<I: VCodeInst> VCode<I> {
     {
         let _tt = timing::vcode_emit();
         let pre_out;
-        let regalloc = match self.reload_pre(regalloc) {
+        let regalloc = match self.reload_pre_rounds(regalloc) {
             Some(o) => {
                 pre_out = o;
                 &pre_out
