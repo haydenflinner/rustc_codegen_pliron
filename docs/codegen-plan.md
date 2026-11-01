@@ -428,9 +428,12 @@ Evening (2026-10-31):
   cascade, and inlining `follow_epsilons` into `next_state` (which a
   looser call count does) costs 40%: the inline model needs a reason to
   keep a large looping callee out of line beyond its op count.
-- **Miscompile found by fuzz** (2026-11-01, seed 24242): `clifpeep::ceval`
-  kept an `ireduce`'s high bits; `bitmerge` folded a wrong field
-  constant. Fixed with a regression test.
+- **Miscompiles found by fuzz** (2026-11-01): seed 24242, `clifpeep::ceval`
+  kept an `ireduce`'s high bits and `bitmerge` folded a wrong field
+  constant; seeds 26212/26694, slotprom skipped the writeback before an
+  sret call whose return value covers only part of the slot (reverted).
+  Both fixed with regression tests. A batch's 400 seeds are too few for
+  memory-pass changes: sweep 2000.
 
 ## Sequencing (revised 2026-10-31, after the census)
 

@@ -291,8 +291,7 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   rebuilds an in-loop address from a dominating base (`peel_const`).
   regex's `follow_epsilons` keeps the `SparseSet` fields in registers
   across the inner loop: regex 1.343 -> 1.205.
-- **Small fixes** (batch 28: gate, crates, fuzz 24200:24600 clean): slotprom skips the
-  write-back before a call that takes the slot as its sret argument;
+- **Small fixes** (batch 28: gate, crates, fuzz 24200:24600 clean):
   memcmpk takes the length from a dominating `len == K` guard (serde's
   derived field visitors); bytescan treats header params passed
   unchanged as loop-invariant (`PLIRON_BYTESCAN_PASS=0`); loadfwd
@@ -305,6 +304,16 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   fuzz; `harness/bisect.py` pointed at jumpthread (the first unit whose
   output differed), and the step checker then named clifpeep. A
   temporary hit limit inside `bitmerge` found the single bad fold.
+- **Two more miscompiles, from a 2000-seed sweep** (25000:27000, after
+  batch 29 had pushed): slotprom's skip of the writeback before a call
+  taking the slot as its sret argument (9696857) assumed the return value
+  covers the whole slot. In rustlantis's custom MIR it can cover only
+  the front (`RET.0` of a 224-byte local); the fields past it never
+  reached memory before the reload after the call. Seeds 26212/26694,
+  both bisected to slotprom; the skip is reverted (the CLIF signature
+  doesn't carry the return size) with a unit test that fails on the old
+  code. Batch 28's 400 seeds had missed it: memory-pass changes now get a
+  2000-seed sweep.
 - **Escapes in unreachable blocks** (`PLIRON_ESC_REACH=0` off):
   `isolated_escapes` scanned every layout block. regex's
   `SparseSet::insert` asserts `len < capacity` before its push, so the
@@ -326,7 +335,10 @@ Held-out geomean 1.192 (c9c6b6d) -> 1.182 (mintrip on) -> 1.172
   calls in a callee's doomed blocks toward the inline score would inline
   serde_json's `parse_object_colon` (json -1%), but it also inlines
   `follow_epsilons` into `next_state`, and the two cost 40% more together
-  (regex +14%). licm hoists that see roots uncaptured until after the
+  (regex +14%): its live calls fell under the loop-site bonus gate.
+  Charging only live calls in the cost but gating the bonus on all calls
+  keeps `follow_epsilons` out and inlines `parse_object_colon`, but nets
+  negative (json -0.7%; pulldown, blind-sig, blake3 +0.7-0.9%). licm hoists that see roots uncaptured until after the
   loop as isolated (`promote`'s rule) changed nothing on regex, and a
   loop-load pass that reloads after cold clobbering calls never fired
   there either (both shelved): the clobber was the dead grow call above.
