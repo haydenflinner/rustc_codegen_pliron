@@ -749,3 +749,29 @@ block0(v0: i8, v1: i8):
     verify(&f);
     equiv(&before, &f);
 }
+
+/// `bitmerge` folds link constants with `ceval`, which must keep each
+/// value within its own width: `ireduce` drops the high bits before the
+/// `sshr` (fuzz seed 24242 folded the field to 0x2e655 instead of 5).
+#[test]
+fn bitmerge_const_link_through_ireduce() {
+    let src = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0x2e65_5ce0_781c
+    v2 = ireduce.i32 v1
+    v3 = iconst.i32 28
+    v4 = sshr v2, v3
+    v5 = uextend.i64 v4
+    v6 = iconst.i64 -4294967296
+    v7 = band v0, v6
+    v8 = bor v7, v5
+    v9 = iconst.i64 0xffff_ffff
+    v10 = band v8, v9
+    return v10
+}";
+    let before = parse(src);
+    let mut after = before.clone();
+    assert!(pipeline(&mut after) > 0);
+    verify(&after);
+    equiv(&before, &after);
+}

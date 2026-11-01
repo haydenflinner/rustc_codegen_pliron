@@ -1789,11 +1789,15 @@ fn ceval(func: &Function, v: Value, d: u32) -> Option<u128> {
         let a = func.dfg.resolve_aliases(a);
         func.dfg.value_type(a).bits()
     };
-    Some(match func.dfg.insts[i] {
+    // Every result is masked to its own width: an `ireduce` keeps only
+    // the low bits and a `sextend` fills only up to its type, so bits
+    // above it never reach a later `sshr`/`ushr` (fuzz seed 24242:
+    // `sshr (ireduce.i32 0x2e65_5ce0_781c), 28` read as 0x2e655).
+    let r = match func.dfg.insts[i] {
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
             imm,
-        } => imm.bits() as u64 as u128 & m,
+        } => imm.bits() as u64 as u128,
         InstructionData::Unary {
             opcode: Opcode::Uextend | Opcode::Ireduce,
             arg,
@@ -1836,10 +1840,11 @@ fn ceval(func: &Function, v: Value, d: u32) -> Option<u128> {
                 }
                 _ => return None,
             };
-            r & m
+            r
         }
         _ => return None,
-    })
+    };
+    Some(r & m)
 }
 
 /// Given `x + a2 == k2` for certain, is `x + a1 == k1` decided?
