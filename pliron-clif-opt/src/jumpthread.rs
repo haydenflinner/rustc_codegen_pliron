@@ -3931,12 +3931,105 @@ pub(crate) fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<B
         if t == blocks[1].block(&func.dfg.value_lists) {
             continue;
         }
+        let taken = b == t;
+        if selfact_on()
+            && let Some(f) = select_brif_fact(func, arg, taken)
+        {
+            fact.insert(b, f);
+            continue;
+        }
         let Some((c, x, y)) = cond_icmp(func, arg).and_then(|i| norm_icmp(func, i)) else {
             continue;
         };
-        fact.insert(b, (if b == t { c } else { c.complement() }, x, y));
+        fact.insert(b, (if taken { c } else { c.complement() }, x, y));
     }
     fact
+}
+
+/// `PLIRON_SELFACT=1` (opt-in; docs/loop-unswitch-pressure.md section 1).
+fn selfact_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pliron_cfg::env_is("PLIRON_SELFACT", "1"))
+}
+
+/// The fact a `brif arg` edge gives about the condition of a select with
+/// a zero arm: `arg` is the select (through `uextend`, or `ireduce` when
+/// nonzero) or `icmp eq/ne select, 0`. An inlined slice `next()` is
+/// `select(ptr == end, 0, ptr)` and the loop branches on it; the taken
+/// edge then knows `ptr != end`, which later re-tests ask.
+// r[impl clif.selfact]
+fn select_brif_fact(func: &Function, arg: Value, taken: bool) -> Option<Cmp> {
+    if let Some(f) = select_fact(func, arg, taken) {
+        return Some(f);
+    }
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()?;
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    if !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+        return None;
+    }
+    let env = FxHashMap::default();
+    let (a, b) = (func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1]));
+    let v = if known(func, &env, b) == Some(0) {
+        a
+    } else if known(func, &env, a) == Some(0) {
+        b
+    } else {
+        return None;
+    };
+    // `v != 0` holds on the edge where `icmp ne v, 0` is true.
+    select_fact(func, v, (cond == IntCC::NotEqual) == taken)
+}
+
+/// What `v != 0` (`nonzero`) or `v == 0` says about the condition `c` of
+/// `v = select(c, 0, x)` / `select(c, x, 0)`. The zero-side direction
+/// needs the other arm to be a nonzero constant.
+fn select_fact(func: &Function, v: Value, nonzero: bool) -> Option<Cmp> {
+    let env = FxHashMap::default();
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..4 {
+        let Some(i) = func.dfg.value_def(v).inst() else {
+            break;
+        };
+        match func.dfg.insts[i] {
+            InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } => v = func.dfg.resolve_aliases(arg),
+            // `ireduce x != 0` implies `x != 0`, not the converse.
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } if nonzero => v = func.dfg.resolve_aliases(arg),
+            _ => break,
+        }
+    }
+    let i = func.dfg.value_def(v).inst()?;
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let [c, a, b] = args.map(|x| func.dfg.resolve_aliases(x));
+    let nz = |x: Value| known(func, &env, x).is_some_and(|k| k != 0);
+    // `c` true picks `a`.
+    let c_true = match (known(func, &env, a) == Some(0), known(func, &env, b) == Some(0)) {
+        (true, false) if nonzero => false,
+        (true, false) if nz(b) => true,
+        (false, true) if nonzero => true,
+        (false, true) if nz(a) => false,
+        _ => return None,
+    };
+    let (cc, x, y) = cond_icmp(func, c).and_then(|i| norm_icmp(func, i))?;
+    Some(if c_true { (cc, x, y) } else { (cc.complement(), x, y) })
 }
 
 /// Index constants known on entry to blocks whose only predecessor is a
