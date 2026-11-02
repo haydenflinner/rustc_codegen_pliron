@@ -1498,7 +1498,20 @@ fn module_codegen(
             tracing::info!(target: "pliron::stats", "xcgu {cgu_name}: {} local copies", extra.len())
         };
     }
+    // `PLIRON_XCGU_HOME=1`: degraded copies only; `=all`: every copy.
+    let home_mode = env_get("PLIRON_XCGU_HOME").filter(|_| !extra.is_empty());
+    let extra_set: rustc_hash::FxHashSet<_> =
+        if home_mode.is_some() { extra.iter().copied().collect() } else { Default::default() };
     for &inst in &extra {
+        if let Some(m) = home_mode
+            && (m == "all" || m == "1" && xcgu::degraded(tcx, inst, cgu, &extra_set))
+            && xcgu::home_linkable(tcx).contains(tcx.symbol_name(inst).name)
+        {
+            cx.st
+                .borrow_mut()
+                .xcgu_home
+                .insert(tcx.symbol_name(inst).name.to_string());
+        }
         // Rustc's `used` lists don't cover copy-to-copy calls, so these
         // bodies can end up with zero `direct_callee`-resolvable callers
         // while still being referenced at lowering — keep them off

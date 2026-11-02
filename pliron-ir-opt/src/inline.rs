@@ -875,6 +875,51 @@ pub fn dead_fns(ctx: &Context, st: &mut State) {
     mark_dead_unopt(ctx, st);
 }
 
+/// `PLIRON_XCGU_HOME=1`: a cross-CGU copy that inlining left called (or
+/// address-taken) becomes a declaration of its home definition again. Its
+/// callers then reach the home body, which was optimized with its own
+/// callees in reach; the copy is usually worse. blind-sig: with bigger
+/// copies (`PLIRON_XCGU_SIZE=100`) `SmallVec::extend` was copied into every
+/// CGU, too big to inline anywhere, and each copy called `reserve`,
+/// `size_hint` and the `Cloned` fold out of line (no bodies here), where
+/// the home copy has them inlined. Runs right after inlining, before any
+/// pass that relies on seeing every caller of a `Local` fn (spec, sret2reg,
+/// deadarg, the internal call ABI). Returns the copies converted.
+// r[impl par.xcgu.home]
+pub fn home_copies(ctx: &mut Context, st: &mut State) -> usize {
+    if st.xcgu_home.is_empty() {
+        return 0;
+    }
+    let taken = crate::address_taken(ctx, st);
+    let counts = call_counts(ctx, st);
+    let back: Vec<(String, Ptr<Operation>)> = st
+        .xcgu_home
+        .iter()
+        .filter_map(|n| {
+            let f = st.funcs.get(n.as_str())?;
+            (f.linkage == Linkage::Local
+                && has_body(ctx, f.op)
+                && !st.dead_fns.contains(n.as_str())
+                && (counts.contains_key(n.as_str()) || taken.contains(n.as_str())))
+            .then(|| (n.clone(), f.op))
+        })
+        .collect();
+    for (n, op) in &back {
+        erase_body(ctx, *op);
+        if let Some(f) = st.funcs.get_mut(n.as_str()) {
+            f.linkage = Linkage::Import;
+        }
+    }
+    if !back.is_empty() {
+        st.purge_dead(ctx);
+    }
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        tracing::info!(target: "pliron::stats", "xcgu-home {}: {} copies call home", st.cgu, back.len());
+    }
+    back.len()
+}
+
 /// Mark `xcgu_copies` members nothing live references as `dead_unopt`:
 /// `Local` + bodied + no `live_counts` caller + not `live`-address-taken,
 /// iterated to a fixpoint (a marked caller's calls stop counting).

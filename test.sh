@@ -522,6 +522,20 @@ t_xcgufnptr() {
   rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcgufnptr/main.rs -o $out/xcgufnptr$exe && $out/xcgufnptr$exe
 }
 
+t_xcguhome() {
+  # PLIRON_XCGU_HOME: degraded copies inlining left called go back to the
+  # home definition. Output matches stock rustc's either way; with HOME the
+  # never-inlined `work` (which calls a cold, uncopyable fn) is defined
+  # once, not once per calling CGU.
+  local n0 n1
+  PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_HOME=0 rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhome0$exe && $out/xcguhome0$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out && \
+  PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_HOME=1 rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhome1$exe && $out/xcguhome1$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out || return 1
+  n0=$(nm $out/xcguhome0$exe | grep -c '1a4work')
+  n1=$(nm $out/xcguhome1$exe | grep -c '1a4work')
+  echo "xcguhome: work defined $n0 times without HOME, $n1 with"
+  [ "$n1" = 1 ] && [ "$n0" -gt 1 ]
+}
+
 t_selmul() {
   # Late select-chain folds, the madd carry, the stepped exit compare and
   # same-loop remat (all opt-in): output must match stock LLVM rustc's.
@@ -1233,6 +1247,7 @@ want lowerfree && t_lowerfree
 want lowerfree-wasm && t_lowerfree_wasm
 want xcgurot && t_xcgurot
 want xcgufnptr && t_xcgufnptr
+want xcguhome && t_xcguhome
 want selmul && t_selmul
 want elabloops && t_elabloops
 # catch_unwind can't intercept stock-std SEH throws on Windows (see `unwind`).

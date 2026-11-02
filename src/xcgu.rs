@@ -195,6 +195,56 @@ pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
     })
 }
 
+/// `PLIRON_XCGU_HOME`: symbols of fns another CGU of this crate can link
+/// to: held by exactly one partition, not an `inlined` per-CGU copy, and
+/// not `Internal` (or promoted to hidden-external). A copy of one that
+/// inlining left called can go back to calling the home definition.
+pub fn home_linkable<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
+    static H: std::sync::OnceLock<FxHashSet<String>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+        let mut home: FxHashMap<MonoItem<'tcx>, (Linkage, bool, u32)> = FxHashMap::default();
+        for p in parts {
+            for (&item, data) in p.items() {
+                let e = home.entry(item).or_insert((data.linkage, data.inlined, 0));
+                e.2 += 1;
+            }
+        }
+        let promoted = promoted(tcx);
+        home.into_iter()
+            .filter_map(|(item, (linkage, inlined, n))| {
+                let MonoItem::Fn(i) = item else { return None };
+                let sym = tcx.symbol_name(i).name;
+                (n == 1 && !inlined && (linkage != Linkage::Internal || promoted.contains(sym)))
+                    .then(|| sym.to_string())
+            })
+            .collect()
+    })
+}
+
+/// A copy is *degraded* when it calls a fn of this crate whose body lives
+/// in another CGU and is not copied here: the home definition reaches that
+/// callee as a local, the copy only through a call. `PLIRON_XCGU_HOME=1`
+/// sends only degraded copies home; copies whose callees are all here can
+/// beat the home definition (their local linkage feeds spec, sret2reg,
+/// deadarg and the internal call ABI: pulldown).
+pub fn degraded<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    inst: Instance<'tcx>,
+    cgu: &CodegenUnit<'tcx>,
+    copies: &FxHashSet<Instance<'tcx>>,
+) -> bool {
+    let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+    used(tcx, inst).unwrap_or(&[]).iter().any(|u| {
+        let MonoItem::Fn(c) = u.node else { return false };
+        c != inst
+            && needs_body(tcx, &u.node)
+            && !cgu.items().contains_key(&u.node)
+            && !copies.contains(&c)
+            && parts.iter().any(|p| p.items().contains_key(&u.node))
+    })
+}
+
 fn is_promoted<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
     matches!(m, MonoItem::Fn(i) if promoted(tcx).contains(tcx.symbol_name(*i).name))
 }

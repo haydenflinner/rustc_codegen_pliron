@@ -175,6 +175,16 @@ every off switch and diagnostic goes through.
   so a cut never leaves a dangling reference.
 ]
 
+#r("par.xcgu.home", title: "Called copies may call home", level: "may",
+   refines: ("model.abi", "model.parity"))[
+  With `PLIRON_XCGU_HOME=1`, a copy that inlining left called or
+  address-taken, and whose home definition another CGU can link to (one
+  partition holds it, it is not an `inlined` per-CGU item, and it is not
+  `Internal` unless promoted), MAY become a declaration of the home
+  symbol again. This MUST happen right after inlining, before any pass
+  that relies on seeing every caller of a `Local` function.
+]
+
 #r("par.xcgu.keep", title: "Callerless copies are emitted, not optimized", level: "must",
    refines: ("model.abi", "model.parity"))[
   rustc's use lists do not show calls from one copy to another, so the

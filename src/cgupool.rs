@@ -1098,6 +1098,7 @@ pub(crate) fn iropt_head(
         domcheck::run(ctx, st, "inline")
     );
     pliron_ir_opt::irstat::report(ctx, st, "post-inline");
+    pt!(prof, cgu, "xcgu-home", inline::home_copies(ctx, st));
     // Inlining kills most copy callsites — mark the dead ones now so
     // spec/sroa/constload/devirt never walk their emit-only bodies.
     // (devirt-inline below can still inline into a live caller; a copy

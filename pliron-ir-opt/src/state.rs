@@ -174,6 +174,9 @@ impl SymSet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
 }
 
 impl Extend<String> for SymSet {
@@ -487,6 +490,9 @@ pub struct State {
     /// and would emit dangling `U`s). Keeping an unused copy is only
     /// object-code bloat; stripping a referenced one breaks the link.
     pub xcgu_copies: SymSet,
+    /// `PLIRON_XCGU_HOME=1`: the `xcgu_copies` whose home definition is
+    /// linkable from this CGU (`inline::home_copies`).
+    pub xcgu_home: SymSet,
     /// `PLIRON_XCGUFN_KILL=1`: `dead_fns` may strip `xcgu_copies` entries —
     /// the default exemption exists because copy-to-copy refs can evade
     /// `direct_callee`.
