@@ -178,5 +178,15 @@ registers, most of them values the IR and CLIF passes forwarded or
 hoisted across calls to the whole function. A spill (store + reload) of
 those cannot catch up; re-loading them from their original address
 (when memory is unchanged, the same facts that justified forwarding
-them) would cost only the load. That is the next lever: bound how far
-forwarded/GVN'd loads live across calls, or rematerialize them.
+them) would cost only the load.
+
+Checked on the final CLIF (before Cranelift's egraph): across the two
+`follow_epsilons` calls in `next_state`'s loops, 26-27 integer values
+are live -- 11-14 constants (Cranelift rematerializes these), 7-9
+function/loop params, 1-2 stack addresses, 1 load, 2-3 others. So
+forwarded loads are not the problem; about 12-13 real values compete for
+10 callee-saved registers, 2-3 must spill, and regalloc2 picks `b`
+(used once per `Bytes` state) where LLVM keeps it in w22 and spills
+something else. The remaining lever is regalloc2's choice of what to
+spill around a call in a loop (spill weight of uses vs. the cost of
+reloads inside the loop), not the IR.
