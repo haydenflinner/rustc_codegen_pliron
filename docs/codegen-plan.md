@@ -728,6 +728,37 @@ Evening (2026-10-31):
   SROA alone costs pulldown +10%); `=3` (loop-free callers only) is
   pulldown -2%, json/regex/blind-sig +1-3%. Left off; the pieces
   (`run_fn` per pass, `PLIRON_SIMP_PARTS` bisect mask) remain.
+- **More allocatable registers** (2026-11-02, vendored Cranelift patch
+  95, opt-in): `PLIRON_X17=1` allocates x17 (its post-regalloc users are
+  prologue-only, `LoadAddr`'s large-offset path now uses `rd`, and the
+  26-bit branch veneer saves it below sp), `PLIRON_X30=1` allocates the
+  link register (clobbered by every call; a function that uses it gets a
+  frame record). That is 28 registers to LLVM's 29. Tuning geomean x17
+  1.006, x30 1.007, both 1.001: montgomery drops one spill pair, nothing
+  else moves. With INNERPRESS in, register count does not limit these
+  benches; this lever is closed for now (x16 would need emit-time
+  scratch for large offsets, i.e. register scavenging).
+- **`parse_line` closure, again** (2026-11-02): `PLIRON_INLINE_FREEMUL=12`
+  now gives pulldown -2.0% and -2.3% in two layout-averaged runs
+  (before tonight's flips it was +2.2%; spill CSE removed the scan
+  loop's reload/store pair). The other four move +-1.5% between runs
+  (geomean 0.991, then 1.003). 14 and 16 are no better (pulldown -1.4%,
+  -1.6%).
+- **Why bigger cross-CGU copies hurt blind-sig** (2026-11-02): at
+  `PLIRON_XCGU_SIZE=100`, `SmallVec<[u64; 4]>::extend::<Cloned<..>>`
+  (598 ops) is copied into all nine num-bigint-dig CGUs. It is too big
+  to inline at any site, so every caller calls its CGU's copy, and in a
+  copy its own callees `reserve`, `size_hint` and the `Cloned` fold have
+  no body (they live in the home CGU): "reject (ineligible)" in the
+  inline log, out-of-line calls in the profile. The home definition has
+  them inlined. Copies that stay called are therefore sometimes worse
+  than the home definition, and sometimes better: sending every called
+  copy home (`PLIRON_XCGU_HOME=all`) halves blind-sig's loss at 100
+  (+5.3% -> +3.5%) but also pulldown's gain (-3.9% -> -1.6%), since a
+  local copy feeds spec/sret2reg/deadarg and the internal call ABI.
+  `PLIRON_XCGU_HOME=1` sends home only *degraded* copies (calls a fn of
+  this crate whose body is in another CGU and not copied here); test
+  `test.sh xcguhome`.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
