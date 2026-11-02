@@ -690,6 +690,15 @@ Evening (2026-10-31):
   allocates them, 28). Levers: give regalloc2 x16/x17 (emit-time users
   need their own scratch), or pressure-aware LICM that leaves a cheap
   invariant load in an outer loop whose inner loops are register-bound.
+  The second, crudest form landed as `PLIRON_LICM_INNERPRESS` (on): in a
+  loop with inner loops, a load no inner loop uses is not hoisted. The
+  montgomery spill is gone (warm loop 1.062 -> 1.054); tuning geomean
+  0.997 / 0.998 in two runs.
+- **Tonight's flips together** (2026-11-02, held-out, 6 layouts x 7
+  rounds, one interleaved run vs all six forced off): geomean 1.141 ->
+  1.122; json 1.152 -> 1.070, blind-sig 1.096 -> 1.070, regex 1.150 ->
+  1.126, pulldown 1.185 -> 1.168. compression, html-rewriter and
+  protobuf did not move: their gaps have other causes.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
