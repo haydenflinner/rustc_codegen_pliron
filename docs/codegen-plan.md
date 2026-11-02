@@ -647,6 +647,17 @@ Evening (2026-10-31):
   `PLIRON_SYMSUB` (on) folds the difference: json 1.118 -> 1.058,
   pulldown -0.9%; memcpy calls now 115k / 54k. With it, memcpy, memset
   and bcmp counts match LLVM on all five tuning benches.
+- **Dead stores are cheap** (2026-11-02): three ways of deleting stores
+  nobody reads all measured neutral with fresh bases: post-RA dead spill
+  stores (`$S/deadspill.patch`, not landed; 69-134 per bench), slotprom
+  writebacks of undefined or just-reloaded values before bounded calls
+  (`PLIRON_SLOTPROM_UNDEFPARAM`, opt-in; up to 1,526 insts in regex,
+  including the zeroing of `item_to_event`'s sret slot), and the
+  i128-function identity folds (the final CLIF was already clean). Spill
+  CSE won because it also removed in-loop reloads. Also neutral on
+  current defaults: inline limit 256/400/480 (320 stays), REMATW,
+  CONSTSINK, ELABLOOPS, XBLOCK, REMATLOOP, LIBCALL_DIRECT, BYVALHOME,
+  DEADARG, RETNN, CSE_SYM; LUTCORR miscompiles blind-sig (opt-in).
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.

@@ -26,7 +26,7 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{
     Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot,
-    Type, Value, types,
+    Type, Value, ValueDef, types,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -935,6 +935,13 @@ pub fn run_lt(
 
     // Rewrite: alias loads, drop stores, append reaching values on edges.
     let mut n = 0;
+    let mut writebacks: Vec<(Inst, usize)> = Vec::new();
+    // Post-call reloads → their field: right after one, that field's
+    // memory holds the reloaded value, and nothing touches it until the
+    // next synced call (promoted stores are dropped; that call reloads
+    // again). Only for the same field: the program may copy the value
+    // into another field, whose memory doesn't hold it (blind-sig).
+    let mut reloads: FxHashMap<Value, usize> = FxHashMap::default();
     for b in func.layout.blocks().collect::<Vec<_>>() {
         if !reach.contains(&b) {
             continue;
@@ -963,6 +970,7 @@ pub fn run_lt(
                     .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
                 let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
                 dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                reloads.insert(v, ki);
                 cur[ki] = Some(v);
             }
         }
@@ -1000,6 +1008,9 @@ pub fn run_lt(
                         {
                             pos.ins()
                                 .store(MemFlagsData::new().with_notrap(), v, sa, f.off as i32);
+                            if let Some(st) = pos.prev_inst() {
+                                writebacks.push((st, ki));
+                            }
                         }
                     }
                 }
@@ -1018,6 +1029,7 @@ pub fn run_lt(
                             .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
                         let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
                         dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                        reloads.insert(v, ki);
                         cur[ki] = Some(v);
                     }
                 }
@@ -1118,6 +1130,77 @@ pub fn run_lt(
         {
             for v in vs {
                 bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
+            }
+        }
+    }
+    // `PLIRON_SLOTPROM_UNDEFPARAM=1`: drop writebacks that can't change
+    // memory. Memory equals the field's value when that value is an undef
+    // (memory is undefined too), a post-call reload (memory holds it until
+    // the next synced call), or a new param every incoming value of which
+    // is one of those (greatest fixpoint: loop-carried copies count).
+    // pulldown's `Parser::next` zeroed `item_to_event`'s 56-byte sret slot
+    // before every call (cparm later turns the undef param into an
+    // explicit 0, past telling apart), and `parse_block`'s special-byte
+    // loop wrote its callback's last result back before each call.
+    if !writebacks.is_empty() && pliron_cfg::env_is("PLIRON_SLOTPROM_UNDEFPARAM", "1") {
+        let mut pos_of: FxHashMap<Value, (Block, usize)> = FxHashMap::default();
+        let mut field_of: FxHashMap<Value, usize> = FxHashMap::default();
+        for (ki, m) in params.iter().enumerate() {
+            for &v in m.values() {
+                if let ValueDef::Param(b, k) = func.dfg.value_def(v) {
+                    pos_of.insert(v, (b, k));
+                    field_of.insert(v, ki);
+                }
+            }
+        }
+        let keys: FxHashSet<(Block, usize)> = pos_of.values().copied().collect();
+        let mut und: FxHashSet<Value> = pos_of.keys().copied().collect();
+        // Incoming args per (block, param index).
+        let mut inc: FxHashMap<(Block, usize), Vec<Option<Value>>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            let Some(t) = func.layout.last_inst(b) else { continue };
+            let dfg = &func.dfg;
+            for bc in dfg.insts[t].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                let d = bc.block(&dfg.value_lists);
+                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+                for (k, a) in args.iter().enumerate() {
+                    if keys.contains(&(d, k)) {
+                        let v = match a {
+                            BlockArg::Value(v) => Some(dfg.resolve_aliases(*v)),
+                            _ => None,
+                        };
+                        inc.entry((d, k)).or_default().push(v);
+                    }
+                }
+            }
+        }
+        loop {
+            let next: FxHashSet<Value> = und
+                .iter()
+                .copied()
+                .filter(|p| {
+                    inc.get(&pos_of[p]).is_none_or(|vs| {
+                        let ki = field_of[p];
+                        vs.iter().all(|v| {
+                            v.is_some_and(|v| {
+                                v == *p
+                                    || undefs.contains(&v)
+                                    || reloads.get(&v) == Some(&ki)
+                                    || (und.contains(&v) && field_of.get(&v) == Some(&ki))
+                            })
+                        })
+                    })
+                })
+                .collect();
+            if next.len() == und.len() {
+                break;
+            }
+            und = next;
+        }
+        for (st, ki) in writebacks {
+            let v = func.dfg.resolve_aliases(func.dfg.inst_args(st)[0]);
+            if (und.contains(&v) && field_of.get(&v) == Some(&ki)) || reloads.get(&v) == Some(&ki) {
+                func.layout.remove_inst(st);
             }
         }
     }
