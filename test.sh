@@ -309,18 +309,28 @@ t_slotpromlt() {
   # reload is adrp+add with two relocations instead of one stack load).
   PLIRON_RA2_XBLOCK=1 PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl3$exe &&
       $out/spl3$exe | diff --strip-trailing-cr - $out/spl.out
-  PLIRON_RA2_XBLOCK=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
-  PLIRON_RA2_XBLOCK=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
-  local z0 z3
+  # Spill CSE (vendored cranelift `reload_cse`, PLIRON_PATCH #94) drops
+  # the same store-backs, so both are measured against a baseline without
+  # it, and it must shrink the code on its own too.
+  PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
+  local z0 z3 z4
   if [[ -x "$llvmod" ]]; then
     z0=$("$llvmod" -d --no-show-raw-insn $out/spl0.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)
     z3=$("$llvmod" -d --no-show-raw-insn $out/spl3.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)
+    z4=$("$llvmod" -d --no-show-raw-insn $out/spl4.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)
   else
-    z0=$(wc -c < $out/spl0.o); z3=$(wc -c < $out/spl3.o)
+    z0=$(wc -c < $out/spl0.o); z3=$(wc -c < $out/spl3.o); z4=$(wc -c < $out/spl4.o)
   fi
   if [[ "$z3" -ge "$z0" ]]; then
     echo "slotpromlt: code size $z0 -> $z3 under PLIRON_RA2_XBLOCK (want a drop)"; return 1
   fi
+  if [[ "$z4" -ge "$z0" ]]; then
+    echo "slotpromlt: code size $z0 -> $z4 under PLIRON_SPILLCSE (want a drop)"; return 1
+  fi
+  PLIRON_SPILLCSE=1 PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/slotprom_lt/main.rs -o $out/spl4$exe &&
+      $out/spl4$exe | diff --strip-trailing-cr - $out/spl.out
 }
 
 t_byvalhome() {
