@@ -608,6 +608,29 @@ pub fn isolated_escapes(
     FxHashMap<Root, Vec<Block>>,
     FxHashSet<Root>,
 ) {
+    isolated_escapes_x(func, noalias, ps, _cfrozen, nocap, scoped, false)
+}
+
+/// `isolated_escapes`, optionally (`trap_benign`) ignoring uses in blocks
+/// that end in `trap` and load nothing. Such a block's escapes (a panic's
+/// `fmt::Arguments` holding `&x`) are followed by no code of this frame —
+/// a plain `call` unwinds past it — so they can't make a load anywhere
+/// else stale. Only for the reading side (forwarding): a store whose sole
+/// reader is that escaping call is still live, so DSE/promotion must keep
+/// the strict answer.
+pub fn isolated_escapes_x(
+    func: &Function,
+    noalias: &FxHashSet<Value>,
+    ps: &VMap<Value>,
+    _cfrozen: &FxHashMap<FuncRef, u64>,
+    nocap: &FxHashSet<(Inst, u32)>,
+    scoped: &FxHashSet<Value>,
+    trap_benign: bool,
+) -> (
+    FxHashSet<Root>,
+    FxHashMap<Root, Vec<Block>>,
+    FxHashSet<Root>,
+) {
     let mut cand: FxHashSet<Root> = noalias
         .iter()
         .filter(|&v| !scoped.contains(v))
@@ -659,8 +682,15 @@ pub fn isolated_escapes(
             }
             seen
         });
+    let dead_end = |b: Block| {
+        func.layout.last_inst(b).is_some_and(|t| func.dfg.insts[t].opcode() == Opcode::Trap)
+            && func.layout.block_insts(b).all(|i| !func.dfg.insts[i].opcode().can_load())
+    };
     for b in func.layout.blocks() {
         if reach.as_ref().is_some_and(|r| !r.contains(&b)) {
+            continue;
+        }
+        if trap_benign && dead_end(b) {
             continue;
         }
         for i in func.layout.block_insts(b) {
@@ -1185,7 +1215,12 @@ pub fn run_deref(
     } else {
         (&VMap::default(), &VMap::default())
     };
-    let (iso, _escapes, ncc) = isolated_escapes(func, noalias, ps, cfrozen, nocap, scoped_na);
+    // `PLIRON_ESC_TRAP=1`: escapes in dead-end trap blocks don't stop
+    // forwarding. num-bigint-dig's `montgomery` formats `&x, &y, &m` in an
+    // `assert!` message, so rustc keeps each in a slot and every use
+    // reloads it; the slots escape only into the panic's arguments.
+    let trap_benign = pliron_cfg::env_is("PLIRON_ESC_TRAP", "1");
+    let (iso, _escapes, ncc) = isolated_escapes_x(func, noalias, ps, cfrozen, nocap, scoped_na, trap_benign);
     if let Some(f) = crate::env_get("PLIRON_LF_DEBUG") {
         if func.name.to_string().contains(&f) {
             if pliron_cfg::tracing_on() {
