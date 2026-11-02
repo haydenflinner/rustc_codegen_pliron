@@ -118,9 +118,13 @@ big, unswitch by cloning only the loop body:
    et al. over the now-complete CFG: a block with one predecessor reads
    through it; a block with several gets a new block param (created
    before recursing, so cycles terminate) whose argument on each incoming
-   edge is `v` from an original-body predecessor, `v'` from a clone
-   predecessor, and `read` of the predecessor otherwise. Trivial params
-   are left for `remove_trivial_params`.
+   edge is `v` from an original-body predecessor that `v`'s definition
+   dominates, `v'` from the clone of one, `read` of the predecessor inside
+   the region `v`'s definition dominates, and a zero constant otherwise
+   (no path from such an edge reaches a use; fuzz seed 57201 passed `v`
+   on exit edges from body blocks before its definition). The backward
+   walk stays inside that dominance region; only integer values up to 64
+   bits are repaired. Trivial params are left for `remove_trivial_params`.
 6. Drop blocks the folds made unreachable (existing sweep).
 
 **Soundness.** Each use outside the loop was dominated by `v`'s

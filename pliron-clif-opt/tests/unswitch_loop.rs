@@ -72,3 +72,19 @@ fn loop_only_unswitch_repairs_exit_values() {
         panic!("{m}\n{}", after.display());
     }
 }
+
+/// Fuzz seed 57201 (`fn12`, before the step): the exit block that gains
+/// params is also entered from body blocks the escaping value's def does
+/// not dominate. Passing the value on those edges broke dominance; they
+/// now carry a zero, and the repair walk stays inside the def's dominance
+/// region.
+#[test]
+fn exit_edges_before_the_def_carry_no_value() {
+    unsafe { std::env::set_var("PLIRON_UNSWITCH_LOOP", "1") };
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/unswitch_loop_fuzz57201.clif")).unwrap();
+    let mut f = cranelift_reader::parse_functions(&src).unwrap().remove(0);
+    let k = pliron_clif_opt::bcheck::unswitch(&mut f, &mut Analysis::default(), "fuzz57201");
+    assert!(k > 0);
+    cranelift_codegen::verify_function(&f, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+        .unwrap_or_else(|e| panic!("{e}"));
+}

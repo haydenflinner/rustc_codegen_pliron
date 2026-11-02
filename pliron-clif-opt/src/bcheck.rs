@@ -2630,26 +2630,44 @@ fn unswitch_loop_only(
     // Blocks between the exits and the uses: backward from each use block,
     // stopping at body predecessors. Every one must be entered by plain
     // branches (it may gain a param).
-    let mut between: FxHashSet<Block> = FxHashSet::default();
-    let mut stack: Vec<Block> = escaping.iter().flat_map(|(_, s)| s.iter().map(|&(u, _)| u)).collect();
-    while let Some(b) = stack.pop() {
-        if body.contains(&b) || !between.insert(b) {
-            continue;
+    // Per escaping value: its def block, and the blocks between the exits
+    // and its uses -- backward from each use block, inside the region the
+    // def dominates (a use is dominated by its def, so no path from outside
+    // that region reaches it), stopping at body predecessors. Every such
+    // block, and every pred of one, must be a plain branch (it may gain a
+    // param), and only integer values are repaired (an irrelevant edge
+    // carries a zero constant).
+    let mut regions: Vec<(Block, FxHashSet<Block>)> = Vec::new();
+    for (v, sites) in &escaping {
+        let ty = func.dfg.value_type(*v);
+        if !ty.is_int() || ty.bits() > 64 {
+            bail!("non-integer escaping value");
         }
-        if between.len() > 512 {
-            bail!("repair region too big");
-        }
-        for p in cfg.pred_iter(b) {
-            if !matches!(
-                func.dfg.insts[p.inst],
-                InstructionData::Jump { .. } | InstructionData::Brif { .. } | InstructionData::BranchTable { .. }
-            ) {
-                bail!("repair block entered by an exception edge");
+        let Some(dv) = def_block(func, *v) else {
+            bail!("escaping value without a block");
+        };
+        let mut between: FxHashSet<Block> = FxHashSet::default();
+        let mut stack: Vec<Block> = sites.iter().map(|&(u, _)| u).collect();
+        while let Some(b) = stack.pop() {
+            if body.contains(&b) || !between.insert(b) {
+                continue;
             }
-            if !body.contains(&p.block) {
-                stack.push(p.block);
+            if between.len() > 512 {
+                bail!("repair region too big");
+            }
+            for p in cfg.pred_iter(b) {
+                if !matches!(
+                    func.dfg.insts[p.inst],
+                    InstructionData::Jump { .. } | InstructionData::Brif { .. } | InstructionData::BranchTable { .. }
+                ) {
+                    bail!("repair block entered by an exception edge");
+                }
+                if !body.contains(&p.block) && dt.block_dominates(dv, p.block) {
+                    stack.push(p.block);
+                }
             }
         }
+        regions.push((dv, between));
     }
     // Clone; fold the candidate (and every brif on it) to true in the
     // clone, false in the original.
@@ -2702,10 +2720,17 @@ fn unswitch_loop_only(
     // fed `v` from the original body, `v'` from the clone, else the
     // predecessor's value.
     let cfg2 = ControlFlowGraph::with_function(func);
-    for (v, sites) in &escaping {
-        let v = *v;
+    let orig_of: FxHashMap<Block, Block> = bmap.iter().map(|(&o, &c)| (c, o)).collect();
+    let entry = func.layout.entry_block().unwrap();
+    let mut zeros: FxHashMap<Type, Value> = FxHashMap::default();
+    for ((v, sites), (dv, between)) in escaping.iter().zip(&regions) {
+        let (v, dv) = (*v, *dv);
         let vc = vmap.get(&v).copied().unwrap_or(v);
         let ty = func.dfg.value_type(v);
+        let zero = *zeros.entry(ty).or_insert_with(|| {
+            let mut pos = FuncCursor::new(func).at_first_insertion_point(entry);
+            pos.ins().iconst(ty, 0)
+        });
         let mut val: FxHashMap<Block, Value> = FxHashMap::default();
         // Params first, so cycles resolve.
         let multi: Vec<Block> = between
@@ -2717,19 +2742,24 @@ fn unswitch_loop_only(
             let p = func.dfg.append_block_param(b, ty);
             val.insert(b, p);
         }
-        // Single-predecessor chains end in the body, the clone or a param.
+        // What an edge from `p` carries: `v` from an original body block the
+        // def dominates, `v'` from its clone, the value of a `between` block,
+        // and otherwise a zero no use can observe (the edge starts outside
+        // the def's dominance region, so no path from it reaches a use).
         let end = |val: &FxHashMap<Block, Value>, p: Block| -> Option<Value> {
             if body.contains(&p) {
-                Some(v)
-            } else if cbody.contains(&p) {
-                Some(vc)
-            } else {
+                Some(if dt.block_dominates(dv, p) { v } else { zero })
+            } else if let Some(&o) = orig_of.get(&p) {
+                Some(if dt.block_dominates(dv, o) { vc } else { zero })
+            } else if between.contains(&p) {
                 val.get(&p).copied()
+            } else {
+                Some(zero)
             }
         };
         for _ in 0..between.len() + 1 {
             let mut progress = false;
-            for &b in &between {
+            for &b in between {
                 if val.contains_key(&b) {
                     continue;
                 }
@@ -2746,7 +2776,7 @@ fn unswitch_loop_only(
         }
         for &b in &multi {
             for p in cfg2.pred_iter(b) {
-                let a = end(&val, p.block).unwrap_or(v);
+                let a = end(&val, p.block).unwrap_or(zero);
                 let dfg = &mut func.dfg;
                 for bc in dfg.insts[p.inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
                     if bc.block(&dfg.value_lists) == b {

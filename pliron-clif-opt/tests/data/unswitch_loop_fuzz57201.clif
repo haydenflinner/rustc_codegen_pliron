@@ -1,0 +1,3121 @@
+function u0:0(i64, i64, i64, i16) -> f32 tail {
+    ss0 = explicit_slot 4, align = 4
+    ss1 = explicit_slot 8, align = 8
+    ss2 = explicit_slot 16, align = 8
+    ss3 = explicit_slot 8, align = 8
+    ss4 = explicit_slot 8, align = 8
+    ss5 = explicit_slot 8, align = 8
+    ss6 = explicit_slot 8, align = 8
+    ss7 = explicit_slot 24, align = 8
+    ss8 = explicit_slot 4, align = 4
+    ss9 = explicit_slot 16, align = 8
+    ss10 = explicit_slot 3
+    ss11 = explicit_slot 8, align = 8
+    ss12 = explicit_slot 4, align = 4
+    ss13 = explicit_slot 4, align = 4
+    ss14 = explicit_slot 8, align = 8
+    ss15 = explicit_slot 8, align = 8
+    ss16 = explicit_slot 4, align = 4
+    ss17 = explicit_slot 8, align = 8
+    ss18 = explicit_slot 4, align = 4
+    ss19 = explicit_slot 8, align = 8
+    ss20 = explicit_slot 8, align = 8
+    ss21 = explicit_slot 4, align = 4
+    ss22 = explicit_slot 8, align = 8
+    ss23 = explicit_slot 21, align = 8
+    ss24 = explicit_slot 8, align = 8
+    ss25 = explicit_slot 8, align = 8
+    ss26 = explicit_slot 16, align = 8
+    ss27 = explicit_slot 4, align = 4
+    ss28 = explicit_slot 4, align = 4
+    ss29 = explicit_slot 12, align = 4
+    ss30 = explicit_slot 4, align = 4
+    ss31 = explicit_slot 4, align = 4
+    ss32 = explicit_slot 8, align = 8
+    ss33 = explicit_slot 8, align = 8
+    sig0 = (i128) -> f32 apple_aarch64
+    sig1 = (i128) -> f32 apple_aarch64
+    sig2 = (i16, i64, i64, i16) tail
+    sig3 = (i16, i16, i32) tail
+    sig4 = (i64, f32, i64, i64) -> i64 tail
+    sig5 = (i128) -> f64 apple_aarch64
+    sig6 = (f32) -> i128 apple_aarch64
+    sig7 = (i128) -> f64 apple_aarch64
+    sig8 = (i64, i64, i8, i16) tail
+    sig9 = (i32, i64, i8, i16) tail
+    sig10 = (i32, i64, i64, i32) tail
+    sig11 = (i16, i32) tail
+    sig12 = (i128, i64, i128, i64) tail
+    sig13 = (i64, i64, i32, i32) tail
+    sig14 = (i8, i128, i64, i32) tail
+    sig15 = (i128) tail
+    fn0 = colocated u0:119 sig0
+    fn1 = colocated u0:123 sig1
+    fn2 = colocated u0:57 sig2
+    fn3 = colocated u0:58 sig3
+    fn4 = colocated u0:100 sig4
+    fn5 = colocated u0:121 sig5
+    fn6 = colocated u0:125 sig6
+    fn7 = colocated u0:120 sig7
+    fn8 = colocated u0:6 sig8
+    fn9 = colocated u0:49 sig9
+    fn10 = colocated u0:25 sig10
+    fn11 = colocated u0:55 sig11
+    fn12 = colocated u0:53 sig12
+    fn13 = colocated u0:70 sig13
+    fn14 = colocated u0:30 sig14
+    fn15 = colocated u0:12 sig15
+
+block0(v0: i64, v1: i64, v2: i64, v3: i16):
+    v4154 = iconst.i64 0
+    v3597 = iconst.i64 0
+    v5 = stack_addr.i64 ss0
+    v9 = stack_addr.i64 ss4
+    v10 = stack_addr.i64 ss5
+    v11 = stack_addr.i64 ss6
+    v12 = stack_addr.i64 ss7
+    v13 = stack_addr.i64 ss8
+    v15 = stack_addr.i64 ss10
+    v16 = stack_addr.i64 ss11
+    v17 = stack_addr.i64 ss12
+    v18 = stack_addr.i64 ss13
+    v19 = stack_addr.i64 ss14
+    v20 = stack_addr.i64 ss15
+    v21 = stack_addr.i64 ss16
+    v22 = stack_addr.i64 ss17
+    store notrap v21, v22
+    v24 = iconst.i32 -1792455449
+    v25 = fcvt_from_sint.f32 v24  ; v24 = -1792455449
+    store notrap v25, v21
+    v27 = iconst.i64 -3369558910448605008
+    v28 = fcvt_from_uint.f32 v27  ; v27 = -3369558910448605008
+    store notrap v28, v21
+    v29 = load.i64 notrap v22
+    v30 = iconst.i32 0x4afc_e5ec
+    v31 = fcvt_from_sint.f32 v30  ; v30 = 0x4afc_e5ec
+    store notrap v31, v29
+    v32 = load.i64 notrap v22
+    v34 = stack_addr.i64 ss18
+    v35 = stack_addr.i64 ss19
+    store notrap v34, v35
+    v37 = iconst.i16 0x2e78
+    v41 = iconst.i64 0x5c7e_b613_f83f_492d
+    v42 = iconst.i64 0x209e_b56e_2535_278c
+    v43 = iconcat v41, v42  ; v41 = 0x5c7e_b613_f83f_492d, v42 = 0x209e_b56e_2535_278c
+    v44 = call fn0(v43)
+    store notrap v44, v34
+    v45 = load.i64 notrap v35
+    v46 = iconst.i64 -9083564210321833545
+    v47 = fcvt_from_sint.f32 v46  ; v46 = -9083564210321833545
+    store notrap v47, v45
+    v48 = load.i64 notrap v35
+    v49 = bxor v3, v3
+    store notrap v48, v35
+    v111 = iconst.i64 -6034581037796470233
+    v112 = iconst.i64 0x1ce2_f5ec_546c_6958
+    v115 = iconst.i64 -7563317447395451459
+    v116 = iconst.i64 -1862259597032899258
+    v119 = iconst.i64 5
+    v123 = iconst.i64 -6100580964613818122
+    v124 = iconst.i64 -2331310569257312092
+    v130 = iconst.i64 0x0010_6122
+    v131 = iconst.i64 -4294967296
+    v135 = iconst.i64 -6795840057232003323
+    v139 = iconst.i64 15
+    v140 = iconst.i64 0
+    v149 = iconst.i64 -1862259597032899258
+    v4613 = iconst.i64 0x0001_0000_0000
+    v4618 = iconst.i64 -1099511627776
+    v4620 = iconst.i64 0x000c_000f_fdb5
+    v178 = iconst.i32 -149525188
+    v186 = iconst.i64 -1862259597032899258
+    v3296 = iconst.i64 0x533e_7bcb_41af_bb30
+    v3297 = iconst.i64 0x2136_359d_044d_ed4d
+    v3301 = iconst.i64 -2083453947680315498
+    v3308 = iconst.i16 15
+    v3312 = iconst.i64 0x26f0_cebd_57ad_1beb
+    v3315 = iconst.i64 -8725605901209645114
+    v3316 = iconst.i64 -809592977159303349
+    v266 = iconst.i64 0x7fff_ffff_ffff_ffff
+    v267 = iconst.i64 0x00eb_0007_5324
+    v273 = iconst.i64 -8836100573157773700
+    v286 = iconst.i64 -2285543122749383203
+    v299 = iconst.i32 -113236681
+    v191 = iconst.i64 -7563317447395451459
+    v3214 = iconst.i32 -113236681
+    v4588 = iconst.i64 0x0001_0000_0000
+    v3161 = iconst.i64 0x533e_7bcb_41af_bb30
+    v3162 = iconst.i64 0x2136_359d_044d_ed4d
+    v3166 = iconst.i64 -2083453947680315498
+    v3173 = iconst.i16 15
+    v3177 = iconst.i64 0x26f0_cebd_57ad_1beb
+    v3180 = iconst.i64 -8725605901209645114
+    v3181 = iconst.i64 -809592977159303349
+    v4690 = iconst.i64 -7563317447395451459
+    v84 = iconst.i64 0x533e_7bcb_41af_bb30
+    v85 = iconst.i64 0x2136_359d_044d_ed4d
+    v89 = iconst.i64 -2083453947680315498
+    v96 = iconst.i16 15
+    v100 = iconst.i64 0x26f0_cebd_57ad_1beb
+    v103 = iconst.i64 -8725605901209645114
+    v104 = iconst.i64 -809592977159303349
+    v3401 = iconst.i64 0x533e_7bcb_41af_bb30
+    v3402 = iconst.i64 0x2136_359d_044d_ed4d
+    v3406 = iconst.i64 -2083453947680315498
+    v3413 = iconst.i16 15
+    v3417 = iconst.i64 0x26f0_cebd_57ad_1beb
+    v3420 = iconst.i64 -8725605901209645114
+    v3421 = iconst.i64 -809592977159303349
+    v3327 = iconst.i64 0x4304_beb1_311d_a08a
+    v3328 = iconst.i64 -2706257100355077752
+    v3332 = iconst.i64 0x375d_71f9_8857_42c8
+    v3333 = iconst.i64 0x2c56_b254_7bcf_7fad
+    v3338 = iconst.i32 0x0576_6c07
+    v3343 = iconst.i64 -9223372036854775808
+    v154 = iconst.i64 -7563317447395451459
+    v3266 = iconst.i64 0x533e_7bcb_41af_bb30
+    v3267 = iconst.i64 0x2136_359d_044d_ed4d
+    v3271 = iconst.i64 -2083453947680315498
+    v3278 = iconst.i16 15
+    v3282 = iconst.i64 0x26f0_cebd_57ad_1beb
+    v3285 = iconst.i64 -8725605901209645114
+    v3286 = iconst.i64 -809592977159303349
+    v4587 = iconst.i64 0x0001_0000_0000
+    v4650 = iconst.i64 -1099511627776
+    v4652 = iconst.i64 0x000c_000f_fdb5
+    v3244 = iconst.i32 -149525188
+    v3252 = iconst.i64 -1862259597032899258
+    v3191 = iconst.i64 0x533e_7bcb_41af_bb30
+    v3192 = iconst.i64 0x2136_359d_044d_ed4d
+    v3196 = iconst.i64 -2083453947680315498
+    v3203 = iconst.i16 15
+    v3207 = iconst.i64 0x26f0_cebd_57ad_1beb
+    v3210 = iconst.i64 -8725605901209645114
+    v3211 = iconst.i64 -809592977159303349
+    v319 = iconst.i64 -7563317447395451459
+    v59 = iconst.i64 0x4304_beb1_311d_a08a
+    v60 = iconst.i64 -2706257100355077752
+    v64 = iconst.i64 0x375d_71f9_8857_42c8
+    v65 = iconst.i64 0x2c56_b254_7bcf_7fad
+    v70 = iconst.i32 0x0576_6c07
+    v75 = iconst.i64 -9223372036854775808
+    v3432 = iconst.i64 0x4304_beb1_311d_a08a
+    v3433 = iconst.i64 -2706257100355077752
+    v3437 = iconst.i64 0x375d_71f9_8857_42c8
+    v3438 = iconst.i64 0x2c56_b254_7bcf_7fad
+    v3443 = iconst.i32 0x0576_6c07
+    v3448 = iconst.i64 -9223372036854775808
+    v3349 = iconst.i64 -6034581037796470233
+    v3350 = iconst.i64 0x1ce2_f5ec_546c_6958
+    v3353 = iconst.i64 -7563317447395451459
+    v3354 = iconst.i64 -1862259597032899258
+    v3357 = iconst.i64 5
+    v3361 = iconst.i64 -6100580964613818122
+    v3362 = iconst.i64 -2331310569257312092
+    v3368 = iconst.i64 0x0010_6122
+    v3369 = iconst.i64 -4294967296
+    v3373 = iconst.i64 -6795840057232003323
+    v3377 = iconst.i64 15
+    v3378 = iconst.i64 0
+    v3387 = iconst.i64 -1862259597032899258
+    v4586 = iconst.i64 0x0001_0000_0000
+    v4614 = iconst.i64 0x0001_0000_0000
+    v195 = iconst.i64 -89
+    v209 = iconst.i64 0x29cc_ab6b_4794_9639
+    v210 = iconst.i64 -2425523257307766026
+    v4640 = iconst.i64 -1099511627776
+    v4642 = iconst.i64 0x004e_0000_f741
+    v250 = iconst.i32 0x1bf9_c4f6
+    v254 = iconst.i64 -1862259597032899258
+    v308 = iconst.i64 0
+    v310 = iconst.i64 -4294967296
+    v317 = iconst.i64 -1862259597032899258
+    v324 = iconst.i64 0
+    v326 = iconst.i64 -4294967296
+    v331 = iconst.i64 0x00a0_0000_0000
+    v332 = iconst.i64 -1095216660481
+    v336 = iconst.i64 0x38db_5781_7028_ea62
+    v345 = iconst.i32 0x1348_43fa
+    v367 = iconst.i64 0
+    v369 = iconst.i64 -4294967296
+    v376 = iconst.i32 0x29c7_1632
+    v384 = iconst.i64 32
+    v387 = iconst.i8 -96
+    v259 = iconst.i64 -7563317447395451459
+    v3146 = iconst.i32 -113236681
+    v4693 = iconst.i64 -7563317447395451459
+    v113 = iconcat v111, v112  ; v111 = -6034581037796470233, v112 = 0x1ce2_f5ec_546c_6958
+    v117 = iconcat v115, v116  ; v115 = -7563317447395451459, v116 = -1862259597032899258
+    v120 = fcvt_from_uint.f32 v119  ; v119 = 5
+    v125 = iconcat v123, v124  ; v123 = -6100580964613818122, v124 = -2331310569257312092
+    v136 = fcvt_from_uint.f32 v135  ; v135 = -6795840057232003323
+    v141 = iconcat v139, v140  ; v139 = 15, v140 = 0
+    v142 = band v117, v141
+    v143 = ireduce.i16 v142
+    v147, v148 = isplit v117
+    v150 = icmp eq v148, v149  ; v149 = -1862259597032899258
+    v166 = iconst.i32 11
+    v167 = fcvt_from_uint.f32 v166  ; v166 = 11
+    v179 = fcvt_from_uint.f32 v178  ; v178 = -149525188
+    v3298 = iconcat v3296, v3297  ; v3296 = 0x533e_7bcb_41af_bb30, v3297 = 0x2136_359d_044d_ed4d
+    v3302 = fcvt_from_sint.f32 v3301  ; v3301 = -2083453947680315498
+    v3313 = fcvt_from_uint.f32 v3312  ; v3312 = 0x26f0_cebd_57ad_1beb
+    v3317 = iconcat v3315, v3316  ; v3315 = -8725605901209645114, v3316 = -809592977159303349
+    v274 = fcvt_from_sint.f32 v273  ; v273 = -8836100573157773700
+    v277 = fcvt_from_sint.f32 v266  ; v266 = 0x7fff_ffff_ffff_ffff
+    v282 = iconst.i32 -21
+    v283 = fcvt_from_sint.f32 v282  ; v282 = -21
+    v287 = fcvt_from_uint.f32 v286  ; v286 = -2285543122749383203
+    v297 = iconst.i32 142
+    v298 = fcvt_from_uint.f32 v297  ; v297 = 142
+    v300 = fcvt_from_uint.f32 v299  ; v299 = -113236681
+    v3215 = fcvt_from_uint.f32 v3214  ; v3214 = -113236681
+    v3163 = iconcat v3161, v3162  ; v3161 = 0x533e_7bcb_41af_bb30, v3162 = 0x2136_359d_044d_ed4d
+    v3167 = fcvt_from_sint.f32 v3166  ; v3166 = -2083453947680315498
+    v3178 = fcvt_from_uint.f32 v3177  ; v3177 = 0x26f0_cebd_57ad_1beb
+    v3182 = iconcat v3180, v3181  ; v3180 = -8725605901209645114, v3181 = -809592977159303349
+    v86 = iconcat v84, v85  ; v84 = 0x533e_7bcb_41af_bb30, v85 = 0x2136_359d_044d_ed4d
+    v90 = fcvt_from_sint.f32 v89  ; v89 = -2083453947680315498
+    v101 = fcvt_from_uint.f32 v100  ; v100 = 0x26f0_cebd_57ad_1beb
+    v105 = iconcat v103, v104  ; v103 = -8725605901209645114, v104 = -809592977159303349
+    v3403 = iconcat v3401, v3402  ; v3401 = 0x533e_7bcb_41af_bb30, v3402 = 0x2136_359d_044d_ed4d
+    v3407 = fcvt_from_sint.f32 v3406  ; v3406 = -2083453947680315498
+    v3418 = fcvt_from_uint.f32 v3417  ; v3417 = 0x26f0_cebd_57ad_1beb
+    v3422 = iconcat v3420, v3421  ; v3420 = -8725605901209645114, v3421 = -809592977159303349
+    v3329 = iconcat v3327, v3328  ; v3327 = 0x4304_beb1_311d_a08a, v3328 = -2706257100355077752
+    v3334 = iconcat v3332, v3333  ; v3332 = 0x375d_71f9_8857_42c8, v3333 = 0x2c56_b254_7bcf_7fad
+    v3339 = fcvt_from_uint.f32 v3338  ; v3338 = 0x0576_6c07
+    v3344 = fcvt_from_sint.f32 v3343  ; v3343 = -9223372036854775808
+    v155 = icmp eq v147, v154  ; v154 = -7563317447395451459
+    v3268 = iconcat v3266, v3267  ; v3266 = 0x533e_7bcb_41af_bb30, v3267 = 0x2136_359d_044d_ed4d
+    v3272 = fcvt_from_sint.f32 v3271  ; v3271 = -2083453947680315498
+    v3283 = fcvt_from_uint.f32 v3282  ; v3282 = 0x26f0_cebd_57ad_1beb
+    v3287 = iconcat v3285, v3286  ; v3285 = -8725605901209645114, v3286 = -809592977159303349
+    v3232 = iconst.i32 11
+    v3233 = fcvt_from_uint.f32 v3232  ; v3232 = 11
+    v3245 = fcvt_from_uint.f32 v3244  ; v3244 = -149525188
+    v3193 = iconcat v3191, v3192  ; v3191 = 0x533e_7bcb_41af_bb30, v3192 = 0x2136_359d_044d_ed4d
+    v3197 = fcvt_from_sint.f32 v3196  ; v3196 = -2083453947680315498
+    v3208 = fcvt_from_uint.f32 v3207  ; v3207 = 0x26f0_cebd_57ad_1beb
+    v3212 = iconcat v3210, v3211  ; v3210 = -8725605901209645114, v3211 = -809592977159303349
+    v61 = iconcat v59, v60  ; v59 = 0x4304_beb1_311d_a08a, v60 = -2706257100355077752
+    v66 = iconcat v64, v65  ; v64 = 0x375d_71f9_8857_42c8, v65 = 0x2c56_b254_7bcf_7fad
+    v71 = fcvt_from_uint.f32 v70  ; v70 = 0x0576_6c07
+    v76 = fcvt_from_sint.f32 v75  ; v75 = -9223372036854775808
+    v3434 = iconcat v3432, v3433  ; v3432 = 0x4304_beb1_311d_a08a, v3433 = -2706257100355077752
+    v3439 = iconcat v3437, v3438  ; v3437 = 0x375d_71f9_8857_42c8, v3438 = 0x2c56_b254_7bcf_7fad
+    v3444 = fcvt_from_uint.f32 v3443  ; v3443 = 0x0576_6c07
+    v3449 = fcvt_from_sint.f32 v3448  ; v3448 = -9223372036854775808
+    v3351 = iconcat v3349, v3350  ; v3349 = -6034581037796470233, v3350 = 0x1ce2_f5ec_546c_6958
+    v3355 = iconcat v3353, v3354  ; v3353 = -7563317447395451459, v3354 = -1862259597032899258
+    v3358 = fcvt_from_uint.f32 v3357  ; v3357 = 5
+    v3363 = iconcat v3361, v3362  ; v3361 = -6100580964613818122, v3362 = -2331310569257312092
+    v3374 = fcvt_from_uint.f32 v3373  ; v3373 = -6795840057232003323
+    v3379 = iconcat v3377, v3378  ; v3377 = 15, v3378 = 0
+    v3380 = band v3355, v3379
+    v3381 = ireduce.i16 v3380
+    v3385, v3386 = isplit v3355
+    v4695 = icmp ne v3386, v3387  ; v3387 = -1862259597032899258
+    v152 = icmp uge v147, v4586  ; v4586 = 0x0001_0000_0000
+    v3390 = icmp uge v3385, v4614  ; v4614 = 0x0001_0000_0000
+    v211 = iconcat v209, v210  ; v209 = 0x29cc_ab6b_4794_9639, v210 = -2425523257307766026
+    v222 = iconst.i32 0x7d12
+    v223 = fcvt_from_uint.f32 v222  ; v222 = 0x7d12
+    v225 = fcvt_from_sint.f32 v195  ; v195 = -89
+    v247 = fcvt_from_sint.f32 v195  ; v195 = -89
+    v251 = fcvt_from_uint.f32 v250  ; v250 = 0x1bf9_c4f6
+    v153 = ireduce.i32 v147
+    v3391 = ireduce.i32 v3385
+    v340 = fcvt_from_uint.f32 v336  ; v336 = 0x38db_5781_7028_ea62
+    v346 = fcvt_from_sint.f32 v345  ; v345 = 0x1348_43fa
+    jump block42(v49, v37, v3, v3597)  ; v37 = 0x2e78, v3597 = 0
+
+block42(v3580: i16, v3585: i16, v3590: i16, v3595: i64):
+    v52 = load.i64 notrap v35
+    store notrap v52, v35
+    v53 = load.i64 notrap v35
+    store notrap v53, v35
+    v54 = load.i64 notrap v35
+    store notrap v54, v35
+    v55 = load.i64 notrap v35
+    store notrap v55, v35
+    v58 = load.i64 notrap v35
+    v62 = call fn0(v61)
+    store notrap v62, v58
+    v63 = load.i64 notrap v35
+    v67 = call fn1(v66)
+    store notrap v67, v63
+    v68 = load.i64 notrap v35
+    store notrap v68, v35
+    v69 = load.i64 notrap v35
+    store.f32 notrap v71, v69
+    v72 = load.i64 notrap v35
+    store notrap v72, v35
+    v73 = load.i64 notrap v35
+    store notrap v73, v35
+    v74 = load.i64 notrap v35
+    store.f32 notrap v76, v74
+    v380 = fcvt_from_uint.f32 v336  ; v336 = 0x38db_5781_7028_ea62
+    v3147 = fcvt_from_uint.f32 v3146  ; v3146 = -113236681
+    v4694 = icmp.i64 eq v3385, v4693  ; v4693 = -7563317447395451459
+    jump block43(v3580, v3585, v3590, v3595)
+
+block43(v81: i16, v92: i16, v95: i16, v3594: i64):
+    v77 = load.i64 notrap v35
+    v82 = sextend.i32 v81
+    v83 = fcvt_from_sint.f32 v82
+    store notrap v83, v77
+    v87 = call fn1(v86)
+    store notrap v87, v77
+    store notrap v77, v35
+    store.f32 notrap v90, v77
+    store notrap v77, v35
+    v91 = load.i64 notrap v35
+    store notrap v91, v35
+    v93 = sextend.i32 v92
+    v94 = fcvt_from_sint.f32 v93
+    store notrap v94, v77
+    v97 = band v81, v96  ; v96 = 15
+    v98 = ishl v95, v97
+    store notrap v77, v35
+    v99 = load.i64 notrap v35
+    store.f32 notrap v101, v99
+    v102 = load.i64 notrap v35
+    v106 = call fn1(v105)
+    store notrap v106, v102
+    jump block44(v77, v3594, v98, v81, v92)
+
+block44(v110: i64, v127: i64, v138: i16, v3581: i16, v3586: i16):
+    v108 = load.i64 notrap v35
+    store notrap v108, v35
+    v109 = load.i64 notrap v35
+    store notrap v109, v35
+    v114 = call fn1(v113)
+    store notrap v114, v110
+    store notrap v110, v35
+    v118 = load.i64 notrap v35
+    store.f32 notrap v120, v118
+    v121 = load.i64 notrap v35
+    store notrap v121, v35
+    v122 = load.i64 notrap v35
+    v126 = call fn1(v125)
+    store notrap v126, v122
+    store notrap v110, v35
+    v132 = band v127, v131  ; v131 = -4294967296
+    v133 = bor v132, v130  ; v130 = 0x0010_6122
+    v134 = load.i64 notrap v35
+    store.f32 notrap v136, v134
+    v137 = load.i64 notrap v35
+    v144 = sshr v138, v143
+    v145 = sextend.i32 v138
+    v146 = fcvt_from_sint.f32 v145
+    store notrap v146, v137
+    brif.i8 v150, block93, block94
+
+block94:
+    brif.i64 v148, block45(v3581, v3586, v133), block92
+
+block92:
+    brif.i8 v152, block45(v3581, v3586, v133), block95
+
+block95:
+    br_table v153, block45(v3581, v3586, v133), [block42(v3581, v3586, v144, v133), block43(v3581, v3586, v144, v133), block46(v3581, v3586, v133)]
+
+block93:
+    brif.i8 v155, block47(v133, v137, v3581, v3586), block45(v3581, v3586, v133)
+
+block47(v157: i64, v3608: i64, v3612: i16, v3614: i16):
+    v4794 = iconst.i64 15
+    v4795 = iconst.i64 0
+    v4796 = iconcat v4794, v4795  ; v4794 = 15, v4795 = 0
+    v4797 = band.i128 v117, v4796
+    v4798 = ireduce.i16 v4797
+    v4799 = sshr.i16 v138, v4798
+    v164 = load.i64 notrap v35
+    store.f32 notrap v167, v164
+    v4619 = band v157, v4618  ; v4618 = -1099511627776
+    v173 = bor v4619, v4620  ; v4620 = 0x000c_000f_fdb5
+    v175 = load.i64 notrap v35
+    store notrap v175, v35
+    v176 = load.i64 notrap v35
+    store notrap v176, v35
+    v177 = load.i64 notrap v35
+    store.f32 notrap v179, v177
+    v180 = load.i64 notrap v35
+    store notrap v180, v35
+    v181 = load.i64 notrap v35
+    store notrap v181, v35
+    v182 = load.i64 notrap v35
+    store notrap v182, v35
+    v184, v185 = isplit.i128 v117
+    v187 = icmp eq v185, v186  ; v186 = -1862259597032899258
+    brif v187, block97, block98
+
+block98:
+    brif.i64 v185, block48(v3608, v173, v3612, v3614), block96
+
+block96:
+    v189 = icmp.i64 uge v184, v4587  ; v4587 = 0x0001_0000_0000
+    brif v189, block48(v3608, v173, v3612, v3614), block99
+
+block99:
+    v190 = ireduce.i32 v184
+    br_table v190, block48(v3608, v173, v3612, v3614), [block49(v3612, v3614, v173), block50(v3612, v3614, v173)]
+
+block97:
+    v192 = icmp.i64 eq v184, v191  ; v191 = -7563317447395451459
+    brif v192, block51(v173, v3608, v3612, v3614), block48(v3608, v173, v3612, v3614)
+
+block51(v199: i64, v3593: i64, v3606: i16, v3607: i16):
+    v194 = load.i64 notrap v35
+    store notrap v194, v35
+    v196 = load.i64 notrap v35
+    v198 = call fn0(v117)
+    store notrap v198, v196
+    v206 = load.i64 notrap v35
+    v207 = call fn0(v117)
+    store notrap v207, v206
+    v208 = load.i64 notrap v35
+    v212 = call fn1(v211)
+    store notrap v212, v208
+    v220 = load.i64 notrap v35
+    store.f32 notrap v223, v220
+    v224 = load.i64 notrap v35
+    store.f32 notrap v225, v224
+    v4641 = band v199, v4640  ; v4640 = -1099511627776
+    v245 = bor v4641, v4642  ; v4642 = 0x004e_0000_f741
+    v246 = load.i64 notrap v35
+    store.f32 notrap v247, v246
+    v249 = load.i64 notrap v35
+    store.f32 notrap v251, v249
+    v252, v253 = isplit.i128 v117
+    v255 = icmp eq v253, v254  ; v254 = -1862259597032899258
+    brif v255, block101, block102
+
+block102:
+    brif.i64 v253, block52, block100
+
+block100:
+    v257 = icmp.i64 uge v252, v4588  ; v4588 = 0x0001_0000_0000
+    brif v257, block52, block103
+
+block103:
+    v258 = ireduce.i32 v252
+    br_table v258, block52, [block48(v3593, v245, v3606, v3607), block50(v3606, v3607, v245), block44(v3593, v245, v138, v3606, v3607), block46(v3606, v3607, v245)]
+
+block101:
+    v260 = icmp.i64 eq v252, v259  ; v259 = -7563317447395451459
+    brif v260, block53, block52
+
+block53:
+    v268 = load.i64 notrap v35
+    store notrap v268, v35
+    v271 = isub.i16 v4799, v4799
+    store.f32 notrap v274, v268
+    v275 = load.i64 notrap v35
+    store notrap v275, v35
+    store.f32 notrap v277, v275
+    v278 = load.i64 notrap v35
+    store.f32 notrap v283, v278
+    v284 = load.i64 notrap v35
+    store notrap v284, v35
+    store.f32 notrap v287, v284
+    v288 = iadd v271, v4799
+    v289 = load.i64 notrap v35
+    store notrap v289, v35
+    store.f32 notrap v298, v289
+    store.f32 notrap v300, v34
+    v4697 = load.i64 notrap v35
+    jump block54(v267, v4697)  ; v267 = 0x00eb_0007_5324
+
+block54(v306: i64, v4696: i64):
+    v4807 = ireduce.i32 v306
+    v307 = uextend.i64 v4807
+    v309 = ishl v307, v308  ; v308 = 0
+    v311 = band v306, v310  ; v310 = -4294967296
+    v312 = bor v311, v309
+    v315, v316 = isplit.i128 v117
+    v318 = icmp eq v316, v317  ; v317 = -1862259597032899258
+    brif v318, block105, block106
+
+block106:
+    brif.i64 v316, block55, block104
+
+block104:
+    brif.i64 v315, block55, block56
+
+block105:
+    v320 = icmp.i64 eq v315, v319  ; v319 = -7563317447395451459
+    brif v320, block57, block55
+
+block57:
+    v323 = uextend.i64 v4807
+    v325 = ishl v323, v324  ; v324 = 0
+    v327 = band.i64 v312, v326  ; v326 = -4294967296
+    v328 = bor v327, v325
+    v333 = band v328, v332  ; v332 = -1095216660481
+    v334 = bor v333, v331  ; v331 = 0x00a0_0000_0000
+    store.i64 notrap v4696, v35
+    store.f32 notrap v340, v4696
+    store.f32 notrap v346, v34
+    v366 = uextend.i64 v4807
+    v368 = ishl v366, v367  ; v367 = 0
+    v370 = band v334, v369  ; v369 = -4294967296
+    v371 = bor v370, v368
+    store.f32 notrap v380, v4696
+    store.i64 notrap v34, v35
+    v385 = ushr v371, v384  ; v384 = 32
+    v386 = ireduce.i8 v385
+    v388 = icmp eq v386, v387  ; v387 = -96
+    brif v388, block61, block107
+
+block107:
+    v389 = uextend.i32 v386
+    br_table v389, block58, [block50(v288, v288, v371), block51(v371, v4696, v288, v288), block59, block60]
+
+block61:
+    v399 = iconst.i16 0
+    v400 = isub v399, v288  ; v399 = 0
+    store.i64 notrap v4696, v35
+    v403 = iconst.i32 167
+    v404 = fcvt_from_uint.f32 v403  ; v403 = 167
+    store notrap v404, v4696
+    v420 = load.i64 notrap v35
+    v421 = iconst.i64 -3339870588203622246
+    v422 = iconst.i64 0x2e99_04fe_3cf5_94be
+    v423 = iconcat v421, v422  ; v421 = -3339870588203622246, v422 = 0x2e99_04fe_3cf5_94be
+    v424 = call fn1(v423)
+    store notrap v424, v420
+    v426 = iconst.i64 -8391387870722308554
+    v427 = iconst.i32 0x1348_43fa
+    v4589 = uextend.i64 v271
+    v4590 = iconst.i64 63
+    v441 = band v4589, v4590  ; v4590 = 63
+    v442 = iconst.i64 6
+    v443 = ishl v442, v441  ; v442 = 6
+    store.i64 notrap v4696, v35
+    v448 = fcvt_from_sint.f32 v266  ; v266 = 0x7fff_ffff_ffff_ffff
+    store notrap v448, v4696
+    v451 = imul.i128 v117, v117
+    v452 = load.i64 notrap v35
+    v453 = fcvt_from_uint.f32 v426  ; v426 = -8391387870722308554
+    store notrap v453, v452
+    store.i64 notrap v4696, v35
+    v469 = iconst.i16 147
+    v471 = iconst.i64 -7500681262094410550
+    v475 = fcvt_from_uint.f32 v471  ; v471 = -7500681262094410550
+    store notrap v475, v4696
+    v476 = iconst.i64 0x09a2_fb1f_ecf7_eed3
+    v477 = iconst.i64 0x5566_f8d9_3113_2ef2
+    v478 = iconcat v476, v477  ; v476 = 0x09a2_fb1f_ecf7_eed3, v477 = 0x5566_f8d9_3113_2ef2
+    v479 = call fn1(v478)
+    store.i64 notrap v4696, v35
+    v486 = fcvt_from_sint.f32 v427  ; v427 = 0x1348_43fa
+    store notrap v486, v4696
+    v487 = load.i64 notrap v35
+    v488 = call fn0(v451)
+    store notrap v488, v487
+    v489 = iconst.i64 0x3f6a_002d_8fe9_4653
+    v490 = iconst.i64 0x0e9a_c3cd_d5ec_8d6c
+    v491 = iconcat v489, v490  ; v489 = 0x3f6a_002d_8fe9_4653, v490 = 0x0e9a_c3cd_d5ec_8d6c
+    v492 = call fn1(v491)
+    store.i64 notrap v4696, v35
+    v493 = fcvt_from_uint.f32 v471  ; v471 = -7500681262094410550
+    store notrap v493, v4696
+    v494 = sextend.i32 v288
+    v495 = fcvt_from_sint.f32 v494
+    store notrap v495, v34
+    call fn2(v469, v443, v266, v4799)  ; v469 = 147, v266 = 0x7fff_ffff_ffff_ffff
+    call fn3(v400, v138, v376)  ; v376 = 0x29c7_1632
+    v497 = load.f32 notrap v34
+    store notrap v497, v32
+    v499 = iconst.i16 384
+    store.i64 notrap v21, v22
+    v503 = iconst.i64 0x7fff_ffff_ffff_ffff
+    v504 = fcvt_from_sint.f32 v503  ; v503 = 0x7fff_ffff_ffff_ffff
+    store notrap v504, v21
+    v507 = iconst.i32 155
+    v508 = fcvt_from_uint.f32 v507  ; v507 = 155
+    store notrap v508, v21
+    v509 = load.i64 notrap v22
+    v510 = iconst.i64 0x12d6_38e5_47c2_9734
+    v511 = fcvt_from_uint.f32 v510  ; v510 = 0x12d6_38e5_47c2_9734
+    store notrap v511, v509
+    v512 = load.i64 notrap v22
+    store notrap v512, v22
+    v514 = iconst.i64 2
+    v515 = fcvt_from_uint.f32 v514  ; v514 = 2
+    store notrap v515, v512
+    v517 = load.i64 notrap v22
+    v519 = iconst.i32 0xcc20
+    v520 = fcvt_from_uint.f32 v519  ; v519 = 0xcc20
+    store notrap v520, v517
+    v521 = load.i64 notrap v22
+    store notrap v521, v22
+    v2876 = iconst.i64 0x552a_cd6e_c8aa_3d8c
+    v2877 = iconst.i64 0x140e_b6f3_ad43_ba07
+    v749 = iconst.i32 -1066380098
+    v4672 = iconst.i32 7
+    v755 = iconst.i8 -66
+    v761 = iconst.i32 -1
+    v764 = iconst.i64 -9223372036854775808
+    v4593 = iconst.i64 0x0001_0000_0000
+    v2292 = iconst.i64 0x6a55_da45_6e7c_49a3
+    v2511 = iconst.i32 -1
+    v2520 = iconst.i8 37
+    v2521 = iconst.i64 1
+    v2523 = iconst.i8 74
+    v2524 = iconst.i64 2
+    v2526 = iconst.i8 -52
+    v2540 = iconst.i8 -36
+    v2541 = iconst.i64 1
+    v2543 = iconst.i8 -22
+    v2544 = iconst.i64 2
+    v2546 = iconst.i8 -37
+    v2555 = iconst.i64 0x74c6_4cc2_6f8a_95ca
+    v2699 = iconst.i64 8
+    v2708 = iconst.i64 6
+    v2713 = iconst.i64 0x7fff_ffff_ffff_ffff
+    v2718 = iconst.i64 0x49cc_df60_28d7_443c
+    v864 = iconst.i32 -1
+    v873 = iconst.i8 37
+    v874 = iconst.i64 1
+    v876 = iconst.i8 74
+    v877 = iconst.i64 2
+    v879 = iconst.i8 -52
+    v893 = iconst.i8 -36
+    v894 = iconst.i64 1
+    v896 = iconst.i8 -22
+    v897 = iconst.i64 2
+    v899 = iconst.i8 -37
+    v908 = iconst.i64 0x74c6_4cc2_6f8a_95ca
+    v2269 = iconst.i64 20
+    v2288 = iconst.i64 0
+    v1340 = iconst.i64 -2
+    v1345 = iconst.i64 -1315862539377158149
+    v954 = iconst.i8 -89
+    v955 = iconst.i64 1
+    v957 = iconst.i8 9
+    v958 = iconst.i64 2
+    v960 = iconst.i8 122
+    v964 = iconst.i64 0
+    v1923 = iconst.i8 87
+    v1924 = iconst.i64 1
+    v1926 = iconst.i8 71
+    v1927 = iconst.i64 2
+    v1929 = iconst.i8 108
+    v1941 = iconst.i8 -118
+    v1942 = iconst.i64 1
+    v1944 = iconst.i8 -38
+    v1945 = iconst.i64 2
+    v1947 = iconst.i8 77
+    v1949 = iconst.i64 4
+    v1952 = iconst.i64 0x6a55_da45_6e7c_49a3
+    v1155 = iconst.i32 -1936553825
+    v1156 = iconst.i64 8
+    v1165 = iconst.i64 6
+    v1170 = iconst.i64 0x7fff_ffff_ffff_ffff
+    v1175 = iconst.i64 0x49cc_df60_28d7_443c
+    v710 = iconst.i64 -99
+    v716 = iconst.i32 0x3b3b_ac23
+    v720 = iconst.i32 0x02a5_a382
+    v723 = iconst.i32 0x6f3d_92de
+    v726 = iconst.i32 -1545206288
+    v728 = iconst.i64 -6451915945820699960
+    v731 = iconst.i64 -9223372036854775808
+    v737 = iconst.i64 -3690511948449329794
+    v741 = iconst.i64 -9223372036854775808
+    v744 = iconst.i8 0
+    v2290 = iconst.i64 1
+    v2565 = iconst.i8 -89
+    v2566 = iconst.i64 1
+    v2568 = iconst.i8 9
+    v2569 = iconst.i64 2
+    v2571 = iconst.i8 122
+    v2575 = iconst.i64 0
+    v2753 = iconst.i64 0x552a_cd6e_c8aa_3d8c
+    v2754 = iconst.i64 0x140e_b6f3_ad43_ba07
+    v2395 = iconst.i64 0x626e_5ca8_56bc_0d69
+    v2398 = iconst.i64 -6753952338686199543
+    v2414 = iconst.i8 -43
+    v2415 = iconst.i64 1
+    v2417 = iconst.i8 -112
+    v2418 = iconst.i64 2
+    v2420 = iconst.i8 96
+    v1274 = iconst.i64 3
+    v1283 = iconst.i64 -7
+    v1290 = iconst.i64 -6
+    v1293 = iconst.i16 0
+    v1296 = iconst.i32 0x10d1_34c2
+    v2975 = iconst.i8 15
+    v2976 = iconst.i64 1
+    v2978 = iconst.i8 -12
+    v2979 = iconst.i64 2
+    v2981 = iconst.i8 27
+    v2984 = iconst.i64 -383605314167426216
+    v2985 = iconst.i64 0x4690_8f6a_b3bb_66d2
+    v2990 = iconst.i64 0x1e37_fd70_b944_4118
+    v3003 = iconst.i64 -5557755341736380211
+    v1565 = iconst.i64 -8336632367364994270
+    v1914 = iconst.i64 -102
+    v1123 = iconst.i64 60
+    v1128 = iconst.i64 -4465584269192554660
+    v1129 = iconst.i64 0x49cc_df60_28d7_443c
+    v1132 = iconst.i64 0x2a9d_cff2_19c1_4ca3
+    v1133 = iconst.i64 -6059118504639291756
+    v1140 = iconst.i64 0x5e86_562b_a085_5f3c
+    v1141 = iconst.i64 0x74fc_7a6f_c864_d151
+    v910 = iconst.i64 -4017781672461578577
+    v665 = iconst.i64 -477180722809202585
+    v666 = iconst.i64 -4789719269570172715
+    v682 = iconst.i64 2
+    v687 = iconst.i64 6
+    v692 = iconst.i64 3
+    v694 = iconst.i64 0x652e_1762_a5a0_9ca3
+    v695 = iconst.i64 -7041934467126151977
+    v699 = iconst.i16 -1
+    v700 = iconst.i64 0x6311_93bc_fcf3_b3ff
+    v2182 = iconst.i8 -53
+    v2183 = iconst.i64 1
+    v2185 = iconst.i8 36
+    v2186 = iconst.i64 2
+    v2188 = iconst.i8 116
+    v2194 = iconst.i64 0
+    v2795 = iconst.i64 0x552a_cd6e_c8aa_3d8c
+    v2796 = iconst.i64 0x140e_b6f3_ad43_ba07
+    v1180 = iconst.i64 -4465584269192554660
+    v4683 = iconst.i64 1
+    v2557 = iconst.i64 -4017781672461578577
+    v2435 = iconst.i32 -1066380098
+    v4675 = iconst.i32 7
+    v2441 = iconst.i8 -66
+    v2447 = iconst.i32 -1
+    v2450 = iconst.i64 -9223372036854775808
+    v1232 = iconst.i64 8
+    v1235 = iconst.i64 -4
+    v1241 = iconst.i64 8
+    v1246 = iconst.i64 4
+    v1250 = iconst.i64 -6563519144290790462
+    v1253 = iconst.i64 0x5cf0_4f49_2f71_3d3b
+    v1259 = iconst.i64 -9018018456040995859
+    v1268 = iconst.i64 0x75b7_0a30_dc4e_4b07
+    v3010 = iconst.i64 0x12d6_38e5_47c2_9734
+    v3015 = iconst.i64 2
+    v1450 = iconst.i64 1
+    v1461 = iconst.i64 8
+    v1464 = iconst.i64 0x4e75_588b_09e4_d7be
+    v1105 = iconst.i32 0x0010_4fe0
+    v1113 = iconst.i64 -7452106143569889224
+    v631 = iconst.i32 0x61e5_d106
+    v647 = iconst.i64 0x5e71_4855_8bb6_15cf
+    v648 = iconst.i64 0x6aba_8910_2bb3_3ff1
+    v652 = iconst.i64 5
+    v659 = iconst.i64 5
+    v1822 = iconst.i64 2
+    v1873 = iconst.i64 -7899696129866597630
+    v1874 = iconst.i64 1
+    v1876 = iconst.i64 2
+    v1878 = iconst.i64 3
+    v1880 = iconst.i64 4
+    v1898 = iconst.i8 1
+    v1906 = iconst.i64 16
+    v1909 = iconst.i32 0
+    v4607 = iconst.i64 0x0001_0000_0000
+    v2061 = iconst.i8 52
+    v2062 = iconst.i64 1
+    v2064 = iconst.i8 -52
+    v2065 = iconst.i64 2
+    v2067 = iconst.i8 69
+    v2068 = iconst.i8 46
+    v2069 = iconst.i64 1
+    v2071 = iconst.i8 -43
+    v2072 = iconst.i64 2
+    v2074 = iconst.i8 -21
+    v2075 = iconst.i8 106
+    v2076 = iconst.i64 1
+    v2078 = iconst.i8 -82
+    v2079 = iconst.i64 2
+    v2081 = iconst.i8 -38
+    v2089 = iconst.i8 29
+    v2090 = iconst.i64 1
+    v2092 = iconst.i8 -86
+    v2093 = iconst.i64 2
+    v2095 = iconst.i8 74
+    v4644 = iconst.i64 -256
+    v4646 = iconst.i64 2
+    v2114 = iconst.i8 -104
+    v2115 = iconst.i64 1
+    v2117 = iconst.i8 114
+    v2118 = iconst.i64 2
+    v2120 = iconst.i8 -16
+    v2121 = iconst.i64 8
+    v2126 = iconst.i64 63
+    v2128 = iconst.i64 0
+    v2167 = iconst.i64 0x6a55_da45_6e7c_49a3
+    v4594 = iconst.i64 0x0001_0000_0000
+    v2461 = iconst.i8 15
+    v2462 = iconst.i64 1
+    v2464 = iconst.i8 -12
+    v2465 = iconst.i64 2
+    v2467 = iconst.i8 27
+    v2470 = iconst.i64 -383605314167426216
+    v2471 = iconst.i64 0x4690_8f6a_b3bb_66d2
+    v2476 = iconst.i64 0x1e37_fd70_b944_4118
+    v2489 = iconst.i64 -5557755341736380211
+    v1213 = iconst.i64 0x34c8_6021_7205_749c
+    v1214 = iconst.i64 -7889294670562934542
+    v1220 = iconst.i64 0x7fff_ffff_ffff_ffff
+    v3026 = iconst.i32 -1066380098
+    v4663 = iconst.i32 7
+    v3032 = iconst.i8 -66
+    v3038 = iconst.i32 -1
+    v3041 = iconst.i64 -9223372036854775808
+    v1404 = iconst.i64 0x7c1c_d9f9_aa1e_055b
+    v1433 = iconst.i64 -3645290141612146199
+    v1435 = iconst.i64 7
+    v1444 = iconst.i64 -4787228447409842621
+    v973 = iconst.i64 0x6a55_da45_6e7c_49a3
+    v976 = iconst.i64 20
+    v979 = iconst.i8 1
+    v981 = iconst.i8 1
+    v985 = iconst.i8 -15
+    v986 = iconst.i64 1
+    v988 = iconst.i8 49
+    v989 = iconst.i64 2
+    v991 = iconst.i8 125
+    v994 = iconst.i64 -2556624297083292120
+    v998 = iconst.i8 121
+    v999 = iconst.i64 1
+    v1001 = iconst.i8 56
+    v1002 = iconst.i64 2
+    v1004 = iconst.i8 84
+    v527 = iconst.i64 0x0806_8f78_4495_34ea
+    v534 = iconst.i32 0x3661_2c64
+    v538 = iconst.i32 0x5b9d_f368
+    v543 = iconst.i64 0x595f_bc0b_4018_a7cb
+    v544 = iconst.i64 -3177502566850844990
+    v558 = iconst.i64 0x12f4_7f09_de99_6064
+    v559 = iconst.i64 0x41c8_2564_5faf_fe52
+    v566 = iconst.i64 -2584084526369008014
+    v567 = iconst.i64 0x7280_7596_cec2_abf8
+    v571 = iconst.i64 0x6d71_5738_23e1_12d1
+    v575 = iconst.i64 -9223372036854775808
+    v577 = iconst.i32 0x7f5f_b7c4
+    v584 = iconst.i64 -2452551009006681612
+    v591 = iconst.i32 0x73e8_7081
+    v594 = iconst.i32 -843415883
+    v597 = iconst.i64 0x7cf8_007c_3964_cde7
+    v599 = iconst.i64 -8296417542235928254
+    v600 = iconst.i64 -1383884486908807654
+    v603 = iconst.i32 0x6fab_6ada
+    v606 = iconst.i64 0x7fff_ffff_ffff_ffff
+    v609 = iconst.i64 -7705092265312726629
+    v610 = iconst.i64 0x3e78_6954_4f0b_076f
+    v619 = iconst.i64 -8147915341656014653
+    v622 = iconst.i32 0x2eec_df9e
+    v1959 = iconst.i64 0x12d6_38e5_47c2_9734
+    v1964 = iconst.i64 2
+    v1189 = iconst.i64 0x49cc_df60_28d7_443c
+    v966 = iconst.i64 -102
+    v825 = iconst.i64 0x626e_5ca8_56bc_0d69
+    v828 = iconst.i64 -6753952338686199543
+    v829 = iconst.i64 -4017781672461578577
+    v830 = iconst.i64 0x74c6_4cc2_6f8a_95ca
+    v836 = iconst.i64 0x7e4f_c926_e36d_f3c1
+    v843 = iconst.i64 -102
+    v844 = iconst.i8 -43
+    v845 = iconst.i64 1
+    v847 = iconst.i8 -112
+    v848 = iconst.i64 2
+    v850 = iconst.i8 96
+    v854 = iconst.i64 0x2d09_0041_080a_2151
+    v855 = iconst.i64 -8898972108410530768
+    v2200 = iconst.i64 0x6a55_da45_6e7c_49a3
+    v2496 = iconst.i64 0x12d6_38e5_47c2_9734
+    v2501 = iconst.i64 2
+    v2656 = iconst.i64 -7452106143569889224
+    v1194 = iconst.i64 -4465584269192554660
+    v924 = iconst.i64 -6942259781219233790
+    v943 = iconst.i64 -6942259781219233790
+    v4687 = iconst.i64 -4465584269192554660
+    v2335 = iconst.i64 0x12d6_38e5_47c2_9734
+    v2340 = iconst.i64 2
+    v2891 = iconst.i64 -99
+    v2897 = iconst.i32 0x3b3b_ac23
+    v2901 = iconst.i32 0x02a5_a382
+    v2904 = iconst.i32 0x6f3d_92de
+    v2907 = iconst.i32 -1545206288
+    v2909 = iconst.i64 -6451915945820699960
+    v2912 = iconst.i64 -9223372036854775808
+    v2918 = iconst.i64 -3690511948449329794
+    v2922 = iconst.i64 -9223372036854775808
+    v2925 = iconst.i8 0
+    v1098 = iconst.i64 -9154788606126868873
+    v2198 = iconst.i64 2
+    v1978 = iconst.i8 -86
+    v1979 = iconst.i64 1
+    v1981 = iconst.i8 -84
+    v1982 = iconst.i64 2
+    v1984 = iconst.i8 113
+    v1989 = iconst.i8 -55
+    v1990 = iconst.i64 1
+    v1992 = iconst.i8 -27
+    v1993 = iconst.i64 2
+    v1995 = iconst.i8 25
+    v2000 = iconst.i64 16
+    v2003 = iconst.i64 -3
+    v2004 = iconst.i8 -102
+    v2005 = iconst.i64 1
+    v2007 = iconst.i8 58
+    v2008 = iconst.i64 2
+    v2010 = iconst.i8 -114
+    v2035 = iconst.i8 9
+    v2036 = iconst.i64 1
+    v2038 = iconst.i8 70
+    v2039 = iconst.i64 2
+    v2041 = iconst.i8 -27
+    v2821 = iconst.i64 60
+    v2830 = iconst.i64 0x2a9d_cff2_19c1_4ca3
+    v2831 = iconst.i64 -6059118504639291756
+    v767 = iconst.i8 68
+    v768 = iconst.i64 1
+    v770 = iconst.i8 -24
+    v771 = iconst.i64 2
+    v773 = iconst.i8 -4
+    v782 = iconst.i64 0x22f7_3963_5f2e_7048
+    v783 = iconst.i64 0x0f17_5c98_99c5_0464
+    v794 = iconst.i8 15
+    v795 = iconst.i64 1
+    v797 = iconst.i8 -12
+    v798 = iconst.i64 2
+    v800 = iconst.i8 27
+    v803 = iconst.i64 -383605314167426216
+    v804 = iconst.i64 0x4690_8f6a_b3bb_66d2
+    v809 = iconst.i64 0x1e37_fd70_b944_4118
+    v822 = iconst.i64 -5557755341736380211
+    v2205 = iconst.i8 -95
+    v2206 = iconst.i64 1
+    v2208 = iconst.i8 7
+    v2209 = iconst.i64 2
+    v2211 = iconst.i8 33
+    v2228 = iconst.i64 16
+    v4681 = iconst.i32 31
+    v2243 = iconst.i8 -44
+    v2244 = iconst.i64 1
+    v2246 = iconst.i8 88
+    v2247 = iconst.i64 2
+    v2249 = iconst.i8 -52
+    v2264 = iconst.i64 0x6a55_da45_6e7c_49a3
+    v2666 = iconst.i64 60
+    v2675 = iconst.i64 0x2a9d_cff2_19c1_4ca3
+    v2676 = iconst.i64 -6059118504639291756
+    v4595 = iconst.i64 0x0001_0000_0000
+    v4685 = iconst.i64 -102
+    v4610 = iconst.i64 0x0001_0000_0000
+    v2350 = iconst.i64 -477180722809202585
+    v2351 = iconst.i64 -4789719269570172715
+    v2367 = iconst.i64 2
+    v2372 = iconst.i64 6
+    v2377 = iconst.i64 3
+    v2379 = iconst.i64 0x652e_1762_a5a0_9ca3
+    v2380 = iconst.i64 -7041934467126151977
+    v2384 = iconst.i16 -1
+    v2385 = iconst.i64 0x6311_93bc_fcf3_b3ff
+    v1353 = iconst.i64 7
+    v1354 = iconst.i64 -6525777234453459713
+    v1363 = iconst.i8 19
+    v1369 = iconst.i64 0
+    v1374 = iconst.i64 0x0f73_b017_0a27_85c9
+    v2929 = iconst.i64 0x626e_5ca8_56bc_0d69
+    v2932 = iconst.i64 -6753952338686199543
+    v2948 = iconst.i8 -43
+    v2949 = iconst.i64 1
+    v2951 = iconst.i8 -112
+    v2952 = iconst.i64 2
+    v2954 = iconst.i8 96
+    v1068 = iconst.i64 0x552a_cd6e_c8aa_3d8c
+    v1069 = iconst.i64 0x140e_b6f3_ad43_ba07
+    v2878 = iconcat v2876, v2877  ; v2876 = 0x552a_cd6e_c8aa_3d8c, v2877 = 0x140e_b6f3_ad43_ba07
+    v750 = fcvt_from_uint.f32 v749  ; v749 = -1066380098
+    v765 = sextend.i128 v764  ; v764 = -9223372036854775808
+    v2516 = iconst.i32 -80
+    v2517 = fcvt_from_sint.f32 v2516  ; v2516 = -80
+    v2533 = iconst.i32 -40
+    v2534 = fcvt_from_sint.f32 v2533  ; v2533 = -40
+    v2709 = fcvt_from_uint.f32 v2708  ; v2708 = 6
+    v2714 = fcvt_from_sint.f32 v2713  ; v2713 = 0x7fff_ffff_ffff_ffff
+    v869 = iconst.i32 -80
+    v870 = fcvt_from_sint.f32 v869  ; v869 = -80
+    v886 = iconst.i32 -40
+    v887 = fcvt_from_sint.f32 v886  ; v886 = -40
+    v2270 = iadd.i64 v12, v2269  ; v2269 = 20
+    v1943 = iadd.i64 v15, v1942  ; v1942 = 1
+    v1946 = iadd.i64 v15, v1945  ; v1945 = 2
+    v1166 = fcvt_from_uint.f32 v1165  ; v1165 = 6
+    v1171 = fcvt_from_sint.f32 v1170  ; v1170 = 0x7fff_ffff_ffff_ffff
+    v711 = fcvt_from_sint.f32 v710  ; v710 = -99
+    v713 = iconst.i32 0x7cae
+    v729 = fcvt_from_sint.f32 v728  ; v728 = -6451915945820699960
+    v732 = fcvt_from_sint.f32 v731  ; v731 = -9223372036854775808
+    v742 = fcvt_from_sint.f32 v741  ; v741 = -9223372036854775808
+    v746 = iconst.i64 0xc8b2
+    v2755 = iconcat v2753, v2754  ; v2753 = 0x552a_cd6e_c8aa_3d8c, v2754 = 0x140e_b6f3_ad43_ba07
+    v2396 = fcvt_from_sint.f32 v2395  ; v2395 = 0x626e_5ca8_56bc_0d69
+    v2404 = iconst.i32 0xfdca
+    v2405 = fcvt_from_uint.f32 v2404  ; v2404 = 0xfdca
+    v1303 = iconst.i32 9
+    v1304 = fcvt_from_sint.f32 v1303  ; v1303 = 9
+    v1309 = fcvt_from_sint.f64 v1296  ; v1296 = 0x10d1_34c2
+    v1314 = iconst.i64 1
+    v1316 = iconst.i32 0xdd78
+    v1317 = fcvt_from_uint.f64 v1316  ; v1316 = 0xdd78
+    v2969 = iconst.i32 108
+    v2970 = fcvt_from_sint.f32 v2969  ; v2969 = 108
+    v2977 = iadd.i64 v15, v2976  ; v2976 = 1
+    v2980 = iadd.i64 v15, v2979  ; v2979 = 2
+    v2986 = iconcat v2984, v2985  ; v2984 = -383605314167426216, v2985 = 0x4690_8f6a_b3bb_66d2
+    v2991 = fcvt_from_sint.f32 v2990  ; v2990 = 0x1e37_fd70_b944_4118
+    v3004 = fcvt_from_uint.f32 v3003  ; v3003 = -5557755341736380211
+    v1573 = fcvt_from_uint.f64 v1565  ; v1565 = -8336632367364994270
+    v1124 = fcvt_from_sint.f32 v1123  ; v1123 = 60
+    v1130 = iconcat v1128, v1129  ; v1128 = -4465584269192554660, v1129 = 0x49cc_df60_28d7_443c
+    v1134 = iconcat v1132, v1133  ; v1132 = 0x2a9d_cff2_19c1_4ca3, v1133 = -6059118504639291756
+    v1142 = iconcat v1140, v1141  ; v1140 = 0x5e86_562b_a085_5f3c, v1141 = 0x74fc_7a6f_c864_d151
+    v667 = iconcat v665, v666  ; v665 = -477180722809202585, v666 = -4789719269570172715
+    v671 = iconst.i32 -110
+    v672 = fcvt_from_sint.f32 v671  ; v671 = -110
+    v675 = iconst.i32 0x696d
+    v676 = fcvt_from_uint.f32 v675  ; v675 = 0x696d
+    v679 = iconst.i32 124
+    v680 = fcvt_from_uint.f32 v679  ; v679 = 124
+    v683 = fcvt_from_uint.f32 v682  ; v682 = 2
+    v688 = fcvt_from_uint.f32 v687  ; v687 = 6
+    v693 = fcvt_from_uint.f32 v692  ; v692 = 3
+    v696 = iconcat v694, v695  ; v694 = 0x652e_1762_a5a0_9ca3, v695 = -7041934467126151977
+    v701 = fcvt_from_sint.f32 v700  ; v700 = 0x6311_93bc_fcf3_b3ff
+    v2797 = iconcat v2795, v2796  ; v2795 = 0x552a_cd6e_c8aa_3d8c, v2796 = 0x140e_b6f3_ad43_ba07
+    v2436 = fcvt_from_uint.f32 v2435  ; v2435 = -1066380098
+    v2451 = sextend.i128 v2450  ; v2450 = -9223372036854775808
+    v1244 = iconst.i32 63
+    v1245 = fcvt_from_uint.f64 v1244  ; v1244 = 63
+    v1254 = fcvt_from_uint.f64 v1253  ; v1253 = 0x5cf0_4f49_2f71_3d3b
+    v1260 = fcvt_from_sint.f64 v1259  ; v1259 = -9018018456040995859
+    v1262 = iconst.i32 0xc2c8
+    v1263 = fcvt_from_uint.f64 v1262  ; v1262 = 0xc2c8
+    v3007 = iconst.i32 155
+    v3008 = fcvt_from_uint.f32 v3007  ; v3007 = 155
+    v3011 = fcvt_from_uint.f32 v3010  ; v3010 = 0x12d6_38e5_47c2_9734
+    v3016 = fcvt_from_uint.f32 v3015  ; v3015 = 2
+    v3020 = iconst.i32 0xcc20
+    v3021 = fcvt_from_uint.f32 v3020  ; v3020 = 0xcc20
+    v4726 = stack_addr.i64 ss27
+    v4727 = load.f32 notrap v4726
+    jump block2(v22, v499, v4154, v521, v4727)  ; v499 = 384, v4154 = 0
+
+block2(v523: i64, v549: i16, v4146: i64, v4698: i64, v4746: f32):
+    store notrap v4698, v523
+    v525 = load.i64 notrap v22
+    store notrap v525, v523
+    v526 = load.i64 notrap v22
+    v528 = fcvt_from_uint.f32 v527  ; v527 = 0x0806_8f78_4495_34ea
+    store notrap v528, v526
+    v529 = load.i64 notrap v22
+    store notrap v529, v523
+    v530 = load.i64 notrap v22
+    store notrap v530, v523
+    v531 = load.i64 notrap v22
+    store notrap v531, v22
+    v535 = fcvt_from_sint.f32 v534  ; v534 = 0x3661_2c64
+    store notrap v535, v531
+    v536 = load.i64 notrap v22
+    store notrap v536, v523
+    v537 = load.i64 notrap v22
+    v539 = fcvt_from_uint.f32 v538  ; v538 = 0x5b9d_f368
+    store notrap v539, v537
+    v540 = load.i64 notrap v22
+    store notrap v540, v523
+    v541 = load.i64 notrap v22
+    store notrap v541, v523
+    v542 = load.i64 notrap v22
+    v545 = iconcat.i64 v543, v544  ; v543 = 0x595f_bc0b_4018_a7cb, v544 = -3177502566850844990
+    v546 = call fn1(v545)
+    store notrap v546, v542
+    v547 = load.i64 notrap v22
+    store notrap v547, v523
+    v548 = load.i64 notrap v22
+    v550 = sextend.i32 v549
+    v551 = fcvt_from_sint.f32 v550
+    store notrap v551, v548
+    v552 = load.i64 notrap v22
+    store notrap v552, v523
+    v553 = load.i64 notrap v22
+    store notrap v553, v523
+    v554 = load.i64 notrap v22
+    v555 = sextend.i32 v549
+    v556 = fcvt_from_sint.f32 v555
+    store notrap v556, v554
+    v557 = load.i64 notrap v22
+    v560 = iconcat.i64 v558, v559  ; v558 = 0x12f4_7f09_de99_6064, v559 = 0x41c8_2564_5faf_fe52
+    v561 = call fn1(v560)
+    store notrap v561, v557
+    v562 = load.i64 notrap v22
+    v563 = sextend.i32 v549
+    v564 = fcvt_from_sint.f32 v563
+    store notrap v564, v562
+    v565 = load.i64 notrap v22
+    v568 = iconcat.i64 v566, v567  ; v566 = -2584084526369008014, v567 = 0x7280_7596_cec2_abf8
+    v569 = call fn1(v568)
+    store notrap v569, v565
+    v570 = load.i64 notrap v22
+    v572 = fcvt_from_uint.f32 v571  ; v571 = 0x6d71_5738_23e1_12d1
+    store notrap v572, v570
+    v573 = load.i64 notrap v22
+    store notrap v573, v523
+    v574 = load.i64 notrap v22
+    v576 = fcvt_from_sint.f32 v575  ; v575 = -9223372036854775808
+    store notrap v576, v574
+    v578 = fcvt_from_sint.f32 v577  ; v577 = 0x7f5f_b7c4
+    store notrap v578, v21
+    v579 = load.i64 notrap v22
+    store notrap v579, v523
+    v580 = load.i64 notrap v22
+    store notrap v580, v523
+    v581 = load.i64 notrap v22
+    store notrap v581, v523
+    v582 = load.i64 notrap v22
+    store notrap v582, v523
+    v583 = load.i64 notrap v22
+    v585 = fcvt_from_uint.f32 v584  ; v584 = -2452551009006681612
+    store notrap v585, v583
+    v586 = load.i64 notrap v22
+    v588 = iconst.i32 40
+    v589 = fcvt_from_uint.f32 v588  ; v588 = 40
+    store notrap v589, v586
+    v590 = load.i64 notrap v22
+    v592 = fcvt_from_uint.f32 v591  ; v591 = 0x73e8_7081
+    store notrap v592, v590
+    v593 = load.i64 notrap v22
+    v595 = fcvt_from_uint.f32 v594  ; v594 = -843415883
+    store notrap v595, v593
+    v596 = load.i64 notrap v22
+    v598 = fcvt_from_sint.f32 v597  ; v597 = 0x7cf8_007c_3964_cde7
+    store notrap v598, v596
+    v601 = iconcat.i64 v599, v600  ; v599 = -8296417542235928254, v600 = -1383884486908807654
+    v602 = load.i64 notrap v22
+    v604 = fcvt_from_sint.f32 v603  ; v603 = 0x6fab_6ada
+    store notrap v604, v602
+    v605 = load.i64 notrap v22
+    v607 = fcvt_from_sint.f32 v606  ; v606 = 0x7fff_ffff_ffff_ffff
+    store notrap v607, v605
+    v608 = load.i64 notrap v22
+    v611 = iconcat.i64 v609, v610  ; v609 = -7705092265312726629, v610 = 0x3e78_6954_4f0b_076f
+    v612 = call fn0(v611)
+    store notrap v612, v608
+    v613 = load.i64 notrap v22
+    v615 = iconst.i32 0x783e
+    v616 = fcvt_from_uint.f32 v615  ; v615 = 0x783e
+    store notrap v616, v613
+    v617 = load.i64 notrap v22
+    store notrap v617, v523
+    v618 = load.i64 notrap v22
+    v620 = fcvt_from_sint.f32 v619  ; v619 = -8147915341656014653
+    store notrap v620, v618
+    v621 = load.i64 notrap v22
+    v623 = fcvt_from_uint.f32 v622  ; v622 = 0x2eec_df9e
+    store notrap v623, v621
+    v624 = load.i64 notrap v22
+    v625 = call fn1(v601)
+    store notrap v625, v624
+    v1684 = fadd.f64 v1573, v1573
+    v1694 = fneg v1684
+    v1114 = fcvt_from_uint.f32 v1113  ; v1113 = -7452106143569889224
+    v632 = fcvt_from_uint.f32 v631  ; v631 = 0x61e5_d106
+    v635 = iconst.i32 0xd5ad
+    v636 = fcvt_from_uint.f32 v635  ; v635 = 0xd5ad
+    v641 = iconst.i32 1196
+    v642 = fcvt_from_uint.f32 v641  ; v641 = 1196
+    v649 = iconcat.i64 v647, v648  ; v647 = 0x5e71_4855_8bb6_15cf, v648 = 0x6aba_8910_2bb3_3ff1
+    v653 = fcvt_from_uint.f32 v652  ; v652 = 5
+    v656 = iconst.i32 0xcb5f
+    v657 = fcvt_from_uint.f32 v656  ; v656 = 0xcb5f
+    v660 = fcvt_from_uint.f32 v659  ; v659 = 5
+    v1820 = fneg v1694
+    v1823 = bswap.i64 v1822  ; v1822 = 2
+    v1834 = iconst.i64 -2
+    v1860 = iconst.i64 2
+    v1885 = iconst.i8 0
+    v1907 = iadd.i64 v12, v1906  ; v1906 = 16
+    v2122 = iadd.i64 v12, v2121  ; v2121 = 8
+    v2125 = iconst.i64 0x0007_7f62
+    v2159 = iconst.i16 782
+    v2455 = iconst.i32 108
+    v2456 = fcvt_from_sint.f32 v2455  ; v2455 = 108
+    v2463 = iadd.i64 v15, v2462  ; v2462 = 1
+    v2466 = iadd.i64 v15, v2465  ; v2465 = 2
+    v2472 = iconcat.i64 v2470, v2471  ; v2470 = -383605314167426216, v2471 = 0x4690_8f6a_b3bb_66d2
+    v2477 = fcvt_from_sint.f32 v2476  ; v2476 = 0x1e37_fd70_b944_4118
+    v2490 = fcvt_from_uint.f32 v2489  ; v2489 = -5557755341736380211
+    v1208 = iconst.i32 -7698
+    v1209 = fcvt_from_sint.f64 v1208  ; v1208 = -7698
+    v1215 = iconcat.i64 v1213, v1214  ; v1213 = 0x34c8_6021_7205_749c, v1214 = -7889294670562934542
+    v1221 = fcvt_from_sint.f64 v1220  ; v1220 = 0x7fff_ffff_ffff_ffff
+    v1226 = iconst.i32 8
+    v1227 = fcvt_from_sint.f64 v1226  ; v1226 = 8
+    v3027 = fcvt_from_uint.f32 v3026  ; v3026 = -1066380098
+    v3042 = sextend.i128 v3041  ; v3041 = -9223372036854775808
+    v1393 = iconst.i32 -84
+    v1394 = fcvt_from_sint.f64 v1393  ; v1393 = -84
+    v1399 = fneg v1394
+    v1402 = fmul v1399, v1399
+    v1405 = fcvt_from_uint.f32 v1404  ; v1404 = 0x7c1c_d9f9_aa1e_055b
+    v1415 = fsub v1399, v1399
+    v970 = iconst.i32 15
+    v971 = fcvt_from_sint.f32 v970  ; v970 = 15
+    v977 = iadd.i64 v12, v976  ; v976 = 20
+    v1000 = iadd.i64 v15, v999  ; v999 = 1
+    v1003 = iadd.i64 v15, v1002  ; v1002 = 2
+    v1037 = iconst.i32 24
+    v1038 = fcvt_from_sint.f32 v1037  ; v1037 = 24
+    v1720 = fcvt_from_sint.f32 v1314  ; v1314 = 1
+    v1736 = iconst.i64 0x0028_0000
+    v1774 = iconst.i16 0
+    v1184 = iconst.i32 99
+    v1185 = fcvt_from_sint.f64 v1184  ; v1184 = 99
+    v826 = fcvt_from_sint.f32 v825  ; v825 = 0x626e_5ca8_56bc_0d69
+    v831 = iconcat.i64 v829, v830  ; v829 = -4017781672461578577, v830 = 0x74c6_4cc2_6f8a_95ca
+    v834 = iconst.i32 0xfdca
+    v835 = fcvt_from_uint.f32 v834  ; v834 = 0xfdca
+    v846 = iadd.i64 v15, v845  ; v845 = 1
+    v849 = iadd.i64 v15, v848  ; v848 = 2
+    v856 = iconcat.i64 v854, v855  ; v854 = 0x2d09_0041_080a_2151, v855 = -8898972108410530768
+    v2657 = fcvt_from_uint.f32 v2656  ; v2656 = -7452106143569889224
+    v2892 = fcvt_from_sint.f32 v2891  ; v2891 = -99
+    v2894 = iconst.i32 0x7cae
+    v2910 = fcvt_from_sint.f32 v2909  ; v2909 = -6451915945820699960
+    v2913 = fcvt_from_sint.f32 v2912  ; v2912 = -9223372036854775808
+    v2923 = fcvt_from_sint.f32 v2922  ; v2922 = -9223372036854775808
+    v2927 = iconst.i64 0xc8b2
+    jump block3(v523, v4146, v4746)
+
+block3(v626: i64, v4145: i64, v4730: f32):
+    v627 = load.i64 notrap v22
+    store notrap v627, v626
+    v628 = load.i64 notrap v22
+    store notrap v628, v626
+    v629 = load.i64 notrap v22
+    store notrap v629, v626
+    v630 = load.i64 notrap v22
+    store.f32 notrap v632, v630
+    v633 = load.i64 notrap v22
+    store.f32 notrap v636, v633
+    v637 = load.i64 notrap v22
+    store notrap v637, v626
+    v638 = load.i64 notrap v22
+    store notrap v638, v22
+    store.f32 notrap v642, v638
+    v643 = load.i64 notrap v22
+    store notrap v643, v626
+    v644 = load.i64 notrap v22
+    store notrap v644, v626
+    v646 = load.i64 notrap v22
+    v650 = call fn0(v649)
+    store notrap v650, v646
+    v651 = load.i64 notrap v22
+    store.f32 notrap v653, v651
+    v654 = load.i64 notrap v22
+    store.f32 notrap v657, v654
+    v658 = load.i64 notrap v22
+    store.f32 notrap v660, v658
+    v1478 = fneg.f64 v1399
+    v1489 = iconst.i64 0
+    v1491 = fcvt_from_uint.f64 v1489  ; v1489 = 0
+    v1500 = iconst.i32 0x607b_17b0
+    v1096 = iconst.i32 1
+    v1099 = fcvt_from_uint.f32 v1098  ; v1098 = -9154788606126868873
+    v2001 = iadd.i64 v12, v2000  ; v2000 = 16
+    v2822 = fcvt_from_sint.f32 v2821  ; v2821 = 60
+    v2832 = iconcat.i64 v2830, v2831  ; v2830 = 0x2a9d_cff2_19c1_4ca3, v2831 = -6059118504639291756
+    v769 = iadd.i64 v15, v768  ; v768 = 1
+    v772 = iadd.i64 v15, v771  ; v771 = 2
+    v779 = iconst.i32 0x2f50
+    v780 = fcvt_from_uint.f32 v779  ; v779 = 0x2f50
+    v784 = iconcat.i64 v782, v783  ; v782 = 0x22f7_3963_5f2e_7048, v783 = 0x0f17_5c98_99c5_0464
+    v788 = iconst.i32 108
+    v789 = fcvt_from_sint.f32 v788  ; v788 = 108
+    v796 = iadd.i64 v15, v795  ; v795 = 1
+    v799 = iadd.i64 v15, v798  ; v798 = 2
+    v805 = iconcat.i64 v803, v804  ; v803 = -383605314167426216, v804 = 0x4690_8f6a_b3bb_66d2
+    v810 = fcvt_from_sint.f32 v809  ; v809 = 0x1e37_fd70_b944_4118
+    v823 = fcvt_from_uint.f32 v822  ; v822 = -5557755341736380211
+    v2229 = iadd.i64 v12, v2228  ; v2228 = 16
+    v2667 = fcvt_from_sint.f32 v2666  ; v2666 = 60
+    v2677 = iconcat.i64 v2675, v2676  ; v2675 = 0x2a9d_cff2_19c1_4ca3, v2676 = -6059118504639291756
+    v2352 = iconcat.i64 v2350, v2351  ; v2350 = -477180722809202585, v2351 = -4789719269570172715
+    v2356 = iconst.i32 -110
+    v2357 = fcvt_from_sint.f32 v2356  ; v2356 = -110
+    v2360 = iconst.i32 0x696d
+    v2361 = fcvt_from_uint.f32 v2360  ; v2360 = 0x696d
+    v2364 = iconst.i32 124
+    v2365 = fcvt_from_uint.f32 v2364  ; v2364 = 124
+    v2368 = fcvt_from_uint.f32 v2367  ; v2367 = 2
+    v2373 = fcvt_from_uint.f32 v2372  ; v2372 = 6
+    v2378 = fcvt_from_uint.f32 v2377  ; v2377 = 3
+    v2381 = iconcat.i64 v2379, v2380  ; v2379 = 0x652e_1762_a5a0_9ca3, v2380 = -7041934467126151977
+    v2386 = fcvt_from_sint.f32 v2385  ; v2385 = 0x6311_93bc_fcf3_b3ff
+    v1375 = fcvt_from_sint.f32 v1374  ; v1374 = 0x0f73_b017_0a27_85c9
+    v2930 = fcvt_from_sint.f32 v2929  ; v2929 = 0x626e_5ca8_56bc_0d69
+    v2938 = iconst.i32 0xfdca
+    v2939 = fcvt_from_uint.f32 v2938  ; v2938 = 0xfdca
+    v1070 = iconcat.i64 v1068, v1069  ; v1068 = 0x552a_cd6e_c8aa_3d8c, v1069 = 0x140e_b6f3_ad43_ba07
+    v1505 = fcvt_from_uint.f64 v1489  ; v1489 = 0
+    v1512 = fcvt_from_sint.f64 v1500  ; v1500 = 0x607b_17b0
+    jump block4(v626, v4145, v4730)
+
+block4(v684: i64, v4144: i64, v4739: f32):
+    v664 = load.i64 notrap v22
+    v668 = call fn0(v667)
+    store notrap v668, v664
+    v669 = load.i64 notrap v22
+    store.f32 notrap v672, v669
+    v673 = load.i64 notrap v22
+    store.f32 notrap v676, v673
+    v677 = load.i64 notrap v22
+    store.f32 notrap v680, v677
+    v681 = load.i64 notrap v22
+    store.f32 notrap v683, v681
+    v685 = load.i64 notrap v22
+    store notrap v685, v684
+    v686 = load.i64 notrap v22
+    store notrap v686, v684
+    store.f32 notrap v688, v686
+    store notrap v686, v684
+    v691 = load.i64 notrap v22
+    store.f32 notrap v693, v691
+    v697 = call fn0(v696)
+    store notrap v697, v686
+    store notrap v686, v684
+    store.f32 notrap v701, v686
+    store notrap v686, v684
+    store notrap v686, v684
+    store notrap v686, v684
+    jump block5(v686, v684, v699, v4144, v4739)  ; v699 = -1
+
+block5(v709: i64, v717: i64, v734: i16, v4143: i64, v4749: f32):
+    store.f32 notrap v711, v709
+    store.i32 notrap v713, v17  ; v713 = 0x7cae
+    store.i64 notrap v17, v20
+    store.i32 notrap v716, v17  ; v716 = 0x3b3b_ac23
+    store notrap v709, v717
+    v718 = load.i64 notrap v20
+    store.i32 notrap v720, v718  ; v720 = 0x02a5_a382
+    v721 = load.i64 notrap v20
+    store.i32 notrap v723, v721  ; v723 = 0x6f3d_92de
+    v724 = load.i64 notrap v20
+    store.i32 notrap v726, v724  ; v726 = -1545206288
+    v727 = load.i64 notrap v22
+    store.f32 notrap v729, v727
+    v730 = load.i64 notrap v22
+    store.f32 notrap v732, v730
+    v733 = load.i64 notrap v22
+    v735 = sextend.i32 v734
+    v736 = fcvt_from_sint.f32 v735
+    store notrap v736, v733
+    v738 = load.i64 notrap v22
+    v739 = sextend.i32 v734
+    v740 = fcvt_from_sint.f32 v739
+    store notrap v740, v738
+    store.f32 notrap v742, v709
+    store.i64 notrap v746, v19  ; v746 = 0xc8b2
+    jump block6(v717, v709, v737, v744, v4143, v4749)  ; v737 = -3690511948449329794, v744 = 0
+
+block6(v747: i64, v748: i64, v766: i64, v3464: i8, v4142: i64, v4733: f32):
+    store.f32 notrap v750, v748
+    store notrap v748, v22
+    v4657 = load.i32 notrap v19
+    v4673 = band v4657, v4672  ; v4672 = 7
+    v754 = ireduce.i8 v4673
+    v756 = ushr.i8 v755, v754  ; v755 = -66
+    store notrap v748, v747
+    v758 = uextend.i32 v756
+    v759 = fcvt_from_uint.f32 v758
+    store notrap v759, v748
+    store.i64 notrap v17, v20
+    store.i64 notrap v18, v20
+    store notrap v748, v747
+    v760 = load.i32 notrap v17
+    v762 = bxor v760, v761  ; v761 = -1
+    store notrap v762, v18
+    v763 = load.i64 notrap v22
+    store notrap v763, v747
+    store notrap v766, v16
+    jump block7(v765, v748, v747, v20, v3464, v756, v747, v4142, v4733)
+
+block7(v775: i128, v790: i64, v807: i64, v808: i64, v813: i8, v3470: i8, v3480: i64, v4141: i64, v4742: f32):
+    store.i8 notrap v767, v15  ; v767 = 68
+    store.i8 notrap v770, v769  ; v770 = -24
+    store.i8 notrap v773, v772  ; v773 = -4
+    v774 = load.i64 notrap v22
+    v776 = call fn1(v775)
+    store notrap v776, v774
+    v777 = load.i64 notrap v22
+    store.f32 notrap v780, v777
+    v781 = load.i64 notrap v22
+    v785 = call fn0(v784)
+    store notrap v785, v781
+    v786 = load.i64 notrap v22
+    store.f32 notrap v789, v786
+    v791 = load.f64 notrap v16
+    v792 = fdemote.f32 v791
+    store notrap v792, v790
+    store.i8 notrap v794, v15  ; v794 = 15
+    store.i8 notrap v797, v796  ; v797 = -12
+    store.i8 notrap v800, v799  ; v800 = 27
+    v801 = load.i32 notrap v18
+    v802 = fcvt_from_sint.f32 v801
+    store notrap v802, v790
+    v806 = call fn0(v805)
+    store notrap v806, v790
+    store notrap v790, v807
+    store.i64 notrap v18, v808
+    store.f32 notrap v810, v790
+    v811 = load.f64 notrap v16
+    v812 = fdemote.f32 v811
+    store notrap v812, v790
+    store.i64 notrap v18, v808
+    store.i64 notrap v18, v808
+    store notrap v790, v807
+    v819 = load.i64 notrap v22
+    store notrap v819, v807
+    store.i64 notrap v17, v808
+    v820 = load.i64 notrap v22
+    store notrap v820, v807
+    v821 = load.i64 notrap v22
+    store notrap v821, v807
+    store.f32 notrap v823, v790
+    store notrap v790, v807
+    v4755 = stack_addr.i64 ss11
+    v4756 = load.f64 notrap v4755
+    jump block8(v790, v3470, v808, v807, v3480, v813, v4141, v4742, v4756)
+
+block8(v832: i64, v840: i8, v841: i64, v842: i64, v3479: i64, v3498: i8, v4140: i64, v4751: f32, v4771: f64):
+    v4802 = uextend.i16 v3498
+    v4804 = iconst.i16 1
+    v4805 = band v4802, v4804  ; v4804 = 1
+    v824 = load.i64 notrap v22
+    store.f32 notrap v826, v824
+    store.i64 notrap v828, v19  ; v828 = -6753952338686199543
+    store.f32 notrap v835, v832
+    store.i64 notrap v18, v841
+    store notrap v832, v842
+    store.i64 notrap v17, v841
+    store.i8 notrap v844, v15  ; v844 = -43
+    store.i8 notrap v847, v846  ; v847 = -112
+    store.i8 notrap v850, v849  ; v850 = 96
+    jump block12(v842, v832, v15, v841, v3479, v4805, v3498, v840, v4140, v4751, v4771)
+
+block12(v866: i64, v867: i64, v872: i64, v880: i64, v892: i64, v3458: i16, v3497: i8, v3504: i8, v4139: i64, v4737: f32, v4762: f64):
+    v863 = load.i32 notrap v18
+    v865 = bxor v863, v864  ; v864 = -1
+    store notrap v865, v17
+    store notrap v867, v866
+    store.f32 notrap v870, v867
+    v871 = load.i32 notrap v17
+    store notrap v871, v18
+    store.i8 notrap v873, v872  ; v873 = 37
+    v875 = iadd v872, v874  ; v874 = 1
+    store.i8 notrap v876, v875  ; v876 = 74
+    v878 = iadd v872, v877  ; v877 = 2
+    store.i8 notrap v879, v878  ; v879 = -52
+    store.i64 notrap v18, v880
+    store notrap v867, v866
+    v881 = load.i64 notrap v22
+    v882 = load.i64 notrap v19
+    v883 = fcvt_from_uint.f32 v882
+    store notrap v883, v881
+    v884 = load.i64 notrap v22
+    store.f32 notrap v887, v884
+    v890 = load.f32 notrap v867
+    v891 = fneg v890
+    store.i64 notrap v18, v880
+    store notrap v891, v867
+    store.i8 notrap v893, v872  ; v893 = -36
+    v895 = iadd v872, v894  ; v894 = 1
+    store.i8 notrap v896, v895  ; v896 = -22
+    v898 = iadd v872, v897  ; v897 = 2
+    store.i8 notrap v899, v898  ; v899 = -37
+    store notrap v867, v22
+    store notrap v891, v867
+    v904 = fdemote.f32 v4762
+    store notrap v904, v867
+    v906, v907 = isplit.i128 v831
+    v909 = icmp eq v907, v908  ; v908 = 0x74c6_4cc2_6f8a_95ca
+    brif v909, block111, block169
+
+block169:
+    v4774 = stack_addr.i64 ss11
+    store.f64 notrap v4762, v4774
+    jump block159
+
+block159:
+    brif.i64 v907, block5(v867, v892, v3458, v4139, v4737), block110
+
+block110:
+    brif.i64 v906, block5(v867, v892, v3458, v4139, v4737), block4(v892, v4139, v4737)
+
+block111:
+    v911 = icmp.i64 eq v906, v910  ; v910 = -4017781672461578577
+    brif v911, block13(v880, v867, v891, v3458, v856, v22, v892, v3497, v3504, v892, v836, v872, v843, v4139, v4737, v4762), block170  ; v836 = 0x7e4f_c926_e36d_f3c1, v843 = -102
+
+block170:
+    v4775 = stack_addr.i64 ss11
+    store.f64 notrap v4762, v4775
+    jump block5(v867, v892, v3458, v4139, v4737)
+
+block13(v912: i64, v913: i64, v914: f32, v916: i16, v3487: i128, v3492: i64, v3494: i64, v3496: i8, v3503: i8, v3507: i64, v3510: i64, v3517: i64, v3520: i64, v4138: i64, v4748: f32, v4768: f64):
+    store.i64 notrap v18, v912
+    v915 = fsub v914, v914
+    store notrap v915, v913
+    jump block14(v913, v914, v3487, v912, v3492, v3494, v916, v3496, v3503, v3507, v3510, v3517, v3520, v4138, v4748, v4768)
+
+block14(v917: i64, v918: f32, v921: i128, v922: i64, v932: i64, v3455: i64, v3459: i16, v3466: i8, v3471: i8, v3481: i64, v3509: i64, v3516: i64, v3519: i64, v4137: i64, v4731: f32, v4758: f64):
+    v919 = fsub v918, v918
+    store notrap v919, v917
+    v920 = fneg v918
+    store notrap v920, v917
+    store.i64 notrap v17, v922
+    store.i64 notrap v17, v922
+    store.i64 notrap v17, v922
+    v923 = fsub v918, v918
+    store notrap v923, v917
+    store.i64 notrap v924, v19  ; v924 = -6942259781219233790
+    v925 = fneg v918
+    store notrap v925, v917
+    store.i64 notrap v18, v922
+    store notrap v917, v932
+    store.i64 notrap v17, v922
+    v933 = load.i64 notrap v22
+    v934 = fsub v918, v918
+    store notrap v934, v933
+    store.i64 notrap v18, v922
+    v937 = load.i64 notrap v22
+    store notrap v918, v937
+    v938 = load.i64 notrap v22
+    store notrap v938, v932
+    v939 = load.i64 notrap v22
+    store notrap v939, v932
+    v940 = load.i64 notrap v22
+    v941 = fsub v918, v918
+    store notrap v941, v940
+    store.i64 notrap v17, v922
+    store notrap v917, v932
+    v942 = load.i64 notrap v19
+    v944 = icmp eq v942, v943  ; v943 = -6942259781219233790
+    brif v944, block18, block113
+
+block113:
+    v946 = icmp.i64 uge v942, v4593  ; v4593 = 0x0001_0000_0000
+    brif v946, block171, block114
+
+block171:
+    v4776 = stack_addr.i64 ss11
+    store.f64 notrap v4758, v4776
+    jump block15(v3509, v3466, v4137, v4731)
+
+block114:
+    v947 = ireduce.i32 v942
+    br_table v947, block172, [block173, block174, block13(v922, v917, v918, v3459, v921, v932, v3455, v3466, v3471, v3481, v3509, v3516, v3519, v4137, v4731, v4758), block175, block176, block17]
+
+block176:
+    v4781 = stack_addr.i64 ss11
+    store.f64 notrap v4758, v4781
+    jump block16
+
+block175:
+    v4780 = stack_addr.i64 ss11
+    store.f64 notrap v4758, v4780
+    jump block7(v921, v917, v3455, v922, v3466, v3471, v3481, v4137, v4731)
+
+block174:
+    v4779 = stack_addr.i64 ss11
+    store.f64 notrap v4758, v4779
+    jump block3(v3455, v4137, v4731)
+
+block173:
+    v4778 = stack_addr.i64 ss11
+    store.f64 notrap v4758, v4778
+    jump block5(v917, v3455, v3459, v4137, v4731)
+
+block172:
+    v4777 = stack_addr.i64 ss11
+    store.f64 notrap v4758, v4777
+    jump block15(v3509, v3466, v4137, v4731)
+
+block18:
+    v951 = sextend.i32 v3459
+    v952 = fcvt_from_sint.f32 v951
+    store notrap v952, v13
+    store.i8 notrap v954, v3516  ; v954 = -89
+    v956 = iadd.i64 v3516, v955  ; v955 = 1
+    store.i8 notrap v957, v956  ; v957 = 9
+    v959 = iadd.i64 v3516, v958  ; v958 = 2
+    store.i8 notrap v960, v959  ; v960 = 122
+    v961 = sextend.i32 v3459
+    v962 = fcvt_from_sint.f64 v961
+    v965 = icmp.i64 eq v3519, v964  ; v964 = 0
+    brif v965, block177, block115
+
+block177:
+    v4782 = stack_addr.i64 ss11
+    store.f64 notrap v962, v4782
+    jump block20(v4137, v4731)
+
+block115:
+    v967 = icmp.i64 eq v3519, v966  ; v966 = -102
+    brif v967, block21(v3466, v932, v3516, v3519, v922, v3509, v3459, v4137, v4731), block19(v3516, v922, v3481, v3466, v4137, v4731, v962)
+
+block21(v978: i8, v983: i64, v984: i64, v3888: i64, v3949: i64, v4093: i64, v4114: i16, v4136: i64, v4744: f32):
+    v4800 = sextend.i32 v3459
+    v4801 = fcvt_from_sint.f64 v4800
+    store.f32 notrap v971, v917
+    store.i64 notrap v17, v922
+    v972 = load.f32 notrap v13
+    store notrap v972, v917
+    store.i64 notrap v973, v12  ; v973 = 0x6a55_da45_6e7c_49a3
+    v980 = band v978, v979  ; v979 = 1
+    v982 = bxor v980, v981  ; v981 = 1
+    store notrap v982, v977
+    store.i8 notrap v985, v984  ; v985 = -15
+    v987 = iadd v984, v986  ; v986 = 1
+    store.i8 notrap v988, v987  ; v988 = 49
+    v990 = iadd v984, v989  ; v989 = 2
+    store.i8 notrap v991, v990  ; v991 = 125
+    store.i64 notrap v13, v983
+    v992 = load.i64 notrap v22
+    v993 = load.f32 notrap v917
+    store notrap v993, v992
+    store.i64 notrap v13, v983
+    v995 = load.i32 notrap v17
+    v997 = band v995, v995
+    store notrap v997, v18
+    store.i64 notrap v17, v922
+    store.i8 notrap v998, v15  ; v998 = 121
+    store.i8 notrap v1001, v1000  ; v1001 = 56
+    store.i8 notrap v1004, v1003  ; v1004 = 84
+    v1005 = load.i64 notrap v22
+    store notrap v1005, v983
+    store.i64 notrap v917, v22
+    store.i64 notrap v17, v922
+    store.i64 notrap v917, v983
+    store.i64 notrap v917, v10
+    store.i64 notrap v917, v11
+    v1011 = load.i64 notrap v22
+    v1014 = stack_addr.i64 ss20
+    v1016 = stack_addr.i64 ss22
+    v1025 = stack_addr.i64 ss25
+    v1026 = stack_addr.i64 ss26
+    v1029 = stack_addr.i64 ss29
+    v1030 = stack_addr.i64 ss30
+    v1031 = stack_addr.i64 ss31
+    v1033 = stack_addr.i64 ss33
+    store.f32 notrap v1038, v1030
+    store.f32 notrap v1038, v1031
+    v2700 = iadd v1026, v2699  ; v2699 = 8
+    v1157 = iadd v1026, v1156  ; v1156 = 8
+    v1233 = iadd v1026, v1232  ; v1232 = 8
+    v1242 = iadd v1026, v1241  ; v1241 = 8
+    jump block63(v1011, v19, v4744)
+
+block63(v1047: i64, v1080: i64, v4753: f32):
+    v1044 = load.f32 notrap v1030
+    v1063 = fneg v1044
+    store notrap v1063, v1031
+    store.i64 notrap v1031, v1033
+    v1071 = call fn1(v1070)
+    store notrap v1071, v1031
+    v1072 = load.i64 notrap v1033
+    store notrap v1072, v1033
+    v1074 = load.f32 notrap v1030
+    v1076 = fsub v1074, v1074
+    store notrap v1076, v1072
+    v1077 = load.i64 notrap v1033
+    v1079 = load.f32 notrap v1077
+    v1081 = call fn4(v1077, v1079, v1031, v1080)
+    jump block64(v1081, v4753)
+
+block64(v3651: i64, v4736: f32):
+    store.i64 notrap v1030, v1033
+    v1083 = load.i64 notrap v1033
+    v1084 = load.f32 notrap v1031
+    v1085 = fneg v1084
+    store notrap v1085, v1083
+    v1086 = load.i64 notrap v1033
+    v1091 = load.f32 notrap v1031
+    v1093 = fsub v1091, v1091
+    store notrap v1093, v1086
+    v1097 = load.i64 notrap v1033
+    store.f32 notrap v1099, v1097
+    jump block65(v3651, v4736)
+
+block65(v3650: i64, v4745: f32):
+    v1100 = load.i64 notrap v1033
+    v1101 = load.f32 notrap v1031
+    v1103 = fadd v1101, v1101
+    store notrap v1103, v1100
+    jump block66(v3650, v4745)
+
+block66(v1104: i64, v4729: f32):
+    v1106 = load.i64 notrap v1033
+    v1107 = load.f32 notrap v1031
+    store notrap v1107, v1106
+    v1108 = load.i64 notrap v1033
+    v1109 = load.f32 notrap v1031
+    v1111 = fsub v1109, v1109
+    store notrap v1111, v1108
+    v1112 = load.i64 notrap v1033
+    store.f32 notrap v1114, v1112
+    jump block67(v1104, v4729)
+
+block67(v1116: i64, v4738: f32):
+    v1117 = load.i64 notrap v1033
+    store.f32 notrap v1124, v1117
+    v1125 = load.i64 notrap v1033
+    v1126 = load.f32 notrap v1031
+    v1127 = fneg v1126
+    store notrap v1127, v1125
+    v1131 = load.i64 notrap v1033
+    v1135 = call fn1(v1134)
+    store notrap v1135, v1131
+    v1136 = load.i64 notrap v1033
+    store notrap v1136, v1033
+    v1145 = load.f32 notrap v1031
+    store notrap v1145, v1136
+    jump block68(v4738)
+
+block68(v4747: f32):
+    v1158 = load.i64 notrap v1033
+    v1159 = load.f32 notrap v1158
+    v1162 = fmul v1159, v1159
+    store.f32 notrap v1166, v1158
+    v1168 = call fn5(v1142)
+    store notrap v1168, v1025
+    v1173, v1174 = isplit.i128 v1130
+    v1176 = icmp eq v1174, v1175  ; v1175 = 0x49cc_df60_28d7_443c
+    brif v1176, block117, block118
+
+block118:
+    brif.i64 v1174, block69, block116
+
+block116:
+    v1178 = icmp.i64 uge v1173, v4594  ; v4594 = 0x0001_0000_0000
+    brif v1178, block69, block119
+
+block119:
+    v1179 = ireduce.i32 v1173
+    br_table v1179, block69, [block63(v1031, v1116, v1171), block64(v1157, v1171), block65(v1157, v1171), block66(v1157, v1171), block67(v1116, v1171), block70]
+
+block117:
+    v1181 = icmp.i64 eq v1173, v1180  ; v1180 = -4465584269192554660
+    brif v1181, block189, block69
+
+block189:
+    v1187, v1188 = isplit.i128 v1130
+    v2716, v2717 = isplit.i128 v1130
+    jump block71(v1162)
+
+block71(v3708: f32):
+    store.f64 notrap v1185, v1025
+    v1190 = icmp.i64 eq v1188, v1189  ; v1189 = 0x49cc_df60_28d7_443c
+    brif v1190, block121, block122
+
+block122:
+    brif.i64 v1188, block72, block120
+
+block120:
+    v1192 = icmp.i64 uge v1187, v4595  ; v4595 = 0x0001_0000_0000
+    brif v1192, block72, block123
+
+block123:
+    v1193 = ireduce.i32 v1187
+    br_table v1193, block72, [block69, block73, block74, block75, block76, block77]
+
+block121:
+    v1195 = icmp.i64 eq v1187, v1194  ; v1194 = -4465584269192554660
+    brif v1195, block78, block72
+
+block78:
+    v1196 = load.i64 notrap v1033
+    store.f32 notrap v1171, v1196
+    v1200 = load.f32 notrap v1031
+    v1201 = load.i64 notrap v1033
+    v1202 = load.f32 notrap v1201
+    v1203 = fadd v1200, v1202
+    v1205 = load.i64 notrap v1033
+    store.f64 notrap v1209, v1025
+    v1217 = band.i128 v1142, v1142
+    v1219 = call fn6(v1203)
+    store.f64 notrap v1221, v1025
+    store.f64 notrap v1227, v1025
+    jump block79
+
+block79:
+    v1231 = fcvt_from_sint.f64 v1096  ; v1096 = 1
+    store notrap v1231, v1025
+    store.i64 notrap v1235, v1233  ; v1235 = -4
+    v1240 = fneg.f32 v1203
+    store notrap v1240, v1205
+    store.f64 notrap v1245, v1025
+    store.i64 notrap v1246, v1242  ; v1246 = 4
+    v1248 = fcvt_from_sint.f64 v1096  ; v1096 = 1
+    store notrap v1248, v1025
+    store.i64 notrap v1250, v1242  ; v1250 = -6563519144290790462
+    store.f64 notrap v1254, v1025
+    v1257 = call fn7(v1215)
+    store notrap v1257, v1025
+    v1258 = fpromote.f64 v3708
+    store notrap v1258, v1025
+    store.f64 notrap v1260, v1025
+    store.f64 notrap v1263, v1025
+    store.i64 notrap v1268, v1242  ; v1268 = 0x75b7_0a30_dc4e_4b07
+    jump block80
+
+block80:
+    v1269 = load.i64 notrap v1033
+    v1271 = load.f32 notrap v1031
+    store notrap v1271, v1269
+    store.i64 notrap v1274, v1242  ; v1274 = 3
+    v1277 = load.i64 notrap v1033
+    v1279 = load.f32 notrap v1031
+    v1281 = fadd v1279, v1203
+    store notrap v1281, v1277
+    store.i64 notrap v1283, v1242  ; v1283 = -7
+    v1287 = load.i64 notrap v1033
+    store.i64 notrap v1290, v1242  ; v1290 = -6
+    v1292 = iadd.i128 v1217, v1217
+    store.f32 notrap v3708, v1287
+    v1301 = fmul.f32 v3708, v1203
+    store notrap v1301, v1030
+    v1306 = load.i64 notrap v1242
+    v1307 = fcvt_from_uint.f64 v1306
+    store notrap v1307, v1025
+    store.f64 notrap v1309, v1025
+    v1311 = fsub.f32 v3708, v3708
+    store notrap v1311, v1030
+    store.f64 notrap v1317, v1025
+    jump block81
+
+block81:
+    store.i64 notrap v1340, v1242  ; v1340 = -2
+    v1343 = call fn5(v1217)
+    store notrap v1343, v1025
+    store.i64 notrap v1345, v1242  ; v1345 = -1315862539377158149
+    store.i64 notrap v1030, v1033
+    jump block82
+
+block82:
+    store.f32 notrap v3708, v1030
+    store.i64 notrap v1353, v1242  ; v1353 = 7
+    store.i64 notrap v1354, v1242  ; v1354 = -6525777234453459713
+    v1359 = load.f32 notrap v1031
+    v1360 = fsub.f32 v3708, v1359
+    store notrap v1360, v1030
+    store.i64 notrap v1025, v1026
+    v1362 = load.i64 notrap v1033
+    store.f32 notrap v3708, v1362
+    store.i64 notrap v1369, v1242  ; v1369 = 0
+    v1372 = load.i64 notrap v1033
+    store.f32 notrap v1375, v1372
+    v1377 = load.i64 notrap v1033
+    v1380 = fadd.f32 v3708, v3708
+    store notrap v1380, v1377
+    v1381 = load.i64 notrap v1033
+    v1382 = load.f32 notrap v1381
+    jump block84
+
+block84:
+    store.f64 notrap v1394, v1025
+    store.f64 notrap v1402, v1025
+    store.f32 notrap v1405, v1381
+    v1406 = load.i64 notrap v1033
+    store.f32 notrap v1382, v1406
+    v1409 = load.i64 notrap v1033
+    store.f32 notrap v1382, v1409
+    store.f64 notrap v1415, v1016
+    v1423 = load.i64 notrap v1033
+    v1424 = fneg.f32 v1382
+    store notrap v1424, v1423
+    v1428 = load.i64 notrap v1033
+    v1431 = fsub.f32 v1382, v1304
+    store notrap v1431, v1428
+    store.i64 notrap v1433, v1242  ; v1433 = -3645290141612146199
+    store.i64 notrap v1435, v1242  ; v1435 = 7
+    store.i64 notrap v1444, v1242  ; v1444 = -4787228447409842621
+    jump block85
+
+block85:
+    store.i64 notrap v1450, v1242  ; v1450 = 1
+    v1462 = iadd.i64 v1026, v1461  ; v1461 = 8
+    store.i64 notrap v1464, v1462  ; v1464 = 0x4e75_588b_09e4_d7be
+    store.f64 notrap v1478, v1016
+    store.i64 notrap v1489, v1242  ; v1489 = 0
+    store.f64 notrap v1491, v1016
+    jump block86
+
+block86:
+    store.f64 notrap v1505, v1016
+    store.f64 notrap v1512, v1016
+    store.f64 notrap v1573, v1016
+    v1583 = load.f32 notrap v1030
+    store notrap v1583, v1031
+    jump block88
+
+block88:
+    store.i64 notrap v1031, v1033
+    store.f64 notrap v1684, v1016
+    jump block90
+
+block90:
+    store.i64 notrap v1736, v1242  ; v1736 = 0x0028_0000
+    v1744 = fmul.f32 v1720, v1583
+    v1800 = call fn5(v1217)
+    jump block91
+
+block91:
+    store.f64 notrap v1820, v1016
+    store.i64 notrap v1823, v1242
+    v1831 = imul.i128 v1292, v1292
+    v1833 = call fn1(v1831)
+    store notrap v1833, v1031
+    v1838 = fcmp.f32 le v1744, v1744
+    store.i64 notrap v1016, v1026
+    store.f32 notrap v1744, v1030
+    v1866 = fcvt_to_uint_sat.i64 v1382
+    v4717 = ireduce.i32 v1866
+    v1872 = ireduce.i16 v4717
+    store.i64 notrap v1873, v1242  ; v1873 = -7899696129866597630
+    v1875 = iadd.i64 v1014, v1874  ; v1874 = 1
+    v1877 = iadd.i64 v1014, v1876  ; v1876 = 2
+    v1879 = iadd.i64 v1014, v1878  ; v1878 = 3
+    v1881 = iadd.i64 v1014, v1880  ; v1880 = 4
+    store.i8 notrap v1363, v1014  ; v1363 = 19
+    store.i8 notrap v1363, v1875  ; v1363 = 19
+    store.i8 notrap v1363, v1877  ; v1363 = 19
+    store.i8 notrap v1363, v1879  ; v1363 = 19
+    store.i8 notrap v1363, v1881  ; v1363 = 19
+    v1882 = load.i64 notrap v1014
+    v4722 = stack_addr.i64 ss29
+    store.i32 notrap v1105, v4722+8  ; v1105 = 0x0010_4fe0
+    store.i32 notrap v1105, v4722+4  ; v1105 = 0x0010_4fe0
+    store.i32 notrap v1105, v4722  ; v1105 = 0x0010_4fe0
+    call fn8(v1029, v1882, v1885, v1774)  ; v1885 = 0, v1774 = 0
+    v1899 = band v1838, v1898  ; v1898 = 1
+    call fn9(v1155, v1860, v1899, v1872)  ; v1155 = -1936553825, v1860 = 2
+    call fn10(v1105, v1314, v1834, v1105)  ; v1105 = 0x0010_4fe0, v1314 = 1, v1834 = -2, v1105 = 0x0010_4fe0
+    call fn11(v1293, v1105)  ; v1293 = 0, v1105 = 0x0010_4fe0
+    v1901 = load.f32 notrap v1030
+    store notrap v1901, v917
+    store.i64 notrap v917, v10
+    store.i64 notrap v917, v10
+    v1905 = load.f32 notrap v13
+    store notrap v1905, v917
+    store.i64 notrap v917, v10
+    v1908 = load.i32 notrap v18
+    v1910 = isub.i32 v1909, v1908  ; v1909 = 0
+    store notrap v1910, v1907
+    jump block23
+
+block23:
+    store.f32 notrap v918, v917
+    v1915 = icmp.i64 eq v3888, v1914  ; v1914 = -102
+    brif v1915, block24, block25
+
+block25:
+    store.i64 notrap v18, v3949
+    v1919 = fsub.f32 v918, v918
+    store notrap v1919, v917
+    jump block14(v917, v918, v921, v3949, v10, v3455, v3459, v978, v3471, v983, v4093, v15, v3888, v4136, v1720, v4801)
+
+block24:
+    store.i8 notrap v1923, v15  ; v1923 = 87
+    v1925 = iadd.i64 v15, v1924  ; v1924 = 1
+    store.i8 notrap v1926, v1925  ; v1926 = 71
+    v1928 = iadd.i64 v15, v1927  ; v1927 = 2
+    store.i8 notrap v1929, v1928  ; v1929 = 108
+    v1930 = load.i64 notrap v12
+    v1932 = isub v1930, v1930
+    store.i64 notrap v917, v22
+    store.i64 notrap v917, v10
+    v1936 = load.i64 notrap v10
+    v1937 = fcvt_from_sint.f32 v994  ; v994 = -2556624297083292120
+    store notrap v1937, v1936
+    v1938 = load.i64 notrap v22
+    v1939 = load.f32 notrap v13
+    v1940 = fneg v1939
+    store notrap v1940, v1938
+    store.i64 notrap v917, v10
+    store.i8 notrap v1941, v15  ; v1941 = -118
+    store.i8 notrap v1944, v1943  ; v1944 = -38
+    store.i8 notrap v1947, v1946  ; v1947 = 77
+    store.i64 notrap v1949, v19  ; v1949 = 4
+    v1950 = load.i64 notrap v10
+    store notrap v1950, v10
+    store.i64 notrap v917, v11
+    v1951 = load.i64 notrap v12
+    v1953 = icmp eq v1951, v1952  ; v1952 = 0x6a55_da45_6e7c_49a3
+    brif v1953, block26, block178
+
+block178:
+    v4783 = stack_addr.i64 ss11
+    store.f64 notrap v4801, v4783
+    jump block27
+
+block27:
+    v1954 = load.i64 notrap v22
+    v1956 = iconst.i32 155
+    v1957 = fcvt_from_uint.f32 v1956  ; v1956 = 155
+    store notrap v1957, v1954
+    v1958 = load.i64 notrap v22
+    v1960 = fcvt_from_uint.f32 v1959  ; v1959 = 0x12d6_38e5_47c2_9734
+    store notrap v1960, v1958
+    v1962 = load.i64 notrap v22
+    store notrap v1962, v3455
+    v1963 = load.i64 notrap v22
+    v1965 = fcvt_from_uint.f32 v1964  ; v1964 = 2
+    store notrap v1965, v1963
+    v1967 = load.i64 notrap v22
+    v1969 = iconst.i32 0xcc20
+    v1970 = fcvt_from_uint.f32 v1969  ; v1969 = 0xcc20
+    store notrap v1970, v1967
+    v1971 = load.i64 notrap v22
+    store notrap v1971, v3455
+    v1972 = load.i64 notrap v22
+    store notrap v1972, v3455
+    v4700 = load.i64 notrap v22
+    jump block2(v3455, v3459, v4136, v4700, v1720)
+
+block26:
+    v1974 = fcvt_to_sint_sat.i64 v4801
+    store.f32 notrap v918, v917
+    store.i8 notrap v1978, v15  ; v1978 = -86
+    v1980 = iadd.i64 v15, v1979  ; v1979 = 1
+    store.i8 notrap v1981, v1980  ; v1981 = -84
+    v1983 = iadd.i64 v15, v1982  ; v1982 = 2
+    store.i8 notrap v1984, v1983  ; v1984 = 113
+    v1986 = load.i64 notrap v10
+    store notrap v1986, v11
+    store.i64 notrap v917, v10
+    v1987 = load.f32 notrap v13
+    v1988 = fadd v1987, v918
+    store notrap v1988, v917
+    store.i64 notrap v17, v9
+    store.i64 notrap v917, v10
+    store.i8 notrap v1989, v15  ; v1989 = -55
+    v1991 = iadd.i64 v15, v1990  ; v1990 = 1
+    store.i8 notrap v1992, v1991  ; v1992 = -27
+    v1994 = iadd.i64 v15, v1993  ; v1993 = 2
+    store.i8 notrap v1995, v1994  ; v1995 = 25
+    v1996 = load.i64 notrap v9
+    v1997 = load.i32 notrap v1996
+    store notrap v1997, v18
+    v1999 = load.i64 notrap v10
+    store notrap v1999, v22
+    store.i64 notrap v17, v9
+    store.i64 notrap v2001, v9
+    store.i64 notrap v2003, v19  ; v2003 = -3
+    store.i8 notrap v2004, v15  ; v2004 = -102
+    v2006 = iadd.i64 v15, v2005  ; v2005 = 1
+    store.i8 notrap v2007, v2006  ; v2007 = 58
+    v2009 = iadd.i64 v15, v2008  ; v2008 = 2
+    store.i8 notrap v2010, v2009  ; v2010 = -114
+    v2013 = load.i64 notrap v10
+    v2015 = fcvt_from_sint.f32 v3888
+    store notrap v2015, v2013
+    v2017 = fcvt_from_sint.f32 v1974
+    store notrap v2017, v917
+    v2020 = fcmp le v2017, v2017
+    v2022 = uextend.i32 v4114
+    v2023 = fcvt_from_uint.f32 v2022
+    store notrap v2023, v917
+    v2024 = load.f32 notrap v13
+    v2025 = fsub.f32 v918, v2024
+    store notrap v2025, v917
+    v2027 = fdemote.f32 v4801
+    store notrap v2027, v917
+    store.i64 notrap v18, v9
+    v2028 = isub.i8 v3471, v3471
+    v2029 = load.i64 notrap v19
+    v2030 = fcvt_from_uint.f64 v2029
+    v4605 = uextend.i32 v3471
+    v4606 = uextend.i32 v3471
+    v2033 = band v4605, v4606
+    v2034 = fcvt_from_uint.f32 v2033
+    store notrap v2034, v917
+    store.i8 notrap v2035, v15  ; v2035 = 9
+    v2037 = iadd.i64 v15, v2036  ; v2036 = 1
+    store.i8 notrap v2038, v2037  ; v2038 = 70
+    v2040 = iadd.i64 v15, v2039  ; v2039 = 2
+    store.i8 notrap v2041, v2040  ; v2041 = -27
+    jump block28
+
+block28:
+    store.i64 notrap v17, v9
+    v2048 = load.i64 notrap v22
+    store notrap v2048, v10
+    store.i64 notrap v917, v10
+    store.i64 notrap v917, v10
+    v2054 = load.f32 notrap v13
+    v2055 = fmul.f32 v918, v2054
+    store notrap v2055, v917
+    v4670 = load.i32 notrap v19
+    store.i8 notrap v2061, v15  ; v2061 = 52
+    v2063 = iadd.i64 v15, v2062  ; v2062 = 1
+    store.i8 notrap v2064, v2063  ; v2064 = -52
+    v2066 = iadd.i64 v15, v2065  ; v2065 = 2
+    store.i8 notrap v2067, v2066  ; v2067 = 69
+    store.i8 notrap v2068, v15  ; v2068 = 46
+    v2070 = iadd.i64 v15, v2069  ; v2069 = 1
+    store.i8 notrap v2071, v2070  ; v2071 = -43
+    v2073 = iadd.i64 v15, v2072  ; v2072 = 2
+    store.i8 notrap v2074, v2073  ; v2074 = -21
+    store.f32 notrap v918, v917
+    store.i8 notrap v2075, v15  ; v2075 = 106
+    v2077 = iadd.i64 v15, v2076  ; v2076 = 1
+    store.i8 notrap v2078, v2077  ; v2078 = -82
+    v2080 = iadd.i64 v15, v2079  ; v2079 = 2
+    store.i8 notrap v2081, v2080  ; v2081 = -38
+    store.i64 notrap v17, v9
+    v2087 = load.i64 notrap v11
+    store notrap v2087, v22
+    store.i64 notrap v17, v9
+    v2088 = load.i64 notrap v10
+    store notrap v2088, v11
+    store.i64 notrap v17, v9
+    store.i8 notrap v2089, v15  ; v2089 = 29
+    v2091 = iadd.i64 v15, v2090  ; v2090 = 1
+    store.i8 notrap v2092, v2091  ; v2092 = -86
+    v2094 = iadd.i64 v15, v2093  ; v2093 = 2
+    store.i8 notrap v2095, v2094  ; v2095 = 74
+    v2096 = load.f32 notrap v13
+    store notrap v2096, v917
+    v4645 = band.i64 v4136, v4644  ; v4644 = -256
+    v2112 = bor v4645, v4646  ; v4646 = 2
+    v2113 = load.i64 notrap v19
+    store.i8 notrap v2114, v15  ; v2114 = -104
+    v2116 = iadd.i64 v15, v2115  ; v2115 = 1
+    store.i8 notrap v2117, v2116  ; v2117 = 114
+    v2119 = iadd.i64 v15, v2118  ; v2118 = 2
+    store.i8 notrap v2120, v2119  ; v2120 = -16
+    store.i64 notrap v2125, v2122  ; v2125 = 0x0007_7f62
+    v2127 = band v2113, v2126  ; v2126 = 63
+    v2129 = ishl.i64 v2128, v2127  ; v2128 = 0
+    store.i64 notrap v917, v11
+    store.i64 notrap v917, v11
+    v2144 = uextend.i128 v1932
+    v2146 = fcvt_from_uint.f32 v4670
+    store notrap v2146, v917
+    v2160 = load.i64 notrap v11
+    v2161 = load.f32 notrap v13
+    v2163 = fsub v2161, v2161
+    store notrap v2163, v2160
+    v2166 = load.i64 notrap v12
+    v2168 = icmp eq v2166, v2167  ; v2167 = 0x6a55_da45_6e7c_49a3
+    brif v2168, block29, block179
+
+block179:
+    v4784 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4784
+    jump block6(v3455, v917, v1932, v2020, v2112, v1720)
+
+block29:
+    store.i64 notrap v18, v9
+    v2175 = load.i64 notrap v11
+    store notrap v2175, v10
+    v2179 = load.f32 notrap v13
+    v2180 = fneg v2179
+    store notrap v2180, v2175
+    store.i8 notrap v2182, v15  ; v2182 = -53
+    v2184 = iadd.i64 v15, v2183  ; v2183 = 1
+    store.i8 notrap v2185, v2184  ; v2185 = 36
+    v2187 = iadd.i64 v15, v2186  ; v2186 = 2
+    store.i8 notrap v2188, v2187  ; v2188 = 116
+    store.i64 notrap v17, v9
+    v2190 = load.f32 notrap v13
+    v2192 = fmul v2190, v918
+    store notrap v2192, v917
+    v2193 = load.i64 notrap v12
+    v2195 = icmp eq v2193, v2194  ; v2194 = 0
+    brif v2195, block180, block161
+
+block180:
+    v4785 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4785
+    jump block15(v1932, v2020, v2112, v1720)
+
+block161:
+    v4684 = icmp.i64 eq v2193, v4683  ; v4683 = 1
+    brif v4684, block181, block133
+
+block181:
+    v4786 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4786
+    jump block7(v921, v917, v3455, v9, v2020, v3471, v10, v2112, v1720)
+
+block133:
+    v2199 = icmp.i64 eq v2193, v2198  ; v2198 = 2
+    brif v2199, block31, block134
+
+block134:
+    v2201 = icmp.i64 eq v2193, v2200  ; v2200 = 0x6a55_da45_6e7c_49a3
+    brif v2201, block32, block30
+
+block32:
+    v4669 = load.i32 notrap v19
+    store.i8 notrap v2205, v15  ; v2205 = -95
+    v2207 = iadd.i64 v15, v2206  ; v2206 = 1
+    store.i8 notrap v2208, v2207  ; v2208 = 7
+    v2210 = iadd.i64 v15, v2209  ; v2209 = 2
+    store.i8 notrap v2211, v2210  ; v2211 = 33
+    v2213 = load.i64 notrap v10
+    store notrap v2213, v11
+    v2215 = load.f32 notrap v13
+    v2217 = fmul v2215, v918
+    store notrap v2217, v917
+    v2230 = load.i32 notrap v2229
+    v4682 = band v4669, v4681  ; v4681 = 31
+    v2234 = ishl v2230, v4682
+    store notrap v2234, v18
+    store.i8 notrap v2243, v15  ; v2243 = -44
+    v2245 = iadd.i64 v15, v2244  ; v2244 = 1
+    store.i8 notrap v2246, v2245  ; v2246 = 88
+    v2248 = iadd.i64 v15, v2247  ; v2247 = 2
+    store.i8 notrap v2249, v2248  ; v2249 = -52
+    store.i64 notrap v917, v10
+    v2251 = load.f32 notrap v13
+    v2252 = fmul.f32 v918, v2251
+    store notrap v2252, v917
+    store.i64 notrap v917, v11
+    v2253 = load.i64 notrap v10
+    v2254 = load.f32 notrap v2253
+    store notrap v2253, v11
+    v2260 = load.f32 notrap v13
+    v2261 = fneg v2260
+    store notrap v2261, v2253
+    store.i64 notrap v17, v9
+    v2263 = load.i64 notrap v12
+    v2265 = icmp eq v2263, v2264  ; v2264 = 0x6a55_da45_6e7c_49a3
+    brif v2265, block182, block135
+
+block182:
+    v4787 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4787
+    jump block37
+
+block135:
+    v2267 = icmp.i64 uge v2263, v4607  ; v4607 = 0x0001_0000_0000
+    brif v2267, block183, block136
+
+block183:
+    v4788 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4788
+    jump block33
+
+block136:
+    v2268 = ireduce.i32 v2263
+    br_table v2268, block184, [block19(v15, v9, v10, v2020, v2112, v1720, v2030), block34, block185, block36]
+
+block185:
+    v4790 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4790
+    jump block35
+
+block184:
+    v4789 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4789
+    jump block33
+
+block37:
+    v2272 = icmp.i8 ult v2028, v3471
+    store notrap v2272, v2270
+    store.i64 notrap v17, v9
+    v2277 = load.i64 notrap v10
+    v2279 = sextend.i32 v3459
+    v2280 = fcvt_from_sint.f32 v2279
+    store notrap v2280, v2277
+    store.i64 notrap v17, v9
+    v2281 = load.i64 notrap v10
+    v2283 = fsub.f32 v2254, v2254
+    store notrap v2283, v2281
+    v2285 = load.i64 notrap v10
+    store notrap v2285, v11
+    v2287 = load.i64 notrap v12
+    v2289 = icmp eq v2287, v2288  ; v2288 = 0
+    brif v2289, block3(v3455, v2112, v1720), block137
+
+block137:
+    v2291 = icmp.i64 eq v2287, v2290  ; v2290 = 1
+    brif v2291, block39, block138
+
+block138:
+    v2293 = icmp.i64 eq v2287, v2292  ; v2292 = 0x6a55_da45_6e7c_49a3
+    brif v2293, block168, block38
+
+block168:
+    v4754 = stack_addr.i64 ss27
+    store.f32 notrap v1720, v4754
+    jump block40
+
+block40:
+    store.i64 notrap v17, v9
+    v2310 = load.f32 notrap v917
+    v2312 = load.f32 notrap v2285
+    v2313 = fcmp ge v2310, v2312
+    store.i64 notrap v917, v11
+    store.i64 notrap v18, v9
+    v2314 = iconst.i64 20
+    v2315 = iadd.i64 v12, v2314  ; v2314 = 20
+    v2316 = iconst.i8 1
+    v2317 = band v2313, v2316  ; v2316 = 1
+    store notrap v2317, v2315
+    v2320 = iconst.i64 0
+    call fn12(v2144, v1932, v921, v2320)  ; v2320 = 0
+    v2321 = load.i64 notrap v19
+    v2322 = load.i32 notrap v18
+    v2323 = load.i32 notrap v17
+    call fn13(v1932, v2321, v2322, v2323)
+    v2325 = load.i16 notrap v15
+    v2326 = load.i8 notrap v15+2
+    store notrap v2325, v5
+    store notrap v2326, v5+2
+    v2327 = load.i32 notrap v5
+    call fn14(v3471, v921, v1974, v2327)
+    call fn15(v921)
+    v2329 = load.f32 notrap v21
+    return v2329
+
+block39:
+    v2330 = load.i64 notrap v22
+    v2332 = iconst.i32 155
+    v2333 = fcvt_from_uint.f32 v2332  ; v2332 = 155
+    store notrap v2333, v2330
+    v2334 = load.i64 notrap v22
+    v2336 = fcvt_from_uint.f32 v2335  ; v2335 = 0x12d6_38e5_47c2_9734
+    store notrap v2336, v2334
+    v2338 = load.i64 notrap v22
+    store notrap v2338, v3455
+    v2339 = load.i64 notrap v22
+    v2341 = fcvt_from_uint.f32 v2340  ; v2340 = 2
+    store notrap v2341, v2339
+    v2343 = load.i64 notrap v22
+    v2345 = iconst.i32 0xcc20
+    v2346 = fcvt_from_uint.f32 v2345  ; v2345 = 0xcc20
+    store notrap v2346, v2343
+    v2347 = load.i64 notrap v22
+    store notrap v2347, v3455
+    v2348 = load.i64 notrap v22
+    store notrap v2348, v3455
+    v4702 = load.i64 notrap v22
+    jump block2(v3455, v3459, v2112, v4702, v1720)
+
+block38:
+    v2349 = load.i64 notrap v22
+    v2353 = call fn0(v2352)
+    store notrap v2353, v2349
+    v2354 = load.i64 notrap v22
+    store.f32 notrap v2357, v2354
+    v2358 = load.i64 notrap v22
+    store.f32 notrap v2361, v2358
+    v2362 = load.i64 notrap v22
+    store.f32 notrap v2365, v2362
+    v2366 = load.i64 notrap v22
+    store.f32 notrap v2368, v2366
+    v2370 = load.i64 notrap v22
+    store notrap v2370, v3455
+    v2371 = load.i64 notrap v22
+    store notrap v2371, v3455
+    store.f32 notrap v2373, v2371
+    store notrap v2371, v3455
+    v2376 = load.i64 notrap v22
+    store.f32 notrap v2378, v2376
+    v2382 = call fn0(v2381)
+    store notrap v2382, v2371
+    store notrap v2371, v3455
+    store.f32 notrap v2386, v2371
+    store notrap v2371, v3455
+    store notrap v2371, v3455
+    store notrap v2371, v3455
+    jump block5(v2371, v3455, v2384, v2112, v1720)  ; v2384 = -1
+
+block36:
+    v2394 = load.i64 notrap v22
+    store.f32 notrap v2396, v2394
+    store.i64 notrap v2398, v19  ; v2398 = -6753952338686199543
+    store.f32 notrap v2405, v917
+    store.i64 notrap v18, v9
+    store.i64 notrap v917, v3455
+    store.i64 notrap v17, v9
+    store.i8 notrap v2414, v15  ; v2414 = -43
+    v2416 = iadd.i64 v15, v2415  ; v2415 = 1
+    store.i8 notrap v2417, v2416  ; v2417 = -112
+    v2419 = iadd.i64 v15, v2418  ; v2418 = 2
+    store.i8 notrap v2420, v2419  ; v2420 = 96
+    jump block12(v3455, v917, v15, v9, v10, v3459, v2020, v3471, v2112, v1720, v2030)
+
+block35:
+    store.f32 notrap v2436, v917
+    store.i64 notrap v917, v22
+    v4671 = load.i32 notrap v19
+    v4676 = band v4671, v4675  ; v4675 = 7
+    v2440 = ireduce.i8 v4676
+    v2442 = ushr.i8 v2441, v2440  ; v2441 = -66
+    store.i64 notrap v917, v3455
+    v2444 = uextend.i32 v2442
+    v2445 = fcvt_from_uint.f32 v2444
+    store notrap v2445, v917
+    store.i64 notrap v17, v20
+    store.i64 notrap v18, v20
+    store.i64 notrap v917, v3455
+    v2446 = load.i32 notrap v17
+    v2448 = bxor v2446, v2447  ; v2447 = -1
+    store notrap v2448, v18
+    v2449 = load.i64 notrap v22
+    store notrap v2449, v3455
+    store.i64 notrap v1932, v16
+    jump block7(v2451, v917, v3455, v20, v2020, v2442, v3455, v2112, v1720)
+
+block34:
+    v2453 = load.i64 notrap v22
+    store.f32 notrap v2456, v2453
+    v2459 = fdemote.f32 v2030
+    store notrap v2459, v917
+    store.i8 notrap v2461, v15  ; v2461 = 15
+    store.i8 notrap v2464, v2463  ; v2464 = -12
+    store.i8 notrap v2467, v2466  ; v2467 = 27
+    v2468 = load.i32 notrap v18
+    v2469 = fcvt_from_sint.f32 v2468
+    store notrap v2469, v917
+    v2473 = call fn0(v2472)
+    store notrap v2473, v917
+    store.i64 notrap v917, v3455
+    store.i64 notrap v18, v9
+    store.f32 notrap v2477, v917
+    v2479 = fdemote.f32 v2030
+    store notrap v2479, v917
+    store.i64 notrap v18, v9
+    store.i64 notrap v18, v9
+    store.i64 notrap v917, v3455
+    v2486 = load.i64 notrap v22
+    store notrap v2486, v3455
+    store.i64 notrap v17, v9
+    v2487 = load.i64 notrap v22
+    store notrap v2487, v3455
+    v2488 = load.i64 notrap v22
+    store notrap v2488, v3455
+    store.f32 notrap v2490, v917
+    store.i64 notrap v917, v3455
+    jump block8(v917, v3471, v9, v3455, v10, v2020, v2112, v1720, v2030)
+
+block33:
+    v2491 = load.i64 notrap v22
+    v2493 = iconst.i32 155
+    v2494 = fcvt_from_uint.f32 v2493  ; v2493 = 155
+    store notrap v2494, v2491
+    v2495 = load.i64 notrap v22
+    v2497 = fcvt_from_uint.f32 v2496  ; v2496 = 0x12d6_38e5_47c2_9734
+    store notrap v2497, v2495
+    v2499 = load.i64 notrap v22
+    store notrap v2499, v3455
+    v2500 = load.i64 notrap v22
+    v2502 = fcvt_from_uint.f32 v2501  ; v2501 = 2
+    store notrap v2502, v2500
+    v2504 = load.i64 notrap v22
+    v2506 = iconst.i32 0xcc20
+    v2507 = fcvt_from_uint.f32 v2506  ; v2506 = 0xcc20
+    store notrap v2507, v2504
+    v2508 = load.i64 notrap v22
+    store notrap v2508, v3455
+    v2509 = load.i64 notrap v22
+    store notrap v2509, v3455
+    v4701 = load.i64 notrap v22
+    jump block2(v3455, v3459, v2112, v4701, v1720)
+
+block31:
+    v2510 = load.i32 notrap v18
+    v2512 = bxor v2510, v2511  ; v2511 = -1
+    store notrap v2512, v17
+    store.i64 notrap v917, v3455
+    store.f32 notrap v2517, v917
+    v2518 = load.i32 notrap v17
+    store notrap v2518, v18
+    store.i8 notrap v2520, v15  ; v2520 = 37
+    v2522 = iadd.i64 v15, v2521  ; v2521 = 1
+    store.i8 notrap v2523, v2522  ; v2523 = 74
+    v2525 = iadd.i64 v15, v2524  ; v2524 = 2
+    store.i8 notrap v2526, v2525  ; v2526 = -52
+    store.i64 notrap v18, v9
+    store.i64 notrap v917, v3455
+    v2528 = load.i64 notrap v22
+    v2529 = load.i64 notrap v19
+    v2530 = fcvt_from_uint.f32 v2529
+    store notrap v2530, v2528
+    v2531 = load.i64 notrap v22
+    store.f32 notrap v2534, v2531
+    v2537 = load.f32 notrap v917
+    v2538 = fneg v2537
+    store.i64 notrap v18, v9
+    store notrap v2538, v917
+    store.i8 notrap v2540, v15  ; v2540 = -36
+    v2542 = iadd.i64 v15, v2541  ; v2541 = 1
+    store.i8 notrap v2543, v2542  ; v2543 = -22
+    v2545 = iadd.i64 v15, v2544  ; v2544 = 2
+    store.i8 notrap v2546, v2545  ; v2546 = -37
+    store.i64 notrap v917, v22
+    store notrap v2538, v917
+    v2551 = fdemote.f32 v2030
+    store notrap v2551, v917
+    v2553, v2554 = isplit.i128 v921
+    v2556 = icmp eq v2554, v2555  ; v2555 = 0x74c6_4cc2_6f8a_95ca
+    brif v2556, block142, block186
+
+block186:
+    v4791 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4791
+    jump block162
+
+block162:
+    brif.i64 v2554, block5(v917, v10, v3459, v2112, v1720), block141
+
+block141:
+    brif.i64 v2553, block5(v917, v10, v3459, v2112, v1720), block4(v10, v2112, v1720)
+
+block142:
+    v2558 = icmp.i64 eq v2553, v2557  ; v2557 = -4017781672461578577
+    brif v2558, block13(v9, v917, v2538, v3459, v921, v22, v10, v2020, v3471, v10, v1932, v15, v2129, v2112, v1720, v2030), block187
+
+block187:
+    v4792 = stack_addr.i64 ss11
+    store.f64 notrap v2030, v4792
+    jump block5(v917, v10, v3459, v2112, v1720)
+
+block30:
+    v2562 = sextend.i32 v3459
+    v2563 = fcvt_from_sint.f32 v2562
+    store notrap v2563, v13
+    store.i8 notrap v2565, v15  ; v2565 = -89
+    v2567 = iadd.i64 v15, v2566  ; v2566 = 1
+    store.i8 notrap v2568, v2567  ; v2568 = 9
+    v2570 = iadd.i64 v15, v2569  ; v2569 = 2
+    store.i8 notrap v2571, v2570  ; v2571 = 122
+    v2572 = sextend.i32 v3459
+    v2573 = fcvt_from_sint.f64 v2572
+    v2576 = icmp.i64 eq v2129, v2575  ; v2575 = 0
+    brif v2576, block188, block164
+
+block188:
+    v4793 = stack_addr.i64 ss11
+    store.f64 notrap v2573, v4793
+    jump block20(v2112, v1720)
+
+block164:
+    v4686 = icmp.i64 eq v2129, v4685  ; v4685 = -102
+    brif v4686, block21(v2020, v11, v15, v2129, v9, v1932, v2159, v2112, v1720), block19(v15, v9, v10, v2020, v2112, v1720, v2573)  ; v2159 = 782
+
+block77:
+    v2649 = load.i64 notrap v1033
+    v2650 = load.f32 notrap v1031
+    store notrap v2650, v2649
+    v2651 = load.i64 notrap v1033
+    v2652 = load.f32 notrap v1031
+    v2654 = fsub v2652, v2652
+    store notrap v2654, v2651
+    v2655 = load.i64 notrap v1033
+    store.f32 notrap v2657, v2655
+    jump block67(v1157, v1171)
+
+block76:
+    v2660 = load.i64 notrap v1033
+    store.f32 notrap v2667, v2660
+    v2668 = load.i64 notrap v1033
+    v2669 = load.f32 notrap v1031
+    v2670 = fneg v2669
+    store notrap v2670, v2668
+    v2674 = load.i64 notrap v1033
+    v2678 = call fn1(v2677)
+    store notrap v2678, v2674
+    v2679 = load.i64 notrap v1033
+    store notrap v2679, v1033
+    v2688 = load.f32 notrap v1031
+    store notrap v2688, v2679
+    jump block68(v1171)
+
+block75:
+    v2701 = load.i64 notrap v1033
+    v2702 = load.f32 notrap v2701
+    v2705 = fmul v2702, v2702
+    store.f32 notrap v2709, v2701
+    v2711 = call fn5(v1142)
+    store notrap v2711, v1025
+    v4689 = icmp.i64 ne v2717, v2718  ; v2718 = 0x49cc_df60_28d7_443c
+    brif v4689, block147, block165
+
+block165:
+    v4688 = icmp.i64 eq v2716, v4687  ; v4687 = -4465584269192554660
+    brif v4688, block71(v2705), block69
+
+block147:
+    brif.i64 v2717, block69, block145
+
+block145:
+    v2721 = icmp.i64 uge v2716, v4610  ; v4610 = 0x0001_0000_0000
+    brif v2721, block69, block148
+
+block148:
+    v2722 = ireduce.i32 v2716
+    br_table v2722, block69, [block63(v1031, v1116, v2714), block64(v2700, v2714), block65(v2700, v2714), block66(v2700, v2714), block67(v1116, v2714), block70]
+
+block74:
+    v2729 = load.f32 notrap v1030
+    v2748 = fneg v2729
+    store notrap v2748, v1031
+    store.i64 notrap v1031, v1033
+    v2756 = call fn1(v2755)
+    store notrap v2756, v1031
+    v2757 = load.i64 notrap v1033
+    store notrap v2757, v1033
+    v2759 = load.f32 notrap v1030
+    v2761 = fsub v2759, v2759
+    store notrap v2761, v2757
+    v2762 = load.i64 notrap v1033
+    v2764 = load.f32 notrap v2762
+    v2766 = call fn4(v2762, v2764, v1031, v1116)
+    jump block64(v2766, v1171)
+
+block73:
+    v2771 = load.f32 notrap v1030
+    v2790 = fneg v2771
+    store notrap v2790, v1031
+    store.i64 notrap v1031, v1033
+    v2798 = call fn1(v2797)
+    store notrap v2798, v1031
+    v2799 = load.i64 notrap v1033
+    store notrap v2799, v1033
+    v2801 = load.f32 notrap v1030
+    v2803 = fsub v2801, v2801
+    store notrap v2803, v2799
+    v2804 = load.i64 notrap v1033
+    v2806 = load.f32 notrap v2804
+    v2808 = call fn4(v2804, v2806, v1031, v1116)
+    jump block64(v2808, v1171)
+
+block72:
+    v2809 = load.i64 notrap v1033
+    v2810 = load.f32 notrap v1031
+    v2812 = fadd v2810, v2810
+    store notrap v2812, v2809
+    jump block66(v1157, v1171)
+
+block70:
+    v2815 = load.i64 notrap v1033
+    store.f32 notrap v2822, v2815
+    v2823 = load.i64 notrap v1033
+    v2824 = load.f32 notrap v1031
+    v2825 = fneg v2824
+    store notrap v2825, v2823
+    v2829 = load.i64 notrap v1033
+    v2833 = call fn1(v2832)
+    store notrap v2833, v2829
+    v2834 = load.i64 notrap v1033
+    store notrap v2834, v1033
+    v2843 = load.f32 notrap v1031
+    store notrap v2843, v2834
+    jump block68(v1171)
+
+block69:
+    v2852 = load.f32 notrap v1030
+    v2871 = fneg v2852
+    store notrap v2871, v1031
+    store.i64 notrap v1031, v1033
+    v2879 = call fn1(v2878)
+    store notrap v2879, v1031
+    v2880 = load.i64 notrap v1033
+    store notrap v2880, v1033
+    v2882 = load.f32 notrap v1030
+    v2884 = fsub v2882, v2882
+    store notrap v2884, v2880
+    v2885 = load.i64 notrap v1033
+    v2887 = load.f32 notrap v2885
+    v2889 = call fn4(v2885, v2887, v1031, v1116)
+    jump block64(v2889, v1171)
+
+block20(v4166: i64, v4735: f32):
+    store.f32 notrap v2892, v917
+    store.i32 notrap v2894, v17  ; v2894 = 0x7cae
+    store.i64 notrap v17, v20
+    store.i32 notrap v2897, v17  ; v2897 = 0x3b3b_ac23
+    store.i64 notrap v917, v3455
+    v2899 = load.i64 notrap v20
+    store.i32 notrap v2901, v2899  ; v2901 = 0x02a5_a382
+    v2902 = load.i64 notrap v20
+    store.i32 notrap v2904, v2902  ; v2904 = 0x6f3d_92de
+    v2905 = load.i64 notrap v20
+    store.i32 notrap v2907, v2905  ; v2907 = -1545206288
+    v2908 = load.i64 notrap v22
+    store.f32 notrap v2910, v2908
+    v2911 = load.i64 notrap v22
+    store.f32 notrap v2913, v2911
+    v2914 = load.i64 notrap v22
+    v2916 = sextend.i32 v3459
+    v2917 = fcvt_from_sint.f32 v2916
+    store notrap v2917, v2914
+    v2919 = load.i64 notrap v22
+    v2920 = sextend.i32 v3459
+    v2921 = fcvt_from_sint.f32 v2920
+    store notrap v2921, v2919
+    store.f32 notrap v2923, v917
+    store.i64 notrap v2927, v19  ; v2927 = 0xc8b2
+    jump block6(v3455, v917, v2918, v2925, v4166, v4735)  ; v2918 = -3690511948449329794, v2925 = 0
+
+block19(v2941: i64, v2945: i64, v3486: i64, v3500: i8, v4164: i64, v4752: f32, v4772: f64):
+    v2928 = load.i64 notrap v22
+    store.f32 notrap v2930, v2928
+    store.i64 notrap v2932, v19  ; v2932 = -6753952338686199543
+    store.f32 notrap v2939, v917
+    store.i64 notrap v18, v2945
+    store.i64 notrap v917, v3455
+    store.i64 notrap v17, v2945
+    store.i8 notrap v2948, v2941  ; v2948 = -43
+    v2950 = iadd v2941, v2949  ; v2949 = 1
+    store.i8 notrap v2951, v2950  ; v2951 = -112
+    v2953 = iadd v2941, v2952  ; v2952 = 2
+    store.i8 notrap v2954, v2953  ; v2954 = 96
+    jump block12(v3455, v917, v2941, v2945, v3486, v3459, v3500, v3471, v4164, v4752, v4772)
+
+block17:
+    v2967 = load.i64 notrap v22
+    store.f32 notrap v2970, v2967
+    v2973 = fdemote.f32 v4758
+    store notrap v2973, v917
+    store.i8 notrap v2975, v15  ; v2975 = 15
+    store.i8 notrap v2978, v2977  ; v2978 = -12
+    store.i8 notrap v2981, v2980  ; v2981 = 27
+    v2982 = load.i32 notrap v18
+    v2983 = fcvt_from_sint.f32 v2982
+    store notrap v2983, v917
+    v2987 = call fn0(v2986)
+    store notrap v2987, v917
+    store.i64 notrap v917, v3455
+    store.i64 notrap v18, v922
+    store.f32 notrap v2991, v917
+    v2993 = fdemote.f32 v4758
+    store notrap v2993, v917
+    store.i64 notrap v18, v922
+    store.i64 notrap v18, v922
+    store.i64 notrap v917, v3455
+    v3000 = load.i64 notrap v22
+    store notrap v3000, v3455
+    store.i64 notrap v17, v922
+    v3001 = load.i64 notrap v22
+    store notrap v3001, v3455
+    v3002 = load.i64 notrap v22
+    store notrap v3002, v3455
+    store.f32 notrap v3004, v917
+    store.i64 notrap v917, v3455
+    jump block8(v917, v3471, v922, v3455, v3481, v3466, v4137, v4731, v4758)
+
+block16:
+    v3005 = load.i64 notrap v22
+    store.f32 notrap v3008, v3005
+    v3009 = load.i64 notrap v22
+    store.f32 notrap v3011, v3009
+    v3013 = load.i64 notrap v22
+    store notrap v3013, v3455
+    v3014 = load.i64 notrap v22
+    store.f32 notrap v3016, v3014
+    v3018 = load.i64 notrap v22
+    store.f32 notrap v3021, v3018
+    v3022 = load.i64 notrap v22
+    store notrap v3022, v3455
+    v3023 = load.i64 notrap v22
+    store notrap v3023, v3455
+    v4699 = load.i64 notrap v22
+    jump block2(v3455, v3459, v4137, v4699, v4731)
+
+block15(v3043: i64, v3469: i8, v4168: i64, v4740: f32):
+    store.f32 notrap v3027, v917
+    store.i64 notrap v917, v22
+    v4654 = load.i32 notrap v19
+    v4664 = band v4654, v4663  ; v4663 = 7
+    v3031 = ireduce.i8 v4664
+    v3033 = ushr.i8 v3032, v3031  ; v3032 = -66
+    store.i64 notrap v917, v3455
+    v3035 = uextend.i32 v3033
+    v3036 = fcvt_from_uint.f32 v3035
+    store notrap v3036, v917
+    store.i64 notrap v17, v20
+    store.i64 notrap v18, v20
+    store.i64 notrap v917, v3455
+    v3037 = load.i32 notrap v17
+    v3039 = bxor v3037, v3038  ; v3038 = -1
+    store notrap v3039, v18
+    v3040 = load.i64 notrap v22
+    store notrap v3040, v3455
+    store notrap v3043, v16
+    jump block7(v3042, v917, v3455, v20, v3469, v3033, v3455, v4168, v4740)
+
+block60:
+    store.f32 notrap v3147, v34
+    jump block54(v371, v34)
+
+block59:
+    v3159 = sextend.i32 v288
+    v3160 = fcvt_from_sint.f32 v3159
+    store notrap v3160, v34
+    v3164 = call fn1(v3163)
+    store notrap v3164, v34
+    store.i64 notrap v34, v35
+    store.f32 notrap v3167, v34
+    store.i64 notrap v34, v35
+    v3168 = load.i64 notrap v35
+    store notrap v3168, v35
+    v3170 = sextend.i32 v288
+    v3171 = fcvt_from_sint.f32 v3170
+    store notrap v3171, v34
+    v3174 = band.i16 v288, v3173  ; v3173 = 15
+    v3175 = ishl.i16 v4799, v3174
+    store.i64 notrap v34, v35
+    v3176 = load.i64 notrap v35
+    store.f32 notrap v3178, v3176
+    v3179 = load.i64 notrap v35
+    v3183 = call fn1(v3182)
+    store notrap v3183, v3179
+    jump block44(v34, v371, v3175, v288, v288)
+
+block58:
+    v3189 = sextend.i32 v288
+    v3190 = fcvt_from_sint.f32 v3189
+    store notrap v3190, v34
+    v3194 = call fn1(v3193)
+    store notrap v3194, v34
+    store.i64 notrap v34, v35
+    store.f32 notrap v3197, v34
+    store.i64 notrap v34, v35
+    v3198 = load.i64 notrap v35
+    store notrap v3198, v35
+    v3200 = sextend.i32 v288
+    v3201 = fcvt_from_sint.f32 v3200
+    store notrap v3201, v34
+    v3204 = band.i16 v288, v3203  ; v3203 = 15
+    v3205 = ishl.i16 v4799, v3204
+    store.i64 notrap v34, v35
+    v3206 = load.i64 notrap v35
+    store.f32 notrap v3208, v3206
+    v3209 = load.i64 notrap v35
+    v3213 = call fn1(v3212)
+    store notrap v3213, v3209
+    jump block44(v34, v371, v3205, v288, v288)
+
+block56:
+    store.f32 notrap v3215, v34
+    jump block54(v312, v4696)
+
+block55:
+    store.f32 notrap v3233, v4696
+    v4651 = band.i64 v312, v4650  ; v4650 = -1099511627776
+    v3239 = bor v4651, v4652  ; v4652 = 0x000c_000f_fdb5
+    v3241 = load.i64 notrap v35
+    store notrap v3241, v35
+    v3242 = load.i64 notrap v35
+    store notrap v3242, v35
+    v3243 = load.i64 notrap v35
+    store.f32 notrap v3245, v3243
+    v3246 = load.i64 notrap v35
+    store notrap v3246, v35
+    v3247 = load.i64 notrap v35
+    store notrap v3247, v35
+    v3248 = load.i64 notrap v35
+    store notrap v3248, v35
+    v3250, v3251 = isplit.i128 v117
+    v4692 = icmp ne v3251, v3252  ; v3252 = -1862259597032899258
+    brif v4692, block153, block166
+
+block166:
+    v4691 = icmp.i64 eq v3250, v4690  ; v4690 = -7563317447395451459
+    brif v4691, block51(v3239, v4696, v288, v288), block48(v4696, v3239, v288, v288)
+
+block153:
+    brif.i64 v3251, block48(v4696, v3239, v288, v288), block151
+
+block151:
+    v3255 = icmp.i64 uge v3250, v4613  ; v4613 = 0x0001_0000_0000
+    brif v3255, block48(v4696, v3239, v288, v288), block154
+
+block154:
+    v3256 = ireduce.i32 v3250
+    br_table v3256, block48(v4696, v3239, v288, v288), [block49(v288, v288, v3239), block50(v288, v288, v3239)]
+
+block52:
+    v3259 = load.i64 notrap v35
+    v3264 = sextend.i32 v3606
+    v3265 = fcvt_from_sint.f32 v3264
+    store notrap v3265, v3259
+    v3269 = call fn1(v3268)
+    store notrap v3269, v3259
+    store notrap v3259, v35
+    store.f32 notrap v3272, v3259
+    store notrap v3259, v35
+    v3273 = load.i64 notrap v35
+    store notrap v3273, v35
+    v3275 = sextend.i32 v3607
+    v3276 = fcvt_from_sint.f32 v3275
+    store notrap v3276, v3259
+    v3279 = band.i16 v3606, v3278  ; v3278 = 15
+    v3280 = ishl.i16 v4799, v3279
+    store notrap v3259, v35
+    v3281 = load.i64 notrap v35
+    store.f32 notrap v3283, v3281
+    v3284 = load.i64 notrap v35
+    v3288 = call fn1(v3287)
+    store notrap v3288, v3284
+    jump block44(v3259, v245, v3280, v3606, v3607)
+
+block50(v3293: i16, v3304: i16, v3603: i64):
+    v3289 = load.i64 notrap v35
+    v3294 = sextend.i32 v3293
+    v3295 = fcvt_from_sint.f32 v3294
+    store notrap v3295, v3289
+    v3299 = call fn1(v3298)
+    store notrap v3299, v3289
+    store notrap v3289, v35
+    store.f32 notrap v3302, v3289
+    store notrap v3289, v35
+    v3303 = load.i64 notrap v35
+    store notrap v3303, v35
+    v3305 = sextend.i32 v3304
+    v3306 = fcvt_from_sint.f32 v3305
+    store notrap v3306, v3289
+    v3309 = band v3293, v3308  ; v3308 = 15
+    v3310 = ishl.i16 v4799, v3309
+    store notrap v3289, v35
+    v3311 = load.i64 notrap v35
+    store.f32 notrap v3313, v3311
+    v3314 = load.i64 notrap v35
+    v3318 = call fn1(v3317)
+    store notrap v3318, v3314
+    jump block44(v3289, v3603, v3310, v3293, v3304)
+
+block49(v3583: i16, v3588: i16, v3598: i64):
+    v3320 = load.i64 notrap v35
+    store notrap v3320, v35
+    v3321 = load.i64 notrap v35
+    store notrap v3321, v35
+    v3322 = load.i64 notrap v35
+    store notrap v3322, v35
+    v3323 = load.i64 notrap v35
+    store notrap v3323, v35
+    v3326 = load.i64 notrap v35
+    v3330 = call fn0(v3329)
+    store notrap v3330, v3326
+    v3331 = load.i64 notrap v35
+    v3335 = call fn1(v3334)
+    store notrap v3335, v3331
+    v3336 = load.i64 notrap v35
+    store notrap v3336, v35
+    v3337 = load.i64 notrap v35
+    store.f32 notrap v3339, v3337
+    v3340 = load.i64 notrap v35
+    store notrap v3340, v35
+    v3341 = load.i64 notrap v35
+    store notrap v3341, v35
+    v3342 = load.i64 notrap v35
+    store.f32 notrap v3344, v3342
+    jump block43(v3583, v3588, v4799, v3598)
+
+block48(v3348: i64, v3365: i64, v3582: i16, v3587: i16):
+    v3346 = load.i64 notrap v35
+    store notrap v3346, v35
+    v3347 = load.i64 notrap v35
+    store notrap v3347, v35
+    v3352 = call fn1(v3351)
+    store notrap v3352, v3348
+    store notrap v3348, v35
+    v3356 = load.i64 notrap v35
+    store.f32 notrap v3358, v3356
+    v3359 = load.i64 notrap v35
+    store notrap v3359, v35
+    v3360 = load.i64 notrap v35
+    v3364 = call fn1(v3363)
+    store notrap v3364, v3360
+    store notrap v3348, v35
+    v3370 = band v3365, v3369  ; v3369 = -4294967296
+    v3371 = bor v3370, v3368  ; v3368 = 0x0010_6122
+    v3372 = load.i64 notrap v35
+    store.f32 notrap v3374, v3372
+    v3375 = load.i64 notrap v35
+    v3382 = sshr.i16 v138, v3381
+    v3383 = sextend.i32 v138
+    v3384 = fcvt_from_sint.f32 v3383
+    store notrap v3384, v3375
+    brif.i8 v4695, block157, block167
+
+block167:
+    brif.i8 v4694, block47(v3371, v3375, v3582, v3587), block45(v3582, v3587, v3371)
+
+block157:
+    brif.i64 v3386, block45(v3582, v3587, v3371), block155
+
+block155:
+    brif.i8 v3390, block45(v3582, v3587, v3371), block158
+
+block158:
+    br_table v3391, block45(v3582, v3587, v3371), [block42(v3582, v3587, v3382, v3371), block43(v3582, v3587, v3382, v3371), block46(v3582, v3587, v3371)]
+
+block46(v3398: i16, v3409: i16, v3604: i64):
+    v3394 = load.i64 notrap v35
+    v3399 = sextend.i32 v3398
+    v3400 = fcvt_from_sint.f32 v3399
+    store notrap v3400, v3394
+    v3404 = call fn1(v3403)
+    store notrap v3404, v3394
+    store notrap v3394, v35
+    store.f32 notrap v3407, v3394
+    store notrap v3394, v35
+    v3408 = load.i64 notrap v35
+    store notrap v3408, v35
+    v3410 = sextend.i32 v3409
+    v3411 = fcvt_from_sint.f32 v3410
+    store notrap v3411, v3394
+    v3414 = band v3398, v3413  ; v3413 = 15
+    v3415 = ishl.i16 v144, v3414
+    store notrap v3394, v35
+    v3416 = load.i64 notrap v35
+    store.f32 notrap v3418, v3416
+    v3419 = load.i64 notrap v35
+    v3423 = call fn1(v3422)
+    store notrap v3423, v3419
+    jump block44(v3394, v3604, v3415, v3398, v3409)
+
+block45(v3584: i16, v3589: i16, v3599: i64):
+    v3425 = load.i64 notrap v35
+    store notrap v3425, v35
+    v3426 = load.i64 notrap v35
+    store notrap v3426, v35
+    v3427 = load.i64 notrap v35
+    store notrap v3427, v35
+    v3428 = load.i64 notrap v35
+    store notrap v3428, v35
+    v3431 = load.i64 notrap v35
+    v3435 = call fn0(v3434)
+    store notrap v3435, v3431
+    v3436 = load.i64 notrap v35
+    v3440 = call fn1(v3439)
+    store notrap v3440, v3436
+    v3441 = load.i64 notrap v35
+    store notrap v3441, v35
+    v3442 = load.i64 notrap v35
+    store.f32 notrap v3444, v3442
+    v3445 = load.i64 notrap v35
+    store notrap v3445, v35
+    v3446 = load.i64 notrap v35
+    store notrap v3446, v35
+    v3447 = load.i64 notrap v35
+    store.f32 notrap v3449, v3447
+    jump block43(v3584, v3589, v144, v3599)
+}
