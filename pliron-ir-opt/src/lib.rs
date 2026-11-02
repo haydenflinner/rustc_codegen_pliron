@@ -20,6 +20,7 @@ pub mod dbg;
 pub mod domcheck;
 pub mod guardelim;
 pub mod inline;
+pub mod inline_cost;
 pub mod instcombine;
 pub mod irstat;
 pub mod lutcorr;

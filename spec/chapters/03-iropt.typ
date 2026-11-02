@@ -307,6 +307,24 @@ the parallel chapter; this chapter only names the point where they plug in.
   base limit.
 ]
 
+#r("iropt.inline.spec", title: "Callsite-specialized callee size", level: "may",
+   refines: "model.parity")[
+  With `PLIRON_INLINE_SPEC=1` (opt-in), the inliner MAY size a callee per
+  callsite: the callee is walked with the site's constant actuals
+  substituted, ops that fold to constants and blocks only reachable through
+  a decided branch are not counted, nor are ops that emit no code. The
+  result, scaled by `PLIRON_INLINE_SPEC_SCALE` percent, replaces the raw
+  op count in the site's score, fan-in and growth checks.
+]
+
+#llvm(kind: "same", summary: [LLVM's `CallAnalyzer` sizes each callsite's callee the same way.])[
+  LLVM's inline cost walks the callee with simplified values for the
+  site's constant arguments and skips dead blocks. It also sees callees
+  that its CGSCC pipeline already simplified, which this inliner does not
+  yet do, so specialized sizing alone measured neutral (pulldown +1%,
+  json -1%).
+]
+
 #r("iropt.inline.fanin", title: "High fan-in callees stay out of line", level: "should",
    refines: ("model.parity", "model.linear"))[
   Outside #term("iropt-small"), a callee at a plain site SHOULD be inlined

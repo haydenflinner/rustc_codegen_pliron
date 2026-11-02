@@ -1228,6 +1228,14 @@ pub fn run(
     // `scan_nextline` too big to inline into its callers; LLVM keeps the
     // closure out of line.
     let freemax: Option<usize> = crate::env_get("PLIRON_INLINE_FREEMAX").and_then(|s| s.parse().ok());
+    // `PLIRON_INLINE_SPEC=1`: size each callsite's callee as specialized to
+    // that site (`inline_cost`), scaled by `PLIRON_INLINE_SPEC_SCALE`
+    // percent (default 147: code-free ops are ~32% of the raw count the
+    // thresholds were tuned on). Replaces the fold/mem bonuses.
+    let spec = model && crate::env_is("PLIRON_INLINE_SPEC", "1");
+    let spec_scale: usize =
+        crate::env_get("PLIRON_INLINE_SPEC_SCALE").and_then(|s| s.parse().ok()).unwrap_or(147);
+    let mut spec_cache: FxHashMap<(String, Vec<Option<u128>>), crate::inline_cost::SpecCost> = FxHashMap::default();
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
     let cold_once = crate::env_is("PLIRON_INLINE_COLDONCE", "1");
     let always_all = crate::pass_enabled("PLIRON_INLINE_ALWAYS");
@@ -1485,6 +1493,7 @@ pub fn run(
                         t = t.max(limit.saturating_mul(bonus));
                     }
                     if fold > 1
+                        && !spec
                         && ci
                             .conds
                             .iter()
@@ -1500,11 +1509,28 @@ pub fn run(
                     if site_count.is_some_and(|c| c >= 4) {
                         t = t.saturating_add(limit.saturating_mul(2));
                     }
-                    let mut cost = ci.n;
+                    // The callee's size at this site: specialized (`spec`) or raw.
+                    let (sn, scalls) = if spec {
+                        let key: Vec<Option<u128>> = args
+                            .iter()
+                            .map(|a| match st.consts.get(*a) {
+                                Some(ConstVal::Bits(b)) => Some(*b),
+                                Some(ConstVal::Zero) => Some(0),
+                                _ => None,
+                            })
+                            .collect();
+                        let sc = *spec_cache
+                            .entry((cs.clone(), key))
+                            .or_insert_with(|| crate::inline_cost::spec_cost(ctx, st, ci.op, &args));
+                        (sc.n.saturating_mul(spec_scale) / 100, sc.ncalls)
+                    } else {
+                        (ci.n, ci.ncalls)
+                    };
+                    let mut cost = sn;
                     if model {
-                        cost = ci.n.saturating_add(ci.ncalls.saturating_mul(call_w));
+                        cost = sn.saturating_add(scalls.saturating_mul(call_w));
                         let mut save = 0usize;
-                        for (i, a) in args.iter().enumerate() {
+                        for (i, a) in args.iter().enumerate().filter(|_| !spec) {
                             if const_arg(st, a) {
                                 save = save.saturating_add(
                                     FOLD_USE * ci.fold.get(i).copied().unwrap_or(0) as usize,
@@ -1540,7 +1566,7 @@ pub fn run(
                             // Net global growth is ~0 — the callee's out-of-line
                             // copy dies — so nested calls and coldness aren't
                             // charged; `cap` still bounds the caller's size.
-                            cost = ci.n;
+                            cost = sn;
                         }
                     } else if hot > 1
                         && ci.ncalls <= 2
@@ -1638,13 +1664,13 @@ pub fn run(
                         && adj
                             .as_ref()
                             .and_then(|a| a.callers_of.get(cs.as_str()))
-                            .is_some_and(|v| ci.n.saturating_mul(v.len()) > t.saturating_mul(fanin))
+                            .is_some_and(|v| sn.saturating_mul(v.len()) > t.saturating_mul(fanin))
                         && !loops
                             .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                             .contains(&b)
                     {
                         "reject (fanin)"
-                    } else if model && !free && grown + ci.n > growth {
+                    } else if model && !free && grown + sn > growth {
                         "reject (growth)"
                     } else if maxdup > 0
                         && !f.always_inline
@@ -1653,7 +1679,7 @@ pub fn run(
                         "reject (dup)"
                     } else {
                         if model && !free {
-                            grown += ci.n;
+                            grown += sn;
                         }
                         if maxdup > 0 {
                             *dup.entry(cs.clone()).or_default() += 1;
