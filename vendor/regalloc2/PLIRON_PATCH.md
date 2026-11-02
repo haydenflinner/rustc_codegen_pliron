@@ -58,3 +58,44 @@ halves the weight of rematerializable intervals.
 `src/lib.rs` hook (default `false`), `src/ion/merge.rs`: blockparams of
 the named block are not merged with their inputs, so the live-range
 split Cranelift's `shrink_split` makes at the save block survives.
+
+## `set_explain` / `explain!` (runtime, debug): why a value was spilled
+
+`src/lib.rs` (thread-local flag, `explain!` macro), `src/ion/process.rs`
+(`explain_bundle`, events in `process_bundle`, `split_and_requeue_bundle`,
+`split_into_minimal_bundles`): with the flag set, every bundle processed,
+register granted, eviction, split decision (with the cheapest conflict
+set and its weights), requirement conflict, split point and minimal-bundle
+fallback prints a `ra2x:` line naming the bundle's vregs, its code range,
+use count, spill weight and loop depth. Cranelift re-exports
+`set_explain`; pliron sets it from `PLIRON_RA_EXPLAIN=<symbol substring>`
+and also dumps that function's pre-regalloc VCode, so a vreg in the log
+can be matched to its instructions.
+
+## `PLIRON_RA2_LOOPDEPTH=1` (runtime, opt-in): dominance-checked back edges
+
+`src/cfg.rs`: `approx_loop_depth` counted every edge to an earlier block
+as a loop back edge. Cranelift lays cold blocks out last, and cold paths
+that rejoin hot code look like back edges: regex's `next_state` reached
+"depth" 16, use weights (`1000 * 4^depth`) hit the bundle weight cap
+(12 bundles at exactly 26843545), and ties decided which hot value kept a
+register. Under the flag only an edge to a block that dominates its
+source counts (max depth 6, no capped bundles). The back edges are also
+recorded (`CFGInfo::back_edges`).
+
+## `PLIRON_RA2_LOOPSPLIT=1` (runtime, opt-in): split at the hottest use's cycle
+
+`src/ion/process.rs` `process_bundle`: when a bundle must split, find the
+innermost cycle around its hottest use (the shortest recorded back edge
+`u -> h` with `h <= use block <= u`) and split at that cycle's entry
+(bundle starts before it) or exit (bundle starts inside and runs past
+it), without trimming the loop piece to its uses. regalloc2 otherwise
+splits at the conflict point, re-splits the remainder at its own start,
+peels one use at a time and falls back to per-use reloads: pulldown's
+byte-scan loop reloaded its LUT pointer (and with the depth fix alone,
+its length) from the stack every byte, because they are live across the
+special-byte handler's calls. With both flags the loop is
+`ldrb; ldrb; cbnz; add; cmp; b.lo` with everything in caller-saved
+registers, LLVM's shape. Loops sharing a header (the scan loop and the
+handler both jump back to it) have one depth; the shortest back edge
+still separates them.

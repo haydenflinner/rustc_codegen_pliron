@@ -30,6 +30,51 @@ macro_rules! trace {
     };
 }
 
+// PLIRON: `explain!` prints allocation decisions (splits, evictions,
+// minimal-bundle fallbacks) for the function being allocated on this
+// thread when `set_explain(true)` was called for it (Cranelift sets it
+// from `PLIRON_RA_EXPLAIN=<symbol substring>`).
+#[cfg(feature = "std")]
+std::thread_local! {
+    static EXPLAIN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// PLIRON: turn allocation-decision logging on or off for this thread.
+pub fn set_explain(on: bool) {
+    #[cfg(feature = "std")]
+    EXPLAIN.with(|e| e.set(on));
+    #[cfg(not(feature = "std"))]
+    let _ = on;
+}
+
+/// PLIRON: is allocation-decision logging on for this thread?
+pub fn explain_on() -> bool {
+    #[cfg(feature = "std")]
+    return EXPLAIN.with(|e| e.get());
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_LOOPSPLIT=1` (opt-in): split a bundle at the
+/// boundaries of the loop around its conflict (see `process_bundle`).
+pub(crate) fn loopsplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_LOOPSPLIT").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+macro_rules! explain {
+    ($($tt:tt)*) => {
+        if $crate::explain_on() {
+            std::eprintln!("ra2x: {}", format_args!($($tt)*));
+        }
+    };
+}
+
 macro_rules! trace_enabled {
     () => {
         cfg!(feature = "trace-log") && ::log::log_enabled!(::log::Level::Trace)

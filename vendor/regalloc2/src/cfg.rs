@@ -37,6 +37,10 @@ pub struct CFGInfo {
     /// indices. Otherwise, it will be approximate, but should still
     /// be usable for heuristic purposes.
     pub approx_loop_depth: Vec<u32>,
+    /// PLIRON: back edges `(header, source)` by block index (dominance-checked
+    /// under `PLIRON_RA2_LOOPDEPTH=1`), for `PLIRON_RA2_LOOPSPLIT`'s
+    /// innermost-cycle split.
+    pub back_edges: Vec<(u32, u32)>,
 }
 
 impl CFGInfo {
@@ -75,6 +79,8 @@ impl CFGInfo {
             .block_exit
             .repopulate(nb, ProgPoint::before(Inst::invalid()));
         let (backedge_in, backedge_out) = ctx.backedge.repopulate(nb * 2, 0).split_at_mut(nb);
+        let mut back_edges = core::mem::take(&mut self.back_edges);
+        back_edges.clear();
 
         for block in 0..f.num_blocks() {
             let block = Block::new(block);
@@ -117,14 +123,26 @@ impl CFGInfo {
                 }
             }
 
+            // PLIRON `PLIRON_RA2_LOOPDEPTH=1`: only an edge to a block that
+            // dominates its source is a loop back edge. Cranelift lays cold
+            // blocks out last, and a cold path rejoining the hot code earlier
+            // looked like a back edge: regex's `next_state` reached "depth"
+            // 12, every use weight saturated at the bundle cap, and ties
+            // decided which hot value kept a register.
+            let true_back = loopdepth_on();
             for &succ in f.block_succs(block) {
-                if succ.index() <= block.index() {
+                if succ.index() <= block.index()
+                    && (!true_back
+                        || domtree::dominates(&self.domtree[..], succ, block))
+                {
                     backedge_in[succ.index()] += 1;
                     backedge_out[block.index()] += 1;
+                    back_edges.push((succ.index() as u32, block.index() as u32));
                 }
             }
         }
 
+        self.back_edges = back_edges;
         let approx_loop_depth = self.approx_loop_depth.cleared();
         let mut backedge_stack: SmallVec<[u32; 4]> = smallvec![];
         let mut cur_depth = 0;
@@ -152,4 +170,16 @@ impl CFGInfo {
     pub fn dominates(&self, a: Block, b: Block) -> bool {
         domtree::dominates(&self.domtree[..], a, b)
     }
+}
+
+/// PLIRON: `PLIRON_RA2_LOOPDEPTH=1` (opt-in): dominance-checked back edges
+/// for `approx_loop_depth`.
+fn loopdepth_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_LOOPDEPTH").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
 }

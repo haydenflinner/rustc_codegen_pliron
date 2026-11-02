@@ -235,6 +235,10 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_OPT_BISECT=N`, `PLIRON_OPT_BISECT_DEBUG=1` — transform budget.
 - `PLIRON_PAR=0|N` — lowering threads.
 - `PLIRON_VERIFY=1|full` — Cranelift verifier after the pipeline / each step.
+- `PLIRON_RA_EXPLAIN=<symbol substring>` — regalloc2's decisions for
+  matching functions (`ra2x:` lines: splits, evictions, weights, loop
+  depth, minimal-bundle fallbacks) plus their pre-regalloc VCode, on
+  stderr. Use it before guessing why a value is reloaded in a loop.
 - `PLIRON_STATS=1`, `PLIRON_TIMING=1`, `PLIRON_FACTS=<substr>`,
   `PLIRON_CLIF=<substr>`, `PLIRON_DUMP=1` / `PLIRON_DUMP_OPT=1` (pliron
   IR before/after IR passes).

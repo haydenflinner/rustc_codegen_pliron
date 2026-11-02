@@ -64,7 +64,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     let ra2_verbose =
         *RA2_VERBOSE.get_or_init(|| std::env::var_os("PLIRON_RA2_VERBOSE").is_some());
     let ra2_edits = *RA2_EDITS.get_or_init(|| std::env::var_os("PLIRON_RA2_EDITS").is_some());
-    if prevcode_match {
+    if prevcode_match || regalloc2::explain_on() {
         eprintln!("==== prevcode {} ====\n{:?}", f.name, vcode);
     }
 

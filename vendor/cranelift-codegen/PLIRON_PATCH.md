@@ -1170,3 +1170,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `aarch64/inst/mod.rs`). Across 3 function orders x 4 stack pads:
     loop heads at 32/64 cost regex 2.5%/4% (NOPs on inner-loop entry);
     64-byte functions are within noise.
+97. regalloc2 decision logging hook (debug): `lib.rs` re-exports
+    `regalloc2::set_explain` as `ra_set_explain`; `machinst/compile.rs`
+    dumps the pre-regalloc VCode when regalloc2's explain flag is set, so
+    pliron's `PLIRON_RA_EXPLAIN=<symbol substring>` shows a function's
+    VCode next to its allocation decisions (vendored regalloc2 patch log).

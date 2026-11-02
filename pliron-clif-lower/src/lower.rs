@@ -1079,6 +1079,13 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     if sh.dbg {
         dbg_const_srclocs(&mut clctx.func);
     }
+    // `PLIRON_RA_EXPLAIN=<symbol substring>`: log regalloc2's split and
+    // evict decisions for matching functions (stderr, `ra2x:` lines).
+    let explain = crate::env_get("PLIRON_RA_EXPLAIN").is_some_and(|p| n.contains(p));
+    if explain {
+        eprintln!("ra2x: ==== {n} ====");
+        cranelift_codegen::ra_set_explain(true);
+    }
     // r[impl clif.lower.vecretry]
     let mut vec_retry = 0;
     let defr = loop {
@@ -1136,6 +1143,9 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         }
         break defr;
     };
+    if explain {
+        cranelift_codegen::ra_set_explain(false);
+    }
     drop(_scomp);
     *j.stats.timing.entry("*compile*").or_default() += tcomp.elapsed();
     pliron_cfg::trace("*compile*", tcomp.elapsed().as_secs_f64() * 1e3, n);

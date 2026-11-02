@@ -463,6 +463,7 @@ impl<'a, F: Function> Env<'a, F> {
         trace!(
             "split bundle {bundle:?} at {split_at:?} and requeue with reg hint (for first part) {hint:?}"
         );
+        explain!("  split-requeue {} at inst {}", self.explain_bundle(bundle), split_at.inst().index());
 
         // Split `bundle` at `split_at`, creating new LiveRanges and
         // bundles (and updating vregs' linked lists appropriately),
@@ -862,6 +863,7 @@ impl<'a, F: Function> Env<'a, F> {
     /// registers just at uses/defs and moves the "spilled" value
     /// into/out of them immediately.
     pub fn split_into_minimal_bundles(&mut self, bundle: LiveBundleIndex, hint: PReg) {
+        explain!("  minimal-split {}", self.explain_bundle(bundle));
         assert_eq!(self.ctx.scratch_removed_lrs_vregs.len(), 0);
         self.ctx.scratch_removed_lrs.clear();
 
@@ -1030,11 +1032,13 @@ impl<'a, F: Function> Env<'a, F> {
             hint = PReg::invalid();
         }
         trace!("process_bundle: bundle {bundle:?} hint {hint:?}");
+        explain!("process {}", self.explain_bundle(bundle));
 
         let req = match self.compute_requirement(bundle) {
             Ok(req) => req,
             Err(conflict) => {
                 trace!("conflict!: {:?}", conflict);
+                explain!("  requirement conflict {:?}", conflict);
                 // We have to split right away. We'll find a point to
                 // split that would allow at least the first half of the
                 // split to be conflict-free.
@@ -1148,6 +1152,7 @@ impl<'a, F: Function> Env<'a, F> {
                     &mut scratch,
                 ) {
                     AllocRegResult::Allocated(alloc) => {
+                        explain!("  -> {:?} gets {:?}", bundle, alloc);
                         self.ctx.output.stats.process_bundle_reg_success_any += 1;
                         trace!(" -> allocated to any {:?}", preg_idx);
                         self.ctx.spillsets[self.ctx.bundles[bundle].spillset].hint =
@@ -1342,6 +1347,20 @@ impl<'a, F: Function> Env<'a, F> {
                     " -> deciding to split: our spill weight is {}",
                     self.bundle_spill_weight(bundle)
                 );
+                if crate::explain_on() {
+                    let conf: alloc::vec::Vec<alloc::string::String> = lowest_cost_evict_conflict_set
+                        .iter()
+                        .map(|&b| self.explain_bundle(b))
+                        .collect();
+                    explain!(
+                        "  -> split {:?} (w={}) at {:?}; cheapest conflict set cost {:?}: {:?}",
+                        bundle,
+                        our_spill_weight,
+                        lowest_cost_split_conflict_point,
+                        lowest_cost_evict_conflict_cost,
+                        conf
+                    );
+                }
                 let bundle_start = self.ctx.bundles[bundle].ranges[0].range.from;
                 let mut split_at_point =
                     core::cmp::max(lowest_cost_split_conflict_point, bundle_start);
@@ -1366,11 +1385,68 @@ impl<'a, F: Function> Env<'a, F> {
                     }
                 }
 
+                // PLIRON `PLIRON_RA2_LOOPSPLIT=1`: isolate the loop around
+                // the conflict. A bundle that starts before the loop splits
+                // at its entry (as above); one that starts inside it but
+                // runs past it splits at its exit, so the in-loop piece is
+                // a dense bundle of its own. Without this the remainder
+                // keeps re-splitting at its own start, peels one use at a
+                // time and falls back to per-use reloads inside the loop
+                // (regex's `exec_byte` byte, pulldown's closure state).
+                let mut loop_split = false;
+                if crate::loopsplit_on() {
+                    // Isolate the innermost cycle around the bundle's
+                    // hottest use: the shortest back edge `u -> h` with
+                    // `h <= use block <= u`, over all uses. Not the cycle
+                    // around the conflict: pulldown's byte-scan LUT pointer
+                    // conflicts in the special-byte handler but is used only
+                    // in the three-block scan loop. Loops sharing a header
+                    // (that scan loop and the handler both jump back to it)
+                    // have one depth; the shortest back edge still separates
+                    // them.
+                    let cfg = &self.ctx.cfginfo;
+                    let nb = cfg.approx_loop_depth.len();
+                    let bundle_end = self.ctx.bundles[bundle].ranges.last().unwrap().range.to;
+                    let mut best: Option<(u32, u32)> = None;
+                    for entry in &self.ctx.bundles[bundle].ranges {
+                        for u in &self.ctx.ranges[entry.index].uses {
+                            let ub = cfg.insn_block[u.pos.inst().index()].index() as u32;
+                            if let Some(&e) = cfg
+                                .back_edges
+                                .iter()
+                                .filter(|&&(h, s)| h <= ub && ub <= s)
+                                .min_by_key(|&&(h, s)| s - h)
+                            {
+                                if best.is_none_or(|(bh, bs)| e.1 - e.0 < bs - bh) {
+                                    best = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    if let Some((h, u)) = best {
+                        let region_start = cfg.block_entry[h as usize];
+                        if bundle_start < region_start && region_start < bundle_end {
+                            split_at_point = region_start;
+                            loop_split = true;
+                        } else if (u as usize) + 1 < nb {
+                            let region_end = cfg.block_entry[u as usize + 1];
+                            if bundle_start < region_end && region_end < bundle_end {
+                                split_at_point = region_end;
+                                loop_split = true;
+                            }
+                        }
+                        explain!("  loopsplit {:?}: hottest-use cycle blocks {h}..={u}, split at {:?}", bundle, split_at_point);
+                    }
+                }
+
+                // A loop piece keeps its whole span: trimming it to its uses
+                // would drop the register across the back edge and reload
+                // it every iteration anyway.
                 self.split_and_requeue_bundle(
                     bundle,
                     split_at_point,
                     requeue_with_reg,
-                    /* should_trim = */ true,
+                    /* should_trim = */ !loop_split,
                 );
 
                 // Success, return scratch memory to context and finish
@@ -1380,6 +1456,7 @@ impl<'a, F: Function> Env<'a, F> {
                 self.ctx.output.stats.evict_bundle_event += 1;
                 for &bundle in &lowest_cost_evict_conflict_set {
                     trace!(" -> evicting {:?}", bundle);
+                    explain!("  -> evict {}", self.explain_bundle(bundle));
                     self.evict_bundle(bundle);
                     self.ctx.output.stats.evict_bundle_count += 1;
                 }
@@ -1423,5 +1500,37 @@ fn minimal_range_for_use(u: &Use) -> CodeRange {
             from: early,
             to: next_early,
         },
+    }
+}
+
+impl<'a, F: Function> Env<'a, F> {
+    /// PLIRON explain: `bundle(vregs) [from..to) w=weight depth=d..d`.
+    pub(crate) fn explain_bundle(&self, bundle: LiveBundleIndex) -> alloc::string::String {
+        let ranges = &self.ctx.bundles[bundle].ranges;
+        let mut vregs: alloc::vec::Vec<usize> = ranges
+            .iter()
+            .map(|e| self.ctx.ranges[e.index].vreg)
+            .filter(|v| v.is_valid())
+            .map(|v| v.index())
+            .collect();
+        vregs.sort_unstable();
+        vregs.dedup();
+        let (from, to) = match (ranges.first(), ranges.last()) {
+            (Some(a), Some(b)) => (a.range.from.inst().index(), b.range.to.inst().index()),
+            _ => (0, 0),
+        };
+        let nuses: usize = ranges.iter().map(|e| self.ctx.ranges[e.index].uses.len()).sum();
+        let depth = |i: usize| {
+            let i = i.min(self.ctx.cfginfo.insn_block.len().saturating_sub(1));
+            self.ctx.cfginfo.approx_loop_depth[self.ctx.cfginfo.insn_block[i].index()]
+        };
+        alloc::format!(
+            "{bundle:?}(v{:?}) [{from}..{to}) uses={nuses} w={} min={} depth {}..{}",
+            vregs,
+            self.ctx.bundles[bundle].cached_spill_weight(),
+            self.minimal_bundle(bundle),
+            depth(from),
+            depth(to.saturating_sub(1)),
+        )
     }
 }

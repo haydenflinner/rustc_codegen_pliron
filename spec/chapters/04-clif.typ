@@ -693,7 +693,12 @@ only the consumer of the optimized CLIF differs.
   keep a register; `RA2_LINEAR=1` restores upstream behaviour.
   `PLIRON_RA2_XBLOCK=1` (default off) MAY keep the redundant-move
   eliminator's state across a block boundary whose successor has the
-  previous block as its only predecessor.
+  previous block as its only predecessor. `PLIRON_RA2_LOOPDEPTH=1`
+  (default off) MAY count only dominance-checked back edges for loop
+  depth, and `PLIRON_RA2_LOOPSPLIT=1` (default off) MAY split a bundle at
+  the entry or exit of the innermost cycle around its hottest use; both
+  change only which valid allocation is chosen (checked by
+  `PLIRON_RA_CHECK=1`).
 ]
 
 #llvm(kind: "choice", summary: [Register allocation is Cranelift's regalloc2 (with a patched spill weight), not LLVM's greedy allocator; frames are larger.])[
