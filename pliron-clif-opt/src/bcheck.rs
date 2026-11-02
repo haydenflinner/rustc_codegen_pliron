@@ -1018,6 +1018,16 @@ pub(crate) fn clone_region(
     region: &FxHashSet<Block>,
     fold: &FxHashMap<Inst, usize>,
 ) -> FxHashMap<Block, Block> {
+    clone_region_vm(func, h, region, fold).0
+}
+
+/// `clone_region`, also returning the value map (original -> clone).
+fn clone_region_vm(
+    func: &mut Function,
+    h: Block,
+    region: &FxHashSet<Block>,
+    fold: &FxHashMap<Inst, usize>,
+) -> (FxHashMap<Block, Block>, FxHashMap<Value, Value>) {
     let rpo = {
         let mut seen = FxHashSet::default();
         let mut post = Vec::new();
@@ -1106,7 +1116,7 @@ pub(crate) fn clone_region(
             }
         }
     }
-    bmap
+    (bmap, vmap)
 }
 
 /// Redirect every entry edge in `entries` to `g`, keeping its args.
@@ -2265,6 +2275,12 @@ fn unswitch_loop(
     }
     let params = func.dfg.block_params(h).to_vec();
     let Some(region) = closed_region(func, cfg, &body) else {
+        if pliron_cfg::env_is("PLIRON_UNSWITCH_LOOP", "1") {
+            let k = unswitch_loop_only(func, cfg, dt, h, &body, &entries, &backs, name, debug, seen);
+            if k > 0 {
+                return k;
+            }
+        }
         bail!("region too big");
     };
     // A `brif c` at a body-block end with loop-invariant `c`, dominating
@@ -2442,6 +2458,314 @@ fn unswitch_loop(
     if debug {
         if pliron_cfg::tracing_on() {
             tracing::debug!(target: "pliron::unswitch", "unswitch {name}: block{} unswitched", h.as_u32())
+        };
+    }
+    1
+}
+
+/// Remove blocks unreachable from the entry, keeping any a surviving
+/// block still references (see `unswitch_loop`'s sweep).
+fn sweep_unreachable(func: &mut Function) {
+    let cfg2 = ControlFlowGraph::with_function(func);
+    let mut live: FxHashSet<Block> = FxHashSet::default();
+    if let Some(e) = func.layout.entry_block() {
+        let mut stack = vec![e];
+        while let Some(b) = stack.pop() {
+            if !live.insert(b) {
+                continue;
+            }
+            for s in cfg2.succ_iter(b) {
+                stack.push(s);
+            }
+        }
+    }
+    let mut dead: FxHashSet<Block> = func.layout.blocks().filter(|b| !live.contains(b)).collect();
+    let uses = crate::uses::Uses::new(func);
+    loop {
+        let keep: Vec<Block> = dead
+            .iter()
+            .copied()
+            .filter(|d| {
+                cfg2.pred_iter(*d).any(|p| !dead.contains(&p.block))
+                    || func
+                        .dfg
+                        .block_params(*d)
+                        .iter()
+                        .chain(func.layout.block_insts(*d).flat_map(|i| func.dfg.inst_results(i)))
+                        .any(|&v| {
+                            uses.sites(func.dfg.resolve_aliases(v))
+                                .iter()
+                                .any(|(b, _)| !dead.contains(b))
+                        })
+            })
+            .collect();
+        if keep.is_empty() {
+            break;
+        }
+        for d in keep {
+            dead.remove(&d);
+        }
+    }
+    for b in dead {
+        func.layout.remove_block_and_insts(b);
+    }
+}
+
+/// `PLIRON_UNSWITCH_LOOP=1`: unswitch by cloning only the loop body when
+/// its closed region is too big, repairing SSA for values the loop
+/// defines and later code uses (docs/loop-unswitch-pressure.md section 3).
+/// regex's `exec_byte` re-tests the invariant `b == EOF` per `Bytes`
+/// state in a loop followed by the rest of `next_state`.
+// r[impl clif.unswitch.loop]
+#[allow(clippy::too_many_arguments)]
+fn unswitch_loop_only(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    body: &FxHashSet<Block>,
+    entries: &[Edge],
+    backs: &[Edge],
+    name: &str,
+    debug: bool,
+    seen: &mut FxHashSet<Block>,
+) -> usize {
+    const MAX_ESCAPING: usize = 16;
+    const MAX_OUT_USES: usize = 64;
+    macro_rules! bail {
+        ($why:expr) => {{
+            if debug {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::unswitch", "unswitch-loop {name} block{}: {}", h.as_u32(), $why)
+                };
+            }
+            return 0;
+        }};
+    }
+    let invc = |func: &Function, v: Value| -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if iconst(func, v).is_some() {
+            return false;
+        }
+        match def_block(func, v) {
+            Some(b) if b == h => {
+                if let cranelift_codegen::ir::ValueDef::Param(_, n) = func.dfg.value_def(v) {
+                    backs.iter().all(|e| edge_arg(func, e, n).is_some_and(|a| a == v))
+                } else {
+                    false
+                }
+            }
+            Some(b) => !body.contains(&b),
+            None => true,
+        }
+    };
+    // Candidate: per-iteration first, else any invariant brif in the body.
+    let mut cond: Option<Value> = None;
+    for pass in 0..2 {
+        for b in func.layout.blocks().filter(|b| body.contains(b)) {
+            let Some(t) = func.layout.last_inst(b) else { continue };
+            if pass == 0
+                && !backs
+                    .iter()
+                    .all(|e| dt.block_dominates(b, func.layout.inst_block(e.inst).unwrap()))
+            {
+                continue;
+            }
+            if let InstructionData::Brif { arg, .. } = func.dfg.insts[t]
+                && invc(func, arg)
+            {
+                cond = Some(func.dfg.resolve_aliases(arg));
+                break;
+            }
+        }
+        if cond.is_some() {
+            break;
+        }
+    }
+    let Some(cond) = cond else {
+        bail!("no invariant brif");
+    };
+    // Exits must be plain branches (their targets may gain params).
+    for &b in body {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        let leaves = func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .iter()
+            .any(|bc| !body.contains(&bc.block(&func.dfg.value_lists)));
+        // Jump-table entries are BlockCalls like any other (the clone gets
+        // its own tables); exception edges can't take extra args.
+        if leaves
+            && !matches!(
+                func.dfg.insts[t],
+                InstructionData::Jump { .. } | InstructionData::Brif { .. } | InstructionData::BranchTable { .. }
+            )
+        {
+            bail!("exit through an exception table");
+        }
+    }
+    // Values defined in the body and used outside it.
+    let uses = crate::uses::Uses::new(func);
+    let mut escaping: Vec<(Value, Vec<(Block, Inst)>)> = Vec::new();
+    let mut nuses = 0usize;
+    for &b in body {
+        let defs: Vec<Value> = func
+            .dfg
+            .block_params(b)
+            .iter()
+            .copied()
+            .chain(func.layout.block_insts(b).flat_map(|i| func.dfg.inst_results(i).to_vec()))
+            .collect();
+        for v in defs {
+            let out: Vec<(Block, Inst)> =
+                uses.sites(v).iter().copied().filter(|(u, _)| !body.contains(u)).collect();
+            if !out.is_empty() {
+                nuses += out.len();
+                escaping.push((v, out));
+            }
+        }
+    }
+    if escaping.len() > MAX_ESCAPING || nuses > MAX_OUT_USES {
+        bail!("too many escaping values");
+    }
+    // Blocks between the exits and the uses: backward from each use block,
+    // stopping at body predecessors. Every one must be entered by plain
+    // branches (it may gain a param).
+    let mut between: FxHashSet<Block> = FxHashSet::default();
+    let mut stack: Vec<Block> = escaping.iter().flat_map(|(_, s)| s.iter().map(|&(u, _)| u)).collect();
+    while let Some(b) = stack.pop() {
+        if body.contains(&b) || !between.insert(b) {
+            continue;
+        }
+        if between.len() > 512 {
+            bail!("repair region too big");
+        }
+        for p in cfg.pred_iter(b) {
+            if !matches!(
+                func.dfg.insts[p.inst],
+                InstructionData::Jump { .. } | InstructionData::Brif { .. } | InstructionData::BranchTable { .. }
+            ) {
+                bail!("repair block entered by an exception edge");
+            }
+            if !body.contains(&p.block) {
+                stack.push(p.block);
+            }
+        }
+    }
+    // Clone; fold the candidate (and every brif on it) to true in the
+    // clone, false in the original.
+    let mut fold: FxHashMap<Inst, usize> = FxHashMap::default();
+    for &b in body {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        if let InstructionData::Brif { arg, .. } = func.dfg.insts[t]
+            && func.dfg.resolve_aliases(arg) == cond
+        {
+            fold.insert(t, 0);
+        }
+    }
+    let params = func.dfg.block_params(h).to_vec();
+    let g = func.dfg.make_block();
+    let pb = func.layout.inst_block(entries[0].inst).unwrap();
+    func.layout.insert_block_after(g, pb);
+    let gp: Vec<Value> = params
+        .iter()
+        .map(|&p| {
+            let t = func.dfg.value_type(p);
+            func.dfg.append_block_param(g, t)
+        })
+        .collect();
+    let gcond = match func.dfg.value_def(cond) {
+        cranelift_codegen::ir::ValueDef::Param(b, n) if b == h => gp[n],
+        _ => cond,
+    };
+    let (bmap, vmap) = clone_region_vm(func, h, body, &fold);
+    let cbody: FxHashSet<Block> = bmap.values().copied().collect();
+    for &b in body {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        if !fold.contains_key(&t) {
+            continue;
+        }
+        let bc = func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[1];
+        let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+        let d = bc.block(&func.dfg.value_lists);
+        func.layout.remove_inst(t);
+        let mut pos = FuncCursor::new(func).at_bottom(b);
+        pos.ins().jump(d, &args);
+    }
+    retarget_entries(func, entries, g);
+    let gpargs: Vec<BlockArg> = gp.iter().map(|&v| BlockArg::from(v)).collect();
+    let hc = bmap[&h];
+    seen.insert(hc);
+    let mut pos = FuncCursor::new(func).at_bottom(g);
+    pos.ins().brif(gcond, hc, &gpargs, h, &gpargs);
+    // SSA repair (Braun et al. over the complete CFG): a `between` block
+    // with one predecessor reads through it; with several it gets a param,
+    // fed `v` from the original body, `v'` from the clone, else the
+    // predecessor's value.
+    let cfg2 = ControlFlowGraph::with_function(func);
+    for (v, sites) in &escaping {
+        let v = *v;
+        let vc = vmap.get(&v).copied().unwrap_or(v);
+        let ty = func.dfg.value_type(v);
+        let mut val: FxHashMap<Block, Value> = FxHashMap::default();
+        // Params first, so cycles resolve.
+        let multi: Vec<Block> = between
+            .iter()
+            .copied()
+            .filter(|&b| cfg2.pred_iter(b).count() > 1)
+            .collect();
+        for &b in &multi {
+            let p = func.dfg.append_block_param(b, ty);
+            val.insert(b, p);
+        }
+        // Single-predecessor chains end in the body, the clone or a param.
+        let end = |val: &FxHashMap<Block, Value>, p: Block| -> Option<Value> {
+            if body.contains(&p) {
+                Some(v)
+            } else if cbody.contains(&p) {
+                Some(vc)
+            } else {
+                val.get(&p).copied()
+            }
+        };
+        for _ in 0..between.len() + 1 {
+            let mut progress = false;
+            for &b in &between {
+                if val.contains_key(&b) {
+                    continue;
+                }
+                if let Some(p) = cfg2.pred_iter(b).next()
+                    && let Some(x) = end(&val, p.block)
+                {
+                    val.insert(b, x);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        for &b in &multi {
+            for p in cfg2.pred_iter(b) {
+                let a = end(&val, p.block).unwrap_or(v);
+                let dfg = &mut func.dfg;
+                for bc in dfg.insts[p.inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+                    if bc.block(&dfg.value_lists) == b {
+                        bc.append_argument(a, &mut dfg.value_lists);
+                    }
+                }
+            }
+        }
+        for &(u, i) in sites {
+            let Some(&nv) = val.get(&u) else { continue };
+            let names: Vec<Value> =
+                func.dfg.inst_values(i).filter(|&x| func.dfg.resolve_aliases(x) == v).collect();
+            func.dfg.map_inst_values(i, |x| if names.contains(&x) { nv } else { x });
+        }
+    }
+    sweep_unreachable(func);
+    if debug {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::unswitch", "unswitch-loop {name}: block{} unswitched ({} escaping)", h.as_u32(), escaping.len())
         };
     }
     1
