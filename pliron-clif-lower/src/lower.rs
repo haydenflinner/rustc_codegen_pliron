@@ -409,6 +409,15 @@ pub fn fminmax_on() -> bool {
     crate::env_is("PLIRON_FMINMAX", "1")
 }
 
+/// A CFG edge to a block that dominates its source: the function loops.
+fn has_back_edge(f: &ir::Function) -> bool {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
+    let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(f, &cfg);
+    f.layout.blocks().any(|b| {
+        cfg.succ_iter(b).any(|s| dt.block_dominates(s, b))
+    })
+}
+
 // r[impl native.obj.writer]
 // r[impl native.obj.order]
 // r[impl native.obj.sections]
@@ -1898,7 +1907,26 @@ pub fn lower_module<'a>(
     // can define the helper (nothing in the Rust runtime provides it).
     let mut needs_pshufb = false;
     let mut dbg_fns = Vec::new();
-    for j in &jobs {
+    // `PLIRON_FNORDER=1` (opt-in): emit functions with a loop first and
+    // `#[cold]` ones last, each group in declaration order, so the hot
+    // code of a CGU sits together in the text section (ld64 and the ELF
+    // linkers keep an object's function order). Placement otherwise
+    // follows declaration order, which mixes hot loops with cold paths.
+    let mut emit: Vec<usize> = (0..jobs.len()).collect();
+    if crate::env_is("PLIRON_FNORDER", "1") {
+        let class = |j: &FnJob| -> u8 {
+            if st.funcs.get(j.name.as_str()).is_some_and(|f| f.cold) {
+                2
+            } else if has_back_edge(&j.func) {
+                0
+            } else {
+                1
+            }
+        };
+        let keys: Vec<u8> = jobs.iter().map(class).collect();
+        emit.sort_by_key(|&i| keys[i]);
+    }
+    for j in emit.iter().map(|&i| &jobs[i]) {
         stats.merge(&j.stats);
         asm_stubs.extend(j.stubs.iter().copied());
         let Some(code) = &j.code else {
