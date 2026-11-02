@@ -634,6 +634,27 @@ fn run_loop(
 
     // Two rounds: results of moved instructions are themselves outside the
     // loop, so a second scan exposes dependents (e.g. `a+b` after `a`).
+    //
+    // `PLIRON_LICM_INNERPRESS=1`: in a loop with inner loops, a load used
+    // only outside them stays put. Hoisted, it lives across the inner
+    // loops for nothing: num-bigint-dig's `montgomery` hoisted six
+    // SmallVec field selects out of its outer loop, and one of its two
+    // inner multiply-accumulate loops then spilled its source pointer
+    // every iteration.
+    let inner_uses: Option<FxHashSet<Value>> = pliron_cfg::env_is("PLIRON_LICM_INNERPRESS", "1")
+        .then(|| {
+            let lvl = la.loop_level(h).level();
+            let mut used = FxHashSet::default();
+            for &b in &body {
+                if la.loop_level(b).level() > lvl {
+                    for i in func.layout.block_insts(b) {
+                        used.extend(func.dfg.inst_values(i).map(|v| func.dfg.resolve_aliases(v)));
+                    }
+                }
+            }
+            used
+        })
+        .filter(|u| !u.is_empty());
     for _ in 0..2 {
         let mut moved = 0;
         for &b in &body {
@@ -641,6 +662,13 @@ fn run_loop(
             for i in insts {
                 if n >= MAX_MOVES {
                     break;
+                }
+                if let Some(u) = &inner_uses
+                    && func.dfg.insts[i].opcode().can_load()
+                    && la.loop_level(b).level() == la.loop_level(h).level()
+                    && func.dfg.inst_results(i).iter().all(|r| !u.contains(r))
+                {
+                    continue;
                 }
                 if hoists(
                     func, ps, na, &inv, &writers, iso, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i,
