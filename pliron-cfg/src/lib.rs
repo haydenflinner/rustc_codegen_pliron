@@ -151,6 +151,9 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // Degraded cross-CGU copies inlining left called go back to the home
     // fn (2026-11-02, tuning geomean 0.996; `=0` off, `=all` every copy).
     ("PLIRON_XCGU_HOME", "1"),
+    // Single-site free inline threshold, x the inline limit (2026-11-02:
+    // pulldown's `parse_line` closure, 4,594 ops, inlines; pulldown -2%).
+    ("PLIRON_INLINE_FREEMUL", "12"),
 ];
 
 // r[impl par.cfg.once]
