@@ -544,6 +544,29 @@ Evening (2026-10-31):
      Apple's cores eliminate `mov` at rename, so copies are cheap here.
   Spills are the one item left that costs real work (stack refs 40 vs 21
   in `next_state`).
+- **Spills** (2026-11-01): `next_state`'s are cold (1 of 155 samples). Where
+  they cost: stack accesses plus the next instruction are 13% of pulldown's
+  samples vs LLVM's 6.5%, json ~5% of runtime; regex and blind-sig match.
+  They are ordinary values (pulldown value stores 46 vs 8 samples), not
+  constants, and not the spill weighting (upstream `RA2_LINEAR` changed
+  nothing). Two allocator weaknesses:
+  1. *Repeated reloads*: regalloc2 reloads before each use, often into a
+     fresh register (`handle_inline_pass1`: `[sp, #0x3c0]` into four
+     registers in a dozen instructions). Reload CSE at emission
+     (`PLIRON_RELOADCSE`, through single-predecessor blocks) turns 206 of
+     pulldown's stack loads into register moves; geomean 0.996 over six
+     layouts; checker-clean.
+  2. *Parked registers*: in pulldown's hot loops up to eight callee-saved
+     registers hold outer values unused inside, while the loop's
+     invariants spill (in-loop stack traffic 363 samples, 191 in loops
+     with parked registers). Splitting every bundle around a use-free
+     deeper loop span before allocation (`PLIRON_RA2_LOOPSPLIT`, not
+     landed) cut those to 215 / 107, but the pieces often land in
+     different registers: +3,116 moves, +4% code, geomean 1.006 (regex
+     +2.5%). A narrower trigger (split only when an in-loop conflict
+     occurs) is the next attempt.
+  json's extra traffic is mostly results returned through memory after
+  calls, a separate item.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
