@@ -793,6 +793,28 @@ Evening (2026-10-31):
     remaining sensitivity is which hot code and data alias, not
     alignment. Next: a cold text section (`#[cold]` and panic-only fns
     out of `__text` across all objects), and pads in every A/B.
+- **regex, warm loop by function** (2026-11-02, `scratchpad warm-rx`,
+  start..end looped, 1.14x LLVM like the held-out run): `next_state`
+  (with `exec_byte` inlined) 1496 vs 984 samples, `Utf8Sequences::next`
+  470 vs 269, `cached_state` 1725 vs 1537; `follow_epsilons` is even.
+  In `next_state`:
+  - the `for &ip in qcur` loop keeps `b: Byte` in a stack slot and
+    re-tests `b == EOF` per `Bytes` state; LLVM keeps the byte in w22 and
+    unswitches the test. The loop calls `follow_epsilons`, so everything
+    live across it needs a callee-saved register.
+  - the state-decode loop (`for ip in state.inst_ptrs() { qcur.insert(ip) }`)
+    reloads qcur's `dense` pointer, `sparse` pointer and length every
+    iteration; LLVM loads them once. Two blockers, in order: the dead
+    `Vec::push` grow call (`len < cap` asserted, then `len == cap`)
+    leaves qcur escaped -- `PLIRON_LICM_DOMCOND=1` folds it (verified in
+    the CLIF) -- and then INNERPRESS refuses the hoist (the varint inner
+    loop doesn't use the fields). With both (`DOMCOND=1 INNERPRESS=0`)
+    the reloads go (12 -> 0) but stack loads rise 15 -> 27 and the
+    varint loop grows `cmp`/`csel` triples (the iterator's `ptr == end`
+    select re-derived on the path where `cbnz` already proved it
+    false); no faster. Needs: selects folded under a dominating
+    `brif select(c, 0, p)` with `p` nonnull, and INNERPRESS limited to
+    loads whose loop has calls.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
