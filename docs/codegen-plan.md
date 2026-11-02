@@ -793,6 +793,17 @@ Evening (2026-10-31):
     remaining sensitivity is which hot code and data alias, not
     alignment. Next: a cold text section (`#[cold]` and panic-only fns
     out of `__text` across all objects), and pads in every A/B.
+- **pulldown, warm loop by function** (2026-11-02, `scratchpad warm-pd`,
+  `push_html` looped; 1.15x LLVM): escaping is even (`escape_html_scalar`
+  1544 vs 1631 samples). The excess is the special-byte scan with the
+  `parse_line` closure inlined (FREEMUL=12) plus `parse_block`: 1956 vs
+  LLVM's `parse_line` + `new_with_broken_link_callback` 1606; `Parser::next`
+  +130, `item_to_event` +99, and two scanners LLVM inlines
+  (`scan_nextline` 278, `scan_closing_code_fence` 262). The hottest
+  single spot (parse.rs:2853, 268 samples on one instruction) is a stack
+  reload heading the per-special-byte dispatch block, right after the
+  LUT test's branch: register pressure in the inlined closure, the same
+  pattern as regex's `exec_byte`.
 - **regex, warm loop by function** (2026-11-02, `scratchpad warm-rx`,
   start..end looped, 1.14x LLVM like the held-out run): `next_state`
   (with `exec_byte` inlined) 1496 vs 984 samples, `Utf8Sequences::next`
