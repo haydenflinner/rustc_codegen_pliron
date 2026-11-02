@@ -638,6 +638,10 @@ pub struct Analysis {
     pub(crate) cfg_builds: usize,
     pub(crate) dt_builds: usize,
     pub(crate) la_builds: usize,
+    /// (allocatable, callee-saved) integer registers of the target, for
+    /// pressure estimates (`PLIRON_LICM_INNERPRESS=2`); `None` outside the
+    /// pipeline (tests), where aarch64's are assumed.
+    pub regs: Option<(u32, u32)>,
     pub(crate) cfg_ns: u64,
     pub(crate) dt_ns: u64,
     pub(crate) la_ns: u64,
@@ -1503,6 +1507,10 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     }
     lt_probe(p, "start");
     let mut an = Analysis::default();
+    an.regs = Some(match p.isa.triple().architecture {
+        target_lexicon::Architecture::Aarch64(_) => (26, 10),
+        _ => (14, 5),
+    });
     // `-g` value labels name this CGU's variable pieces, and cache keys
     // don't see them: a hit would replay another function's labels.
     let labelled = p.clctx.func.dfg.values_labels.is_some();

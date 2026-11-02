@@ -480,6 +480,126 @@ fn hoists_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `PLIRON_LICM_INNERPRESS=2`: integer-class values live on entry to each
+/// block (live-in plus the block's params; `i128` counts two), from one
+/// sparse backward dataflow. `None` past the size cap. An estimate: it is
+/// computed once per `licm::run` and not updated as hoists happen
+/// (docs/loop-unswitch-pressure.md section 2).
+fn block_pressure(func: &Function, cfg: &ControlFlowGraph) -> Option<FxHashMap<Block, u32>> {
+    const MAX_BLOCKS: usize = 4000;
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    if blocks.len() > MAX_BLOCKS {
+        return None;
+    }
+    // Constants, symbol addresses and constant offsets don't hold a
+    // register across a loop: regalloc rematerializes the first two and
+    // lowering folds the last into addressing modes.
+    let free = |v: Value| -> bool {
+        let Some(i) = func.dfg.value_def(v).inst() else {
+            return false;
+        };
+        match func.dfg.insts[i] {
+            InstructionData::UnaryImm { .. } | InstructionData::UnaryGlobalValue { .. } => true,
+            InstructionData::Binary { opcode: Opcode::Iadd, args } => args.iter().any(|&a| {
+                func.dfg
+                    .value_def(func.dfg.resolve_aliases(a))
+                    .inst()
+                    .is_some_and(|d| matches!(func.dfg.insts[d], InstructionData::UnaryImm { .. }))
+            }),
+            _ => false,
+        }
+    };
+    let w = |v: Value| -> u32 {
+        let t = func.dfg.value_type(v);
+        if !t.is_int() || free(v) {
+            0
+        } else if t.bits() > 64 {
+            2
+        } else {
+            1
+        }
+    };
+    let mut uses: FxHashMap<Block, Vec<Value>> = FxHashMap::default();
+    let mut defs: FxHashMap<Block, FxHashSet<Value>> = FxHashMap::default();
+    for &b in &blocks {
+        let mut d: FxHashSet<Value> = func.dfg.block_params(b).iter().copied().collect();
+        let mut u: Vec<Value> = Vec::new();
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                if w(v) > 0 && !d.contains(&v) {
+                    u.push(v);
+                }
+            }
+            d.extend(func.dfg.inst_results(i).iter().copied());
+        }
+        u.sort_unstable();
+        u.dedup();
+        uses.insert(b, u);
+        defs.insert(b, d);
+    }
+    // Backward: visit blocks last-to-first in layout order, iterate to a
+    // fixpoint (bounded; an unconverged estimate only under-counts).
+    let mut live: FxHashMap<Block, FxHashSet<Value>> = FxHashMap::default();
+    for _ in 0..32 {
+        let mut changed = false;
+        for &b in blocks.iter().rev() {
+            let mut inn: FxHashSet<Value> = uses[&b].iter().copied().collect();
+            for s in cfg.succ_iter(b) {
+                if let Some(ls) = live.get(&s) {
+                    let d = &defs[&b];
+                    inn.extend(ls.iter().copied().filter(|v| !d.contains(v)));
+                }
+            }
+            if live.get(&b).is_none_or(|old| old.len() != inn.len()) {
+                changed = true;
+                live.insert(b, inn);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Peak inside each block, not just on entry: scan backward from the
+    // live-out set (the multiply-accumulate loops of montgomery keep their
+    // products and carries live only within the block; entry counts alone
+    // left room that wasn't there, and three hoists cost blind-sig 39%).
+    Some(
+        blocks
+            .iter()
+            .map(|&b| {
+                let mut cur: FxHashSet<Value> = FxHashSet::default();
+                for s in cfg.succ_iter(b) {
+                    if let Some(ls) = live.get(&s) {
+                        cur.extend(ls.iter().copied());
+                    }
+                }
+                let mut n: u32 = cur.iter().map(|&v| w(v)).sum();
+                let mut peak = n;
+                let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+                for &i in insts.iter().rev() {
+                    for &r in func.dfg.inst_results(i) {
+                        if cur.remove(&r) {
+                            n -= w(r);
+                        }
+                    }
+                    for v in func.dfg.inst_values(i) {
+                        let v = func.dfg.resolve_aliases(v);
+                        if w(v) > 0 && cur.insert(v) {
+                            n += w(v);
+                        }
+                    }
+                    // Results are live at the point after `i`; count them
+                    // together with the operands still needed.
+                    let res: u32 = func.dfg.inst_results(i).iter().map(|&r| w(r)).sum();
+                    peak = peak.max(n + res);
+                }
+                (b, peak)
+            })
+            .collect(),
+    )
+}
+
 fn run_loop(
     func: &mut Function,
     ps: &VMap<Value>,
@@ -499,6 +619,8 @@ fn run_loop(
     breg: &FxHashMap<Block, Region>,
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    press: &mut Option<Option<FxHashMap<Block, u32>>>,
+    regs: (u32, u32),
 ) -> usize {
     let h = la.loop_header(lp);
     // Exactly one branch destination in from outside.
@@ -641,7 +763,8 @@ fn run_loop(
     // SmallVec field selects out of its outer loop, and one of its two
     // inner multiply-accumulate loops then spilled its source pointer
     // every iteration.
-    let inner_uses: Option<FxHashSet<Value>> = pliron_cfg::env_is("PLIRON_LICM_INNERPRESS", "1")
+    let ip_mode = pliron_cfg::env_get("PLIRON_LICM_INNERPRESS").unwrap_or("0");
+    let inner_uses: Option<FxHashSet<Value>> = matches!(ip_mode, "1" | "2")
         .then(|| {
             let lvl = la.loop_level(h).level();
             let mut used = FxHashSet::default();
@@ -655,6 +778,52 @@ fn run_loop(
             used
         })
         .filter(|u| !u.is_empty());
+    // `=2`: such loads may still hoist while every inner loop has room
+    // (pressure + hoisted < budget; the budget is the callee-saved count
+    // when the inner loop calls). regex's state-decode loop keeps its
+    // `SparseSet` fields in registers around a tiny varint loop, where
+    // montgomery's crowded multiply loops still refuse.
+    // r[impl clif.licm.innerpress]
+    let mut room: u32 = 0;
+    if inner_uses.is_some() && ip_mode == "2" {
+        let pr = press.get_or_insert_with(|| block_pressure(func, cfg));
+        if let Some(pr) = pr {
+            let lvl = la.loop_level(h).level();
+            // Inner loop (the child of `lp` holding the block) -> (max pressure, calls).
+            let mut inner: FxHashMap<Loop, (u32, bool)> = FxHashMap::default();
+            for &b in &body {
+                if la.loop_level(b).level() <= lvl {
+                    continue;
+                }
+                let Some(mut c) = la.innermost_loop(b) else { continue };
+                while let Some(par) = la.loop_parent(c) {
+                    if par == lp {
+                        break;
+                    }
+                    c = par;
+                }
+                let e = inner.entry(c).or_insert((0, false));
+                e.0 = e.0.max(pr.get(&b).copied().unwrap_or(0));
+                e.1 |= func
+                    .layout
+                    .block_insts(b)
+                    .any(|i| func.dfg.insts[i].opcode().is_call());
+            }
+            room = inner
+                .values()
+                .map(|&(p, call)| {
+                    let budget = if call { regs.1 } else { regs.0.saturating_sub(2) };
+                    budget.saturating_sub(p)
+                })
+                .min()
+                .unwrap_or(0);
+            if debug {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::licm", "licm innerpress {:?}: inner {:?} room {room}", h, inner)
+                };
+            }
+        }
+    }
     for _ in 0..2 {
         let mut moved = 0;
         for &b in &body {
@@ -663,12 +832,16 @@ fn run_loop(
                 if n >= MAX_MOVES {
                     break;
                 }
+                let mut spends_room = false;
                 if let Some(u) = &inner_uses
                     && func.dfg.insts[i].opcode().can_load()
                     && la.loop_level(b).level() == la.loop_level(h).level()
                     && func.dfg.inst_results(i).iter().all(|r| !u.contains(r))
                 {
-                    continue;
+                    if room == 0 {
+                        continue;
+                    }
+                    spends_room = true;
                 }
                 if hoists(
                     func, ps, na, &inv, &writers, iso, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i,
@@ -708,6 +881,9 @@ fn run_loop(
                     func.layout.insert_inst(i, anchor.or(ph_inst).unwrap());
                     n += 1;
                     moved += 1;
+                    if spends_room {
+                        room -= 1;
+                    }
                 }
             }
         }
@@ -1535,6 +1711,8 @@ pub fn run(
     nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
     let mut la = LoopAnalysis::new();
+    let regs = an.regs.unwrap_or((26, 10));
+    let mut press: Option<Option<FxHashMap<Block, u32>>> = None;
     let (cfg, dt) = an.cfg_dt(func);
     la.compute(func, cfg, dt);
     let ps = &loadfwd::param_src(func);
@@ -1604,7 +1782,7 @@ pub fn run(
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
                 func, &ps, &stop, cfg, dt, &la, lp, iso_l, &escapes, deref, scoped_na, nw, nounwind, debug,
-                scoped, breg, rpar, ofz,
+                scoped, breg, rpar, ofz, &mut press, regs,
             )
         };
         n += n2;
