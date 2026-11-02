@@ -10,9 +10,9 @@ how to tell whether it worked.
 | suite | pliron / LLVM | note |
 |---|---|---|
 | our 19 kernels, native | ~0.91 | tuned against for three weeks |
-| 8 held-out programs, native (`bench/heldout`) | **1.15** | 1.57 on 2026-10-31 morning, 1.31 that evening |
-| of which tuned on | blake3 1.05, blind-sig 1.09, pulldown-cmark 1.19, regex 1.21, serde_json 1.17 | 2026-11-01 |
-| of which kept untouched | lol_html 1.21, flate2 1.34, prost 1.05 | the check set |
+| 8 held-out programs, native (`bench/heldout`) | **1.12** | 1.57 on 2026-10-31 morning, 1.31 that evening, 1.15 on 11-01 |
+| of which tuned on | blake3 1.06, blind-sig 1.07, pulldown-cmark 1.16, regex 1.13, serde_json 1.07 | 2026-11-02 (batch 46) |
+| of which kept untouched | lol_html 1.19, flate2 1.32, prost 1.01 | the check set; 11-02's fixes did not move them |
 
 The held-out number is the one that matters. The kernels say we can match
 LLVM on code shapes we have looked at; the held-out programs say how much
@@ -668,7 +668,11 @@ Evening (2026-10-31):
   LLVM's shape. Bisecting the copies fails to link (copies depend on
   each other: `is_ascii::runtime`); the ascii helpers alone do nothing.
   Next: find which copy unlocks the closure inline, or size copies by
-  their simplified body.
+  their simplified body. blind-sig's loss (warm loop 1.057 -> 1.117) is
+  not montgomery (slightly faster) but helpers going out of line:
+  `mac::long` replaces `mac_digit`, and `Cloned<Iter<u64>>` folds and
+  SmallVec `clone`/`extend`/`try_reserve` become calls. Extra local
+  copies change which callees look single-caller.
 - **blind-sig's real gap** (2026-11-02): the held-out binary times one
   ~2 ms sign; whole-process profiles (setup included) showed parity, so
   earlier montgomery analysis read the wrong code. A copy of the bench
