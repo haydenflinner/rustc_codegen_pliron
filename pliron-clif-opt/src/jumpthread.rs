@@ -3445,6 +3445,145 @@ fn bypass_forwarders(
     n
 }
 
+/// `v` with truth-preserving casts stripped: `uextend` keeps zero-ness,
+/// and `ireduce` of a `uextend` back to the source width is the source.
+fn truth_root(func: &Function, v: Value) -> Value {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Result(i, 0) = func.dfg.value_def(v) else { break };
+        match func.dfg.insts[i] {
+            InstructionData::Unary { opcode: Opcode::Uextend, arg } => {
+                v = func.dfg.resolve_aliases(arg);
+            }
+            InstructionData::Unary { opcode: Opcode::Ireduce, arg } => {
+                let a = func.dfg.resolve_aliases(arg);
+                match func.dfg.value_def(a) {
+                    ValueDef::Result(j, 0)
+                        if let InstructionData::Unary { opcode: Opcode::Uextend, arg: x } = func.dfg.insts[j]
+                            && func.dfg.value_type(x) == func.dfg.value_type(v) =>
+                    {
+                        v = func.dfg.resolve_aliases(x);
+                    }
+                    _ => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+/// The truth of `c` on entry to `x`, from a dominating `brif` on the same
+/// value: walk up through blocks with a single incoming edge until one
+/// leaves a two-way `brif` whose condition has `c`'s truth root. Returns
+/// the decision and the blocks walked.
+fn join_decided(func: &Function, cfg: &ControlFlowGraph, mut x: Block, c: Value) -> Option<(bool, Vec<Block>)> {
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        chain.push(x);
+        let mut it = cfg.pred_iter(x);
+        let e = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[e.inst] {
+            let (t, f) = (blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists));
+            if t != f && truth_root(func, arg) == c {
+                return Some((t == x, chain));
+            }
+        }
+        x = e.block;
+    }
+    None
+}
+
+/// Fold `brif c` where the path into its block already decided `c`, and
+/// thread `jump`s into a block that is nothing but `brif c` when the
+/// predecessor's path decided it (`PLIRON_JOINTHREAD`). An
+/// `Option`-returning helper inlined into a loop re-tests its tag where
+/// the loop's exits join (serde_json's `parse_whitespace`: `peek()`'s
+/// tag decides the loop, and the exit block tests it again for the
+/// caller's `match`); that test keeps the merged tag live past the merge
+/// block, so the merge itself can't be threaded. Each predecessor reached
+/// only through one arm of a `brif` on the same value goes straight to
+/// the decided successor. The test block has no params and no other
+/// insts, so the successor's args dominate it and hence every
+/// predecessor. Returns the branches folded plus the edges retargeted.
+pub fn thread_join_tests(func: &mut Function) -> usize {
+    let mut n = 0;
+    for _ in 0..4 {
+        let cfg = ControlFlowGraph::with_function(func);
+        let mut edits: Vec<(Inst, Block, bool)> = Vec::new();
+        let mut walked: FxHashSet<Block> = FxHashSet::default();
+        for b in func.layout.blocks() {
+            if !func.dfg.block_params(b).is_empty() {
+                continue;
+            }
+            let Some(term) = func.layout.first_inst(b) else { continue };
+            if func.layout.last_inst(b) != Some(term) {
+                continue;
+            }
+            let InstructionData::Brif { arg, .. } = func.dfg.insts[term] else { continue };
+            let c = truth_root(func, arg);
+            for e in cfg.pred_iter(b) {
+                if e.block == b || func.dfg.insts[e.inst].opcode() != Opcode::Jump {
+                    continue;
+                }
+                if let Some((k, chain)) = join_decided(func, &cfg, e.block, c) {
+                    walked.extend(chain);
+                    edits.push((e.inst, b, k));
+                }
+            }
+        }
+        // A block reached only through one arm of a `brif` on the same
+        // value (directly or down a single-edge chain) tests a decided
+        // condition: its own `brif` becomes a `jump`. Removing an edge
+        // never breaks another walk's single-edge premise.
+        let mut folds: Vec<(Inst, bool)> = Vec::new();
+        for b in func.layout.blocks() {
+            let Some(term) = func.layout.last_inst(b) else { continue };
+            let InstructionData::Brif { arg, .. } = func.dfg.insts[term] else { continue };
+            if let Some((k, _)) = join_decided(func, &cfg, b, truth_root(func, arg)) {
+                folds.push((term, k));
+            }
+        }
+        for &(term, taken) in &folds {
+            let InstructionData::Brif { blocks, .. } = func.dfg.insts[term] else { unreachable!() };
+            let d = blocks[if taken { 0 } else { 1 }];
+            let db = d.block(&func.dfg.value_lists);
+            let args: Vec<BlockArg> = d.args(&func.dfg.value_lists).collect();
+            func.replace(term).jump(db, &args);
+        }
+        if !folds.is_empty() {
+            n += folds.len();
+            continue;
+        }
+        // A retarget adds an edge into its destination; one landing in a
+        // block another decision walked through would break that walk's
+        // single-edge premise, so it waits for the next round.
+        let mut k = 0;
+        for (pi, b, taken) in edits {
+            let term = func.layout.last_inst(b).unwrap();
+            let InstructionData::Brif { blocks, .. } = func.dfg.insts[term] else { unreachable!() };
+            let d = blocks[if taken { 0 } else { 1 }];
+            let db = d.block(&func.dfg.value_lists);
+            if walked.contains(&db) {
+                continue;
+            }
+            let args: Vec<BlockArg> = d.args(&func.dfg.value_lists).collect();
+            let nbc = BlockCall::new(db, args, &mut func.dfg.value_lists);
+            let dfg = &mut func.dfg;
+            dfg.insts[pi].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[0] = nbc;
+            k += 1;
+        }
+        n += k;
+        if k == 0 {
+            break;
+        }
+    }
+    n
+}
+
 /// The icmp a branch condition tests, through `band 1` and extends of its 0/1 result.
 pub(crate) fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
     let env = FxHashMap::default();

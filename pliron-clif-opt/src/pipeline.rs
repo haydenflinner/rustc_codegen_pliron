@@ -2016,6 +2016,18 @@ fn s_mergechain(p: &mut Pipe, an: &mut Analysis) -> usize {
         }
         tt("dup1", t0);
     }
+    if cond && pliron_cfg::env_is("PLIRON_JOINTHREAD", "1") {
+        let t0 = prof2.then(std::time::Instant::now);
+        let k = jumpthread::thread_join_tests(&mut p.clctx.func);
+        if k > 0 {
+            // The bypassed test block's uses would still count as exports
+            // of the merge it tested (`rebind_exports` below).
+            jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+            n += k;
+            cd.stale();
+        }
+        tt("jointhread", t0);
+    }
     if cond && crate::pass_enabled("PLIRON_EDGESPEC2") {
         cd.stale();
         if crate::pass_enabled("PLIRON_REBIND") {
