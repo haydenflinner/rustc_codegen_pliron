@@ -815,6 +815,14 @@ Evening (2026-10-31):
     false); no faster. Needs: selects folded under a dominating
     `brif select(c, 0, p)` with `p` nonnull, and INNERPRESS limited to
     loads whose loop has calls.
+  - the `b == EOF` test is `v13 = icmp eq b, 256` at entry; the qcur
+    loop branches on it per `Bytes` state, and lowering re-derives it
+    from the spilled `b` each time. Unswitching skips it twice: the test
+    doesn't run every iteration (an opt-in "any invariant brif" variant
+    was tried), and the loop's closed region (everything after the
+    loop, which only the loop reaches) is "too big" to clone. LLVM
+    clones just the loop. Small win even if done: `b` stays live across
+    `follow_epsilons` for the byte compare.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
