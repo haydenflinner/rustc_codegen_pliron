@@ -162,3 +162,21 @@ All three are correct and tested but measure neutral; they stay opt-in.
 regex's `next_state` loops are not where its time goes once these
 compile as intended: the remaining gap is spread over loads in the
 decode and `follow_epsilons` loops (codegen-plan.md).
+
+## Tried: splitting live ranges around crowded loops (`PLIRON_LOOPSPILL`, reverted)
+
+A last CLIF step stored values live through a crowded loop but unused in
+it to a stack slot before the loop and reloaded them at their later uses
+(blocks strictly dominated by the preheader; a use in the preheader runs
+before the store and, around an outer loop, keeps the value live
+anyway; the first version missed this and miscompiled regex and
+pulldown). Correct after that, but no gain: regex 1% faster, pulldown 2%
+slower (noise), and regex's qcur loop still reloads `b`, now twice per
+state. The pressure numbers say why: about 37 integer values are live
+across that loop's `follow_epsilons` call against 10 callee-saved
+registers, most of them values the IR and CLIF passes forwarded or
+hoisted across calls to the whole function. A spill (store + reload) of
+those cannot catch up; re-loading them from their original address
+(when memory is unchanged, the same facts that justified forwarding
+them) would cost only the load. That is the next lever: bound how far
+forwarded/GVN'd loads live across calls, or rematerialize them.
