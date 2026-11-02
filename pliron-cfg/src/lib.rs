@@ -109,6 +109,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // Decided Option-tag re-tests at loop exits threaded: regex -3.5%,
     // json -1.2%, geomean 0.991 (6 layouts).
     "PLIRON_JOINTHREAD",
+    // bittab leaf args through single-pred params: with join threading,
+    // json 1.142 -> 1.133 (serde_json's whitespace skip is one bit test).
+    "PLIRON_BITTAB_CANON",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
