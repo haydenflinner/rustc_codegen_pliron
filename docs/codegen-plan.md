@@ -505,6 +505,24 @@ Evening (2026-10-31):
   callees after simplification. That is the remaining lever: per-callsite
   specialized costing, or callee simplification calibrated against
   thresholds.
+- **Layout noise and the inline policy search** (2026-11-01): relinking
+  the same objects under a random function order (`bench/heldout/run.py
+  --layouts K`) moves held-out ratios by ~3%, and a byte-identical hot loop
+  ran 50% slower in one placement, so single-layout A/Bs under ~3% are not
+  evidence. Scored that way (geomean of five tuning benches, four layouts
+  each, interleaved against default), callsite-specialized costing
+  (`PLIRON_INLINE_SPEC`), callee simplification (`PLIRON_INLINE_SIMP`,
+  branch folding alone or the subset without SROA/const casts) and their
+  combinations all land within +/-0.5% of default: each wins some benches
+  (json, blind-sig, pulldown about -1.3% with the subset) and loses others
+  (regex +4%, real in every layout). The inline policy is near a local
+  optimum for this backend. Where inlining matches LLVM's, our code is
+  bigger: regex `next_state` has the same call set, 658 vs 533
+  instructions and 40 vs 21 stack refs, mostly `mov` (+44), jumps (+18),
+  spill loads/stores (+20) and re-extensions of an `i16` param at every
+  compare (+16 `uxth`/`uxtb`; Apple's ABI already zero-extends it). Across
+  the matched hot functions `mov` dominates: the gap left is backend code
+  quality (regalloc moves, edge-split blocks), not decisions.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.

@@ -17,6 +17,12 @@ host clock. A build or a stdout mismatch against
 Runs alternate LLVM/pliron for `--rounds` rounds (order flipped every
 round) and the per-side median is compared. Results go to
 target/heldout/results.json.
+
+`--layouts K` (macOS): relink every side's binary under K random function
+orders (ld64 `-order_file`, same objects) and time all of them; a side's
+time is the mean of its per-layout medians. Placement alone moves these
+ratios by ~3% (a byte-identical hot loop ran 50% slower in one layout), so
+single-layout differences below that are not evidence.
 """
 import argparse, json, math, os, re, shutil, statistics, subprocess, sys
 
@@ -77,6 +83,44 @@ def build(name, binary, side, env):
     return exe
 
 
+def layouts(name, binary, side, env, k):
+    """`k` relinks of one built side, each under a random function order."""
+    src = os.path.join(src_dir(name), CRATE)
+    tdir = os.path.join(OUT, side, name)
+    base = os.path.join(tdir, "release", binary)
+    # The fresh crate would print nothing: relink it, keeping temporaries.
+    sh(["cargo", "clean", "-p", "benchmark", "--release", "--target-dir", tdir], cwd=src, env=env)
+    r = sh(["cargo", "rustc", "--release", "--bin", binary, "--target-dir", tdir,
+            "--config", f'patch.crates-io.sightglass-api.path="{SHIM}"',
+            "--", "--print", "link-args", "-C", "save-temps"], cwd=src, env=env)
+    cmd = [l for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not cmd:
+        print(f"  {name}: {side}: no link command for layouts")
+        return [base]
+    import random, shlex
+    args = shlex.split(cmd[-1])
+    nm = sh(["nm", "-n", "--defined-only", base]).stdout.split("\n")
+    syms = [l.split()[2] for l in nm if len(l.split()) == 3 and l.split()[1] in ("t", "T")]
+    out = []
+    for i in range(1, k + 1):
+        d = os.path.join(tdir, f"layout{i}")
+        os.makedirs(d, exist_ok=True)
+        order = list(syms)
+        random.Random(i).shuffle(order)
+        with open(os.path.join(d, "order.txt"), "w") as f:
+            f.write("\n".join(order) + "\n")
+        a = list(args)
+        a[a.index("-o") + 1] = os.path.join(d, binary)
+        a.append(f"-Wl,-order_file,{os.path.join(d, 'order.txt')}")
+        if sh(a).returncode == 0:
+            out.append(os.path.join(d, binary))
+    return out or [base]
+
+
+def src_dir(name):
+    return os.path.join(OUT, "src", name)
+
+
 def run_once(name, exe):
     """(ns, stdout ok) for one run, cwd = the benchmark dir (its inputs)."""
     src = os.path.join(OUT, "src", name)
@@ -96,6 +140,8 @@ def main():
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--backend", default=os.path.join(ROOT, "target", "debug", DYLIB))
     ap.add_argument("--json", default=os.path.join(OUT, "results.json"))
+    ap.add_argument("--layouts", type=int, default=0,
+                    help="relink each side under K random function orders (macOS)")
     ap.add_argument("--variant", action="append", default=[],
                     help="NAME:K=V,K=V -- another pliron build with extra backend env, "
                          "measured interleaved with the others (ratio vs LLVM each)")
@@ -127,6 +173,10 @@ def main():
             else:
                 print(f"build {name} ({side})", flush=True)
                 exes[(name, side)] = build(name, binary, side, envs[side])
+            if exes[(name, side)] and a.layouts > 0 and sys.platform == "darwin":
+                exes[(name, side)] = layouts(name, binary, side, envs[side], a.layouts)
+            elif exes[(name, side)]:
+                exes[(name, side)] = [exes[(name, side)]]
 
     res = {}
     for name, _, _ in benches:
@@ -136,21 +186,28 @@ def main():
                 s for s in allsides if not exes.get((name, s)))}
             continue
         t = {s: [] for s in sides}
+        tl = {(s, i): [] for s in sides for i in range(len(exes[(name, s)]))}
         bad = None
         for r in range(a.rounds):
             for s in (sides if r % 2 == 0 else sides[::-1]):
-                ns, ok, p = run_once(name, exes[(name, s)])
-                if not ok:
-                    bad = f"{s} run failed (rc {p.returncode}): {p.stderr[-300:]!r}"
+                for i, exe in enumerate(exes[(name, s)]):
+                    ns, ok, p = run_once(name, exe)
+                    if not ok:
+                        bad = f"{s} run failed (rc {p.returncode}): {p.stderr[-300:]!r}"
+                        break
+                    t[s].append(ns)
+                    tl[(s, i)].append(ns)
+                if bad:
                     break
-                t[s].append(ns)
             if bad:
                 break
         if bad:
             res[name] = {"status": bad}
             print(f"  {name}: {bad}")
             continue
-        med = {s: statistics.median(t[s]) for s in sides}
+        # Mean over layouts of each layout's median (one layout: the median).
+        med = {s: statistics.mean(statistics.median(tl[(s, i)]) for i in range(len(exes[(name, s)])))
+               for s in sides}
         for s in sides[2:]:
             res.setdefault("variants", {}).setdefault(s, {})[name] = med[s] / med["llvm"]
         res[name] = {"status": "ok", "llvm_ms": med["llvm"] / 1e6, "pliron_ms": med["pliron"] / 1e6,
