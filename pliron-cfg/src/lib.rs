@@ -148,6 +148,9 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // Always-inline waffle bodies (src/wasm.rs). 6: −~0.4 KiB regex-wasm
     // vs default 12 with no observed runtime hit on hash kernels.
     ("PLIRON_WASM_TINY", "6"),
+    // Degraded cross-CGU copies inlining left called go back to the home
+    // fn (2026-11-02, tuning geomean 0.996; `=0` off, `=all` every copy).
+    ("PLIRON_XCGU_HOME", "1"),
 ];
 
 // r[impl par.cfg.once]
