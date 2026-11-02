@@ -658,6 +658,17 @@ Evening (2026-10-31):
   current defaults: inline limit 256/400/480 (320 stays), REMATW,
   CONSTSINK, ELABLOOPS, XBLOCK, REMATLOOP, LIBCALL_DIRECT, BYVALHOME,
   DEADARG, RETNN, CSE_SYM; LUTCORR miscompiles blind-sig (opt-in).
+- **Cross-CGU copy limit** (2026-11-02): `PLIRON_XCGU_SIZE=100` (default
+  50) makes pulldown 2.4-2.6% faster in two layout-averaged runs (1.177
+  -> 1.146), but blind-sig +5%, json +2.3%, regex +1.4%. In pulldown it
+  is a global inlining reshuffle (203 extra copies, many from core):
+  `scalar_iterate_special_bytes` goes out of line with the `parse_line`
+  closure inlined into it, `Tree::append` and the code-fence scanners
+  inline, `parse_paragraph` splits out; profile total -7%, closer to
+  LLVM's shape. Bisecting the copies fails to link (copies depend on
+  each other: `is_ascii::runtime`); the ascii helpers alone do nothing.
+  Next: find which copy unlocks the closure inline, or size copies by
+  their simplified body.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
