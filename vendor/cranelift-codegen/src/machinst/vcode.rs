@@ -904,6 +904,8 @@ impl<I: VCodeInst> VCode<I> {
                 }
             }
         }
+        static SPILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let spill_cse = *SPILL.get_or_init(|| std::env::var("PLIRON_SPILLCSE").as_deref() == Ok("1"));
         let vreg_of = |e: usize| ra.edit_vregs.get(e).copied().flatten();
         let is_remat = |e: usize| vreg_of(e).is_some_and(|v| remat.contains(&v.vreg()));
         // Per edit: keep (None), drop (Some(None)), or replace (Some(Some(edit))).
@@ -912,18 +914,44 @@ impl<I: VCodeInst> VCode<I> {
         let nb = self.num_blocks();
         // Facts at each block's end, for single-predecessor successors.
         let mut at_end: Vec<Option<crate::FxHashMap<PReg, regalloc2::SpillSlot>>> = vec![None; nb];
-        for b in 0..nb {
+        type Holds = crate::FxHashMap<PReg, regalloc2::SpillSlot>;
+        // Facts on entry to `b`. `PLIRON_SPILLCSE=1`: the intersection over
+        // all predecessors (unscanned ones, `None`, are optimistic top), so
+        // facts survive loop headers; iterated to a fixpoint below.
+        // Otherwise: a single already-scanned predecessor's end facts.
+        let entry = regalloc2::Function::entry_block(self).index();
+        let in_state = |b: usize, at_end: &Vec<Option<Holds>>| -> Holds {
+            let preds = regalloc2::Function::block_preds(self, BlockIndex::new(b));
+            if !spill_cse {
+                return match preds {
+                    [p] if p.index() < b => at_end[p.index()].clone().unwrap_or_default(),
+                    _ => Default::default(),
+                };
+            }
+            if b == entry || preds.is_empty() {
+                return Default::default();
+            }
+            let mut acc: Option<Holds> = None;
+            for p in preds {
+                let Some(h) = &at_end[p.index()] else { continue };
+                acc = Some(match acc {
+                    None => h.clone(),
+                    Some(mut a) => {
+                        a.retain(|k, v| h.get(k) == Some(v));
+                        a
+                    }
+                });
+            }
+            acc.unwrap_or_default()
+        };
+        let mut scan = |b: usize, holds_in: Holds, fix: &mut Vec<Option<Option<Edit>>>, changed: &mut bool| -> Holds {
             let r = self.block_ranges.get(b);
             let mut e = ra
                 .edits
                 .partition_point(|&(p, _)| p < ProgPoint::before(InsnIndex::new(r.start)));
             // reg -> slot whose value it holds. A block entered only from
             // one already-scanned predecessor starts from that block's end.
-            let preds = regalloc2::Function::block_preds(self, BlockIndex::new(b));
-            let mut holds: crate::FxHashMap<PReg, regalloc2::SpillSlot> = match preds {
-                [p] if p.index() < b => at_end[p.index()].clone().unwrap_or_default(),
-                _ => Default::default(),
-            };
+            let mut holds = holds_in;
             let kill_reg = |holds: &mut crate::FxHashMap<PReg, regalloc2::SpillSlot>, p: PReg| {
                 holds.remove(&p);
             };
@@ -948,8 +976,19 @@ impl<I: VCodeInst> VCode<I> {
                         }
                         holds.insert(r, s);
                     }
-                    // Spill [S] <- R: R and S now agree.
+                    // Spill [S] <- R: R and S now agree. If they already
+                    // did (R was reloaded from S, or spilled there, and
+                    // neither changed since), the store is dead:
+                    // `PLIRON_SPILLCSE=1` drops it. A loop's split range
+                    // reloaded a loop invariant and stored it straight
+                    // back every iteration (pulldown's special-byte scan
+                    // with its callback inlined).
                     (_, _, Some(r), Some(s)) if !remat_e => {
+                        if spill_cse && holds.get(&r) == Some(&s) {
+                            fix[e] = Some(None);
+                            *changed = true;
+                            return;
+                        }
                         kill_slot(holds, s);
                         holds.insert(r, s);
                     }
@@ -974,7 +1013,7 @@ impl<I: VCodeInst> VCode<I> {
             for i in r.clone() {
                 let ii = InsnIndex::new(i);
                 while e < ra.edits.len() && ra.edits[e].0 <= ProgPoint::before(ii) {
-                    edit(e, &mut holds, &mut fix, &mut changed);
+                    edit(e, &mut holds, fix, changed);
                     e += 1;
                 }
                 for p in self.inst_clobbers(ii) {
@@ -991,11 +1030,43 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
                 while e < ra.edits.len() && ra.edits[e].0 <= ProgPoint::after(ii) {
-                    edit(e, &mut holds, &mut fix, &mut changed);
+                    edit(e, &mut holds, fix, changed);
                     e += 1;
                 }
             }
-            at_end[b] = Some(holds);
+            holds
+        };
+        if spill_cse {
+            // Optimistic iteration: facts only shrink once a block is
+            // scanned; apply nothing unless it settles.
+            let mut scratch = vec![None; ra.edits.len()];
+            let mut sc = false;
+            let mut settled = false;
+            for _ in 0..8 {
+                let mut moved = false;
+                for b in 0..nb {
+                    let h = scan(b, in_state(b, &at_end), &mut scratch, &mut sc);
+                    if at_end[b].as_ref() != Some(&h) {
+                        at_end[b] = Some(h);
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    settled = true;
+                    break;
+                }
+            }
+            if !settled {
+                return None;
+            }
+            for b in 0..nb {
+                scan(b, in_state(b, &at_end), &mut fix, &mut changed);
+            }
+        } else {
+            for b in 0..nb {
+                let h = scan(b, in_state(b, &at_end), &mut fix, &mut changed);
+                at_end[b] = Some(h);
+            }
         }
         if !changed {
             return None;

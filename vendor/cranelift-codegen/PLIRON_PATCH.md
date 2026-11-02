@@ -1136,3 +1136,14 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     the slot is dropped and one into another register becomes a register
     move. Rematerialized values are skipped. pulldown: 206 stack loads
     become moves.
+94. Spill CSE (`PLIRON_SPILLCSE=1` opt-in, in `reload_cse`): a spill of a
+    register already known to hold that slot's value is dropped, and the
+    register/slot facts flow into every block as the intersection over
+    its predecessors, iterated optimistically to a fixpoint (nothing is
+    rewritten unless it settles within 8 rounds), so they survive loop
+    headers. Dropping a reload or a store leaves the register and slot
+    contents unchanged, so the facts don't depend on the rewrites.
+    pulldown with its `parse_line` closure inlined
+    (`PLIRON_INLINE_FREEMUL=12`): the special-byte scan loop reloaded a
+    loop invariant and stored it straight back every iteration. pulldown:
+    394 spill stores dropped (2,936 -> 2,542); checker clean.

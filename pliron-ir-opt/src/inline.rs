@@ -1228,6 +1228,12 @@ pub fn run(
     // `scan_nextline` too big to inline into its callers; LLVM keeps the
     // closure out of line.
     let freemax: Option<usize> = crate::env_get("PLIRON_INLINE_FREEMAX").and_then(|s| s.parse().ok());
+    // `PLIRON_INLINE_FREEMUL=<k>`: the free (single-site) threshold as a
+    // multiple of the base limit (default 10). pulldown's `parse_line`
+    // closure (4,594 raw ops, one site) missed it at 4,200, and its scan
+    // loop paid a call, seven spills and a result through memory per
+    // special byte; LLVM inlines it (last-call bonus on the simplified body).
+    let free_mul: usize = crate::env_get("PLIRON_INLINE_FREEMUL").and_then(|s| s.parse().ok()).unwrap_or(10);
     // `PLIRON_INLINE_SPEC=1`: size each callsite's callee as specialized to
     // that site (`inline_cost`), scaled by `PLIRON_INLINE_SPEC_SCALE`
     // percent (default 147: code-free ops are ~32% of the raw count the
@@ -1463,7 +1469,7 @@ pub fn run(
                         limit
                     };
                     let mut t = if free {
-                        limit.saturating_mul(10)
+                        limit.saturating_mul(free_mul)
                     } else {
                         cold
                     };
