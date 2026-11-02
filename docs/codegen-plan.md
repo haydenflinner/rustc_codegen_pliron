@@ -682,8 +682,14 @@ Evening (2026-10-31):
   other loop (blind-sig -0.9%, blake3 +0.6%); with `PLIRON_ESC_TRAP=0` it
   disappears but the outer loop loses more. Likely the pointer's bundle
   is merged with long out-of-loop ranges, its weight diluted, then split
-  per use. Fix belongs in regalloc2's split/eviction (split a spilled
-  bundle at loop boundaries so the in-loop piece gets loop-depth weight).
+  per use. Upstream linear spill weights (`RA2_LINEAR` build) keep the
+  spill and the timing (1.065), so it is plain pressure: ~20 outer-loop
+  values (including the six SmallVec selects ESC_TRAP lets LICM hoist)
+  live across inner loops that need 8-9 more, against our 26 allocatable
+  integer registers (Cranelift reserves x16/x17 as emit scratch; LLVM
+  allocates them, 28). Levers: give regalloc2 x16/x17 (emit-time users
+  need their own scratch), or pressure-aware LICM that leaves a cheap
+  invariant load in an outer loop whose inner loops are register-bound.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
