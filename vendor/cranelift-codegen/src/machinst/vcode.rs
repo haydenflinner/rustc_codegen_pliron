@@ -905,7 +905,7 @@ impl<I: VCodeInst> VCode<I> {
             }
         }
         static SPILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let spill_cse = *SPILL.get_or_init(|| std::env::var("PLIRON_SPILLCSE").as_deref() == Ok("1"));
+        let spill_cse = *SPILL.get_or_init(|| std::env::var("PLIRON_SPILLCSE").as_deref() != Ok("0"));
         let vreg_of = |e: usize| ra.edit_vregs.get(e).copied().flatten();
         let is_remat = |e: usize| vreg_of(e).is_some_and(|v| remat.contains(&v.vreg()));
         // Per edit: keep (None), drop (Some(None)), or replace (Some(Some(edit))).
@@ -915,7 +915,8 @@ impl<I: VCodeInst> VCode<I> {
         // Facts at each block's end, for single-predecessor successors.
         let mut at_end: Vec<Option<crate::FxHashMap<PReg, regalloc2::SpillSlot>>> = vec![None; nb];
         type Holds = crate::FxHashMap<PReg, regalloc2::SpillSlot>;
-        // Facts on entry to `b`. `PLIRON_SPILLCSE=1`: the intersection over
+        // Facts on entry to `b`. With spill CSE (default; `PLIRON_SPILLCSE=0`
+        // off): the intersection over
         // all predecessors (unscanned ones, `None`, are optimistic top), so
         // facts survive loop headers; iterated to a fixpoint below.
         // Otherwise: a single already-scanned predecessor's end facts.
@@ -979,7 +980,7 @@ impl<I: VCodeInst> VCode<I> {
                     // Spill [S] <- R: R and S now agree. If they already
                     // did (R was reloaded from S, or spilled there, and
                     // neither changed since), the store is dead:
-                    // `PLIRON_SPILLCSE=1` drops it. A loop's split range
+                    // on by default (`PLIRON_SPILLCSE=0` keeps it). A loop's split range
                     // reloaded a loop invariant and stored it straight
                     // back every iteration (pulldown's special-byte scan
                     // with its callback inlined).
