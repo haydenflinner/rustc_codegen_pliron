@@ -861,6 +861,162 @@ impl<I: VCodeInst> VCode<I> {
         Some((BlockIndex::new(sb), full))
     }
 
+    /// PLIRON: the post-allocation rewrites applied at emission: reload PRE
+    /// (`reload_pre_rounds`), then reload CSE (`reload_cse`).
+    pub(crate) fn post_alloc(&self, ra: &regalloc2::Output) -> Option<regalloc2::Output> {
+        match self.reload_pre_rounds(ra) {
+            Some(o) => Some(self.reload_cse(&o).unwrap_or(o)),
+            None => self.reload_cse(ra),
+        }
+    }
+
+    /// PLIRON: reload CSE (`PLIRON_RELOADCSE=1`). regalloc2 gives each use
+    /// of a spilled value its own reload, often into a fresh register, so
+    /// one block may load the same slot several times
+    /// (pulldown's `handle_inline_pass1` loaded `[sp, #0x3c0]` into
+    /// `x0`, `x8`, `x12` and `x14` within a dozen instructions). Scanning
+    /// each block forward, track which registers hold which slot's value;
+    /// a reload into a register that already holds it is dropped, and a
+    /// reload into another register becomes a register move (eliminated
+    /// at rename on Apple cores, against a load's latency). A register's
+    /// fact dies when it is written (def, clobber or edit), a slot's when
+    /// it is stored. Rematerialized values are skipped: their slot may
+    /// never be written.
+    pub(crate) fn reload_cse(&self, ra: &regalloc2::Output) -> Option<regalloc2::Output> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RELOADCSE").as_deref() == Ok("1"))
+            || !self.debug_value_labels.is_empty()
+            || ra.edits.is_empty()
+        {
+            return None;
+        }
+        let mut remat = crate::FxHashSet::default();
+        if std::env::var("PLIRON_REMAT").as_deref() != Ok("0") && !ra.edit_vregs.is_empty() {
+            let probe = Writable::from_reg(Reg::from(regalloc2::PReg::new(0, regalloc2::RegClass::Int)));
+            for (i, inst) in self.insts.iter().enumerate() {
+                if inst.rematerialize(probe).is_none() {
+                    continue;
+                }
+                if let [op] = &self.operands[self.operand_ranges.get(i)]
+                    && op.kind() == OperandKind::Def
+                {
+                    remat.insert(op.vreg().vreg());
+                }
+            }
+        }
+        let vreg_of = |e: usize| ra.edit_vregs.get(e).copied().flatten();
+        let is_remat = |e: usize| vreg_of(e).is_some_and(|v| remat.contains(&v.vreg()));
+        // Per edit: keep (None), drop (Some(None)), or replace (Some(Some(edit))).
+        let mut fix: Vec<Option<Option<Edit>>> = vec![None; ra.edits.len()];
+        let mut changed = false;
+        let nb = self.num_blocks();
+        // Facts at each block's end, for single-predecessor successors.
+        let mut at_end: Vec<Option<crate::FxHashMap<PReg, regalloc2::SpillSlot>>> = vec![None; nb];
+        for b in 0..nb {
+            let r = self.block_ranges.get(b);
+            let mut e = ra
+                .edits
+                .partition_point(|&(p, _)| p < ProgPoint::before(InsnIndex::new(r.start)));
+            // reg -> slot whose value it holds. A block entered only from
+            // one already-scanned predecessor starts from that block's end.
+            let preds = regalloc2::Function::block_preds(self, BlockIndex::new(b));
+            let mut holds: crate::FxHashMap<PReg, regalloc2::SpillSlot> = match preds {
+                [p] if p.index() < b => at_end[p.index()].clone().unwrap_or_default(),
+                _ => Default::default(),
+            };
+            let kill_reg = |holds: &mut crate::FxHashMap<PReg, regalloc2::SpillSlot>, p: PReg| {
+                holds.remove(&p);
+            };
+            let kill_slot = |holds: &mut crate::FxHashMap<PReg, regalloc2::SpillSlot>, s: regalloc2::SpillSlot| {
+                holds.retain(|_, v| *v != s);
+            };
+            let mut edit = |e: usize, holds: &mut crate::FxHashMap<PReg, regalloc2::SpillSlot>, fix: &mut Vec<Option<Option<Edit>>>, changed: &mut bool| {
+                let Edit::Move { from, to } = ra.edits[e].1;
+                let remat_e = is_remat(e);
+                match (from.as_stack(), to.as_reg(), from.as_reg(), to.as_stack()) {
+                    // Reload R <- [S].
+                    (Some(s), Some(r), _, _) if !remat_e => {
+                        if holds.get(&r) == Some(&s) {
+                            fix[e] = Some(None);
+                            *changed = true;
+                            return;
+                        }
+                        let src = holds.iter().find(|(p, v)| **v == s && p.class() == r.class()).map(|(p, _)| *p);
+                        if let Some(src) = src {
+                            fix[e] = Some(Some(Edit::Move { from: Allocation::reg(src), to }));
+                            *changed = true;
+                        }
+                        holds.insert(r, s);
+                    }
+                    // Spill [S] <- R: R and S now agree.
+                    (_, _, Some(r), Some(s)) if !remat_e => {
+                        kill_slot(holds, s);
+                        holds.insert(r, s);
+                    }
+                    // Register move R2 <- R1: R2 inherits R1's fact.
+                    (_, Some(r2), Some(r1), _) => {
+                        let f = holds.get(&r1).copied();
+                        kill_reg(holds, r2);
+                        if let Some(s) = f {
+                            holds.insert(r2, s);
+                        }
+                    }
+                    _ => {
+                        if let Some(r) = to.as_reg() {
+                            kill_reg(holds, r);
+                        }
+                        if let Some(s) = to.as_stack() {
+                            kill_slot(holds, s);
+                        }
+                    }
+                }
+            };
+            for i in r.clone() {
+                let ii = InsnIndex::new(i);
+                while e < ra.edits.len() && ra.edits[e].0 <= ProgPoint::before(ii) {
+                    edit(e, &mut holds, &mut fix, &mut changed);
+                    e += 1;
+                }
+                for p in self.inst_clobbers(ii) {
+                    kill_reg(&mut holds, p);
+                }
+                for (op, a) in self.operands[self.operand_ranges.get(i)].iter().zip(ra.inst_allocs(ii)) {
+                    if op.kind() == OperandKind::Def {
+                        if let Some(p) = a.as_reg() {
+                            kill_reg(&mut holds, p);
+                        }
+                        if let Some(s) = a.as_stack() {
+                            kill_slot(&mut holds, s);
+                        }
+                    }
+                }
+                while e < ra.edits.len() && ra.edits[e].0 <= ProgPoint::after(ii) {
+                    edit(e, &mut holds, &mut fix, &mut changed);
+                    e += 1;
+                }
+            }
+            at_end[b] = Some(holds);
+        }
+        if !changed {
+            return None;
+        }
+        let mut out = ra.clone();
+        out.edits.clear();
+        out.edit_vregs.clear();
+        let keep_vregs = !ra.edit_vregs.is_empty();
+        for (k, (p, ed)) in ra.edits.iter().enumerate() {
+            match &fix[k] {
+                None => out.edits.push((*p, ed.clone())),
+                Some(None) => continue,
+                Some(Some(n)) => out.edits.push((*p, n.clone())),
+            }
+            if keep_vregs {
+                out.edit_vregs.push(ra.edit_vregs[k]);
+            }
+        }
+        Some(out)
+    }
+
     /// PLIRON: `reload_pre` repeated while it moves something, up to
     /// `PLIRON_RELOADPRE_ROUNDS` (default 3) times: a reload moved into a
     /// preheader that is itself in a loop can move again.
@@ -1350,7 +1506,7 @@ impl<I: VCodeInst> VCode<I> {
     {
         let _tt = timing::vcode_emit();
         let pre_out;
-        let regalloc = match self.reload_pre_rounds(regalloc) {
+        let regalloc = match self.post_alloc(regalloc) {
             Some(o) => {
                 pre_out = o;
                 &pre_out

@@ -1125,3 +1125,14 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     so it skips the bounds clamp (x64 `cmp; cmov`; aarch64 `cmp; b.hs;
     csel; csdb`, replaced by one `mov`). Test:
     `pliron-clif-opt/tests/switch_dead_default.rs`.
+93. Reload CSE (`PLIRON_RELOADCSE`, `machinst/vcode.rs` `reload_cse`, run
+    with reload PRE as `post_alloc` at emission and under
+    `PLIRON_RELOADPRE_CHECK=1`'s checker): regalloc2 reloads a spilled
+    value before each use, often into a fresh register, so one stretch of
+    code loads the same slot several times (pulldown's
+    `handle_inline_pass1`: `[sp, #0x3c0]` into four registers). Tracking
+    which registers hold which slot through each block, and into a block
+    from its only predecessor, a reload into a register already holding
+    the slot is dropped and one into another register becomes a register
+    move. Rematerialized values are skipped. pulldown: 206 stack loads
+    become moves.
