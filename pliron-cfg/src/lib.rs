@@ -102,6 +102,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // (regex-syntax's `from_encoded_range` bounds checks; bittab reads
     // the chain's offset range tests).
     "PLIRON_SWITCH_CHAIN",
+    // Loop-invariant header params moved onto a preheader: regex -1.8% in
+    // two layout-averaged runs (8 layouts), the rest flat
+    // (docs/codegen-plan.md, inline policy search).
+    "PLIRON_INVPARAM",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
