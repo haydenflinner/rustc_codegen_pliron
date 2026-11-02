@@ -563,8 +563,13 @@ Evening (2026-10-31):
      deeper loop span before allocation (`PLIRON_RA2_LOOPSPLIT`, not
      landed) cut those to 215 / 107, but the pieces often land in
      different registers: +3,116 moves, +4% code, geomean 1.006 (regex
-     +2.5%). A narrower trigger (split only when an in-loop conflict
-     occurs) is the next attempt.
+     +2.5%). The narrower trigger (a conflicting bundle that lives through
+     the conflict's loop without a use there is evicted at ~0 cost and
+     split around that loop when requeued) adds only +0.5% code and cuts
+     in-loop stack traffic 514 -> 364 samples, yet geomean is 1.003
+     (pulldown -0.3%, regex +1.1%). On these cores spill reloads are
+     cheap (L1, store forwarding); stack-traffic samples overstate them.
+     Not landed; patches kept.
   json's extra traffic is mostly results returned through memory after
   calls, a separate item.
   Lesson: the mask had to be undone by every pass that reshaped the
