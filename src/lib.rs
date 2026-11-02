@@ -1484,7 +1484,7 @@ fn module_codegen(
     cx.st.borrow_mut().earlydead =
         pass_enabled("PLIRON_EARLYDEAD") && env_get("PLIRON_OPT_FNS").is_none();
     let mono_items = cgu.items_in_deterministic_order(tcx);
-    let extra = if tcx.sess.opts.optimize != OptLevel::No
+    let mut extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
         && !crate::env_set("PLIRON_HOT")
     {
@@ -1503,6 +1503,24 @@ fn module_codegen(
     // pliron-wasm-ld, untested here.
     let home_mode = env_get("PLIRON_XCGU_HOME")
         .filter(|_| !extra.is_empty() && !tcx.sess.target.is_like_wasm);
+    // `=skip`: don't make degraded copies whose home is linkable at all, so
+    // the inliner never inlines a body whose callees are calls here and the
+    // home definition (callees local) is called instead. Dropping a copy can
+    // degrade another, so iterate. Measured worse overall (codegen-plan.md).
+    if home_mode == Some("skip") {
+        loop {
+            let set: rustc_hash::FxHashSet<_> = extra.iter().copied().collect();
+            let before = extra.len();
+            extra.retain(|&i| {
+                !(xcgu::home_linkable(tcx).contains(tcx.symbol_name(i).name)
+                    && xcgu::degraded(tcx, i, cgu, &set))
+            });
+            if extra.len() == before {
+                break;
+            }
+        }
+    }
+    let home_mode = home_mode.map(|m| if m == "skip" { "1" } else { m });
     let extra_set: rustc_hash::FxHashSet<_> =
         if home_mode.is_some() { extra.iter().copied().collect() } else { Default::default() };
     for &inst in &extra {
