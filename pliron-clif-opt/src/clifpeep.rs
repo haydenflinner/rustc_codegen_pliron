@@ -94,6 +94,51 @@ fn sconst(func: &Function, v: Value) -> Option<i64> {
     Some(sext(imm.bits() as u64, w))
 }
 
+/// `v` as `base + k` through `iadd`/`isub` of constants, with every
+/// `symbol_value` of one global as the same base (GVN keeps them apart).
+fn sym_base(func: &Function, v: Value) -> (Result<Value, cranelift_codegen::ir::GlobalValue>, i64) {
+    let mut v = func.dfg.resolve_aliases(v);
+    let mut k: i64 = 0;
+    for _ in 0..8 {
+        let Some(d) = func.dfg.value_def(v).inst() else { break };
+        match func.dfg.insts[d] {
+            InstructionData::UnaryGlobalValue { opcode: Opcode::SymbolValue, global_value } => {
+                return (Err(global_value), k);
+            }
+            InstructionData::Binary { opcode: op @ (Opcode::Iadd | Opcode::Isub), args } => {
+                if let Some(c) = sconst(func, args[1]) {
+                    k = if op == Opcode::Iadd { k.wrapping_add(c) } else { k.wrapping_sub(c) };
+                    v = func.dfg.resolve_aliases(args[0]);
+                } else if op == Opcode::Iadd
+                    && let Some(c) = sconst(func, args[0])
+                {
+                    k = k.wrapping_add(c);
+                    v = func.dfg.resolve_aliases(args[1]);
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    (Ok(v), k)
+}
+
+/// `a - b` as a constant when both are offsets from one base
+/// (`PLIRON_SYMSUB`): a `&'static str`'s length arrives as `(sym + n) -
+/// sym` from two `symbol_value`s, so `push_str("<p>")`'s memcpy kept a
+/// runtime length and stayed a libc call (pulldown's `HtmlWriter::run`:
+/// ~22k extra memcpy calls of 1-14 bytes).
+fn sym_delta(func: &Function, a: Value, b: Value) -> Option<i64> {
+    let ty = func.dfg.value_type(a);
+    if !ty.is_int() || ty.bits() != 64 {
+        return None;
+    }
+    let (ba, ka) = sym_base(func, a);
+    let (bb, kb) = sym_base(func, b);
+    (ba == bb).then(|| ka.wrapping_sub(kb))
+}
+
 /// `v` is `iconst` of all-ones in `ty` — the width-aware `-1`.
 fn allones(func: &Function, v: Value, ty: Type) -> bool {
     let m = if ty.bits() >= 64 {
@@ -6660,9 +6705,19 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let icmpk_on = crate::pass_enabled("PLIRON_ICMPK");
     let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
     let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM");
+    let symsub = pliron_cfg::env_is("PLIRON_SYMSUB", "1");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
+            if symsub
+                && let InstructionData::Binary { opcode: Opcode::Isub, args } = pos.func.dfg.insts[inst]
+                && let Some(d) = sym_delta(pos.func, args[0], args[1])
+            {
+                let ty = pos.func.dfg.ctrl_typevar(inst);
+                pos.func.replace(inst).iconst(ty, d);
+                n += 1;
+                continue;
+            }
             if ldsel
                 && let InstructionData::Load {
                     arg, flags, offset, ..
