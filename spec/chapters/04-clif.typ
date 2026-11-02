@@ -420,6 +420,41 @@ only the consumer of the optimized CLIF differs.
   accumulator). A fix to the table's extraction then fixes every consumer.
 ]
 
+== Loop transforms (docs/loop-unswitch-pressure.md)
+
+#r("clif.selfact", title: "A branch on a zero-armed select decides its condition", level: "may",
+   refines: "model.equiv", checked: "pliron-clif-opt/tests/selfact.rs")[
+  With `PLIRON_SELFACT=1`, a block whose only predecessor ends in
+  `brif v` (or `brif (icmp eq/ne v, 0)`) with `v = select(c, a, b)` and
+  `c` an `icmp` MAY take as known: on the edge where `v` is nonzero, `c`
+  false when `a` is 0 and `c` true when `b` is 0; on the edge where `v`
+  is zero, the same only when the other arm is a nonzero constant. It
+  MUST NOT derive a fact on the zero edge otherwise.
+]
+
+#r("clif.licm.innerpress", title: "Hoists past inner loops respect their register room", level: "should",
+   refines: "model.equiv", checked: "pliron-clif-opt/tests/licm_innerpress2.rs")[
+  With `PLIRON_LICM_INNERPRESS=2`, LICM SHOULD hoist a load that no inner
+  loop uses out of a loop with inner loops only while every inner loop has
+  room: its peak count of integer values live on block entry (constants,
+  symbol addresses and constant offsets excluded) plus the hoists made so
+  far stays below the target's allocatable integer registers minus two,
+  or its callee-saved count when it contains a call. Liveness is computed
+  at most once per LICM run and MUST be skipped (no such hoists) past its
+  block cap.
+]
+
+#r("clif.unswitch.loop", title: "Loop-only unswitching repairs SSA at the exits", level: "may",
+   refines: ("model.equiv", "model.bail"), checked: "pliron-clif-opt/tests/unswitch_loop.rs")[
+  With `PLIRON_UNSWITCH_LOOP=1`, a loop whose closed region is too big MAY
+  be unswitched on a loop-invariant `brif` by cloning only its body. Every
+  use outside the loop of a value the loop defines MUST then read the
+  value that reaches it: a block on the way from the exits gets a block
+  parameter where both versions (or other paths) meet. It MUST bail before
+  changing anything when an exit or such a block is reached through an
+  exception edge, or past its escaping-value, use and region budgets.
+]
+
 == Checking and bisecting
 
 #r("clif.verify", title: "PLIRON_VERIFY", level: "must",
