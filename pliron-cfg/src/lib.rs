@@ -115,6 +115,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // loadfwd ignores slot escapes in dead-end trap blocks (panic message
     // args): blind-sig 1.092 -> 1.069 (6 layouts).
     "PLIRON_ESC_TRAP",
+    // (sym + n) - sym folds, so static-string copies get a constant size
+    // and expand inline: json 1.118 -> 1.058, pulldown -0.9% (6 layouts).
+    "PLIRON_SYMSUB",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
