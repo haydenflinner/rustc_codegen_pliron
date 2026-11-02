@@ -76,6 +76,7 @@ fn scoped_noalias_root_is_not_function_wide_isolated() {
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
+        &FxHashSet::default(),
     );
     let facts = Facts {
         noalias: Some(&noalias),

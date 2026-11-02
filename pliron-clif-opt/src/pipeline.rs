@@ -2452,7 +2452,25 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // `PLIRON_LICM_DOMCOND=1`: fold branches a dominating check decides
+    // before LICM looks for escapes. regex's `follow_epsilons` asserts
+    // `len < cap` and then tests `len == cap` for `Vec::push`'s grow call,
+    // which takes `q`; the dead call left `q` escaped, so none of its
+    // fields were promoted and every loop iteration reloaded five of them.
+    // `celim` folds the test, but only after the last LICM.
+    if pliron_cfg::env_is("PLIRON_LICM_DOMCOND", "1") && config().enabled("PLIRON_DOMCOND") {
+        let (cfg, dt) = an.cfg_dt(&p.clctx.func);
+        let folds = jumpthread::fold_dominated_conds_at(&mut p.clctx.func, cfg, dt);
+        if folds > 0 {
+            p.stats.dominated_folds += folds;
+            if jumpthread::fold_const_branches(&mut p.clctx.func) > 0 {
+                jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+            }
+            an.invalidate(&p.clctx.func);
+        }
+    }
     let breg_now = live_block_region(p);
+    let no_nocap = FxHashSet::default();
     let k = licm::run(
         &mut p.clctx.func,
         an,
@@ -2466,6 +2484,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         &breg_now,
         p.region_parent,
         p.operand_frozen,
+        if pliron_cfg::env_is("PLIRON_LICM_NCC", "1") { p.nocap } else { &no_nocap },
     );
     // Hoisting can expose `base + iv` adds whose base was loop-internal
     // at indvars time; stepping them into params evicts the base's live

@@ -1504,13 +1504,14 @@ pub fn run(
     breg: &FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     rpar: &pliron::cols::ColMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
+    nocap: &FxHashSet<(Inst, u32)>,
 ) -> usize {
     let mut la = LoopAnalysis::new();
     let (cfg, dt) = an.cfg_dt(func);
     la.compute(func, cfg, dt);
     let ps = &loadfwd::param_src(func);
-    let (iso, escapes, _) =
-        loadfwd::isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default(), scoped_na);
+    let (iso, escapes, ncc) =
+        loadfwd::isolated_escapes(func, noalias, ps, cfrozen, nocap, scoped_na);
     // Operand-frozen values name their own scope roots (same merged set
     // loadfwd uses): peeling past one would lose the `ofz` claim before the
     // region check can apply it.
@@ -1518,6 +1519,9 @@ pub fn run(
     stop.extend(ofz.keys().copied());
     let debug = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::licm", tracing::Level::DEBUG);
+    if debug {
+        tracing::debug!(target: "pliron::licm", "licm iso: noalias={:?} scoped={:?} iso={:?} escapes={:?}", noalias, scoped_na, iso, escapes);
+    }
     // Innermost first: values hoisted out of an inner loop become candidates
     // for the enclosing loop on the same pass.
     let mut loops: Vec<Loop> = la.loops().collect();
@@ -1545,10 +1549,33 @@ pub fn run(
         // block and without the pred's redirected edge, so an entry
         // scan can count one outside edge where several exist. Read the
         // fresh pair through `an` each iteration.
+        // `PLIRON_LICM_NCC=1` (`nocap` non-empty): a root whose every
+        // escape is a `nocapture` call operand has no lasting alias once
+        // those calls return, so inside a loop holding none of them it is
+        // as isolated as a root that never escapes (loadfwd's `ncc`).
+        // regex's `next_state` hands `qnext` to the out-of-line
+        // `follow_epsilons`, outside the loop that decodes a state into
+        // `qnext`; that loop reloaded five of its fields per element.
+        let iso_lp;
+        let iso_l = if ncc.is_empty() {
+            &iso
+        } else {
+            let mut s = iso.clone();
+            for r in &ncc {
+                if escapes
+                    .get(r)
+                    .is_none_or(|bs| bs.iter().all(|&b| !la.is_in_loop(b, lp)))
+                {
+                    s.insert(*r);
+                }
+            }
+            iso_lp = s;
+            &iso_lp
+        };
         let n2 = {
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
-                func, &ps, &stop, cfg, dt, &la, lp, &iso, &escapes, deref, scoped_na, nw, nounwind, debug,
+                func, &ps, &stop, cfg, dt, &la, lp, iso_l, &escapes, deref, scoped_na, nw, nounwind, debug,
                 scoped, breg, rpar, ofz,
             )
         };

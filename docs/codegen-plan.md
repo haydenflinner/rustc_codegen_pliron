@@ -601,6 +601,20 @@ Evening (2026-10-31):
   register-starved loop: pulldown +2.2% (with spill CSE, -1% vs -0.6%),
   regex/json -2-3% from other inlines. Left at 10; the real fix is
   sizing the simplified callee (see below).
+- **SparseSet field reloads in regex** (2026-11-02): `follow_epsilons`
+  and `next_state`'s state-decode loop reload a `&mut SparseSet`'s five
+  fields per element; LLVM keeps them in registers. Two reasons LICM
+  saw the param as escaped: `insert`'s dead `Vec::push` grow call takes
+  it (`len < cap` was just asserted; `celim` folds the test, but after
+  the last LICM), and `next_state` hands `qnext` to the out-of-line
+  `follow_epsilons`, outside the loop. `PLIRON_LICM_DOMCOND` (dominated
+  folds before LICM) and `PLIRON_LICM_NCC` (a root escaping only through
+  `nocapture` call operands is isolated in loops holding none of them;
+  test `licm_ncc.rs`) fix both and the fields hoist, but `next_state`
+  goes from 41 to 63 stack references: geomean 1.002 for DOMCOND alone,
+  1.006 with NCC (regex +1.5%). Both opt-in. Same lesson as loop
+  splitting: an L1 reload is cheaper than the spill that replaces it
+  under register pressure; hoisting needs a pressure check.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
