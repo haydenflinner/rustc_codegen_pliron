@@ -118,6 +118,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // (sym + n) - sym folds, so static-string copies get a constant size
     // and expand inline: json 1.118 -> 1.058, pulldown -0.9% (6 layouts).
     "PLIRON_SYMSUB",
+    // Outer-only loads stay out of nested-loop preheaders: geomean
+    // 0.997 / 0.998 in two layout-averaged runs (regex -0.8% both).
+    "PLIRON_LICM_INNERPRESS",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
