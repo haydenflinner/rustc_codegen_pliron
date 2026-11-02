@@ -317,6 +317,12 @@ pub(crate) fn canon(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value 
     v
 }
 
+fn canon_args() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_BITTAB_CANON", "1"));
+    *ON
+}
+
 struct Plan {
     root: Block,
     x: Value,
@@ -486,7 +492,17 @@ fn try_tree(
             }
             _ => return None,
         }
-        for (db, dargs, eset) in out {
+        for (db, mut dargs, eset) in out {
+            // Edge args through single-pred params: a hit edge passing the
+            // root's `i + 1` and one passing a test block's param fed that
+            // same value are one outcome (`PLIRON_BITTAB_CANON`).
+            if canon_args() {
+                for a in dargs.iter_mut() {
+                    if let BlockArg::Value(v) = *a {
+                        *a = BlockArg::Value(canon(func, cfg, v));
+                    }
+                }
+            }
             if region.contains(&db) {
                 stack.push((db, eset));
             } else {
