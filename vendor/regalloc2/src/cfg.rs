@@ -41,6 +41,10 @@ pub struct CFGInfo {
     /// under `PLIRON_RA2_LOOPDEPTH=1`), for `PLIRON_RA2_LOOPSPLIT`'s
     /// innermost-cycle split.
     pub back_edges: Vec<(u32, u32)>,
+    /// PLIRON: per block, the shortest back edge `(header, source)` whose
+    /// block span covers it (`(u32::MAX, _)` when none), so a split looks a
+    /// use's innermost cycle up in O(1).
+    pub innermost_cycle: Vec<(u32, u32)>,
 }
 
 impl CFGInfo {
@@ -142,6 +146,34 @@ impl CFGInfo {
             }
         }
 
+        // Shortest spans first; each block takes the first span covering
+        // it. `next` skips filled blocks (path-halving union-find), so the
+        // whole fill is near-linear in blocks plus back edges.
+        let mut ic = core::mem::take(&mut self.innermost_cycle);
+        ic.clear();
+        ic.resize(nb, (u32::MAX, 0));
+        if !back_edges.is_empty() {
+            let mut order: Vec<(u32, u32)> = back_edges.clone();
+            order.sort_by_key(|&(h, u)| u - h);
+            let mut next: Vec<u32> = (0..=nb as u32).collect();
+            fn find(next: &mut [u32], mut x: u32) -> u32 {
+                while next[x as usize] != x {
+                    let p = next[x as usize];
+                    next[x as usize] = next[p as usize];
+                    x = p;
+                }
+                x
+            }
+            for (h, u) in order {
+                let mut b = find(&mut next, h);
+                while b <= u {
+                    ic[b as usize] = (h, u);
+                    next[b as usize] = b + 1;
+                    b = find(&mut next, b + 1);
+                }
+            }
+        }
+        self.innermost_cycle = ic;
         self.back_edges = back_edges;
         let approx_loop_depth = self.approx_loop_depth.cleared();
         let mut backedge_stack: SmallVec<[u32; 4]> = smallvec![];

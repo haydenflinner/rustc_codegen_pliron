@@ -1410,16 +1410,10 @@ impl<'a, F: Function> Env<'a, F> {
                     let mut best: Option<(u32, u32)> = None;
                     for entry in &self.ctx.bundles[bundle].ranges {
                         for u in &self.ctx.ranges[entry.index].uses {
-                            let ub = cfg.insn_block[u.pos.inst().index()].index() as u32;
-                            if let Some(&e) = cfg
-                                .back_edges
-                                .iter()
-                                .filter(|&&(h, s)| h <= ub && ub <= s)
-                                .min_by_key(|&&(h, s)| s - h)
-                            {
-                                if best.is_none_or(|(bh, bs)| e.1 - e.0 < bs - bh) {
-                                    best = Some(e);
-                                }
+                            let ub = cfg.insn_block[u.pos.inst().index()].index();
+                            let e = cfg.innermost_cycle[ub];
+                            if e.0 != u32::MAX && best.is_none_or(|(bh, bs)| e.1 - e.0 < bs - bh) {
+                                best = Some(e);
                             }
                         }
                     }
