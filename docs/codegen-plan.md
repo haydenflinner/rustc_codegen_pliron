@@ -581,6 +581,15 @@ Evening (2026-10-31):
      stores were what cost.
   json's extra traffic is mostly results returned through memory after
   calls, a separate item.
+- **Measurement note** (2026-11-02): the quick six-layout A/Bs quoted
+  below for join threading, bittab canon, spill CSE and the LICM knobs
+  ran against a stale `base` (a zsh `nomatch` abort made the cleanup a
+  no-op), so their magnitudes include earlier flips. The authoritative
+  numbers are the held-out batch A/Bs (same build, knob forced off):
+  invparam 1.149 -> 1.142, join threading + canon 1.144 -> 1.142 (json
+  1.150 -> 1.135), spill CSE 1.140 -> 1.134, ESC_TRAP 1.132 -> 1.131
+  (blind-sig 1.108 -> 1.075), SYMSUB 1.133 -> 1.121 (json 1.129 ->
+  1.069). Rejections stand: a stale base favours the variant.
 - **Option-tag re-tests** (2026-11-02): serde_json's `parse_whitespace`
   inlined into a loop merges `peek()`'s tag and byte, the loop tests the
   tag, and the loop's exits join to test it again for the caller. That

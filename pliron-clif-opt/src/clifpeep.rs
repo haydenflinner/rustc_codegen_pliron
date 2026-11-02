@@ -9991,6 +9991,7 @@ enum CseKey {
     IC(IntCC, Type, Value, Value),
     FC(FloatCC, Type, Value, Value),
     T(Opcode, Type, Value, Value, Value),
+    G(cranelift_codegen::ir::GlobalValue),
 }
 
 // Commutative integer ops get sorted args; fadd/fmul are bitwise
@@ -10057,9 +10058,18 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
         InstructionData::Ternary { opcode, args } => {
             Some(CseKey::T(opcode, t, r(args[0]), r(args[1]), r(args[2])))
         }
+        // `PLIRON_CSE_SYM=1`: one `symbol_value` per global and block (or
+        // dominator scope, under dgvn). Separate copies hid `(sym + n) -
+        // sym` and `sym + a == sym + b` from every fold keyed on values.
+        InstructionData::UnaryGlobalValue { opcode: Opcode::SymbolValue, global_value } if *CSE_SYM => {
+            Some(CseKey::G(global_value))
+        }
         _ => None,
     }
 }
+
+static CSE_SYM: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_CSE_SYM", "1"));
 
 /// Per-block CSE with the shared keying: later insts in a block alias
 /// the earliest equivalent def, which dominates them.
