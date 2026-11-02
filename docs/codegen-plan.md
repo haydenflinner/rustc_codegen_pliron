@@ -835,6 +835,65 @@ Evening (2026-10-31):
     clones just the loop. Small win even if done: `b` stays live across
     `follow_epsilons` for the byte compare.
 
+## Paused here (2026-11-02, 16:30 EST)
+
+Where the register-allocation work stands, for whoever picks it up.
+
+**Landed on main (all opt-in unless noted; validated by gate, fuzz with
+`PLIRON_RA_CHECK=1`, held-out):**
+- Defaults flipped today: `PLIRON_XCGU_HOME=1`, `PLIRON_INLINE_FREEMUL=12`
+  (held-out 1.125 -> 1.121). Current held-out geomean: **1.121**.
+- `PLIRON_RA_EXPLAIN=<symbol substring>` (debug): regalloc2 logs every
+  split, eviction (with spill weights), requirement conflict and
+  minimal-bundle fallback for matching functions as `ra2x:` lines, plus
+  their pre-regalloc VCode. **Use this before guessing why a value is
+  reloaded in a loop**: find the vreg in the VCode (e.g. `%v196`), then
+  `grep 'v\[196\]'` the `ra2x:` lines.
+- `PLIRON_RA2_LOOPDEPTH=1`: loop depth from dominance-checked back edges
+  only. The stock estimate counts cold paths that jump back into hot code
+  as loops (regex `next_state` reached "depth" 16; 12 bundles saturated at
+  the weight cap, so ties picked who kept a register).
+- `PLIRON_RA2_LOOPSPLIT=1`: when a bundle must split, split at the entry or
+  exit of the innermost cycle around its hottest use (shortest back edge
+  covering it), without trimming the loop piece. pulldown's byte-scan loop
+  becomes LLVM's 6-instruction shape with no stack access.
+- Also opt-in from today, measured neutral: `PLIRON_SELFACT`,
+  `PLIRON_LICM_INNERPRESS=2`, `PLIRON_UNSWITCH_LOOP`, `PLIRON_X17`,
+  `PLIRON_X30`, `PLIRON_FNORDER`, `PLIRON_LOOPALIGN`, `PLIRON_FNALIGN`,
+  `PLIRON_XCGU_HOME=skip` (details in docs/loop-unswitch-pressure.md and
+  the entries above).
+
+**Last measurement (batch 50, held-out, 3 layouts x 2 pads):** both RA
+knobs on vs off: geomean 1.121 vs 1.121. pulldown -3.0%, html-rewriter
+-0.9%, json -0.7%; regex +1.3%, protobuf +2.3%, blind-sig +0.6%. Not
+flipped.
+
+**Next steps, in order:**
+1. Branch `wip/ra-cycle-index` (pushed, d884aa1, unverified): replaces
+   the loop split's per-use scan of every back edge (quadratic on huge
+   functions) with a per-block innermost-cycle table. Check it gives the
+   same allocations as main (compare disassembly ignoring addresses and the
+   file-name header line), then gate + fuzz. Required before any default
+   flip of `PLIRON_RA2_LOOPSPLIT`.
+2. Run `PLIRON_RA_EXPLAIN` on protobuf's and regex's hottest functions
+   with both knobs on vs off, and find which split makes them slower.
+   Candidates seen so far: in regex's unrolled DFA loop the split adds
+   register copies on the hot path (values used both in the inner cycle
+   and in the search loop at the same depth). A "split only when the rest
+   of the bundle is colder" rule fixed that but cost pulldown (its scan
+   loop and special-byte handler share a header, so loop depth can't tell
+   them apart); a frequency-aware cost (reloads saved in the cycle vs
+   moves added at its boundary edges) is the likely fix.
+3. If the losers are fixed, flip `PLIRON_RA2_LOOPDEPTH` and
+   `PLIRON_RA2_LOOPSPLIT` in separate commits through the usual batch
+   (gate, crates, fuzz with `PLIRON_RA_CHECK=1`, held-out with an old
+   variant).
+
+**Measurement notes:** single-binary warm-loop timings move 1-5% with
+code placement and stack offset alone; use `evalcfg.sh` (layouts x pads)
+or held-out `--layouts 3 --pads 0,2040` for decisions. regex is the
+noisiest bench (layout spread up to 10%).
+
 ## Sequencing (revised 2026-10-31, after the census)
 
 The census reordered the plan: register allocation (W4) and the fact
