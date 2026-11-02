@@ -106,6 +106,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // two layout-averaged runs (8 layouts), the rest flat
     // (docs/codegen-plan.md, inline policy search).
     "PLIRON_INVPARAM",
+    // Decided Option-tag re-tests at loop exits threaded: regex -3.5%,
+    // json -1.2%, geomean 0.991 (6 layouts).
+    "PLIRON_JOINTHREAD",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
