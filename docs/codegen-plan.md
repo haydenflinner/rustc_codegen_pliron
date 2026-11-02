@@ -761,6 +761,16 @@ Evening (2026-10-31):
   `test.sh xcguhome`.
   On held-out (batch 47) `PLIRON_XCGU_HOME=1` and `FREEMUL=12` together
   give 1.125 -> 1.121, each alone off 1.125; both on by default.
+  What is left of blind-sig's loss at 100 is inlined degraded copies:
+  `SmallVec::clone` inlines a copied `from_iter` whose `Cloned::next`
+  has no body in that CGU, so the copy loop calls it per element.
+  `PLIRON_XCGU_HOME=skip` (opt-in) makes no degraded copy whose home is
+  linkable (iterated: dropping one can degrade another). Five benches x
+  3 layouts x 2 pads: at 100 it fixes blind-sig (+2.9% -> +0.6%) and
+  keeps pulldown's gain (-2.6%), but regex +2.4%, json +1.6% (geomean
+  1.0045); at 50 it is 1.016 (pulldown +2.6%, regex +3.7%): inlining a
+  degraded body usually still wins. "Degraded" is too coarse; a callee
+  missing inside a copy's loop would be the finer test.
 - **Placement: code order, stack offset, alignment** (2026-11-02). Four
   tuning benches, each binary run at four environment pads (moves the
   initial stack; `bench/heldout/run.py --pads`), LLVM at the same pads:
