@@ -570,8 +570,37 @@ Evening (2026-10-31):
      (pulldown -0.3%, regex +1.1%). On these cores spill reloads are
      cheap (L1, store forwarding); stack-traffic samples overstate them.
      Not landed; patches kept.
+  3. *Stored-back invariants* (2026-11-02): a split loop range reloaded
+     a loop invariant and stored it straight back each iteration. Spill
+     CSE (`PLIRON_SPILLCSE`, on; PLIRON_PATCH #94) drops a spill of a
+     register known to hold that slot, and the reload-CSE facts now
+     flow through every block as an intersection over predecessors,
+     iterated to a fixpoint, so they survive loop headers. pulldown -394
+     spill stores; geomean 0.987 over six layouts (regex -3.7%, json
+     -2.2%). The cheap-reload lesson above still holds for loads; dead
+     stores were what cost.
   json's extra traffic is mostly results returned through memory after
   calls, a separate item.
+- **Option-tag re-tests** (2026-11-02): serde_json's `parse_whitespace`
+  inlined into a loop merges `peek()`'s tag and byte, the loop tests the
+  tag, and the loop's exits join to test it again for the caller. That
+  second use kept the merged tag live past the merge block, so jump
+  threading never threaded the merge (13 instructions and three back
+  branches per byte vs LLVM's 6). `PLIRON_JOINTHREAD` (on) folds a
+  `brif` whose block is reached only through one arm of a `brif` on the
+  same value, and retargets jumps into a block that is only such a test;
+  the merge then threads. `PLIRON_BITTAB_CANON` (on) lets bittab compare
+  leaf args through single-predecessor params, so the whitespace chain
+  becomes LLVM's bit test. regex -3.5%, json -2%, geomean 0.991.
+- **Single-site inline threshold** (2026-11-02): pulldown's
+  `parse_line` closure (4,594 raw ops, one site) misses the free
+  threshold (10 x limit = 4,200), so its scan loop pays a call, seven
+  spills and a result through memory per special byte. LLVM inlines it.
+  `PLIRON_INLINE_FREEMUL=12` inlines it, but the enclosing
+  `scalar_iterate_special_bytes` then stays out of line with a
+  register-starved loop: pulldown +2.2% (with spill CSE, -1% vs -0.6%),
+  regex/json -2-3% from other inlines. Left at 10; the real fix is
+  sizing the simplified callee (see below).
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
