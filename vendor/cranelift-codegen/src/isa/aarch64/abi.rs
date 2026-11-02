@@ -1318,6 +1318,25 @@ impl ABIMachineSpec for AArch64MachineDeps {
     }
 
     fn get_machine_env(flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
+        if x17_allocatable() || x30_allocatable() {
+            static EXTRA_PINNED: std::sync::OnceLock<MachineEnv> = std::sync::OnceLock::new();
+            static EXTRA: std::sync::OnceLock<MachineEnv> = std::sync::OnceLock::new();
+            let (cell, pinned) = if flags.enable_pinned_reg() {
+                (&EXTRA_PINNED, true)
+            } else {
+                (&EXTRA, false)
+            };
+            return cell.get_or_init(|| {
+                let mut env = create_reg_env(pinned);
+                if x17_allocatable() {
+                    env.preferred_regs_by_class[0].add(xreg_preg(17));
+                }
+                if x30_allocatable() {
+                    env.preferred_regs_by_class[0].add(xreg_preg(30));
+                }
+                env
+            });
+        }
         if flags.enable_pinned_reg() {
             static MACHINE_ENV: MachineEnv = create_reg_env(true);
             &MACHINE_ENV
@@ -1328,24 +1347,12 @@ impl ABIMachineSpec for AArch64MachineDeps {
     }
 
     fn get_regs_clobbered_by_call(call_conv: isa::CallConv, is_exception: bool) -> PRegSet {
-        match (call_conv, is_exception) {
-            (isa::CallConv::Tail, true) => ALL_CLOBBERS,
-            (isa::CallConv::Winch, true) => ALL_CLOBBERS,
-            (isa::CallConv::Winch, false) => WINCH_CLOBBERS,
-            // Note that "PreserveAll" actually preserves nothing at
-            // the callsite if used for a `try_call`, because the
-            // unwinder ABI for `try_call`s is still "no clobbered
-            // register restores" for this ABI (so as to work with
-            // Wasmtime).
-            (isa::CallConv::PreserveAll, true) => ALL_CLOBBERS,
-            (isa::CallConv::SystemV, _) => DEFAULT_AAPCS_CLOBBERS,
-            // On Mach-O, the compact unwind info properly describes how are callee-save
-            // registers restored during unwinding.
-            (isa::CallConv::AppleAarch64, true) => DEFAULT_AAPCS_CLOBBERS,
-            (isa::CallConv::PreserveAll, _) => NO_CLOBBERS,
-            (_, false) => DEFAULT_AAPCS_CLOBBERS,
-            (_, true) => panic!("unimplemented clobbers for exn abi of {call_conv:?}"),
+        let mut set = clobbers_by_conv(call_conv, is_exception);
+        if x30_allocatable() {
+            // `bl`/`blr` write the link register.
+            set.add(xreg_preg(30));
         }
+        set
     }
 
     fn get_ext_mode(
@@ -1371,6 +1378,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
         fixed_frame_storage_size: u32,
         outgoing_args_size: u32,
     ) -> FrameLayout {
+        let lr_clobbered = regs.iter().any(|r| r.to_reg() == link_reg().to_real_reg().unwrap());
         let mut regs: Vec<Writable<RealReg>> = regs
             .iter()
             .cloned()
@@ -1406,8 +1414,15 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 || fixed_frame_storage_size > 0
                 || outgoing_args_size > 0;
 
+        // `PLIRON_X30`: a body that allocates the link register needs the
+        // frame record to save and restore it.
+        let uses_lr = x30_allocatable() && lr_clobbered;
+
         // Compute linkage frame size.
-        let setup_area_size = if needs_linkage_frame || function_calls == FunctionCalls::Regular {
+        let setup_area_size = if needs_linkage_frame
+            || uses_lr
+            || function_calls == FunctionCalls::Regular
+        {
             16 // FP, LR
         } else {
             0
@@ -1774,6 +1789,27 @@ const fn all_clobbers() -> PRegSet {
         .with(vreg_preg(29))
         .with(vreg_preg(30))
         .with(vreg_preg(31))
+}
+
+fn clobbers_by_conv(call_conv: isa::CallConv, is_exception: bool) -> PRegSet {
+    match (call_conv, is_exception) {
+        (isa::CallConv::Tail, true) => ALL_CLOBBERS,
+        (isa::CallConv::Winch, true) => ALL_CLOBBERS,
+        (isa::CallConv::Winch, false) => WINCH_CLOBBERS,
+        // Note that "PreserveAll" actually preserves nothing at
+        // the callsite if used for a `try_call`, because the
+        // unwinder ABI for `try_call`s is still "no clobbered
+        // register restores" for this ABI (so as to work with
+        // Wasmtime).
+        (isa::CallConv::PreserveAll, true) => ALL_CLOBBERS,
+        (isa::CallConv::SystemV, _) => DEFAULT_AAPCS_CLOBBERS,
+        // On Mach-O, the compact unwind info properly describes how are callee-save
+        // registers restored during unwinding.
+        (isa::CallConv::AppleAarch64, true) => DEFAULT_AAPCS_CLOBBERS,
+        (isa::CallConv::PreserveAll, _) => NO_CLOBBERS,
+        (_, false) => DEFAULT_AAPCS_CLOBBERS,
+        (_, true) => panic!("unimplemented clobbers for exn abi of {call_conv:?}"),
+    }
 }
 
 const DEFAULT_AAPCS_CLOBBERS: PRegSet = default_aapcs_clobbers();

@@ -3643,9 +3643,20 @@ impl MachInstEmit for Inst {
                     // that no other instructions will be inserted here (we're emitting directly),
                     // and a live range of `tmp2` should not span this instruction, so this use
                     // should otherwise be correct.
-                    debug_assert!(rd.to_reg() != tmp2_reg());
-                    debug_assert!(reg != tmp2_reg());
-                    let tmp = writable_tmp2_reg();
+                    //
+                    // With `PLIRON_X17`, x17 is allocatable, so use `rd` (written here
+                    // anyway) unless it is also the base, in which case the base is an
+                    // allocated register and `spilltmp` is free.
+                    let tmp = if !x17_allocatable() {
+                        debug_assert!(rd.to_reg() != tmp2_reg());
+                        debug_assert!(reg != tmp2_reg());
+                        writable_tmp2_reg()
+                    } else if rd.to_reg() != reg {
+                        rd
+                    } else {
+                        debug_assert!(reg != spilltmp_reg());
+                        writable_spilltmp_reg()
+                    };
                     for insn in Inst::load_constant(tmp, abs_offset).into_iter() {
                         insn.emit(sink, emit_info, state);
                     }

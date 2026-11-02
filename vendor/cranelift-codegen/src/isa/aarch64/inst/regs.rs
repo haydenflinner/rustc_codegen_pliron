@@ -128,6 +128,23 @@ pub fn writable_spilltmp_reg() -> Writable<Reg> {
     Writable::from_reg(spilltmp_reg())
 }
 
+/// `PLIRON_X17`: x17 is allocatable (LLVM allocates both IP registers).
+/// Its post-regalloc uses are all in the prologue (stack-limit check,
+/// probestack loop) where it holds nothing, or in a long-branch veneer,
+/// which then saves and restores it. x16 stays the emit scratch.
+pub fn x17_allocatable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_X17").as_deref() == Ok("1"))
+}
+
+/// `PLIRON_X30`: the link register is allocatable, as in LLVM. Every call
+/// clobbers it, and a function that allocates it sets up a frame record,
+/// which saves and restores it around the body.
+pub fn x30_allocatable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_X30").as_deref() == Ok("1"))
+}
+
 /// Get a reference to the second temp register. We need this in some edge cases
 /// where we need both the spilltmp and another temporary.
 ///

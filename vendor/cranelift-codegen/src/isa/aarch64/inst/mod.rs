@@ -3391,13 +3391,14 @@ impl MachInstLabelUse for LabelUse {
     fn veneer_size(self) -> CodeOffset {
         match self {
             LabelUse::Branch14 | LabelUse::Branch19 => 4,
+            LabelUse::Branch26 if regs::x17_allocatable() => 28,
             LabelUse::Branch26 => 20,
             _ => unreachable!(),
         }
     }
 
     fn worst_case_veneer_size() -> CodeOffset {
-        20
+        if regs::x17_allocatable() { 28 } else { 20 }
     }
 
     /// Generate a veneer into the buffer, given that this veneer is at `veneer_offset`, and return
@@ -3426,6 +3427,30 @@ impl MachInstLabelUse for LabelUse {
             // available. Otherwise for intra-function jumps we also reserve
             // x16/x17 as spill-style registers. In both cases these are
             // available for us to use.
+            // With `PLIRON_X17`, x17 may hold a live value across an
+            // intra-function jump, so the veneer saves it below sp around its use.
+            LabelUse::Branch26 if regs::x17_allocatable() => {
+                let tmp1 = regs::spilltmp_reg();
+                let tmp1_w = regs::writable_spilltmp_reg();
+                let tmp2 = regs::tmp2_reg();
+                let tmp2_w = regs::writable_tmp2_reg();
+                // str x17, [sp, #-16]!
+                let save = 0xf81f0ff1u32;
+                // ldrsw x16, 20
+                let ldr = emit::enc_ldst_imm19(0b1001_1000, 20 / 4, tmp1);
+                // adr x17, 16
+                let adr = emit::enc_adr(16, tmp2_w);
+                // add x16, x16, x17
+                let add = emit::enc_arith_rrr(0b10001011_000, 0, tmp1_w, tmp1, tmp2);
+                // ldr x17, [sp], #16
+                let restore = 0xf84107f1u32;
+                // br x16
+                let br = emit::enc_br(tmp1);
+                for (i, w) in [save, ldr, adr, add, restore, br].into_iter().enumerate() {
+                    buffer[i * 4..i * 4 + 4].clone_from_slice(&u32::to_le_bytes(w));
+                }
+                (veneer_offset + 24, LabelUse::PCRel32)
+            }
             LabelUse::Branch26 => {
                 let tmp1 = regs::spilltmp_reg();
                 let tmp1_w = regs::writable_spilltmp_reg();
