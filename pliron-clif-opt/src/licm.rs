@@ -1675,7 +1675,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-        );
+            &FxHashSet::default(),        );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("licm produced invalid IR: {e}\n{}", func.display());
@@ -1737,7 +1737,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-        );
+            &FxHashSet::default(),        );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("licm produced invalid IR: {e}\n{}", func.display());
@@ -1809,7 +1809,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-        );
+            &FxHashSet::default(),        );
         let blk = |v: Value| {
             func.layout
                 .inst_block(func.dfg.value_def(v).inst().unwrap())
@@ -1892,7 +1892,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-        );
+            &FxHashSet::default(),        );
         let blk = |v: Value| {
             func.layout
                 .inst_block(func.dfg.value_def(v).inst().unwrap())
@@ -1981,7 +1981,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-        );
+            &FxHashSet::default(),        );
         let blk = |v: Value| {
             func.layout
                 .inst_block(func.dfg.value_def(v).inst().unwrap())
@@ -2073,7 +2073,7 @@ mod tests {
                 &FxHashMap::default(),
                 &pliron::cols::ColMap::default(),
                 &FxHashMap::default(),
-            );
+                &FxHashSet::default(),            );
             let flags =
                 cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
             if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
