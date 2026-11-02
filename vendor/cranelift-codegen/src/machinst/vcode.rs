@@ -884,7 +884,7 @@ impl<I: VCodeInst> VCode<I> {
     /// never be written.
     pub(crate) fn reload_cse(&self, ra: &regalloc2::Output) -> Option<regalloc2::Output> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_RELOADCSE").as_deref() == Ok("1"))
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RELOADCSE").as_deref() != Ok("0"))
             || !self.debug_value_labels.is_empty()
             || ra.edits.is_empty()
         {

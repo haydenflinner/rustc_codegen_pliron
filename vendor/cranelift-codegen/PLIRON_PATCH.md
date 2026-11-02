@@ -1125,7 +1125,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     so it skips the bounds clamp (x64 `cmp; cmov`; aarch64 `cmp; b.hs;
     csel; csdb`, replaced by one `mov`). Test:
     `pliron-clif-opt/tests/switch_dead_default.rs`.
-93. Reload CSE (`PLIRON_RELOADCSE`, `machinst/vcode.rs` `reload_cse`, run
+93. Reload CSE (`PLIRON_RELOADCSE=0` disables, `machinst/vcode.rs` `reload_cse`, run
     with reload PRE as `post_alloc` at emission and under
     `PLIRON_RELOADPRE_CHECK=1`'s checker): regalloc2 reloads a spilled
     value before each use, often into a fresh register, so one stretch of
