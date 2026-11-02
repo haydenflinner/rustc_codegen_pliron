@@ -1499,7 +1499,10 @@ fn module_codegen(
         };
     }
     // `PLIRON_XCGU_HOME=1`: degraded copies only; `=all`: every copy.
-    let home_mode = env_get("PLIRON_XCGU_HOME").filter(|_| !extra.is_empty());
+    // Native only: wasm's copies feed the waffle inliner and link through
+    // pliron-wasm-ld, untested here.
+    let home_mode = env_get("PLIRON_XCGU_HOME")
+        .filter(|_| !extra.is_empty() && !tcx.sess.target.is_like_wasm);
     let extra_set: rustc_hash::FxHashSet<_> =
         if home_mode.is_some() { extra.iter().copied().collect() } else { Default::default() };
     for &inst in &extra {
