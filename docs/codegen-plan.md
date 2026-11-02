@@ -759,6 +759,30 @@ Evening (2026-10-31):
   `PLIRON_XCGU_HOME=1` sends home only *degraded* copies (calls a fn of
   this crate whose body is in another CGU and not copied here); test
   `test.sh xcguhome`.
+  On held-out (batch 47) `PLIRON_XCGU_HOME=1` and `FREEMUL=12` together
+  give 1.125 -> 1.121, each alone off 1.125; both on by default.
+- **Placement: code order, stack offset, alignment** (2026-11-02). Four
+  tuning benches, each binary run at four environment pads (moves the
+  initial stack; `bench/heldout/run.py --pads`), LLVM at the same pads:
+  - Stack offset alone moves one binary 1-5% (LLVM 1-2%), as much as
+    function order; random function orders never vary it, so the
+    `--layouts` A/Bs understated noise.
+  - Profile-guided hot-first function order (`scratchpad place.py`,
+    ld64 `-order_file` by samples) was best or tied in the first run
+    (json 1.078 -> 1.064, regex 1.144 -> 1.139) but json did not
+    reproduce; regex gained twice. Worth ~0.5%, mostly by avoiding bad
+    layouts. `PLIRON_FNORDER=1` (loop fns first, `#[cold]` last within
+    an object) changes nothing: ordering within one object is too
+    local.
+  - Loop-head alignment above 16 hurts (`PLIRON_LOOPALIGN`: regex +2.5%
+    at 32, +4% at 64; pulldown +2.5% at 64: NOPs on every inner-loop
+    entry). Loop alignment off (`PLIRON_ALIGN=0`) and 64-byte function
+    alignment (`PLIRON_FNALIGN=64`) are within +-1.5% across 3 layouts x
+    4 pads (FNALIGN=64 looked -0.6% in one layout, then regex +2.4%
+    across layouts). No alignment setting is systematically better; the
+    remaining sensitivity is which hot code and data alias, not
+    alignment. Next: a cold text section (`#[cold]` and panic-only fns
+    out of `__text` across all objects), and pads in every A/B.
 
 ## Sequencing (revised 2026-10-31, after the census)
 
