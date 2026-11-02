@@ -615,6 +615,19 @@ Evening (2026-10-31):
   1.006 with NCC (regex +1.5%). Both opt-in. Same lesson as loop
   splitting: an L1 reload is cheaper than the spill that replaces it
   under register pressure; hoisting needs a pressure check.
+- **Panic-message slots** (2026-11-02): num-bigint-dig's `montgomery`
+  formats `&x, &y, &m` in an `assert!` message, so rustc keeps each in a
+  slot and every use reloaded it; the slots escape only into the panic's
+  arguments. `PLIRON_ESC_TRAP` (on) lets loadfwd ignore escapes in
+  dead-end trap blocks that load nothing (forwarding only; DSE and
+  promotion keep the strict set). The params' SmallVec inline/heap tests
+  then hoist out of the outer loop: blind-sig 1.108 -> 1.075 held-out.
+  Its remaining outer-loop work includes `(len*8)>>3` as a real `mul`:
+  Cranelift's egraph is skipped for any function holding an i128 value
+  (`egraph_safe`, ISLE prelude panics). Running it anyway (no panic on
+  blind-sig) made blind-sig 20% slower: it breaks the
+  `isplit (imul (uextend) (uextend))` shape the backend lowers to
+  mul+umulh. Keep the guard; port the few wanted rewrites instead.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
