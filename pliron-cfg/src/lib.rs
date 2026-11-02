@@ -112,6 +112,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // bittab leaf args through single-pred params: with join threading,
     // json 1.142 -> 1.133 (serde_json's whitespace skip is one bit test).
     "PLIRON_BITTAB_CANON",
+    // loadfwd ignores slot escapes in dead-end trap blocks (panic message
+    // args): blind-sig 1.092 -> 1.069 (6 layouts).
+    "PLIRON_ESC_TRAP",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
