@@ -1358,9 +1358,18 @@ impl MachInst for Inst {
     fn function_alignment() -> FunctionAlignment {
         // We use 32-byte alignment for performance reasons, but for correctness
         // we would only need 4-byte alignment.
+        // `PLIRON_FNALIGN=<bytes>` overrides the preferred alignment.
+        static FA: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let preferred = *FA.get_or_init(|| {
+            std::env::var("PLIRON_FNALIGN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &u32| v.is_power_of_two())
+                .unwrap_or(32)
+        });
         FunctionAlignment {
             minimum: 4,
-            preferred: 32,
+            preferred,
         }
     }
 }

@@ -1985,7 +1985,19 @@ impl<I: VCodeInst> VCode<I> {
             let mut new_offset = I::align_basic_block(buffer.cur_offset());
             // PLIRON: loop headers get 16-byte alignment.
             if loop_head[block.index()] {
-                new_offset = new_offset.max((buffer.cur_offset() + 15) & !15);
+                // `PLIRON_LOOPALIGN=<bytes>` (power of two, default 16).
+                static LA: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                let la = *LA.get_or_init(|| {
+                    std::env::var("PLIRON_LOOPALIGN")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|v: &u32| v.is_power_of_two())
+                        .unwrap_or(16)
+                });
+                new_offset = new_offset.max((buffer.cur_offset() + la - 1) & !(la - 1));
+                if la > 32 {
+                    buffer.require_alignment(la);
+                }
                 // PLIRON: with fixed-size instructions, a loop that fits in
                 // one 64-byte line must not straddle two: the hot loop is
                 // then one fetch block per iteration (chars_ascii ran 1.77x

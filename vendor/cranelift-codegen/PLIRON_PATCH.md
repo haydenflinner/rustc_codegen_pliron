@@ -1163,3 +1163,10 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     safe with `get_return_address`, which pliron emits only for wasm.
     Tuning geomean: x17 1.006, x30 1.007, both 1.001 (montgomery loses
     one spill pair; register count is not what limits these benches).
+96. Alignment knobs (opt-in, measured neutral or worse): `PLIRON_LOOPALIGN=<bytes>`
+    (power of two, default 16; `machinst/vcode.rs` loop heads, which ask
+    the function for that alignment above 32) and `PLIRON_FNALIGN=<bytes>`
+    (aarch64 preferred function alignment, default 32,
+    `aarch64/inst/mod.rs`). Across 3 function orders x 4 stack pads:
+    loop heads at 32/64 cost regex 2.5%/4% (NOPs on inner-loop entry);
+    64-byte functions are within noise.
