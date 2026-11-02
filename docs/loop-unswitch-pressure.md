@@ -190,3 +190,13 @@ forwarded loads are not the problem; about 12-13 real values compete for
 something else. The remaining lever is regalloc2's choice of what to
 spill around a call in a loop (spill weight of uses vs. the cost of
 reloads inside the loop), not the IR.
+
+Upstream spill weights (`RA2_LINEAR=1` build) reload `b` the same way, so
+the patched weight is not the cause. regalloc2 splits `b`'s whole-function
+range into minimal pieces around each use and reloads each from the
+stack; LLVM's greedy allocator instead gives `b` one loop-local piece in
+w22 for the whole loop and spills another value around the call (its
+loop has `str x19, [sp]` before `follow_epsilons`). The fix is a split
+heuristic in regalloc2: when a bundle with uses inside a loop is split,
+try a piece covering the loop (evicting a bundle whose loop-local part
+has fewer, or no, uses) before falling back to per-use minimal bundles.
