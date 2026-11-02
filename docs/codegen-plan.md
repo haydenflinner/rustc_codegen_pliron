@@ -523,6 +523,27 @@ Evening (2026-10-31):
   compare (+16 `uxth`/`uxtb`; Apple's ABI already zero-extends it). Across
   the matched hot functions `mov` dominates: the gap left is backend code
   quality (regalloc moves, edge-split blocks), not decisions.
+- **The three backend items, measured** (2026-11-01, layout-averaged,
+  five tuning benches):
+  1. *Narrow re-extension.* Not the ABI: the Rust calling convention marks
+     no small-int arg extended, so a "param arrives extended" rule never
+     fires. Extending once (`uextend` placed at the def, compares moved to
+     it) cut regex `next_state`'s `uxth` 19 -> 13 but kept both registers
+     live (stack refs 40 -> 56); neutral. Doing it right needs Cranelift to
+     track clean high bits across uses. Dropped.
+  2. *Edge-split move blocks.* 834 in regex vs LLVM's 399, but ~0% of
+     samples (cold paths). Code size only.
+  3. *Register copies.* The `mov` sample share (pulldown 9.2% vs 6.5%) is
+     mostly skid onto block-leading `mov`s after taken branches. The real
+     ones are back-edge copies: `latchspec` hoists `i + 1` above a scan
+     loop's exit test, so the new value needs its own register (`mov x8,
+     x10; b loop`, no branch saved). `PLIRON_LATCHSPEC=0` removes them
+     (pulldown -95 reg moves), and so does hoisting only when the
+     consumed values are dead on the exit side; both are neutral overall
+     (geomean 1.002 / 1.004 over 8 layouts; pulldown -0.7%, regex +2%).
+     Apple's cores eliminate `mov` at rename, so copies are cheap here.
+  Spills are the one item left that costs real work (stack refs 40 vs 21
+  in `next_state`).
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
