@@ -627,7 +627,17 @@ Evening (2026-10-31):
   (`egraph_safe`, ISLE prelude panics). Running it anyway (no panic on
   blind-sig) made blind-sig 20% slower: it breaks the
   `isplit (imul (uextend) (uextend))` shape the backend lowers to
-  mul+umulh. Keep the guard; port the few wanted rewrites instead.
+  mul+umulh. Keep the guard; port the few wanted rewrites instead
+  (`imul x, 2^k` -> `ishl` alone measured neutral, not landed).
+- **Static-string copies** (2026-11-02): counting libc calls with a
+  `DYLD_INSERT_LIBRARIES` interposer (same mallocs/reallocs as LLVM)
+  showed 137k memcpy calls in pulldown vs LLVM's 115k and 189k vs 70k
+  in json, all 1-14 bytes. A `&'static str`'s length arrives as
+  `(sym + n) - sym` from two `symbol_value`s GVN keeps apart, so the
+  copy's size never became a constant and `memcall` never expanded it.
+  `PLIRON_SYMSUB` (on) folds the difference: json 1.118 -> 1.058,
+  pulldown -0.9%; memcpy calls now 115k / 54k. With it, memcpy, memset
+  and bcmp counts match LLVM on all five tuning benches.
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
