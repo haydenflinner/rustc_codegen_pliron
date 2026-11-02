@@ -23,6 +23,13 @@ orders (ld64 `-order_file`, same objects) and time all of them; a side's
 time is the mean of its per-layout medians. Placement alone moves these
 ratios by ~3% (a byte-identical hot loop ran 50% slower in one layout), so
 single-layout differences below that are not evidence.
+
+`--pads P,P,..`: run every binary once per pad, with an environment
+variable of P bytes (`HELDOUT_PAD`), which moves the initial stack and so
+the addresses of stack data. One binary's time moves 1-5% across pads
+(LLVM's 1-2%), as much as with function order, and random function orders
+never vary it. Every side gets the same pads; a side's time is the mean
+over (layout, pad) cells of each cell's median.
 """
 import argparse, json, math, os, re, shutil, statistics, subprocess, sys
 
@@ -121,10 +128,10 @@ def src_dir(name):
     return os.path.join(OUT, "src", name)
 
 
-def run_once(name, exe):
+def run_once(name, exe, pad=0):
     """(ns, stdout ok) for one run, cwd = the benchmark dir (its inputs)."""
     src = os.path.join(OUT, "src", name)
-    r = sh([exe], cwd=src)
+    r = sh([exe], cwd=src, env=dict(os.environ, HELDOUT_PAD="x" * pad) if pad else None)
     m = re.search(r"^heldout-ns (\d+)$", r.stderr, re.M)
     exp = os.path.join(src, "benchmark.stdout.expected")
     ok = r.returncode == 0 and m is not None
@@ -142,10 +149,13 @@ def main():
     ap.add_argument("--json", default=os.path.join(OUT, "results.json"))
     ap.add_argument("--layouts", type=int, default=0,
                     help="relink each side under K random function orders (macOS)")
+    ap.add_argument("--pads", default="0",
+                    help="comma-separated environment pad sizes in bytes (stack placement)")
     ap.add_argument("--variant", action="append", default=[],
                     help="NAME:K=V,K=V -- another pliron build with extra backend env, "
                          "measured interleaved with the others (ratio vs LLVM each)")
     a = ap.parse_args()
+    pads = [int(x) for x in a.pads.split(",")]
     benches = [b for b in BENCHES if not a.only or b[0] in a.only.split(",")]
     os.makedirs(os.path.join(OUT, "src"), exist_ok=True)
 
@@ -186,17 +196,18 @@ def main():
                 s for s in allsides if not exes.get((name, s)))}
             continue
         t = {s: [] for s in sides}
-        tl = {(s, i): [] for s in sides for i in range(len(exes[(name, s)]))}
+        cells = {s: [(i, pad) for i in range(len(exes[(name, s)])) for pad in pads] for s in sides}
+        tl = {(s, c): [] for s in sides for c in cells[s]}
         bad = None
         for r in range(a.rounds):
             for s in (sides if r % 2 == 0 else sides[::-1]):
-                for i, exe in enumerate(exes[(name, s)]):
-                    ns, ok, p = run_once(name, exe)
+                for c in cells[s]:
+                    ns, ok, p = run_once(name, exes[(name, s)][c[0]], c[1])
                     if not ok:
                         bad = f"{s} run failed (rc {p.returncode}): {p.stderr[-300:]!r}"
                         break
                     t[s].append(ns)
-                    tl[(s, i)].append(ns)
+                    tl[(s, c)].append(ns)
                 if bad:
                     break
             if bad:
@@ -205,9 +216,8 @@ def main():
             res[name] = {"status": bad}
             print(f"  {name}: {bad}")
             continue
-        # Mean over layouts of each layout's median (one layout: the median).
-        med = {s: statistics.mean(statistics.median(tl[(s, i)]) for i in range(len(exes[(name, s)])))
-               for s in sides}
+        # Mean over (layout, pad) cells of each cell's median (one cell: the median).
+        med = {s: statistics.mean(statistics.median(tl[(s, c)]) for c in cells[s]) for s in sides}
         for s in sides[2:]:
             res.setdefault("variants", {}).setdefault(s, {})[name] = med[s] / med["llvm"]
         res[name] = {"status": "ok", "llvm_ms": med["llvm"] / 1e6, "pliron_ms": med["pliron"] / 1e6,
@@ -226,7 +236,7 @@ def main():
         vs = list(by.values())
         print(f"geomean {s}/llvm over {len(vs)}: {math.exp(sum(map(math.log, vs)) / len(vs)):.3f}")
     with open(a.json, "w") as f:
-        json.dump({"rounds": a.rounds, "geomean": gm, "benches": res}, f, indent=1)
+        json.dump({"rounds": a.rounds, "pads": pads, "geomean": gm, "benches": res}, f, indent=1)
 
 
 if __name__ == "__main__":
