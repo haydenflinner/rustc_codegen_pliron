@@ -669,6 +669,21 @@ Evening (2026-10-31):
   each other: `is_ascii::runtime`); the ascii helpers alone do nothing.
   Next: find which copy unlocks the closure inline, or size copies by
   their simplified body.
+- **blind-sig's real gap** (2026-11-02): the held-out binary times one
+  ~2 ms sign; whole-process profiles (setup included) showed parity, so
+  earlier montgomery analysis read the wrong code. A copy of the bench
+  with `start..end` in a loop gives the same ratio warm (1.067 vs 1.065
+  cold), and its profile shows the gap: one of montgomery's two inner
+  multiply-accumulate loops keeps its source pointer in a stack slot,
+  `stur` after the post-increment and `ldur` on the back edge every
+  iteration (store-forwarding latency on the loop-carried chain, plus a
+  `cbz`/`b` back edge); LLVM's loop has no stack access. The CLIF loop
+  carries four values. With `PLIRON_POSTIDX=0` the spill moves to the
+  other loop (blind-sig -0.9%, blake3 +0.6%); with `PLIRON_ESC_TRAP=0` it
+  disappears but the outer loop loses more. Likely the pointer's bundle
+  is merged with long out-of-loop ranges, its weight diluted, then split
+  per use. Fix belongs in regalloc2's split/eviction (split a spilled
+  bundle at loop boundaries so the in-loop piece gets loop-depth weight).
   Lesson: the mask had to be undone by every pass that reshaped the
   table. Encoding the fact where it belongs (the switch's default) made
   each consumer simple.
