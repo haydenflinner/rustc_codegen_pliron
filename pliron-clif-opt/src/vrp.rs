@@ -197,10 +197,10 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
                 let s = pos.ins().iadd(x, y);
                 let z = pos.ins().iconst(cranelift_codegen::ir::types::I8, 0);
                 let _ = ty;
-                func.dfg.change_to_alias(sum, s);
-                func.dfg.change_to_alias(flag, z);
                 func.dfg.clear_results(inst);
                 func.layout.remove_inst(inst);
+                func.dfg.change_to_alias(sum, s);
+                func.dfg.change_to_alias(flag, z);
             }
         }
     }

@@ -1,0 +1,22 @@
+; test vrp
+; diffcheck
+; check: iconst.i8 1
+; check: iconst.i8 0
+; check-not: icmp ult v2, v3
+; check-not: v7 = band
+; check-not: uadd_overflow
+function %f(i64, i64) -> i8, i8, i64, i64, i8 {
+block0(v0: i64, v1: i64):
+    ; v2 in [0, 255], v3 = 256: v2 < v3 always, v2 == v3 never
+    v20 = iconst.i64 255
+    v2 = band v0, v20
+    v3 = iconst.i64 256
+    v4 = icmp ult v2, v3
+    v5 = icmp eq v2, v3
+    ; band of a value already within the mask is the value
+    v6 = uload8.i64 v1
+    v7 = band v6, v20
+    ; a sum of two bytes cannot carry out of 64 bits
+    v8, v9 = uadd_overflow v2, v6
+    return v4, v5, v7, v8, v9
+}

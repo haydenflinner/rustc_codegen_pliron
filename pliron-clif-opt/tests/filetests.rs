@@ -49,6 +49,20 @@ fn pass(name: &str) -> Pass {
             clifpeep::dgvn(f, &dt)
         },
         "edgefwd" => edgefwd::run,
+        "vrp" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::vrp::run(f, &mut an)
+        },
+        "ivexit" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::scev::exit_values(f, &mut an)
+        },
+        "brhint" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::brhint::run(f, &mut an);
+            // Report the hints as a count so `check` lines can test them.
+            f.layout.blocks().filter(|&b| f.layout.unlikely_arm(b).is_some()).count()
+        },
         "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "zext_chain" => clifpeep::zext_chain,

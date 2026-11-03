@@ -1,0 +1,20 @@
+; test vrp
+; diffcheck
+; check: iconst.i8 1
+; check-not: icmp ult v0, v3
+function %f(i64) -> i8 {
+block0(v0: i64):
+    ; on the true arm v0 < 10, so v0 < 20 holds there
+    v1 = iconst.i64 10
+    v2 = icmp ult v0, v1
+    brif v2, block1, block2
+
+block1:
+    v3 = iconst.i64 20
+    v4 = icmp ult v0, v3
+    return v4
+
+block2:
+    v5 = iconst.i8 0
+    return v5
+}

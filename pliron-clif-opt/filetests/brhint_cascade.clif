@@ -1,0 +1,32 @@
+; test brhint
+; check: brif
+function %f(i64) -> i64 {
+block0(v0: i64):
+    ; a compare cascade on v0: each match arm is unlikely
+    v1 = iconst.i64 1
+    v2 = icmp eq v0, v1
+    brif v2, block10, block1
+
+block1:
+    v3 = iconst.i64 2
+    v4 = icmp eq v0, v3
+    brif v4, block11, block2
+
+block2:
+    ; zero test: eq is unlikely
+    v5 = iconst.i64 0
+    v6 = icmp eq v0, v5
+    brif v6, block12, block13
+
+block10:
+    return v1
+
+block11:
+    return v3
+
+block12:
+    return v5
+
+block13:
+    return v0
+}
