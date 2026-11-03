@@ -1608,6 +1608,63 @@ impl<I: VCodeInst> VCode<I> {
                 final_order.push(block);
             }
         }
+        // Count edits per block ahead of time; this is needed for
+        // lookahead island emission. (We could derive it per-block
+        // with binary search in the edit list, but it's more
+        // efficient to do it in one pass here.)
+        let mut ra_edits_per_block: SmallVec<[u32; 64]> = smallvec![];
+        let mut edit_idx = 0;
+        for block in 0..self.num_blocks() {
+            let end_inst = InsnIndex::new(self.block_ranges.get(block).end);
+            let start_edit_idx = edit_idx;
+            while edit_idx < regalloc.edits.len() && regalloc.edits[edit_idx].0.inst() < end_inst {
+                edit_idx += 1;
+            }
+            let end_edit_idx = edit_idx;
+            ra_edits_per_block.push((end_edit_idx - start_edit_idx) as u32);
+        }
+
+        // PLIRON: chain-based placement of the hot blocks with static
+        // branch probabilities (`PLIRON_PLACE=1`, `machinst/placement.rs`);
+        // cold blocks stay at the end in their original order.
+        static PLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Blocks that start a placed loop chain: aligned like loop heads
+        // (a rotated loop's chain starts at a body block, not the header).
+        let mut chain_heads: Option<Vec<bool>> = None;
+        if *PLACE.get_or_init(|| std::env::var("PLIRON_PLACE").as_deref() == Ok("1")) {
+            let nb = self.num_blocks();
+            let succs: Vec<Vec<usize>> = (0..nb)
+                .map(|b| {
+                    self.block_succs(BlockIndex::new(b))
+                        .iter()
+                        .map(|s| s.index())
+                        .filter(|&s| s < nb)
+                        .collect()
+                })
+                .collect();
+            let cold: Vec<bool> = (0..nb).map(|b| self.block_order.is_cold(BlockIndex::new(b))).collect();
+            // A block that is only an unconditional jump, with no regalloc
+            // edits, emits nothing: `MachBuffer` aliases its label to the
+            // target, so it is free wherever it lands.
+            let empty: Vec<bool> = (0..nb)
+                .map(|b| {
+                    let r = self.block_ranges.get(b);
+                    r.len() == 1
+                        && ra_edits_per_block[b] == 0
+                        && succs[b].len() == 1
+                        && self.insts[r.start].is_term() == MachTerminator::Branch
+                })
+                .collect();
+            let unlikely: Vec<Vec<bool>> = (0..nb)
+                .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
+                .collect();
+            if let Some((order, heads)) = super::placement::place(self.entry.index(), &succs, &cold, &empty, &unlikely) {
+                if order.len() == final_order.len() {
+                    final_order = order.into_iter().map(BlockIndex::new).collect();
+                    chain_heads = Some(heads);
+                }
+            }
+        }
         final_order.extend(cold_blocks.clone());
 
         // PLIRON: mark blocks that are targets of backward edges in the
@@ -1629,9 +1686,21 @@ impl<I: VCodeInst> VCode<I> {
             for (pred, range) in self.block_succ_range.iter() {
                 for succ in &self.block_succs[range] {
                     let s = succ.index();
+                    // PLIRON: under placement, a head whose layout
+                    // predecessor branches conditionally into it is not
+                    // padded: the pad would turn that fallthrough into a
+                    // taken branch plus a jump.
+                    let cond_fallthrough = chain_heads.is_some() && order_of[s] > 0 && {
+                        let p = final_order[order_of[s] - 1];
+                        let pr = self.block_succ_range.get(p.index());
+                        let ps = &self.block_succs[pr];
+                        ps.len() >= 2 && ps.iter().any(|t| t.index() == s)
+                    };
                     if s < self.num_blocks()
                         && order_of[s] <= order_of[pred]
-                        && self.block_order.is_back_edge_target(BlockIndex::new(s))
+                        && !cond_fallthrough
+                        && (self.block_order.is_back_edge_target(BlockIndex::new(s))
+                            || chain_heads.as_ref().is_some_and(|h| h[s]))
                     {
                         loop_head[s] = true;
                         loop_end[s] = loop_end[s].max(order_of[pred]);
@@ -1745,22 +1814,6 @@ impl<I: VCodeInst> VCode<I> {
 
         if !self.debug_value_labels.is_empty() {
             inst_offsets.resize(self.insts.len(), NO_INST_OFFSET);
-        }
-
-        // Count edits per block ahead of time; this is needed for
-        // lookahead island emission. (We could derive it per-block
-        // with binary search in the edit list, but it's more
-        // efficient to do it in one pass here.)
-        let mut ra_edits_per_block: SmallVec<[u32; 64]> = smallvec![];
-        let mut edit_idx = 0;
-        for block in 0..self.num_blocks() {
-            let end_inst = InsnIndex::new(self.block_ranges.get(block).end);
-            let start_edit_idx = edit_idx;
-            while edit_idx < regalloc.edits.len() && regalloc.edits[edit_idx].0.inst() < end_inst {
-                edit_idx += 1;
-            }
-            let end_edit_idx = edit_idx;
-            ra_edits_per_block.push((end_edit_idx - start_edit_idx) as u32);
         }
 
         let is_forward_edge_cfi_enabled = self.abi.is_forward_edge_cfi_enabled();

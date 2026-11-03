@@ -256,6 +256,8 @@ pub use vcode::*;
 pub mod compile;
 pub use compile::*;
 pub mod blockorder;
+/// PLIRON: chain-based block placement (`PLIRON_PLACE=1`).
+pub mod placement;
 pub use blockorder::*;
 pub mod abi;
 pub use abi::*;

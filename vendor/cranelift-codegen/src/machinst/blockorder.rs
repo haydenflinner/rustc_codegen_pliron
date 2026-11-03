@@ -88,6 +88,9 @@ pub struct BlockLoweringOrder {
     /// which is used by VCode emission to sink the blocks at the last
     /// moment (when we actually emit bytes into the MachBuffer).
     cold_blocks: FxHashSet<BlockIndex>,
+    /// PLIRON: (block, successor index) pairs the CLIF marked unlikely
+    /// (`Layout::unlikely_arm`), for emission-time placement.
+    unlikely_succs: FxHashSet<(BlockIndex, usize)>,
     /// PLIRON: targets of true dominance back-edges (loop headers, and
     /// the critical-edge blocks materialized for such edges). Edges
     /// that merely point backward in emission order — e.g. merge
@@ -401,6 +404,7 @@ impl BlockLoweringOrder {
         // first.
         let mut lowered_succ_indices = Vec::new();
         let mut cold_blocks = FxHashSet::default();
+        let mut unlikely_succs = FxHashSet::default();
         let mut indirect_branch_targets = FxHashSet::default();
         let mut back_edge_targets = FxHashSet::default();
         let lowered_succ_ranges =
@@ -427,6 +431,9 @@ impl BlockLoweringOrder {
 
                         if f.is_effectively_cold(block) {
                             cold_blocks.insert(bindex);
+                        }
+                        if let Some(arm) = f.layout.unlikely_arm(block) {
+                            unlikely_succs.insert((bindex, arm as usize));
                         }
 
                         if indirect_branch_target_clif_blocks.contains(&block) {
@@ -474,6 +481,7 @@ impl BlockLoweringOrder {
             lowered_succ_ranges,
             blockindex_by_block,
             cold_blocks,
+            unlikely_succs,
             back_edge_targets,
             indirect_branch_targets,
         };
@@ -505,6 +513,11 @@ impl BlockLoweringOrder {
     /// Determine whether the given lowered-block index is cold.
     pub fn is_cold(&self, block: BlockIndex) -> bool {
         self.cold_blocks.contains(&block)
+    }
+
+    /// PLIRON: is successor `idx` of `block` hinted unlikely?
+    pub fn is_unlikely_succ(&self, block: BlockIndex, idx: usize) -> bool {
+        self.unlikely_succs.contains(&(block, idx))
     }
 
     /// PLIRON: whether the given lowered-block index is the target of

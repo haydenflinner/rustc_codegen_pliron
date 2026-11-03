@@ -36,6 +36,10 @@ pub struct Layout {
     /// First block in the layout order, or `None` when no blocks have been laid out.
     first_block: Option<Block>,
 
+    /// PLIRON: static branch hint per block: `k + 1` when arm `k` of the
+    /// block's `brif` is unlikely (0: no hint). Read by block placement.
+    unlikely: SecondaryMap<Block, u8>,
+
     /// Last block in the layout order, or `None` when no blocks have been laid out.
     last_block: Option<Block>,
 
@@ -49,6 +53,7 @@ impl Layout {
     pub fn new() -> Self {
         Self {
             blocks: SecondaryMap::new(),
+            unlikely: SecondaryMap::new(),
             insts: SecondaryMap::new(),
             first_block: None,
             last_block: None,
@@ -63,6 +68,7 @@ impl Layout {
         self.first_block = None;
         self.last_block = None;
         self.num_blocks = 0;
+        self.unlikely.clear();
     }
 
     /// Returns the capacity of the `BlockData` map.
@@ -381,6 +387,24 @@ impl Layout {
     /// Is the given block cold?
     pub fn is_cold(&self, block: Block) -> bool {
         self.blocks[block].cold
+    }
+
+    /// PLIRON: mark arm `arm` (0 or 1) of `block`'s `brif` as unlikely.
+    pub fn set_unlikely_arm(&mut self, block: Block, arm: u8) {
+        self.unlikely[block] = arm + 1;
+    }
+
+    /// PLIRON: clear the branch hint of `block`.
+    pub fn clear_unlikely_arm(&mut self, block: Block) {
+        self.unlikely[block] = 0;
+    }
+
+    /// PLIRON: the unlikely arm of `block`'s `brif`, if hinted.
+    pub fn unlikely_arm(&self, block: Block) -> Option<u8> {
+        match self.unlikely[block] {
+            0 => None,
+            k => Some(k - 1),
+        }
     }
 }
 

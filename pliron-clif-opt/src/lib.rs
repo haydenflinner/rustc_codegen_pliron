@@ -6,6 +6,8 @@
 //! backend dylib.
 
 pub mod armmerge;
+pub mod scev;
+pub mod brhint;
 pub mod bcheck;
 pub mod bunroll;
 pub mod latchspec;

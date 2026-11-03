@@ -3846,6 +3846,14 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
+    crate::brhint::run(&mut p.clctx.func, an)
+}
+
+fn s_scev(p: &mut Pipe, an: &mut Analysis) -> usize {
+    crate::scev::census(&p.clctx.func, an)
+}
+
 fn s_ivdown(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::ivdown::run(&mut p.clctx.func, an);
     if k > 0 {
@@ -4408,6 +4416,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `p + d == e` exit tests with `d`, `e` invariant: `p == e - d`.
         // After ivretro, which rewrites a second IV as `p + d`.
         step("ivcmp", "ivcmp", Gate::Env("PLIRON_IVCMP"), s_ivcmp).needs(shape::LOOPS),
+        // SCEV-lite census (analysis only, `PLIRON_TRACE=pliron::scev`).
+        step("scev", "", Gate::OptIn("PLIRON_SCEV"), s_scev).needs(shape::LOOPS),
         // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
         // — are phase-D relational merges; the later sameargs3/webmerge
         // positions cover anything this extra call found.)
@@ -4639,6 +4649,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // After everything: the `end + -1` bound and the stepped pointer
         // only settle into one block at the end (parse_only).
         step("stepcmp", "", Gate::OptIn("PLIRON_STEPCMP"), s_stepcmp).needs(shape::LOOPS),
+        // Last: static branch hints for emission-time placement
+        // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
+        step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
     ]
 });
 
