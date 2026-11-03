@@ -1037,9 +1037,26 @@ LLVM's 7 with one, and each extra instruction had a different owner:
 
 With all five knobs the reproducer (`t/zipcmp.rs`) is LLVM's loop
 exactly: `ldrb [x2, x9]; ldrb [x4, x9]; cmp; b.ne; add x9, x9, #1; cmp
-x9, #n; b.lo`. Filetests `ivrefold_alias.clif` and `looprot_sink.clif`;
-regex corpus diffcheck clean under the chain (1579 ok, 338 inconclusive,
-0 mismatches). Lesson: every one of the four owners was a pass-ordering
+x9, #n; b.lo`, and so is brotli's. Filetests `ivrefold_alias.clif` and
+`looprot_sink.clif`; regex corpus diffcheck clean under the chain (1579
+ok, 338 inconclusive, 0 mismatches). Measured (evalcfg, 3 layouts x 3
+rounds): **rust-compression 0.899 of base with all five knobs**, while
+the null-fold half (0.992) and the rotation half (0.990) alone are
+worth 1% each — the loop needs the whole chain. Tuning set: 1.012 at
+first, all of it blind-sig (+7%): montgomery's inner loop, now
+index-addressed, had a post-index store between the sum's `add` and its
+carry `cmn`, and the flag-twin sweep (patch 91) stopped at it because
+`nzcv_free` did not list the writeback forms. With that fixed the chain
+is 1.002 on the tuning set (blind-sig 0.998, regex +1% inside its
+spread) and compression stays at 0.899. Validation batch (gate both
+ways, 600 fuzz seeds, held-out with `chain` and `rot` variants) is
+running; flip on pass.
+
+Follow-ups seen in the same profile: `EvaluateNode` (6% of samples)
+stays out of line — the inliner scores it 692 against a 320 threshold at
+all three callers, and its 18 nested calls disqualify it from the
+in-loop bonus; LLVM inlines it. `BrotliEstimateBitCostsForLiterals`
+runs 37% slower than LLVM's and is not yet looked at. Lesson: every one of the four owners was a pass-ordering
 or fact-propagation gap, not a missing optimization; the late pipeline
 (`jtround` → `sameargs`/`niche`/`constdedup2` → `ivrefold2` →
 `looprot2`) is where iterator loops become canonical, and anything that

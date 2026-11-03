@@ -54,7 +54,7 @@ fn pend_clamps_on_bound_overflow() {
         }",
     );
     let mut after = before.clone();
-    let k = pliron_clif_opt::indvars::run(&mut after, &mut Analysis::default(), false);
+    let k = pliron_clif_opt::indvars::run(&mut after, &mut Analysis::default(), false, &mut pliron_clif_opt::vmap::VMap::default());
     assert!(k > 0, "elim_shadowed did not fire\n{}", after.display());
     let cfg = Config {
         trials: 128,
