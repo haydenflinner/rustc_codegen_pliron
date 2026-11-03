@@ -894,6 +894,68 @@ code placement and stack offset alone; use `evalcfg.sh` (layouts x pads)
 or held-out `--layouts 3 --pads 0,2040` for decisions. regex is the
 noisiest bench (layout spread up to 10%).
 
+## 2026-11-02/03: the three frameworks as opt-in steps (W5, W3, W2)
+
+Built in one session, each behind a knob, measured on the five tuning
+benches (`evalcfg.sh`: 3 relinked layouts x 3 rounds x 2 stack pads,
+ratios to the same-day base build). All three pass the regex corpus
+diffcheck (1917 functions) and their filetests.
+
+**W5 placement** (`PLIRON_PLACE=1`, Cranelift patch 98): emission-time
+chain placement with static probabilities (`machinst/placement.rs`), with
+`PLIRON_BRHINT=1` (last CLIF step) supplying compare-cascade and zero-test
+hints through `Layout::set_unlikely_arm`. What the A/Bs taught:
+
+- Emission-time loop rotation is a loss (1.012): it costs a taken jump per
+  loop entry; `looprot`'s IR-level rotation gets a fallthrough guard
+  instead. Off by default (`PLIRON_PLACE_ROT=1`).
+- A 50/50 tie on a compare cascade (a `br_table` turned chain) must keep
+  the chain contiguous: without the hint regex lost 5-10%
+  (`follow_epsilons`). With `brhint`: regex neutral.
+- Chain heads must not be padded when entered by a conditional
+  fallthrough (directly or through an empty edge block): the NOPs turn
+  the fallthrough into `b.cond head; b other` — a taken branch per
+  iteration.
+- Result: 0.993-0.995 geomean of base on the tuning set (blind-sig -2%,
+  pulldown -1%, json -0.6%). Held-out with the check set: pending the
+  batch below.
+
+**W3 ranges** (`PLIRON_VRP=1`): `ranges.rs`, one memoized interval engine
+(unsigned + signed, definitions and dominating `brif` facts) and `vrp.rs`
+as its first consumer (icmp/brif folds, redundant masks and extensions,
+urem/udiv below the divisor, carry-free overflow checks). regex corpus:
+139 of 1917 functions change, -86 instructions net; with `celim` off,
+vrp recovers 60% of celim's effect (celim's remaining edge is symbolic
+facts, `x <u y`, which constant intervals cannot carry). Runtime on the
+tuning set: neutral (within +-1%). Compile time: 81 ms of 10.4 s on the
+regex corpus (0.8%). Three miscompiles found by `PLIRON_DIFFCHECK=step`
+on blind-sig before it was clean: an unmodeled type (i128) read as a
+1-bit range, a band fold that used the bound as the bit cover, and
+sign-extended narrow constants. Lesson: every rule needs the width in
+hand, and `diffcheck=step` on a real crate catches what the corpus
+replay's random inputs miss.
+
+**W2 SCEV-lite** (`scev.rs`): add recurrences per header param
+(constant or invariant step), affine exit tests with their net step, and
+unit-step symbolic trip counts, as a shared analysis. The census over the
+regex corpus (`PLIRON_SCEV=1`, `PLIRON_TRACE=pliron::scev`): 2005 loops,
+1470 with a constant-step IV, 744 with a computable trip count, 133
+same-step IV pairs after `ivrefold`, 19 loops with two exit tests on
+distinct IVs (the LFTR case is rare here). First consumer `ivexit`
+(`PLIRON_IVEXIT=1`): exit-value replacement of a recurrence that is only
+returned (`q = p + (q0 - p0)` at the exits, forwarding params stripped).
+7 loops in regex; `next_state`'s counter also feeds a second header slot
+(previous-iteration value) and stays. Runtime: neutral on the tuning set.
+
+Where this leaves the plan: the frameworks exist and are correct, but
+the runtime gains on the held-out programs are small (placement ~0.5%,
+the rest noise), consistent with the 10-31 census: the gap is calls,
+frames, loads and spills, not branch layout or range facts. The next
+consumers worth building on them are the ones that touch those: trip
+counts for `willreturn` and unroll decisions, ranges for `dem64`-style
+narrowing of address arithmetic, and placement's frequencies exported to
+regalloc2 as spill weights (today it uses its own loop-depth estimate).
+
 ## Sequencing (revised 2026-10-31, after the census)
 
 The census reordered the plan: register allocation (W4) and the fact

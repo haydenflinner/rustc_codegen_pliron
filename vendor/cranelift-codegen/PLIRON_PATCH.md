@@ -1175,3 +1175,30 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     dumps the pre-regalloc VCode when regalloc2's explain flag is set, so
     pliron's `PLIRON_RA_EXPLAIN=<symbol substring>` shows a function's
     VCode next to its allocation decisions (vendored regalloc2 patch log).
+98. Chain-based block placement with static branch probabilities (opt-in,
+    `PLIRON_PLACE=1`; `machinst/placement.rs`, hooked in `VCode::emit`
+    where cold blocks were already sunk). Edge probabilities in the
+    Ball-Larus style (cold or trapping target 1/33, back edge 124/128,
+    loop exit 4/128, CLIF hint 4/36, else even); block frequencies by
+    packaged loops (`1 / (1 - back-edge mass)`, capped 4096 per loop);
+    MachineBlockPlacement-style chains per loop innermost first (hottest
+    successor, skipped when a hotter predecessor is still unplaced; ties
+    to a successor with no other unplaced predecessor; fallback to the
+    hottest block whose predecessors are all placed, else the first
+    unplaced in RPO), loop chains as units in the function chain, cold
+    blocks last. Empty jump-only blocks (label-aliased at emission) are
+    placed last and chains see through them. `PLIRON_PLACE_ROT=1` rotates
+    loop chains by a branch-cost model (worse: a taken jump per loop
+    entry that `looprot`'s guard avoids). Chain heads are aligned like
+    loop heads unless entered by a conditional fallthrough, directly or
+    through an empty edge block (the pad turned regex `follow_epsilons`'s
+    hot fallthrough into a taken branch plus a jump, +24% on the
+    function). `PLIRON_PLACE_DEBUG=1` dumps the graph, frequencies and
+    order. Branch hints: `Layout::set_unlikely_arm`/`unlikely_arm`
+    (`ir/layout.rs`), forwarded by `BlockLoweringOrder::is_unlikely_succ`
+    (`machinst/blockorder.rs`); pliron's `brhint` step sets them (compare
+    cascades on one value, zero tests). Tuning A/B, 3 layouts x 3 rounds x
+    2 pads: placement alone 0.996-1.013 of base (regex +5-10% from the
+    cascade split and the padded head), with hints and the padding rule
+    0.993-0.995 (blind-sig -2%, pulldown -1%, json -0.6%, regex and
+    blake3 neutral).
