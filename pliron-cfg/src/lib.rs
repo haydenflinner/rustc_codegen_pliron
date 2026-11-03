@@ -125,6 +125,14 @@ pub const DEFAULT_ON: &[&str] = &[
     // reads PLIRON_PLACE itself, on by default; docs/codegen-plan.md
     // 2026-11-02/03): held-out 1.111 -> 1.104 with the check set.
     "PLIRON_BRHINT",
+    // The zip/enumerate loop chain (docs/codegen-plan.md 2026-11-03
+    // afternoon): the late null fold, its brif-aware single-source
+    // lookthrough, and looprot's latch sink; with `PLIRON_IVREFOLD2` and
+    // `PLIRON_LOOPROT2` (pipeline gates) held-out 1.117 -> 1.099,
+    // rust-compression -9%. `=0` restores each.
+    "PLIRON_NULLSRC",
+    "PLIRON_NULLFOLD2",
+    "PLIRON_LOOPROT_SINK",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

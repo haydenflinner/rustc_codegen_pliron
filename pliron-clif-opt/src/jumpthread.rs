@@ -1320,8 +1320,9 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
     };
     let sentinel = crate::pass_enabled("PLIRON_SENTINEL");
     let paramnull = crate::pass_enabled("PLIRON_PARAMNULL");
-    // Opt-in: removes the zip/enumerate per-element null test, but the
-    // threading it enables costs regex ~5% (compression gains ~4%).
+    // Removes the zip/enumerate per-element null test (on since
+    // 2026-11-03 with the late fold, `ivrefold2` and `looprot2`;
+    // `PLIRON_NULLSRC=0` disables). Alone it cost regex ~5% on 10-31.
     let single_src = pliron_cfg::env_is("PLIRON_NULLSRC", "1");
     let mut hits = Vec::new();
     let mut cfg_lazy: Option<ControlFlowGraph> = None;
@@ -5168,7 +5169,7 @@ fn fnn<'a>(
     fold_null_tests(func, &nn, rnn)
 }
 
-/// Late null-test folds (`PLIRON_NULLFOLD2=1`, from `jtround`): the
+/// Late null-test folds (`PLIRON_NULLFOLD2=0` disables; from `jtround`): the
 /// lattice rebuilt on the current CFG for tests the first `jumpthread`
 /// could not decide. The zip/enumerate niche test is `icmp eq (select f,
 /// p, 0), 0` with `f` and `p` single-edge params only after edgespec and

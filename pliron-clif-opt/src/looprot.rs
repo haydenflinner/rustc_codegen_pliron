@@ -25,7 +25,8 @@ pub fn run(
 }
 
 /// `run` with the latch sink (`sink_to_latch`) chosen by the caller
-/// (`PLIRON_LOOPROT_SINK=1` in the pipeline; filetests pass it directly).
+/// (`PLIRON_LOOPROT_SINK`, default on, in the pipeline; filetests pass
+/// it directly).
 pub fn run_with(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
@@ -75,8 +76,9 @@ pub fn run_with(
                 })
         };
         if ok {
-            // `PLIRON_LOOPROT_SINK=1`: the header's own increments move
-            // to the latch first, so the rotated loop carries one index.
+            // The header's own increments move to the latch first, so
+            // the rotated loop carries one index (`PLIRON_LOOPROT_SINK=0`
+            // disables).
             if sink && sink_to_latch(func, an, h) > 0 {
                 an.invalidate(func);
             }

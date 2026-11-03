@@ -1048,9 +1048,15 @@ index-addressed, had a post-index store between the sum's `add` and its
 carry `cmn`, and the flag-twin sweep (patch 91) stopped at it because
 `nzcv_free` did not list the writeback forms. With that fixed the chain
 is 1.002 on the tuning set (blind-sig 0.998, regex +1% inside its
-spread) and compression stays at 0.899. Validation batch (gate both
-ways, 600 fuzz seeds, held-out with `chain` and `rot` variants) is
-running; flip on pass.
+spread) and compression stays at 0.899. Validation: gate clean with
+the chain on and off, 600 fuzz seeds clean, held-out (8 programs, 5
+rounds x 3 layouts x 2 pads) **1.117 -> 1.099** (compression 1.402 ->
+1.281, json -1.8%, regex -1.2%, pulldown -1.2%, blind-sig +0.7%;
+rotation alone 1.107). **All five flipped on** (`PLIRON_NULLSRC=0`,
+`PLIRON_NULLFOLD2=0`, `PLIRON_IVREFOLD2=0`, `PLIRON_LOOPROT2=0`,
+`PLIRON_LOOPROT_SINK=0` restore). The `jt_backedge_stale` shape test
+now accepts a back edge with no arguments (the counters refold onto one
+index).
 
 Follow-ups seen in the same profile: `EvaluateNode` (6% of samples)
 stays out of line — the inliner scores it 692 against a 320 threshold at

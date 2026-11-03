@@ -40,6 +40,13 @@ fn erase_indices_backedge_carries_counters() {
         .find(|(_, b)| b.iter().any(|l| l.starts_with("store.i64 notrap") && l.ends_with("-8")))
         .expect("update_index latch");
     let back = *latch.1.iter().rev().find(|l| l.starts_with("brif") || l.starts_with("jump")).unwrap();
+    // Since 2026-11-03 (`ivrefold2` after the late null fold) the loop
+    // carries one index and the back edge passes no block arguments at
+    // all: nothing pre-loop can ride on it.
+    if !back.contains('(') {
+        eprintln!("back edge carries no arguments: {back}");
+        return;
+    }
     // Its loop target: the destination that has another, outside edge.
     let mut checked = false;
     for t in back.split(' ').filter_map(|w| w.split_once('(').map(|(b, _)| b)).filter(|b| b.starts_with("block")) {

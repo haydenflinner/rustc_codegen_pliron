@@ -2095,8 +2095,9 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // NonNull builds lazily inside `round` on the first candidate edge;
     // a round that threads nothing never pays for the fixpoint.
     let mut nn: Option<jumpthread::NonNull> = None;
-    // `PLIRON_NULLFOLD2=1`: null tests the first jumpthread left (see
-    // `fold_nulls_late`) before the rounds thread the decided edges.
+    // Null tests the first jumpthread left (see `fold_nulls_late`),
+    // before the rounds thread the decided edges (`PLIRON_NULLFOLD2=0`
+    // disables; on since 2026-11-03).
     if pliron_cfg::env_is("PLIRON_NULLFOLD2", "1") {
         let k = jumpthread::fold_nulls_late(&mut p.clctx.func, p.nonnull, p.derived);
         if k > 0 {
@@ -4613,8 +4614,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // loops after `nullfold2`), then the rotation those loops can
         // take once their niche test is gone: top test + `jump` back
         // becomes one bottom `brif`.
-        step("ivrefold2", "ivrefold", Gate::OptIn("PLIRON_IVREFOLD2"), s_ivrefold).needs(shape::LOOPS),
-        step("looprot2", "looprot", Gate::OptIn("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
+        step("ivrefold2", "ivrefold", Gate::Env("PLIRON_IVREFOLD2"), s_ivrefold).needs(shape::LOOPS),
+        step("looprot2", "looprot", Gate::Env("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         // Loop-invariant header params onto a preheader (no back-edge
         // param webs for regalloc2 to spill around; serde_json's escape scan).
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
