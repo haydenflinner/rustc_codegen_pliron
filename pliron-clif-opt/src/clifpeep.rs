@@ -30,6 +30,43 @@ use crate::vmap::{BMap, BSet, VMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
+/// On an aarch64 target (set by the pipeline from the ISA; `PLIRON_BIGOFF=0`
+/// disables): memory offsets the encoder cannot take as an immediate are not
+/// folded, and are split into a hoistable `base + hi` plus a small
+/// offset (see `amode_off_fits`).
+static BIGOFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_bigoff(on: bool) {
+    BIGOFF.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn bigoff_on() -> bool {
+    BIGOFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether an aarch64 load/store of `ty` encodes `[base + off]` without
+/// materializing the offset: `ldur`'s signed 9-bit, or the scaled
+/// unsigned 12-bit (`off` a multiple of the access size, up to
+/// `4095 * size`). Beyond that the lowering spends `mov`+`movk` on the
+/// offset at every access (miniz_oxide's `compress_inner` reads three
+/// `Box` fields at `d + 0x10018..0x10028` per byte: 224 `movk` in one
+/// function, LLVM none).
+pub fn amode_off_fits(ty: Type, off: i64) -> bool {
+    if (-256..=255).contains(&off) {
+        return true;
+    }
+    let size = i64::from(ty.bytes().max(1));
+    off >= 0 && off % size == 0 && off / size <= 4095
+}
+
+/// The `(hi, lo)` split of an unencodable offset: `hi` a multiple of
+/// 4096 (one `add base, #hi, lsl #12` when it fits 24 bits, hoistable
+/// when `base` is), `lo` in `0..4096`.
+fn bigoff_split(off: i64) -> (i64, i64) {
+    let lo = off.rem_euclid(4096);
+    (off - lo, lo)
+}
+
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
     match func.dfg.insts[func.dfg.value_def(v).inst()?] {
@@ -10225,9 +10262,11 @@ pub fn lcse(func: &mut Function) -> usize {
     // `(a + k) + x` chains: rewrite the outer add's args to
     // `(a, x)` — in-place, so its operands still dominate it — and
     // carry `k` into the offset too (outer add must be single-use).
+    let bigoff = bigoff_on();
     let memoff = |func: &mut Function,
                   v: &mut Value,
                   off: &mut i64,
+                  ty: Type,
                   seen: &mut Seen,
                   cnt: &mut FxHashMap<Value, u32>|
      -> usize {
@@ -10245,6 +10284,10 @@ pub fn lcse(func: &mut Function) -> usize {
             let a = func.dfg.resolve_aliases(*v);
             if let Some((b, k)) = bin_k(func, a, Opcode::Iadd) {
                 match off.checked_add(k).and_then(|x| i32::try_from(x).ok()) {
+                    // A peel that leaves an offset the encoder would
+                    // materialize at the access stays an `iadd` (it is
+                    // the split's hoistable base, or will become it).
+                    Some(no) if bigoff && !amode_off_fits(ty, i64::from(no)) => break,
                     Some(no) => {
                         *off = i64::from(no);
                         // The peel moves the memory operand from the
@@ -10290,6 +10333,9 @@ pub fn lcse(func: &mut Function) -> usize {
             let Some(no) = off.checked_add(k).and_then(|x| i32::try_from(x).ok()) else {
                 break;
             };
+            if bigoff && !amode_off_fits(ty, i64::from(no)) {
+                break;
+            }
             *off = i64::from(no);
             let other = args[1 - ix];
             untrack(func, seen, d);
@@ -10326,9 +10372,70 @@ pub fn lcse(func: &mut Function) -> usize {
             }
         }
     }
+    // bigoff (`PLIRON_BIGOFF=0` disables): an access whose folded offset the encoder would
+    // materialize becomes `q = iadd base, hi; access [q + lo]`, `q`
+    // shared per block by `(base, hi)` and hoisted/merged by licm and
+    // dgvn later (`memoff` above no longer folds it back). The x64
+    // encoder takes any 32-bit displacement, so the pipeline sets the
+    // flag only for aarch64.
+    let mut bigmap: FxHashMap<(Value, i64), Value> = FxHashMap::default();
+    let split = |func: &mut Function,
+                 at: Inst,
+                 a: &mut Value,
+                 off: &mut i64,
+                 ty: Type,
+                 bigmap: &mut FxHashMap<(Value, i64), Value>,
+                 cnt: &mut FxHashMap<Value, u32>|
+     -> usize {
+        if !bigoff || func.dfg.value_type(*a) != types::I64 {
+            return 0;
+        }
+        // Two shapes: the offset itself is unencodable, or the base is
+        // `iadd b, k` whose constant `memoff` refused to fold because
+        // the sum would be (the constant is then a hoisted register per
+        // distinct `k`, three for miniz's fields; one `b + hi` serves
+        // them all).
+        let (base, total) = if amode_off_fits(ty, *off) {
+            let Some((b, k)) = bin_k(func, func.dfg.resolve_aliases(*a), Opcode::Iadd) else {
+                return 0;
+            };
+            let Some(t) = off.checked_add(k).filter(|t| i32::try_from(*t).is_ok()) else {
+                return 0;
+            };
+            if amode_off_fits(ty, t) {
+                return 0;
+            }
+            // Already the split shape (`k` is the hi part).
+            if k == bigoff_split(t).0 {
+                return 0;
+            }
+            (b, t)
+        } else {
+            (func.dfg.resolve_aliases(*a), *off)
+        };
+        let (hi, lo) = bigoff_split(total);
+        let q = match bigmap.get(&(base, hi)) {
+            Some(&q) => q,
+            None => {
+                let mut pos = FuncCursor::new(func).at_inst(at);
+                let k = pos.ins().iconst(types::I64, hi);
+                let q = pos.ins().iadd(base, k);
+                inc(func, cnt, base);
+                inc(func, cnt, k);
+                bigmap.insert((base, hi), q);
+                q
+            }
+        };
+        dec(func, cnt, *a);
+        inc(func, cnt, q);
+        *a = q;
+        *off = lo;
+        1
+    };
     let mut compact_at = 1024;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         seen.clear();
+        bigmap.clear();
         let mut dead = Vec::new();
         for i in func.layout.block_insts(b).collect::<Vec<_>>() {
             let data = func.dfg.insts[i];
@@ -10336,7 +10443,10 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Load { arg, offset, .. } => {
                     let mut a = arg;
                     let mut off = i64::from(offset);
-                    if memoff(func, &mut a, &mut off, &mut seen, &mut usecnt) > 0 {
+                    let ty = func.dfg.value_type(func.dfg.first_result(i));
+                    let mut k = memoff(func, &mut a, &mut off, ty, &mut seen, &mut usecnt);
+                    k += split(func, i, &mut a, &mut off, ty, &mut bigmap, &mut usecnt);
+                    if k > 0 {
                         if let InstructionData::Load { arg, offset, .. } = &mut func.dfg.insts[i] {
                             *arg = a;
                             *offset = (off as i32).into();
@@ -10348,7 +10458,10 @@ pub fn lcse(func: &mut Function) -> usize {
                 InstructionData::Store { args, offset, .. } => {
                     let mut a = args[1];
                     let mut off = i64::from(offset);
-                    if memoff(func, &mut a, &mut off, &mut seen, &mut usecnt) > 0 {
+                    let ty = func.dfg.value_type(args[0]);
+                    let mut k = memoff(func, &mut a, &mut off, ty, &mut seen, &mut usecnt);
+                    k += split(func, i, &mut a, &mut off, ty, &mut bigmap, &mut usecnt);
+                    if k > 0 {
                         if let InstructionData::Store { args, offset, .. } = &mut func.dfg.insts[i]
                         {
                             args[1] = a;

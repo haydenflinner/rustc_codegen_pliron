@@ -2602,6 +2602,51 @@ impl<I: VCodeInst> VCode<I> {
                     continue;
                 };
                 let n = chain.len();
+                // PLIRON: one writeback per chain (`PLIRON_POSTIDX_ONEWB=0`
+                // restores the telescoping chain). Telescoping writebacks (`str [b], #4; str [b],
+                // #4; str [b], #4; str [b], #8`) make every access's
+                // address wait on the previous access's writeback, so a
+                // loop storing a 20-byte struct per iteration (brotli's
+                // `BrotliInitZopfliNodes`) carries a 4-cycle recurrence
+                // through the base where the `add` it replaced cost one.
+                // Instead the last offset-0 member `k` takes the whole
+                // bump `#C` and the members after it are re-addressed to
+                // `[base + (o_m - C)]` (`stur`), as LLVM's loop-strength
+                // reduction lays the same loop out; members before `k`
+                // keep their offsets. Refused (the `add` stays) when a
+                // re-addressed offset does not encode.
+                static ONE_WB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let one_wb = *ONE_WB.get_or_init(|| {
+                    std::env::var("PLIRON_POSTIDX_ONEWB").map_or(true, |v| v != "0")
+                });
+                if one_wb {
+                    let Some(k) = chain.iter().rposition(|&(_, o, _)| o == 0) else {
+                        continue;
+                    };
+                    let kix = chain[k].0;
+                    if preg_ops[kix.index()].1.iter().any(|r| *r == base) {
+                        continue;
+                    }
+                    if !self.insts[kix.index()].post_index_imm_ok(c) {
+                        continue;
+                    }
+                    if chain[k + 1..]
+                        .iter()
+                        .any(|&(ix, o, _)| !self.insts[ix.index()].mem_offset_ok(o - c))
+                    {
+                        continue;
+                    }
+                    if c != 0 {
+                        self.insts[kix.index()].set_post_index(c);
+                        preg_ops[kix.index()].1.push(base);
+                        for &(ix, o, _) in &chain[k + 1..] {
+                            self.insts[ix.index()].set_mem_offset(o - c);
+                        }
+                    }
+                    self.insts[add_ix.index()] = I::gen_nop(0);
+                    squashed[add_ix.index()] = true;
+                    continue;
+                }
                 let mut wbs: SmallVec<[i64; 8]> = SmallVec::new();
                 for m in 0..n {
                     let next = if m + 1 < n { chain[m + 1].1 } else { c };

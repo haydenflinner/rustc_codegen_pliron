@@ -632,6 +632,19 @@ pub trait MachInstEmit: MachInst {
     /// validated by the caller.
     fn set_post_index(&mut self, _wb: i64) {}
 
+    /// PLIRON: whether this load/store (a `mem_signed_offset` access)
+    /// can be re-addressed to `[base + off]` with no helper
+    /// instructions — the post-index sweep runs after register
+    /// allocation, so an offset that would need a scratch register is
+    /// refused.
+    fn mem_offset_ok(&self, _off: i64) -> bool {
+        false
+    }
+
+    /// PLIRON: re-address this load/store to `[base + off]`. `off` must
+    /// have passed `mem_offset_ok`.
+    fn set_mem_offset(&mut self, _off: i64) {}
+
     /// If this instruction is `add rd, rn, #imm` with `rd == rn`,
     /// return `(rn, imm)`.
     fn self_add_imm(&self) -> Option<(Reg, i64)> {

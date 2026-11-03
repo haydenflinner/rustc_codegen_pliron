@@ -1117,6 +1117,96 @@ depth hoist already lands on loop entries; a colder boundary further
 back rarely exists and did not pay where it did. Held-out 0.999
 [0.995, 1.003] of base. Opt-in.
 
+## 2026-11-03 (night): compression at the new defaults; post-index chains serialize fills
+
+**The profile, redone.** The earlier note that `BrotliEstimateBitCostsForLiterals`
+ran 37% slower than LLVM's came from a 50-sample profile taken before the
+zip-loop chain went on. At today's defaults (dev2 rebuilt at 41c583e; the
+profiling scripts had been using a dylib that predated the warm-gate flip,
+which still had `EvaluateNode` out of line) and 300 process runs per side:
+
+| function (self samples) | pliron | LLVM |
+|---|---|---|
+| `BrotliCreateHqZopfliBackwardReferences` (with `EvaluateNode` inlined on both) | 893 | 589 |
+| `FindMatchLengthWithLimit` | 564 | 581 |
+| `BrotliEstimateBitCostsForLiterals` | 448 | 429 |
+| `set_from_literal_costs` | 231 | 244 |
+| `StoreAndFindMatchesH10` | 137 | 115 |
+| ZopfliNode / Command fills (`extend_with` vs LLVM's alloc + `bzero`) | 132 + 78 | 126 + 65 |
+| miniz_oxide `compress_inner` | 104 | 18 |
+| `_platform_memmove` | 98 | 27 |
+
+So the literal-cost estimator is at parity and off the list. The brotli
+side is about 685 samples (19%) behind, and HqZopfli alone is 304 of it.
+Per instruction, three things in HqZopfli, in order of size:
+
+1. *`BrotliInitZopfliNodes`' fill* (196 samples vs LLVM's 86). The CLIF is
+   right: four stores at `p+0, +4, +8, +12` and `p += 20`. The emit-time
+   post-index sweep (patch 90's) then telescoped the bump into a writeback
+   on every store, `str [b], #4; str [b], #4; str [b], #4; str [b], #8`,
+   so each address waits on the previous store's writeback and the next
+   iteration's first store on the last: a 4-cycle recurrence through the
+   base where the `add` it deleted cost one. LLVM's loop-strength
+   reduction puts the base 16 bytes into the record, two `stur` at
+   negative offsets and one `str wzr, [x10], #20`. Built the same:
+   `PLIRON_POSTIDX_ONEWB=1` gives the last offset-0 access the whole bump
+   and re-addresses the ones after it below the bumped base (`stur`),
+   refusing the rewrite when an offset does not encode. The loop is now
+   `str wzr, [x1], #0x14; stur s1, [x1, #-0x10]; stur w0, [x1, #-0xc];
+   stur d0, [x1, #-0x8]`; HqZopfli's post-index stores 18 -> 5, the
+   binary's 2109 -> 1395. Test `pliron-clif-opt/tests/postidx_onewb.rs`.
+   Gate 94/94 and fuzz 400/400 with the knob on; held-out (10 rounds, 3
+   layouts, 2 pads, A/A floor 0.999 [0.993, 1.005]): compression 0.980
+   [0.974, 0.991] of base, geomean 0.997 [0.992, 1.001], no program
+   worse than its interval (worst pulldown 1.010 [0.998, 1.024]). Default.
+2. *The Kahan sum in `set_from_literal_costs`' inlined copy* (261 samples
+   vs about 210): `literal_costs[i+1] = literal_costs[i] + carry; carry -=
+   literal_costs[i+1] - literal_costs[i]`. LLVM keeps `literal_costs[i]`
+   in a register across iterations; we reload it twice per iteration
+   through store-to-load forwarding (141 samples on one of them). The
+   final CLIF has the store's address `v695 + v4934*4` and the latch's
+   reload address `v695 + v4934*4` as two different values: looprot
+   cloned the header loads into the latch, and by the time
+   sameargs/paramsink made their operands equal (the last `lcse`/`dgvn`
+   ran at step 127524 of the dump; the operands became identical after
+   ivretro/latchspec), no value numbering ran again, so `loadfwd` saw two
+   roots and forwarded nothing. The loop-carried half (this iteration's
+   `cost[i]` is last iteration's `cost[i+1]`) is LLVM's
+   LoopLoadElimination and needs the IV relation; the same-iteration half
+   only needs a late CSE. Not built yet.
+3. *miniz_oxide's `compress_inner` dictionary-insert loop* (104 vs 18
+   self samples, 120 vs 27 inclusive). Not the pointer reloads: LLVM
+   also reloads the three `Box` field pointers every byte (`ldp x16,
+   x15, [x27, #0x20]`). It is where the fields sit: `d + 0x10018`,
+   `+0x10020`, `+0x10028`, past the scaled 12-bit immediate, and the
+   aarch64 lowering's `amode` folds any `iadd base, K` into the access
+   offset and then materializes an unencodable offset with `mov`+`movk`
+   at *every* access (224 `movk ..., lsl #16` in the function; LLVM
+   hoists `x27 = d + 0x10000` once and addresses off it). The CLIF had
+   the whole offset in the load (`load.i64 v1+0x0001_0018`), lcse's
+   `memoff` having folded it there. Built `PLIRON_BIGOFF=1` (aarch64):
+   `memoff` refuses a fold whose sum the encoder would not take
+   (`amode_off_fits`: `ldur`'s -256..255 or `4095 * size` scaled), and
+   splits such an access into `q = base + hi` (hi a multiple of 4096,
+   shared per block by `(base, hi)`, hoisted and merged by licm/dgvn
+   later) plus `[q + lo]`; the lowering's `amode` rules 1/2 stop folding
+   an `iadd base, K` when the sum does not encode (`amode_fold_ok`), so
+   the hoisted `q` stays a register. First cut (offset-in-access only)
+   took compress_inner's `movk` from 224 to 88; the rest were the
+   `iadd base, K` shape with `K` a licm-hoisted register (three of them,
+   spilled in the loop), now split the same way (224 -> 4). Tests
+   `pliron-clif-opt/tests/bigoff.rs`. Gate and fuzz pass with both knobs
+   on. Held-out: `bigoff` alone compression 0.989 [0.981, 0.995], json
+   0.984 [0.976, 0.996]; both knobs compression 0.962 [0.954, 0.972],
+   json 0.978 [0.966, 0.990], geomean 0.993 [0.988, 1.003], no
+   significant loss (regex 1.012 [0.997, 1.035] inside its interval; the
+   run's A/A floor was wider than usual, protobuf aa 0.984*). Both are
+   on by default now (`PLIRON_POSTIDX_ONEWB=0`, `PLIRON_BIGOFF=0`
+   restore); held-out 1.098 -> 1.088 vs LLVM.
+
+`_platform_memmove` (98 vs 27) is still unattributed; LLVM's inlined
+copies or elided moves, callers not yet listed.
+
 ## 2026-11-03 (afternoon): one hot loop, end to end (brotli's byte compare)
 
 rust-compression is the worst held-out ratio (1.32). Its profile against

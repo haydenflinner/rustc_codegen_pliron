@@ -4223,10 +4223,21 @@
         (amode_no_more_iconst ty val offset))
 (rule 1 (amode ty (iadd _ x (i32_from_iconst y)) offset)
         (if-let new_offset (i32_checked_add y offset))
+        (if-let true (amode_fold_ok ty new_offset))
         (amode_no_more_iconst ty x new_offset))
 (rule 2 (amode ty (iadd _ (i32_from_iconst x) y) offset)
         (if-let new_offset (i32_checked_add x offset))
+        (if-let true (amode_fold_ok ty new_offset))
         (amode_no_more_iconst ty y new_offset))
+
+;; PLIRON: an `iadd base, K` is only folded into
+;; the access offset when the sum still encodes (`simm9` / scaled
+;; `uimm12`); otherwise the sum stays a register (pliron's lcse made it
+;; `base + hi`, hoistable) and the access keeps its small offset, instead
+;; of `mov`+`movk` of the whole offset at every access. Always true
+;; with `PLIRON_BIGOFF=0`.
+(decl pure amode_fold_ok (Type i32) bool)
+(extern constructor amode_fold_ok amode_fold_ok)
 
 (rule 3
       (amode ty (stack_addr _ slot offset1) offset2)

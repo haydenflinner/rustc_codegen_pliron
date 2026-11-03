@@ -1104,6 +1104,14 @@ const fn cstep(
 
 pub fn run_pipeline(p: &mut Pipe) {
     corpus_dump(p);
+    // lcse splits offsets the aarch64 encoder cannot take as an
+    // immediate (clifpeep `amode_off_fits`; `PLIRON_BIGOFF=0` disables).
+    // Not for wasm, whose host ISA is bookkeeping only.
+    clifpeep::set_bigoff(
+        !p.wasm
+            && !pliron_cfg::env_is("PLIRON_BIGOFF", "0")
+            && matches!(p.isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)),
+    );
     // `PLIRON_LIVEREGION=0` falls back to the lowering-time block regions.
     if !p.block_region.is_empty() && crate::pass_enabled("PLIRON_LIVEREGION") {
         let func = &p.clctx.func;

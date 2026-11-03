@@ -962,6 +962,16 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         SImm9::maybe_from_i64(val)
     }
 
+    /// PLIRON: see `amode_fold_ok` in `inst.isle`. `PLIRON_BIGOFF=0` disables.
+    fn amode_fold_ok(&mut self, ty: Type, off: i32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_BIGOFF").as_deref() != Ok("0")) {
+            return true;
+        }
+        let off = i64::from(off);
+        SImm9::maybe_from_i64(off).is_some() || UImm12Scaled::maybe_from_i64(off, ty).is_some()
+    }
+
     fn uimm12_scaled_from_i64(&mut self, val: i64, ty: Type) -> Option<UImm12Scaled> {
         UImm12Scaled::maybe_from_i64(val, ty)
     }

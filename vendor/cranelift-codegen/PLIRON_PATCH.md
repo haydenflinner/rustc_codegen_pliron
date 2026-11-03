@@ -1226,3 +1226,46 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `PLIRON_RA2_FREQ`). Cold and unlikely blocks fall below the entry's
     weight; loops get their real nesting weight even where the lowering
     order's block indices made a cold rejoin look like a back edge.
+
+100. One writeback per post-index chain (`machinst/vcode.rs` emit-time
+    sweep, default since 11-03, `PLIRON_POSTIDX_ONEWB=0` restores the chain; `MachInst::mem_offset_ok` /
+    `set_mem_offset`, aarch64 in `inst/emit.rs`). The sweep's telescoping
+    writebacks (`str [b], #4; str [b], #4; str [b], #4; str [b], #8` for
+    brotli's 20-byte `BrotliInitZopfliNodes` fill) make every access's
+    address wait on the previous access's writeback, and the next
+    iteration's first access on the last: a 4-cycle loop recurrence
+    through the base where the deleted `add` cost one (the fill ran at
+    196 profile samples against LLVM's 86). With the knob the last
+    offset-0 member takes the whole bump `#C` and the members after it are
+    re-addressed to `[base + (o - C)]` (`stur`'s signed 9-bit, else a
+    scaled unsigned offset; pairs by scaled 7-bit); members before it keep
+    their offsets. LLVM's loop-strength reduction lays the loop out the
+    same way (`stur [x10, #-16]; stur [x10, #-8]; str wzr, [x10], #20`).
+    When a re-addressed offset does not encode the chain is left alone
+    (the `add` stays) rather than telescoped. Patch 90's load-and-store
+    at offset 0 keeps its shape: the writeback lands on the store, the
+    last offset-0 member. Test: `pliron-clif-opt/tests/postidx_onewb.rs`.
+    rust-compression: HqZopfli's post-index stores 18 -> 5, the binary's
+    2109 -> 1395; held-out 0.980 [0.974, 0.991] of base on compression,
+    geomean 0.997 [0.992, 1.001], no program worse.
+
+101. Unencodable memory offsets stay a register base (default since
+    11-03, `PLIRON_BIGOFF=0` disables; `amode_fold_ok` in `aarch64/inst.isle` rules 1/2 of `amode`,
+    extern in `lower/isle.rs`). `amode` folds every `iadd base, K` into
+    the access offset and `amode_no_more_iconst`'s base case then
+    materializes an offset past `simm9` / scaled `uimm12` with
+    `mov`+`movk` at every access: miniz_oxide's `compress_inner` read
+    three `Box` fields at `d + 0x10018..0x10028` per byte, 224 `movk`
+    in the function, LLVM none (it hoists `d + 0x10000`). With the knob
+    the fold is refused when the sum would not encode, so the `iadd`
+    (which pliron's lcse has split into `base + hi`, `hi` a multiple of
+    4096, hoisted and shared — `clifpeep::amode_off_fits`/`set_bigoff`,
+    `pliron-clif-opt/tests/bigoff.rs`) is one register and the access
+    keeps its small immediate. Off, nothing changes. Held-out: alone,
+    compression 0.989 [0.981, 0.995] and json 0.984 [0.976, 0.996] of
+    base; with patch 100, compression 0.962 [0.954, 0.972], json 0.978
+    [0.966, 0.990], geomean 0.993 [0.988, 1.003], nothing significantly
+    worse. Without the lcse
+    split a single-use unencodable `iadd` would cost one more
+    instruction than the materialized fold, which is why the knob gates
+    both sides together.

@@ -4362,6 +4362,82 @@ impl MachInstEmit for Inst {
         }
     }
 
+    fn mem_offset_ok(&self, off: i64) -> bool {
+        match self {
+            Inst::LoadP64 { mem, .. }
+            | Inst::StoreP64 { mem, .. }
+            | Inst::FpuLoadP64 { mem, .. }
+            | Inst::FpuStoreP64 { mem, .. }
+            | Inst::FpuLoadP128 { mem, .. }
+            | Inst::FpuStoreP128 { mem, .. } => match mem {
+                PairAMode::SignedOffset { simm7, .. } => {
+                    SImm7Scaled::maybe_from_i64(off, simm7.scale_ty).is_some()
+                }
+                _ => false,
+            },
+            _ => match (self.mem_signed_offset(), self.mem_type()) {
+                (Some(_), Some(ty)) => {
+                    SImm9::maybe_from_i64(off).is_some()
+                        || UImm12Scaled::maybe_from_i64(off, ty).is_some()
+                }
+                _ => false,
+            },
+        }
+    }
+
+    fn set_mem_offset(&mut self, off: i64) {
+        let ty = self.mem_type();
+        match self {
+            Inst::LoadP64 { mem, .. }
+            | Inst::StoreP64 { mem, .. }
+            | Inst::FpuLoadP64 { mem, .. }
+            | Inst::FpuStoreP64 { mem, .. }
+            | Inst::FpuLoadP128 { mem, .. }
+            | Inst::FpuStoreP128 { mem, .. } => {
+                if let PairAMode::SignedOffset { reg, simm7 } = *mem {
+                    let simm7 = SImm7Scaled::maybe_from_i64(off, simm7.scale_ty)
+                        .expect("pair offset out of range");
+                    *mem = PairAMode::SignedOffset { reg, simm7 };
+                }
+            }
+            Inst::ULoad8 { mem, .. }
+            | Inst::SLoad8 { mem, .. }
+            | Inst::ULoad16 { mem, .. }
+            | Inst::SLoad16 { mem, .. }
+            | Inst::ULoad32 { mem, .. }
+            | Inst::SLoad32 { mem, .. }
+            | Inst::ULoad64 { mem, .. }
+            | Inst::Store8 { mem, .. }
+            | Inst::Store16 { mem, .. }
+            | Inst::Store32 { mem, .. }
+            | Inst::Store64 { mem, .. }
+            | Inst::FpuLoad16 { mem, .. }
+            | Inst::FpuLoad32 { mem, .. }
+            | Inst::FpuLoad64 { mem, .. }
+            | Inst::FpuLoad128 { mem, .. }
+            | Inst::FpuStore16 { mem, .. }
+            | Inst::FpuStore32 { mem, .. }
+            | Inst::FpuStore64 { mem, .. }
+            | Inst::FpuStore128 { mem, .. } => {
+                let rn = match *mem {
+                    AMode::Unscaled { rn, .. }
+                    | AMode::UnsignedOffset { rn, .. }
+                    | AMode::RegOffset { rn, .. } => rn,
+                    _ => return,
+                };
+                let ty = ty.expect("scalar access has a type");
+                *mem = if let Some(simm9) = SImm9::maybe_from_i64(off) {
+                    AMode::Unscaled { rn, simm9 }
+                } else {
+                    let uimm12 = UImm12Scaled::maybe_from_i64(off, ty)
+                        .expect("mem offset out of range");
+                    AMode::UnsignedOffset { rn, uimm12 }
+                };
+            }
+            _ => {}
+        }
+    }
+
     fn self_add_imm(&self) -> Option<(Reg, i64)> {
         match self {
             Inst::AluRRImm12 {
