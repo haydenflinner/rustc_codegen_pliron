@@ -41,12 +41,32 @@ pub fn spill_weight_from_constraint(
     // 16000 for three loop levels, etc. Avoids exponentiation.
     let loop_depth = core::cmp::min(10, loop_depth);
     let hot_bonus: f32 = (0..loop_depth).fold(1000.0, |a, _| a * 4.0);
+    spill_weight_from_hot(constraint, hot_bonus, is_def)
+}
+
+/// PLIRON: the weight from a block's precomputed hot bonus
+/// (`CFGInfo::hot_bonus`: loop depth or frontend block frequency).
+#[inline(always)]
+pub fn spill_weight_from_hot(
+    constraint: OperandConstraint,
+    hot_bonus: f32,
+    is_def: bool,
+) -> SpillWeight {
     let def_bonus: f32 = if is_def { 2000.0 } else { 0.0 };
     let constraint_bonus: f32 = match constraint {
         OperandConstraint::Any => 1000.0,
         OperandConstraint::Reg | OperandConstraint::FixedReg(_) => 2000.0,
         _ => 0.0,
     };
+    // PLIRON: under the normalized frequency modes the bonuses scale the
+    // block's weight (`1 + 2 + 2` at most) instead of adding a constant
+    // that would swamp every use in a cold region.
+    // Capped at the depth scale's maximum (`1000 * 4^10`): a block without
+    // a frequency keeps its depth bonus, and `to_int` must not saturate
+    // (`conflict_cost + move_cost` overflowed u32 on blind-sig).
+    if crate::cfg::freq_multiplicative() {
+        return SpillWeight((hot_bonus * (1000.0 + def_bonus + constraint_bonus) / 1000.0).min(1.0e9));
+    }
     SpillWeight(hot_bonus + def_bonus + constraint_bonus)
 }
 
@@ -215,10 +235,9 @@ impl<'a, F: Function> Env<'a, F> {
         let operand = u.operand;
         let constraint = operand.constraint();
         let block = self.cfginfo.insn_block[u.pos.inst().index()];
-        let loop_depth = self.cfginfo.approx_loop_depth[block.index()] as usize;
-        let weight = spill_weight_from_constraint(
+        let weight = spill_weight_from_hot(
             constraint,
-            loop_depth,
+            self.cfginfo.hot_bonus[block.index()],
             operand.kind() != OperandKind::Use,
         );
         u.weight = weight.to_bits();

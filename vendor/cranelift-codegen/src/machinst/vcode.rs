@@ -118,6 +118,12 @@ pub struct VCode<I: VCodeInst> {
     /// `compute_remat_vregs` (opt-in, `PLIRON_RA2_REMATW=1`).
     remat_vregs: Vec<bool>,
 
+    /// PLIRON: per block, placement's static execution frequency relative
+    /// to the entry block (empty when not computed), handed to regalloc2
+    /// as `block_hotness` for spill weights under `PLIRON_RA2_FREQ`
+    /// (`compute_block_freq`).
+    block_freq: Vec<f32>,
+
     /// PLIRON: the lowered block whose blockparams regalloc2 must not merge
     /// with their inputs (`PLIRON_SPLIT_BLOCK`).
     no_merge_block: Option<BlockIndex>,
@@ -1367,6 +1373,33 @@ impl<I: VCodeInst> VCode<I> {
         Some(out)
     }
 
+    /// PLIRON: fill `block_freq` (see the field) before regalloc when
+    /// `PLIRON_RA2_FREQ` is set: the same graph, cold marks and branch
+    /// hints the emission-time placement uses.
+    pub fn compute_block_freq(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_FREQ").is_ok_and(|v| v != "0")) {
+            return;
+        }
+        let nb = self.num_blocks();
+        let succs: Vec<Vec<usize>> = (0..nb)
+            .map(|b| {
+                self.block_succs(BlockIndex::new(b))
+                    .iter()
+                    .map(|s| s.index())
+                    .filter(|&s| s < nb)
+                    .collect()
+            })
+            .collect();
+        let cold: Vec<bool> = (0..nb).map(|b| self.block_order.is_cold(BlockIndex::new(b))).collect();
+        let unlikely: Vec<Vec<bool>> = (0..nb)
+            .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
+            .collect();
+        if let Some(freq) = super::placement::frequencies(self.entry.index(), &succs, &cold, &unlikely) {
+            self.block_freq = freq.into_iter().map(|f| f as f32).collect();
+        }
+    }
+
     /// PLIRON: fill `remat_vregs` (see the field) before regalloc, and
     /// pick up shrink-wrapping's split block.
     pub fn compute_remat_vregs(&mut self) {
@@ -1415,6 +1448,7 @@ impl<I: VCodeInst> VCode<I> {
             sigs,
             vreg_types: vec![],
             remat_vregs: vec![],
+            block_freq: vec![],
             no_merge_block: None,
             insts: Vec::with_capacity(10 * n_blocks),
             user_stack_maps: FxHashMap::default(),
@@ -3572,6 +3606,10 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
 
     fn no_param_merge(&self, block: BlockIndex) -> bool {
         self.no_merge_block == Some(block)
+    }
+
+    fn block_hotness(&self, block: BlockIndex) -> Option<f32> {
+        self.block_freq.get(block.index()).copied()
     }
 
     fn num_blocks(&self) -> usize {

@@ -1206,3 +1206,17 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     pads, release dylib): 1.111 -> 1.104 (html-rewriter -2.3%, json
     -3.2%, blind-sig -1.4%, regex +2%); gate and 400 fuzz seeds clean
     with the flags on, so placement and `brhint` were flipped on.
+
+99. Block frequencies for the register allocator (opt-in,
+    `PLIRON_RA2_FREQ=1|2`; `machinst/placement.rs` `frequencies`,
+    `machinst/vcode.rs` `compute_block_freq` / `block_freq` /
+    `RegallocFunction::block_hotness`, called from `compile.rs` before
+    `run_with_ctx`): patch 98's loop forest, edge probabilities and
+    packaged-loop block frequencies are split out of `place` into
+    `analyze`, and before regalloc the same graph (successors, cold marks,
+    `brhint` arms) gives every block its frequency relative to the entry.
+    regalloc2 uses it as the spill-weight hot bonus instead of
+    `1000 * 4^depth` (vendor/regalloc2/PLIRON_PATCH.md
+    `PLIRON_RA2_FREQ`). Cold and unlikely blocks fall below the entry's
+    weight; loops get their real nesting weight even where the lowering
+    order's block indices made a cold rejoin look like a back edge.

@@ -13,7 +13,7 @@
 //! Main allocation loop that processes bundles.
 
 use super::{
-    spill_weight_from_constraint, Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag,
+    spill_weight_from_hot, Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag,
     LiveRangeIndex, LiveRangeKey, LiveRangeList, LiveRangeListEntry, PRegIndex, RegTraversalIter,
     Requirement, SpillWeight, UseList, VRegIndex,
 };
@@ -1177,13 +1177,12 @@ impl<'a, F: Function> Env<'a, F> {
                             lowest_cost_evict_conflict_set.extend(bundles);
                         }
 
-                        let loop_depth =
-                            self.ctx.cfginfo.approx_loop_depth[self.ctx.cfginfo.insn_block
-                                [first_conflict_point.inst().index()]
-                            .index()];
-                        let move_cost = spill_weight_from_constraint(
+                        let hot = self.ctx.cfginfo.hot_bonus[self.ctx.cfginfo.insn_block
+                            [first_conflict_point.inst().index()]
+                        .index()];
+                        let move_cost = spill_weight_from_hot(
                             OperandConstraint::Reg,
-                            loop_depth as usize,
+                            hot,
                             /* is_def = */ true,
                         )
                         .to_int();
@@ -1199,11 +1198,11 @@ impl<'a, F: Function> Env<'a, F> {
                     AllocRegResult::ConflictWithFixed(max_cost, point) => {
                         trace!(" -> conflict with fixed alloc; cost of other bundles up to point is {}, conflict at {:?}", max_cost, point);
 
-                        let loop_depth = self.ctx.cfginfo.approx_loop_depth
+                        let hot = self.ctx.cfginfo.hot_bonus
                             [self.ctx.cfginfo.insn_block[point.inst().index()].index()];
-                        let move_cost = spill_weight_from_constraint(
+                        let move_cost = spill_weight_from_hot(
                             OperandConstraint::Reg,
-                            loop_depth as usize,
+                            hot,
                             /* is_def = */ true,
                         )
                         .to_int();

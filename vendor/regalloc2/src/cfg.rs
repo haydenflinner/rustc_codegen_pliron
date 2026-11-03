@@ -45,6 +45,10 @@ pub struct CFGInfo {
     /// block span covers it (`(u32::MAX, _)` when none), so a split looks a
     /// use's innermost cycle up in O(1).
     pub innermost_cycle: Vec<(u32, u32)>,
+    /// PLIRON: per block, the spill-weight hot bonus (`1000 * 4^depth`, or
+    /// under `PLIRON_RA2_FREQ` the frontend's block frequency scaled; see
+    /// `init`).
+    pub hot_bonus: Vec<f32>,
 }
 
 impl CFGInfo {
@@ -196,12 +200,95 @@ impl CFGInfo {
             }
         }
 
+        // PLIRON `PLIRON_RA2_FREQ=1|2` (opt-in): the spill-weight hot bonus
+        // per block comes from the frontend's block frequencies (Cranelift's
+        // placement probabilities: ~32x per loop level, cold paths far below
+        // the entry) instead of `1000 * 4^depth`. Mode 1 uses the frequency
+        // as is; mode 2 maps it onto the depth scale (`freq^0.4`: 4x per
+        // 32x), so only the shape changes. A block without a frequency
+        // keeps the depth bonus.
+        // Modes 3 and 4 normalize by the function's hottest block (the
+        // entry can be nearly the coldest: a fast-path return before a
+        // cold slow path with loops), map it to the depth scale's top
+        // (`1000 * 4^6`), and multiply the def/constraint bonuses in
+        // (`spill_weight_from_hot`), so the relative structure inside a
+        // cold region survives; 3 uses the frequency as is, 4 its square
+        // root.
+        let mode = freq_mode();
+        let hot_bonus = self.hot_bonus.cleared();
+        let mut max_fr: f32 = 0.0;
+        if mode >= 3 {
+            for block in 0..nb {
+                if let Some(fr) = f.block_hotness(Block::new(block)) {
+                    if fr.is_finite() && fr > max_fr {
+                        max_fr = fr;
+                    }
+                }
+            }
+        }
+        for block in 0..nb {
+            let depth = core::cmp::min(10, approx_loop_depth[block] as usize);
+            let by_depth: f32 = (0..depth).fold(1000.0, |a, _| a * 4.0);
+            let bonus = match f.block_hotness(Block::new(block)) {
+                Some(fr) if mode >= 3 && max_fr > 0.0 => hot_bonus_normalized(mode, fr, max_fr),
+                Some(fr) if mode == 1 || mode == 2 => hot_bonus_from_freq(mode, fr),
+                _ => by_depth,
+            };
+            hot_bonus.push(bonus);
+        }
+
         Ok(())
     }
 
     pub fn dominates(&self, a: Block, b: Block) -> bool {
         domtree::dominates(&self.domtree[..], a, b)
     }
+}
+
+/// PLIRON: `PLIRON_RA2_FREQ=1|2` (opt-in): block-frequency spill weights
+/// (see `CFGInfo::hot_bonus`); 0 is off.
+fn freq_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            std::env::var("PLIRON_RA2_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
+/// PLIRON: the hot bonus for a block of frequency `fr` (entry = 1).
+#[cfg(feature = "std")]
+fn hot_bonus_from_freq(mode: u8, fr: f32) -> f32 {
+    let fr = if fr.is_finite() { fr.clamp(1.0 / 64.0, 1_048_576.0) } else { 1.0 };
+    match mode {
+        1 => 1000.0 * fr,
+        _ => 1000.0 * fr.powf(0.4),
+    }
+}
+#[cfg(not(feature = "std"))]
+fn hot_bonus_from_freq(_mode: u8, _fr: f32) -> f32 {
+    1000.0
+}
+
+/// PLIRON: modes 3/4: `fr / max` mapped onto `[1, 1000 * 4^6]`.
+#[cfg(feature = "std")]
+fn hot_bonus_normalized(mode: u8, fr: f32, max_fr: f32) -> f32 {
+    let rel = if fr.is_finite() { (fr / max_fr).clamp(0.0, 1.0) } else { 0.0 };
+    let rel = if mode == 4 { rel.sqrt() } else { rel };
+    (rel * 4_096_000.0).max(1.0)
+}
+#[cfg(not(feature = "std"))]
+fn hot_bonus_normalized(_mode: u8, _fr: f32, _max_fr: f32) -> f32 {
+    1000.0
+}
+
+/// PLIRON: the bonuses multiply the hot bonus (modes 3/4) instead of
+/// adding to it.
+pub(crate) fn freq_multiplicative() -> bool {
+    freq_mode() >= 3
 }
 
 /// PLIRON: `PLIRON_RA2_LOOPDEPTH=1` (opt-in): dominance-checked back edges

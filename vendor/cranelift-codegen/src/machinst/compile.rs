@@ -85,6 +85,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         };
 
         vcode.compute_remat_vregs();
+        vcode.compute_block_freq();
         regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
             .map_err(|err| {
                 log::error!(
@@ -200,9 +201,11 @@ pub fn compile<B: LowerBackend + TargetIsa>(
                 c[k][pos] += 1;
             }
             let nslots = regalloc_ctx.output.num_spillslots;
+            let sym = crate::PLIRON_FN_NAME.with(|s| s.borrow().clone());
+            let name = if sym.is_empty() { alloc::format!("{}", f.name) } else { sym };
             eprintln!(
                 "RA2STAT {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-                f.name, n, c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0],
+                name, n, c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0],
                 c[2][1], c[2][2], c[3][0] + c[3][1] + c[3][2], nslots, 0
             );
         }

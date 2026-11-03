@@ -1082,6 +1082,9 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     // `PLIRON_RA_EXPLAIN=<symbol substring>`: log regalloc2's split and
     // evict decisions for matching functions (stderr, `ra2x:` lines).
     let explain = crate::env_get("PLIRON_RA_EXPLAIN").is_some_and(|p| n.contains(p));
+    if crate::env_get("PLIRON_RA2_STATS").is_some() {
+        cranelift_codegen::pliron_set_fn_name(n);
+    }
     if explain {
         eprintln!("ra2x: ==== {n} ====");
         cranelift_codegen::ra_set_explain(true);

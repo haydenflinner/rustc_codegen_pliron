@@ -56,6 +56,21 @@ pub use regalloc2::set_explain as ra_set_explain;
 /// workspace's unit tests.
 pub use machinst::placement::place as pliron_place;
 
+std::thread_local! {
+    /// PLIRON: the symbol of the function being compiled on this thread
+    /// (`pliron_set_fn_name`), for the `RA2STAT` lines.
+    pub static PLIRON_FN_NAME: core::cell::RefCell<alloc::string::String> = core::cell::RefCell::new(alloc::string::String::new());
+}
+
+/// PLIRON: name the function this thread compiles next (debug output).
+pub fn pliron_set_fn_name(name: &str) {
+    PLIRON_FN_NAME.with(|n| {
+        let mut n = n.borrow_mut();
+        n.clear();
+        n.push_str(name);
+    });
+}
+
 pub mod binemit;
 pub mod cfg_printer;
 pub mod cursor;

@@ -1374,6 +1374,14 @@ pub trait Function {
         false
     }
 
+    /// PLIRON: this block's execution frequency relative to the entry
+    /// block, from the frontend's static branch probabilities, for spill
+    /// weights under `PLIRON_RA2_FREQ`; `None` keeps the loop-depth
+    /// estimate for the block.
+    fn block_hotness(&self, _block: Block) -> Option<f32> {
+        None
+    }
+
     // --------------
     // Spills/reloads
     // --------------

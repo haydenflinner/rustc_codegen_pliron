@@ -68,17 +68,31 @@ struct Loop {
     factor: f64,
 }
 
-/// `succs[b]` lists b's successors (with repeats for `br_table`); `cold[b]`
-/// marks blocks that are emitted last anyway. Returns the emission order
-/// of the non-cold blocks, entry first, or `None` to keep the old order.
-/// `empty[b]`: b is only an unconditional jump (its label is aliased to the
-/// target at emission), so it costs nothing wherever it is placed and is
-/// never worth a fallthrough slot.
-/// Returns the emission order of the non-cold blocks (entry first) and
-/// the blocks that start a loop chain (aligned like loop headers), or
-/// `None` to keep the old order.
-/// `unlikely[b][k]`: the CLIF hinted successor `k` of `b` unlikely.
-pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], unlikely: &[Vec<bool>]) -> Option<(Vec<usize>, Vec<bool>)> {
+/// What `analyze` computes: the loop forest, edge probabilities and block
+/// frequencies that both placement and (through `frequencies`) the
+/// register allocator's spill weights use.
+struct Freq {
+    n: usize,
+    preds: Vec<Vec<usize>>,
+    rpo: Vec<usize>,
+    rpo_idx: Vec<usize>,
+    loops: Vec<Loop>,
+    /// Loop ids by ascending size (innermost first).
+    asc: Vec<usize>,
+    innermost: Vec<Option<usize>>,
+    in_loop: Vec<Vec<bool>>,
+    prob: Vec<Vec<f64>>,
+    freq: Vec<f64>,
+}
+
+/// Block frequencies relative to the entry block (`succs`, `cold`,
+/// `unlikely` as for `place`), or `None` where `place` would also give up
+/// (tiny, huge or irreducible graphs, a cold entry).
+pub fn frequencies(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bool>]) -> Option<Vec<f64>> {
+    analyze(entry, succs, cold, unlikely).map(|a| a.freq)
+}
+
+fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bool>]) -> Option<Freq> {
     let n = succs.len();
     if n < 3 || n > MAX_BLOCKS || cold[entry] {
         return None;
@@ -404,6 +418,21 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
             None => rel[b].min(FREQ_CAP),
         })
         .collect();
+    Some(Freq { n, preds, rpo, rpo_idx, loops, asc, innermost, in_loop, prob, freq })
+}
+
+/// `succs[b]` lists b's successors (with repeats for `br_table`); `cold[b]`
+/// marks blocks that are emitted last anyway. Returns the emission order
+/// of the non-cold blocks, entry first, or `None` to keep the old order.
+/// `empty[b]`: b is only an unconditional jump (its label is aliased to the
+/// target at emission), so it costs nothing wherever it is placed and is
+/// never worth a fallthrough slot.
+/// Returns the emission order of the non-cold blocks (entry first) and
+/// the blocks that start a loop chain (aligned like loop headers), or
+/// `None` to keep the old order.
+/// `unlikely[b][k]`: the CLIF hinted successor `k` of `b` unlikely.
+pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], unlikely: &[Vec<bool>]) -> Option<(Vec<usize>, Vec<bool>)> {
+    let Freq { n, preds, rpo, rpo_idx, loops, asc, innermost, in_loop, prob, freq } = analyze(entry, succs, cold, unlikely)?;
 
     // An empty jump block emits nothing (its label aliases the target), so
     // chains see through it: `res[b]` is the first non-empty block reached.

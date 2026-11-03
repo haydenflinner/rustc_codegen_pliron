@@ -99,3 +99,26 @@ special-byte handler's calls. With both flags the loop is
 registers, LLVM's shape. Loops sharing a header (the scan loop and the
 handler both jump back to it) have one depth; the shortest back edge
 still separates them.
+
+## `PLIRON_RA2_FREQ=1..4` (runtime, opt-in): block-frequency spill weights
+
+`Function::block_hotness(block) -> Option<f32>` (default `None`) lets the
+frontend hand in each block's execution frequency relative to the entry
+block. `CFGInfo::hot_bonus` holds the per-block hot bonus of the spill
+weight: `1000 * 4^depth` as before, or under the flag derived from the
+frequency. `spill_weight_from_hot` replaces the depth-based
+`spill_weight_from_constraint` at the three call sites (use weights in
+`liveranges.rs`, the two move costs in `process.rs`); the loop-depth
+hoist of a split point still uses `approx_loop_depth`. Cranelift fills it
+from `placement::frequencies` (`VCode::compute_block_freq`, patch 99).
+
+Modes 1 and 2 scale the raw frequency (`1000 * freq`, `1000 * freq^0.4`)
+floored at 1/64 and keep the additive def/constraint bonuses. That fails
+where the hot code sits behind a cold edge: regex's `Fsm::next_state` is
+a fast-path return and a cold slow path with the loops, every block is
+below the entry, the floor flattened them all, and the constant bonuses
+decided (bundle weights of 45..271 against millions before; the state
+index went to the stack). Modes 3 and 4 normalize by the function's
+hottest block, map `freq / max` (mode 4: its square root) onto
+`[1, 1000 * 4^6]`, and multiply the bonuses in (`x1..x5`) instead of
+adding them, so a cold region keeps its internal structure.
