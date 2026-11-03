@@ -1,0 +1,12 @@
+; test vrp
+; diffcheck
+; check: v3 = band v1, v2
+function %f(i64) -> i64 {
+block0(v0: i64):
+    ; v1 <= 0x100 does not make `band v1, 0x100` the identity: 0xff & 0x100 = 0
+    v10 = iconst.i64 256
+    v1 = umin v0, v10
+    v2 = iconst.i64 256
+    v3 = band v1, v2
+    return v3
+}

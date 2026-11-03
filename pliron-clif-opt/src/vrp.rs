@@ -85,21 +85,24 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
                     InstructionData::Binary { opcode, args: [x, y] } => {
                         let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
                         let res = func.dfg.first_result(inst);
+                        // Constants are stored sign-extended: mask to the width.
+                        let Some(wb) = bits_of(func.dfg.value_type(x)) else { continue };
+                        let wmask = if wb >= 64 { u64::MAX } else { (1u64 << wb) - 1 };
                         match opcode {
                             Opcode::Band => {
                                 let (v, k) = match (crate::loopidiom::iconst(func, x), crate::loopidiom::iconst(func, y)) {
-                                    (_, Some(k)) => (x, k as u64),
-                                    (Some(k), _) => (y, k as u64),
+                                    (_, Some(k)) => (x, k as u64 & wmask),
+                                    (Some(k), _) => (y, k as u64 & wmask),
                                     _ => continue,
                                 };
                                 let r = rs.at(func, dt, v, b);
-                                if r.uhi & !k == 0 && lead_fits(&r, k) {
+                                if cover(r.uhi) & !k == 0 {
                                     fixes.push(Fix::Alias(res, v));
                                 }
                             }
                             Opcode::Urem | Opcode::Udiv => {
                                 let Some(k) = crate::loopidiom::iconst(func, y) else { continue };
-                                let k = k as u64;
+                                let k = k as u64 & wmask;
                                 if k == 0 {
                                     continue;
                                 }
@@ -216,13 +219,11 @@ fn no_carry(a: &Range, b: &Range) -> bool {
     a.uhi.checked_add(b.uhi).is_some_and(|s| s <= m)
 }
 
-/// The mask keeps every bit the range can set (`uhi & !k == 0` covers the
-/// value bits; the sign side is irrelevant for unsigned-only ranges but a
-/// negative signed range would have bits above `uhi` — reject those).
-fn lead_fits(r: &Range, _k: u64) -> bool {
-    // An unsigned interval bounds every bit pattern below `uhi`, so the
-    // check on `uhi` is sufficient.
-    r.uhi != u64::MAX || r.bits < 64
+/// Every bit a value `<= uhi` can have set: all bits up to `uhi`'s top
+/// bit (`uhi = 0x100` allows `0xff`, so the bound alone says nothing about
+/// the low bits).
+fn cover(uhi: u64) -> u64 {
+    if uhi == 0 { 0 } else { u64::MAX >> uhi.leading_zeros() }
 }
 
 #[allow(dead_code)]

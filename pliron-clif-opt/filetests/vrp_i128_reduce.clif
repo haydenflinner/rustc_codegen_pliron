@@ -1,0 +1,11 @@
+; test vrp
+; diffcheck
+; check: v3 = icmp ult v1, v2
+function %f(i128) -> i8 {
+block0(v0: i128):
+    ; an i128 is outside the analysis: its reduction has no range
+    v1 = ireduce.i64 v0
+    v2 = iconst.i64 4
+    v3 = icmp ult v1, v2
+    return v3
+}

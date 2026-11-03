@@ -53,6 +53,10 @@ fn sext(x: u64, bits: u32) -> i64 {
     if bits >= 64 { x as i64 } else { ((x << (64 - bits)) as i64) >> (64 - bits) }
 }
 
+/// A value of a type the analysis does not model (vectors, i128): every
+/// 64-bit pattern, so any rule consuming it stays conservative.
+pub const UNKNOWN: Range = Range { bits: 0, ulo: 0, uhi: u64::MAX, slo: i64::MIN, shi: i64::MAX };
+
 impl Range {
     pub fn full(bits: u32) -> Range {
         Range { bits, ulo: 0, uhi: umask(bits), slo: smin(bits), shi: smax(bits) }
@@ -158,7 +162,7 @@ impl Ranges {
     /// Range of `v` from its definition alone.
     pub fn def(&mut self, func: &Function, v: Value) -> Range {
         let v = func.dfg.resolve_aliases(v);
-        let Some(bits) = width(func.dfg.value_type(v)) else { return Range::full(1) };
+        let Some(bits) = width(func.dfg.value_type(v)) else { return UNKNOWN };
         if let Some(r) = self.memo.get(&v) {
             return *r;
         }
@@ -180,7 +184,7 @@ impl Ranges {
 
     fn sub(&mut self, func: &Function, v: Value, depth: u32) -> Range {
         let v = func.dfg.resolve_aliases(v);
-        let Some(bits) = width(func.dfg.value_type(v)) else { return Range::full(1) };
+        let Some(bits) = width(func.dfg.value_type(v)) else { return UNKNOWN };
         if let Some(r) = self.memo.get(&v) {
             return *r;
         }
