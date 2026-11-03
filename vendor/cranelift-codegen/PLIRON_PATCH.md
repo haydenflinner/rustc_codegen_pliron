@@ -1207,6 +1207,12 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     -3.2%, blind-sig -1.4%, regex +2%); gate and 400 fuzz seeds clean
     with the flags on, so placement and `brhint` were flipped on.
 
+    Addendum (11-03): `nzcv_free` now includes the post-index
+    `LoadPost`/`StorePost` forms (patch 90). The sweep stopped at a
+    writeback store between the `add` and its `cmn` (montgomery's inner
+    loop once the zip pointers refold onto the index, `PLIRON_IVREFOLD2`),
+    leaving the carry recomputed: blind-sig +7% on the tuning set.
+
 99. Block frequencies for the register allocator (opt-in,
     `PLIRON_RA2_FREQ=1|2`; `machinst/placement.rs` `frequencies`,
     `machinst/vcode.rs` `compute_block_freq` / `block_freq` /

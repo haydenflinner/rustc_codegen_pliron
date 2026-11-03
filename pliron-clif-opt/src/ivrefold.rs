@@ -75,6 +75,97 @@ fn step_of(func: &Function, v: Value, p: Value) -> Option<i64> {
     }
 }
 
+/// Is `v` defined strictly above `h` (outside any loop headed by `h`)?
+fn above(func: &Function, domtree: &DominatorTree, h: Block, v: Value) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let b = match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(b, _) => Some(b),
+        _ => None,
+    };
+    b.is_some_and(|b| b != h && domtree.try_dominates(b, h, &func.layout))
+}
+
+/// Slot `ix`'s arg on a back edge (`a`) is `iadd B, q'` with `q'` the
+/// edge's arg for another slot `j` and `B` above `h`: `(j, B)`.
+/// `z` may also be slot `j`'s current param (the rotated form: the
+/// latch computes `B + q` before `q` steps), then `p = B + q - step_j`;
+/// the offset is returned as `off` (`0` or `-step_j`).
+fn alias_pair(
+    func: &Function,
+    domtree: &DominatorTree,
+    h: Block,
+    params: &[Value],
+    steps: &[Option<i64>],
+    a: &[Value],
+    ix: usize,
+) -> Option<(usize, Value, i64)> {
+    let v = func.dfg.resolve_aliases(a[ix]);
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return None;
+    };
+    let InstructionData::Binary {
+        opcode: Opcode::Iadd,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let (x, y) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    for (b, z) in [(x, y), (y, x)] {
+        if !above(func, domtree, h, b) {
+            continue;
+        }
+        if let Some(j) = (0..a.len()).find(|&j| j != ix && func.dfg.resolve_aliases(a[j]) == z) {
+            return Some((j, b, 0));
+        }
+        if let Some(j) = (0..params.len()).find(|&j| j != ix && params[j] == z)
+            && let Some(s) = steps[j]
+        {
+            return Some((j, b, s.wrapping_neg()));
+        }
+    }
+    None
+}
+
+/// Entry edge: `p0 = B + q0 + off` (as `iadd B, q0` with `off = 0`, `B`
+/// with `q0 = -off`, or `iadd B, k` with `q0 = k - off`).
+fn entry_matches(func: &Function, p0: Value, b: Value, q0: Value, off: i64) -> bool {
+    let p0 = func.dfg.resolve_aliases(p0);
+    let b = func.dfg.resolve_aliases(b);
+    let q0 = func.dfg.resolve_aliases(q0);
+    let kq = iconst(func, q0);
+    if p0 == b {
+        return kq == Some(off.wrapping_neg());
+    }
+    let ValueDef::Result(i, _) = func.dfg.value_def(p0) else {
+        return false;
+    };
+    let InstructionData::Binary {
+        opcode: Opcode::Iadd,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return false;
+    };
+    let (x, y) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    for (bb, z) in [(x, y), (y, x)] {
+        if bb == b
+            && ((off == 0 && z == q0)
+                || (kq.is_some() && iconst(func, z) == kq.map(|k| k.wrapping_add(off))))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Edges into each block: `(inst, dest_index)` pairs (branch arg lists
 /// are per-destination on brif/br_table/try_call).
 fn edges_to(func: &Function) -> FxHashMap<Block, Vec<(Inst, usize)>> {
@@ -253,6 +344,47 @@ fn refold_header(
             }
         }
         steps.push(if ok { step } else { None });
+    }
+    // `p = B + q` carried beside `q`: the zip/enumerate iterators
+    // recompute each element pointer as `base + i` from the stepped
+    // index, so the back edge passes `iadd B, q'` (`q'` this edge's arg
+    // for slot `j`, `B` defined strictly above `h`) and never `p + k`.
+    // With `p0 = B + q0` on the entry edge, `p` steps with `q` and
+    // refolds onto it like any affine slot (`bp = p0 - q0 = B`).
+    let mut alias: Vec<Option<(usize, Value)>> = vec![None; params.len()];
+    for ix in 0..params.len() {
+        if steps[ix].is_some() {
+            continue;
+        }
+        let mut cand: Option<(usize, Value, i64)> = None;
+        let mut ok = true;
+        for a in &back_args {
+            match alias_pair(func, domtree, h, &params, &steps, a, ix) {
+                Some(c) if cand.is_none_or(|x| x == c) => cand = Some(c),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let Some((j, b, off)) = cand else { continue };
+        if !ok || !entry_matches(func, entry_args[ix], b, entry_args[j], off) {
+            if debug && pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::ivrefold", "ivrefold {h}: slot {ix} alias of slot {j} (+{b}, off {off}) rejected: ok={ok}");
+            }
+            continue;
+        }
+        alias[ix] = Some((j, b));
+    }
+    for ix in 0..params.len() {
+        if let Some((j, _)) = alias[ix]
+            && alias[j].is_none()
+            && let Some(s) = steps[j]
+            && s != 0
+            && func.dfg.value_type(params[ix]) == func.dfg.value_type(params[j])
+        {
+            steps[ix] = Some(s);
+        }
     }
     // Anchor: an affine slot (nonzero step) whose param feeds an icmp
     // — the loop counter — else the smallest |step|. When a positive-step
@@ -1044,7 +1176,11 @@ pub fn run(
     let mut n = 0;
     let mut pmap = FxHashMap::default();
     for h in func.layout.blocks().collect::<Vec<_>>() {
-        n += refold_header(func, domtree, &edges, h, debug, &mut pmap);
+        let k = refold_header(func, domtree, &edges, h, debug, &mut pmap);
+        if debug && pliron_cfg::tracing_on() && func.dfg.block_params(h).len() > 1 {
+            tracing::debug!(target: "pliron::ivrefold", "ivrefold {h}: {} params -> {k}", func.dfg.block_params(h).len());
+        }
+        n += k;
     }
     if n > 0 {
         // The stripped increments (`p + step` edge args) are usually dead now.

@@ -2095,6 +2095,17 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // NonNull builds lazily inside `round` on the first candidate edge;
     // a round that threads nothing never pays for the fixpoint.
     let mut nn: Option<jumpthread::NonNull> = None;
+    // `PLIRON_NULLFOLD2=1`: null tests the first jumpthread left (see
+    // `fold_nulls_late`) before the rounds thread the decided edges.
+    if pliron_cfg::env_is("PLIRON_NULLFOLD2", "1") {
+        let k = jumpthread::fold_nulls_late(&mut p.clctx.func, p.nonnull, p.derived);
+        if k > 0 {
+            total += k;
+            if p.dump {
+                p.dump("nullfold2");
+            }
+        }
+    }
     for i in 0..8 {
         let mut evict = FxHashSet::default();
         let n = {
@@ -2454,7 +2465,7 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
     // shared base from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         an.invalidate(&p.clctx.func);
-        indvars::run(&mut p.clctx.func, an, p.amode_scale);
+        indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
     }
     k
 }
@@ -2499,7 +2510,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
     // range from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         an.invalidate(&p.clctx.func);
-        indvars::run(&mut p.clctx.func, an, p.amode_scale);
+        indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
     }
     if k > 0 && p.dump {
         p.dump("licm");
@@ -2661,7 +2672,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         // loopvec rewrote the loop the cache describes.
         an.invalidate(&p.clctx.func);
-        indvars::run(&mut p.clctx.func, an, p.amode_scale);
+        indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
     }
     k
 }
@@ -3783,7 +3794,7 @@ pub fn amode_scale(isa: &dyn TargetIsa) -> bool {
 }
 
 fn s_indvars(p: &mut Pipe, an: &mut Analysis) -> usize {
-    indvars::run(&mut p.clctx.func, an, p.amode_scale)
+    indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived)
 }
 
 fn s_zipiv(p: &mut Pipe, an: &mut Analysis) -> usize {
@@ -4338,7 +4349,6 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Loops the late threading simplified (an `Option` niche test
         // folded away) can rotate now: top test + `jump` back becomes one
         // bottom `brif`.
-        step("looprot2", "looprot", Gate::OptIn("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         // `p' = B + s*i` with `i' = i + 1` and a matching entry: `p + s`
         // (late: the loop must be rotated and its addresses simplified).
         step("ivptr", "ivptr", Gate::Env("PLIRON_IVPTR"), s_ivptr).needs(shape::LOOPS),
@@ -4597,6 +4607,14 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_constdedup,
         )
         .needs(shape::ICONST),
+        // Carried `base + i` pointers whose index step only became
+        // visible once the late threading and its sameargs/niche
+        // cleanup collapsed the Option-merge params (the zip/enumerate
+        // loops after `nullfold2`), then the rotation those loops can
+        // take once their niche test is gone: top test + `jump` back
+        // becomes one bottom `brif`.
+        step("ivrefold2", "ivrefold", Gate::OptIn("PLIRON_IVREFOLD2"), s_ivrefold).needs(shape::LOOPS),
+        step("looprot2", "looprot", Gate::OptIn("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         // Loop-invariant header params onto a preheader (no back-edge
         // param webs for regalloc2 to spill around; serde_json's escape scan).
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),

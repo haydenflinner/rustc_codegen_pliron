@@ -57,6 +57,20 @@ fn pass(name: &str) -> Pass {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::scev::exit_values(f, &mut an)
         },
+        "ivrefold" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::ivrefold::run(f, &mut an).0
+        },
+        "looprot" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            let mut derived = pliron_clif_opt::vmap::VMap::default();
+            pliron_clif_opt::looprot::run_with(f, &mut an, &mut derived, false)
+        },
+        "looprot_sink" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            let mut derived = pliron_clif_opt::vmap::VMap::default();
+            pliron_clif_opt::looprot::run_with(f, &mut an, &mut derived, true)
+        },
         "brhint" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::brhint::run(f, &mut an);

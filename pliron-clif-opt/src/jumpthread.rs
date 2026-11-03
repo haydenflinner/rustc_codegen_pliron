@@ -488,6 +488,9 @@ impl<'a> NonNull<'a> {
                                 deps: deps.iter().copied().collect(),
                             });
                         } else {
+                            if pliron_cfg::tracing_on() {
+                                tracing::trace!(target: "pliron::jumpthread", "nn evict0 {p}: edge {t}:{ei} arg {v} derived={:?}", nn.derived.get(&v))
+                            };
                             evict.push(p);
                         }
                     }
@@ -1269,6 +1272,35 @@ impl RegionNN<'_> {
 /// The same select shape with a non-zero sentinel (`icmp eq/ne
 /// (select c, X, K), K` with `X` provably `!= K`, e.g. `Option<char>`'s
 /// `-1`) reduces to `!c`.
+/// The value a block param takes when its block has one predecessor
+/// whose terminator reaches it through exactly one arm (a `jump`, or one
+/// `brif` arm); `v` itself otherwise. Up to four levels.
+fn single_edge_source(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value {
+    let mut x = func.dfg.resolve_aliases(v);
+    for _ in 0..4 {
+        let ValueDef::Param(d, pidx) = func.dfg.value_def(x) else { break };
+        let mut preds = cfg.pred_iter(d);
+        let (Some(p), None) = (preds.next(), preds.next()) else { break };
+        let mut arm = None;
+        for bc in func.dfg.insts[p.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            if bc.block(&func.dfg.value_lists) == d {
+                if arm.is_some() {
+                    return x;
+                }
+                arm = Some(*bc);
+            }
+        }
+        let Some(bc) = arm else { break };
+        let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(pidx) else { break };
+        let a = func.dfg.resolve_aliases(a);
+        if a == x {
+            break;
+        }
+        x = a;
+    }
+    x
+}
+
 fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) -> usize {
     let none = FxHashMap::default();
     enum Fold {
@@ -1374,11 +1406,18 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
                 for _ in 0..4 {
                     // `select (a != 0), a, 0` is `a` (and `select (a == 0), 0, a`):
                     // the second level of an `Option` merge after if-conversion.
+                    // `select c, a, b` with `c` a constant (through
+                    // single-edge params: the zip's `Some` flag after
+                    // edgespec) is the chosen arm.
                     if let Some(i) = func.dfg.value_def(x).inst()
                         && let InstructionData::Ternary { opcode: Opcode::Select, args: sa } = func.dfg.insts[i]
                     {
                         let (c, t, f) = (sa[0], func.dfg.resolve_aliases(sa[1]), func.dfg.resolve_aliases(sa[2]));
                         let z = |v: Value| known(func, &none, v) == Some(0);
+                        if let Some(k) = known(func, &none, single_edge_source(func, cfg, c)) {
+                            x = if k != 0 { t } else { f };
+                            continue;
+                        }
                         match nz_test_of(func, c, 0) {
                             Some((a, true)) if a == t && z(f) => {
                                 x = t;
@@ -1391,12 +1430,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
                             _ => break,
                         }
                     }
-                    let ValueDef::Param(d, pidx) = func.dfg.value_def(x) else { break };
-                    let mut preds = cfg.pred_iter(d);
-                    let (Some(p), None) = (preds.next(), preds.next()) else { break };
-                    let InstructionData::Jump { destination, .. } = func.dfg.insts[p.inst] else { break };
-                    let Some(BlockArg::Value(a)) = destination.args(&func.dfg.value_lists).nth(pidx) else { break };
-                    let a = func.dfg.resolve_aliases(a);
+                    let a = single_edge_source(func, cfg, x);
                     if a == x {
                         break;
                     }
@@ -1404,6 +1438,9 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
                 }
             }
             let ib = func.layout.inst_block(inst);
+            if pliron_cfg::tracing_on() {
+                tracing::trace!(target: "pliron::jumpthread", "nulltest {inst}: x={x} (from {}) nn={}", args[0], nn.is_m(func, x, &mut nnm));
+            }
             if nn.is_m(func, x, &mut nnm) || rnn.zip(ib).is_some_and(|(r, ib)| r.holds(func, nn.derived, x, ib)) {
                 hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
                 continue;
@@ -5129,6 +5166,26 @@ fn fnn<'a>(
         }
     };
     fold_null_tests(func, &nn, rnn)
+}
+
+/// Late null-test folds (`PLIRON_NULLFOLD2=1`, from `jtround`): the
+/// lattice rebuilt on the current CFG for tests the first `jumpthread`
+/// could not decide. The zip/enumerate niche test is `icmp eq (select f,
+/// p, 0), 0` with `f` and `p` single-edge params only after edgespec and
+/// mergechain, and `p`'s stepped back-edge value carries its inbounds
+/// mark only after indvars. Decided `brif`s are folded and the blocks
+/// they strand removed.
+pub fn fold_nulls_late(func: &mut Function, loads: &FxHashSet<Value>, derived: &VMap<Value>) -> usize {
+    if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
+        return 0;
+    }
+    let cfg = ControlFlowGraph::with_function(func);
+    let nn = NonNull::new(func, &cfg, loads, derived);
+    let k = fold_null_tests(func, &nn, None);
+    if k > 0 && fold_const_branches(func) > 0 {
+        remove_unreachable_blocks(func);
+    }
+    k
 }
 
 /// Thread until nothing changes (bounded); returns the edges retargeted.

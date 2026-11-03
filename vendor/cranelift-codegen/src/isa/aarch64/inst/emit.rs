@@ -4353,7 +4353,11 @@ impl MachInstEmit for Inst {
             | Inst::FpuLoad128 { .. }
             | Inst::FpuStore32 { .. }
             | Inst::FpuStore64 { .. }
-            | Inst::FpuStore128 { .. } => true,
+            | Inst::FpuStore128 { .. }
+            // Post-index forms (patch 90's writeback loads/stores):
+            // the address update is a plain add, no flags.
+            | Inst::StorePost { .. }
+            | Inst::LoadPost { .. } => true,
             _ => false,
         }
     }

@@ -1405,6 +1405,7 @@ fn run_loop(
     lp: Loop,
     debug: bool,
     amode_scale: bool,
+    derived: &mut crate::vmap::VMap<Value>,
 ) -> usize {
     let h = la.loop_header(lp);
     if !dt.is_reachable(h) {
@@ -1517,13 +1518,41 @@ fn run_loop(
             };
             // Compute the new param's argument on every edge into `h`.
             let np = func.dfg.append_block_param(h, ty);
+            // The replaced adds' derived base (inbounds mark), carried
+            // onto the param and the fresh edge values.
+            // (A tombstoned base — alias to the reserved slot — means the
+            // recorded base was deleted: nothing to carry.)
+            let dbase = insts
+                .iter()
+                .filter(|&&i| func.dfg.has_results(i))
+                .find_map(|&i| derived.get(&func.dfg.first_result(i)).copied())
+                .and_then(|mut b| {
+                    for _ in 0..16 {
+                        match func.dfg.value_alias_dest_for_serialization(b) {
+                            Some(d) if d != <Value as cranelift_codegen::entity::packed_option::ReservedValue>::reserved_value() => b = d,
+                            _ => break,
+                        }
+                    }
+                    func.dfg.value_is_real(b).then_some(b)
+                });
             for (e, arg) in edges.iter().zip(args) {
                 let v = edge_value(func, iv, np, &body, base, mul, e, arg);
+                if let Some(b) = dbase
+                    && v != b
+                    && v != np
+                    && func.dfg.value_def(v).inst().is_some()
+                    && !derived.contains_key(&v)
+                {
+                    derived.insert(v, b);
+                }
                 let dfg = &mut func.dfg;
                 let bc = &mut dfg.insts[e.inst]
                     .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
                     [e.slot];
                 bc.append_argument(v, &mut dfg.value_lists);
+            }
+            if let Some(b) = dbase {
+                derived.insert(np, b);
             }
             for &i in insts {
                 let r = func.dfg.first_result(i);
@@ -1552,7 +1581,16 @@ fn run_loop(
     n
 }
 
-pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, amode_scale: bool) -> usize {
+/// `derived`: the pipeline's derived-pointer marks (`Pipe::derived`). A
+/// stepped `base + iv*K` whose original carried an inbounds mark passes it
+/// to the new param and its edge values, so the non-null lattice still
+/// sees through the recurrence (the zip/enumerate niche test).
+pub fn run(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    amode_scale: bool,
+    derived: &mut crate::vmap::VMap<Value>,
+) -> usize {
     let debug = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
     let mut n = 0;
@@ -1572,7 +1610,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis, amode_scale:
             break;
         };
         done.insert(la.loop_header(lp));
-        let m = run_loop(func, cfg, dt, la, lp, debug, amode_scale);
+        let m = run_loop(func, cfg, dt, la, lp, debug, amode_scale, derived);
         n += m;
         if m > 0 {
             an.invalidate(func);

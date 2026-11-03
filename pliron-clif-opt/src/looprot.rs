@@ -21,6 +21,17 @@ pub fn run(
     an: &mut crate::pipeline::Analysis,
     derived: &mut VMap<Value>,
 ) -> usize {
+    run_with(func, an, derived, pliron_cfg::env_is("PLIRON_LOOPROT_SINK", "1"))
+}
+
+/// `run` with the latch sink (`sink_to_latch`) chosen by the caller
+/// (`PLIRON_LOOPROT_SINK=1` in the pipeline; filetests pass it directly).
+pub fn run_with(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    derived: &mut VMap<Value>,
+    sink: bool,
+) -> usize {
     // Each block is evaluated once, in layout order: re-scanning let cloned
     // headers created by earlier rotations starve late-layout loops (e.g.
     // bcheck clones appended at the end) of the rotation budget.
@@ -64,6 +75,11 @@ pub fn run(
                 })
         };
         if ok {
+            // `PLIRON_LOOPROT_SINK=1`: the header's own increments move
+            // to the latch first, so the rotated loop carries one index.
+            if sink && sink_to_latch(func, an, h) > 0 {
+                an.invalidate(func);
+            }
             let u = an.uses(func);
             let (cfg, domtree) = an.cfg_dt(func);
             if rotate(func, cfg, domtree, h, derived, &u) {
@@ -75,6 +91,65 @@ pub fn run(
         }
     }
     n
+}
+
+/// Header instructions whose results are used only by the latch's
+/// terminator (the index increment feeding the back edge's args) move
+/// to the latch, right before that terminator. Rotation then copies
+/// only the test: without this the increment is a header value used
+/// past the header, becomes a successor param, and the rotated loop
+/// carries both `i` and `i + 1` (a `mov` per iteration). Operands are
+/// header-dominated, so the move keeps SSA order; only side-effect-free,
+/// non-trapping instructions qualify.
+fn sink_to_latch(func: &mut Function, an: &mut crate::pipeline::Analysis, h: Block) -> usize {
+    let (lb, li) = {
+        let (cfg, domtree) = an.cfg_dt(func);
+        let Some(l) = cfg.pred_iter(h).find(|p| domtree.block_dominates(h, p.block)) else {
+            return 0;
+        };
+        (l.block, l.inst)
+    };
+    if lb == h {
+        return 0;
+    }
+    // Backwards over the header: an instruction moves when every use is
+    // the latch terminator or an instruction already moving (the `iconst
+    // 1` feeding the increment goes with it, instead of becoming a
+    // carried param). Re-inserted in header order before the terminator.
+    let mut moving: FxHashSet<Inst> = FxHashSet::default();
+    {
+        let u = an.uses(func);
+        let insts: Vec<Inst> = func.layout.block_insts(h).collect();
+        for &i in insts.iter().rev() {
+            let op = func.dfg.insts[i].opcode();
+            if op.is_branch()
+                || op.is_terminator()
+                || op.is_call()
+                || op.can_load()
+                || op.can_store()
+                || op.can_trap()
+                || op.other_side_effects()
+            {
+                continue;
+            }
+            let rs = func.dfg.inst_results(i);
+            if rs.is_empty()
+                || rs.iter().any(|&r| {
+                    let s = u.sites(r);
+                    s.is_empty() || s.iter().any(|&(b, j)| !((b == lb && j == li) || moving.contains(&j)))
+                })
+            {
+                continue;
+            }
+            moving.insert(i);
+        }
+    }
+    let moves: Vec<Inst> = func.layout.block_insts(h).filter(|i| moving.contains(i)).collect();
+    for &i in &moves {
+        func.layout.remove_inst(i);
+        func.layout.insert_inst(i, li);
+    }
+    moves.len()
 }
 
 /// The `rotatable` checks that need only the layout and inst data —

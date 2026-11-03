@@ -997,6 +997,54 @@ regalloc2 patch log; Cranelift patch 99). What the A/Bs taught:
   lowering), so per-function spill/reload diffs between variants are one
   script (`ra2stat_regex_*.txt` in the session scratchpad).
 
+## 2026-11-03 (afternoon): one hot loop, end to end (brotli's byte compare)
+
+rust-compression is the worst held-out ratio (1.32). Its profile against
+LLVM's build is not one slow function but a 30% tax on the two hottest
+(`FindMatchLengthWithLimit`, `BrotliEstimateBitCostsForLiterals`) plus
+one missed inline (`EvaluateNode`, 6% of samples, inlined by LLVM). The
+byte compare is a plain `s1[..n].iter().zip(s2[..n]).enumerate()` loop.
+pliron emitted 11 instructions with two taken branches per byte against
+LLVM's 7 with one, and each extra instruction had a different owner:
+
+- a `cbz` per byte: the `Option<(&u8, &u8)>` niche test. The lowering
+  knows both slice pointers are non-null and marks the `iadd base, i`
+  inbounds, but `indvars` rebuilt that add as a stepped header param
+  without the mark, the first `jumpthread` ran before edgespec and
+  mergechain had reduced the test to `select 1, p, 0`, and the only
+  null-fold (`PLIRON_NULLSRC`) looked through `jump` edges only.
+  Fixes: `indvars` carries the derived mark onto the param and its edge
+  values (always on; a tombstoned base is skipped); `fold_null_tests`
+  sees through `brif` arms and constant select conditions
+  (`single_edge_source`); a late fold (`PLIRON_NULLFOLD2=1`, start of
+  `jtround`) rebuilds the lattice when the shape is decidable.
+- three address adds and a `mov`: the zip's pointers are recomputed as
+  `base + i'` from the stepped index, so `ivrefold` (which matches
+  `p + k`) never refolded them. New alias rule: a slot whose back-edge
+  value is `iadd B, q'` (`q'` another slot's edge value, or the slot's
+  current param one step behind) with a matching entry is affine with
+  `q` and refolds onto it (`bp = B`); loads become `[base, index]`
+  amodes. The first `ivrefold` still runs before the late cleanup, so a
+  second run (`PLIRON_IVREFOLD2=1`, after `constdedup2`) catches the
+  loops the null fold just simplified.
+- top test plus `jump` back: `looprot2` (existing opt-in, moved after
+  `constdedup2`) rotates once the niche test is gone, but copied the
+  header's increment into a second carried index (`i` and `i + 1`, a
+  `mov` each iteration). `PLIRON_LOOPROT_SINK=1`: header instructions
+  used only by the latch terminator (the increment and its constant)
+  move to the latch first, so the clone tests the stepped index in
+  place.
+
+With all five knobs the reproducer (`t/zipcmp.rs`) is LLVM's loop
+exactly: `ldrb [x2, x9]; ldrb [x4, x9]; cmp; b.ne; add x9, x9, #1; cmp
+x9, #n; b.lo`. Filetests `ivrefold_alias.clif` and `looprot_sink.clif`;
+regex corpus diffcheck clean under the chain (1579 ok, 338 inconclusive,
+0 mismatches). Lesson: every one of the four owners was a pass-ordering
+or fact-propagation gap, not a missing optimization; the late pipeline
+(`jtround` → `sameargs`/`niche`/`constdedup2` → `ivrefold2` →
+`looprot2`) is where iterator loops become canonical, and anything that
+wants their final shape has to run after it.
+
 ## Sequencing (revised 2026-10-31, after the census)
 
 The census reordered the plan: register allocation (W4) and the fact
