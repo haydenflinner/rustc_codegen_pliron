@@ -55,6 +55,18 @@ pub fn explain_on() -> bool {
     false
 }
 
+/// PLIRON: `PLIRON_RA2_FREQSPLIT=1` (opt-in): move a split to the
+/// cheapest block boundary before the conflict (see `process_bundle`).
+pub(crate) fn freqsplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_FREQSPLIT").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON: `PLIRON_RA2_LOOPSPLIT=1` (opt-in): split a bundle at the
 /// boundaries of the loop around its conflict (see `process_bundle`).
 pub(crate) fn loopsplit_on() -> bool {

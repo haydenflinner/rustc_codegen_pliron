@@ -23,8 +23,8 @@ use crate::{
         MINIMAL_BUNDLE_SPILL_WEIGHT, MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT,
         MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT,
     },
-    Allocation, Function, Inst, InstPosition, OperandConstraint, OperandKind, PReg, ProgPoint,
-    RegAllocError,
+    Allocation, Block, Function, Inst, InstPosition, OperandConstraint, OperandKind, PReg,
+    ProgPoint, RegAllocError,
 };
 use core::fmt::Debug;
 use smallvec::{smallvec, SmallVec};
@@ -1381,6 +1381,58 @@ impl<'a, F: Function> Env<'a, F> {
                             split_at_point = self.ctx.cfginfo.block_entry[block];
                             break;
                         }
+                    }
+                }
+
+                // PLIRON `PLIRON_RA2_FREQSPLIT=1`: put the split where its
+                // move is cheapest. The split's move runs at the frequency
+                // of the point it lands on: inside a block, that block's;
+                // at a block's entry, the forward edges into it (a loop
+                // header's back edge connects the second piece to itself
+                // and carries no move), each at most `min(pred, block)`.
+                // Scan the block boundaries between the bundle's start
+                // and the conflict (the range the depth hoist above walks)
+                // and take the cheapest, keeping the later point on ties.
+                // With the frequency weights (`PLIRON_RA2_FREQ`) this is
+                // LLVM's region split in spirit: the reload lands on the
+                // coldest edge before the hot region, not on the first
+                // loop entry or at the conflict itself.
+                if crate::freqsplit_on() {
+                    let cfg = &self.ctx.cfginfo;
+                    let sb = cfg.insn_block[bundle_start.inst().index()].index();
+                    let cb = cfg.insn_block[split_at_point.inst().index()].index();
+                    let at_conflict = split_at_point;
+                    let mut best_cost = cfg.hot_bonus[cb];
+                    let mut best = split_at_point;
+                    for b in (sb + 1)..=cb {
+                        let entry = cfg.block_entry[b];
+                        if entry <= bundle_start || entry > at_conflict {
+                            continue;
+                        }
+                        let hb = cfg.hot_bonus[b];
+                        let preds = self.func.block_preds(Block::new(b));
+                        let mut c = 0.0f32;
+                        let mut any = false;
+                        for &p in preds {
+                            if p.index() < b {
+                                c += hb.min(cfg.hot_bonus[p.index()]);
+                                any = true;
+                            }
+                        }
+                        if !any {
+                            c = hb;
+                        }
+                        if c < best_cost {
+                            best_cost = c;
+                            best = entry;
+                        }
+                    }
+                    if best != split_at_point {
+                        explain!(
+                            "  freqsplit {:?}: conflict in block {cb} (cost {}) -> block entry {:?} (cost {})",
+                            bundle, cfg.hot_bonus[cb], best, best_cost
+                        );
+                        split_at_point = best;
                     }
                 }
 

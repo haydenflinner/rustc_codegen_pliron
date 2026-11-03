@@ -1074,6 +1074,49 @@ conflict, LLVM's region split in spirit) uses frequencies where they
 are reliable in relative terms; real frequencies (a sampling feed into
 `block_hotness`) are the only answer for a cache hit rate.
 
+## 2026-11-03 (evening): warm calls in the inliner's loop gate; frequency-aware split placement
+
+**`EvaluateNode`.** LLVM's compression build inlines brotli's
+`EvaluateNode` into `UpdateNodes` and keeps `UpdateNodes` and
+`ComputeDistanceCache` out of line. Ours rejected it at cost 692 against
+320: the callsite sits in a loop, but the loop bonus is gated on the
+callee being leaf-ish (`PLIRON_INLINE_LOOPCALLS`, at most 4 calls of its
+own), and `EvaluateNode` carries 18 calls, 13 of them bounds-check
+panics and the rest `#[cold]` or already inlined. A panic call never runs
+on the warm path and moves no call traffic into the loop, so the gate
+now counts warm calls only (`PLIRON_INLINE_WARMCALLS=1`: not noreturn,
+not `#[cold]`): `EvaluateNode` has one. Two things learned on the way:
+
+- The gate at 4 warm calls is far looser than 4 total calls was. 59
+  regex sites flipped, among them `follow_epsilons` (16% of regex's
+  samples, 3 warm calls, 322 ops) into the per-byte `exec_byte` loop,
+  which LLVM does not do: regex +4.8%. The old limit of 4 was calibrated
+  against counts that panics inflate by two or three, so the warm gate
+  wants 2: `follow_epsilons` out, `EvaluateNode` in, regex flat.
+- Pricing the callee by its warm ops instead (`=2`, the ops outside
+  panic blocks plus 20 per warm call; `EvaluateNode` 317 against 320,
+  `follow_epsilons` 372) looked clean on the decisions I diffed and was
+  not: it re-prices every panic-heavy callee, regex's binary grew 4% and
+  ran 2.2% slower. Kept as a documented negative.
+
+Tuning set (K=3 x 3 rounds): warm gate at 2 calls 0.996 (pulldown 0.983,
+blind 0.993, regex 1.001), at 1 call 0.998; rust-compression 0.988 at 2,
+0.993 at 1. Held-out (10 rounds x 3 layouts x 2 pads, A/A floor 0.998
+[0.994, 1.004]): the gate at 2 warm calls / base 0.997 [0.994, 0.999],
+pulldown 0.986 [0.978, 0.990], blind-sig 0.993 [0.985, 0.998], regex
+1.000, compression 1.002 [0.996, 1.007] (the tuning-set 0.988 there did
+not reproduce with intervals). Gate and 400 fuzz seeds clean with the
+flags on. **Default now:** `PLIRON_INLINE_WARMCALLS=1` with
+`PLIRON_INLINE_LOOPCALLS=2` (`=0` and `=4` restore the old gate).
+
+**Frequency-aware split placement** (`PLIRON_RA2_FREQSPLIT=1`, regalloc2
+patch log): the split point moves to the cheapest block boundary between
+the bundle's start and the conflict, costing a boundary by its forward
+edges at `min(pred, block)`. Tuning set 0.999, compression 1.010. The
+depth hoist already lands on loop entries; a colder boundary further
+back rarely exists and did not pay where it did. Held-out 0.999
+[0.995, 1.003] of base. Opt-in.
+
 ## 2026-11-03 (afternoon): one hot loop, end to end (brotli's byte compare)
 
 rust-compression is the worst held-out ratio (1.32). Its profile against

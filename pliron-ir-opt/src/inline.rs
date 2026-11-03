@@ -212,6 +212,17 @@ struct CInfo {
     n: usize,
     /// Call ops inside the body (`CALL_OP_W` extra cost each under the model).
     ncalls: usize,
+    /// Of those, calls that can run on a warm path: not to a `#[cold]`
+    /// callee and not noreturn (bounds-check and overflow panics). The
+    /// loop gate (`PLIRON_INLINE_LOOPCALLS`) counts these: inlining a body
+    /// whose only calls are panics moves no call traffic into the loop
+    /// (brotli's `EvaluateNode`: 18 calls, 13 of them panics).
+    nwarm: usize,
+    /// Ops outside the blocks that end in a noreturn call (bounds-check and
+    /// overflow panic blocks): the body a warm path can execute. Under
+    /// `PLIRON_INLINE_WARMCALLS=2` the cost is `nwarm_ops + CALL_OP_W *
+    /// nwarm`, LLVM's shape: a cold panic block is code size, not work.
+    nwarm_ops: usize,
     /// Params feeding an indirect call's target (see `devirt_params`).
     dvirt: Vec<usize>,
     /// Params reaching a branch condition (see `cond_params`).
@@ -246,12 +257,15 @@ fn callee_info(
         };
         return None;
     }
-    let (mut n, mut ncalls, mut eh) = (0, 0, false);
+    let (mut n, mut ncalls, mut nwarm, mut nwarm_ops, mut eh) = (0, 0, 0, 0, false);
     let mut dvirt_tgt = Vec::new();
     let mut cond_roots = Vec::new();
     for b in blocks_iter(ctx, f.op) {
+        let mut bn = 0usize;
+        let mut panic_block = false;
         for op in b.deref(ctx).iter(ctx) {
             n += 1;
+            bn += 1;
             let intr = st.intrinsics.get(op);
             if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
                 || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
@@ -261,6 +275,12 @@ fn callee_info(
             eh |= st.invokes.contains(op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
             if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
                 ncalls += 1;
+                let noret = st.calls.get(op).is_some_and(|i| i.noret);
+                let cold = direct_callee(ctx, st, op).is_some_and(|c| st.funcs.get(c).is_some_and(|f| f.cold));
+                if !noret && !cold {
+                    nwarm += 1;
+                }
+                panic_block |= noret;
                 // Indirect target is operand 0; `callee()` would clone the
                 // attr for a direct call only to discard it here.
                 if c.get_attr_llvm_call_callee(ctx).is_none() {
@@ -273,6 +293,9 @@ fn callee_info(
                 cond_roots.push(op.deref(ctx).get_operand(ctx, 0));
             }
         }
+        if !panic_block {
+            nwarm_ops += bn;
+        }
     }
     if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
         return None;
@@ -282,6 +305,8 @@ fn callee_info(
         eh,
         n,
         ncalls,
+        nwarm,
+        nwarm_ops,
         dvirt: Vec::new(),
         conds: Vec::new(),
         mem: Vec::new(),
@@ -1094,8 +1119,12 @@ fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
 ///   x`PLIRON_INLINE_DEVIRT` when a constant-address actual feeds an
 ///   indirect-call param, x`PLIRON_INLINE_FOLD` when a constant actual feeds
 ///   a branch condition, plus `FOLD_USE`/`MEM_USE` per use a constant or
-///   local-slot actual resolves, plus half the base when the callsite sits in
-///   a loop — all capped at `MAX_T`x the base.
+///   local-slot actual resolves, plus `PLIRON_INLINE_LOOP`/4 of the base when
+///   the callsite sits in a loop and the callee is leaf-ish (at most
+///   `PLIRON_INLINE_LOOPCALLS` warm calls of its own, default 2: calls that
+///   can run, not `#[cold]` or noreturn panics (`PLIRON_INLINE_WARMCALLS=0`
+///   counts every call); brotli's `EvaluateNode` has 18 calls, one of them
+///   warm) — all capped at `MAX_T`x the base.
 /// - `PLIRON_INLINE_GROWTH` (default `GROWTH_MULT`x the base) caps the
 ///   non-free ops one caller may absorb; `PLIRON_INLINE_CALLER_MAX` still
 ///   bounds total size. `small` disables every bonus and the budget.
@@ -1239,9 +1268,19 @@ pub fn run(
     // leaf-ish rule. A callee that carries many calls just moves them into
     // the loop: parser loops (`while input.peek(..)`) took 25-call drop
     // glues at 3x the base threshold. syn CPU -65%, kernels neutral.
+    // Default 2 since 11-03, counting warm calls only (`PLIRON_INLINE_WARMCALLS`
+    // below); it was 4 against all calls, which bounds-check panics inflate.
     let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(2);
+    // `PLIRON_INLINE_WARMCALLS`: `1` (the default) gates the loop bonus on
+    // the warm calls only; `0` counts every call (the old gate; pair it with
+    // `PLIRON_INLINE_LOOPCALLS=4` for the old behaviour); `2` keeps the old
+    // gate and instead prices the callee by its warm ops and warm calls (see
+    // `CInfo::nwarm_ops`): a documented negative (regex +2%, binary +4%).
+    let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let warm_gate = warm_mode == 1;
+    let warm_cost = warm_mode == 2;
     // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
     let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
         .and_then(|s| s.parse().ok())
@@ -1580,6 +1619,9 @@ pub fn run(
                     let mut cost = sn;
                     if model {
                         cost = sn.saturating_add(scalls.saturating_mul(call_w));
+                        if warm_cost && !spec {
+                            cost = ci.nwarm_ops.saturating_add(ci.nwarm.saturating_mul(call_w));
+                        }
                         let mut save = 0usize;
                         for (i, a) in args.iter().enumerate().filter(|_| !spec) {
                             if const_arg(st, a) {
@@ -1597,7 +1639,9 @@ pub fn run(
                         if f.cold {
                             cost = cost.saturating_mul(COLD_W);
                         }
-                        if ci.ncalls <= loop_calls
+                        // `PLIRON_INLINE_WARMCALLS=1` (default): gate on the
+                        // warm calls only.
+                        if (if warm_gate { ci.nwarm } else { ci.ncalls }) <= loop_calls
                             && loops
                                 .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                                 .contains(&b)
@@ -1747,8 +1791,8 @@ pub fn run(
                     };
                     if verbose {
                         if pliron_cfg::tracing_on() {
-                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",
-                                st.cgu, ci.n, ci.ncalls, single.contains(cs), f.linkage == Linkage::Local,
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",
+                                st.cgu, ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops, single.contains(cs), f.linkage == Linkage::Local,
                                 adj.as_ref().is_some_and(|a| a.taken.contains(cs.as_str())),
                                 adj.as_ref().and_then(|a| a.callers_of.get(cs.as_str())).map_or(0, |v| v.len()),
                                 rec_caller, free_used.contains(cs.as_str())

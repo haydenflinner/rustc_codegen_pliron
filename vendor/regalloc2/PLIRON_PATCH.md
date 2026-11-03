@@ -100,6 +100,24 @@ registers, LLVM's shape. Loops sharing a header (the scan loop and the
 handler both jump back to it) have one depth; the shortest back edge
 still separates them.
 
+## `PLIRON_RA2_FREQSPLIT=1` (runtime, opt-in): split at the cheapest block boundary
+
+`process_bundle`: after the depth hoist, the split point moves to the
+cheapest block boundary between the bundle's start and the conflict.
+A split's move runs at the frequency of the point it lands on: inside a
+block, that block's `hot_bonus`; at a block entry, the forward edges
+into it (a loop header's back edge joins the second piece to itself and
+carries no move), each estimated at `min(pred, block)`. Ties keep the
+later point, so straight-line code splits at the conflict as before and
+a loop entry wins only when its preheader edge is colder than the
+conflict's block. With the frequency weights this is LLVM's region split
+in spirit. Measured (11-03): tuning set 0.999, rust-compression 1.010
+(100 of its functions change, mostly `FindLongestMatch` variants, a
+few spills traded for register moves); held-out 0.999 [0.995, 1.003]
+of base with the harness's intervals. Opt-in: the
+depth hoist already lands on loop entries, and the cases where a
+colder boundary exists further back did not pay.
+
 ## `PLIRON_RA2_FREQ=0..5` (runtime; 3 is the default, `=0` off): block-frequency spill weights
 
 `Function::block_hotness(block) -> Option<f32>` (default `None`) lets the
