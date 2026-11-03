@@ -608,10 +608,14 @@ fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &s
         let mut fs = cranelift_reader::parse_functions(&text).ok()?;
         (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
     });
-    let Some((func, facts)) = loaded else {
+    let Some((mut func, facts)) = loaded else {
         row.status = "parse";
         return row;
     };
+    // Name the function after its corpus file so per-function traces
+    // (`PLIRON_TRACE=pliron::<step>`) can be grepped.
+    let stem = std::path::Path::new(&row.file).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    func.name = cranelift_codegen::ir::UserFuncName::testcase(stem.as_bytes());
     let before = func.clone();
     let (ib, bb) = size_of(&before);
     let t0 = std::time::Instant::now();

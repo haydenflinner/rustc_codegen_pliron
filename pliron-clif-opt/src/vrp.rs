@@ -133,6 +133,9 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
                             continue;
                         }
                         let Some(nb) = bits_of(func.dfg.value_type(a)) else { continue };
+                        if nb >= 64 || bits_of(func.dfg.value_type(wide)).is_none() {
+                            continue;
+                        }
                         let r = rs.at(func, dt, wide, b);
                         let fits = match op {
                             Opcode::Uextend => r.uhi < (1u64 << nb),

@@ -3858,6 +3858,14 @@ fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::brhint::run(&mut p.clctx.func, an)
 }
 
+fn s_ivexit(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::scev::exit_values(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("ivexit");
+    }
+    k
+}
+
 fn s_scev(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::scev::census(&p.clctx.func, an)
 }
@@ -4426,7 +4434,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `p + d == e` exit tests with `d`, `e` invariant: `p == e - d`.
         // After ivretro, which rewrites a second IV as `p + d`.
         step("ivcmp", "ivcmp", Gate::Env("PLIRON_IVCMP"), s_ivcmp).needs(shape::LOOPS),
-        // SCEV-lite census (analysis only, `PLIRON_TRACE=pliron::scev`).
+        // SCEV-lite consumers: exit-value replacement of a redundant
+        // same-step recurrence; then the census (analysis only,
+        // `PLIRON_TRACE=pliron::scev`).
+        step("ivexit", "ivexit", Gate::OptIn("PLIRON_IVEXIT"), s_ivexit).needs(shape::LOOPS),
         step("scev", "", Gate::OptIn("PLIRON_SCEV"), s_scev).needs(shape::LOOPS),
         // (`relparm`'s symbolic-gap pairs — tokenize's `pos` = `cur - base`
         // — are phase-D relational merges; the later sameargs3/webmerge
