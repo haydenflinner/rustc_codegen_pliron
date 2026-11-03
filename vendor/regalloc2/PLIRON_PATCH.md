@@ -121,4 +121,7 @@ decided (bundle weights of 45..271 against millions before; the state
 index went to the stack). Modes 3 and 4 normalize by the function's
 hottest block, map `freq / max` (mode 4: its square root) onto
 `[1, 1000 * 4^6]`, and multiply the bonuses in (`x1..x5`) instead of
-adding them, so a cold region keeps its internal structure.
+adding them, so a cold region keeps its internal structure. Measured
+(11-03): tuning set 0.996 (mode 3), 0.986 with `LOOPSPLIT`+`LOOPDEPTH`;
+held-out 1.126 -> 1.123 either way (pulldown, compression, html-rewriter
+-2%; regex, json, protobuf +1%). Opt-in.

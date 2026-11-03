@@ -963,6 +963,40 @@ counts for `willreturn` and unroll decisions, ranges for `dem64`-style
 narrowing of address arithmetic, and placement's frequencies exported to
 regalloc2 as spill weights (today it uses its own loop-depth estimate).
 
+## 2026-11-03: placement frequencies as spill weights (W4 x W5)
+
+The first cross-framework consumer: `placement::frequencies` (the loop
+forest, edge probabilities and packaged-loop frequencies split out of
+`place`) runs before regalloc (`VCode::compute_block_freq`) and reaches
+regalloc2 through `Function::block_hotness`; `CFGInfo::hot_bonus`
+replaces `1000 * 4^depth` in the spill weights (`PLIRON_RA2_FREQ`,
+regalloc2 patch log; Cranelift patch 99). What the A/Bs taught:
+
+- Raw frequencies (modes 1/2, floored at 1/64 of the entry, additive
+  def/constraint bonuses) fail where the hot code sits behind a cold edge.
+  regex's `Fsm::next_state` is a fast-path return and a cold slow path
+  holding the loops; every block was below the entry, the floor flattened
+  them, the constant bonuses decided, and the state index went to the
+  stack (`PLIRON_RA_EXPLAIN` showed bundle weights of 45..271 against
+  millions). Tuning set: neutral; regex +2%.
+- Normalized per function (modes 3/4: `freq / max` onto the depth
+  scale's top, bonuses multiplicative): tuning set 0.996 (mode 3), 0.986
+  with `PLIRON_RA2_LOOPSPLIT=1 PLIRON_RA2_LOOPDEPTH=1` (pulldown -2.5%,
+  regex -2.3%, every bench down). The multiplied depth fallback overflowed
+  a u32 move cost on blind-sig (capped at the depth scale's ceiling).
+- Held-out (8 programs, quiet machine, 5 rounds x 3 layouts x 2 pads):
+  1.126 -> 1.123 for mode 3 alone and with the split knobs. pulldown,
+  compression and html-rewriter -2%; regex, json and protobuf +1%. The
+  same split as the 11-02 RA batch, so the frequency weights do not
+  resolve why those three lose from loop-aware allocation. Gate and 400
+  fuzz seeds with `PLIRON_RA_CHECK=1` clean. **Opt-in.**
+- Note: the held-out base moved from 1.104 (11-03 morning) to 1.126 in
+  the afternoon with an identical build (protobuf 0.977 -> 1.068, LLVM's
+  own times moved too); compare variants only within one run.
+- `RA2STAT` lines now carry the symbol (`pliron_set_fn_name` from the
+  lowering), so per-function spill/reload diffs between variants are one
+  script (`ra2stat_regex_*.txt` in the session scratchpad).
+
 ## Sequencing (revised 2026-10-31, after the census)
 
 The census reordered the plan: register allocation (W4) and the fact
