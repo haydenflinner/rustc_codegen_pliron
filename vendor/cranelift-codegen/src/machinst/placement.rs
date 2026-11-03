@@ -78,7 +78,7 @@ struct Loop {
 /// the blocks that start a loop chain (aligned like loop headers), or
 /// `None` to keep the old order.
 /// `unlikely[b][k]`: the CLIF hinted successor `k` of `b` unlikely.
-pub(crate) fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], unlikely: &[Vec<bool>]) -> Option<(Vec<usize>, Vec<bool>)> {
+pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], unlikely: &[Vec<bool>]) -> Option<(Vec<usize>, Vec<bool>)> {
     let n = succs.len();
     if n < 3 || n > MAX_BLOCKS || cold[entry] {
         return None;
@@ -709,3 +709,4 @@ pub(crate) fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[
     }
     Some((order, heads))
 }
+

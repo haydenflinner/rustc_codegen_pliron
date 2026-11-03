@@ -52,6 +52,9 @@ mod machinst;
 pub use crate::machinst::pliron_last_frame;
 /// PLIRON: regalloc2 decision logging for the next allocations on this thread.
 pub use regalloc2::set_explain as ra_set_explain;
+/// PLIRON: block placement (`machinst/placement.rs`), exported for the
+/// workspace's unit tests.
+pub use machinst::placement::place as pliron_place;
 
 pub mod binemit;
 pub mod cfg_printer;
