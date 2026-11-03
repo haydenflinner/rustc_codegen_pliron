@@ -1175,8 +1175,9 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     dumps the pre-regalloc VCode when regalloc2's explain flag is set, so
     pliron's `PLIRON_RA_EXPLAIN=<symbol substring>` shows a function's
     VCode next to its allocation decisions (vendored regalloc2 patch log).
-98. Chain-based block placement with static branch probabilities (opt-in,
-    `PLIRON_PLACE=1`; `machinst/placement.rs`, hooked in `VCode::emit`
+98. Chain-based block placement with static branch probabilities (on by
+    default since the 2026-11-03 batch, `PLIRON_PLACE=0` restores the
+    lowering order; `machinst/placement.rs`, hooked in `VCode::emit`
     where cold blocks were already sunk). Edge probabilities in the
     Ball-Larus style (cold or trapping target 1/33, back edge 124/128,
     loop exit 4/128, CLIF hint 4/36, else even); block frequencies by
@@ -1201,4 +1202,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     2 pads: placement alone 0.996-1.013 of base (regex +5-10% from the
     cascade split and the padded head), with hints and the padding rule
     0.993-0.995 (blind-sig -2%, pulldown -1%, json -0.6%, regex and
-    blake3 neutral).
+    blake3 neutral). Full held-out (8 programs, 5 rounds x 3 layouts x 2
+    pads, release dylib): 1.111 -> 1.104 (html-rewriter -2.3%, json
+    -3.2%, blind-sig -1.4%, regex +2%); gate and 400 fuzz seeds clean
+    with the flags on, so placement and `brhint` were flipped on.

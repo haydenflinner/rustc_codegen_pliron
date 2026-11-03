@@ -121,6 +121,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // Outer-only loads stay out of nested-loop preheaders: geomean
     // 0.997 / 0.998 in two layout-averaged runs (regex -0.8% both).
     "PLIRON_LICM_INNERPRESS",
+    // Static branch hints for emission-time placement (Cranelift patch 98
+    // reads PLIRON_PLACE itself, on by default; docs/codegen-plan.md
+    // 2026-11-02/03): held-out 1.111 -> 1.104 with the check set.
+    "PLIRON_BRHINT",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

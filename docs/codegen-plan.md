@@ -10,7 +10,7 @@ how to tell whether it worked.
 | suite | pliron / LLVM | note |
 |---|---|---|
 | our 19 kernels, native | ~0.91 | tuned against for three weeks |
-| 8 held-out programs, native (`bench/heldout`) | **1.12** | 1.57 on 2026-10-31 morning, 1.31 that evening, 1.15 on 11-01 |
+| 8 held-out programs, native (`bench/heldout`) | **1.104** | 1.57 on 2026-10-31 morning, 1.31 that evening, 1.15 on 11-01, 1.111 on 11-02; 1.104 with placement + branch hints on (11-03 batch) |
 | of which tuned on | blake3 1.06, blind-sig 1.07, pulldown-cmark 1.16, regex 1.13, serde_json 1.07 | 2026-11-02 (batch 46) |
 | of which kept untouched | lol_html 1.19, flate2 1.32, prost 1.01 | the check set; 11-02's fixes did not move them |
 
@@ -917,8 +917,15 @@ hints through `Layout::set_unlikely_arm`. What the A/Bs taught:
   the fallthrough into `b.cond head; b other` — a taken branch per
   iteration.
 - Result: 0.993-0.995 geomean of base on the tuning set (blind-sig -2%,
-  pulldown -1%, json -0.6%). Held-out with the check set: pending the
-  batch below.
+  pulldown -1%, json -0.6%). Full held-out batch (11-03, 5 rounds x 3
+  layouts x 2 pads, release dylib): 1.111 -> 1.104; the check set moved
+  with it (html-rewriter 1.199 -> 1.172, protobuf 0.973 -> 0.977,
+  compression 1.292 -> 1.300), json 1.064 -> 1.030, regex 1.118 -> 1.140
+  (its layout spread is 1.05-1.23, so within its noise). With vrp and
+  ivexit added: 1.100. Gate (both default sets) and 400 fuzz seeds clean.
+  **Flipped on** (`PLIRON_PLACE=0`, `PLIRON_BRHINT=0` restore); vrp and
+  ivexit stay opt-in (no measurable runtime gain, vrp costs 0.8% compile
+  time).
 
 **W3 ranges** (`PLIRON_VRP=1`): `ranges.rs`, one memoized interval engine
 (unsigned + signed, definitions and dominating `brif` facts) and `vrp.rs`

@@ -1625,13 +1625,14 @@ impl<I: VCodeInst> VCode<I> {
         }
 
         // PLIRON: chain-based placement of the hot blocks with static
-        // branch probabilities (`PLIRON_PLACE=1`, `machinst/placement.rs`);
-        // cold blocks stay at the end in their original order.
+        // branch probabilities (`machinst/placement.rs`, on by default,
+        // `PLIRON_PLACE=0` restores the lowering order); cold blocks stay
+        // at the end in their original order.
         static PLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // Blocks that start a placed loop chain: aligned like loop heads
         // (a rotated loop's chain starts at a body block, not the header).
         let mut chain_heads: Option<Vec<bool>> = None;
-        if *PLACE.get_or_init(|| std::env::var("PLIRON_PLACE").as_deref() == Ok("1")) {
+        if *PLACE.get_or_init(|| std::env::var("PLIRON_PLACE").as_deref() != Ok("0")) {
             let nb = self.num_blocks();
             let succs: Vec<Vec<usize>> = (0..nb)
                 .map(|b| {
