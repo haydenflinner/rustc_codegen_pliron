@@ -8,6 +8,8 @@
 pub mod armmerge;
 pub mod scev;
 pub mod brhint;
+pub mod ranges;
+pub mod vrp;
 pub mod bcheck;
 pub mod bunroll;
 pub mod latchspec;

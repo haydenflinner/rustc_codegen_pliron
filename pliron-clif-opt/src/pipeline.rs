@@ -3846,6 +3846,14 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::vrp::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("vrp");
+    }
+    k
+}
+
 fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::brhint::run(&mut p.clctx.func, an)
 }
@@ -4206,6 +4214,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("foldf", "foldf", Gate::Env("PLIRON_FOLDF"), s_foldf).needs(shape::JUMP),
         step("pushin", "pushin", Gate::OptIn("PLIRON_PUSHIN"), s_pushin)
             .needs(shape::CONDBR),
+        // Value-range propagation (ranges.rs) ahead of celim, which it subsumes in part.
+        step("vrp", "vrp", Gate::OptIn("PLIRON_VRP"), s_vrp),
         cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
         cstep(
             "ivrefold",

@@ -1694,7 +1694,26 @@ impl<I: VCodeInst> VCode<I> {
                         let p = final_order[order_of[s] - 1];
                         let pr = self.block_succ_range.get(p.index());
                         let ps = &self.block_succs[pr];
-                        ps.len() >= 2 && ps.iter().any(|t| t.index() == s)
+                        // Through empty jump-only blocks (label-aliased):
+                        // a critical edge to the head goes via one.
+                        let reaches = |t: BlockIndex| -> bool {
+                            let mut t = t;
+                            for _ in 0..8 {
+                                if t.index() == s {
+                                    return true;
+                                }
+                                let r = self.block_ranges.get(t.index());
+                                let tr = self.block_succ_range.get(t.index());
+                                let ts = &self.block_succs[tr];
+                                if r.len() == 1 && ts.len() == 1 && ra_edits_per_block[t.index()] == 0 {
+                                    t = ts[0];
+                                } else {
+                                    return false;
+                                }
+                            }
+                            false
+                        };
+                        ps.len() >= 2 && ps.iter().any(|&t| reaches(t))
                     };
                     if s < self.num_blocks()
                         && order_of[s] <= order_of[pred]
