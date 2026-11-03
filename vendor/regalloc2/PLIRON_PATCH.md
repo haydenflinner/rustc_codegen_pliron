@@ -100,7 +100,7 @@ registers, LLVM's shape. Loops sharing a header (the scan loop and the
 handler both jump back to it) have one depth; the shortest back edge
 still separates them.
 
-## `PLIRON_RA2_FREQ=1..4` (runtime, opt-in): block-frequency spill weights
+## `PLIRON_RA2_FREQ=0..5` (runtime; 3 is the default, `=0` off): block-frequency spill weights
 
 `Function::block_hotness(block) -> Option<f32>` (default `None`) lets the
 frontend hand in each block's execution frequency relative to the entry
@@ -125,3 +125,43 @@ adding them, so a cold region keeps its internal structure. Measured
 (11-03): tuning set 0.996 (mode 3), 0.986 with `LOOPSPLIT`+`LOOPDEPTH`;
 held-out 1.126 -> 1.123 either way (pulldown, compression, html-rewriter
 -2%; regex, json, protobuf +1%). Opt-in.
+
+Why modes 3/4 lose on regex (11-03, `RA2STAT` per function, base vs
+mode 3): stores 6518 -> 7974, reloads 16953 -> 14601, but the two hot
+DFA functions got more reloads (`cached_state` 4 -> 9, `next_state`
+19 -> 29) while their loops stayed instruction-for-instruction the same.
+Placement rates a loop body at ~32x its surroundings (back edge 124
+against 4); regalloc2's depth scale says 4x. Those loops walk a DFA
+state's short instruction list, so the straight-line code around them
+runs about as often as the loop, and 32x made the allocator spill the
+state pointer out of the fast path (twelve reloads in `next_state`
+where base kept it in a callee-saved register). The trip-count guess
+is the untrustworthy half of the static model; the cold marks and
+unlikely hints are facts.
+
+Mode 5 ("demote only") keeps the depth scale and the additive bonuses
+and lets the frequency only lower a block: `by_depth * fr / max_at_depth`
+(the hottest block at the same loop depth), floored at 1/64. A loop
+never rises above 4x its surroundings; a cold arm inside a loop or a
+cold function tail still drops below its peers. regex: reloads 16953 ->
+14867 at stores 6518 -> 6785, `cached_state` identical to base,
+`next_state` 19 -> 21 reloads, 225 functions changed (418 under mode
+3). Tuning set (same run, K=6 layouts x 3 rounds): mode 5 0.9928
+(regex 0.982, pulldown 0.992, blake3 0.993, json 0.996, blind 1.000)
+against mode 3 0.9943 (pulldown 0.982, json 1.006). Held-out on AC
+power with the harness's new bootstrap intervals and A/A floor (10
+rounds x 3 layouts x 2 pads): mode 5 / base 0.995 [0.990, 0.999], mode 3
+0.992 [0.987, 0.998], A/A 1.000 [0.992, 1.005]; no single program is
+outside its own A/A interval. Head to head from the same samples, mode
+3 / mode 5 is 0.997 [0.994, 1.002] (regex 0.988, html-rewriter 0.985,
+blind-sig 1.011), and against the A/A side mode 3 is a significant win
+(0.993 [0.989, 0.999]) while mode 5 is not (0.996 [0.990, 1.002]). The
+per-function reload counts in regex's `next_state` did not predict the
+runtime: regex runs 1.2% faster under mode 3. **Mode 3 is the default**
+(`=0` restores the depth-only weights); mode 5 stays as the
+"facts only" variant. Compile time: no visible cost (regex's benchmark
+crate 3.2 s either way). Against mode 3 as the base (same harness, 10
+rounds): mode 3 + `LOOPSPLIT`/`LOOPDEPTH` 0.998 [0.994, 1.003], mode 4
+1.003 [0.997, 1.007], mode 5 1.004 [0.999, 1.009], A/A 0.996 [0.985,
+1.000]; nothing beats mode 3 outside the floor, the split knobs stay
+opt-in.

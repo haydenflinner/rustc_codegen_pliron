@@ -30,8 +30,18 @@ the addresses of stack data. One binary's time moves 1-5% across pads
 (LLVM's 1-2%), as much as with function order, and random function orders
 never vary it. Every side gets the same pads; a side's time is the mean
 over (layout, pad) cells of each cell's median.
+
+Every ratio is printed with a bootstrap 95% interval (whole rounds
+resampled, so a side's cells stay paired with the others' in the same
+round; 1000 replicates) and marked `*` when the interval excludes 1. The
+geomean gets the same treatment. `--aa` times the pliron binaries a second
+time as the variant `aa`: its ratio to pliron is the noise floor of the run
+and should be 1 inside its interval. The power source and Low Power Mode
+(macOS `pmset`) are recorded in the JSON and warned about: on battery or
+in Low Power Mode the clocks are capped and ratios drift by a few percent.
+All per-round samples of every side are saved (`rounds_ns`).
 """
-import argparse, json, math, os, re, shutil, statistics, subprocess, sys
+import argparse, json, math, os, random, re, shutil, statistics, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SG = os.environ.get(
@@ -140,6 +150,63 @@ def run_once(name, exe, pad=0):
     return (int(m.group(1)) if m else None), ok, r
 
 
+def power_state():
+    """{"source": "AC"|"Battery"|"?", "lowpower": bool|None} (macOS `pmset`)."""
+    st = {"source": "?", "lowpower": None}
+    if sys.platform != "darwin":
+        return st
+    b = sh(["pmset", "-g", "batt"]).stdout
+    st["source"] = "AC" if "AC Power" in b else "Battery" if "Battery Power" in b else "?"
+    m = re.search(r"^\s*(?:low)?powermode\s+(\d)", sh(["pmset", "-g"]).stdout, re.M)
+    if m:
+        st["lowpower"] = m.group(1) == "1"
+    return st
+
+
+def side_stat(rounds, idx):
+    """Mean over cells of the per-cell median, over the rounds `idx`."""
+    cells = len(rounds[0])
+    return statistics.mean(statistics.median(rounds[i][c] for i in idx) for c in range(cells))
+
+
+def boot_ratio(num, den, reps=1000, seed=0):
+    """(ratio, lo, hi): stat(num)/stat(den) with a 95% interval from resampling
+    whole rounds (the same rounds for both sides)."""
+    n = min(len(num), len(den))
+    idx = list(range(n))
+    r = side_stat(num, idx) / side_stat(den, idx)
+    rng = random.Random(seed)
+    bs = []
+    for _ in range(reps):
+        k = [rng.randrange(n) for _ in range(n)]
+        bs.append(side_stat(num, k) / side_stat(den, k))
+    bs.sort()
+    return r, bs[int(0.025 * reps)], bs[int(0.975 * reps) - 1]
+
+
+def boot_geomean(pairs, reps=1000, seed=0):
+    """(geomean, lo, hi) of per-program ratios, resampling each program's rounds."""
+    def gm(xs):
+        return math.exp(sum(map(math.log, xs)) / len(xs))
+    g = gm([side_stat(a, range(min(len(a), len(b)))) / side_stat(b, range(min(len(a), len(b))))
+            for a, b in pairs])
+    rng = random.Random(seed)
+    bs = []
+    for _ in range(reps):
+        rs = []
+        for a, b in pairs:
+            n = min(len(a), len(b))
+            k = [rng.randrange(n) for _ in range(n)]
+            rs.append(side_stat(a, k) / side_stat(b, k))
+        bs.append(gm(rs))
+    bs.sort()
+    return g, bs[int(0.025 * reps)], bs[int(0.975 * reps) - 1]
+
+
+def fmt(r, lo, hi):
+    return f"{r:.3f} [{lo:.3f},{hi:.3f}]" + ("*" if lo > 1 or hi < 1 else " ")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=7)
@@ -154,8 +221,14 @@ def main():
     ap.add_argument("--variant", action="append", default=[],
                     help="NAME:K=V,K=V -- another pliron build with extra backend env, "
                          "measured interleaved with the others (ratio vs LLVM each)")
+    ap.add_argument("--aa", action="store_true",
+                    help="time the pliron binaries again as the variant `aa` (noise floor)")
     a = ap.parse_args()
     pads = [int(x) for x in a.pads.split(",")]
+    power = power_state()
+    if power["source"] == "Battery" or power["lowpower"]:
+        print(f"WARNING: timing on {power['source']} power, Low Power Mode "
+              f"{'on' if power['lowpower'] else 'off'}: clocks may be capped", flush=True)
     benches = [b for b in BENCHES if not a.only or b[0] in a.only.split(",")]
     os.makedirs(os.path.join(OUT, "src"), exist_ok=True)
 
@@ -166,7 +239,7 @@ def main():
     for v in a.variant:
         vname, _, kvs = v.partition(":")
         envs[f"pliron-{vname}"] = dict(envs["pliron"], **dict(kv.split("=", 1) for kv in kvs.split(",") if kv))
-    allsides = list(envs)
+    allsides = list(envs) + (["pliron-aa"] if a.aa else [])
     exes = {}
     for name, binary, update in benches:
         dst = os.path.join(OUT, "src", name)
@@ -177,6 +250,9 @@ def main():
             for c in update:
                 sh(["cargo", "update", "-q", "-p", c], cwd=os.path.join(dst, CRATE), env=base)
         for side in allsides:
+            if side == "pliron-aa":
+                exes[(name, side)] = exes.get((name, "pliron"))
+                continue
             if a.skip_build:
                 exe = os.path.join(OUT, side, name, "release", binary)
                 exes[(name, side)] = exe if os.path.exists(exe) else None
@@ -195,21 +271,22 @@ def main():
             res[name] = {"status": "build failed: " + ",".join(
                 s for s in allsides if not exes.get((name, s)))}
             continue
-        t = {s: [] for s in sides}
         cells = {s: [(i, pad) for i in range(len(exes[(name, s)])) for pad in pads] for s in sides}
-        tl = {(s, c): [] for s in sides for c in cells[s]}
+        # rounds[s][r] = the round's samples, one per cell (cell order fixed).
+        rounds = {s: [] for s in sides}
         bad = None
         for r in range(a.rounds):
             for s in (sides if r % 2 == 0 else sides[::-1]):
+                row = []
                 for c in cells[s]:
                     ns, ok, p = run_once(name, exes[(name, s)][c[0]], c[1])
                     if not ok:
                         bad = f"{s} run failed (rc {p.returncode}): {p.stderr[-300:]!r}"
                         break
-                    t[s].append(ns)
-                    tl[(s, c)].append(ns)
+                    row.append(ns)
                 if bad:
                     break
+                rounds[s].append(row)
             if bad:
                 break
         if bad:
@@ -217,26 +294,35 @@ def main():
             print(f"  {name}: {bad}")
             continue
         # Mean over (layout, pad) cells of each cell's median (one cell: the median).
-        med = {s: statistics.mean(statistics.median(tl[(s, c)]) for c in cells[s]) for s in sides}
+        idx = range(a.rounds)
+        med = {s: side_stat(rounds[s], idx) for s in sides}
+        pl = boot_ratio(rounds["pliron"], rounds["llvm"])
+        vs = {s: boot_ratio(rounds[s], rounds["pliron"]) for s in sides[2:]}
         for s in sides[2:]:
             res.setdefault("variants", {}).setdefault(s, {})[name] = med[s] / med["llvm"]
         res[name] = {"status": "ok", "llvm_ms": med["llvm"] / 1e6, "pliron_ms": med["pliron"] / 1e6,
-                     "ratio": med["pliron"] / med["llvm"],
-                     "llvm_runs_ms": [x / 1e6 for x in t["llvm"]],
-                     "pliron_runs_ms": [x / 1e6 for x in t["pliron"]]}
-        print(f"  {name:20} llvm {med['llvm']/1e6:9.2f} ms  pliron {med['pliron']/1e6:9.2f} ms"
-              f"  {med['pliron']/med['llvm']:.3f}"
-              + "".join(f"  {s[7:]} {med[s]/med['llvm']:.3f}" for s in sides[2:]), flush=True)
+                     "ratio": pl[0], "ratio_ci": pl[1:],
+                     "variant_vs_pliron": {s: {"ratio": v[0], "ci": v[1:]} for s, v in vs.items()},
+                     "llvm_runs_ms": [x / 1e6 for row in rounds["llvm"] for x in row],
+                     "pliron_runs_ms": [x / 1e6 for row in rounds["pliron"] for x in row],
+                     "rounds_ns": rounds}
+        print(f"  {name:20} llvm {med['llvm']/1e6:8.2f} ms  pliron {med['pliron']/1e6:8.2f} ms "
+              f" {fmt(*pl)}"
+              + "".join(f"  {s[7:]}/pliron {fmt(*v)}" for s, v in vs.items()), flush=True)
 
-    rs = [v["ratio"] for v in res.values() if v.get("status") == "ok"]
-    gm = math.exp(sum(map(math.log, rs)) / len(rs)) if rs else None
-    print(f"geomean pliron/llvm over {len(rs)} of {len(benches)}: "
-          + (f"{gm:.3f}" if gm else "n/a"))
-    for s, by in res.get("variants", {}).items():
-        vs = list(by.values())
-        print(f"geomean {s}/llvm over {len(vs)}: {math.exp(sum(map(math.log, vs)) / len(vs)):.3f}")
+    ok = [n for n, _, _ in benches if res.get(n, {}).get("status") == "ok"]
+    gm = None
+    if ok:
+        g = boot_geomean([(res[n]["rounds_ns"]["pliron"], res[n]["rounds_ns"]["llvm"]) for n in ok])
+        gm = g[0]
+        print(f"geomean pliron/llvm over {len(ok)} of {len(benches)}: {fmt(*g)}")
+        for s in res.get("variants", {}):
+            vl = boot_geomean([(res[n]["rounds_ns"][s], res[n]["rounds_ns"]["llvm"]) for n in ok])
+            vp = boot_geomean([(res[n]["rounds_ns"][s], res[n]["rounds_ns"]["pliron"]) for n in ok])
+            print(f"geomean {s}/llvm over {len(ok)}: {fmt(*vl)}  {s[7:]}/pliron {fmt(*vp)}")
     with open(a.json, "w") as f:
-        json.dump({"rounds": a.rounds, "pads": pads, "geomean": gm, "benches": res}, f, indent=1)
+        json.dump({"rounds": a.rounds, "pads": pads, "power": power, "geomean": gm,
+                   "benches": res}, f, indent=1)
 
 
 if __name__ == "__main__":

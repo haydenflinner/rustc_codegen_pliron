@@ -200,7 +200,8 @@ impl CFGInfo {
             }
         }
 
-        // PLIRON `PLIRON_RA2_FREQ=1|2` (opt-in): the spill-weight hot bonus
+        // PLIRON `PLIRON_RA2_FREQ` (mode 3 the default, the others opt-in): the
+        // spill-weight hot bonus
         // per block comes from the frontend's block frequencies (Cranelift's
         // placement probabilities: ~32x per loop level, cold paths far below
         // the entry) instead of `1000 * 4^depth`. Mode 1 uses the frequency
@@ -214,14 +215,27 @@ impl CFGInfo {
         // (`spill_weight_from_hot`), so the relative structure inside a
         // cold region survives; 3 uses the frequency as is, 4 its square
         // root.
+        // Mode 5 ("demote only") keeps the depth scale and additive bonuses
+        // and lets the frequency only lower a block: `by_depth * fr / max`
+        // where `max` is the hottest block at the same depth, floored at
+        // 1/64. A loop never rises above `4x` its surroundings (the 32x
+        // the static model assumes was wrong for regex's short
+        // instruction-list loops: mode 3 spilled the state pointer out of
+        // the straight-line code around them), but a cold arm inside a
+        // loop or a cold tail of the function still drops below its peers.
         let mode = freq_mode();
         let hot_bonus = self.hot_bonus.cleared();
         let mut max_fr: f32 = 0.0;
+        let mut max_at_depth = [0.0f32; 11];
         if mode >= 3 {
             for block in 0..nb {
                 if let Some(fr) = f.block_hotness(Block::new(block)) {
                     if fr.is_finite() && fr > max_fr {
                         max_fr = fr;
+                    }
+                    let d = core::cmp::min(10, approx_loop_depth[block] as usize);
+                    if fr.is_finite() && fr > max_at_depth[d] {
+                        max_at_depth[d] = fr;
                     }
                 }
             }
@@ -230,7 +244,11 @@ impl CFGInfo {
             let depth = core::cmp::min(10, approx_loop_depth[block] as usize);
             let by_depth: f32 = (0..depth).fold(1000.0, |a, _| a * 4.0);
             let bonus = match f.block_hotness(Block::new(block)) {
-                Some(fr) if mode >= 3 && max_fr > 0.0 => hot_bonus_normalized(mode, fr, max_fr),
+                Some(fr) if mode == 5 && max_at_depth[depth] > 0.0 => {
+                    let rel = if fr.is_finite() { (fr / max_at_depth[depth]).clamp(1.0 / 64.0, 1.0) } else { 1.0 };
+                    by_depth * rel
+                }
+                Some(fr) if (mode == 3 || mode == 4) && max_fr > 0.0 => hot_bonus_normalized(mode, fr, max_fr),
                 Some(fr) if mode == 1 || mode == 2 => hot_bonus_from_freq(mode, fr),
                 _ => by_depth,
             };
@@ -245,14 +263,15 @@ impl CFGInfo {
     }
 }
 
-/// PLIRON: `PLIRON_RA2_FREQ=1|2` (opt-in): block-frequency spill weights
-/// (see `CFGInfo::hot_bonus`); 0 is off.
+/// PLIRON: `PLIRON_RA2_FREQ=0..5`: block-frequency spill weights (see
+/// `CFGInfo::hot_bonus`). Unset = 3 (normalized, default since 11-03);
+/// `=0` restores the depth-only weights; 1, 2, 4, 5 are the experiments.
 fn freq_mode() -> u8 {
     #[cfg(feature = "std")]
     {
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| {
-            std::env::var("PLIRON_RA2_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("PLIRON_RA2_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
         })
     }
     #[cfg(not(feature = "std"))]
@@ -288,7 +307,7 @@ fn hot_bonus_normalized(_mode: u8, _fr: f32, _max_fr: f32) -> f32 {
 /// PLIRON: the bonuses multiply the hot bonus (modes 3/4) instead of
 /// adding to it.
 pub(crate) fn freq_multiplicative() -> bool {
-    freq_mode() >= 3
+    matches!(freq_mode(), 3 | 4)
 }
 
 /// PLIRON: `PLIRON_RA2_LOOPDEPTH=1` (opt-in): dominance-checked back edges

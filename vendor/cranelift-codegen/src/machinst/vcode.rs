@@ -1378,7 +1378,8 @@ impl<I: VCodeInst> VCode<I> {
     /// hints the emission-time placement uses.
     pub fn compute_block_freq(&mut self) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_FREQ").is_ok_and(|v| v != "0")) {
+        // Unset = on (regalloc2's mode 3); `PLIRON_RA2_FREQ=0` turns it off.
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_FREQ").map_or(true, |v| v != "0")) {
             return;
         }
         let nb = self.num_blocks();

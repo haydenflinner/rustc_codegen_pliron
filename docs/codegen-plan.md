@@ -997,6 +997,83 @@ regalloc2 patch log; Cranelift patch 99). What the A/Bs taught:
   lowering), so per-function spill/reload diffs between variants are one
   script (`ra2stat_regex_*.txt` in the session scratchpad).
 
+## 2026-11-03 (evening): why frequency spill weights were a wash, and mode 5
+
+The regex side of the mode-3 split has a mechanism now (`RA2STAT` per
+function plus the explain and placement dumps, base against mode 3):
+
+- The function totals moved the right way (stores 6518 -> 7974, reloads
+  16953 -> 14601), but the two hot DFA functions got more reloads
+  (`cached_state` 4 -> 9, `next_state` 19 -> 29), all of them in the
+  straight-line code around loops that stayed identical.
+- Placement rates a loop body at ~32x its surroundings; regalloc2's depth
+  scale says 4x. regex's loops walk a DFA state's short instruction
+  list, so the code around them runs about as often as the loop, and
+  32x made the allocator spill the state pointer out of the fast path
+  (twelve reloads in `next_state`; base kept it in a callee-saved
+  register). The held-out regex base itself spreads 1.11..1.22 across
+  layouts, so the +1% there was never the signal; the per-function
+  statistics are.
+- The lesson: of the static model, the cold marks and unlikely hints
+  are facts, the trip-count guess is not. A spill weight should use the
+  first and not the second.
+
+`PLIRON_RA2_FREQ=5` ("demote only") keeps stock's depth scale and
+additive bonuses and lets the frequency only lower a block relative to
+the hottest block at its depth (floored at 1/64). regex reloads 16953 ->
+14867 at stores 6518 -> 6785, `cached_state` identical to base, 225
+functions changed against 418. Tuning set (same run as mode 3): 0.9928
+(regex 0.982, pulldown 0.992, blake3 0.993, json 0.996, blind 1.000),
+mode 3 0.9943.
+
+Held-out needed a better harness first. Two runs that afternoon were on
+battery with macOS Low Power Mode on: the unchanged base moved 1.122 ->
+1.107 between back-to-back runs (LLVM's own blake3 took 4.09 ms there and
+2.89 ms on AC), and mode 3 flipped sign on four programs against the
+morning. `bench/heldout/run.py` now saves every side's per-round
+samples, prints a bootstrap 95% interval for each ratio (whole rounds
+resampled so the sides stay paired; `*` = excludes 1) and for the
+geomean, has `--aa` (the pliron binaries timed again as a variant, the
+noise floor), and records and warns about the power state. On AC, 10
+rounds x 3 layouts x 2 pads:
+
+| | / base | interval |
+|---|---|---|
+| mode 5 | 0.995 | [0.990, 0.999] |
+| mode 3 | 0.992 | [0.987, 0.998] |
+| A/A | 1.000 | [0.992, 1.005] |
+
+Per program the A/A interval is +-1..2% (pulldown's A/A even came out
+"significant" at 0.990, so a single program's star is not evidence);
+the geomean floor is +-0.5%. Head to head from the same samples, mode 3
+/ mode 5 is 0.997 [0.994, 1.002], and only mode 3 beats the A/A side
+outside the floor (0.993 [0.989, 0.999] against 0.996 [0.990, 1.002]).
+The regex per-function reload counts that argued for mode 5 did not
+predict the runtime (regex 0.988 under mode 3 relative to mode 5): the
+reloads landed on a path that costs nothing measurable while mode 3's
+larger cuts in the inlined matchers paid. **Mode 3 is now the default**
+(`=0` off); the "facts only" mode 5 stays opt-in. Compile time: no
+visible cost. The "best of both" candidates, measured on the same
+harness against mode 3 as the base (10 rounds x 3 layouts x 2 pads):
+
+| / mode 3 | ratio | interval |
+|---|---|---|
+| mode 3 + `LOOPSPLIT`/`LOOPDEPTH` | 0.998 | [0.994, 1.003] |
+| mode 4 | 1.003 | [0.997, 1.007] |
+| mode 5 | 1.004 | [0.999, 1.009] |
+| A/A | 0.996 | [0.985, 1.000] |
+
+Nothing beats mode 3 outside the floor (the split knobs, 0.986 on the
+tuning set, are neutral held-out and stay opt-in). pliron/LLVM with the
+new default: 1.101 [1.096, 1.106], from 1.113 with the depth-only
+weights in the previous run.
+
+Next steps if mode 5 holds: frequency-aware split placement (hoist a
+split to the coldest block boundary between the bundle's start and the
+conflict, LLVM's region split in spirit) uses frequencies where they
+are reliable in relative terms; real frequencies (a sampling feed into
+`block_hotness`) are the only answer for a cache hit rate.
+
 ## 2026-11-03 (afternoon): one hot loop, end to end (brotli's byte compare)
 
 rust-compression is the worst held-out ratio (1.32). Its profile against
