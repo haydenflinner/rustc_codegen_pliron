@@ -1351,13 +1351,25 @@ The gate with the step on then failed in five stanzas: the wasm ones
 (`wasm_smoke`, `lowerfree-wasm`, `pgo`'s wasm32 std) with "egraph broke
 <fn>: Verifier errors" on wasm32 CLIF, and `rusttailcc` with the
 post-egraph check finding a `return_call` operand whose def the
-elaborator left out of the layout. Both are skipped now (`p.wasm`,
-`ReturnCall*` alongside `TryCall*`); diagnosing them is part of step 0.
-With the guards: gate 94/94 with `PLIRON_EGRAPH=1 PLIRON_EGRAPH_RULES=1
-PLIRON_EGRAPH_MIGRATE=1 PLIRON_REKEY=1`, fuzz 400/400, gate 94/94 at
-defaults. All four stay opt-in until the held-out run (armed to start
-on AC power) gives intervals for rekey, egraph alone, and egraph with
-the migrated rules.
+elaborator left out of the layout. Both diagnosed the same evening. The wasm failures were the pass's
+own verifier (`verify_if(fisa)`) running with the bookkeeping host ISA,
+so it rejected i32 pointers ("global_value with type i32 references
+global value with type i64", "invalid pointer width (got 32, expected
+64)"); the egraph itself never reads the ISA, so on the wasm path it now
+verifies with flags only. The tail-call failure was not tail calls: at
+O0, `tail_become` is `return_call fn0(v0)` followed by an unreachable
+`block1: return v2` with `v2` a constant from block0; the egraph lifts
+pure values out of the layout and only elaborates reachable blocks, so
+the dead block kept a use with no def in the layout. The step now runs
+`eliminate_unreachable_code` first. Both `PLIRON_EGRAPH_ALL=1`
+diagnoses pass, the wasm smoke test passes with the step on, and the
+step's compile-time cost on rust-compression is within noise (median
+5.3 s either way, 3 builds each). `try_call` functions are still
+skipped (the vendored egraph predates exception edges). Gate and fuzz
+with `PLIRON_EGRAPH=1 PLIRON_EGRAPH_RULES=1 PLIRON_EGRAPH_MIGRATE=1
+PLIRON_REKEY=1` after the fixes: gate 94/94, fuzz 400/400. All four stay opt-in until
+the held-out run (armed to start on AC power) gives intervals for
+rekey, egraph alone, and egraph with the migrated rules.
 With the step on, the counters (`rule:<name>` under PLIRON_STATS,
 patch-style per-rule hit counters in clifpeep) say: the early sweep's
 10,493 addnorm and 101 icmpk hits leave only 184 and 99 survivors for

@@ -2438,15 +2438,16 @@ fn s_dse(p: &mut Pipe, an: &mut Analysis) -> usize {
 // functions with invokes are skipped entirely.
 fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     use cranelift_codegen::ir::Opcode;
-    // Skipped: the wasm path (its host ISA is bookkeeping only; the
-    // egraph's output failed the verifier on wasm32 CLIF in the gate's
-    // wasm_smoke/lowerfree-wasm/pgo stanzas) and functions with tail
-    // calls (the elaborator left a `return_call` operand's def out of
-    // the layout: rusttailcc). Both are "step 0" of the migration
-    // (docs/codegen-plan.md "Direction"), not yet diagnosed.
-    if p.wasm {
-        return 0;
-    }
+    // Diagnosed on the way to making this step a default (docs/
+    // codegen-plan.md "Direction", step 0): on the wasm path the pass's
+    // own verifier ran with the bookkeeping host ISA and rejected i32
+    // pointers, so it verifies with flags only there (the egraph itself
+    // never reads the ISA); and an unreachable block left behind by an
+    // earlier pass (`return_call` then a dead `return v2`, rusttailcc at
+    // O0) kept a use of a pure value the egraph had lifted out of the
+    // layout, so unreachable code goes first.
+    // `PLIRON_EGRAPH_ALL=1`: run on the skipped shapes anyway (diagnosis).
+    let all = pliron_cfg::env_is("PLIRON_EGRAPH_ALL", "1");
     let unsupported = p
         .clctx
         .func
@@ -2456,24 +2457,42 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
         .any(|i| {
             matches!(
                 p.clctx.func.dfg.insts[i].opcode(),
-                Opcode::TryCall | Opcode::TryCallIndirect | Opcode::ReturnCall | Opcode::ReturnCallIndirect
+                Opcode::TryCall | Opcode::TryCallIndirect
             )
         });
-    if unsupported || !p.clctx.egraph_safe() {
+    if (unsupported && !all) || !p.clctx.egraph_safe() {
         return 0;
     }
+    let _ = all;
     let mut cp = ControlPlane::default();
     // The egraph indexes values directly; our passes leave
     // `Value` aliases it doesn't resolve.
     p.clctx.func.dfg.resolve_all_aliases();
     p.clctx.compute_cfg();
     p.clctx.compute_domtree();
-    p.clctx.egraph_pass(p.isa, &mut cp).unwrap_or_else(|e| {
-        panic!(
-            "egraph broke `{}`: {e}\n{}",
-            p.fname,
-            p.clctx.func.display()
-        )
+    let flags = p.isa.flags().clone();
+    if p.wasm {
+        p.clctx.eliminate_unreachable_code(&flags).unwrap();
+        p.clctx.compute_cfg();
+        p.clctx.compute_domtree();
+    } else {
+        p.clctx.eliminate_unreachable_code(p.isa).unwrap();
+        p.clctx.compute_cfg();
+        p.clctx.compute_domtree();
+    }
+    let r = if p.wasm {
+        p.clctx.egraph_pass(&flags, &mut cp)
+    } else {
+        p.clctx.egraph_pass(p.isa, &mut cp)
+    };
+    r.unwrap_or_else(|e| {
+        let detail = match &e {
+            cranelift_codegen::CodegenError::Verifier(errs) => {
+                cranelift_codegen::print_errors::pretty_verifier_error(&p.clctx.func, None, errs.clone())
+            }
+            _ => format!("{e}\n{}", p.clctx.func.display()),
+        };
+        panic!("egraph broke `{}`: {detail}", p.fname)
     });
     // The egraph populated cfg/domtree; later passes don't maintain
     // them, so drop them rather than leave stale-but-"valid" state
