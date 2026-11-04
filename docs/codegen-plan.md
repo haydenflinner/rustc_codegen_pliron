@@ -1516,6 +1516,92 @@ egraph runs mid-pipeline on every function, the first batch of pure
 rules lives in ISLE, and the early sweep no longer runs them. The
 rerun of the watchdog window passed 900/900.
 
+**regex's `next_state` (11-04, 02:00): where its sparse set escapes.**
+Profiles at the new defaults: regex `next_state` 500 vs LLVM 369
+samples. Its hot loop decodes varint instruction pointers into a
+`SparseSet` and reloads the set's four fields (`dense` ptr, len, `sparse`
+ptr, cap) per element, where LLVM keeps them in registers: loadfwd's
+root verdict (`PLIRON_LF_DEBUG=dump`, new: scoped to the `PLIRON_CLIF`
+function, and it now prints each escape site) has `qnext` neither
+isolated nor `ncc`. Found on the way, both kept: (a) inlining
+`exec_byte` seeded region-scoped `noalias` on the clone's params, and
+merging them onto the caller's own `&mut` params carried `scoped_na`
+along; `carry_one` now never scopes a function-wide `noalias` value.
+(b) The nocapture inference treated the allocator shims as retaining
+their arguments unless `PLIRON_NOCAP_FIELDS=1`, so every `Vec::push`
+captured its vector through `grow_one` -> `finish_grow` ->
+`__rust_realloc`; the shim rule is now unconditional (a shim's result
+is a fresh block and its old block is dead on return, so no derived
+pointer survives). A first attempt to also type-filter the
+frame-slot flows (a pointer stored into a slot does not reach an `i8`
+load of it) was wrong and is not in: memory is an int <-> ptr bridge,
+and `int_copy_through_slot_captures` says so. The misread that
+prompted it: `cached_state`'s "param2 retained via a byte load" is its
+`StateFlags(u8)` param, not the set. Neither (a) nor (b) changed
+`next_state`'s reloads; the escape sites are the next step.
+
+**regex `next_state`, continued (11-04, 03:00): cross-CGU nocapture and
+loop-carried load PRE.** With the allocator-shim rule in, `grow_one`
+is `nocapture` in its own CGU, but `follow_epsilons` still captured its
+sparse set: the call's callee had no body in that CGU, and the
+capture fixpoint treats a bodiless callee as retaining every argument.
+Adopted cross-CGU facts (`facts_adopt`) do land in `st.nocapture`, but
+after both nocapture runs, and the fixpoint never consulted them. Now
+`nocapture::run` seeds the table from adopted verdicts (a bodiless
+callee keeps exactly what its copy keeps) and `PLIRON_NOCAP3=1` re-runs
+it after adoption when any adopted set is non-empty; the final table
+keeps the adopted entries. regex: `follow_epsilons` `[0,3]` -> `[0,2,3]`,
+`next_state` `[0]` -> `[0,1,2]`, and loadfwd's roots gain both sets.
+
+That exposed the second half. The set's five fields are loaded in one
+arm of the loop body, so no pred of that arm's merge has them, while
+the loop header has them on the arm's back edge and loses them only
+after the `follow_epsilons` call. `edge_pre` only handled partial
+availability at a merge reached by a single-pred chain.
+`PLIRON_LOADPRE_CARRY=1` adds (a) loop-carried preds: a missing pred
+the merge dominates whose end value, given the new param at the
+merge's start, is known (the param itself, or a value stored on the
+way: `region_value`, a forward fixpoint over the region, inner cycles
+included) takes that value as its edge arg instead of a compensating
+load; (b) a dominator climb when the merge has the loc on no pred
+(from a single-pred chain's merge, or from the load's own block when
+it is a merge), each step requiring every block between to preserve
+the loc; (c) speculatability by the loc's root and root-relative
+offset against the `deref` table (the load's own address operand may
+be a copy the table doesn't key, which bailed round 1 entirely).
+`PLIRON_LF_DEBUG=dump` scopes the root print to the `PLIRON_CLIF`
+function and lists each escape site; `PLIRON_LOADPRE_DEBUG=1` traces
+the climb and each region's loss point.
+
+Result on `next_state`: the header carries the four fields (the hot
+`ldr x0,[x21,#0x20]`, 109 samples, is gone) but the function stays at
+~540 vs LLVM ~390 samples: the per-instruction profile now spreads
+over the loop's ordinary instructions, and the scan loop is 26
+instructions where LLVM's is 11. What remains, in order: the byte
+parameter is spilled and its `b == 256` (EOF) test runs per iteration
+(LLVM unswitched the loop on it); the instruction-kind dispatch is
+three range checks before the common `Bytes` case (LLVM tests `> 3`
+then `== 6`); the element address is computed twice (`lsl` + register-
+offset load, then `add` for the later use); the element pointer's
+post-index form is missed because the bump sits in another block; two
+spill reloads inside the insert loop. The `(v2, 0)` field (dense.len)
+still reloads per insert: its climb reaches the header, where the
+stale `out` set (computed before any PRE added params) has it on no
+pred.
+
+Validation (03:00-08:00, on a machine with its swap full): facts and
+the nocapture unit tests pass; gate passes with both flags except the
+new `loadpre_carry` test (a CLIF opcode typo, fixed); fuzz 2,000 seeds
+with both flags: 1,983 pass, 17 `compile-timeout`, all attributable to
+`PLIRON_LOADPRE_CARRY` (seed 74680: timeout with it, pass with
+`PLIRON_NOCAP3` alone or at defaults) — the region walks re-ran a
+block's transfer per load, per pred, per climb step. Now memoized by
+(block, loc, seed) with a 4,000-transfer budget per function. The
+held-out A/B did not finish: its variant builds spent four hours
+being killed and retried by the memory watchdog. Both flags stay
+opt-in until that run exists; the allocator-shim rule is default-on
+(gate + fuzz at defaults below).
+
 **Level 2, built (11-04 early).** `jumpthread::SiteFacts` on the
 `Pipe` (`site_facts`): `nonnull: value -> [site]`, `derived: value ->
 [(base, site)]`, a site being a `ProgramPoint` (the original's

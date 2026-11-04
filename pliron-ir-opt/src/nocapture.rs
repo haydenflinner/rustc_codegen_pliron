@@ -245,7 +245,7 @@ pub fn run(ctx: &Context, st: &mut State) {
     let dbg = crate::env_get("PLIRON_NOCAPDBG");
     let fields = crate::env_get("PLIRON_NOCAP_FIELDS") == Some("1");
     let mut dbgrets: Vec<(String, Value, String)> = Vec::new();
-    let mut dbgargs: Vec<(String, Value, String)> = Vec::new();
+    let mut dbgargs: Vec<(String, Value, String, u32, u32)> = Vec::new();
     // `slot_loads`'s nested `accesses` walks — one memo for the whole
     // pass: the analysis never mutates the function, and the same temp
     // slot is typically the destination of many stores.
@@ -255,6 +255,26 @@ pub fn run(ctx: &Context, st: &mut State) {
     let mut kinds: FxHashMap<Value, (bool, bool)> = FxHashMap::default();
     // Slot pointers already linked to their loads (see the store case).
     let mut via_slot: FxHashSet<Value> = FxHashSet::default();
+    // Verdicts adopted from other CGUs (`State::facts_adopt`, bodiless
+    // decls only): a call into them keeps exactly what that copy keeps.
+    // Without this seed every cross-CGU callee counted as retaining all
+    // its args, so `Vec::push`'s `grow_one` (one copy per crate, in some
+    // other CGU) captured the vector in every function that pushed:
+    // regex's `follow_epsilons` lost `nocapture` on its sparse set, and
+    // `next_state` then reloaded the set's fields per decoded varint.
+    let bodied_set: FxHashSet<&str> = bodied.iter().map(String::as_str).collect();
+    let mut imported: Vec<(String, FxHashSet<u32>)> = st
+        .funcs
+        .iter()
+        .filter(|(s, f)| !bodied_set.contains(s.as_str()) && !crate::has_body(ctx, f.op))
+        .filter_map(|(s, _)| st.nocapture.get(s).map(|v| (s.clone(), v.clone())))
+        .collect();
+    imported.sort_by(|a, b| a.0.cmp(&b.0));
+    for (s, set) in &imported {
+        let c = ids.id(s);
+        p.nparams.push((c, MAX_PARAMS));
+        p.captured.extend((0..MAX_PARAMS).filter(|i| !set.contains(i)).map(|i| (c, i)));
+    }
     for s in &bodied {
         let f = ids.id(s);
         let bs = blocks(ctx, st.funcs[s].op);
@@ -280,23 +300,30 @@ pub fn run(ctx: &Context, st: &mut State) {
                 // pointee, not the pointer: memory only holds a derived
                 // pointer if a store put it there, which is a capture
                 // already (or the caller's, as in LLVM's CaptureTracking).
+                // A value only carries a param's mask if it can encode
+                // a pointer derived from it: `ptrtoint`/`inttoptr` are
+                // the sole int<->ptr bridges, so e.g. an i64 call result
+                // can't be the ptr arg (no `store i8 (hash)` capture).
+                let mut pk = |v: Value| -> (bool, bool) {
+                    *kinds.entry(v).or_insert_with(|| {
+                        if fields {
+                            return carriers(ctx, v.get_type(ctx), 0);
+                        }
+                        let k = classify(ctx, v.get_type(ctx));
+                        (
+                            matches!(k, TyK::Ptr | TyK::Func(..)),
+                            matches!(k, TyK::Int(_)),
+                        )
+                    })
+                };
+                // Does a mask flow from `v` to `r`? Scalars: no ptr <-> int
+                // flow but through a bridge (checked at the use).
+                let mut flows = |v: Value, r: Value| -> bool {
+                    let (vp, vi) = pk(v);
+                    let (rp, ri) = pk(r);
+                    if fields { vp && rp || vi && ri } else { !(vp && ri) && !(vi && rp) }
+                };
                 if !(is!(ICmpOp) || is!(FCmpOp) || is!(LoadOp) || is!(AtomicLoadOp)) {
-                    // A value only carries a param's mask if it can encode
-                    // a pointer derived from it: `ptrtoint`/`inttoptr` are
-                    // the sole int<->ptr bridges, so e.g. an i64 call result
-                    // can't be the ptr arg (no `store i8 (hash)` capture).
-                    let mut pk = |v: Value| -> (bool, bool) {
-                        *kinds.entry(v).or_insert_with(|| {
-                            if fields {
-                                return carriers(ctx, v.get_type(ctx), 0);
-                            }
-                            let k = classify(ctx, v.get_type(ctx));
-                            (
-                                matches!(k, TyK::Ptr | TyK::Func(..)),
-                                matches!(k, TyK::Int(_)),
-                            )
-                        })
-                    };
                     let bridge = is!(PtrToIntOp) || is!(IntToPtrOp);
                     // A field read back from an aggregate carries only what
                     // was inserted at that index, not the whole aggregate's
@@ -308,22 +335,18 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // An allocator shim's result is a fresh allocation, not
                     // derived from its args (`__rust_realloc` only ever sees a
                     // heap pointer in a valid program).
-                    let fresh = fields && is!(CallOp) && direct_callee(ctx, st, op).is_some_and(|c| alloc_shim(c));
+                    let fresh = is!(CallOp) && direct_callee(ctx, st, op).is_some_and(|c| alloc_shim(c));
                     for r in d.results(ctx) {
-                        let (rp, ri) = pk(r);
                         let srcs: Vec<Value> = match field {
                             _ if fresh => Vec::new(),
                             Some(v) => vec![v],
                             None => d.operands(ctx).collect(),
                         };
                         for v in srcs {
-                            let (vp, vi) = pk(v);
-                            // Scalars: no ptr <-> int flow but through a
-                            // bridge. `PLIRON_NOCAP_FIELDS`: by what each
-                            // type's leaves can hold, so an all-int struct
-                            // a call returns can't carry its ptr operand.
-                            let ok = if fields { vp && rp || vi && ri } else { !(vp && ri) && !(vi && rp) };
-                            if bridge || ok {
+                            // `PLIRON_NOCAP_FIELDS`: by what each type's
+                            // leaves can hold, so an all-int struct a call
+                            // returns can't carry its ptr operand.
+                            if bridge || flows(v, r) {
                                 p.flow.push((v, r));
                             }
                         }
@@ -367,6 +390,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // finished). Sound: a frame-confined slot pointer only
                     // feeds loads, stores and GEPs of the same slot.
                     let (sv, dp) = (d.get_operand(ctx, 0), d.get_operand(ctx, 1));
+                    // Every load of the slot inherits the stored value's
+                    // mask, whatever its type: memory is an int <-> ptr
+                    // bridge (`int_copy_through_slot_captures`).
                     match crate::sroa::slot_loads(ctx, st, dp, 0, &mut accmemo) {
                         Some(ls) if ls.len() > SLOT_FANOUT => {
                             p.flow.push((sv, dp));
@@ -387,14 +413,19 @@ pub fn run(ctx: &Context, st: &mut State) {
                     let args = Operation::get_op::<CallOp>(op, ctx).unwrap().args(ctx);
                     match direct_callee(ctx, st, op) {
                         // The allocator shims retain no argument: the old block
-                        // of a realloc/dealloc is dead once they return.
-                        Some(c) if fields && alloc_shim(c) => {}
+                        // of a realloc/dealloc is dead once they return. (Was
+                        // `PLIRON_NOCAP_FIELDS` only: every `Vec::push` then
+                        // captured its vector through `grow_one` ->
+                        // `finish_grow` -> `__rust_realloc`, and regex's
+                        // `next_state` reloaded its sparse set's fields per
+                        // element because `qnext` never became `nocapture`.)
+                        Some(c) if alloc_shim(c) => {}
                         Some(c) => {
                             let c = ids.id(c);
                             for (k, a) in args.into_iter().enumerate() {
                                 p.arg.push((f, c, k as u32, a));
                                 if dbg.is_some_and(|d| s.contains(d)) {
-                                    dbgargs.push((s.clone(), a, OpDbg { op, ctx }.to_string()));
+                                    dbgargs.push((s.clone(), a, OpDbg { op, ctx }.to_string(), c, k as u32));
                                 }
                             }
                         }
@@ -467,10 +498,12 @@ pub fn run(ctx: &Context, st: &mut State) {
                 };
             }
         }
-        for (s, v, o) in &dbgargs {
+        let nparams: FxHashMap<u32, u32> = p.nparams.iter().copied().collect();
+        let keeps: FxHashSet<(u32, u32)> = p.keeps.iter().copied().collect();
+        for (s, v, o, c, k) in &dbgargs {
             for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
                 if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} via call-arg {v:?} at {o}")
+                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} via call-arg {v:?} (callee known={} keeps={}) at {o}", nparams.contains_key(c), keeps.contains(&(*c, *k)))
                 };
             }
         }
@@ -532,6 +565,9 @@ pub fn run(ctx: &Context, st: &mut State) {
         v.sort();
         crate::dump_fact("nocapture", s, &v);
     }
+    // Adopted verdicts for bodiless decls stay (lowering's call-arg
+    // `nocap` sets read them for every callee).
+    nc.extend(imported);
     st.nocapture = nc.into_iter().collect();
 }
 

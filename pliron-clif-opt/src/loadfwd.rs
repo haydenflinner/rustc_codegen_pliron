@@ -618,6 +618,16 @@ pub fn isolated_escapes(
 /// else stale. Only for the reading side (forwarding): a store whose sole
 /// reader is that escaping call is still live, so DSE/promotion must keep
 /// the strict answer.
+thread_local! {
+    /// `Pipe::dump` for the function loadfwd is running on: `PLIRON_LF_DEBUG=dump`
+    /// prints the root verdicts and every escape site of that function only.
+    pub static LF_DUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn lf_dump() -> bool {
+    LF_DUMP.with(|c| c.get())
+}
+
 pub fn isolated_escapes_x(
     func: &Function,
     noalias: &FxHashSet<Value>,
@@ -749,6 +759,9 @@ pub fn isolated_escapes_x(
                     _ => k >= nargs && fwd(k - nargs),
                 };
                 if !ok {
+                    if lf_dump() && pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::loadfwd", "lf-escape {:?} at {}", r, func.dfg.display_inst(i));
+                    }
                     escapes.entry(r).or_default().push(b);
                     let bounded = data.opcode().is_call()
                         && match data {
@@ -1222,9 +1235,9 @@ pub fn run_deref(
     let trap_benign = pliron_cfg::env_is("PLIRON_ESC_TRAP", "1");
     let (iso, _escapes, ncc) = isolated_escapes_x(func, noalias, ps, cfrozen, nocap, scoped_na, trap_benign);
     if let Some(f) = crate::env_get("PLIRON_LF_DEBUG") {
-        if func.name.to_string().contains(&f) {
+        if (f == "dump" && lf_dump()) || func.name.to_string().contains(&f) {
             if pliron_cfg::tracing_on() {
-                tracing::debug!(target: "pliron::loadfwd", "lf-debug {}: iso={:?} ncc={:?} escapes={:?}", func.name, iso, ncc, _escapes)
+                tracing::debug!(target: "pliron::loadfwd", "lf-debug {}: iso={:?} ncc={:?} escapes={:?} noalias={:?} scoped={:?} deref={:?}", func.name, iso, ncc, _escapes, noalias, scoped_na, deref)
             };
         }
     }
@@ -1458,7 +1471,17 @@ struct Pre<'a> {
     /// the location (partial-availability PRE): `(block, loc, pred)` → the
     /// inserted load's result, used as the edge arg instead of `end_val`.
     inserted: FxHashMap<(Block, Loc, Block), Value>,
+    /// `PLIRON_LOADPRE_CARRY`: block-transfer evaluations left for the
+    /// region walks (`region_value`/`region_preserves`) this function;
+    /// 0 disables them (rustlantis seed 74680 compiled past the fuzz
+    /// timeout with unbounded climbs), and a memo keyed by (block, loc,
+    /// seed) makes repeated walks over the same region free.
+    budget: std::cell::Cell<usize>,
+    memo: std::cell::RefCell<FxHashMap<(Block, Loc, Value), Option<Value>>>,
 }
+
+/// Region-walk budget per function (block transfers).
+const CARRY_BUDGET: usize = 4000;
 
 fn pred_blocks(cfg: &ControlFlowGraph, b: Block) -> Vec<Block> {
     let mut v: Vec<Block> = cfg.pred_iter(b).map(|p| p.block).collect();
@@ -1555,6 +1578,154 @@ fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>,
 static NARROW: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_LOADFWD_NARROW", "0"));
 
+/// `PLIRON_LOADPRE_CARRY=1`: loop-carried PRE. At a merge, a missing pred
+/// that the merge dominates and that preserves the location all the way
+/// from the merge's start carries the new param around (its edge arg is
+/// the param itself) instead of needing a compensating load; and when no
+/// pred of the merge has the location, the search climbs the dominator
+/// tree while every block on the way preserves it. LLVM's GVN load PRE
+/// gets the same result through its full availability fixpoint: regex's
+/// `next_state` reloaded its `&mut SparseSet`'s five fields per decoded
+/// element because the only loads sat in one arm of the loop body, so no
+/// pred of the arm's merge had them, while the loop header had them on
+/// the arm's back edge and lost them only after the `follow_epsilons` call.
+static LOADPRE_CARRY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_LOADPRE_CARRY", "1"));
+
+/// Every block on a path from `top` to `from` (both inclusive) preserves
+/// `loc`, and every path into `from` passes `top` (so `top` dominates it).
+fn region_preserves(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    reach: &FxHashSet<Block>,
+    pre: &Pre,
+    top: Block,
+    from: Block,
+    incl_from: bool,
+    loc: Loc,
+    preserves: &dyn Fn(&Function, Block, Loc) -> bool,
+) -> bool {
+    let keeps = |x: Block| -> bool {
+        let key = (x, loc, Value::reserved_value());
+        if let Some(&r) = pre.memo.borrow().get(&key) {
+            return r == Some(Value::reserved_value());
+        }
+        if pre.budget.get() == 0 {
+            return false;
+        }
+        pre.budget.set(pre.budget.get() - 1);
+        let r = preserves(func, x, loc);
+        pre.memo.borrow_mut().insert(key, r.then_some(Value::reserved_value()));
+        r
+    };
+    if !keeps(top) {
+        return false;
+    }
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut stack = vec![from];
+    while let Some(x) = stack.pop() {
+        if x == top || !seen.insert(x) {
+            continue;
+        }
+        if seen.len() > 256 || !reach.contains(&x) || ((incl_from || x != from) && !keeps(x)) {
+            return false;
+        }
+        let ps = pred_blocks(cfg, x);
+        if ps.is_empty() {
+            return false;
+        }
+        stack.extend(ps);
+    }
+    true
+}
+
+/// The value `loc` holds at the end of `p` when it holds `seed` at the
+/// start of `top`, following every path inside the region `top` dominates
+/// down to `p` (`carry` runs one block's transfer): `None` when a path
+/// clobbers it, two paths disagree at a merge, or the region has a cycle.
+fn region_value(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    reach: &FxHashSet<Block>,
+    pre: &Pre,
+    top: Block,
+    p: Block,
+    loc: Loc,
+    seed: Value,
+    carry0: &dyn Fn(&Function, Block, Loc, Value) -> Option<Value>,
+) -> Option<Value> {
+    let carry = |f: &Function, x: Block, loc: Loc, v: Value| -> Option<Value> {
+        let key = (x, loc, v);
+        if let Some(&r) = pre.memo.borrow().get(&key) {
+            return r;
+        }
+        if pre.budget.get() == 0 {
+            return None;
+        }
+        pre.budget.set(pre.budget.get() - 1);
+        let r = carry0(f, x, loc, v);
+        pre.memo.borrow_mut().insert(key, r);
+        r
+    };
+    let carry = &carry;
+    let mut region: FxHashSet<Block> = FxHashSet::default();
+    let mut stack = vec![p];
+    while let Some(x) = stack.pop() {
+        if x == top || !region.insert(x) {
+            continue;
+        }
+        if region.len() > 256 || !reach.contains(&x) {
+            return None;
+        }
+        let ps = pred_blocks(cfg, x);
+        if ps.is_empty() {
+            return None;
+        }
+        stack.extend(ps);
+    }
+    // Forward fixpoint over the region: a block's value goes unknown ->
+    // some value -> lost (never one value to another), so it converges;
+    // inner cycles that preserve the value pass it through.
+    let mut out: FxHashMap<Block, Option<Option<Value>>> = FxHashMap::default();
+    out.insert(top, Some(carry(func, top, loc, seed)));
+    let mut order: Vec<Block> = region.iter().copied().collect();
+    order.sort_unstable();
+    for _ in 0..64 {
+        let mut changed = false;
+        for &x in &order {
+            let known: Vec<Option<Value>> =
+                pred_blocks(cfg, x).iter().filter_map(|q| out.get(q).copied().flatten()).collect();
+            let new = match known.first() {
+                None => None,
+                Some(&Some(v)) if known.iter().all(|&k| k == Some(v)) => {
+                    let o = carry(func, x, loc, v);
+                    if o.is_none() && *LOADPRE_DEBUG {
+                        eprintln!("    region {top}->{p} {loc:?}: lost in {x}");
+                    }
+                    Some(o)
+                }
+                _ => {
+                    if *LOADPRE_DEBUG && out.get(&x).copied().unwrap_or(None) != Some(None) {
+                        eprintln!("    region {top}->{p} {loc:?}: disagree/lost at {x}: {known:?}");
+                    }
+                    Some(None)
+                }
+            };
+            if new != out.get(&x).copied().unwrap_or(None) {
+                out.insert(x, new);
+                changed = true;
+            }
+        }
+        if !changed {
+            return out.get(&p).copied().flatten().flatten();
+        }
+    }
+    if *LOADPRE_DEBUG {
+        eprintln!("    region {top}->{p} {loc:?}: no fixpoint");
+    }
+    None
+}
+
 static LOADPRE_DEBUG: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("PLIRON_LOADPRE_DEBUG").is_some());
 static LOADPRE_UP: std::sync::LazyLock<bool> =
@@ -1597,7 +1768,18 @@ fn edge_pre(
     loc: Loc,
     deref: &FxHashMap<Value, (u64, bool)>,
     preserves: Option<&dyn Fn(&Function, Block, Loc) -> bool>,
+    carry: Option<&dyn Fn(&Function, Block, Loc, Value) -> Option<Value>>,
 ) -> Option<Value> {
+    // Inside a dereferenceable parameter's range, by the loc's root and
+    // root-relative offset (the load's own address operand may be a copy
+    // or a derived pointer the `deref` table doesn't key).
+    let in_deref = |loc: Loc| -> bool {
+        let size = i64::from(loc.2.bytes());
+        match loc.0 {
+            Root::V(r) => deref.get(&r).is_some_and(|&(bytes, _)| loc.1 >= 0 && loc.1 + size <= bytes as i64),
+            _ => false,
+        }
+    };
     let mut avail = false;
     let mut missing: Vec<(Block, Inst)> = Vec::new();
     for p in cfg.pred_iter(b) {
@@ -1621,6 +1803,41 @@ fn edge_pre(
     // merge's compensating loads run on paths that never reach this load,
     // so the load must be speculatable. regex's `follow_epsilons` reloaded
     // its `&mut SparseSet`'s buffer pointer and length every iteration.
+    if !avail && missing.len() >= 2 && *LOADPRE_CARRY && *LOADPRE_UP {
+        // The load's own block is a merge with the loc on no pred: climb
+        // the dominator tree from here (the chain walk below is for the
+        // single-pred case).
+        let Some(preserves) = preserves else { return None };
+        if !in_deref(loc)
+            && !func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move())
+        {
+            return None;
+        }
+        let mut m = b;
+        for _ in 0..8 {
+            if dom.is_none() {
+                *dom = Some(DominatorTree::with_function(func, cfg));
+            }
+            let Some(idom) = dom.as_ref().unwrap().idom(m) else { return None };
+            if !reach.contains(&idom) || !region_preserves(func, cfg, reach, pre, idom, m, m != b, loc, preserves) {
+                if *LOADPRE_DEBUG {
+                    eprintln!("edge_pre {b} {i} {loc:?}: merge climb stops at {idom}");
+                }
+                return None;
+            }
+            if *LOADPRE_DEBUG {
+                eprintln!("edge_pre {b} {i} {loc:?}: merge climb to {idom}");
+            }
+            m = idom;
+            if let Some(v) = edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, Some(preserves), carry) {
+                return Some(v);
+            }
+            if cfg.pred_iter(m).any(|p| out.get(&p.block).is_some_and(|o| o.contains(&loc))) {
+                return None;
+            }
+        }
+        return None;
+    }
     if !avail && missing.len() == 1 && *LOADPRE_UP {
         let Some(preserves) = preserves else { return None };
         let off = match func.dfg.insts[i] {
@@ -1630,14 +1847,27 @@ fn edge_pre(
         let arg0 = func.dfg.resolve_aliases(func.dfg.inst_args(i)[0]);
         let size = i64::from(func.dfg.value_type(func.dfg.first_result(i)).bytes());
         let spec = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move())
-            || deref.get(&arg0).is_some_and(|&(bytes, _)| off >= 0 && off + size <= bytes as i64);
+            || deref.get(&arg0).is_some_and(|&(bytes, _)| off >= 0 && off + size <= bytes as i64)
+            || in_deref(loc);
         if !spec {
+            if *LOADPRE_DEBUG {
+                eprintln!("edge_pre {b} {i} {loc:?}: upward bail: not speculatable (deref {:?})", deref.get(&arg0));
+            }
             return None;
         }
         let mut m = missing[0].0;
         let mut chain: Vec<Block> = Vec::new();
         loop {
             if m == b || chain.contains(&m) || !reach.contains(&m) || !preserves(func, m, loc) {
+                if *LOADPRE_DEBUG {
+                    eprintln!(
+                        "edge_pre {b} {i} {loc:?}: upward bail at {m}: self={} seen={} reach={} preserves={}",
+                        m == b,
+                        chain.contains(&m),
+                        reach.contains(&m),
+                        preserves(func, m, loc)
+                    );
+                }
                 return None;
             }
             chain.push(m);
@@ -1654,18 +1884,76 @@ fn edge_pre(
         if *LOADPRE_DEBUG {
             eprintln!("edge_pre {b} {i} {loc:?}: upward to {m} via {chain:?}");
         }
-        return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None);
+        if !*LOADPRE_CARRY {
+            return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None, None);
+        }
+        // Climb while the merge has the loc on no pred: each step needs
+        // every block between the dominator and the merge to preserve it.
+        let mut m = m;
+        for _ in 0..8 {
+            if let Some(v) = edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, Some(preserves), carry) {
+                return Some(v);
+            }
+            if cfg.pred_iter(m).any(|p| out.get(&p.block).is_some_and(|o| o.contains(&loc))) {
+                return None;
+            }
+            if dom.is_none() {
+                *dom = Some(DominatorTree::with_function(func, cfg));
+            }
+            let Some(idom) = dom.as_ref().unwrap().idom(m) else { return None };
+            if !reach.contains(&idom) || !region_preserves(func, cfg, reach, pre, idom, m, true, loc, preserves) {
+                if *LOADPRE_DEBUG {
+                    eprintln!("edge_pre {b} {i} {loc:?}: climb stops at {idom}");
+                }
+                return None;
+            }
+            if *LOADPRE_DEBUG {
+                eprintln!("edge_pre {b} {i} {loc:?}: climb to {idom}");
+            }
+            m = idom;
+        }
+        return None;
     }
     if *LOADPRE_DEBUG {
         eprintln!("edge_pre {b} {i} {loc:?}: avail={avail} missing={}", missing.len());
     }
     // `missing` empty is the fully-available case (`st` would have hit);
-    // `avail` false is plain hoisting, not redundancy elimination; a self
-    // back-edge among the missing would read memory past the load itself.
-    if !avail || missing.is_empty() || missing.iter().any(|&(p, _)| p == b) {
+    // `avail` false is plain hoisting, not redundancy elimination.
+    if !avail || missing.is_empty() {
         return None;
     }
-    if pre.inserted.len() + missing.len() > MAX_INSERTS {
+    // Already PRE'd here for an earlier load of the same loc: reuse the
+    // param instead of inserting a second set of compensating loads.
+    if let Some(&v) = pre.start.get(&(b, loc))
+        && missing.iter().all(|&(p, _)| pre.inserted.contains_key(&(b, loc, p)))
+    {
+        return Some(v);
+    }
+    // Loop-carried preds (`PLIRON_LOADPRE_CARRY`): dominated by `b`, with
+    // the loc's value known at their end given the new param at `b`'s
+    // start — the param itself (reserved marker) or a value stored on
+    // the way. A self back-edge among the non-carried missing would read
+    // memory past the load itself.
+    let carried: Vec<Option<Value>> = missing
+        .iter()
+        .map(|&(p, _)| {
+            if !*LOADPRE_CARRY {
+                return None;
+            }
+            let c = carry?;
+            region_value(func, cfg, reach, pre, b, p, loc, Value::reserved_value(), c)
+        })
+        .collect();
+    if missing.iter().zip(&carried).any(|(&(p, _), c)| p == b && c.is_none()) {
+        return None;
+    }
+    let real = carried.iter().filter(|c| c.is_none()).count();
+    if real == 0 {
+        // Nothing to insert: the loc would be fully available only if
+        // every missing pred were carried, which `out` already rejects.
+        return None;
+    }
+    if pre.inserted.len() + real > MAX_INSERTS {
         if *LOADPRE_DEBUG {
             eprintln!("  bail: MAX_INSERTS ({})", pre.inserted.len());
         }
@@ -1683,7 +1971,7 @@ fn edge_pre(
     // valid for the whole call). regex's `follow_epsilons` reloaded its
     // `&mut SparseSet`'s buffer pointer and length at an inner-loop header
     // with ten critical in-edges.
-    let in_deref = || {
+    let in_deref_arg = || {
         let off = match func.dfg.insts[i] {
             InstructionData::Load { offset, .. } => i64::from(i32::from(offset)),
             _ => return false,
@@ -1691,8 +1979,13 @@ fn edge_pre(
         let size = i64::from(func.dfg.value_type(func.dfg.first_result(i)).bytes());
         deref.get(&arg).is_some_and(|&(bytes, _)| off >= 0 && off + size <= bytes as i64)
     };
-    let speculatable = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move()) || in_deref();
-    for &(p, pinst) in &missing {
+    let speculatable = func.dfg.insts[i].memflags_data(&func.dfg).is_some_and(|f| f.can_move())
+        || in_deref_arg()
+        || in_deref(loc);
+    for (&(p, pinst), c) in missing.iter().zip(&carried) {
+        if c.is_some() {
+            continue;
+        }
         if func.layout.last_inst(p) != Some(pinst)
             || !matches!(
                 func.dfg.insts[pinst].opcode(),
@@ -1744,7 +2037,15 @@ fn edge_pre(
             v
         }
     };
-    for &(p, pinst) in &missing {
+    for (&(p, pinst), c) in missing.iter().zip(&carried) {
+        if let Some(cv) = *c {
+            let cv = if cv == Value::reserved_value() { v } else { cv };
+            if *LOADPRE_DEBUG {
+                eprintln!("  carried: {p} -> {cv}");
+            }
+            pre.inserted.insert((b, loc, p), cv);
+            continue;
+        }
         let d = dom.as_ref().unwrap();
         let dom_arg = match func.dfg.value_def(arg) {
             ValueDef::Result(di, _) => d.try_dominates(di, pinst, &func.layout),
@@ -1922,6 +2223,8 @@ fn pre(
         start: FxHashMap::default(),
         pending: Vec::new(),
         inserted: FxHashMap::default(),
+        budget: std::cell::Cell::new(CARRY_BUDGET),
+        memo: std::cell::RefCell::new(FxHashMap::default()),
     };
     let mut dom: Option<DominatorTree> = None;
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
@@ -1933,6 +2236,32 @@ fn pre(
     // (fuzz seed 27992: block27 stored to `v6` and reloaded it; the
     // `out` fixpoint had dropped the reload at `MAX_ENTRIES`, so PRE
     // went upward through block27).
+    let carry = |f: &Function, x: Block, loc: Loc, seed: Value| -> Option<Value> {
+        let mut av: Avail = std::iter::once((loc, seed)).collect();
+        transfer(
+            f,
+            ps,
+            na,
+            na0,
+            x,
+            &mut av,
+            None,
+            iso,
+            ncc,
+            &FxHashSet::default(),
+            &mut FxHashSet::default(),
+            None,
+            &FxHashMap::default(),
+            &mut FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            nw,
+            bnd,
+            pm,
+            eh,
+            &nm,
+        );
+        av.get(&loc).copied()
+    };
     let preserves = |f: &Function, x: Block, loc: Loc| -> bool {
         let mut av: Avail = std::iter::once((loc, Value::reserved_value())).collect();
         transfer(
@@ -2002,7 +2331,7 @@ fn pre(
                     } else if !clobbered
                         && writes.iter().all(|&(w, ms)| !may_write_iso(w, ms, loc, iso, ncc))
                         && let Some(v) =
-                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves))
+                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves), Some(&carry))
                     {
                         fwd.push((i, v));
                         st.insert(loc, St::Local(v));

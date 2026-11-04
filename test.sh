@@ -385,6 +385,7 @@ nocapture fx_stash: [1]
 nocapture fx_launder: []
 nocapture fx_poke: [0, 1]
 nocapture fx_copy: [0, 1]
+nocapture fx_slotbyte: [0, 1]
 nocapture fx_sum: [0]
 nocapture fx_second: [0]
 nowrite fx_stash: None

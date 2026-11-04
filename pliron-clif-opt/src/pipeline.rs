@@ -2369,6 +2369,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     // on a load arm) — without one, the CFG/RPO/proot/iso setup and
     // the fixpoint can produce nothing.
     if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
+        loadfwd::LF_DUMP.with(|c| c.set(p.dump));
         let breg_now = live_block_region(p);
         let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
         p.stats.forwarded += loadfwd::run_deref(
@@ -3631,7 +3632,16 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         p.noalias.insert(w);
         p.fact_bits[w] |= fact_bits::NOALIAS;
     }
-    if bits & fact_bits::SCOPED_NA != 0 && p.scoped_na.contains(&d) {
+    // A region-scoped `noalias` (an inlined callee's param) carried onto a
+    // value that is function-wide `noalias` (the caller's own `&mut`
+    // param) must not scope it down: the wider fact is the stronger one
+    // and still holds. regex's `next_state` lost `qcur`/`qnext` from
+    // loadfwd's isolated roots this way once `exec_byte` was inlined, and
+    // reloaded the sparse set's four fields per decoded varint.
+    if bits & fact_bits::SCOPED_NA != 0
+        && p.scoped_na.contains(&d)
+        && !(p.noalias.contains(&w) && !p.scoped_na.contains(&w))
+    {
         p.scoped_na.insert(w);
         p.fact_bits[w] |= fact_bits::SCOPED_NA;
     }

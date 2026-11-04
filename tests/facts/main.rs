@@ -22,6 +22,17 @@ fn fx_poke(p: &mut i32, v: i32) {
     *p = v;
 }
 
+/// Stores `p` into a local temp next to a byte, then stores the byte
+/// read back from that temp through `out`: a pointer at one field of a
+/// frame-confined slot never comes back out of an `i8` load of another,
+/// so neither param is captured (regex's `cached_state` keyed its
+/// state on such a byte and lost `nocapture` on its sparse set).
+#[inline(never)]
+fn fx_slotbyte(p: &mut [u8; 8], out: &mut u8) {
+    let t = (p as *mut [u8; 8], p[1]);
+    *out = t.1;
+}
+
 /// Copies a value read through `p` into `q`: neither is captured, and
 /// it only writes through `q`.
 #[inline(never)]
@@ -77,6 +88,10 @@ fn main() {
 
     let mut z = 0;
     fx_poke(&mut z, 5);
+    let mut bytes = [n as u8; 8];
+    let mut b = 0u8;
+    fx_slotbyte(&mut bytes, &mut b);
+    assert_eq!(b, 1);
     assert_eq!(z, 5);
     let (one, two) = (n, n + 1);
     let mut c = &one;
