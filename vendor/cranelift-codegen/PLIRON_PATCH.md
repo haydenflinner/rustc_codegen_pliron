@@ -1272,13 +1272,15 @@ the sum; plain `ushr` lowering zero-extends first. They now require
 
 102. Migrated clifpeep rewrites as egraph rules (`opts/pliron.isle`,
     listed in `cranelift-codegen-meta/src/isle.rs`; `pliron_rules_on`
-    extern in `opts.rs`; `PLIRON_EGRAPH_RULES=1` opt-in). First batch:
+    extern in `opts.rs`; default since 11-04, `PLIRON_EGRAPH_RULES=0`
+    disables). First batch:
     addnorm's constant chains on an additive spine (`(x + k1) + k2`,
     the three `isub` mixes) and icmpk's constant across an equality
     (`(x ± k) ==/!= c`, `(a - b) ==/!= 0`, `-x ==/!= c`). Tests:
     `pliron-clif-opt/tests/egraph_rules.rs`. The pipeline's mid-pipeline
-    `egraph` step is opt-in (`PLIRON_EGRAPH=1`), so at defaults these
-    only fire in the compile-path egraph after every pliron pass.
+    `egraph` step (and its second round, `PLIRON_EGRAPH2`) are default
+    since 11-04 too, with `egraph::Stats::renames` (patch 104) feeding
+    pliron's fact carry.
 
 103. `BlockCall::update_args` (`ir/instructions.rs`) returns on an empty
     value list. The egraph pass frees the lists of instructions it
@@ -1286,3 +1288,15 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     every instruction in the dfg, so pliron's `apply_param_drops` (cparm,
     right after the egraph step) indexed `[1..]` of a zero-length list
     and panicked on the first crate built with `PLIRON_EGRAPH=1`.
+
+104. `egraph::Stats::renames` and `Context::egraph_renames`: the egraph
+    pass records every `(survivor, original, is_clone)` value pair it
+    creates (GVN merges and rule rewrites in `remove_pure_and_optimize`,
+    skeleton merges, elaboration clones and remat clones) and the
+    context hands them to the client after the pass. pliron carries its
+    value-keyed facts (derived, non-null, noalias, frozen, deref) across
+    them: clones outright, merges under its site rule (an unconditional
+    carry on merges gave a GVN survivor's earlier uses a `!nonnull`
+    site fact: regex segfaulted). Without it the egraph step lost the
+    inbounds mark on brotli's byte-compare pointer and that loop ran
+    2.3x slower (docs/codegen-plan.md "Direction").

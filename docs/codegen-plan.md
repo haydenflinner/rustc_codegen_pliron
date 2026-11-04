@@ -1509,10 +1509,12 @@ again (a rerun of that window is the check). Held-out:
 
 From 1.016 to neutral by two root-cause fixes, both of the "a pass
 dropped or re-spelled what the next pass needed" kind, neither a
-placement fight. The migrated form (all four knobs) is now the
-candidate default: the egraph runs mid-pipeline on every function, the
-first batch of pure rules lives in ISLE, and the early sweep no longer
-runs them.
+placement fight. The migrated form (all four knobs) is the default
+since 11-04 (`PLIRON_EGRAPH=0`, `PLIRON_EGRAPH2=0`,
+`PLIRON_EGRAPH_RULES=0`, `PLIRON_EGRAPH_MIGRATE=0` restore each): the
+egraph runs mid-pipeline on every function, the first batch of pure
+rules lives in ISLE, and the early sweep no longer runs them. The
+rerun of the watchdog window passed 900/900.
 
 **Level 2, built (11-04 early).** `jumpthread::SiteFacts` on the
 `Pipe` (`site_facts`): `nonnull: value -> [site]`, `derived: value ->

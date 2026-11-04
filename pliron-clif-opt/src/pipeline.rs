@@ -2449,8 +2449,12 @@ fn s_dse(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 // Upstream Cranelift's egraph pass: GVN + ISLE cprop/remat rules +
-// redundant-load elimination + egraph LICM. Opt-in while its cost and
-// wins vs. our own passes are measured.
+// redundant-load elimination + egraph LICM. On by default since 11-04
+// (`PLIRON_EGRAPH=0` disables): with the clone log, the site facts and
+// the boundary re-canonicalization it is neutral on the held-out set
+// (1.004 [1.000, 1.008] alone, 1.000 [0.996, 1.005] with the second
+// round and the migrated rules), and it is the home of the pure rules
+// (docs/codegen-plan.md "Direction").
 // Upstream's egraph doesn't know `try_call` (it predates EH), so
 // functions with invokes are skipped entirely.
 fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -4285,7 +4289,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             // Rewrite-by-reconstruction can emit inst kinds the input
             // lacked.
             creates: u32::MAX,
-            gate: Gate::OptIn("PLIRON_EGRAPH"),
+            gate: Gate::Env("PLIRON_EGRAPH"),
             run: s_egraph,
             site: std::sync::OnceLock::new(),
         },
@@ -4927,8 +4931,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_coldret,
             site: std::sync::OnceLock::new(),
         },
-        // A second egraph round after the loop passes (`PLIRON_EGRAPH2=1`,
-        // opt-in): the late sweep's addnorm/icmpk survivors are chains
+        // A second egraph round after the loop passes (default since 11-04,
+        // `PLIRON_EGRAPH2=0` disables): the late sweep's addnorm/icmpk survivors are chains
         // the loop passes create after the first round (`(x + k1) + k2`
         // from ivrefold/looprot param refolds: 3,996 of 5,071 on
         // rust-compression), which the migrated ISLE rules only see
@@ -4944,7 +4948,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             shape: 0,
             any: 0,
             creates: u32::MAX,
-            gate: Gate::OptIn("PLIRON_EGRAPH2"),
+            gate: Gate::Env("PLIRON_EGRAPH2"),
             run: s_egraph,
             site: std::sync::OnceLock::new(),
         },

@@ -6801,10 +6801,11 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let bittab_on = crate::pass_enabled("PLIRON_BITTAB");
     let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
     let divchk_on = crate::pass_enabled("PLIRON_DIVCHK");
-    // `PLIRON_EGRAPH_MIGRATE=1`: the early sweep skips the rules that
-    // `opts/pliron.isle` now carries; the late sweep (`post_sweep`) keeps
-    // them, so its hit counts measure what the egraph missed.
-    let migrated = pliron_cfg::env_is("PLIRON_EGRAPH_MIGRATE", "1");
+    // The early sweep skips the rules that `opts/pliron.isle` now carries
+    // (default since 11-04; `PLIRON_EGRAPH_MIGRATE=0` runs them here too);
+    // the late sweep (`post_sweep`) keeps them, so its hit counts measure
+    // what the egraph missed.
+    let migrated = !pliron_cfg::env_is("PLIRON_EGRAPH_MIGRATE", "0");
     let icmpk_on = crate::pass_enabled("PLIRON_ICMPK") && !migrated;
     let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
     let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM") && !migrated;

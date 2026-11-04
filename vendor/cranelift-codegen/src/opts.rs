@@ -316,10 +316,10 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
     /// sub-form swap); conservative for targets with wider immediate
     /// fields, which only lose a neutral remat.
     /// PLIRON: `opts/pliron.isle` rules (migrated clifpeep rewrites).
-    /// `PLIRON_EGRAPH_RULES=1` enables.
+    /// Default since 11-04; `PLIRON_EGRAPH_RULES=0` disables.
     fn pliron_rules_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_EGRAPH_RULES").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_EGRAPH_RULES").as_deref() != Ok("0"))
     }
 
     fn imm64_addsub_imm(&mut self, ty: Type, imm: Imm64) -> Option<()> {
