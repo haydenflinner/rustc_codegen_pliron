@@ -1352,6 +1352,18 @@ pub(crate) fn iropt_tail(
     {
         pt!(prof, cgu, "nocap3", nocapture::run(ctx, st));
     }
+    // `PLIRON_SROA_TAILSPLIT=1`: re-split allocas that deferred on a
+    // bodiless-callee pin — adopt + nocap3 may have proven the pin
+    // nonretaining, turning the `pin_a` fallback into a synced promote.
+    // bench/sieve's `Vec<bool>` alloca was pinned by cross-CGU
+    // `extend_with`/`Drop::drop` calls, reloading ptr+len in the
+    // marking loop; nocapture on those callees frees it.
+    if env_is("PLIRON_SROA_TAILSPLIT", "1") && pass_enabled("PLIRON_SROA") {
+        let n = pt!(prof, cgu, "sroa3", sroa::retry_deferred(ctx, st));
+        if n > 0 {
+            pt!(prof, cgu, "domcheck:sroa3", domcheck::run(ctx, st, "sroa3"));
+        }
+    }
     // Dead-call elim + readonly call dedup + loop-call hoist, on the
     // final post-inline call set.
     if pass_enabled("PLIRON_CALLGVN") {

@@ -363,6 +363,17 @@ pub struct State {
     /// them one stack object: split, every other access would scalarize
     /// and the call would get a fresh copy of the scalars again.
     pub homes: ColSet<Value>,
+    /// `PLIRON_SROA_TAILSPLIT=1`: allocas whose split deferred — a `Pin`
+    /// on a bodiless-callee call operand blocked syncability, and the
+    /// xfacts-adopt merge (iropt_tail) may yet prove the pin
+    /// nonretaining. `sroa::retry_deferred` re-splits them there; a
+    /// retry that still can't sync takes the ordinary pin split, so the
+    /// outcome is never worse than deferring nothing.
+    pub sroa_defer: ColSet<Value>,
+    /// Set by `sroa::retry_deferred` once adopted facts are in `nocapture`/
+    /// `nowrite`: lets `split` fall through to the pin path rather than
+    /// re-deferring a deferred alloca it still can't prove.
+    pub sroa_facts: bool,
     pub calls: ColMap<Ptr<Operation>, CallInfo>,
     pub intrinsics: ColMap<Ptr<Operation>, String>,
     pub rmw: ColMap<Ptr<Operation>, AtomicRmwKindAttr>,

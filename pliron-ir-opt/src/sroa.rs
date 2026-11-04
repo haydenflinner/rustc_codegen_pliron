@@ -305,6 +305,30 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
         .is_some_and(|s| s.contains(&(ai as u32)))
 }
 
+/// Operand `idx` of `op` pins alloca bytes and belongs to a direct call
+/// whose callee has no body in this CGU: `nonretaining` failed only for
+/// want of a nocapture/nowrite fact, which the xfacts-adopt merge in
+/// `iropt_tail` may still supply. The structural `nonretaining` gates
+/// that adopted facts can't change (no next op, invoke) are rechecked
+/// here so a defer only lands on a call a retry could actually sync.
+fn bodiless_pin(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+    let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+        return false;
+    };
+    let Some(id) = c.get_attr_llvm_call_callee(ctx) else {
+        return false;
+    };
+    if op.get_next(ctx).is_none() || st.invokes.contains(op) {
+        return false;
+    }
+    let Some(sym) = st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref())) else {
+        return false;
+    };
+    st.funcs
+        .get(sym)
+        .is_some_and(|f| !crate::has_body(ctx, f.op))
+}
+
 fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
     st.intrinsics.get(op).map(|s| s.as_str())
 }
@@ -1006,6 +1030,11 @@ fn split(
     if st.escape_copies.contains(a) || st.homes.contains(a) {
         return false;
     }
+    // Deferred on a bodiless-callee pin: only `retry_deferred` (post
+    // xfacts-adopt) clears the mark — head rounds skip the re-analysis.
+    if st.sroa_defer.contains(a) && !st.sroa_facts {
+        return false;
+    }
     if st.promoted.contains(a) {
         validate(ctx, st, a);
         if st.promoted.contains(a) {
@@ -1057,6 +1086,9 @@ fn split(
     let mut pin_rngs: FxHashMap<Ptr<Operation>, Vec<(u64, u64)>> = FxHashMap::default();
     let mut covered = vec![false; sl.len()];
     let mut bad = vec![false; sl.len()];
+    // A `Pin` a retry could still sync: its operand is a bodiless-callee
+    // arg, so `nonretaining` failed only for want of a cross-CGU fact.
+    let mut deferrable_pin = false;
     for x in &acc {
         let n = match x.kind {
             Kind::Pin { n, .. } | Kind::Copy { n, .. } | Kind::Set { n, .. } => n,
@@ -1069,7 +1101,11 @@ fn split(
             continue;
         }
         let ok = match x.kind {
-            Kind::Pin { idx, .. } => nonretaining(ctx, st, x.op, idx),
+            Kind::Pin { idx, .. } => {
+                let nr = nonretaining(ctx, st, x.op, idx);
+                deferrable_pin |= !nr && bodiless_pin(ctx, st, x.op);
+                nr
+            }
             // A flow access is an opaque touch — no call boundary to sync at.
             _ => !x.flow,
         };
@@ -1099,6 +1135,21 @@ fn split(
     let syncable: Vec<bool> = (0..sl.len())
         .map(|i| sl[i].pinned && covered[i] && !bad[i])
         .collect();
+    // `PLIRON_SROA_TAILSPLIT=1`: a pinned-but-unsyncable slice whose pin
+    // is a bodiless-callee operand may turn syncable once `iropt_tail`
+    // adopts cross-CGU nocapture/nowrite facts. Deferring keeps the
+    // alloca whole for `retry_deferred`; if the facts never arrive the
+    // retry takes the same `pin_a` split below, so deferral costs only
+    // the in-between passes' view of the slot — which the pin path
+    // leaves in memory anyway.
+    if deferrable_pin
+        && !st.sroa_facts
+        && crate::env_is("PLIRON_SROA_TAILSPLIT", "1")
+        && sl.iter().enumerate().any(|(i, s)| s.pinned && !syncable[i])
+    {
+        st.sroa_defer.insert(a);
+        return false;
+    }
     // `PLIRON_SROA_DEBUG=<fn substr>`: the access list and slices of each
     // split attempted in matching functions (eprintln, for bisect repros).
     if let Some(want) = crate::env_get("PLIRON_SROA_DEBUG")
@@ -1551,6 +1602,20 @@ pub fn allocas(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<Operation>> {
 /// SROA on one function (the module pass's per-function body; also the
 /// inliner's callee simplification, `PLIRON_INLINE_SIMP`).
 pub fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) {
+    // `PLIRON_SROA_DCEPAD`: erase blocks unreachable over real + invoke
+    // edges first. `nounwind` and invoke inlining orphan pad regions whose
+    // `br` operands still route alloca addresses through block args —
+    // blocking promotion (`phisimp` can't fold them: the unique value is
+    // only known-non-dominating dead code). bench/sieve's `Vec` alloca
+    // escaped this way, reloading ptr+len every inner-loop iteration.
+    if crate::env_is("PLIRON_SROA_DCEPAD", "1") {
+        let bs = crate::inline::blocks(ctx, f);
+        let all: FxHashMap<Ptr<pliron::basic_block::BasicBlock>, Vec<Ptr<Operation>>> = bs
+            .iter()
+            .map(|&b| (b, b.deref(ctx).iter(ctx).collect()))
+            .collect();
+        crate::helpers::erase_unreachable(ctx, st, &bs, &|b| all[&b].clone());
+    }
     // No alloca anywhere: `forward_single_store`, the split rounds
     // and the trailing cleanup all have nothing to do.
     let mut wl = allocas(ctx, f);
@@ -1612,6 +1677,52 @@ pub fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) {
         }
         validate(ctx, st, a);
     }
+}
+
+/// `PLIRON_SROA_TAILSPLIT=1` tail step: retry splits deferred on
+/// bodiless-callee pins. Runs after `xfacts` adopt + `nocap3`, so a pin
+/// that only lacked a cross-CGU fact may now read `nocapture`/`nowrite`
+/// on the callee; `st.sroa_facts` makes a still-unproven retry take the
+/// ordinary `pin_a` split rather than re-defer. Returns the number of
+/// allocas this call promoted past deferral.
+pub fn retry_deferred(ctx: &mut Context, st: &mut State) -> usize {
+    if st.sroa_defer.is_empty() {
+        return 0;
+    }
+    st.sroa_facts = true;
+    let mut n = 0;
+    for f in st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| crate::opt_body(ctx, st, f))
+        .collect::<Vec<_>>()
+    {
+        let bname = crate::bisect_name(st, f);
+        for op in allocas(ctx, f) {
+            let a = op.deref(ctx).get_result(ctx, 0);
+            if !st.sroa_defer.contains(a) || !st.allocas.contains(a) {
+                continue;
+            }
+            let mut made = Vec::new();
+            let mut cfg_dirty = false;
+            // NB `a`/`op` may dangle after `split` (it erases an alloca
+            // whose uses all retargeted) — don't touch them here.
+            let ok =
+                crate::bisect_in("sroa", &bname) && split(ctx, st, op, &mut made, &mut cfg_dirty);
+            n += usize::from(ok);
+            for op in made {
+                // Slice allocas the rewrite never wired up are dead.
+                let v = op.deref(ctx).get_result(ctx, 0);
+                if !v.is_used(ctx) {
+                    st.allocas.remove(v);
+                    st.promoted.remove(v);
+                    Operation::erase(op, ctx);
+                }
+            }
+        }
+    }
+    n
 }
 
 pub fn run(ctx: &mut Context, st: &mut State) {
