@@ -90,10 +90,7 @@ fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHas
     loop {
         let mut changed = false;
         for &b in &bs[1..] {
-            let Some(ps) = preds
-                .get(&b)
-                .filter(|_| !landing.contains(&b) && reach.contains(&b))
-            else {
+            let Some(ps) = preds.get(&b).filter(|_| !landing.contains(&b)) else {
                 continue;
             };
             let na = b.deref(ctx).get_num_arguments();
@@ -112,6 +109,23 @@ fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHas
                 let Some(v) = uniq.filter(|&v| ok && !defined_in(ctx, v, b)) else {
                     continue;
                 };
+                // An orphaned pad region (`nounwind` dropped its invoke) is
+                // unreachable to `reach`, but folding still can't reference a
+                // non-dominating value. An entry-block alloca dominates
+                // everything (incl. dead code), so it folds there too —
+                // otherwise the dead region's br operands keep the alloca
+                // escaping and SROA can never promote it (bench/sieve's
+                // `Vec` fields reloaded every inner iteration). Allocas
+                // cloned mid-function by the inliner don't dominate the
+                // dead region and stay folded-out.
+                if !reach.contains(&b)
+                    && !(st.allocas.contains(v)
+                        && v.defining_op().is_some_and(|op| {
+                            op.deref(ctx).get_parent_block() == Some(bs[0])
+                        }))
+                {
+                    continue;
+                }
                 // A region-scoped `nnargs` fact on `arg` (an inlined
                 // call's result, `PLIRON_RETNN`) holds only at the
                 // continuation; `v` would lose it. An alloca's address
