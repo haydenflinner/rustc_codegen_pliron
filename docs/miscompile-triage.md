@@ -115,7 +115,7 @@ prefix length. Two traps:
   `PLIRON_LICM_LOADS=0`-style transform-class gates). If it goes green,
   `k` is confirmed; prefer the diffcheck result if they disagree.
 
-`harness/bisect.py -- <check.sh>` automates the same oracle over
+`harness/optbisect.py -- <check.sh>` automates the same oracle over
 `PLIRON_OPT_BISECT=N` at finer granularity (one unit = one pass application,
 across IR and CLIF passes). The numbering is deterministic without extra
 flags: under `PLIRON_OPT_BISECT` the backend runs CGUs and lowering

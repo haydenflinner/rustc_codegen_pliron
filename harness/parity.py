@@ -78,11 +78,7 @@ def parse_native(text):
     """bench/run.sh tees two benchfmt outputs — LLVM epochs first, then
     pliron epochs (each block starts with a `goos:` header). Per-kernel
     ratio = median(pliron ns/op) / median(llvm ns/op)."""
-    # statistics imports bisect transitively; harness/bisect.py shadows it.
-    def median(v):
-        s = sorted(v)
-        n = len(s)
-        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    import statistics
     blocks = re.split(r"(?m)^goos:", text)[1:]
     med = []
     for block in blocks[:2]:
@@ -95,7 +91,7 @@ def parse_native(text):
                     per.setdefault(name, []).append(float(f[2]))
                 except ValueError:
                     pass
-        med.append({k: median(v) for k, v in per.items()})
+        med.append({k: statistics.median(v) for k, v in per.items()})
     if len(med) < 2:
         return {}
     rows = {}

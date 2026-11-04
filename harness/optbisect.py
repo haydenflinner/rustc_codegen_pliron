@@ -3,7 +3,7 @@
 # r[verify verify.bisect.unit]
 """Find the first optimization unit that makes a test fail.
 
-Usage: harness/bisect.py [--max N] -- <command...>
+Usage: harness/optbisect.py [--max N] -- <command...>
 
 <command> must rebuild the program with the pliron backend and run it,
 exiting 0 when the output is right and non-zero when it is wrong. It is run
@@ -18,7 +18,7 @@ PLIRON_OPT_BISECT_DEBUG=1 and reports which step ran on which function as
 unit N, plus the commands that dump and differentially check that function.
 
 Example:
-  harness/bisect.py -- sh -c 'rustc -Zcodegen-backend=$BACKEND -O t.rs -o t && ./t'
+  harness/optbisect.py -- sh -c 'rustc -Zcodegen-backend=$BACKEND -O t.rs -o t && ./t'
 """
 import argparse, os, re, subprocess, sys
 

@@ -177,7 +177,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   unit. The numbering is deterministic: under `PLIRON_OPT_BISECT` the
   backend itself takes the serial paths (no CGU job pool, serial
   lowering; `cgupool::enabled`, `lower.rs`). The step and pipeline caches
-  also turn off. `harness/bisect.py -- <cmd>` automates it when
+  also turn off. `harness/optbisect.py -- <cmd>` automates it when
   `<cmd>`'s stderr is passed through.
 - **Is that step wrong?** `PLIRON_DIFFCHECK=1` (`=step` for every step)
   interprets CLIF before/after on random inputs and saves
