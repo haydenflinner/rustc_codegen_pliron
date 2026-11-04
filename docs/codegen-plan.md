@@ -1383,8 +1383,16 @@ addnorm 5,071 -> 2,203, icmpk 560 -> 275, size 2205184 -> 2205184
 and the late one is the one that matters. The rest sit in functions the step still skips: the
 samples (`p + 1 + 1`, `p + 2 + 1`, unrolled address chains) are in
 brotli's hot functions, which carry `try_call` for their unwinding
-calls. Gate 94/94 and fuzz 400/400 with all five knobs on. All five
-knobs stay opt-in until
+calls. Gate 94/94 and fuzz 400/400 with all five knobs on. Forcing the
+step onto those functions too (`PLIRON_EGRAPH_ALL=1`) builds and runs
+rust-compression correctly: 994 functions covered, late addnorm 2,203
+-> 1,093, icmpk 275 -> 109, size 2205184 -> 2205136. The `try_call`
+skip dates from before the vendored egraph's value mapping covered
+exception tables; gate 94/94 and fuzz 400/400 with the skip lifted, so
+it is gone (`PLIRON_EGRAPH_SKIP_TRYCALL=1` restores it); 2,000 more
+fuzz seeds pass with every knob on (the egraph includes redundant-load
+elimination, so the memory-pass sweep rule applied).
+All knobs stay opt-in until
 the held-out run (armed to start on AC power) gives intervals for
 rekey, egraph alone, and egraph with the migrated rules.
 With the step on, the counters (`rule:<name>` under PLIRON_STATS,

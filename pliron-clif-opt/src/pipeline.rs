@@ -2446,24 +2446,29 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // earlier pass (`return_call` then a dead `return v2`, rusttailcc at
     // O0) kept a use of a pure value the egraph had lifted out of the
     // layout, so unreachable code goes first.
-    // `PLIRON_EGRAPH_ALL=1`: run on the skipped shapes anyway (diagnosis).
-    let all = pliron_cfg::env_is("PLIRON_EGRAPH_ALL", "1");
-    let unsupported = p
-        .clctx
-        .func
-        .layout
-        .blocks()
-        .flat_map(|b| p.clctx.func.layout.block_insts(b))
-        .any(|i| {
-            matches!(
-                p.clctx.func.dfg.insts[i].opcode(),
-                Opcode::TryCall | Opcode::TryCallIndirect
-            )
-        });
-    if (unsupported && !all) || !p.clctx.egraph_safe() {
+    // `try_call` functions were skipped ("upstream's egraph doesn't know
+    // try_call") until 11-03: the vendored egraph's value mapping covers
+    // exception tables, and with the skip lifted the gate's unwinding
+    // stanzas and fuzz pass; on rust-compression it covers 994 of 925+
+    // functions instead of 850 and halves the late sweep's survivors
+    // again. `PLIRON_EGRAPH_SKIP_TRYCALL=1` restores the skip.
+    let skip_try = pliron_cfg::env_is("PLIRON_EGRAPH_SKIP_TRYCALL", "1");
+    let unsupported = skip_try
+        && p
+            .clctx
+            .func
+            .layout
+            .blocks()
+            .flat_map(|b| p.clctx.func.layout.block_insts(b))
+            .any(|i| {
+                matches!(
+                    p.clctx.func.dfg.insts[i].opcode(),
+                    Opcode::TryCall | Opcode::TryCallIndirect
+                )
+            });
+    if unsupported || !p.clctx.egraph_safe() {
         return 0;
     }
-    let _ = all;
     let mut cp = ControlPlane::default();
     // The egraph indexes values directly; our passes leave
     // `Value` aliases it doesn't resolve.
