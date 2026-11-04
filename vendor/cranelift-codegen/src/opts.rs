@@ -315,6 +315,13 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
     /// 12-bit immediate, optionally shifted left 12 (negative is a
     /// sub-form swap); conservative for targets with wider immediate
     /// fields, which only lose a neutral remat.
+    /// PLIRON: `opts/pliron.isle` rules (migrated clifpeep rewrites).
+    /// `PLIRON_EGRAPH_RULES=1` enables.
+    fn pliron_rules_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_EGRAPH_RULES").as_deref() == Ok("1"))
+    }
+
     fn imm64_addsub_imm(&mut self, ty: Type, imm: Imm64) -> Option<()> {
         let v = self.i64_sextend_imm64(ty, imm).unsigned_abs();
         (v <= 0xfff || (v & 0xfff == 0 && v <= 0xfff_000)).then_some(())

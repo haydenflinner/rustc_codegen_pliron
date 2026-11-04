@@ -1269,3 +1269,20 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     split a single-use unencodable `iadd` would cost one more
     instruction than the materialized fold, which is why the knob gates
     both sides together.
+
+102. Migrated clifpeep rewrites as egraph rules (`opts/pliron.isle`,
+    listed in `cranelift-codegen-meta/src/isle.rs`; `pliron_rules_on`
+    extern in `opts.rs`; `PLIRON_EGRAPH_RULES=1` opt-in). First batch:
+    addnorm's constant chains on an additive spine (`(x + k1) + k2`,
+    the three `isub` mixes) and icmpk's constant across an equality
+    (`(x ± k) ==/!= c`, `(a - b) ==/!= 0`, `-x ==/!= c`). Tests:
+    `pliron-clif-opt/tests/egraph_rules.rs`. The pipeline's mid-pipeline
+    `egraph` step is opt-in (`PLIRON_EGRAPH=1`), so at defaults these
+    only fire in the compile-path egraph after every pliron pass.
+
+103. `BlockCall::update_args` (`ir/instructions.rs`) returns on an empty
+    value list. The egraph pass frees the lists of instructions it
+    drops from the layout; `DataFlowGraph::resolve_all_aliases` walks
+    every instruction in the dfg, so pliron's `apply_param_drops` (cparm,
+    right after the egraph step) indexed `[1..]` of a zero-length list
+    and panicked on the first crate built with `PLIRON_EGRAPH=1`.

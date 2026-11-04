@@ -67,6 +67,30 @@ fn bigoff_split(off: i64) -> (i64, i64) {
     (off - lo, lo)
 }
 
+/// Per-rule hit counters (`rule:<name> <k> <fn>` under PLIRON_STATS, taken
+/// after each step): the migration criterion for a rule moved into the
+/// egraph (`opts/pliron.isle`) is its Rust counter dropping to zero.
+pub const RULE_NAMES: [&str; 2] = ["addnorm", "icmpk"];
+const R_ADDNORM: usize = 0;
+const R_ICMPK: usize = 1;
+thread_local! {
+    static RULE_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+fn hit(r: usize) {
+    RULE_HITS.with(|h| {
+        let mut a = h.get();
+        a[r] += 1;
+        h.set(a);
+    });
+}
+/// Drain the counters: `(name, hits)` for every rule that fired.
+pub fn take_rule_hits() -> Vec<(&'static str, usize)> {
+    RULE_HITS.with(|h| {
+        let a = h.replace([0; 2]);
+        RULE_NAMES.iter().zip(a).filter(|(_, k)| *k > 0).map(|(n, k)| (*n, k)).collect()
+    })
+}
+
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
     match func.dfg.insts[func.dfg.value_def(v).inst()?] {
@@ -1543,6 +1567,7 @@ fn icmpk(pos: &mut FuncCursor, inst: Inst, cc: IntCC, x: Value, c: i64) -> bool 
     if terms.is_empty() {
         let v = i64::from((koff == 0) == (cc == IntCC::Equal));
         pos.func.replace(inst).iconst(types::I8, v);
+        hit(R_ICMPK);
         return true;
     }
     // `K - x == 0` → `x == K`; `x + K == 0` → `x == -K`.
@@ -1550,6 +1575,7 @@ fn icmpk(pos: &mut FuncCursor, inst: Inst, cc: IntCC, x: Value, c: i64) -> bool 
         let (t, s) = terms[0];
         let k = pos.ins().iconst(ty, if s > 0 { koff.wrapping_neg() } else { koff });
         pos.func.replace(inst).icmp(cc, t, k);
+        hit(R_ICMPK);
         return true;
     }
     // Two-sided: positives stay on the left with the const, negatives
@@ -1578,6 +1604,7 @@ fn icmpk(pos: &mut FuncCursor, inst: Inst, cc: IntCC, x: Value, c: i64) -> bool 
         rhs = pos.ins().iadd(rhs, t);
     }
     pos.func.replace(inst).icmp(cc, lhs, rhs);
+    hit(R_ICMPK);
     true
 }
 
@@ -1751,6 +1778,7 @@ fn addnorm(pos: &mut FuncCursor, inst: Inst) -> bool {
                 pos.func.replace(inst).iadd(rest, y);
             }
         }
+        hit(R_ADDNORM);
         return true;
     }
     // Const reassoc on the additive spine: `iadd (y+k1), k2` and
@@ -1813,6 +1841,7 @@ fn addnorm(pos: &mut FuncCursor, inst: Inst) -> bool {
                 pos.func.replace(inst).iadd(y, kk);
             }
         }
+        hit(R_ADDNORM);
         return true;
     }
     false
@@ -6739,9 +6768,13 @@ pub fn run(func: &mut Function, x64: bool) -> usize {
     let bittab_on = crate::pass_enabled("PLIRON_BITTAB");
     let icmpeq = crate::pass_enabled("PLIRON_ICMPEQFOLD");
     let divchk_on = crate::pass_enabled("PLIRON_DIVCHK");
-    let icmpk_on = crate::pass_enabled("PLIRON_ICMPK");
+    // `PLIRON_EGRAPH_MIGRATE=1`: the early sweep skips the rules that
+    // `opts/pliron.isle` now carries; the late sweep (`post_sweep`) keeps
+    // them, so its hit counts measure what the egraph missed.
+    let migrated = pliron_cfg::env_is("PLIRON_EGRAPH_MIGRATE", "1");
+    let icmpk_on = crate::pass_enabled("PLIRON_ICMPK") && !migrated;
     let icmpred_on = crate::pass_enabled("PLIRON_ICMPRED");
-    let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM");
+    let addnorm_on = crate::pass_enabled("PLIRON_ADDNORM") && !migrated;
     let symsub = pliron_cfg::env_is("PLIRON_SYMSUB", "1");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
@@ -10829,6 +10862,104 @@ pub fn dgvn(func: &mut Function, dt: &DominatorTree) -> usize {
         if n >= compact_at {
             func.dfg.compact_aliases();
             compact_at = n + 1024;
+        }
+    }
+    n
+}
+
+/// Equality as an invariant (`PLIRON_REKEY`): a pass that merged values
+/// (`sameargs`, `paramsink`, `webmerge` hand over their param maps) also
+/// re-keys the merged values' users, so two instructions that *became*
+/// identical are aliased at the moment the equality is created instead
+/// of waiting for a whole-function `dgvn` that may already have run.
+/// brotli's inlined `set_from_literal_costs`: looprot cloned the
+/// header's `cost[i+1]` address into the latch; one step after the last
+/// `dgvn`, `sameargs` merged the two params feeding them, and the loop
+/// kept both the address and a reload of the value it had just stored
+/// (141 samples on the reload). Transitive: an aliased result's users are
+/// queued too. One scan of the function when there is anything to seed,
+/// nothing otherwise; pure single-result insts only (`cse_key`), so
+/// loads and side effects are untouched. Dominance is checked per
+/// candidate with a fresh tree (the merging pass may have reshaped edges).
+pub fn rekey(func: &mut Function, seeds: impl IntoIterator<Item = Value>) -> usize {
+    let mut work: Vec<Value> = seeds
+        .into_iter()
+        .map(|v| func.dfg.resolve_aliases(v))
+        .collect();
+    work.sort_unstable();
+    work.dedup();
+    if work.is_empty() {
+        return 0;
+    }
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    // One scan: users by (resolved) operand, and every keyable inst by key.
+    let mut users: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+    let mut index: FxHashMap<CseKey, Vec<Inst>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                users.entry(func.dfg.resolve_aliases(a)).or_default().push(i);
+            }
+            if func.dfg.inst_results(i).len() == 1 {
+                if let Some(k) = cse_key(func, i) {
+                    index.entry(k).or_default().push(i);
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    let mut seen_user: FxHashSet<Inst> = FxHashSet::default();
+    while let Some(v) = work.pop() {
+        let Some(us) = users.get(&v).cloned() else { continue };
+        for u in us {
+            if !func.layout.inst_block(u).is_some() || !seen_user.insert(u) {
+                continue;
+            }
+            if func.dfg.inst_results(u).len() != 1 {
+                continue;
+            }
+            let res = func.dfg.first_result(u);
+            if func.dfg.resolve_aliases(res) != res {
+                continue;
+            }
+            let Some(k) = cse_key(func, u) else { continue };
+            // Candidates under the (current) key: entries were indexed under
+            // their key at scan time, which for an inst whose operand was
+            // merged is stale — re-verify before trusting one.
+            let cands = index.entry(k.clone()).or_default();
+            let mut found = None;
+            for &c in cands.iter() {
+                if c == u || func.layout.inst_block(c).is_none() {
+                    continue;
+                }
+                if cse_key(func, c).as_ref() != Some(&k) {
+                    continue;
+                }
+                if dt.dominates(c, u, &func.layout) {
+                    found = Some(func.dfg.first_result(c));
+                    break;
+                }
+            }
+            match found {
+                Some(cv) => {
+                    let cv = func.dfg.resolve_aliases(cv);
+                    func.dfg.clear_results(u);
+                    func.dfg.change_to_alias(res, cv);
+                    func.layout.remove_inst(u);
+                    // `res`'s users now use `cv`: queue them under `cv`.
+                    if let Some(ru) = users.remove(&res) {
+                        users.entry(cv).or_default().extend(ru);
+                    }
+                    work.push(cv);
+                    n += 1;
+                }
+                None => {
+                    if !cands.contains(&u) {
+                        cands.push(u);
+                    }
+                }
+            }
         }
     }
     n

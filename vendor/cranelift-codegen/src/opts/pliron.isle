@@ -1,0 +1,59 @@
+;; PLIRON: pure rewrites migrated from pliron-clif-opt's `clifpeep` sweep
+;; (docs/codegen-plan.md, "Direction": equality as an invariant, then the
+;; egraph). Each family here mirrors a Rust rule whose hit counter
+;; (`rule:<name>` under PLIRON_STATS) must drop to zero on the corpus
+;; before the Rust rule is deleted. `PLIRON_EGRAPH_RULES=1` enables.
+
+(decl pure pliron_rules_on () bool)
+(extern constructor pliron_rules_on pliron_rules_on)
+
+;;;; addnorm: constant chains on an additive spine fold once.
+;; cprop pushes immediates to the right of `iadd`, so only right-constant
+;; shapes are needed; `isub k, x` is already `ineg (isub x k)`.
+
+;; (x + k1) + k2 --> x + (k1 + k2)
+(rule (simplify (iadd (fits_in_64 ty) (iadd ty x (iconst ty k1)) (iconst ty k2)))
+      (if-let true (pliron_rules_on))
+      (iadd ty x (iconst ty (imm64_add ty k1 k2))))
+;; (x + k1) - k2 --> x + (k1 - k2)
+(rule (simplify (isub (fits_in_64 ty) (iadd ty x (iconst ty k1)) (iconst ty k2)))
+      (if-let true (pliron_rules_on))
+      (iadd ty x (iconst ty (imm64_sub ty k1 k2))))
+;; (x - k1) + k2 --> x + (k2 - k1)
+(rule (simplify (iadd (fits_in_64 ty) (isub ty x (iconst ty k1)) (iconst ty k2)))
+      (if-let true (pliron_rules_on))
+      (iadd ty x (iconst ty (imm64_sub ty k2 k1))))
+;; (x - k1) - k2 --> x - (k1 + k2)
+(rule (simplify (isub (fits_in_64 ty) (isub ty x (iconst ty k1)) (iconst ty k2)))
+      (if-let true (pliron_rules_on))
+      (isub ty x (iconst ty (imm64_add ty k1 k2))))
+
+;;;; icmpk: a constant on an additive spine moves across an equality.
+;; (x + k) ==/!= c --> x ==/!= (c - k)
+(rule (simplify (eq cty (iadd (fits_in_64 ty) x (iconst ty k)) (iconst ty c)))
+      (if-let true (pliron_rules_on))
+      (eq cty x (iconst ty (imm64_sub ty c k))))
+(rule (simplify (ne cty (iadd (fits_in_64 ty) x (iconst ty k)) (iconst ty c)))
+      (if-let true (pliron_rules_on))
+      (ne cty x (iconst ty (imm64_sub ty c k))))
+;; (x - k) ==/!= c --> x ==/!= (c + k)
+(rule (simplify (eq cty (isub (fits_in_64 ty) x (iconst ty k)) (iconst ty c)))
+      (if-let true (pliron_rules_on))
+      (eq cty x (iconst ty (imm64_add ty c k))))
+(rule (simplify (ne cty (isub (fits_in_64 ty) x (iconst ty k)) (iconst ty c)))
+      (if-let true (pliron_rules_on))
+      (ne cty x (iconst ty (imm64_add ty c k))))
+;; (a - b) ==/!= 0 --> a ==/!= b
+(rule (simplify (eq cty (isub (fits_in_64 ty) a b) (iconst_u ty 0)))
+      (if-let true (pliron_rules_on))
+      (eq cty a b))
+(rule (simplify (ne cty (isub (fits_in_64 ty) a b) (iconst_u ty 0)))
+      (if-let true (pliron_rules_on))
+      (ne cty a b))
+;; (x + k) ==/!= y  with y = (z + k) is cranelift's own rule; -x ==/!= c --> x ==/!= -c
+(rule (simplify (eq cty (ineg (fits_in_64 ty) x) (iconst ty c)))
+      (if-let true (pliron_rules_on))
+      (eq cty x (iconst ty (imm64_neg ty c))))
+(rule (simplify (ne cty (ineg (fits_in_64 ty) x) (iconst ty c)))
+      (if-let true (pliron_rules_on))
+      (ne cty x (iconst ty (imm64_neg ty c))))

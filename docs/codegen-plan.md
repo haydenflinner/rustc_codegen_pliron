@@ -1278,6 +1278,115 @@ or fact-propagation gap, not a missing optimization; the late pipeline
 `looprot2`) is where iterator loops become canonical, and anything that
 wants their final shape has to run after it.
 
+## Direction (2026-11-03, after the Kahan-loop trace): equality as an invariant, then the egraph
+
+The HqZopfli trace above is the first concrete case of a structural
+problem: `sameargs` proved two block params equal and rewrote their
+users, and nothing drew the consequence that two users (the header's
+and the latch's `v695 + i*4`) had become the same value, because value
+numbering is a pass that had already run. Every pass that merges values
+(`sameargs`, `paramsink`, `webmerge`, `ivretro`, jumpthread's param
+folds) is such a site. The pipeline has about seventy steps, each
+recomputing its analyses from the IR and dropping them; the only thing
+that flows forward is what a pass writes into the IR, and "these two
+values are equal" is only written when one is aliased to the other.
+
+The order of work, each step measured on the held-out set and on
+compile time (CMP stays at or under 0.85x LLVM):
+
+1. **Equality as an invariant on plain CLIF** (`clifpeep::rekey`,
+   `PLIRON_REKEY`). A merging pass hands the values it merged to a
+   re-key worklist: each user of a merged value is re-hashed with
+   `cse_key`, aliased to a dominating equal if one exists, and its own
+   users are queued. One scan when a merge happened, nothing otherwise;
+   transitive; no new pass and no ordering to get right. Done for the
+   three param-merging passes first; the rest follow as their traces
+   show misses.
+2. **One placement policy for the egraph's elaborator.** The egraph's
+   elaboration places each node as early as its operands allow (LICM by
+   default); `splink`, `PLIRON_CONSTSINK` and `PLIRON_REMATSINK` undo
+   that for one-instruction values inside loops with calls. Two policies
+   fight regardless of order. Give elaboration the placement cost
+   `splink` and regalloc2's spill weights already encode (loop depth,
+   call clobbers, pressure), so the repairs retire and the egraph can
+   run late or twice.
+3. **Pure rewrites out of `clifpeep` and into ISLE egraph rules**
+   (`vendor/cranelift-codegen/src/opts/pliron.isle`). `clifpeep.rs` is
+   13,900 lines and 136 functions run as an ordered sweep several times;
+   the egraph's rules are 2,800 lines applied to saturation once, where
+   rules compose and an equality created late cannot be missed. Migrate
+   in batches by rule family (addnorm/icmpk/bandk, extend-reduce chains,
+   mem-offset folds, neg/shift folds, select folds), each batch verified
+   by the clifpeep rule's hit counter dropping to zero on the corpus
+   before the Rust rule is deleted, and each measured, since extraction's
+   cost model will choose differently than the sweep did. Rules that
+   depend on facts the egraph does not carry (ranges, non-null, region
+   tags, loop shape) stay in Rust until the fact becomes a node
+   attribute.
+4. **What stays a pass.** Loop rotation, unrolling, jump threading,
+   inlining, store forwarding, DSE, allocation: graph and memory
+   transforms with no saturation form (LLVM runs about a hundred passes
+   and reruns GVN/InstCombine for the same reason). Their rule is the
+   existing one: write down what you proved so the next pass does not
+   re-derive it.
+
+**Measured so far (2026-11-03, night).** Step 1 is built: `clifpeep::rekey`
+(`PLIRON_REKEY`, wired into sameargs, paramsink, webmerge). On HqZopfli
+it removes the latch's duplicate address and the reload of the value
+just stored; gate 94/94, fuzz 400/400 (a first run reported 305
+"compile-errors" that were the memory watchdog killing rustc under an
+overlapping dev2 build; the clean rerun passed). Held-out pending AC
+power (the battery run's A/A floor moved 1%).
+
+Step 3's first batch (`opts/pliron.isle`: addnorm's constant chains,
+icmpk's constant-across-equality, `PLIRON_EGRAPH_RULES=1`) exposed the
+real precondition: the mid-pipeline `egraph` step is
+`Gate::OptIn("PLIRON_EGRAPH")` and at defaults runs on **zero**
+functions; the only egraph that runs is Cranelift's compile-path one,
+after every pliron pass. The step also crashed on first use
+(`BlockCall::update_args` on a value list the egraph had freed, hit by
+`resolve_all_aliases` in cparm; patch 103 makes the walk skip it), and
+skips functions with `try_call`, which on rust-compression is 75 of 925.
+The gate with the step on then failed in five stanzas: the wasm ones
+(`wasm_smoke`, `lowerfree-wasm`, `pgo`'s wasm32 std) with "egraph broke
+<fn>: Verifier errors" on wasm32 CLIF, and `rusttailcc` with the
+post-egraph check finding a `return_call` operand whose def the
+elaborator left out of the layout. Both are skipped now (`p.wasm`,
+`ReturnCall*` alongside `TryCall*`); diagnosing them is part of step 0.
+With the guards: gate 94/94 with `PLIRON_EGRAPH=1 PLIRON_EGRAPH_RULES=1
+PLIRON_EGRAPH_MIGRATE=1 PLIRON_REKEY=1`, fuzz 400/400, gate 94/94 at
+defaults. All four stay opt-in until the held-out run (armed to start
+on AC power) gives intervals for rekey, egraph alone, and egraph with
+the migrated rules.
+With the step on, the counters (`rule:<name>` under PLIRON_STATS,
+patch-style per-rule hit counters in clifpeep) say: the early sweep's
+10,493 addnorm and 101 icmpk hits leave only 184 and 99 survivors for
+the late sweep when the early rules are off (`PLIRON_EGRAPH_MIGRATE=1`),
+and the ISLE rules then take 12 of the 184 and 87 of the 99. So the
+early Rust rules are already nearly redundant with what runs after them,
+icmpk migrates cleanly, and addnorm's survivors are shapes the egraph
+does not see (created after it) or forms the rules do not match yet.
+Firing counts are not the criterion, though: a rule that fires 10,000
+times and changes nothing downstream is noise. The criterion is the
+pipeline with the egraph step on by default being correct (gate, fuzz),
+no slower to compile, and no slower at run time; that validation is
+running. Until it passes, the migrated rules and the migration knob stay
+opt-in, and the plan's step 3 is blocked on step "0": make the
+mid-pipeline egraph a default pass.
+
+Later, not now: **an offline autotuner over the numeric knobs**
+(inline budget and loop bonus, placement weights `W_*`, spill-weight
+scales, unroll factors; after step 3, the extraction cost model's
+weights). The pieces exist: a tuning set separate from the held-out set,
+`bench/heldout/run.py`'s bootstrap intervals and A/A floor, knobs as
+environment variables. The loop proposes a knob vector, builds the
+tuning set, accepts only moves whose interval excludes 1, validates on
+held-out, and freezes the result into defaults. Offline only: a learner
+inside the compiler would make builds non-reproducible and would be
+training on this machine's noise; "no tuning on the check set" stays.
+Learned cost models (as LLVM's MLGO did for inlining and eviction) need
+a corpus larger than our benchmarks and are research, not a week.
+
 ## Sequencing (revised 2026-10-31, after the census)
 
 The census reordered the plan: register allocation (W4) and the fact

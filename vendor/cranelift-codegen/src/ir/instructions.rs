@@ -122,7 +122,13 @@ impl BlockCall {
         pool: &mut ValueListPool,
         mut f: F,
     ) {
-        for raw in self.values.as_mut_slice(pool)[1..].iter_mut() {
+        // PLIRON: a block call whose list the egraph freed (its inst left
+        // the layout) is empty; `resolve_all_aliases` walks every inst in
+        // the dfg, so skip it instead of indexing past the block slot.
+        let Some(args) = self.values.as_mut_slice(pool).get_mut(1..) else {
+            return;
+        };
+        for raw in args.iter_mut() {
             let new = f(BlockArg::decode_from_value(*raw));
             *raw = new.encode_as_value();
         }

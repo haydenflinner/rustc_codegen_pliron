@@ -293,13 +293,18 @@ impl Pipe<'_> {
         }
     }
     fn log(&self, label: &str, k: usize) {
-        if k > 0
-            && crate::config::tracing_on()
+        if crate::config::tracing_on()
             && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+            && pliron_cfg::tracing_on()
         {
-            if pliron_cfg::tracing_on() {
-                tracing::info!(target: "pliron::stats", "{label} {k} {}", self.fname)
-            };
+            if k > 0 {
+                tracing::info!(target: "pliron::stats", "{label} {k} {}", self.fname);
+            }
+            // Per-rule counters (clifpeep `hit`), drained after every step
+            // so a rule's hits are attributed to the step that ran it.
+            for (name, hits) in clifpeep::take_rule_hits() {
+                tracing::info!(target: "pliron::stats", "rule:{name} {hits} {} @{label}", self.fname);
+            }
         }
     }
 }
@@ -1959,7 +1964,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             carry_aliases(p, an);
         }
     }
-    p.log(s.stat, k);
+    p.log(if s.stat.is_empty() { s.name } else { s.stat }, k);
     if red_before && crate::taildup::irreducible(&p.clctx.func) {
         eprintln!("pliron: {} made `{}` irreducible", s.name, p.fname);
     }
@@ -2432,14 +2437,29 @@ fn s_dse(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Upstream's egraph doesn't know `try_call` (it predates EH), so
 // functions with invokes are skipped entirely.
 fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let has_try_call = p
+    use cranelift_codegen::ir::Opcode;
+    // Skipped: the wasm path (its host ISA is bookkeeping only; the
+    // egraph's output failed the verifier on wasm32 CLIF in the gate's
+    // wasm_smoke/lowerfree-wasm/pgo stanzas) and functions with tail
+    // calls (the elaborator left a `return_call` operand's def out of
+    // the layout: rusttailcc). Both are "step 0" of the migration
+    // (docs/codegen-plan.md "Direction"), not yet diagnosed.
+    if p.wasm {
+        return 0;
+    }
+    let unsupported = p
         .clctx
         .func
         .layout
         .blocks()
         .flat_map(|b| p.clctx.func.layout.block_insts(b))
-        .any(|i| p.clctx.func.dfg.insts[i].opcode() == cranelift_codegen::ir::Opcode::TryCall);
-    if has_try_call || !p.clctx.egraph_safe() {
+        .any(|i| {
+            matches!(
+                p.clctx.func.dfg.insts[i].opcode(),
+                Opcode::TryCall | Opcode::TryCallIndirect | Opcode::ReturnCall | Opcode::ReturnCallIndirect
+            )
+        });
+    if unsupported || !p.clctx.egraph_safe() {
         return 0;
     }
     let mut cp = ControlPlane::default();
@@ -2461,7 +2481,9 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     p.clctx.cfg.clear();
     p.clctx.domtree.clear();
     p.dump("egraph");
-    0
+    // 1 = the egraph ran on this function (`egraph 1 <fn>` under
+    // PLIRON_STATS: the migration's coverage denominator).
+    1
 }
 
 // Loop-carried load reuse: sibling to indvars since it grows
@@ -2999,6 +3021,7 @@ fn s_paramsink(p: &mut Pipe, an: &mut Analysis) -> usize {
     if !moved.is_empty() {
         let pmap: FxHashMap<Value, Value> = moved.into_iter().collect();
         carry_pmap(p, &pmap);
+        rekey_after(p, pmap.values().copied());
     }
     if k > 0 {
         p.dump("paramsink");
@@ -3101,6 +3124,7 @@ fn s_sameargs(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let (k, pmap) = clifpeep::sameargs(&mut p.clctx.func);
     if k > 0 {
         carry_pmap(p, &pmap);
+        rekey_after(p, pmap.values().copied());
         if p.dump {
             p.dump("sameargs");
         }
@@ -3506,6 +3530,22 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     }
 }
 
+/// `PLIRON_REKEY=1` (opt-in): after a pass merged values, re-key their
+/// users (`clifpeep::rekey`) so instructions that became identical are
+/// aliased now rather than by a later `dgvn` (docs/codegen-plan.md,
+/// "equality as an invariant").
+fn rekey_after(p: &mut Pipe, merged: impl IntoIterator<Item = Value>) {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_REKEY", "1"));
+    if !*ON {
+        return;
+    }
+    let k = clifpeep::rekey(&mut p.clctx.func, merged);
+    if k > 0 && p.dump {
+        p.dump("rekey");
+    }
+}
+
 fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
     // Resolve each pmap link once: chasing per `derived` key walked the
     // chain O(|pmap|) per key — quadratic on functions that drop many
@@ -3605,6 +3645,7 @@ fn s_webmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let (k, pmap) = clifpeep::webmerge(&mut p.clctx.func);
     if k > 0 {
         carry_pmap(p, &pmap);
+        rekey_after(p, pmap.values().copied());
         if p.dump {
             p.dump("webmerge");
         }
