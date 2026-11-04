@@ -2,9 +2,9 @@
 # bench/tune.sh — the PLIRON_* knob-tuning driver. For each config in
 # CONFIGS, rebuilds the bench crate (the knobs gate codegen of the
 # kernels, not the backend dylib, so each row is one cargo-rustc plus one
-# criterion run against the saved `llvm` baseline), records the mean
-# ns/iter per kernel, then asks mimas to rank the results through a
-# `datalog {}` block: rows -> `res` input relation -> `best` rule.
+# benchfmt run), records the median ns/op per kernel, then asks mimas to
+# rank the results through a `datalog {}` block: rows -> `res` input
+# relation -> `best` rule.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,6 +16,9 @@ CONFIGS=(
   "PLIRON_PIPELINE=jumpthread,clifpeep,loadfwd"
 )
 RESULTS=bench/tune/results.tsv
+
+BENCHTIME=${BENCHTIME:-2s}
+COUNT=${COUNT:-3}
 
 case "$(uname -s)" in
   Darwin) lib=librustc_codegen_pliron.dylib ;;
@@ -38,23 +41,24 @@ if not exe: sys.exit("bench_bin: no executable")
 print(exe)'
 }
 
-# mean of criterion's [lo mid hi] estimate, normalized to ns
-mean_ns() {
+# median of each benchmark's ns/op across -count epochs
+med_ns() {
   "$PY" -c '
-import re, sys, json
+import json, statistics, sys
+rows = {}
 for line in sys.stdin:
-    m = re.match(r"^(\S+)\s+time:\s+\[[\d.]+ [a-zµ]+ ([\d.]+) ([a-zµ]+)", line)
-    if m:
-        unit = {"ps":1e-3,"ns":1,"µs":1e3,"us":1e3,"ms":1e6,"s":1e9}[m.group(3)]
-        print(json.dumps({"k": m.group(1), "ns": float(m.group(2)) * unit}))'
+    f = line.split()
+    if len(f) >= 4 and f[0].startswith("Benchmark"):
+        try:
+            rows.setdefault(f[0][len("Benchmark"):].rsplit("-", 1)[0].lower(), []).append(float(f[2]))
+        except ValueError:
+            pass
+for k, v in rows.items():
+    print(json.dumps({"k": k, "ns": statistics.median(v)}))'
 }
 
 cargo build
-llvm_bin=$(bench_bin "")
 : > "$RESULTS"
-for k in "${KERNELS[@]}"; do
-  "$llvm_bin" --bench --save-baseline llvm "^$k\$" >/dev/null
-done
 
 cid=0
 for cfg in "${CONFIGS[@]}"; do
@@ -62,7 +66,7 @@ for cfg in "${CONFIGS[@]}"; do
   touch bench/benches/kernels.rs   # env isn't fingerprinted — force rebuild
   bin=$(bench_bin "$cfg")
   for k in "${KERNELS[@]}"; do
-    "$bin" --bench --baseline llvm "^$k\$" | mean_ns | \
+    "$bin" -bench "$k" -benchtime "$BENCHTIME" -count "$COUNT" -cpu 1 | med_ns | \
       while read -r row; do
         echo "$row" | "$PY" -c "import json,sys; r=json.load(sys.stdin); print(f\"{r['k']}\t$cid\t{r['ns']}\")" >> "$RESULTS"
       done

@@ -1,6 +1,6 @@
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use std::time::Duration;
+
+use benchfmt::{CountingAlloc, Suite};
 
 mod arrayvec;
 mod chars_alpha;
@@ -21,6 +21,13 @@ mod strwork;
 mod tokenize;
 mod varint;
 
+// CountingAlloc wraps the System allocator so `-benchmem` (or
+// `b.report_allocs()`) reports B/op and allocs/op per benchmark epoch.
+// It lives in this crate, so it is compiled by the backend under test —
+// same few instructions on both sides of a bench/run.sh comparison.
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc::new();
+
 // Crash probe (windows): vectored handler prints faulting RIP before dying.
 #[cfg(windows)]
 fn install_crash_probe() {
@@ -30,7 +37,7 @@ fn install_crash_probe() {
         flags: u32,
         _next: usize,
         addr: usize,
-        nparams: u32,
+        nparams: usize,
         _pad: u32,
     }
     #[repr(C)]
@@ -98,7 +105,7 @@ fn install_crash_probe() {
                 fn RtlVirtualUnwind(
                     htype: u32,
                     base: usize,
-                    pc: usize,
+                    pc: *mut u8,
                     fnentry: *const u8,
                     ctx: *mut u8,
                     handler: *mut usize,
@@ -146,7 +153,7 @@ fn install_crash_probe() {
                 };
                 std::eprintln!("  {n}={v:#x}{tag}");
             }
-            let rsp = *(ctx.add(0x98) as *const usize);
+            let rsp = *(c2.as_ptr().add(0x98) as *const usize);
             for i in 0..160usize {
                 let q = *(rsp as *const usize).add(i);
                 if q >= base && q < base + 0x2c6000 {
@@ -167,141 +174,85 @@ fn install_crash_probe() {
 #[cfg(not(windows))]
 fn install_crash_probe() {}
 
-fn bench_arrayvec(c: &mut Criterion) {
-    c.bench_function("arrayvec", |b| {
-        let v = arrayvec::setup();
-        b.iter(|| arrayvec::run(black_box(&v)))
-    });
-}
-
-fn bench_chars_alpha(c: &mut Criterion) {
+fn main() {
     install_crash_probe();
-    c.bench_function("chars_alpha", |b| {
-        let s = chars_alpha::setup();
-        b.iter(|| chars_alpha::run(black_box(&s)))
-    });
-}
 
-fn bench_chars_ascii(c: &mut Criterion) {
-    c.bench_function("chars_ascii", |b| {
-        let s = chars_ascii::setup();
-        b.iter(|| chars_ascii::run(black_box(&s)))
-    });
+    // Go-compatible flags: -bench <substr>, -benchtime 2s|Nx, -count N,
+    // -cpu N (name suffix only), -benchmem, -cpuprofile, -memprofile.
+    Suite::from_env("pliron-bench")
+        .with_alloc(&ALLOC)
+        .bench("arrayvec", |b| {
+            let v = arrayvec::setup();
+            b.iter(|| arrayvec::run(black_box(&v)));
+        })
+        .bench("chars_alpha", |b| {
+            let s = chars_alpha::setup();
+            b.iter(|| chars_alpha::run(black_box(&s)));
+        })
+        .bench("chars_ascii", |b| {
+            let s = chars_ascii::setup();
+            b.iter(|| chars_ascii::run(black_box(&s)));
+        })
+        .bench("chars_mixed", |b| {
+            let s = chars_mixed::setup();
+            b.iter(|| chars_mixed::run(black_box(&s)));
+        })
+        .bench("contains_rng", |b| {
+            let v = contains_rng::setup();
+            b.iter(|| contains_rng::run(black_box(&v), black_box(100), black_box(60_000)));
+        })
+        .bench("eqbug", |b| b.iter(eqbug::run))
+        .bench("fib", |b| b.iter(fib::run))
+        .bench("hashmap", |b| b.iter(hashmap::run))
+        .bench("hmget", |b| {
+            let m = hmget::setup();
+            b.iter(|| hmget::run(black_box(&m)));
+        })
+        .bench("iterw", |b| {
+            let a = iterw::setup();
+            b.iter(|| iterw::run(black_box(&a)));
+        })
+        .bench("matmul", |b| {
+            // run() accumulates into c; reusing it across iterations keeps the
+            // same instruction stream (f64 fma count is data-independent).
+            let (a, bb, mut c, n) = matmul::setup();
+            b.iter(|| matmul::run(black_box(&a), black_box(&bb), black_box(&mut c), n));
+        })
+        .bench("nbody", |b| {
+            // run() advances the simulation in place; restock the pristine
+            // state each iteration so long epochs can't drift into inf/denormal
+            // territory (280 B copy vs a 2M-step advance).
+            let orig = nbody::setup();
+            let mut bodies = orig;
+            b.iter(|| {
+                bodies.copy_from_slice(&orig);
+                nbody::run(black_box(&mut bodies))
+            });
+        })
+        .bench("parse_only", |b| b.iter(parse_only::run))
+        .bench("sieve", |b| b.iter(sieve::run))
+        .bench("sortw", |b| {
+            // run() sorts in place; restock the shuffled input each iteration —
+            // sorting an already-sorted vec would take the fast path.
+            let orig = sortw::setup();
+            let mut v = orig.clone();
+            b.iter(|| {
+                v.clone_from(&orig);
+                sortw::run(black_box(&mut v))
+            });
+        })
+        .bench("strwork", |b| b.iter(strwork::run))
+        .bench("tokenize", |b| {
+            let s = tokenize::setup();
+            b.iter(|| tokenize::run(black_box(&s)));
+        })
+        .bench("varint", |b| {
+            let buf = varint::setup();
+            b.iter(|| varint::run(black_box(&buf)));
+        })
+        .bench("varint_postcard", |b| {
+            let buf = varint::setup_postcard();
+            b.iter(|| varint::run_postcard(black_box(&buf)));
+        })
+        .run();
 }
-
-fn bench_chars_mixed(c: &mut Criterion) {
-    c.bench_function("chars_mixed", |b| {
-        let s = chars_mixed::setup();
-        b.iter(|| chars_mixed::run(black_box(&s)))
-    });
-}
-
-fn bench_contains_rng(c: &mut Criterion) {
-    c.bench_function("contains_rng", |b| {
-        let v = contains_rng::setup();
-        b.iter(|| contains_rng::run(black_box(&v), black_box(100), black_box(60_000)))
-    });
-}
-
-fn bench_eqbug(c: &mut Criterion) {
-    c.bench_function("eqbug", |b| b.iter(eqbug::run));
-}
-
-fn bench_fib(c: &mut Criterion) {
-    c.bench_function("fib", |b| b.iter(fib::run));
-}
-
-fn bench_hashmap(c: &mut Criterion) {
-    c.bench_function("hashmap", |b| b.iter(hashmap::run));
-}
-
-fn bench_hmget(c: &mut Criterion) {
-    c.bench_function("hmget", |b| {
-        let m = hmget::setup();
-        b.iter(|| hmget::run(black_box(&m)))
-    });
-}
-
-fn bench_iterw(c: &mut Criterion) {
-    c.bench_function("iterw", |b| {
-        let a = iterw::setup();
-        b.iter(|| iterw::run(black_box(&a)))
-    });
-}
-
-fn bench_matmul(c: &mut Criterion) {
-    c.bench_function("matmul", |b| {
-        b.iter_batched(
-            matmul::setup,
-            |(a, bb, mut c, n)| matmul::run(&a, &bb, &mut c, n),
-            BatchSize::LargeInput,
-        )
-    });
-}
-
-fn bench_nbody(c: &mut Criterion) {
-    c.bench_function("nbody", |b| {
-        b.iter_batched(
-            nbody::setup,
-            |mut bodies| nbody::run(&mut bodies),
-            BatchSize::LargeInput,
-        )
-    });
-}
-
-fn bench_parse_only(c: &mut Criterion) {
-    c.bench_function("parse_only", |b| b.iter(parse_only::run));
-}
-
-fn bench_sieve(c: &mut Criterion) {
-    c.bench_function("sieve", |b| b.iter(sieve::run));
-}
-
-fn bench_sortw(c: &mut Criterion) {
-    c.bench_function("sortw", |b| {
-        b.iter_batched(
-            sortw::setup,
-            |mut v| sortw::run(&mut v),
-            BatchSize::LargeInput,
-        )
-    });
-}
-
-fn bench_strwork(c: &mut Criterion) {
-    c.bench_function("strwork", |b| b.iter(strwork::run));
-}
-
-fn bench_tokenize(c: &mut Criterion) {
-    c.bench_function("tokenize", |b| {
-        let s = tokenize::setup();
-        b.iter(|| tokenize::run(black_box(&s)))
-    });
-}
-
-fn bench_varint(c: &mut Criterion) {
-    c.bench_function("varint", |b| {
-        let buf = varint::setup();
-        b.iter(|| varint::run(black_box(&buf)))
-    });
-}
-
-fn bench_varint_postcard(c: &mut Criterion) {
-    c.bench_function("varint_postcard", |b| {
-        let buf = varint::setup_postcard();
-        b.iter(|| varint::run_postcard(black_box(&buf)))
-    });
-}
-
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(2));
-    targets = bench_arrayvec, bench_chars_alpha, bench_chars_ascii, bench_chars_mixed,
-        bench_contains_rng, bench_eqbug, bench_fib, bench_hashmap, bench_hmget,
-        bench_iterw, bench_matmul, bench_nbody, bench_parse_only, bench_sieve,
-        bench_sortw, bench_strwork, bench_tokenize, bench_varint,
-        bench_varint_postcard
-}
-
-criterion_main!(benches);

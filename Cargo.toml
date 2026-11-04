@@ -73,6 +73,11 @@ incremental = false
 [profile.dev.package.regalloc2]
 incremental = false
 
+# Line tables so `-cpuprofile`/`-memprofile` (benchfmt pprof feature) can
+# attribute samples to source lines.
+[profile.bench]
+debug = 1
+
 [package.metadata.rust-analyzer]
 rustc_private = true
 

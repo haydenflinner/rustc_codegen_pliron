@@ -28,7 +28,7 @@ MSVC/WinSDK files:
 msvcrt/ucrtbase/vcruntime140/ole32/advapi32/shell32/user32/bcrypt/
 bcryptprimitives plus `synchronization.lib` (api-set forwarders). Names
 unspellable in .def (C++ operators, `=X.#N` ordinal forwards) are skipped —
-rustc objects never import them. Verified end-to-end: the criterion bench
+rustc objects never import them. Verified end-to-end: the bench suite
 builds and runs with zero VS inputs.
 
 ## Targets, cross-compiling, self-hosting

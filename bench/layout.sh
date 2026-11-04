@@ -10,11 +10,12 @@
 #   bench/layout.sh sieve            # 3 layouts (1 as-built + 2 shuffled)
 #   bench/layout.sh sieve 5          # more samples
 #   PLIRON_CICM=1 bench/layout.sh sieve   # ambient PLIRON_* config applies
-#   bench/layout.sh "sieve|hmget" 2 --verbose   # extra args go to criterion
+#   bench/layout.sh "sieve|hmget" 2  # |-separated names; extra args go to
+#                                    # the benchfmt binary
 #
 # Mechanism: `-Wl,-order_file` (Darwin) / `--symbol-ordering-file` (lld)
 # reorders __text by symbol list at link time — identical codegen, different
-# placement. ~4 s per extra layout plus one criterion run.
+# placement. ~4 s per extra layout plus one benchfmt run.
 #
 # Each layout needs a distinct order-file PATH: cargo fingerprints the
 # link-arg string, not the file contents, so reusing one path reuses the
@@ -22,7 +23,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-KERNEL=${1:?usage: bench/layout.sh KERNEL [N] [criterion args...]}
+KERNEL=${1:?usage: bench/layout.sh KERNEL [N] [bench args...]}
 N=${2:-3}
 shift; [ $# -gt 0 ] && shift || true
 
@@ -57,15 +58,20 @@ if not exe:
 print(exe)'
 }
 
-# criterion "time: [lo mid hi]" -> mid in ns
-mid_ns() {
+# benchfmt "BenchmarkName iters ns ns/op" epochs -> "name median_ns" per kernel
+med_ns() {
   "${PY[@]}" -c '
-import re, sys
+import statistics, sys
+rows = {}
 for line in sys.stdin:
-    m = re.match(r"^(\S+)\s+time:\s+\[[\d.]+ [a-zµ]+ ([\d.]+) ([a-zµ]+)", line)
-    if m:
-        unit = {"ps":1e-3,"ns":1,"µs":1e3,"us":1e3,"ms":1e6,"s":1e9}[m.group(3)]
-        print(float(m.group(2)) * unit)'
+    f = line.split()
+    if len(f) >= 4 and f[0].startswith("Benchmark"):
+        try:
+            rows.setdefault(f[0][len("Benchmark"):].rsplit("-", 1)[0].lower(), []).append(float(f[2]))
+        except ValueError:
+            pass
+for k, v in rows.items():
+    print(k, int(statistics.median(v)))'
 }
 
 cargo build >/dev/null   # the backend dylib
@@ -91,17 +97,25 @@ while [ $i -lt "$N" ]; do
     tag="L$i $ord"
   fi
   echo "=== $tag" >&2
-  med=$("$run_bin" --bench "^$KERNEL\$" "$@" | tee /dev/stderr | mid_ns)
-  meds+=("${med:-nan}")
+  for k in $KERNEL; do
+    while read -r row; do meds+=("$row"); done \
+      < <("$run_bin" -bench "$k" -benchtime "${BENCHTIME:-1s}" -count "${COUNT:-5}" -cpu 1 "$@" \
+          | tee /dev/stderr | med_ns)
+  done
   i=$((i + 1))
 done
 
 {
   echo "== layout medians (ns) =="
   printf '%s\n' "${meds[@]}" | "${PY[@]}" -c '
-import sys, statistics
-v = [float(x) for x in sys.stdin.read().split()]
-v.sort()
-print("runs   :", " ".join(f"{x:.0f}" for x in v))
-print(f"median : {statistics.median(v):.0f}  spread: {(v[-1]-v[0])/v[0]*100:.1f}%")'
+import sys, statistics, collections
+g = collections.defaultdict(list)
+for line in sys.stdin:
+    f = line.split()
+    if len(f) >= 2:
+        g[f[0]].append(float(f[1]))
+for k, v in g.items():
+    v.sort()
+    print(f"{k}: " + " ".join(f"{x:.0f}" for x in v))
+    print(f"{k}: median {statistics.median(v):.0f}  spread {(v[-1]-v[0])/v[0]*100:.1f}%")'
 }

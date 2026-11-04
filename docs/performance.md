@@ -11,15 +11,17 @@ optimizations. Only the backend is different.
 
 ## What we measured
 
-The kernels live in `bench/` as a `criterion` bench target (`pliron-bench`).
+The kernels live in `bench/` as a `benchfmt::Suite` bench target
+(`pliron-bench`; the vendored `benchfmt.rs` harness emits Go `benchfmt`
+epochs for `benchstat` — see `vendor/benchfmt.rs/PLIRON_PATCH.md`).
 `bench/run.sh` compiles that target twice — once with stock `rustc -O`
-(LLVM), once with `rustc -O -Zcodegen-backend=<pliron>` — saves the LLVM run
-as the `llvm` baseline, then runs the pliron build against it. Each
-benchmark gets 1 s of warm-up and 2 s of measurement over 100 samples, and
-criterion reports a significance-tested change per kernel. The `cargo
-rustc --bench` flags reach the bench crate only, so criterion itself is
-always LLVM-built and cannot skew the numbers. The machine is an Apple
-Silicon Mac (aarch64-apple-darwin); the toolchain is `nightly-2026-10-06`.
+(LLVM), once with `rustc -O -Zcodegen-backend=<pliron>` — runs `COUNT`
+steady-state `-benchtime` epochs under each, and compares with `benchstat`
+(Mann-Whitney U per kernel, `B/op` and `allocs/op` from `CountingAlloc`).
+The `cargo rustc --bench` flags reach the bench crate only, so the suite
+harness itself is always LLVM-built and cannot skew the numbers. Per-kernel
+medians append to `bench/history.tsv`. The machine is an Apple Silicon Mac
+(aarch64-apple-darwin); the toolchain is `nightly-2026-10-06`.
 
 `black_box` is a real barrier under both backends, and now nearly free:
 pliron emits a call to a never-defined `__pliron_bb*`/`__pliron_bbm`

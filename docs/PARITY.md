@@ -66,7 +66,7 @@ Correctness inputs: crates tier 1 run in the default `--deps stock` mode
 (the crates' own code only); the UI input is the 2026-10-27 stage-2
 self-host run. x86-64 was last measured 2026-10-22.
 
-**Native kernels** (criterion, pliron vs an LLVM baseline taken minutes earlier):
+**Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|

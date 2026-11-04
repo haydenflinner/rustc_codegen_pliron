@@ -56,7 +56,7 @@ Read it before picking a task.
 | `pliron-cfg/` | the one-shot `PLIRON_*` env parse (`pass_enabled`, `env_*`, bisect counters, `PLIRON_OPT_FNS`); `DEFAULT_ON`/`DEFAULT_VALUES` are the single list of opt-in knobs that are on by default |
 | `vendor/` | patched Cranelift, regalloc2, pliron, rsasm, waffle; changes are marked `PLIRON:` in the source and listed in the crate's `PLIRON_PATCH.md` (`vendor/PLIRON_REV` pins pliron's upstream revision) |
 | `harness/` | gate, corpus, live dashboard, bisectors, compile-time and disk tools |
-| `bench/` | runtime kernels (criterion native, `bench/wasm/` node) |
+| `bench/` | runtime kernels (benchfmt/benchstat native, `bench/wasm/` node) |
 | `tests/` | `test.sh` programs (one dir per stanza) |
 | `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `seh-design.md` (planned real SEH catch), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
 
@@ -89,8 +89,12 @@ time, memory, code size, stack frames) in ~20 min and writes
 
 ### Speed of generated code (runtime parity)
 
-- `bench/run.sh [filter]` — native criterion kernels, pliron vs a saved
-  LLVM baseline, per-kernel change with significance. ~6 min for all.
+- `bench/run.sh [filter]` — native kernels (benchfmt::Suite, vendored
+  `benchfmt.rs`): `COUNT` steady-state `-benchtime` epochs per side,
+  `benchstat` per-kernel change with Mann-Whitney p-values, `B/op` and
+  `allocs/op` via `CountingAlloc`, `-cpuprofile`/`-memprofile` pprof.
+  Medians append to `bench/history.tsv` (commit it when a number moves).
+  ~8 min for all; `BENCHTIME`/`COUNT` env vars tune it.
 - `bench/wasm/run.sh [filter]` — same kernels on wasm32 in node.
 - To see why a kernel is slow: `PLIRON_CLIF=<fn substr>` dumps CLIF
   after every step; `rustc --emit obj` + `llvm-objdump -d` (or

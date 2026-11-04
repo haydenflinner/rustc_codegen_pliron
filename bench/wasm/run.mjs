@@ -1,7 +1,7 @@
 // node run.mjs <llvm.wasm> <pliron.wasm> [extra.wasm] [name-filter]
 //
 // Times every `k_<name>(iters)` export in the modules and prints a
-// comparison table, the wasm counterpart of bench/run.sh's criterion
+// comparison table, the wasm counterpart of bench/run.sh's benchfmt
 // run. `k_<name>_prep` (kernels whose input is consumed) is called
 // before each timed call and is not part of the timing. An optional
 // third module adds a second comparison column beside pliron.

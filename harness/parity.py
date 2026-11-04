@@ -8,7 +8,7 @@
 Usage: harness/parity.py [--skip native,wasm,ctime,stack] [--from-logs]
 
 Runs, one after another so they don't perturb each other (~20 min):
-  native  bench/run.sh        criterion kernels, pliron vs saved LLVM baseline
+  native  bench/run.sh        benchfmt epochs, pliron vs LLVM (benchstat)
   wasm    bench/wasm/run.sh   same kernels on wasm32 in node
   ctime   harness/ctime.py    compile time, peak RSS, machine-code bytes
   stack   harness/frames.py   frame bytes on functions both backends define
@@ -72,22 +72,38 @@ CARD = [
     ("COR", "correctness", 20),
 ]
 VERIFY = os.environ.get("PLIRON_VERIFY_OUT") or os.path.join(ROOT, "../rust-sh/verify-out")
-UNIT = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1e3}
 
 
 def parse_native(text):
-    """bench/run.sh prints criterion output twice: the LLVM run against its
-    previous self, then the pliron run against the fresh LLVM baseline.
-    The last block's `change` is pliron vs LLVM."""
+    """bench/run.sh tees two benchfmt outputs — LLVM epochs first, then
+    pliron epochs (each block starts with a `goos:` header). Per-kernel
+    ratio = median(pliron ns/op) / median(llvm ns/op)."""
+    # statistics imports bisect transitively; harness/bisect.py shadows it.
+    def median(v):
+        s = sorted(v)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    blocks = re.split(r"(?m)^goos:", text)[1:]
+    med = []
+    for block in blocks[:2]:
+        per = {}
+        for line in block.splitlines():
+            f = line.split()
+            if len(f) >= 4 and f[0].startswith("Benchmark"):
+                name = f[0][len("Benchmark"):].rsplit("-", 1)[0].lower()
+                try:
+                    per.setdefault(name, []).append(float(f[2]))
+                except ValueError:
+                    pass
+        med.append({k: median(v) for k, v in per.items()})
+    if len(med) < 2:
+        return {}
     rows = {}
-    pat = re.compile(r"^(\w+)\s+time:\s+\[\S+ \S+ ([\d.]+) (\S+) .*?\n\s+change: \[\S+ (\S+)%",
-                     re.M)
-    for m in pat.finditer(text):
-        name, t, u, ch = m.group(1), float(m.group(2)), m.group(3), m.group(4)
-        ch = float(ch.replace("−", "-").replace("+", ""))
-        ms = t * UNIT.get(u, 1.0)
-        r = 1 + ch / 100
-        rows[name] = {"pliron_ms": ms, "llvm_ms": ms / r, "ratio": r}
+    for name, plir_ns in med[1].items():
+        llvm_ns = med[0].get(name)
+        if llvm_ns:
+            rows[name] = {"pliron_ms": plir_ns * 1e-6, "llvm_ms": llvm_ns * 1e-6,
+                          "ratio": plir_ns / llvm_ns}
     return rows
 
 

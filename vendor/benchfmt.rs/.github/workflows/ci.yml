@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run clippy (pprof)
+        run: cargo clippy --all-targets --features pprof -- -D warnings
+      - name: Run tests (default)
+        run: cargo test
+      - name: Run tests (pprof)
+        run: cargo test --features pprof
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV (default)
+        run: cargo check --all-targets
+      - name: Check MSRV (pprof)
+        run: cargo check --all-targets --features pprof

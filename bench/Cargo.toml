@@ -10,7 +10,8 @@ autobenches = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-criterion = { version = "0.8", default-features = false }
+# benchfmt::Suite + CountingAlloc + pprof; vendored, see vendor/benchfmt.rs/PLIRON_PATCH.md.
+benchfmt = { path = "../vendor/benchfmt.rs", features = ["pprof"] }
 # varint_postcard kernel; same versions as the backend's own (src/lto.rs).
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
