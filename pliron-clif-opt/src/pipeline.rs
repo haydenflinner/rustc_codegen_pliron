@@ -2370,6 +2370,7 @@ fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     // the fixpoint can produce nothing.
     if an.shape_bits(&p.clctx.func) & shape::LOAD != 0 {
         loadfwd::LF_DUMP.with(|c| c.set(p.dump));
+        loadfwd::LF_SYM.with(|n| *n.borrow_mut() = p.fname.to_string());
         let breg_now = live_block_region(p);
         let (cfg, pf, ps) = an.lf_inputs(&p.clctx.func);
         p.stats.forwarded += loadfwd::run_deref(

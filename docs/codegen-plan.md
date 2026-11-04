@@ -1616,6 +1616,25 @@ builds spent four hours being killed and retried by the memory
 watchdog. Both flags stay opt-in until that run exists; the
 allocator-shim rule is default-on (gate + fuzz at defaults).
 
+Held-out A/B (10:00, 10 rounds, A/A floor 0.985): nocap3/pliron 0.999
+[0.988, 1.012], carry/pliron 1.000 [0.984, 1.010], both 1.000 —
+neutral; neither flag earns a default flip on these benches. And the
+run found a miscompile fuzz had not: rust-html-rewriter under
+`PLIRON_LOADPRE_CARRY=1` fails with "Tag should be a start tag".
+Bisected with a knob of its own (`PLIRON_LOADPRE_CARRY_LIMIT=N`,
+`PLIRON_LOADPRE_CARRY_ONLY=<sym>`; `PLIRON_OPT_BISECT` counts every
+gate in every crate and a limit that cuts other passes short breaks
+the build first) to one merge-climb in lol_html's
+`StateMachine::continue_from_bookmark`: the block loads `self.state`
+(a fn pointer), `try_call_indirect`s it (the callee stores the next
+state) and the loop edge comes straight back to that block. The climb
+to the dominator excluded the load's own block from the preservation
+check — correct for its prefix, which the caller vouches for, wrong
+for its tail when the region re-enters the block. `region_preserves`
+now requires the whole block when a region pred is the block itself.
+html-rewriter passes; a unit test holds the shape; 300 seeds with the
+flag pass.
+
 Open, found while cleaning up: a `rustc-ice` file from 02:21 (a regex
 held-out build under the nocapture debug run) holds the pipeline's
 `egraph broke `statics`` assertion (pipeline.rs:2480) on a

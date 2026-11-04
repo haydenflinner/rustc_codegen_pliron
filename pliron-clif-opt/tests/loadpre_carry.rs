@@ -106,3 +106,72 @@ fn field_load_carried_around_the_loop() {
     );
     assert_eq!(f.dfg.num_block_params(Block::from_u32(1)), 3, "{}", f.display());
 }
+
+/// The load's own block is a merge the loop re-enters, and the call after
+/// the load writes the location (lol_html's state machine: `self.state`
+/// loaded, then called, and the callee stores the next state). The climb
+/// to the dominator must not treat the block's tail as preserved.
+const SELF_CLOBBER: &str = "function %f(i64, i64) -> i64 {
+    sig0 = (i64) -> i64
+    sig1 = (i64)
+    fn1 = %g sig1
+block0(v0: i64, v1: i64):
+    brif v1, block1, block2
+block1:
+    store.i64 notrap v1, v0+16
+    jump block3
+block2:
+    call fn1(v0)
+    jump block3
+block3:
+    jump block4
+block4:
+    v3 = load.i64 notrap v0+16
+    v4 = call_indirect sig0, v3(v0)
+    brif v4, block5, block6
+block5:
+    jump block4
+block6:
+    return v4
+}";
+
+#[test]
+fn load_before_clobbering_call_in_reentered_block_stays() {
+    unsafe { std::env::set_var("PLIRON_LOADPRE_CARRY", "1") };
+    let mut f = cranelift_reader::parse_functions(SELF_CLOBBER).unwrap().remove(0);
+    let v0 = cranelift_codegen::ir::Value::from_u32(0);
+    let calls: Vec<Inst> = f
+        .layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter(|&i| f.dfg.insts[i].opcode().is_call())
+        .collect();
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&f);
+    let pf = pliron_clif_opt::proots::facts_cfg(&f, &cfg);
+    let ps = pliron_clif_opt::proots::alias_of(&pf);
+    let noalias: FxHashSet<_> = [v0].into_iter().collect();
+    let nocap: FxHashSet<(Inst, u32)> = calls.iter().map(|&c| (c, 0)).collect();
+    let deref: FxHashMap<_, (u64, bool)> = [(v0, (24, true))].into_iter().collect();
+    pliron_clif_opt::loadfwd::run_deref(
+        &mut f,
+        &cfg,
+        &pf,
+        &ps,
+        &noalias,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashMap::default(),
+        &FxHashMap::default(),
+        &pliron::cols::ColMap::default(),
+        &FxHashMap::default(),
+        &FxHashMap::default(),
+        &nocap,
+        &deref,
+    );
+    let in_b4 = f
+        .layout
+        .block_insts(Block::from_u32(4))
+        .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Load)
+        .count();
+    assert_eq!(in_b4, 1, "the load must stay after the clobbering call's back edge\n{}", f.display());
+}

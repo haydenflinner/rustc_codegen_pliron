@@ -622,6 +622,8 @@ thread_local! {
     /// `Pipe::dump` for the function loadfwd is running on: `PLIRON_LF_DEBUG=dump`
     /// prints the root verdicts and every escape site of that function only.
     pub static LF_DUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The function's symbol, for `PLIRON_OPT_BISECT_DEBUG` lines.
+    pub static LF_SYM: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 fn lf_dump() -> bool {
@@ -1627,6 +1629,13 @@ fn region_preserves(
     }
     let mut seen: FxHashSet<Block> = FxHashSet::default();
     let mut stack = vec![from];
+    // `from` excluded (`!incl_from`) means only its prefix up to the load
+    // is vouched for by the caller. If the region re-enters `from` — a
+    // cycle through it back to itself — its tail is on the path too and
+    // the whole block must preserve: lol_html's state machine loaded
+    // `self.state` in the block whose `try_call_indirect` then wrote it,
+    // and the loop edge came straight back to that block.
+    let mut reenters_from = false;
     while let Some(x) = stack.pop() {
         if x == top || !seen.insert(x) {
             continue;
@@ -1638,9 +1647,12 @@ fn region_preserves(
         if ps.is_empty() {
             return false;
         }
+        if ps.contains(&from) {
+            reenters_from = true;
+        }
         stack.extend(ps);
     }
-    true
+    !(reenters_from && !incl_from) || keeps(from)
 }
 
 /// The value `loc` holds at the end of `p` when it holds `seed` at the
@@ -1729,6 +1741,28 @@ fn region_value(
     }
     None
 }
+
+/// `PLIRON_LOADPRE_CARRY_LIMIT`: numbers every carried PRE and every climb
+/// attempt in this process; `false` once past the limit.
+fn carry_app(kind: &str, b: Block, loc: Loc) -> bool {
+    // `PLIRON_LOADPRE_CARRY_ONLY=<substr>`: only in matching symbols.
+    if let Some(only) = &*CARRY_ONLY
+        && !LF_SYM.with(|s| s.borrow().contains(only.as_str()))
+    {
+        return false;
+    }
+    let Some(limit) = *CARRY_LIMIT else { return true };
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    LF_SYM.with(|s| eprintln!("carry-app {n} {kind} {} {b} {loc:?}", s.borrow()));
+    n <= limit
+}
+
+static CARRY_ONLY: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("PLIRON_LOADPRE_CARRY_ONLY").ok());
+
+static CARRY_LIMIT: std::sync::LazyLock<Option<u64>> =
+    std::sync::LazyLock::new(|| std::env::var("PLIRON_LOADPRE_CARRY_LIMIT").ok().and_then(|v| v.parse().ok()));
 
 static LOADPRE_DEBUG: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("PLIRON_LOADPRE_DEBUG").is_some());
@@ -1852,6 +1886,9 @@ fn edge_pre_inner(
         {
             return None;
         }
+        if !carry_app("merge-climb", b, loc) {
+            return None;
+        }
         let mut m = b;
         for _ in 0..8 {
             if dom.is_none() {
@@ -1926,6 +1963,9 @@ fn edge_pre_inner(
         if !*LOADPRE_CARRY {
             return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None, None, false);
         }
+        if !carry_app("chain-climb", b, loc) {
+            return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None, None, false);
+        }
         // Climb while the merge has the loc on no pred: each step needs
         // every block between the dominator and the merge to preserve it.
         let mut m = m;
@@ -1984,6 +2024,15 @@ fn edge_pre_inner(
         })
         .collect();
     if missing.iter().zip(&carried).any(|(&(p, _), c)| p == b && c.is_none()) {
+        return None;
+    }
+    // `PLIRON_LOADPRE_CARRY_LIMIT=N`: only the first N loop-carried PREs
+    // of this process apply (a bisect knob of its own: `PLIRON_OPT_BISECT`
+    // counts every gate in every crate, and a limit that cuts other
+    // passes short breaks the build before it reaches these). Each
+    // application prints `carry-app <n> <symbol>` to stderr when the
+    // limit is set.
+    if carried.iter().any(|c| c.is_some()) && !carry_app("carried", b, loc) {
         return None;
     }
     let real = carried.iter().filter(|c| c.is_none()).count();
