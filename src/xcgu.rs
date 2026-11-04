@@ -544,6 +544,13 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     // mono item can be dead-stripped in its home CGU), so they may still
     // need to become local copies themselves.
     let mut seen: FxHashSet<MonoItem<'tcx>> = frontier.iter().map(|&c| MonoItem::Fn(c)).collect();
+    // `PLIRON_XCGU_XDEPS=1`: also descend into external deps of copies.
+    // A copy emitted in a CGU whose caller binds a local copy instead of
+    // the home definition keeps its `visible` deps as out-of-line calls,
+    // which leaves them opaque to the inliner and IPO analyses in this
+    // CGU; the home CGU's own copy inlines them. Making the external deps
+    // copies too closes that gap at the cost of more emit.
+    let xdeps = crate::env_is("PLIRON_XCGU_XDEPS", "1");
     let mut candidates = Vec::new();
     let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
     let mut needed: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
@@ -569,7 +576,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 if let MonoItem::Fn(c2) = u.node
                     && !ours.contains_key(&u.node)
                     && seen.insert(u.node)
-                    && (inlined.contains(&u.node) || !externs.contains(&u.node))
+                    && (inlined.contains(&u.node) || !externs.contains(&u.node) || xdeps)
                 {
                     size_report(c2);
                     if copyable(tcx, c2, limit) {
