@@ -83,6 +83,36 @@ fn hit(r: usize) {
         h.set(a);
     });
 }
+
+/// `PLIRON_RULE_TRACE=1`: the instruction a counted rule fires on, as it
+/// stands before the rewrite, with its operands' defining instructions
+/// (`trace:<rule> <inst> <= [defs]` under `pliron::stats`), so the shapes
+/// a migrated rule still leaves for the late sweep can be classified.
+fn hit_trace(r: usize, func: &Function, inst: Inst) {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_RULE_TRACE", "1"));
+    if *ON && pliron_cfg::tracing_on() {
+        let args: Vec<String> = func
+            .dfg
+            .inst_args(inst)
+            .iter()
+            .map(|&a| {
+                let a = func.dfg.resolve_aliases(a);
+                match func.dfg.value_def(a).inst() {
+                    Some(d) => format!("{}", func.dfg.display_inst(d)),
+                    None => format!("{a} (param)"),
+                }
+            })
+            .collect();
+        tracing::info!(
+            target: "pliron::stats",
+            "trace:{} {} <= [{}]",
+            RULE_NAMES[r],
+            func.dfg.display_inst(inst),
+            args.join(" | ")
+        );
+    }
+}
 /// Drain the counters: `(name, hits)` for every rule that fired.
 pub fn take_rule_hits() -> Vec<(&'static str, usize)> {
     RULE_HITS.with(|h| {
@@ -1558,6 +1588,7 @@ fn icmpk(pos: &mut FuncCursor, inst: Inst, cc: IntCC, x: Value, c: i64) -> bool 
     if consumed == 0 {
         return false;
     }
+    hit_trace(R_ICMPK, pos.func, inst);
     let bits = ty.bits().min(64);
     if bits < 64 {
         koff = ((koff as u64) & ((1u64 << bits) - 1)) as i64;
@@ -1770,6 +1801,7 @@ fn addnorm(pos: &mut FuncCursor, inst: Inst) -> bool {
             continue;
         };
         let rest = args[1 - i];
+        hit_trace(R_ADDNORM, pos.func, inst);
         match opcode {
             Opcode::Iadd => {
                 pos.func.replace(inst).isub(rest, y);
@@ -1811,6 +1843,7 @@ fn addnorm(pos: &mut FuncCursor, inst: Inst) -> bool {
         let Some(l) = inner_lin(pos.func, args[xi]) else {
             continue;
         };
+        hit_trace(R_ADDNORM, pos.func, inst);
         match (l, form) {
             // `(y+k1) + k2` / `(y+k1) - k2` → `y + (k1±k2)`
             (LinK::YK(y, k1), Outer::AddK) => {

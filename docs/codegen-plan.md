@@ -1367,7 +1367,24 @@ step's compile-time cost on rust-compression is within noise (median
 5.3 s either way, 3 builds each). `try_call` functions are still
 skipped (the vendored egraph predates exception edges). Gate and fuzz
 with `PLIRON_EGRAPH=1 PLIRON_EGRAPH_RULES=1 PLIRON_EGRAPH_MIGRATE=1
-PLIRON_REKEY=1` after the fixes: gate 94/94, fuzz 400/400. All four stay opt-in until
+PLIRON_REKEY=1` after the fixes: gate 94/94, fuzz 400/400.
+
+Where the survivors come from (`PLIRON_RULE_TRACE=1`, the instruction
+and its operand defs at each late hit): 3,996 of the 5,071 late addnorm
+hits are plain `(x + k1) + k2` on i64, the migrated rule's own shape,
+plus 487 on i32; the icmpk survivors are likewise `icmp eq/ne (iadd x,
+k), c`. They are created by the loop passes (ivrefold, looprot,
+latchspec param refolds) after the first egraph round, so the round
+never sees them. A second round right before the final sweep
+(`PLIRON_EGRAPH2=1`, opt-in, same step function) takes half: late
+addnorm 5,071 -> 2,203, icmpk 560 -> 275, size 2205184 -> 2205184
+(unchanged), and the second round alone, without the first, gives
+2,166 / 301, so for these two rules the early round contributes little
+and the late one is the one that matters. The rest sit in functions the step still skips: the
+samples (`p + 1 + 1`, `p + 2 + 1`, unrolled address chains) are in
+brotli's hot functions, which carry `try_call` for their unwinding
+calls. Gate 94/94 and fuzz 400/400 with all five knobs on. All five
+knobs stay opt-in until
 the held-out run (armed to start on AC power) gives intervals for
 rekey, egraph alone, and egraph with the migrated rules.
 With the step on, the counters (`rule:<name>` under PLIRON_STATS,

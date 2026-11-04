@@ -4734,6 +4734,27 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_coldret,
             site: std::sync::OnceLock::new(),
         },
+        // A second egraph round after the loop passes (`PLIRON_EGRAPH2=1`,
+        // opt-in): the late sweep's addnorm/icmpk survivors are chains
+        // the loop passes create after the first round (`(x + k1) + k2`
+        // from ivrefold/looprot param refolds: 3,996 of 5,071 on
+        // rust-compression), which the migrated ISLE rules only see
+        // here. Measured against the late sweep's counters, size, and
+        // the elaborator's placement (docs/codegen-plan.md "Direction").
+        Step {
+            name: "egraph2",
+            bisect: Some("egraph2"),
+            stat: "",
+            verify: false,
+            mutates: true,
+            cached: true,
+            shape: 0,
+            any: 0,
+            creates: u32::MAX,
+            gate: Gate::OptIn("PLIRON_EGRAPH2"),
+            run: s_egraph,
+            site: std::sync::OnceLock::new(),
+        },
         // Legality, not optimization: `iconst.i128` reaches isel with no
         // lowering rule and panics. Any pass can mint one, so sweep last.
         Step {
