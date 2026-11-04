@@ -1602,6 +1602,16 @@ being killed and retried by the memory watchdog. Both flags stay
 opt-in until that run exists; the allocator-shim rule is default-on
 (gate + fuzz at defaults below).
 
+Open, found while cleaning up: a `rustc-ice` file from 02:21 (a regex
+held-out build under the nocapture debug run) holds the pipeline's
+`egraph broke `statics`` assertion (pipeline.rs:2480) on a
+`u0:0(i32) -> i32 system_v` function with two colocated symbol gvs —
+a non-aarch64 calling convention, so a build-script or proc-macro
+target. The build itself completed on retry. Not reproduced yet; the
+mid-pipeline egraph is default-on since 31d01f5, so this needs a
+repro (`PLIRON_CLIF` on that symbol under the same build) before the
+next egraph change.
+
 **Level 2, built (11-04 early).** `jumpthread::SiteFacts` on the
 `Pipe` (`site_facts`): `nonnull: value -> [site]`, `derived: value ->
 [(base, site)]`, a site being a `ProgramPoint` (the original's
