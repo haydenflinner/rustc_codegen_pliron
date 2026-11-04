@@ -1594,13 +1594,27 @@ the nocapture unit tests pass; gate passes with both flags except the
 new `loadpre_carry` test (a CLIF opcode typo, fixed); fuzz 2,000 seeds
 with both flags: 1,983 pass, 17 `compile-timeout`, all attributable to
 `PLIRON_LOADPRE_CARRY` (seed 74680: timeout with it, pass with
-`PLIRON_NOCAP3` alone or at defaults) — the region walks re-ran a
-block's transfer per load, per pred, per climb step. Now memoized by
-(block, loc, seed) with a 4,000-transfer budget per function. The
-held-out A/B did not finish: its variant builds spent four hours
-being killed and retried by the memory watchdog. Both flags stay
-opt-in until that run exists; the allocator-shim rule is default-on
-(gate + fuzz at defaults below).
+`PLIRON_NOCAP3` alone or at defaults). First guess, wrong: the region
+walks re-ran a block's transfer per load, per pred, per climb step;
+memoizing them by (block, loc, seed) with a 4,000-transfer budget per
+function left 12 of the 17 seeds timing out. The real cause
+(`PLIRON_LOADPRE_DEBUG` on the seed for 75 s: 1.1M lines for one
+`f64` load, 324k of them `merge climb to`): the climb was nested. Each
+merge a climb reached was evaluated by a recursive `edge_pre`, which
+started its own eight-step climb from there — the same dominator chain
+the outer loop was about to walk — so the work was eight-way
+exponential in depth. Walks are now confined to the outermost call
+(`climb` flag), which loses nothing: the inner climbs only revisited
+the outer one's next steps. Then a negative memo per (merge, loc,
+climb) so a later load of the same loc never redoes a failed climb.
+Seed 74680 compiles in 1-3 s either way (was >300 s); all 17 seeds
+pass; 600 + 300 further seeds with the flag: every failure is a
+program stock rustc also rejects (rustlantis's `static mut` /
+`LazyLock` shape under this nightly) or a transient watchdog kill
+that passes on rerun. The held-out A/B did not finish: its variant
+builds spent four hours being killed and retried by the memory
+watchdog. Both flags stay opt-in until that run exists; the
+allocator-shim rule is default-on (gate + fuzz at defaults).
 
 Open, found while cleaning up: a `rustc-ice` file from 02:21 (a regex
 held-out build under the nocapture debug run) holds the pipeline's

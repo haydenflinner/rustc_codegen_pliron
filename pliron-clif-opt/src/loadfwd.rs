@@ -1478,6 +1478,10 @@ struct Pre<'a> {
     /// seed) makes repeated walks over the same region free.
     budget: std::cell::Cell<usize>,
     memo: std::cell::RefCell<FxHashMap<(Block, Loc, Value), Option<Value>>>,
+    /// Merges where PRE of a loc already failed: `out` is fixed for the
+    /// pass and the other inputs only tighten, so a retry from the next
+    /// load of the same loc would redo the same climb for the same answer.
+    failed: FxHashSet<(Block, Loc, bool)>,
 }
 
 /// Region-walk budget per function (block transfers).
@@ -1769,7 +1773,42 @@ fn edge_pre(
     deref: &FxHashMap<Value, (u64, bool)>,
     preserves: Option<&dyn Fn(&Function, Block, Loc) -> bool>,
     carry: Option<&dyn Fn(&Function, Block, Loc, Value) -> Option<Value>>,
+    climb: bool,
 ) -> Option<Value> {
+    // Keyed by `climb` too: the merge-only evaluation of a block failing
+    // says nothing about a climb that starts from it.
+    if pre.failed.contains(&(b, loc, climb)) {
+        return None;
+    }
+    let r = edge_pre_inner(func, cfg, dom, out, reach, pre, b, i, loc, deref, preserves, carry, climb);
+    if r.is_none() {
+        pre.failed.insert((b, loc, climb));
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edge_pre_inner(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dom: &mut Option<DominatorTree>,
+    out: &FxHashMap<Block, FxHashSet<Loc>>,
+    reach: &FxHashSet<Block>,
+    pre: &mut Pre,
+    b: Block,
+    i: Inst,
+    loc: Loc,
+    deref: &FxHashMap<Value, (u64, bool)>,
+    preserves: Option<&dyn Fn(&Function, Block, Loc) -> bool>,
+    carry: Option<&dyn Fn(&Function, Block, Loc, Value) -> Option<Value>>,
+    climb: bool,
+) -> Option<Value> {
+    // `climb`: this is the outermost call for the load, allowed to walk
+    // upward (single-pred chain, dominator climb). The calls it makes
+    // for the merges it reaches evaluate that merge only: a climb inside
+    // a climb multiplied the walk by the depth at every level (rustlantis
+    // seed 74680: one `f64` load produced 1.1M climb steps, past the fuzz
+    // compile timeout).
     // Inside a dereferenceable parameter's range, by the loc's root and
     // root-relative offset (the load's own address operand may be a copy
     // or a derived pointer the `deref` table doesn't key).
@@ -1803,7 +1842,7 @@ fn edge_pre(
     // merge's compensating loads run on paths that never reach this load,
     // so the load must be speculatable. regex's `follow_epsilons` reloaded
     // its `&mut SparseSet`'s buffer pointer and length every iteration.
-    if !avail && missing.len() >= 2 && *LOADPRE_CARRY && *LOADPRE_UP {
+    if climb && !avail && missing.len() >= 2 && *LOADPRE_CARRY && *LOADPRE_UP {
         // The load's own block is a merge with the loc on no pred: climb
         // the dominator tree from here (the chain walk below is for the
         // single-pred case).
@@ -1829,7 +1868,7 @@ fn edge_pre(
                 eprintln!("edge_pre {b} {i} {loc:?}: merge climb to {idom}");
             }
             m = idom;
-            if let Some(v) = edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, Some(preserves), carry) {
+            if let Some(v) = edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, Some(preserves), carry, false) {
                 return Some(v);
             }
             if cfg.pred_iter(m).any(|p| out.get(&p.block).is_some_and(|o| o.contains(&loc))) {
@@ -1838,7 +1877,7 @@ fn edge_pre(
         }
         return None;
     }
-    if !avail && missing.len() == 1 && *LOADPRE_UP {
+    if climb && !avail && missing.len() == 1 && *LOADPRE_UP {
         let Some(preserves) = preserves else { return None };
         let off = match func.dfg.insts[i] {
             InstructionData::Load { offset, .. } => i64::from(i32::from(offset)),
@@ -1885,13 +1924,13 @@ fn edge_pre(
             eprintln!("edge_pre {b} {i} {loc:?}: upward to {m} via {chain:?}");
         }
         if !*LOADPRE_CARRY {
-            return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None, None);
+            return edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, None, None, false);
         }
         // Climb while the merge has the loc on no pred: each step needs
         // every block between the dominator and the merge to preserve it.
         let mut m = m;
         for _ in 0..8 {
-            if let Some(v) = edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, Some(preserves), carry) {
+            if let Some(v) = edge_pre(func, cfg, dom, out, reach, pre, m, i, loc, deref, Some(preserves), carry, false) {
                 return Some(v);
             }
             if cfg.pred_iter(m).any(|p| out.get(&p.block).is_some_and(|o| o.contains(&loc))) {
@@ -2225,6 +2264,7 @@ fn pre(
         inserted: FxHashMap::default(),
         budget: std::cell::Cell::new(CARRY_BUDGET),
         memo: std::cell::RefCell::new(FxHashMap::default()),
+        failed: FxHashSet::default(),
     };
     let mut dom: Option<DominatorTree> = None;
     let mut fwd: Vec<(Inst, Value)> = Vec::new();
@@ -2331,7 +2371,7 @@ fn pre(
                     } else if !clobbered
                         && writes.iter().all(|&(w, ms)| !may_write_iso(w, ms, loc, iso, ncc))
                         && let Some(v) =
-                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves), Some(&carry))
+                            edge_pre(func, cfg, &mut dom, &out, &reach, &mut pre, b, i, loc, deref, Some(&preserves), Some(&carry), true)
                     {
                         fwd.push((i, v));
                         st.insert(loc, St::Local(v));
