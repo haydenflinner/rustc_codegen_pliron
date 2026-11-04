@@ -231,6 +231,7 @@ where
                 debug_assert_eq!(self.func.dfg.inst_results(inst).len(), 1);
                 let result = self.func.dfg.first_result(inst);
                 self.value_to_opt_value[result] = orig_result;
+                self.stats.renames.push((orig_result, result, false));
                 self.available_block[result] = self.available_block[orig_result];
             }
             orig_result
@@ -290,6 +291,9 @@ where
                 depth,
             );
             self.value_to_opt_value[result] = opt_value;
+            if opt_value != result {
+                self.stats.renames.push((opt_value, result, false));
+            }
             opt_value
         }
     }
@@ -520,6 +524,7 @@ where
                             // Hit in GVN map -- reuse value.
                             self.stats.skeleton_inst_gvn += 1;
                             self.value_to_opt_value[result] = orig_result;
+                            self.stats.renames.push((orig_result, result, false));
                             self.available_block[result] = self.available_block[orig_result];
                             trace!(" -> merges result {} to {}", result, orig_result);
                         }
@@ -561,6 +566,7 @@ where
                     inst, result, new_result
                 );
                 self.value_to_opt_value[result] = new_result;
+                self.stats.renames.push((new_result, result, false));
                 self.available_block[result] = self.available_block[new_result];
                 Some(SkeletonInstSimplification::Remove)
             }
@@ -1314,6 +1320,15 @@ impl<'a> CtxHash<(Type, InstructionData)> for GVNContext<'a> {
 /// Statistics collected during egraph-based processing.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Stats {
+    /// PLIRON: `(survivor, original, is_clone)` value pairs the pass
+    /// created. A clone (elaboration's `clone_inst`, remat) is the same
+    /// instruction re-issued on the original's paths; a merge or rewrite
+    /// (GVN to an earlier equal value, a rule's replacement) makes the
+    /// survivor the original's value at the original's uses only. The
+    /// pipeline carries facts keyed on the original accordingly: site
+    /// facts (derived/non-null) go to clones outright and to merges only
+    /// under its site rule. Taken by the pipeline after the pass.
+    pub renames: Vec<(Value, Value, bool)>,
     pub(crate) pure_inst: u64,
     pub(crate) pure_inst_deduped: u64,
     pub(crate) pure_inst_subsume: u64,

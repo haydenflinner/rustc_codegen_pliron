@@ -131,6 +131,8 @@ fn main() {
         fn_names: &[],
         region_parent: &e6,
         lifetimes: &mut lifetimes,
+        renames: Vec::new(),
+                site_facts: Default::default(),
         nocap: &e7,
         dbg_slots: &Default::default(),
         tcfg: isa.frontend_config(),

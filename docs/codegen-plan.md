@@ -1404,13 +1404,134 @@ Held-out on AC power (10 rounds, 3 layouts, 2 pads; A/A floor 1.000
 | + try_call functions | 1.016 [1.011, 1.022]* | compression 1.048*, json 1.086* |
 
 So `rekey` is on by default now (`PLIRON_REKEY=0` disables), and the
-mid-pipeline egraph step is not: it is correct and cheap to compile but
-costs 1.5% at run time, concentrated in compression and json, which is
-the placement fight step 2 predicted (its elaborator hoists and
-rematerializes by its own rules, and the loop passes after it undo or
-compound that). The rules and knobs stay opt-in; the next piece of work
-is step 2, diagnosed from a per-function profile of the egraph build of
-compression against base.
+mid-pipeline egraph step is not: correct and cheap to compile, 1.5%
+slower at run time, concentrated in compression and json.
+
+**The mechanism, traced (same night).** The profile put the whole
+compression loss in one function: `FindMatchLengthWithLimit` (brotli's
+zip/enumerate byte compare), 598 -> 795 samples. Its loop had two exit
+tests per iteration instead of one: the zip iterator's niche test
+(`icmp eq (select f, p, 0), 0`) survived, and ivrefold then turned it
+into `i == -p`. Per-step dumps of that function showed the test is
+folded in base by `nullfold2` (the late null fold inside jtround) and
+never in the egraph build, and the jumpthread trace gave the verdict:
+base `nulltest: x=v196 nn=true`, egraph `x=v214 nn=false`. `v214` is
+edgefwd's clone of the pointer `v99 = iadd v0, i` into the predecessor
+block; the original carried `derived[v99] = v0` with `v0` non-null, the
+clone carried nothing. Not a placement fight at all: a renumbering
+pass dropped a side-table fact, which is step 1's thesis in a second
+form. The pipeline's `carry_one` treats derived/non-null as *site*
+facts and only copies them within a block (sound for merged loads whose
+`!nonnull` holds at one site), so even the egraph's own renames, once
+recorded (`egraph::Stats::renames`, `Context::egraph_renames`), did not
+reach the clone. Fix: a pipeline-level clone log (`Pipe::renames`,
+`(survivor, original)` pairs; edgefwd's forwarder clones and the
+egraph's merges, rewrites and clones record into it) carried after
+every step by `carry_renames`, which copies derived/non-null outright
+for clones (a clone is the same computation on the same paths; its uses
+are the original's, rewritten) and the rest through `carry_one`
+(`PLIRON_CLONE_SITEFACTS=0` keeps the site rule for clones). With it the
+test folds with the egraph on (`after nullfold2: eq=0`) and the function
+is back near base (633 vs 594 samples, from 776). The carry also
+changes the default pipeline, since edgefwd clones in base too.
+
+The first version carried derived/non-null outright for *every* pair,
+and regex built with the egraph then segfaulted while rust-protobuf's
+proc-macro crates panicked: a GVN merge gives the survivor the
+original's uses, but the survivor also has its own earlier uses that a
+`!nonnull` load's site fact never covered (the serde_derive
+`get_member` fold `carry_one` documents). Three regex builds pinned
+it: egraph + outright carry crashes, egraph with the site rule kept or
+with no carry runs. The pairs are now tagged: elaboration clones,
+remat and edgefwd clones are `is_clone` and carry outright (a clone is
+the original instruction re-issued on its own paths); the egraph's
+merges and rewrites go through `carry_one`'s site rule. With that,
+regex runs and the zip loop's test still folds.
+
+**The finer version to build next (level 2): site-qualified facts.**
+The facts are properties of a value *at the points a site justified*
+(`!nonnull` at the load, inbounds at the offset computation); the
+tables key them by value alone and approximate the rest positionally
+("same block, original first"). Key them by (value, justifying site)
+and answer queries with dominance (`w` non-null at use `u` iff some
+(w, s) has `s` dominating `u`). A merge then carries the original's
+fact to the survivor *at the original's site* (exactly the original's
+uses, nothing earlier), a clone at the clone's own site, and no
+cross-block rule remains. Strictly better than LLVM's GVN, which
+intersects metadata on the survivor and loses the stronger fact at the
+replaced uses. Cost: the `NonNull` query and the `derived` lookups
+(about fifty sites in jumpthread) take the use point; the callers
+already hold a dominator tree. Level 3, facts as IR flags (`inbounds`
+on the add, `nonnull` in `MemFlags`), is the version no pass can
+forget, at the price of a vendored IR change and LLVM's intersection
+weakness.
+
+The clone/merge-tagged carry, validated (11-04, 00:41, AC, A/A 0.996
+[0.991, 1.000]): gate pending its rerun (a test dispatcher had the old
+edgefwd signature), fuzz 400/400 at defaults and 2,000/2,000 with the
+egraph knobs, every held-out program builds and runs with the egraph
+on. Held-out: `nocarry` 1.000 [0.996, 1.004] of base, so the carry
+costs nothing on the default path; `egraph` 1.013 [1.009, 1.017] with
+compression now 0.998 [0.988, 1.005] and regex 0.996, and the whole
+remainder in json: 1.102 [1.089, 1.111]. The egraph's second mechanism
+lives in json; its profile against base is next.
+
+**json's mechanism (11-04, 00:50).** Profile: `serialize_str` 1,136 ->
+1,610 samples, nothing else moved. Its per-byte escape-table scan runs
+7 instructions in base and 14 with the egraph: a second exit test
+(`sub x23, len, i; cbz`) on top of `cmp i, len; b.hs`, plus the table
+address rematerialized per iteration. Step dumps: the check is the
+slice index's remaining-length test, `v198 = icmp ne (isub len, i), 0;
+brif v198`, which celim removes in base (the loop guard implies it).
+The egraph folds `brif (icmp ne x, 0)` to `brif x`, and celim, like
+every pliron pass that reasons about a branch, keys on the compare; the
+final CLIF has exactly one compare-less `brif` in that function with
+the egraph and none without. Fix at the boundary: `egraph_recanon` in
+`s_egraph` spells `brif c` with `c` wider than i8 back as `brif (icmp
+ne c, 0)` (pliron's conditions are i8, so a wider condition can only be
+the folded form; `PLIRON_EGRAPH_RECANON=0` leaves it). Same family as
+the lost fact: the egraph's canonical form is not the pipeline's, and
+the pipeline's form is the contract its passes were written against.
+With the re-canonicalization the check is gone from the final CLIF and
+`serialize_str` is at parity (1,126 vs 1,165 samples). The combined
+state (tagged carry, site facts, re-canonicalization), validated 11-04
+01:33 on AC (A/A 1.000 [0.994, 1.003]): gate 94/94 at defaults and
+with the knobs, fuzz 400/400 at defaults; the 2,000-seed sweep with the
+knobs reported 163 "compile-errors" in one window where even stock
+rustc failed, the memory watchdog under an overlapping test build
+again (a rerun of that window is the check). Held-out:
+
+| variant vs base | geomean | notable |
+|---|---|---|
+| nocarry | 0.998 [0.994, 1.001] | the carry itself is free |
+| egraph (mid-pipeline step on) | 1.004 [1.000, 1.008] | html 1.015* with the A/A also 1.016* there; json 1.006, compression 1.003 |
+| egraph + rules + migrate + round 2 | 1.000 [0.996, 1.005] | blind-sig 0.982*, compression 0.985 |
+
+From 1.016 to neutral by two root-cause fixes, both of the "a pass
+dropped or re-spelled what the next pass needed" kind, neither a
+placement fight. The migrated form (all four knobs) is now the
+candidate default: the egraph runs mid-pipeline on every function, the
+first batch of pure rules lives in ISLE, and the early sweep no longer
+runs them.
+
+**Level 2, built (11-04 early).** `jumpthread::SiteFacts` on the
+`Pipe` (`site_facts`): `nonnull: value -> [site]`, `derived: value ->
+[(base, site)]`, a site being a `ProgramPoint` (the original's
+defining instruction, or its block for a param). `carry_one` records
+there exactly where its site rule refused the plain carry, and carries
+an original's own site facts on to the survivor; `NonNull::with_sites`
+takes the table plus a dominator tree, and `is_m_at(v, at)` answers
+"non-null at `at`" with the plain facts or any site that dominates
+`at` (`is_deps_at` threads the point through the select/derived walk,
+`site_derived` extends the inbounds chain the same way). The null
+folds (`fold_null_tests`, early and late) query at the test's own
+instruction, the param-null path at the predecessor's terminator; the
+seeding fixpoint and the threading rounds keep the plain answers. Test
+`pliron-clif-opt/tests/sitefacts.rs` (no fold from the plain tables,
+fold from a dominating site, no fold from a non-dominating one). The
+functional check is the zip loop with the clone-outright rule turned
+off (`PLIRON_CLONE_SITEFACTS=0`): edgefwd's clone then reaches the
+late fold only through the site-qualified path.
 With the step on, the counters (`rule:<name>` under PLIRON_STATS,
 patch-style per-rule hit counters in clifpeep) say: the early sweep's
 10,493 addnorm and 101 icmpk hits leave only 184 and 99 survivors for

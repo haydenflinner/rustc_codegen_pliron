@@ -418,6 +418,8 @@ fn with_pipe<R>(
         region_parent: &e6,
         inst_region: Default::default(),
         lifetimes: &mut lifetimes,
+        renames: Vec::new(),
+                site_facts: Default::default(),
         nocap: &e7,
         edge_kills: Vec::new(),
         dbg_slots: &Default::default(),

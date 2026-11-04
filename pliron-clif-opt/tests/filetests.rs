@@ -48,7 +48,7 @@ fn pass(name: &str) -> Pass {
             let dt = DominatorTree::with_function(f, &cfg);
             clifpeep::dgvn(f, &dt)
         },
-        "edgefwd" => edgefwd::run,
+        "edgefwd" => |f| edgefwd::run(f, &mut Vec::new()),
         "vrp" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::vrp::run(f, &mut an)

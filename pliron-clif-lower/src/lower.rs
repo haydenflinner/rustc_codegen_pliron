@@ -986,6 +986,8 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 region_parent: &sh.region_parent,
                 inst_region: Default::default(),
                 lifetimes: &mut j.lifetimes,
+                renames: Vec::new(),
+                site_facts: Default::default(),
                 nocap: &j.nocap,
                 edge_kills: Vec::new(),
                 dbg_slots: &j.dbg_slots,

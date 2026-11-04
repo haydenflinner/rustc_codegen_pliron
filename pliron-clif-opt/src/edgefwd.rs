@@ -256,7 +256,7 @@ fn same_value(func: &Function, a: Value, b: Value) -> bool {
 /// incoming edges), but the body is pure — clone it into each predecessor
 /// and retarget. This is the residual shape left after `bypass_round`
 /// (shared `-1`/`8` constants fed to merged error-path blocks).
-fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
+fn remat_round(func: &mut Function, cfg: &ControlFlowGraph, renames: &mut Vec<(Value, Value, bool)>) -> usize {
     const MAX_BODY: usize = 4;
     let domtree = DominatorTree::with_function(func, cfg);
     let entry = func.layout.entry_block();
@@ -490,6 +490,11 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
                     func.set_srcloc(ni, func.srcloc(i));
                     func.dfg.make_inst_results(ni, ctv);
                     func.layout.insert_inst(ni, pinst);
+                    // The clone computes the original's value: facts keyed
+                    // on the original carry to it (`Pipe::renames`).
+                    for (&nr, &or) in func.dfg.inst_results(ni).iter().zip(func.dfg.inst_results(i).iter()) {
+                        renames.push((nr, func.dfg.resolve_aliases(or), true));
+                    }
                     let nargs: Vec<Value> = func
                         .dfg
                         .inst_args(ni)
@@ -553,11 +558,11 @@ fn remat_round(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
 /// Retarget edges past forwarder blocks, then delete the ones left without
 /// predecessors. Runs to a fixpoint so forwarder chains collapse end to end.
 /// Returns edges retargeted plus traps inlined.
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, renames: &mut Vec<(Value, Value, bool)>) -> usize {
     let mut total = inline_trap_tails(func);
     for _ in 0..16 {
         let cfg = ControlFlowGraph::with_function(func);
-        let n = bypass_round(func, &cfg) + remat_round(func, &cfg);
+        let n = bypass_round(func, &cfg) + remat_round(func, &cfg, renames);
         total += n;
         let removed = remove_unreachable_blocks(func);
         if n == 0 && removed == 0 {

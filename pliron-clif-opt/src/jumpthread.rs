@@ -359,9 +359,57 @@ fn nz_test_of(func: &Function, c: Value, depth: u32) -> Option<(Value, bool)> {
     }
 }
 
+/// Site-qualified facts (docs/codegen-plan.md "Direction", level 2). A
+/// `!nonnull` load result or an inbounds offset is non-null *at the
+/// points its site justifies*; the plain tables (`nonnull`, `derived`)
+/// key facts by value and so only hold them where the value's own
+/// definition covers every use. When a pass merges a value into a
+/// survivor defined elsewhere (`carry_one`'s site rule refuses the plain
+/// carry) the fact still holds at the original's uses: record it here
+/// with the original's site, and `NonNull` answers queries at a use
+/// point by dominance (`site` dominates the use).
+#[derive(Default, Clone)]
+pub struct SiteFacts {
+    pub nonnull: FxHashMap<Value, Vec<ProgramPoint>>,
+    pub derived: FxHashMap<Value, Vec<(Value, ProgramPoint)>>,
+}
+
+impl SiteFacts {
+    pub fn is_empty(&self) -> bool {
+        self.nonnull.is_empty() && self.derived.is_empty()
+    }
+    pub fn add_nonnull(&mut self, v: Value, s: ProgramPoint) {
+        let e = self.nonnull.entry(v).or_default();
+        if !e.contains(&s) {
+            e.push(s);
+        }
+    }
+    pub fn add_derived(&mut self, v: Value, base: Value, s: ProgramPoint) {
+        let e = self.derived.entry(v).or_default();
+        if !e.contains(&(base, s)) {
+            e.push((base, s));
+        }
+    }
+}
+
+/// A memo key for a `(value, use point)` query.
+pub type AtKey = (Value, (bool, u32));
+fn at_key(v: Value, at: ProgramPoint) -> AtKey {
+    use cranelift_codegen::entity::EntityRef;
+    match at {
+        ProgramPoint::Inst(i) => (v, (false, i.index() as u32)),
+        ProgramPoint::Block(b) => (v, (true, b.index() as u32)),
+    }
+}
+
 pub struct NonNull<'a> {
     loads: &'a FxHashSet<Value>,
     derived: &'a VMap<Value>,
+    /// Site-qualified facts and the dominator tree that answers "does
+    /// the site cover this use" (`with_sites`); `None` keeps the plain
+    /// value-keyed answers.
+    sites: Option<&'a SiteFacts>,
+    dt: Option<DominatorTree>,
     params: FxHashSet<Value>,
     /// `PLIRON_NN_ADDR`, read once — `pass_enabled` does a TLS-tracked
     /// lookup per call, which is too hot inside `is_deps`.
@@ -402,6 +450,8 @@ impl<'a> NonNull<'a> {
         let mut nn = NonNull {
             loads,
             derived,
+            sites: None,
+            dt: None,
             params: FxHashSet::default(),
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
             nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
@@ -543,6 +593,8 @@ impl<'a> NonNull<'a> {
         NonNull {
             loads,
             derived,
+            sites: None,
+            dt: None,
             params,
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
             nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
@@ -560,6 +612,81 @@ impl<'a> NonNull<'a> {
         self.params.retain(|&p| {
             !matches!(func.dfg.value_def(p), ValueDef::Param(b, _) if evict.contains(&b))
         });
+    }
+
+    /// `new`, plus site-qualified facts answered by dominance at the
+    /// use point (`is_m_at`). The seeding fixpoint is unchanged.
+    pub fn with_sites(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        loads: &'a FxHashSet<Value>,
+        derived: &'a VMap<Value>,
+        sites: &'a SiteFacts,
+    ) -> Self {
+        let mut nn = Self::new_ext(func, cfg, loads, derived, false);
+        if !sites.is_empty() {
+            nn.sites = Some(sites);
+            nn.dt = Some(DominatorTree::with_function(func, cfg));
+        }
+        nn
+    }
+
+    /// A recorded site covers the use when it dominates it; a site whose
+    /// instruction or block left the layout covers nothing.
+    fn site_covers(&self, func: &Function, s: ProgramPoint, at: ProgramPoint) -> bool {
+        let Some(dt) = &self.dt else {
+            return false;
+        };
+        let live = match s {
+            ProgramPoint::Inst(i) => func.layout.inst_block(i).is_some(),
+            ProgramPoint::Block(b) => func.layout.is_block_inserted(b),
+        };
+        let at_live = match at {
+            ProgramPoint::Inst(i) => func.layout.inst_block(i).is_some(),
+            ProgramPoint::Block(b) => func.layout.is_block_inserted(b),
+        };
+        live && at_live && dt.dominates(s, at, &func.layout)
+    }
+
+    fn site_nn(&self, func: &Function, v: Value, at: Option<ProgramPoint>) -> bool {
+        let (Some(sites), Some(at)) = (self.sites, at) else {
+            return false;
+        };
+        sites
+            .nonnull
+            .get(&v)
+            .is_some_and(|ss| ss.iter().any(|&s| self.site_covers(func, s, at)))
+    }
+
+    fn site_derived(&self, func: &Function, v: Value, at: Option<ProgramPoint>) -> Option<Value> {
+        let (Some(sites), Some(at)) = (self.sites, at) else {
+            return None;
+        };
+        sites
+            .derived
+            .get(&v)?
+            .iter()
+            .find(|&&(_, s)| self.site_covers(func, s, at))
+            .map(|&(b, _)| func.dfg.resolve_aliases(b))
+    }
+
+    /// `is` at a use point: the plain facts plus the site-qualified ones
+    /// whose site dominates `at`.
+    pub fn is_m_at(
+        &self,
+        func: &Function,
+        v: Value,
+        at: ProgramPoint,
+        memo: &mut FxHashMap<AtKey, bool>,
+    ) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        let k = at_key(v, at);
+        if let Some(&r) = memo.get(&k) {
+            return r;
+        }
+        let r = self.is_deps_at(func, v, Some(at), &mut FxHashSet::default());
+        memo.insert(k, r);
+        r
     }
 
     pub fn is(&self, func: &Function, v: Value) -> bool {
@@ -607,6 +734,16 @@ impl<'a> NonNull<'a> {
     }
 
     fn is_deps(&self, func: &Function, v: Value, deps: &mut FxHashSet<Value>) -> bool {
+        self.is_deps_at(func, v, None, deps)
+    }
+
+    fn is_deps_at(
+        &self,
+        func: &Function,
+        v: Value,
+        at: Option<ProgramPoint>,
+        deps: &mut FxHashSet<Value>,
+    ) -> bool {
         // `select c, a, b` is non-null iff both arms are; every term on
         // the worklist must justify itself (a `!nonnull` load, a param
         // the fixpoint kept, a symbol/stack address, or an `inbounds`
@@ -621,6 +758,7 @@ impl<'a> NonNull<'a> {
                 if self.loads.contains(&v)
                     || addr_of_symbol(func, v, self.nn_addr)
                     || non_zero_const(func, v)
+                    || self.site_nn(func, v, at)
                 {
                     continue 'terms;
                 }
@@ -649,8 +787,12 @@ impl<'a> NonNull<'a> {
                         // inbounds offset from null by a non-zero
                         // amount is UB, so either operand non-null
                         // suffices.
+                        if let Some(b) = self.site_derived(func, v, at) {
+                            v = b;
+                            continue;
+                        }
                         if let Some((a, b)) = self.tomb_pair(func, v)
-                            && (self.is_deps(func, a, deps) || self.is_deps(func, b, deps))
+                            && (self.is_deps_at(func, a, at, deps) || self.is_deps_at(func, b, at, deps))
                         {
                             continue 'terms;
                         }
@@ -1331,7 +1473,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
     let mut ne_sets: FxHashMap<u64, FxHashSet<Value>> = FxHashMap::default();
     // `nn` queries run only inside this immutable scan — `hits` apply
     // after — so one memo covers them all.
-    let mut nnm: FxHashMap<Value, bool> = FxHashMap::default();
+    let mut nnm: FxHashMap<AtKey, bool> = FxHashMap::default();
     for b in func.layout.blocks() {
         for inst in func.layout.block_insts(b) {
             let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[inst] else {
@@ -1440,9 +1582,9 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
             }
             let ib = func.layout.inst_block(inst);
             if pliron_cfg::tracing_on() {
-                tracing::trace!(target: "pliron::jumpthread", "nulltest {inst}: x={x} (from {}) nn={}", args[0], nn.is_m(func, x, &mut nnm));
+                tracing::trace!(target: "pliron::jumpthread", "nulltest {inst}: x={x} (from {}) nn={}", args[0], nn.is_m_at(func, x, ProgramPoint::Inst(inst), &mut nnm));
             }
-            if nn.is_m(func, x, &mut nnm) || rnn.zip(ib).is_some_and(|(r, ib)| r.holds(func, nn.derived, x, ib)) {
+            if nn.is_m_at(func, x, ProgramPoint::Inst(inst), &mut nnm) || rnn.zip(ib).is_some_and(|(r, ib)| r.holds(func, nn.derived, x, ib)) {
                 hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
                 continue;
             }
@@ -1487,7 +1629,7 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
                         match known(func, &none, arg) {
                             Some(0) => edges.push((arm, true)),
                             Some(_) => edges.push((arm, false)),
-                            None if nn.is_m(func, arg, &mut nnm)
+                            None if nn.is_m_at(func, arg, ProgramPoint::Inst(pred.inst), &mut nnm)
                                 || rnn.is_some_and(|r| r.holds(func, nn.derived, arg, pred.block)) =>
                             {
                                 edges.push((arm, false))
@@ -1575,8 +1717,8 @@ fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) ->
                 continue;
             };
             // `select c, 0, X == 0` iff `c` (X ≠ 0); `select c, X, 0` mirrors.
-            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is_m(func, sa[2], &mut nnm);
-            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is_m(func, sa[1], &mut nnm);
+            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is_m_at(func, sa[2], ProgramPoint::Inst(inst), &mut nnm);
+            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is_m_at(func, sa[1], ProgramPoint::Inst(inst), &mut nnm);
             let c = sa[0];
             let f = match (t0, t1, ne) {
                 (true, _, false) | (false, true, true) if booly(func, c) => Fold::Alias(c),
@@ -2213,6 +2355,7 @@ pub(crate) fn round<'a>(
     func: &mut Function,
     loads: &'a FxHashSet<Value>,
     derived: &'a VMap<Value>,
+    sites: &'a SiteFacts,
     nn: &mut Option<NonNull<'a>>,
     domcond: bool,
     cfg: &ControlFlowGraph,
@@ -2332,7 +2475,7 @@ pub(crate) fn round<'a>(
                 // never reach it.
                 let nnr = nn.get_or_insert_with(|| {
                     let t = std::time::Instant::now();
-                    let r = NonNull::new(func, cfg, loads, derived);
+                    let r = NonNull::with_sites(func, cfg, loads, derived, sites);
                     let el = t.elapsed();
                     if pliron_cfg::tracing_on()
                         && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO)
@@ -5152,6 +5295,7 @@ fn fnn<'a>(
     func: &mut Function,
     loads: &'a FxHashSet<Value>,
     derived: &'a VMap<Value>,
+    sites: &'a SiteFacts,
     nn: Option<NonNull<'a>>,
     cd: &mut Cd,
     rnn: Option<&RegionNN>,
@@ -5163,7 +5307,7 @@ fn fnn<'a>(
         Some(nn) => nn,
         None => {
             let (c, _) = cd.get(func);
-            NonNull::new(func, c, loads, derived)
+            NonNull::with_sites(func, c, loads, derived, sites)
         }
     };
     fold_null_tests(func, &nn, rnn)
@@ -5176,12 +5320,17 @@ fn fnn<'a>(
 /// mergechain, and `p`'s stepped back-edge value carries its inbounds
 /// mark only after indvars. Decided `brif`s are folded and the blocks
 /// they strand removed.
-pub fn fold_nulls_late(func: &mut Function, loads: &FxHashSet<Value>, derived: &VMap<Value>) -> usize {
+pub fn fold_nulls_late(
+    func: &mut Function,
+    loads: &FxHashSet<Value>,
+    derived: &VMap<Value>,
+    sites: &SiteFacts,
+) -> usize {
     if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
         return 0;
     }
     let cfg = ControlFlowGraph::with_function(func);
-    let nn = NonNull::new(func, &cfg, loads, derived);
+    let nn = NonNull::with_sites(func, &cfg, loads, derived, sites);
     let k = fold_null_tests(func, &nn, None);
     if k > 0 && fold_const_branches(func) > 0 {
         remove_unreachable_blocks(func);
@@ -5196,7 +5345,7 @@ pub fn run(
     derived: &mut VMap<Value>,
     sh: u32,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
-    run_rnn(func, loads, derived, sh, None)
+    run_rnn(func, loads, derived, sh, None, &SiteFacts::default())
 }
 
 /// [`run`] with region-scoped non-null facts for the null-test folds.
@@ -5206,6 +5355,7 @@ pub fn run_rnn(
     derived: &mut VMap<Value>,
     sh: u32,
     rnn: Option<&RegionNN>,
+    sites: &SiteFacts,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
     use crate::pipeline::shape;
     let prof = pliron_cfg::tracing_on()
@@ -5224,7 +5374,7 @@ pub fn run_rnn(
     // inlined clone's entry param carries its callee's `nonnull` fact
     // (`PLIRON_INLINENN`), which must not move to the caller's value.
     if pliron_cfg::pass_enabled("PLIRON_INLINENN") {
-        fnn(func, loads, derived, None, &mut cd, rnn);
+        fnn(func, loads, derived, sites, None, &mut cd, rnn);
     }
     if sh & shape::JUMP != 0 {
         merge_chains(func, &mut cd);
@@ -5446,6 +5596,7 @@ pub fn run_rnn(
                 func,
                 loads,
                 derived,
+                sites,
                 &mut nn_opt,
                 domcond,
                 c,
@@ -5484,7 +5635,7 @@ pub fn run_rnn(
         if n == 0 {
             // `fold_null_tests` on the converged function — a fresh
             // `NonNull` matches the proofs a rebuild would produce.
-            fnn_cur = Some(fnn(func, loads, derived, None, &mut cd, rnn));
+            fnn_cur = Some(fnn(func, loads, derived, sites, None, &mut cd, rnn));
             break;
         }
         // No refresh needed: the guarded bits can only shrink inside
@@ -5498,7 +5649,7 @@ pub fn run_rnn(
     }
     let fnn = match fnn_cur {
         Some(x) => x,
-        None => fnn(func, loads, derived, None, &mut cd, rnn),
+        None => fnn(func, loads, derived, sites, None, &mut cd, rnn),
     };
     if prof {
         if pliron_cfg::tracing_on() {

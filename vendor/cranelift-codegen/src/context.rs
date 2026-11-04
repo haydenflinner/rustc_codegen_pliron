@@ -49,6 +49,11 @@ pub struct Context {
     /// Loop analysis of `func`.
     pub loop_analysis: LoopAnalysis,
 
+    /// PLIRON: the last `egraph_pass`'s `(survivor, original)` value
+    /// pairs (`egraph::Stats::renames`), for clients that keep facts
+    /// keyed on values.
+    pub egraph_renames: Vec<(crate::ir::Value, crate::ir::Value, bool)>,
+
     /// Result of MachBackend compilation, if computed.
     pub(crate) compiled_code: Option<CompiledCode>,
 
@@ -78,6 +83,7 @@ impl Context {
             cfg: ControlFlowGraph::new(),
             domtree: DominatorTree::new(),
             loop_analysis: LoopAnalysis::new(),
+            egraph_renames: Vec::new(),
             compiled_code: None,
             want_disasm: false,
             regalloc_ctx: regalloc2::Ctx::default(),
@@ -1832,12 +1838,14 @@ impl Context {
             &mut self.cfg,
         );
         let cfg_maybe_changed = pass.run();
+        let renames = core::mem::take(&mut pass.stats.renames);
         log::debug!("egraph stats: {:?}", pass.stats);
         if *STATS.get_or_init(|| std::env::var_os("PLIRON_STATS").is_some()) {
             let stats = pass.stats.clone();
             drop(pass);
             eprintln!("egraph stats {:?}: {:?}", self.func.name, stats);
         }
+        self.egraph_renames = renames;
         trace!("After egraph optimization:\n{}", self.func.display());
 
         // PLIRON: `run` recomputes `cfg` when it rewrites a terminator

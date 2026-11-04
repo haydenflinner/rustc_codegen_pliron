@@ -211,6 +211,20 @@ pub struct Pipe<'a> {
     /// lowering/`Facts` time — by slotmerge's point in the pipeline the
     /// operand `Value` is typically dead, so it can't ride along.
     pub lifetimes: &'a mut Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>,
+    /// `(survivor, original)` pairs from passes that re-materialize or
+    /// replace a value without aliasing it (edgefwd's forwarder clones,
+    /// the egraph's renames): the survivor computes the original's value,
+    /// so facts keyed on the original (derived, non-null, noalias, frozen,
+    /// deref) carry to it after the step (`carry_renames`), the way
+    /// `carry_aliases` serves aliasing passes. brotli's byte-compare loop
+    /// kept its zip niche test with the egraph on because edgefwd's clone
+    /// of the stepped pointer had no inbounds mark.
+    pub renames: Vec<(Value, Value, bool)>,
+    /// Site-qualified non-null/derived facts (`jumpthread::SiteFacts`):
+    /// where `carry_one`'s site rule refuses a plain carry, the fact is
+    /// kept with the original's site and the null folds answer by
+    /// dominance at the use.
+    pub site_facts: jumpthread::SiteFacts,
     pub nocap: &'a FxHashSet<(Inst, u32)>,
     /// `PLIRON_SM_MARKFLOW`: end markers re-expressed at pipeline entry as
     /// kills on incoming edges, (slot, terminator, destination index) —
@@ -1964,6 +1978,7 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             carry_aliases(p, an);
         }
     }
+    carry_renames(p);
     p.log(if s.stat.is_empty() { s.name } else { s.stat }, k);
     if red_before && crate::taildup::irreducible(&p.clctx.func) {
         eprintln!("pliron: {} made `{}` irreducible", s.name, p.fname);
@@ -2112,7 +2127,7 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // before the rounds thread the decided edges (`PLIRON_NULLFOLD2=0`
     // disables; on since 2026-11-03).
     if pliron_cfg::env_is("PLIRON_NULLFOLD2", "1") {
-        let k = jumpthread::fold_nulls_late(&mut p.clctx.func, p.nonnull, p.derived);
+        let k = jumpthread::fold_nulls_late(&mut p.clctx.func, p.nonnull, p.derived, &p.site_facts);
         if k > 0 {
             total += k;
             if p.dump {
@@ -2132,6 +2147,7 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
                 &mut p.clctx.func,
                 p.nonnull,
                 p.derived,
+                &p.site_facts,
                 &mut nn,
                 crate::pass_enabled("PLIRON_DOMCOND"),
                 c,
@@ -2185,7 +2201,8 @@ fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
         block_region: p.block_region,
         region_parent: p.region_parent,
     });
-    let (n, dead, folds, pmap) = jumpthread::run_rnn(&mut p.clctx.func, p.nonnull, p.derived, sh, rnn.as_ref());
+    let (n, dead, folds, pmap) =
+        jumpthread::run_rnn(&mut p.clctx.func, p.nonnull, p.derived, sh, rnn.as_ref(), &p.site_facts);
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }
@@ -2499,6 +2516,48 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
         };
         panic!("egraph broke `{}`: {detail}", p.fname)
     });
+    // Re-canonicalize at the boundary: the egraph folds `brif (icmp ne
+    // x, 0)` to `brif x`, and every pliron pass that reasons about a
+    // branch (celim, bcheck, rangefold, edgespec, the null folds) keys
+    // on the compare. serde_json's `serialize_str` kept its per-byte
+    // remaining-length check (`sub; cbz` per iteration, json 1.10x)
+    // because celim never saw `len - i != 0` as a compare. A branch on
+    // a wider-than-i8 integer can only be the folded form (pliron's
+    // conditions are i8), so spell the compare back out.
+    // `PLIRON_EGRAPH_RECANON=0` leaves the egraph's spelling.
+    if !pliron_cfg::env_is("PLIRON_EGRAPH_RECANON", "0") {
+        let k = egraph_recanon(&mut p.clctx.func);
+        if k > 0 {
+            p.log("egraph-recanon", k);
+        }
+    }
+    // The egraph re-elaborates pure values under new numbers and merges
+    // or rewrites others; facts keyed on the originals (derived,
+    // non-null, noalias, frozen, deref) would die with them: brotli's
+    // byte-compare loop kept its zip niche test because the stepped
+    // pointer's inbounds mark sat on a value the egraph had replaced,
+    // and the late null fold could not prove it. Carry every
+    // `(survivor, original)` pair the pass recorded, one map per
+    // "layer" so an original cloned into several survivors reaches all
+    // of them (`carry_pmap` copies facts of the key to its value).
+    // `PLIRON_EGRAPH_CARRY=0` disables.
+    let renames = std::mem::take(&mut p.clctx.egraph_renames);
+    if crate::config::tracing_on() && pliron_cfg::tracing_on() {
+        tracing::info!(
+            target: "pliron::stats",
+            "egraph-carry renames={} derived={} nonnull={} {} derived-keys={:?} nonnull-keys={:?} renames={:?}",
+            renames.len(),
+            p.derived.len(),
+            p.nonnull.len(),
+            p.fname,
+            if p.derived.len() <= 12 { p.derived.iter().map(|(k, v)| (k, *v)).collect::<Vec<_>>() } else { Vec::new() },
+            if p.nonnull.len() <= 12 { p.nonnull.iter().copied().collect::<Vec<_>>() } else { Vec::new() },
+            if renames.len() <= 40 { renames.clone() } else { Vec::new() }
+        );
+    }
+    if !pliron_cfg::env_is("PLIRON_EGRAPH_CARRY", "0") {
+        p.renames.extend(renames);
+    }
     // The egraph populated cfg/domtree; later passes don't maintain
     // them, so drop them rather than leave stale-but-"valid" state
     // that `compile`'s initial verify would check.
@@ -2918,7 +2977,7 @@ fn s_fuse(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // jumpthread bypass cannot touch; each surviving forwarder emits a
 // `b` in the final stream.
 fn s_edgefwd(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = edgefwd::run(&mut p.clctx.func);
+    let k = edgefwd::run(&mut p.clctx.func, &mut p.renames);
     if k > 0 && p.dump {
         p.dump("edgefwd");
     }
@@ -3462,7 +3521,7 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         let dbase = p.derived.get(&d).copied();
         let dnn = p.nonnull.contains(&d);
         if dbase.is_some() || dnn {
-            let covered = {
+            let (pd, covered) = {
                 use cranelift_codegen::ir::ProgramPoint;
                 let f = &p.clctx.func;
                 // `try_value_def` skips reserved/stale values and doesn't
@@ -3484,12 +3543,14 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
                     }
                     _ => None,
                 };
-                match (pp(d), pp(w)) {
-                    (Some(a), Some(b)) => {
+                let pd = pp(d);
+                match (pd, pp(w)) {
+                    (Some(a), Some(b)) => (
+                        pd,
                         f.layout.pp_block(a) == f.layout.pp_block(b)
-                            && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater
-                    }
-                    _ => false,
+                            && f.layout.pp_cmp(a, b) != std::cmp::Ordering::Greater,
+                    ),
+                    _ => (pd, false),
                 }
             };
             if covered {
@@ -3522,7 +3583,44 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
                     p.nonnull.insert(w);
                     p.fact_bits[w] |= fact_bits::NONNULL;
                 }
+            } else if let Some(s) = pd.or_else(|| {
+                // Level 2: the fact still holds at `d`'s uses, now `w`'s;
+                // keep it with `d`'s site and `NonNull` answers by
+                // dominance. A merged original's instruction is usually
+                // already gone (GVN removed it); its block, if it still
+                // stands, is the next anchor: every point the inst
+                // dominated it dominates too, and a path-conditional fact
+                // (a guarded `!nonnull` load) is conditioned by a branch
+                // that dominates the whole block.
+                use cranelift_codegen::ir::ProgramPoint;
+                let f = &p.clctx.func;
+                match f.dfg.try_value_def(d) {
+                    Some(ValueDef::Result(i, _)) => f
+                        .layout
+                        .inst_block(i)
+                        .filter(|&b| f.layout.is_block_inserted(b))
+                        .map(ProgramPoint::Block),
+                    _ => None,
+                }
+            }) {
+                if let Some(b) = dbase {
+                    p.site_facts.add_derived(w, b, s);
+                }
+                if dnn {
+                    p.site_facts.add_nonnull(w, s);
+                }
             }
+        }
+    }
+    // `d`'s own site-qualified facts hold at the same sites for `w`.
+    if let Some(ss) = p.site_facts.nonnull.get(&d).cloned() {
+        for s in ss {
+            p.site_facts.add_nonnull(w, s);
+        }
+    }
+    if let Some(ds) = p.site_facts.derived.get(&d).cloned() {
+        for (b, s) in ds {
+            p.site_facts.add_derived(w, b, s);
         }
     }
     if bits & fact_bits::NOALIAS != 0 && p.noalias.contains(&d) {
@@ -3624,6 +3722,95 @@ fn carry_pmap(p: &mut Pipe, pmap: &FxHashMap<Value, Value>) {
 /// than plumbing a merge map out of each, scan the alias table after
 /// mutating steps — re-carrying an already-carried pair is idempotent,
 /// and `an.carried` skips pairs already handled.
+/// Carry facts across `p.renames` (see the field): one `carry_pmap` per
+/// "layer" so an original cloned into several survivors reaches all of
+/// them. `carry_pmap` copies the facts of its key to its value, so the
+/// maps are keyed by the original.
+/// `brif c` with `c` wider than i8 becomes `brif (icmp ne c, 0)`; see
+/// the call site in `s_egraph`. Returns the branches rewritten.
+/// `egraph_recanon` for the unit test.
+pub fn egraph_recanon_for_test(func: &mut Function) -> usize {
+    egraph_recanon(func)
+}
+
+fn egraph_recanon(func: &mut Function) -> usize {
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{InstBuilder, InstructionData, types};
+    let mut todo: Vec<(Inst, Value)> = Vec::new();
+    for b in func.layout.blocks() {
+        if let Some(t) = func.layout.last_inst(b)
+            && let InstructionData::Brif { arg, .. } = func.dfg.insts[t]
+        {
+            let c = func.dfg.resolve_aliases(arg);
+            let ty = func.dfg.value_type(c);
+            if ty.is_int() && !ty.is_vector() && ty.bits() > 8 {
+                todo.push((t, c));
+            }
+        }
+    }
+    let n = todo.len();
+    for (t, c) in todo {
+        let ty = func.dfg.value_type(c);
+        let mut pos = FuncCursor::new(func).at_inst(t);
+        let z = pos.ins().iconst(ty, 0);
+        let cc = pos.ins().icmp(IntCC::NotEqual, c, z);
+        debug_assert_eq!(pos.func.dfg.value_type(cc), types::I8);
+        if let InstructionData::Brif { arg, .. } = &mut pos.func.dfg.insts[t] {
+            *arg = cc;
+        }
+    }
+    n
+}
+
+fn carry_renames(p: &mut Pipe) {
+    if p.renames.is_empty() {
+        return;
+    }
+    let renames = std::mem::take(&mut p.renames);
+    // A clone (`is_clone`) computes the original's value on the
+    // original's paths (its uses are the original's, rewritten), so the
+    // site facts `carry_one` only copies within a block hold for it
+    // wherever it was placed: copy derived/non-null outright, then the
+    // rest through `carry_one`. A merge (GVN to an earlier equal value,
+    // a rewrite) is not: the survivor also has its own, earlier uses,
+    // and a `!nonnull` load's site fact must not reach those (the
+    // serde_derive `get_member` fold `carry_one` documents). Merges go
+    // through `carry_one`'s site rule only. `PLIRON_CLONE_SITEFACTS=0`
+    // keeps the site rule for clones too.
+    let site_free = !pliron_cfg::env_is("PLIRON_CLONE_SITEFACTS", "0");
+    let mut remap: FxHashMap<Value, Value> = FxHashMap::default();
+    for &(survivor, original, is_clone) in &renames {
+        if survivor == original {
+            continue;
+        }
+        remap.entry(original).or_insert(survivor);
+        if is_clone && site_free {
+            let bits = p.fact_bits[original];
+            if bits & fact_bits::DERIVED != 0
+                && let Some(&b) = p.derived.get(&original)
+            {
+                p.derived.insert(survivor, b);
+                p.fact_bits[survivor] |= fact_bits::DERIVED;
+            }
+            if bits & fact_bits::NONNULL != 0 && p.nonnull.contains(&original) {
+                p.nonnull.insert(survivor);
+                p.fact_bits[survivor] |= fact_bits::NONNULL;
+            }
+        }
+        carry_one(p, original, survivor);
+    }
+    // Bases that were replaced (the egraph's merges) move to the survivor.
+    let keys: Vec<Value> = p.derived.keys().collect();
+    for x in keys {
+        if let Some(&b) = p.derived.get(&x)
+            && let Some(&nb) = remap.get(&b)
+        {
+            p.derived.insert(x, nb);
+        }
+    }
+}
+
 fn carry_aliases(p: &mut Pipe, an: &mut Analysis) {
     // Steps that wrote no aliases since the last scan can't have new
     // (alias, root) pairs — most mutating steps don't alias anything,
@@ -4873,6 +5060,8 @@ mod tests {
         region_parent: &region_parent,
         inst_region: Default::default(),
         lifetimes: &mut lifetimes,
+        renames: Vec::new(),
+        site_facts: Default::default(),
         nocap: &nocap,
         edge_kills: Vec::new(),
         dbg_slots: &Default::default(),

@@ -565,6 +565,7 @@ impl<'a> Elaborator<'a> {
                     let new_inst = func.dfg.clone_inst(inst);
                     func.layout.insert_inst(new_inst, before);
                     let new_result = func.dfg.inst_results(new_inst)[0];
+                    stats.renames.push((new_result, arg.value, true));
                     *v.insert(new_result)
                 }
             };
@@ -819,6 +820,7 @@ impl<'a> Elaborator<'a> {
                                 scope_depth,
                             );
 
+                            self.stats.renames.push((new_result, result, true));
                             self.value_to_best_value[new_result] = best_result;
 
                             trace!(
