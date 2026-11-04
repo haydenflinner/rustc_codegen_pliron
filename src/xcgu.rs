@@ -478,6 +478,22 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             );
         }
     };
+    let inlined: FxHashSet<MonoItem<'tcx>> = parts
+        .iter()
+        .flat_map(|other| {
+            other
+                .items()
+                .iter()
+                .filter_map(|(&item, data)| data.inlined.then_some(item))
+        })
+        .collect();
+    // `PLIRON_XCGU_INLINED=1`: `inlined=true` deps ignore the size cap.
+    // rustc's partitioning already duplicates an inlined body into every
+    // CGU that wants it — the cap is what stops *this* CGU's copy
+    // closure from covering them (std's SipHash `d_rounds` is 127 vs
+    // the native 50: `hash_one` never covered, so hashmap's probe loop
+    // kept `bl hash_one` twice a lookup).
+    let inl_size = crate::env_is("PLIRON_XCGU_INLINED", "1");
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
     let mut frontier = Vec::new();
     for item in ours.keys() {
@@ -507,22 +523,17 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 && !ours.contains_key(&u.node)
             {
                 size_report(c);
-                if copyable(tcx, c, limit) {
+                if copyable(tcx, c, limit)
+                    || (inl_size
+                        && inlined.contains(&u.node)
+                        && copyable(tcx, c, usize::MAX))
+                {
                     frontier.push(c);
                 }
             }
         }
     }
 
-    let inlined: FxHashSet<MonoItem<'tcx>> = parts
-        .iter()
-        .flat_map(|other| {
-            other
-                .items()
-                .iter()
-                .filter_map(|(&item, data)| data.inlined.then_some(item))
-        })
-        .collect();
     // Items bindable without a copy: some partition emits the symbol
     // externally. An Internal dep (e.g. `RawVecInner::deallocate` under a
     // `RawVec::drop` copy) can only be satisfied by a copy of its own, so
@@ -579,7 +590,11 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     && (inlined.contains(&u.node) || !externs.contains(&u.node) || xdeps)
                 {
                     size_report(c2);
-                    if copyable(tcx, c2, limit) {
+                    if copyable(tcx, c2, limit)
+                        || (inl_size
+                            && inlined.contains(&u.node)
+                            && copyable(tcx, c2, usize::MAX))
+                    {
                         next.push(c2);
                     }
                 }
@@ -671,6 +686,13 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     // closest callees win the budget and anything cut takes its
     // referrers down with it.
     let mut emit: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+    // `inlined=true` items admitted by the `PLIRON_XCGU_INLINED` size
+    // exemption don't spend the cap: the partitioner already duplicates
+    // them into every CGU that asks, so they aren't the unplanned extra
+    // emit the cap bounds. Charging them let one big exempted closure
+    // (std `visit_seq`, size 110) evict small copies like postcard's
+    // `take_from_bytes` (`cap: 224 + 1 > 224`).
+    let mut charged = 0usize;
     for &c in &candidates {
         let m = MonoItem::Fn(c);
         if !remaining.contains(&m) || emit.contains(&m) {
@@ -707,7 +729,16 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             }),
             _ => false,
         });
-        if coverable && emit.len() + closure.len() <= cap {
+        let cost = closure
+            .iter()
+            .filter(|n| match n {
+                MonoItem::Fn(inst) => {
+                    !(inl_size && inlined.contains(n) && !copyable(tcx, *inst, limit))
+                }
+                _ => true,
+            })
+            .count();
+        if coverable && charged + cost <= cap {
             if let Some(w) = &why
                 && with_no_trimmed_paths!(c.to_string()).contains(*w)
                 && pliron_cfg::tracing_on()
@@ -720,12 +751,13 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     closure,
                 );
             }
+            charged += cost;
             emit.extend(closure);
         } else if let Some(w) = &why
             && with_no_trimmed_paths!(c.to_string()).contains(*w)
         {
             let hole: Vec<String> = if coverable {
-                vec![format!("cap: {} + {} > {}", emit.len(), closure.len(), cap)]
+                vec![format!("cap: {} + {} > {}", charged, cost, cap)]
             } else {
                 closure
                     .iter()
