@@ -3554,13 +3554,14 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     }
 }
 
-/// `PLIRON_REKEY=1` (opt-in): after a pass merged values, re-key their
-/// users (`clifpeep::rekey`) so instructions that became identical are
-/// aliased now rather than by a later `dgvn` (docs/codegen-plan.md,
-/// "equality as an invariant").
+/// After a pass merged values, re-key their users (`clifpeep::rekey`)
+/// so instructions that became identical are aliased now rather than by
+/// a later `dgvn` (docs/codegen-plan.md, "equality as an invariant").
+/// Default since 11-03 (held-out 0.994 [0.990, 0.998] of base, regex
+/// 0.973, json 0.983, nothing worse); `PLIRON_REKEY=0` disables.
 fn rekey_after(p: &mut Pipe, merged: impl IntoIterator<Item = Value>) {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_REKEY", "1"));
+        std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_REKEY", "0"));
     if !*ON {
         return;
     }

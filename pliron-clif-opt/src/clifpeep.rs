@@ -10900,7 +10900,7 @@ pub fn dgvn(func: &mut Function, dt: &DominatorTree) -> usize {
     n
 }
 
-/// Equality as an invariant (`PLIRON_REKEY`): a pass that merged values
+/// Equality as an invariant (default; `PLIRON_REKEY=0` disables): a pass that merged values
 /// (`sameargs`, `paramsink`, `webmerge` hand over their param maps) also
 /// re-keys the merged values' users, so two instructions that *became*
 /// identical are aliased at the moment the equality is created instead

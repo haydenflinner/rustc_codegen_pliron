@@ -1392,9 +1392,25 @@ exception tables; gate 94/94 and fuzz 400/400 with the skip lifted, so
 it is gone (`PLIRON_EGRAPH_SKIP_TRYCALL=1` restores it); 2,000 more
 fuzz seeds pass with every knob on (the egraph includes redundant-load
 elimination, so the memory-pass sweep rule applied).
-All knobs stay opt-in until
-the held-out run (armed to start on AC power) gives intervals for
-rekey, egraph alone, and egraph with the migrated rules.
+Held-out on AC power (10 rounds, 3 layouts, 2 pads; A/A floor 1.000
+[0.994, 1.005]):
+
+| variant vs base | geomean | notable |
+|---|---|---|
+| rekey | 0.994 [0.990, 0.998]* | regex 0.973*, json 0.983*, nothing worse |
+| egraph (mid-pipeline step on) | 1.016 [1.011, 1.020]* | compression 1.060*, json 1.071*, regex 0.976* |
+| egraph + rules + migrate | 1.015 [1.011, 1.020]* | compression 1.050*, json 1.073* |
+| + second round | 1.013 [1.009, 1.019]* | compression 1.055*, json 1.067* |
+| + try_call functions | 1.016 [1.011, 1.022]* | compression 1.048*, json 1.086* |
+
+So `rekey` is on by default now (`PLIRON_REKEY=0` disables), and the
+mid-pipeline egraph step is not: it is correct and cheap to compile but
+costs 1.5% at run time, concentrated in compression and json, which is
+the placement fight step 2 predicted (its elaborator hoists and
+rematerializes by its own rules, and the loop passes after it undo or
+compound that). The rules and knobs stay opt-in; the next piece of work
+is step 2, diagnosed from a per-function profile of the egraph build of
+compression against base.
 With the step on, the counters (`rule:<name>` under PLIRON_STATS,
 patch-style per-rule hit counters in clifpeep) say: the early sweep's
 10,493 addnorm and 101 icmpk hits leave only 184 and 99 survivors for
