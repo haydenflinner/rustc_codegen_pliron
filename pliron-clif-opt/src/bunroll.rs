@@ -1,4 +1,4 @@
-//! Bounded full unroll of `0..K` loops (`PLIRON_BUNROLL`, opt-in).
+//! Bounded full unroll of `0..K` loops (`PLIRON_BUNROLL`, default on).
 //!
 //! A header param that starts at a constant and steps by `+s` on every
 //! back-edge, checked in-loop against a small constant bound (postcard's

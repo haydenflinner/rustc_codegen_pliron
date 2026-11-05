@@ -133,6 +133,10 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_NULLSRC",
     "PLIRON_NULLFOLD2",
     "PLIRON_LOOPROT_SINK",
+    // Bounded full unroll of `0..K` loops with LCSSA exit-cone repair:
+    // postcard's varint decoders get the unrolled ldrb + const-shift orr
+    // + tbz shape (varint_postcard -16%); `=0` keeps the runtime loop.
+    "PLIRON_BUNROLL",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
