@@ -266,6 +266,11 @@ in the scoreboard and in the linked history files.
   semantics. `spec` now skips copies on wasm; any other callee-side IPO
   that rewrites a copy's body per CGU has the same hazard
   (`history/2026-10-30-wasm-spec-xcgu-copy-fold.md`).
+- **wasm32 std miscompiles (open).** `tests/wasm/run_std.mjs` fails
+  `float_fmt` (trap) and `hm_u64` (a few missed hashbrown lookups),
+  backend-independent of the 2026-11 xcgu work; the wasm sysroot leg
+  stays red until triaged
+  (`history/2026-11-05-loopidiom-fwdparam-inline-xcgu.md`).
 - **Corpus replay is lossy.** The corpus fact header does not carry
   every `Pipe` fact table, so a clean replay does not clear a step
   ([`miscompile-triage.md`](miscompile-triage.md#replay-fidelity-gap-found-the-hard-way)).
