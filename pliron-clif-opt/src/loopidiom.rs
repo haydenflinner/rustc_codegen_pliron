@@ -2516,6 +2516,15 @@ fn plan_dead(
                 .is_some_and(|b| info.body.contains(&b)),
             _ => false,
         };
+        // Params of the forwarder blocks walked above (bound in `fwd`)
+        // behave like escaping loop values: the fast edge skips their
+        // binding block, so uses under `dest` must be rebound to an
+        // appended param. Unlike loop values they may appear at any
+        // depth — every legal use is dominated by `dest`, since the
+        // forwarder's lone `jump` continues through it (std
+        // `PathBuf::__push` wasm ICE: `isub` read `block20`'s param from
+        // `block268` past the new bypass edge).
+        let fwd_val = |v: Value| fwd.contains_key(&func.dfg.resolve_aliases(v));
         let mut escapes: Vec<(Value, Ins)> = Vec::new();
         let mut seen = info.body.clone();
         let mut wl = vec![dest];
@@ -2525,10 +2534,10 @@ fn plan_dead(
             }
             for i in func.layout.block_insts(b) {
                 for &a in func.dfg.inst_args(i) {
-                    if !loop_val(a) {
+                    if !loop_val(a) && !fwd_val(a) {
                         continue;
                     }
-                    if b != dest {
+                    if b != dest && !fwd_val(a) {
                         why!("dead: {b:?} reads loop values");
                     }
                     if !escapes.iter().any(|&(v, _)| v == a) {
@@ -2545,10 +2554,10 @@ fn plan_dead(
                         let BlockArg::Value(v) = a else {
                             continue;
                         };
-                        if !loop_val(v) {
+                        if !loop_val(v) && !fwd_val(v) {
                             continue;
                         }
-                        if b != dest {
+                        if b != dest && !fwd_val(v) {
                             why!("dead: {b:?} reads loop values");
                         }
                         if !escapes.iter().any(|&(e, _)| e == v) {
@@ -2608,6 +2617,40 @@ fn apply_dead(
         })
         .collect();
     if !new_params.is_empty() {
+        // Rewrite escaping uses to the new params — everywhere, not just
+        // in `exit_dest`: forwarder-param escapes (`fwd`) can be read in
+        // any block `dest` dominates (std `PathBuf::__push` had a
+        // `call fn2(v0, v1432, …)` two blocks down). This runs BEFORE
+        // args are appended to the old edges so the freshly-passed
+        // originals aren't remapped — `np` isn't in scope on those
+        // edges.
+        let remap: FxHashMap<Value, Value> = p
+            .escapes
+            .iter()
+            .zip(&new_params)
+            .flat_map(|(&(v, _), &np)| [(v, np), (func.dfg.resolve_aliases(v), np)])
+            .collect();
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+            for i in insts {
+                for a in func.dfg.inst_args_mut(i) {
+                    if let Some(&np) = remap.get(&*a) {
+                        *a = np;
+                    }
+                }
+                let dfg = &mut func.dfg;
+                for bc in dfg.insts[i]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                {
+                    bc.update_args(&mut dfg.value_lists, |a| match a {
+                        BlockArg::Value(v) => {
+                            remap.get(&v).map(|&np| BlockArg::Value(np)).unwrap_or(a)
+                        }
+                        a => a,
+                    });
+                }
+            }
+        }
         // Edges into `exit_dest`, before the fast edge exists.
         let mut edges: Vec<(Inst, usize)> = Vec::new();
         for b in func.layout.blocks() {
@@ -2630,32 +2673,6 @@ fn apply_dead(
                 .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
             for &(v, _) in &p.escapes {
                 bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
-            }
-        }
-        // Rewrite the escaping uses in `exit_dest` to the new params. Key
-        // both the escape's raw spelling and its resolved form — uses can
-        // appear under either.
-        let remap: FxHashMap<Value, Value> = p
-            .escapes
-            .iter()
-            .zip(&new_params)
-            .flat_map(|(&(v, _), &np)| [(v, np), (func.dfg.resolve_aliases(v), np)])
-            .collect();
-        let insts: Vec<Inst> = func.layout.block_insts(p.exit_dest).collect();
-        for i in insts {
-            for a in func.dfg.inst_args_mut(i) {
-                if let Some(&np) = remap.get(&*a) {
-                    *a = np;
-                }
-            }
-            let dfg = &mut func.dfg;
-            for bc in
-                dfg.insts[i].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-            {
-                bc.update_args(&mut dfg.value_lists, |a| match a {
-                    BlockArg::Value(v) => remap.get(&v).map(|&np| BlockArg::Value(np)).unwrap_or(a),
-                    a => a,
-                });
             }
         }
     }
