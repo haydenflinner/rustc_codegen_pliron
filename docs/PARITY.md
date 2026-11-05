@@ -162,8 +162,18 @@ in the scoreboard and in the linked history files.
   the cold `Err` arm carries block-arg moves, so V8 places an edge block
   inline on the hot path. Levers: no moves on cold edges, or wasm branch
   hints.
-- **`eqbug` native.** `uxtb`/`uxth` on narrow `black_box` results before
-  compares. Lever: compare lowering (hoisted constant + `cmp wk, w, uxtb`).
+- **`eqbug` native.** Root-caused: the kernel is ALU-port-bound
+  (~5 int ops/cycle) and our loop executes ~6 more ALU ops/iter than
+  LLVM's. The difference is `black_box` materialisation: LLVM lowers it
+  to a `strb`/`ldrb` stack round-trip, so every narrow operand arrives
+  pre-truncated — zero standalone `uxtb`/`uxth` in the loop (the wrap
+  semantics then ride the compares' flag-extension for free). Ours is a
+  zero-cost op on native, so each of the six narrow values pays one
+  ALU-port `uxtb`/`uxth`. Loop shape is irrelevant: a `while` rewrite
+  producing the ideal single-block form (`add x,x,#1` in place, one
+  `b.lt`) timed *slower* than the `for` version. Fixing this means
+  forcing `black_box` through byte memory on native too — a deliberate
+  divergence (the wasm path already does it), not a bug.
   History: `history/2026-10-27-slow-kernels.md`.
 - **Register pressure from loop-invariant hoists.** `PLIRON_ELABLOOPS=1`
   (vendored Cranelift egraph elaboration) hoists correctly and helps
@@ -309,8 +319,10 @@ Ranked by expected card gain per effort. Each item links its evidence.
    pipeline job.
 7. **Pressure-aware loop-invariant hoisting**, so `PLIRON_ELABLOOPS` can
    be default-on.
-8. **`eqbug` compare lowering**, and `uxtb` after `zeroext` bool call
-   results (trust the callee's extension on Apple arm64).
+8. **`eqbug` is port-bound, not shape-bound** (see above) — the only
+   remaining lever is `black_box` materialisation; `uxtb` after
+   `zeroext` bool call results (trust the callee's extension on Apple
+   arm64) is worth its own look elsewhere.
 9. **Compile time on giant functions**: per-instruction cost of the top
    CLIF steps; sharing pliron-IR results for live `xcgu` copies.
 10. **Correctness debt**: real SEH catch on windows-msvc; audit
