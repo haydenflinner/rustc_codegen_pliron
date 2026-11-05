@@ -2432,11 +2432,26 @@ fn peep_body_opts(
     // `PLIRON_WASM_DELSE=0` off.
     if opts.delse {
         let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
+        // Ancestor construct opcodes (`block`/`loop`/`if`), innermost
+        // last: label K of a `br` inside the `if` being folded is
+        // `stack[len - K]`. Folded regions are consumed atomically, so
+        // only insts pushed one at a time update it.
+        let mut stack: Vec<u8> = Vec::new();
         let mut i = 0;
         'iter: while i < ins.len() {
             if !(matches!(ins[i].0, WPeek::Ctl) && b[ins[i].1] == 0x04)
                 || b.get(ins[i].1 + 1) != Some(&0x40)
             {
+                let (k0, s0, _, _) = ins[i];
+                if matches!(k0, WPeek::Ctl) {
+                    match b[s0] {
+                        0x02 | 0x03 | 0x04 => stack.push(b[s0]),
+                        0x0b => {
+                            stack.pop();
+                        }
+                        _ => {}
+                    }
+                }
                 out.push(ins[i]);
                 i += 1;
                 continue;
@@ -2501,26 +2516,31 @@ fn peep_body_opts(
                 // K' `end`s — so drop it when those ends exist too.
                 let mut a1len = arm1.len();
                 let k1 = a1len.checked_sub(1).and_then(|x| br_of(arm1[x]));
-                let mut kmax = k.max(k1.unwrap_or(0));
                 // `br K` from inside an arm exits the `if` + K outer
                 // labels — the fallthrough lands there only when the K
-                // parent tails are empty (`end`s only).
+                // parent tails are empty (`end`s only) AND label K is a
+                // forward construct: `br` to a `loop` jumps to its
+                // header, not past its `end` (a back-edge, never dead).
                 let ends_clear = |n: usize| {
                     (j + 1..j + 1 + n)
                         .all(|x| ins.get(x).is_some_and(|&(_, s, _, _)| b[s] == 0x0b))
                 };
-                if !ends_clear(kmax) {
-                    if k1.is_some_and(|x| x > k) {
-                        // Arm1's `br` reaches further than the else's —
-                        // keep it, fold the else arm alone.
-                        kmax = k;
-                        if !ends_clear(kmax) {
-                            break 'fold;
-                        }
-                    } else {
-                        break 'fold;
-                    }
-                } else if k1.is_some() {
+                // Label 0 is the `if` itself (forward); a depth past
+                // every ancestor is the function body (also forward).
+                let fwd_label = |n: usize| {
+                    n == 0
+                        || stack
+                            .len()
+                            .checked_sub(n)
+                            .is_none_or(|d| stack[d] != 0x03)
+                };
+                let br_dead = |n: usize| ends_clear(n) && fwd_label(n);
+                // The else arm dies only when its `br K` is dead; arm1's
+                // own trailing `br K'` dies on its own terms.
+                if !br_dead(k) {
+                    break 'fold;
+                }
+                if k1.is_some_and(&br_dead) {
                     a1len -= 1; // drop arm1's trailing `br`
                 }
                 // `prel` anchors in the deleted span (arm1's `br`, the
@@ -2549,6 +2569,9 @@ fn peep_body_opts(
                 i = j + 1;
                 continue 'iter;
             }
+            // Not folded: the `if` stays — its label is now the
+            // innermost ancestor for the insts that follow.
+            stack.push(0x04);
             out.push(ins[i]);
             i += 1;
         }
@@ -6030,6 +6053,65 @@ mod wpeep_tests {
         );
         let out = peep_body_opts(&b, &[], &[], 0, &opts_delse()).unwrap();
         assert!(has_seq(&out, &[0x05]), "else wrongly dropped: {out:02x?}");
+    }
+
+    // A `br K` whose K-th enclosing label is a `loop` jumps to the
+    // loop header, not past its `end` — it is a back-edge, not a
+    // forward exit, so neither arm's trailing `br` may fold.
+    #[test]
+    fn delse_br_to_loop_label_keeps_both_arms() {
+        let b = body(
+            3,
+            &[
+                0x03, 0x40, // loop L
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x41, 0x07, 0x21, 0x01, // const 7; set 1
+                0x0c, 0x01, // br 1 -> L's header (back-edge)
+                0x05, // else
+                0x0c, 0x01, // br 1 -> L's header
+                0x0b, // end (if)
+                0x0b, // end (loop) — `ends_clear` sees it, but it is a
+                // loop's end, so the brs are not dead
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_delse()).unwrap();
+        assert!(
+            has_seq(&out, &[0x05, 0x0c, 0x01]),
+            "loop back-edge else wrongly folded: {out:02x?}"
+        );
+        assert_eq!(
+            out.iter().filter(|&&x| x == 0x0c).count(),
+            2,
+            "a back-edge br was dropped: {out:02x?}"
+        );
+    }
+
+    // Arm1's trailing `br` to a `loop` is a back-edge too: only the
+    // else arm (a forward `br` to a block end) may fold.
+    #[test]
+    fn delse_else_folds_but_loop_backedge_kept() {
+        let b = body(
+            3,
+            &[
+                0x03, 0x40, // loop L
+                0x02, 0x40, // block B
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x41, 0x07, 0x21, 0x01, // const 7; set 1
+                0x0c, 0x02, // br 2 -> L's header (back-edge)
+                0x05, // else
+                0x0c, 0x01, // br 1 -> B's end (forward)
+                0x0b, // end (if)
+                0x0b, // end (B) — ends_clear end #1
+                0x0b, // end (loop) — ends_clear end #2
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_delse()).unwrap();
+        assert!(
+            has_seq(&out, &[0x04, 0x40, 0x41, 0x07, 0x21, 0x01, 0x0c, 0x02, 0x0b]),
+            "back-edge arm or its if not kept: {out:02x?}"
+        );
     }
 
     // bri: `if { br K } else { A }` → `br_if (K-1); A` — the
