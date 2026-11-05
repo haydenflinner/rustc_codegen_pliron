@@ -180,6 +180,13 @@ struct Plan {
     ivs: Vec<(usize, i64, i64)>,
     iters: usize,
     entries: Vec<Inst>,
+    /// LCSSA repair: `(exit-cone block, ordered in-loop values it must
+    /// receive as params)`. Cloned exits then forward cloned values on
+    /// the same edges.
+    repair: Vec<(Block, Vec<Value>)>,
+    /// `(terminator inst, target)` for every in-loop or in-cone pred
+    /// edge into a repaired block — where the new args get appended.
+    repair_edges: Vec<(Inst, Block)>,
 }
 
 fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis, lp: Loop) -> Option<Plan> {
@@ -388,8 +395,12 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
     // loop-defined value outside an edge arg — clone paths aren't
     // dominated by the original header, so a free-var use (postcard's
     // `v588 -> v544` alias into the serialize loop's merge) would lose
-    // its def. Edge args on in-loop terminators are the sanctioned way
-    // out; a free use downstream makes the loop ineligible.
+    // its def. Free uses are repaired by threading the value through
+    // the exit edges as params of the cone blocks (`repair`/`apply`
+    // below); a block whose free use can't be supplied that way (a pred
+    // outside the loop and outside the cone) keeps the loop ineligible.
+    let mut repair: Vec<(Block, Vec<Value>)> = Vec::new();
+    let mut repair_edges: Vec<(Inst, Block)> = Vec::new();
     {
         let mut wl: Vec<Block> = Vec::new();
         let mut seen: FxHashSet<Block> = FxHashSet::default();
@@ -417,33 +428,92 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
                 _ => false,
             }
         };
+        // Walk the cone, gathering each block's direct free uses of
+        // in-loop values (inst args and its terminator's edge args).
+        let mut cone: Vec<Block> = Vec::new();
+        let mut need: FxHashMap<Block, FxHashSet<Value>> = FxHashMap::default();
+        let mut succs: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
         while let Some(x) = wl.pop() {
             if budget == 0 {
                 dbg("cone-budget");
                 return None;
             }
             budget -= 1;
+            cone.push(x);
+            let mut xsuccs = Vec::new();
             for i in func.layout.block_insts(x) {
-                if func.dfg.inst_args(i).iter().any(|&a| leaks(func, a)) {
-                    dbg("leak-arg");
-                    return None;
+                for &a in func.dfg.inst_args(i) {
+                    if leaks(func, a) {
+                        need.entry(x).or_default().insert(func.dfg.resolve_aliases(a));
+                    }
                 }
                 for bc in func.dfg.insts[i]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
-                    if bc
-                        .args(&func.dfg.value_lists)
-                        .any(|a| matches!(a, BlockArg::Value(v) if leaks(func, v)))
-                    {
-                        dbg("leak-edge");
-                        return None;
+                    for a in bc.args(&func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a {
+                            if leaks(func, v) {
+                                need.entry(x)
+                                    .or_default()
+                                    .insert(func.dfg.resolve_aliases(v));
+                            }
+                        }
                     }
                     let tb = bc.block(&func.dfg.value_lists);
-                    if seen.insert(tb) {
-                        wl.push(tb);
+                    if !inset.contains(&tb) {
+                        xsuccs.push(tb);
+                        if seen.insert(tb) {
+                            wl.push(tb);
+                        }
                     }
                 }
             }
+            succs.insert(x, xsuccs);
+        }
+        // A block's params must cover the needs of its cone successors
+        // too — it forwards their values on its out edges.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &x in &cone {
+                let extra: Vec<Value> = succs[&x]
+                    .iter()
+                    .flat_map(|y| need.get(y).into_iter().flatten().copied())
+                    .collect();
+                let e = need.entry(x).or_default();
+                let before = e.len();
+                e.extend(extra);
+                changed |= e.len() != before;
+            }
+        }
+        // Every pred of a needy block must be able to supply the values:
+        // in-loop preds pass the original value (it dominates the edge,
+        // else the cone-block use would already be undominated), cone
+        // preds forward their own param for it.
+        for (&x, ns) in &need {
+            if ns.is_empty() {
+                continue;
+            }
+            let mut dedup: FxHashSet<(Inst, Block)> = FxHashSet::default();
+            for p in cfg.pred_iter(x) {
+                if inset.contains(&p.block) || seen.contains(&p.block) {
+                    if dedup.insert((p.inst, x)) {
+                        repair_edges.push((p.inst, x));
+                    }
+                } else {
+                    dbg("leak-pred");
+                    return None;
+                }
+            }
+        }
+        for &x in &cone {
+            let Some(n) = need.get(&x) else { continue };
+            if n.is_empty() {
+                continue;
+            }
+            let mut ns: Vec<Value> = n.iter().copied().collect();
+            ns.sort_by_key(|v| v.as_u32());
+            repair.push((x, ns));
         }
     }
     dbg(&format!("plan iters={iters}"));
@@ -453,6 +523,8 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
         ivs,
         iters,
         entries,
+        repair,
+        repair_edges,
     })
 }
 
@@ -579,7 +651,77 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     }
     let n = plans.len();
     for p in plans {
+        repair(func, &p);
         apply(func, &p);
     }
     n
+}
+
+/// Thread each exit-cone block's needed in-loop values through as new
+/// block params, fed by the exit edges — the LCSSA form `detect`
+/// planned. In-loop preds pass the original value; cone preds pass
+/// their own param for it.
+fn repair(func: &mut Function, plan: &Plan) {
+    if plan.repair.is_empty() {
+        return;
+    }
+    let inset: FxHashSet<Block> = plan.blocks.iter().copied().collect();
+    // param_of[(x, v)] — the param appended to cone block `x` for in-loop
+    // value `v`.
+    let mut pof: FxHashMap<(Block, Value), Value> = FxHashMap::default();
+    for (x, vs) in &plan.repair {
+        for &v in vs {
+            let ty = func.dfg.value_type(v);
+            let nv = func.dfg.append_block_param(*x, ty);
+            pof.insert((*x, v), nv);
+        }
+    }
+    // Rewrite the free uses inside each cone block to its params —
+    // inst args and edge args alike (an edge arg is a use at the end of
+    // the block, so the param spelling is valid there too). Raw values
+    // must be captured first: `map_inst_values`'s callback cannot
+    // re-enter `dfg.resolve_aliases`.
+    for (x, vs) in &plan.repair {
+        let targets: FxHashSet<Value> = vs.iter().copied().collect();
+        let mut rmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for i in func.layout.block_insts(*x) {
+            for v in func.dfg.inst_values(i) {
+                let r = func.dfg.resolve_aliases(v);
+                if targets.contains(&r) {
+                    rmap.insert(v, r);
+                }
+            }
+        }
+        for i in func.layout.block_insts(*x).collect::<Vec<_>>() {
+            func.dfg.map_inst_values(i, |v| match rmap.get(&v) {
+                Some(&r) => pof[&(*x, r)],
+                None => v,
+            });
+        }
+    }
+    // Append the args on every pred edge into a repaired block.
+    let mut blocks_of: FxHashMap<Inst, Block> = FxHashMap::default();
+    for &(t, _) in &plan.repair_edges {
+        blocks_of.insert(t, func.layout.inst_block(t).unwrap());
+    }
+    let dfg = &mut func.dfg;
+    for &(t, x) in &plan.repair_edges {
+        let src = blocks_of[&t];
+        let vs = &plan.repair.iter().find(|(b, _)| *b == x).unwrap().1;
+        for bc in dfg.insts[t]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if bc.block(&dfg.value_lists) != x {
+                continue;
+            }
+            for &v in vs {
+                let a = if inset.contains(&src) {
+                    v
+                } else {
+                    pof[&(src, v)]
+                };
+                bc.append_argument(BlockArg::Value(a), &mut dfg.value_lists);
+            }
+        }
+    }
 }
