@@ -168,6 +168,13 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // bench/sieve -21%, varint_postcard -5%, rest within noise; ~+30%
     // emitted copies, ~7% codegen on the bench crate). `=0` off.
     ("PLIRON_XCGU_XDEPS", "1"),
+    // `inlined=true` deps may exceed the size cap: the partitioner already
+    // expects them duplicated per CGU (SipHash `d_rounds`, size 127, in the
+    // hashmap probe loop). Only items that actually fail the normal limit
+    // are exempted from cap accounting (2026-11-05: hashmap -5%, iterw and
+    // the rest within noise, no codegen-time delta; needed the loopidiom
+    // forwarder-param escape fix for the wasm leg). `=0` off.
+    ("PLIRON_XCGU_INLINED", "1"),
     // Single-site free inline threshold, x the inline limit (2026-11-02:
     // pulldown's `parse_line` closure, 4,594 ops, inlines; pulldown -2%).
     ("PLIRON_INLINE_FREEMUL", "12"),

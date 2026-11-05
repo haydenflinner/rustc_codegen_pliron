@@ -487,10 +487,10 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 .filter_map(|(&item, data)| data.inlined.then_some(item))
         })
         .collect();
-    // `PLIRON_XCGU_INLINED=1`: `inlined=true` deps ignore the size cap.
-    // rustc's partitioning already duplicates an inlined body into every
-    // CGU that wants it — the cap is what stops *this* CGU's copy
-    // closure from covering them (std's SipHash `d_rounds` is 127 vs
+    // `PLIRON_XCGU_INLINED` (default on): `inlined=true` deps ignore the
+    // size cap. rustc's partitioning already duplicates an inlined body
+    // into every CGU that wants it — the cap is what stops *this* CGU's
+    // copy closure from covering them (std's SipHash `d_rounds` is 127 vs
     // the native 50: `hash_one` never covered, so hashmap's probe loop
     // kept `bl hash_one` twice a lookup).
     let inl_size = crate::env_is("PLIRON_XCGU_INLINED", "1");
