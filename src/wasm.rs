@@ -6619,19 +6619,22 @@ mod wpeep_tests {
             ],
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
-        // preamble: get0;get1;add;set8;get2;get3;sub;set9; then an empty
-        // loop — the in-loop `get8;get9;add;drop` is fully dead (ddrop).
+        // preamble: get0;get1;add;set8;get2;get3;sub;set9; the in-loop
+        // `get8;get9;add;drop` is fully dead (ddrop) and the emptied
+        // `loop` is elided (elideblk).
         assert!(
             has_seq(
                 &out,
                 &[
                     0x20, 0x00, 0x20, 0x01, 0x6a, 0x21, 0x08, // get0;get1;add;set8
                     0x20, 0x02, 0x20, 0x03, 0x6b, 0x21, 0x09, // get2;get3;sub;set9
-                    0x03, 0x40, // loop
-                    0x0b, // end — loop body emptied
                 ]
             ),
             "licm hoist missing: {out:02x?}"
+        );
+        assert!(
+            !has_seq(&out, &[0x03, 0x40]),
+            "dead loop not elided: {out:02x?}"
         );
     }
 
