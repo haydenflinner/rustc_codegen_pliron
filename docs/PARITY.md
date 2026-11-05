@@ -162,6 +162,13 @@ in the scoreboard and in the linked history files.
   the cold `Err` arm carries block-arg moves, so V8 places an edge block
   inline on the hot path. Levers: no moves on cold edges, or wasm branch
   hints.
+- **`varint_postcard` native.** Fixed by `bunroll`'s LCSSA
+  exit-cone repair (`95cab3a`, default-on `3f6a2ff`): the
+  `0..varint_max` decode loops now fully unroll to the
+  ldrb + const-shift `orr` + `tbz` shape LLVM emits (the `done`
+  exit's `i == max` check used to fail the free-var cone check).
+  Same-state A/B −16%.
+  History: `history/2026-11-05-bunroll-lcssa-varint.md`.
 - **`eqbug` native.** Root-caused: the kernel is ALU-port-bound
   (~5 int ops/cycle) and our loop executes ~6 more ALU ops/iter than
   LLVM's. The difference is `black_box` materialisation: LLVM lowers it
