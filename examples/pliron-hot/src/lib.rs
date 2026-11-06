@@ -156,12 +156,132 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
 /// targets (`__rcg_alloc.N` counters differ between builds) hash by content.
 pub type Prints = HashMap<String, u64>;
 
-pub fn fingerprints(f: &object::File) -> Prints {
-    fn sec_key(f: &object::File, si: SectionIndex, h: &mut DefaultHasher, deep: bool) {
-        let Ok(s) = f.section_by_index(si) else { return };
-        s.data().unwrap_or(&[]).hash(h);
-        for (o, r) in s.relocations() {
-            o.hash(h);
+/// Pre-parsed symbol: `symbol_by_index` re-decodes the nlist/symtab entry on
+/// every call, which dominates `fingerprints` on leaf crates with tens of
+/// thousands of relocations. Decode once into a table.
+struct Sym<'a> {
+    name: &'a str,
+    kind: SymbolKind,
+    sec: Option<SectionIndex>,
+    addr: u64,
+    size: u64,
+    def: bool,
+    undef: bool,
+    weak: bool,
+}
+
+/// Symbols of `f` indexed by `SymbolIndex`.
+fn symtab<'d, 'f>(f: &'f object::File<'d, &'d [u8]>) -> Vec<Option<Sym<'d>>> {
+    let mut v: Vec<Option<Sym<'d>>> = Vec::new();
+    for s in f.symbols() {
+        let i = s.index().0;
+        if i >= v.len() {
+            v.resize_with(i + 1, || None);
+        }
+        v[i] = Some(Sym {
+            name: s.name().unwrap_or(""),
+            kind: s.kind(),
+            sec: s.section_index(),
+            addr: s.address(),
+            size: s.size(),
+            def: s.is_definition(),
+            undef: s.is_undefined(),
+            weak: s.is_weak(),
+        });
+    }
+    v
+}
+
+/// Pre-parsed section.
+struct Sec<'d> {
+    data: &'d [u8],
+    size: u64,
+    align: u64,
+    kind: SectionKind,
+}
+
+/// One parse of a patch object, shared by `fingerprints` and the loaders:
+/// decoding the symtab and bucketing relocs once instead of per caller
+/// roughly halves apply time on large leaf crates.
+struct Parsed<'d> {
+    syms: Vec<Option<Sym<'d>>>,
+    secs: HashMap<SectionIndex, Sec<'d>>,
+    /// Relocations per section, sorted by offset.
+    relocs: HashMap<SectionIndex, Vec<(u64, object::Relocation)>>,
+    /// Sorted defined-symbol addresses per section (function extents).
+    by_sec: HashMap<SectionIndex, Vec<u64>>,
+}
+
+impl<'d> Parsed<'d> {
+    fn load(f: &object::File<'d, &'d [u8]>) -> Self {
+        let mut p = Parsed {
+            syms: symtab(f),
+            secs: HashMap::new(),
+            relocs: HashMap::new(),
+            by_sec: HashMap::new(),
+        };
+        for s in f.sections() {
+            p.secs.insert(
+                s.index(),
+                Sec {
+                    data: s.data().unwrap_or(&[]),
+                    size: s.size(),
+                    align: s.align(),
+                    kind: s.kind(),
+                },
+            );
+            let mut rs: Vec<_> = s.relocations().collect();
+            rs.sort_unstable_by_key(|&(o, _)| o);
+            p.relocs.insert(s.index(), rs);
+        }
+        for s in p.syms.iter().flatten() {
+            if let (Some(si), true) = (s.sec, s.def) {
+                p.by_sec.entry(si).or_default().push(s.addr);
+            }
+        }
+        for v in p.by_sec.values_mut() {
+            v.sort_unstable();
+        }
+        p
+    }
+
+    /// A symbol's byte range inside its section: explicit size, else up to
+    /// the next symbol in the same section (Mach-O nlist symbols carry no
+    /// size).
+    fn extent(&self, si: SectionIndex, a: u64, size: u64) -> (u64, u64) {
+        if size > 0 {
+            return (a, a + size);
+        }
+        let next = self
+            .by_sec
+            .get(&si)
+            .map(|v| v.partition_point(|&x| x <= a))
+            .and_then(|i| self.by_sec[&si].get(i).copied())
+            .unwrap_or_else(|| self.secs.get(&si).map(|s| s.size).unwrap_or(a));
+        (a, next.max(a))
+    }
+
+    /// Hash a function's byte range plus the relocations inside it. `deep`
+    /// follows data-section targets one level (per-function string/const
+    /// blobs) — relocatable objects keep symbol values and reloc offsets
+    /// section-relative, so `lo`/`hi` index `sec_data` directly.
+    fn hash_range(&self, si: SectionIndex, lo: u64, hi: u64, h: &mut DefaultHasher, deep: bool) {
+        if let Some(d) = self.secs.get(&si).map(|s| s.data) {
+            let (i0, i1) = (lo as usize, hi as usize);
+            if i1 <= d.len() && i0 <= i1 {
+                d[i0..i1].hash(h);
+            }
+        }
+        let Some(rs) = self.relocs.get(&si) else { return };
+        let i0 = rs.partition_point(|&(o, _)| o < lo);
+        for &(o, ref r) in &rs[i0..] {
+            if o >= hi {
+                break;
+            }
+            // Hash the offset relative to the function start: a function
+            // that moved because a neighbour grew keeps its fingerprint,
+            // avoiding spurious repoints of identical code.
+            (o - lo).hash(h);
             r.addend().hash(h);
             match r.flags() {
                 RelocationFlags::Elf { r_type } => r_type.hash(h),
@@ -172,36 +292,91 @@ pub fn fingerprints(f: &object::File) -> Prints {
             }
             match r.target() {
                 RelocationTarget::Symbol(i) => {
-                    let Ok(t) = f.symbol_by_index(i) else { continue };
-                    let name = t.name().unwrap_or("");
-                    if t.is_undefined() || t.kind() == SymbolKind::Text || is_mangled(name) {
-                        name.hash(h);
-                    } else if let (Some(ti), true) = (t.section_index(), deep) {
-                        t.address().hash(h);
-                        sec_key(f, ti, h, false);
+                    let Some(Some(t)) = self.syms.get(i.0) else { continue };
+                    if t.undef || t.kind == SymbolKind::Text || is_mangled(t.name) {
+                        t.name.hash(h);
+                    } else if let (Some(ti), true) = (t.sec, deep) {
+                        t.addr.hash(h);
+                        let (tlo, thi) = self.extent(ti, t.addr, t.size);
+                        self.hash_range(ti, tlo, thi, h, false);
                     }
                 }
-                RelocationTarget::Section(ti) if deep => sec_key(f, ti, h, false),
+                RelocationTarget::Section(ti) if deep => {
+                    let end = self.secs.get(&ti).map(|s| s.size).unwrap_or(0);
+                    self.hash_range(ti, 0, end, h, false);
+                }
                 _ => {}
             }
         }
     }
-    let mut out = HashMap::new();
-    for sym in f.symbols() {
-        if sym.kind() != SymbolKind::Text || !sym.is_definition() {
-            continue;
+}
+
+pub fn fingerprints(f: &object::File) -> Prints {
+    fingerprints_of(&Parsed::load(f))
+}
+
+/// Fingerprints over an already-parsed object. Each function's extent is its
+/// explicit size or up to the next symbol in its section; the hash covers its
+/// code bytes and the relocations inside it (anonymous targets by content —
+/// `__rcg_alloc.N` counters differ between builds). Work is split across
+/// threads since hashing dominates on large leaf crates.
+fn fingerprints_of(t: &Parsed) -> Prints {
+    let mut texts = Vec::new();
+    for (i, s) in t.syms.iter().enumerate() {
+        let Some(s) = s else { continue };
+        if s.def && s.kind == SymbolKind::Text && s.sec.is_some() {
+            texts.push((i, s.sec.unwrap()));
         }
-        let (Ok(name), Some(si)) = (sym.name(), sym.section_index()) else { continue };
-        let mut h = DefaultHasher::new();
-        sec_key(f, si, &mut h, true);
-        out.insert(name.to_string(), h.finish());
+    }
+
+    let mut out = HashMap::new();
+    let hash_fns = |chunk: &[(usize, SectionIndex)]| -> Vec<(String, u64)> {
+        let mut v = Vec::with_capacity(chunk.len());
+        for &(i, si) in chunk {
+            let s = t.syms[i].as_ref().unwrap();
+            let (lo, hi) = t.extent(si, s.addr, s.size);
+            let mut h = DefaultHasher::new();
+            t.hash_range(si, lo, hi, &mut h, true);
+            v.push((s.name.to_string(), h.finish()));
+        }
+        v
+    };
+    let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if texts.len() < 512 || nthreads == 1 {
+        out.extend(hash_fns(&texts));
+    } else {
+        let chunk = texts.len().div_ceil(nthreads);
+        let mut results: Vec<Vec<(String, u64)>> = Vec::new();
+        std::thread::scope(|sc| {
+            let mut hs = Vec::new();
+            for c in texts.chunks(chunk) {
+                hs.push(sc.spawn(|| hash_fns(c)));
+            }
+            for h in hs {
+                results.push(h.join().unwrap());
+            }
+        });
+        out.extend(results.into_iter().flatten());
     }
     out
 }
 
+/// A successfully applied patch: its fingerprints, the mapping it occupies
+/// (for `PLIRON_HOT_FREE` reclamation) and the slots it repointed.
+pub struct Applied {
+    /// Functions whose slots were repointed.
+    pub n: usize,
+    /// Fingerprints of this object — diff base for the next patch.
+    pub prints: Prints,
+    /// Functions repointed by name, and the mapping's extent.
+    fns: Vec<String>,
+    mem: usize,
+    len: usize,
+}
+
 /// Load one patch object, repointing the slots of functions that differ from
-/// `prev`. Returns how many were repointed and this object's fingerprints.
-pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, Prints), String> {
+/// `prev`. Returns what was repointed and this object's fingerprints.
+pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<Applied, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
     if matches!(f, object::File::MachO64(_)) {
@@ -333,7 +508,7 @@ pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, 
             reg((mem + eh) as *const u8);
         }
     }
-    let mut n = 0;
+    let mut fns = Vec::new();
     for sym in f.symbols() {
         if sym.kind() != SymbolKind::Text || !sym.is_definition() {
             continue;
@@ -345,10 +520,11 @@ pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, 
         if let Some(slot) = base.syms.get(&format!("__hot_slot.{name}")) {
             let new = mem + place[&sym.section_index().unwrap()] + sym.address() as usize;
             unsafe { (*(slot.addr as *const AtomicUsize)).store(new, Ordering::Release) };
-            n += 1;
+            fns.push(name.to_string());
         }
     }
-    Ok((n, prints))
+    let n = fns.len();
+    Ok(Applied { n, prints, fns, mem, len: plt0 + 8 * nrel })
 }
 
 // Darwin arm64: MAP_JIT pages obey a per-thread write/execute toggle and
@@ -401,72 +577,239 @@ fn imm12_shift(insn: u32) -> u32 {
     }
 }
 
-/// Patch in a Mach-O object: place its alloc sections in one RWX mapping,
-/// apply arm64 relocations, repoint the `__hot_slot.*` of changed functions.
+/// Patch in a Mach-O object: copy changed functions and non-code sections
+/// into one RWX mapping, apply the relocations inside those regions only,
+/// repoint the `__hot_slot.*` of changed functions. Unchanged patch functions
+/// are never mapped — references to them resolve to the live executable's
+/// thunk (which forwards through the live slot), so apply cost and memory
+/// grow with the size of the edit, not the crate.
 fn apply_macho<'d>(
     base: &Base,
     f: &object::File<'d, &'d [u8]>,
     prev: Option<&Prints>,
-) -> Result<(usize, Prints), String> {
-    let prints = fingerprints(f);
-    let changed = |n: &str| prev.is_none_or(|p| p.get(n) != prints.get(n));
+) -> Result<Applied, String> {
+    let dbg = std::env::var_os("PLIRON_HOT_DEBUG").is_some();
+    let t0 = std::time::Instant::now();
+    let p = Parsed::load(f);
+    let tparse = t0.elapsed();
+    let prints = fingerprints_of(&p);
+    if dbg {
+        eprintln!("[hot] parse {:?} fingerprints {:?}", tparse, t0.elapsed());
+    }
+    let changed = |n: &str| prev.is_none_or(|q| q.get(n) != prints.get(n));
 
-    // Layout: every real section goes in the mapping (debug/unwind
-    // metadata is not needed — Mach-O compact unwind cannot be
-    // registered post-load).
-    let mut place: HashMap<SectionIndex, usize> = HashMap::new();
-    let (mut off, mut nrel) = (0usize, 0usize);
+    let syms = &p.syms;
+    let relocs = &p.relocs;
+    // Sections the loader must not map (debug/unwind metadata is not needed —
+    // Mach-O compact unwind cannot be registered post-load).
+    let mut skip: HashSet<SectionIndex> = HashSet::new();
     for s in f.sections() {
         let name = s.name().unwrap_or("");
         let seg = s.segment_name().unwrap_or(None).unwrap_or("");
-        if seg == "__DWARF" || seg == "__LD" || name == "__unwind_info" || name == "__eh_frame" {
-            continue;
-        }
         if name.starts_with("__thread") {
             return Err("patch defines thread-locals; restart needed".into());
         }
-        if s.size() == 0 {
+        if seg == "__DWARF" || seg == "__LD" || name == "__unwind_info" || name == "__eh_frame"
+            || s.size() == 0
+        {
+            skip.insert(s.index());
+        }
+    }
+    let mut place: HashMap<SectionIndex, usize> = HashMap::new();
+    let mut text_secs: HashSet<SectionIndex> = HashSet::new();
+    for (&si, s) in &p.secs {
+        if skip.contains(&si) {
             continue;
         }
-        off = align(off, s.align().max(1) as usize);
-        place.insert(s.index(), off);
-        off += s.size() as usize;
-        nrel += s.relocations().count();
+        if s.kind == SectionKind::Text {
+            text_secs.insert(si);
+        } else {
+            place.insert(si, usize::MAX); // non-code sections: assigned below
+        }
+    }
+
+    let extent = |si: SectionIndex, a: u64, size: u64| p.extent(si, a, size);
+
+    // Live set: changed functions, plus the transitive closure of
+    // patch-defined text symbols they reference that the base cannot
+    // resolve (a live thunk forwards those that it can).
+    let mut live: HashMap<usize, (u64, u64)> = HashMap::new(); // symidx -> (lo,hi)
+    let mut wl: Vec<usize> = Vec::new();
+    let want = |live: &mut HashMap<usize, (u64, u64)>, wl: &mut Vec<usize>, t: &Sym, ti: usize| {
+        if t.def
+            && t.kind == SymbolKind::Text
+            && !live.contains_key(&ti)
+            && !base.syms.contains_key(t.name)
+        {
+            let (tlo, thi) = extent(t.sec.unwrap(), t.addr, t.size);
+            live.insert(ti, (tlo, thi));
+            wl.push(ti);
+        }
+    };
+    for (i, s) in syms.iter().enumerate() {
+        let Some(s) = s else { continue };
+        if s.def && s.kind == SymbolKind::Text && changed(s.name) {
+            let (lo, hi) = extent(s.sec.unwrap(), s.addr, s.size);
+            live.insert(i, (lo, hi));
+            wl.push(i);
+        }
+    }
+    // Only data reachable from live functions is copied: a probe-only patch
+    // skips the crate's whole `__const` tables and their relocations. Data
+    // sections may in turn reference patch-local functions (`__const`
+    // fn-pointer tables) and other data, so the worklist covers both.
+    let mut dsec: HashSet<SectionIndex> = HashSet::new();
+    let mut dwl: Vec<SectionIndex> = Vec::new();
+    loop {
+        if let Some(i) = wl.pop() {
+            let s = syms[i].as_ref().unwrap();
+            let si = s.sec.unwrap();
+            let (lo, hi) = live[&i];
+            if let Some(rs) = relocs.get(&si) {
+                let i0 = rs.partition_point(|&(o, _)| o < lo);
+                for &(o, ref r) in &rs[i0..] {
+                    if o >= hi {
+                        break;
+                    }
+                    match r.target() {
+                        RelocationTarget::Symbol(ti) => {
+                            if let Some(Some(t)) = syms.get(ti.0) {
+                                if t.kind == SymbolKind::Text {
+                                    want(&mut live, &mut wl, t, ti.0);
+                                } else if let Some(ti) = t.sec {
+                                    if place.contains_key(&ti) && dsec.insert(ti) {
+                                        dwl.push(ti);
+                                    }
+                                }
+                            }
+                        }
+                        RelocationTarget::Section(ti) => {
+                            if place.contains_key(&ti) && dsec.insert(ti) {
+                                dwl.push(ti);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if let Some(di) = dwl.pop() {
+            if let Some(rs) = relocs.get(&di) {
+                for (_, r) in rs {
+                    match r.target() {
+                        RelocationTarget::Symbol(ti) => {
+                            if let Some(Some(t)) = syms.get(ti.0) {
+                                if t.kind == SymbolKind::Text {
+                                    want(&mut live, &mut wl, t, ti.0);
+                                } else if let Some(ti) = t.sec {
+                                    if place.contains_key(&ti) && dsec.insert(ti) {
+                                        dwl.push(ti);
+                                    }
+                                }
+                            }
+                        }
+                        RelocationTarget::Section(ti) => {
+                            if place.contains_key(&ti) && dsec.insert(ti) {
+                                dwl.push(ti);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Layout: [live fn ranges, packed][non-code sections][GOT][stubs].
+    let mut fndst: HashMap<usize, usize> = HashMap::new(); // symidx -> mem offset
+    let (mut off, mut nrel) = (0usize, 0usize);
+    let mut livev: Vec<(usize, u64, u64)> = live.iter().map(|(&i, &r)| (i, r.0, r.1)).collect();
+    livev.sort_unstable();
+    for &(i, lo, hi) in &livev {
+        off = align(off, 16);
+        fndst.insert(i, off);
+        off += (hi - lo) as usize;
+    }
+    for &si in &dsec {
+        let s = &p.secs[&si];
+        off = align(off, s.align.max(1) as usize);
+        place.insert(si, off);
+        off += s.size as usize;
+        nrel += relocs.get(&si).map_or(0, |r| r.len());
     }
     let got0 = align(off, 8);
     let stub0 = got0 + 8 * (nrel + 64);
+    let t1 = std::time::Instant::now();
+    if dbg {
+        eprintln!("[hot] layout {:?}", t1.duration_since(t0));
+    }
     let mem = map_near(base.end, stub0 + 16 * nrel)?;
+    if dbg {
+        eprintln!("[hot] map {:?}", t1.elapsed());
+    }
     jit_writeable(stub0 + 16 * nrel, mem, || -> Result<(), String> {
-        for s in f.sections() {
-            let Some(&o) = place.get(&s.index()) else { continue };
-            if s.kind() == SectionKind::UninitializedData {
+        for &(i, lo, hi) in &livev {
+            let s = &syms[i].as_ref().unwrap();
+            let d = p.secs[&s.sec.unwrap()].data;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    d.as_ptr().add(lo as usize),
+                    (mem + fndst[&i]) as *mut u8,
+                    (hi - lo) as usize,
+                )
+            };
+        }
+        for &si in &dsec {
+            let s = &p.secs[&si];
+            let o = place[&si];
+            if s.kind == SectionKind::UninitializedData {
                 continue;
             }
-            let d = s.data().map_err(|e| e.to_string())?;
-            unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), (mem + o) as *mut u8, d.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.data.as_ptr(), (mem + o) as *mut u8, s.data.len())
+            };
+        }
+        if dbg {
+            eprintln!("[hot] copy {:?}", t1.elapsed());
         }
 
     let mut missing = Vec::new();
-    let mut resolve = |sym: &object::Symbol<'_, '_>| -> usize {
-        if let Some(&o) = sym.section_index().and_then(|i| place.get(&i)) {
-            let local = mem + o + sym.address() as usize;
-            if sym.kind() == SymbolKind::Section {
-                return local;
-            }
-            let name = sym.name().unwrap_or("");
-            match base.syms.get(name) {
-                Some(b) if sym.kind() == SymbolKind::Text && !changed(name) => b.addr,
-                Some(b) if b.writable && b.unique && sym.kind() == SymbolKind::Data && is_mangled(name) => b.addr,
-                _ => local,
-            }
-        } else {
-            let name = sym.name().unwrap_or("");
-            base.lookup(name).unwrap_or_else(|| {
-                if !sym.is_weak() {
-                    missing.push(name.to_string());
+    let resolve = |i: usize, s: &Sym, missing: &mut Vec<String>| -> usize {
+        match s.kind {
+            SymbolKind::Section => s
+                .sec
+                .and_then(|si| place.get(&si))
+                .filter(|&&o| o != usize::MAX)
+                .map(|&o| mem + o + s.addr as usize)
+                .unwrap_or_else(|| {
+                    missing.push("<anonymous section symbol>".to_string());
+                    0
+                }),
+            SymbolKind::Text if fndst.contains_key(&i) => mem + fndst[&i],
+            _ => {
+                let b = base.syms.get(s.name);
+                match (s.kind, b) {
+                    (SymbolKind::Text, Some(b)) => b.addr,
+                    (SymbolKind::Data, Some(b)) if b.writable && b.unique && is_mangled(s.name) => {
+                        b.addr
+                    }
+                    (_, Some(b)) if s.sec.is_none() => b.addr,
+                    _ => s
+                        .sec
+                        .and_then(|si| place.get(&si))
+                        .filter(|&&o| o != usize::MAX)
+                        .map(|o| mem + o + s.addr as usize)
+                        .unwrap_or_else(|| {
+                            base.lookup(s.name).unwrap_or_else(|| {
+                                if !s.weak {
+                                    missing.push(s.name.to_string());
+                                }
+                                0
+                            })
+                        }),
                 }
-                0
-            })
+            }
         }
     };
     let mut got: HashMap<usize, usize> = Default::default();
@@ -491,28 +834,38 @@ fn apply_macho<'d>(
         a
     };
 
-    for s in f.sections() {
-        let Some(&so) = place.get(&s.index()) else { continue };
-        for (o, r) in s.relocations() {
-            let p = mem + so + o as usize;
-            let dbg = std::env::var_os("PLIRON_HOT_DEBUG").is_some();
-            let mut tgt_of = |r: &object::Relocation| -> Option<usize> {
-                match r.target() {
-                    RelocationTarget::Symbol(i) => f
-                        .symbol_by_index(i)
-                        .ok()
-                        .map(|sy| {
-                            let v = resolve(&sy);
-                            if dbg {
-                                eprintln!("[hot] reloc {o:#x} {:?} -> {v:#x}", sy.name());
-                            }
-                            v
-                        }),
-                    RelocationTarget::Section(i) => place.get(&i).map(|&x| mem + x),
-                    _ => None,
-                }
+    let apply_relocs = |si: SectionIndex,
+                            lo: u64,
+                            hi: u64,
+                            base_addr: usize,
+                            missing: &mut Vec<String>,
+                            got_slot: &mut dyn FnMut(usize) -> usize,
+                            stub: &mut dyn FnMut(usize) -> usize|
+     -> Result<(), String> {
+        let Some(rs) = relocs.get(&si) else { return Ok(()) };
+        let i0 = rs.partition_point(|&(o, _)| o < lo);
+        let mut napp = 0usize;
+        for &(o, ref r) in &rs[i0..] {
+            if o >= hi {
+                break;
+            }
+            napp += 1;
+            let p = base_addr + (o - lo) as usize;
+            let mut tgt = match r.target() {
+                RelocationTarget::Symbol(i) => match syms.get(i.0) {
+                    Some(Some(sy)) => resolve(i.0, sy, missing),
+                    _ => continue,
+                },
+                RelocationTarget::Section(i) => match place.get(&i).filter(|&&x| x != usize::MAX) {
+                    Some(&x) => mem + x,
+                    None => {
+                        return Err(format!(
+                            "section-target reloc into unmapped section {i:?}; restart needed"
+                        ))
+                    }
+                },
+                _ => continue,
             };
-            let Some(mut tgt) = tgt_of(&r) else { continue };
             let a = r.addend();
             let RelocationFlags::MachO { r_type, r_length, .. } = r.flags() else {
                 continue;
@@ -532,8 +885,8 @@ fn apply_macho<'d>(
                     // UNSIGNED reloc object folds in as `subtractor()`.
                     let sub = r
                         .subtractor()
-                        .and_then(|i| f.symbol_by_index(i).ok())
-                        .map(|sy| resolve(&sy))
+                        .and_then(|i| syms.get(i.0).and_then(|o| o.as_ref()).map(|s| (i.0, s)))
+                        .map(|(si, sy)| resolve(si, sy, missing))
                         .unwrap_or(0);
                     tgt = tgt.wrapping_sub(sub).wrapping_add(a as usize);
                     match r_length {
@@ -610,7 +963,36 @@ fn apply_macho<'d>(
                 t => return Err(format!("unsupported arm64 relocation type {t}")),
             }
         }
+        if dbg {
+            eprintln!("[hot]   range {si:?} lo={lo:#x} hi={hi:#x} applied {napp}");
+        }
+        Ok(())
+    };
+    for &(i, lo, hi) in &livev {
+        apply_relocs(
+            syms[i].as_ref().unwrap().sec.unwrap(),
+            lo,
+            hi,
+            mem + fndst[&i],
+            &mut missing,
+            &mut got_slot,
+            &mut stub,
+        )?;
     }
+        let tapp = t1.elapsed();
+    for &si in &dsec {
+        let o = place[&si];
+        let end = p.secs.get(&si).map(|s| s.size).unwrap_or(0);
+        apply_relocs(si, 0, end, mem + o, &mut missing, &mut got_slot, &mut stub)?;
+    }
+        if dbg {
+            eprintln!(
+                "[hot] apply {:?} (fns {} data {} relocs {tapp:?})",
+                t1.elapsed(),
+                livev.len(),
+                dsec.len()
+            );
+        }
         if !missing.is_empty() {
             missing.sort();
             missing.dedup();
@@ -618,22 +1000,25 @@ fn apply_macho<'d>(
         }
         Ok(())
     })?;
-    let mut n = 0;
-    for sym in f.symbols() {
-        if sym.kind() != SymbolKind::Text || !sym.is_definition() {
+    if dbg {
+        eprintln!("[hot] relocs {:?}", t0.elapsed());
+    }
+    let mut fns = Vec::new();
+    for (i, s) in syms.iter().enumerate() {
+        let Some(s) = s else { continue };
+        if s.kind != SymbolKind::Text || !s.def || !changed(s.name) {
             continue;
         }
-        let Ok(name) = sym.name() else { continue };
-        if !changed(name) {
-            continue;
-        }
-        if let Some(slot) = base.syms.get(&format!("__hot_slot.{name}")) {
-            let new = mem + place[&sym.section_index().unwrap()] + sym.address() as usize;
-            unsafe { (*(slot.addr as *const AtomicUsize)).store(new, Ordering::Release) };
-            n += 1;
+        if let Some(slot) = base.syms.get(&format!("__hot_slot.{}", s.name)) {
+            unsafe { (*(slot.addr as *const AtomicUsize)).store(mem + fndst[&i], Ordering::Release) };
+            if dbg {
+                eprintln!("[hot] repoint {}", s.name);
+            }
+            fns.push(s.name.to_string());
         }
     }
-    Ok((n, prints))
+    let n = fns.len();
+    Ok(Applied { n, prints, fns, mem, len: stub0 + 16 * nrel })
 }
 
 /// If `PLIRON_HOT_DIR` is set, apply every `*.o` that appears in it, in name order.
@@ -647,6 +1032,14 @@ pub fn start() {
             Err(e) => return eprintln!("[hot] disabled: {e}"),
         };
         let mut seen = HashSet::new();
+        let free = std::env::var_os("PLIRON_HOT_FREE").is_some();
+        let grace: usize = std::env::var("PLIRON_HOT_GRACE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let mut gnr = 0usize;
+        let mut applied: Vec<(usize, usize, HashSet<String>, usize)> = Vec::new();
+        let mut provider: HashMap<String, usize> = HashMap::new();
         loop {
             let mut new: Vec<_> = std::fs::read_dir(&dir)
                 .into_iter()
@@ -664,9 +1057,24 @@ pub fn start() {
             for p in new {
                 let t = std::time::Instant::now();
                 match apply(&base, &p, prev.as_ref()) {
-                    Ok((n, prints)) => {
-                        prev = Some(prints);
-                        eprintln!("[hot] {}: {n} functions patched in {:?}", p.display(), t.elapsed())
+                    Ok(ap) => {
+                        gnr += 1;
+                        for name in &ap.fns {
+                            provider.insert(name.clone(), gnr);
+                        }
+                        eprintln!("[hot] {}: {} functions patched in {:?}", p.display(), ap.n, t.elapsed());
+                        prev = Some(ap.prints);
+                        applied.push((ap.mem, ap.len, ap.fns.iter().cloned().collect(), gnr));
+                        if free {
+                            applied.retain(|&(mem, len, ref fns, g)| {
+                                let keep = g + grace > gnr
+                                    || !fns.iter().all(|n| provider.get(n).is_some_and(|&pg| pg > g));
+                                if !keep {
+                                    unsafe { libc::munmap(mem as *mut _, len) };
+                                }
+                                keep
+                            });
+                        }
                     }
                     Err(e) => eprintln!("[hot] {}: {e}", p.display()),
                 }
