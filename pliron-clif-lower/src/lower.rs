@@ -1386,7 +1386,12 @@ pub fn lower_module<'a>(
                 .declare_function(crate::obj_sym(n), Linkage::Import, &sig)
                 .unwrap();
             hot_bodies.insert(n.clone(), body);
-            hot_asm.push_str(&crate::hot::thunk_asm(n, l));
+            hot_asm.push_str(&crate::hot::thunk_asm(
+                n,
+                l,
+                macho,
+                isa.triple().architecture == target_lexicon::Architecture::X86_64,
+            ));
             ids.insert(n.clone(), Sym::F(thunk, f.ty));
             continue;
         }

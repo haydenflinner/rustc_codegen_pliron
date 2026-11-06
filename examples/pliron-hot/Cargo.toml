@@ -6,5 +6,5 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-object = { version = "0.39", default-features = false, features = ["std", "read_core", "elf"] }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "elf", "macho"] }
 libc = "0.2"

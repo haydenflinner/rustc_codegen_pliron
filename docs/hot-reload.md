@@ -1,0 +1,109 @@
+# Hot reload for Rust applications (`PLIRON_HOT`)
+
+Subsecond-style hot reload without a linker in the loop: edit a file, the
+crate is recompiled to one relocatable object, and the running process
+maps it in place. Functions that changed are repointed; the ones that did
+not keep running; statics keep their live state. Works on x86_64 Linux
+(ELF) and arm64 macOS (Mach-O).
+
+## Getting started
+
+1. Build the backend (`cargo build` at the repo root produces
+   `target/debug/librustc_codegen_pliron.{so,dylib}`).
+
+2. Add the runtime helper to your crate:
+
+   ```toml
+   [dependencies]
+   pliron_hot = { path = ".../examples/pliron-hot" }
+   ```
+
+   ```rust
+   fn main() {
+       pliron_hot::start(); // watches $PLIRON_HOT_DIR for patch objects
+       // ... your application as usual
+   }
+   ```
+
+3. Run the dev loop from your crate's directory:
+
+   ```bash
+   path/to/examples/hot-dev.sh . -- your-app-args
+   ```
+
+   It builds the crate with `PLIRON_HOT` + `-Ccodegen-units=1`, writes
+   `target/hot/patches/base.ref` (the fingerprint reference), starts your
+   app with `PLIRON_HOT_DIR` pointing at that directory, and rebuilds a
+   patch object on every change under `src/`. Each patch lands in the
+   running process in ~1 ms once built.
+
+## How it works
+
+With `PLIRON_HOT=<crate>` the backend emits every function of that crate
+as a body `<sym>.hot` plus a stable thunk `<sym>` that jumps through a
+writable `__hot_slot.<sym>` pointer (`pliron-clif-lower/src/hot.rs`).
+Calls, function pointers and vtables all go through the thunk, so the
+loader only ever repoints one cell per function.
+
+A patch is the same crate recompiled normally (`--emit=obj`). The
+`pliron_hot` runtime (`examples/pliron-hot`) watches `PLIRON_HOT_DIR`,
+fingerprints each new object against `base.ref` / the previous patch,
+maps it near the executable, resolves undefined symbols against the
+executable's symbol table (then `dlsym`), binds writable statics to the
+live copies so state survives, and repoints the slots of the functions
+whose code changed.
+
+On macOS the patch is mapped with `MAP_JIT`, written while
+`pthread_jit_write_protect_np` is off, made executable again, and the
+instruction cache is invalidated before any slot is repointed.
+
+## Manual invocation (what the script does)
+
+```bash
+export RUSTFLAGS="-Zcodegen-backend=.../librustc_codegen_pliron.dylib -Ccodegen-units=1"
+PLIRON_HOT=<crate_name> cargo build --bin <crate_name>   # thunked base
+cargo rustc --bin <crate_name> -- --emit=obj=target/hot/patches/base.ref
+PLIRON_HOT_DIR=target/hot/patches ./target/debug/<crate_name>
+# after each edit:
+cargo rustc --bin <crate_name> -- --emit=obj=target/hot/p.o
+mv target/hot/p.o target/hot/patches/0001.o   # name-sorted apply order
+```
+
+`PLIRON_HOT` takes the crate name (underscores, not hyphens).
+`-Ccodegen-units=1` is required so the crate is one object. Emit the
+patch outside the patch directory and move it in atomically — a watcher
+can pick up a partially written object otherwise. Files matching
+`*.rcgu.o` (rustc intermediates) are ignored.
+
+## Environment variables
+
+- `PLIRON_HOT=<crate>` — emit the named crate's functions patchably.
+- `PLIRON_HOT_DIR=<dir>` — runtime: directory watched for `*.o` patches
+  (plus `base.ref` fingerprints). Unset = hot reload off, thunks cost one
+  indirect jump.
+- `PLIRON_HOT_DEBUG=1` — print each symbol resolution during a patch
+  apply.
+
+## Limits
+
+- x86_64 ELF and arm64 Mach-O only (the thunk assembly and the
+  relocations are per-platform; other targets need a port).
+- `main` itself is not patchable (the C entry point is excluded).
+- Patches that define or use thread-locals are rejected — restart.
+- Changing a struct/enum layout that live state depends on needs a
+  restart; new code sees old-layout values otherwise.
+- New dependencies of the patch that are not already in the process
+  (new extern symbols) fail the apply with a "symbols not in the running
+  binary" diagnostic.
+- Mach-O compact unwind cannot be registered post-load: panics
+  unwinding through patched frames do not get unwind metadata (the patch
+  code still runs correctly; `.eh_frame` registration is automatic on
+  ELF).
+- On macOS the base executable needs a symbol table (the default —
+  do not pass `-Wl,-x` / strip it).
+
+## Smoke test
+
+`tests/hot/run.sh` exercises the whole path on both platforms: run the
+base, edit `value()` to read a static, drop the patch in and check the
+process prints the live-static result (~80 ms patch build, ~1 ms apply).

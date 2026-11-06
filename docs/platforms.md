@@ -55,7 +55,7 @@ builds and runs with zero VS inputs.
   functions on the platform ABI. `ArgumentPurpose::StructArgument` (byval) is
   unsupported by cranelift-aarch64, but rustc never emits on-stack indirect
   args for AAPCS64.
-- The asm test covers x86-64 and aarch64; PLIRON_HOT is x86-64/ELF only.
+- The asm test covers x86-64 and aarch64; PLIRON_HOT is x86-64/ELF and arm64/Mach-O.
 - Cross-target codegen: cranelift-codegen is built `host-arch`-only
   (Cargo.toml), so the dylib can't emit other architectures —
   `error: cranelift: Support for this target is disabled`. Flip to

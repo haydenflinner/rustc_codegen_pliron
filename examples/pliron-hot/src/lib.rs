@@ -21,6 +21,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[inline(never)]
 pub extern "C" fn pliron_hot_anchor() {}
 
+fn exe_path() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)]
+    unsafe {
+        let p = libc::_dyld_get_image_name(0);
+        if !p.is_null() {
+            return Ok(std::path::PathBuf::from(
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    Ok(std::path::PathBuf::from("/proc/self/exe"))
+}
+
 struct BaseSym {
     addr: usize,
     writable: bool,
@@ -35,7 +49,8 @@ pub struct Base {
 
 impl Base {
     pub fn load() -> Result<Base, String> {
-        let bytes = std::fs::read("/proc/self/exe").map_err(|e| e.to_string())?;
+        let path = exe_path()?;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
         let mut raw = HashMap::new();
         for s in f.symbols() {
@@ -53,7 +68,11 @@ impl Base {
                 *e = (s.address() as usize, writable, true, e.3);
             }
         }
-        let anchor = raw.get("pliron_hot_anchor").ok_or("executable has no symbol table")?.0;
+        let anchor = raw
+            .get("pliron_hot_anchor")
+            .or_else(|| raw.get("_pliron_hot_anchor"))
+            .ok_or("executable has no symbol table")?
+            .0;
         let slide = (pliron_hot_anchor as *const () as usize).wrapping_sub(anchor);
         let end = f.segments().map(|s| (s.address() + s.size()) as usize).max().unwrap_or(0).wrapping_add(slide);
         let syms = raw
@@ -67,6 +86,9 @@ impl Base {
         if let Some(s) = self.syms.get(name) {
             return Some(s.addr);
         }
+        // dlsym wants the C spelling: Mach-O file names carry one extra `_`.
+        #[cfg(target_os = "macos")]
+        let name = name.strip_prefix('_').unwrap_or(name);
         let c = std::ffi::CString::new(name).ok()?;
         let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
         (!p.is_null()).then_some(p as usize)
@@ -74,7 +96,9 @@ impl Base {
 }
 
 fn is_mangled(n: &str) -> bool {
-    n.starts_with("_R") || n.starts_with("_ZN")
+    // ELF spells Rust names `_R*`/`_ZN*`; Mach-O adds one more leading `_`.
+    let t = n.strip_prefix('_').unwrap_or(n);
+    n.starts_with("_R") || n.starts_with("_ZN") || t.starts_with("_R") || t.starts_with("_ZN")
 }
 
 fn align(x: usize, a: usize) -> usize {
@@ -101,12 +125,14 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
         // advance when the kernel picked a spot beyond PC32 reach.
         #[cfg(not(target_os = "linux"))]
         let p = {
+            // Darwin arm64 rejects plain RWX maps; MAP_JIT pages may be
+            // written and executed on unsigned binaries.
             let p = unsafe {
                 libc::mmap(
                     hint as *mut _,
                     len,
                     libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
                     -1,
                     0,
                 )
@@ -137,8 +163,12 @@ pub fn fingerprints(f: &object::File) -> Prints {
         for (o, r) in s.relocations() {
             o.hash(h);
             r.addend().hash(h);
-            if let RelocationFlags::Elf { r_type } = r.flags() {
-                r_type.hash(h);
+            match r.flags() {
+                RelocationFlags::Elf { r_type } => r_type.hash(h),
+                RelocationFlags::MachO { r_type, r_pcrel, r_length } => {
+                    (r_type, r_pcrel, r_length).hash(h)
+                }
+                _ => {}
             }
             match r.target() {
                 RelocationTarget::Symbol(i) => {
@@ -174,6 +204,9 @@ pub fn fingerprints(f: &object::File) -> Prints {
 pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, Prints), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
+    if matches!(f, object::File::MachO64(_)) {
+        return apply_macho(base, &f, prev);
+    }
     let prints = fingerprints(&f);
     let changed = |n: &str| prev.is_none_or(|p| p.get(n) != prints.get(n));
 
@@ -318,6 +351,291 @@ pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, 
     Ok((n, prints))
 }
 
+// Darwin arm64: MAP_JIT pages obey a per-thread write/execute toggle and
+// code writes must be made visible to the instruction cache.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_jit_write_protect_np(enabled: i32);
+    fn sys_icache_invalidate(start: *const u8, size: usize);
+}
+
+#[cfg(target_os = "macos")]
+fn jit_writeable<T>(len: usize, mem: usize, f: impl FnOnce() -> T) -> T {
+    unsafe { pthread_jit_write_protect_np(0) };
+    let r = f();
+    unsafe {
+        sys_icache_invalidate(mem as *const u8, len);
+        pthread_jit_write_protect_np(1);
+    }
+    r
+}
+
+#[cfg(not(target_os = "macos"))]
+fn jit_writeable<T>(_len: usize, _mem: usize, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// Mach-O arm64 relocation types (mach-o/reloc.h).
+mod a64 {
+    pub const UNSIGNED: u8 = 0;
+    pub const SUBTRACTOR: u8 = 1;
+    pub const BRANCH26: u8 = 2;
+    pub const PAGE21: u8 = 3;
+    pub const PAGEOFF12: u8 = 4;
+    pub const GOT_LOAD_PAGE21: u8 = 5;
+    pub const GOT_LOAD_PAGEOFF12: u8 = 6;
+    pub const POINTER_TO_GOT: u8 = 7;
+    pub const TLV_PAGE21: u8 = 8;
+    pub const TLV_PAGEOFF12: u8 = 9;
+}
+
+/// imm12 scale for an unsigned-immediate load/store: access size is in
+/// insn[31:30] for GPR/FP, `ldr q` takes 16 bytes, `add` takes raw bytes.
+fn imm12_shift(insn: u32) -> u32 {
+    if insn & 0x3b00_0000 == 0x3d00_0000 {
+        4
+    } else if insn & 0x3b00_0000 == 0x3900_0000 {
+        insn >> 30
+    } else {
+        0
+    }
+}
+
+/// Patch in a Mach-O object: place its alloc sections in one RWX mapping,
+/// apply arm64 relocations, repoint the `__hot_slot.*` of changed functions.
+fn apply_macho<'d>(
+    base: &Base,
+    f: &object::File<'d, &'d [u8]>,
+    prev: Option<&Prints>,
+) -> Result<(usize, Prints), String> {
+    let prints = fingerprints(f);
+    let changed = |n: &str| prev.is_none_or(|p| p.get(n) != prints.get(n));
+
+    // Layout: every real section goes in the mapping (debug/unwind
+    // metadata is not needed — Mach-O compact unwind cannot be
+    // registered post-load).
+    let mut place: HashMap<SectionIndex, usize> = HashMap::new();
+    let (mut off, mut nrel) = (0usize, 0usize);
+    for s in f.sections() {
+        let name = s.name().unwrap_or("");
+        let seg = s.segment_name().unwrap_or(None).unwrap_or("");
+        if seg == "__DWARF" || seg == "__LD" || name == "__unwind_info" || name == "__eh_frame" {
+            continue;
+        }
+        if name.starts_with("__thread") {
+            return Err("patch defines thread-locals; restart needed".into());
+        }
+        if s.size() == 0 {
+            continue;
+        }
+        off = align(off, s.align().max(1) as usize);
+        place.insert(s.index(), off);
+        off += s.size() as usize;
+        nrel += s.relocations().count();
+    }
+    let got0 = align(off, 8);
+    let stub0 = got0 + 8 * (nrel + 64);
+    let mem = map_near(base.end, stub0 + 16 * nrel)?;
+    jit_writeable(stub0 + 16 * nrel, mem, || -> Result<(), String> {
+        for s in f.sections() {
+            let Some(&o) = place.get(&s.index()) else { continue };
+            if s.kind() == SectionKind::UninitializedData {
+                continue;
+            }
+            let d = s.data().map_err(|e| e.to_string())?;
+            unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), (mem + o) as *mut u8, d.len()) };
+        }
+
+    let mut missing = Vec::new();
+    let mut resolve = |sym: &object::Symbol<'_, '_>| -> usize {
+        if let Some(&o) = sym.section_index().and_then(|i| place.get(&i)) {
+            let local = mem + o + sym.address() as usize;
+            if sym.kind() == SymbolKind::Section {
+                return local;
+            }
+            let name = sym.name().unwrap_or("");
+            match base.syms.get(name) {
+                Some(b) if sym.kind() == SymbolKind::Text && !changed(name) => b.addr,
+                Some(b) if b.writable && b.unique && sym.kind() == SymbolKind::Data && is_mangled(name) => b.addr,
+                _ => local,
+            }
+        } else {
+            let name = sym.name().unwrap_or("");
+            base.lookup(name).unwrap_or_else(|| {
+                if !sym.is_weak() {
+                    missing.push(name.to_string());
+                }
+                0
+            })
+        }
+    };
+    let mut got: HashMap<usize, usize> = Default::default();
+    let mut got_slot = |s: usize| -> usize {
+        let n = got.len();
+        *got.entry(s).or_insert_with(|| {
+            let g = mem + got0 + 8 * n;
+            unsafe { (g as *mut usize).write(s) };
+            g
+        })
+    };
+    let mut nstub = 0usize;
+    let mut stub = |tgt: usize| -> usize {
+        // ldr x16, [pc, #8]; br x16; .quad tgt — 16 bytes, reaches anywhere
+        let a = mem + stub0 + 16 * nstub;
+        nstub += 1;
+        unsafe {
+            (a as *mut u32).write(0x5800_0050); // ldr x16, #8
+            ((a + 4) as *mut u32).write(0xd61f_0200); // br x16
+            ((a + 8) as *mut u64).write_unaligned(tgt as u64);
+        }
+        a
+    };
+
+    for s in f.sections() {
+        let Some(&so) = place.get(&s.index()) else { continue };
+        for (o, r) in s.relocations() {
+            let p = mem + so + o as usize;
+            let dbg = std::env::var_os("PLIRON_HOT_DEBUG").is_some();
+            let mut tgt_of = |r: &object::Relocation| -> Option<usize> {
+                match r.target() {
+                    RelocationTarget::Symbol(i) => f
+                        .symbol_by_index(i)
+                        .ok()
+                        .map(|sy| {
+                            let v = resolve(&sy);
+                            if dbg {
+                                eprintln!("[hot] reloc {o:#x} {:?} -> {v:#x}", sy.name());
+                            }
+                            v
+                        }),
+                    RelocationTarget::Section(i) => place.get(&i).map(|&x| mem + x),
+                    _ => None,
+                }
+            };
+            let Some(mut tgt) = tgt_of(&r) else { continue };
+            let a = r.addend();
+            let RelocationFlags::MachO { r_type, r_length, .. } = r.flags() else {
+                continue;
+            };
+            match r_type {
+                a64::UNSIGNED => match r_length {
+                    3 => unsafe {
+                        (p as *mut u64).write_unaligned(tgt.wrapping_add(a as usize) as u64)
+                    },
+                    2 => unsafe {
+                        (p as *mut u32).write_unaligned(tgt.wrapping_add(a as usize) as u32)
+                    },
+                    _ => {}
+                },
+                a64::SUBTRACTOR => {
+                    // `minuend - subtrahend`: the subtrahend is the paired
+                    // UNSIGNED reloc object folds in as `subtractor()`.
+                    let sub = r
+                        .subtractor()
+                        .and_then(|i| f.symbol_by_index(i).ok())
+                        .map(|sy| resolve(&sy))
+                        .unwrap_or(0);
+                    tgt = tgt.wrapping_sub(sub).wrapping_add(a as usize);
+                    match r_length {
+                        3 => unsafe { (p as *mut u64).write_unaligned(tgt as u64) },
+                        2 => unsafe { (p as *mut u32).write_unaligned(tgt as u32) },
+                        _ => {}
+                    }
+                }
+                a64::BRANCH26 => {
+                    let a = (tgt as i64).wrapping_add(a).wrapping_sub(p as i64);
+                    let t = if (-(1 << 27)..(1 << 27)).contains(&(a >> 2)) {
+                        tgt
+                    } else {
+                        stub(tgt)
+                    };
+                    let a = (t as i64).wrapping_add(0).wrapping_sub(p as i64);
+                    if (a & 3) != 0 || !(-(1 << 27)..(1 << 27)).contains(&(a >> 2)) {
+                        return Err("BRANCH26 out of range".into());
+                    }
+                    unsafe {
+                        let w = p as *mut u32;
+                        *w = (*w & !0x03ff_ffff) | (((a >> 2) as u32) & 0x03ff_ffff);
+                    }
+                }
+                a64::PAGE21 => {
+                    let v = (((tgt as i64) + a) >> 12) - (p as i64 >> 12);
+                    unsafe {
+                        let w = p as *mut u32;
+                        *w = (*w & !0x60ff_ffe0)
+                            | (((v as u32) & 3) << 29)
+                            | ((((v >> 2) as u32) & 0x7ffff) << 5);
+                    }
+                }
+                a64::PAGEOFF12 => {
+                    let off = (tgt as u64).wrapping_add(a as u64) & 0xfff;
+                    unsafe {
+                        let w = p as *mut u32;
+                        let insn = *w;
+                        // Unsigned-imm loads scale imm12 by the access size
+                        // in insn[31:30]; `add`-style targets take raw bytes.
+                        let shift = imm12_shift(insn);
+                        *w = (insn & !0x003f_fc00) | (((off >> shift) as u32) << 10);
+                    }
+                }
+                a64::GOT_LOAD_PAGE21 => {
+                    let g = got_slot(tgt);
+                    let v = ((g as i64) >> 12) - (p as i64 >> 12);
+                    unsafe {
+                        let w = p as *mut u32;
+                        *w = (*w & !0x60ff_ffe0)
+                            | (((v as u32) & 3) << 29)
+                            | ((((v >> 2) as u32) & 0x7ffff) << 5);
+                    }
+                }
+                a64::GOT_LOAD_PAGEOFF12 => {
+                    let g = got_slot(tgt);
+                    let off = g as u64 & 0xfff;
+                    unsafe {
+                        let w = p as *mut u32;
+                        let insn = *w;
+                        let shift = imm12_shift(insn);
+                        *w = (insn & !0x003f_fc00) | (((off >> shift) as u32) << 10);
+                    }
+                }
+                a64::POINTER_TO_GOT => {
+                    let g = got_slot(tgt);
+                    let v = g as i64 - p as i64;
+                    let v = i32::try_from(v).map_err(|_| "POINTER_TO_GOT out of range")?;
+                    unsafe { (p as *mut i32).write_unaligned(v) };
+                }
+                a64::TLV_PAGE21 | a64::TLV_PAGEOFF12 => {
+                    return Err("patch uses thread-locals; restart needed".into())
+                }
+                t => return Err(format!("unsupported arm64 relocation type {t}")),
+            }
+        }
+    }
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            return Err(format!("{} symbols not in the running binary, e.g. {:?}", missing.len(), &missing[..missing.len().min(5)]));
+        }
+        Ok(())
+    })?;
+    let mut n = 0;
+    for sym in f.symbols() {
+        if sym.kind() != SymbolKind::Text || !sym.is_definition() {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        if !changed(name) {
+            continue;
+        }
+        if let Some(slot) = base.syms.get(&format!("__hot_slot.{name}")) {
+            let new = mem + place[&sym.section_index().unwrap()] + sym.address() as usize;
+            unsafe { (*(slot.addr as *const AtomicUsize)).store(new, Ordering::Release) };
+            n += 1;
+        }
+    }
+    Ok((n, prints))
+}
+
 /// If `PLIRON_HOT_DIR` is set, apply every `*.o` that appears in it, in name order.
 pub fn start() {
     let Some(dir) = std::env::var_os("PLIRON_HOT_DIR") else { return };
@@ -335,7 +653,12 @@ pub fn start() {
                 .flatten()
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "o") && !seen.contains(p))
+                .filter(|p| {
+                    let n = p.file_name().unwrap_or_default().to_string_lossy();
+                    p.extension().is_some_and(|x| x == "o")
+                        && !n.contains(".rcgu.")
+                        && !seen.contains(p)
+                })
                 .collect();
             new.sort();
             for p in new {

@@ -92,7 +92,8 @@ where
                 | SectionKind::UninitializedTls
                 | SectionKind::Elf(_)
         ) || coff_named
-            || (out.format() == BinaryFormat::MachO && name == b"__mod_init_func"))
+            || (out.format() == BinaryFormat::MachO
+                && matches!(&*name, b"__mod_init_func" | b"__hot_slots")))
             && (s.size() > 0 || coff_named);
         if !keep {
             continue;
@@ -226,8 +227,32 @@ where
         };
         for (offset, r) in s.relocations() {
             let symbol = match r.target() {
-                RelocationTarget::Symbol(i) => syms[&i],
-                RelocationTarget::Section(i) => out.section_symbol(secs[&i]),
+                RelocationTarget::Symbol(i) => {
+                    let Some(&v) = syms.get(&i) else {
+                        let nm = f
+                            .symbol_by_index(i)
+                            .and_then(|s| s.name().map(|n| n.to_string()))
+                            .unwrap_or_else(|_| "?".into());
+                        panic!(
+                            "reloc sym {i:?} ({nm}) unmapped ({} syms, src {:?} off {offset:#x} flags {:?})",
+                            syms.len(),
+                            s.name(),
+                            r.flags()
+                        );
+                    };
+                    v
+                }
+                RelocationTarget::Section(i) => {
+                    let Some(&to2) = secs.get(&i) else {
+                        panic!(
+                            "section reloc target {:?} unmapped (src {:?} off {offset:#x} flags {:?})",
+                            i,
+                            s.name(),
+                            r.flags()
+                        );
+                    };
+                    out.section_symbol(to2)
+                }
                 t => panic!("unsupported relocation target {t:?} in asm object"),
             };
             // A Mach-O `A - B` field is a SUBTRACTOR+UNSIGNED pair, which
