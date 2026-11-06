@@ -214,26 +214,42 @@ struct Parsed<'d> {
 
 impl<'d> Parsed<'d> {
     fn load(f: &object::File<'d, &'d [u8]>) -> Self {
-        let mut p = Parsed {
-            syms: symtab(f),
-            secs: HashMap::new(),
-            relocs: HashMap::new(),
-            by_sec: HashMap::new(),
-        };
-        for s in f.sections() {
-            p.secs.insert(
-                s.index(),
-                Sec {
-                    data: s.data().unwrap_or(&[]),
-                    size: s.size(),
-                    align: s.align(),
-                    kind: s.kind(),
+        // Symtab decode and section/reloc collection are independent —
+        // they are the two halves of parse time on large leaf crates.
+        let (mut p, sec_parts) = std::thread::scope(|sc| {
+            let sym_h = sc.spawn(|| symtab(f));
+            let sec_h = sc.spawn(|| {
+                let mut secs = HashMap::new();
+                let mut relocs = HashMap::new();
+                for s in f.sections() {
+                    secs.insert(
+                        s.index(),
+                        Sec {
+                            data: s.data().unwrap_or(&[]),
+                            size: s.size(),
+                            align: s.align(),
+                            kind: s.kind(),
+                        },
+                    );
+                    let mut rs: Vec<_> = s.relocations().collect();
+                    rs.sort_unstable_by_key(|&(o, _)| o);
+                    relocs.insert(s.index(), rs);
+                }
+                (secs, relocs)
+            });
+            (
+                Parsed {
+                    syms: sym_h.join().unwrap(),
+                    secs: HashMap::new(),
+                    relocs: HashMap::new(),
+                    by_sec: HashMap::new(),
                 },
-            );
-            let mut rs: Vec<_> = s.relocations().collect();
-            rs.sort_unstable_by_key(|&(o, _)| o);
-            p.relocs.insert(s.index(), rs);
-        }
+                sec_h.join().unwrap(),
+            )
+        });
+        let (secs, relocs) = sec_parts;
+        p.secs = secs;
+        p.relocs = relocs;
         for s in p.syms.iter().flatten() {
             if let (Some(si), true) = (s.sec, s.def) {
                 p.by_sec.entry(si).or_default().push(s.addr);
