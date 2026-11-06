@@ -81,8 +81,29 @@ can pick up a partially written object otherwise. Files matching
 - `PLIRON_HOT_DIR=<dir>` — runtime: directory watched for `*.o` patches
   (plus `base.ref` fingerprints). Unset = hot reload off, thunks cost one
   indirect jump.
-- `PLIRON_HOT_DEBUG=1` — print each symbol resolution during a patch
-  apply.
+- `PLIRON_HOT_DEBUG=1` — print per-phase timings during a patch apply.
+- `PLIRON_HOT_FREE=1` — `munmap` superseded patch mappings once every
+  function they supplied has been repointed again, after a grace window
+  of `PLIRON_HOT_GRACE` generations (default 3). Off by default: an
+  unmap could race a thread still executing old code.
+
+## Scaling
+
+Apply cost grows with the size of the *edit*, not the crate. The loader
+copies only changed function ranges plus the data sections reachable
+from them; references to unchanged patch functions resolve to the live
+executable's thunk, so their code is never mapped or relocated.
+
+`bench/hot/run.sh [--fns N] [--rounds K] [--free]` generates a leaf
+crate of N functions behind a small app binary and repeats this
+edit→compile→drop loop, reporting patch build time, apply time and app
+RSS. On an 8000-function leaf editing one function:
+
+- patch build ~1.2 s (rustc dominates — apply is ~3% of the loop)
+- apply ~30-45 ms, of which ~25 ms is parsing + fingerprinting the
+  object and <1 ms is the actual copy/relocate/slot work
+- RSS plateaus (old mappings are a few pages each; `PLIRON_HOT_FREE`
+  reclaims them if needed)
 
 ## Limits
 
@@ -101,6 +122,11 @@ can pick up a partially written object otherwise. Files matching
   ELF).
 - On macOS the base executable needs a symbol table (the default —
   do not pass `-Wl,-x` / strip it).
+- The per-function compact mapping is Mach-O only for now; on ELF the
+  whole patch object is mapped and relocated, so apply time and memory
+  scale with the crate, not the edit.
+- Section-target relocations into text sections are rejected on Mach-O
+  (rare — the linker normally emits named `ltmp` symbols).
 
 ## Smoke test
 
