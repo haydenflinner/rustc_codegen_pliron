@@ -224,8 +224,19 @@ in the scoreboard and in the linked history files.
 - **wasm** adds CLIF → waffle translation, the waffle inliner and `wpeep`
   on top of the same pipeline. The small `kernels-wasm` input is
   dominated by fixed rustc latency.
+- **Incremental round trips** (edit a leaf binary over a 281-crate
+  egui/wgpu/winit tree, dev profile): at parity on both targets —
+  thin leaf ~0.51 s native and ~0.65 s wasm, large leaf ~0.88 s, cold
+  tree ~23 s, all ≈ stock. rustc-side the thin rebuild is ~36% faster
+  than stock (incremental CGU reuse skips LLVM's re-emission); the
+  end-to-end floor is the system link (~0.2 s, Apple ld beats ld64.lld
+  2:1 here) plus cargo bookkeeping (~0.2 s). `tools/pliron-wasm-ld`
+  went 1.01 → 0.40 s on the same link (FxHash, O(n²) dedup loops,
+  fused type-scan) which moved the wasm round trip from 2.1× slower
+  to parity.
 - History: `history/2026-10-20-compile-time-worklist.md`,
-  `history/2026-10-27-ctime.md`.
+  `history/2026-10-27-ctime.md`,
+  `history/2026-11-06-round-trip-parity.md`.
 
 ### Compile memory
 
