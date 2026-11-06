@@ -529,16 +529,20 @@ t_xcguhome() {
   # never-inlined `work` (which calls a cold, uncopyable fn) is defined
   # once, not once per calling CGU. `PLIRON_XCGU_PROMOTE=copyable` +
   # `HOME=all` additionally promotes the homes of copied items to
-  # hidden-external and sends every surviving copy home.
-  local n0 n1 na
+  # hidden-external and sends every surviving copy home; `HOME=mono` does
+  # the same and also elects one owner partition for each shared
+  # `inlined` mono item (rustc's "CGU-private copies").
+  local n0 n1 na nm
   PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_HOME=0 rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhome0$exe && $out/xcguhome0$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out && \
   PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_HOME=1 rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhome1$exe && $out/xcguhome1$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out && \
-  PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_PROMOTE=copyable PLIRON_XCGU_HOME=all rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhomea$exe && $out/xcguhomea$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out || return 1
+  PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_PROMOTE=copyable PLIRON_XCGU_HOME=all rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhomea$exe && $out/xcguhomea$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out && \
+  PLIRON_XCGU_SIZE=1000 PLIRON_XCGU_PROMOTE=copyable PLIRON_XCGU_HOME=mono rustc $BE --edition 2021 -O -C codegen-units=16 tests/xcguhome/main.rs -o $out/xcguhomem$exe && $out/xcguhomem$exe | diff --strip-trailing-cr - tests/xcguhome/expected.out || return 1
   n0=$(nm $out/xcguhome0$exe | grep -c '1a4work')
   n1=$(nm $out/xcguhome1$exe | grep -c '1a4work')
   na=$(nm $out/xcguhomea$exe | grep -c '1a4work')
-  echo "xcguhome: work defined $n0 times without HOME, $n1 with, $na with promote+all"
-  [ "$n1" = 1 ] && [ "$n0" -gt 1 ] && [ "$na" = 1 ]
+  nm=$(nm $out/xcguhomem$exe | grep -c '1a4work')
+  echo "xcguhome: work defined $n0 times without HOME, $n1 with, $na with promote+all, $nm with promote+mono"
+  [ "$n1" = 1 ] && [ "$n0" -gt 1 ] && [ "$na" = 1 ] && [ "$nm" = 1 ]
 }
 
 t_selmul() {

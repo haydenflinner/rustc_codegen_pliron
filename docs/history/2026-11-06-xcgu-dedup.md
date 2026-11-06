@@ -70,3 +70,46 @@ specialized copies is the follow-up if this is to default on.
 - `PLIRON_XCGU_HOME=all` alone (no promotion): no-op — copied items'
   homes are `Internal`, not linkable.
 - Callerless-copy conversions without promotion: same, nothing to bind.
+
+## 2026-11-06 later: `HOME=mono` — `inlined` mono items
+
+The remaining `syn` duplication was not `extra` copies: rustc gives
+every partition that reaches an `inlined` mono item its own
+`Internal` "CGU-private copy" (`rustc_monomorphize::partitioning`),
+each emitting a `non-external` body ld64 can't merge. On `syn` that
+was ~205 symbols / ~430 KB — `drop_glue<BareFnArg>` defined `t` in
+13 of 16 objects with ~97 live call sites each. LLVM keeps 2 defs
+because it *inlines* the glue chain; pliron's inliner rejects it
+(`drop_glue<BareFnArg>`: 414 ops, cost 1314 vs limit 320) — forcing
+`always_inline` on `DropGlue` shims exploded syn 2.2 MB → 14 MB
+(recursive glue trees duplicated whole, no per-site collapse).
+
+`PLIRON_XCGU_HOME=mono` instead applies the design-(b) bind to
+`inlined` items: `xcgu::inlined_home` elects one owner partition per
+shared item (a real `inlined=false` root holder wins, else the first
+inlined holder), `promoted()` flips the owner's `Internal` def to
+hidden-external, and non-owner copies — mono items in `items()` and
+`extra` copies alike — go into `xcgu_home` for `home_copies` to
+convert post-inline. `xcgu_extra` suppresses the promoted flip on
+non-owner decls, the same mechanism as for `extra` copies.
+
+Numbers (`PLIRON_XCGU_PROMOTE=copyable PLIRON_XCGU_HOME=mono`):
+syn rlib text 2208965 → 1515853 (−31%, **zero** multi-defined
+symbols, was 205+), kernels −1.4%, regex −4.2%; card deltas syn SIZ
+1.753→1.202, CMP 1.31→1.13, MEM 1.84→1.69 (converted bodies skip
+lowering), wasm untouched. Bench runtime −0.04% geomean (neutral).
+`tests/xcguhome` gained a `mono` leg: `work` defined once, output
+identical.
+
+Dead ends inside `mono`:
+
+- Electing *every* inlined item: +165 KB on syn — a promoted `Hidden`
+  def can never `dead_fns`-strip, so items inlined away in all 16
+  CGUs emitted for the first time (kernels: 97 → 265 defs).
+- `data.size_estimate` floor at `size_limit` (50): killed the win —
+  drop glue scores ~dozens of MIR stmts but expands 10x at codegen.
+  Resolved as `PLIRON_XCGU_MONOMIN` (default 200) for plain `Item`s
+  plus an unconditional elect for `ShimKind::DropGlue`.
+- `n>=2 holders` alone missed `inlined`-in-one-partition +
+  `extra`-copied-elsewhere items (`PrivateIter::next` x6); the
+  `copied` set covers them.

@@ -147,45 +147,131 @@ fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
 pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
     static P: std::sync::OnceLock<FxHashSet<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
+        let mut out = dep_promoted(tcx).clone();
         // wasm's copies feed the waffle inliner and link through
         // pliron-wasm-ld (same `is_like_wasm` gate as `home_mode`), so a
         // promoted home def would only grow the module.
-        if crate::env_get("PLIRON_XCGU_PROMOTE") != Some("copyable")
-            || tcx.sess.target.is_like_wasm
-        {
-            return dep_promoted(tcx).clone();
+        if tcx.sess.target.is_like_wasm {
+            return out;
         }
-        // `=copyable`: also promote single-home Internal items that some
-        // CGU actually copies — the only items whose duplicated bodies
-        // could bind a linkable home def instead. The copy set itself is
-        // the signal: the referencing CGU's demand comes through
-        // `copies()`, not the partition used-lists. `is_promoted` inside
-        // `copies` reads `dep_promoted` only, so acceptance (and hence
-        // inlining reachability) stays identical to the `cold` baseline
-        // — an earlier draft promoted every copyable item and grew
-        // `kernels` text ~10 KB through extra accepted copies.
-        let mut out = dep_promoted(tcx).clone();
         let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
         if parts.len() <= 1 {
             return out;
         }
-        // item -> (linkage, inlined, partitions holding it)
-        let mut home: FxHashMap<MonoItem<'tcx>, (Linkage, bool, u32)> = FxHashMap::default();
-        for p in parts {
-            for (&item, data) in p.items() {
-                let e = home.entry(item).or_insert((data.linkage, data.inlined, 0));
-                e.2 += 1;
+        if crate::env_get("PLIRON_XCGU_PROMOTE") == Some("copyable") {
+            // `=copyable`: also promote single-home Internal items that some
+            // CGU actually copies — the only items whose duplicated bodies
+            // could bind a linkable home def instead. The copy set itself is
+            // the signal: the referencing CGU's demand comes through
+            // `copies()`, not the partition used-lists. `is_promoted` inside
+            // `copies` reads `dep_promoted` only, so acceptance (and hence
+            // inlining reachability) stays identical to the `cold` baseline
+            // — an earlier draft promoted every copyable item and grew
+            // `kernels` text ~10 KB through extra accepted copies.
+            // item -> (linkage, inlined, partitions holding it)
+            let mut home: FxHashMap<MonoItem<'tcx>, (Linkage, bool, u32)> = FxHashMap::default();
+            for p in parts {
+                for (&item, data) in p.items() {
+                    let e = home.entry(item).or_insert((data.linkage, data.inlined, 0));
+                    e.2 += 1;
+                }
             }
-        }
-        for p in parts {
-            for inst in copies(tcx, p) {
-                let item = MonoItem::Fn(inst);
-                if matches!(home.get(&item), Some(&(Linkage::Internal, false, 1))) {
-                    out.insert(tcx.symbol_name(inst).name.to_string());
+            for p in parts {
+                for inst in copies(tcx, p) {
+                    let item = MonoItem::Fn(inst);
+                    if matches!(home.get(&item), Some(&(Linkage::Internal, false, 1))) {
+                        out.insert(tcx.symbol_name(inst).name.to_string());
+                    }
                 }
             }
         }
+        if crate::env_get("PLIRON_XCGU_HOME") == Some("mono") {
+            // `PLIRON_XCGU_HOME=mono`: promote the elected owner's def of
+            // every shared `inlined` mono item so the other partitions'
+            // bodies can convert to imports after inlining.
+            out.extend(inlined_home(tcx).keys().cloned());
+        }
         out
+    })
+}
+
+/// `PLIRON_XCGU_HOME=mono`: rustc gives every partition that reaches an
+/// `inlined` mono item its own `Internal` copy ("CGU-private copies" —
+/// shared generics and drop glue), and each copy emits a `non-external`
+/// body the linker can't merge: on `syn` that was 205 functions totalling
+/// ~430 KB of rlib text. Maps each such item's symbol to the CGU name
+/// elected to emit the single definition — the partition holding the
+/// item as a real (`inlined=false`) root when there is one, else the
+/// first holder — so `predefine_fn` promotes that def hidden-external
+/// (`promoted`) while the other partitions' copies, suppressed in
+/// `xcgu_extra`, become `Import`s in `home_copies`.
+pub fn inlined_home<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashMap<String, String> {
+    static M: std::sync::OnceLock<FxHashMap<String, String>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+        // Instances some CGU copies as `extra`: a sole inlined holder's
+        // def still needs promoting when foreign copies exist to bind it.
+        let mut copied: FxHashSet<String> = FxHashSet::default();
+        for p in parts {
+            copied.extend(copies(tcx, p).iter().map(|i| tcx.symbol_name(*i).name.to_string()));
+        }
+        // sym -> (root holder, first inlined holder, holders, any inlined,
+        //         always-elect)
+        let mut h: FxHashMap<String, (Option<String>, Option<String>, u32, bool, bool)> =
+            FxHashMap::default();
+        for p in parts {
+            for (&item, data) in p.items() {
+                let MonoItem::Fn(inst) = item else { continue };
+                let e = h
+                    .entry(tcx.symbol_name(inst).name.to_string())
+                    .or_default();
+                e.2 += 1;
+                // Drop glue has a small MIR size estimate but expands
+                // into a real body codegen can't inline away — it
+                // survives in every holder, so dedup can't lose.
+                e.4 |= matches!(
+                    inst.def,
+                    InstanceKind::Shim(rustc_middle::ty::ShimKind::DropGlue(_, _))
+                );
+                if data.inlined {
+                    e.1.get_or_insert_with(|| p.name().as_str().to_string());
+                    e.3 = true;
+                } else {
+                    e.0 = Some(p.name().as_str().to_string());
+                }
+            }
+        }
+        // An item `inlined` in at least one holder gets an owner only when
+        // another partition actually duplicates it (a second holder or an
+        // `extra` copy): a real-root holder wins, else the first inlined
+        // holder. Ordinary small bodies inline away in every CGU and
+        // their owner def would emit for nothing (`dead_fns` can't strip
+        // `Hidden`), so plain `Item`s need a body over the copy-size bar
+        // (`PLIRON_XCGU_MONOMIN`, default 200 MIR stmts — past that the
+        // floor stops mattering: every elected owner is a body that
+        // plausibly survives inlining); shims and uncopyable bodies
+        // always earn it.
+        let limit = crate::env_get("PLIRON_XCGU_MONOMIN")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| 200);
+        let mut est: FxHashMap<String, usize> = FxHashMap::default();
+        for p in parts {
+            for (&item, data) in p.items() {
+                let MonoItem::Fn(inst) = item else { continue };
+                let e = est
+                    .entry(tcx.symbol_name(inst).name.to_string())
+                    .or_default();
+                *e = (*e).max(data.size_estimate);
+            }
+        }
+        h.into_iter()
+            .filter(|(s, (_, _, n, any_inlined, always))| {
+                *any_inlined
+                    && (*always || est.get(s.as_str()).copied().unwrap_or(0) >= limit)
+                    && (*n >= 2 || copied.contains(s.as_str()))
+            })
+            .filter_map(|(s, (root, inl, _, _, _))| root.or(inl).map(|o| (s, o)))
+            .collect()
     })
 }
 

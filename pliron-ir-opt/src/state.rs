@@ -502,12 +502,15 @@ pub struct State {
     /// object-code bloat; stripping a referenced one breaks the link.
     pub xcgu_copies: SymSet,
     /// `PLIRON_XCGU_HOME=1`: the `xcgu_copies` whose home definition is
-    /// linkable from this CGU (`inline::home_copies`).
+    /// linkable from this CGU; `=mono` additionally holds this CGU's
+    /// non-owner `inlined` mono items and their `extra` copies
+    /// (`inline::home_copies`).
     pub xcgu_home: SymSet,
-    /// Symbols this CGU defines as an xcgu `extra` copy — the partition's
-    /// own `Internal` items are `xcgu_copies` too, so `predefine_fn` uses
-    /// this set to promote only a home definition, never a copy
-    /// (`xcgu::promoted`).
+    /// Symbols this CGU defines as an xcgu `extra` copy — or, under
+    /// `XCGU_HOME=mono`, as a non-owner `inlined` mono item — the
+    /// partition's own `Internal` items are `xcgu_copies` too, so
+    /// `predefine_fn` uses this set to promote only a home definition,
+    /// never a duplicate (`xcgu::promoted`).
     pub xcgu_extra: SymSet,
     /// `PLIRON_XCGUFN_KILL=1`: `dead_fns` may strip `xcgu_copies` entries —
     /// the default exemption exists because copy-to-copy refs can evade

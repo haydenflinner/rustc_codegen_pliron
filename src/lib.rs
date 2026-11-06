@@ -1498,11 +1498,15 @@ fn module_codegen(
             tracing::info!(target: "pliron::stats", "xcgu {cgu_name}: {} local copies", extra.len())
         };
     }
-    // `PLIRON_XCGU_HOME=1`: degraded copies only; `=all`: every copy.
-    // Native only: wasm's copies feed the waffle inliner and link through
+    // `PLIRON_XCGU_HOME=1`: degraded copies only; `=all`: every copy;
+    // `=mono`: shared `inlined` mono items (rustc's "CGU-private copies")
+    // keep one owner definition and import it elsewhere. Native only:
+    // wasm's copies feed the waffle inliner and link through
     // pliron-wasm-ld, untested here.
     let home_mode = env_get("PLIRON_XCGU_HOME")
         .filter(|_| !extra.is_empty() && !tcx.sess.target.is_like_wasm);
+    let mono_home = env_get("PLIRON_XCGU_HOME") == Some("mono")
+        && !tcx.sess.target.is_like_wasm;
     // `=skip`: don't make degraded copies whose home is linkable at all, so
     // the inliner never inlines a body whose callees are calls here and the
     // home definition (callees local) is called instead. Dropping a copy can
@@ -1524,14 +1528,23 @@ fn module_codegen(
     let extra_set: rustc_hash::FxHashSet<_> =
         if home_mode.is_some() { extra.iter().copied().collect() } else { Default::default() };
     for &inst in &extra {
+        let sym = tcx.symbol_name(inst).name;
+        // `=mono` adds inlined-mono conversion on top of `=all` copy
+        // conversion: `inlined_home` covers items whose home is a shared
+        // `inlined` mono item, `home_linkable` the single-home ones.
         if let Some(m) = home_mode
-            && (m == "all" || m == "1" && xcgu::degraded(tcx, inst, cgu, &extra_set))
-            && xcgu::home_linkable(tcx).contains(tcx.symbol_name(inst).name)
+            && (m == "all" || m == "mono"
+                || m == "1" && xcgu::degraded(tcx, inst, cgu, &extra_set))
+            && (xcgu::home_linkable(tcx).contains(sym)
+                || (m == "mono"
+                    && xcgu::inlined_home(tcx)
+                        .get(sym)
+                        .is_some_and(|owner| owner != cgu_name.as_str())))
         {
             cx.st
                 .borrow_mut()
                 .xcgu_home
-                .insert(tcx.symbol_name(inst).name.to_string());
+                .insert(sym.to_string());
         }
         // Rustc's `used` lists don't cover copy-to-copy calls, so these
         // bodies can end up with zero `direct_callee`-resolvable callers
@@ -1567,10 +1580,19 @@ fn module_codegen(
         // resolve, and neither shows up as a caller in `call_counts`.
         if data.inlined || data.linkage == rustc_attr_ir::Linkage::Internal {
             if let rustc_middle::mono::MonoItem::Fn(inst) = mono_item {
-                cx.st
-                    .borrow_mut()
-                    .xcgu_copies
-                    .insert(tcx.symbol_name(inst).name.to_string());
+                let sym = tcx.symbol_name(inst).name.to_string();
+                cx.st.borrow_mut().xcgu_copies.insert(sym.clone());
+                // `PLIRON_XCGU_HOME=mono`: this CGU isn't the elected
+                // owner — suppress the `promoted` flip on its own decl
+                // (`xcgu_extra`) and send the body back to an import of
+                // the owner's def after inlining (`xcgu_home`).
+                if mono_home && data.inlined
+                    && xcgu::inlined_home(tcx).get(sym.as_str())
+                        .is_some_and(|owner| owner != cgu_name.as_str())
+                {
+                    cx.st.borrow_mut().xcgu_extra.insert(sym.clone());
+                    cx.st.borrow_mut().xcgu_home.insert(sym);
+                }
             }
         }
         if dump {

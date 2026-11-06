@@ -284,15 +284,23 @@ in the scoreboard and in the linked history files.
   cap) recovered only ~0.2-0.5% and stays opt-in. Full attribution:
   `history/2026-11-06-siz-mem-attribution.md`.
   **Dedup (opt-in, not default):** `PLIRON_XCGU_PROMOTE=copyable
-  PLIRON_XCGU_HOME=all` promotes the single-home `Internal` defs of
-  items some CGU copies to hidden-external, then `home_copies` turns
-  every surviving copy into an import of the home body. rlib text:
-  kernels −4.2 KB (2.065→1.920), regex-syntax −5 KB (1.897→1.875),
-  syn −207 KB (1.753→1.547); linked-binary delta ≈ 0 (ld64 already
-  dead-strips the duplicates it can). Bench runtime geomean −1.0%
-  (varint_postcard −16.6%, contains_rng +7.5% — sending specialised
-  copies home trades wins on both sides); compile time and memory
-  neutral. `history/2026-11-06-xcgu-dedup.md`.
+  PLIRON_XCGU_HOME=mono` elects one owner partition per shared
+  `inlined` mono item (rustc's "CGU-private copies" — drop glue and
+  shared generics, ~205 symbols / 430 KB of `syn` text defined in
+  6–13 objects each) as well as per `extra` copy, promotes the
+  owner's `Internal` def hidden-external, and `home_copies` turns
+  every surviving duplicate into an import of the one body — zero
+  multi-defined symbols on `syn`. Card deltas under the flags:
+  syn SIZ 1.753→**1.202** (also CMP 1.31→1.13, MEM 1.84→1.69 —
+  converted bodies skip lowering entirely), regex-syntax SIZ
+  1.897→1.811, kernels 2.065→1.975, wasm unchanged. Bench runtime
+  neutral (−0.04% geomean). `PLIRON_XCGU_MONOMIN` (default 200 MIR
+  stmts) keeps ordinary small items per-CGU — bodies that inline
+  away everywhere must not force an owner def `dead_fns` can't
+  strip; drop glue and other shims always elect since they survive
+  inlining regardless. The weaker `HOME=all` form (copy dedup only,
+  no `inlined`-item election) is also available.
+  `history/2026-11-06-xcgu-dedup.md`.
 - **wasm.** Op density, not dead code: `local.get`/`local.set`, `br` and
   `if`/`else` counts are several times LLVM's (see the runtime entry on
   local traffic). The default-on wasm size set (`PLIRON_WASM_NOIRRED`,
