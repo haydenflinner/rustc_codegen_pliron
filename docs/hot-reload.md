@@ -99,9 +99,10 @@ crate of N functions behind a small app binary and repeats this
 edit→compile→drop loop, reporting patch build time, apply time and app
 RSS. On an 8000-function leaf editing one function:
 
-- patch build ~1.2 s (rustc dominates — apply is ~3% of the loop)
-- apply ~30-45 ms, of which ~25 ms is parsing + fingerprinting the
-  object and <1 ms is the actual copy/relocate/slot work
+- patch build ~1.2 s (rustc dominates — apply is ~2% of the loop)
+- apply ~25 ms at 8000 functions, ~60 ms at 20000 (~3 ms/1000), of
+  which nearly all is parsing + fingerprinting the object; the actual
+  copy/relocate/slot work is <1 ms
 - RSS plateaus (old mappings are a few pages each; `PLIRON_HOT_FREE`
   reclaims them if needed)
 
