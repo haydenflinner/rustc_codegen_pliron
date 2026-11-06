@@ -1536,10 +1536,15 @@ fn module_codegen(
         // Rustc's `used` lists don't cover copy-to-copy calls, so these
         // bodies can end up with zero `direct_callee`-resolvable callers
         // while still being referenced at lowering — keep them off
-        // `dead_fns` (see `State::xcgu_copies`).
+        // `dead_fns` (see `State::xcgu_copies`). `xcgu_extra` keeps the
+        // `promoted` flip off this copy's own decl (`predefine_fn`).
         cx.st
             .borrow_mut()
             .xcgu_copies
+            .insert(tcx.symbol_name(inst).name.to_string());
+        cx.st
+            .borrow_mut()
+            .xcgu_extra
             .insert(tcx.symbol_name(inst).name.to_string());
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
             &mut cx,

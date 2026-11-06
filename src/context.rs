@@ -568,9 +568,13 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
     ) {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
-        // Promoted for other CGUs' local copies (`xcgu::promoted`).
+        // Promoted for other CGUs' local copies (`xcgu::promoted`). A
+        // CGU's own `extra` copy of a promoted item stays `Internal`:
+        // only the home definition may go hidden-external, or two objects
+        // define the same symbol.
         let (linkage, visibility) = if matches!(linkage, RLinkage::Internal)
             && crate::xcgu::promoted(self.tcx).contains(symbol_name)
+            && !self.st.borrow().xcgu_extra.contains(symbol_name)
         {
             (RLinkage::External, Visibility::Hidden)
         } else {

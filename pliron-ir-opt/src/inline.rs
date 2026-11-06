@@ -915,8 +915,11 @@ pub fn home_copies(ctx: &mut Context, st: &mut State) -> usize {
     if st.xcgu_home.is_empty() {
         return 0;
     }
-    let taken = crate::address_taken(ctx, st);
-    let counts = call_counts(ctx, st);
+    // A callerless copy converts too: refs `direct_callee`/`address_taken`
+    // can't see (copy-to-copy calls are the known gap) bind to the
+    // same-named hidden-external home def either way, so erasing is never
+    // a link risk under `home_linkable` — and it stops an unreferenced
+    // local body being emitted for nothing.
     let back: Vec<(String, Ptr<Operation>)> = st
         .xcgu_home
         .iter()
@@ -924,8 +927,7 @@ pub fn home_copies(ctx: &mut Context, st: &mut State) -> usize {
             let f = st.funcs.get(n.as_str())?;
             (f.linkage == Linkage::Local
                 && has_body(ctx, f.op)
-                && !st.dead_fns.contains(n.as_str())
-                && (counts.contains_key(n.as_str()) || taken.contains(n.as_str())))
+                && !st.dead_fns.contains(n.as_str()))
             .then(|| (n.clone(), f.op))
         })
         .collect();

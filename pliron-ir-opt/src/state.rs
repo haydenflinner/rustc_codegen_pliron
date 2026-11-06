@@ -504,6 +504,11 @@ pub struct State {
     /// `PLIRON_XCGU_HOME=1`: the `xcgu_copies` whose home definition is
     /// linkable from this CGU (`inline::home_copies`).
     pub xcgu_home: SymSet,
+    /// Symbols this CGU defines as an xcgu `extra` copy — the partition's
+    /// own `Internal` items are `xcgu_copies` too, so `predefine_fn` uses
+    /// this set to promote only a home definition, never a copy
+    /// (`xcgu::promoted`).
+    pub xcgu_extra: SymSet,
     /// `PLIRON_XCGUFN_KILL=1`: `dead_fns` may strip `xcgu_copies` entries —
     /// the default exemption exists because copy-to-copy refs can evade
     /// `direct_callee`.

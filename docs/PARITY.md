@@ -283,6 +283,16 @@ in the scoreboard and in the linked history files.
   `PLIRON_ALIGN_MAXB=<bytes>` (skip pads on loops whose body exceeds the
   cap) recovered only ~0.2-0.5% and stays opt-in. Full attribution:
   `history/2026-11-06-siz-mem-attribution.md`.
+  **Dedup (opt-in, not default):** `PLIRON_XCGU_PROMOTE=copyable
+  PLIRON_XCGU_HOME=all` promotes the single-home `Internal` defs of
+  items some CGU copies to hidden-external, then `home_copies` turns
+  every surviving copy into an import of the home body. rlib text:
+  kernels −4.2 KB (2.065→1.920), regex-syntax −5 KB (1.897→1.875),
+  syn −207 KB (1.753→1.547); linked-binary delta ≈ 0 (ld64 already
+  dead-strips the duplicates it can). Bench runtime geomean −1.0%
+  (varint_postcard −16.6%, contains_rng +7.5% — sending specialised
+  copies home trades wins on both sides); compile time and memory
+  neutral. `history/2026-11-06-xcgu-dedup.md`.
 - **wasm.** Op density, not dead code: `local.get`/`local.set`, `br` and
   `if`/`else` counts are several times LLVM's (see the runtime entry on
   local traffic). The default-on wasm size set (`PLIRON_WASM_NOIRRED`,

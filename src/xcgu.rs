@@ -147,13 +147,62 @@ fn size_limit<'tcx>(tcx: TyCtxt<'tcx>) -> usize {
 pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
     static P: std::sync::OnceLock<FxHashSet<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
+        // wasm's copies feed the waffle inliner and link through
+        // pliron-wasm-ld (same `is_like_wasm` gate as `home_mode`), so a
+        // promoted home def would only grow the module.
+        if crate::env_get("PLIRON_XCGU_PROMOTE") != Some("copyable")
+            || tcx.sess.target.is_like_wasm
+        {
+            return dep_promoted(tcx).clone();
+        }
+        // `=copyable`: also promote single-home Internal items that some
+        // CGU actually copies — the only items whose duplicated bodies
+        // could bind a linkable home def instead. The copy set itself is
+        // the signal: the referencing CGU's demand comes through
+        // `copies()`, not the partition used-lists. `is_promoted` inside
+        // `copies` reads `dep_promoted` only, so acceptance (and hence
+        // inlining reachability) stays identical to the `cold` baseline
+        // — an earlier draft promoted every copyable item and grew
+        // `kernels` text ~10 KB through extra accepted copies.
+        let mut out = dep_promoted(tcx).clone();
+        let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
+        if parts.len() <= 1 {
+            return out;
+        }
+        // item -> (linkage, inlined, partitions holding it)
+        let mut home: FxHashMap<MonoItem<'tcx>, (Linkage, bool, u32)> = FxHashMap::default();
+        for p in parts {
+            for (&item, data) in p.items() {
+                let e = home.entry(item).or_insert((data.linkage, data.inlined, 0));
+                e.2 += 1;
+            }
+        }
+        for p in parts {
+            for inst in copies(tcx, p) {
+                let item = MonoItem::Fn(inst);
+                if matches!(home.get(&item), Some(&(Linkage::Internal, false, 1))) {
+                    out.insert(tcx.symbol_name(inst).name.to_string());
+                }
+            }
+        }
+        out
+    })
+}
+
+/// The original promotion set — `PLIRON_XCGU_PROMOTE` `cold`/`1`/`0`
+/// modes on dependencies of copyable fns. `is_promoted` consults this
+/// (not `promoted`) so the `copyable` experiment can't change which
+/// copies `copies()` accepts.
+fn dep_promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
+    static P: std::sync::OnceLock<FxHashSet<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
         let mut out = FxHashSet::default();
         // `=cold` promotes only `#[cold]` deps: enough for `reserve` (its
         // one blocker is the cold `do_reserve_and_handle`) without
         // unlocking every other copy (`=1` reshuffled regex's inlining).
         // Default `cold`; `=1` promotes every uncopyable dep, `=0` none.
         let mode = crate::env_get("PLIRON_XCGU_PROMOTE");
-        let cold_only = mode.is_none_or(|m| m == "cold");
+        let cold_only = mode.is_none_or(|m| m == "cold" || m == "copyable");
         if mode == Some("0") {
             return out;
         }
@@ -246,7 +295,7 @@ pub fn degraded<'tcx>(
 }
 
 fn is_promoted<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
-    matches!(m, MonoItem::Fn(i) if promoted(tcx).contains(tcx.symbol_name(*i).name))
+    matches!(m, MonoItem::Fn(i) if dep_promoted(tcx).contains(tcx.symbol_name(*i).name))
 }
 
 /// Instances from other CGUs to define here as internal copies.
