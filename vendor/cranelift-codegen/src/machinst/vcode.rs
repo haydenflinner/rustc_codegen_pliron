@@ -2093,36 +2093,12 @@ impl<I: VCodeInst> VCode<I> {
             let mut new_offset = I::align_basic_block(buffer.cur_offset());
             // PLIRON: loop headers get 16-byte alignment.
             if loop_head[block.index()] {
-                // `PLIRON_LOOPALIGN=<bytes>` (power of two, default 16).
-                static LA: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-                let la = *LA.get_or_init(|| {
-                    std::env::var("PLIRON_LOOPALIGN")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .filter(|v: &u32| v.is_power_of_two())
-                        .unwrap_or(16)
-                });
-                new_offset = new_offset.max((buffer.cur_offset() + la - 1) & !(la - 1));
-                if la > 32 {
-                    buffer.require_alignment(la);
-                }
-                // PLIRON: with fixed-size instructions, a loop that fits in
-                // one 64-byte line must not straddle two: the hot loop is
-                // then one fetch block per iteration (chars_ascii ran 1.77x
-                // slower with an identical 36-byte loop across a 64-byte
-                // boundary). The function asks for 64-byte alignment so
-                // offsets are absolute. `PLIRON_ALIGN64=0` disables.
-                static ALIGN64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if let Some(sz) = I::fixed_inst_size()
-                    && *ALIGN64.get_or_init(|| std::env::var("PLIRON_ALIGN64").as_deref() != Ok("0"))
-                {
+                // PLIRON: emitted size of the loop body (insts × inst
+                // size), for the size gates below.
+                let (mut est, mut calls) = (0u32, false);
+                if let Some(sz) = I::fixed_inst_size() {
                     let bi = block.index();
                     let (from, to) = (order_of[bi], loop_end[bi]);
-                    let mut est: u32 = 0;
-                    // A loop with a call is not fetch-bound, and its pad
-                    // runs on every entry: fib's tail-recursion loop is
-                    // entered once per call (10 NOPs per call: +16%).
-                    let mut calls = false;
                     if from <= to && to < final_order.len() {
                         for &lb in &final_order[from..=to] {
                             let r = self.block_ranges.get(lb.index());
@@ -2131,7 +2107,46 @@ impl<I: VCodeInst> VCode<I> {
                                 .any(|i| self.insts[i].call_type() != CallType::None);
                         }
                     }
-                    let bytes = est * sz;
+                    est *= sz;
+                }
+                // PLIRON: `PLIRON_ALIGN_MAXB=<bytes>` skips the loop-head
+                // pad when the emitted body exceeds it — a body larger
+                // than a few fetch lines gains nothing from a 16-byte
+                // head, and every pad is dead bytes on cold entries
+                // (regex-syntax carried 641 nops to LLVM's 220).
+                static MAXB: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                let maxb = *MAXB.get_or_init(|| {
+                    std::env::var("PLIRON_ALIGN_MAXB")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(u32::MAX)
+                });
+                if est <= maxb {
+                    // `PLIRON_LOOPALIGN=<bytes>` (power of two, default 16).
+                    static LA: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+                    let la = *LA.get_or_init(|| {
+                        std::env::var("PLIRON_LOOPALIGN")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .filter(|v: &u32| v.is_power_of_two())
+                            .unwrap_or(16)
+                    });
+                    new_offset = new_offset.max((buffer.cur_offset() + la - 1) & !(la - 1));
+                    if la > 32 {
+                        buffer.require_alignment(la);
+                    }
+                }
+                // PLIRON: with fixed-size instructions, a loop that fits in
+                // one 64-byte line must not straddle two: the hot loop is
+                // then one fetch block per iteration (chars_ascii ran 1.77x
+                // slower with an identical 36-byte loop across a 64-byte
+                // boundary). The function asks for 64-byte alignment so
+                // offsets are absolute. `PLIRON_ALIGN64=0` disables.
+                static ALIGN64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if I::fixed_inst_size().is_some()
+                    && *ALIGN64.get_or_init(|| std::env::var("PLIRON_ALIGN64").as_deref() != Ok("0"))
+                {
+                    let bytes = est;
                     if !calls && bytes > 0 && bytes <= 64 && (new_offset % 64) + bytes > 64 {
                         new_offset = (new_offset + 63) & !63;
                         buffer.require_alignment(64);

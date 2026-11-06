@@ -257,6 +257,10 @@ in the scoreboard and in the linked history files.
   function inside its pipeline job would release it earlier), and fewer
   ops after inlining. History: `history/2026-10-26-memory.md`,
   `history/2026-10-27-memory2.md`, `history/2026-10-27-memory3.md`.
+  The remaining peak is live data, not allocator retention: ~16 CGU
+  `Context`s (~55 MB each) sit in the parallel stage-A pool while
+  post-inline op counts roughly double (syn: 1.04 GB vs LLVM 614 MB;
+  `history/2026-11-06-siz-mem-attribution.md`).
 
 ### Code size
 
@@ -270,6 +274,15 @@ in the scoreboard and in the linked history files.
   `uxtb` after bool-returning calls, and loop-header alignment `nop`s
   (`PLIRON_ALIGN`). Kill-switch attribution:
   `history/2026-10-29-ir-excess.md`, `history/2026-10-29-code-size.md`.
+- **xcgu copies.** On kernels, ~14 KB of the rlib gap is per-CGU IPO
+  clones (genuinely specialised, not dedup-able at the link) and ~5.5 KB
+  is byte-identical `non-external` copies ld64 keeps in full. A linked
+  binary shrinks the gap roughly in half (kernels: 14 KB / 5.5%
+  `__text`), so part of the rlib metric is dead-strip noise. The
+  `PLIRON_ALIGN` pads are concentrated on small loops where they earn;
+  `PLIRON_ALIGN_MAXB=<bytes>` (skip pads on loops whose body exceeds the
+  cap) recovered only ~0.2-0.5% and stays opt-in. Full attribution:
+  `history/2026-11-06-siz-mem-attribution.md`.
 - **wasm.** Op density, not dead code: `local.get`/`local.set`, `br` and
   `if`/`else` counts are several times LLVM's (see the runtime entry on
   local traffic). The default-on wasm size set (`PLIRON_WASM_NOIRRED`,

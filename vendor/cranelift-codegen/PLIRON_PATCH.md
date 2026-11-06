@@ -159,7 +159,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     only x64): blocks
     targeted by back-edges in the final emission order get `gen_nop`
     padding before their label binds, like LLVM's `.p2align 4` loop tops.
-    `PLIRON_ALIGN=0` disables. A companion fix lives in vendored
+    `PLIRON_ALIGN=0` disables. `PLIRON_ALIGN_MAXB=<bytes>` caps it:
+    loops whose emitted body exceeds the cap get no pad (a body bigger
+    than a few fetch lines gains nothing from the 16-byte head). A
+    companion fix lives in vendored
     `cranelift-object` (`backend.rs`): `define_function_inner` maxes the
     ISA's `function_alignment().preferred` (32 on x64) into symbol
     alignment — the buffer minimum is usually 1, so without it functions
