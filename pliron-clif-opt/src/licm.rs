@@ -397,7 +397,18 @@ fn hoists_inner(
         }
         _ => false,
     });
-    if !own_write && let Some(&target) = scoped.get(&i) {
+    // `own_write`'s exact same-root test is necessary but not
+    // sufficient: a writer whose root resolves through a `select`,
+    // alias, or call escapes it while still clobbering the loc
+    // (blind-sig `div_rem`: the SmallVec `len` store's address is a
+    // `select` over `ss61+40`-ish arms). The region-frozen tag only
+    // covers the clone's own accesses — the full `clobbers` scan must
+    // come back clean before an in-region hoist can skip it.
+    let nw_w = writers
+        .iter()
+        .filter(|&&w| clobbers(func, ps, w, loc, iso, nw, deref, scoped_na))
+        .count();
+    if !own_write && nw_w == 0 && let Some(&target) = scoped.get(&i) {
         let mut r = breg.get(&pb).copied();
         let mut chain = Vec::new();
         while let Some(x) = r {
@@ -431,6 +442,7 @@ fn hoists_inner(
     // as the load's block and the hoist target both sit inside the
     // record's region, the hoist can't observe a write.
     if !own_write
+        && nw_w == 0
         && let Root::V(rv) = r
         && let Some(rs) = ofz.get(&rv)
         && let (Some(&pbreg), Some(&breg_)) = (
@@ -454,10 +466,6 @@ fn hoists_inner(
             }
         }
     }
-    let nw_w = writers
-        .iter()
-        .filter(|&&w| clobbers(func, ps, w, loc, iso, nw, deref, scoped_na))
-        .count();
     if dbg {
         if pliron_cfg::tracing_on() {
             tracing::debug!(target: "pliron::licm", "licm?   safe={safe} writers_clobbering={nw_w}")

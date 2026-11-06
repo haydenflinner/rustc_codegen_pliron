@@ -116,22 +116,25 @@ self-host run. x86-64 was last measured 2026-10-22.
 
 SPD is measured on the kernels above, which the backend has been tuned
 against for weeks. On real programs it was never tuned on, native code is
-**1.57x slower** than LLVM (geomean of 8; 2026-10-31, `59589ee`, 11
-interleaved rounds, `bench/heldout/run.py`):
+**1.10x slower** than LLVM (geomean of 8; 2026-11-06, 11 interleaved
+rounds, `bench/heldout/run.py`):
 
 | program (sightglass) | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| blake3-scalar | 4.13 ms | 13.00 ms | 3.149 |
-| blind-sig | 1.87 ms | 4.02 ms | 2.148 |
-| pulldown-cmark | 5.38 ms | 8.24 ms | 1.531 |
-| rust-compression | 3.36 ms | 4.90 ms | 1.457 |
-| rust-html-rewriter | 7.00 ms | 10.07 ms | 1.438 |
-| regex | 3.89 ms | 5.12 ms | 1.315 |
-| rust-json | 4.58 ms | 5.87 ms | 1.282 |
-| rust-protobuf | 8.68 ms | 8.68 ms | 0.999 |
+| blake3-scalar | 2.93 ms | 3.09 ms | 1.056 |
+| blind-sig | 1.33 ms | 1.46 ms | 1.098 |
+| pulldown-cmark | 3.72 ms | 4.10 ms | 1.101 |
+| rust-compression | 2.29 ms | 2.73 ms | 1.193 |
+| rust-html-rewriter | 4.89 ms | 5.59 ms | 1.144 |
+| regex | 2.79 ms | 3.10 ms | 1.112 |
+| rust-json | 3.02 ms | 3.29 ms | 1.089 |
+| rust-protobuf | 5.22 ms | 5.33 ms | 1.020 |
 
 Treat the kernel geomean as "parity on code shapes we have worked on", not
-as generated-code speed in general.
+as generated-code speed in general. `blind-sig`'s 2.148 was a licm
+miscompile livelock (`history/2026-11-06-licm-frozen-clobber.md`), and
+most of `blake3-scalar`'s 3.149 fell to the intervening optimisation
+work — what remains is an honest ~10% spread.
 [`history/2026-10-31-heldout.md`](history/2026-10-31-heldout.md).
 
 ## Known gaps by axis
@@ -141,10 +144,10 @@ in the scoreboard and in the linked history files.
 
 ### Runtime speed
 
-- **Held-out programs: 1.57x.** The largest runtime gap is outside the
-  card (table above): blake3's compression rounds (3.1x), blind-sig's
-  bignum arithmetic (2.1x), and 1.3-1.5x across parsers and compressors.
-  Nothing there has been profiled yet.
+- **Held-out programs: 1.10x** (was 1.57x on 2026-10-31). The livelock
+  behind blind-sig's 2.1x is fixed
+  (`history/2026-11-06-licm-frozen-clobber.md`); the remaining spread is
+  1.02-1.19x across compressors and parsers, no single outlier left.
 - **wasm local traffic.** CLIF SSA values become wasm locals; waffle's
   relooper passes block params through scratch locals at `if`/`else`
   boundaries, and we emit structured `if` diamonds where LLVM emits
