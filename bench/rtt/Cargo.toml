@@ -1,0 +1,10 @@
+[package]
+name = "rtt"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+egui = "0.36"
+wgpu = "30"
+winit = "0.30"
+
+[workspace]

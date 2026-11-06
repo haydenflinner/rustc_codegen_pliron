@@ -1,0 +1,13 @@
+[package]
+name = "pliron-inc-ld"
+version = "0.1.0"
+edition = "2021"
+description = "Incremental Mach-O linker for rustc_codegen_pliron: relinks only changed leaf objects into the previous image."
+
+[dependencies]
+rustc-hash = "2"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace]

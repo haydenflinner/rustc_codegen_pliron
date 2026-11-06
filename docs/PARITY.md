@@ -234,9 +234,15 @@ in the scoreboard and in the linked history files.
   went 1.01 → 0.40 s on the same link (FxHash, O(n²) dedup loops,
   fused type-scan) which moved the wasm round trip from 2.1× slower
   to parity.
+- `tools/pliron-inc-ld` (drop-in `-Clinker`, splices only changed
+  leaf objects into the previous image) now lifts the link floor on
+  native: thin leaf 0.409 s stock → **0.238 s** (0.58×), large leaf
+  0.670 s → 0.627 s, both ASLR-safe via rebase-blob extension and a
+  writable `__DATA` pad. `history/2026-11-06-inc-ld.md`.
 - History: `history/2026-10-20-compile-time-worklist.md`,
   `history/2026-10-27-ctime.md`,
-  `history/2026-11-06-round-trip-parity.md`.
+  `history/2026-11-06-round-trip-parity.md`,
+  `history/2026-11-06-inc-ld.md`.
 
 ### Compile memory
 
