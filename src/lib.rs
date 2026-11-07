@@ -914,17 +914,42 @@ fn cpu_features(cpu: &str) -> &'static [&'static str] {
         "avx512vnni",
     ];
     match cpu {
-        // Apple A12-generation and later: v8.3/v8.4+ -- dotprod, lse, fp16.
-        "apple-a12" | "apple-s4" | "apple-s5" => &["aes", "sha2", "dotprod", "lse", "fp16"],
-        // FEAT_SHA3 arrived with A13; all Apple Silicon Macs (M1+) have it.
-        "apple-a13" | "apple-a14" | "apple-s6" | "apple-s7" | "apple-s8" | "apple-m1" => {
-            &["aes", "sha2", "sha3", "dotprod", "lse", "fp16"]
+        // Apple tiers seed the same entry features LLVM's cpu model does;
+        // `internal_target_features` expands the v8.xa closure
+        // (v8.1a → crc/lse/rdm/pan/lor/vh, v8.4a → dotprod/dit/flagm, ...),
+        // matching `rustc --print cfg -Ctarget-cpu=<name>` under stock.
+        // A12 generation: ARMv8.3-era (no dotprod in LLVM's A12 model).
+        "apple-a12" | "apple-s4" | "apple-s5" => {
+            &["aes", "sha2", "fp16", "fcma", "pmuv3", "v8.3a"]
         }
-        // FEAT_I8MM arrived with the A15/M2 generation.
-        "apple-a15" | "apple-a16" | "apple-a17" | "apple-a18" | "apple-s9" | "apple-s10"
-        | "apple-s11" | "apple-m2" | "apple-m3" | "apple-m4" | "apple-latest" => {
-            &["aes", "sha2", "sha3", "dotprod", "lse", "fp16", "i8mm"]
-        }
+        // A13 generation: FEAT_SHA3 arrives, v8.4a + lse2/rcpc2.
+        "apple-a13" | "apple-s6" | "apple-s7" | "apple-s8" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "lse2", "rcpc2", "pmuv3", "v8.4a",
+        ],
+        // A14/M1: adds frintts, flagm2, ssbs, sb, dpb2 over A13.
+        "apple-a14" | "apple-m1" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ssbs", "sb", "dpb2", "v8.4a",
+        ],
+        // A15/M2 generation: v8.6a pulls bf16+i8mm (+bti/ssbs/sb/dpb2 via v8.5a).
+        "apple-a15" | "apple-a16" | "apple-a17" | "apple-s9" | "apple-s10" | "apple-s11"
+        | "apple-m2" | "apple-m3" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ecv", "v8.6a",
+        ],
+        // M4/A18-class: v8.7a (+wfxt) and SME2.
+        "apple-m4" | "apple-a18" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ecv", "sme", "sme2", "sme-f64f64", "sme-i16i64", "v8.7a",
+        ],
+        // apple-latest (A18 Pro): M4 + cssc/hbc/mte and the remaining SME2
+        // sub-features.
+        "apple-latest" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ecv", "sme", "sme2", "sme-f64f64", "sme-i16i64",
+            "sme-b16b16", "sme-f16f16", "sme2p1", "sve-b16b16", "cssc", "hbc", "mte",
+            "v8.7a",
+        ],
         // SSSE3-era (Core 2, original Atom): no SSE4.
         "core2" | "bonnell" | "saltwell" => &["cmpxchg16b", "lahfsahf", "ssse3"],
         // SSE4.1-era (Penryn; also the x86_64-apple-darwin spec default).
