@@ -130,8 +130,14 @@ rounds, `bench/heldout/run.py`):
 | rust-json | 3.02 ms | 3.29 ms | 1.089 |
 | rust-protobuf | 5.22 ms | 5.33 ms | 1.020 |
 
-Treat the kernel geomean as "parity on code shapes we have worked on", not
-as generated-code speed in general. `blind-sig`'s 2.148 was a licm
+`rust-compression` got its own deep-dive
+(`history/2026-11-08-amode-crc-brotli.md`,
+`history/2026-11-09-copypair-scalar-merge.md`): `compress_inner` is at
+parity after aarch64 scaled-amode fixes and Apple `crc` feature tiers;
+the brotli hot function's 32-byte swap now emits `ldp q`/`stp q` under
+the opt-in `PLIRON_COPYPAIR`+`PLIRON_AMODESHARE`, and its self-time is
+near parity. Treat the kernel geomean as "parity on code shapes we have
+worked on", not as generated-code speed in general. `blind-sig`'s 2.148 was a licm
 miscompile livelock (`history/2026-11-06-licm-frozen-clobber.md`), and
 most of `blake3-scalar`'s 3.149 fell to the intervening optimisation
 work — what remains is an honest ~10% spread.
@@ -368,7 +374,10 @@ Ranked by expected card gain per effort. Each item links its evidence.
    (`history/2026-10-29-ir-excess.md` §5) and `PLIRON_LIBCALL_DIRECT=1`,
    `PLIRON_EDGEMERGE=3`/`PLIRON_EPIMERGE=2`
    (`history/2026-10-29-code-size.md`) still need a bench A/B,
-   `harness/gate.py --full`, crates and stage-2 UI.
+   `harness/gate.py --full`, crates and stage-2 UI. `COPYPAIR` now also
+   does the scalar-pair → `i64x2` merge; A/B it together with
+   `PLIRON_AMODESHARE` since pairing needs the shared base register
+   (`history/2026-11-09-copypair-scalar-merge.md`).
 3. **Size/cold gates on duplicating passes**: `punroll`, peeling,
    `jumpthread`, `looprot` and the `MEMFAST` fast path, gated on cold
    loops (bodies that lead to a panic) or huge functions. Bench every
