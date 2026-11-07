@@ -195,3 +195,63 @@ fn narrow_ubfx_on_w_register() {
         "want `ubfx w?, w?, #2, #6`:\n{a}"
     );
 }
+
+/// `x <s -64` — the signed-byte continuation bound `sextload` produces:
+/// `cmn x, #64` in place of `movn`+`cmp`.
+const CMN_I64: &str = "function %f(i64) -> i32 {
+block0(v0: i64):
+    v10 = iconst.i64 -64
+    v1 = icmp slt v0, v10
+    v20 = iconst.i32 1
+    v21 = iconst.i32 0
+    v2 = select v1, v20, v21
+    return v2
+}";
+
+/// Same on a W register — the i32 iconst stores `0xffffffc0`; the
+/// negated-immediate helper sign-extends by type before negating.
+const CMN_I32: &str = "function %f(i32) -> i32 {
+block0(v0: i32):
+    v10 = iconst.i32 -64
+    v1 = icmp slt v0, v10
+    v20 = iconst.i32 1
+    v21 = iconst.i32 0
+    v2 = select v1, v20, v21
+    return v2
+}";
+
+/// `x == 0` must stay on the `is_nonzero` path, not `cmn x, #0`.
+const CMP_ZERO: &str = "function %f(i64) -> i32 {
+block0(v0: i64):
+    v10 = iconst.i64 0
+    v1 = icmp eq v0, v10
+    v20 = iconst.i32 1
+    v21 = iconst.i32 0
+    v2 = select v1, v20, v21
+    return v2
+}";
+
+#[test]
+fn negative_imm_compare_is_cmn() {
+    for (clif, reg) in [(CMN_I64, "x"), (CMN_I32, "w")] {
+        let a = asm(clif);
+        assert!(
+            a.lines()
+                .any(|l| l.trim_start().starts_with(&format!("cmn {reg}"))),
+            "want `cmn {reg}?, #64`:\n{a}"
+        );
+        assert!(
+            !a.lines().any(|l| l.trim_start().starts_with("movn ")),
+            "no `movn` materialization:\n{a}"
+        );
+    }
+}
+
+#[test]
+fn zero_compare_stays_nonzero_path() {
+    let a = asm(CMP_ZERO);
+    assert!(
+        !a.lines().any(|l| l.trim_start().starts_with("cmn ")),
+        "`cmp x, 0` must not become `cmn x, #0`:\n{a}"
+    );
+}

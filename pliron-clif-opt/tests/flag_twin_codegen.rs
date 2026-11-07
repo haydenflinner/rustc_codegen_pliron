@@ -45,5 +45,9 @@ fn stored_sum_and_its_carry_share_one_adds() {
         adds.len() == 1 && !adds[0].contains("xzr"),
         "want one `adds d, a, b` and no flag-only recompute:\n{a}"
     );
+    assert!(
+        !a.lines().any(|l| l.trim_start().starts_with("cmn ")),
+        "`cmn` is the same flag-only recompute under its alias:\n{a}"
+    );
     assert!(!a.lines().any(|l| l.trim_start().starts_with("add ")), "separate `add` left:\n{a}");
 }

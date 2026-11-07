@@ -1142,6 +1142,12 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         narrowext_part(1) && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
     }
 
+    /// PLIRON (`PLIRON_CMN`, default on): `cmp x, -c` -> `cmn x, c`.
+    fn cmn_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_CMN").as_deref() != Ok("0"))
+    }
+
     /// PLIRON bitfield fusion (`PLIRON_BFUSE`, default on): `(x>>k)&m`,
     /// `(x&m)<<k`, `y|((x&m)<<k)`, `y|((x<<k)&m')` → `ubfx`/`ubfiz`/`bfi`.
     /// The externs compute UBFM immediates; `bf_disjoint*` proves `y`'s

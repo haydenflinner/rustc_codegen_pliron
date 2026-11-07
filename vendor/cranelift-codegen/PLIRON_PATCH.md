@@ -1343,3 +1343,17 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     always fails there. `PLIRON_BFUSE=0` restores the decomposed code.
     LLVM emits the same `ubfiz`/`bfi` pairs for UTF-8 codepoint
     assembly (`is_mostly_utf8`): 2 insns where we had 6.
+
+107. aarch64 `cmn` for negative compare immediates (`PLIRON_CMN`,
+    default on, `=0` off): `emit_icmp` on a 32/64-bit `icmp x, -c`
+    emits `cmn x, c` (`AluRRImm12 AddS` into the zero register) when
+    the negated immediate fits imm12 — one insn where `movn`+`cmp`
+    otherwise materializes. `imm12_from_negated_value` already
+    sign-extends by the iconst's type, so i32 immediates stored
+    zero-extended are handled. Zero is excluded: `icmp x, 0` stays on
+    the `is_nonzero` path. Motivating case: `sextload`'s `x <s -64`
+    UTF-8 continuation bound.
+    `Inst::AluRRImm12` pretty-print now aliases flag-setting ops into
+    the zero register: `adds xzr, rn, #i` prints `cmn rn, #i` and
+    `subs xzr, rn, #i` prints `cmp rn, #i` — matches the disassembler
+    reading of the same encoding.

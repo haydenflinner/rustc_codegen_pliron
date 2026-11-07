@@ -2862,6 +2862,16 @@
        (MInst.AluRRImm12 (ALUOp.SubS) size (writable_zero_reg)
         src1 src2)))
 
+;; PLIRON: `cmn` — compare against a negated immediate (`cmp x, -c` is
+;; `adds` flags of `x + c`). Pairs with `sextload`'s `x <s -64` byte
+;; tests; `PLIRON_CMN=0` disables the rule that uses it.
+(attr cmn_imm (veri chain))
+(decl cmn_imm (OperandSize Reg Imm12) ProducesFlags)
+(rule (cmn_imm size src1 src2)
+      (ProducesFlags.ProducesFlagsSideEffect
+       (MInst.AluRRImm12 (ALUOp.AddS) size (writable_zero_reg)
+        src1 src2)))
+
 (attr cmp64_imm (veri chain))
 (decl cmp64_imm (Reg Imm12) ProducesFlags)
 (rule (cmp64_imm src1 src2)
@@ -5350,6 +5360,19 @@
 
 (rule 6 (emit_icmp cond rn @ (value_type (ty_32_or_64 ty)) (u64_from_iconst (imm12_from_u64 c)))
   (CondResult.Cond (cmp_imm (operand_size ty) rn c) (cond_code cond)))
+
+;; PLIRON (`PLIRON_CMN`, default on): `cmp x, -c` is `cmn x, c` when the
+;; negated immediate fits imm12 — one insn where a `movn`+`cmp` pair
+;; otherwise materializes. `sextload`'s `x <s -64` continuation tests
+;; are the motivating shape.
+(rule 9 (emit_icmp cond rn @ (value_type (ty_32_or_64 ty)) y @ (iconst _ (u64_from_imm64 n)))
+      (if-let true (cmn_on))
+      (if-let true (u64_ne n 0))
+      (if-let imm (imm12_from_negated_value y))
+  (CondResult.Cond (cmn_imm (operand_size ty) (put_in_reg rn) imm) (cond_code cond)))
+
+(decl pure cmn_on () bool)
+(extern constructor cmn_on cmn_on)
 
 ;; For direct equality comparisons to zero transform the other operand into a
 ;; nonzero comparison and then invert the whole conditional to test for zero.

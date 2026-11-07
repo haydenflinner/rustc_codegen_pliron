@@ -5928,6 +5928,214 @@ fn reap_dead(func: &mut Function, insts: &[Inst]) {
 /// the `uextend`+`cmp`+`b.hs` triple disappears); x64 emits
 /// `test`+`jnz`, never worse than `cmp`+`jcc`. Runs as its own late
 /// step: the `icmp` form is canonical for every earlier pass.
+// ---------------------------------------------------------------------------
+// `sextload` (PLIRON_SEXTLOAD, opt-in): `uload8` -> `sload8` under
+// byte-transparent uses, then `(x & m) == v` on a sign-extended byte ->
+// a one-sided signed/unsigned compare.
+//
+// The UTF-8 continuation test `(b & 0xC0) == 0x80` is `b <s -64` on the
+// sign-extended byte — `ldrsb`+`cmn` in place of `ldrb`+`and`+`cmp`
+// (is_mostly_utf8's per-continuation-byte cost, and LLVM's exact form).
+//
+// Mask/value shape for one compare: `m` top-contiguous in the byte
+// (`m | (m-1) == 0xff`, `0x80 <= m < 0xff`) makes `(b & m) == v` pick a
+// single byte interval `[v, v|~m]` that stays inside one sign class.
+// Two cases collapse to one comparison:
+//   * `v == 0x80` (interval rooted at the sign boundary):
+//     `x <=s sext(v|~m)` / `x >s sext(v|~m)` for `ne`.
+//   * `v == 0`: `x <=u ~m` — negative bytes compare huge unsigned.
+// `x` must provably hold sign bits at its width: a `sload8`, a
+// `sextend` of an i8, or any i8-typed value (an `icmp` on i8 reads the
+// byte's own sign bits).
+//
+// Flip rule: `uload8` -> `sload8` when every use reads only the low
+// byte — `band` against a constant `<= 0xff` (result bit-identical for
+// the zext and sext forms), `ireduce` to `i8`, `istore8`. Anything else
+// (icmp, bor/bxor, shifts, extends, calls, edge args) keeps the `uload8`.
+pub fn sextload(func: &mut Function) -> usize {
+    let mut n = 0;
+
+    // One scan builds the use map (value -> user insts) and collects the
+    // `uload8` defs; branch args are inside `inst_values`.
+    let mut uses: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+    let mut uloads = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                uses.entry(func.dfg.resolve_aliases(v))
+                    .or_default()
+                    .push(i);
+            }
+            if let InstructionData::Load {
+                opcode: Opcode::Uload8,
+                ..
+            } = func.dfg.insts[i]
+            {
+                uloads.push(i);
+            }
+        }
+    }
+
+    for i in uloads {
+        let v = func.dfg.first_result(i);
+        let v = func.dfg.resolve_aliases(v);
+        let ok = uses.get(&v).into_iter().flatten().all(|&u| {
+            match func.dfg.insts[u] {
+                InstructionData::Binary {
+                    opcode: Opcode::Band,
+                    args,
+                } => {
+                    let other = if func.dfg.resolve_aliases(args[0]) == v {
+                        args[1]
+                    } else {
+                        args[0]
+                    };
+                    iconst(func, other).is_some_and(|k| (0..=0xff).contains(&k))
+                }
+                InstructionData::Unary {
+                    opcode: Opcode::Ireduce,
+                    ..
+                } => func.dfg.value_type(func.dfg.first_result(u)).bits() <= 8,
+                InstructionData::StoreNoOffset {
+                    opcode: Opcode::Istore8,
+                    args,
+                    ..
+                } => func.dfg.resolve_aliases(args[0]) == v,
+                _ => false,
+            }
+        });
+        if ok {
+            if let InstructionData::Load { opcode, .. } = &mut func.dfg.insts[i] {
+                *opcode = Opcode::Sload8;
+                n += 1;
+            }
+        }
+    }
+
+    // (x & m) ==/!= v -> x <=s/≤u bound. Runs after the flips so the
+    // fresh `sload8`s are visible.
+    let mut icmps = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond: IntCC::Equal | IntCC::NotEqual,
+                ..
+            } = func.dfg.insts[i]
+            {
+                icmps.push(i);
+            }
+        }
+    }
+    for i in icmps {
+        let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] else {
+            continue;
+        };
+        // Find `(band x, m)` on one side and `v` on the other.
+        let Some((x, m, c)) = [args[0], args[1]].iter().enumerate().find_map(|(s, &a)| {
+            let v = iconst(func, args[1 - s])?;
+            let a = func.dfg.resolve_aliases(a);
+            let d = func.dfg.value_def(a).inst()?;
+            let InstructionData::Binary {
+                opcode: Opcode::Band,
+                args: bargs,
+            } = func.dfg.insts[d]
+            else {
+                return None;
+            };
+            let (x, m) = [bargs[0], bargs[1]]
+                .iter()
+                .enumerate()
+                .find_map(|(t, &b)| iconst(func, bargs[1 - t]).map(|m| (b, m)))?;
+            Some((x, m as u64, v as u64))
+        }) else {
+            continue;
+        };
+        let ty = func.dfg.value_type(func.dfg.resolve_aliases(x));
+        if !ty.is_int() || ty.is_vector() || ty.bits() < 8 {
+            continue;
+        }
+        let bits = ty.bits();
+        let bmask = if bits >= 64 { u64::MAX } else { (1 << bits) - 1 };
+        let m = m & bmask;
+        let c = c & bmask;
+        // The mask and constant must live inside the byte, and `m` must
+        // be top-contiguous in it — `m | (m-1) == 0xff` accepts exactly
+        // {0x80, 0xC0, ..., 0xFE, 0xFF}, which makes `(b & m) == c` a
+        // single byte interval `[c, c|~m]`.
+        if m > 0xff || c > 0xff || m < 0x80 || m | (m - 1) != 0xff || c & !m != 0 {
+            continue;
+        }
+        // In sign-extended space the interval is one-sided only when it
+        // sits at a sign edge; `m == 0xff` is byte equality.
+        let hi = c | (!m & 0xff);
+        let (cc, bound) = if m == 0xff {
+            (
+                cond,
+                if c >= 0x80 { c as i64 - 256 } else { c as i64 },
+            )
+        } else if c == 0 {
+            (
+                if cond == IntCC::Equal {
+                    IntCC::UnsignedLessThanOrEqual
+                } else {
+                    IntCC::UnsignedGreaterThan
+                },
+                hi as i64,
+            )
+        } else if c == 0x80 {
+            (
+                if cond == IntCC::Equal {
+                    IntCC::SignedLessThanOrEqual
+                } else {
+                    IntCC::SignedGreaterThan
+                },
+                hi as i64 - 256,
+            )
+        } else {
+            continue;
+        };
+        if !sext_byte(func, x, bits) {
+            continue;
+        }
+        // The `icmp`'s operands keep the band's type; write the new
+        // compare in place so the (possibly multi-use) band survives
+        // for its other uses.
+        let x = func.dfg.resolve_aliases(x);
+        let mut pos = FuncCursor::new(func).at_inst(i);
+        let k = pos.ins().iconst(ty, bound);
+        pos.func.dfg.insts[i] = InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            cond: cc,
+            args: [x, k],
+        };
+        n += 1;
+    }
+    n
+}
+
+/// `v` (of `bits`-wide type) provably holds a byte's sign in every bit
+/// at and above bit 7.
+fn sext_byte(func: &Function, v: Value, bits: u32) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let Some(d) = func.dfg.value_def(v).inst() else {
+        return bits == 8;
+    };
+    match func.dfg.insts[d] {
+        InstructionData::Load {
+            opcode: Opcode::Sload8,
+            ..
+        } => bits >= 32,
+        InstructionData::Unary {
+            opcode: Opcode::Sextend,
+            arg,
+        } => {
+            bits > 8 && func.dfg.value_type(func.dfg.resolve_aliases(arg)).bits() == 8
+        }
+        _ => bits == 8,
+    }
+}
+
 pub fn sgntest(func: &mut Function) -> usize {
     let mut brifs = Vec::new();
     for b in func.layout.blocks() {
@@ -13470,5 +13678,184 @@ mod tests {
             "expected icmp ne or the select to survive:\n{}",
             func.display()
         );
+    }
+
+    /// `(b & 0xC0) == 0x80` where `b = uload8` used only by byte masks:
+    /// the load flips to `sload8` and the test becomes `x <=s -65`.
+    #[test]
+    fn sextload_continuation_test() {
+        let src = "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = uload8.i32 notrap aligned v0
+            v10 = iconst.i32 0xc0
+            v2 = band v1, v10
+            v11 = iconst.i32 0x80
+            v3 = icmp eq v2, v11
+            v12 = iconst.i32 0x3f
+            v4 = band v1, v12
+            v5 = ireduce.i8 v4
+            return v5
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(sextload(&mut func), 2);
+        let mut saw_sload8 = false;
+        let mut saw_sle = false;
+        for i in func.layout.block_insts(func.layout.entry_block().unwrap()) {
+            match func.dfg.insts[i] {
+                InstructionData::Load { opcode, .. } => {
+                    saw_sload8 |= opcode == Opcode::Sload8;
+                }
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond,
+                    args,
+                } => {
+                    assert_eq!(cond, IntCC::SignedLessThanOrEqual);
+                    assert_eq!(iconst(&func, args[1]).map(|k| k as i32), Some(-65));
+                    saw_sle = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_sload8 && saw_sle, "\n{}", func.display());
+    }
+
+    /// A `uload8` with a non-byte use (an `icmp` on the loaded value)
+    /// keeps its opcode and its masked compare.
+    #[test]
+    fn sextload_keeps_zext_when_full_word_used() {
+        let src = "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = uload8.i32 notrap aligned v0
+            v10 = iconst.i32 0xc0
+            v2 = band v1, v10
+            v11 = iconst.i32 0x80
+            v3 = icmp eq v2, v11
+            v12 = iconst.i32 5
+            v4 = icmp ult v1, v12
+            v5 = ireduce.i8 v4
+            return v5
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(sextload(&mut func), 0, "\n{}", func.display());
+    }
+
+    /// `sload8` bytes already sign-extend: `(x & 0x80) == 0` is
+    /// `x <=u 0x7f` without touching the load.
+    #[test]
+    fn sextload_sign_bit_test_on_sload() {
+        let src = "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = sload8.i32 notrap aligned v0
+            v10 = iconst.i32 0x80
+            v2 = band v1, v10
+            v11 = iconst.i32 0
+            v3 = icmp ne v2, v11
+            v4 = ireduce.i8 v3
+            return v4
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(sextload(&mut func), 1);
+        for i in func.layout.block_insts(func.layout.entry_block().unwrap()) {
+            if let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] {
+                assert_eq!(cond, IntCC::UnsignedGreaterThan);
+                assert_eq!(iconst(&func, args[1]), Some(0x7f));
+            }
+        }
+    }
+
+    /// `(x & m) == 0x40` on a sext byte is a positive-side interval —
+    /// two compares, so the band+cmp stays.
+    #[test]
+    fn sextload_skips_mid_interval() {
+        let src = "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = sload8.i32 notrap aligned v0
+            v10 = iconst.i32 0xc0
+            v2 = band v1, v10
+            v11 = iconst.i32 0x40
+            v3 = icmp eq v2, v11
+            v4 = ireduce.i8 v3
+            return v4
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(sextload(&mut func), 0, "\n{}", func.display());
+    }
+
+    /// i8-typed bytes need no load at all: `(x.i8 & 0xC0) == 0x80` ->
+    /// `x <=s -65` directly.
+    #[test]
+    fn sextload_i8_compare() {
+        let src = "function %f(i8) -> i8 {
+        block0(v0: i8):
+            v10 = iconst.i8 0xc0
+            v2 = band v0, v10
+            v11 = iconst.i8 0x80
+            v3 = icmp eq v2, v11
+            return v3
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(sextload(&mut func), 1, "\n{}", func.display());
+    }
+
+    /// The rewrite is exact: interpret before and after over all 256
+    /// byte values for each collapsed form.
+    #[test]
+    fn sextload_interpreter_round_trip() {
+        use cranelift_codegen::data_value::DataValue;
+        use cranelift_interpreter::environment::FunctionStore;
+        use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
+        use cranelift_interpreter::step::ControlFlow;
+
+        fn run(f: &Function, byte: u8) -> Vec<DataValue> {
+            let mut fs = FunctionStore::default();
+            fs.add(f.name.to_string(), f);
+            let mut it =
+                Interpreter::new(InterpreterState::default().with_function_store(fs));
+            match it
+                .call_by_name(&f.name.to_string(), &[DataValue::I8(byte as i8)])
+                .unwrap()
+            {
+                ControlFlow::Return(r) => r.to_vec(),
+                _ => panic!("no return"),
+            }
+        }
+        // `(b & m) cc v` selects 1/0 — covers eq/ne at 0x80, 0, and
+        // byte-equality (m == 0xff).
+        for (m, v, cc) in [
+            ("0xc0", "0x80", "eq"),
+            ("0xc0", "0x80", "ne"),
+            ("0xe0", "0", "eq"),
+            ("0xe0", "0", "ne"),
+            ("0x80", "0", "eq"),
+            ("0x80", "0x80", "ne"),
+            ("0xff", "0xa5", "eq"),
+            ("0xff", "0x42", "ne"),
+        ] {
+            let src = format!(
+                "function %f(i8) -> i8 {{
+            block0(v0: i8):
+                v10 = iconst.i8 {m}
+                v2 = band v0, v10
+                v11 = iconst.i8 {v}
+                v3 = icmp {cc} v2, v11
+                v12 = iconst.i8 1
+                v13 = iconst.i8 0
+                v4 = select v3, v12, v13
+                return v4
+            }}"
+            );
+            let f = cranelift_reader::parse_functions(&src).unwrap().remove(0);
+            let mut g = f.clone();
+            let n = sextload(&mut g);
+            for b in 0..=255u8 {
+                assert_eq!(
+                    run(&f, b),
+                    run(&g, b),
+                    "m={m} v={v} {cc} byte={b:#04x} n={n}\n{}",
+                    g.display()
+                );
+            }
+        }
     }
 }

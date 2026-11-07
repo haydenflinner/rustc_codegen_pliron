@@ -45,6 +45,9 @@ block0(v0: i64, v1: i64, v2: i64):
     assert_eq!(count(&a, "csinc"), 1, "{a}");
     assert_eq!(count(&a, "cset"), 0, "{a}");
     assert_eq!(count(&a, "subs"), 0, "{a}");
+    // `cmp`/`cmn` is the same flag-only recompute under its alias.
+    assert_eq!(count(&a, "cmp "), 0, "{a}");
+    assert_eq!(count(&a, "cmn "), 0, "{a}");
 }
 
 /// The `uextend` form, compared against the other addend.

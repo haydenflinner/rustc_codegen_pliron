@@ -1489,13 +1489,26 @@ impl Inst {
                 ref imm12,
             } => {
                 let op = op_name(alu_op);
-                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rd_reg = rd.to_reg();
                 let rn = pretty_print_ireg(rn, size);
 
                 if imm12.bits == 0 && alu_op == ALUOp::Add && size.is64() {
                     // special-case MOV (used for moving into SP).
+                    let rd = pretty_print_ireg(rd_reg, size);
                     format!("mov {rd}, {rn}")
+                } else if rd_reg == zero_reg() {
+                    // PLIRON: flag-setting ops into the zero register are
+                    // `cmp`/`cmn`/`tst`-class aliases; keep the mnemonic
+                    // readable instead of `adds xzr, ...`.
+                    let imm12 = imm12.pretty_print(0);
+                    let alias = match alu_op {
+                        ALUOp::AddS => "cmn",
+                        ALUOp::SubS => "cmp",
+                        _ => op,
+                    };
+                    format!("{alias} {rn}, {imm12}")
                 } else {
+                    let rd = pretty_print_ireg(rd_reg, size);
                     let imm12 = imm12.pretty_print(0);
                     format!("{op} {rd}, {rn}, {imm12}")
                 }

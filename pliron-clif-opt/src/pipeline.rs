@@ -2919,6 +2919,17 @@ fn s_sgntest(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::sgntest(&mut p.clctx.func)
 }
 
+// `uload8` -> `sload8` under byte-transparent uses, and byte-mask
+// equality tests on sign-extended bytes -> one compare — see
+// `clifpeep::sextload`.
+fn s_sextload(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::sextload(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("sextload");
+    }
+    k
+}
+
 // Two-compare range predicates (`x >= lo && x <= hi`) merged to
 // `(x - lo) <u w` — see `clifpeep::rgmerge`.
 fn s_rgmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -4820,6 +4831,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `test`+`jcc` on x64. Runs last: the `icmp` form is canonical for
         // every earlier pass.
         step("sgntest", "sgntest", Gate::Env("PLIRON_SGNTEST"), s_sgntest).needs(shape::CONDBR),
+        // `uload8` -> `sload8` under byte-transparent uses, then
+        // `(x & m) == v` on a sign-extended byte -> one compare
+        // (UTF-8 continuation tests `& 0xC0 == 0x80` -> `x <s -64`:
+        // `ldrsb`+`cmn` in place of `ldrb`+`and`+`cmp`). Opt-in.
+        step("sextload", "sextload", Gate::Env("PLIRON_SEXTLOAD"), s_sextload).needs(shape::MEM),
         // `jump`-edge continuations whose param-bound loads a pred just
         // stored (or_insert's `*v += 1` reading its own `0`) get cloned onto
         // the edge so lcse4 can fold the RMW to a direct store.
