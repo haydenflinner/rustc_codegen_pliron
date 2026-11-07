@@ -1303,3 +1303,20 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     site fact: regex segfaulted). Without it the egraph step lost the
     inbounds mark on brotli's byte-compare pointer and that loop ran
     2.3x slower (docs/codegen-plan.md "Direction").
+
+105. aarch64 scaled-amode recovery for doubled/multiplied indices
+    (`src/isa/aarch64/inst.isle` `amode_no_more_iconst`): the egraph's
+    `ishl y, 1` → `iadd y, y` strength reduction hid the scaled-index
+    pattern upstream rule 6/7 keys on, so `base + 2*i` addressing (e.g.
+    miniz_oxide's halfword-table indexing) materialized a standalone
+    `add` plus a reg+reg amode. New rules fold `iadd x, (iadd y, y)`
+    (either operand order) into `amode_reg_scaled` when
+    `ty_bytes == 2`, and `iadd x, (imul y, C)` when `C == ty_bytes` —
+    the same `lsl #1`/`lsl #2`/`lsl #3` single-insn form LLVM emits.
+    `emit.rs::enc_ldst_reg` keeps its uxtw/sxtw/sxtx/lsl whitelist with
+    a note: the ldst-register option field rejects uxtb/uxth/sxtb/sxth
+    (verified — they trap on Apple Silicon), so i16-typed indices fall
+    through to `RegScaled` on the already-extended value.
+    `args.rs::PrettyPrint` now prints the W/X index width correctly for
+    the wider extendop space (relevant to `add`-with-extend forms,
+    where those ops ARE legal).

@@ -263,6 +263,9 @@ fn enc_ldst_reg(
     rd: Reg,
 ) -> u32 {
     let s_bit = if s_bit { 1 } else { 0 };
+    // PLIRON: keep the whitelist — the ldst-register option field only
+    // permits uxtw/sxtw/sxtx/lsl; uxtb/uxth/sxtb/sxth encodings trap at
+    // runtime (verified on Apple Silicon).
     let extend_bits = match extendop {
         Some(ExtendOp::UXTW) => 0b010,
         Some(ExtendOp::SXTW) => 0b110,

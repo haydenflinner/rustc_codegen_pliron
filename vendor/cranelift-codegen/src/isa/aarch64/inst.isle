@@ -4291,6 +4291,24 @@
 (rule 7 (amode_no_more_iconst ty (iadd _ (ishl shift_ty y (iconst _ (u64_from_imm64 n))) x) offset)
         (if-let true (u64_eq (ty_bytes ty) (u64_wrapping_shl 1 (shift_masked_imm shift_ty n))))
         (amode_reg_scaled (amode_add x offset) y))
+;; PLIRON: `iadd y, y` is `y * 2` — the egraph's `ishl y, 1` strength
+;; reduction produces this shape (miniz_oxide's halfword-table
+;; indexing), and it otherwise survives to a standalone `add` plus a
+;; reg+reg amode instead of the single scaled form.
+(rule 6 (amode_no_more_iconst ty (iadd _ x (iadd _ y y)) offset)
+        (if-let true (u64_eq (ty_bytes ty) 2))
+        (amode_reg_scaled (amode_add x offset) y))
+(rule 7 (amode_no_more_iconst ty (iadd _ (iadd _ y y) x) offset)
+        (if-let true (u64_eq (ty_bytes ty) 2))
+        (amode_reg_scaled (amode_add x offset) y))
+;; PLIRON: likewise `imul y, ty_bytes` — `index * sizeof` is the same
+;; scaled index, whichever op produced it.
+(rule 6 (amode_no_more_iconst ty (iadd _ x (imul _ y (iconst _ (u64_from_imm64 n)))) offset)
+        (if-let true (u64_eq (ty_bytes ty) n))
+        (amode_reg_scaled (amode_add x offset) y))
+(rule 7 (amode_no_more_iconst ty (iadd _ (imul _ y (iconst _ (u64_from_imm64 n))) x) offset)
+        (if-let true (u64_eq (ty_bytes ty) n))
+        (amode_reg_scaled (amode_add x offset) y))
 
 ;; Highest priority: a non-zero uimm12 offset folds into the load's immediate,
 ;; keeping `val` (e.g. a shared `base + index`) CSE-able across offsets instead
@@ -4325,6 +4343,10 @@
         (AMode.RegScaledExtended base index (ExtendOp.UXTW)))
 (rule 1 (amode_reg_scaled base (sextend _ index @ (value_type $I32)))
         (AMode.RegScaledExtended base index (ExtendOp.SXTW)))
+;; PLIRON: narrower extend sources are NOT expressible — the
+;; ldst-register option field only permits uxtw/sxtw/sxtx/lsl; uxtb/
+;; uxth/sxtb/sxth encodings trap at runtime. An i16-typed index falls
+;; through to RegScaled on the already-extended 64-bit value.
 
 ;; Helper to add a 32-bit signed immediate to the register provided. This will
 ;; select an appropriate `add` instruction to use.
