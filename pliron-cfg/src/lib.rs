@@ -137,6 +137,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // postcard's varint decoders get the unrolled ldrb + const-shift orr
     // + tbz shape (varint_postcard -16%); `=0` keeps the runtime loop.
     "PLIRON_BUNROLL",
+    // licm noalias provenance shelter: a writable rustc-`noalias` entry
+    // param with no loop-observable escape has no in-loop value carrying
+    // its provenance under another root, so stores rooted elsewhere
+    // can't clobber its locs — &mut self field loads hoist past stores
+    // through pointers loaded from it (compress_inner). `=0` off.
+    "PLIRON_LICM_NASHEL",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
