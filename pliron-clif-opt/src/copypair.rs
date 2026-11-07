@@ -166,6 +166,141 @@ fn use_counts(func: &Function) -> FxHashMap<Value, u32> {
     m
 }
 
+/// Use map: value → one instruction using it (only sound to consult
+/// when `use_counts` reports exactly one use for that value).
+fn use_map(func: &Function) -> FxHashMap<Value, Inst> {
+    let mut m: FxHashMap<Value, Inst> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                m.insert(func.dfg.resolve_aliases(v), i);
+            }
+        }
+    }
+    m
+}
+
+/// A `load.i64 base+o` whose flags merge cleanly with a neighbour.
+fn scalar_load(func: &Function, i: Inst) -> Option<(Value, i32, MemFlagsData)> {
+    let InstructionData::Load {
+        opcode: Opcode::Load,
+        arg,
+        offset,
+        flags: lf,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let v = func.dfg.first_result(i);
+    if func.dfg.value_type(v) != types::I64 {
+        return None;
+    }
+    Some((arg, i32::from(offset), func.dfg.mem_flags[lf]))
+}
+
+/// A `store.i64 v, base+o` storing exactly `v`.
+fn scalar_store(func: &Function, i: Inst, v: Value) -> Option<(Value, i32, MemFlagsData)> {
+    let InstructionData::Store {
+        opcode: Opcode::Store,
+        args: [sv, sbase],
+        offset,
+        flags: sf,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    if func.dfg.resolve_aliases(sv) != v {
+        return None;
+    }
+    Some((sbase, i32::from(offset), func.dfg.mem_flags[sf]))
+}
+
+/// Merge `load.i64 p+o; load.i64 p+o+8` (consecutive insts, same base)
+/// plus the matching consecutive `store` pair their values feed into a
+/// single `load.i64x2` + `store.i64x2`. Nothing moves — the wider access
+/// covers the same byte range at the same position, so no aliasing
+/// analysis is needed. SROA leaves the tail of a widened aggregate copy
+/// as scalar pairs; LLVM emits `ldp q`/`stp q` for the whole thing.
+fn merge_pairs(
+    func: &mut Function,
+    uses: &FxHashMap<Value, u32>,
+    umap: &FxHashMap<Value, Inst>,
+) -> usize {
+    let mut n = 0;
+    let mut gone = rustc_hash::FxHashSet::default();
+    let blocks: Vec<_> = func.layout.blocks().collect();
+    for b in blocks {
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        let pos: FxHashMap<Inst, usize> =
+            insts.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+        let mut k = 0;
+        while k + 1 < insts.len() {
+            let (l0, l1) = (insts[k], insts[k + 1]);
+            k += 1;
+            // `insts` is a snapshot; a previous merge's removals are
+            // still in the dfg, so skip anything already consumed.
+            if gone.contains(&l0) || gone.contains(&l1) {
+                continue;
+            }
+            let Some((a0, o0, f0)) = scalar_load(func, l0) else {
+                continue;
+            };
+            let Some((a1, o1, f1)) = scalar_load(func, l1) else {
+                continue;
+            };
+            let (v0, v1) = (func.dfg.first_result(l0), func.dfg.first_result(l1));
+            if func.dfg.resolve_aliases(a0) != func.dfg.resolve_aliases(a1)
+                || o1 != o0.wrapping_add(8)
+                || plain(f0) != plain(f1)
+                || !f0.notrap()
+                || !f1.notrap()
+                || !ok_vec_off(i64::from(o0))
+                || uses.get(&v0) != Some(&1)
+                || uses.get(&v1) != Some(&1)
+            {
+                continue;
+            }
+            let (Some(&s0), Some(&s1)) = (umap.get(&v0), umap.get(&v1)) else {
+                continue;
+            };
+            if gone.contains(&s0) || gone.contains(&s1) {
+                continue;
+            }
+            // The two stores must be consecutive insts in this block.
+            if pos.get(&s0).map_or(true, |&si| {
+                si + 1 >= insts.len() || insts[si + 1] != s1
+            }) {
+                continue;
+            }
+            let Some((d0, r0, g0)) = scalar_store(func, s0, v0) else {
+                continue;
+            };
+            let Some((d1, r1, g1)) = scalar_store(func, s1, v1) else {
+                continue;
+            };
+            if func.dfg.resolve_aliases(d0) != func.dfg.resolve_aliases(d1)
+                || r1 != r0.wrapping_add(8)
+                || plain(g0) != plain(g1)
+                || !g0.notrap()
+                || !g1.notrap()
+                || !ok_vec_off(i64::from(r0))
+            {
+                continue;
+            }
+            let mut cur = FuncCursor::new(func).at_inst(l0);
+            let v = cur.ins().load(types::I64X2, plain(f0), a0, o0);
+            let mut cur = FuncCursor::new(func).at_inst(s0);
+            cur.ins().store(plain(g0), v, d0, r0);
+            for i in [l0, l1, s0, s1] {
+                func.layout.remove_inst(i);
+                gone.insert(i);
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
 fn as_pair(func: &Function, uses: &FxHashMap<Value, u32>, l: Inst, s: Inst) -> Option<Pair> {
     let InstructionData::Load {
         opcode: Opcode::Load,
@@ -211,7 +346,7 @@ fn as_pair(func: &Function, uses: &FxHashMap<Value, u32>, l: Inst, s: Inst) -> O
 /// Returns the number of runs rewritten.
 pub fn run(func: &mut Function) -> usize {
     let uses = use_counts(func);
-    let mut n = 0;
+    let mut n = merge_pairs(func, &uses, &use_map(func));
     let blocks: Vec<_> = func.layout.blocks().collect();
     for b in blocks {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();

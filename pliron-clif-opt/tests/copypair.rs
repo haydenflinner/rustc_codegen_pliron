@@ -224,3 +224,62 @@ fn readonly_loads_regroup_without_can_move() {
         }
     }
 }
+
+/// The swap/copy tail SROA leaves behind: two consecutive scalar loads
+/// whose values feed two consecutive adjacent scalar stores. Both merge
+/// into one `i64x2` pair without any reordering.
+const SWAP_TAIL: &str = "function %t(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v20 = load.i64 notrap v0+16
+    v21 = load.i64 notrap v0+24
+    v30 = iconst.i64 0
+    store notrap v20, v1+16
+    store notrap v21, v1+24
+    return v30
+}";
+
+#[test]
+fn swap_tail_scalar_pairs_become_vector() {
+    let (_f, g, n) = opt(SWAP_TAIL);
+    assert_eq!(n, 1, "{}", g.display());
+    assert_eq!(
+        mem_seq(&g),
+        vec![(Opcode::Load, 128), (Opcode::Store, 128)],
+        "{}",
+        g.display()
+    );
+}
+
+/// The scalar loads feed anything else: no merge.
+const SWAP_USED: &str = "function %t(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v20 = load.i64 notrap v0+16
+    v21 = load.i64 notrap v0+24
+    store notrap v20, v1+16
+    store notrap v21, v1+24
+    v22 = iadd v20, v21
+    return v22
+}";
+
+#[test]
+fn swap_tail_values_with_other_uses_stay() {
+    let (_f, g, n) = opt(SWAP_USED);
+    assert_eq!(n, 0, "{}", g.display());
+}
+
+/// The stores are not consecutive: no merge.
+const SWAP_SPLIT: &str = "function %t(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v20 = load.i64 notrap v0+16
+    v21 = load.i64 notrap v0+24
+    store notrap v20, v1+16
+    v30 = iconst.i64 0
+    store notrap v21, v1+24
+    return v30
+}";
+
+#[test]
+fn swap_tail_split_stores_stay() {
+    let (_f, g, n) = opt(SWAP_SPLIT);
+    assert_eq!(n, 0, "{}", g.display());
+}
