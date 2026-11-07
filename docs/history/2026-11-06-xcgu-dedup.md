@@ -113,3 +113,12 @@ Dead ends inside `mono`:
 - `n>=2 holders` alone missed `inlined`-in-one-partition +
   `extra`-copied-elsewhere items (`PrivateIter::next` x6); the
   `copied` set covers them.
+
+## Default-on flip (same day, later)
+
+`harness/crates.py --tier 2` under `PLIRON_XCGU_PROMOTE=copyable
+PLIRON_XCGU_HOME=mono`: 31 crates (ryu…toml + crossbeam, rayon, tokio,
+serde_json), **0 pliron-only failures** — so `DEFAULT_VALUES` now ships
+`PLIRON_XCGU_HOME=mono` + `PLIRON_XCGU_PROMOTE=copyable`. `=1` keeps the
+old degraded-only mode, `=0` disables home conversion entirely. Gate +
+quick green on the flipped build.

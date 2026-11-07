@@ -164,9 +164,18 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // Always-inline waffle bodies (src/wasm.rs). 6: −~0.4 KiB regex-wasm
     // vs default 12 with no observed runtime hit on hash kernels.
     ("PLIRON_WASM_TINY", "6"),
-    // Degraded cross-CGU copies inlining left called go back to the home
-    // fn (2026-11-02, tuning geomean 0.996; `=0` off, `=all` every copy).
-    ("PLIRON_XCGU_HOME", "1"),
+    // Duplicate-less copies: every shared `inlined` mono item keeps one
+    // owner definition; the other partitions' copies convert to imports
+    // after inlining, as does every `extra` copy whose home is linkable
+    // (2026-11-06-xcgu-dedup.md: syn SIZ 1.75->1.20, CMP 1.31->1.13,
+    // MEM 1.84->1.69, runtime neutral). `=1` degraded copies only, `=all`
+    // copies only (no inlined-item election), `=0` off.
+    ("PLIRON_XCGU_HOME", "mono"),
+    // Promote single-home Internal items some CGU copies (and `inlined`
+    // items' owners under HOME=mono) hidden-external so the duplicates
+    // can bind them. `=cold` copies only, `=1` every uncopyable dep,
+    // `=0` none.
+    ("PLIRON_XCGU_PROMOTE", "copyable"),
     // Descend into external deps when closing over copy candidates, so a
     // consumer CGU's copy inlines as deeply as the home CGU's (2026-11-04:
     // bench/sieve -21%, varint_postcard -5%, rest within noise; ~+30%

@@ -283,23 +283,23 @@ in the scoreboard and in the linked history files.
   `PLIRON_ALIGN_MAXB=<bytes>` (skip pads on loops whose body exceeds the
   cap) recovered only ~0.2-0.5% and stays opt-in. Full attribution:
   `history/2026-11-06-siz-mem-attribution.md`.
-  **Dedup (opt-in, not default):** `PLIRON_XCGU_PROMOTE=copyable
-  PLIRON_XCGU_HOME=mono` elects one owner partition per shared
-  `inlined` mono item (rustc's "CGU-private copies" — drop glue and
-  shared generics, ~205 symbols / 430 KB of `syn` text defined in
-  6–13 objects each) as well as per `extra` copy, promotes the
+  **Dedup (default-on since 2026-11-06):** `PLIRON_XCGU_HOME=mono`
+  elects one owner partition per shared `inlined` mono item (rustc's
+  "CGU-private copies" — drop glue and shared generics, ~205 symbols
+  / 430 KB of `syn` text defined in 6–13 objects each) as well as
+  per `extra` copy, `PLIRON_XCGU_PROMOTE=copyable` promotes the
   owner's `Internal` def hidden-external, and `home_copies` turns
   every surviving duplicate into an import of the one body — zero
-  multi-defined symbols on `syn`. Card deltas under the flags:
+  multi-defined symbols on `syn`. Card deltas when flipped on:
   syn SIZ 1.753→**1.202** (also CMP 1.31→1.13, MEM 1.84→1.69 —
   converted bodies skip lowering entirely), regex-syntax SIZ
   1.897→1.811, kernels 2.065→1.975, wasm unchanged. Bench runtime
-  neutral (−0.04% geomean). `PLIRON_XCGU_MONOMIN` (default 200 MIR
-  stmts) keeps ordinary small items per-CGU — bodies that inline
-  away everywhere must not force an owner def `dead_fns` can't
-  strip; drop glue and other shims always elect since they survive
-  inlining regardless. The weaker `HOME=all` form (copy dedup only,
-  no `inlined`-item election) is also available.
+  neutral (−0.04% geomean); crates.py tier 2 clean (31 crates).
+  `PLIRON_XCGU_MONOMIN` (default 200 MIR stmts) keeps ordinary
+  small items per-CGU — bodies that inline away everywhere must not
+  force an owner def `dead_fns` can't strip; drop glue and other
+  shims always elect since they survive inlining regardless.
+  `=1`/`=all`/`=0` keep the older copy modes.
   `history/2026-11-06-xcgu-dedup.md`.
 - **wasm.** Op density, not dead code: `local.get`/`local.set`, `br` and
   `if`/`else` counts are several times LLVM's (see the runtime entry on
