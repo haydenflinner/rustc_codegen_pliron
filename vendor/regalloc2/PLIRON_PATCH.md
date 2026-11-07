@@ -184,7 +184,7 @@ rounds): mode 3 + `LOOPSPLIT`/`LOOPDEPTH` 0.998 [0.994, 1.003], mode 4
 1.000]; nothing beats mode 3 outside the floor, the split knobs stay
 opt-in.
 
-## `PLIRON_RA2_NOPINMERGE=1` (runtime, opt-in): don't spread a fixed pin through merges
+## `PLIRON_RA2_NOPINMERGE` (runtime, default on, `=0` off): don't spread a fixed pin through merges
 
 `Requirement::merge` promotes `Register + FixedReg(p)` to
 `FixedReg(p)`, so a single fixed-use operand (a try_call-ret vreg, an

@@ -79,19 +79,22 @@ pub(crate) fn loopsplit_on() -> bool {
     false
 }
 
-/// PLIRON: `PLIRON_RA2_NOPINMERGE=1` (opt-in): refuse blockparam merges
-/// that would spread a `FixedReg`/`FixedStack` requirement onto an
-/// unconstrained bundle whose ranges cross a fixed reservation
-/// (clobber) of that preg — the pin would force split+fill at every
-/// clobber where the unmerged edge move is cheaper (see `merge.rs`).
+/// PLIRON: `PLIRON_RA2_NOPINMERGE` (default on, `=0` off): refuse
+/// blockparam merges that would spread a `FixedReg`/`FixedStack`
+/// requirement onto an unconstrained bundle whose ranges cross a fixed
+/// reservation (clobber) of that preg — the pin would force split+fill
+/// at every clobber where the unmerged edge move is cheaper (see
+/// `merge.rs`). Held-out A/B neutral (0.991 [0.967,1.035]) with a
+/// measured win on the motivating function (HqZopfli −14% `[sp]`
+/// accesses, ~6% faster).
 pub(crate) fn nopinmerge_on() -> bool {
     #[cfg(feature = "std")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_NOPINMERGE").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_NOPINMERGE").as_deref() != Ok("0"))
     }
     #[cfg(not(feature = "std"))]
-    false
+    true
 }
 
 macro_rules! explain {
