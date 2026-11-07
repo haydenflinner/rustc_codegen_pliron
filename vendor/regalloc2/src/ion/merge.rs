@@ -13,9 +13,10 @@
 //! Bundle merging.
 
 use crate::ion::data_structures::{
-    BlockparamOut, CodeRange, Env, LiveBundleIndex, LiveRangeList, SpillSet, SpillSlotIndex,
-    VRegIndex,
+    BlockparamOut, CodeRange, Env, LiveBundleIndex, LiveRangeKey, LiveRangeList, SpillSet,
+    SpillSlotIndex, VRegIndex,
 };
+use crate::ion::requirement::Requirement;
 use crate::{Function, Inst, OperandConstraint, OperandKind, PReg, ProgPoint};
 use alloc::format;
 use core::convert::TryFrom;
@@ -256,6 +257,53 @@ impl<'a, F: Function> Env<'a, F> {
         true
     }
 
+    /// PLIRON (`PLIRON_RA2_NOPINMERGE`): would merging `from` into `to`
+    /// pin an unconstrained side onto a preg it can't actually keep?
+    /// True when exactly one side has a `FixedReg`/`FixedStack`
+    /// constraint, the merged requirement is a fixed preg, and some
+    /// range of the unconstrained side overlaps a fixed reservation
+    /// (clobber) on that preg — pinning there forces a split where an
+    /// edge move would do.
+    fn pin_spread_hurts(&mut self, from: LiveBundleIndex, to: LiveBundleIndex) -> bool {
+        let f = self.bundles[from].cached_fixed() || self.bundles[from].cached_stack();
+        let t = self.bundles[to].cached_fixed() || self.bundles[to].cached_stack();
+        if f == t {
+            return false;
+        }
+        let preg = match self.merge_bundle_requirements(from, to) {
+            Ok(Requirement::FixedReg(p)) | Ok(Requirement::FixedStack(p)) => p,
+            _ => return false,
+        };
+        let side = if f { to } else { from };
+        for entry in &self.bundles[side].ranges {
+            let r = entry.range;
+            let probe = LiveRangeKey::from_range(&CodeRange {
+                from: r.from,
+                to: r.to,
+            });
+            for (key, lr) in self.ctx.pregs[preg.index()]
+                .allocations
+                .btree
+                .range(probe..)
+            {
+                if key.to_range().from >= r.to {
+                    break;
+                }
+                if !lr.is_valid() {
+                    explain!(
+                        "  nopinmerge: refuse {:?}->{:?}; range {:?} crosses fixed use of {:?}",
+                        from,
+                        to,
+                        r,
+                        preg
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn merge_vreg_bundles(&mut self) {
         // Create a bundle for every vreg, initially.
         trace!("merge_vreg_bundles: creating vreg bundles");
@@ -414,6 +462,17 @@ impl<'a, F: Function> Env<'a, F> {
                 from_bundle.index(),
                 to_bundle.index()
             );
+            // PLIRON: `PLIRON_RA2_NOPINMERGE=1` — don't let one side's
+            // `FixedReg`/`FixedStack` constraint pin an unconstrained
+            // neighbor whose ranges cross a clobber of that preg. The
+            // merged bundle would require the preg everywhere it is
+            // live and split+fill at every call clobber; refusing the
+            // merge keeps the edge move, which is cheaper. (A pinned
+            // try_call-ret vreg merging into a long param chain is the
+            // motivating case — `BrotliCreateHqZopfli...`.)
+            if crate::nopinmerge_on() && self.pin_spread_hurts(from_bundle, to_bundle) {
+                continue;
+            }
             self.merge_bundles(from_bundle, to_bundle);
         }
 

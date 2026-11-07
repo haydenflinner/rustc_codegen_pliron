@@ -165,3 +165,35 @@ eviction strategy that prefers low-weight long-lived entry bundles
 over hot in-loop ones at clobber points — that's the
 `conflict_set`/`ConflictWithFixed` path in `ion/process.rs`, a real
 regalloc2 change, not a knob.
+
+## Resolution (same day): the pin spread through *merges*, not evictions
+
+Follow-up found the actual mechanism and a working fix:
+
+- The hot "empty conflict set" bundles are `FixedReg` bundles — but the
+  fixed use isn't on the long-lived value itself. A *try_call ret*
+  vreg (x0-pinned at its def, range `[call..edge]`) merges into the
+  destination block's blockparam chain via best-effort coalescing, and
+  `Requirement::merge`'s `Register + FixedReg -> FixedReg` promotion
+  drags the pin onto the whole 11-vreg chain. The chain then splits at
+  every x0 clobber in the loop.
+- **`PLIRON_RA2_NOPINMERGE=1`** (`ion/merge.rs::pin_spread_hurts`):
+  refuse a blockparam merge when the merged requirement is
+  `FixedReg`/`FixedStack` *and* the unconstrained side's ranges
+  overlap a fixed reservation on that preg — pinning there provably
+  forces a split where the edge move is cheaper. On the function:
+  2258 -> **2205 insns**, `[sp]` accesses 527 -> **454** (-14%),
+  ~2.80 -> ~2.62 ms. Safe by construction (refusing a merge just keeps
+  the edge move) and precise (the clobber-overlap probe only refuses
+  when pinning is provably harmful).
+- **`PLIRON_OUTCOPY=1`** (`machinst/lower.rs::out_detach`): the
+  def-side analog for *plain* call results — substitute a tmp into
+  `defs`, emit `mov result, tmp` after the call. Neutral here (the pin
+  spread through merges, not the result's own range); kept opt-in.
+  try_call rets can't take this path — they're edge-delivered and a
+  block-tail mov after a terminator is invalid vcode (that mistake
+  caused the `register allocation: BB` ICE; reverted).
+
+So the "deep RA" gap had a ~40-line answer in the merge stage: LLVM's
+explicit `COPY`-to-arg-reg structure is what the guard's refused
+merges + existing edge moves effectively reconstruct.

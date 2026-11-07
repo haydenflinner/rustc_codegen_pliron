@@ -253,6 +253,11 @@ pub struct Lower<'func, I: VCodeInst> {
     /// inst's position; see `set_pending_postindex`.
     pending_postindex: Option<(Inst, I, InstOutput)>,
 
+    /// PLIRON: detach movs queued by `out_detach` (PLIRON_OUTCOPY);
+    /// appended to `ir_insts` by `finish_ir_inst` so they land right
+    /// after the call they copy results out of.
+    pending_out_movs: SmallVec<[I; 4]>,
+
     /// Compilation flags.
     flags: Flags,
 }
@@ -541,6 +546,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             try_call_payloads,
             pinned_reg: None,
             pending_postindex: None,
+            pending_out_movs: smallvec![],
             flags,
         })
     }
@@ -764,6 +770,60 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         Some(out)
     }
 
+    /// PLIRON: the result-side twin of `arg_detach`. A call result's
+    /// `FixedReg` *def* pins its whole bundle to the return register:
+    /// `compute_requirement` merges all uses of all ranges, and the
+    /// blockparam-merged chain of a long-lived result then requires
+    /// the clobbered preg everywhere it is live — splitting at every
+    /// later call into spill+fill pieces (`BrotliCreateHqZopfli...`'s
+    /// `v448`-family bundle: one call result pinned to x0 across the
+    /// whole walk loop). Substituting fresh vregs into `defs` confines
+    /// the pin to the tmp's minimal range and emits one `mov` after
+    /// the call — the same shape LLVM's `COPY`s produce.
+    ///
+    /// Applied only to multi-use results: a single-use result's pin is
+    /// free (its range ends at its only use) while the detach would add
+    /// a `mov` the constraint never forced. `PLIRON_OUTCOPY=1` enables
+    /// (opt-in); try_call results are delivered on edges and are
+    /// already short-range, so `gen_try_call_rets` is untouched.
+    fn out_detach(&mut self, outputs: &[ValueRegs<Reg>]) -> Option<Vec<ValueRegs<Reg>>> {
+        static OUTCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*OUTCOPY.get_or_init(|| std::env::var_os("PLIRON_OUTCOPY").is_some_and(|v| v == "1")) {
+            return None;
+        }
+        let inst = self.cur_inst?;
+        let results = self.f.dfg.inst_results(inst);
+        let mut out = Vec::with_capacity(outputs.len());
+        let mut any = false;
+        for (i, regs) in outputs.iter().enumerate() {
+            let multi = results
+                .get(i)
+                .is_some_and(|&v| self.value_ir_uses[v] == ValueUseState::Multiple);
+            if !multi {
+                out.push(*regs);
+                continue;
+            }
+            any = true;
+            let val = results[i];
+            let ty = self.f.dfg.value_type(val);
+            let (_, tys) = I::rc_for_type(ty).unwrap_or_default();
+            let mut detached: SmallVec<[Reg; 2]> = smallvec![];
+            for (j, &r) in regs.regs().iter().enumerate() {
+                let reg_ty = tys.get(j).copied().unwrap_or(ty);
+                let tmp = self.vregs.alloc_with_deferred_error(reg_ty).only_reg().unwrap();
+                self.pending_out_movs
+                    .push(I::gen_move(Writable::from_reg(r), tmp, reg_ty));
+                detached.push(tmp);
+            }
+            out.push(match detached.len() {
+                1 => ValueRegs::one(detached[0]),
+                2 => ValueRegs::two(detached[0], detached[1]),
+                _ => panic!("Value must reside in 1 or 2 registers"),
+            });
+        }
+        any.then_some(out)
+    }
+
     /// PLIRON: copy `regs` into fresh vregs, emitting the moves. Gives
     /// `ret_detach`d return operands a minimal-range vreg so the
     /// fixed-return-reg constraint stays local to the copy.
@@ -839,6 +899,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     /// Set up return values `outputs` for a call with signature `sig`.
     pub fn gen_call_rets(&mut self, sig: Sig, outputs: &[ValueRegs<Reg>]) -> CallRetList {
+        // PLIRON: detach multi-use results so the fixed-return-reg def
+        // binds only the tmp (`out_detach`); the copy back is queued in
+        // `pending_out_movs` and lands after the call.
+        let detached = self.out_detach(outputs);
+        let outputs: &[ValueRegs<Reg>] = detached.as_deref().unwrap_or(outputs);
         self.vcode
             .abi()
             .gen_call_rets(self.vcode.sigs(), sig, outputs, None, &mut self.vregs)
@@ -1195,6 +1260,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // The VCodeBuilder builds in reverse order (and reverses at
         // the end), but `ir_insts` is in forward order, so reverse
         // it.
+        // PLIRON: detach movs queued by `out_detach` belong at the end
+        // of this IR-inst's emitted sequence — after the call whose
+        // `defs` write the tmp vregs they copy out of.
+        self.ir_insts.extend(self.pending_out_movs.drain(..));
         for inst in self.ir_insts.drain(..).rev() {
             self.vcode.push(inst, loc);
         }

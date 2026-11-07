@@ -1365,3 +1365,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `PLIRON_FN_NAME` thread-local, and `lower.rs` populates it when
     `PLIRON_RA2_STATS` *or* `PLIRON_PREVCODE` is set (previously only
     the former — `PLIRON_PREVCODE=<symbol>` matched nothing).
+
+109. `PLIRON_OUTCOPY=1` (runtime, opt-in; `machinst/lower.rs`
+    `out_detach` + `pending_out_movs`): result-side twin of
+    `arg_detach`. A multi-use call result's `FixedReg` def pins its
+    whole merged bundle to the return register for its full extent;
+    `out_detach` substitutes a fresh tmp into `defs` and queues
+    `mov result, tmp` in `pending_out_movs`, which `finish_ir_inst`
+    appends to `ir_insts` so it lands right after the call. Single-use
+    results keep the direct def (their pin is free — the range ends at
+    the use). try_call results are deliberately untouched: they are
+    edge-delivered (`BlockArg::TryCallRet`), short-range already, and a
+    block-tail mov after a terminator is invalid vcode — their pin
+    propagation is handled by regalloc2's `PLIRON_RA2_NOPINMERGE`
+    merge guard instead. Measured neutral on the motivating function
+    (the pin there spread through merges, not the def itself); kept
+    opt-in for workloads with long-lived plain-call results.

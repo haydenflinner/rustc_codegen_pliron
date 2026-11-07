@@ -183,3 +183,19 @@ rounds): mode 3 + `LOOPSPLIT`/`LOOPDEPTH` 0.998 [0.994, 1.003], mode 4
 1.003 [0.997, 1.007], mode 5 1.004 [0.999, 1.009], A/A 0.996 [0.985,
 1.000]; nothing beats mode 3 outside the floor, the split knobs stay
 opt-in.
+
+## `PLIRON_RA2_NOPINMERGE=1` (runtime, opt-in): don't spread a fixed pin through merges
+
+`Requirement::merge` promotes `Register + FixedReg(p)` to
+`FixedReg(p)`, so a single fixed-use operand (a try_call-ret vreg, an
+arg copy) pins whatever it merges with — and blockparam coalescing
+merges whole chains. The merged bundle then requires `p` for its full
+extent and splits+fills at every `p`-clobber it crosses
+(`BrotliCreateHqZopfliBackwardReferences`: a try_call result pinned to
+x0 dragged its 11-vreg param chain through every call in the walk
+loop). `pin_spread_hurts` (`ion/merge.rs`) refuses the merge only when
+the merged requirement is `FixedReg`/`FixedStack` *and* the
+unconstrained side's ranges overlap a fixed reservation on that preg —
+pinning would provably force a split where the edge move is cheaper.
+Measured on that function: 2258 -> 2205 insns, `[sp]` accesses
+527 -> 454, ~2.8 -> ~2.6 ms.
