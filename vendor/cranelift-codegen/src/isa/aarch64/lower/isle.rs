@@ -154,6 +154,122 @@ pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget
     }
 }
 
+/// PLIRON: bits of `v` known zero — a bounded known-bits walk for the
+/// `bfi` fusion (`y | field` lowers to `bfm` only when `y`'s field bits
+/// are all provably zero). Answers a `u64` mask; a miss returns 0
+/// (nothing known), never a wrong bit. Only low-bandwidth producers are
+/// followed; `budget` bounds the walk.
+fn bf_known_zero(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> u64 {
+    if *budget == 0 {
+        return 0;
+    }
+    *budget -= 1;
+    let ty = dfg.value_type(v);
+    let Some(inst) = dfg.value_def(v).inst() else {
+        return 0;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => !imm.bits() as u64,
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args: [a, b],
+        } => bf_known_zero(dfg, *a, budget) | bf_known_zero(dfg, *b, budget),
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args: [a, b],
+        } => bf_known_zero(dfg, *a, budget) & bf_known_zero(dfg, *b, budget),
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, k],
+        } => {
+            let Some(k) = iconst_bits(dfg, *k) else {
+                return 0;
+            };
+            if k >= 64 {
+                return !0u64;
+            }
+            (bf_known_zero(dfg, *a, budget) << k) | ((1u64 << k) - 1)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args: [a, k],
+        } => {
+            let Some(k) = iconst_bits(dfg, *k) else {
+                return 0;
+            };
+            let tz = ty.bits().min(64) as u64;
+            if k >= tz {
+                return !0u64;
+            }
+            (bf_known_zero(dfg, *a, budget) >> k) | (!0u64 << (tz - k))
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            let from = dfg.value_type(*arg).bits() as u64;
+            if from >= 64 {
+                return 0;
+            }
+            (!0u64 << from) | (bf_known_zero(dfg, *arg, budget) & ((1u64 << from) - 1))
+        }
+        // Load width, not result width: `uload8.i64` leaves 56 clean
+        // high bits.
+        InstructionData::Load {
+            opcode: Opcode::Uload8,
+            ..
+        } => !0u64 << 8,
+        InstructionData::Load {
+            opcode: Opcode::Uload16,
+            ..
+        } => !0u64 << 16,
+        InstructionData::Load {
+            opcode: Opcode::Uload32,
+            ..
+        } => !0u64 << 32,
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => !1u64,
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce | Opcode::BlackBox,
+            arg,
+        } => bf_known_zero(dfg, *arg, budget),
+        _ => 0,
+    }
+}
+
+fn iconst_bits(dfg: &crate::ir::DataFlowGraph, v: Value) -> Option<u64> {
+    let inst = dfg.value_def(v).inst()?;
+    if let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = &dfg.insts[inst]
+    {
+        Some(imm.bits() as u64)
+    } else {
+        None
+    }
+}
+
+/// `(1<<w)-1` → `w`, when `1 <= w < bits`.
+fn bf_low_w(bits: u32, m: u64) -> Option<u32> {
+    let w = m.checked_add(1)?.trailing_zeros();
+    (w >= 1 && w < bits && (1u64 << w) - 1 == m).then_some(w)
+}
+
+/// `((1<<w)-1) << k` → `w`, when `k >= 1`.
+fn bf_field_w(bits: u32, m: u64, k: u64) -> Option<u32> {
+    if k == 0 || k >= bits as u64 {
+        return None;
+    }
+    let mm = m >> k;
+    if mm.checked_shl(k as u32)? != m {
+        return None;
+    }
+    bf_low_w(bits, mm)
+}
+
 pub struct ExtendedValue {
     val: Value,
     extend: ExtendOp,
@@ -1024,6 +1140,66 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     fn narrowext_clean(&mut self, val: Value) -> bool {
         let mut budget = 16;
         narrowext_part(1) && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
+    }
+
+    /// PLIRON bitfield fusion (`PLIRON_BFUSE`, default on): `(x>>k)&m`,
+    /// `(x&m)<<k`, `y|((x&m)<<k)`, `y|((x<<k)&m')` → `ubfx`/`ubfiz`/`bfi`.
+    /// The externs compute UBFM immediates; `bf_disjoint*` proves `y`'s
+    /// field bits zero with a bounded known-bits walk.
+    fn bfuse_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_BFUSE").as_deref() != Ok("0"))
+    }
+
+    /// `0 < k < bits` for UBFM.
+    fn bf_imm_u8(&mut self, k: u64) -> Option<u8> {
+        (k >= 1 && k < 64).then_some(k as u8)
+    }
+
+    /// `(x>>k)&m` → `ubfx`: `m = (1<<w)-1`, `k+w <= bits`; imms = k+w-1.
+    fn bf_ubfx_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let bits = ty.bits();
+        let w = bf_low_w(bits, m)?;
+        (k + w as u64 <= bits as u64).then_some((k + w as u64 - 1) as u8)
+    }
+
+    /// `(x<<k)&m` → `ubfiz`: `m = ((1<<w)-1)<<k`; imms = k+w-1.
+    fn bf_field_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let bits = ty.bits();
+        let w = bf_field_w(bits, m, k)?;
+        Some((k + w as u64 - 1) as u8)
+    }
+
+    /// `ubfiz` with lsb `k`: immr = bits - k.
+    fn bf_ubfiz_immr(&mut self, ty: Type, k: u64) -> Option<u8> {
+        let bits = ty.bits();
+        (k >= 1 && k < bits as u64).then_some((bits as u64 - k) as u8)
+    }
+
+    /// `(x&m)<<k` → `ubfiz`: imms = w-1.
+    fn bf_ubfiz_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let w = bf_low_w(ty.bits(), m)?;
+        (k + w as u64 <= ty.bits() as u64).then_some((w - 1) as u8)
+    }
+
+    /// `(x<<k)&m` as `ubfiz` mask form: imms = w-1.
+    fn bf_field_ubfiz_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let w = bf_field_w(ty.bits(), m, k)?;
+        Some((w - 1) as u8)
+    }
+
+    /// `bfi`: `y`'s bits inside `((1<<w)-1)<<k` all provably zero.
+    fn bf_disjoint_lowfield(&mut self, y: Value, m: u64, k: u64) -> bool {
+        let mut budget = 16;
+        let z = bf_known_zero(self.lower_ctx.dfg(), y, &mut budget);
+        k < 64 && (m << k) & z == (m << k)
+    }
+
+    /// `bfi`: `y`'s bits inside mask `m` all provably zero.
+    fn bf_disjoint_mask(&mut self, y: Value, m: u64) -> bool {
+        let mut budget = 16;
+        let z = bf_known_zero(self.lower_ctx.dfg(), y, &mut budget);
+        m & z == m
     }
 
     fn test_and_compare_bit_const(&mut self, ty: Type, n: u64) -> Option<u8> {

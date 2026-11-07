@@ -233,6 +233,26 @@
         (from_bits u8)
         (to_bits u8))
 
+       ;; PLIRON: unsigned bitfield move — `ubfm rd, rn, #immr, #imms`,
+       ;; covering the `ubfiz`/`ubfx`/`lsl`/`lsr` aliases for
+       ;; `(x & mask) << k` and `(x >> k) & mask` forms.
+       (UBfm
+        (rd WritableReg)
+        (rn Reg)
+        (immr u8)
+        (imms u8)
+        (size OperandSize))
+
+       ;; PLIRON: bitfield merge — `bfm rd, rn, #immr, #imms` (`bfi`).
+       ;; Modifies `rd` like `MovK`: separate input `rd_in` tied to `rd`.
+       (Bfm
+        (rd WritableReg)
+        (rn Reg)
+        (rd_in Reg)
+        (immr u8)
+        (imms u8)
+        (size OperandSize))
+
        ;; A conditional-select operation.
        (CSel
         (rd WritableReg)
@@ -3975,6 +3995,44 @@
 (extern constructor narrowext_on narrowext_on)
 (decl pure narrowext_clean (Value) bool)
 (extern constructor narrowext_clean narrowext_clean)
+
+;; PLIRON (`PLIRON_BFUSE`, default on): bitfield fusion — `(x>>k)&m`,
+;; `(x&m)<<k`, and `bor` field assembly → `ubfx`/`ubfiz`/`bfi`.
+(decl pure bfuse_on () bool)
+(extern constructor bfuse_on bfuse_on)
+(decl pure partial bf_imm_u8 (u64) u8)
+(extern constructor bf_imm_u8 bf_imm_u8)
+(decl pure partial bf_ubfx_imms (Type u64 u64) u8)
+(extern constructor bf_ubfx_imms bf_ubfx_imms)
+(decl pure partial bf_field_imms (Type u64 u64) u8)
+(extern constructor bf_field_imms bf_field_imms)
+(decl pure partial bf_ubfiz_immr (Type u64) u8)
+(extern constructor bf_ubfiz_immr bf_ubfiz_immr)
+(decl pure partial bf_ubfiz_imms (Type u64 u64) u8)
+(extern constructor bf_ubfiz_imms bf_ubfiz_imms)
+(decl pure partial bf_field_ubfiz_imms (Type u64 u64) u8)
+(extern constructor bf_field_ubfiz_imms bf_field_ubfiz_imms)
+(decl pure bf_disjoint_lowfield (Value u64 u64) bool)
+(extern constructor bf_disjoint_lowfield bf_disjoint_lowfield)
+(decl pure bf_disjoint_mask (Value u64) bool)
+(extern constructor bf_disjoint_mask bf_disjoint_mask)
+
+;; `ubfm` — unsigned bitfield move (`ubfiz`/`ubfx`/`lsl`/`lsr` aliases).
+(attr ubfm (veri chain))
+(decl ubfm (OperandSize Reg u8 u8) Reg)
+(rule (ubfm size src immr imms)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.UBfm dst src immr imms size))))
+        dst))
+
+;; `bfm` — insert a bitfield into an existing register (`bfi` alias).
+;; `rd_in` is a tied operand (modifies in place).
+(attr bfm (veri chain))
+(decl bfm (OperandSize Reg Reg u8 u8) Reg)
+(rule (bfm size src rd_in immr imms)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.Bfm dst src rd_in immr imms size))))
+        dst))
 
 ;; Place a `Value` into a register, sign extending it to 32-bits
 (attr put_in_reg_sext32 (veri chain))

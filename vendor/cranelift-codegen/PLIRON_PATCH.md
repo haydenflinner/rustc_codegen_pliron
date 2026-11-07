@@ -1327,3 +1327,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `args.rs::PrettyPrint` now prints the W/X index width correctly for
     the wider extendop space (relevant to `add`-with-extend forms,
     where those ops ARE legal).
+
+106. aarch64 bitfield fusion (`PLIRON_BFUSE`, default on, `=0` off):
+    `(x>>k)&m`, `(x&m)<<k`, `(x<<k)&m'` and `ushr (band x, field<<k), k`
+    lower to one `UBfm` (`ubfx`/`ubfiz`); `y | ((x&m)<<k)` and
+    `y | ((x<<k)&m')` lower to `Bfm` (`bfi`) when `y`'s field bits are
+    provably zero. New `Inst::UBfm`/`Bfm` variants emit through the
+    existing `enc_bfm` (UBFM opc 0b10, BFM 0b01); `Bfm` carries a tied
+    `rd_in` like `MovK`. Disjointness is a bounded known-bits walk
+    (`bf_known_zero` in `lower/isle.rs`): iconst, band/bor/bxor,
+    ishl/ushr by const, uextend, uload8/16/32, compares, ireduce,
+    black_box; a miss answers "not disjoint" and the `orr` stays. The
+    `bor` rules sit above `extr_32_or_64` but can't steal a rotate — an
+    `extr` operand's live bits are exactly the field, so disjointness
+    always fails there. `PLIRON_BFUSE=0` restores the decomposed code.
+    LLVM emits the same `ubfiz`/`bfi` pairs for UTF-8 codepoint
+    assembly (`is_mostly_utf8`): 2 insns where we had 6.

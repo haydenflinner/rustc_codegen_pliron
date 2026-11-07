@@ -3084,6 +3084,12 @@ impl MachInstEmit for Inst {
                 };
                 sink.put4(enc_bfm(opc, size, rd, rn, 0, from_bits - 1));
             }
+            &Inst::UBfm { rd, rn, immr, imms, size } => {
+                sink.put4(enc_bfm(0b10, size, rd, rn, immr, imms));
+            }
+            &Inst::Bfm { rd, rn, rd_in: _, immr, imms, size } => {
+                sink.put4(enc_bfm(0b01, size, rd, rn, immr, imms));
+            }
             &Inst::Jump { ref dest } => {
                 let off = sink.cur_offset();
                 // Indicate that the jump uses a label, if so, so that a fixup can occur later.
@@ -4097,6 +4103,8 @@ impl MachInstEmit for Inst {
                 | Inst::MovWide { .. }
                 | Inst::MovK { .. }
                 | Inst::Extend { .. }
+                | Inst::UBfm { .. }
+                | Inst::Bfm { .. }
                 | Inst::FpuMove32 { .. }
                 | Inst::FpuMove64 { .. }
                 | Inst::FpuMove128 { .. }
@@ -4336,6 +4344,8 @@ impl MachInstEmit for Inst {
             | Inst::MovWide { .. }
             | Inst::MovK { .. }
             | Inst::Extend { .. }
+            | Inst::UBfm { .. }
+            | Inst::Bfm { .. }
             | Inst::Nop0
             | Inst::Nop4
             | Inst::ULoad8 { .. }

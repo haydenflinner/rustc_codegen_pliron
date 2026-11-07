@@ -480,6 +480,15 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rn);
             collector.reg_reuse_def(rd, 0); // `rn` == `rd`.
         }
+        Inst::UBfm { rd, rn, .. } => {
+            collector.reg_use(rn);
+            collector.reg_def(rd);
+        }
+        Inst::Bfm { rd, rn, rd_in, .. } => {
+            collector.reg_use(rn);
+            collector.reg_use(rd_in);
+            collector.reg_reuse_def(rd, 1); // `rd_in` == `rd`.
+        }
         Inst::MovWide { rd, .. } => {
             collector.reg_def(rd);
         }
@@ -1288,7 +1297,8 @@ impl MachInst for Inst {
             }
             Inst::AluRRRR { rn, rm, ra, .. } => ok(rn) && ok(rm) && ok(ra),
             Inst::AluRRImm12 { rn, .. } | Inst::AluRRImmLogic { rn, .. } | Inst::AluRRImmShift { rn, .. } => ok(rn),
-            Inst::BitRR { rn, .. } | Inst::Extend { rn, .. } => ok(rn),
+            Inst::BitRR { rn, .. } | Inst::Extend { rn, .. } | Inst::UBfm { rn, .. } => ok(rn),
+            Inst::Bfm { rn, rd_in, .. } => ok(rn) && ok(rd_in),
             Inst::Mov { rm, .. } => ok(rm),
             Inst::MovWide { .. } | Inst::MovK { .. } | Inst::CSet { .. } | Inst::CSetm { .. } => true,
             Inst::CSel { rn, rm, .. } | Inst::CSNeg { rn, rm, .. } | Inst::CSInc { rn, rm, .. } => ok(rn) && ok(rm),
@@ -2951,6 +2961,32 @@ impl Inst {
                     let rd = pretty_print_ireg(rd.to_reg(), dest_size);
                     let rn = pretty_print_ireg(rn, OperandSize::from_bits(from_bits));
                     format!("{op} {rd}, {rn}")
+                }
+            }
+            &Inst::UBfm { rd, rn, immr, imms, size } => {
+                let bits = u32::from(size.bits());
+                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rn = pretty_print_ireg(rn, size);
+                let (immr, imms) = (u32::from(immr), u32::from(imms));
+                if imms == bits - 1 && immr > 0 {
+                    format!("lsr {rd}, {rn}, #{immr}")
+                } else if immr == imms + 1 {
+                    format!("lsl {rd}, {rn}, #{}", bits - immr)
+                } else if immr > imms {
+                    format!("ubfiz {rd}, {rn}, #{}, #{}", bits - immr, imms + 1)
+                } else {
+                    format!("ubfx {rd}, {rn}, #{immr}, #{}", imms + 1 - immr)
+                }
+            }
+            &Inst::Bfm { rd, rn, rd_in: _, immr, imms, size } => {
+                let bits = u32::from(size.bits());
+                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rn = pretty_print_ireg(rn, size);
+                let (immr, imms) = (u32::from(immr), u32::from(imms));
+                if immr > imms {
+                    format!("bfi {rd}, {rn}, #{}, #{}", bits - immr, imms + 1)
+                } else {
+                    format!("bfm {rd}, {rn}, #{immr}, #{imms}")
                 }
             }
             &Inst::Call { ref info } => {
