@@ -1,4 +1,4 @@
-//! `copypair` (`PLIRON_COPYPAIR=1`, opt-in, aarch64/SIMD): regroup straight-line
+//! `copypair` (`PLIRON_COPYPAIR=0` off, aarch64/SIMD): regroup straight-line
 //! memory-copy runs so the emitter's `ldp`/`stp` fusion can fire.
 //!
 //! By-value aggregate moves reach the end of the pipeline as runs of

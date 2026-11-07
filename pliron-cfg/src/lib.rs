@@ -48,6 +48,10 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_SM_COALCALL",
     "PLIRON_NOCAP_FIELDS",
     "PLIRON_NOCAP_CALLEE",
+    // copypair regroup + adjacent scalar-pair -> i64x2 merge
+    // (docs/history/2026-11-09-copypair-scalar-merge.md); held-out A/B
+    // 0.982 [0.971, 0.998] with the already-default-on AMODESHARE.
+    "PLIRON_COPYPAIR",
     // Inliner (2026-10-26-inline-recursion.md).
     "PLIRON_INLINE_RESUME_DOM",
     "PLIRON_INLINE_RESUME_HOIST",
