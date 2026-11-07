@@ -59,7 +59,12 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     let prevcode_match = PREVCODE
         .get_or_init(|| std::env::var("PLIRON_PREVCODE").ok())
         .as_deref()
-        .map(|pat| pat == "all" || (!pat.is_empty() && format!("{}", f.name).contains(pat)))
+        .map(|pat| {
+            pat == "all"
+                || (!pat.is_empty()
+                    && (format!("{}", f.name).contains(pat)
+                        || crate::PLIRON_FN_NAME.with(|s| s.borrow().contains(pat))))
+        })
         .unwrap_or(false);
     let ra2_verbose =
         *RA2_VERBOSE.get_or_init(|| std::env::var_os("PLIRON_RA2_VERBOSE").is_some());

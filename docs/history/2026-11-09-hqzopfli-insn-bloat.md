@@ -123,3 +123,45 @@ Result on the walk loop (fn+0x17a0..): the two stores now share one
 insns vs ~21. profbench gzip+brotli 40 iters: ~125 → ~120 ms vs LLVM
 ~96 ms (ratio ~1.31 → ~1.22). Remaining per-iter overhead is the 3×
 `[sp,#0x2328]` base fills — RA pressure, not isel.
+
+## RA investigation: the 3× `[sp]` base fills (same day, continued)
+
+`PLIRON_RA_EXPLAIN=BrotliCreateHqZopfliBackwardReferences` +
+`PLIRON_PREVCODE` (after fixing its symbol match — rustc CLIF names are
+generic `UserFuncName`s, so the matcher now also checks the
+`PLIRON_FN_NAME` thread-local; patch 108):
+
+- All ten integer CSRs (x19-x28) are already spilled into the frame —
+  regalloc2 *does* use callee-saved regs; they are exhausted.
+- The splits cluster around `Inst 1662: bl 0` — a `try_call`'s fixed
+  register clobber. Hot depth-9/10 bundles (spill weights ~300k)
+  split at the call with *empty* conflict sets rather than evicting
+  low-weight (w≈6k) entry bundles that hold CSRs from `[0..1701)`.
+- `RA2STATS`: 503 fills + 170 spill stores over 43 spill slots — ~36%
+  of the function's instructions are stack traffic.
+- Some fills are the loop-carried walk state itself (a spilled IV:
+  `str`+`ldr [sp,#0x2260]` per iteration).
+
+Knob A/Bs on this function (insns / `[sp,#` accesses):
+
+| config | insns | sp accesses |
+|---|---|---|
+| default (FREQ=3) | 2258 | 527 |
+| `RA2_LOOPSPLIT=1` | 2349 | 560 |
+| `RA2_FREQSPLIT=1` | 2238 | 536 |
+| `RA2_FREQ=0` (depth weights) | 2217 | **463** |
+| `FREQ=0`+`REMATW=1` | 2216 | 465 |
+
+`FREQ=0` cuts fills 12% here — but the held-out A/B (5 rounds, 8
+programs) says no: `f0/pliron` geomean **1.028 [1.009,1.140]\***,
+rust-json 1.081\* and rust-protobuf 1.035\* regressions, no bench
+improved. The normalized-frequency model is correctly tuned; the
+Brotli fills are genuine pressure, not a miscalibrated weight.
+
+**Verdict: deep-RA territory confirmed.** Closing the fill gap needs
+either fewer live values across the calls (the 26 surviving
+bounds-check `try_call`s create the clobber boundaries) or a better
+eviction strategy that prefers low-weight long-lived entry bundles
+over hot in-loop ones at clobber points — that's the
+`conflict_set`/`ConflictWithFixed` path in `ion/process.rs`, a real
+regalloc2 change, not a knob.

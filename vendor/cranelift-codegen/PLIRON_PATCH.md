@@ -1357,3 +1357,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     the zero register: `adds xzr, rn, #i` prints `cmn rn, #i` and
     `subs xzr, rn, #i` prints `cmp rn, #i` — matches the disassembler
     reading of the same encoding.
+
+108. `PLIRON_PREVCODE` name match (`machinst/compile.rs` +
+    `src/lib.rs`, `pliron-clif-lower`): rustc-lowered CLIF functions
+    carry a generic `UserFuncName`, so a substring match on `f.name`
+    never fires for real symbols. The matcher now also consults the
+    `PLIRON_FN_NAME` thread-local, and `lower.rs` populates it when
+    `PLIRON_RA2_STATS` *or* `PLIRON_PREVCODE` is set (previously only
+    the former — `PLIRON_PREVCODE=<symbol>` matched nothing).
