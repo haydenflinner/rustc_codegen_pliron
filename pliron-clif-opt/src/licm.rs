@@ -115,16 +115,53 @@ pub(crate) fn speculatable(func: &Function, i: Inst) -> bool {
     )
 }
 
+/// Whether address value `x` — a `Root::V` that stopped `concrete`'s
+/// peel — can be proven to carry none of the
+/// `noalias` entry param `rv`'s provenance, so a store through it
+/// cannot touch `*rv` even when `rv` isn't sheltered (it has escapes
+/// the loop can observe, so load results can hold planted provenance
+/// and params/`select`/`call` results may hold it outright — all
+/// conservatively derived). Constants and global/frame bases can't
+/// carry `rv` at all; a *different* `noalias` entry param claims a
+/// pointee the caller must keep disjoint (`&mut rv.field` alongside
+/// `rv` is already UB on entry).
+fn not_derived(
+    func: &Function,
+    x: Value,
+    noalias: &FxHashSet<Value>,
+    scoped_na: &FxHashSet<Value>,
+    rv: Value,
+) -> bool {
+    let x = func.dfg.resolve_aliases(x);
+    if x != rv && noalias.contains(&x) && !scoped_na.contains(&x) {
+        return true;
+    }
+    let Some(i) = func.dfg.value_def(x).inst() else {
+        return false;
+    };
+    match func.dfg.insts[i].opcode() {
+        Opcode::Iconst
+        | Opcode::SymbolValue
+        | Opcode::FuncAddr
+        | Opcode::GetStackPointer
+        | Opcode::GetReturnAddress => true,
+        _ => false,
+    }
+}
+
 /// Whether a write-ish instruction `w` can touch `loc`.
+#[allow(clippy::too_many_arguments)]
 fn clobbers(
     func: &Function,
     ps: &VMap<Value>,
     w: Inst,
     loc: Loc,
     iso: &FxHashSet<Root>,
+    shel: Option<&FxHashSet<Root>>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
+    noalias: &FxHashSet<Value>,
 ) -> bool {
     // A `noalias`+`readonly` (`deref` with `!writable`) pointee is
     // exclusively read through this root for the call's duration —
@@ -172,6 +209,34 @@ fn clobbers(
             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
             let (r2, o2) = loadfwd::concrete(func, ps, args[1]);
             let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
+            // A loc on a rustc-`noalias` entry param can be written only
+            // through addresses derived from that param (LLVM
+            // arg-`noalias`: accessing the pointee through a non-derived
+            // pointer during the call is UB). `isolated_escapes` counts
+            // every use it can't address-track (`select` operand, merged
+            // param, call arg, stored value) as an escape, so a `shel`ed
+            // root — `iso`, `ncc`, escapes confined to blocks the loop
+            // can't observe — has no in-loop value carrying its
+            // provenance under a different root: stores rooted elsewhere
+            // can't clobber it at all (`&mut self` field loads hoist
+            // past stores through pointers loaded from it,
+            // `compress_inner`). Without shelter a store is still safe
+            // when `not_derived` proves its address `rv`-free. The
+            // entry-param `noalias` set only: a scoped claim holds
+            // inside its clone's region, not function-wide.
+            if let Some(shel) = shel
+                && let Root::V(rv) = cloc.0
+                && noalias.contains(&rv)
+                && !scoped_na.contains(&rv)
+                && r2 != cloc.0
+            {
+                if shel.contains(&cloc.0) {
+                    return false;
+                }
+                if let Root::V(x) = r2 {
+                    return !not_derived(func, x, noalias, scoped_na, rv);
+                }
+            }
             !overlap_keeps((r2, o2, ty), cloc, iso)
         }
         _ if op.can_store()
@@ -244,9 +309,11 @@ fn hoists(
     func: &Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    noalias: &FxHashSet<Value>,
     inv: &dyn Fn(&Function, Value) -> bool,
     writers: &[Inst],
     iso: &FxHashSet<Root>,
+    shel: Option<&FxHashSet<Root>>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -257,7 +324,7 @@ fn hoists(
     pb: Block,
     i: Inst,
 ) -> bool {
-    hoists_inner(func, ps, na, inv, writers, iso, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i)
+    hoists_inner(func, ps, na, noalias, inv, writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i)
         && (!func.dfg.insts[i].opcode().can_load() || pliron_cfg::bisect("licm-load"))
 }
 
@@ -266,9 +333,11 @@ fn hoists_inner(
     func: &Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    noalias: &FxHashSet<Value>,
     inv: &dyn Fn(&Function, Value) -> bool,
     writers: &[Inst],
     iso: &FxHashSet<Root>,
+    shel: Option<&FxHashSet<Root>>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -406,7 +475,7 @@ fn hoists_inner(
     // come back clean before an in-region hoist can skip it.
     let nw_w = writers
         .iter()
-        .filter(|&&w| clobbers(func, ps, w, loc, iso, nw, deref, scoped_na))
+        .filter(|&&w| clobbers(func, ps, w, loc, iso, shel, nw, deref, scoped_na, noalias))
         .count();
     if !own_write && nw_w == 0 && let Some(&target) = scoped.get(&i) {
         let mut r = breg.get(&pb).copied();
@@ -472,7 +541,7 @@ fn hoists_inner(
         };
         for &w in writers {
             if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
-                && clobbers(func, ps, w, loc, iso, nw, deref, scoped_na)
+                && clobbers(func, ps, w, loc, iso, shel, nw, deref, scoped_na, noalias)
             {
                 let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
                 if pliron_cfg::tracing_on() {
@@ -612,11 +681,13 @@ fn run_loop(
     func: &mut Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    noalias: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -627,10 +698,47 @@ fn run_loop(
     breg: &FxHashMap<Block, Region>,
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    nashel: bool,
     press: &mut Option<Option<FxHashMap<Block, u32>>>,
     regs: (u32, u32),
 ) -> usize {
     let h = la.loop_header(lp);
+    // `shel`: roots no in-loop load can be based on — `iso` (this loop's
+    // set, `ncc` with only out-of-loop escapes folded in by `run`), every
+    // `ncc` root (a `nocapture` escape can't plant the pointer in memory
+    // anywhere), and roots whose escapes are all post-loop: an escape
+    // block that can't reach `h` runs only after a loop exit, so nothing
+    // it stores can show up in an in-loop load (`promote`'s `reachers`).
+    // A store rooted in such a root's *other* values can't touch its
+    // locs either — `clobbers`/`not_derived` use this for rustc-`noalias`
+    // param locs. `None` without `nashel`: the whole arm is off.
+    let shel_own;
+    let shel = if !nashel {
+        None
+    } else if ncc.is_empty() && escapes.is_empty() {
+        Some(iso)
+    } else {
+        let mut s: FxHashSet<Root> = iso.union(ncc).copied().collect();
+        if !escapes.is_empty() {
+            let mut reachers: FxHashSet<Block> = FxHashSet::default();
+            let mut stack = vec![h];
+            while let Some(b) = stack.pop() {
+                for p in cfg.pred_iter(b) {
+                    if reachers.insert(p.block) {
+                        stack.push(p.block);
+                    }
+                }
+            }
+            reachers.insert(h);
+            for (r, bs) in escapes {
+                if bs.iter().all(|b| !reachers.contains(b)) {
+                    s.insert(*r);
+                }
+            }
+        }
+        shel_own = s;
+        Some(&shel_own)
+    };
     // Exactly one branch destination in from outside.
     let mut entry: Option<(Inst, usize)> = None;
     for p in cfg.pred_iter(h) {
@@ -852,7 +960,7 @@ fn run_loop(
                     spends_room = true;
                 }
                 if hoists(
-                    func, ps, na, &inv, &writers, iso, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i,
+                    func, ps, na, noalias, &inv, &writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i,
                 ) {
                     if debug {
                         if pliron_cfg::tracing_on() {
@@ -1037,7 +1145,7 @@ fn run_loop(
     }
     cn + n
         + promote(
-            func, ps, na, cfg, dt, la, lp, iso, escapes, deref, scoped_na, nw, nounwind, ofz, debug,
+            func, ps, na, noalias, cfg, dt, la, lp, iso, shel, escapes, deref, scoped_na, nw, nounwind, ofz, debug,
         )
 }
 
@@ -1049,11 +1157,13 @@ fn promote(
     func: &mut Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    noalias: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
+    shel: Option<&FxHashSet<Root>>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -1283,6 +1393,7 @@ fn promote(
             func,
             ps,
             na,
+            noalias,
             cfg,
             dt,
             la,
@@ -1292,6 +1403,7 @@ fn promote(
             (r, o, ty),
             off,
             iso_l,
+            shel,
             nw,
             deref,
             scoped_na,
@@ -1309,6 +1421,7 @@ fn promote_loc(
     func: &mut Function,
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
+    noalias: &FxHashSet<Value>,
     cfg: &ControlFlowGraph,
     dt: &DominatorTree,
     la: &LoopAnalysis,
@@ -1318,6 +1431,7 @@ fn promote_loc(
     loc: Loc,
     off: i32,
     iso: &FxHashSet<Root>,
+    shel: Option<&FxHashSet<Root>>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -1544,7 +1658,7 @@ fn promote_loc(
             {
                 seed = Some(func.dfg.resolve_aliases(args[0]));
             }
-            _ if clobbers(func, ps, i, loc, iso, nw, deref, scoped_na) => seed = None,
+            _ if clobbers(func, ps, i, loc, iso, shel, nw, deref, scoped_na, noalias) => seed = None,
             _ => {}
         }
     }
@@ -1717,6 +1831,7 @@ pub fn run(
     rpar: &pliron::cols::ColMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
     nocap: &FxHashSet<(Inst, u32)>,
+    nashel: bool,
 ) -> usize {
     let mut la = LoopAnalysis::new();
     let regs = an.regs.unwrap_or((26, 10));
@@ -1789,8 +1904,8 @@ pub fn run(
         let n2 = {
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
-                func, &ps, &stop, cfg, dt, &la, lp, iso_l, &escapes, deref, scoped_na, nw, nounwind, debug,
-                scoped, breg, rpar, ofz, &mut press, regs,
+                func, &ps, &stop, noalias, cfg, dt, &la, lp, iso_l, &ncc, &escapes, deref, scoped_na, nw, nounwind, debug,
+                scoped, breg, rpar, ofz, nashel, &mut press, regs,
             )
         };
         n += n2;
@@ -1890,6 +2005,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashSet::default(),
+            false,
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
@@ -1953,6 +2069,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashSet::default(),
+            false,
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
@@ -2026,6 +2143,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashSet::default(),
+            false,
         );
         let blk = |v: Value| {
             func.layout
@@ -2110,6 +2228,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashSet::default(),
+            false,
         );
         let blk = |v: Value| {
             func.layout
@@ -2200,6 +2319,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashSet::default(),
+            false,
         );
         let blk = |v: Value| {
             func.layout
@@ -2293,6 +2413,7 @@ mod tests {
                 &pliron::cols::ColMap::default(),
                 &FxHashMap::default(),
                 &FxHashSet::default(),
+                false,
             );
             let flags =
                 cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -2314,5 +2435,191 @@ mod tests {
         PEEL_TEST.with(|f| f.set(0));
         assert!(hoisted, "peel on: in-bounds scope-name load stayed in the loop:\n{ir}");
         assert!(stayed, "peel on: load past the param's bytes left the loop:\n{ir}");
+    }
+
+    /// A writable `noalias` entry param (`&mut self`) can be written only
+    /// through addresses derived from it, so a store through a pointer
+    /// *loaded* from one of its fields (e.g. `self.dict`) cannot clobber
+    /// the param's other fields: `load m+40` hoists past `store x, q`
+    /// where `q = load m+8` — `m` is isolated, so no loaded pointer is
+    /// `m`-based. A store through `iadd m, 28` overlaps `load m+24`
+    /// without matching its loc — too wild for promotion, so the load
+    /// stays (a store at the load's exact offset would promote instead).
+    /// Models `miniz_oxide::compress_inner`'s field reloads.
+    #[test]
+    fn mut_noalias_root_hoists_past_nonderived_store() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let lbody = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, h, lbody, done] {
+            func.layout.append_block(b);
+        }
+        let m = func.dfg.append_block_param(b0, types::I64);
+        let p = func.dfg.append_block_param(h, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let fv = cur.ins().iconst(types::I64, 5);
+        let q = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), m, 8);
+        let k28 = cur.ins().iconst(types::I64, 28);
+        let mp28 = cur.ins().iadd(m, k28);
+        cur.ins().jump(h, &[fv.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I64, 1);
+        let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+        cur.ins().brif(r, lbody, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+        let x = cur.ins().iconst(types::I64, 7);
+        cur.ins().store(MemFlagsData::new(), x, q, 0);
+        cur.ins().store(MemFlagsData::new(), x, mp28, 0);
+        let a = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), m, 24);
+        let b = cur
+            .ins()
+            .load(types::I64, MemFlagsData::new().with_notrap(), m, 40);
+        let s = cur.ins().iadd(a, b);
+        cur.ins().jump(h, &[s.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        cur.ins().return_(&[fv]);
+
+        let mut deref = FxHashMap::default();
+        deref.insert(m, (64, true));
+        let na: FxHashSet<Value> = [m].into_iter().collect();
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            &na,
+            &FxHashSet::default(),
+            &deref,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            true,
+        );
+        let blk = |v: Value| {
+            func.layout
+                .inst_block(func.dfg.value_def(v).inst().unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            blk(a),
+            lbody,
+            "store through the derived pointer must still clobber:\n{}",
+            func.display()
+        );
+        assert_eq!(
+            blk(b),
+            b0,
+            "load-derived store wrongly blocked the noalias field load:\n{}",
+            func.display()
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// The same `noalias` param, but the store goes through `sel` — a
+    /// `select` that can produce the param itself or another entry param
+    /// (a caller can hand in an `m`-based pointer, e.g. `&mut s.field`):
+    /// its offset within `*m` is unknown, so it can hit `load m+40` and
+    /// the load must stay in the loop. When `m`'s pointer escapes into
+    /// memory (`store p, m` before the loop), even a load-derived store
+    /// is suspect and `load m+40` stays too.
+    #[test]
+    fn mut_noalias_maybe_derived_store_stays() {
+        let build = |plant: bool| {
+            let mut sig = Signature::new(CallConv::Fast);
+            for _ in 0..3 {
+                sig.params.push(AbiParam::new(types::I64));
+            }
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let h = func.dfg.make_block();
+            let lbody = func.dfg.make_block();
+            let done = func.dfg.make_block();
+            for b in [b0, h, lbody, done] {
+                func.layout.append_block(b);
+            }
+            let m = func.dfg.append_block_param(b0, types::I64);
+            let other = func.dfg.append_block_param(b0, types::I64);
+            let sink = func.dfg.append_block_param(b0, types::I64);
+            let p = func.dfg.append_block_param(h, types::I64);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let fv = cur.ins().iconst(types::I64, 5);
+            let q = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), m, 8);
+            let cnd = cur.ins().icmp(IntCC::UnsignedGreaterThan, m, other);
+            let sel = cur.ins().select(cnd, m, other);
+            if plant {
+                // `m` escapes into memory: a `q`-style load may now yield
+                // an `m`-based pointer, so nothing is provably clean.
+                cur.ins().store(MemFlagsData::new(), m, sink, 0);
+            }
+            cur.ins().jump(h, &[fv.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let one = cur.ins().iconst(types::I64, 1);
+            let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+            cur.ins().brif(r, lbody, &[], done, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+            let x = cur.ins().iconst(types::I64, 7);
+            cur.ins().store(MemFlagsData::new(), x, q, 0);
+            let b = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), m, 40);
+            cur.ins().store(MemFlagsData::new(), x, sel, 0);
+            cur.ins().jump(h, &[b.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+            cur.ins().return_(&[fv]);
+
+            let mut deref = FxHashMap::default();
+            deref.insert(m, (64, true));
+            let na: FxHashSet<Value> = [m].into_iter().collect();
+            run(
+                &mut func,
+                &mut crate::pipeline::Analysis::default(),
+                &na,
+                &FxHashSet::default(),
+                &deref,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                true,
+            );
+            func.layout
+                .inst_block(func.dfg.value_def(b).inst().unwrap())
+                .unwrap()
+                == lbody
+        };
+        // `sel` can be `other`, possibly `m`-based at any offset: clobber.
+        assert!(build(false), "maybe-derived store must block the hoist");
+        // With `m` escaped, `q` itself is suspect: `b` still stays.
+        assert!(build(true), "escaped noalias root must not shelter loads");
     }
 }

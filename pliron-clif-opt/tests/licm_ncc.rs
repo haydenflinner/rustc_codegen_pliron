@@ -77,6 +77,7 @@ fn run(call_in_loop: bool, nocap_on: bool) -> Function {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &nocap,
+        false,
     );
     f
 }

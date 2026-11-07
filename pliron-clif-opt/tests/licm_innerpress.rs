@@ -63,6 +63,7 @@ fn outer_only_load_stays_inner_used_load_hoists() {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashSet::default(),
+        false,
     );
     let outer = loads_in(&f, Block::from_u32(1));
     // `v0+8` stays in the outer loop; `v0+16` left it.

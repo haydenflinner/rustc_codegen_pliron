@@ -36,6 +36,7 @@ fn run(src: &str) -> Function {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashSet::default(),
+        false,
     );
     f
 }

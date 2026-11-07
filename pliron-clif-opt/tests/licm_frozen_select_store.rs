@@ -79,6 +79,7 @@ fn frozen_hoist_must_still_run_the_clobber_scan() {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashSet::default(),
+        false,
     );
     // The select-rooted store writes the load's bytes: the load must
     // stay inside the loop.
