@@ -52,6 +52,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // (docs/history/2026-11-09-copypair-scalar-merge.md); held-out A/B
     // 0.982 [0.971, 0.998] with the already-default-on AMODESHARE.
     "PLIRON_COPYPAIR",
+    // sextload: uload8 -> sload8 when all uses are byte-transparent +
+    // top-contiguous byte-mask compare -> signed interval compare
+    // (commit d41c3ba; ~7% on the is_mostly_utf8 region, held-out A/B
+    // neutral 1.004 [0.984, 1.039]).
+    "PLIRON_SEXTLOAD",
     // Inliner (2026-10-26-inline-recursion.md).
     "PLIRON_INLINE_RESUME_DOM",
     "PLIRON_INLINE_RESUME_HOIST",

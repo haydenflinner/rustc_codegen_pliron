@@ -1197,6 +1197,12 @@ impl<'a, F: Function> Env<'a, F> {
                     }
                     AllocRegResult::ConflictWithFixed(max_cost, point) => {
                         trace!(" -> conflict with fixed alloc; cost of other bundles up to point is {}, conflict at {:?}", max_cost, point);
+                        explain!(
+                            "    fixed-conflict on {:?} at {:?} max_cost {}",
+                            preg_idx,
+                            point,
+                            max_cost
+                        );
 
                         let hot = self.ctx.cfginfo.hot_bonus
                             [self.ctx.cfginfo.insn_block[point.inst().index()].index()];
