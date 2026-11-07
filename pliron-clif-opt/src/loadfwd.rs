@@ -791,6 +791,196 @@ pub fn isolated_escapes_x(
     (iso, escapes, ncc)
 }
 
+/// Function-local `captures(none)` for licm's `noalias` shelter — the
+/// same judgement LLVM's FunctionAttrs makes on `ptr noalias` params,
+/// which rustc's `deduced_param_attrs` never computes for references
+/// (`type_could_benefit_from_deduction` only covers by-value params).
+/// `isolated_escapes` answers a stricter question: its "escape" is any
+/// use it can't key under the root (`iadd v1, i` — a variable-index
+/// field address — escapes even though the result still provably
+/// carries `v1`'s provenance inside the function). Shelter needs the
+/// weaker claim: no `v1`-based value reaches *memory* or an opaque
+/// consumer, so nothing loaded in a loop can secretly be `v1`-based.
+///
+/// `taint[v] & bit(c)` — `v` may carry candidate `c`'s provenance:
+/// `c` itself plus pointer-width results of ops fed by tainted operands
+/// (loads and calls launder — their results hold whatever memory or the
+/// callee had, so for a candidate that never escapes they stay clean —
+/// and sub-pointer-width results can't hold a pointer anyway) plus
+/// block params a tainted edge arg feeds.
+///
+/// `esc[b] & bit(c)` — a `c`-based value left SSA tracking in `b`:
+/// stored into memory, passed to a call operand the callee may keep
+/// (not `nocap`), returned, handed to an indirect/tail call, or eaten
+/// by an op with no provenance model. A loop shelters `c` when none of
+/// `c`'s escape blocks can reach its header (`licm`'s `reachers`).
+#[derive(Default)]
+pub struct ProvEsc {
+    /// Candidate value → its mask bit.
+    pub bit: FxHashMap<Value, u64>,
+    /// Value → mask of candidates it may be based on.
+    pub taint: FxHashMap<Value, u64>,
+    /// Block → mask of candidates whose provenance externalizes there.
+    pub esc: FxHashMap<Block, u64>,
+}
+
+/// Worklist over `uses`: each candidate owns one bit, so a single pass
+/// propagates every candidate's provenance at once. `None` on >63
+/// candidates or an over-budget walk — the caller treats it as "nothing
+/// is sheltered", which is conservative.
+pub fn provescapes(
+    func: &Function,
+    cands: &FxHashSet<Value>,
+    pf: &crate::proots::Facts,
+    nocap: &FxHashSet<(Inst, u32)>,
+) -> Option<ProvEsc> {
+    if cands.is_empty() {
+        return Some(ProvEsc::default());
+    }
+    if cands.len() > 63 {
+        return None;
+    }
+    // `bit` keys the raw candidate — that is the `Root::V` name
+    // `norm_root` returns for a `noalias` member (its raw value is the
+    // scope name; `root_min` deliberately stops before resolving), while
+    // `taint`/`esc` work on resolved values where the uses live.
+    let bit: FxHashMap<Value, u64> = cands
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| (v, 1u64 << k))
+        .collect();
+    // A pointer's provenance rides on pointer-width values only: `icmp`'s
+    // i8 and narrow ints stay clean, so `select(cnd, p, q)` doesn't
+    // inherit a tainted condition's mask.
+    let pbits = cands
+        .iter()
+        .map(|&m| func.dfg.value_type(m).bits())
+        .min()
+        .unwrap_or(64);
+    // Edge arg → params it feeds (`pf.edge` is (param, arg)).
+    let mut feeds: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    for &(p, a) in &pf.edge {
+        feeds.entry(a).or_default().push(p);
+    }
+    let uses = crate::uses::Uses::new(func);
+    let mut taint: FxHashMap<Value, u64> = FxHashMap::default();
+    for (&v, &m) in &bit {
+        // Two `noalias` names can alias-resolve to one value.
+        *taint.entry(func.dfg.resolve_aliases(v)).or_insert(0) |= m;
+    }
+    // `seen[v]` = the candidate mask `v`'s sites were already processed
+    // with — starts empty so a seed's first pop propagates its bit.
+    let mut seen: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut esc: FxHashMap<Block, u64> = FxHashMap::default();
+    let mut work: Vec<Value> = cands.iter().map(|&v| func.dfg.resolve_aliases(v)).collect();
+    let mut steps = 0usize;
+    while let Some(v) = work.pop() {
+        let m = taint[&v] & !seen.get(&v).copied().unwrap_or(0);
+        seen.insert(v, seen.get(&v).copied().unwrap_or(0) | m);
+        if m == 0 {
+            continue;
+        }
+        for &(b, i) in uses.sites(v) {
+            steps += 1;
+            if steps > 8 * func.dfg.num_values() {
+                return None;
+            }
+            let data = &func.dfg.insts[i];
+            let op = data.opcode();
+            let nargs = func.dfg.inst_args(i).len();
+            let mut used = false;
+            for (k, a) in func.dfg.inst_values(i).enumerate() {
+                if func.dfg.resolve_aliases(a) != v {
+                    continue;
+                }
+                if k >= nargs {
+                    // Edge arg: provenance flows on to the fed params.
+                    if let Some(ps) = feeds.get(&v) {
+                        for &p in ps {
+                            let e = taint.entry(p).or_insert(0);
+                            if *e & m != m {
+                                *e |= m;
+                                work.push(p);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                used = true;
+                // Does this operand use let the provenance out of SSA
+                // tracking? A `v`-based *address* (store/atomic arg) is
+                // still inside the pointee — it can write `*c` but can't
+                // plant `c` anywhere else.
+                let leak = if op.is_branch() {
+                    false
+                } else if op.is_return() {
+                    true
+                } else if op.is_call() {
+                    match data {
+                        InstructionData::Call { .. } => {
+                            !nocap.contains(&(i, k as u32))
+                        }
+                        InstructionData::CallIndirect { .. }
+                        | InstructionData::TryCallIndirect { .. } => {
+                            k == 0 || !nocap.contains(&(i, (k - 1) as u32))
+                        }
+                        // Tail calls hand the callee the frame; try_call
+                        // splits its operand list across call and edge
+                        // args — either way the operand can be kept.
+                        _ => true,
+                    }
+                } else if op.can_store() {
+                    match op {
+                        // `x` (the value written) is operand 0; `p` the
+                        // address is operand 1.
+                        Opcode::Store
+                        | Opcode::Istore8
+                        | Opcode::Istore16
+                        | Opcode::Istore32
+                        | Opcode::AtomicStore
+                        | Opcode::Vscatter => k == 0,
+                        // `atomic_rmw`/`atomic_cas` put `p` first.
+                        Opcode::AtomicRmw | Opcode::AtomicCas => k > 0,
+                        _ => true,
+                    }
+                } else if op.can_load() {
+                    false
+                } else if func.dfg.inst_results(i).is_empty()
+                    || op.is_terminator()
+                    || op.other_side_effects()
+                {
+                    true
+                } else {
+                    false
+                };
+                if leak {
+                    *esc.entry(b).or_default() |= m;
+                    tracing::debug!(target: "pliron::loadfwd", "pe-esc {} {b} m={m:#x} k={k}: {}", func.name, func.dfg.display_inst(i));
+                }
+            }
+            if !used || op.is_call() || op.can_load() || op.is_branch() {
+                continue;
+            }
+            // Producer: results wide enough to hold a pointer inherit
+            // the operand's provenance. Call and load results are
+            // excluded — they carry whatever the callee or memory held,
+            // which is `c`-based only after an escape (and an escaped
+            // candidate is never live).
+            for &r in func.dfg.inst_results(i) {
+                if func.dfg.value_type(r).bits() < pbits {
+                    continue;
+                }
+                let e = taint.entry(r).or_insert(0);
+                if *e & m != m {
+                    *e |= m;
+                    work.push(r);
+                }
+            }
+        }
+    }
+    Some(ProvEsc { bit, taint, esc })
+}
+
 /// Run `b`'s transfer function; with `rw`, record forwarded loads.
 /// `load (select c, pa, pb)` with both arms forwarding: the result is
 /// `select c, aval(pa), aval(pb)`. Keeps the select to scalar types the

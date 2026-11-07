@@ -149,6 +149,18 @@ fn not_derived(
     }
 }
 
+/// One loop's view of `loadfwd::provescapes`: `live` maps each
+/// `noalias` entry param whose provenance has no escape the loop can
+/// observe to its `ProvEsc` bit. Under shelter, an in-loop value
+/// carries `rv`'s provenance exactly when `taint` says so — loaded
+/// pointers can't be `rv`-based because nothing planted `rv` in
+/// memory, and derived values are tracked — and a call that takes no
+/// `rv`-based operand has no way to write `*rv` at all.
+struct Shel<'a> {
+    pe: &'a loadfwd::ProvEsc,
+    live: FxHashMap<Value, u64>,
+}
+
 /// Whether a write-ish instruction `w` can touch `loc`.
 #[allow(clippy::too_many_arguments)]
 fn clobbers(
@@ -157,7 +169,7 @@ fn clobbers(
     w: Inst,
     loc: Loc,
     iso: &FxHashSet<Root>,
-    shel: Option<&FxHashSet<Root>>,
+    shel: Option<&Shel>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -199,6 +211,22 @@ fn clobbers(
     };
     let op = func.dfg.insts[w].opcode();
     if op.is_call() {
+        // Sheltered root: the callee can only touch `*rv` through an
+        // operand carrying `rv`'s provenance — it can't already hold
+        // one, since nothing planted `rv` in memory (LLVM's
+        // `noalias` + `captures(none)` → `MemSSA` non-clobber).
+        if let Some(s) = shel
+            && let Root::V(rv) = cloc.0
+            && let Some(&bit) = s.live.get(&rv)
+            && func.dfg.inst_args(w).iter().all(|&a| {
+                s.pe
+                    .taint
+                    .get(&func.dfg.resolve_aliases(a))
+                    .is_none_or(|&m| m & bit == 0)
+            })
+        {
+            return false;
+        }
         return !loadfwd::write_free(func, w, nw, false) && !iso.contains(&cloc.0);
     }
     match func.dfg.insts[w] {
@@ -212,26 +240,31 @@ fn clobbers(
             // A loc on a rustc-`noalias` entry param can be written only
             // through addresses derived from that param (LLVM
             // arg-`noalias`: accessing the pointee through a non-derived
-            // pointer during the call is UB). `isolated_escapes` counts
-            // every use it can't address-track (`select` operand, merged
-            // param, call arg, stored value) as an escape, so a `shel`ed
-            // root — `iso`, `ncc`, escapes confined to blocks the loop
-            // can't observe — has no in-loop value carrying its
-            // provenance under a different root: stores rooted elsewhere
-            // can't clobber it at all (`&mut self` field loads hoist
-            // past stores through pointers loaded from it,
+            // pointer during the call is UB). `provescapes` tracks that
+            // provenance precisely: for a `live` root — no escape the
+            // loop can observe — only a store through a still-`rv`-based
+            // address (`taint`) can clobber; loaded pointers and
+            // unrelated roots can't be `rv`-based (`&mut self` field
+            // loads hoist past stores through pointers loaded from it,
             // `compress_inner`). Without shelter a store is still safe
             // when `not_derived` proves its address `rv`-free. The
             // entry-param `noalias` set only: a scoped claim holds
             // inside its clone's region, not function-wide.
-            if let Some(shel) = shel
+            if let Some(s) = shel
                 && let Root::V(rv) = cloc.0
                 && noalias.contains(&rv)
                 && !scoped_na.contains(&rv)
                 && r2 != cloc.0
             {
-                if shel.contains(&cloc.0) {
-                    return false;
+                if let Some(&bit) = s.live.get(&rv) {
+                    return match r2 {
+                        Root::V(x) => s
+                            .pe
+                            .taint
+                            .get(&func.dfg.resolve_aliases(x))
+                            .is_some_and(|&m| m & bit != 0),
+                        _ => false,
+                    };
                 }
                 if let Root::V(x) = r2 {
                     return !not_derived(func, x, noalias, scoped_na, rv);
@@ -313,7 +346,7 @@ fn hoists(
     inv: &dyn Fn(&Function, Value) -> bool,
     writers: &[Inst],
     iso: &FxHashSet<Root>,
-    shel: Option<&FxHashSet<Root>>,
+    shel: Option<&Shel>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -337,7 +370,7 @@ fn hoists_inner(
     inv: &dyn Fn(&Function, Value) -> bool,
     writers: &[Inst],
     iso: &FxHashSet<Root>,
-    shel: Option<&FxHashSet<Root>>,
+    shel: Option<&Shel>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -391,7 +424,8 @@ fn hoists_inner(
     let (r, o) = loadfwd::root(func, ps, na, arg);
     if dbg {
         if pliron_cfg::tracing_on() {
-            tracing::debug!(target: "pliron::licm", "licm? {}: root {:?} off {o} iso={} deref={:?}",
+            tracing::debug!(target: "pliron::licm", "licm? {} {}: root {:?} off {o} iso={} deref={:?}",
+                func.name,
                 func.dfg.display_inst(i),
                 r,
                 iso.contains(&r),
@@ -687,7 +721,6 @@ fn run_loop(
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
-    ncc: &FxHashSet<Root>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -698,28 +731,20 @@ fn run_loop(
     breg: &FxHashMap<Block, Region>,
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
-    nashel: bool,
+    pe: Option<&loadfwd::ProvEsc>,
     press: &mut Option<Option<FxHashMap<Block, u32>>>,
     regs: (u32, u32),
 ) -> usize {
     let h = la.loop_header(lp);
-    // `shel`: roots no in-loop load can be based on — `iso` (this loop's
-    // set, `ncc` with only out-of-loop escapes folded in by `run`), every
-    // `ncc` root (a `nocapture` escape can't plant the pointer in memory
-    // anywhere), and roots whose escapes are all post-loop: an escape
-    // block that can't reach `h` runs only after a loop exit, so nothing
-    // it stores can show up in an in-loop load (`promote`'s `reachers`).
-    // A store rooted in such a root's *other* values can't touch its
-    // locs either — `clobbers`/`not_derived` use this for rustc-`noalias`
-    // param locs. `None` without `nashel`: the whole arm is off.
-    let shel_own;
-    let shel = if !nashel {
-        None
-    } else if ncc.is_empty() && escapes.is_empty() {
-        Some(iso)
-    } else {
-        let mut s: FxHashSet<Root> = iso.union(ncc).copied().collect();
-        if !escapes.is_empty() {
+    // `shel`: the `noalias` entry params whose provenance can't escape
+    // anywhere the loop observes — `provescapes`' escape blocks
+    // intersected with the header's `reachers` (`promote`'s rule: an
+    // escape that can't reach `h` only runs after a loop exit, so
+    // nothing it stores can show up in an in-loop load). `None` without
+    // `nashel`: the whole arm is off.
+    let shel = pe.map(|pe| {
+        let mut seen: u64 = 0;
+        if !pe.esc.is_empty() {
             let mut reachers: FxHashSet<Block> = FxHashSet::default();
             let mut stack = vec![h];
             while let Some(b) = stack.pop() {
@@ -730,15 +755,26 @@ fn run_loop(
                 }
             }
             reachers.insert(h);
-            for (r, bs) in escapes {
-                if bs.iter().all(|b| !reachers.contains(b)) {
-                    s.insert(*r);
+            for (&b, &m) in &pe.esc {
+                if reachers.contains(&b) {
+                    seen |= m;
                 }
             }
         }
-        shel_own = s;
-        Some(&shel_own)
-    };
+        Shel {
+            pe,
+            live: pe
+                .bit
+                .iter()
+                .filter(|&(_, &b)| b & seen == 0)
+                .map(|(&v, &b)| (v, b))
+                .collect(),
+        }
+    });
+    let shel = shel.as_ref();
+    if let Some(s) = shel {
+        tracing::debug!(target: "pliron::licm", "licm shel {}: {h} live={:?}", func.name, s.live);
+    }
     // Exactly one branch destination in from outside.
     let mut entry: Option<(Inst, usize)> = None;
     for p in cfg.pred_iter(h) {
@@ -1163,7 +1199,7 @@ fn promote(
     la: &LoopAnalysis,
     lp: Loop,
     iso: &FxHashSet<Root>,
-    shel: Option<&FxHashSet<Root>>,
+    shel: Option<&Shel>,
     escapes: &FxHashMap<Root, Vec<Block>>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -1204,6 +1240,19 @@ fn promote(
         }
     }
     let iso_l = &iso_l;
+    // Candidacy adds `shel`'s live `noalias` roots: their locs promote
+    // like an isolated root's. The `iso` handed to `promote_loc` stays
+    // `iso_l` — a `taint`ed derived root (`v1+i`) must not inherit
+    // `V(m)`'s immunities through `overlap_keeps` — and an access
+    // through a derived address poisons every candidate it may be
+    // based on, since it can read or write the pointee anywhere.
+    let mut cand = iso_l.clone();
+    if let Some(s) = shel {
+        for &m in s.live.keys() {
+            cand.insert(Root::V(m));
+        }
+    }
+    let mut tainted: u64 = 0;
 
     // Group in-loop accesses by (root, offset) -> (ty, saw_store, uniform,
     // byte extent). The extent is the widest access seen: a group mixing an
@@ -1282,7 +1331,17 @@ fn promote(
             // `V` — may-alias as far as the group scan is concerned.
             let (r, o) = loadfwd::norm_root(func, ps, na, addr.0);
             let o = o.wrapping_add(i64::from(addr.1));
-            if !iso_l.contains(&r) {
+            if !cand.contains(&r) {
+                // An access through a `live` candidate's derived address
+                // (`v1+i` — `s.head[h]` in `compress_inner`) reaches its
+                // pointee at an unknown offset: no loc on it may
+                // promote.
+                if let Some(s) = shel
+                    && let Root::V(x) = r
+                    && let Some(&m) = s.pe.taint.get(&x)
+                {
+                    tainted |= m;
+                }
                 // An operand-frozen access is never a candidate: the scope
                 // is re-entered each iteration, so its reads must see the
                 // previous iteration's stores, which promotion would hold
@@ -1323,6 +1382,13 @@ fn promote(
             let ((r2, o2), (.., e2)) = ks[j];
             if r == r2 && o != o2 && o < o2 + e2 && o2 < o + e {
                 bad.insert(r);
+            }
+        }
+    }
+    if let Some(s) = shel {
+        for (&v, &b) in &s.pe.bit {
+            if tainted & b != 0 {
+                bad.insert(Root::V(v));
             }
         }
     }
@@ -1431,7 +1497,7 @@ fn promote_loc(
     loc: Loc,
     off: i32,
     iso: &FxHashSet<Root>,
-    shel: Option<&FxHashSet<Root>>,
+    shel: Option<&Shel>,
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
@@ -1841,6 +1907,20 @@ pub fn run(
     let ps = &loadfwd::param_src(func);
     let (iso, escapes, ncc) =
         loadfwd::isolated_escapes(func, noalias, ps, cfrozen, nocap, scoped_na);
+    // `PLIRON_LICM_NASHEL`: function-local `captures(none)` for the
+    // entry `noalias` params — which provenance escapes where, so each
+    // loop can tell which roots it shelters (`Shel` in `run_loop`).
+    let pe = if nashel && !noalias.is_empty() {
+        let cands: FxHashSet<Value> = noalias
+            .iter()
+            .copied()
+            .filter(|v| !scoped_na.contains(v))
+            .collect();
+        let (_cfg, pf, _ps) = an.lf_inputs(func);
+        loadfwd::provescapes(func, &cands, pf, nocap)
+    } else {
+        None
+    };
     // Operand-frozen values name their own scope roots (same merged set
     // loadfwd uses): peeling past one would lose the `ofz` claim before the
     // region check can apply it.
@@ -1849,7 +1929,10 @@ pub fn run(
     let debug = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::licm", tracing::Level::DEBUG);
     if debug {
-        tracing::debug!(target: "pliron::licm", "licm iso: noalias={:?} scoped={:?} iso={:?} escapes={:?}", noalias, scoped_na, iso, escapes);
+        tracing::debug!(target: "pliron::licm", "licm iso {}: noalias={:?} scoped={:?} iso={:?} escapes={:?}", func.name, noalias, scoped_na, iso, escapes);
+        if let Some(pe) = &pe {
+            tracing::debug!(target: "pliron::licm", "licm pe {}: esc={:?}", func.name, pe.esc);
+        }
     }
     // Innermost first: values hoisted out of an inner loop become candidates
     // for the enclosing loop on the same pass.
@@ -1904,8 +1987,8 @@ pub fn run(
         let n2 = {
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
-                func, &ps, &stop, noalias, cfg, dt, &la, lp, iso_l, &ncc, &escapes, deref, scoped_na, nw, nounwind, debug,
-                scoped, breg, rpar, ofz, nashel, &mut press, regs,
+                func, &ps, &stop, noalias, cfg, dt, &la, lp, iso_l, &escapes, deref, scoped_na, nw, nounwind, debug,
+                scoped, breg, rpar, ofz, pe.as_ref(), &mut press, regs,
             )
         };
         n += n2;
@@ -2621,5 +2704,102 @@ mod tests {
         assert!(build(false), "maybe-derived store must block the hoist");
         // With `m` escaped, `q` itself is suspect: `b` still stays.
         assert!(build(true), "escaped noalias root must not shelter loads");
+    }
+
+    /// `compress_inner`'s `s.head[h]` shape: `iadd(m, i)` — a variable
+    /// index into `*m` — keeps `m`'s provenance, so a store through it
+    /// still clobbers `*m` locs, but it is NOT an escape: it plants
+    /// nothing, so `m` stays sheltered and a store through a pointer
+    /// loaded from `*m` can't clobber the fields. A `load`-only use of
+    /// the derived address leaves `load m+40` free to hoist; turning it
+    /// into a store keeps the load in the loop.
+    #[test]
+    fn mut_noalias_indexed_addr_taints_but_does_not_escape() {
+        let build = |indexed_store: bool| {
+            let mut sig = Signature::new(CallConv::Fast);
+            for _ in 0..2 {
+                sig.params.push(AbiParam::new(types::I64));
+            }
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let h = func.dfg.make_block();
+            let lbody = func.dfg.make_block();
+            let done = func.dfg.make_block();
+            for b in [b0, h, lbody, done] {
+                func.layout.append_block(b);
+            }
+            let m = func.dfg.append_block_param(b0, types::I64);
+            let i = func.dfg.append_block_param(b0, types::I64);
+            let p = func.dfg.append_block_param(h, types::I64);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let fv = cur.ins().iconst(types::I64, 5);
+            let q = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), m, 8);
+            // `mi = m + i`: variable field index — `m`-based but only
+            // ever an address, never planted.
+            let mi = cur.ins().iadd(m, i);
+            cur.ins().jump(h, &[fv.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let one = cur.ins().iconst(types::I64, 1);
+            let r = cur.ins().icmp(IntCC::UnsignedGreaterThan, p, one);
+            cur.ins().brif(r, lbody, &[], done, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(lbody);
+            let x = cur.ins().iconst(types::I64, 7);
+            cur.ins().store(MemFlagsData::new(), x, q, 0);
+            if indexed_store {
+                cur.ins().store(MemFlagsData::new(), x, mi, 0);
+            } else {
+                let _t = cur
+                    .ins()
+                    .load(types::I64, MemFlagsData::new().with_notrap(), mi, 0);
+            }
+            let b = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), m, 40);
+            cur.ins().jump(h, &[b.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+            cur.ins().return_(&[fv]);
+
+            let mut deref = FxHashMap::default();
+            deref.insert(m, (64, true));
+            let na: FxHashSet<Value> = [m].into_iter().collect();
+            run(
+                &mut func,
+                &mut crate::pipeline::Analysis::default(),
+                &na,
+                &FxHashSet::default(),
+                &deref,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                true,
+            );
+            func.layout
+                .inst_block(func.dfg.value_def(b).inst().unwrap())
+                .unwrap()
+                == lbody
+        };
+        // `mi` exists but is only read through: `m` is sheltered, the
+        // `q`-store can't be `m`-based, and `b` hoists out.
+        assert!(
+            !build(false),
+            "load-derived store wrongly kept the noalias field load in the loop"
+        );
+        // `store x, [mi]` writes `*m` at an unknown offset: `b` stays.
+        assert!(
+            build(true),
+            "store through the derived address must still clobber"
+        );
     }
 }
