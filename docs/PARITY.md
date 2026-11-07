@@ -147,7 +147,11 @@ rounds, `bench/heldout/run.py`):
 parity after aarch64 scaled-amode fixes and Apple `crc` feature tiers;
 the brotli hot function's 32-byte swap now emits `ldp q`/`stp q` under
 the opt-in `PLIRON_COPYPAIR`+`PLIRON_AMODESHARE`, and its self-time is
-near parity. Treat the kernel geomean as "parity on code shapes we have
+near parity. The walk-loop `[sp]` fill traffic was pinned chains, not
+pressure: `PLIRON_RA2_NOPINMERGE` (now default on) stops a try_call-ret
+`FixedReg` from spreading through blockparam merges — 527→454 stack
+accesses in `BrotliCreateHqZopfliBackwardReferences`
+(`history/2026-11-09-hqzopfli-insn-bloat.md`). Treat the kernel geomean as "parity on code shapes we have
 worked on", not as generated-code speed in general. `blind-sig`'s 2.148 was a licm
 miscompile livelock (`history/2026-11-06-licm-frozen-clobber.md`), and
 most of `blake3-scalar`'s 3.149 fell to the intervening optimisation
