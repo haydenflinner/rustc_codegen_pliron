@@ -42,74 +42,85 @@ The CubeCL CPU-kernel path has its own card (`harness/cubecl_card.py`,
 ## Scoreboard
 
 <!-- SCOREBOARD:BEGIN -->
-**Last measured 2026-10-30**, aarch64-apple-darwin, backend `3c43d21`,
-nightly-2026-10-22, load 7–9 (SPD and CMP ±3–5%). Full run, per-input
-tables and the comparison with the previous card:
-[`history/2026-10-30-parity-card.md`](history/2026-10-30-parity-card.md).
+**Last measured 2026-11-07**, aarch64-apple-darwin, backend `862ce3a`,
+nightly-2026-10-22. `PLIRON_COPYPAIR` is default-on since `862ce3a`
+(held-out A/B 0.982 [0.971, 0.998] with `AMODESHARE`); this card is the
+first under that default — the 2026-10-30 card's CMP/SIZ cells came from
+a stale mix of flag states.
 
-**Overall 95** (2026-10-27: 88).
+**Overall 92** (2026-10-30: 95).
 
 | SPD | CMP | MEM | SIZ | STK | COR |
 |---|---|---|---|---|---|
-| **106** | **112** | **68** | **64** | **92** | **100** |
+| **102** | **101** | **70** | **61** | **86** | **100** |
 
 | category | weight | pliron/LLVM | rating | from |
 |---|---|---|---|---|
-| SPD runtime speed | 30 | 0.918 | 106 | native 0.917 · wasm 0.919 |
-| CMP compile time | 15 | 0.853 | 112 | 5 inputs |
-| MEM compile memory | 10 | 1.556 | 68 | peak RSS, 5 inputs |
-| SIZ code size | 10 | 1.655 | 64 | machine code, 5 inputs + wasm module 1.71 |
-| STK stack frames | 15 | 1.124 | 92 | regex-syntax, 327 shared fns |
-| COR correctness | 20 | 1.000 | 100 | ui: 0 stage-2-only vs 3 stage-1-only (3 d old) · crates: 0 pliron-only across 20 crates (0 h old) · fuzz: 0 of 200 seeds (0 h old) |
+| SPD runtime speed | 30 | 0.979 | 102 | native 0.980 · wasm 0.977 |
+| CMP compile time | 15 | 0.993 | 101 | 5 inputs |
+| MEM compile memory | 10 | 1.524 | 70 | peak RSS, 5 inputs |
+| SIZ code size | 10 | 1.710 | 61 | machine code, 5 inputs + wasm module 1.84 |
+| STK stack frames | 15 | 1.207 | 86 | regex-syntax, 324 shared fns |
+| COR correctness | 20 | 1.000 | 100 | ui: 0 stage-2-only vs 3 stage-1-only (11 d old) |
 
 Correctness inputs: crates tier 1 run in the default `--deps stock` mode
 (the crates' own code only); the UI input is the 2026-10-27 stage-2
-self-host run. x86-64 was last measured 2026-10-22.
+self-host run. x86-64 was last measured 2026-10-22. The CMP rating drop
+(112 → 101) is mostly the corrected measurement mix, not a slowdown —
+the same 0.85–0.99 ratio band, weighted differently across the five
+inputs; STK drifted up to 1.207.
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| arrayvec | 5.576 ms | 5.150 ms | 0.924 ◄ faster |
-| chars_alpha | 2.094 ms | 2.014 ms | 0.962 ◄ faster |
-| chars_ascii | 2.185 ms | 1.301 ms | 0.595 ◄ faster |
-| chars_mixed | 15.527 ms | 15.371 ms | 0.990 |
-| contains_rng | 2.189 ms | 1.720 ms | 0.786 ◄ faster |
-| eqbug | 0.112 ms | 0.122 ms | 1.089 ▲ slower |
-| fib | 14.395 ms | 13.072 ms | 0.908 ◄ faster |
-| hashmap | 71.040 ms | 64.149 ms | 0.903 ◄ faster |
-| hmget | 14.369 ms | 12.822 ms | 0.892 ◄ faster |
-| iterw | 19.584 ms | 13.856 ms | 0.708 ◄ faster |
-| matmul | 8.495 ms | 8.529 ms | 1.004 |
-| nbody | 113.523 ms | 90.536 ms | 0.798 ◄ faster |
-| parse_only | 367.568 ms | 391.640 ms | 1.065 ▲ slower |
-| sieve | 12.320 ms | 11.887 ms | 0.965 ◄ faster |
-| sortw | 6.841 ms | 6.368 ms | 0.931 ◄ faster |
-| strwork | 13.876 ms | 13.951 ms | 1.005 |
-| tokenize | 5.913 ms | 7.264 ms | 1.229 ▲ slower |
-| varint | 6.372 ms | 6.448 ms | 1.012 |
-| varint_postcard | 5.920 ms | 5.187 ms | 0.876 ◄ faster |
+| arrayvec | 4.011 ms | 3.744 ms | 0.934 ◄ faster |
+| chars_alpha | 1.524 ms | 3.393 ms | 2.227 ▲ slower |
+| chars_ascii | 1.553 ms | 2.552 ms | 1.643 ▲ slower |
+| chars_mixed | 11.273 ms | 11.992 ms | 1.064 ▲ slower |
+| contains_rng | 1.570 ms | 1.054 ms | 0.671 ◄ faster |
+| eqbug | 0.080 ms | 0.095 ms | 1.194 ▲ slower |
+| fib | 10.265 ms | 9.941 ms | 0.968 ◄ faster |
+| hashmap | 39.799 ms | 41.528 ms | 1.043 ▲ slower |
+| hmget | 8.412 ms | 8.164 ms | 0.971 |
+| iterw | 14.293 ms | 9.860 ms | 0.690 ◄ faster |
+| matmul | 6.258 ms | 6.072 ms | 0.970 |
+| nbody | 83.731 ms | 64.450 ms | 0.770 ◄ faster |
+| parse_only | 271.165 ms | 239.094 ms | 0.882 ◄ faster |
+| sieve | 8.719 ms | 8.726 ms | 1.001 |
+| sortw | 4.982 ms | 4.464 ms | 0.896 ◄ faster |
+| strwork | 10.530 ms | 10.279 ms | 0.976 |
+| tokenize | 4.270 ms | 5.379 ms | 1.260 ▲ slower |
+| varint | 5.724 ms | 4.350 ms | 0.760 ◄ faster |
+| varint_postcard | 5.638 ms | 3.564 ms | 0.632 ◄ faster |
+
+`chars_alpha`/`chars_ascii` are a real regression since 2026-11-04
+(pliron 1.48/0.94 ms then): the per-char loop is ~11 insns vs LLVM's ~7
+(`ldrsb` post-increment + sign-folded ASCII test, no per-iteration null
+check or extra mov/b). Not `COPYPAIR`, `NASHEL` or the new target
+features (all tested off). See
+[`history/2026-11-09-hqzopfli-insn-bloat.md`](history/2026-11-09-hqzopfli-insn-bloat.md).
 
 **wasm kernels** (node, interleaved rounds):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| chars_alpha | 4.635 ms | 4.008 ms | 0.866 ◄ faster |
-| chars_ascii | 2.319 ms | 2.316 ms | 0.999 |
-| chars_mixed | 18.381 ms | 18.227 ms | 0.993 |
-| contains_rng | 4.924 ms | 3.939 ms | 0.804 ◄ faster |
-| eqbug | 0.136 ms | 0.119 ms | 0.877 ◄ faster |
-| fib | 9.352 ms | 8.862 ms | 0.940 ◄ faster |
-| hashmap | 66.195 ms | 70.189 ms | 1.061 ▲ slower |
-| hmget | 11.473 ms | 11.509 ms | 1.003 |
-| iterw | 66.800 ms | 53.491 ms | 0.802 ◄ faster |
-| matmul | 30.773 ms | 21.701 ms | 0.705 ◄ faster |
-| nbody | 84.100 ms | 87.151 ms | 1.036 ▲ slower |
-| parse_only | 380.972 ms | 389.002 ms | 1.021 |
-| sieve | 13.941 ms | 14.024 ms | 1.006 |
-| sortw | 6.042 ms | 5.630 ms | 0.930 ◄ faster |
-| strwork | 17.729 ms | 19.087 ms | 1.078 ▲ slower |
-| tokenize | 7.674 ms | 5.495 ms | 0.714 ◄ faster |
+| chars_alpha | 3.269 ms | 2.851 ms | 0.878 ◄ faster |
+| chars_ascii | 1.652 ms | 1.662 ms | 1.004 |
+| chars_mixed | 13.052 ms | 13.927 ms | 1.067 ▲ slower |
+| contains_rng | 3.513 ms | 3.675 ms | 1.051 ▲ slower |
+| eqbug | 0.097 ms | 0.093 ms | 0.966 ◄ faster |
+| fib | 6.721 ms | 6.389 ms | 0.955 ◄ faster |
+| hashmap | 47.192 ms | 48.665 ms | 1.029 |
+| hmget | 8.192 ms | 8.288 ms | 1.012 |
+| iterw | 47.669 ms | 66.542 ms | 1.402 ▲ slower |
+| matmul | 21.865 ms | 10.810 ms | 0.493 ◄ faster |
+| nbody | 59.478 ms | 59.240 ms | 0.999 |
+| parse_only | 275.676 ms | 376.178 ms | 1.374 ▲ slower |
+| sieve | 10.166 ms | 9.206 ms | 0.906 ◄ faster |
+| sortw | 4.462 ms | 4.148 ms | 0.926 ◄ faster |
+| strwork | 12.776 ms | 14.145 ms | 1.107 ▲ slower |
+| tokenize | 5.512 ms | 4.533 ms | 0.824 ◄ faster |
 <!-- SCOREBOARD:END -->
 
 ### Held-out runtime (not in the card)

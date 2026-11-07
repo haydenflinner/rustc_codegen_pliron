@@ -351,6 +351,17 @@ pub fn run(
     name: &str,
     prof: &FxHashMap<Block, u64>,
 ) -> usize {
+    // `PLIRON_PUNROLL_FNMAX=N`: skip duplicating loops when the function
+    // already exceeds N instructions — every clone in a huge function is
+    // pure code size and register pressure (brotli's HqZopfli gained ~400
+    // unexecuted insns, `docs/history/2026-11-09-hqzopfli-insn-bloat.md`).
+    if let Some(max) = crate::env_get("PLIRON_PUNROLL_FNMAX")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&m| m > 0)
+        && func.dfg.num_insts() > max
+    {
+        return 0;
+    }
     // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
     let empty_prof = FxHashMap::default();
     let prof: &FxHashMap<Block, u64> = if crate::pass_enabled("PLIRON_PGO_LOOP") {
