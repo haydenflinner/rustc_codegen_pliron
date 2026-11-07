@@ -2109,6 +2109,29 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         if self.value_non_amode_use[val] {
             return true;
         }
+        // A decomposed `iadd(mul, base)` pays a fresh `mul` for every
+        // access; materializing the sum costs one `madd` either way, so
+        // keeping it whole is never worse even in a starved block — and
+        // shares the base+index across its uses (the HqZopfli node-walk
+        // paid a `mul` plus a base reload per store otherwise).
+        if let ValueDef::Result(inst, _) = self.f.dfg.value_def(val) {
+            if self.f.dfg.insts[inst].opcode() == crate::ir::Opcode::Iadd {
+                let imul = self
+                    .f
+                    .dfg
+                    .inst_args(inst)
+                    .iter()
+                    .any(|&a| match self.f.dfg.value_def(a) {
+                        ValueDef::Result(a_inst, _) => {
+                            self.f.dfg.insts[a_inst].opcode() == crate::ir::Opcode::Imul
+                        }
+                        _ => false,
+                    });
+                if imul {
+                    return true;
+                }
+            }
+        }
         if self.value_direct_uses[val] > 3 {
             return false;
         }

@@ -69,3 +69,51 @@ fn doubled_index_folds_into_scaled_amode() {
         );
     }
 }
+
+/// `nodes[i'].f = v` four times over: `iadd(imul(i, 20), base)` with four
+/// amode uses. The share gate's fanout cap (3) used to decompose this,
+/// paying a `mul` + reg+reg amode per store; an `iadd` over an `imul` is
+/// always worth sharing — `madd` once is never worse than `mul` per use.
+/// (`BrotliCreateHqZopfliBackwardReferences` node walk.)
+const NODE_STORES: &str = "function %f(i64, i64, i32) {
+block0(v0: i64, v1: i64, v2: i32):
+    v10 = iconst.i64 20
+    v3 = imul v1, v10
+    v4 = iadd v0, v3
+    store.i32 notrap v2, v4
+    store.i32 notrap v2, v4+4
+    store.i32 notrap v2, v4+8
+    store.i32 notrap v2, v4+12
+    return
+}";
+
+#[test]
+fn imul_address_is_shared_across_stores() {
+    let a = asm(NODE_STORES);
+    let madds = a
+        .lines()
+        .filter(|l| l.trim_start().starts_with("madd "))
+        .count();
+    let muls = a
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start();
+            l.starts_with("mul ") || l.starts_with("umulh ")
+        })
+        .count();
+    assert_eq!(
+        madds, 1,
+        "want one `madd` materializing the shared address:\n{a}"
+    );
+    assert_eq!(muls, 0, "no standalone `mul` per store:\n{a}");
+    assert_eq!(
+        a.lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                l.starts_with("str w") || l.starts_with("stur w")
+            })
+            .count(),
+        4,
+        "all four stores present:\n{a}"
+    );
+}

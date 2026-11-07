@@ -704,6 +704,13 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     low-pressure ones. Default on (PRESS=5): paired medians give
     sieve −5.5% / parse_only −3% wins with sortw/hashmap hot fns
     byte-identical to OFF; `PLIRON_AMODESHARE=0` disables.
+    Extension: a multi-use `iadd` whose operand is an `imul` result is
+    always shareable, regardless of the pressure cap — decomposing it
+    pays a fresh `mul` per access, while keeping it whole lowers to a
+    single `madd` shared by every use (the Brotli
+    `HqZopfliBackwardReferences` node-walk paid a `mul` plus a base
+    reload per store). The pressure cap still applies to plain
+    `iadd reg, reg` sums.
 57. `DominatorTree::try_dominates` is false across blocks unless both
     are reachable in the tree (`src/dominator_tree.rs`). Unreachable
     and newer-than-the-tree blocks keep default preorder numbers, and
