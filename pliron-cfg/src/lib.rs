@@ -148,6 +148,11 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // At most 8 CGUs past the start of stage A (2026-10-27-memory2.md).
     // Tuned on a 14-core Mac; `=0` disables the cap.
     ("PLIRON_CGU_ACAP", "8"),
+    // At most 4 CGUs submitted and unfinished: the main thread parks in
+    // `submit` instead of queueing more unoptimized Contexts. syn peak
+    // RSS 1.07->0.75 GB (1.70->1.22x LLVM), regex-syntax 0.55->0.47 GB,
+    // no measurable wall cost (2026-11-06; `=0` disables).
+    ("PLIRON_CGU_INFLIGHT", "4"),
     // Waffle loop-rule leaf filter (`1` ⇒ ≤2 calls in the callee).
     // 5.73x → 2.17x on regex-wasm CODE; hash_one-style leaves still inline.
     ("PLIRON_WASM_HOTLEAF", "1"),

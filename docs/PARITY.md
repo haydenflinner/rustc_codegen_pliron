@@ -250,17 +250,23 @@ in the scoreboard and in the linked history files.
 ### Compile memory
 
 - The default-on memory set (`PLIRON_LOWERFREE`, `PLIRON_JEARENA`,
-  `PLIRON_CGU_ACAP=8`, `PLIRON_DEADFREE`, `PLIRON_LTUNDEF`; see
-  `pliron-cfg/src/lib.rs` `DEFAULT_ON`/`DEFAULT_VALUES`) closed most of
-  the first gap. Remaining levers: the wasm phase-(A) hump (the whole
+  `PLIRON_CGU_ACAP=8`, `PLIRON_CGU_INFLIGHT=4`, `PLIRON_DEADFREE`,
+  `PLIRON_LTUNDEF`; see `pliron-cfg/src/lib.rs`
+  `DEFAULT_ON`/`DEFAULT_VALUES`) closed most of the first gap.
+  `CGU_INFLIGHT` (default-on since 2026-11-06) bounds the
+  submitted-and-unfinished set at 4 CGUs — the main thread parks in
+  `submit` instead of queueing more unoptimized `Context`s ahead of the
+  workers — and cut syn's peak 1.07→0.75 GB (1.70→1.22× LLVM) and
+  regex-syntax's 0.55→0.47 GB with no measured wall cost.
+  Remaining levers: the wasm phase-(A) hump (the whole
   CGU's optimized CLIF is held until waffle translation; translating each
   function inside its pipeline job would release it earlier), and fewer
   ops after inlining. History: `history/2026-10-26-memory.md`,
-  `history/2026-10-27-memory2.md`, `history/2026-10-27-memory3.md`.
-  The remaining peak is live data, not allocator retention: ~16 CGU
-  `Context`s (~55 MB each) sit in the parallel stage-A pool while
-  post-inline op counts roughly double (syn: 1.04 GB vs LLVM 614 MB;
-  `history/2026-11-06-siz-mem-attribution.md`).
+  `history/2026-10-27-memory2.md`, `history/2026-10-27-memory3.md`,
+  `history/2026-11-06-inflight-cap.md`.
+  The remaining peak is live data, not allocator retention: CGU
+  `Context`s parked at stage B hold their post-inline form (~2× ops,
+  ~55 MB each on syn; `history/2026-11-06-siz-mem-attribution.md`).
 
 ### Code size
 
