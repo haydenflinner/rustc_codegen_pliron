@@ -2114,21 +2114,25 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // keeping it whole is never worse even in a starved block — and
         // shares the base+index across its uses (the HqZopfli node-walk
         // paid a `mul` plus a base reload per store otherwise).
-        if let ValueDef::Result(inst, _) = self.f.dfg.value_def(val) {
-            if self.f.dfg.insts[inst].opcode() == crate::ir::Opcode::Iadd {
-                let imul = self
-                    .f
-                    .dfg
-                    .inst_args(inst)
-                    .iter()
-                    .any(|&a| match self.f.dfg.value_def(a) {
-                        ValueDef::Result(a_inst, _) => {
-                            self.f.dfg.insts[a_inst].opcode() == crate::ir::Opcode::Imul
-                        }
-                        _ => false,
-                    });
-                if imul {
-                    return true;
+        static IMUL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let imul_on = *IMUL.get_or_init(|| std::env::var("PLIRON_AMODESHARE_IMUL").as_deref() != Ok("0"));
+        if imul_on {
+            if let ValueDef::Result(inst, _) = self.f.dfg.value_def(val) {
+                if self.f.dfg.insts[inst].opcode() == crate::ir::Opcode::Iadd {
+                    let imul = self
+                        .f
+                        .dfg
+                        .inst_args(inst)
+                        .iter()
+                        .any(|&a| match self.f.dfg.value_def(a) {
+                            ValueDef::Result(a_inst, _) => {
+                                self.f.dfg.insts[a_inst].opcode() == crate::ir::Opcode::Imul
+                            }
+                            _ => false,
+                        });
+                    if imul {
+                        return true;
+                    }
                 }
             }
         }
