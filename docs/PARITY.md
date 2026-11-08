@@ -127,19 +127,19 @@ features (all tested off). See
 
 SPD is measured on the kernels above, which the backend has been tuned
 against for weeks. On real programs it was never tuned on, native code is
-**1.10x slower** than LLVM (geomean of 8; 2026-11-06, 11 interleaved
+**1.08x slower** than LLVM (geomean of 8; 2026-11-09, 11 interleaved
 rounds, `bench/heldout/run.py`):
 
 | program (sightglass) | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| blake3-scalar | 2.93 ms | 3.09 ms | 1.056 |
-| blind-sig | 1.33 ms | 1.46 ms | 1.098 |
-| pulldown-cmark | 3.72 ms | 4.10 ms | 1.101 |
-| rust-compression | 2.29 ms | 2.73 ms | 1.193 |
-| rust-html-rewriter | 4.89 ms | 5.59 ms | 1.144 |
-| regex | 2.79 ms | 3.10 ms | 1.112 |
-| rust-json | 3.02 ms | 3.29 ms | 1.089 |
-| rust-protobuf | 5.22 ms | 5.33 ms | 1.020 |
+| blake3-scalar | 2.97 ms | 3.13 ms | 1.054 |
+| blind-sig | 1.35 ms | 1.43 ms | 1.052 |
+| pulldown-cmark | 3.80 ms | 4.18 ms | 1.100 |
+| rust-compression | 2.32 ms | 2.65 ms | 1.144 |
+| rust-html-rewriter | 4.93 ms | 5.64 ms | 1.143 |
+| regex | 2.75 ms | 2.96 ms | 1.077 |
+| rust-json | 3.03 ms | 3.20 ms | 1.057 |
+| rust-protobuf | 5.38 ms | 5.31 ms | 0.986 |
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
@@ -165,10 +165,15 @@ in the scoreboard and in the linked history files.
 
 ### Runtime speed
 
-- **Held-out programs: 1.10x** (was 1.57x on 2026-10-31). The livelock
+- **Held-out programs: 1.08x** (was 1.57x on 2026-10-31). The livelock
   behind blind-sig's 2.1x is fixed
   (`history/2026-11-06-licm-frozen-clobber.md`); the remaining spread is
-  1.02-1.19x across compressors and parsers, no single outlier left.
+  0.99-1.14x across compressors and parsers — rust-protobuf is the first
+  program faster than LLVM. pulldown's gap decomposes in
+  `history/2026-11-09-mcp-sibling-pulldown.md`: the top mechanism is
+  early-exit search-loop vectorisation (`iter().any`/`memchr` shapes →
+  `cmeq`+reduce, which `loopvec` doesn't cover) plus per-copy end-test
+  cost in peeled scans.
 - **wasm local traffic.** CLIF SSA values become wasm locals; waffle's
   relooper passes block params through scratch locals at `if`/`else`
   boundaries, and we emit structured `if` diamonds where LLVM emits
@@ -379,20 +384,18 @@ in the scoreboard and in the linked history files.
 Ranked by expected card gain per effort. Each item links its evidence.
 
 1. **Runtime parity on held-out programs** (`bench/heldout/run.py`,
-   1.31x after 2026-10-31's fixes): the phased plan, with the LLVM and GCC
+   1.08x on 2026-11-09): the phased plan, with the LLVM and GCC
    frameworks we lack (SCEV/LFTR, value ranges, regalloc
    rematerialization, block placement, isel idiom mining), is
-   [`codegen-plan.md`](codegen-plan.md). Phase 0 is a per-function gap
-   census.
-2. **Validate and flip the pending size flags.** `PLIRON_COPYPAIR=1`,
-   `PLIRON_TBNZ_IREDUCE=1`, `PLIRON_SROA_MAXSLICES=18`
-   (`history/2026-10-29-ir-excess.md` §5) and `PLIRON_LIBCALL_DIRECT=1`,
-   `PLIRON_EDGEMERGE=3`/`PLIRON_EPIMERGE=2`
-   (`history/2026-10-29-code-size.md`) still need a bench A/B,
-   `harness/gate.py --full`, crates and stage-2 UI. `COPYPAIR` now also
-   does the scalar-pair → `i64x2` merge; A/B it together with
-   `PLIRON_AMODESHARE` since pairing needs the shared base register
-   (`history/2026-11-09-copypair-scalar-merge.md`).
+   [`codegen-plan.md`](codegen-plan.md). Current top mechanisms:
+   early-exit search-loop vectorisation (`.any`/`memchr` → `cmeq`,
+   `history/2026-11-09-mcp-sibling-pulldown.md`), the HqZopfli ~200-mov
+   residue (`history/2026-11-09-hqzopfli-insn-bloat.md`).
+2. ~~Validate and flip the pending size flags~~ — done 2026-11-09:
+   `EDGEMERGE=3`/`EPIMERGE=2`/`TBNZ_IREDUCE` default-on (`3bbb029`),
+   `SROA_MAXSLICES=18` rejected (borderline regression),
+   `LIBCALL_DIRECT` held on an unexplained html-rewriter regression.
+   Full table in `history/2026-11-09-mcp-sibling-pulldown.md`.
 3. **Size/cold gates on duplicating passes**: `punroll`, peeling,
    `jumpthread`, `looprot` and the `MEMFAST` fast path, gated on cold
    loops (bodies that lead to a panic) or huge functions. Bench every
