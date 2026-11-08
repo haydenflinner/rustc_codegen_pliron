@@ -4939,6 +4939,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Fold a loop latch's few pure instructions into its predecessor's
         // `brif` so the back edge is one branch (pulldown's escape scan).
         step("latchspec", "latchspec", Gate::Env("PLIRON_LATCHSPEC"), s_latchspec).needs(shape::LOOPS),
+        // The pointer-param shape edgesink/latchspec leaves (loop args
+        // `iadd base, iv'`) postdates ivrefold2; a third opt-in run
+        // refolds those slots back onto the index (zip-style loops).
+        step("ivrefold3", "ivrefold", Gate::OptIn("PLIRON_IVREFOLD3"), s_ivrefold).needs(shape::LOOPS),
         // Interleaved `ld; st` copy runs -> `ldp`/`stp`-fusable groups
         // (aarch64): by-value aggregate moves, 4 insns per 16 B before.
         step("copypair", "copypair", Gate::OptIn("PLIRON_COPYPAIR"), s_copypair)

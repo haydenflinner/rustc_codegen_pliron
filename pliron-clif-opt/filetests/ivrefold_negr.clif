@@ -1,0 +1,23 @@
+; test ivrefold
+; A pointer stepping +8 against a countdown index is ratio -8:
+; `bp - 8*iv` cannot fold into a scale amode, so the refold would emit
+; a multiply per iteration. The slot stays carried as `p += 8`.
+; check: block1(v2: i64, v3: i64):
+; check-not: block1(v2: i64):
+function %neg(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v10: i64):
+    v11 = iadd v1, v0
+    jump block1(v10, v11)
+
+block1(v2: i64, v3: i64):
+    v5 = load.i8 notrap v3
+    v6 = iconst.i64 1
+    v7 = isub v2, v6
+    v8 = iconst.i64 8
+    v9 = iadd v3, v8
+    v14 = icmp ult v7, v10
+    brif v14, block1(v7, v9), block2(v2)
+
+block2(v15: i64):
+    return v15
+}

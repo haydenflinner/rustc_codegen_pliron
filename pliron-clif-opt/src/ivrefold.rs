@@ -48,7 +48,12 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
 
 /// `v` as `p + k` for constant `k` (`isub p, k` is `p - k`); the arg may
 /// be an alias chain to the add result.
-fn step_of(func: &Function, v: Value, p: Value) -> Option<i64> {
+fn step_of(
+    func: &Function,
+    v: Value,
+    p: Value,
+    pkonst: &FxHashMap<Value, i64>,
+) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
     let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
         return None;
@@ -60,18 +65,48 @@ fn step_of(func: &Function, v: Value, p: Value) -> Option<i64> {
         func.dfg.resolve_aliases(args[0]),
         func.dfg.resolve_aliases(args[1]),
     );
+    // The step may be a param bound to the same `iconst` on every edge
+    // (a threaded `+ stride` that lowering kept as a slot).
+    let kof = |v: Value| iconst(func, v).or_else(|| pkonst.get(&v).copied());
     match opcode {
         Opcode::Iadd => {
             if a == p {
-                iconst(func, b)
+                kof(b)
             } else if b == p {
-                iconst(func, a)
+                kof(a)
             } else {
                 None
             }
         }
-        Opcode::Isub if a == p => iconst(func, b).map(|k| k.wrapping_neg()),
+        Opcode::Isub if a == p => kof(b).map(|k| k.wrapping_neg()),
         _ => None,
+    }
+}
+
+/// `p0` as `B + i0`: when the entry arg is literally `iadd B, i0` the
+/// refolded base is `B` directly — no `isub` to emit and no reliance
+/// on a later reassociate to cancel `i0`.
+fn add_base(func: &Function, p0: Value, i0: Value) -> Option<Value> {
+    let ValueDef::Result(i, _) = func.dfg.value_def(func.dfg.resolve_aliases(p0)) else {
+        return None;
+    };
+    let InstructionData::Binary {
+        opcode: Opcode::Iadd,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let (x, y) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    if x == i0 {
+        Some(y)
+    } else if y == i0 {
+        Some(x)
+    } else {
+        None
     }
 }
 
@@ -315,6 +350,16 @@ fn refold_header(
     let Some(entry_args) = edge_args(func, ei, ed, params.len()) else {
         return 0;
     };
+    // A param fed the same `iconst` on every edge carries a constant;
+    // `step_of` resolves through it so `p + q` recurrences still match.
+    let mut pkonst: FxHashMap<Value, i64> = FxHashMap::default();
+    for (ix, &p) in params.iter().enumerate() {
+        if let Some(k) = iconst(func, entry_args[ix])
+            && back_args.iter().all(|a| iconst(func, a[ix]) == Some(k))
+        {
+            pkonst.insert(p, k);
+        }
+    }
     // Per-slot affine step: `p` itself counts as step 0 (an edge could
     // mix `p` and `p+k` — then the steps differ and the slot isn't
     // affine). Identity slots pass `p` on every back edge.
@@ -326,7 +371,7 @@ fn refold_header(
             let k = if func.dfg.resolve_aliases(a[ix]) == p {
                 Some(0)
             } else {
-                step_of(func, a[ix], p)
+                step_of(func, a[ix], p, &pkonst)
             };
             match k {
                 Some(k) => match step {
@@ -473,14 +518,31 @@ fn refold_header(
         if ix == ai {
             continue;
         }
-        let Some(s) = steps[ix] else { continue };
+        let Some(s) = steps[ix] else {
+            // Same resolved value on every edge (e.g. a constant fed
+            // from the preheader): `p` is `entry_args[ix]` — strip it
+            // like an identity slot. The entry pred dominates `h`, so
+            // the replacement dominates every use.
+            if func.dfg.value_type(p) == aty
+                && back_args
+                    .iter()
+                    .all(|a| a[ix] == entry_args[ix])
+            {
+                idents.push(ix);
+            }
+            continue;
+        };
         if s == 0 {
             if func.dfg.value_type(p) == aty {
                 idents.push(ix);
             }
             continue;
         }
-        if s % astep != 0 || func.dfg.value_type(p) != aty {
+        // A nonpositive ratio walks the addresses against the counter's
+        // direction: `bp - |r|*iv` can't fold into a scale amode, so the
+        // per-use `iadd bp, scaled(iv)` materializes a multiply each
+        // iteration — strictly worse than the carried `p += k`.
+        if s % astep != 0 || s / astep <= 0 || func.dfg.value_type(p) != aty {
             continue;
         }
         drops.push((ix, s / astep));
@@ -528,9 +590,21 @@ fn refold_header(
     }
     // Precompute const-ness of the entry args before a cursor takes
     // `func`: `bp = p0 - r*i0` on the entry edge.
-    let drops_pre: Vec<(usize, i64, Option<i64>, Option<i64>)> = drops
+    let drops_pre: Vec<(usize, i64, Option<i64>, Option<i64>, Option<Value>)> = drops
         .iter()
-        .map(|&(ix, r)| (ix, r, iconst(func, i0), iconst(func, entry_args[ix])))
+        .map(|&(ix, r)| {
+            (
+                ix,
+                r,
+                iconst(func, i0),
+                iconst(func, entry_args[ix]),
+                if r == 1 {
+                    add_base(func, entry_args[ix], i0)
+                } else {
+                    None
+                },
+            )
+        })
         .collect();
     // Load/store uses of a dropped param get a fresh `iadd bp, scaled(iv)`
     // per use: single-use chains fold into base+index*scale amodes, so
@@ -560,10 +634,12 @@ fn refold_header(
     let mut bpv = Vec::with_capacity(drops.len());
     {
         let mut pos = FuncCursor::new(func).at_inst(ei);
-        for &(ix, r, ki0, kp0) in &drops_pre {
+        for &(ix, r, ki0, kp0, kbp) in &drops_pre {
             let p0 = entry_args[ix];
             let bp = if ki0 == Some(0) {
                 p0
+            } else if let Some(b) = kbp {
+                b
             } else if let (Some(a), Some(b)) = (kp0, ki0) {
                 pos.ins().iconst(aty, a.wrapping_sub(r.wrapping_mul(b)))
             } else {
