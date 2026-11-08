@@ -1,0 +1,21 @@
+; test vrp
+; Negative: same loop-header shape as vrp_multi_edge.clif but the
+; preheader enters unguarded (a `jump`), so `p == end` can hold on the
+; first iteration and the clamp compare must survive.
+; check: icmp eq v4, v2
+function %g(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iadd.i64 v0, v1
+    jump block1(v0)
+
+block1(v4: i64):
+    v5 = icmp eq v4, v2
+    v6 = iconst.i64 1
+    v7 = iadd.i64 v4, v6
+    v8 = select.i64 v5, v4, v7
+    v9 = icmp ne v8, v2
+    brif v9, block1(v8), block2
+
+block2:
+    return v4
+}

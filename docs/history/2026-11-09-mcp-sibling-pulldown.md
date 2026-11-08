@@ -196,3 +196,38 @@ Flipped default-on via `DEFAULT_ON` (`PLIRON_LIBCALL_DIRECT=0` off):
 (BRANCH26) instead of `adrp; ldr [GOT]; blr`, ~2 insns/site, -1.7 KB
 crate-wide (2026-10-29-code-size.md). Verified on `copy_from_slice`:
 unset → `bl _memcpy`, `=0` → GOT indirection.
+
+## VRP multi-edge edge facts (all-preds agree)
+
+`Ranges` gained per-edge facts for multi-pred blocks whose EVERY pred
+is a `brif` (`edge_facts_multi`, ≤ 8 preds). Three consumers:
+
+- `at()`: joins the per-edge interval ranges (union — alternatives
+  widen), kept only when EVERY edge yields a fact; met into the
+  unconditional range.
+- `known_rel(x, y, at)`: new query — `x == y` decided by edge facts
+  when every edge proves the same verdict (covers `x != bound` for a
+  non-const bound, which intervals can't express).
+- `diff_bounds`: per-edge `D = yb - xb` bounds unioned (widened)
+  across edges.
+
+`fact()` also learned `brif c` binding `c` to a block param: the param
+is `0` on the false arm and *nonzero* on the true arm — NOT `1` (an
+i64 brif cond tests `!= 0`; claiming `[1,1]` was a real miscompile,
+fuzz seed 20565: a `v != 0` edge range of `[1,1]` folded a true
+`x == K` to 0).
+
+`poison_self_params` fixes a second soundness hole found by the
+regression filetests: on a self-edge (single-block loop), a compare
+operand that is a param of the dest and not passed as an arg refers to
+the OLD binding, so `brif (v4 == end) → exit | loop(v4+1)` proves
+`old_v4 != end`, nothing about `v4`. Unbound self-edge params are
+mapped to a sentinel that matches no query; args passed through (e.g.
+`v8 = select(p==end,p,p+1)` tested `!= end`) still translate.
+
+Effect (std corpus): 396 fns differ, net −925 insns, worst +17. On
+`scan_code_fence`'s final shape it folds both `select(p==end,p,p+1)`
+clamps (`v634`, `v648` → 0). Filetests: `vrp_multi_edge{,_flag,_neg}`.
+Validation: corpus 4870 fns 0 mismatches, gate 94 jobs, fuzz 400/400
+(seed 20565 included) — plus one earlier unsound-fold version caught
+by the same filetests before the fix.

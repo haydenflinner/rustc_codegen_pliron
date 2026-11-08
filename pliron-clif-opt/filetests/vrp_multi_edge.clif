@@ -1,0 +1,34 @@
+; test vrp
+; Loop-header param proven `!= end` on EVERY incoming edge: the
+; preheader guard `p != end` and the backedge `q != end`. Inside the
+; loop body the iterator clamp compare `p == end` folds to 0, so the
+; `select` picks `p + 1` unconditionally (the `iter::next` shape that
+; leaves a `select(p==end, p, p+1)` + a second end test per element).
+; On the self-edge the compare's operand is the ARG `v8` bound to the
+; param, so the fact reaches the new binding soundly.
+; diffcheck
+; check-not: icmp eq v4, v2
+; check: v5 -> v
+function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    ; v1 = len, iterate p over [base, base+len).
+    v2 = iadd.i64 v0, v1
+    v3 = icmp eq v0, v2
+    brif v3, block4, block1(v0)
+
+block1(v4: i64):
+    ; p = v4; both preds prove p != v2.
+    v5 = icmp eq v4, v2
+    v6 = iconst.i64 1
+    v7 = iadd.i64 v4, v6
+    v8 = select.i64 v5, v4, v7
+    v9 = icmp ne v8, v2
+    brif v9, block1(v8), block2
+
+block2:
+    return v4
+
+block4:
+    v10 = iconst.i64 0
+    return v10
+}

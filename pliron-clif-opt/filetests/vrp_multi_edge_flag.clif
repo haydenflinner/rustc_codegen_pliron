@@ -1,0 +1,34 @@
+; test vrp
+; `brif c` whose cond is bound to a param: `pv = arm` on that edge.
+; Both edges bind the flag param to their (false) compare results, so
+; the flag is const 0 in the loop and `flag != 0` folds. The eq
+; compare `v22` MUST SURVIVE: on the self-edge its operand `v4` is the
+; OLD param binding (the edge binds `v24`), so the edge proves
+; `old_v4 != end` — nothing about `v4` — and the loop genuinely exits
+; via `v22` (regression: folding it here made the loop infinite).
+; diffcheck
+; check: v22 = icmp eq v4, v2
+; check: v25 -> v
+; check-not: v25 = icmp
+function %h(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iadd.i64 v0, v1
+    v3 = icmp eq v0, v2
+    brif v3, block4, block1(v0, v3)
+
+block1(v4: i64, v20: i8):
+    ; v20 = 0 on both edges (bound to the false arm's compare).
+    v21 = iconst.i8 0
+    v22 = icmp eq v4, v2
+    v23 = iconst.i64 1
+    v24 = iadd.i64 v4, v23
+    v25 = icmp ne v20, v21
+    brif v22, block2, block1(v24, v22)
+
+block2:
+    return v4
+
+block4:
+    v10 = iconst.i64 0
+    return v10
+}

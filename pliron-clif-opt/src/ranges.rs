@@ -33,6 +33,10 @@ const MAX_FACT_HOPS: usize = 48;
 const STRIP_DEPTH: u32 = 8;
 const LIN_DEPTH: u32 = 3;
 const DIFF_HOPS: usize = 16;
+/// Most predecessors a multi-pred block may have and still contribute
+/// all-agree edge facts (a wider join is a merge point, not a fact
+/// source, and the per-edge work would grow unbounded).
+const MAX_EDGE_PREDS: usize = 8;
 
 /// Interval of a `bits`-wide integer, as unsigned and as signed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +135,10 @@ pub struct Ranges {
     /// Compared values that cross the edge as arguments get renamed to
     /// the param so facts reach the param's uses.
     edge_fact: FxHashMap<Block, (Value, bool, FxHashMap<Value, Value>)>,
+    /// Per multi-pred block whose EVERY pred is a `brif` with a
+    /// distinct other dest: one (cond, arm-into-block, arg_map) per
+    /// edge. A fact holds on entry only when every edge proves it.
+    edge_facts_multi: FxHashMap<Block, Vec<(Value, bool, FxHashMap<Value, Value>)>>,
     /// Block param → its single incoming source value, when every
     /// non-self edge arg names the same value (loop-preserving self
     /// edges keep the induction). One pass at construction.
@@ -142,6 +150,19 @@ pub struct Ranges {
 
 fn width(ty: Type) -> Option<u32> {
     if ty.is_int() && ty.bits() <= 64 { Some(ty.bits()) } else { None }
+}
+
+/// On a self-edge (`pred == dest`) a compare operand that is a param
+/// of `dest` and was not passed as an arg refers to the OLD binding —
+/// the fact says nothing about the param the edge binds. Poison those
+/// params so the translation never matches them to a query.
+fn poison_self_params(func: &Function, b: Block, pred: Block, arg_map: &mut FxHashMap<Value, Value>) {
+    if pred != b {
+        return;
+    }
+    for &pv in func.dfg.block_params(b) {
+        arg_map.entry(pv).or_insert(Value::from_bits(u32::MAX));
+    }
 }
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
@@ -245,21 +266,64 @@ impl Ranges {
             .into_iter()
             .filter_map(|(k, v)| v.map(|v| (k, v)))
             .collect();
+        let mut edge_facts_multi: FxHashMap<Block, Vec<(Value, bool, FxHashMap<Value, Value>)>> =
+            FxHashMap::default();
         for b in func.layout.blocks() {
             let mut preds = cfg.pred_iter(b);
-            let (Some(p), None) = (preds.next(), preds.next()) else { continue };
-            if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[p.inst] {
+            let Some(p) = preds.next() else { continue };
+            if preds.next().is_none() {
+                if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[p.inst] {
+                    let d0 = blocks[0].block(&func.dfg.value_lists);
+                    let d1 = blocks[1].block(&func.dfg.value_lists);
+                    if d0 == d1 {
+                        continue;
+                    }
+                    let (arm, bc) = if d0 == b {
+                        (true, &blocks[0])
+                    } else if d1 == b {
+                        (false, &blocks[1])
+                    } else {
+                        continue;
+                    };
+                    let mut arg_map = FxHashMap::default();
+                    let params = func.dfg.block_params(b);
+                    for (i, ba) in bc.args(&func.dfg.value_lists).enumerate() {
+                        if let (cranelift_codegen::ir::BlockArg::Value(v), Some(&pv)) =
+                            (ba, params.get(i))
+                        {
+                            arg_map.insert(func.dfg.resolve_aliases(v), pv);
+                        }
+                    }
+                    poison_self_params(func, b, p.block, &mut arg_map);
+                    edge_fact.insert(b, (func.dfg.resolve_aliases(arg), arm, arg_map));
+                }
+                continue;
+            }
+            // Multi-pred: every pred a `brif` with a distinct other
+            // dest records one edge; any other shape proves nothing.
+            if 2 + preds.count() > MAX_EDGE_PREDS {
+                continue;
+            }
+            let mut edges = Vec::new();
+            let mut ok = true;
+            for p in cfg.pred_iter(b) {
+                let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[p.inst] else {
+                    ok = false;
+                    break;
+                };
                 let d0 = blocks[0].block(&func.dfg.value_lists);
                 let d1 = blocks[1].block(&func.dfg.value_lists);
                 if d0 == d1 {
-                    continue;
+                    ok = false;
+                    break;
                 }
                 let (arm, bc) = if d0 == b {
                     (true, &blocks[0])
                 } else if d1 == b {
                     (false, &blocks[1])
                 } else {
-                    continue;
+                    ok = false;
+                    break;
                 };
                 let mut arg_map = FxHashMap::default();
                 let params = func.dfg.block_params(b);
@@ -270,7 +334,11 @@ impl Ranges {
                         arg_map.insert(func.dfg.resolve_aliases(v), pv);
                     }
                 }
-                edge_fact.insert(b, (func.dfg.resolve_aliases(arg), arm, arg_map));
+                poison_self_params(func, b, p.block, &mut arg_map);
+                edges.push((func.dfg.resolve_aliases(arg), arm, arg_map));
+            }
+            if ok {
+                edge_facts_multi.insert(b, edges);
             }
         }
         Ranges {
@@ -278,6 +346,7 @@ impl Ranges {
             visiting: FxHashSet::default(),
             work: 0,
             edge_fact,
+            edge_facts_multi,
             param_src,
             at_memo: FxHashMap::default(),
         }
@@ -589,6 +658,30 @@ impl Ranges {
                     }
                 }
             }
+            if let Some(edges) = self.edge_facts_multi.get(&b) {
+                // Each edge's fact is conditional on arriving via that
+                // edge: `v` at `b` is the JOIN of the per-edge ranges
+                // (unconditional), but only when every edge yields a
+                // bound — one that can't leaves `v` unrestricted.
+                let edges = edges.clone();
+                let mut u = None;
+                for (c, arm, arg_map) in edges.iter() {
+                    match self.fact(func, *c, *arm, v, bits, arg_map) {
+                        Some(f) => {
+                            u = Some(u.map_or(f, |u: Range| u.join(&f)));
+                        }
+                        None => {
+                            u = None;
+                            break;
+                        }
+                    }
+                }
+                if let Some(u) = u
+                    && let Some(m) = r.meet(&u)
+                {
+                    r = m;
+                }
+            }
             hops += 1;
             if hops > MAX_FACT_HOPS {
                 break;
@@ -609,6 +702,15 @@ impl Ranges {
     /// the edge's branch args to the dest block's params so the fact
     /// reaches values bound on the edge.
     fn fact(&mut self, func: &Function, c: Value, arm: bool, v: Value, bits: u32, arg_map: &FxHashMap<Value, Value>) -> Option<Range> {
+        // `c` itself (or the param it binds on this edge): 0 on the
+        // false arm, nonzero on the true (brif tests != 0 at any width).
+        if arg_map.get(&c).copied().unwrap_or(c) == v {
+            return Some(if arm {
+                Range::unsigned(bits, 1, umask(bits))
+            } else {
+                Range::konst(bits, 0)
+            });
+        }
         let ci = func.dfg.value_def(c).inst()?;
         let (cc, x, y) = match func.dfg.insts[ci] {
             InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args: [x, y] } => (cond, func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y)),
@@ -616,6 +718,10 @@ impl Ranges {
         };
         let x = arg_map.get(&x).copied().unwrap_or(x);
         let y = arg_map.get(&y).copied().unwrap_or(y);
+        // A poisoned operand (self-edge old binding) invalidates the fact.
+        if !func.dfg.value_is_valid(x) || !func.dfg.value_is_valid(y) {
+            return None;
+        }
         let (cc, other) = if x == v {
             (cc, y)
         } else if y == v {
@@ -854,11 +960,132 @@ impl Ranges {
         for (a, b, cc) in [(a2, b2, cc0), (b2, a2, cc0.swap_args())] {
             let a = arg_map.get(&a).copied().unwrap_or(a);
             let b = arg_map.get(&b).copied().unwrap_or(b);
+            if !func.dfg.value_is_valid(a) || !func.dfg.value_is_valid(b) {
+                continue;
+            }
             if let Some((cy, t)) = self.diff_term(func, dt, a, b, xb, yb, cb) {
                 Self::cmp_bound(cc, cy, t, lo, hi);
                 continue;
             }
             self.sub_diff(func, dt, a, b, cc, xb, yb, cb, lo, hi);
+        }
+    }
+
+    /// What `brif c` arm `arm` says about `x == y` on that edge:
+    /// Some(true) provably equal, Some(false) provably different —
+    /// the relations interval facts can't express (`x != y` for
+    /// non-constant `y`). `arg_map` is as in `fact`.
+    fn edge_rel(&mut self, func: &Function, c: Value, arm: bool, arg_map: &FxHashMap<Value, Value>, x: Value, y: Value) -> Option<bool> {
+        // `c` bound to a param: pv = 0 on the false arm, nonzero on the
+        // true. `pv == other` settles when `other` is a constant (0 is
+        // decided on both arms; nonzero only on the false arm).
+        if let Some(&pv) = arg_map.get(&c) {
+            for (q, other) in [(x, y), (y, x)] {
+                if q != pv {
+                    continue;
+                }
+                if let Some(ko) = iconst(func, other) {
+                    if !arm {
+                        return Some(ko == 0);
+                    }
+                    if ko == 0 {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        let ci = func.dfg.value_def(c).inst()?;
+        let InstructionData::IntCompare { opcode: Opcode::Icmp, cond: cc0, args: [a2, b2] } = func.dfg.insts[ci] else { return None };
+        let cc = if arm { cc0 } else { cc0.complement() };
+        let a = func.dfg.resolve_aliases(a2);
+        let b = func.dfg.resolve_aliases(b2);
+        let a = arg_map.get(&a).copied().unwrap_or(a);
+        let b = arg_map.get(&b).copied().unwrap_or(b);
+        if !func.dfg.value_is_valid(a) || !func.dfg.value_is_valid(b) {
+            return None;
+        }
+        let a = self.resolve_param(func, a);
+        let b = self.resolve_param(func, b);
+        for (a, b, cc) in [(a, b, cc), (b, a, cc.swap_args())] {
+            if a != x {
+                continue;
+            }
+            // Fact `x cc y` settles `x == y` for eq/ne/strict order.
+            if b == y {
+                return match cc {
+                    IntCC::Equal => Some(true),
+                    IntCC::NotEqual
+                    | IntCC::UnsignedLessThan
+                    | IntCC::UnsignedGreaterThan
+                    | IntCC::SignedLessThan
+                    | IntCC::SignedGreaterThan => Some(false),
+                    _ => None,
+                };
+            }
+            // `x cc k` settles `x == y` when `y` is a constant.
+            if let (Some(kb), Some(ky)) = (iconst(func, b), iconst(func, y)) {
+                return match cc {
+                    IntCC::Equal => Some(kb == ky),
+                    IntCC::NotEqual
+                    | IntCC::UnsignedLessThan
+                    | IntCC::UnsignedGreaterThan
+                    | IntCC::SignedLessThan
+                    | IntCC::SignedGreaterThan => {
+                        if kb == ky { Some(false) } else { None }
+                    }
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// `x == y` decided by dominating edge facts. Single-pred edges
+    /// prove relations on entry to their dest; a multi-pred block's
+    /// edges must all agree (the unproven edge would admit anything).
+    pub fn known_rel(&mut self, func: &Function, dt: &DominatorTree, x: Value, y: Value, at: Block) -> Option<bool> {
+        let x = self.resolve_param(func, x);
+        let y = self.resolve_param(func, y);
+        if x == y {
+            return Some(true);
+        }
+        let mut b = at;
+        let mut hops = 0;
+        loop {
+            if let Some((c, arm, arg_map)) = self.edge_fact.get(&b) {
+                let (c, arm, arg_map) = (*c, *arm, arg_map.clone());
+                if let Some(r) = self.edge_rel(func, c, arm, &arg_map, x, y) {
+                    return Some(r);
+                }
+            }
+            if let Some(edges) = self.edge_facts_multi.get(&b) {
+                let edges = edges.clone();
+                let mut verdict = None;
+                let mut ok = true;
+                for (c, arm, arg_map) in edges.iter() {
+                    match self.edge_rel(func, *c, *arm, arg_map, x, y) {
+                        Some(v) if verdict.is_none_or(|w| w == v) => verdict = Some(v),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    return verdict;
+                }
+            }
+            hops += 1;
+            if hops > MAX_FACT_HOPS {
+                return None;
+            }
+            match dt.idom(b) {
+                Some(i) => b = i,
+                None => return None,
+            }
+            if b == at {
+                return None;
+            }
         }
     }
 
@@ -874,6 +1101,21 @@ impl Ranges {
                 let (c, arm) = (*c, *arm);
                 let arg_map = arg_map.clone();
                 self.edge_diff(func, dt, c, arm, xb, yb, b, &arg_map, &mut lo, &mut hi);
+            }
+            if let Some(edges) = self.edge_facts_multi.get(&b) {
+                // Per-edge bounds are conditional on the arrival path:
+                // `D` at `b` is the union (widening) of them.
+                let edges = edges.clone();
+                let mut elo = i128::MAX;
+                let mut ehi = i128::MIN;
+                for (c, arm, arg_map) in edges.iter() {
+                    let (mut l, mut h) = (lo, hi);
+                    self.edge_diff(func, dt, *c, *arm, xb, yb, b, arg_map, &mut l, &mut h);
+                    elo = elo.min(l);
+                    ehi = ehi.max(h);
+                }
+                lo = elo;
+                hi = ehi;
             }
             hops += 1;
             if hops > DIFF_HOPS {
@@ -900,6 +1142,13 @@ impl Ranges {
     pub fn implied(&mut self, func: &Function, dt: &DominatorTree, cc: IntCC, x: Value, y: Value, at: Block) -> Option<bool> {
         let x = func.dfg.resolve_aliases(x);
         let y = func.dfg.resolve_aliases(y);
+        // eq/ne: edge facts (`x != bound` on every way in, `x == y`
+        // proven) decide what the intervals cannot.
+        if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some(eq) = self.known_rel(func, dt, x, y, at)
+        {
+            return Some(if cc == IntCC::Equal { eq } else { !eq });
+        }
         let bits = width(func.dfg.value_type(x))?;
         if Some(bits) != width(func.dfg.value_type(y)) {
             return None;
