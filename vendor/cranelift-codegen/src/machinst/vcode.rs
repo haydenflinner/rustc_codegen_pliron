@@ -1900,6 +1900,36 @@ impl<I: VCodeInst> VCode<I> {
         let mut ep_fused = 0usize;
         let mut ep_r2r = 0usize;
 
+        // PLIRON (`PLIRON_MCP=1`): post-alloc copy propagation — a
+        // reg-reg move whose destination provably already holds its
+        // source's value class is dead (the `mov x5,x2; mov x2,x5`
+        // residue parallel-move resolution leaves). `vclass` maps preg
+        // index to a value-class id; movs propagate the class, every
+        // other def freshens it, calls and block boundaries clear the
+        // map. LLVM's MachineCopyPropagation does the same sweep.
+        static MCP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mcp = *MCP.get_or_init(|| std::env::var("PLIRON_MCP").as_deref() == Ok("1"));
+        // PLIRON: only allocatable Int-class pregs participate. Float-class
+        // movs have mixed widths (`fmov d` zeroes the upper half, `fmov v`
+        // copies 128 bits) so a single class cannot represent equality for
+        // both; non-allocatable regs (sp, fp, lr, xzr, pinned) take writes
+        // that never appear as operand defs (writeback amodes in the
+        // prologue/epilogue), which would leave stale classes.
+        let mcp_allocset = if mcp {
+            Some(PRegSet::from(self.abi.machine_env()))
+        } else {
+            None
+        };
+        let mcp_key = |r: Reg| -> Option<Reg> {
+            let preg = r.to_real_reg()?;
+            (preg.class() == RegClass::Int
+                && mcp_allocset.as_ref().unwrap().contains(preg.into()))
+            .then_some(r)
+        };
+        let mut vclass: FxHashMap<Reg, u32> = FxHashMap::default();
+        let mut next_class = 1u32;
+        let mut mcp_dead = 0usize;
+
         static EPROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let eprof = *EPROF.get_or_init(|| std::env::var_os("PLIRON_EPROF").is_some());
         let mut t_inst = std::time::Duration::ZERO;
@@ -2314,6 +2344,7 @@ impl<I: VCodeInst> VCode<I> {
             let items: SmallVec<[InstOrEdit; 64]> =
                 regalloc.block_insts_and_edits(&self, block).collect();
             t_items += ti.elapsed();
+            vclass.clear();
 
             // PLIRON: when this block unconditionally branches to the next
             // emitted block and that block is a loop header, skip the jump
@@ -2894,12 +2925,62 @@ impl<I: VCodeInst> VCode<I> {
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);
 
                             // Emit the instruction!
-                            do_emit(
-                                &self.insts[iix.index()],
-                                &mut disasm,
-                                &mut buffer,
-                                &mut state,
-                            );
+                            let mut dead_mov = false;
+                            if mcp {
+                                if let Some((wd, ws)) = self.insts[iix.index()].is_move() {
+                                    let (d, s) = (wd.to_reg(), ws);
+                                    match (mcp_key(d), mcp_key(s)) {
+                                        (Some(dk), Some(sk))
+                                            if d != s
+                                                && vclass.contains_key(&dk)
+                                                && vclass.get(&dk) == vclass.get(&sk) =>
+                                        {
+                                            mcp_dead += 1;
+                                            dead_mov = true;
+                                        }
+                                        (Some(dk), sk) => {
+                                            let sc = match sk {
+                                                Some(sk) => *vclass
+                                                    .entry(sk)
+                                                    .or_insert_with(|| {
+                                                        next_class += 1;
+                                                        next_class
+                                                    }),
+                                                // Source untracked: the dest
+                                                // gets a fresh class rather
+                                                // than an untracked one.
+                                                None => {
+                                                    next_class += 1;
+                                                    next_class
+                                                }
+                                            };
+                                            vclass.insert(dk, sc);
+                                        }
+                                        (None, _) => {}
+                                    }
+                                } else if self.insts[iix.index()].call_type()
+                                    != CallType::None
+                                {
+                                    vclass.clear();
+                                } else {
+                                    for &d in &preg_ops[iix.index()].1 {
+                                        if mcp_key(d).is_some() {
+                                            next_class += 1;
+                                            vclass.insert(d, next_class);
+                                        } else {
+                                            vclass.remove(&d);
+                                        }
+                                    }
+                                }
+                            }
+                            if !dead_mov {
+                                do_emit(
+                                    &self.insts[iix.index()],
+                                    &mut disasm,
+                                    &mut buffer,
+                                    &mut state,
+                                );
+                            }
 
                             if debug_tag_pos == MachDebugTagPos::Post {
                                 place_debug_tags(&self, debug_tag_pos, &mut buffer);
@@ -2977,6 +3058,26 @@ impl<I: VCodeInst> VCode<I> {
                                     }
                                     if let Some(fused) = m1.fuse_with_next(&m2, &state) {
                                         ep_fused += 1;
+                                        if mcp {
+                                            // The pair writes both reload
+                                            // dests; freshen each so later
+                                            // movs don't dedup against a
+                                            // stale class.
+                                            for e in [edit, e2] {
+                                                let Edit::Move { to, .. } = e;
+                                                if let Some(t) = to.as_reg() {
+                                                    let tr = Reg::from(t);
+                                                    if mcp_key(tr).is_some() {
+                                                        next_class += 1;
+                                                        vclass.insert(
+                                                            tr, next_class,
+                                                        );
+                                                    } else {
+                                                        vclass.remove(&tr);
+                                                    }
+                                                }
+                                            }
+                                        }
                                         do_emit(&fused, &mut disasm, &mut buffer, &mut state);
                                         k += 2;
                                         continue;
@@ -2990,12 +3091,49 @@ impl<I: VCodeInst> VCode<I> {
                             (Some(from), Some(to)) => {
                                 // Reg-to-reg move.
                                 ep_r2r += 1;
-                                let from_rreg = Reg::from(from);
-                                let to_rreg = Writable::from_reg(Reg::from(to));
-                                debug_assert_eq!(from.class(), to.class());
-                                let ty = I::canonical_type_for_rc(from.class());
-                                let mv = I::gen_move(to_rreg, from_rreg, ty);
-                                do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                let (srcreg, dstreg) =
+                                    (Reg::from(from), Reg::from(to));
+                                match mcp
+                                    .then(|| (mcp_key(dstreg), mcp_key(srcreg)))
+                                    .unwrap_or((None, None))
+                                {
+                                    (Some(dk), Some(sk))
+                                        if from != to
+                                            && vclass.contains_key(&dk)
+                                            && vclass.get(&dk) == vclass.get(&sk) =>
+                                    {
+                                        mcp_dead += 1;
+                                    }
+                                    (Some(dk), sk) => {
+                                        let sc = match sk {
+                                            Some(sk) => {
+                                                *vclass.entry(sk).or_insert_with(|| {
+                                                    next_class += 1;
+                                                    next_class
+                                                })
+                                            }
+                                            None => {
+                                                next_class += 1;
+                                                next_class
+                                            }
+                                        };
+                                        vclass.insert(dk, sc);
+                                        let from_rreg = Reg::from(from);
+                                        let to_rreg = Writable::from_reg(Reg::from(to));
+                                        debug_assert_eq!(from.class(), to.class());
+                                        let ty = I::canonical_type_for_rc(from.class());
+                                        let mv = I::gen_move(to_rreg, from_rreg, ty);
+                                        do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                    }
+                                    _ => {
+                                        let from_rreg = Reg::from(from);
+                                        let to_rreg = Writable::from_reg(Reg::from(to));
+                                        debug_assert_eq!(from.class(), to.class());
+                                        let ty = I::canonical_type_for_rc(from.class());
+                                        let mv = I::gen_move(to_rreg, from_rreg, ty);
+                                        do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                    }
+                                }
                             }
                             (Some(from), None) => {
                                 // Spill from register to spillslot.
@@ -3009,6 +3147,15 @@ impl<I: VCodeInst> VCode<I> {
                             (None, Some(to)) => {
                                 // Load from spillslot to register.
                                 let from = from.as_stack().unwrap();
+                                if mcp {
+                                    let tr = Reg::from(to);
+                                    if mcp_key(tr).is_some() {
+                                        next_class += 1;
+                                        vclass.insert(tr, next_class);
+                                    } else {
+                                        vclass.remove(&tr);
+                                    }
+                                }
                                 let to_rreg = Writable::from_reg(RealReg::from(to));
                                 if let Some(r) = remat_inst(edit, to) {
                                     do_emit(&r, &mut disasm, &mut buffer, &mut state);
@@ -3122,7 +3269,7 @@ impl<I: VCodeInst> VCode<I> {
         let t_fin = ti.elapsed();
         if eprof {
             eprintln!(
-                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?} ep={ep_mem}/{ep_next}/{ep_dir}/{ep_fused} r2r={ep_r2r}"
+                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?} ep={ep_mem}/{ep_next}/{ep_dir}/{ep_fused} r2r={ep_r2r} mcp={mcp_dead}"
             );
         }
 

@@ -1403,3 +1403,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `stp/ldp [x29, #-0x..]` pairs (2202 -> 2164 insns). Pairs with
     `PLIRON_RA2_SLOTPAIR` in vendored regalloc2, which repacks
     pairing-edge chains to the top of the spillslot area.
+
+112. `PLIRON_MCP=1` (runtime, opt-in; `VCode::emit`): post-allocation
+    copy propagation — an LLVM MachineCopyPropagation analogue. A
+    per-emitted-block map preg -> value-class: `mov d,s` propagates
+    s's class to d (and is skipped when d already holds it), any other
+    operand def freshens the dest's class, calls and block boundaries
+    clear the map. Only allocatable Int-class pregs participate:
+    Float-class movs have mixed widths (`fmov d` zeroes the upper
+    half, `fmov v` copies 128 bits) so one class cannot express
+    equality for both, and non-allocatable regs (sp/fp/lr/xzr) take
+    writes that never appear as operand defs (SP writeback amodes in
+    prologue/epilogue code). Both dests of a fused `ldp` edit pair are
+    freshened — the `k += 2` skip would otherwise leave the second
+    edit's dest stale (this was a real miscompile found by fuzz seed
+    5042: a restore mov was deleted and a store used stale data as its
+    base). ~214 dead movs crate-wide on rust-compression.
