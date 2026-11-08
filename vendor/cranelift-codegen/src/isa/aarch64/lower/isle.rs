@@ -1127,10 +1127,10 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             || !self.lower_ctx.value_has_multiple_uses(val)
     }
 
-    /// PLIRON: `PLIRON_TBNZ_IREDUCE=1` (opt-in), see `lower.isle`.
+    /// PLIRON: `PLIRON_TBNZ_IREDUCE=0` off (default on), see `lower.isle`.
     fn tbnz_ireduce_on(&mut self, _bit: u64) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_TBNZ_IREDUCE").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_TBNZ_IREDUCE").as_deref() != Ok("0"))
     }
 
     fn narrowext_on(&mut self, bit: u64) -> bool {

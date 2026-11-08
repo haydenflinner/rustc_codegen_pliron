@@ -42,12 +42,12 @@ use cranelift_entity::{Keys, entity_impl};
 type EdgeKey = (SmallVec<[(Allocation, Allocation); 4]>, BlockIndex, bool);
 
 /// PLIRON: a `PLIRON_*` mode knob for EDGEMERGE/EPIMERGE. Unset defaults
-/// to mode `1` (placement-aware merge); `0` is off; a digit is itself;
-/// anything else is 1. Matches `pliron_cfg::DEFAULT_VALUES`.
-fn pliron_mode(var: &str) -> u8 {
+/// to `default`; `0` is off; a digit is itself; anything else is the
+/// default. Matches `pliron_cfg::DEFAULT_VALUES`.
+fn pliron_mode(var: &str, default: u8) -> u8 {
     match std::env::var(var) {
-        Err(_) => 1,
-        Ok(v) => v.parse::<u8>().unwrap_or(1),
+        Err(_) => default,
+        Ok(v) => v.parse::<u8>().unwrap_or(default),
     }
 }
 
@@ -2025,7 +2025,7 @@ impl<I: VCodeInst> VCode<I> {
         // into its own successor, unless it is cold: merging it would put
         // that path on an extra taken branch. `=2` merges every dup.
         static EDGEMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let edgemerge = *EDGEMERGE.get_or_init(|| pliron_mode("PLIRON_EDGEMERGE"));
+        let edgemerge = *EDGEMERGE.get_or_init(|| pliron_mode("PLIRON_EDGEMERGE", 3));
         let mut merged = vec![false; self.num_blocks()];
         // `PLIRON_EDGEMERGE=3`: like 2 (merge every duplicate) except for
         // blocks inside a loop, approximated as the emission-order interval
@@ -2107,7 +2107,7 @@ impl<I: VCodeInst> VCode<I> {
         // (a hot leaf like `fib`'s base case pays a taken branch); `=2`
         // merges every return.
         static EPIMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE"));
+        let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE", 2));
         let mut epi_label: Option<MachLabel> = None;
         let shrink = self.pliron_shrink_wrap(regalloc, &final_order);
 

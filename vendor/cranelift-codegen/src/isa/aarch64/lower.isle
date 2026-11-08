@@ -4026,7 +4026,7 @@
   (if-let bit (test_and_compare_bit_const ty n))
   (emit_side_effect (tbz taken not_taken x bit)))
 
-;; PLIRON (`PLIRON_TBNZ_IREDUCE=1`, opt-in): `brif (band (ireduce y), 2^k)` with
+;; PLIRON (`PLIRON_TBNZ_IREDUCE=0` off, default on): `brif (band (ireduce y), 2^k)` with
 ;; k inside the narrow type tests bit k of `y`'s own register: the `uxtb`/`uxth`
 ;; the `ireduce` rule materializes only clears bits `tbnz` never reads
 ;; (`bl f; uxtb w3,w2; tbnz w3,#0` x149 in regex-syntax).

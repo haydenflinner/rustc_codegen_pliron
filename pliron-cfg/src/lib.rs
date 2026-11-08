@@ -26,9 +26,10 @@ pub struct PassConfig {
 /// never `env_set` (presence would count `=0` as on). The vendored
 /// Cranelift reads `PLIRON_REMAT_SADDR`, `PLIRON_REMATCALL`,
 /// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE`,
-/// `PLIRON_EPIMERGE` and `PLIRON_JT_NARROW` itself and defaults them the
-/// same way (booleans on unless `=0`; EDGEMERGE/EPIMERGE mode `1` when
-/// unset). Validation: docs/history/2026-10-27-defaults.md,
+/// `PLIRON_EPIMERGE`, `PLIRON_TBNZ_IREDUCE`, `PLIRON_EDITPAIR`,
+/// `PLIRON_MCP` and `PLIRON_JT_NARROW` itself and defaults them the
+/// same way (on unless `=0`; EDGEMERGE/EPIMERGE take their mode default
+/// when unset). Validation: docs/history/2026-10-27-defaults.md,
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
@@ -172,9 +173,10 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // 5.73x → 2.17x on regex-wasm CODE; hash_one-style leaves still inline.
     ("PLIRON_WASM_HOTLEAF", "1"),
     // Edge/epilogue merge modes (vendored Cranelift `pliron_mode` also
-    // defaults unset → 1; `=0` off, `=2` merge-everything).
-    ("PLIRON_EDGEMERGE", "1"),
-    ("PLIRON_EPIMERGE", "1"),
+    // defaults unset the same way; `=0` off, `=1` placement-aware merge,
+    // `=2` merge-everything, EDGEMERGE `=3` merge-everything-outside-loops).
+    ("PLIRON_EDGEMERGE", "3"),
+    ("PLIRON_EPIMERGE", "2"),
     // Cap inlining of high-fan-in callees (2026-10-27-ir-size.md). lockf
     // ctime: FANIN=8 cut syn text 1.94→1.46x / RSS 1.81→1.52x. `=0` off.
     ("PLIRON_INLINE_FANIN", "8"),
