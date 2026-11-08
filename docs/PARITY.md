@@ -394,7 +394,9 @@ Ranked by expected card gain per effort. Each item links its evidence.
 2. ~~Validate and flip the pending size flags~~ — done 2026-11-09:
    `EDGEMERGE=3`/`EPIMERGE=2`/`TBNZ_IREDUCE` default-on (`3bbb029`),
    `SROA_MAXSLICES=18` rejected (borderline regression),
-   `LIBCALL_DIRECT` held on an unexplained html-rewriter regression.
+   `LIBCALL_DIRECT` flipped on (`812b317`) after randomized-layout
+   reruns showed both flagged regressions were layout noise
+   (`lib/pliron` 1.005 geomean vs `aa` 1.001; blind-sig deep run 1.001).
    Full table in `history/2026-11-09-mcp-sibling-pulldown.md`.
 3. **Size/cold gates on duplicating passes**: `punroll`, peeling,
    `jumpthread`, `looprot` and the `MEMFAST` fast path, gated on cold
