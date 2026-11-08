@@ -490,7 +490,26 @@ impl Ranges {
         let m = umask(bits);
         Some(match cc {
             IntCC::Equal => o,
-            IntCC::NotEqual => return None,
+            // `x != k` tightens one side only when k sits at a domain
+            // edge: != 0 / != umax bound the unsigned side, != smin /
+            // != smax the signed. Anything else is not an interval.
+            IntCC::NotEqual => {
+                let k = o.is_const()?;
+                if k == 0 {
+                    Range::unsigned(bits, 1, m)
+                } else if k == m {
+                    Range::unsigned(bits, 0, m - 1)
+                } else {
+                    let sk = sext(k, bits);
+                    if sk == smin(bits) {
+                        Range::signed(bits, smin(bits) + 1, smax(bits))
+                    } else if sk == smax(bits) {
+                        Range::signed(bits, smin(bits), smax(bits) - 1)
+                    } else {
+                        return None;
+                    }
+                }
+            }
             IntCC::UnsignedLessThan => Range::unsigned(bits, 0, o.uhi.checked_sub(1)?),
             IntCC::UnsignedLessThanOrEqual => Range::unsigned(bits, 0, o.uhi),
             IntCC::UnsignedGreaterThan => Range::unsigned(bits, o.ulo.checked_add(1).filter(|&x| x <= m)?, m),
