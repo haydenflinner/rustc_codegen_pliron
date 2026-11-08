@@ -28,6 +28,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const MAX_DEPTH: u32 = 12;
 const MAX_WORK: usize = 200_000;
 const MAX_FACT_HOPS: usize = 48;
+/// `iadd`/`isub`-const chain peel and `lin` recursion limits for the
+/// correlated-difference machinery (`implied`).
+const STRIP_DEPTH: u32 = 8;
+const LIN_DEPTH: u32 = 3;
+const DIFF_HOPS: usize = 16;
 
 /// Interval of a `bits`-wide integer, as unsigned and as signed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,8 +127,10 @@ pub struct Ranges {
     visiting: FxHashSet<Value>,
     work: usize,
     /// Per block: the single-pred `brif` fact that holds on entry:
-    /// (cond value, arm taken).
-    edge_fact: FxHashMap<Block, (Value, bool)>,
+    /// (cond value, arm taken, branch-arg → block-param bindings).
+    /// Compared values that cross the edge as arguments get renamed to
+    /// the param so facts reach the param's uses.
+    edge_fact: FxHashMap<Block, (Value, bool, FxHashMap<Value, Value>)>,
 }
 
 fn width(ty: Type) -> Option<u32> {
@@ -140,6 +147,53 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
+/// `v` with `iadd`/`isub`-by-constant peeled: `(base, off)` with machine
+/// `v = base + off`. Pure syntactic strip; wrap checks are the callers'
+/// (`fits`). Depth-bounded for the `x+1+1+…` chains unrolling leaves.
+fn strip_add(func: &Function, mut v: Value, mut depth: u32) -> (Value, i128) {
+    let mut off: i128 = 0;
+    loop {
+        v = func.dfg.resolve_aliases(v);
+        if depth == 0 {
+            return (v, off);
+        }
+        depth -= 1;
+        let bits = func.dfg.value_type(v).bits();
+        let next = match func.dfg.value_def(v) {
+            ValueDef::Result(i, _) => match func.dfg.insts[i] {
+                InstructionData::Binary { opcode: Opcode::Iadd, args: [x, y] } => {
+                    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+                    if let Some(k) = iconst(func, y) {
+                        Some((x, k, false))
+                    } else {
+                        iconst(func, x).map(|k| (y, k, false))
+                    }
+                }
+                InstructionData::Binary { opcode: Opcode::Isub, args: [x, y] } => {
+                    iconst(func, func.dfg.resolve_aliases(y))
+                        .map(|k| (func.dfg.resolve_aliases(x), k, true))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((nv, k, neg)) = next else { return (v, off) };
+        v = nv;
+        let k = sext((k as u64) & umask(bits), bits) as i128;
+        off += if neg { -k } else { k };
+    }
+}
+
+/// `base + off` stays in `0..=m` for `base`'s whole range — the machine
+/// `iadd`/`isub` then equals the integer sum.
+fn fits(m: u64, r: &Range, off: i128) -> bool {
+    if off >= 0 {
+        r.uhi as i128 + off <= m as i128
+    } else {
+        r.ulo as i128 + off >= 0
+    }
+}
+
 impl Ranges {
     pub fn new(func: &Function, cfg: &ControlFlowGraph) -> Ranges {
         let mut edge_fact = FxHashMap::default();
@@ -152,8 +206,23 @@ impl Ranges {
                 if d0 == d1 {
                     continue;
                 }
-                let arm = if d0 == b { true } else if d1 == b { false } else { continue };
-                edge_fact.insert(b, (func.dfg.resolve_aliases(arg), arm));
+                let (arm, bc) = if d0 == b {
+                    (true, &blocks[0])
+                } else if d1 == b {
+                    (false, &blocks[1])
+                } else {
+                    continue;
+                };
+                let mut arg_map = FxHashMap::default();
+                let params = func.dfg.block_params(b);
+                for (i, ba) in bc.args(&func.dfg.value_lists).enumerate() {
+                    if let (cranelift_codegen::ir::BlockArg::Value(v), Some(&pv)) =
+                        (ba, params.get(i))
+                    {
+                        arg_map.insert(func.dfg.resolve_aliases(v), pv);
+                    }
+                }
+                edge_fact.insert(b, (func.dfg.resolve_aliases(arg), arm, arg_map));
             }
         }
         Ranges { memo: FxHashMap::default(), visiting: FxHashSet::default(), work: 0, edge_fact }
@@ -449,8 +518,12 @@ impl Ranges {
         let mut b = at;
         let mut hops = 0;
         loop {
-            if let Some(&(c, arm)) = self.edge_fact.get(&b) {
-                if let Some(f) = self.fact(func, c, arm, v, bits) {
+            let ef = self
+                .edge_fact
+                .get(&b)
+                .map(|(c, arm, m)| (*c, *arm, m.clone()));
+            if let Some((c, arm, arg_map)) = ef {
+                if let Some(f) = self.fact(func, c, arm, v, bits, &arg_map) {
                     if let Some(m) = r.meet(&f) {
                         r = m;
                     }
@@ -471,13 +544,17 @@ impl Ranges {
         r
     }
 
-    /// What `brif c` taking arm `arm` says about `v`.
-    fn fact(&mut self, func: &Function, c: Value, arm: bool, v: Value, bits: u32) -> Option<Range> {
+    /// What `brif c` taking arm `arm` says about `v`. `arg_map` renames
+    /// the edge's branch args to the dest block's params so the fact
+    /// reaches values bound on the edge.
+    fn fact(&mut self, func: &Function, c: Value, arm: bool, v: Value, bits: u32, arg_map: &FxHashMap<Value, Value>) -> Option<Range> {
         let ci = func.dfg.value_def(c).inst()?;
         let (cc, x, y) = match func.dfg.insts[ci] {
             InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args: [x, y] } => (cond, func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y)),
             _ => return None,
         };
+        let x = arg_map.get(&x).copied().unwrap_or(x);
+        let y = arg_map.get(&y).copied().unwrap_or(y);
         let (cc, other) = if x == v {
             (cc, y)
         } else if y == v {
@@ -519,6 +596,344 @@ impl Ranges {
             IntCC::SignedGreaterThan => Range::signed(bits, o.slo.checked_add(1)?, smax(bits)),
             IntCC::SignedGreaterThanOrEqual => Range::signed(bits, o.slo, smax(bits)),
         })
+    }
+
+    // ---- correlated-difference facts ----
+    //
+    // `at()` refines one value at a time; it cannot use a dominating
+    // `idx < end - min(end, k)` guard to decide `idx + j < end`.
+    // `implied` instead treats each dominating edge compare as an
+    // integer inequality and bounds `D = yb - xb`, which decides the
+    // sign of `x - y = (kx - ky) - D` for `x = xb + kx`, `y = yb + ky`.
+    // Every reconstructed side needs a no-wrap certificate (`fits` on
+    // the `at()`-refined range): machine `b + k` equals the integer
+    // `b + k` only when `b`'s range plus `k` stays inside `0..=m`.
+
+    /// `v` as the integer `cx·xb + cy·yb + t` evaluated at `cb`, or
+    /// None. `cx`/`cy` are small (usually ±1); constructions that can
+    /// wrap or aren't affine in the bases fail.
+    fn lin(&mut self, func: &Function, dt: &DominatorTree, v: Value, xb: Value, yb: Value, cb: Block, depth: u32) -> Option<(i32, i32, i128)> {
+        let v = func.dfg.resolve_aliases(v);
+        if v == xb {
+            return Some((1, 0, 0));
+        }
+        if v == yb {
+            return Some((0, 1, 0));
+        }
+        let v = self.resolve_param(func, v);
+        if v == xb {
+            return Some((1, 0, 0));
+        }
+        if v == yb {
+            return Some((0, 1, 0));
+        }
+        let bits = width(func.dfg.value_type(v))?;
+        let r = self.at(func, dt, v, cb);
+        if let Some(k) = r.is_const() {
+            return Some((0, 0, k as i128));
+        }
+        if depth == 0 {
+            return None;
+        }
+        let (b, o) = strip_add(func, v, STRIP_DEPTH);
+        if b != v {
+            if !fits(umask(bits), &self.at(func, dt, b, cb), o) {
+                return None;
+            }
+            let (cx, cy, t) = self.lin(func, dt, b, xb, yb, cb, depth - 1)?;
+            return Some((cx, cy, t + o));
+        }
+        if let ValueDef::Result(i, _) = func.dfg.value_def(v)
+            && let InstructionData::Binary { opcode: Opcode::Isub, args: [p, q] } = func.dfg.insts[i]
+        {
+            let (p, q) = (func.dfg.resolve_aliases(p), func.dfg.resolve_aliases(q));
+            if self.no_wrap_sub(func, p, q) {
+                let (cx1, cy1, t1) = self.lin(func, dt, p, xb, yb, cb, depth - 1)?;
+                let (cx2, cy2, t2) = self.lin(func, dt, q, xb, yb, cb, depth - 1)?;
+                return Some((cx1 - cx2, cy1 - cy2, t1 - t2));
+            }
+        }
+        None
+    }
+
+    /// `isub p, q` computes the nonnegative integer `p - q` (no wrap):
+    /// `q <= p` for every value, from ranges or `q`'s shape.
+    fn no_wrap_sub(&mut self, func: &Function, p: Value, q: Value) -> bool {
+        if self.def(func, q).uhi <= self.def(func, p).ulo {
+            return true;
+        }
+        let (p, q) = (func.dfg.resolve_aliases(p), func.dfg.resolve_aliases(q));
+        let ValueDef::Result(i, _) = func.dfg.value_def(q) else { return false };
+        match func.dfg.insts[i] {
+            // `min(p,·) <= p`, `p & · <= p`, `p % · <= p`, `p >> · <= p`.
+            InstructionData::Binary { opcode, args: [x, y] } => {
+                let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+                match opcode {
+                    Opcode::Umin | Opcode::Band | Opcode::Urem => x == p || y == p,
+                    Opcode::Ushr => x == p,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `q` is `umin(p, k)`: the value `q` is forced to whenever
+    /// `p - q > 0` is known (satisfiability: `p - min(p,k) >= 1` needs
+    /// `p > k`, so `min(p,k) = k`).
+    fn umin_bound(&self, func: &Function, p: Value, q: Value) -> Option<i64> {
+        let p = func.dfg.resolve_aliases(p);
+        let ValueDef::Result(i, _) = func.dfg.value_def(func.dfg.resolve_aliases(q)) else { return None };
+        if let InstructionData::Binary { opcode: Opcode::Umin, args: [x, y] } = func.dfg.insts[i] {
+            let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+            if x == p {
+                return iconst(func, y);
+            }
+            if y == p {
+                return iconst(func, x);
+            }
+        }
+        None
+    }
+
+    /// `A - B` expressed in `D = yb - xb`: returns `(cy, t)` with
+    /// `A - B = cy·D + t`, `cy` ±1 — the only coefficients that decide
+    /// the sign from a `D` bound.
+    fn diff_term(&mut self, func: &Function, dt: &DominatorTree, a: Value, b: Value, xb: Value, yb: Value, cb: Block) -> Option<(i32, i128)> {
+        let (cxa, cya, ta) = self.lin(func, dt, a, xb, yb, cb, LIN_DEPTH)?;
+        let (cxb, cyb, tb) = self.lin(func, dt, b, xb, yb, cb, LIN_DEPTH)?;
+        let (cx, cy) = (cxa - cxb, cya - cyb);
+        if cx + cy != 0 || cy.abs() != 1 {
+            return None;
+        }
+        Some((cy, ta - tb))
+    }
+
+    /// `A cc (P - Q)`: `P - Q` a certified nonnegative integer whose
+    /// `lin` failed (the `umin`-clamped remainder idiom). Bounds `D`
+    /// through `P - A` vs `Q`'s range.
+    fn sub_diff(&mut self, func: &Function, dt: &DominatorTree, a: Value, b: Value, cc: IntCC, xb: Value, yb: Value, cb: Block, lo: &mut i128, hi: &mut i128) {
+        let b = self.resolve_param(func, b);
+        let ValueDef::Result(i, _) = func.dfg.value_def(b) else { return };
+        let InstructionData::Binary { opcode: Opcode::Isub, args: [p, q] } = func.dfg.insts[i] else { return };
+        let (p, q) = (func.dfg.resolve_aliases(p), func.dfg.resolve_aliases(q));
+        if !self.no_wrap_sub(func, p, q) {
+            return;
+        }
+        let Some((1, 0, at_)) = self.lin(func, dt, a, xb, yb, cb, LIN_DEPTH) else { return };
+        let Some((0, 1, pt)) = self.lin(func, dt, p, xb, yb, cb, LIN_DEPTH) else { return };
+        // `A cc (P - Q)` ⇔ `A + Q - P cc 0` ⇔ `Q - (D + pt - at_) cc 0`
+        // — bounds on `Q` transfer to `D`. `e = at_ - pt`.
+        let e = at_ - pt;
+        let rq = self.at(func, dt, q, cb);
+        let (mut qlo, qhi) = (rq.ulo as i128, rq.uhi as i128);
+        match cc {
+            // `A < P - Q` ⇒ `P - A > Q` ⇒ `D + pt - at_ >= Q + 1`; with
+            // `q = umin(p, k)` satisfiability forces `q = k`.
+            IntCC::UnsignedLessThan => {
+                if let Some(k) = self.umin_bound(func, p, q) {
+                    qlo = qlo.max(k as i128);
+                }
+                *lo = (*lo).max(e + qlo + 1)
+            }
+            IntCC::UnsignedLessThanOrEqual => *lo = (*lo).max(e + qlo),
+            // `A >= P - Q` ⇔ `P - A <= Q` ⇒ `D <= at_ - pt + qhi`.
+            IntCC::UnsignedGreaterThanOrEqual => *hi = (*hi).min(e + qhi),
+            IntCC::UnsignedGreaterThan => *hi = (*hi).min(e + qhi - 1),
+            // `A = P - Q` ⇔ `D = at_ - pt + Q`.
+            IntCC::Equal => {
+                *lo = (*lo).max(e + qlo);
+                *hi = (*hi).min(e + qhi);
+            }
+            _ => {}
+        }
+    }
+
+    /// `cy·D + t cc 0` narrows `[lo, hi]` for `D`.
+    fn cmp_bound(cc: IntCC, cy: i32, t: i128, lo: &mut i128, hi: &mut i128) {
+        match (cy, cc) {
+            (1, IntCC::UnsignedLessThan) => *hi = (*hi).min(-t - 1),
+            (1, IntCC::UnsignedLessThanOrEqual) => *hi = (*hi).min(-t),
+            (1, IntCC::UnsignedGreaterThan) => *lo = (*lo).max(-t + 1),
+            (1, IntCC::UnsignedGreaterThanOrEqual) => *lo = (*lo).max(-t),
+            (-1, IntCC::UnsignedLessThan) => *lo = (*lo).max(t + 1),
+            (-1, IntCC::UnsignedLessThanOrEqual) => *lo = (*lo).max(t),
+            (-1, IntCC::UnsignedGreaterThan) => *hi = (*hi).min(t - 1),
+            (-1, IntCC::UnsignedGreaterThanOrEqual) => *hi = (*hi).min(t),
+            (_, IntCC::Equal) => {
+                let d = if cy == 1 { -t } else { t };
+                *lo = (*lo).max(d);
+                *hi = (*hi).min(d);
+            }
+            _ => {}
+        }
+    }
+
+    /// `v` behind single-source block-param bindings: when a param's
+    /// non-self incoming args all name one value, the param is that
+    /// value for analysis purposes. Bounded chain.
+    fn resolve_param(&self, func: &Function, mut v: Value) -> Value {
+        for _ in 0..8 {
+            v = func.dfg.resolve_aliases(v);
+            let ValueDef::Param(b, idx) = func.dfg.value_def(v) else { return v };
+            let mut want = None;
+            for a in self.incoming(func, b, idx) {
+                let a = func.dfg.resolve_aliases(a);
+                if a == v {
+                    continue;
+                }
+                match want {
+                    None => want = Some(a),
+                    Some(w) if w == a => {}
+                    _ => return v,
+                }
+            }
+            match want {
+                Some(w) => v = w,
+                None => return v,
+            }
+        }
+        v
+    }
+
+    /// One dominating edge compare's contribution to `[lo, hi]` for
+    /// `D = yb - xb` at edge-dest block `cb`.
+    fn edge_diff(&mut self, func: &Function, dt: &DominatorTree, c: Value, arm: bool, xb: Value, yb: Value, cb: Block, arg_map: &FxHashMap<Value, Value>, lo: &mut i128, hi: &mut i128) {
+        let Some(ci) = func.dfg.value_def(func.dfg.resolve_aliases(c)).inst() else { return };
+        let InstructionData::IntCompare { opcode: Opcode::Icmp, cond: cc0, args: [a2, b2] } = func.dfg.insts[ci] else { return };
+        let cc0 = if arm { cc0 } else { cc0.complement() };
+        for (a, b, cc) in [(a2, b2, cc0), (b2, a2, cc0.swap_args())] {
+            let a = arg_map.get(&a).copied().unwrap_or(a);
+            let b = arg_map.get(&b).copied().unwrap_or(b);
+            if let Some((cy, t)) = self.diff_term(func, dt, a, b, xb, yb, cb) {
+                Self::cmp_bound(cc, cy, t, lo, hi);
+                continue;
+            }
+            self.sub_diff(func, dt, a, b, cc, xb, yb, cb, lo, hi);
+        }
+    }
+
+    /// Integer bounds `[lo, hi]` on `yb - xb` at `at`: the `at()` ranges
+    /// plus every dominating edge compare that mentions the bases.
+    fn diff_bounds(&mut self, func: &Function, dt: &DominatorTree, xb: Value, yb: Value, rx: &Range, ry: &Range, at: Block) -> (i128, i128) {
+        let mut lo = ry.ulo as i128 - rx.uhi as i128;
+        let mut hi = ry.uhi as i128 - rx.ulo as i128;
+        let mut b = at;
+        let mut hops = 0;
+        loop {
+            if let Some((c, arm, arg_map)) = self.edge_fact.get(&b) {
+                let (c, arm) = (*c, *arm);
+                let arg_map = arg_map.clone();
+                self.edge_diff(func, dt, c, arm, xb, yb, b, &arg_map, &mut lo, &mut hi);
+            }
+            hops += 1;
+            if hops > DIFF_HOPS {
+                break;
+            }
+            match dt.idom(b) {
+                Some(i) => b = i,
+                None => break,
+            }
+            if b == at {
+                break;
+            }
+        }
+        (lo, hi)
+    }
+
+    /// `x cc y` at `at` decided by correlated facts. `x = xb + kx`,
+    /// `y = yb + ky` non-wrapping at `at` makes `x - y` the integer
+    /// `(kx - ky) - D` with `D = yb - xb`; unsigned compares are plain
+    /// sign tests on that difference. The `D` bounds themselves certify
+    /// the strips: `D >= d` gives `xb <= yb - d`, so `kx <= d` cannot
+    /// wrap even when `xb`'s own range is full. Signed compares need
+    /// signed-range reasoning not done here.
+    pub fn implied(&mut self, func: &Function, dt: &DominatorTree, cc: IntCC, x: Value, y: Value, at: Block) -> Option<bool> {
+        let x = func.dfg.resolve_aliases(x);
+        let y = func.dfg.resolve_aliases(y);
+        let bits = width(func.dfg.value_type(x))?;
+        if Some(bits) != width(func.dfg.value_type(y)) {
+            return None;
+        }
+        let m = umask(bits) as i128;
+        let (xb, kx) = strip_add(func, x, STRIP_DEPTH);
+        let (yb, ky) = strip_add(func, y, STRIP_DEPTH);
+        let (rx, ry) = (self.at(func, dt, xb, at), self.at(func, dt, yb, at));
+        let (lo, hi) = if xb == yb {
+            (0, 0)
+        } else {
+            self.diff_bounds(func, dt, xb, yb, &rx, &ry, at)
+        };
+        // Effective base ranges under the `D` bounds: `xb <= yb - lo`
+        // etc. `x = xb + kx` is non-wrapping iff the whole effective
+        // interval shifted by `kx` stays in `0..=m`.
+        let xlo = (rx.ulo as i128).max(ry.ulo as i128 - hi);
+        let xhi = (rx.uhi as i128).min(ry.uhi as i128 - lo);
+        let ylo = (ry.ulo as i128).max(rx.ulo as i128 + lo);
+        let yhi = (ry.uhi as i128).min(rx.uhi as i128 + hi);
+        if xlo + kx < 0 || xhi + kx > m || ylo + ky < 0 || yhi + ky > m {
+            return None;
+        }
+        let c = kx - ky;
+        // `x - y ∈ [c - hi, c - lo]` (integer).
+        let (rlo, rhi) = (c - hi, c - lo);
+        match cc {
+            IntCC::UnsignedLessThan => {
+                if rhi < 0 {
+                    Some(true)
+                } else if rlo >= 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            IntCC::UnsignedLessThanOrEqual => {
+                if rhi <= 0 {
+                    Some(true)
+                } else if rlo > 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            IntCC::UnsignedGreaterThan => {
+                if rlo > 0 {
+                    Some(true)
+                } else if rhi <= 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            IntCC::UnsignedGreaterThanOrEqual => {
+                if rlo >= 0 {
+                    Some(true)
+                } else if rhi < 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            IntCC::Equal => {
+                if rlo == 0 && rhi == 0 {
+                    Some(true)
+                } else if rlo > 0 || rhi < 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            IntCC::NotEqual => {
+                if rlo > 0 || rhi < 0 {
+                    Some(true)
+                } else if rlo == 0 && rhi == 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 

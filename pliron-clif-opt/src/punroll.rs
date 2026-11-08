@@ -1380,7 +1380,7 @@ fn run_loop(
     // args re-bind h's params on the backedge — the latch `cont` edge, the
     // condback latch's h edge, or the rotated `jump h` call.
     let mut demoted = false;
-    let (test_i, texit_bc, tcpos, back_bc, cnt, hparams, cont_args) = loop {
+    let (texit_bc, tcpos, back_bc, cnt, hparams) = loop {
         let (ti, te, tp, bb) = if rotated {
             let tt = top_test.as_ref().unwrap();
             (
@@ -1408,7 +1408,7 @@ fn run_loop(
             (lt, dests[1 - cpos], cpos, dests[cpos])
         };
         match probe_count(func, &body, cfg, dt, h, ti, te, tp, bb) {
-            Some((cnt, hparams, cont_args)) => break (ti, te, tp, bb, cnt, hparams, cont_args),
+            Some((cnt, hparams, _)) => break (te, tp, bb, cnt, hparams),
             None if promoted && !demoted => {
                 mid_exits.insert(0, top_test.take().unwrap());
                 rotated = false;

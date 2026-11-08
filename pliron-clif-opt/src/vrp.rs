@@ -57,6 +57,10 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
                             fixes.push(Fix::Const(r, t as i64));
                             continue;
                         }
+                        if let Some(t) = rs.implied(func, dt, cond, x, y, b) {
+                            fixes.push(Fix::Const(r, t as i64));
+                            continue;
+                        }
                         // `icmp ult (iadd a, b), a`: carry test.
                         if cond == IntCC::UnsignedLessThan
                             && let ValueDef::Result(si, _) = func.dfg.value_def(x)

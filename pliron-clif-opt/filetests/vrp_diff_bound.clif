@@ -1,0 +1,53 @@
+; test vrp
+; `idx < end - min(end, k)` on a dominating edge bounds the integer
+; difference `end - idx >= k+1` (satisfiability forces `min = k`), so
+; `idx + j < end` folds for `j <= k`. This is the counted-unroll guard
+; idiom (`isub end, umin(end, k)`).
+; diffcheck
+; check: iconst.i8 1
+; check-not: icmp ult v7, v1
+function %f(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 8
+    v3 = umin.i64 v1, v2
+    v4 = isub.i64 v1, v3
+    v5 = icmp ult v0, v4
+    brif v5, block1, block2
+
+block1:
+    ; v1 - v0 >= 9, so v0 + 8 < v1.
+    v6 = iconst.i64 8
+    v7 = iadd.i64 v0, v6
+    v8 = icmp ult v7, v1
+    v9 = iconst.i8 0
+    v10 = icmp ne v8, v9
+    return v10
+
+block2:
+    v11 = iconst.i8 0
+    return v11
+}
+
+; `x + 4 < y` dominating proves `x + 3 < y` — the same fact in
+; offset-compare form (needs x's range +4 in `0..=m`; the uload8 keeps
+; it tight).
+; check: iconst.i8 1
+; check-not: icmp ult v7, v1
+function %g(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = uload8.i64 notrap aligned v0
+    v3 = iconst.i64 4
+    v4 = iadd.i64 v2, v3
+    v5 = icmp ult v4, v1
+    brif v5, block1, block2
+
+block1:
+    v6 = iconst.i64 3
+    v7 = iadd.i64 v2, v6
+    v8 = icmp ult v7, v1
+    return v8
+
+block2:
+    v9 = iconst.i8 0
+    return v9
+}
