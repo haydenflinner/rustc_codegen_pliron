@@ -538,8 +538,15 @@ struct Walk {
     latch: Block,
     /// `jump`-latch rotated loop: the latch is a plain `jump h` and h's
     /// own `brif` (a pos-0 side exit) is the counting test. `false` for
-    /// brif-latch do-while loops.
+    /// brif-latch do-while loops. A `brif`-latch whose non-h dest leaves
+    /// the body is also rotated — the counting test sits on h the same
+    /// way, and the latch brif plays the data-exit's role (`latch_exit`).
     rotated: bool,
+    /// Conditional backedge: the latch `brif -> h | exit` of a rotated
+    /// loop (`while p != end && f(p)`) — its exit arm is a per-copy
+    /// side exit like `mid_exits`, but at the chain's last position so
+    /// its continue edge binds the next copy's header params.
+    latch_exit: Option<SideExit>,
 }
 
 /// Walk the linear chain `h -> .. -> latch`: `jump` steps land on a fresh
@@ -567,6 +574,7 @@ fn walk(
         .collect();
     let mut chain = vec![h];
     let mut mid_exits: Vec<SideExit> = Vec::new();
+    let mut latch_exit = None;
     let latch;
     let mut rotated = false;
     loop {
@@ -599,6 +607,31 @@ fn walk(
                 let d1 = dests[1].block(&func.dfg.value_lists);
                 if d0 == h || d1 == h {
                     latch = cur;
+                    // Conditional-backedge candidate: the latch's other
+                    // arm leaves the body. A pos-0 side exit (the top
+                    // test) makes this the rotated `while count && data`
+                    // shape — `run_loop` arbitrates; without one it is
+                    // the ordinary do-while (latch test = count test).
+                    let (hb, eb, epos) = if d0 == h {
+                        (0, 1, 1)
+                    } else {
+                        (1, 0, 0)
+                    };
+                    if !body.contains(&dests[eb].block(&func.dfg.value_lists)) {
+                        latch_exit = Some(SideExit {
+                            pos: chain.len() - 1,
+                            cont_bc: dests[hb],
+                            exit_bc: dests[eb],
+                            epos,
+                            cone: ExitCone {
+                                seblk: dests[eb].block(&func.dfg.value_lists),
+                                lvals: Vec::new(),
+                                corder: Vec::new(),
+                                cmap: FxHashMap::default(),
+                                clone_root: None,
+                            },
+                        });
+                    }
                     break;
                 }
                 let (cont_bc, exit_bc, epos) = if body.contains(&d0) && !body.contains(&d1) {
@@ -642,7 +675,56 @@ fn walk(
         mid_exits,
         latch,
         rotated,
+        latch_exit,
     })
+}
+
+/// The counting-test probe shared by the do-while latch read and the
+/// rotated top-test read: `test_i` must be a `brif` on an icmp whose
+/// `texit_bc` edge leaves the body, and the normalized continue cond
+/// must satisfy `find_count` over `back_bc`'s rebinding args. `None` on
+/// any mismatch — callers arbitrate between the rotated and do-while
+/// readings without diagnostics.
+fn probe_count(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    test_i: Inst,
+    texit_bc: BlockCall,
+    tcpos: usize,
+    back_bc: BlockCall,
+) -> Option<(Cnt, Vec<Value>, Vec<Value>)> {
+    if body.contains(&texit_bc.block(&func.dfg.value_lists)) {
+        return None;
+    }
+    let InstructionData::Brif { arg: c, .. } = func.dfg.insts[test_i] else {
+        return None;
+    };
+    let ci = func.dfg.resolved_value_def(c).inst()?;
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args: [x, y],
+    } = func.dfg.insts[ci]
+    else {
+        return None;
+    };
+    let cond = if tcpos == 0 { cond } else { cond.complement() };
+    let hparams = func.dfg.block_params(h).to_vec();
+    let cont_args: Vec<Value> = back_bc
+        .args(&func.dfg.value_lists)
+        .filter_map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect();
+    if cont_args.len() != hparams.len() {
+        return None;
+    }
+    let cnt = find_count(func, h, body, cfg, dt, x, y, cond, &hparams, &cont_args)?;
+    Some((cnt, hparams, cont_args))
 }
 
 /// The counted continue-test search: `a cc bound` where `a` is
@@ -1245,6 +1327,7 @@ fn run_loop(
         mut mid_exits,
         latch,
         rotated,
+        mut latch_exit,
         body,
     } = walk(func, cfg, dt, la, lp, h, name)?;
     // `PLIRON_PUNROLL_VEC=1`: allow unrolling loops that touch vector
@@ -1270,8 +1353,18 @@ fn run_loop(
     // it out of `mid_exits` (it plays the do-while latch's role, not a
     // side exit's). The chain's `jump h` is the backedge: its args re-bind
     // h's params for the next iteration, exactly like the do-while
-    // latch's `cont` edge.
-    let top_test = if rotated {
+    // latch's `cont` edge. A conditional backedge (`brif -> h | exit`,
+    // `latch_exit` set) with a pos-0 side exit is the same rotated shape
+    // — promote it provisionally: if the pos-0 test is not affine-counted
+    // the loop demotes back to do-while (latch test = count test).
+    let mut rotated = rotated;
+    let promoted = !rotated
+        && latch_exit.is_some()
+        && mid_exits.first().map(|e| e.pos) == Some(0);
+    if promoted {
+        rotated = true;
+    }
+    let mut top_test = if rotated {
         if mid_exits.first().map(|e| e.pos) != Some(0) {
             bail!("rotated loop without top test");
         }
@@ -1284,62 +1377,48 @@ fn run_loop(
     // `test_i`/`texit_bc`/`tcpos`: the counting-test brif and its edges —
     // the latch brif for do-while loops, h's own brif for rotated ones
     // (tcpos = position of the continue dest). `back_bc`: the call whose
-    // args re-bind h's params on the backedge — the latch `cont` edge, or
-    // the rotated `jump h` call.
-    let (test_i, texit_bc, tcpos, back_bc) = if rotated {
-        let tt = top_test.as_ref().unwrap();
-        let ti = func.layout.last_inst(h).unwrap();
-        let bcs: Vec<BlockCall> = func.dfg.insts[lt]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            .to_vec();
-        (ti, tt.exit_bc, 1 - tt.epos, bcs[0])
-    } else {
-        let dests: Vec<BlockCall> = func.dfg.insts[lt]
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            .to_vec();
-        let Some(cpos) = dests
-            .iter()
-            .position(|bc| bc.block(&func.dfg.value_lists) == h)
-        else {
-            bail!("no backedge dest");
+    // args re-bind h's params on the backedge — the latch `cont` edge, the
+    // condback latch's h edge, or the rotated `jump h` call.
+    let mut demoted = false;
+    let (test_i, texit_bc, tcpos, back_bc, cnt, hparams, cont_args) = loop {
+        let (ti, te, tp, bb) = if rotated {
+            let tt = top_test.as_ref().unwrap();
+            (
+                func.layout.last_inst(h).unwrap(),
+                tt.exit_bc,
+                1 - tt.epos,
+                match latch_exit.as_ref() {
+                    Some(e) => e.cont_bc,
+                    None => func.dfg.insts[lt].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    )[0],
+                },
+            )
+        } else {
+            let dests: Vec<BlockCall> = func.dfg.insts[lt]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .to_vec();
+            let Some(cpos) = dests
+                .iter()
+                .position(|bc| bc.block(&func.dfg.value_lists) == h)
+            else {
+                bail!("no backedge dest");
+            };
+            (lt, dests[1 - cpos], cpos, dests[cpos])
         };
-        (lt, dests[1 - cpos], cpos, dests[cpos])
+        match probe_count(func, &body, cfg, dt, h, ti, te, tp, bb) {
+            Some((cnt, hparams, cont_args)) => break (ti, te, tp, bb, cnt, hparams, cont_args),
+            None if promoted && !demoted => {
+                mid_exits.insert(0, top_test.take().unwrap());
+                rotated = false;
+                latch_exit = None;
+                demoted = true;
+            }
+            None => bail!("no counting test"),
+        }
     };
     let exit_bc = texit_bc;
-    if body.contains(&exit_bc.block(&func.dfg.value_lists)) {
-        bail!("exit inside loop");
-    }
-    let InstructionData::Brif { arg: c, .. } = func.dfg.insts[test_i] else {
-        bail!("cond not a brif")
-    };
-    let Some(ci) = func.dfg.resolved_value_def(c).inst() else {
-        bail!("cond not an icmp");
-    };
-    let InstructionData::IntCompare {
-        opcode: Opcode::Icmp,
-        cond,
-        args: [x, y],
-    } = func.dfg.insts[ci]
-    else {
-        bail!("cond not an icmp");
-    };
-    let cond = if tcpos == 0 { cond } else { cond.complement() };
-
-    let hparams = func.dfg.block_params(h).to_vec();
-    let cont_args: Vec<Value> = back_bc
-        .args(&func.dfg.value_lists)
-        .filter_map(|a| match a {
-            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
-            _ => None,
-        })
-        .collect();
-    if cont_args.len() != hparams.len() {
-        bail!("backedge arity");
-    }
-
-    let Some(cnt) = find_count(func, h, &body, cfg, dt, x, y, cond, &hparams, &cont_args) else {
-        bail!("no counting test")
-    };
     let k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
         Ok(k) => k,
         Err(m) => bail!(format!("trip <= {m}")),
@@ -1428,11 +1507,11 @@ fn run_loop(
     // panic block fed by all unrolled bounds checks). Bounds keep cold
     // panic cones small: <=8 exits, <=8 blocks / 48 insts per cone, <=96
     // cloned insts total.
-    if mid_exits.len() > 8 {
+    if mid_exits.len() + latch_exit.is_some() as usize > 8 {
         bail!("too many side exits");
     }
     let mut clone_insts = 0usize;
-    for e in &mut mid_exits {
+    for e in mid_exits.iter_mut().chain(latch_exit.iter_mut()) {
         for bc in [e.cont_bc, e.exit_bc] {
             if bc
                 .args(&func.dfg.value_lists)
@@ -1450,6 +1529,7 @@ fn run_loop(
     {
         let targets: Vec<Block> = std::iter::once(eblk)
             .chain(mid_exits.iter().map(|e| e.cone.seblk))
+            .chain(latch_exit.iter().map(|e| e.cone.seblk))
             .collect();
         if !exit_continuations_ok(func, &body, dt, &lvals, &targets) {
             bail!("body value used outside exit cones");
@@ -1486,9 +1566,11 @@ fn run_loop(
     for kk in 0..k as usize {
         // Rotated: the last copy keeps the top test — its chain[0] ends in
         // the test brif, so it needs one extra segment over the mid-exit
-        // count. Earlier copies drop the test and stay fused.
+        // count. Earlier copies drop the test and stay fused. A
+        // conditional backedge also forces a block per copy: the latch
+        // brif's continue edge needs a real target.
         let extra = (rotated && kk + 1 == k as usize) as usize;
-        if mid_exits.is_empty() && kk > 0 && extra == 0 {
+        if mid_exits.is_empty() && latch_exit.is_none() && kk > 0 && extra == 0 {
             usegs.push(Vec::new());
             continue;
         }
@@ -1538,6 +1620,7 @@ fn run_loop(
         h,
         &mut mid_exits
             .iter_mut()
+            .chain(latch_exit.iter_mut())
             .map(|e| &mut e.cone)
             .collect::<Vec<_>>(),
     );
@@ -1716,6 +1799,61 @@ fn run_loop(
                     }
                     curseg = nxt;
                     seg_i += 1;
+                }
+                InstructionData::Brif { arg: c, .. }
+                    if latch_exit.is_some() && i + 1 == chain.len() =>
+                {
+                    // Conditional backedge (`brif -> h | exit`): like a
+                    // mid-chain side exit — the data test is kept per
+                    // copy — but its continue edge is the backedge: it
+                    // binds chain[0]'s params for the next copy (0..K-2,
+                    // fresh segment) or becomes `hu`'s edge on the last
+                    // copy. The exit edge targets the shared cone clone.
+                    let e = latch_exit.as_ref().unwrap();
+                    let c = func.dfg.resolve_aliases(c);
+                    let carg = *vmap.get(&c).unwrap_or(&c);
+                    let mut eargs: Vec<BlockArg> = e
+                        .exit_bc
+                        .args(&func.dfg.value_lists)
+                        .map(|a| mv(func, a))
+                        .collect();
+                    if e.cone.clone_root.is_some() {
+                        for &lv in &e.cone.lvals {
+                            let lv = func.dfg.resolve_aliases(lv);
+                            eargs.push(BlockArg::Value(*vmap.get(&lv).unwrap_or(&lv)));
+                        }
+                    }
+                    let etgt = e.cone.clone_root.unwrap_or(e.cone.seblk);
+                    let epos = e.epos;
+                    if kk + 1 < k as usize {
+                        let sps = func.dfg.block_params(chain[0]).to_vec();
+                        for (j, a) in e.cont_bc.args(&func.dfg.value_lists).enumerate() {
+                            carry.insert(sps[j], mvv(func, a));
+                        }
+                        let nxt = usegs[kk + 1][0];
+                        let mut pos = FuncCursor::new(func).at_bottom(curseg);
+                        if epos == 0 {
+                            pos.ins().brif(carg, etgt, &eargs, nxt, &[]);
+                        } else {
+                            pos.ins().brif(carg, nxt, &[], etgt, &eargs);
+                        }
+                        curseg = nxt;
+                    } else {
+                        let mut cont: Vec<BlockArg> = e
+                            .cont_bc
+                            .args(&func.dfg.value_lists)
+                            .map(|a| mv(func, a))
+                            .collect();
+                        if let Some(sv) = stop {
+                            cont.push(sv.into());
+                        }
+                        let mut pos = FuncCursor::new(func).at_bottom(curseg);
+                        if epos == 0 {
+                            pos.ins().brif(carg, etgt, &eargs, hu, &cont);
+                        } else {
+                            pos.ins().brif(carg, hu, &cont, etgt, &eargs);
+                        }
+                    }
                 }
                 InstructionData::Brif { arg: c, .. } => {
                     let c = func.dfg.resolve_aliases(c);
@@ -2519,6 +2657,7 @@ fn run_peel(
         latch,
         body,
         rotated: _,
+        latch_exit: _,
     } = walk(func, cfg, dt, la, lp, h, name)?;
     for &b in &chain {
         let vec_param = func
