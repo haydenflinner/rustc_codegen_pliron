@@ -131,6 +131,13 @@ pub struct Ranges {
     /// Compared values that cross the edge as arguments get renamed to
     /// the param so facts reach the param's uses.
     edge_fact: FxHashMap<Block, (Value, bool, FxHashMap<Value, Value>)>,
+    /// Block param → its single incoming source value, when every
+    /// non-self edge arg names the same value (loop-preserving self
+    /// edges keep the induction). One pass at construction.
+    param_src: FxHashMap<Value, Value>,
+    /// `at()` results per (value, block); unrolled runs re-ask the
+    /// same question down the same dominator chain.
+    at_memo: FxHashMap<(Value, Block), Range>,
 }
 
 fn width(ty: Type) -> Option<u32> {
@@ -197,6 +204,47 @@ fn fits(m: u64, r: &Range, off: i128) -> bool {
 impl Ranges {
     pub fn new(func: &Function, cfg: &ControlFlowGraph) -> Ranges {
         let mut edge_fact = FxHashMap::default();
+        // Param single-sources: one pass over every branch arg in the
+        // function (the `resolve_param` queries would otherwise rescan
+        // the layout per block param).
+        let mut param_src: FxHashMap<Value, Option<Value>> = FxHashMap::default();
+        for pb in func.layout.blocks() {
+            let Some(t) = func.layout.last_inst(pb) else { continue };
+            let data = &func.dfg.insts[t];
+            if !data.opcode().is_branch() {
+                continue;
+            }
+            for bc in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                let db = bc.block(&func.dfg.value_lists);
+                let params = func.dfg.block_params(db);
+                for (i, &pv) in params.iter().enumerate() {
+                    // An edge passing no value for this param poisons it
+                    // (exception-table edges bind only the tag operands).
+                    let Some(cranelift_codegen::ir::BlockArg::Value(v)) = bc.args(&func.dfg.value_lists).nth(i) else {
+                        param_src.insert(pv, None);
+                        continue;
+                    };
+                    let v = func.dfg.resolve_aliases(v);
+                    if v == pv {
+                        continue;
+                    }
+                    match param_src.entry(pv) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(Some(v));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if *e.get() != Some(v) {
+                                e.insert(None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let param_src = param_src
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
         for b in func.layout.blocks() {
             let mut preds = cfg.pred_iter(b);
             let (Some(p), None) = (preds.next(), preds.next()) else { continue };
@@ -225,7 +273,14 @@ impl Ranges {
                 edge_fact.insert(b, (func.dfg.resolve_aliases(arg), arm, arg_map));
             }
         }
-        Ranges { memo: FxHashMap::default(), visiting: FxHashSet::default(), work: 0, edge_fact }
+        Ranges {
+            memo: FxHashMap::default(),
+            visiting: FxHashSet::default(),
+            work: 0,
+            edge_fact,
+            param_src,
+            at_memo: FxHashMap::default(),
+        }
     }
 
     /// Range of `v` from its definition alone.
@@ -484,12 +539,11 @@ impl Ranges {
         }
     }
 
-    /// Incoming edge args of param `idx` of `b`.
+    /// Incoming edge args of param `idx` of `b`. Whole-layout scan —
+    /// call only under `def`'s per-value memo, never from a per-query
+    /// recursion (`param_src` covers the single-source query).
     fn incoming(&self, func: &Function, b: Block, idx: usize) -> Vec<Value> {
         let mut out = Vec::new();
-        // Walk every branch in the function once per param query is too
-        // slow for big functions; the caller supplies a CFG through
-        // `with_preds` when it has one. Here, fall back to the layout.
         for pb in func.layout.blocks() {
             let Some(t) = func.layout.last_inst(pb) else { continue };
             let data = &func.dfg.insts[t];
@@ -513,8 +567,14 @@ impl Ranges {
     /// the compare facts of dominating single-predecessor edges.
     pub fn at(&mut self, func: &Function, dt: &DominatorTree, v: Value, at: Block) -> Range {
         let v = func.dfg.resolve_aliases(v);
+        if let Some(&r) = self.at_memo.get(&(v, at)) {
+            return r;
+        }
         let mut r = self.def(func, v);
-        let Some(bits) = width(func.dfg.value_type(v)) else { return r };
+        let Some(bits) = width(func.dfg.value_type(v)) else {
+            self.at_memo.insert((v, at), r);
+            return r;
+        };
         let mut b = at;
         let mut hops = 0;
         loop {
@@ -541,6 +601,7 @@ impl Ranges {
                 break;
             }
         }
+        self.at_memo.insert((v, at), r);
         r
     }
 
@@ -770,26 +831,14 @@ impl Ranges {
     }
 
     /// `v` behind single-source block-param bindings: when a param's
-    /// non-self incoming args all name one value, the param is that
-    /// value for analysis purposes. Bounded chain.
+    /// non-self incoming args all name one value (precomputed in
+    /// `param_src`), the param is that value for analysis purposes.
+    /// Bounded chain.
     fn resolve_param(&self, func: &Function, mut v: Value) -> Value {
         for _ in 0..8 {
             v = func.dfg.resolve_aliases(v);
-            let ValueDef::Param(b, idx) = func.dfg.value_def(v) else { return v };
-            let mut want = None;
-            for a in self.incoming(func, b, idx) {
-                let a = func.dfg.resolve_aliases(a);
-                if a == v {
-                    continue;
-                }
-                match want {
-                    None => want = Some(a),
-                    Some(w) if w == a => {}
-                    _ => return v,
-                }
-            }
-            match want {
-                Some(w) => v = w,
+            match self.param_src.get(&v) {
+                Some(&w) => v = w,
                 None => return v,
             }
         }
