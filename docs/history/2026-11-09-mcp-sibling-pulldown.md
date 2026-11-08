@@ -231,3 +231,17 @@ clamps (`v634`, `v648` → 0). Filetests: `vrp_multi_edge{,_flag,_neg}`.
 Validation: corpus 4870 fns 0 mismatches, gate 94 jobs, fuzz 400/400
 (seed 20565 included) — plus one earlier unsound-fold version caught
 by the same filetests before the fix.
+
+### vrp2 (late second vrp) — measured, rejected
+
+`scan_ch_repeat`'s steady-state keeps a `select(p==end,p,p+1)` clamp
+(`sub/cmp/csel`, ~3 insns/iter) that only forms after `dem64`/
+`latchspec` — past vrp's pipeline position. An opt-in `vrp2` after
+latchspec folded both clamps (scan_code_fence 299 → 283 insns) but
+measured `vrp2/pliron 1.005 [0.990,1.065]` on pulldown-cmark and had
+ZERO effect on the 4870-fn std corpus — the late-position facts don't
+fire anywhere else. Reverted: a second 200-ms-corpus pass for one
+function's −16 is not a trade. The clamp needs late LVI or stays.
+Both builds' memchr paths already carry `cmeq.16b` NEON (the memchr
+crate's own vectorized path); LLVM's edge there is 7 vs our 5 cmeq
+sites, not a missing vectorizer.
