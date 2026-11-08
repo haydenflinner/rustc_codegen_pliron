@@ -100,3 +100,27 @@ vectorisation in `loopvec` (`.any`/`position`/`memchr` shapes →
 `ptr+k != end` fact fold inside peeled/punrolled runs where the
 guard already proves `end−ptr ≥ K`; the HqZopfli ~200-mov residue
 (regalloc-level, not emit-level).
+
+## punroll conditional-backedge unrolling (37c7cd7)
+
+Finding 2 above is fixed. `punroll::walk` now records a
+conditional-backedge latch (`brif -> h | exit` with the non-header arm
+outside the body) as `latch_exit`; `run_loop` promotes the loop to the
+rotated path when a pos-0 side exit exists, and demotes back to
+do-while (latch test probed as the count test) when `find_count`
+rejects the top test — the two shapes are syntactically identical at
+walk time and only `find_count` arbitrates (`punroll_ne.clif` keeps its
+do-while `umin` guard).
+
+`scan_code_fence`'s `.any(|&b| b == 0x60)` scan now emits the LLVM
+shape: one `p < end - umin(end, K-2)` group guard (the `PRSTOP`
+fold), K=8 copies at ~3 insns/element (`ldrb`/`cmp`/`b.eq`, the
+found-exit shared) and the rolled scalar remainder — previously ~7
+insns/element of peeled per-copy `ptr+k == end` tests. The scalar
+tail even picks up post-index `ldrb [x0], #1` in lowering.
+
+The neighbouring loops are principled misses, not shape gaps:
+`scan_ch_repeat` (the fence counter) iterates `iter.next()` whose
+step is `select(flag, p, p+1)` — not affine, "no counting latch" is
+correct and LLVM keeps the same `csel` machinery; the `memchr(b'\n')`
+loop does have the NEON `cmeq.16b` region on our side too.
