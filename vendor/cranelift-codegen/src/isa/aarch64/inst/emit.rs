@@ -3971,16 +3971,30 @@ impl MachInstEmit for Inst {
             if r1 != r2 {
                 return None;
             }
-            let size = i64::from(scale_ty.bytes());
-            let (base, swap) = if o2 == o1 + size {
-                (o1, false)
-            } else if o1 == o2 + size {
-                (o2, true)
-            } else {
-                return None;
-            };
-            let simm7 = SImm7Scaled::maybe_from_i64(base, scale_ty)?;
-            Some((PairAMode::SignedOffset { reg: r1, simm7 }, swap))
+            // PLIRON: also try an fp-relative base when sp-resolution is
+            // in play — deep spillslots are beyond `ldp`/`stp`'s simm7
+            // from sp but sit just below fp (the clobber area). High-index
+            // slots are within ±512 of fp there.
+            let mut cands: SmallVec<[(Reg, i64, i64); 2]> = SmallVec::new();
+            cands.push((r1, o1, o2));
+            if r1 == stack_reg() && state.frame_layout().setup_area_size > 0 {
+                let s2f = i64::from(state.frame_layout().sp_to_fp());
+                cands.push((fp_reg(), o1 - s2f, o2 - s2f));
+            }
+            for (r, a, b) in cands {
+                let size = i64::from(scale_ty.bytes());
+                let (base, swap) = if b == a + size {
+                    (a, false)
+                } else if a == b + size {
+                    (b, true)
+                } else {
+                    continue;
+                };
+                if let Some(simm7) = SImm7Scaled::maybe_from_i64(base, scale_ty) {
+                    return Some((PairAMode::SignedOffset { reg: r, simm7 }, swap));
+                }
+            }
+            None
         }
         match (self, next) {
             (

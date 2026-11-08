@@ -1887,6 +1887,19 @@ impl<I: VCodeInst> VCode<I> {
         let mut preg_ops: Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)> =
             vec![(smallvec![], smallvec![]); self.insts.len()];
 
+        // PLIRON (`PLIRON_EDITPAIR=1`, opt-in): fuse two consecutive
+        // same-direction spill/reload edits to adjacent slots into
+        // `ldp`/`stp`. Spill traffic is emitted as `Edit::Move`s, which
+        // the inst-level pair fusion below never sees.
+        static EDITPAIR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let editpair =
+            *EDITPAIR.get_or_init(|| std::env::var("PLIRON_EDITPAIR").as_deref() != Ok("0"));
+        let mut ep_mem = 0usize;
+        let mut ep_next = 0usize;
+        let mut ep_dir = 0usize;
+        let mut ep_fused = 0usize;
+        let mut ep_r2r = 0usize;
+
         static EPROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let eprof = *EPROF.get_or_init(|| std::env::var_os("PLIRON_EPROF").is_some());
         let mut t_inst = std::time::Duration::ZERO;
@@ -2904,11 +2917,79 @@ impl<I: VCodeInst> VCode<I> {
                     }
 
                     InstOrEdit::Edit(edit @ Edit::Move { from, to }) => {
+                        // PLIRON: a reload of a constant or symbol
+                        // address re-executes its definition instead of
+                        // the fill (see `remat_def`). Shared by the
+                        // edit-pair peek below and the normal path.
+                        let remat_inst = |e: &Edit, to: PReg| -> Option<I> {
+                            remat_def.as_ref().and_then(|m| {
+                                let base = regalloc.edits.as_ptr() as usize;
+                                let at = (e as *const Edit) as usize;
+                                let sz =
+                                    core::mem::size_of::<(regalloc2::ProgPoint, Edit)>();
+                                let off =
+                                    core::mem::offset_of!((regalloc2::ProgPoint, Edit), 1);
+                                let ei = (at - base - off) / sz;
+                                let v = regalloc.edit_vregs.get(ei).copied().flatten()?;
+                                let &di = m.get(&v.vreg())?;
+                                self.insts[di]
+                                    .rematerialize(Writable::from_reg(Reg::from(to)))
+                            })
+                        };
+                        // PLIRON (`PLIRON_EDITPAIR`): two consecutive
+                        // same-direction spill/reload edits to adjacent
+                        // slots fuse into `ldp`/`stp`. Edit items never
+                        // reach the inst-level pair fusion above, so
+                        // try the generated pair here instead.
+                        if editpair {
+                            let gen_mem_inst = |e: &Edit| -> Option<I> {
+                                let &Edit::Move { from, to } = e;
+                                match (from.as_reg(), to.as_reg()) {
+                                    (Some(f), None) => {
+                                        let slot = to.as_stack().unwrap();
+                                        (!dead_slots.contains(&slot.index())).then(|| {
+                                            self.abi.gen_spill(slot, RealReg::from(f))
+                                        })
+                                    }
+                                    (None, Some(t)) => {
+                                        let slot = from.as_stack().unwrap();
+                                        if remat_inst(e, t).is_some() {
+                                            return None;
+                                        }
+                                        Some(self.abi.gen_reload(
+                                            Writable::from_reg(RealReg::from(t)),
+                                            slot,
+                                        ))
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if let Some(m1) = gen_mem_inst(edit) {
+                                ep_mem += 1;
+                                if let Some(&InstOrEdit::Edit(e2)) = items.get(k + 1)
+                                    && let Some(m2) = gen_mem_inst(e2)
+                                {
+                                    ep_next += 1;
+                                    let Edit::Move { to: t1, .. } = *edit;
+                                    let Edit::Move { to: t2, .. } = *e2;
+                                    if t1.is_stack() == t2.is_stack() {
+                                        ep_dir += 1;
+                                    }
+                                    if let Some(fused) = m1.fuse_with_next(&m2, &state) {
+                                        ep_fused += 1;
+                                        do_emit(&fused, &mut disasm, &mut buffer, &mut state);
+                                        k += 2;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         // Create a move/spill/reload instruction and
                         // immediately emit it.
                         match (from.as_reg(), to.as_reg()) {
                             (Some(from), Some(to)) => {
                                 // Reg-to-reg move.
+                                ep_r2r += 1;
                                 let from_rreg = Reg::from(from);
                                 let to_rreg = Writable::from_reg(Reg::from(to));
                                 debug_assert_eq!(from.class(), to.class());
@@ -2929,20 +3010,7 @@ impl<I: VCodeInst> VCode<I> {
                                 // Load from spillslot to register.
                                 let from = from.as_stack().unwrap();
                                 let to_rreg = Writable::from_reg(RealReg::from(to));
-                                // PLIRON: a reload of a constant or symbol
-                                // address re-executes its definition
-                                // instead (see `remat_def`).
-                                let remat = remat_def.as_ref().and_then(|m| {
-                                    let base = regalloc.edits.as_ptr() as usize;
-                                    let at = (edit as *const Edit) as usize;
-                                    let sz = core::mem::size_of::<(regalloc2::ProgPoint, Edit)>();
-                                    let off = core::mem::offset_of!((regalloc2::ProgPoint, Edit), 1);
-                                    let ei = (at - base - off) / sz;
-                                    let v = regalloc.edit_vregs.get(ei).copied().flatten()?;
-                                    let &di = m.get(&v.vreg())?;
-                                    self.insts[di].rematerialize(Writable::from_reg(Reg::from(to)))
-                                });
-                                if let Some(r) = remat {
+                                if let Some(r) = remat_inst(edit, to) {
                                     do_emit(&r, &mut disasm, &mut buffer, &mut state);
                                 } else {
                                     let reload = self.abi.gen_reload(to_rreg, from);
@@ -3054,7 +3122,7 @@ impl<I: VCodeInst> VCode<I> {
         let t_fin = ti.elapsed();
         if eprof {
             eprintln!(
-                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?}"
+                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?} ep={ep_mem}/{ep_next}/{ep_dir}/{ep_fused} r2r={ep_r2r}"
             );
         }
 

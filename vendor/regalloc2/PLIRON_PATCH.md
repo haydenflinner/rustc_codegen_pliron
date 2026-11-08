@@ -199,3 +199,27 @@ unconstrained side's ranges overlap a fixed reservation on that preg —
 pinning would provably force a split where the edge move is cheaper.
 Measured on that function: 2258 -> 2205 insns, `[sp]` accesses
 527 -> 454, ~2.8 -> ~2.6 ms.
+
+## `PLIRON_RA2_SLOTPAIR` (runtime, default on, `=0` off): pair-aware spillslot repacking
+
+`allocate_spillslot` assigns word indices in allocation order, which has
+no relation to emission order — two fills emitted consecutively almost
+never land on adjacent slots, so AArch64 `ldp`/`stp` fusion of
+spill/reload edits could not fire (LLVM emits ~100 pairs in
+`BrotliCreateHqZopfliBackwardReferences`; we emitted none).
+`slot_pair_layout` (`ion/spill.rs`, called at the end of `ion::run`)
+collects weighted pairing edges between slot words — same-direction
+`Edit::Move` pairs at the same emission gap, weighted by the block's
+`hot_bonus`, requiring equal size and class — links each slot to its
+two heaviest partners into chains (union-find, no cycles), then repacks
+`[0, num_spillslots)`: chains first at the *highest* aligned bases
+(the top of the spillslot area sits just below fp+clobber, inside
+simm7 reach fp-relative even when deep from sp), leftovers bottom-up.
+Every `Allocation::stack` in `output.edits`, `output.allocs`,
+`output.debug_locations`, `ctx.spillslots`, and
+`ctx.extra_spillslots_by_class` is rewritten consistently; the
+permutation is a pure relabeling so semantics are unchanged. Bails
+(leaving the original layout) on `multi_spillslot_named_by_last_slot`
+or any stack allocation whose extent is unknown. Pairs with the
+emit-side `PLIRON_EDITPAIR` peek in `vcode.rs` and the fp-relative
+`pair_amode` fallback in aarch64 `emit.rs` (`PLIRON_PATCH.md` there).

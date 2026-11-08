@@ -1381,3 +1381,25 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     merge guard instead. Measured neutral on the motivating function
     (the pin there spread through merges, not the def itself); kept
     opt-in for workloads with long-lived plain-call results.
+
+110. aarch64 `ldp`/`stp` on regalloc spill/reload edits
+    (`PLIRON_EDITPAIR`, default on, `=0` off): spill/fill traffic is emitted as
+    `Edit::Move` items in `VCode::emit`, invisible to the inst-level
+    `fuse_with_next` scan. The emit loop now peeks at the next item
+    when it is also an `Edit`, generates both memory insts
+    (respecting `dead_slots` and the remat path), and emits the fused
+    pair when `fuse_with_next` accepts. Crate-wide: +194 pairs with
+    slot pairing on (+504 were already adjacent naturally).
+
+111. aarch64 fp-relative pair fallback (`pair_amode` in
+    `isa/aarch64/inst/emit.rs`): when both accesses resolve to
+    `stack_reg()` and the pair base exceeds `SImm7Scaled` range
+    (±512 B), retry with `off - sp_to_fp()` — the top of the spillslot
+    area sits just below the clobber area, so high-index slots are
+    within simm7 of fp even in huge frames (every spilling function
+    establishes fp since `fixed_frame_storage_size > 0` forces
+    `setup_area_size = 16`). Unlocks `ldp`/`stp` on deep-frame spill
+    pairs: `BrotliCreateHqZopfliBackwardReferences` emits real
+    `stp/ldp [x29, #-0x..]` pairs (2202 -> 2164 insns). Pairs with
+    `PLIRON_RA2_SLOTPAIR` in vendored regalloc2, which repacks
+    pairing-edge chains to the top of the spillslot area.

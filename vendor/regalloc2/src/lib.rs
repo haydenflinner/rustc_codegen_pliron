@@ -97,6 +97,23 @@ pub(crate) fn nopinmerge_on() -> bool {
     true
 }
 
+/// PLIRON (`PLIRON_RA2_SLOTPAIR`, default on, `=0` off): repack
+/// spill-slot word indices so same-direction spill/reload edits
+/// emitted consecutively land on adjacent slots, letting ISA pair
+/// fusion (`ldp`/`stp` on AArch64) fire in vcode emission. Slot
+/// assignment otherwise follows allocation order, which almost never
+/// matches emission order.
+/// See `ion/spill.rs::slot_pair_layout`.
+pub(crate) fn slotpair_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SLOTPAIR").as_deref() != Ok("0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
 macro_rules! explain {
     ($($tt:tt)*) => {
         if $crate::explain_on() {
