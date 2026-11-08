@@ -124,3 +124,32 @@ The neighbouring loops are principled misses, not shape gaps:
 step is `select(flag, p, p+1)` — not affine, "no counting latch" is
 correct and LLVM keeps the same `csel` machinery; the `memchr(b'\n')`
 loop does have the NEON `cmeq.16b` region on our side too.
+
+## vrp correlated-difference implication (af81586, 3f98391)
+
+The follow-up "`ptr+k != end` fact fold inside unrolled runs" is done,
+at `ranges` level rather than inside punroll: `Ranges::implied` treats
+each dominating single-pred edge compare as an integer inequality and
+bounds `D = yb - xb`, which decides the sign of `x - y = (kx - ky) - D`
+for `x = xb + kx`, `y = yb + ky`. `edge_fact` now carries branch-arg ->
+block-param bindings so facts reach values bound on the edge
+(`resolve_param` follows single-source params); `lin` reconstructs
+affine forms through params and certified-nonnegative `isub`s;
+`sub_diff` handles the `P - umin(P, k)` remainder idiom where
+satisfiability of the in-range arm forces `umin = k`. Every stripped
+side is certified non-wrapping by `fits` over the at()-refined range —
+the machine adds equal the integer sums only then.
+
+On `BrotliCreateHqZopfliBackwardReferences` vrp folds 26 icmps (was 4):
+the unrolled `idx+k uge rem-bound` checks and the `idx < len` chains
+under a dominating `idx+N < len`. Held-out A/B `vrp/pliron`: geomean
+1.007 [0.990,1.021], rust-compression 0.970 [0.966,1.001]* — its one
+targeted benchmark, borderline-significant ~3%.
+
+Compile-time fix mattered as much as the transform: `resolve_param`'s
+`incoming()` was a whole-layout scan per recursion level — vrp cost
+594 ms (~5% of pipeline) on the rust-compression build. Precomputing
+param single-sources in `Ranges::new` and memoizing `at()` per
+(value, block) brings it to 113 ms (~1%). Gate 94/94 and 400 fuzz
+seeds clean with `PLIRON_VRP=1`; flipped default-on in the pipeline
+gate (`PLIRON_VRP=0` restores).

@@ -1,4 +1,4 @@
-//! Value-range propagation (`PLIRON_VRP=1`): the first consumer of
+//! Value-range propagation (`PLIRON_VRP=0` off): the first consumer of
 //! [`crate::ranges`]. Folds what the ranges decide:
 //!
 //! - an `icmp` whose operands' ranges (at its block) settle it becomes a

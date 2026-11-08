@@ -925,7 +925,10 @@ hints through `Layout::set_unlikely_arm`. What the A/Bs taught:
   ivexit added: 1.100. Gate (both default sets) and 400 fuzz seeds clean.
   **Flipped on** (`PLIRON_PLACE=0`, `PLIRON_BRHINT=0` restore); vrp and
   ivexit stay opt-in (no measurable runtime gain, vrp costs 0.8% compile
-  time).
+  time). *Update 2026-11-09: vrp flipped on once `implied` (correlated
+  `D = yb - xb` bounds) gave it a measurable win — rust-compression
+  0.970 — and param-source precomputation + `at()` memoization kept its
+  cost at ~1% of pipeline; ivexit stays opt-in.*
 
 **W3 ranges** (`PLIRON_VRP=1`): `ranges.rs`, one memoized interval engine
 (unsigned + signed, definitions and dominating `brif` facts) and `vrp.rs`

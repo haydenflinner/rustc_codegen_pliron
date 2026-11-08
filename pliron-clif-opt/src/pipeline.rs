@@ -4523,7 +4523,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("pushin", "pushin", Gate::OptIn("PLIRON_PUSHIN"), s_pushin)
             .needs(shape::CONDBR),
         // Value-range propagation (ranges.rs) ahead of celim, which it subsumes in part.
-        step("vrp", "vrp", Gate::OptIn("PLIRON_VRP"), s_vrp),
+        step("vrp", "vrp", Gate::Env("PLIRON_VRP"), s_vrp),
         cstep("celim", "celim", Gate::Env("PLIRON_CELIM"), s_celim).needs(shape::CONDBR),
         cstep(
             "ivrefold",
