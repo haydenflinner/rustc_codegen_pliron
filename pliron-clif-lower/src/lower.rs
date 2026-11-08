@@ -1048,7 +1048,8 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
             tracing::info!(target: "pliron::dump", "==== clif {n} final ====\n{}", clctx.func.display())
         };
     }
-    // `PLIRON_LIBCALL_DIRECT=1` (default off): memcpy/memmove/memset/memcmp
+    // `PLIRON_LIBCALL_DIRECT` (default on via DEFAULT_ON; `=0` off):
+    // memcpy/memmove/memset/memcmp
     // libcalls are direct `bl`/`call` (the linker adds a stub/PLT entry, as
     // clang's output does) instead of `adrp; ldr [GOT]; blr` / `call *got`.
     if !sh.wasm && pliron_cfg::env_is("PLIRON_LIBCALL_DIRECT", "1") {

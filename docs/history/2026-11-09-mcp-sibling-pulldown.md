@@ -153,3 +153,46 @@ param single-sources in `Ranges::new` and memoizing `at()` per
 (value, block) brings it to 113 ms (~1%). Gate 94/94 and 400 fuzz
 seeds clean with `PLIRON_VRP=1`; flipped default-on in the pipeline
 gate (`PLIRON_VRP=0` restores).
+
+## HqZopfli residual census (post-vrp, vs LLVM)
+
+Re-counted the opcode mix on `pliron-vrp` vs LLVM builds: 2295 vs
+1321 insns. The gap is structural, not one mechanism:
+
+- `mov` 464 vs 258 (+206): 321 reg-reg movs, ~64 are `ldr xT,[sp]`
+  followed by `mov xA,xT` (reload to scratch then copy to the ABI arg
+  reg — Ion reloads the spilled vreg to its allocated preg rather than
+  the operand's fixed preg). Another ~75 are arg-setup for the 26
+  `panic_bounds_check` call sites (LLVM: 2, via shared stubs over ~8
+  surviving guards). The rest are scattered boundary moves.
+- `ldr`/`str` +154/+99: 247 spill `ldr [sp]` vs 127 — top slots reload
+  17-28x inside unrolled runs (loop invariants spilled under pressure
+  in a 2.3k-insn function). Symptom of the size gap, not a mechanism.
+- `ldur/stur` +54: `amode_no_more_iconst` prefers `Unscaled` before
+  `UnsignedOffset`; same latency as `str`, no win in flipping it.
+- `ldp` gap is `ldp q` vector struct copies on LLVM's side; `copypair`
+  covers what it can.
+- The `ldr w1,[x22,w0,lsl#2]` repeats in the histogram loop are NOT
+  redundant (different byte index per unrolled copy).
+
+Verdict: the remaining bloat is regalloc-quality (fixed-reg reloads,
+spill pressure) + check-elimination depth, not emit-level idiom loss.
+
+## LIBCALL_DIRECT resolved (layout noise) and flipped
+
+The held `PLIRON_LIBCALL_DIRECT` regression did not survive
+randomized-layout reruns:
+
+- rust-html-rewriter, 6 layouts: `lib/pliron 1.013 [1.000,1.021]`
+  vs `aa/pliron 1.011 [0.987,1.020]` — inside the noise floor.
+- Full 8-program, 6 layouts: `lib/pliron 1.005 [0.998,1.012]` vs
+  `aa/pliron 1.001 [0.989,1.007]` — geomean noise-level. blind-sig's
+  starred 1.020 [1.002,1.024] was the only outlier.
+- blind-sig, 12 layouts x 9 rounds: `lib/pliron 1.001 [0.983,1.010]`
+  vs `aa 0.994 [0.987,1.006]` — resolved, no regression.
+
+Flipped default-on via `DEFAULT_ON` (`PLIRON_LIBCALL_DIRECT=0` off):
+`_memcpy`/`_memmove`/`_memset`/`_memcmp` libcalls emit direct `bl`
+(BRANCH26) instead of `adrp; ldr [GOT]; blr`, ~2 insns/site, -1.7 KB
+crate-wide (2026-10-29-code-size.md). Verified on `copy_from_slice`:
+unset → `bl _memcpy`, `=0` → GOT indirection.

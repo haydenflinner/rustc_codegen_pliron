@@ -153,6 +153,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // can't clobber its locs — &mut self field loads hoist past stores
     // through pointers loaded from it (compress_inner). `=0` off.
     "PLIRON_LICM_NASHEL",
+    // Direct `bl`/`call` to mem*/memcmp libcalls instead of the GOT
+    // indirection (lower.rs; ~2 insns per site, -1.7 KB crate-wide in
+    // docs/history/2026-10-29-code-size.md). Held-out A/B with layouts
+    // is noise-level (lib/pliron 1.005 vs aa 1.001; the earlier
+    // html-rewriter/blind-sig regressions did not reproduce under
+    // --layouts, 2026-11-09).
+    "PLIRON_LIBCALL_DIRECT",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
