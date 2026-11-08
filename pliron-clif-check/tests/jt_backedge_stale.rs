@@ -37,7 +37,10 @@ fn erase_indices_backedge_carries_counters() {
     // The latch: the block storing `*index = new` (`store.i64 .., vN-8`).
     let latch = blocks
         .iter()
-        .find(|(_, b)| b.iter().any(|l| l.starts_with("store.i64 notrap") && l.ends_with("-8")))
+        .find(|(_, b)| {
+            b.iter()
+                .any(|l| l.starts_with("store") && l.contains("notrap") && l.ends_with("-8"))
+        })
         .expect("update_index latch");
     let back = *latch.1.iter().rev().find(|l| l.starts_with("brif") || l.starts_with("jump")).unwrap();
     // Since 2026-11-03 (`ivrefold2` after the late null fold) the loop
