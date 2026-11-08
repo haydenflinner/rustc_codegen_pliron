@@ -245,3 +245,39 @@ function's −16 is not a trade. The clamp needs late LVI or stays.
 Both builds' memchr paths already carry `cmeq.16b` NEON (the memchr
 crate's own vectorized path); LLVM's edge there is 7 vs our 5 cmeq
 sites, not a missing vectorizer.
+
+## ivrefold: const-bound steps, edge-ident idents, late run, r<=0 (fda9d07, a2cdca2)
+
+Held-out census put Brotli's `static_dict::FindMatchLengthWithLimit`
+at 47 vs 33 insns and +6 samples: the loop carried `i`, `base1+i`,
+`base2+i` and recomputed the two pointer args each iteration, while
+LLVM carries `i` and emits `ldrb [x0, x8]` / `ldrb [x2, x8]`.
+ivrefold's alias path already handles exactly this (`arg = iadd B, q'`
+with `q'` another slot's arg) but three matchers missed this shape:
+
+- `step_of` only read literal `iconst` steps; the index stepped by a
+  param bound to the same `iconst` on every edge (`+ stride` threaded
+  as a slot). `pkonst` resolves those steps.
+- That const param itself was fed the same value on every edge but
+  wasn't `p`-identity, so it survived as a slot; `idents` now also
+  strips same-resolved-value-on-every-edge params.
+- `bp = p0 - r*i0` emitted `isub (iadd B, i0), i0`; `add_base` returns
+  `B` directly for r==1.
+
+And one profitability fix that predates this loop: `drops` accepted
+any divisible ratio. With a countdown anchor a +8 pointer becomes
+r = -8 — `bp - 8*iv` can't fold into a scale amode, so the pass
+emitted `imul iv, -8` + a shared pv add per iteration (montgomery in
+blind-sig: +21 insns, 1.31x slower under ivr3). `r <= 0` is now
+rejected — alone it is −177 insns corpus-wide at the existing
+positions.
+
+The pointer-param shape only forms in the late sweep (edgesink/
+latchspec), after ivrefold2's position, so a third `ivrefold3` run
+sits after `latchspec` (default-on, `PLIRON_IVREFOLD3=0` off).
+FindMatchLengthWithLimit now emits LLVM's exact 7-insn loop.
+
+Numbers: corpus 0 mismatches; ivr3 on vs off net +53 static over
+16 fns, held-out A/B 0.991 [0.974,1.013]; jt_backedge_stale needed a
+looser latch pattern (the *index = new* store prints untyped).
+Validation: quick, gate 94/94 both ways, fuzz 400/400.
