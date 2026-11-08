@@ -1887,10 +1887,10 @@ impl<I: VCodeInst> VCode<I> {
         let mut preg_ops: Vec<(SmallVec<[Reg; 4]>, SmallVec<[Reg; 4]>)> =
             vec![(smallvec![], smallvec![]); self.insts.len()];
 
-        // PLIRON (`PLIRON_EDITPAIR=1`, opt-in): fuse two consecutive
-        // same-direction spill/reload edits to adjacent slots into
-        // `ldp`/`stp`. Spill traffic is emitted as `Edit::Move`s, which
-        // the inst-level pair fusion below never sees.
+        // PLIRON (`PLIRON_EDITPAIR=0` off, default on): fuse two
+        // consecutive same-direction spill/reload edits to adjacent slots
+        // into `ldp`/`stp`. Spill traffic is emitted as `Edit::Move`s,
+        // which the inst-level pair fusion below never sees.
         static EDITPAIR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let editpair =
             *EDITPAIR.get_or_init(|| std::env::var("PLIRON_EDITPAIR").as_deref() != Ok("0"));
@@ -1900,15 +1900,15 @@ impl<I: VCodeInst> VCode<I> {
         let mut ep_fused = 0usize;
         let mut ep_r2r = 0usize;
 
-        // PLIRON (`PLIRON_MCP=1`): post-alloc copy propagation — a
-        // reg-reg move whose destination provably already holds its
-        // source's value class is dead (the `mov x5,x2; mov x2,x5`
-        // residue parallel-move resolution leaves). `vclass` maps preg
-        // index to a value-class id; movs propagate the class, every
-        // other def freshens it, calls and block boundaries clear the
-        // map. LLVM's MachineCopyPropagation does the same sweep.
+        // PLIRON (`PLIRON_MCP=0` off, default on): post-alloc copy
+        // propagation — a reg-reg move whose destination provably already
+        // holds its source's value class is dead (the `mov x5,x2;
+        // mov x2,x5` residue parallel-move resolution leaves). `vclass`
+        // maps preg index to a value-class id; movs propagate the class,
+        // every other def freshens it, calls and block boundaries clear
+        // the map. LLVM's MachineCopyPropagation does the same sweep.
         static MCP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mcp = *MCP.get_or_init(|| std::env::var("PLIRON_MCP").as_deref() == Ok("1"));
+        let mcp = *MCP.get_or_init(|| std::env::var("PLIRON_MCP").as_deref() != Ok("0"));
         // PLIRON: only allocatable Int-class pregs participate. Float-class
         // movs have mixed widths (`fmov d` zeroes the upper half, `fmov v`
         // copies 128 bits) so a single class cannot represent equality for
