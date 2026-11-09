@@ -1929,14 +1929,14 @@ impl<I: VCodeInst> VCode<I> {
         let mut vclass: FxHashMap<Reg, u32> = FxHashMap::default();
         let mut next_class = 1u32;
         let mut mcp_dead = 0usize;
-        // PLIRON (`PLIRON_MCPBB=1` opt-in): per-block exit states seed a
-        // block's entry facts from already-emitted preds. Dropping a
-        // move requires the fact to hold on every entry edge, so the
-        // seed is the intersection of all preds' exit states; a pred
-        // emitted later (a backedge, or a block ordered after its
-        // successor) contributes nothing and empties the seed.
+        // PLIRON (`PLIRON_MCPBB=0` off, default on): per-block exit
+        // states seed a block's entry facts from already-emitted preds.
+        // Dropping a move requires the fact to hold on every entry
+        // edge, so the seed is the intersection of all preds' exit
+        // states; a pred emitted later (a backedge, or a block ordered
+        // after its successor) contributes nothing and empties the seed.
         static MCPBB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mcpbb = *MCPBB.get_or_init(|| std::env::var("PLIRON_MCPBB").as_deref() == Ok("1"));
+        let mcpbb = *MCPBB.get_or_init(|| std::env::var("PLIRON_MCPBB").as_deref() != Ok("0"));
         let mut order_pos = vec![usize::MAX; self.num_blocks()];
         for (i, &b) in final_order.iter().enumerate() {
             order_pos[b.index()] = i;

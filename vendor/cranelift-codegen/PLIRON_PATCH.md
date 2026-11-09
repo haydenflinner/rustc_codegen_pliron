@@ -1469,7 +1469,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     html-rewriter: +44 ccmp, −73 cset, −46 cmp, −36 and (−10 static
     net, regalloc churn absorbs the rest); 12-round runtime wash.
 
-114. `PLIRON_MCPBB` (runtime, opt-in `=1`; `VCode::emit`): extends
+114. `PLIRON_MCPBB` (runtime, default on, `=0` off; `VCode::emit`): extends
     `PLIRON_MCP` across block boundaries — each block's exit value-class
     map is recorded, and a block's entry map is seeded from the
     intersection of the exit states of its already-emitted CFG preds; a
