@@ -26,10 +26,10 @@ pub struct PassConfig {
 /// never `env_set` (presence would count `=0` as on). The vendored
 /// Cranelift reads `PLIRON_REMAT_SADDR`, `PLIRON_REMATCALL`,
 /// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE`,
-/// `PLIRON_EPIMERGE`, `PLIRON_TBNZ_IREDUCE`, `PLIRON_EDITPAIR`,
-/// `PLIRON_MCP` and `PLIRON_JT_NARROW` itself and defaults them the
-/// same way (on unless `=0`; EDGEMERGE/EPIMERGE take their mode default
-/// when unset). Validation: docs/history/2026-10-27-defaults.md,
+/// `PLIRON_EPIMERGE`, `PLIRON_BJALIAS`, `PLIRON_TBNZ_IREDUCE`,
+/// `PLIRON_EDITPAIR`, `PLIRON_MCP` and `PLIRON_JT_NARROW` itself and
+/// defaults them the same way (on unless `=0`; EDGEMERGE/EPIMERGE take
+/// their mode default when unset). Validation: docs/history/2026-10-27-defaults.md,
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[

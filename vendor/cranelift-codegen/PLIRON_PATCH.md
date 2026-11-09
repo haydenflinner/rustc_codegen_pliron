@@ -805,7 +805,8 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     insts. `=1` merges an epilogue of 5 or more insts, or any epilogue in a
     cold block: `fib`'s 3-inst base-case return is hot (+8% when merged).
     Frameless `ret` stays inline, and return calls are not changed.
-68. Eager bare-jump label aliasing, `PLIRON_BJALIAS=1` (default `0`,
+68. Eager bare-jump label aliasing, `PLIRON_BJALIAS` (default `1`,
+    `=0` off;
     `src/machinst/vcode.rs` `emit`). A block that is a single
     operand-less `b label` with no regalloc edits emits nothing:
     `MachBuffer` aliases its label to the target — but only lazily, once

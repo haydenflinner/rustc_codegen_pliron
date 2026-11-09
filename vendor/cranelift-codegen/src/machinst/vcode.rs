@@ -2116,7 +2116,7 @@ impl<I: VCodeInst> VCode<I> {
         // form a cycle (`b .`, `b x; ...; b y; y: b x`) keep their code.
         static BJALIAS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         if !flags.machine_code_cfg_info()
-            && *BJALIAS.get_or_init(|| pliron_mode("PLIRON_BJALIAS", 0)) > 0
+            && *BJALIAS.get_or_init(|| pliron_mode("PLIRON_BJALIAS", 1)) > 0
         {
             const UNRESOLVED: u32 = u32::MAX;
             const CYCLE: u32 = u32::MAX - 1;
