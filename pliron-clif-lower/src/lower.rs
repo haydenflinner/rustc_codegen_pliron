@@ -1209,7 +1209,8 @@ enum Pending {
     Serial(Vec<FnJob>),
     Pool {
         drx: std::sync::mpsc::Receiver<(usize, std::thread::Result<FnJob>)>,
-        sent: usize,
+        /// Emitted declaration indices, in `produce` (sorted) order.
+        sent: Vec<usize>,
     },
 }
 
@@ -1233,9 +1234,9 @@ fn start_jobs(nthreads: usize, produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJ
         let (dtx, drx) =
             std::sync::mpsc::channel::<(usize, std::thread::Result<FnJob>)>();
         let pool = fn_pool();
-        let mut sent = 0usize;
+        let mut sent = Vec::new();
         produce(&mut |i, j| {
-            sent += 1;
+            sent.push(i);
             fn_pool_push(
                 pool,
                 GMsg {
@@ -1251,30 +1252,71 @@ fn start_jobs(nthreads: usize, produce: &mut dyn FnMut(&mut dyn FnMut(usize, FnJ
 }
 
 /// Phase (B)'s rest: run (serial) or collect (pool) every job; returns them
-/// in declaration order.
+/// in declaration order. `consume`, when given, runs on each finished job
+/// in declaration order *as the results drain* — a caller that moves the
+/// function out of `j.func` keeps at most the out-of-order backlog of
+/// finished jobs resident instead of every function's optimized CLIF
+/// (the wasm emitter translates to a waffle body this way;
+/// `PLIRON_WASM_STREAM=0` restores collect-then-consume).
 // r[impl clif.lower.phases]
-fn finish_jobs(p: Pending, name: &str) -> Vec<FnJob> {
+fn finish_jobs(
+    p: Pending,
+    name: &str,
+    mut consume: Option<&mut dyn FnMut(&str, ir::Function)>,
+) -> Vec<FnJob> {
     let tpb = std::time::Instant::now();
+    // Consume every finished-but-unordered prefix of `sent` from `done`
+    // into `out`, in declaration order.
+    let mut drain = |done: &mut std::collections::BTreeMap<usize, FnJob>,
+                     sent: &[usize],
+                     next: &mut usize,
+                     out: &mut Vec<FnJob>| {
+        while *next < sent.len() {
+            match done.remove(&sent[*next]) {
+                Some(mut j) => {
+                    if let Some(f) = consume.as_deref_mut() {
+                        let cf = std::mem::replace(&mut j.func, ir::Function::new());
+                        f(&j.name, cf);
+                    }
+                    out.push(j);
+                    *next += 1;
+                }
+                None => break,
+            }
+        }
+    };
     let jobs = match p {
         Pending::Serial(mut jobs) => {
             let mut wcl = cranelift_codegen::Context::new();
             for j in &mut jobs {
                 let sh = j.sh.clone();
                 run_job(j, &mut wcl, &sh);
+                if let Some(f) = consume.as_deref_mut() {
+                    let cf = std::mem::replace(&mut j.func, ir::Function::new());
+                    f(&j.name, cf);
+                }
             }
             jobs
         }
         Pending::Pool { drx, sent } => {
             let pool = fn_pool();
-            let mut done = std::collections::BTreeMap::new();
+            // `next` is the declaration-order position whose result the
+            // drain loop consumes first; `done` only ever holds results
+            // that arrived ahead of `next`, so a `consume` here keeps the
+            // resident set to that jitter backlog instead of every CLIF.
+            let mut done: std::collections::BTreeMap<usize, FnJob> =
+                std::collections::BTreeMap::new();
+            let mut out: Vec<FnJob> = Vec::with_capacity(sent.len());
+            let mut next = 0usize;
             let mut wcl = cranelift_codegen::Context::new();
             let mut got = 0usize;
-            while got < sent {
+            while got < sent.len() {
                 // Take a finished result if one's waiting…
                 match drx.try_recv() {
                     Ok((i, Ok(j))) => {
                         done.insert(i, j);
                         got += 1;
+                        drain(&mut done, &sent, &mut next, &mut out);
                         continue;
                     }
                     Ok((_, Err(p))) => std::panic::resume_unwind(p),
@@ -1304,6 +1346,7 @@ fn finish_jobs(p: Pending, name: &str) -> Vec<FnJob> {
                             Ok((i, Ok(j))) => {
                                 done.insert(i, j);
                                 got += 1;
+                                drain(&mut done, &sent, &mut next, &mut out);
                             }
                             Ok((_, Err(p))) => std::panic::resume_unwind(p),
                             Err(e) => panic!("fn pool disconnected: {e}"),
@@ -1311,7 +1354,7 @@ fn finish_jobs(p: Pending, name: &str) -> Vec<FnJob> {
                     }
                 }
             }
-            done.into_values().collect()
+            out
         }
     };
     pliron_cfg::trace("*phaseB*", tpb.elapsed().as_secs_f64() * 1e3, name);
@@ -1918,7 +1961,7 @@ pub fn lower_module<'a>(
             tracing::info!(target: "pliron::stats", "lowerfree {name}: pliron Context released after phase (A)");
         }
     }
-    let jobs = finish_jobs(pending, name);
+    let jobs = finish_jobs(pending, name, None);
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
@@ -2502,7 +2545,9 @@ mod tests {
 /// Result of running the wasm module through the CLIF pipeline: per-function
 /// optimized CLIF plus symbol tables for resolving FuncRef/GlobalValue.
 pub struct WasmClif {
-    /// (symbol name, optimized CLIF) — one per `st.funcs` entry with a body.
+    /// (symbol name, optimized CLIF) — one per `st.funcs` entry with a
+    /// body, only when `consume` was `None` (streamed consumers empty
+    /// the functions as they run).
     pub funcs: Vec<(String, ir::Function)>,
     /// FuncId::index() -> declared symbol name.
     pub fn_names: Vec<String>,
@@ -2529,6 +2574,12 @@ pub struct WasmClif {
 /// one is dropped once phase (A) has lowered every function, before the
 /// pipeline drains (see [`lowerfree`]). The caller must have read
 /// everything it needs from the `Context` beforehand.
+///
+/// `consume`, when set, runs on each finished function in declaration
+/// order as phase (B) drains (fn names, data names, symbol, CLIF) — the
+/// caller translates to a waffle body there so the whole CGU's optimized
+/// CLIF is never resident at once. `None` returns all functions in
+/// [`WasmClif::funcs`] as before (`PLIRON_WASM_STREAM=0`).
 pub fn lower_clif_wasm(
     ctx_slot: &mut CtxSlot<'_>,
     st: &State,
@@ -2536,6 +2587,7 @@ pub fn lower_clif_wasm(
     cgu: &str,
     unwind: bool,
     simd: bool,
+    consume: Option<&mut dyn FnMut(&[String], &[String], &str, ir::Function)>,
 ) -> WasmClif {
     let ctx: &Context = ctx_slot.get();
     // `PLIRON_LOWERFREE`: nothing below phase (A) reads `ctx`.
@@ -2858,14 +2910,9 @@ pub fn lower_clif_wasm(
             tracing::info!(target: "pliron::stats", "lowerfree {cgu}: pliron Context released after phase (A)");
         }
     }
-    let out: Vec<(String, ir::Function)> = finish_jobs(pending, cgu)
-        .into_iter()
-        .map(|j| (j.name, j.func))
-        .collect();
-    pliron_cfg::mark(&format!("wasm-pB {cgu}"));
-    CUR_FN.with(|c| c.borrow_mut().clear());
     // FnLower can declare more symbols mid-lower (libcalls, va_fids, lazy
-    // data refs) — build the id->name tables last.
+    // data refs), so the tables are built after `produce` — and before
+    // `finish_jobs` so a streaming `consume` sees them too.
     let decls = m.declarations();
     let mut fn_names: Vec<String> = Vec::new();
     for (id, d) in decls.get_functions() {
@@ -2881,6 +2928,20 @@ pub fn lower_clif_wasm(
         }
         data_names[id.index()] = d.name.clone().unwrap_or_default();
     }
+    let mut wrapped;
+    let consume2: Option<&mut dyn FnMut(&str, ir::Function)> = match consume {
+        Some(c) => {
+            wrapped = |n: &str, cf: ir::Function| c(&fn_names, &data_names, n, cf);
+            Some(&mut wrapped)
+        }
+        None => None,
+    };
+    let out: Vec<(String, ir::Function)> = finish_jobs(pending, cgu, consume2)
+        .into_iter()
+        .map(|j| (j.name, j.func))
+        .collect();
+    pliron_cfg::mark(&format!("wasm-pB {cgu}"));
+    CUR_FN.with(|c| c.borrow_mut().clear());
     WasmClif {
         funcs: out,
         fn_names,

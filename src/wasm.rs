@@ -12584,23 +12584,24 @@ mod clif_emit {
             }
             ModTail::new(c, st)
         };
-        let t0 = std::time::Instant::now();
-        let wc = crate::lower::lower_clif_wasm(&mut ctx, st, host, name, unwind, simd);
-        pliron_cfg::trace("*wasm-clif*", t0.elapsed().as_secs_f64() * 1e3, name);
-        let t0 = std::time::Instant::now();
-        let crate::lower::WasmClif {
-            funcs,
-            fn_names,
-            data_names,
-        } = wc;
         let verbose = pliron_cfg::tracing_on()
             && tracing::enabled!(target: "pliron::wasm", tracing::Level::DEBUG);
         let mut stubs = 0;
         let mut defined = 0;
-        // By value: a function's CLIF is dropped once translated.
-        for (n, mut cf) in funcs {
+        let mut ttrans = std::time::Duration::ZERO;
+        // Each function's CLIF is consumed — and dropped — as soon as it
+        // is translated. `PLIRON_WASM_STREAM` (default on) runs that
+        // inside `lower_clif_wasm` in declaration order as phase (B)
+        // drains, so the whole CGU's optimized CLIF never sits resident;
+        // `=0` collects them and translates in the loop below as before.
+        let stream = !pliron_cfg::env_is("PLIRON_WASM_STREAM", "0");
+        let mut translate = |fn_names: &[String],
+                             data_names: &[String],
+                             n: &str,
+                             mut cf: ir::Function| {
+            let t0 = std::time::Instant::now();
             defined += 1;
-            let i = o.fidx[&n];
+            let i = o.fidx[n];
             let sig = o.funcs[i].sig;
             if verbose {
                 if pliron_cfg::tracing_on() {
@@ -12608,8 +12609,8 @@ mod clif_emit {
                 };
             }
             let body = match guarded(|| {
-                let mut cx = CX::new(&mut o, sig, &fn_names, &data_names);
-                cx.name = n.clone();
+                let mut cx = CX::new(&mut o, sig, fn_names, data_names);
+                cx.name = n.to_string();
                 cx.translate(&mut cf)
             }) {
                 Ok(b) => b,
@@ -12634,8 +12635,32 @@ mod clif_emit {
                 }
             };
             o.funcs[i].body = Some(body);
+            ttrans += t0.elapsed();
+        };
+        let consume: Option<
+            &mut dyn FnMut(&[String], &[String], &str, ir::Function),
+        > = if stream { Some(&mut translate) } else { None };
+        let t0 = std::time::Instant::now();
+        let wc =
+            crate::lower::lower_clif_wasm(&mut ctx, st, host, name, unwind, simd, consume);
+        pliron_cfg::trace("*wasm-clif*", t0.elapsed().as_secs_f64() * 1e3, name);
+        let t0 = std::time::Instant::now();
+        let crate::lower::WasmClif {
+            funcs,
+            fn_names,
+            data_names,
+        } = wc;
+        // !stream fallback: every CLIF was collected; translate now.
+        // Streamed functions come back emptied (`ir::Function::new()`),
+        // already translated inside `lower_clif_wasm`.
+        for (n, cf) in funcs {
+            if cf.layout.num_blocks() == 0 {
+                continue;
+            }
+            translate(&fn_names, &data_names, &n, cf);
         }
-        pliron_cfg::trace("*wasm-translate*", t0.elapsed().as_secs_f64() * 1e3, name);
+        let ttrans = if stream { ttrans } else { t0.elapsed() };
+        pliron_cfg::trace("*wasm-translate*", ttrans.as_secs_f64() * 1e3, name);
         drop((fn_names, data_names));
         pliron_cfg::mark(&format!("wasm-translate {name}"));
         let t0 = std::time::Instant::now();
