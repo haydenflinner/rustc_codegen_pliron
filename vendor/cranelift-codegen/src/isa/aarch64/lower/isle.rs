@@ -2,7 +2,7 @@
 
 // Pull in the ISLE generated code.
 pub mod generated_code;
-use generated_code::{Context, ImmExtend};
+use generated_code::{ALUOp, CondResult, Context, ImmExtend, ProducesFlags};
 
 // Types that the generated ISLE code uses via `use super::*`.
 use super::{
@@ -277,6 +277,117 @@ fn bf_field_w(bits: u32, m: u64, k: u64) -> Option<u32> {
         return None;
     }
     bf_low_w(bits, mm)
+}
+
+/// PLIRON: does `cond` hold under the NZCV bit pattern `bits`
+/// (n<<3|z<<2|c<<1|v)? Used by `nzcv_for_cond` to pick the `ccmp`
+/// constant-NZCV operand.
+fn eval_cond(cond: Cond, bits: u32) -> bool {
+    let (n, z, c, v) = (bits & 8 != 0, bits & 4 != 0, bits & 2 != 0, bits & 1 != 0);
+    match cond {
+        Cond::Eq => z,
+        Cond::Ne => !z,
+        Cond::Hs => c,
+        Cond::Lo => !c,
+        Cond::Mi => n,
+        Cond::Pl => !n,
+        Cond::Vs => v,
+        Cond::Vc => !v,
+        Cond::Hi => c && !z,
+        Cond::Ls => !c || z,
+        Cond::Ge => n == v,
+        Cond::Lt => n != v,
+        Cond::Gt => !z && n == v,
+        Cond::Le => z || n != v,
+        Cond::Al => true,
+        Cond::Nv => false,
+    }
+}
+
+/// PLIRON (`PLIRON_CCMP`, default off): fuse integer-compare bool
+/// combinations into `cmp; ccmp` flag chains — see the `ccmp_*`
+/// comment block in inst.isle.
+fn ccmp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_CCMP").as_deref() == Ok("1"))
+}
+
+/// An NZCV constant that makes `cond` evaluate to `value` — the
+/// `ccmp` immediate forcing the fused result when the primary
+/// comparison's condition didn't hold. `None` when no flag state
+/// yields `value` (`al` forced false / `nv` forced true).
+fn nzcv_for_cond(cond: &Cond, value: bool) -> Option<NZCV> {
+    (0..16)
+        .map(|bits| NZCV::new(bits & 8 != 0, bits & 4 != 0, bits & 2 != 0, bits & 1 != 0))
+        .find(|nzcv| eval_cond(*cond, nzcv.bits()) == value)
+}
+
+/// Try the two compares in both primary/secondary orders — `band`
+/// and `bor` operands have no canonical order, and the secondary's
+/// operands must be 32/64-bit (`ccmp` reg/reg form).
+fn ccmp_pair(
+    ctx: &mut IsleContext<'_, '_, MInst, AArch64Backend>,
+    mode: u8,
+    cc_a: &IntCC,
+    x: Value,
+    y: Value,
+    cc_b: &IntCC,
+    u: Value,
+    v: Value,
+) -> Option<CondResult> {
+    let cr_a = generated_code::constructor_emit_icmp(ctx, cc_a, x, y);
+    if let Some(cr) = ccmp_chain(ctx, mode, &cr_a, cc_b, u, v) {
+        return Some(cr);
+    }
+    let cr_b = generated_code::constructor_emit_icmp(ctx, cc_b, u, v);
+    ccmp_chain(ctx, mode, &cr_b, cc_a, x, y)
+}
+
+/// Build `cmp_primary; ccmp u,v,#nzcv,guard` as one flag chain whose
+/// final condition is the secondary compare's. Declines when the
+/// primary isn't a single flag-producing instruction (the
+/// `ProducesFlags` enum can't express chains longer than two) or the
+/// secondary operands aren't 32/64-bit.
+fn ccmp_chain(
+    ctx: &mut IsleContext<'_, '_, MInst, AArch64Backend>,
+    mode: u8,
+    cr: &CondResult,
+    cc_b: &IntCC,
+    u: Value,
+    v: Value,
+) -> Option<CondResult> {
+    let (flags_a, cond_a) = match cr {
+        CondResult::Cond {
+            flags: ProducesFlags::ProducesFlagsSideEffect { inst },
+            cond,
+        } => (inst.clone(), *cond),
+        _ => return None,
+    };
+    let size = match ctx.value_type(u) {
+        I32 => OperandSize::Size32,
+        I64 => OperandSize::Size64,
+        _ => return None,
+    };
+    let cond_b = ctx.cond_code(cc_b);
+    let nzcv = nzcv_for_cond(&cond_b, mode & 2 != 0)?;
+    let guard = if mode & 1 != 0 {
+        cond_a.invert()
+    } else {
+        cond_a
+    };
+    Some(CondResult::Cond {
+        flags: ProducesFlags::ProducesFlagsTwiceSideEffect {
+            inst1: flags_a,
+            inst2: MInst::CCmp {
+                size,
+                rn: ctx.put_in_reg(u),
+                rm: ctx.put_in_reg(v),
+                nzcv,
+                cond: guard,
+            },
+        },
+        cond: cond_b,
+    })
 }
 
 pub struct ExtendedValue {
@@ -1155,6 +1266,109 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     fn cmn_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("PLIRON_CMN").as_deref() != Ok("0"))
+    }
+
+    /// PLIRON (`PLIRON_CCMP`, default off): `band`/`bor` of two integer
+    /// compares consumed as a condition → `cmp; ccmp` flag chain
+    /// (`a && b` / `a || b`). `mode`: bit0 inverts the primary guard,
+    /// bit1 makes the constant NZCV satisfy (not falsify) the secondary
+    /// cond — 0 = `A && B`, 3 = `A || B`. Declines to `is_nonzero` of
+    /// the whole combination value, the generic catch-all's result.
+    fn ccmp_band_cond(
+        &mut self,
+        mode: u8,
+        val: Value,
+        cc_a: &IntCC,
+        x: Value,
+        y: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> CondResult {
+        if ccmp_on() {
+            if let Some(cr) = ccmp_pair(self, mode, cc_a, x, y, cc_b, u, v) {
+                return cr;
+            }
+        }
+        generated_code::constructor_is_nonzero(self, val)
+    }
+
+    /// PLIRON: `select` of a compare against a constant arm is a bool op
+    /// on the select's own condition — `sel(A,B,0)` = 0 `A&&B`,
+    /// `sel(A,0,B)` = 1 `!A&&B`, `sel(A,B,1)` = 2 `!A||B`,
+    /// `sel(A,1,B)` = 3 `A||B`. Same `is_nonzero` decline as above.
+    fn ccmp_sel_cond(
+        &mut self,
+        mode: u8,
+        val: Value,
+        cond: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> CondResult {
+        if ccmp_on() {
+            let cr = generated_code::constructor_is_nonzero_cmp(self, cond);
+            if let Some(cr) = ccmp_chain(self, mode, &cr, cc_b, u, v) {
+                return cr;
+            }
+        }
+        generated_code::constructor_is_nonzero(self, val)
+    }
+
+    /// PLIRON: `band`/`bor` of two compares produced as a *value* —
+    /// fused is `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; cset; op` (5).
+    /// Declines to the base `and`/`orr` on the bound arm values.
+    fn ccmp_band_out(
+        &mut self,
+        mode: u8,
+        ty: Type,
+        a0: Value,
+        cc_a: &IntCC,
+        x: Value,
+        y: Value,
+        a1: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> InstOutput {
+        if ccmp_on() {
+            if let Some(cr) = ccmp_pair(self, mode, cc_a, x, y, cc_b, u, v) {
+                let reg = generated_code::constructor_lower_cond_result_bool(self, &cr);
+                return generated_code::constructor_output_reg(self, reg);
+            }
+        }
+        let op = if mode & 2 != 0 {
+            ALUOp::Orr
+        } else {
+            ALUOp::And
+        };
+        let reg =
+            generated_code::constructor_alu_rs_imm_logic_commutative(self, &op, ty, a0, a1);
+        generated_code::constructor_output_reg(self, reg)
+    }
+
+    /// PLIRON: `select` of a compare against a constant arm produced as
+    /// a value — same fusion, declining to `lower_select`.
+    fn ccmp_sel_out(
+        &mut self,
+        mode: u8,
+        ty: Type,
+        cond: Value,
+        rn: Value,
+        rm: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> InstOutput {
+        let cr = generated_code::constructor_is_nonzero_cmp(self, cond);
+        if ccmp_on() {
+            if let Some(cr) = ccmp_chain(self, mode, &cr, cc_b, u, v) {
+                let reg = generated_code::constructor_lower_cond_result_bool(self, &cr);
+                return generated_code::constructor_output_reg(self, reg);
+            }
+        }
+        let regs = generated_code::constructor_lower_select(self, ty, &cr, rn, rm);
+        self.output(regs)
     }
 
     /// PLIRON bitfield fusion (`PLIRON_BFUSE`, default on): `(x>>k)&m`,

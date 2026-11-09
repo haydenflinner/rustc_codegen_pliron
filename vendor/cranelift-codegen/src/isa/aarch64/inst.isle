@@ -5249,6 +5249,65 @@
 (rule 1 (is_nonzero_cmp (maybe_uextend (icmp _ cc a b))) (emit_icmp cc a b))
 (rule 0 (is_nonzero_cmp val) (is_nonzero val))
 
+;; PLIRON (`PLIRON_CCMP`, default off): `band`/`bor` of two integer
+;; compares is one `cmp; ccmp` flag chain — the `a && b` / `a || b`
+;; idiom LLVM emits. `ccmp u,v,#nzcv,cc` applies the second compare
+;; only when the primary's condition held on its flags and forces the
+;; constant NZCV otherwise, so `brif`/`select`/`trapnz` consumers read
+;; the fused condition directly instead of `cset; cset; and` + test.
+;; The primary may be anything `emit_icmp` handles (narrow, i128);
+;; the secondary needs `ccmp`'s plain reg/reg form so it's gated to
+;; 32/64-bit operands. Both operand orders are tried since `band`/
+;; `bor` operands have no canonical order.
+;; The `mode` argument selects which of the four flag-chain shapes to
+;; build for a `cset condB` / `b.condB` consumer: `ccmp u,v,#nzcv,cc`
+;; applies B's compare only when `cc` held on the primary flags and
+;; forces the constant NZCV otherwise. bit0 = invert the primary cond
+;; for the guard; bit1 = the constant NZCV must satisfy (not falsify)
+;; `condB`.
+;;
+;;   mode 0 (`a && b`, `sel(A,B,0)`): guard = condA,   NZCV falsifies B
+;;   mode 1 (`!a && b`, `sel(A,0,B)`): guard = !condA,  NZCV falsifies B
+;;   mode 2 (`!a || b`, `sel(A,B,1)`): guard = condA,   NZCV satisfies B
+;;   mode 3 (`a || b`, `sel(A,1,B)`): guard = !condA,  NZCV satisfies B
+;; The fusion externs are total: when they decline (knob off, non-`Cond`
+;; primary, non-32/64-bit secondary compare) they build the same result
+;; the generic rules would — `is_nonzero` of the combination value for
+;; the `is_nonzero_cmp` consumers, or the plain `and`/`orr`/`select`
+;; for the `lower` value producers.
+(decl ccmp_band_cond (u8 Value IntCC Value Value IntCC Value Value) CondResult)
+(extern constructor ccmp_band_cond ccmp_band_cond)
+(decl ccmp_sel_cond (u8 Value Value IntCC Value Value) CondResult)
+(extern constructor ccmp_sel_cond ccmp_sel_cond)
+(decl ccmp_band_out (u8 Type Value IntCC Value Value Value IntCC Value Value) InstOutput)
+(extern constructor ccmp_band_out ccmp_band_out)
+(decl ccmp_sel_out (u8 Type Value Value Value IntCC Value Value) InstOutput)
+(extern constructor ccmp_sel_out ccmp_sel_out)
+
+(rule 2 (is_nonzero_cmp val @ (band _ (maybe_uextend (icmp _ cc0 x0 y0))
+                                     (maybe_uextend (icmp _ cc1 x1 y1))))
+        (ccmp_band_cond 0 val cc0 x0 y0 cc1 x1 y1))
+(rule 2 (is_nonzero_cmp val @ (bor _ (maybe_uextend (icmp _ cc0 x0 y0))
+                                    (maybe_uextend (icmp _ cc1 x1 y1))))
+        (ccmp_band_cond 3 val cc0 x0 y0 cc1 x1 y1))
+;; `select` of a compare against a constant arm is the same bool op.
+(rule 2 (is_nonzero_cmp val @ (select _ cond
+                                (maybe_uextend (icmp _ ccB u v))
+                                (u64_from_iconst 0)))
+        (ccmp_sel_cond 0 val cond ccB u v))
+(rule 3 (is_nonzero_cmp val @ (select _ cond
+                                (u64_from_iconst 0)
+                                (maybe_uextend (icmp _ ccB u v))))
+        (ccmp_sel_cond 1 val cond ccB u v))
+(rule 4 (is_nonzero_cmp val @ (select _ cond
+                                (maybe_uextend (icmp _ ccB u v))
+                                (u64_from_iconst 1)))
+        (ccmp_sel_cond 2 val cond ccB u v))
+(rule 5 (is_nonzero_cmp val @ (select _ cond
+                                (u64_from_iconst 1)
+                                (maybe_uextend (icmp _ ccB u v))))
+        (ccmp_sel_cond 3 val cond ccB u v))
+
 ;; Converts a `Value` to a `CondResult` with the condition being tested if
 ;; `Value` is nonzero.
 ;;

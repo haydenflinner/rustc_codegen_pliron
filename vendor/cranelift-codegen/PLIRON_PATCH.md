@@ -1449,3 +1449,23 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     base). ~214 dead movs crate-wide on rust-compression; held-out
     A/B neutral (0.999 [0.981,1.017]); gate green and a 400-seed fuzz
     sweep clean before the default-on flip.
+
+113. aarch64 `cmp; ccmp` compare-chain fusion (`PLIRON_CCMP`, default
+    off, `=1` opt-in; `isa/aarch64/inst.isle` + `lower.isle` +
+    `lower/isle.rs`): `band`/`bor` of two integer compares, and
+    `select` of a compare against a constant arm, lower as one
+    `cmp; ccmp` flag chain — the `a && b` / `a || b` idiom LLVM emits
+    (~421 `ccmp` on html-rewriter vs our prior 163 div-check uses).
+    `ccmp u,v,#nzcv,cc` applies the secondary compare only when the
+    guard held on the primary's flags and forces a constant NZCV
+    otherwise; `nzcv_for_cond` picks the constant by enumerating the
+    16 flag states. The secondary compare is restricted to 32/64-bit
+    operands (plain reg/reg `ccmp`); the primary may be anything
+    `emit_icmp` lowers. Both operand orders are tried (band/bor have
+    no canonical order). The externs are total — when they decline
+    they build exactly what the generic rules would (`is_nonzero` of
+    the combination, or `and`/`orr`/`select`), so `PLIRON_CCMP=0` is
+    byte-identical. Pairs with `PLIRON_FOLDCOMMON` in pliron-clif-opt,
+    which creates the `brif`-consumed `band`/`bor` shape upstream.
+    html-rewriter: +44 ccmp, −73 cset, −46 cmp, −36 and (−10 static
+    net, regalloc churn absorbs the rest); 12-round runtime wash.

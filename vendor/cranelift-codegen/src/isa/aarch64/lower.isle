@@ -1872,6 +1872,17 @@
 
 (rule (lower (band $I128 x y)) (i128_alu_bitop (ALUOp.And) $I64 x y))
 
+;; PLIRON (`PLIRON_CCMP`, default off): a `band`/`bor` of two integer
+;; compares whose result is consumed as a value is `cmp; ccmp; cset`
+;; (3) instead of `cmp; cset; cmp; cset; and` (5) — `ccmp_band_out`
+;; emits the fused chain or, declining, the base `and`/`orr` on the
+;; bound arm values. `fits_in_32` covers the i8 (`icmp` result) and
+;; i32 (uextend'd bool) shapes.
+(rule 55 (lower (band (fits_in_64 (ty_int ty))
+                      a0 @ (maybe_uextend (icmp _ cc0 x0 y0))
+                      a1 @ (maybe_uextend (icmp _ cc1 x1 y1))))
+      (ccmp_band_out 0 ty a0 cc0 x0 y0 a1 cc1 x1 y1))
+
 ;; Specialized lowerings for `(band x (bnot y))` which is additionally produced
 ;; by Cranelift's `band_not` builder method, which emits the simpler
 ;; forms early on.
@@ -1897,6 +1908,13 @@
 
 (rule bor_fits_in_64 -4 (lower (bor (fits_in_64 (ty_int ty)) x y))
       (alu_rs_imm_logic_commutative (ALUOp.Orr) ty x y))
+
+;; PLIRON (`PLIRON_CCMP`, default off): `bor` of two compares as a
+;; value — `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; cset; orr` (5).
+(rule 55 (lower (bor (fits_in_64 (ty_int ty))
+                     a0 @ (maybe_uextend (icmp _ cc0 x0 y0))
+                     a1 @ (maybe_uextend (icmp _ cc1 x1 y1))))
+      (ccmp_band_out 3 ty a0 cc0 x0 y0 a1 cc1 x1 y1))
 
 (rule -3 (lower (bor (fits_in_64 (ty_scalar_float ty)) x y))
       (orr_vec x y (float_vector_size_in_64 ty)))
@@ -2988,6 +3006,29 @@
   (side_effect (trap_if_cond_result (is_nonzero_cmp val) trap_code)))
 
 ;;;; Rules for `select` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; PLIRON (`PLIRON_CCMP`, default off): `select` of a compare against a
+;; constant arm is the bool op `ccmp_sel_out` builds —
+;; `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; csel`-plus-materialization;
+;; declining it emits the base `lower_select` on the bound arms.
+;; Modes per arm order: (B,0)=0 `A&&B`, (0,B)=1 `!A&&B`,
+;; (B,1)=2 `!A||B`, (1,B)=3 `A||B`.
+(rule 1 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (maybe_uextend (icmp _ ccB u v))
+                       rm @ (u64_from_iconst 0)))
+      (ccmp_sel_out 0 ty cond rn rm ccB u v))
+(rule 2 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (u64_from_iconst 0)
+                       rm @ (maybe_uextend (icmp _ ccB u v))))
+      (ccmp_sel_out 1 ty cond rn rm ccB u v))
+(rule 3 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (maybe_uextend (icmp _ ccB u v))
+                       rm @ (u64_from_iconst 1)))
+      (ccmp_sel_out 2 ty cond rn rm ccB u v))
+(rule 4 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (u64_from_iconst 1)
+                       rm @ (maybe_uextend (icmp _ ccB u v))))
+      (ccmp_sel_out 3 ty cond rn rm ccB u v))
 
 (rule (lower (select ty cond rn rm))
   (lower_select ty (is_nonzero_cmp cond) rn rm))
