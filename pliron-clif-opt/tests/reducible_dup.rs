@@ -58,7 +58,7 @@ fn dispatch_dup_keeps_the_cfg_reducible() {
         "block1 got the clone:\n{}",
         f.display()
     );
-    let n = pliron_clif_opt::taildup::run(&mut f);
+    let n = pliron_clif_opt::taildup::run(&mut f, &rustc_hash::FxHashMap::default());
     assert!(
         !pliron_clif_opt::taildup::irreducible(&f),
         "taildup ({n} clones) made it irreducible:\n{}",

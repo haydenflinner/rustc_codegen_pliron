@@ -20,8 +20,15 @@ pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
     derived: &mut VMap<Value>,
+    prof: &FxHashMap<Block, u64>,
 ) -> usize {
-    run_with(func, an, derived, pliron_cfg::env_is("PLIRON_LOOPROT_SINK", "1"))
+    run_with(
+        func,
+        an,
+        derived,
+        pliron_cfg::env_is("PLIRON_LOOPROT_SINK", "1"),
+        prof,
+    )
 }
 
 /// `run` with the latch sink (`sink_to_latch`) chosen by the caller
@@ -32,16 +39,24 @@ pub fn run_with(
     an: &mut crate::pipeline::Analysis,
     derived: &mut VMap<Value>,
     sink: bool,
+    prof: &FxHashMap<Block, u64>,
 ) -> usize {
     // Each block is evaluated once, in layout order: re-scanning let cloned
     // headers created by earlier rotations starve late-layout loops (e.g.
     // bcheck clones appended at the end) of the rotation budget.
+    // `PLIRON_LOOPROT_COLD` (opt-in): skip loops a cold mark or a zero
+    // PGO count flags — rotating them duplicates the exit test for a
+    // path that never runs hot.
+    let cold = pliron_cfg::env_is("PLIRON_LOOPROT_COLD", "1");
     let reducible = crate::jumpthread::keep_reducible();
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for h in blocks {
         if n >= MAX_ROTATIONS {
             break;
+        }
+        if cold && (func.layout.is_cold(h) || prof.get(&h) == Some(&0)) {
+            continue;
         }
         // Layout-only checks run before the `cfg_dt` borrow: after a
         // rotation the analysis is stale, so every later block that

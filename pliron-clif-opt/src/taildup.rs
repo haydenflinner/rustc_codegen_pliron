@@ -179,8 +179,20 @@ pub fn irreducible(func: &Function) -> bool {
 }
 
 /// Returns the number of jumps replaced by a copy of the return block.
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
     let edge_on = crate::pass_enabled("PLIRON_TAILDUP_EDGE");
+    // `PLIRON_TAILDUP_COLD` (opt-in): skip tails and preds a cold mark
+    // or a zero PGO count flags — duplicating into them is code size
+    // with no hot-path payoff.
+    let cold_blocks: FxHashSet<Block> = if pliron_cfg::env_is("PLIRON_TAILDUP_COLD", "1") {
+        func.layout
+            .blocks()
+            .filter(|&b| func.layout.is_cold(b) || prof.get(&b) == Some(&0))
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
+    let is_cold = |b: Block| cold_blocks.contains(&b);
     let reducible = crate::jumpthread::keep_reducible();
     let entry = func.layout.entry_block();
     let mut cfg = ControlFlowGraph::with_function(func);
@@ -216,7 +228,7 @@ pub fn run(func: &mut Function) -> usize {
     let rets: FxHashSet<Block> = func
         .layout
         .blocks()
-        .filter(|&b| Some(b) != entry && candidate(func, &uses, b))
+        .filter(|&b| Some(b) != entry && !is_cold(b) && candidate(func, &uses, b))
         .collect();
     if rets.is_empty() {
         return 0;
@@ -224,6 +236,9 @@ pub fn run(func: &mut Function) -> usize {
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for p in blocks {
+        if is_cold(p) {
+            continue;
+        }
         let Some(t) = func.layout.last_inst(p) else {
             continue;
         };
@@ -548,7 +563,7 @@ mod tests {
         let mut cur = FuncCursor::new(&mut func).at_bottom(ret_b);
         cur.ins().return_(&[y]);
 
-        let n = run(&mut func);
+        let n = run(&mut func, &FxHashMap::default());
         assert!(n >= 2, "expected both clones, ran {n}:\n{}", func.display());
 
         // The brif cloned into `q` must still test `c == ..`, i.e. its arg's

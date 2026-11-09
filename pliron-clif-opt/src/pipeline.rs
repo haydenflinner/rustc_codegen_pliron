@@ -2349,7 +2349,7 @@ fn s_tailmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_taildup(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = taildup::run(&mut p.clctx.func);
+    let k = taildup::run(&mut p.clctx.func, p.prof);
     p.stats.dupd += k;
     k
 }
@@ -4203,7 +4203,7 @@ fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = looprot::run(&mut p.clctx.func, an, p.derived);
+    let k = looprot::run(&mut p.clctx.func, an, p.derived, p.prof);
     p.dump("looprot");
     k
 }

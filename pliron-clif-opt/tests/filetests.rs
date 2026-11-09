@@ -64,12 +64,24 @@ fn pass(name: &str) -> Pass {
         "looprot" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             let mut derived = pliron_clif_opt::vmap::VMap::default();
-            pliron_clif_opt::looprot::run_with(f, &mut an, &mut derived, false)
+            pliron_clif_opt::looprot::run_with(
+                f,
+                &mut an,
+                &mut derived,
+                false,
+                &rustc_hash::FxHashMap::default(),
+            )
         },
         "looprot_sink" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             let mut derived = pliron_clif_opt::vmap::VMap::default();
-            pliron_clif_opt::looprot::run_with(f, &mut an, &mut derived, true)
+            pliron_clif_opt::looprot::run_with(
+                f,
+                &mut an,
+                &mut derived,
+                true,
+                &rustc_hash::FxHashMap::default(),
+            )
         },
         "brhint" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
