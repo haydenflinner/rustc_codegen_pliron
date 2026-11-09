@@ -1574,7 +1574,7 @@ fn plan(
     let mut fully_guarded = None;
     let mut with_early = None;
     for &e in &info.exits {
-        let Some(c) = count(func, dt, &info, &kinds, e, body_mem) else {
+        let Some(c) = count(func, dt, &info, &kinds, e, body_mem, false) else {
             continue;
         };
         let mut ps = Vec::new();
@@ -1590,7 +1590,7 @@ fn plan(
             // `post_tested` isn't compared: it's per-exit (a memory op in
             // the sibling's own latch block, not a trip-count property) —
             // only the chosen exit's value drives the epilogue-entry pred.
-            let c2 = count(func, dt, &info, &kinds, e2, body_mem);
+            let c2 = count(func, dt, &info, &kinds, e2, body_mem, false);
             if c2.as_ref().is_some_and(|c2| {
                 c2.iv == c.iv
                     && c2.bound == c.bound
@@ -2480,6 +2480,8 @@ fn subst(e: &Ins, iv: Value, w: Value) -> Ins {
         Ins::Mul(a, b) => Ins::Mul(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
         Ins::And(a, b) => Ins::And(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
         Ins::Div(a, b) => Ins::Div(Box::new(subst(a, iv, w)), Box::new(subst(b, iv, w))),
+        // `loopidiom`-only leaf; `subst` never sees one, clone anyway.
+        Ins::Load(v, o, t, f) => Ins::Load(*v, *o, *t, *f),
     }
 }
 

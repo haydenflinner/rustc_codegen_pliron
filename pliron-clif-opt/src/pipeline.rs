@@ -4420,6 +4420,18 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // the back edge.
         .needs_any(shape::LOOPS | shape::CONDBR),
         cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
+        // Post-rotation dead-loop idioms (`PLIRON_LOOPDEL`): `looprot`
+        // produces the post-tested single-latch shape `plan_dead` folds —
+        // memory-carried countdowns like montgomery's `*p = --i`, which
+        // punroll would otherwise peel into per-copy dispatch chains.
+        step(
+            "loopdel",
+            "idiom",
+            Gate::OptIn("PLIRON_LOOPDEL"),
+            s_loopidiom,
+        )
+        .needs(shape::LOOPS | shape::MEM)
+        .creates_all(),
         // `brif c` args that are `select c, a, b`: `a`/`b` per edge (the
         // TrustedRandomAccess zip's if-converted index update becomes
         // affine before the IV passes below).

@@ -367,6 +367,12 @@ pub enum Ins {
     Mul(Box<Ins>, Box<Ins>),
     And(Box<Ins>, Box<Ins>),
     Div(Box<Ins>, Box<Ins>),
+    /// Re-execute one load on the fast path — `ld ty (addr+off)`. Produced
+    /// only for in-loop loads whose last-iteration read the post-store
+    /// emission position reproduces (`plan_dead`'s `loadable` set); never
+    /// inside `preds`/`iters` or an rmw `fin`, which emit on the other
+    /// side of the folded stores.
+    Load(Value, i32, Type, MemFlagsData),
 }
 
 /// `e` evaluates to a known constant (constants and `iconst` values folded
@@ -384,6 +390,7 @@ pub fn ins_eval(func: &Function, e: &Ins) -> Option<i64> {
         Ins::Div(a, b) => {
             (ins_eval(func, a)? as u64).checked_div(ins_eval(func, b)? as u64)? as i64
         }
+        Ins::Load(..) => return None,
     })
 }
 
@@ -796,6 +803,31 @@ pub fn emit(pos: &mut FuncCursor, ty: Type, e: &Ins) -> Value {
             let (a, b) = (emit(pos, ty, a), emit(pos, ty, b));
             pos.ins().udiv(a, b)
         }
+        Ins::Load(v, off, lty, flags) => {
+            let r = pos.ins().load(*lty, *flags, *v, *off);
+            if *lty == ty {
+                r
+            } else if lty.bits() < ty.bits() {
+                pos.ins().uextend(ty, r)
+            } else {
+                pos.ins().ireduce(ty, r)
+            }
+        }
+    }
+}
+
+/// Does `e`'s emission include a fast-path load (must run after the
+/// folded stores, on the memory-work branch)?
+fn ins_has_load(e: &Ins) -> bool {
+    match e {
+        Ins::Load(..) => true,
+        Ins::Add(a, b)
+        | Ins::Sub(a, b)
+        | Ins::SatSub(a, b)
+        | Ins::Mul(a, b)
+        | Ins::And(a, b)
+        | Ins::Div(a, b) => ins_has_load(a) || ins_has_load(b),
+        _ => false,
     }
 }
 
@@ -975,6 +1007,7 @@ pub fn count(
     kinds: &[Param],
     exit: Edge,
     store: Inst,
+    relax: bool,
 ) -> Option<Count> {
     let InstructionData::Brif { arg, .. } = func.dfg.insts[exit.inst] else {
         return None;
@@ -1007,15 +1040,25 @@ pub fn count(
         _ => return None,
     };
     let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+    let bound_of = |v: Value| {
+        outv(func, info, kinds, v).or_else(|| {
+            // `relax` also accepts an in-body `iconst`: `emit` remats
+            // constant defs at the cursor, so `Ins::Val` still resolves
+            // at the pre-loop emission point.
+            (relax && iconst(func, v).is_some()).then_some(v)
+        })
+    };
     let ((idx, on_next), bound) = if let Some(t) = iv_side(func, info, kinds, x) {
-        (t, outv(func, info, kinds, y)?)
+        (t, bound_of(y)?)
     } else {
-        (iv_side(func, info, kinds, y)?, outv(func, info, kinds, x)?)
+        (iv_side(func, info, kinds, y)?, bound_of(x)?)
     };
     let Param::Step(step) = kinds[idx] else {
         return None;
     };
-    if step <= 0 {
+    // Countdowns (`step < 0`) only under `relax` — `plan_dead`'s folded
+    // countdown idiom; `Param::Step(0)` never occurs.
+    if step < 0 && !relax {
         return None;
     }
     Some(Count {
@@ -1493,6 +1536,18 @@ pub fn trips_idx(cnt: &Count) -> Option<(Ins, Vec<Pred>)> {
             };
             Some((Ins::Add(Box::new(count), Box::new(Ins::K(1))), Vec::new()))
         }
+        // do-while `iv+step >= bound` counting down (`step < 0`): the iv
+        // descends to `bound-1` and exits — count = iv0 - bound + 1.
+        // Wrap arithmetic is the true count when `iv0 < bound`: the loop
+        // itself wraps through u64::MAX to reach `bound-1`, and every
+        // consumer of `iters` is affine mod 2^64, matching it.
+        (IntCC::UnsignedGreaterThanOrEqual, true, true) if cnt.step < 0 => Some((
+            Ins::Add(
+                Box::new(Ins::Sub(Box::new(iv0()), Box::new(n()))),
+                Box::new(Ins::K(1)),
+            ),
+            Vec::new(),
+        )),
         _ => None,
     }
 }
@@ -1656,7 +1711,7 @@ pub fn plan(
         .exits
         .iter()
         .find_map(|&e| {
-            let c = count(func, dt, &info, &kinds, e, s)?;
+            let c = count(func, dt, &info, &kinds, e, s, false)?;
             let mut ps = Vec::new();
             for &e2 in &info.exits {
                 if e2 == e {
@@ -2043,6 +2098,7 @@ fn arg_ins(
     kinds: &[Param],
     itb: &Ins,
     fwd: &FxHashMap<Value, Ins>,
+    loadable: &FxHashSet<Inst>,
     v: Value,
     depth: u32,
 ) -> Option<Ins> {
@@ -2084,12 +2140,24 @@ fn arg_ins(
     {
         return Some(Ins::Val(v));
     }
+    // A `loadable` in-loop load's exit-iteration read is one load on the
+    // fast path, emitted after the folded stores.
+    if let InstructionData::Load { arg, offset, .. } = func.dfg.insts[i]
+        && loadable.contains(&i)
+    {
+        let a = outv(func, info, kinds, func.dfg.resolve_aliases(arg))?;
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        let flags = func.dfg.insts[i]
+            .memflags_data(&func.dfg)
+            .unwrap_or_else(MemFlagsData::new);
+        return Some(Ins::Load(a, i32::from(offset), ty, flags));
+    }
     let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
         return None;
     };
     let (a, b) = (
-        arg_ins(func, info, kinds, itb, fwd, args[0], depth + 1)?,
-        arg_ins(func, info, kinds, itb, fwd, args[1], depth + 1)?,
+        arg_ins(func, info, kinds, itb, fwd, loadable, args[0], depth + 1)?,
+        arg_ins(func, info, kinds, itb, fwd, loadable, args[1], depth + 1)?,
     );
     Some(match opcode {
         Opcode::Iadd => Ins::Add(Box::new(a), Box::new(b)),
@@ -2133,6 +2201,8 @@ fn rmw_locs(
     dt: &DominatorTree,
     info: &Info,
     kinds: &[Param],
+    itb: &Ins,
+    set_iv: bool,
     loads: &[Inst],
     stores: &[Inst],
 ) -> Option<Vec<RmwLoc>> {
@@ -2170,10 +2240,15 @@ fn rmw_locs(
         e.1 = e.1.max(i64::from(ty.bytes()));
         e.3 = Some(i);
     }
-    // At most one non-stack root, and its locations must not overlap.
+    // At most one non-stack *stored* root, and its locations must not
+    // overlap — a second param root may alias the first's pointee, so two
+    // param-rooted stores could fight over one address with an order the
+    // folded emission can't reproduce. Load-only locs are exempt: they
+    // re-execute on the fast path (`loadable`), which orders them after
+    // every folded store regardless of aliasing.
     let mut vroot: Option<(Root, Vec<(i64, i64)>)> = None;
-    for (&(r, o), &(_, w, _, _)) in &groups {
-        if let Root::S(_) = r {
+    for (&(r, o), &(_, w, _, st)) in &groups {
+        if st.is_none() || matches!(r, Root::S(_)) {
             continue;
         }
         match &mut vroot {
@@ -2249,14 +2324,32 @@ fn rmw_locs(
                         opcode: Opcode::Isub,
                         args: [a, b],
                     } if is_ld(a) => RmwDelta::Sub(Ins::Val(outv(func, info, kinds, b)?)),
+                    // `st(f(iv))` (`PLIRON_LOOPDEL`): the last iteration
+                    // writes the closed form at `itb`. An empty
+                    // `loadable` keeps in-loop loads out of the value —
+                    // this emission precedes the loc's own folded store.
+                    _ if set_iv => {
+                        let (ef, el) = (FxHashMap::default(), FxHashSet::default());
+                        let ins = arg_ins(func, info, kinds, itb, &ef, &el, sval, 0)?;
+                        RmwDelta::Set(ins)
+                    }
                     _ => return None,
                 },
                 _ => {
                     if let Some(k) = iconst(func, sval) {
                         RmwDelta::Set(Ins::K(k))
-                    } else {
-                        let v = outv(func, info, kinds, sval)?;
+                    } else if let Some(v) = outv(func, info, kinds, sval) {
                         RmwDelta::Set(Ins::Val(v))
+                    } else if set_iv {
+                        // `st(f(iv))` — the last iteration writes the
+                        // closed form at `itb`. An empty `loadable` keeps
+                        // in-loop loads out of the value: this emission
+                        // precedes the loc's own folded store.
+                        let (ef, el) = (FxHashMap::default(), FxHashSet::default());
+                        let ins = arg_ins(func, info, kinds, itb, &ef, &el, sval, 0)?;
+                        RmwDelta::Set(ins)
+                    } else {
+                        return None;
                     }
                 }
             }
@@ -2341,16 +2434,43 @@ fn plan_dead(
             }
         }
     }
-    // Memory work confined to disjoint invariant-address `ld`/`st` pairs
-    // folds into a same-address RMW chain closed-form on the fast path.
-    let rmw = if loads.is_empty() && stores.is_empty() {
-        Vec::new()
-    } else {
-        let Some(r) = rmw_locs(func, ps, na, dt, &info, &kinds, &loads, &stores) else {
-            why!("dead: rmw shape {:?}", info.h);
-        };
-        r
-    };
+    // `PLIRON_LOOPDEL` (opt-in): an in-loop load may be re-executed once
+    // on the fast path when its last-iteration read is reproducible
+    // there — its address root is loop-invariant and either every store
+    // dominates it (its last read is the post-store state, which the
+    // post-store emission position sees) or its loc is provably disjoint
+    // from every stored loc (the value never changes).
+    let loopdel = pliron_cfg::env_is("PLIRON_LOOPDEL", "1");
+    let mut loadable = FxHashSet::default();
+    if loopdel {
+        for &l in &loads {
+            let InstructionData::Load { arg, .. } = func.dfg.insts[l] else {
+                continue;
+            };
+            let ok = match loadfwd::norm_root(func, ps, na, arg).0 {
+                Root::S(_) => true,
+                Root::V(v) => {
+                    !def_block(func, v).is_some_and(|b| info.body.contains(&b))
+                        && (stores
+                            .iter()
+                            .all(|&s| dt.try_dominates(s, l, &func.layout))
+                            || stores.iter().all(|&s| {
+                                let InstructionData::Store { args, .. } = func.dfg.insts[s]
+                                else {
+                                    return false;
+                                };
+                                matches!(
+                                    loadfwd::norm_root(func, ps, na, args[1]).0,
+                                    Root::S(_)
+                                )
+                            }))
+                }
+            };
+            if ok {
+                loadable.insert(l);
+            }
+        }
+    }
     'exits: for &e in &info.exits {
         // The iv update inst stands in for `count`'s `store` argument: its
         // dominance over the exit is exactly "the body ran before the
@@ -2398,7 +2518,8 @@ fn plan_dead(
                 Some(upd)
             }
         })();
-        let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s)) else {
+        let Some(cnt) = upd.and_then(|s| count(func, dt, &info, &kinds, e, s, loopdel))
+        else {
             if pliron_cfg::tracing_on()
                 && tracing::enabled!(target: "pliron::loopidiom", tracing::Level::DEBUG)
             {
@@ -2408,11 +2529,6 @@ fn plan_dead(
             }
             continue;
         };
-        // A store folded into the RMW form only runs when the loop body
-        // executes at least once — post-tested counts guarantee that.
-        if !rmw.is_empty() && !cnt.post_tested {
-            continue;
-        }
         let mut inv_preds = Vec::new();
         if !info.exits.iter().all(|&e2| {
             e2 == e
@@ -2441,6 +2557,25 @@ fn plan_dead(
         } else {
             iters.clone()
         };
+        // Memory work confined to disjoint invariant-address `ld`/`st`
+        // pairs folds into a same-address RMW chain closed-form on the
+        // fast path. Computed per exit: `set_iv` store values evaluate
+        // the iv at this exit's `itb`.
+        let rmw = if loads.is_empty() && stores.is_empty() {
+            Vec::new()
+        } else {
+            let Some(r) = rmw_locs(
+                func, ps, na, dt, &info, &kinds, &itb, loopdel, &loads, &stores,
+            ) else {
+                continue 'exits;
+            };
+            r
+        };
+        // A store folded into the RMW form only runs when the loop body
+        // executes at least once — post-tested counts guarantee that.
+        if !rmw.is_empty() && !cnt.post_tested {
+            continue;
+        }
         // Fold statically-known preds (e.g. `iv0 < bound` with both
         // constant); a statically-false one means the fast path can never
         // run, so skip the transform entirely.
@@ -2474,7 +2609,8 @@ fn plan_dead(
             }
             exit_args.clear();
             for &v in &args {
-                let Some(a) = arg_ins(func, &info, &kinds, &itb, &fwd, v, 0) else {
+                let Some(a) = arg_ins(func, &info, &kinds, &itb, &fwd, &loadable, v, 0)
+                else {
                     continue 'exits;
                 };
                 exit_args.push(a);
@@ -2541,7 +2677,9 @@ fn plan_dead(
                         why!("dead: {b:?} reads loop values");
                     }
                     if !escapes.iter().any(|&(v, _)| v == a) {
-                        let Some(ins) = arg_ins(func, &info, &kinds, &itb, &fwd, a, 0) else {
+                        let Some(ins) =
+                            arg_ins(func, &info, &kinds, &itb, &fwd, &loadable, a, 0)
+                        else {
                             continue 'exits;
                         };
                         escapes.push((a, ins));
@@ -2561,7 +2699,9 @@ fn plan_dead(
                             why!("dead: {b:?} reads loop values");
                         }
                         if !escapes.iter().any(|&(e, _)| e == v) {
-                            let Some(ins) = arg_ins(func, &info, &kinds, &itb, &fwd, v, 0) else {
+                            let Some(ins) =
+                                arg_ins(func, &info, &kinds, &itb, &fwd, &loadable, v, 0)
+                            else {
                                 continue 'exits;
                             };
                             escapes.push((v, ins));
@@ -2593,7 +2733,16 @@ fn apply_dead(
     func: &mut Function,
     p: &DeadPlan,
     tcfg: cranelift_codegen::isa::TargetFrontendConfig,
+    dt: &DominatorTree,
 ) {
+    // `dt` predates this rewrite — `block_dominates` reads garbage
+    // (`SecondaryMap` defaults) for blocks created below, so resolve
+    // `exit_dest`'s dominion before any `make_block`.
+    let dominated: FxHashSet<Block> = func
+        .layout
+        .blocks()
+        .filter(|&b| b == p.exit_dest || dt.block_dominates(p.exit_dest, b))
+        .collect();
     let pblock = func.layout.inst_block(p.entry.inst).unwrap();
     let nb = func.dfg.make_block();
     func.layout.insert_block_after(nb, pblock);
@@ -2617,13 +2766,17 @@ fn apply_dead(
         })
         .collect();
     if !new_params.is_empty() {
-        // Rewrite escaping uses to the new params — everywhere, not just
-        // in `exit_dest`: forwarder-param escapes (`fwd`) can be read in
-        // any block `dest` dominates (std `PathBuf::__push` had a
-        // `call fn2(v0, v1432, …)` two blocks down). This runs BEFORE
-        // args are appended to the old edges so the freshly-passed
-        // originals aren't remapped — `np` isn't in scope on those
-        // edges.
+        // Rewrite escaping uses to the new params — in `exit_dest` and
+        // the blocks it dominates, not everywhere: forwarder-param
+        // escapes (`fwd`) can be read in any block `dest` dominates (std
+        // `PathBuf::__push` had a `call fn2(v0, v1432, …)` two blocks
+        // down), but the loop itself stays reachable on the non-fast
+        // path and its body still binds `v` — rewriting in-body uses to
+        // `np` leaves a use `np` doesn't dominate (egg's
+        // `SymbolLang::matches` latch counted `v147+1` after `v120` was
+        // sunk). This runs BEFORE args are appended to the old edges so
+        // the freshly-passed originals aren't remapped — `np` isn't in
+        // scope on those edges.
         let remap: FxHashMap<Value, Value> = p
             .escapes
             .iter()
@@ -2631,6 +2784,9 @@ fn apply_dead(
             .flat_map(|(&(v, _), &np)| [(v, np), (func.dfg.resolve_aliases(v), np)])
             .collect();
         for b in func.layout.blocks().collect::<Vec<_>>() {
+            if !dominated.contains(&b) {
+                continue;
+            }
             let insts: Vec<Inst> = func.layout.block_insts(b).collect();
             for i in insts {
                 for a in func.dfg.inst_args_mut(i) {
@@ -2698,21 +2854,18 @@ fn apply_dead(
             Some(o) => pos.ins().band(o, c),
         });
     }
-    let mut exit_args: Vec<BlockArg> = Vec::with_capacity(p.exit_args.len() + p.escapes.len());
-    for (j, ins) in p.exit_args.iter().enumerate() {
-        let ty = pos.func.dfg.value_type(dst_params[j]);
-        let v = emit(&mut pos, ty, ins);
-        exit_args.push(BlockArg::Value(v));
-    }
-    for (&np, (_, ins)) in new_params.iter().zip(&p.escapes) {
-        let ty = pos.func.dfg.value_type(np);
-        let v = emit(&mut pos, ty, ins);
-        exit_args.push(BlockArg::Value(v));
-    }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
-    if !p.rmw.is_empty() {
-        // The folded RMW load/stores are side effects: they may only run
-        // on the fast path, so they go in a block past the preds check.
+    // Fast-path loads in the exit args (a `loadable` in-loop load) must
+    // emit past the preds check and after the folded stores: their
+    // in-loop reads were dominated by every store, so the last-iteration
+    // read is the post-store state.
+    let mem_side = !p.rmw.is_empty()
+        || p
+            .exit_args
+            .iter()
+            .chain(p.escapes.iter().map(|e| &e.1))
+            .any(ins_has_load);
+    if mem_side {
         let mb = pos.func.dfg.make_block();
         pos.func.layout.insert_block_after(mb, nb);
         match ok {
@@ -2729,27 +2882,47 @@ fn apply_dead(
                 RmwAddr::V(e) => emit(&mut pos, pty, e),
                 RmwAddr::S(ss) => pos.ins().stack_addr(pty, *ss, 0),
             };
-            let init = pos.ins().load(r.ty, r.load_flags, a, r.offset);
             let fin = match &r.delta {
-                RmwDelta::Keep => init,
-                RmwDelta::Add(d) => {
-                    let d = emit(&mut pos, r.ty, d);
-                    let n = emit(&mut pos, r.ty, &p.iters);
-                    let m = pos.ins().imul(d, n);
-                    pos.ins().iadd(init, m)
-                }
-                RmwDelta::Sub(d) => {
-                    let d = emit(&mut pos, r.ty, d);
-                    let n = emit(&mut pos, r.ty, &p.iters);
-                    let m = pos.ins().imul(d, n);
-                    pos.ins().isub(init, m)
-                }
                 RmwDelta::Set(v) => emit(&mut pos, r.ty, v),
+                RmwDelta::Keep => pos.ins().load(r.ty, r.load_flags, a, r.offset),
+                RmwDelta::Add(d) | RmwDelta::Sub(d) => {
+                    let init = pos.ins().load(r.ty, r.load_flags, a, r.offset);
+                    let d = emit(&mut pos, r.ty, d);
+                    let n = emit(&mut pos, r.ty, &p.iters);
+                    let m = pos.ins().imul(d, n);
+                    match r.delta {
+                        RmwDelta::Add(_) => pos.ins().iadd(init, m),
+                        _ => pos.ins().isub(init, m),
+                    }
+                }
             };
             pos.ins().store(r.store_flags, fin, a, r.offset);
         }
+        let mut exit_args: Vec<BlockArg> =
+            Vec::with_capacity(p.exit_args.len() + p.escapes.len());
+        for (j, ins) in p.exit_args.iter().enumerate() {
+            let ty = pos.func.dfg.value_type(dst_params[j]);
+            let v = emit(&mut pos, ty, ins);
+            exit_args.push(BlockArg::Value(v));
+        }
+        for (&np, (_, ins)) in new_params.iter().zip(&p.escapes) {
+            let ty = pos.func.dfg.value_type(np);
+            let v = emit(&mut pos, ty, ins);
+            exit_args.push(BlockArg::Value(v));
+        }
         pos.ins().jump(p.exit_dest, &exit_args);
         return;
+    }
+    let mut exit_args: Vec<BlockArg> = Vec::with_capacity(p.exit_args.len() + p.escapes.len());
+    for (j, ins) in p.exit_args.iter().enumerate() {
+        let ty = pos.func.dfg.value_type(dst_params[j]);
+        let v = emit(&mut pos, ty, ins);
+        exit_args.push(BlockArg::Value(v));
+    }
+    for (&np, (_, ins)) in new_params.iter().zip(&p.escapes) {
+        let ty = pos.func.dfg.value_type(np);
+        let v = emit(&mut pos, ty, ins);
+        exit_args.push(BlockArg::Value(v));
     }
     match ok {
         Some(ok) => {
@@ -2805,7 +2978,7 @@ pub fn run(
                         tracing::debug!(target: "pliron::loopidiom", "idiom {fname}: dead loop {:?} eliminated", d.h)
                     };
                 }
-                apply_dead(func, &d, tcfg);
+                apply_dead(func, &d, tcfg, dt);
                 done.insert(d.h);
             } else {
                 continue;
