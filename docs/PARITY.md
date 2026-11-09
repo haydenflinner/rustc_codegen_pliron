@@ -150,7 +150,12 @@ held-out A/B `bja/pliron` geomean 0.985
 `imms`-encoding miscompile (`band (ishl x,k), m` emitted `ubfx`
 where `ubfiz` was meant — fuzz seed 6279) is fixed in 02baa35;
 narrowext bit 32 (`ushr`-of-clean + narrow logical `lsr` fusion) is
-default-on in c1fc7d8.
+default-on in c1fc7d8. `PLIRON_CCMP` aarch64 compare-chain fusion is
+default-on (4144dde). `PLIRON_LOOPDEL` post-rotation dead-loop
+deletion is default-on (64ca6c2 + d205f29): `st(f(iv))` countdown
+loops fold to one closed-form store (`montgomery` 858→816 insns);
+held-out A/B `loopdel/pliron` geomean 0.994 [0.977,1.015],
+html-rewriter 0.978* — `history/2026-11-11-loopdel-countdown.md`.
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
