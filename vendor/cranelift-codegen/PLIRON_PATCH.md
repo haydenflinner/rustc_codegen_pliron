@@ -1450,8 +1450,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     A/B neutral (0.999 [0.981,1.017]); gate green and a 400-seed fuzz
     sweep clean before the default-on flip.
 
-113. aarch64 `cmp; ccmp` compare-chain fusion (`PLIRON_CCMP`, default
-    off, `=1` opt-in; `isa/aarch64/inst.isle` + `lower.isle` +
+113. aarch64 `cmp; ccmp` compare-chain fusion (`PLIRON_CCMP`, default on, `=0` off; `isa/aarch64/inst.isle` + `lower.isle` +
     `lower/isle.rs`): `band`/`bor` of two integer compares, and
     `select` of a compare against a constant arm, lower as one
     `cmp; ccmp` flag chain — the `a && b` / `a || b` idiom LLVM emits

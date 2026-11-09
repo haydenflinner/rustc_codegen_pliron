@@ -5249,7 +5249,7 @@
 (rule 1 (is_nonzero_cmp (maybe_uextend (icmp _ cc a b))) (emit_icmp cc a b))
 (rule 0 (is_nonzero_cmp val) (is_nonzero val))
 
-;; PLIRON (`PLIRON_CCMP`, default off): `band`/`bor` of two integer
+;; PLIRON (`PLIRON_CCMP`, default on): `band`/`bor` of two integer
 ;; compares is one `cmp; ccmp` flag chain — the `a && b` / `a || b`
 ;; idiom LLVM emits. `ccmp u,v,#nzcv,cc` applies the second compare
 ;; only when the primary's condition held on its flags and forces the

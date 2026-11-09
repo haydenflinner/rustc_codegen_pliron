@@ -1872,7 +1872,7 @@
 
 (rule (lower (band $I128 x y)) (i128_alu_bitop (ALUOp.And) $I64 x y))
 
-;; PLIRON (`PLIRON_CCMP`, default off): a `band`/`bor` of two integer
+;; PLIRON (`PLIRON_CCMP`, default on): a `band`/`bor` of two integer
 ;; compares whose result is consumed as a value is `cmp; ccmp; cset`
 ;; (3) instead of `cmp; cset; cmp; cset; and` (5) — `ccmp_band_out`
 ;; emits the fused chain or, declining, the base `and`/`orr` on the
@@ -1909,7 +1909,7 @@
 (rule bor_fits_in_64 -4 (lower (bor (fits_in_64 (ty_int ty)) x y))
       (alu_rs_imm_logic_commutative (ALUOp.Orr) ty x y))
 
-;; PLIRON (`PLIRON_CCMP`, default off): `bor` of two compares as a
+;; PLIRON (`PLIRON_CCMP`, default on): `bor` of two compares as a
 ;; value — `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; cset; orr` (5).
 (rule 55 (lower (bor (fits_in_64 (ty_int ty))
                      a0 @ (maybe_uextend (icmp _ cc0 x0 y0))
@@ -3007,7 +3007,7 @@
 
 ;;;; Rules for `select` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; PLIRON (`PLIRON_CCMP`, default off): `select` of a compare against a
+;; PLIRON (`PLIRON_CCMP`, default on): `select` of a compare against a
 ;; constant arm is the bool op `ccmp_sel_out` builds —
 ;; `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; csel`-plus-materialization;
 ;; declining it emits the base `lower_select` on the bound arms.

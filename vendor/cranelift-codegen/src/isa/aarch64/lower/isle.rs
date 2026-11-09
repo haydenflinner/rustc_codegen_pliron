@@ -304,12 +304,12 @@ fn eval_cond(cond: Cond, bits: u32) -> bool {
     }
 }
 
-/// PLIRON (`PLIRON_CCMP`, default off): fuse integer-compare bool
+/// PLIRON (`PLIRON_CCMP`, default on): fuse integer-compare bool
 /// combinations into `cmp; ccmp` flag chains — see the `ccmp_*`
 /// comment block in inst.isle.
 fn ccmp_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_CCMP").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_CCMP").as_deref() != Ok("0"))
 }
 
 /// An NZCV constant that makes `cond` evaluate to `value` — the
@@ -1268,7 +1268,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_CMN").as_deref() != Ok("0"))
     }
 
-    /// PLIRON (`PLIRON_CCMP`, default off): `band`/`bor` of two integer
+    /// PLIRON (`PLIRON_CCMP`, default on): `band`/`bor` of two integer
     /// compares consumed as a condition → `cmp; ccmp` flag chain
     /// (`a && b` / `a || b`). `mode`: bit0 inverts the primary guard,
     /// bit1 makes the constant NZCV satisfy (not falsify) the secondary
