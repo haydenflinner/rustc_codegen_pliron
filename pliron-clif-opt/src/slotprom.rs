@@ -35,10 +35,12 @@ use crate::webroot::{self, Web, Webs};
 
 /// Cap on promoted fields per function — param bloat bound.
 const MAX_FIELDS: usize = 48;
-/// Cap on memory accesses per slot before the slot is left alone.
+/// Cap on memory accesses per slot before the slot is left alone
+/// (`PLIRON_SLOTPROM_ACCS` — big state-machine fns like miniz's
+/// `decompress` have 200+ accesses on their hot slots).
 const MAX_ACCS: usize = 128;
 /// Cap on blocks receiving a param for one field — keeps deep CFGs from
-/// growing signatures unboundedly.
+/// growing signatures unboundedly (`PLIRON_SLOTPROM_LIVEIN`).
 const MAX_LIVEIN: usize = 256;
 /// Skip gigantic functions outright; the field×block matrices are
 /// quadratic-ish and a CGU this size is a rarity anyway.
@@ -309,6 +311,12 @@ pub fn run_lt(
     if func.sized_stack_slots.is_empty() || nblocks > MAX_BLOCKS {
         return 0;
     }
+    let max_accs = crate::env_get("PLIRON_SLOTPROM_ACCS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_ACCS);
+    let max_livein = crate::env_get("PLIRON_SLOTPROM_LIVEIN")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_LIVEIN);
     let timer = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::slotprom", tracing::Level::INFO);
     let t0 = timer.then(std::time::Instant::now);
@@ -482,7 +490,7 @@ pub fn run_lt(
         // offset; fuzz seed 8631 overflowed `off + bytes` below) can't be
         // a field: the slot stays in memory.
         let size = i64::from(func.sized_stack_slots[*ss].size);
-        if list.len() > MAX_ACCS || list.iter().any(|a| a.off < 0 || a.off.checked_add(a.bytes).is_none_or(|e| e > size)) {
+        if list.len() > max_accs || list.iter().any(|a| a.off < 0 || a.off.checked_add(a.bytes).is_none_or(|e| e > size)) {
             bad.insert(*ss);
         }
     }
@@ -756,7 +764,7 @@ pub fn run_lt(
         // one that doesn't fit stays on memory (sound: the callee just
         // sees it there like today).
         let fits = !sync_calls.contains_key(&f.slot) || i32::try_from(f.off).is_ok();
-        if fits && livein.iter().filter(|&&x| x).count() <= MAX_LIVEIN {
+        if fits && livein.iter().filter(|&&x| x).count() <= max_livein {
             kept.push(fi);
             liveins.push(livein);
         }

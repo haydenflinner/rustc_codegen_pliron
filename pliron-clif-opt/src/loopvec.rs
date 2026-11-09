@@ -37,6 +37,8 @@ use crate::loopidiom::{
 };
 use crate::proots;
 
+/// Loops analyzed per function (`PLIRON_LOOPVEC_LOOPS` — state-machine
+/// fns like miniz's `decompress` have 40+; parents burn budget).
 const MAX_LOOPS: usize = 16;
 const MAX_CONV: usize = 4;
 /// Sanity bound on insts scanned per loop.
@@ -4962,7 +4964,10 @@ pub fn run(
         && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
     let pty = tcfg.pointer_type();
     let mut n = 0;
-    for lp in loops.into_iter().take(MAX_LOOPS) {
+    let max_loops = crate::env_get("PLIRON_LOOPVEC_LOOPS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_LOOPS);
+    for lp in loops.into_iter().take(max_loops) {
         // PGO: measured-dead loop — vector clones are pure code size.
         if prof.get(&la.loop_header(lp)) == Some(&0) {
             continue;
