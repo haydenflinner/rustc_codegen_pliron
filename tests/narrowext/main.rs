@@ -89,6 +89,50 @@ fn utf8(c: u32, out: &mut [u8; 4]) -> usize {
     }
 }
 
+#[inline(never)]
+fn or_shr(x: u8, y: u8) -> u8 {
+    // `x | (y >> k)` on a clean `y` fuses to `orr .., lsr #k` under bit 32.
+    x | (y >> 3)
+}
+
+#[inline(never)]
+fn or_shl16(x: u16, y: u16) -> u16 {
+    // `ishl` operand fuses unconditionally — its low bits are exact.
+    x | (y << 2)
+}
+
+#[inline(never)]
+fn and_shr(x: u8, y: u8) -> u8 {
+    x & (y >> 4)
+}
+
+#[inline(never)]
+fn shr_load(b: &[u8], i: usize) -> u8 {
+    // `uload8` is clean: `ushr` needs no `uxtb` first under bit 32.
+    b[i] >> 3
+}
+
+#[inline(never)]
+fn chain(v: u8) -> u8 {
+    // Clean results chain: `band`/`bor` are clean, `ushr`'s result is
+    // clean, so the whole tree shifts and ors without extensions.
+    let t = (v & 0xf0) | (v >> 4);
+    (t >> 2) | 0x80
+}
+
+#[inline(never)]
+fn dirty_shift(x: u8, y: u8) -> u8 {
+    // `y + 1` is NOT clean (iadd keeps carry in bit 8): fusing
+    // `x | (t >> 3)` into `orr x, t, lsr #3` would shift the carry bit
+    // into the result. Must keep the `uxtb` before the `lsr`.
+    x | (y.wrapping_add(1) >> 3)
+}
+
+#[inline(never)]
+fn dirty_shift16(x: u16, y: u16) -> u16 {
+    x | (y.wrapping_add(1) >> 5)
+}
+
 #[derive(Clone, Copy)]
 enum Op {
     A,
@@ -140,6 +184,16 @@ fn main() {
         assert_eq!(e as u32, (a & 1 == 0) as u32);
         assert_eq!(widen(a, b), (((a as u32) & (b as u32)) as u64) << 3);
         assert_eq!(widen16(w, a as u16), ((w as u32) & 0x0ff0) ^ (a as u32));
+        assert_eq!(or_shr(a, b) as u32, (a as u32) | ((b as u32) >> 3));
+        assert_eq!(or_shl16(w, a as u16) as u32, (w as u32) | (((a as u16 as u32) << 2) & 0xffff));
+        assert_eq!(and_shr(a, b) as u32, (a as u32) & ((b as u32) >> 4));
+        assert_eq!(shr_load(black_box(&[a, b, 7, 200]), (i & 3) as usize) as u32,
+                   ([a, b, 7u8, 200][(i & 3) as usize] as u32) >> 3);
+        assert_eq!(chain(a) as u32, ((((a as u32) & 0xf0) | ((a as u32) >> 4)) >> 2) | 0x80);
+        assert_eq!(dirty_shift(a, b) as u32,
+                   (a as u32) | ((((b as u32) + 1) & 0xff) >> 3));
+        assert_eq!(dirty_shift16(w, a as u16) as u32,
+                   (w as u32) | ((((a as u16 as u32) + 1) & 0xffff) >> 5));
         flags.push(r);
 
         let cp = black_box(i.wrapping_mul(0x2f1) % 0x110000);

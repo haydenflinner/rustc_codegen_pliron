@@ -86,8 +86,11 @@ pub(crate) fn narrowext_enabled() -> bool {
 
 /// PLIRON: one `PLIRON_NARROWEXT` user, by bit, for bisecting:
 /// 1 = the extra cleanliness facts, 2 = return extension, 4 = `uextend`
-/// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`.
-/// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
+/// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`,
+/// 32 = narrow `ushr`-of-clean and `ushr`-operand fusion on narrow
+/// `bor`/`band`/`bxor`.
+/// `PLIRON_NARROWEXT_MASK` (default all but 32 — the newest rules land
+/// masked off first and flip separately) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     narrowext_enabled()
@@ -95,7 +98,7 @@ pub(crate) fn narrowext_part(bit: u64) -> bool {
             std::env::var("PLIRON_NARROWEXT_MASK")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(u64::MAX)
+                .unwrap_or(u64::MAX & !32)
         }) & bit
             != 0
 }
@@ -150,6 +153,13 @@ pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget
             let [a, b] = *args;
             narrow_uext_clean(dfg, a, budget) && narrow_uext_clean(dfg, b, budget)
         }
+        // A narrow `ushr`'s register is clean either way: the default
+        // lowering zero-extends the operand first, and the clean-operand
+        // rule (`ushr_clean_narrow`) shifts an already-narrow register.
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            ..
+        } => true,
         _ => false,
     }
 }

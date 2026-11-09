@@ -2065,6 +2065,43 @@
       (if-let shift (rotr_from_u64 ty (u64_wrapping_sub (ty_bits ty) k)))
       (alu_rrr_shift (ALUOp.Eor) ty y x shift))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 32): the shifted-operand fusion above,
+;; for i8/i16 logical ops. `ishl` operands need no rule — the generic
+;; `alu_rs_imm_logic` helpers already fold them at any width (`y lsl k`
+;; is exact below the narrow width). An `ushr` operand fuses only when
+;; `y`'s register is already narrow-clean (`narrowext_clean`), since
+;; `y lsr k`'s low bits must be `y`'s own, not the unspecified high bits.
+(rule bor_lsr_op_narrow 70 (lower (bor (fits_in_16 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Orr) ty x y shift))
+(rule bor_lsr_op_narrow_l 71 (lower (bor (fits_in_16 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Orr) ty y x shift))
+(rule band_lsr_op_narrow 72 (lower (band (fits_in_16 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_lsr_op_narrow_l 73 (lower (band (fits_in_16 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+(rule bxor_lsr_op_narrow 74 (lower (bxor (fits_in_16 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_lsr_op_narrow_l 75 (lower (bxor (fits_in_16 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+
 ;; PLIRON (`PLIRON_BFUSE`, default on): bitfield fusion — `(x>>k)&m` and
 ;; `(x&m)<<k` are one `ubfm` (`ubfx`/`ubfiz`); `y|((x&m)<<k)` and
 ;; `y|((x<<k)&m')` become `bfm` (`bfi`) when `bf_disjoint*` proves `y`'s
@@ -2326,6 +2363,14 @@
 ;; Shift for i8/i16/i32.
 (rule ushr_fits_in_32 -1 (lower (ushr (fits_in_32 ty) x y))
       (do_shift (ALUOp.Lsr) ty (put_in_reg_zext32 x) y))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 32): a `ushr.i8/i16` on an already
+;; narrow-clean register (`narrowext_clean`) needs no `uxtb`/`uxth`
+;; first — `lsr` of narrow bits is exact, and its result is clean.
+(rule ushr_clean_narrow 64 (lower (ushr (fits_in_16 ty) x y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (do_shift (ALUOp.Lsr) ty (put_in_reg x) y))
 
 ;; Shift for i64.
 (rule ushr_64 (lower (ushr $I64 x y))
