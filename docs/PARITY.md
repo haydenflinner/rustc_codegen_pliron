@@ -141,6 +141,12 @@ rounds, `bench/heldout/run.py`):
 | rust-json | 3.03 ms | 3.20 ms | 1.057 |
 | rust-protobuf | 5.38 ms | 5.31 ms | 0.986 |
 
+Since then `PLIRON_BJALIAS` (default on, afcc31b) removed ~600 dead
+`b .+4` fallthrough branches per binary — eager aliasing of bare-jump
+edge-block labels so MachBuffer's purgatory sees the real target;
+held-out A/B `bja/pliron` geomean 0.985
+(`history/2026-11-09-bjalias-dead-branches.md`).
+
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
 `history/2026-11-09-copypair-scalar-merge.md`): `compress_inner` is at
