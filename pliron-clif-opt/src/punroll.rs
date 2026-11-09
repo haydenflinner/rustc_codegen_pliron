@@ -1419,10 +1419,26 @@ fn run_loop(
         }
     };
     let exit_bc = texit_bc;
-    let k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
+    let mut k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
         Ok(k) => k,
         Err(m) => bail!(format!("trip <= {m}")),
     };
+    // A retained exit rides every copy — its test is per-copy work the
+    // unroll cannot amortize, so the shared latch test is the only
+    // saving. `PLIRON_PUNROLL_KEXIT=N` bounds the copied branch sites
+    // (0/unset: no bound): montgomery's decrement/store loops regressed
+    // ~5% at k=8 with one mid-exit each.
+    let kept = mid_exits.len() + latch_exit.is_some() as usize;
+    if kept > 0
+        && let Some(budget) = crate::env_get("PLIRON_PUNROLL_KEXIT")
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&b| b > 0)
+    {
+        k = (k as usize).min(budget / (kept + 1)).max(1) as i64;
+        if k < 2 {
+            bail!("kept-exit budget below 2");
+        }
+    }
 
     let ity = func.dfg.value_type(hparams[cnt.pidx]);
     // `bound - a0` must not wrap: <=32-bit counters widen to i64 (signed or
