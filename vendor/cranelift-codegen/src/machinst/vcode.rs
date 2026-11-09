@@ -2101,6 +2101,94 @@ impl<I: VCodeInst> VCode<I> {
             }
         }
 
+        // PLIRON: `PLIRON_BJALIAS` — alias the labels of bare-jump blocks
+        // (a single operandless `b label` with no regalloc edits) to the
+        // jump's target eagerly, before emission, and skip their code
+        // entirely. MachBuffer otherwise establishes that alias lazily,
+        // only once the block's `b` reaches the buffer tail — but by then
+        // forward branches to the block have left the purgatory window,
+        // so a `b` to a bare-jump block whose true target lands on the
+        // next instruction survives as a dead `b .+4` (~600 of these in
+        // the html-rewriter benchmark, vs ~30 with LLVM). With the alias
+        // in place up front, every branch to the block resolves to the
+        // real target while it can still fold at the tail. Chains of
+        // bare jumps resolve to the final non-bare successor; jumps that
+        // form a cycle (`b .`, `b x; ...; b y; y: b x`) keep their code.
+        static BJALIAS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        if !flags.machine_code_cfg_info()
+            && *BJALIAS.get_or_init(|| pliron_mode("PLIRON_BJALIAS", 0)) > 0
+        {
+            const UNRESOLVED: u32 = u32::MAX;
+            const CYCLE: u32 = u32::MAX - 1;
+            let nb = self.num_blocks();
+            let bare: Vec<bool> = (0..nb)
+                .map(|b| {
+                    let r = self.block_ranges.get(b);
+                    r.len() == 1
+                        && ra_edits_per_block[b] == 0
+                        && self.insts[r.start].is_term() == MachTerminator::Branch
+                        && self.block_succs(BlockIndex::new(b)).len() == 1
+                        && regalloc.inst_allocs(InsnIndex::new(r.start)).is_empty()
+                })
+                .collect();
+            // resolve[b]: for a bare-jump block, the final non-bare
+            // successor's index; CYCLE for blocks on or reaching a cycle.
+            let mut resolve: Vec<u32> = (0..nb as u32).collect();
+            for (b, bare_b) in bare.iter().enumerate() {
+                if *bare_b {
+                    resolve[b] = UNRESOLVED;
+                }
+            }
+            let mut path: Vec<u32> = Vec::new();
+            let mut onpath: Vec<bool> = vec![false; nb];
+            for b in 0..nb {
+                if !bare[b] || resolve[b] != UNRESOLVED {
+                    continue;
+                }
+                let mut t = b;
+                let result = loop {
+                    if resolve[t] != UNRESOLVED {
+                        break resolve[t];
+                    }
+                    if onpath[t] {
+                        break CYCLE;
+                    }
+                    onpath[t] = true;
+                    path.push(t as u32);
+                    let next = self.block_succs(BlockIndex::new(t))[0].index();
+                    if next >= nb {
+                        // A non-block jump target (e.g. a trap/veneer
+                        // pseudo-succ): keep this block's code.
+                        break CYCLE;
+                    }
+                    t = next;
+                };
+                for &p in &path {
+                    resolve[p as usize] = result;
+                    onpath[p as usize] = false;
+                }
+                path.clear();
+            }
+            for &block in &final_order {
+                let bi = block.index();
+                if !bare[bi]
+                    || merged[bi]
+                    || block == self.entry
+                    || noret_dead.as_ref().is_some_and(|d| d[bi])
+                {
+                    continue;
+                }
+                let t = resolve[bi] as usize;
+                if t < nb {
+                    merged[bi] = true;
+                    buffer.alias_label(
+                        MachLabel::from_block(block),
+                        MachLabel::from_block(BlockIndex::new(t)),
+                    );
+                }
+            }
+        }
+
         // PLIRON: `PLIRON_EPIMERGE` emits the epilogue once per function and
         // every later `return` jumps to it, for epilogues of 3+ insts. `=1`
         // keeps a hot return's own copy unless the epilogue is 5+ insts

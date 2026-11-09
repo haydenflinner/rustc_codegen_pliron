@@ -729,6 +729,17 @@ t_edgemerge() {
     PLIRON_LIBCALL_DIRECT=$(( m == 3 )) PLIRON_EDGEMERGE=$m PLIRON_EPIMERGE=$m rustc $BE --edition 2021 -O tests/edgemerge/main.rs -o $out/edgemerge$exe &&
     $out/edgemerge$exe | diff --strip-trailing-cr - tests/edgemerge/expected.out || return 1
   done
+  # PLIRON_BJALIAS (default off): bare-jump edge blocks get their labels
+  # aliased to the real target before emission, so a branch to one whose
+  # target lands on the next instruction folds in MachBuffer's purgatory
+  # instead of surviving as a `b .+4` (word 0x14000001 on aarch64).
+  if [[ -x "$llvmod" && "$(uname -m)" == arm64 ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/edgemerge/main.rs -o $out/em_bj0.o
+    PLIRON_BJALIAS=1 rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/edgemerge/main.rs -o $out/em_bj1.o
+    d0=$("$llvmod" -d $out/em_bj0.o | grep -cE '^\s*[0-9a-f]+:\s*14000001\s+b\b' || true)
+    d1=$("$llvmod" -d $out/em_bj1.o | grep -cE '^\s*[0-9a-f]+:\s*14000001\s+b\b' || true)
+    (( d1 < d0 )) || { echo "edgemerge: dead b .+4 $d0 -> $d1, bjalias no better" >&2; return 1; }
+  fi
 }
 
 # r[verify native.asm.splice]

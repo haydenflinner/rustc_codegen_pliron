@@ -805,6 +805,23 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     insts. `=1` merges an epilogue of 5 or more insts, or any epilogue in a
     cold block: `fib`'s 3-inst base-case return is hot (+8% when merged).
     Frameless `ret` stays inline, and return calls are not changed.
+68. Eager bare-jump label aliasing, `PLIRON_BJALIAS=1` (default `0`,
+    `src/machinst/vcode.rs` `emit`). A block that is a single
+    operand-less `b label` with no regalloc edits emits nothing:
+    `MachBuffer` aliases its label to the target — but only lazily, once
+    the block's `b` reaches the buffer tail. Forward branches to the
+    block have by then left the branch-purgatory window, so a `b` to a
+    bare-jump block whose true target lands on the next instruction
+    survives as a dead `b .+4` (rust-html-rewriter carried 616 of them).
+    With `=1`, emission computes the bare-jump blocks up front, resolves
+    chains of them to the final non-bare successor (cycles — `b .` and
+    mutual loops — keep their code), aliases their labels, and skips
+    their emission like an edge-merged dup. Every branch to such a block
+    then resolves to the real target while it can still fold at the
+    tail: 616 dead `b`s drop to 7 (−1,024 insns, −1,130 `b`s on
+    rust-html-rewriter). The entry block, `noret_dead` blocks (which
+    bind a label without code), and `machine_code_cfg_info` compiles are
+    excluded. The remaining dead `b`s are odd landing-pad/edge pairs.
 
 Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
 a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's
