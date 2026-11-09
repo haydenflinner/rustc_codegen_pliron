@@ -666,8 +666,13 @@ impl<'a> NonNull<'a> {
             .derived
             .get(&v)?
             .iter()
-            .find(|&&(_, s)| self.site_covers(func, s, at))
-            .map(|&(b, _)| func.dfg.resolve_aliases(b))
+            .filter(|&&(_, s)| self.site_covers(func, s, at))
+            // Recorded bases go stale as passes alias or delete them:
+            // a chain ending at the reserved slot means the fact is
+            // unusable, not that the query is unanswerable — skip it and
+            // try the next covering site.
+            .filter_map(|&(b, _)| func.dfg.try_resolve_aliases(b))
+            .next()
     }
 
     /// `is` at a use point: the plain facts plus the site-qualified ones
@@ -1399,7 +1404,10 @@ impl RegionNN<'_> {
                 }
             }
             let Some(&base) = derived.get(&v) else { return false };
-            v = func.dfg.resolve_aliases(base);
+            let Some(b) = func.dfg.try_resolve_aliases(base) else {
+                return false;
+            };
+            v = b;
         }
         false
     }
