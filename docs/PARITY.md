@@ -127,25 +127,30 @@ features (all tested off). See
 
 SPD is measured on the kernels above, which the backend has been tuned
 against for weeks. On real programs it was never tuned on, native code is
-**1.08x slower** than LLVM (geomean of 8; 2026-11-09, 11 interleaved
-rounds, `bench/heldout/run.py`):
+**1.054x slower** than LLVM (geomean of 8; 2026-11-10, 3 interleaved
+rounds, `bench/heldout/run.py`; was 1.08x on 11-09 before
+`PLIRON_BJALIAS`/`ivrefold3`/narrowext-32):
 
 | program (sightglass) | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| blake3-scalar | 2.97 ms | 3.13 ms | 1.054 |
-| blind-sig | 1.35 ms | 1.43 ms | 1.052 |
-| pulldown-cmark | 3.80 ms | 4.18 ms | 1.100 |
-| rust-compression | 2.32 ms | 2.65 ms | 1.144 |
-| rust-html-rewriter | 4.93 ms | 5.64 ms | 1.143 |
-| regex | 2.75 ms | 2.96 ms | 1.077 |
-| rust-json | 3.03 ms | 3.20 ms | 1.057 |
-| rust-protobuf | 5.38 ms | 5.31 ms | 0.986 |
+| blake3-scalar | 2.96 ms | 3.03 ms | 1.024 |
+| blind-sig | 1.37 ms | 1.43 ms | 1.049 |
+| pulldown-cmark | 3.72 ms | 4.01 ms | 1.078 |
+| rust-compression | 2.29 ms | 2.56 ms | 1.116 |
+| rust-html-rewriter | 4.94 ms | 5.61 ms | 1.137 |
+| regex | 2.85 ms | 2.88 ms | 1.011 |
+| rust-json | 3.05 ms | 3.09 ms | 1.011 |
+| rust-protobuf | 4.83 ms | 4.89 ms | 1.013 |
 
 Since then `PLIRON_BJALIAS` (default on, afcc31b) removed ~600 dead
 `b .+4` fallthrough branches per binary — eager aliasing of bare-jump
 edge-block labels so MachBuffer's purgatory sees the real target;
 held-out A/B `bja/pliron` geomean 0.985
-(`history/2026-11-09-bjalias-dead-branches.md`).
+(`history/2026-11-09-bjalias-dead-branches.md`). A `PLIRON_BFUSE`
+`imms`-encoding miscompile (`band (ishl x,k), m` emitted `ubfx`
+where `ubfiz` was meant — fuzz seed 6279) is fixed in 02baa35;
+narrowext bit 32 (`ushr`-of-clean + narrow logical `lsr` fusion) is
+default-on in c1fc7d8.
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
