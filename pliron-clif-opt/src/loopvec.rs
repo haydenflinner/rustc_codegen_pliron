@@ -1907,16 +1907,29 @@ fn plan(
                         && is_splat(func, &info, &kinds, &mut splat_cache, s)
                 }
                 // Mask-valued bitwise ops stay masks (e.g. the `bor` chain
-                // ifconv's br_table conversion builds).
+                // ifconv's br_table conversion builds); mixed with
+                // lane-replicable data they're still lane-exact — `band(m, 1)`
+                // yields {0,1} lanes, `bor(x, m & k)` a masked merge — so the
+                // result is a plain value.
                 InstructionData::Binary {
                     opcode: Opcode::Band | Opcode::Bor | Opcode::Bxor,
                     args,
-                } if args
-                    .iter()
-                    .all(|&a| masks.contains(&func.dfg.resolve_aliases(a))) =>
-                {
-                    masks.insert(rv);
-                    grew = true;
+                } => {
+                    let mut all_mask = true;
+                    let ok = args.iter().all(|&a| {
+                        let a = func.dfg.resolve_aliases(a);
+                        if masks.contains(&a) {
+                            return true;
+                        }
+                        all_mask = false;
+                        can_vec.contains(&a)
+                            || (is_splat(func, &info, &kinds, &mut splat_cache, a)
+                                && splat_lane_ok(func, a, elem))
+                    });
+                    if ok {
+                        (if all_mask { &mut masks } else { &mut can_vec }).insert(rv);
+                        grew = true;
+                    }
                     continue;
                 }
                 InstructionData::Binary { args, .. } => args.iter().all(|&a| {
@@ -5287,6 +5300,74 @@ mod tests {
             .blocks()
             .flat_map(|b| func.layout.block_insts(b))
             .any(|i| func.dfg.ctrl_typevar(i) == ty)
+    }
+
+    /// `dst[i] = src[i] | (((src[i] - 'A') u< 26) & 1) << 5)` — the
+    /// ascii_lowercase idiom: `band(icmp mask, 1)` is lane-exact {0,1}, so
+    /// the `ishl`/`bor` chain over it vectorizes. The mixed mask/data
+    /// `band` used to classify as neither a mask nor lane-replicable.
+    #[test]
+    fn band_mask_splat_chain_vectorizes() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let exit = b.create_block();
+            b.append_block_param(head, types::I64);
+            b.append_block_param(head, types::I64);
+            b.append_block_param(exit, types::I64);
+
+            b.switch_to_block(entry);
+            let dst = b.ins().iconst(types::I64, 0x2000);
+            let src = b.ins().iconst(types::I64, 0x1000);
+            let n = b.ins().iconst(types::I64, 64);
+            let end = b.ins().iadd(src, n);
+            let zero = b.ins().iconst(types::I64, 0);
+            b.ins().jump(head, &[zero.into(), src.into()]);
+
+            b.switch_to_block(head);
+            let (idx, p) = (b.block_params(head)[0], b.block_params(head)[1]);
+            let wa = b.ins().iadd(dst, idx);
+            let x = b
+                .ins()
+                .load(types::I8, MemFlagsData::new().with_notrap(), p, 0);
+            let c65 = b.ins().iconst(types::I8, 65);
+            let s = b.ins().isub(x, c65);
+            let c26 = b.ins().iconst(types::I8, 26);
+            let m = b.ins().icmp(IntCC::UnsignedLessThan, s, c26);
+            let c1 = b.ins().iconst(types::I8, 1);
+            let q = b.ins().band(m, c1);
+            let c5 = b.ins().iconst(types::I8, 5);
+            let k = b.ins().ishl(q, c5);
+            let y = b.ins().bor(x, k);
+            b.ins().store(MemFlagsData::new().with_notrap(), y, wa, 0);
+            let p1 = b.ins().iadd_imm_s(p, 1);
+            let i1 = b.ins().iadd_imm_s(idx, 1);
+            let done = b.ins().icmp(IntCC::Equal, p1, end);
+            b.ins()
+                .brif(done, exit, &[i1.into()], head, &[i1.into(), p1.into()]);
+
+            b.switch_to_block(exit);
+            let r = b.block_params(exit)[0];
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+        }
+        let n = run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            "lowercase",
+            &FxHashSet::default(),
+            tcfg64(),
+            true,
+            false,
+            true,
+            &FxHashMap::default(),
+            WideCaps::BASE,
+        );
+        assert_eq!(n, 1);
+        assert!(has_typed_inst(&func, types::I8X16));
     }
 
     #[test]

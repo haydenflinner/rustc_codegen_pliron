@@ -156,6 +156,11 @@ deletion is default-on (64ca6c2 + d205f29): `st(f(iv))` countdown
 loops fold to one closed-form store (`montgomery` 858→816 insns);
 held-out A/B `loopdel/pliron` geomean 0.994 [0.977,1.015],
 html-rewriter 0.978* — `history/2026-11-11-loopdel-countdown.md`.
+`loopvec` now classes mask/data `band`/`bor`/`bxor` as lane-exact, so
+`to_ascii_lowercase`'s `b | ((upper&1) << 5)` collect loops vectorize
+(NEON `sub`/`cmhi`/`and`/`shl`/`orr.16b`); held-out A/B geomean
+1.010 [0.993,1.042] toward faster —
+`history/2026-11-11-loopvec-mixed-band.md`.
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
