@@ -2338,6 +2338,10 @@ fn s_selchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::selchain(&mut p.clctx.func)
 }
 
+fn s_foldcommon(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    foldcommon::run(&mut p.clctx.func)
+}
+
 fn s_tailmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = tailmerge::run(&mut p.clctx.func);
     p.stats.merged += k;
@@ -4621,6 +4625,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // jtround so the edge constants thread.
         step("cmp3", "cmp3", Gate::OptIn("PLIRON_CMP3"), s_cmp3).needs(shape::TESTC),
         step("mergechain", "", Gate::Env("PLIRON_LATESPEC"), s_mergechain).needs(shape::MULTI),
+        // Short-circuit `&&`/`||` block pairs collapse to one `brif` on
+        // `band`/`bor` of the conditions — the flag-chained form aarch64
+        // `ccmp` lowering consumes. Before jtround so the merged band
+        // threads and any residue cleans up.
+        step("foldcommon", "foldcommon", Gate::OptIn("PLIRON_FOLDCOMMON"), s_foldcommon)
+            .needs(shape::MULTI | shape::CONDBR),
         // Select-chain folds `clifpeep` missed while the arms still sat
         // behind block params that mergechain just merged (eqbug).
         step("selchain", "", Gate::OptIn("PLIRON_SELCHAIN"), s_selchain),

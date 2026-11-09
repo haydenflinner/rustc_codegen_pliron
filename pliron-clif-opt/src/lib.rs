@@ -39,6 +39,7 @@ pub mod edgefwd;
 pub mod edgesink;
 pub mod edgespec;
 pub mod ifconv;
+pub mod foldcommon;
 pub mod indvars;
 pub mod ivalign;
 pub mod ivrefold;
