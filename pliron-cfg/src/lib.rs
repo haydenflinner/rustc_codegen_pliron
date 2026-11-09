@@ -59,6 +59,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // (commit d41c3ba; ~7% on the is_mostly_utf8 region, held-out A/B
     // neutral 1.004 [0.984, 1.039]).
     "PLIRON_SEXTLOAD",
+    // Post-rotation dead-loop deletion: `st(f(iv))` countdown loops fold
+    // to one closed-form store (montgomery's `*p = --i`; held-out A/B
+    // 0.994 [0.977,1.015], html-rewriter 0.978*).
+    "PLIRON_LOOPDEL",
     // Inliner (2026-10-26-inline-recursion.md).
     "PLIRON_INLINE_RESUME_DOM",
     "PLIRON_INLINE_RESUME_HOIST",

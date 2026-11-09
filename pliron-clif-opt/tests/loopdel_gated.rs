@@ -1,14 +1,33 @@
-//! `PLIRON_LOOPDEL` is opt-in: without it the countdown fold is inert and
-//! the loop survives (kept in its own binary — `pliron_cfg`'s env parse
+//! `PLIRON_LOOPDEL=0` kills the post-rotation countdown fold: the loop
+//! stays reachable (kept in its own binary — `pliron_cfg`'s env parse
 //! is one-shot per process, so set/unset tests can't share one).
-
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::Function;
+use cranelift_codegen::ir::{Block, Function, Opcode};
 use pliron_clif_opt::pipeline::Analysis;
 use rustc_hash::FxHashSet;
 
 fn parse(src: &str) -> Function {
     cranelift_reader::parse_functions(src).unwrap().remove(0)
+}
+
+fn live_blocks(f: &Function) -> FxHashSet<Block> {
+    let entry = f.layout.entry_block().unwrap();
+    let (mut seen, mut wl) = (FxHashSet::default(), vec![entry]);
+    while let Some(b) = wl.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        for i in f.layout.block_insts(b) {
+            for bc in f
+                .dfg
+                .insts[i]
+                .branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+            {
+                wl.push(bc.block(&f.dfg.value_lists));
+            }
+        }
+    }
+    seen
 }
 
 const COUNTDOWN: &str = "function %f(i64, i64) -> i64 {
@@ -28,7 +47,8 @@ block2(v20: i64):
 }";
 
 #[test]
-fn gated_off_by_default() {
+fn zero_disables_the_fold() {
+    unsafe { std::env::set_var("PLIRON_LOOPDEL", "0") };
     let mut f = parse(COUNTDOWN);
     pliron_clif_opt::loopidiom::run(
         &mut f,
@@ -42,10 +62,15 @@ fn gated_off_by_default() {
         "f",
     );
     let cfg = ControlFlowGraph::with_function(&f);
-    let self_loops = f
-        .layout
-        .blocks()
+    let live_loops = live_blocks(&f)
+        .into_iter()
         .filter(|&b| cfg.pred_iter(b).any(|p| p.block == b))
         .count();
-    assert_eq!(self_loops, 1, "folded without PLIRON_LOOPDEL:\n{}", f.display());
+    assert_eq!(live_loops, 1, "folded under =0:\n{}", f.display());
+    let live_stores = live_blocks(&f)
+        .into_iter()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Store)
+        .count();
+    assert_eq!(live_stores, 1, "extra store under =0:\n{}", f.display());
 }
