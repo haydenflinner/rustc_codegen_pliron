@@ -89,8 +89,7 @@ pub(crate) fn narrowext_enabled() -> bool {
 /// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`,
 /// 32 = narrow `ushr`-of-clean and `ushr`-operand fusion on narrow
 /// `bor`/`band`/`bxor`.
-/// `PLIRON_NARROWEXT_MASK` (default all but 32 — the newest rules land
-/// masked off first and flip separately) selects which are live.
+/// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     narrowext_enabled()
@@ -98,7 +97,7 @@ pub(crate) fn narrowext_part(bit: u64) -> bool {
             std::env::var("PLIRON_NARROWEXT_MASK")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(u64::MAX & !32)
+                .unwrap_or(u64::MAX)
         }) & bit
             != 0
 }

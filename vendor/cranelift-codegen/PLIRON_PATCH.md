@@ -767,7 +767,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
       defining `x` folded into `and w, w, w, lsl #2`, its amount masked by the
       narrow type (rustlantis seed 12309, fixed 2026-10-27).
     `PLIRON_NARROWEXT_MASK=<bits>` (default all) keeps only some users live,
-    for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`.
+    for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`,
+    32 narrow `ushr`-of-clean (a narrow `lsr` result is always canonical)
+    plus `bor`/`band`/`bxor` with a constant `ushr` operand folding to
+    `orr`/`and`/`eor ..., lsr #k` when the shifted value is clean.
 
 63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP`, default on,
     `=0` off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table
