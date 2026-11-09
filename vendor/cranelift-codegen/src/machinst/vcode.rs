@@ -1929,6 +1929,28 @@ impl<I: VCodeInst> VCode<I> {
         let mut vclass: FxHashMap<Reg, u32> = FxHashMap::default();
         let mut next_class = 1u32;
         let mut mcp_dead = 0usize;
+        // PLIRON (`PLIRON_MCPBB=1` opt-in): per-block exit states seed a
+        // block's entry facts from already-emitted preds. Dropping a
+        // move requires the fact to hold on every entry edge, so the
+        // seed is the intersection of all preds' exit states; a pred
+        // emitted later (a backedge, or a block ordered after its
+        // successor) contributes nothing and empties the seed.
+        static MCPBB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mcpbb = *MCPBB.get_or_init(|| std::env::var("PLIRON_MCPBB").as_deref() == Ok("1"));
+        let mut order_pos = vec![usize::MAX; self.num_blocks()];
+        for (i, &b) in final_order.iter().enumerate() {
+            order_pos[b.index()] = i;
+        }
+        let mut out_class: Vec<Option<FxHashMap<Reg, u32>>> =
+            std::iter::repeat_with(|| None).take(self.num_blocks()).collect();
+        let mut prev_block: Option<BlockIndex> = None;
+        // Blocks an `EDGEMERGE`/`BJALIAS` canonical copy answers for:
+        // their labels alias to the canon, so their preds' edges enter
+        // the canon and must join its entry-fact intersection.
+        let mut canon_dups: Vec<SmallVec<[BlockIndex; 4]>> =
+            std::iter::repeat_with(SmallVec::new)
+                .take(self.num_blocks())
+                .collect();
 
         static EPROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let eprof = *EPROF.get_or_init(|| std::env::var_os("PLIRON_EPROF").is_some());
@@ -2085,6 +2107,7 @@ impl<I: VCodeInst> VCode<I> {
                     });
                 if let Some(c) = dup {
                     merged[block.index()] = true;
+                    canon_dups[c.index()].push(block);
                     buffer.alias_label(MachLabel::from_block(block), MachLabel::from_block(c));
                 } else if !dead && (ra_edits_per_block[block.index()] != 0
                     || self.block_ranges.get(block.index()).len() != 1
@@ -2181,6 +2204,7 @@ impl<I: VCodeInst> VCode<I> {
                 let t = resolve[bi] as usize;
                 if t < nb {
                     merged[bi] = true;
+                    canon_dups[t].push(block);
                     buffer.alias_label(
                         MachLabel::from_block(block),
                         MachLabel::from_block(BlockIndex::new(t)),
@@ -2432,7 +2456,50 @@ impl<I: VCodeInst> VCode<I> {
             let items: SmallVec<[InstOrEdit; 64]> =
                 regalloc.block_insts_and_edits(&self, block).collect();
             t_items += ti.elapsed();
-            vclass.clear();
+            if mcp && mcpbb {
+                if let Some(pb) = prev_block.replace(block) {
+                    out_class[pb.index()] = Some(std::mem::take(&mut vclass));
+                }
+                // A `None` out-state for an already-emitted pred means it
+                // was merged or skipped: its true exit state is not
+                // separately tracked, so it contributes nothing.
+                let mut seeded = false;
+                let mut feed = |p: BlockIndex, vclass: &mut FxHashMap<Reg, u32>| {
+                    match (order_pos[p.index()] < oi)
+                        .then(|| out_class[p.index()].as_ref())
+                        .flatten()
+                    {
+                        Some(out) if !seeded => {
+                            vclass.clone_from(out);
+                            seeded = true;
+                            true
+                        }
+                        Some(out) => {
+                            vclass.retain(|k, v| out.get(k) == Some(v));
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                let mut ok = true;
+                for &p in self.block_preds(block).iter() {
+                    ok &= feed(p, &mut vclass);
+                }
+                // A merged block's label aliases to this block (an
+                // EDGEMERGE canon or a BJALIAS jump-through target): its
+                // preds' edges enter here too, so the seed must also
+                // satisfy their exit states.
+                for &d in &canon_dups[block.index()] {
+                    for &p in self.block_preds(d).iter() {
+                        ok &= feed(p, &mut vclass);
+                    }
+                }
+                if !ok {
+                    vclass.clear();
+                }
+            } else {
+                vclass.clear();
+            }
 
             // PLIRON: when this block unconditionally branches to the next
             // emitted block and that block is a loop header, skip the jump
@@ -3018,9 +3085,15 @@ impl<I: VCodeInst> VCode<I> {
                                 if let Some((wd, ws)) = self.insts[iix.index()].is_move() {
                                     let (d, s) = (wd.to_reg(), ws);
                                     match (mcp_key(d), mcp_key(s)) {
+                                        // `mov x,x` is a no-op at full
+                                        // width (`is_move` only matches
+                                        // Size64); emit nothing.
+                                        (Some(_), _) if d == s => {
+                                            mcp_dead += 1;
+                                            dead_mov = true;
+                                        }
                                         (Some(dk), Some(sk))
-                                            if d != s
-                                                && vclass.contains_key(&dk)
+                                            if vclass.contains_key(&dk)
                                                 && vclass.get(&dk) == vclass.get(&sk) =>
                                         {
                                             mcp_dead += 1;
@@ -3181,45 +3254,53 @@ impl<I: VCodeInst> VCode<I> {
                                 ep_r2r += 1;
                                 let (srcreg, dstreg) =
                                     (Reg::from(from), Reg::from(to));
-                                match mcp
-                                    .then(|| (mcp_key(dstreg), mcp_key(srcreg)))
-                                    .unwrap_or((None, None))
-                                {
-                                    (Some(dk), Some(sk))
-                                        if from != to
-                                            && vclass.contains_key(&dk)
-                                            && vclass.get(&dk) == vclass.get(&sk) =>
+                                // regalloc2 emits `from == to` moves
+                                // for vreg-metadata continuity; a
+                                // same-preg move is a no-op — emit
+                                // nothing (the metadata lives in
+                                // `edit_vregs`, not the bytes).
+                                if from == to {
+                                    mcp_dead += 1;
+                                } else {
+                                    match mcp
+                                        .then(|| (mcp_key(dstreg), mcp_key(srcreg)))
+                                        .unwrap_or((None, None))
                                     {
-                                        mcp_dead += 1;
-                                    }
-                                    (Some(dk), sk) => {
-                                        let sc = match sk {
-                                            Some(sk) => {
-                                                *vclass.entry(sk).or_insert_with(|| {
+                                        (Some(dk), Some(sk))
+                                            if vclass.contains_key(&dk)
+                                                && vclass.get(&dk) == vclass.get(&sk) =>
+                                        {
+                                            mcp_dead += 1;
+                                        }
+                                        (Some(dk), sk) => {
+                                            let sc = match sk {
+                                                Some(sk) => {
+                                                    *vclass.entry(sk).or_insert_with(|| {
+                                                        next_class += 1;
+                                                        next_class
+                                                    })
+                                                }
+                                                None => {
                                                     next_class += 1;
                                                     next_class
-                                                })
-                                            }
-                                            None => {
-                                                next_class += 1;
-                                                next_class
-                                            }
-                                        };
-                                        vclass.insert(dk, sc);
-                                        let from_rreg = Reg::from(from);
-                                        let to_rreg = Writable::from_reg(Reg::from(to));
-                                        debug_assert_eq!(from.class(), to.class());
-                                        let ty = I::canonical_type_for_rc(from.class());
-                                        let mv = I::gen_move(to_rreg, from_rreg, ty);
-                                        do_emit(&mv, &mut disasm, &mut buffer, &mut state);
-                                    }
-                                    _ => {
-                                        let from_rreg = Reg::from(from);
-                                        let to_rreg = Writable::from_reg(Reg::from(to));
-                                        debug_assert_eq!(from.class(), to.class());
-                                        let ty = I::canonical_type_for_rc(from.class());
-                                        let mv = I::gen_move(to_rreg, from_rreg, ty);
-                                        do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                                }
+                                            };
+                                            vclass.insert(dk, sc);
+                                            let from_rreg = Reg::from(from);
+                                            let to_rreg = Writable::from_reg(Reg::from(to));
+                                            debug_assert_eq!(from.class(), to.class());
+                                            let ty = I::canonical_type_for_rc(from.class());
+                                            let mv = I::gen_move(to_rreg, from_rreg, ty);
+                                            do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                        }
+                                        _ => {
+                                            let from_rreg = Reg::from(from);
+                                            let to_rreg = Writable::from_reg(Reg::from(to));
+                                            debug_assert_eq!(from.class(), to.class());
+                                            let ty = I::canonical_type_for_rc(from.class());
+                                            let mv = I::gen_move(to_rreg, from_rreg, ty);
+                                            do_emit(&mv, &mut disasm, &mut buffer, &mut state);
+                                        }
                                     }
                                 }
                             }

@@ -1468,3 +1468,24 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     which creates the `brif`-consumed `band`/`bor` shape upstream.
     html-rewriter: +44 ccmp, −73 cset, −46 cmp, −36 and (−10 static
     net, regalloc churn absorbs the rest); 12-round runtime wash.
+
+114. `PLIRON_MCPBB` (runtime, opt-in `=1`; `VCode::emit`): extends
+    `PLIRON_MCP` across block boundaries — each block's exit value-class
+    map is recorded, and a block's entry map is seeded from the
+    intersection of the exit states of its already-emitted CFG preds; a
+    pred emitted later (backedge) or merged/skipped (`None` out-state)
+    empties the seed conservatively. Blocks merged by `PLIRON_EDGEMERGE`
+    or `PLIRON_BJALIAS` alias their label to a canonical block, so their
+    preds' edges enter the canon too: the seed also intersects those
+    (`canon_dups`). Missing that miscompiles — `syn`'s
+    `fixup::FixupContext::precedence` (and `tests/edgemerge`'s
+    `restore`) has a jump-table edge block and an ordinary edge block
+    carrying the same `mov` restore merged into one copy; the canon's
+    own pred happened to satisfy the restore's dead-move condition while
+    the jump-table edge arrived with the register clobbered, and the
+    dedup'd copy left the continuation reading the table index as a
+    pointer (SIGSEGV in generated code). Also drops `mov x,x` no-ops at
+    both emit sites (`Edit::Move` same-preg metadata moves and inst-level
+    `Mov{Size64}` self-moves — `is_move` only matches 64-bit, so 32-bit
+    `w` self-moves still correctly freshen). syn rlib: −471 emitted
+    `mov`s (56636 vs 57107), all deleted insns movs.

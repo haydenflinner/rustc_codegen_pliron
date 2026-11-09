@@ -90,6 +90,64 @@ fn cleanup(n: u64) -> u64 {
     acc + a.0 + b.0
 }
 
+#[inline(never)]
+fn deref(p: *const u64) -> u64 {
+    unsafe { *p }
+}
+
+// A jump-table edge block carrying a register restore merges with
+// restore blocks from ordinary edges: the shared copy must run on every
+// incoming edge, even ones whose own block was folded away. The merged
+// blocks' predecessor states must agree the restore is dead before it
+// may be dropped — the jump-table edge arrives with the table index in
+// the restored register, not the pointer.
+#[inline(never)]
+fn restore(ctx: &[u64; 2], e: &[u64; 8], a: u64, b: u64, c: u64) -> u64 {
+    if ctx[0] != 0 {
+        let d = e[0];
+        if d == 6 && e[7] != 0 {
+            return 0;
+        }
+        if d == 30 && e[3] != 0 {
+            return 0;
+        }
+        if d == 39 && e[3] != 0 {
+            return 0;
+        }
+    }
+    if ctx[1] == 0 {
+        let d = e[0];
+        let i = d.wrapping_sub(6) as usize;
+        if i <= 33 {
+            match i {
+                0 => return a + 14,
+                12 => return b + 14,
+                18 => return c + 14,
+                20 => {
+                    let q = deref(&e[6]);
+                    if q != 0 {
+                        return a + 14;
+                    }
+                }
+                24 => return b + 14,
+                32 => return c + 14,
+                _ => {}
+            }
+        }
+    }
+    if ctx[0] & 1 == 0 {
+        let d = e[0];
+        if d == 8 {
+            let q = deref(&e[5]);
+            if q != 0 {
+                return a + b;
+            }
+        }
+        return deref(e.as_ptr()).wrapping_add(a).wrapping_add(b).wrapping_add(c);
+    }
+    deref(e.as_ptr()).wrapping_add(a)
+}
+
 fn main() {
     let ops: Vec<Op> = (0..400u32)
         .map(|i| match i % 8 {
@@ -123,4 +181,14 @@ fn main() {
         }
     }
     println!("cleanup {c} drops {}", DROPS.load(std::sync::atomic::Ordering::Relaxed));
+    let mut r = 0u64;
+    for ctx0 in [0u64, 1] {
+        for d in [6u64, 8, 12, 18, 20, 26, 28, 30, 32, 36, 38, 39, 40] {
+            let ctx: [u64; 2] = [std::hint::black_box(ctx0), std::hint::black_box(0)];
+            let mut e = [0u64; 8];
+            e[0] = std::hint::black_box(d);
+            r = r.wrapping_mul(31).wrapping_add(restore(&ctx, &e, 1, 2, 3));
+        }
+    }
+    println!("restore {r:x}");
 }
