@@ -258,6 +258,10 @@ pub struct Lower<'func, I: VCodeInst> {
     /// after the call they copy results out of.
     pending_out_movs: SmallVec<[I; 4]>,
 
+    /// PLIRON: lazy CFG+domtree for post-index's dominator-bound-use
+    /// relaxation (`try_postindex` in the aarch64 lower).
+    postindex_cfg_dt: Option<(crate::flowgraph::ControlFlowGraph, crate::dominator_tree::DominatorTree)>,
+
     /// Compilation flags.
     flags: Flags,
 }
@@ -547,6 +551,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             pinned_reg: None,
             pending_postindex: None,
             pending_out_movs: smallvec![],
+            postindex_cfg_dt: None,
             flags,
         })
     }
@@ -2132,6 +2137,18 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 None
             }
         }
+    }
+
+    /// PLIRON: lazy CFG+domtree for `try_postindex`'s dominator-bound
+    /// use relaxation.
+    pub fn postindex_dominates(&mut self, a: crate::ir::Block, b: crate::ir::Block) -> bool {
+        let f = self.f;
+        let (_, dt) = self.postindex_cfg_dt.get_or_insert_with(|| {
+            let cfg = crate::flowgraph::ControlFlowGraph::with_function(f);
+            let dt = crate::dominator_tree::DominatorTree::with_function(f, &cfg);
+            (cfg, dt)
+        });
+        dt.dominates(a, b, &f.layout)
     }
 
     /// PLIRON: is `ir_inst` the load/store claimed by a pending

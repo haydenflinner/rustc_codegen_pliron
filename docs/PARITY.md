@@ -75,9 +75,9 @@ inputs; STK drifted up to 1.207.
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
 | arrayvec | 4.011 ms | 3.744 ms | 0.934 ◄ faster |
-| chars_alpha | 1.524 ms | 3.393 ms | 2.227 ▲ slower |
-| chars_ascii | 1.553 ms | 2.552 ms | 1.643 ▲ slower |
-| chars_mixed | 11.273 ms | 11.992 ms | 1.064 ▲ slower |
+| chars_alpha | 1.517 ms | 3.258 ms | 2.147 ▲ slower |
+| chars_ascii | 1.567 ms | 1.658 ms | 1.058 |
+| chars_mixed | 11.150 ms | 11.640 ms | 1.044 ▲ slower |
 | contains_rng | 1.570 ms | 1.054 ms | 0.671 ◄ faster |
 | eqbug | 0.080 ms | 0.095 ms | 1.194 ▲ slower |
 | fib | 10.265 ms | 9.941 ms | 0.968 ◄ faster |
@@ -94,11 +94,16 @@ inputs; STK drifted up to 1.207.
 | varint | 5.724 ms | 4.350 ms | 0.760 ◄ faster |
 | varint_postcard | 5.638 ms | 3.564 ms | 0.632 ◄ faster |
 
-`chars_alpha`/`chars_ascii` are a real regression since 2026-11-04
-(pliron 1.48/0.94 ms then): the per-char loop is ~11 insns vs LLVM's ~7
-(`ldrsb` post-increment + sign-folded ASCII test, no per-iteration null
-check or extra mov/b). Not `COPYPAIR`, `NASHEL` or the new target
-features (all tested off). See
+`chars_ascii` is back near parity after `esplit` (the merge tail is
+cloned per-edge and the ASCII arm's `icmp ult c, 128` folds to the
+bump, 7 insns/char) plus the `brhint` masked-test fix (don't mark the
+zero arm of `band`/`bor`/`bxor` tests unlikely — UTF-8's
+`c & 0x80 == 0` is the *hot* ASCII case). `chars_alpha` is the residual:
+its `is_alphabetic` merge ends in `brif`, so `esplit` doesn't touch it;
+opt-in `PLIRON_TAILDUP4`+`BRIF`+`ESCAPE`+`EDGE` re-duplicates it
+(3.26 → 2.43 ms) but the loop still pays a taken `tbz` hop, a `cbz`
+null check LLVM elides, and a `mov` count++ — post-index `ldrsb` and
+branch direction are the next levers. See
 [`history/2026-11-09-hqzopfli-insn-bloat.md`](history/2026-11-09-hqzopfli-insn-bloat.md).
 
 **wasm kernels** (node, interleaved rounds):

@@ -17,14 +17,37 @@ use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 4;
+/// Escape-repair bounds: values threaded / use-blocks param'd per block.
+const MAX_ESCAPE_VALS: usize = 4;
+const MAX_ESCAPE_BLOCKS: usize = 8;
+/// Repair attempts rebuild the CFG, so cap them to keep the pass linear.
+const MAX_REPAIRS: usize = 16;
 
-fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) -> bool {
+/// Feature switches (`PLIRON_TAILDUP_{BRIF,ESCAPE,EDGE}`); `run` reads
+/// the env, tests construct it directly.
+#[derive(Clone, Copy, Default)]
+pub struct Opts {
+    pub brif: bool,
+    pub escape: bool,
+    pub edge: bool,
+}
+
+fn candidate(
+    func: &Function,
+    uses: &FxHashMap<Value, Option<Block>>,
+    b: Block,
+    opts: Opts,
+) -> bool {
     let Some(t) = func.layout.last_inst(b) else {
         return false;
     };
-    let brif =
-        func.dfg.insts[t].opcode() == Opcode::Brif && crate::pass_enabled("PLIRON_TAILDUP_BRIF");
-    if !func.dfg.insts[t].opcode().is_return() && !(brif && local_values(func, uses, b)) {
+    let brif = func.dfg.insts[t].opcode() == Opcode::Brif && opts.brif;
+    // Escaping values are repaired by parameterizing their use-blocks
+    // (checked in `run`, which has the CFG); egraph2 merges per-edge
+    // check tails whose args feed uses in successor bodies, exactly
+    // this shape.
+    let locals_ok = local_values(func, uses, b) || (brif && opts.escape);
+    if !func.dfg.insts[t].opcode().is_return() && !(brif && locals_ok) {
         return false;
     }
     let mut n = 0;
@@ -33,6 +56,9 @@ fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) 
             continue;
         }
         let op = func.dfg.insts[i].opcode();
+        // `iconst` is free to duplicate (remat sinks or hoists them
+        // anyway); don't charge it against the size bound — late in the
+        // pipeline it is what makes a 4-op check tail look "too big".
         if op.is_call()
             || op.can_store()
             || op.can_load()
@@ -50,7 +76,9 @@ fn candidate(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Block) 
             }
             return false;
         }
-        n += 1;
+        if op != Opcode::Iconst {
+            n += 1;
+        }
     }
     if n > MAX_INSTS
         && pliron_cfg::tracing_on()
@@ -98,6 +126,204 @@ fn local_values(func: &Function, uses: &FxHashMap<Value, Option<Block>>, b: Bloc
             .layout
             .block_insts(b)
             .all(|i| func.dfg.inst_results(i).iter().all(ok))
+}
+
+/// For each value used anywhere in the layout: every block containing a
+/// use, RPO-sorted by first appearance. No reachability filter — clone
+/// blocks minted mid-run are invisible to the caller's domtree snapshot,
+/// and a dead block's extra site only over-approximates an escape set.
+fn use_sites(func: &Function) -> FxHashMap<Value, Vec<Block>> {
+    let mut m: FxHashMap<Value, Vec<Block>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                let e = m.entry(v).or_default();
+                if e.last() != Some(&b) {
+                    e.push(b);
+                }
+            }
+        }
+    }
+    m
+}
+
+/// A plan for repairing a candidate's escaping values: each use-block
+/// takes the values it uses as fresh params, and every edge into it
+/// supplies the pred's binding (`r`'s value on `r`'s own edges, the
+/// pred's fresh param on a use-block's edges — `block174`'s check then
+/// `block166`'s call chain them).
+struct Repair {
+    /// (use-block, values it gets params for) in RPO order.
+    steps: Vec<(Block, Vec<Value>)>,
+    /// (pred terminator, edge index, use-block) — args appended at apply.
+    edges: Vec<(Inst, usize, Block)>,
+}
+
+/// `r`'s values escaping to use-blocks `D` are repairable when every
+/// pred of every `D` can supply a binding: `r` itself (its value) or a
+/// use-block already param'd in this plan (its fresh param). Anything
+/// else — a third pred, a back edge in — bails: the clone would reach
+/// `D` without the binding. The CFG is rebuilt fresh: clones earlier in
+/// this run added edges (and removed pred terminators) the caller's
+/// snapshot cannot see — a stale edge list both misses arg appends and
+/// dereferences dead `Inst`s.
+fn repair_plan(
+    func: &Function,
+    sites: &FxHashMap<Value, Vec<Block>>,
+    r: Block,
+) -> Option<Repair> {
+    let cfg = ControlFlowGraph::with_function(func);
+    let mut vals: Vec<Value> = func.dfg.block_params(r).to_vec();
+    vals.extend(
+        func.layout
+            .block_insts(r)
+            .flat_map(|i| func.dfg.inst_results(i).iter().copied().collect::<Vec<_>>()),
+    );
+    let escapees: Vec<Value> = vals
+        .iter()
+        .copied()
+        .filter(|v| sites.get(v).is_some_and(|bs| bs.iter().any(|&b| b != r)))
+        .collect();
+    if escapees.is_empty() || escapees.len() > MAX_ESCAPE_VALS {
+        return None;
+    }
+    let mut dbs: FxHashSet<Block> = escapees
+        .iter()
+        .flat_map(|v| sites[v].iter().copied())
+        .filter(|&b| b != r)
+        .collect();
+    if dbs.len() > MAX_ESCAPE_BLOCKS {
+        return None;
+    }
+    if pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::taildup", tracing::Level::DEBUG)
+    {
+        tracing::debug!(target: "pliron::taildup", "taildup: repair {r} escapees {escapees:?} use-blocks {dbs:?} (fn {})", func.name);
+    }
+    // A use-block supplies the escapees its successors need too, not
+    // just the ones it uses — `needed[d]` is the use-block-local
+    // backward union over use-block successors.
+    let mut needed: FxHashMap<Block, FxHashSet<Value>> = dbs
+        .iter()
+        .map(|&d| {
+            (
+                d,
+                escapees
+                    .iter()
+                    .copied()
+                    .filter(|v| sites[v].contains(&d))
+                    .collect(),
+            )
+        })
+        .collect();
+    loop {
+        let mut grew = false;
+        for &d in &dbs {
+            let extra: Vec<Value> = cfg
+                .succ_iter(d)
+                .filter(|s| dbs.contains(s))
+                .flat_map(|s| needed[&s].iter().copied().collect::<Vec<_>>())
+                .collect();
+            for v in extra {
+                grew |= needed.get_mut(&d).unwrap().insert(v);
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // Order steps so supply blocks precede the blocks they feed:
+    // process a use-block once every pred can supply each `needed`
+    // value — `r` (its value) or an already-stepped block (its param).
+    let mut bound: FxHashSet<(Block, Value)> =
+        escapees.iter().map(|&v| (r, v)).collect();
+    let mut steps = Vec::new();
+    let mut edges = Vec::new();
+    while !dbs.is_empty() {
+        let Some(&d) = dbs.iter().find(|&&d| {
+            cfg.pred_iter(d).all(|bp| {
+                needed[&d]
+                    .iter()
+                    .all(|&v| bound.contains(&(bp.block, v)))
+            })
+        }) else {
+            return None;
+        };
+        for bp in cfg.pred_iter(d) {
+            for (di, bc) in func.dfg.insts[bp.inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .iter()
+                .enumerate()
+            {
+                if bc.block(&func.dfg.value_lists) == d {
+                    edges.push((bp.inst, di, d));
+                }
+            }
+        }
+        let vs: Vec<Value> = escapees
+            .iter()
+            .copied()
+            .filter(|v| needed[&d].contains(v))
+            .collect();
+        for &v in &vs {
+            bound.insert((d, v));
+        }
+        steps.push((d, vs));
+        dbs.remove(&d);
+    }
+    Some(Repair { steps, edges })
+}
+
+/// Apply `plan`: param each use-block, rewrite its uses, then append the
+/// pred's binding to every edge in. Runs before `r`'s clones so a clone
+/// copies the repaired edge args mapped to its own analogs.
+fn apply_repair(func: &mut Function, r: Block, plan: &Repair) {
+    let mut supply: FxHashMap<(Block, Value), Value> = FxHashMap::default();
+    for &(d, ref vs) in &plan.steps {
+        for &v in vs {
+            let ty = func.dfg.value_type(v);
+            let p = func.dfg.append_block_param(d, ty);
+            supply.insert((d, v), p);
+        }
+        let to: FxHashMap<Value, Value> = func
+            .layout
+            .block_insts(d)
+            .flat_map(|i| {
+                func.dfg
+                    .inst_values(i)
+                    .filter_map(|v| {
+                        supply
+                            .get(&(d, func.dfg.resolve_aliases(v)))
+                            .map(|&p| (v, p))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if !to.is_empty() {
+            let insts: Vec<Inst> = func.layout.block_insts(d).collect();
+            for i in insts {
+                func.dfg
+                    .map_inst_values(i, |v| to.get(&v).copied().unwrap_or(v));
+            }
+        }
+    }
+    for &(t, di, d) in &plan.edges {
+        let p = func.layout.inst_block(t).unwrap();
+        let vs: Vec<Value> = plan
+            .steps
+            .iter()
+            .find(|(s, _)| *s == d)
+            .map(|(_, vs)| vs.clone())
+            .unwrap_or_default();
+        let dfg = &mut func.dfg;
+        let bc = &mut dfg.insts[t]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di];
+        for &v in &vs {
+            let arg = if p == r { v } else { supply[&(p, v)] };
+            bc.append_argument(arg, &mut dfg.value_lists);
+        }
+    }
 }
 
 /// The `icmp` behind `t`'s `brif` condition when it is the branch's only
@@ -180,7 +406,19 @@ pub fn irreducible(func: &Function) -> bool {
 
 /// Returns the number of jumps replaced by a copy of the return block.
 pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
-    let edge_on = crate::pass_enabled("PLIRON_TAILDUP_EDGE");
+    run_opts(
+        func,
+        prof,
+        Opts {
+            brif: pliron_cfg::env_is("PLIRON_TAILDUP_BRIF", "1"),
+            escape: pliron_cfg::env_is("PLIRON_TAILDUP_ESCAPE", "1"),
+            edge: pliron_cfg::env_is("PLIRON_TAILDUP_EDGE", "1"),
+        },
+    )
+}
+
+pub fn run_opts(func: &mut Function, prof: &FxHashMap<Block, u64>, opts: Opts) -> usize {
+    let edge_on = opts.edge;
     // `PLIRON_TAILDUP_COLD` (opt-in): skip tails and preds a cold mark
     // or a zero PGO count flags — duplicating into them is code size
     // with no hot-path payoff.
@@ -224,15 +462,25 @@ pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
     {
         tracing::debug!(target: "pliron::taildup", "taildup: IRREDUCIBLE at entry (fn {})", func.name);
     }
-    let uses = use_blocks(func, &domtree);
+    let mut uses = use_blocks(func, &domtree);
     let rets: FxHashSet<Block> = func
         .layout
         .blocks()
-        .filter(|&b| Some(b) != entry && !is_cold(b) && candidate(func, &uses, b))
+        .filter(|&b| Some(b) != entry && !is_cold(b) && candidate(func, &uses, b, opts))
         .collect();
     if rets.is_empty() {
         return 0;
     }
+    let mut sites: Option<FxHashMap<Value, Vec<Block>>> = None;
+    let mut repairs: FxHashMap<Block, Option<Repair>> = FxHashMap::default();
+    let mut repairs_attempted = 0;
+    let mut repaired: FxHashSet<Block> = FxHashSet::default();
+    // Clone-block -> def-blocks of the values it uses but does not
+    // define. A clone copies its source's *current* terminator, edges
+    // already retargeted to earlier clones included; that new edge
+    // makes the clone's host a fresh pred on a path the target's
+    // free-value defs may not dominate.
+    let mut clone_imports: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for p in blocks {
@@ -364,6 +612,64 @@ pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
             if arg_in_candidate {
                 continue;
             }
+            // A candidate whose params or results escape into successor
+            // bodies is cloned only after the use-blocks are param'd and
+            // the in-edges carry the bindings — otherwise the clone's
+            // path reaches them unbound. Repair attempts are capped:
+            // each rebuilds the CFG, so the pass stays linear overall.
+            if !local_values(func, &uses, r) {
+                if !repairs.contains_key(&r) {
+                    if repairs_attempted >= MAX_REPAIRS {
+                        continue;
+                    }
+                    repairs_attempted += 1;
+                    let s = sites.get_or_insert_with(|| use_sites(func));
+                    repairs.insert(r, repair_plan(func, s, r));
+                }
+                match repairs.get(&r).unwrap() {
+                    // `local_values` failed on an already-repaired `r`: a
+                    // post-repair clone minted a new use-block for an
+                    // escapee (a free value in another candidate's copy).
+                    // No plan covers it — keep `r`'s pred so the def's
+                    // dominance over the new site survives.
+                    Some(_) if repaired.contains(&r) => continue,
+                    Some(_) => {
+                        apply_repair(func, r, repairs[&r].as_ref().unwrap());
+                        // Post-repair an escapee's only use is `r`'s own
+                        // edge args: publish that into `uses`/`sites` so
+                        // `local_values` fast-passes the remaining edges
+                        // and the arm above sees only genuinely new sites.
+                        for (_, vs) in &repairs[&r].as_ref().unwrap().steps {
+                            for &v in vs {
+                                uses.insert(v, Some(r));
+                                if let Some(s) = sites.as_mut() {
+                                    s.insert(v, vec![r]);
+                                }
+                            }
+                        }
+                        repaired.insert(r);
+                    }
+                    None => continue,
+                }
+            }
+            // The clone copies `r`'s terminator — including edges that
+            // earlier clones retargeted onto clone blocks. Those clones'
+            // free values are valid only where their defs dominate; a new
+            // edge sourced from `p`/`nb` must stay under them (original
+            // targets are safe: an imported def dominates `r`, hence `p`).
+            let bad_edge = func.layout.last_inst(r).is_some_and(|rt| {
+                func.dfg.insts[rt]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .any(|bc| {
+                        clone_imports.get(&bc.block(&func.dfg.value_lists)).is_some_and(
+                            |defs| defs.iter().any(|&d| !domtree.block_dominates(d, p)),
+                        )
+                    })
+            });
+            if bad_edge {
+                continue;
+            }
             let mut map: FxHashMap<Value, Value> = FxHashMap::default();
             let args: Vec<BlockArg> = dest.args(&func.dfg.value_lists).collect();
             let mut ok = true;
@@ -426,11 +732,12 @@ pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
                 }
                 new_insts.push(ni);
             }
-            if matches!(func.dfg.insts[t], InstructionData::Jump { .. }) {
+            let host = if matches!(func.dfg.insts[t], InstructionData::Jump { .. }) {
                 for &ni in &new_insts {
                     func.layout.insert_inst(ni, t);
                 }
                 func.layout.remove_inst(t);
+                p
             } else {
                 let nb = func.dfg.make_block();
                 func.layout.insert_block_after(nb, p);
@@ -441,6 +748,44 @@ pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
                 dfg.insts[t]
                     .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
                     BlockCall::new(nb, std::iter::empty(), &mut dfg.value_lists);
+                nb
+            };
+            // `host` now uses every free value the clone's body does
+            // (`v2235`-style: another block's def stays unmapped). Record
+            // them — a later `local_values`/`sites` query must see these
+            // fresh uses or it will clone the def block unbound. For a
+            // new block, also record the def-blocks so later clones keep
+            // any new edge into `host` under them.
+            let mut defs = FxHashSet::default();
+            for &ni in &new_insts {
+                for v in func.dfg.inst_values(ni) {
+                    let (d, ok) = match func.dfg.resolved_value_def(v) {
+                        ValueDef::Result(d, _) => {
+                            (func.layout.inst_block(d), func.layout.inst_block(d) != Some(host))
+                        }
+                        ValueDef::Param(d, _) => (Some(d), d != host),
+                        _ => (None, false),
+                    };
+                    if !ok {
+                        continue;
+                    }
+                    let Some(d) = d else { continue };
+                    defs.insert(d);
+                    let v = func.dfg.resolve_aliases(v);
+                    if let Some(s) = sites.as_mut() {
+                        let e = s.entry(v).or_default();
+                        if !e.contains(&host) {
+                            e.push(host);
+                        }
+                    }
+                    let u = uses.entry(v).or_insert(Some(host));
+                    if *u != Some(host) {
+                        *u = None;
+                    }
+                }
+            }
+            if host != p {
+                clone_imports.insert(host, defs);
             }
             if latch && di == 0 {
                 flip0 = flip;
@@ -563,7 +908,15 @@ mod tests {
         let mut cur = FuncCursor::new(&mut func).at_bottom(ret_b);
         cur.ins().return_(&[y]);
 
-        let n = run(&mut func, &FxHashMap::default());
+        let n = run_opts(
+            &mut func,
+            &FxHashMap::default(),
+            Opts {
+                brif: true,
+                escape: false,
+                edge: true,
+            },
+        );
         assert!(n >= 2, "expected both clones, ran {n}:\n{}", func.display());
 
         // The brif cloned into `q` must still test `c == ..`, i.e. its arg's

@@ -125,3 +125,9 @@
 2026-11-09T09:17:42	4f17d95	Darwin-arm64	pliron	chars_alpha	3231779	0	0
 2026-11-09T09:17:42	4f17d95	Darwin-arm64	pliron	chars_ascii	2473148	0	0
 2026-11-09T09:17:42	4f17d95	Darwin-arm64	pliron	chars_mixed	11518530	0	0
+2026-11-09T10:35:37	9a68733	Darwin-arm64	llvm	chars_alpha	1516937	0	0
+2026-11-09T10:35:37	9a68733	Darwin-arm64	llvm	chars_ascii	1566968	0	0
+2026-11-09T10:35:37	9a68733	Darwin-arm64	llvm	chars_mixed	11145571	0	0
+2026-11-09T10:35:37	9a68733	Darwin-arm64	pliron	chars_alpha	3258016	0	0
+2026-11-09T10:35:37	9a68733	Darwin-arm64	pliron	chars_ascii	1658498	0	0
+2026-11-09T10:35:37	9a68733	Darwin-arm64	pliron	chars_mixed	11643264	0	0

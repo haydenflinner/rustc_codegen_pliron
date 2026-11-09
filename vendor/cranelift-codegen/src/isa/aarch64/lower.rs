@@ -13,7 +13,7 @@ use crate::inst_predicates::{
 use crate::ir::Inst as IRInst;
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::types;
-use crate::ir::{Function, InstructionData, Opcode, Value};
+use crate::ir::{Function, InstructionData, Opcode, Value, ValueDef};
 use crate::isa::aarch64::AArch64Backend;
 use crate::isa::aarch64::inst::*;
 use crate::machinst::*;
@@ -261,12 +261,30 @@ fn try_postindex(ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
             return None;
         }
     }
+    // A use of `base` in a dominator `ub` of `block` where `base` is
+    // *bound* in `ub` (param of `ub`, or result of an inst in `ub`)
+    // runs within a binding epoch that ends before `block` executes:
+    // re-entering `ub` re-binds `base` (fresh block args / re-executed
+    // def inst), so the use can never observe the post-writeback vreg.
+    // This covers the canonical `ldrb [ptr]; ptr' = ptr + 1` decode
+    // loop, where `ptr` is a header param consumed by the header's own
+    // exit test. Any other out-of-block use keeps the old reject.
+    let base_def_block = match f.dfg.value_def(base) {
+        ValueDef::Param(d, _) => Some(d),
+        ValueDef::Result(di, _) => f.layout.inst_block(di),
+        ValueDef::Union(_, _) => None,
+    };
     for bb in f.layout.blocks() {
         if bb == block {
             continue;
         }
+        let bound_here = base_def_block == Some(bb);
+        let dominates = bound_here && ctx.postindex_dominates(bb, block);
         for inst in f.layout.block_insts(bb) {
             if f.dfg.inst_values(inst).any(|u| f.dfg.resolve_aliases(u) == base) {
+                if dominates {
+                    continue;
+                }
                 if *POSTIDX_DEBUG.get_or_init(|| std::env::var_os("PLIRON_POSTIDX_DEBUG").is_some()) {
                     eprintln!("postidx {} {ir_inst}: base live in {bb} at {inst}", f.name);
                 }

@@ -1489,3 +1489,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `Mov{Size64}` self-moves — `is_move` only matches 64-bit, so 32-bit
     `w` self-moves still correctly freshen). syn rlib: −471 emitted
     `mov`s (56636 vs 57107), all deleted insns movs.
+
+115. `try_postindex` dominator-bound use relaxation (`isa/aarch64/lower.rs`;
+    lazy `postindex_cfg_dt` on `Lower` in `machinst/lower.rs`). The
+    fusion's profitability gate rejected a candidate whenever `base`
+    had any use in another block — even a use that provably executes
+    *before* the fused access on every path. A use of `base` in a
+    dominator `ub` of the fusion block where `base` is *bound* (param
+    of `ub`, or result of an inst in `ub`) is inside a binding epoch
+    that ends before `block` runs: re-entering `ub` re-binds `base`,
+    so the use can never observe the post-writeback vreg and no
+    reuse-def copy is wasted. This is the canonical `ldrb [ptr];
+    ptr' = ptr + 1` decode-loop shape, where `ptr` is a header param
+    consumed by the header's own exit test — fusion fired on it
+    (`ldrb w1, [x23], #1` on chars_alpha). Any other out-of-block use
+    keeps the old reject. `PLIRON_POSTIDX=0` still disables the whole
+    fusion.

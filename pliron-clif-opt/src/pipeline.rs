@@ -2354,6 +2354,23 @@ fn s_taildup(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// Late fixpoint for the post-egraph run: cloning a merge block into a
+// `jump` pred can turn that pred into a fresh small merge candidate
+// (the chars decode loop's `block91`), so a second round reaches the
+// edge the first couldn't.
+fn s_taildup4(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let mut k = taildup::run(&mut p.clctx.func, p.prof);
+    for _ in 0..3 {
+        let r = taildup::run(&mut p.clctx.func, p.prof);
+        if r == 0 {
+            break;
+        }
+        k += r;
+    }
+    p.stats.dupd += k;
+    k
+}
+
 // `f(a) + f(b)`-style recursion → accumulate the first call and
 // loop on the second's args (LLVM TRE); before loadfwd/licm so
 // they can still hoist out of the new back-edge.
@@ -5025,6 +5042,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // this specializes.
         step("esplit", "esplit", Gate::OptIn("PLIRON_ESPLIT"), s_esplit)
             .needs(shape::BPARAM | shape::CONDBR),
+        // egraph2's GVN merges per-edge check tails into one shared
+        // block, breaking hot-path fall-through with a merge hop (the
+        // chars decode loop: 2.1x vs LLVM; `EGRAPH2=0` 1.08x). Re-dup
+        // the small brif/return blocks into their jump preds.
+        step("taildup4", "", Gate::OptIn("PLIRON_TAILDUP4"), s_taildup4)
+            .needs(shape::BLOCKS2),
         // Legality, not optimization: `iconst.i128` reaches isel with no
         // lowering rule and panics. Any pass can mint one, so sweep last.
         Step {

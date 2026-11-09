@@ -36,6 +36,15 @@ fn is_const(func: &Function, v: Value) -> Option<i64> {
     crate::loopidiom::iconst(func, v)
 }
 
+/// `v` is a `band`/`bor`/`bxor` result — a bit mask, not a scalar where
+/// "== 0" implies cold.
+fn masked(func: &Function, v: Value) -> bool {
+    matches!(
+        func.dfg.value_def(v).inst().map(|i| func.dfg.insts[i].opcode()),
+        Some(Opcode::Band | Opcode::Bor | Opcode::Bxor)
+    )
+}
+
 /// `eq`/`ne` test against a constant: (x, K, arm that matches).
 fn eq_test(func: &Function, cc: IntCC, x: Value, y: Value) -> Option<(Value, i64, u8)> {
     let (v, k) = match (is_const(func, x), is_const(func, y)) {
@@ -68,7 +77,10 @@ pub fn run(func: &mut Function, _an: &mut Analysis) -> usize {
                 && v2 == v
             {
                 hint = Some(arm);
-            } else if k == 0 {
+            } else if k == 0 && !masked(func, v) {
+                // `x == 0` rare for pointers/lengths/counters — but not
+                // for a `band`/`bor` mask, where the zero arm is just as
+                // often the common one (UTF-8's `c & 0x80 == 0` is ASCII).
                 hint = Some(arm);
             }
         }
@@ -84,4 +96,59 @@ pub fn run(func: &mut Function, _an: &mut Analysis) -> usize {
         tracing::debug!(target: "pliron::brhint", "{}: {} hints", func.name, n);
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hinted(src: &str) -> Vec<Option<u8>> {
+        let mut funcs = cranelift_reader::parse_functions(src).unwrap();
+        let mut an = Analysis::default();
+        run(&mut funcs[0], &mut an);
+        funcs[0]
+            .layout
+            .blocks()
+            .map(|b| funcs[0].layout.unlikely_arm(b))
+            .collect()
+    }
+
+    /// `band x, M == 0` is a mask test — the zero arm is as often the
+    /// common path (UTF-8's `c & 0x80 == 0` is ASCII); do not hint it.
+    #[test]
+    fn band_zero_not_hinted() {
+        let h = hinted(
+            "function %f(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 128
+    v2 = band v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp ne v2, v3
+    brif v4, block1, block2
+block1:
+    return v0
+block2:
+    return v1
+}",
+        );
+        assert_eq!(h, vec![None, None, None]);
+    }
+
+    /// A plain `x == 0`/`x != 0` scalar test still gets the null hint.
+    #[test]
+    fn scalar_zero_hinted() {
+        let h = hinted(
+            "function %f(i64) -> i64 {
+block0(v0: i64):
+    v3 = iconst.i64 0
+    v4 = icmp eq v0, v3
+    brif v4, block1, block2
+block1:
+    return v0
+block2:
+    return v3
+}",
+        );
+        assert_eq!(h, vec![Some(0), None, None]);
+    }
 }

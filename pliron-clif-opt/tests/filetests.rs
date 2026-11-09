@@ -93,6 +93,17 @@ fn pass(name: &str) -> Pass {
             // Report the hints as a count so `check` lines can test them.
             f.layout.blocks().filter(|&b| f.layout.unlikely_arm(b).is_some()).count()
         },
+        "taildup" => |f| {
+            pliron_clif_opt::taildup::run_opts(
+                f,
+                &rustc_hash::FxHashMap::default(),
+                pliron_clif_opt::taildup::Opts {
+                    brif: true,
+                    escape: true,
+                    edge: true,
+                },
+            )
+        },
         "edgesink" => pliron_clif_opt::edgesink::run,
         "foldforwarders" => clifpeep::foldforwarders,
         "zext_chain" => clifpeep::zext_chain,
