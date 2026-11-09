@@ -3332,6 +3332,17 @@ fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_esplit(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::esplit::run(&mut p.clctx.func, an);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("esplit");
+        }
+    }
+    k
+}
+
 // Sparse small-domain membership trees (is_whitespace/is_ascii_*
 // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
 // the accepted set fits a 64-bit window.
@@ -5007,6 +5018,13 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_egraph,
             site: std::sync::OnceLock::new(),
         },
+        // Clone a small merge block for the pred edge whose arm fact +
+        // arg ranges decide insts the join cannot (UTF-8 decode `c <
+        // 128` on the ASCII edge): `icmp`/`uextend`/`iadd` -> `+1`.
+        // Runs after `egraph2`, which creates the shared merge tails
+        // this specializes.
+        step("esplit", "esplit", Gate::OptIn("PLIRON_ESPLIT"), s_esplit)
+            .needs(shape::BPARAM | shape::CONDBR),
         // Legality, not optimization: `iconst.i128` reaches isel with no
         // lowering rule and panics. Any pass can mint one, so sweep last.
         Step {

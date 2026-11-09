@@ -1,0 +1,29 @@
+; test esplit
+; check-not: iconst.i64 11
+; check-not: iconst.i64 21
+; A merge block whose body result escapes into the successor's body is
+; unclonable: the clone's path would reach the successor without
+; defining it. Both edges fold (10+1, 20+1) — neither may clone.
+function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 0
+    v3 = iconst.i64 1
+    v4 = icmp ult v0, v3
+    v10 = iconst.i64 10
+    v20 = iconst.i64 20
+    brif v4, block1, block2
+
+block1:
+    jump block3(v10)
+
+block2:
+    jump block3(v20)
+
+block3(v30: i64):
+    v31 = iadd v30, v3
+    jump block4
+
+block4:
+    v40 = iadd v31, v31
+    return v40
+}

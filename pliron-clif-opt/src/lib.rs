@@ -38,6 +38,7 @@ pub mod dse;
 pub mod edgefwd;
 pub mod edgesink;
 pub mod edgespec;
+pub mod esplit;
 pub mod ifconv;
 pub mod foldcommon;
 pub mod indvars;

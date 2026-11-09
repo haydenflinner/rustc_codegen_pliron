@@ -1,0 +1,43 @@
+; test esplit
+; diffcheck
+; check: iconst.i8 1
+; check: icmp ult v30, v14
+; UTF-8 ASCII scan: `band byte, 128 == 0` on the not-taken arm proves
+; the byte < 128, so the merge block's `icmp ult` folds to 1 in the
+; clone made for that edge (the original keeps the merged compare).
+function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 0
+    v3 = iconst.i64 0
+    jump block1(v0, v2)
+
+block1(v10: i64, v11: i64):
+    v12 = icmp ult v10, v1
+    brif v12, block2, block6(v11)
+
+block2:
+    v13 = uload8.i64 notrap v10
+    v14 = iconst.i64 128
+    v15 = band v13, v14
+    v16 = icmp ne v15, v2
+    v17 = iconst.i64 1
+    v18 = iadd v10, v17
+    brif v16, block3, block4(v13, v18)
+
+block3:
+    v19 = iconst.i64 2
+    v20 = iadd v10, v19
+    v21 = iconst.i64 255
+    v22 = band v13, v21
+    jump block4(v22, v20)
+
+; merge: on the block2 edge v13 < 128; on the block3 edge v22 is full
+block4(v30: i64, v31: i64):
+    v32 = icmp ult v30, v14
+    v33 = uextend.i64 v32
+    v34 = iadd v33, v11
+    jump block1(v31, v34)
+
+block6(v40: i64):
+    return v40
+}

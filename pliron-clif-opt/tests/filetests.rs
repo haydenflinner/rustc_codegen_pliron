@@ -49,6 +49,10 @@ fn pass(name: &str) -> Pass {
             clifpeep::dgvn(f, &dt)
         },
         "edgefwd" => |f| edgefwd::run(f, &mut Vec::new()),
+        "esplit" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::esplit::run(f, &mut an)
+        },
         "vrp" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::vrp::run(f, &mut an)

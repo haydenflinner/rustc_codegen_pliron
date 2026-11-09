@@ -1,0 +1,30 @@
+; test esplit
+; check-not: iconst.i8 1
+; A loop header's only entry edge (the preheader) must not be cloned
+; off: the header would be reachable only through its back edges and
+; its params would stop dominating their in-loop uses. block1 has no
+; escaping values, so only the entry-edge guard prevents the clone.
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 0
+    v2 = iconst.i64 1
+    v9 = iconst.i64 99
+    v3 = icmp ult v0, v2
+    brif v3, block1(v1), block4
+
+block1(v10: i64):
+    ; folds to 1 on the entry edge (v10 == 0) — but that edge is the
+    ; only non-dominated pred, so no clone may be made.
+    v11 = icmp ult v10, v2
+    v12 = uextend.i64 v11
+    v13 = iadd v12, v10
+    v14 = iadd v13, v2
+    brif v10, block1(v14), block3
+
+block3:
+    return v9
+
+block4:
+    v20 = iconst.i64 0
+    return v20
+}
