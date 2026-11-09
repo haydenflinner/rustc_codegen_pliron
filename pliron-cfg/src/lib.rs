@@ -166,6 +166,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // html-rewriter/blind-sig regressions did not reproduce under
     // --layouts, 2026-11-09).
     "PLIRON_LIBCALL_DIRECT",
+    // Edge-specialise small pure merge blocks: chars_ascii 2.473ms ->
+    // 1.651ms (-33%, LLVM 1.567ms); corpus +214 insts over 12 fns, 0
+    // verifier failures (docs/history/2026-11-09-esplit.md).
+    "PLIRON_ESPLIT",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

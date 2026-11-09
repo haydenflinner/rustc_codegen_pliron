@@ -113,3 +113,15 @@
 2026-11-07T09:31:10	862ce3a	Darwin-arm64	pliron	tokenize	5378870	0	0
 2026-11-07T09:31:10	862ce3a	Darwin-arm64	pliron	varint	4349937	0	0
 2026-11-07T09:31:10	862ce3a	Darwin-arm64	pliron	varint_postcard	3564088	0	0
+2026-11-09T09:17:01	4f17d95	Darwin-arm64	llvm	chars_alpha	1492904	0	0
+2026-11-09T09:17:01	4f17d95	Darwin-arm64	llvm	chars_ascii	1566794	0	0
+2026-11-09T09:17:01	4f17d95	Darwin-arm64	llvm	chars_mixed	11120532	0	0
+2026-11-09T09:17:01	4f17d95	Darwin-arm64	pliron	chars_alpha	3252712	0	0
+2026-11-09T09:17:01	4f17d95	Darwin-arm64	pliron	chars_ascii	1651373	0	0
+2026-11-09T09:17:01	4f17d95	Darwin-arm64	pliron	chars_mixed	11634578	0	0
+2026-11-09T09:17:42	4f17d95	Darwin-arm64	llvm	chars_alpha	1503445	0	0
+2026-11-09T09:17:42	4f17d95	Darwin-arm64	llvm	chars_ascii	1573292	0	0
+2026-11-09T09:17:42	4f17d95	Darwin-arm64	llvm	chars_mixed	11092194	0	0
+2026-11-09T09:17:42	4f17d95	Darwin-arm64	pliron	chars_alpha	3231779	0	0
+2026-11-09T09:17:42	4f17d95	Darwin-arm64	pliron	chars_ascii	2473148	0	0
+2026-11-09T09:17:42	4f17d95	Darwin-arm64	pliron	chars_mixed	11518530	0	0
