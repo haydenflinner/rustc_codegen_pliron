@@ -1361,6 +1361,13 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     always fails there. `PLIRON_BFUSE=0` restores the decomposed code.
     LLVM emits the same `ubfiz`/`bfi` pairs for UTF-8 codepoint
     assembly (`is_mostly_utf8`): 2 insns where we had 6.
+    Fix (fuzz seed 6279): the `(x<<k)&m` rules encoded `imms` with the
+    `ubfx` convention (`bf_field_imms` = `k+w-1`) instead of `ubfiz`
+    (`bf_field_ubfiz_imms` = `w-1`), so a standalone
+    `band (ishl x, k), m` emitted the wrong field — `w = 64-2k` or
+    wider flipped the UBFM to `ubfx x, #64-k, ...` outright. Usually
+    hidden because `ushr (band x, m), k` absorbs such a `band` first;
+    `dem64`'s `ireduce.i32` passthrough exposed it.
 
 107. aarch64 `cmn` for negative compare immediates (`PLIRON_CMN`,
     default on, `=0` off): `emit_icmp` on a 32/64-bit `icmp x, -c`

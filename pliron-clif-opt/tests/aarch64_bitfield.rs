@@ -57,6 +57,18 @@ block0(v0: i32):
     return v2
 }";
 
+/// `(v0 << 8) & ((1<<50)-1)<<8` on i64 — a real field mask (`w = 50`,
+/// non-redundant); `imms = k+w-1 = 57 >= immr = 56` flips a bad
+/// encoding all the way to `ubfx`.
+const UBFIZ_SHIFT_FIRST_I64: &str = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v10 = iconst.i64 8
+    v1 = ishl v0, v10
+    v11 = iconst.i64 0x03ffffffffffff00
+    v2 = band v1, v11
+    return v2
+}";
+
 /// `(v0 & 0xff00) >> 8` — field mask then shift back down.
 const UBFX_FIELD: &str = "function %f(i32) -> i32 {
 block0(v0: i32):
@@ -137,13 +149,37 @@ fn band_then_ishl_is_ubfiz() {
 #[test]
 fn ishl_then_band_is_ubfiz() {
     let a = asm(UBFIZ_SHIFT_FIRST);
+    // `ubfiz` immediates are (lsb, width): `x<<8` masked to bits 8..15
+    // is `ubfiz w?, w?, #8, #8`. The field-width bug encoded the
+    // extract form's `k+w-1` as `imms` and printed `#8, #16`.
     assert!(
         a.lines().any(|l| {
             let l = l.trim_start();
-            (l.starts_with("ubfiz ") || l.starts_with("ubfm "))
-                && l.contains("#8")
+            l.starts_with("ubfiz ") && l.contains("#8, #8")
         }),
         "want `ubfiz w?, w?, #8, #8`:\n{a}"
+    );
+}
+
+#[test]
+fn ishl_then_band_i64_is_ubfiz() {
+    let a = asm(UBFIZ_SHIFT_FIRST_I64);
+    // `(x<<8) & ((1<<50)-1)<<8` = `ubfiz x?, x?, #8, #50`. The
+    // field-width bug encoded `imms = k+w-1 = 57 >= immr` and produced
+    // `ubfx x, x, #56, #2` (`lsr x, x, #56`) — the top 2 bits instead.
+    assert!(
+        a.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("ubfiz ") && l.contains("#8, #50")
+        }),
+        "want `ubfiz x?, x?, #8, #50`:\n{a}"
+    );
+    assert!(
+        !a.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("ubfx ") || l.starts_with("lsr ")
+        }),
+        "no `ubfx`/`lsr` — that extracts instead of inserts:\n{a}"
     );
 }
 

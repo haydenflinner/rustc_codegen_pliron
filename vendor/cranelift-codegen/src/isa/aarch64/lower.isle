@@ -2128,14 +2128,14 @@
                       (iconst _ (u64_from_imm64 m))))
       (if-let true (bfuse_on))
       (if-let immr (bf_ubfiz_immr ty k))
-      (if-let imms (bf_field_imms ty m k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
       (ubfm (operand_size ty) (put_in_reg x) immr imms))
 (rule 63 (lower (band (fits_in_64 (ty_int ty))
                       (iconst _ (u64_from_imm64 m))
                       (ishl _ x (iconst _ (u64_from_imm64 k)))))
       (if-let true (bfuse_on))
       (if-let immr (bf_ubfiz_immr ty k))
-      (if-let imms (bf_field_imms ty m k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
       (ubfm (operand_size ty) (put_in_reg x) immr imms))
 
 ;; `ishl (band x, lowmask(w)), k` and `ushr (band x, lowmask(w)<<k), k`
