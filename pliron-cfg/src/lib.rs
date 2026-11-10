@@ -191,6 +191,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // unicode lookup_slow's table base). Wrapping-add reassociation
     // only; corpus -311 insts over 20 functions, one +2 outlier.
     "PLIRON_LSR",
+    // Parameterized cold-tail merge: blocks identical modulo iconst
+    // immediates share one parameterized body; members shrink to
+    // iconsts + jump (UTF-8 Utf8Error exits, gimli match arms). Corpus
+    // -194 functions touched, all shrinks (top -244/-164/-146), diff
+    // clean, gate clean under the flag.
+    "PLIRON_TMPARAM",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
