@@ -5115,6 +5115,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `[p, #K]` (UTF-8 scan's index-param pairs). After iconst128:
         // `post_sweep` would re-funnel `iadd (iadd root, b), K`.
         step("lsr", "lsr", Gate::OptIn("PLIRON_LSR"), s_lsr).needs(shape::LOOPS),
+        // Late trees: egraph2/rebase/lsr re-associate bor chains and
+        // normalize loads after the first ldmerge (Min4's stack-copy
+        // compare loop is built there).
+        step("ldmerge2", "ldmerge", Gate::OptIn("PLIRON_LDMERGE"), s_ldmerge),
         // Cold tails identical modulo iconst immediates (error
         // constructions after unrolls) share one param'd copy; each
         // member keeps its block and shrinks to `iconsts; jump M(args)`.

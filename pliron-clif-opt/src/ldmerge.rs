@@ -411,5 +411,27 @@ pub fn run(func: &mut Function) -> usize {
             }
         }
     }
+    if n > 0 {
+        // Covered loads, their `ishl`/`uextend` covers and the
+        // mid-tree `bor`s are dead once the root is aliased — sweep
+        // them here or they emit (the pipeline's `since_reap` window
+        // is already spent by the late `ldmerge2` run).
+        crate::uses::worklist_dce(func, |f, i| {
+            let op = f.dfg.insts[i].opcode();
+            !op.is_terminator()
+                && (crate::jumpthread::pure_op(f, i)
+                    || matches!(
+                        &f.dfg.insts[i],
+                        InstructionData::Load { flags: lf, .. }
+                            if matches!(
+                                op,
+                                Opcode::Uload8
+                                    | Opcode::Uload16
+                                    | Opcode::Uload32
+                                    | Opcode::Load
+                            ) && f.dfg.mem_flags[*lf].notrap()
+                    ))
+        });
+    }
     n
 }
