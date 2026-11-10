@@ -3966,6 +3966,12 @@ fn s_copypair(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_ldmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = ldmerge::run(&mut p.clctx.func);
+    p.stats.merged += k;
+    k
+}
+
 fn s_cicm(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = cicm::run(&mut p.clctx.func, an);
     if k > 0 && p.dump {
@@ -5020,6 +5026,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // (aarch64): by-value aggregate moves, 4 insns per 16 B before.
         step("copypair", "copypair", Gate::OptIn("PLIRON_COPYPAIR"), s_copypair)
             .needs(shape::STORE),
+        // `bor`-tree byte assemblies of consecutive uload8s -> one wide
+        // load (LLVM's CombineConsecutiveLoads; Brotli's
+        // FindMatchLengthWithLimitMin4 builds u32/u64 compares from
+        // 4/8 `ldrb`+`orr` where LLVM emits `ldr w`/`ldur x`).
+        step("ldmerge", "ldmerge", Gate::OptIn("PLIRON_LDMERGE"), s_ldmerge),
         Step {
             name: "coldret",
             bisect: Some("coldret"),

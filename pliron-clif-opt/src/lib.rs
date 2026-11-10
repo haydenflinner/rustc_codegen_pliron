@@ -47,6 +47,7 @@ pub mod ivrefold;
 pub mod ivretro;
 pub mod jumpthread;
 pub mod licm;
+pub mod ldmerge;
 pub mod loadfwd;
 pub mod loopdel;
 pub mod loopidiom;
