@@ -153,6 +153,10 @@ fn pass(name: &str) -> Pass {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::rebase::run(f, &mut an)
         },
+        "lsr" => |f| {
+            let mut an = pliron_clif_opt::pipeline::Analysis::default();
+            pliron_clif_opt::lsr::run(f, &mut an)
+        },
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,
         "selargs" => clifpeep::selargs,

@@ -3079,6 +3079,14 @@ fn s_rebase(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_lsr(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = lsr::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("lsr");
+    }
+    k
+}
+
 // `(a ⊕ deep) ⊕ shallow` -> `(a ⊕ shallow) ⊕ deep` inside a block, so
 // the most recently computed operand waits for one op (blake3's G).
 fn s_hreassoc(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -5085,6 +5093,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Must be the last inst-mutating step — `iconst128`'s
         // `post_sweep` re-folds `(x+k1)+k2` back to `x+(k1+k2)`.
         step("rebase", "rebase", Gate::OptIn("PLIRON_REBASE"), s_rebase),
+        // Rebase `iadd X, b` through proven param-difference invariants
+        // onto a canonical `iadd root, b` so slot addresses fold into
+        // `[p, #K]` (UTF-8 scan's index-param pairs). After iconst128:
+        // `post_sweep` would re-funnel `iadd (iadd root, b), K`.
+        step("lsr", "lsr", Gate::OptIn("PLIRON_LSR"), s_lsr).needs(shape::LOOPS),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

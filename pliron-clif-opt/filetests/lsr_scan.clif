@@ -1,0 +1,39 @@
+; test lsr
+; `i2 = i1 + 16` is established on the entry edge (`v11 = v10 + 16`)
+; and preserved on the back edge (`(i2 + 128) - (i2 + 112) = 16` — the
+; param leaves cancel), so every `iadd i2(+K), base` rebases onto the
+; canonical `v22 = iadd i1, v0` — the UTF-8 scan's slot addressing.
+; v36 (`iadd v21, v1`: no canonical `iadd v20, v1` exists) must stay.
+;
+; check: v38 = iconst.i64 16
+; check: v24 = iadd v22, v38
+; check: v39 = iconst.i64 32
+; check: v28 = iadd v22, v39
+; check: v37 = iadd v21, v1
+; check-not: iadd v21, v0
+function %f(i64, i64) {
+block0(v0: i64, v1: i64):
+    v10 = iconst.i64 0
+    v11 = iconst.i64 16
+    jump block1(v10, v11)
+
+block1(v20: i64, v21: i64):
+    v22 = iadd.i64 v20, v0
+    v23 = load.i64 notrap v22
+    v24 = iadd.i64 v21, v0
+    v25 = load.i64 notrap v24
+    v26 = iconst.i64 16
+    v27 = iadd.i64 v21, v26
+    v28 = iadd.i64 v27, v0
+    v29 = load.i64 notrap v28
+    v33 = iconst.i64 112
+    v34 = iadd.i64 v21, v33
+    v35 = iconst.i64 128
+    v36 = iadd.i64 v21, v35
+    v37 = iadd.i64 v21, v1
+    v32 = icmp.i64 ugt v23, v25
+    brif v32, block2, block1(v34, v36)
+
+block2:
+    return
+}
