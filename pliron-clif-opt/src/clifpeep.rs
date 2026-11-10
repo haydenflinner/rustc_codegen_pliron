@@ -1969,6 +1969,14 @@ fn ceval(func: &Function, v: Value, d: u32) -> Option<u128> {
                 Opcode::Iadd => a.wrapping_add(b),
                 Opcode::Isub => a.wrapping_sub(b),
                 Opcode::Imul => a.wrapping_mul(b),
+                Opcode::Umulhi if w <= 64 => (a * b) >> w,
+                Opcode::Smulhi if w <= 64 => {
+                    let ext = |x: u128| -> i128 {
+                        let sh = 128 - w;
+                        ((x << sh) as i128) >> sh
+                    };
+                    ((ext(a) * ext(b)) >> w) as u128
+                }
                 Opcode::Band => a & b,
                 Opcode::Bor => a | b,
                 Opcode::Bxor => a ^ b,

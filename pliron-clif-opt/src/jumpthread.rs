@@ -161,6 +161,10 @@ pub fn eval(
                 Opcode::Urem if *ARITH && b != 0 => a % b,
                 Opcode::Ishl if *ARITH => a << (b & u64::from(w - 1)),
                 Opcode::Ushr if *ARITH => a >> (b & u64::from(w - 1)),
+                Opcode::Umulhi => (((a as u128) * (b as u128)) >> w) as u64,
+                Opcode::Smulhi => {
+                    ((sext(a, w) as i128 * sext(b, w) as i128) >> w) as u64
+                }
                 Opcode::Sshr if *ARITH => (sext(a, w) >> (b & u64::from(w - 1))) as u64,
                 Opcode::Rotl | Opcode::Rotr if *ARITH => {
                     let s = (b & u64::from(w - 1)) as u32;
