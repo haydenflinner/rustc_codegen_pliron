@@ -32,7 +32,7 @@ use cranelift_codegen::ir::{
     ValueDef,
 };
 use cranelift_codegen::ir::BlockArg;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ivptr::{lin, Lin};
 use crate::pipeline::{Analysis, CfgDtLa};
@@ -97,6 +97,10 @@ impl Uf {
 pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
     // (inst to rewrite, canonical value, new offset)
     let mut edits: Vec<(Inst, Value, i64)> = Vec::new();
+    // One rewrite per inst: `iadd a, b` with both operands qualifying
+    // (e.g. two outside-loop invariants, or `iadd v, v`) pushes into two
+    // groups — every rewrite is the same reassociation, so first wins.
+    let mut edited: FxHashSet<Inst> = FxHashSet::default();
     {
         let CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         // Blocks per loop (nested included), one layout walk.
@@ -253,6 +257,7 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
                         }
                     }
                     if let Some((_, cv, ck)) = best
+                        && edited.insert(ri)
                         && pliron_cfg::bisect("lsr")
                     {
                         edits.push((ri, cv, rk.wrapping_sub(ck)));
@@ -263,8 +268,13 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
     }
     let n = edits.len();
     for (i, c, k) in edits {
+        // The canonical's own inst may have been removed by an earlier
+        // `k == 0` edit — chase the alias to what it rewrites to.
+        let c = func.dfg.resolve_aliases(c);
         if k == 0 {
-            let x = func.dfg.inst_results(i)[0];
+            let Some(&x) = func.dfg.inst_results(i).first() else {
+                continue;
+            };
             func.layout.remove_inst(i);
             func.dfg.detach_inst_results(i);
             func.dfg.change_to_alias(x, c);

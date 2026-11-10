@@ -185,6 +185,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // ~2.10ms (LLVM 2.12ms); corpus replay clean with both on.
     "PLIRON_RETNN",
     "PLIRON_NNBB",
+    // Affine address rebase through proven param-difference invariants:
+    // `iadd X, b` with X ≡ root+K under a dominating `iadd root, b`
+    // funnels onto the shared pointer (UTF-8 scan's paired index IVs,
+    // unicode lookup_slow's table base). Wrapping-add reassociation
+    // only; corpus -311 insts over 20 functions, one +2 outlier.
+    "PLIRON_LSR",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

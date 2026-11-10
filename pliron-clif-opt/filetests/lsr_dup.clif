@@ -1,0 +1,21 @@
+; test lsr
+; `iadd v1, v1` pushes into the same (b, root) group twice — once per
+; operand side. Without the per-inst edit dedup the same inst got two
+; `k == 0` edits and the second indexed the already-detached results
+; (fuzz seed 730 ICE).
+; check: v4 = iadd.i64 v1, v1
+; check: v5 -> v4
+; check-not: v5 = iadd
+function %f(i64, i64) {
+block0(v0: i64, v1: i64):
+    jump block1(v0, v0)
+
+block1(v2: i64, v3: i64):
+    v4 = iadd.i64 v1, v1
+    v5 = iadd.i64 v1, v1
+    v6 = icmp.i64 ugt v4, v5
+    brif v6, block2, block1(v4, v3)
+
+block2:
+    return
+}
