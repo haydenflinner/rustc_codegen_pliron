@@ -5808,6 +5808,7 @@ mod tests {
         let derived = VMap::default();
         let cfg = ControlFlowGraph::with_function(&func);
         let mut nn = NonNull::new(&func, &cfg, &loads, &derived);
+        nn.set_nn_bb(false);
         assert!(!nn.is(&func, bb), "gate off: the barrier hides the proof");
         nn.set_nn_bb(true);
         assert!(nn.is(&func, bb), "gate on: nonnull through the barrier");

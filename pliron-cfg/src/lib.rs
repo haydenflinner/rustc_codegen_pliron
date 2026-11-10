@@ -176,6 +176,15 @@ pub const DEFAULT_ON: &[&str] = &[
     // `!= "0"`; PLIRON_PATCH.md #116; chars_alpha 3.26ms -> ~2.1ms with
     // the AArch64 post-index path).
     "PLIRON_BUMPHOIST",
+    // rustc's `nonnull` return attribute seeds nonnull call results
+    // (lower.rs, extends the unconditional `st.nnret` inference to
+    // `&[T]` data pointers et al) and `black_box` keeps the nonnull
+    // proof — the op returns the argument's exact bits (jumpthread,
+    // test black_box_keeps_nonnull). Together they fold the
+    // `Option<NonNull>` niche `cbz` LLVM elides: chars_alpha 2.46 ->
+    // ~2.10ms (LLVM 2.12ms); corpus replay clean with both on.
+    "PLIRON_RETNN",
+    "PLIRON_NNBB",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

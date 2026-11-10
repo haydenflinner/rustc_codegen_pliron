@@ -75,7 +75,7 @@ inputs; STK drifted up to 1.207.
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
 | arrayvec | 4.011 ms | 3.744 ms | 0.934 ◄ faster |
-| chars_alpha | 1.517 ms | 3.258 ms | 2.147 ▲ slower |
+| chars_alpha | 2.082 ms | 2.098 ms | 1.008 |
 | chars_ascii | 1.567 ms | 1.658 ms | 1.058 |
 | chars_mixed | 11.150 ms | 11.640 ms | 1.044 ▲ slower |
 | contains_rng | 1.570 ms | 1.054 ms | 0.671 ◄ faster |
@@ -98,12 +98,12 @@ inputs; STK drifted up to 1.207.
 cloned per-edge and the ASCII arm's `icmp ult c, 128` folds to the
 bump, 7 insns/char) plus the `brhint` masked-test fix (don't mark the
 zero arm of `band`/`bor`/`bxor` tests unlikely — UTF-8's
-`c & 0x80 == 0` is the *hot* ASCII case). `chars_alpha` is the residual:
-its `is_alphabetic` merge ends in `brif`, so `esplit` doesn't touch it;
-opt-in `PLIRON_TAILDUP4`+`BRIF`+`ESCAPE`+`EDGE` re-duplicates it
-(3.26 → 2.43 ms) but the loop still pays a taken `tbz` hop, a `cbz`
-null check LLVM elides, and a `mov` count++ — post-index `ldrsb` and
-branch direction are the next levers. See
+`c & 0x80 == 0` is the *hot* ASCII case). `chars_alpha` closed at
+1.008 (2.098 vs 2.082 ms): `brhint` marks the single-bit `band`'s
+bit-set arm unlikely so ASCII falls through (`tbnz`-away like LLVM),
+`bump_hoist`+post-index emit `ldrb [x], #1`, and `PLIRON_RETNN`+
+`PLIRON_NNBB` (now default-on) fold the `Option<NonNull>` niche `cbz`
+through `black_box`. See
 [`history/2026-11-09-hqzopfli-insn-bloat.md`](history/2026-11-09-hqzopfli-insn-bloat.md).
 
 **wasm kernels** (node, interleaved rounds):
