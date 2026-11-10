@@ -286,16 +286,19 @@ fn rewrite(func: &mut Function, root: Inst, leaves: &[Value]) -> usize {
     if pieces.is_empty() {
         return 0;
     }
-    // All merged loads must be in root's block with no store/call
-    // between the earliest and the latest (the wide load reads the
-    // whole range at its anchor's position).
-    let Some(block) = func.layout.inst_block(root) else {
-        return 0;
-    };
-    let insts: Vec<Inst> = func.layout.block_insts(block).collect();
-    let pos: FxHashMap<Inst, usize> = insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
-    let (mut lo_pos, mut hi_pos) = (usize::MAX, 0usize);
+    // Each piece's merged loads must sit in one block (the anchor's)
+    // with no store/call between the earliest and the latest — the
+    // wide load reads the whole range at the anchor's position. Loads
+    // and the `bor` tree may live in different blocks; the anchor
+    // block dominates the tree since the leaf values do.
     for p in &pieces {
+        let Some(block) = func.layout.inst_block(p.anchor) else {
+            return 0;
+        };
+        let insts: Vec<Inst> = func.layout.block_insts(block).collect();
+        let pos: FxHashMap<Inst, usize> =
+            insts.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        let (mut lo_pos, mut hi_pos) = (usize::MAX, 0usize);
         for &t in &p.cover {
             let Some(&x) = pos.get(&terms[t].ld) else {
                 return 0;
@@ -303,11 +306,11 @@ fn rewrite(func: &mut Function, root: Inst, leaves: &[Value]) -> usize {
             lo_pos = lo_pos.min(x);
             hi_pos = hi_pos.max(x);
         }
-    }
-    if hi_pos.wrapping_sub(lo_pos) > MAX_SPAN
-        || !no_writes_between(func, &insts, lo_pos, hi_pos)
-    {
-        return 0;
+        if hi_pos.wrapping_sub(lo_pos) > MAX_SPAN
+            || !no_writes_between(func, &insts, lo_pos, hi_pos)
+        {
+            return 0;
+        }
     }
     // Emit each piece's load at its anchor, then any extend/shift and
     // the rebuilt `bor` chain just before `root`.
