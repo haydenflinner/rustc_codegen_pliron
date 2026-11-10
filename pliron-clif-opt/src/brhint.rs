@@ -10,7 +10,10 @@
 //!   `brchain`, or a `match` on an enum): each arm matches 1/N of the
 //!   time, so the match arm is unlikely and the chain stays contiguous;
 //! - **zero test**: `icmp eq x, 0` is unlikely and `icmp ne x, 0` likely
-//!   (null pointers, empty lengths, error codes).
+//!   (null pointers, empty lengths, error codes) — except for masked
+//!   values (`band`/`bor`/`bxor`), where the zero arm is as often the
+//!   common path. A single-bit `band x, 1<<k` flips it: the bit-set arm
+//!   is the "flag present" special case and goes unlikely instead.
 //!
 //! Cold blocks and loop structure are stronger signals and placement
 //! applies them first. Runs last in the pipeline so no CFG rewrite has to
@@ -43,6 +46,26 @@ fn masked(func: &Function, v: Value) -> bool {
         func.dfg.value_def(v).inst().map(|i| func.dfg.insts[i].opcode()),
         Some(Opcode::Band | Opcode::Bor | Opcode::Bxor)
     )
+}
+
+/// `v` is a single-bit `band x, 1<<k` test: the nonzero arm is the
+/// "flag set" path — the special case (UTF-8's `c & 0x80` sets the bit
+/// only for non-ASCII). Returns true only for `band`: `bor x, K != 0`
+/// is near-always true and `bxor` has no flag reading.
+fn maskbit(func: &Function, v: Value) -> bool {
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return false;
+    };
+    let InstructionData::Binary {
+        opcode: Opcode::Band,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return false;
+    };
+    args.iter().any(|&a| {
+        is_const(func, a).is_some_and(|k| k != 0 && (k as u64).is_power_of_two())
+    })
 }
 
 /// `eq`/`ne` test against a constant: (x, K, arm that matches).
@@ -82,6 +105,11 @@ pub fn run(func: &mut Function, _an: &mut Analysis) -> usize {
                 // for a `band`/`bor` mask, where the zero arm is just as
                 // often the common one (UTF-8's `c & 0x80 == 0` is ASCII).
                 hint = Some(arm);
+            } else if k == 0 && maskbit(func, v) {
+                // A single-bit mask flips the direction: `flags & BIT`
+                // nonzero is the "flag set" arm — the special case —
+                // so the bit-clear arm keeps the fallthrough instead.
+                hint = Some(1 - arm);
             }
         }
         if let Some(arm) = hint {
@@ -113,15 +141,57 @@ mod tests {
             .collect()
     }
 
-    /// `band x, M == 0` is a mask test — the zero arm is as often the
-    /// common path (UTF-8's `c & 0x80 == 0` is ASCII); do not hint it.
+    /// `band x, 1<<k != 0` is a flag test — the bit-set arm is the
+    /// special case (UTF-8's `c & 0x80 != 0` is non-ASCII), so it is
+    /// the arm marked unlikely.
     #[test]
-    fn band_zero_not_hinted() {
+    fn band_single_bit_marks_nonzero() {
         let h = hinted(
             "function %f(i32) -> i32 {
 block0(v0: i32):
     v1 = iconst.i32 128
     v2 = band v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp ne v2, v3
+    brif v4, block1, block2
+block1:
+    return v0
+block2:
+    return v1
+}",
+        );
+        assert_eq!(h, vec![Some(0), None, None]);
+    }
+
+    /// A multi-bit `band` is a field test, not a flag test — no hint.
+    #[test]
+    fn band_multibit_not_hinted() {
+        let h = hinted(
+            "function %f(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 240
+    v2 = band v0, v1
+    v3 = iconst.i32 0
+    v4 = icmp ne v2, v3
+    brif v4, block1, block2
+block1:
+    return v0
+block2:
+    return v1
+}",
+        );
+        assert_eq!(h, vec![None, None, None]);
+    }
+
+    /// `bor x, K != 0` is near-always true — the nonzero arm is hot, so
+    /// no hint (and the zero arm is not common either way).
+    #[test]
+    fn bor_not_hinted() {
+        let h = hinted(
+            "function %f(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 128
+    v2 = bor v0, v1
     v3 = iconst.i32 0
     v4 = icmp ne v2, v3
     brif v4, block1, block2

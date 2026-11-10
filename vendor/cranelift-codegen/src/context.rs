@@ -565,7 +565,28 @@ impl Context {
             if !self.domtree.block_dominates(h, b) {
                 continue;
             }
-            // The constant operand must reach the new position too.
+            // Only the cursor bump belongs in `h`: its result feeds the
+            // next iteration's base, so it shows up in the site's
+            // terminator args. Other bumps on the same base (`p+2` on a
+            // cold decode path) would compute unconditionally in `h` —
+            // leave them so phase 2 remats their base operand in `b`.
+            let res = self.func.dfg.first_result(i);
+            let feeds_edge = self
+                .func
+                .layout
+                .last_inst(b)
+                .is_some_and(|t| {
+                    self.func
+                        .dfg
+                        .inst_values(t)
+                        .any(|v| self.func.dfg.resolve_aliases(v) == res)
+                });
+            if !feeds_edge {
+                continue;
+            }
+            // The constant operand must reach the new position too. The
+            // egraph's elaborator sinks `iconst`s into their use blocks —
+            // a copy placed at the hoist point is free to remat.
             let InstructionData::Binary { args, .. } = self.func.dfg.insts[i] else {
                 continue;
             };
@@ -574,12 +595,32 @@ impl Context {
             } else {
                 args[0]
             };
+            let mut c_remat: Option<(i64, crate::ir::Type)> = None;
             let okc = match self.func.dfg.value_def(self.func.dfg.resolve_aliases(c)) {
-                ValueDef::Result(ci, _) => self
-                    .func
-                    .layout
-                    .inst_block(ci)
-                    .is_some_and(|cb| cb == h || self.domtree.block_dominates(cb, h)),
+                ValueDef::Result(ci, _) => {
+                    let reaches = self
+                        .func
+                        .layout
+                        .inst_block(ci)
+                        .is_some_and(|cb| cb == h || self.domtree.block_dominates(cb, h));
+                    if reaches {
+                        true
+                    } else {
+                        match self.func.dfg.insts[ci] {
+                            InstructionData::UnaryImm {
+                                opcode: Opcode::Iconst,
+                                imm,
+                            } => {
+                                c_remat =
+                                    Some((imm.bits(), self.func.dfg.value_type(
+                                        self.func.dfg.first_result(ci),
+                                    )));
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                }
                 ValueDef::Param(cb, _) => self.domtree.block_dominates(cb, h),
                 _ => false,
             };
@@ -589,6 +630,22 @@ impl Context {
             let Some(t) = self.func.layout.last_inst(h) else {
                 continue;
             };
+            if let Some((k, ty)) = c_remat {
+                let ci = self.func.dfg.make_inst(InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    imm: k.into(),
+                });
+                self.func.dfg.make_inst_results(ci, ty);
+                let cv = self.func.dfg.first_result(ci);
+                self.func.layout.insert_inst(ci, t);
+                let dfg = &mut self.func.dfg;
+                dfg.insts[i].map_values(
+                    &mut dfg.value_lists,
+                    &mut dfg.jump_tables,
+                    &mut dfg.exception_tables,
+                    |v| if v == c { cv } else { v },
+                );
+            }
             self.func.layout.remove_inst(i);
             self.func.layout.insert_inst(i, t);
             moved += 1;

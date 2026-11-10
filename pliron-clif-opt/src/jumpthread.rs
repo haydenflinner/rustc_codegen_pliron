@@ -414,6 +414,10 @@ pub struct NonNull<'a> {
     /// `PLIRON_NN_ADDR`, read once — `pass_enabled` does a TLS-tracked
     /// lookup per call, which is too hot inside `is_deps`.
     nn_addr: bool,
+    /// `PLIRON_NNBB`: `black_box v` keeps `v`'s non-null proof (the op
+    /// returns `v`'s bits; hiding identity must not hide type-level
+    /// facts). Opt-in until measured.
+    nn_bb: bool,
     /// `PLIRON_NN_ANYINT`: seed scalar-int params of every width, not just
     /// i64 — wasm32 iterator pointers are i32, and a `!= 0` proof is
     /// width-agnostic anyway (`non_zero_const` masks to the value's own
@@ -454,6 +458,7 @@ impl<'a> NonNull<'a> {
             dt: None,
             params: FxHashSet::default(),
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
+            nn_bb: crate::env_is("PLIRON_NNBB", "1"),
             nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
             deref: ext.then(|| deref_chains(func, cfg)),
         };
@@ -597,6 +602,7 @@ impl<'a> NonNull<'a> {
             dt: None,
             params,
             nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
+            nn_bb: crate::env_is("PLIRON_NNBB", "1"),
             nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
             deref: None,
         }
@@ -781,6 +787,22 @@ impl<'a> NonNull<'a> {
                     work.push(func.dfg.resolve_aliases(args[2]));
                     continue 'terms;
                 }
+                // `black_box v` returns `v` unchanged: it hides the
+                // value's *identity*, not its type-level facts — a
+                // non-null arg stays non-null (`nnargs`-seeded `&T`/
+                // `&str` data ptrs keep feeding iterator niche folds
+                // through `black_box(&s)`; LLVM re-derives the same fact
+                // from `nonnull`-annotated phis).
+                if self.nn_bb
+                    && let Some(i) = func.dfg.value_def(v).inst()
+                    && let InstructionData::Unary {
+                        opcode: Opcode::BlackBox,
+                        arg,
+                    } = func.dfg.insts[i]
+                {
+                    v = func.dfg.resolve_aliases(arg);
+                    continue;
+                }
                 match self.derived_base(func, v) {
                     Some(b) => {
                         v = b;
@@ -896,6 +918,11 @@ impl NonNull<'_> {
     /// Debug: `derived` base for `v`, if present.
     pub fn derived_debug(&self, func: &Function, v: Value) -> Option<Value> {
         self.derived.get(&func.dfg.resolve_aliases(v)).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_nn_bb(&mut self, v: bool) {
+        self.nn_bb = v;
     }
 
     /// Is `v` provably non-null on edge `ei` of terminator `t`? Beyond
@@ -5733,6 +5760,57 @@ mod tests {
         let cfg = ControlFlowGraph::with_function(&func);
         let nn = NonNull::new(&func, &cfg, &loads, &derived);
         assert!(nn.is(&func, p), "i32 loop param should prove non-null");
+
+        assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
+        let di = func.dfg.value_def(null_test).inst().unwrap();
+        assert!(matches!(
+            func.dfg.insts[di],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm
+            } if imm.bits() == 0
+        ));
+    }
+
+    /// `black_box(&s)` returns its argument's bits — under `PLIRON_NNBB`
+    /// an `nnargs`-seeded `&str` data ptr stays provably non-null through
+    /// the barrier, so the `Option<&u8>` niche test on the boxed cursor
+    /// folds. With the gate off the barrier is opaque (`nn.is` false).
+    #[test]
+    fn black_box_keeps_nonnull() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (bb, null_test) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let body = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(entry, types::I64); // ptr (nonnull)
+            builder.switch_to_block(entry);
+            let p = builder.block_params(entry)[0];
+            let bb = builder.ins().black_box(p);
+            let z = builder.ins().iconst(types::I64, 0);
+            let null_test = builder.ins().icmp(IntCC::Equal, bb, z);
+            builder.ins().brif(null_test, exit, &[], body, &[]);
+            builder.switch_to_block(body);
+            builder.ins().return_(&[]);
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (bb, null_test)
+        };
+
+        let loads: FxHashSet<_> = [func.dfg.block_params(
+            func.layout.entry_block().unwrap(),
+        )[0]]
+        .into_iter()
+        .collect();
+        let derived = VMap::default();
+        let cfg = ControlFlowGraph::with_function(&func);
+        let mut nn = NonNull::new(&func, &cfg, &loads, &derived);
+        assert!(!nn.is(&func, bb), "gate off: the barrier hides the proof");
+        nn.set_nn_bb(true);
+        assert!(nn.is(&func, bb), "gate on: nonnull through the barrier");
 
         assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
         let di = func.dfg.value_def(null_test).inst().unwrap();

@@ -3071,6 +3071,14 @@ fn s_reassoc(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_rebase(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = rebase::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("rebase");
+    }
+    k
+}
+
 // `(a ⊕ deep) ⊕ shallow` -> `(a ⊕ shallow) ⊕ deep` inside a block, so
 // the most recently computed operand waits for one op (blake3's G).
 fn s_hreassoc(p: &mut Pipe, _an: &mut Analysis) -> usize {
@@ -5071,6 +5079,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // After everything: the `end + -1` bound and the stepped pointer
         // only settle into one block at the end (parse_only).
         step("stepcmp", "", Gate::OptIn("PLIRON_STEPCMP"), s_stepcmp).needs(shape::LOOPS),
+        // Rebase `iadd p, K` uses through a dominating `w = iadd p, J`
+        // so a load's base dies at the fused inst and aarch64
+        // post-index fires (`p + 2` in the UTF-8 decode arm → `p' + 1`).
+        // Must be the last inst-mutating step — `iconst128`'s
+        // `post_sweep` re-folds `(x+k1)+k2` back to `x+(k1+k2)`.
+        step("rebase", "rebase", Gate::OptIn("PLIRON_REBASE"), s_rebase),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

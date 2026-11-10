@@ -1505,3 +1505,25 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     (`ldrb w1, [x23], #1` on chars_alpha). Any other out-of-block use
     keeps the old reject. `PLIRON_POSTIDX=0` still disables the whole
     fusion.
+
+116. Post-egraph cursor-bump hoisting (`src/context.rs` `bump_hoist`,
+    `PLIRON_BUMPHOIST`, default on, `=0` off). The compile-path egraph's
+    elaborator sinks pure insts into use blocks: a loop cursor's
+    `iadd p, k` lands in a successor block, splitting the `load [p]` /
+    `p+k` adjacency patch 115's post-index fusion needs. For each block
+    param `p` used as a load/store base in its own block `h`, a
+    dominated `iadd p, k`/`isub p, k` moves back next to `h`'s
+    terminator — but only the *cursor* bump (its result must appear in
+    the site block's terminator args, i.e. it feeds the next
+    iteration's base); cold-path bumps like a decode arm's `p+2` stay
+    home, since hoisting them would compute them unconditionally on the
+    hot path. If the egraph also sank the bump's `iconst` into a
+    non-dominating block, a fresh `iconst` is materialized at the hoist
+    point. Phase 2 then makes `p` die after its memory op: duplicate
+    `p ± k` bumps in `h` fold to one (`resolve_all_aliases` afterwards,
+    since lowering's use counts key the raw arg value), and every other
+    use of `p` is rewritten to a remat `isub q,k`/`iadd q,k` at the top
+    of the using block — `q` the kept bump's result, which dominates
+    those blocks because `p` does. On `chars_alpha`'s ASCII loop the
+    hoisted `p+1` restores the fusion patch 115 needed:
+    `ldrb w10, [x23], #0x1`.

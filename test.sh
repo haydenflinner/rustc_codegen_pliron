@@ -311,10 +311,12 @@ t_slotpromlt() {
       $out/spl3$exe | diff --strip-trailing-cr - $out/spl.out
   # Spill CSE (vendored cranelift `reload_cse`, PLIRON_PATCH #94) drops
   # the same store-backs, so both are measured against a baseline without
-  # it, and it must shrink the code on its own too.
-  PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
-  PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
-  PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
+  # it, and it must shrink the code on its own too. `bump_hoist` already
+  # deletes these moves pre-regalloc, so the comparison pins it off to
+  # keep measuring what RA2_XBLOCK contributes.
+  PLIRON_BUMPHOIST=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  PLIRON_BUMPHOIST=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  PLIRON_BUMPHOIST=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
   local z0 z3 z4
   if [[ -x "$llvmod" ]]; then
     z0=$("$llvmod" -d --no-show-raw-insn $out/spl0.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)

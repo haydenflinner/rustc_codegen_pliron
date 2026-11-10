@@ -170,6 +170,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // 1.651ms (-33%, LLVM 1.567ms); corpus +214 insts over 12 fns, 0
     // verifier failures (docs/history/2026-11-09-esplit.md).
     "PLIRON_ESPLIT",
+    // Cursor-bump hoist back into the memory block after the compile-path
+    // egraph's elaboration sinks it into use blocks — exposes the
+    // ldr-post-index fusion (vendored Cranelift reads it itself,
+    // `!= "0"`; PLIRON_PATCH.md #116; chars_alpha 3.26ms -> ~2.1ms with
+    // the AArch64 post-index path).
+    "PLIRON_BUMPHOIST",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

@@ -1,0 +1,24 @@
+; test rebase
+; `x = iadd p, K` with a dominating `w = iadd p, J` on a memory base
+; becomes `x = iadd w, K-J` so `p`'s post-increment uses funnel
+; through `w` — the shape aarch64 post-index fusion needs.
+;
+; v5 (p+1 again) folds to an alias of v2: the same-offset case used to
+; crash because `change_to_alias` ran on a still-attached result.
+; check: v5 -> v2
+; check: v7 = iadd v5, v8
+; check: store v5, v0
+; check-not: v5 = iadd
+function %f(i64) {
+block0(v0: i64):
+    v1 = iconst.i64 1
+    v2 = iadd.i64 v0, v1
+    v3 = uload8.i32 notrap v0
+    v4 = iconst.i64 1
+    v5 = iadd.i64 v0, v4
+    v6 = iconst.i64 3
+    v7 = iadd.i64 v0, v6
+    store.i64 v5, v0
+    store.i64 v7, v2
+    return
+}
