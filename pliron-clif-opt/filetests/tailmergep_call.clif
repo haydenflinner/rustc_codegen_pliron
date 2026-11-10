@@ -1,0 +1,46 @@
+; test tailmergep
+; Panic tails: `symbol_value gvN; try_call panic(idx, len, loc)` —
+; members differ in the gv location const and in external idx/len
+; operands (one member's idx arrives as its own block param). One
+; try_call survives in a shared block taking (loc, idx, len) params;
+; stubs rematerialize their own gv and pass their own operands.
+; check: block11(v
+; check: symbol_value.i64 gv0
+; check: symbol_value.i64 gv1
+; check: symbol_value.i64 gv2
+; check: try_call fn0(
+; check-not: try_call fn0(v2,
+; check: jump block11(
+function %g(i64, i64, i64) {
+    sig0 = (i64, i64, i64) apple_aarch64
+    fn0 = u0:0 sig0
+    gv0 = symbol colocated userextname0
+    gv1 = symbol colocated userextname1
+    gv2 = symbol colocated userextname2
+
+block0(v0: i64, v1: i64, v2: i64):
+    brif v1, block2, block3
+
+block2:
+    brif v0, block4(v2), block5
+
+; idx = v2, len = v1
+block3 cold:
+    v30 = symbol_value.i64 gv0
+    try_call fn0(v2, v1, v30), sig0, block9, [ tag0: block10(exn0) ]
+
+; idx arrives as a block param
+block4(v40: i64) cold:
+    v41 = symbol_value.i64 gv1
+    try_call fn0(v40, v1, v41), sig0, block9, [ tag0: block10(exn0) ]
+
+block5 cold:
+    v50 = symbol_value.i64 gv2
+    try_call fn0(v0, v1, v50), sig0, block9, [ tag0: block10(exn0) ]
+
+block9:
+    return
+
+block10(v100: i64):
+    return
+}

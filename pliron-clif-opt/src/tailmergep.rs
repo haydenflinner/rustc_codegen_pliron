@@ -1,21 +1,26 @@
-//! Parameterized tail merge (`PLIRON_TMPARAM`, opt-in).
+//! Parameterized tail merge (`PLIRON_TMPARAM`).
 //!
-//! Cold error/return tails that are identical modulo `iconst`
-//! immediates — the UTF-8 validator's ~15 `Utf8Error`-construction
-//! exits, differing only in tag/`error_len` immediates — collapse to
-//! `iconsts; jump M(args)` stubs feeding one shared copy
-//! `M(p1..pk): body`. Each member keeps its block identity so no pred
-//! edges move, and every member dominates the shared block, so the
-//! body's external operands (all identical `Value`s by key-match)
-//! still dominate every use. LLVM emits exactly this shape: the
-//! differing immediate materializes at each site and the construction
-//! tail is shared.
+//! Error/return tails that are identical modulo operand values —
+//! the UTF-8 validator's ~15 `Utf8Error`-construction exits differing
+//! only in tag/`error_len` immediates, or `panic_bounds_check` calls
+//! differing only in index/len/`symbol_value` location — collapse to
+//! `consts; jump M(args)` stubs feeding one shared copy
+//! `M(p1..pk): body`. Each member keeps its block identity (and its
+//! own params) so no pred edges move, and every member dominates the
+//! shared block, so operands that agree stay concrete and still
+//! dominate every use; operands that differ become shared-block params
+//! passed by each stub. LLVM emits exactly this shape: the differing
+//! materialization happens at each site and the tail is shared.
 //!
-//! Two operand families can differ across a group: a local `iconst`'s
-//! immediate (masked in the shape key), and an operand that names an
-//! `iconst` defined outside the block (normalized to `{C}` in the key).
-//! Positions where all members agree stay concrete in the shared body;
-//! positions that differ become params, materialized per stub.
+//! Two operand families can differ across a group: a local const's
+//! materialization (`iconst`/`f32const`/`f64const`/`symbol_value`/
+//! `func_addr`/`tls_value` — immediates masked in the shape key and
+//! re-cloned per stub), and an operand value defined outside the block
+//! (normalized to `{V}`). Positions whose operand types differ across
+//! members cannot take one param type and break the group. Call
+//! terminators are weighted 3 in the profitability model: each
+//! `try_call` site is an exception-table entry and a fixed-arg
+//! boundary, so merging panic tails pays for the stub jumps alone.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
@@ -27,23 +32,23 @@ const MAX_INSTS: usize = 32;
 /// Branch-arg marker for an occurrence in `inst_args` (not a bc index).
 const ARG: u32 = u32::MAX;
 
-fn is_iconst(func: &Function, i: Inst) -> bool {
+/// Insts that materialize a constant from immediates only — `iconst`,
+/// float consts, and global-address consts (`symbol_value`/`func_addr`/
+/// `tls_value`). Panic tails differ only in the `symbol_value` source
+/// location, so these belong in the same mask/remat family.
+fn is_const(func: &Function, i: Inst) -> bool {
     matches!(
         func.dfg.insts[i],
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
             ..
-        }
+        } | InstructionData::UnaryIeee32 { .. }
+            | InstructionData::UnaryIeee64 { .. }
+            | InstructionData::UnaryGlobalValue {
+                opcode: Opcode::SymbolValue | Opcode::FuncAddr | Opcode::TlsValue,
+                ..
+            }
     )
-}
-
-fn iconst_val(func: &Function, v: Value) -> bool {
-    func.dfg.value_is_valid(v)
-        && func
-            .dfg
-            .resolved_value_def(v)
-            .inst()
-            .is_some_and(|i| is_iconst(func, i))
 }
 
 /// Block each value is used in (None when used in several) — mirrors
@@ -66,9 +71,10 @@ fn use_blocks(func: &Function) -> FxHashMap<Value, Option<Block>> {
 struct Member {
     block: Block,
     insts: Vec<Inst>,
-    /// `iconst` defs in inst order: (inst position, imm, result ty).
-    locals: Vec<(usize, i64, Type)>,
-    /// Ext-`iconst` operand occurrences, in scan order:
+    /// Local const-materializing defs in inst order: (inst position,
+    /// the member's own inst — cloned into the stub on merge).
+    locals: Vec<(usize, Inst)>,
+    /// External operand occurrences, in scan order:
     /// (inst position, bc index or `ARG`, arg index, resolved value).
     exts: Vec<(u32, u32, u32, Value)>,
 }
@@ -76,7 +82,7 @@ struct Member {
 /// Shape key: local defs positional, local `iconst` immediates masked,
 /// external `iconst` operands normalized to `{C}`.
 fn key_of(func: &Function, b: Block) -> Option<(String, Member)> {
-    if Some(b) == func.layout.entry_block() || !func.dfg.block_params(b).is_empty() {
+    if Some(b) == func.layout.entry_block() {
         return None;
     }
     let insts: Vec<Inst> = func.layout.block_insts(b).collect();
@@ -103,9 +109,12 @@ fn key_of(func: &Function, b: Block) -> Option<(String, Member)> {
         String::new()
     };
     for (ii, &i) in insts.iter().enumerate() {
+        // Every non-local operand is a candidate param: positions where
+        // members disagree are passed per-stub (the value's def
+        // dominates the member block, hence its tail `jump`).
         for (ai, &v) in func.dfg.inst_args(i).iter().enumerate() {
             let v = func.dfg.resolve_aliases(v);
-            if !local.contains_key(&v) && iconst_val(func, v) {
+            if !local.contains_key(&v) {
                 m.exts.push((ii as u32, ARG, ai as u32, v));
             }
         }
@@ -120,24 +129,22 @@ fn key_of(func: &Function, b: Block) -> Option<(String, Member)> {
                 match a {
                     BlockArg::Value(v) => {
                         let v = func.dfg.resolve_aliases(v);
-                        if !local.contains_key(&v) && iconst_val(func, v) {
+                        if !local.contains_key(&v) {
                             m.exts.push((ii as u32, bci as u32, ai as u32, v));
                         }
                     }
-                    _ => return None,
+                    // `retN`/`exnN` are positional — same-shape members
+                    // carry identical indices, so the literal text in
+                    // the key already covers them.
+                    _ => {}
                 }
             }
         }
-        if is_iconst(func, i) {
+        if is_const(func, i) {
             let Some(&r) = func.dfg.inst_results(i).first() else {
                 return None;
             };
-            let imm = match func.dfg.insts[i] {
-                InstructionData::UnaryImm { imm, .. } => imm.bits(),
-                _ => return None,
-            };
-            m.locals
-                .push((ii, imm, func.dfg.value_type(r)));
+            m.locals.push((ii, i));
             s.push_str(&format!("%{} = CONST {:?}\n", local[&r], func.dfg.value_type(r)));
             continue;
         }
@@ -149,12 +156,10 @@ fn key_of(func: &Function, b: Block) -> Option<(String, Member)> {
         let flush = |tok: &mut String, s: &mut String| {
             if let Some(n) = tok.strip_prefix('v').and_then(|d| d.parse::<u32>().ok()) {
                 let v = func.dfg.resolve_aliases(Value::from_u32(n));
-                if let Some(k) = local.get(&v) {
-                    s.push_str(&format!("%{k}"));
-                } else if iconst_val(func, v) {
-                    s.push_str("{C}");
+                if local.contains_key(&v) {
+                    s.push_str(&format!("%{}", local[&v]));
                 } else {
-                    s.push_str(tok);
+                    s.push_str("{V}");
                 }
             } else {
                 s.push_str(tok);
@@ -175,8 +180,35 @@ fn key_of(func: &Function, b: Block) -> Option<(String, Member)> {
     Some((s, m))
 }
 
+/// Do two local const-materializing insts produce the same constant?
+fn const_eq(func: &Function, a: Inst, b: Inst) -> bool {
+    match (&func.dfg.insts[a], &func.dfg.insts[b]) {
+        (
+            InstructionData::UnaryImm { imm: a, .. },
+            InstructionData::UnaryImm { imm: b, .. },
+        ) => a.bits() == b.bits(),
+        (
+            InstructionData::UnaryIeee32 { imm: a, .. },
+            InstructionData::UnaryIeee32 { imm: b, .. },
+        ) => a.bits() == b.bits(),
+        (
+            InstructionData::UnaryIeee64 { imm: a, .. },
+            InstructionData::UnaryIeee64 { imm: b, .. },
+        ) => a.bits() == b.bits(),
+        (
+            InstructionData::UnaryGlobalValue {
+                global_value: a, ..
+            },
+            InstructionData::UnaryGlobalValue {
+                global_value: b, ..
+            },
+        ) => a == b,
+        _ => false,
+    }
+}
+
 enum Slot {
-    /// `locals` index whose imm differs across members.
+    /// `locals` index whose constant differs across members.
     Local(usize, Type),
     /// `exts` index whose value differs across members.
     Ext(usize, Type),
@@ -251,13 +283,27 @@ pub fn run(func: &mut Function) -> usize {
         let m0 = &members[0];
         let mut slots = vec![];
         for j in 0..m0.locals.len() {
-            if members.iter().any(|m| m.locals[j].1 != m0.locals[j].1) {
-                slots.push(Slot::Local(j, m0.locals[j].2));
+            if members
+                .iter()
+                .any(|m| !const_eq(func, m.locals[j].1, m0.locals[j].1))
+            {
+                let r = func.dfg.inst_results(m0.locals[j].1)[0];
+                slots.push(Slot::Local(j, func.dfg.value_type(r)));
             }
         }
         for j in 0..m0.exts.len() {
+            let ty = func.dfg.value_type(m0.exts[j].3);
+            // Operand types are not part of the shape key (`uextend.i32
+            // v.i8` prints like `uextend.i32 v.i32`), so a position whose
+            // types disagree across members cannot take one param type.
+            if members
+                .iter()
+                .any(|m| func.dfg.value_type(m.exts[j].3) != ty)
+            {
+                continue 'grp;
+            }
             if members.iter().any(|m| m.exts[j].3 != m0.exts[j].3) {
-                slots.push(Slot::Ext(j, func.dfg.value_type(m0.exts[j].3)));
+                slots.push(Slot::Ext(j, ty));
             }
         }
         // Identical-modulo-numbering tails are `tailmerge`'s job.
@@ -265,10 +311,20 @@ pub fn run(func: &mut Function) -> usize {
             continue;
         }
         let n_local = slots.iter().filter(|s| matches!(s, Slot::Local(..))).count();
-        // before: n * len; after: n * (n_local + jump) + (len - n_local)
-        let len = m0.insts.len();
+        // before: n * W; after: n * (remat consts + jump) + shared body
+        // (W - n_local). Calls are weighted 3: each `try_call` site is
+        // also an exception-table entry and a fixed-arg boundary —
+        // merging panic tails pays for the stub jumps alone.
+        let w = |i: Inst| -> usize {
+            if func.dfg.insts[i].opcode().is_call() {
+                3
+            } else {
+                1
+            }
+        };
+        let w_body: usize = m0.insts.iter().map(|&i| w(i)).sum();
         let n = members.len();
-        if n * len <= n * (n_local + 1) + (len - n_local) {
+        if n * w_body <= n * (n_local + 1) + (w_body - n_local) {
             continue;
         }
         merges.push((members, slots));
@@ -306,8 +362,7 @@ pub fn run(func: &mut Function) -> usize {
         let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
         for (si, s) in slots.iter().enumerate() {
             if let Slot::Local(j, _) = s {
-                let (ii, _, _) = m0.locals[*j];
-                let r = func.dfg.inst_results(m0.insts[ii])[0];
+                let r = func.dfg.inst_results(m0.locals[*j].1)[0];
                 vmap.insert(r, params[si]);
             }
         }
@@ -390,9 +445,10 @@ pub fn run(func: &mut Function) -> usize {
             let mut args = vec![];
             for s in &slots {
                 match s {
-                    Slot::Local(j, ty) => {
-                        let (_, imm, _) = m.locals[*j];
-                        args.push(pos.ins().iconst(*ty, imm));
+                    Slot::Local(j, _) => {
+                        let ni = pos.func.dfg.clone_inst(m.locals[*j].1);
+                        pos.insert_inst(ni);
+                        args.push(pos.func.dfg.inst_results(ni)[0]);
                     }
                     Slot::Ext(j, _) => args.push(m.exts[*j].3),
                 }
