@@ -126,6 +126,18 @@ pub fn eval(
                 Opcode::Sextend => sext(a, aw) as u64,
                 Opcode::Bnot => !a,
                 Opcode::Ineg => a.wrapping_neg(),
+                Opcode::Clz => {
+                    let am = mask(a, aw);
+                    u64::from(if am == 0 { aw } else { am.leading_zeros() - (64 - aw) })
+                }
+                Opcode::Ctz => {
+                    let am = mask(a, aw);
+                    u64::from(if am == 0 { aw } else { am.trailing_zeros() })
+                }
+                Opcode::Popcnt => u64::from(mask(a, aw).count_ones()),
+                Opcode::Bswap => mask(a, aw).swap_bytes() >> 64u32.saturating_sub(aw),
+                Opcode::Bitrev => mask(a, aw).reverse_bits() >> 64u32.saturating_sub(aw),
+                Opcode::Bmask => 0u64.wrapping_sub(u64::from(a != 0)),
                 _ => return None,
             }
         }
