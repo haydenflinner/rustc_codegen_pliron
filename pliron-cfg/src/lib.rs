@@ -197,6 +197,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // -194 functions touched, all shrinks (top -244/-164/-146), diff
     // clean, gate clean under the flag.
     "PLIRON_TMPARAM",
+    // `bor`-tree byte assemblies of consecutive uload8s -> one wide
+    // load (LLVM's CombineConsecutiveLoads). Brotli corpus -4,423
+    // across 77 fns, all shrinks, diff+gate clean under the flag
+    // (FindMatchLengthWithLimitMin4 872->696 emitted).
+    "PLIRON_LDMERGE",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
