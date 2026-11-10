@@ -74,6 +74,7 @@ pub mod stepcache;
 pub mod switchmap;
 pub mod taildup;
 pub mod tailmerge;
+pub mod tailmergep;
 pub mod tailrec;
 pub(crate) mod trace;
 pub mod unreach;

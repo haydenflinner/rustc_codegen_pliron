@@ -1,0 +1,53 @@
+; test tailmergep
+; Three cold error tails identical modulo the tag immediate (local
+; `iconst.i8 K`) and the stored payload (differing external iconsts
+; v100/v101/v102) share one param'd block; each member keeps its
+; identity and shrinks to `iconst; jump M(args)`. The same-imm local
+; `iconst.i64 8` stays concrete in the shared body.
+; check: block10(v
+; check: jump block10(
+; check: = iconst.i8 2
+; check: = iconst.i8 3
+; check: = iconst.i8 4
+; check: = iconst.i64 8
+; check-not: v20 = iconst.i64
+function %f(i64, i64) {
+block0(v0: i64, v1: i64):
+    v100 = iconst.i8 1
+    v101 = iconst.i8 2
+    v102 = iconst.i8 3
+    brif v1, block2, block9
+
+block9:
+    brif v0, block3, block4
+
+; error_len = 2 tail
+block2 cold:
+    v20 = iconst.i8 2
+    v21 = iconst.i64 8
+    store.i64 notrap v1, v0
+    store notrap v20, v21
+    store notrap v100, v0
+    jump block5
+
+; error_len = 3 tail
+block3 cold:
+    v30 = iconst.i8 3
+    v31 = iconst.i64 8
+    store.i64 notrap v1, v0
+    store notrap v30, v31
+    store notrap v101, v0
+    jump block5
+
+; error_len = 4 tail
+block4 cold:
+    v40 = iconst.i8 4
+    v41 = iconst.i64 8
+    store.i64 notrap v1, v0
+    store notrap v40, v41
+    store notrap v102, v0
+    jump block5
+
+block5:
+    return
+}

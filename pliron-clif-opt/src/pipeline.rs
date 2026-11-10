@@ -2348,6 +2348,12 @@ fn s_tailmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_tailmergep(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = tailmergep::run(&mut p.clctx.func);
+    p.stats.merged += k;
+    k
+}
+
 fn s_taildup(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = taildup::run(&mut p.clctx.func, p.prof);
     p.stats.dupd += k;
@@ -5098,6 +5104,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `[p, #K]` (UTF-8 scan's index-param pairs). After iconst128:
         // `post_sweep` would re-funnel `iadd (iadd root, b), K`.
         step("lsr", "lsr", Gate::OptIn("PLIRON_LSR"), s_lsr).needs(shape::LOOPS),
+        // Cold tails identical modulo iconst immediates (error
+        // constructions after unrolls) share one param'd copy; each
+        // member keeps its block and shrinks to `iconsts; jump M(args)`.
+        // Before brhint: stubs replace members' terminators.
+        step("tailmergep", "tailmergep", Gate::OptIn("PLIRON_TMPARAM"), s_tailmergep)
+            .needs(shape::BLOCKS2),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
