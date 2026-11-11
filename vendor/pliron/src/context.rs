@@ -151,6 +151,28 @@ impl Context {
 
     /// PLIRON: bytes reserved by each big container (capacity x element
     /// size), and live element counts for the pools — `PLIRON_MEM_MARK`.
+    /// PLIRON: same accounting as [`Self::mem_report`], as one number —
+    /// reserved bytes across the big containers. Used by the cgupool's
+    /// `PLIRON_CGU_MEMCAP` growth estimate.
+    pub fn approx_bytes(&self) -> u64 {
+        use core::mem::size_of;
+        fn v<T>(x: &Vec<T>) -> u64 {
+            (x.capacity() * size_of::<T>()) as u64
+        }
+        (self.operations.capacity() * (size_of::<core::cell::RefCell<Operation>>() + 8)
+            + self.basic_blocks.capacity()
+                * (size_of::<core::cell::RefCell<BasicBlock>>() + 8)) as u64
+            + v(&self.use_links.borrow().arena)
+            + v(&self.op_links.borrow())
+            + v(&self.block_links.borrow())
+            + v(&self.op_kind.borrow())
+            + v(&self.op_operand_pool.borrow())
+            + v(&self.op_result_pool.borrow())
+            + v(&self.op_successor_pool.borrow())
+            + v(&self.block_arg_pool.borrow())
+            + v(&self.op_region_pool.borrow())
+    }
+
     pub fn mem_report(&self) -> alloc::string::String {
         use core::mem::size_of;
         fn v<T>(name: &str, x: &Vec<T>) -> alloc::string::String {

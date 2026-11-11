@@ -271,6 +271,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   them before the iropt passes so `bodied`/`opt_body` skip them too
   (default-on; marked bodies emit rawer, so object bytes differ;
   disabled under `PLIRON_OPT_FNS`).
+- `PLIRON_CGU_MEMCAP=<MiB>` (opt-in) — memory-pressure throttle on the
+  CGU pool: a stage-A job is admitted only if current footprint plus the
+  committed growth of running jobs plus its own estimate stays under the
+  cap. Deadlock floors: one job always runs, and an ordinal a parked
+  stage-B job waits on is exempt. macOS only (`footprint_mib`).
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 

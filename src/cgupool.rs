@@ -231,6 +231,11 @@ struct Job {
     /// Wall time spent in iropt stages A+B — the `*iropt*` timing row.
     /// Parked time between publish and adopt does not count.
     iropt: std::time::Duration,
+    /// `PLIRON_CGU_MEMCAP` growth estimate: the Context's reserved bytes
+    /// at submit, in MiB — close to the extra a running job adds on top
+    /// of the pre-inline footprint (post-inline ops ≈ 2×). Approximate
+    /// by design: emit/regalloc transients ride on top.
+    est_mib: u64,
 }
 
 enum RunOut {
@@ -271,6 +276,11 @@ struct Store {
     /// CGUs whose first step (A or Whole) has started and that are not
     /// done yet (`PLIRON_CGU_ACAP`).
     started: u32,
+    /// Ordinals a parked stage-B job waits on (`PLIRON_CGU_MEMCAP`
+    /// exemption — see `admissible`).
+    needed: rustc_hash::FxHashSet<u32>,
+    /// Σ `Job::est_mib` over started-not-done jobs (`PLIRON_CGU_MEMCAP`).
+    started_mib: u64,
 }
 
 /// `PLIRON_CGU_ACAP=N`: at most N CGUs between the start of their first
@@ -293,7 +303,27 @@ fn acap() -> u32 {
 impl Store {
     fn admissible(&self, j: &Job) -> bool {
         let cap = acap();
-        cap == 0 || self.hold || matches!(j.step, Step::B) || self.started < cap
+        if !(cap == 0 || self.hold || matches!(j.step, Step::B) || self.started < cap) {
+            return false;
+        }
+        // `PLIRON_CGU_MEMCAP`: don't start a job whose predicted peak —
+        // current footprint plus the committed growth of jobs already
+        // running plus this job's own estimate — would cross the cap.
+        // Reactive footprint checks alone can't bound the peak: several
+        // jobs admitted at a low footprint amplify together (post-inline
+        // ops ≈ 2×), so admission charges each running job's *remaining*
+        // growth (`est_mib`, ~raw ctx size) against the cap. Exemptions
+        // keep it deadlock-free: an ord a parked stage-B job waits on
+        // must run or the parked Contexts themselves hold the memory that
+        // keeps it out; `started == 0` is the floor (one live job can't
+        // shrink).
+        if matches!(j.step, Step::A | Step::Whole)
+            && let Some(cap) = memcap_mib()
+            && pliron_cfg::footprint_mib() + self.started_mib + j.est_mib > cap
+        {
+            return self.started == 0 || self.needed.contains(&j.ord);
+        }
+        true
     }
 
     fn has_runnable(&self) -> bool {
@@ -306,6 +336,7 @@ impl Store {
         let j = self.ready.remove(i)?;
         if !matches!(j.step, Step::B) {
             self.started += 1;
+            self.started_mib += j.est_mib;
         }
         Some(j)
     }
@@ -362,6 +393,30 @@ fn inflight_cap() -> u32 {
     pliron_cfg::env_get("PLIRON_CGU_INFLIGHT").and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
+/// `PLIRON_CGU_MEMCAP=<MiB>`: while the process's physical footprint is
+/// over the cap, the inflight ceiling collapses to 1 — the main thread
+/// parks in `submit` until a worker finishes a CGU (which drops its
+/// Context) instead of queueing another unoptimized one — and
+/// `admissible` stops starting stage A. The peak is live Contexts, so
+/// holding N-1 of them parked (or raw) is the only way down; a footprint
+/// already over the cap can't go below one job's worth, so the floor is
+/// 1, not 0 (that would deadlock the pool). Scheduling only — output is
+/// unaffected (docs/determinism.md). Opt-in.
+fn memcap_mib() -> Option<u64> {
+    let cap = pliron_cfg::env_get("PLIRON_CGU_MEMCAP").and_then(|v| v.parse::<u64>().ok())?;
+    // `footprint_mib` is macOS-only today (0 elsewhere): without a real
+    // footprint signal the predictor would just serialize the pool.
+    (pliron_cfg::footprint_mib() > 0).then_some(cap)
+}
+
+fn memcap_open() -> bool {
+    memcap_mib().is_none_or(|cap| pliron_cfg::footprint_mib() <= cap)
+}
+
+fn memcap_cap() -> u32 {
+    if memcap_open() { u32::MAX } else { 1 }
+}
+
 /// Whether this compile holds published jobs for `finish_held`.
 pub(crate) fn holding() -> bool {
     STORE.lock().unwrap().hold
@@ -384,11 +439,22 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
     // ordinals, all submitted already, so the cap can't deadlock. Not
     // while holding for the two-phase barrier, which needs every CGU
     // published before any finishes.
-    let cap = inflight_cap();
+    let mut cap = inflight_cap().min(memcap_cap());
     while cap > 0 && !g.hold && g.inflight >= cap {
         g = CV.wait(g).unwrap();
+        cap = inflight_cap().min(memcap_cap());
     }
     g.inflight += 1;
+    // A stage-A job's live footprint grows well past its raw context:
+    // IR-opt amplifies the op count (measured ~2x ops post-inline, plus
+    // the operand/link pools) and the arenas hold the high-water mark
+    // for the job's whole lifetime. ~4x the reserved bytes tracks the
+    // observed per-job growth (50-100MiB on syn, 30-40 on regex-syntax).
+    let est_mib = if memcap_mib().is_some() {
+        (ctx.approx_bytes() >> 20) * 4
+    } else {
+        0
+    };
     let key = g.next_key;
     g.next_key += 1;
     let (ord, step) = if participates {
@@ -432,6 +498,7 @@ pub(crate) fn submit(name: String, ctx: Context, st: State, module: Ptr<Operatio
         needs: Vec::new(),
         adopt_all: false,
         iropt: std::time::Duration::ZERO,
+        est_mib,
     });
     CV.notify_one();
     key
@@ -456,6 +523,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
     };
     let jkey = job.key;
     let jord = job.ord;
+    let jest = job.est_mib;
     drop(g);
     let r = catch_unwind(AssertUnwindSafe(|| run_job(job, prof)));
     g = STORE.lock().unwrap();
@@ -464,6 +532,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
             g.done.insert(key, Ok(out));
             g.inflight = g.inflight.saturating_sub(1);
             g.started = g.started.saturating_sub(1);
+            g.started_mib = g.started_mib.saturating_sub(jest);
             CV.notify_all();
         }
         Ok(RunOut::Published { job }) if g.hold => {
@@ -499,6 +568,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
             if covered(&g.published, &job.needs) {
                 g.ready.push_back(job);
             } else {
+                g.needed.extend(job.needs.iter().copied());
                 g.parked.insert(job.ord, job);
             }
             release_parked(&mut g);
@@ -522,6 +592,7 @@ fn step_once(prof: &SelfProfilerRef, emitter: &SharedEmitter) -> bool {
             g.done.insert(jkey, Err(p));
             g.inflight = g.inflight.saturating_sub(1);
             g.started = g.started.saturating_sub(1);
+            g.started_mib = g.started_mib.saturating_sub(jest);
             CV.notify_all();
             // A job that never reached publish would stall every
             // higher-ordinal parked job (and the coordinator, which
