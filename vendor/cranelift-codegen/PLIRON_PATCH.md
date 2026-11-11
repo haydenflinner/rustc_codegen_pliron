@@ -760,6 +760,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
       `uextend` of a clean narrow value is a passthrough;
     - `is_nonzero` rule 4: a clean i8/i16 tests with `cbnz w` instead of
       `tst #0xff` / `uxth`;
+    - `is_nonzero` rules 5/6 (`narrowext_tst_mask`): a single-use narrow
+      `ireduce` or `band (ireduce y), k` tests the unmasked source —
+      `tst y, #W-1` / `tst y, #k&W-1` — instead of materialising the
+      value's `uxtb`/`uxth`/`and` (LLVM's `tst w, #0xff` shape);
     - `band_ireduce_imm` (priority 30): `band (ireduce x) k`, canonical `k`,
       masks `x`'s register directly, so the `ireduce`'s `uxtb` (patch 36)
       is not materialized. `x` goes in as a plain register (`alu_rr_imm_logic`
