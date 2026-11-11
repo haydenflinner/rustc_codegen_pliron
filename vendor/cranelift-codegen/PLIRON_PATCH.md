@@ -1093,7 +1093,9 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     or the preheader of the call-free loop the use sits in). pliron's
     licm hoists every constant out of every loop; across a call each
     then needs a callee-saved register or a spill slot. Held-out A/B
-    (5 rounds): 1.274 vs 1.264 without; stays off.
+    (5 rounds): 1.274 vs 1.264 without; stays off. The aarch64
+    `ImmLogic` bitmask-immediate oracle is `#[cfg(feature = "arm64")]`
+    gated so non-arm64 hosts still compile (it reports false there).
 
 79. Opt-in rematerialization-aware spill weights (`PLIRON_RA2_REMATW=1`;
     `VCode::compute_remat_vregs`, vendored regalloc2 `Function::is_remat`):

@@ -852,16 +852,24 @@ impl Context {
         }
         // One aarch64 instruction: `movz`/`movn` (one non-zero halfword in
         // `v` or `!v`) or `orr` with a bitmask immediate.
+        #[cfg(feature = "arm64")]
+        fn bitmask_imm(v: u64, bits: u32) -> bool {
+            crate::isa::aarch64::inst::ImmLogic::maybe_from_u64(
+                v,
+                if bits > 32 { crate::ir::types::I64 } else { crate::ir::types::I32 },
+            )
+            .is_some()
+        }
+        // PLIRON: CONSTSINK is aarch64-tuned; without the arm64 ISA
+        // compiled in, no bitmask-immediate oracle exists.
+        #[cfg(not(feature = "arm64"))]
+        fn bitmask_imm(_v: u64, _bits: u32) -> bool {
+            false
+        }
         fn one_inst(v: u64, bits: u32) -> bool {
             let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
             let halves = |x: u64| (0..4).filter(|k| (x >> (16 * k)) & 0xffff != 0).count() <= 1;
-            halves(v & m)
-                || halves(!v & m)
-                || crate::isa::aarch64::inst::ImmLogic::maybe_from_u64(
-                    v & m,
-                    if bits > 32 { crate::ir::types::I64 } else { crate::ir::types::I32 },
-                )
-                .is_some()
+            halves(v & m) || halves(!v & m) || bitmask_imm(v & m, bits)
         }
         let mut cands: Vec<crate::ir::Inst> = Vec::new();
         for b in self.func.layout.blocks() {

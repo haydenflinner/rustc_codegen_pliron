@@ -49,6 +49,26 @@ LIB = "" if sys.platform == "win32" else "lib"
 TOOLCHAIN = open(os.path.join(ROOT, "rust-toolchain.toml")).read().split('channel = "')[1].split('"')[0]
 
 
+def _real_rustc():
+    """The rustup proxy spawns rustc as a child on Windows (no exec), so
+    peak RSS of a `rustc` Popen is only the proxy's ~12 MB. Run the
+    toolchain's real binary; RUSTUP_TOOLCHAIN stays harmless."""
+    if os.name != "nt":
+        return "rustc"
+    try:
+        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)
+        sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], env=env, text=True).strip()
+        cand = os.path.join(sysroot, "bin", "rustc.exe")
+        if os.path.isfile(cand):
+            return cand
+    except subprocess.CalledProcessError:
+        pass
+    return "rustc"
+
+
+RUSTC = _real_rustc()
+
+
 def regex_syntax():
     c = sorted(glob.glob(os.path.expanduser("~/.cargo/registry/src/*/regex-syntax-0.8.*")))
     return os.path.join(c[-1], "src/lib.rs") if c else None
@@ -71,7 +91,7 @@ def syn_args():
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)
     def dep(crate, src, ed, *extra):
         if not os.path.exists(os.path.join(deps, f"lib{crate}.rlib")):
-            subprocess.run(["rustc", "-O", "--crate-name", crate, "--crate-type", "rlib", "--edition", ed,
+            subprocess.run([RUSTC, "-O", "--crate-name", crate, "--crate-type", "rlib", "--edition", ed,
                             "--cap-lints", "allow", "--out-dir", deps, "-L", deps, *extra, src + "/src/lib.rs"],
                            env=env, check=True, capture_output=True)
     dep("unicode_ident", ui, "2018")
@@ -104,22 +124,50 @@ def inputs():
     return out
 
 
+def _peak_rss_win(p):
+    """PeakWorkingSetSize (bytes) of an exited child, Windows."""
+    import ctypes
+    fields = ["cb", "PageFaultCount", "PeakWorkingSetSize", "WorkingSetSize",
+              "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+              "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+              "PagefileUsage", "PeakPagefileUsage"]
+
+    class PMC(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulong if n in ("cb", "PageFaultCount") else ctypes.c_size_t)
+                    for n in fields]
+
+    c = PMC(cb=ctypes.sizeof(PMC))
+    for dll, fn in (("psapi", "GetProcessMemoryInfo"), ("kernel32", "K32GetProcessMemoryInfo")):
+        try:
+            ok = getattr(ctypes.windll, dll).__getattr__(fn)(p._handle, ctypes.byref(c), c.cb)
+        except AttributeError:
+            continue
+        return c.PeakWorkingSetSize if ok else None
+    return None
+
+
 def time_one(args, backend, tmp):
-    cmd = ["rustc", "-O", "--out-dir", tmp] + args
+    cmd = [RUSTC, "-O", "--out-dir", tmp] + args
     if backend:
         cmd.append(f"-Zcodegen-backend={backend}")
     env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, RUSTC_ICE=os.path.join(ROOT, "target/ices"))
     t = time.time()
     p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    # `wait4` gives this child's own peak RSS (KiB on Linux, bytes on
-    # macOS); `communicate` would reap it and lose the rusage.
     err = p.stderr.read()
-    _, status, ru = os.wait4(p.pid, 0)
-    p.returncode = os.waitstatus_to_exitcode(status)
+    if os.name == "nt":
+        # No wait4. stderr EOF means the child is gone; query its handle
+        # for the peak BEFORE wait() — _cleanup() would close it.
+        rss = _peak_rss_win(p)
+        p.wait()
+    else:
+        # `wait4` gives this child's own peak RSS (KiB on Linux, bytes on
+        # macOS); `communicate` would reap it and lose the rusage.
+        _, status, ru = os.wait4(p.pid, 0)
+        p.returncode = os.waitstatus_to_exitcode(status)
+        rss = ru.ru_maxrss if sys.platform == "darwin" else ru.ru_maxrss * 1024
     dt = time.time() - t
     if p.returncode != 0:
         return None, None, None, err[-800:]
-    rss = ru.ru_maxrss if sys.platform == "darwin" else ru.ru_maxrss * 1024
     # Machine-code bytes: the text sections of every object written (an
     # rlib's members included). Whole-file size would count LLVM's
     # embedded bitcode and both sides' metadata.
@@ -127,7 +175,26 @@ def time_one(args, backend, tmp):
     return dt, rss, size, ""
 
 
-LLVM_SIZE = shutil.which("llvm-size") or "/opt/homebrew/opt/llvm/bin/llvm-size"
+def _llvm_tool(name):
+    """llvm-tools lives in the toolchain's rustlib bin, not on PATH."""
+    exe = shutil.which(name)
+    if exe:
+        return exe
+    try:
+        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)
+        sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], env=env, text=True).strip()
+        v = subprocess.check_output(["rustc", "-vV"], env=env, text=True)
+        host = next(l.split()[-1] for l in v.splitlines() if l.startswith("host:"))
+        for cand in (os.path.join(sysroot, "lib", "rustlib", host, "bin", name + e)
+                     for e in (".exe", "")):
+            if os.path.isfile(cand):
+                return cand
+    except (subprocess.CalledProcessError, StopIteration):
+        pass
+    return "/opt/homebrew/opt/llvm/bin/" + name
+
+
+LLVM_SIZE = _llvm_tool("llvm-size")
 
 
 def text_bytes(paths):
@@ -138,7 +205,8 @@ def text_bytes(paths):
         r = subprocess.run([LLVM_SIZE, "-A", p], capture_output=True, text=True)
         for line in r.stdout.splitlines():
             f = line.split()
-            if len(f) >= 2 and f[0] in (".text", "__text", "CODE") and f[1].isdigit():
+            # MSVC COFF puts functions in `.text$mn` COMDAT sections.
+            if len(f) >= 2 and f[0].startswith((".text", "__text", "CODE")) and f[1].isdigit():
                 tot += int(f[1])
     return tot or None
 

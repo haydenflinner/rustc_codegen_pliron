@@ -105,7 +105,7 @@ fn install_crash_probe() {
                 fn RtlVirtualUnwind(
                     htype: u32,
                     base: usize,
-                    pc: *mut u8,
+                    pc: usize,
                     fnentry: *const u8,
                     ctx: *mut u8,
                     handler: *mut usize,

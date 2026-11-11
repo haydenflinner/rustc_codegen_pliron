@@ -16,7 +16,7 @@ target/parity/stack.json.
 import argparse, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OD = shutil.which("llvm-objdump") or "/opt/homebrew/opt/llvm/bin/llvm-objdump"
+OD = "llvm-objdump"  # resolved in main() via ctime._llvm_tool
 
 
 def frames(obj):
@@ -45,9 +45,11 @@ def frames(obj):
             tot -= int(m.group(1), 16) << (12 if m.group(2) else 0)
         elif m := re.search(r"stp\s+[xdq]\d+, [xdq]\d+, \[sp, #-0x([0-9a-f]+)\]!", line):
             tot += int(m.group(1), 16)  # callee-save / frame-record push
-        elif m := re.search(r"sub\s+\$0x([0-9a-f]+), %rsp", line):
+        elif m := re.search(r"sub[a-z0-9]*\s+\$0x([0-9a-f]+), %rsp", line):
             tot += int(m.group(1), 16)
-        elif re.search(r"push[q]?\s+%r", line):
+        elif m := re.search(r"sub\s+rsp, 0x([0-9a-f]+)", line):
+            tot += int(m.group(1), 16)  # Intel syntax
+        elif re.search(r"push[a-z0-9]*\s+%r", line) or re.search(r"push\s+r[a-z0-9]+", line):
             tot += 8
     if cur is not None:
         out[cur] = tot
@@ -71,6 +73,8 @@ def main():
     spec = importlib.util.spec_from_file_location("ctime", os.path.join(ROOT, "harness/ctime.py"))
     ct = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ct)
+    global OD
+    OD = ct._llvm_tool("llvm-objdump")
     a.backend = a.backend or os.path.join(ROOT, f"target/release/{ct.LIB}rustc_codegen_pliron.{ct.SO}")
     args = ct.inputs()[a.input]
     with tempfile.TemporaryDirectory() as dl, tempfile.TemporaryDirectory() as dp:
