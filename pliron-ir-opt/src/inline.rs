@@ -1275,12 +1275,14 @@ pub fn run(
     let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-    // `PLIRON_INLINE_WARMCALLS`: `1` (the default) gates the loop bonus on
-    // the warm calls only; `0` counts every call (the old gate; pair it with
-    // `PLIRON_INLINE_LOOPCALLS=4` for the old behaviour); `2` keeps the old
-    // gate and instead prices the callee by its warm ops and warm calls (see
+    // `PLIRON_INLINE_WARMCALLS`: `0` (the default) counts every call, so the
+    // bonus only rescues leaf-ish bodies — a callee carrying panic calls it
+    // never executes still moves those into the loop (regex-syntax's parser
+    // loops inlined `bump`/`char`, 9 and 6 calls each: −9% parse_only,
+    // −5% .text). `1` gates on the warm calls only; `2` keeps that gate and
+    // instead prices the callee by its warm ops and warm calls (see
     // `CInfo::nwarm_ops`): a documented negative (regex +2%, binary +4%).
-    let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(0);
     let warm_gate = warm_mode == 1;
     let warm_cost = warm_mode == 2;
     // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
