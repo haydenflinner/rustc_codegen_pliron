@@ -33,6 +33,18 @@ enum Fwd {
     /// extended to the load's result type when it differs (`uloadN`/
     /// `sloadN`, `signed` for the latter). Little-endian.
     Narrow { v: Value, shift: u32, mty: Type, signed: bool },
+    /// Re-read `rty`-typed `op` bytes from `(addr, offset)` — the
+    /// covering store's value is itself a `load` and the source bytes
+    /// are still available, so the stack round-trip is bypassed (LLVM
+    /// memcpyopt's memcpy→load forwarding: brotli's `sub_match!` reads
+    /// u64s back out of `clone_from_slice` buffers).
+    SrcLoad {
+        op: Opcode,
+        addr: Value,
+        offset: i32,
+        rty: Type,
+        flags: cranelift_codegen::ir::MemFlagsData,
+    },
 }
 
 /// An available integer covering `[off, off + bytes)` of root `r` from a
@@ -50,6 +62,55 @@ fn narrow_src(func: &Function, av: &Avail, r: Root, off: i64, bytes: u32) -> Opt
             && off + i64::from(bytes) <= o2 + i64::from(t2.bytes()))
         .then(|| (v, ((off - o2) * 8) as u32))
     })
+}
+
+/// `r[off .. off+bytes)` sits inside a covering store `store v` whose `v`
+/// is itself a plain `load (q, qoff)` and the source location still maps
+/// to `v` (no may-alias store since — the availability kill rules carry
+/// that): the load can re-read the original memory instead of the copy.
+/// `q` dominates the source load, which dominates the copy store, which
+/// is available at this point, so the emitted address is in scope.
+fn copy_src(
+    func: &Function,
+    ps: &VMap<Value>,
+    na: &FxHashSet<Value>,
+    nm: &NrMemo,
+    av: &Avail,
+    r: Root,
+    off: i64,
+    mty: Type,
+) -> Option<(Value, i32, cranelift_codegen::ir::MemFlagsData)> {
+    let bytes = i64::from(mty.bytes());
+    let (v, o2, t2) = av
+        .iter()
+        .filter(|(l, _)| l.0 == r && l.1 <= off && off + bytes <= l.1 + i64::from(l.2.bytes()))
+        .max_by_key(|(l, _)| (i64::from(l.2.bytes()), l.1))
+        .map(|(l, &v)| (v, l.1, l.2))?;
+    let ValueDef::Result(si, _) = func.dfg.value_def(func.dfg.resolve_aliases(v)) else {
+        return None;
+    };
+    let InstructionData::Load { arg: q, offset: qo, .. } = func.dfg.insts[si] else {
+        return None;
+    };
+    if func.dfg.insts[si].opcode() != Opcode::Load || !notrap(func, si) {
+        return None;
+    }
+    let (rq, oq) = nm.pair(func, ps, na, q).1;
+    let base = oq.wrapping_add(i64::from(i32::from(qo)));
+    if av.get(&(rq, base, t2)) != Some(&v) {
+        return None;
+    }
+    let d = off - o2;
+    let offset = i32::try_from(base.checked_add(d)?).ok()?;
+    let sdata = func.dfg.insts[si].memflags_data(&func.dfg)?;
+    let mut flags = cranelift_codegen::ir::MemFlagsData::new().with_notrap();
+    if let Some(e) = sdata.explicit_endianness() {
+        flags = flags.with_endianness(e);
+    }
+    if sdata.aligned() && d % bytes == 0 {
+        flags = flags.with_aligned();
+    }
+    Some((q, offset, flags))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1130,6 +1191,16 @@ fn transfer(
                     if let Some(rw) = rw.as_deref_mut() {
                         rw.push((i, Fwd::V(v)));
                     }
+                } else if *SRCCOPY
+                    && rw.is_some()
+                    && let Some((addr, offset, flags)) =
+                        copy_src(func, ps, na, nm, av, r, off, ty)
+                {
+                    rw.as_deref_mut().unwrap().push((
+                        i,
+                        Fwd::SrcLoad { op: Opcode::Load, addr, offset, rty: ty, flags },
+                    ));
+                    av.insert(loc, res);
                 } else if *NARROW
                     && ty.is_int()
                     && !ty.is_vector()
@@ -1170,6 +1241,20 @@ fn transfer(
                 let hit = av.get(&(r, off, mty)).map(|&v| (v, 0)).or_else(|| narrow_src(func, av, r, off, mty.bytes()));
                 if let Some((v, shift)) = hit {
                     rw.as_deref_mut().unwrap().push((i, Fwd::Narrow { v, shift, mty, signed }));
+                } else if *SRCCOPY
+                    && let Some((addr, offset, flags)) =
+                        copy_src(func, ps, na, nm, av, r, off, mty)
+                {
+                    rw.as_deref_mut().unwrap().push((
+                        i,
+                        Fwd::SrcLoad {
+                            op: lop,
+                            addr,
+                            offset,
+                            rty: func.dfg.value_type(func.dfg.first_result(i)),
+                            flags,
+                        },
+                    ));
                 }
             }
             InstructionData::Store {
@@ -1638,6 +1723,20 @@ pub fn run_deref(
                 }
                 x
             }
+            Fwd::SrcLoad { op, addr, offset, rty, flags } => {
+                let mut pos = cranelift_codegen::cursor::FuncCursor::new(func).at_inst(i);
+                use cranelift_codegen::cursor::Cursor;
+                match op {
+                    Opcode::Load => pos.ins().load(rty, flags, addr, offset),
+                    Opcode::Uload8 => pos.ins().uload8(rty, flags, addr, offset),
+                    Opcode::Uload16 => pos.ins().uload16(rty, flags, addr, offset),
+                    Opcode::Uload32 => pos.ins().uload32(flags, addr, offset),
+                    Opcode::Sload8 => pos.ins().sload8(rty, flags, addr, offset),
+                    Opcode::Sload16 => pos.ins().sload16(rty, flags, addr, offset),
+                    Opcode::Sload32 => pos.ins().sload32(flags, addr, offset),
+                    _ => unreachable!(),
+                }
+            }
         };
         func.layout.remove_inst(i);
         func.dfg.clear_results(i);
@@ -1773,6 +1872,12 @@ fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>,
 /// load from a wider stored value.
 static NARROW: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_LOADFWD_NARROW", "0"));
+
+/// `PLIRON_LOADFWD_SRCCOPY` (opt-in): a load covered by `store (load s)`
+/// re-reads `s` directly instead of the copied destination — memcpy→load
+/// forwarding through a stack round-trip.
+static SRCCOPY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_LOADFWD_SRCCOPY", "1"));
 
 /// `PLIRON_LOADPRE_CARRY=1`: loop-carried PRE. At a merge, a missing pred
 /// that the merge dominates and that preserves the location all the way

@@ -25,7 +25,18 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const MAX_BLOCKS: usize = 8;
 const MAX_ITERS: usize = 12;
 /// Non-terminator insts per loop, summed — each clone costs this again.
+/// `PLIRON_BUNROLL_BODY` overrides (brotli's `sub_match!` byte-assemble
+/// loop is ~100 insts of fodder that folds flat once unrolled).
 const MAX_BODY: usize = 48;
+
+fn max_body() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::env_get("PLIRON_BUNROLL_BODY")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_BODY)
+    })
+}
 
 struct Vm<'a> {
     func: &'a mut Function,
@@ -236,7 +247,7 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
         .iter()
         .map(|&b| func.layout.block_insts(b).count().saturating_sub(1))
         .sum();
-    if body > MAX_BODY {
+    if body > max_body() {
         dbg("body");
         return None;
     }
