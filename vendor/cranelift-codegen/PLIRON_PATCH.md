@@ -772,7 +772,19 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
       `LowerBackend::narrow_arg_uext_clean`); `ABIMachineSpec::
       gen_call_args` then takes a clean i8/i16 `uext` register slot's
       source reg as-is, dropping the `uxtb`/`uxth` before the call
-      (172 of 1447 on regex-syntax; stack slots still widen).
+      (172 of 1447 on regex-syntax; stack slots still widen);
+    - narrow compare of `isub`/`iadd`-by-constant against a constant
+      (`narrow_addsub_cmp` + `emit_icmp_addsub_k`, `emit_icmp` rules
+      10/11): for eq/ne the constant is rolled (`(c∓j) mod W == k` is
+      `c == (k±j) mod W` — one `cmp` on `c`, the arithmetic goes dead);
+      for the unsigned relations the unmasked 32-bit `sub c, j` (the
+      `iadd` j ≥ W/2 form rewritten to `sub c, W-j`) orders identically
+      to the masked result against `k` whenever the bound `j + k' ≤ W`
+      (`Sub`) or `k' ≤ j` (`Rewrite`) holds, so the operand's
+      `uxtb`/`uxth` is never materialized. `put_in_reg_uext_narrow_maybe`
+      still widens a dirty operand before the sub/cmp — the bounds are
+      checked against `c & mask` either way (886 uxtb/uxth and 1510
+      insns off rust-html-rewriter's benchmark, -6144 B __text).
     `PLIRON_NARROWEXT_MASK=<bits>` (default all) keeps only some users live,
     for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`,
     32 narrow `ushr`-of-clean (a narrow `lsr` result is always canonical)
@@ -788,7 +800,8 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     by a constant → `ubfx` on the wide register, `ireduce (ireduce x)`
     extends once, and `select` arms that are `ireduce`s read the wide
     source directly (the low bits are exact and a `select` result is
-    modelled dirty anyway), 512 call-arg `uext` skip. A dirty-source
+    modelled dirty anyway), 512 call-arg `uext` skip, 1024 narrow
+    `iadd`/`isub`-by-const `icmp`-vs-const fusions. A dirty-source
     passthrough variant of 256 was tried and reverted: it converted one
     shared `uxtb` into one extension/test per fusing use and grew
     regex-syntax `.text`.

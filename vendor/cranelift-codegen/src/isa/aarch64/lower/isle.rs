@@ -99,7 +99,11 @@ pub(crate) fn narrowext_enabled() -> bool {
 /// wide source directly (the low bits are exact and the result is
 /// modelled dirty anyway), 512 = call-arg `uext` skip
 /// (`narrow_arg_uext_clean`: a clean narrow operand needs no
-/// `uxtb`/`uxth` at the call site, mirroring the return path).
+/// `uxtb`/`uxth` at the call site, mirroring the return path), 1024 =
+/// narrow `icmp` of `iadd`/`isub`-by-constant against a constant: drop
+/// the operand's `uxtb`/`uxth` by rolling the constant (eq/ne) or by
+/// comparing the unmasked 32-bit result when the wrapped/unwrapped
+/// orderings agree (`narrow_addsub_cmp`).
 /// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1389,6 +1393,72 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     fn narrowext_on(&mut self, bit: u64) -> bool {
         narrowext_part(bit)
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 1024): a narrow `icmp` of
+    /// `isub c, j` / `iadd c, j` (iconst `j`) against iconst `k` can often
+    /// drop the operand's `uxtb`/`uxth`, because the wrapped and
+    /// unwrapped 32-bit results order identically against `k`. Returns:
+    ///   `C`   — compare `c` itself against the rolled constant `k2`
+    ///           (eq/ne: `(c ∓ j) mod W == k  ⟺  c == (k ± j) mod W`);
+    ///           `put_in_reg_ext32_maybe` covers a dirty `c`.
+    ///   `Sub` — compare the `isub` result itself: unmasked `c-j` ∈
+    ///           [-j, W-1-j] orders the same as the masked result
+    ///           against `k` iff `j + k' ≤ W` (`k'` = k for lt/ge,
+    ///           k+1 for le/gt) — wrapped negatives are unsigned-huge
+    ///           and the masked range [W-j, W) must all fail.
+    ///   `Rewrite` — `iadd c, j` with j ≥ W/2 is `isub c, W-j` in the
+    ///           masked type: emit `sub c, s` (`s` = W-j) and compare
+    ///           unmasked; needs `k' ≤ j` so the no-wrap masked range
+    ///           [j, W) all fails the compare.
+    /// `put_in_reg_uext_narrow_maybe` widens a dirty `c` before the
+    /// sub/cmp, so the bounds are checked against `c & mask` either
+    /// way — no cleanliness precondition.
+    fn narrow_addsub_cmp(
+        &mut self,
+        op: u64,
+        cc: &IntCC,
+        ty: Type,
+        _c: Value,
+        j: u64,
+        k: u64,
+    ) -> Option<generated_code::NarrowAddsubCmp> {
+        use crate::ir::condcodes::IntCC::*;
+        use generated_code::NarrowAddsubCmp as R;
+        if !narrowext_part(1024) || ty.bits() > 16 {
+            return None;
+        }
+        let w = 1u64 << ty.bits();
+        let mask = w - 1;
+        // Everything emitted is an imm12.
+        if k > 0xfff {
+            return None;
+        }
+        match (op, cc) {
+            (0, Equal) | (0, NotEqual) => {
+                let k2 = k.wrapping_add(j) & mask;
+                (k2 <= 0xfff).then_some(R::C { k2 })
+            }
+            (1, Equal) | (1, NotEqual) => {
+                let k2 = k.wrapping_sub(j) & mask;
+                (k2 <= 0xfff).then_some(R::C { k2 })
+            }
+            (0, UnsignedLessThan) | (0, UnsignedGreaterThanOrEqual) if j + k <= w => {
+                (j <= 0xfff).then_some(R::Sub { j, k2: k })
+            }
+            (0, UnsignedLessThanOrEqual) | (0, UnsignedGreaterThan) if j + k + 1 <= w => {
+                (j <= 0xfff).then_some(R::Sub { j, k2: k })
+            }
+            (1, UnsignedLessThan) | (1, UnsignedGreaterThanOrEqual) if j >= w / 2 && k <= j => {
+                (w - j <= 0xfff).then_some(R::Rewrite { s: w - j, k2: k })
+            }
+            (1, UnsignedLessThanOrEqual) | (1, UnsignedGreaterThan)
+                if j >= w / 2 && k + 1 <= j =>
+            {
+                (w - j <= 0xfff).then_some(R::Rewrite { s: w - j, k2: k })
+            }
+            _ => None,
+        }
     }
 
     fn narrowext_clean(&mut self, val: Value) -> bool {

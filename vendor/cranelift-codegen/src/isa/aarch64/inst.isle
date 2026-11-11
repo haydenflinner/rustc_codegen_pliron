@@ -5383,6 +5383,58 @@
   (if-let true (val_already_extended ae val))
   (put_in_reg val))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 1024): a narrow `icmp` of
+;; `isub c, j` / `iadd c, j` against iconst `k` can often drop the
+;; operand's `uxtb`/`uxth` — `(c∓j) mod W == k` is `c == (k±j) mod W`
+;; (one cmp on `c`), and an unsigned relation can compare the unmasked
+;; 32-bit sub/add result when the bound in `narrow_addsub_cmp` holds
+;; (`add+uxtb+cmp`/`sub+uxtb+cmp` → `sub+cmp`/`cmp`).
+(type NarrowAddsubCmp (enum
+  ;; compare `c` against the rolled constant `k2` (eq/ne)
+  (C (k2 u64))
+  ;; emit `sub c, j` on the clean register; compare against `k2`
+  (Sub (j u64) (k2 u64))
+  ;; emit `sub c, s` on the clean register (`iadd`-as-isub rewrite);
+  ;; compare against `k2`
+  (Rewrite (s u64) (k2 u64))))
+(decl pure partial narrow_addsub_cmp (u64 IntCC Type Value u64 u64) NarrowAddsubCmp)
+(extern constructor narrow_addsub_cmp narrow_addsub_cmp)
+;; The narrow source reg when clean, the `uxtb`/`uxth` when not.
+(decl put_in_reg_uext_narrow_maybe (Value) Reg)
+(rule 0 (put_in_reg_uext_narrow_maybe v)
+  (put_in_reg_ext32_maybe v (ArgumentExtension.Uext)))
+(rule 1 (put_in_reg_uext_narrow_maybe v)
+  (if-let true (narrowext_clean v))
+  (put_in_reg v))
+(decl emit_icmp_addsub_k (IntCC Value NarrowAddsubCmp) CondResult)
+(rule 0 (emit_icmp_addsub_k cc c (NarrowAddsubCmp.C k2))
+  (if-let (imm12_from_u64 k2i) k2)
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32) (put_in_reg_uext_narrow_maybe c) k2i)
+    (cond_code cc)))
+(rule 1 (emit_icmp_addsub_k cc c (NarrowAddsubCmp.Sub j k2))
+  (if-let (imm12_from_u64 ji) j)
+  (if-let (imm12_from_u64 k2i) k2)
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32)
+             (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) ji)
+             k2i)
+    (cond_code cc)))
+(rule 2 (emit_icmp_addsub_k cc c (NarrowAddsubCmp.Rewrite s k2))
+  (if-let (imm12_from_u64 si) s)
+  (if-let (imm12_from_u64 k2i) k2)
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32)
+             (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) si)
+             k2i)
+    (cond_code cc)))
+(rule 10 (emit_icmp cc rn @ (isub ty @ (fits_in_16 _) c (u64_from_iconst j)) (u64_from_iconst k))
+  (if-let x (narrow_addsub_cmp 0 cc ty c j k))
+  (emit_icmp_addsub_k cc c x))
+(rule 11 (emit_icmp cc rn @ (iadd ty @ (fits_in_16 _) c (u64_from_iconst j)) (u64_from_iconst k))
+  (if-let x (narrow_addsub_cmp 1 cc ty c j k))
+  (emit_icmp_addsub_k cc c x))
+
 ;; 32/64-bit base case
 (rule 2 (emit_icmp cc rn rm @ (value_type (ty_32_or_64 ty)))
   (CondResult.Cond
