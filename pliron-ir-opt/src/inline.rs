@@ -86,6 +86,12 @@ pub fn wasm_cold_keep(sym: &str) -> bool {
         || sym.contains("11utf8_decode")
 }
 
+/// rustc's drop paths (`drop_in_place<T>` monomorphizations lower to the
+/// `4core3ptr9drop_glue` v0 fragment; same test as `memcpyopt`'s).
+fn is_drop_glue(sym: &str) -> bool {
+    sym.contains("4core3ptr9drop_glue") || sym.contains("13drop_in_place")
+}
+
 // Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
 // `cost <= threshold`.
 /// Each call inside the callee costs this much on top of its own op: inlining
@@ -1332,6 +1338,17 @@ pub fn run(
     let mut spec_cache: FxHashMap<(String, Vec<Option<u128>>), crate::inline_cost::SpecCost> = FxHashMap::default();
     let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
     let cold_once = crate::env_is("PLIRON_INLINE_COLDONCE", "1");
+    // `PLIRON_INLINE_DROPLIM=<n>` (opt-in): a drop-glue callee's threshold
+    // never exceeds n. Glue bodies lower ~1 op:1 insn (stores and calls, no
+    // slack), so even mid-size glue is far past LLVM's threshold — LLVM
+    // keeps `drop_glue<Box<ClassSet>>` a call at ~30 insns where our 320-op
+    // limit + alloca-arg save accepts the 104-op body, cloning its dealloc
+    // and landing-pad paths into every site (regex-syntax `pop_class_op`,
+    // +518 insns over LLVM). `free` sites stay exempt: the out-of-line copy
+    // dies there, so inlining can't grow the crate.
+    let droplim: usize = crate::env_get("PLIRON_INLINE_DROPLIM")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let always_all = crate::pass_enabled("PLIRON_INLINE_ALWAYS");
     // `PLIRON_INLINE_WASM_COLDKEEP=1` (small mode; default off): non-keep
     // callees use `WASM_COLDKEEP_THRESH` as the flat cold cap; keep-list
@@ -1727,6 +1744,13 @@ pub fn run(
                         && doomed.get_or_insert_with(|| doomed_blocks(ctx, st, caller)).contains(&b)
                     {
                         t = t.min(limit / 5);
+                    }
+                    if droplim > 0
+                        && !free
+                        && !f.always_inline
+                        && is_drop_glue(cs)
+                    {
+                        t = t.min(droplim);
                     }
                     // `#[inline(always)]` skips the score like LLVM's
                     // AlwaysInliner (`PLIRON_INLINE_ALWAYS=0` restores it; the
@@ -3641,7 +3665,7 @@ fn inline_call(
 
 #[cfg(test)]
 mod coldkeep_tests {
-    use super::wasm_cold_keep;
+    use super::{is_drop_glue, wasm_cold_keep};
 
     #[test]
     fn keep_matches_hash_num_str_parse() {
@@ -3682,6 +3706,17 @@ mod coldkeep_tests {
         ));
         assert!(!wasm_cold_keep(
             "_RNvNtNtNtCsf5r1dCIKy5h_17compiler_builtins4math9libm_math6scalbn6scalbn"
+        ));
+    }
+
+    #[test]
+    fn drop_glue_matches() {
+        assert!(is_drop_glue(
+            "_RINvNtCscyJ6arFbMDT_4core3ptr9drop_glueINtNtCscu5Z4uCmBC0_5alloc5boxed3BoxNtNtCs31JiNmLaWF1_12regex_syntax3ast8ClassSetEEB1e_"
+        ));
+        assert!(is_drop_glue("_RINvNtCscyJ6arFbMDT_4core3ptr13drop_in_placeNtNtCs31JiNmLaWF1_12regex_syntax3ast3AstEBH_"));
+        assert!(!is_drop_glue(
+            "_RNvMs7_NtCscu5Z4uCmBC0_5alloc5boxedINtB5_3BoxNtNtCs31JiNmLaWF1_12regex_syntax3ast8ClassSetE3newBL_"
         ));
     }
 }
