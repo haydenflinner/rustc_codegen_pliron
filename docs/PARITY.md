@@ -332,6 +332,18 @@ in the scoreboard and in the linked history files.
   `uxtb` after bool-returning calls, and loop-header alignment `nop`s
   (`PLIRON_ALIGN`). Kill-switch attribution:
   `history/2026-10-29-ir-excess.md`, `history/2026-10-29-code-size.md`.
+  Inlining volume update 2026-11-10 (`d21d9da`): the inliner's
+  loop-callsite bonus (`+limit*8/4` threshold) gated on warm calls
+  only, so helpers carrying unexecuted panic paths got a 3x budget —
+  regex-syntax's `while !is_eof()` loop inlined `bump` (9 calls) and
+  `char` (6 calls) where LLVM keeps them as calls (LLVM's ~5/insn
+  cost puts their ~60-insn bodies over its 225 threshold). Gating on
+  all calls (`PLIRON_INLINE_WARMCALLS=0`, now default) splits the
+  motivating leaf (`hash_one`, 1 call) from call-carrying helpers:
+  regex-syntax .text −5.3%, matched-symbol excess vs LLVM −9.4%
+  (parse fns at/below LLVM size), parse_only −9.3%, hash kernels
+  flat. `PLIRON_INLINE=200` shaves another −6%; the residual is
+  per-function codegen, not one transform.
 - **xcgu copies.** On kernels, ~14 KB of the rlib gap is per-CGU IPO
   clones (genuinely specialised, not dedup-able at the link) and ~5.5 KB
   is byte-identical `non-external` copies ld64 keeps in full. A linked
