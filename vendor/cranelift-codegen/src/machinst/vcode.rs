@@ -2917,8 +2917,13 @@ impl<I: VCodeInst> VCode<I> {
                         // (no regalloc edit, pad or island in between),
                         // as LLVM's `NoTrapAfterNoreturn` does. The last
                         // block keeps it so the return address stays
-                        // inside the function.
-                        if code_follows
+                        // inside the function, unless `PLIRON_NORETUDF=1`
+                        // drops it too: unwinders look up call sites at
+                        // `ret_addr - 1`, which still lands on the `bl`.
+                        static NORETUDF: std::sync::OnceLock<bool> =
+                            std::sync::OnceLock::new();
+                        if (code_follows
+                            || *NORETUDF.get_or_init(|| pliron_mode("PLIRON_NORETUDF", 0) != 0))
                             && self.insts[iix.index()].trap_code()
                                 == Some(crate::ir::TrapCode::NORETURN_CALL)
                             && iix.index() > brange.start
