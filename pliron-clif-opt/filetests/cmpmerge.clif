@@ -1,0 +1,70 @@
+; test cmpmerge
+; check: load.i32 notrap little v0
+; check: load.i32 notrap little v1
+; check: icmp eq
+; check: brif v47, block6, block1
+; A guarded byte-equality cascade: four `load.i8`/`icmp.i8 eq` compare
+; blocks chained through `x+k < len` bound checks. The pass splits the
+; edge into the first compare: one `x+3` bounds check per (x, len)
+; family, then a wide `load.i32` pair and `icmp eq`. Equal re-enters at
+; the last hop's check block (which re-checks the provably-true bound
+; and runs the last byte compare that computes its own continue args);
+; any doubt falls back to the serial chain.
+function %f(i64, i64, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    jump block1
+
+block1:
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v1
+    v12 = icmp.i8 eq v10, v11
+    brif v12, block2, block20
+
+block2:
+    v13 = iconst.i64 1
+    v14 = iadd.i64 v2, v13
+    v15 = icmp uge v14, v3
+    brif v15, block30(v14), block3
+
+block3:
+    v16 = load.i8 notrap v0+1
+    v17 = load.i8 notrap v1+1
+    v18 = icmp.i8 eq v16, v17
+    brif v18, block4, block20
+
+block4:
+    v19 = iconst.i64 2
+    v20 = iadd.i64 v2, v19
+    v21 = icmp uge v20, v3
+    brif v21, block30(v20), block5
+
+block5:
+    v22 = load.i8 notrap v0+2
+    v23 = load.i8 notrap v1+2
+    v24 = icmp.i8 eq v22, v23
+    brif v24, block6, block20
+
+block6:
+    v25 = iconst.i64 3
+    v26 = iadd.i64 v2, v25
+    v27 = icmp uge v26, v3
+    brif v27, block30(v26), block7
+
+block7:
+    v28 = load.i8 notrap v0+3
+    v29 = load.i8 notrap v1+3
+    v30 = icmp.i8 eq v28, v29
+    v31 = iconst.i64 4
+    v32 = iadd.i64 v1, v31
+    v33 = iadd.i64 v2, v31
+    brif v30, block8(v32, v33), block20
+
+block8(v34: i64, v35: i64):
+    return
+
+block20:
+    return
+
+block30(v36: i64):
+    return
+}

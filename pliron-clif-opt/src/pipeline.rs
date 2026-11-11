@@ -3972,6 +3972,12 @@ fn s_ldmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_cmpmerge(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = cmpmerge::run(&mut p.clctx.func, an);
+    p.stats.merged += k;
+    k
+}
+
 fn s_cicm(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = cicm::run(&mut p.clctx.func, an);
     if k > 0 && p.dump {
@@ -5119,6 +5125,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // normalize loads after the first ldmerge (Min4's stack-copy
         // compare loop is built there).
         step("ldmerge2", "ldmerge", Gate::OptIn("PLIRON_LDMERGE"), s_ldmerge),
+        // Guarded byte-compare cascades (unrolled slice equality):
+        // a wide-compare fast path on the edge into the first compare
+        // block. After ldmerge2 — the same late trees are done.
+        step("cmpmerge", "cmpmerge", Gate::OptIn("PLIRON_CMPMERGE"), s_cmpmerge),
         // Cold tails identical modulo iconst immediates (error
         // constructions after unrolls) share one param'd copy; each
         // member keeps its block and shrinks to `iconsts; jump M(args)`.
