@@ -370,6 +370,98 @@ fn inherit_markers(ctx: &mut Context, st: &mut State, a: Value, c: Value) {
     }
 }
 
+/// `PLIRON_LTUNDEF` gating (called from lowering): may `llvm.lifetime`
+/// marker `m` restart the promoted variables of object `a`? Only when no
+/// read of `a` can observe the value the restart replaces — every read
+/// strictly precedes `m`, or is dominated by a write `m` dominates.
+/// rustc emits `write -> lifetime.start -> load` for moved temporaries:
+/// the marker bounds the documented lifetime, not the physical bytes, so
+/// an unchecked restart turns a defined read into the zero `ltundef`
+/// emits at the marker.
+pub fn lt_marker_bounded(
+    ctx: &Context,
+    st: &State,
+    slot: &mut Option<crate::domcheck::Dom>,
+    a: Value,
+    m: Ptr<Operation>,
+) -> bool {
+    let Some(f) = m.deref(ctx).get_parent_block().and_then(|b| {
+        b.deref(ctx)
+            .get_parent_region()
+            .map(|r| r.deref(ctx).get_parent_op())
+    }) else {
+        return false;
+    };
+    // `a`'s use-cone through GEPs as byte ranges relative to `a`: reads
+    // and writes. Anything else — a call operand, `ptrtoint`, a block
+    // arg — leaves the answer unproven; a promoted object's cone is
+    // clean anyway, so refusing only costs the restart, never
+    // correctness.
+    let mut reads: Vec<(Ptr<Operation>, i64, u64)> = Vec::new();
+    let mut writes: Vec<(Ptr<Operation>, i64, u64)> = Vec::new();
+    let mut work = vec![(a, 0i64)];
+    let mut seen = 0usize;
+    while let Some((p, off)) = work.pop() {
+        for u in p.uses_iter(ctx) {
+            seen += 1;
+            if seen > 512 {
+                return false;
+            }
+            let op = u.user_op();
+            let i = u.find_index(ctx);
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) && i == 0 {
+                let Some(g) = gep_offset(ctx, st, op) else {
+                    return false;
+                };
+                work.push((op.deref(ctx).get_result(ctx, 0), off.wrapping_add(g)));
+                continue;
+            }
+            if let Some(name) = st.intrinsics.get(op).map(|s| s.as_str()) {
+                match name {
+                    "llvm.lifetime.start" | "llvm.lifetime.end" => continue,
+                    "llvm.memcpy" | "llvm.memmove" | "llvm.memset" if i <= 1 => {
+                        // memset's operand 1 is the byte, not a pointer.
+                        if i == 1 && name == "llvm.memset" {
+                            return false;
+                        }
+                        let Some(n) = const_int(
+                            ctx,
+                            st,
+                            op.deref(ctx).get_operand(ctx, 2),
+                        )
+                        .and_then(|n| u64::try_from(n).ok()) else {
+                            return false;
+                        };
+                        if i == 1 {
+                            reads.push((op, off, n));
+                        } else {
+                            writes.push((op, off, n));
+                        }
+                    }
+                    _ => return false,
+                }
+            } else if Operation::is_op::<LoadOp>(op, ctx) && i == 0 {
+                let t = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
+                reads.push((op, off, size_align(ctx, t).0));
+            } else if Operation::is_op::<StoreOp>(op, ctx) && i == 1 {
+                let t = op.deref(ctx).get_operand(ctx, 0).get_type(ctx);
+                writes.push((op, off, size_align(ctx, t).0));
+            } else {
+                return false;
+            }
+        }
+    }
+    reads.iter().all(|&(r, ro, rl)| {
+        crate::domcheck::op_dominates(ctx, st, slot, f, r, m)
+            || writes.iter().any(|&(w, wo, wl)| {
+                wo <= ro
+                    && ro + rl as i64 <= wo + wl as i64
+                    && crate::domcheck::op_dominates(ctx, st, slot, f, m, w)
+                    && crate::domcheck::op_dominates(ctx, st, slot, f, w, r)
+            })
+    })
+}
+
 /// Deepest `store *q <- p` chain the flow walk will chase (a pointer stored
 /// into a temp, loaded back, then stored into another temp, ...).
 const MAX_FLOW_DEPTH: u32 = 6;
@@ -2130,4 +2222,117 @@ fn forward_single_store_d(
         n += 1;
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline::{blocks, ops};
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::parsable::parse_from_str;
+    use pliron_llvm::ops::FuncOp;
+
+    /// Parse `input`, register the `llvm.lifetime.start` ops in
+    /// `st.intrinsics` (builder-side state the parser doesn't populate),
+    /// and return (ctx-owned state, alloca value, marker op).
+    fn lt_fixture(input: &str, st: &mut State, ctx: &mut Context) -> (Value, Ptr<Operation>) {
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let f = blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .unwrap();
+        let (mut a, mut m) = (None, None);
+        for b in blocks(ctx, f) {
+            for o in ops(ctx, b) {
+                if Operation::is_op::<AllocaOp>(o, ctx) {
+                    a = Some(o.deref(ctx).get_result(ctx, 0));
+                }
+                if Operation::is_op::<CallIntrinsicOp>(o, ctx) {
+                    st.intrinsics.insert(o, "llvm.lifetime.start".to_string());
+                    m = Some(o);
+                }
+            }
+        }
+        (a.unwrap(), m.unwrap())
+    }
+
+    const PRE: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            two = llvm.constant <builtin.integer <2: i64>> : builtin.integer i64;
+            p = llvm.alloca [builtin.integer i16 x one] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i16>> : builtin.integer i16;
+    "#;
+    const POST: &str = "    }\n    }\n";
+
+    /// `store -> lifetime.start -> load`: the load reads bytes defined
+    /// before the marker — a zero restart at the marker would corrupt it
+    /// (fuzz seed 13475's fn8 shape).
+    #[test]
+    fn marker_after_write_before_read() {
+        let input = format!(
+            "{PRE}        llvm.store *p <- v;\n            lt = llvm.call_intrinsic @\"llvm.lifetime.start\" (two, p) : llvm.func <llvm.void (builtin.integer i64, llvm.ptr (0)) variadic = false>;\n            r = llvm.load p : builtin.integer i16;\n            llvm.return\n{POST}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (a, m) = lt_fixture(&input, st, ctx);
+        assert!(!lt_marker_bounded(ctx, st, &mut None, a, m));
+    }
+
+    /// The normal case: the marker opens the window and a dominating
+    /// write inside it covers the read — the restart is invisible.
+    #[test]
+    fn marker_then_write_then_read() {
+        let input = format!(
+            "{PRE}        lt = llvm.call_intrinsic @\"llvm.lifetime.start\" (two, p) : llvm.func <llvm.void (builtin.integer i64, llvm.ptr (0)) variadic = false>;\n            llvm.store *p <- v;\n            r = llvm.load p : builtin.integer i16;\n            llvm.return\n{POST}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (a, m) = lt_fixture(&input, st, ctx);
+        assert!(lt_marker_bounded(ctx, st, &mut None, a, m));
+    }
+
+    /// Every read precedes the marker: the restart can't reach them.
+    #[test]
+    fn reads_before_marker() {
+        let input = format!(
+            "{PRE}        llvm.store *p <- v;\n            r = llvm.load p : builtin.integer i16;\n            lt = llvm.call_intrinsic @\"llvm.lifetime.start\" (two, p) : llvm.func <llvm.void (builtin.integer i64, llvm.ptr (0)) variadic = false>;\n            llvm.return\n{POST}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (a, m) = lt_fixture(&input, st, ctx);
+        assert!(lt_marker_bounded(ctx, st, &mut None, a, m));
+    }
+
+    /// A covering write must cover the read's whole byte range: writing
+    /// [0,2) does not cover a read of [2,4).
+    #[test]
+    fn partial_cover_refused() {
+        let input = format!(
+            "{PRE}        two_off = llvm.gep <builtin.integer i8> (p, two)[OperandIdx(1)] : llvm.ptr (0);\n            lt = llvm.call_intrinsic @\"llvm.lifetime.start\" (two, p) : llvm.func <llvm.void (builtin.integer i64, llvm.ptr (0)) variadic = false>;\n            llvm.store *p <- v;\n            r = llvm.load two_off : builtin.integer i16;\n            llvm.return\n{POST}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (a, m) = lt_fixture(&input, st, ctx);
+        assert!(!lt_marker_bounded(ctx, st, &mut None, a, m));
+    }
+
+    /// Cross-block: a write dominating the marker does not cover a read
+    /// the marker dominates.
+    #[test]
+    fn write_dom_marker_dom_read() {
+        let input = format!(
+            "{PRE}        llvm.store *p <- v;\n            llvm.br ^mid()\n          ^mid():\n            lt = llvm.call_intrinsic @\"llvm.lifetime.start\" (two, p) : llvm.func <llvm.void (builtin.integer i64, llvm.ptr (0)) variadic = false>;\n            llvm.br ^tail()\n          ^tail():\n            r = llvm.load p : builtin.integer i16;\n            llvm.return\n{POST}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (a, m) = lt_fixture(&input, st, ctx);
+        assert!(!lt_marker_bounded(ctx, st, &mut None, a, m));
+    }
 }

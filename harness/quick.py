@@ -78,7 +78,7 @@ ALIAS = {
     "dbg": ["debuginfo", "dbgnested"],
 }
 # Fuzz seeds by historical bug yield (newest / subtlest first).
-FUZZ_YIELD = [13475, 12309, 1939, 3441, 8631, 2598, 4940, 4895, 5042, 5542, 3938, 2542, 2187, 1776, 1276, 810, 730, 683, 538]
+FUZZ_YIELD = [13475, 24242, 12309, 1939, 3441, 8631, 2598, 4940, 4895, 5042, 5542, 3938, 2542, 2187, 1776, 1276, 810, 730, 683, 538]
 # Slow commands that finish the proof, by area touched.
 SLOW = {
     "gate": "harness/gate.py",

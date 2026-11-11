@@ -112,7 +112,7 @@ fn check(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<String> {
 
 /// Dominator tree over the blocks reachable from the entry (counting invoke
 /// landing-pad edges).
-pub(crate) struct Dom {
+pub struct Dom {
     /// Reachable blocks in reverse post-order.
     pub order: Vec<Ptr<BasicBlock>>,
     /// block → local ordinal (covers every `blocks` entry plus any
@@ -262,6 +262,41 @@ impl Dom {
         let i = self.rpo_idx(b)?;
         (self.idom[i] != i).then(|| self.order[self.idom[i]])
     }
+}
+
+/// `a` strictly dominates `b` — same block settled by op order, others
+/// by the domtree built lazily in `slot` for function `f`.
+pub fn op_dominates(
+    ctx: &Context,
+    st: &State,
+    slot: &mut Option<Dom>,
+    f: Ptr<Operation>,
+    a: Ptr<Operation>,
+    b: Ptr<Operation>,
+) -> bool {
+    if a == b {
+        return false;
+    }
+    let (Some(ab), Some(bb)) = (
+        a.deref(ctx).get_parent_block(),
+        b.deref(ctx).get_parent_block(),
+    ) else {
+        return false;
+    };
+    if ab == bb {
+        let mut cur = a.get_next(ctx);
+        while let Some(op) = cur {
+            if op == b {
+                return true;
+            }
+            cur = op.get_next(ctx);
+        }
+        return false;
+    }
+    if slot.is_none() {
+        *slot = Dom::new(ctx, st, f);
+    }
+    slot.as_ref().is_some_and(|d| d.dominates(ab, bb))
 }
 
 #[cfg(test)]

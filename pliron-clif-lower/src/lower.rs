@@ -1735,6 +1735,7 @@ pub fn lower_module<'a>(
                     ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                     ltzero: FxHashSet::default(),
                     ltloops: FxHashSet::default(),
+                    ltdom: None,
                     dbg_slots: Default::default(),
                 };
                 if pliron_cfg::tracing_on() {
@@ -2808,6 +2809,7 @@ pub fn lower_clif_wasm(
                 ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                 ltzero: FxHashSet::default(),
                 ltloops: FxHashSet::default(),
+                ltdom: None,
                 dbg_slots: Default::default(),
             };
             fl.lower(f.op);
@@ -3391,6 +3393,9 @@ struct FnLower<'a, 'b> {
     /// blurring slotmerge's lifetimes (NestLimiter's error-kind temps
     /// stopped sharing a slot).
     ltzero: FxHashSet<ir::Inst>,
+    /// Lazily-built domtree for `sroa::lt_marker_bounded`'s marker/read
+    /// ordering check.
+    ltdom: Option<pliron_ir_opt::domcheck::Dom>,
     /// `-g`: see `FnJob::dbg_slots`.
     dbg_slots: pliron_clif_opt::dbglabel::DbgSlots,
 }
@@ -7560,16 +7565,35 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 // the promoted slices SROA split off it (`lt_slices`). One
                 // zero per type serves every variable the marker restarts.
                 let own = self.vars.get(&opnds[1]).cloned();
-                let mut vars = own.clone().unwrap_or_default();
+                let mut cand: Vec<Value> = Vec::new();
+                if own.is_some() {
+                    cand.push(opnds[1]);
+                }
                 if let Some(sl) = self.st.lt_slices.get(opnds[1]) {
-                    for s in sl {
-                        if let Some(vs) = self.vars.get(s) {
-                            vars.extend(vs.iter().copied());
+                    for &s in sl.clone().iter() {
+                        if self.vars.contains_key(&s) {
+                            cand.push(s);
                         }
                     }
                 }
-                if !in_lt_loop {
-                    vars.clear();
+                let mut vars = Vec::new();
+                if in_lt_loop {
+                    // A restart is invisible only when the marker bounds the
+                    // object's reads: rustc can write a temp before its
+                    // `lifetime.start` and read it inside the window, and the
+                    // physical bytes stay defined (`lt_marker_bounded`).
+                    for a in cand {
+                        if pliron_ir_opt::sroa::lt_marker_bounded(
+                            self.ctx,
+                            self.st,
+                            &mut self.ltdom,
+                            a,
+                            op,
+                        ) && let Some(vs) = self.vars.get(&a)
+                        {
+                            vars.extend(vs.iter().copied());
+                        }
+                    }
                 }
                 let mut zeros: SmallVec<[(ClType, ir::Value); 4]> = SmallVec::new();
                 for (var, t) in vars {

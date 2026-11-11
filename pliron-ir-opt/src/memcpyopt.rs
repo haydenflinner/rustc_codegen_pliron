@@ -1,11 +1,18 @@
-//! memcpyopt call-slot forwarding: `call f(sret %tmp); memcpy(%dst, %tmp, size(tmp))`
-//! becomes `call f(sret %dst)`, and `memset(%tmp, c, k); memcpy(%dst, %tmp, n)`
-//! with `k <= n` becomes `memset(%dst, c, k)` (the unwritten tail refines
-//! from `%tmp`'s uninit alloca bytes to `%dst`'s old ones), when `%tmp` is an
-//! alloca used only by the two ops and `%dst` is an alloca or the caller's own
-//! `sret` argument whose every use is dominated by the copy — before it ran
-//! `%dst` still held its own bytes, so any use it can't dominate could
-//! observe them. `PLIRON_MEMCPYOPT=0` disables it.
+//! memcpyopt call-slot forwarding: `memcpy(%dst, %tmp, n)`/`memmove`
+//! where `%tmp` is an `n`-byte alloca forwards every write the temp's
+//! use-cone carries — `store`s, `memset`/`memcpy`/`memmove` destinations
+//! and `sret` call arguments — onto `%dst` directly, then drops the copy
+//! and the temp. `call f(sret %tmp); memcpy(%dst, %tmp, n)` becomes
+//! `call f(sret %dst)`; a struct built field-by-field in a temp then
+//! whole-copied (`store`, `memcpy`, `memmove` into a parent field or the
+//! caller's `sret` slot) writes the field straight into its home.
+//! Unwritten ranges of `[0, n)` refine from the temp's uninit alloca
+//! bytes to `%dst`'s old ones; reads of the temp rebase onto `%dst` and
+//! see the same bytes or an equally-valid undef refinement. Writers must
+//! dominate the copy, each writer's committed range must be clear of
+//! `dst` touches until the copy would have run, and copy sources plus
+//! non-`sret` call arguments must be provably disjoint from `%dst`.
+//! `PLIRON_MEMCPYOPT=0` disables it.
 
 use pliron::{
     context::{Context, Ptr},
@@ -23,6 +30,16 @@ use crate::opt_body;
 use crate::sroa::{const_int, gep_offset};
 use crate::state::{ArgExt, State};
 use crate::types::size_align;
+
+/// `PLIRON_TRACE=pliron::memcpyopt=debug`: why a copy was not forwarded.
+macro_rules! why {
+    ($($t:tt)*) => {{
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::memcpyopt", "fwd: {}", format!($($t)*));
+        }
+        return false;
+    }};
+}
 
 /// The domtree for `f`, built on first use.
 fn dom_of<'a>(
@@ -47,40 +64,23 @@ fn op_dominates(
     a: Ptr<Operation>,
     b: Ptr<Operation>,
 ) -> bool {
-    if a == b {
-        return false;
-    }
-    let (Some(ab), Some(bb)) = (
-        a.deref(ctx).get_parent_block(),
-        b.deref(ctx).get_parent_block(),
-    ) else {
-        return false;
-    };
-    if ab == bb {
-        let mut cur = a.get_next(ctx);
-        while let Some(op) = cur {
-            if op == b {
-                return true;
-            }
-            cur = op.get_next(ctx);
-        }
-        return false;
-    }
-    dom_of(ctx, st, dom, f).is_some_and(|d| d.dominates(ab, bb))
+    crate::domcheck::op_dominates(ctx, st, dom, f, a, b)
 }
 
-/// Every use of `v` other than in `m` itself is either before `prod` —
-/// it still sees `dst`'s old bytes, which the forward doesn't change —
-/// or dominated by `m`, where it sees the producer's bytes either way.
-/// A use in between could observe the difference.
-fn uses_after(
+/// Is any op in `set` strictly between `prod` and `m`? Ops before `prod`
+/// still see `dst`'s old bytes, which the forward doesn't change; ops
+/// dominated by `m` see the producer's bytes either way. An op in between
+/// could observe the difference. Same-block position is settled by op
+/// order, cross-block by the domtree (`m` being strictly dominated by
+/// `prod`, a third block is "before prod" only if it dominates `prod`'s).
+fn any_between(
     ctx: &Context,
     st: &State,
     dom: &mut Option<Dom>,
     f: Ptr<Operation>,
     m: Ptr<Operation>,
     prod: Ptr<Operation>,
-    v: Value,
+    set: &FxHashSet<Ptr<Operation>>,
 ) -> bool {
     let (mb, pb) = (
         m.deref(ctx).get_parent_block().unwrap(),
@@ -89,22 +89,7 @@ fn uses_after(
     let mut same_m: FxHashSet<Ptr<Operation>> = FxHashSet::default();
     let mut same_p: FxHashSet<Ptr<Operation>> = FxHashSet::default();
     let mut other: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
-    for u in v.uses_iter(ctx) {
-        let uo = u.user_op();
-        // Lifetime markers bracket storage; they observe no bytes.
-        if uo == prod {
-            // The producer reading dst itself (e.g. through another call
-            // arg) would observe its own write once it lands in dst.
-            return false;
-        }
-        if uo == m
-            || matches!(
-                st.intrinsics.get(uo).map(|s| s.as_str()),
-                Some("llvm.lifetime.start" | "llvm.lifetime.end")
-            )
-        {
-            continue;
-        }
+    for &uo in set {
         match uo.deref(ctx).get_parent_block() {
             Some(b) if b == mb => {
                 same_m.insert(uo);
@@ -115,7 +100,7 @@ fn uses_after(
             Some(b) => {
                 other.insert(b);
             }
-            None => return false,
+            None => return true,
         }
     }
     if !same_m.is_empty() {
@@ -137,7 +122,7 @@ fn uses_after(
             cur = o.get_next(ctx);
         }
         if !same_m.is_empty() {
-            return false;
+            return true;
         }
     }
     if !same_p.is_empty() {
@@ -150,16 +135,166 @@ fn uses_after(
             cur = o.get_next(ctx);
         }
         if !same_p.is_empty() {
-            return false;
+            return true;
         }
     }
     if let Some(d) = (!other.is_empty()).then(|| dom_of(ctx, st, dom, f)).flatten() {
-        other.iter().all(|&b| d.dominates(mb, b) || d.dominates(b, pb))
+        other.iter().any(|&b| !(d.dominates(mb, b) || d.dominates(b, pb)))
     } else {
-        other.is_empty()
+        !other.is_empty()
     }
 }
 
+/// The byte width `op` reads through pointer operand `i` of a chain that
+/// started at `tmp`, or `None` when `op` is not a pure reader (stores and
+/// copy destinations write; calls, compares and block args can observe
+/// `tmp`'s address itself).
+fn leaf_read(ctx: &Context, st: &State, op: Ptr<Operation>, i: usize) -> Option<u64> {
+    if Operation::is_op::<LoadOp>(op, ctx) && i == 0 {
+        return Some(size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0);
+    }
+    if i == 1
+        && matches!(
+            st.intrinsics.get(op).map(|s| s.as_str()),
+            Some("llvm.memcpy" | "llvm.memmove")
+        )
+    {
+        return op
+            .deref(ctx)
+            .operands(ctx)
+            .nth(2)
+            .and_then(|v| const_int(ctx, st, v))
+            .and_then(|n| u64::try_from(n).ok());
+    }
+    None
+}
+
+/// The byte width `op` writes through a `tmp`-derived pointer at operand
+/// `i`, when it is a pure writer: a typed store, a memory intrinsic's
+/// destination, or a call's `sret` argument — the whole return region
+/// per `arg_extent`. Volatile ops, invokes, and uses that merely carry
+/// the pointer (callee operands, non-`sret` args, GEP indices) refuse.
+fn leaf_write(ctx: &Context, st: &State, op: Ptr<Operation>, i: usize) -> Option<u64> {
+    if st.volatile.contains(op) || st.invokes.contains(op) {
+        return None;
+    }
+    if Operation::is_op::<StoreOp>(op, ctx) {
+        return (i == 1)
+            .then(|| size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0);
+    }
+    if i == 0
+        && matches!(
+            st.intrinsics.get(op).map(|s| s.as_str()),
+            Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
+        )
+    {
+        return op
+            .deref(ctx)
+            .operands(ctx)
+            .nth(2)
+            .and_then(|v| const_int(ctx, st, v))
+            .and_then(|n| u64::try_from(n).ok());
+    }
+    let ci = st.calls.get(op)?;
+    let nopd = op.deref(ctx).get_num_operands();
+    let first_arg = nopd - ci.exts.params.len().min(nopd);
+    let ai = i.checked_sub(first_arg)?;
+    if ci.exts.params.get(ai) != Some(&ArgExt::SRet) {
+        return None;
+    }
+    ci.arg_extent
+        .as_ref()
+        .and_then(|e| e.get(ai))
+        .map(|&(n, _)| n)
+}
+
+/// `tmp`'s use-cone, classified for forwarding: every path through
+/// constant GEPs must end at a pure read or write of `[0, n)` — the
+/// copy's extent, which is also `tmp`'s alloca size. Returns the chain
+/// roots to rebase (every non-marker direct use), the writer ops with
+/// their `[lo, hi)` ranges in `tmp`, the reader ops likewise, and the
+/// lifetime markers to erase. Anything that can observe `tmp`'s
+/// address — compares, `ptrtoint`, block args, call operands,
+/// non-constant GEPs — refuses the cone.
+fn tmp_flow(
+    ctx: &Context,
+    st: &State,
+    m: Ptr<Operation>,
+    tmp: Value,
+    n: u64,
+) -> Option<(
+    Vec<(Ptr<Operation>, usize)>,
+    Vec<(Ptr<Operation>, u64, u64)>,
+    Vec<(Ptr<Operation>, u64, u64)>,
+    Vec<Ptr<Operation>>,
+)> {
+    let mut roots: Vec<(Ptr<Operation>, usize)> = Vec::new();
+    let mut writers: Vec<(Ptr<Operation>, u64, u64)> = Vec::new();
+    let mut readers: Vec<(Ptr<Operation>, u64, u64)> = Vec::new();
+    let mut marks: Vec<Ptr<Operation>> = Vec::new();
+    let mut seen = 0usize;
+    let mut work: Vec<(Value, u64, bool)> = vec![(tmp, 0, true)];
+    while let Some((p, bo, root)) = work.pop() {
+        for u in p.uses_iter(ctx) {
+            seen += 1;
+            if seen > 512 {
+                return None;
+            }
+            let op = u.user_op();
+            let i = u.find_index(ctx);
+            if op == m {
+                continue;
+            }
+            if matches!(
+                st.intrinsics.get(op).map(|s| s.as_str()),
+                Some("llvm.lifetime.start" | "llvm.lifetime.end")
+            ) {
+                if root {
+                    marks.push(op);
+                }
+                continue;
+            }
+            if root {
+                roots.push((op, i));
+            }
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) && i == 0 {
+                let nb = gep_offset(ctx, st, op).and_then(|o| (bo as i64).checked_add(o))?;
+                if nb < 0 {
+                    return None;
+                }
+                work.push((op.deref(ctx).get_result(ctx, 0), nb as u64, false));
+            } else if let Some(w) = leaf_read(ctx, st, op, i) {
+                if bo + w > n {
+                    return None;
+                }
+                readers.push((op, bo, bo + w));
+            } else if let Some(w) = leaf_write(ctx, st, op, i) {
+                if bo + w > n {
+                    return None;
+                }
+                writers.push((op, bo, bo + w));
+            } else {
+                return None;
+            }
+        }
+    }
+    Some((roots, writers, readers, marks))
+}
+
+/// Forward `m = memcpy|memmove(dst, tmp, n)` where `tmp` is an `n`-byte
+/// alloca: rebase every `tmp`-rooted pointer to `dbase + doff` and drop
+/// `m`, the temp and its markers. Each writer's bytes then land in `dst`
+/// at the writer's own position instead of at `m`, which is exact for
+/// the ranges any writer covers and a valid undef refinement for the
+/// rest (the unwritten tail is `tmp`'s uninit alloca bytes either way).
+/// Soundness rests on four checks, all below: every writer dominates `m`
+/// (post-`m` `tmp` writes would leak into `dst`); a copy writer's source
+/// is provably disjoint from `dst` (an `llvm.memcpy` would otherwise
+/// trade guaranteed-disjoint semantics for possibly-overlapping, and an
+/// aliased read would observe `dst`'s new bytes early — `memmove` gets
+/// the same check); no op touches `dst`'s copy range between a writer
+/// and `m` (it would see the write early); and `tmp`'s use-cone is only
+/// reads and writes inside `[0, n)` through constant GEPs.
 fn try_forward(
     ctx: &mut Context,
     st: &mut State,
@@ -168,94 +303,140 @@ fn try_forward(
     sret_args: &[Value],
     m: Ptr<Operation>,
 ) -> bool {
-    if st.volatile.contains(m) || st.intrinsics.get(m).map(|s| s.as_str()) != Some("llvm.memcpy")
+    if st.volatile.contains(m)
+        || !matches!(
+            st.intrinsics.get(m).map(|s| s.as_str()),
+            Some("llvm.memcpy" | "llvm.memmove")
+        )
+        || st.invokes.contains(m)
     {
         return false;
     }
     let o: Vec<Value> = m.deref(ctx).operands(ctx).collect();
     let (dst, src) = (o[0], o[1]);
-    let Some(n) = const_int(ctx, st, o[2]) else {
+    let Some(n) = const_int(ctx, st, o[2]).and_then(|n| u64::try_from(n).ok()) else {
         return false;
     };
     let Some(a) = src.defining_op() else {
         return false;
     };
-    if !Operation::is_op::<AllocaOp>(a, ctx) || st.allocas.get(src).map(|x| x.0 as i128) != Some(n)
-    {
+    if !Operation::is_op::<AllocaOp>(a, ctx) || st.allocas.get(src).map(|x| x.0) != Some(n) {
         return false;
     }
-    // The temp's uses: exactly one producer and the copy, plus any
-    // lifetime markers (dead once the slot is).
-    let mut marks: Vec<Ptr<Operation>> = Vec::new();
-    let mut uses: Vec<(Ptr<Operation>, usize)> = Vec::new();
-    for u in src.uses_iter(ctx) {
-        let o = u.user_op();
-        if matches!(
-            st.intrinsics.get(o).map(|s| s.as_str()),
-            Some("llvm.lifetime.start" | "llvm.lifetime.end")
-        ) {
-            marks.push(o);
-        } else {
-            uses.push((o, u.find_index(ctx)));
-        }
-    }
-    if uses.len() != 2 {
-        return false;
-    }
-    let Some(&(call, idx)) = uses.iter().find(|(u, _)| *u != m) else {
-        return false;
+    let Some((roots, writers, readers, marks)) = tmp_flow(ctx, st, m, src, n) else {
+        why!("src has opaque or out-of-range uses");
     };
-    // The producer is either an `sret` call argument ... or a `memset`
-    // whose destination is the temp (index 0): `memset(%tmp, c, k)` with
-    // `k <= n`. A `k < n` copy tail is the temp's uninit alloca bytes —
-    // leaving `dst`'s old bytes there is a valid undef refinement. A
-    // `memcpy`/`memmove` producer is refused: forwarding it would turn a
-    // provably disjoint copy into a possibly-overlapping one.
-    let is_memset = st.calls.get(call).is_none()
-        && idx == 0
-        && !st.volatile.contains(call)
-        && st.intrinsics.get(call).map(|s| s.as_str()) == Some("llvm.memset")
-        && call
-            .deref(ctx)
-            .operands(ctx)
-            .nth(2)
-            .and_then(|v| const_int(ctx, st, v))
-            .is_some_and(|k| k <= n);
-    if !is_memset {
-        let Some(ci) = st.calls.get(call) else {
-            return false;
+    for &(w, _, _) in &writers {
+        if !op_dominates(ctx, st, dom, f, w, m) {
+            why!("writer does not dominate the copy");
+        }
+    }
+    // A `memcpy(tmp, tmp)` would rebase into `memcpy(p, p)` — overlap an
+    // `llvm.memcpy` forbids. Rare enough to refuse outright.
+    if readers.iter().any(|r| writers.iter().any(|w| w.0 == r.0)) {
+        why!("self-copy through the temp");
+    }
+    // Where `tmp`'s range lands in `dst`: the caller's `sret` arg at
+    // offset 0, or a constant-offset field of an alloca it fits inside.
+    let (dbase, doff) = if sret_args.contains(&dst) {
+        (dst, 0)
+    } else {
+        let Some((base, off)) = alloca_base(ctx, st, dst) else {
+            why!("dst has no provable base");
         };
-        if st.invokes.contains(call) {
-            return false;
+        if base == src
+            || !st
+                .allocas
+                .get(base)
+                .is_some_and(|x| off <= x.0 && n <= x.0 - off)
+        {
+            why!("dst field out of bounds or based on src");
         }
-        let nopd = call.deref(ctx).get_num_operands();
-        let first_arg = nopd - ci.exts.params.len().min(nopd);
-        if idx < first_arg || ci.exts.params.get(idx - first_arg) != Some(&ArgExt::SRet) {
-            return false;
+        (base, off)
+    };
+    // Writer-specific hazards: a copy writer's source must be provably
+    // disjoint from `dst` (and not `tmp`-derived, or the rebase dangles
+    // it), and a call writer's pointer arguments must be too — otherwise
+    // the callee could observe its own `sret` writes through them once
+    // they land in `dst` instead of `tmp`.
+    for &(w, _, _) in &writers {
+        if st.calls.get(w).is_some() {
+            let nopd = w.deref(ctx).get_num_operands();
+            let first_arg = nopd - st.calls.get(w).unwrap().exts.params.len().min(nopd);
+            for (j, x) in w.deref(ctx).operands(ctx).enumerate() {
+                if j < first_arg {
+                    continue;
+                }
+                if crate::types::leaf_is_ptr(ctx, x.get_type(ctx)).contains(&true)
+                    && !disjoint(ctx, st, sret_args, x, dst)
+                {
+                    why!("call writer's arg may alias dst");
+                }
+            }
+        } else if matches!(
+            st.intrinsics.get(w).map(|s| s.as_str()),
+            Some("llvm.memcpy" | "llvm.memmove")
+        ) {
+            let x = w.deref(ctx).operands(ctx).nth(1).unwrap();
+            if alloca_base(ctx, st, x).is_some_and(|(b, _)| b == src)
+                || !disjoint(ctx, st, sret_args, x, dst)
+            {
+                why!("copy writer's src may alias dst");
+            }
         }
     }
-    // The producer must run before the copy (it feeds it), and dst must
-    // be a known slot — an alloca at least `n` bytes whose definition
-    // reaches the producer, or the caller's `sret` argument — with no use
-    // strictly between the two: an earlier use sees dst's old bytes, a
-    // later one the producer's, but a use in between could observe the
-    // difference the forward introduces.
-    if !op_dominates(ctx, st, dom, f, call, m) {
-        return false;
+    // `dbase`'s definition must reach every op a rebased pointer is
+    // inserted before (allocas are entry-hoisted and the `sret` arg
+    // dominates everything, so this only bites for odd IR).
+    let dom_ok = dbase
+        .defining_op()
+        .is_none_or(|bd| roots.iter().all(|&(u, _)| op_dominates(ctx, st, dom, f, bd, u)));
+    if !dom_ok {
+        why!("dst base does not dominate all rebase sites");
     }
-    let dst_ok = sret_args.contains(&dst)
-        || dst.defining_op().is_some_and(|d| {
-            Operation::is_op::<AllocaOp>(d, ctx)
-                && st.allocas.get(dst).is_some_and(|x| x.0 as i128 >= n)
-                && op_dominates(ctx, st, dom, f, d, call)
-        });
-    if !dst_ok {
-        return false;
+    // Between a writer and `m`, nothing may touch the range that writer
+    // commits to `dst` — it would observe the early write. Ops outside
+    // the range keep reading `dst`'s old bytes, which is what they saw
+    // before `m` ran anyway.
+    let size = st.allocas.get(dbase).map(|x| x.0).unwrap_or(u64::MAX);
+    for &(w, lo, hi) in &writers {
+        let Some(mut set) = base_touches(ctx, st, dbase, size, doff + lo, hi - lo) else {
+            why!("dst use-cone not fully walkable");
+        };
+        set.remove(&m);
+        set.remove(&w);
+        if any_between(ctx, st, dom, f, m, w, &set) {
+            why!("dst touched in writer-to-copy window");
+        }
     }
-    if !uses_after(ctx, st, dom, f, m, call, dst) {
-        return false;
+    // A reader after `m` reads `tmp`'s final bytes — `dst`'s after the
+    // rebase — so the copy must dominate it (a path skipping `m` could
+    // miss writers entirely) and nothing may touch its range in `dst`
+    // in between (a write would substitute bytes `tmp` never held).
+    // Readers before `m` are already covered by the writer windows.
+    for &(r, ro, rh) in &readers {
+        if op_dominates(ctx, st, dom, f, r, m) {
+            continue;
+        }
+        if !op_dominates(ctx, st, dom, f, m, r) {
+            why!("post-copy read not dominated by the copy");
+        }
+        let Some(mut set) = base_touches(ctx, st, dbase, size, doff + ro, rh - ro) else {
+            why!("dst use-cone not fully walkable");
+        };
+        set.remove(&m);
+        set.remove(&r);
+        for &(w, _, _) in &writers {
+            set.remove(&w);
+        }
+        if any_between(ctx, st, dom, f, r, m, &set) {
+            why!("dst touched between copy and post-copy read");
+        }
     }
-    Operation::replace_operand(call, ctx, idx, dst);
+    for &(u, i) in &roots {
+        let p = crate::sroa::ptr_plus(ctx, st, dbase, doff, u);
+        Operation::replace_operand(u, ctx, i, p);
+    }
     st.intrinsics.remove(m);
     Operation::erase(m, ctx);
     for o in marks {
@@ -286,8 +467,106 @@ fn alloca_base(ctx: &Context, st: &State, mut v: Value) -> Option<(Value, u64)> 
     None
 }
 
+/// `x` and `dst` provably point at different memory: distinct alloca bases
+/// (stack slots never overlap, whatever the offsets), or an alloca base
+/// against the caller's `sret` argument (a caller-owned pointer cannot
+/// address this frame). Two `sret`-side pointers may alias each other —
+/// not disjoint.
+fn disjoint(ctx: &Context, st: &State, sret_args: &[Value], x: Value, dst: Value) -> bool {
+    match (
+        alloca_base(ctx, st, x),
+        alloca_base(ctx, st, dst),
+        sret_args.contains(&x),
+        sret_args.contains(&dst),
+    ) {
+        (Some((a, _)), Some((b, _)), _, _) => a != b,
+        (Some(_), _, _, true) | (_, Some(_), true, _) => true,
+        _ => false,
+    }
+}
+
+/// Every op that may touch bytes `[off, off+len)` of the alloca `base`,
+/// walked through GEP chains (`None` = the walk overflowed or the base's
+/// address reached something unbounded, so "not provably clear"). An op
+/// whose range is unknown — a call taking the pointer, a store of the
+/// pointer as a value, a non-constant GEP's consumer — counts as touching
+/// everything.
+fn base_touches(
+    ctx: &Context,
+    st: &State,
+    base: Value,
+    size: u64,
+    off: u64,
+    len: u64,
+) -> Option<FxHashSet<Ptr<Operation>>> {
+    let mut out: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+    let mut seen = 0usize;
+    // (pointer value, its byte offset in base, offset known)
+    let mut work: Vec<(Value, u64, bool)> = vec![(base, 0, true)];
+    while let Some((p, bo, known)) = work.pop() {
+        for u in p.uses_iter(ctx) {
+            seen += 1;
+            if seen > 512 {
+                return None;
+            }
+            let op = u.user_op();
+            let i = u.find_index(ctx);
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+                if i != 0 {
+                    // The pointer is an index — it escapes as a scalar.
+                    out.insert(op);
+                    continue;
+                }
+                let r = op.deref(ctx).get_result(ctx, 0);
+                match gep_offset(ctx, st, op).and_then(|go| (bo as i64).checked_add(go)) {
+                    Some(nb) if known && nb >= 0 && nb as u64 <= size => {
+                        work.push((r, nb as u64, true))
+                    }
+                    _ => work.push((r, 0, false)),
+                }
+                continue;
+            }
+            if matches!(
+                st.intrinsics.get(op).map(|s| s.as_str()),
+                Some("llvm.lifetime.start" | "llvm.lifetime.end")
+            ) {
+                continue;
+            }
+            if !known {
+                out.insert(op);
+                continue;
+            }
+            // Byte range of the access, when it is statically known.
+            let range = if Operation::is_op::<LoadOp>(op, ctx) {
+                Some((bo, size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0))
+            } else if Operation::is_op::<StoreOp>(op, ctx) && i == 1 {
+                Some((bo, size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0))
+            } else if i <= 1
+                && matches!(
+                    st.intrinsics.get(op).map(|s| s.as_str()),
+                    Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
+                )
+            {
+                op.deref(ctx)
+                    .operands(ctx)
+                    .nth(2)
+                    .and_then(|v| const_int(ctx, st, v))
+                    .and_then(|n| u64::try_from(n).ok())
+                    .map(|n| (bo, n))
+            } else {
+                None
+            };
+            if range.is_none_or(|(lo, n)| lo < off + len && off < lo.saturating_add(n)) {
+                out.insert(op);
+            }
+        }
+    }
+    Some(out)
+}
+
 // `PLIRON_TRACE=pliron::memcpyopt=debug`: why a by-value copy was not
-// forwarded (`nope!` inside `home_users`, `bail!` in `try_byval`).
+// forwarded (`nope!` inside `home_users`, `bail!` in `try_byval`, `why!`
+// in `try_forward`).
 macro_rules! nope {
     ($($t:tt)*) => {{
         if pliron_cfg::tracing_on() {
@@ -681,6 +960,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         if !opt_body(ctx, st, f) {
             continue;
         }
+        let bname = crate::bisect_name(st, f);
         let Some(entry) = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head() else {
             continue;
         };
@@ -695,6 +975,14 @@ pub fn run(ctx: &mut Context, st: &mut State) {
         for b in blocks {
             let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
             for op in ops {
+                // Only candidate copies consume bisect units.
+                if matches!(
+                    st.intrinsics.get(op).map(|s| s.as_str()),
+                    Some("llvm.memcpy" | "llvm.memmove")
+                ) && !crate::bisect_in("memcpyopt", &bname)
+                {
+                    continue;
+                }
                 n += try_forward(ctx, st, f, &mut dom, &sret_args, op) as usize;
             }
         }
