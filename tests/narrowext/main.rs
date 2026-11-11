@@ -133,6 +133,36 @@ fn dirty_shift16(x: u16, y: u16) -> u16 {
     x | (y.wrapping_add(1) >> 5)
 }
 
+#[inline(never)]
+fn cast_shr(x: u64) -> u8 {
+    // `ushr.i8 (ireduce x), k` fuses to `ubfx` on the wide register
+    // (bit 256). The shift must see the byte, not bits 8+ of `x`.
+    (x as u8) >> 3
+}
+
+#[inline(never)]
+fn cast_shr16(x: u64) -> u16 {
+    (x as u16) >> 5
+}
+
+#[inline(never)]
+fn cast_chain(v: u64) -> u8 {
+    // `ireduce.i8 (ireduce.i16 x)` extends the wide source once.
+    v as u16 as u8
+}
+
+#[inline(never)]
+fn cast_sel(c: bool, x: u64, y: u64) -> u8 {
+    // Narrow `select` arms that are `ireduce`s select the wide registers
+    // — only the low byte of the chosen arm is the result.
+    if c { x as u8 } else { y as u8 }
+}
+
+#[inline(never)]
+fn cast_sel16(c: bool, x: u64, y: u64) -> u16 {
+    if c { x as u16 } else { y as u16 }
+}
+
 #[derive(Clone, Copy)]
 enum Op {
     A,
@@ -207,6 +237,18 @@ fn main() {
         }
 
         let op = ops[(i & 7) as usize];
+        let wide = black_box((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+        assert_eq!(cast_shr(wide) as u32, (wide as u32 & 0xff) >> 3);
+        assert_eq!(cast_shr16(wide) as u32, (wide as u32 & 0xffff) >> 5);
+        assert_eq!(cast_chain(wide) as u32, wide as u32 & 0xff);
+        assert_eq!(cast_sel(a > b, wide, b as u64) as u32,
+                   if a > b { wide as u32 & 0xff } else { b as u32 });
+        assert_eq!(cast_sel16(a > b, wide, w as u64) as u32,
+                   if a > b { wide as u32 & 0xffff } else { w as u32 });
+        mix(cast_shr(wide) as u64 | (cast_shr16(wide) as u64) << 8
+            | (cast_chain(wide) as u64) << 24
+            | (cast_sel(a > b, wide, b as u64) as u64) << 32
+            | (cast_sel16(a > b, wide, w as u64) as u64) << 40);
         mix(dispatch(op, a as u64 * 977, b as u64 + w as u64));
         mix(r as u64 + m as u64 + x as u64 + s as u64 + c as u64 + nb as u64 + e as u64);
     }
@@ -215,5 +257,5 @@ fn main() {
     mix(n as u64);
     println!("{acc}");
     // Stock rustc value.
-    assert_eq!(acc, 13935495612886148059);
+    assert_eq!(acc, 15308719940693316553);
 }

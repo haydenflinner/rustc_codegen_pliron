@@ -770,7 +770,20 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`,
     32 narrow `ushr`-of-clean (a narrow `lsr` result is always canonical)
     plus `bor`/`band`/`bxor` with a constant `ushr` operand folding to
-    `orr`/`and`/`eor ..., lsr #k` when the shifted value is clean.
+    `orr`/`and`/`eor ..., lsr #k` when the shifted value is clean,
+    64 `ireduce` passthrough when `wide_uext_clean` proves the wide
+    source already zero above the destination width (small-const `select`
+    arms, narrower `uextend`s, masked `band`s, top-byte `ushr`s),
+    128 `ireduce` source fusions (`ireduce (ushr x, k)` → one `ubfm`,
+    `ireduce` of a single-use `load` → narrow `uload`, byte/halfword
+    `store`/`istore8`/`istore16` of an `ireduce` stores the wide
+    register), 256 `ireduce` consumer sinks: `ushr` of a narrow `ireduce`
+    by a constant → `ubfx` on the wide register, `ireduce (ireduce x)`
+    extends once, and `select` arms that are `ireduce`s read the wide
+    source directly (the low bits are exact and a `select` result is
+    modelled dirty anyway). A dirty-source passthrough variant of 256 was
+    tried and reverted: it converted one shared `uxtb` into one
+    extension/test per fusing use and grew regex-syntax `.text`.
 
 63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP`, default on,
     `=0` off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table

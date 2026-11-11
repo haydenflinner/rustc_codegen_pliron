@@ -2390,6 +2390,23 @@
       (if-let true (narrowext_clean x))
       (do_shift (ALUOp.Lsr) ty (put_in_reg x) y))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 256): `ushr` of a narrow `ireduce` by a
+;; constant is one `ubfm` (`ubfx x, #k, #width-k`) — the byte/halfword
+;; semantics are exactly "extract bits [k, width)" of the wide register,
+;; so the `uxtb`/`uxth` + `lsr` pair folds into the bitfield and the
+;; `ireduce`'s own extension dies with it when unused elsewhere. Must
+;; outrank `ushr_clean_narrow` (64): the `ireduce` registers as clean
+;; there, but the extract reads the wide source for the same cost as the
+;; `lsr` while also killing the `ireduce`'s `uxtb`/`uxth`.
+(rule ushr_ireduce_ubfm 65 (lower (ushr ty @ (fits_in_16 _)
+                                     (ireduce _ x @ (value_type (fits_in_64 s_ty)))
+                                     (iconst _ (u64_from_imm64 k))))
+      (if-let true (narrowext_on 256))
+      (if-let true (u64_lt k (ty_bits_u64 ty)))
+      (if-let immr (bf_imm_u8 k))
+      (if-let imms (bf_imm_u8 (u64_wrapping_sub (ty_bits_u64 ty) 1)))
+      (ubfm (operand_size s_ty) (put_in_reg x) immr imms))
+
 ;; Shift for i64.
 (rule ushr_64 (lower (ushr $I64 x y))
       (do_shift (ALUOp.Lsr) $I64 (put_in_reg_zext64 x) y))
@@ -2892,6 +2909,43 @@
 (rule 1 (lower (ireduce ty @ (fits_in_16 _) src))
     (extend (value_regs_get src 0) false (ty_bits ty) 32))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 64): ...unless the wide source's register
+;; is already zero above the narrow width (`wide_clean` — small-const
+;; `select` arms, narrower `uextend`s, masked `band`s, top-byte `ushr`s):
+;; the passthrough reg is already canonical.
+(rule 2 (lower (ireduce ty @ (fits_in_16 _) src))
+    (if-let true (wide_clean (ty_bits ty) src))
+    (value_regs_get src 0))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 128): `ireduce (ushr x, k)` is one `ubfm`
+;; (`ubfx`) instead of `lsr` + `uxtb`/`uxth`. A single-use shift's own `lsr`
+;; dies when its result goes unread; a shared shift trades the `uxtb` for
+;; the same `ubfm` count.
+(rule 3 (lower (ireduce ty @ (fits_in_16 _)
+               (ushr (fits_in_64 s_ty) x (iconst _ (u64_from_imm64 k)))))
+    (if-let true (narrowext_on 128))
+    (if-let true (u64_lt (u64_wrapping_add k (u64_wrapping_sub (ty_bits_u64 ty) 1))
+                        (ty_bits_u64 s_ty)))
+    (if-let immr (bf_imm_u8 k))
+    (if-let imms (bf_imm_u8 (u64_wrapping_sub (u64_wrapping_add k (ty_bits_u64 ty)) 1)))
+    (ubfm (operand_size s_ty) (put_in_reg x) immr imms))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 128): `ireduce (load)` read only here
+;; narrows to the matching `uload` — the wide load's `uxtb`/`uxth` dies.
+(rule 4 (lower (ireduce ty @ (fits_in_16 _)
+               l @ (load _ (little_or_native_endian flags) address offset)))
+    (if-let true (narrowext_on 128))
+    (if-let inst (is_sinkable_inst l))
+    (let ((_ Unit (sink_inst inst)))
+      (aarch64_uload ty (amode ty address offset) flags)))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 256): chained narrow reductions —
+;; `ireduce.i8 (ireduce.i16 x)` extends `x` once; the intermediate
+;; `uxth`/`uxtb` dies when the inner result goes unread elsewhere.
+(rule 5 (lower (ireduce ty @ (fits_in_16 _) (ireduce _ x)))
+    (if-let true (narrowext_on 256))
+    (extend (value_regs_get x 0) false (ty_bits ty) 32))
+
 ;;;; Rules for `fcmp` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule 4 (lower (fcmp ty @ (multi_lane _ _) (fcmp_zero_cond_not_eq cond) x y))
@@ -3029,6 +3083,24 @@
                        rn @ (u64_from_iconst 1)
                        rm @ (maybe_uextend (icmp _ ccB u v))))
       (ccmp_sel_out 3 ty cond rn rm ccB u v))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 256): narrow `select` arms that are
+;; `ireduce`s select the wide registers directly — `csel` of the sources
+;; keeps the same low byte, the arm's `uxtb`/`uxth` dies when unused
+;; elsewhere, and the result is modelled dirty either way.
+(rule 5 (lower (select (fits_in_16 ty) cond
+                       (ireduce _ rn @ (value_type (fits_in_64 _))) rm))
+  (if-let true (narrowext_on 256))
+  (lower_select ty (is_nonzero_cmp cond) rn rm))
+(rule 6 (lower (select (fits_in_16 ty) cond rn
+                       (ireduce _ rm @ (value_type (fits_in_64 _)))))
+  (if-let true (narrowext_on 256))
+  (lower_select ty (is_nonzero_cmp cond) rn rm))
+(rule 7 (lower (select (fits_in_16 ty) cond
+                       (ireduce _ rn @ (value_type (fits_in_64 _)))
+                       (ireduce _ rm @ (value_type (fits_in_64 _)))))
+  (if-let true (narrowext_on 256))
+  (lower_select ty (is_nonzero_cmp cond) rn rm))
 
 (rule (lower (select ty cond rn rm))
   (lower_select ty (is_nonzero_cmp cond) rn rm))
@@ -3488,6 +3560,38 @@
        (istore16 (little_or_native_endian flags) value address offset))
       (side_effect
        (aarch64_store16 (amode $I16 address offset) flags value)))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 128): a byte/halfword store of an
+;; `ireduce` reads only the low field — store the wide source's register
+;; directly; a single-use truncate's `uxtb`/`uxth` then dies with it.
+(rule 1 (lower
+       (store (little_or_native_endian flags)
+              (and (value_type $I8)
+                   (ireduce _ x @ (value_type (fits_in_64 _))))
+              address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (put_in_reg x))))
+(rule 1 (lower
+       (store (little_or_native_endian flags)
+              (and (value_type $I16)
+                   (ireduce _ x @ (value_type (fits_in_64 _))))
+              address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (put_in_reg x))))
+(rule 1 (lower
+       (istore8 (little_or_native_endian flags)
+                (ireduce _ x @ (value_type (fits_in_64 _))) address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (put_in_reg x))))
+(rule 1 (lower
+       (istore16 (little_or_native_endian flags)
+                 (ireduce _ x @ (value_type (fits_in_64 _))) address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (put_in_reg x))))
 (rule (lower
        (istore32 (little_or_native_endian flags) value address offset))
       (side_effect

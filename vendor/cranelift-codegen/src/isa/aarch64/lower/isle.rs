@@ -88,7 +88,14 @@ pub(crate) fn narrowext_enabled() -> bool {
 /// 1 = the extra cleanliness facts, 2 = return extension, 4 = `uextend`
 /// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`,
 /// 32 = narrow `ushr`-of-clean and `ushr`-operand fusion on narrow
-/// `bor`/`band`/`bxor`.
+/// `bor`/`band`/`bxor`, 64 = narrow `ireduce` passthrough when the wide
+/// source is already clean (`wide_uext_clean`), 128 = `ireduce` source
+/// fusions (`ushr`+`ireduce` → `ubfm`, `load`+`ireduce` → narrow `uload`,
+/// `istore8`/`store` of `ireduce` → store the wide reg), 256 = `ireduce`
+/// consumer sinks: `ushr` by a constant → `ubfx` on the wide register,
+/// chained narrow `ireduce`s extend once, and `select` arms read the
+/// wide source directly (the low bits are exact and the result is
+/// modelled dirty anyway).
 /// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -245,6 +252,86 @@ fn bf_known_zero(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> 
             arg,
         } => bf_known_zero(dfg, *arg, budget),
         _ => 0,
+    }
+}
+
+/// PLIRON: bits of `v`'s register above `bits` are all zero — the wide
+/// operand of a narrow `ireduce` that needs no `uxtb`/`uxth` of its own
+/// (`PLIRON_NARROWEXT` bit 64). `narrow_uext_clean` answers this at the
+/// value's own i8/i16 width; this answers it for the wider (i16/i32/i64)
+/// sources. `budget` bounds the walk; running out answers "dirty".
+pub(crate) fn wide_uext_clean(
+    dfg: &crate::ir::DataFlowGraph,
+    v: Value,
+    bits: u32,
+    budget: &mut u32,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    if dfg.value_type(v).bits() <= bits {
+        return false;
+    }
+    let Some(inst) = dfg.value_def(v).inst() else {
+        return false;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) >> bits == 0,
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => true,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            dfg.value_type(*arg).bits() <= bits
+                || wide_uext_clean(dfg, *arg, bits, budget)
+        }
+        // A narrow `ireduce`/`black_box` materializes `uxtb`/`uxth`, so the
+        // register is clean at the value's own width; clean above a smaller
+        // `bits` only when the source already is.
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce | Opcode::BlackBox,
+            arg,
+        } => wide_uext_clean(dfg, *arg, bits, budget),
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let [a, b] = *args;
+            wide_uext_clean(dfg, a, bits, budget) || wide_uext_clean(dfg, b, bits, budget)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            let [a, b] = *args;
+            wide_uext_clean(dfg, a, bits, budget) && wide_uext_clean(dfg, b, bits, budget)
+        }
+        // `x >> k` with a constant `k` leaves `ty_bits - k` live bits; the
+        // whole register is clean when that fits under `bits`.
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args,
+        } => {
+            let [x, k] = *args;
+            let _ = x;
+            let Some(k) = iconst_bits(dfg, k) else {
+                return false;
+            };
+            let ty_bits = dfg.value_type(v).bits() as u64;
+            k < ty_bits && ty_bits - k <= bits as u64
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select | Opcode::SelectSpectreGuard,
+            args,
+        } => {
+            let [_, a, b] = *args;
+            wide_uext_clean(dfg, a, bits, budget) && wide_uext_clean(dfg, b, bits, budget)
+        }
+        _ => false,
     }
 }
 
@@ -1303,6 +1390,16 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     fn narrowext_clean(&mut self, val: Value) -> bool {
         let mut budget = 16;
         narrowext_part(1) && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 64): `val`'s register is already zero
+    /// above `bits`, so a narrow `ireduce` of it needs no `uxtb`/`uxth`.
+    fn wide_clean(&mut self, bits: u64, val: Value) -> bool {
+        let mut budget = 16;
+        let Ok(bits) = u32::try_from(bits) else {
+            return false;
+        };
+        narrowext_part(64) && wide_uext_clean(self.lower_ctx.dfg(), val, bits, &mut budget)
     }
 
     /// PLIRON (`PLIRON_CMN`, default on): `cmp x, -c` -> `cmn x, c`.

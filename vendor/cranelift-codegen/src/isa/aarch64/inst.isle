@@ -4005,6 +4005,10 @@
 (extern constructor narrowext_on narrowext_on)
 (decl pure narrowext_clean (Value) bool)
 (extern constructor narrowext_clean narrowext_clean)
+;; `wide_clean bits v`: `v`'s register is already zero above `bits`, so a
+;; narrow `ireduce` of it needs no `uxtb`/`uxth` of its own.
+(decl pure wide_clean (u64 Value) bool)
+(extern constructor wide_clean wide_clean)
 
 ;; PLIRON (`PLIRON_BFUSE`, default on): bitfield fusion — `(x>>k)&m`,
 ;; `(x&m)<<k`, and `bor` field assembly → `ubfx`/`ubfiz`/`bfi`.
