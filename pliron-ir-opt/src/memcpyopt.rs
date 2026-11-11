@@ -509,9 +509,40 @@ fn try_forward(
     // rebase — so the copy must dominate it (a path skipping `m` could
     // miss writers entirely) and nothing may touch its range in `dst`
     // in between (a write would substitute bytes `tmp` never held).
-    // Readers before `m` are already covered by the writer windows.
     for &(r, ro, rh) in &readers {
         if op_dominates(ctx, st, dom, f, r, m) {
+            // A reader before `m` sees `dst`'s new bytes early. That is
+            // the correct value only where a writer covering the byte
+            // dominates `r`: a byte covered by some writer but not by
+            // one dominating `r` may hold defined leftovers from an
+            // earlier dynamic visit (a loop wrap — `r` dominates `m`,
+            // so `m` can reach `r` through a back edge whose `dst`
+            // touches sit in no writer window), and the rebase would
+            // swap them for `dst`'s own bytes. Bytes no writer covers
+            // are always alloca-undef — refining them to `dst`'s bytes
+            // is legal.
+            let mut left = vec![(ro, rh)];
+            for &(w, lo, hi) in &writers {
+                if !op_dominates(ctx, st, dom, f, w, r) {
+                    continue;
+                }
+                left = left
+                    .iter()
+                    .flat_map(|&(a, b)| {
+                        [
+                            (a < lo.min(b)).then_some((a, lo.min(b))),
+                            (hi.max(a) < b).then_some((hi.max(a), b)),
+                        ]
+                    })
+                    .flatten()
+                    .collect();
+            }
+            let stale = left
+                .iter()
+                .any(|&(a, b)| writers.iter().any(|&(_, lo, hi)| a < hi && lo < b));
+            if stale {
+                why!("pre-copy read of possibly-stale bytes");
+            }
             continue;
         }
         if !op_dominates(ctx, st, dom, f, m, r) {
@@ -1232,5 +1263,90 @@ pub fn run_byval(ctx: &mut Context, st: &mut State) {
         if pliron_cfg::tracing_on() {
             tracing::info!(target: "pliron::stats","byvalhome {}: {n} by-value args homed", st.cgu)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline::{blocks, ops};
+    use pliron::builtin::ops::ModuleOp;
+    use pliron::irfmt::parsers::spaced;
+    use pliron::op::Op;
+    use pliron::parsable::parse_from_str;
+    use pliron_llvm::ops::{CallIntrinsicOp, FuncOp};
+
+    /// Parse `input`; register the memcpy in `st.intrinsics` and the two
+    /// 8-byte allocas in `st.allocas` (builder-side tables the parser
+    /// leaves empty). Returns (func, memcpy op).
+    fn fixture(input: &str, st: &mut State, ctx: &mut Context) -> (Ptr<Operation>, Ptr<Operation>) {
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let f = blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .unwrap();
+        let mut m = None;
+        for b in blocks(ctx, f) {
+            for o in ops(ctx, b) {
+                if Operation::is_op::<AllocaOp>(o, ctx) {
+                    st.allocas.insert(o.deref(ctx).get_result(ctx, 0), (8, 8));
+                }
+                if Operation::is_op::<CallIntrinsicOp>(o, ctx) {
+                    st.intrinsics.insert(o, "llvm.memcpy".to_string());
+                    st.consts.insert(
+                        o.deref(ctx).get_operand(ctx, 2),
+                        crate::state::ConstVal::Bits(8),
+                    );
+                    m = Some(o);
+                }
+            }
+        }
+        (f, m.unwrap())
+    }
+
+    const HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;
+            llvm.br ^loop()
+          ^loop():
+    "#;
+    const TAIL: &str = "        llvm.cond_br if flag ^loop() else ^exit()\n          ^exit():\n            llvm.return\n        }\n    }\n";
+    const MC: &str = "            m = llvm.call_intrinsic @\"llvm.memcpy\" (dst, tmp, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n";
+
+    /// Loop-carried stale read: the load sits before the writer, so on
+    /// iteration 2+ it reads last iteration's store — defined bytes the
+    /// rebase would swap for `dst`'s own bytes (the post-copy `dst`
+    /// store on the wrap path lands in no window). Must refuse.
+    #[test]
+    fn stale_pre_copy_read_refused() {
+        let input = format!(
+            "{HEAD}            r = llvm.load tmp : builtin.integer i64;\n            llvm.store *tmp <- v;\n{MC}            llvm.store *dst <- v;\n{TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// Same loop with the load after the store: the covering writer
+    /// dominates the read, so the rebase hands it the same bytes.
+    #[test]
+    fn covered_pre_copy_read_forwarded() {
+        let input = format!(
+            "{HEAD}            llvm.store *tmp <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{MC}            llvm.store *dst <- v;\n{TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
     }
 }
