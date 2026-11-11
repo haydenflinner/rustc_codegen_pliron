@@ -166,6 +166,15 @@ html-rewriter 0.978* — `history/2026-11-11-loopdel-countdown.md`.
 (NEON `sub`/`cmhi`/`and`/`shl`/`orr.16b`); held-out A/B geomean
 1.010 [0.993,1.042] toward faster —
 `history/2026-11-11-loopvec-mixed-band.md`.
+`PLIRON_INLINE_WARMCALLS=3` is default-on (b1b9413 + dc32cd2): a
+warm-call-sparse call-carrier earns the loop bonus when its warm body
+alone fits the base limit and its total growth passes the `fanin`
+bound. That inlines brotli's `EvaluateNode` (18 calls, 17 of them cold
+`panic_bounds_check` scaffolding, 3 callers — LLVM inlines it, we kept
+it out-of-line at ~6% self-time) while regex-syntax's `bump`/`char`/
+`peek` stay out. Held-out A/B `w3/pliron`: rust-compression 0.944
+[0.935,0.958], geomean 0.998 [0.974,1.008]; binary sizes neutral
+except the `regex` crate +0.8%.
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
