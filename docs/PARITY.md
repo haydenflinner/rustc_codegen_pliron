@@ -203,7 +203,15 @@ W-j` when the wrapped and unwrapped orderings provably agree
 (`j + k' ≤ W` / `k' ≤ j`); a dirty operand is still widened first, so
 no cleanliness proof is needed. −886 `uxtb`/`uxth` and −1,510
 instructions on rust-html-rewriter's benchmark binary (`__text`
-−6,144 B); residual `uxtb→cmp` sites 1,462 → 632.
+−6,144 B); residual `uxtb→cmp` sites 1,462 → 632. The narrow-clean
+oracle gained an `ishl` arm (`bool << k` — lowercase-style idioms —
+is clean when the source's bits at/above `width-k` are known zero) and
+the narrow-`icmp`-vs-imm path now consults it (c13494c; −297 more
+extends on the same binary). Bit 1024 also folds the `br_table`
+bounds check on a narrow `(c−s) mod W` index — `uextend (iadd c, -s)`
+becomes `sub c, s; cmp c-s, N` when `s + N ≤ W` since wrap-around
+indices land ≥N either way (84c22f2; 26 masked-bound sites folded on
+the benchmark CGUs).
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
