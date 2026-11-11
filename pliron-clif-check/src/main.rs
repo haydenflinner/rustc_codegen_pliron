@@ -290,7 +290,7 @@ fn with_pipe<R>(
         _,
         rustc_hash::FxHashMap<_, _>,
         pliron::cols::ColMap<_, _>,
-        rustc_hash::FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
+        rustc_hash::FxHashMap<(cranelift_codegen::ir::Inst, u32), u64>,
         _,
     ) = Default::default();
     // Region-scoped facts (`; diffcheck-bregion/rparent/rnn:`): regions
@@ -326,11 +326,13 @@ fn with_pipe<R>(
     // call operand bounded for dumps without one.
     use cranelift_codegen::ir::instructions::CallInfo;
     if !facts.nocap.is_empty() {
-        let set: rustc_hash::FxHashSet<(u32, u32)> = facts
-            .nocap
-            .iter()
-            .map(|(r, a)| (r.index() as u32, *a))
-            .collect();
+        // The callee's several sites can carry different extents — keep
+        // the widest recorded one per position.
+        let mut extents: rustc_hash::FxHashMap<(u32, u32), u64> = Default::default();
+        for &(r, a, ext) in &facts.nocap {
+            let e = extents.entry((r.index() as u32, a)).or_insert(ext);
+            *e = (*e).max(ext);
+        }
         for b in clctx.func.layout.blocks() {
             for i in clctx.func.layout.block_insts(b) {
                 let info = clctx.func.dfg.insts[i].analyze_call(
@@ -339,8 +341,8 @@ fn with_pipe<R>(
                 );
                 if let CallInfo::Direct(fr, cargs) | CallInfo::DirectWithSig(fr, _, cargs) = info {
                     for k in 0..cargs.len() {
-                        if set.contains(&(fr.index() as u32, k as u32)) {
-                            e7.insert((i, k as u32));
+                        if let Some(&ext) = extents.get(&(fr.index() as u32, k as u32)) {
+                            e7.insert((i, k as u32), ext);
                         }
                     }
                 }
@@ -355,7 +357,7 @@ fn with_pipe<R>(
                     let adj =
                         usize::from(matches!(op, Opcode::CallIndirect | Opcode::TryCallIndirect));
                     for k in adj..clctx.func.dfg.inst_args(i).len() {
-                        e7.insert((i, (k - adj) as u32));
+                        e7.insert((i, (k - adj) as u32), u64::MAX);
                     }
                 }
             }

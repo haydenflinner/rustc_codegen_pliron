@@ -294,8 +294,16 @@ pub struct CallInfo {
     /// Per-operand `captures(none)` flags (indexed like the call's operand
     /// list), deduced by rustc from the callee's MIR. A non-captured pointer
     /// can't outlive the call, so slotmerge treats it as a bounded use
-    /// rather than a function-end escape.
+    /// rather than a function-end escape. The sret out-pointer is kept out
+    /// of this list (`sret_nocap` below): SROA's `copyable_arg` reads a
+    /// `nocap` mark as "a fresh copy is unobservable", which is backwards
+    /// for a pointer the callee *returns through*.
     pub nocap: Option<Box<[bool]>>,
+    /// The sret out-pointer is a bounded use (`deduced[0].captures_none`):
+    /// the callee writes the return through it and can't retain it.
+    /// CLIF-level consumers (slotprom/slotmerge) may sync the out-slot's
+    /// fields around the call instead of pinning it to memory.
+    pub sret_nocap: bool,
     /// Per-operand `(size, align)` for pointer args with a sized pointee —
     /// `&T`/`&mut T` (Direct) cover `size_of::<T>()` bytes at `T`'s align,
     /// `Indirect` params cover the arg's own layout. Raw pointers get none:

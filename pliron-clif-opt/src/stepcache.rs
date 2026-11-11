@@ -653,7 +653,7 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
             .map(|(k, v)| (rep_of(&k), rep_of(v))),
     );
     seq_hash(&mut h, p.lifetimes.iter());
-    seq_hash(&mut h, p.nocap.iter());
+    seq_hash(&mut h, p.nocap.iter().map(|(&k, &v)| (k, v)));
     seq_hash(&mut h, p.edge_kills.iter());
     seq_hash(&mut h, p.prof.iter());
     // Steps can observe the function's identity: `tailrec` matches

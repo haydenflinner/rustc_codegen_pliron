@@ -728,7 +728,7 @@ pub fn isolated(
     cfrozen: &FxHashMap<FuncRef, u64>,
     scoped: &FxHashSet<Value>,
 ) -> FxHashSet<Root> {
-    isolated_escapes(func, noalias, ps, cfrozen, &FxHashSet::default(), scoped).0
+    isolated_escapes(func, noalias, ps, cfrozen, &FxHashMap::default(), scoped).0
 }
 
 /// `isolated` plus, for every rejected root, the blocks holding its
@@ -752,7 +752,7 @@ pub fn isolated_escapes(
     noalias: &FxHashSet<Value>,
     ps: &VMap<Value>,
     _cfrozen: &FxHashMap<FuncRef, u64>,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     scoped: &FxHashSet<Value>,
 ) -> (
     FxHashSet<Root>,
@@ -786,7 +786,7 @@ pub fn isolated_escapes_x(
     noalias: &FxHashSet<Value>,
     ps: &VMap<Value>,
     _cfrozen: &FxHashMap<FuncRef, u64>,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     scoped: &FxHashSet<Value>,
     trap_benign: bool,
 ) -> (
@@ -922,7 +922,7 @@ pub fn isolated_escapes_x(
                             | InstructionData::TryCallIndirect { .. } => k.checked_sub(1),
                             _ => Some(k),
                         }
-                        .is_some_and(|ai| nocap.contains(&(i, ai as u32)));
+                        .is_some_and(|ai| nocap.contains_key(&(i, ai as u32)));
                     if !bounded {
                         ncc_bad.insert(r);
                     }
@@ -983,7 +983,7 @@ pub fn provescapes(
     func: &Function,
     cands: &FxHashSet<Value>,
     pf: &crate::proots::Facts,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
 ) -> Option<ProvEsc> {
     if cands.is_empty() {
         return Some(ProvEsc::default());
@@ -1069,11 +1069,11 @@ pub fn provescapes(
                 } else if op.is_call() {
                     match data {
                         InstructionData::Call { .. } => {
-                            !nocap.contains(&(i, k as u32))
+                            !nocap.contains_key(&(i, k as u32))
                         }
                         InstructionData::CallIndirect { .. }
                         | InstructionData::TryCallIndirect { .. } => {
-                            k == 0 || !nocap.contains(&(i, (k - 1) as u32))
+                            k == 0 || !nocap.contains_key(&(i, (k - 1) as u32))
                         }
                         // Tail calls hand the callee the frame; try_call
                         // splits its operand list across call and edge
@@ -1509,7 +1509,7 @@ pub fn run(
     rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
 ) -> usize {
     run_deref(func, cfg, pf, ps, noalias, scoped_na, inv_insts, ofrozen, breg, rpar, nw, cfrozen, nocap, &FxHashMap::default())
 }
@@ -1530,7 +1530,7 @@ pub fn run_deref(
     rpar: &pliron::cols::ColMap<Region, Region>,
     nw: &FxHashMap<FuncRef, bool>,
     cfrozen: &FxHashMap<FuncRef, u64>,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     deref: &FxHashMap<Value, (u64, bool)>,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {

@@ -27,7 +27,7 @@
 //! Each case asserts the temp is NOT folded onto the long-lived slot.
 
 use cranelift_codegen::ir::{Function, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn parse(src: &str) -> Function {
     cranelift_reader::parse_functions(src).unwrap().remove(0)
@@ -42,7 +42,7 @@ fn slot_of(f: &Function, v: Value) -> StackSlot {
 }
 
 fn run(f: &mut Function) {
-    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashSet::default());
+    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashMap::default());
 }
 
 /// ss0 (16 bytes) is written in full before the loop; each trip stores

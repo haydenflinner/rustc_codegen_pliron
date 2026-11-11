@@ -58,7 +58,7 @@ fn field_load_leaves_the_loop_body() {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashSet::default(),
+        &FxHashMap::default(),
     );
     assert_eq!(loads_in(&f, 2), 0, "load stayed in the body:\n{}", f.display());
     let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());

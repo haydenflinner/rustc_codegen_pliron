@@ -1,5 +1,5 @@
 use pliron_clif_opt::slotmerge;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -13,7 +13,7 @@ fn main() {
     let mut funcs = cranelift_reader::parse_functions(&src).unwrap();
     let nowrite = FxHashMap::default();
     let lifetimes = Vec::new();
-    let nocap = FxHashSet::default();
+    let nocap = FxHashMap::default();
     for f in &mut funcs {
         let n = slotmerge::run(f, &nowrite, &lifetimes, &nocap);
         eprintln!("merged {n} in {}", f.name);

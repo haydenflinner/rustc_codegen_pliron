@@ -247,6 +247,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 cc: None,
                 tail: false,
                 nocap: None,
+                sret_nocap: false,
                 arg_extent: None,
                 arg_noalias: None,
                 arg_byval_ro: None,
@@ -1244,6 +1245,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let mut nals = vec![false; full.len()];
         let mut ros = vec![false; full.len()];
         let (mut any_nc, mut any_ex, mut any_nal, mut any_ro) = (false, false, false, false);
+        let mut sret_cap = false;
         if let Some(abi) = fn_abi {
             use rustc_target::callconv::PassMode;
             let mut j = usize::from(return_slot.is_indirect());
@@ -1256,6 +1258,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 );
                 exts[0] = e;
                 any_ex |= e.0 > 0;
+                // `deduced[0]` is the return place: a non-captured sret
+                // pointer is a bounded write into the caller's slot, so
+                // slotprom can sync fields around the call rather than
+                // pinning the out-buffer to memory. It must NOT join
+                // `nocap`: SROA's copyable_arg reads a nocap mark as "a
+                // fresh copy is unobservable" and would hand the callee a
+                // copy of the out-buffer — the return never lands.
+                sret_cap = deduced
+                    .get(0)
+                    .is_some_and(|d| d.captures_none(self.tcx, env, abi.ret.layout.ty));
             }
             for (ai, a) in abi.args.iter().enumerate() {
                 let n = match &a.mode {
@@ -1350,6 +1362,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             info.foreign = foreign;
             info.cc = cc;
             info.nocap = any_nc.then(|| nc.into_boxed_slice());
+            info.sret_nocap = sret_cap;
             info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
             info.arg_noalias = any_nal.then(|| nals.into_boxed_slice());
             info.arg_byval_ro = any_ro.then(|| ros.into_boxed_slice());

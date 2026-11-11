@@ -72,7 +72,7 @@ fn field_load_carried_around_the_loop() {
     let pf = pliron_clif_opt::proots::facts_cfg(&f, &cfg);
     let ps = pliron_clif_opt::proots::alias_of(&pf);
     let noalias: FxHashSet<_> = [v1].into_iter().collect();
-    let nocap: FxHashSet<(Inst, u32)> = [(call, 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(call, 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     let deref: FxHashMap<_, (u64, bool)> = [(v1, (16, true))].into_iter().collect();
     pliron_clif_opt::loadfwd::run_deref(
         &mut f,
@@ -150,7 +150,7 @@ fn load_before_clobbering_call_in_reentered_block_stays() {
     let pf = pliron_clif_opt::proots::facts_cfg(&f, &cfg);
     let ps = pliron_clif_opt::proots::alias_of(&pf);
     let noalias: FxHashSet<_> = [v0].into_iter().collect();
-    let nocap: FxHashSet<(Inst, u32)> = calls.iter().map(|&c| (c, 0)).collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = calls.iter().map(|&c| ((c, 0), u64::MAX)).collect();
     let deref: FxHashMap<_, (u64, bool)> = [(v0, (24, true))].into_iter().collect();
     pliron_clif_opt::loadfwd::run_deref(
         &mut f,

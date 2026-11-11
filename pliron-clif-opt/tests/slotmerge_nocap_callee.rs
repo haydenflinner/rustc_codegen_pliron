@@ -6,7 +6,7 @@
 //! only an un-annotated copy survives.
 
 use cranelift_codegen::ir::{Block, Function, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 const SRC: &str = "function %t() {
     ss0 = explicit_slot 352, align = 8
@@ -41,7 +41,7 @@ fn copied_call_keeps_callee_nocap() {
     // The annotated original: block1's call, then dropped from the layout.
     let b1 = Block::from_u32(1);
     let orig = f.layout.block_insts(b1).nth(1).unwrap();
-    let nocap: FxHashSet<_> = [(orig, 0u32)].into_iter().collect();
+    let nocap: FxHashMap<_, u64> = [(orig, 0u32)].into_iter().map(|k| (k, u64::MAX)).collect();
     for i in f.layout.block_insts(b1).collect::<Vec<_>>() {
         f.layout.remove_inst(i);
     }

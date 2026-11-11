@@ -7,7 +7,7 @@
 
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Function, Inst, Opcode};
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 // ss0 is an sret-style temp filled by `fn0`. Two paths merge before the
 // call: neither writes field +0 (its reaching value is a param fed only
@@ -53,7 +53,7 @@ fn undefined_field_gets_no_writeback() {
         .flat_map(|b| f.layout.block_insts(b))
         .find(|&i| f.dfg.insts[i].opcode() == Opcode::Call)
         .unwrap();
-    let nocap: FxHashSet<(Inst, u32)> = [(call, 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(call, 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     let cfg = ControlFlowGraph::with_function(&f);
     pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default());
     let st = stores(&f);
@@ -98,7 +98,7 @@ fn reloaded_field_gets_no_writeback() {
         .flat_map(|b| f.layout.block_insts(b))
         .find(|&i| f.dfg.insts[i].opcode() == Opcode::Call)
         .unwrap();
-    let nocap: FxHashSet<(Inst, u32)> = [(call, 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(call, 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     let cfg = ControlFlowGraph::with_function(&f);
     pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default());
     assert!(stores(&f).is_empty(), "{:?}\n{}", stores(&f), f.display());
@@ -138,7 +138,7 @@ fn copied_reload_keeps_its_writeback() {
         .flat_map(|b| f.layout.block_insts(b))
         .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Call)
         .collect();
-    let nocap: FxHashSet<(Inst, u32)> = calls.iter().map(|&c| (c, 0)).collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = calls.iter().map(|&c| ((c, 0), u64::MAX)).collect();
     let cfg = ControlFlowGraph::with_function(&f);
     pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default());
     // ss1's writeback before `fn1` (the copied reload) must remain.

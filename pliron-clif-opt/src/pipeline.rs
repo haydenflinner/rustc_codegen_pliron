@@ -225,7 +225,7 @@ pub struct Pipe<'a> {
     /// kept with the original's site and the null folds answer by
     /// dominance at the use.
     pub site_facts: jumpthread::SiteFacts,
-    pub nocap: &'a FxHashSet<(Inst, u32)>,
+    pub nocap: &'a FxHashMap<(Inst, u32), u64>,
     /// `PLIRON_SM_MARKFLOW`: end markers re-expressed at pipeline entry as
     /// kills on incoming edges, (slot, terminator, destination index) —
     /// they survive passes that delete the marker's block (see
@@ -1261,11 +1261,11 @@ fn corpus_dump(p: &mut Pipe) {
     // map so replays can report real callee names.
     let f = &p.clctx.func;
     let mut nc: Vec<String> = Vec::new();
-    for &(i, a) in p.nocap.iter() {
+    for (&(i, a), &ext) in p.nocap.iter() {
         use cranelift_codegen::ir::instructions::CallInfo;
         let info = f.dfg.insts[i].analyze_call(&f.dfg.value_lists, &f.dfg.exception_tables);
         if let CallInfo::Direct(fr, _) | CallInfo::DirectWithSig(fr, _, _) = info {
-            nc.push(format!("fn{}:{a}", fr.index()));
+            nc.push(format!("fn{}:{a}:{ext}", fr.index()));
         }
     }
     nc.sort();
@@ -2636,7 +2636,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         }
     }
     let breg_now = live_block_region(p);
-    let no_nocap = FxHashSet::default();
+    let no_nocap = FxHashMap::default();
     let k = licm::run(
         &mut p.clctx.func,
         an,
@@ -5195,7 +5195,7 @@ mod tests {
     let prof: FxHashMap<Block, u64> = Default::default();
     let region_parent: pliron::cols::ColMap<Ptr<BasicBlock>, Ptr<BasicBlock>> =
         Default::default();
-    let nocap: FxHashSet<(Inst, u32)> = Default::default();
+    let nocap: FxHashMap<(Inst, u32), u64> = Default::default();
     let mut nonnull = nonnull;
     let mut derived = VMap::default();
     let mut frozen = FxHashMap::default();

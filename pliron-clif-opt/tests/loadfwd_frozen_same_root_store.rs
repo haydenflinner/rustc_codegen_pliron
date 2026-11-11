@@ -66,7 +66,7 @@ fn same_root_store_kills_region_frozen_loc() {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashSet::default(),
+        &FxHashMap::default(),
     );
     assert_eq!(loads(&after), 2, "the post-store reload must stay:\n{}", after.display());
     let cfgc = Config {

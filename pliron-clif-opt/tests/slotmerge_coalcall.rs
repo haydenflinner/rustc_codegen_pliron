@@ -4,7 +4,7 @@
 //! `Drop` value built in a temporary and moved into its binding.
 
 use cranelift_codegen::ir::{Function, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn slot_of(f: &Function, v: u32) -> StackSlot {
     let v = f.dfg.resolve_aliases(Value::from_u32(v));
@@ -22,7 +22,7 @@ fn run(src: &str) -> Function {
         std::env::set_var("PLIRON_SM_COALCALL", "1");
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &[], &FxHashSet::default(), &[]);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &[], &FxHashMap::default(), &[]);
     f
 }
 

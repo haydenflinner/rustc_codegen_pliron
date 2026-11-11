@@ -1542,9 +1542,10 @@ pub struct OwnedFacts {
     pub nowrite: FxHashMap<FuncRef, bool>,
     pub self_name: Option<String>,
     pub derived: VMap<Value>,
-    /// `(FuncRef, arg-index)` pairs a `; diffcheck-nocap:` header records;
-    /// applied to every direct callsite of that callee on replay.
-    pub nocap: Vec<(FuncRef, u32)>,
+    /// `(FuncRef, arg-index, extent)` triples a `; diffcheck-nocap:`
+    /// header records; applied to every direct callsite of that callee
+    /// on replay (`u64::MAX` = unknown = whole slot).
+    pub nocap: Vec<(FuncRef, u32, u64)>,
     /// `FuncRef -> callee symbol` from a `; diffcheck-names:` header.
     pub names: Vec<(FuncRef, String)>,
     /// `; diffcheck-lifetimes:` markers as `(slots, anchor inst
@@ -1620,10 +1621,17 @@ impl OwnedFacts {
         for line in text.lines() {
             if let Some(list) = line.strip_prefix("; diffcheck-nocap:") {
                 for item in list.split(',').filter(|x| !x.is_empty()) {
-                    if let Some((f, a)) = item.trim().split_once(':')
+                    // `fn{funcref}:{arg}` or `fn{funcref}:{arg}:{extent}`;
+                    // a missing extent is the conservative `u64::MAX`.
+                    let mut it = item.trim().split(':');
+                    if let (Some(f), Some(a)) = (it.next(), it.next())
                         && let (Some(r), Ok(a)) = (fref(f), a.parse())
                     {
-                        out.nocap.push((r, a));
+                        let ext = it
+                            .next()
+                            .and_then(|e| e.parse().ok())
+                            .unwrap_or(u64::MAX);
+                        out.nocap.push((r, a, ext));
                     }
                 }
             } else if let Some(list) = line.strip_prefix("; diffcheck-names:") {

@@ -50,7 +50,7 @@ fn run(deref: bool) -> (Function, Function) {
     }
     // The call's arg is `nocapture`: `v0` stays an `ncc` root.
     let call = f.layout.block_insts(Block::from_u32(3)).next().unwrap();
-    let nocap: FxHashSet<_> = [(call, 0u32)].into_iter().collect();
+    let nocap: FxHashMap<_, u64> = [(call, 0u32)].into_iter().map(|k| (k, u64::MAX)).collect();
     pliron_clif_opt::loadfwd::run_deref(
         &mut f,
         &cfg,

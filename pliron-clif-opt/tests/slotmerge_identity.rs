@@ -5,14 +5,14 @@
 //! range ended earlier is fine — nothing observes that one's address.)
 
 use cranelift_codegen::ir::Function;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn parse(src: &str) -> Function {
     cranelift_reader::parse_functions(src).unwrap().remove(0)
 }
 
 fn merge(f: &mut Function) -> usize {
-    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashSet::default())
+    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashMap::default())
 }
 
 /// The slot a `stack_addr` result names after merging.

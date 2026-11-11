@@ -233,7 +233,7 @@ pub fn run(
     let mut domtree = DominatorTree::with_function(func, &cfg);
     let mut ps = loadfwd::param_src(func);
     let (mut iso, mut escapes, _) =
-        loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default(), scoped_na);
+        loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashMap::default(), scoped_na);
     let eh = crate::pass_enabled("PLIRON_NOWRITE_EH");
     // Roots that only escape on blocks that can't reach `p` are still
     // isolated *at* `p`: before the first escaping use can run (the cold
@@ -447,7 +447,7 @@ pub fn run(
         uses = an.refresh_uses(func);
         ps = loadfwd::param_src(func);
         (iso, escapes, _) =
-            loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashSet::default(), scoped_na);
+            loadfwd::isolated_escapes(func, noalias, &ps, cfrozen, &FxHashMap::default(), scoped_na);
     }
     n
 }

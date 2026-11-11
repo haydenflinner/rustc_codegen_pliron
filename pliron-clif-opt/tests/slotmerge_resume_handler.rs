@@ -9,7 +9,7 @@
 //! early exit) freed a garbage pointer.
 
 use cranelift_codegen::ir::{Block, Function, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn slot_of(f: &Function, v: u32) -> StackSlot {
     let v = f.dfg.resolve_aliases(Value::from_u32(v));
@@ -29,7 +29,7 @@ fn run(src: &str, resume_block: u32) -> Function {
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let resume = f.layout.last_inst(Block::from_u32(resume_block)).unwrap();
     let kills = [(StackSlot::from_u32(u32::MAX - 1), resume, pliron_clif_opt::slotmerge::KILL_ALL)];
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &[], &FxHashSet::default(), &kills);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &[], &FxHashMap::default(), &kills);
     f
 }
 

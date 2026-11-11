@@ -61,16 +61,16 @@ fn main() {
         _,
         _,
         _,
-        rustc_hash::FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
+        rustc_hash::FxHashMap<(cranelift_codegen::ir::Inst, u32), u64>,
         _,
     ) = Default::default();
     {
         use cranelift_codegen::entity::EntityRef as _;
         use cranelift_codegen::ir::instructions::CallInfo;
-        let set: rustc_hash::FxHashSet<(u32, u32)> = facts
+        let set: rustc_hash::FxHashMap<(u32, u32), u64> = facts
             .nocap
             .iter()
-            .map(|(r, a)| (r.index() as u32, *a))
+            .map(|(r, a, e)| ((r.index() as u32, *a), *e))
             .collect();
         for b in clctx.func.layout.blocks() {
             for i in clctx.func.layout.block_insts(b) {
@@ -80,8 +80,8 @@ fn main() {
                 );
                 if let CallInfo::Direct(fr, cargs) | CallInfo::DirectWithSig(fr, _, cargs) = info {
                     for k in 0..cargs.len() {
-                        if set.contains(&(fr.index() as u32, k as u32)) {
-                            e7.insert((i, k as u32));
+                        if let Some(&e) = set.get(&(fr.index() as u32, k as u32)) {
+                            e7.insert((i, k as u32), e);
                         }
                     }
                 }

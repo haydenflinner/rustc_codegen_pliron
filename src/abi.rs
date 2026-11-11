@@ -172,6 +172,9 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                 info.nocap = (v.len() == cargs.len())
                     .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
+            // The sret out-pointer is operand 0; if dead-arg elimination
+            // dropped it there is no sret operand to sync anymore.
+            info.sret_nocap &= live.first().copied().unwrap_or(false);
             if let Some(v) = info.arg_extent.take() {
                 info.arg_extent = (v.len() == cargs.len())
                     .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
@@ -377,6 +380,7 @@ fn rewrite(
         info.exts = exts.clone();
         // `nocap`/`arg_extent` are indexed by operand position, and operand 0
         // (the sret pointer) is gone — shift the arrays left to match.
+        info.sret_nocap = false;
         if let Some(v) = info.nocap.take() {
             info.nocap = (v.len() == cargs.len()).then(|| v[1..].into());
         }

@@ -5,7 +5,7 @@
 //! between locals this way.
 
 use cranelift_codegen::ir::{Function, Inst, InstructionData, Opcode, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn slot_of(f: &Function, v: u32) -> StackSlot {
     let v = f.dfg.resolve_aliases(Value::from_u32(v));
@@ -28,12 +28,12 @@ fn run(src: &str) -> Function {
     // SAFETY: set before any config read in this test binary.
     unsafe { std::env::set_var("PLIRON_SM_COALESCE", "1") };
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
-    let nocap: FxHashSet<(Inst, u32)> = f
+    let nocap: FxHashMap<(Inst, u32), u64> = f
         .layout
         .blocks()
         .flat_map(|b| f.layout.block_insts(b))
         .filter(|&i| f.dfg.insts[i].opcode().is_call())
-        .map(|i| (i, 0))
+        .map(|i| ((i, 0), u64::MAX))
         .collect();
     pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &nocap);
     f

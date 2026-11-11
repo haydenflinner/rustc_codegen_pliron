@@ -7,7 +7,7 @@
 //! (`sql::test_append_select_multiple`: unfiltered columns, 2026-10-22).
 
 use cranelift_codegen::ir::{Function, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn parse(src: &str) -> Function {
     cranelift_reader::parse_functions(src).unwrap().remove(0)
@@ -65,7 +65,7 @@ fn check(self_loop: bool) {
     // The reader writes nothing, so passing the env doesn't escape it.
     let fr = f.dfg.ext_funcs.keys().next().unwrap();
     let nowrite: FxHashMap<_, _> = [(fr, true)].into_iter().collect();
-    pliron_clif_opt::slotmerge::run(&mut f, &nowrite, &[], &FxHashSet::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &nowrite, &[], &FxHashMap::default());
     let req = slot_of(&f, Value::from_u32(2));
     let tmp = slot_of(&f, Value::from_u32(7));
     assert_ne!(req, tmp, "the loop temp was folded onto the env-read slot:\n{}", f.display());

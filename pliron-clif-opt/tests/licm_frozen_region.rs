@@ -66,7 +66,7 @@ fn promotion_respects_operand_frozen_reads_of_the_same_location() {
         &FxHashMap::default(),
         &pliron::cols::ColMap::default(),
         &ofz,
-        &FxHashSet::default(),
+        &FxHashMap::default(),
         false,
     );
     let facts = Facts {

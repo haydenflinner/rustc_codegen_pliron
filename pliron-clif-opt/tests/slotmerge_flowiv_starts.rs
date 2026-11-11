@@ -7,7 +7,7 @@
 //! 56-byte `ErrorKind` across the entire inlined visitor loop.
 
 use cranelift_codegen::ir::{Block, Function, Inst, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 type Lifetimes = Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>;
 
@@ -33,12 +33,12 @@ fn run(src: &str, lt: impl Fn(&Function) -> Lifetimes) -> Function {
         std::env::set_var("PLIRON_SM_FLOWIV", "1");
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
-    let nocap: FxHashSet<(Inst, u32)> = f
+    let nocap: FxHashMap<(Inst, u32), u64> = f
         .layout
         .blocks()
         .flat_map(|b| f.layout.block_insts(b))
         .filter(|&i| f.dfg.insts[i].opcode().is_call())
-        .map(|i| (i, 0))
+        .map(|i| ((i, 0), u64::MAX))
         .collect();
     let lifetimes = lt(&f);
     pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &nocap);

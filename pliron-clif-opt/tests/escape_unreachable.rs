@@ -23,6 +23,6 @@ block1:
     let f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let na: FxHashSet<Value> = [Value::from_u32(0)].into_iter().collect();
     let ps = param_src(&f);
-    let (iso, esc, _) = isolated_escapes(&f, &na, &ps, &FxHashMap::default(), &FxHashSet::default(), &FxHashSet::default());
+    let (iso, esc, _) = isolated_escapes(&f, &na, &ps, &FxHashMap::default(), &FxHashMap::default(), &FxHashSet::default());
     assert!(iso.contains(&Root::V(Value::from_u32(0))), "escapes {esc:?}");
 }

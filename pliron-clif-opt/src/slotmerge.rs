@@ -1580,7 +1580,7 @@ fn info_on() -> bool {
 /// `nocapture` inference, drop glue), so carry it to every current direct
 /// call of that callee at the same arg index. A removed inst keeps its
 /// data, so the original's callee is still readable.
-fn nocap_by_callee(func: &Function, nocap: &FxHashSet<(Inst, u32)>) -> Option<FxHashSet<(Inst, u32)>> {
+fn nocap_by_callee(func: &Function, nocap: &FxHashMap<(Inst, u32), u64>) -> Option<FxHashMap<(Inst, u32), u64>> {
     if nocap.is_empty() || !pliron_cfg::env_is("PLIRON_NOCAP_CALLEE", "1") {
         return None;
     }
@@ -1588,15 +1588,23 @@ fn nocap_by_callee(func: &Function, nocap: &FxHashSet<(Inst, u32)>) -> Option<Fx
         CallInfo::Direct(fr, _) | CallInfo::DirectWithSig(fr, _, _) => Some(fr),
         _ => None,
     };
-    let facts: FxHashSet<(FuncRef, u32)> =
-        nocap.iter().filter_map(|&(i, k)| Some((callee(i)?, k))).collect();
+    // The extent travels with the fact: it is the callee arg's reachable
+    // range. Sources of the fact for the same (callee, arg) should agree,
+    // but keep the widest if they do not.
+    let mut facts: FxHashMap<(FuncRef, u32), u64> = FxHashMap::default();
+    for (&(i, k), &e) in nocap {
+        if let Some(fr) = callee(i) {
+            let f = facts.entry((fr, k)).or_insert(e);
+            *f = (*f).max(e);
+        }
+    }
     let mut out = nocap.clone();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
             if let Some(fr) = callee(i) {
                 for k in 0..func.dfg.inst_args(i).len() as u32 {
-                    if facts.contains(&(fr, k)) {
-                        out.insert((i, k));
+                    if let Some(&e) = facts.get(&(fr, k)) {
+                        out.insert((i, k), e);
                     }
                 }
             }
@@ -1609,7 +1617,7 @@ pub fn run(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
 ) -> usize {
     run_with(func, nowrite, lifetimes, nocap, &[])
 }
@@ -1619,7 +1627,7 @@ pub fn run_with(
     func: &mut Function,
     nowrite: &FxHashMap<FuncRef, bool>,
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     edge_kills: &[(StackSlot, Inst, u32)],
 ) -> usize {
     let wide = nocap_by_callee(func, nocap);
@@ -2250,7 +2258,7 @@ pub fn run_with(
                                             if !nw
                                                 && !nokeep
                                                 && !(sret && k == 0)
-                                                && !nocap.contains(&(i, k as u32))
+                                                && !nocap.contains_key(&(i, k as u32))
                                             {
                                                 escape_deep!(contains, s, i);
                                             } else if !nokeep && !(sret && k == 0) {
@@ -2275,7 +2283,7 @@ pub fn run_with(
                                         for &s in &derived[func.dfg.resolve_aliases(a)] {
                                             use_at(&mut iv, &mut uses, s, pos);
                                             reads[s.index()].push(i);
-                                            if !nocap.contains(&(i, k as u32)) {
+                                            if !nocap.contains_key(&(i, k as u32)) {
                                                 escape_deep!(contains, s, i);
                                             } else {
                                                 // As for direct calls: the
@@ -2848,7 +2856,7 @@ pub fn run_with(
                 .iter()
                 .enumerate()
                 .filter(|&(_, &a)| derived[func.dfg.resolve_aliases(a)].contains(&s))
-                .map(|(k, _)| format!("arg{k}{}", if nocap.contains(&(i, k as u32)) { ":nocap" } else { "" }))
+                .map(|(k, _)| format!("arg{k}{}", if nocap.contains_key(&(i, k as u32)) { ":nocap" } else { "" }))
                 .collect();
             eprintln!(
                 "sm-info:   {s} escapes at {}: {} [{}]",

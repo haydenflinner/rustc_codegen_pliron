@@ -56,7 +56,7 @@ block0(v0: i64):
 
 fn run(
     f: &mut Function,
-    nocap: &FxHashSet<(cranelift_codegen::ir::Inst, u32)>,
+    nocap: &FxHashMap<(cranelift_codegen::ir::Inst, u32), u64>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<BasicBlock>)>>,
 ) -> usize {
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
@@ -87,8 +87,8 @@ fn frozen_op_arg_reaches_the_underlying_noalias_root() {
     let ofz: FxHashMap<Value, Vec<(u64, _)>> = [(Value::from_u32(4), vec![(16, region)])]
         .into_iter()
         .collect();
-    let nocap: FxHashSet<(cranelift_codegen::ir::Inst, u32)> =
-        [(calls(&f)[0], 0)].into_iter().collect();
+    let nocap: FxHashMap<(cranelift_codegen::ir::Inst, u32), u64> =
+        [(calls(&f)[0], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     run(&mut f, &nocap, &ofz);
     // Both post-call loads must remain: the callee writes through v4.
     assert_eq!(loads(&f), 4, "{}", f.display());
@@ -103,8 +103,8 @@ fn frozen_op_forwarding_preserves_behavior() {
     let ofz: FxHashMap<Value, Vec<(u64, _)>> = [(Value::from_u32(4), vec![(16, region)])]
         .into_iter()
         .collect();
-    let nocap: FxHashSet<(cranelift_codegen::ir::Inst, u32)> =
-        [(calls(&after)[0], 0)].into_iter().collect();
+    let nocap: FxHashMap<(cranelift_codegen::ir::Inst, u32), u64> =
+        [(calls(&after)[0], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     run(&mut after, &nocap, &ofz);
     let noalias: FxHashSet<Value> = [Value::from_u32(0)].into_iter().collect();
     let facts = Facts {

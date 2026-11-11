@@ -42,7 +42,7 @@ fn run(f: &mut Function, breg: &FxHashMap<cranelift_codegen::ir::Block, Ptr<Basi
         &[Value::from_u32(0)].into_iter().collect(),
         &FxHashSet::default(), &FxHashSet::default(),
         ofz, breg, rpar,
-        &FxHashMap::default(), &FxHashMap::default(), &FxHashSet::default(),
+        &FxHashMap::default(), &FxHashMap::default(), &FxHashMap::default(),
     )
 }
 

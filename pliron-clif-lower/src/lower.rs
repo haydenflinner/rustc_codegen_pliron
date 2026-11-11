@@ -589,7 +589,7 @@ struct FnJob {
     // block_region); CLIF passes read it through Pipe.prof.
     prof: FxHashMap<ir::Block, u64>,
     lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>,
-    nocap: FxHashSet<(ir::Inst, u32)>,
+    nocap: FxHashMap<(ir::Inst, u32), u64>,
     stubs: rustc_hash::FxHashSet<&'static str>,
     /// `FuncId` index -> declared symbol for the fn's namespace-0
     /// `user_named_funcs` — the step cache keys those indices by
@@ -667,7 +667,7 @@ impl FnJob {
             block_region: FxHashMap::default(),
             prof: FxHashMap::default(),
             lifetimes: Vec::new(),
-            nocap: FxHashSet::default(),
+            nocap: FxHashMap::default(),
             stubs: rustc_hash::FxHashSet::default(),
             uen_syms: FxHashMap::default(),
             sh,
@@ -1680,7 +1680,7 @@ pub fn lower_module<'a>(
             let block_region: FxHashMap<ir::Block, Ptr<BasicBlock>>;
             let prof: FxHashMap<ir::Block, u64>;
             let lifetimes: Vec<(Vec<ir::StackSlot>, Option<ir::Inst>, ir::Block, bool)>;
-            let nocap: FxHashSet<(ir::Inst, u32)>;
+            let nocap: FxHashMap<(ir::Inst, u32), u64>;
             let dbg_slots: pliron_clif_opt::dbglabel::DbgSlots;
             let stubs: rustc_hash::FxHashSet<&'static str>;
             {
@@ -1723,7 +1723,7 @@ pub fn lower_module<'a>(
                     nowrite: FxHashMap::default(),
                     nounwind: FxHashSet::default(),
                     lifetimes: Vec::new(),
-                    nocap: FxHashSet::default(),
+                    nocap: FxHashMap::default(),
                     va_buf: None,
                     va_fids: std::mem::take(&mut scratch.va_fids),
                     eh_data,
@@ -2796,7 +2796,7 @@ pub fn lower_clif_wasm(
                 nowrite: FxHashMap::default(),
                 nounwind: FxHashSet::default(),
                 lifetimes: Vec::new(),
-                nocap: FxHashSet::default(),
+                nocap: FxHashMap::default(),
                 va_buf: None,
                 va_fids: std::mem::take(&mut scratch.va_fids),
                 eh_data,
@@ -3362,7 +3362,7 @@ struct FnLower<'a, 'b> {
     /// `captures(none)` for — the pointer can't outlive the call, so
     /// slotmerge bounds the use instead of escaping the slot to
     /// function end.
-    nocap: FxHashSet<(ir::Inst, u32)>,
+    nocap: FxHashMap<(ir::Inst, u32), u64>,
     /// Hidden buffer-pointer param of a C-variadic function (`pliron.va.buf`).
     va_buf: Option<ir::Value>,
     /// `__pliron_va8.<sym>` trampoline imports declared for this module.
@@ -7078,7 +7078,24 @@ impl<'a, 'b> FnLower<'a, 'b> {
         {
             for (k, &s) in csrc.iter().enumerate() {
                 if s == 0 {
-                    self.nocap.insert((inst, k as u32));
+                    self.nocap.insert((inst, k as u32), u64::MAX);
+                }
+            }
+        }
+        // The sret out-pointer (`csrc` 0) is a bounded use when the
+        // callee can't retain it — kept out of `CallInfo::nocap`, which
+        // SROA reads as "a fresh copy is unobservable" (backwards for a
+        // return slot). Its extent is the return layout (`arg_extent[0]`).
+        if info.sret_nocap {
+            for (k, &s) in csrc.iter().enumerate() {
+                if s == 0 {
+                    let ext = info
+                        .arg_extent
+                        .as_ref()
+                        .and_then(|x| x.first().map(|&(e, _)| e))
+                        .filter(|&e| e > 0)
+                        .unwrap_or(u64::MAX);
+                    self.nocap.insert((inst, k as u32), ext);
                 }
             }
         }
@@ -7091,7 +7108,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         .is_some_and(|nc| nc.get(s) == Some(&true))
                         || own.is_some_and(|o| o.contains(&(s as u32))));
                 if flagged {
-                    self.nocap.insert((inst, k as u32));
+                    // `arg_extent` bounds the bytes the callee can reach
+                    // through the operand; `u64::MAX` = unknown, sync the
+                    // whole slot.
+                    let ext = info
+                        .arg_extent
+                        .as_ref()
+                        .and_then(|x| x.get(s).map(|&(e, _)| e))
+                        .filter(|&e| e > 0)
+                        .unwrap_or(u64::MAX);
+                    self.nocap.insert((inst, k as u32), ext);
                 }
             }
         }

@@ -5,7 +5,7 @@
 //! precision, never soundness.
 
 use cranelift_codegen::ir::{Block, Function, Inst, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 type Lifetimes = Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>;
 
@@ -38,7 +38,7 @@ fn run(src: &str, lt: impl Fn(&Function) -> Lifetimes) -> Function {
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let lifetimes = lt(&f);
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default());
     f
 }
 
@@ -202,7 +202,7 @@ block3(v9: i64):
     let j = f.layout.first_inst(b1).unwrap();
     f.layout.remove_inst(j);
     f.layout.remove_block(b1);
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &kills);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills);
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "ss0 stayed live past its (forwarded) end marker:\n{}", f.display());
 }
 
@@ -255,7 +255,7 @@ block3:
         f.layout.remove_inst(j);
         f.layout.remove_block(b);
     }
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &kills);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills);
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "the chain's kill was lost:\n{}", f.display());
 }
 
@@ -299,7 +299,7 @@ block1:
         f.layout.append_inst(i, b0);
     }
     f.layout.remove_block(b1);
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &kills);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills);
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "ss0 stayed live past its merged-away marker:\n{}", f.display());
 }
 
@@ -380,7 +380,7 @@ block3(v9: i64):
             let resume = f.layout.first_inst(b3).unwrap();
             kills.push((StackSlot::from_u32(u32::MAX - 1), resume, pliron_clif_opt::slotmerge::KILL_ALL));
         }
-        pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default(), &kills);
+        pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills);
         merged.push(slot_of(&f, 1) == slot_of(&f, 2));
     }
     assert_eq!(merged, [false, true], "overlap only in the resume block should block merging until KILL_ALL");

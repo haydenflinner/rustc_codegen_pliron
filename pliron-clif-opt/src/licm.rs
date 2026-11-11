@@ -1896,7 +1896,7 @@ pub fn run(
     breg: &FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     rpar: &pliron::cols::ColMap<pliron::context::Ptr<pliron::basic_block::BasicBlock>, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     nashel: bool,
 ) -> usize {
     let mut la = LoopAnalysis::new();
@@ -2087,7 +2087,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             false,
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -2151,7 +2151,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             false,
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -2225,7 +2225,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             false,
         );
         let blk = |v: Value| {
@@ -2310,7 +2310,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             false,
         );
         let blk = |v: Value| {
@@ -2401,7 +2401,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             false,
         );
         let blk = |v: Value| {
@@ -2495,8 +2495,8 @@ mod tests {
                 &FxHashMap::default(),
                 &pliron::cols::ColMap::default(),
                 &FxHashMap::default(),
-                &FxHashSet::default(),
-                false,
+                &FxHashMap::default(),
+            false,
             );
             let flags =
                 cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -2591,7 +2591,7 @@ mod tests {
             &FxHashMap::default(),
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &FxHashMap::default(),
             true,
         );
         let blk = |v: Value| {
@@ -2692,8 +2692,8 @@ mod tests {
                 &FxHashMap::default(),
                 &pliron::cols::ColMap::default(),
                 &FxHashMap::default(),
-                &FxHashSet::default(),
-                true,
+                &FxHashMap::default(),
+            true,
             );
             func.layout
                 .inst_block(func.dfg.value_def(b).inst().unwrap())
@@ -2782,8 +2782,8 @@ mod tests {
                 &FxHashMap::default(),
                 &pliron::cols::ColMap::default(),
                 &FxHashMap::default(),
-                &FxHashSet::default(),
-                true,
+                &FxHashMap::default(),
+            true,
             );
             func.layout
                 .inst_block(func.dfg.value_def(b).inst().unwrap())

@@ -59,9 +59,9 @@ fn run(call_in_loop: bool, nocap_on: bool) -> Function {
     let v0 = Value::from_u32(0);
     let noalias: FxHashSet<Value> = [v0].into_iter().collect();
     let deref: FxHashMap<Value, (u64, bool)> = [(v0, (16, true))].into_iter().collect();
-    let mut nocap: FxHashSet<(Inst, u32)> = FxHashSet::default();
+    let mut nocap: FxHashMap<(Inst, u32), u64> = FxHashMap::default();
     if nocap_on {
-        nocap.insert((call_inst(&f), 0));
+        nocap.insert((call_inst(&f), 0), u64::MAX);
     }
     pliron_clif_opt::licm::run(
         &mut f,

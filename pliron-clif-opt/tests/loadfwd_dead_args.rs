@@ -270,7 +270,7 @@ fn dead_pair_edge_args_not_appended() {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashSet::default(),
+        &FxHashMap::default(),
     );
     cranelift_codegen::verify_function(&f, &Flags::new(settings::builder()))
         .expect("loadfwd left arity-mismatched edges");

@@ -1,25 +1,25 @@
 use cranelift_codegen::entity::EntityRef as _;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::ir::instructions::CallInfo;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 fn main() {
     let src = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
     let facts = pliron_clif_opt::diffcheck::OwnedFacts::parse(&src);
     let mut f: Function = cranelift_reader::parse_functions(&src).unwrap().remove(0);
-    let set: FxHashSet<(u32, u32)> = facts
+    let set: FxHashMap<(u32, u32), u64> = facts
         .nocap
         .iter()
-        .map(|(r, a)| (r.index() as u32, *a))
+        .map(|(r, a, e)| ((r.index() as u32, *a), *e))
         .collect();
-    let mut nocap = FxHashSet::default();
+    let mut nocap = FxHashMap::default();
     for b in f.layout.blocks() {
         for i in f.layout.block_insts(b) {
             let info = f.dfg.insts[i].analyze_call(&f.dfg.value_lists, &f.dfg.exception_tables);
             if let CallInfo::Direct(fr, cargs) | CallInfo::DirectWithSig(fr, _, cargs) = info {
                 for k in 0..cargs.len() {
-                    if set.contains(&(fr.index() as u32, k as u32)) {
-                        nocap.insert((i, k as u32));
+                    if let Some(&e) = set.get(&(fr.index() as u32, k as u32)) {
+                        nocap.insert((i, k as u32), e);
                     }
                 }
             }

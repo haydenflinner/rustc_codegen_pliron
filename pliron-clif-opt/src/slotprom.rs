@@ -194,6 +194,14 @@ fn single_pred_dests(func: &Function, cfg: &ControlFlowGraph, i: Inst) -> bool {
             .all(|bc| cfg.pred_iter(bc.block(&dfg.value_lists)).count() == 1)
 }
 
+/// Do the `ext` bytes a call operand can reach at slot offset `off`
+/// overlap the field's `[f.off, f.off + f.bytes)` range? `u64::MAX`
+/// extents cover the whole slot.
+fn covers(f: &Field, off: i64, ext: u64) -> bool {
+    let end = off.saturating_add(ext.min(i64::MAX as u64) as i64);
+    off < f.off + f.bytes && f.off < end
+}
+
 /// A zero constant of field type, materialized at the top of `b` — the
 /// "undef" reaching value for entry-block reads (the original program
 /// read uninitialized slot bytes; any value refines that).
@@ -241,7 +249,7 @@ fn undef(func: &mut Function, b: Block, ty: Type) -> Value {
 pub fn run(
     func: &mut Function,
     cfg: &ControlFlowGraph,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     keep_keyed: bool,
     dbg_slots: &crate::dbglabel::DbgSlots,
 ) -> usize {
@@ -298,7 +306,7 @@ pub fn kills_of(
 pub fn run_lt(
     func: &mut Function,
     cfg: &ControlFlowGraph,
-    nocap: &FxHashSet<(Inst, u32)>,
+    nocap: &FxHashMap<(Inst, u32), u64>,
     keep_keyed: bool,
     dbg_slots: &crate::dbglabel::DbgSlots,
     kills: &[Kill],
@@ -343,9 +351,11 @@ pub fn run_lt(
     if keep_keyed {
         bad.extend(func.sized_stack_slots.iter().filter(|(_, d)| d.key.is_some()).map(|(ss, _)| ss));
     }
-    // Slot → call insts whose operand is a bounded (`nocap`) use of the
-    // slot's address — promoted fields sync around them.
-    let mut sync_calls: FxHashMap<StackSlot, Vec<Inst>> = FxHashMap::default();
+    // Slot → bounded (`nocap`) call uses of its address: the call inst,
+    // the operand's offset in the slot, and the bytes the callee can
+    // reach through it (`arg_extent`; `u64::MAX` = unknown = whole
+    // slot). Promoted fields sync only where the call can touch them.
+    let mut sync_calls: FxHashMap<StackSlot, Vec<(Inst, i64, u64)>> = FxHashMap::default();
     for b in func.layout.blocks() {
         if !reach.contains(&b) {
             continue;
@@ -437,18 +447,27 @@ pub fn run_lt(
                             data.opcode(),
                             Opcode::CallIndirect | Opcode::TryCallIndirect
                         ));
-                        let bounded = k
-                            .checked_sub(adj)
-                            .is_some_and(|ai| nocap.contains(&(i, ai as u32)))
+                        let ai = k.checked_sub(adj);
+                        let bounded = ai
+                            .is_some_and(|ai| nocap.contains_key(&(i, ai as u32)))
                             && (!matches!(
                                 data.opcode(),
                                 Opcode::TryCall | Opcode::TryCallIndirect
                             ) || single_pred_dests(func, cfg, i));
-                        for &(ss, _) in &w.slots {
+                        for &(ss, off) in &w.slots {
                             if bounded {
+                                let mut ext = ai
+                                    .and_then(|ai| nocap.get(&(i, ai as u32)).copied())
+                                    .unwrap_or(u64::MAX);
+                                // `ANY` (unknown offset) covers the slot.
+                                let mut off = off;
+                                if off == webroot::ANY {
+                                    off = 0;
+                                    ext = u64::MAX;
+                                }
                                 let ss_ = sync_calls.entry(ss).or_default();
-                                if !ss_.contains(&i) {
-                                    ss_.push(i);
+                                if !ss_.contains(&(i, off, ext)) {
+                                    ss_.push((i, off, ext));
                                     if pliron_cfg::tracing_on()
                                         && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
                                     {
@@ -458,6 +477,24 @@ pub fn run_lt(
                                     }
                                 }
                             } else {
+                                if pliron_cfg::tracing_on()
+                                    && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+                                {
+                                    let adj = usize::from(matches!(
+                                        data.opcode(),
+                                        Opcode::CallIndirect | Opcode::TryCallIndirect
+                                    ));
+                                    let nc = k
+                                        .checked_sub(adj)
+                                        .is_some_and(|ai| nocap.contains_key(&(i, ai as u32)));
+                                    let spd = !matches!(
+                                        data.opcode(),
+                                        Opcode::TryCall | Opcode::TryCallIndirect
+                                    ) || single_pred_dests(func, cfg, i);
+                                    if pliron_cfg::tracing_on() {
+                                        tracing::debug!(target: "pliron::slotprom", "slotprom: unbounded {i} arg{k} nocap={nc} spd={spd}")
+                                    };
+                                }
                                 esc.push(ss);
                             }
                         }
@@ -491,6 +528,15 @@ pub fn run_lt(
         // a field: the slot stays in memory.
         let size = i64::from(func.sized_stack_slots[*ss].size);
         if list.len() > max_accs || list.iter().any(|a| a.off < 0 || a.off.checked_add(a.bytes).is_none_or(|e| e > size)) {
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::slotprom", "slotprom: {ss} rejected naccs={} size={size} ({})",
+                        list.len(),
+                        func.name)
+                };
+            }
             bad.insert(*ss);
         }
     }
@@ -517,9 +563,11 @@ pub fn run_lt(
     // (its bytes are still read/written through the slot), as do ranges
     // touched by narrow ops or with mixed types.
     let mut fields: Vec<Field> = Vec::new();
-    for (slot, list) in accs {
+    let mut slot_accs: FxHashMap<StackSlot, usize> = FxHashMap::default();
+    for (slot, list) in &accs {
+        slot_accs.insert(*slot, list.len());
         let mut ranges: Vec<(i64, i64)> = Vec::new();
-        for a in &list {
+        for a in list {
             let rr = (a.off, a.bytes);
             if !ranges.contains(&rr) {
                 ranges.push(rr);
@@ -562,7 +610,7 @@ pub fn run_lt(
             }
             if good && let Some(ty) = ty {
                 fields.push(Field {
-                    slot,
+                    slot: *slot,
                     off,
                     bytes,
                     ty,
@@ -570,7 +618,38 @@ pub fn run_lt(
             }
         }
     }
-    if fields.is_empty() || fields.len() > MAX_FIELDS {
+    // Over the param-bloat bound, evict whole slots — least-accessed
+    // first — rather than abandoning every promotion. A dropped slot's
+    // accesses simply stay on memory.
+    if fields.len() > MAX_FIELDS {
+        let mut by_field: FxHashMap<StackSlot, usize> = FxHashMap::default();
+        for f in &fields {
+            *by_field.entry(f.slot).or_default() += 1;
+        }
+        let mut order: Vec<StackSlot> = by_field.keys().copied().collect();
+        order.sort_by_key(|s| (slot_accs.get(s).copied().unwrap_or(0), by_field[s]));
+        let mut drop = FxHashSet::default();
+        let mut n = fields.len();
+        for s in order {
+            if n <= MAX_FIELDS {
+                break;
+            }
+            n -= by_field[&s];
+            drop.insert(s);
+        }
+        fields.retain(|f| !drop.contains(&f.slot));
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::slotprom", "slotprom: evicted {} slots, nfields={} ({})",
+                    drop.len(),
+                    fields.len(),
+                    func.name)
+            };
+        }
+    }
+    if fields.is_empty() {
         return 0;
     }
     // `PLIRON_SLOTPROM_FIELDS=N` promotes only the first N fields
@@ -589,12 +668,9 @@ pub fn run_lt(
     }
 
     // Bounded calls read the slot's memory, so each counts as a use of
-    // every field of its slot: without it a store-only field has an empty
-    // livein, loses its store, and is never written back before the call.
-    let sync_insts: FxHashMap<StackSlot, FxHashSet<Inst>> = sync_calls
-        .iter()
-        .map(|(s, v)| (*s, v.iter().copied().collect()))
-        .collect();
+    // the fields its operands can reach: without it a store-only field
+    // has an empty livein, loses its store, and is never written back
+    // before the call.
 
     // Each access inst's slot site — field-invariant, so it is computed
     // once here rather than per field inside the livein scan.
@@ -657,10 +733,10 @@ pub fn run_lt(
             contained.insert(i, (fi, off - fields[fi].off));
         }
     }
-    let mut sync_inst_slots: FxHashMap<Inst, Vec<StackSlot>> = FxHashMap::default();
-    for (slot, insts) in &sync_insts {
-        for &i in insts {
-            sync_inst_slots.entry(i).or_default().push(*slot);
+    let mut sync_inst_slots: FxHashMap<Inst, Vec<(StackSlot, i64, u64)>> = FxHashMap::default();
+    for (slot, insts) in &sync_calls {
+        for &(i, off, ext) in insts {
+            sync_inst_slots.entry(i).or_default().push((*slot, off, ext));
         }
     }
 
@@ -707,10 +783,10 @@ pub fn run_lt(
             }
             pending = kill_after.get(&i);
             if let Some(slots) = sync_inst_slots.get(&i) {
-                for &ss in slots {
+                for &(ss, off, ext) in slots {
                     if let Some(fis) = slot_fields.get(&ss) {
                         for &fi in fis {
-                            if !stored[fi] {
+                            if !stored[fi] && covers(&fields[fi], off, ext) {
                                 ues[fi][ix] = true;
                             }
                         }
@@ -791,11 +867,8 @@ pub fn run_lt(
     {
         let w = |b: Option<Block>| b.map_or(0, |b| u64::from(weight.get(&b).copied().unwrap_or(1)));
         let mut benefit: FxHashMap<StackSlot, u64> = FxHashMap::default();
-        let mut nkept: FxHashMap<StackSlot, u64> = FxHashMap::default();
+        let nkept: FxHashSet<StackSlot> = kept.iter().map(|&fi| fields[fi].slot).collect();
         let kept_set: FxHashSet<usize> = kept.iter().copied().collect();
-        for &fi in &kept {
-            *nkept.entry(fields[fi].slot).or_default() += 1;
-        }
         for (&i, &(s, _)) in &sites {
             if let Some((ss, off)) = s
                 && let Some(fi) = field_ix.get(&(ss, off)).copied().or_else(|| contained.get(&i).map(|c| c.0))
@@ -807,9 +880,20 @@ pub fn run_lt(
         }
         let mut drop_slots: FxHashSet<StackSlot> = FxHashSet::default();
         for (slot, insts) in &sync_calls {
-            let Some(&nk) = nkept.get(slot) else { continue };
+            if !nkept.contains(slot) {
+                continue;
+            }
             let mut cost = 0u64;
-            for &i in insts {
+            for &(i, off, ext) in insts {
+                // The call syncs only the kept fields its operand can
+                // reach, not the whole slot.
+                let nk = kept
+                    .iter()
+                    .filter(|&&fi| fields[fi].slot == *slot && covers(&fields[fi], off, ext))
+                    .count() as u64;
+                if nk == 0 {
+                    continue;
+                }
                 let dfg = &func.dfg;
                 let reload = match dfg.insts[i].opcode() {
                     Opcode::TryCall | Opcode::TryCallIndirect => dfg.insts[i]
@@ -842,22 +926,23 @@ pub fn run_lt(
         return 0;
     }
 
-    // Per bounded call: the kept-field indices written back before it,
-    // and for try_call terminators the single-pred destination blocks
-    // whose tops get the reloads (normal + exception edges alike).
+    // Per bounded call: the kept-field indices written back before it —
+    // only the ones the operand's extent can reach — and for try_call
+    // terminators the single-pred destination blocks whose tops get the
+    // reloads (normal + exception edges alike).
     let mut sync: FxHashMap<Inst, Vec<usize>> = FxHashMap::default();
     let mut reload_top: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
     for (slot, insts) in &sync_calls {
-        let kis: Vec<usize> = kept
-            .iter()
-            .enumerate()
-            .filter(|&(_, &fi)| fields[fi].slot == *slot)
-            .map(|(ki, _)| ki)
-            .collect();
-        if kis.is_empty() {
-            continue;
-        }
-        for &i in insts {
+        for &(i, off, ext) in insts {
+            let kis: Vec<usize> = kept
+                .iter()
+                .enumerate()
+                .filter(|&(_, &fi)| fields[fi].slot == *slot && covers(&fields[fi], off, ext))
+                .map(|(ki, _)| ki)
+                .collect();
+            if kis.is_empty() {
+                continue;
+            }
             // A call can take several promoted slots — accumulate the
             // field sets; a plain `insert` would drop all but the last.
             sync.entry(i).or_default().extend(kis.iter().copied());
@@ -874,6 +959,11 @@ pub fn run_lt(
                 }
             }
         }
+    }
+    // Two operands of one call can cover the same field — sync it once.
+    for kis in sync.values_mut().chain(reload_top.values_mut()) {
+        kis.sort_unstable();
+        kis.dedup();
     }
 
     // `-g`: each kept field's variable labels; its slot drops its key.
@@ -1237,8 +1327,8 @@ mod tests {
         }
     }
 
-    fn empty_nocap() -> FxHashSet<(Inst, u32)> {
-        FxHashSet::default()
+    fn empty_nocap() -> FxHashMap<(Inst, u32), u64> {
+        FxHashMap::default()
     }
 
     fn memops(func: &Function) -> usize {
@@ -1463,7 +1553,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let mut nocap = empty_nocap();
-        nocap.insert((call, 0));
+        nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
         let n = run(&mut func, &cfg, &nocap, false, &Default::default());
         assert!(n > 0, "expected promotion");
@@ -1512,7 +1602,7 @@ mod tests {
         cur.ins().return_(&[z]);
 
         let mut nocap = empty_nocap();
-        nocap.insert((call, 0));
+        nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
         run(&mut func, &cfg, &nocap, false, &Default::default());
         // The callee must see arg0 in *a: writeback store + post-call
@@ -1557,7 +1647,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let mut nocap = empty_nocap();
-        nocap.insert((call, 0));
+        nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
         run(&mut func, &cfg, &nocap, false, &Default::default());
         let stores = func
@@ -1613,8 +1703,8 @@ mod tests {
         cur.ins().return_(&[z]);
 
         let mut nocap = empty_nocap();
-        nocap.insert((call, 0));
-        nocap.insert((call, 1));
+        nocap.insert((call, 0), u64::MAX);
+        nocap.insert((call, 1), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
         run(&mut func, &cfg, &nocap, false, &Default::default());
         // Each arg's bytes reach the callee through memory: two
@@ -1920,7 +2010,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let mut nocap = empty_nocap();
-        nocap.insert((call, 1));
+        nocap.insert((call, 1), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
         run(&mut func, &cfg, &nocap, false, &Default::default());
         // The callee reads ss29 through `a`: 4 writeback stores before
@@ -2208,7 +2298,7 @@ mod tests {
             let (mut func, call) = build(in_loop);
             let before = memops(&func);
             let mut nocap = empty_nocap();
-            nocap.insert((call, 0));
+            nocap.insert((call, 0), u64::MAX);
             let w = weights(&func);
             let cfg = ControlFlowGraph::with_function(&func);
             let n = run_lt(&mut func, &cfg, &nocap, false, &Default::default(), &[], Some(&w));
@@ -2220,7 +2310,7 @@ mod tests {
             // Without the cost check both promote.
             let (mut func, call) = build(in_loop);
             let mut nocap = empty_nocap();
-            nocap.insert((call, 0));
+            nocap.insert((call, 0), u64::MAX);
             let cfg = ControlFlowGraph::with_function(&func);
             assert!(run(&mut func, &cfg, &nocap, false, &Default::default()) > 0);
         }

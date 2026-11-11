@@ -8,13 +8,13 @@
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::{Function, Opcode};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 fn run(src: &str) -> (Function, Function) {
     let before = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let mut f = before.clone();
     let cfg = ControlFlowGraph::with_function(&f);
-    pliron_clif_opt::slotprom::run(&mut f, &cfg, &FxHashSet::default(), false, &Default::default());
+    pliron_clif_opt::slotprom::run(&mut f, &cfg, &FxHashMap::default(), false, &Default::default());
     (before, f)
 }
 

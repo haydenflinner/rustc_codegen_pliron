@@ -28,7 +28,7 @@ fn loads(f: &Function) -> usize {
         .count()
 }
 
-fn run(f: &mut Function, nocap: &FxHashSet<(Inst, u32)>) -> usize {
+fn run(f: &mut Function, nocap: &FxHashMap<(Inst, u32), u64>) -> usize {
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(f);
     let pf = pliron_clif_opt::proots::facts_cfg(f, &cfg);
     let ps = pliron_clif_opt::proots::alias_of(&pf);
@@ -71,7 +71,7 @@ block0(v0: i64, v9: i64):
 #[test]
 fn ncc_root_survives_unrelated_store() {
     let mut f = parse(SURVIVES_UNRELATED_STORE);
-    let nocap: FxHashSet<(Inst, u32)> = [(calls(&f)[0], 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(calls(&f)[0], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     run(&mut f, &nocap);
     assert_eq!(loads(&f), 2, "{}", f.display());
 }
@@ -79,7 +79,7 @@ fn ncc_root_survives_unrelated_store() {
 #[test]
 fn without_nocap_the_escape_still_kills() {
     let mut f = parse(SURVIVES_UNRELATED_STORE);
-    run(&mut f, &FxHashSet::default());
+    run(&mut f, &FxHashMap::default());
     assert_eq!(loads(&f), 3, "{}", f.display());
 }
 
@@ -102,7 +102,7 @@ fn nocap_call_receiving_the_root_still_clobbers() {
             return v5
         }",
     );
-    let nocap: FxHashSet<(Inst, u32)> = [(calls(&f)[0], 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(calls(&f)[0], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     run(&mut f, &nocap);
     assert_eq!(loads(&f), 2, "{}", f.display());
 }
@@ -132,7 +132,7 @@ fn ncc_root_survives_a_call_it_is_not_passed_to() {
         }",
     );
     let cs = calls(&f);
-    let nocap: FxHashSet<(Inst, u32)> = [(cs[0], 0), (cs[1], 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(cs[0], 0), (cs[1], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     let n = run(&mut f, &nocap);
     assert_eq!(n, 1, "{}", f.display());
     assert_eq!(loads(&f), 2, "{}", f.display());
@@ -160,7 +160,7 @@ fn indirect_call_arg_zero_is_the_first_argument() {
             return v5
         }",
     );
-    let nocap: FxHashSet<(Inst, u32)> = [(calls(&f)[0], 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(calls(&f)[0], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     run(&mut f, &nocap);
     // v10's load + v3 + v8 + v4 → v4 forwards; 4 loads become 3.
     assert_eq!(loads(&f), 3, "{}", f.display());
@@ -171,7 +171,7 @@ fn indirect_call_arg_zero_is_the_first_argument() {
 fn ncc_forwarding_preserves_behavior() {
     let before = parse(SURVIVES_UNRELATED_STORE);
     let mut after = before.clone();
-    let nocap: FxHashSet<(Inst, u32)> = [(calls(&after)[0], 0)].into_iter().collect();
+    let nocap: FxHashMap<(Inst, u32), u64> = [(calls(&after)[0], 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     run(&mut after, &nocap);
     let cfg = Config {
         trials: 64,

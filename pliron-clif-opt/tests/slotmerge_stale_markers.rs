@@ -8,7 +8,7 @@
 //! shared the ICU list formatter lost its data.
 
 use cranelift_codegen::ir::{Block, Function, Inst, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 type Lifetimes = Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>;
 
@@ -32,7 +32,7 @@ fn run(src: &str, lt: impl Fn(&Function) -> Lifetimes) -> Function {
     }
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let lifetimes = lt(&f);
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default());
     f
 }
 

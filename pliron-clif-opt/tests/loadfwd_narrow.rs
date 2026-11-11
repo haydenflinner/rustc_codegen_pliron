@@ -48,7 +48,7 @@ fn narrow_loads_read_the_wider_store() {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashSet::default(),
+        &FxHashMap::default(),
     );
     assert_eq!(loads(&f), 0, "loads left:\n{}", f.display());
     let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());

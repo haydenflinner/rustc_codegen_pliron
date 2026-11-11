@@ -63,7 +63,7 @@ fn loads_in_block2(flags: &str) -> usize {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        &FxHashSet::default(),
+        &FxHashMap::default(),
     );
     let b2 = Block::from_u32(2);
     f.layout

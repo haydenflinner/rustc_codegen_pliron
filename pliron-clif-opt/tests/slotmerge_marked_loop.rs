@@ -9,7 +9,7 @@
 //! The header reads ss0 only through the escaped pointer (`call fn0`).
 
 use cranelift_codegen::ir::{Block, Function, InstructionData, StackSlot, Value};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 const SRC: &str = "function %t(i64, i64, i64) -> i64 {
     ss0 = explicit_slot 8, align = 8
@@ -51,6 +51,6 @@ fn marked_slot_keeps_loop_span() {
     let end = f.layout.first_inst(b2); // after `iadd` in the exit
     let ss0 = StackSlot::from_u32(0);
     let lifetimes = vec![(vec![ss0], start, b0, true), (vec![ss0], end, b2, false)];
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashSet::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default());
     assert_ne!(slot_of(&f, 3), slot_of(&f, 5), "the loop-body temp was folded onto the marked slot:\n{}", f.display());
 }
