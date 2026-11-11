@@ -1263,6 +1263,11 @@
 (decl gen_return (ValueRegsVec) Unit)
 (extern constructor gen_return gen_return)
 
+;; PLIRON: `put_in_regs_vec` for `return` operands — sinks a clean
+;; narrow `ireduce` to its source register (see `ret_ireduce_src`).
+(decl put_in_regs_vec_ret (ValueSlice) ValueRegsVec)
+(extern constructor put_in_regs_vec_ret put_in_regs_vec_ret)
+
 (decl gen_call_output (SigRef) ValueRegsVec)
 (extern constructor gen_call_output gen_call_output)
 

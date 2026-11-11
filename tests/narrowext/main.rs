@@ -163,6 +163,28 @@ fn cast_sel16(c: bool, x: u64, y: u64) -> u16 {
     if c { x as u16 } else { y as u16 }
 }
 
+#[inline(never)]
+fn ret_cast(x: u64) -> u8 {
+    // `ret (ireduce (ushr x, 8))`: the shift's register is already
+    // zero-extended, so the return operand is `x`'s wide register — no
+    // `uxtb` (bit 2). Callers may use `w0` unmasked, so a dirty source
+    // would leak into `r as u32` below.
+    (x >> 8) as u8
+}
+
+#[inline(never)]
+fn ret_cast_dirty(x: u64) -> u8 {
+    // `x + 1` keeps carry in bit 8 — not clean: the ireduce must still
+    // materialise (or the ABI uext must still fire). Returning the raw
+    // register would poison `r as u32` in the caller.
+    x.wrapping_add(1) as u8
+}
+
+#[inline(never)]
+fn ret_cast16(x: u64) -> u16 {
+    (x >> 16) as u16
+}
+
 #[derive(Clone, Copy)]
 enum Op {
     A,
@@ -245,10 +267,17 @@ fn main() {
                    if a > b { wide as u32 & 0xff } else { b as u32 });
         assert_eq!(cast_sel16(a > b, wide, w as u64) as u32,
                    if a > b { wide as u32 & 0xffff } else { w as u32 });
+        assert_eq!(ret_cast(wide) as u32, ((wide >> 8) & 0xff) as u32);
+        assert_eq!(ret_cast_dirty(wide) as u32,
+                   (wide.wrapping_add(1) & 0xff) as u32);
+        assert_eq!(ret_cast16(wide) as u32, ((wide >> 16) & 0xffff) as u32);
         mix(cast_shr(wide) as u64 | (cast_shr16(wide) as u64) << 8
             | (cast_chain(wide) as u64) << 24
             | (cast_sel(a > b, wide, b as u64) as u64) << 32
-            | (cast_sel16(a > b, wide, w as u64) as u64) << 40);
+            | (cast_sel16(a > b, wide, w as u64) as u64) << 40
+            | (ret_cast(wide) as u64) << 48
+            | (ret_cast_dirty(wide) as u64) << 56);
+        mix(ret_cast16(wide) as u64);
         mix(dispatch(op, a as u64 * 977, b as u64 + w as u64));
         mix(r as u64 + m as u64 + x as u64 + s as u64 + c as u64 + nb as u64 + e as u64);
     }
@@ -257,5 +286,5 @@ fn main() {
     mix(n as u64);
     println!("{acc}");
     // Stock rustc value.
-    assert_eq!(acc, 15308719940693316553);
+    assert_eq!(acc, 1528500929986150900);
 }

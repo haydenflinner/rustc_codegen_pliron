@@ -158,6 +158,27 @@ macro_rules! isle_lower_prelude_methods {
                 .collect()
         }
 
+        /// PLIRON (`PLIRON_NARROWEXT`): like `put_in_regs_vec`, used only
+        /// for `return` operands. A narrow `ireduce` operand whose
+        /// source is already uext-clean (`narrow_ret_uext_clean`) yields
+        /// the *source's* registers: the ireduce then has no remaining
+        /// uses and never materialises its `uxtb`/`uxth` (LLVM likewise
+        /// returns the raw producer register; the ABI's uext-on-retval
+        /// contract still holds because the source is clean). A dirty or
+        /// multi-reg source keeps the identity — the ireduce
+        /// materialises once, as before. Identity when the backend's
+        /// oracle says not clean, so the default (feature off) build is
+        /// unaffected.
+        fn put_in_regs_vec_ret(&mut self, (list, off): ValueSlice) -> ValueRegsVec {
+            (off..list.len(&self.lower_ctx.dfg().value_lists))
+                .map(|ix| {
+                    let val = list.get(ix, &self.lower_ctx.dfg().value_lists).unwrap();
+                    let val = crate::machinst::isle::ret_ireduce_src(self, val);
+                    self.put_in_regs(val)
+                })
+                .collect()
+        }
+
         #[inline]
         fn value_regs_get(&mut self, regs: ValueRegs, i: usize) -> Reg {
             regs.regs()[i]
@@ -897,6 +918,34 @@ pub fn shuffle_imm_as_le_lane_idx(size: u8, bytes: &[u8]) -> Option<u8> {
     // immediate to specify a lane of `size` bytes. The index, when viewed as
     // `size`-byte immediates, will be the first byte divided by the byte size.
     Some(bytes[0] / size)
+}
+
+/// PLIRON (`PLIRON_NARROWEXT`): the `ireduce` operand a narrow `return`
+/// operand may be replaced by — its clean single-reg source — or `val`
+/// itself when the sink is not legal (non-ireduce, dirty or >64-bit
+/// source, oracle off). See `put_in_regs_vec_ret`.
+pub(crate) fn ret_ireduce_src<I, B>(ctx: &mut IsleContext<'_, '_, I, B>, val: Value) -> Value
+where
+    I: VCodeInst,
+    B: LowerBackend<MInst = I>,
+{
+    let f = ctx.lower_ctx.f;
+    let val = f.dfg.resolve_aliases(val);
+    let crate::ir::ValueDef::Result(inst, _) = f.dfg.value_def(val) else {
+        return val;
+    };
+    if f.dfg.insts[inst].opcode() != crate::ir::Opcode::Ireduce {
+        return val;
+    }
+    let src = f.dfg.resolve_aliases(f.dfg.inst_args(inst)[0]);
+    if f.dfg.value_type(src).bits() > 64 {
+        return val;
+    }
+    if ctx.backend.narrow_ret_uext_clean(ctx.lower_ctx, src) {
+        src
+    } else {
+        val
+    }
 }
 
 /// This structure is used to implement the ISLE-generated `Context` trait and

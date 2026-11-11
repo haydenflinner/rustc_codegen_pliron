@@ -85,7 +85,9 @@ pub(crate) fn narrowext_enabled() -> bool {
 }
 
 /// PLIRON: one `PLIRON_NARROWEXT` user, by bit, for bisecting:
-/// 1 = the extra cleanliness facts, 2 = return extension, 4 = `uextend`
+/// 1 = the extra cleanliness facts, 2 = return extension (the ABI
+/// `uext`-on-retval skip and the `ret (ireduce)` source sink, both via
+/// `narrow_ret_uext_clean`), 4 = `uextend`
 /// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`,
 /// 32 = narrow `ushr`-of-clean and `ushr`-operand fusion on narrow
 /// `bor`/`band`/`bxor`, 64 = narrow `ireduce` passthrough when the wide
