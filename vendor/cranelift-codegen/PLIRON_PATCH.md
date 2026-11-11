@@ -766,6 +766,13 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
       / `alu_rrr`): through `alu_rs_imm_logic_commutative` an `ishl.i64 y, 34`
       defining `x` folded into `and w, w, w, lsl #2`, its amount masked by the
       narrow type (rustlantis seed 12309, fixed 2026-10-27).
+    - call args: `Lower::gen_call_args`/`gen_return_call_args` take a
+      `skip_uext` bitset (`call_arg_uext_skips` maps the call's narrow
+      operands through `value_regs` and asks the new
+      `LowerBackend::narrow_arg_uext_clean`); `ABIMachineSpec::
+      gen_call_args` then takes a clean i8/i16 `uext` register slot's
+      source reg as-is, dropping the `uxtb`/`uxth` before the call
+      (172 of 1447 on regex-syntax; stack slots still widen).
     `PLIRON_NARROWEXT_MASK=<bits>` (default all) keeps only some users live,
     for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`,
     32 narrow `ushr`-of-clean (a narrow `lsr` result is always canonical)
@@ -781,9 +788,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     by a constant → `ubfx` on the wide register, `ireduce (ireduce x)`
     extends once, and `select` arms that are `ireduce`s read the wide
     source directly (the low bits are exact and a `select` result is
-    modelled dirty anyway). A dirty-source passthrough variant of 256 was
-    tried and reverted: it converted one shared `uxtb` into one
-    extension/test per fusing use and grew regex-syntax `.text`.
+    modelled dirty anyway), 512 call-arg `uext` skip. A dirty-source
+    passthrough variant of 256 was tried and reverted: it converted one
+    shared `uxtb` into one extension/test per fusing use and grew
+    regex-syntax `.text`.
 
 63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP`, default on,
     `=0` off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table

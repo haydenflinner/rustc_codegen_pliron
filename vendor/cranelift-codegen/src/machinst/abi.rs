@@ -1902,6 +1902,10 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// up all arguments, as well as a `CallArgList` list representing
     /// the arguments passed in registers.  The latter need to be added
     /// as constraints to the actual call instruction.
+    /// PLIRON: `skip_uext[i]` (indexed parallel to `args`) marks arg `i`'s
+    /// source register as already zero-extended to its narrow width; a
+    /// `uext` register slot then takes the source reg as-is (mirroring
+    /// `gen_copy_regs_to_retval`'s `skip_uext`). Pass `&[]` when unknown.
     pub fn gen_call_args(
         &self,
         sigs: &SigSet,
@@ -1910,6 +1914,7 @@ impl<M: ABIMachineSpec> Callee<M> {
         is_tail_call: bool,
         flags: &settings::Flags,
         vregs: &mut VRegAllocator<M::I>,
+        skip_uext: &[bool],
     ) -> (CallArgList, SmallInstVec<M::I>) {
         let mut uses: CallArgList = smallvec![];
         let mut insts = smallvec![];
@@ -2006,7 +2011,17 @@ impl<M: ABIMachineSpec> Callee<M> {
                             ABIArgSlot::Stack { ty, extension, .. } => (ty, extension),
                         };
                         let ext = M::get_ext_mode(call_conv, extension);
-                        let (vreg, ty) = if ext != ir::ArgumentExtension::None
+                        // PLIRON: a register arg whose source already
+                        // holds the zero-extended form (PLIRON_NARROWEXT
+                        // bit 512) needs no `uxtb`/`uxth`; stack slots
+                        // still widen so the outgoing slot's bytes are
+                        // fully defined.
+                        let clean = matches!(*slot, ABIArgSlot::Reg { .. })
+                            && ext == ir::ArgumentExtension::Uext
+                            && ty_bits(ty) <= 16
+                            && skip_uext.get(idx).copied().unwrap_or(false);
+                        let (vreg, ty) = if !clean
+                            && ext != ir::ArgumentExtension::None
                             && ty_bits(ty) < word_bits
                         {
                             assert_eq!(word_rc, from_reg.class());

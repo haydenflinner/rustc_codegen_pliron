@@ -155,6 +155,13 @@ pub trait LowerBackend {
     fn narrow_ret_uext_clean(&self, _ctx: &mut Lower<Self::MInst>, _val: Value) -> bool {
         false
     }
+
+    /// PLIRON: does the register of narrow (i8/i16) call operand `val`
+    /// already hold its zero-extended form, so a `uext` arg slot needs
+    /// no extension instruction? Default: never.
+    fn narrow_arg_uext_clean(&self, _ctx: &mut Lower<Self::MInst>, _val: Value) -> bool {
+        false
+    }
 }
 
 /// Machine-independent lowering driver / machine-instruction container. Maintains a correspondence
@@ -868,8 +875,58 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.gen_call_output(&self.f.dfg.signatures[sig_ref])
     }
 
+    /// PLIRON: for each `args[i]`, whether its source register already
+    /// holds the operand zero-extended to its narrow (i8/i16) width, so a
+    /// `uext` arg slot needs no extension instruction — the call-side
+    /// twin of the `skip_uext` flag in `gen_return`. The flag is computed
+    /// from the current instruction's operands (`put_in_regs*` keeps the
+    /// `value_regs` mapping for them), so it must run before `arg_detach`
+    /// substitutes fresh vregs; flags stay positional either way.
+    pub(crate) fn call_arg_uext_skips(
+        &mut self,
+        args: &[ValueRegs<Reg>],
+        uext_clean: &mut dyn FnMut(&mut Self, Value) -> bool,
+    ) -> Option<Vec<bool>> {
+        let inst = self.cur_inst?;
+        let mut by_reg: FxHashMap<Reg, Value> = FxHashMap::default();
+        for &v in self.f.dfg.inst_args(inst) {
+            let v = self.f.dfg.resolve_aliases(v);
+            let ty = self.f.dfg.value_type(v);
+            if ty.is_int() && ty.bits() <= 16 {
+                for &r in self.value_regs[v].regs() {
+                    by_reg.insert(r, v);
+                }
+            }
+        }
+        if by_reg.is_empty() {
+            return None;
+        }
+        let mut out = None;
+        for (i, regs) in args.iter().enumerate() {
+            let v = regs
+                .regs()
+                .first()
+                .and_then(|r| by_reg.get(r))
+                .copied();
+            if let Some(v) = v {
+                if uext_clean(self, v) {
+                    out.get_or_insert_with(|| vec![false; args.len()])[i] = true;
+                }
+            }
+        }
+        out
+    }
+
     /// Set up arguments values `args` for a call with signature `sig`.
-    pub fn gen_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+    ///
+    /// PLIRON: `skip_uext[i]` marks `args[i]` as already zero-extended
+    /// (see `call_arg_uext_skips`); pass `&[]` when unknown.
+    pub fn gen_call_args(
+        &mut self,
+        sig: Sig,
+        args: &[ValueRegs<Reg>],
+        skip_uext: &[bool],
+    ) -> CallArgList {
         let copied = self.arg_detach(args);
         let args: &[ValueRegs<Reg>] = copied.as_deref().unwrap_or(args);
         let (uses, insts) = self.vcode.abi().gen_call_args(
@@ -879,6 +936,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             /* is_tail_call */ false,
             &self.flags,
             &mut self.vregs,
+            skip_uext,
         );
         for insn in insts {
             self.emit(insn);
@@ -887,7 +945,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Likewise, but for a `return_call`.
-    pub fn gen_return_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+    pub fn gen_return_call_args(
+        &mut self,
+        sig: Sig,
+        args: &[ValueRegs<Reg>],
+        skip_uext: &[bool],
+    ) -> CallArgList {
         let (uses, insts) = self.vcode.abi().gen_call_args(
             self.vcode.sigs(),
             sig,
@@ -895,6 +958,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             /* is_tail_call */ true,
             &self.flags,
             &mut self.vregs,
+            skip_uext,
         );
         for insn in insts {
             self.emit(insn);

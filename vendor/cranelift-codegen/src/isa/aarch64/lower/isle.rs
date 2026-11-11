@@ -97,7 +97,9 @@ pub(crate) fn narrowext_enabled() -> bool {
 /// consumer sinks: `ushr` by a constant → `ubfx` on the wide register,
 /// chained narrow `ireduce`s extend once, and `select` arms read the
 /// wide source directly (the low bits are exact and the result is
-/// modelled dirty anyway).
+/// modelled dirty anyway), 512 = call-arg `uext` skip
+/// (`narrow_arg_uext_clean`: a clean narrow operand needs no
+/// `uxtb`/`uxth` at the call site, mirroring the return path).
 /// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

@@ -178,7 +178,7 @@ fn emit_vm_call(
     }
     let sig = ctx.sigs().abi_sig_for_signature(&sig);
 
-    let uses = ctx.gen_call_args(sig, inputs);
+    let uses = ctx.gen_call_args(sig, inputs, &[]);
     let defs = ctx.gen_call_rets(sig, &outputs);
 
     let stack_ret_space = ctx.sigs()[sig].sized_stack_ret_space();

@@ -417,4 +417,11 @@ impl LowerBackend for AArch64Backend {
     fn narrow_ret_uext_clean(&self, ctx: &mut Lower<Inst>, val: Value) -> bool {
         isle::narrowext_part(2) && isle::val_uext_clean(ctx, self, val)
     }
+
+    /// PLIRON (`PLIRON_NARROWEXT=1`): the call-arg twin of
+    /// `narrow_ret_uext_clean` — a clean narrow operand skips the `uext`
+    /// arg slot's `uxtb`/`uxth` (mask bit 512).
+    fn narrow_arg_uext_clean(&self, ctx: &mut Lower<Inst>, val: Value) -> bool {
+        isle::narrowext_part(512) && isle::val_uext_clean(ctx, self, val)
+    }
 }
