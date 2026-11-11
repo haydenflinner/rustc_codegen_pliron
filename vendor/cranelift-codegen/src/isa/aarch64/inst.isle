@@ -5445,7 +5445,7 @@
 (rule 3 (emit_icmp cc rn @ (value_type (fits_in_16 ty)) (imm12_from_value rm))
   (if (unsigned_cond_code cc))
   (CondResult.Cond
-    (cmp_imm (OperandSize.Size32) (put_in_reg_ext32_maybe rn (ArgumentExtension.Uext)) rm)
+    (cmp_imm (OperandSize.Size32) (put_in_reg_uext_narrow_maybe rn) rm)
     (cond_code cc)))
 
 ;; 128-bit base case

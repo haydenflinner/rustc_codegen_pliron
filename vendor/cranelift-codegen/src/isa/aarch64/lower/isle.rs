@@ -174,6 +174,24 @@ pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget
             opcode: Opcode::Ushr,
             ..
         } => true,
+        // `ishl v, k` on extended operands computes `(v & mask) << k`;
+        // the register is clean only when `v`'s bits at and above
+        // `bits - k` are known zero (`bool << 5`, the lowercase-bit
+        // idiom, is the common case).
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, k],
+        } => {
+            let Some(k) = iconst_bits(dfg, *k) else {
+                return false;
+            };
+            let bits = ty.bits() as u64;
+            if k >= bits {
+                return false;
+            }
+            let keep = bits - k;
+            (bf_known_zero(dfg, *a, budget) >> keep) == (u64::MAX >> keep)
+        }
         _ => false,
     }
 }
