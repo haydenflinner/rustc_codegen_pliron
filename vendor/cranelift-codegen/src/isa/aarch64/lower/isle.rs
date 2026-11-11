@@ -1512,6 +1512,23 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         Some(s)
     }
 
+    /// PLIRON (`PLIRON_NARROWEXT` bit 8): the mask for a `tst` of a
+    /// narrow zero-test — `(v mod W) & k` reads identically on the
+    /// unmasked source register. `val` is the narrow value (its own
+    /// type gives `W`); returns `k & (W-1)`, or none when the value
+    /// isn't narrow or the masked constant is 0.
+    fn narrowext_tst_mask(&mut self, val: Value, k: u64) -> Option<u64> {
+        if !narrowext_part(8) {
+            return None;
+        }
+        let ty = self.lower_ctx.dfg().value_type(val);
+        if ty.bits() > 16 {
+            return None;
+        }
+        let m = k & ((1u64 << ty.bits()) - 1);
+        (m != 0).then_some(m)
+    }
+
     fn narrowext_clean(&mut self, val: Value) -> bool {
         let mut budget = 16;
         narrowext_part(1) && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)

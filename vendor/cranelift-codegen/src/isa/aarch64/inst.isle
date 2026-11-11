@@ -5339,6 +5339,36 @@
   (if-let true (narrowext_on 8))
   (if-let true (val_already_extended (ArgumentExtension.Uext) val))
   (CondResult.NotZero val (OperandSize.Size32)))
+;; PLIRON (`PLIRON_NARROWEXT` bit 8): `is_nonzero` of a narrow `ireduce`
+;; or `band`-of-`ireduce` tests the unmasked source register with `tst`
+;; — `(y mod W) != 0` is `y & (W-1) != 0`, `(y & k) != 0` likewise —
+;; instead of materialising the value's `uxtb`/`uxth`/`and` first
+;; (LLVM's `tst w, #0xff` shape). Single-use only: a shared value still
+;; materialises for its other uses and the extra `tst` would be a loss.
+(decl pure partial narrowext_tst_mask (Value u64) u64)
+(extern constructor narrowext_tst_mask narrowext_tst_mask)
+(rule 5 (is_nonzero val @ (maybe_uextend inner @ (ireduce _ y)))
+  (if-let false (value_has_multiple_uses val))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let m (narrowext_tst_mask inner 0xFFFFFFFFFFFFFFFF))
+  (if-let mi (imm_logic_from_u64 $I32 m))
+  (CondResult.Cond (tst_imm $I32 (put_in_reg y) mi) (Cond.Ne)))
+(rule 5 (is_nonzero val @ (maybe_uextend inner @ (band _ inner2 @ (ireduce _ y)
+                                                        (u64_from_iconst k))))
+  (if-let false (value_has_multiple_uses val))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let false (value_has_multiple_uses inner2))
+  (if-let m (narrowext_tst_mask inner k))
+  (if-let mi (imm_logic_from_u64 $I32 m))
+  (CondResult.Cond (tst_imm $I32 (put_in_reg y) mi) (Cond.Ne)))
+(rule 6 (is_nonzero val @ (maybe_uextend inner @ (band _ (u64_from_iconst k)
+                                                        inner2 @ (ireduce _ y))))
+  (if-let false (value_has_multiple_uses val))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let false (value_has_multiple_uses inner2))
+  (if-let m (narrowext_tst_mask inner k))
+  (if-let mi (imm_logic_from_u64 $I32 m))
+  (CondResult.Cond (tst_imm $I32 (put_in_reg y) mi) (Cond.Ne)))
 
 (attr emit_icmp (veri chain))
 (decl emit_icmp (IntCC Value Value) CondResult)
