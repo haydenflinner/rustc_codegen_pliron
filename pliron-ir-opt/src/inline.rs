@@ -1281,19 +1281,20 @@ pub fn run(
     let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-    // `PLIRON_INLINE_WARMCALLS`: `0` (the default) counts every call, so the
-    // bonus only rescues leaf-ish bodies — a callee carrying panic calls it
-    // never executes still moves those into the loop (regex-syntax's parser
+    // `PLIRON_INLINE_WARMCALLS`: `0` counts every call, so the bonus only
+    // rescues leaf-ish bodies — a callee carrying panic calls it never
+    // executes still moves those into the loop (regex-syntax's parser
     // loops inlined `bump`/`char`, 9 and 6 calls each: −9% parse_only,
     // −5% .text). `1` gates on the warm calls only; `2` keeps that gate and
     // instead prices the callee by its warm ops and warm calls (see
     // `CInfo::nwarm_ops`): a documented negative (regex +2%, binary +4%).
-    let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(3);
     let warm_gate = warm_mode == 1;
     let warm_cost = warm_mode == 2;
-    // `3` keeps the default all-calls gate but also lets a warm-call-sparse
-    // call-carrier earn the loop bonus when its warm body alone fits the
-    // base limit and it passes the `fanin` growth bound: brotli's
+    // `3` (the default) keeps the all-calls gate but also lets a
+    // warm-call-sparse call-carrier earn the loop bonus when its warm
+    // body alone fits the base limit and it passes the `fanin` growth
+    // bound: brotli's
     // `EvaluateNode` (18 calls, 1 warm — the rest are `panic_bounds_check`
     // scaffolding — 297 warm ops, 3 callers, all in the zopfli node loop;
     // LLVM inlines it) gets the bonus, while regex's `bump`/`char`
@@ -1672,12 +1673,13 @@ pub fn run(
                             cost = cost.saturating_mul(COLD_W);
                         }
                         // `PLIRON_INLINE_WARMCALLS=1`: gate on the warm calls
-                        // only; `=3`: a call-carrier over `loop_calls` total
-                        // calls still qualifies when its warm calls fit, its
-                        // warm body alone scores under the base limit (the
-                        // bonus then pays for cold panic scaffolding, not a
-                        // real worker — regex's `peek` is 387 warm ops), and
-                        // total growth stays under the `fanin` bound.
+                        // only; `=3` (default): a call-carrier over
+                        // `loop_calls` total calls still qualifies when its
+                        // warm calls fit, its warm body alone scores under
+                        // the base limit (the bonus then pays for cold panic
+                        // scaffolding, not a real worker — regex's `peek` is
+                        // 387 warm ops), and total growth stays under the
+                        // `fanin` bound.
                         let leafish =
                             (if warm_gate { ci.nwarm } else { ci.ncalls }) <= loop_calls;
                         let warm_leaf = warm_fanin
