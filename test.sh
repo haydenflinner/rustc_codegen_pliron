@@ -342,19 +342,24 @@ t_byvalhome() {
   # stays one stack object through SROA (docs/history/2026-10-27-spills3.md).
   # A parser-shaped loop that moves a 72-byte aggregate through `?` calls
   # and rebuilds it from their results must print the same with the flag
-  # off and on (the output also matches stock rustc), and `parse`'s frame
-  # must shrink (the temps and the scalarized local's spills go away).
+  # off and on (the output also matches stock rustc). memcpyopt's
+  # generalized forwarding now removes the same temps under the flag-off
+  # pipeline too, so the flag adds no further drop here — the contract is
+  # that homing still fires and never grows the frame.
   PLIRON_BYVALHOME=0 PLIRON_FRAME_INFO=5parse rustc $BE --edition 2021 -O -C codegen-units=1 tests/byval_home/main.rs -o $out/bvh0$exe 2> $out/bvh0.fi &&
       $out/bvh0$exe > $out/bvh.out
-  PLIRON_BYVALHOME=1 PLIRON_FRAME_INFO=5parse rustc $BE --edition 2021 -O -C codegen-units=1 tests/byval_home/main.rs -o $out/bvh1$exe 2> $out/bvh1.fi &&
+  PLIRON_BYVALHOME=1 PLIRON_FRAME_INFO=5parse PLIRON_TRACE='pliron::stats=info' rustc $BE --edition 2021 -O -C codegen-units=1 tests/byval_home/main.rs -o $out/bvh1$exe 2> $out/bvh1.fi &&
       $out/bvh1$exe | diff --strip-trailing-cr - $out/bvh.out
   PLIRON_BYVALHOME=1 rustc $BE --edition 2021 tests/byval_home/main.rs -o $out/bvh2$exe &&
       $out/bvh2$exe | diff --strip-trailing-cr - $out/bvh.out
+  grep -q "by-value args homed" $out/bvh1.fi || {
+    echo "byvalhome: no args homed under PLIRON_BYVALHOME"; return 1
+  }
   local s0 s1
   s0=$(sed -nE 's/^frame-info .*5parse[^:]*: .*fixed=([0-9]+).*/\1/p' $out/bvh0.fi | head -1)
   s1=$(sed -nE 's/^frame-info .*5parse[^:]*: .*fixed=([0-9]+).*/\1/p' $out/bvh1.fi | head -1)
-  if [[ -z "$s0" || -z "$s1" || "$s1" -ge "$s0" ]]; then
-    echo "byvalhome: parse frame bytes $s0 -> $s1 under PLIRON_BYVALHOME (want a drop)"; return 1
+  if [[ -z "$s0" || -z "$s1" || "$s1" -gt "$s0" ]]; then
+    echo "byvalhome: parse frame bytes $s0 -> $s1 under PLIRON_BYVALHOME (must not grow)"; return 1
   fi
 }
 

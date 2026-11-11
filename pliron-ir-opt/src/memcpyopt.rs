@@ -461,10 +461,49 @@ fn try_forward(
                 if j < first_arg {
                     continue;
                 }
-                if crate::types::leaf_is_ptr(ctx, x.get_type(ctx)).contains(&true)
-                    && !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
-                {
-                    why!("call writer's arg may alias dst");
+                if crate::types::leaf_is_ptr(ctx, x.get_type(ctx)).contains(&true) {
+                    if !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst) {
+                        why!("call writer's arg may alias dst");
+                    }
+                    // `concat = f(concat)`: the arg's alloca holds a byval
+                    // copy of `dst` (`memcpy(arg_tmp, dst)`), so forwarding
+                    // lands `sret` in `dst` one step too early — `try_byval`
+                    // can then no longer home the arg into `dst` without
+                    // aliasing `sret` and the byval arg. Keep the copy-back
+                    // so the home fires.
+                    if let Some(bs) = alloca_bases(ctx, st, inc_of(ctx, f, pin), x) {
+                        for xa in bs {
+                            let copied = xa.uses_iter(ctx).any(|u| {
+                                let cu = u.user_op();
+                                u.find_index(ctx) == 0
+                                    && matches!(
+                                        st.intrinsics.get(cu).map(|s| s.as_str()),
+                                        Some("llvm.memcpy" | "llvm.memmove")
+                                    )
+                                    && {
+                                        let s = cu.deref(ctx).get_operand(ctx, 1);
+                                        s == dbase
+                                            || alloca_base(
+                                                ctx,
+                                                st,
+                                                inc_of(ctx, f, pin),
+                                                s,
+                                            )
+                                            .is_some_and(|(b, _)| b == dbase)
+                                            || alloca_bases(
+                                                ctx,
+                                                st,
+                                                inc_of(ctx, f, pin),
+                                                s,
+                                            )
+                                            .is_some_and(|b| b.contains(&dbase))
+                                    }
+                            });
+                            if copied {
+                                why!("call arg holds a byval copy of dst");
+                            }
+                        }
+                    }
                 }
             }
         } else if matches!(
@@ -490,22 +529,81 @@ fn try_forward(
         why!("dst base does not dominate all rebase sites");
     }
     let size = st.allocas.get(dbase).map(|x| x.0).unwrap_or(u64::MAX);
-    if !all_dom {
-        // Sibling-arm writers (`if c { f(sret tmp) } else { g(sret tmp)
-        // }; memcpy(dst, tmp)`) can't dominate the copy but still make
-        // it exact — under one rule that also subsumes the dominated
-        // path's window and reader checks: walking backwards from every
-        // consumer of the copy's value (`m` and each `tmp` reader), the
-        // first `dst`-range touch on every route must be a writer. A
-        // `dst` touch dominated by `m` still poisons a wrap route that
-        // reaches `m` again, which block-dominance windows cannot see.
-        // Every writer must cover `[0, n)` so a route's last writer
-        // always commits the same bytes the copy would have moved; a
-        // route that dies at a pred-less block (entry or dead code)
-        // never ran a writer, so `tmp` is still alloca-undef there and
-        // `dst`'s bytes are a legal refinement.
-        if writers.is_empty() || !writers.iter().all(|&(_, lo, hi)| lo == 0 && hi == n) {
-            why!("writer does not dominate the copy");
+    let mut all_touch = None;
+    // `dst` copied into a call's byval temp (`memcpy(arg_tmp, dst)`,
+    // arg_tmp passed to a call) is a `try_byval` home: sinking a writer
+    // into `dst` makes the call reach `dst` directly, which then blocks
+    // the home — `sret` and the byval arg can't share `dst`. Keep the
+    // copy so `try_byval` fires (it only runs under PLIRON_BYVALHOME).
+    if pliron_cfg::env_is("PLIRON_BYVALHOME", "1") {
+        let Some(t) = base_touches(ctx, st, dbase, size, 0, size) else {
+            why!("dst use-cone not fully walkable");
+        };
+        let home_src = t.iter().any(|&c| {
+            matches!(
+                st.intrinsics.get(c).map(|s| s.as_str()),
+                Some("llvm.memcpy" | "llvm.memmove")
+            ) && alloca_bases(
+                ctx,
+                st,
+                inc_of(ctx, f, pin),
+                c.deref(ctx).get_operand(ctx, 1),
+            )
+            .is_some_and(|bs| bs.contains(&dbase))
+                && alloca_base(
+                    ctx,
+                    st,
+                    inc_of(ctx, f, pin),
+                    c.deref(ctx).get_operand(ctx, 0),
+                )
+                .is_some_and(|(xa, _)| reaches_call(ctx, xa))
+        });
+        if home_src {
+            why!("dst is a byval-home source");
+        }
+        all_touch = Some(t);
+    }
+    // Full-range writers get a check that subsumes windows, reader
+    // dominance and the stale-read rule alike — and also accepts
+    // sibling-arm writers (`if c { f(sret tmp) } else { g(sret tmp) };
+    // memcpy(dst, tmp)`): walking backwards from every consumer of the
+    // copy's value (`m` and each `tmp` reader), the first `dst`-range
+    // touch on every route must be a writer. Unlike block-dominance
+    // windows the scan sees real routes only (a `dst` write on a dead
+    // side branch is never visited) and it sees loop wraps (a `dst`
+    // touch dominated by `m` still poisons a route that reaches `m`
+    // again). A route that dies at a pred-less block (entry or dead
+    // code) never ran a writer, so `tmp` is still alloca-undef there
+    // and `dst`'s bytes are a legal refinement. Partial-coverage
+    // writers fall back to the dominance path below.
+    let full = !writers.is_empty() && writers.iter().all(|&(_, lo, hi)| lo == 0 && hi == n);
+    if full {
+        // Profitability, not soundness: a `tmp` written only by scalar
+        // ops could still promote — its copies and readers would
+        // scalarize away — so sinking it into a `dst` whose address a
+        // call takes trades promotion-eligible bytes for a pinned slot
+        // and hardened `memcpy`s (byvalhome's `x = f(x)` shape). A
+        // call-written `tmp` already escapes, so nothing is lost by
+        // moving the write into `dst`.
+        let tmp_esc = writers
+            .iter()
+            .any(|&(w, _, _)| st.calls.get(w).is_some() || st.invokes.contains(w));
+        if !tmp_esc {
+            let t = match all_touch {
+                Some(t) => t,
+                None => match base_touches(ctx, st, dbase, size, 0, size) {
+                    Some(t) => t,
+                    None => {
+                        why!("dst use-cone not fully walkable");
+                    }
+                },
+            };
+            if t
+                .iter()
+                .any(|&t| st.calls.get(t).is_some() || st.invokes.contains(t))
+            {
+                why!("tmp could promote; dst escapes to a call");
+            }
         }
         let Some(touch) = base_touches(ctx, st, dbase, size, doff, n) else {
             why!("dst use-cone not fully walkable");
@@ -559,6 +657,8 @@ fn try_forward(
             }
             stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
         }
+    } else if !all_dom {
+        why!("writer does not dominate the copy");
     } else {
         // Between a writer and `m`, nothing may touch the range that writer
         // commits to `dst` — it would observe the early write. Ops outside
@@ -581,9 +681,9 @@ fn try_forward(
     // in between (a write would substitute bytes `tmp` never held).
     // Under the writer-cut rule the route scan has already proven the
     // same property for every reader, so these checks are only needed
-    // on the dominated path.
+    // when it did not run.
     for &(r, ro, rh) in &readers {
-        if !all_dom {
+        if full {
             continue;
         }
         if op_dominates(ctx, st, dom, f, r, m) {
@@ -646,10 +746,43 @@ fn try_forward(
         st.intrinsics.remove(o);
         Operation::erase(o, ctx);
     }
+    if pliron_cfg::tracing_on() {
+        tracing::debug!(target: "pliron::memcpyopt", "fwd: FORWARDED {m:?} dst {dbase:?}@{doff} src {src:?}");
+    }
     st.allocas.remove(src);
     st.promoted.remove(src);
     Operation::erase(a, ctx);
     true
+}
+
+/// Whether `p`'s pointer cone reaches a call operand, through constant
+/// GEPs and branch successor arguments (bounded; overflow answers yes —
+/// the callers use this only to refuse a transform).
+fn reaches_call(ctx: &Context, p: Value) -> bool {
+    let mut work = vec![p];
+    let mut seen: FxHashSet<Value> = FxHashSet::default();
+    let mut steps = 0usize;
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        for u in v.uses_iter(ctx) {
+            steps += 1;
+            if steps > 256 {
+                return true;
+            }
+            let op = u.user_op();
+            if Operation::is_op::<CallOp>(op, ctx) {
+                return true;
+            }
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) && u.find_index(ctx) == 0 {
+                work.push(op.deref(ctx).get_result(ctx, 0));
+            } else if let Some(param) = succ_param(ctx, op, u.find_index(ctx)) {
+                work.push(param);
+            }
+        }
+    }
+    false
 }
 
 /// Every block parameter's incoming edges in `f`, as `(terminator,
