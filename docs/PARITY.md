@@ -62,7 +62,7 @@ a stale mix of flag states.
 | CMP compile time | 15 | 0.993 | 101 | 5 inputs |
 | MEM compile memory | 10 | 1.524 | 70 | peak RSS, 5 inputs |
 | SIZ code size | 10 | 1.710 | 61 | machine code, 5 inputs + wasm module 1.84 |
-| STK stack frames | 15 | 1.046 | 96 | regex-syntax, 336 shared fns |
+| STK stack frames | 15 | 1.047 | 96 | regex-syntax, 336 shared fns |
 | COR correctness | 20 | 1.000 | 100 | ui: 0 stage-2-only vs 3 stage-1-only (11 d old) |
 
 Correctness inputs: crates tier 1 run in the default `--deps stock` mode
@@ -75,8 +75,17 @@ learned to sink a memset/sret-written temp into the alloca a `memcpy`
 copies it to (was: two 4 KiB `driftsort` scratch slots + a 4 KiB copy).
 The generalisation to multi-writer temps, `memmove` and
 struct-field/`sret` destinations landed with the quiescence rule for
-post-copy temp reads (fuzz 24242); the residual ~1.05 is `visit_post`
-register-pressure spills, not retained slots.
+post-copy temp reads (fuzz 24242). `memcpyopt` now also resolves copy
+destinations through block parameters — every incoming edge must agree
+on (alloca, offset) — and follows destination pointers into block
+params when scanning the writer→copy and copy→read windows
+(`1ed006c`; regex-syntax forwards 1257→1398). Fresh measurement
+2026-11-11 puts STK at 1.047; the residual is `visit_post`
+register-pressure spills, not retained slots — `slotmerge` already
+packs 125 explicit slots down to 288 B and the rest of the ~1.5 KB
+frame is spill traffic, which tracks the function's inlining shape
+(204 calls vs LLVM's 142 — see `PLIRON_INLINE_GLUEWARM` in the work
+list and the `eh callee at invoke` stats).
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
@@ -550,7 +559,12 @@ Ranked by expected card gain per effort. Each item links its evidence.
    `SROA_MAXSLICES` threshold. The forwarding side is done: `memcpyopt`
    now sinks a `memset`/`sret`-written temp into the alloca a `memcpy`
    moves it to whenever no use can observe the gap (STK 1.207→1.029 —
-   the `driftsort` 4 KiB temp + copy is gone).
+   the `driftsort` 4 KiB temp + copy is gone). 2026-11-11: the inliner's
+   `PLIRON_INLINE_GLUEWARM` (default on, `e4830a7`) prices drop glue by
+   its warm body so leaf glue reaches the doomed unwind-edge sites LLVM
+   inlines it into (regex-syntax −1.8 KB .text); the remaining callsite
+   divergence is bigger callees (`try_allocate_in`, `canonicalize`) that
+   miss the `fanin`/score bounds.
 5. **wasm local traffic**: wpeep-friendly `CondBr` → `br_if` emission,
    block-typed merges for branch arms, make multi-value `WIFRET`
    (`PLIRON_WIFRET_MULTI`) shrink code instead of growing it.
@@ -563,7 +577,10 @@ Ranked by expected card gain per effort. Each item links its evidence.
    `zeroext` bool call results (trust the callee's extension on Apple
    arm64) is worth its own look elsewhere.
 9. **Compile time on giant functions**: per-instruction cost of the top
-   CLIF steps; sharing pliron-IR results for live `xcgu` copies.
+   CLIF steps; sharing pliron-IR results for live `xcgu` copies. The
+   existing `PLIRON_MEMCACHE` whole-pipeline cache measured 2026-11-11:
+   9 hits / 806 lookups on regex-syntax with `codegen-units=8` (~1%) —
+   its value is confined to crates whose generics duplicate across CGUs.
 10. **Correctness debt**: real SEH catch on windows-msvc; audit
    callee-side IPO on `xcgu` copies for wasm; serialize the remaining
    fact tables in the corpus header.
