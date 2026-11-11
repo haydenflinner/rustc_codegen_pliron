@@ -363,7 +363,21 @@ in the scoreboard and in the linked history files.
   pairs into `load.i16`/`store.i16`: `drift::sort<
   ClassBytesRange>` 963→867 insns (LLVM 369 — its residual is
   the usual cmp/cset/add bookkeeping, not copies), rlib
-  −200 insns, wasm −573 B, Sortw −11%.
+  −200 insns, wasm −573 B, Sortw −11%. Narrow-int update
+  2026-11-10 (`2e23071`): `ireduce.i8/i16` lowering materialised
+  `uxtb`/`uxth` unconditionally (1,633 `uxtb` in the regex-syntax
+  rlib vs LLVM's 9). `PLIRON_NARROWEXT` bits 64/128/256 add a
+  `wide_uext_clean` source oracle (skip the extension when the
+  wide register is already zero above the destination width) and
+  targeted source/consumer fusions (`ushr`+`ireduce`→`ubfm`,
+  `ireduce` of a single-use load→narrow `uload`, narrow stores of
+  `ireduce` store the wide reg, `ushr (ireduce x),k`→`ubfx`,
+  chained `ireduce`s extend once, `select` arms read the wide
+  source): regex-syntax .text −768 B, `uxtb` 1,633→1,381. A
+  dirty-source passthrough variant converted one shared `uxtb`
+  into per-use extensions/tests and grew .text — reverted; the
+  residual `uxtb`s are multi-use producers where materialising
+  once is already optimal.
 - **xcgu copies.** On kernels, ~14 KB of the rlib gap is per-CGU IPO
   clones (genuinely specialised, not dedup-able at the link) and ~5.5 KB
   is byte-identical `non-external` copies ld64 keeps in full. A linked
