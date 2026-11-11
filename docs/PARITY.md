@@ -62,7 +62,7 @@ a stale mix of flag states.
 | CMP compile time | 15 | 0.993 | 101 | 5 inputs |
 | MEM compile memory | 10 | 1.524 | 70 | peak RSS, 5 inputs |
 | SIZ code size | 10 | 1.710 | 61 | machine code, 5 inputs + wasm module 1.84 |
-| STK stack frames | 15 | 1.029 | 98 | regex-syntax, 336 shared fns |
+| STK stack frames | 15 | 1.046 | 96 | regex-syntax, 336 shared fns |
 | COR correctness | 20 | 1.000 | 100 | ui: 0 stage-2-only vs 3 stage-1-only (11 d old) |
 
 Correctness inputs: crates tier 1 run in the default `--deps stock` mode
@@ -70,9 +70,13 @@ Correctness inputs: crates tier 1 run in the default `--deps stock` mode
 self-host run. x86-64 was last measured 2026-10-22. The CMP rating drop
 (112 → 101) is mostly the corrected measurement mix, not a slowdown —
 the same 0.85–0.99 ratio band, weighted differently across the five
-inputs; STK drifted up to 1.207, then dropped to 1.029 once `memcpyopt`
+inputs; STK drifted up to 1.207, then dropped to ~1.03 once `memcpyopt`
 learned to sink a memset/sret-written temp into the alloca a `memcpy`
 copies it to (was: two 4 KiB `driftsort` scratch slots + a 4 KiB copy).
+The generalisation to multi-writer temps, `memmove` and
+struct-field/`sret` destinations landed with the quiescence rule for
+post-copy temp reads (fuzz 24242); the residual ~1.05 is `visit_post`
+register-pressure spills, not retained slots.
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
