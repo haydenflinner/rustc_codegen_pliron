@@ -377,7 +377,14 @@ in the scoreboard and in the linked history files.
   dirty-source passthrough variant converted one shared `uxtb`
   into per-use extensions/tests and grew .text — reverted; the
   residual `uxtb`s are multi-use producers where materialising
-  once is already optimal.
+  once is already optimal. Tail-trap update 2026-11-10
+  (`da593ef`+`b6adf36`): functions ended in `bl noret_callee;
+  udf` where LLVM ends at the `bl` (the `NORETURN_CALL` trap
+  elision already dropped mid-function copies; the last block's
+  was kept so a return address never pointed past the function —
+  unwind lookups use `ret_addr - 1`, which still lands on the
+  `bl`). `PLIRON_NORETUDF` (default) drops it too: regex-syntax
+  .text −1.1 KB, `udf`s 523→200.
 - **xcgu copies.** On kernels, ~14 KB of the rlib gap is per-CGU IPO
   clones (genuinely specialised, not dedup-able at the link) and ~5.5 KB
   is byte-identical `non-external` copies ld64 keeps in full. A linked
