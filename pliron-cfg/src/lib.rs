@@ -70,6 +70,11 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_INLINE_ONCE1",
     "PLIRON_INLINE_RECSTACK",
     "PLIRON_INLINE_SCCLIMIT",
+    // Price drop glue by its warm body (commit e4830a7): the EH scaffold
+    // never runs on a normal drop, and charging it priced leaf glue out
+    // of doomed cleanup sites LLVM inlines it into (regex-syntax
+    // −1.8 KB .text; gate + corpus clean at e4830a7).
+    "PLIRON_INLINE_GLUEWARM",
     // Memory (2026-10-26-memory.md, 2026-10-27-memory2.md, memory3.md).
     "PLIRON_DEADFREE",
     "PLIRON_LOWERFREE",
