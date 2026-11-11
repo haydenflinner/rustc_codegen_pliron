@@ -1350,6 +1350,7 @@ pub fn run(
     // output can't afford it.
     let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
+    let glue_warm = crate::env_is("PLIRON_INLINE_GLUEWARM", "1");
     // `PLIRON_INLINE_FREEMAX=<n>` (opt-in): a single-site callee over n ops
     // gets no "free" threshold. memchr's 809-op search closure, inlined
     // into its one site in `search_slice_with_raw`, made pulldown's
@@ -1675,6 +1676,18 @@ pub fn run(
                     if model {
                         cost = sn.saturating_add(scalls.saturating_mul(call_w));
                         if warm_cost && !spec {
+                            cost = ci.nwarm_ops.saturating_add(ci.nwarm.saturating_mul(call_w));
+                        }
+                        // `PLIRON_INLINE_GLUEWARM`: drop glue is priced by its
+                        // warm body — the EH scaffold (`_Unwind_Resume`,
+                        // `panic_in_cleanup`, exn stores) never executes on a
+                        // normal drop, and charging it prices leaf glue out of
+                        // exactly the doomed cleanup sites where inlining kills
+                        // the temp slot feeding it (regex-syntax's
+                        // `visit_class_set_item_post`: `drop_glue<Vec<_>>` at
+                        // 74 sites, warm cost 59 vs the cold-site t=64; LLVM
+                        // inlines them and calls `__rust_dealloc` directly).
+                        if glue_warm && !spec && is_drop_glue(cs) {
                             cost = ci.nwarm_ops.saturating_add(ci.nwarm.saturating_mul(call_w));
                         }
                         let mut save = 0usize;
