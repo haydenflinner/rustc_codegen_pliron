@@ -211,7 +211,17 @@ extends on the same binary). Bit 1024 also folds the `br_table`
 bounds check on a narrow `(c−s) mod W` index — `uextend (iadd c, -s)`
 becomes `sub c, s; cmp c-s, N` when `s + N ≤ W` since wrap-around
 indices land ≥N either way (84c22f2; 26 masked-bound sites folded on
-the benchmark CGUs).
+the benchmark CGUs). Bit 8's `is_nonzero` rules 5/6 turn a single-use
+narrow `ireduce`/`band (ireduce y), k` brif into `tst` on the
+unmasked source (383eba0; −118 extends on lol_html, `cbz`/`cbnz` −158
+↔ `tst`+cond-br +158, net ≈ −67 insns). Bit 2048 then extends the
+cleanliness oracle itself (a70194d): blockparams whose every incoming
+blockcall arg is clean — a per-function greatest-fixpoint sweep,
+coinductively sound so loop-carried `phi(clean, band(y, k))` phis
+qualify — and call results whose signature return declares `uext`
+(−315 extends, −2,112 B `__text` on rust-html-rewriter's benchmark;
+885 standalone `uxtb`/`uxth` remain vs LLVM's 0 — dirty-producer
+extends LLVM's demanded-bits avoids, a structural gap).
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
