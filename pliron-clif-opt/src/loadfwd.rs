@@ -64,6 +64,94 @@ fn narrow_src(func: &Function, av: &Avail, r: Root, off: i64, bytes: u32) -> Opt
     })
 }
 
+/// Bounded constant evaluation for addend-shaped expressions: `iconst`,
+/// extends, and arithmetic on constants. `bunroll`'s clone constants
+/// reach the loads wrapped in `ishl`/`imul`/`uextend` chains —
+/// `(idx<<3)*1` — that the plain `iconst` peel can't see as an offset.
+fn keval(func: &Function, ps: &VMap<Value>, na: &FxHashSet<Value>, v: Value, d: u32) -> Option<i64> {
+    if d == 0 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(psrc(ps, na, func, v));
+    let i = func.dfg.value_def(v).inst()?;
+    Some(match func.dfg.insts[i] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => imm.bits(),
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            let a = func.dfg.resolve_aliases(arg);
+            let bits = func.dfg.value_type(a).bits();
+            let k = keval(func, ps, na, arg, d - 1)?;
+            if bits >= 64 { k } else { k & ((1i64 << bits) - 1i64) }
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Sextend,
+            arg,
+        } => {
+            let a = func.dfg.resolve_aliases(arg);
+            let bits = func.dfg.value_type(a).bits();
+            let k = keval(func, ps, na, arg, d - 1)?;
+            if bits >= 64 { k } else { (k << (64 - bits)) >> (64 - bits).min(63) }
+        }
+        InstructionData::Binary { opcode, args } => {
+            let a = keval(func, ps, na, args[0], d - 1)?;
+            let b = keval(func, ps, na, args[1], d - 1)?;
+            let sh = (b as u64 % u64::from(func.dfg.ctrl_typevar(i).bits())) as u32;
+            match opcode {
+                Opcode::Iadd => a.wrapping_add(b),
+                Opcode::Isub => a.wrapping_sub(b),
+                Opcode::Imul => a.wrapping_mul(b),
+                Opcode::Ishl => a.wrapping_shl(sh),
+                Opcode::Ushr => ((a as u64) >> sh) as i64,
+                Opcode::Band => a & b,
+                Opcode::Bor => a | b,
+                Opcode::Bxor => a ^ b,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// `nm.pair` plus an `iadd base, <const expr>` peel — the offset the
+/// constant-evaluated addend contributes. Used only on the `SRCCOPY`
+/// path so the rest of the machinery's loc naming is untouched.
+fn kpair(
+    func: &Function,
+    ps: &VMap<Value>,
+    na: &FxHashSet<Value>,
+    nm: &NrMemo,
+    v: Value,
+) -> ((Root, i64), (Root, i64)) {
+    let mut v = func.dfg.resolve_aliases(psrc(ps, na, func, v));
+    let mut off = 0i64;
+    for _ in 0..8 {
+        let Some(i) = func.dfg.value_def(v).inst() else { break };
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } = func.dfg.insts[i]
+        else {
+            break;
+        };
+        if let Some(k) = keval(func, ps, na, args[1], 6) {
+            off = off.wrapping_add(k);
+            v = func.dfg.resolve_aliases(psrc(ps, na, func, args[0]));
+        } else if let Some(k) = keval(func, ps, na, args[0], 6) {
+            off = off.wrapping_add(k);
+            v = func.dfg.resolve_aliases(psrc(ps, na, func, args[1]));
+        } else {
+            break;
+        }
+    }
+    let ((r0, o0), (r, o)) = nm.pair(func, ps, na, v);
+    ((r0, o0.wrapping_add(off)), (r, o.wrapping_add(off)))
+}
+
 /// `r[off .. off+bytes)` sits inside a covering store `store v` whose `v`
 /// is itself a plain `load (q, qoff)` and the source location still maps
 /// to `v` (no may-alias store since — the availability kill rules carry
@@ -101,7 +189,9 @@ fn copy_src(
         return None;
     }
     let d = off - o2;
-    let offset = i32::try_from(base.checked_add(d)?).ok()?;
+    // `q`'s own normalization already carries `oq` — the emitted
+    // `load (q, off)` covers only the field offset plus the byte delta.
+    let offset = i32::try_from(i64::from(i32::from(qo)).checked_add(d)?).ok()?;
     let sdata = func.dfg.insts[si].memflags_data(&func.dfg)?;
     let mut flags = cranelift_codegen::ir::MemFlagsData::new().with_notrap();
     if let Some(e) = sdata.explicit_endianness() {
@@ -1193,8 +1283,11 @@ fn transfer(
                     }
                 } else if *SRCCOPY
                     && rw.is_some()
-                    && let Some((addr, offset, flags)) =
-                        copy_src(func, ps, na, nm, av, r, off, ty)
+                    && let Some((addr, offset, flags)) = {
+                        let (_, (r2, o2)) = kpair(func, ps, na, nm, arg);
+                        let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
+                        copy_src(func, ps, na, nm, av, r2, o2, ty)
+                    }
                 {
                     rw.as_deref_mut().unwrap().push((
                         i,
@@ -1242,8 +1335,11 @@ fn transfer(
                 if let Some((v, shift)) = hit {
                     rw.as_deref_mut().unwrap().push((i, Fwd::Narrow { v, shift, mty, signed }));
                 } else if *SRCCOPY
-                    && let Some((addr, offset, flags)) =
-                        copy_src(func, ps, na, nm, av, r, off, mty)
+                    && let Some((addr, offset, flags)) = {
+                        let (_, (r2, o2)) = kpair(func, ps, na, nm, arg);
+                        let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
+                        copy_src(func, ps, na, nm, av, r2, o2, mty)
+                    }
                 {
                     rw.as_deref_mut().unwrap().push((
                         i,

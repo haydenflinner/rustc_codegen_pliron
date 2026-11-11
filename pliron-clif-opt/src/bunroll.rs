@@ -205,7 +205,9 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
     if !dt.is_reachable(h) {
         return None;
     }
-    let dbg = |why: &str| tracing::debug!(target: "pliron::bunroll", "block{}: {why}", h.as_u32());
+    let dbg = |why: &str| {
+        tracing::debug!(target: "pliron::bunroll", "{} block{}: {why}", func.name, h.as_u32())
+    };
     // Loop blocks = blocks whose *innermost* loop is `lp` (no nested).
     // Bail on nested loops: blocks in a child loop aren't cloned but
     // outer uses of their values would leak original defs into clones.
@@ -439,23 +441,20 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
                 _ => false,
             }
         };
-        // Walk the cone, gathering each block's direct free uses of
-        // in-loop values (inst args and its terminator's edge args).
-        let mut cone: Vec<Block> = Vec::new();
-        let mut need: FxHashMap<Block, FxHashSet<Value>> = FxHashMap::default();
-        let mut succs: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
-        while let Some(x) = wl.pop() {
-            if budget == 0 {
-                dbg("cone-budget");
-                return None;
+        // Direct free uses of in-loop values per non-loop block — one
+        // whole-function scan. Only blocks that can reach one of these
+        // along non-loop edges can need repair params, so the forward
+        // walk below prunes to that set instead of charging the budget
+        // for everything reachable downstream of the loop.
+        let mut uses: FxHashMap<Block, FxHashSet<Value>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            if inset.contains(&b) {
+                continue;
             }
-            budget -= 1;
-            cone.push(x);
-            let mut xsuccs = Vec::new();
-            for i in func.layout.block_insts(x) {
+            for i in func.layout.block_insts(b) {
                 for &a in func.dfg.inst_args(i) {
                     if leaks(func, a) {
-                        need.entry(x).or_default().insert(func.dfg.resolve_aliases(a));
+                        uses.entry(b).or_default().insert(func.dfg.resolve_aliases(a));
                     }
                 }
                 for bc in func.dfg.insts[i]
@@ -464,12 +463,50 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
                     for a in bc.args(&func.dfg.value_lists) {
                         if let BlockArg::Value(v) = a {
                             if leaks(func, v) {
-                                need.entry(x)
+                                uses.entry(b)
                                     .or_default()
                                     .insert(func.dfg.resolve_aliases(v));
                             }
                         }
                     }
+                }
+            }
+        }
+        // Backward reachability to `uses` blocks through non-loop blocks.
+        let mut reach_need: FxHashSet<Block> = uses.keys().copied().collect();
+        {
+            let mut w: Vec<Block> = reach_need.iter().copied().collect();
+            while let Some(x) = w.pop() {
+                for p in cfg.pred_iter(x) {
+                    if !inset.contains(&p.block) && reach_need.insert(p.block) {
+                        w.push(p.block);
+                    }
+                }
+            }
+        }
+        // Walk the cone, gathering each block's direct free uses of
+        // in-loop values (inst args and its terminator's edge args).
+        let mut cone: Vec<Block> = Vec::new();
+        let mut need: FxHashMap<Block, FxHashSet<Value>> = FxHashMap::default();
+        let mut succs: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+        while let Some(x) = wl.pop() {
+            if !reach_need.contains(&x) {
+                continue;
+            }
+            if budget == 0 {
+                dbg("cone-budget");
+                return None;
+            }
+            budget -= 1;
+            cone.push(x);
+            if let Some(us) = uses.get(&x) {
+                need.entry(x).or_default().extend(us.iter().copied());
+            }
+            let mut xsuccs = Vec::new();
+            if let Some(t) = func.layout.last_inst(x) {
+                for bc in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
                     let tb = bc.block(&func.dfg.value_lists);
                     if !inset.contains(&tb) {
                         xsuccs.push(tb);
@@ -653,7 +690,7 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let mut plans = Vec::new();
     {
         let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
-        tracing::debug!(target: "pliron::bunroll", "run: {} loops", la.loops().count());
+        tracing::debug!(target: "pliron::bunroll", "run {}: {} loops", func.name, la.loops().count());
         for lp in la.loops().take(16) {
             if let Some(p) = detect(func, cfg, dt, la, lp) {
                 plans.push(p);
