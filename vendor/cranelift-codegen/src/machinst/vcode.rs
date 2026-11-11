@@ -3049,7 +3049,7 @@ impl<I: VCodeInst> VCode<I> {
                                     epi.len() >= 5
                                         || (epi.len() >= 3 && self.block_order.is_cold(block))
                                 }
-                                _ => epi.len() >= 3,
+                                _ => epi.len() >= 2,
                             };
                             if epi_ok {
                                 if let Some(l) = epi_label {

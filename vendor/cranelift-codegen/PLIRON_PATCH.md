@@ -835,13 +835,15 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     changes no code. On regex-syntax, `=1` removes 1,291 `b`s and 14.7 KB
     of `__text`, and `=2` removes 1,716 `b`s and 20.4 KB
     (docs/history/2026-10-27-branches.md).
-67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default mode `1`, `=0` off;
+67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default mode `2`, `=0` off;
     `src/machinst/vcode.rs`). The first `return` that merges binds a label
     in front of its epilogue. Each later merging `return` jumps to that
-    label in place of its own copy. `=2` merges every epilogue of 3 or more
-    insts. `=1` merges an epilogue of 5 or more insts, or any epilogue in a
-    cold block: `fib`'s 3-inst base-case return is hot (+8% when merged).
-    Frameless `ret` stays inline, and return calls are not changed.
+    label in place of its own copy. `=2` merges every epilogue of 2 or more
+    insts — the `ldp x29, x30, [sp], #N; ret` form included (−453 `ret`s,
+    −1,728 B `__text` on rust-html-rewriter's benchmark). `=1` merges an
+    epilogue of 5 or more insts, or any epilogue in a cold block: `fib`'s
+    3-inst base-case return is hot (+8% when merged). Frameless `ret`
+    stays inline, and return calls are not changed.
 68. Eager bare-jump label aliasing, `PLIRON_BJALIAS` (default `1`,
     `=0` off;
     `src/machinst/vcode.rs` `emit`). A block that is a single
