@@ -187,6 +187,10 @@ pub fn dead_args(ctx: &mut Context, st: &mut State) {
                 info.arg_byval_ro = (v.len() == cargs.len())
                     .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
             }
+            if let Some(v) = info.arg_ro.take() {
+                info.arg_ro = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
             st.calls.insert(nc, info);
             if let Some(u) = st.invokes.remove(c) {
                 st.invokes.insert(nc, u);

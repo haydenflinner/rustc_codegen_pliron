@@ -138,6 +138,7 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
                     arg_extent: None,
                     arg_noalias: None,
                     arg_byval_ro: None,
+                    arg_ro: None,
                     bb: false,
                     callee,
                     noret: false,

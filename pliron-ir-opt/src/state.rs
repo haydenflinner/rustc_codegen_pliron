@@ -323,6 +323,12 @@ pub struct CallInfo {
     /// (`DeducedParamAttrs::read_only`). memcpyopt passes the caller's
     /// own local instead of a copy of it (`PLIRON_BYVALHOME`).
     pub arg_byval_ro: Option<Box<[bool]>>,
+    /// Per-operand `readonly` attr from rustc's fn_abi — frozen `&T`
+    /// (`PointerKind::SharedRef`, paired with `noalias` +
+    /// `captures_readonly`) and deduced-readonly Indirect params. With
+    /// `arg_noalias` bounding the borrow's duration, the operand is a
+    /// bounded read of `arg_extent` bytes at the call's position.
+    pub arg_ro: Option<Box<[bool]>>,
     /// `black_box` barrier: the callee is a never-defined `__pliron_bb*`
     /// symbol; lowering emits the CLIF `black_box` op instead of a call.
     pub bb: bool,

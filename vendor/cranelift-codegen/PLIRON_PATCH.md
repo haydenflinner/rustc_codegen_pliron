@@ -768,7 +768,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     - `is_nonzero` rules 5/6 (`narrowext_tst_mask`): a single-use narrow
       `ireduce` or `band (ireduce y), k` tests the unmasked source —
       `tst y, #W-1` / `tst y, #k&W-1` — instead of materialising the
-      value's `uxtb`/`uxth`/`and` (LLVM's `tst w, #0xff` shape);
+      value's `uxtb`/`uxth`/`and` (LLVM's `tst w, #0xff` shape). `y` goes
+      in via `lo_reg`, not `put_in_reg`: an `ireduce.i8 (i128)` source is
+      a register pair and only its low half is ever tested (rustlantis
+      seed 21920, fixed 2026-11-11);
     - `band_ireduce_imm` (priority 30): `band (ireduce x) k`, canonical `k`,
       masks `x`'s register directly, so the `ireduce`'s `uxtb` (patch 36)
       is not materialized. `x` goes in as a plain register (`alu_rr_imm_logic`

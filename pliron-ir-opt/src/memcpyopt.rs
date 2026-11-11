@@ -20,6 +20,8 @@ use pliron::{
     operation::Operation,
     value::Value,
 };
+use pliron::builtin::op_interfaces::BranchOpInterface;
+use pliron::op::op_cast;
 use pliron::r#type::Typed;
 use pliron_llvm::ops::{AllocaOp, CallOp, GetElementPtrOp, LoadOp, StoreOp};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -169,6 +171,45 @@ fn leaf_read(ctx: &Context, st: &State, op: Ptr<Operation>, i: usize) -> Option<
             .and_then(|v| const_int(ctx, st, v))
             .and_then(|n| u64::try_from(n).ok());
     }
+    // A call operand that is a frozen `&T` (`arg_ro` + `arg_noalias`): the
+    // callee reads up to `arg_extent` bytes at the call's position and the
+    // borrow's scope ends when it returns — a bounded read. Invokes and
+    // black_box barriers stay opaque; `sret`/`ByVal` operands are not
+    // reads (leaf_write and escape respectively).
+    if st.invokes.contains(op) {
+        return None;
+    }
+    let ci = st.calls.get(op)?;
+    if ci.bb {
+        return None;
+    }
+    let nopd = op.deref(ctx).get_num_operands();
+    let first_arg = nopd - ci.exts.params.len().min(nopd);
+    let ai = i.checked_sub(first_arg)?;
+    if ci.exts.params.get(ai) != Some(&ArgExt::None) {
+        return None;
+    }
+    let ro = ci.arg_ro.as_ref().and_then(|v| v.get(ai)).copied() == Some(true);
+    let na = ci.arg_noalias.as_ref().and_then(|v| v.get(ai)).copied() == Some(true);
+    if !(ro && na) {
+        return None;
+    }
+    ci.arg_extent.as_ref().and_then(|e| e.get(ai)).map(|&(n, _)| n)
+}
+
+/// The block argument terminator `op`'s operand `i` forwards, when `i`
+/// lies in a successor's operand range. Other operand positions — a
+/// `cond_br` condition, a `br_table` index — are scalar uses, not
+/// pointer forwarding.
+fn succ_param(ctx: &Context, op: Ptr<Operation>, i: usize) -> Option<Value> {
+    let o = Operation::get_op_dyn(op, ctx);
+    let br = op_cast::<dyn BranchOpInterface>(&*o)?;
+    for (si, s) in op.deref(ctx).successors(ctx).enumerate() {
+        let r = br.successor_operand_range(ctx, si);
+        if r.contains(&i) {
+            return Some(s.deref(ctx).get_argument(ctx, i - r.start));
+        }
+    }
     None
 }
 
@@ -236,8 +277,15 @@ fn tmp_flow(
     let mut readers: Vec<(Ptr<Operation>, u64, u64)> = Vec::new();
     let mut marks: Vec<Ptr<Operation>> = Vec::new();
     let mut seen = 0usize;
+    // `(value, offset)` pairs already walked — a block param can carry the
+    // temp's pointer back into its own block (loop-carried), so the cone
+    // is a graph, not a tree.
+    let mut done: FxHashSet<(Value, u64)> = FxHashSet::default();
     let mut work: Vec<(Value, u64, bool)> = vec![(tmp, 0, true)];
     while let Some((p, bo, root)) = work.pop() {
+        if !done.insert((p, bo)) {
+            continue;
+        }
         for u in p.uses_iter(ctx) {
             seen += 1;
             if seen > 512 {
@@ -266,6 +314,13 @@ fn tmp_flow(
                     return None;
                 }
                 work.push((op.deref(ctx).get_result(ctx, 0), nb as u64, false));
+            } else if let Some(param) = succ_param(ctx, op, i) {
+                // A branch argument carries the derived pointer to the
+                // target's parameter — the parameter's own uses classify
+                // from there. Only the temp's edge is rebased; other edges
+                // keep feeding the param their own pointers, so merged
+                // params stay correct.
+                work.push((param, bo, false));
             } else if let Some(w) = leaf_read(ctx, st, op, i) {
                 if bo + w > n {
                     return None;
@@ -277,6 +332,13 @@ fn tmp_flow(
                 }
                 writers.push((op, bo, bo + w));
             } else {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(
+                        target: "pliron::memcpyopt",
+                        "tmp use is opaque: {}",
+                        Operation::get_opid(op, ctx)
+                    );
+                }
                 return None;
             }
         }

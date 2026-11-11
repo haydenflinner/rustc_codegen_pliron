@@ -251,6 +251,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 arg_extent: None,
                 arg_noalias: None,
                 arg_byval_ro: None,
+                arg_ro: None,
                 bb: false,
                 callee: callee_sym,
                 noret: false,
@@ -1244,7 +1245,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let mut exts = vec![(0u64, 0u64); full.len()];
         let mut nals = vec![false; full.len()];
         let mut ros = vec![false; full.len()];
-        let (mut any_nc, mut any_ex, mut any_nal, mut any_ro) = (false, false, false, false);
+        let mut roas = vec![false; full.len()];
+        let (mut any_nc, mut any_ex, mut any_nal, mut any_ro, mut any_roa) =
+            (false, false, false, false, false);
         let mut sret_cap = false;
         if let Some(abi) = fn_abi {
             use rustc_target::callconv::PassMode;
@@ -1290,6 +1293,26 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     && deduced
                         .get(ai + 1)
                         .is_some_and(|d| d.read_only(self.tcx, env, a.layout.ty));
+                // `readonly` from the param's own attrs — rustc stamps it
+                // on frozen `&T` (`PointerKind::SharedRef`, together with
+                // `noalias` and `captures_readonly`) and inserts it into
+                // Indirect attrs from `deduced`. A `&T` operand marked here
+                // is a bounded read of the pointee for memcpyopt's tmp
+                // cone (`&mut T` is writable; `&Cell<T>` never freezes).
+                let roa: &[bool] = match &a.mode {
+                    PassMode::Direct(attrs)
+                    | PassMode::Indirect { attrs, .. }
+                    | PassMode::IndirectUnsized { attrs, .. } => &[attrs
+                        .regular
+                        .contains(rustc_target::callconv::ArgAttribute::ReadOnly)],
+                    PassMode::Pair(a0, a1) => &[
+                        a0.regular
+                            .contains(rustc_target::callconv::ArgAttribute::ReadOnly),
+                        a1.regular
+                            .contains(rustc_target::callconv::ArgAttribute::ReadOnly),
+                    ],
+                    _ => &[],
+                };
                 // The `(size, align)` range the callee may legally reach
                 // through this operand: a ref's pointee layout, or the
                 // whole arg for Indirect. Raw pointers are excluded —
@@ -1347,11 +1370,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     if ro {
                         ros[j + k] = true;
                     }
+                    if roa.get(k).copied().unwrap_or(false) {
+                        roas[j + k] = true;
+                    }
                 }
                 any_nc |= cap;
                 any_ex |= ext.is_some_and(|e| e.0 > 0);
                 any_nal |= na.iter().any(|b| *b);
                 any_ro |= ro;
+                any_roa |= roa.iter().any(|b| *b);
                 j += n;
             }
         }
@@ -1366,6 +1393,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
             info.arg_noalias = any_nal.then(|| nals.into_boxed_slice());
             info.arg_byval_ro = any_ro.then(|| ros.into_boxed_slice());
+            info.arg_ro = any_roa.then(|| roas.into_boxed_slice());
             // rustc's `noreturn` (rustc_codegen_llvm `apply_attrs_llfn`): the
             // return layout is uninhabited, so the call cannot come back.
             info.noret = fn_abi.is_some_and(|a| a.ret.layout.is_uninhabited());
