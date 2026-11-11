@@ -269,6 +269,13 @@ pub struct Lower<'func, I: VCodeInst> {
     /// relaxation (`try_postindex` in the aarch64 lower).
     postindex_cfg_dt: Option<(crate::flowgraph::ControlFlowGraph, crate::dominator_tree::DominatorTree)>,
 
+    /// PLIRON: lazily-built set of blockparams whose every incoming
+    /// blockcall arg is provably narrow-clean (aarch64
+    /// `narrow_uext_clean`; built by `clean_blockparams` there).
+    /// `Rc` so the ISLE context can hold the set while also borrowing
+    /// `self` immutably for the cleanliness walk.
+    narrow_clean_params: Option<alloc::rc::Rc<FxHashSet<Value>>>,
+
     /// Compilation flags.
     flags: Flags,
 }
@@ -559,6 +566,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             pending_postindex: None,
             pending_out_movs: smallvec![],
             postindex_cfg_dt: None,
+            narrow_clean_params: None,
             flags,
         })
     }
@@ -2213,6 +2221,19 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             (cfg, dt)
         });
         dt.dominates(a, b, &f.layout)
+    }
+
+    /// PLIRON: the lazily-built set of narrow-clean blockparams for this
+    /// function (aarch64 `narrow_uext_clean`). `build` computes it once.
+    pub fn clean_blockparams(
+        &mut self,
+        build: impl FnOnce(&Lower<'func, I>) -> FxHashSet<Value>,
+    ) -> alloc::rc::Rc<FxHashSet<Value>> {
+        if self.narrow_clean_params.is_none() {
+            let set = alloc::rc::Rc::new(build(&*self));
+            self.narrow_clean_params = Some(set);
+        }
+        self.narrow_clean_params.as_ref().unwrap().clone()
     }
 
     /// PLIRON: is `ir_inst` the load/store claimed by a pending

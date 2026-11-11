@@ -751,7 +751,12 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     budget 16) extends the `val_already_extended` oracle (patch 36) to
     canonical narrow `iconst`s, `band` with one clean operand, and
     `bor`/`bxor` of two clean operands (all exact 32-bit `and`/`orr`/`eor`;
-    the `bic`/`orn`/`eon` forms need a `bnot` operand, never clean). Users:
+    the `bic`/`orn`/`eon` forms need a `bnot` operand, never clean), plus
+    blockparams whose every incoming blockcall arg is clean
+    (`build_clean_blockparams` — a per-function greatest-fixpoint sweep,
+    memoized in `Lower::narrow_clean_params`, sound coinductively so
+    loop-carried `y = phi(clean, band(y, k))` phis qualify) and call
+    results whose signature return slot declares `uext`. Users:
     - `Lower::gen_return` asks the new `LowerBackend::narrow_ret_uext_clean`
       for each i8/i16 `uext` return and passes `skip_uext` to
       `gen_copy_regs_to_retval`, dropping the ABI `uxtb`/`uxth` (309 of
@@ -807,7 +812,10 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     modelled dirty anyway), 512 call-arg `uext` skip, 1024 narrow
     `iadd`/`isub`-by-const `icmp`-vs-const fusions and the same fold on
     a `br_table` bounds check (`uextend (iadd c, -s)` index →
-    `sub c, s; cmp c-s, N` when `s + N <= W`). A dirty-source
+    `sub c, s; cmp c-s, N` when `s + N <= W`), 2048 blockparam and
+    `uext`-declared call-result cleanliness (the oracle extensions
+    above; −315 uxtb/uxth and −2112 B `__text` on rust-html-rewriter's
+    benchmark). A dirty-source
     passthrough variant of 256 was tried and reverted: it converted one
     shared `uxtb` into one extension/test per fusing use and grew
     regex-syntax `.text`.

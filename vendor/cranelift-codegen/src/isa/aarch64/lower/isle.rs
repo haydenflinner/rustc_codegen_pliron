@@ -33,6 +33,7 @@ use crate::{
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use crate::FxHashSet;
 use regalloc2::PReg;
 
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
@@ -104,7 +105,10 @@ pub(crate) fn narrowext_enabled() -> bool {
 /// the operand's `uxtb`/`uxth` by rolling the constant (eq/ne) or by
 /// comparing the unmasked 32-bit result when the wrapped/unwrapped
 /// orderings agree (`narrow_addsub_cmp`), and the same unsigned-bound
-/// fold on `br_table` indices (`btsub_imm`).
+/// fold on `br_table` indices (`btsub_imm`), 2048 = cleanliness of
+/// blockparams (proven clean when every incoming blockcall arg is
+/// clean — `build_clean_blockparams`' greatest-fixpoint sweep) and of
+/// call results whose signature return slot declares `uext`.
 /// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -123,21 +127,34 @@ pub(crate) fn narrowext_part(bit: u64) -> bool {
 /// canonical narrow `iconst` (materialized by `movz` or a masked constant
 /// load), `band` with a clean operand, `bor`/`bxor` with two clean operands
 /// (all three lower to exact 32-bit `and`/`orr`/`eor`; the `bic`/`orn`/`eon`
-/// forms only match through a `bnot` operand, which is never clean), plus
-/// the existing leaf cases so the recursion sees through them. `budget`
-/// bounds the walk; running out answers "dirty".
-pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> bool {
+/// forms only match through a `bnot` operand, which is never clean),
+/// blockparams in `params` (`build_clean_blockparams` proves them clean
+/// from every incoming edge arg), call results whose signature declares a
+/// zero-extended return, plus the existing leaf cases so the recursion
+/// sees through them. `budget` bounds the walk; running out answers
+/// "dirty".
+pub(crate) fn narrow_uext_clean(
+    lctx: &Lower<'_, MInst>,
+    v: Value,
+    budget: &mut u32,
+    params: &FxHashSet<Value>,
+) -> bool {
     if *budget == 0 {
         return false;
     }
     *budget -= 1;
+    let dfg = lctx.dfg();
     let ty = dfg.value_type(v);
     let mask: u64 = match ty {
         I8 => 0xff,
         I16 => 0xffff,
         _ => return false,
     };
-    let Some(inst) = dfg.value_def(v).inst() else {
+    let def = dfg.value_def(v);
+    if let crate::ir::ValueDef::Param(..) = def {
+        return params.contains(&v);
+    }
+    let Some(inst) = def.inst() else {
         return false;
     };
     match &dfg.insts[inst] {
@@ -159,14 +176,31 @@ pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget
             args,
         } => {
             let [a, b] = *args;
-            narrow_uext_clean(dfg, b, budget) || narrow_uext_clean(dfg, a, budget)
+            narrow_uext_clean(lctx, b, budget, params)
+                || narrow_uext_clean(lctx, a, budget, params)
         }
         InstructionData::Binary {
             opcode: Opcode::Bor | Opcode::Bxor,
             args,
         } => {
             let [a, b] = *args;
-            narrow_uext_clean(dfg, a, budget) && narrow_uext_clean(dfg, b, budget)
+            narrow_uext_clean(lctx, a, budget, params)
+                && narrow_uext_clean(lctx, b, budget, params)
+        }
+        // A call result is clean when this return slot's ABI declares
+        // unsigned extension (`call_signature` covers `call`,
+        // `call_indirect`, and the `try_call` pair; `try_call` return
+        // values are `ValueDef::Result`s of the try_call).
+        InstructionData::Call { .. }
+        | InstructionData::CallIndirect { .. }
+        | InstructionData::TryCall { .. }
+        | InstructionData::TryCallIndirect { .. } => {
+            narrowext_part(2048)
+                && dfg
+                    .call_signature(inst)
+                    .and_then(|sig| dfg.signatures[sig].returns.get(def.num()))
+                    .map(|p| p.extension == ArgumentExtension::Uext)
+                    .unwrap_or(false)
         }
         // A narrow `ushr`'s register is clean either way: the default
         // lowering zero-extends the operand first, and the clean-operand
@@ -195,6 +229,84 @@ pub(crate) fn narrow_uext_clean(dfg: &crate::ir::DataFlowGraph, v: Value, budget
         }
         _ => false,
     }
+}
+
+/// PLIRON: blockparams whose every incoming blockcall arg is provably
+/// narrow-clean — O(E) per pass, converging in a few passes, memoized
+/// in `Lower::narrow_clean_params`.
+///
+/// Greatest-fixpoint direction: start from all params assumed clean and
+/// evict any param with an edge arg that fails under the assumption,
+/// to a fixpoint. The converged set is sound by coinduction — for every
+/// survivor, every edge arg is clean given that all survivors' regs are
+/// clean, so induction over any execution trace keeps them clean —
+/// and it proves self-sustaining cases a grow-direction pass cannot,
+/// like loop-carried `y = phi(clean, band(y, k))`. Intermediate sets
+/// are NOT sound, so on the (unrealistic) non-convergence cap the
+/// result is thrown away rather than shipped half-proven.
+fn build_clean_blockparams(lctx: &Lower<'_, MInst>) -> FxHashSet<Value> {
+    let f = lctx.f;
+    let dfg = &f.dfg;
+    let mut edges: Vec<(Value, Option<Value>)> = Vec::new();
+    let mut prev: FxHashSet<Value> = FxHashSet::default();
+    for block in f.layout.blocks() {
+        for p in dfg.block_params(block) {
+            if matches!(dfg.value_type(*p), I8 | I16) {
+                prev.insert(*p);
+            }
+        }
+        let Some(term) = f.layout.last_inst(block) else {
+            continue;
+        };
+        for bc in dfg.insts[term].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+            let target = bc.block(&dfg.value_lists);
+            for (i, arg) in bc.args(&dfg.value_lists).enumerate() {
+                if let Some(&p) = dfg.block_params(target).get(i) {
+                    edges.push((p, arg.as_value()));
+                }
+            }
+        }
+    }
+    // Entry params whose signature arg doesn't declare uext can be
+    // dirty in the register; evict them up front rather than assume.
+    if let Some(entry) = f.layout.entry_block() {
+        for (i, p) in dfg.block_params(entry).iter().enumerate() {
+            if !f
+                .signature
+                .params
+                .get(i)
+                .map(|a| a.extension == ArgumentExtension::Uext)
+                .unwrap_or(false)
+            {
+                prev.remove(p);
+            }
+        }
+    }
+    for _ in 0..16 {
+        let mut next = prev.clone();
+        let mut dirty = FxHashSet::default();
+        for &(p, arg) in &edges {
+            if dirty.contains(&p) {
+                continue;
+            }
+            let ok = match arg {
+                Some(av) => {
+                    let mut budget = 8;
+                    narrow_uext_clean(lctx, av, &mut budget, &prev)
+                }
+                None => false,
+            };
+            if !ok {
+                next.remove(&p);
+                dirty.insert(p);
+            }
+        }
+        if next == prev {
+            return next;
+        }
+        prev = next;
+    }
+    FxHashSet::default()
 }
 
 /// PLIRON: bits of `v` known zero — a bounded known-bits walk for the
@@ -1531,7 +1643,19 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     fn narrowext_clean(&mut self, val: Value) -> bool {
         let mut budget = 16;
-        narrowext_part(1) && narrow_uext_clean(self.lower_ctx.dfg(), val, &mut budget)
+        if !narrowext_part(1) {
+            return false;
+        }
+        // Bit 2048: blockparam cleanliness from incoming edge args.
+        static EMPTY: std::sync::OnceLock<FxHashSet<Value>> = std::sync::OnceLock::new();
+        let rc;
+        let params: &FxHashSet<Value> = if narrowext_part(2048) {
+            rc = self.lower_ctx.clean_blockparams(build_clean_blockparams);
+            &rc
+        } else {
+            EMPTY.get_or_init(FxHashSet::default)
+        };
+        narrow_uext_clean(self.lower_ctx, val, &mut budget, params)
     }
 
     /// PLIRON (`PLIRON_NARROWEXT` bit 64): `val`'s register is already zero
