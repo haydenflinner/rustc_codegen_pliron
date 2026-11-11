@@ -150,6 +150,9 @@ fn any_between(
 /// copy destinations write; calls, compares and block args can observe
 /// `tmp`'s address itself).
 fn leaf_read(ctx: &Context, st: &State, op: Ptr<Operation>, i: usize) -> Option<u64> {
+    if st.volatile.contains(op) {
+        return None;
+    }
     if Operation::is_op::<LoadOp>(op, ctx) && i == 0 {
         return Some(size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0);
     }
