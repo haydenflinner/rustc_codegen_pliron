@@ -93,6 +93,12 @@ single-site bonus. At k=2 it inlines pulldown-cmark's
 inlines it too): ~5% faster on that benchmark (~4.22→~4.00 ms) and
 the symbol dies. Cost: +3.9% regex-syntax `.text` — stays opt-in.
 
+Fresh 5-round held-out on HEAD: geomean **1.076 [1.060,1.095]**
+(vs 1.054 on 11-10 — within machine drift; the table is updated).
+`regex` reads 1.082 [1.069,1.188] vs its old 1.011 — wide CI,
+interleaves cleanly on manual re-runs (~1.08), `PLIRON_BUNROLL=0`
+makes no difference. Watch item, not clearly a regression.
+
 `pulldown-cmark` (1.139): top self-time `escape_html_scalar` 17%
 (already NEON-vectorized; 282 vs 149, the delta is bounds-check tails)
 and `scalar_iterate_special_bytes` 11% — 5704 IR ops, LLVM inlines
