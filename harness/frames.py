@@ -22,13 +22,13 @@ OD = "llvm-objdump"  # resolved in main() via ctime._llvm_tool
 def frames(obj):
     """Symbol -> frame bytes from its `sub sp` prologue."""
     txt = subprocess.run([OD, "-d", "--no-show-raw-insn", obj], capture_output=True, text=True).stdout
-    out, cur, tot, x16, seen = {}, None, 0, 0, 0
+    out, cur, tot, x16, seen, eax = {}, None, 0, 0, 0, 0
     for line in txt.splitlines():
         m = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
         if m:
             if cur is not None:
                 out[cur] = tot
-            cur, tot, x16, seen = m.group(1), 0, 0, 0
+            cur, tot, x16, seen, eax = m.group(1), 0, 0, 0, 0
             continue
         if cur is None or seen > 24:  # the prologue only
             continue
@@ -49,6 +49,14 @@ def frames(obj):
             tot += int(m.group(1), 16)
         elif m := re.search(r"sub\s+rsp, 0x([0-9a-f]+)", line):
             tot += int(m.group(1), 16)  # Intel syntax
+        elif (m := re.search(r"add[a-z0-9]*\s+\$0x([0-9a-f]+), %rsp", line)) and tot:
+            tot -= int(m.group(1), 16)  # probe-page add-back: `sub; touch; add`
+        elif m := re.search(r"mov[a-z0-9]*\s+\$0x([0-9a-f]+), %e?ax", line):
+            eax = int(m.group(1), 16)
+        elif re.search(r"sub[a-z0-9]*\s+%rax, %rsp|sub\s+rsp, rax|chkstk", line):
+            # `movl $frame, %eax; call __chkstk; sub %rax, %rsp` — the
+            # alloca size is in eax, the sub is register-indirect.
+            tot += eax
         elif re.search(r"push[a-z0-9]*\s+%r", line) or re.search(r"push\s+r[a-z0-9]+", line):
             tot += 8
     if cur is not None:
