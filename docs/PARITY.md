@@ -322,9 +322,12 @@ in the scoreboard and in the linked history files.
   kernels (`sieve`, `nbody`) by up to ±10% native and ±25% under V8.
   Check deltas with `bench/layout.sh` and `run.mjs --layouts=N` before
   acting on them.
-- **x86-64** has not been measured since 2026-10-22 (Windows i7,
-  `history/2026-10-22-parity-scoreboard.md`). Re-measure before working
-  on x64-specific gaps.
+- **x86-64** was re-measured 2026-11 on Windows (i7, msvc): native
+  geomean ~1.09 (`tokenize` 1.85, `fib` 1.43, `iterw` 1.37 worst),
+  wasm ~1.01, STK **1.269** after the Tail-conv xmm8-15 callee-save fix
+  (`PLIRON_X64_TAILXMM`; was 1.556 after honest `__chkstk`/probe
+  accounting). Session log: `history/x64-notes.md` "Windows x64
+  session".
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).

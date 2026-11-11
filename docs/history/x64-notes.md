@@ -980,3 +980,59 @@ N=1..256 incl. non-multiples of 16 — full-matrix diff vs scalar)
 and `/tmp/gather_check.rs` (strides 1..128, u32/u64, do-while
 steps) ALL OK on both arches; fuzz ICEs are the pre-existing
 cparm set, unchanged by this work.
+
+## Windows x64 session (2026-11, x86_64-pc-windows-msvc, i7)
+
+Pull `4c10eb4 -> cef682d` (~499 commits). Windows harness fixes in
+`02d36af` (wait4->GetProcessMemoryInfo RSS, llvm-tools resolution from
+the pinned toolchain, COFF `.text$mn` size accounting, `subq`/`pushq`
+frame regexes, `RtlVirtualUnwind` decl, CONSTSINK aarch64 gate).
+
+### Frame accounting was a measurement artifact
+
+`frames.py` x86-64: LLVM's `__chkstk` frames counted only pushes (the
+indirect `subq %rax,%rsp` was missed — fixed by tracking `eax` through
+the call), and pliron's inline probe `subq $0x1000/touch/addq $0x1000`
+was double-counted. Bogus STK 2.114 -> honest ~1.55. Commit `ca3e899`.
+
+### x64 amode fold `e24d00f` (`PLIRON_X64_AMODEIADD`, default on)
+
+`iadd (ishl (iadd idx K) s) base` -> `disp += K<<s` in
+`isa/x64/inst.isle`. Verified in the real `iterw` bench binary — all 8
+unrolled loads use `movl 0xK(%r8,%rbp,4)` — but timing unchanged
+(~1.36x): the residual is block-param restores, not address material.
+
+### RIP sampler `harness/ripsample.py` (`3b35d48`)
+
+No-admin sampler (SuspendThread+GetThreadContext on the spawned child,
+~46k samples/10 s) — the measurement tool this box was missing:
+- `tokenize` 1.85x: hot byte-scan loop pays ~3 spill-slot accesses/byte
+  (cursor+data ptr live on stack); per-token path pays TLS fetch +
+  non-inlined 3-insn `is_some` call + duplicate compares. Matches the
+  documented "nonnull lost through stack slots" root cause — Mac-side
+  `memcpyopt` territory, don't duplicate.
+- `fib` 1.43x: hottest insns are prologue/epilogue slot save+reload;
+  loop carries `movl %ecx,%ecx` (uextend upper-bits not provably clean
+  at vcode level — `MCPBB` can't drop it).
+- `iterw`: `movq %r14,%rsi` block-param restore per element.
+
+### Tail-conv xmm save storm `9df5288` (`PLIRON_X64_TAILXMM`, default on)
+
+Windows x64 makes xmm6-15 callee-saved; SysV has none — so this gap is
+invisible on aarch64. pliron's internal ABI is `CallConv::Tail`; a Tail
+callee reported `SYSV_CLOBBERS`, so every WindowsFastcall caller of an
+internal fn clobbered all ten callee-saved xmm regs and saved xmm6-15
+(~160 B + 20 movdqu) even with no xmm live — `translate` saved all 10
+and used none (LLVM: saves 0). Now Tail calls on Windows report
+`SYSV \ xmm8-15` and Tail callees save xmm8-15 only when used; xmm6/7
+stay volatile (Tail float args/rets use xmm0-7) so the floor is 32 B.
+regex-syntax STK **1.556 -> 1.269** (`translate` 2152 -> 2024 B).
+Tests: `pliron-clif-opt/tests/x64_tail_winxmm.rs`.
+
+### Windows gate state
+
+4 FAILs, all verified pre-existing/environmental: `xfactsplugin` (MSVC
+fat-LTO unsupported — no relocatable link flavor), `xcguhome` (`nm`
+missing; toolchain ships `llvm-nm`), `edgemerge`/`loopalign` (diffs
+identical with knobs on/off). `corpus:syn`, `pgo`, `cmp3`, `fuzzreg`
+green.
