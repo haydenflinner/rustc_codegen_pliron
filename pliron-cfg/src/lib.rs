@@ -202,6 +202,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // across 77 fns, all shrinks, diff+gate clean under the flag
     // (FindMatchLengthWithLimitMin4 872->696 emitted).
     "PLIRON_LDMERGE",
+    // Adjacent `store.i8` pairs fed by adjacent `load.i8`s (scalarized
+    // 2-byte aggregate copies, sort-element swaps) -> `load.i16`/
+    // `store.i16` (LLVM's MergeConsecutiveStores). regex-syntax
+    // drift::sort<ClassBytesRange> 963->867 insns, rlib -200, wasm
+    // -573B; corpus diff clean, kernels flat-to-better (Sortw -11%).
+    "PLIRON_STMERGE",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

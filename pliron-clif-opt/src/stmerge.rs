@@ -44,7 +44,7 @@ fn peel_addr(func: &Function, v: Value, off: i64) -> (Value, i64) {
         let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
         let k = const_i64(func, a).map(|k| (b, k)).or_else(|| const_i64(func, b).map(|k| (a, k)));
         let Some((nv, k)) = k else { break };
-        off += k;
+        off = off.wrapping_add(k);
         v = nv;
     }
     (v, off)
@@ -146,7 +146,8 @@ pub fn run(func: &mut Function) -> usize {
             // the byte the merged store moves earlier (endpoints are
             // the stores themselves, so the span is exclusive).
             if b0 != b1
-                || bo0 + 1 != bo1
+                || bo0.wrapping_add(1) != bo1
+                || i64::from(bo0 as i32) != bo0
                 || (k0 + 1 < k1
                     && !insts[k0 + 1..k1].iter().all(|&i| {
                         let op = func.dfg.insts[i].opcode();
@@ -179,7 +180,8 @@ pub fn run(func: &mut Function) -> usize {
             if consumed.contains(&l0)
                 || consumed.contains(&l1)
                 || lb0 != lb1
-                || lbo0 + 1 != lbo1
+                || lbo0.wrapping_add(1) != lbo1
+                || i64::from(lbo0 as i32) != lbo0
                 || lf0 != lf1
                 || !lf0.notrap()
                 || !no_writes_between(func, &insts, p0.min(p1), p0.max(p1))
