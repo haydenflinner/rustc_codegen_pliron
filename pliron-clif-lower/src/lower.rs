@@ -7086,7 +7086,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
         // callee can't retain it — kept out of `CallInfo::nocap`, which
         // SROA reads as "a fresh copy is unobservable" (backwards for a
         // return slot). Its extent is the return layout (`arg_extent[0]`).
-        if info.sret_nocap {
+        // Opt-in: the syncs it enables measured ~+1.7–4.7KB .text on
+        // regex-syntax for no runtime gain.
+        if info.sret_nocap && pliron_cfg::env_is("PLIRON_SRETNC", "1") {
             for (k, &s) in csrc.iter().enumerate() {
                 if s == 0 {
                     let ext = info

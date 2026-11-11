@@ -285,6 +285,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   pulldown-cmark's `scalar_iterate_special_bytes` at k=2, but the
   held-out A/B is net-negative (regex +8% slower) — `fanin` still
   applies; no promotion path.
+- `PLIRON_SRETNC=1` (opt-in) — the sret out-pointer counts as a bounded
+  call operand (`CallInfo::sret_nocap`), so slotprom syncs the
+  out-slot's covered fields instead of pinning it to memory. Costed
+  +1.7–4.7KB .text on regex-syntax for no measured runtime — dormant
+  by default.
+- `PLIRON_SLOTPROM_EVICT=1` (opt-in) — over `MAX_FIELDS`, evict
+  least-accessed slots to fit instead of the all-or-nothing bail. The
+  bail doubles as a profitability bound; partial promotion measured
+  +5.9KB .text on regex-syntax for no runtime gain.
+- `PLIRON_SLOTPROM_EXT=0` — slotprom whole-slot call coverage, i.e.
+  revert extent-limited syncs (`nocap` carries per-operand byte
+  extents from `arg_extent`).
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 

@@ -325,6 +325,8 @@ pub fn run_lt(
     let max_livein = crate::env_get("PLIRON_SLOTPROM_LIVEIN")
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_LIVEIN);
+    // `PLIRON_SLOTPROM_EXT=0` reverts to whole-slot call coverage.
+    let ext_on = crate::pass_enabled("PLIRON_SLOTPROM_EXT");
     let timer = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::slotprom", tracing::Level::INFO);
     let t0 = timer.then(std::time::Instant::now);
@@ -461,7 +463,7 @@ pub fn run_lt(
                                     .unwrap_or(u64::MAX);
                                 // `ANY` (unknown offset) covers the slot.
                                 let mut off = off;
-                                if off == webroot::ANY {
+                                if off == webroot::ANY || !ext_on {
                                     off = 0;
                                     ext = u64::MAX;
                                 }
@@ -618,10 +620,17 @@ pub fn run_lt(
             }
         }
     }
-    // Over the param-bloat bound, evict whole slots — least-accessed
-    // first — rather than abandoning every promotion. A dropped slot's
+    // Over the param-bloat bound the default is the all-or-nothing
+    // bail: wide-CFG functions pay a param move per live-in edge per
+    // field, so the bound doubles as a profitability guard (partial
+    // promotion measured +5.9KB .text on regex-syntax for no runtime
+    // gain). `PLIRON_SLOTPROM_EVICT=1` instead evicts whole slots —
+    // least-accessed first — until the survivors fit. A dropped slot's
     // accesses simply stay on memory.
     if fields.len() > MAX_FIELDS {
+        if !pliron_cfg::env_is("PLIRON_SLOTPROM_EVICT", "1") {
+            return 0;
+        }
         let mut by_field: FxHashMap<StackSlot, usize> = FxHashMap::default();
         for f in &fields {
             *by_field.entry(f.slot).or_default() += 1;

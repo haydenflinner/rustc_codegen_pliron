@@ -183,6 +183,13 @@ Held-out A/B `sc/pliron`: geomean 1.001 neutral, rust-compression
 0.984 — `history/2026-11-11-srccopy-memcap-narrowext-ret.md` (which
 also covers the `PLIRON_CGU_MEMCAP` memory throttle and the
 narrowext ret-arg ireduce sink).
+`nocap` call operands now carry byte extents and `slotprom` syncs
+only the covered fields (bc8e581; `PLIRON_SLOTPROM_EXT=0` reverts).
+The two extra mechanisms it enabled — sret out-pointer boundedness
+(`PLIRON_SRETNC`) and `MAX_FIELDS` partial eviction
+(`PLIRON_SLOTPROM_EVICT`) — measured +3.1% `.text` on regex-syntax
+for no runtime gain and are opt-in
+(`history/2026-11-11-nocap-extents-sret-evict.md`).
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
