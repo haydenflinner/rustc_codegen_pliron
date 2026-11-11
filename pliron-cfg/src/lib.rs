@@ -229,6 +229,12 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // Cap inlining of high-fan-in callees (2026-10-27-ir-size.md). lockf
     // ctime: FANIN=8 cut syn text 1.94→1.46x / RSS 1.81→1.52x. `=0` off.
     ("PLIRON_INLINE_FANIN", "8"),
+    // Drop-glue call-site threshold cap (bfc18cc): glue lowers ~1 op:1
+    // insn, so mid-size glue slips under the 320-op limit where LLVM
+    // declines it, cloning dealloc+landing-pad paths into every site.
+    // regex-syntax .text 356,016->346,064 (-2.8%), wasm obj -1.0%,
+    // kernels flat. `=0` off.
+    ("PLIRON_INLINE_DROPLIM", "64"),
     // Waffle single-callsite inline cap (src/wasm.rs). 15: slight win
     // over 25 on regex-wasm post-WTREEREMAT; 10 is a wash. Prior 100.
     ("PLIRON_WASM_SOLO", "15"),
