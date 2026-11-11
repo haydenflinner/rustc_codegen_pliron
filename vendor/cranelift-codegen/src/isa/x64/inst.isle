@@ -601,6 +601,41 @@
 (rule amode_imm_reg_reg_shift_shl_lhs 2 (amode_imm_reg_reg_shift flags (ishl _ y (iconst _ (uimm8 shift))) x offset)
         (if-let true (u32_lt_eq shift 3))
         (Amode.ImmRegRegShift offset x y shift flags))
+(decl pure pliron_amode_iadd () bool)
+(extern constructor pliron_amode_iadd pliron_amode_iadd)
+
+;; PLIRON: `base + ((idx + K) << s)` folds `K<<s` into the displacement
+;; instead of materializing `idx+K` with a separate `lea`. Indexed-loop
+;; addressing (pliron's `iadd`/`ishl`/`iadd` chains) hits this on every
+;; strided access; without it each element costs one extra ALU op.
+(rule amode_imm_reg_reg_shift_iadd_shl_rhs 3
+      (amode_imm_reg_reg_shift flags x (ishl _ (iadd _ y (i64_from_iconst k)) (iconst _ (uimm8 shift))) offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
+(rule amode_imm_reg_reg_shift_iadd_shl_rhs2 4
+      (amode_imm_reg_reg_shift flags x (ishl _ (iadd _ (i64_from_iconst k) y) (iconst _ (uimm8 shift))) offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
+(rule amode_imm_reg_reg_shift_iadd_shl_lhs 5
+      (amode_imm_reg_reg_shift flags (ishl _ (iadd _ y (i64_from_iconst k)) (iconst _ (uimm8 shift))) x offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
+(rule amode_imm_reg_reg_shift_iadd_shl_lhs2 6
+      (amode_imm_reg_reg_shift flags (ishl _ (iadd _ (i64_from_iconst k) y) (iconst _ (uimm8 shift))) x offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
 
 ;; Offsetting an Amode. Used when we need to do consecutive
 ;; loads/stores to adjacent addresses.

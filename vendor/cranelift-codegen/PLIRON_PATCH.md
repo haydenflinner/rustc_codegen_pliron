@@ -1604,3 +1604,12 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     vs 70-77): the unsigned-carry shape is a subset of this pattern
     and the extern's decline path emits a plain `add`, which would
     shadow them. Test: `pliron-clif-opt/tests/aarch64_cinc.rs`.
+
+118. x64 amode: fold `(idx + K) << s` into the load/store displacement
+    (`isa/x64/inst.isle` `amode_imm_reg_reg_shift_iadd_shl_{lhs,rhs}{,2}`,
+    priorities 3-6 over the plain `ishl` rules; `PLIRON_X64_AMODEIADD=0` disables): pliron lowers indexed
+    addressing as `iadd (ishl (iadd idx K) s) base`, which used to
+    materialize `idx+K` in a register (`leaq` per element in unrolled
+    loops). Now `K<<s` joins the amode's imm32, checked with
+    `i64_try_into_i32` + `i32_checked_add`, so `[base + idx*4 + 4*K]`
+    is one memory operand like LLVM's.

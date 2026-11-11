@@ -528,6 +528,16 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
             .is_none()
     }
 
+    /// pliron: `PLIRON_X64_AMODEIADD=0` disables folding `K<<s` of an
+    /// `iadd`-inside-`ishl` index into the amode displacement.
+    #[inline]
+    fn pliron_amode_iadd(&mut self) -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PLIRON_X64_AMODEIADD").map_or(true, |v| v != "0")
+        });
+        *ON
+    }
+
     /// pliron: `PLIRON_X64_BITTAB=0` disables the `(bitmap >> x) & 1`
     /// -> `bt` fold in `is_nonzero_band`.
     #[inline]
