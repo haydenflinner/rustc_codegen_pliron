@@ -1541,6 +1541,14 @@ fn run_loop(
             Err(why) => bail!(why),
         }
     }
+    // `unroll_width` prices only the body, but each retained exit also
+    // emits a shared cone clone — code the unroll itself would never
+    // have added (utf8_valid_up_to grew 68→129 blocks cloning ~8 cold
+    // panic cones behind a k=4 body). Bound the clones by what the
+    // unrolled copies add: past that, the exits outweigh the unroll.
+    if clone_insts > n_insts * (k as usize).saturating_sub(1) {
+        bail!("exit cones outweigh the unroll");
+    }
 
     {
         let targets: Vec<Block> = std::iter::once(eblk)
