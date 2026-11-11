@@ -1,0 +1,41 @@
+; test stmerge
+; check: load.i16 notrap little v0
+; check: store notrap little
+; check-not: store.i8
+; A scalarized 2-byte copy: `load.i8` pair at adjacent source offsets
+; feeding a `store.i8` pair at adjacent destination offsets (the sort
+; swap shape) merges into `load.i16`/`store.i16`.
+function %copy(i64, i64) {
+block0(v0: i64, v1: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v0+1
+    store.i8 notrap v10, v1
+    store.i8 notrap v11, v1+1
+    return
+}
+
+; Same merge with the +1 offsets expressed through `iadd` — the shape
+; the scalarizer actually emits.
+function %copy_iadd(i64, i64) {
+block0(v0: i64, v1: i64):
+    v10 = load.i8 notrap v0
+    v20 = iconst.i64 1
+    v21 = iadd.i64 v0, v20
+    v11 = load.i8 notrap v21
+    store.i8 notrap v10, v1
+    v22 = iadd.i64 v1, v20
+    store.i8 notrap v11, v22
+    return
+}
+
+; Pure work between the stores does not block the merge.
+function %copy_pure_between(i64, i64) {
+block0(v0: i64, v1: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v0+1
+    store.i8 notrap v10, v1
+    v30 = iconst.i64 7
+    v31 = iadd.i64 v0, v30
+    store.i8 notrap v11, v1+1
+    return
+}

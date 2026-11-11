@@ -175,7 +175,7 @@ fn collect(func: &Function, v: Value, out: &mut Vec<Value>, in_tree: &mut FxHash
 /// necessarily as aligned) and `can_move` (it is anchored at the first
 /// load's position). Endianness is pinned little — the byte order the
 /// shift assembly computed.
-fn merged_flags(f: MemFlagsData) -> MemFlagsData {
+pub(crate) fn merged_flags(f: MemFlagsData) -> MemFlagsData {
     let mut nf = MemFlagsData::new()
         .with_alias_region(f.alias_region())
         .with_trap_code(f.trap_code())
@@ -189,7 +189,7 @@ fn merged_flags(f: MemFlagsData) -> MemFlagsData {
     nf
 }
 
-fn no_writes_between(func: &Function, insts: &[Inst], lo: usize, hi: usize) -> bool {
+pub(crate) fn no_writes_between(func: &Function, insts: &[Inst], lo: usize, hi: usize) -> bool {
     insts[lo..=hi].iter().all(|&i| {
         let op = func.dfg.insts[i].opcode();
         !(op.can_store() || op.is_call() || op.other_side_effects())

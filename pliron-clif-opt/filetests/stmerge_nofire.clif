@@ -1,0 +1,55 @@
+; test stmerge
+; check-not: load.i16
+; check-not: store.i16
+; A load between the stores could read the byte the merged store would
+; write early — keep both narrow.
+function %copy_load_between(i64, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v0+1
+    store.i8 notrap v10, v1
+    v30 = load.i8 notrap v2
+    store.i8 notrap v11, v1+1
+    return
+}
+
+; The stored bytes still have other uses — widening their loads is not
+; free.
+function %copy_multiuse(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v0+1
+    store.i8 notrap v10, v1
+    store.i8 notrap v11, v1+1
+    return v10
+}
+
+; Trapping stores keep their own trap points.
+function %copy_trapping(i64, i64) {
+block0(v0: i64, v1: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v0+1
+    store.i8 v10, v1
+    store.i8 v11, v1+1
+    return
+}
+
+; Non-adjacent destination bytes do not merge.
+function %copy_gap(i64, i64) {
+block0(v0: i64, v1: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v0+1
+    store.i8 notrap v10, v1
+    store.i8 notrap v11, v1+2
+    return
+}
+
+; Adjacent stores whose bytes come from disjoint sources do not merge.
+function %copy_diffsrc(i64, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v10 = load.i8 notrap v0
+    v11 = load.i8 notrap v2
+    store.i8 notrap v10, v1
+    store.i8 notrap v11, v1+1
+    return
+}

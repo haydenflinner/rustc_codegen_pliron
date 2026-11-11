@@ -3972,6 +3972,12 @@ fn s_ldmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_stmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = stmerge::run(&mut p.clctx.func);
+    p.stats.merged += k;
+    k
+}
+
 fn s_cmpmerge(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = cmpmerge::run(&mut p.clctx.func, an);
     p.stats.merged += k;
@@ -5125,6 +5131,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // normalize loads after the first ldmerge (Min4's stack-copy
         // compare loop is built there).
         step("ldmerge2", "ldmerge", Gate::OptIn("PLIRON_LDMERGE"), s_ldmerge),
+        // Adjacent `store.i8` pairs fed by adjacent `load.i8`s (scalarized
+        // 2-byte aggregate copies in sort swaps) widen to `i16`. After
+        // ldmerge2: its rewrites create new byte-pair sources.
+        step("stmerge", "stmerge", Gate::OptIn("PLIRON_STMERGE"), s_stmerge),
         // Guarded byte-compare cascades (unrolled slice equality):
         // a wide-compare fast path on the edge into the first compare
         // block. After ldmerge2 — the same late trees are done.

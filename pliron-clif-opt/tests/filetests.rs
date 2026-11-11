@@ -158,6 +158,7 @@ fn pass(name: &str) -> Pass {
             pliron_clif_opt::lsr::run(f, &mut an)
         },
         "ldmerge" => pliron_clif_opt::ldmerge::run,
+        "stmerge" => pliron_clif_opt::stmerge::run,
         "cmpmerge" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::cmpmerge::run(f, &mut an)
