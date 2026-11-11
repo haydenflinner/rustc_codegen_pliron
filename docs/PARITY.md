@@ -175,6 +175,14 @@ it out-of-line at ~6% self-time) while regex-syntax's `bump`/`char`/
 `peek` stay out. Held-out A/B `w3/pliron`: rust-compression 0.944
 [0.935,0.958], geomean 0.998 [0.974,1.008]; binary sizes neutral
 except the `regex` crate +0.8%.
+`PLIRON_LOADFWD_SRCCOPY` is default-on (2d2b8a2): a load covered by
+`store (load s)` re-reads `s` (LLVM's memcpy-forwarding) — brotli's
+`sub_match!` buffers collapse to direct slice loads once `bunroll`
+exposes the copy (`PLIRON_BUNROLL_BODY`, default 48, stays a knob).
+Held-out A/B `sc/pliron`: geomean 1.001 neutral, rust-compression
+0.984 — `history/2026-11-11-srccopy-memcap-narrowext-ret.md` (which
+also covers the `PLIRON_CGU_MEMCAP` memory throttle and the
+narrowext ret-arg ireduce sink).
 
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,

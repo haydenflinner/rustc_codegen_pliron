@@ -276,6 +276,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   committed growth of running jobs plus its own estimate stays under the
   cap. Deadlock floors: one job always runs, and an ordinal a parked
   stage-B job waits on is exempt. macOS only (`footprint_mib`).
+- `PLIRON_BUNROLL_BODY=<insts>` — `bunroll` per-body inst cap
+  (default 48). ~200 exposes memcpy'd chunk loops to `loadfwd`'s
+  source-copy rule; costs .text on big crates.
+- `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
+  functions get 2x the inline limit (body dies when all sites inline,
+  LLVM's last-callsite bonus generalised). `fanin` still applies.
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 
