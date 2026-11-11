@@ -90,8 +90,14 @@ Post-w3 profile of rust-compression: `HqZopfliBackwardReferences`
 (`t.max(limit*2)`) never lifted a callee that had already earned the
 single-site bonus. At k=2 it inlines pulldown-cmark's
 `scalar_iterate_special_bytes` (callers=2, cost 5704 vs t=3840, LLVM
-inlines it too): ~5% faster on that benchmark (~4.22→~4.00 ms) and
-the symbol dies. Cost: +3.9% regex-syntax `.text` — stays opt-in.
+inlines it too): the symbol dies and that benchmark gains ~2-5%.
+Held-out A/B `pair/pliron` (5 rounds): geomean 1.010 — NET NEGATIVE.
+pulldown-cmark 0.980 and rust-json 0.975 win, but regex is 1.079
+*slower* (DFA helpers the bonus inlines cost runtime, not just
+.text) and rust-protobuf 1.020. Plus +3.9% regex-syntax `.text`.
+Firmly opt-in; no promotion path at this formula. The residual would
+need per-callsite specialization evidence (what LLVM actually pays
+for), not a callers-count bonus.
 
 Fresh 5-round held-out on HEAD: geomean **1.076 [1.060,1.095]**
 (vs 1.054 on 11-10 — within machine drift; the table is updated).
