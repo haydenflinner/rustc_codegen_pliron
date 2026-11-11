@@ -2923,7 +2923,7 @@ impl<I: VCodeInst> VCode<I> {
                         static NORETUDF: std::sync::OnceLock<bool> =
                             std::sync::OnceLock::new();
                         if (code_follows
-                            || *NORETUDF.get_or_init(|| pliron_mode("PLIRON_NORETUDF", 0) != 0))
+                            || *NORETUDF.get_or_init(|| pliron_mode("PLIRON_NORETUDF", 1) != 0))
                             && self.insts[iix.index()].trap_code()
                                 == Some(crate::ir::TrapCode::NORETURN_CALL)
                             && iix.index() > brange.start

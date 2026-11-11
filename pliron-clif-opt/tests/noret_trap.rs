@@ -1,7 +1,7 @@
 //! `TrapCode::NORETURN_CALL` (`PLIRON_NORETTRAP=1` lowering): the trap after
-//! a call that cannot return is dropped at emission when code follows it,
-//! and kept when it ends the function (the return address must stay inside
-//! it) or when the trap is an ordinary one (`user2`, a may-return callee).
+//! a call that cannot return is dropped at emission — when code follows
+//! it, and, under `PLIRON_NORETUDF=1` (default), at a function end too —
+//! while an ordinary trap (`user2`, a may-return callee) is kept.
 //! A `try_call` whose continuation is such a lone trap emits nothing after
 //! the call, and its dead continuation block emits nothing either.
 //!
@@ -94,13 +94,9 @@ block6:
 fn noreturn_trap_dropped_when_code_follows() {
     let o = compile(&three_sites("user250"));
     let n = o.count(TrapCode::NORETURN_CALL);
-    // Only a trap that ends the function survives.
-    assert!(n <= 1, "{} NORETURN_CALL traps kept: {:?}", n, o.traps);
-    for &(off, c) in &o.traps {
-        if c == TrapCode::NORETURN_CALL {
-            assert!(off + 4 >= o.len.saturating_sub(4), "kept mid-function: {off} of {}", o.len);
-        }
-    }
+    // Under `PLIRON_NORETUDF` (default on) every one drops, the
+    // function-end one included.
+    assert_eq!(n, 0, "{} NORETURN_CALL traps kept: {:?}", n, o.traps);
     assert_eq!(o.ret_addrs.len(), 3);
 }
 
@@ -114,7 +110,9 @@ fn ordinary_trap_after_call_kept() {
 }
 
 #[test]
-fn noreturn_trap_kept_at_function_end() {
+fn noreturn_trap_dropped_at_function_end() {
+    // `PLIRON_NORETUDF` default: unwind lookups use `ret_addr - 1`, so
+    // the `bl`'s own address still resolves to this frame.
     let o = compile(
         "function %f(i32) {
     sig0 = (i32)
@@ -124,8 +122,7 @@ block0(v0: i32):
     trap user250
 }",
     );
-    assert_eq!(o.count(TrapCode::NORETURN_CALL), 1, "{:?}", o.traps);
-    assert_eq!(o.after_call(TrapCode::NORETURN_CALL), 1);
+    assert_eq!(o.count(TrapCode::NORETURN_CALL), 0, "{:?}", o.traps);
 }
 
 #[test]
@@ -173,9 +170,10 @@ fn noreturn_try_call_continuation_elided() {
     let o = compile(&invoke("user250"));
     assert_eq!(o.ret_addrs.len(), 1);
     // Nothing after the call: neither the inline continuation trap nor
-    // the (dead) lone continuation block, unless it ends the function.
+    // the (dead) lone continuation block, and none survives elsewhere
+    // under `PLIRON_NORETUDF` either.
     assert_eq!(o.after_call(TrapCode::NORETURN_CALL), 0, "{:?} / {:?}", o.traps, o.ret_addrs);
-    assert!(o.count(TrapCode::NORETURN_CALL) <= 1, "{:?}", o.traps);
+    assert_eq!(o.count(TrapCode::NORETURN_CALL), 0, "{:?}", o.traps);
 }
 
 #[test]

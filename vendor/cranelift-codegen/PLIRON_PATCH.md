@@ -923,12 +923,12 @@ the sum; plain `ushr` lowering zero-extends first. They now require
       split-edge block in front of it; one forward walk from the entry)
       bind their label and emit nothing. Off under
       `machine_code_cfg_info`.
-    `PLIRON_NORETUDF` (opt-in) additionally drops the last-block
-    `NORETURN_CALL` trap: the call's return address then points past the
-    function, but unwind lookups use `ret_addr - 1`, which still lands
-    on the `bl` (LLVM emits no trap there either). −1.1 KB and −323
-    `udf`s on regex-syntax. Covered by `optin:` gate runs of `noret`,
-    `unwind` and `unwindstd`.
+    `PLIRON_NORETUDF` (default on; `=0` off) additionally drops the
+    last-block `NORETURN_CALL` trap: the call's return address then
+    points past the function, but unwind lookups use `ret_addr - 1`,
+    which still lands on the `bl` (LLVM emits no trap there either).
+    −1.1 KB and −323 `udf`s on regex-syntax. Covered by `optin:` gate
+    runs of `noret`, `unwind` and `unwindstd`.
     Tests: `pliron-clif-opt/tests/noret_trap.rs` (trap and call-site
     records; x86-64 under Rosetta with `--target x86_64-apple-darwin`).
 
