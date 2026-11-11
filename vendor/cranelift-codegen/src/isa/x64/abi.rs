@@ -971,6 +971,8 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     ) -> PRegSet {
         match (call_conv_of_callee, is_exception) {
             (isa::CallConv::Tail, true) => ALL_CLOBBERS,
+            // PLIRON: on Windows, Tail callees preserve xmm8-15.
+            (isa::CallConv::Tail, false) if tail_winxmm() => TAIL_WINDOWS_CLOBBERS,
             // Note that "PreserveAll" actually preserves nothing at
             // the callsite if used for a `try_call`, because the
             // unwinder ABI for `try_call`s is still "no clobbered
@@ -1011,10 +1013,20 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             // The `winch` calling convention doesn't have any callee-save
             // registers.
             CallConv::Winch => vec![],
-            CallConv::Fast | CallConv::SystemV | CallConv::Tail => regs
+            CallConv::Fast | CallConv::SystemV => regs
                 .iter()
                 .cloned()
                 .filter(|r| is_callee_save_systemv(r.to_reg(), flags.enable_pinned_reg()))
+                .collect(),
+            // PLIRON: on Windows, Tail adds xmm8-15 to the callee-save set
+            // so callers of internal functions don't pay the save storm.
+            CallConv::Tail => regs
+                .iter()
+                .cloned()
+                .filter(|r| {
+                    is_callee_save_systemv(r.to_reg(), flags.enable_pinned_reg())
+                        || (tail_winxmm() && is_tail_windows_xmm_save(r.to_reg()))
+                })
                 .collect(),
             CallConv::WindowsFastcall => regs
                 .iter()
@@ -1239,6 +1251,41 @@ fn get_fltreg_for_retval(call_conv: CallConv, fltreg_idx: usize, is_last: bool) 
     }
 }
 
+// PLIRON: set per-compile by `X64Backend::compile_vcode` from the ISA
+// triple. On Windows x64 our internal `CallConv::Tail` treats xmm8-15 as
+// callee-saved (xmm6/7 stay volatile: they are Tail float arg/retval
+// regs, `get_fltreg_for_{arg,retval}`). Stock Tail inherits the SysV
+// clobber set, so every WindowsFastcall caller of an internal function
+// reported all ten callee-saved xmm regs as clobbered and paid a
+// ~160-byte save/restore storm even when it never touched them.
+// `PLIRON_X64_TAILXMM=0` restores the old behavior.
+thread_local! {
+    static PLIRON_X64_WINDOWS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+pub(crate) fn pliron_set_x64_windows(is_windows: bool) {
+    PLIRON_X64_WINDOWS.with(|c| c.set(is_windows));
+}
+
+fn tail_winxmm() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PLIRON_X64_TAILXMM").map_or(true, |v| v != "0")
+    });
+    *ON && PLIRON_X64_WINDOWS.with(|c| c.get())
+}
+
+/// PLIRON: xmm8-15 are callee-saved under `CallConv::Tail` on Windows
+/// (xmm6/7 stay volatile: Tail passes and returns floats in xmm0-7).
+fn is_tail_windows_xmm_save(r: RealReg) -> bool {
+    use asm::xmm::enc::*;
+
+    r.class() == RegClass::Float
+        && matches!(
+            r.hw_enc(),
+            XMM8 | XMM9 | XMM10 | XMM11 | XMM12 | XMM13 | XMM14 | XMM15
+        )
+}
+
 fn is_callee_save_systemv(r: RealReg, enable_pinned_reg: bool) -> bool {
     use asm::gpr::enc::*;
 
@@ -1294,6 +1341,10 @@ fn compute_clobber_size(clobbers: &[Writable<RealReg>]) -> u32 {
 
 const WINDOWS_CLOBBERS: PRegSet = windows_clobbers();
 const SYSV_CLOBBERS: PRegSet = sysv_clobbers();
+// PLIRON: `CallConv::Tail` call-site clobbers on Windows: the SysV set
+// minus xmm8-15, which Tail callees preserve there (see `tail_winxmm`).
+// xmm6/7 stay clobbered -- they are Tail float arg/retval regs.
+const TAIL_WINDOWS_CLOBBERS: PRegSet = tail_windows_clobbers();
 pub(crate) const ALL_CLOBBERS: PRegSet = all_clobbers();
 const NO_CLOBBERS: PRegSet = PRegSet::empty();
 
@@ -1358,6 +1409,32 @@ const fn sysv_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM13))
         .with(regs::fpr_preg(XMM14))
         .with(regs::fpr_preg(XMM15));
+    with_high_xmm(set)
+}
+
+// PLIRON: `sysv_clobbers` minus xmm8-15.
+const fn tail_windows_clobbers() -> PRegSet {
+    use asm::gpr::enc::*;
+    use asm::xmm::enc::*;
+
+    let set = PRegSet::empty()
+        .with(regs::gpr_preg(RAX))
+        .with(regs::gpr_preg(RCX))
+        .with(regs::gpr_preg(RDX))
+        .with(regs::gpr_preg(RSI))
+        .with(regs::gpr_preg(RDI))
+        .with(regs::gpr_preg(R8))
+        .with(regs::gpr_preg(R9))
+        .with(regs::gpr_preg(R10))
+        .with(regs::gpr_preg(R11))
+        .with(regs::fpr_preg(XMM0))
+        .with(regs::fpr_preg(XMM1))
+        .with(regs::fpr_preg(XMM2))
+        .with(regs::fpr_preg(XMM3))
+        .with(regs::fpr_preg(XMM4))
+        .with(regs::fpr_preg(XMM5))
+        .with(regs::fpr_preg(XMM6))
+        .with(regs::fpr_preg(XMM7));
     with_high_xmm(set)
 }
 

@@ -66,6 +66,13 @@ impl X64Backend {
         regalloc_ctx: &mut regalloc2::Ctx,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<VCode<inst::Inst>> {
+        // PLIRON: tell the ABI layer whether this is a Windows target so
+        // `CallConv::Tail` keeps xmm8-15 callee-saved (see
+        // `abi::tail_winxmm`). Thread-local so mixed-triple processes are
+        // still per-function correct.
+        abi::pliron_set_x64_windows(
+            self.triple.operating_system == target_lexicon::OperatingSystem::Windows,
+        );
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
         let emit_info = EmitInfo::new(self.flags.clone(), self.x64_flags.clone());

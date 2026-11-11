@@ -1613,3 +1613,18 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     loops). Now `K<<s` joins the amode's imm32, checked with
     `i64_try_into_i32` + `i32_checked_add`, so `[base + idx*4 + 4*K]`
     is one memory operand like LLVM's.
+
+119. x64 Windows `CallConv::Tail` xmm8-15 callee-saves (`PLIRON_X64_TAILXMM=0`
+    disables; `isa/x64/abi.rs` `tail_winxmm`/`is_tail_windows_xmm_save`/
+    `TAIL_WINDOWS_CLOBBERS`, `pliron_set_x64_windows` thread-local set
+    from the ISA triple in `isa/x64/mod.rs::compile_vcode`): pliron's
+    internal ABI is `Tail`, and a Tail callee reported the SysV clobber
+    set, so every WindowsFastcall caller of an internal function
+    clobbered all ten callee-saved xmm regs and saved xmm6-15 (~160 B,
+    20 movdqu) even with no xmm values live. On Windows, Tail calls now
+    report `SYSV_CLOBBERS \ xmm8-15` and Tail callees save xmm8-15 when
+    they use them — same contract as the Windows ABI, so callers keep
+    live xmm8-15 across internal calls and save nothing they don't use.
+    xmm6/7 stay volatile (Tail float args/rets use xmm0-7), so the floor
+    is 32 B. regex-syntax STK ratio 1.556 -> 1.269. Test:
+    `pliron-clif-opt/tests/x64_tail_winxmm.rs`.
