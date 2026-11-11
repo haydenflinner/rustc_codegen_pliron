@@ -56,6 +56,20 @@ fn dom_of<'a>(
     slot.as_ref()
 }
 
+/// The per-function incoming-edge map for block arguments, built on
+/// first need — a parameter the forwards below never resolve never pays
+/// for the walk.
+fn inc_of<'a>(
+    ctx: &Context,
+    f: Ptr<Operation>,
+    slot: &'a mut Option<IncMap>,
+) -> Option<&'a IncMap> {
+    if slot.is_none() {
+        *slot = Some(incoming_map(ctx, f));
+    }
+    slot.as_ref()
+}
+
 /// `a` strictly dominates `b` — same block settled by op order, others
 /// by the domtree.
 fn op_dominates(
@@ -365,6 +379,7 @@ fn try_forward(
     st: &mut State,
     f: Ptr<Operation>,
     dom: &mut Option<Dom>,
+    pin: &mut Option<IncMap>,
     sret_args: &[Value],
     m: Ptr<Operation>,
 ) -> bool {
@@ -406,7 +421,23 @@ fn try_forward(
     let (dbase, doff) = if sret_args.contains(&dst) {
         (dst, 0)
     } else {
-        let Some((base, off)) = alloca_base(ctx, st, dst) else {
+        let Some((base, off)) = alloca_base(ctx, st, inc_of(ctx, f, pin), dst) else {
+            if pliron_cfg::tracing_on() {
+                let kind = match dst.defining_op() {
+                    None => "block-arg",
+                    Some(d) if Operation::is_op::<LoadOp>(d, ctx) => "load",
+                    Some(d) if st.calls.get(d).is_some() => "call",
+                    Some(d) => {
+                        tracing::debug!(
+                            target: "pliron::memcpyopt",
+                            "dst base is {}",
+                            Operation::get_opid(d, ctx)
+                        );
+                        "other"
+                    }
+                };
+                tracing::debug!(target: "pliron::memcpyopt", "dst unbased: {kind}");
+            }
             why!("dst has no provable base");
         };
         if base == src
@@ -433,7 +464,7 @@ fn try_forward(
                     continue;
                 }
                 if crate::types::leaf_is_ptr(ctx, x.get_type(ctx)).contains(&true)
-                    && !disjoint(ctx, st, sret_args, x, dst)
+                    && !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
                 {
                     why!("call writer's arg may alias dst");
                 }
@@ -443,8 +474,8 @@ fn try_forward(
             Some("llvm.memcpy" | "llvm.memmove")
         ) {
             let x = w.deref(ctx).operands(ctx).nth(1).unwrap();
-            if alloca_base(ctx, st, x).is_some_and(|(b, _)| b == src)
-                || !disjoint(ctx, st, sret_args, x, dst)
+            if alloca_base(ctx, st, inc_of(ctx, f, pin), x).is_some_and(|(b, _)| b == src)
+                || !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
             {
                 why!("copy writer's src may alias dst");
             }
@@ -514,20 +545,118 @@ fn try_forward(
     true
 }
 
+/// Every block parameter's incoming edges in `f`, as `(terminator,
+/// successor index, operand position)` triples — one pass over the
+/// terminators, built on first need. The edge VALUES must not be cached:
+/// `replace_all_uses_with` rewrites operand lists and `try_forward`
+/// erases ops, so the operand is fetched lazily from the (never-erased)
+/// terminator at resolution time.
+type IncMap = FxHashMap<Value, Vec<(Ptr<Operation>, usize, usize)>>;
+
+fn incoming_map(ctx: &Context, f: Ptr<Operation>) -> IncMap {
+    let mut m: IncMap = FxHashMap::default();
+    for b in f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx) {
+        let Some(t) = b.deref(ctx).get_terminator(ctx) else {
+            continue;
+        };
+        let o = Operation::get_op_dyn(t, ctx);
+        let Some(br) = op_cast::<dyn BranchOpInterface>(&*o) else {
+            continue;
+        };
+        for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
+            for k in 0..br.successor_operands(ctx, si).len() {
+                m.entry(s.deref(ctx).get_argument(ctx, k))
+                    .or_default()
+                    .push((t, si, k));
+            }
+        }
+    }
+    m
+}
+
+/// The value terminator `t` forwards into successor `si`'s `k`-th
+/// argument, or None if the edge's operand list no longer matches the
+/// successor's arity (refuse rather than guess).
+fn inc_value(ctx: &Context, t: Ptr<Operation>, si: usize, k: usize) -> Option<Value> {
+    let o = Operation::get_op_dyn(t, ctx);
+    let br = op_cast::<dyn BranchOpInterface>(&*o)?;
+    let v = br.successor_operands(ctx, si);
+    let na = t.deref(ctx).get_successor(ctx, si).deref(ctx).get_num_arguments();
+    if v.len() != na {
+        return None;
+    }
+    v.get(k).copied()
+}
+
 /// The alloca `v` points into and the constant byte offset, through a chain
-/// of constant GEPs.
-fn alloca_base(ctx: &Context, st: &State, mut v: Value) -> Option<(Value, u64)> {
+/// of constant GEPs — and, when `inc` is given, through block parameters
+/// every incoming edge resolves to the same alloca and offset.
+fn alloca_base(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    v: Value,
+) -> Option<(Value, u64)> {
+    let mut memo = FxHashMap::default();
+    let mut on = FxHashSet::default();
+    alloca_base_d(ctx, st, inc, v, &mut memo, &mut on)
+}
+
+fn alloca_base_d(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    mut v: Value,
+    memo: &mut FxHashMap<Value, Option<(Value, u64)>>,
+    on: &mut FxHashSet<Value>,
+) -> Option<(Value, u64)> {
     let mut off: i64 = 0;
     for _ in 0..16 {
-        let d = v.defining_op()?;
-        if Operation::is_op::<AllocaOp>(d, ctx) {
-            return (st.allocas.contains(v) && off >= 0).then_some((v, off as u64));
+        if let Some(d) = v.defining_op() {
+            if Operation::is_op::<AllocaOp>(d, ctx) {
+                return (st.allocas.contains(v) && off >= 0).then_some((v, off as u64));
+            }
+            if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
+                return None;
+            }
+            off = off.checked_add(gep_offset(ctx, st, d)?)?;
+            v = d.deref(ctx).get_operand(ctx, 0);
+            continue;
         }
-        if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
-            return None;
+        // Block argument: it is `base + off` only when every incoming edge
+        // forwards a pointer resolving to the same base and offset. A
+        // loop-carried param's backedge value recurses into the param
+        // itself — `on` spots the cycle and refuses.
+        if let Some(&r) = memo.get(&v) {
+            return r;
         }
-        off = off.checked_add(gep_offset(ctx, st, d)?)?;
-        v = d.deref(ctx).get_operand(ctx, 0);
+        let mut res: Option<(Value, u64)> = None;
+        if on.insert(v) {
+            if let Some(edges) = inc.and_then(|m| m.get(&v)).filter(|v| !v.is_empty()) {
+                let mut ok = true;
+                for &(t, si, k) in edges {
+                    let bo = inc_value(ctx, t, si, k)
+                        .and_then(|iv| alloca_base_d(ctx, st, inc, iv, memo, on));
+                    match (res, bo) {
+                        (None, Some(b)) => res = Some(b),
+                        (Some(a), Some(b)) if a == b => {}
+                        _ => {
+                            res = None;
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    res = None;
+                }
+            }
+            on.remove(&v);
+        }
+        memo.insert(v, res);
+        let (b, po) = res?;
+        off = off.checked_add(i64::try_from(po).ok()?)?;
+        return (off >= 0).then(|| (b, off as u64));
     }
     None
 }
@@ -537,10 +666,17 @@ fn alloca_base(ctx: &Context, st: &State, mut v: Value) -> Option<(Value, u64)> 
 /// against the caller's `sret` argument (a caller-owned pointer cannot
 /// address this frame). Two `sret`-side pointers may alias each other —
 /// not disjoint.
-fn disjoint(ctx: &Context, st: &State, sret_args: &[Value], x: Value, dst: Value) -> bool {
+fn disjoint(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    sret_args: &[Value],
+    x: Value,
+    dst: Value,
+) -> bool {
     match (
-        alloca_base(ctx, st, x),
-        alloca_base(ctx, st, dst),
+        alloca_base(ctx, st, inc, x),
+        alloca_base(ctx, st, inc, dst),
         sret_args.contains(&x),
         sret_args.contains(&dst),
     ) {
@@ -566,9 +702,15 @@ fn base_touches(
 ) -> Option<FxHashSet<Ptr<Operation>>> {
     let mut out: FxHashSet<Ptr<Operation>> = FxHashSet::default();
     let mut seen = 0usize;
-    // (pointer value, its byte offset in base, offset known)
+    // (pointer value, its byte offset in base, offset known) — a graph,
+    // not a tree: branch operands carry the pointer into block params,
+    // and a loop-carried param can carry it back in.
+    let mut done: FxHashSet<(Value, u64, bool)> = FxHashSet::default();
     let mut work: Vec<(Value, u64, bool)> = vec![(base, 0, true)];
     while let Some((p, bo, known)) = work.pop() {
+        if !done.insert((p, bo, known)) {
+            continue;
+        }
         for u in p.uses_iter(ctx) {
             seen += 1;
             if seen > 512 {
@@ -576,6 +718,10 @@ fn base_touches(
             }
             let op = u.user_op();
             let i = u.find_index(ctx);
+            if let Some(param) = succ_param(ctx, op, i) {
+                work.push((param, bo, known));
+                continue;
+            }
             if Operation::is_op::<GetElementPtrOp>(op, ctx) {
                 if i != 0 {
                     // The pointer is an index — it escapes as a scalar.
@@ -937,7 +1083,7 @@ fn try_byval(ctx: &mut Context, st: &mut State, m: Ptr<Operation>) -> bool {
     if call.deref(ctx).get_parent_block() != Some(block) {
         bail!("call in another block");
     }
-    let Some((a, off)) = alloca_base(ctx, st, src) else {
+    let Some((a, off)) = alloca_base(ctx, st, None, src) else {
         bail!("source is not a constant offset into an alloca");
     };
     let Some(&(asize, aalign)) = st.allocas.get(a) else {
@@ -1037,6 +1183,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
             .collect();
         let blocks: Vec<_> = f.deref(ctx).get_region(ctx, 0).deref(ctx).iter(ctx).collect();
         let mut dom = None;
+        let mut pin = None;
         for b in blocks {
             let ops: Vec<_> = b.deref(ctx).iter(ctx).collect();
             for op in ops {
@@ -1048,7 +1195,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                 {
                     continue;
                 }
-                n += try_forward(ctx, st, f, &mut dom, &sret_args, op) as usize;
+                n += try_forward(ctx, st, f, &mut dom, &mut pin, &sret_args, op) as usize;
             }
         }
     }
