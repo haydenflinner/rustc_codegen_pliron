@@ -342,8 +342,20 @@ in the scoreboard and in the linked history files.
   motivating leaf (`hash_one`, 1 call) from call-carrying helpers:
   regex-syntax .text −5.3%, matched-symbol excess vs LLVM −9.4%
   (parse fns at/below LLVM size), parse_only −9.3%, hash kernels
-  flat. `PLIRON_INLINE=200` shaves another −6%; the residual is
-  per-function codegen, not one transform.
+  flat. `PLIRON_INLINE=200` shaves another −6% but regressed
+  Hmget +18%/Hashmap +3.3% — rejected; the residual is
+  per-function codegen, not one transform. Drop-glue update
+  2026-11-10 (`bfc18cc`+`2337769`): glue bodies lower ~1 op:1
+  insn, so the ~150-op `drop_glue<Vec<T>>`/`Box<T>` bodies slip
+  under the 320-op limit (+alloca-arg save) where LLVM keeps
+  them as calls — each clone drags its own `dealloc` /
+  `panic_in_cleanup` / `Unwind_Resume` copies (~63 K ops across
+  406 sites in regex-syntax alone). `PLIRON_INLINE_DROPLIM=64`
+  (default) caps drop-glue call-site thresholds: .text
+  356,016→346,064 (−2.8%), `pop_class_op` 752→600 insns (LLVM
+  234 — its remaining excess is `Box::new`/`push_mut` inlines
+  LLVM also makes plus extra MIR drop sites), regex wasm
+  objects −1.0%, kernels flat.
 - **xcgu copies.** On kernels, ~14 KB of the rlib gap is per-CGU IPO
   clones (genuinely specialised, not dedup-able at the link) and ~5.5 KB
   is byte-identical `non-external` copies ld64 keeps in full. A linked
