@@ -472,7 +472,8 @@ fn try_forward(
             Some("llvm.memcpy" | "llvm.memmove")
         ) {
             let x = w.deref(ctx).operands(ctx).nth(1).unwrap();
-            if alloca_base(ctx, st, inc_of(ctx, f, pin), x).is_some_and(|(b, _)| b == src)
+            if alloca_bases(ctx, st, inc_of(ctx, f, pin), x)
+                .is_some_and(|bs| bs.contains(&src))
                 || !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
             {
                 why!("copy writer's src may alias dst");
@@ -767,6 +768,75 @@ fn alloca_base_d(
     None
 }
 
+/// Every alloca `v` may point into, through constant GEPs and block
+/// parameters — the union of `alloca_base`'s per-edge resolutions rather
+/// than their agreement, so a param merging different slots still
+/// resolves. `None` when any edge is opaque, a cycle bites, or more than
+/// 16 bases meet (bounded: ambiguity grows monotonically).
+fn alloca_bases(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    v: Value,
+) -> Option<FxHashSet<Value>> {
+    let mut memo: FxHashMap<Value, Option<FxHashSet<Value>>> = FxHashMap::default();
+    let mut on = FxHashSet::default();
+    alloca_bases_d(ctx, st, inc, v, &mut memo, &mut on)
+        .filter(|s| !s.is_empty() && s.len() <= 16)
+}
+
+fn alloca_bases_d(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    mut v: Value,
+    memo: &mut FxHashMap<Value, Option<FxHashSet<Value>>>,
+    on: &mut FxHashSet<Value>,
+) -> Option<FxHashSet<Value>> {
+    for _ in 0..16 {
+        if let Some(d) = v.defining_op() {
+            if Operation::is_op::<AllocaOp>(d, ctx) {
+                return st.allocas.contains(v).then(|| [v].into_iter().collect());
+            }
+            if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
+                return None;
+            }
+            v = d.deref(ctx).get_operand(ctx, 0);
+            continue;
+        }
+        if let Some(r) = memo.get(&v) {
+            return r.clone();
+        }
+        if !on.insert(v) {
+            memo.insert(v, None);
+            return None;
+        }
+        let mut acc: Option<FxHashSet<Value>> = Some(FxHashSet::default());
+        if let Some(edges) = inc.and_then(|m| m.get(&v)).filter(|e| !e.is_empty()) {
+            for &(t, si, k) in edges {
+                let Some(iv) = inc_value(ctx, t, si, k)
+                    .and_then(|iv| alloca_bases_d(ctx, st, inc, iv, memo, on))
+                else {
+                    acc = None;
+                    break;
+                };
+                let a = acc.as_mut().unwrap();
+                a.extend(iv);
+                if a.len() > 16 {
+                    acc = None;
+                    break;
+                }
+            }
+        } else {
+            acc = None;
+        }
+        on.remove(&v);
+        memo.insert(v, acc.clone());
+        return acc;
+    }
+    None
+}
+
 /// `x` and `dst` provably point at different memory: distinct alloca bases
 /// (stack slots never overlap, whatever the offsets), or an alloca base
 /// against the caller's `sret` argument (a caller-owned pointer cannot
@@ -781,12 +851,12 @@ fn disjoint(
     dst: Value,
 ) -> bool {
     match (
-        alloca_base(ctx, st, inc, x),
-        alloca_base(ctx, st, inc, dst),
+        alloca_bases(ctx, st, inc, x),
+        alloca_bases(ctx, st, inc, dst),
         sret_args.contains(&x),
         sret_args.contains(&dst),
     ) {
-        (Some((a, _)), Some((b, _)), _, _) => a != b,
+        (Some(a), Some(b), _, _) => a.is_disjoint(&b),
         (Some(_), _, _, true) | (_, Some(_), true, _) => true,
         _ => false,
     }
