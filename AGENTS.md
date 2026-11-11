@@ -280,8 +280,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   (default 48). ~200 exposes memcpy'd chunk loops to `loadfwd`'s
   source-copy rule; costs .text on big crates.
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
-  functions get 2x the inline limit (body dies when all sites inline,
-  LLVM's last-callsite bonus generalised). `fanin` still applies.
+  functions get 2x their callsite limit (the body dies when all sites
+  inline, LLVM's last-callsite bonus generalised; reaches
+  pulldown-cmark's `scalar_iterate_special_bytes` at k=2, ~5% on that
+  benchmark). `fanin` still applies.
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 

@@ -86,6 +86,13 @@ Post-w3 profile of rust-compression: `HqZopfliBackwardReferences`
 | `EstimateBitCostsForLiterals` | 695 | 635 | +29 memops |
 | `alloc_if<ZopfliNode>` (5 variants) | ~550 total | 0 | LLVM inlines; 2 non-loop callers → `PLIRON_INLINE_PAIR` (opt-in, ab235ae) reaches it; −2.6KB binary, runtime neutral — stays opt-in |
 
+`PLIRON_INLINE_PAIR` went multiplicative in d73638b: the floor form
+(`t.max(limit*2)`) never lifted a callee that had already earned the
+single-site bonus. At k=2 it inlines pulldown-cmark's
+`scalar_iterate_special_bytes` (callers=2, cost 5704 vs t=3840, LLVM
+inlines it too): ~5% faster on that benchmark (~4.22→~4.00 ms) and
+the symbol dies. Cost: +3.9% regex-syntax `.text` — stays opt-in.
+
 `pulldown-cmark` (1.139): top self-time `escape_html_scalar` 17%
 (already NEON-vectorized; 282 vs 149, the delta is bounds-check tails)
 and `scalar_iterate_special_bytes` 11% — 5704 IR ops, LLVM inlines
