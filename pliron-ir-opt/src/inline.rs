@@ -1194,7 +1194,27 @@ pub fn run(
     let pure = (!always_only && crate::env_is("PLIRON_INLINE_CLEAN", "1"))
         .then(crate::cleanup::Pure::new);
     let mut cleaned = crate::cleanup::Cleaned::default();
-    if once || callers.is_some() || st.deadfree || fanin > 0 {
+    // `PLIRON_INLINE_PAIR=<k>` (0 = off): a callee reachable from at
+    // most `k` calling functions gets `pair_mul`x the limit — when
+    // every remaining site inlines, the out-of-line body dies, so the
+    // net module delta is about one body (LLVM's last-call-to-static
+    // bonus generalized to the last few sites; brotli's
+    // `alloc_if<ZopfliNode>`, 2 callers, cost 596 vs 320, inlined by
+    // LLVM). The warm body itself must still fit the base limit —
+    // the bonus pays for calls + cold scaffolding, not real work —
+    // and address-taken/`#[cold]` callees are excluded; `fanin` still
+    // bounds the total growth. Opt-in: measured +2.1% regex-syntax
+    // .text (Vec::drain/extend_trusted/IntervalSet::new sites) for a
+    // neutral rust-compression runtime — kept as a knob, not default.
+    let pair: usize = if small {
+        0
+    } else {
+        crate::env_get("PLIRON_INLINE_PAIR")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    let pair_mul: usize = 2;
+    if once || callers.is_some() || st.deadfree || fanin > 0 || pair > 0 {
         adj.get_or_insert_with(|| Adj::build(ctx, st));
     }
     let single: FxHashSet<String> = if once {
@@ -1707,6 +1727,20 @@ pub fn run(
                                 .and_then(|s| s.parse().ok())
                                 .unwrap_or(8);
                             t = t.saturating_add(limit * lb / 4);
+                        }
+                        if pair > 0
+                            && !f.always_inline
+                            && !f.cold
+                            && ci.nwarm_ops <= limit
+                            && adj.as_ref().is_some_and(|a| {
+                                !a.taken.contains(cs.as_str())
+                                    && a
+                                        .callers_of
+                                        .get(cs.as_str())
+                                        .is_some_and(|v| v.len() <= pair)
+                            })
+                        {
+                            t = t.max(limit.saturating_mul(pair_mul));
                         }
                         t = t.min(limit.saturating_mul(MAX_T));
                         if free {
