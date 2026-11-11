@@ -539,7 +539,7 @@ fn try_forward(
         let Some(t) = base_touches(ctx, st, dbase, size, 0, size) else {
             why!("dst use-cone not fully walkable");
         };
-        let home_src = t.iter().any(|&c| {
+        let home_src = t.keys().any(|&c| {
             matches!(
                 st.intrinsics.get(c).map(|s| s.as_str()),
                 Some("llvm.memcpy" | "llvm.memmove")
@@ -599,7 +599,7 @@ fn try_forward(
                 },
             };
             if t
-                .iter()
+                .keys()
                 .any(|&t| st.calls.get(t).is_some() || st.invokes.contains(t))
             {
                 why!("tmp could promote; dst escapes to a call");
@@ -609,7 +609,7 @@ fn try_forward(
             why!("dst use-cone not fully walkable");
         };
         let wset: FxHashSet<Ptr<Operation>> = writers.iter().map(|&(w, _, _)| w).collect();
-        let mut poison = touch;
+        let mut poison: FxHashSet<Ptr<Operation>> = touch.keys().copied().collect();
         for &w in &wset {
             poison.remove(&w);
         }
@@ -657,6 +657,61 @@ fn try_forward(
             }
             stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
         }
+        // `dst` readers get the mirror check: the transform drops `m`'s
+        // write, so a `dst` read sees the last write among {plain `dst`
+        // writes, `m`} before it — after the rebase, among {plain `dst`
+        // writes, `tmp` writers}. Walking backward from each op that may
+        // read the copy range, the first byte-changing touch must be `m`
+        // (the reader sits in the copied window) or a plain `dst` write
+        // (it hides anything earlier). A `tmp` writer there means the
+        // write sat between `m` and the reader — its new bytes would
+        // leak into `dst` ahead of schedule. Pure reads are transparent
+        // (they change nothing) and `Other` is too — it may not write,
+        // so it can't cut the route — while calls and escapes are
+        // seeded like plain readers: their own consistency is proven by
+        // their own backward scan. Routes reaching pred-less blocks
+        // leave `dst` alloca-undef on both sides.
+        let mut rseen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
+            FxHashSet::default();
+        for (&r, &kind) in &touch {
+            if kind == TouchKind::Write {
+                continue;
+            }
+            if let Some(rb) = r.deref(ctx).get_parent_block() {
+                stack.push((rb, Some(r)));
+            }
+        }
+        while let Some((b, upto)) = stack.pop() {
+            if !rseen.insert((b, upto)) {
+                continue;
+            }
+            let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+            let end = upto
+                .and_then(|u| ops.iter().position(|&o| o == u))
+                .unwrap_or(ops.len());
+            let mut cut = false;
+            for &o in ops[..end].iter().rev() {
+                steps += 1;
+                if steps > 8192 {
+                    why!("route scan over budget");
+                }
+                if wset.contains(&o) {
+                    why!("tmp write reaches a dst reader after the copy");
+                }
+                // `m` is `Write` — a reader in the copied window stops
+                // there; a plain `dst` write hides anything earlier.
+                // `Read` and `Other` are transparent: neither provably
+                // writes the bytes.
+                if let Some(&TouchKind::Write) = touch.get(&o) {
+                    cut = true;
+                    break;
+                }
+            }
+            if cut {
+                continue;
+            }
+            stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
+        }
     } else if !all_dom {
         why!("writer does not dominate the copy");
     } else {
@@ -665,9 +720,10 @@ fn try_forward(
         // the range keep reading `dst`'s old bytes, which is what they saw
         // before `m` ran anyway.
         for &(w, lo, hi) in &writers {
-            let Some(mut set) = base_touches(ctx, st, dbase, size, doff + lo, hi - lo) else {
+            let Some(t) = base_touches(ctx, st, dbase, size, doff + lo, hi - lo) else {
                 why!("dst use-cone not fully walkable");
             };
+            let mut set: FxHashSet<Ptr<Operation>> = t.keys().copied().collect();
             set.remove(&m);
             set.remove(&w);
             if any_between(ctx, st, dom, f, m, w, &set) {
@@ -724,9 +780,10 @@ fn try_forward(
         if !op_dominates(ctx, st, dom, f, m, r) {
             why!("post-copy read not dominated by the copy");
         }
-        let Some(mut set) = base_touches(ctx, st, dbase, size, doff + ro, rh - ro) else {
+        let Some(t) = base_touches(ctx, st, dbase, size, doff + ro, rh - ro) else {
             why!("dst use-cone not fully walkable");
         };
+        let mut set: FxHashSet<Ptr<Operation>> = t.keys().copied().collect();
         set.remove(&m);
         set.remove(&r);
         for &(w, _, _) in &writers {
@@ -995,6 +1052,23 @@ fn disjoint(
     }
 }
 
+/// What an op may do to the bytes a tracked pointer addresses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TouchKind {
+    /// Only reads (a `load`, a `memcpy`'s source operand).
+    Read,
+    /// Only writes (a `store`, a `memcpy`/`memset`'s destination).
+    Write,
+    /// May do either or something else entirely: a call operand, the
+    /// pointer escaping as a scalar (`gep` index, stored value), or an
+    /// access through a derived pointer whose offset tracking was lost.
+    Other,
+}
+
+/// Every op that may touch the range, classified — `Read` and `Other`
+/// may observe the bytes, `Write` and `Other` may change them.
+type Touches = FxHashMap<Ptr<Operation>, TouchKind>;
+
 /// Every op that may touch bytes `[off, off+len)` of the alloca `base`,
 /// walked through GEP chains (`None` = the walk overflowed or the base's
 /// address reached something unbounded, so "not provably clear"). An op
@@ -1008,8 +1082,8 @@ fn base_touches(
     size: u64,
     off: u64,
     len: u64,
-) -> Option<FxHashSet<Ptr<Operation>>> {
-    let mut out: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+) -> Option<Touches> {
+    let mut out: Touches = FxHashMap::default();
     let mut seen = 0usize;
     // (pointer value, its byte offset in base, offset known) — a graph,
     // not a tree: branch operands carry the pointer into block params,
@@ -1034,7 +1108,7 @@ fn base_touches(
             if Operation::is_op::<GetElementPtrOp>(op, ctx) {
                 if i != 0 {
                     // The pointer is an index — it escapes as a scalar.
-                    out.insert(op);
+                    out.insert(op, TouchKind::Other);
                     continue;
                 }
                 let r = op.deref(ctx).get_result(ctx, 0);
@@ -1053,31 +1127,43 @@ fn base_touches(
                 continue;
             }
             if !known {
-                out.insert(op);
+                out.insert(op, TouchKind::Other);
                 continue;
             }
             // Byte range of the access, when it is statically known.
-            let range = if Operation::is_op::<LoadOp>(op, ctx) {
-                Some((bo, size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0))
+            let (range, kind) = if Operation::is_op::<LoadOp>(op, ctx) {
+                (
+                    Some((bo, size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0)),
+                    TouchKind::Read,
+                )
             } else if Operation::is_op::<StoreOp>(op, ctx) && i == 1 {
-                Some((bo, size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0))
+                (
+                    Some((bo, size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0)),
+                    TouchKind::Write,
+                )
             } else if i <= 1
                 && matches!(
                     st.intrinsics.get(op).map(|s| s.as_str()),
                     Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
                 )
             {
-                op.deref(ctx)
-                    .operands(ctx)
-                    .nth(2)
-                    .and_then(|v| const_int(ctx, st, v))
-                    .and_then(|n| u64::try_from(n).ok())
-                    .map(|n| (bo, n))
+                (
+                    op.deref(ctx)
+                        .operands(ctx)
+                        .nth(2)
+                        .and_then(|v| const_int(ctx, st, v))
+                        .and_then(|n| u64::try_from(n).ok())
+                        .map(|n| (bo, n)),
+                    if i == 0 { TouchKind::Write } else { TouchKind::Read },
+                )
             } else {
-                None
+                (None, TouchKind::Other)
             };
             if range.is_none_or(|(lo, n)| lo < off + len && off < lo.saturating_add(n)) {
-                out.insert(op);
+                let e = out.entry(op).or_insert(kind);
+                if *e != kind {
+                    *e = TouchKind::Other;
+                }
             }
         }
     }
@@ -1666,5 +1752,50 @@ mod tests {
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
         assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    const BR_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;
+            llvm.store *dst <- v;
+            llvm.store *tmp <- v;
+            llvm.cond_br if flag ^a() else ^b()
+    "#;
+
+    /// `dst` read in the join, where the `b` route skips the copy: the
+    /// writer's rebase into `dst` would reach that read without `m`
+    /// ever having run — the read sees `tmp`'s bytes where it saw
+    /// `dst`'s own. The first write-touch on the `b` route is the
+    /// `tmp` writer, not `m` — refuse.
+    #[test]
+    fn bypass_dst_read_refused() {
+        let input = format!(
+            "{BR_HEAD}          ^a():\n{MC}            llvm.br ^join()\n          ^b():\n            llvm.br ^join()\n          ^join():\n            r = llvm.load dst : builtin.integer i64;\n            llvm.return\n        }}\n    }}\n"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// Same copy with the `dst` read inside the copied arm: its only
+    /// routes pass `m` itself, so the rebase is invisible to it —
+    /// forward.
+    #[test]
+    fn window_dst_read_forwarded() {
+        let input = format!(
+            "{BR_HEAD}          ^a():\n{MC}            r = llvm.load dst : builtin.integer i64;\n            llvm.br ^join()\n          ^b():\n            llvm.br ^join()\n          ^join():\n            llvm.return\n        }}\n    }}\n"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
     }
 }
