@@ -191,6 +191,20 @@ The two extra mechanisms it enabled — sret out-pointer boundedness
 for no runtime gain and are opt-in
 (`history/2026-11-11-nocap-extents-sret-evict.md`).
 
+Two more `narrowext` users are default-on: bit 512 skips the call-arg
+`uxtb`/`uxth` when the source register is already narrow-clean
+(353ec61; −172 extends on regex-syntax, −25 on lol_html — most
+residual `uxtb`s were compare materialisation, not ABI work), and bit
+1024 folds a narrow `icmp` of `iadd`/`isub`-by-constant against a
+constant (f24bc1a): eq/ne rolls the constant (`(c∓j) mod W == k` is
+`c == (k±j) mod W`, one `cmp` on `c`, the arithmetic goes dead) and
+the unsigned relations compare the unmasked 32-bit `sub c, j`/`sub c,
+W-j` when the wrapped and unwrapped orderings provably agree
+(`j + k' ≤ W` / `k' ≤ j`); a dirty operand is still widened first, so
+no cleanliness proof is needed. −886 `uxtb`/`uxth` and −1,510
+instructions on rust-html-rewriter's benchmark binary (`__text`
+−6,144 B); residual `uxtb→cmp` sites 1,462 → 632.
+
 `rust-compression` got its own deep-dive
 (`history/2026-11-08-amode-crc-brotli.md`,
 `history/2026-11-09-copypair-scalar-merge.md`): `compress_inner` is at
