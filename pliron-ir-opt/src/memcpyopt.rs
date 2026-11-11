@@ -406,11 +406,9 @@ fn try_forward(
     let Some((roots, writers, readers, marks)) = tmp_flow(ctx, st, m, src, n) else {
         why!("src has opaque or out-of-range uses");
     };
-    for &(w, _, _) in &writers {
-        if !op_dominates(ctx, st, dom, f, w, m) {
-            why!("writer does not dominate the copy");
-        }
-    }
+    let all_dom = writers
+        .iter()
+        .all(|&(w, _, _)| op_dominates(ctx, st, dom, f, w, m));
     // A `memcpy(tmp, tmp)` would rebase into `memcpy(p, p)` — overlap an
     // `llvm.memcpy` forbids. Rare enough to refuse outright.
     if readers.iter().any(|r| writers.iter().any(|w| w.0 == r.0)) {
@@ -490,26 +488,103 @@ fn try_forward(
     if !dom_ok {
         why!("dst base does not dominate all rebase sites");
     }
-    // Between a writer and `m`, nothing may touch the range that writer
-    // commits to `dst` — it would observe the early write. Ops outside
-    // the range keep reading `dst`'s old bytes, which is what they saw
-    // before `m` ran anyway.
     let size = st.allocas.get(dbase).map(|x| x.0).unwrap_or(u64::MAX);
-    for &(w, lo, hi) in &writers {
-        let Some(mut set) = base_touches(ctx, st, dbase, size, doff + lo, hi - lo) else {
+    if !all_dom {
+        // Sibling-arm writers (`if c { f(sret tmp) } else { g(sret tmp)
+        // }; memcpy(dst, tmp)`) can't dominate the copy but still make
+        // it exact — under one rule that also subsumes the dominated
+        // path's window and reader checks: walking backwards from every
+        // consumer of the copy's value (`m` and each `tmp` reader), the
+        // first `dst`-range touch on every route must be a writer. A
+        // `dst` touch dominated by `m` still poisons a wrap route that
+        // reaches `m` again, which block-dominance windows cannot see.
+        // Every writer must cover `[0, n)` so a route's last writer
+        // always commits the same bytes the copy would have moved; a
+        // route that dies at a pred-less block (entry or dead code)
+        // never ran a writer, so `tmp` is still alloca-undef there and
+        // `dst`'s bytes are a legal refinement.
+        if writers.is_empty() || !writers.iter().all(|&(_, lo, hi)| lo == 0 && hi == n) {
+            why!("writer does not dominate the copy");
+        }
+        let Some(touch) = base_touches(ctx, st, dbase, size, doff, n) else {
             why!("dst use-cone not fully walkable");
         };
-        set.remove(&m);
-        set.remove(&w);
-        if any_between(ctx, st, dom, f, m, w, &set) {
-            why!("dst touched in writer-to-copy window");
+        let wset: FxHashSet<Ptr<Operation>> = writers.iter().map(|&(w, _, _)| w).collect();
+        let mut poison = touch;
+        for &w in &wset {
+            poison.remove(&w);
+        }
+        poison.remove(&m);
+        let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
+        if let Some(mb) = m.deref(ctx).get_parent_block() {
+            stack.push((mb, Some(m)));
+        }
+        for &(r, _, _) in &readers {
+            if let Some(rb) = r.deref(ctx).get_parent_block() {
+                stack.push((rb, Some(r)));
+            }
+        }
+        // A node is `(block, stop-before)`: the seed scans only ops
+        // before its consumer; a block reached on a route sits whole on
+        // that route and scans all its ops (so a post-`m` touch in `m`'s
+        // own block still poisons a wrap).
+        let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
+            FxHashSet::default();
+        let mut steps = 0usize;
+        while let Some((b, upto)) = stack.pop() {
+            if !seen.insert((b, upto)) {
+                continue;
+            }
+            let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+            let end = upto
+                .and_then(|u| ops.iter().position(|&o| o == u))
+                .unwrap_or(ops.len());
+            let mut cut = false;
+            for &o in ops[..end].iter().rev() {
+                steps += 1;
+                if steps > 8192 {
+                    why!("route scan over budget");
+                }
+                if wset.contains(&o) {
+                    cut = true;
+                    break;
+                }
+                if poison.contains(&o) {
+                    why!("dst touched on an uncovered route");
+                }
+            }
+            if cut {
+                continue;
+            }
+            stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
+        }
+    } else {
+        // Between a writer and `m`, nothing may touch the range that writer
+        // commits to `dst` — it would observe the early write. Ops outside
+        // the range keep reading `dst`'s old bytes, which is what they saw
+        // before `m` ran anyway.
+        for &(w, lo, hi) in &writers {
+            let Some(mut set) = base_touches(ctx, st, dbase, size, doff + lo, hi - lo) else {
+                why!("dst use-cone not fully walkable");
+            };
+            set.remove(&m);
+            set.remove(&w);
+            if any_between(ctx, st, dom, f, m, w, &set) {
+                why!("dst touched in writer-to-copy window");
+            }
         }
     }
     // A reader after `m` reads `tmp`'s final bytes — `dst`'s after the
     // rebase — so the copy must dominate it (a path skipping `m` could
     // miss writers entirely) and nothing may touch its range in `dst`
     // in between (a write would substitute bytes `tmp` never held).
+    // Under the writer-cut rule the route scan has already proven the
+    // same property for every reader, so these checks are only needed
+    // on the dominated path.
     for &(r, ro, rh) in &readers {
+        if !all_dom {
+            continue;
+        }
         if op_dominates(ctx, st, dom, f, r, m) {
             // A reader before `m` sees `dst`'s new bytes early. That is
             // the correct value only where a writer covering the byte
@@ -1348,5 +1423,45 @@ mod tests {
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
         assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    const ARM_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;
+            llvm.cond_br if flag ^a() else ^b()
+    "#;
+
+    /// `if c { tmp = f() } else { tmp = g() }; memcpy(dst, tmp)`: no
+    /// single writer dominates the copy but each arm does — a writer
+    /// cut — so the forward is still exact.
+    #[test]
+    fn sibling_arm_writers_forwarded() {
+        let input = format!(
+            "{ARM_HEAD}          ^a():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^b():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^join():\n{MC}            llvm.return\n        }}\n    }}\n"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// Same arms but the `else` arm writes `dst` instead of `tmp`: the
+    /// route's last `dst` touch isn't a writer — refuse.
+    #[test]
+    fn armed_dst_touch_refused() {
+        let input = format!(
+            "{ARM_HEAD}          ^a():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^b():\n            llvm.store *dst <- v;\n            llvm.br ^join()\n          ^join():\n{MC}            llvm.return\n        }}\n    }}\n"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
     }
 }
