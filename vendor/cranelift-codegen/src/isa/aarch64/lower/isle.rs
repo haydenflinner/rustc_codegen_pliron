@@ -1238,6 +1238,49 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_CARRYCINC").as_deref() != Ok("0"))
     }
 
+    /// PLIRON (`PLIRON_CINC`, opt-in): `x + (a cc b ? 1 : 0)` —
+    /// `cmp a, b; csinc x, x, !cc` (LLVM's `cinc`) instead of
+    /// `cmp; cset; add`. Declines to the plain `add` when off, when
+    /// the `icmp` has other uses (its `cset` still materializes
+    /// there, so the fused `cmp` is a second compare for nothing),
+    /// or when the compare didn't produce a single flag-setting
+    /// inst.
+    fn iadd_cinc_for(
+        &mut self,
+        ty: Type,
+        x: Value,
+        y: Value,
+        cc: &IntCC,
+        a: Value,
+        b: Value,
+    ) -> InstOutput {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("PLIRON_CINC").as_deref() == Ok("1"))
+            && !self.lower_ctx.value_has_multiple_uses(y)
+            && let CondResult::Cond {
+                flags: ProducesFlags::ProducesFlagsSideEffect { inst },
+                cond,
+            } = generated_code::constructor_emit_icmp(self, cc, a, b)
+        {
+            self.lower_ctx.emit(inst);
+            let rx = self.put_in_reg(x);
+            let dst = self.lower_ctx.alloc_tmp(I64).only_reg().unwrap();
+            // `csinc c, x, x` is `c ? x : x+1`, so inverting `cond`
+            // gives `cc ? x+1 : x`.
+            self.lower_ctx.emit(MInst::CSInc {
+                rd: dst,
+                cond: cond.invert(),
+                rn: rx,
+                rm: rx,
+            });
+            return generated_code::constructor_output_reg(self, dst.to_reg());
+        }
+        let rx = self.put_in_reg(x);
+        let ry = self.put_in_reg(y);
+        let r = generated_code::constructor_add(self, ty, rx, ry);
+        generated_code::constructor_output_reg(self, r)
+    }
+
     /// PLIRON: may a constant rotate be folded into a logic op's shifted
     /// operand? Only when it has a single use (see `rot_fold_ok` in
     /// `lower.isle`); `PLIRON_RORFOLD_MULTI=1` folds multi-use rotates too.

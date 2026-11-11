@@ -1527,3 +1527,16 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     those blocks because `p` does. On `chars_alpha`'s ASCII loop the
     hoisted `p+1` restores the fusion patch 115 needed:
     `ldrb w10, [x23], #0x1`.
+
+117. aarch64 `x + (a cc b ? 1 : 0)` to `csinc` (`PLIRON_CINC`, opt-in,
+    `=1` on; `isa/aarch64/lower.isle` `iadd_cinc_{r,l}` +
+    `iadd_cinc_for` in `isa/aarch64/lower/isle.rs`): a single-use
+    `iadd x, uextend(icmp cc a b)` lowers to `cmp a, b; csinc x, x, !cc`
+    (LLVM's `cinc`) instead of `cmp; cset; add` — one instruction and
+    one register shorter, same flag work. The extern declines to the
+    plain `add` when the `icmp` has other uses (its `cset`
+    materializes anyway, so the fused compare would be a second
+    `cmp`), or when `emit_icmp` did not produce a single
+    flag-setting inst (`ProducesFlagsTwiceSideEffect`, const-folded
+    compares). `csinc` increments on the false arm, so the rule
+    inverts `cc`. Test: `pliron-clif-opt/tests/aarch64_cinc.rs`.
