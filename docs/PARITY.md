@@ -355,7 +355,15 @@ in the scoreboard and in the linked history files.
   356,016→346,064 (−2.8%), `pop_class_op` 752→600 insns (LLVM
   234 — its remaining excess is `Box::new`/`push_mut` inlines
   LLVM also makes plus extra MIR drop sites), regex wasm
-  objects −1.0%, kernels flat.
+  objects −1.0%, kernels flat. Byte-copy update 2026-11-10
+  (`0a00710`+`b984514`): scalarized 2-byte aggregate copies
+  (the `{u8,u8}` swaps in `drift::sort`/`quicksort`) emitted
+  `ldrb`+`ldrb`+`strb`+`strb` where LLVM emits `ldrh`/`strh`.
+  `stmerge` (default) folds adjacent `load.i8`/`store.i8` copy
+  pairs into `load.i16`/`store.i16`: `drift::sort<
+  ClassBytesRange>` 963→867 insns (LLVM 369 — its residual is
+  the usual cmp/cset/add bookkeeping, not copies), rlib
+  −200 insns, wasm −573 B, Sortw −11%.
 - **xcgu copies.** On kernels, ~14 KB of the rlib gap is per-CGU IPO
   clones (genuinely specialised, not dedup-able at the link) and ~5.5 KB
   is byte-identical `non-external` copies ld64 keeps in full. A linked
