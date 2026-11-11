@@ -1539,4 +1539,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `cmp`), or when `emit_icmp` did not produce a single
     flag-setting inst (`ProducesFlagsTwiceSideEffect`, const-folded
     compares). `csinc` increments on the false arm, so the rule
-    inverts `cc`. Test: `pliron-clif-opt/tests/aarch64_cinc.rs`.
+    inverts `cc`. The rules sit below `carry_cinc` (priorities 69/68
+    vs 70-77): the unsigned-carry shape is a subset of this pattern
+    and the extern's decline path emits a plain `add`, which would
+    shadow them. Test: `pliron-clif-opt/tests/aarch64_cinc.rs`.

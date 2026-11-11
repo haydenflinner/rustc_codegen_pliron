@@ -3871,12 +3871,17 @@
 ;; `cmp a, b; csinc x, x, !cc` (LLVM's `cinc`) instead of `cmp; cset; add`.
 ;; `y` binds the `icmp` itself: when the compare has other uses its
 ;; `cset` still materializes, so the fused `cmp` is declined there.
+;; These sit below the `carry_cinc` rules (70-77): the unsigned-carry
+;; shape `icmp ult (iadd a b) a` is a subset of this pattern, and the
+;; carry rules emit `cmn` against the existing add's operands. This
+;; extern's decline path emits a plain `add`, which would otherwise
+;; shadow them.
 (decl iadd_cinc_for (Type Value Value IntCC Value Value) InstOutput)
 (extern constructor iadd_cinc_for iadd_cinc_for)
-(rule iadd_cinc_r 79 (lower (iadd (ty_32_or_64 ty) x
+(rule iadd_cinc_r 69 (lower (iadd (ty_32_or_64 ty) x
         (maybe_uextend y @ (icmp _ cc a b))))
       (iadd_cinc_for ty x y cc a b))
-(rule iadd_cinc_l 78 (lower (iadd (ty_32_or_64 ty)
+(rule iadd_cinc_l 68 (lower (iadd (ty_32_or_64 ty)
         (maybe_uextend y @ (icmp _ cc a b)) x))
       (iadd_cinc_for ty x y cc a b))
 
