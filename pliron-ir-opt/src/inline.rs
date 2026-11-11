@@ -1291,6 +1291,17 @@ pub fn run(
     let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(0);
     let warm_gate = warm_mode == 1;
     let warm_cost = warm_mode == 2;
+    // `3` keeps the default all-calls gate but also lets a warm-call-sparse
+    // call-carrier earn the loop bonus when its warm body alone fits the
+    // base limit and it passes the `fanin` growth bound: brotli's
+    // `EvaluateNode` (18 calls, 1 warm — the rest are `panic_bounds_check`
+    // scaffolding — 297 warm ops, 3 callers, all in the zopfli node loop;
+    // LLVM inlines it) gets the bonus, while regex's `bump`/`char`
+    // (61–132 callers — the d21d9da growth regression) and `peek` (387
+    // warm ops — a real worker, not a small body plus scaffolding) stay
+    // out. The warm calls are what run each iteration; fanin bounds the
+    // total growth across the callee's remaining sites.
+    let warm_fanin = warm_mode == 3;
     // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
     let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
         .and_then(|s| s.parse().ok())
@@ -1660,9 +1671,27 @@ pub fn run(
                         if f.cold {
                             cost = cost.saturating_mul(COLD_W);
                         }
-                        // `PLIRON_INLINE_WARMCALLS=1` (default): gate on the
-                        // warm calls only.
-                        if (if warm_gate { ci.nwarm } else { ci.ncalls }) <= loop_calls
+                        // `PLIRON_INLINE_WARMCALLS=1`: gate on the warm calls
+                        // only; `=3`: a call-carrier over `loop_calls` total
+                        // calls still qualifies when its warm calls fit, its
+                        // warm body alone scores under the base limit (the
+                        // bonus then pays for cold panic scaffolding, not a
+                        // real worker — regex's `peek` is 387 warm ops), and
+                        // total growth stays under the `fanin` bound.
+                        let leafish =
+                            (if warm_gate { ci.nwarm } else { ci.ncalls }) <= loop_calls;
+                        let warm_leaf = warm_fanin
+                            && !leafish
+                            && ci.nwarm <= loop_calls
+                            && ci.nwarm_ops <= limit
+                            && fanin > 0
+                            && adj
+                                .as_ref()
+                                .and_then(|a| a.callers_of.get(cs.as_str()))
+                                .is_some_and(|v| {
+                                    sn.saturating_mul(v.len()) <= t.saturating_mul(fanin)
+                                });
+                        if (leafish || warm_leaf)
                             && loops
                                 .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                                 .contains(&b)

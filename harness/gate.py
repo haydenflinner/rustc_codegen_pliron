@@ -72,7 +72,8 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 OPTIN_STANZAS = {"bytescan": {"PLIRON_BYTESCAN": "1"},
                  "noret": {"PLIRON_NORETUDF": "1"},
                  "unwind": {"PLIRON_NORETUDF": "1"},
-                 "unwindstd": {"PLIRON_NORETUDF": "1"}}
+                 "unwindstd": {"PLIRON_NORETUDF": "1"},
+                 "inlinecm": {"PLIRON_INLINE_WARMCALLS": "3"}}
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309,
                 13475, 16782, 16787, 16980, 17028, 18889, 24242, 26212, 26694, 27004, 27992, 30177,
                 31625]
