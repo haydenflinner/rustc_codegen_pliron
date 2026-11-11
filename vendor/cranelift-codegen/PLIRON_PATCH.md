@@ -801,7 +801,9 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     extends once, and `select` arms that are `ireduce`s read the wide
     source directly (the low bits are exact and a `select` result is
     modelled dirty anyway), 512 call-arg `uext` skip, 1024 narrow
-    `iadd`/`isub`-by-const `icmp`-vs-const fusions. A dirty-source
+    `iadd`/`isub`-by-const `icmp`-vs-const fusions and the same fold on
+    a `br_table` bounds check (`uextend (iadd c, -s)` index →
+    `sub c, s; cmp c-s, N` when `s + N <= W`). A dirty-source
     passthrough variant of 256 was tried and reverted: it converted one
     shared `uxtb` into one extension/test per fusing use and grew
     regex-syntax `.text`.

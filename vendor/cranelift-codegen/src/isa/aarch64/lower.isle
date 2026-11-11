@@ -4279,6 +4279,47 @@
             (ridx Reg (put_in_reg_zext32 idx)))
        (br_table_impl jt_size ridx default targets)))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 1024): `br_table` on a narrow
+;; `(c - s) mod W` index — `uextend (isub c, j)` or `uextend (iadd c, j)`
+;; with a negative `j` — bounds-checks `index <u jt_size`; `btsub_imm`
+;; proves the unmasked `sub w, c, #s` compare partitions identically, so
+;; the masked add/sub and its `uxtb`/`uxth` fold into one `sub`
+;; (`add+uxtb+cmp` -> `sub+cmp`). Both defs must be single-use or the
+;; still-emitted add/uextend makes this a loss. The dead-default rule
+;; above (no bounds check at all) stays strictly better when it applies.
+(decl pure partial btsub_imm (u64 Type u64 u64) u64)
+(extern constructor btsub_imm btsub_imm)
+(rule 2 (lower_branch (br_table idx @ (maybe_uextend inner @ (isub ty @ (fits_in_16 _) c (u64_from_iconst j)))
+                                    jt)
+                     (jump_table_targets default targets))
+  (if-let false (jump_table_default_dead jt))
+  (if-let false (value_has_multiple_uses idx))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let (imm12_from_u64 s) (btsub_imm 0 ty j (jump_table_size targets)))
+  (let ((_ InstOutput (side_effect (emit_island (targets_jt_space targets))))
+        (ridx Reg (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) s)))
+    (br_table_impl (jump_table_size targets) ridx default targets)))
+(rule 2 (lower_branch (br_table idx @ (maybe_uextend inner @ (iadd ty @ (fits_in_16 _) c (u64_from_iconst j)))
+                                    jt)
+                     (jump_table_targets default targets))
+  (if-let false (jump_table_default_dead jt))
+  (if-let false (value_has_multiple_uses idx))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let (imm12_from_u64 s) (btsub_imm 1 ty j (jump_table_size targets)))
+  (let ((_ InstOutput (side_effect (emit_island (targets_jt_space targets))))
+        (ridx Reg (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) s)))
+    (br_table_impl (jump_table_size targets) ridx default targets)))
+(rule 3 (lower_branch (br_table idx @ (maybe_uextend inner @ (iadd ty @ (fits_in_16 _) (u64_from_iconst j) c))
+                                    jt)
+                     (jump_table_targets default targets))
+  (if-let false (jump_table_default_dead jt))
+  (if-let false (value_has_multiple_uses idx))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let (imm12_from_u64 s) (btsub_imm 1 ty j (jump_table_size targets)))
+  (let ((_ InstOutput (side_effect (emit_island (targets_jt_space targets))))
+        (ridx Reg (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) s)))
+    (br_table_impl (jump_table_size targets) ridx default targets)))
+
 ;; PLIRON: no bounds check when the default is unreachable (`PLIRON_SWITCH_KEEPDEAD`).
 (rule 1 (lower_branch (br_table idx jt) (jump_table_targets default targets))
       (if-let true (jump_table_default_dead jt))

@@ -103,7 +103,8 @@ pub(crate) fn narrowext_enabled() -> bool {
 /// narrow `icmp` of `iadd`/`isub`-by-constant against a constant: drop
 /// the operand's `uxtb`/`uxth` by rolling the constant (eq/ne) or by
 /// comparing the unmasked 32-bit result when the wrapped/unwrapped
-/// orderings agree (`narrow_addsub_cmp`).
+/// orderings agree (`narrow_addsub_cmp`), and the same unsigned-bound
+/// fold on `br_table` indices (`btsub_imm`).
 /// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
 pub(crate) fn narrowext_part(bit: u64) -> bool {
     static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1448,6 +1449,10 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         }
         let w = 1u64 << ty.bits();
         let mask = w - 1;
+        // Narrow `iconst`s store sign-extended bits (`iconst.i8 -9`);
+        // the modular arithmetic wants the truncated value.
+        let j = j & mask;
+        let k = k & mask;
         // Everything emitted is an imm12.
         if k > 0xfff {
             return None;
@@ -1477,6 +1482,34 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             }
             _ => None,
         }
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 1024): the `br_table` bounds
+    /// check `uextend((c - s) mod W) <u N` partitions identically to
+    /// the unmasked `sub w, c, s` unsigned compare when `s + N <= W` —
+    /// no-wrap cases compare equal, wrapped cases produce masked values
+    /// in `[W-s, W)` (all `>= N`) while the unmasked result is
+    /// unsigned-huge (also `>= N`), and the surviving index is the
+    /// correct `c - s`. `op` 0 = `isub c, j` (`s` = j); 1 =
+    /// `iadd c, j`, accepted only when `j` is a negative narrow
+    /// constant (`s` = W-j) — a positive `iadd` wraps masked indices
+    /// back below `N` and cannot fold. Returns `s`, or none when the
+    /// bound fails, `s` overflows imm12, or `s` is 0 (`iadd c, 0`).
+    fn btsub_imm(&mut self, op: u64, ty: Type, j: u64, n: u64) -> Option<u64> {
+        if !narrowext_part(1024) || ty.bits() > 16 {
+            return None;
+        }
+        let w = 1u64 << ty.bits();
+        let j = j & (w - 1);
+        let s = match op {
+            0 => j,
+            1 if j >= w / 2 => w - j,
+            _ => return None,
+        };
+        if s == 0 || s > 0xfff || s + n > w {
+            return None;
+        }
+        Some(s)
     }
 
     fn narrowext_clean(&mut self, val: Value) -> bool {
