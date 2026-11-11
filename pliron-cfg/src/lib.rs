@@ -208,6 +208,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // drift::sort<ClassBytesRange> 963->867 insns, rlib -200, wasm
     // -573B; corpus diff clean, kernels flat-to-better (Sortw -11%).
     "PLIRON_STMERGE",
+    // A load covered by `store (load s)` re-reads `s` (LLVM's
+    // memcpy-forwarding): brotli sub_match buffers collapse to direct
+    // slice reads after bunroll exposes the copy. Held-out geomean
+    // 1.001 neutral, rust-compression 0.984; regex-syntax .text +64B.
+    // `=0` off.
+    "PLIRON_LOADFWD_SRCCOPY",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
