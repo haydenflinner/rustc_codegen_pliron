@@ -344,6 +344,17 @@ impl Context {
         let mut move_set: Vec<Inst> = Vec::new();
         let mut stack: Vec<Inst> = Vec::new();
         let mut seen: FxHashSet<Inst> = FxHashSet::default();
+        // call_pre[j] = number of call instructions in `order[..j]` of the
+        // block currently being walked; rebuilt with `pos`. A use moved to
+        // just before `r` (and the pure producers dragged with it) crosses
+        // every call in between, which stretches its live range across a
+        // register clobber and typically forces it into a callee-saved
+        // register — worse than the copy the in-place op saves. Moves
+        // across calls are refused unless `PLIRON_LUCALLX=0`.
+        static NOCALLX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let nocallx =
+            *NOCALLX.get_or_init(|| std::env::var("PLIRON_LUCALLX").as_deref() != Ok("0"));
+        let mut call_pre: Vec<u32> = Vec::new();
         // Insts that have already been placed (as moved uses or as the
         // inst a move anchored on). A frozen inst is never relocated
         // again — this guarantees termination even when two insts share
@@ -365,6 +376,13 @@ impl Context {
                 }
                 if pos.is_empty() {
                     pos.extend(order.iter().enumerate().map(|(j, &x)| (x, j as u32)));
+                    call_pre.clear();
+                    call_pre.push(0);
+                    for &x in &order {
+                        let c =
+                            call_pre[call_pre.len() - 1] + self.func.dfg.insts[x].opcode().is_call() as u32;
+                        call_pre.push(c);
+                    }
                 }
                 let op = self.func.dfg.insts[r].opcode();
                 r_args.clear();
@@ -390,7 +408,12 @@ impl Context {
                     stack.clear();
                     for &u in us {
                         match pos.get(&u) {
-                            Some(&p) if p as usize >= i => stack.push(u),
+                            Some(&p) if p as usize >= i => {
+                                if nocallx && call_pre[p as usize] != call_pre[i] {
+                                    continue 'cand;
+                                }
+                                stack.push(u);
+                            }
                             Some(_) => {}
                             None => continue 'cand,
                         }
@@ -455,6 +478,15 @@ impl Context {
                     }
                     pos.clear();
                     pos.extend(order.iter().enumerate().map(|(j, &x)| (x, j as u32)));
+                    if nocallx {
+                        call_pre.clear();
+                        call_pre.push(0);
+                        for &x in &order {
+                            let c = call_pre[call_pre.len() - 1]
+                                + self.func.dfg.insts[x].opcode().is_call() as u32;
+                            call_pre.push(c);
+                        }
+                    }
                     i = ri;
                     break 'cand;
                 }
@@ -1302,7 +1334,7 @@ impl Context {
     /// the edge and the callee-saved copy starts inside `S`; constants are
     /// cloned into `S` instead.
     fn shrink_split(&mut self) {
-        use crate::ir::{BlockArg, InstBuilder, InstructionData, Opcode, Value};
+        use crate::ir::{BlockArg, InstructionData, Opcode, Value};
         use crate::cursor::{Cursor, FuncCursor};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(None));

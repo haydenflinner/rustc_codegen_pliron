@@ -1724,3 +1724,15 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `PLIRON_EH_LOCAL=N` (function-local budget), `PLIRON_EH_BISECT=N`
     (global, nondeterministic across parallel lowers). Regressions:
     `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.
+
+124. Call-crossing guard in `lastuse_schedule` (`context.rs`; default
+    on, `PLIRON_LUCALLX=0` restores). The pass moves a pure producer to
+    just before a later RMW use to expose destructive two-address
+    forms; when the move crosses a `call` it stretches the value's live
+    range across a register clobber, typically forcing it into a
+    callee-saved register — worse than the copy the RMW saves (fib's
+    `next` was scheduled pre-call, overlapping the loop-carried param
+    and blocking the back-edge param merge; with the guard the update
+    stays post-call, `cur` keeps one register, `addl $-2` in place —
+    LLVM's loop shape). A cached per-block `call_pre` prefix count
+    (rebuilt with `pos`) makes the check O(1) per candidate.
