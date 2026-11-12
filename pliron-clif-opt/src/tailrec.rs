@@ -105,6 +105,19 @@ fn is_self_call(func: &Function, i: Inst, fr: FuncRef) -> bool {
     )
 }
 
+/// Safe to reorder across the removed call: no memory access, no
+/// control flow, no side effects, cannot trap.
+fn pure(func: &Function, i: Inst) -> bool {
+    let op = func.dfg.insts[i].opcode();
+    !op.can_trap()
+        && !op.can_load()
+        && !op.can_store()
+        && !op.is_call()
+        && !op.is_branch()
+        && !op.is_return()
+        && !op.other_side_effects()
+}
+
 pub fn run(func: &mut Function, id: FuncId) -> usize {
     if func.signature.returns.len() != 1 {
         return 0;
@@ -116,22 +129,26 @@ pub fn run(func: &mut Function, id: FuncId) -> usize {
     let Some(sref) = self_ref(func, id) else {
         return 0;
     };
-    // Find `call self; ..; acc_op(expr, r); return`: the call, the
-    // accumulate, and the return must be the block's last three insts so
-    // nothing observes the removed call between them.
+    // Find `call self; ..; acc_op(expr, r); ..; return`: anchor on the
+    // return's operand — its def must be the accumulate, and one of the
+    // accumulate's operands must be a same-block self-call result used
+    // nowhere else. Instructions between the call and the return move
+    // ahead of it once the call becomes a jump, so each must be
+    // speculatable (`sum`: `band(n,7)` sits between call and `iadd`).
     let mut cand = None;
     'blk: for b in func.layout.blocks() {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
-        let n = insts.len();
-        if n < 3 {
+        let Some(&ri) = insts.last() else {
+            continue;
+        };
+        if func.dfg.insts[ri].opcode() != Opcode::Return || func.dfg.inst_args(ri).len() != 1 {
             continue;
         }
-        let (ci, bi, ri) = (insts[n - 3], insts[n - 2], insts[n - 1]);
-        if func.dfg.insts[ri].opcode() != Opcode::Return
-            || func.dfg.inst_args(ri).len() != 1
-            || !is_self_call(func, ci, sref)
-            || func.dfg.inst_args(ci).len() != func.signature.params.len()
-        {
+        let rv = func.dfg.resolve_aliases(func.dfg.inst_args(ri)[0]);
+        let Some(bi) = func.dfg.value_def(rv).inst() else {
+            continue;
+        };
+        if func.layout.inst_block(bi) != Some(b) {
             continue;
         }
         let InstructionData::Binary { opcode, args } = func.dfg.insts[bi] else {
@@ -140,28 +157,45 @@ pub fn run(func: &mut Function, id: FuncId) -> usize {
         let Some(ident) = accop(opcode, rty) else {
             continue;
         };
-        let rv = func.dfg.resolve_aliases(func.dfg.inst_args(ri)[0]);
-        if func.dfg.value_def(rv).inst() != Some(bi) {
+        // The looped side is a self-call result used only by the
+        // accumulate; the accumulated side can be any value (a second
+        // self call in `fib`). Prefer the later call so earlier calls
+        // stay real calls.
+        let mut cc = None;
+        for (ix, &a) in args.iter().enumerate() {
+            let a = func.dfg.resolve_aliases(a);
+            let Some(ai) = func.dfg.value_def(a).inst() else {
+                continue;
+            };
+            let &[rc] = func.dfg.inst_results(ai) else {
+                continue;
+            };
+            if func.layout.inst_block(ai) != Some(b)
+                || func.dfg.resolve_aliases(rc) != a
+                || !is_self_call(func, ai, sref)
+                || func.dfg.inst_args(ai).len() != func.signature.params.len()
+                || uses(func, rc) != 1
+            {
+                continue;
+            }
+            let pos = insts.iter().position(|&i| i == ai).unwrap();
+            if cc.is_none_or(|(_, _, p)| pos > p) {
+                cc = Some((ai, ix, pos));
+            }
+        }
+        let Some((ci, cix, cpos)) = cc else {
+            continue;
+        };
+        let eix = 1 - cix;
+        if func.dfg.value_type(args[eix]) != rty {
             continue;
         }
-        // The accumulated side can be any value (a second self call in
-        // `fib`); the looped side must be this call's result used nowhere
-        // else.
-        let &[rc] = func.dfg.inst_results(ci) else {
-            continue;
-        };
-        let (a0, a1) = (
-            func.dfg.resolve_aliases(args[0]),
-            func.dfg.resolve_aliases(args[1]),
-        );
-        let eix = if a0 == rc {
-            1
-        } else if a1 == rc {
-            0
-        } else {
-            continue;
-        };
-        if func.dfg.value_type(args[eix]) != rty || uses(func, rc) != 1 {
+        let bpos = insts.iter().position(|&i| i == bi).unwrap();
+        if bpos <= cpos
+            || insts[cpos + 1..insts.len() - 1]
+                .iter()
+                .any(|&i| i != bi && !pure(func, i))
+        {
             continue;
         }
         cand = Some((bi, ri, opcode, ident, eix, ci));
