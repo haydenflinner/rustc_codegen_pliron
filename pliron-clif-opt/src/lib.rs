@@ -75,6 +75,7 @@ pub mod slp;
 pub mod splink;
 pub mod stepcache;
 pub mod stmerge;
+pub mod stubhoist;
 pub mod switchmap;
 pub mod taildup;
 pub mod tailmerge;

@@ -3371,6 +3371,14 @@ fn s_edgesel(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_stubhoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = stubhoist::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("stubhoist");
+    }
+    k
+}
+
 fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgesink::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -5159,6 +5167,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // ride along unchanged through every earlier transform.
         step("edgesel", "edgesel", Gate::Env("PLIRON_EDGESEL"), s_edgesel)
             .needs(shape::CONDBR),
+        // Single-pred stubs whose jump args are computed in the stub
+        // fold into the pred edge (`uext n; jump ret` -> the fib leaf
+        // arm points at the shared return, no out-of-line hop). Late:
+        // the stubs only exist once edgesink/egraph2 finish merging.
+        step("stubhoist", "stubhoist", Gate::OptIn("PLIRON_STUBHOIST"), s_stubhoist)
+            .needs(shape::BLOCKS2),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
