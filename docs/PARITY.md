@@ -329,6 +329,16 @@ in the scoreboard and in the linked history files.
   fastcall-lane args; was 1.556 after honest `__chkstk`/probe
   accounting). Session log: `history/x64-notes.md` "Windows x64
   session".
+  2026-12 follow-ups on the same box: `tokenize` ~**0.91** (faster
+  than LLVM — `ASSUMENN` seeds the cursor's nonnull through
+  `assume(!ptr.is_null())`'s `xor`-peeled form, killing the
+  `Option<&u8>` niche `testq/je` per byte; plus `bt` lowering for the
+  whitespace table probe through `ireduce`/`band-63` index masks);
+  `fib` ~**1.05** with the exact LLVM loop shape (`ARGDIRECT`: a
+  call-arg copy died once `arg_detach` stopped firing on transitive
+  `Multiple`); `iterw` ~**1.0** (`CHAINJOIN` places a diamond's arm
+  before its join — `filter`'s keep-block was out-of-line at 2 taken
+  branches/kept element, ~1.40x).
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).
