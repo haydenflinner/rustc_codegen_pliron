@@ -767,15 +767,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let inst = self.cur_inst?;
         let mut multi: SmallVec<[Reg; 8]> = smallvec![];
         let mut tys: SmallVec<[(Reg, Value); 8]> = smallvec![];
-        // PLIRON (`PLIRON_ARGDIRECT=1`, opt-in): a value used only by
-        // this call dies at the call — its fixed-arg pin is free — so
-        // detach only on *direct* multi-use (`value_direct_uses`), not
-        // the transitive `Multiple` mark a multiply-used consumer's
-        // producer cone picks up: fib's `isub` arg is single-use but
-        // inherits `Multiple` via the accumulator the call result
-        // feeds, and the detach copy costs a `movl` per call. Read per
-        // call inst so tests can toggle it within one process.
-        let argdirect = std::env::var("PLIRON_ARGDIRECT").as_deref() == Ok("1");
+        // PLIRON (`PLIRON_ARGDIRECT=0` restores the old test): a value
+        // used only by this call dies at the call — its fixed-arg pin
+        // is free — so detach only on *direct* multi-use
+        // (`value_direct_uses`), not the transitive `Multiple` mark a
+        // multiply-used consumer's producer cone picks up: fib's
+        // `isub` arg is single-use but inherits `Multiple` via the
+        // accumulator the call result feeds, and the detach copy costs
+        // a `movl` per call. Read per call inst so tests can toggle it
+        // within one process.
+        let argdirect = std::env::var("PLIRON_ARGDIRECT").as_deref() != Ok("0");
         for &v in self.f.dfg.inst_args(inst) {
             let v = self.f.dfg.resolve_aliases(v);
             let multi_use = match self.f.dfg.value_def(v) {

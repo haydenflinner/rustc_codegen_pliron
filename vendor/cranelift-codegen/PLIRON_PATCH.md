@@ -1781,8 +1781,9 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      observed wins on the corpus yet (our own signatures don't mark
      u32 args `uext`); kept opt-in for extern-ABIs that do.
 
-127. Call-arg detach on direct uses only (`PLIRON_ARGDIRECT=1`,
-     opt-in). `arg_detach` copied any arg whose
+127. Call-arg detach on direct uses only (default-on;
+     `PLIRON_ARGDIRECT=0` restores the transitive test).
+     `arg_detach` copied any arg whose
      `value_ir_uses == Multiple` into a fresh vreg so the ABI's
      fixed-register use doesn't pin the value's whole bundle. But
      `value_ir_uses` propagates `Multiple` transitively through the
