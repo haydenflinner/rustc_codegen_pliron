@@ -368,12 +368,15 @@ in the scoreboard and in the linked history files.
   `PLIRON_LOOPFT=0` off) prefers a successor that can reach a
   back-edge latch on placement ties — reverse BFS from latch blocks
   in both `BCHAIN`'s chain pick and `PLACE`'s edge-weight key —
-  and fib now measures ~1.0x standalone (5.9 ms both). Remaining
-  gap: LLVM rotates accumulator recursion (`sum(n-1)+(n&7)`) into
-  a loop and vectorizes it; pliron's `tailrec` requires the
-  self-call to sit immediately before the accumulate+return, so
-  `sum` keeps a real call per level — a 50 M-deep `sum` still
-  overflows pliron's stack where LLVM runs it in O(1) stack.
+  and fib now measures ~1.0x standalone (5.9 ms both). `tailrec`
+  relaxed (e076991): the accumulate may now sit anywhere between
+  the self-call and the return with only speculatable insts
+  between, so `sum(n-1)+(n&7)` rotates — 50 M-deep recursion runs
+  in O(1) stack and `loopvec` vectorizes it. Residual ~1.7x vs
+  LLVM on that kernel: our vectorizer materializes `n - idx` per
+  lane via scalar splat + `psubq` where LLVM keeps a
+  down-counting vector IV (`paddq -4` once per iter) — a
+  `loopvec` IV-materialization quality gap, not a correctness one.
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).
