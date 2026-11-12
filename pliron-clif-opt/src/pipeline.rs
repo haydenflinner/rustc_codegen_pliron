@@ -3363,6 +3363,14 @@ fn s_invparam(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_edgesel(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = edgesel::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("edgesel");
+    }
+    k
+}
+
 fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgesink::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -5145,6 +5153,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Before brhint: stubs replace members' terminators.
         step("tailmergep", "tailmergep", Gate::OptIn("PLIRON_TMPARAM"), s_tailmergep)
             .needs(shape::BLOCKS2),
+        // `select c`/`brif c` inside a block whose every incoming edge
+        // pins `c` (chars' `next().unwrap_or(0)` address/cursor clamps
+        // -> dup `cmp` + `cmov` per tokenize char). Late: the clamps
+        // ride along unchanged through every earlier transform.
+        step("edgesel", "edgesel", Gate::OptIn("PLIRON_EDGESEL"), s_edgesel)
+            .needs(shape::CONDBR),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
