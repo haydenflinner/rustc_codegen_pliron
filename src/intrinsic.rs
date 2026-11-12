@@ -513,10 +513,10 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         // `assume_nonnull` when it builds a `NonNull` or a reference from a
         // raw pointer): `x` is non-null. Only when `x`'s op, the compare and
         // this call are adjacent, so every use of `x` is reached through the
-        // assumption. Opt-in (`PLIRON_ASSUMENN=1`): sound, but no measured
-        // win yet (the zip niche tests it was aimed at need a fact from
-        // elsewhere; see docs/codegen-plan.md, facts service).
-        if crate::env_is("PLIRON_ASSUMENN", "1")
+        // assumption. On since the split_whitespace niche fold needed the
+        // `slice::Iter::next` assume's fact (~20% there);
+        // `PLIRON_ASSUMENN=0` disables.
+        if crate::pass_enabled("PLIRON_ASSUMENN")
             && let Some(vop) = val.defining_op()
         {
             // `assume(!x.is_null())` arrives as `assume(xor(icmp eq x,0),
