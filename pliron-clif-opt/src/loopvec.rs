@@ -286,7 +286,7 @@ struct Plan {
     /// params on the vector header: initialized at `splat(coeff*iv0+off)
     /// ± iota`, stepped `coeff*UNROLL*vf*step` per outer iteration. One
     /// `iadd` per group replaces per-group splat+iota+op emission
-    /// (`PLIRON_VECIV`, opt-in).
+    /// (`PLIRON_VECIV=0` disables).
     iv_affines: Vec<IvAff>,
     /// The counting exit's target when it takes no args: the epilogue can
     /// jump straight to it when the vector count consumed every iteration
@@ -2474,7 +2474,7 @@ fn plan(
     let mut iv_affines: Vec<IvAff> = Vec::new();
     if iv_stream
         && func.dfg.value_type(cnt.iv) == elem
-        && pliron_cfg::env_is("PLIRON_VECIV", "1")
+        && pliron_cfg::pass_enabled("PLIRON_VECIV")
     {
         for &rv in &can_vec {
             if func.dfg.value_type(rv) != elem {

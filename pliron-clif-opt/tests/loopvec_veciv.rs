@@ -1,9 +1,9 @@
-//! `PLIRON_VECIV`: iv-stream lane values affine in the counted iv
+//! `PLIRON_VECIV` (default-on): iv-stream lane values affine in the counted iv
 //! (`coeff*iv + off`, |coeff| = 1) are carried through the vector loop
 //! as `vt` block params stepped once per outer iteration, instead of
 //! recomputing `splat(iv+g) + iota` then a vector add/sub per group —
 //! LLVM's vector-IV form. On `(n - i) & 7` accumulation this drops the
-//! body from ~8 insts/2 lanes to ~3. Opt-in (`=1`); unset keeps the
+//! body from ~8 insts/2 lanes to ~3. Default on (`=0` keeps the
 //! per-group splat seed.
 
 use cranelift_codegen::ir::Function;
@@ -74,7 +74,7 @@ fn vec_params(f: &Function) -> usize {
 
 #[test]
 fn affine_lane_values_carried_as_vector_params() {
-    // Opt-in gate: must be set before pliron_cfg's one-shot env parse.
+    // Explicit-on keeps this test independent of the default flip.
     unsafe { std::env::set_var("PLIRON_VECIV", "1") };
     let before = parse(SRC);
     let mut on = before.clone();

@@ -372,11 +372,12 @@ in the scoreboard and in the linked history files.
   relaxed (e076991): the accumulate may now sit anywhere between
   the self-call and the return with only speculatable insts
   between, so `sum(n-1)+(n&7)` rotates — 50 M-deep recursion runs
-  in O(1) stack and `loopvec` vectorizes it. Residual ~1.7x vs
-  LLVM on that kernel: our vectorizer materializes `n - idx` per
-  lane via scalar splat + `psubq` where LLVM keeps a
-  down-counting vector IV (`paddq -4` once per iter) — a
-  `loopvec` IV-materialization quality gap, not a correctness one.
+  in O(1) stack and `loopvec` vectorizes it. The vector loop now
+  carries affine lane values (`coeff*iv + off`, |coeff| = 1) as
+  vector-header params stepped once per group (`PLIRON_VECIV`,
+  default-on) — LLVM's vector-IV form; `sum(50M)` measures
+  ~5.4 ms vs LLVM ~6.8 ms (was ~11.7 ms with per-group
+  splat+iota+psubq).
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).
