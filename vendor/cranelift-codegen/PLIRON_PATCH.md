@@ -1643,3 +1643,15 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     consecutive absolute positions; args past index 5 spill to the
     stack as before. `translate` frame 2024 -> 1992 B; STK 1.269 ->
     1.218. Same test file.
+
+121. x64 `is_move` now also matches a `movl_mr` *self*-move
+    (`isa/x64/inst/mod.rs`). `gen_move` emits `movl` for <=32-bit vregs;
+    when regalloc places source and destination in the same preg the
+    emitted `movl %r, %r` is dead — low 32 bits unchanged, and upper
+    bits of narrow vregs are undefined so no consumer can read them.
+    Only the equal-preg case matches: `movl_rm` (`movzx`'s real
+    zero-extend, whose self-move is load-bearing) is deliberately not a
+    move, and a non-self `movl` must not join MCP's 64-bit value-class
+    tracking, which models full-width equality. fib loop drops the
+    `movl %ecx,%ecx` arg self-move (isub result already in the arg
+    lane); gated by the same `PLIRON_MCP` switch that runs the block.

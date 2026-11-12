@@ -1336,6 +1336,23 @@ impl MachInst for Inst {
                 asm::GprMem::Mem(_) => None,
             },
 
+            // PLIRON: `movl %r, %r` self-moves from `gen_move` (a <=32-bit
+            // vreg copy coalesced to one preg) are dead — the low 32 bits
+            // are unchanged and upper bits of narrow vregs are undefined,
+            // so keeping the dirty upper bits breaches no contract. Match
+            // ONLY `movl_mr` with equal pregs: `movl_rm` is a real
+            // zero-extend (its `movl %r,%r` is load-bearing), and
+            // non-self `movl` must not join MCP's 64-bit value-class
+            // tracking, which tracks full-width equality.
+            Self::External {
+                inst: I::movl_mr(asm::inst::movl_mr { rm32, r32 }),
+            } => match rm32 {
+                asm::GprMem::Gpr(reg) if reg.to_reg() == r32.as_ref().to_reg() => {
+                    Some((reg.map(|r| r.to_reg()), r32.as_ref().to_reg()))
+                }
+                _ => None,
+            },
+
             // Note that `movss_a_r` and `movsd_a_r` are specifically omitted
             // here because they only overwrite the low bits in the destination
             // register, otherwise preserving the upper bits. That can be used
