@@ -211,6 +211,18 @@ impl Reduc {
     }
 }
 
+/// A lane value affine in the counted iv, `coeff*iv + off` with
+/// |coeff| = 1, carried through the vector loop as a `vt` parameter
+/// instead of being recomputed per group.
+struct IvAff {
+    /// The scalar loop value the vector replaces (a `can_vec` member).
+    res: Value,
+    /// Lane slope sign: +1 for `iv + off` / `iv - off`, -1 for `off - iv`.
+    coeff: i64,
+    /// Loop-invariant offset expression (from `affine`).
+    off: Ins,
+}
+
 struct Plan {
     entry: Edge,
     h: Block,
@@ -270,6 +282,12 @@ struct Plan {
     /// No memory streams: the iv itself is the lane stream. Each group's
     /// `vmap` seeds `iv` with `splat(base) + iota*step`.
     iv_stream: bool,
+    /// Lane values `coeff*iv + off` (|coeff| = 1) carried as vector
+    /// params on the vector header: initialized at `splat(coeff*iv0+off)
+    /// ± iota`, stepped `coeff*UNROLL*vf*step` per outer iteration. One
+    /// `iadd` per group replaces per-group splat+iota+op emission
+    /// (`PLIRON_VECIV`, opt-in).
+    iv_affines: Vec<IvAff>,
     /// The counting exit's target when it takes no args: the epilogue can
     /// jump straight to it when the vector count consumed every iteration
     /// (`rem == 0`), letting a post-tested loop use the full `iters & -K`
@@ -2447,6 +2465,34 @@ fn plan(
         })();
         ok
     };
+    // Carried vector affines (`PLIRON_VECIV`): an iv-stream lane value
+    // `coeff*iv + off` (|coeff| = 1) would otherwise recompute
+    // `splat(iv+g) + iota` then a vector `iadd`/`isub` per group — LLVM
+    // keeps such recurrences as a vector register stepped once per
+    // iteration. Collect `can_vec` members affine in the iv (the iv
+    // itself qualifies, replacing the per-group splat+iota seed).
+    let mut iv_affines: Vec<IvAff> = Vec::new();
+    if iv_stream
+        && func.dfg.value_type(cnt.iv) == elem
+        && pliron_cfg::env_is("PLIRON_VECIV", "1")
+    {
+        for &rv in &can_vec {
+            if func.dfg.value_type(rv) != elem {
+                continue;
+            }
+            let Some((c, off)) = affine(func, &info, &kinds, &cnt, rv, 0) else {
+                continue;
+            };
+            if c != 1 && c != -1 {
+                continue;
+            }
+            iv_affines.push(IvAff {
+                res: rv,
+                coeff: c,
+                off,
+            });
+        }
+    }
     Some(Plan {
         entry: info.entry,
         h: info.h,
@@ -2481,6 +2527,7 @@ fn plan(
         early,
         rev_imm,
         iv_stream,
+        iv_affines,
         exit_bare,
         vrange: pliron_cfg::pass_enabled("PLIRON_VRANGE"),
     })
@@ -4401,6 +4448,42 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         // its carried base advances `stride`× the unit-stream rate.
         sr_steps.push(if s.neg { -e } else { e * s.stride } * p.vf * UNROLL as i64);
     }
+    // Carried iv-affine vectors (`iv_affines`): lane value at outer
+    // iteration t, group g is `coeff*(iv_t + g*vf*step + k*step) + off` —
+    // the param holds group 0's vector `splat(coeff*iv_t + off) ± iota`
+    // and steps `coeff*UNROLL*vf*step` per backedge. Init and the
+    // per-group/backedge step constants emit once here in `cb` (they
+    // dominate the whole vector loop).
+    let mut aff_gstep: Vec<Vec<Value>> = Vec::new();
+    let mut aff_bstep: Vec<Value> = Vec::new();
+    for a in &p.iv_affines {
+        let off_v = emit(&mut pos, iv_ty, &a.off);
+        let s0 = if a.coeff == 1 {
+            pos.ins().iadd(off_v, p.iv0)
+        } else {
+            pos.ins().isub(off_v, p.iv0)
+        };
+        let sp = pos.ins().splat(p.vt, s0);
+        let iot = iota.unwrap();
+        let w0 = if a.coeff == 1 {
+            pos.ins().iadd(sp, iot)
+        } else {
+            pos.ins().isub(sp, iot)
+        };
+        v_arg_vals.push(w0);
+        let mut gs = Vec::new();
+        for g in 1..UNROLL {
+            let k = pos
+                .ins()
+                .iconst(iv_ty, a.coeff * g as i64 * p.vf * p.step);
+            gs.push(pos.ins().splat(p.vt, k));
+        }
+        aff_gstep.push(gs);
+        let bk = pos
+            .ins()
+            .iconst(iv_ty, a.coeff * UNROLL as i64 * p.vf * p.step);
+        aff_bstep.push(pos.ins().splat(p.vt, bk));
+    }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
     let v_args: Vec<BlockArg> = v_arg_vals.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().brif(ok, vh, &v_args, p.h, &h_args);
@@ -4427,6 +4510,12 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         .streams
         .iter()
         .map(|s| (!s.direct).then(|| pos.func.dfg.append_block_param(vh, pty)))
+        .collect();
+    // Carried iv-affine vectors follow the stream bases.
+    let wparams: Vec<Value> = p
+        .iv_affines
+        .iter()
+        .map(|_| pos.func.dfg.append_block_param(vh, p.vt))
         .collect();
     let mut pos = FuncCursor::new(pos.func).at_bottom(vh);
     let c = if countdown {
@@ -4787,8 +4876,13 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         let (addrs, mut vmap) = core::mem::take(&mut groups[g]);
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
         // iv-stream lanes: the group's first scalar iv is `ivv +
-        // g*vf*step`; lane k adds `k*step` via the iota vconst.
-        if let Some(iota) = iota {
+        // g*vf*step`; lane k adds `k*step` via the iota vconst. Carried
+        // iv-affine params cover `p.iv` itself when it qualified — the
+        // splat+iota seed is skipped then.
+        let iv_carried = p.iv_affines.iter().any(|a| a.res == p.iv);
+        if let Some(iota) = iota
+            && !iv_carried
+        {
             let wg = if g == 0 {
                 ivv
             } else {
@@ -4797,6 +4891,17 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             };
             let sp = pos.ins().splat(p.vt, wg);
             vmap.insert(p.iv, pos.ins().iadd(sp, iota));
+        }
+        // Carried affines: group g's vector is the header param plus
+        // `coeff*g*vf*step` splatted (a `cb` constant).
+        for (ai, a) in p.iv_affines.iter().enumerate() {
+            let w = wparams[ai];
+            let wg = if g == 0 {
+                w
+            } else {
+                pos.ins().iadd(w, aff_gstep[ai][g - 1])
+            };
+            vmap.insert(a.res, wg);
         }
         // Loads eagerly in program order: a `store; load` pair on one
         // stream reads back the stored vector, so ordering is observable.
@@ -5069,6 +5174,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         }
         let c = pos.ins().iconst(pty, sr_steps[j]);
         back.push(pos.ins().iadd(sr_ptrs[j].unwrap(), c));
+    }
+    // Step the carried iv-affine vectors: coeff*UNROLL*vf*step per
+    // outer iteration.
+    for (ai, _) in p.iv_affines.iter().enumerate() {
+        back.push(pos.ins().iadd(wparams[ai], aff_bstep[ai]));
     }
     let bargs: Vec<BlockArg> = back.iter().map(|&v| BlockArg::Value(v)).collect();
     pos.ins().jump(vh, &bargs);
