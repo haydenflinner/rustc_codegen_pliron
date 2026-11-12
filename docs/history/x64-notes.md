@@ -1095,3 +1095,27 @@ Plausible direction: a cleanliness fixpoint over block params (all
 incoming edges clean-32 => param clean), gated; or make Tail i32 args
 guarantee clean upper bits as part of the conv (ABI contract — needs
 the same audit as TAILARGS).
+
+### `movl %ecx,%ecx` self-move elision `f185213`
+
+fib's recursive call paid `movl %ecx,%ecx` per arg: `gen_move` emits
+`movl` for <=32-bit vregs (a byte shorter, exact since upper bits are
+undefined) and a same-preg result slipped past MCP — `is_move` only
+matched 64-bit moves, deliberately, since a `movl` self-move *can* be
+a real zero-extend. Fix: `is_move` matches `movl_mr` (the move form)
+only when src==dst preg; `movl_rm` (`movzx`'s real zext) stays
+unmatched, as do non-self `movl`s (they must not join MCP's 64-bit
+value-class tracking). `movl_rm` self-moves were already dropped by a
+vcode pair-fusion; this closes the `gen_move` gap. fib's call
+sequence is now `addl $-1,%ecx; callq` — arg passed in place.
+
+Investigated the remaining tokenize overhead post-XCGU_TINY: the
+byte-scan loop's 3x `cmpq i,len` per byte come from one `icmp eq`
+consumed by `brif` + 2 clamp `cmove`s — vcode emits a fresh cmp per
+consumer though no flag-writer intervenes (movzbq/leaq don't touch
+flags). Fix shape: a vcode emit-level "dead flag recompute" pass —
+track last flag-writing compare + operand pregs via `preg_ops`;
+drop a `cmp/test` with identical opcode+operands when only
+flag-preserving insts (moves/lea/nop/cmov — whitelist, not blacklist)
+intervene and operand pregs are unmodified. Designed, not landed —
+flag-liveness is miscompile-risky and needs careful inst coverage.
