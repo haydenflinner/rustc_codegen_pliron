@@ -359,21 +359,21 @@ in the scoreboard and in the linked history files.
   on the same box (standalone min-of-N mains): `strwork` ~1.04,
   `chars_mixed` ~1.05, `hashmap` ~1.05–1.1, `hmget` ~1.09,
   `nbody` ~1.0, `sieve` ~1.03, `matmul` ~0.97, `sortw` ~0.87,
-  `chars_ascii` ~0.66 — all at parity or faster. The one outlier:
-  recursive `fib` measures ~1.3–1.5x under both a tight standalone
-  harness and criterion (LLVM 6.9 ms vs pliron 9.9 ms). Verified:
-  the emitted loop is instruction-identical to LLVM's (6 insns/iter,
-  same 16B alignment), both pre-LUCALLX and LLVM-loop shapes time
-  the same, pliron executes *fewer* instructions per call (10 vs 13
-  on leaf paths), an iterative call loop shows only ~1.07x — so the
-  residual is recursion-specific and µarch-level (frame /
-  call-return behavior), not instruction selection. Needs perf
-  counters (VTune/uProf) to root-cause; deferred. Related real gap:
-  LLVM rotates accumulator recursion (`sum(n-1)+(n&7)`) into a
-  loop; pliron doesn't — a 50 M-deep `sum` overflows pliron's stack
-  where LLVM runs it in O(1) stack. That's a missing
-  recursion-rotation transform (pliron-IR level), worth doing for
-  real-world recursive code.
+  `chars_ascii` ~0.66 — all at parity or faster. `fib` resolved:
+  same-process A/B (both backends' fib linked into one binary)
+  proved the ~1.4x was block *layout*, not instructions — our
+  placement inlined the leaf arm and forced a taken `jae` per
+  non-leaf call, a front-end redirect bubble; LLVM puts the loop
+  arm on the fall-through path. `LOOPFT` (default-on,
+  `PLIRON_LOOPFT=0` off) prefers a successor that can reach a
+  back-edge latch on placement ties — reverse BFS from latch blocks
+  in both `BCHAIN`'s chain pick and `PLACE`'s edge-weight key —
+  and fib now measures ~1.0x standalone (5.9 ms both). Remaining
+  gap: LLVM rotates accumulator recursion (`sum(n-1)+(n&7)`) into
+  a loop and vectorizes it; pliron's `tailrec` requires the
+  self-call to sit immediately before the accumulate+return, so
+  `sum` keeps a real call per level — a 50 M-deep `sum` still
+  overflows pliron's stack where LLVM runs it in O(1) stack.
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).
