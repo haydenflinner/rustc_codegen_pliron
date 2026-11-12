@@ -4058,13 +4058,36 @@
 ;; width, matching CLIF's masked `ushr`), so the whole shr+test
 ;; chain becomes one `bt` for any base — a constant table or the
 ;; `select`-guarded form `is_whitespace` emits. Gated by
-;; pliron_bittab.
+;; pliron_bittab. `pliron_bt_idx` strips a `& (width-1)` mask off
+;; the index (Rust's `a >> b` masks the shift amount); `bt` takes
+;; the index mod the operand width anyway.
 (rule 3 (is_nonzero_band (ty_32_or_64 ty) (ushr _ k x) (u64_from_iconst 1))
   (if-let true (pliron_bittab))
-  (CondResult.CC (x64_bt ty (put_in_gpr k) x) (CC.B)))
+  (CondResult.CC (x64_bt ty (put_in_gpr k) (pliron_bt_idx ty x)) (CC.B)))
 (rule 3 (is_nonzero_band (ty_32_or_64 ty) (u64_from_iconst 1) (ushr _ k x))
   (if-let true (pliron_bittab))
-  (CondResult.CC (x64_bt ty (put_in_gpr k) x) (CC.B)))
+  (CondResult.CC (x64_bt ty (put_in_gpr k) (pliron_bt_idx ty x)) (CC.B)))
+;; pliron: the same probe through an `ireduce` — narrowing passes
+;; rewrite `band (ushr k x), 1` into `band (ireduce (ushr k x)), 1`,
+;; and bit 0 survives any ireduce. `bt`'s width is the ushr's, not
+;; the reduced band's.
+(rule 3 (is_nonzero_band ty (ireduce _ (ushr (ty_32_or_64 uty) k x)) (u64_from_iconst 1))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt uty (put_in_gpr k) (pliron_bt_idx uty x)) (CC.B)))
+(rule 3 (is_nonzero_band ty (u64_from_iconst 1) (ireduce _ (ushr (ty_32_or_64 uty) k x)))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt uty (put_in_gpr k) (pliron_bt_idx uty x)) (CC.B)))
+
+;; pliron: `bt` takes its bit index modulo the operand width, exactly
+;; like CLIF's masked shift semantics, so an explicit `band x,
+;; (width-1)` — possibly under a `uextend` — on the shift index is
+;; dead work. Strip it so `bt` can use the unmasked index register.
+(decl pliron_bt_idx (Type Value) Value)
+(rule 1 (pliron_bt_idx $I64 (uextend _ (band _ x (u64_from_iconst 63)))) x)
+(rule 1 (pliron_bt_idx $I64 (band _ x (u64_from_iconst 63))) x)
+(rule 1 (pliron_bt_idx $I32 (uextend _ (band _ x (u64_from_iconst 31)))) x)
+(rule 1 (pliron_bt_idx $I32 (band _ x (u64_from_iconst 31))) x)
+(rule (pliron_bt_idx _ x) x)
 
 ;; Helper to test whether the `u64` input has a single bit set, and if so
 ;; yields the bit position of where that bit is set. Used in the lowering of
