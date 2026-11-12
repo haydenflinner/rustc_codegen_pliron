@@ -115,6 +115,18 @@ pub struct Stats {
     /// Wall time per step name, summed over functions; printed under
     /// `PLIRON_TIMING`.
     pub timing: FxHashMap<&'static str, std::time::Duration>,
+    /// Per step, only under step timing (`clif-check bench`,
+    /// `PLIRON_TIMING`): functions it ran on, functions it changed, and
+    /// the time it spent on the functions it left unchanged — what a
+    /// tighter gate or a dropped repeat round would save, and for how
+    /// little effect (relax caps its `simplify` at two rounds on the
+    /// same kind of table: later rounds changed <0.1% for ~25% of the
+    /// optimiser's time).
+    pub effect: FxHashMap<&'static str, (u32, u32, std::time::Duration)>,
+    /// Per step: runs that came after a no-effect run of the same family
+    /// with nothing changed in between (a skippable repeat), how many of
+    /// those changed the function anyway, and their time.
+    pub repeat: FxHashMap<&'static str, (u32, u32, std::time::Duration)>,
     /// How often the shared `Analysis` slot rebuilt each structural
     /// analysis — the granularity-split scoreboard.
     pub cfg_builds: usize,
@@ -149,6 +161,18 @@ impl Stats {
         self.la_ns += o.la_ns;
         for (n, d) in &o.timing {
             *self.timing.entry(n).or_default() += *d;
+        }
+        for (n, &(r, f, d)) in &o.effect {
+            let e = self.effect.entry(n).or_default();
+            e.0 += r;
+            e.1 += f;
+            e.2 += d;
+        }
+        for (n, &(r, f, d)) in &o.repeat {
+            let e = self.repeat.entry(n).or_default();
+            e.0 += r;
+            e.1 += f;
+            e.2 += d;
         }
     }
 }
@@ -633,6 +657,12 @@ fn edge_fp(func: &Function) -> u64 {
 // r[impl clif.analysis]
 pub struct Analysis {
     ver: u64,
+    /// Bumped only when a step reported or showed a change (`run_step`'s
+    /// `fired`), unlike `ver`, which every mutating step bumps.
+    pub eff_ver: u64,
+    /// Per step family (the step name without its round suffix: `dse2`
+    /// -> `dse`), the `eff_ver` at which a member last ran without effect.
+    pub idle_at: FxHashMap<&'static str, u64>,
     /// `edge_fp` of the function state `cfg` describes; `Some` iff
     /// `cfg` is `Some`. Replaces the old `num_insts` fingerprint:
     /// inst count changes on value-only rewrites that leave the CFG
@@ -1925,6 +1955,10 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             };
         }
     }
+    let size0 = t0.map(|_| {
+        let f = &p.clctx.func;
+        (f.dfg.num_insts(), f.dfg.num_values(), f.dfg.num_blocks(), f.layout.blocks().count())
+    });
     let k = if s.cached && p.clctx.func.dfg.values_labels.is_none() {
         match crate::stepcache::lookup(p, s, an) {
             Some(k) => k,
@@ -1942,6 +1976,30 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         let d = t0.elapsed();
         *slot += d;
         trace(s.name, d.as_secs_f64() * 1e3, p.fname);
+        // Some steps report 0 after removing blocks: count a size change
+        // as an effect too.
+        let f = &p.clctx.func;
+        let fired = k > 0
+            || size0 != Some((f.dfg.num_insts(), f.dfg.num_values(), f.dfg.num_blocks(), f.layout.blocks().count()));
+        let e = p.stats.effect.entry(s.name).or_default();
+        e.0 += 1;
+        if fired {
+            e.1 += 1;
+        } else {
+            e.2 += d;
+        }
+        let fam = s.name.trim_end_matches(|c: char| c.is_ascii_digit());
+        if an.idle_at.get(fam) == Some(&an.eff_ver) {
+            let e = p.stats.repeat.entry(s.name).or_default();
+            e.0 += 1;
+            e.1 += fired as u32;
+            e.2 += d;
+        }
+        if fired {
+            an.eff_ver += 1;
+        } else {
+            an.idle_at.insert(fam, an.eff_ver);
+        }
     }
     lt_probe(p, s.name);
     // `PLIRON_CLIF_STEPS=1` (with `PLIRON_CLIF`): dump after every step that

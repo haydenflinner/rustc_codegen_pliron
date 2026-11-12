@@ -523,6 +523,35 @@ fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
             for (n, d) in rows.iter().take(200) {
                 println!("  {d:>9.1?}  {n}");
             }
+            // Cost with no effect: time each step spent on functions it
+            // left unchanged, with how often it changed one. A step high
+            // in this table with a low hit rate wants a tighter shape
+            // gate; a `...2`/late repeat of a step that almost never
+            // fires is a round to cut.
+            let mut rep: Vec<_> = stats.repeat.iter().collect();
+            rep.sort_by_key(|(_, e)| std::cmp::Reverse(e.2));
+            let rep_sum: std::time::Duration = rep.iter().map(|(_, e)| e.2).sum();
+            println!("  repeats with nothing changed since the family's last no-effect run: {rep_sum:.1?}");
+            println!("  {:>9}  {:>7}  {:>7}  step", "time", "repeats", "changed");
+            for (n, (runs, fired, d)) in rep.iter().take(25) {
+                println!("  {d:>9.1?}  {runs:>7}  {fired:>7}  {n}");
+            }
+            let total: std::time::Duration = stats.timing.values().sum();
+            let mut idle: Vec<_> = stats.effect.iter().collect();
+            idle.sort_by_key(|(_, e)| std::cmp::Reverse(e.2));
+            let idle_sum: std::time::Duration = idle.iter().map(|(_, e)| e.2).sum();
+            println!(
+                "  no-effect time: {idle_sum:.1?} of {total:.1?} ({:.0}%)",
+                100.0 * idle_sum.as_secs_f64() / total.as_secs_f64().max(1e-9)
+            );
+            println!("  {:>9}  {:>6}  {:>7}  {:>6}  step", "idle", "of all", "ran", "fired");
+            for (n, (ran, fired, d)) in idle.iter().take(40) {
+                println!(
+                    "  {d:>9.1?}  {:>5.1}%  {ran:>7}  {:>5.1}%  {n}",
+                    100.0 * d.as_secs_f64() / total.as_secs_f64().max(1e-9),
+                    100.0 * *fired as f64 / (*ran).max(1) as f64
+                );
+            }
         }
     }
     true
