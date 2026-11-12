@@ -60,7 +60,7 @@ use core::fmt::Debug;
 use core::num::NonZeroU8;
 use cranelift_control::ControlPlane;
 use cranelift_entity::PrimaryMap;
-use regalloc2::VReg;
+use regalloc2::{PReg, VReg};
 use smallvec::{SmallVec, smallvec};
 
 #[cfg(feature = "enable-serde")]
@@ -281,6 +281,15 @@ pub trait MachInst: Clone + Debug {
 
     /// If this is a simple move, return the (source, destination) tuple of registers.
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)>;
+
+    /// PLIRON FLAGDUP: how this instruction interacts with the target's
+    /// condition flags at emit time; see `FlagKind`. The default is
+    /// `Other` (unknown flag effects), which makes the emit-time
+    /// flag-recompute elision a no-op for targets that do not implement
+    /// the query.
+    fn flag_kind(&self) -> FlagKind {
+        FlagKind::Other
+    }
 
     /// Is this a terminator (branch or ret)? If so, return its type
     /// (ret/uncond/cond) and target if applicable.
@@ -512,6 +521,29 @@ pub trait MachInstLabelUse: Clone + Copy + Debug + Eq {
     /// This returns `None` if the relocation doesn't have a corresponding
     /// representation for the target architecture.
     fn from_reloc(reloc: Reloc, addend: Addend) -> Option<Self>;
+}
+
+/// PLIRON FLAGDUP: how an instruction interacts with the target's
+/// condition flags at emit time. `VCode::emit` uses this to elide a
+/// compare/test whose identical flag state is still live: the compare
+/// was emitted earlier in the block, only flag-preserving insts
+/// intervened, and none of its operand pregs were rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagKind {
+    /// Establishes the condition flags by comparing operands identified
+    /// by `key` (which encodes the operation's form and any immediates)
+    /// over the operand pregs `a` and `b` (`a == b` for one-operand
+    /// forms). A later `Cmp` with the same `key` and unchanged `a`/`b`
+    /// recomputes these exact flags and may be elided.
+    Cmp { key: u64, a: PReg, b: PReg },
+    /// Provably does not write condition flags (moves, loads, lea,
+    /// cmov, setcc, nops, ...). It may still rewrite a compare's
+    /// operand pregs, which the emitter checks separately.
+    Neutral,
+    /// May write flags (arithmetic, unmodelled cmp/test forms) or makes
+    /// flag state unknowable (calls, block boundaries, terminators).
+    /// Conservatively the default for every target and inst.
+    Other,
 }
 
 /// Classification of call instruction types for granular analysis.

@@ -1119,3 +1119,49 @@ drop a `cmp/test` with identical opcode+operands when only
 flag-preserving insts (moves/lea/nop/cmov — whitelist, not blacklist)
 intervene and operand pregs are unmodified. Designed, not landed —
 flag-liveness is miscompile-risky and needs careful inst coverage.
+
+### FLAGDUP landed — `cmp`/`test` re-recompute elision (emit-level)
+
+The dead-flag-recompute pass designed above is in
+`machinst/vcode.rs`'s emit loop: tracks last flag-setting compare as
+`(key, preg_a, preg_b)`; an identical later compare is skipped when
+only whitelisted flag-preserving insts intervene and no operand preg
+was redefined (defs checked via `preg_ops`, edits included). New
+`MachInst::flag_kind`; whitelist uses a generated `mnemonic()` on the
+x64 assembler enum. Default on, `PLIRON_FLAGDUP=0` kills it; bisect
+aids `PLIRON_FLAGDUP_{BISECT,FORMS,FN,LOCAL,TRACE}` (see
+PLIRON_PATCH.md #122).
+
+**cmp3 miscompile + fix.** First gate run: sort test failed — `c`
+descending within equal `(a,b)` groups (checksum break, deterministic
+under `PLIRON_FLAGDUP` on; `=0` passes). Bisection path, worth
+recording because process-global `PLIRON_FLAGDUP_BISECT` was useless
+(rustc hash randomization + parallel lowering shuffle the global
+elision counter between identical compiles — same N gave different
+binaries): `PLIRON_FLAGDUP_FORMS=rc` alone reproduced, then
+`PLIRON_FLAGDUP_FN`+`PLIRON_FLAGDUP_LOCAL` (function-local elision
+counter, stable) bisected it to `quicksort<O3a>` elision #47 — a
+`cmpb %cl,%al` in block311 whose tracked gap contained
+`leal 2(%rdx),%edx`. The vcode says `lea`, but `emit_lea` shrinks
+dst==base forms to `add` (`addl $2,%edx`, 1 byte shorter) — a hidden
+flag write. `flag_kind` now calls `lea_encodes_as_add` mirroring
+`emit_lea`'s shrink conditions; those `leal`/`leaq` are `Other`.
+All four cmp3 legs green after.
+
+Audit notes for the record (holes checked while hunting):
+- `MovToPReg`/`MovFromPReg`/uninit pseudo-insts: `reg_fixed_nonallocatable`
+  dsts are rsp/rbp-class only — can't be cmp operands — but classified
+  `Other` anyway (conservative).
+- Implicit-operand writers `cbw`/`cwde`/`cdqe`/`cwd`/`cdq`/`cqo` were
+  initially whitelisted; rax/rdx defs are invisible to `preg_ops` —
+  removed from whitelist.
+- `cmp*_rm` vs `cmp*_mr` encode inverted subtractions — checked: the
+  dedup key carries the variant tag, no cross-reuse.
+- Pair fusion merges defs into `preg_ops`; squashed insts skip the
+  flag update; `flag_twin` is aarch64-only (inert on x64).
+- Stack->stack edit path: panics unimplemented, not a silent hole.
+
+Unit tests `pliron-clif-opt/tests/x64_flagdup.rs` (same-block reuse,
+operand rewrite, intervening flag writer). The lea->add regression
+itself is regalloc-shape-dependent and can't be forced from CLIF —
+pinned by the cmp3 e2e stanza.

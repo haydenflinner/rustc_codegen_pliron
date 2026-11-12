@@ -1937,6 +1937,80 @@ impl<I: VCodeInst> VCode<I> {
         // after its successor) contributes nothing and empties the seed.
         static MCPBB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mcpbb = *MCPBB.get_or_init(|| std::env::var("PLIRON_MCPBB").as_deref() != Ok("0"));
+        // PLIRON FLAGDUP (`PLIRON_FLAGDUP=0` off, default on): elide a
+        // compare/test that recomputes an identical, still-live flag
+        // state — the same `flag_kind()` Cmp key emitted earlier in the
+        // block, only flag-preserving (`Neutral`) insts intervening, and
+        // no rewrite of the compare's operand pregs. `flag_state` holds
+        // `(key, operand pregs)`; every inst funnelling through
+        // `do_emit` (stream insts, RA edits, island jumps, block
+        // markers) keeps it in sync, and defs invalidate it via
+        // `preg_ops` (stream insts) or the edit destination (moves,
+        // reloads, remats). Terminators, calls, block boundaries and
+        // anything `flag_kind` does not model conservatively drop it.
+        static FLAGDUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let flagdup =
+            *FLAGDUP.get_or_init(|| std::env::var("PLIRON_FLAGDUP").as_deref() != Ok("0"));
+        // PLIRON FLAGDUP_BISECT (`PLIRON_FLAGDUP_BISECT=N`): allow only
+        // the first N elisions process-wide — a miscompile bisector.
+        static FLAGDUP_BISECT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let flagdup_bisect = *FLAGDUP_BISECT.get_or_init(|| {
+            std::env::var("PLIRON_FLAGDUP_BISECT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX)
+        });
+        static FLAGDUP_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        // PLIRON FLAGDUP_FORMS (`PLIRON_FLAGDUP_FORMS=rc,rt,ic,it`):
+        // which compare forms may dedup — reg-reg cmp / reg-reg test /
+        // reg-imm cmp / reg-imm test. Debug aid; default all.
+        static FLAGDUP_FORMS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let flagdup_forms = *FLAGDUP_FORMS.get_or_init(|| {
+            std::env::var("PLIRON_FLAGDUP_FORMS").map_or(0xf, |v| {
+                v.split(',').fold(0u8, |m, s| {
+                    m | match s.trim() {
+                        "rc" => 0x1,
+                        "rt" => 0x2,
+                        "ic" => 0x4,
+                        "it" => 0x8,
+                        _ => 0,
+                    }
+                })
+            })
+        });
+        // PLIRON FLAGDUP_FN (`PLIRON_FLAGDUP_FN=<substr>`): restrict
+        // elision to functions whose name contains the substring
+        // (`!<substr>` inverts). Miscompile bisect aid.
+        static FLAGDUP_FN: std::sync::OnceLock<Option<(bool, String)>> =
+            std::sync::OnceLock::new();
+        let flagdup_fn = FLAGDUP_FN.get_or_init(|| {
+            std::env::var("PLIRON_FLAGDUP_FN").ok().map(|v| {
+                if let Some(rest) = v.strip_prefix('!') {
+                    (false, alloc::string::String::from(rest))
+                } else {
+                    (true, v)
+                }
+            })
+        });
+        let flagdup_fn_ok = flagdup_fn.as_ref().map_or(true, |(allow, pat)| {
+            let m = crate::PLIRON_FN_NAME.with(|s| s.borrow().contains(pat.as_str()));
+            m == *allow
+        });
+        // PLIRON FLAGDUP_LOCAL (`PLIRON_FLAGDUP_LOCAL=N`): allow only the
+        // first N elisions within THIS function — deterministic per
+        // function (unlike the process-wide counter), so
+        // `FLAGDUP_FN=<f> FLAGDUP_LOCAL=N` bisects a bad elision inside
+        // a single function.
+        static FLAGDUP_LOCAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let flagdup_local = *FLAGDUP_LOCAL.get_or_init(|| {
+            std::env::var("PLIRON_FLAGDUP_LOCAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX)
+        });
+        let flagdup_local_n = std::cell::Cell::new(0u64);
+        let flag_state = std::cell::Cell::new(None::<(u64, PReg, PReg)>);
         let mut order_pos = vec![usize::MAX; self.num_blocks()];
         for (i, &b) in final_order.iter().enumerate() {
             order_pos[b.index()] = i;
@@ -2241,6 +2315,10 @@ impl<I: VCodeInst> VCode<I> {
                 && noret_dead.as_ref().is_some_and(|d| d[block.index()])
             {
                 buffer.bind_label(MachLabel::from_block(block), state.ctrl_plane_mut());
+                // PLIRON FLAGDUP: flag state cannot be assumed across a
+                // block boundary — another pred may enter without having
+                // emitted the tracked compare.
+                flag_state.set(None);
                 continue;
             }
 
@@ -2319,6 +2397,18 @@ impl<I: VCodeInst> VCode<I> {
                            disasm: &mut String,
                            buffer: &mut MachBuffer<I>,
                            state: &mut I::State| {
+                // PLIRON FLAGDUP: keep the tracked flag state in sync for
+                // every inst funnelling through here — stream insts, RA
+                // edit moves/spills/reloads/remats, island jumps, and
+                // block markers (`Args`/`Rets`/`Other` clear it, which is
+                // also the block-boundary reset).
+                if flagdup {
+                    match inst.flag_kind() {
+                        FlagKind::Cmp { key, a, b } => flag_state.set(Some((key, a, b))),
+                        FlagKind::Neutral => {}
+                        FlagKind::Other => flag_state.set(None),
+                    }
+                }
                 if want_disasm && !inst.is_args() {
                     let mut s = state.clone();
                     writeln!(disasm, "  {}", inst.pretty_print_inst(&mut s)).unwrap();
@@ -2367,6 +2457,10 @@ impl<I: VCodeInst> VCode<I> {
             // Now emit the regular block body.
 
             buffer.bind_label(MachLabel::from_block(block), state.ctrl_plane_mut());
+            // PLIRON FLAGDUP: flag state cannot be assumed across a
+            // block boundary — another pred may enter without having
+            // emitted the tracked compare.
+            flag_state.set(None);
 
             if want_disasm {
                 // PLIRON: name the CLIF block (or edge) this lowers, so
@@ -3139,7 +3233,76 @@ impl<I: VCodeInst> VCode<I> {
                                     }
                                 }
                             }
-                            if !dead_mov {
+                            // PLIRON FLAGDUP: a compare/test whose exact
+                            // flag state is still tracked is dead. For
+                            // flag-preserving insts, additionally drop
+                            // the tracked state if they rewrite one of
+                            // the compare's operand pregs (`Other` insts
+                            // clear it inside `do_emit`; a recorded `Cmp`
+                            // is (re)established there on emit).
+                            let mut dead_cmp = false;
+                            if flagdup && !dead_mov {
+                                match self.insts[iix.index()].flag_kind() {
+                                    FlagKind::Cmp { key, a, b } => {
+                                        // Form gate (`PLIRON_FLAGDUP_FORMS`):
+                                        // tag byte low nibble classifies
+                                        // reg-reg cmp (1-8) / test (9-c) /
+                                        // reg-imm cmp (0x11-0x17) /
+                                        // reg-imm test (0x19-0x1c).
+                                        let form_bit = match key & 0xff {
+                                            0x01..=0x08 => 0x1,
+                                            0x09..=0x0c => 0x2,
+                                            0x11..=0x17 => 0x4,
+                                            _ => 0x8,
+                                        };
+                                        if flagdup_forms & form_bit != 0
+                                            && flagdup_fn_ok
+                                            && flag_state.get() == Some((key, a, b))
+                                        {
+                                            let n = FLAGDUP_COUNT.fetch_add(
+                                                1,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            if std::env::var("PLIRON_FLAGDUP_TRACE")
+                                                .is_ok()
+                                            {
+                                                eprintln!(
+                                                    "FLAGDUP elide #{n} {} block{} iix{}: {}",
+                                                    crate::PLIRON_FN_NAME
+                                                        .with(|s| s.borrow().clone()),
+                                                    block.index(),
+                                                    iix.index(),
+                                                    self.insts[iix.index()]
+                                                        .pretty_print_inst(&mut state)
+                                                );
+                                            }
+                                            let ln = flagdup_local_n.get();
+                                            if n < flagdup_bisect && ln < flagdup_local {
+                                                flagdup_local_n.set(ln + 1);
+                                                dead_cmp = true;
+                                            }
+                                        }
+                                    }
+                                    FlagKind::Neutral => {
+                                        if let Some((_, a, b)) = flag_state.get() {
+                                            if preg_ops[iix.index()].1.iter().any(
+                                                |d| {
+                                                    matches!(
+                                                        d.to_real_reg(),
+                                                        Some(rr)
+                                                            if PReg::from(rr) == a
+                                                                || PReg::from(rr) == b
+                                                    )
+                                                },
+                                            ) {
+                                                flag_state.set(None);
+                                            }
+                                        }
+                                    }
+                                    FlagKind::Other => {}
+                                }
+                            }
+                            if !dead_mov && !dead_cmp {
                                 do_emit(
                                     &self.insts[iix.index()],
                                     &mut disasm,
@@ -3164,6 +3327,16 @@ impl<I: VCodeInst> VCode<I> {
                     }
 
                     InstOrEdit::Edit(edit @ Edit::Move { from, to }) => {
+                        // PLIRON FLAGDUP: the edit's destination may
+                        // rewrite a tracked compare operand; a stack
+                        // (non-reg) destination cannot.
+                        if let (Some((_, a, b)), Some(preg)) =
+                            (flag_state.get(), to.as_reg())
+                        {
+                            if preg == a || preg == b {
+                                flag_state.set(None);
+                            }
+                        }
                         // PLIRON: a reload of a constant or symbol
                         // address re-executes its definition instead of
                         // the fill (see `remat_def`). Shared by the
@@ -3224,6 +3397,18 @@ impl<I: VCodeInst> VCode<I> {
                                     }
                                     if let Some(fused) = m1.fuse_with_next(&m2, &state) {
                                         ep_fused += 1;
+                                        // PLIRON FLAGDUP: the second
+                                        // edit's destination may also
+                                        // rewrite a tracked compare
+                                        // operand (the first was handled
+                                        // at the `Edit::Move` arm top).
+                                        if let (Some((_, a, b)), Some(preg)) =
+                                            (flag_state.get(), t2.as_reg())
+                                        {
+                                            if preg == a || preg == b {
+                                                flag_state.set(None);
+                                            }
+                                        }
                                         if mcp {
                                             // The pair writes both reload
                                             // dests; freshen each so later
@@ -3441,6 +3626,13 @@ impl<I: VCodeInst> VCode<I> {
         let ti = std::time::Instant::now();
         let buf = buffer.finish(&self.constants, ctrl_plane);
         let t_fin = ti.elapsed();
+        // PLIRON FLAGDUP_TRACE: running elision total (bisect aid).
+        if std::env::var("PLIRON_FLAGDUP_TRACE").is_ok() {
+            eprintln!(
+                "FLAGDUP total {}",
+                FLAGDUP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
         if eprof {
             eprintln!(
                 "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?} ep={ep_mem}/{ep_next}/{ep_dir}/{ep_fused} r2r={ep_r2r} mcp={mcp_dead}"

@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::slice;
 use cranelift_assembler_x64 as asm;
+use regalloc2::PReg;
 use smallvec::{SmallVec, smallvec};
 
 pub mod args;
@@ -1309,6 +1310,65 @@ pub fn wide_vector_bits() -> u32 {
     WIDE_VECTOR_BITS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+// PLIRON FLAGDUP: mnemonics that provably leave x86 condition flags
+// untouched, used to keep the flag-recompute state alive across them.
+// This is a whitelist: anything not listed drops the tracked state —
+// a missed optimization, never a wrong flag reuse. (`popcnt`/`popf`
+// look "pop"-adjacent but write flags — no prefix matches them.)
+// PLIRON FLAGDUP: does an instruction with this mnemonic preserve the
+// x64 condition flags? Only forms that also carry their register defs
+// as ordinary `get_operands` operands may be listed — the emitter
+// invalidates tracked flag state when a flagged-preserved inst rewrites
+// a compare operand, and it can only see real operand defs. Excluded
+// despite preserving flags:
+//   - `cbw`/`cwde`/`cdqe`/`cwd`/`cdq`/`cqo`: sign-extends that write
+//     rax/rdx *implicitly* — invisible to operand tracking.
+//   - `push`/`pop`/`leave`/`call`/`ret`: write rsp/rbp implicitly
+//     (nonallocatable today, but a pinned-reg compare could track them).
+//   - `sahf`/`stc`/`clc`/`cmc`/`popf`/`cmps`/`scas`: flag *writers*.
+//   - `movs`/`stos`/`lods`/`ins`/`outs`/`rep`: implicit rsi/rdi updates.
+// A miss only costs a re-emitted compare; a false positive miscompiles.
+fn flag_preserving_mnemonic(mn: &str) -> bool {
+    mn.starts_with("mov")
+        || mn.starts_with("cmov")
+        || mn.starts_with("set")
+        || mn.starts_with("lea")
+        || mn.starts_with("nop")
+        || mn.starts_with('j')
+        || mn.starts_with("prefetch")
+        || mn.starts_with("vzero")
+        || matches!(mn, "xchg" | "bswap" | "pause" | "mfence" | "lfence" | "sfence")
+}
+
+// `emit_lea` shrinks `lea` into `add` when `dst` is also the (only)
+// source register — `add` writes flags, so those `lea`s are not
+// flag-preserving even though the mnemonic says otherwise. Mirror the
+// exact `emit_lea` conditions: `dst == base` for `disp(base)`, and
+// `dst == base || dst == index` for `0(base, index, 1)`.
+fn lea_encodes_as_add(dst: Gpr, addr: &asm::Amode<Gpr>) -> bool {
+    match addr {
+        asm::Amode::ImmReg {
+            base,
+            simm32:
+                asm::AmodeOffsetPlusKnownOffset {
+                    simm32: _,
+                    offset: None,
+                },
+            trap: None,
+        } => dst == *base,
+        asm::Amode::ImmRegRegShift {
+            base,
+            index,
+            scale: asm::Scale::One,
+            simm32,
+            trap: None,
+        } => {
+            simm32.value() == 0 && (dst == *base || dst == *index.as_ref())
+        }
+        _ => false,
+    }
+}
+
 impl MachInst for Inst {
     type ABIMachineSpec = X64ABIMachineSpec;
 
@@ -1389,6 +1449,122 @@ impl MachInst for Inst {
                 asm::XmmMem::Mem(_) => None,
             },
             _ => None,
+        }
+    }
+
+    // PLIRON FLAGDUP: classify flag effects for the emit-time
+    // flag-recompute elision. `Cmp` covers the reg-reg and reg-imm
+    // cmp/test forms the lowering actually emits; `Neutral` is the
+    // provably flag-preserving set (the pseudo-insts below plus the
+    // assembler insts whose mnemonic is in `flag_preserving_mnemonic`).
+    // Everything else is `Other` and conservatively drops the tracked
+    // state — a missed dedup, never a wrong flag reuse.
+    fn flag_kind(&self) -> FlagKind {
+        use asm::inst::Inst as I;
+        let preg = |r: Reg| -> PReg { PReg::from(r.to_real_reg().unwrap()) };
+        macro_rules! regreg {
+            ($i:expr, $rm:ident, $r:ident, $tag:expr) => {
+                match &$i.$rm {
+                    asm::GprMem::Gpr(b) => FlagKind::Cmp {
+                        key: $tag,
+                        a: preg($i.$r.as_ref().to_reg()),
+                        b: preg(b.to_reg()),
+                    },
+                    _ => FlagKind::Other,
+                }
+            };
+        }
+        // For test-forms also normalize operand order: `test a,b` and
+        // `test b,a` produce identical flags.
+        macro_rules! regreg_test {
+            ($i:expr, $rm:ident, $r:ident, $tag:expr) => {
+                match &$i.$rm {
+                    asm::GprMem::Gpr(b) => {
+                        let (x, y) = (preg($i.$r.as_ref().to_reg()), preg(b.to_reg()));
+                        let (x, y) = if x < y { (x, y) } else { (y, x) };
+                        FlagKind::Cmp { key: $tag, a: x, b: y }
+                    }
+                    _ => FlagKind::Other,
+                }
+            };
+        }
+        macro_rules! regimm {
+            ($i:expr, $rm:ident, $imm:ident, $tag:expr) => {
+                match &$i.$rm {
+                    asm::GprMem::Gpr(b) => {
+                        let p = preg(b.to_reg());
+                        FlagKind::Cmp {
+                            key: $tag | (($i.$imm.value() as i64 as u64) << 8),
+                            a: p,
+                            b: p,
+                        }
+                    }
+                    _ => FlagKind::Other,
+                }
+            };
+        }
+        match self {
+            // Pseudo-insts that emit only flag-preserving code and whose
+            // operand defs are real `get_operands` defs (so the emitter's
+            // operand-rewrite check can see them): xmm cmovs, address
+            // materialization, no-code markers. `MovFromPReg`/
+            // `MovToPReg` (fixed/nonallocatable preg operands, unusual
+            // operand bookkeeping) and `*UninitializedValue` (declare
+            // a def but emit nothing) stay `Other` as cheap insurance —
+            // they are rare and clearing state around them costs a
+            // re-emit at worst. Everything else (`Args`/`Rets` block
+            // markers, terminators, calls, probes, traps, TLS sequences,
+            // atomic and conversion sequences) also stays `Other` —
+            // flag state must not be assumed to cross them.
+            Self::XmmCmove { .. }
+            | Self::DummyUse { .. }
+            | Self::Unwind { .. }
+            | Self::SequencePoint
+            | Self::LabelAddress { .. }
+            | Self::LoadExtName { .. } => FlagKind::Neutral,
+            Self::External { inst } => match inst {
+                I::cmpq_rm(i) => regreg!(i, rm64, r64, 0x01),
+                I::cmpl_rm(i) => regreg!(i, rm32, r32, 0x02),
+                I::cmpw_rm(i) => regreg!(i, rm16, r16, 0x03),
+                I::cmpb_rm(i) => regreg!(i, rm8, r8, 0x04),
+                I::cmpq_mr(i) => regreg!(i, rm64, r64, 0x05),
+                I::cmpl_mr(i) => regreg!(i, rm32, r32, 0x06),
+                I::cmpw_mr(i) => regreg!(i, rm16, r16, 0x07),
+                I::cmpb_mr(i) => regreg!(i, rm8, r8, 0x08),
+                I::testq_mr(i) => regreg_test!(i, rm64, r64, 0x09),
+                I::testl_mr(i) => regreg_test!(i, rm32, r32, 0x0a),
+                I::testw_mr(i) => regreg_test!(i, rm16, r16, 0x0b),
+                I::testb_mr(i) => regreg_test!(i, rm8, r8, 0x0c),
+                I::cmpq_mi(i) => regimm!(i, rm64, imm32, 0x11),
+                I::cmpl_mi(i) => regimm!(i, rm32, imm32, 0x12),
+                I::cmpw_mi(i) => regimm!(i, rm16, imm16, 0x13),
+                I::cmpb_mi(i) => regimm!(i, rm8, imm8, 0x14),
+                I::cmpq_mi_sxb(i) => regimm!(i, rm64, imm8, 0x15),
+                I::cmpl_mi_sxb(i) => regimm!(i, rm32, imm8, 0x16),
+                I::cmpw_mi_sxb(i) => regimm!(i, rm16, imm8, 0x17),
+                I::testq_mi(i) => regimm!(i, rm64, imm32, 0x19),
+                I::testl_mi(i) => regimm!(i, rm32, imm32, 0x1a),
+                I::testw_mi(i) => regimm!(i, rm16, imm16, 0x1b),
+                I::testb_mi(i) => regimm!(i, rm8, imm8, 0x1c),
+                // A `lea` that `emit_lea` shrinks to `add` writes
+                // flags (the cmp3 miscompile: `leal 2(%rdx),%edx` emits
+                // `addl $2,%edx` between the two `cmpb`s of an
+                // equal-key dedup candidate).
+                I::leal_rm(i) if lea_encodes_as_add(i.r32.as_ref().to_reg(), &i.m32) => {
+                    FlagKind::Other
+                }
+                I::leaq_rm(i) if lea_encodes_as_add(i.r64.as_ref().to_reg(), &i.m64) => {
+                    FlagKind::Other
+                }
+                _ => {
+                    if flag_preserving_mnemonic(&inst.mnemonic()) {
+                        FlagKind::Neutral
+                    } else {
+                        FlagKind::Other
+                    }
+                }
+            },
+            _ => FlagKind::Other,
         }
     }
 

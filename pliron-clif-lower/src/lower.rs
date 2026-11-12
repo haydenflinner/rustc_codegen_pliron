@@ -1087,6 +1087,8 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     let explain = crate::env_get("PLIRON_RA_EXPLAIN").is_some_and(|p| n.contains(p));
     if crate::env_get("PLIRON_RA2_STATS").is_some()
         || crate::env_get("PLIRON_PREVCODE").is_some()
+        || crate::env_get("PLIRON_FLAGDUP_FN").is_some()
+        || crate::env_get("PLIRON_FLAGDUP_TRACE").is_some()
     {
         cranelift_codegen::pliron_set_fn_name(n);
     }

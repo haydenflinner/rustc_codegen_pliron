@@ -1655,3 +1655,44 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     tracking, which models full-width equality. fib loop drops the
     `movl %ecx,%ecx` arg self-move (isub result already in the arg
     lane); gated by the same `PLIRON_MCP` switch that runs the block.
+
+122. x64 dead flag-recompute elision (`machinst/vcode.rs` emit loop;
+    `PLIRON_FLAGDUP=0` disables). One `icmp` feeding several consumers
+    lowers to a fresh `cmp`/`test` per consumer even when nothing
+    between writes flags or redefine the operands. During emit, vcode
+    tracks the last flag-setting compare as `(key, preg_a, preg_b)` —
+    key distinguishes `cmp` from `test`, `*_rm` from `*_mr`, and
+    opcode/size — and skips an identical compare when only
+    flag-preserving insts intervene and neither operand preg is
+    redefined. Classification is a new `MachInst::flag_kind`
+    (`machinst/mod.rs`): `Cmp`/`Test` (updates state), `Neutral`
+    (flag-preserving — checked against the operand defs so a neutral
+    inst rewriting a tracked operand clears state), `Other` (clears).
+    `Neutral` is whitelist-by-mnemonic (moves, `lea`, `cmov`, `setcc`,
+    `nop`, sign/zero-extends...) via a generated `mnemonic()` on the
+    assembler enum (`cranelift-assembler-x64-meta/src/generate.rs`) —
+    not a blacklist, so unmodeled insts (calls, terminators, prologue
+    insts, fixed-preg pseudos) conservatively clear. Implicit-operand
+    writers (`cbw`/`cwde`/`cdqe`/`cwd`/`cdq`/`cqo` — rax/rdx defs
+    invisible to `preg_ops`) are excluded from the whitelist. Block
+    boundaries reset via the `bind_label` sites, and every RA edit
+    (`Move`, fused spill/reload/remat pairs) clears state if it writes
+    either tracked preg — edits route through the same `do_emit`
+    funnel. Bisect aids: `PLIRON_FLAGDUP_BISECT=N` (first N elisions
+    only), `PLIRON_FLAGDUP_FORMS=rc,rt,ic,it` (reg-reg cmp/test,
+    reg-imm cmp/test), `PLIRON_FLAGDUP_FN=<substr>`/`!<substr>`
+    (per-function, deterministic unlike the process-global counter),
+    `PLIRON_FLAGDUP_LOCAL=N` (function-local elision budget),
+    `PLIRON_FLAGDUP_TRACE` (prints each elision + running total).
+
+    cmp3 miscompile: `lea` was whitelisted, but `emit_lea` shrinks
+    `lea` to flag-writing `add` when the destination equals the base
+    (`ImmReg`) or base/index (`RegReg`, scale-1, offset-0) —
+    `leal 2(%rdx),%edx` emitted as `addl $2,%edx` clobbered the flags a
+    still-elided `cmpb` relied on, flipping sort order. `flag_kind`
+    now calls `lea_encodes_as_add` (`isa/x64/inst/mod.rs`, mirroring
+    `emit_lea`'s shrink conditions) and classifies those `leal`/`leaq`
+    as `Other`. Regression: `tests/cmp3` e2e stanza (the lea->add
+    shape is regalloc-dependent, not CLIF-controllable);
+    `pliron-clif-opt/tests/x64_flagdup.rs` covers same-block reuse,
+    operand rewrite, and intervening flag writers.

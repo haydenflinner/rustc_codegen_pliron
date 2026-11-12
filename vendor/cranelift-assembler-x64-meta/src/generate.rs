@@ -82,6 +82,15 @@ fn generate_inst_impls(f: &mut Formatter, insts: &[dsl::Inst]) {
                 match_variants(f, insts, "is_available(f)");
             },
         );
+        // PLIRON FLAGDUP: expose the per-instruction mnemonic on the enum
+        // so emit-time peepholes can classify flag effects without
+        // re-deriving them from encodings.
+        f.add_block(
+            "pub fn mnemonic(&self) -> alloc::borrow::Cow<'static, str>",
+            |f| {
+                match_variants(f, insts, "mnemonic()");
+            },
+        );
         f.add_block("pub fn features(&self) -> &'static Features", |f| {
             match_variants(f, insts, "features()");
         });
