@@ -96,6 +96,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   Medians append to `bench/history.tsv` (commit it when a number moves).
   ~8 min for all; `BENCHTIME`/`COUNT` env vars tune it.
 - `bench/wasm/run.sh [filter]` — same kernels on wasm32 in node.
+- `bench/heldout/asmvs.py [--only prog] [--fn F | --line FILE:LINE]` —
+  our code next to LLVM's for a held-out program, keyed by source line
+  (so inlining differences don't break the pairing) with every
+  instruction classified (stack load/store, register copy, extend,
+  ...) and weighted by self samples: a class table of what the gap is
+  made of, the lines that lose most, and side-by-side listings. `--fn`
+  ends with the function's optimization remarks.
+- `PLIRON_REMARKS=<prefix>` + `harness/remarks.py <prefix> [--fn F]
+  [--callee C]` — one fixed-shape record per decision *not* to
+  optimize: each call the inliner kept (reason, cost vs threshold, cap,
+  growth) and each loop `loopvec` left scalar. New passes report
+  refusals with `pliron_cfg::remark!`.
 - To see why a kernel is slow: `PLIRON_CLIF=<fn substr>` dumps CLIF
   after every step; `rustc --emit obj` + `llvm-objdump -d` (or
   `wasm2wat`) for final code; compare with stock rustc's output for the

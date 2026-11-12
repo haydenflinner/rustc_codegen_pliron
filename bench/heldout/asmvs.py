@@ -23,7 +23,9 @@ branch, ...). Self samples are attributed per instruction address, so
 Both sides are built like `run.py` builds them, plus
 `debug = "line-tables-only"` (target/heldout/{llvm,pliron}-g/<name>); the
 machine code is the same as the plain release build's on both backends.
-After relax's `asm <fn> vs=rustc` (relax/libs/relax/compiler/src/inspect/asm.rs).
+Our side is built with `PLIRON_REMARKS`, and `--fn` ends with the remarks
+of the matching functions: why each call stayed a call, why a loop was not
+vectorized. After relax's `asm <fn> vs=rustc`.
 Writes target/heldout/asmvs.json.
 """
 import argparse, bisect, collections, gzip, importlib.util, json, os, re, shutil, subprocess, sys
@@ -33,6 +35,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def load(name):
     spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, name + ".py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def load_harness(name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, "..", "..", "harness", name + ".py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
@@ -199,16 +208,34 @@ class Side:
         return d
 
 
+def remarks_prefix(prog):
+    return os.path.join(OUT, "remarks", prog, "r")
+
+
+def show_remarks(prog, fn):
+    """Why the calls of our functions matching `fn` stayed calls, and their loops scalar."""
+    rm = load_harness("remarks")
+    rows = [r for r in rm.load(remarks_prefix(prog)) if fn in r[1] and "external" not in r[3]]
+    if rows:
+        print(f"\n-- remarks (harness/remarks.py {remarks_prefix(prog)} --fn ...)")
+    for p, f, s, why, n in rows:
+        print(f"  {p}: {s[:110]}\n      {why}" + (f"  (x{n})" if n > 1 else ""))
+
+
 def build_sides(prog, binary, backend, skip):
     base = dict(os.environ, RUSTUP_TOOLCHAIN=run.TOOLCHAIN, CARGO_TERM_COLOR="never",
                 CARGO_PROFILE_RELEASE_DEBUG="line-tables-only",
                 CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO="packed")
     base.pop("RUSTFLAGS", None)
-    envs = {"llvm-g": base, "pliron-g": dict(base, RUSTFLAGS=f"-Zcodegen-backend={backend}")}
+    envs = {"llvm-g": base, "pliron-g": dict(base, RUSTFLAGS=f"-Zcodegen-backend={backend}",
+                                             PLIRON_REMARKS=remarks_prefix(prog))}
     exes = {}
     for side, env in envs.items():
         exe = os.path.join(OUT, side, prog, "release", binary)
         if not (skip and os.path.exists(exe)):
+            if side == "pliron-g":
+                shutil.rmtree(os.path.dirname(remarks_prefix(prog)), ignore_errors=True)
+                os.makedirs(os.path.dirname(remarks_prefix(prog)))
             exe = run.build(prog, binary, side, env)
             if exe is None:
                 sys.exit(f"asmvs: {side} build of {prog} failed")
@@ -282,6 +309,7 @@ def main():
         if a.fn or a.line:
             if a.fn:
                 show_lines(sides, lambda fn, line: a.fn in fn, a.top)
+                show_remarks(prog, a.fn)
             else:
                 show_lines(sides, lambda fn, line: line.endswith(a.line), a.top)
             continue

@@ -599,6 +599,47 @@ pub fn mark(label: &str) {
     }
 }
 
+/// `PLIRON_REMARKS=<path>`: optimization remarks, one tab-separated line
+/// per decision *not* to optimize (`<pass>\t<function>\t<what>\t<why>`),
+/// appended to `<path>.<pid>`. Unlike the `PLIRON_TRACE` debug lines these
+/// have one fixed shape, cost nothing when the knob is unset, and are
+/// meant to be joined with a profile: `harness/remarks.py` answers "why
+/// is this call still a call" / "why did this loop not vectorize" for the
+/// functions a profile names (after relax's `remarks <fn>`).
+pub fn remarks_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| env_get("PLIRON_REMARKS").is_some());
+    *ON
+}
+
+/// Record one remark (see [`remarks_on`]; callers check it first so the
+/// arguments are not formatted when off). `what` names the subject (a
+/// callee, a loop header), `why` the reason with its numbers.
+pub fn remark(pass: &str, func: &str, what: &dyn std::fmt::Display, why: &dyn std::fmt::Display) {
+    use std::io::Write;
+    static SINK: std::sync::LazyLock<Option<std::sync::Mutex<std::io::LineWriter<std::fs::File>>>> =
+        std::sync::LazyLock::new(|| {
+            let path = format!("{}.{}", env_get("PLIRON_REMARKS")?, std::process::id());
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+            Some(std::sync::Mutex::new(std::io::LineWriter::new(f)))
+        });
+    if let Some(m) = SINK.as_ref()
+        && let Ok(mut w) = m.lock()
+    {
+        let _ = writeln!(w, "{pass}\t{func}\t{what}\t{why}");
+    }
+}
+
+/// `remark!(pass, func, what; "why {}", args)`: a remark when
+/// `PLIRON_REMARKS` is set, nothing otherwise.
+#[macro_export]
+macro_rules! remark {
+    ($pass:expr, $func:expr, $what:expr; $($t:tt)*) => {
+        if $crate::remarks_on() {
+            $crate::remark($pass, &*$func, &$what, &format_args!($($t)*));
+        }
+    };
+}
+
 /// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass
 /// applications (across all passes and functions), like LLVM's
 /// `-opt-bisect-limit`. Each gate call consumes one unit; with no env var
