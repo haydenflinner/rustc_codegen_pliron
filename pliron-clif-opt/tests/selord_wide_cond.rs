@@ -62,7 +62,7 @@ fn select_on_wide_cond_keeps_cond_type() {
     ] {
         let before = parse(src);
         let mut after = before.clone();
-        pliron_clif_opt::clifpeep::iconst128(&mut after, true);
+        pliron_clif_opt::clifpeep::iconst128(&mut after, true, false);
         assert!(!after.display().to_string().contains("select"), "{what}: not rewritten");
         verify(&after);
         check(&before, &after, &Facts::default(), &Config::default())

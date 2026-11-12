@@ -51,7 +51,7 @@ fn constant_false_select_chain_stays_false() {
     let mut f = cranelift_reader::parse_functions(SRC).unwrap().remove(0);
     let before: Vec<i8> = [(1, 2), (2, 1), (3, 3)].iter().map(|&(a, b)| run(&f, a, b)).collect();
     assert_eq!(before, [0, 0, 0]);
-    pliron_clif_opt::clifpeep::iconst128(&mut f, true);
+    pliron_clif_opt::clifpeep::iconst128(&mut f, true, false);
     let after: Vec<i8> = [(1, 2), (2, 1), (3, 3)].iter().map(|&(a, b)| run(&f, a, b)).collect();
     assert_eq!(after, before, "post_sweep changed the result:\n{}", f.display());
 }
