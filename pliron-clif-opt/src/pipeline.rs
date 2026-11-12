@@ -5109,7 +5109,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: |p, _an| {
                 let reap = p.since_reap;
                 p.since_reap = false;
-                clifpeep::iconst128(&mut p.clctx.func, reap)
+                clifpeep::iconst128(&mut p.clctx.func, reap, p.x64)
             },
             site: std::sync::OnceLock::new(),
         },

@@ -8290,6 +8290,72 @@ fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: T
     true
 }
 
+/// `imul x, d·2^k` (d ∈ {3,5,9}, k ∈ 1..=3) → `ishl (imul x, d), k` —
+/// the odd factor lowers to one `lea (x, x·(d-1))` (x64
+/// `PLIRON_X64_IMULEA` rule) and the `ishl` folds into a consuming
+/// `iadd`'s amode as `base + idx<<k`. `parse::<u32>`'s `acc·10 + digit`
+/// then emits `lea` + `lea` like LLVM instead of `imul` + `lea`.
+/// Gated on every use being an `iadd`: anywhere else the `ishl`
+/// materializes and the split is a wash. Runs in `post_sweep` — the
+/// `umul_overflow → imul` rewrite (`ovf`) only produces the plain
+/// `imul x, 10` there. x64 only — the `·2^k` tail is a real extra
+/// inst everywhere else.
+fn mulea_sweep(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut uses: Option<crate::uses::Uses> = None;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let InstructionData::Binary {
+                opcode: Opcode::Imul,
+                args,
+            } = pos.func.dfg.insts[inst]
+            else {
+                continue;
+            };
+            let res = pos.func.dfg.first_result(inst);
+            let ty = pos.func.dfg.value_type(res);
+            if !ty.is_int() || ty.is_vector() || !(ty.bits() == 32 || ty.bits() == 64) {
+                continue;
+            }
+            let hit = (0..2).find_map(|i| {
+                let c = iconst(pos.func, args[i])? as u64;
+                let x = pos.func.dfg.resolve_aliases(args[1 - i]);
+                (1..=3).find_map(|k| {
+                    let d = c >> k;
+                    (d << k == c && matches!(d, 3 | 5 | 9)).then_some((x, d, k))
+                })
+            });
+            let Some((x, d, k)) = hit else { continue };
+            if !mulea_all_iadd(pos.func, res, &mut uses) {
+                continue;
+            }
+            let dc = pos.ins().iconst(ty, d as i64);
+            let t = pos.ins().imul(x, dc);
+            pos.func.replace(inst).ishl_imm_s(t, k as i64);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Every use of `v` is an `iadd` — the `PLIRON_X64_IMULEA` split of
+/// `x·(d·2^k)` into `imul x, d` + `ishl …, k` is a strict win only
+/// then: x64 folds the `ishl` into each `iadd`'s `base + idx<<k` amode.
+/// Lazily builds one `Uses` index for the whole sweep.
+fn mulea_all_iadd(
+    func: &Function,
+    v: Value,
+    uses: &mut Option<crate::uses::Uses>,
+) -> bool {
+    let u = uses.get_or_insert_with(|| crate::uses::Uses::new(func));
+    let sites = u.sites(func.dfg.resolve_aliases(v));
+    !sites.is_empty()
+        && sites
+            .iter()
+            .all(|&(_, i)| func.dfg.insts[i].opcode() == Opcode::Iadd)
+}
+
 /// Inst-arg + branch-arg use counts for every value, built on demand.
 fn use_counts(func: &Function) -> FxHashMap<Value, usize> {
     let mut m: FxHashMap<Value, usize> = FxHashMap::default();
@@ -9682,7 +9748,7 @@ fn alias_to(pos: &mut FuncCursor, inst: Inst, res: Value, v: Value) -> bool {
 ///   (`uextend.i32 x8 & 255` — unicode lookup results).
 /// - `icmpk`/`addnorm` on the survivors, for chains the earlier sweeps
 ///   predated.
-fn post_sweep(func: &mut Function) -> usize {
+fn post_sweep(func: &mut Function, x64: bool) -> usize {
     let mut n = crate::jumpthread::remove_dead_insts(func, true);
     let mut hits = Vec::new();
     let ovfk_on = crate::pass_enabled("PLIRON_OVFK");
@@ -9877,6 +9943,9 @@ fn post_sweep(func: &mut Function) -> usize {
             pos.func.layout.remove_inst(i);
             n += 1;
         }
+    }
+    if x64 && pliron_cfg::env_is("PLIRON_X64_IMULEA", "1") {
+        n += mulea_sweep(func);
     }
     if crate::pass_enabled("PLIRON_BITMERGE") {
         n += bitmerge(func);
@@ -10165,14 +10234,14 @@ fn iconst128_sweep(func: &mut Function) -> usize {
     n
 }
 
-pub fn iconst128(func: &mut Function, reap: bool) -> usize {
+pub fn iconst128(func: &mut Function, reap: bool, x64: bool) -> usize {
     let mut n = iconst128_sweep(func);
     // `post_sweep` is three whole-function walks; with no mutation
     // since entry they can only re-scan already-clean IR. `reap` is the
     // pipeline's "edits since last reap" bit; our own i128 rewrites
     // count too.
     if crate::pass_enabled("PLIRON_POSTSWEEP") && (reap || n > 0) {
-        let m = post_sweep(func);
+        let m = post_sweep(func, x64);
         n += m;
         // `post_sweep`'s folds materialize constants of widened types
         // (`icmpred`, `bandk`) — the i128 sweep must stay literally
@@ -13609,7 +13678,7 @@ mod tests {
         let out = cur.ins().uextend(types::I64, c);
         cur.ins().return_(&[out]);
 
-        iconst128(&mut func, true);
+        iconst128(&mut func, true, false);
         assert!(
             !func.display().to_string().contains("iconst.i128"),
             "post_sweep minted an unlegalized iconst.i128:\n{}",
@@ -13640,7 +13709,7 @@ mod tests {
         let lo = cur.ins().ireduce(types::I64, z);
         cur.ins().return_(&[lo]);
 
-        iconst128(&mut func, true);
+        iconst128(&mut func, true, false);
         assert!(
             !func.display().to_string().contains("iconst.i128"),
             "post_sweep minted an unlegalized iconst.i128:\n{}",
@@ -13674,7 +13743,7 @@ mod tests {
         let s = cur.ins().select(c, one, zero);
         cur.ins().return_(&[s]);
 
-        let n = iconst128(&mut func, true);
+        let n = iconst128(&mut func, true, false);
         assert!(n > 0, "expected the select fold to fire:\n{}", func.display());
         // The i8 result must not alias to the i64 condition.
         dem64_verify(&func, "post_sweep wide-cond select");

@@ -1822,3 +1822,24 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      runtime (~1.0x). Read per function so tests can toggle within
      one process. Regression:
      `pliron-clif-opt/tests/x64_chainjoin.rs`.
+
+129. Small-multiplier `lea` for `imul x, d` (opt-in;
+     `PLIRON_X64_IMULEA=1`). LLVM strength-reduces `x·d` for
+     `d ∈ {3,5,9}` to `lea (x, x·(d-1))` — 1c vs `imul`'s 3c, one
+     inst. The `·2^k` tail of `d·2^k` multipliers is NOT handled
+     here: emitting `lea` + `shl` for `x·(d·2^k)` measured slower
+     than the `imul` + consumer `lea` pair it replaced (~320ms vs
+     ~300ms on parse_only) because it inserts an inst LLVM never
+     needs — LLVM instead folds the `·2^k` into the *consumer's*
+     addressing mode. So `clifpeep::mulea_sweep` (post_sweep stage,
+     same gate) splits `imul x, d·2^k` into `imul x, d` +
+     `ishl …, k` only when every use is an `iadd`: x64's existing
+     `to_amode_add` then folds the `ishl` into `base + idx<<k`.
+     `parse::<u32>`'s `acc·10 + digit` emits `leal (%r,%r,4)` +
+     `leal -0x30(%r,%rdx,2)` — LLVM's exact shape. The rule itself:
+     `pliron_mul_lea_d` extractor (pure, `imulea_enabled()` env
+     check) matching a `u64_from_iconst` multiplier of 3/5/9 at
+     priority 10, emitting `x64_lea` over
+     `Amode.ImmRegRegShift(0, x, x, log2(d-1))`. Multi-use or
+     non-`iadd`-fed `d·2^k` products keep `imul`. Regression:
+     `pliron-clif-opt/tests/x64_mulea.rs`.

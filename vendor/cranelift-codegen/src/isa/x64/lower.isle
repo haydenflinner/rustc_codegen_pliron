@@ -1254,6 +1254,16 @@
 (rule -3 (lower (imul (ty_int_ref_16_to_64 ty) (i32_from_iconst x) y))
          (x64_imul_imm ty y x))
 
+;; PLIRON (`PLIRON_X64_IMULEA`, opt-in): `x·d` for `d ∈ {3,5,9}` lowers
+;; to one `lea (x, x·(d-1))` — 1c vs `imul`'s 3c. The `·2^k` factors
+;; are split off upstream by clifpeep into an `ishl` that folds into a
+;; consuming `iadd`'s amode (`base + idx<<k`), so a `x·(d·2^k)` here is
+;; just the odd factor — no `imul` at all on the `acc·10` digit chain.
+(decl pure pliron_mul_lea_d (u8) u64)
+(extern extractor pliron_mul_lea_d pliron_mul_lea_d)
+(rule 10 (lower (imul (ty_32_or_64 ty) x (u64_from_iconst (pliron_mul_lea_d sh))))
+      (x64_lea ty (amode_to_synthetic_amode (Amode.ImmRegRegShift 0 x x sh (mem_flags_trusted_data)))))
+
 ;; Special case widening multiplication from 8-to-16-bits with a single
 ;; instruction since the 8-bit-multiply places both the high and low halves in
 ;; the same register

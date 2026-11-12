@@ -548,6 +548,12 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         *ON
     }
 
+    /// pliron: `PLIRON_X64_IMULEA=1` `imul` → `lea` for odd small
+    /// multipliers — see `mul_lea_shift` below.
+    fn pliron_mul_lea_d(&mut self, c: u64) -> Option<u8> {
+        mul_lea_shift(c)
+    }
+
     #[inline]
     fn use_popcnt(&mut self) -> bool {
         self.backend.x64_flags.has_popcnt() && self.backend.x64_flags.has_sse42()
@@ -2416,3 +2422,26 @@ fn clean_upper32(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> 
         _ => false,
     }
 }
+
+/// PLIRON (`PLIRON_X64_IMULEA`): `x·d` for `d ∈ {3,5,9}` lowers to one
+/// `lea (x, x·(d-1))` — 1c vs `imul`'s 3c; LLVM's canonical
+/// small-multiply form. The `·2^k` tail of `d·2^k` multipliers is
+/// split off upstream (clifpeep `mulea_sweep`) into an `ishl` that
+/// folds into a consuming `iadd`'s amode. Returns `log2(d-1)` — the
+/// amode shift — when `c` is such a `d`. Opt-in: `PLIRON_X64_IMULEA=1`.
+pub(crate) fn imulea_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_X64_IMULEA").as_deref() == Ok("1"))
+}
+
+fn mul_lea_shift(c: u64) -> Option<u8> {
+    imulea_enabled()
+        .then(|| match c {
+            3 => Some(1u8),
+            5 => Some(2u8),
+            9 => Some(3u8),
+            _ => None,
+        })?
+}
+
+
