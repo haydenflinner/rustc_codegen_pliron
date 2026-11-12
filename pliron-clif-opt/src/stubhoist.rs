@@ -1,5 +1,5 @@
 //! Fold single-pred forwarding stubs into the predecessor edge
-//! (`PLIRON_STUBHOIST`). `b: <pure insts>; jump t(args)` with exactly
+//! `PLIRON_STUBHOIST` (default-on, `=0` off). `b: <pure insts>; jump t(args)` with exactly
 //! one incoming edge copies its pure body into the pred before the
 //! terminator and retargets the edge straight at `t`; the stub then
 //! has no preds and is swept. jumpthread's `bypass_forwarders` can

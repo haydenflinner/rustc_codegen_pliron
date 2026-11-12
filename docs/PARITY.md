@@ -368,7 +368,12 @@ in the scoreboard and in the linked history files.
   `PLIRON_LOOPFT=0` off) prefers a successor that can reach a
   back-edge latch on placement ties — reverse BFS from latch blocks
   in both `BCHAIN`'s chain pick and `PLACE`'s edge-weight key —
-  and fib now measures ~1.0x standalone (5.9 ms both). `tailrec`
+  and fib now measures ~1.0x standalone (5.9 ms both). `stubhoist`
+  (default-on, `PLIRON_STUBHOIST=0` off) then closed the residual
+  bench gap: single-pred stubs that compute their `jump` args in-block
+  (`uext n; jump ret(v)`) fold into the pred's edge, so fib's leaf
+  arm `jb`s straight into the shared return — fib(28) ~0.49 ms vs
+  LLVM ~0.55 ms. `tailrec`
   relaxed (e076991): the accumulate may now sit anywhere between
   the self-call and the return with only speculatable insts
   between, so `sum(n-1)+(n&7)` rotates — 50 M-deep recursion runs

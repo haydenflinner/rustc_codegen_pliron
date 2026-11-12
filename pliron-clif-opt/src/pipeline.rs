@@ -5171,7 +5171,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // fold into the pred edge (`uext n; jump ret` -> the fib leaf
         // arm points at the shared return, no out-of-line hop). Late:
         // the stubs only exist once edgesink/egraph2 finish merging.
-        step("stubhoist", "stubhoist", Gate::OptIn("PLIRON_STUBHOIST"), s_stubhoist)
+        step("stubhoist", "stubhoist", Gate::Env("PLIRON_STUBHOIST"), s_stubhoist)
             .needs(shape::BLOCKS2),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.

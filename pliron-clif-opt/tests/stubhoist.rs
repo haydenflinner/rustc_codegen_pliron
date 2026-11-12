@@ -1,4 +1,4 @@
-//! `PLIRON_STUBHOIST` (opt-in): a single-pred block of pure insts ending
+//! `PLIRON_STUBHOIST` (default-on): a single-pred block of pure insts ending
 //! `jump t(args)` folds into the pred's edge — the insts clone before the
 //! pred terminator and the edge retargets at `t`. fib's leaf stub
 //! (`uext n; jump ret(v)`) disappears, so the entry `brif` arm points
