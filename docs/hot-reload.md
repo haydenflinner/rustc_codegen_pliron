@@ -81,6 +81,11 @@ can pick up a partially written object otherwise. Files matching
 - `PLIRON_HOT_DIR=<dir>` — runtime: directory watched for `*.o` patches
   (plus `base.ref` fingerprints). Unset = hot reload off, thunks cost one
   indirect jump.
+- `PLIRON_HOT_LAYOUT=1` — compile time, for `base.ref` and every patch
+  (`hot-dev.sh` sets it): each object carries a table of the crate's
+  struct/enum/union layouts (`src/hot_layout.rs`). The loader compares a
+  patch's table with `base.ref`'s and refuses the patch, naming the
+  types, when one changed.
 - `PLIRON_HOT_DEBUG=1` — print per-phase timings during a patch apply.
 - `PLIRON_HOT_FREE=1` — `munmap` superseded patch mappings once every
   function they supplied has been repointed again, after a grace window
@@ -113,7 +118,12 @@ RSS. On an 8000-function leaf editing one function:
 - `main` itself is not patchable (the C entry point is excluded).
 - Patches that define or use thread-locals are rejected — restart.
 - Changing a struct/enum layout that live state depends on needs a
-  restart; new code sees old-layout values otherwise.
+  restart. With `PLIRON_HOT_LAYOUT=1` the loader detects it and leaves
+  the old code running (`[hot] ...: not applied: the layout of `State`
+  (8 -> 40 bytes ...) changed ...; restart`); without it new code sees
+  old-layout values. The check covers types defined in the patched
+  crate that take no type or const parameters, and treats a renamed
+  field as a change.
 - New dependencies of the patch that are not already in the process
   (new extern symbols) fail the apply with a "symbols not in the running
   binary" diagnostic.

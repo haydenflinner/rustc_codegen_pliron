@@ -377,6 +377,65 @@ fn fingerprints_of(t: &Parsed) -> Prints {
     out
 }
 
+/// Type layouts of one object: `path -> (size, align, hash)`, from the
+/// table the backend writes under `PLIRON_HOT_LAYOUT=1`
+/// (`src/hot_layout.rs`). `None` when the object carries no table.
+pub type Layouts = HashMap<String, (u64, u64, String)>;
+
+pub fn layout_table(f: &object::File) -> Option<Layouts> {
+    let sec = f
+        .sections()
+        .find(|s| matches!(s.name(), Ok("__hot_layout" | ".pliron_hot_layout")))?;
+    let data = sec.data().ok()?;
+    let mut out = Layouts::new();
+    for line in String::from_utf8_lossy(data).lines() {
+        let mut it = line.split('\t');
+        let (Some(name), Some(size), Some(align), Some(hash)) = (it.next(), it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        out.insert(name.to_string(), (size.parse().unwrap_or(0), align.parse().unwrap_or(0), hash.to_string()));
+    }
+    Some(out)
+}
+
+/// The types of `new` whose layout differs from the running process's
+/// (`base`): new code would read values the old code built at the wrong
+/// offsets. Types only one side defines are fine — nothing live has a new
+/// type's layout, and nothing new names a removed one.
+pub fn layout_changes(base: &Layouts, new: &Layouts) -> Vec<String> {
+    let mut v: Vec<String> = new
+        .iter()
+        .filter_map(|(name, n)| {
+            let b = base.get(name)?;
+            (b != n).then(|| {
+                if b.0 != n.0 || b.1 != n.1 {
+                    format!("`{name}` ({} -> {} bytes, align {} -> {})", b.0, n.0, b.1, n.1)
+                } else {
+                    format!("`{name}` (fields changed)")
+                }
+            })
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Refuse a patch object whose type layouts differ from `base`'s.
+pub fn check_layout(base: Option<&Layouts>, path: &Path) -> Result<(), String> {
+    let Some(base) = base else { return Ok(()) };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
+    let Some(new) = layout_table(&f) else { return Ok(()) };
+    let ch = layout_changes(base, &new);
+    if ch.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "not applied: the layout of {} changed, and values the running code built would be read at the wrong offsets; restart to pick up this edit",
+        ch.join(", ")
+    ))
+}
+
 /// A successfully applied patch: its fingerprints, the mapping it occupies
 /// (for `PLIRON_HOT_FREE` reclamation) and the slots it repointed.
 pub struct Applied {
@@ -1042,7 +1101,11 @@ pub fn start() {
     let Some(dir) = std::env::var_os("PLIRON_HOT_DIR") else { return };
     let dir = std::path::PathBuf::from(dir);
     std::thread::spawn(move || {
-        let mut prev = std::fs::read(dir.join("base.ref")).ok().and_then(|b| object::File::parse(&*b).ok().map(|f| fingerprints(&f)));
+        let base_ref = std::fs::read(dir.join("base.ref")).ok();
+        let base_obj = base_ref.as_deref().and_then(|b| object::File::parse(b).ok());
+        let mut prev = base_obj.as_ref().map(fingerprints);
+        // The live process's type layouts (`PLIRON_HOT_LAYOUT=1` builds).
+        let base_layout = base_obj.as_ref().and_then(layout_table);
         let base = match Base::load() {
             Ok(b) => b,
             Err(e) => return eprintln!("[hot] disabled: {e}"),
@@ -1072,7 +1135,7 @@ pub fn start() {
             new.sort();
             for p in new {
                 let t = std::time::Instant::now();
-                match apply(&base, &p, prev.as_ref()) {
+                match check_layout(base_layout.as_ref(), &p).and_then(|()| apply(&base, &p, prev.as_ref())) {
                     Ok(ap) => {
                         gnr += 1;
                         for name in &ap.fns {

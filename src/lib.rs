@@ -24,6 +24,7 @@ extern crate rustc_target;
 
 mod abi;
 mod asm;
+mod hot_layout;
 mod builder;
 mod cgupool;
 mod debuginfo;
@@ -1508,6 +1509,14 @@ fn module_codegen(
     cx.st.borrow_mut().deadfree = env_is("PLIRON_DEADFREE", "1");
     cx.st.borrow_mut().earlydead =
         pass_enabled("PLIRON_EARLYDEAD") && env_get("PLIRON_OPT_FNS").is_none();
+    // `PLIRON_HOT_LAYOUT=1`: the crate's type-layout table, for the
+    // hot-reload loader's patch check.
+    {
+        let t = hot_layout::asm(tcx);
+        if !t.is_empty() {
+            cx.st.borrow_mut().asm.push_str(&t);
+        }
+    }
     let mono_items = cgu.items_in_deterministic_order(tcx);
     let mut extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
