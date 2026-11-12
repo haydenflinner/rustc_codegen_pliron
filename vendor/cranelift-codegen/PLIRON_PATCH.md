@@ -1801,3 +1801,23 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      `pliron-clif-opt/tests/x64_argdirect.rs`; gate clean with
      `PLIRON_ARGDIRECT=1` (four pre-existing environmental failures:
      Windows fat-LTO, missing `nm`, catch_unwind/SEH, loop-align).
+
+128. Diamond-arm chain placement (`PLIRON_CHAINJOIN=1`, opt-in).
+     `BCHAIN`'s fallthrough pick scores each successor by rank, then
+     latch, then predecessor count — so a brif whose successors are
+     `arm` + `join` (the join's other predecessor being the arm) picks
+     the join: it has more preds, and inside a loop it dominates the
+     latch, earning the rank-2 spine bonus. The arm is then deferred
+     to the far end of the function and every trip through it pays
+     two taken branches (`jcc` out, `jmp` back) — `iter().filter`'s
+     keep-block cost a `ja`+`jmp` per kept element in `iterw`
+     (~1.40x vs LLVM). CHAINJOIN detects the diamond — a sibling
+     successor of `block` is also a predecessor of `succ`, and is a
+     viable chain target itself (non-cold, not a back edge, idom
+     dominated by `block`) — and caps the join's rank at 1 while
+     tie-breaking for non-joins, yielding `block, arm, join` with
+     both edges fallthrough. A cold-arm diamond keeps the join
+     preference. iterw's filter loop now matches LLVM's shape and
+     runtime (~1.0x). Read per function so tests can toggle within
+     one process. Regression:
+     `pliron-clif-opt/tests/x64_chainjoin.rs`.

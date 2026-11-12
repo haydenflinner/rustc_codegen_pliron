@@ -249,12 +249,25 @@ impl BlockLoweringOrder {
             let mut best_succ = SecondaryMap::with_default(
                 crate::packed_option::PackedOption::<Block>::default(),
             );
+            // PLIRON (`PLIRON_CHAINJOIN=1`, opt-in): when two of a
+            // brif's successors form a diamond — the join's other
+            // predecessor is the sibling arm — prefer the arm over the
+            // join despite its lower in-count. Emitting `block, arm,
+            // join` makes *both* edges fallthrough (the arm's closing
+            // jump included); emitting `block, join, ..., arm` forces
+            // two taken branches on every trip through the arm —
+            // `iter().filter`'s keep-block landed out-of-line, costing
+            // a `ja`+`jmp` per kept element in `iterw`.
+            // Read per function so tests can toggle it within one
+            // process.
+            let chainjoin = std::env::var("PLIRON_CHAINJOIN").as_deref() == Ok("1");
             for &block in &rpo {
                 let range = block_succ_range[block].clone();
                 let mut pick: Option<Block> = None;
                 let mut pick_in = 0;
                 let mut pick_rank = 0;
                 let mut pick_latch = false;
+                let mut pick_njoin = false;
                 for lb in &block_succs[range] {
                     let succ = lb.orig_block().unwrap();
                     if f.is_effectively_cold(succ) || domtree.block_dominates(succ, block) {
@@ -278,7 +291,46 @@ impl BlockLoweringOrder {
                     //   pulling it in scatters the region.
                     // In-count breaks ties within a class, and a latch
                     // beats a non-latch of the same count.
-                    let rank = if block_preds[block]
+                    // PLIRON_CHAINJOIN: `succ` is a diamond join when a
+                    // sibling successor `p` of `block` also jumps to it
+                    // — but only when that sibling is itself a viable
+                    // chain target (non-cold, not a back edge, idom
+                    // reachable); with a cold arm the join is the real
+                    // continuation and stays preferred.
+                    let djoin = chainjoin
+                        && block_preds[succ].iter().any(|&p| {
+                            p != block
+                                && block_succs[block_succ_range[block].clone()]
+                                    .iter()
+                                    .any(|lb| lb.orig_block() == Some(p))
+                                && !f.is_effectively_cold(p)
+                                && !domtree.block_dominates(p, block)
+                                && domtree
+                                    .idom(p)
+                                    .is_some_and(|d| domtree.block_dominates(d, block))
+                        });
+                    // The rank-2 loop-spine bonus ("dominates a
+                    // predecessor of `block`") applies to a diamond join
+                    // too — every trip around the loop flows through
+                    // it — but placing the arm between `block` and the
+                    // join keeps the spine contiguous anyway, so the
+                    // join must not outrank the arm on it.
+                    let rank = if djoin {
+                        // Cap, don't promote: an outside-region merge
+                        // stays rank 0.
+                        1.min(
+                            if block_preds[block]
+                                .iter()
+                                .any(|&p| domtree.block_dominates(succ, p))
+                            {
+                                2
+                            } else if idom == block {
+                                1
+                            } else {
+                                0
+                            },
+                        )
+                    } else if block_preds[block]
                         .iter()
                         .any(|&p| domtree.block_dominates(succ, p))
                     {
@@ -289,17 +341,21 @@ impl BlockLoweringOrder {
                         0
                     };
                     let latch = is_latch[succ];
+                    let njoin = !djoin;
                     if pick.is_none()
                         || rank > pick_rank
                         || (rank == pick_rank
                             && ((latch && !pick_latch)
                                 || (latch == pick_latch
-                                    && block_in_count[succ] >= pick_in)))
+                                    && ((njoin && !pick_njoin)
+                                        || (njoin == pick_njoin
+                                            && block_in_count[succ] >= pick_in)))))
                     {
                         pick = Some(succ);
                         pick_in = block_in_count[succ];
                         pick_rank = rank;
                         pick_latch = latch;
+                        pick_njoin = njoin;
                     }
                 }
                 if let Some(s) = pick {
