@@ -355,7 +355,16 @@ in the scoreboard and in the linked history files.
   only folds `iadd x,K` into the displacement when the sum has ≤1
   direct use, so `digit = char-0x30` materializes once for its
   range-check + accumulator uses and `char`'s live range dies —
-  LLVM's exact digit-loop shape; still opt-in pending corpus sweep).
+  LLVM's exact digit-loop shape; now default-on). Later re-survey
+  on the same box (standalone min-of-N mains): `strwork` ~1.04,
+  `chars_mixed` ~1.05, `hashmap` ~1.05–1.1, `hmget` ~1.09,
+  `nbody` ~1.0, `sieve` ~1.03, `matmul` ~0.97, `sortw` ~0.87,
+  `chars_ascii` ~0.66 — all at parity or faster. The one outlier:
+  recursive `fib` measures ~1.3–1.5x under a tight standalone
+  harness (criterion measured 0.97) even though the emitted loop is
+  instruction-identical to LLVM's (6 insns/iter, same alignment) —
+  residual is µarch-level (frame layout / call-return behavior),
+  not instruction selection; deferred.
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).
