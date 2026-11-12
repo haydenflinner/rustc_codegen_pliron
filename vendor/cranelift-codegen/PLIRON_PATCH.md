@@ -1628,3 +1628,18 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     xmm6/7 stay volatile (Tail float args/rets use xmm0-7), so the floor
     is 32 B. regex-syntax STK ratio 1.556 -> 1.269. Test:
     `pliron-clif-opt/tests/x64_tail_winxmm.rs`.
+
+120. x64 Windows `CallConv::Tail` fastcall-lane args (`PLIRON_X64_TAILARGS=0`
+    disables; same file, `tail_winargs` — requires `tail_winxmm` so the
+    callee-save filter and call-site clobber set can't disagree):
+    `get_intreg_for_arg`/`get_fltreg_for_arg` map Tail args by absolute
+    position to the fastcall lanes (rcx,rdx,r8,r9 then rsi,rdi;
+    xmm0-3 then xmm4/5) instead of the SysV order — a WindowsFastcall
+    caller passes its first four args straight through with no shuffles.
+    Float args/rets then never touch xmm6/7 (`get_fltreg_for_retval`
+    caps at xmm5), so `is_tail_windows_xmm_save` adds them to the
+    preserved set and `TAIL_WINDOWS_ARGS_CLOBBERS` (SysV minus xmm6-15)
+    reports them unclobbered at Tail call sites. i128 halves still take
+    consecutive absolute positions; args past index 5 spill to the
+    stack as before. `translate` frame 2024 -> 1992 B; STK 1.269 ->
+    1.218. Same test file.

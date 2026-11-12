@@ -971,7 +971,9 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     ) -> PRegSet {
         match (call_conv_of_callee, is_exception) {
             (isa::CallConv::Tail, true) => ALL_CLOBBERS,
-            // PLIRON: on Windows, Tail callees preserve xmm8-15.
+            // PLIRON: on Windows, Tail callees preserve xmm8-15 (or xmm6-15
+            // when `tail_winargs` frees xmm6/7 from the arg set).
+            (isa::CallConv::Tail, false) if tail_winargs() => TAIL_WINDOWS_ARGS_CLOBBERS,
             (isa::CallConv::Tail, false) if tail_winxmm() => TAIL_WINDOWS_CLOBBERS,
             // Note that "PreserveAll" actually preserves nothing at
             // the callsite if used for a `try_call`, because the
@@ -1140,6 +1142,22 @@ impl From<StackAMode> for SyntheticAmode {
 }
 
 fn get_intreg_for_arg(call_conv: CallConv, idx: usize, arg_idx: usize) -> Option<Reg> {
+    // PLIRON: on Windows, `Tail` int args use the fastcall lanes by
+    // absolute position, then rsi/rdi — a WindowsFastcall caller already
+    // has the first four args in place. `arg_idx` keeps the mapping
+    // injective when a lane holds a float arg instead.
+    if call_conv == CallConv::Tail && tail_winargs() {
+        return match arg_idx {
+            0 => Some(regs::rcx()),
+            1 => Some(regs::rdx()),
+            2 => Some(regs::r8()),
+            3 => Some(regs::r9()),
+            4 => Some(regs::rsi()),
+            5 => Some(regs::rdi()),
+            _ => None,
+        };
+    }
+
     let is_fastcall = call_conv == CallConv::WindowsFastcall;
 
     // Fastcall counts by absolute argument number; SysV counts by argument of
@@ -1161,6 +1179,21 @@ fn get_intreg_for_arg(call_conv: CallConv, idx: usize, arg_idx: usize) -> Option
 }
 
 fn get_fltreg_for_arg(call_conv: CallConv, idx: usize, arg_idx: usize) -> Option<Reg> {
+    // PLIRON: `Tail` float args mirror the int lanes on Windows — xmm0-3
+    // by absolute position, then xmm4/5 — freeing xmm6/7 for the
+    // callee-save set.
+    if call_conv == CallConv::Tail && tail_winargs() {
+        return match arg_idx {
+            0 => Some(regs::xmm0()),
+            1 => Some(regs::xmm1()),
+            2 => Some(regs::xmm2()),
+            3 => Some(regs::xmm3()),
+            4 => Some(regs::xmm4()),
+            5 => Some(regs::xmm5()),
+            _ => None,
+        };
+    }
+
     let is_fastcall = call_conv == CallConv::WindowsFastcall;
 
     // Fastcall counts by absolute argument number; SysV counts by argument of
@@ -1225,14 +1258,16 @@ fn get_intreg_for_retval(
 fn get_fltreg_for_retval(call_conv: CallConv, fltreg_idx: usize, is_last: bool) -> Option<Reg> {
     match call_conv {
         CallConv::Tail => match fltreg_idx {
+            // PLIRON: on Windows xmm6/7 are callee-saved under
+            // `tail_winargs`, so they cannot return values either.
             0 => Some(regs::xmm0()),
             1 => Some(regs::xmm1()),
             2 => Some(regs::xmm2()),
             3 => Some(regs::xmm3()),
             4 => Some(regs::xmm4()),
             5 => Some(regs::xmm5()),
-            6 => Some(regs::xmm6()),
-            7 => Some(regs::xmm7()),
+            6 if !tail_winargs() => Some(regs::xmm6()),
+            7 if !tail_winargs() => Some(regs::xmm7()),
             _ => None,
         },
         CallConv::Fast | CallConv::SystemV | CallConv::PreserveAll => match fltreg_idx {
@@ -1274,15 +1309,35 @@ fn tail_winxmm() -> bool {
     *ON && PLIRON_X64_WINDOWS.with(|c| c.get())
 }
 
-/// PLIRON: xmm8-15 are callee-saved under `CallConv::Tail` on Windows
-/// (xmm6/7 stay volatile: Tail passes and returns floats in xmm0-7).
+// PLIRON: `PLIRON_X64_TAILARGS=0` disables the fastcall-lane argument
+// registers for `CallConv::Tail` on Windows (rcx,rdx,r8,r9 + xmm0-3 by
+// absolute position, then rsi,rdi + xmm4,5). Args then arrive in the
+// same registers a WindowsFastcall caller placed them — no shuffle.
+// Only with this do xmm6/7 stop being Tail arg/retval regs, so they may
+// join the callee-save set too.
+fn tail_winargs() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PLIRON_X64_TAILARGS").map_or(true, |v| v != "0")
+    });
+    // Requires `tail_winxmm`: the callee-save filter and the call-site
+    // clobber set must agree on xmm6-15.
+    *ON && tail_winxmm()
+}
+
+/// PLIRON: xmm8-15 are callee-saved under `CallConv::Tail` on Windows;
+/// xmm6/7 join them when `tail_winargs` removes them from the arg set
+/// (stock Tail passes and returns floats in xmm0-7).
 fn is_tail_windows_xmm_save(r: RealReg) -> bool {
     use asm::xmm::enc::*;
 
     r.class() == RegClass::Float
+        && match r.hw_enc() {
+            XMM6 | XMM7 => tail_winargs(),
+            _ => true,
+        }
         && matches!(
             r.hw_enc(),
-            XMM8 | XMM9 | XMM10 | XMM11 | XMM12 | XMM13 | XMM14 | XMM15
+            XMM6 | XMM7 | XMM8 | XMM9 | XMM10 | XMM11 | XMM12 | XMM13 | XMM14 | XMM15
         )
 }
 
@@ -1343,8 +1398,10 @@ const WINDOWS_CLOBBERS: PRegSet = windows_clobbers();
 const SYSV_CLOBBERS: PRegSet = sysv_clobbers();
 // PLIRON: `CallConv::Tail` call-site clobbers on Windows: the SysV set
 // minus xmm8-15, which Tail callees preserve there (see `tail_winxmm`).
-// xmm6/7 stay clobbered -- they are Tail float arg/retval regs.
+// xmm6/7 stay clobbered -- they are Tail float arg/retval regs under the
+// stock arg order; `tail_winargs` removes them too.
 const TAIL_WINDOWS_CLOBBERS: PRegSet = tail_windows_clobbers();
+const TAIL_WINDOWS_ARGS_CLOBBERS: PRegSet = tail_windows_args_clobbers();
 pub(crate) const ALL_CLOBBERS: PRegSet = all_clobbers();
 const NO_CLOBBERS: PRegSet = PRegSet::empty();
 
@@ -1435,6 +1492,30 @@ const fn tail_windows_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM5))
         .with(regs::fpr_preg(XMM6))
         .with(regs::fpr_preg(XMM7));
+    with_high_xmm(set)
+}
+
+// PLIRON: `sysv_clobbers` minus xmm6-15 (all Windows callee-saved xmm).
+const fn tail_windows_args_clobbers() -> PRegSet {
+    use asm::gpr::enc::*;
+    use asm::xmm::enc::*;
+
+    let set = PRegSet::empty()
+        .with(regs::gpr_preg(RAX))
+        .with(regs::gpr_preg(RCX))
+        .with(regs::gpr_preg(RDX))
+        .with(regs::gpr_preg(RSI))
+        .with(regs::gpr_preg(RDI))
+        .with(regs::gpr_preg(R8))
+        .with(regs::gpr_preg(R9))
+        .with(regs::gpr_preg(R10))
+        .with(regs::gpr_preg(R11))
+        .with(regs::fpr_preg(XMM0))
+        .with(regs::fpr_preg(XMM1))
+        .with(regs::fpr_preg(XMM2))
+        .with(regs::fpr_preg(XMM3))
+        .with(regs::fpr_preg(XMM4))
+        .with(regs::fpr_preg(XMM5));
     with_high_xmm(set)
 }
 
