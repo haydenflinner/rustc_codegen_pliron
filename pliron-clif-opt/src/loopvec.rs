@@ -2482,7 +2482,7 @@ fn plan(
         rev_imm,
         iv_stream,
         exit_bare,
-        vrange: pliron_cfg::env_is("PLIRON_VRANGE", "1"),
+        vrange: pliron_cfg::pass_enabled("PLIRON_VRANGE"),
     })
 }
 

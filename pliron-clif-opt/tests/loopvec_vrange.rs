@@ -3,8 +3,8 @@
 //! strict-out-of-range form `~((x < lo) | (x > hi))` — one shared sign
 //! flip of the data, invariant bound flips that hoist, one complement
 //! total — instead of two self-contained `ule`/`uge` lowers (~12 vs ~6
-//! insts per lane group on SSE2). Opt-in; `PLIRON_VRANGE=0` keeps the
-//! pairwise-`band` emission.
+//! insts per lane group on SSE2). Default on; `PLIRON_VRANGE=0` keeps
+//! the pairwise-`band` emission.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{Function, InstructionData, Opcode};
