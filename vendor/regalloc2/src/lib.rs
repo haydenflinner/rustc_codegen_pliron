@@ -97,6 +97,34 @@ pub(crate) fn nopinmerge_on() -> bool {
     true
 }
 
+/// PLIRON (`PLIRON_RA2_POSTOPT=<bits>`, default 0): post-allocation
+/// spill-traffic cleanup, see `ion/postopt.rs`. 1 = redundant reloads,
+/// 2 = reloads served from another register, 4 = redundant spill stores,
+/// 8 = dead spill stores.
+pub(crate) fn postopt_bits() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *BITS.get_or_init(|| {
+            std::env::var("PLIRON_RA2_POSTOPT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
+/// PLIRON (`PLIRON_RA2_POSTOPT_STATS=1`): one `ra2post:` line on stderr
+/// per function the post-pass changed.
+pub(crate) fn postopt_stats() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_POSTOPT_STATS").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON (`PLIRON_RA2_SLOTPAIR`, default on, `=0` off): repack
 /// spill-slot word indices so same-direction spill/reload edits
 /// emitted consecutively land on adjacent slots, letting ISA pair
