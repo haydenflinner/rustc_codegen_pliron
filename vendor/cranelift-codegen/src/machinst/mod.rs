@@ -291,6 +291,28 @@ pub trait MachInst: Clone + Debug {
         FlagKind::Other
     }
 
+    /// PLIRON EDGEHOIST: the `(taken, not_taken)` labels of a
+    /// two-target conditional branch, if this is one. Both edges carry
+    /// their successor's blockparams; the emitter may hoist a pure
+    /// edit block off the taken edge and retarget it.
+    fn cond_br_targets(&self) -> Option<(MachLabel, MachLabel)> {
+        None
+    }
+
+    /// PLIRON EDGEHOIST: retarget the taken label of a two-target
+    /// conditional branch. Only called when `cond_br_targets` matched.
+    fn set_cond_br_taken(&mut self, _taken: MachLabel) {}
+
+    /// PLIRON EDGEHOIST: invert a conditional branch's sense and swap
+    /// its targets (`b.cc T, F` becomes `b.!cc F, T`).
+    fn invert_cond_br(&mut self) {}
+
+    /// PLIRON EDGEHOIST: the target of an unconditional direct branch,
+    /// if this is one.
+    fn uncond_br_target(&self) -> Option<MachLabel> {
+        None
+    }
+
     /// Is this a terminator (branch or ret)? If so, return its type
     /// (ret/uncond/cond) and target if applicable.
     fn is_term(&self) -> MachTerminator;

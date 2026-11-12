@@ -1696,3 +1696,31 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     shape is regalloc-dependent, not CLIF-controllable);
     `pliron-clif-opt/tests/x64_flagdup.rs` covers same-block reuse,
     operand rewrite, and intervening flag writers.
+
+123. Edge-move hoisting at conditional-branch tails (`machinst/vcode.rs`
+    emit loop; opt-in `PLIRON_EDGEHOIST=1`). A `b.cc T, F` whose edge E
+    is a pure move+jump block (a split critical edge, typically a loop
+    back-edge) pays an unconditional `b H` per trip on top of the
+    conditional. Hoist E's regalloc edits ahead of the branch, retarget
+    it at E's destination H, and let the exit block fall through —
+    `moves; b.cc H`, one taken branch, the shape LLVM's
+    MachineBlockPlacement picks. Both orientations are tried
+    (`taken=E` directly, `not_taken=E` after `invert_cond_br`), via new
+    `MachInst` hooks `cond_br_targets` / `set_cond_br_taken` /
+    `invert_cond_br` / `uncond_br_target` (`machinst/mod.rs`, x64 and
+    aarch64 impls). Safety: E must be a single `jmp` with no params and
+    no non-edit items, not an indirect-branch target, not already
+    merged; `edgehoist_demanded` walks the other successor and its
+    successors (bounded, 8 blocks, per-block use-before-def) collecting
+    every location read at entry — a hoisted `to` colliding, or a
+    live-in value bound to a successor param that can't be named
+    locally, rejects the candidate; a `to` colliding with a preg the
+    branch itself reads (aarch64 cbz/tbz) also rejects. E merges away
+    only when physically adjacent AND single-CFG-pred AND free of
+    EDGEMERGE/BJALIAS duplicates (`canon_dups`) — a dedup'd edge block
+    shares E's label, so merging E would route the dup's preds to H
+    skipping the shared moves (the selmul `Option::fmt` miscompile).
+    Bisect aids: `PLIRON_EH_TRACE`, `PLIRON_EH_FN=<substr>`/`!<substr>`,
+    `PLIRON_EH_LOCAL=N` (function-local budget), `PLIRON_EH_BISECT=N`
+    (global, nondeterministic across parallel lowers). Regressions:
+    `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.

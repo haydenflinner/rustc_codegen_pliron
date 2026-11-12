@@ -1109,6 +1109,40 @@ impl MachInst for Inst {
         }
     }
 
+    fn cond_br_targets(&self) -> Option<(MachLabel, MachLabel)> {
+        match self {
+            Inst::CondBr {
+                taken, not_taken, ..
+            } => Some((taken.as_label()?, not_taken.as_label()?)),
+            _ => None,
+        }
+    }
+
+    fn set_cond_br_taken(&mut self, l: MachLabel) {
+        if let Inst::CondBr { taken, .. } = self {
+            *taken = BranchTarget::Label(l);
+        }
+    }
+
+    fn invert_cond_br(&mut self) {
+        if let Inst::CondBr {
+            taken,
+            not_taken,
+            kind,
+        } = self
+        {
+            *kind = kind.invert();
+            core::mem::swap(taken, not_taken);
+        }
+    }
+
+    fn uncond_br_target(&self) -> Option<MachLabel> {
+        match self {
+            Inst::Jump { dest } => dest.as_label(),
+            _ => None,
+        }
+    }
+
     fn is_term(&self) -> MachTerminator {
         match self {
             &Inst::Rets { .. } => MachTerminator::Ret,

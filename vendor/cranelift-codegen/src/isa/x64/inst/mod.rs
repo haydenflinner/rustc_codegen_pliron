@@ -1638,6 +1638,40 @@ impl MachInst for Inst {
         }
     }
 
+    fn cond_br_targets(&self) -> Option<(MachLabel, MachLabel)> {
+        match self {
+            Inst::JmpCond {
+                taken, not_taken, ..
+            } => Some((*taken, *not_taken)),
+            _ => None,
+        }
+    }
+
+    fn set_cond_br_taken(&mut self, l: MachLabel) {
+        if let Inst::JmpCond { taken, .. } = self {
+            *taken = l;
+        }
+    }
+
+    fn invert_cond_br(&mut self) {
+        if let Inst::JmpCond {
+            cc,
+            taken,
+            not_taken,
+        } = self
+        {
+            *cc = cc.invert();
+            core::mem::swap(taken, not_taken);
+        }
+    }
+
+    fn uncond_br_target(&self) -> Option<MachLabel> {
+        match self {
+            Inst::JmpKnown { dst } => Some(*dst),
+            _ => None,
+        }
+    }
+
     fn is_term(&self) -> MachTerminator {
         match self {
             // Interesting cases.

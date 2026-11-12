@@ -36,7 +36,7 @@ use core::cmp::Ordering;
 use core::fmt::{self, Write};
 use core::mem::take;
 use core::ops::Range;
-use cranelift_entity::{Keys, entity_impl};
+use cranelift_entity::{EntityRef, Keys, entity_impl};
 
 /// PLIRON: `PLIRON_EDGEMERGE` key (see `VCode::edge_merge_key`).
 type EdgeKey = (SmallVec<[(Allocation, Allocation); 4]>, BlockIndex, bool);
@@ -2297,6 +2297,17 @@ impl<I: VCodeInst> VCode<I> {
         let mut epi_label: Option<MachLabel> = None;
         let shrink = self.pliron_shrink_wrap(regalloc, &final_order);
 
+        // PLIRON: `PLIRON_EH_LOCAL=N` bounds applied edgehoists within
+        // this function (deterministic bisect); `PLIRON_EH_FN=<substr>`
+        // (`!` inverts) gates them by mangled name.
+        static EH_LOCAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let eh_local_lim = *EH_LOCAL.get_or_init(|| {
+            std::env::var("PLIRON_EH_LOCAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX)
+        });
+        let mut eh_local = 0u64;
         let t_loop0 = std::time::Instant::now();
         for (oi, &block) in final_order.iter().enumerate() {
             if merged[block.index()] {
@@ -2461,6 +2472,15 @@ impl<I: VCodeInst> VCode<I> {
             // block boundary — another pred may enter without having
             // emitted the tracked compare.
             flag_state.set(None);
+            if std::env::var_os("PLIRON_EH_TRACE").is_some() {
+                eprintln!(
+                    "EHM oi={} b{} @off={:#x} [{}]",
+                    oi,
+                    block.index(),
+                    buffer.cur_offset(),
+                    crate::PLIRON_FN_NAME.with(|s| s.borrow().clone())
+                );
+            }
 
             if want_disasm {
                 // PLIRON: name the CLIF block (or edge) this lowers, so
@@ -2547,9 +2567,247 @@ impl<I: VCodeInst> VCode<I> {
             };
 
             let ti = std::time::Instant::now();
-            let items: SmallVec<[InstOrEdit; 64]> =
+            let mut items: SmallVec<[InstOrEdit; 64]> =
                 regalloc.block_insts_and_edits(&self, block).collect();
             t_items += ti.elapsed();
+
+            // PLIRON EDGEHOIST (`PLIRON_EDGEHOIST=1`): this block ends
+            // `b.cc T, F` where one edge E is a pure move+jump edge
+            // block (a split critical edge, typically a loop
+            // back-edge). The loop path then pays an unconditional
+            // `b H` per trip on top of the conditional. Hoist E's
+            // moves ahead of the conditional, retarget it at E's
+            // destination H, and let the exit block fall through —
+            // `moves; b.cc H`, one taken branch, the shape LLVM's
+            // MachineBlockPlacement picks. Two orientations:
+            //
+            //   taken=E:  `b.cc E, F` → `moves; b.cc H` + fallthrough F
+            //   taken=F:  `b.cc F, E` → `moves; b.!cc H` + fallthrough
+            //             through the now-empty E
+            //
+            // Only when no hoisted move destination is a location the
+            // other block needs at its entry (`edgehoist_demanded`),
+            // and — for the inverted form — E must be mergeable away
+            // (single pred) since the exit path falls through its slot.
+            static EDGEHOIST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static EH_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static EH_FN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            let eh_trace = *EH_TRACE
+                .get_or_init(|| std::env::var("PLIRON_EH_TRACE").is_ok());
+            if *EDGEHOIST
+                .get_or_init(|| std::env::var("PLIRON_EDGEHOIST").as_deref() == Ok("1"))
+                && EH_FN
+                    .get_or_init(|| std::env::var("PLIRON_EH_FN").ok())
+                    .as_deref()
+                    .map(|pat| {
+                        let cur = crate::PLIRON_FN_NAME.with(|s| s.borrow().clone());
+                        match pat.strip_prefix('!') {
+                            Some(neg) => !cur.contains(neg),
+                            None => cur.contains(pat),
+                        }
+                    })
+                    .unwrap_or(true)
+            {
+                'eh: {
+                    let Some(&InstOrEdit::Inst(tix)) = items.last() else {
+                        break 'eh;
+                    };
+                    let Some((taken, not_taken)) =
+                        self.insts[tix.index()].cond_br_targets()
+                    else {
+                        break 'eh;
+                    };
+                    // (edge label, exit label, invert?)
+                    let mut cand = None;
+                    for &(el, xl, inv) in
+                        &[(taken, not_taken, false), (not_taken, taken, true)]
+                    {
+                        let (ei, xi) = (el.index(), xl.index());
+                        if ei >= self.num_blocks() || xi >= self.num_blocks() || ei == xi
+                        {
+                            continue;
+                        }
+                        // Already merged (EDGEMERGE dup or BJALIAS): its
+                        // label has an alias already.
+                        if merged[ei] || noret_dead.as_ref().is_some_and(|d| d[ei]) {
+                            if eh_trace {
+                                eprintln!("EH b{} e=b{}: merged/dead", block.index(), ei);
+                            }
+                            continue;
+                        }
+                        let (e, x) = (BlockIndex::new(ei), BlockIndex::new(xi));
+                        let er = self.block_ranges.get(ei);
+                        if er.len() != 1 || !self.block_params(e).is_empty() {
+                            if eh_trace {
+                                eprintln!(
+                                    "EH b{} e=b{}: len {} params {}",
+                                    block.index(),
+                                    ei,
+                                    er.len(),
+                                    self.block_params(e).len()
+                                );
+                            }
+                            continue;
+                        }
+                        let Some(hl) = self.insts[er.start].uncond_br_target()
+                        else {
+                            if eh_trace {
+                                eprintln!("EH b{} e=b{}: not jmp", block.index(), ei);
+                            }
+                            continue;
+                        };
+                        if hl.index() == ei
+                            || self.block_order.is_indirect_branch_target(e)
+                        {
+                            continue;
+                        }
+                        let es = self.block_succs(e);
+                        if es.len() != 1 || hl.index() != es[0].index() {
+                            if eh_trace {
+                                eprintln!("EH b{} e=b{}: succs", block.index(), ei);
+                            }
+                            continue;
+                        }
+                        let t_items: SmallVec<[InstOrEdit; 8]> =
+                            regalloc.block_insts_and_edits(&self, e).collect();
+                        let Some((&InstOrEdit::Inst(jix), edits)) = t_items.split_last()
+                        else {
+                            continue;
+                        };
+                        if jix.index() != er.start
+                            || !edits
+                                .iter()
+                                .all(|it| matches!(it, InstOrEdit::Edit(_)))
+                        {
+                            if eh_trace {
+                                eprintln!("EH b{} e=b{}: impure", block.index(), ei);
+                            }
+                            continue;
+                        }
+                        let Some(demand) = self.edgehoist_demanded(regalloc, x)
+                        else {
+                            if eh_trace {
+                                eprintln!("EH b{} e=b{} x=b{}: demand", block.index(), ei, xi);
+                            }
+                            continue;
+                        };
+                        // The hoisted moves run before B's terminator:
+                        // none may write a location the branch itself
+                        // reads (aarch64 cbz/tbz test a register; x64
+                        // JmpCond reads only flags, so this is a no-op
+                        // there).
+                        let mut br_uses: SmallVec<[Allocation; 4]> =
+                            SmallVec::new();
+                        for (op, a) in self
+                            .inst_operands(tix)
+                            .iter()
+                            .zip(regalloc.inst_allocs(tix).iter())
+                        {
+                            if op.kind() == OperandKind::Use {
+                                br_uses.push(*a);
+                            }
+                        }
+                        if edits.iter().any(|it| {
+                            let InstOrEdit::Edit(Edit::Move { from, to }) = it else {
+                                return true;
+                            };
+                            *from != *to
+                                && (demand.contains(to) || br_uses.contains(to))
+                        }) {
+                            if eh_trace {
+                                eprintln!(
+                                    "EH b{} e=b{} x=b{}: clobber {:?}",
+                                    block.index(),
+                                    ei,
+                                    xi,
+                                    demand
+                                );
+                            }
+                            continue;
+                        }
+                        cand = Some((e, el, hl, inv, edits.len()));
+                        break;
+                    }
+                    let Some((e, el, hl, inv, nedits)) = cand else {
+                        break 'eh;
+                    };
+                    // If E physically follows this block it sits in the
+                    // fallthrough slot: it must merge away (any stale
+                    // code there would run on the exit edge), which is
+                    // only possible when nobody else can reach its
+                    // label: a single CFG pred and no EDGEMERGE/BJALIAS
+                    // duplicates — those blocks' preds resolve through
+                    // E's label and would skip the shared moves
+                    // entirely (`canon_dups`, the selmul Option::fmt
+                    // miscompile).
+                    let adjacent = final_order.get(oi + 1) == Some(&e);
+                    let mergeable = self.block_preds(e).len() == 1
+                        && canon_dups[e.index()].is_empty();
+                    if adjacent && !mergeable {
+                        if eh_trace {
+                            eprintln!("EH b{} e={:?}: multipred/dup adj", block.index(), e);
+                        }
+                        break 'eh;
+                    }
+                    if eh_trace {
+                        let mut pst = state.clone();
+                        let edits_dbg: Vec<String> = regalloc
+                            .block_insts_and_edits(&self, e)
+                            .filter_map(|it| match it {
+                                InstOrEdit::Edit(Edit::Move { from, to }) => {
+                                    Some(format!("{:?}->{:?}", from, to))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        eprintln!(
+                            "EH b{} e={:?} h={:?} inv={} n={} local={} :: {} | {:?} [{}]",
+                            block.index(),
+                            e,
+                            hl,
+                            inv,
+                            nedits,
+                            eh_local,
+                            self.insts[tix.index()].pretty_print_inst(&mut pst),
+                            edits_dbg,
+                            crate::PLIRON_FN_NAME.with(|s| s.borrow().clone()),
+                        );
+                    }
+                    // PLIRON_EH_BISECT=N: allow only the first N
+                    // hoists (debug aid; unstable across compiles —
+                    // prefer EH_FN+EH_LOCAL).
+                    static EH_BISECT: std::sync::OnceLock<u64> =
+                        std::sync::OnceLock::new();
+                    let eh_lim = *EH_BISECT.get_or_init(|| {
+                        std::env::var("PLIRON_EH_BISECT")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(u64::MAX)
+                    });
+                    static EH_N: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if EH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= eh_lim
+                        || eh_local >= eh_local_lim
+                    {
+                        break 'eh;
+                    }
+                    eh_local += 1;
+                    if inv {
+                        self.insts[tix.index()].invert_cond_br();
+                    }
+                    self.insts[tix.index()].set_cond_br_taken(hl);
+                    let at = items.len() - 1;
+                    let t_items: SmallVec<[InstOrEdit; 8]> =
+                        regalloc.block_insts_and_edits(&self, e).collect();
+                    for (i, it) in t_items.iter().take(nedits).enumerate() {
+                        items.insert(at + i, it.clone());
+                    }
+                    if adjacent && mergeable {
+                        merged[e.index()] = true;
+                        buffer.alias_label(el, hl);
+                    }
+                }
+            }
             if mcp && mcpbb {
                 if let Some(pb) = prev_block.replace(block) {
                     out_class[pb.index()] = Some(std::mem::take(&mut vclass));
@@ -3687,6 +3945,94 @@ impl<I: VCodeInst> VCode<I> {
             return None;
         }
         Some((moves, succs[0], self.block_order.is_indirect_branch_target(block)))
+    }
+
+    /// PLIRON EDGEHOIST: locations (pregs or stack slots) that must
+    /// hold particular values at `b`'s entry — the set a hoisted
+    /// edge-block move may not clobber. Walks `b` and its successors
+    /// (bounded): every vreg used before its in-block def reads the
+    /// location it was in at `b`'s entry, and every edit reads its
+    /// source location, so all of those are demanded. A live-in
+    /// vreg bound to a successor's param cannot have its entry
+    /// location named without whole-function liveness, so the
+    /// analysis bails (`None`) — the caller then keeps the edge
+    /// block.
+    fn edgehoist_demanded(
+        &self,
+        regalloc: &regalloc2::Output,
+        b: BlockIndex,
+    ) -> Option<crate::FxHashSet<Allocation>> {
+        let mut demand = crate::FxHashSet::default();
+        let mut work: SmallVec<[BlockIndex; 8]> = smallvec![b];
+        let mut seen = crate::FxHashSet::default();
+        static EHD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ehd = *EHD.get_or_init(|| std::env::var("PLIRON_EH_TRACE").is_ok());
+        while let Some(x) = work.pop() {
+            if !seen.insert(x) || seen.len() > 8 {
+                return None;
+            }
+            let xr = self.block_ranges.get(x.index());
+            if xr.len() == 0 {
+                return None;
+            }
+            // `defined` is deliberately per-block: a vreg defined on a
+            // parallel path does not mask a live-in use on this one.
+            let mut defined: crate::FxHashSet<VReg> = crate::FxHashSet::default();
+            for it in regalloc.block_insts_and_edits(self, x) {
+                match it {
+                    InstOrEdit::Edit(Edit::Move { from, .. }) => {
+                        // Any edit in the walk reads a location whose
+                        // content at `b`'s entry must be preserved
+                        // (conservatively includes edits serving
+                        // values defined inside `b`).
+                        demand.insert(*from);
+                    }
+                    InstOrEdit::Inst(iix) => {
+                        // Uses first, then defs: a use of a vreg with no
+                        // earlier in-block def reads an entry location.
+                        // Block params are live-in vregs, so they are
+                        // covered by the same rule.
+                        for (op, a) in self
+                            .inst_operands(iix)
+                            .iter()
+                            .zip(regalloc.inst_allocs(iix).iter())
+                        {
+                            if op.kind() == OperandKind::Use && !defined.contains(&op.vreg()) {
+                                demand.insert(*a);
+                            }
+                        }
+                        for op in self.inst_operands(iix) {
+                            if op.kind() == OperandKind::Def {
+                                defined.insert(op.vreg());
+                            }
+                        }
+                    }
+                }
+            }
+            // Out-edges: an arg bound to a successor's param that isn't
+            // defined inside this block could be a value live into `b`
+            // carried in-place — its entry location can't be named
+            // locally, so bail. Every successor is walked (bounded by
+            // `seen`) since a value live through `b` may be demanded
+            // anywhere downstream without an edit marking it.
+            let term = InsnIndex::new(xr.end - 1);
+            for (k, s) in self.block_succs(x).iter().enumerate() {
+                let si = s.index();
+                if si >= self.num_blocks() {
+                    continue;
+                }
+                for v in self.branch_blockparams(x, term, k) {
+                    if !defined.contains(v) {
+                        if ehd {
+                            eprintln!("  EHD b{}->b{}: live-in arg", x.index(), si);
+                        }
+                        return None;
+                    }
+                }
+                work.push(*s);
+            }
+        }
+        Some(demand)
     }
 
     fn monotonize_inst_offsets(&self, inst_offsets: &mut [CodeOffset], func_body_len: u32) {
