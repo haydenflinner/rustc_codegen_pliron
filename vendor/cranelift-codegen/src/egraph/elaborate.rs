@@ -7,7 +7,7 @@ use crate::ctxhash::NullCtx;
 use crate::dominator_tree::DominatorTree;
 use crate::hash_map::Entry as HashEntry;
 use crate::inst_predicates::is_pure_for_egraph;
-use crate::ir::{Block, Function, Inst, Value, ValueDef};
+use crate::ir::{Block, Function, Inst, Opcode, Value, ValueDef};
 use crate::loop_analysis::{Loop, LoopAnalysis};
 use crate::scoped_hash_map::ScopedHashMap;
 use crate::trace;
@@ -29,7 +29,48 @@ pub(crate) fn remat_call_on() -> bool {
 /// domtree preorder leaves a loop. See `Elaborator::start_block`.
 pub(crate) fn elab_loops_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_ELABLOOPS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        matches!(std::env::var("PLIRON_ELABLOOPS").as_deref(), Ok("1") | Ok("2"))
+    })
+}
+
+/// PLIRON: `PLIRON_ELABLOOPS=2` (opt-in) — `=1`, pressure-aware: a cheap
+/// invariant is not hoisted out of a loop that contains a call. Hoisted,
+/// it is live across the whole loop, so across the call: it takes a
+/// callee-saved register for the loop's duration or is spilled and
+/// reloaded every iteration, to save one ALU instruction per iteration.
+/// (`=1` cost `strwork` spills that way; relax's allocator makes the same
+/// trade from the other side, recomputing cheap values after a call
+/// instead of keeping them in a callee-saved register.) Loops without
+/// calls hoist as under `=1`: caller-saved registers are free there
+/// (parse_only's `ptr + len` end pointer). See the hoist-level choice in
+/// `Elaborator::process_elab_stack`.
+pub(crate) fn elab_loops_pressure() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABLOOPS").as_deref() == Ok("2"))
+}
+
+/// One instruction with register operands that costs about a cycle:
+/// what `PLIRON_ELABLOOPS=2` would rather recompute than keep across a
+/// call.
+fn cheap_to_recompute(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Iadd
+            | Opcode::Isub
+            | Opcode::Ineg
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor
+            | Opcode::Bnot
+            | Opcode::Ishl
+            | Opcode::Ushr
+            | Opcode::Sshr
+            | Opcode::Uextend
+            | Opcode::Sextend
+            | Opcode::Ireduce
+            | Opcode::Icmp
+    )
 }
 
 pub(crate) struct Elaborator<'a> {
@@ -176,7 +217,7 @@ impl<'a> Elaborator<'a> {
             SecondaryMap::with_default(BestEntry(Cost::infinity(), Value::reserved_value()));
         value_to_best_value.resize(num_values);
         let mut call_loops = FxHashSet::default();
-        if remat_call_on() {
+        if remat_call_on() || elab_loops_pressure() {
             for block in func.layout.blocks() {
                 let Some(mut lp) = loop_analysis.innermost_loop(block) else {
                     continue;
@@ -711,6 +752,22 @@ impl<'a> Elaborator<'a> {
                         })
                         .max()
                         .unwrap_or(self.loop_stack.len().saturating_sub(1));
+                    // PLIRON_ELABLOOPS=2: a cheap op stops below the
+                    // innermost enclosing loop that has a call.
+                    let loop_hoist_level = if elab_loops_pressure()
+                        && loop_hoist_level < self.loop_stack.len()
+                        && cheap_to_recompute(self.func.dfg.insts[inst].opcode())
+                    {
+                        let mut k = self.loop_stack.len();
+                        while k > loop_hoist_level
+                            && !self.call_loops.contains(&self.loop_stack[k - 1].lp)
+                        {
+                            k -= 1;
+                        }
+                        k
+                    } else {
+                        loop_hoist_level
+                    };
                     trace!(
                         " -> loop hoist level: {:?}; cur loop depth: {:?}, loop_stack: {:?}",
                         loop_hoist_level,
