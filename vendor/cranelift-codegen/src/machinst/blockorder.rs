@@ -253,7 +253,7 @@ impl BlockLoweringOrder {
             // alternative is a taken front-end redirect per
             // non-leaf call (~1.4x on fib where the leaf arm is the
             // *less* dynamic-work arm but won the in-count tie).
-            let loopft = std::env::var("PLIRON_LOOPFT").as_deref() == Ok("1");
+            let loopft = std::env::var("PLIRON_LOOPFT").as_deref() != Ok("0");
             let mut reaches_latch = SecondaryMap::with_default(false);
             if loopft {
                 let mut stack: Vec<Block> = Vec::new();

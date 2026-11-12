@@ -1874,7 +1874,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      `Lower::value_single_direct_use` (machinst/lower.rs).
      Regression: `pliron-clif-opt/tests/x64_suamode.rs` (+ `_off`).
 
-131. Loop-side fallthrough placement (opt-in `PLIRON_LOOPFT=1`).
+131. Loop-side fallthrough placement (default-on; `PLIRON_LOOPFT=0`
+     disables).
      When a brif's two arms are a leaf/return block and a block that
      can reach a back-edge latch, prefer the loop arm as the
      fallthrough: loop work stays on the straight-line fetch path

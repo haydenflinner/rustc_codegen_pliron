@@ -1,4 +1,4 @@
-//! x64 loop-side fallthrough placement (`PLIRON_LOOPFT=1`, opt-in).
+//! x64 loop-side fallthrough placement (default-on, `PLIRON_LOOPFT=0` disables).
 //!
 //! When a brif's two arms are a leaf/return block and a loop entry,
 //! the loop arm should be the fallthrough: keeping loop work on the

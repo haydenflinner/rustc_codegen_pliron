@@ -465,7 +465,7 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
     // straight-line fetch path while a leaf/return arm takes the
     // out-of-line spot. Recursive hot loops otherwise pay a taken
     // front-end redirect per non-leaf call (~1.4x on fib).
-    let loopft = std::env::var("PLIRON_LOOPFT").as_deref() == Ok("1");
+    let loopft = std::env::var("PLIRON_LOOPFT").as_deref() != Ok("0");
     let reach_loop: Vec<bool> = {
         let mut reach = vec![false; n];
         if loopft {
