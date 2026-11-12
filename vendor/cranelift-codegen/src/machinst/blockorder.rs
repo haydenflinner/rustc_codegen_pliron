@@ -246,6 +246,32 @@ impl BlockLoweringOrder {
                     .iter()
                     .any(|lb| domtree.block_dominates(lb.orig_block().unwrap(), block));
             }
+            // PLIRON (`PLIRON_LOOPFT=0` disables): a succ that can
+            // reach a back-edge latch keeps the function's loop work
+            // on the straight-line fetch path — a leaf/return arm
+            // gets out-of-lined instead. On recursive hot loops the
+            // alternative is a taken front-end redirect per
+            // non-leaf call (~1.4x on fib where the leaf arm is the
+            // *less* dynamic-work arm but won the in-count tie).
+            let loopft = std::env::var("PLIRON_LOOPFT").as_deref() == Ok("1");
+            let mut reaches_latch = SecondaryMap::with_default(false);
+            if loopft {
+                let mut stack: Vec<Block> = Vec::new();
+                for &block in &rpo {
+                    if is_latch[block] {
+                        reaches_latch[block] = true;
+                        stack.push(block);
+                    }
+                }
+                while let Some(b) = stack.pop() {
+                    for &p in &block_preds[b] {
+                        if !reaches_latch[p] {
+                            reaches_latch[p] = true;
+                            stack.push(p);
+                        }
+                    }
+                }
+            }
             let mut best_succ = SecondaryMap::with_default(
                 crate::packed_option::PackedOption::<Block>::default(),
             );
@@ -267,6 +293,7 @@ impl BlockLoweringOrder {
                 let mut pick_in = 0;
                 let mut pick_rank = 0;
                 let mut pick_latch = false;
+                let mut pick_reach = false;
                 let mut pick_njoin = false;
                 for lb in &block_succs[range] {
                     let succ = lb.orig_block().unwrap();
@@ -341,20 +368,24 @@ impl BlockLoweringOrder {
                         0
                     };
                     let latch = is_latch[succ];
+                    let reach = reaches_latch[succ];
                     let njoin = !djoin;
                     if pick.is_none()
                         || rank > pick_rank
                         || (rank == pick_rank
                             && ((latch && !pick_latch)
                                 || (latch == pick_latch
-                                    && ((njoin && !pick_njoin)
-                                        || (njoin == pick_njoin
-                                            && block_in_count[succ] >= pick_in)))))
+                                    && ((reach && !pick_reach)
+                                        || (reach == pick_reach
+                                            && ((njoin && !pick_njoin)
+                                                || (njoin == pick_njoin
+                                                    && block_in_count[succ] >= pick_in)))))))
                     {
                         pick = Some(succ);
                         pick_in = block_in_count[succ];
                         pick_rank = rank;
                         pick_latch = latch;
+                        pick_reach = reach;
                         pick_njoin = njoin;
                     }
                 }

@@ -460,6 +460,33 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
     let edge_w = |b: usize, k: usize| freq[b] * prob[b][k];
     // A predecessor through a back edge (later in RPO) is never waited for.
     let in_loop_back = |_lp: Option<usize>, p: usize, b: usize| rpo_idx[p] >= rpo_idx[b];
+    // PLIRON (`PLIRON_LOOPFT=0` disables): on edge-weight ties prefer
+    // a successor that can reach a loop — loop work stays on the
+    // straight-line fetch path while a leaf/return arm takes the
+    // out-of-line spot. Recursive hot loops otherwise pay a taken
+    // front-end redirect per non-leaf call (~1.4x on fib).
+    let loopft = std::env::var("PLIRON_LOOPFT").as_deref() == Ok("1");
+    let reach_loop: Vec<bool> = {
+        let mut reach = vec![false; n];
+        if loopft {
+            let mut stack = Vec::new();
+            for b in 0..n {
+                if innermost[b].is_some() {
+                    reach[b] = true;
+                    stack.push(b);
+                }
+            }
+            while let Some(b) = stack.pop() {
+                for &p in &preds[b] {
+                    if !reach[p] {
+                        reach[p] = true;
+                        stack.push(p);
+                    }
+                }
+            }
+        }
+        reach
+    };
     // Build the chain for region `lp`, starting at `start`.
     let build = |lp: Option<usize>, start: usize, chain_of: &mut Vec<usize>, chains: &mut Vec<Vec<usize>>, free: &mut Vec<bool>| {
         let in_region = |b: usize| match lp {
@@ -525,7 +552,7 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
         }
         loop {
             let tail = *chains[cur].last().unwrap();
-            let mut best: Option<(usize, (f64, bool))> = None;
+            let mut best: Option<(usize, (f64, bool, bool))> = None;
             for (k, &s) in succs[tail].iter().enumerate() {
                 let s = res[s];
                 if cold[s] || empty[s] || !in_region(s) {
@@ -563,7 +590,7 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
                 // Ties go to a successor none of whose other predecessors
                 // is unplaced (the arm of an if, not its join).
                 let unplaced_other = preds[s].iter().any(|&p| p != tail && !placed_here[p] && !cold[p] && in_region(p) && chain_of[p] != c);
-                let key = (w, !unplaced_other);
+                let key = (w, reach_loop[s], !unplaced_other);
                 if best.map_or(true, |(_, bk)| key > bk) {
                     best = Some((s, key));
                 }

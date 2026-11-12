@@ -1873,3 +1873,20 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      (direct, not the transitive `value_ir_uses`). New accessor:
      `Lower::value_single_direct_use` (machinst/lower.rs).
      Regression: `pliron-clif-opt/tests/x64_suamode.rs` (+ `_off`).
+
+131. Loop-side fallthrough placement (opt-in `PLIRON_LOOPFT=1`).
+     When a brif's two arms are a leaf/return block and a block that
+     can reach a back-edge latch, prefer the loop arm as the
+     fallthrough: loop work stays on the straight-line fetch path
+     while the leaf arm takes the out-of-line spot. Recursive hot
+     loops otherwise pay a taken front-end redirect per non-leaf
+     call — fib measured ~1.4x slower with the (more frequent) leaf
+     arm inline, then ~1.0x (LLVM parity) once the loop arm fell
+     through. Both mechanisms that pick fallthrough successors get
+     the same signal, computed once per function by reverse BFS:
+     `BCHAIN`'s chain pick gains a `reaches_latch` tie-break after
+     `latch` (back-edge sources seeded from `is_latch`), and
+     `PLACE`'s edge-weight key gains `reach_loop` between `w` and
+     `!unplaced_other` (blocks reaching `innermost.is_some()`).
+     Ties only — explicit edge weights still dominate. Regression:
+     `pliron-clif-opt/tests/x64_loopft.rs`.
