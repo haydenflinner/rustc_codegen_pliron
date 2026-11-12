@@ -313,6 +313,24 @@ pub trait MachInst: Clone + Debug {
         None
     }
 
+    /// PLIRON FLAGX: if this is a conditional branch on the target's
+    /// flag register, the `(taken, not_taken)` labels plus the flag
+    /// bits each edge proves, as `(mask, value)` pairs over the
+    /// target's flag-bit numbering (x64: CF=1, ZF=2, SF=4, OF=8,
+    /// PF=16). Used to propagate known flag state across a
+    /// single-predecessor edge.
+    fn flag_branch(&self) -> Option<FlagBranch> {
+        None
+    }
+
+    /// PLIRON FLAGX: for a flag-reading conditional inst (cmov-class),
+    /// evaluate its condition under the known flag bits `(mask, vals)`:
+    /// `Some(outcome)` when the mask covers every flag the condition
+    /// needs, `None` otherwise (or when this inst has no flag cc).
+    fn flag_cc_eval(&self, _mask: u8, _vals: u8) -> Option<bool> {
+        None
+    }
+
     /// Is this a terminator (branch or ret)? If so, return its type
     /// (ret/uncond/cond) and target if applicable.
     fn is_term(&self) -> MachTerminator;
@@ -566,6 +584,22 @@ pub enum FlagKind {
     /// flag state unknowable (calls, block boundaries, terminators).
     /// Conservatively the default for every target and inst.
     Other,
+}
+
+/// PLIRON FLAGX: a flag-register conditional branch and the flag bits
+/// each of its outgoing edges proves, as `(mask, value)` pairs (x64
+/// bits: CF=1, ZF=2, SF=4, OF=8, PF=16). A successor entered through
+/// `taken` has `taken_bits` proven; through `not_taken`, `fall_bits`.
+#[derive(Clone, Copy, Debug)]
+pub struct FlagBranch {
+    /// The branch-taken target.
+    pub taken: MachLabel,
+    /// The fallthrough/not-taken target.
+    pub not_taken: MachLabel,
+    /// `(mask, value)` flag bits proven on the taken edge.
+    pub taken_bits: (u8, u8),
+    /// `(mask, value)` flag bits proven on the not-taken edge.
+    pub fall_bits: (u8, u8),
 }
 
 /// Classification of call instruction types for granular analysis.

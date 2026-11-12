@@ -27,6 +27,18 @@ fn asm(clif: &str, gate: &str) -> String {
     ctx.compiled_code().unwrap().vcode.clone().unwrap()
 }
 
+// FLAGX (`PLIRON_FLAGX=1`, opt-in): propagate the tracked compare and
+// the flag bits a conditional predecessor's edges prove across a
+// single-predecessor block boundary; a `cmov` whose condition the
+// proven bits decide (false) is elided.
+fn asm_fx(clif: &str, fx: &str) -> String {
+    unsafe {
+        std::env::set_var("PLIRON_FLAGDUP", "1");
+        std::env::set_var("PLIRON_FLAGX", fx)
+    };
+    asm(clif, "1")
+}
+
 fn count(asm: &str, mnem: &str) -> usize {
     asm.lines()
         .filter(|l| l.split_whitespace().next() == Some(mnem))
@@ -113,4 +125,69 @@ block2:
 }";
     let a = asm(clif, "1");
     assert!(count(&a, "cmpq") >= 2, "{a}");
+}
+
+// FLAGX (`PLIRON_FLAGX=1`): the compare feeding a `brif` propagates
+// across each single-predecessor edge together with the flag bits the
+// edge proves. On the `jz` not-taken edge ZF is known 0, so a `cmove`
+// there is provably dead (and the re-issued compare dedups against the
+// propagated state); on the taken edge ZF is known 1 and the `cmove`
+// is provably live — it stays.
+#[test]
+fn edge_cc_folds_cmov() {
+    let clif = "
+function %f(i64, i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    v8 = icmp eq v0, v1
+    brif v8, block1, block2
+block1:
+    v4 = select v8, v2, v3
+    return v4
+block2:
+    v5 = select v8, v3, v2
+    return v5
+}";
+    let off = asm_fx(clif, "0");
+    let on = asm_fx(clif, "1");
+    assert_eq!(count(&off, "cmpq"), 3, "{off}");
+    assert_eq!(count(&off, "cmoveq"), 2, "{off}");
+    assert_eq!(count(&on, "cmpq"), 1, "{on}");
+    assert_eq!(count(&on, "cmoveq"), 1, "{on}");
+}
+
+// With two predecessors the flag state at a block entry is not pinned
+// by either edge — the propagated compare and bits may only be used
+// for single-pred successors. block3 is reached both from the `brif`'s
+// taken edge and from block4, so its select keeps both the compare and
+// the cmov; block5 is single-pred and still folds.
+#[test]
+fn multi_pred_keeps_cmov() {
+    let clif = "
+function %f(i64, i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    v9 = icmp ne v2, v3
+    brif v9, block1, block4
+block1:
+    v8 = icmp eq v0, v1
+    brif v8, block3, block5
+block4:
+    jump block3
+block3:
+    v11 = icmp eq v0, v1
+    v5 = select v11, v3, v2
+    return v5
+block5:
+    v12 = icmp eq v0, v1
+    v6 = select v12, v2, v3
+    return v6
+}";
+    let off = asm_fx(clif, "0");
+    let on = asm_fx(clif, "1");
+    // block3 (two preds) keeps its compare and cmov; block5
+    // (single-pred, ZF=0 edge) dedups the compare and folds the
+    // provably-false `cmove`.
+    assert_eq!(count(&off, "cmpq"), 4, "{off}");
+    assert_eq!(count(&off, "cmoveq"), 2, "{off}");
+    assert_eq!(count(&on, "cmpq"), 3, "{on}");
+    assert_eq!(count(&on, "cmoveq"), 1, "{on}");
 }

@@ -1340,6 +1340,114 @@ fn flag_preserving_mnemonic(mn: &str) -> bool {
         || matches!(mn, "xchg" | "bswap" | "pause" | "mfence" | "lfence" | "sfence")
 }
 
+// PLIRON FLAGX: EFLAGS bit numbering for the emit-time known-flag
+// tracking (`flag_branch` / `flag_cc_eval`).
+const XF_CF: u8 = 1;
+const XF_ZF: u8 = 2;
+const XF_SF: u8 = 4;
+const XF_OF: u8 = 8;
+const XF_PF: u8 = 16;
+
+/// The cc suffix used by `cmov*`/`set*`/xed mnemonics.
+fn cc_by_name(s: &str) -> Option<CC> {
+    Some(match s {
+        "o" => CC::O,
+        "no" => CC::NO,
+        "b" | "c" | "nae" => CC::B,
+        "ae" | "nb" | "nc" => CC::NB,
+        "e" | "z" => CC::Z,
+        "ne" | "nz" => CC::NZ,
+        "be" | "na" => CC::BE,
+        "a" | "nbe" => CC::NBE,
+        "s" => CC::S,
+        "ns" => CC::NS,
+        "p" | "pe" => CC::P,
+        "np" | "po" => CC::NP,
+        "l" | "nge" => CC::L,
+        "ge" | "nl" => CC::NL,
+        "le" | "ng" => CC::LE,
+        "g" | "nle" => CC::NLE,
+        _ => return None,
+    })
+}
+
+/// The flag bits a condition needs to be decidable.
+fn cc_flag_need(cc: CC) -> u8 {
+    match cc {
+        CC::O | CC::NO => XF_OF,
+        CC::B | CC::NB => XF_CF,
+        CC::Z | CC::NZ => XF_ZF,
+        CC::BE | CC::NBE => XF_CF | XF_ZF,
+        CC::S | CC::NS => XF_SF,
+        CC::P | CC::NP => XF_PF,
+        CC::L | CC::NL => XF_SF | XF_OF,
+        CC::LE | CC::NLE => XF_ZF | XF_SF | XF_OF,
+    }
+}
+
+/// Evaluate a condition under the known flag bits `(mask, vals)`;
+/// `None` when the mask doesn't cover every bit the condition reads.
+fn cc_eval_flag(cc: CC, mask: u8, vals: u8) -> Option<bool> {
+    let need = cc_flag_need(cc);
+    if mask & need != need {
+        return None;
+    }
+    let cf = vals & XF_CF != 0;
+    let zf = vals & XF_ZF != 0;
+    let sf = vals & XF_SF != 0;
+    let of = vals & XF_OF != 0;
+    let pf = vals & XF_PF != 0;
+    Some(match cc {
+        CC::O => of,
+        CC::NO => !of,
+        CC::B => cf,
+        CC::NB => !cf,
+        CC::Z => zf,
+        CC::NZ => !zf,
+        CC::BE => cf || zf,
+        CC::NBE => !cf && !zf,
+        CC::S => sf,
+        CC::NS => !sf,
+        CC::P => pf,
+        CC::NP => !pf,
+        CC::L => sf != of,
+        CC::NL => sf == of,
+        CC::LE => zf || sf != of,
+        CC::NLE => !zf && sf == of,
+    })
+}
+
+/// The `(mask, value)` bits an edge proves when `cc` is known to be
+/// `on` along it. Compound conditions (`be` = CF|ZF, the signed
+/// relations) pin a bit on only one side, or not at all.
+fn cc_proven_bits(cc: CC, on: bool) -> (u8, u8) {
+    match (cc, on) {
+        (CC::O, true) => (XF_OF, XF_OF),
+        (CC::O, false) => (XF_OF, 0),
+        (CC::NO, true) => (XF_OF, 0),
+        (CC::NO, false) => (XF_OF, XF_OF),
+        (CC::B, true) => (XF_CF, XF_CF),
+        (CC::B, false) => (XF_CF, 0),
+        (CC::NB, true) => (XF_CF, 0),
+        (CC::NB, false) => (XF_CF, XF_CF),
+        (CC::Z, true) => (XF_ZF, XF_ZF),
+        (CC::Z, false) => (XF_ZF, 0),
+        (CC::NZ, true) => (XF_ZF, 0),
+        (CC::NZ, false) => (XF_ZF, XF_ZF),
+        (CC::S, true) => (XF_SF, XF_SF),
+        (CC::S, false) => (XF_SF, 0),
+        (CC::NS, true) => (XF_SF, 0),
+        (CC::NS, false) => (XF_SF, XF_SF),
+        (CC::P, true) => (XF_PF, XF_PF),
+        (CC::P, false) => (XF_PF, 0),
+        (CC::NP, true) => (XF_PF, 0),
+        (CC::NP, false) => (XF_PF, XF_PF),
+        // `!be` and `a` both mean "above" (CF=0, ZF=0).
+        (CC::BE, false) | (CC::NBE, true) => (XF_CF | XF_ZF, 0),
+        _ => (0, 0),
+    }
+}
+
 // `emit_lea` shrinks `lea` into `add` when `dst` is also the (only)
 // source register — `add` writes flags, so those `lea`s are not
 // flag-preserving even though the mnemonic says otherwise. Mirror the
@@ -1651,6 +1759,66 @@ impl MachInst for Inst {
         if let Inst::JmpCond { taken, .. } = self {
             *taken = l;
         }
+    }
+
+    fn flag_branch(&self) -> Option<FlagBranch> {
+        match self {
+            Inst::JmpCond {
+                cc,
+                taken,
+                not_taken,
+            } => Some(FlagBranch {
+                taken: *taken,
+                not_taken: *not_taken,
+                taken_bits: cc_proven_bits(*cc, true),
+                fall_bits: cc_proven_bits(*cc, false),
+            }),
+            _ => None,
+        }
+    }
+
+    fn flag_cc_eval(&self, mask: u8, vals: u8) -> Option<bool> {
+        use asm::inst::Inst as I;
+        let Inst::External { inst } = self else {
+            return None;
+        };
+        let mn = inst.mnemonic();
+        let s = mn.strip_prefix("cmov")?;
+        let (cc, sz) = s.split_at(s.len().checked_sub(1)?);
+        if !"wlq".contains(sz) {
+            return None;
+        }
+        // A `cmov` with a memory source performs the load even when its
+        // condition is false; eliding it would drop a mandatory (and
+        // possibly faulting) read. Only register-source forms fold.
+        macro_rules! cmov_mem_src {
+            ($($rm:ident : $($v:ident),+ ;)+) => {
+                match inst {
+                    $($(I::$v(i) => i.$rm.is_memory(),)+)+
+                    // Any `cmov*` form not listed (or a non-cmov that
+                    // somehow passed the mnemonic check): not provably
+                    // register-sourced, so refuse to fold.
+                    _ => true,
+                }
+            };
+        }
+        if cmov_mem_src! {
+            rm16: cmovaw_rm, cmovaew_rm, cmovbw_rm, cmovbew_rm, cmovew_rm,
+                  cmovgw_rm, cmovgew_rm, cmovlw_rm, cmovlew_rm, cmovnew_rm,
+                  cmovnow_rm, cmovnpw_rm, cmovnsw_rm, cmovow_rm, cmovpw_rm,
+                  cmovsw_rm;
+            rm32: cmoval_rm, cmovael_rm, cmovbl_rm, cmovbel_rm, cmovel_rm,
+                  cmovgl_rm, cmovgel_rm, cmovll_rm, cmovlel_rm, cmovnel_rm,
+                  cmovnol_rm, cmovnpl_rm, cmovnsl_rm, cmovol_rm, cmovpl_rm,
+                  cmovsl_rm;
+            rm64: cmovaq_rm, cmovaeq_rm, cmovbq_rm, cmovbeq_rm, cmoveq_rm,
+                  cmovgq_rm, cmovgeq_rm, cmovlq_rm, cmovleq_rm, cmovneq_rm,
+                  cmovnoq_rm, cmovnpq_rm, cmovnsq_rm, cmovoq_rm, cmovpq_rm,
+                  cmovsq_rm;
+        } {
+            return None;
+        }
+        cc_eval_flag(cc_by_name(cc)?, mask, vals)
     }
 
     fn invert_cond_br(&mut self) {

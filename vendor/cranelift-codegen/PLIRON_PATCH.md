@@ -1736,3 +1736,27 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     stays post-call, `cur` keeps one register, `addl $-2` in place —
     LLVM's loop shape). A cached per-block `call_pre` prefix count
     (rebuilt with `pos`) makes the check O(1) per candidate.
+
+125. Cross-block flag-state propagation + conditional-move folding
+    (`machinst/vcode.rs` emit loop; opt-in `PLIRON_FLAGX=1`,
+    `PLIRON_FLAGX_TRACE` diagnostics). FLAGDUP's tracked compare and a
+    `(mask, value)` known-EFLAGS-bit pair propagate to a successor that
+    has exactly one CFG predecessor — the pred's exit state is
+    snapshotted per block (`exit_flags`, keyed by block index, taken at
+    its terminator's entry) so layout order doesn't matter. A
+    conditional-branch pred additionally proves flag bits on each edge
+    (`MachInst::flag_branch` → `FlagBranch{taken,not_taken,taken_bits,
+    fall_bits}`; x64 `JmpCond` via `cc_proven_bits`: e.g. `jz`-taken
+    pins ZF, `jb`-taken pins CF, `jbe`-fallthrough pins CF=ZF=0;
+    compound signed ccs pin nothing). In-block flag effects then apply
+    as usual (`Cmp` rewrites everything, `Other`/operand rewrites
+    clear). Two consumers: the propagated compare lets FLAGDUP kill a
+    re-issued `cmp` across the boundary, and `MachInst::flag_cc_eval`
+    (`cc_eval_flag` over CF=1,ZF=2,SF=4,OF=8,PF=16) decides a
+    `cmov`'s cc — `Some(false)` elides it (a proven-false cmov is a
+    no-op). `cmov` with a memory source still performs the load, so
+    only register-source `cmov{w,l,q}` forms may fold (checked
+    per-variant against `GprMem::is_memory`). Regressions:
+    `pliron-clif-opt/tests/x64_flagdup.rs`
+    (`edge_cc_folds_cmov`, `multi_pred_keeps_cmov`) and the
+    `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.

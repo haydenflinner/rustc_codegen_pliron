@@ -2011,6 +2011,25 @@ impl<I: VCodeInst> VCode<I> {
         });
         let flagdup_local_n = std::cell::Cell::new(0u64);
         let flag_state = std::cell::Cell::new(None::<(u64, PReg, PReg)>);
+        // PLIRON FLAGX (`PLIRON_FLAGX=1` opt-in): propagate the tracked
+        // compare — plus the flag bits a conditional predecessor's edge
+        // proves — across a single-predecessor block boundary, and
+        // elide `cmov`-class insts whose condition the bits decide.
+        // `flag_known` = `(mask, vals)` known EFLAGS bits; `inst_entry`
+        // = flag state going into each emitted inst (the terminator's
+        // entry = the block's exit state); `term_br` = the last emitted
+        // inst's `flag_branch()`; `exit_flags` snapshots both keyed by
+        // block — a single-pred successor inherits its pred's exit
+        // state no matter where the pred emitted in the layout.
+        // Read directly (not OnceLock) so tests can toggle it between
+        // compiles in one process.
+        let flagx = std::env::var("PLIRON_FLAGX").as_deref() == Ok("1");
+        let flag_known = std::cell::Cell::new((0u8, 0u8));
+        let inst_entry = std::cell::Cell::new(None::<(u64, PReg, PReg)>);
+        let term_br = std::cell::Cell::new(None::<FlagBranch>);
+        let mut exit_flags =
+            vec![None::<(Option<(u64, PReg, PReg)>, Option<FlagBranch>)>; self.num_blocks()];
+        let mut fx_prev: Option<BlockIndex> = None;
         let mut order_pos = vec![usize::MAX; self.num_blocks()];
         for (i, &b) in final_order.iter().enumerate() {
             order_pos[b.index()] = i;
@@ -2415,9 +2434,17 @@ impl<I: VCodeInst> VCode<I> {
                 // also the block-boundary reset).
                 if flagdup {
                     match inst.flag_kind() {
-                        FlagKind::Cmp { key, a, b } => flag_state.set(Some((key, a, b))),
+                        FlagKind::Cmp { key, a, b } => {
+                            flag_state.set(Some((key, a, b)));
+                            // A new compare overwrites every flag:
+                            // prior edge polarity is stale.
+                            flag_known.set((0, 0));
+                        }
                         FlagKind::Neutral => {}
-                        FlagKind::Other => flag_state.set(None),
+                        FlagKind::Other => {
+                            flag_state.set(None);
+                            flag_known.set((0, 0));
+                        }
                     }
                 }
                 if want_disasm && !inst.is_args() {
@@ -2468,10 +2495,55 @@ impl<I: VCodeInst> VCode<I> {
             // Now emit the regular block body.
 
             buffer.bind_label(MachLabel::from_block(block), state.ctrl_plane_mut());
-            // PLIRON FLAGDUP: flag state cannot be assumed across a
-            // block boundary — another pred may enter without having
-            // emitted the tracked compare.
-            flag_state.set(None);
+            // PLIRON FLAGX: across a single-predecessor edge the flag
+            // state at the pred's terminator survives — the pred is the
+            // only way in — and when that terminator was a flag
+            // conditional branch, the edge taken proves flag bits.
+            // Otherwise flag state cannot be assumed across a block
+            // boundary (another pred may enter without the tracked
+            // compare). Snapshot the just-finished block's exit state
+            // first so non-adjacent preds can be looked up.
+            if flagx && flagdup {
+                if let Some(pb) = fx_prev {
+                    exit_flags[pb.index()] = Some((inst_entry.get(), term_br.get()));
+                }
+                let mut kb = (0u8, 0u8);
+                let entry = if let [p] = self.block_preds(block) {
+                    exit_flags.get(p.index()).copied().flatten()
+                } else {
+                    None
+                };
+                if let Some((st, fb)) = entry {
+                    flag_state.set(st);
+                    if let Some(fb) = fb {
+                        let l = MachLabel::from_block(block);
+                        if fb.taken == l {
+                            kb = fb.taken_bits;
+                        } else if fb.not_taken == l {
+                            kb = fb.fall_bits;
+                        }
+                    }
+                } else {
+                    flag_state.set(None);
+                }
+                flag_known.set(kb);
+                if std::env::var_os("PLIRON_FLAGX_TRACE").is_some()
+                    && (kb.0 != 0 || flag_state.get().is_some())
+                {
+                    eprintln!(
+                        "FLAGX prop {} block{} kb=({:#x},{:#x}) cmp={}",
+                        crate::PLIRON_FN_NAME.with(|s| s.borrow().clone()),
+                        block.index(),
+                        kb.0,
+                        kb.1,
+                        flag_state.get().is_some()
+                    );
+                }
+            } else {
+                flag_state.set(None);
+                flag_known.set((0, 0));
+            }
+            fx_prev = Some(block);
             if std::env::var_os("PLIRON_EH_TRACE").is_some() {
                 eprintln!(
                     "EHM oi={} b{} @off={:#x} [{}]",
@@ -3431,6 +3503,17 @@ impl<I: VCodeInst> VCode<I> {
 
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);
 
+                            // PLIRON FLAGX: snapshot the flag state
+                            // going into this inst — for the block's
+                            // last inst (its terminator) that is the
+                            // block-exit state the single-pred
+                            // propagation reads — and note a flag
+                            // conditional branch for edge polarity.
+                            if flagx {
+                                inst_entry.set(flag_state.get());
+                                term_br.set(self.insts[iix.index()].flag_branch());
+                            }
+
                             // Emit the instruction!
                             let mut dead_mov = false;
                             if mcp {
@@ -3553,6 +3636,30 @@ impl<I: VCodeInst> VCode<I> {
                                         }
                                     }
                                     FlagKind::Other => {}
+                                }
+                            }
+                            // PLIRON FLAGX: a `cmov`-class inst whose
+                            // condition the propagated flag bits decide
+                            // is a no-op under a false outcome (its
+                            // not-taken value is already in place).
+                            if flagx && !dead_mov && !dead_cmp {
+                                let (km, kv) = flag_known.get();
+                                if flagdup_fn_ok
+                                    && self.insts[iix.index()].flag_cc_eval(km, kv)
+                                        == Some(false)
+                                {
+                                    if std::env::var("PLIRON_FLAGX_TRACE").is_ok() {
+                                        eprintln!(
+                                            "FLAGX elide {} block{} iix{}: {}",
+                                            crate::PLIRON_FN_NAME
+                                                .with(|s| s.borrow().clone()),
+                                            block.index(),
+                                            iix.index(),
+                                            self.insts[iix.index()]
+                                                .pretty_print_inst(&mut state)
+                                        );
+                                    }
+                                    dead_cmp = true;
                                 }
                             }
                             if !dead_mov && !dead_cmp {
