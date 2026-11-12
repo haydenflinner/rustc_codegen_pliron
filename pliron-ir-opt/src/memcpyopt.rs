@@ -729,6 +729,52 @@ fn try_forward(
             if any_between(ctx, st, dom, f, m, w, &set) {
                 why!("dst touched in writer-to-copy window");
             }
+            // The window above is the first visit only. A copy in a loop
+            // its writer sits outside of runs again without the writer:
+            // it re-commits `tmp`'s bytes over whatever the loop did to
+            // `dst` since (`let mut x = empty();` at the top of a loop
+            // body whose `empty()` value was built once before the loop
+            // — regex-syntax's `alternate_literals` kept the previous
+            // iteration's moved-out `Vec` and freed it twice). With `m`
+            // gone nothing restores them, so on every route from `m`
+            // back to `m` that does not pass the writer, nothing may
+            // change the range: walk backward from `m`, cut at the
+            // writer, refuse at a `Write`/`Other` touch. Reads are fine
+            // — they see the bytes `m` would have written.
+            let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
+            if let Some(mb) = m.deref(ctx).get_parent_block() {
+                stack.push((mb, Some(m)));
+            }
+            let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
+                FxHashSet::default();
+            let mut steps = 0usize;
+            while let Some((b, upto)) = stack.pop() {
+                if !seen.insert((b, upto)) {
+                    continue;
+                }
+                let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+                let end = upto
+                    .and_then(|u| ops.iter().position(|&o| o == u))
+                    .unwrap_or(ops.len());
+                let mut cut = false;
+                for &o in ops[..end].iter().rev() {
+                    steps += 1;
+                    if steps > 8192 {
+                        why!("wrap scan over budget");
+                    }
+                    if o == w {
+                        cut = true;
+                        break;
+                    }
+                    if o != m && t.get(&o).is_some_and(|&k| k != TouchKind::Read) {
+                        why!("dst changed on a route that reaches the copy again");
+                    }
+                }
+                if cut {
+                    continue;
+                }
+                stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
+            }
         }
     }
     // A reader after `m` reads `tmp`'s final bytes — `dst`'s after the
@@ -1708,6 +1754,35 @@ mod tests {
         let input = format!(
             "{HEAD}            llvm.store *tmp <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{MC}            llvm.store *dst <- v;\n{TAIL}"
         );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// A partial writer before the loop, the copy inside it, and `dst`
+    /// changed after the copy: the next iteration's copy restored
+    /// `tmp`'s bytes, the rebased code would keep the changed ones
+    /// (regex-syntax `alternate_literals`: a double free). Must refuse.
+    #[test]
+    fn partial_writer_outside_loop_refused() {
+        let pre = "            four = llvm.constant <builtin.integer <3: i32>> : builtin.integer i32;\n            llvm.store *tmp <- four;\n            llvm.br ^loop()\n          ^loop():\n";
+        let head = HEAD.replace("            llvm.br ^loop()\n          ^loop():\n", pre);
+        assert_ne!(head, HEAD);
+        let input = format!("{head}{MC}            llvm.store *dst <- v;\n{TAIL}");
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// Same shape with `dst` only read after the copy: every iteration
+    /// sees the writer's bytes either way — still forwarded.
+    #[test]
+    fn partial_writer_outside_loop_read_only_forwarded() {
+        let pre = "            four = llvm.constant <builtin.integer <3: i32>> : builtin.integer i32;\n            llvm.store *tmp <- four;\n            llvm.br ^loop()\n          ^loop():\n";
+        let head = HEAD.replace("            llvm.br ^loop()\n          ^loop():\n", pre);
+        let input = format!("{head}{MC}            r = llvm.load dst : builtin.integer i64;\n{TAIL}");
         let ctx = &mut Context::new();
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
