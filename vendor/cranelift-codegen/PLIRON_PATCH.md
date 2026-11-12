@@ -1758,6 +1758,15 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     only register-source `cmov{w,l,q}` forms may fold (checked
     per-variant against `GprMem::is_memory`). Regressions:
     `pliron-clif-opt/tests/x64_flagdup.rs`
+
+    Status: **superseded by `EDGESEL`, stays opt-in.** Post-EDGESEL
+    corpus check (all bench kernels + std deps): 1516 cross-block
+    propagations, **0** `FLAGX elide` cmov folds, and identical
+    FLAGDUP elide counts (98) with `PLIRON_FLAGX=0` vs `=1` — the
+    CLIF-level pass already folds the selects/cmovs this was built
+    to kill, so the emit-level machinery finds nothing to do. Kept
+    behind `PLIRON_FLAGX=1` for future shapes that reach emit with
+    edge-pinned conditions.
     (`edge_cc_folds_cmov`, `multi_pred_keeps_cmov`) and the
     `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.
 
