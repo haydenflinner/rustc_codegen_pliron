@@ -1802,7 +1802,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      `PLIRON_ARGDIRECT=1` (four pre-existing environmental failures:
      Windows fat-LTO, missing `nm`, catch_unwind/SEH, loop-align).
 
-128. Diamond-arm chain placement (`PLIRON_CHAINJOIN=1`, opt-in).
+128. Diamond-arm chain placement (default-on; `PLIRON_CHAINJOIN=0`
+     restores the in-count preference).
      `BCHAIN`'s fallthrough pick scores each successor by rank, then
      latch, then predecessor count — so a brif whose successors are
      `arm` + `join` (the join's other predecessor being the arm) picks

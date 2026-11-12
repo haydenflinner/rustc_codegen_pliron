@@ -249,7 +249,7 @@ impl BlockLoweringOrder {
             let mut best_succ = SecondaryMap::with_default(
                 crate::packed_option::PackedOption::<Block>::default(),
             );
-            // PLIRON (`PLIRON_CHAINJOIN=1`, opt-in): when two of a
+            // PLIRON (`PLIRON_CHAINJOIN=0` disables): when two of a
             // brif's successors form a diamond — the join's other
             // predecessor is the sibling arm — prefer the arm over the
             // join despite its lower in-count. Emitting `block, arm,
@@ -260,7 +260,7 @@ impl BlockLoweringOrder {
             // a `ja`+`jmp` per kept element in `iterw`.
             // Read per function so tests can toggle it within one
             // process.
-            let chainjoin = std::env::var("PLIRON_CHAINJOIN").as_deref() == Ok("1");
+            let chainjoin = std::env::var("PLIRON_CHAINJOIN").as_deref() != Ok("0");
             for &block in &rpo {
                 let range = block_succ_range[block].clone();
                 let mut pick: Option<Block> = None;
