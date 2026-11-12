@@ -857,12 +857,18 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let r = self.mk(|c| ICmpOp::new(c, p, a, b));
         // `x != null` for a later `assume` (rustc's `assume_nonnull`, e.g.
-        // building a `NonNull`): see `ne_null` and `assume`.
-        if matches!(op, IntNE) {
+        // building a `NonNull`): see `ne_null` and `assume`. `x == null`
+        // is recorded too — an `assume` of its `not` (`assume(!x.is_null())`)
+        // means the same.
+        if matches!(op, IntNE | IntEQ) {
             let zero = |v: Value| self.cx.const_to_opt_uint(v) == Some(0);
             let x = if zero(b) { Some(a) } else if zero(a) { Some(b) } else { None };
             if let (Some(x), Some(cop)) = (x, r.defining_op()) {
-                self.st.borrow_mut().ne_null.insert(cop, x);
+                if matches!(op, IntNE) {
+                    self.st.borrow_mut().ne_null.insert(cop, x);
+                } else {
+                    self.st.borrow_mut().eq_null.insert(cop, x);
+                }
             }
         }
         r

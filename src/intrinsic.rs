@@ -2,6 +2,7 @@
 
 use pliron::r#type::TypeHandle;
 use pliron::value::Value;
+use pliron_llvm::ops::XorOp;
 use rustc_abi::{Align, BackendRepr};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::IntPredicate;
@@ -516,16 +517,53 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         // win yet (the zip niche tests it was aimed at need a fact from
         // elsewhere; see docs/codegen-plan.md, facts service).
         if crate::env_is("PLIRON_ASSUMENN", "1")
-            && let Some(cop) = val.defining_op()
+            && let Some(vop) = val.defining_op()
         {
-            let x = self.st.borrow().ne_null.get(cop).copied();
+            // `assume(!x.is_null())` arrives as `assume(xor(icmp eq x,0),
+            // -1)`: peel the `not` so the compare lookup sees the `icmp`
+            // op itself.
+            let ctx = self.cx.pctx.borrow();
+            let mut cop = vop;
+            let mut peeled = false;
+            if pliron::operation::Operation::is_op::<XorOp>(vop, &ctx) {
+                let mut it = vop.deref(&ctx).operands(&ctx);
+                if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                    let ones = |v: Value| {
+                        self.cx.const_to_opt_uint(v).is_some_and(|k| {
+                            k == u64::MAX || (k + 1).is_power_of_two()
+                        })
+                    };
+                    let src = if ones(b) {
+                        Some(a)
+                    } else if ones(a) {
+                        Some(b)
+                    } else {
+                        None
+                    };
+                    if let Some(io) = src.and_then(|s| s.defining_op())
+                        && io.get_next(&ctx) == Some(vop)
+                    {
+                        cop = io;
+                        peeled = true;
+                    }
+                }
+            }
+            let st = self.st.borrow();
+            let x = if peeled {
+                st.eq_null.get(cop).copied()
+            } else {
+                st.ne_null.get(cop).copied()
+            };
+            drop(st);
             if let Some(x) = x
                 && let Some(xop) = x.defining_op()
             {
-                let adjacent = {
-                    let ctx = self.cx.pctx.borrow();
-                    cop.get_prev(&ctx) == Some(xop) && cop.get_next(&ctx).is_none()
-                };
+                let adjacent = cop.get_prev(&ctx) == Some(xop)
+                    && (if peeled {
+                        cop.get_next(&ctx) == Some(vop) && vop.get_next(&ctx).is_none()
+                    } else {
+                        cop.get_next(&ctx).is_none()
+                    });
                 if adjacent {
                     self.st.borrow_mut().nonnull.insert(xop);
                 }

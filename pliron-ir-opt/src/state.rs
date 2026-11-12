@@ -420,6 +420,9 @@ pub struct State {
     /// `icmp ne x, null` ops the builder made, with `x`: an `assume` of one
     /// marks `x` non-null when nothing separates the three.
     pub ne_null: ColMap<Ptr<Operation>, Value>,
+    /// `icmp eq x, null` ops the builder made, with `x`: an `assume` of
+    /// `not(<icmp>)` (`assume(!x.is_null())`) marks `x` non-null.
+    pub eq_null: ColMap<Ptr<Operation>, Value>,
     /// Entry params of local functions that point at frozen memory, with
     /// their dereferenceable size (see `FuncInfo::frozen`).
     pub frozen: ColMap<Value, u64>,
