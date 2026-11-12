@@ -1057,3 +1057,41 @@ aarch64 clif-check (SupportDisabled on Windows) — all pre-existing.
 Residual fib gap: the loop still pays `movl %ecx,%ecx` (uextend with
 upper bits not provably clean at the def) and a block-param move per
 trip — regalloc/value-cleanliness territory, not ABI.
+
+### tokenize: tiny-callee XCGU + what item-(2) turned out to be `80b1022`
+
+`PLIRON_XCGU_TINY` (default 8 MIR stmts, 0 disables): closures made
+entirely of <=N-stmt bodies don't spend the `ours.len()` copy cap. The
+`Split::next` machinery in tokenize had been copied + inlined all along,
+but `str::IsNotEmpty::call_mut` (size 3, the `!s.is_empty()` filter
+predicate) lost the cap lottery to BFS admission order — a non-inlined
+3-insn call plus TLS fetch per token. After the exemption the copy
+emits, the call *and* the TLS fetch vanish from the hot loop:
+**tokenize 4.87 -> 4.13 ms (~15%; ~1.77x -> ~1.50x LLVM)**.
+
+Post-inline disasm of the byte-scan loop (0x4c810-0x4c87b): the
+`Option<&str>` niche fold **fired** — `testq %rcx,%rcx` on a scalar
+pointer is the is_some test; the Option never reaches memory. So the
+PARITY "nonnull lost through stack slots" item is *mostly captured by
+inlining* for this kernel — mid-end enum scalarization would add
+nothing here. What remains per byte:
+
+- 3x `cmpq %r8,%r11` where one suffices — `icmp eq i,len` consumed by
+  `brif` + 2 clamp-`cmove`s; vcode emits a fresh `cmp` per consumer
+  even though no flag-writer intervenes. Fix = dead-flag-recompute
+  peephole (vcode flag-liveness: drop `cmp/test a,b` when the identical
+  flag state is live and operand vregs are unmodified). Bounded, gated,
+  x64; est. 2 insns/byte of ~13 in the scan loop. NOT yet implemented —
+  flag-liveness across movs needs care (must prove operand vregs
+  unwritten between the two cmps).
+- clamped-index `cmove` pairs (the `min(i,len)` checked-access idiom)
+  — structurally fine once the redundant cmps die.
+- loop-invariant spill/reload on the per-token path only (fine).
+
+fib residual (unchanged by XCGU work): `movl %ecx,%ecx` uextend whose
+upper bits aren't provably clean (Tail ABI can't assume clean i32
+upper bits on args/blockparams) + one block-param move per trip.
+Plausible direction: a cleanliness fixpoint over block params (all
+incoming edges clean-32 => param clean), gated; or make Tail i32 args
+guarantee clean upper bits as part of the conv (ABI contract — needs
+the same audit as TAILARGS).
