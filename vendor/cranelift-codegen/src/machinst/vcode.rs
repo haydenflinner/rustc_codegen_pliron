@@ -2731,24 +2731,16 @@ impl<I: VCodeInst> VCode<I> {
                     let Some((e, el, hl, inv, nedits)) = cand else {
                         break 'eh;
                     };
-                    // If E physically follows this block it sits in the
-                    // fallthrough slot: it must merge away (any stale
-                    // code there would run on the exit edge), which is
-                    // only possible when nobody else can reach its
-                    // label: a single CFG pred and no EDGEMERGE/BJALIAS
-                    // duplicates — those blocks' preds resolve through
-                    // E's label and would skip the shared moves
-                    // entirely (`canon_dups`, the selmul Option::fmt
-                    // miscompile).
-                    let adjacent = final_order.get(oi + 1) == Some(&e);
+                    // E can only stop emitting when nobody else can
+                    // reach its label: a single CFG pred (this block)
+                    // and no EDGEMERGE/BJALIAS duplicates — those
+                    // blocks' preds resolve through E's label and would
+                    // skip the shared moves entirely (`canon_dups`, the
+                    // selmul Option::fmt miscompile). Without the merge
+                    // E keeps its own slot — reachable for any other
+                    // preds, dead bytes otherwise.
                     let mergeable = self.block_preds(e).len() == 1
                         && canon_dups[e.index()].is_empty();
-                    if adjacent && !mergeable {
-                        if eh_trace {
-                            eprintln!("EH b{} e={:?}: multipred/dup adj", block.index(), e);
-                        }
-                        break 'eh;
-                    }
                     if eh_trace {
                         let mut pst = state.clone();
                         let edits_dbg: Vec<String> = regalloc
@@ -2802,7 +2794,7 @@ impl<I: VCodeInst> VCode<I> {
                     for (i, it) in t_items.iter().take(nedits).enumerate() {
                         items.insert(at + i, it.clone());
                     }
-                    if adjacent && mergeable {
+                    if mergeable {
                         merged[e.index()] = true;
                         buffer.alias_label(el, hl);
                     }
