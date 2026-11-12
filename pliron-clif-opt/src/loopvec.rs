@@ -275,6 +275,9 @@ struct Plan {
     /// (`rem == 0`), letting a post-tested loop use the full `iters & -K`
     /// vector count instead of leaving a forced scalar group.
     exit_bare: Option<Block>,
+    /// `PLIRON_VRANGE` — emit `band`ed range-check compare pairs as
+    /// `~((x < lo) | (x > hi))` with the sign flips explicit.
+    vrange: bool,
 }
 
 /// `v` as `coeff*iv + off`, with `off` lifted to an `Ins` expr over values
@@ -2479,6 +2482,7 @@ fn plan(
         rev_imm,
         iv_stream,
         exit_bare,
+        vrange: pliron_cfg::env_is("PLIRON_VRANGE", "1"),
     })
 }
 
@@ -2750,6 +2754,162 @@ fn sat_idiom(func: &Function, p: &Plan, args: [Value; 3]) -> Option<(Opcode, Val
     }
 }
 
+/// `band`'s operands as a closed-range keep mask `(x >= lo) & (x <= hi)`
+/// in any `ule`/`uge`/`sle`/`sge` spelling — `RangeInclusive::contains`
+/// in a `filter().count()`. Emitted naively each compare lowers alone on
+/// SSE2: a sign-flip const materialization, `pcmpgt`, and a `pcmpeqd` +
+/// `pxor` complement *per compare*, plus the `pand` join (~12 insts).
+/// The strict-out-of-range form `~((x < lo) | (x > hi))` shares `x`'s
+/// sign flip across both compares (one `pxor`), hoists the bounds'
+/// flips (they're invariant splats), and needs one complement total —
+/// LLVM's exact shape for this kernel. A `band(cmp, 1)` bool-mask
+/// wrapper on either term is seen through; the rewritten mask then
+/// takes a trailing `& 1` to preserve 0/1 lanes.
+/// One `band` term of a closed-range keep mask to its out-of-range
+/// readings: `ule(b,x)` keeps `x >= b` so `ult(x,b)` is out; `ule(x,b)`
+/// keeps `x <= b` so `ugt(x,b)` is out — and the `uge`/`sle`/`sge`
+/// spellings likewise. Both operand positions yield readings; the
+/// caller keeps the pair sharing one `x`. A `band(cmp, 1)` bool
+/// normalization wrapper is seen through and flags `n01` — the
+/// rewritten mask must then re-apply `& 1` for 0/1 lanes.
+fn range_term(
+    func: &Function,
+    v: Value,
+    outs: &mut Vec<(Value, Value, IntCC)>,
+    n01: &mut bool,
+) {
+    use IntCC::*;
+    let v = func.dfg.resolve_aliases(v);
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return;
+    };
+    let (cond, x, y) = match func.dfg.insts[i] {
+        InstructionData::IntCompare { cond, args, .. } => (
+            cond,
+            func.dfg.resolve_aliases(args[0]),
+            func.dfg.resolve_aliases(args[1]),
+        ),
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let (a, b) = (
+                func.dfg.resolve_aliases(args[0]),
+                func.dfg.resolve_aliases(args[1]),
+            );
+            let c = if iconst(func, a) == Some(1) {
+                b
+            } else if iconst(func, b) == Some(1) {
+                a
+            } else {
+                return;
+            };
+            *n01 = true;
+            return range_term(func, c, outs, n01);
+        }
+        _ => return,
+    };
+    let (lt, gt, le, ge) = match cond {
+        UnsignedLessThanOrEqual | UnsignedGreaterThanOrEqual => (
+            UnsignedLessThan,
+            UnsignedGreaterThan,
+            UnsignedLessThanOrEqual,
+            UnsignedGreaterThanOrEqual,
+        ),
+        SignedLessThanOrEqual | SignedGreaterThanOrEqual => (
+            SignedLessThan,
+            SignedGreaterThan,
+            SignedLessThanOrEqual,
+            SignedGreaterThanOrEqual,
+        ),
+        _ => return,
+    };
+    if cond == le {
+        outs.push((y, x, lt));
+        outs.push((x, y, gt));
+    } else if cond == ge {
+        outs.push((x, y, lt));
+        outs.push((y, x, gt));
+    }
+}
+
+fn range_pair(
+    pos: &mut FuncCursor,
+    p: &Plan,
+    vmap: &mut FxHashMap<Value, Value>,
+    splats: &mut FxHashMap<Value, Value>,
+    smemo: &mut FxHashMap<Value, Value>,
+    addrs: &[(Value, i64)],
+    a0: Value,
+    a1: Value,
+    depth: usize,
+    keep01: bool,
+) -> Option<Value> {
+    use IntCC::*;
+    let mut o0 = Vec::new();
+    let mut o1 = Vec::new();
+    let mut n01 = false;
+    range_term(pos.func, a0, &mut o0, &mut n01);
+    range_term(pos.func, a1, &mut o1, &mut n01);
+    // One `ult`/`slt` out-term and one `ugt`/`sgt`, same `x`, same
+    // signedness — that's `x ∈ [lo, hi]` (closed).
+    let ltish = |c: IntCC| matches!(c, UnsignedLessThan | SignedLessThan);
+    let ucc = |c: IntCC| matches!(c, UnsignedLessThan | UnsignedGreaterThan);
+    let (x, lo, hi, unsigned) = o0
+        .iter()
+        .flat_map(|&t0| {
+            o1.iter().filter_map(move |&t1| {
+                let ((x0, _, c0), (x1, _, c1)) = (t0, t1);
+                (x0 == x1 && ltish(c0) != ltish(c1) && ucc(c0) == ucc(c1)).then(|| {
+                    let ((x, lo, _), (_, hi, _)) = if ltish(c0) { (t0, t1) } else { (t1, t0) };
+                    (x, lo, hi, ucc(c0))
+                })
+            })
+        })
+        .next()?;
+    let xv = emit_val(pos, p, vmap, splats, smemo, addrs, x, depth + 1);
+    let lov = emit_val(pos, p, vmap, splats, smemo, addrs, lo, depth + 1);
+    let hiv = emit_val(pos, p, vmap, splats, smemo, addrs, hi, depth + 1);
+    let vt = pos.func.dfg.value_type(xv);
+    if !vt.is_vector()
+        || pos.func.dfg.value_type(lov) != vt
+        || pos.func.dfg.value_type(hiv) != vt
+    {
+        return None;
+    }
+    let (lt, gt, xv, lov, hiv) = if unsigned {
+        // `x <u b` ≡ `(x^S) <s (b^S)` — the bounds' bxors are
+        // invariant and hoist; `x`'s flip is shared by both compares.
+        let lane = vt.lane_type();
+        let sb = pos.ins().iconst(lane, -1i64 << (lane.bits() - 1));
+        let sv = pos.ins().splat(vt, sb);
+        (
+            SignedLessThan,
+            SignedGreaterThan,
+            pos.ins().bxor(xv, sv),
+            pos.ins().bxor(lov, sv),
+            pos.ins().bxor(hiv, sv),
+        )
+    } else {
+        (SignedLessThan, SignedGreaterThan, xv, lov, hiv)
+    };
+    let f1 = pos.ins().icmp(lt, xv, lov);
+    let f2 = pos.ins().icmp(gt, xv, hiv);
+    let o = pos.ins().bor(f1, f2);
+    let m = pos.ins().bnot(o);
+    Some(if n01 && keep01 {
+        // A `band(cmp, 1)` term was seen through: `band(band(i,1), j)`
+        // = `i & j & 1`, so the 0/-1 rewritten mask takes `& 1`.
+        // (`select`-intercepted calls pass `keep01: false` — a truth-
+        // tested `band(i,1)` term is the bare predicate there.)
+        let one = pos.ins().iconst(vt.lane_type(), 1);
+        let ones = pos.ins().splat(vt, one);
+        pos.ins().band(m, ones)
+    } else {
+        m
+    })
+}
+
 /// Emit `v`'s vector value in `vb`, recursively materializing producers:
 /// loop-local insts become lane-wise ops; invariants/constants are splatted.
 fn emit_val(
@@ -2844,39 +3004,51 @@ fn emit_val(
             emit_vload(pos, p, j, addrs, false)
         }
         InstructionData::Binary { opcode, args } => {
-            let a = m!(args[0]);
-            // Shift amounts stay scalar (Cranelift has no per-lane
-            // vector shift); everything else is lane-wise.
-            let b = if matches!(opcode, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr) {
-                emit_scalar(pos, p, smemo, args[1], 0)
+            if let Some(v2) = (opcode == Opcode::Band && p.vrange)
+                .then(|| {
+                    range_pair(
+                        pos, p, vmap, splats, smemo, addrs, args[0], args[1], depth, true,
+                    )
+                })
+                .flatten()
+            {
+                v2
             } else {
-                m!(args[1])
-            };
-            match opcode {
-                Opcode::Iadd => pos.ins().iadd(a, b),
-                Opcode::Isub => pos.ins().isub(a, b),
-                Opcode::Imul => pos.ins().imul(a, b),
-                Opcode::Band => pos.ins().band(a, b),
-                Opcode::Bor => pos.ins().bor(a, b),
-                Opcode::Bxor => pos.ins().bxor(a, b),
-                Opcode::Smin => pos.ins().smin(a, b),
-                Opcode::Smax => pos.ins().smax(a, b),
-                Opcode::Umin => pos.ins().umin(a, b),
-                Opcode::Umax => pos.ins().umax(a, b),
-                Opcode::Ishl => pos.ins().ishl(a, b),
-                Opcode::Ushr => pos.ins().ushr(a, b),
-                Opcode::Sshr => pos.ins().sshr(a, b),
-                // Lane-wise mulhi = widen+2×-imul+uzp2 (see divconst::mulhi)
-                // — the `x % k` magic-div sequences vectorize through it.
-                Opcode::Smulhi => crate::divconst::mulhi(pos, p.vt, true, a, b),
-                Opcode::Umulhi => crate::divconst::mulhi(pos, p.vt, false, a, b),
-                Opcode::Fadd => pos.ins().fadd(a, b),
-                Opcode::Fsub => pos.ins().fsub(a, b),
-                Opcode::Fmul => pos.ins().fmul(a, b),
-                Opcode::Fdiv => pos.ins().fdiv(a, b),
-                Opcode::Fmin => pos.ins().fmin(a, b),
-                Opcode::Fmax => pos.ins().fmax(a, b),
-                _ => unreachable!(),
+                let a = m!(args[0]);
+                // Shift amounts stay scalar (Cranelift has no per-lane
+                // vector shift); everything else is lane-wise.
+                let b = if matches!(opcode, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr) {
+                    emit_scalar(pos, p, smemo, args[1], 0)
+                } else {
+                    m!(args[1])
+                };
+                match opcode {
+                    Opcode::Iadd => pos.ins().iadd(a, b),
+                    Opcode::Isub => pos.ins().isub(a, b),
+                    Opcode::Imul => pos.ins().imul(a, b),
+                    Opcode::Band => pos.ins().band(a, b),
+                    Opcode::Bor => pos.ins().bor(a, b),
+                    Opcode::Bxor => pos.ins().bxor(a, b),
+                    Opcode::Smin => pos.ins().smin(a, b),
+                    Opcode::Smax => pos.ins().smax(a, b),
+                    Opcode::Umin => pos.ins().umin(a, b),
+                    Opcode::Umax => pos.ins().umax(a, b),
+                    Opcode::Ishl => pos.ins().ishl(a, b),
+                    Opcode::Ushr => pos.ins().ushr(a, b),
+                    Opcode::Sshr => pos.ins().sshr(a, b),
+                    // Lane-wise mulhi = widen+2×-imul+uzp2 (see
+                    // divconst::mulhi) — the `x % k` magic-div
+                    // sequences vectorize through it.
+                    Opcode::Smulhi => crate::divconst::mulhi(pos, p.vt, true, a, b),
+                    Opcode::Umulhi => crate::divconst::mulhi(pos, p.vt, false, a, b),
+                    Opcode::Fadd => pos.ins().fadd(a, b),
+                    Opcode::Fsub => pos.ins().fsub(a, b),
+                    Opcode::Fmul => pos.ins().fmul(a, b),
+                    Opcode::Fdiv => pos.ins().fdiv(a, b),
+                    Opcode::Fmin => pos.ins().fmin(a, b),
+                    Opcode::Fmax => pos.ins().fmax(a, b),
+                    _ => unreachable!(),
+                }
             }
         }
         InstructionData::Unary { opcode, arg } => {
@@ -2918,6 +3090,19 @@ fn emit_val(
                     pos.ins().usub_sat(a, b)
                 }
                 _ => {
+                    // `select(band(i1,1), i2, 0)` — the bool-tree AND:
+                    // the cond is truth-tested so a range pair here is
+                    // `i1 & i2` as a -1/0 mask (no `& 1` re-apply).
+                    if p.vrange
+                        && iconst(pos.func, args[2]) == Some(0)
+                        && let Some(v2) = range_pair(
+                            pos, p, vmap, splats, smemo, addrs, args[0], args[1], depth,
+                            false,
+                        )
+                    {
+                        vmap.insert(v, v2);
+                        return v2;
+                    }
                     let c = m!(args[0]);
                     let (x, y) = (m!(args[1]), m!(args[2]));
                     // Mask lanes are int-typed; bitselect needs the data type.
