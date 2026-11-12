@@ -2013,12 +2013,14 @@ impl<M: ABIMachineSpec> Callee<M> {
                         let ext = M::get_ext_mode(call_conv, extension);
                         // PLIRON: a register arg whose source already
                         // holds the zero-extended form (PLIRON_NARROWEXT
-                        // bit 512) needs no `uxtb`/`uxth`; stack slots
-                        // still widen so the outgoing slot's bytes are
-                        // fully defined.
+                        // bit 512; x64 extends this to i32 via
+                        // `PLIRON_ARGUEXT`) needs no `uxtb`/`uxth`/`movl`;
+                        // stack slots still widen so the outgoing slot's
+                        // bytes are fully defined. `skip_uext` is only
+                        // populated for widths the backend approved.
                         let clean = matches!(*slot, ABIArgSlot::Reg { .. })
                             && ext == ir::ArgumentExtension::Uext
-                            && ty_bits(ty) <= 16
+                            && ty_bits(ty) < word_bits
                             && skip_uext.get(idx).copied().unwrap_or(false);
                         let (vreg, ty) = if !clean
                             && ext != ir::ArgumentExtension::None

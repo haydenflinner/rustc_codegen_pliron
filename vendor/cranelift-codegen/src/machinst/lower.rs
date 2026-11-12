@@ -162,6 +162,14 @@ pub trait LowerBackend {
     fn narrow_arg_uext_clean(&self, _ctx: &mut Lower<Self::MInst>, _val: Value) -> bool {
         false
     }
+
+    /// PLIRON: widest integer call-arg width (in bits) that
+    /// `narrow_arg_uext_clean` may be consulted for. Default 16 (the
+    /// original narrow scope); x64 raises it to 32 because every
+    /// 32-bit-writing producer zero-extends the register for free.
+    fn arg_uext_skip_bits(&self) -> u32 {
+        16
+    }
 }
 
 /// Machine-independent lowering driver / machine-instruction container. Maintains a correspondence
@@ -759,10 +767,25 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let inst = self.cur_inst?;
         let mut multi: SmallVec<[Reg; 8]> = smallvec![];
         let mut tys: SmallVec<[(Reg, Value); 8]> = smallvec![];
+        // PLIRON (`PLIRON_ARGDIRECT=1`, opt-in): a value used only by
+        // this call dies at the call — its fixed-arg pin is free — so
+        // detach only on *direct* multi-use (`value_direct_uses`), not
+        // the transitive `Multiple` mark a multiply-used consumer's
+        // producer cone picks up: fib's `isub` arg is single-use but
+        // inherits `Multiple` via the accumulator the call result
+        // feeds, and the detach copy costs a `movl` per call. Read per
+        // call inst so tests can toggle it within one process.
+        let argdirect = std::env::var("PLIRON_ARGDIRECT").as_deref() == Ok("1");
         for &v in self.f.dfg.inst_args(inst) {
             let v = self.f.dfg.resolve_aliases(v);
             let multi_use = match self.f.dfg.value_def(v) {
-                ValueDef::Result(..) => self.value_ir_uses[v] == ValueUseState::Multiple,
+                ValueDef::Result(..) => {
+                    if argdirect {
+                        self.value_direct_uses[v] > 1
+                    } else {
+                        self.value_ir_uses[v] == ValueUseState::Multiple
+                    }
+                }
                 // Block params are live from the block start: detach them
                 // too (as `ret_detach` does).
                 ValueDef::Param(..) => true,
@@ -893,6 +916,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     pub(crate) fn call_arg_uext_skips(
         &mut self,
         args: &[ValueRegs<Reg>],
+        max_bits: u32,
         uext_clean: &mut dyn FnMut(&mut Self, Value) -> bool,
     ) -> Option<Vec<bool>> {
         let inst = self.cur_inst?;
@@ -900,7 +924,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         for &v in self.f.dfg.inst_args(inst) {
             let v = self.f.dfg.resolve_aliases(v);
             let ty = self.f.dfg.value_type(v);
-            if ty.is_int() && ty.bits() <= 16 {
+            if ty.is_int() && ty.bits() <= max_bits {
                 for &r in self.value_regs[v].regs() {
                     by_reg.insert(r, v);
                 }

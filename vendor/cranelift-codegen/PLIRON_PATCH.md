@@ -1760,3 +1760,43 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `pliron-clif-opt/tests/x64_flagdup.rs`
     (`edge_cc_folds_cmov`, `multi_pred_keeps_cmov`) and the
     `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.
+
+126. Call-arg zero-extension skipping for i32 (`PLIRON_ARGUEXT=1`,
+     opt-in). The shared `skip_uext` machinery queried
+     `narrow_arg_uext_clean` only for i8/i16 call operands; a new
+     `LowerBackend::arg_uext_skip_bits` (default 16) lets x64 raise the
+     cap to 32, and `call_arg_uext_skips` takes the max as a parameter.
+     x64's `narrow_arg_uext_clean` answers with `arg_uext_clean32`: an
+     i32 operand is "clean" when its register already holds the
+     zero-extended form, which every 32-bit-writing producer gives for
+     free on x86-64. `clean32` walks the producer cone (budget 8):
+     passthroughs (`ireduce` of a dirty i64, `copy`/`black_box`
+     aliases, blockparams, call results without `uext` on the return
+     slot) are dirty, everything else writes a 32-bit GPR.
+     `clean_upper32` answers the i64 side for `ireduce` sources
+     (`iconst <= u32::MAX`, `uextend` of <=i32, `uload32`, `band` with
+     one clean half, `bor`/`bxor` with both, `ushr` by >=32). The
+     `clean` gate in `machinst/abi.rs` widened `ty_bits <= 16` to
+     `< word_bits` — the skip list itself is now the width gate. No
+     observed wins on the corpus yet (our own signatures don't mark
+     u32 args `uext`); kept opt-in for extern-ABIs that do.
+
+127. Call-arg detach on direct uses only (`PLIRON_ARGDIRECT=1`,
+     opt-in). `arg_detach` copied any arg whose
+     `value_ir_uses == Multiple` into a fresh vreg so the ABI's
+     fixed-register use doesn't pin the value's whole bundle. But
+     `value_ir_uses` propagates `Multiple` transitively through the
+     producer cone of a multiply-used value — a call *result* that
+     feeds a multi-used accumulator back-marks the call's args — so
+     single-use args were detached too, costing a `mov` per call
+     (fib's `leal -1(%r12), %eax; movl %eax, %ecx; call`). A value
+     used only by this call dies at the call; pinning it to the arg
+     register is free, so the copy is pure waste. ARGDIRECT gates the
+     `ValueDef::Result` case on `value_direct_uses[v] > 1` (the
+     non-transitive map) — block params still always detach. Read per
+     call inst so tests can toggle within one process. Fib's
+     recursive loop now matches LLVM's shape exactly
+     (`leal -0x1(%r12), %ecx; call`). Regression:
+     `pliron-clif-opt/tests/x64_argdirect.rs`; gate clean with
+     `PLIRON_ARGDIRECT=1` (four pre-existing environmental failures:
+     Windows fat-LTO, missing `nm`, catch_unwind/SEH, loop-align).

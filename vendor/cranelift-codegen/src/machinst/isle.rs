@@ -667,22 +667,22 @@ macro_rules! isle_lower_prelude_methods {
 
         fn gen_call_args(&mut self, sig: Sig, inputs: &ValueRegsVec) -> CallArgList {
             let backend = self.backend;
-            let skip = self
-                .lower_ctx
-                .call_arg_uext_skips(inputs, &mut |ctx, v| {
-                    backend.narrow_arg_uext_clean(ctx, v)
-                });
+            let skip = self.lower_ctx.call_arg_uext_skips(
+                inputs,
+                backend.arg_uext_skip_bits(),
+                &mut |ctx, v| backend.narrow_arg_uext_clean(ctx, v),
+            );
             self.lower_ctx
                 .gen_call_args(sig, inputs, skip.as_deref().unwrap_or(&[]))
         }
 
         fn gen_return_call_args(&mut self, sig: Sig, inputs: &ValueRegsVec) -> CallArgList {
             let backend = self.backend;
-            let skip = self
-                .lower_ctx
-                .call_arg_uext_skips(inputs, &mut |ctx, v| {
-                    backend.narrow_arg_uext_clean(ctx, v)
-                });
+            let skip = self.lower_ctx.call_arg_uext_skips(
+                inputs,
+                backend.arg_uext_skip_bits(),
+                &mut |ctx, v| backend.narrow_arg_uext_clean(ctx, v),
+            );
             self.lower_ctx
                 .gen_return_call_args(sig, inputs, skip.as_deref().unwrap_or(&[]))
         }

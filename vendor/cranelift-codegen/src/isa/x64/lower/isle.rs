@@ -2283,3 +2283,136 @@ const I8X16_USHR_MASKS: [u8; 128] = [
     0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
 ];
+
+/// PLIRON (`PLIRON_ARGUEXT=1`, opt-in): enable the i32 call-arg
+/// `uext` skip (`narrow_arg_uext_clean` / `arg_uext_skip_bits`).
+pub(crate) fn arguext_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ARGUEXT").as_deref() == Ok("1"))
+}
+
+/// PLIRON (`PLIRON_ARGUEXT=1`): is the register of `v` (an i32 call
+/// operand) already zero-extended through all 64 bits? Almost every
+/// i32-typed CLIF result lowers to an x64 instruction that writes a
+/// 32-bit GPR, and every 32-bit GPR write zero-extends the upper half
+/// for free — so the dirty producers are the passthroughs (`ireduce`
+/// of a wider value, `copy`/`black_box` aliases), blockparams, and
+/// call results whose return slot doesn't declare `uext`.
+pub(crate) fn arg_uext_clean32(lctx: &Lower<'_, MInst>, v: Value) -> bool {
+    let dfg = lctx.dfg();
+    let ty = dfg.value_type(v);
+    ty.bits() == 32 && clean32(dfg, v, &mut 8)
+}
+
+fn clean32(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let v = dfg.resolve_aliases(v);
+    let crate::ir::ValueDef::Result(inst, num) = dfg.value_def(v) else {
+        // Blockparams and unions can carry dirty upper bits.
+        return false;
+    };
+    match &dfg.insts[inst] {
+        // `black_box` is a passthrough: keeps the source's cleanliness.
+        InstructionData::Unary {
+            opcode: Opcode::BlackBox,
+            arg,
+        } => clean32(dfg, *arg, budget),
+        // `ireduce` keeps the wide register: clean only when the wide
+        // source's upper half is already zero.
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => clean_upper32(dfg, *arg, budget),
+        // A call result is clean only when this return slot's ABI
+        // declares unsigned extension (`call_signature` covers
+        // `call`, `call_indirect`, and the `try_call` pair).
+        InstructionData::Call { .. }
+        | InstructionData::CallIndirect { .. }
+        | InstructionData::TryCall { .. }
+        | InstructionData::TryCallIndirect { .. } => dfg
+            .call_signature(inst)
+            .and_then(|sig| dfg.signatures[sig].returns.get(num))
+            .map(|p| p.extension == crate::ir::ArgumentExtension::Uext)
+            .unwrap_or(false),
+        // Every other i32 result lowers to a 32-bit-writing inst, and
+        // a 32-bit dest write zero-extends to 64 bits on x64.
+        _ => true,
+    }
+}
+
+/// PLIRON: is `v` (an i64 value) zero through bit 32 — i.e. does its
+/// register already hold a `uext` 32->64 value? Used for `ireduce`
+/// sources; bounded by the same budget as `clean32`.
+fn clean_upper32(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let v = dfg.resolve_aliases(v);
+    let bits = dfg.value_type(v).bits();
+    if bits == 32 {
+        return clean32(dfg, v, budget);
+    }
+    if bits != 64 {
+        return false;
+    }
+    let crate::ir::ValueDef::Result(inst, _) = dfg.value_def(v) else {
+        return false;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) <= u32::MAX as u64,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => dfg.value_type(*arg).bits() <= 32,
+        InstructionData::Unary {
+            opcode: Opcode::BlackBox | Opcode::Ireduce,
+            arg,
+        } => clean_upper32(dfg, *arg, budget),
+        InstructionData::Load {
+            opcode: Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32,
+            ..
+        } => true,
+        // `x & m` is clean when either operand is: a canonical
+        // `band x, 0xffffffff` or a nested clean value both work.
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let [a, b] = *args;
+            clean_upper32(dfg, a, budget) || clean_upper32(dfg, b, budget)
+        }
+        // `x | y` / `x ^ y` need both halves clean.
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            let [a, b] = *args;
+            clean_upper32(dfg, a, budget) && clean_upper32(dfg, b, budget)
+        }
+        // `x >> k` with k >= 32 leaves at most 32 live bits.
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args,
+        } => {
+            let [_, k] = *args;
+            match dfg.value_def(k) {
+                crate::ir::ValueDef::Result(inst, _) => match &dfg.insts[inst] {
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } => (imm.bits() as u64) >= 32,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
