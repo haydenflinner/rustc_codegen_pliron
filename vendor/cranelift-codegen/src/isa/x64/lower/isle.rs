@@ -554,6 +554,44 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         mul_lea_shift(c)
     }
 
+    /// pliron: `iadd x, K` as an amode operand. Under
+    /// `PLIRON_X64_SUAMODE=1` the `to_amode_add` displacement fold
+    /// fires only when the sum has ≤1 direct use — a multi-use result
+    /// is materialized anyway for its other consumers, and folding
+    /// then keeps `x` live alongside it (parse's digit adds: folded
+    /// `lea -0x30(char, acc*2)` kept `char` live across the range
+    /// check → spills; `lea (digit, acc*2)` frees it). Off =
+    /// unconditional fold (stock). Returns `(x, K)`.
+    fn pliron_iadd_su_iconst(&mut self, v: Value) -> Option<(Value, i64)> {
+        let v = self.lower_ctx.dfg().resolve_aliases(v);
+        let inst = self.lower_ctx.dfg().value_def(v).inst()?;
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } = self.lower_ctx.dfg().insts[inst]
+        else {
+            return None;
+        };
+        if su_amode_enabled() && !self.lower_ctx.value_single_direct_use(v) {
+            return None;
+        }
+        for i in 0..2 {
+            let kv = self.lower_ctx.dfg().resolve_aliases(args[1 - i]);
+            let Some(d) = self.lower_ctx.dfg().value_def(kv).inst() else {
+                continue;
+            };
+            if let InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } = self.lower_ctx.dfg().insts[d]
+            {
+                let x = self.lower_ctx.dfg().resolve_aliases(args[i]);
+                return Some((x, imm.bits()));
+            }
+        }
+        None
+    }
+
     #[inline]
     fn use_popcnt(&mut self) -> bool {
         self.backend.x64_flags.has_popcnt() && self.backend.x64_flags.has_sse42()
@@ -2443,6 +2481,14 @@ fn mul_lea_shift(c: u64) -> Option<u8> {
             9 => Some(3u8),
             _ => None,
         })?
+}
+
+/// PLIRON (`PLIRON_X64_SUAMODE`, opt-in): `pliron_iadd_su_iconst`
+/// requires the folded `iadd x, K` to have ≤1 direct use. Off = the
+/// stock unconditional displacement fold.
+fn su_amode_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_X64_SUAMODE").as_deref() == Ok("1"))
 }
 
 

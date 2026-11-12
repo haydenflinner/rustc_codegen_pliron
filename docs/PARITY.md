@@ -342,7 +342,13 @@ in the scoreboard and in the linked history files.
   than LLVM — `VRANGE` fuses the `(lo..=hi).contains` keep mask into
   `~((x<lo)|(x>hi))` with one shared sign flip and invariant bound
   flips, ~6 insts/lane group vs ~12 with per-bound remats; ~3.0 →
-  ~1.6 ms vs LLVM ~2.5).
+  ~1.6 ms vs LLVM ~2.5); `parse_only` ~283 → ~270 ms vs LLVM ~280
+  (`IMULEA`: `x·d`/`x·d·2^k` → `lea` + consumer-amode `ishl` fold —
+  `acc·10+d` is two `leal`s — plus opt-in `SUAMODE`: `to_amode_add`
+  only folds `iadd x,K` into the displacement when the sum has ≤1
+  direct use, so `digit = char-0x30` materializes once for its
+  range-check + accumulator uses and `char`'s live range dies —
+  LLVM's exact digit-loop shape; still opt-in pending corpus sweep).
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and
   narrow where LLVM keeps packed ops); x86-64 not run.
   [`cubecl-burn.md`](cubecl-burn.md#what-is-next).

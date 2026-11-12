@@ -568,17 +568,24 @@
 (rule to_amode_add_const_lhs 2 (to_amode_add flags (i32_from_iconst c) x offset)
         (if-let sum (i32_checked_add offset c))
         (amode_imm_reg flags x sum))
-(rule to_amode_add_const_fold_iadd_lhs_rhs 3 (to_amode_add flags (iadd _ x (i32_from_iconst c)) y offset)
-        (if-let sum (i32_checked_add offset c))
+;; PLIRON (`PLIRON_X64_SUAMODE`, opt-in): the extractor matches the
+;; same `iadd x, K` in either operand order the stock four rules
+;; covered, plus a use-count gate — fold `K` into the displacement
+;; only when the sum has ≤1 direct use. A multi-use sum is
+;; materialized anyway for its other consumers; folding then keeps
+;; `x` live alongside the sum (parse's digit adds: folded
+;; `lea -0x30(char, acc*2)` kept `char` live across the range check →
+;; spills; `lea (digit, acc*2)` frees it). With the env off the
+;; extractor ignores use counts — identical to the stock rules.
+(decl pure pliron_iadd_su_iconst (Value i64) Value)
+(extern extractor pliron_iadd_su_iconst pliron_iadd_su_iconst)
+(rule to_amode_add_const_fold_iadd_lhs 3 (to_amode_add flags (pliron_iadd_su_iconst x c) y offset)
+        (if-let k (i64_try_into_i32 c))
+        (if-let sum (i32_checked_add offset k))
         (amode_imm_reg_reg_shift flags x y sum))
-(rule to_amode_add_const_fold_iadd_lhs_lhs 4 (to_amode_add flags (iadd _ (i32_from_iconst c) x) y offset)
-        (if-let sum (i32_checked_add offset c))
-        (amode_imm_reg_reg_shift flags x y sum))
-(rule to_amode_add_const_fold_iadd_rhs_rhs 5 (to_amode_add flags x (iadd _ y (i32_from_iconst c)) offset)
-        (if-let sum (i32_checked_add offset c))
-        (amode_imm_reg_reg_shift flags x y sum))
-(rule to_amode_add_const_fold_iadd_rhs_lhs 6 (to_amode_add flags x (iadd _ (i32_from_iconst c) y) offset)
-        (if-let sum (i32_checked_add offset c))
+(rule to_amode_add_const_fold_iadd_rhs 4 (to_amode_add flags x (pliron_iadd_su_iconst y c) offset)
+        (if-let k (i64_try_into_i32 c))
+        (if-let sum (i32_checked_add offset k))
         (amode_imm_reg_reg_shift flags x y sum))
 
 ;; Final cases of amode lowering. Does not hunt for constants and only attempts

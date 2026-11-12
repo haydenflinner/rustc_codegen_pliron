@@ -2280,6 +2280,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.value_ir_uses[val] == ValueUseState::Multiple
     }
 
+    /// PLIRON: is `val` used by at most one instruction
+    /// (`value_direct_uses`, the non-transitive map)? Amode
+    /// displacement folds decompose a producer `iadd x, K` into
+    /// `[x, K]` pieces — profitable only when `x` has no other
+    /// consumers, since a multi-use result is materialized anyway and
+    /// the fold then keeps `x` live alongside it.
+    pub fn value_single_direct_use(&self, val: Value) -> bool {
+        self.value_direct_uses[self.f.dfg.resolve_aliases(val)] <= 1
+    }
+
     /// PLIRON: may a multi-use `iadd` `val` stay whole in an amode?
     /// Sharing is free when the sum is genuinely needed as a value
     /// (at least one non-address use — e.g. a loop-carried pointer).

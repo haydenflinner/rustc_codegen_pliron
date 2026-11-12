@@ -1843,3 +1843,24 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      `Amode.ImmRegRegShift(0, x, x, log2(d-1))`. Multi-use or
      non-`iadd`-fed `d·2^k` products keep `imul`. Regression:
      `pliron-clif-opt/tests/x64_mulea.rs`.
+
+130. Single-use gate on the `iadd x, K` displacement fold (opt-in;
+     `PLIRON_X64_SUAMODE=1`, unset/`0` = stock unconditional fold).
+     `to_amode_add_const_fold_iadd_*` folded a constant `iadd`
+     operand into the lea/load displacement regardless of how many
+     uses the sum had. When the sum feeds something else too it is
+     materialized regardless, and the fold then keeps the *addend*
+     live next to the materialized result — `parse::<u32>`'s
+     `char - 0x30` is used by the digit range check and by
+     `acc*10 + digit`, and the folded `leal -0x30(char, acc*2)`
+     kept the raw char live across the check (extra live range in
+     an unrolled loop; ~283ms vs ~270ms on the parse bench). The
+     stock four rules are replaced by two using the
+     `pliron_iadd_su_iconst` extractor (pure, both operand orders):
+     under the gate it declines when `value_single_direct_use` is
+     false, so the sum materializes and the lea reads its register
+     — `leal -0x30(%rdx), %r10d` + `cmpl` + `leal (%r10,%rdx,2)`,
+     LLVM's exact shape. The use count is `value_direct_uses`
+     (direct, not the transitive `value_ir_uses`). New accessor:
+     `Lower::value_single_direct_use` (machinst/lower.rs).
+     Regression: `pliron-clif-opt/tests/x64_suamode.rs` (+ `_off`).
