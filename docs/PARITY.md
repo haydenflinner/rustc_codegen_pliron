@@ -334,6 +334,13 @@ in the scoreboard and in the linked history files.
   `assume(!ptr.is_null())`'s `xor`-peeled form, killing the
   `Option<&u8>` niche `testq/je` per byte; plus `bt` lowering for the
   whitespace table probe through `ireduce`/`band-63` index masks);
+  `tokenize` re-measured ~1.4x before `EDGESEL` (the earlier ~0.91
+  build predates later churn — measured on this box's exact kernel:
+  `split_whitespace().count()` ×10 over a 400 KB string), then
+  ~**0.93** (faster than LLVM — `EDGESEL` folds
+  `select c`/`brif c` under the edge condition that pins it: chars'
+  `next().unwrap_or(0)` clamps emitted a dup `cmp` + 2 `cmov` per
+  ASCII byte, ~3.8 → ~2.5 ms vs LLVM ~2.7);
   `fib` ~**1.05** with the exact LLVM loop shape (`ARGDIRECT`: a
   call-arg copy died once `arg_detach` stopped firing on transitive
   `Multiple`); `iterw` ~**1.0** (`CHAINJOIN` places a diamond's arm

@@ -1,4 +1,5 @@
-//! Edge-conditioned select/branch fold (`PLIRON_EDGESEL`).
+//! Edge-conditioned select/branch fold (`PLIRON_EDGESEL`, default-on;
+//! `=0` disables).
 //!
 //! On `brif c`'s then-edge `c != 0` and on its else-edge `c == 0`, so
 //! a `select c, t, e` in the target picks a fixed arm. `str::chars`'s

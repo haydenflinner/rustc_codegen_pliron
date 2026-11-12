@@ -5157,7 +5157,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // pins `c` (chars' `next().unwrap_or(0)` address/cursor clamps
         // -> dup `cmp` + `cmov` per tokenize char). Late: the clamps
         // ride along unchanged through every earlier transform.
-        step("edgesel", "edgesel", Gate::OptIn("PLIRON_EDGESEL"), s_edgesel)
+        step("edgesel", "edgesel", Gate::Env("PLIRON_EDGESEL"), s_edgesel)
             .needs(shape::CONDBR),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
