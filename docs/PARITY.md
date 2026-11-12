@@ -323,9 +323,10 @@ in the scoreboard and in the linked history files.
   Check deltas with `bench/layout.sh` and `run.mjs --layouts=N` before
   acting on them.
 - **x86-64** was re-measured 2026-11 on Windows (i7, msvc): native
-  geomean ~1.09 (`tokenize` 1.85, `fib` 1.43, `iterw` 1.37 worst),
-  wasm ~1.01, STK **1.269** after the Tail-conv xmm8-15 callee-save fix
-  (`PLIRON_X64_TAILXMM`; was 1.556 after honest `__chkstk`/probe
+  geomean ~1.09 (`tokenize` ~1.77, `fib` 1.35, `iterw` 1.37 worst),
+  wasm ~1.01, STK **1.218** after the Tail-conv Windows ABI fixes
+  (`PLIRON_X64_TAILXMM` xmm callee-saves + `PLIRON_X64_TAILARGS`
+  fastcall-lane args; was 1.556 after honest `__chkstk`/probe
   accounting). Session log: `history/x64-notes.md` "Windows x64
   session".
 - **CubeCL kernels**: f16 GEMM is the largest gap (per-leaf widen and

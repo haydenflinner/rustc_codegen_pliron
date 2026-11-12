@@ -1036,3 +1036,24 @@ fat-LTO unsupported — no relocatable link flavor), `xcguhome` (`nm`
 missing; toolchain ships `llvm-nm`), `edgemerge`/`loopalign` (diffs
 identical with knobs on/off). `corpus:syn`, `pgo`, `cmp3`, `fuzzreg`
 green.
+
+### Tail-conv fastcall-lane args `c02cb98` (`PLIRON_X64_TAILARGS`, default on)
+
+Continuation of the Tail xmm fix: stock `Tail` maps args SysV-style
+(rdi,rsi,rdx,rcx,r8,r9 / xmm0-7 per class), so every WindowsFastcall
+caller shuffled its rcx,rdx,r8,r9 args at each internal call — fib's
+recursive loop paid `leal -1(%rsi),%ecx; movl %ecx,%edi` where LLVM
+writes the arg straight into ecx. Now Tail args take the fastcall lanes
+by absolute position (rcx,rdx,r8,r9 then rsi,rdi; xmm0-3 then xmm4/5),
+verified on a mixed 7-arg signature incl. the stack spillover and
+`retq $0x10` callee-pop. Float args/rets capped at xmm5, so xmm6/7 join
+the callee-save set; `TAIL_WINDOWS_ARGS_CLOBBERS` = SysV \ xmm6-15.
+`tail_winargs()` requires `tail_winxmm()` — TAILXMM=0 restores the old
+ABI wholesale. Results: fib 33.7 -> 31.4 s (LLVM 23.25; **1.45 ->
+1.35**), `translate` 2024 -> 1992 B, STK **1.269 -> 1.218**. Gate: same
+4 environmental FAILs plus `unit`/`jt_backedge_stale` which needs an
+aarch64 clif-check (SupportDisabled on Windows) — all pre-existing.
+
+Residual fib gap: the loop still pays `movl %ecx,%ecx` (uextend with
+upper bits not provably clean at the def) and a block-param move per
+trip — regalloc/value-cleanliness territory, not ABI.
