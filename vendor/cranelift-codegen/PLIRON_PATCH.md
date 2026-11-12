@@ -1823,8 +1823,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      one process. Regression:
      `pliron-clif-opt/tests/x64_chainjoin.rs`.
 
-129. Small-multiplier `lea` for `imul x, d` (opt-in;
-     `PLIRON_X64_IMULEA=1`). LLVM strength-reduces `x·d` for
+129. Small-multiplier `lea` for `imul x, d` (default-on;
+     `PLIRON_X64_IMULEA=0` keeps `imul`). LLVM strength-reduces `x·d` for
      `d ∈ {3,5,9}` to `lea (x, x·(d-1))` — 1c vs `imul`'s 3c, one
      inst. The `·2^k` tail of `d·2^k` multipliers is NOT handled
      here: emitting `lea` + `shl` for `x·(d·2^k)` measured slower

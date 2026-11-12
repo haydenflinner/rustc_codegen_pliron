@@ -1254,7 +1254,8 @@
 (rule -3 (lower (imul (ty_int_ref_16_to_64 ty) (i32_from_iconst x) y))
          (x64_imul_imm ty y x))
 
-;; PLIRON (`PLIRON_X64_IMULEA`, opt-in): `x·d` for `d ∈ {3,5,9}` lowers
+;; PLIRON (`PLIRON_X64_IMULEA`, default-on; `=0` keeps `imul`):
+;; `x·d` for `d ∈ {3,5,9}` lowers
 ;; to one `lea (x, x·(d-1))` — 1c vs `imul`'s 3c. The `·2^k` factors
 ;; are split off upstream by clifpeep into an `ishl` that folds into a
 ;; consuming `iadd`'s amode (`base + idx<<k`), so a `x·(d·2^k)` here is

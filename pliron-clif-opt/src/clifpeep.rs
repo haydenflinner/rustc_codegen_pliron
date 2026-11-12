@@ -9944,7 +9944,7 @@ fn post_sweep(func: &mut Function, x64: bool) -> usize {
             n += 1;
         }
     }
-    if x64 && pliron_cfg::env_is("PLIRON_X64_IMULEA", "1") {
+    if x64 && crate::pass_enabled("PLIRON_X64_IMULEA") {
         n += mulea_sweep(func);
     }
     if crate::pass_enabled("PLIRON_BITMERGE") {

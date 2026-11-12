@@ -1,4 +1,5 @@
-//! `PLIRON_X64_IMULEA` (opt-in): `imul x, d·2^k` (d ∈ {3,5,9},
+//! `PLIRON_X64_IMULEA` (default-on; `=0` keeps `imul`):
+//! `imul x, d·2^k` (d ∈ {3,5,9},
 //! k ∈ 1..=3) splits into `imul x, d` + `ishl …, k` in `post_sweep`
 //! (`mulea_sweep`) — the `ishl` folds into a consuming `iadd`'s x64
 //! amode as `base + idx<<k`, while `imul x, d` itself lowers to one

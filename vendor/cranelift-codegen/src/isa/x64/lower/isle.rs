@@ -2428,10 +2428,11 @@ fn clean_upper32(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> 
 /// small-multiply form. The `·2^k` tail of `d·2^k` multipliers is
 /// split off upstream (clifpeep `mulea_sweep`) into an `ishl` that
 /// folds into a consuming `iadd`'s amode. Returns `log2(d-1)` — the
-/// amode shift — when `c` is such a `d`. Opt-in: `PLIRON_X64_IMULEA=1`.
+/// amode shift — when `c` is such a `d`. Default-on;
+/// `PLIRON_X64_IMULEA=0` keeps `imul`.
 pub(crate) fn imulea_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_X64_IMULEA").as_deref() == Ok("1"))
+    *ON.get_or_init(|| !matches!(std::env::var("PLIRON_X64_IMULEA").as_deref(), Ok("0")))
 }
 
 fn mul_lea_shift(c: u64) -> Option<u8> {
