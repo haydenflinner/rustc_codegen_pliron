@@ -827,6 +827,16 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     // emit the cap bounds. Charging them let one big exempted closure
     // (std `visit_seq`, size 110) evict small copies like postcard's
     // `take_from_bytes` (`cap: 224 + 1 > 224`).
+    //
+    // `PLIRON_XCGU_TINY` (default 8 MIR stmts, `=0` disables): closures
+    // made entirely of <=N-stmt bodies don't spend the cap either. A
+    // 3-stmt predicate like `IsNotEmpty::call_mut` costs ~nothing to
+    // copy and optimize, but the cap's arbitrary admission order
+    // evicted it (`cap: 190 + 2 > 190`), leaving a real call in
+    // tokenize's per-token path.
+    let tiny_max = crate::env_get("PLIRON_XCGU_TINY")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8usize);
     let mut charged = 0usize;
     for &c in &candidates {
         let m = MonoItem::Fn(c);
@@ -873,7 +883,12 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 _ => true,
             })
             .count();
-        if coverable && charged + cost <= cap {
+        let tiny = tiny_max > 0
+            && closure.iter().all(|n| match n {
+                MonoItem::Fn(inst) => tcx.size_estimate(*inst) <= tiny_max,
+                _ => false,
+            });
+        if coverable && (tiny || charged + cost <= cap) {
             if let Some(w) = &why
                 && with_no_trimmed_paths!(c.to_string()).contains(*w)
                 && pliron_cfg::tracing_on()
