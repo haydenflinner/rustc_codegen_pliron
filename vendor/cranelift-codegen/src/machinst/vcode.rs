@@ -2595,7 +2595,7 @@ impl<I: VCodeInst> VCode<I> {
             let eh_trace = *EH_TRACE
                 .get_or_init(|| std::env::var("PLIRON_EH_TRACE").is_ok());
             if *EDGEHOIST
-                .get_or_init(|| std::env::var("PLIRON_EDGEHOIST").as_deref() == Ok("1"))
+                .get_or_init(|| pliron_mode("PLIRON_EDGEHOIST", 1) != 0)
                 && EH_FN
                     .get_or_init(|| std::env::var("PLIRON_EH_FN").ok())
                     .as_deref()
@@ -2794,7 +2794,10 @@ impl<I: VCodeInst> VCode<I> {
                     for (i, it) in t_items.iter().take(nedits).enumerate() {
                         items.insert(at + i, it.clone());
                     }
-                    if mergeable {
+                    // Only merge E out while its label is still
+                    // unbound — an earlier-emitted E already wrote its
+                    // bytes (`alias_label` ICEs on a bound label).
+                    if mergeable && order_pos[e.index()] > oi {
                         merged[e.index()] = true;
                         buffer.alias_label(el, hl);
                     }
