@@ -1,5 +1,5 @@
 //! x64 `to_amode_add`: an `iadd x, K` operand folds `K` into the
-//! lea/load displacement. Under `PLIRON_X64_SUAMODE=1` (opt-in) the
+//! lea/load displacement. Under `PLIRON_X64_SUAMODE` (default-on) the
 //! fold is restricted to sums with <=1 direct use — a multi-use sum
 //! is materialized anyway for its other consumers, and folding then
 //! keeps `x` live alongside it (parse's digit adds: folded

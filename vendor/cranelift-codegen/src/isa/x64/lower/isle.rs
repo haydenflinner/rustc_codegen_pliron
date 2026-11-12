@@ -2483,12 +2483,12 @@ fn mul_lea_shift(c: u64) -> Option<u8> {
         })?
 }
 
-/// PLIRON (`PLIRON_X64_SUAMODE`, opt-in): `pliron_iadd_su_iconst`
-/// requires the folded `iadd x, K` to have ≤1 direct use. Off = the
+/// PLIRON (`PLIRON_X64_SUAMODE`, default-on): `pliron_iadd_su_iconst`
+/// requires the folded `iadd x, K` to have ≤1 direct use. `=0` = the
 /// stock unconditional displacement fold.
 fn su_amode_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_X64_SUAMODE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| !matches!(std::env::var("PLIRON_X64_SUAMODE").as_deref(), Ok("0")))
 }
 
 

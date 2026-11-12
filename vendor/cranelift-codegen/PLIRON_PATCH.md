@@ -1844,8 +1844,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      non-`iadd`-fed `d·2^k` products keep `imul`. Regression:
      `pliron-clif-opt/tests/x64_mulea.rs`.
 
-130. Single-use gate on the `iadd x, K` displacement fold (opt-in;
-     `PLIRON_X64_SUAMODE=1`, unset/`0` = stock unconditional fold).
+130. Single-use gate on the `iadd x, K` displacement fold
+     (default-on; `PLIRON_X64_SUAMODE=0` = stock unconditional fold).
      `to_amode_add_const_fold_iadd_*` folded a constant `iadd`
      operand into the lea/load displacement regardless of how many
      uses the sum had. When the sum feeds something else too it is
