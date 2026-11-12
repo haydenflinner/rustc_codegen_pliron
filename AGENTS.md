@@ -309,6 +309,18 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_SLOTPROM_EXT=0` — slotprom whole-slot call coverage, i.e.
   revert extent-limited syncs (`nocap` carries per-operand byte
   extents from `arg_extent`).
+- `PLIRON_RA2_POSTOPT=<bits>` (opt-in) — regalloc2 post-allocation
+  cleanup over the whole CFG: 1 redundant reloads, 2 reloads served
+  from a register that already mirrors the slot, 4 redundant spill
+  stores, 8 dead spill stores (`vendor/regalloc2/src/ion/postopt.rs`;
+  `PLIRON_RA2_POSTOPT_STATS=1` counts). Check with `PLIRON_RA_CHECK=1`.
+- `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but
+  cheap invariants stay inside loops that contain a call.
+- `PLIRON_HOT_LAYOUT=1` — type-layout table in each object for the
+  hot-reload loader's layout guard (`docs/hot-reload.md`).
+- `clif-check bench <corpus>` (with `PLIRON_MEMCACHE=0`) also prints
+  each step's time on functions it left unchanged and the repeat rounds
+  that ran with nothing changed since the family's last no-effect run.
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 
