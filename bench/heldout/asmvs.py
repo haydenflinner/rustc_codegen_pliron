@@ -254,13 +254,14 @@ def show_remarks(prog, fn):
         print(f"  {p}: {s[:110]}\n      {why}" + (f"  (x{n})" if n > 1 else ""))
 
 
-def build_sides(prog, binary, backend, skip):
+def build_sides(prog, binary, backend, skip, extra=()):
     base = dict(os.environ, RUSTUP_TOOLCHAIN=run.TOOLCHAIN, CARGO_TERM_COLOR="never",
                 CARGO_PROFILE_RELEASE_DEBUG="line-tables-only",
                 CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO="packed")
     base.pop("RUSTFLAGS", None)
     envs = {"llvm-g": base, "pliron-g": dict(base, RUSTFLAGS=f"-Zcodegen-backend={backend}",
-                                             PLIRON_REMARKS=remarks_prefix(prog))}
+                                             PLIRON_REMARKS=remarks_prefix(prog),
+                                             **dict(kv.split("=", 1) for kv in extra))}
     exes = {}
     for side, env in envs.items():
         exe = os.path.join(OUT, side, prog, "release", binary)
@@ -314,6 +315,8 @@ def main():
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--fn", help="print the lines of our functions whose name contains this")
     ap.add_argument("--line", help="print one source line (a suffix of FILE:LINE as the tables spell it)")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                    help="extra backend environment for our side (an opt-in knob to look at)")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-profile", action="store_true")
     ap.add_argument("--backend", default=os.path.join(run.ROOT, "target", "release", run.DYLIB))
@@ -325,7 +328,7 @@ def main():
             continue
         if not os.path.isdir(run.src_dir(prog)):
             sys.exit(f"asmvs: {run.src_dir(prog)} missing; run bench/heldout/run.py once first")
-        exes = build_sides(prog, binary, a.backend, a.skip_build)
+        exes = build_sides(prog, binary, a.backend, a.skip_build, a.env)
         sides = {}
         for side, exe in exes.items():
             prof = os.path.join(OUT, f"asmvs-{side}-{prog}.json.gz")

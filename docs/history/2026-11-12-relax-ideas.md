@@ -94,3 +94,40 @@ first runs that find nothing, i.e. shape gates.
   with a wrap-route check and a unit test (2bf3d01).
 - `pliron-clif-opt` tests did not compile (`iconst128` gained an
   argument), so the gate's unit leg was red.
+
+## Second pass (same day)
+
+**Fuzz sweep 30000..32000 at the first pass's head found five `-O`
+mismatches, all older than this work:**
+
+- 30621, 30696, 31403: `memcpyopt`'s `base_touches` counted an escaped
+  destination address (stored as a value) as one touch at the store;
+  reads through the reloaded pointer inside the writer-to-copy window
+  were invisible. After an escape every access that does not resolve to
+  another alloca, and every call, is a touch (58405d1, unit tests).
+- 30694, 31084: aarch64 `ubfiz`/`bfi` fusion (`PLIRON_BFUSE`) computed
+  `immr` from the type's width; an i8/i16 op runs as a 32-bit `ubfm`,
+  so the field landed at bit `16 + k` (8d3fd9e). `optbisect` blamed
+  `csweep2`, which only made the operand a constant.
+
+All five are in the gate's fuzz regression list.
+
+**Item 3, continued.** Cranelift's `vcode.rs` already had whole-CFG
+reload CSE and reload PRE (`PLIRON_RELOADCSE`, `PLIRON_SPILLCSE`,
+`PLIRON_RELOADPRE`), which is why `PLIRON_RA2_POSTOPT` found so little.
+`asmvs` now splits our stack traffic into `spill-*` and `slot-*` from
+frame remarks; on pulldown-cmark the excess over LLVM is about half
+each. The hottest spill site was a dozen slot-to-slot copies of
+constants on entry to `scalar_iterate_special_bytes` — block-parameter
+moves whose `edit_vregs` label (the parameter) hid that the value was a
+constant. `PLIRON_RA2_SRCVREG=1` labels them with the argument: stack
+loads -4.3% (pulldown-cmark), -3.5% (regex), -3.6% (rust-compression),
+spill-load samples on pulldown 136 -> 73. What is left there is one
+slot reloaded into `x20` after each call (callee-saved pressure).
+
+**Item 8, continued.** Direct-jump thunks (`PLIRON_HOT_DIRECT=1`, arm64
+macOS: own page-padded thunk section, threads suspended for the flip),
+tests on save (`PLIRON_HOT_REACH=1`, `examples/hot-test.sh`, `hotdiff`),
+`PLIRON_HOT_FREE=protect`. The loader's fingerprints no longer hash an
+anonymous constant's address, which had made every function naming a
+constant look changed after an unrelated edit.

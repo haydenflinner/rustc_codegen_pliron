@@ -314,10 +314,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   from a register that already mirrors the slot, 4 redundant spill
   stores, 8 dead spill stores (`vendor/regalloc2/src/ion/postopt.rs`;
   `PLIRON_RA2_POSTOPT_STATS=1` counts). Check with `PLIRON_RA_CHECK=1`.
+- `PLIRON_RA2_SRCVREG=1` (opt-in) — a block-parameter move is labelled
+  with the branch argument's vreg, so a constant passed to a spilled
+  parameter is rematerialized instead of loaded from its own spill
+  slot (stack loads -3.5..-4.3% on three held-out binaries).
 - `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but
   cheap invariants stay inside loops that contain a call.
 - `PLIRON_HOT_LAYOUT=1` — type-layout table in each object for the
-  hot-reload loader's layout guard (`docs/hot-reload.md`).
+  hot-reload loader's layout guard; `PLIRON_HOT_REACH=1` — thunks mark
+  their function entered (tests on save, `examples/hot-test.sh`);
+  runtime `PLIRON_HOT_DIRECT=1` (direct-jump thunks, arm64 macOS) and
+  `PLIRON_HOT_FREE=protect` (`docs/hot-reload.md`).
 - `clif-check bench <corpus>` (with `PLIRON_MEMCACHE=0`) also prints
   each step's time on functions it left unchanged and the repeat rounds
   that ran with nothing changed since the family's last no-effect run.
