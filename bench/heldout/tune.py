@@ -97,6 +97,12 @@ def main():
     sides = ["llvm", "llvm-pgo", "pliron", "pgo"] + ([side(best)] if best else [])
     m = measure(a.prog, binary, sides, max(a.rounds, 15), a.backend)
     b = m["llvm"]
+    # The search accepts on 1%; the longer final run decides. A winner
+    # that does not beat the plain bundle here was noise.
+    if best and m[side(best)][0] >= m["pgo"][0]:
+        print("the tuned setting does not beat the bundle in the final run: keeping the bundle")
+        sides.remove(side(best))
+        best = {}
     print(f"\n{a.prog}: tuned environment: {' '.join(f'{k}={v}' for k, v in sorted(best.items())) or '(the bundle as is)'}")
     for s in sides:
         name = "tuned" if s.startswith("pgo-t:") else s

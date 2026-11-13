@@ -207,3 +207,35 @@ on rust-json dropping the never-run-site rejection
 (`PLIRON_PGO_COLDSITE=0`) saves 3% instructions but it is mixed
 elsewhere; the hot multiplier wants 13 on rust-json and
 rust-html-rewriter and 0-3 on rust-protobuf.
+
+## 2026-11-13: loop cost, and the per-program tuner
+
+- Instrumented builds are unoptimized by default (`PLIRON_PGO_OPT=1`
+  restores): same profile (8,196 functions matched either way on
+  rust-html-rewriter, same speedup), build 9 s -> 6 s, profiling run 2x
+  slower. Loop cost 2.52x -> 2.18x a plain LLVM build.
+- `bench/heldout/tune.py PROG`: greedy search over 13 profile and
+  codegen knobs on top of the bundle, one cached build per candidate,
+  keep a setting only if the timed region's median improves >1% and its
+  fastest run >0.5%; a longer final run against LLVM decides.
+
+Final runs (15 rounds, median, ratio to plain LLVM):
+
+| program | pliron | bundle | tuned | LLVM+profile | tuned setting |
+|---|---|---|---|---|---|
+| rust-protobuf | 0.98 | 1.01 | **0.90** | 0.86 | `MEMFAST_SMALL=1 PGO_COLDSITE=0 PGO_HOT=0` |
+| rust-json | 1.04 | **0.96** | (1.01) | 0.92 | bundle (the search's pick lost the final run) |
+| pulldown-cmark | 1.15 | 1.05 | **1.01** | 0.86 | `PGO_COLDSITE=0 PLACE_ROT=1` |
+| blind-sig | 1.02 | 1.04 | — | 1.13 | bundle |
+| rust-html-rewriter | 1.14 | 1.04 | — | 0.83 | bundle |
+| blake3-scalar | 1.04 | 1.05 | — | 0.97 | bundle |
+| rust-compression | 1.14 | 1.11 | **1.06** | 0.98 | `ELABLOOPS=2 INLINE=640 RA2_POSTOPT=15` |
+| regex | 1.20 | 1.18 | **1.11** | 1.03 | `PGO_INLINE=0 PGO_LOOP=0` |
+
+Best of bundle/tuned per program: geomean ~1.02x plain LLVM (plain
+pliron 1.09x), two programs ahead of LLVM. What the picks say about the
+consumers: on regex both the profile-guided inliner and the
+profile-driven loop passes are net harmful; the opt-in knobs from the
+relax work (`ELABLOOPS=2`, `RA2_POSTOPT`) pay on rust-compression;
+rust-protobuf wants small inline copies everywhere and no hot-site
+bonus.
