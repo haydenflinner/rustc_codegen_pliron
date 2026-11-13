@@ -294,7 +294,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.block.deref(&ctx).get_parent_op(&ctx).unwrap()
     }
 
-    /// `PLIRON_DEVIRT=1`: lower the virtual call `virt` through `llfn`
+    /// `PLIRON_DEVIRT=1` without a profile: lower the virtual call `virt` through `llfn`
     /// (the pointer loaded from the vtable) as a chain of
     /// `llfn == &<Impl as Trait>::method` guards, each with a direct call,
     /// ending in the original indirect call (see `devirt.rs`). `catch` is
@@ -325,21 +325,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             (String::new(), String::new())
         };
         match &targets {
-            Ok((t, note)) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){}{} [{note}]: {}",
+            Ok((t, note)) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){} [{note}]: {}",
                 t.len(),
                 if catch.is_some() { " (invoke)" } else { "" },
-                if crate::devirt::profile_mode() { " (profile build)" } else { "" },
                 t.iter().map(|i| self.tcx.symbol_name(*i).name).collect::<Vec<_>>().join(" ")),
-            Err(why) => {
-                pliron_cfg::remark!("devirt", caller, what; "reject ({why})");
-                if pliron_cfg::remarks_on()
-                    && crate::env_set("PLIRON_PGO_USE")
-                    && !why.contains("virtual drop")
-                {
-                    let b = self.block;
-                    self.st.borrow_mut().devirt_rejects.push((b, caller.clone(), what.clone(), why.clone()));
-                }
-            }
+            Err(why) => pliron_cfg::remark!("devirt", caller, what; "reject ({why})"),
         }
         let targets = targets.ok()?.0;
         let ret = match self.kind(llty) {
@@ -365,47 +355,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             bx.mk_op(|c| BrOp::new(c, merge, if void { vec![] } else { vec![v] }));
         };
-        // Guard blocks hold only the compare and branch, so the profile
-        // pruning (`pliron_ir_opt::devirt::prune`) can relink them.
         let guards: Vec<_> = targets.iter().map(|_| self.append_sibling_block("devirt_guard")).collect();
         let fallback = self.append_sibling_block("devirt_fallback");
-        let mut arms = Vec::with_capacity(targets.len());
-        let mut local = Vec::with_capacity(targets.len());
         self.br(guards[0]);
         for (k, t) in targets.into_iter().enumerate() {
             self.switch_to_block(guards[k]);
             let addr = self.get_fn_addr(t, None);
-            // A copy this CGU has only because the profile called the
-            // target hot did not exist in the instrumented build: here
-            // the guard compares against the copy's address, there it
-            // compared against the home definition's, so its counts say
-            // nothing about this guard. Pruned in `devirt::prune`.
-            let stale = crate::env_set("PLIRON_PGO_USE")
-                && self.st.borrow().xcgu_extra.contains(self.tcx.symbol_name(t).name)
-                && crate::xcgu::pgo_only_copy(self.tcx, t);
             let hit = self.append_sibling_block("devirt_hit");
             let eq = self.icmp(IntPredicate::IntEQ, llfn, addr);
             self.cond_br(eq, hit, guards.get(k + 1).copied().unwrap_or(fallback));
             self.switch_to_block(hit);
             let abi = self.fn_abi_of_instance(t, ty::List::empty());
             arm(self, addr, abi, Some(t));
-            arms.push((guards[k], hit, stale));
-            local.push(
-                self.st
-                    .borrow()
-                    .funcs
-                    .get(self.tcx.symbol_name(t).name)
-                    .is_some_and(|f| f.linkage != cranelift_module::Linkage::Import),
-            );
-        }
-        if crate::env_set("PLIRON_PGO_USE") {
-            self.st.borrow_mut().devirt_sites.push(crate::context::DevirtSite {
-                arms,
-                local,
-                fallback,
-                caller,
-                what,
-            });
         }
         self.switch_to_block(fallback);
         // `instance: None` — `call` reads it only for `Item` callees, and
@@ -1344,6 +1305,30 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         full.extend_from_slice(args);
         let exts = fn_abi.map(crate::type_of::exts_of).unwrap_or_default();
         let v = self.call_raw(llty, llfn, &full, exts);
+        // Profile builds: mark the call for indirect-call promotion
+        // (`pliron_ir_opt::devirt`): every virtual call, and with
+        // `PLIRON_DEVIRT_FNPTR=1` every call through a fn pointer.
+        if fn_abi.is_some()
+            && pliron_ir_opt::devirt::icp_on()
+            && match instance {
+                Some(i) => matches!(i.def, ty::InstanceKind::Virtual(..)),
+                None => crate::env_is("PLIRON_DEVIRT_FNPTR", "1"),
+            }
+        {
+            let what = match instance {
+                Some(i) if pliron_cfg::remarks_on() => {
+                    ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(i.def_id()))
+                }
+                None if pliron_cfg::remarks_on() => "fn pointer".to_string(),
+                _ => String::new(),
+            };
+            let mut st = self.st.borrow_mut();
+            if let Some(op) = st.last_call
+                && st.calls.get(op).is_some_and(|c| c.callee.is_none())
+            {
+                st.icall_sites.insert(op, what);
+            }
+        }
         // `foreign` callees get variadic args via the real C ABI: extern items,
         // and `#[naked]` definitions, whose hand-written asm reads the native
         // varargs convention (register save area) rather than our buffer.
@@ -1582,7 +1567,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // skipped by the terminator logic once `return_call` is emitted.
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
-            self.st.borrow_mut().calls.get_mut(p).unwrap().tail = true;
+            let mut st = self.st.borrow_mut();
+            st.calls.get_mut(p).unwrap().tail = true;
+            st.icall_sites.remove(p);
         }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),

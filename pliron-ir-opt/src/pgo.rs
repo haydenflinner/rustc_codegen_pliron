@@ -42,6 +42,69 @@ use crate::state::{ConstVal, GlobalInfo, State};
 
 /// `.prof` magic: "PLPROF01" little-endian.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"PLPROF01");
+/// Header magic of a CGU that carries the indirect-call extension
+/// (`{crate id, cgu hash, sites ptr, nsites, fns ptr, nfns, names ptr,
+/// names len, crate hash}` after `recs`).
+pub const MAGIC2: u64 = u64::from_le_bytes(*b"PLPROF02");
+/// Magic of the `.prof` trailer holding the indirect-call sites. Readers
+/// that stop after the function records never see it.
+pub const ICALL_MAGIC: u64 = u64::from_le_bytes(*b"PLICALL2");
+/// Target slots per indirect-call site; a site is `SLOTS` x `(address,
+/// count)` plus one count for everything else.
+pub const SLOTS: usize = 4;
+/// `ProfTarget::flags`: the target's symbol is visible to other objects.
+pub const TARGET_EXTERNAL: u32 = 1;
+
+/// One callee an indirect-call site reached.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProfTarget {
+    pub name: String,
+    /// `StableCrateId` of the crate whose object defined the address,
+    /// and that crate's hash (SVH) in the instrumented build (0 for a
+    /// crate nothing can depend on).
+    pub crate_id: u64,
+    pub crate_hash: u64,
+    /// Hash of the name of the CGU that defined it (`cgu_hash`).
+    pub cgu: u64,
+    pub flags: u32,
+    pub count: u64,
+}
+
+/// One indirect-call site's value profile.
+#[derive(Clone, Debug, Default)]
+pub struct ProfSite {
+    /// Calls to targets with no slot or no name (uninstrumented code).
+    pub other: u64,
+    pub targets: Vec<ProfTarget>,
+}
+
+impl ProfSite {
+    pub fn merge(&mut self, o: &ProfSite) {
+        self.other += o.other;
+        for t in &o.targets {
+            match self
+                .targets
+                .iter_mut()
+                .find(|x| x.name == t.name && x.crate_id == t.crate_id && x.cgu == t.cgu)
+            {
+                Some(x) => {
+                    x.count += t.count;
+                    x.flags |= t.flags;
+                }
+                None => self.targets.push(t.clone()),
+            }
+        }
+    }
+}
+
+/// Hash of a CGU name as the profile stores it.
+pub fn cgu_hash(cgu: &str) -> u64 {
+    sym_hash(&sanitize(cgu))
+}
+
+fn sanitize(cgu: &str) -> String {
+    cgu.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect()
+}
 
 /// The object format a CGU is emitted as — pliron-ir-opt is rustc-free,
 /// so the caller maps `sess.target` onto this before section names or
@@ -62,6 +125,8 @@ pub struct ProfFn {
     pub blocks: Vec<u64>,
     /// `(pred_block_idx, succ_slot, count)` for instrumented edges.
     pub edges: Vec<(u16, u16, u64)>,
+    /// Indirect-call sites in `devirt::sites` order.
+    pub sites: Vec<ProfSite>,
 }
 
 /// One counter site: `load ctr; add 1; store ctr` at the head of `block`
@@ -202,7 +267,7 @@ pub fn fingerprint(ctx: &Context, f: Ptr<Operation>) -> (u64, Vec<(u16, u16)>) {
     (h.finish(), edges)
 }
 
-fn sym_hash(sym: &str) -> u64 {
+pub fn sym_hash(sym: &str) -> u64 {
     let mut h = FxHasher::default();
     h.write(sym.as_bytes());
     h.finish()
@@ -210,7 +275,7 @@ fn sym_hash(sym: &str) -> u64 {
 
 /// Identifier for a symbol (same `s{n}_sanitized` scheme as context.rs,
 /// plus the sym<->ident maps).
-fn ident(st: &mut State, sym: &str) -> Identifier {
+pub(crate) fn ident(st: &mut State, sym: &str) -> Identifier {
     if let Some(i) = st.sym_to_ident.get(sym) {
         return i.clone();
     }
@@ -255,20 +320,17 @@ pub fn instrument(
     st: &mut State,
     cgu: &str,
     fmt: ObjFmt,
+    (crate_id, crate_hash): (u64, u64),
 ) -> (String, String, String) {
     let wasm = fmt == ObjFmt::Wasm;
+    // Indirect-call value profile: native only (wasm keeps the v1 header
+    // its host reads).
+    let icp = !wasm && crate::devirt::icp_on();
     // CGU names carry '-' ('foo.abc-cgu.0') — illegal in asm operands,
     // and the hdr/ctor syms cross into rsasm text; sanitize the suffix.
-    let cgu: String = cgu
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let cgu: String = sanitize(cgu);
+    let cgu_id = sym_hash(&cgu);
+    let icalls_sym = format!("__pliron_prof_icalls.{cgu}");
     let ctrs_sym = format!("__pliron_prof_ctrs.{cgu}");
     let hdr_sym = format!("__pliron_prof_hdr.{cgu}");
     let ctor_sym = format!("__pliron_prof_ctor.{cgu}");
@@ -303,9 +365,30 @@ pub fn instrument(
     let edges_on = crate::env_get("PLIRON_PGO_COUNTERS").is_none_or(|c| c != "block");
     let mut names = Vec::new(); // sym_hash -> name blob
     let mut nctrs = 0u32;
+    let mut nsites = 0u32;
+    // (sym hash, symbol, flags) of every body here: the address table.
+    let mut ftab: Vec<(u64, String, u32)> = Vec::new();
     for (sym, fop) in funcs {
         let bs = blocks(ctx, fop);
         let (fp, all_edges) = fingerprint(ctx, fop);
+        // Sites are numbered before any counter block exists, the way
+        // `devirt::promote` numbers them in the profile-use build.
+        let fsites = if icp { crate::devirt::sites(ctx, st, &bs) } else { Vec::new() };
+        for (k, &(op, callee)) in fsites.iter().enumerate() {
+            let site = crate::sroa::mk_const(
+                ctx,
+                st,
+                ptr_t,
+                ConstVal::Sym { sym: icalls_sym.clone(), off: (nsites as i64 + k as i64) * (SLOTS as i64 * 2 + 1) * 8 },
+            );
+            crate::devirt::record_call(ctx, st, op, site, callee);
+        }
+        if icp {
+            let ext = st.funcs.get(&sym).is_some_and(|f| {
+                matches!(f.linkage, Linkage::Export | Linkage::Hidden | Linkage::Preemptible)
+            }) && !st.xcgu_extra.contains(&sym);
+            ftab.push((sym_hash(&sym), sym.clone(), if ext { TARGET_EXTERNAL } else { 0 }));
+        }
         let edges = if edges_on { all_edges } else { Vec::new() };
         let sh = sym_hash(&sym);
         let base = nctrs;
@@ -337,7 +420,10 @@ pub fn instrument(
         recs.extend_from_slice(&(base as u64).to_le_bytes());
         recs.extend_from_slice(&(bs.len() as u32).to_le_bytes());
         recs.extend_from_slice(&(edges.len() as u32).to_le_bytes());
-        recs.extend_from_slice(&0u32.to_le_bytes());
+        // The record's spare word: how many of the CGU's sites, in table
+        // order, are this function's.
+        recs.extend_from_slice(&(fsites.len() as u32).to_le_bytes());
+        nsites += fsites.len() as u32;
         for (p, s) in &edges {
             recs.extend_from_slice(&((*p as u32) << 16 | *s as u32).to_le_bytes());
         }
@@ -389,48 +475,9 @@ pub fn instrument(
     // One wire layout everywhere: wasm writes only the low 4 bytes of the
     // ctrs reloc (linear addr), so it uses an i64-typed field there too
     // and the offsets stay {0,8,16,24} on both targets.
-    let ctrs_t = if wasm { i64t } else { ptr_t };
-    let recs_ty = ArrayType::get(ctx, i8t, recs.len() as u64).into();
-    let hdr_ty = StructType::get_unnamed(
-        ctx,
-        (
-            vec![i64t, ctrs_t, i64t, i64t, recs_ty],
-            StructLayout::Unpacked,
-        ),
-    )
-    .into();
-    let f0 = mk(ctx, st, i64t, ConstVal::Bits(MAGIC as u128));
-    let f1 = mk(
-        ctx,
-        st,
-        ctrs_t,
-        ConstVal::Sym {
-            sym: ctrs_sym.clone(),
-            off: 0,
-        },
-    );
-    let f2 = mk(ctx, st, i64t, ConstVal::Bits(nctrs as u128));
-    let f3 = mk(ctx, st, i64t, ConstVal::Bits(recs.len() as u128));
-    let f4 = mk(ctx, st, recs_ty, ConstVal::Bytes(recs));
-    let init = mk(ctx, st, hdr_ty, ConstVal::Agg(vec![f0, f1, f2, f3, f4]));
-    declare_global(
-        ctx,
-        st,
-        module,
-        &hdr_sym,
-        GlobalInfo {
-            ty: hdr_ty,
-            init: Some(init),
-            align: 8,
-            mutable: false,
-            tls: false,
-            linkage: Linkage::Local,
-            used: true,
-            section: sec("pliron_prof", "pliron_prof"),
-        },
-    );
-    // symbol names for `pliron-prof dump`
-    let names_ty = ArrayType::get(ctx, i8t, names.len() as u64).into();
+    // symbol names for `pliron-prof dump` and for naming icall targets
+    let names_len = names.len() as u64;
+    let names_ty = ArrayType::get(ctx, i8t, names_len).into();
     let names_sym = format!("__pliron_prof_names.{cgu}");
     let init = mk(ctx, st, names_ty, ConstVal::Bytes(names));
     declare_global(
@@ -449,6 +496,125 @@ pub fn instrument(
             section: sec("pliron_prof_names", "pliron_pnames"),
         },
     );
+    // Indirect-call extension: the site table (zeroed, mutable) and the
+    // address table `{sym hash, &fn, flags}` per body, which lets
+    // `pliron-prof` turn a recorded address into a symbol.
+    let mut ext_tys: Vec<TypeHandle> = Vec::new();
+    let mut ext_vals: Vec<Value> = Vec::new();
+    if icp {
+        let words = nsites as u64 * (SLOTS as u64 * 2 + 1);
+        if nsites > 0 {
+            let ty = ArrayType::get(ctx, i64t, words).into();
+            let init = mk(ctx, st, ty, ConstVal::Zero);
+            declare_global(
+                ctx,
+                st,
+                module,
+                &icalls_sym,
+                GlobalInfo {
+                    ty,
+                    init: Some(init),
+                    align: 8,
+                    mutable: true,
+                    tls: false,
+                    linkage: Linkage::Local,
+                    used: true,
+                    section: sec("pliron_prof_icall", "pliron_picall"),
+                },
+            );
+        }
+        let fns_sym = format!("__pliron_prof_fns.{cgu}");
+        let mut tys = Vec::with_capacity(ftab.len() * 3);
+        let mut vals = Vec::with_capacity(ftab.len() * 3);
+        for (h, sym, flags) in &ftab {
+            tys.extend([i64t, ptr_t, i64t]);
+            vals.push(mk(ctx, st, i64t, ConstVal::Bits(*h as u128)));
+            vals.push(mk(ctx, st, ptr_t, ConstVal::Sym { sym: sym.clone(), off: 0 }));
+            vals.push(mk(ctx, st, i64t, ConstVal::Bits(*flags as u128)));
+        }
+        let fns_ty = StructType::get_unnamed(ctx, (tys, StructLayout::Unpacked)).into();
+        let init = mk(ctx, st, fns_ty, ConstVal::Agg(vals));
+        declare_global(
+            ctx,
+            st,
+            module,
+            &fns_sym,
+            GlobalInfo {
+                ty: fns_ty,
+                init: Some(init),
+                align: 8,
+                mutable: false,
+                tls: false,
+                linkage: Linkage::Local,
+                used: true,
+                section: sec("pliron_prof_fns", "pliron_pfns"),
+            },
+        );
+        let sym_or_null = |ctx: &mut Context, st: &mut State, sym: &str, present: bool| {
+            if present {
+                (ptr_t, mk(ctx, st, ptr_t, ConstVal::Sym { sym: sym.to_string(), off: 0 }))
+            } else {
+                (i64t, mk(ctx, st, i64t, ConstVal::Bits(0)))
+            }
+        };
+        let (st_t, st_v) = sym_or_null(ctx, st, &icalls_sym, nsites > 0);
+        let (fn_t, fn_v) = sym_or_null(ctx, st, &fns_sym, !ftab.is_empty());
+        let (nm_t, nm_v) = sym_or_null(ctx, st, &names_sym, names_len > 0);
+        ext_tys = vec![i64t, i64t, st_t, i64t, fn_t, i64t, nm_t, i64t, i64t];
+        ext_vals = vec![
+            mk(ctx, st, i64t, ConstVal::Bits(crate_id as u128)),
+            mk(ctx, st, i64t, ConstVal::Bits(cgu_id as u128)),
+            st_v,
+            mk(ctx, st, i64t, ConstVal::Bits(nsites as u128)),
+            fn_v,
+            mk(ctx, st, i64t, ConstVal::Bits(ftab.len() as u128)),
+            nm_v,
+            mk(ctx, st, i64t, ConstVal::Bits(names_len as u128)),
+            mk(ctx, st, i64t, ConstVal::Bits(crate_hash as u128)),
+        ];
+    }
+    // header+records: {magic, ctrs ptr, nctrs, recs_len, recs bytes}
+    // (+ the indirect-call extension, 9 words, right after `recs`).
+    // One wire layout everywhere: wasm writes only the low 4 bytes of the
+    // ctrs reloc (linear addr), so it uses an i64-typed field there too
+    // and the offsets stay {0,8,16,24} on both targets.
+    let ctrs_t = if wasm { i64t } else { ptr_t };
+    let recs_ty = ArrayType::get(ctx, i8t, recs.len() as u64).into();
+    let mut hdr_fields = vec![i64t, ctrs_t, i64t, i64t, recs_ty];
+    hdr_fields.extend(ext_tys);
+    let hdr_ty = StructType::get_unnamed(ctx, (hdr_fields, StructLayout::Unpacked)).into();
+    let f0 = mk(ctx, st, i64t, ConstVal::Bits(if icp { MAGIC2 } else { MAGIC } as u128));
+    let f1 = mk(
+        ctx,
+        st,
+        ctrs_t,
+        ConstVal::Sym {
+            sym: ctrs_sym.clone(),
+            off: 0,
+        },
+    );
+    let f2 = mk(ctx, st, i64t, ConstVal::Bits(nctrs as u128));
+    let f3 = mk(ctx, st, i64t, ConstVal::Bits(recs.len() as u128));
+    let f4 = mk(ctx, st, recs_ty, ConstVal::Bytes(recs));
+    let mut hdr_vals = vec![f0, f1, f2, f3, f4];
+    hdr_vals.extend(ext_vals);
+    let init = mk(ctx, st, hdr_ty, ConstVal::Agg(hdr_vals));
+    declare_global(
+        ctx,
+        st,
+        module,
+        &hdr_sym,
+        GlobalInfo {
+            ty: hdr_ty,
+            init: Some(init),
+            align: 8,
+            mutable: false,
+            tls: false,
+            linkage: Linkage::Local,
+            used: true,
+            section: sec("pliron_prof", "pliron_prof"),
+        },
+    );
 
     (hdr_sym, ctor_sym, ctrs_sym)
 }
@@ -463,6 +629,10 @@ pub fn instrument(
 /// links as `___pliron_prof_register`).
 // r[impl native.pgo.ctor]
 pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<String> {
+    // The ctor's section lands after other text whose size need not be a
+    // multiple of the instruction size (a function may end in literal
+    // bytes): an A64 instruction at an odd address faults.
+    let align = if aarch64 { ".balign 4\n" } else { "" };
     let asm = match fmt {
         ObjFmt::Elf => {
             let body = if aarch64 {
@@ -472,7 +642,7 @@ pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<Str
             };
             let slot = if aarch64 { ".xword" } else { ".quad" };
             format!(
-                ".att_syntax\n.text\n.weak {ctor}\n.hidden {ctor}\n{ctor}:\n  {body}\n.section .init_array,\"aw\",@init_array\n.balign 8\n{slot} {ctor}\n.text\n"
+                ".att_syntax\n.text\n.weak {ctor}\n.hidden {ctor}\n{align}{ctor}:\n  {body}\n.section .init_array,\"aw\",@init_array\n.balign 8\n{slot} {ctor}\n.text\n"
             )
         }
         ObjFmt::MachO => {
@@ -492,7 +662,7 @@ pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<Str
                 )
             };
             format!(
-                "{att}.section __TEXT,__text,regular,pure_instructions\n.globl {ctor}\n.weak_definition {ctor}\n.private_extern {ctor}\n{ctor}:\n  {body}\n.mod_init_func\n.balign 8\n.quad {ctor}\n.text\n"
+                "{att}.section __TEXT,__text,regular,pure_instructions\n.globl {ctor}\n.weak_definition {ctor}\n.private_extern {ctor}\n{align}{ctor}:\n  {body}\n.mod_init_func\n.balign 8\n.quad {ctor}\n.text\n"
             )
         }
         ObjFmt::Coff => {
@@ -514,7 +684,7 @@ pub fn ctor_asm(hdr: &str, ctor: &str, aarch64: bool, fmt: ObjFmt) -> Option<Str
                 )
             };
             format!(
-                "{att}.text\n{ctor}:\n  {body}\n.section .CRT$XCU,\"dr\"\n.balign 8\n.quad {ctor}\n.text\n"
+                "{att}.text\n{align}{ctor}:\n  {body}\n.section .CRT$XCU,\"dr\"\n.balign 8\n.quad {ctor}\n.text\n"
             )
         }
         ObjFmt::Wasm => return None,
@@ -564,7 +734,72 @@ pub fn serialize(m: &FxHashMap<(u64, u64), ProfFn>) -> Vec<u8> {
             put_u32(&mut out, ((p as u32) << 16) | s as u32);
         }
     }
+    // Trailer: indirect-call sites, for the functions that have any.
+    let with: Vec<_> = m.iter().filter(|(_, f)| !f.sites.is_empty()).collect();
+    if !with.is_empty() {
+        put_u64(&mut out, ICALL_MAGIC);
+        put_u64(&mut out, with.len() as u64);
+        for (&(sh, _), f) in with {
+            put_u64(&mut out, sh);
+            put_u64(&mut out, f.fingerprint);
+            put_u32(&mut out, f.sites.len() as u32);
+            for site in &f.sites {
+                put_u64(&mut out, site.other);
+                put_u32(&mut out, site.targets.len() as u32);
+                for t in &site.targets {
+                    put_u64(&mut out, t.count);
+                    put_u64(&mut out, t.crate_id);
+                    put_u64(&mut out, t.crate_hash);
+                    put_u64(&mut out, t.cgu);
+                    put_u32(&mut out, t.flags);
+                    put_u32(&mut out, t.name.len() as u32);
+                    out.extend_from_slice(t.name.as_bytes());
+                }
+            }
+        }
+    }
     out
+}
+
+/// The `.prof` trailer (see `serialize`), merged into `m`. Absent or
+/// truncated trailers leave the functions without sites.
+fn parse_icalls(b: &[u8], p: &mut usize, m: &mut FxHashMap<(u64, u64), ProfFn>) -> Option<()> {
+    if rd_u64(b, p)? != ICALL_MAGIC {
+        return None;
+    }
+    let n = rd_u64(b, p)?;
+    for _ in 0..n {
+        let sh = rd_u64(b, p)?;
+        let fp = rd_u64(b, p)?;
+        let ns = rd_u32(b, p)? as usize;
+        let mut sites = Vec::with_capacity(ns.min(1 << 16));
+        for _ in 0..ns {
+            let other = rd_u64(b, p)?;
+            let nt = rd_u32(b, p)? as usize;
+            let mut targets = Vec::with_capacity(nt.min(64));
+            for _ in 0..nt {
+                let count = rd_u64(b, p)?;
+                let crate_id = rd_u64(b, p)?;
+                let crate_hash = rd_u64(b, p)?;
+                let cgu = rd_u64(b, p)?;
+                let flags = rd_u32(b, p)?;
+                let len = rd_u32(b, p)? as usize;
+                let name = String::from_utf8(b.get(*p..*p + len)?.to_vec()).ok()?;
+                *p += len;
+                targets.push(ProfTarget { name, crate_id, crate_hash, cgu, flags, count });
+            }
+            sites.push(ProfSite { other, targets });
+        }
+        let f = m.entry((sh, fp)).or_default();
+        f.fingerprint = fp;
+        if f.sites.len() < sites.len() {
+            f.sites.resize(sites.len(), ProfSite::default());
+        }
+        for (i, s) in sites.iter().enumerate() {
+            f.sites[i].merge(s);
+        }
+    }
+    Some(())
 }
 
 /// Parse `.prof` bytes into `{(sym_hash, fp) -> ProfFn}`, merging repeated
@@ -610,6 +845,7 @@ pub fn parse(b: &[u8]) -> Option<FxHashMap<(u64, u64), ProfFn>> {
             }
         }
     }
+    let _ = parse_icalls(b, &mut p, &mut m);
     Some(m)
 }
 
@@ -623,6 +859,9 @@ pub fn parse(b: &[u8]) -> Option<FxHashMap<(u64, u64), ProfFn>> {
 pub struct Summary {
     pub hot: u64,
     pub entry: FxHashMap<u64, u64>,
+    /// Every symbol some indirect-call site of the profile reached, with
+    /// the symbol hashes of the functions holding those sites.
+    pub icall_targets: FxHashMap<String, Vec<u64>>,
 }
 
 /// The summary of `PLIRON_PGO_USE`'s profile, read once per process.
@@ -648,7 +887,16 @@ pub fn summary() -> Option<&'static Summary> {
             let e = entry.entry(*sh).or_default();
             *e = (*e).max(f.blocks.first().copied().unwrap_or(0));
         }
-        Some(Summary { hot, entry })
+        let mut icall_targets: FxHashMap<String, Vec<u64>> = FxHashMap::default();
+        for ((caller, _), f) in &profiles {
+            for t in f.sites.iter().flat_map(|s| s.targets.iter()) {
+                let e = icall_targets.entry(t.name.clone()).or_default();
+                if !e.contains(caller) {
+                    e.push(*caller);
+                }
+            }
+        }
+        Some(Summary { hot, entry, icall_targets })
     })
     .as_ref()
 }

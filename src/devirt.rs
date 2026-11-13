@@ -1,8 +1,12 @@
-//! Guarded devirtualization of `dyn Trait` calls (`PLIRON_DEVIRT=1`,
-//! opt-in). rustc knows which methods the vtables of this crate hold (see
+//! Guarded devirtualization of `dyn Trait` calls without a profile
+//! (`PLIRON_DEVIRT=1`, opt-in), and the rustc-side facts for the
+//! profile-driven version (`pliron_ir_opt::devirt`, on by default in
+//! profile builds): which symbols to promote so a guard can name them
+//! ([`promotable`]) and which profiled targets link ([`IcpCfg`]).
+//!
+//! rustc knows which methods the vtables of this crate hold (see
 //! `index`); when few of them can be the callee (`PLIRON_DEVIRT_MAX`,
-//! default 2), or a profile says which ones are (see [`plan`]), a virtual
-//! call becomes
+//! default 2, see [`plan`]), a virtual call becomes
 //!
 //! ```text
 //! fnptr = load vtable[idx]
@@ -25,40 +29,23 @@ use rustc_target::callconv::FnAbi;
 
 use crate::context::CodegenCx;
 
+/// Blind guards: `PLIRON_DEVIRT=1` in a build without a profile. Profile
+/// builds use the value profile instead (`pliron_ir_opt::devirt`, on by
+/// default there).
 pub fn enabled() -> bool {
-    crate::env_is("PLIRON_DEVIRT", "1")
+    crate::env_is("PLIRON_DEVIRT", "1") && !pliron_ir_opt::devirt::profile_build()
 }
 
 fn knob(name: &str, default: usize) -> usize {
     crate::env_get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-/// A profile build, generating (`PLIRON_PGO`) or using (`PLIRON_PGO_USE`):
-/// both must emit the same guard chains, since a profile only applies to
-/// a function whose CFG fingerprint matches the instrumented build's.
-pub fn profile_mode() -> bool {
-    crate::env_set("PLIRON_PGO") || crate::env_set("PLIRON_PGO_USE")
-}
-
 /// The targets to guard at one site, from its usable candidates (sorted
-/// by symbol), and how many were left without a guard. Without a
-/// profile: all of them when there are at most `PLIRON_DEVIRT_MAX`
-/// (default 2), else none — nothing says which to prefer. In a profile
-/// build: the first `PLIRON_DEVIRT_PROF_MAX` (default 16); the hit
-/// blocks' counters rank them and `pliron_ir_opt::devirt::prune` keeps
-/// the hot ones.
+/// by symbol): all of them when there are at most `PLIRON_DEVIRT_MAX`
+/// (default 2), else none — without a profile nothing says which to
+/// prefer.
 pub fn plan<'tcx>(c: Cands<'tcx>) -> Result<(Vec<Instance<'tcx>>, String), String> {
-    let Cands { mut targets, note } = c;
-    if profile_mode() {
-        let max = knob("PLIRON_DEVIRT_PROF_MAX", 16);
-        let left = targets.len().saturating_sub(max);
-        targets.truncate(max);
-        if targets.is_empty() {
-            return Err("PLIRON_DEVIRT_PROF_MAX is 0".into());
-        }
-        let note = if left > 0 { format!("{note}; {left} usable left unguarded") } else { note };
-        return Ok((targets, note));
-    }
+    let Cands { targets, note } = c;
     let max = knob("PLIRON_DEVIRT_MAX", 2);
     if targets.len() > max {
         return Err(format!(
@@ -67,6 +54,144 @@ pub fn plan<'tcx>(c: Cands<'tcx>) -> Result<(Vec<Instance<'tcx>>, String), Strin
         ));
     }
     Ok((targets, note))
+}
+
+/// What `pliron_ir_opt::devirt::promote` needs from rustc, captured once
+/// per crate (the deferred pipeline runs without a `TyCtxt`).
+pub struct IcpCfg {
+    /// This crate's `StableCrateId`, and its hash (SVH; 0 for a crate
+    /// nothing can depend on): what the instrumented build stores as the
+    /// defining crate of each target.
+    pub crate_id: u64,
+    pub crate_hash: u64,
+    /// Every crate this one depends on, by `StableCrateId`: its symbols
+    /// are part of any link this crate is part of.
+    pub deps: FxHashMap<u64, Dep>,
+    /// This crate is linked right here (a binary, a dylib, ...): cargo
+    /// starts such a compile only when its dependencies' rlibs are
+    /// complete, so they can be read. A plain rlib may be compiled while
+    /// its dependencies are still in codegen (pipelining).
+    pub linked: bool,
+    pub macho: bool,
+    /// Symbols of this crate another CGU can link: `xcgu::home_linkable`
+    /// and the promoted vtable slot instances ([`promotable`]).
+    pub home: &'static rustc_hash::FxHashSet<String>,
+    pub promoted: &'static rustc_hash::FxHashSet<String>,
+    /// `PLIRON_DEVIRT_DOWNSTREAM=1`: also guard targets defined in crates
+    /// that depend on this one (a closure the final binary passes in).
+    /// The object then only links into programs that define them, and
+    /// nothing checks that the profile still describes those crates.
+    pub downstream: bool,
+}
+
+/// A dependency: its hash, its rlib, and (read on first use) the symbols
+/// the rlib defines for other objects.
+pub struct Dep {
+    pub hash: u64,
+    pub rlib: Option<std::path::PathBuf>,
+    syms: std::sync::OnceLock<Option<rustc_hash::FxHashSet<String>>>,
+}
+
+impl Dep {
+    /// The external definitions in the rlib's objects, without the
+    /// Mach-O underscore; `None` when it cannot be read.
+    fn symbols(&self, macho: bool) -> Option<&rustc_hash::FxHashSet<String>> {
+        use object::read::archive::ArchiveFile;
+        use object::{Object, ObjectSymbol};
+        self.syms
+            .get_or_init(|| {
+                let data = std::fs::read(self.rlib.as_ref()?).ok()?;
+                let ar = ArchiveFile::parse(&*data).ok()?;
+                let mut out = rustc_hash::FxHashSet::default();
+                for m in ar.members() {
+                    let m = m.ok()?;
+                    // Members that are not objects (`lib.rmeta`) are skipped.
+                    let Ok(obj) = object::File::parse(m.data(&*data).ok()?) else { continue };
+                    for s in obj.symbols() {
+                        if s.is_definition()
+                            && s.is_global()
+                            && let Ok(n) = s.name()
+                        {
+                            let n = if macho { n.strip_prefix('_').unwrap_or(n) } else { n };
+                            out.insert(n.to_string());
+                        }
+                    }
+                }
+                Some(out)
+            })
+            .as_ref()
+    }
+}
+
+impl IcpCfg {
+    pub fn new(tcx: TyCtxt<'_>) -> Option<Self> {
+        if !pliron_ir_opt::devirt::icp_on() || tcx.sess.target.is_like_wasm {
+            return None;
+        }
+        let local = rustc_hir::def_id::LOCAL_CRATE;
+        let hash = |c| tcx.crate_hash(c).as_u128() as u64;
+        Some(IcpCfg {
+            crate_id: tcx.stable_crate_id(local).as_u64(),
+            // Only a crate with metadata has a hash to ask for.
+            crate_hash: if tcx.needs_hir_hash() { hash(local) } else { 0 },
+            deps: tcx
+                .crates(())
+                .iter()
+                .map(|&c| {
+                    let rlib = tcx
+                        .used_crate_source(c)
+                        .paths()
+                        .find(|p| p.extension().is_some_and(|e| e == "rlib"))
+                        .cloned();
+                    (
+                        tcx.stable_crate_id(c).as_u64(),
+                        Dep { hash: hash(c), rlib, syms: std::sync::OnceLock::new() },
+                    )
+                })
+                .collect(),
+            linked: tcx.crate_types().iter().any(|t| *t != rustc_structures::CrateType::Rlib),
+            macho: tcx.sess.target.is_like_darwin,
+            home: crate::xcgu::home_linkable(tcx),
+            promoted: promotable(tcx),
+            downstream: crate::env_is("PLIRON_DEVIRT_DOWNSTREAM", "1"),
+        })
+    }
+
+    /// Does a reference to `t`, which has no body in the current CGU,
+    /// link, and is its address the one the profile saw?
+    pub fn linkable(&self, t: &pliron_ir_opt::pgo::ProfTarget) -> Result<(), &'static str> {
+        let external = t.flags & pliron_ir_opt::pgo::TARGET_EXTERNAL != 0;
+        // Symbol names are unique across crates: one of ours that this
+        // build defines for other CGUs, whatever the profile's age.
+        if self.home.contains(&t.name) || self.promoted.contains(&t.name) {
+            return Ok(());
+        }
+        if t.crate_id == self.crate_id {
+            return Err("private to another CGU");
+        }
+        let Some(dep) = self.deps.get(&t.crate_id) else {
+            return if self.downstream && external {
+                Ok(())
+            } else {
+                Err("defined downstream")
+            };
+        };
+        if self.linked {
+            // The dependency's objects are on disk: see for ourselves.
+            match dep.symbols(self.macho) {
+                Some(s) if s.contains(&t.name) => Ok(()),
+                Some(_) => Err("not an external symbol of its rlib"),
+                None => Err("dependency rlib unreadable"),
+            }
+        } else if !external {
+            Err("private to another crate")
+        } else if dep.hash == t.crate_hash && dep.hash != 0 {
+            // Same sources and options as profiled, so the same symbols.
+            Ok(())
+        } else {
+            Err("dependency changed since the profile (crate hash)")
+        }
+    }
 }
 
 /// What the vtables instantiated in this crate hold, per trait method:
@@ -182,35 +307,92 @@ fn build_index<'tcx>(tcx: TyCtxt<'tcx>) -> Index<'tcx> {
     ix
 }
 
-/// Symbols of vtable slot instances that live `Internal` in exactly one
-/// CGU (closures, private impl methods): `xcgu::promoted` adds them, so
-/// their home CGU defines them hidden-external and a guard in any other
-/// CGU of the crate can name them. They are address-taken already (a
-/// vtable holds them), so nothing that needs a private symbol applied.
-/// Depends only on the partition, never on a profile.
-pub fn promotable<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<String> {
+/// Symbols of vtable slot instances that are `Internal` and held by
+/// exactly one CGU (closures, private or `#[inline]` impl methods, shims):
+/// `xcgu::promoted` adds them, so that CGU defines them hidden-external
+/// and a guard in any other object — another CGU of this crate, or by
+/// name another crate — can refer to the very address the vtable holds.
+/// They are address-taken already, so nothing that needs a private symbol
+/// applied to them. The candidates depend only on the partition; the
+/// profile-use build keeps those its profile names from another CGU.
+///
+/// An item rustc instantiates per user (`inlined`) qualifies only when
+/// its symbol cannot also be this-crate-external somewhere else: its
+/// definition is local, or it is a generic instance (whose symbol names
+/// the instantiating crate). A non-generic `#[inline]` fn of another
+/// crate has one name in every crate that copies it.
+pub fn promotable<'tcx>(tcx: TyCtxt<'tcx>) -> &'static rustc_hash::FxHashSet<String> {
     use rustc_middle::mono::MonoItem;
-    if !enabled() {
-        return Vec::new();
-    }
-    let mut home: FxHashMap<MonoItem<'tcx>, (bool, u32)> = FxHashMap::default();
-    for p in tcx.collect_and_partition_mono_items(()).codegen_units {
-        for (&item, data) in p.items() {
-            let e = home
-                .entry(item)
-                .or_insert((data.linkage == rustc_attr_ir::Linkage::Internal && !data.inlined, 0));
-            e.1 += 1;
+    static P: std::sync::OnceLock<rustc_hash::FxHashSet<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let mut out = rustc_hash::FxHashSet::default();
+        if (!enabled() && !pliron_ir_opt::devirt::icp_on()) || tcx.sess.target.is_like_wasm {
+            return out;
         }
-    }
-    let mut out: Vec<String> = index(tcx)
-        .values()
-        .flatten()
-        .filter(|i| matches!(home.get(&MonoItem::Fn(**i)), Some(&(true, 1))))
-        .map(|i| tcx.symbol_name(*i).name.to_string())
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+        // item -> (Internal, inlined, holders)
+        let mut home: FxHashMap<MonoItem<'tcx>, (bool, bool, u32)> = FxHashMap::default();
+        for p in tcx.collect_and_partition_mono_items(()).codegen_units {
+            for (&item, data) in p.items() {
+                let e = home.entry(item).or_insert((
+                    data.linkage == rustc_attr_ir::Linkage::Internal,
+                    data.inlined,
+                    0,
+                ));
+                e.2 += 1;
+            }
+        }
+        // Profile-use build: a promoted function gives up what the
+        // optimizer does for private ones (measured on html-rewriter:
+        // +0.3% instructions when the hot targets are promoted and no
+        // guard uses them). Promote only a target some site outside its
+        // own CGU names; the instrumented build promotes every
+        // candidate, like blind mode.
+        let named = crate::env_set("PLIRON_PGO_USE")
+            .then(|| pliron_ir_opt::pgo::summary().map(|s| &s.icall_targets));
+        // symbol hash -> the CGUs holding that function of this crate
+        let mut holders: FxHashMap<u64, Vec<rustc_span::Symbol>> = FxHashMap::default();
+        if named.is_some() {
+            for p in tcx.collect_and_partition_mono_items(()).codegen_units {
+                for item in p.items().keys() {
+                    if let MonoItem::Fn(f) = *item {
+                        let h = pliron_ir_opt::pgo::sym_hash(tcx.symbol_name(f).name);
+                        holders.entry(h).or_default().push(p.name());
+                    }
+                }
+            }
+        }
+        let holder_of = |i: Instance<'tcx>| {
+            tcx.collect_and_partition_mono_items(())
+                .codegen_units
+                .iter()
+                .find(|p| p.items().contains_key(&MonoItem::Fn(i)))
+                .map(|p| p.name())
+        };
+        for &i in index(tcx).values().flatten() {
+            let Some(&(true, inlined, 1)) = home.get(&MonoItem::Fn(i)) else { continue };
+            if inlined
+                && !i.def_id().is_local()
+                && i.args.non_erasable_generics().next().is_none()
+            {
+                continue;
+            }
+            let sym = tcx.symbol_name(i).name;
+            if let Some(named) = named {
+                let Some(callers) = named.and_then(|n| n.get(sym)) else { continue };
+                let here = holder_of(i);
+                // A caller this crate does not hold is in another crate.
+                let outside = callers.iter().any(|c| match holders.get(c) {
+                    Some(cgus) => cgus.iter().any(|g| Some(*g) != here),
+                    None => true,
+                });
+                if !outside {
+                    continue;
+                }
+            }
+            out.insert(sym.to_string());
+        }
+        out
+    })
 }
 
 /// The collector's `find_tails_for_unsizing`: the (sized, unsized) pair of
@@ -402,18 +584,10 @@ fn same_abi<'tcx>(
 fn linkable<'tcx>(cx: &CodegenCx<'tcx>, inst: Instance<'tcx>) -> bool {
     let tcx = cx.tcx;
     let sym = tcx.symbol_name(inst).name;
-    {
-        // An xcgu copy made here is not a reason in a profile build: the
-        // copy set follows the profile (`PLIRON_PGO_XCGU`), and the
-        // candidate list must not differ between gen and use builds.
-        let st = cx.st.borrow();
-        if st.funcs.get(sym).is_some_and(|f| f.linkage != cranelift_module::Linkage::Import)
-            && !(profile_mode() && st.xcgu_extra.contains(sym))
-        {
-            return true;
-        }
+    if cx.st.borrow().funcs.get(sym).is_some_and(|f| f.linkage != cranelift_module::Linkage::Import) {
+        return true;
     }
-    if crate::xcgu::home_linkable(tcx).contains(sym) {
+    if crate::xcgu::home_linkable(tcx).contains(sym) || promotable(tcx).contains(sym) {
         return true;
     }
     let def_id = inst.def_id();

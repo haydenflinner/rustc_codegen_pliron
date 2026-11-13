@@ -15,7 +15,14 @@
 //! ```text
 //! "PLRAW01" (8 bytes)
 //! per CGU: u64 payload_len | Hdr (32B) | recs (recs_len B) | ctrs (nctrs*8 B)
+//!          [| Ext (72B) | sites (nsites*72 B) | fns (nfns*24 B) | names]
 //! ```
+//!
+//! The bracketed part follows when the header magic is "PLPROF02": the
+//! indirect-call value profile. [`__pliron_prof_icall`] fills each site's
+//! `SLOTS` `(target address, count)` pairs; `fns` is the CGU's
+//! `{symbol hash, address, flags}` table and `names` its symbol names,
+//! from which `pliron-prof` names the recorded addresses.
 //!
 //! `pliron-prof merge` folds raw dumps (and `.prof` files) into a
 //! profile — merging lives in the CLI so the runtime never allocates.
@@ -26,6 +33,24 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// `.prof` magic the headers carry ("PLPROF01" little-endian).
 const MAGIC: u64 = u64::from_le_bytes(*b"PLPROF01");
+/// Header magic of a CGU with the indirect-call extension after `recs`.
+const MAGIC2: u64 = u64::from_le_bytes(*b"PLPROF02");
+/// Target slots per indirect-call site (pgo.rs `SLOTS`).
+const SLOTS: usize = 4;
+
+/// What follows `recs` in a "PLPROF02" header (pgo.rs `instrument`).
+#[repr(C)]
+pub struct Ext {
+    pub crate_id: u64,
+    pub cgu: u64,
+    pub sites: *const u64,
+    pub nsites: u64,
+    pub fns: *const u64,
+    pub nfns: u64,
+    pub names: *const u8,
+    pub names_len: u64,
+    pub crate_hash: u64,
+}
 
 /// Registered CGU headers. rustc links ~20k CGUs; overflow is
 /// dropped, never fatal.
@@ -145,18 +170,40 @@ extern "C" fn flush() {
         let hdrs = core::ptr::addr_of!(HDRS) as *const usize;
         for i in 0..n {
             let h = *hdrs.add(i) as *const Hdr;
-            if (*h).magic != MAGIC {
+            let v2 = (*h).magic == MAGIC2;
+            if (*h).magic != MAGIC && !v2 {
                 continue;
             }
             let recs_len = (*h).recs_len as usize;
             let nctrs = (*h).nctrs as usize;
+            let ext = (h as *const u8).add(core::mem::size_of::<Hdr>() + recs_len) as *const Ext;
+            let (sites_b, fns_b, names_b) = if v2 {
+                (
+                    (*ext).nsites as usize * (SLOTS * 2 + 1) * 8,
+                    (*ext).nfns as usize * 24,
+                    (*ext).names_len as usize,
+                )
+            } else {
+                (0, 0, 0)
+            };
             let total = core::mem::size_of::<Hdr>() as u64
                 + recs_len as u64
-                + nctrs as u64 * 8;
+                + nctrs as u64 * 8
+                + if v2 {
+                    (core::mem::size_of::<Ext>() + sites_b + fns_b + names_b) as u64
+                } else {
+                    0
+                };
             w(fd, &total as *const u64 as *const u8, 8);
             w(fd, h as *const u8, core::mem::size_of::<Hdr>());
             w(fd, (h as *const u8).add(core::mem::size_of::<Hdr>()), recs_len);
             w(fd, (*h).ctrs as *const u8, nctrs * 8);
+            if v2 {
+                w(fd, ext as *const u8, core::mem::size_of::<Ext>());
+                w(fd, (*ext).sites as *const u8, sites_b);
+                w(fd, (*ext).fns as *const u8, fns_b);
+                w(fd, (*ext).names, names_b);
+            }
         }
         close(fd);
     }
@@ -176,6 +223,29 @@ pub extern "C" fn __pliron_prof_register(hdr: *const Hdr) {
             *(core::ptr::addr_of_mut!(HDRS) as *mut usize).add(i) = hdr as usize;
         }
     }
+}
+
+/// Called before every profiled indirect call: count `target` at `site`
+/// (`SLOTS` x `(address, count)`, then one count for everything that
+/// found no slot). Plain loads and stores like the block counters; a lost
+/// update under threads only costs a count.
+#[no_mangle]
+pub unsafe extern "C" fn __pliron_prof_icall(site: *mut u64, target: u64) {
+    let mut i = 0usize;
+    while i < SLOTS {
+        let a = site.add(i * 2);
+        if *a == target {
+            *a.add(1) += 1;
+            return;
+        }
+        if *a == 0 {
+            *a = target;
+            *a.add(1) = 1;
+            return;
+        }
+        i += 1;
+    }
+    *site.add(SLOTS * 2) += 1;
 }
 
 #[panic_handler]

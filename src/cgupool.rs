@@ -85,6 +85,8 @@ pub(crate) struct CrateCfg {
     pub small: bool,
     pub small_limit: usize,
     pub ihot: usize,
+    /// Indirect-call promotion (`PLIRON_DEVIRT` in a profile build).
+    pub icp: Option<crate::devirt::IcpCfg>,
 }
 
 impl CrateCfg {
@@ -157,6 +159,7 @@ impl CrateCfg {
                 inline::SMALL_LIMIT
             },
             ihot,
+            icp: crate::devirt::IcpCfg::new(tcx),
         }
     }
 }
@@ -1024,15 +1027,45 @@ pub(crate) fn finish_pre(
         let fmt = cfg.fmt;
         let mut asm = None;
         if env_set("PLIRON_PGO") {
-            let (hdr, ctor, _) = pgo::instrument(ctx, st, name, fmt);
+            if cfg.icp.is_some() && pliron_ir_opt::devirt::any_sites(ctx, st) {
+                // The value-profile hook `pgo::instrument` calls at every
+                // indirect-call site.
+                let ptr = type_ptr(ctx);
+                let void = type_void(ctx);
+                let fty = type_func(ctx, &[ptr, ptr], void);
+                declare_fn_sym(
+                    ctx,
+                    st,
+                    module,
+                    pliron_ir_opt::devirt::ICALL_SYM,
+                    fty,
+                    Linkage::Import,
+                    Exts::default(),
+                );
+            }
+            let crate_id = cfg.icp.as_ref().map_or((0, 0), |c| (c.crate_id, c.crate_hash));
+            let (hdr, ctor, _) = pgo::instrument(ctx, st, name, fmt, crate_id);
             if !hdr.is_empty() {
                 asm = pgo::ctor_asm(&hdr, &ctor, cfg.aarch64, fmt);
             }
         }
         if let Some(f) = env_get("PLIRON_PGO_USE") {
             pgo::load(ctx, st, f);
-            // `PLIRON_DEVIRT`: keep the guard arms the profile saw taken.
-            pliron_ir_opt::devirt::prune(ctx, st);
+            // `PLIRON_DEVIRT`: guard the targets the profile saw at each
+            // indirect-call site.
+            if let Some(c) = &cfg.icp {
+                pliron_ir_opt::devirt::promote(
+                    ctx,
+                    st,
+                    &mut pliron_ir_opt::devirt::Icp {
+                        cgu: pgo::cgu_hash(name),
+                        linkable: &|t| c.linkable(t),
+                        declare: &mut |ctx, st, sym, ty, exts| {
+                            declare_fn_sym(ctx, st, module, sym, ty, Linkage::Import, exts);
+                        },
+                    },
+                );
+            }
             // `PLIRON_FIELD_HEAT`: weigh this CGU's field accesses.
             crate::field_order::resolve(name, st);
         }

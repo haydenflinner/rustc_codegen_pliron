@@ -345,24 +345,6 @@ pub struct CallInfo {
     pub noret: bool,
 }
 
-/// One guarded-devirtualization site (`PLIRON_DEVIRT`): a chain of guard
-/// blocks, each holding only `icmp eq fnptr, &target` and a `cond_br` to
-/// its hit block (the direct call) or to the next guard; the last guard
-/// misses to `fallback`, the indirect call.
-pub struct DevirtSite {
-    /// (guard block, hit block, counts unusable) in chain order. The flag
-    /// marks an arm whose hit count from the instrumented build does not
-    /// describe this build's guard; it is always dropped.
-    pub arms: Vec<(Ptr<BasicBlock>, Ptr<BasicBlock>, bool)>,
-    /// Per arm: the target has a body in this CGU (the direct call can
-    /// inline). Remarks only.
-    pub local: Vec<bool>,
-    pub fallback: Ptr<BasicBlock>,
-    /// Caller symbol and trait method path, for remarks (empty when off).
-    pub caller: String,
-    pub what: String,
-}
-
 #[derive(Default)]
 // r[impl front.ir.sidetables]
 // r[impl iropt.state]
@@ -626,12 +608,13 @@ pub struct State {
     /// to cloned blocks (scaled by callsite/callee-entry ratio), so
     /// inlined code carries the callee's counts into the caller.
     pub prof_bcount: ColMap<Ptr<BasicBlock>, u64>,
-    /// `PLIRON_DEVIRT` guard chains built for a profile-use build
-    /// (`PLIRON_PGO_USE`), pruned by `devirt::prune` once counts are loaded.
-    pub devirt_sites: Vec<DevirtSite>,
-    /// Virtual calls `PLIRON_DEVIRT` left alone in a profile-use build,
-    /// kept only for remarks: (block of the call, caller, method, reason).
-    pub devirt_rejects: Vec<(Ptr<BasicBlock>, String, String, String)>,
+    /// Indirect-call promotion sites (`PLIRON_DEVIRT` in a profile
+    /// build): the virtual (and, opt-in, fn-pointer) call ops the front
+    /// end emitted, with the trait method path for remarks (empty when
+    /// remarks are off). `pgo::instrument` records each site's targets,
+    /// `devirt::promote` guards the hot ones; both number a function's
+    /// sites by position, so only ops still in place count.
+    pub icall_sites: ColMap<Ptr<Operation>, String>,
     /// The profile's hot count: the smallest block count among the blocks
     /// that together carry 99% of all counted executions (LLVM's
     /// `ProfileSummary` hot threshold). A call site at or above it is hot.
@@ -691,9 +674,7 @@ impl State {
         self.region_blocks.retain(lb);
         self.region_parent.retain(lb);
         self.prof_bcount.retain(lb);
-        self.devirt_rejects.retain(|r| lb(&r.0));
-        self.devirt_sites
-            .retain(|s| lb(&s.fallback) && s.arms.iter().all(|(g, h, _)| lb(g) && lb(h)));
+        self.icall_sites.retain(lo);
         if self.last_call.is_some_and(|c| !c.is_live(ctx)) {
             self.last_call = None;
         }

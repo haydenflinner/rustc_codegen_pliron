@@ -1,0 +1,9 @@
+# Cross-crate indirect-call promotion (docs/pgo.md, "Devirtualization").
+# Not wired into test.sh; run through the profile loop:
+#   PLIRON_PGO=1 build + run, `pliron-prof merge`, PLIRON_PGO_USE build.
+[workspace]
+members = ["lib", "app"]
+resolver = "2"
+
+[profile.release]
+codegen-units = 4

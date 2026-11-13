@@ -44,6 +44,10 @@ computed when counters are placed. The use-side build recomputes it on
 the same pre-pipeline CFG, so matching is exact; a function whose shape
 changed keeps its old record harmlessly un-merged.
 
+After the function records an optional trailer (`"PLICALL2"`) holds the
+indirect-call sites of the functions that have any (see
+"Devirtualization"); a profile without it is read as having no sites.
+
 Merging: keyed union add on `(sym_hash, fingerprint)`. The runtime merges
 on write, so repeated runs accumulate without a merge tool. Multiple
 files can be concatenated by `pliron-prof merge`.
@@ -340,29 +344,54 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
 
 ## Devirtualization
 
-`PLIRON_DEVIRT=1` turns a `dyn Trait` call into guards on the function
-pointer loaded from the vtable, each followed by a direct call, with the
-indirect call kept as the last arm (`src/devirt.rs`). The profile says
-which targets deserve a guard, and it needs no value-profiling runtime:
-every guard's hit block has an ordinary block counter. The candidates
-are the slot instances of the vtables this crate instantiates (impl
-methods, provided methods, closure bodies behind `dyn Fn*`); the
-instrumented build emits a guard for up to `PLIRON_DEVIRT_PROF_MAX`
-(16) of them, in symbol order, and the remark says how many were left
-without one. The profile-use build emits exactly the same chain, so
-the function's fingerprint matches, and right after `pgo::load`
-`pliron_ir_opt::devirt::prune` rewrites each chain: arms with at least
-`PLIRON_DEVIRT_MIN_SHARE` (10) percent of the site's calls stay, at
-most `PLIRON_DEVIRT_MAX` (2), hottest first; the rest are deleted and
-their counts added to the fallback block. A site with no calls, or in a
-function without a matching record, becomes the plain indirect call
-again. The knob must be set for both builds
-(`run.py --pgo-gen-env PLIRON_DEVIRT=1 --pgo-env PLIRON_DEVIRT=1`);
-set on one side only, every function with a site goes stale.
-`PLIRON_REMARKS` lists each site's shares, and for the sites left
-indirect their call counts and the reason (vtable built in another
-crate, target not linkable from the CGU, ABI). Numbers:
-`docs/history/2026-11-13-six-features.md`, section 3.
+Indirect-call promotion from a value profile, on by default in both
+profile builds (`PLIRON_DEVIRT=0` turns it off; use the same setting
+for the instrumented and the profile-use build, because it also decides
+which symbols are promoted to external).
+
+- **Sites.** Every virtual call (`dyn Trait` methods, `dyn Fn*`, virtual
+  drop) is a site; `PLIRON_DEVIRT_FNPTR=1` adds calls through fn
+  pointers. Both builds emit the plain indirect call, so the CFG
+  fingerprint is the same with and without the feature. A function's
+  sites are numbered by position (`pliron_ir_opt::devirt::sites`).
+- **Instrumented build.** `__pliron_prof_icall(site, target)` runs
+  before each site. A site is 4 `(address, count)` slots, first come
+  first kept, plus a count for everything else. The CGU header (magic
+  `PLPROF02`) is followed by `{crate hash, cgu hash, sites, nsites, fns,
+  nfns, names, names_len}`; `fns` is `{symbol hash, &fn, flags}` for
+  every body in the CGU. The function record's spare word holds its
+  number of sites.
+- **Merge.** The raw dump carries those tables; `pliron-prof merge`
+  maps each recorded address to a symbol through the tables of all CGUs
+  of the process and appends the sites to the `.prof` as a trailer
+  (`PLICALL1`): per function, per site, the "other" count and
+  `(count, crate hash, cgu hash, flags, symbol name)` per target.
+  Addresses no table has (std, C) count as "other".
+- **Profile-use build.** After `pgo::load`,
+  `pliron_ir_opt::devirt::promote` turns a site into
+  `if fnptr == &target { target(args) } else ... else { fnptr(args) }`
+  for at most `PLIRON_DEVIRT_MAX` (2) targets with at least
+  `PLIRON_DEVIRT_MIN_SHARE` (10) percent of its calls. The indirect
+  call always stays, so a wrong profile costs a compare.
+- **Which targets.** One whose body is in the CGU and whose profiled
+  address came from that CGU; a symbol of the crate that other CGUs
+  can link; a symbol of a dependency, verified in this build — a crate
+  linked here (a binary) reads the dependency rlib's symbol table, an
+  rlib crate requires the dependency's crate hash to equal the profiled
+  one. `PLIRON_DEVIRT_DOWNSTREAM=1` also accepts targets in crates that
+  depend on this one — the object then needs them at link time, and
+  nothing checks the profile against those crates.
+  `PLIRON_DEVIRT_LINKED=0` keeps only targets with a body in the CGU.
+- **Promotion.** For a target to have a linkable name, vtable slot
+  instances that are `Internal` in one CGU are defined hidden-external
+  (`devirt::promotable`): all of them in the instrumented build, in the
+  profile-use build those the profile names from outside their CGU.
+
+`PLIRON_REMARKS` has one `devirt` line per site that ran: targets kept,
+shares, and why a hot target was not used. Numbers:
+`docs/history/2026-11-13-six-features.md`, section 3. Without a
+profile, `PLIRON_DEVIRT=1` guards sites with at most two possible
+targets among the vtables the crate instantiates (`src/devirt.rs`).
 
 ## Knobs
 

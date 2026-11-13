@@ -92,13 +92,6 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
             ))
 }
 
-/// Whether a copy of `inst` exists only because the profile called it hot
-/// (`PLIRON_PGO_XCGU`): over the size limit every build applies.
-pub fn pgo_only_copy<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>) -> bool {
-    let limit = size_limit(tcx);
-    limit != usize::MAX && tcx.size_estimate(inst) > limit
-}
-
 fn used<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>) -> Option<&'tcx [Spanned<MonoItem<'tcx>>]> {
     tcx.items_of_instance((inst, CollectionMode::UsedItems))
         .ok()
@@ -176,13 +169,14 @@ pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
         if tcx.sess.target.is_like_wasm {
             return out;
         }
+        // `PLIRON_DEVIRT`: guard targets (vtable slot instances) private
+        // to one CGU, so guards in other CGUs — of this crate or, by
+        // symbol, of another — can name them. Also for a one-CGU crate.
+        out.extend(crate::devirt::promotable(tcx).iter().cloned());
         let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
         if parts.len() <= 1 {
             return out;
         }
-        // `PLIRON_DEVIRT=1`: guard targets (vtable slot instances) private
-        // to one CGU, so guards in the crate's other CGUs can name them.
-        out.extend(crate::devirt::promotable(tcx));
         if crate::env_get("PLIRON_XCGU_PROMOTE") == Some("copyable") {
             // `=copyable`: also promote single-home Internal items that some
             // CGU actually copies — the only items whose duplicated bodies
