@@ -325,3 +325,17 @@ the cache. The backend is the cost, not the front end. (Fixed on the
 way: an instrumented unit with no function bodies emitted a
 constructor for a header it never defined — a link error under
 incremental builds.)
+
+**`PLIRON_MEMFAST_SMALL=loop`** (new, opt-in, no profile needed):
+inline small copies only in blocks on a CFG cycle of the function.
+Eight programs, 11 rounds, against defaults:
+
+| mode | time | instructions run | instructions in binary (per program) |
+|---|---|---|---|
+| `=1` | 0.971 | 0.992 | +6.5 +1.7 +1.7 +0.6 +0.1 +1.9 +0.2 +1.4 % |
+| `=loop` | 0.980 | 0.997 | +2.0 +1.0 +0.1 +0.1 +0.0 +0.8 +0.1 +0.1 % |
+
+(program order: regex, pulldown-cmark, rust-html-rewriter, rust-json,
+rust-protobuf, rust-compression, blake3-scalar, blind-sig.) Two thirds
+of the speed for a quarter of the size; rust-protobuf 0.91 and regex
+0.97 carry it. The best candidate from this work for a default flip.

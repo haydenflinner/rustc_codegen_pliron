@@ -1771,6 +1771,7 @@ pub fn lower_module<'a>(
                     ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                     ltzero: FxHashSet::default(),
                     ltloops: FxHashSet::default(),
+                cycles: FxHashSet::default(),
                     ltdom: None,
                     dbg_slots: Default::default(),
                 };
@@ -2849,6 +2850,7 @@ pub fn lower_clif_wasm(
                 ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                 ltzero: FxHashSet::default(),
                 ltloops: FxHashSet::default(),
+                cycles: FxHashSet::default(),
                 ltdom: None,
                 dbg_slots: Default::default(),
             };
@@ -3427,6 +3429,9 @@ struct FnLower<'a, 'b> {
     ltundef: bool,
     /// The blocks where `ltundef` emits its zeros (`lt_loop_blocks`).
     ltloops: FxHashSet<Ptr<BasicBlock>>,
+    /// `PLIRON_MEMFAST_SMALL=loop`: the blocks on a CFG cycle
+    /// (`cycle_blocks`); empty unless that mode is on.
+    cycles: FxHashSet<Ptr<BasicBlock>>,
     /// The zeros `ltundef` emits at markers. They are skipped when a later
     /// marker picks its anchor: a zero no read uses dies in the pipeline,
     /// and a marker anchored on a dead inst falls back to its whole block,
@@ -3574,6 +3579,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .collect();
                 self.vars.insert(a, vs);
             }
+        }
+        if pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot") == Some("loop") {
+            self.cycles = cycle_blocks(ctx, &pblocks);
         }
         if self.ltundef && !crate::env_is("PLIRON_LTUNDEF_ALL", "1") {
             self.ltloops = lt_loop_blocks(ctx, self.st, &pblocks, &self.vars);
@@ -7842,6 +7850,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .get_parent_block()
                             .and_then(|b| crate::pgo::block_count(self.st, b))
                             .is_none_or(|c| c > 0),
+                        // `=loop`: no profile needed — copies on a CFG
+                        // cycle of this function (after inlining). Most
+                        // of `=1`'s speed for a fraction of its size.
+                        Some("loop") => {
+                            op.deref(self.ctx).get_parent_block().is_some_and(|b| self.cycles.contains(&b))
+                        }
                         _ => false,
                     };
                     self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2], small);
@@ -8152,6 +8166,48 @@ impl<'a, 'b> FnLower<'a, 'b> {
         };
         self.set1(op, r);
     }
+}
+
+/// Blocks that lie on a CFG cycle (successor edges only): those that can
+/// reach themselves. Quadratic; functions over 4,000 blocks get nothing.
+fn cycle_blocks(ctx: &Context, pblocks: &[Ptr<BasicBlock>]) -> rustc_hash::FxHashSet<Ptr<BasicBlock>> {
+    let mut out = rustc_hash::FxHashSet::default();
+    let n = pblocks.len();
+    if n > 4000 {
+        return out;
+    }
+    let idx: FxHashMap<Ptr<BasicBlock>, usize> = pblocks.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let succ: Vec<Vec<usize>> = pblocks
+        .iter()
+        .map(|b| match b.deref(ctx).iter(ctx).last() {
+            Some(t) => t.deref(ctx).successors(ctx).filter_map(|d| idx.get(&d).copied()).collect(),
+            None => Vec::new(),
+        })
+        .collect();
+    // Only blocks with a retreating edge somewhere below can cycle; the
+    // plain per-block search is fine at these sizes.
+    let mut seen = vec![usize::MAX; n];
+    let mut stack = Vec::new();
+    for i in 0..n {
+        stack.clear();
+        stack.extend(succ[i].iter().copied());
+        let mut hit = false;
+        while let Some(x) = stack.pop() {
+            if x == i {
+                hit = true;
+                break;
+            }
+            if seen[x] == i {
+                continue;
+            }
+            seen[x] = i;
+            stack.extend(succ[x].iter().copied());
+        }
+        if hit {
+            out.insert(pblocks[i]);
+        }
+    }
+    out
 }
 
 /// `lt_loop_blocks`' default: distinct restarted variables that make a
