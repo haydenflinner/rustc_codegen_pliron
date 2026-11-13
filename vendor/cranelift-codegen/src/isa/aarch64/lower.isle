@@ -1235,6 +1235,11 @@
 ;; vectors.
 (rule (lower (ineg (ty_vec128 ty) x))
       (neg x (vector_size ty)))
+;; PLIRON: 64-bit integer vectors too (`neg` on `.8b/.4h/.2s`): slp
+;; builds `ineg.i32x2` and nothing matched it (brotli `FindBlocks` under
+;; a profile: "should be implemented in ISLE").
+(rule -1 (lower (ineg (ty_vec64_int ty) x))
+      (neg x (vector_size ty)))
 
 ;;;; Rules for `imul` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

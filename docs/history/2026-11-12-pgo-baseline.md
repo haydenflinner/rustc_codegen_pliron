@@ -39,3 +39,19 @@ Failures under `PLIRON_PGO_USE`:
   that emits a vector `ineg` the aarch64 backend has no rule for.
 - blind-sig: the profiled binary dies with SIGBUS (the instrumented one
   runs).
+
+## Follow-up (same evening)
+
+- rust-compression: fixed — aarch64 had no rule for `ineg` on 64-bit
+  integer vectors (`slp` builds `ineg.i32x2`); added next to the other
+  `ty_vec64_int` rules. With it, pgo/pliron 1.021 [0.969, 1.056],
+  llvm-pgo/llvm 0.965 on that program.
+- blind-sig: still open. `fnbisect` names
+  `rsa::internals::blind::<ThreadRng, RsaPublicKey>` (crash in
+  `SmallVec<[u64; 4]>::extend` called from it). `PLIRON_SROA=0` hides
+  it; `PLIRON_PGO_LOOP=0`, `MEMCPYOPT=0`, `SLOTPROM=0`, `EGRAPH=0` do
+  not. `optbisect` lands on `egraph2` (unit 421), and
+  `PLIRON_DIFFCHECK=step` reports nothing for the function, so the
+  wrong step is probably on the pliron-IR side (`sroa`) with the CLIF
+  step only exposing it. Repro: `PLIRON_PGO_USE=target/heldout/pgo/
+  blind-sig/pliron.prof` on the blind-sig benchmark crate.
