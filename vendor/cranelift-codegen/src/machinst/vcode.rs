@@ -1383,6 +1383,36 @@ impl<I: VCodeInst> VCode<I> {
         }
         let v: Vec<Option<u64>> =
             (0..self.num_blocks()).map(|b| self.block_order.prof_count(BlockIndex::new(b))).collect();
+        // `PLIRON_PGO_FREQ_STATS=1`: coverage, one line per function.
+        static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *STATS.get_or_init(|| std::env::var_os("PLIRON_PGO_FREQ_STATS").is_some()) {
+            let nb = self.num_blocks();
+            let have = v.iter().filter(|c| c.is_some()).count();
+            let (mut br, mut meas) = (0, 0);
+            for b in 0..nb {
+                let ss = self.block_succs(BlockIndex::new(b));
+                if ss.len() > 1 {
+                    br += 1;
+                    if ss.iter().all(|s| {
+                        let mut t = s.index();
+                        for _ in 0..4 {
+                            if t < nb && v[t].is_some() {
+                                return true;
+                            }
+                            let ts = if t < nb { self.block_succs(BlockIndex::new(t)) } else { &[] };
+                            if ts.len() != 1 {
+                                return false;
+                            }
+                            t = ts[0].index();
+                        }
+                        false
+                    }) {
+                        meas += 1;
+                    }
+                }
+            }
+            std::eprintln!("pgofreq: blocks {nb} counted {have} branches {br} measured {meas}");
+        }
         if v.iter().any(|c| c.is_some()) { v } else { Vec::new() }
     }
 

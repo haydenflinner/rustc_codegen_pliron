@@ -7213,7 +7213,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// Runtime-size copy: sizes in [k, 2k] (k = 16, or 8 without SIMD) are two
     /// overlapping k-byte moves, loads first so it is also a valid memmove; other
     /// sizes call libc. `PLIRON_MEMFAST=0` always calls libc.
-    fn small_copy_or_call(&mut self, memcpy: bool, dst: ir::Value, src: ir::Value, n: ir::Value) {
+    ///
+    /// `small` (`PLIRON_MEMFAST_SMALL`): sizes below `k` are inline too —
+    /// two overlapping 8- or 4-byte moves, or three byte moves for 1..3
+    /// (first, middle, last), nothing for 0. Short strings (`push_str` of
+    /// a tag, a word) never reach `[k, 2k]`, and the libc call costs more
+    /// than the copy: its own size dispatch, and every value live across
+    /// it pushed into a callee-saved register or a spill slot. LLVM gets
+    /// the same effect from value-profiling the size (`MemOPSizeOpt`,
+    /// -6% cycles on pulldown-cmark under its profile).
+    fn small_copy_or_call(&mut self, memcpy: bool, dst: ir::Value, src: ir::Value, n: ir::Value, small: bool) {
         let t = if crate::pass_enabled("PLIRON_SIMD") {
             clt::I8X16
         } else {
@@ -7230,7 +7239,53 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .b
             .ins()
             .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, m, k);
-        self.b.ins().brif(c, fast, &[], slow, &[]);
+        if small {
+            let f = if self.st.notrap { MemFlagsData::new().with_notrap() } else { MemFlagsData::new() };
+            let (tiny, big) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(c, fast, &[], tiny, &[]);
+            self.b.switch_to_block(tiny);
+            // Not in [k, 2k]: below k is ours, above 2k is libc's.
+            let lt = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, n, k);
+            self.b.ins().brif(lt, big, &[], slow, &[]);
+            self.b.switch_to_block(big);
+            // Two overlapping `w`-byte moves cover [w, 2w).
+            let mut widths: Vec<(i64, ir::Type)> = Vec::new();
+            if k == 16 {
+                widths.push((8, clt::I64));
+            }
+            widths.push((4, clt::I32));
+            for (w, wt) in widths {
+                let (hit, miss) = (self.b.create_block(), self.b.create_block());
+                let ge = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, n, w);
+                self.b.ins().brif(ge, hit, &[], miss, &[]);
+                self.b.switch_to_block(hit);
+                let off = self.b.ins().iadd_imm_s(n, -w);
+                let (se, de) = (self.b.ins().iadd(src, off), self.b.ins().iadd(dst, off));
+                let v0 = self.b.ins().load(wt, f, src, 0);
+                let v1 = self.b.ins().load(wt, f, se, 0);
+                self.b.ins().store(f, v0, dst, 0);
+                self.b.ins().store(f, v1, de, 0);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(miss);
+            }
+            // 0..3 bytes: first, middle and last byte cover 1, 2 and 3.
+            let some = self.b.create_block();
+            self.b.ins().brif(n, some, &[], done, &[]);
+            self.b.switch_to_block(some);
+            let half = self.b.ins().ushr_imm_u(n, 1);
+            let last = self.b.ins().iadd_imm_s(n, -1);
+            let (sm, dm) = (self.b.ins().iadd(src, half), self.b.ins().iadd(dst, half));
+            let (sl, dl) = (self.b.ins().iadd(src, last), self.b.ins().iadd(dst, last));
+            let b0 = self.b.ins().load(clt::I8, f, src, 0);
+            let b1 = self.b.ins().load(clt::I8, f, sm, 0);
+            let b2 = self.b.ins().load(clt::I8, f, sl, 0);
+            self.b.ins().store(f, b0, dst, 0);
+            self.b.ins().store(f, b1, dm, 0);
+            self.b.ins().store(f, b2, dl, 0);
+            self.b.ins().jump(done, &[]);
+        } else {
+            self.b.ins().brif(c, fast, &[], slow, &[]);
+        }
         self.b.switch_to_block(fast);
         let (se, de) = (self.b.ins().iadd(src, m), self.b.ins().iadd(dst, m));
         // Same UB-on-invalid rule as `plain_mf`: a copy to/from invalid
@@ -7755,7 +7810,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     && !self.st.volatile.contains(op)
                     && self.b.func.dfg.value_type(a[2]) == clt::I64
                 {
-                    self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2]);
+                    // `PLIRON_MEMFAST_SMALL=1`: every runtime-size copy;
+                    // `=hot`: only where the profile's count for this
+                    // block reaches its hot count.
+                    let small = match crate::env_get("PLIRON_MEMFAST_SMALL").as_deref() {
+                        Some("1") => true,
+                        Some("hot") => op
+                            .deref(self.ctx)
+                            .get_parent_block()
+                            .and_then(|b| crate::pgo::block_count(self.st, b))
+                            .zip(self.st.prof_hot)
+                            .is_some_and(|(c, h)| c >= h),
+                        _ => false,
+                    };
+                    self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2], small);
                     return;
                 }
                 let cfg = self.tcfg;
