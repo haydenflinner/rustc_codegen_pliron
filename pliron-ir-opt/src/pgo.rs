@@ -629,6 +629,27 @@ pub fn load(ctx: &Context, st: &mut State, path: &str) -> usize {
         eprintln!("pliron-pgo: {path}: bad profile (magic)");
         return 0;
     };
+    // The hot count, over the whole profile (not just this CGU's
+    // functions): walk block counts from the largest down until 99% of
+    // the total is covered.
+    {
+        let mut counts: Vec<u64> = profiles
+            .iter()
+            .flat_map(|(_, f)| f.blocks.iter().copied())
+            .filter(|&c| c > 0)
+            .collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let total: u128 = counts.iter().map(|&c| c as u128).sum();
+        let mut acc: u128 = 0;
+        st.prof_hot = None;
+        for &c in &counts {
+            acc += c as u128;
+            if acc * 100 >= total * 99 {
+                st.prof_hot = Some(c.max(2));
+                break;
+            }
+        }
+    }
     // Group by sym hash: several fingerprints per symbol may exist.
     let mut by_sym: FxHashMap<u64, Vec<(u64, ProfFn)>> = FxHashMap::default();
     for ((sh, fp), f) in profiles {

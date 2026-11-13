@@ -1408,6 +1408,11 @@ pub fn run(
         FxHashMap::default()
     };
     let pgo_inline = !crate::env_is("PLIRON_PGO_INLINE", "0");
+    let pgo_hot: usize = if pgo_inline {
+        crate::env_get("PLIRON_PGO_HOT").and_then(|s| s.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    };
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
@@ -1672,6 +1677,21 @@ pub fn run(
                     if site_count.is_some_and(|c| c >= 4) {
                         t = t.saturating_add(limit.saturating_mul(2));
                     }
+                    // `PLIRON_PGO_HOT=<k>` (opt-in): a call site whose count
+                    // reaches the profile's hot count gets `k` times the
+                    // base limit (LLVM: 3000 against 225) and is exempt
+                    // from the static doubts below (`loopy`, `fanin`, the
+                    // per-caller growth budget): the profile says this is
+                    // where the time goes. LLVM's whole PGO gain on
+                    // pulldown-cmark is this — `parse_line`,
+                    // `escape_html_scalar`, `Tree::append` and
+                    // `item_to_event` folded into their hot callers.
+                    let hot_site = pgo_hot > 0
+                        && !f.cold
+                        && site_count.zip(st.prof_hot).is_some_and(|(c, h)| c >= h);
+                    if hot_site {
+                        t = t.max(limit.saturating_mul(pgo_hot));
+                    }
                     // The callee's size at this site: specialized (`spec`) or raw.
                     let (sn, scalls) = if spec {
                         let key: Vec<Option<u128>> = args
@@ -1805,6 +1825,7 @@ pub fn run(
                             .is_some_and(|&(_, catch)| catch || !eh_invoke);
                     let loopy = (small || loopy_native)
                         && loopy_min > 0
+                        && !hot_site
                         && !free
                         && !f.inline_hint
                         && ci.n > loopy_min
@@ -1879,6 +1900,7 @@ pub fn run(
                         "reject (cap)"
                     } else if fanin > 0
                         && !free
+                        && !hot_site
                         && !f.always_inline
                         && adj
                             .as_ref()
@@ -1889,7 +1911,7 @@ pub fn run(
                             .contains(&b)
                     {
                         "reject (fanin)"
-                    } else if model && !free && grown + sn > growth {
+                    } else if model && !free && !hot_site && grown + sn > growth {
                         "reject (growth)"
                     } else if maxdup > 0
                         && !f.always_inline
@@ -3545,7 +3567,15 @@ fn inline_call(
     }
     let callee_entry = st.prof.get(callee).and_then(|p| p.blocks.first().copied());
     let scale = |x: u64| match (callsite_c, callee_entry) {
-        (Some(c), Some(e)) => ((x as u128 * c as u128) / e.max(1) as u128) as u64,
+        // Never round a block that ran, cloned into a site that ran, down
+        // to 0: a zero count means "cold" to every consumer (the inliner
+        // rejects its call sites outright, layout moves it out of line),
+        // and a callee with a large entry count scaled into a rarer site
+        // truncated most of its body to exactly that.
+        (Some(c), Some(e)) => {
+            let v = ((x as u128 * c as u128) / e.max(1) as u128) as u64;
+            if v == 0 && x > 0 && c > 0 { 1 } else { v }
+        }
         _ => x,
     };
 

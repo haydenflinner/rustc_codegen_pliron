@@ -608,6 +608,10 @@ pub struct State {
     /// to cloned blocks (scaled by callsite/callee-entry ratio), so
     /// inlined code carries the callee's counts into the caller.
     pub prof_bcount: ColMap<Ptr<BasicBlock>, u64>,
+    /// The profile's hot count: the smallest block count among the blocks
+    /// that together carry 99% of all counted executions (LLVM's
+    /// `ProfileSummary` hot threshold). A call site at or above it is hot.
+    pub prof_hot: Option<u64>,
     /// Terminator → count per successor slot (from edge counters and
     /// single-pred block counts); drives profile-weighted block layout
     /// and `expect` seeding.

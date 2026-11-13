@@ -145,7 +145,7 @@ def prof_tools():
     return cli, thin
 
 
-def pgo_build(name, binary, base, backend, tools):
+def pgo_build(name, binary, base, backend, tools, use_env=()):
     """`--pgo`: profile one run of the benchmark, then build with the profile.
 
     Ours (`pliron-pgo`): instrumented build (`PLIRON_PGO`), one run,
@@ -173,7 +173,8 @@ def pgo_build(name, binary, base, backend, tools):
         r = sh([gen], cwd=src, env=dict(os.environ, PLIRON_PROFILE_FILE=raw))
         ok = r.returncode == 0 and os.path.exists(raw) and sh([cli, "merge", raw, "-o", merged]).returncode == 0
     exes["pliron-pgo"] = build(name, binary, "pliron-pgo",
-                               dict(base, RUSTFLAGS=be, PLIRON_PGO_USE=merged)) if ok else None
+                               dict(base, RUSTFLAGS=be, PLIRON_PGO_USE=merged,
+                                    **dict(kv.split("=", 1) for kv in use_env))) if ok else None
     secs["pliron-pgo"] = time.time() - t0
 
     t0 = time.time()
@@ -319,6 +320,8 @@ def main():
     ap.add_argument("--pgo", action="store_true",
                     help="also time `pliron-pgo` and `llvm-pgo`: each side profiles one run of the "
                          "benchmark and rebuilds with the profile (the whole loop's build time is reported)")
+    ap.add_argument("--pgo-env", action="append", default=[], metavar="K=V",
+                    help="extra backend environment for the profiled (use) build of `pliron-pgo`")
     ap.add_argument("--aa", action="store_true",
                     help="time the pliron binaries again as the variant `aa` (noise floor)")
     a = ap.parse_args()
@@ -353,7 +356,7 @@ def main():
                 sh(["cargo", "update", "-q", "-p", c], cwd=os.path.join(dst, CRATE), env=base)
         if a.pgo and not a.skip_build:
             print(f"build {name} (pgo loops)", flush=True)
-            pe, ps = pgo_build(name, binary, base, a.backend, tools)
+            pe, ps = pgo_build(name, binary, base, a.backend, tools, a.pgo_env)
             for side, exe in pe.items():
                 exes[(name, side)] = [exe] if exe else None
                 build_secs[(name, side)] = ps[side]
