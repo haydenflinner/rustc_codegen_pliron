@@ -1048,6 +1048,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 clctx.func.layout.set_prof_count(b, c);
             }
         }
+        prof_infer(&mut clctx.func);
     }
     drop(_spipe);
     // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
@@ -8492,3 +8493,72 @@ fn magicu128(d: u128) -> (u128, u32, bool) {
     (q2.wrapping_add(1), p - 128 - u32::from(add), add)
 }
 
+
+/// PGO: give blocks the CLIF passes created a profile count where the
+/// CFG leaves no doubt (`PLIRON_PROF_INFER=0` disables). About half the
+/// blocks reach the backend without one — preheaders, rotated guards,
+/// unrolled copies, cold adapters, split edges — and block placement
+/// then falls back to static guesses around them. Rules, to a fixpoint
+/// (4 sweeps): a block marked cold never ran; a block between a
+/// single-successor predecessor and it alone (or a single-predecessor
+/// successor and it alone) ran as often as that neighbour; a block all
+/// of whose predecessors only jump to it ran as often as they did
+/// together; the other arm of a two-way branch whose first arm is known
+/// and private ran the remainder.
+fn prof_infer(func: &mut ir::Function) {
+    if pliron_cfg::env_is("PLIRON_PROF_INFER", "0") {
+        return;
+    }
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let blocks: Vec<ir::Block> = func.layout.blocks().collect();
+    let npred = |b: ir::Block| cfg.pred_iter(b).count();
+    let succs = |b: ir::Block| -> smallvec::SmallVec<[ir::Block; 4]> {
+        let mut v: smallvec::SmallVec<[ir::Block; 4]> = cfg.succ_iter(b).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    for _ in 0..4 {
+        let mut changed = false;
+        for &b in &blocks {
+            if func.layout.prof_count(b).is_some() {
+                continue;
+            }
+            let known = |x: ir::Block| func.layout.prof_count(x);
+            let ss = succs(b);
+            let preds: smallvec::SmallVec<[ir::Block; 4]> = cfg.pred_iter(b).map(|p| p.block).collect();
+            let c = if func.layout.is_cold(b) {
+                Some(0)
+            } else if let [p] = preds[..]
+                && succs(p).len() == 1
+                && let Some(c) = known(p)
+            {
+                Some(c)
+            } else if let [s] = ss[..]
+                && npred(s) == 1
+                && let Some(c) = known(s)
+            {
+                Some(c)
+            } else if !preds.is_empty() && preds.iter().all(|&p| succs(p).len() == 1 && known(p).is_some()) {
+                Some(preds.iter().map(|&p| known(p).unwrap()).fold(0u64, u64::saturating_add))
+            } else if let [p] = preds[..]
+                && let Some(cp) = known(p)
+                && let [x, y] = succs(p)[..]
+                && let other = if x == b { y } else { x }
+                && npred(other) == 1
+                && let Some(co) = known(other)
+            {
+                Some(cp.saturating_sub(co))
+            } else {
+                None
+            };
+            if let Some(c) = c {
+                func.layout.set_prof_count(b, c);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}

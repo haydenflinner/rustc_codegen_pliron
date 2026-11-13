@@ -360,13 +360,19 @@ fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bo
     let counts: Vec<Option<u64>> = COUNTS.with(|c| c.borrow().clone());
     let count_of = |mut s: usize| -> Option<u64> {
         for _ in 0..4 {
-            if let Some(c) = counts.get(s).copied().flatten() {
-                return Some(c);
+            match counts.get(s).copied().flatten() {
+                // A critical-edge block: as often as the edge it splits
+                // (capped by its source below; its target may have other
+                // predecessors).
+                Some(u64::MAX) if succs[s].len() == 1 => s = succs[s][0],
+                // A measured count wins over a static cold mark: the
+                // marks come from shape rules (paths to a panic) and the
+                // profile has seen the block run.
+                Some(c) if c != u64::MAX => return Some(c),
+                // No count: a cold block counts as never run, anything
+                // else is unknown.
+                _ => return cold[s].then_some(0),
             }
-            if succs[s].len() != 1 {
-                return None;
-            }
-            s = succs[s][0];
         }
         None
     };
@@ -378,7 +384,10 @@ fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bo
             }
             // Measured: every successor counted, and the branch ran.
             if counts.len() == n && ss.len() > 1 {
-                let cs: Vec<Option<u64>> = ss.iter().map(|&s| count_of(s)).collect();
+                // An edge can carry no more than its source ran.
+                let cap = counts[b].filter(|&c| c != u64::MAX);
+                let cs: Vec<Option<u64>> =
+                    ss.iter().map(|&s| count_of(s).map(|c| cap.map_or(c, |m| c.min(m)))).collect();
                 if cs.iter().all(|c| c.is_some()) {
                     let sum: u64 = cs.iter().map(|c| c.unwrap()).sum();
                     if sum > 0 {
@@ -879,9 +888,15 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
                 .enumerate()
                 .map(|(k, &t)| alloc::format!("{}@{:.2}", t, prob[b][k]))
                 .collect();
+            let cnt = COUNTS.with(|c| c.borrow().get(b).copied().flatten());
             s.push_str(&alloc::format!(
-                "place: b{} freq={:.3} loop={:?}{}{} -> {}\n",
+                "place: b{} count={} freq={:.3} loop={:?}{}{} -> {}\n",
                 b,
+                match cnt {
+                    Some(u64::MAX) => alloc::string::String::from("edge"),
+                    Some(c) => alloc::format!("{c}"),
+                    None => alloc::string::String::from("-"),
+                },
                 freq[b],
                 innermost[b],
                 if cold[b] { " cold" } else { "" },

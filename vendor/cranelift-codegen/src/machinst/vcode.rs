@@ -1398,7 +1398,7 @@ impl<I: VCodeInst> VCode<I> {
         static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *STATS.get_or_init(|| std::env::var_os("PLIRON_PGO_FREQ_STATS").is_some()) {
             let nb = self.num_blocks();
-            let have = v.iter().filter(|c| c.is_some()).count();
+            let have = v.iter().filter(|c| c.is_some_and(|c| c != u64::MAX)).count();
             let (mut br, mut meas) = (0, 0);
             for b in 0..nb {
                 let ss = self.block_succs(BlockIndex::new(b));
@@ -1424,7 +1424,7 @@ impl<I: VCodeInst> VCode<I> {
             }
             std::eprintln!("pgofreq: blocks {nb} counted {have} branches {br} measured {meas}");
         }
-        if v.iter().any(|c| c.is_some()) { v } else { Vec::new() }
+        if v.iter().any(|c| c.is_some_and(|c| c != u64::MAX)) { v } else { Vec::new() }
     }
 
     /// PLIRON: fill `block_freq` (see the field) before regalloc when
@@ -1773,7 +1773,7 @@ impl<I: VCodeInst> VCode<I> {
         if *LSTATS.get_or_init(|| {
             std::env::var_os("PLIRON_LAYOUT_STATS").is_some() || std::env::var_os("PLIRON_REMARKS").is_some()
         })
-            && let Some(ec) = self.block_order.prof_count(self.entry).filter(|&c| c > 0)
+            && let Some(ec) = self.block_order.prof_count(self.entry).filter(|&c| c > 0 && c != u64::MAX)
         {
             let nb = self.num_blocks();
             let succs: Vec<Vec<usize>> = (0..nb)

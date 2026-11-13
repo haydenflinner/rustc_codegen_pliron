@@ -96,6 +96,10 @@ def ensure(prog, binary, side, backend):
     if os.path.exists(exe) and os.path.exists(sfile) and open(sfile).read() == stamp:
         return exe
     t0 = time.time()
+    # Cargo tracks neither the backend dylib nor PLIRON_* variables: a
+    # rebuild into the old directory would be a no-op.
+    import shutil
+    shutil.rmtree(os.path.join(OUT, d, prog), ignore_errors=True)
     # Memory-pressure kills show up as failed builds on this machine: retry.
     for attempt in range(3):
         got = run.build(prog, binary, d, env)

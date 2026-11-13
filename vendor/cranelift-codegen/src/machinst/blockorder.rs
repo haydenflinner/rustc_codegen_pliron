@@ -498,8 +498,12 @@ impl BlockLoweringOrder {
         let prof_counts: Vec<Option<u64>> = lowered_order
             .iter()
             .map(|lb| match lb {
-                &LoweredBlock::Orig { block } => f.layout.prof_count(block),
-                _ => None,
+                &LoweredBlock::Orig { block } => f.layout.prof_count(block).map(|c| c.min(u64::MAX - 1)),
+                // A critical-edge block runs exactly as often as its edge:
+                // `u64::MAX` tells the frequency estimator to look through
+                // it to its successor. (A real block without a count gets
+                // no such treatment: its count is simply unknown.)
+                _ => Some(u64::MAX),
             })
             .collect();
         let mut indirect_branch_targets = FxHashSet::default();

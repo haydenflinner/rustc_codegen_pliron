@@ -1955,6 +1955,14 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             };
         }
     }
+    // `PLIRON_PROF_COVERAGE=1` (with a profile): blocks in the layout that
+    // have no count, before and after the step; the difference is what
+    // the step created without handing a count on.
+    static COVER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| env_set("PLIRON_PROF_COVERAGE"));
+    let uncounted = |p: &Pipe| -> usize {
+        p.clctx.func.layout.blocks().filter(|b| !p.prof.contains_key(b)).count()
+    };
+    let cover0 = (*COVER && !p.prof.is_empty()).then(|| uncounted(p));
     let size0 = t0.map(|_| {
         let f = &p.clctx.func;
         (f.dfg.num_insts(), f.dfg.num_values(), f.dfg.num_blocks(), f.layout.blocks().count())
@@ -1999,6 +2007,12 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             an.eff_ver += 1;
         } else {
             an.idle_at.insert(fam, an.eff_ver);
+        }
+    }
+    if let Some(c0) = cover0 {
+        let c1 = uncounted(p);
+        if c1 > c0 {
+            eprintln!("profcover: {} +{}", s.name, c1 - c0);
         }
     }
     lt_probe(p, s.name);
