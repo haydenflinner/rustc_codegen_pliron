@@ -17,6 +17,7 @@ pub mod callgvn;
 pub mod cleanup;
 pub mod constload;
 pub mod dbg;
+pub mod devirt;
 pub mod domcheck;
 pub mod guardelim;
 pub mod inline;

@@ -266,6 +266,26 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
   matches `benchmark.stdout.expected` on all three. Correct, and so far
   neutral.
 
+## Devirtualization
+
+`PLIRON_DEVIRT=1` turns a `dyn Trait` call into guards on the function
+pointer loaded from the vtable, each followed by a direct call, with the
+indirect call kept as the last arm (`src/devirt.rs`). The profile says
+which targets deserve a guard, and it needs no value-profiling runtime:
+every guard's hit block has an ordinary block counter. The instrumented
+build emits a guard for up to `PLIRON_DEVIRT_PROF_MAX` (8) concrete
+impls, in symbol order. The profile-use build emits exactly the same
+chain, so the function's fingerprint matches, and right after
+`pgo::load` `pliron_ir_opt::devirt::prune` rewrites each chain: arms
+with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the site's
+calls stay, at most `PLIRON_DEVIRT_MAX` (2), hottest first; the rest
+are deleted and their counts added to the fallback block. A site with
+no calls, or in a function without a matching record, becomes the plain
+indirect call again. The knob must be set for both builds
+(`run.py --pgo-gen-env PLIRON_DEVIRT=1 --pgo-env PLIRON_DEVIRT=1`);
+set on one side only, every function with a site goes stale.
+`PLIRON_REMARKS` lists each site's shares.
+
 ## Knobs
 
 | env | effect |

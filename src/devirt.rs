@@ -1,6 +1,7 @@
 //! Guarded devirtualization of `dyn Trait` calls (`PLIRON_DEVIRT=1`,
-//! opt-in). rustc knows the set of impls of a trait; when it is small
-//! (`PLIRON_DEVIRT_MAX`, default 2) a virtual call becomes
+//! opt-in). rustc knows the set of impls of a trait; when few of them can
+//! be the callee (`PLIRON_DEVIRT_MAX`, default 2), or a profile says
+//! which ones are (see [`plan`]), a virtual call becomes
 //!
 //! ```text
 //! fnptr = load vtable[idx]
@@ -26,16 +27,45 @@ pub fn enabled() -> bool {
     crate::env_is("PLIRON_DEVIRT", "1")
 }
 
-fn max_impls() -> usize {
-    crate::env_get("PLIRON_DEVIRT_MAX")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2)
+fn knob(name: &str, default: usize) -> usize {
+    crate::env_get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+/// A profile build, generating (`PLIRON_PGO`) or using (`PLIRON_PGO_USE`):
+/// both must emit the same guard chains, since a profile only applies to
+/// a function whose CFG fingerprint matches the instrumented build's.
+pub fn profile_mode() -> bool {
+    crate::env_set("PLIRON_PGO") || crate::env_set("PLIRON_PGO_USE")
+}
+
+/// The targets to guard at one site, from its usable candidates (sorted
+/// by symbol). Without a profile: all of them when there are at most
+/// `PLIRON_DEVIRT_MAX` (default 2), else none — nothing says which to
+/// prefer. In a profile build: the first `PLIRON_DEVIRT_PROF_MAX`
+/// (default 8); the hit blocks' counters rank them and
+/// `pliron_ir_opt::devirt::prune` keeps the hot ones.
+pub fn plan<'tcx>(mut cands: Vec<Instance<'tcx>>) -> Result<Vec<Instance<'tcx>>, String> {
+    if profile_mode() {
+        cands.truncate(knob("PLIRON_DEVIRT_PROF_MAX", 8));
+        if cands.is_empty() {
+            return Err("PLIRON_DEVIRT_PROF_MAX is 0".into());
+        }
+        return Ok(cands);
+    }
+    let max = knob("PLIRON_DEVIRT_MAX", 2);
+    if cands.len() > max {
+        return Err(format!("{} candidates, more than {max}, and no profile to rank them", cands.len()));
+    }
+    Ok(cands)
 }
 
 /// Direct-call targets for the virtual call `virt` (an
 /// `InstanceKind::Virtual` instance whose `args` are the trait method's
-/// with `Self = dyn Trait`), or the reason there are none. Memoized per
-/// CGU: the answer depends on which symbols this CGU can link to.
+/// with `Self = dyn Trait`), sorted by symbol name, or the reason there
+/// are none. Memoized per CGU: the answer depends on which symbols this
+/// CGU can link to. Impls that cannot serve this call (other trait args)
+/// or have no single instance (generic, blanket) are simply not
+/// candidates; the indirect arm covers them.
 pub fn candidates<'tcx>(
     cx: &CodegenCx<'tcx>,
     virt: Instance<'tcx>,
@@ -71,9 +101,11 @@ fn compute<'tcx>(
     {
         return Err("by-value self receiver".into());
     }
-    let max = max_impls();
-    if tcx.all_impls(trait_def).take(max + 1).count() > max {
-        return Err(format!("more than {max} impls"));
+    // Compile-time bound only: every impl examined costs a normalize, a
+    // resolve and an fn ABI, and `dyn Debug` has thousands.
+    let scan = knob("PLIRON_DEVIRT_SCAN", 64);
+    if tcx.all_impls(trait_def).take(scan + 1).count() > scan {
+        return Err(format!("more than {scan} impls to scan"));
     }
     let env = ty::TypingEnv::fully_monomorphized();
     let ntrait = tcx.generics_of(trait_def).count();
@@ -138,7 +170,13 @@ fn compute<'tcx>(
             out.push(inst);
         }
     }
-    if out.is_empty() { Err(why) } else { Ok(out) }
+    if out.is_empty() {
+        return Err(why);
+    }
+    // One order for every build of this crate: the instrumented and the
+    // profile-use build must lay the chain out identically.
+    out.sort_by_key(|i| tcx.symbol_name(*i).name);
+    Ok(out)
 }
 
 /// The direct callee must take exactly the lowered argument list of the
@@ -196,14 +234,16 @@ fn same_abi<'tcx>(
 fn linkable<'tcx>(cx: &CodegenCx<'tcx>, inst: Instance<'tcx>) -> bool {
     let tcx = cx.tcx;
     let sym = tcx.symbol_name(inst).name;
-    if cx
-        .st
-        .borrow()
-        .funcs
-        .get(sym)
-        .is_some_and(|f| f.linkage != cranelift_module::Linkage::Import)
     {
-        return true;
+        // An xcgu copy made here is not a reason in a profile build: the
+        // copy set follows the profile (`PLIRON_PGO_XCGU`), and the
+        // candidate list must not differ between gen and use builds.
+        let st = cx.st.borrow();
+        if st.funcs.get(sym).is_some_and(|f| f.linkage != cranelift_module::Linkage::Import)
+            && !(profile_mode() && st.xcgu_extra.contains(sym))
+        {
+            return true;
+        }
     }
     if crate::xcgu::home_linkable(tcx).contains(sym) {
         return true;

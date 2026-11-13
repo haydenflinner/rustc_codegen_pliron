@@ -145,7 +145,7 @@ def prof_tools():
     return cli, thin
 
 
-def pgo_build(name, binary, base, backend, tools, use_env=()):
+def pgo_build(name, binary, base, backend, tools, use_env=(), gen_env=()):
     """`--pgo`: profile one run of the benchmark, then build with the profile.
 
     Ours (`pliron-pgo`): instrumented build (`PLIRON_PGO`), one run,
@@ -167,7 +167,8 @@ def pgo_build(name, binary, base, backend, tools, use_env=()):
     # they exit: keep those dumps out of the package directories.
     gen = build(name, binary, "pliron-pgogen",
                 dict(base, RUSTFLAGS=f"{be} -Clink-arg={rt}", PLIRON_PGO="1",
-                     PLIRON_PROFILE_FILE=os.path.join(pdir, "build-time.raw")))
+                     PLIRON_PROFILE_FILE=os.path.join(pdir, "build-time.raw"),
+                     **dict(kv.split("=", 1) for kv in gen_env)))
     ok = gen is not None
     if ok:
         r = sh([gen], cwd=src, env=dict(os.environ, PLIRON_PROFILE_FILE=raw))
@@ -322,6 +323,10 @@ def main():
                          "benchmark and rebuilds with the profile (the whole loop's build time is reported)")
     ap.add_argument("--pgo-env", action="append", default=[], metavar="K=V",
                     help="extra backend environment for the profiled (use) build of `pliron-pgo`")
+    ap.add_argument("--pgo-gen-env", action="append", default=[], metavar="K=V",
+                    help="extra backend environment for the instrumented (gen) build of `pliron-pgo`; "
+                         "a knob that changes the CFG the profile is keyed to (`PLIRON_DEVIRT=1`) "
+                         "must be given to both builds")
     ap.add_argument("--aa", action="store_true",
                     help="time the pliron binaries again as the variant `aa` (noise floor)")
     a = ap.parse_args()
@@ -356,7 +361,7 @@ def main():
                 sh(["cargo", "update", "-q", "-p", c], cwd=os.path.join(dst, CRATE), env=base)
         if a.pgo and not a.skip_build:
             print(f"build {name} (pgo loops)", flush=True)
-            pe, ps = pgo_build(name, binary, base, a.backend, tools, a.pgo_env)
+            pe, ps = pgo_build(name, binary, base, a.backend, tools, a.pgo_env, a.pgo_gen_env)
             for side, exe in pe.items():
                 exes[(name, side)] = [exe] if exe else None
                 build_secs[(name, side)] = ps[side]

@@ -1,10 +1,11 @@
-// Guarded devirtualization (`PLIRON_DEVIRT=1`): `Shape` has two ordinary
-// impls, so `dyn Shape` calls become `fnptr == Circle::area` /
-// `fnptr == Square::area` guards with direct calls. `Odd` is a third impl
-// (run with `PLIRON_DEVIRT_MAX=3` to make the trait a candidate; at the
-// default 2 the sites are rejected) whose `area` is `#[track_caller]`, so
-// its vtable slot holds a shim no guard matches: its calls take the
-// indirect fallback arm. `Named` keeps exactly two impls for the default.
+// Guarded devirtualization (`PLIRON_DEVIRT=1`). `Named` has two impls:
+// its calls become `fnptr == Circle::name` / `fnptr == Square::name`
+// guards with direct calls. `Shape` has three; `Odd::area` is
+// `#[track_caller]`, so its vtable slot holds a shim that is never a
+// candidate and `area` is guarded for the other two, with `Odd` taking
+// the indirect fallback arm. The other `Shape` methods have three
+// candidates: left alone at the default `PLIRON_DEVIRT_MAX=2` unless a
+// profile ranks them (`PLIRON_PGO` / `PLIRON_PGO_USE`, see docs/pgo.md).
 // Output must be identical with and without the knob.
 
 use std::hint::black_box;
@@ -148,6 +149,6 @@ fn main() {
     let named: Vec<Box<dyn Named>> = vec![Box::new(Circle(7)), Box::new(Square(9))];
     println!("names: {}", names(&named));
     let bad: Vec<Box<dyn Named>> = vec![Box::new(Circle(1)), Box::new(Square(13))];
-    let r = std::panic::catch_unwind(|| names(&bad));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| names(&bad)));
     println!("unwind: {}", r.is_err());
 }

@@ -315,17 +315,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let ty::InstanceKind::Virtual(method, _) = virt.def else {
             return None;
         };
-        let targets = crate::devirt::candidates(self.cx, virt, fn_abi);
-        if pliron_cfg::remarks_on() {
-            let caller = self.fn_sym(self.parent_fn());
-            let what = self.tcx.def_path_str(method);
-            match &targets {
-                Ok(t) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){}: {}",
-                    t.len(),
-                    if catch.is_some() { " (invoke)" } else { "" },
-                    t.iter().map(|i| self.tcx.symbol_name(*i).name).collect::<Vec<_>>().join(" ")),
-                Err(why) => pliron_cfg::remark!("devirt", caller, what; "reject ({why})"),
-            }
+        let targets = crate::devirt::candidates(self.cx, virt, fn_abi).and_then(crate::devirt::plan);
+        let (caller, what) = if pliron_cfg::remarks_on() {
+            (
+                self.fn_sym(self.parent_fn()),
+                ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(method)),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        match &targets {
+            Ok(t) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){}{}: {}",
+                t.len(),
+                if catch.is_some() { " (invoke)" } else { "" },
+                if crate::devirt::profile_mode() { " (profile build)" } else { "" },
+                t.iter().map(|i| self.tcx.symbol_name(*i).name).collect::<Vec<_>>().join(" ")),
+            Err(why) => pliron_cfg::remark!("devirt", caller, what; "reject ({why})"),
         }
         let targets = targets.ok()?;
         let ret = match self.kind(llty) {
@@ -345,24 +350,38 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let arm = |bx: &mut Self, callee: Value, abi: &FnAbi<'tcx, Ty<'tcx>>, inst| {
             bx.st.borrow_mut().last_call = None;
             let v = bx.call(llty, None, Some(abi), callee, return_slot, args, funclet, inst);
-            if let Some(catch) = catch
-                && let Some(op) = bx.st.borrow_mut().last_call.take()
-            {
+            let last = bx.st.borrow_mut().last_call.take();
+            if let (Some(catch), Some(op)) = (catch, last) {
                 bx.st.borrow_mut().invokes.insert(op, (catch, false));
             }
             bx.mk_op(|c| BrOp::new(c, merge, if void { vec![] } else { vec![v] }));
         };
-        for t in targets {
+        // Guard blocks hold only the compare and branch, so the profile
+        // pruning (`pliron_ir_opt::devirt::prune`) can relink them.
+        let guards: Vec<_> = targets.iter().map(|_| self.append_sibling_block("devirt_guard")).collect();
+        let fallback = self.append_sibling_block("devirt_fallback");
+        let mut arms = Vec::with_capacity(targets.len());
+        self.br(guards[0]);
+        for (k, t) in targets.into_iter().enumerate() {
+            self.switch_to_block(guards[k]);
             let addr = self.get_fn_addr(t, None);
             let hit = self.append_sibling_block("devirt_hit");
-            let miss = self.append_sibling_block("devirt_miss");
             let eq = self.icmp(IntPredicate::IntEQ, llfn, addr);
-            self.cond_br(eq, hit, miss);
+            self.cond_br(eq, hit, guards.get(k + 1).copied().unwrap_or(fallback));
             self.switch_to_block(hit);
             let abi = self.fn_abi_of_instance(t, ty::List::empty());
             arm(self, addr, abi, Some(t));
-            self.switch_to_block(miss);
+            arms.push((guards[k], hit));
         }
+        if crate::env_set("PLIRON_PGO_USE") {
+            self.st.borrow_mut().devirt_sites.push(crate::context::DevirtSite {
+                arms,
+                fallback,
+                caller,
+                what,
+            });
+        }
+        self.switch_to_block(fallback);
         // `instance: None` — `call` reads it only for `Item` callees, and
         // it keeps this arm from being transformed again.
         arm(self, llfn, fn_abi, None);

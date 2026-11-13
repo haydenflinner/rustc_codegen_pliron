@@ -345,6 +345,19 @@ pub struct CallInfo {
     pub noret: bool,
 }
 
+/// One guarded-devirtualization site (`PLIRON_DEVIRT`): a chain of guard
+/// blocks, each holding only `icmp eq fnptr, &target` and a `cond_br` to
+/// its hit block (the direct call) or to the next guard; the last guard
+/// misses to `fallback`, the indirect call.
+pub struct DevirtSite {
+    /// (guard block, hit block) in chain order.
+    pub arms: Vec<(Ptr<BasicBlock>, Ptr<BasicBlock>)>,
+    pub fallback: Ptr<BasicBlock>,
+    /// Caller symbol and trait method path, for remarks (empty when off).
+    pub caller: String,
+    pub what: String,
+}
+
 #[derive(Default)]
 // r[impl front.ir.sidetables]
 // r[impl iropt.state]
@@ -608,6 +621,9 @@ pub struct State {
     /// to cloned blocks (scaled by callsite/callee-entry ratio), so
     /// inlined code carries the callee's counts into the caller.
     pub prof_bcount: ColMap<Ptr<BasicBlock>, u64>,
+    /// `PLIRON_DEVIRT` guard chains built for a profile-use build
+    /// (`PLIRON_PGO_USE`), pruned by `devirt::prune` once counts are loaded.
+    pub devirt_sites: Vec<DevirtSite>,
     /// The profile's hot count: the smallest block count among the blocks
     /// that together carry 99% of all counted executions (LLVM's
     /// `ProfileSummary` hot threshold). A call site at or above it is hot.
@@ -667,6 +683,8 @@ impl State {
         self.region_blocks.retain(lb);
         self.region_parent.retain(lb);
         self.prof_bcount.retain(lb);
+        self.devirt_sites
+            .retain(|s| lb(&s.fallback) && s.arms.iter().all(|(g, h)| lb(g) && lb(h)));
         if self.last_call.is_some_and(|c| !c.is_live(ctx)) {
             self.last_call = None;
         }

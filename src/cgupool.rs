@@ -1031,6 +1031,8 @@ pub(crate) fn finish_pre(
         }
         if let Some(f) = env_get("PLIRON_PGO_USE") {
             pgo::load(ctx, st, f);
+            // `PLIRON_DEVIRT`: keep the guard arms the profile saw taken.
+            pliron_ir_opt::devirt::prune(ctx, st);
             // `PLIRON_FIELD_HEAT`: weigh this CGU's field accesses.
             crate::field_order::resolve(name, st);
         }
