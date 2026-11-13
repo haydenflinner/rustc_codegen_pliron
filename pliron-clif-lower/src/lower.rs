@@ -3580,7 +3580,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.vars.insert(a, vs);
             }
         }
-        if pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot") == Some("loop") {
+        if pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot").unwrap_or("loop") == "loop" {
             self.cycles = cycle_blocks(ctx, &pblocks);
         }
         if self.ltundef && !crate::env_is("PLIRON_LTUNDEF_ALL", "1") {
@@ -7833,7 +7833,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // `PLIRON_MEMFAST_SMALL=1`: every runtime-size copy;
                     // `=hot`: only where the profile's count for this
                     // block reaches its hot count.
-                    let small = match pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot") {
+                    // Default without a profile: `loop` (2026-11-13: 0.980
+                    // time on the held-out programs for +0.5% code);
+                    // `=0` turns it off.
+                    let small = match pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot").or(Some("loop")) {
                         Some("1") => true,
                         Some("hot") => op
                             .deref(self.ctx)

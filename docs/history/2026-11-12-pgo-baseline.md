@@ -444,3 +444,8 @@ pliron-pgo/llvm 1.044 [1.016, 1.083], llvm-pgo/llvm 0.931, loop 2.29x
 (llvm 28 s, pliron 32, pliron-pgo 63, llvm-pgo 60). Unchanged within
 noise at this resolution; the interleaved A/B is what resolves the
 regex gain. Gate: passed on 1dc9a17.
+
+**`PLIRON_MEMFAST_SMALL` defaults to `loop`** without a profile
+(user's call, 2026-11-13; `0` turns it off; under a profile the bundle's
+`hot` still applies). `slotpromlt`'s RA2_XBLOCK size comparison pins it
+off like the other passes that delete what it measures. Gate passed.
