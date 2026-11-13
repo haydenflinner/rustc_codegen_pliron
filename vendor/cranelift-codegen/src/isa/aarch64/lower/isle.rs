@@ -1805,10 +1805,15 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         Some((k + w as u64 - 1) as u8)
     }
 
-    /// `ubfiz` with lsb `k`: immr = bits - k.
+    /// `ubfiz` with lsb `k`: immr = regsize - k. The register size, not
+    /// the type's width: an i8/i16 op runs as a 32-bit `ubfm`, whose
+    /// insert position is `32 - immr` — `16 - k` put an i16 field at bit
+    /// `16 + k` and left the value's own bits zero (fuzz seeds 30694,
+    /// 31084).
     fn bf_ubfiz_immr(&mut self, ty: Type, k: u64) -> Option<u8> {
         let bits = ty.bits();
-        (k >= 1 && k < bits as u64).then_some((bits as u64 - k) as u8)
+        let rs: u64 = if bits <= 32 { 32 } else { 64 };
+        (k >= 1 && k < bits as u64).then_some((rs - k) as u8)
     }
 
     /// `(x&m)<<k` → `ubfiz`: imms = w-1.
