@@ -339,3 +339,15 @@ Eight programs, 11 rounds, against defaults:
 rust-protobuf, rust-compression, blake3-scalar, blind-sig.) Two thirds
 of the speed for a quarter of the size; rust-protobuf 0.91 and regex
 0.97 carry it. The best candidate from this work for a default flip.
+
+**regex `Fsm::next_state`** (+5.8% of LLVM's cycles, self). One shape
+reproduced in isolation (`InstPtrs::next` over `read_varu32`): the
+rotated loop header retests `len == 0` although both edges into it
+already decided that. `PLIRON_EDGEKNOWN=1` (new pass `edgeknown`,
+opt-in) folds a `brif` on a block parameter when every incoming edge
+settles it (constant, the predecessor's own condition, the value it
+compares with zero, or `isub`/`bxor` of the values it compares): repro
+171 -> 165 instructions. On the eight programs it changes nothing
+measurable (instructions 1.001), nor does `PLIRON_INBOUNDSNN=1`
+(non-null from in-bounds offsets, instructions 1.002) or both. The
+hot test in the real function is not this one; still open.

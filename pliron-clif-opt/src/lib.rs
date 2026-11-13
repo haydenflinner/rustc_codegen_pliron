@@ -37,6 +37,7 @@ pub mod diffcheck;
 pub mod divconst;
 pub mod dse;
 pub mod edgefwd;
+pub mod edgeknown;
 pub mod edgesel;
 pub mod edgesink;
 pub mod edgespec;

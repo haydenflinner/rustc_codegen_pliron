@@ -2266,6 +2266,17 @@ fn s_mergejump(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// A `brif` on a block param every incoming edge already decided — see
+// `edgeknown`.
+fn s_edgeknown(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::edgeknown::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("edgeknown");
+    }
+    k
+}
+
 fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
     let sh = an.shape_bits(&p.clctx.func);
     let rnn = (!p.region_nn.is_empty()).then(|| jumpthread::RegionNN {
@@ -5116,6 +5127,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("looprot2", "looprot", Gate::Env("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         // Loop-invariant header params onto a preheader (no back-edge
         // param webs for regalloc2 to spill around; serde_json's escape scan).
+        // After the late rotation: a rotated loop's guard sits on both
+        // edges into its header, and the header's own first test of the
+        // carried value is then decided (regex `InstPtrs::next`).
+        step("edgeknown", "edgeknown", Gate::OptIn("PLIRON_EDGEKNOWN"), s_edgeknown).needs(shape::MULTI),
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one
         // `brif` edge's args (parse_only's `ParseIntError` pack on every
