@@ -235,12 +235,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`pliron-clif-lower` `fastcc_compile`). Exact counts 2026-11-13:
     // pulldown-cmark 52.82M -> 52.53M (-0.55%), the other five held-out
     // programs within 0.01% (their hot calls leave the CGU or are
-    // `try_call`s); compile CPU and peak RSS unchanged. Validation:
+    // `try_call`s); compile CPU +0..1.5%, peak RSS +0..3% (regex,
+    // rust-html-rewriter). Validation:
     // docs/history/2026-11-13-six-features.md. `=0` off.
     "PLIRON_FASTCC",
     // Cold `call f(..); trap` tails of one callee share one block per
-    // function (`panicstub`). A size change only: .text -0.15% on
-    // pulldown-cmark, regex and html-rewriter, executed instructions
+    // function (`panicstub`). A size change only: .text -0.1..-0.2% on
+    // regex and html-rewriter, less elsewhere, executed instructions
     // within +-0.05%. `=0` off.
     "PLIRON_PANICSTUB",
 ];

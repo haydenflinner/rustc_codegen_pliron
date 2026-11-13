@@ -1126,6 +1126,14 @@ impl PlironRegSet {
     pub fn len(&self) -> u32 {
         self.0.len()
     }
+
+    /// Whether the set holds the integer (`float == false`) or
+    /// float/vector register with hardware encoding `enc` (diagnostics:
+    /// how many of the ABI's caller-saved registers a call leaves alone).
+    pub fn contains_enc(&self, enc: usize, float: bool) -> bool {
+        let class = if float { regalloc2::RegClass::Float } else { regalloc2::RegClass::Int };
+        self.0.contains(regalloc2::PReg::new(enc, class))
+    }
 }
 
 /// PLIRON: FASTCC — start recording on this thread: the next function

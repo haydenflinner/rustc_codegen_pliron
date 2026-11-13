@@ -131,3 +131,74 @@ block2:
         .unwrap_or_else(|m| panic!("{m}\n{}", after.display()));
     assert!(s.compared > 0);
 }
+
+fn has(f: &Function, op: cranelift_codegen::ir::Opcode) -> bool {
+    f.layout.blocks().flat_map(|b| f.layout.block_insts(b)).any(|i| f.dfg.insts[i].opcode() == op)
+}
+
+/// A power-of-two size whose result is only tested against zero is one
+/// compare of the two loads, not the byte-swapped three-way form
+/// (`starts_with(b"\xFF\xFE")`, encoding_rs's `for_bom`). The sign uses
+/// keep the swaps.
+#[test]
+fn power_of_two_under_zero_tests_is_a_plain_compare() {
+    use cranelift_codegen::ir::Opcode;
+    for n in [2, 4, 8] {
+        let f = expanded(&src(n, ZERO));
+        assert_eq!(calls(&f), 0, "n={n}");
+        assert!(!has(&f, Opcode::Bswap), "n={n}: {}", f.display());
+        assert!(has(&expanded(&src(n, SIGN)), Opcode::Bswap), "n={n}");
+    }
+}
+
+/// One side is a constant data object: its bytes are read at compile
+/// time, so no load of it is left and each chunk is a compare with an
+/// immediate, or-ed (the `ne` test) or and-ed (the `eq` test).
+#[test]
+fn constant_side_is_read_at_compile_time() {
+    use cranelift_codegen::ir::Opcode;
+    let src = "function %f(i64) -> i8, i8 {
+    gv0 = symbol colocated u1:7
+    sig0 = (i64, i64, i64) -> i32
+    fn0 = %Memcmp sig0
+block0(v0: i64):
+    v1 = symbol_value.i64 gv0
+    v2 = iconst.i64 3
+    v3 = call fn0(v0, v1, v2)
+    v4 = iconst.i32 0
+    v5 = icmp eq v3, v4
+    v6 = icmp ne v3, v4
+    return v5, v6
+}";
+    let before = cranelift_reader::parse_functions(src).unwrap().remove(0);
+    let mut tables = pliron_clif_opt::memcmpk::Tables::default();
+    tables.insert(7, std::sync::Arc::from(&b"\xEF\xBB\xBF"[..]));
+    let mut f = before.clone();
+    assert_eq!(pliron_clif_opt::memcmpk::run_with(&mut f, &[], "f", &tables, true), 1);
+    cranelift_codegen::verify_function(&f, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+        .unwrap_or_else(|e| panic!("{e}\n{}", f.display()));
+    let text = f.display().to_string();
+    // Two loads (of the argument), none through the symbol.
+    let loads = f
+        .layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Load)
+        .count();
+    assert_eq!(loads, 2, "{text}");
+    assert!(text.contains("iconst.i16 -17425"), "0xBBEF as i16: {text}");
+    assert!(text.contains("iconst.i8 -65"), "0xBF as i8: {text}");
+    assert!(has(&f, Opcode::Band) && has(&f, Opcode::Bor), "{text}");
+    // A big-endian target, a table too short, or the knob's off state
+    // (no table): the loads stay.
+    for (t, little) in [(&tables, false), (&pliron_clif_opt::memcmpk::Tables::default(), true)] {
+        let mut g = before.clone();
+        assert_eq!(pliron_clif_opt::memcmpk::run_with(&mut g, &[], "f", t, little), 1);
+        assert!(!g.display().to_string().contains("iconst.i16"), "{}", g.display());
+    }
+    let mut short = pliron_clif_opt::memcmpk::Tables::default();
+    short.insert(7, std::sync::Arc::from(&b"\xEF\xBB"[..]));
+    let mut g = before.clone();
+    assert_eq!(pliron_clif_opt::memcmpk::run_with(&mut g, &[], "f", &short, true), 1);
+    assert!(!g.display().to_string().contains("iconst.i16"), "{}", g.display());
+}

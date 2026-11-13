@@ -211,6 +211,49 @@ fn live_edges(ctx: &Context, k: &Known, t: Ptr<Operation>) -> Vec<(Ptr<BasicBloc
 
 /// `callee`'s surviving ops and calls when called with `actuals`.
 pub fn spec_cost(ctx: &Context, st: &State, callee: Ptr<Operation>, actuals: &[Value]) -> SpecCost {
+    cost_of(ctx, st, callee, actuals, None)
+}
+
+/// `p` is a local slot's address: an `alloca`, or a constant-offset
+/// `getelementptr`/`bitcast` chain on one.
+fn slot_addr(ctx: &Context, st: &State, mut p: Value) -> bool {
+    for _ in 0..4 {
+        if st.allocas.contains(p) {
+            return true;
+        }
+        let Some(op) = p.defining_op() else { return false };
+        if !(Operation::is_op::<GetElementPtrOp>(op, ctx) || Operation::is_op::<BitcastOp>(op, ctx)) {
+            return false;
+        }
+        p = op.deref(ctx).get_operand(ctx, 0);
+    }
+    false
+}
+
+/// The callee's size as the code generator will see it, with no callsite
+/// knowledge (`PLIRON_INLINE_LEAN`): [`spec_cost`]'s walk (constant
+/// branches folded, marker ops free), and additionally nothing for
+///
+/// - loads and stores whose address is a local slot (the CLIF pipeline
+///   promotes them: the IR-level SROA leaves an `Option<(ptr, Layout)>`
+///   temporary as three slots written on one path and read on the next);
+/// - pure ops whose result nothing live reads (rustc's layout
+///   preconditions leave compares nobody branches on).
+///
+/// The inliner's own count is of raw ops, which is five to ten times the
+/// machine code for std's thin wrappers: `drop_glue::<RawVec<u8>>` is 63
+/// ops and ten instructions, `if cap != 0 { __rust_dealloc(ptr, cap, 1) }`.
+pub fn lean_cost(ctx: &Context, st: &State, callee: Ptr<Operation>, pure: &crate::cleanup::Pure) -> SpecCost {
+    cost_of(ctx, st, callee, &[], Some(pure))
+}
+
+fn cost_of(
+    ctx: &Context,
+    st: &State,
+    callee: Ptr<Operation>,
+    actuals: &[Value],
+    lean: Option<&crate::cleanup::Pure>,
+) -> SpecCost {
     let bs = blocks(ctx, callee);
     let Some(&entry) = bs.first() else { return SpecCost::default() };
     let mut k = Known { st, map: FxHashMap::default() };
@@ -234,6 +277,8 @@ pub fn spec_cost(ctx: &Context, st: &State, callee: Ptr<Operation>, actuals: &[V
     }
     let mut live: FxHashSet<Ptr<BasicBlock>> = [entry].into_iter().collect();
     let mut cost = SpecCost::default();
+    // `lean`: the counted pure ops, in visit order, for the dead-op pass.
+    let mut counted: Vec<Ptr<Operation>> = Vec::new();
     // Layout order approximates RPO; a block first reached by a later
     // block's edge (a back edge) is visited in a second sweep.
     let mut done: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
@@ -278,6 +323,20 @@ pub fn spec_cost(ctx: &Context, st: &State, callee: Ptr<Operation>, actuals: &[V
                     k.map.insert(r, v);
                     continue;
                 }
+                if let Some(pure) = lean {
+                    let slot_mem = (Operation::is_op::<LoadOp>(op, ctx)
+                        && !st.volatile.contains(op)
+                        && slot_addr(ctx, st, op.deref(ctx).get_operand(ctx, 0)))
+                        || (Operation::is_op::<StoreOp>(op, ctx)
+                            && !st.volatile.contains(op)
+                            && slot_addr(ctx, st, op.deref(ctx).get_operand(ctx, 1)));
+                    if slot_mem {
+                        continue;
+                    }
+                    if pure.erasable(ctx, st, op) && op.deref(ctx).get_num_results() == 1 {
+                        counted.push(op);
+                    }
+                }
                 cost.n += 1;
                 if Operation::is_op::<CallOp>(op, ctx) {
                     cost.ncalls += 1;
@@ -286,6 +345,16 @@ pub fn spec_cost(ctx: &Context, st: &State, callee: Ptr<Operation>, actuals: &[V
         }
         if !progressed {
             break;
+        }
+    }
+    // Dead pure ops, users before definitions (visit order is close to
+    // dominance order; a use around a loop is missed and stays counted).
+    let mut dead: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+    for &op in counted.iter().rev() {
+        let r = op.deref(ctx).get_result(ctx, 0);
+        if r.uses_iter(ctx).all(|u| dead.contains(&u.user_op())) {
+            dead.insert(op);
+            cost.n = cost.n.saturating_sub(1);
         }
     }
     cost

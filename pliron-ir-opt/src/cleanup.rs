@@ -92,7 +92,7 @@ impl Pure {
         }
     }
 
-    fn erasable(&self, ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+    pub(crate) fn erasable(&self, ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
         let id = Operation::get_opid(op, ctx);
         self.ids.contains(&id) || (id == self.load && !st.volatile.contains(op))
     }

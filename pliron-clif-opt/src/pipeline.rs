@@ -1178,7 +1178,7 @@ pub fn run_pipeline(p: &mut Pipe) {
     // their regions as lowered, for loadfwd (`loadfwd::ScopedNa`). Taken
     // here because later `scoped_na` members are carried facts, not params.
     let _scoped = loadfwd::scoped_enabled().then(|| {
-        loadfwd::scoped_enter(loadfwd::scoped_seed(&p.clctx.func, p.scoped_na, p.block_region))
+        loadfwd::scoped_enter(loadfwd::scoped_seed(&p.clctx.func, p.noalias, p.scoped_na, p.block_region))
     });
     match crate::diffcheck::mode_for(p.fname) {
         None => {
@@ -3417,6 +3417,17 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// `PLIRON_SCOPED_NOALIAS=1`: `loadfwd` on the function as lowered, while
+// the inlined callees' `&mut` params are still their clones' entry params
+// (`loadfwd::scoped_any`). Functions without a candidate skip it.
+// `PLIRON_SCOPEDFWD=0` skips the step (the facts then never apply).
+fn s_scopedfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !loadfwd::scoped_any() || pliron_cfg::env_is("PLIRON_SCOPEDFWD", "0") {
+        return 0;
+    }
+    loadfwd::scoped_prerun(|| s_loadfwd2(p, an))
+}
+
 // `band v, 1` on an already-0/1 scalar (rustc's i1 normalization
 // residue around `icmp`/`uextend`/`select` booleans) — one `and`
 // per element in scalar count_if loops. After sameargs: the merged
@@ -3889,6 +3900,15 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
             p.site_facts.add_derived(w, b, s);
         }
     }
+    // Read before `w` joins `noalias` below: the scoped carry asks whether
+    // `w` was function-wide `noalias` on its own. Asked afterwards the
+    // answer was always yes, the scope was dropped, and a value that took
+    // an inlined callee's region-scoped `noalias` became a function-wide
+    // (isolated) root: licm hoisted loads of it out of loops that write
+    // the same memory through the caller's name (regex, json, protobuf
+    // and html-rewriter miscompiled under `PLIRON_SCOPED_NOALIAS=1` once
+    // the scoped params lived long enough to be carried).
+    let w_wide = p.noalias.contains(&w) && !p.scoped_na.contains(&w);
     if bits & fact_bits::NOALIAS != 0 && p.noalias.contains(&d) {
         p.noalias.insert(w);
         p.fact_bits[w] |= fact_bits::NOALIAS;
@@ -3899,10 +3919,7 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // and still holds. regex's `next_state` lost `qcur`/`qnext` from
     // loadfwd's isolated roots this way once `exec_byte` was inlined, and
     // reloaded the sparse set's four fields per decoded varint.
-    if bits & fact_bits::SCOPED_NA != 0
-        && p.scoped_na.contains(&d)
-        && !(p.noalias.contains(&w) && !p.scoped_na.contains(&w))
-    {
+    if bits & fact_bits::SCOPED_NA != 0 && p.scoped_na.contains(&d) && !w_wide {
         p.scoped_na.insert(w);
         p.fact_bits[w] |= fact_bits::SCOPED_NA;
     }
@@ -3912,8 +3929,17 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         p.frozen.insert(w, f);
         p.fact_bits[w] |= fact_bits::FROZEN;
     }
+    // A scoped value's `deref` is its region's claim (an inlined `&self`
+    // callee's param: read-only while the clone runs). On a value that
+    // stays function-wide `noalias` (the caller's own `&mut self`, which
+    // the param was folded into) it would read "never written in this
+    // function": licm hoisted a load of a `Vec` field out of the loop that
+    // pushes to it (regex-syntax `HeapVisitor::visit`, a crash). Nor does
+    // a carried fact replace one `w` already has.
     if bits & fact_bits::DEREF != 0
         && let Some(&x) = p.deref.get(&d)
+        && !(p.scoped_na.contains(&d) && w_wide)
+        && !p.deref.contains_key(&w)
     {
         p.deref.insert(w, x);
         p.fact_bits[w] |= fact_bits::DEREF;
@@ -4310,7 +4336,8 @@ fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_memcmpk(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = crate::memcmpk::run(&mut p.clctx.func, p.fn_names, p.fname);
+    let little = p.isa.endianness() == cranelift_codegen::ir::Endianness::Little;
+    let k = crate::memcmpk::run_with(&mut p.clctx.func, p.fn_names, p.fname, p.const_tables, little);
     if k > 0 {
         p.dump("memcmpk");
     }
@@ -4431,6 +4458,10 @@ fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Cold `call f(..); trap` tails of one callee share one block per
 // function (`panicstub`); members keep their argument setup and jump.
 fn s_panicstub(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Native only: never run or measured on wasm.
+    if p.wasm {
+        return 0;
+    }
     let k = crate::panicstub::run(&mut p.clctx.func, pliron_cfg::env_is("PLIRON_COLDCOPY", "1"));
     if k > 0 {
         an.invalidate(&p.clctx.func);
@@ -4496,6 +4527,9 @@ const JT: Gate = Gate::Flag(FlagId::Jumpthread);
 // r[impl clif.step.order]
 pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(|| {
     vec![
+        // Before any block merge: see `s_scopedfwd`.
+        step("scopedfwd", "loadfwd", Gate::OptIn("PLIRON_SCOPED_NOALIAS"), s_scopedfwd)
+            .needs(shape::LOAD),
         // Straight-line `jump` pairs merge first, so jumpthread sees a
         // param block and the `brif` it feeds as one (see `mergejump`).
         step("mergejump", "mergejump", Gate::OptIn("PLIRON_MERGEJUMP"), s_mergejump).needs(shape::MULTI),
@@ -5527,6 +5561,70 @@ mod tests {
     };
         p.seed_fact_bits();
         f(&mut p)
+    }
+
+    /// A region-scoped `noalias` (an inlined callee's param) carried onto
+    /// another value must stay scoped there: `noalias` without `scoped_na`
+    /// is the function-wide fact, which makes the value an isolated root
+    /// no foreign store can clobber. The carry inserted `noalias` first
+    /// and then took the value for one that had been function-wide all
+    /// along. A value that really was function-wide before keeps that.
+    #[test]
+    fn carry_keeps_noalias_scope() {
+        let func = cranelift_reader::parse_functions(OPT_PTR)
+            .unwrap()
+            .remove(0);
+        let v = |n: u32| Value::from_u32(n);
+        let (v0, v1, v2) = (v(0), v(1), v(2));
+        with_test_pipe("carry_keeps_noalias_scope", func, FxHashSet::default(), |p| {
+            // `v1`: scoped. `v0`: function-wide (the caller's own param).
+            p.noalias.insert(v1);
+            p.scoped_na.insert(v1);
+            p.noalias.insert(v0);
+            p.seed_fact_bits();
+            carry_one(p, v1, v2);
+            assert!(p.noalias.contains(&v2));
+            assert!(
+                p.scoped_na.contains(&v2),
+                "a scoped noalias fact became function-wide when carried"
+            );
+            carry_one(p, v1, v0);
+            assert!(
+                p.noalias.contains(&v0) && !p.scoped_na.contains(&v0),
+                "a function-wide noalias value was scoped down"
+            );
+        });
+    }
+
+    /// The scoped value's read-only `deref` (an inlined `&self` callee's
+    /// param) must not land on the function-wide value it is folded into
+    /// (the caller's `&mut self`), with or without a `deref` of its own.
+    #[test]
+    fn carry_keeps_scoped_deref_off_wide_values() {
+        let func = cranelift_reader::parse_functions(OPT_PTR)
+            .unwrap()
+            .remove(0);
+        let v = |n: u32| Value::from_u32(n);
+        let (v0, v1, v2, v4) = (v(0), v(1), v(2), v(4));
+        with_test_pipe("carry_keeps_scoped_deref_off_wide_values", func, FxHashSet::default(), |p| {
+            p.noalias.insert(v1);
+            p.scoped_na.insert(v1);
+            p.deref.insert(v1, (48, false));
+            // Function-wide, writable.
+            p.noalias.insert(v0);
+            p.deref.insert(v0, (64, true));
+            // Function-wide, no `deref` of its own.
+            p.noalias.insert(v4);
+            p.seed_fact_bits();
+            carry_one(p, v1, v0);
+            assert_eq!(p.deref.get(&v0), Some(&(64, true)), "a writable pointee became read-only");
+            carry_one(p, v1, v4);
+            assert_eq!(p.deref.get(&v4), None, "a region's read-only claim became function-wide");
+            // A value with no facts takes the scope and the claim together.
+            carry_one(p, v1, v2);
+            assert!(p.scoped_na.contains(&v2));
+            assert_eq!(p.deref.get(&v2), Some(&(48, false)));
+        });
     }
 
     /// A block param's `nonnull` is true only on paths into its block;

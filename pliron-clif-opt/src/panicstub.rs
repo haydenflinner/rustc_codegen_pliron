@@ -32,15 +32,16 @@
 //! Soundness needs no noreturn fact: `call f(a); trap c` in two places
 //! and `jump S(a)` to one copy of it run the same call with the same
 //! arguments and then the same trap. Only plain `call` qualifies —
-//! `try_call` sites keep their own exception edge. The shared call
-//! keeps the first member's source location: the other sites lose the
-//! per-site debug line of the call instruction (the `&Location` the
-//! panic message prints is an argument and is unaffected).
+//! `try_call` sites keep their own exception edge. Sites share a tail
+//! only when their calls also have the same source location, so a
+//! build with line tables keeps the per-site line of the panicking
+//! frame (and shares less); the `&Location` the panic message prints is
+//! an argument and is unaffected either way.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
     types::Type, Block, BlockArg, BlockCall, FuncRef, Function, Inst, InstBuilder,
-    InstructionData, Opcode, TrapCode, Value, ValueDef,
+    InstructionData, Opcode, SourceLoc, TrapCode, Value, ValueDef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -165,9 +166,19 @@ fn sweep(func: &mut Function, uses: &mut FxHashMap<Value, u32>, b: Block, roots:
 /// `copy` selects `coldargs`' `PLIRON_COLDCOPY` form for the rebind in
 /// the shared block.
 pub fn run(func: &mut Function, copy: bool) -> usize {
+    let strip = !pliron_cfg::env_is("PLIRON_PANICSTUB_STRIP", "0");
+    let retarget = !pliron_cfg::env_is("PLIRON_PANICSTUB_FWD", "0");
+    run_opts(func, copy, strip, retarget)
+}
+
+/// [`run`] with its two sub-knobs explicit: `strip` looks through the
+/// members' `coldargs` wrappers (the raw value rides the edge and the
+/// shared block rebinds it once), `retarget` lets predecessors of a
+/// member that became a bare forwarder jump to the shared block directly.
+pub fn run_opts(func: &mut Function, copy: bool, strip: bool, retarget: bool) -> usize {
     let entry = func.layout.entry_block();
     // Candidate sites, grouped in first-seen order.
-    let mut index: FxHashMap<(FuncRef, TrapCode, Vec<Type>), usize> = FxHashMap::default();
+    let mut index: FxHashMap<(FuncRef, TrapCode, Vec<Type>, SourceLoc), usize> = FxHashMap::default();
     let mut groups: Vec<(FuncRef, TrapCode, Vec<Site>)> = vec![];
     for b in func.layout.blocks() {
         if Some(b) == entry || !func.layout.is_cold(b) {
@@ -203,13 +214,19 @@ pub fn run(func: &mut Function, copy: bool) -> usize {
         let mut args = orig.clone();
         let mut stripped = vec![false; args.len()];
         for (j, a) in args.iter_mut().enumerate() {
-            if let Some(raw) = unwrap_coldarg(func, b, *a) {
+            if strip && let Some(raw) = unwrap_coldarg(func, b, *a) {
                 *a = raw;
                 stripped[j] = true;
             }
         }
         let tys: Vec<Type> = args.iter().map(|&v| func.dfg.value_type(v)).collect();
-        let gi = *index.entry((func_ref, code, tys)).or_insert_with(|| {
+        // The call's source location is part of the key: with line tables
+        // (`-g`, `debug = "line-tables-only"`) the panicking frame of a
+        // backtrace is resolved through the call's return address, and a
+        // shared call would report one site's line for all of them.
+        // Without debug info every location is the default and nothing is
+        // kept apart.
+        let gi = *index.entry((func_ref, code, tys, func.srcloc(call))).or_insert_with(|| {
             groups.push((func_ref, code, vec![]));
             groups.len() - 1
         });
@@ -221,6 +238,21 @@ pub fn run(func: &mut Function, copy: bool) -> usize {
             args,
             stripped,
         });
+    }
+    // `PLIRON_TRACE=pliron::panicstub`: one line per function with a
+    // candidate — cold `call; trap` tails, how many share a tail with
+    // another (callee, trap code and argument types agree), how many are
+    // alone in their group.
+    if pliron_cfg::tracing_on() && !groups.is_empty() {
+        let cand: usize = groups.iter().map(|g| g.2.len()).sum();
+        let shared: usize = groups.iter().filter(|g| g.2.len() >= 2).map(|g| g.2.len()).sum();
+        tracing::info!(
+            target: "pliron::panicstub",
+            "panicstub-fn cand={cand} shared={shared} alone={} groups={} tails={}",
+            cand - shared,
+            groups.len(),
+            groups.iter().filter(|g| g.2.len() >= 2).count()
+        );
     }
     if !groups.iter().any(|g| g.2.len() >= 2) {
         return 0;
@@ -363,7 +395,7 @@ pub fn run(func: &mut Function, copy: bool) -> usize {
             n += 1;
             // Nothing left but the jump, and every arg is one of the
             // block's own params: preds can target `sb` directly.
-            if func.layout.first_inst(s.block) == func.layout.last_inst(s.block) {
+            if retarget && func.layout.first_inst(s.block) == func.layout.last_inst(s.block) {
                 let params = func.dfg.block_params(s.block);
                 let map: Option<Vec<usize>> = pass
                     .iter()
@@ -545,6 +577,36 @@ mod tests {
         let (mut func, _) = build([nr, TrapCode::unwrap_user(2), TrapCode::unwrap_user(3)]);
         assert_eq!(run(&mut func, true), 0);
         assert_eq!(count(&func, Opcode::Call), 3);
+    }
+
+    /// Calls on different source lines keep their own tails: the line of
+    /// the panicking frame comes from the call's return address.
+    #[test]
+    fn source_lines_stay_apart() {
+        let nr = TrapCode::NORETURN_CALL;
+        let (mut func, _) = build([nr, nr, nr]);
+        let calls: Vec<Inst> = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b).collect::<Vec<_>>())
+            .filter(|&i| func.dfg.insts[i].opcode() == Opcode::Call)
+            .collect();
+        assert_eq!(calls.len(), 3);
+        // Two sites on line 7, one on line 9.
+        func.set_srcloc(calls[0], SourceLoc::new(7));
+        func.set_srcloc(calls[1], SourceLoc::new(9));
+        func.set_srcloc(calls[2], SourceLoc::new(7));
+        assert_eq!(run_opts(&mut func, true, true, true), 2);
+        verify(&func);
+        assert_eq!(count(&func, Opcode::Call), 2, "{}", func.display());
+        let locs: Vec<u32> = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b).collect::<Vec<_>>())
+            .filter(|&i| func.dfg.insts[i].opcode() == Opcode::Call)
+            .map(|i| func.srcloc(i).bits())
+            .collect();
+        assert!(locs.contains(&7) && locs.contains(&9), "{locs:?}");
     }
 
     /// Two `tailmergep`-style shared blocks for one callee fold into

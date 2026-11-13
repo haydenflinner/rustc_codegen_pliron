@@ -63,6 +63,7 @@ pub fn run_fn(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
 
 fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHashSet<Ptr<BasicBlock>>) -> usize {
     let pin_nn = pliron_cfg::env_is("PLIRON_RETNN", "1");
+    let pin_na = pliron_cfg::env_is("PLIRON_SCOPED_NOALIAS", "1") && !pliron_cfg::env_is("PLIRON_SCOPED_PHI", "0");
     let mut n = 0;
     // `reach`/`preds` are loop-invariant: `remove_successor_operand`
     // only shrinks an edge's operand list, never retargets edges, so
@@ -131,6 +132,15 @@ fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHas
                 // continuation; `v` would lose it. An alloca's address
                 // needs no fact (and must not block SROA).
                 if pin_nn && st.nnargs.contains(arg) && !st.allocas.contains(v) {
+                    continue;
+                }
+                // `PLIRON_SCOPED_NOALIAS`: a clone-entry arg bound to a
+                // `noalias` callee param is the name the scoped fact hangs
+                // on (`State::region_noalias`); folded into the caller's
+                // value, accesses through it are indistinguishable from the
+                // caller's own. Allocas fold as above. `PLIRON_SCOPED_PHI=0`
+                // folds them anyway (then few candidates reach lowering).
+                if pin_na && st.region_noalias.contains(arg) && !st.allocas.contains(v) {
                     continue;
                 }
                 arg.replace_all_uses_with(ctx, &v);

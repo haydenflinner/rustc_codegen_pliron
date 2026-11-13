@@ -390,11 +390,21 @@ time, memory, code size, stack frames) in ~20 min and writes
   (`docs/history/2026-11-13-six-features.md`).
 - `PLIRON_PANICSTUB=0` — off switch for shared panic tails (default on,
   native only): the cold `call f(..); trap` tails of one callee in a
-  function become one block (.text -0.15% on three held-out programs,
-  executed instructions unchanged). `PLIRON_PANICSTUB_STRIP=0` keeps
+  function become one block (.text -0.1..-0.2% on regex and
+  rust-html-rewriter, less elsewhere; executed instructions unchanged). `PLIRON_PANICSTUB_STRIP=0` keeps
   each site's `coldargs` wrapper, `PLIRON_PANICSTUB_FWD=0` keeps
   forwarder blocks. Sites on different source lines stay apart when the
   build has line tables.
+- `PLIRON_SCOPED_NOALIAS=1` (opt-in) — an inlined callee's `&mut`
+  param keeps its `noalias` fact for the span of the inlined body: a
+  first pipeline step (`scopedfwd`) runs `loadfwd` on the function as
+  lowered, where locs reached through the param survive stores and
+  calls proven not based on it. Exact counts: rust-protobuf -0.95%,
+  rust-json -0.70%, rust-html-rewriter -0.43%, pulldown-cmark +0.64%
+  (not understood, hence opt-in). `PLIRON_TRACE=pliron::scopedna` says
+  why candidates drop out; `PLIRON_SCOPEDFWD=0` skips the step,
+  `PLIRON_SCOPEDFWD_PRE=0` its load PRE, `PLIRON_SCOPED_NCC=0` the
+  `nocapture` relaxation.
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
   functions get 2x their callsite limit (the body dies when all sites
   inline, LLVM's last-callsite bonus generalised). Reaches

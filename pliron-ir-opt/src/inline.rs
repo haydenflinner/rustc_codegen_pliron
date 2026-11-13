@@ -1427,6 +1427,20 @@ pub fn run(
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
+    // `PLIRON_INLINE_LEAN=<k>` (`0` off): a callee that is at most `k`
+    // ops and one call once constant branches, slot traffic and dead
+    // compares are taken out (`inline_cost::lean_cost`) passes the score
+    // whatever its raw op count, and is exempt from `fanin` and the
+    // caller's growth budget: it is a call wrapper, and inlining it costs
+    // about the call it replaces. `drop_glue::<RawVec<u8>>` (63 raw ops,
+    // `cost=83 t=64`) was a call at 1106 sites of lol_html.
+    let lean_k: usize = if always_only {
+        0
+    } else {
+        crate::env_get("PLIRON_INLINE_LEAN").and_then(|s| s.parse().ok()).unwrap_or(0)
+    };
+    let lean_pure = crate::cleanup::Pure::new();
+    let mut lean_memo: FxHashMap<String, crate::inline_cost::SpecCost> = FxHashMap::default();
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| limit.saturating_mul(GROWTH_MULT));
@@ -1898,6 +1912,18 @@ pub fn run(
                     {
                         t = t.min(droplim);
                     }
+                    // `PLIRON_INLINE_LEAN`: a wrapper passes the score.
+                    let mut lean_n = usize::MAX;
+                    let lean = lean_k > 0 && !f.cold && cost > t && {
+                        let lc = *lean_memo
+                            .entry(cs.clone())
+                            .or_insert_with(|| crate::inline_cost::lean_cost(ctx, st, ci.op, &lean_pure));
+                        lean_n = lc.n;
+                        lc.n <= lean_k && lc.ncalls <= 1
+                    };
+                    if lean {
+                        t = cost;
+                    }
                     // `#[inline(always)]` skips the score like LLVM's
                     // AlwaysInliner (`PLIRON_INLINE_ALWAYS=0` restores it; the
                     // caller `cap` and the recursion/EH rules still apply).
@@ -1930,6 +1956,7 @@ pub fn run(
                     } else if fanin > 0
                         && !free
                         && !hot_site
+                        && !lean
                         && !f.always_inline
                         && adj
                             .as_ref()
@@ -1940,7 +1967,7 @@ pub fn run(
                             .contains(&b)
                     {
                         "reject (fanin)"
-                    } else if model && !free && !hot_site && grown + sn > growth {
+                    } else if model && !free && !hot_site && !lean && grown + sn > growth {
                         "reject (growth)"
                     } else if maxdup > 0
                         && !f.always_inline
@@ -1948,7 +1975,7 @@ pub fn run(
                     {
                         "reject (dup)"
                     } else {
-                        if model && !free {
+                        if model && !free && !lean {
                             grown += sn;
                         }
                         if maxdup > 0 {
@@ -1965,13 +1992,15 @@ pub fn run(
                         "accept"
                     };
                     if why != "accept" {
-                        pliron_cfg::remark!("inline", sym, cs; "{why} n={} calls={} warm={}/{} cost={cost} t={t} size={size} cap={cap} grown={grown} growth={growth}",
-                            ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops);
+                        pliron_cfg::remark!("inline", sym, cs; "{why} n={} calls={} warm={}/{} cost={cost} t={t} size={size} cap={cap} grown={grown} growth={growth} lean={}",
+                            ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops, if lean_n == usize::MAX { -1 } else { lean_n as i64 });
                     }
                     if verbose {
                         if pliron_cfg::tracing_on() {
-                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",
-                                st.cgu, ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops, single.contains(cs), f.linkage == Linkage::Local,
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [lean={} single={} local={} taken={} callers={} rec={} used={}]",
+                                st.cgu, ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops,
+                                if lean_n == usize::MAX { -1 } else { lean_n as i64 },
+                                single.contains(cs), f.linkage == Linkage::Local,
                                 adj.as_ref().is_some_and(|a| a.taken.contains(cs.as_str())),
                                 adj.as_ref().and_then(|a| a.callers_of.get(cs.as_str())).map_or(0, |v| v.len()),
                                 rec_caller, free_used.contains(cs.as_str())

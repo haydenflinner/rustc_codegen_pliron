@@ -8,7 +8,7 @@
 # Links with the pure-Rust `wild` linker when it is on PATH (cargo install wild-linker).
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
-#   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
+#   punroll icmpfold coldargs coldcopy fastcc scopedna bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
@@ -190,6 +190,53 @@ t_coldcopy() {
   PLIRON_COLDCOPY=1 rustc $BE --edition 2021 -O -C codegen-units=1 tests/coldcopy/main.rs -o $out/coldcopy$exe || return 1
   [[ -n "$exe" ]] && return 0
   diff <($out/coldcopy-stock$exe) <($out/coldcopy$exe)
+}
+
+t_fastcc() {
+  # PLIRON_FASTCC (aarch64): a direct call to a function compiled in the same
+  # object clobbers only what that function's code writes. Callers keep
+  # sixteen values live across calls to a leaf, a chain, recursion, fn
+  # pointers and `dyn`, std, multi-register and stack returns, and a callee
+  # whose cold path panics (caught above the narrowed call); the output
+  # matches stock rustc's with one and with several codegen units, and with
+  # the noreturn-path rule off. On aarch64 the caller of the leaf must come
+  # out shorter than with PLIRON_FASTCC=0, and no function may write a
+  # register outside its recorded set (harness/fastcc_check.py).
+  rustc --edition 2021 -O tests/fastcc/main.rs -o $out/fastcc-stock$exe || return 1
+  local v i=0
+  for v in "PLIRON_FASTCC=1 CGU=1" "PLIRON_FASTCC=1 CGU=4" "PLIRON_FASTCC=1 PLIRON_FASTCC_NORET=0 CGU=1" "PLIRON_FASTCC=1 PLIRON_FASTCC_HIDDEN=0 CGU=4"; do
+    i=$((i + 1))
+    env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/fastcc/main.rs -o $out/fastcc$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/fastcc-stock$exe) <($out/fastcc$i$exe) || { echo "fastcc: output differs ($v)" >&2; return 1; }
+  done
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  PLIRON_FASTCC=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/fastcc/main.rs -o $out/fastcc-off.o || return 1
+  PLIRON_FASTCC=1 PLIRON_FASTCC_NORET=0 PLIRON_TRACE=pliron::fastcc=debug rustc $BE --edition 2021 -O -C codegen-units=1 \
+    --emit=obj tests/fastcc/main.rs -o $out/fastcc-on.o 2> $out/fastcc-on.log || return 1
+  local n0 n1
+  n0=$("$llvmod" -d --no-show-raw-insn $out/fastcc-off.o | awk '/across_leaf>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  n1=$("$llvmod" -d --no-show-raw-insn $out/fastcc-on.o | awk '/across_leaf>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  (( n0 > 0 && n1 < n0 )) || { echo "fastcc: across_leaf $n0 -> $n1 instructions, nothing narrowed" >&2; return 1; }
+  harness/fastcc_check.py $out/fastcc-on.log $out/fastcc-on.o
+}
+
+t_scopedna() {
+  # PLIRON_SCOPED_NOALIAS=1 (opt-in): an inlined callee's `&mut` param is a
+  # second name for the caller's memory inside the inlined body. A `&self`
+  # method inlined into a `&mut self` loop that grows the same Vec, an
+  # in-place collect, callee stores read back by the caller and the
+  # reverse: output matches stock rustc's, with rustc's MIR inliner and
+  # with ours doing all the inlining (-Zinline-mir=no, where the first
+  # version that let the fact reach the passes printed garbage).
+  rustc --edition 2021 -O tests/scopedna/main.rs -o $out/scopedna-stock$exe || return 1
+  local f i=0
+  for f in "" "-Zinline-mir=no"; do
+    i=$((i + 1))
+    PLIRON_SCOPED_NOALIAS=1 rustc $BE --edition 2021 -O $f -C codegen-units=1 tests/scopedna/main.rs -o $out/scopedna$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/scopedna-stock$exe) <($out/scopedna$i$exe) || { echo "scopedna: output differs ($f)" >&2; return 1; }
+  done
 }
 
 t_bcheck() {
@@ -1259,6 +1306,8 @@ want icmpfold && t_icmpfold
 want rangefold && t_rangefold
 want coldargs && t_coldargs
 want coldcopy && t_coldcopy
+want fastcc && t_fastcc
+want scopedna && t_scopedna
 want bcheck && t_bcheck
 want unswitch && t_unswitch
 want slotmerge && t_slotmerge

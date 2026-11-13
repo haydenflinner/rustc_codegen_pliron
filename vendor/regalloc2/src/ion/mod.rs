@@ -35,6 +35,7 @@ pub(crate) mod dump;
 pub(crate) mod moves;
 pub(crate) mod spill;
 pub(crate) mod postopt;
+pub(crate) mod rehome;
 
 impl<'a, F: Function> Env<'a, F> {
     pub(crate) fn new(func: &'a F, env: &'a MachineEnv, ctx: &'a mut Ctx) -> Self {
@@ -98,6 +99,9 @@ impl<'a, F: Function> Env<'a, F> {
         self.process_bundles()?;
         self.try_allocating_regs_for_spilled_bundles();
         self.allocate_spillslots();
+        // PLIRON (`PLIRON_RA2_REHOME`): a value's place in a join-only
+        // block follows the cheaper side of its edges (`ion/rehome.rs`).
+        self.rehome_joins();
         if trace_enabled!() {
             self.dump_state();
         }

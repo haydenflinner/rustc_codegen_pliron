@@ -370,12 +370,16 @@ Checked:
 - `harness/fastcc_check.py`: disassembles the objects and reports any
   instruction that writes a caller-saved register missing from its
   function's recorded set (build with `PLIRON_FASTCC_NORET=0` and
-  `PLIRON_TRACE=pliron::fastcc=debug`). All eight held-out programs
-  (macOS) and five on linux-musl: no violation among the functions this
-  backend compiled, 14k-123k instructions checked per program. (One
-  report on blind-sig was the prebuilt std's own copy of
-  `decode_error_kind` next to our local copy of the same name: check
-  objects, not the linked binary.) A set zeroed by hand is reported.
+  `PLIRON_TRACE=pliron::fastcc=debug`). The rlibs and `-Csave-temps`
+  objects of all eight held-out programs (macOS): every recorded set
+  found in the code (455 to 12,371 functions a program), 49k-597k
+  instructions checked, no violation; the linked linux-musl binaries of
+  five as well. 4-9% of the words are skipped: what follows a transfer
+  that does not fall through, up to the next direct branch target, is
+  jump-table data, a block only a jump table reaches, or a landing pad.
+  On a linked binary the prebuilt std's own copy of a function we also
+  compiled a local copy of (`decode_error_kind`) is checked against our
+  set and reported: check objects. A set zeroed by hand is reported.
 - `tests/fastcc/main.rs`, stanza `fastcc` (new): leaf, chain,
   recursion, mutual recursion, fn pointers and `dyn`, calls into std,
   floats, `u128`, ten-value and array returns, a callee whose cold path
@@ -384,13 +388,21 @@ Checked:
   caller must get shorter, and the checker must pass.
 - All eight held-out programs print the expected output natively, the
   six callgrind ones also under valgrind on linux-musl.
-- Fuzz, `PLIRON_FASTCC=1`: seeds 91000:91600 (first version),
-  95000:95600 (with the two rule changes) FUZZ_FCC_PLACEHOLDER
+- Fuzz: seeds 91000:91600 (`PLIRON_FASTCC=1`, first version),
+  95000:95600 (with the two rule changes), and 95000:95600 again on
+  the final tree with the knob at its default: 600 pass each. (A run
+  on fresh seeds 98000:98600 died in the harness near its end when
+  another session's fuzz removed a seed directory under it.)
 - Two builds of regex and rust-json are byte-identical. `PLIRON_PAR=0`
   gives a different binary than the parallel build, with the knob on
   and off alike (rust-json: the same two hashes either way), so that
   difference is not this feature's.
-- CRATES_PLACEHOLDER
+- `harness/crates.py --tier 1 --deps pliron` with FASTCC and the panic
+  tails on: 19 of 20 crates as stock. hashbrown fails two doc-tests
+  (`symmetric_difference`, `bitxor`: `{4}` where `{1, 4}` is expected).
+  The same wrong set comes out of a ten-line program on std's `HashSet`
+  at opt-level 0 with both knobs off, and with a backend built before
+  this work. Not this work's and not fixed here.
 
 Not done: an x64 consumer; cross-CGU and cross-crate sets; `try_call`
 (regalloc2 has one clobber set per instruction, the unwind edge needs
@@ -410,8 +422,12 @@ not built with it.
 | rust-protobuf | 9160 | 354 | 123 | 8806 | 366,628 -> 366,500 (-0.03%) | 0 |
 
 (Tail counts: `PLIRON_TRACE=pliron::panicstub`, the whole crate graph
-of a native build; .text: the linux-musl binary, prebuilt std
-included.) Executed instructions do not move beyond what one
+of a native build; .text: the linux-musl binary with line tables, built
+before the source-location key below, prebuilt std included. The
+native binaries without debug info, final tree, `__text` off -> on:
+pulldown-cmark 416,176 both, regex 751,152 -> 749,744, rust-html-rewriter
+766,640 -> 765,616, rust-json 359,856 -> 359,792, rust-protobuf
+283,440 -> 283,184.) Executed instructions do not move beyond what one
 instruction in one hot function is worth, and that moves with the tree:
 across four backend builds of the day the same knob measured
 pulldown-cmark -0.06%, -0.06%, 0 and +0.05%, regex +0.30%
@@ -434,8 +450,12 @@ line for all of them; without debug info every location is the default
 and nothing is kept apart (unit test `source_lines_stay_apart`). Not run
 on wasm (the step returns early there).
 
-Checked: all eight programs' output; fuzz seeds FUZZ_PS_PLACEHOLDER;
-the gate with the knob on by default.
+Checked: all eight programs' output; the std corpus replayed with the
+interpreter check, off against on: 4198 ok and 672 inconclusive either
+way, 392,274 -> 391,601 CLIF instructions (-0.17%), 196 of 4870
+functions changed; fuzz seeds 96000:96600 with the knob set (before
+the source-location key) and 95000:95600 on the final tree with it on
+by default, 600 pass each; the gate with the knob on by default.
 
 ### Scoped noalias: sound now, still opt-in
 
@@ -489,7 +509,55 @@ functions with a candidate, and candidates whose caller-side root is a
 stack slot or the caller's own function-wide `noalias` param are not
 seeded.
 
-SNA_RESULT_PLACEHOLDER
+Final form, the knob on against the same backend's defaults:
+
+| program | off | on | |
+|---|---|---|---|
+| pulldown-cmark | 52,528,195 | 52,864,224 | +0.64% |
+| regex | 51,582,040 | 51,580,776 | 0 |
+| rust-html-rewriter | 104,539,286 | 104,093,682 | -0.43% |
+| rust-json | 51,853,297 | 51,488,114 | -0.70% |
+| rust-protobuf | 65,690,420 | 65,066,483 | -0.95% |
+| blake3-scalar | 49,075,163 | 49,066,078 | -0.02% |
+
+What the `scopedfwd` run sees (`pliron::scopedna` trace, the whole
+crate graph of a native build). "Kept": a store or call inside the
+clone met locs under the param and was proven not based on it; "killed":
+it was not proven.
+
+| program | functions with a candidate | candidates | qualify | escape (rule 2) | no single source | stores kept / killed | calls kept / killed |
+|---|---|---|---|---|---|---|---|
+| regex | 465 | 3362 | 483 | 2559 | 320 | 120 / 117 | 143 / 66 |
+| pulldown-cmark | 145 | 1127 | 241 | 839 | 47 | 11 / 52 | 5 / 13 |
+| rust-html-rewriter | 358 | 1713 | 253 | 1233 | 225 | 166 / 66 | 88 / 42 |
+| rust-json | 129 | 2069 | 590 | 1453 | 26 | 0 / 17 | 196 / 37 |
+| rust-protobuf | 217 | 1796 | 529 | 1230 | 37 | 100 / 36 | 201 / 59 |
+
+It stays opt-in. Three programs gain, pulldown-cmark loses 0.64%, and
+that loss is not understood: +0.10% is there with the step off
+(`PLIRON_SCOPEDFWD=0`; only the IR side then differs — `phisimp` keeps
+the clone-entry args — and per-function counts move by hundreds of
+thousands in both directions), the rest comes with the step. Without
+load PRE in that run (`PLIRON_SCOPEDFWD_PRE=0`) pulldown-cmark is at
++0.43% but rust-protobuf at +0.55% instead of -0.95%, so PRE stays in.
+Without the `phisimp` hold nothing reaches lowering on pulldown-cmark
+(the count is the baseline's to the instruction).
+
+Open: the pulldown-cmark loss; rule 2 (68-76% of the candidates are
+handed to a callee or stored; counting `nocapture` operands as tracked,
+`PLIRON_SCOPED_NCC=0` off, moved regex from 421 to 483 qualifying);
+"no single source" at the start of the pipeline; licm and dse do not
+use the fact; the corpus header records `noalias`/`scopedna` only for
+entry params, so a corpus replay never has a candidate and `--check`
+says nothing about this feature.
+
+Checked: the five unit tests in `loadfwd_scoped_noalias.rs`, the two
+carry tests, stanza `scopedna`; all eight held-out programs print the
+expected output with the knob on (native), six under valgrind; fuzz
+seeds 94000:94600 with the knob on, final tree: 600 pass (the first
+live version failed in that range: 18 compile errors, 34
+`env-compile-error`s and a run timeout, seed 94297). A memory-pass change wants a longer sweep than that before it
+becomes a default.
 
 ## Parity by exact counts (`bench/heldout/irdiff.py`)
 

@@ -1652,26 +1652,79 @@ impl<I: VCodeInst> VCode<I> {
     }
 
     /// PLIRON: FASTCC (see `machinst/abi.rs`) — every register this
-    /// function's machine code may write, from the regalloc result: move
-    /// destinations, def allocations, and each instruction's clobber set.
-    /// Unlike `compute_clobbers_and_function_calls` this includes the
-    /// clobbers of same-ABI calls (no `is_included_in_clobbers` filter),
-    /// which is what makes the set transitive over callees. Registers the
-    /// emitter writes without telling regalloc (scratch registers, the
-    /// link register, prologue/epilogue temporaries) are not here: the
-    /// backend that consumes the set adds them back at the call site.
+    /// function's machine code may write before it *returns*, from the
+    /// regalloc result: move destinations, def allocations, and each
+    /// instruction's clobber set. Unlike
+    /// `compute_clobbers_and_function_calls` this includes the clobbers of
+    /// same-ABI calls (no `is_included_in_clobbers` filter), which is what
+    /// makes the set transitive over callees. Registers the emitter writes
+    /// without telling regalloc (scratch registers, the link register,
+    /// prologue/epilogue temporaries) are not here: the backend that
+    /// consumes the set adds them back at the call site.
+    ///
+    /// Only blocks from which a `ret` is reachable count
+    /// (`PLIRON_FASTCC_NORET=0` counts every block): what a path that ends
+    /// in a trap, a noreturn call (panic) or an endless loop writes is
+    /// never seen by a caller that resumes after its `call`. A caller that
+    /// resumes at a landing pad used a `try_call`, which never takes a
+    /// reduced set. Without this a single bounds-check panic gives a leaf
+    /// the whole ABI clobber set.
+    ///
     /// `None` when the function contains a tail call — the tail callee
     /// runs in this function's place and its writes are not known here.
     fn pliron_written_regs(&self, regalloc: &regalloc2::Output) -> Option<PRegSet> {
+        static NORET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let noret = *NORET.get_or_init(|| std::env::var("PLIRON_FASTCC_NORET").as_deref() != Ok("0"));
+        let nb = self.num_blocks();
+        // Blocks that can reach a return, by a backward walk from the
+        // returning blocks.
+        let mut returns = vec![!noret; nb];
+        let mut insn_block = vec![0u32; self.insts.len()];
+        let mut work: Vec<usize> = Vec::new();
+        for b in 0..nb {
+            let r = self.block_ranges.get(b);
+            for i in r.start..r.end {
+                insn_block[i] = b as u32;
+                if self.insts[i].call_type() == CallType::TailCall {
+                    return None;
+                }
+                match self.insts[i].is_term() {
+                    MachTerminator::Ret => {
+                        if !returns[b] {
+                            returns[b] = true;
+                        }
+                        work.push(b);
+                    }
+                    MachTerminator::RetCall => return None,
+                    _ => {}
+                }
+            }
+        }
+        if noret {
+            let mut seen = vec![false; nb];
+            while let Some(b) = work.pop() {
+                if std::mem::replace(&mut seen[b], true) {
+                    continue;
+                }
+                returns[b] = true;
+                for p in &self.block_preds[self.block_pred_range.get(b)] {
+                    if !seen[p.index()] {
+                        work.push(p.index());
+                    }
+                }
+            }
+        }
         let mut written = PRegSet::default();
-        for (_, Edit::Move { to, .. }) in &regalloc.edits {
-            if let Some(preg) = to.as_reg() {
+        for (pp, Edit::Move { to, .. }) in &regalloc.edits {
+            if let Some(preg) = to.as_reg()
+                && returns[insn_block[pp.inst().index()] as usize]
+            {
                 written.add(preg);
             }
         }
         for (i, range) in self.operand_ranges.iter() {
-            if self.insts[i].call_type() == CallType::TailCall {
-                return None;
+            if !returns[insn_block[i] as usize] {
+                continue;
             }
             let operands = &self.operands[range.clone()];
             let allocs = &regalloc.allocs[range];
