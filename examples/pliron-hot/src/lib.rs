@@ -45,6 +45,9 @@ struct BaseSym {
 pub struct Base {
     syms: HashMap<String, BaseSym>,
     end: usize,
+    /// Runtime extent of the executable's `__hot_thunks` section (arm64
+    /// Mach-O): the only pages `direct` may rewrite.
+    thunks: (usize, usize),
 }
 
 impl Base {
@@ -79,7 +82,14 @@ impl Base {
             .into_iter()
             .map(|(k, (a, w, _, n))| (k, BaseSym { addr: a.wrapping_add(slide), writable: w, unique: n == 1 }))
             .collect();
-        Ok(Base { syms, end })
+        let thunks = f
+            .sections()
+            .find(|s| s.name() == Ok("__hot_thunks"))
+            .map_or((0, 0), |s| {
+                let a = (s.address() as usize).wrapping_add(slide);
+                (a, a + s.size() as usize)
+            });
+        Ok(Base { syms, end, thunks })
     }
 
     fn lookup(&self, name: &str) -> Option<usize> {
@@ -377,6 +387,196 @@ fn fingerprints_of(t: &Parsed) -> Prints {
     out
 }
 
+/// `PLIRON_HOT_DIRECT=1` (arm64 macOS): after the slots of a patch are
+/// repointed, rewrite each patched function's thunk from
+/// `adrp x16, slot; ldr x16, [x16]; br x16` to `b <new body>`, so calls
+/// cost a direct jump instead of a load and an indirect branch (relax's
+/// thunk head). The slot is always updated too: a thread already past the
+/// first instruction still loads the right target.
+///
+/// Thunks live in their own page-padded section (`__TEXT,__hot_thunks`),
+/// because the write needs the page read-write and Apple Silicon has no
+/// writable+executable pages: for the moment a page is flipped nothing
+/// on it can run. Every other thread is suspended around the flip, and
+/// the patcher's own code is never on a thunk page. Returns how many
+/// thunks now jump directly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn direct(base: &Base, targets: &[(usize, usize)]) -> usize {
+    use std::sync::atomic::AtomicU32;
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn vm_protect(task: u32, addr: usize, size: usize, set_max: i32, prot: i32) -> i32;
+        fn task_threads(task: u32, list: *mut *mut u32, n: *mut u32) -> i32;
+        fn thread_suspend(t: u32) -> i32;
+        fn thread_resume(t: u32) -> i32;
+        fn mach_thread_self() -> u32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+    }
+    const PAGE: usize = 0x4000;
+    let (lo, hi) = base.thunks;
+    // (page, instruction address, new instruction), decided before any
+    // thread stops: nothing below may allocate or take a lock.
+    let mut work: Vec<(usize, usize, u32)> = Vec::new();
+    for &(thunk, target) in targets {
+        if thunk < lo || thunk + 28 > hi || (lo & (PAGE - 1)) != 0 || (hi & (PAGE - 1)) != 0 {
+            continue;
+        }
+        // The slot load is the thunk's first instruction, or its fifth
+        // behind a reach mark; a thunk patched before starts with `b`.
+        let at = (0..5).map(|i| thunk + 4 * i).find(|&a| {
+            let w = unsafe { (*(a as *const AtomicU32)).load(Ordering::Relaxed) };
+            (w & 0x9f00_001f) == 0x9000_0010 || (w & 0xfc00_0000) == 0x1400_0000
+        });
+        let Some(at) = at else { continue };
+        let d = target as isize - at as isize;
+        if d & 3 != 0 || !(-(1 << 27)..(1 << 27)).contains(&d) {
+            continue;
+        }
+        work.push((at & !(PAGE - 1), at, 0x1400_0000 | (((d >> 2) as u32) & 0x03ff_ffff)));
+    }
+    if work.is_empty() {
+        return 0;
+    }
+    work.sort();
+    let mut done = 0;
+    unsafe {
+        let task = mach_task_self_;
+        let me = mach_thread_self();
+        let (mut list, mut n) = (std::ptr::null_mut::<u32>(), 0u32);
+        if task_threads(task, &mut list, &mut n) != 0 {
+            return 0;
+        }
+        let threads = std::slice::from_raw_parts(list, n as usize);
+        for &t in threads {
+            if t != me {
+                thread_suspend(t);
+            }
+        }
+        let mut i = 0;
+        while i < work.len() {
+            let page = work[i].0;
+            let mut j = i;
+            while j < work.len() && work[j].0 == page {
+                j += 1;
+            }
+            // 1|2|0x10: read, write, copy (a private copy of the file page).
+            if vm_protect(task, page, PAGE, 0, 1 | 2 | 0x10) == 0 {
+                for &(_, at, insn) in &work[i..j] {
+                    (*(at as *const AtomicU32)).store(insn, Ordering::Release);
+                }
+                done += j - i;
+            }
+            // Back to read+execute whether or not the write happened.
+            vm_protect(task, page, PAGE, 0, 1 | 4);
+            sys_icache_invalidate(page as *const u8, PAGE);
+            i = j;
+        }
+        for &t in threads {
+            if t != me {
+                thread_resume(t);
+            }
+            mach_port_deallocate(task, t);
+        }
+        mach_port_deallocate(task, me);
+        vm_deallocate(task, list as usize, n as usize * 4);
+    }
+    done
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn direct(_base: &Base, _targets: &[(usize, usize)]) -> usize {
+    0
+}
+
+/// The functions of the hot crate this process has entered so far, as the
+/// executable spells them (`PLIRON_HOT_REACH=1` builds: every thunk sets
+/// its function's byte in `__hot_marks` on the way in).
+pub fn reach(base: &Base) -> Vec<String> {
+    let mut v: Vec<String> = base
+        .syms
+        .iter()
+        .filter_map(|(k, s)| {
+            let name = k.strip_prefix("__hot_mark.")?;
+            (unsafe { *(s.addr as *const u8) } != 0).then(|| name.to_string())
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// `PLIRON_HOT_REACH_OUT=<file>`: write `reach` there when the process
+/// exits. Runs from a static constructor, so a test binary gets it without
+/// a line of code — it only has to link this crate
+/// (`#[cfg(test)] use pliron_hot as _;` plus the `-u` link argument
+/// `examples/hot-test.sh` passes).
+extern "C" fn reach_dump() {
+    let Some(out) = std::env::var_os("PLIRON_HOT_REACH_OUT") else { return };
+    if let Ok(base) = Base::load() {
+        let _ = std::fs::write(out, reach(&base).join("\n"));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pliron_hot_reach_init() {
+    if std::env::var_os("PLIRON_HOT_REACH_OUT").is_some() {
+        unsafe { libc::atexit(reach_dump) };
+    }
+}
+
+#[used]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+#[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".init_array"))]
+static REACH_CTOR: extern "C" fn() = pliron_hot_reach_init;
+
+/// `PLIRON_HOT_FREE=protect`: retired patch mappings are not unmapped but
+/// made inaccessible, and a fault inside one says so. An unmapped range
+/// can be handed out again, and a thread that was still in the old code
+/// (a long-running loop, a frame parked across the grace window) would
+/// run whatever landed there; protected, it stops at once with the
+/// reason on stderr. The address space stays reserved.
+static RETIRED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static RETIRED_N: AtomicUsize = AtomicUsize::new(0);
+/// Lock-free copy for the signal handler.
+static RETIRED_TAB: [(AtomicUsize, AtomicUsize); 256] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; 256];
+
+extern "C" fn retired_fault(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    let addr = unsafe { (*info).si_addr() } as usize;
+    let n = RETIRED_N.load(Ordering::Acquire).min(RETIRED_TAB.len());
+    if (0..n).any(|i| {
+        let (lo, len) = (RETIRED_TAB[i].0.load(Ordering::Relaxed), RETIRED_TAB[i].1.load(Ordering::Relaxed));
+        addr >= lo && addr < lo + len
+    }) {
+        let msg = b"[hot] a thread was still running code of a patch that has been retired (PLIRON_HOT_FREE=protect); raise PLIRON_HOT_GRACE or restart\n";
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Make a retired mapping inaccessible and remember it for the handler.
+fn retire(mem: usize, len: usize) {
+    static HANDLER: std::sync::Once = std::sync::Once::new();
+    HANDLER.call_once(|| unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = retired_fault as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    });
+    unsafe { libc::mprotect(mem as *mut _, len, libc::PROT_NONE) };
+    let mut v = RETIRED.lock().unwrap();
+    if v.len() < RETIRED_TAB.len() {
+        RETIRED_TAB[v.len()].0.store(mem, Ordering::Relaxed);
+        RETIRED_TAB[v.len()].1.store(len, Ordering::Relaxed);
+        v.push((mem, len));
+        RETIRED_N.store(v.len(), Ordering::Release);
+    }
+}
+
 /// Type layouts of one object: `path -> (size, align, hash)`, from the
 /// table the backend writes under `PLIRON_HOT_LAYOUT=1`
 /// (`src/hot_layout.rs`). `None` when the object carries no table.
@@ -445,6 +645,8 @@ pub struct Applied {
     pub prints: Prints,
     /// Functions repointed by name, and the mapping's extent.
     fns: Vec<String>,
+    /// (thunk address, new body) of each repointed function, for `direct`.
+    pub targets: Vec<(usize, usize)>,
     mem: usize,
     len: usize,
 }
@@ -599,7 +801,7 @@ pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<Applied,
         }
     }
     let n = fns.len();
-    Ok(Applied { n, prints, fns, mem, len: plt0 + 8 * nrel })
+    Ok(Applied { n, prints, fns, targets: Vec::new(), mem, len: plt0 + 8 * nrel })
 }
 
 // Darwin arm64: MAP_JIT pages obey a per-thread write/execute toggle and
@@ -1079,6 +1281,7 @@ fn apply_macho<'d>(
         eprintln!("[hot] relocs {:?}", t0.elapsed());
     }
     let mut fns = Vec::new();
+    let mut targets = Vec::new();
     for (i, s) in syms.iter().enumerate() {
         let Some(s) = s else { continue };
         if s.kind != SymbolKind::Text || !s.def || !changed(s.name) {
@@ -1086,6 +1289,9 @@ fn apply_macho<'d>(
         }
         if let Some(slot) = base.syms.get(&format!("__hot_slot.{}", s.name)) {
             unsafe { (*(slot.addr as *const AtomicUsize)).store(mem + fndst[&i], Ordering::Release) };
+            if let Some(th) = base.syms.get(s.name) {
+                targets.push((th.addr, mem + fndst[&i]));
+            }
             if dbg {
                 eprintln!("[hot] repoint {}", s.name);
             }
@@ -1093,7 +1299,7 @@ fn apply_macho<'d>(
         }
     }
     let n = fns.len();
-    Ok(Applied { n, prints, fns, mem, len: stub0 + 16 * nrel })
+    Ok(Applied { n, prints, fns, targets, mem, len: stub0 + 16 * nrel })
 }
 
 /// If `PLIRON_HOT_DIR` is set, apply every `*.o` that appears in it, in name order.
@@ -1112,6 +1318,8 @@ pub fn start() {
         };
         let mut seen = HashSet::new();
         let free = std::env::var_os("PLIRON_HOT_FREE").is_some();
+        let protect = std::env::var("PLIRON_HOT_FREE").as_deref() == Ok("protect");
+        let want_direct = std::env::var("PLIRON_HOT_DIRECT").as_deref() == Ok("1");
         let grace: usize = std::env::var("PLIRON_HOT_GRACE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1141,7 +1349,14 @@ pub fn start() {
                         for name in &ap.fns {
                             provider.insert(name.clone(), gnr);
                         }
-                        eprintln!("[hot] {}: {} functions patched in {:?}", p.display(), ap.n, t.elapsed());
+                        let nd = if want_direct { direct(&base, &ap.targets) } else { 0 };
+                        eprintln!(
+                            "[hot] {}: {} functions patched in {:?}{}",
+                            p.display(),
+                            ap.n,
+                            t.elapsed(),
+                            if want_direct { format!(", {nd} thunks jump directly") } else { String::new() }
+                        );
                         prev = Some(ap.prints);
                         applied.push((ap.mem, ap.len, ap.fns.iter().cloned().collect(), gnr));
                         if free {
@@ -1149,7 +1364,11 @@ pub fn start() {
                                 let keep = g + grace > gnr
                                     || !fns.iter().all(|n| provider.get(n).is_some_and(|&pg| pg > g));
                                 if !keep {
-                                    unsafe { libc::munmap(mem as *mut _, len) };
+                                    if protect {
+                                        retire(mem, len);
+                                    } else {
+                                        unsafe { libc::munmap(mem as *mut _, len) };
+                                    }
                                 }
                                 keep
                             });

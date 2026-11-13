@@ -13,7 +13,7 @@ case "$(uname)" in
 Darwin) DYLIB=dylib; LINKER=(); SEDI=(-i '') ;;
 *)      DYLIB=so;    LINKER=(-Clinker="$B/selfhost/cc-wild"); SEDI=(-i) ;;
 esac
-FL="-Zcodegen-backend=$B/target/debug/librustc_codegen_pliron.$DYLIB -Ccodegen-units=1"
+FL="-Zcodegen-backend=${PLIRON_BACKEND:-$B/target/debug/librustc_codegen_pliron.$DYLIB} -Ccodegen-units=1"
 W="$B/target/hot-test"; rm -rf "$W"; mkdir -p "$W/patches"
 RUSTFLAGS="$FL ${LINKER[*]:-}" CARGO_TARGET_DIR="$W/agent" \
     cargo build -q --manifest-path "$B/examples/pliron-hot/Cargo.toml"
@@ -24,7 +24,8 @@ LDEPS=(); for d in "$D"/build/*/*/out; do LDEPS+=(-L "dependency=$d"); done
 RC=(rustc $FL --edition 2024 "${LINKER[@]}" --extern pliron_hot="$LIB" --extern pliron_hot="${LIB%.rlib}.rmeta" "${LDEPS[@]}" "$W/demo.rs")
 PLIRON_HOT=demo "${RC[@]}" -o "$W/demo"
 "${RC[@]}" --emit=obj -o "$W/patches/base.ref"
-PLIRON_HOT_DIR="$W/patches" "$W/demo" > "$W/out.txt" 2> "$W/err.txt" & PID=$!
+# PLIRON_HOT_DIRECT=1: on arm64 macOS the patched thunk becomes a direct `b`.
+PLIRON_HOT_DIRECT=1 PLIRON_HOT_DIR="$W/patches" "$W/demo" > "$W/out.txt" 2> "$W/err.txt" & PID=$!
 sleep 0.3
 sed "${SEDI[@]}" 's/^    1$/    1000 + TICKS.load(Ordering::Relaxed)/' "$W/demo.rs"
 t0=$(date +%s.%N)
@@ -36,6 +37,9 @@ cat "$W/err.txt"
 last=$(tail -1 "$W/out.txt"); echo "$last"
 read -r _ t _ v <<< "$last"
 [[ $t -gt 0 && $v -eq $((1000 + t + 1)) ]] && echo "hot patch OK"
+if [[ "$(uname -sm)" == "Darwin arm64" ]]; then
+    grep -q "p1.o: .* [1-9][0-9]* thunks jump directly" "$W/err.txt" && echo "hot direct thunks OK"
+fi
 
 # Layout guard (`PLIRON_HOT_LAYOUT=1`): a patch that changes a struct the
 # live process holds values of must be refused, not applied -- the old

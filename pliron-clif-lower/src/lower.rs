@@ -2187,7 +2187,11 @@ pub fn lower_module<'a>(
         verbatim_syms,
         custom_secs,
         asm_stubs,
-        hot_asm,
+        hot_asm: crate::hot::thunks_wrap(
+            &hot_asm,
+            macho,
+            isa.triple().architecture == target_lexicon::Architecture::X86_64,
+        ),
         dbg_fns,
     }
 }
