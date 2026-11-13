@@ -44,7 +44,9 @@ ICES = os.path.join(OUT, "ices")
 TOOLCHAIN = re.search(r'channel = "([^"]+)"', open(os.path.join(ROOT, "rust-toolchain.toml")).read()).group(1)
 SO = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
 LIB = "" if sys.platform == "win32" else "lib"
-BACKEND = os.path.join(ROOT, f"target/debug/{LIB}rustc_codegen_pliron.{SO}")
+# PLIRON_PROFILE=<cargo profile> (default debug): which build of the backend to test.
+PROFILE = os.environ.get("PLIRON_PROFILE", "debug")
+BACKEND = os.path.join(ROOT, f"target/{PROFILE}/{LIB}rustc_codegen_pliron.{SO}")
 ARCH = platform.machine()
 
 os.environ["RUSTUP_TOOLCHAIN"] = TOOLCHAIN
@@ -619,7 +621,7 @@ def main():
     ap.add_argument("--no-build", action="store_true", help="skip `cargo build` of the backend")
     args = ap.parse_args()
     if not args.no_build:
-        subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
+        subprocess.run(["cargo", "build"] + ([] if PROFILE == "debug" else ["--profile", PROFILE]), cwd=ROOT, check=True)
     os.makedirs(ICES, exist_ok=True)
     ices_before = set(os.listdir(ICES))
     bad = 0

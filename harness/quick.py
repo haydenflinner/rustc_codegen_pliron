@@ -235,7 +235,7 @@ class Runner:
         self.a, self.g, self.plan = a, g, plan
         os.makedirs(OUT, exist_ok=True)
         self.rows = []
-        self.cc = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "clif-check")
+        self.cc = g.CLIF_CHECK  # target/$PLIRON_PROFILE (default debug)
         self.env = dict(os.environ, RUSTC_ICE=os.path.join(ROOT, "target/ices"))
 
     def sh(self, name, cmd, env=None, timeout=900, quiet=False):
@@ -284,7 +284,7 @@ class Runner:
 
     def unit(self, crate):
         sel = self.plan.units.get(crate)
-        base = ["cargo", "test", "-q", "-p", crate]
+        base = ["cargo", "test", "-q", *self.g.PROFILE_ARGS, "-p", crate]
         if crate == "pliron-clif-check":
             return
         if sel is None:
@@ -379,7 +379,7 @@ def main():
     # --- build -------------------------------------------------------------
     if not a.no_build:
         pk = ["-p", "pliron-clif-check"] + (["-p", "rustc_codegen_pliron"] if (plan.glue or a.tier >= 1) else [])
-        b = R.sh("build", ["cargo", "build", *pk])
+        b = R.sh("build", ["cargo", "build", *g.PROFILE_ARGS, *pk])
         if not b["ok"]:
             print(open(b["log"]).read()[-3000:])
             print("quick: build failed")

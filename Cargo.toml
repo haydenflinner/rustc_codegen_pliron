@@ -34,7 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace]
-members = ["pliron-clif-opt", "pliron-clif-lower", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "bench"]
+members = ["pliron-clif-opt", "pliron-clif-lower", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "pliron-hack", "bench"]
 exclude = ["vendor"]
 
 [profile.dev]
@@ -72,6 +72,17 @@ incremental = false
 incremental = false
 [profile.dev.package.regalloc2]
 incremental = false
+
+# Inner-loop profile (docs/dev-loop.md, harness/dev.py): `dev` without the
+# crate-local ThinLTO pass that rustc runs over an incremental crate's
+# CGUs at opt-level >= 1. After a one-line pass edit that pass is ~13 s of
+# a ~17 s pliron-clif-opt rebuild; without it the backend runs ~15% slower
+# (CPU time of `clif-check report` on the std corpus). Builds into
+# target/fast; the `[profile.dev.package.*]` overrides are inherited.
+# Scripts take it with PLIRON_PROFILE=fast.
+[profile.fast]
+inherits = "dev"
+lto = "off"
 
 # Line tables so `-cpuprofile`/`-memprofile` (benchfmt pprof feature) can
 # attribute samples to source lines.

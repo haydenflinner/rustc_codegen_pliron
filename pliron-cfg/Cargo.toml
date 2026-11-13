@@ -7,3 +7,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 rustc-hash = "2"
 tracing = "0.1"
+# Feature unification across cargo package selections (docs/dev-loop.md).
+pliron-hack = { path = "../pliron-hack" }

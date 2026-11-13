@@ -3,7 +3,14 @@
 /// checkout), so selfhost/setup.sh writes `.pliron-src-rev` there; a git
 /// checkout asks harness/src-rev.sh.
 fn src_rev() -> String {
-    println!("cargo::rerun-if-changed=.pliron-src-rev");
+    // Only when the file exists: cargo treats a missing rerun-if-changed
+    // path as always changed, which reran this script and then recompiled
+    // and relinked the dylib on every `cargo build`, edit or not. A copy
+    // that gains the file later is synced first (selfhost/setup.sh), and
+    // the sources are listed below.
+    if std::path::Path::new(".pliron-src-rev").exists() {
+        println!("cargo::rerun-if-changed=.pliron-src-rev");
+    }
     if let Ok(r) = std::fs::read_to_string(".pliron-src-rev") {
         return r.trim().to_string();
     }

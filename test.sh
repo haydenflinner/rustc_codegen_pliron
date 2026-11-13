@@ -33,14 +33,21 @@ done
 want() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
 
 # TEST_NOBUILD=1: the caller (harness/gate.py) already built the backend.
-[[ -n "${TEST_NOBUILD:-}" ]] || cargo build
+# PLIRON_PROFILE=<cargo profile> (default debug) tests that profile's dylib,
+# e.g. `fast` (docs/dev-loop.md).
+PROF=${PLIRON_PROFILE:-debug}
+if [[ -z "${TEST_NOBUILD:-}" ]]; then
+  if [[ "$PROF" == debug ]]; then cargo build; else cargo build --profile "$PROF"; fi
+fi
 export RUSTC_ICE=${RUSTC_ICE:-$PWD/target/ices}
 case "$(uname -s)" in
   Darwin)              lib=librustc_codegen_pliron.dylib; exe= ;;
   MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll;     exe=.exe ;;
   *)                   lib=librustc_codegen_pliron.so;    exe= ;;
 esac
-BE="-Zcodegen-backend=$PWD/target/debug/$lib"
+BE="-Zcodegen-backend=$PWD/target/$PROF/$lib"
+# The stanza scripts under tests/ take the dylib from these.
+[[ "$PROF" == debug ]] || export BACKEND="$PWD/target/$PROF/$lib" PLIRON_BACKEND="$PWD/target/$PROF/$lib"
 # Extra rustc flags for every stanza (experiments, e.g. -Zmir-move-elimination).
 BE="$BE ${PLIRON_TEST_RUSTFLAGS:-}"
 if [[ "$(uname -s)" == Linux ]] && command -v wild >/dev/null; then
@@ -1102,7 +1109,7 @@ t_pgo() {
   if command -v node > /dev/null 2>&1 && command -v cargo > /dev/null 2>&1; then
     # Keyed on the backend: cargo doesn't track the dylib, so a reused
     # dir would keep core from an older backend.
-    local wdir=$PWD/$out/wasm-pgo-$(cksum < target/debug/$lib | cut -d' ' -f1)
+    local wdir=$PWD/$out/wasm-pgo-$(cksum < target/$PROF/$lib | cut -d' ' -f1)
     mkdir -p "$wdir" && touch "$wdir"
     # Prune only keys idle for an hour: a concurrent run may own a younger one.
     find "$PWD/$out" -mindepth 1 -maxdepth 1 -type d -name 'wasm-pgo*' -mmin +60 \
@@ -1114,7 +1121,7 @@ t_pgo() {
     case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) wroot=$(cygpath -m "$wroot") ;; esac
     cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml &&
     (cd tests/wasm &&
-      RUSTFLAGS="-Zcodegen-backend=$wroot/target/debug/$lib -Clinker=$wroot/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe" \
+      RUSTFLAGS="-Zcodegen-backend=$wroot/target/$PROF/$lib -Clinker=$wroot/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe" \
         CARGO_TARGET_DIR=$wdir PLIRON_PGO=1 \
         cargo build -q --release --target wasm32-unknown-unknown \
         -Zbuild-std=core,compiler_builtins \

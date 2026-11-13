@@ -40,7 +40,11 @@ OUT = os.path.join(ROOT, "target/gate")
 # r[impl verify.corpus.known]
 KNOWN = os.path.join(ROOT, "harness/expectations/corpus-known.txt")
 WIN = os.name == "nt"
-CLIF_CHECK = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "clif-check")
+# PLIRON_PROFILE=<cargo profile> (default debug) gates that profile's build,
+# e.g. `fast` (docs/dev-loop.md); test.sh and run.py read the same variable.
+PROFILE = os.environ.get("PLIRON_PROFILE", "debug")
+PROFILE_ARGS = [] if PROFILE == "debug" else ["--profile", PROFILE]
+CLIF_CHECK = os.path.join(ROOT, "target", PROFILE, "clif-check.exe" if WIN else "clif-check")
 # Bash for .sh legs: CreateProcess doesn't honor `#!/bin/sh`, so the
 # shell scripts need an explicit interpreter on Windows.
 BASH = shutil.which("bash") or shutil.which("sh")
@@ -170,7 +174,7 @@ def main():
         os.replace(tmp, os.path.join(OUT, "summary.json"))
 
     save()
-    build = run("build", ["cargo", "build", "-p", "rustc_codegen_pliron", "-p", "pliron-clif-check"])
+    build = run("build", ["cargo", "build", *PROFILE_ARGS, "-p", "rustc_codegen_pliron", "-p", "pliron-clif-check"])
     summary["jobs"].append(build)
     if not build["ok"]:
         summary["state"] = "failed"
@@ -185,7 +189,7 @@ def main():
     want = lambda n: (not only or n in only or n.split(":")[0] in only) and n not in skip and n.split(":")[0] not in skip
     jobs = []
     if want("unit"):
-        jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", "-p", "pliron-cfg", "-p",
+        jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", *PROFILE_ARGS, "-p", "pliron-cfg", "-p",
                                                   "pliron-clif-opt", "-p", "pliron-ir-opt", "-p",
                                                   "pliron-clif-check"])))
     # Slowest first so the pool's tail is short.

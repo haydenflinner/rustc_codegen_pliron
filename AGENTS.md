@@ -77,6 +77,11 @@ Pinned toolchain `nightly-2026-10-22` (`rust-toolchain.toml`; needs
   ~3–5 s incremental. Our crates build at O1, deps and vendored
   Cranelift at O3. Measure compile time with the **release** dylib
   (`cargo build --release`); the debug one is ~1.3x slower.
+- Inner loop after a pass edit: `harness/dev.py` (`clif`, `corpus`, `rs`,
+  `test`, `check`, `bench`, `watch ...`) builds with the `fast` profile
+  (`target/fast`, 2-4x quicker to rebuild than `dev`) and prints
+  before/after; `PLIRON_PROFILE=fast` points gate/quick/test.sh/run.py at
+  the same build. Numbers and details: [`docs/dev-loop.md`](docs/dev-loop.md).
 - One file: `rustc -O -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs`
 - cargo does not track the backend dylib or `PLIRON_*` vars: after
   changing either, use a fresh `CARGO_TARGET_DIR` or `cargo clean -p`.
@@ -312,6 +317,21 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_BUNROLL_BODY=<insts>` — `bunroll` per-body inst cap
   (default 48). ~200 exposes memcpy'd chunk loops to `loadfwd`'s
   source-copy rule; costs .text on big crates.
+- `PLIRON_PUNROLL_SEARCH=1` (opt-in) — `punroll` also group-unrolls
+  search loops (a data exit into warm code: `position`, `any`,
+  `take_while(..).count()`). Off by default without a measured trip
+  count: pulldown-cmark's scanners make a trip or two and paid the
+  guard (exact counts: pulldown -0.4%, html-rewriter -0.2% with the
+  rule). Counted loops and loops whose other exits are cold unroll
+  either way.
+- `PLIRON_ELABHOT=1` (opt-in, vendored elaborator) — restore a popped
+  loop-stack entry for blocks that dominate the latches of a call-free
+  loop; hoists out of one-trip loops (pulldown-cmark +0.5%).
+- `PLIRON_WM_KEEPCOUNT=0`, `PLIRON_EXITSINK=0`, `PLIRON_CMPCANCEL_INV=0`,
+  `PLIRON_SELKNOWN=0`, `PLIRON_RETEST=0`, `PLIRON_DEADSLOT=0` — the
+  byte-scan loop work of 2026-11-13
+  (`docs/history/2026-11-13-six-features.md`, "Fourth item"), each
+  default on.
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
   functions get 2x their callsite limit (the body dies when all sites
   inline, LLVM's last-callsite bonus generalised). Reaches

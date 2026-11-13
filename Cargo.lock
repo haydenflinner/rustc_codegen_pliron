@@ -1252,6 +1252,7 @@ dependencies = [
 name = "pliron-cfg"
 version = "0.1.0"
 dependencies = [
+ "pliron-hack",
  "rustc-hash",
  "tracing",
 ]
@@ -1333,6 +1334,33 @@ dependencies = [
  "quote",
  "rustc-hash",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "pliron-hack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.2",
+ "byteorder",
+ "cranelift-bitset",
+ "cranelift-codegen",
+ "cranelift-entity",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "libc",
+ "log",
+ "object 0.39.1",
+ "postcard",
+ "regalloc2",
+ "regex-automata",
+ "regex-syntax",
+ "serde",
+ "smallvec",
+ "target-lexicon",
+ "thiserror 2.0.21",
+ "tracing-core",
+ "typenum",
 ]
 
 [[package]]

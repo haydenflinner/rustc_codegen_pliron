@@ -27,7 +27,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(ROOT, "target/live")
 WATCH = ["pliron-clif-opt/src", "pliron-cfg/src", "pliron-clif-check/src"]
-CLIF_CHECK = os.path.join(ROOT, "target/debug/clif-check")
+# PLIRON_PROFILE=fast rebuilds 2-4x sooner after a save (docs/dev-loop.md).
+PROFILE = os.environ.get("PLIRON_PROFILE", "debug")
+CLIF_CHECK = os.path.join(ROOT, "target", PROFILE, "clif-check")
 
 status = {"state": "starting", "runs": 0, "corpora": [], "log": "", "changed": [],
           "build_s": None, "run_s": None, "finished": None}
@@ -66,7 +68,7 @@ def corpora(sel):
 def cycle(a, changed):
     write_status(state="building", changed=changed)
     t = time.time()
-    b = subprocess.run(["cargo", "build", "-q", "-p", "pliron-clif-check"], cwd=ROOT,
+    b = subprocess.run(["cargo", "build", "-q", *([] if PROFILE == "debug" else ["--profile", PROFILE]), "-p", "pliron-clif-check"], cwd=ROOT,
                        capture_output=True, text=True)
     build_s = round(time.time() - t, 1)
     if b.returncode != 0:

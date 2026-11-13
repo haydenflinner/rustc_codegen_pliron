@@ -21,7 +21,7 @@ case "$(uname -s)" in
   Darwin) lib=librustc_codegen_pliron.dylib ;;
   *)      lib=librustc_codegen_pliron.so ;;
 esac
-BE="-Zcodegen-backend=$ROOT/target/debug/$lib"
+BE="-Zcodegen-backend=$ROOT/target/${PLIRON_PROFILE:-debug}/$lib"
 HOST=$(rustc -vV | sed -n 's/host: //p')
 export RUSTC_ICE=${RUSTC_ICE:-$ROOT/target/ices}
 set_=${1:?usage: corpus.sh smoke|std|cargo DIR}
