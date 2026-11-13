@@ -10984,6 +10984,10 @@ mod clif_emit {
             if matches!(op, P::Uload8 | P::Uload16) && i64 {
                 v = self.op(O::I64ExtendI32U, &[v], WT::I64);
             }
+            // Narrow signed loads into i64 sign-extend the i32 container.
+            if matches!(op, P::Sload8 | P::Sload16) && i64 {
+                v = self.op(O::I64ExtendI32S, &[v], WT::I64);
+            }
             smallvec![v]
         }
 

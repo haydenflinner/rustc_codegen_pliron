@@ -54,3 +54,33 @@ pub extern "C" fn indirect(x: u32) -> u32 {
 pub extern "C" fn crosscall(x: u32) -> u32 {
     unsafe { helper(x).wrapping_mul(2) }
 }
+
+#[derive(Clone, Copy)]
+pub struct Gene {
+    pub down: Option<bool>,
+}
+
+static GENES: [Gene; 3] = [
+    Gene { down: Some(true) },
+    Gene { down: None },
+    Gene { down: Some(false) },
+];
+
+/// The Option's byte read widens to `sload8.i64` (discriminant + payload in
+/// one i64): the emit's i32 container must sign-extend into the i64 `band`
+/// or the module fails validation (`i64.and` fed a local.get of type i32).
+#[unsafe(no_mangle)]
+pub fn tape_hash(t: &[Gene]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for g in t {
+        for m in [g.down.map(|d| d as u64)] {
+            h = (h ^ m.unwrap_or(u64::MAX)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+    h
+}
+
+#[unsafe(no_mangle)]
+pub fn genes_hash() -> u64 {
+    tape_hash(&GENES)
+}
