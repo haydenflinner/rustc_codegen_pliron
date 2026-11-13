@@ -291,3 +291,49 @@ around a `#[cold]` call in a loop). Held-out programs: prologue
 callee-saved saves -0.1..-5.1%, retired instructions unchanged
 (0.993..1.007); `PLIRON_RA_CHECK=1` clean. See
 `docs/history/2026-11-13-six-features.md` section 5 for the accounting.
+
+## `PLIRON_RA2_REHOME` (runtime, default `2`; `0` off, `1` loop latches only): a value's register in a block that only joins
+
+`src/ion/rehome.rs` (new), called from `Env::run` (`src/ion/mod.rs`)
+after `allocate_spillslots` and before the move insertion;
+`src/lib.rs` (`rehome_mode`).
+
+A bundle that must split is cut at program points, and each piece is a
+contiguous stretch of the lowered block order. A block that several
+paths jump to comes after all of them in that order, so it falls into
+the piece that covers the code just ahead of it, usually the one that
+crosses a call and sits in a callee-saved register. When the block's
+successor is back in the first piece (a loop latch jumping to its
+header), the value is moved into the block's register on every path in
+and moved back on the way out. pulldown-cmark's `scanners::unescape`
+with one latch (`PLIRON_LOOPROT_MERGE=1`) ran `mov x19, x2; mov x22, x3;
+cmp; b.hs; mov x2, x19; mov x3, x22; b` on every trip; the explain log
+showed the header in `[6..51)` with `x2`, the latch at instruction 545
+inside `[84..714)` with `x19`.
+
+The pass takes each block with two or more predecessors together with
+its jump-only successor blocks (the split critical edges) as a region.
+For every value live through the region (its live-ins and its block
+parameters) it prices the moves on the edges into and out of the region
+with the block frequencies (`CFGInfo::hot_bonus`), once for the
+allocation the value has there and once for each register it has on the
+far side of one of those edges. If another register costs at most 15/16
+of the current one and is free over the region's blocks (the per-register
+allocation maps, which also hold clobbers and fixed uses), the value's
+live range is cut at the region's block boundaries and the middle range
+gets a bundle of its own with that register. The edge moves then come
+from the normal insertion in `moves.rs`. Left alone: values whose live
+ranges overlap (a spilled value with per-use register pieces), bundles
+with a register limit, and values with a use in the region that is not a
+plain `Reg`/`Any` use.
+
+`tests/parity/latch.rs`: the latch above becomes `cmp; b.lo` (the moves
+go to the arms that call). Exact executed instructions, off -> `2`
+(2026-11-13): regex 51.58M -> 51.38M, rust-protobuf 65.69M -> 65.41M,
+rust-html-rewriter -0.13M, rust-compression -0.06M, pulldown-cmark
+-0.04M, rust-json and blind-sig unchanged, blake3-scalar +0.02M (eight
+alignment `nop`s moved in front of a loop entered 3027 times; the moves
+are the same). Mode `1` (regions with an edge to an earlier block only)
+gives about half of it. Compile time: regex-syntax 80.62G -> 80.65G
+retired instructions. Checked with `PLIRON_RA_CHECK=1` on the eight
+held-out programs.

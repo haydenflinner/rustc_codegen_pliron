@@ -55,7 +55,9 @@ BASH = shutil.which("bash") or shutil.which("sh")
 
 
 # test.sh stanzas the gate also runs under PLIRON_SM_POISON (`poison:*`).
-POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "inlinecm", "unroll", "sroa", "licm"]
+# `o0std` is the only one at opt-level 0, where std's bodies arrive as
+# optimized MIR with storage markers and no IR pass reshapes them.
+POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "inlinecm", "unroll", "sroa", "licm", "o0std"]
 
 # rustlantis seeds that exposed real bugs: slp same-address splat
 # (538, 683, 730), loadfwd's dead-pair poisoning (810, 1276) and loop

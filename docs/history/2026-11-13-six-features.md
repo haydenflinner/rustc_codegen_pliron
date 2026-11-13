@@ -259,7 +259,7 @@ Sweep rule (default): heat carries `@seq` / `@rand` per struct (address on an ar
 
 ## 1. Scoped noalias
 
-`PLIRON_SCOPED_NOALIAS=1` (opt-in, default off). What existed: the inliner already records each
+`PLIRON_SCOPED_NOALIAS` (opt-in as written; still opt-in; see "Scoped noalias: the pulldown-cmark loss explained and fixed"). What existed: the inliner already records each
 clone as a region (`State::region_blocks`/`region_parent`), pins the clone-entry params bound to
 rustc-`noalias` callee params (`region_noalias`, `region_frozen`) and lowers them into
 `noalias`/`scoped_na`; the readonly half already worked (`region_frozen_op` -> loadfwd's
@@ -558,6 +558,150 @@ seeds 94000:94600 with the knob on, final tree: 600 pass (the first
 live version failed in that range: 18 compile errors, 34
 `env-compile-error`s and a run timeout, seed 94297). A memory-pass change wants a longer sweep than that before it
 becomes a default.
+
+### Scoped noalias: the pulldown-cmark loss explained and fixed (still opt-in)
+
+Same day, later. On the tree of that hour the knob cost pulldown-cmark
++0.67% (51,928k -> 52,280k), and all but 15k of it was there with the
+step off (`PLIRON_SCOPEDFWD=0`): the loss was the IR side, not
+`loadfwd`. Per ELF symbol (callgrind `--dump-instr`, our two builds):
+`Tree::append_text` +188k, `parse_block` +113k,
+`scalar_iterate_special_bytes` +45k, a `Rev<Iter<u8>>::try_fold` +44k;
+with the step on `item_to_event` +98k and `parse_block` -93k on top.
+Two mechanisms.
+
+**The `phisimp` hold hid the argument from the IR passes.** To let the
+fact reach lowering, `phisimp` kept every clone-entry arg bound to a
+`noalias` param as a block param, `readonly` ones included. In
+`append_text` the inlined callee is the derived `<ItemBody as
+PartialEq>::eq(&ItemBody::Text, &self[ix].item.body)`: the first
+operand is a constant, and through the held param `constload` no longer
+saw one. The discriminant test `ldrb; cmp #1` became a load from the
+constant's memory and the whole derived `eq` switch (90 -> 173
+instructions in the repro, `tests/scopedna/hold.rs`). The arg is now
+held only where `loadfwd::ScopedNa` can use it (`phisimp::scoped_hold`):
+the param is written through, and its source is not an address inside
+an alloca (rule 1 refuses stack slots), not a constant, and not the
+function's own `noalias` param at a constant offset (`scoped_seed` drops
+those). That alone brought pulldown-cmark to +0.35%.
+
+What the wider hold did elsewhere was not the fact either. On
+rust-html-rewriter, by class (`PLIRON_SCOPED_PHI_KEEP=<bits>` holds one
+class again; against the final rule): alloca fields -222k
+(`exec_without_attrs` -326k, `pop_up_to` -97k, `exec_for_start_tag`
+-86k against `memcpy` +201k, `as_lowercase_string` +104k: an alloca
+kept from SROA), constants -166k (the benchmark's two closures), the
+own `noalias` param -96k (`TagScanner`; no candidate is seeded for it).
+Holding `readonly` args with the same source rule
+(`PLIRON_SCOPED_PHI_RO=1`) gives pulldown-cmark -0.12% and takes 0.92%
+from rust-protobuf. These are leads for SROA and `constload`, not
+reasons to hold an arg: the 0.43% rust-html-rewriter had in the table
+above was this, and is gone (-0.04% now).
+
+**`scopedfwd` ran `loadfwd` where the fact had nothing to add.** The
+step ran in every function with a candidate: 145 functions in
+pulldown-cmark's crate graph, where 16 stores or calls were sheltered.
+`loadfwd` with load PRE on the function as lowered, before the first
+jump threading, is not free: the four `Rev<Iter<u8>>::try_fold`
+scanners (`scan_rev_while`) went from 38 to 48 instructions in that
+step, jump threading then left 29 where it leaves 20, and the final
+code was 31 instructions against 22, with an unrotated loop behind 15
+alignment `nop`s executed on every call (186k -> 318k for one of them).
+The step now asks first (`loadfwd::scoped_probe`: the availability
+fixpoint without PRE, nothing rewritten) whether a store or call
+evicts a loc that rule 4 puts back, and runs only then
+(`PLIRON_SCOPEDFWD_PROBE=0`: as before).
+
+Result, knob off against on, one backend build (measured on a build
+with the knob in `DEFAULT_ON`, `=0` for the off side):
+
+| program | off | on | |
+|---|---|---|---|
+| rust-protobuf | 65.408M | 64.468M | -939,611 (-1.44%) |
+| rust-json | 51.575M | 51.185M | -389,873 (-0.76%) |
+| pulldown-cmark | 51.923M | 51.866M | -56,667 (-0.11%) |
+| rust-html-rewriter | 102.529M | 102.492M | -37,354 (-0.04%) |
+| regex | 50.657M | 50.655M | -2,043 |
+| blake3-scalar | 49.040M | 49.040M | -5 |
+| rust-compression | 44.236M | 44.236M | +16 |
+| blind-sig | 34.695M | 34.696M | +608 (noise, below) |
+
+blind-sig draws random numbers: one binary gives 34.68M to 34.71M from
+run to run, and the function that carries the difference between two
+builds (`montgomery`) has identical code in both. Its static code
+differs in three functions by 10 instructions.
+
+`PLIRON_SCOPED_NOALIAS` stays opt-in: the 2000-seed fuzz sweep a
+memory-pass default needs died at about seed 457 of 2000 when the disk
+filled (no verdicts were written). See the handoff section at the end.
+
+The corpus header now names the candidates: `scopedna=` lists the
+clone-entry block params that are scoped only, not just entry params
+(`diffcheck::facts_header`). A std corpus recorded with the knob on has
+candidates in 1216 `loadfwd` runs, 624 with one that qualifies, 732
+sheltered stores and calls; `clif-check report --check` under
+`PLIRON_VERIFY=full`: 4241 ok, 684 inconclusive, as with the knob off.
+A corpus recorded before this has none (re-record: `gate.py --record`).
+
+Checked: `probe_counts_only_what_the_fact_shelters`
+(`loadfwd_scoped_noalias.rs`), stanza `scopedna` (now also: `append_text`
+no larger with the knob on; 87 against 170 instructions with
+`PLIRON_SCOPED_PHI_ALL=1`), all eight
+held-out programs exit 0 with the expected stdout (linux-musl, the
+binaries of the table; the expected file is empty for seven of them);
+the gate with the knob default-on: 106 of 107 jobs, `simdshift` fails on
+another session's uncommitted NEON narrowing (`PLIRON_VTRUNC_UZP=0`
+passes), not on this. Not done: the fuzz sweep.
+
+Open: rule 2 as before; the leads above (SROA on an alloca whose field
+address is passed to an inlined callee, rust-html-rewriter -0.2%); the
+readonly hold's rust-protobuf loss is not traced.
+
+### Opt-level 0: a lifetime marker anchored on an instruction that moves
+
+`{1,2,3}.symmetric_difference({2,3,4})` on std's `HashSet` gave `{4}`
+at opt-level 0 (two hashbrown doc-tests under `crates.py --deps
+pliron`). The function is instantiated in the user's crate from std's
+optimized MIR: `difference` and `iter` are inlined into it and the
+storage markers are kept, which the local crate's own MIR does not have
+at opt-level 0 (rustc's `RemoveStorageMarkers`).
+
+Lowering recorded a marker's position as "after the last instruction
+emitted". For the markers at the top of the entry block that was the
+last alloca's `stack_addr`, which the egraph takes out of the layout
+and puts back at its first use, here the `chain` call 28 instructions
+down. The start marker of the first `Difference` moved with it, below
+the six stores that fill the slot. `slotmerge::use_flow` treats an
+exactly placed start marker as a kill, so the slot was dead from its
+last store to the call (`segs=[(8,13),(29,29)]` for a slot written at
+8..13 and read by the call at 29), and the second `iter()` result was
+given the same bytes. `stale_markers` did not object: a call after a
+start marker counts as a write there.
+
+Fix (`lower.rs`, `PLIRON_LT_PINANCHOR=0` off): the anchor steps back
+over instructions the egraph may move (side-effect-free non-loads and
+read-only loads, `marker_can_step_over`). They touch no memory, so the
+marker keeps its place among the slot's accesses. In a 400-function
+std-collections program at opt-level 0 four functions had such a hole;
+none at -O in the two programs compared.
+
+Age: reachable since 6dd307d (2026-11-13 06:58, `SLOTPROM_SYNCCOST`
+default on; with `=0` slotprom still promotes these slots and nothing
+is left to merge), found by `git bisect` over 645 commits in a scratch
+worktree. The anchor rule itself dates from the start-marker kills
+(2026-10-26).
+
+Why nothing caught it: it was eight hours old, and it needs optimized
+MIR from another crate lowered by the opt-level-0 pipeline with a
+by-value aggregate handed to a callee that does not capture it. The
+gate's opt-level-0 legs compile local code (no markers) and rustlantis
+programs; every `poison:*` leg ran at -O. New: stanza `o0std`
+(`tests/o0std/main.rs`: std's set, map, deque, heap and iterator
+adaptors at opt-level 0 and 1, output against stock rustc's; fails
+without the fix with 10 wrong lines) and `poison:o0std` in the gate
+(`PLIRON_SM_POISON` crashes the unfixed build whether or not a merge
+reuses the bytes); `quick.py` runs `o0std` with its core set.
+`crates.py --deps pliron` doc-tests stay out of the gate (minutes).
 
 ## Parity by exact counts (`bench/heldout/irdiff.py`)
 
@@ -1029,3 +1173,315 @@ build and exit 0 under callgrind with the final defaults. Measured
 again on the working tree at the end, which by then also held another
 session's edits: pulldown-cmark 52.53M and blind-sig 34.65M, the other
 six as in the table.
+
+## Handoff: O0 HashSet miscompile and scoped noalias (2026-11-13 afternoon)
+
+Written for someone with no memory of the session. Details and numbers
+are in the two subsections "Scoped noalias: the pulldown-cmark loss
+explained and fixed" and "Opt-level 0: a lifetime marker anchored on an
+instruction that moves" above.
+
+### The opt-level-0 miscompile: fixed, test in the gate
+
+- Reduced repro: `tests/o0std/repro.rs` (6 lines). Commands:
+  `rustc +nightly-2026-10-22 --edition 2021 -Zcodegen-backend=$PWD/target/fast/librustc_codegen_pliron.dylib tests/o0std/repro.rs -o /tmp/r && /tmp/r`
+  prints `Some(1) Some(4) None` (order may vary; two `Some`). The bug
+  prints `Some(4) None None`; `PLIRON_LT_PINANCHOR=0` on the compile
+  brings it back. Edition 2021 is needed (array `into_iter`).
+- Established: the wrong code is in the user crate, in its copy of
+  `HashSet::symmetric_difference` built from std's optimized MIR; the
+  pass is `slotmerge` (`PLIRON_SLOTMERGE=0` hides it), fed a start
+  marker whose anchor (`stack_addr`) the egraph moved. See
+  `PLIRON_SM_INFO=all PLIRON_SM_INFO_FN=symmetric_difference
+  PLIRON_SM_INFO_SLOT=9 PLIRON_PAR=0`: before the fix `ss9 start pos=28`
+  and `segs=[(8,13),(29,29)]`.
+- Fix: `pliron-clif-lower/src/lower.rs`, `marker_can_step_over` and the
+  anchor loop at the lifetime-marker lowering.
+- Age: `git bisect` (645 commits, scratch worktree, each built into its
+  own target dir) names 6dd307d, 2026-11-13 06:58; of its default flips
+  it is `PLIRON_SLOTPROM_SYNCCOST` (`=0` hides the bug). ca07e7c
+  (10-26) and everything up to 6dd307d's parent print the right answer.
+- Ruled out: prebuilt std's own code; FASTCC, PANICSTUB, REMAT_CARRIED,
+  LATEGVN, CMPCANCEL; -O (opt-levels 1, 2, 3, s are right).
+- Gate: stanza `o0std` and `poison:o0std` (see above). Both fail
+  without the fix (checked with `PLIRON_LT_PINANCHOR=0`).
+- Not done, optional hardening: `slotmerge::stale_markers` excuses a
+  call that reads a slot after a start marker ("presumably writes").
+  A write of the slot that reaches a start marker with no end marker
+  between, followed by such a call, contradicts the marker and could
+  drop the slot's markers. It would have caught this bug class on its
+  own. Check frame sizes (stanza `slotmerge`, `harness/frames.py`)
+  if you add it.
+
+### Scoped noalias: ready except for the fuzz sweep; left opt-in
+
+- State of the tree: `PLIRON_SCOPED_NOALIAS` is opt-in. The two fixes
+  (`phisimp::scoped_hold`, `loadfwd::scoped_probe` in `s_scopedfwd`)
+  and the corpus header change are in and only act under the knob.
+- Measured with the knob on (table above): no program worse beyond
+  noise, rust-protobuf -1.44%, rust-json -0.76%.
+- The one missing precondition for the default: 2000 fuzz seeds with
+  the knob on. The run died on a full disk near seed 457 with no
+  verdicts. Redo, with at least 10 GB free:
+  `mkdir -p target/snfuzz && cp target/fast/librustc_codegen_pliron.dylib target/snfuzz/ &&
+  PLIRON_PROFILE=snfuzz PLIRON_FUZZ_JOBS=4 PLIRON_SCOPED_NOALIAS=1 harness/run.py --suite fuzz --no-build --fuzz-seeds 120000:122000`
+  (`PLIRON_PROFILE` only names the directory under `target/`, so the
+  copy pins the backend while others rebuild `target/fast`). It took
+  about 9 minutes per 450 seeds on the loaded machine.
+- Then flip: add `"PLIRON_SCOPED_NOALIAS"` to `DEFAULT_ON` in
+  `pliron-cfg/src/lib.rs`, change the AGENTS.md entry to "default on,
+  `=0` off", rerun `PLIRON_PROFILE=fast harness/gate.py --jobs 4`. The
+  gate passed that way this afternoon except `simdshift`, which fails
+  on another session's uncommitted `PLIRON_VTRUNC_UZP` lowering.
+- `target/corpus/std` was re-recorded with the knob on (4925
+  functions), so the gate's replay has scoped candidates when the knob
+  is on. `target/corpus/clcg` and `smoke` were not re-recorded.
+- Commands used: `bench/heldout/irdiff.py PROG --backend DYLIB [--env
+  PLIRON_SCOPED_NOALIAS=1] --tag T`, then per ELF symbol
+  `symc.py PROG ir-pliron-A ir-pliron-B` and per instruction
+  `asmc.py PROG ir-pliron-T FN` (scratch tools from the earlier
+  session, not in the repo; they read callgrind `--dump-instr` output
+  against `llvm-nm`/`llvm-objdump`).
+
+### Traps
+
+- blind-sig is not deterministic (random numbers): one binary gives
+  34.68M to 34.71M. Do not read a 25k difference there as a result.
+- Copy the backend dylib before a long measurement; `target/fast` is
+  rebuilt by other sessions with their uncommitted edits in it.
+- `test.sh --only=NAME` with an unknown name passes vacuously.
+- `irdiff.py` lets cargo use every core; set `CARGO_BUILD_JOBS=4`.
+- The disk went from 25 GB to 0.5 GB free in five minutes while swap
+  was full (18 GB). Check `df -h` before a fuzz sweep; `run.py` loses
+  every verdict when one write fails.
+- Callgrind in docker fails now and then under load: rerun.
+- At opt-level 0 the local crate has no storage markers
+  (`RemoveStorageMarkers`); only MIR from other crates does. A
+  self-contained opt-level-0 test needs
+  `-Zmir-enable-passes=-RemoveStorageMarkers` to have any.
+
+## Handoff: parity (2026-11-13 afternoon)
+
+Written for whoever continues with no memory of the session. Counts are
+callgrind executed instructions (`bench/heldout/irdiff.py`), in
+millions. Run-to-run noise: blind-sig +-0.03M, regex +-0.0003M, the
+rest under 10 instructions.
+
+### Table
+
+"start" is the tree at the session's start (ddb1668 plus the FASTCC
+work). "now" is the working tree's defaults **as last measured**: the
+run named `t13 defaults` = the `per=8` run below; the tree changed
+after it only by a refactor of the SROA rule into
+`frag_copy_stays_whole` (same condition) and an opt-in knob
+(`PLIRON_PADJUMP`, default off). **Re-measure before quoting.**
+"lean" is the same tree with `PLIRON_INLINE_LEAN=32` (opt-in).
+
+| program | LLVM | start | now | now + `INLINE_LEAN=32` |
+|---|---|---|---|---|
+| rust-html-rewriter | 85.83 | 104.54 | 102.30 | 101.25 |
+| pulldown-cmark | 45.33 | 52.53 | 51.66 (51.60 in a second build) | 51.87 |
+| regex | 45.97 | 51.58 | 50.66 | 50.42 |
+| rust-json | 45.55 | 51.85 | 51.58 | 51.11 |
+| rust-protobuf | 60.76 | 65.69 | 65.41 | 63.99 |
+| rust-compression | 39.72 | 44.28 | 44.24 | 44.16 |
+| blind-sig | 31.51 | 34.67 | 34.67-34.70 | 34.67 |
+| blake3-scalar | 46.63 | 49.08 | 49.04 | 49.04 |
+
+### How to measure (copy these)
+
+```sh
+# backend: fast profile, snapshot the dylib so later edits do not move it
+cargo build --profile fast --jobs 4 -p rustc_codegen_pliron -p pliron-clif-check
+cp target/fast/librustc_codegen_pliron.dylib /tmp/be.dylib      # any scratch path
+# one program, exact counts, own build dir (delete it afterwards: 0.5 GB)
+bench/heldout/irdiff.py regex --backend /tmp/be.dylib --tag x1 --top 40 [--env PLIRON_INLINE_LEAN=32]
+rm -rf target/heldout/ir-pliron-x1
+```
+
+A loop over the eight names with three in parallel takes 2-3 minutes
+when the machine is idle and 15+ when its load is over 100. The first
+line of the output is the total. To see *which ELF symbol* moved
+between two builds, keep both build dirs and compare callgrind
+`--dump-instr=yes` runs per symbol; the session's scripts did this
+(`symc.py A B`, `asmc.py PROG DIR FN` for per-instruction counts with
+disassembly) and are small enough to rewrite: run valgrind in the
+`pliron-callgrind` image with `--dump-instr=yes`, sum the `0x...` cost
+lines per `llvm-nm -n` symbol range. The irdiff function table is by
+*inlined* function and shifts with inlining; use the symbol comparison
+to decide what changed.
+
+Traps:
+- `cargo` does not track the backend dylib or `PLIRON_*`: irdiff
+  deletes our side's dir per run, but a hand-rolled `cargo build` into
+  an existing dir silently reuses old objects.
+- A function whose name filter needs `bisect_name` (`PLIRON_SROA_DEBUG=<fn>`)
+  prints nothing unless `PLIRON_OPT_BISECT=1000000000` is also set.
+- `PLIRON_SROA_WHYFN=<fn> PLIRON_STATS=1` prints why allocas stayed
+  whole; `llvm.br #0` means the address is a branch operand.
+- Totals move by alignment `nop`s: a loop head padded to 64 bytes
+  executes up to 15 `nop`s per entry on the fallthrough path. Before
+  explaining a +0.1M by a transform, diff the per-instruction counts
+  and look for `nop` runs (blake3 +0.02M and 99k of pulldown's
+  `parse_block` cost under `INLINE_LEAN` were only that).
+- A compile error in a repro leaves the previous object file in place;
+  delete the `.o` before disassembling.
+- Commit ae04d1b (the FASTCC commit) swept in this session's files as
+  they were at 13:29: `vendor/regalloc2/src/ion/rehome.rs` (then opt-in),
+  the `memcmpk` changes with tests, `inline_cost::lean_cost` and the
+  first `INLINE_LEAN` code, `tests/parity/{bom,latch}.rs`.
+
+### What changed, default on unless said (knob, effect)
+
+1. `PLIRON_RA2_REHOME` (default 2, `0` off; `vendor/regalloc2/src/ion/rehome.rs`,
+   described in `vendor/regalloc2/PLIRON_PATCH.md`): after allocation a
+   value live through a join block (plus its jump-only edge blocks)
+   takes the register it has on the cheaper side of the region's edges.
+   regex -0.20M, rust-protobuf -0.28M, html -0.13M, compression -0.06M,
+   pulldown -0.04M, blake3 +0.02M (alignment nops). Repro
+   `tests/parity/latch.rs` with `PLIRON_LOOPROT_MERGE=1`: the latch goes
+   from `mov; mov; cmp; b.hs; mov; mov; b` to `cmp; b.lo`. Checked with
+   `PLIRON_RA_CHECK=1` on all eight. Compile time +0.03%.
+2. `memcmpk` (`PLIRON_MEMCMPK_EQ=0`, `PLIRON_MEMCMPK_CONST=0` off):
+   power-of-two sizes under zero tests are one compare, a constant side
+   is read at compile time (`const_tables` now holds objects from 2
+   bytes), compare chains fuse to `cmp; ccmp`. `tests/parity/bom.rs` 51
+   -> 28 instructions (LLVM 24). html -0.48M, pulldown -0.15M, json
+   -0.06M. Unit tests in `pliron-clif-opt/tests/memcmpk.rs`.
+3. NEON pairwise ops and lane narrowing inline (`PLIRON_NEON_PAIRWISE=0`,
+   `PLIRON_VTRUNC_UZP=0` off; `pliron-clif-lower/src/lower.rs`
+   `neon_pairwise` and the `pliron.vtrunc` arm): `vpmaxq_u8` was a call
+   to a one-instruction asm stub that clobbered every caller-saved
+   register inside memchr's loop. `tests/parity/umaxp.rs`, test.sh
+   stanza `neonpair` (`tests/neonpair/main.rs`, self-checking). html
+   -0.78M, pulldown -0.41M, json -0.31M.
+4. `PLIRON_XCGU_GLUEDEPTH` (`=0` off; `src/xcgu.rs`): drop glue does not
+   spend cross-CGU descent depth. This, not the 50-statement cap, was
+   what kept `Map::fold` out of `as_lowercase_string`'s CGU: the copy
+   closure needs five levels of closure drop glue under `Iter::fold`
+   (found with `PLIRON_STATS_XCGU=to_ascii_lowercase`, lines `xcgu
+   reject`). html -0.24M, nothing else moves. `PLIRON_XCGU_DEPTH=16`
+   gets html -0.51M but pulldown +0.33M and protobuf +0.26M: not taken.
+5. `selxor` sign form (`PLIRON_SELXOR_SIGN=0` off): zigzag *encode*,
+   `select (n < 0), !y, y` -> `y ^ (n >> 31)`. regex -0.44M
+   (`cached_state`). `tests/parity/statekey.rs` (`zigzag`), unit test in
+   `selxor.rs`.
+6. `phisimp` (`PLIRON_PHISIMP_DEADPRED=0` off): in code the entry cannot
+   reach, a block with one incoming edge and no path back takes its
+   params' values. No effect alone; needed by `INLINE_LEAN` (below).
+   Test `pliron-ir-opt/tests/phisimp.rs` (fails with the knob off).
+7. `PLIRON_SROA_FRAGCOPY=<k>` (default 8, `0` off; `sroa.rs`
+   `frag_copy_stays_whole`): a whole-copied aggregate cut into more
+   pieces than words, two of them off word boundaries, with at most `k`
+   direct accesses a piece, stays whole. regex -0.28M, html -0.61M,
+   pulldown -0.27M, blake3 -0.06M; rust-json +0.10M (`parse_str` and
+   `skip_to_escape` one instruction more per call, 38,850 calls each,
+   memcpy +17k: not looked at further), compression +0.02M
+   (`StoreAndFindMatchesH10` +75k against `HqZopfli` -72k). With no
+   access bound blake3 goes 49.1M -> 73.4M: keep the bound. k = 2, 4,
+   8, 16 were measured; 8 and 16 are equal.
+
+Opt-in, with the blocker:
+
+8. `PLIRON_INLINE_LEAN=<k>` (default 0): a callee of at most `k` live
+   ops and one call (`inline_cost::lean_cost`: constant branches folded,
+   slot loads/stores and dead pure ops free) passes the inliner's
+   score; `State::lean_discount` keeps the caller's apparent size, call
+   count and warm-call count as if the call were still there (without
+   it rust-json +0.99M: `has_next_key` grew past its callers' limit).
+   At 32: protobuf -1.42M, html -1.05M, json -0.47M, regex -0.24M,
+   compression -0.08M, **pulldown +0.21M**. That is `parse_block` +303k
+   against -113k of glue no longer called; of it 99k is one 15-`nop`
+   alignment pad on a 6636-times path, the rest (+80k register moves,
+   +41k stack loads by class counting) is not explained. Next step:
+   measure `PLIRON_PADJUMP=4` (item 9) with and without `INLINE_LEAN=32`
+   on pulldown; if pulldown is then no worse than without `LEAN`, add
+   `("PLIRON_INLINE_LEAN", "32")` to `DEFAULT_VALUES` in
+   `pliron-cfg/src/lib.rs` (the inliner reads it with `env_get`; check
+   that `env_get` consults `DEFAULT_VALUES`, else change the
+   `unwrap_or(0)` in `inline.rs`), then gate + fuzz. 24, 32 and 48
+   differ only on html (101.29 / 101.25 / 101.20).
+   Repro `tests/parity/dropv.rs`: `PLIRON_TRACE=pliron::inline=debug`
+   prints `lean=<n>` per rejected site; remarks carry `lean=` too.
+9. `PLIRON_PADJUMP=<n>` (default 0 = off, **never measured, never
+   run**; `vendor/cranelift-codegen/src/machinst/vcode.rs`, just above
+   the `gen_nop` pad loop in `emit`): a pad of `n` or more instructions
+   starts with a jump to the padded block. pulldown executes 510k
+   alignment nops (LLVM's build 3.6k). Next step: build, compile
+   `tests/parity/*.rs` with `PLIRON_PADJUMP=4` and check a padded loop
+   head disassembles as `b <head>; nop...`, run the gate with the knob
+   exported, then irdiff all eight with `--env PLIRON_PADJUMP=4` (and
+   `=2`). If it holds, default 4.
+10. `PLIRON_LOOPROT_MERGE=1` (still opt-in). With `REHOME` the
+    `unescape` rotation is gone (-51k there), but on vs off is still
+    html -0.45M, json -0.17M, protobuf -0.14M against pulldown +0.69M,
+    regex +0.39M, blind-sig +0.29M. Two blockers found:
+    (a) derived header params are recomputed in the merged latch:
+    `handle_inline_pass1` runs a new 12-instruction block per trip with
+    two `mul #48` and a stack-slot rotation (`ldp/stp`) where the
+    unmerged loop passed already-computed values on each edge;
+    (b) blind-sig `montgomery`: a loop-carried value is split inside the
+    body (`mov x10, x28` twice, `mov x28, x10` on the back edge, which
+    also turns `b.lo head` into `b.hs exit; mov; b head`), +3
+    instructions per outer trip. `REHOME` cannot fix (b): the register
+    is busy inside the latch block. Next step for (a): in
+    `looprot::merge_latches`, give the latch a param for a header param
+    whose incoming values differ only by being derived from another
+    param, instead of letting `webmerge`/`sameargs` re-derive it; find
+    the pass with `PLIRON_CLIF=handle_inline_pass1` on pulldown and the
+    first step whose dump shows the `imul` in the latch.
+    Important side finding: the reported "raising `PLIRON_XCGU_SIZE`
+    costs rust-json +8.9M" is this same missing rotation. At 100,
+    `format_escaped_str_contents` becomes a copy, `serialize_str`'s
+    byte loop keeps four back edges, is not rotated (11 instructions a
+    byte against 7, table address rematerialized in the loop);
+    `XCGU_SIZE=100` + `LOOPROT_MERGE=1` is 53.66M, not 60.74M.
+    rust-protobuf's +2.2M at 100 is `grow_amortized` copied into
+    `do_reserve_and_handle`'s CGU without `finish_grow` (over the cap),
+    so the inlined copy calls what the home body had inlined (94
+    instructions a grow against 58). A size raise must not admit a copy
+    whose callee is left behind (`xcgu::degraded` computes this).
+
+### Not started
+
+- regex `next_state` (8.05M against 6.64M) and `cached_state` (12.19M
+  against 11.11M). In `cached_state` the push arm's back edge re-runs
+  two loop-invariant instructions and two alignment nops (`add x2,
+  x28, x22, lsl #3; mov x1, #0x100000000; nop; nop`, 217k times): the
+  invariants sit in the inner loop's preheader, which is inside the
+  outer loop. `tests/parity/statekey.rs` (`state_key`, `cached_key`)
+  reproduces the function; it also shows a double load (`ldr x1,
+  [x24], #8` then `sub x2, x24, #8; ldr w26, [x2]`) for `ip as u32`.
+- html-rewriter symbols with the largest gap to LLVM after this work:
+  `TagScanner::finish_tag_name` (+1.6M), `try_allocate_in` (LLVM
+  inlines it; ours is "external (no body in this CGU)" at 216 sites:
+  check `PLIRON_STATS_XCGU=try_allocate_in`), `data_state` (LLVM tail
+  calls the next state and uses `shrn`/`umaxp`; ours `uzp1` and
+  `uzp1; uzp2; umax`: an ISLE rule `umax(uzp1 a b, uzp2 a b) -> umaxp`
+  would finish it), `as_lowercase_string` (scalar loop 10 instructions
+  a byte against 9: `add` of the counter ahead of its last use forces
+  `mov x15, x4`).
+- `closing` leftovers and the pulldown line list: untouched.
+
+### Late change: `PLIRON_VTRUNC_UZP` is opt-in
+
+The gate on the final tree failed one stanza, `simdshift` ("movemask not
+vectorized"), with the `uzp1` narrowing on; `PLIRON_VTRUNC_UZP=0`
+passed. It is now opt-in (`=1`), so item 3 above is the pairwise ops
+only and the "now" column overstates html, pulldown and json by the
+narrowing's share (not measured separately; `memchr`'s mask is `ushr;
+movi; and; sqxtun` again). Next step: read `t_simdshift` in `test.sh`,
+find the pass that recognizes the movemask (it matches `band` +
+`unarrow`), teach it the `shuffle` form or do the `uzp1` rewrite after
+it, then flip the knob and re-measure.
+
+### Validation state
+
+On the final tree: `PLIRON_PROFILE=fast harness/gate.py --jobs 4`
+passed (107 jobs, includes the unit tests, corpus replays and the fuzz
+regression seeds). The eight programs were last built and run under
+callgrind one step before the final tree (before `VTRUNC_UZP` went
+opt-in and the `frag_copy_stays_whole` refactor). Not run at any
+point in this session: fresh fuzz seeds (700 were required), `harness/crates.py`, wasm, x86-64.
+`PLIRON_RA_CHECK=1` builds of all eight ran for `REHOME` only, before
+the later changes.

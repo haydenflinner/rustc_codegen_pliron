@@ -73,3 +73,45 @@ fn constant_actuals_shrink_the_callee() {
     // `c` true and `x` = 3: the arm folds to a constant.
     assert_eq!(spec_cost(ctx, &st, f, &[k3, k1]), SpecCost { n: 1, ncalls: 0 });
 }
+
+// `lean_cost` (`PLIRON_INLINE_LEAN`): the callee as the code generator
+// will see it. On top of `spec_cost`'s folding, loads and stores of a
+// local slot and pure ops nothing live reads cost nothing.
+const LEAN_SRC: &str = r#"
+builtin.module @m {
+^block_0_0():
+  llvm.func @g: llvm.func <builtin.integer i32(builtin.integer i32) variadic = false> [] {
+  ^entry_block_1_0(x: builtin.integer i32):
+    one = llvm.constant <builtin.integer <1: i32>> : builtin.integer i32;
+    s = llvm.alloca [builtin.integer i32 x one]  : llvm.ptr (0);
+    llvm.store *s <- x ;
+    y = llvm.load s  : builtin.integer i32;
+    d0 = llvm.sub y, x <{nsw=false,nuw=false}>: builtin.integer i32;
+    d1 = llvm.icmp d0 <EQ> x : builtin.integer i1;
+    a = llvm.add y, x <{nsw=false,nuw=false}>: builtin.integer i32;
+    llvm.return a
+  }
+}
+"#;
+
+#[test]
+fn lean_cost_leaves_out_slot_traffic_and_dead_ops() {
+    use pliron_ir_opt::inline_cost::lean_cost;
+    let ctx = &mut Context::new();
+    let m = parse_from_str(spaced(Operation::top_level_parser()), ctx, LEAN_SRC).expect("parse");
+    let m = Operation::get_op::<ModuleOp>(m, ctx).unwrap().get_operation();
+    let f = funcs(ctx, m)[0];
+    let fops = pliron_ir_opt::inline::ops(ctx, pliron_ir_opt::inline::blocks(ctx, f)[0]);
+    let slot = fops[1].deref(ctx).get_result(ctx, 0);
+    let x = pliron_ir_opt::inline::blocks(ctx, f)[0].deref(ctx).arguments(ctx).next().unwrap();
+    let mut st = State::default();
+    st.consts.insert(fops[0].deref(ctx).get_result(ctx, 0), ConstVal::Bits(1));
+    let pure = pliron_ir_opt::cleanup::Pure::new();
+    // The raw walk: store, load, sub, icmp, add, return.
+    assert_eq!(spec_cost(ctx, &st, f, &[x]), SpecCost { n: 6, ncalls: 0 });
+    // The slot is not known to be one: only the dead `sub`/`icmp` pair goes.
+    assert_eq!(lean_cost(ctx, &st, f, &pure), SpecCost { n: 4, ncalls: 0 });
+    // A local slot: its store and load go too; `add` and `return` are left.
+    st.allocas.insert(slot, (4, 4));
+    assert_eq!(lean_cost(ctx, &st, f, &pure), SpecCost { n: 2, ncalls: 0 });
+}

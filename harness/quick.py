@@ -37,10 +37,10 @@ OUT = os.path.join(ROOT, "target/quick")
 WIN = os.name == "nt"
 
 # Always-on cheap smoke stanzas when a path matches nothing more specific.
-CORE = ["nostd", "std", "mirshapes", "unroll", "licm", "sroa"]
+CORE = ["nostd", "std", "o0std", "mirshapes", "unroll", "licm", "sroa"]
 # path stem -> extra stanzas / unit-test prefixes beyond the name-derived ones.
 ALIAS = {
-    "slotmerge": ["slotmerge", "stackmove", "resumehoist", "nocapfields", "spills", "std"],
+    "slotmerge": ["slotmerge", "stackmove", "resumehoist", "nocapfields", "spills", "std", "o0std"],
     "slotprom": ["slotpromlt", "spills"],
     "loadfwd": ["loadpre", "std"],
     "dse": ["dseunwind", "std"],

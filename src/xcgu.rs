@@ -763,12 +763,32 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     let mut candidates = Vec::new();
     let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
     let mut needed: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+    // `PLIRON_XCGU_GLUEDEPTH` (default on, `=0` off): drop glue does not
+    // spend descent depth. Glue calls glue along the type's structure,
+    // one mono item per level, and a closure that captures a closure that
+    // captures a guard is a chain of them: `Iter::fold`'s copy needs
+    // `drop_glue::<{map_fold closure}>` -> `<{for_each closure}>` ->
+    // `<{extend_trusted closure}>` -> `<SetLenOnDrop>` ->
+    // `SetLenOnDrop::drop`, five levels under the three calls that lead
+    // to it, so the copy closure of `[u8]::to_ascii_lowercase`'s
+    // `extend_trusted` was cut at the depth limit and `Map::fold` stayed
+    // a call in every CGU but its own (lol_html's `as_lowercase_string`).
+    // A raised limit admits the chain too, but with it every other deep
+    // call chain (`PLIRON_XCGU_DEPTH=16`: pulldown-cmark +0.33M,
+    // rust-protobuf +0.26M executed instructions).
+    let glue_free = !crate::env_is("PLIRON_XCGU_GLUEDEPTH", "0");
+    let is_glue = |i: Instance<'tcx>| {
+        matches!(i.def, InstanceKind::Shim(rustc_middle::ty::ShimKind::DropGlue(..)))
+    };
     for _ in 0..=depth {
         if frontier.is_empty() {
             break;
         }
         let mut next = Vec::new();
-        for c in frontier {
+        let mut work = frontier;
+        let mut wi = 0;
+        while let Some(&c) = work.get(wi) {
+            wi += 1;
             let Some(us) = used(tcx, c) else {
                 continue;
             };
@@ -803,7 +823,13 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                             && inlined.contains(&u.node)
                             && copyable(tcx, c2, usize::MAX))
                     {
-                        next.push(c2);
+                        // Glue under glue (or under anything) and what
+                        // glue calls stay in this round.
+                        if glue_free && (is_glue(c2) || is_glue(c)) {
+                            work.push(c2);
+                        } else {
+                            next.push(c2);
+                        }
                     }
                 }
             }

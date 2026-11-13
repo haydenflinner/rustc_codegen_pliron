@@ -227,3 +227,67 @@ fn escaped_and_read_back_is_ordinary_forwarding() {
     assert_eq!(run(ESCAPED_FORWARDED, false), 1);
     assert_eq!(run(ESCAPED_FORWARDED, true), 1);
 }
+
+/// `loadfwd::scoped_probe` on `src`: (locs the fact put back, loads left).
+fn probe(src: &str) -> (u32, usize) {
+    unsafe { std::env::set_var("PLIRON_SCOPED_NOALIAS", "1") };
+    let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
+    let mut ctx = Context::new();
+    let outer = BasicBlock::new(&mut ctx, None, vec![]);
+    let r = BasicBlock::new(&mut ctx, None, vec![]);
+    let mut rpar = pliron::cols::ColMap::default();
+    rpar.insert(r, outer);
+    let breg: FxHashMap<Block, Region> = f
+        .layout
+        .blocks()
+        .enumerate()
+        .map(|(k, b)| (b, if k == 1 { r } else { outer }))
+        .collect();
+    let na: FxHashSet<Value> = FxHashSet::default();
+    let sna: FxHashSet<Value> = [Value::from_u32(2)].into_iter().collect();
+    let _g = pliron_clif_opt::loadfwd::scoped_enter(pliron_clif_opt::loadfwd::scoped_seed(&f, &na, &sna, &breg));
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&f);
+    let pf = pliron_clif_opt::proots::facts_cfg(&f, &cfg);
+    let ps = pliron_clif_opt::proots::alias_of(&pf);
+    let hits = pliron_clif_opt::loadfwd::scoped_probe(|| {
+        pliron_clif_opt::loadfwd::run(
+            &mut f, &cfg, &pf, &ps,
+            &na, &sna, &FxHashSet::default(),
+            &FxHashMap::default(), &breg, &rpar,
+            &FxHashMap::default(), &FxHashMap::default(), &FxHashMap::default(),
+        )
+    });
+    (hits, loads(&f))
+}
+
+// A candidate whose clone holds no store or call a loc has to survive:
+// the fact adds nothing, and the `scopedfwd` step must leave the function
+// to the regular `loadfwd` (the early run made pulldown-cmark's
+// `Rev<Iter<u8>>::try_fold` scanners 40% longer).
+const NOTHING_TO_SHELTER: &str = "function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    jump block1(v0)
+
+block1(v2: i64):
+    v3 = load.i64 notrap v2+8
+    v4 = load.i64 notrap v2+8
+    jump block2
+
+block2:
+    store.i64 notrap v4, v1
+    v5 = load.i64 notrap v2+8
+    v6 = iadd v3, v5
+    return v6
+}";
+
+#[test]
+fn probe_counts_only_what_the_fact_shelters() {
+    // The probe rewrites nothing: all three loads are still there.
+    assert_eq!(probe(IN_REGION), (1, 3));
+    assert_eq!(probe(NOTHING_TO_SHELTER), (0, 3));
+    // The store through the caller's name of the same object is not
+    // sheltered (rule 5).
+    assert_eq!(probe(SAME_OBJECT).0, 0);
+    // After a probe the pass still runs in full.
+    assert_eq!(run(IN_REGION, true), 2);
+}

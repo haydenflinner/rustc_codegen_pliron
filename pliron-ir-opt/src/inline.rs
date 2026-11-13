@@ -263,7 +263,7 @@ fn callee_info(
         };
         return None;
     }
-    let (mut n, mut ncalls, mut nwarm, mut nwarm_ops, mut eh) = (0, 0, 0, 0, false);
+    let (mut n, mut ncalls, mut nwarm, mut nwarm_ops, mut eh) = (0usize, 0usize, 0usize, 0usize, false);
     let mut dvirt_tgt = Vec::new();
     let mut cond_roots = Vec::new();
     for b in blocks_iter(ctx, f.op) {
@@ -302,6 +302,15 @@ fn callee_info(
         if !panic_block {
             nwarm_ops += bn;
         }
+    }
+    // `PLIRON_INLINE_LEAN`: wrappers inlined into this body count as the
+    // calls they replaced.
+    if let Some(&[d, dc, dw]) = st.lean_discount.get(&f.op) {
+        let d = d.min(n.saturating_sub(1));
+        n -= d;
+        nwarm_ops = nwarm_ops.saturating_sub(d).max(1);
+        ncalls = ncalls.saturating_sub(dc);
+        nwarm = nwarm.saturating_sub(dw);
     }
     if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
         return None;
@@ -1520,6 +1529,7 @@ pub fn run(
             Default::default();
         for _round in 0..32 {
             let mut sites = Vec::new();
+            let mut lean_add: Vec<[usize; 3]> = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut doomed: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut bi = 0;
@@ -1988,6 +1998,18 @@ pub fn run(
                             *copies.entry(cs.clone()).or_default() += 1;
                         }
                         size += ci.n;
+                        // The callee's own discount moves into the caller
+                        // with its body; a wrapper adds what it has beyond
+                        // the call it replaces.
+                        let mut d = st.lean_discount.get(&ci.op).copied().unwrap_or([0; 3]);
+                        if lean {
+                            d[0] += ci.n.saturating_sub(1);
+                            d[1] += ci.ncalls.saturating_sub(1);
+                            d[2] += ci.nwarm.saturating_sub(1);
+                        }
+                        if d != [0; 3] {
+                            lean_add.push(d);
+                        }
                         sites.push((op, ci.op, cs.clone()));
                         "accept"
                     };
@@ -2013,6 +2035,14 @@ pub fn run(
             t0 = std::time::Instant::now();
             if sites.is_empty() {
                 break;
+            }
+            if !lean_add.is_empty() {
+                let e = st.lean_discount.entry(caller).or_default();
+                for d in &lean_add {
+                    for k in 0..3 {
+                        e[k] += d[k];
+                    }
+                }
             }
             for (call, callee, cs) in sites {
                 let tags = tagcache

@@ -3760,6 +3760,30 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
     }
 }
 
+/// May a lifetime marker's anchor step back over `i`? Yes for what touches
+/// no memory and can be moved by a later pass: everything
+/// `inst_predicates::is_pure_for_egraph` (private upstream) lets the egraph
+/// re-place, i.e. side-effect-free non-loads and read-only loads.
+fn marker_can_step_over(func: &ir::Function, i: ir::Inst) -> bool {
+    let op = func.dfg.insts[i].opcode();
+    if op.can_load() {
+        return match func.dfg.insts[i] {
+            ir::InstructionData::Load { opcode: ir::Opcode::Load, flags, .. } => {
+                let f = func.dfg.mem_flags[flags];
+                f.readonly() && f.notrap() && f.can_move()
+            }
+            _ => false,
+        };
+    }
+    !(op.is_call()
+        || op.is_branch()
+        || op.is_terminator()
+        || op.is_return()
+        || op.can_trap()
+        || op.other_side_effects()
+        || op.can_store())
+}
+
 // r[impl clif.lower.leaves]
 struct FnLower<'a, 'b> {
     ctx: &'a Context,
@@ -5699,6 +5723,55 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.ins().iconcat(lo, hi)
     }
 
+    /// `llvm.aarch64.neon.{umaxp,uminp,smaxp,sminp,addp}` on 128-bit
+    /// integer vectors, inline: the even and the odd lanes of `a ++ b`
+    /// (two `shuffle`s, `uzp1`/`uzp2` on aarch64) combined lane by lane.
+    /// As a call to its stub the op clobbered every caller-saved
+    /// register: memchr's search loop tests four compare results with
+    /// `vpmaxq_u8(x, x)`, and lol_html's `TagScanner::data_state` saved
+    /// eight registers and spilled four vectors around it on every call
+    /// (`tests/parity/umaxp.rs`). `PLIRON_NEON_PAIRWISE=0` keeps the call.
+    fn neon_pairwise(&mut self, sym: &str, args: &[ir::Value]) -> Option<ir::Value> {
+        let (opn, ty) = sym.strip_prefix("__pliron_llvm_aarch64_neon_")?.split_once('_')?;
+        let (lane_ty, lb) = match ty {
+            "v16i8" => (clt::I8X16, 1usize),
+            "v8i16" => (clt::I16X8, 2),
+            "v4i32" => (clt::I32X4, 4),
+            _ => return None,
+        };
+        if !matches!(opn, "umaxp" | "uminp" | "smaxp" | "sminp" | "addp")
+            || self.wasm
+            || pliron_cfg::env_is("PLIRON_NEON_PAIRWISE", "0")
+        {
+            return None;
+        }
+        let &[a, b] = args else { return None };
+        if self.b.func.dfg.value_type(a) != lane_ty || self.b.func.dfg.value_type(b) != lane_ty {
+            return None;
+        }
+        let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+        let bytes = |b: &mut FunctionBuilder, v: ir::Value| {
+            if lane_ty == clt::I8X16 { v } else { b.ins().bitcast(clt::I8X16, mf, v) }
+        };
+        let (a8, b8) = (bytes(&mut self.b, a), bytes(&mut self.b, b));
+        let mut half = |b: &mut FunctionBuilder, odd: usize| {
+            let mask: Vec<u8> = (0..16 / lb)
+                .flat_map(|j| (0..lb).map(move |k| ((2 * j + odd) * lb + k) as u8))
+                .collect();
+            let m = b.func.dfg.immediates.push(ir::ConstantData::from(&mask[..]));
+            let h = b.ins().shuffle(a8, b8, m);
+            if lane_ty == clt::I8X16 { h } else { b.ins().bitcast(lane_ty, mf, h) }
+        };
+        let (e, o) = (half(&mut self.b, 0), half(&mut self.b, 1));
+        Some(match opn {
+            "umaxp" => self.b.ins().umax(e, o),
+            "uminp" => self.b.ins().umin(e, o),
+            "smaxp" => self.b.ins().smax(e, o),
+            "sminp" => self.b.ins().smin(e, o),
+            _ => self.b.ins().iadd(e, o),
+        })
+    }
+
     fn set(&mut self, op: Ptr<Operation>, vals: Vals) {
         let r = op.deref(self.ctx).get_result(self.ctx, 0);
         self.vals.insert(r, vals);
@@ -6886,6 +6959,30 @@ impl<'a, 'b> FnLower<'a, 'b> {
             "pliron.vtrunc" => {
                 let st = self.b.func.dfg.value_type(a[0]);
                 let lane = st.lane_type();
+                // aarch64: the low half of every lane is one `uzp1` of the
+                // vector with itself (`vshrn_n_u16`'s narrow in memchr's
+                // match mask was `movi; and; sqxtun`).
+                // Opt-in (`PLIRON_VTRUNC_UZP=1`): on by default it fails
+                // the `simdshift` stanza ("movemask not vectorized"; a
+                // later match expects the mask-and-narrow form).
+                if st.bits() == 128
+                    && matches!(
+                        self.m.isa().triple().architecture,
+                        target_lexicon::Architecture::Aarch64(_)
+                    )
+                    && pliron_cfg::env_is("PLIRON_VTRUNC_UZP", "1")
+                {
+                    let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+                    let half = (lane.bits() / 16) as usize;
+                    let b8 = if st == clt::I8X16 { a[0] } else { self.b.ins().bitcast(clt::I8X16, mf, a[0]) };
+                    let mask: Vec<u8> =
+                        (0..16 / half).flat_map(|j| (0..half).map(move |k| (2 * j * half + k) as u8)).collect();
+                    let m = self.b.func.dfg.immediates.push(ir::ConstantData::from(&mask[..]));
+                    let n = self.b.ins().shuffle(b8, b8, m);
+                    let q = self.b.ins().bitcast(clt::I64X2, mf, n);
+                    let lo = self.b.ins().extractlane(q, 0);
+                    return self.b.ins().bitcast(rt, mf, lo);
+                }
                 let mask = (1u64 << (lane.bits() / 2)) - 1;
                 let k = self.b.ins().iconst(lane, mask as i64);
                 let m = self.b.ins().splat(st, k);
@@ -7221,6 +7318,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
             if op.deref(ctx).get_num_results() > 0 {
                 self.set(op, rs);
             }
+            return;
+        }
+        // NEON pairwise ops arrive as calls to one-instruction asm stubs
+        // (`asm.rs` `llvm_intrinsic_stub`); see `neon_pairwise`.
+        if let CallOpCallable::Direct(id) = call.callee(ctx)
+            && let Some(r) = self
+                .st
+                .ident_to_sym
+                .get(&id.to_string())
+                .filter(|s| s.starts_with("__pliron_llvm_aarch64_neon_"))
+                .cloned()
+                .and_then(|s| self.neon_pairwise(&s, &cargs))
+        {
+            self.set1(op, r);
             return;
         }
         // C variadic: fn_ty only has the fixed params. Foreign callees get the
@@ -8202,7 +8313,24 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // here would panic.
             if let Some(b) = self.b.current_block() {
                 let mut anchor = self.b.func.layout.last_inst(b);
-                while let Some(i) = anchor.filter(|i| self.ltzero.contains(i)) {
+                // The anchor has to stay where it is: an instruction the
+                // egraph treats as pure (a `stack_addr`, an `iadd`, a
+                // read-only load; `marker_can_step_over`) is taken out of
+                // the layout and put back at its first use, and the marker
+                // would move with it. A
+                // start marker whose anchor sank below the slot's first
+                // writes declared them dead (`HashSet::symmetric_difference`
+                // at opt-level 0: the entry block's markers were anchored
+                // on the last alloca's `stack_addr`, which sank to the call
+                // 28 instructions later, and slotmerge gave the live slot
+                // to another value). Pure instructions touch no memory, so
+                // stepping back over them leaves the marker at the same
+                // place among the slot's accesses. `PLIRON_LT_PINANCHOR=0`
+                // restores the old anchors.
+                let pin = crate::pass_enabled("PLIRON_LT_PINANCHOR");
+                while let Some(i) = anchor.filter(|&i| {
+                    self.ltzero.contains(&i) || (pin && marker_can_step_over(self.b.func, i))
+                }) {
                     anchor = self.b.func.layout.prev_inst(i);
                 }
                 let size = self.const_int(opnds[0]);

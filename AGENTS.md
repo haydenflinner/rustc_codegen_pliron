@@ -360,6 +360,19 @@ time, memory, code size, stack frames) in ~20 min and writes
   rust-json -0.17M, pulldown-cmark +0.78M, regex +0.25M, blind-sig
   +0.29M): regalloc2 rotates registers at the merged latch (see
   `looprot::merge_latches`).
+- 2026-11-13 afternoon round (`docs/history/2026-11-13-six-features.md`,
+  "Handoff: parity"): `PLIRON_RA2_REHOME` (vendored regalloc2, default
+  `2`, `0` off: a value's register in a join-only block follows the
+  cheaper side of its edges), `PLIRON_MEMCMPK_EQ=0` /
+  `PLIRON_MEMCMPK_CONST=0`, `PLIRON_NEON_PAIRWISE=0` (aarch64 NEON pairwise ops inline), `PLIRON_XCGU_GLUEDEPTH=0` (drop glue free of copy descent
+  depth), `PLIRON_SELXOR_SIGN=0`, `PLIRON_PHISIMP_DEADPRED=0`,
+  `PLIRON_SROA_FRAGCOPY=<k>` (default 8, `0` off: whole-copied
+  aggregates cut into sub-word pieces stay whole) — off switches for
+  what is default on. Opt-in: `PLIRON_INLINE_LEAN=<k>` (wrapper
+  callees pass the inline score; 32 measured, pulldown-cmark +0.21M
+  open), `PLIRON_VTRUNC_UZP=1` (aarch64 lane narrowing as `uzp1`; fails
+  the `simdshift` stanza when on), `PLIRON_PADJUMP=<n>` (vendored Cranelift: jump over alignment
+  pads of `n`+ instructions; unmeasured).
 - `PLIRON_LICM_INNERPRESS` (default `2`; `=1` the old rule, `=0` off),
   `PLIRON_UNSWITCH_LOOP=0`, `PLIRON_LF_TRIVPHI=0`, `PLIRON_ELABKEEP=0`
   (vendored elaborator), `PLIRON_BUMPEDGE=0`, `PLIRON_WM_WIDE=0`,
@@ -395,16 +408,32 @@ time, memory, code size, stack frames) in ~20 min and writes
   each site's `coldargs` wrapper, `PLIRON_PANICSTUB_FWD=0` keeps
   forwarder blocks. Sites on different source lines stay apart when the
   build has line tables.
-- `PLIRON_SCOPED_NOALIAS=1` (opt-in) — an inlined callee's `&mut`
-  param keeps its `noalias` fact for the span of the inlined body: a
-  first pipeline step (`scopedfwd`) runs `loadfwd` on the function as
-  lowered, where locs reached through the param survive stores and
-  calls proven not based on it. Exact counts: rust-protobuf -0.95%,
-  rust-json -0.70%, rust-html-rewriter -0.43%, pulldown-cmark +0.64%
-  (not understood, hence opt-in). `PLIRON_TRACE=pliron::scopedna` says
-  why candidates drop out; `PLIRON_SCOPEDFWD=0` skips the step,
-  `PLIRON_SCOPEDFWD_PRE=0` its load PRE, `PLIRON_SCOPED_NCC=0` the
-  `nocapture` relaxation.
+- `PLIRON_SCOPED_NOALIAS=1` (opt-in; measured ready for default-on but
+  the 2000-seed fuzz sweep it needs first did not complete, see the
+  handoff section of `docs/history/2026-11-13-six-features.md`): an
+  inlined callee's `&mut` param keeps its `noalias` fact for
+  the span of the inlined body: a first pipeline step (`scopedfwd`)
+  runs `loadfwd` on the function as lowered, where locs reached through
+  the param survive stores and calls proven not based on it. The step
+  runs only in functions where a probe finds such a loc
+  (`PLIRON_SCOPEDFWD_PROBE=0`: wherever there is a candidate), and
+  `phisimp` keeps a clone-entry arg only where the fact can be used
+  (`PLIRON_SCOPED_PHI_ALL=1`: every `noalias` arg, `PLIRON_SCOPED_PHI_RO=1`:
+  `readonly` ones too, `PLIRON_SCOPED_PHI_KEEP=<bits>`: one class).
+  Exact counts: rust-protobuf -1.44%, rust-json -0.77%,
+  rust-html-rewriter -0.04%, the other five held-out programs within
+  0.01% or their noise (`docs/history/2026-11-13-six-features.md`).
+  `PLIRON_TRACE=pliron::scopedna` says why candidates drop out;
+  `PLIRON_SCOPEDFWD=0` skips the step, `PLIRON_SCOPEDFWD_PRE=0` its load
+  PRE, `PLIRON_SCOPED_NCC=0` the `nocapture` relaxation. Corpora
+  recorded with the knob on carry the candidates
+  (`; diffcheck-facts: scopedna=`), so `clif-check report --check`
+  replays the step.
+- `PLIRON_LT_PINANCHOR=0` — a lifetime marker is anchored on the last
+  instruction lowered before it again, pure ones included (default: the
+  anchor steps back over instructions the egraph may move; a
+  `stack_addr` anchor that sank below a slot's first writes made
+  slotmerge reuse the slot at opt-level 0, stanza `o0std`).
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
   functions get 2x their callsite limit (the body dies when all sites
   inline, LLVM's last-callsite bonus generalised). Reaches

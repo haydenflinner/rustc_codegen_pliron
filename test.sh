@@ -8,8 +8,9 @@
 # Links with the pure-Rust `wild` linker when it is on PATH (cargo install wild-linker).
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
-#   punroll icmpfold coldargs coldcopy fastcc scopedna bcheck unswitch slotmerge bittab polsw tailrec
+#   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   o0std
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -221,6 +222,24 @@ t_fastcc() {
   harness/fastcc_check.py $out/fastcc-on.log $out/fastcc-on.o
 }
 
+t_neonpair() {
+  # NEON pairwise ops (`vpmaxq_u8` ...) and lane narrowing (`vshrn_n_u16`,
+  # `vmovn_*`) are lowered inline on aarch64 (PLIRON_NEON_PAIRWISE,
+  # PLIRON_VTRUNC_UZP): the program checks every op against a scalar model
+  # and its output matches stock rustc's, with the lowerings on and off; with
+  # them on no call to a `__pliron_llvm_aarch64_neon_*` stub is left.
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  rustc --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair-stock$exe || return 1
+  PLIRON_VTRUNC_UZP=1 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair$exe || return 1
+  PLIRON_NEON_PAIRWISE=0 PLIRON_VTRUNC_UZP=0 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair-off$exe || return 1
+  diff <($out/neonpair-stock$exe) <($out/neonpair$exe) || { echo "neonpair: output differs" >&2; return 1; }
+  diff <($out/neonpair-stock$exe) <($out/neonpair-off$exe) || { echo "neonpair: output differs (lowerings off)" >&2; return 1; }
+  if $out/neonpair$exe | grep -qv "mismatches 0 "; then echo "neonpair: differs from the scalar model" >&2; return 1; fi
+  local n
+  n=$("$llvmod" -d --no-show-raw-insn $out/neonpair$exe | grep -c 'bl.*__pliron_llvm_aarch64_neon' || true)
+  (( n == 0 )) || { echo "neonpair: $n stub calls left" >&2; return 1; }
+}
+
 t_scopedna() {
   # PLIRON_SCOPED_NOALIAS=1 (opt-in): an inlined callee's `&mut` param is a
   # second name for the caller's memory inside the inlined body. A `&self`
@@ -237,6 +256,17 @@ t_scopedna() {
     [[ -n "$exe" ]] && continue
     diff <($out/scopedna-stock$exe) <($out/scopedna$i$exe) || { echo "scopedna: output differs ($f)" >&2; return 1; }
   done
+  # Keeping a clone-entry arg as a name of its own must not hide a constant
+  # from the IR passes (tests/scopedna/hold.rs): `append_text` is the same
+  # size with the knob off and on (it was 90 against 173 instructions).
+  [[ -x "$llvmod" ]] || return 0
+  local n0 n1 k
+  for k in 0 1; do
+    PLIRON_SCOPED_NOALIAS=$k rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/scopedna/hold.rs -o $out/scopedna-hold$k.o || return 1
+  done
+  n0=$("$llvmod" -d --no-show-raw-insn $out/scopedna-hold0.o | awk '/append_text>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  n1=$("$llvmod" -d --no-show-raw-insn $out/scopedna-hold1.o | awk '/append_text>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  (( n0 > 0 && n1 <= n0 )) || { echo "scopedna: append_text is $n0 instructions without the knob, $n1 with it" >&2; return 1; }
 }
 
 t_bcheck() {
@@ -274,6 +304,23 @@ t_slotmerge() {
         echo "slotmerge: dispatch frame is $((frame))B (expected <1024)" >&2; exit 1
     fi
   fi
+}
+
+# r[verify front.ir.lifetime]
+t_o0std() {
+  # std's generic code at opt-level 0: optimized MIR from std's metadata
+  # (inlined, storage markers kept) through the opt-level-0 pipeline. A
+  # start marker anchored on a `stack_addr` the egraph moved made slotmerge
+  # reuse a live slot (`HashSet::symmetric_difference` gave {4} for
+  # {1,2,3} ^ {2,3,4}). The gate reruns this under PLIRON_SM_POISON
+  # (`poison:o0std`), which fails on a wrong interval whether or not a
+  # merge reuses the bytes.
+  rustc --edition 2021 -Copt-level=0 tests/o0std/main.rs -o $out/o0std-stock$exe || return 1
+  $out/o0std-stock$exe > $out/o0std-stock.out || return 1
+  for o in 0 1; do
+    rustc $BE --edition 2021 -Copt-level=$o tests/o0std/main.rs -o $out/o0std$o$exe || return 1
+    diff $out/o0std-stock.out <($out/o0std$o$exe) || { echo "o0std: output differs from stock rustc's (opt-level $o)" >&2; return 1; }
+  done
 }
 
 t_bittab() {
@@ -1308,9 +1355,11 @@ want coldargs && t_coldargs
 want coldcopy && t_coldcopy
 want fastcc && t_fastcc
 want scopedna && t_scopedna
+want neonpair && t_neonpair
 want bcheck && t_bcheck
 want unswitch && t_unswitch
 want slotmerge && t_slotmerge
+want o0std && t_o0std
 want bittab && t_bittab
 want polsw && t_polsw
 want tailrec && t_tailrec

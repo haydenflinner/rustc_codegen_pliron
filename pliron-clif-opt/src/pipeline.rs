@@ -3421,11 +3421,19 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
 // the inlined callees' `&mut` params are still their clones' entry params
 // (`loadfwd::scoped_any`). Functions without a candidate skip it.
 // `PLIRON_SCOPEDFWD=0` skips the step (the facts then never apply).
+// A probe run first asks whether the fact shelters any loc from a store or
+// call in this function; where it does not, the function is left for the
+// regular `loadfwd` step (`PLIRON_SCOPEDFWD_PROBE=0`: run regardless).
 fn s_scopedfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     if !loadfwd::scoped_any() || pliron_cfg::env_is("PLIRON_SCOPEDFWD", "0") {
         return 0;
     }
-    loadfwd::scoped_prerun(|| s_loadfwd2(p, an))
+    loadfwd::scoped_prerun(|| {
+        if !pliron_cfg::env_is("PLIRON_SCOPEDFWD_PROBE", "0") && loadfwd::scoped_probe(|| s_loadfwd2(p, an)) == 0 {
+            return 0;
+        }
+        s_loadfwd2(p, an)
+    })
 }
 
 // `band v, 1` on an already-0/1 scalar (rustc's i1 normalization

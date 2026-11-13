@@ -1925,7 +1925,28 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
             .unwrap_or_default(),
     );
     let noalias = sorted(set(facts.noalias));
-    let scopedna = sorted(set(facts.scoped_na));
+    // Entry params, plus the scoped-`noalias` candidates of
+    // `PLIRON_SCOPED_NOALIAS`: an inlined callee's written-through
+    // `noalias` param is a clone-entry block param that is scoped only
+    // (`loadfwd::scoped_seed`). Without those a replay has no candidate
+    // and says nothing about `scopedfwd`. The `readonly` half (scoped and
+    // `noalias`) stays out, as do its `noalias`/`deref` entries: on a
+    // replay it would be a candidate, which it is not in the compile.
+    let scopedna = sorted(
+        facts
+            .scoped_na
+            .map(|s| {
+                s.iter()
+                    .filter(|&&v| {
+                        params.contains(&v)
+                            || (!facts.noalias.is_some_and(|n| n.contains(&v))
+                                && matches!(f.dfg.try_value_def(v), Some(ir::ValueDef::Param(b, _)) if f.layout.is_block_inserted(b)))
+                    })
+                    .map(|v| v.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     let deref = sorted(
         facts
             .deref

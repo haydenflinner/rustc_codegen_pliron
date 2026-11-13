@@ -2623,6 +2623,27 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
             }
+            // PLIRON (`PLIRON_PADJUMP=<n>`, opt-in, default `0` = off; not
+            // measured yet, see the handoff notes in
+            // docs/history/2026-11-13-six-features.md): a pad of
+            // `n` or more instructions starts with a jump to the block it
+            // pads. The pad sits on the fallthrough path into a loop
+            // head, and the 64-byte rule above pads up to 15 `nop`s:
+            // pulldown-cmark executed 510k of them (LLVM's code 3.6k),
+            // 1% of its instructions, 99k on one path of
+            // `FirstPass::parse_block`.
+            static PADJUMP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let padjump = *PADJUMP.get_or_init(|| {
+                std::env::var("PLIRON_PADJUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            });
+            if let Some(sz) = I::fixed_inst_size()
+                && padjump > 0
+                && block != self.entry
+                && new_offset - buffer.cur_offset() >= padjump * sz
+            {
+                let j = I::gen_jump(MachLabel::from_block(block));
+                j.emit(&mut buffer, &self.emit_info, &mut Default::default());
+            }
             while new_offset > buffer.cur_offset() {
                 // Pad with NOPs up to the aligned block offset.
                 let nop = I::gen_nop((new_offset - buffer.cur_offset()) as usize);

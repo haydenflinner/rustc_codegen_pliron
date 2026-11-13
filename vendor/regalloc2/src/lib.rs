@@ -247,20 +247,21 @@ pub(crate) fn postopt_stats() -> bool {
     false
 }
 
-/// PLIRON (`PLIRON_RA2_REHOME`, `0` off, `1` loop latches, `2` every
-/// join block): after allocation, a value live through a block that only
-/// joins paths takes the register it has on the cheaper side of the
-/// block's edges, when that register is free there. See `ion/rehome.rs`.
+/// PLIRON (`PLIRON_RA2_REHOME`, default `2`; `0` off, `1` loop latches
+/// only, `2` every join block): after allocation, a value live through a
+/// block that only joins paths takes the register it has on the cheaper
+/// side of the block's edges, when that register is free there. See
+/// `ion/rehome.rs`.
 pub(crate) fn rehome_mode() -> u8 {
     #[cfg(feature = "std")]
     {
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| {
-            std::env::var("PLIRON_RA2_REHOME").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("PLIRON_RA2_REHOME").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
         })
     }
     #[cfg(not(feature = "std"))]
-    0
+    2
 }
 
 /// PLIRON (`PLIRON_RA2_SLOTPAIR`, default on, `=0` off): repack

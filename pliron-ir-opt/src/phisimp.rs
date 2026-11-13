@@ -35,6 +35,67 @@ fn defined_in(ctx: &Context, v: Value, b: Ptr<BasicBlock>) -> bool {
     }
 }
 
+/// Is the clone-entry arg `arg`, fed only `v`, worth keeping as a name of
+/// its own for the scoped `noalias` fact (`PLIRON_SCOPED_NOALIAS`)? A held
+/// arg hides `v` from every IR pass that follows: `constload` no longer
+/// folds a load from a constant (a derived `PartialEq::eq(&CONST, &x)`
+/// became a byte-by-byte compare against the constant's memory:
+/// pulldown-cmark `Tree::append_text`, 90 -> 173 instructions), SROA sees
+/// an alloca's field address leave through a branch operand. So it is
+/// held only where `loadfwd::ScopedNa` can use it:
+///
+/// - the param is written through. A `readonly` one (every leaf in
+///   `region_frozen`) is not a candidate there; it folds as it does
+///   without the knob. `PLIRON_SCOPED_PHI_RO=1` holds those too (they
+///   then reach lowering as `noalias` roots with a frozen region: exact
+///   counts pulldown-cmark -0.12%, rust-protobuf +0.92% against folding);
+/// - `v` is not an address inside an alloca or a constant (rule 1 there
+///   refuses stack slots; nothing writes a constant);
+/// - `v` is not the function's own `noalias` param at a constant offset
+///   (`scoped_seed` drops those: the root is already sheltered
+///   function-wide); for a held `readonly` arg, not the own frozen param.
+///
+/// What holding the other classes did on rust-html-rewriter was not the
+/// fact: an alloca field kept from SROA (`exec_without_attrs` -326k
+/// instructions, `memcpy` +201k), a constant kept from `constload` (the
+/// benchmark's two closures -166k). `PLIRON_SCOPED_PHI_KEEP` reproduces
+/// each.
+fn scoped_hold(ctx: &Context, st: &State, arg: Value, v: Value, hold_ro: bool) -> bool {
+    use pliron_llvm::ops::{AddrSpaceCastOp, BitcastOp, FreezeOp, GetElementPtrOp};
+    let Some(subs) = st.region_noalias.get(arg) else {
+        return false;
+    };
+    let fz = st.region_frozen.get(arg);
+    let ro = subs.iter().all(|&s| fz.is_some_and(|rs| rs.iter().any(|&(f, _, _)| f == s)));
+    if ro && !hold_ro {
+        return false;
+    }
+    let (mut b, mut konst) = (v, true);
+    for _ in 0..16 {
+        let Some(op) = b.defining_op() else { break };
+        if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+            konst &= crate::sroa::gep_offset(ctx, st, op).is_some();
+        } else if !(Operation::is_op::<BitcastOp>(op, ctx)
+            || Operation::is_op::<FreezeOp>(op, ctx)
+            || Operation::is_op::<AddrSpaceCastOp>(op, ctx))
+        {
+            break;
+        }
+        b = op.deref(ctx).get_operand(ctx, 0);
+    }
+    // `PLIRON_SCOPED_PHI_KEEP=<bits>` holds a class anyway (ablation): 1 an
+    // alloca's field, 2 a constant, 4 the own `noalias` param under a
+    // written-through arg, 8 the own frozen param under a `readonly` one.
+    static KEEP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_SCOPED_PHI_KEEP").and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    let keep = *KEEP;
+    if (st.allocas.contains(b) && keep & 1 == 0) || (st.consts.contains(b) && keep & 2 == 0) {
+        return false;
+    }
+    !(konst && if ro { st.frozen.contains(b) && keep & 8 == 0 } else { st.noalias.contains(b) && keep & 4 == 0 })
+}
+
 /// Blocks reachable from the entry, counting invoke landing-pad edges.
 fn reachable(ctx: &Context, st: &State, bs: &[Ptr<BasicBlock>]) -> FxHashSet<Ptr<BasicBlock>> {
     let mut seen = FxHashSet::default();
@@ -64,6 +125,8 @@ pub fn run_fn(ctx: &mut Context, st: &State, f: Ptr<Operation>) -> usize {
 fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHashSet<Ptr<BasicBlock>>) -> usize {
     let pin_nn = pliron_cfg::env_is("PLIRON_RETNN", "1");
     let pin_na = pliron_cfg::env_is("PLIRON_SCOPED_NOALIAS", "1") && !pliron_cfg::env_is("PLIRON_SCOPED_PHI", "0");
+    let pin_all = pin_na && pliron_cfg::env_is("PLIRON_SCOPED_PHI_ALL", "1");
+    let pin_ro = pliron_cfg::env_is("PLIRON_SCOPED_PHI_RO", "1");
     let mut n = 0;
     // `reach`/`preds` are loop-invariant: `remove_successor_operand`
     // only shrinks an edge's operand list, never retargets edges, so
@@ -119,11 +182,47 @@ fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHas
                 // `Vec` fields reloaded every inner iteration). Allocas
                 // cloned mid-function by the inliner don't dominate the
                 // dead region and stay folded-out.
+                //
+                // The same when `b` has one incoming edge and no path back
+                // to the block that edge leaves: that block is then on
+                // every path to `b` and ahead of it, reachable or not, and
+                // `v` is available at its end. An inlined callee's entry in
+                // such a region otherwise keeps its arguments as block
+                // params, and one of them can be a caller's local or a
+                // field address of one (`&self.alloc` of the `Vec` whose
+                // inlined `RawVec` drop sits in the dead unwind path):
+                // regex's `cached_state` then kept its scratch `Vec` whole
+                // in memory and stored `len` on every push
+                // (`tests/parity/statekey.rs`, `PLIRON_PHISIMP_DEADPRED=0`
+                // off). With a path back (a loop that lost its entry edge)
+                // `v` may be computed from the param itself.
+                let dead_single_pred = || {
+                    if pliron_cfg::env_is("PLIRON_PHISIMP_DEADPRED", "0") || ps.len() != 1 {
+                        return false;
+                    }
+                    let Some(pb) = ps[0].0.deref(ctx).get_parent_block() else { return false };
+                    let mut seen: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
+                    let mut work = vec![b];
+                    while let Some(x) = work.pop() {
+                        if x == pb || seen.len() > 64 {
+                            return false;
+                        }
+                        if !seen.insert(x) {
+                            continue;
+                        }
+                        for op in x.deref(ctx).iter(ctx) {
+                            work.extend(op.deref(ctx).successors(ctx));
+                            work.extend(st.invokes.get(op).map(|&(l, _)| l));
+                        }
+                    }
+                    true
+                };
                 if !reach.contains(&b)
                     && !(st.allocas.contains(v)
                         && v.defining_op().is_some_and(|op| {
                             op.deref(ctx).get_parent_block() == Some(bs[0])
                         }))
+                    && !dead_single_pred()
                 {
                     continue;
                 }
@@ -138,9 +237,12 @@ fn run_fn_with(ctx: &mut Context, st: &State, f: Ptr<Operation>, landing: &FxHas
                 // `noalias` callee param is the name the scoped fact hangs
                 // on (`State::region_noalias`); folded into the caller's
                 // value, accesses through it are indistinguishable from the
-                // caller's own. Allocas fold as above. `PLIRON_SCOPED_PHI=0`
-                // folds them anyway (then few candidates reach lowering).
-                if pin_na && st.region_noalias.contains(arg) && !st.allocas.contains(v) {
+                // caller's own. Allocas fold as above, and so does every
+                // arg the fact could not serve (`scoped_hold`;
+                // `PLIRON_SCOPED_PHI_ALL=1` holds those too).
+                // `PLIRON_SCOPED_PHI=0` folds them all (then few candidates
+                // reach lowering).
+                if pin_na && st.region_noalias.contains(arg) && !st.allocas.contains(v) && (pin_all || scoped_hold(ctx, st, arg, v, pin_ro)) {
                     continue;
                 }
                 arg.replace_all_uses_with(ctx, &v);

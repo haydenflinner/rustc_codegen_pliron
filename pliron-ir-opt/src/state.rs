@@ -511,6 +511,12 @@ pub struct State {
     /// transforms skip them (`helpers::opt_body`); interprocedural
     /// rewrites and analyses still read them.
     pub opt_skip: rustc_hash::FxHashSet<Ptr<Operation>>,
+    /// `PLIRON_INLINE_LEAN`: per function, the raw ops, calls and warm
+    /// calls that inlined wrappers added beyond the calls they replaced.
+    /// The inliner takes them off the function's counts when it scores
+    /// it as a callee, so inlining a wrapper does not make its caller
+    /// look bigger to the callers above (see `inline.rs`, `lean_k`).
+    pub lean_discount: rustc_hash::FxHashMap<Ptr<Operation>, [usize; 3]>,
     /// xcgu extra-copy symbols (`xcgu::copies` in lib.rs). Rustc never
     /// reports cross-CGU callers of a local-copy instance, so `dead_fns`
     /// must not strip them: a copy's only callers can be other copies
@@ -684,6 +690,7 @@ impl State {
         self.prof.retain(lo);
         self.prof_edges.retain(lo);
         self.opt_skip.retain(lo);
+        self.lean_discount.retain(|k, _| lo(k));
         self.dead_unopt_ops.retain(lo);
         self.region_blocks.retain(lb);
         self.region_parent.retain(lb);

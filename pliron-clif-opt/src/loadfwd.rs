@@ -1219,6 +1219,33 @@ thread_local! {
     static NO_PRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// `Some(hits)` while a `scoped_probe` run is in progress.
+    static PROBE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` (the `scopedfwd` step's `run_deref`) as a probe: no load PRE,
+/// the availability fixpoint only, nothing rewritten. Returns how many
+/// locs a store or call evicted and the scoped fact put back, i.e.
+/// whether the fact changes anything in this function. The step proper
+/// runs only then: `loadfwd` on the function as lowered, before the first
+/// jump threading, is otherwise all cost (pulldown-cmark's
+/// `Rev<Iter<u8>>::try_fold` scanners went from 38 to 48 instructions in
+/// it and ended at 31 instead of 22; 145 functions had a candidate and 16
+/// stores or calls were sheltered).
+pub fn scoped_probe(f: impl FnOnce() -> usize) -> u32 {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROBE.with(|c| c.set(None));
+        }
+    }
+    PROBE.with(|c| c.set(Some(0)));
+    let _r = Reset;
+    f();
+    PROBE.with(|c| c.get()).unwrap_or(0)
+}
+
 /// Run `f` (the `scopedfwd` step's `run_deref`) without the load-PRE
 /// phase when `PLIRON_SCOPEDFWD_PRE=0`. Default: with it. Exact counts
 /// with / without (2026-11-13): rust-protobuf -0.95% / +0.55%,
@@ -1352,6 +1379,9 @@ struct ScopedNa {
     stops: FxHashSet<Value>,
     entry: Block,
     memo: std::cell::RefCell<FxHashMap<Value, bool>>,
+    /// Locs a store or call evicted and rule 4 put back: what the fact
+    /// added to this run (`scoped_probe`).
+    hits: std::cell::Cell<u32>,
 }
 
 impl ScopedNa {
@@ -1369,7 +1399,7 @@ impl ScopedNa {
             return None;
         }
         let none = |stops: FxHashSet<Value>| {
-            Some(ScopedNa { reg: Default::default(), bad: Default::default(), stops, entry, memo: Default::default() })
+            Some(ScopedNa { reg: Default::default(), bad: Default::default(), stops, entry, memo: Default::default(), hits: Default::default() })
         };
         let seed = SCOPED_REG.with(|c| c.borrow().clone());
         // `PLIRON_TRACE=pliron::scopedna`: why candidates drop out
@@ -1448,7 +1478,7 @@ impl ScopedNa {
                 bad.insert(x);
             }
         }
-        Some(ScopedNa { reg, bad, stops, entry, memo: Default::default() })
+        Some(ScopedNa { reg, bad, stops, entry, memo: Default::default(), hits: Default::default() })
     }
 
     /// Rule 4: `v` is provably not based on any scoped root.
@@ -1891,7 +1921,14 @@ fn transfer(
                         }
                     }
                 }
-                for (l, v) in kept.into_iter().chain(same_obj) {
+                for (l, v) in kept {
+                    if av.insert(l, v).is_none()
+                        && let Some(sc) = sc
+                    {
+                        sc.hits.set(sc.hits.get() + 1);
+                    }
+                }
+                for (l, v) in same_obj {
                     av.insert(l, v);
                 }
                 if av.len() < MAX_ENTRIES {
@@ -1958,7 +1995,11 @@ fn transfer(
                         keep || kreg
                     });
                     for (l, v) in kept {
-                        av.insert(l, v);
+                        if av.insert(l, v).is_none()
+                            && let Some(sc) = sc
+                        {
+                            sc.hits.set(sc.hits.get() + 1);
+                        }
                     }
                 }
             }
@@ -2143,7 +2184,8 @@ pub fn run_deref(
             };
         }
     };
-    if crate::pass_enabled("PLIRON_LOADPRE") && !NO_PRE.with(|c| c.get()) {
+    let probing = PROBE.with(|c| c.get()).is_some();
+    if crate::pass_enabled("PLIRON_LOADPRE") && !NO_PRE.with(|c| c.get()) && !probing {
         let t0 = prof2.then(std::time::Instant::now);
         // `pre` needs the real `iso`: its loc-set dataflow runs `kill`,
         // which retains a loc across a store to a different root only when
@@ -2278,6 +2320,10 @@ pub fn run_deref(
         };
     }
     if !stable {
+        return 0;
+    }
+    if probing {
+        PROBE.with(|c| c.set(Some(sc.as_ref().map_or(0, |s| s.hits.get()))));
         return 0;
     }
     let t0 = prof2.then(std::time::Instant::now);

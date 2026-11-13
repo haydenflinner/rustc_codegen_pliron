@@ -93,7 +93,9 @@ function. Consequences:
 - A step that does nothing offline may still be the corruptor.
 
 Fix direction: extend `OwnedFacts`/`corpus_dump` to serialize the remaining
-`Pipe` fact tables (done for `scoped_na`; the map-valued tables need a
+`Pipe` fact tables (done for `scoped_na`, since 2026-11-13 including the
+clone-entry block params that are `PLIRON_SCOPED_NOALIAS` candidates, and
+for `block_region`/`region_parent`; the other map-valued tables need a
 value/inst-keyed encoding).
 
 ## 4. Prefix-bisect `PLIRON_PIPELINE` — rebuild-per-probe, last resort
