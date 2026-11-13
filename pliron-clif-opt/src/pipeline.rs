@@ -3526,6 +3526,18 @@ fn s_esplit(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Sparse small-domain membership trees (is_whitespace/is_ascii_*
 // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
 // the accepted set fits a 64-bit window.
+// Selects whose condition a dominating branch or the loop's edges
+// decided — `edgeknown::selects`, straight after if-conversion made
+// them, so the induction-variable passes see the loop without them.
+fn s_selknown(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::edgeknown::selects(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("selknown");
+    }
+    k
+}
+
 // A membership predicate held in a select chain — see `selset`.
 fn s_selset(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::selset::run(&mut p.clctx.func);
@@ -4594,6 +4606,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // length by now (`ifconv2`'s const sweep); `loadfwd2`/`dse2`
         // later forward and drop a stack slot holding the compared bytes
         // (`ends_with(char)`).
+        step("selknown", "edgeknown", Gate::OptIn("PLIRON_SELKNOWN"), s_selknown).needs(shape::CONDBR),
         step("memcmpk", "memcmpk", Gate::Env("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
         cstep(
             "unswitch",
@@ -5168,7 +5181,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // After the late rotation: a rotated loop's guard sits on both
         // edges into its header, and the header's own first test of the
         // carried value is then decided (regex `InstPtrs::next`).
-        step("edgeknown", "edgeknown", Gate::OptIn("PLIRON_EDGEKNOWN"), s_edgeknown).needs(shape::MULTI),
+        step("edgeknown", "edgeknown", Gate::Env("PLIRON_EDGEKNOWN"), s_edgeknown).needs(shape::MULTI),
         // The late refold expressed walked pointers as `base + idx`;
         // their exit tests still compare `base + idx + 1` with `base +
         // len`.

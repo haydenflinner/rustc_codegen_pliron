@@ -195,3 +195,169 @@ pub fn run(func: &mut Function) -> usize {
     }
     n
 }
+
+/// `(a, b, true)` for `a != b`, `false` for `a == b`, operands in a fixed
+/// order.
+fn eq_key(func: &Function, v: Value) -> Option<(Value, Value, bool)> {
+    let (a, b, ne) = eq_test(func, v)?;
+    Some(if a.as_u32() <= b.as_u32() { (a, b, ne) } else { (b, a, ne) })
+}
+
+/// Selects whose condition is already decided where they stand.
+///
+/// A slice iterator's `next` — "at the end? stay : step" — if-converts to
+/// `p' = select (icmp eq p, end), p, p + 1`, inside a loop that only runs
+/// while `p != end`: the test is dead, and the select and its second
+/// compare cost two instructions a trip (pulldown-cmark's
+/// `scan_ch_repeat` loops: nine instructions where seven do).
+/// Two sources of the fact:
+/// - a dominating `brif` on an equal compare (same operands) whose edge
+///   to this region is the block's only way in;
+/// - a block parameter `p` whose every incoming edge is the "differs"
+///   (or "equals") side of a `brif` comparing that edge's argument with
+///   one common value `e`: then `p != e` (`p == e`) wherever `p` is
+///   visible.
+/// The select becomes an alias of the arm it always takes.
+pub fn selects(func: &mut Function) -> usize {
+    use cranelift_codegen::dominator_tree::DominatorTree;
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    if blocks.len() > 2000 {
+        return 0;
+    }
+    // (operands, "differs" holds, region root).
+    let mut facts: Vec<((Value, Value), bool, Block)> = Vec::new();
+    for &b in &blocks {
+        // Dominating branch: its single-predecessor successors.
+        if let Some(t) = func.layout.last_inst(b)
+            && let InstructionData::Brif { arg, blocks: [bt, bf], .. } = func.dfg.insts[t]
+            && let Some((x, y, ne)) = eq_key(func, func.dfg.resolve_aliases(arg))
+        {
+            let (tb, fb) = (bt.block(&func.dfg.value_lists), bf.block(&func.dfg.value_lists));
+            if tb != fb {
+                for (s, taken) in [(tb, true), (fb, false)] {
+                    let mut ps = cfg.pred_iter(s);
+                    if let (Some(_), None) = (ps.next(), ps.next()) {
+                        // `ne` true and taken: differs. `ne` false and not taken: differs.
+                        facts.push(((x, y), ne == taken, s));
+                    }
+                }
+            }
+        }
+        // Block parameters decided on every edge.
+        if Some(b) == func.layout.entry_block() {
+            continue;
+        }
+        for (pi, &p) in func.dfg.block_params(b).iter().enumerate() {
+            let mut common: Option<(Value, bool)> = None;
+            let mut ok = true;
+            let mut any = false;
+            for pred in cfg.pred_iter(b) {
+                any = true;
+                let dests =
+                    func.dfg.insts[pred.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                let hits: Vec<usize> = (0..dests.len()).filter(|&i| dests[i].block(&func.dfg.value_lists) == b).collect();
+                let fact = (|| {
+                    let [i] = hits[..] else { return None };
+                    let BlockArg::Value(a) = dests[i].args(&func.dfg.value_lists).nth(pi)? else { return None };
+                    let a = func.dfg.resolve_aliases(a);
+                    let InstructionData::Brif { arg, .. } = func.dfg.insts[pred.inst] else { return None };
+                    let (x, y, ne) = eq_test(func, func.dfg.resolve_aliases(arg))?;
+                    let e = if x == a {
+                        y
+                    } else if y == a {
+                        x
+                    } else {
+                        return None;
+                    };
+                    // The other operand must not be this block's own
+                    // parameter (it would be a different value per edge).
+                    if func.dfg.block_params(b).contains(&e) {
+                        return None;
+                    }
+                    Some((e, ne == (i == 0)))
+                })();
+                match (fact, common) {
+                    (Some(f), None) => common = Some(f),
+                    (Some(f), Some(c)) if f == c => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && any && let Some((e, differs)) = common {
+                // `e` reaches `b`: it is an operand in a predecessor that
+                // `b` does not dominate (the loop's entry edge), or a
+                // constant; require one such predecessor.
+                let outside = cfg.pred_iter(b).any(|pr| !domtree.block_dominates(b, pr.block));
+                if outside {
+                    let key = if p.as_u32() <= e.as_u32() { (p, e) } else { (e, p) };
+                    facts.push((key, differs, b));
+                }
+            }
+        }
+    }
+    if facts.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    // If-conversion also leaves the select *above* the branch that tests
+    // the same condition (`p' = select (p == end), p, p + 1; brif (p ==
+    // end), exit, body`): the select itself is not in the decided region,
+    // its uses are. Every use in a decided block takes the arm directly.
+    let mut sel: rustc_hash::FxHashMap<Value, ((Value, Value), bool, Value, Value)> = rustc_hash::FxHashMap::default();
+    for &b in &blocks {
+        for i in func.layout.block_insts(b) {
+            if let InstructionData::Ternary { opcode: Opcode::Select, args } = func.dfg.insts[i]
+                && let Some((x, y, ne)) = eq_key(func, func.dfg.resolve_aliases(args[0]))
+            {
+                sel.insert(func.dfg.first_result(i), ((x, y), ne, args[1], args[2]));
+            }
+        }
+    }
+    for &b in &blocks {
+        let live: Vec<&((Value, Value), bool, Block)> =
+            facts.iter().filter(|f| domtree.block_dominates(f.2, b)).collect();
+        if live.is_empty() {
+            continue;
+        }
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        for &i in &insts {
+            let mut rmap: Vec<(Value, Value)> = Vec::new();
+            for v in func.dfg.inst_values(i) {
+                let rv = func.dfg.resolve_aliases(v);
+                if let Some(&(key, ne, a, bb)) = sel.get(&rv)
+                    && let Some(f) = live.iter().find(|f| f.0 == key)
+                {
+                    rmap.push((v, if f.1 == ne { a } else { bb }));
+                }
+            }
+            if rmap.is_empty() || !pliron_cfg::bisect("edgeknown") {
+                continue;
+            }
+            func.dfg.map_inst_values(i, |v| rmap.iter().find(|(o, _)| *o == v).map_or(v, |&(_, nv)| nv));
+            n += 1;
+        }
+        for i in insts {
+            if func.layout.inst_block(i).is_none() {
+                continue;
+            }
+            let InstructionData::Ternary { opcode: Opcode::Select, args } = func.dfg.insts[i] else { continue };
+            let Some((x, y, ne)) = eq_key(func, func.dfg.resolve_aliases(args[0])) else { continue };
+            let Some(f) = live.iter().find(|f| f.0 == (x, y)) else { continue };
+            if !pliron_cfg::bisect("edgeknown") {
+                continue;
+            }
+            // The condition is true when "differs" matches the compare's sense.
+            let pick = if f.1 == ne { args[1] } else { args[2] };
+            let r = func.dfg.first_result(i);
+            func.dfg.clear_results(i);
+            func.dfg.change_to_alias(r, pick);
+            func.layout.remove_inst(i);
+            n += 1;
+        }
+    }
+    n
+}

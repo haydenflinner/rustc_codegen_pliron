@@ -50,52 +50,61 @@ lowers the callee-saved cost the test compares against and is ignored; the test 
 
 ## 3. Guarded devirtualization
 
-`PLIRON_DEVIRT=1` (opt-in). `Builder::call`/`invoke` see a virtual call as
-`instance = Virtual(trait_method, idx)`. Candidates are what the vtables instantiated
-in this crate hold (`src/devirt.rs`, `index`, built once per crate): every `Unsize`
-coercion in the MIR of every mono item gives a `(Self, dyn Trait)` pair, and for each
-pair and each method of the trait and its supertraits the slot instance is
-`Instance::expect_resolve_for_vtable` — the function rustc fills vtables with — so impl
-methods (generic impls at their instantiations too), provided methods, closure bodies
-behind `dyn Fn*` and shims are all exactly the address a vtable holds. A candidate is
-usable when its fn ABI and lowered signature equal the virtual call's (thin-pointer
-receiver, same pass modes and layouts) and its symbol links from this CGU: defined
-here, `xcgu::home_linkable`, or upstream-linkable. Slot instances private to one CGU
-are added to `xcgu::promoted` (hidden-external home definition) so the crate's other
-CGUs can name them. Not seen: vtables built in other crates and vtables that exist
-only in constants; those calls take the indirect arm, which is always kept last.
-`Builder::devirt_call` emits one guard block per target (`fnptr == &target`, nothing
-else) with a hit block holding the direct call; results merge through a block argument
-and every arm of an invoke gets the unwind destination.
-Which candidates get a guard: without a profile, all of them if there are at most
-`PLIRON_DEVIRT_MAX` (2), else none. In a profile build (`PLIRON_PGO` or
-`PLIRON_PGO_USE`) the first `PLIRON_DEVIRT_PROF_MAX` (16) by symbol name, identically
-in both builds so the CFG fingerprints agree; the hit blocks' counters are the value
-profile, and `pliron_ir_opt::devirt::prune` (right after `pgo::load`) keeps at most
-`PLIRON_DEVIRT_MAX` arms with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the
-site's calls, hottest first, moves the dropped counts to the fallback block and turns
-a site that never ran back into the plain indirect call. An arm whose target is an
-xcgu copy made only because of the profile is always dropped (its guard would compare
-the copy's address, which no vtable from the instrumented run held).
-Remarks (`devirt`): per site the guarded targets with `N instantiated, K usable
-(reasons)`, `profile: kept N of M arms (shares ..)` with `L`/`X` for a target body in
-this CGU or elsewhere, and `profile: unguarded calls N (reason)` for rejected sites.
-Measured (release dylib, profile loop with the knob on both builds, 2026-11-13):
-rust-html-rewriter guards 130 sites, 23 ran (202k calls), 13 keep an arm (all at 100%,
-12 of them with the body in the same CGU); pgo+devirt vs pgo: instructions 0.994-0.997,
-cycles and time within noise (0.986/1.001 over two runs); LLVM's ICP on the same
-program: instructions 0.995, cycles 0.99. 8195 functions matched, 1 stale (an xcgu
-copy whose chain is computed in another CGU). Calls still indirect there: 215k at 11
-sites calling vtables built in the upstream crate, 126k at one site in the upstream
-crate calling closures of the downstream crate, 68k at 29 `FnOnce` sites whose slot
-is a per-CGU `VTable` shim. rust-protobuf guards 135 sites; 3 ran (2.6k calls), no
-measurable change (instructions 1.002). `tests/devirt/main.rs` prints the same with
-and without the knob, at O0, with 8 CGUs and through the profile loop.
-Not done: cross-crate candidates (needs the upstream crate's vtable list; LLVM's
-non-LTO ICP has the same limit); xcgu copies of hot targets (a copy has its own
-address, so the guard would need an alias of the home symbol to compare against; one
-kept arm on html-rewriter would gain); devirtualizing through `VTable` shims;
-`tests/devirt/main.rs` is not wired into `test.sh`.
+Two modes, one transform: a `dyn` call becomes `fnptr == &target` guards with direct
+calls, the indirect call always kept as the last arm.
+
+**Profile builds: value-profiled indirect-call promotion, on by default**
+(`PLIRON_DEVIRT=0` disables; it must then be off in both builds). The front end marks
+every virtual call — drop glue included, and with `PLIRON_DEVIRT_FNPTR=1` every call
+through a fn pointer — in `State::icall_sites` and emits the plain indirect call in
+both builds, so CFG fingerprints do not depend on the feature. `pgo::instrument` puts
+`__pliron_prof_icall(site, target)` before each site; the runtime keeps the first 4
+distinct target addresses per site with counts plus an "other" count. Each
+instrumented CGU registers (header magic `PLPROF02`) its site table, a
+`{symbol hash, &fn, flags}` table of its bodies and its symbol names;
+`pliron-prof merge` resolves every recorded address through the tables of all CGUs
+in the dump and writes the sites — target symbol name, defining crate hash (SVH),
+defining CGU, "external" flag, count — in a trailer of the `.prof` (`PLICALL1`; old
+readers stop before it, old profiles simply have no sites). After `pgo::load`,
+`pliron_ir_opt::devirt::promote` rewrites each site: at most `PLIRON_DEVIRT_MAX` (2)
+targets with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the site's calls,
+hottest first. A target is used when `&symbol` is the profiled address and links:
+its body is in this CGU and the address came from this CGU; or it is a symbol of this
+crate another CGU can link (`xcgu::home_linkable` or promoted); or it is external in
+a dependency whose crate hash still equals the one profiled (a profile of an older
+dependency names nothing). Targets in crates that depend on this one (a closure the
+binary passes into a library) need `PLIRON_DEVIRT_DOWNSTREAM=1`: the library object
+then only links into programs defining them. So that targets can be named, both
+builds make vtable slot instances that are `Internal` in exactly one CGU
+hidden-external (`devirt::promotable` -> `xcgu::promoted`): closures, private and
+`#[inline]` impl methods, shims; per-user copies only when their symbol is unique to
+this crate (local definition or generic instance).
+
+**Without a profile: blind guards, opt-in** (`PLIRON_DEVIRT=1`). Candidates are the
+slot instances of the vtables this crate instantiates (`src/devirt.rs` `index`: every
+`Unsize` coercion in the MIR of every mono item, slots resolved with
+`Instance::expect_resolve_for_vtable`), filtered by fn ABI / lowered signature and
+linkability; a site with at most `PLIRON_DEVIRT_MAX` usable candidates gets guards
+(`Builder::devirt_call`), others are left alone.
+
+Measured (release dylib, 2026-11-13). rust-html-rewriter, default loop: 8196 functions
+matched, 0 stale; 69 sites ran, 45 get a guard; 484k profiled indirect calls, 349k
+(72%) now go to a guarded target: all 215k `Fn::call` calls into vtables built in
+the upstream crate, 27.5k of 34k `FnOnce::call_once`, 107k of 235k `FnMut::call_mut`.
+Not guarded: 126k calls of the `&mut dyn FnMut(&[u8])` forwarder whose target is in
+the downstream crate (guarded with `PLIRON_DEVIRT_DOWNSTREAM=1`), 7k where the CGU
+holds its own copy of the target. pgo vs pgo with `PLIRON_DEVIRT=0`, 15 rounds:
+instructions 0.994, cycles 0.970 (noisy machine); with the downstream knob 1.003 —
+a direct call into another crate cannot inline, so it only adds the compare.
+LLVM's ICP on the same program: instructions 0.995. Only 66k of the guarded calls
+have the target's body in the calling CGU (inlinable); 283k are direct calls into
+another crate or CGU.
+`tests/devirt/main.rs` (one crate) and `tests/devirt_xc/` (library + binary: upstream
+vtables, downstream targets) print the same through the loop as without it.
+
+Not done: inlining a promoted target whose body is in another crate or CGU (needs a
+copy with its own name, so the guard can still compare the home address);
+`tests/devirt*` are not wired into `test.sh`; wasm has no value profile.
 
 ## 6. Shared panic tails
 
@@ -140,8 +149,10 @@ Cross-crate rule: eligibility is by the defining crate (the crate being compiled
 Soundness: nothing may assume a `repr(Rust)` order, and `offset_of!`, derives, const eval and debuginfo read the same query. Limits: every non-sysroot crate in the link must be built by this backend with the same file — mixing objects built with and without the knob, with different files, or with stock-rustc dependencies (`crates.py --deps stock`) is unsound and not diagnosed; use a fresh target dir.
 Status (built and run): `tests/field_order/run.sh` (integer widths, arrays, nested structs, `Option<Box<_>>`, generics, niche fields, a `Vec` element, a tuple struct, an unsize-coerced tail) prints identical sizes, alignments and values plain, with heat, and under three order files at `-O` and `-Copt-level=0`; only `offset_of!` lines differ. `PLIRON_FIELD_ORDER_LOG=<file>` lists permuted layouts.
 Profile path, end to end (`PLIRON_PGO` build, run, merge, `PLIRON_PGO_USE` + `PLIRON_FIELD_HEAT`, `PLIRON_PGO_USE` + `PLIRON_FIELD_ORDER`): weights are measured counts; `PLIRON_TRACE=pliron::field_order` shows every `(block, field)` pair mapped to a backend block (pulldown-cmark: 913 counted, 607 count 0, 287 in functions absent from the profile, 0 unmapped); the order file does not stale the profile (matched with/without: pulldown-cmark 2144/2144, rust-html-rewriter 8196/8196, rust-protobuf 1804/1804, 0 stale); stdout matches the expected output.
-Cache benchmark (`tests/field_order/cache.sh`, M3 Max, 128-byte lines, 160/192-byte structs with four hot fields on two lines; plain -> reordered ns/element; stock LLVM equals plain): 20k elements (in L2) gather 2.58 -> 1.07, walk 11.2 -> 9.5, sweep 1.42 -> 1.05; 1M elements gather 14.3 -> 9.4, walk 149 -> 136 (noise-level), sweep 2.59 -> 7.12. So random access gains 35-60%, a linked walk 10-15% in cache, and an out-of-cache sequential sweep gets 2.5x slower — reproduced with stock LLVM and a hand-ordered `repr(C)` struct, so it is the layout (likely, not verified: hot fields packed = one sparse prefetch stream instead of several dense ones). The profile cannot tell a sweep from a gather: the knob stays opt-in.
+Cache benchmark (`tests/field_order/cache.sh`, M3 Max, 128-byte lines, 160/192-byte structs with four hot fields on two lines; plain -> reordered ns/element; stock LLVM equals plain): 20k elements (in L2) gather 2.58 -> 1.07, walk 11.2 -> 9.5, sweep 1.42 -> 1.05; 1M elements gather 14.3 -> 9.4, walk 149 -> 136 (noise-level), sweep 2.59 -> 7.12. So random access gains 35-60%, a linked walk 10-15% in cache, and an out-of-cache sequential sweep gets 2.5x slower — reproduced with stock LLVM and a hand-ordered `repr(C)` struct, so it is the layout (mechanism below). 
 Held-out, profile-weighted heat, cycles reordered/plain: pulldown-cmark 1.014 (5 rounds), rust-html-rewriter 1.006 (15), rust-protobuf 0.989 (15), load average 12-17, noise about 2%: no signal at this data size. Not done: co-access pairs, `PLIRON_FIELD_ORDER_PAD`, wasm, `crates.py --deps pliron`.
+Why the sweep loses, verified (`tests/field_order/sweep.rs`, stock rustc, layout only; ns/element scattered / packed / packed + prefetch 32 ahead / packed + one cold read per 64 bytes): stride 64: 1.2 / 1.2 / 1.5 / 1.2; 128: 2.1 / 4.6 / 4.4 / 2.1; 160: 2.4 / 6.7 / 4.5 / 2.7; 192: 2.7 / 5.3 / 4.0 / 3.0; 256: 3.3 / 5.6 / 4.2 / 3.9; 320: 3.8 / 6.4 / 3.9 / 4.7. The loss starts exactly when the stride skips a 64-byte line and goes away when every line is read again: consecutive lines stream at about 1.1 ns each, skipped lines turn the sweep into one demand miss per element. Software prefetch recovers only part (about 4.2 ns, flat from 32 elements ahead). No miss counters headless.
+Sweep rule (default): heat carries `@seq` / `@rand` per struct (address on an arithmetic recurrence in MIR vs loaded from memory; flow-insensitive, SCC over local dependencies); a struct wider than 64 bytes with more than half its heat sequential keeps rustc's order (`PLIRON_FIELD_ORDER_SEQ=1` overrides, the log says `skip-seq`). Cache benchmark, 1M elements: sweep 2.6-3.6 plain / 2.6-3.2 rule / 7.7-8.3 forced; gather 13.5-17 -> 9.8-12.5. Limits: only shapes MIR inlining exposes; one layout per type. pulldown-cmark and rust-html-rewriter: no struct skipped, output correct.
 
 ## 1. Scoped noalias
 
@@ -203,3 +214,27 @@ iteration against six. Three causes, each fixed behind a knob:
 Repro loop: 10 -> 6 instructions per iteration (LLVM's shape).
 pulldown-cmark, exact, cumulative with the first item:
 56.57M -> 53.78M (x1.248 -> x1.187 of LLVM).
+
+Third item, the scanners' byte predicates: `selset` (default on) turns
+a select-chain membership test (`c == 9 || c == 11 || c == 12 || c ==
+32` after if-conversion) into a range check and a bit test, absorbing
+the single-constant branch left in front. `scan_while::<is_ascii_
+whitespace_no_nl>`: 14 -> 8 instructions a trip, the same code as
+LLVM's, mask included. pulldown-cmark x1.187 -> x1.179. `edgeknown`
+(branch on a block parameter every edge decided) is default on.
+
+Open, with the evidence: `PLIRON_SELKNOWN=1` (opt-in) folds selects
+whose condition a dominating branch or the loop's edges decided — the
+slice iterator's `p' = select (p == end), p, p + 1` inside a loop that
+runs only while `p != end`. It removes the select and its compare, but
+the loop then carries a pointer and a counter that step together, and
+the pipeline retires the *counter*: the count becomes `p - base`,
+computed inside the loop for the exits (`ldrb; add; sub; cmp; b.ne;
+cmp; b.eq; mov; b`, nine instructions; the select form reaches six via
+`base + idx` and `cmpcancel`). Exact counts, pulldown-cmark: fold off
+53.44M (53.30M with `PUNROLL=0`); fold on 53.49M (54.13M with
+`PUNROLL=0`; the cleaned loop also trips the partial unroller). Needed:
+retire the pointer in favour of the counter when both step in lockstep
+(or sink `p - base` to the exits), and keep `punroll` off multi-exit
+byte scans. Repro: scratch `cf.rs` (`closing`), copied to
+`tests/parity/closing.rs`.
