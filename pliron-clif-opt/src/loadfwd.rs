@@ -1132,6 +1132,243 @@ pub fn provescapes(
     Some(ProvEsc { bit, taint, esc })
 }
 
+// ---- Scoped noalias (`PLIRON_SCOPED_NOALIAS=1`, opt-in) ----------------
+//
+// rustc's `noalias` on a callee parameter (`&mut T`, frozen `&T`) says:
+// while the callee runs, memory accessed through pointers based on the
+// parameter is not also modified/accessed through pointers that are not.
+// LLVM drops the fact when the callee is inlined; here it stays attached
+// to the clone's entry parameter `a` (lowering seeds it into
+// `noalias`/`scoped_na` from `State::region_noalias`; its block's
+// lowering-time region is the clone, `scoped_seed`).
+//
+// Rule (`ScopedNa`): a location rooted at `a` survives a store or a call
+// when ALL of these hold, otherwise the ordinary kill rules apply:
+// 1. `a` is still the clone-entry block parameter it was at lowering and
+//    has a single source (`param_src`) that does not concrete to a stack
+//    slot (those locs key under the slot, not `a`).
+// 2. Every use of an `a`-rooted value in the function keeps the pointer
+//    tracked (`isolated_escapes`: load/store address, constant `iadd`,
+//    `icmp`, same-root branch arg) — never stored, never a call operand,
+//    no variable offset. So "based on the parameter" is exactly "roots
+//    at `a`".
+// 3. The store/call sits in a block whose live region is the clone's
+//    region or nested in it (`in_region`): the fact ends when the inlined
+//    body does. Unwind edges and non-plain stores keep killing.
+// 4. The store's address (every operand of the call) is provably not
+//    based on `a` (`foreign`): its bounded backward cone ends only in
+//    load results, call results, function entry parameters and
+//    constants/slot addresses, and never touches `a` or the value `a`'s
+//    source roots at. Loop-carried pointers and anything over budget are
+//    "maybe based on `a`".
+// 5. For a store: its concrete root differs from `a`'s source's (the
+//    same object under its caller-side name uses the offset rules).
+// Only the loc side is immune: a store *through* `a` still kills
+// foreign locs (the caller may read them after the region ends).
+thread_local! {
+    /// Clone-entry `noalias` params of the function the pipeline is
+    /// running on → their region; set by `pipeline::run_pipeline`.
+    static SCOPED_REG: std::cell::RefCell<FxHashMap<Value, Region>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+/// Restores the previous `SCOPED_REG` on drop (panics, nested pipelines).
+pub struct ScopedRegGuard(FxHashMap<Value, Region>);
+
+impl Drop for ScopedRegGuard {
+    fn drop(&mut self) {
+        SCOPED_REG.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+pub fn scoped_enabled() -> bool {
+    pliron_cfg::env_is("PLIRON_SCOPED_NOALIAS", "1")
+}
+
+/// Install `m` (from `scoped_seed`) for the loadfwd runs on this thread
+/// until the guard drops.
+pub fn scoped_enter(m: FxHashMap<Value, Region>) -> ScopedRegGuard {
+    SCOPED_REG.with(|c| ScopedRegGuard(c.replace(m)))
+}
+
+/// The scoped-noalias candidates of a freshly lowered function: each
+/// `scoped_na` value that is a non-entry block param, with its block's
+/// lowering-time region. Taken before any pass runs — later `scoped_na`
+/// members (facts carried onto merge survivors) are not the callee's
+/// parameter and never qualify.
+pub fn scoped_seed(
+    func: &Function,
+    scoped_na: &FxHashSet<Value>,
+    block_region: &FxHashMap<Block, Region>,
+) -> FxHashMap<Value, Region> {
+    let entry = func.layout.entry_block();
+    let mut out = FxHashMap::default();
+    for &v in scoped_na {
+        if let Some(ValueDef::Param(b, _)) = func.dfg.try_value_def(v)
+            && Some(b) != entry
+            && let Some(&r) = block_region.get(&b)
+        {
+            out.insert(v, r);
+        }
+    }
+    out
+}
+
+/// Values walked per `foreign` query.
+const FOREIGN_BUDGET: usize = 32;
+
+/// The qualifying scoped-noalias roots of one loadfwd run (see above).
+struct ScopedNa {
+    /// `a` → (its region, the concrete root of its source).
+    reg: FxHashMap<Value, (Region, Root)>,
+    /// Every `a` and every value an `a`'s source roots at.
+    bad: FxHashSet<Value>,
+    entry: Block,
+    memo: std::cell::RefCell<FxHashMap<Value, bool>>,
+}
+
+impl ScopedNa {
+    fn build(
+        func: &Function,
+        ps: &VMap<Value>,
+        noalias: &FxHashSet<Value>,
+        scoped_na: &FxHashSet<Value>,
+        cfrozen: &FxHashMap<FuncRef, u64>,
+        nocap: &FxHashMap<(Inst, u32), u64>,
+        entry: Block,
+    ) -> Option<ScopedNa> {
+        if !scoped_enabled() {
+            return None;
+        }
+        let seed = SCOPED_REG.with(|c| c.borrow().clone());
+        let mut reg: FxHashMap<Value, (Region, Root)> = FxHashMap::default();
+        for (&a, &r) in &seed {
+            if !scoped_na.contains(&a) || !noalias.contains(&a) {
+                continue;
+            }
+            let Some(ValueDef::Param(b, _)) = func.dfg.try_value_def(a) else {
+                continue;
+            };
+            if b == entry || !func.layout.is_block_inserted(b) || !func.dfg.block_params(b).contains(&a) {
+                continue;
+            }
+            // The caller-side name of `a`'s memory. No single source: no
+            // way to recognise that name; a slot: locs key under it.
+            let (cr, _) = concrete(func, ps, a);
+            if matches!(cr, Root::S(_)) || cr == Root::V(a) {
+                continue;
+            }
+            reg.insert(a, (r, cr));
+        }
+        if reg.is_empty() {
+            return None;
+        }
+        // Rule 2, by the function-wide scan `iso` uses: the candidates
+        // join its candidate set (the other scoped names stay excluded).
+        let rest: FxHashSet<Value> = scoped_na.iter().filter(|v| !reg.contains_key(v)).copied().collect();
+        let (iso, _, _) = isolated_escapes_x(func, noalias, ps, cfrozen, nocap, &rest, false);
+        reg.retain(|a, _| iso.contains(&Root::V(*a)));
+        if reg.is_empty() {
+            return None;
+        }
+        let mut bad: FxHashSet<Value> = reg.keys().copied().collect();
+        for &(_, cr) in reg.values() {
+            if let Root::V(x) = cr {
+                bad.insert(x);
+            }
+        }
+        Some(ScopedNa { reg, bad, entry, memo: Default::default() })
+    }
+
+    /// Rule 4: `v` is provably not based on any scoped root.
+    fn foreign(&self, func: &Function, ps: &VMap<Value>, v: Value) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if let Some(&m) = self.memo.borrow().get(&v) {
+            return m;
+        }
+        let mut stack = vec![v];
+        let mut seen: Vec<Value> = Vec::new();
+        let mut ok = true;
+        while let Some(x) = stack.pop() {
+            let x = func.dfg.resolve_aliases(x);
+            if self.bad.contains(&x) {
+                ok = false;
+                break;
+            }
+            match self.memo.borrow().get(&x) {
+                Some(true) => continue,
+                Some(false) => {
+                    ok = false;
+                    break;
+                }
+                None => {}
+            }
+            if seen.contains(&x) {
+                continue;
+            }
+            if seen.len() >= FOREIGN_BUDGET {
+                ok = false;
+                break;
+            }
+            seen.push(x);
+            match func.dfg.value_def(x) {
+                ValueDef::Param(b, _) if b == self.entry => {}
+                // A single-source param is its source; a real merge may
+                // carry anything.
+                ValueDef::Param(..) => match ps.get(&x) {
+                    Some(&s) if s != x => stack.push(s),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                },
+                ValueDef::Result(i, _) => {
+                    let op = func.dfg.insts[i].opcode();
+                    // Loads and calls launder: an `a`-based pointer never
+                    // reaches memory or a callee (rule 2).
+                    if !(op.is_call() || op.can_load()) {
+                        stack.extend(func.dfg.inst_args(i).iter().copied());
+                    }
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let mut memo = self.memo.borrow_mut();
+        if ok {
+            for x in seen {
+                memo.insert(x, true);
+            }
+        } else {
+            memo.insert(v, false);
+        }
+        ok
+    }
+
+    /// Locs rooted at a scoped root whose region contains `cur` (rule 3),
+    /// minus those whose caller-side root is `wr` (rule 5).
+    fn sheltered(
+        &self,
+        av: &Avail,
+        cur: Region,
+        rpar: &pliron::cols::ColMap<Region, Region>,
+        wr: Option<Root>,
+    ) -> Vec<(Loc, Value)> {
+        av.iter()
+            .filter(|((r, _, _), _)| match r {
+                Root::V(a) => self
+                    .reg
+                    .get(a)
+                    .is_some_and(|&(t, cr)| Some(cr) != wr && in_region(cur, t, rpar)),
+                _ => false,
+            })
+            .map(|(&l, &v)| (l, v))
+            .collect()
+    }
+}
+
 /// Run `b`'s transfer function; with `rw`, record forwarded loads.
 /// `load (select c, pa, pb)` with both arms forwarding: the result is
 /// `select c, aval(pa), aval(pb)`. Keeps the select to scalar types the
@@ -1200,6 +1437,7 @@ fn transfer(
     pm: &VMap<(Root, i64)>,
     eh: bool,
     nm: &NrMemo,
+    sc: Option<&ScopedNa>,
 ) {
     let mut rw = rw;
     // `na` is `na0` plus the `ofrozen` stop names (`run`'s `stop`): any
@@ -1367,6 +1605,17 @@ fn transfer(
                     Root::V(rv) => ms_of(rv, o),
                     _ => None,
                 };
+                // `PLIRON_SCOPED_NOALIAS`: locs of an inlined callee's
+                // `noalias` param outlive a store through a pointer not
+                // based on it, inside the clone (`ScopedNa`). Put back
+                // after the kills below.
+                let kept: Vec<(Loc, Value)> = match (sc, cur) {
+                    (Some(sc), Some(cur)) => {
+                        let k = sc.sheltered(av, cur, rpar, Some(concrete(func, ps, args[1]).0));
+                        if !k.is_empty() && sc.foreign(func, ps, args[1]) { k } else { Vec::new() }
+                    }
+                    _ => Vec::new(),
+                };
                 kill(av, r, o, ty, ms, iso, ncc, invs, cur, invreg, rpar);
                 // `na` includes `ofrozen` stops but `iso`/`ncc` classify
                 // under `na0` — the same memory can carry two root names.
@@ -1421,12 +1670,30 @@ fn transfer(
                         }
                     }
                 }
+                for (l, v) in kept {
+                    av.insert(l, v);
+                }
                 if av.len() < MAX_ENTRIES {
                     av.insert((r, o, ty), val);
                 }
             }
             _ if op.is_call() => {
                 if !write_free(func, i, nw, eh) {
+                    // `PLIRON_SCOPED_NOALIAS`: the same for a call inside
+                    // the clone none of whose operands is based on the
+                    // param — it was never stored or passed anywhere, so
+                    // the callee holds no pointer based on it.
+                    let kept: Vec<(Loc, Value)> = match (sc, cur) {
+                        (Some(sc), Some(cur)) => {
+                            let k = sc.sheltered(av, cur, rpar, None);
+                            if !k.is_empty() && func.dfg.inst_values(i).all(|v| sc.foreign(func, ps, v)) {
+                                k
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
                     // Roots this call can reach through its args: a
                     // `nocapture` callee can't stash the pointer, but it
                     // may still write the pointee — drop `ncc` locs the
@@ -1461,6 +1728,9 @@ fn transfer(
                         };
                         keep || kreg
                     });
+                    for (l, v) in kept {
+                        av.insert(l, v);
+                    }
                 }
             }
             _ if op.can_store()
@@ -1705,6 +1975,9 @@ pub fn run_deref(
     // One root-walk memo for the whole fixpoint + scan pair — `ps`/
     // `stop`/`fbnd`/`fpm` are fixed for this phase.
     let nm = NrMemo::default();
+    // `PLIRON_SCOPED_NOALIAS`: after `pre`, so the escape scan sees the
+    // function the fixpoint runs on.
+    let sc = ScopedNa::build(func, ps, noalias, scoped_na, cfrozen, nocap, entry);
     while let Some(b) = work.pop_front() {
         inq.remove(&b);
         let Some(mut av) = input(&out, b) else {
@@ -1732,6 +2005,7 @@ pub fn run_deref(
             fpm,
             eh,
             &nm,
+            sc.as_ref(),
         );
         if out.get(&b) != Some(&av) {
             out.insert(b, av);
@@ -1784,6 +2058,7 @@ pub fn run_deref(
                 fpm,
                 eh,
                 &nm,
+                sc.as_ref(),
             );
         }
     }
@@ -2672,6 +2947,7 @@ fn pre(
             pm,
             eh,
             &nm,
+            None,
         );
         let ks: FxHashSet<Loc> = av.into_keys().collect();
         if out.get(&b) != Some(&ks) {
@@ -2739,6 +3015,7 @@ fn pre(
             pm,
             eh,
             &nm,
+            None,
         );
         av.get(&loc).copied()
     };
@@ -2765,6 +3042,7 @@ fn pre(
             pm,
             eh,
             &nm,
+            None,
         );
         av.get(&loc) == Some(&Value::reserved_value())
     };

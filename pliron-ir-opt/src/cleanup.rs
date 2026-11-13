@@ -415,6 +415,7 @@ fn merge_blocks(ctx: &mut Context, st: &mut State, pure: &Pure, f: Ptr<Operation
             || st.promoted.contains(v)
             || st.allocas.contains(v)
     };
+    let scoped_noalias = crate::env_is("PLIRON_SCOPED_NOALIAS", "1");
     let mut n = 0;
     for &b in &bs {
         if b == entry || !b.is_live(ctx) || pads.contains(&b) {
@@ -447,6 +448,13 @@ fn merge_blocks(ctx: &mut Context, st: &mut State, pure: &Pure, f: Ptr<Operation
         // from the callsite block), so licm's in-region test can't newly
         // pass; where `b` was the deeper region the test only gets stricter.
         if st.region_parent.contains(b) {
+            continue;
+        }
+        // `PLIRON_SCOPED_NOALIAS=1`: a region tag also scopes a `noalias`
+        // fact loadfwd uses against stores and calls, so a block must not
+        // take a region it was not cloned into (the caller's continuation
+        // joining the clone's last block would run "inside" the callee).
+        if scoped_noalias && st.region_blocks.get(b) != st.region_blocks.get(a) {
             continue;
         }
         let args: Vec<Value> = b.deref(ctx).arguments(ctx).collect();

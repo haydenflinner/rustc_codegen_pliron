@@ -3184,6 +3184,18 @@ fn frozen_args(
     // `inline_call` branches to `entry` with `args` positionally, so the
     // entry arg at index k is bound to `call_args[k]`.
     let eargs: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
+    // `PLIRON_SCOPED_NOALIAS=1` turns the records below into alias facts
+    // loadfwd acts on (`pliron-clif-opt` `loadfwd::ScopedNa`: inside this
+    // clone a `noalias` param's pointee is not touched through pointers
+    // not based on it). The leaf indices describe the declared ABI, so
+    // take them only when the clone's entry still has that layout (as
+    // `nonnull_args` checks); otherwise record nothing for this clone.
+    if crate::env_is("PLIRON_SCOPED_NOALIAS", "1") && !(f.frozen.is_empty() && f.noalias.is_empty()) {
+        let nleaves: usize = eargs.iter().map(|a| crate::types::leaves(ctx, a.get_type(ctx)).len()).sum();
+        if nleaves != f.nparams || eargs.len() != call_args.len() {
+            return;
+        }
+    }
     for &(leaf, bytes) in &f.frozen {
         let Some((a, sub)) = leaf_arg(ctx, entry, leaf) else {
             if dbg {

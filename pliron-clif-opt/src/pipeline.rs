@@ -1174,6 +1174,12 @@ pub fn run_pipeline(p: &mut Pipe) {
         }
         p.inst_region = m;
     }
+    // `PLIRON_SCOPED_NOALIAS=1`: the inlined callees' `noalias` params and
+    // their regions as lowered, for loadfwd (`loadfwd::ScopedNa`). Taken
+    // here because later `scoped_na` members are carried facts, not params.
+    let _scoped = loadfwd::scoped_enabled().then(|| {
+        loadfwd::scoped_enter(loadfwd::scoped_seed(&p.clctx.func, p.scoped_na, p.block_region))
+    });
     match crate::diffcheck::mode_for(p.fname) {
         None => {
             run_steps(p, false);
