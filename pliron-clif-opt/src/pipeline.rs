@@ -5262,7 +5262,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `brif flag, return, return` on void-forwarder and drop-free
         // exits) collapses to `jump`, freeing the whole flag chain. Own
         // step: mergechain's `brif_fold` never sees single-brif fns.
-        step("commonret", "commonret", Gate::OptIn("PLIRON_COMMONRET"), s_commonret)
+        step("commonret", "commonret", Gate::Env("PLIRON_COMMONRET"), s_commonret)
             .needs(shape::CONDBR),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.

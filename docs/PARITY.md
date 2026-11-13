@@ -557,10 +557,16 @@ in the scoreboard and in the linked history files.
   emulated raise is a TLS store; a write-free callee can contain
   none) — nounwind inference already covered `nounwind` callees;
   `stubhoist` sweeps orphaned forwarder blocks unconditionally.
-  Import/indirect calls keep the check — a foreign callee can
-  call back into pliron code that raises (the `sort_by` callback
-  case), so they legitimately maythrow. The remaining big lever
-  is real SEH (`docs/seh-design.md`, unlanded).
+  `commonret` (default-on, `PLIRON_COMMONRET=0` off) folds
+  `brif c, A, B` whose arms are the same `return` — the
+  `brif flag, return, return` `eh_check` shape on drop-free/void
+  exits — and the flag load is `MemFlagsData::trusted` so the
+  dead check DCEs: `__rust_dealloc` 49 B → 13 B, probe text
+  5254 → 5023 B (-4.4%). Import/indirect calls keep the check —
+  a foreign callee can call back into pliron code that raises
+  (the `sort_by` callback case), so they legitimately maythrow.
+  The remaining big lever is real SEH (`docs/seh-design.md`,
+  unlanded).
 - **wasm.** Op density, not dead code: `local.get`/`local.set`, `br` and
   `if`/`else` counts are several times LLVM's (see the runtime entry on
   local traffic). The default-on wasm size set (`PLIRON_WASM_NOIRRED`,
