@@ -68,6 +68,8 @@ def side(env):
 
 
 def measure(prog, binary, sides, rounds, backend):
+    # A search builds dozens of sides at ~240 MB each: keep few.
+    ab.prune({ab.side_env(prog, s, backend)[0] for s in sides}, limit=6)
     exes = {s: ab.ensure(prog, binary, s, backend) for s in sides}
     data = {s: [] for s in sides}
     for r in range(rounds):
