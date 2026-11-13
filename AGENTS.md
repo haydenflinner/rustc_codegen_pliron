@@ -185,6 +185,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   `clif-check report target/corpus/std out.json --check` runs the whole
   pipeline + an interpreter diff on every function in parallel (~7 s
   for std). Re-record after lowering or IR-opt changes.
+  `PLIRON_VERIFY=full` adds the verifier after every step (a failing
+  step is a `panic` row naming it; the gate and quick set it), `--every
+  N` replays a sample. `harness/corpus.sh clcg` records our vendored
+  cranelift-codegen and its dependencies (~38k functions, ~1.5 min):
+  compiling our own crates found bugs std does not show. The gate
+  replays every 8th function of it (~20 s), `gate.py --full` all of it.
 - **Real crates**: `harness/crates.py [--tier 1|2|3] [--only a,b]
   [--deps stock|pliron]` runs pinned crates' own test suites
   (`--release`) under stock and pliron and reports pliron-only failures,
@@ -332,6 +338,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   byte-scan loop work of 2026-11-13
   (`docs/history/2026-11-13-six-features.md`, "Fourth item"), each
   default on.
+- `PLIRON_PUNROLL_COUNTED=1` (opt-in) — `punroll` also group-unrolls
+  plain counted loops whose trip count is neither measured nor a
+  constant (the default until 2026-11-13; off: rust-protobuf -0.7%,
+  html-rewriter -0.4% exact). Under a profile the floor is
+  `PLIRON_PUNROLL_MINTRIP` (default 4 average trips);
+  `PLIRON_PEEL_MINTRIP` (default 0) is the same for peeling.
+- `PLIRON_LOOPROT_MERGE=1` (opt-in) — one latch for a loop with several
+  back edges so `looprot` can rotate it; mixed exact counts (see
+  `looprot::merge_latches`).
+- `PLIRON_ALLOC_JMP=0`, `PLIRON_VEC_SHORT=0`, `PLIRON_SELXOR=0`,
+  `PLIRON_LICM_DOMCOND=0` — off switches for the allocator shim as one
+  jump (aarch64), `loopvec`'s short-trip dispatch, the zigzag select
+  fold, and the dominated-branch fold ahead of LICM
+  (`docs/history/2026-11-13-six-features.md`, "Fifth item").
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
   functions get 2x their callsite limit (the body dies when all sites
   inline, LLVM's last-callsite bonus generalised). Reaches

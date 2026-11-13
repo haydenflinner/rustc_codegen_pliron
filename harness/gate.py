@@ -20,9 +20,13 @@ Runs, after one `cargo build`:
   <stanza>  every `./test.sh` stanza (nostd, std, licm, ...) as its own
             job — TEST_NOBUILD=1 ./test.sh --only=<stanza>
   corpus:*  `clif-check report --check` over each recorded corpus under
-            target/corpus/ (harness/corpus.sh); fails on any verifier error,
+            target/corpus/ (harness/corpus.sh), with the verifier after
+            every step (PLIRON_VERIFY=full); fails on any verifier error,
             panic, or interpreter mismatch not listed in
-            harness/expectations/corpus-known.txt
+            harness/expectations/corpus-known.txt. A corpus over
+            CORPUS_SAMPLE_OVER functions (`harness/corpus.sh clcg`:
+            cranelift-codegen, ~38k) is sampled, every Nth function, to
+            about that many; `--full` replays all of it (~1 min more).
 The `wasm` stanza (tests/wasm/run.sh) is OFF by default: it rebuilds core/std
 through the backend for every backend change (~4 min). The default gate runs
 `wasm_smoke` — emit->link->run, ~1 s — instead. `--full` or `--only wasm`
@@ -116,10 +120,21 @@ def run(name, cmd, env=None, timeout=1800):
     return {"job": name, "ok": rc == 0, "rc": rc, "secs": round(time.time() - t, 1), "log": log}
 
 
-def corpus_job(dirname):
+# A corpus with more functions than this is replayed as a sample of about
+# this many (every Nth file of the sorted list; `--full` replays it all).
+CORPUS_SAMPLE_OVER = 5000
+
+
+def corpus_job(dirname, full=False):
     name = f"corpus:{dirname}"
     out = os.path.join(OUT, f"corpus_{dirname}.json")
-    res = run(name, [CLIF_CHECK, "report", os.path.join(ROOT, "target/corpus", dirname), out, "--check"])
+    src = os.path.join(ROOT, "target/corpus", dirname)
+    n = sum(f.endswith(".clif") for _, _, fs in os.walk(src) for f in fs)
+    every = 1 if full else max(1, round(n / CORPUS_SAMPLE_OVER))
+    # The verifier after every step: a step that leaves invalid IR which a
+    # later step happens to clean up is otherwise invisible to a replay
+    # (webmerge on a dead self-loop, found compiling cranelift-codegen).
+    res = run(name, [CLIF_CHECK, "report", src, out, "--check", "--every", str(every)], {"PLIRON_VERIFY": "full"})
     known = set()
     if os.path.exists(KNOWN):
         known = {l.split("#")[0].strip() for l in open(KNOWN)} - {""}
@@ -153,7 +168,7 @@ def main():
     ap.add_argument("--skip", default="")
     ap.add_argument("--only", default="")
     ap.add_argument("--full", action="store_true",
-                    help="include heavyweight legs off by default (wasm sysroot builds)")
+                    help="include heavyweight legs off by default (wasm sysroot builds, whole big corpora)")
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--install-hook", action="store_true")
     a = ap.parse_args()
@@ -230,7 +245,7 @@ def main():
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
         if want(f"corpus:{d}"):
-            jobs.append((f"corpus:{d}", lambda d=d: corpus_job(d)))
+            jobs.append((f"corpus:{d}", lambda d=d: corpus_job(d, a.full)))
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         futs = {ex.submit(fn): n for n, fn in jobs}
         for fut in cf.as_completed(futs):

@@ -60,13 +60,50 @@ pub struct Facts<'a> {
     /// self-recursion is interpreted instead of stubbed. Defaults to the
     /// function's `name`.
     pub self_name: Option<String>,
-    /// Derived pointer → its base, as the pipeline tracks them. Not used by
-    /// the check; saved in repros so `clif-check` replays a step faithfully.
+    /// Derived pointer → its base, as the pipeline tracks them: an inbounds
+    /// offset, non-null whenever its base is (`jumpthread::NonNull`). The
+    /// original computing 0 from a non-zero base is undefined behavior
+    /// (the run stops); also saved in repros so `clif-check` replays a
+    /// step faithfully.
     pub derived: Option<&'a VMap<Value>>,
     /// Callees that are libc's `memcmp`/`bcmp` under a user symbol: run
     /// like the `Memcmp` libcall, not stubbed, so expanding one inline
     /// (`memcmpk`) compares like for like.
     pub memcmp: FxHashSet<FuncRef>,
+    /// `(callee as calls spell it, argument index)` → the most bytes any
+    /// call of it may reach through that pointer operand (`Pipe::nocap`'s
+    /// extents, see [`stub_extents`]): slotprom keeps the fields beyond it
+    /// in registers across the call, so the stub's fill stops there too.
+    /// An operand not listed is unbounded.
+    pub stub_extent: FxHashMap<(String, u32), u64>,
+}
+
+/// [`Facts::stub_extent`] for `func`: per direct callee and argument, the
+/// largest extent over its call sites, where `extent(call, arg)` is the
+/// bound known for that site (`None`: the callee may reach anything). An
+/// operand unbounded at any one site stays unbounded.
+pub fn stub_extents(
+    func: &Function,
+    extent: impl Fn(Inst, u32) -> Option<u64>,
+) -> FxHashMap<(String, u32), u64> {
+    let mut out: FxHashMap<(String, u32), u64> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let (InstructionData::Call { func_ref, .. } | InstructionData::TryCall { func_ref, .. }) =
+                func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let name = func.dfg.ext_funcs[func_ref].name.display(Some(&func.params)).to_string();
+            for k in 0..func.dfg.inst_args(i).len() as u32 {
+                let e = extent(i, k).unwrap_or(u64::MAX);
+                let slot = out.entry((name.clone(), k)).or_insert(e);
+                *slot = (*slot).max(e);
+            }
+        }
+    }
+    out.retain(|_, e| *e != u64::MAX);
+    out
 }
 
 pub struct Config {
@@ -213,15 +250,22 @@ pub fn check(
                 // real bytes, not the zero fill). Re-run `before` under a
                 // different stack fill; `a` must match on every byte the
                 // original itself kept stable.
+                // The same for stack addresses: a pass may move a slot
+                // (slotmerge), and `end - buf` of a stubbed call's result
+                // then differs by the move (serde_json `Number`'s
+                // `Display`: ryu's returned length). The re-run also
+                // shifts every slot, so bytes that depend on where the
+                // frame's slots sit are not pinned either.
                 let world1 = World {
                     stack_fill: 0xa5,
+                    slot_pad: 0x25,
                     ..world.clone()
                 };
                 let b1 = run(before, &world1, &nowrite_names, &self_name, cfg.fuel, true);
                 if underdetermined(&a, &b, &b1) {
                     sum.inconclusive += 1;
                     sum.why.get_or_insert_with(|| {
-                        "before's output depends on uninit stack bytes".into()
+                        "before's output depends on uninit stack bytes or slot addresses".into()
                     });
                 } else {
                     return Err(Mismatch {
@@ -318,7 +362,7 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
     else {
         return false;
     };
-    if ra.len() != r0.len() || ca.len() != c0.len() {
+    if ra.len() != r0.len() {
         return false;
     }
     // `v0`'s byte k is determined iff the two original runs agree on it;
@@ -337,9 +381,6 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
                         .all(|k| n0[k] != n1[k] || na[k] == n0[k])
             })
     };
-    if !lanes_ok(ra, r0, r1) {
-        return false;
-    }
     for ((x0, x1), ya) in c0.iter().zip(c1).zip(ca) {
         if x0.0 != x1.0 {
             return true; // the original's call sequence is fill-dependent
@@ -350,6 +391,19 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
         if !lanes_ok(&ya.1, &x0.1, &x1.1) {
             return false;
         }
+        // The original handed this callee a value it never determined.
+        // A stub's results and writes are a hash of its arguments, so
+        // from here on the two original runs agree only by chance (a
+        // one-bit `bool` result half the time): nothing later is pinned.
+        if x0.1.iter().map(norm).ne(x1.1.iter().map(norm)) {
+            return true;
+        }
+    }
+    if ca.len() != c0.len() {
+        return false;
+    }
+    if !lanes_ok(ra, r0, r1) {
+        return false;
     }
     // Written bytes, by address. A fill-dependent write set means the
     // original's memory traffic itself is underdetermined.
@@ -422,11 +476,19 @@ struct World {
     /// re-runs `before` under a different fill on a mismatch to find
     /// output bytes the original never determined.
     stack_fill: u8,
+    /// Unused pages ahead of the first stack slot in every frame. Normally
+    /// 0; the re-run of `before` moves the slots with it.
+    slot_pad: u64,
     /// Values the optimizer may assume nonzero (`!nonnull` loads too): a
     /// load that yields 0 into one is undefined behavior, so the run stops.
     nonnull: FxHashSet<Value>,
+    /// `Facts::derived`: inbounds offset → base. An offset that comes out
+    /// 0 from a non-zero base is undefined behavior, so the run stops.
+    derived: FxHashMap<Value, Value>,
     /// `Facts::memcmp` callees as call names spell them.
     memcmp: FxHashSet<String>,
+    /// `Facts::stub_extent`.
+    extent: FxHashMap<(String, u32), u64>,
 }
 
 impl World {
@@ -495,13 +557,19 @@ impl World {
             stack_fill: crate::config::env_get("PLIRON_DIFFCHECK_FILL")
                 .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0),
+            slot_pad: 0,
             nonnull: facts.nonnull.cloned().unwrap_or_default(),
+            derived: facts
+                .derived
+                .map(|d| d.iter().map(|(v, &b)| (v, b)).collect())
+                .unwrap_or_default(),
             memcmp: facts
                 .memcmp
                 .iter()
                 .filter_map(|fr| f.dfg.ext_funcs.get(*fr))
                 .map(|d| d.name.display(Some(&f.params)).to_string())
                 .collect(),
+            extent: facts.stub_extent.clone(),
         }
     }
 }
@@ -703,9 +771,14 @@ struct Sandbox<'a> {
     calls: Vec<(String, Vec<DataValue>)>,
     nowrite: &'a FxHashSet<String>,
     nonnull: &'a FxHashSet<Value>,
+    /// Empty unless this run checks the facts (the original).
+    derived: &'a FxHashMap<Value, Value>,
     memcmp: &'a FxHashSet<String>,
+    extent: &'a FxHashMap<(String, u32), u64>,
     seed: u64,
     stack_fill: u8,
+    /// `World::slot_pad`.
+    slot_pad: u64,
     pinned: DataValue,
     /// Last address a load or store fell outside the sandbox at.
     fault: Cell<Option<u64>>,
@@ -1018,13 +1091,14 @@ fn run_inner(
     check_nonnull: bool,
 ) -> Outcome {
     let no_facts = FxHashSet::default();
+    let no_derived = FxHashMap::default();
     // Stack frame: one fixed-stride page per slot. Packing by declared
     // size would let a pass that shrinks a dead slot (slotmerge) shift
     // every later slot's seeded bytes — bytes the function never wrote
     // but may read back (e.g. after a callee fills them through an
     // escaped pointer) — a false mismatch.
     let mut slot_off = FxHashMap::default();
-    let mut off = 0u64;
+    let mut off = world.slot_pad * 0x1000;
     for (slot, _d) in f.sized_stack_slots.iter() {
         slot_off.insert(slot, off);
         off += 0x1000;
@@ -1044,9 +1118,16 @@ fn run_inner(
         } else {
             &no_facts
         },
+        derived: if check_nonnull {
+            &world.derived
+        } else {
+            &no_derived
+        },
         memcmp: &world.memcmp,
+        extent: &world.extent,
         seed: world.seed,
         stack_fill: world.stack_fill,
+        slot_pad: world.slot_pad,
         pinned: DataValue::I64(0),
         fault: Cell::new(None),
     };
@@ -1158,6 +1239,25 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
                 {
                     return Err(Stop::Trap(format!("nonnull load {r} yielded 0")));
                 }
+                // An inbounds offset of a non-null base is non-null
+                // (`derived`); passes fold `offset == 0` on that. A stub
+                // call returning 32 into `p - 32` breaks the premise, not
+                // the pass (hashbrown's `next().map(|b| b.as_ptr())`
+                // under `DebugMap::entries`).
+                if matches!(vals.first(), Some(DataValue::I64(0)))
+                    && let Some(&r) = f.dfg.inst_results(i).first()
+                    && let Some(&base) = s.derived.get(&r)
+                    && let Some(base) = f.dfg.try_resolve_aliases(base)
+                    && f.dfg.value_is_valid(base)
+                    && matches!(
+                        s.current_frame_mut().entries_mut().get(base.index()),
+                        Some(Some(DataValue::I64(b))) if *b != 0
+                    )
+                {
+                    return Err(Stop::Trap(format!(
+                        "inbounds offset {r} of non-null {base} yielded 0"
+                    )));
+                }
                 s.current_frame_mut()
                     .set_all(f.dfg.inst_results(i), vals.to_vec());
                 inst = f.layout.next_inst(i);
@@ -1263,6 +1363,11 @@ fn stub(
         for (k, a) in orig_args.iter().enumerate() {
             if let DataValue::I64(p) = a {
                 let p = *p as u64;
+                // The callee reaches at most this many bytes through the
+                // operand (`&mut RawVecInner` inside a `String` slot: 16
+                // of its 24; the `len` beyond is the caller's to keep in
+                // a register).
+                let ext = s.extent.get(&(name.clone(), k as u32)).copied().unwrap_or(u64::MAX);
                 if (STACK_BASE..STACK_BASE + 0x1000_0000).contains(&p) {
                     // Frame pointer: bound the fill to the containing
                     // slot's extent so it can't spill into a neighbor.
@@ -1274,7 +1379,9 @@ fn stub(
                     if fidx as usize >= s.frames.len() {
                         continue;
                     }
-                    let rel = (d % s.frame_size) / 0x1000;
+                    let Some(rel) = ((d % s.frame_size) / 0x1000).checked_sub(s.slot_pad) else {
+                        continue;
+                    };
                     let in_off = (d % s.frame_size) % 0x1000;
                     let Some((slot, _)) = s.func.sized_stack_slots.iter().nth(rel as usize) else {
                         continue;
@@ -1283,7 +1390,7 @@ fn stub(
                     if in_off >= sz {
                         continue;
                     }
-                    let n = (sz - in_off).min(64) as usize;
+                    let n = (sz - in_off).min(64).min(ext) as usize;
                     let v: Vec<u8> = (0..n)
                         .map(|j| (mix(h, k as u64) >> ((j % 8) * 8)) as u8 ^ j as u8)
                         .collect();
@@ -1295,7 +1402,7 @@ fn stub(
                 let writable = s
                     .find(p, 8)
                     .is_some_and(|(base, r)| r.stub_writable && base < STACK_BASE);
-                if writable {
+                if writable && ext >= 8 {
                     let v = mix(h, k as u64).to_le_bytes();
                     s.bytes_mut(p, 8).unwrap().copy_from_slice(&v);
                 }
@@ -1541,6 +1648,11 @@ pub struct OwnedFacts {
     pub frozen: FxHashMap<Value, u64>,
     pub nowrite: FxHashMap<FuncRef, bool>,
     pub self_name: Option<String>,
+    /// The symbol a corpus dump's `self=` held, once [`Self::bind_self`]
+    /// has turned `self_name` into the `u0:<FuncId>` spelling.
+    pub self_symbol: Option<String>,
+    /// [`Facts::stub_extent`], filled by [`Self::bind_self`] from `nocap`.
+    pub stub_extent: FxHashMap<(String, u32), u64>,
     pub derived: VMap<Value>,
     /// `(FuncRef, arg-index, extent)` triples a `; diffcheck-nocap:`
     /// header records; applied to every direct callsite of that callee
@@ -1564,6 +1676,40 @@ pub struct OwnedFacts {
 }
 
 impl OwnedFacts {
+    /// A corpus dump records `self=<symbol>`, a diffcheck repro
+    /// `self=u0:<FuncId>`; callees are spelled `u0:<FuncId>` in both. Turn
+    /// the symbol into that spelling through the `names` header, so a
+    /// replay knows which calls are self-calls: `tailrec` keys on the
+    /// `FuncId` and the interpreter runs self-recursion for real. A
+    /// function that never calls itself has no id in the text: `self_name`
+    /// becomes `None` (the caller must then not invent an id — defaulting
+    /// to 0 made `tailrec` loop on calls to whichever callee was `u0:0`).
+    pub fn bind_self(&mut self, func: &Function) {
+        // The `nocap` header is per callee (every direct call of it).
+        let mut by_callee: FxHashMap<(FuncRef, u32), u64> = FxHashMap::default();
+        for &(fr, a, e) in &self.nocap {
+            let x = by_callee.entry((fr, a)).or_insert(e);
+            *x = (*x).max(e);
+        }
+        self.stub_extent = stub_extents(func, |i, k| match func.dfg.insts[i] {
+            InstructionData::Call { func_ref, .. } | InstructionData::TryCall { func_ref, .. } => {
+                by_callee.get(&(func_ref, k)).copied()
+            }
+            _ => None,
+        });
+        let Some(sym) = self.self_name.take_if(|n| !n.starts_with("u0:")) else {
+            return;
+        };
+        self.self_name = self.names.iter().find(|(_, n)| *n == sym).and_then(|(fr, _)| {
+            let ExternalName::User(u) = func.dfg.ext_funcs.get(*fr)?.name else {
+                return None;
+            };
+            let un = &func.params.user_named_funcs()[u];
+            (un.namespace == 0).then(|| format!("u0:{}", un.index))
+        });
+        self.self_symbol = Some(sym);
+    }
+
     pub fn facts(&self) -> Facts<'_> {
         Facts {
             nonnull: Some(&self.nonnull),
@@ -1580,6 +1726,7 @@ impl OwnedFacts {
                 .filter(|(_, n)| n == "memcmp" || n == "bcmp")
                 .map(|(r, _)| *r)
                 .collect(),
+            stub_extent: self.stub_extent.clone(),
         }
     }
 

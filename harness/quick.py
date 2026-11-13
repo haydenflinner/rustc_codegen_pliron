@@ -266,7 +266,8 @@ class Runner:
             self.report({"job": job, "ok": True, "secs": 0.0, "log": "", "skipped": "no corpus (harness/corpus.sh)"})
             return
         out = os.path.join(OUT, f"corpus_{name}.json")
-        r = self.sh(job, [self.cc, "report", d, out, "--check"], quiet=True)
+        # The verifier after every step, as in the gate's corpus jobs.
+        r = self.sh(job, [self.cc, "report", d, out, "--check"], env={"PLIRON_VERIFY": "full"}, quiet=True)
         t = r["secs"]
         known = set()
         kp = os.path.join(ROOT, "harness/expectations/corpus-known.txt")

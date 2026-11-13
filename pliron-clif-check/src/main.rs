@@ -18,7 +18,11 @@
 //!                                          also weighted 8^loop-depth (the
 //!                                          register-allocation score)
 //!                                          (--check: also diffcheck each fn,
-//!                                          --jobs N, --limit N)
+//!                                          --jobs N, --limit N, --every N:
+//!                                          each Nth file of the sorted list;
+//!                                          PLIRON_VERIFY=full: the verifier
+//!                                          after every step, a failure is a
+//!                                          `panic` row naming the step)
 //!   clif-check steps                       list step names
 //!
 //! Options (after the subcommand args): --trials N, --seed N, --fuel N, --print.
@@ -41,6 +45,8 @@ struct Opts {
     check: bool,
     jobs: usize,
     limit: usize,
+    /// `report`/`codegen`: every Nth file (a deterministic sample of a big corpus).
+    every: usize,
 }
 
 #[global_allocator]
@@ -69,6 +75,7 @@ fn main() -> ExitCode {
         check: false,
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         limit: usize::MAX,
+        every: 1,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -85,6 +92,7 @@ fn main() -> ExitCode {
             "--check" => opts.check = true,
             "--jobs" => opts.jobs = num().max(1) as usize,
             "--limit" => opts.limit = num() as usize,
+            "--every" => opts.every = num().max(1) as usize,
             _ => pos.push(a.clone()),
         }
     }
@@ -214,7 +222,16 @@ fn load(path: &Path) -> (Function, OwnedFacts) {
     let mut fs = cranelift_reader::parse_functions(&text)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     assert!(!fs.is_empty(), "{}: no function", path.display());
-    (fs.remove(0), OwnedFacts::parse(&text))
+    let func = fs.remove(0);
+    let facts = parse_facts(&text, &func);
+    (func, facts)
+}
+
+/// A file's fact headers, with `self=` bound to the function's own id.
+fn parse_facts(text: &str, func: &Function) -> OwnedFacts {
+    let mut facts = OwnedFacts::parse(text);
+    facts.bind_self(func);
+    facts
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -282,7 +299,8 @@ fn with_pipe<R>(
         .and_then(|n| n.strip_prefix("u0:"))
         .and_then(|n| n.parse().ok())
         .map(FuncId::from_u32)
-        .unwrap_or(FuncId::from_u32(0));
+        // No self-call in the text: an id no callee can have.
+        .unwrap_or(FuncId::from_u32(u32::MAX - 1));
     let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
     let (e1, e2, e3, mut e5, mut e6, mut e7, e8): (
         _,
@@ -435,8 +453,10 @@ fn with_pipe<R>(
         has_eh: false,
         flags: &flags,
         // `PLIRON_CLIF=<substr of the file's self name>` dumps steps.
-        dump: std::env::var("PLIRON_CLIF").is_ok_and(|f| facts.self_name.as_deref().is_some_and(|n| n.contains(&f))),
-        verify_full: false,
+        dump: std::env::var("PLIRON_CLIF").is_ok_and(|f| facts.self_symbol.as_deref().or(facts.self_name.as_deref()).is_some_and(|n| n.contains(&f))),
+        // `PLIRON_VERIFY=full`: the verifier after every step, as in the
+        // backend (a failing step panics; `report` records it as `panic`).
+        verify_full: pliron_cfg::env_is("PLIRON_VERIFY", "full"),
         since_reap: false,
         unopt: false,
         stats: &mut stats,
@@ -639,7 +659,11 @@ fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &s
     let mut row = FnRow { file: rel, insts: (0, 0), blocks: (0, 0), us: 0, status: "ok", msg: String::new() };
     let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
         let mut fs = cranelift_reader::parse_functions(&text).ok()?;
-        (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
+        (!fs.is_empty()).then(|| {
+            let func = fs.remove(0);
+            let facts = parse_facts(&text, &func);
+            (func, facts)
+        })
     });
     let Some((mut func, facts)) = loaded else {
         row.status = "parse";
@@ -719,6 +743,9 @@ fn report_corpus(isa: &std::sync::Arc<dyn TargetIsa>, dir: &Path, out: &Path, o:
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();
+    if o.every > 1 {
+        files = files.into_iter().step_by(o.every).collect();
+    }
     files.truncate(o.limit);
     std::panic::set_hook(Box::new(|_| {}));
     let t0 = std::time::Instant::now();
@@ -859,7 +886,11 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
     let mut row = CgRow { file: file.strip_prefix(root).unwrap_or(file).display().to_string(), status: "ok", ..Default::default() };
     let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
         let mut fs = cranelift_reader::parse_functions(&text).ok()?;
-        (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
+        (!fs.is_empty()).then(|| {
+            let func = fs.remove(0);
+            let facts = parse_facts(&text, &func);
+            (func, facts)
+        })
     });
     let Some((func, facts)) = loaded else {
         row.status = "parse";
@@ -906,6 +937,9 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();
+    if o.every > 1 {
+        files = files.into_iter().step_by(o.every).collect();
+    }
     files.truncate(o.limit);
     std::panic::set_hook(Box::new(|_| {}));
     let next = std::sync::atomic::AtomicUsize::new(0);

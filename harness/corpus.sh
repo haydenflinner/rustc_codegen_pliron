@@ -7,6 +7,10 @@
 #   harness/corpus.sh smoke              tests/*/main.rs        -> target/corpus/smoke
 #   harness/corpus.sh std                std+alloc+core (-Zbuild-std, release) -> target/corpus/std
 #   harness/corpus.sh cargo DIR [ARGS]   any cargo project (release) -> target/corpus/<basename DIR>
+#   harness/corpus.sh clcg               our vendored cranelift-codegen and its dependencies
+#                                        (release, ~38k functions, ~1.5 min) -> target/corpus/clcg.
+#                                        Compiling our own crates found bugs std did not show; the
+#                                        gate replays a sample of it, `gate.py --full` all of it.
 #
 # OUT=<dir> overrides the destination. The backend is target/debug's dylib
 # (build it first). Re-recording replaces the set.
@@ -24,7 +28,7 @@ esac
 BE="-Zcodegen-backend=$ROOT/target/${PLIRON_PROFILE:-debug}/$lib"
 HOST=$(rustc -vV | sed -n 's/host: //p')
 export RUSTC_ICE=${RUSTC_ICE:-$ROOT/target/ices}
-set_=${1:?usage: corpus.sh smoke|std|cargo DIR}
+set_=${1:?usage: corpus.sh smoke|std|clcg|cargo DIR}
 shift
 out=${OUT:-$ROOT/target/corpus/$set_}
 [[ $set_ == cargo ]] && out=${OUT:-$ROOT/target/corpus/$(basename "${1:?cargo DIR}")}
@@ -45,6 +49,9 @@ case "$set_" in
     echo 'fn main() { println!("{:?}", std::collections::HashMap::<u8, String>::new()); }' > "$tmp/p/src/main.rs"
     (cd "$tmp/p" && RUSTFLAGS="$BE" PLIRON_CORPUS="$out" CARGO_TARGET_DIR="$tmp/t" \
       cargo build -q --release --target "$HOST" -Zbuild-std=std,panic_abort) ;;
+  clcg)
+    (cd "$ROOT" && RUSTFLAGS="$BE" PLIRON_CORPUS="$out" CARGO_TARGET_DIR="$tmp/t" \
+      cargo build -q --release -p cranelift-codegen) ;;
   cargo)
     dir=$1; shift
     (cd "$dir" && RUSTFLAGS="$BE" PLIRON_CORPUS="$out" CARGO_TARGET_DIR="$tmp/t" \

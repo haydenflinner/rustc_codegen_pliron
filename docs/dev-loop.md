@@ -166,7 +166,15 @@ passes under rustc:
 ## What did not work
 
 - **Building the backend with itself** (`RUSTFLAGS=-Zcodegen-backend=...
-  cargo build -p pliron-clif-check`). It does not get through
+  cargo build -p pliron-clif-check`). Update, same day: the failures
+  below were one bug (`webmerge` materializing a param's value on a dead
+  self-loop, where it mentions the param itself; `mask01`, the egraph and
+  the verifier then met the orphaned value), fixed with a test in
+  `clifpeep.rs`. `clif-check` now builds with the backend under
+  `PLIRON_VERIFY=full` in 3 min 18 s and the self-built binary replays
+  the std corpus with identical results; the eight interpreter mismatches
+  were checker artifacts (`tests/diffcheck.rs`). What follows is the
+  state before that. It does not get through
   `pliron-clif-opt`: a release backend panics (`index out of bounds ...
   4294967295` in `dfg.rs`), a debug one fails Cranelift's verifier. With
   `PLIRON_VERIFY=full` the committed HEAD already fails in

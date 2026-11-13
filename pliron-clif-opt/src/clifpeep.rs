@@ -4403,6 +4403,17 @@ pub fn webmerge_ctx(
             tpre_sum += el(tb0);
             continue;
         }
+        // An unreachable block has no entry edge: on a dead self-loop
+        // `b(p): v = band p, K; jump b(v)` the only edge's key mentions
+        // `p` itself, the slot looks uniform, and materializing it at
+        // the head defines `p' = band p', K` — an instruction that uses
+        // its own result (cranelift-codegen `Vec::extend_trusted`: a
+        // later `mask01` then left a use of a removed definition).
+        // Dominance, which `mat_ok` leans on, means nothing there.
+        if !dom.is_reachable(b) {
+            tpre_sum += el(tb0);
+            continue;
+        }
         // `diff_b` re-proves the same (x, y) pairs across oracle calls
         // and join paths — two-level memo: head-independent results
         // shared by every query, head-dependent ones per (pi, pj).
@@ -5726,8 +5737,12 @@ pub fn mask01(func: &mut Function) -> usize {
             // The mask is a no-op when `cover` proves every set bit of `x`
             // is already in `m` (value bound is not enough: 7 <= 8 but
             // `7 & 8 != 7`); `is01` covers the non-const bit-cover case.
-            if cover(func, x, 4) & !m == 0 || (m == 1 && is01(func, x, 4)) {
-                hits.push((i, res, func.dfg.resolve_aliases(x)));
+            // `x == res` is dead code that uses its own result (an
+            // unreachable self-loop another pass rebound): leave it, an
+            // alias to itself would orphan every use of `res`.
+            let x = func.dfg.resolve_aliases(x);
+            if x != res && (cover(func, x, 4) & !m == 0 || (m == 1 && is01(func, x, 4))) {
+                hits.push((i, res, x));
             }
         }
     }
@@ -12123,9 +12138,13 @@ mod tests {
         cur.ins().jump(a, &[pb.into()]);
 
         sameargs(&mut func);
-        assert_eq!(
-            func.dfg.block_params(a).len() + func.dfg.block_params(b).len(),
-            1,
+        // The two blocks only reach each other, so they are unreachable,
+        // and `webmerge` now leaves unreachable blocks alone
+        // (`webmerge_skips_unreachable_self_loop`): both params stay.
+        // What this test still pins is that nothing is detached under
+        // its uses.
+        assert!(
+            (1..=2).contains(&(func.dfg.block_params(a).len() + func.dfg.block_params(b).len())),
             "{}",
             func.display()
         );
@@ -12842,6 +12861,54 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// A dead self-loop `dead(p): v = band p, K; jump dead(v)`: the only
+    /// edge into `dead` passes a value computed from `p`, so the slot is
+    /// "uniform" and its key mentions `p`. Materializing it at the head
+    /// made `p' = band p', K` (cranelift-codegen `Vec::extend_trusted`
+    /// under self-hosting; `mask01` then removed the definition and left
+    /// its uses). Unreachable blocks are left alone.
+    #[test]
+    fn webmerge_skips_unreachable_self_loop() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let dead = func.dfg.make_block();
+        for blk in [entry, dead] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let p = func.dfg.append_block_param(dead, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins().return_(&[x]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(dead);
+        let k = cur.ins().iconst(types::I64, -4294967296);
+        let v = cur.ins().band(p, k);
+        cur.ins().jump(dead, &[v.into()]);
+
+        sameargs(&mut func);
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                let res = func.dfg.inst_results(i);
+                for a in func.dfg.inst_values(i) {
+                    let a = func.dfg.resolve_aliases(a);
+                    assert!(
+                        !res.contains(&a),
+                        "{} uses its own result\n{}",
+                        func.dfg.display_inst(i),
+                        func.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(mask01(&mut func), 0);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("invalid IR: {e}\n{}", func.display());
         }
     }
 

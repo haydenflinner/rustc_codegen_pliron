@@ -280,6 +280,225 @@ fn nonnull_load_fact_is_honored() {
     check(&a, &b, &facts, &cfg).unwrap();
 }
 
+#[test]
+fn derived_offset_fact_is_honored() {
+    // `v3 = v1 - 1` is an inbounds offset of `v1` (`derived`): non-null
+    // whenever `v1` is, so folding `v3 == 0` under `v1 != 0` is allowed. A
+    // run where it comes out 0 anyway is undefined, not a mismatch
+    // (cranelift-codegen corpus: `DebugMap::entries` over a hashbrown
+    // iterator — a stub call returned 32 into `bucket - 32`, `jtround`
+    // had folded the `Option<&T>` test and the loop never left).
+    let a = parse(
+        "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = load.i64 notrap v0
+            v9 = iconst.i64 0
+            v2 = icmp eq v1, v9
+            brif v2, block2, block1
+        block1:
+            v8 = iconst.i64 -1
+            v3 = iadd v1, v8
+            v4 = icmp eq v3, v9
+            return v4
+        block2:
+            v5 = iconst.i8 2
+            return v5
+        }",
+    );
+    let b = parse(
+        "function %f(i64) -> i8 {
+        block0(v0: i64):
+            v1 = load.i64 notrap v0
+            v9 = iconst.i64 0
+            v2 = icmp eq v1, v9
+            brif v2, block2, block1
+        block1:
+            v4 = iconst.i8 0
+            return v4
+        block2:
+            v5 = iconst.i8 2
+            return v5
+        }",
+    );
+    let cfg = Config {
+        trials: 256,
+        ..Config::default()
+    };
+    // Without the fact a 1 in memory exposes the fold.
+    assert!(check(&a, &b, &Facts::default(), &cfg).is_err());
+    let mut derived = pliron_clif_opt::vmap::VMap::default();
+    derived.insert(Value::from_u32(3), Value::from_u32(1));
+    let facts = Facts {
+        derived: Some(&derived),
+        ..Facts::default()
+    };
+    let s = check(&a, &b, &facts, &cfg).unwrap();
+    assert!(s.compared > 0 && s.inconclusive > 0, "{s:?}");
+}
+
+#[test]
+fn slot_address_arithmetic_may_move() {
+    // `fn0` returns a pointer into the buffer it was given; the function
+    // passes `end - buf` on. The stub's result does not follow the buffer,
+    // so the difference is whatever the slot's address makes it: merging
+    // the dead `ss0` away moves `ss1` and with it that value. Not a
+    // mismatch (serde_json `Number`'s `Display` under slotmerge) — but a
+    // changed constant still is.
+    let a = parse(
+        "function %f(i64) -> i64 {
+            ss0 = explicit_slot 8, align = 8
+            ss1 = explicit_slot 24, align = 8
+            sig0 = (i64) -> i64
+            sig1 = (i64, i64) -> i64
+            fn0 = u0:7 sig0
+            fn1 = u0:8 sig1
+        block0(v0: i64):
+            v1 = stack_addr.i64 ss1
+            v2 = call fn0(v1)
+            v3 = isub v2, v1
+            v4 = iconst.i64 7
+            v5 = call fn1(v3, v4)
+            return v5
+        }",
+    );
+    let moved = parse(
+        "function %f(i64) -> i64 {
+            ss1 = explicit_slot 24, align = 8
+            sig0 = (i64) -> i64
+            sig1 = (i64, i64) -> i64
+            fn0 = u0:7 sig0
+            fn1 = u0:8 sig1
+        block0(v0: i64):
+            v1 = stack_addr.i64 ss1
+            v2 = call fn0(v1)
+            v3 = isub v2, v1
+            v4 = iconst.i64 7
+            v5 = call fn1(v3, v4)
+            return v5
+        }",
+    );
+    let s = check(&a, &moved, &Facts::default(), &cfg()).unwrap();
+    assert_eq!(s.compared + s.inconclusive, 32);
+    let wrong = parse(
+        "function %f(i64) -> i64 {
+            ss1 = explicit_slot 24, align = 8
+            sig0 = (i64) -> i64
+            sig1 = (i64, i64) -> i64
+            fn0 = u0:7 sig0
+            fn1 = u0:8 sig1
+        block0(v0: i64):
+            v1 = stack_addr.i64 ss1
+            v2 = call fn0(v1)
+            v3 = isub v2, v1
+            v4 = iconst.i64 8
+            v5 = call fn1(v3, v4)
+            return v5
+        }",
+    );
+    assert!(check(&a, &wrong, &Facts::default(), &cfg()).is_err());
+}
+
+#[test]
+fn call_stub_respects_operand_extent() {
+    // `fn0` takes `&mut RawVecInner`, the first 16 bytes of a 24-byte
+    // `String` slot: it cannot reach `len` at +16, so slotprom keeps `len`
+    // in a register across the call. The stub must not clobber it either
+    // (regex-syntax `repeat_char` in the wider corpora: a false mismatch).
+    let a = parse(
+        "function %f() -> i64 {
+            ss0 = explicit_slot 24, align = 8
+            sig0 = (i64)
+            fn0 = u0:7 sig0
+        block0:
+            v1 = stack_addr.i64 ss0
+            v2 = iconst.i64 5
+            store notrap v2, v1
+            store notrap v2, v1+8
+            store notrap v2, v1+16
+            call fn0(v1)
+            v3 = load.i64 notrap v1+16
+            v4 = load.i64 notrap v1
+            v5 = iadd v3, v4
+            return v5
+        }",
+    );
+    let b = parse(
+        "function %f() -> i64 {
+            ss0 = explicit_slot 24, align = 8
+            sig0 = (i64)
+            fn0 = u0:7 sig0
+        block0:
+            v1 = stack_addr.i64 ss0
+            v2 = iconst.i64 5
+            store notrap v2, v1
+            store notrap v2, v1+8
+            store notrap v2, v1+16
+            call fn0(v1)
+            v4 = load.i64 notrap v1
+            v5 = iadd v2, v4
+            return v5
+        }",
+    );
+    // Unbounded operand: the callee may write `len`, forwarding it is wrong.
+    assert!(check(&a, &b, &Facts::default(), &cfg()).is_err());
+    let facts = Facts {
+        stub_extent: [(("u0:7".to_string(), 0), 16)].into_iter().collect(),
+        ..Facts::default()
+    };
+    let s = check(&a, &b, &facts, &cfg()).unwrap();
+    assert_eq!(s.compared, 32);
+    // The bytes inside the extent are still clobbered: forwarding the
+    // first word across the call is caught.
+    let c = parse(
+        "function %f() -> i64 {
+            ss0 = explicit_slot 24, align = 8
+            sig0 = (i64)
+            fn0 = u0:7 sig0
+        block0:
+            v1 = stack_addr.i64 ss0
+            v2 = iconst.i64 5
+            store notrap v2, v1
+            store notrap v2, v1+8
+            store notrap v2, v1+16
+            call fn0(v1)
+            v5 = iadd v2, v2
+            return v5
+        }",
+    );
+    assert!(check(&a, &c, &facts, &cfg()).is_err());
+}
+
+#[test]
+fn corpus_self_symbol_binds_to_its_func_id() {
+    // A corpus dump names the function by symbol; its callees are
+    // `u0:<FuncId>`. Only a call whose `names` entry is that symbol is a
+    // self-call. (Replays used to assume id 0 and `tailrec` looped on calls
+    // to whatever `u0:0` was: invalid IR on `jumpthread::round`'s closure.)
+    let text = "; diffcheck-facts: nonnull= noalias= self=_RNvself
+; diffcheck-nocap: fn0:0:16
+; diffcheck-names: fn0:_RNvother,fn1:_RNvself
+function %f(i64) -> i64 {
+    sig0 = (i64) -> i64
+    fn0 = u0:0 sig0
+    fn1 = u0:9 sig0
+block0(v0: i64):
+    v1 = call fn0(v0)
+    v2 = call fn1(v1)
+    return v2
+}";
+    let f = parse(text);
+    let mut facts = pliron_clif_opt::diffcheck::OwnedFacts::parse(text);
+    facts.bind_self(&f);
+    assert_eq!(facts.self_name.as_deref(), Some("u0:9"));
+    assert_eq!(facts.self_symbol.as_deref(), Some("_RNvself"));
+    assert_eq!(facts.stub_extent.get(&("u0:0".to_string(), 0)), Some(&16));
+    // No self-call in the text: no id (not 0).
+    let text = text.replace("fn1:_RNvself", "fn1:_RNvthird");
+    let mut facts = pliron_clif_opt::diffcheck::OwnedFacts::parse(&text);
+    facts.bind_self(&f);
+    assert_eq!(facts.self_name, None);
+}
+
 // r[verify verify.diffcheck.inconclusive]
 #[test]
 fn uninit_slot_bytes_may_reshuffle() {
