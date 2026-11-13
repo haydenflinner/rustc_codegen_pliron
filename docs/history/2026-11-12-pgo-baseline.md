@@ -165,3 +165,45 @@ pulldown-cmark alone the instruction count falls 81.1M -> 74.8M.
 Still open: our block placement. `PLIRON_PLACE=0` costs ~1% and real
 counts (`PLIRON_PGO_FREQ=1`: 49% of blocks, 68% of branches measured at
 layout time) change the code but not the time.
+
+## 2026-11-13 early morning: the bundle as default
+
+Since the last table: `PLIRON_PGO_FREQ` became a bit set (placement
+only; spill weights from counts measured worse), counts for
+pass-created blocks are inferred from the CFG before the backend sees
+them (46% -> 53% of blocks, 74% -> 81% of branches measured on
+pulldown-cmark), a measured count overrides a static cold mark, and
+only critical-edge blocks are looked through. The bundle is on whenever
+`PLIRON_PGO_USE` is set (docs/pgo.md). `harness/pgofuzz.py`: 300 seeds
+through generate/run/use, all pass. Gate green.
+
+`bench/heldout/run.py --pgo`, defaults, 7 rounds:
+
+| | ratio | interval |
+|---|---|---|
+| pliron-pgo / pliron | 0.960 | [0.946, 0.977] |
+| pliron-pgo / llvm | 1.043 | [1.013, 1.066] |
+| pliron / llvm | 1.086 | [1.054, 1.111] |
+| llvm-pgo / llvm | 0.927 | [0.907, 0.978] |
+| pliron-pgo / llvm-pgo | 1.126 | [1.048, 1.144] |
+
+pgo/pliron per program: pulldown-cmark 0.913, rust-json 0.934,
+rust-protobuf 0.936, rust-html-rewriter 0.949, blake3-scalar 0.976,
+rust-compression 0.979, regex 0.994, blind-sig 1.004. Loop cost 2.52x
+a plain LLVM build.
+
+Layout, measured and set aside: `PLIRON_LAYOUT_STATS` /
+`harness/layout_score.py` score the emitted order under the measured
+frequencies (pulldown-cmark: 0.37 transfers per block against a floor
+of 0.20). Placement variants (real counts on or off, emission-time
+loop rotation) change the code and the score slightly and the run time
+not measurably (+-1.5% over 9 rounds on three programs). LLVM loses
+5-20% of cycles with its placement disabled; whatever it gains there,
+our chain placement does not reproduce it with the counts we carry.
+
+Per-consumer notes from `ab.py`: on regex the profile-guided inliner
+costs ~2.5% instructions (`PLIRON_PGO_INLINE=0` is its best setting);
+on rust-json dropping the never-run-site rejection
+(`PLIRON_PGO_COLDSITE=0`) saves 3% instructions but it is mixed
+elsewhere; the hot multiplier wants 13 on rust-json and
+rust-html-rewriter and 0-3 on rust-protobuf.
