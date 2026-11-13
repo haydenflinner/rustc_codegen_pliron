@@ -1408,6 +1408,11 @@ pub fn run(
         FxHashMap::default()
     };
     let pgo_inline = !crate::env_is("PLIRON_PGO_INLINE", "0");
+    // Ablations of the two older call-site rules: `PLIRON_PGO_COLDSITE=0`
+    // keeps never-run sites inlinable, `PLIRON_PGO_WARM=0` drops the
+    // +2x-limit bonus of sites that ran at least 4 times.
+    let pgo_coldsite = !crate::env_is("PLIRON_PGO_COLDSITE", "0");
+    let pgo_warm = !crate::env_is("PLIRON_PGO_WARM", "0");
     let pgo_hot: usize = if pgo_inline {
         pliron_cfg::pgo_knob("PLIRON_PGO_HOT", "13").and_then(|s| s.parse().ok()).unwrap_or(0)
     } else {
@@ -1559,7 +1564,7 @@ pub fn run(
                     // `PLIRON_PGO_INLINE=0`: ablation, the inliner ignores
                     // callsite counts.
                     let site_count = if pgo_inline { crate::pgo::block_count(st, b) } else { None };
-                    if !f.always_inline && site_count == Some(0) {
+                    if pgo_coldsite && !f.always_inline && site_count == Some(0) {
                         pliron_cfg::remark!("inline", sym, cs; "reject (cold callsite: profile count 0)");
                         if verbose {
                             if pliron_cfg::tracing_on() {
@@ -1674,7 +1679,7 @@ pub fn run(
                     }
                     // PGO: a callsite the profile proves runs is worth
                     // more code growth than a static guess.
-                    if site_count.is_some_and(|c| c >= 4) {
+                    if pgo_warm && site_count.is_some_and(|c| c >= 4) {
                         t = t.saturating_add(limit.saturating_mul(2));
                     }
                     // `PLIRON_PGO_HOT=<k>` (opt-in): a call site whose count
