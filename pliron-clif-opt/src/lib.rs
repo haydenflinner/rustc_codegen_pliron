@@ -59,6 +59,7 @@ pub mod looprot;
 pub mod loopvec;
 pub mod memspec;
 pub mod niche;
+pub mod panicstub;
 pub mod paramsink;
 pub mod pipeline;
 pub mod proots;

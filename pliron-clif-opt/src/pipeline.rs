@@ -4352,6 +4352,19 @@ fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// Cold `call f(..); trap` tails of one callee share one block per
+// function (`panicstub`); members keep their argument setup and jump.
+fn s_panicstub(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::panicstub::run(&mut p.clctx.func, pliron_cfg::env_is("PLIRON_COLDCOPY", "1"));
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("panicstub");
+        }
+    }
+    k
+}
+
 fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::brhint::run(&mut p.clctx.func, an)
 }
@@ -5293,6 +5306,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // step: mergechain's `brif_fold` never sees single-brif fns.
         step("commonret", "commonret", Gate::Env("PLIRON_COMMONRET"), s_commonret)
             .needs(shape::CONDBR),
+        // Shared panic tails: every cold `call f; trap` of one callee
+        // jumps to one copy. After tailmergep/stubhoist — it folds
+        // tailmergep's per-shape shared blocks, and stubhoist would
+        // hoist arg-only stubs back into hot preds.
+        step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
+            .needs(shape::CALL),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
