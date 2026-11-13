@@ -204,6 +204,10 @@ pub struct LiveBundle {
     pub prio: u32, // recomputed after every bulk update
     pub spill_weight_and_props: u32,
     pub limit: Option<u8>,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): this bundle is a piece (hot
+    /// remainder or cold region) of a cold-region split, or was split off
+    /// one; the rule does not apply to it again.
+    pub cold_split: bool,
 }
 
 pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
@@ -416,6 +420,7 @@ impl LiveBundles {
             prio: 0,
             spill_weight_and_props: 0,
             limit: None,
+            cold_split: false,
         })
     }
 }

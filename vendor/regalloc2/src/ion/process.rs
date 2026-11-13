@@ -679,6 +679,9 @@ impl<'a, F: Function> Env<'a, F> {
         let new_bundle = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
         trace!(" -> creating new bundle {:?}", new_bundle);
         self.ctx.bundles[new_bundle].spillset = spillset;
+        // PLIRON (`PLIRON_RA2_COLDSPLIT`): a piece of a cold-split piece
+        // stays exempt from the rule (the flag is never set otherwise).
+        self.ctx.bundles[new_bundle].cold_split = self.ctx.bundles[bundle].cold_split;
         for entry in &new_lr_list {
             self.ctx.ranges[entry.index].bundle = new_bundle;
         }
@@ -1082,6 +1085,8 @@ impl<'a, F: Function> Env<'a, F> {
         let mut attempts = 0;
         let mut scratch = core::mem::take(&mut self.ctx.scratch_conflicts);
         let mut lowest_cost_evict_conflict_set = core::mem::take(&mut self.ctx.scratch_bundle);
+        // PLIRON (`PLIRON_RA2_COLDSPLIT`): see `try_cold_split`.
+        let coldsplit = crate::coldsplit_on() && !self.ctx.bundles[bundle].cold_split;
         'outer: loop {
             attempts += 1;
             trace!("attempt {}, req {:?}", attempts, req);
@@ -1111,6 +1116,10 @@ impl<'a, F: Function> Env<'a, F> {
             let mut lowest_cost_split_conflict_cost: Option<u32> = None;
             let mut lowest_cost_split_conflict_point = ProgPoint::before(Inst::new(0));
             let mut lowest_cost_split_conflict_reg = PReg::invalid();
+            // PLIRON (`PLIRON_RA2_COLDSPLIT`): the clobber in the coldest
+            // block that kept this bundle out of a register:
+            // `(point, block hot bonus, preg)`.
+            let mut cold_conflict: Option<(ProgPoint, f32, PReg)> = None;
 
             // Heuristic: start the scan for an available
             // register at an offset influenced both by our
@@ -1212,6 +1221,14 @@ impl<'a, F: Function> Env<'a, F> {
                             /* is_def = */ true,
                         )
                         .to_int();
+
+                        // PLIRON (`PLIRON_RA2_COLDSPLIT`).
+                        if coldsplit
+                            && cold_conflict.is_none_or(|(_, h, _)| hot < h)
+                            && self.func.inst_clobbers(point.inst()).contains(preg)
+                        {
+                            cold_conflict = Some((point, hot, preg));
+                        }
 
                         if lowest_cost_split_conflict_cost.is_none()
                             || (max_cost + move_cost) < lowest_cost_split_conflict_cost.unwrap()
@@ -1328,6 +1345,20 @@ impl<'a, F: Function> Env<'a, F> {
                 }
 
                 panic!("Could not allocate minimal bundle, but the allocation problem should be possible to solve");
+            }
+
+            // PLIRON `PLIRON_RA2_COLDSPLIT=1`: before choosing between
+            // evicting and splitting at the first conflict, take the cold
+            // call blocks out of the bundle (see `try_cold_split`). When
+            // the rule does not apply, nothing has changed and the
+            // existing choice below runs.
+            if let Some((point, _, preg)) = cold_conflict {
+                if fixed_preg.is_none()
+                    && !self.minimal_bundle(bundle)
+                    && self.try_cold_split(bundle, point, preg)
+                {
+                    break 'outer;
+                }
             }
 
             // If our bundle's weight is less than or equal to(*) the
@@ -1559,6 +1590,271 @@ fn minimal_range_for_use(u: &Use) -> CodeRange {
 }
 
 impl<'a, F: Function> Env<'a, F> {
+    /// PLIRON `PLIRON_RA2_COLDSPLIT=1` (opt-in): region splitting around
+    /// cold code, using the block frequencies behind the spill weights
+    /// (`CFGInfo::hot_bonus`).
+    ///
+    /// The case: a value that is hot in a loop is also live across a cold
+    /// block with a call (a panic path, an allocation slow path). The
+    /// call's clobbers keep the whole bundle out of every caller-saved
+    /// register, so it takes a callee-saved one for its whole life, or
+    /// evicts something, or is split at the first conflict and reloaded
+    /// in hot code. The rule instead takes the cold blocks out of the
+    /// bundle, so the store and the reload land on the edges into and
+    /// out of the cold code and the rest is free to take any register.
+    ///
+    /// - Trigger: `process_bundle` found no register, and for at least
+    ///   one preg the blocking reservation was a clobber of that preg
+    ///   (`conflict`: the one in the coldest block; `hint`: its preg).
+    ///   The bundle has no fixed-register requirement, is not minimal
+    ///   and does not carry `LiveBundle::cold_split`.
+    /// - Cold: a block is cold for the bundle when its hot bonus is at
+    ///   most `1/K` of the highest hot bonus of a block the bundle has a
+    ///   use or def in (`PLIRON_RA2_COLDSPLIT_RATIO`, default 16). The
+    ///   conflict's block must be cold, or the rule does not apply.
+    /// - Regions: over the blocks the bundle is live in, each maximal
+    ///   run of consecutive cold blocks (in regalloc2's linear block
+    ///   order) in which the bundle is live across a clobber. A cold
+    ///   run without such a clobber forces nothing and stays in the
+    ///   bundle. All regions are found in one walk of the bundle's
+    ///   ranges, so the cost is linear in the blocks it is live in.
+    /// - Split: every range is cut at each region's entry
+    ///   (`block_entry[lo]`) and exit (the point after `block_exit[hi]`),
+    ///   with the range-level steps of `split_and_requeue_bundle` (new
+    ///   range for the tail, uses divided at the cut, lazy append to the
+    ///   vreg's range list). The ranges outside the regions stay in the
+    ///   original bundle, as *one* bundle with holes: the lowered block
+    ///   order interleaves cold blocks with hot ones (they are only sunk
+    ///   at emission), and separate bundles for the hot code before and
+    ///   after a cold block could get different registers and a move on
+    ///   a hot edge. The hot remainder is not trimmed to its uses and is
+    ///   requeued with `hint`.
+    /// - The cold pieces: one per region. Without uses, its ranges go
+    ///   straight into the spillset's spill bundle (what `process_bundle`
+    ///   does for a use-less bundle once a spill bundle exists). With
+    ///   uses (a call argument, say) it is requeued as a bundle of its
+    ///   own and its low spill weight decides.
+    /// - Termination: the remainder and every cold piece carry
+    ///   `cold_split`, which `split_and_requeue_bundle` hands on to the
+    ///   pieces it makes, so the rule runs at most once per original
+    ///   bundle. It does not count against `MAX_SPLITS_PER_SPILLSET`.
+    ///
+    /// Only block-boundary points are split at, and the moves between
+    /// the pieces come from the normal edge/range move insertion
+    /// (`moves.rs`), so the checker's view is that of any other split.
+    /// Returns false, with nothing changed, when the rule does not apply.
+    pub(crate) fn try_cold_split(
+        &mut self,
+        bundle: LiveBundleIndex,
+        conflict: ProgPoint,
+        hint: PReg,
+    ) -> bool {
+        let cfg = &self.ctx.cfginfo;
+        if cfg.block_clobbers.len() != cfg.hot_bonus.len() {
+            return false;
+        }
+        let mut max_hot = 0.0f32;
+        for entry in &self.ctx.bundles[bundle].ranges {
+            for u in &self.ctx.ranges[entry.index].uses {
+                let h = cfg.hot_bonus[cfg.insn_block[u.pos.inst().index()].index()];
+                if h > max_hot {
+                    max_hot = h;
+                }
+            }
+        }
+        let thr = max_hot / crate::coldsplit_ratio();
+        let cb = cfg.insn_block[conflict.inst().index()].index();
+        if !(max_hot > 0.0 && cfg.hot_bonus[cb] <= thr) {
+            return false;
+        }
+
+        // The regions, as `[from, to)` program points, in order.
+        let mut regions: SmallVec<[(ProgPoint, ProgPoint); 4]> = smallvec![];
+        // The open run: first block, last block, live across a clobber.
+        let mut run: Option<(usize, usize, bool)> = None;
+        let mut close = |run: Option<(usize, usize, bool)>| {
+            if let Some((lo, hi, true)) = run {
+                regions.push((cfg.block_entry[lo], cfg.block_exit[hi].next()));
+            }
+        };
+        for entry in &self.ctx.bundles[bundle].ranges {
+            if entry.range.from >= entry.range.to {
+                continue;
+            }
+            let b0 = cfg.insn_block[entry.range.from.inst().index()].index();
+            let b1 = cfg.insn_block[entry.range.to.prev().inst().index()].index();
+            for b in b0..=b1 {
+                if !(cfg.hot_bonus[b] <= thr) {
+                    close(run.take());
+                    continue;
+                }
+                let (first, last) = cfg.block_clobbers[b];
+                let covers = |i: u32| {
+                    let p = ProgPoint::after(Inst::new(i as usize));
+                    entry.range.from <= p && p < entry.range.to
+                };
+                let clob = b == cb || (first != u32::MAX && (covers(first) || covers(last)));
+                run = match run {
+                    Some((lo, hi, c)) if hi == b || hi + 1 == b => Some((lo, b, c || clob)),
+                    _ => {
+                        close(run.take());
+                        Some((b, b, clob))
+                    }
+                };
+            }
+        }
+        close(run.take());
+        if regions.is_empty() {
+            return false;
+        }
+
+        explain!(
+            "  coldsplit {}: hottest use {max_hot}, cold <= {thr}, clobber conflict at {:?} (block {cb}, {}), {} region(s) {:?}",
+            self.explain_bundle(bundle),
+            conflict,
+            self.ctx.cfginfo.hot_bonus[cb],
+            regions.len(),
+            regions
+        );
+        trace!("coldsplit {bundle:?}: regions {regions:?}");
+        self.ctx.output.stats.splits += regions.len();
+
+        // Distribute the ranges: outside every region -> `hot`, inside
+        // region `r` -> `cold` tagged `r`; a range across a boundary is
+        // cut there.
+        let empty_vec = LiveRangeList::new_in(self.ctx.bump());
+        let old = core::mem::replace(&mut self.ctx.bundles[bundle].ranges, empty_vec);
+        let mut hot = LiveRangeList::new_in(self.ctx.bump());
+        let mut cold: SmallVec<[(usize, LiveRangeListEntry); 8]> = smallvec![];
+        let mut r = 0;
+        for entry in old.iter().cloned() {
+            let mut cur = entry;
+            loop {
+                while r < regions.len() && regions[r].1 <= cur.range.from {
+                    r += 1;
+                }
+                if r == regions.len() || regions[r].0 >= cur.range.to {
+                    hot.push(cur);
+                    break;
+                }
+                let (from, to) = regions[r];
+                if cur.range.from < from {
+                    let tail = self.cold_split_range(cur.index, from);
+                    cur.range.to = from;
+                    hot.push(cur);
+                    cur = LiveRangeListEntry {
+                        range: self.ctx.ranges[tail].range,
+                        index: tail,
+                    };
+                } else if cur.range.to > to {
+                    let tail = self.cold_split_range(cur.index, to);
+                    cur.range.to = to;
+                    cold.push((r, cur));
+                    cur = LiveRangeListEntry {
+                        range: self.ctx.ranges[tail].range,
+                        index: tail,
+                    };
+                } else {
+                    cold.push((r, cur));
+                    break;
+                }
+            }
+        }
+        // A use in the hottest block is outside every region.
+        debug_assert!(!hot.is_empty());
+        debug_assert!(!cold.is_empty());
+
+        let spillset = self.ctx.bundles[bundle].spillset;
+        let mut i = 0;
+        while i < cold.len() {
+            let region = cold[i].0;
+            let mut j = i;
+            let mut has_uses = false;
+            while j < cold.len() && cold[j].0 == region {
+                has_uses |= !self.ctx.ranges[cold[j].1.index].uses.is_empty();
+                j += 1;
+            }
+            if has_uses {
+                let piece = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+                self.ctx.bundles[piece].spillset = spillset;
+                self.ctx.bundles[piece].cold_split = true;
+                for &(_, entry) in &cold[i..j] {
+                    self.ctx.ranges[entry.index].bundle = piece;
+                    self.ctx.bundles[piece].ranges.push(entry);
+                }
+                self.recompute_bundle_properties(piece);
+                explain!("    cold piece {} requeued", self.explain_bundle(piece));
+                let prio = self.ctx.bundles[piece].prio;
+                self.ctx
+                    .allocation_queue
+                    .insert(piece, prio as usize, PReg::invalid());
+            } else {
+                let spill = self
+                    .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
+                    .unwrap();
+                explain!(
+                    "    cold piece [{:?}..{:?}) has no uses -> spill bundle {:?}",
+                    cold[i].1.range.from,
+                    cold[j - 1].1.range.to,
+                    spill
+                );
+                for &(_, entry) in &cold[i..j] {
+                    self.ctx.ranges[entry.index].bundle = spill;
+                    self.ctx.bundles[spill].ranges.push(entry);
+                }
+            }
+            i = j;
+        }
+
+        self.ctx.bundles[bundle].ranges = hot;
+        self.ctx.bundles[bundle].cold_split = true;
+        if self.ctx.bundles[bundle].ranges.len() > 0 {
+            self.recompute_bundle_properties(bundle);
+            explain!("    hot remainder {}", self.explain_bundle(bundle));
+            let prio = self.ctx.bundles[bundle].prio;
+            self.ctx
+                .allocation_queue
+                .insert(bundle, prio as usize, hint);
+        }
+        true
+    }
+
+    /// PLIRON (`try_cold_split`): cut live range `orig` at `at` (strictly
+    /// inside it, a block entry). `orig` keeps `[from, at)`; the new range
+    /// gets `[at, to)` with the uses from `at` on and is appended to the
+    /// vreg's range list (sorted after allocation, as for any split). The
+    /// caller puts both into bundles.
+    fn cold_split_range(&mut self, orig: LiveRangeIndex, at: ProgPoint) -> LiveRangeIndex {
+        debug_assert!(self.ctx.ranges[orig].range.from < at && at < self.ctx.ranges[orig].range.to);
+        debug_assert!(at.pos() == InstPosition::Before);
+        let to = self.ctx.ranges[orig].range.to;
+        let new_lr = self
+            .ctx
+            .ranges
+            .add(CodeRange { from: at, to }, self.ctx.scratch_bump.clone());
+        self.ctx.ranges[new_lr].vreg = self.ctx.ranges[orig].vreg;
+        let first_use = self.ctx.ranges[orig]
+            .uses
+            .iter()
+            .position(|u| u.pos >= at)
+            .unwrap_or(self.ctx.ranges[orig].uses.len());
+        let mut rest_uses = UseList::new_in(self.ctx.bump());
+        rest_uses.extend(self.ctx.ranges[orig].uses.iter().cloned().skip(first_use));
+        self.ctx.ranges[new_lr].uses = rest_uses;
+        self.ctx.ranges[orig].uses.truncate(first_use);
+        self.ctx.ranges[orig].uses.shrink_to_fit();
+        self.ctx.ranges[orig].range.to = at;
+        self.recompute_range_properties(orig);
+        self.recompute_range_properties(new_lr);
+        let range = self.ctx.ranges[new_lr].range;
+        let vreg = self.ctx.ranges[new_lr].vreg;
+        self.ctx.vregs[vreg].ranges.push(LiveRangeListEntry {
+            range,
+            index: new_lr,
+        });
+        new_lr
+    }
+
     /// PLIRON explain: `bundle(vregs) [from..to) w=weight depth=d..d`.
     pub(crate) fn explain_bundle(&self, bundle: LiveBundleIndex) -> alloc::string::String {
         let ranges = &self.ctx.bundles[bundle].ranges;

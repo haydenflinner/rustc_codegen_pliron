@@ -96,6 +96,38 @@ pub(crate) fn loopsplit_max() -> usize {
     0
 }
 
+/// PLIRON: `PLIRON_RA2_COLDSPLIT=1` (opt-in): carve the cold blocks whose
+/// call clobbers block a caller-saved register out of a hot bundle (see
+/// `Env::try_cold_split` in `ion/process.rs`).
+pub(crate) fn coldsplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_COLDSPLIT").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT_RATIO=<K>` (default 16, at least 2): a
+/// block is cold for a bundle when its frequency (`CFGInfo::hot_bonus`)
+/// is at most `1/K` of the hottest block the bundle has a use or def in.
+pub(crate) fn coldsplit_ratio() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT_RATIO")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|k| k.is_finite())
+                .map_or(16.0, |k| k.max(2.0))
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    16.0
+}
+
 /// PLIRON: `PLIRON_RA2_NOPINMERGE` (default on, `=0` off): refuse
 /// blockparam merges that would spread a `FixedReg`/`FixedStack`
 /// requirement onto an unconstrained bundle whose ranges cross a fixed

@@ -264,3 +264,18 @@ pulldown's `scalar_iterate_special_bytes` initialised a dozen spilled
 loop states that way on every call. Static, release held-out binaries:
 stack loads -4.3% (pulldown-cmark), -3.5% (regex), -3.6%
 (rust-compression); stores -0.7..-1.3%. Checked with `PLIRON_RA_CHECK=1`.
+
+## `PLIRON_RA2_COLDSPLIT=1` (runtime, opt-in): cut cold call blocks out of a hot bundle
+
+`src/ion/process.rs` (`try_cold_split`, `cold_split_range`, the hook in
+`process_bundle`), `src/cfg.rs` (`CFGInfo::block_clobbers`, filled only
+under the knob), `src/ion/data_structures.rs` (`LiveBundle::cold_split`),
+`src/lib.rs` (`coldsplit_on`, `coldsplit_ratio`). When a bundle finds no
+register and a clobber in a cold block blocked a caller-saved one, every
+run of consecutive cold blocks in which the bundle is live across a
+clobber is cut out at its block boundaries. Cold: hot bonus at most `1/K`
+(`PLIRON_RA2_COLDSPLIT_RATIO`, default 16) of the hottest block with a
+use or def of the bundle. The remainder stays one bundle (with holes) and
+is requeued untrimmed; a cold piece without uses goes to the spill
+bundle, one with uses is requeued. Once per original bundle. Not yet
+measured or run under `PLIRON_RA_CHECK=1`.
