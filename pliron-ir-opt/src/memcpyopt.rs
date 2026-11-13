@@ -23,7 +23,7 @@ use pliron::{
 use pliron::builtin::op_interfaces::BranchOpInterface;
 use pliron::op::op_cast;
 use pliron::r#type::Typed;
-use pliron_llvm::ops::{AllocaOp, CallOp, GetElementPtrOp, LoadOp, StoreOp};
+use pliron_llvm::ops::{AllocaOp, AtomicLoadOp, AtomicStoreOp, CallOp, GetElementPtrOp, ICmpOp, LoadOp, StoreOp};
 use rustc_hash::{FxHashMap, FxHashSet};
 use pliron::basic_block::BasicBlock;
 
@@ -1131,6 +1131,10 @@ fn base_touches(
 ) -> Option<Touches> {
     let mut out: Touches = FxHashMap::default();
     let mut seen = 0usize;
+    // The address left the use-def cone (stored as a value, used as an
+    // index, turned into an integer): from then on any access through a
+    // pointer we cannot place may be an access to `base`.
+    let mut escaped = false;
     // (pointer value, its byte offset in base, offset known) — a graph,
     // not a tree: branch operands carry the pointer into block params,
     // and a loop-carried param can carry it back in.
@@ -1155,6 +1159,7 @@ fn base_touches(
                 if i != 0 {
                     // The pointer is an index — it escapes as a scalar.
                     out.insert(op, TouchKind::Other);
+                    escaped = true;
                     continue;
                 }
                 let r = op.deref(ctx).get_result(ctx, 0);
@@ -1203,12 +1208,75 @@ fn base_touches(
                     if i == 0 { TouchKind::Write } else { TouchKind::Read },
                 )
             } else {
+                // A call operand is a touch at the call (as before); a
+                // compare observes nothing. Everything else — the address
+                // stored as a value above all — publishes it.
+                if !(Operation::is_op::<CallOp>(op, ctx)
+                    || st.invokes.contains(op)
+                    || st.intrinsics.get(op).is_some()
+                    || Operation::is_op::<ICmpOp>(op, ctx))
+                {
+                    escaped = true;
+                }
                 (None, TouchKind::Other)
             };
             if range.is_none_or(|(lo, n)| lo < off + len && off < lo.saturating_add(n)) {
                 let e = out.entry(op).or_insert(kind);
                 if *e != kind {
                     *e = TouchKind::Other;
+                }
+            }
+        }
+    }
+    if escaped {
+        // Reads and writes of `base` can now come through pointers the
+        // cone never saw (`let r = &mut x;` kept in a closure environment
+        // or an argument array, reloaded and dereferenced — fuzz seeds
+        // 30621/30696/31403 read the destination through such a pointer
+        // inside the writer-to-copy window). Every access whose pointer
+        // does not resolve to a different alloca, and every call, may
+        // touch the range.
+        let Some(region) = base
+            .defining_op()
+            .and_then(|a| a.deref(ctx).get_parent_block())
+            .and_then(|b| b.deref(ctx).get_parent_region())
+        else {
+            return None;
+        };
+        let mut n = 0usize;
+        let elsewhere = |p: Value| alloca_base(ctx, st, None, p).is_some_and(|(b, _)| b != base);
+        for b in region.deref(ctx).iter(ctx) {
+            for op in b.deref(ctx).iter(ctx) {
+                n += 1;
+                if n > 40_000 {
+                    return None;
+                }
+                if out.contains_key(&op) {
+                    continue;
+                }
+                let o = op.deref(ctx);
+                let wild = if Operation::is_op::<LoadOp>(op, ctx) {
+                    !elsewhere(o.get_operand(ctx, 0))
+                } else if Operation::is_op::<StoreOp>(op, ctx) {
+                    !elsewhere(o.get_operand(ctx, 1))
+                } else if let Some(name) = st.intrinsics.get(op) {
+                    if name.starts_with("llvm.mem") {
+                        !(elsewhere(o.get_operand(ctx, 0))
+                            && (name == "llvm.memset" || elsewhere(o.get_operand(ctx, 1))))
+                    } else {
+                        !(name.starts_with("llvm.lifetime")
+                            || name.starts_with("llvm.dbg")
+                            || name == "llvm.assume"
+                            || name.starts_with("llvm.expect"))
+                    }
+                } else {
+                    Operation::is_op::<CallOp>(op, ctx)
+                        || st.invokes.contains(op)
+                        || Operation::is_op::<AtomicLoadOp>(op, ctx)
+                        || Operation::is_op::<AtomicStoreOp>(op, ctx)
+                };
+                if wild {
+                    out.insert(op, TouchKind::Other);
                 }
             }
         }
@@ -1783,6 +1851,46 @@ mod tests {
         let pre = "            four = llvm.constant <builtin.integer <3: i32>> : builtin.integer i32;\n            llvm.store *tmp <- four;\n            llvm.br ^loop()\n          ^loop():\n";
         let head = HEAD.replace("            llvm.br ^loop()\n          ^loop():\n", pre);
         let input = format!("{head}{MC}            r = llvm.load dst : builtin.integer i64;\n{TAIL}");
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    const ESC_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            cell = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+    "#;
+
+    /// `dst`'s address sits in memory and is reloaded: the load through
+    /// the reloaded pointer reads `dst` between the writer and the copy,
+    /// where the rebase would already have written it (fuzz seeds
+    /// 30621/30696/31403). Must refuse.
+    #[test]
+    fn escaped_dst_read_in_window_refused() {
+        let input = format!(
+            "{ESC_HEAD}            llvm.store *cell <- dst;\n            llvm.store *tmp <- v;\n            p = llvm.load cell : llvm.ptr (0);\n            r = llvm.load p : builtin.integer i64;\n{MC}            llvm.return\n        }}\n    }}\n"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// The same loads with `dst`'s address never stored: nothing can
+    /// reach `dst` through `p`, so the forward stands.
+    #[test]
+    fn unescaped_dst_wild_load_forwarded() {
+        let input = format!(
+            "{ESC_HEAD}            llvm.store *tmp <- v;\n            p = llvm.load cell : llvm.ptr (0);\n            r = llvm.load p : builtin.integer i64;\n{MC}            llvm.return\n        }}\n    }}\n"
+        );
         let ctx = &mut Context::new();
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
