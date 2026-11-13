@@ -204,10 +204,59 @@ jumps and branches of the emitted order under the measured
 frequencies), `harness/pgofuzz.py` (differential fuzz of the whole
 generate/run/use loop).
 
+## Field order
+
+`repr(Rust)` structs have no guaranteed field order; rustc picks one to
+minimise padding and LLVM never sees the choice. We own the layout
+query, so the profile can pick it (`src/field_order.rs`, both knobs
+opt-in):
+
+```
+# 1. profiled build that also records field heat (appends, one crate
+#    after another; start from an empty file)
+PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_HEAT=$PWD/fields.heat cargo build --release
+harness/field_order.py fields.heat        # per-type ranking, for a human
+# 2. rebuild *everything* (fresh CARGO_TARGET_DIR: cargo does not track
+#    PLIRON_* variables) with the order applied
+PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --release
+```
+
+- **Heat** is one line per `(struct, field)`:
+  `<crate>::<path>\t<field>\t<weight>`; duplicates are summed. It comes
+  from a walk over the MIR of every codegen'd instance (the builder only
+  sees byte offsets): each field projection on a struct counts once,
+  times the profile count of its MIR block. Without `PLIRON_PGO_USE` the
+  weight is `8^loop depth`. The file can also be written by hand.
+- **Order** wraps `layout_of`. Inside a plain `repr(Rust)` struct (no
+  `C`/`packed`/`align`/`transparent`/`simd`; no enums or unions) fields
+  of *identical size and alignment* trade places so the hotter one has
+  the smaller offset; ties keep rustc's order. Size, alignment and
+  padding cannot change. Only sized in-memory aggregates
+  (`BackendRepr::Memory`) are touched — `Scalar`/`ScalarPair` structs
+  encode field positions in the repr — and not structs whose last field
+  may be unsized (unsizing needs the prefix fixed). The largest niche
+  moves with its field.
+- **Which types**: those named in the file whose defining crate is the
+  crate being compiled or a dependency outside the sysroot. The rule
+  looks only at the type's definition and the file, so every crate
+  computes the same layout for it. `core`/`alloc`/`std`/`proc_macro`/
+  `test` and everything else loaded from the sysroot stay stock.
+- **Soundness and its limits**: code may not rely on `repr(Rust)` field
+  order, and `offset_of!`, derives, const evaluation and debuginfo all
+  read the same `layout_of`. What breaks it is mixing: every non-sysroot
+  crate in the link (and every rlib/rmeta it reads) must be built by
+  this backend with the same file. Objects built without the knob, with
+  a different file, or by stock rustc (`harness/crates.py --deps stock`)
+  disagree on offsets — undefined behaviour, not a link error. Two
+  crates with the same name share keys; that is consistent, only
+  coarser.
+
 ## Knobs
 
 | env | effect |
 | --- | --- |
+| `PLIRON_FIELD_HEAT=<file>` | append per-field access weights for the crate (see Field order) |
+| `PLIRON_FIELD_ORDER=<file>` | hot fields first inside same-size/alignment groups of listed `repr(Rust)` structs (see Field order) |
 | `PLIRON_PGO=<dir>` | instrument build; profile written to `<dir>/pliron-<pid>.prof` (or `$PLIRON_PROFILE_FILE`) |
 | `PLIRON_PGO_OPT=1` | optimize the instrumented build too (default: it is built unoptimized — the counters sit on the pre-optimization CFG, the profile is the same, the build is about a third faster and the profiling run about 2x slower) |
 | `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |

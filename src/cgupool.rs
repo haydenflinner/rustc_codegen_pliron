@@ -1031,6 +1031,8 @@ pub(crate) fn finish_pre(
         }
         if let Some(f) = env_get("PLIRON_PGO_USE") {
             pgo::load(ctx, st, f);
+            // `PLIRON_FIELD_HEAT`: weigh this CGU's field accesses.
+            crate::field_order::resolve(name, st);
         }
         if let Some(a) = asm {
             // The ctor's `jmp __pliron_prof_register` resolves through the

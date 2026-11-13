@@ -28,6 +28,8 @@ mod hot_layout;
 mod builder;
 mod cgupool;
 mod debuginfo;
+mod devirt;
+mod field_order;
 mod consts;
 mod context;
 mod intrinsic;
@@ -1055,6 +1057,12 @@ impl CodegenBackend for PlironCodegenBackend {
         }
     }
 
+    // `PLIRON_FIELD_ORDER=<file>`: profile-guided field order wraps
+    // `layout_of`. Unset, no provider is touched.
+    fn provide(&self, providers: &mut rustc_middle::util::Providers) {
+        field_order::provide(providers);
+    }
+
     fn target_cpu(&self, _sess: &Session) -> String {
         "generic".to_string()
     }
@@ -1078,10 +1086,13 @@ impl CodegenBackend for PlironCodegenBackend {
         _outputs: &OutputFilenames,
         crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
-        ongoing_codegen
+        let r = ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<PlironCodegenBackend>>()
             .expect("expected PlironCodegenBackend's OngoingCodegen")
-            .join(sess, incr_comp_session, crate_info)
+            .join(sess, incr_comp_session, crate_info);
+        // `PLIRON_FIELD_HEAT`: every CGU is done, append the crate's totals.
+        field_order::flush();
+        r
     }
 }
 
@@ -1672,6 +1683,13 @@ fn module_codegen(
         }
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
+    if field_order::heat_on() {
+        let fns = mono_items.iter().filter_map(|&(m, _)| match m {
+            rustc_middle::mono::MonoItem::Fn(i) => Some(i),
+            _ => None,
+        });
+        field_order::record_cgu(&cx, cgu_name.as_str(), fns.chain(extra.iter().copied()));
+    }
     drop(_sdef);
     let m = if cgupool::enabled(tcx) {
         // Hand the finished pliron module to the worker pool: IR-opt,

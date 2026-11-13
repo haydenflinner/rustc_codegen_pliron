@@ -56,6 +56,9 @@ pub struct CodegenCx<'tcx> {
     /// CGU symbol this codegen context is building (set at construction;
     /// read-only afterwards — tracing uses it without borrowing `st`).
     pub cgu_name: String,
+    /// `PLIRON_DEVIRT`: direct-call targets per virtual-call instance
+    /// (`devirt::candidates`), or why there are none.
+    pub devirt: RefCell<FxHashMap<Instance<'tcx>, Result<Vec<Instance<'tcx>>, String>>>,
 }
 
 // r[impl front.ir.symbols]
@@ -101,6 +104,7 @@ impl<'tcx> CodegenCx<'tcx> {
             dbg_insts: Default::default(),
             dbg_files: Default::default(),
             dbg_types: Default::default(),
+            devirt: Default::default(),
         }
     }
 
