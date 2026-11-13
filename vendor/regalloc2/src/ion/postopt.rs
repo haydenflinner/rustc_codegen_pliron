@@ -315,6 +315,10 @@ pub fn run<F: Function>(func: &F, ctx: &mut Ctx) {
         dead_stores(func, out, &first, &mut stats);
     }
 
+    if crate::postopt_stats() {
+        region_census(func, out, &first);
+    }
+
     if crate::postopt_stats() && stats.reload + stats.fwd + stats.store + stats.dead > 0 {
         #[cfg(feature = "std")]
         std::eprintln!(
@@ -452,5 +456,73 @@ fn dead_stores<F: Function>(func: &F, out: &mut crate::Output, first: &[usize], 
     out.edits.truncate(k);
     if has_vregs {
         out.edit_vregs.truncate(k);
+    }
+}
+
+/// `PLIRON_RA2_POSTOPT_STATS=1` diagnostic: for every loop (a back edge
+/// `u -> h`, taken as the block range `h..=u`), the reloads of slots the
+/// range never writes, and how many integer registers the range never
+/// touches at all (no operand, no clobber, no edit). A range with
+/// invariant reloads and an untouched register could keep the value in
+/// that register for the whole loop.
+fn region_census<F: Function>(func: &F, out: &crate::Output, first: &[usize]) {
+    let nb = func.num_blocks();
+    let mut lines = 0;
+    for u in 0..nb {
+        for &h in func.block_succs(Block::new(u)) {
+            let h = h.index();
+            if h > u {
+                continue;
+            }
+            let mut touched = crate::PRegSet::empty();
+            let mut written: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+            let mut reloads: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+            let mut calls = 0;
+            for b in h..=u {
+                for inst in func.block_insns(Block::new(b)).iter() {
+                    let base = out.inst_alloc_offsets[inst.index()] as usize;
+                    for (i, op) in func.inst_operands(inst).iter().enumerate() {
+                        let a = out.allocs[base + i];
+                        if let Some(r) = a.as_reg() {
+                            touched.add(r);
+                        } else if let (Some(s), OperandKind::Def) = (a.as_stack(), op.kind()) {
+                            written.push(s.index() as u32);
+                        }
+                    }
+                    let cl = func.inst_clobbers(inst);
+                    if cl != crate::PRegSet::empty() {
+                        calls += 1;
+                    }
+                    touched.union_from(cl);
+                }
+                for e in first[b]..first[b + 1] {
+                    let Edit::Move { from, to } = out.edits[e].1;
+                    for a in [from, to] {
+                        if let Some(r) = a.as_reg() {
+                            touched.add(r);
+                        }
+                    }
+                    if let Some(s) = to.as_stack() {
+                        written.push(s.index() as u32);
+                    }
+                    if let (Some(s), true) = (from.as_stack(), to.is_reg()) {
+                        reloads.push(s.index() as u32);
+                    }
+                }
+            }
+            let inv = reloads.iter().filter(|s| !written.contains(s)).count();
+            let mut slots: alloc::vec::Vec<u32> = reloads.iter().copied().filter(|s| !written.contains(s)).collect();
+            slots.sort();
+            slots.dedup();
+            let free_int = (0..31).filter(|&i| !touched.contains(PReg::new(i, RegClass::Int))).count();
+            if inv >= 2 && lines < 6 {
+                lines += 1;
+                #[cfg(feature = "std")]
+                std::eprintln!(
+                    "ra2region: blocks {h}..={u} calls {calls} invariant-reloads {inv} of {} slots, int regs untouched {free_int}",
+                    slots.len()
+                );
+            }
+        }
     }
 }

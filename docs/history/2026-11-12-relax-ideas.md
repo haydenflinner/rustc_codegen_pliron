@@ -131,3 +131,32 @@ tests on save (`PLIRON_HOT_REACH=1`, `examples/hot-test.sh`, `hotdiff`),
 `PLIRON_HOT_FREE=protect`. The loader's fingerprints no longer hash an
 anonymous constant's address, which had made every function naming a
 constant look changed after an unrelated edit.
+
+## The reload-after-call pattern in `scalar_iterate_special_bytes` (evening)
+
+Two values are stored once at entry (`stp x20, x4, [sp, #0x188]`) and
+loaded ~60 times. Looked at before building anything:
+
+- The `ldr x20, [sp, #0x188]` sites are mostly `ldr; b <block>`: edge
+  reloads into regions where the value does live in `x20`. regalloc2
+  already split it; these are the entries to the register pieces, not a
+  per-use reload after each call.
+- `PLIRON_RA2_POSTOPT_STATS=1` now prints a per-loop census
+  (`ra2region:` — invariant reloads, slots, untouched integer
+  registers). On pulldown-cmark every loop with invariant reloads has
+  calls and only 3-6 untouched integer registers, i.e. the reserved
+  ones: no register is free to hold the value across the loop, so a
+  region-window pass has nothing to work with.
+- Existing knobs, sampled (200 runs, `asmvs --env`, with SRCVREG):
+  `LOOPDEPTH=1` alone makes the function 2.4x slower (448 -> 1058
+  samples, spill 85 -> 902); `LOOPDEPTH=1 LOOPSPLIT=1` is level
+  (431, spill 151); `REMATW=1` is inside run-to-run noise (87 vs 119
+  spill samples; two runs of the same build gave 85 and 119).
+- Size of the prize: spill traffic is 85-120 of ~450 samples in this
+  function, ~3% of the program; the two entry-stored slots are a
+  fraction of that. Explicit-slot loads (`slot-load`, 180 samples) are
+  the larger stack cost on this program.
+
+Nothing built for it: the cause is register pressure in a 5,800-op
+inlined body (more than ten values live across its calls), not a
+missing allocator mechanism.
