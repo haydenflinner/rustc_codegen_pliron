@@ -1038,6 +1038,17 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         }
         break 'retry;
     }
+    // PGO: hand the blocks' profile counts to the backend (placement
+    // and spill-weight frequencies read them under `PLIRON_PGO_FREQ=1`).
+    // Blocks the CLIF passes created carry none; the estimator falls back
+    // to its static rules around them.
+    if !j.prof.is_empty() {
+        for (&b, &c) in &j.prof {
+            if clctx.func.layout.is_block_inserted(b) {
+                clctx.func.layout.set_prof_count(b, c);
+            }
+        }
+    }
     drop(_spipe);
     // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
     // per-function total for the tier-1 cache sizing question.

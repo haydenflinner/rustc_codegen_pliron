@@ -39,6 +39,9 @@ pub struct Layout {
     /// PLIRON: static branch hint per block: `k + 1` when arm `k` of the
     /// block's `brif` is unlikely (0: no hint). Read by block placement.
     unlikely: SecondaryMap<Block, u8>,
+    /// PLIRON: profile count of each block plus one (0: none recorded).
+    /// Read by block placement and the spill-weight frequencies.
+    prof: SecondaryMap<Block, u64>,
 
     /// Last block in the layout order, or `None` when no blocks have been laid out.
     last_block: Option<Block>,
@@ -54,6 +57,7 @@ impl Layout {
         Self {
             blocks: SecondaryMap::new(),
             unlikely: SecondaryMap::new(),
+            prof: SecondaryMap::new(),
             insts: SecondaryMap::new(),
             first_block: None,
             last_block: None,
@@ -69,6 +73,7 @@ impl Layout {
         self.last_block = None;
         self.num_blocks = 0;
         self.unlikely.clear();
+        self.prof.clear();
     }
 
     /// Returns the capacity of the `BlockData` map.
@@ -387,6 +392,17 @@ impl Layout {
     /// Is the given block cold?
     pub fn is_cold(&self, block: Block) -> bool {
         self.blocks[block].cold
+    }
+
+    /// PLIRON: record `block`'s profile count (executions in the
+    /// profiled run).
+    pub fn set_prof_count(&mut self, block: Block, count: u64) {
+        self.prof[block] = count.saturating_add(1);
+    }
+
+    /// PLIRON: `block`'s profile count, if one was recorded.
+    pub fn prof_count(&self, block: Block) -> Option<u64> {
+        self.prof[block].checked_sub(1)
     }
 
     /// PLIRON: mark arm `arm` (0 or 1) of `block`'s `brif` as unlikely.

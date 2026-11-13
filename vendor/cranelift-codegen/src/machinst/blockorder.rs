@@ -91,6 +91,9 @@ pub struct BlockLoweringOrder {
     /// PLIRON: (block, successor index) pairs the CLIF marked unlikely
     /// (`Layout::unlikely_arm`), for emission-time placement.
     unlikely_succs: FxHashSet<(BlockIndex, usize)>,
+    /// PLIRON: profile count per lowered block (`Layout::prof_count` of
+    /// its CLIF block; none for critical-edge blocks).
+    prof_counts: Vec<Option<u64>>,
     /// PLIRON: targets of true dominance back-edges (loop headers, and
     /// the critical-edge blocks materialized for such edges). Edges
     /// that merely point backward in emission order — e.g. merge
@@ -492,6 +495,13 @@ impl BlockLoweringOrder {
         let mut lowered_succ_indices = Vec::new();
         let mut cold_blocks = FxHashSet::default();
         let mut unlikely_succs = FxHashSet::default();
+        let prof_counts: Vec<Option<u64>> = lowered_order
+            .iter()
+            .map(|lb| match lb {
+                &LoweredBlock::Orig { block } => f.layout.prof_count(block),
+                _ => None,
+            })
+            .collect();
         let mut indirect_branch_targets = FxHashSet::default();
         let mut back_edge_targets = FxHashSet::default();
         let lowered_succ_ranges =
@@ -569,6 +579,7 @@ impl BlockLoweringOrder {
             blockindex_by_block,
             cold_blocks,
             unlikely_succs,
+            prof_counts,
             back_edge_targets,
             indirect_branch_targets,
         };
@@ -600,6 +611,11 @@ impl BlockLoweringOrder {
     /// Determine whether the given lowered-block index is cold.
     pub fn is_cold(&self, block: BlockIndex) -> bool {
         self.cold_blocks.contains(&block)
+    }
+
+    /// PLIRON: the block's profile count, if recorded.
+    pub fn prof_count(&self, block: BlockIndex) -> Option<u64> {
+        self.prof_counts.get(block.index()).copied().flatten()
     }
 
     /// PLIRON: is successor `idx` of `block` hinted unlikely?

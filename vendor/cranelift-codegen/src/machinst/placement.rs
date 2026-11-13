@@ -92,6 +92,26 @@ pub fn frequencies(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: 
     analyze(entry, succs, cold, unlikely).map(|a| a.freq)
 }
 
+std::thread_local! {
+    /// PLIRON (`PLIRON_PGO_FREQ=1`): profile counts per block for the
+    /// `analyze` call in progress (`with_counts`). A thread-local so the
+    /// two entry points keep their signatures.
+    static COUNTS: core::cell::RefCell<Vec<Option<u64>>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` (a `frequencies` or `place` call) with real profile counts:
+/// where every successor of a block has a count, the edge probabilities
+/// are the counts' shares instead of the static guesses (back edges 8:1,
+/// hints, cold). A successor without a count of its own (a critical-edge
+/// block) takes its single successor's. LLVM's profile gain is largely
+/// this: block placement and spill weights from measured frequencies.
+pub fn with_counts<R>(counts: Vec<Option<u64>>, f: impl FnOnce() -> R) -> R {
+    COUNTS.with(|c| *c.borrow_mut() = counts);
+    let r = f();
+    COUNTS.with(|c| c.borrow_mut().clear());
+    r
+}
+
 fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bool>]) -> Option<Freq> {
     let n = succs.len();
     if n < 3 || n > MAX_BLOCKS || cold[entry] {
@@ -256,11 +276,39 @@ fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bo
     }
     // Edge probabilities.
     let is_back = |b: usize, s: usize| rpo_idx[s] <= rpo_idx[b];
+    let counts: Vec<Option<u64>> = COUNTS.with(|c| c.borrow().clone());
+    let count_of = |mut s: usize| -> Option<u64> {
+        for _ in 0..4 {
+            if let Some(c) = counts.get(s).copied().flatten() {
+                return Some(c);
+            }
+            if succs[s].len() != 1 {
+                return None;
+            }
+            s = succs[s][0];
+        }
+        None
+    };
     let prob: Vec<Vec<f64>> = (0..n)
         .map(|b| {
             let ss = &succs[b];
             if ss.is_empty() {
                 return Vec::new();
+            }
+            // Measured: every successor counted, and the branch ran.
+            if counts.len() == n && ss.len() > 1 {
+                let cs: Vec<Option<u64>> = ss.iter().map(|&s| count_of(s)).collect();
+                if cs.iter().all(|c| c.is_some()) {
+                    let sum: u64 = cs.iter().map(|c| c.unwrap()).sum();
+                    if sum > 0 {
+                        // Never exactly 0: the walk below divides mass
+                        // along every edge, and a path the profiled run
+                        // skipped can still run.
+                        let w: Vec<f64> = cs.iter().map(|c| (c.unwrap() as f64 / sum as f64).max(1e-4)).collect();
+                        let t: f64 = w.iter().sum();
+                        return w.into_iter().map(|x| x / t).collect();
+                    }
+                }
             }
             let any_back = ss.iter().any(|&s| is_back(b, s) && !cold[s]);
             let lp = innermost[b];

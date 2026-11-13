@@ -1373,6 +1373,19 @@ impl<I: VCodeInst> VCode<I> {
         Some(out)
     }
 
+    /// PLIRON (`PLIRON_PGO_FREQ=1`, opt-in): the profile count of every
+    /// block, for `placement::with_counts`; empty when the knob is off or
+    /// the function carries no counts.
+    fn pliron_prof_counts(&self) -> Vec<Option<u64>> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_PGO_FREQ").as_deref() == Ok("1")) {
+            return Vec::new();
+        }
+        let v: Vec<Option<u64>> =
+            (0..self.num_blocks()).map(|b| self.block_order.prof_count(BlockIndex::new(b))).collect();
+        if v.iter().any(|c| c.is_some()) { v } else { Vec::new() }
+    }
+
     /// PLIRON: fill `block_freq` (see the field) before regalloc when
     /// `PLIRON_RA2_FREQ` is set: the same graph, cold marks and branch
     /// hints the emission-time placement uses.
@@ -1396,7 +1409,10 @@ impl<I: VCodeInst> VCode<I> {
         let unlikely: Vec<Vec<bool>> = (0..nb)
             .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
             .collect();
-        if let Some(freq) = super::placement::frequencies(self.entry.index(), &succs, &cold, &unlikely) {
+        let counts = self.pliron_prof_counts();
+        if let Some(freq) = super::placement::with_counts(counts, || {
+            super::placement::frequencies(self.entry.index(), &succs, &cold, &unlikely)
+        }) {
             self.block_freq = freq.into_iter().map(|f| f as f32).collect();
         }
     }
@@ -1694,7 +1710,10 @@ impl<I: VCodeInst> VCode<I> {
             let unlikely: Vec<Vec<bool>> = (0..nb)
                 .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
                 .collect();
-            if let Some((order, heads)) = super::placement::place(self.entry.index(), &succs, &cold, &empty, &unlikely) {
+            let counts = self.pliron_prof_counts();
+            if let Some((order, heads)) = super::placement::with_counts(counts, || {
+                super::placement::place(self.entry.index(), &succs, &cold, &empty, &unlikely)
+            }) {
                 if order.len() == final_order.len() {
                     final_order = order.into_iter().map(BlockIndex::new).collect();
                     chain_heads = Some(heads);

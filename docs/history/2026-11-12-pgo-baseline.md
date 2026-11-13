@@ -55,3 +55,54 @@ Failures under `PLIRON_PGO_USE`:
   wrong step is probably on the pliron-IR side (`sroa`) with the CLIF
   step only exposing it. Repro: `PLIRON_PGO_USE=target/heldout/pgo/
   blind-sig/pliron.prof` on the blind-sig benchmark crate.
+
+## Night: both failures fixed, two consumers built, neither pays yet
+
+- blind-sig crash: not a profile bug. `skip_jmp` (drop the jump into an
+  aligned loop header that is emitted next, fall through the pad) did
+  not check that the header still had code; `PLIRON_BJALIAS` removes
+  bare-jump headers, so execution fell into the following block. The
+  profile only changed block order enough to hit it (4a2221b).
+  Ablation knobs added on the way: `PLIRON_PGO_{EXPECT,INLINE,COLD}=0`.
+- All eight programs now run under our profile. With
+  `PLIRON_PGO_HOT=13`: pliron-pgo/pliron 1.000 [0.973, 1.030],
+  llvm-pgo/llvm 0.908 [0.904, 0.970], pliron-pgo/llvm-pgo 1.194, loop
+  cost 2.52x a plain LLVM build.
+
+What LLVM's profile does on pulldown-cmark (per-function sample diff of
+its two builds): hot callees disappear into their callers
+(`parse_line`, `parse_block`, `escape_html_scalar`, `Tree::append`,
+`item_to_event`, `memchr`), text +8%, no `.cold` symbols.
+
+Consumers built, both opt-in:
+
+- `PLIRON_PGO_HOT=<k>`: a call site at or above the profile's hot
+  count (blocks covering 99% of all counts) gets `k` x the inline limit
+  and skips `loopy`/`fanin`/growth. Scaled counts no longer round a
+  block that ran down to 0.
+- `PLIRON_PGO_FREQ=1`: block counts ride `Layout::prof_count` into the
+  lowering order, and `placement::analyze` takes measured edge
+  probabilities where every successor has a count — so block placement
+  and regalloc2's spill weights see real frequencies instead of the
+  8:1 back-edge / hint / cold guesses.
+
+Measured (15-21 interleaved rounds, ratios to plain LLVM):
+
+| | pulldown-cmark | rust-html-rewriter |
+|---|---|---|
+| pliron | 1.12-1.18 | 1.14 |
+| + profile | 1.13-1.20 | 1.09 |
+| + profile + FREQ | 1.12 | 1.10 |
+| + profile + FREQ + HOT=13 | 1.11 | 1.12 |
+| LLVM + profile | 0.84-0.87 | 0.84-0.85 |
+| LLVM + profile, hot-callsite bonus off | 0.86 | 0.87 (binary identical) |
+
+Both knobs change the code and neither moves the time beyond noise.
+LLVM keeps nearly all of its gain with the hot-call-site threshold set
+back to the default, so the threshold bonus is not what its profile
+buys either. Open: what is. Leads not yet followed: 1,970 of our
+rejected call sites on pulldown-cmark are "no body in this CGU"
+(LLVM's release builds have thin-local LTO across the crate's units;
+our cross-unit copies skip large callees), and one unit for everything
+is not the answer (pulldown-cmark at `-Ccodegen-units=1` is 1.29x even
+without a profile — itself worth a look).
