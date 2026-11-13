@@ -239,3 +239,45 @@ profile-driven loop passes are net harmful; the opt-in knobs from the
 relax work (`ELABLOOPS=2`, `RA2_POSTOPT`) pay on rust-compression;
 rust-protobuf wants small inline copies everywhere and no hot-site
 bonus.
+
+## 2026-11-13: layout closed out; opt-in knobs without a profile
+
+**Layout.** `PLIRON_PLACE_OPT=1` (new, opt-in): local search on the
+finished order — move a block's likeliest successor (with its
+fallthrough run) behind it when the expected taken-transfer mass
+drops. It moves the model score from 0.384 to 0.382 transfers per block
+on rust-html-rewriter and nothing measurable in run time (11 rounds,
+two programs). The chain order is already a local optimum of the
+model; what separates it from the floor is joins and loop shapes, which
+only a transformation (tail duplication) changes, not an order. LLVM's
+"placement off" baseline is source order with arbitrary branch
+polarity; ours (`PLIRON_PLACE=0`: RPO with cold blocks sunk) is within
+1% of our best. Layout is not where our gap is.
+
+**LLVM's profile on rust-html-rewriter** (0.820 of plain): placement
+off 0.895, memop off 0.840, ICP off 0.844, hot-callsite bonus off
+0.826.
+
+**Opt-in knobs without a profile**, all eight programs, 9 rounds,
+geomean time / instructions against defaults:
+
+| knob | time | instructions |
+|---|---|---|
+| `PLIRON_MEMFAST_SMALL=1` | **0.967** | 0.992 |
+| `PLIRON_RA2_SRCVREG=1` | 0.990 | 1.000 |
+| `PLIRON_RA2_POSTOPT=15` | 0.991 | 1.000 |
+| `PLIRON_PLACE_ROT=1` | 0.992 | 1.000 |
+| `PLIRON_INLINE=640` | 0.997 | 1.013 |
+| `PLIRON_ELABLOOPS=2` | 1.007 | 1.006 |
+| `PLIRON_XCGU_SIZE=200` | 1.009 | 1.002 |
+
+`MEMFAST_SMALL=1` wins on six programs (regex 0.92, rust-protobuf
+0.93, pulldown-cmark 0.94, rust-json 0.95) and costs code size:
+instructions in the binary +1.7% (pulldown-cmark, rust-html-rewriter),
++1.9% (rust-compression), +6.5% (regex). Left opt-in for that reason
+(SIZ is the card's weakest axis); under a profile it is on at hot
+sites only. The rest are inside the noise of a 9-round run.
+
+Candidate bundle changes (`PGO_LOOP=0`, `PGO_WARM=0`, `PLACE_ROT=1`),
+eight programs, 9 rounds: 0.977 / 1.008 / 0.993 geomean with one noisy
+program driving the first — no change made.

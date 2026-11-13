@@ -879,6 +879,110 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
     if order.first() != Some(&entry) {
         return None;
     }
+    // `PLIRON_PLACE_OPT=1` (opt-in): local search on the finished order.
+    // The chain walk commits greedily; a block whose likeliest successor
+    // ended up elsewhere pays a taken transfer on its hottest edge. For
+    // each such block, try moving the successor's fallthrough run (the
+    // successor and the blocks that already follow it by their own
+    // likeliest edges) to right behind the block, and keep the move when
+    // the order's expected taken-transfer mass drops. Quadratic, so only
+    // for functions up to `MAX_OPT` placed blocks; up to 3 passes.
+    static OPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    const MAX_OPT: usize = 320;
+    if *OPT.get_or_init(|| std::env::var("PLIRON_PLACE_OPT").as_deref() == Ok("1")) && order.len() <= MAX_OPT {
+        let hottest = |b: usize| -> Option<usize> {
+            let mut best: Option<(f64, usize)> = None;
+            for (k, &t) in succs[b].iter().enumerate() {
+                if best.is_none_or(|(w, _)| prob[b][k] > w) {
+                    best = Some((prob[b][k], res[t]));
+                }
+            }
+            best.map(|(_, t)| t)
+        };
+        let cost = |order: &[usize]| -> f64 {
+            let mut next = vec![usize::MAX; n];
+            let mut prev: Option<usize> = None;
+            for &b in order {
+                if empty[b] {
+                    continue;
+                }
+                if let Some(p) = prev {
+                    next[p] = b;
+                }
+                prev = Some(b);
+            }
+            let mut c = 0.0;
+            for &b in order {
+                if empty[b] {
+                    continue;
+                }
+                for (k, &t) in succs[b].iter().enumerate() {
+                    if res[t] != next[b] {
+                        c += edge_w(b, k);
+                    }
+                }
+            }
+            c
+        };
+        let mut cur = cost(&order);
+        for _pass in 0..3 {
+            let mut improved = false;
+            let mut i = 0;
+            while i < order.len() {
+                let b = order[i];
+                i += 1;
+                if empty[b] || freq[b] <= 0.0 {
+                    continue;
+                }
+                let Some(s) = hottest(b) else { continue };
+                if s == entry || s == b || cold[s] || empty[s] {
+                    continue;
+                }
+                let Some(ps) = order.iter().position(|&x| x == s) else { continue };
+                // Already the next placed block?
+                if order[i..].iter().find(|&&x| !empty[x]) == Some(&s) {
+                    continue;
+                }
+                // The run that follows `s` by likeliest edges.
+                let mut end = ps + 1;
+                while end < order.len() {
+                    let x = order[end - 1];
+                    if order[end] == b || hottest(x) != Some(order[end]) {
+                        break;
+                    }
+                    end += 1;
+                }
+                if (ps..end).contains(&(i - 1)) {
+                    continue;
+                }
+                let run: Vec<usize> = order[ps..end].to_vec();
+                let mut trial: Vec<usize> = Vec::with_capacity(order.len());
+                for (j, &x) in order.iter().enumerate() {
+                    if (ps..end).contains(&j) {
+                        continue;
+                    }
+                    trial.push(x);
+                    if x == b {
+                        trial.extend(run.iter().copied());
+                    }
+                }
+                let c = cost(&trial);
+                if c < cur * (1.0 - 1e-6) - 1e-9 {
+                    order = trial;
+                    cur = c;
+                    improved = true;
+                    // `b` may have moved: rescan from the start of the order.
+                    i = 0;
+                    if !improved {
+                        break;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
     static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DEBUG.get_or_init(|| std::env::var("PLIRON_PLACE_DEBUG").as_deref() == Ok("1")) {
         let mut s = alloc::string::String::new();
