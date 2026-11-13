@@ -38,6 +38,15 @@ fn main() {
     let xs: Vec<u16> = (0..500).collect();
     println!("fold: {}", dvlib::fold(&*fs[0], &xs) ^ dvlib::fold(&*fs[1], &xs));
 
+    // Upstream closures that use private items of `dvlib`.
+    let gs: Vec<Box<dyn Fn(u32) -> u32>> = (0..4).map(|i| dvlib::make2(black_box(i))).collect();
+    let mut t = [0u32; 4];
+    for i in 0..4000u32 {
+        let j = (i % 4) as usize;
+        t[j] = t[j].wrapping_add(gs[j](i));
+    }
+    println!("make2: {t:?} {}", dvlib::count());
+
     // Upstream impls plus one defined here.
     let mut ops = dvlib::ops();
     ops.push(Box::new(Xor(0x55)));

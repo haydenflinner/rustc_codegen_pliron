@@ -15,6 +15,7 @@ extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
+extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
@@ -1062,6 +1063,9 @@ impl CodegenBackend for PlironCodegenBackend {
     // `layout_of`. Unset, no provider is touched.
     fn provide(&self, providers: &mut rustc_middle::util::Providers) {
         field_order::provide(providers);
+        // Profile-use builds: profiled indirect-call targets become
+        // instantiable downstream (`reachable_set`).
+        devirt::provide(providers);
     }
 
     fn target_cpu(&self, _sess: &Session) -> String {

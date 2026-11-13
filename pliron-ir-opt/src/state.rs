@@ -615,6 +615,20 @@ pub struct State {
     /// `devirt::promote` guards the hot ones; both number a function's
     /// sites by position, so only ops still in place count.
     pub icall_sites: ColMap<Ptr<Operation>, String>,
+    /// The direct calls `devirt::promote` put on guard hit arms (and the
+    /// inliner's clones of them): what `devirt::report` checks after the
+    /// inline rounds to say which promoted calls were inlined.
+    pub icp_calls: rustc_hash::FxHashMap<Ptr<Operation>, crate::devirt::IcpCall>,
+    /// The promoted calls the inliner has taken.
+    pub icp_inlined: Vec<crate::devirt::IcpCall>,
+    /// Home aliases this CGU's guards compare against
+    /// (`devirt::home_alias` names; nothing else refers to them).
+    pub icp_aliases: FxHashSet<String>,
+    /// Bodies that are this crate's instantiation of a function another
+    /// crate was profiled with (a local copy of a dependency's promoted
+    /// target): local symbol -> the symbol the profile knows it by.
+    /// `pgo::load` looks such a body up under that name.
+    pub prof_as: FxHashMap<String, String>,
     /// The profile's hot count: the smallest block count among the blocks
     /// that together carry 99% of all counted executions (LLVM's
     /// `ProfileSummary` hot threshold). A call site at or above it is hot.
@@ -675,6 +689,7 @@ impl State {
         self.region_parent.retain(lb);
         self.prof_bcount.retain(lb);
         self.icall_sites.retain(lo);
+        self.icp_calls.retain(|o, _| lo(o));
         if self.last_call.is_some_and(|c| !c.is_live(ctx)) {
             self.last_call = None;
         }

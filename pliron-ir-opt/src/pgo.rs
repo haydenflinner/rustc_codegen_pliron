@@ -54,6 +54,12 @@ pub const ICALL_MAGIC: u64 = u64::from_le_bytes(*b"PLICALL2");
 pub const SLOTS: usize = 4;
 /// `ProfTarget::flags`: the target's symbol is visible to other objects.
 pub const TARGET_EXTERNAL: u32 = 1;
+/// `ProfTarget::flags`: the address is a mono item's definition in its
+/// own CGU, not a cross-CGU copy the backend added (`State::xcgu_extra`).
+/// Only such a definition gets a home alias in the profile-use build
+/// (`devirt::home_alias`), so only such a target can be guarded from
+/// another object.
+pub const TARGET_ITEM: u32 = 2;
 
 /// One callee an indirect-call site reached.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -387,7 +393,12 @@ pub fn instrument(
             let ext = st.funcs.get(&sym).is_some_and(|f| {
                 matches!(f.linkage, Linkage::Export | Linkage::Hidden | Linkage::Preemptible)
             }) && !st.xcgu_extra.contains(&sym);
-            ftab.push((sym_hash(&sym), sym.clone(), if ext { TARGET_EXTERNAL } else { 0 }));
+            let item = !st.xcgu_extra.contains(&sym);
+            ftab.push((
+                sym_hash(&sym),
+                sym.clone(),
+                if ext { TARGET_EXTERNAL } else { 0 } | if item { TARGET_ITEM } else { 0 },
+            ));
         }
         let edges = if edges_on { all_edges } else { Vec::new() };
         let sh = sym_hash(&sym);
@@ -862,6 +873,9 @@ pub struct Summary {
     /// Every symbol some indirect-call site of the profile reached, with
     /// the symbol hashes of the functions holding those sites.
     pub icall_targets: FxHashMap<String, Vec<u64>>,
+    /// The same, one entry per (function holding sites, target): the
+    /// target as profiled, its count summed over the function's sites.
+    pub icalls: Vec<(u64, ProfTarget)>,
 }
 
 /// The summary of `PLIRON_PGO_USE`'s profile, read once per process.
@@ -896,7 +910,17 @@ pub fn summary() -> Option<&'static Summary> {
                 }
             }
         }
-        Some(Summary { hot, entry, icall_targets })
+        let mut icalls: Vec<(u64, ProfTarget)> = Vec::new();
+        for ((caller, _), f) in &profiles {
+            let mut sum = ProfSite::default();
+            for s in &f.sites {
+                sum.merge(s);
+            }
+            icalls.extend(sum.targets.into_iter().filter(|t| t.count > 0).map(|t| (*caller, t)));
+        }
+        // Hash-map order must not reach any decision made from this.
+        icalls.sort_by(|a, b| (a.0, &a.1.name, a.1.cgu).cmp(&(b.0, &b.1.name, b.1.cgu)));
+        Some(Summary { hot, entry, icall_targets, icalls })
     })
     .as_ref()
 }
@@ -953,8 +977,11 @@ pub fn load(ctx: &Context, st: &mut State, path: &str) -> usize {
         if !has_body(ctx, f.op) {
             continue;
         }
-        let sh = sym_hash(sym);
-        let Some(cands) = by_sym.get(&sh) else {
+        // A function's own record first; a local instantiation of a
+        // dependency's function (`State::prof_as`) that never ran under
+        // its own name takes the dependency's.
+        let own = by_sym.get(&sym_hash(sym));
+        let Some(cands) = own.or_else(|| by_sym.get(&sym_hash(st.prof_as.get(sym)?))) else {
             continue;
         };
         let (fp, _) = fingerprint(ctx, f.op);

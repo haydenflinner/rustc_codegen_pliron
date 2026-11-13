@@ -403,10 +403,25 @@ pub fn parse_raw_all(b: &[u8], m: &mut ProfileMap, ic: &mut IcallMap) -> bool {
         let ext = if v2 { raw_ext(&rest[ctrs_b..]) } else { None };
         if let Some(e) = &ext {
             for f in e.fns.chunks_exact(24) {
-                addr.insert(
-                    u64at(f, 8),
-                    (u64at(f, 0), u64at(f, 16) as u32, (e.crate_id, e.crate_hash), e.cgu),
-                );
+                // One address can be in several tables: a CGU lists every
+                // body it compiled, and a cross-CGU copy that went back to
+                // an import of its home definition lists the home's
+                // address. The mono item's own entry (flag 2, pgo.rs
+                // `TARGET_ITEM`) names the definition; among equals the
+                // smallest CGU hash, so the result does not depend on
+                // registration order.
+                let new = (u64at(f, 0), u64at(f, 16) as u32, (e.crate_id, e.crate_hash), e.cgu);
+                let rank = |x: &(u64, u32, (u64, u64), u64)| (x.1 & 2 == 0, x.3);
+                match addr.entry(u64at(f, 8)) {
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        if rank(&new) < rank(o.get()) {
+                            o.insert(new);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(new);
+                    }
+                }
             }
             let mut q = 0usize;
             while q + 10 <= e.names.len() {

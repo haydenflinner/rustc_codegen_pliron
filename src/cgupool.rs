@@ -1050,6 +1050,20 @@ pub(crate) fn finish_pre(
             }
         }
         if let Some(f) = env_get("PLIRON_PGO_USE") {
+            let cgu_hash = pgo::cgu_hash(name);
+            if let Some(c) = &cfg.icp {
+                // The profiled targets this CGU is the home of get their
+                // alias; this crate's copies of a dependency's targets
+                // take the dependency's profile records.
+                if let Some(homes) = c.targets.by_cgu.get(&cgu_hash) {
+                    pliron_ir_opt::devirt::define_aliases(ctx, st, cgu_hash, homes.iter().map(String::as_str));
+                }
+                for (local, prof) in &c.targets.bodies.dep_local {
+                    if st.funcs.get(local).is_some_and(|f| pliron_ir_opt::has_body(ctx, f.op)) {
+                        st.prof_as.insert(local.clone(), prof.clone());
+                    }
+                }
+            }
             pgo::load(ctx, st, f);
             // `PLIRON_DEVIRT`: guard the targets the profile saw at each
             // indirect-call site.
@@ -1058,8 +1072,8 @@ pub(crate) fn finish_pre(
                     ctx,
                     st,
                     &mut pliron_ir_opt::devirt::Icp {
-                        cgu: pgo::cgu_hash(name),
-                        linkable: &|t| c.linkable(t),
+                        cgu: cgu_hash,
+                        resolve: &|st, t| c.resolve(st, cgu_hash, t),
                         declare: &mut |ctx, st, sym, ty, exts| {
                             declare_fn_sym(ctx, st, module, sym, ty, Linkage::Import, exts);
                         },
@@ -1311,6 +1325,8 @@ pub(crate) fn iropt_head(
         // Inlining + SROA make vtable pointers constant: call those slots
         // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
         if pass_enabled("PLIRON_DEVIRT") {
+            // Profile guards on a pointer that is a constant by now.
+            pt!(prof, cgu, "icp-fold", pliron_ir_opt::devirt::fold_static(ctx, st));
             let (sites, owners) = pt!(prof, cgu, "devirt", inline::devirt(ctx, st));
             pt!(prof, cgu, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
             grew |= !sites.is_empty();
@@ -1356,6 +1372,8 @@ pub(crate) fn iropt_head(
             }
         }
     }
+    // `PLIRON_REMARKS`: which promoted indirect-call targets were inlined.
+    pliron_ir_opt::devirt::report(ctx, st);
     // The call graph is final after devirt-inline: every later pass only
     // deletes calls. Mark copies inlining left callerless now so the
     // whole tail (`nocap2`..`callgvn`, `dead_fns`' recounts) skips them.

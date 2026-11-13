@@ -17,10 +17,17 @@
 //! else -> the original indirect call
 //! ```
 //!
-//! A target is named by symbol wherever it lives (this CGU, another CGU,
-//! another crate). The indirect arm is always kept, so a wrong or stale
-//! profile costs a compare, never correctness — provided the symbol
-//! links, which is what the usability rule in `promote` is about.
+//! The guard and the call are two roles with two symbols. The guard must
+//! name the address the profile saw, the *home* definition: the target's
+//! own symbol when the home is this CGU, otherwise the home's alias
+//! ([`home_alias`], which the home CGU defines for every profiled target
+//! it holds as a mono item — [`define_aliases`]). The call goes to a body
+//! in this CGU when there is one (the home itself, a cross-CGU copy, or
+//! this crate's instantiation of a dependency's function), so the inliner
+//! can take it; otherwise it calls the home through the alias. The
+//! indirect arm is always kept, so a wrong or stale profile costs a
+//! compare, never correctness — provided the alias links, which is what
+//! `Icp::resolve` answers.
 
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface};
@@ -132,17 +139,87 @@ pub(crate) fn record_call(
     st.calls.insert(c, plain_call(fty.into(), ICALL_SYM));
 }
 
+/// The symbol a home CGU defines next to a profiled target, for guards
+/// in other objects: `<target>.icp.<hash of the home CGU's name>`. A
+/// second name is needed because the target's own name can be taken in
+/// the guarding CGU by a local copy (cross-CGU copies keep the symbol
+/// name, with internal linkage), and because the target itself may be
+/// private to its CGU.
+pub fn home_alias(sym: &str, cgu: u64) -> String {
+    format!("{sym}.icp.{cgu:016x}")
+}
+
+/// How one profiled target is guarded and called from the current CGU.
+pub struct Resolved {
+    /// The symbol whose address the profile saw.
+    pub guard: String,
+    /// The symbol the hit arm calls: a body in this CGU, or `guard`.
+    pub call: String,
+    /// `L`: the home definition is in this CGU. `C`: guard on the home's
+    /// alias, call to a body in this CGU. `X`: guard and call through
+    /// the alias (no body here).
+    pub tag: &'static str,
+}
+
+/// A direct call on a guard's hit arm (`State::icp_calls`).
+#[derive(Clone, Debug)]
+pub struct IcpCall {
+    /// The function holding the original site, the profiled target, and
+    /// the symbol called.
+    pub caller: String,
+    pub target: String,
+    pub callee: String,
+    /// Profiled calls of this target at the site.
+    pub count: u64,
+    pub tag: &'static str,
+}
+
 /// What the rustc side knows that this crate does not.
 pub struct Icp<'a> {
     /// Hash of this CGU's name (`pgo::cgu_hash`), as the instrumented
     /// build stored it with every target it defined (CGU names carry the
     /// crate's name and disambiguator).
     pub cgu: u64,
-    /// Can this CGU link a reference to a target that has no body here?
-    /// `Err` carries the reason for the remark.
-    pub linkable: &'a dyn Fn(&ProfTarget) -> Result<(), &'static str>,
+    /// The guard and call symbols for a target seen from this CGU, or
+    /// the reason (for the remark) it cannot be guarded.
+    pub resolve: &'a dyn Fn(&State, &ProfTarget) -> Result<Resolved, &'static str>,
     /// Declare an import of `sym` with the given signature.
     pub declare: &'a mut dyn FnMut(&mut Context, &mut State, &str, TypeHandle, Exts),
+}
+
+/// Profile-use build, in the home CGU: define the alias of every
+/// profiled target in `homes` (symbols this CGU holds as mono items, by
+/// the crate-wide rule the guarding CGUs also apply). The function stays
+/// as it is — private if it was — but counts as address-taken from here
+/// on (`address_taken` reads `State::aliases`), and it is never turned
+/// back into an import (`xcgu_home`). Returns the aliases defined.
+pub fn define_aliases<'s>(
+    ctx: &Context,
+    st: &mut State,
+    cgu: u64,
+    homes: impl Iterator<Item = &'s str>,
+) -> usize {
+    let mut n = 0;
+    for sym in homes {
+        let body = st.funcs.get(sym).is_some_and(|f| {
+            f.linkage != cranelift_module::Linkage::Import && has_body(ctx, f.op)
+        });
+        if !body {
+            // The crate-wide rule said this CGU defines it: a guard
+            // elsewhere may reference the alias, and the link would say
+            // so. Make the mismatch findable.
+            if pliron_cfg::tracing_on() {
+                tracing::warn!(target: "pliron::pgo", "pliron-pgo: {}: no body for profiled target {sym}: home alias not defined", st.cgu);
+            }
+            continue;
+        }
+        if st.xcgu_home.contains(sym) {
+            st.xcgu_home = st.xcgu_home.iter().filter(|s| s.as_str() != sym).cloned().collect();
+        }
+        st.aliases.push((home_alias(sym, cgu), sym.to_string(), false));
+        n += 1;
+    }
+    n
 }
 
 /// Profile-use build, after `pgo::load`: guard the hot targets of every
@@ -151,12 +228,8 @@ pub struct Icp<'a> {
 /// of the site's calls, hottest first. Returns the number of sites
 /// rewritten.
 ///
-/// A target is usable when the guard's `&symbol` is the address the
-/// profile saw and the symbol links:
-/// - it has a body in this CGU and the profiled address came from this
-///   very CGU (other CGUs' private copies have other addresses), or
-/// - it has no body here and `icp.linkable` accepts it (one external
-///   definition in this crate or in a dependency).
+/// Which targets are usable, and through which symbols, is
+/// `icp.resolve`'s answer (see the module comment).
 pub fn promote(ctx: &mut Context, st: &mut State, icp: &mut Icp<'_>) -> usize {
     if st.icall_sites.is_empty() {
         return 0;
@@ -184,7 +257,7 @@ pub fn promote(ctx: &mut Context, st: &mut State, icp: &mut Icp<'_>) -> usize {
                 "profile has {} sites, function has {}: not promoted", psites.len(), fsites.len());
             continue;
         }
-        for ((op, callee), ps) in fsites.into_iter().zip(psites) {
+        for (k, ((op, callee), ps)) in fsites.into_iter().zip(psites).enumerate() {
             let what = st.icall_sites.get(op).cloned().unwrap_or_default();
             let total: u64 = ps.targets.iter().fold(ps.other, |a, t| a.saturating_add(t.count));
             if total == 0 {
@@ -198,7 +271,7 @@ pub fn promote(ctx: &mut Context, st: &mut State, icp: &mut Icp<'_>) -> usize {
             }
             let mut order: Vec<&ProfTarget> = ps.targets.iter().collect();
             order.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-            let mut kept: Vec<&ProfTarget> = Vec::new();
+            let mut kept: Vec<(&ProfTarget, Resolved)> = Vec::new();
             let mut notes: Vec<String> = Vec::new();
             for t in order {
                 let pct = t.count as u128 * 100 / total as u128;
@@ -209,43 +282,36 @@ pub fn promote(ctx: &mut Context, st: &mut State, icp: &mut Icp<'_>) -> usize {
                     notes.push(format!("{pct}% over the arm limit"));
                     continue;
                 }
-                let here = st
-                    .funcs
-                    .get(&t.name)
-                    .filter(|f| f.linkage != cranelift_module::Linkage::Import);
-                let ok = match here {
-                    Some(f) if f.ty != info.fn_ty => Err("signature differs"),
-                    Some(_) if t.cgu == icp.cgu => Ok("L"),
-                    Some(_) => Err("this CGU holds another copy of the target"),
-                    None => match st.funcs.get(&t.name) {
-                        Some(f) if f.ty != info.fn_ty => Err("signature differs"),
-                        _ => (icp.linkable)(t).map(|()| "X"),
-                    },
-                };
-                // `PLIRON_DEVIRT_LINKED=0`: only targets whose body is in
-                // this CGU. A guard for a linked target buys a direct call
-                // (no inlining); this isolates what that is worth.
-                let ok = match ok {
-                    Ok("X") if crate::env_is("PLIRON_DEVIRT_LINKED", "0") => Err("linked targets off"),
-                    o => o,
-                };
-                match ok {
-                    Ok(k) => {
-                        notes.push(format!("{pct}%{k}"));
-                        kept.push(t);
+                let ok = (icp.resolve)(st, t).and_then(|r| {
+                    let sig = |s: &str| st.funcs.get(s).is_none_or(|f| f.ty == info.fn_ty);
+                    if !sig(&r.call) || !sig(&t.name) {
+                        return Err("signature differs");
                     }
-                    Err(why) => notes.push(format!("{pct}% unusable ({why})")),
+                    // `PLIRON_DEVIRT_LINKED=0`: only targets with a body in
+                    // this CGU. A guard for a linked target buys a direct
+                    // call (no inlining); this isolates what that is worth.
+                    if r.tag == "X" && crate::env_is("PLIRON_DEVIRT_LINKED", "0") {
+                        return Err("linked targets off");
+                    }
+                    Ok(r)
+                });
+                match ok {
+                    Ok(r) => {
+                        notes.push(format!("{pct}%{} [{}]", r.tag, t.name));
+                        kept.push((t, r));
+                    }
+                    Err(why) => notes.push(format!("{pct}% unusable ({why}) [{}]", t.name)),
                 }
             }
             let other_pct = ps.other as u128 * 100 / total as u128;
             pliron_cfg::remark!("devirt", caller, what;
-                "icp: kept {} of {} targets, calls {total} (shares {}; unnamed {other_pct}%; L = body in this CGU, X = linked)",
+                "icp: site {k} kept {} of {} targets, calls {total} (shares {}; unnamed {other_pct}%; L = home body in this CGU, C = copy in this CGU, X = linked)",
                 kept.len(), ps.targets.len(), notes.join(" "));
             if kept.is_empty() {
                 continue;
             }
-            let kept: Vec<ProfTarget> = kept.into_iter().cloned().collect();
-            guard(ctx, st, &mut rw, icp, op, callee, &info, &kept, total);
+            let kept: Vec<(ProfTarget, Resolved)> = kept.into_iter().map(|(t, r)| (t.clone(), r)).collect();
+            guard(ctx, st, &mut rw, icp, &caller, op, callee, &info, &kept, total);
             done += 1;
         }
     }
@@ -259,10 +325,11 @@ fn guard(
     st: &mut State,
     rw: &mut IRRewriter<DummyListener>,
     icp: &mut Icp<'_>,
+    caller: &str,
     op: Ptr<Operation>,
     callee: Value,
     info: &CallInfo,
-    kept: &[ProfTarget],
+    kept: &[(ProfTarget, Resolved)],
     total: u64,
 ) {
     let block = op.deref(ctx).get_parent_block().unwrap();
@@ -312,13 +379,18 @@ fn guard(
     let br = BrOp::new(ctx, guards[0], vec![]).get_operation();
     br.deref_mut(ctx).set_loc(loc.clone());
     br.insert_at_back(block, ctx);
-    for (k, t) in kept.iter().enumerate() {
-        if st.funcs.get(&t.name).is_none() {
-            (icp.declare)(ctx, st, &t.name, info.fn_ty, info.exts.clone());
+    for (k, (t, r)) in kept.iter().enumerate() {
+        if r.guard != t.name {
+            st.icp_aliases.insert(r.guard.clone());
+        }
+        for s in [&r.guard, &r.call] {
+            if st.funcs.get(s).is_none() {
+                (icp.declare)(ctx, st, s, info.fn_ty, info.exts.clone());
+            }
         }
         let hit = new_block(ctx);
         let next = guards.get(k + 1).copied().unwrap_or(fallback);
-        let addr = crate::sroa::mk_const(ctx, st, ptr_t, ConstVal::Sym { sym: t.name.clone(), off: 0 });
+        let addr = crate::sroa::mk_const(ctx, st, ptr_t, ConstVal::Sym { sym: r.guard.clone(), off: 0 });
         let eq = ICmpOp::new(ctx, ICmpPredicateAttr::EQ, callee, addr).get_operation();
         eq.deref_mut(ctx).set_loc(loc.clone());
         eq.insert_at_back(guards[k], ctx);
@@ -326,13 +398,25 @@ fn guard(
         let cbr = CondBrOp::new(ctx, cond, hit, vec![], next, vec![]).get_operation();
         cbr.deref_mut(ctx).set_loc(loc.clone());
         cbr.insert_at_back(guards[k], ctx);
-        let id = crate::pgo::ident(st, &t.name);
+        let id = crate::pgo::ident(st, &r.call);
         let call = CallOp::new(ctx, CallOpCallable::Direct(id), fty, args.clone()).get_operation();
         call.deref_mut(ctx).set_loc(loc.clone());
         call.insert_at_back(hit, ctx);
         let mut ci = info.clone();
-        ci.callee = Some(t.name.clone());
+        ci.callee = Some(r.call.clone());
         st.calls.insert(call, ci);
+        if pliron_cfg::remarks_on() {
+            st.icp_calls.insert(
+                call,
+                IcpCall {
+                    caller: caller.to_string(),
+                    target: t.name.clone(),
+                    callee: r.call.clone(),
+                    count: t.count,
+                    tag: r.tag,
+                },
+            );
+        }
         if let Some(u) = unwind {
             st.invokes.insert(call, u);
         }
@@ -353,4 +437,100 @@ fn guard(
         st.prof_bcount.insert(fallback, remaining);
     }
     st.icall_sites.remove(op);
+}
+
+/// After `constload`, before the static devirtualization
+/// (`inline::devirt`): a guard whose called pointer has become a
+/// constant function address decides nothing — inlining exposed the
+/// vtable, so the call is resolved without a profile. Comparing that
+/// constant with a home alias cannot be folded by address (two symbols,
+/// one address, known only to the linker; or a local copy's address,
+/// which differs), and it does not have to be: when the constant names
+/// the guarded target itself, the guard's arm calls — or by now is —
+/// that very function, whichever copy of it the pointer holds, so the
+/// guard is taken as true and the indirect arm goes. When it names
+/// another function the guard is false and its arm goes. Left alone,
+/// every such site kept two address materializations and a compare for
+/// nothing (lol_html's `&mut dyn FnMut(&[u8])` forwarder, 62k calls);
+/// taking the indirect arm instead would lose the body, because a
+/// cross-CGU copy is an import again by the time `inline::devirt` makes
+/// the call direct (`home_copies`). Returns the guards removed.
+pub fn fold_static(ctx: &mut Context, st: &mut State) -> usize {
+    if st.icp_aliases.is_empty() || crate::env_is("PLIRON_DEVIRT_FOLD", "0") {
+        return 0;
+    }
+    let fns: Vec<Ptr<Operation>> =
+        st.funcs.iter().filter(|(_, f)| crate::opt_body(ctx, st, f.op)).map(|(_, f)| f.op).collect();
+    let sym = |st: &State, v: Value| match st.consts.get(v) {
+        Some(ConstVal::Sym { sym, off: 0 }) => Some(sym.clone()),
+        _ => None,
+    };
+    let mut n = 0;
+    for f in fns {
+        let mut hits: Vec<(Ptr<Operation>, bool)> = Vec::new();
+        for b in blocks(ctx, f) {
+            for op in b.deref(ctx).iter(ctx) {
+                if Operation::get_op::<ICmpOp>(op, ctx).is_some()
+                    && let Some(a) = sym(st, op.deref(ctx).get_operand(ctx, 1))
+                    && st.icp_aliases.contains(&a)
+                    && let Some(x) = sym(st, op.deref(ctx).get_operand(ctx, 0))
+                {
+                    let same = a.strip_prefix(x.as_str()).is_some_and(|r| r.starts_with(".icp."));
+                    hits.push((op, same));
+                }
+            }
+        }
+        if hits.is_empty() {
+            continue;
+        }
+        for (op, same) in hits {
+            let ty = op.deref(ctx).get_result(ctx, 0).get_type(ctx);
+            let no = crate::sroa::mk_const(ctx, st, ty, ConstVal::Bits(same as u128));
+            op.deref(ctx).get_result(ctx, 0).replace_all_uses_with(ctx, &no);
+            Operation::erase(op, ctx);
+            n += 1;
+        }
+        crate::cleanup::fold_branches(ctx, st, f);
+    }
+    n
+}
+
+/// After the inline rounds: one `icp` remark per promoted call (and per
+/// clone the inliner made of one): `inlined`, or `call` when it is still
+/// a call in a function that is emitted (the `inline` remark of the same
+/// caller and callee says why). Remarks only.
+pub fn report(ctx: &Context, st: &mut State) {
+    if (st.icp_calls.is_empty() && st.icp_inlined.is_empty()) || !pliron_cfg::remarks_on() {
+        return;
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let row = |state: &str, c: &IcpCall, at: &str, cgu: &str| {
+        format!(
+            "{}\t{}\t{state} tag={} calls={} callee={} in={at} cgu={cgu}",
+            c.caller, c.target, c.tag, c.count, c.callee
+        )
+    };
+    for c in &st.icp_inlined {
+        rows.push(row("inlined", c, "", &st.cgu));
+    }
+    for (n, f) in st.funcs.iter() {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(n.as_str()) || st.dead_unopt.contains(n.as_str()) {
+            continue;
+        }
+        for b in blocks(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                if let Some(c) = st.icp_calls.get(&op) {
+                    rows.push(row("call", c, n, &st.cgu));
+                }
+            }
+        }
+    }
+    rows.sort();
+    for r in rows {
+        let mut f = r.splitn(3, '\t');
+        let (func, what, why) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+        pliron_cfg::remark("icp", func, &what, &why);
+    }
+    st.icp_calls.clear();
+    st.icp_inlined.clear();
 }

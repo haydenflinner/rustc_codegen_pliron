@@ -345,9 +345,9 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
 ## Devirtualization
 
 Indirect-call promotion from a value profile, on by default in both
-profile builds (`PLIRON_DEVIRT=0` turns it off; use the same setting
-for the instrumented and the profile-use build, because it also decides
-which symbols are promoted to external).
+profile builds (`PLIRON_DEVIRT=0` turns it off, and with it the static
+devirtualization of constant vtable slots; use the same setting for the
+instrumented and the profile-use build).
 
 - **Sites.** Every virtual call (`dyn Trait` methods, `dyn Fn*`, virtual
   drop) is a site; `PLIRON_DEVIRT_FNPTR=1` adds calls through fn
@@ -359,36 +359,89 @@ which symbols are promoted to external).
   first kept, plus a count for everything else. The CGU header (magic
   `PLPROF02`) is followed by `{crate hash, cgu hash, sites, nsites, fns,
   nfns, names, names_len}`; `fns` is `{symbol hash, &fn, flags}` for
-  every body in the CGU. The function record's spare word holds its
-  number of sites.
+  every body in the CGU (flag 1: the symbol is external; flag 2: the
+  body is a mono item of the CGU, not a cross-CGU copy the backend
+  added). The function record's spare word holds its number of sites.
 - **Merge.** The raw dump carries those tables; `pliron-prof merge`
   maps each recorded address to a symbol through the tables of all CGUs
   of the process and appends the sites to the `.prof` as a trailer
-  (`PLICALL1`): per function, per site, the "other" count and
+  (`PLICALL2`): per function, per site, the "other" count and
   `(count, crate hash, cgu hash, flags, symbol name)` per target.
-  Addresses no table has (std, C) count as "other".
-- **Profile-use build.** After `pgo::load`,
-  `pliron_ir_opt::devirt::promote` turns a site into
-  `if fnptr == &target { target(args) } else ... else { fnptr(args) }`
-  for at most `PLIRON_DEVIRT_MAX` (2) targets with at least
-  `PLIRON_DEVIRT_MIN_SHARE` (10) percent of its calls. The indirect
-  call always stays, so a wrong profile costs a compare.
-- **Which targets.** One whose body is in the CGU and whose profiled
-  address came from that CGU; a symbol of the crate that other CGUs
-  can link; a symbol of a dependency, verified in this build — a crate
-  linked here (a binary) reads the dependency rlib's symbol table, an
-  rlib crate requires the dependency's crate hash to equal the profiled
-  one. `PLIRON_DEVIRT_DOWNSTREAM=1` also accepts targets in crates that
-  depend on this one — the object then needs them at link time, and
-  nothing checks the profile against those crates.
-  `PLIRON_DEVIRT_LINKED=0` keeps only targets with a body in the CGU.
-- **Promotion.** For a target to have a linkable name, vtable slot
-  instances that are `Internal` in one CGU are defined hidden-external
-  (`devirt::promotable`): all of them in the instrumented build, in the
-  profile-use build those the profile names from outside their CGU.
+  Addresses no table has (std, C) count as "other". When several tables
+  list one address (a copy that went back to an import of its home
+  lists the home's), the mono item's entry names it.
+- **Guard and call are two symbols** (`pliron_ir_opt::devirt::promote`,
+  after `pgo::load`). A site becomes
+  `if fnptr == &guard { call(args) } ... else { fnptr(args) }` for at
+  most `PLIRON_DEVIRT_MAX` (2) targets with at least
+  `PLIRON_DEVIRT_MIN_SHARE` (10) percent of its calls. The indirect call
+  always stays, so a wrong profile costs a compare.
+  - The *guard* names the address the profile saw, the target's home
+    definition. In the home CGU that is the target's own symbol.
+    Everywhere else it is the **home alias**
+    `<symbol>.icp.<hash of the home CGU's name>`: a second, hidden
+    symbol the home CGU defines on every profiled target it holds as a
+    mono item (`devirt::define_aliases`). The function keeps its name
+    and linkage — a private closure stays private — and only counts as
+    address-taken. A second name is what lets a CGU hold a local copy
+    of the target (cross-CGU copies keep the symbol name, internal) and
+    still compare against the home's address.
+  - The *call* goes to a body in the calling CGU when there is one, so
+    the inliner can take it: the home itself (`L` in the remarks), or a
+    copy (`C`). Without a body it calls the home through the alias
+    (`X`), which buys a direct call and nothing else;
+    `PLIRON_DEVIRT_LINKED=0` drops those guards.
+- **Where the bodies come from.** The profiled targets of a function's
+  sites are candidates for cross-CGU copies like its direct callees
+  (`xcgu::copies`; same size rules, a hot target up to
+  `PLIRON_PGO_XCGU`; `PLIRON_DEVIRT_COPY=0` turns it off). For a target
+  defined in a dependency the using crate instantiates its own copy
+  when rustc has the MIR (`devirt::dep_instances`): a generic instance
+  both crates use, or a function or closure of the dependency found by
+  the symbol the dependency gave it. The copy takes the dependency's
+  profile record (`State::prof_as`). `PLIRON_DEVIRT_DEPCOPY=0` turns it
+  off.
+- **Closures of plain functions.** rustc puts MIR in a crate's metadata
+  only for what downstream code can reach by name; a closure inside a
+  non-generic function — `Box::new(move |x| ..) as Box<dyn Fn(..)>`, the
+  usual promoted target — is not. The profile-use build of the
+  defining crate therefore adds its profiled closure targets to
+  `reachable_set` (`devirt::provide`), together with what their MIR
+  mentions: private functions become exported symbols (or instantiable
+  bodies, when rustc would inline them across crates), private statics
+  exported, nested closures come along. A body that uses something the
+  walk cannot make available (a thread local, inline asm, a private
+  `const` item, a vtable or coroutine constant) is left alone and its
+  callers downstream keep a linked call. The using crate checks the same
+  closure of references before it instantiates anything
+  (`closed_downstream`), because rustc's collector answers a missing
+  body with a fatal error. `PLIRON_DEVIRT_EXPORT=0` turns the addition
+  off. The crate hash does not change.
+- **Does the alias link?** In the same crate: the profiled address is a
+  mono item of that CGU in this build's partition (one rule, read by the
+  home and by every guard). In a dependency: a crate that is linked
+  right here (a binary) reads the dependency rlib's symbol table and
+  requires the alias; an rlib crate (possibly compiled while its
+  dependencies are still in codegen) requires the dependency's crate
+  hash to equal the profiled one and the profiled address to be a mono
+  item. Targets in crates that depend on this one need
+  `PLIRON_DEVIRT_DOWNSTREAM=1`: the object then only links into
+  programs that define them. No inlining is possible there — the call
+  site is compiled before the target's crate exists — so this stays
+  opt-in and costs instructions (see the measurements).
+- **Guards on a constant.** When inlining exposes the vtable, the
+  called pointer becomes a constant and the guard compares two symbol
+  addresses nothing but the linker can relate. `devirt::fold_static`
+  (after `constload`) decides it by name: the constant is the guarded
+  target, so the guard's arm — by then usually the inlined body — is
+  kept and the indirect arm removed; any other constant removes the
+  guard's arm. `PLIRON_DEVIRT_FOLD=0` turns it off.
 
-`PLIRON_REMARKS` has one `devirt` line per site that ran: targets kept,
-shares, and why a hot target was not used. Numbers:
+`PLIRON_REMARKS` has one `devirt` line per site that ran (targets kept
+with `L`/`C`/`X`, shares, why a hot target was not used) and one `icp`
+line per promoted call after the inline rounds (`inlined`, or `call`
+with the function it is still in; the `inline` remark of that caller
+and callee has the reason). Numbers:
 `docs/history/2026-11-13-six-features.md`, section 3. Without a
 profile, `PLIRON_DEVIRT=1` guards sites with at most two possible
 targets among the vtables the crate instantiates (`src/devirt.rs`).

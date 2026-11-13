@@ -15,6 +15,13 @@ use rustc_span::Spanned;
 
 // r[impl par.xcgu.eligible]
 fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool {
+    copyable_as(tcx, inst, limit, None)
+}
+
+/// [`copyable`], with the symbol the profile knows `inst` by when that
+/// is not its symbol in this crate (a dependency's function this crate
+/// instantiates for itself, `devirt::Targets::dep_copy`).
+fn copyable_as<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize, prof_sym: Option<&str>) -> bool {
     // Items and shims (drop glue, closure-once, reify/fnptr, ...) all have
     // MIR bodies LLVM can inline across CGUs; other kinds (virtual,
     // intrinsic, vtable) have no copyable body here.
@@ -80,7 +87,9 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
         static HOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let hot_size =
             *HOT.get_or_init(|| pliron_cfg::pgo_knob("PLIRON_PGO_XCGU", "4000").and_then(|s| s.parse().ok()).unwrap_or(0));
-        if size <= hot_size && pliron_ir_opt::pgo::hot_symbol(tcx.symbol_name(inst).name) {
+        if size <= hot_size
+            && pliron_ir_opt::pgo::hot_symbol(prof_sym.unwrap_or_else(|| tcx.symbol_name(inst).name))
+        {
             return true;
         }
     }
@@ -608,7 +617,19 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         .unwrap_or(8usize);
     let ours = cgu.items();
     let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
-    if parts.len() <= 1 {
+    // Indirect-call promotion (profile-use build): the profiled targets
+    // of a function's indirect-call sites are candidates like its direct
+    // callees — `devirt::promote` will call them directly behind a
+    // guard, and only a body in this CGU lets the inliner take that
+    // call. Same size rules (a hot target up to `PLIRON_PGO_XCGU`), and
+    // a target that cannot be copied costs its caller nothing: these are
+    // not dependencies. `PLIRON_DEVIRT_COPY=0` turns it off.
+    let icp = Some(crate::devirt::bodies(tcx))
+        .filter(|t| !t.is_empty())
+        .filter(|_| !crate::env_is("PLIRON_DEVIRT_COPY", "0"));
+    // A one-CGU crate holds all its mono items; only a dependency's
+    // function can still be missing.
+    if parts.len() <= 1 && icp.is_none_or(|t| t.dep_copy.is_empty()) {
         return Vec::new();
     }
     // Same bound as the legacy path: copies never exceed the CGU's own
@@ -687,6 +708,29 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             }
         }
     }
+    let icp_ok = |name: &str, t: Instance<'tcx>| {
+        let m = MonoItem::Fn(t);
+        let ok = copyable_as(tcx, t, limit, Some(name))
+            || (inl_size && inlined.contains(&m) && copyable(tcx, t, usize::MAX));
+        if let Some(w) = &why
+            && with_no_trimmed_paths!(t.to_string()).contains(*w)
+            && pliron_cfg::tracing_on()
+        {
+            tracing::info!(target: "pliron::stats", "xcgu icp cand {} in {}: copyable={ok} size={}",
+                with_no_trimmed_paths!(t.to_string()), cgu.name(), tcx.size_estimate(t));
+        }
+        ok
+    };
+    if let Some(targets) = icp {
+        for item in ours.keys() {
+            let MonoItem::Fn(inst) = *item else { continue };
+            for (name, t) in targets.wanted_by(tcx, inst) {
+                if !ours.contains_key(&MonoItem::Fn(t)) && !frontier.contains(&t) && icp_ok(name, t) {
+                    frontier.push(t);
+                }
+            }
+        }
+    }
 
     // Items bindable without a copy: some partition emits the symbol
     // externally. An Internal dep (e.g. `RawVecInner::deallocate` under a
@@ -730,6 +774,16 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             };
             refs.insert(c, us);
             candidates.push(c);
+            // A copy brings its indirect-call sites along.
+            if let Some(targets) = icp {
+                for (name, t) in targets.wanted_by(tcx, c) {
+                    let m = MonoItem::Fn(t);
+                    if !ours.contains_key(&m) && !seen.contains(&m) && icp_ok(name, t) {
+                        seen.insert(m);
+                        next.push(t);
+                    }
+                }
+            }
             for u in us {
                 if !ours.contains_key(&u.node) {
                     needed.insert(u.node);

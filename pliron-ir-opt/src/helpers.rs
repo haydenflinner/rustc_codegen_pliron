@@ -69,6 +69,10 @@ pub fn address_taken_ex(
             .filter(|n| st.asm.contains(n.as_str()))
             .cloned(),
     );
+    // A function another object reaches through an alias symbol (EII
+    // aliases, `devirt`'s home aliases) has callers and address uses
+    // nothing here can see.
+    taken.extend(st.aliases.iter().map(|(_, target, _)| target.clone()));
     taken
 }
 

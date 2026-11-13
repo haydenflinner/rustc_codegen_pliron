@@ -3734,6 +3734,12 @@ fn inline_call(
     }
     // History node for calls cloned out of this body, pushed on first use.
     let parent = st.inline_hist.get(call).copied().unwrap_or(u32::MAX);
+    // A promoted call (`devirt::promote`) is being inlined.
+    if !st.icp_calls.is_empty()
+        && let Some(r) = st.icp_calls.remove(&call)
+    {
+        st.icp_inlined.push(r);
+    }
     let mut hist_node = None;
     // Plain calls of the body that become invokes to this callsite's pad.
     let mut fresh_invokes: Vec<Ptr<Operation>> = Vec::new();
@@ -3748,6 +3754,12 @@ fn inline_call(
             });
             st.inline_hist.insert(new, node);
             st.calls.insert(new, st.calls[op].clone());
+            // A promoted call (`devirt::promote`) cloned with its caller.
+            if !st.icp_calls.is_empty()
+                && let Some(r) = st.icp_calls.get(&op).cloned()
+            {
+                st.icp_calls.insert(new, r);
+            }
             if let Some(&(lp, catch)) = st.invokes.get(op) {
                 st.invokes
                     .insert(new, (map.lookup_block(lp).unwrap(), catch));
