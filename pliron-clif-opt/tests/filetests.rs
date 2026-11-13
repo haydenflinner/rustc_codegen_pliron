@@ -207,6 +207,16 @@ fn clif_files(dir: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn filetests() {
+    // `punroll_*.clif` exercise the group unroll on loops of unknown
+    // length, which the pass leaves rolled by default since 2026-11-13
+    // (no trip count to justify the guard). The mechanism is what these
+    // files test, so turn it back on; the knobs are read once per
+    // process and this is the binary's only test.
+    // SAFETY: set before anything reads the environment.
+    unsafe {
+        std::env::set_var("PLIRON_PUNROLL_COUNTED", "1");
+        std::env::set_var("PLIRON_PUNROLL_SEARCH", "1");
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("filetests");
     let flags = Flags::new(settings::builder());
     let mut ran = 0;

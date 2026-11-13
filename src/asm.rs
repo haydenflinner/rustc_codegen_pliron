@@ -201,6 +201,46 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 }
 
+/// The allocator shim (`__rust_alloc` -> `__rdl_alloc` and friends) as
+/// one jump, which is what LLVM emits for it (`PLIRON_ALLOC_JMP=0` off).
+///
+/// The shim forwards its arguments unchanged to a function of the same
+/// signature, so a branch is the whole body under any calling
+/// convention. Built as a function it was `stp; mov; bl; ldp; ret`:
+/// Cranelift tail-calls only between `tail`-convention functions, and
+/// these are C-ABI exports. rust-html-rewriter allocates 89,351 times:
+/// four instructions on each `alloc` and each `dealloc`.
+///
+/// ELF and Mach-O on aarch64 only; everything else keeps the function. Returns whether the shim was emitted.
+pub(crate) fn alloc_shim_jump(cx: &CodegenCx<'_>, from: &str, to: &str) -> bool {
+    use rustc_target::spec::BinaryFormat::*;
+    if !pliron_cfg::pass_enabled("PLIRON_ALLOC_JMP") {
+        return false;
+    }
+    let fmt = cx.tcx.sess.target.options.binary_format;
+    let jump = match (cx.tcx.sess.asm_arch, fmt) {
+        (Some(InlineAsmArch::AArch64), Elf | MachO) => "b",
+        // (x86-64 would be `jmp`; not enabled until someone runs it there.)
+        _ => return false,
+    };
+    let (from, to) = (cx.asm_sym(from), cx.asm_sym(to));
+    let mut st = cx.st.borrow_mut();
+    if fmt == MachO {
+        write!(
+            st.asm,
+            ".section __TEXT,__text,regular,pure_instructions\n.globl {from}\n.p2align 2\n{from}:\n    {jump} {to}\n"
+        )
+        .unwrap();
+    } else {
+        write!(
+            st.asm,
+            ".section .text.{from},\"ax\",@progbits\n.globl {from}\n.type {from},@function\n.p2align 2\n{from}:\n    {jump} {to}\n.size {from}, .-{from}\n.text\n"
+        )
+        .unwrap();
+    }
+    true
+}
+
 /// Weak hidden asm stub shared by `llvm.*` intrinsics etc. `body` is
 /// arch syntax (Intel flavor on x86 — the wrappers toggle
 /// `noprefix`/`att` around it).

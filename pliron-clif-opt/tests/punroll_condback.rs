@@ -40,6 +40,8 @@ fn search_on() {
     // SAFETY: every test sets the same value before anything reads it.
     unsafe {
         std::env::set_var("PLIRON_PUNROLL_SEARCH", "1");
+        // ... and counted loops of unknown length (same reason).
+        std::env::set_var("PLIRON_PUNROLL_COUNTED", "1");
     }
 }
 

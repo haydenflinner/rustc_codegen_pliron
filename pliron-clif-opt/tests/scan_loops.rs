@@ -235,8 +235,8 @@ block4:
 }";
 
 /// A search loop (`while p != end && *p != c`, the data exit going to
-/// ordinary code) stays rolled without a trip count; a plain counted
-/// do-while still unrolls.
+/// ordinary code) stays rolled without a trip count, and so does a
+/// counted loop whose length nothing tells.
 #[test]
 fn punroll_leaves_search_loops_rolled() {
     use pliron_clif_opt::pipeline::Analysis;
@@ -276,9 +276,13 @@ block2(v20: i64):
     return v20
 }",
     );
+    let before = f.display().to_string();
     let mut an = Analysis::default();
-    assert!(pliron_clif_opt::punroll::run(&mut f, &mut an, "dowhile", &Default::default()) > 0);
+    pliron_clif_opt::punroll::run(&mut f, &mut an, "dowhile", &Default::default());
     verify(&f);
+    // (Peeling may still copy the body; the group guard's `umin` is
+    // what marks an unroll.)
+    assert!(!f.display().to_string().contains("umin"), "{}\n{before}", f.display());
 }
 
 /// Fuzz seed 74256: `d = 0 + w` in an inner loop, `w` the *outer*
@@ -319,4 +323,36 @@ block4:
         .filter(|&i| matches!(f.dfg.insts[i].opcode(), Opcode::Iadd | Opcode::Isub))
         .count();
     assert_eq!(adds, 1, "{}", f.display());
+}
+
+/// Fuzz seed 76003: as above, but a second instruction reads the outer
+/// header's parameter, and its step — computed in the inner loop — is
+/// itself sunk out of that inner loop first. The second instruction's
+/// clone must not name the step.
+#[test]
+fn exit_sink_does_not_read_a_step_that_was_sunk() {
+    let mut f = parse(
+        "function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 0
+    jump block1(v0)
+block1(v3: i64):
+    v10 = isub v3, v0
+    jump block2(v2)
+block2(v4: i64):
+    v5 = iadd v2, v3
+    v6 = iconst.i64 1
+    v7 = iadd v4, v6
+    v8 = icmp ne v7, v1
+    brif v8, block2(v7), block3
+block3:
+    v9 = icmp eq v5, v1
+    brif v9, block4, block1(v5)
+block4:
+    v11 = iadd v5, v10
+    return v11
+}",
+    );
+    pliron_clif_opt::edgesink::run(&mut f);
+    verify(&f);
 }

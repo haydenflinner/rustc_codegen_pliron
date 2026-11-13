@@ -307,10 +307,37 @@ fn cap_unroll(k: i64, trip: Option<u64>) -> Option<i64> {
     let Some(t) = trip else {
         return Some(k);
     };
-    if t < 2 {
+    // A loop measured at fewer than `min_trip_unroll()` trips a run
+    // rarely fills even a group of two: it pays the group guard and
+    // runs the scalar tail.
+    if t < min_trip_unroll() {
         return None;
     }
     Some(k.min(t.next_power_of_two() as i64 / 2).max(2))
+}
+
+/// Measured average trips below which a loop is not group-unrolled
+/// (`PLIRON_PUNROLL_MINTRIP`, default 4; it was 2). Profiled builds,
+/// retired instructions, 4 against 2: rust-protobuf -0.2%, regex -0.5%,
+/// pulldown-cmark 0, rust-html-rewriter +0.2%, rust-json +0.2%.
+fn min_trip_unroll() -> u64 {
+    static V: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        crate::env_get("PLIRON_PUNROLL_MINTRIP").and_then(|s| s.parse().ok()).unwrap_or(4)
+    });
+    *V
+}
+
+/// `PLIRON_PEEL_MINTRIP` (default 0: no floor): a loop measured below
+/// this many trips a run is not peeled. Measured, a floor loses: with
+/// 2, rust-html-rewriter's profiled build runs 2.7% more instructions
+/// (its short loops gain most from a straight-line first iteration),
+/// for 0.1–0.5% on the other programs. The copy count is still capped
+/// at the measured trips plus one.
+fn min_trip_peel() -> u64 {
+    static V: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        crate::env_get("PLIRON_PEEL_MINTRIP").and_then(|s| s.parse().ok()).unwrap_or(0)
+    });
+    *V
 }
 
 /// Without a profile (`trip`), cap K by the trip bound the header's
@@ -474,7 +501,7 @@ pub fn run(
                     break; // cfg/la stale; rescan
                 }
                 if peel_on
-                    && run_peel(func, cfg, dt, la, lp, h, name).is_some()
+                    && run_peel(func, cfg, dt, la, lp, h, name, trip).is_some()
                 {
                     n += 1;
                     hit = true;
@@ -493,6 +520,13 @@ pub fn run(
 /// `PLIRON_PUNROLL_SEARCH=1`: unroll search loops too (see `warm_exit`).
 fn search_on() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_SEARCH", "1"));
+    *ON
+}
+
+/// `PLIRON_PUNROLL_COUNTED=1`: unroll counted loops of unknown length
+/// without a profile (the behaviour before 2026-11-13).
+fn counted_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_COUNTED", "1"));
     *ON
 }
 
@@ -1447,6 +1481,25 @@ fn run_loop(
         }
     };
     let exit_bc = texit_bc;
+    // A plain counted loop (no retained exit) of unknown length: with
+    // neither a measured trip count nor a constant one of at least two
+    // groups it stays rolled (`PLIRON_PUNROLL_COUNTED=1` unrolls it as
+    // before). The group guard is paid on every entry and only loops
+    // that run long earn it back; LLVM's generic aarch64 and x86-64
+    // builds do not runtime-unroll these either. Exact counts with the
+    // rule: rust-protobuf -0.48M (prost's `encode` loops over a
+    // message's few fields), rust-html-rewriter -0.38M, pulldown-cmark
+    // and rust-json 0, regex +0.08M.
+    if !rotated && mid_exits.is_empty() && trip.is_none() && !counted_on() {
+        let known = (|| {
+            let iv0 = crate::loopidiom::entry_arg(func, cfg, dt, h, cnt.pidx)?;
+            let (a, b) = (iconst(func, iv0)?, iconst(func, cnt.bound)?);
+            (cnt.step > 0).then(|| b.wrapping_sub(a).wrapping_sub(cnt.d) / cnt.step)
+        })();
+        if known.is_none_or(|t| t < 2 * k) {
+            bail!("counted loop of unknown length");
+        }
+    }
     let mut k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
         Ok(k) => k,
         Err(m) => bail!(format!("trip <= {m}")),
@@ -2722,6 +2775,7 @@ fn run_peel(
     lp: Loop,
     h: Block,
     name: &str,
+    trip: Option<u64>,
 ) -> Option<()> {
     macro_rules! bail {
         ($why:expr) => {{
@@ -2730,6 +2784,9 @@ fn run_peel(
             }
             return None;
         }};
+    }
+    if trip.is_some_and(|t| t < min_trip_peel()) {
+        bail!("measured trip below the peel floor");
     }
     let Walk {
         chain,
@@ -2777,6 +2834,10 @@ fn run_peel(
     // eight): peel at most that many, which unrolls it fully.
     if let Some(m) = peel_trip_cap(func, cfg, dt, h, latch, &body) {
         k = k.min(usize::try_from(m).unwrap_or(usize::MAX)).max(1);
+    }
+    // Copies past the measured average mostly do not run either.
+    if let Some(t) = trip {
+        k = k.min(usize::try_from(t.saturating_add(1)).unwrap_or(usize::MAX)).max(1);
     }
     for &b in &chain {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();

@@ -484,3 +484,127 @@ does not link for musl: `open64` from getrandom 0.2.8).
   `bytes.get(1) == Some(&b'\n')` loads the promoted constant's pointer
   from memory and null-checks it (LLVM folds the whole comparison: its
   result is unused).
+
+### Fifth item: rust-html-rewriter and regex, first line-level pass
+
+Exact totals, this item's knobs off -> defaults:
+
+| program | LLVM | before | after | |
+|---|---|---|---|---|
+| regex | 45.97M | 55.12M (x1.199) | 53.10M (x1.155) | -3.7% |
+| rust-html-rewriter | 85.83M | 106.54M (x1.241) | 104.50M (x1.218) | -1.9% |
+| rust-protobuf | 60.76M | 66.77M (x1.099) | 65.72M (x1.082) | -1.6% |
+| rust-json | 45.55M | 52.08M (x1.143) | 51.91M (x1.139) | -0.3% |
+| pulldown-cmark | 45.33M | 52.99M (x1.169) | 52.93M (x1.168) | -0.1% |
+| blake3-scalar | 46.63M | 49.08M | 49.08M | 0 |
+
+**html-rewriter 1: the allocator shim** (`src/asm.rs`,
+`alloc_shim_jump`, `PLIRON_ALLOC_JMP=0` off). `__rust_alloc` and
+friends forward to `__rdl_*` with the same arguments. LLVM emits each
+as one `b`; ours was a function, `stp; mov; bl; ldp; ret`, because
+Cranelift tail-calls only between `tail`-convention functions and
+these are C-ABI exports. The shim is now module asm, one branch
+(aarch64 ELF and Mach-O; other targets keep the function — x86-64
+would be `jmp`, not enabled because nothing here ran it). The program
+allocates 89,351 times: rust-html-rewriter 106.54M -> 105.81M,
+rust-json and rust-protobuf -0.2M and -0.6M.
+
+**html-rewriter 2: short runs skip the vector dispatch**
+(`loopvec.rs`, `PLIRON_VEC_SHORT=0` off). `[u8]::to_ascii_lowercase`
+on tag and attribute names of a few bytes
+(`tests/parity/lowercase.rs`; `Map<Iter<u8>, _>::fold`, called 21,406
+times, 2.08M instructions). The vectorized loop's dispatch block
+computed the range-overlap tests, the trip rounding and the splats
+before deciding anything — about thirty instructions ahead of the
+first byte. A new block in front compares the trip count with one
+vector group and goes straight to the scalar loop below it, as LLVM's
+`min.iters.check` does ahead of its memory checks. 105.81M -> 104.87M;
+pulldown-cmark -0.08M. Still open on this path: the chain
+`as_lowercase_string -> from_iter -> extend_trusted -> fold` is three
+calls here and one inlined function in LLVM (about 135 instructions a
+call against 44), and the scalar remainder of a vectorized loop is
+group-unrolled again.
+
+**regex 1: `follow_epsilons`** (`PLIRON_LICM_DOMCOND`, now in
+`DEFAULT_ON`). `SparseSet::insert` asserts `len < cap` and then
+`Vec::push` tests `len == cap` for its grow call; the call takes the
+set, so the set escaped inside the loop and LICM promoted none of its
+fields. The fold of the dead test existed (opt-in) but had not been
+measured exactly: regex 55.09M -> 53.17M, `follow_epsilons` 17.56M ->
+15.64M (LLVM: 15.80M). pulldown-cmark +0.03M (`scan_setext_heading`
+changes shape and is no longer unrolled).
+
+**regex 2: zigzag decode** (new step `selxor`, `PLIRON_SELXOR=0`
+off). `let mut n = un >> 1; if un & 1 != 0 { n = !n }` if-converts to
+`select (un & 1), !n, n`: `lsr; and; mvn; cmp; csel`. It is
+`n ^ -(un & 1)`: `and; neg; eor ..., lsr #1` (LLVM: `sbfx; eor`).
+`tests/parity/instptrs.rs`; regex 53.17M -> 53.02M.
+
+Tried and left opt-in, with the blocker:
+- `PLIRON_LOOPROT_MERGE=1` gives a loop with several back edges one
+  latch so it can rotate (regex's `exec_byte` dispatch loop,
+  `tests/parity/prog_loop.rs`: 16 instructions for a skipped
+  instruction against LLVM's 12). html-rewriter -0.27M and json
+  -0.16M, but regex +0.63M and pulldown +0.64M: the rotated loop
+  recomputes its end pointer in the latch (the elaborator's
+  pop-on-leave placement again) and shuffles the cursor between a
+  caller-saved and a callee-saved register around the call.
+- `PLIRON_LICM_INNERPRESS=2` hoists the `SparseSet` fields out of the
+  state-decode loop (the repro then matches LLVM instruction for
+  instruction, 28 a state) but `next_state` itself gets 1.07M worse —
+  a spill somewhere in the larger function; not traced.
+- `PLIRON_LOADPRE_CARRY=1` (loop-carried load PRE, for `Vec::push` in
+  `cached_state`'s varint writer): regex worse, others mixed.
+
+regex after this: `next_state` 9.86M against 6.63M, `cached_state`
+12.62M against 11.11M, `hash_one::<&State>` 0.87M against 0.04M (not
+inlined here).
+
+### Trip counts
+
+Measured (profiled builds, `ab.py PROG pgo pgo-x:...`, retired
+instructions, 11 rounds):
+
+- Group unroll needs an average of at least 4 trips
+  (`PLIRON_PUNROLL_MINTRIP`, was 2): rust-protobuf -0.2%, regex -0.5%,
+  pulldown-cmark 0, html-rewriter +0.2%, rust-json +0.2%.
+- A floor for peeling loses, so there is none
+  (`PLIRON_PEEL_MINTRIP`, default 0): with 2, html-rewriter's profiled
+  build ran 2.7% more instructions; the other four programs moved
+  0.1-0.5% the other way. Loops that make about one trip are where a
+  straight-line first iteration pays most. The number of peeled copies
+  is now capped at the measured trips plus one.
+
+Static (no profile): a plain counted loop — no retained exit — whose
+trip count is neither measured nor a constant of at least two groups
+is no longer group-unrolled (`PLIRON_PUNROLL_COUNTED=1` restores).
+Exact counts: rust-protobuf -0.48M (prost's `encode` loops over a
+message's few fields, hashbrown's group walk), rust-html-rewriter
+-0.38M, pulldown-cmark and rust-json 0, regex +0.08M. This is LLVM's
+policy for generic aarch64 and x86-64 too (no runtime unrolling). The
+bench kernels that were tuned with the unroll were not re-timed (the
+machine was loaded all day); the knob is the way back.
+
+### Self-compile check
+
+Another session reported ICEs while building the backend with itself.
+With this tree, `PLIRON_VERIFY=full` builds `pliron-clif-opt` and its
+dependencies, then the whole backend, and that stage-2 backend builds
+miette 7.6 with its dependencies, all without a verifier failure. The
+two failures on record were `mask01 broke Vec::extend_trusted`
+(webmerge materializing a slot of an unreachable self-loop; the fix,
+skipping unreachable blocks, is in `clifpeep.rs` with its test) and
+`edgesink broke HashMap::retain` (the `exit_sink` substitution fixed
+above, seed 74256).
+
+Validation for the fifth item and the trip-count rules: gate passes;
+fuzz 76000:76700 found one more `exit_sink` verifier failure (seeds
+76003, 76268: a header parameter read through a step that was itself
+being sunk out of an inner loop — the substitution now skips steps
+that are leaving a loop; regression test
+`exit_sink_does_not_read_a_step_that_was_sunk`), then 77000:77700 and
+both seeds pass; all eight programs build and exit 0. One `test.sh`
+stanza (`slotpromlt`) measures what `PLIRON_RA2_XBLOCK` removes and
+needed `PLIRON_LICM_DOMCOND=0` pinned in its comparison builds, like
+the other passes that delete the same moves first.
+

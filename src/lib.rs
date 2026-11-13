@@ -1137,7 +1137,9 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             };
             let from = mangle_internal_symbol(tcx, &global_fn_name(method.name));
             let to = mangle_internal_symbol(tcx, &default_fn_name(method.name));
-            wrapper(&cx, &from, Some(&to), &types, output);
+            if !asm::alloc_shim_jump(&cx, &from, &to) {
+                wrapper(&cx, &from, Some(&to), &types, output);
+            }
         }
         wrapper(
             &cx,

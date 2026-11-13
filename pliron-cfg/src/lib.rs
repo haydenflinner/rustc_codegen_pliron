@@ -35,6 +35,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // Fold branches a dominating check decides before LICM looks for
+    // escapes (regex's `follow_epsilons`: `assert!(len < cap)` then
+    // `Vec::push`'s dead grow call, which took the set). Exact counts:
+    // regex 55.09M -> 53.17M (x1.199 -> x1.157; `follow_epsilons` below
+    // LLVM's), rust-protobuf, json, html-rewriter unchanged, pulldown
+    // +0.03M (`scan_setext_heading` no longer unrolls).
+    "PLIRON_LICM_DOMCOND",
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).
     "PLIRON_SLOTMERGE_MARK",

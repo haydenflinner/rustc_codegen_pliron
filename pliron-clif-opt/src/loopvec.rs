@@ -4245,6 +4245,13 @@ fn widen_mul(
 /// latency and halve loop overhead, matching part of LLVM's default unroll.
 const UNROLL: usize = 4;
 
+/// A fresh block laid out right after `after`.
+fn pos_block(func: &mut Function, after: Block) -> Block {
+    let b = func.dfg.make_block();
+    func.layout.insert_block_after(b, after);
+    b
+}
+
 fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let pb = func.layout.inst_block(p.entry.inst).unwrap();
     let (cb, vh, vb, ve) = (
@@ -4278,12 +4285,50 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // loops read `ivv` for the lane base, so they keep the count-up form.
     let countdown =
         p.step > 0 && !p.iv_stream && p.early.is_empty() && p.streams.iter().all(|s| !s.direct);
+    // Short trips first (`PLIRON_VEC_SHORT=0` off): a run of fewer than
+    // one vector group never enters the vector loop, so it should not
+    // pay for the dispatch either — the range-overlap tests, the trip
+    // rounding, the splats. One compare decides, as LLVM's
+    // `min.iters.check` does ahead of its memory checks. lol_html
+    // lowercases tag and attribute names of a few bytes
+    // (`tests/parity/lowercase.rs`): about thirty instructions of
+    // dispatch ran before the first byte on every call.
+    // `iters` is pure arithmetic and was already computed ahead of the
+    // predicates; with them false it is garbage, and whichever way the
+    // compare goes the scalar loop (directly, or via the failed
+    // predicates in `cb`) is where control ends up.
+    let short = crate::pass_enabled("PLIRON_VEC_SHORT");
+    let iters = if short {
+        let pre = pos_block(func, pb);
+        // Redirect the entry edge once more, through `pre`.
+        {
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[p.entry.inst]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[p.entry.slot];
+            *bc = BlockCall::new(pre, core::iter::empty(), &mut dfg.value_lists);
+        }
+        let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
+        let mut pos = FuncCursor::new(func).at_bottom(pre);
+        let iters = emit(&mut pos, iv_ty, &p.iters);
+        // One group, plus the iteration a body-first epilogue keeps.
+        let full_floor = !p.post_tested || p.exit_bare.is_some();
+        let need = p.vf * UNROLL as i64 + i64::from(!full_floor);
+        let k = pos.ins().iconst(iv_ty, need);
+        let c = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iters, k);
+        pos.ins().brif(c, cb, &[], p.h, &h_args);
+        Some(iters)
+    } else {
+        None
+    };
     let mut pos = FuncCursor::new(func).at_bottom(cb);
     // nm = iters & -(VF*UNROLL) ; end_v = iv0 + nm*step. A post-tested
     // epilogue can't run 0 iters (the body precedes its test), so round
     // `iters-1` down instead and leave ≥1 scalar iteration (preds give
     // `iters ≥ 1` on this path).
-    let iters = emit(&mut pos, iv_ty, &p.iters);
+    let iters = match iters {
+        Some(v) => v,
+        None => emit(&mut pos, iv_ty, &p.iters),
+    };
     // `base - (base & (K-1))` == `base & -K`, but unlike `band x, iconst`
     // the result isn't in the egraph's remat set, so the trip bound stays
     // hoisted instead of being re-executed on every vector-loop backedge.

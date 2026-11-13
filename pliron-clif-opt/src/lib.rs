@@ -32,6 +32,7 @@ pub mod cmpcancel;
 pub mod deadslot;
 pub mod cmpmerge;
 pub mod selset;
+pub mod selxor;
 pub mod commute;
 pub mod config;
 pub mod constdedup;

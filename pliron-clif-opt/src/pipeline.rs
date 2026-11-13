@@ -3560,6 +3560,15 @@ fn s_deadslot(p: &mut Pipe, _an: &mut Analysis) -> usize {
     crate::deadslot::run(&mut p.clctx.func)
 }
 
+// `select (x & 1), !y, y` as `y ^ -(x & 1)` — see `selxor`.
+fn s_selxor(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::selxor::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("selxor");
+    }
+    k
+}
+
 // A membership predicate held in a select chain — see `selset`.
 fn s_selset(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::selset::run(&mut p.clctx.func);
@@ -5211,6 +5220,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // chain. Late: the branch it left in front has shed its edge
         // arguments by now and can join the set.
         step("selset", "selset", Gate::Env("PLIRON_SELSET"), s_selset).needs(shape::CONDBR),
+        step("selxor", "selxor", Gate::Env("PLIRON_SELXOR"), s_selxor),
         step("cmpcancel", "cmpcancel", Gate::Env("PLIRON_CMPCANCEL"), s_cmpcancel),
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one

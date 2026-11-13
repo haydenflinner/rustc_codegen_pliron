@@ -322,10 +322,12 @@ t_slotpromlt() {
   # `edgesel` already delete these moves pre-regalloc, so the comparison
   # pins them off to keep measuring what RA2_XBLOCK contributes; so does
   # `MEMFAST_SMALL` (default `loop` since 2026-11-13), which inlines the
-  # short copies whose calls these moves surrounded.
-  PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
-  PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
-  PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
+  # short copies whose calls these moves surrounded, and `LICM_DOMCOND`
+  # (default on since 2026-11-13), which lets LICM promote the fields
+  # those reloads fetched (1546 -> 1500 instructions on its own).
+  PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
   local z0 z3 z4
   if [[ -x "$llvmod" ]]; then
     z0=$("$llvmod" -d --no-show-raw-insn $out/spl0.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)

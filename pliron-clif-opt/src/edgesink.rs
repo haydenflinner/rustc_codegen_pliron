@@ -758,7 +758,11 @@ fn exit_sink(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la
                 let Some(Some(bp)) = bumps.get(&w) else {
                     continue;
                 };
-                if bp.q == v {
+                // Nor a step that is itself leaving a loop (an inner one:
+                // it is this loop's back-edge value, so it stays inside
+                // this loop, but as clones at its uses — the one value
+                // `q` is gone or about to be; fuzz seed 76003).
+                if bp.q == v || alive.contains(&bp.q) {
                     continue;
                 }
                 let dom = match mid_pred.get(&x) {
