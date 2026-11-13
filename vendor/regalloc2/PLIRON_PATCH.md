@@ -248,3 +248,19 @@ fallthrough only). After relax's post-allocation spill windows,
 prints one `ra2post:` line per changed function. Checked with
 `PLIRON_RA_CHECK=1` on the eight held-out programs (identical output);
 static effect at `=15`: stack stores -1..3%, instructions -0.1..0.3%.
+
+## `PLIRON_RA2_SRCVREG=1` (runtime, default off): block-parameter moves carry the argument's vreg
+
+`src/ion/moves.rs` (`block_param_src_vreg`, the block-param move
+insertion), `src/lib.rs` (`srcvreg_on`): the `edit_vregs` entry of a
+block-parameter move names the branch argument's vreg instead of the
+parameter's. After the move both hold the same value; Cranelift only
+uses the entry to decide rematerialization, and the argument is the one
+that can be a constant. A constant passed to a spilled parameter was a
+load of the constant's own spill slot plus a store (through the scratch
+register, both legs keep the label); it becomes `mov #k` + store, and a
+slot read only that way loses its stores (`PLIRON_REMAT_STORE`).
+pulldown's `scalar_iterate_special_bytes` initialised a dozen spilled
+loop states that way on every call. Static, release held-out binaries:
+stack loads -4.3% (pulldown-cmark), -3.5% (regex), -3.6%
+(rust-compression); stores -0.7..-1.3%. Checked with `PLIRON_RA_CHECK=1`.

@@ -113,6 +113,19 @@ pub(crate) fn postopt_bits() -> u32 {
     0
 }
 
+/// PLIRON (`PLIRON_RA2_SRCVREG=1`, default off): a block-parameter move's
+/// `edit_vregs` entry names the branch argument's vreg instead of the
+/// parameter's. See `ion/moves.rs`.
+pub(crate) fn srcvreg_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SRCVREG").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON (`PLIRON_RA2_POSTOPT_STATS=1`): one `ra2post:` line on stderr
 /// per function the post-pass changed.
 pub(crate) fn postopt_stats() -> bool {

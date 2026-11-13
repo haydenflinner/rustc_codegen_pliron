@@ -14,7 +14,9 @@ row, i.e. the innermost inlined position), and classifies each instruction
 branch, ...). Self samples are attributed per instruction address, so
 
   * the class table says what the gap is made of, in time
-    (e.g. "stack loads +310 samples, register copies +120");
+    (e.g. "stack loads +310 samples, register copies +120"); on our side
+    stack traffic is split into `spill-*` (regalloc spill slots) and
+    `slot-*` (explicit stack slots the mid-end left in memory);
   * the line table ranks source lines by pliron-minus-LLVM samples,
     independent of which function the line was inlined into;
   * `--fn SUBSTR` / `--line FILE:LINE` print both sides' instructions for
@@ -54,7 +56,7 @@ OUT = run.OUT
 LOADS = ("ldr", "ldur", "ldp", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw", "ldurb", "ldurh",
          "ldursb", "ldursh", "ldursw", "ldpsw")
 STORES = ("str", "stur", "stp", "strb", "strh", "sturb", "sturh")
-CLASSES = ["stack-load", "stack-store", "load", "store", "mov-reg", "const", "cmp", "select",
+CLASSES = ["spill-load", "spill-store", "slot-load", "slot-store", "stack-load", "stack-store", "load", "store", "mov-reg", "const", "cmp", "select",
            "extend", "cbranch", "jump", "call", "ret", "fp/vec", "alu", "other"]
 FPREG = re.compile(r"(?<![\w.])(?:[vqdsh]\d{1,2})(?![\w])")
 
@@ -152,6 +154,25 @@ class Side:
         self.samples = collections.Counter()  # instruction index -> self samples
         self.total = 0
 
+    def split_stack(self, frames):
+        """Our side: `stack-*` -> `spill-*` (regalloc spill slots) or `slot-*`
+        (explicit stack slots: allocas the mid-end left in memory), by the
+        `[sp, #off]` offset against the function's frame regions (`frame`
+        remarks: sp + outgoing args, then slots, then spills)."""
+        for k, (fn, line, cls, text) in enumerate(self.inst):
+            fr = frames.get(fn)
+            if not cls.startswith("stack-") or fr is None:
+                continue
+            m = re.search(r"\[sp(?:, #(-?(?:0x)?[0-9a-f]+))?\]", text)
+            if not m:
+                continue
+            off = int(m.group(1), 0) if m.group(1) else 0
+            out, slots, spills = fr
+            if out <= off < out + slots:
+                self.inst[k] = (fn, line, "slot-" + cls[6:], text)
+            elif out + slots <= off < out + slots + spills:
+                self.inst[k] = (fn, line, "spill-" + cls[6:], text)
+
     def add_profile(self, path, proc_substr="benchmark"):
         """Attribute the profile's self samples to instructions."""
         p = json.load(gzip.open(path))
@@ -212,10 +233,21 @@ def remarks_prefix(prog):
     return os.path.join(OUT, "remarks", prog, "r")
 
 
+def frames(prog):
+    """Demangled function -> (outgoing, slots, spills) bytes, from `frame` remarks."""
+    rm = load_harness("remarks")
+    out = {}
+    for p, f, s, why, n in rm.load(remarks_prefix(prog)):
+        if p == "frame":
+            d = dict(kv.split("=") for kv in why.split())
+            out[census.demangle_key(f)] = (int(d["outgoing"]), int(d["slots"]), int(d["spills"]))
+    return out
+
+
 def show_remarks(prog, fn):
     """Why the calls of our functions matching `fn` stayed calls, and their loops scalar."""
     rm = load_harness("remarks")
-    rows = [r for r in rm.load(remarks_prefix(prog)) if fn in r[1] and "external" not in r[3]]
+    rows = [r for r in rm.load(remarks_prefix(prog)) if fn in r[1] and "external" not in r[3] and r[0] != "frame"]
     if rows:
         print(f"\n-- remarks (harness/remarks.py {remarks_prefix(prog)} --fn ...)")
     for p, f, s, why, n in rows:
@@ -300,6 +332,8 @@ def main():
             if not (a.skip_profile and os.path.exists(prof)):
                 census.profile(exe, run.src_dir(prog), a.runs, prof)
             s = Side(exe)
+            if side == "pliron-g":
+                s.split_stack(frames(prog))
             s.add_profile(prof)
             sides[side] = s
         ours, llvm = sides["pliron-g"], sides["llvm-g"]

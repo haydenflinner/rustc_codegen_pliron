@@ -269,6 +269,7 @@ impl<'a, F: Function> Env<'a, F> {
                 3 * self.func.num_insts(),
                 Default::default(),
             );
+        let mut block_param_src_vreg = FxHashMap::<BlockparamSourceKey, VRegIndex>::default();
         let mut block_param_dests = Vec::with_capacity(3 * self.func.num_insts());
 
         let debug_labels = self.func.debug_value_labels();
@@ -429,6 +430,9 @@ impl<'a, F: Function> Env<'a, F> {
                             );
 
                             let key = BlockparamSourceKey::new(from_block, to_vreg);
+                            // PLIRON (`PLIRON_RA2_SRCVREG`): remember whose
+                            // value this edge passes.
+                            block_param_src_vreg.insert(BlockparamSourceKey::new(from_block, to_vreg), from_vreg);
                             match block_param_sources.entry(key) {
                                 // As with inter-block moves, if the entry is already present we'll
                                 // try to prefer a register allocation.
@@ -657,7 +661,18 @@ impl<'a, F: Function> Env<'a, F> {
                 let src = dest.source();
                 let src_alloc = block_param_sources.get(&src).unwrap();
                 let (pos, prio) = choose_move_location(self, dest.from_block, dest.to_block);
-                inserted_moves.push(pos, prio, *src_alloc, dest.alloc, self.vreg(dest.to_vreg));
+                // PLIRON (`PLIRON_RA2_SRCVREG=1`): label the move with the
+                // vreg whose value it carries (the branch argument), not
+                // the block parameter it lands in. Both hold the same
+                // value after the move; the argument is the one a client
+                // can rematerialize (a constant passed to a spilled
+                // parameter is then a `mov #k` + store, not a load of the
+                // constant's own spill slot + store).
+                let label = match block_param_src_vreg.get(&src) {
+                    Some(&v) if crate::srcvreg_on() => v,
+                    _ => dest.to_vreg,
+                };
+                inserted_moves.push(pos, prio, *src_alloc, dest.alloc, self.vreg(label));
             }
         }
 
