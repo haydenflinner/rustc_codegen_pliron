@@ -487,3 +487,25 @@ profiled build had stopped beating the plain one on rust-protobuf
 copies in loops and the bundle's `hot` took fewer. Bundle value is now
 `hotloop` (hot blocks, plus loops the profile saw run): eight programs,
 11 rounds, pgo/pliron 0.977 with it against 0.987 with `hot`.
+
+**Single codegen unit, and what it says about the inliner** (eight
+programs, instructions against the 16-unit default):
+
+| build | geomean | pulldown | html-rewriter | protobuf | blake3 |
+|---|---|---|---|---|---|
+| `-Ccodegen-units=1` | 1.001 | 1.063 | 0.968 | 0.977 | 1.001 |
+| `+ INLINE_COLDONCE=1` | 1.000 | 1.038 | 0.968 | 0.986 | 1.002 |
+| `+ INLINE_CALLER_MAX=8000` | 1.003 | 0.995 | 0.966 | 0.987 | 1.072 |
+
+Seeing every body is worth 2-3% on rust-html-rewriter and
+rust-protobuf (the cross-CGU copier's limits again). pulldown-cmark
+pays twice for it: `Vec<u8>::reserve` takes its `#[cold]` slow path as
+a free single-caller inline, reaches 813 ops and stops inlining into
+its 115 callers (`INLINE_COLDONCE` fixes that: 1.063 -> 1.038), and
+`parse_block`, already 17k ops, absorbs five more scanners and its own
+code gets ~5% of the program slower. A caller cap of 8000 fixes
+pulldown and breaks blake3-scalar (+7%), whose compress function needs
+its rounds. At the default 16 units `INLINE_COLDONCE` is 1.0015
+(rust-protobuf +1.2%) and the caps only cost. No default changed; the
+missing piece is a caller-growth rule that tells `parse_block` from
+blake3's `compress`.
