@@ -186,10 +186,20 @@ fn layout_of<'tcx>(
 /// `Scalar`/`ScalarPair`/vector structs encode field positions in the
 /// repr and are left alone.
 ///
-/// Within each group of non-zero-sized fields that share size and
-/// alignment, the group's existing slots (offset + memory-order position)
-/// are handed out hottest first; ties keep rustc's order. Everything else
-/// in the layout is copied; the largest niche moves with its field.
+/// The non-zero-sized fields are taken one ABI-alignment class at a time.
+/// If the class's fields tile one contiguous byte span `[s, e)` in rustc's
+/// layout (each starts where the previous one ends), the span is
+/// re-packed hottest first, ties in rustc's order. Why nothing else can
+/// change: every field of the class has alignment `a` and a size that is
+/// a multiple of `a`, and `s` is a multiple of `a`, so packing them from
+/// `s` in any order puts each one on a multiple of `a`, leaves no gap and
+/// ends exactly at `e`. Bytes outside `[s, e)` — other classes, padding,
+/// the struct's size and alignment — are not touched, so the type cannot
+/// grow and its padding bytes stay where they were. A class that does not
+/// tile a span (rustc put a niche field at an end, or interleaved
+/// classes) falls back to swapping fields of equal size, which is
+/// trivially neutral. Zero-sized fields keep their offsets. Everything
+/// else in the layout is copied; the largest niche moves with its field.
 fn permute<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
@@ -237,45 +247,63 @@ fn permute<'tcx>(
     let cx = LayoutCx::new(tcx, typing_env);
     let fl: Vec<TyAndLayout<'tcx>> = (0..n).map(|i| l.field(&cx, i)).collect();
     let off = |i: usize| offsets[FieldIdx::from_usize(i)];
-    // Memory-order position of each source field.
-    let mut pos = vec![usize::MAX; n];
-    for (p, f) in in_memory_order.iter().enumerate() {
-        *pos.get_mut(f.as_usize())? = p;
-    }
-    if pos.contains(&usize::MAX) {
-        return None;
-    }
 
+    // One alignment class at a time (non-zero-sized fields only).
     let mut idx: Vec<usize> = (0..n).filter(|&i| fl[i].size.bytes() != 0).collect();
-    idx.sort_by_key(|&i| (fl[i].size, fl[i].align.abi, off(i)));
+    idx.sort_by_key(|&i| (fl[i].align.abi, off(i)));
     let mut new_off = offsets.clone();
-    let mut new_mem = in_memory_order.clone();
-    let mut moved = false;
     let mut k = 0;
     while k < idx.len() {
+        let a = fl[idx[k]].align.abi;
         let mut e = k + 1;
-        while e < idx.len()
-            && fl[idx[e]].size == fl[idx[k]].size
-            && fl[idx[e]].align.abi == fl[idx[k]].align.abi
-        {
+        while e < idx.len() && fl[idx[e]].align.abi == a {
             e += 1;
         }
-        // `slots`: the group's fields by increasing offset; `by_heat`: the
-        // same fields hottest first (stable, so ties keep that order).
+        // `slots`: the class by increasing offset; `by_heat`: the same
+        // fields hottest first (stable, so ties keep rustc's order).
         let slots = &idx[k..e];
+        k = e;
         let mut by_heat = slots.to_vec();
-        by_heat.sort_by(|&a, &b| w[b].cmp(&w[a]));
-        for (&slot, &f) in slots.iter().zip(&by_heat) {
-            if slot != f {
-                moved = true;
-                new_off[FieldIdx::from_usize(f)] = off(slot);
-                new_mem[pos[slot] as u32] = FieldIdx::from_usize(f);
+        by_heat.sort_by(|&x, &y| w[y].cmp(&w[x]));
+        let (start, end) = (off(slots[0]), off(slots[slots.len() - 1]) + fl[slots[slots.len() - 1]].size);
+        // Re-pack the whole span when the class tiles it exactly: every
+        // field starts where the previous one ends, sizes and the start
+        // are multiples of the class alignment, and no zero-sized field
+        // sits strictly inside (it would end up in the middle of a field).
+        let tiles = slots.windows(2).all(|p| off(p[0]) + fl[p[0]].size == off(p[1]))
+            && start.is_aligned(a)
+            && slots.iter().all(|&i| fl[i].size.is_aligned(a))
+            && (0..n).all(|z| fl[z].size.bytes() != 0 || off(z) <= start || off(z) >= end);
+        if tiles {
+            let mut at = start;
+            for &f in &by_heat {
+                new_off[FieldIdx::from_usize(f)] = at;
+                at += fl[f].size;
+            }
+            debug_assert_eq!(at, end);
+        } else {
+            // Otherwise only fields of equal size trade slots.
+            let mut used = vec![false; by_heat.len()];
+            for &slot in slots {
+                let j = (0..by_heat.len())
+                    .find(|&j| !used[j] && fl[by_heat[j]].size == fl[slot].size)?;
+                used[j] = true;
+                new_off[FieldIdx::from_usize(by_heat[j])] = off(slot);
             }
         }
-        k = e;
     }
-    if !moved {
+    let moved = (0..n).filter(|&i| new_off[FieldIdx::from_usize(i)] != off(i)).count();
+    if moved == 0 {
         return None;
+    }
+    // Memory order: rustc's order re-sorted by the new offsets (stable, so
+    // zero-sized fields keep their place next to whatever shares their
+    // offset).
+    let mut mem: Vec<FieldIdx> = in_memory_order.iter().copied().collect();
+    mem.sort_by_key(|&f| new_off[f]);
+    let mut new_mem = in_memory_order.clone();
+    for (p, f) in mem.into_iter().enumerate() {
+        new_mem[p as u32] = f;
     }
 
     // The niche is a byte range inside exactly one non-zero-sized field.
@@ -296,6 +324,23 @@ fn permute<'tcx>(
             }
             niche = Some(Niche { offset: new + inner.offset, ..nc });
         }
+    }
+
+    // `PLIRON_FIELD_ORDER_LOG=<file>`: one line per permuted layout
+    // (compiling crate, struct, instantiation, fields moved), to count what the order file did.
+    if let Some(log) = pliron_cfg::env_get("PLIRON_FIELD_ORDER_LOG") {
+        use std::io::Write;
+        let line = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
+            "{}\t{}\t{}\t{moved}\n",
+            tcx.crate_name(LOCAL_CRATE),
+            type_key(tcx, did),
+            l.ty
+        ));
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
     }
 
     let mut nd = data.clone();

@@ -228,14 +228,21 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
   times the profile count of its MIR block. Without `PLIRON_PGO_USE` the
   weight is `8^loop depth`. The file can also be written by hand.
 - **Order** wraps `layout_of`. Inside a plain `repr(Rust)` struct (no
-  `C`/`packed`/`align`/`transparent`/`simd`; no enums or unions) fields
-  of *identical size and alignment* trade places so the hotter one has
-  the smaller offset; ties keep rustc's order. Size, alignment and
-  padding cannot change. Only sized in-memory aggregates
+  `C`/`packed`/`align`/`transparent`/`simd`; no enums or unions) the
+  non-zero-sized fields are taken one alignment class at a time. When a
+  class tiles one contiguous byte span in rustc's layout, the span is
+  re-packed hottest first (ties keep rustc's order): all its fields have
+  the same alignment `a` and sizes that are multiples of `a`, so any
+  order fills the span exactly, and nothing outside it moves — size,
+  alignment and padding cannot change. A class that is not contiguous
+  (rustc put a niche field at an end, or interleaved classes) only swaps
+  fields of equal size. Only sized in-memory aggregates
   (`BackendRepr::Memory`) are touched — `Scalar`/`ScalarPair` structs
   encode field positions in the repr — and not structs whose last field
   may be unsized (unsizing needs the prefix fixed). The largest niche
-  moves with its field.
+  moves with its field. `PLIRON_FIELD_ORDER_LOG=<file>` appends one line
+  per permuted layout (compiling crate, struct, instantiation, fields
+  moved).
 - **Which types**: those named in the file whose defining crate is the
   crate being compiled or a dependency outside the sysroot. The rule
   looks only at the type's definition and the file, so every crate
@@ -250,13 +257,21 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
   disagree on offsets — undefined behaviour, not a link error. Two
   crates with the same name share keys; that is consistent, only
   coarser.
+- **Check**: `tests/field_order/run.sh` builds one program plain, with
+  heat, and under three order files, and diffs sizes, alignments and
+  values. Measured 2026-11-13 with static heat (no profile), 5 rounds of
+  `bench/heldout/ab.py`: pulldown-cmark 15 structs permuted,
+  instructions 1.000-1.004; rust-json 54 structs, 1.002;
+  rust-html-rewriter 152 structs, 1.000; cycles within noise; output
+  matches `benchmark.stdout.expected` on all three. Correct, and so far
+  neutral.
 
 ## Knobs
 
 | env | effect |
 | --- | --- |
 | `PLIRON_FIELD_HEAT=<file>` | append per-field access weights for the crate (see Field order) |
-| `PLIRON_FIELD_ORDER=<file>` | hot fields first inside same-size/alignment groups of listed `repr(Rust)` structs (see Field order) |
+| `PLIRON_FIELD_ORDER=<file>` | hot fields first inside each alignment class of listed `repr(Rust)` structs (see Field order); `PLIRON_FIELD_ORDER_LOG=<file>` lists what was permuted |
 | `PLIRON_PGO=<dir>` | instrument build; profile written to `<dir>/pliron-<pid>.prof` (or `$PLIRON_PROFILE_FILE`) |
 | `PLIRON_PGO_OPT=1` | optimize the instrumented build too (default: it is built unoptimized — the counters sit on the pre-optimization CFG, the profile is the same, the build is about a third faster and the profiling run about 2x slower) |
 | `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |
