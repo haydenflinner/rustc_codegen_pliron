@@ -96,6 +96,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   Medians append to `bench/history.tsv` (commit it when a number moves).
   ~8 min for all; `BENCHTIME`/`COUNT` env vars tune it.
 - `bench/wasm/run.sh [filter]` — same kernels on wasm32 in node.
+- `bench/heldout/ab.py PROG SIDE...` — the fast A/B for one held-out
+  program. Sides: `llvm`, `llvm-pgo`, `llvm:FLAGS` (ablate LLVM's own
+  passes), `pliron`, `NAME:K=V,..`, `pgo`, `pgo-NAME:K=V,..`
+  (profiled), `@FLAGS` for extra RUSTFLAGS. Builds are cached per
+  side; each side is timed interleaved under `/usr/bin/time -l` and
+  reported with retired instructions (repeatable to ~0.3%), cycles and
+  IPC — so one run says whether a change removes work or only moves
+  it. `--prof` adds inclusive/self per-function cycle deltas. Start
+  here for any "is X faster" question on real programs.
+- `bench/heldout/run.py --pgo` — the profile loop for all eight
+  programs, ours and LLVM's, with build-time totals; `tune.py PROG`
+  searches the profile knobs for one program. `harness/pgofuzz.py`
+  fuzzes the generate/run/use loop. `PLIRON_REMARKS` +
+  `harness/layout_score.py` score a profiled build's block layout.
+  State of the profile work: `docs/pgo.md`,
+  `docs/history/2026-11-12-pgo-baseline.md`.
 - `bench/heldout/asmvs.py [--only prog] [--fn F | --line FILE:LINE]` —
   our code next to LLVM's for a held-out program, keyed by source line
   (so inlining differences don't break the pairing) with every
