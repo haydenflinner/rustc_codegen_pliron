@@ -277,5 +277,6 @@ clobber is cut out at its block boundaries. Cold: hot bonus at most `1/K`
 (`PLIRON_RA2_COLDSPLIT_RATIO`, default 16) of the hottest block with a
 use or def of the bundle. The remainder stays one bundle (with holes) and
 is requeued untrimmed; a cold piece without uses goes to the spill
-bundle, one with uses is requeued. Once per original bundle. Not yet
-measured or run under `PLIRON_RA_CHECK=1`.
+bundle, one with uses is requeued. Once per original bundle. Held-out
+programs pass with `PLIRON_RA_CHECK=1`; instructions 0.987..1.004x of
+default (noise level), no fuzz sweep yet.

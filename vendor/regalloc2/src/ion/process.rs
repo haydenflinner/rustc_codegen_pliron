@@ -1806,6 +1806,11 @@ impl<'a, F: Function> Env<'a, F> {
             i = j;
         }
 
+        // The tail of a range cut at a region's exit is a new range: it
+        // has no bundle yet.
+        for entry in &hot {
+            self.ctx.ranges[entry.index].bundle = bundle;
+        }
         self.ctx.bundles[bundle].ranges = hot;
         self.ctx.bundles[bundle].cold_split = true;
         if self.ctx.bundles[bundle].ranges.len() > 0 {
