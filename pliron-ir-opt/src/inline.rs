@@ -1418,6 +1418,11 @@ pub fn run(
     } else {
         0
     };
+    let pgo_heavy: u64 = if pgo_inline {
+        pliron_cfg::pgo_knob("PLIRON_PGO_HEAVY", "256").and_then(|s| s.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    };
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
@@ -1679,7 +1684,25 @@ pub fn run(
                     }
                     // PGO: a callsite the profile proves runs is worth
                     // more code growth than a static guess.
-                    if pgo_warm && site_count.is_some_and(|c| c >= 4) {
+                    // `PLIRON_PGO_HEAVY=<k>` (bundle: 256; 0 off): no profile bonus for
+                    // a callee that runs more than `k` blocks per call in
+                    // the profile. A bonus buys back call overhead, and a
+                    // callee that loops for hundreds of blocks per entry
+                    // has none worth buying: regex's `follow_epsilons`
+                    // (its hottest function, a loop nest) went into
+                    // `next_state` and `exec_byte` on the hot/warm bonus
+                    // and cost 3.3% instructions (two loop nests sharing
+                    // one frame's registers).
+                    let heavy = pgo_heavy > 0
+                        && site_count.is_some()
+                        && st.prof.get(f.op).is_some_and(|p| {
+                            let e = p.blocks.first().copied().unwrap_or(0);
+                            e > 0 && p.blocks.iter().fold(0u64, |a, &b| a.saturating_add(b)) / e > pgo_heavy
+                        });
+                    if heavy {
+                        pliron_cfg::remark!("inline", sym, cs; "no profile bonus (heavy callee)");
+                    }
+                    if pgo_warm && !heavy && site_count.is_some_and(|c| c >= 4) {
                         t = t.saturating_add(limit.saturating_mul(2));
                     }
                     // `PLIRON_PGO_HOT=<k>` (opt-in): a call site whose count
@@ -1692,6 +1715,7 @@ pub fn run(
                     // `escape_html_scalar`, `Tree::append` and
                     // `item_to_event` folded into their hot callers.
                     let hot_site = pgo_hot > 0
+                        && !heavy
                         && !f.cold
                         && site_count.zip(st.prof_hot).is_some_and(|(c, h)| c >= h);
                     if hot_site {

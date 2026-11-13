@@ -400,3 +400,28 @@ hot-site bonus (0.90, —, 0.88: level with LLVM's profiled build), regex
 without the profile-guided inliner (1.11, 1.10, 1.12). The bundle's
 `PGO_HOT=13` is right for rust-json and wrong for rust-protobuf; a
 profile-derived rule for when the bonus pays is the next thing to find.
+
+## `PLIRON_PGO_HEAVY`: why the profile made regex slower
+
+regex with the profile-guided inliner off was the one tuner signal that
+repeated (three runs). Split by rule (13 rounds, against the bundle):
+`PGO_HOT=0` 1.02, `PGO_WARM=0` 1.01, both off **0.936** with 3.3% fewer
+instructions — either bonus alone is enough to make the same bad
+decision. Diffing the inliner's score rejections with and without the
+bonuses names it: `Fsm::follow_epsilons` (regex's hottest function, a
+loop nest, cost 482) inlined into `next_state` (1,383 ops) and
+`exec_byte`. LLVM keeps it out of line.
+
+The rule: a bonus buys back call overhead, so a callee that runs many
+blocks per call has nothing to gain. `PLIRON_PGO_HEAVY=<k>`: a callee
+whose profile shows more than `k` block executions per entry gets
+neither bonus. Eight programs, 11 rounds, against the bundle:
+
+| k | time | instructions | regex time / instr |
+|---|---|---|---|
+| 16 | 0.988 | 1.000 | 0.93 / 0.965 |
+| 64 | 0.993 | 0.997 | 0.94 / 0.965 |
+| 256 | 0.985 | 0.997 | 0.94 / 0.965 |
+
+The other seven programs move by at most 0.5% in instructions at 256.
+In the bundle at 256; `harness/pgofuzz.py` 200 seeds pass.
