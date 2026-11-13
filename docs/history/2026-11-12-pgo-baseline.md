@@ -383,3 +383,20 @@ only `ELABLOOPS=2`. Read the first table as an upper bound with
 selection bias, not a result: what repeated is regex 1.18-1.20 -> 1.10-1.11
 and rust-compression 1.09-1.11 -> 1.05-1.06 of LLVM. `tune.py` now
 keeps a candidate only if it wins twice in independent measurements.
+
+Third tuner run, with the confirmation rule (9 candidates won once and
+lost the confirmation, across the eight programs):
+
+| program | bundle | tuned | LLVM+profile | setting |
+|---|---|---|---|---|
+| rust-protobuf | 0.96 | **0.88** | 0.88 | `INLINE=640 PGO_FREQ=0 PGO_HOT=0 PGO_XCGU=0` |
+| rust-html-rewriter | 1.09 | **1.05** | 0.84 | `XCGU_DEPTH=16` |
+| regex | 1.19 | **1.12** | 0.95 | (`PGO_INLINE=0` again among them) |
+| rust-compression | 1.11 | 1.10 | 0.97 | `INLINE=640` |
+| others | — | bundle | | |
+
+Across three runs the repeatable signals are: rust-protobuf without the
+hot-site bonus (0.90, —, 0.88: level with LLVM's profiled build), regex
+without the profile-guided inliner (1.11, 1.10, 1.12). The bundle's
+`PGO_HOT=13` is right for rust-json and wrong for rust-protobuf; a
+profile-derived rule for when the bonus pays is the next thing to find.
