@@ -425,3 +425,22 @@ neither bonus. Eight programs, 11 rounds, against the bundle:
 
 The other seven programs move by at most 0.5% in instructions at 256.
 In the bundle at 256; `harness/pgofuzz.py` 200 seeds pass.
+
+`edgeknown` generalised: the tested parameter may belong to any block
+(a parameter is fixed once its block is entered), and an edge through a
+single-predecessor `jump` block takes its fact from the branch before
+it. A regex-style sparse-set loop (`contains` then `insert`, both
+bounds-checking the same index) carried the first check's result round
+the loop as an `i8` parameter and re-tested it: 63 -> 55 instructions;
+the varint repro 100 -> 94. Eight programs: instructions 1.000. The
+shapes are real but not where these programs spend time; opt-in.
+Same repro: the late `ivrefold2` rewrites the slice pointer in terms of
+the set's length (`ptr - len*8 + len'*8`), 2 instructions per
+iteration worse than leaving it; `PLIRON_IVREFOLD2=0` gives 61.
+
+Full run after `PGO_HEAVY` (`run.py --pgo`, 7 rounds, a noisy hour —
+regex's interval is [0.96, 1.13]): pgo/pliron 0.974 [0.946, 0.999],
+pliron-pgo/llvm 1.044 [1.016, 1.083], llvm-pgo/llvm 0.931, loop 2.29x
+(llvm 28 s, pliron 32, pliron-pgo 63, llvm-pgo 60). Unchanged within
+noise at this resolution; the interleaved A/B is what resolves the
+regex gain. Gate: passed on 1dc9a17.

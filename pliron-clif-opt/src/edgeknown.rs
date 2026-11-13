@@ -98,32 +98,77 @@ fn edge_fact(func: &Function, term: Inst, then: bool, a: Value) -> Option<bool> 
     None
 }
 
+/// The fact for `b`'s parameter `pi` if every incoming edge agrees.
+fn param_fact(func: &Function, cfg: &ControlFlowGraph, b: Block, pi: usize) -> Option<bool> {
+    let mut known: Option<bool> = None;
+    for pred in cfg.pred_iter(b) {
+        let dests = func.dfg.insts[pred.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let hits: Vec<usize> = (0..dests.len()).filter(|&i| dests[i].block(&func.dfg.value_lists) == b).collect();
+        let [i] = hits[..] else { return None };
+        let Some(BlockArg::Value(a)) = dests[i].args(&func.dfg.value_lists).nth(pi) else {
+            return None;
+        };
+        let mut fact = edge_fact(func, pred.inst, i == 0, a);
+        // A plain `jump` out of a block with one predecessor: the edge
+        // into that block decided it (a split edge, a landing block).
+        if fact.is_none()
+            && matches!(func.dfg.insts[pred.inst], InstructionData::Jump { .. })
+            && Some(pred.block) != func.layout.entry_block()
+        {
+            let mut ps = cfg.pred_iter(pred.block);
+            if let (Some(pp), None) = (ps.next(), ps.next()) {
+                let d2 = func.dfg.insts[pp.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                let h2: Vec<usize> =
+                    (0..d2.len()).filter(|&i| d2[i].block(&func.dfg.value_lists) == pred.block).collect();
+                if let [j] = h2[..] {
+                    fact = edge_fact(func, pp.inst, j == 0, a);
+                }
+            }
+        }
+        match (fact, known) {
+            (Some(f), None) => known = Some(f),
+            (Some(f), Some(k)) if f == k => {}
+            _ => return None,
+        }
+    }
+    known
+}
+
 /// Returns the number of `brif`s that became `jump`s.
 pub fn run(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
-    let mut n = 0;
-    for b in blocks {
+    // Parameter -> (its block, its index).
+    let mut home: rustc_hash::FxHashMap<Value, (Block, usize)> = rustc_hash::FxHashMap::default();
+    for &b in &blocks {
         if Some(b) == entry {
             continue;
         }
+        for (i, &p) in func.dfg.block_params(b).iter().enumerate() {
+            home.insert(p, (b, i));
+        }
+    }
+    let mut facts: rustc_hash::FxHashMap<Value, Option<bool>> = rustc_hash::FxHashMap::default();
+    let mut n = 0;
+    for b in blocks {
         let Some(t) = func.layout.last_inst(b) else { continue };
         let InstructionData::Brif { arg, blocks: [bt, bf], .. } = func.dfg.insts[t] else {
             continue;
         };
-        // The tested parameter, and whether non-zero takes the `then` edge.
+        // The tested parameter (of this block or one that dominates it:
+        // a parameter's value is fixed once its block is entered), and
+        // whether non-zero takes the `then` edge.
         let c = func.dfg.resolve_aliases(arg);
-        let params = func.dfg.block_params(b);
-        let (p, nz_then) = if params.contains(&c) {
+        let (p, nz_then) = if home.contains_key(&c) {
             (c, true)
         } else if let Some((x, y, ne)) = eq_test(func, c) {
-            if params.contains(&x) && iconst(func, y) == Some(0) {
+            if home.contains_key(&x) && iconst(func, y) == Some(0) {
                 (x, ne)
-            } else if params.contains(&y) && iconst(func, x) == Some(0) {
+            } else if home.contains_key(&y) && iconst(func, x) == Some(0) {
                 (y, ne)
             } else if let Some(q) = added(func, x, y).or_else(|| added(func, y, x))
-                && params.contains(&q)
+                && home.contains_key(&q)
             {
                 // `x == x + q` is `q == 0` (a slice iterator's
                 // `ptr == ptr + len` before the egraph folds it).
@@ -134,33 +179,11 @@ pub fn run(func: &mut Function) -> usize {
         } else {
             continue;
         };
-        let pi = params.iter().position(|&x| x == p).unwrap();
-        let mut known: Option<bool> = None;
-        let mut ok = true;
-        let mut any = false;
-        for pred in cfg.pred_iter(b) {
-            any = true;
-            let dests = func.dfg.insts[pred.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
-            let hits: Vec<usize> =
-                (0..dests.len()).filter(|&i| dests[i].block(&func.dfg.value_lists) == b).collect();
-            let fact = match hits[..] {
-                [i] => match dests[i].args(&func.dfg.value_lists).nth(pi) {
-                    Some(BlockArg::Value(a)) => edge_fact(func, pred.inst, i == 0, a),
-                    _ => None,
-                },
-                _ => None,
-            };
-            match (fact, known) {
-                (Some(f), None) => known = Some(f),
-                (Some(f), Some(k)) if f == k => {}
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        let Some(nz) = known else { continue };
-        if !ok || !any || !pliron_cfg::bisect("edgeknown") {
+        let (hb, pi) = home[&p];
+        let Some(nz) = *facts.entry(p).or_insert_with(|| param_fact(func, &cfg, hb, pi)) else {
+            continue;
+        };
+        if !pliron_cfg::bisect("edgeknown") {
             continue;
         }
         let keep = if nz == nz_then { bt } else { bf };
