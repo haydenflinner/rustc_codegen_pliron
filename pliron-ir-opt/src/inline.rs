@@ -3584,6 +3584,11 @@ fn inline_call(
         _ => x,
     };
 
+    if let (Some(c), Some(e)) = (callsite_c, callee_entry)
+        && c > e.saturating_mul(2)
+    {
+        pliron_cfg::remark!("pgoscale", caller, cs; "site={c} entry={e}");
+    }
     let src = &tags.src;
     let mut map = IrMapping::bounded(tags.vb, tags.ob, tags.bb);
     clone_blocks_into(src, region, ctx, rw, &mut map);

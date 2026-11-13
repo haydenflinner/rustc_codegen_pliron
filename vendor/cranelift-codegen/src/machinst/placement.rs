@@ -550,12 +550,49 @@ fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bo
         };
         loops[id].factor = (f * loops[id].entry * loops[id].scale).min(FREQ_CAP);
     }
-    let freq: Vec<f64> = (0..n)
+    let mut freq: Vec<f64> = (0..n)
         .map(|b| match innermost[b] {
             Some(l) => (loops[l].factor * rel[b]).min(FREQ_CAP),
             None => rel[b].min(FREQ_CAP),
         })
         .collect();
+    // `PLIRON_PLACE_PIN=1` (opt-in): where a block has a measured count,
+    // its frequency is that count over the entry's, not what the walk
+    // above propagated. The walk only sees successor shares: a loop all
+    // of whose exits the profiled run took from count-less blocks, or
+    // whose latch never left, comes out thousands of iterations long
+    // (pulldown-cmark `scan_containers`: 64M modelled iterations where
+    // the whole profile's largest count is 0.85M). A block without a
+    // count is rescaled by its nearest counted dominator's correction.
+    static PIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PIN.get_or_init(|| std::env::var("PLIRON_PLACE_PIN").as_deref() == Ok("1"))
+        && counts.len() == n
+        && let Some(ec) = counts[entry].filter(|&c| c > 0 && c != u64::MAX)
+    {
+        let measured = |b: usize| counts[b].filter(|&c| c != u64::MAX).map(|c| c as f64 / ec as f64);
+        let old = freq.clone();
+        for b in 0..n {
+            if rpo_idx[b] == usize::MAX {
+                continue;
+            }
+            if let Some(m) = measured(b) {
+                freq[b] = m.min(FREQ_CAP);
+                continue;
+            }
+            let mut d = b;
+            let mut steps = 0;
+            while d != entry && idom[d] != usize::MAX && steps < 64 {
+                d = idom[d];
+                steps += 1;
+                if let Some(m) = measured(d) {
+                    if old[d] > 0.0 {
+                        freq[b] = (old[b] * m / old[d]).min(FREQ_CAP);
+                    }
+                    break;
+                }
+            }
+        }
+    }
     Some(Freq { n, preds, rpo, rpo_idx, loops, asc, innermost, in_loop, prob, freq })
 }
 

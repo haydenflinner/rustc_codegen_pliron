@@ -290,3 +290,25 @@ program driving the first — no change made.
   remaining 700 rerun: 700 pass.
 - `harness/pgofuzz.py`: 400 seeds through generate/run/use, all pass.
 - `harness/crates.py --tier 1`: 20 crates, 0 pliron-only problems.
+
+## 2026-11-13 (later): the layout model's frequencies were wrong
+
+`harness/layout_score.py` reported 268M block executions for
+pulldown-cmark, 96% of them in `scan_containers` — which samples at 2%
+of the time, and the raw profile's largest block count is 0.85M (40M
+in total). The counts are fine; `placement::analyze` turns them into
+successor *shares* and propagates, and a loop whose latch never left
+in the profiled run gets the 1e-4 floor as its exit probability: ten
+thousand modelled iterations. `PLIRON_PLACE_PIN=1` (opt-in) pins every
+counted block's frequency to count/entry and rescales count-less
+blocks by their nearest counted dominator. With it the model totals
+38.5M blocks (profile: 40.5M) and the score is honest: 0.498 transfers
+per block against a floor of 0.179 (pulldown-cmark), 0.420 / 0.201
+(rust-html-rewriter). Use it whenever scoring a layout.
+
+Run time with it (11 rounds): pulldown-cmark 1.009, rust-html-rewriter
+1.028 (noise), with `PLACE_ROT`/`PLACE_OPT` on top the same. So the
+earlier conclusion stands on a sound model now: on this CPU the order
+of blocks is not where the time is; retired instructions do not move
+(1.001). Also ruled out: the inliner's count scaling (new `pgoscale`
+remark; only 14 sites, all tiny, have site > callee entry).
