@@ -312,3 +312,16 @@ earlier conclusion stands on a sound model now: on this CPU the order
 of blocks is not where the time is; retired instructions do not move
 (1.001). Also ruled out: the inliner's count scaling (new `pgoscale`
 remark; only 14 sites, all tiny, have site > callee entry).
+
+**Loop cost: sharing the front end does not help.** Phase times
+(`--jobs 2`, warm): the instrumented build costs 0.8-1.0x a plain
+build even unoptimized, the profiled build 1.0-1.3x. Tried: both
+builds in one target directory with `-Cincremental` on every crate and
+`-Zdisable-incr-comp-backend-caching`, so the profiled build reuses the
+front end's query results and only regenerates code. Profiled build
+6.8 s -> 6.8 s (rust-html-rewriter), 3.0 -> 2.3 (pulldown-cmark),
+4.0 -> 4.5 (regex), and the instrumented build pays ~10% for writing
+the cache. The backend is the cost, not the front end. (Fixed on the
+way: an instrumented unit with no function bodies emitted a
+constructor for a header it never defined — a link error under
+incremental builds.)

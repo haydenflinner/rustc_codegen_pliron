@@ -1025,7 +1025,9 @@ pub(crate) fn finish_pre(
         let mut asm = None;
         if env_set("PLIRON_PGO") {
             let (hdr, ctor, _) = pgo::instrument(ctx, st, name, fmt);
-            asm = pgo::ctor_asm(&hdr, &ctor, cfg.aarch64, fmt);
+            if !hdr.is_empty() {
+                asm = pgo::ctor_asm(&hdr, &ctor, cfg.aarch64, fmt);
+            }
         }
         if let Some(f) = env_get("PLIRON_PGO_USE") {
             pgo::load(ctx, st, f);

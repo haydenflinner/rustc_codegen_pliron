@@ -280,7 +280,10 @@ pub fn instrument(
         .map(|(n, f)| (n.clone(), f.op))
         .collect();
     let Some((_, first)) = funcs.first() else {
-        return (hdr_sym, ctor_sym, ctrs_sym);
+        // Nothing to count (an incremental build's fallback unit, a unit
+        // of statics): no header is defined, so the caller must not emit
+        // the constructor that registers it.
+        return (String::new(), ctor_sym, ctrs_sym);
     };
     let module = first
         .deref(ctx)
