@@ -30,6 +30,7 @@ pub mod clifpeep;
 pub mod cmp3;
 pub mod cmpcancel;
 pub mod cmpmerge;
+pub mod selset;
 pub mod commute;
 pub mod config;
 pub mod constdedup;

@@ -3526,6 +3526,16 @@ fn s_esplit(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Sparse small-domain membership trees (is_whitespace/is_ascii_*
 // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
 // the accepted set fits a 64-bit window.
+// A membership predicate held in a select chain — see `selset`.
+fn s_selset(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::selset::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("selset");
+    }
+    k
+}
+
 fn s_bittab(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = bittab::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -5162,6 +5172,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // The late refold expressed walked pointers as `base + idx`;
         // their exit tests still compare `base + idx + 1` with `base +
         // len`.
+        // What if-conversion turned from a membership tree into a select
+        // chain. Late: the branch it left in front has shed its edge
+        // arguments by now and can join the set.
+        step("selset", "selset", Gate::Env("PLIRON_SELSET"), s_selset).needs(shape::CONDBR),
         step("cmpcancel", "cmpcancel", Gate::Env("PLIRON_CMPCANCEL"), s_cmpcancel),
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one
