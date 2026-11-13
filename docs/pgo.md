@@ -285,13 +285,47 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
   walk gains 10-15% in cache and little beyond it (its misses already
   overlap inside one node; the chain is latency-bound). The sequential
   sweep is the warning: 25% faster in cache, **2.5x slower** once the
-  array leaves the cache. A stock-LLVM build with the hot fields placed
-  first by hand in a `repr(C)` struct shows the same slowdown, so it is
-  the layout, not our code. The likely cause (not verified with
-  counters): with the hot fields spread out, the sweep
-  touches every line and several load streams prefetch ahead; packed,
-  it is one sparse stream. The profile cannot tell a sweep from a
-  gather, so this stays opt-in.
+  array leaves the cache (that table is every listed struct reordered,
+  `PLIRON_FIELD_ORDER_SEQ=1`).
+- **Why the sweep loses** (`tests/field_order/sweep.rs`, layout only, no
+  backend involved; 128 MB arrays, ns/element, best of 21). With the hot
+  words spread out the sweep touches every 64-byte line in order; packed
+  at the front it touches one line per element and skips the rest:
+
+  | stride | lines touched, packed | scattered | packed | packed + prefetch 32 ahead | packed + read every line |
+  | --- | --- | --- | --- | --- | --- |
+  | 64 | 100% | 1.2 | 1.2 | 1.5 | 1.2 |
+  | 128 | 50% | 2.1 | 4.6 | 4.4 | 2.1 |
+  | 160 | 40% | 2.4 | 6.7 | 4.5 | 2.7 |
+  | 192 | 33% | 2.7 | 5.3 | 4.0 | 3.0 |
+  | 256 | 25% | 3.3 | 5.6 | 4.2 | 3.9 |
+  | 320 | 20% | 3.8 | 6.4 | 3.9 | 4.7 |
+
+  The loss starts exactly where the stride first skips a 64-byte line
+  (128), not before, and reading one cold word from every skipped line
+  gives the speed back: this core streams consecutive lines at about
+  1.1 ns each, and stops streaming when lines are skipped, leaving one
+  demand miss per element (4.5-6.5 ns whatever the stride). A software
+  prefetch per element helps only partly (about 4.2 ns from 32 elements
+  ahead on, no better at 64 or 128): it is still one line fill per
+  element, not a stream. Cache-miss counters were not available
+  headless (`xctrace`'s CPU Counters template records cycles and
+  pipeline bottleneck classes only).
+- **Sweep rule** (default): heat also records, per struct, how much of
+  it is in accesses whose address *steps* (`@seq`: the pointer or index
+  is on an arithmetic recurrence in the MIR — `for p in slice`,
+  `v[i]` with `i += 1`) and how much comes *out of memory* (`@rand`:
+  `v[order[k]]`, `node.next`); the rest (through a parameter, a stack
+  local) is unknown. A struct wider than 64 bytes whose heat is more
+  than half sequential keeps rustc's order. On the cache benchmark
+  (`Particle` swept, an identical `Body` gathered, `Node` walked; 1M
+  elements, loaded machine): sweep 2.6-3.6 plain, 2.6-3.2 with the
+  rule, 7.7-8.3 forced; gather 13.5-17 -> 9.8-12.5; in cache gather
+  2.82 -> 1.45. The rule gives up the 20% the sweep would gain in
+  cache. It sees only what MIR inlining exposes: a sweep whose body is
+  a method taking `&mut self` is "unknown" and the struct is reordered.
+  One layout per type: a struct that is both swept and gathered follows
+  whichever has more heat.
 - **Held-out programs**, profile-weighted heat, `ab.py`, cycles
   reordered/plain: pulldown-cmark 1.014 (5 rounds, 8 structs),
   rust-html-rewriter 1.006 (15 rounds, 44 structs), rust-protobuf 0.989
@@ -335,7 +369,7 @@ crate, target not linkable from the CGU, ABI). Numbers:
 | env | effect |
 | --- | --- |
 | `PLIRON_FIELD_HEAT=<file>` | append per-field access weights for the crate (see Field order) |
-| `PLIRON_FIELD_ORDER=<file>` | hot fields first inside each alignment class of listed `repr(Rust)` structs (see Field order); `PLIRON_FIELD_ORDER_LOG=<file>` lists what was permuted |
+| `PLIRON_FIELD_ORDER=<file>` | hot fields first inside each alignment class of listed `repr(Rust)` structs (see Field order); `PLIRON_FIELD_ORDER_LOG=<file>` lists what was permuted or skipped; `PLIRON_FIELD_ORDER_SEQ=1` also reorders swept structs |
 | `PLIRON_PGO=<dir>` | instrument build; profile written to `<dir>/pliron-<pid>.prof` (or `$PLIRON_PROFILE_FILE`) |
 | `PLIRON_PGO_OPT=1` | optimize the instrumented build too (default: it is built unoptimized — the counters sit on the pre-optimization CFG, the profile is the same, the build is about a third faster and the profiling run about 2x slower) |
 | `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |

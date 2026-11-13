@@ -28,7 +28,7 @@ sort -u -k1,2 "$out/heat.txt" | awk -F'\t' '{print $1 "\t" $2 "\t" 100000-NR}' >
 fail=0
 for o in heat up down; do
     build "order-$o" "PLIRON_FIELD_ORDER=$PWD/$out/$o.txt" "PLIRON_FIELD_ORDER_LOG=$PWD/$out/$o.log"
-    n=$(sort -u "$out/$o.log" 2>/dev/null | wc -l | tr -d ' ')
+    n=$(grep -v 'skip-seq$' "$out/$o.log" 2>/dev/null | sort -u | wc -l | tr -d ' ')
     if diff <(grep -v '^offset_of' "$out/plain.out") <(grep -v '^offset_of' "$out/order-$o.out") > "$out/$o.diff"; then
         d=$(diff <(grep '^offset_of' "$out/plain.out") <(grep '^offset_of' "$out/order-$o.out") | grep -c '^>' || true)
         echo "ok   order-$o: $n layouts permuted, $d offset_of lines differ"

@@ -234,6 +234,22 @@ fn permute<'tcx>(
     if w.iter().all(|&x| x == 0) {
         return None;
     }
+    // Swept types keep rustc's order (`access_class`): packing the hot
+    // fields of an element wider than one line makes a sequential pass
+    // skip lines, and the hardware's stream prefetch stops following it
+    // (tests/field_order/sweep.rs: 2-3x slower out of cache). An element
+    // of at most `LINE` bytes cannot skip a line. `PLIRON_FIELD_ORDER_SEQ=1`
+    // reorders them anyway.
+    let seq = heat.get(SEQ_NAME).copied().unwrap_or(0);
+    let total: u64 =
+        heat.iter().filter(|(k, _)| !k.starts_with('@')).fold(0u64, |a, (_, &v)| a.saturating_add(v));
+    if data.size.bytes() > LINE
+        && seq.saturating_mul(2) > total
+        && !pliron_cfg::env_is("PLIRON_FIELD_ORDER_SEQ", "1")
+    {
+        log_layout(tcx, did, l.ty, "skip-seq");
+        return None;
+    }
     // Same test as `rustc_ty_utils::layout` (`maybe_unsized`).
     let last = variant.tail_opt()?;
     let def_env = ty::TypingEnv::new(
@@ -326,22 +342,7 @@ fn permute<'tcx>(
         }
     }
 
-    // `PLIRON_FIELD_ORDER_LOG=<file>`: one line per permuted layout
-    // (compiling crate, struct, instantiation, fields moved), to count what the order file did.
-    if let Some(log) = pliron_cfg::env_get("PLIRON_FIELD_ORDER_LOG") {
-        use std::io::Write;
-        let line = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
-            "{}\t{}\t{}\t{moved}\n",
-            tcx.crate_name(LOCAL_CRATE),
-            type_key(tcx, did),
-            l.ty
-        ));
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-            .and_then(|mut f| f.write_all(line.as_bytes()));
-    }
+    log_layout(tcx, did, l.ty, &moved.to_string());
 
     let mut nd = data.clone();
     nd.fields = FieldsShape::Arbitrary { offsets: new_off, in_memory_order: new_mem };
@@ -349,7 +350,176 @@ fn permute<'tcx>(
     Some(TyAndLayout { ty: l.ty, layout: tcx.mk_layout(nd) })
 }
 
+/// `PLIRON_FIELD_ORDER_LOG=<file>`: one line per layout the order file
+/// reached (compiling crate, struct, instantiation, fields moved or
+/// `skip-seq`), to count what it did.
+fn log_layout<'tcx>(tcx: TyCtxt<'tcx>, did: DefId, ty: Ty<'tcx>, what: &str) {
+    let Some(log) = pliron_cfg::env_get("PLIRON_FIELD_ORDER_LOG") else { return };
+    use std::io::Write;
+    let line = rustc_middle::ty::print::with_no_trimmed_paths!(format!(
+        "{}\t{}\t{}\t{what}\n",
+        tcx.crate_name(LOCAL_CRATE),
+        type_key(tcx, did),
+        ty
+    ));
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
+/// Pseudo-fields in the heat file: the part of a struct's heat that is
+/// sequential (`access_class`) and the part that is random.
+const SEQ_NAME: &str = "@seq";
+const RAND_NAME: &str = "@rand";
+const SEQ: u32 = u32::MAX;
+const RAND: u32 = u32::MAX - 1;
+/// Bytes per cache line for the sweep rule. 64 on every target we care
+/// about (Apple's 128-byte figure is the L2 line; the stride experiment
+/// shows the loss starting when 64-byte lines are skipped).
+const LINE: u64 = 64;
+
 // --------------------------------------------------------------- record
+
+/// How the address of an access is formed, per local, flow-insensitive:
+/// `STEP`: the local is on a cycle through pointer/integer arithmetic (an
+/// induction variable or a stepped pointer) or computed from one;
+/// `LOAD`: it holds, or is computed from, a value read out of memory
+/// (`order[k]`, `node.next`).
+const STEP: u8 = 1;
+const LOAD: u8 = 2;
+
+fn local_flow(body: &mir::Body<'_>) -> Vec<u8> {
+    use mir::{BinOp, Operand, Rvalue, StatementKind};
+    let n = body.local_decls.len();
+    let mut flags = vec![0u8; n];
+    // dst depends on src; arithmetic (dst, operand) pairs.
+    let mut deps: Vec<(mir::Local, mir::Local)> = Vec::new();
+    let mut arith: Vec<(mir::Local, mir::Local)> = Vec::new();
+    let reads_memory = |pl: &mir::Place<'_>| {
+        pl.projection.iter().any(|e| matches!(e, ProjectionElem::Deref | ProjectionElem::Index(_)))
+    };
+    for data in body.basic_blocks.iter() {
+        for st in &data.statements {
+            let StatementKind::Assign(asg) = &st.kind else { continue };
+            let (place, rv) = &**asg;
+            if place.is_indirect() {
+                continue;
+            }
+            let dst = place.local;
+            let operand = |op: &Operand<'_>, flags: &mut Vec<u8>, deps: &mut Vec<_>| {
+                let Some(pl) = op.place() else { return None };
+                if reads_memory(&pl) {
+                    flags[dst.as_usize()] |= LOAD;
+                    None
+                } else {
+                    deps.push((dst, pl.local));
+                    Some(pl.local)
+                }
+            };
+            match rv {
+                Rvalue::Use(op, ..) | Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => {
+                    operand(op, &mut flags, &mut deps);
+                }
+                Rvalue::BinaryOp(bop, ops) => {
+                    let (a, b) = &**ops;
+                    let step = matches!(
+                        bop,
+                        BinOp::Add
+                            | BinOp::AddUnchecked
+                            | BinOp::AddWithOverflow
+                            | BinOp::Sub
+                            | BinOp::SubUnchecked
+                            | BinOp::SubWithOverflow
+                            | BinOp::Offset
+                    );
+                    for op in [a, b] {
+                        if let Some(src) = operand(op, &mut flags, &mut deps)
+                            && step
+                        {
+                            arith.push((dst, src));
+                        }
+                    }
+                }
+                Rvalue::Ref(_, _, pl) | Rvalue::RawPtr(_, pl) => {
+                    // An address: the base pointer and the indices, no load
+                    // (a second deref on the way is one).
+                    let derefs =
+                        pl.projection.iter().filter(|e| matches!(e, ProjectionElem::Deref)).count();
+                    if derefs > 1 {
+                        flags[dst.as_usize()] |= LOAD;
+                    }
+                    deps.push((dst, pl.local));
+                    for e in pl.projection.iter() {
+                        if let ProjectionElem::Index(i) = e {
+                            deps.push((dst, i));
+                        }
+                    }
+                }
+                Rvalue::Aggregate(_, ops) => {
+                    for op in ops.iter() {
+                        operand(op, &mut flags, &mut deps);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // An arithmetic assignment on a dependency cycle is a recurrence.
+    let graph = rustc_data_structures::graph::vec_graph::VecGraph::<mir::Local>::new(n, deps.clone());
+    let sccs = rustc_data_structures::graph::scc::Sccs::<mir::Local, usize>::new(&graph);
+    for &(dst, src) in &arith {
+        if sccs.scc(dst) == sccs.scc(src) {
+            flags[dst.as_usize()] |= STEP;
+        }
+    }
+    // Both facts flow along the dependencies (bounded rounds; statements
+    // are mostly in dependency order).
+    for _ in 0..32 {
+        let mut changed = false;
+        for &(dst, src) in &deps {
+            let f = flags[dst.as_usize()] | flags[src.as_usize()];
+            if f != flags[dst.as_usize()] {
+                flags[dst.as_usize()] = f;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    flags
+}
+
+/// `SEQ` / `RAND` / neither for an access whose address is `base`:
+/// sequential when the pointer or an index steps through memory, random
+/// when it comes out of memory (and does not step), unknown otherwise
+/// (a parameter, a stack local).
+fn access_class(flow: &[u8], base: mir::PlaceRef<'_>) -> Option<u32> {
+    let mut derefs = 0;
+    let mut f = 0u8;
+    for e in base.projection {
+        match e {
+            ProjectionElem::Deref => derefs += 1,
+            ProjectionElem::Index(i) => f |= flow[i.as_usize()],
+            _ => {}
+        }
+    }
+    if derefs > 0 {
+        f |= flow[base.local.as_usize()];
+    }
+    if derefs > 1 {
+        f |= LOAD;
+    }
+    if f & STEP != 0 {
+        Some(SEQ)
+    } else if f & LOAD != 0 {
+        Some(RAND)
+    } else {
+        None
+    }
+}
 
 pub(crate) fn heat_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -459,6 +629,8 @@ struct Walk<'a, 'tcx> {
     keys: &'a mut Vec<(String, String)>,
     /// Accesses per `(MIR block, key)` in this body.
     hits: HashMap<(u32, u32), u64>,
+    /// `local_flow` of the body.
+    flow: Vec<u8>,
 }
 
 impl<'tcx> Walk<'_, 'tcx> {
@@ -469,8 +641,17 @@ impl<'tcx> Walk<'_, 'tcx> {
             if !plain_repr(&def.repr()) || !crate_ok(tcx, def.did().krate) {
                 return None;
             }
-            let f = def.non_enum_variant().fields.get(rustc_abi::FieldIdx::from_u32(field))?;
-            keys.push((type_key(tcx, def.did()), f.name.to_string()));
+            let name = match field {
+                SEQ => SEQ_NAME.to_string(),
+                RAND => RAND_NAME.to_string(),
+                _ => def
+                    .non_enum_variant()
+                    .fields
+                    .get(rustc_abi::FieldIdx::from_u32(field))?
+                    .name
+                    .to_string(),
+            };
+            keys.push((type_key(tcx, def.did()), name));
             Some(keys.len() as u32 - 1)
         })
     }
@@ -495,6 +676,11 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
             }
             if let Some(k) = self.key(*def, f.as_u32()) {
                 *self.hits.entry((loc.block.as_u32(), k)).or_insert(0) += 1;
+                if let Some(c) = access_class(&self.flow, base)
+                    && let Some(k) = self.key(*def, c)
+                {
+                    *self.hits.entry((loc.block.as_u32(), k)).or_insert(0) += 1;
+                }
             }
         }
     }
@@ -519,7 +705,14 @@ pub(crate) fn record_cgu<'tcx>(
     let mut unmapped = (0u64, 0u64);
     for inst in insts {
         let body = tcx.instance_mir(inst.def);
-        let mut walk = Walk { tcx, body, ids: &mut ids, keys: &mut keys, hits: HashMap::new() };
+        let mut walk = Walk {
+            tcx,
+            body,
+            ids: &mut ids,
+            keys: &mut keys,
+            hits: HashMap::new(),
+            flow: local_flow(body),
+        };
         walk.visit_body(body);
         let hits = walk.hits;
         if hits.is_empty() {

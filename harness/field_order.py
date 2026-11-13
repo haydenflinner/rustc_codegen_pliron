@@ -8,7 +8,9 @@ The file has one "<crate>::<type path>\\t<field>\\t<weight>" line per
 can repeat. The backend reads the raw file itself (PLIRON_FIELD_ORDER);
 this is for looking at it. Types are listed hottest first; within a type
 the fields are in the order the backend prefers (it only swaps fields of
-identical size and alignment, so the final layout may differ).
+one alignment class, so the final layout may differ). "sequential" is
+the share of a type's heat in accesses that step through memory; over
+half, and wider than a cache line, the backend leaves the type alone.
 """
 import argparse
 import collections
@@ -52,6 +54,13 @@ def main():
         heat, bad = load(a.heat_file)
     except OSError as e:
         sys.exit(f"{a.heat_file}: {e}")
+    # "@seq" / "@rand" are not fields: the share of the type's heat whose
+    # address steps through memory / comes out of memory.
+    marks = collections.defaultdict(dict)
+    for ty, fields in heat.items():
+        for f in [f for f in fields if f.startswith("@")]:
+            marks[ty][f] = fields.pop(f)
+    heat = {ty: fields for ty, fields in heat.items() if fields}
     types = sorted(heat.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))
     shown = 0
     for ty, fields in types:
@@ -59,7 +68,12 @@ def main():
         if total < a.min_weight:
             continue
         shown += 1
-        print(f"{ty}  total={total}")
+        note = ""
+        if marks[ty]:
+            seq, rand = marks[ty].get("@seq", 0), marks[ty].get("@rand", 0)
+            note = (f"  sequential {100.0 * seq / total:.0f}% random {100.0 * rand / total:.0f}%"
+                    if total else "")
+        print(f"{ty}  total={total}{note}")
         width = max(len(f) for f in fields)
         for f, w in sorted(fields.items(), key=lambda kv: (-kv[1], kv[0])):
             share = 100.0 * w / total if total else 0.0

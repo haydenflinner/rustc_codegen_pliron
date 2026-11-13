@@ -9,31 +9,71 @@ use std::hint::black_box;
 use std::mem::{offset_of, size_of};
 use std::time::Instant;
 
-/// 160 bytes, one alignment class. Hot: `x`, `vx`, `mass`, `alive`
-/// (declaration offsets 0, 64, 128, 152: three 64-byte lines, two
-/// 128-byte lines; hot-first they share one).
-struct Particle {
-    x: f64,
-    c1: u64,
-    c2: u64,
-    c3: u64,
-    c4: u64,
-    c5: u64,
-    c6: u64,
-    c7: u64,
-    vx: f64,
-    c8: u64,
-    c9: u64,
-    c10: u64,
-    c11: u64,
-    c12: u64,
-    c13: u64,
-    c14: u64,
-    mass: f64,
-    c15: u64,
-    c16: u64,
-    alive: u64,
+// 160 bytes, one alignment class. Hot: `x`, `vx`, `mass`, `alive`
+// (declaration offsets 0, 64, 128, 152: three 64-byte lines, two
+// 128-byte lines; hot-first they share one).
+// Two identical types: `Particle` is only swept, `Body` only gathered, so
+// the sequential/random split in the heat file can treat them apart.
+macro_rules! particle {
+    ($name:ident, $make:ident) => {
+        struct $name {
+            x: f64,
+            c1: u64,
+            c2: u64,
+            c3: u64,
+            c4: u64,
+            c5: u64,
+            c6: u64,
+            c7: u64,
+            vx: f64,
+            c8: u64,
+            c9: u64,
+            c10: u64,
+            c11: u64,
+            c12: u64,
+            c13: u64,
+            c14: u64,
+            mass: f64,
+            c15: u64,
+            c16: u64,
+            alive: u64,
+        }
+
+        #[inline(never)]
+        fn $make(n: usize) -> Vec<$name> {
+            let mut s = 0x9e3779b97f4a7c15u64;
+            (0..n)
+                .map(|i| {
+                    let r = rng(&mut s);
+                    $name {
+                        x: i as f64,
+                        c1: r,
+                        c2: r ^ 2,
+                        c3: r ^ 3,
+                        c4: r ^ 4,
+                        c5: r ^ 5,
+                        c6: r ^ 6,
+                        c7: r ^ 7,
+                        vx: (r % 1000) as f64 / 1000.0,
+                        c8: r ^ 8,
+                        c9: r ^ 9,
+                        c10: r ^ 10,
+                        c11: r ^ 11,
+                        c12: r ^ 12,
+                        c13: r ^ 13,
+                        c14: r ^ 14,
+                        mass: 1.0 + (r % 7) as f64,
+                        c15: r ^ 15,
+                        c16: r ^ 16,
+                        alive: r & 1,
+                    }
+                })
+                .collect()
+        }
+    };
 }
+particle!(Particle, make_particles);
+particle!(Body, make_bodies);
 
 /// 192 bytes. Hot: `key`, `val`, `next`, `hits`.
 struct Node {
@@ -51,38 +91,6 @@ fn rng(s: &mut u64) -> u64 {
     *s ^= *s >> 7;
     *s ^= *s << 17;
     *s
-}
-
-#[inline(never)]
-fn make_particles(n: usize) -> Vec<Particle> {
-    let mut s = 0x9e3779b97f4a7c15u64;
-    (0..n)
-        .map(|i| {
-            let r = rng(&mut s);
-            Particle {
-                x: i as f64,
-                c1: r,
-                c2: r ^ 2,
-                c3: r ^ 3,
-                c4: r ^ 4,
-                c5: r ^ 5,
-                c6: r ^ 6,
-                c7: r ^ 7,
-                vx: (r % 1000) as f64 / 1000.0,
-                c8: r ^ 8,
-                c9: r ^ 9,
-                c10: r ^ 10,
-                c11: r ^ 11,
-                c12: r ^ 12,
-                c13: r ^ 13,
-                c14: r ^ 14,
-                mass: 1.0 + (r % 7) as f64,
-                c15: r ^ 15,
-                c16: r ^ 16,
-                alive: r & 1,
-            }
-        })
-        .collect()
 }
 
 #[inline(never)]
@@ -119,7 +127,7 @@ fn sweep(ps: &mut [Particle]) -> f64 {
 /// Gather: the same four fields, elements in shuffled order. The visits
 /// are independent, so misses overlap and the cost is lines per element.
 #[inline(never)]
-fn gather(ps: &mut [Particle], order: &[u32]) -> f64 {
+fn gather(ps: &mut [Body], order: &[u32]) -> f64 {
     let mut live = 0u64;
     let mut e = 0.0;
     for &i in order {
@@ -147,12 +155,15 @@ fn walk(ns: &mut [Node], start: usize, steps: usize) -> u64 {
 
 /// Cold fields are read once, so nothing is dead.
 #[inline(never)]
-fn cold_sum(ps: &[Particle], ns: &[Node]) -> u64 {
+fn cold_sum(ps: &[Particle], bs: &[Body], ns: &[Node]) -> u64 {
     let p = &ps[ps.len() / 2];
+    let b = &bs[bs.len() / 2];
     let n = &ns[ns.len() / 2];
     p.c1 ^ p.c2 ^ p.c3 ^ p.c4 ^ p.c5 ^ p.c6 ^ p.c7 ^ p.c8 ^ p.c9 ^ p.c10 ^ p.c11 ^ p.c12
         ^ p.c13 ^ p.c14 ^ p.c15 ^ p.c16
         ^ n.a[3] ^ n.b[2] ^ n.c[1]
+        ^ b.c1 ^ b.c2 ^ b.c3 ^ b.c4 ^ b.c5 ^ b.c6 ^ b.c7 ^ b.c8 ^ b.c9 ^ b.c10 ^ b.c11 ^ b.c12
+        ^ b.c13 ^ b.c14 ^ b.c15 ^ b.c16
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -166,12 +177,16 @@ fn main() {
     let reps: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(9);
     let n = black_box(n);
     println!(
-        "Particle {} bytes: x {} vx {} mass {} alive {} | Node {} bytes: key {} val {} next {} hits {}",
+        "Particle {} bytes: x {} vx {} mass {} alive {} | Body: x {} vx {} mass {} alive {} | Node {} bytes: key {} val {} next {} hits {}",
         size_of::<Particle>(),
         offset_of!(Particle, x),
         offset_of!(Particle, vx),
         offset_of!(Particle, mass),
         offset_of!(Particle, alive),
+        offset_of!(Body, x),
+        offset_of!(Body, vx),
+        offset_of!(Body, mass),
+        offset_of!(Body, alive),
         size_of::<Node>(),
         offset_of!(Node, key),
         offset_of!(Node, val),
@@ -179,6 +194,7 @@ fn main() {
         offset_of!(Node, hits),
     );
     let mut ps = make_particles(n);
+    let mut bs = make_bodies(n);
     let (mut ns, start) = make_nodes(n);
     let mut order: Vec<u32> = (0..n as u32).collect();
     let mut seed = 0xdeadbeefcafef00du64;
@@ -192,14 +208,14 @@ fn main() {
         cs += sweep(&mut ps);
         ts.push(t.elapsed().as_nanos() as f64 / n as f64);
         let t = Instant::now();
-        cs += gather(&mut ps, &order);
+        cs += gather(&mut bs, &order);
         tg.push(t.elapsed().as_nanos() as f64 / n as f64);
         let t = Instant::now();
         cw = cw.wrapping_add(walk(&mut ns, start, n));
         tw.push(t.elapsed().as_nanos() as f64 / n as f64);
     }
     let hits: u64 = ns.iter().map(|n| n.hits).sum();
-    println!("checksum {:.3} {} {} {}", cs, cw, hits, cold_sum(&ps, &ns));
+    println!("checksum {:.3} {} {} {}", cs, cw, hits, cold_sum(&ps, &bs, &ns));
     println!(
         "sweep {:.2} gather {:.2} walk {:.2} ns/element ({} elements, median of {})",
         median(ts),
