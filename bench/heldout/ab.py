@@ -17,7 +17,8 @@ A SIDE is one of
   @FLAGS suffix        extra RUSTFLAGS on any pliron side: `pliron@-Ccodegen-units=1`
 
 Builds are cached per side (a stamp of its environment and the backend
-dylib), so a second call only rebuilds what changed. Every side is then
+dylib), so a second call only rebuilds what changed; the 24 most
+recently used side directories are kept. Every side is then
 run `--rounds` times, interleaved, under `/usr/bin/time -l`, and the table
 gives, per side: the timed region (median and min of `heldout-ns`), and
 the whole process's retired instructions, cycles and instructions per
@@ -114,6 +115,21 @@ def ensure(prog, binary, side, backend):
     return got
 
 
+def prune(keep, limit=24):
+    """Drop the least recently used cached side directories beyond `limit`.
+
+    Every side is a full build of the program (50-100 MB); a night of
+    A/Bs filled the disk once."""
+    import shutil
+    dirs = [d for d in os.listdir(OUT) if d.startswith("ab-") and os.path.isdir(os.path.join(OUT, d))]
+    dirs = sorted((d for d in dirs if d not in keep), key=lambda d: os.path.getmtime(os.path.join(OUT, d)))
+    for d in dirs[:max(0, len(dirs) - limit)]:
+        shutil.rmtree(os.path.join(OUT, d), ignore_errors=True)
+        for f in os.listdir(OUT):
+            if f.startswith(f"build-{d}-") and f.endswith(".log"):
+                os.remove(os.path.join(OUT, f))
+
+
 def once(prog, exe):
     """(timed ns, instructions, cycles) of one run."""
     p = subprocess.run(["/usr/bin/time", "-l", exe], cwd=run.src_dir(prog), capture_output=True, text=True)
@@ -137,6 +153,7 @@ def main():
     binary = next((b for n, b, _ in run.BENCHES if n == a.prog), None)
     if binary is None:
         sys.exit(f"ab: unknown program {a.prog}")
+    prune({side_env(a.prog, s, a.backend)[0] for s in a.sides})
     exes = {s: ensure(a.prog, binary, s, a.backend) for s in a.sides}
     data = {s: [] for s in a.sides}
     for r in range(a.rounds):
