@@ -57,7 +57,7 @@ block2(v38: i64):
 fn leaf_stub_folds_into_brif_arm() {
     let mut f = parse(FIB);
     let k = stubhoist::run(&mut f);
-    assert_eq!(k, 1, "one edge folded");
+    assert_eq!(k, 2, "one edge folded, and the orphaned stub swept (the count includes removed blocks since 1367499)");
     let s = f.to_string();
     // The leaf arm points at the shared return with the uext computed
     // in block0; the stub is gone and the loop-exit stub survives
@@ -97,7 +97,7 @@ block5(v16: i64):
 fn jump_pred_folds_in_loop() {
     let mut f = parse(JUMPPRED);
     let k = stubhoist::run(&mut f);
-    assert_eq!(k, 1, "jump pred folds");
+    assert_eq!(k, 2, "jump pred folds, and the orphaned stub is swept");
     let s = f.to_string();
     assert!(!s.contains("block5:"), "{s}");
     // The cloned iadd sits in block3 before its retargeted jump.
