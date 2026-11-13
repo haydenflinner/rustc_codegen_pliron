@@ -3790,7 +3790,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
     // r[impl wasm.eh.check]
     fn eh_check(&mut self, catch: Option<Ptr<BasicBlock>>) {
         let tls = self.eh_tls();
-        let f = self.b.ins().load(clt::I32, MemFlagsData::new(), tls, 0);
+        // `trusted` (notrap+aligned): the slot is an always-live global,
+        // and a check folded to a same-`return` branch (`commonret`)
+        // leaves the load dead — it must be removable.
+        let f = self.b.ins().load(clt::I32, MemFlagsData::trusted(), tls, 0);
         let cont = self.b.create_block();
         let bad = match catch {
             Some(pb) => self.blocks[&pb],

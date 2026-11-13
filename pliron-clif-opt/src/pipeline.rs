@@ -3437,6 +3437,33 @@ fn s_stubhoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+/// `brif c, A, B` whose arms are the same `return` — the emulated-EH
+/// `eh_check` shape — collapses to `jump`. Runs on every CONDBR function
+/// (the `mergechain` step's MULTI gate skips single-brif shims).
+fn s_commonret(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    use cranelift_codegen::ir::Opcode;
+    let f = &mut p.clctx.func;
+    let mut n = 0;
+    let brifs: Vec<Inst> = f
+        .layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Brif)
+        .collect();
+    for i in brifs {
+        if clifpeep::brif_commondest(f, i) {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        n += jumpthread::remove_unreachable_blocks(f);
+        if p.dump {
+            p.dump("commonret");
+        }
+    }
+    n
+}
+
 fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgesink::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -5231,6 +5258,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // the stubs only exist once edgesink/egraph2 finish merging.
         step("stubhoist", "stubhoist", Gate::Env("PLIRON_STUBHOIST"), s_stubhoist)
             .needs(shape::BLOCKS2),
+        // `brif c, A, B` where A/B are the same `return` (the emulated-EH
+        // `brif flag, return, return` on void-forwarder and drop-free
+        // exits) collapses to `jump`, freeing the whole flag chain. Own
+        // step: mergechain's `brif_fold` never sees single-brif fns.
+        step("commonret", "commonret", Gate::OptIn("PLIRON_COMMONRET"), s_commonret)
+            .needs(shape::CONDBR),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

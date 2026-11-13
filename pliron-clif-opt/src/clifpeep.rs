@@ -2454,6 +2454,67 @@ pub fn brif_not(func: &mut Function, inst: Inst) -> bool {
     true
 }
 
+/// `brif c, T(targs), E(eargs)` where T and E each hold only a `return`
+/// whose operands — substituted through each arm's block params with its
+/// edge args — are pairwise identical: both edges compute the same
+/// result, so the branch collapses to `jump`. Catches the emulated-EH
+/// `eh_check` shape `brif flag, return, return` where an early-exit arm
+/// and the normal path are the same `return`, freeing the TLS chain +
+/// flag load feeding the condition. `PLIRON_COMMONRET`.
+pub fn brif_commondest(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Brif { blocks, .. } = func.dfg.insts[inst] else {
+        return false;
+    };
+    let mut rets: [Vec<Value>; 2] = [Vec::new(), Vec::new()];
+    for k in 0..2 {
+        let b = blocks[k].block(&func.dfg.value_lists);
+        let mut args = Vec::new();
+        for a in blocks[k].args(&func.dfg.value_lists) {
+            let BlockArg::Value(v) = a else { return false };
+            args.push(v);
+        }
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        if insts.len() != 1 || func.dfg.insts[insts[0]].opcode() != Opcode::Return {
+            return false;
+        }
+        let params = func.dfg.block_params(b);
+        for &a in func.dfg.inst_args(insts[0]) {
+            let a = func.dfg.resolve_aliases(a);
+            let v = params
+                .iter()
+                .position(|&p| p == a)
+                .map(|i| args[i])
+                .unwrap_or(a);
+            rets[k].push(func.dfg.resolve_aliases(v));
+        }
+    }
+    if rets[0] != rets[1] {
+        return false;
+    }
+    // Jump to the warmer arm.
+    let (t, e) = (
+        blocks[0].block(&func.dfg.value_lists),
+        blocks[1].block(&func.dfg.value_lists),
+    );
+    let pick = if func.layout.is_cold(t) && !func.layout.is_cold(e) {
+        1
+    } else {
+        0
+    };
+    let mut args = Vec::new();
+    for a in blocks[pick].args(&func.dfg.value_lists) {
+        let BlockArg::Value(v) = a else { return false };
+        args.push(BlockArg::Value(v));
+    }
+    let b = if pick == 0 { t } else { e };
+    let bc = BlockCall::new(b, args, &mut func.dfg.value_lists);
+    func.dfg.insts[inst] = InstructionData::Jump {
+        opcode: Opcode::Jump,
+        destination: bc,
+    };
+    true
+}
+
 /// `brif c, T(.., select c', t, e, ..), E(..)` — an edge arg built on a
 /// condition the `un_not` chain equates with the branch's own is decided
 /// per edge: `c'` is known-true on the taken arm's edge, known-false on
@@ -2592,10 +2653,15 @@ pub fn brif_fold(func: &mut Function) -> usize {
     let mut n = 0;
     let argspec = crate::pass_enabled("PLIRON_ARGSPEC");
     let brifnot = crate::pass_enabled("PLIRON_BRIFNOT");
+    let commonret = crate::env_is("PLIRON_COMMONRET", "1");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             if pos.func.dfg.insts[inst].opcode() != Opcode::Brif {
+                continue;
+            }
+            if commonret && brif_commondest(pos.func, inst) {
+                n += 1;
                 continue;
             }
             if argspec {
