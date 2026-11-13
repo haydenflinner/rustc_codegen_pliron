@@ -1112,6 +1112,13 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         let msg = match &defr {
             Ok(Err(e)) => format!("{e}"),
             Ok(_) => {
+                // `PLIRON_REMARKS`: the frame's regions, so a tool can tell
+                // regalloc spill traffic from explicit-slot traffic by
+                // `[sp, #off]` (bench/heldout/asmvs.py).
+                if pliron_cfg::remarks_on() {
+                    let [slots, spills, clobber, out, fixed] = cranelift_codegen::pliron_last_frame();
+                    pliron_cfg::remark!("frame", n, "layout"; "slots={slots} spills={spills} clobber={clobber} outgoing={out} fixed={fixed}");
+                }
                 // `PLIRON_FRAME_INFO=<symbol substring>`: where the frame
                 // goes (stack slots, spills, callee saves, outgoing args).
                 if let Some(f) = crate::env_get("PLIRON_FRAME_INFO")
@@ -2180,7 +2187,11 @@ pub fn lower_module<'a>(
         verbatim_syms,
         custom_secs,
         asm_stubs,
-        hot_asm,
+        hot_asm: crate::hot::thunks_wrap(
+            &hot_asm,
+            macho,
+            isa.triple().architecture == target_lexicon::Architecture::X86_64,
+        ),
         dbg_fns,
     }
 }

@@ -223,3 +223,44 @@ permutation is a pure relabeling so semantics are unchanged. Bails
 or any stack allocation whose extent is unknown. Pairs with the
 emit-side `PLIRON_EDITPAIR` peek in `vcode.rs` and the fp-relative
 `pair_amode` fallback in aarch64 `emit.rs` (`PLIRON_PATCH.md` there).
+
+## `PLIRON_RA2_POSTOPT=<bits>` (runtime, default 0): spill-traffic cleanup after allocation
+
+`src/ion/postopt.rs`, called from `ion::run` before the slot-pair
+repack; knobs in `src/lib.rs` (`postopt_bits`, `postopt_stats`). Two
+whole-function dataflows over the finished `Output` (edits + operand
+allocations); operands, slots and registers are never changed, only
+edits deleted or a load turned into a register copy:
+
+- forward "register `r` mirrors slot `s`", intersection over all
+  predecessors, optimistic around loops (8 sweeps, then one pessimistic
+  sweep): bit 1 drops a reload into a register that already mirrors the
+  slot, bit 2 turns a reload into a copy from another register that
+  mirrors it, bit 4 drops a spill store whose slot is already clean;
+- backward slot liveness: bit 8 drops stores to slots no path reads
+  before the next write (can leave `debug_locations` naming a stale
+  slot).
+
+The stock eliminator (`redundant_moves.rs`) forgets its state at block
+boundaries (`PLIRON_RA2_XBLOCK` extends it to single-predecessor
+fallthrough only). After relax's post-allocation spill windows,
+`redundant_saves` and `dead_spill_stores`. `PLIRON_RA2_POSTOPT_STATS=1`
+prints one `ra2post:` line per changed function. Checked with
+`PLIRON_RA_CHECK=1` on the eight held-out programs (identical output);
+static effect at `=15`: stack stores -1..3%, instructions -0.1..0.3%.
+
+## `PLIRON_RA2_SRCVREG=1` (runtime, default off): block-parameter moves carry the argument's vreg
+
+`src/ion/moves.rs` (`block_param_src_vreg`, the block-param move
+insertion), `src/lib.rs` (`srcvreg_on`): the `edit_vregs` entry of a
+block-parameter move names the branch argument's vreg instead of the
+parameter's. After the move both hold the same value; Cranelift only
+uses the entry to decide rematerialization, and the argument is the one
+that can be a constant. A constant passed to a spilled parameter was a
+load of the constant's own spill slot plus a store (through the scratch
+register, both legs keep the label); it becomes `mov #k` + store, and a
+slot read only that way loses its stores (`PLIRON_REMAT_STORE`).
+pulldown's `scalar_iterate_special_bytes` initialised a dozen spilled
+loop states that way on every call. Static, release held-out binaries:
+stack loads -4.3% (pulldown-cmark), -3.5% (regex), -3.6%
+(rust-compression); stores -0.7..-1.3%. Checked with `PLIRON_RA_CHECK=1`.

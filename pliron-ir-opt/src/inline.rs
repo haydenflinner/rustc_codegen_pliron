@@ -1526,6 +1526,19 @@ pub fn run(
                     }
                     let ci = &infos[cs];
                     let Some(ci) = ci.as_ref() else {
+                        if pliron_cfg::remarks_on() {
+                            let g = &st.funcs[cs];
+                            let why = if !has_body(ctx, g.op) {
+                                "external (no body in this CGU)"
+                            } else if g.no_inline {
+                                "noinline"
+                            } else if g.linkage == Linkage::Preemptible {
+                                "preemptible"
+                            } else {
+                                "ineligible (too big, recursive or variadic)"
+                            };
+                            pliron_cfg::remark!("inline", sym, cs; "reject ({why})");
+                        }
                         if verbose {
                             if pliron_cfg::tracing_on() {
                                 tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu)
@@ -1539,6 +1552,7 @@ pub fn run(
                     // semantic requirement and still fires).
                     let site_count = crate::pgo::block_count(st, b);
                     if !f.always_inline && site_count == Some(0) {
+                        pliron_cfg::remark!("inline", sym, cs; "reject (cold callsite: profile count 0)");
                         if verbose {
                             if pliron_cfg::tracing_on() {
                                 tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (cold callsite)",
@@ -1896,6 +1910,10 @@ pub fn run(
                         sites.push((op, ci.op, cs.clone()));
                         "accept"
                     };
+                    if why != "accept" {
+                        pliron_cfg::remark!("inline", sym, cs; "{why} n={} calls={} warm={}/{} cost={cost} t={t} size={size} cap={cap} grown={grown} growth={growth}",
+                            ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops);
+                    }
                     if verbose {
                         if pliron_cfg::tracing_on() {
                             tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",

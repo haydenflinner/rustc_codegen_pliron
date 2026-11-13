@@ -42,7 +42,7 @@ fn inverted_or_rebased_bools_do_not_alias_their_inner_compare() {
     ] {
         let before = parse(src);
         let mut after = before.clone();
-        pliron_clif_opt::clifpeep::iconst128(&mut after, true);
+        pliron_clif_opt::clifpeep::iconst128(&mut after, true, false);
         check(&before, &after, &Facts::default(), &Config { trials: 256, ..Config::default() })
             .unwrap_or_else(|e| panic!("{what}: {e}\n{}", after.display()));
     }

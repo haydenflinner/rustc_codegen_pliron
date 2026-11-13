@@ -51,6 +51,7 @@ const MAX_GATHER: i64 = 2048;
 
 macro_rules! why {
     ($f:expr; $($t:tt)*) => {{
+        pliron_cfg::remark!("loopvec", $f, "loop"; $($t)*);
         if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG) {
             if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::loopvec", "vec bail {}: {}", $f, format_args!($($t)*)) };
         }

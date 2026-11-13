@@ -81,11 +81,60 @@ can pick up a partially written object otherwise. Files matching
 - `PLIRON_HOT_DIR=<dir>` — runtime: directory watched for `*.o` patches
   (plus `base.ref` fingerprints). Unset = hot reload off, thunks cost one
   indirect jump.
+- `PLIRON_HOT_LAYOUT=1` — compile time, for `base.ref` and every patch
+  (`hot-dev.sh` sets it): each object carries a table of the crate's
+  struct/enum/union layouts (`src/hot_layout.rs`). The loader compares a
+  patch's table with `base.ref`'s and refuses the patch, naming the
+  types, when one changed.
+- `PLIRON_HOT_DIRECT=1` — runtime, arm64 macOS: after a patch, each
+  patched function's thunk is rewritten from the slot load to a direct
+  `b <new body>` (see "Direct thunks" below).
+- `PLIRON_HOT_REACH=1` — compile time: every thunk first marks its
+  function entered; `pliron_hot::reach` lists the marked functions and
+  `PLIRON_HOT_REACH_OUT=<file>` writes the list at exit (see "Tests on
+  save").
 - `PLIRON_HOT_DEBUG=1` — print per-phase timings during a patch apply.
+- `PLIRON_HOT_FREE=protect` — like `=1` below, but a retired mapping is
+  made inaccessible instead of unmapped: its addresses cannot be reused,
+  and a thread that was still running the old code stops at once with
+  `[hot] a thread was still running code of a patch that has been
+  retired` instead of executing whatever was mapped there next.
 - `PLIRON_HOT_FREE=1` — `munmap` superseded patch mappings once every
   function they supplied has been repointed again, after a grace window
   of `PLIRON_HOT_GRACE` generations (default 3). Off by default: an
   unmap could race a thread still executing old code.
+
+## Direct thunks (`PLIRON_HOT_DIRECT=1`)
+
+A thunk costs a load and an indirect branch per call. With the knob, the
+loader rewrites the thunk of each function a patch replaced into a direct
+`b` to the new body (the slot is updated as well, for a thread already
+past the first instruction). Apple Silicon has no writable+executable
+pages, so a thunk page is briefly read-write and nothing on it can run:
+thunks therefore sit in their own section (`__TEXT,__hot_thunks`, padded
+to whole 16 KiB pages by the backend) and every other thread is suspended
+for the flip. A body out of `b` range (±128 MiB) keeps the slot load.
+arm64 macOS only; elsewhere the knob does nothing. Measured on the smoke
+test: 3 thunks rewritten, apply 14 ms instead of 0.4 ms (the thread
+suspension), so it is off by default — turn it on when call overhead in
+the patched code matters more than apply time.
+
+## Tests on save (`examples/hot-test.sh`)
+
+```bash
+path/to/examples/hot-test.sh .     # in a crate with #[test]s
+```
+
+Reruns, after each save, only the tests that entered a function whose
+code changed. The crate is built with `PLIRON_HOT` and
+`PLIRON_HOT_REACH=1`; each test runs in its own process and leaves the
+functions it entered; after a save `hotdiff old.o new.o`
+(`examples/pliron-hot/src/bin/hotdiff.rs`) names the functions whose
+fingerprint changed, and a test reruns when its list meets that set, when
+it failed last time, or when it is new. The crate needs `pliron_hot` as a
+dev-dependency and `#[cfg(test)] use pliron_hot as _;`. Edits in
+dependencies are not seen. `tests/hot/reach.sh` is the smoke test (three
+tests, one edit, two rerun).
 
 ## Scaling
 
@@ -113,7 +162,12 @@ RSS. On an 8000-function leaf editing one function:
 - `main` itself is not patchable (the C entry point is excluded).
 - Patches that define or use thread-locals are rejected — restart.
 - Changing a struct/enum layout that live state depends on needs a
-  restart; new code sees old-layout values otherwise.
+  restart. With `PLIRON_HOT_LAYOUT=1` the loader detects it and leaves
+  the old code running (`[hot] ...: not applied: the layout of `State`
+  (8 -> 40 bytes ...) changed ...; restart`); without it new code sees
+  old-layout values. The check covers types defined in the patched
+  crate that take no type or const parameters, and treats a renamed
+  field as a change.
 - New dependencies of the patch that are not already in the process
   (new extern symbols) fail the apply with a "symbols not in the running
   binary" diagnostic.

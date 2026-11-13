@@ -1891,3 +1891,14 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      `!unplaced_other` (blocks reaching `innermost.is_some()`).
      Ties only — explicit edge weights still dominate. Regression:
      `pliron-clif-opt/tests/x64_loopft.rs`.
+
+## `PLIRON_ELABLOOPS=2` (opt-in): pressure-aware egraph hoisting
+
+`src/egraph/elaborate.rs` (`elab_loops_pressure`, `cheap_to_recompute`,
+the hoist-level choice in the `PendingInst` arm): `=1`'s loop-stack fix,
+except that a cheap single-instruction invariant (add/sub/logic/shift/
+extend/compare) is not hoisted out of a loop that contains a call — it
+stops below the innermost enclosing call loop. Hoisted, the value is
+live across the call for the whole loop and takes a callee-saved
+register or a spill slot with a reload per iteration. `call_loops` is
+built under this knob as well as under `PLIRON_REMATCALL`.

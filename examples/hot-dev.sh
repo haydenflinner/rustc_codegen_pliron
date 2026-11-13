@@ -19,6 +19,9 @@ case "$(uname)" in Darwin) DYLIB=dylib;; *) DYLIB=so;; esac
 NAME=$(cargo metadata --no-deps --format-version 1 -q \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["targets"][0]["name"])')
 export RUSTFLAGS="-Zcodegen-backend=$B/target/debug/librustc_codegen_pliron.$DYLIB -Ccodegen-units=1"
+# Type-layout table in base.ref and every patch: the loader refuses a
+# patch that changes a struct/enum the live process holds values of.
+export PLIRON_HOT_LAYOUT=1
 W=target/hot; mkdir -p "$W/patches"
 CR=(cargo rustc -q --bin "$NAME" --)
 echo "[hot-dev] building $NAME with PLIRON_HOT"

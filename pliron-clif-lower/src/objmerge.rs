@@ -93,7 +93,7 @@ where
                 | SectionKind::Elf(_)
         ) || coff_named
             || (out.format() == BinaryFormat::MachO
-                && matches!(&*name, b"__mod_init_func" | b"__hot_slots")))
+                && matches!(&*name, b"__mod_init_func" | b"__hot_slots" | b"__hot_layout" | b"__hot_marks" | b"__hot_thunks")))
             && (s.size() > 0 || coff_named);
         if !keep {
             continue;

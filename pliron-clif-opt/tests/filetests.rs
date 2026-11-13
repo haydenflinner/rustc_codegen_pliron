@@ -119,7 +119,7 @@ fn pass(name: &str) -> Pass {
         },
         "fusechains" => clifpeep::fusechains,
         "lcse" => clifpeep::lcse,
-        "iconst128" => |f| clifpeep::iconst128(f, true),
+        "iconst128" => |f| clifpeep::iconst128(f, true, false),
         "unroll" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             let prof = std::collections::HashMap::default();
