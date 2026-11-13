@@ -470,3 +470,11 @@ isolate. Eight programs, instructions against the old default:
 | uncapped | 1.002 | 0.995 | 1.014 (rust-protobuf) |
 
 Default 16 (`0` off, `1` uncapped). Gate passed.
+
+**Opt-in pile exhausted (instruction counts, new defaults).** All 28
+`Gate::OptIn` CLIF passes, each alone, eight programs: every geomean
+within 0.9971..1.0048 (best `REBASE` 0.9971, which a 7-round rerun put
+at 0.9999); the best four and six stacked: 0.9997, 0.9992. None is a
+default candidate on this set. Also tried and reverted: isolating
+larger loops (64/200/1000 instructions) for values used on the loop's
+hot path — instructions 1.001..1.005.
