@@ -449,3 +449,24 @@ regex gain. Gate: passed on 1dc9a17.
 (user's call, 2026-11-13; `0` turns it off; under a profile the bundle's
 `hot` still applies). `slotpromlt`'s RA2_XBLOCK size comparison pins it
 off like the other passes that delete what it measures. Gate passed.
+
+## `PLIRON_RA2_LOOPSPLIT` capped and on by default
+
+pulldown-cmark's hottest loop (`scalar_iterate_special_bytes`' byte
+scan, ~5% of the program's samples) was eight instructions, three of
+them the allocator's: the loop bound reloaded from its spill slot every
+iteration and the lookup-table pointer shuffled between two registers.
+`PLIRON_RA2_LOOPSPLIT=1` (an earlier opt-in: isolate the cycle around a
+bundle's hottest use, keep the piece's register across it) fixes that
+loop but holds registers across large loops for values barely used in
+them. The knob now takes the largest cycle, in instructions, it will
+isolate. Eight programs, instructions against the old default:
+
+| cap | geomean | pulldown-cmark | worst |
+|---|---|---|---|
+| 16 | 0.998 | 0.981 | 1.003 (rust-protobuf) |
+| 40 | 1.000 | 0.981 | 1.010 (rust-compression) |
+| 100 | 1.001 | 0.996 | 1.007 |
+| uncapped | 1.002 | 0.995 | 1.014 (rust-protobuf) |
+
+Default 16 (`0` off, `1` uncapped). Gate passed.

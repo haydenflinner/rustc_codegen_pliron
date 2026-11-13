@@ -1474,6 +1474,10 @@ impl<'a, F: Function> Env<'a, F> {
                             }
                         }
                     }
+                    let cycle_insts = |(h, u): (u32, u32)| {
+                        cfg.block_exit[u as usize].inst().index().saturating_sub(cfg.block_entry[h as usize].inst().index())
+                    };
+                    let best = best.filter(|&e| cycle_insts(e) <= crate::loopsplit_max());
                     if let Some((h, u)) = best {
                         let region_start = cfg.block_entry[h as usize];
                         if bundle_start < region_start && region_start < bundle_end {

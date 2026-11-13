@@ -67,16 +67,33 @@ pub(crate) fn freqsplit_on() -> bool {
     false
 }
 
-/// PLIRON: `PLIRON_RA2_LOOPSPLIT=1` (opt-in): split a bundle at the
-/// boundaries of the loop around its conflict (see `process_bundle`).
+/// PLIRON: `PLIRON_RA2_LOOPSPLIT` (default 16): split a bundle at the
+/// boundaries of the small loop around its hottest use (see
+/// `process_bundle`).
 pub(crate) fn loopsplit_on() -> bool {
+    loopsplit_max() > 0
+}
+
+/// PLIRON: `PLIRON_RA2_LOOPSPLIT=<n>`: 0 off, 1 any cycle, larger
+/// values the biggest cycle (in instructions) a bundle is isolated to. A
+/// piece that keeps its register across a 300-instruction loop for one
+/// cold use starves the values that loop really runs on; across an
+/// 8-instruction scan loop it is the whole point.
+pub(crate) fn loopsplit_max() -> usize {
     #[cfg(feature = "std")]
     {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_LOOPSPLIT").as_deref() == Ok("1"))
+        static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("PLIRON_RA2_LOOPSPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(1) => usize::MAX,
+            Some(n) => n,
+            // Default 16 (2026-11-13): pulldown-cmark -1.9% instructions,
+            // the other seven held-out programs within 0.3%; 40 and
+            // above cost rust-protobuf and rust-compression up to 1%.
+            None => 16,
+        })
     }
     #[cfg(not(feature = "std"))]
-    false
+    0
 }
 
 /// PLIRON: `PLIRON_RA2_NOPINMERGE` (default on, `=0` off): refuse
