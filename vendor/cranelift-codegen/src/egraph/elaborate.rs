@@ -34,6 +34,18 @@ pub(crate) fn elab_loops_on() -> bool {
     })
 }
 
+/// PLIRON: `PLIRON_ELABHOT=1` (opt-in) — a narrow part of
+/// `PLIRON_ELABLOOPS=1`: a block that lost its own loop's stack entry
+/// to the pop-on-leave rule gets it back when the loop contains no
+/// call and the block runs on every completed iteration (it dominates
+/// each latch). See `Elaborator::start_block`. Opt-in: with no trip
+/// count to go by it hoists out of loops that make a trip or less
+/// (pulldown-cmark +0.5% executed instructions, exact count).
+pub(crate) fn elab_hot_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABHOT").as_deref() == Ok("1"))
+}
+
 /// PLIRON: `PLIRON_ELABLOOPS=2` (opt-in) — `=1`, pressure-aware: a cheap
 /// invariant is not hoisted out of a loop that contains a call. Hoisted,
 /// it is live across the whole loop, so across the call: it takes a
@@ -129,6 +141,9 @@ pub(crate) struct Elaborator<'a> {
     /// the hoisted value it replaces lives across that call in a
     /// callee-saved register or a spill slot.
     call_loops: FxHashSet<Loop>,
+    /// PLIRON (`PLIRON_ELABHOT`): each loop's latches (in-loop
+    /// predecessors of its header).
+    loop_latches: FxHashMap<Loop, SmallVec<[Block; 2]>>,
     /// Stats for various events during egraph processing, to help
     /// with optimization of this infrastructure.
     stats: &'a mut Stats,
@@ -241,10 +256,35 @@ impl<'a> Elaborator<'a> {
                 }
             }
         }
+        let mut loop_latches: FxHashMap<Loop, SmallVec<[Block; 2]>> = FxHashMap::default();
+        if elab_hot_on() && loop_analysis.loops().next().is_some() {
+            for block in func.layout.blocks() {
+                if loop_analysis.innermost_loop(block).is_none() {
+                    continue;
+                }
+                let Some(t) = func.layout.last_inst(block) else {
+                    continue;
+                };
+                for bc in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    let dest = bc.block(&func.dfg.value_lists);
+                    if let Some(lp) = loop_analysis.is_loop_header(dest)
+                        && loop_analysis.is_in_loop(block, lp)
+                    {
+                        let l = loop_latches.entry(lp).or_default();
+                        if !l.contains(&block) {
+                            l.push(block);
+                        }
+                    }
+                }
+            }
+        }
         Self {
             func,
             domtree,
             loop_analysis,
+            loop_latches,
             value_to_elaborated_value: ScopedHashMap::with_capacity(num_values),
             value_to_best_value,
             loop_stack: smallvec![],
@@ -325,7 +365,7 @@ impl<'a> Elaborator<'a> {
         // and loop depths will not match.
         if let Some(idom) = idom {
             if let Some(lp) = self.loop_analysis.is_loop_header(block) {
-                self.loop_stack.push(LoopStackEntry {
+                let e = LoopStackEntry {
                     lp,
                     // Any code hoisted out of this loop will have code
                     // placed in `idom`, and will have def mappings
@@ -333,11 +373,37 @@ impl<'a> Elaborator<'a> {
                     // level.
                     hoist_block: idom,
                     scope_depth: (self.value_to_elaborated_value.depth() - 1) as u32,
-                });
+                };
+                if elab_hot_on() {
+                    self.loop_entries.insert(lp, e.clone());
+                }
+                self.loop_stack.push(e);
                 trace!(
                     " -> loop header, pushing; depth now {}",
                     self.loop_stack.len()
                 );
+            } else if elab_hot_on()
+                && let Some(lp) = self.loop_analysis.innermost_loop(block)
+                && self.loop_stack.last().is_none_or(|e| e.lp != lp)
+                && !self.call_loops.contains(&lp)
+                && let Some(e) = self.loop_entries.get(&lp)
+                && self.loop_latches.get(&lp).is_some_and(|ls| {
+                    ls.iter().all(|&l| self.domtree.block_dominates(block, l))
+                })
+            {
+                // PLIRON_ELABHOT: the domtree preorder visited one of the
+                // loop's exit blocks before `block` and popped the loop
+                // (see the `PLIRON_ELABLOOPS=1` note above). `block` runs
+                // on every completed iteration of a call-free loop, so an
+                // invariant placed here costs an instruction per trip and
+                // a register either way: hoist as if the entry were still
+                // there. Blocks on conditional paths keep the popped
+                // stack — their invariants stay next to their use
+                // (`ELABLOOPS=1` hoists those too: pulldown-cmark +2.4%
+                // executed instructions). The header dominates `block`,
+                // so the hoist block's scope is still open.
+                self.loop_stack.push(e.clone());
+                trace!(" -> restored popped loop entry; depth now {}", self.loop_stack.len());
             }
         } else {
             debug_assert!(

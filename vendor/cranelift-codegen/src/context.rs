@@ -766,6 +766,7 @@ impl Context {
             let mut h_uses: Vec<Inst> = Vec::new();
             let mut seen_bump = false;
             let mut raw_set: FxHashSet<Value> = FxHashSet::default();
+            let mut far_dups: Vec<Inst> = Vec::new();
             for i in self.func.layout.block_insts(h) {
                 if i == binst {
                     seen_bump = true;
@@ -787,6 +788,34 @@ impl Context {
                     continue;
                 }
                 for i in self.func.layout.block_insts(bb) {
+                    // PLIRON: the same bump again in a dominated block
+                    // (the elaborator gives each using successor its
+                    // own `iadd p,k`) is the kept result, not a use of
+                    // `p` to remat as `(q - k) + k`.
+                    if let InstructionData::Binary { opcode, args } = self.func.dfg.insts[i]
+                        && opcode == (if is_sub { Opcode::Isub } else { Opcode::Iadd })
+                    {
+                        let side = (0..2usize).find(|&s| {
+                            (s == 0 || !is_sub) && self.func.dfg.resolve_aliases(args[s]) == p
+                        });
+                        let same = side.is_some_and(|s| {
+                            self.func
+                                .dfg
+                                .value_def(self.func.dfg.resolve_aliases(args[1 - s]))
+                                .inst()
+                                .is_some_and(|ci| {
+                                    matches!(
+                                        self.func.dfg.insts[ci],
+                                        InstructionData::UnaryImm { opcode: Opcode::Iconst, imm }
+                                            if imm.bits() == k
+                                    )
+                                })
+                        });
+                        if same {
+                            far_dups.push(i);
+                            continue;
+                        }
+                    }
                     for v in self.func.dfg.inst_values(i) {
                         if self.func.dfg.resolve_aliases(v) == p {
                             per_block.entry(bb).or_default().push(i);
@@ -795,6 +824,14 @@ impl Context {
                         }
                     }
                 }
+            }
+            for d in far_dups {
+                let dres = self.func.dfg.first_result(d);
+                self.func.layout.remove_inst(d);
+                self.func.dfg.detach_inst_results(d);
+                self.func.dfg.change_to_alias(dres, qres);
+                moved += 1;
+                aliased = true;
             }
             if per_block.is_empty() && h_uses.is_empty() {
                 continue;

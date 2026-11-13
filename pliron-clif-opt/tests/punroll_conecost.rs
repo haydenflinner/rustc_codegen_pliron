@@ -2,6 +2,11 @@
 //! the shared cone clone each retained exit emits. Two data exits each
 //! cloning ~30 insts behind a 7-inst body add more code than the eight
 //! unrolled copies do — the unroll is refused.
+//!
+//! These are search loops, which `punroll` leaves rolled by default
+//! now (`punroll::warm_exit`); the cone pricing still applies under
+//! `PLIRON_PUNROLL_SEARCH=1` and under a profile, so this binary sets
+//! the knob.
 
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::settings;
@@ -53,6 +58,11 @@ block99:
 }
 
 fn run(f: &mut Function) -> usize {
+    // SAFETY: both tests set the same value before anything reads it
+    // (the knob is read once per process).
+    unsafe {
+        std::env::set_var("PLIRON_PUNROLL_SEARCH", "1");
+    }
     let mut an = Analysis::default();
     pliron_clif_opt::punroll::run(f, &mut an, "conecost", &Default::default())
 }

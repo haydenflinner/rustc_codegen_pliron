@@ -15,12 +15,28 @@
 //! Only rewrites when each side comes down to at most one value plus a
 //! constant, and reuses an `iadd x, k` that already dominates the test
 //! (the counter's own step) before creating one.
+//!
+//! Two extensions, both from `scan_closing_code_fence`'s second scan
+//! (`tests/parity/closing.rs`), whose slice starts at `bytes + found`:
+//!
+//! - A parameter of a block with one incoming edge is that edge's
+//!   argument (loop rotation passes the guard's values to the loop that
+//!   way), so sums are read through it.
+//! - Inside a loop, `(a + x) + k == c` with `a`, `c` defined outside the
+//!   loop and `x` inside becomes `x + k == c - a`, the difference
+//!   computed once in the block that enters the loop
+//!   (`PLIRON_CMPCANCEL_INV=0` off). There the test was
+//!   `(bytes + found) + idx + 1 != bytes + len`: after cancelling `bytes`
+//!   the pointer stayed live for the compare, so the load could not use
+//!   `[base, idx]` and the loop ran eight instructions a trip; with
+//!   `len - found` outside it runs LLVM's six.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value};
+use cranelift_codegen::ir::{Block, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef};
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use rustc_hash::FxHashMap;
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
@@ -30,21 +46,47 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
     }
 }
 
+/// The value a parameter of a single-edge block is bound to.
+fn sole_arg(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Option<Value> {
+    let ValueDef::Param(b, ix) = func.dfg.value_def(v) else {
+        return None;
+    };
+    let mut preds = cfg.pred_iter(b);
+    let p = preds.next()?;
+    if preds.next().is_some() {
+        return None;
+    }
+    let pool = &func.dfg.value_lists;
+    let mut edges = func.dfg.insts[p.inst]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .iter()
+        .filter(|bc| bc.block(pool) == b);
+    let bc = edges.next()?;
+    if edges.next().is_some() {
+        return None;
+    }
+    bc.args(pool).nth(ix)?.as_value()
+}
+
 /// `v` as a sum: its non-constant leaves and the constant part.
-fn flatten(func: &Function, v: Value, depth: u32, terms: &mut Vec<Value>, k: &mut i64) {
+fn flatten(func: &Function, cfg: &ControlFlowGraph, v: Value, depth: u32, terms: &mut Vec<Value>, k: &mut i64) {
     let v = func.dfg.resolve_aliases(v);
     if let Some(c) = iconst(func, v) {
         *k = k.wrapping_add(c);
         return;
     }
-    if depth > 0
-        && terms.len() < 6
-        && let Some(i) = func.dfg.value_def(v).inst()
-        && let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i]
-    {
-        flatten(func, args[0], depth - 1, terms, k);
-        flatten(func, args[1], depth - 1, terms, k);
-        return;
+    if depth > 0 && terms.len() < 6 {
+        if let Some(i) = func.dfg.value_def(v).inst()
+            && let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i]
+        {
+            flatten(func, cfg, args[0], depth - 1, terms, k);
+            flatten(func, cfg, args[1], depth - 1, terms, k);
+            return;
+        }
+        if let Some(a) = sole_arg(func, cfg, v) {
+            flatten(func, cfg, a, depth - 1, terms, k);
+            return;
+        }
     }
     terms.push(v);
 }
@@ -81,6 +123,8 @@ pub fn run(func: &mut Function) -> usize {
             }
         }
     }
+    let inv_on = pliron_cfg::pass_enabled("PLIRON_CMPCANCEL_INV");
+    let mut la: Option<LoopAnalysis> = None;
     let mut n = 0;
     for (b, t) in tests {
         let InstructionData::IntCompare { args, .. } = func.dfg.insts[t] else { continue };
@@ -89,8 +133,8 @@ pub fn run(func: &mut Function) -> usize {
             continue;
         }
         let (mut lt, mut rt, mut lk, mut rk) = (Vec::new(), Vec::new(), 0i64, 0i64);
-        flatten(func, args[0], 3, &mut lt, &mut lk);
-        flatten(func, args[1], 3, &mut rt, &mut rk);
+        flatten(func, &cfg, args[0], 5, &mut lt, &mut lk);
+        flatten(func, &cfg, args[1], 5, &mut rt, &mut rk);
         let mut cancelled = false;
         lt.retain(|x| match rt.iter().position(|y| y == x) {
             Some(j) => {
@@ -100,7 +144,76 @@ pub fn run(func: &mut Function) -> usize {
             }
             None => true,
         });
-        if !cancelled || lt.len() > 1 || rt.len() > 1 || (lt.is_empty() && rt.is_empty()) {
+        if !cancelled || (lt.is_empty() && rt.is_empty()) {
+            continue;
+        }
+        if lt.len() + rt.len() == 3 && inv_on {
+            // One loop-variant value and two invariants: the invariants
+            // meet on the right, outside the loop.
+            let la = la.get_or_insert_with(|| {
+                let mut la = LoopAnalysis::new();
+                la.compute(func, &cfg, &domtree);
+                la
+            });
+            let Some(lp) = la.innermost_loop(b) else { continue };
+            let inside = |v: Value| match func.dfg.value_def(v) {
+                ValueDef::Result(i, _) => func.layout.inst_block(i).is_none_or(|db| la.is_in_loop(db, lp)),
+                ValueDef::Param(pb, _) => la.is_in_loop(pb, lp),
+                _ => true,
+            };
+            // (term, on the left side)
+            let all: Vec<(Value, bool)> =
+                lt.iter().map(|&v| (v, true)).chain(rt.iter().map(|&v| (v, false))).collect();
+            let var: Vec<&(Value, bool)> = all.iter().filter(|(v, _)| inside(*v)).collect();
+            let [&(x, x_left)] = var[..] else { continue };
+            let inv: Vec<(Value, bool)> = all.iter().copied().filter(|&(v, _)| v != x).collect();
+            let [(i0, l0), (i1, l1)] = inv[..] else { continue };
+            // `x + k == pos - neg` (or `pos + neg2`): an invariant on
+            // `x`'s side changes sign.
+            // The block that enters the loop: both invariants dominate
+            // the header from outside the loop, so they are defined by
+            // the end of its immediate dominator.
+            let Some(ht) = domtree.idom(la.loop_header(lp)).and_then(|hb| func.layout.last_inst(hb)) else {
+                continue;
+            };
+            if !pliron_cfg::bisect("cmpcancel") {
+                continue;
+            }
+            let k = if x_left { mask(ty, lk.wrapping_sub(rk)) } else { mask(ty, rk.wrapping_sub(lk)) };
+            let mut hpos = FuncCursor::new(func).at_inst(ht);
+            let other = match (l0 == x_left, l1 == x_left) {
+                (false, false) => hpos.ins().iadd(i0, i1),
+                (true, false) => hpos.ins().isub(i1, i0),
+                (false, true) => hpos.ins().isub(i0, i1),
+                (true, true) => continue,
+            };
+            let step = steps.get(&(x, k)).and_then(|l| {
+                l.iter().find_map(|&(db, di, v)| {
+                    let ok = if db == b {
+                        func.layout.block_insts(b).take_while(|&i| i != t).any(|i| i == di)
+                    } else {
+                        domtree.block_dominates(db, b)
+                    };
+                    ok.then_some(v)
+                })
+            });
+            let nl = match step {
+                Some(v) => v,
+                None if k == 0 => x,
+                None => {
+                    let mut pos = FuncCursor::new(func).at_inst(t);
+                    let c = pos.ins().iconst(ty, k);
+                    pos.ins().iadd(x, c)
+                }
+            };
+            if let InstructionData::IntCompare { args, .. } = &mut func.dfg.insts[t] {
+                args[0] = nl;
+                args[1] = other;
+            }
+            n += 1;
+            continue;
+        }
+        if lt.len() > 1 || rt.len() > 1 {
             continue;
         }
         // `L + lk == R + rk`: the constant goes to one side.

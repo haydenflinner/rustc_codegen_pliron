@@ -84,13 +84,18 @@ pub fn mem_finalize(
                     AMode::UnsignedOffset { rn: tmp.to_reg(), uimm12: UImm12Scaled::zero(access_ty) },
                 )
             } else {
+                // PLIRON: `[base, tmp]` (the LSL form, no shift) instead
+                // of `[base, tmp, sxtx]`. With a 64-bit index the two
+                // address the same byte, the base may be SP in both, and
+                // valgrind decodes only this one for `ldr q` (regex's
+                // `ExecBuilder::build` has a 14KB frame: `ldr q0, [sp,
+                // x16, sxtx]` stopped callgrind with SIGILL).
                 let tmp = writable_spilltmp_reg();
                 (
                     Inst::load_constant(tmp, off as u64),
-                    AMode::RegExtended {
+                    AMode::RegReg {
                         rn: basereg,
                         rm: tmp.to_reg(),
-                        extendop: ExtendOp::SXTX,
                     },
                 )
             }
@@ -3618,6 +3623,8 @@ impl MachInstEmit for Inst {
                         let r = rn;
                         (r, Some((rm, extendop)), 0)
                     }
+                    // PLIRON: `mem_finalize`'s large-offset form (patch 132).
+                    AMode::RegReg { rn, rm } => (rn, Some((rm, ExtendOp::UXTX)), 0),
                     AMode::Unscaled { rn, simm9 } => {
                         let r = rn;
                         (r, None, simm9.value())

@@ -20,14 +20,20 @@
 //! so sinking would only add a block. `br_table` edges live in the
 //! jump-table pool and `try_call` edges carry pseudo-value args —
 //! neither is touched.
+//!
+//! Loop-exit sinking (`exit_sink`, `PLIRON_EXITSINK`, default on) is
+//! the same idea for a value several exits read: a pure in-loop inst
+//! whose every use is outside its loop (or an arg on an edge leaving
+//! it) is cloned to those uses and leaves the loop. See `exit_sink`.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::types::I64;
 use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstBuilder, InstructionData, Opcode, Value, ValueDef,
 };
-use cranelift_codegen::loop_analysis::LoopAnalysis;
+use cranelift_codegen::loop_analysis::{Loop, LoopAnalysis};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::jumpthread::pure_op;
@@ -230,11 +236,7 @@ fn apply(func: &mut Function, b: Block, edge: usize, set: &[Inst]) -> bool {
 /// every use sits in a strictly-dominated block at the same loop
 /// depth (never sink into a deeper loop — that trades the def's one
 /// execution for per-iteration work).
-fn push_to_use_blocks(func: &mut Function) -> usize {
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let mut la = LoopAnalysis::new();
-    la.compute(func, &cfg, &dt);
+fn push_to_use_blocks(func: &mut Function, dt: &DominatorTree, la: &LoopAnalysis) -> usize {
     // value -> use blocks; `inst_values` covers terminator edge args,
     // attributing them to the pred block (a `b`-edge arg makes `b` a
     // use block, which the `ub.contains(&b)` test then rejects).
@@ -393,7 +395,467 @@ pub fn run(func: &mut Function) -> usize {
             }
         }
     }
-    changed + push_to_use_blocks(func)
+    let (cfg, dt, la) = analyses(func);
+    let sunk = exit_sink(func, &cfg, &dt, &la);
+    // Exit sinking splits edges: the push phase needs the new blocks.
+    let (dt, la) = if sunk > 0 {
+        let (_, dt, la) = analyses(func);
+        (dt, la)
+    } else {
+        (dt, la)
+    };
+    changed + sunk + push_to_use_blocks(func, &dt, &la)
+}
+
+fn analyses(func: &Function) -> (ControlFlowGraph, DominatorTree, LoopAnalysis) {
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let mut la = LoopAnalysis::new();
+    la.compute(func, &cfg, &dt);
+    (cfg, dt, la)
+}
+
+fn exit_sink_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::pass_enabled("PLIRON_EXITSINK"));
+    *ON
+}
+
+/// A loop-header param's step: every back edge passes `q = w + k`.
+#[derive(Clone, Copy)]
+struct Bump {
+    q: Value,
+    k: i64,
+    /// Block defining `q`.
+    qb: Block,
+}
+
+fn iconst_of(func: &Function, v: Value) -> Option<i64> {
+    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `w` is an `i64` param of `lp`'s header that every back edge steps
+/// by one constant.
+fn iv_bump(func: &Function, cfg: &ControlFlowGraph, la: &LoopAnalysis, lp: Loop, w: Value) -> Option<Bump> {
+    let ValueDef::Param(h, j) = func.dfg.value_def(w) else {
+        return None;
+    };
+    if h != la.loop_header(lp) || func.dfg.value_type(w) != I64 {
+        return None;
+    }
+    let pool = &func.dfg.value_lists;
+    let mut q: Option<Value> = None;
+    for p in cfg.pred_iter(h) {
+        if !la.is_in_loop(p.block, lp) {
+            continue;
+        }
+        for c in func.dfg.insts[p.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            if c.block(pool) != h {
+                continue;
+            }
+            let a = func.dfg.resolve_aliases(c.args(pool).nth(j)?.as_value()?);
+            match q {
+                None => q = Some(a),
+                Some(x) if x == a => {}
+                _ => return None,
+            }
+        }
+    }
+    let q = q?;
+    let ValueDef::Result(qi, _) = func.dfg.value_def(q) else {
+        return None;
+    };
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[qi] else {
+        return None;
+    };
+    let (a0, a1) = (func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1]));
+    let k = match opcode {
+        Opcode::Iadd if a0 == w => iconst_of(func, a1)?,
+        Opcode::Iadd if a1 == w => iconst_of(func, a0)?,
+        Opcode::Isub if a0 == w => iconst_of(func, a1)?.checked_neg()?,
+        _ => return None,
+    };
+    Some(Bump { q, k, qb: func.layout.inst_block(qi)? })
+}
+
+/// Loop-exit sinking.
+///
+/// Shape: a pure inst in a loop block whose result no in-loop code
+/// reads — every use is an inst outside the loop, an arg on a `brif`
+/// edge leaving the loop, or an operand of another such inst:
+///
+/// ```text
+/// h(p):  n = isub p, base        ; the count, wanted only after the loop
+///        q = iadd p, 1
+///        c = load p
+///        brif c == x, latch, exit(n)
+/// latch: brif q != end, h(q), exit2      ; exit2: n + 1
+/// ```
+///
+/// Evidence: the slice iterator under `position`/`take_while(..).count()`
+/// (pulldown-cmark's scanners, `tests/parity/closing.rs` with
+/// `PLIRON_WM_KEEPCOUNT=0`). Where `webmerge` retires the counter that
+/// steps in lockstep with the pointer, the count is `p - base`,
+/// computed every trip for the two exits: nine instructions a trip.
+/// Sunk, the loop is the load (post-indexed on aarch64), two compares
+/// and two branches. pulldown-cmark, exact: 53.38M -> 53.33M.
+///
+/// Rule: the inst is cloned to the head of each using block (an exit
+/// edge out of an in-loop `brif` is split to hold it) and removed from
+/// the loop, when
+/// - every use site runs at most once per exit of the loop (outside it,
+///   and not inside another loop that excludes the def), and
+/// - every operand is loop-invariant, sinks too, is an `iconst`, or is
+///   a header param stepped by a constant on every back edge (`q = p +
+///   k`). Where `q`'s def dominates the site the clone reads `q - k`
+///   instead of `p`, so `p` still dies at its step and the header param
+///   keeps one register (otherwise the back edge pays a `mov`); an
+///   `iadd`/`isub` clone is built as `op(q, x) -/+ k` and a using
+///   `iadd _, k2` absorbs the constant (`(p - base) + 1` on the
+///   exhausted exit is `q - base`).
+///
+/// Any other loop-variant operand would stay live to the exit just for
+/// the clone, so such insts stay put.
+fn exit_sink(func: &mut Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &LoopAnalysis) -> usize {
+    if !exit_sink_on() || la.loops().next().is_none() {
+        return 0;
+    }
+    struct Cand {
+        inst: Inst,
+        block: Block,
+        lp: Loop,
+    }
+    // Candidates in reverse postorder: a def comes before its users.
+    let mut cands: FxHashMap<Value, Cand> = FxHashMap::default();
+    let mut order: Vec<Value> = Vec::new();
+    for &b in dt.cfg_postorder().iter().rev() {
+        let Some(lp) = la.innermost_loop(b) else {
+            continue;
+        };
+        for i in func.layout.block_insts(b) {
+            if !pure_op(func, i) {
+                continue;
+            }
+            let v = func.dfg.first_result(i);
+            if func.dfg.resolve_aliases(v) != v {
+                continue;
+            }
+            cands.insert(v, Cand { inst: i, block: b, lp });
+            order.push(v);
+        }
+    }
+    if cands.is_empty() {
+        return 0;
+    }
+    let mut sites: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                if cands.contains_key(&v) {
+                    let l = sites.entry(v).or_default();
+                    if l.last() != Some(&i) {
+                        l.push(i);
+                    }
+                }
+            }
+        }
+    }
+    let mut bumps: FxHashMap<Value, Option<Bump>> = FxHashMap::default();
+    // `v` is read at an exit edge of in-loop `brif` `s` only.
+    let exit_edges = |func: &Function, s: Inst, v: Value, lp: Loop| -> Option<Vec<usize>> {
+        let InstructionData::Brif { arg, blocks, .. } = &func.dfg.insts[s] else {
+            return None;
+        };
+        if func.dfg.resolve_aliases(*arg) == v {
+            return None;
+        }
+        let pool = &func.dfg.value_lists;
+        let mut out = Vec::new();
+        for (e, bc) in blocks.iter().enumerate() {
+            let mut has = false;
+            for a in bc.args(pool) {
+                has |= func.dfg.resolve_aliases(a.as_value()?) == v;
+            }
+            if has {
+                if la.is_in_loop(bc.block(pool), lp) {
+                    return None;
+                }
+                out.push(e);
+            }
+        }
+        Some(out)
+    };
+    // Shrink the candidate set to its largest self-consistent subset.
+    let mut alive: FxHashSet<Value> = order.iter().copied().collect();
+    let mut stable = false;
+    for _ in 0..8 {
+        let mut dropped = false;
+        for &v in &order {
+            if !alive.contains(&v) {
+                continue;
+            }
+            let c = &cands[&v];
+            let ok = (|| {
+                let us = sites.get(&v)?;
+                if us.is_empty() || us.len() > MAX_PUSH_BLOCKS {
+                    return None;
+                }
+                for &s in us {
+                    let u = func.layout.inst_block(s)?;
+                    if la.is_in_loop(u, c.lp) {
+                        let member = func
+                            .dfg
+                            .inst_results(s)
+                            .first()
+                            .is_some_and(|r| alive.contains(r) && cands[r].inst == s && cands[r].lp == c.lp);
+                        if !member {
+                            exit_edges(func, s, v, c.lp)?;
+                        }
+                    } else if let Some(lu) = la.innermost_loop(u)
+                        && !la.is_in_loop(c.block, lu)
+                    {
+                        return None;
+                    }
+                }
+                for &a in func.dfg.inst_args(c.inst) {
+                    let w = func.dfg.resolve_aliases(a);
+                    match func.dfg.value_def(w) {
+                        ValueDef::Param(pb, _) => {
+                            if la.is_in_loop(pb, c.lp) {
+                                // A parameter of this loop's own header
+                                // (the memo is per parameter, so only ever
+                                // for the loop that parameter heads).
+                                if pb != la.loop_header(c.lp) {
+                                    return None;
+                                }
+                                bumps
+                                    .entry(w)
+                                    .or_insert_with(|| iv_bump(func, cfg, la, c.lp, w))
+                                    .as_ref()?;
+                            }
+                        }
+                        ValueDef::Result(di, _) => {
+                            let db = func.layout.inst_block(di)?;
+                            if la.is_in_loop(db, c.lp)
+                                && !(alive.contains(&w) && cands[&w].lp == c.lp)
+                                && func.dfg.insts[di].opcode() != Opcode::Iconst
+                            {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(())
+            })()
+            .is_some();
+            if !ok {
+                alive.remove(&v);
+                dropped = true;
+            }
+        }
+        if !dropped {
+            stable = true;
+            break;
+        }
+    }
+    if !stable || alive.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    // Edge blocks made here, with the in-loop block they hang off.
+    let mut mid_pred: FxHashMap<Block, Block> = FxHashMap::default();
+    // Users before defs: an operand's clone lands above its user's.
+    for &v in order.iter().rev() {
+        if !alive.contains(&v) {
+            continue;
+        }
+        let c = &cands[&v];
+        let (d, lp) = (c.inst, c.lp);
+        let users = sites.get(&v).cloned().unwrap_or_default();
+        // A user that stayed in the loop (bisect) keeps `v` there.
+        let movable = users.iter().all(|&s| {
+            func.layout
+                .inst_block(s)
+                .is_some_and(|u| !la.is_in_loop(u, lp) || exit_edges(func, s, v, lp).is_some())
+        });
+        if users.is_empty() || !movable || !pliron_cfg::bisect("exitsink") {
+            continue;
+        }
+        // Split the exit edges that carry `v`.
+        let mut finals: Vec<Inst> = Vec::new();
+        for &s in &users {
+            let u = func.layout.inst_block(s).unwrap();
+            if !la.is_in_loop(u, lp) {
+                finals.push(s);
+                continue;
+            }
+            for e in exit_edges(func, s, v, lp).unwrap() {
+                let (dest, args) = {
+                    let InstructionData::Brif { blocks, .. } = &func.dfg.insts[s] else {
+                        unreachable!()
+                    };
+                    let pool = &func.dfg.value_lists;
+                    let args: Vec<Value> = blocks[e].args(pool).map(|a| a.as_value().unwrap()).collect();
+                    (blocks[e].block(pool), args)
+                };
+                let mid = func.dfg.make_block();
+                func.layout.insert_block_after(mid, u);
+                let barg: Vec<BlockArg> = args.iter().map(|&a| BlockArg::Value(a)).collect();
+                let j = FuncCursor::new(func).at_bottom(mid).ins().jump(dest, &barg);
+                let dfg = &mut func.dfg;
+                dfg.insts[s].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[e] =
+                    BlockCall::new(mid, [], &mut dfg.value_lists);
+                mid_pred.insert(mid, u);
+                for &a in &args {
+                    let r = func.dfg.resolve_aliases(a);
+                    let still = func.dfg.inst_values(s).any(|x| func.dfg.resolve_aliases(x) == r);
+                    if let Some(l) = sites.get_mut(&r) {
+                        if !still {
+                            l.retain(|&x| x != s);
+                        }
+                        if !l.contains(&j) {
+                            l.push(j);
+                        }
+                    }
+                }
+                finals.push(j);
+            }
+        }
+        let mut by_block: Vec<(Block, Vec<Inst>)> = Vec::new();
+        for s in finals {
+            let x = func.layout.inst_block(s).unwrap();
+            match by_block.iter_mut().find(|(b, _)| *b == x) {
+                Some((_, l)) => {
+                    if !l.contains(&s) {
+                        l.push(s)
+                    }
+                }
+                None => by_block.push((x, vec![s])),
+            }
+        }
+        let data = func.dfg.insts[d];
+        let ty = func.dfg.ctrl_typevar(d);
+        let args: Vec<Value> = func.dfg.inst_args(d).to_vec();
+        for (x, us) in by_block {
+            // Header params whose step dominates this site.
+            let mut subs: Vec<(usize, Bump)> = Vec::new();
+            for (ix, &a) in args.iter().enumerate() {
+                let w = func.dfg.resolve_aliases(a);
+                // Only a parameter of the loop `d` leaves: one of an
+                // enclosing loop's header is invariant here, and its
+                // step may be `d` itself (fuzz seed 74256: `d = 0 + w`
+                // in an inner loop, passed back to the outer header).
+                if !matches!(func.dfg.value_def(w), ValueDef::Param(pb, _) if pb == la.loop_header(lp)) {
+                    continue;
+                }
+                let Some(Some(bp)) = bumps.get(&w) else {
+                    continue;
+                };
+                if bp.q == v {
+                    continue;
+                }
+                let dom = match mid_pred.get(&x) {
+                    Some(&u) => bp.qb == u || dt.try_dominates(bp.qb, u, &func.layout),
+                    None => bp.qb != x && dt.try_dominates(bp.qb, x, &func.layout),
+                };
+                if dom {
+                    subs.push((ix, *bp));
+                }
+            }
+            let first = func.layout.first_inst(x).unwrap();
+            let mut new_args = args.clone();
+            // `v = n + post` when the constant is peeled off the clone.
+            let mut post: Option<i64> = None;
+            if let [(ix, bp)] = subs[..]
+                && matches!(data.opcode(), Opcode::Iadd | Opcode::Isub)
+                && ty == I64
+            {
+                new_args[ix] = bp.q;
+                post = Some(if data.opcode() == Opcode::Isub && ix == 1 { bp.k } else { bp.k.wrapping_neg() });
+            } else {
+                for &(ix, bp) in &subs {
+                    let mut cur = FuncCursor::new(func).at_inst(first);
+                    let kc = cur.ins().iconst(I64, bp.k.wrapping_neg());
+                    new_args[ix] = cur.ins().iadd(bp.q, kc);
+                }
+            }
+            let ni = func.dfg.make_inst(data);
+            func.set_srcloc(ni, func.srcloc(d));
+            func.dfg.inst_args_mut(ni).copy_from_slice(&new_args);
+            func.dfg.make_inst_results(ni, ty);
+            func.layout.insert_inst(ni, first);
+            let nv = func.dfg.first_result(ni);
+            for &a in &new_args {
+                let r = func.dfg.resolve_aliases(a);
+                if let Some(l) = sites.get_mut(&r) {
+                    l.push(ni);
+                }
+            }
+            // The value the remaining users read; made on demand.
+            let mut full: Option<Value> = post.is_none().then_some(nv);
+            for s in us {
+                if let Some(pk) = post
+                    && let InstructionData::Binary { opcode: Opcode::Iadd, args: [a0, a1] } = func.dfg.insts[s]
+                {
+                    let (r0, r1) = (func.dfg.resolve_aliases(a0), func.dfg.resolve_aliases(a1));
+                    let other = if r0 == v && r1 != v {
+                        Some(r1)
+                    } else if r1 == v && r0 != v {
+                        Some(r0)
+                    } else {
+                        None
+                    };
+                    if let Some(o) = other
+                        && let Some(k2) = iconst_of(func, o)
+                    {
+                        if let Some(l) = sites.get_mut(&o) {
+                            l.retain(|&y| y != s);
+                        }
+                        let total = pk.wrapping_add(k2);
+                        if total == 0 {
+                            let res = func.dfg.first_result(s);
+                            func.layout.remove_inst(s);
+                            func.dfg.detach_inst_results(s);
+                            func.dfg.change_to_alias(res, nv);
+                        } else {
+                            let kc = FuncCursor::new(func).at_inst(s).ins().iconst(I64, total);
+                            func.dfg.inst_args_mut(s).copy_from_slice(&[nv, kc]);
+                        }
+                        continue;
+                    }
+                }
+                let fv = match full {
+                    Some(fv) => fv,
+                    None => {
+                        let mut cur = FuncCursor::new(func).after_inst(ni);
+                        let kc = cur.ins().iconst(I64, post.unwrap());
+                        let fv = cur.ins().iadd(nv, kc);
+                        full = Some(fv);
+                        fv
+                    }
+                };
+                let raw: Vec<Value> = func.dfg.inst_values(s).filter(|&w| func.dfg.resolve_aliases(w) == v).collect();
+                func.dfg.map_inst_values(s, |w| if raw.contains(&w) { fv } else { w });
+            }
+        }
+        for &a in &args {
+            let r = func.dfg.resolve_aliases(a);
+            if let Some(l) = sites.get_mut(&r) {
+                l.retain(|&y| y != d);
+            }
+        }
+        func.layout.remove_inst(d);
+        func.dfg.clear_results(d);
+        n += 1;
+    }
+    n
 }
 
 #[cfg(test)]
@@ -524,5 +986,120 @@ mod tests {
         assert_eq!(run(&mut func), 0);
         verify(&func);
         assert_eq!(func.layout.blocks().count(), 3);
+    }
+
+    /// `n = p - base` read only by the loop's two exits leaves the loop;
+    /// the clones read the stepped pointer, so `(p - base) + 1` on the
+    /// latch exit is `q - base`.
+    #[test]
+    fn sinks_exit_only_value_out_of_loop() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(I64));
+        }
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for bl in [entry, h, latch, exit] {
+            func.layout.append_block(bl);
+        }
+        let base = func.dfg.append_block_param(entry, I64);
+        let end = func.dfg.append_block_param(entry, I64);
+        let stop = func.dfg.append_block_param(entry, I64);
+        let p = func.dfg.append_block_param(h, I64);
+        let r = func.dfg.append_block_param(exit, I64);
+        FuncCursor::new(&mut func).at_bottom(entry).ins().jump(h, &[BlockArg::Value(base)]);
+        let (n, q, one) = {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let n = cur.ins().isub(p, base);
+            let one = cur.ins().iconst(I64, 1);
+            let q = cur.ins().iadd(p, one);
+            let c = cur.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, p, stop);
+            cur.ins().brif(c, exit, &[BlockArg::Value(n)], latch, &[]);
+            (n, q, one)
+        };
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+            let m = cur.ins().iadd(n, one);
+            let t = cur.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, q, end);
+            cur.ins().brif(t, h, &[BlockArg::Value(q)], exit, &[BlockArg::Value(m)]);
+        }
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[r]);
+        verify(&func);
+        let k = run(&mut func);
+        verify(&func);
+        assert!(k >= 2, "{}", func.display());
+        let subs_in = |func: &Function, b: Block| {
+            func.layout
+                .block_insts(b)
+                .filter(|&i| func.dfg.insts[i].opcode() == Opcode::Isub)
+                .count()
+        };
+        assert_eq!(subs_in(&func, h) + subs_in(&func, latch), 0, "{}", func.display());
+        // Both exits compute from `q`, and `p` has no use left but its
+        // step and the loop's own test.
+        let mut subs = 0;
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                if let InstructionData::Binary { opcode: Opcode::Isub, args } = func.dfg.insts[i] {
+                    assert_eq!(func.dfg.resolve_aliases(args[0]), q, "{}", func.display());
+                    subs += 1;
+                }
+            }
+        }
+        assert_eq!(subs, 2, "{}", func.display());
+        // The latch exit's `+ 1` cancelled against the step.
+        let adds = func
+            .layout
+            .blocks()
+            .filter(|&b| b != h)
+            .flat_map(|b| func.layout.block_insts(b).collect::<Vec<_>>())
+            .filter(|&i| func.dfg.insts[i].opcode() == Opcode::Iadd)
+            .count();
+        assert_eq!(adds, 1, "{}", func.display());
+    }
+
+    /// A value an in-loop inst still reads stays in the loop.
+    #[test]
+    fn keeps_value_used_in_loop() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        for _ in 0..2 {
+            sig.params.push(AbiParam::new(I64));
+        }
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for bl in [entry, h, exit] {
+            func.layout.append_block(bl);
+        }
+        let base = func.dfg.append_block_param(entry, I64);
+        let end = func.dfg.append_block_param(entry, I64);
+        let p = func.dfg.append_block_param(h, I64);
+        let r = func.dfg.append_block_param(exit, I64);
+        FuncCursor::new(&mut func).at_bottom(entry).ins().jump(h, &[BlockArg::Value(base)]);
+        {
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let n = cur.ins().isub(p, base);
+            let one = cur.ins().iconst(I64, 1);
+            let q = cur.ins().iadd(p, one);
+            // The loop's own test reads `n`.
+            let t = cur.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::NotEqual, n, end);
+            cur.ins().brif(t, h, &[BlockArg::Value(q)], exit, &[BlockArg::Value(n)]);
+        }
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[r]);
+        verify(&func);
+        run(&mut func);
+        verify(&func);
+        // (The step may move to the back edge; the count stays.)
+        assert!(
+            func.layout.block_insts(h).any(|i| func.dfg.insts[i].opcode() == Opcode::Isub),
+            "{}",
+            func.display()
+        );
     }
 }

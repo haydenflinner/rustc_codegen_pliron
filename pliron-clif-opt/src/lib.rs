@@ -29,6 +29,7 @@ pub mod cicm;
 pub mod clifpeep;
 pub mod cmp3;
 pub mod cmpcancel;
+pub mod deadslot;
 pub mod cmpmerge;
 pub mod selset;
 pub mod commute;

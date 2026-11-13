@@ -1,5 +1,8 @@
 //! Tests on a block parameter that every incoming edge already decided
-//! (`PLIRON_EDGEKNOWN=1`, opt-in).
+//! (default on; `PLIRON_EDGEKNOWN=0` off). Two relatives live here:
+//! `selects` (`PLIRON_SELKNOWN=0` off) folds selects whose condition is
+//! decided where they stand, and `retests` (`PLIRON_RETEST=0` off)
+//! folds a branch that repeats the test on its block's only way in.
 //!
 //! `b(p): brif (p == 0), X, Y` where each predecessor reaches `b` over an
 //! edge of its own `brif` that settles whether the argument for `p` is
@@ -201,6 +204,73 @@ pub fn run(func: &mut Function) -> usize {
 fn eq_key(func: &Function, v: Value) -> Option<(Value, Value, bool)> {
     let (a, b, ne) = eq_test(func, v)?;
     Some(if a.as_u32() <= b.as_u32() { (a, b, ne) } else { (b, a, ne) })
+}
+
+/// A `brif` that repeats the test its block's only way in already made.
+///
+/// ```text
+/// block0: brif (len == 0), empty, block2
+/// block2: brif (len == 0), exit, loop          ; one predecessor: never taken
+/// ```
+///
+/// The second test is a rotated loop's guard: `p == p + len` until
+/// `cmpcancel` rewrites it at the end of the pipeline, and the last
+/// dominator GVN then finds it equal to the caller's `is_empty` check —
+/// after every pass that folds decided branches has run
+/// (`tests/parity/closing.rs`: `cbz x1` twice in a row). Climbs
+/// single-predecessor edges (at most eight) looking for a `brif` on the
+/// same value, or on an `icmp eq/ne` of the same operands.
+pub fn retests(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    let mut n = 0;
+    for b in blocks {
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        let InstructionData::Brif { arg, blocks: [bt, bf], .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        let c = func.dfg.resolve_aliases(arg);
+        let ck = eq_key(func, c);
+        let mut cur = b;
+        let mut known: Option<bool> = None;
+        for _ in 0..8 {
+            let mut ps = cfg.pred_iter(cur);
+            let (Some(p), None) = (ps.next(), ps.next()) else { break };
+            if p.block == cur {
+                break;
+            }
+            if let InstructionData::Brif { arg: pa, blocks: [pt, pf], .. } = func.dfg.insts[p.inst] {
+                let (tb, fb) = (pt.block(&func.dfg.value_lists), pf.block(&func.dfg.value_lists));
+                if tb != fb {
+                    let taken = tb == cur;
+                    let pc = func.dfg.resolve_aliases(pa);
+                    if pc == c {
+                        known = Some(taken);
+                        break;
+                    }
+                    if let (Some((x, y, ne)), Some((px, py, pne))) = (ck, eq_key(func, pc))
+                        && (x, y) == (px, py)
+                    {
+                        // The operands differ on this edge iff `pne == taken`.
+                        known = Some((pne == taken) == ne);
+                        break;
+                    }
+                }
+            }
+            cur = p.block;
+        }
+        let Some(k) = known else { continue };
+        if !pliron_cfg::bisect("edgeknown") {
+            continue;
+        }
+        let keep = if k { bt } else { bf };
+        let (kb, kargs): (Block, Vec<BlockArg>) =
+            (keep.block(&func.dfg.value_lists), keep.args(&func.dfg.value_lists).collect());
+        func.layout.remove_inst(t);
+        FuncCursor::new(func).at_bottom(b).ins().jump(kb, &kargs);
+        n += 1;
+    }
+    n
 }
 
 /// Selects whose condition is already decided where they stand.

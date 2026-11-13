@@ -490,6 +490,34 @@ pub fn run(
     n
 }
 
+/// `PLIRON_PUNROLL_SEARCH=1`: unroll search loops too (see `warm_exit`).
+fn search_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_SEARCH", "1"));
+    *ON
+}
+
+/// `eb` is ordinary code: not a cold block and not a trap stub.
+///
+/// A loop that leaves through a data test into warm code is a search
+/// (`position`, `take_while(..).count()`, `any`): the trip test the
+/// unroll amortizes is one exit of several, every copy keeps the data
+/// test, and the trip count is whatever the data says — for
+/// pulldown-cmark's scanners (`scan_ch_repeat`, `scan_while`,
+/// `tests/parity/closing.rs`, `tests/parity/scan_while.rs`) a trip or
+/// two, so each run pays the group guard and falls into the scalar
+/// tail: `closing` grew from 91 to 283 instructions and the program
+/// executed 0.6% more. Without a measured trip count such loops stay
+/// rolled (LLVM's runtime unroller also refuses multi-exit loops unless
+/// the other exits are cold). Exits to cold blocks (bounds-check
+/// panics) are not searches and unroll as before.
+fn warm_exit(func: &Function, eb: Block) -> bool {
+    !func.layout.is_cold(eb)
+        && func
+            .layout
+            .last_inst(eb)
+            .is_none_or(|t| !matches!(func.dfg.insts[t].opcode(), Opcode::Trap))
+}
+
 macro_rules! wbail {
     ($name:expr, $h:expr, $why:expr) => {{
         if debug() {
@@ -1429,6 +1457,16 @@ fn run_loop(
     // (0/unset: no bound): montgomery's decrement/store loops regressed
     // ~5% at k=8 with one mid-exit each.
     let kept = mid_exits.len() + latch_exit.is_some() as usize;
+    // (A do-while's `latch_exit` is its counting test, not a data exit.)
+    if trip.is_none()
+        && !search_on()
+        && mid_exits
+            .iter()
+            .chain(latch_exit.iter().filter(|_| rotated))
+            .any(|e| warm_exit(func, e.cone.seblk))
+    {
+        bail!("search loop: data exit to warm code");
+    }
     if kept > 0
         && let Some(budget) = crate::env_get("PLIRON_PUNROLL_KEXIT")
             .and_then(|s| s.parse::<usize>().ok())
@@ -2377,6 +2415,24 @@ fn run_region(
     let Some(cnt) = cnt else {
         bail!("no counting latch");
     };
+    if trip.is_none() && !search_on() {
+        // Every edge out of the body except a counting latch's own
+        // exit arm is a data exit kept in each copy.
+        for &b in &rpo {
+            let t = func.layout.last_inst(b).unwrap();
+            if latches.iter().any(|l| l.blk == b && l.counting) {
+                continue;
+            }
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                let d = bc.block(&func.dfg.value_lists);
+                if !body.contains(&d) && warm_exit(func, d) {
+                    bail!("search loop: data exit to warm code");
+                }
+            }
+        }
+    }
 
     // ---- exits: every out-of-body target gets the shared-cone
     // treatment, exactly like chain side exits ----

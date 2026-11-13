@@ -3257,6 +3257,8 @@ impl Inst {
                 }
                 let (reg, index_reg, offset) = match mem {
                     AMode::RegExtended { rn, rm, extendop } => (rn, Some((rm, extendop)), 0),
+                    // PLIRON: `mem_finalize`'s large-offset form (patch 132).
+                    AMode::RegReg { rn, rm } => (rn, Some((rm, ExtendOp::UXTX)), 0),
                     AMode::Unscaled { rn, simm9 } => (rn, None, simm9.value()),
                     AMode::UnsignedOffset { rn, uimm12 } => (rn, None, uimm12.value() as i32),
                     _ => panic!("Unsupported case for LoadAddr: {mem:?}"),

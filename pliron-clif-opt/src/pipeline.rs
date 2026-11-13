@@ -3538,6 +3538,25 @@ fn s_selknown(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// A branch repeating its only predecessor's test — see `edgeknown::retests`.
+fn s_retest(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::edgeknown::retests(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("retest");
+    }
+    k
+}
+
+// Slots whose last reference a late pass removed — see `deadslot`.
+fn s_deadslot(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    // `-g -O0`: every variable keeps its own slot for the debugger.
+    if p.flags.keep_dbg_slots {
+        return 0;
+    }
+    crate::deadslot::run(&mut p.clctx.func)
+}
+
 // A membership predicate held in a select chain — see `selset`.
 fn s_selset(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::selset::run(&mut p.clctx.func);
@@ -4606,7 +4625,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // length by now (`ifconv2`'s const sweep); `loadfwd2`/`dse2`
         // later forward and drop a stack slot holding the compared bytes
         // (`ends_with(char)`).
-        step("selknown", "edgeknown", Gate::OptIn("PLIRON_SELKNOWN"), s_selknown).needs(shape::CONDBR),
+        step("selknown", "edgeknown", Gate::Env("PLIRON_SELKNOWN"), s_selknown).needs(shape::CONDBR),
         step("memcmpk", "memcmpk", Gate::Env("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
         cstep(
             "unswitch",
@@ -5360,6 +5379,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // already holds (`idx + 1` on a loop's exit edge next to the
         // counter's own step): one more dominator GVN.
         step("dgvn3", "dgvn", Gate::Env("PLIRON_LATEGVN"), s_dgvn),
+        // That GVN is also what shows a rotated loop's guard to be the
+        // test the block's only predecessor just made.
+        step("retest", "edgeknown", Gate::Env("PLIRON_RETEST"), s_retest).needs(shape::CONDBR),
+        // A slot whose last store `dse3` deleted (after `slotmerge`)
+        // still has its size, and the function a frame for it.
+        step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),
         step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
             .needs(shape::CALL),
         // Last: static branch hints for emission-time placement

@@ -64,21 +64,50 @@ instrumented CGU registers (header magic `PLPROF02`) its site table, a
 `{symbol hash, &fn, flags}` table of its bodies and its symbol names;
 `pliron-prof merge` resolves every recorded address through the tables of all CGUs
 in the dump and writes the sites — target symbol name, defining crate hash (SVH),
-defining CGU, "external" flag, count — in a trailer of the `.prof` (`PLICALL1`; old
-readers stop before it, old profiles simply have no sites). After `pgo::load`,
-`pliron_ir_opt::devirt::promote` rewrites each site: at most `PLIRON_DEVIRT_MAX` (2)
-targets with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the site's calls,
-hottest first. A target is used when `&symbol` is the profiled address and links:
-its body is in this CGU and the address came from this CGU; or it is a symbol of this
-crate another CGU can link (`xcgu::home_linkable` or promoted); or it is external in
-a dependency whose crate hash still equals the one profiled (a profile of an older
-dependency names nothing). Targets in crates that depend on this one (a closure the
-binary passes into a library) need `PLIRON_DEVIRT_DOWNSTREAM=1`: the library object
-then only links into programs defining them. So that targets can be named, both
-builds make vtable slot instances that are `Internal` in exactly one CGU
-hidden-external (`devirt::promotable` -> `xcgu::promoted`): closures, private and
-`#[inline]` impl methods, shims; per-user copies only when their symbol is unique to
-this crate (local definition or generic instance).
+defining CGU, flags ("external", "mono item of its CGU"), count — in a trailer of the
+`.prof` (`PLICALL2`; old readers stop before it, old profiles simply have no sites).
+After `pgo::load`, `pliron_ir_opt::devirt::promote` rewrites each site: at most
+`PLIRON_DEVIRT_MAX` (2) targets with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent
+of the site's calls, hottest first.
+
+*Guard and call are two symbols* (second pass, same day). The first version compared
+against the target's own symbol and called it, so a target was usable from another
+CGU only as a linked call, and a CGU holding its own copy of the target could not
+guard at all (the copy has the symbol name and another address). Now:
+- The guard compares against the **home alias** `<symbol>.icp.<hash of the home CGU's
+  name>`, a second hidden symbol the home CGU puts on every profiled address it holds
+  as a mono item (`devirt::define_aliases`; `State::aliases`, which `address_taken`
+  now reads). In the home CGU itself the guard uses the symbol. Nothing is promoted
+  any more: the target keeps its linkage in both builds (the first version made
+  profiled targets hidden-external, which cost the private-function optimizations).
+- The call goes to a body in the calling CGU when there is one — the home (`L`), a
+  cross-CGU copy or this crate's own instantiation of a dependency's function (`C`) —
+  and through the alias otherwise (`X`).
+- Bodies: the profiled targets of a function's sites are cross-CGU copy candidates
+  like its direct callees (`xcgu::copies_fixpoint`, hot targets up to
+  `PLIRON_PGO_XCGU`). A dependency's target is instantiated here when rustc has its
+  MIR (`devirt::dep_instances`: by the symbol the dependency mangled it to,
+  `symbol_name_for_instance_in_crate`, over this crate's generic instances and the
+  dependency's non-generic functions and closures); its symbol differs from the
+  dependency's (the instantiating crate is part of it), and it takes the
+  dependency's profile record (`State::prof_as`).
+- rustc does not encode MIR for a closure of a plain function — exactly what
+  `Box<dyn Fn>` targets are. The profile-use build of the defining crate adds its
+  profiled closure targets to `reachable_set` (`devirt::provide`), closed over what
+  their MIR mentions: private functions and statics become exported, inlinable ones
+  and nested closures instantiable; a thread local, inline asm, a private `const`
+  item or a vtable/coroutine constant leaves the target alone. The using crate
+  re-checks that closure before instantiating (`closed_downstream`; a miss in rustc's
+  collector is a fatal error). `tests/devirt_xc` has one closure of each kind.
+- A guard whose pointer turned constant (inlining exposed the vtable) is decided by
+  name after `constload` (`devirt::fold_static`): the arm with the inlined body
+  stays, the indirect arm goes. Taking the indirect arm instead and letting the
+  static devirtualization make it direct loses the body — a cross-CGU copy is an
+  import again by then (`home_copies`) — and measured about 0.2% more instructions.
+- Does the alias link: same crate, the profiled address is a mono item of that CGU
+  in this build's partition; a dependency, a crate linked right here reads the rlib's
+  symbol table, an rlib crate requires the profiled crate hash and the "mono item"
+  flag. Targets in crates that depend on this one need `PLIRON_DEVIRT_DOWNSTREAM=1`.
 
 **Without a profile: blind guards, opt-in** (`PLIRON_DEVIRT=1`). Candidates are the
 slot instances of the vtables this crate instantiates (`src/devirt.rs` `index`: every
@@ -87,23 +116,96 @@ slot instances of the vtables this crate instantiates (`src/devirt.rs` `index`: 
 linkability; a site with at most `PLIRON_DEVIRT_MAX` usable candidates gets guards
 (`Builder::devirt_call`), others are left alone.
 
-Measured (release dylib, 2026-11-13). rust-html-rewriter, default loop: 8196 functions
-matched, 0 stale; 69 sites ran, 45 get a guard; 484k profiled indirect calls, 349k
-(72%) now go to a guarded target: all 215k `Fn::call` calls into vtables built in
-the upstream crate, 27.5k of 34k `FnOnce::call_once`, 107k of 235k `FnMut::call_mut`.
-Not guarded: 126k calls of the `&mut dyn FnMut(&[u8])` forwarder whose target is in
-the downstream crate (guarded with `PLIRON_DEVIRT_DOWNSTREAM=1`), 7k where the CGU
-holds its own copy of the target. pgo vs pgo with `PLIRON_DEVIRT=0`, 15 rounds:
-instructions 0.994, cycles 0.970 (noisy machine); with the downstream knob 1.003 —
-a direct call into another crate cannot inline, so it only adds the compare.
-LLVM's ICP on the same program: instructions 0.995. Only 66k of the guarded calls
-have the target's body in the calling CGU (inlinable); 283k are direct calls into
-another crate or CGU.
-`tests/devirt/main.rs` (one crate) and `tests/devirt_xc/` (library + binary: upstream
-vtables, downstream targets) print the same through the loop as without it.
+Measured (release dylib, 2026-11-13, second pass). The first pass's call counts
+summed the remark lines of every CGU copy of a caller; the profile itself (one record
+per function, copies merged) has **191.8k** indirect calls on rust-html-rewriter, in
+26 sites. Per profiled target, over all emitted copies of its caller:
 
-Not done: inlining a promoted target whose body is in another crate or CGU (needs a
-copy with its own name, so the guard can still compare the home address);
+| | calls | share |
+| --- | --- | --- |
+| guarded | 128.5k | 67.0% |
+| guarded, body in the calling CGU | 118.2k | 61.6% |
+| inlined in every emitted copy | 115.6k | 60.3% |
+| inlined in some copies, linked call in others | 2.7k | 1.4% |
+| body local but not inlined | 0 | |
+| guarded, linked call only (`X`) | 10.3k | 5.4% |
+| not guarded: target defined downstream | 62.8k | 32.7% |
+
+What is inlined: the `&mut dyn FnMut(&[u8])` forwarder into lol_html's serializers
+(62.8k; its copy is now made in the callers' CGUs); lol_html's tag-name selector
+closure (`Expr<OnTagNameExpr>::compile::{closure}`, 42.9k) into the benchmark's
+instantiations of the selector VM, through `reachable_set` — a plain closure of a
+non-generic function, no MIR downstream before; the binary's own closures and
+`call_once` shims across its CGUs (9.9k, plus 2.7k in some copies of the caller).
+The linked-only rest is three targets of 3.4k calls each, all below the profile's
+hot count, so the copy rules are the default 50 statements: lol_html's attribute
+selector closure (instantiable here, but it needs `AttributeMatcher::find`
+instantiated with it, which is bigger), a `call_once` vtable shim (its closure body
+is bigger) and one closure of `main`; and a dozen calls of drop-glue and shim
+instances of the dependency (only plain functions and closures are looked up
+there). Body local but not inlined: none, so no inliner reason to list.
+
+The 62.8k downstream calls are one site: the forwarder calls the closure the binary
+passed into lol_html (`DispatcherDelegate::token_produced::{closure}`). Guard and
+target are in different crates in the wrong order — the site's function is compiled
+before the target's crate exists, and the callers (lol_html's non-generic
+serializers) have no MIR for the binary to instantiate — so there is no build in
+which both ends are local; that needs cross-crate IR, not promotion. A guard alone
+(`PLIRON_DEVIRT_DOWNSTREAM=1`, or a weak reference, which would link everywhere but
+generate the same code) costs instructions: 0.998 against 0.995 without it. It
+stays opt-in.
+
+Instructions, `bench/heldout/ab.py rust-html-rewriter`, ratio to `pgo-off:PLIRON_DEVIRT=0`
+(which also switches the static devirtualization off), 401 interleaved rounds (the
+program's own run-to-run spread is about 1%, hash seeds; 21 rounds resolve 0.3%, 401
+about 0.05%):
+
+| side | instructions | cycles |
+| --- | --- | --- |
+| default (`pgo`) | 0.995 | 0.990 |
+| no promotion, static devirtualization only (`PLIRON_DEVIRT_MAX=0`, no copies, no export) | 1.002 | 1.003 |
+| `PLIRON_DEVIRT_LINKED=0` | 0.995 | 0.992 |
+| `PLIRON_DEVIRT_DOWNSTREAM=1` | 0.998 | 0.999 |
+
+At the requested 21 rounds: 0.993. LLVM's ICP on this program: 0.995. The first
+pass's build, measured the same way against its own `PLIRON_DEVIRT=0` build: 0.9985
+(sides must come from one backend dylib: other work landing the same morning moved
+this program by 0.7%). Where the difference comes from, by ablation on the way:
+bodies for same-crate targets, linked guards off, 0.998-0.999 — the forwarder is
+three instructions, so inlining it is worth about what its guard costs, and it is
+the binary's closures (10k calls, real bodies) that pay; folding the forwarder's
+guards by name, no measurable change in the median; the dependency's closures, to
+0.995. `-Zalways-encode-mir` on both builds gives the same 0.995: the
+`reachable_set` addition finds what that flag would.
+
+rust-protobuf: 2.5k profiled indirect calls, all guarded and inlined (first pass: 2 of
+4 sites guarded); instructions 0.998-1.000, nothing to gain.
+
+`bench/heldout/run.py --pgo --rounds 5`, all eight programs build and run, 0 stale
+functions each (blake3-scalar 220 matched, blind-sig 6677, pulldown-cmark 2204,
+regex 10451, rust-compression 4742, rust-html-rewriter 8485, rust-json 2587,
+rust-protobuf 1804); time, 5 rounds on a loaded machine:
+```
+geomean pliron/llvm over 8 of 8: 1.061 [1.033,1.077]*
+geomean pliron-pgo/llvm over 8: 1.051 [1.015,1.069]*  pgo/pliron 0.990 [0.959,1.015]
+geomean llvm-pgo/llvm over 8: 0.942 [0.911,0.969]*  llvm-pgo/pliron 0.888 [0.865,0.917]*
+pliron-pgo loop / plain llvm build: 1.81x
+```
+`tests/devirt/main.rs` (one crate, 1 and 8 CGUs) and `tests/devirt_xc/` (library +
+binary: upstream vtables and closures — with a private function, a private static, a
+nested closure, a thread local — and downstream targets, also with
+`PLIRON_DEVIRT_DOWNSTREAM=1`) print the same through the loop as without it.
+`harness/pgofuzz.py 61000:61150`: pass 150.
+
+Knobs added: `PLIRON_DEVIRT_COPY=0` (no copies for targets), `PLIRON_DEVIRT_DEPCOPY=0`
+(no instantiation of a dependency's targets), `PLIRON_DEVIRT_EXPORT=0` (no
+`reachable_set` addition), `PLIRON_DEVIRT_FOLD=0` (keep guards on constants).
+
+Not done: the downstream site above; shim and drop-glue instances of a dependency as
+copies; copying the body under a `call_once` shim for a warm (not hot) target; a
+profile-use rlib built into a target directory that holds rlibs of a build without
+the profile is trusted by crate hash (cargo does not track `PLIRON_*`; use a fresh
+directory, as for every profile build); the aliases are exercised on Mach-O only;
 `tests/devirt*` are not wired into `test.sh`; wasm has no value profile.
 
 ## 6. Shared panic tails
@@ -238,3 +340,147 @@ retire the pointer in favour of the counter when both step in lockstep
 (or sink `p - base` to the exits), and keep `punroll` off multi-exit
 byte scans. Repro: scratch `cf.rs` (`closing`), copied to
 `tests/parity/closing.rs`.
+
+### Fourth item: the open select fold, closed (`selknown` default on)
+
+The select fold above was correct but lost instructions because of
+what happened to the loop afterwards. Five causes, fixed in the pass
+that owned each; `tests/parity/closing.rs` (`closing`) went from 92
+instructions (283 with the fold on, partial unroll included) to 83
+(LLVM: 52), its two scans from 6 and 9 instructions a trip to 6 and 6
+— LLVM's loop, `ldrb [base, idx]; cmp; b.ne; add; cmp; b.ne`.
+
+- **The counter was retired, not the pointer.** `webmerge` (inside
+  `sameargs2`) saw a pointer and a counter stepping in lockstep, each
+  expressible from the other (`p = c + base`, `c = p - base`); its cycle
+  check kept whichever candidate came first, which was the pointer. The
+  count then had to be computed from the pointer for both exits and the
+  cursor copied at entry. `sameargs` now orders the candidates so a slot
+  seeded with a constant survives (`WmCtx::keep_count`,
+  `PLIRON_WM_KEEPCOUNT=0` off). Only in `sameargs`: the early `cparm`
+  rounds keep the pointer walk, which `bytescan` and `punroll` match —
+  with the counter kept there, `escape_html_scalar`'s `position` over a
+  byte table lost its 16-byte scan and pulldown-cmark ran 4% more
+  instructions (55.55M).
+- **The exit test of a scan that starts mid-slice kept the pointer
+  alive.** `(bytes + found) + idx + 1 != bytes + len`: `cmpcancel`
+  cancelled `bytes` but refused the two-value left side. It now moves
+  loop-invariant addends to the other side, computing `len - found`
+  once in the block that enters the loop (`PLIRON_CMPCANCEL_INV=0` off),
+  and reads sums through parameters of single-edge blocks (loop
+  rotation passes the guard's values that way). Second scan of
+  `closing`: 8 instructions a trip -> 6.
+- **`punroll` unrolled search loops.** With the select gone the scans
+  matched its multi-block path (`run_region`), which made 8 copies
+  behind a group guard: 283 instructions, and each run of a loop that
+  makes a trip or two paid the guard and fell into the scalar tail. A
+  loop that leaves through a data test into warm code (not a cold block
+  or a trap stub) is now left rolled unless a measured trip count says
+  otherwise (`punroll::warm_exit`; `PLIRON_PUNROLL_SEARCH=1` restores
+  the old behaviour; LLVM's runtime unroller refuses multi-exit loops
+  the same way). Counted loops and loops whose other exits are
+  bounds-check panics unroll as before.
+- **Loop-exit values computed in the loop** (`edgesink::exit_sink`,
+  `PLIRON_EXITSINK=0` off). Where the counter *is* retired early (the
+  pointer loops `cparm` leaves), `p - base` sat in the header for the
+  exits. A pure in-loop instruction whose every use is outside the loop
+  or on an exit edge is cloned to those uses; a header parameter
+  operand is read through its step (`q - k`) where the step dominates,
+  so the parameter still dies at its step. The vendored `bump_hoist`
+  (patch 116) learned to alias a dominated duplicate of the kept bump
+  instead of rematerializing it as `(q - k) + k`. With
+  `PLIRON_WM_KEEPCOUNT=0` the `closing` scans become
+  `ldrb [p], #1; cmp; b.ne; cmp; b.ne` — five a trip, but two or three
+  more per run of the loop, which is why the counter form is the one
+  kept for these scans.
+- Tried and left opt-in: `PLIRON_ELABHOT=1` (vendored elaborator: a
+  block that lost its loop's stack entry to the pop-on-leave rule gets
+  it back when the loop has no call and the block dominates the
+  latches). It fixes `scan_while`'s in-loop mask constant when exit
+  blocks precede the body in the domtree walk, but hoists out of loops
+  that run a trip or less: pulldown-cmark +0.5% (`ELABLOOPS=1`: +2.4%).
+  Needs trip counts.
+
+Two things `closing` showed besides the loops, both default on:
+
+- `deadslot` (new step, `PLIRON_DEADSLOT=0` off): a stack slot whose
+  last store `dse3` deleted after `slotmerge` kept its size, so the
+  function kept a frame (`sub sp` / `add sp`). The closure handed to
+  `take_while` captures the fence byte by reference; the byte's slot is
+  dead by the end. `scan_while.rs`: 40 -> 35 instructions (`scan_ch` is
+  frameless). pulldown-cmark -0.12M.
+- `retest` (`edgeknown::retests`, `PLIRON_RETEST=0` off): a `brif` that
+  repeats the test on its block's only way in. The rotated loop's guard
+  is `p == p + len` until `cmpcancel` rewrites it at the end of the
+  pipeline and the last GVN finds it equal to the caller's `is_empty`
+  check (`cbz x1` twice). pulldown-cmark -0.19M.
+
+Exact totals (callgrind, `aarch64-unknown-linux-musl`), every knob of
+this item off -> defaults:
+
+| program | LLVM | before | after | |
+|---|---|---|---|---|
+| pulldown-cmark | 45.33M | 53.40M (x1.178) | 52.99M (x1.169) | -0.77% |
+| regex | 45.97M | 55.29M (x1.203) | 55.12M (x1.199) | -0.31% |
+| rust-html-rewriter | 85.83M | 106.98M (x1.246) | 106.54M (x1.241) | -0.41% |
+| rust-json | 45.55M | 51.95M (x1.140) | 52.08M (x1.143) | +0.25% |
+| rust-protobuf | 60.76M | 66.87M (x1.100) | 66.77M (x1.099) | -0.15% |
+| blake3-scalar | 46.63M | 49.08M | 49.08M | 0 |
+
+pulldown-cmark by knob (each one off against 52.99M): search-loop rule
++0.21M, `retest` +0.19M, `exit_sink` +0.16M, `deadslot` +0.12M,
+`keep_count` +0.08M, `selknown` +0.02M, `cmpcancel` invariants 0.
+
+rust-json's +0.13M is `exit_sink` (51.93M with it off) and is not the
+loop: `serialize_str` is called 38,850 times and runs four more
+instructions a call — three alignment `nop`s in front of its scan loop
+(the function is two instructions longer, so the loop head moved off a
+16-byte boundary) and one more register copy in the prologue. The
+macOS whole-process counts (`ab.py`) cannot arbitrate: the same pair of
+builds measured 0.991 and 1.001 for rust-json in two runs an hour
+apart, and blake3-scalar (identical code on both sides in the exact
+count) 0.986, 1.004 and 1.012, with other agents loading the machine.
+
+Validation: `harness/gate.py` passes; fuzz seeds 74000:74700 and
+75000:75700 pass (the first range found one verifier failure in
+`exit_sink`, seed 74256 — a header parameter of an *enclosing* loop was
+read through its step, which was the instruction being sunk; fixed,
+regression test `exit_sink_does_not_read_a_value_through_itself` in
+`pliron-clif-opt/tests/scan_loops.rs`); all eight held-out programs
+build and exit 0 under `ab.py`.
+
+### irdiff on regex
+
+`irdiff.py regex` died in callgrind with SIGILL: valgrind does not
+decode `ldr q0, [sp, x16, sxtx]`, which Cranelift emits for a frame
+offset no immediate form holds (regex's `ExecBuilder::build` has a
+14KB frame). `mem_finalize` now uses the plain register form
+`[sp, x16]` (same address for a 64-bit index, vendored patch 132);
+valgrind decodes that one (checked both encodings with a three-line
+`asm!` program in the container). Still not runnable: rust-compression
+(our `main` touches its multi-megabyte frame without probing it page by
+page; valgrind only grows the stack near SP, so the first access
+faults — `--main-stacksize` does not help) and blind-sig (the LLVM side
+does not link for musl: `open64` from getrandom 0.2.8).
+
+### Leads from the tables, not yet taken
+
+- `punroll` as a whole still costs pulldown-cmark 0.12M
+  (`PLIRON_PUNROLL=0`: 52.87M) — peeling (`PLIRON_PEEL=0`) accounts for
+  it: `scalar_iterate_special_bytes` +0.25M, against gains in
+  `parse_block`. Across programs peel is a wash (protobuf -0.43M with
+  it, html-rewriter +0.30M, pulldown +0.17M), and unrolling plain
+  counted loops costs protobuf +0.7% and html-rewriter +0.3% (seen when
+  a bug in the first version of the search rule also switched those
+  off). Trip counts again.
+- pulldown-cmark lines after this item: `iterator.rs:2503` +1.07M,
+  `scanners.rs:373` +0.81M, `vec/mod.rs:1002` +0.72M, `parse.rs:2837`
+  +0.63M, `parse.rs:2937` +0.62M, `parse.rs:780` +0.55M,
+  `tree.rs:163` +0.33M.
+- `closing` is still 83 instructions to LLVM's 52: each rotated scan
+  keeps a peeled first iteration (`looprot2` rotates a loop whose latch
+  already ends in a `brif`), the bounds checks of `&bytes[i..]` compare
+  twice where LLVM uses one `subs`, and `scan_eol`'s
+  `bytes.get(1) == Some(&b'\n')` loads the promoted constant's pointer
+  from memory and null-checks it (LLVM folds the whole comparison: its
+  result is unused).

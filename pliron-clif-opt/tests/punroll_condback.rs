@@ -4,6 +4,11 @@
 //! non-header arm leaves the body (the data exit). The group copies keep
 //! only the byte test; the `p == end` count test survives in the group
 //! guard, the last copy and the scalar remainder.
+//!
+//! Without a measured trip count `punroll` now leaves such search loops
+//! rolled (`punroll::warm_exit`; `tests/scan_loops.rs` checks that), so
+//! this binary turns the transform back on with `PLIRON_PUNROLL_SEARCH=1`
+//! — the mechanism still runs under that knob and under a profile.
 
 use cranelift_codegen::ir::{Function, Inst, Opcode, Value};
 use cranelift_codegen::settings;
@@ -30,6 +35,14 @@ block4:
     return v18
 }";
 
+/// The knob is read once per process: set it before the first pass call.
+fn search_on() {
+    // SAFETY: every test sets the same value before anything reads it.
+    unsafe {
+        std::env::set_var("PLIRON_PUNROLL_SEARCH", "1");
+    }
+}
+
 fn insts(f: &Function) -> impl Iterator<Item = Inst> + '_ {
     f.layout
         .blocks()
@@ -54,6 +67,7 @@ fn count_brifs_on(f: &Function, bound: Value) -> usize {
 
 #[test]
 fn conditional_backedge_unrolls_with_one_group_test() {
+    search_on();
     let mut f = cranelift_reader::parse_functions(ANY).unwrap().remove(0);
     let bound = f.dfg.block_params(f.layout.entry_block().unwrap())[1];
     let mut an = Analysis::default();
@@ -78,6 +92,7 @@ fn conditional_backedge_unrolls_with_one_group_test() {
 
 #[test]
 fn do_while_latch_still_unrolls() {
+    search_on();
     // Both dests of the latch brif stay inside the body — the classic
     // counted do-while, unaffected by the conditional-backedge arm.
     let src = "function %f(i64, i64) -> i64 {

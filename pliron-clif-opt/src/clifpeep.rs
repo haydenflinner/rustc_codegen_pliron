@@ -3692,6 +3692,7 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // (cfg/dom/edges) is round-invariant, so it is built once here
     // rather than per call.
     let mut wctx = WmCtx::new(func);
+    wctx.keep_count = pliron_cfg::pass_enabled("PLIRON_WM_KEEPCOUNT");
     // A round's merges rebind only values inside the merged blocks'
     // dominated regions — the next round's scan is confined to those
     // regions plus their out-edge targets (`merge_dirty`).
@@ -4172,6 +4173,11 @@ pub struct WmCtx {
     cfg: cranelift_codegen::flowgraph::ControlFlowGraph,
     dom: cranelift_codegen::dominator_tree::DominatorTree,
     edges: FxHashMap<Block, Vec<(Inst, usize)>>,
+    /// In a pointer/counter pair that step in lockstep, drop the
+    /// pointer (`webmerge_ctx`'s candidate order). Set by `sameargs`,
+    /// which runs after the loop transforms; `cparm` runs before them
+    /// and keeps the pointer walk `bytescan`/`punroll` match.
+    pub keep_count: bool,
 }
 
 impl WmCtx {
@@ -4193,7 +4199,7 @@ impl WmCtx {
                 }
             }
         }
-        WmCtx { cfg, dom, edges }
+        WmCtx { cfg, dom, edges, keep_count: false }
     }
 
     /// Rebuild in place after structural edits — `compute` keeps the
@@ -4328,7 +4334,8 @@ pub fn webmerge_ctx(
     let wmprof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
     let t0 = wmprof.then(std::time::Instant::now);
-    let WmCtx { cfg, dom, edges } = ctx;
+    let WmCtx { cfg, dom, edges, keep_count } = ctx;
+    let keep_count = *keep_count;
     // One edge-fact scan feeds both the web normal forms and the
     // canonical-class proots — nothing mutates between them.
     let facts = crate::proots::facts_cfg(func, cfg);
@@ -5118,6 +5125,27 @@ pub fn webmerge_ctx(
                     )
                 };
             }
+        }
+        // A pointer and a counter that step in lockstep each explain the
+        // other (`p = c + base`, `c = p - base`); the cycle check below
+        // lets the first of such a pair survive and drops the second.
+        // Keep the counter: a slot some edge seeds with a constant goes
+        // first. `base + c` folds into the load's address mode,
+        // `cmpcancel` turns the exit test into `c + 1 != len`, and the
+        // count is ready at every exit — LLVM's shape for
+        // `iter().take_while(..).count()` (pulldown-cmark's `scan_ch`,
+        // `tests/parity/closing.rs`). Retiring the counter instead left
+        // `p - base` to compute for each exit and a cursor copy at
+        // entry: three more instructions per run of a loop that
+        // typically makes one or two trips. Only in `sameargs`
+        // (`PLIRON_WM_KEEPCOUNT=0` off): the early `cparm` rounds keep
+        // the pointer, which `bytescan` and `punroll` read (escape's
+        // `position` over a byte table lost its 16-byte scan otherwise:
+        // pulldown-cmark +4% instructions).
+        if keep_count && cands.len() > 1 {
+            cands.sort_by_key(|&(ix, _)| {
+                !(0..es.len()).any(|e| matches!(skey_of(e, ix), crate::proots::Key::K(..)))
+            });
         }
         for &(ix, ref rk) in &cands {
             pend.insert(ix, rk.clone());
