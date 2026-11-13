@@ -598,6 +598,34 @@ impl<'a> Elaborator<'a> {
             {
                 return false;
             }
+            // PLIRON `PLIRON_REMAT_CARRIED=0` (opt-in): no remat of a
+            // value its own block passes on as a branch argument. Remat
+            // pays when it lets the *result* die at the end of its block;
+            // a loop counter's step (`i + 1`, handed to the header) is
+            // live out regardless, so a clone on the exit edge only keeps
+            // the old `i` alive past the step. The two then overlap, the
+            // header's parameter cannot share a register with its
+            // argument, and every iteration pays a `mov` and a `b`
+            // (pulldown-cmark `scan_ch`: 8 instructions a trip, 6 without
+            // the clone).
+            static CARRIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*CARRIED.get_or_init(|| std::env::var("PLIRON_REMAT_CARRIED").as_deref() != Ok("0"))
+                && let Some(def) = func.dfg.value_def(arg.value).inst()
+                && !func.dfg.inst_args(def).is_empty()
+                && let Some(t) = func.layout.last_inst(arg.in_block)
+            {
+                let carried = func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .any(|bc| {
+                        bc.args(&func.dfg.value_lists).any(|a| {
+                            matches!(a, crate::ir::BlockArg::Value(v) if func.dfg.resolve_aliases(v) == arg.value)
+                        })
+                    });
+                if carried {
+                    return false;
+                }
+            }
             let new_value = match remat_copies.entry((insert_block, arg.value)) {
                 HashEntry::Occupied(o) => *o.get(),
                 HashEntry::Vacant(v) => {

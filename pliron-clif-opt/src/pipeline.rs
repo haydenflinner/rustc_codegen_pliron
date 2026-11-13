@@ -2283,6 +2283,15 @@ fn s_edgeknown(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// Common addends cancelled out of `icmp eq/ne` — see `cmpcancel`.
+fn s_cmpcancel(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::cmpcancel::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("cmpcancel");
+    }
+    k
+}
+
 fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
     let sh = an.shape_bits(&p.clctx.func);
     let rnn = (!p.region_nn.is_empty()).then(|| jumpthread::RegionNN {
@@ -5150,6 +5159,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // edges into its header, and the header's own first test of the
         // carried value is then decided (regex `InstPtrs::next`).
         step("edgeknown", "edgeknown", Gate::OptIn("PLIRON_EDGEKNOWN"), s_edgeknown).needs(shape::MULTI),
+        // The late refold expressed walked pointers as `base + idx`;
+        // their exit tests still compare `base + idx + 1` with `base +
+        // len`.
+        step("cmpcancel", "cmpcancel", Gate::OptIn("PLIRON_CMPCANCEL"), s_cmpcancel),
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one
         // `brif` edge's args (parse_only's `ParseIntError` pack on every
@@ -5316,6 +5329,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // jumps to one copy. After tailmergep/stubhoist — it folds
         // tailmergep's per-shape shared blocks, and stubhoist would
         // hoist arg-only stubs back into hot preds.
+        // The last sinks and hoists re-create values a dominating block
+        // already holds (`idx + 1` on a loop's exit edge next to the
+        // counter's own step): one more dominator GVN.
+        step("dgvn3", "dgvn", Gate::OptIn("PLIRON_LATEGVN"), s_dgvn),
         step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
             .needs(shape::CALL),
         // Last: static branch hints for emission-time placement

@@ -21,37 +21,51 @@ instructions 0.987..1.004x of default, inside the run-to-run spread of these 3-r
 ## 3. Guarded devirtualization
 
 `PLIRON_DEVIRT=1` (opt-in). `Builder::call`/`invoke` see a virtual call as
-`instance = Virtual(trait_method, idx)`; `src/devirt.rs` lists the trait's impls
-(`tcx.all_impls`, at most `PLIRON_DEVIRT_SCAN`=64 examined), and the usable candidates
-are the non-generic positive impls for the same trait args whose method resolves
-(`Instance::try_resolve`, provided methods included) to a plain item with the virtual
-call's ABI and lowered signature, linkable from this CGU (defined here,
-`xcgu::home_linkable`, or an upstream reachable non-generic). Generic/blanket impls,
-by-value `self` and `#[track_caller]` shims are never candidates and do not reject
-the site: the indirect arm, always kept last, covers them. `Builder::devirt_call`
-emits one guard block per target (`fnptr == &target`, nothing else) with a hit block
-holding the direct call; results merge through a block argument and every arm of an
-invoke gets the unwind destination.
+`instance = Virtual(trait_method, idx)`. Candidates are what the vtables instantiated
+in this crate hold (`src/devirt.rs`, `index`, built once per crate): every `Unsize`
+coercion in the MIR of every mono item gives a `(Self, dyn Trait)` pair, and for each
+pair and each method of the trait and its supertraits the slot instance is
+`Instance::expect_resolve_for_vtable` — the function rustc fills vtables with — so impl
+methods (generic impls at their instantiations too), provided methods, closure bodies
+behind `dyn Fn*` and shims are all exactly the address a vtable holds. A candidate is
+usable when its fn ABI and lowered signature equal the virtual call's (thin-pointer
+receiver, same pass modes and layouts) and its symbol links from this CGU: defined
+here, `xcgu::home_linkable`, or upstream-linkable. Slot instances private to one CGU
+are added to `xcgu::promoted` (hidden-external home definition) so the crate's other
+CGUs can name them. Not seen: vtables built in other crates and vtables that exist
+only in constants; those calls take the indirect arm, which is always kept last.
+`Builder::devirt_call` emits one guard block per target (`fnptr == &target`, nothing
+else) with a hit block holding the direct call; results merge through a block argument
+and every arm of an invoke gets the unwind destination.
 Which candidates get a guard: without a profile, all of them if there are at most
 `PLIRON_DEVIRT_MAX` (2), else none. In a profile build (`PLIRON_PGO` or
-`PLIRON_PGO_USE`) the first `PLIRON_DEVIRT_PROF_MAX` (8) by symbol name, identically
+`PLIRON_PGO_USE`) the first `PLIRON_DEVIRT_PROF_MAX` (16) by symbol name, identically
 in both builds so the CFG fingerprints agree; the hit blocks' counters are the value
 profile, and `pliron_ir_opt::devirt::prune` (right after `pgo::load`) keeps at most
 `PLIRON_DEVIRT_MAX` arms with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the
 site's calls, hottest first, moves the dropped counts to the fallback block and turns
-a site that never ran back into the plain indirect call.
-Measured (release dylib): `tests/devirt/main.rs` prints the same with and without the
-knob, at O0, with 8 CGUs and through the profile loop (shares as expected, e.g.
-`kept 2 of 3 arms (shares 40% 20% 40%)`). rust-html-rewriter and rust-protobuf:
-instructions 1.000-1.001 blind, 1.001 for pgo+devirt vs pgo; 8196/1804 functions
-matched, 0 stale, with the knob on both builds. Neither program runs an eligible
-site: their sites are `fmt::Write::write_str`, `log::Log` and regex `Strategy`, all
-with zero calls in the profile; the hot `dyn` calls go to generic impls or to traits
-with more than 64 impls (`Iterator`). `bench/heldout/run.py --pgo-gen-env K=V`
-passes a knob to the instrumented build.
-Not done: speculative targets are not xcgu copy candidates (virtual calls are absent
-from `items_of_instance`), so a target in another CGU is called directly but not
-inlined. `tests/devirt/main.rs` is not wired into `test.sh`.
+a site that never ran back into the plain indirect call. An arm whose target is an
+xcgu copy made only because of the profile is always dropped (its guard would compare
+the copy's address, which no vtable from the instrumented run held).
+Remarks (`devirt`): per site the guarded targets with `N instantiated, K usable
+(reasons)`, `profile: kept N of M arms (shares ..)` with `L`/`X` for a target body in
+this CGU or elsewhere, and `profile: unguarded calls N (reason)` for rejected sites.
+Measured (release dylib, profile loop with the knob on both builds, 2026-11-13):
+rust-html-rewriter guards 130 sites, 23 ran (202k calls), 13 keep an arm (all at 100%,
+12 of them with the body in the same CGU); pgo+devirt vs pgo: instructions 0.994-0.997,
+cycles and time within noise (0.986/1.001 over two runs); LLVM's ICP on the same
+program: instructions 0.995, cycles 0.99. 8195 functions matched, 1 stale (an xcgu
+copy whose chain is computed in another CGU). Calls still indirect there: 215k at 11
+sites calling vtables built in the upstream crate, 126k at one site in the upstream
+crate calling closures of the downstream crate, 68k at 29 `FnOnce` sites whose slot
+is a per-CGU `VTable` shim. rust-protobuf guards 135 sites; 3 ran (2.6k calls), no
+measurable change (instructions 1.002). `tests/devirt/main.rs` prints the same with
+and without the knob, at O0, with 8 CGUs and through the profile loop.
+Not done: cross-crate candidates (needs the upstream crate's vtable list; LLVM's
+non-LTO ICP has the same limit); xcgu copies of hot targets (a copy has its own
+address, so the guard would need an alias of the home symbol to compare against; one
+kept arm on html-rewriter would gain); devirtualizing through `VTable` shims;
+`tests/devirt/main.rs` is not wired into `test.sh`.
 
 ## 6. Shared panic tails
 
@@ -142,3 +156,20 @@ repro goes 94 -> 55 instructions (LLVM: 57), and pulldown-cmark
 56.57M -> 55.17M (x1.248 -> x1.217). Eight programs (macOS, 5 rounds):
 all correct; instructions 0.9957 with both (pulldown-cmark 0.981,
 blake3-scalar 0.990, rust-html-rewriter 1.005).
+
+Second item, `scanners.rs` (x1.65 LLVM's instructions; `scan_while`,
+`scan_ch`: `data.iter().take_while(f).count()`): ten instructions an
+iteration against six. Three causes, each fixed behind a knob:
+- the exit test stayed `(base + idx + 1) != (base + len)` after the
+  pointer was re-expressed as `base + idx`: `PLIRON_CMPCANCEL=1` (new
+  pass `cmpcancel`) cancels common addends of `icmp eq/ne`, leaving
+  `idx + 1 != len` on the loop's own counter;
+- the egraph's remat of `x + k` cloned the counter's step onto the exit
+  edge, keeping the old counter alive past its step, so the header
+  param could not share its register and every trip paid `mov` + `b`:
+  `PLIRON_REMAT_CARRIED=0` skips remat of a value its block passes on
+  as a branch argument;
+- `PLIRON_LATEGVN=1`: one more dominator GVN after the last sinks.
+Repro loop: 10 -> 6 instructions per iteration (LLVM's shape).
+pulldown-cmark, exact, cumulative with the first item:
+56.57M -> 53.78M (x1.248 -> x1.187 of LLVM).
