@@ -724,6 +724,9 @@ struct JobShared {
     shed: bool,
     /// See `Pipe::const_tables`.
     const_tables: FxHashMap<u32, Arc<[u8]>>,
+    /// `PLIRON_FASTCC=1`: `run_job` stops after the CLIF pipeline; the
+    /// Cranelift compile runs callee-first in [`fastcc_compile`].
+    fastcc: bool,
 }
 
 /// One queued function job: the declaration index (phase (C) re-orders
@@ -1079,6 +1082,21 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         }
         return;
     }
+    if sh.fastcc {
+        // `PLIRON_FASTCC`: park the optimized CLIF; `fastcc_compile`
+        // compiles it once its callees' clobber sets are known.
+        j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
+        clctx.clear();
+        return;
+    }
+    compile_job(j, clctx, sh);
+}
+
+/// The Cranelift half of [`run_job`]: compile `clctx.func` (the job's
+/// optimized CLIF) and store the code in `j`.
+fn compile_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
+    let n = j.name.as_str();
+    let tron = pliron_cfg::tracing_on();
     // Panics inside Cranelift (verifier, egraph, regalloc asserts)
     // bypass the Err path below — catch and rethrow so the message
     // carries the function name and final CLIF for reproduction.
@@ -1233,6 +1251,173 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     // func — drop them like `clear_context` did so the next job's
     // compile doesn't verify against a stale cfg.
     clctx.clear();
+}
+
+/// `PLIRON_FASTCC=1`: a private calling convention for local functions,
+/// as per-callee clobber sets (interprocedural register allocation).
+///
+/// Rust's ABI is unspecified, so a direct call that can only reach one
+/// body compiled in this object need not assume the platform's whole
+/// caller-saved set destroyed — only what that body (and everything it
+/// calls) really writes. Phase (B) ran only the CLIF pipeline
+/// (`JobShared::fastcc`); this is the second phase, serial on the CGU's
+/// thread (other CGUs keep compiling in parallel on theirs):
+///
+/// 1. Build the direct call graph of the CGU from the final CLIF
+///    (`call`/`try_call`/`return_call` to a function with a job here).
+/// 2. Compile strongly connected components callee-first (Tarjan emits
+///    them in that order; roots and successors are walked in declaration
+///    order, so the result does not depend on scheduling).
+/// 3. After each compile take the set of registers the machine code may
+///    write (`cranelift_codegen::pliron_fastcc_end`, computed from the
+///    regalloc result in `VCode::pliron_written_regs`) and *record* it if
+///    the function is in `ok` (internal linkage, address not taken, not
+///    variadic) and not part of a cycle (recursion gets no reduced set).
+/// 4. Before each compile install the recorded sets of the function's
+///    direct callees (`pliron_fastcc_begin`); the aarch64 call lowering
+///    *consumes* them, intersecting a plain direct `call`'s ABI clobber
+///    set with the callee's set (never for `try_call`).
+///
+/// Soundness: the caller's assumption only shrinks to a superset of what
+/// the bound body destroys. A callee without a recorded set (other CGU,
+/// import, cycle member, not yet compiled, tail-calling body) keeps the
+/// full ABI set, and a recorded set already contains the clobbers of every
+/// call its body makes, so the property is transitive. Compile order
+/// therefore affects only how many sets are available, never correctness.
+fn fastcc_compile(jobs: &mut [FnJob], ok: &FxHashSet<u32>, name: &str) {
+    let t0 = std::time::Instant::now();
+    let n = jobs.len();
+    let idx: FxHashMap<u32, usize> =
+        jobs.iter().enumerate().map(|(i, j)| (j.id.as_u32(), i)).collect();
+    // Direct callees with a job in this CGU, per job, sorted and deduped.
+    let succ: Vec<Vec<usize>> = jobs
+        .iter()
+        .map(|j| {
+            let f = &j.func;
+            let mut out: Vec<usize> = Vec::new();
+            for b in f.layout.blocks() {
+                for inst in f.layout.block_insts(b) {
+                    let fr = match f.dfg.insts[inst] {
+                        ir::InstructionData::Call { func_ref, .. }
+                        | ir::InstructionData::TryCall { func_ref, .. } => func_ref,
+                        _ => continue,
+                    };
+                    let ir::ExternalName::User(nr) = f.dfg.ext_funcs[fr].name else {
+                        continue;
+                    };
+                    let Some(un) = f.params.user_named_funcs().get(nr) else {
+                        continue;
+                    };
+                    if un.namespace == 0
+                        && let Some(&c) = idx.get(&un.index)
+                    {
+                        out.push(c);
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+    // Iterative Tarjan: SCCs come out callee-first.
+    const UNSEEN: usize = usize::MAX;
+    let mut num = vec![UNSEEN; n];
+    let mut low = vec![0usize; n];
+    let mut on = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0usize;
+    for root in 0..n {
+        if num[root] != UNSEEN {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        num[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = work.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if num[w] == UNSEEN {
+                    num[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(num[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(p, _)) = work.last() {
+                    low[p] = low[p].min(low[v]);
+                }
+                if low[v] == num[v] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on[w] = false;
+                        scc.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    scc.sort_unstable();
+                    sccs.push(scc);
+                }
+            }
+        }
+    }
+    // Leaves the thread's FASTCC state clear even if a compile panics:
+    // a stale table must never meet another CGU's function ids.
+    struct End;
+    impl Drop for End {
+        fn drop(&mut self) {
+            let _ = cranelift_codegen::pliron_fastcc_end();
+        }
+    }
+    let mut sets: FxHashMap<u32, cranelift_codegen::PlironRegSet> = FxHashMap::default();
+    let mut wcl = cranelift_codegen::Context::new();
+    for scc in &sccs {
+        let cyclic = scc.len() > 1 || succ[scc[0]].contains(&scc[0]);
+        for &i in scc {
+            let callees: Vec<((u32, u32), cranelift_codegen::PlironRegSet)> = succ[i]
+                .iter()
+                .filter_map(|&c| {
+                    let id = jobs[c].id.as_u32();
+                    sets.get(&id).map(|&s| ((0, id), s))
+                })
+                .collect();
+            let j = &mut jobs[i];
+            let sh = j.sh.clone();
+            CUR_FN.with(|c| c.borrow_mut().clone_from(&j.name));
+            wcl.func = std::mem::replace(&mut j.func, ir::Function::new());
+            cranelift_codegen::pliron_fastcc_begin(callees);
+            let end = End;
+            compile_job(j, &mut wcl, &sh);
+            std::mem::forget(end);
+            let written = cranelift_codegen::pliron_fastcc_end();
+            let id = j.id.as_u32();
+            if let Some(w) = written
+                && !cyclic
+                && j.code.is_some()
+                && ok.contains(&id)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::fastcc", "{}: writes {} regs", j.name, w.len());
+                }
+                sets.insert(id, w);
+            }
+        }
+    }
+    if pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::fastcc", "{name}: {} of {n} fns have a clobber set, {} sccs", sets.len(), sccs.len());
+    }
+    pliron_cfg::trace("*fastcc*", t0.elapsed().as_secs_f64() * 1e3, name);
 }
 
 /// Phase (B) over the jobs `produce` lowers (each emitted with its
@@ -1637,6 +1822,36 @@ pub fn lower_module<'a>(
     // `PLIRON_LOWERFREE`: everything below phase (A) that reads `ctx` or a
     // job's CLIF body is `-g`-only.
     let free_ctx = lowerfree() && st.dbg.is_none();
+    // `PLIRON_FASTCC=1` (opt-in, aarch64): per-callee clobber sets, see
+    // [`fastcc_compile`]. Off under hot reload (calls go through
+    // patchable thunks) and in instrumented PGO builds.
+    let fastcc = crate::env_is("PLIRON_FASTCC", "1")
+        && matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_))
+        && !hot
+        && !crate::env_set("PLIRON_HOT")
+        && !crate::env_set("PLIRON_PGO");
+    // Callees that may get a reduced set: defined here with internal
+    // linkage (every direct call binds to the body compiled in this
+    // object), address never taken, not variadic.
+    let fastcc_ok: FxHashSet<u32> = if fastcc {
+        let taken = address_taken(ctx, st);
+        st.funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && !taken.contains(n.as_str())
+                    && !matches!(classify(ctx, f.ty), TyK::Func(_, _, true))
+                    && !st.dead_fns.contains(n.as_str())
+            })
+            .filter_map(|(n, _)| match ids.get(n.as_str()) {
+                Some(Sym::F(id, _)) => Some(id.as_u32()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
     // Read-only job inputs, owned so `FnJob`s are `'static` and can ride
     // the process-wide pool.
     let shared = Arc::new(JobShared {
@@ -1656,6 +1871,7 @@ pub fn lower_module<'a>(
         wasm: false,
         shed: free_ctx,
         const_tables: const_tables(ctx, st, &ids),
+        fastcc,
     });
     // `PLIRON_DEFERDEAD` (`=0` disables): emit-only `xcgu` copies (`dead_unopt`: no
     // caller `direct_callee` or `address_taken` can see) lower last, and
@@ -1999,7 +2215,11 @@ pub fn lower_module<'a>(
             tracing::info!(target: "pliron::stats", "lowerfree {name}: pliron Context released after phase (A)");
         }
     }
-    let jobs = finish_jobs(pending, name, None);
+    let mut jobs = finish_jobs(pending, name, None);
+    if fastcc {
+        fastcc_compile(&mut jobs, &fastcc_ok, name);
+    }
+    let jobs = jobs;
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
@@ -2769,6 +2989,7 @@ pub fn lower_clif_wasm(
         wasm: true,
         shed: free_ctx,
         const_tables: FxHashMap::default(),
+        fastcc: false,
     });
     let mut scratch = FlScratch::default();
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
