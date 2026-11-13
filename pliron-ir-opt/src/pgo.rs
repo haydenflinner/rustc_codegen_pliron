@@ -614,6 +614,47 @@ pub fn parse(b: &[u8]) -> Option<FxHashMap<(u64, u64), ProfFn>> {
 // load(): profile -> State
 // ---------------------------------------------------------------------------
 
+/// What a consumer outside the IR passes needs from the profile: the
+/// hot count and each symbol's entry count (the largest, when a symbol
+/// has several fingerprints).
+pub struct Summary {
+    pub hot: u64,
+    pub entry: FxHashMap<u64, u64>,
+}
+
+/// The summary of `PLIRON_PGO_USE`'s profile, read once per process.
+pub fn summary() -> Option<&'static Summary> {
+    static S: std::sync::OnceLock<Option<Summary>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let path = crate::env_get("PLIRON_PGO_USE")?;
+        let profiles = parse(&std::fs::read(path).ok()?)?;
+        let mut counts: Vec<u64> =
+            profiles.iter().flat_map(|(_, f)| f.blocks.iter().copied()).filter(|&c| c > 0).collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let total: u128 = counts.iter().map(|&c| c as u128).sum();
+        let (mut acc, mut hot) = (0u128, u64::MAX);
+        for &c in &counts {
+            acc += c as u128;
+            if acc * 100 >= total * 99 {
+                hot = c.max(2);
+                break;
+            }
+        }
+        let mut entry: FxHashMap<u64, u64> = FxHashMap::default();
+        for ((sh, _), f) in &profiles {
+            let e = entry.entry(*sh).or_default();
+            *e = (*e).max(f.blocks.first().copied().unwrap_or(0));
+        }
+        Some(Summary { hot, entry })
+    })
+    .as_ref()
+}
+
+/// Whether the profile saw `sym` entered at least as often as its hot count.
+pub fn hot_symbol(sym: &str) -> bool {
+    summary().is_some_and(|s| s.entry.get(&sym_hash(sym)).is_some_and(|&c| c >= s.hot))
+}
+
 /// Read a `.prof` file and populate `st.prof`, `st.prof_bidx`,
 /// `st.prof_edges`. Seeds `st.expect` on strongly biased cond_brs
 /// (>=4:1 with >=8 samples). Returns the number of matched functions.

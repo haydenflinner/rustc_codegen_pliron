@@ -69,7 +69,22 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     // copyable at any size; they inline wherever they land, so a copy
     // costs IR-opt time, not code. memchr's `search_slice_with_raw` kept
     // pulldown's 7-statement `scan_nextline` from reaching its callers.
-    tcx.size_estimate(inst) <= limit
+    // `PLIRON_PGO_XCGU=<size>` (opt-in, with `PLIRON_PGO_USE`): a callee
+    // the profile saw entered at least as often as its hot count is
+    // copyable up to `<size>`. The default limit keeps copies small
+    // because most are speculative; a hot callee is where the calls are,
+    // and without its body here `PLIRON_PGO_HOT` has nothing to inline
+    // (LLVM's thin-local LTO imports hot callees at 10x its limit).
+    let size = tcx.size_estimate(inst);
+    if size > limit && limit != usize::MAX {
+        static HOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let hot_size =
+            *HOT.get_or_init(|| crate::env_get("PLIRON_PGO_XCGU").and_then(|s| s.parse().ok()).unwrap_or(0));
+        if size <= hot_size && pliron_ir_opt::pgo::hot_symbol(tcx.symbol_name(inst).name) {
+            return true;
+        }
+    }
+    size <= limit
         || (crate::env_is("PLIRON_XCGU_ALWAYS", "1")
             && matches!(
                 a.inline,
