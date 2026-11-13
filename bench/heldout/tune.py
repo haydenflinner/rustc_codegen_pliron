@@ -53,6 +53,12 @@ SPACE = [
     ("PLIRON_RA2_POSTOPT", ["15"]),
     ("PLIRON_PGO_EXPECT", ["0"]),
     ("PLIRON_PGO_LOOP", ["0"]),
+    # Deeper / larger cross-CGU copies: iterator `fold` chains (73 MIR
+    # statements, nine mono items deep) only inline with these; regex
+    # and rust-html-rewriter run fewer instructions, rust-protobuf more.
+    ("PLIRON_XCGU_DEPTH", ["16"]),
+    ("PLIRON_XCGU_SIZE", ["120"]),
+    ("PLIRON_EDGEKNOWN", ["1"]),
 ]
 
 

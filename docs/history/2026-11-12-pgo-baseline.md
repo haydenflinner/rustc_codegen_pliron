@@ -351,3 +351,26 @@ compares with zero, or `isub`/`bxor` of the values it compares): repro
 measurable (instructions 1.001), nor does `PLIRON_INBOUNDSNN=1`
 (non-null from in-bounds offsets, instructions 1.002) or both. The
 hot test in the real function is not this one; still open.
+
+**rust-html-rewriter: a lowercase loop LLVM vectorizes and we call.**
+`<[u8]>::to_ascii_lowercase` is `iter().map().collect()`; in isolation
+we vectorize it too. In the program the `Map::fold` instance lives in
+another CGU and stays a call (1.6% of cycles in a scalar loop that
+stores the length through a pointer every iteration). The cross-CGU
+copier refuses it twice over: `slice::Iter::fold` is 73 MIR statements
+(limit 50), and the chain down to `SetLenOnDrop::drop` is nine mono
+items deep (`PLIRON_XCGU_DEPTH` default 8). Eight programs, 9 rounds:
+
+| setting | time | instructions | per program instructions |
+|---|---|---|---|
+| `XCGU_DEPTH=16` | 1.000 | 1.001 | html-rewriter 0.991 |
+| `+ XCGU_SIZE=80` | 1.010 | 1.005 | html-rewriter 0.989, protobuf 1.028 |
+| `+ XCGU_SIZE=120` | 1.004 | 0.999 | regex 0.977, html-rewriter 0.986, protobuf 1.022 |
+
+Program-dependent, so not a default: more bodies help where a
+vectorizable loop is behind the call and hurt where the inliner then
+spends its budget badly (rust-protobuf). Added to `tune.py`'s search
+space instead.
+
+Gate: passed on a01e55a (101 jobs). Fuzz: 600 seeds with
+`MEMFAST_SMALL=loop`, 400 with `EDGEKNOWN=1`, all pass.
