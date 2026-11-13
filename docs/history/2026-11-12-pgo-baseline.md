@@ -520,3 +520,23 @@ geomean 1.006; rust-html-rewriter 0.966, rust-protobuf 0.965,
 rust-compression 0.988, rust-json 1.072, pulldown-cmark 1.045, regex
 1.018. Build time 32 s against 30 s for the eight. Program-dependent
 again: `tune.py` now tries it (and `INLINE_COLDONCE`).
+
+Fourth tuner run (new defaults, confirmation rule, extended space),
+ratio to plain LLVM:
+
+| program | pliron | bundle | tuned | LLVM+profile | setting |
+|---|---|---|---|---|---|
+| rust-json | 1.02 | 0.94 | **0.91** | 0.90 | `INLINE_COLDONCE=1 PGO_COLDSITE=0` |
+| rust-protobuf | 0.96 | 0.96 | **0.94** | 0.86 | `PGO_HOT=0` |
+| rust-html-rewriter | 1.14 | 1.07 | **0.98** | 0.83 | `-Ccodegen-units=1 PGO_EXPECT=0` |
+| pulldown-cmark | 1.09 | 1.04 | **1.01** | 0.89 | `PGO_HOT=0 RA2_POSTOPT=15` |
+| blake3-scalar | 1.05 | 1.06 | — | 0.97 | bundle |
+| blind-sig | 1.05 | 1.06 | — | 1.08 | bundle |
+| rust-compression | 1.11 | 1.12 | 1.09 | 0.99 | `PGO_COLDSITE=0` |
+| regex | 1.19 | 1.18 | — | 0.97 | bundle |
+
+Geomean of the per-program best: ~1.025x plain LLVM (bundle alone
+~1.05x in this run). Three programs at or under LLVM. Each pick won
+two independent measurements, but it is still a search over ~20
+settings per program on one input: read as "what the knobs can reach",
+not as a default.
