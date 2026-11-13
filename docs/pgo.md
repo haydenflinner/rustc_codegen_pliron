@@ -208,6 +208,7 @@ generate/run/use loop).
 | env | effect |
 | --- | --- |
 | `PLIRON_PGO=<dir>` | instrument build; profile written to `<dir>/pliron-<pid>.prof` (or `$PLIRON_PROFILE_FILE`) |
+| `PLIRON_PGO_OPT=1` | optimize the instrumented build too (default: it is built unoptimized — the counters sit on the pre-optimization CFG, the profile is the same, the build is about a third faster and the profiling run about 2x slower) |
 | `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |
 | `PLIRON_PGO_COUNTERS=block` | block counters only (edge counters are additive); default is block+edge |
 | `PLIRON_PGO_ATOMIC=1` | `atomicrmw` counter ops instead of load/add/store (races lose counts by default, same as LLVM) |

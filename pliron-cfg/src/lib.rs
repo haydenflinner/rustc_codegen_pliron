@@ -782,7 +782,14 @@ fn parse_fn_sel(spec: &str) -> Option<(bool, FnSel)> {
 // r[impl par.cfg.opt-fns]
 pub fn fn_opt_selected(name: &str) -> bool {
     static SEL: LazyLock<Option<(bool, FnSel)>> = LazyLock::new(|| {
-        let spec = env_get("PLIRON_OPT_FNS")?;
+        // An instrumented build (`PLIRON_PGO`) only has to count: its
+        // counters sit on the pre-optimization CFG, so optimizing it buys
+        // nothing but a faster profiling run, and costs a third of its
+        // build time. `PLIRON_PGO_OPT=1` optimizes it anyway (a long
+        // profiling workload).
+        let spec = env_get("PLIRON_OPT_FNS").or_else(|| {
+            (env_get("PLIRON_PGO").is_some() && !env_is("PLIRON_PGO_OPT", "1")).then_some("0..0")
+        })?;
         Some(
             parse_fn_sel(spec)
                 .unwrap_or_else(|| panic!("PLIRON_OPT_FNS: bad selector `{spec}`")),
