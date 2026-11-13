@@ -1067,6 +1067,20 @@ std::thread_local! {
     static PLIRON_LAST_FRAME: core::cell::Cell<[u32; 5]> = const { core::cell::Cell::new([0; 5]) };
 }
 
+std::thread_local! {
+    /// PLIRON: the layout score of the function compiled last on this
+    /// thread (`VCode::emit` under `PLIRON_LAYOUT_STATS`/`PLIRON_REMARKS`):
+    /// entry count, taken jumps, taken branches, block executions, floor,
+    /// backward jumps, backward branches.
+    pub(crate) static PLIRON_LAST_LAYOUT: core::cell::Cell<Option<[f64; 7]>> = const { core::cell::Cell::new(None) };
+}
+
+/// PLIRON: take the layout score of the function compiled last on this
+/// thread, if it had profile counts.
+pub fn pliron_last_layout() -> Option<[f64; 7]> {
+    PLIRON_LAST_LAYOUT.with(|c| c.take())
+}
+
 /// PLIRON: the frame of the last function this thread compiled:
 /// `[stack slots, spill slots, clobber saves, outgoing args, fixed
 /// storage (slots + spills, aligned)]` in bytes.

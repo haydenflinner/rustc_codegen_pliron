@@ -1132,6 +1132,11 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 // `PLIRON_REMARKS`: the frame's regions, so a tool can tell
                 // regalloc spill traffic from explicit-slot traffic by
                 // `[sp, #off]` (bench/heldout/asmvs.py).
+                if pliron_cfg::remarks_on()
+                    && let Some([e, j, br, bl, fl, bj, bb]) = cranelift_codegen::pliron_last_layout()
+                {
+                    pliron_cfg::remark!("layout", n, "order"; "entries={e:.0} jumps={j:.0} branches={br:.0} blocks={bl:.0} floor={fl:.0} backjumps={bj:.0} backbranches={bb:.0}");
+                }
                 if pliron_cfg::remarks_on() {
                     let [slots, spills, clobber, out, fixed] = cranelift_codegen::pliron_last_frame();
                     pliron_cfg::remark!("frame", n, "layout"; "slots={slots} spills={spills} clobber={clobber} outgoing={out} fixed={fixed}");
@@ -7819,7 +7824,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // `PLIRON_MEMFAST_SMALL=1`: every runtime-size copy;
                     // `=hot`: only where the profile's count for this
                     // block reaches its hot count.
-                    let small = match crate::env_get("PLIRON_MEMFAST_SMALL").as_deref() {
+                    let small = match pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot") {
                         Some("1") => true,
                         Some("hot") => op
                             .deref(self.ctx)

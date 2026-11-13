@@ -536,6 +536,19 @@ pub fn env_get(var: &str) -> Option<&'static str> {
     config().get(var)
 }
 
+/// A profile-use knob's value: what the environment says, else `bundle`
+/// when a profile is in use (`PLIRON_PGO_USE`) and the bundle is not
+/// switched off (`PLIRON_PGO_BUNDLE=0`). The bundle is the set of
+/// consumers that measurably pay on the held-out programs
+/// (docs/pgo.md): hot-call-site inlining, hot callees copied across
+/// codegen units, small inline copies at hot sites, measured block
+/// placement.
+pub fn pgo_knob(var: &str, bundle: &'static str) -> Option<&'static str> {
+    env_get(var).or_else(|| {
+        (env_get("PLIRON_PGO_USE").is_some() && !env_is("PLIRON_PGO_BUNDLE", "0")).then_some(bundle)
+    })
+}
+
 /// `PLIRON_TRACE_FILE=<path>`: append one timing line per pipeline step (and per
 /// `*pipeline*`/`*compile*` CGU summary) the moment it is measured, so a
 /// watcher can read live progress instead of waiting for the process to

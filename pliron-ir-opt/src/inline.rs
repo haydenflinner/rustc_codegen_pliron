@@ -1409,7 +1409,7 @@ pub fn run(
     };
     let pgo_inline = !crate::env_is("PLIRON_PGO_INLINE", "0");
     let pgo_hot: usize = if pgo_inline {
-        crate::env_get("PLIRON_PGO_HOT").and_then(|s| s.parse().ok()).unwrap_or(0)
+        pliron_cfg::pgo_knob("PLIRON_PGO_HOT", "13").and_then(|s| s.parse().ok()).unwrap_or(0)
     } else {
         0
     };

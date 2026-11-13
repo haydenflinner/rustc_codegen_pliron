@@ -176,6 +176,33 @@ differs is how counts leave the guest:
   exists), so a wasm-side flush function can be added later for
   long-running guests that want periodic snapshotted profiles.
 
+## The profile bundle
+
+With `PLIRON_PGO_USE` set, these are on unless `PLIRON_PGO_BUNDLE=0`
+(each also has its own knob, which wins):
+
+| knob | bundle value | what |
+| --- | --- | --- |
+| `PLIRON_PGO_HOT` | 13 | a call site whose count reaches the profile's hot count (the blocks carrying 99% of all counts, LLVM's `ProfileSummary` rule) gets 13x the inline limit and skips `loopy`/`fanin`/growth |
+| `PLIRON_PGO_XCGU` | 4000 | a callee entered at least hot-count times is copyable across codegen units up to 4000 MIR statements (default limit 50), so the hot inliner has its body |
+| `PLIRON_XCGU_CAP` | 100000 | no per-CGU bound on copies |
+| `PLIRON_MEMFAST_SMALL` | hot | runtime-size copies in hot blocks handle sizes below 16 bytes inline |
+| `PLIRON_PGO_FREQ` | 1 | block placement uses measured edge probabilities (bit 2, spill weights, measured worse and stays off) |
+
+Measured with `bench/heldout/run.py --pgo` (2026-11-12, 7 rounds):
+pliron-pgo/pliron 0.974 [0.952, 0.995] over eight programs —
+pulldown-cmark 0.885, rust-html-rewriter 0.942, the rest within noise
+of 1. LLVM's own profile: 0.938. `docs/history/2026-11-12-pgo-baseline.md`
+has the path there, including what LLVM's profile buys (block
+placement first, memcpy size specialization second).
+
+Tools: `bench/heldout/ab.py` (cached A/B with retired instructions and
+cycles; LLVM sides take extra flags, so its passes can be ablated),
+`PLIRON_LAYOUT_STATS=1` + `harness/layout_score.py` (expected taken
+jumps and branches of the emitted order under the measured
+frequencies), `harness/pgofuzz.py` (differential fuzz of the whole
+generate/run/use loop).
+
 ## Knobs
 
 | env | effect |
@@ -185,6 +212,8 @@ differs is how counts leave the guest:
 | `PLIRON_PGO_COUNTERS=block` | block counters only (edge counters are additive); default is block+edge |
 | `PLIRON_PGO_ATOMIC=1` | `atomicrmw` counter ops instead of load/add/store (races lose counts by default, same as LLVM) |
 | `PLIRON_PGO_LOOP=0` | the CLIF loop passes ignore the profile (ablation) |
+| `PLIRON_PGO_EXPECT=0` / `PLIRON_PGO_INLINE=0` / `PLIRON_PGO_COLD=0` | ablations: no branch expectations from the profile / the inliner ignores call-site counts / zero-count blocks are not marked cold |
+| `PLIRON_PGO_BUNDLE=0` | the bundle above stays off |
 
 ## Non-goals (for now)
 

@@ -79,7 +79,7 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     if size > limit && limit != usize::MAX {
         static HOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let hot_size =
-            *HOT.get_or_init(|| crate::env_get("PLIRON_PGO_XCGU").and_then(|s| s.parse().ok()).unwrap_or(0));
+            *HOT.get_or_init(|| pliron_cfg::pgo_knob("PLIRON_PGO_XCGU", "4000").and_then(|s| s.parse().ok()).unwrap_or(0));
         if size <= hot_size && pliron_ir_opt::pgo::hot_symbol(tcx.symbol_name(inst).name) {
             return true;
         }
@@ -450,7 +450,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     // Copies exist to feed the cross-CGU inliner; more copies than the
     // CGU's own fns would double its IR-opt work for marginal picks.
     // `PLIRON_XCGU_CAP` overrides (absolute count; >=usize::MAX disables).
-    let cap = crate::env_get("PLIRON_XCGU_CAP")
+    let cap = pliron_cfg::pgo_knob("PLIRON_XCGU_CAP", "100000")
         .and_then(|s| s.parse().ok())
         .unwrap_or(ours.len());
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
@@ -609,7 +609,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     }
     // Same bound as the legacy path: copies never exceed the CGU's own
     // item count (`PLIRON_XCGU_CAP` overrides; 0 would take none).
-    let cap = crate::env_get("PLIRON_XCGU_CAP")
+    let cap = pliron_cfg::pgo_knob("PLIRON_XCGU_CAP", "100000")
         .and_then(|s| s.parse().ok())
         .unwrap_or(ours.len());
     let why = crate::env_get("PLIRON_STATS_XCGU");

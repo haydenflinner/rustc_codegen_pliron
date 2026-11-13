@@ -1381,8 +1381,13 @@ impl<I: VCodeInst> VCode<I> {
     /// allocator's spill weights (`which` is the caller's bit).
     fn pliron_prof_counts(&self, which: u8) -> Vec<Option<u64>> {
         static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        // Default 1 (placement) when a profile is in use, like the rest of
+        // the profile bundle (`pliron_cfg::pgo_knob`).
         let bits = *ON.get_or_init(|| {
-            std::env::var("PLIRON_PGO_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("PLIRON_PGO_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                (std::env::var_os("PLIRON_PGO_USE").is_some()
+                    && std::env::var("PLIRON_PGO_BUNDLE").as_deref() != Ok("0")) as u8
+            })
         });
         if bits & which == 0 {
             return Vec::new();
@@ -1765,7 +1770,9 @@ impl<I: VCodeInst> VCode<I> {
         // executions. Summed over a build they say how good a placement
         // is without a timing run (`harness/layout_score.py`).
         static LSTATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *LSTATS.get_or_init(|| std::env::var_os("PLIRON_LAYOUT_STATS").is_some())
+        if *LSTATS.get_or_init(|| {
+            std::env::var_os("PLIRON_LAYOUT_STATS").is_some() || std::env::var_os("PLIRON_REMARKS").is_some()
+        })
             && let Some(ec) = self.block_order.prof_count(self.entry).filter(|&c| c > 0)
         {
             let nb = self.num_blocks();
@@ -1792,10 +1799,14 @@ impl<I: VCodeInst> VCode<I> {
                 super::placement::score(self.entry.index(), &succs, &cold, &unlikely, &empty, &order)
             }) {
                 let e = ec as f64;
-                std::eprintln!(
+                super::abi::PLIRON_LAST_LAYOUT
+                    .with(|c| c.set(Some([e, j * e, br * e, bl * e, fl * e, bj * e, bb * e])));
+                if std::env::var_os("PLIRON_LAYOUT_STATS").is_some() {
+                    std::eprintln!(
                     "layout: entries {ec} jumps {:.0} branches {:.0} blocks {:.0} floor {:.0} backjumps {:.0} backbranches {:.0}",
                     j * e, br * e, bl * e, fl * e, bj * e, bb * e
                 );
+                }
             }
         }
 
