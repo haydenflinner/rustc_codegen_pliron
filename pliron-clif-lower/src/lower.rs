@@ -7833,6 +7833,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .and_then(|b| crate::pgo::block_count(self.st, b))
                             .zip(self.st.prof_hot)
                             .is_some_and(|(c, h)| c >= h),
+                        // `=warm`: every block the profile saw run (a
+                        // block without a count is treated as run): the
+                        // speed of `=1` without growing code that never
+                        // executes.
+                        Some("warm") => op
+                            .deref(self.ctx)
+                            .get_parent_block()
+                            .and_then(|b| crate::pgo::block_count(self.st, b))
+                            .is_none_or(|c| c > 0),
                         _ => false,
                     };
                     self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2], small);
