@@ -51,6 +51,8 @@ mod machinst;
 // PLIRON: frame breakdown of the last compiled function (debug aid).
 pub use crate::machinst::pliron_last_frame;
 pub use crate::machinst::pliron_last_layout;
+// PLIRON: FASTCC per-callee clobber sets (`machinst/abi.rs`).
+pub use crate::machinst::{PlironRegSet, pliron_fastcc_begin, pliron_fastcc_end};
 /// PLIRON: regalloc2 decision logging for the next allocations on this thread.
 pub use regalloc2::set_explain as ra_set_explain;
 /// PLIRON: block placement (`machinst/placement.rs`), exported for the

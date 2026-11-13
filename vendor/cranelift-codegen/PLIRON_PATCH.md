@@ -1902,3 +1902,15 @@ stops below the innermost enclosing call loop. Hoisted, the value is
 live across the call for the whole loop and takes a callee-saved
 register or a spill slot with a reload per iteration. `call_loops` is
 built under this knob as well as under `PLIRON_REMATCALL`.
+
+## `PLIRON_FASTCC=1` (opt-in): per-callee call clobber sets
+
+`src/machinst/abi.rs` (`PlironRegSet`, `pliron_fastcc_begin`/`_end`, the
+thread-local callee table and recorded set; re-exported from `lib.rs`),
+`src/machinst/vcode.rs` (`VCode::pliron_written_regs`, called from
+`emit` next to `compute_clobbers_and_function_calls` while recording),
+`src/isa/aarch64/lower/isle.rs` (`gen_call_info`): a direct `call` to a
+callee whose written-register set the embedder installed gets
+`ABI clobbers ∩ (callee set ∪ {x16, x17, x30, x9 if a stack return})`
+as its clobber set. Never for `try_call` or patchable calls. Nothing
+changes unless the embedder calls `pliron_fastcc_begin` on the thread.

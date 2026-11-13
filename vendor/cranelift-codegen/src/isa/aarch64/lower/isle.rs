@@ -639,10 +639,48 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             .abi_mut()
             .accumulate_outgoing_args_size(stack_ret_space + stack_arg_space);
 
-        Box::new(
-            self.lower_ctx
-                .gen_call_info(sig, dest, uses, defs, try_call_info, patchable),
-        )
+        let mut info = self
+            .lower_ctx
+            .gen_call_info(sig, dest, uses, defs, try_call_info, patchable);
+        // PLIRON: FASTCC (`PLIRON_FASTCC=1`; scheme in `machinst/abi.rs`).
+        // A direct call to a local callee whose machine code is already
+        // known destroys only what that code writes: narrow the ABI
+        // clobber set to the callee's recorded set. Not for `try_call`
+        // (the unwind edge resumes with ABI-clobbered state) and not for
+        // patchable calls (the target can change).
+        if info.try_call_info.is_none() && !info.patchable {
+            if let ExternalName::User(name_ref) = &info.dest {
+                let callee = self
+                    .lower_ctx
+                    .f
+                    .params
+                    .user_named_funcs()
+                    .get(*name_ref)
+                    .and_then(|n| crate::machinst::pliron_fastcc_callee(n.namespace, n.index));
+                if let Some(mut keep) = callee {
+                    // What the call sequence itself writes regardless of
+                    // the callee's body: the IP scratch registers
+                    // (prologue/epilogue and emitter temporaries, linker
+                    // veneers and branch islands), the link register
+                    // (`bl`), and the temporary that moves stack-carried
+                    // return values into spill slots after the call.
+                    keep.add(crate::isa::aarch64::inst::regs::xreg_preg(16));
+                    keep.add(crate::isa::aarch64::inst::regs::xreg_preg(17));
+                    keep.add(crate::isa::aarch64::inst::regs::xreg_preg(30));
+                    let any_stack_ret = info.defs.iter().any(|d| {
+                        matches!(d.location, crate::machinst::abi::RetLocation::Stack(..))
+                    });
+                    if any_stack_ret {
+                        let temp = <AArch64MachineDeps as crate::machinst::abi::ABIMachineSpec>::retval_temp_reg(info.callee_conv);
+                        keep.add(PReg::from(temp.to_reg().to_real_reg().unwrap()));
+                    }
+                    // Intersection: registers outside the ABI set stay
+                    // callee-preserved, return registers stay removed.
+                    info.clobbers.intersect_from(keep);
+                }
+            }
+        }
+        Box::new(info)
     }
 
     fn gen_call_ind_info(

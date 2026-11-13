@@ -1651,6 +1651,49 @@ impl<I: VCodeInst> VCode<I> {
         (clobbered_regs, function_calls)
     }
 
+    /// PLIRON: FASTCC (see `machinst/abi.rs`) — every register this
+    /// function's machine code may write, from the regalloc result: move
+    /// destinations, def allocations, and each instruction's clobber set.
+    /// Unlike `compute_clobbers_and_function_calls` this includes the
+    /// clobbers of same-ABI calls (no `is_included_in_clobbers` filter),
+    /// which is what makes the set transitive over callees. Registers the
+    /// emitter writes without telling regalloc (scratch registers, the
+    /// link register, prologue/epilogue temporaries) are not here: the
+    /// backend that consumes the set adds them back at the call site.
+    /// `None` when the function contains a tail call — the tail callee
+    /// runs in this function's place and its writes are not known here.
+    fn pliron_written_regs(&self, regalloc: &regalloc2::Output) -> Option<PRegSet> {
+        let mut written = PRegSet::default();
+        for (_, Edit::Move { to, .. }) in &regalloc.edits {
+            if let Some(preg) = to.as_reg() {
+                written.add(preg);
+            }
+        }
+        for (i, range) in self.operand_ranges.iter() {
+            if self.insts[i].call_type() == CallType::TailCall {
+                return None;
+            }
+            let operands = &self.operands[range.clone()];
+            let allocs = &regalloc.allocs[range];
+            for (operand, alloc) in operands.iter().zip(allocs.iter()) {
+                if operand.kind() == OperandKind::Def {
+                    if let Some(preg) = alloc.as_reg() {
+                        written.add(preg);
+                    }
+                    // A fixed def names its register even if the
+                    // allocation were ever reported differently.
+                    if let OperandConstraint::FixedReg(preg) = operand.constraint() {
+                        written.add(preg);
+                    }
+                }
+            }
+            if let Some(&inst_clobbered) = self.clobbers.get(&InsnIndex::new(i)) {
+                written.union_from(inst_clobbered);
+            }
+        }
+        Some(written)
+    }
+
     /// Emit the instructions to a `MachBuffer`, containing fixed-up
     /// code and external reloc/trap/etc. records ready for use. Takes
     /// the regalloc results as well.
@@ -1881,6 +1924,10 @@ impl<I: VCodeInst> VCode<I> {
         // relatively cheap.
         let ti = std::time::Instant::now();
         let (clobbers, function_calls) = self.compute_clobbers_and_function_calls(regalloc);
+        // PLIRON: FASTCC — record what this function may write.
+        if crate::machinst::pliron_fastcc_recording() {
+            crate::machinst::pliron_fastcc_record(self.pliron_written_regs(regalloc));
+        }
         self.abi.compute_frame_layout(
             &self.sigs,
             regalloc.num_spillslots,

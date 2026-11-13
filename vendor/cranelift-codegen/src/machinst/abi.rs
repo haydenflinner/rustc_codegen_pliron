@@ -1088,6 +1088,81 @@ pub fn pliron_last_frame() -> [u32; 5] {
     PLIRON_LAST_FRAME.with(|c| c.get())
 }
 
+// PLIRON: FASTCC (`PLIRON_FASTCC=1`, set up by `pliron-clif-lower`) — a
+// private calling convention for local functions, as per-callee clobber
+// sets ("interprocedural register allocation").
+//
+// Recorded: after regalloc, `VCode::emit` computes the set of registers the
+// function's machine code may write (`VCode::pliron_written_regs`: every def
+// allocation, every regalloc move destination, and the clobber set of every
+// instruction including its calls — so the set is transitive: a call to a
+// callee with a reduced set contributes that reduced set, any other call the
+// ABI's full caller-saved set). A function with a tail call records nothing.
+// The embedder takes it with `pliron_fastcc_end`.
+//
+// Consumed: before compiling a caller the embedder installs the sets of the
+// already-compiled callees it may bind to (`pliron_fastcc_begin`, keyed by
+// `UserExternalName`); the aarch64 lowering of a direct, non-`try_call`,
+// non-patchable `call` intersects the call's ABI clobber set with the
+// callee's set (`lower/isle.rs::gen_call_info`), adding back the registers
+// the call sequence itself writes. The feature only ever shrinks what the
+// caller assumes destroyed, so a recorded set must be a superset of what the
+// callee destroys; registers the ABI makes the callee preserve are untouched
+// (they are not in the ABI clobber set to begin with).
+std::thread_local! {
+    static PLIRON_FASTCC_CALLEES: core::cell::RefCell<Option<crate::FxHashMap<(u32, u32), PRegSet>>> =
+        const { core::cell::RefCell::new(None) };
+    static PLIRON_FASTCC_WRITTEN: core::cell::Cell<Option<PRegSet>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// PLIRON: an opaque set of machine registers a compiled function may
+/// write (FASTCC, see the comment above).
+#[derive(Clone, Copy, Debug)]
+pub struct PlironRegSet(PRegSet);
+
+impl PlironRegSet {
+    /// Number of registers in the set (diagnostics).
+    pub fn len(&self) -> u32 {
+        self.0.len()
+    }
+}
+
+/// PLIRON: FASTCC — start recording on this thread: the next function
+/// compiled here may bind its direct calls to `callees`
+/// (`(namespace, index)` of the callee's `UserExternalName` and that
+/// callee's recorded set) and has its own written-register set recorded.
+/// Pair with [`pliron_fastcc_end`].
+pub fn pliron_fastcc_begin(callees: impl IntoIterator<Item = ((u32, u32), PlironRegSet)>) {
+    let map = callees.into_iter().map(|(k, v)| (k, v.0)).collect();
+    PLIRON_FASTCC_CALLEES.with(|c| *c.borrow_mut() = Some(map));
+    PLIRON_FASTCC_WRITTEN.with(|c| c.set(None));
+}
+
+/// PLIRON: FASTCC — stop recording on this thread and take the set of the
+/// function compiled since [`pliron_fastcc_begin`]. `None`: nothing was
+/// compiled, or the function has no usable set (it contains a tail call).
+pub fn pliron_fastcc_end() -> Option<PlironRegSet> {
+    PLIRON_FASTCC_CALLEES.with(|c| *c.borrow_mut() = None);
+    PLIRON_FASTCC_WRITTEN.with(|c| c.take()).map(PlironRegSet)
+}
+
+/// PLIRON: FASTCC — whether this thread is between `begin` and `end`.
+pub(crate) fn pliron_fastcc_recording() -> bool {
+    PLIRON_FASTCC_CALLEES.with(|c| c.borrow().is_some())
+}
+
+/// PLIRON: FASTCC — `VCode::emit` hands over the compiled function's set.
+pub(crate) fn pliron_fastcc_record(set: Option<PRegSet>) {
+    PLIRON_FASTCC_WRITTEN.with(|c| c.set(set));
+}
+
+/// PLIRON: FASTCC — the recorded set of callee `(namespace, index)`, if
+/// the embedder installed one for the function being compiled.
+pub(crate) fn pliron_fastcc_callee(namespace: u32, index: u32) -> Option<PRegSet> {
+    PLIRON_FASTCC_CALLEES.with(|c| c.borrow().as_ref()?.get(&(namespace, index)).copied())
+}
+
 /// Structure describing the layout of a function's stack frame.
 #[derive(Clone, Debug, Default)]
 pub struct FrameLayout {
