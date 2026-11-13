@@ -147,6 +147,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   over ~15k real functions, per-step time table, no rustc. The fastest
   loop for pass compile-time work; the live dashboard shows the same
   per-step times against a baseline on every save.
+- `harness/headstart.py record --heldout PROG [--pliron]` (or `-- cargo
+  build ...`) — a cargo build's schedule: per rustc, when interfaces
+  were checked, metadata written, code generated; the critical path;
+  and the same build replayed under early-metadata pipelining
+  (`docs/headstart.md`, a prediction).
 - `PLIRON_TIMING=1` — per-CGU per-step wall time for one real compile.
   `-Zself-profile` records `pliron_*` activities next to rustc's.
 - `harness/prof.py -- rustc ...` (or `-p PID`, `-a FILE`) — wraps
