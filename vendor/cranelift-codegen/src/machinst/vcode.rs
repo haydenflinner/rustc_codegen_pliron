@@ -1376,9 +1376,15 @@ impl<I: VCodeInst> VCode<I> {
     /// PLIRON (`PLIRON_PGO_FREQ=1`, opt-in): the profile count of every
     /// block, for `placement::with_counts`; empty when the knob is off or
     /// the function carries no counts.
-    fn pliron_prof_counts(&self) -> Vec<Option<u64>> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_PGO_FREQ").as_deref() == Ok("1")) {
+    ///
+    /// The knob is a bit set: 1 = block placement, 2 = the register
+    /// allocator's spill weights (`which` is the caller's bit).
+    fn pliron_prof_counts(&self, which: u8) -> Vec<Option<u64>> {
+        static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let bits = *ON.get_or_init(|| {
+            std::env::var("PLIRON_PGO_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if bits & which == 0 {
             return Vec::new();
         }
         let v: Vec<Option<u64>> =
@@ -1439,7 +1445,7 @@ impl<I: VCodeInst> VCode<I> {
         let unlikely: Vec<Vec<bool>> = (0..nb)
             .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
             .collect();
-        let counts = self.pliron_prof_counts();
+        let counts = self.pliron_prof_counts(2);
         if let Some(freq) = super::placement::with_counts(counts, || {
             super::placement::frequencies(self.entry.index(), &succs, &cold, &unlikely)
         }) {
@@ -1740,7 +1746,7 @@ impl<I: VCodeInst> VCode<I> {
             let unlikely: Vec<Vec<bool>> = (0..nb)
                 .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
                 .collect();
-            let counts = self.pliron_prof_counts();
+            let counts = self.pliron_prof_counts(1);
             if let Some((order, heads)) = super::placement::with_counts(counts, || {
                 super::placement::place(self.entry.index(), &succs, &cold, &empty, &unlikely)
             }) {
@@ -1751,6 +1757,47 @@ impl<I: VCodeInst> VCode<I> {
             }
         }
         final_order.extend(cold_blocks.clone());
+
+        // `PLIRON_LAYOUT_STATS=1`: score this order against the profile
+        // (always the measured counts, whatever `PLIRON_PGO_FREQ` says):
+        // one `layout:` line per profiled function with its entry count
+        // and the expected taken jumps, taken branches and block
+        // executions. Summed over a build they say how good a placement
+        // is without a timing run (`harness/layout_score.py`).
+        static LSTATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LSTATS.get_or_init(|| std::env::var_os("PLIRON_LAYOUT_STATS").is_some())
+            && let Some(ec) = self.block_order.prof_count(self.entry).filter(|&c| c > 0)
+        {
+            let nb = self.num_blocks();
+            let succs: Vec<Vec<usize>> = (0..nb)
+                .map(|b| self.block_succs(BlockIndex::new(b)).iter().map(|s| s.index()).filter(|&s| s < nb).collect())
+                .collect();
+            let cold: Vec<bool> = (0..nb).map(|b| self.block_order.is_cold(BlockIndex::new(b))).collect();
+            let empty: Vec<bool> = (0..nb)
+                .map(|b| {
+                    let r = self.block_ranges.get(b);
+                    r.len() == 1
+                        && ra_edits_per_block[b] == 0
+                        && succs[b].len() == 1
+                        && self.insts[r.start].is_term() == MachTerminator::Branch
+                })
+                .collect();
+            let unlikely: Vec<Vec<bool>> = (0..nb)
+                .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
+                .collect();
+            let counts: Vec<Option<u64>> =
+                (0..nb).map(|b| self.block_order.prof_count(BlockIndex::new(b))).collect();
+            let order: Vec<usize> = final_order.iter().map(|b| b.index()).collect();
+            if let Some((j, br, bl, fl, bj, bb)) = super::placement::with_counts(counts, || {
+                super::placement::score(self.entry.index(), &succs, &cold, &unlikely, &empty, &order)
+            }) {
+                let e = ec as f64;
+                std::eprintln!(
+                    "layout: entries {ec} jumps {:.0} branches {:.0} blocks {:.0} floor {:.0} backjumps {:.0} backbranches {:.0}",
+                    j * e, br * e, bl * e, fl * e, bj * e, bb * e
+                );
+            }
+        }
 
         // PLIRON: mark blocks that are targets of backward edges in the
         // final emission order — loop headers — so their first instruction

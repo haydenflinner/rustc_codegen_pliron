@@ -92,6 +92,87 @@ pub fn frequencies(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: 
     analyze(entry, succs, cold, unlikely).map(|a| a.freq)
 }
 
+/// Score an emission order: the expected number of taken unconditional
+/// jumps, taken conditional branches and block executions per entry of
+/// the function, under `analyze`'s frequencies (measured ones inside
+/// `with_counts`). `order` lists every block that is emitted; `empty[b]`
+/// blocks emit nothing and are looked through. `None` where `analyze`
+/// gives up. For `PLIRON_LAYOUT_STATS`.
+pub fn score(
+    entry: usize,
+    succs: &[Vec<usize>],
+    cold: &[bool],
+    unlikely: &[Vec<bool>],
+    empty: &[bool],
+    order: &[usize],
+) -> Option<(f64, f64, f64, f64, f64, f64)> {
+    let a = analyze(entry, succs, cold, unlikely)?;
+    let n = succs.len();
+    let res = |mut b: usize| {
+        for _ in 0..8 {
+            if !empty[b] {
+                break;
+            }
+            b = succs[b][0];
+        }
+        b
+    };
+    // The block emitted right after each block, empties skipped.
+    let mut next = vec![usize::MAX; n];
+    let mut prev: Option<usize> = None;
+    for &b in order {
+        if empty[b] {
+            continue;
+        }
+        if let Some(p) = prev {
+            next[p] = b;
+        }
+        prev = Some(b);
+    }
+    let (mut jumps, mut branches, mut blocks) = (0.0, 0.0, 0.0);
+    // Of those, the ones that go backward in the order (loop back edges).
+    let (mut back_jumps, mut back_branches) = (0.0, 0.0);
+    let mut pos = vec![usize::MAX; n];
+    for (i, &b) in order.iter().enumerate() {
+        pos[b] = i;
+    }
+    // What no order can avoid: every block's mass that does not go to its
+    // likeliest successor (each block has one fallthrough slot at best).
+    let mut floor = 0.0;
+    for b in 0..n {
+        if empty[b] || a.freq[b] <= 0.0 {
+            continue;
+        }
+        blocks += a.freq[b];
+        if !succs[b].is_empty() {
+            let best = a.prob[b].iter().cloned().fold(0.0, f64::max);
+            floor += a.freq[b] * (1.0 - best);
+        }
+        for (k, &s0) in succs[b].iter().enumerate() {
+            let w = a.freq[b] * a.prob[b][k];
+            if res(s0) != next[b] {
+                let back = pos[res(s0)] <= pos[b];
+                if succs[b].len() == 1 {
+                    jumps += w;
+                    if back {
+                        back_jumps += w;
+                    }
+                } else {
+                    branches += w;
+                    if back {
+                        back_branches += w;
+                    }
+                }
+            }
+        }
+        // A two-way branch neither of whose targets follows costs a
+        // conditional branch and then a jump on the not-taken side; the
+        // loop above counted both edges as taken branches, which is the
+        // same number of redirects.
+    }
+    Some((jumps, branches, blocks, floor, back_jumps, back_branches))
+}
+
 std::thread_local! {
     /// PLIRON (`PLIRON_PGO_FREQ=1`): profile counts per block for the
     /// `analyze` call in progress (`with_counts`). A thread-local so the

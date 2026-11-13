@@ -1123,6 +1123,12 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         let msg = match &defr {
             Ok(Err(e)) => format!("{e}"),
             Ok(_) => {
+                // `PLIRON_LAYOUT_STATS`: name the function whose `layout:`
+                // line the emitter just printed (pair them up under
+                // `PLIRON_PAR=0`).
+                if crate::env_set("PLIRON_LAYOUT_STATS") {
+                    eprintln!("layoutfn: {n}");
+                }
                 // `PLIRON_REMARKS`: the frame's regions, so a tool can tell
                 // regalloc spill traffic from explicit-slot traffic by
                 // `[sp, #off]` (bench/heldout/asmvs.py).
