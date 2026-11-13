@@ -106,3 +106,62 @@ rejected call sites on pulldown-cmark are "no body in this CGU"
 our cross-unit copies skip large callees), and one unit for everything
 is not the answer (pulldown-cmark at `-Ccodegen-units=1` is 1.29x even
 without a profile — itself worth a look).
+
+## Late night: ab.py, what LLVM's profile buys, first real gain
+
+`bench/heldout/ab.py PROG SIDE...` (new): cached builds, interleaved
+runs under `/usr/bin/time -l`, and per side the timed region plus the
+process's retired instructions, cycles and IPC. Instructions repeat to
+~0.01%, so one run answers what wall-clock needs intervals for; LLVM
+sides take extra RUSTFLAGS (`llvm-pgo:-Cllvm-args=...`), so LLVM's own
+passes can be ablated the same way. `--prof` adds inclusive and self
+per-function cycle deltas.
+
+pulldown-cmark, whole process, ratios to plain LLVM:
+
+| build | instructions | cycles |
+|---|---|---|
+| LLVM + profile | 0.905 | 0.86-0.91 |
+| ... `-disable-block-placement` | 0.924 | 0.98-1.03 |
+| ... `-disable-memop-opt` | 0.927 | 0.914 |
+| ... `-disable-icp` | 0.908 | 0.884 |
+| ... hot-callsite thresholds at default | 0.911 | 0.895 |
+| LLVM, `-inline-threshold=3000` (no profile) | 0.943 | 0.956 |
+| LLVM, `-disable-block-placement` (no profile) | 1.007 | 1.03 |
+| pliron | 1.196 | 1.07-1.10 |
+| pliron, `PLIRON_PLACE=0` | 1.20 | +0.4% on pliron |
+
+So LLVM's profile gain is, in order: profile-guided block placement
+(~12% of cycles; 3% without a profile), memcpy size specialization
+(~6%), inlining and the rest. We execute 5-20% more instructions than
+LLVM on every program (mostly register moves: +7 points of the
+instruction mix on shared hot functions), at higher IPC.
+
+Built since:
+
+- `PLIRON_MEMFAST_SMALL=1|hot`: runtime-size copies below 16 bytes are
+  inline (8/4-byte overlapping pairs, 3 byte moves for 1..3). At `=1`:
+  pulldown-cmark instructions -2.5%, cycles -3.5%; rust-html-rewriter
+  -0.7% / -1.6%.
+- `PLIRON_PGO_XCGU=<size>`: a callee whose profiled entry count
+  reaches the hot count is copyable across codegen units up to
+  `<size>` MIR statements (default limit 50). 1,970 of the inliner's
+  rejections on pulldown-cmark were "no body in this CGU".
+
+`run.py --pgo --pgo-env PLIRON_PGO_HOT=13 --pgo-env
+PLIRON_PGO_XCGU=4000 --pgo-env PLIRON_XCGU_CAP=100000`, 7 rounds:
+
+| | ratio | interval |
+|---|---|---|
+| pliron-pgo / pliron | 0.975 | [0.965, 0.987] |
+| pliron-pgo / llvm | 1.061 | [1.052, 1.083] |
+| llvm-pgo / llvm | 0.930 | [0.915, 0.950] |
+| pliron-pgo / llvm-pgo | 1.141 | [1.127, 1.167] |
+
+pulldown-cmark 0.936, rust-html-rewriter 0.958, rust-json 0.960;
+rust-protobuf 1.021 (worse). Loop cost 2.37x a plain LLVM build. On
+pulldown-cmark alone the instruction count falls 81.1M -> 74.8M.
+
+Still open: our block placement. `PLIRON_PLACE=0` costs ~1% and real
+counts (`PLIRON_PGO_FREQ=1`: 49% of blocks, 68% of branches measured at
+layout time) change the code but not the time.
