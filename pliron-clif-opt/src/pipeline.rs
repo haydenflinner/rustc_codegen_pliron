@@ -4396,6 +4396,14 @@ fn s_ivalign(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_bumpedge(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = bumpedge::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("bumpedge");
+    }
+    k
+}
+
 fn s_ivretro(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = ivretro::run(&mut p.clctx.func, an);
     if k > 0 {
@@ -5395,6 +5403,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // That GVN is also what shows a rotated loop's guard to be the
         // test the block's only predecessor just made.
         step("retest", "edgeknown", Gate::Env("PLIRON_RETEST"), s_retest).needs(shape::CONDBR),
+        // A cursor that a rotated loop's top block only steps is stepped
+        // on the edges instead, next to the load of the same pointer
+        // (post-index), so the block carries one cursor. After every
+        // sink: `edgesink` would push the edge's add onto a split edge.
+        step("bumpedge", "", Gate::Env("PLIRON_BUMPEDGE"), s_bumpedge).needs(shape::BPARAM),
         // A slot whose last store `dse3` deleted (after `slotmerge`)
         // still has its size, and the function a frame for it.
         step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),

@@ -117,6 +117,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   `harness/layout_score.py` score a profiled build's block layout.
   State of the profile work: `docs/pgo.md`,
   `docs/history/2026-11-12-pgo-baseline.md`.
+- `bench/heldout/irdiff.py PROG [--env K=V] [--tag T] [--fn S | --line
+  FILE:LINE] [--backend DYLIB]` — exact executed-instruction counts
+  (callgrind, aarch64-linux-musl in docker), ours against LLVM's, per
+  function and source line; all eight held-out programs run. `--tag`
+  gives our side its own build dir so several run at once (delete
+  `target/heldout/ir-pliron-<tag>` afterwards: ~0.5 GB each). The
+  function table is by innermost inlined function (DWARF), not by ELF
+  symbol.
 - `bench/heldout/asmvs.py [--only prog] [--fn F | --line FILE:LINE]` —
   our code next to LLVM's for a held-out program, keyed by source line
   (so inlining differences don't break the pairing) with every
@@ -345,13 +353,48 @@ time, memory, code size, stack frames) in ~20 min and writes
   `PLIRON_PUNROLL_MINTRIP` (default 4 average trips);
   `PLIRON_PEEL_MINTRIP` (default 0) is the same for peeling.
 - `PLIRON_LOOPROT_MERGE=1` (opt-in) — one latch for a loop with several
-  back edges so `looprot` can rotate it; mixed exact counts (see
+  back edges so `looprot` can rotate it. The repro
+  (`tests/parity/prog_loop.rs`) is at 11 instructions a skipped state
+  (LLVM 12) since `PLIRON_ELABKEEP`, `PLIRON_BUMPEDGE` and
+  `PLIRON_WM_WIDE`; exact counts are still mixed (html-rewriter -0.39M,
+  rust-json -0.17M, pulldown-cmark +0.78M, regex +0.25M, blind-sig
+  +0.29M): regalloc2 rotates registers at the merged latch (see
   `looprot::merge_latches`).
+- `PLIRON_LICM_INNERPRESS` (default `2`; `=1` the old rule, `=0` off),
+  `PLIRON_UNSWITCH_LOOP=0`, `PLIRON_LF_TRIVPHI=0`, `PLIRON_ELABKEEP=0`
+  (vendored elaborator), `PLIRON_BUMPEDGE=0`, `PLIRON_WM_WIDE=0`,
+  `PLIRON_PROBE_SP=0` (vendored aarch64 emitter) — the 2026-11-13
+  parity round (`docs/history/2026-11-13-six-features.md`, "Sixth
+  item"): pressure-aware hoisting of outer-loop loads, loop-only
+  unswitching, no single-value block params from `loadfwd`'s PRE,
+  elaboration keeps the pipeline's hoists, a cursor stepped on the
+  edges into the block that only steps it, `webmerge` keeps the wide
+  slot of an extended pair, and a stack-probe loop that moves `sp`
+  (valgrind).
 - `PLIRON_ALLOC_JMP=0`, `PLIRON_VEC_SHORT=0`, `PLIRON_SELXOR=0`,
   `PLIRON_LICM_DOMCOND=0` — off switches for the allocator shim as one
   jump (aarch64), `loopvec`'s short-trip dispatch, the zigzag select
   fold, and the dominated-branch fold ahead of LICM
   (`docs/history/2026-11-13-six-features.md`, "Fifth item").
+- `PLIRON_FASTCC=0` — off switch for per-callee clobber sets (aarch64
+  ELF/Mach-O, default on): a direct call to a function compiled in the
+  same object destroys only the registers that function's code writes
+  on a path that returns, so the caller keeps values in caller-saved
+  registers across it. `PLIRON_FASTCC_NORET=0` counts paths that never
+  return too, `PLIRON_FASTCC_HIDDEN=0` limits callees to internal
+  linkage. `PLIRON_TRACE=pliron::fastcc` prints one `fastcc-sites` line
+  per CGU (what happened to every direct call site); with `=debug` and
+  `PLIRON_FASTCC_NORET=0`, `harness/fastcc_check.py LOG OBJECTS...`
+  checks every recorded set against the disassembled code. Exact
+  counts: pulldown-cmark -0.55%, the other held-out programs unchanged
+  (`docs/history/2026-11-13-six-features.md`).
+- `PLIRON_PANICSTUB=0` — off switch for shared panic tails (default on,
+  native only): the cold `call f(..); trap` tails of one callee in a
+  function become one block (.text -0.15% on three held-out programs,
+  executed instructions unchanged). `PLIRON_PANICSTUB_STRIP=0` keeps
+  each site's `coldargs` wrapper, `PLIRON_PANICSTUB_FWD=0` keeps
+  forwarder blocks. Sites on different source lines stay apart when the
+  build has line tables.
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
   functions get 2x their callsite limit (the body dies when all sites
   inline, LLVM's last-callsite bonus generalised). Reaches

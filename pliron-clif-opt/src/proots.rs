@@ -807,16 +807,16 @@ pub fn paramize<'k>(
     skip: usize,
     hmap: &FxHashMap<u64, u32>,
     vmap: &FxHashMap<Value, u32>,
-    hmemo: &mut FxHashMap<*const Key, u64>,
+    hmemo: &mut KHash,
 ) -> Key {
     // A subtree equal to a sibling slot's whole key is that slot's
     // incoming value — `P(i)`. `hmap` is keyed on *hashes* because a
     // `FxHashMap<&Key, _>` lookup hashes `k` — an O(subtree) walk
     // repeated at every recursion level made paramize quadratic on
     // deep keys. `hmemo` gives per-node hashing in O(1) amortized
-    // (shared `Rc` subtrees hit the cache); a hash hit is verified
-    // with `==` before rewriting, so stale entries from recycled
-    // `Rc` addresses can only miss a match, never make a wrong one.
+    // (shared `Rc` subtrees hit the cache, which pins them so their
+    // addresses are not recycled); a hash hit is verified with `==`
+    // before rewriting.
     // `slotk` materializes sibling keys lazily — a hit is the only
     // point they're needed.
     let mut memo = FxHashMap::default();
@@ -844,7 +844,7 @@ fn paramize_r<'k>(
     skip: usize,
     hmap: &FxHashMap<u64, u32>,
     vmap: &FxHashMap<Value, u32>,
-    hmemo: &mut FxHashMap<*const Key, u64>,
+    hmemo: &mut KHash,
     memo: &mut FxHashMap<*const Key, Option<Key>>,
 ) -> Option<Key> {
     let inner = matches!(k, Key::A(..) | Key::N(..));
@@ -866,7 +866,7 @@ fn paramize_node<'k>(
     skip: usize,
     hmap: &FxHashMap<u64, u32>,
     vmap: &FxHashMap<Value, u32>,
-    hmemo: &mut FxHashMap<*const Key, u64>,
+    hmemo: &mut KHash,
     memo: &mut FxHashMap<*const Key, Option<Key>>,
 ) -> Option<Key> {
     if let Some(&i) = hmap.get(&khash_m(k, hmemo)) {
@@ -921,29 +921,72 @@ pub fn ohash(x: u64) -> u64 {
     h.finish()
 }
 
+/// Memo for [`khash_m`]: the hash of every node reached through an `Rc`
+/// (an `A`'s base, the elements of an `N`'s operand slice), by address,
+/// together with a clone of that `Rc`. The clone keeps the node
+/// allocated while the memo lives, so its address cannot be handed to
+/// another node. The first version keyed every `&Key` it was given,
+/// stack temporaries and keys built and dropped by `key_sub_h` included,
+/// and returned the hash of whatever had been at that address before: a
+/// stale hash only ever lost a match (every hit is confirmed with `==`),
+/// but which matches were lost depended on stack layout and allocator
+/// reuse, so the same source built with a different cargo profile
+/// optimized differently (`webmerge` kept the pointer instead of the
+/// counter in pulldown-cmark's scanners under `--profile fast`: +3%
+/// instructions against the release build of the same tree).
+#[derive(Default)]
+pub struct KHash {
+    map: FxHashMap<*const Key, u64>,
+    pin_a: Vec<std::rc::Rc<Key>>,
+    pin_n: Vec<std::rc::Rc<[Key]>>,
+    /// Operand slices already pinned, by first-element address.
+    slices: FxHashSet<*const Key>,
+}
+
 /// Memoized structural hash — `Rc`-shared subtrees hash once, so
 /// `paramize`'s per-node slot probe is O(nodes) total instead of
-/// O(nodes × depth). Keyed on node address; callers treat hits as
-/// candidates and confirm with `==`.
-pub fn khash_m(k: &Key, memo: &mut FxHashMap<*const Key, u64>) -> u64 {
+/// O(nodes × depth). The node passed in is hashed from its children's
+/// memoized hashes and is not itself remembered (it may be a
+/// temporary); callers treat equal hashes as candidates and confirm
+/// with `==`.
+pub fn khash_m(k: &Key, memo: &mut KHash) -> u64 {
     use std::hash::{Hash, Hasher};
-    if let Some(&h) = memo.get(&(k as *const Key)) {
-        return h;
-    }
     let mut h = rustc_hash::FxHasher::default();
     match k {
         Key::A(t, b, off) => {
             0u8.hash(&mut h);
             t.hash(&mut h);
-            khash_m(b, memo).hash(&mut h);
+            let p = std::rc::Rc::as_ptr(b);
+            let bh = match memo.map.get(&p) {
+                Some(&bh) => bh,
+                None => {
+                    let bh = khash_m(b, memo);
+                    memo.map.insert(p, bh);
+                    memo.pin_a.push(b.clone());
+                    bh
+                }
+            };
+            bh.hash(&mut h);
             off.hash(&mut h);
         }
         Key::N(op, t, args, extra) => {
             1u8.hash(&mut h);
             op.hash(&mut h);
             t.hash(&mut h);
+            if !args.is_empty() && memo.slices.insert(args.as_ptr()) {
+                memo.pin_n.push(args.clone());
+            }
             for a in args.iter() {
-                khash_m(a, memo).hash(&mut h);
+                let p = a as *const Key;
+                let ah = match memo.map.get(&p) {
+                    Some(&ah) => ah,
+                    None => {
+                        let ah = khash_m(a, memo);
+                        memo.map.insert(p, ah);
+                        ah
+                    }
+                };
+                ah.hash(&mut h);
             }
             extra.hash(&mut h);
         }
@@ -961,9 +1004,7 @@ pub fn khash_m(k: &Key, memo: &mut FxHashMap<*const Key, u64>) -> u64 {
             }
         }
     }
-    let h = h.finish();
-    memo.insert(k as *const Key, h);
-    h
+    h.finish()
 }
 
 /// Rewrite `V` leaves naming `ps` members through `rep` — under a
@@ -1091,7 +1132,7 @@ pub fn slope(k: &Key, i: u32) -> Option<i64> {
 /// *keys*, so congruent-but-distinct SSA names cancel too. `ty` types
 /// the zero/const results; `depth` bounds the rewrite recursion.
 pub fn key_sub(x: &Key, y: &Key, ty: cranelift_codegen::ir::Type, depth: u32) -> Option<Key> {
-    key_sub_h(x, y, ty, depth, &mut FxHashMap::default())
+    key_sub_h(x, y, ty, depth, &mut KHash::default())
 }
 
 /// `key_sub` with a shared `khash_m` memo: every structural `==` is
@@ -1103,9 +1144,9 @@ pub fn key_sub_h(
     y: &Key,
     ty: cranelift_codegen::ir::Type,
     depth: u32,
-    hm: &mut FxHashMap<*const Key, u64>,
+    hm: &mut KHash,
 ) -> Option<Key> {
-    let heq = |a: &Key, b: &Key, hm: &mut FxHashMap<*const Key, u64>| {
+    let heq = |a: &Key, b: &Key, hm: &mut KHash| {
         khash_m(a, hm) == khash_m(b, hm) && a == b
     };
     let k0 = || Some(Key::K(ty, 0));
@@ -1535,7 +1576,7 @@ mod tests {
                     let (h, n) = vhn(&func, &nf, &canon, &mut hnm, v);
                     assert_eq!(
                         h,
-                        khash_m(&k, &mut FxHashMap::default()),
+                        khash_m(&k, &mut KHash::default()),
                         "vhn hash drifted from key_of on {v}"
                     );
                     assert_eq!(n, nodes(&k), "vhn nodes drifted on {v}");
@@ -1575,7 +1616,7 @@ mod tests {
         for _ in 0..48 {
             k = Key::N(Opcode::Iadd, types::I64, std::rc::Rc::from(vec![k.clone(), k]), 0);
         }
-        let mut hmemo = FxHashMap::default();
+        let mut hmemo = KHash::default();
         let slot1 = Key::K(types::I64, 3);
         let slots = [leaf.clone(), slot1];
         let mut hmap = FxHashMap::default();
@@ -1594,5 +1635,31 @@ mod tests {
         }
         assert_eq!(depth, 48);
         assert_eq!(*d, Key::P(0));
+    }
+    /// One memo, several keys that occupy the same memory one after the
+    /// other: a stack temporary reused by a loop, and heap nodes that are
+    /// freed before the next one is built. Each must hash as it does with
+    /// a fresh memo (the address-keyed memo returned the first key's hash
+    /// for all of them, and which keys collided depended on the build).
+    #[test]
+    fn khash_m_ignores_recycled_addresses() {
+        let fresh = |k: &Key| khash_m(k, &mut KHash::default());
+        let mut memo = KHash::default();
+        for i in 0..8i64 {
+            let k = Key::K(types::I64, i);
+            assert_eq!(khash_m(std::hint::black_box(&k), &mut memo), fresh(&k), "stack temporary {i}");
+        }
+        for i in 0..8i64 {
+            let k = Key::N(
+                Opcode::Iadd,
+                types::I64,
+                std::rc::Rc::from(vec![Key::V(Value::from_u32(i as u32)), Key::K(types::I64, i)]),
+                0,
+            );
+            let k = Key::A(types::I64, std::rc::Rc::new(k), 8 + i);
+            assert_eq!(khash_m(&k, &mut memo), fresh(&k), "heap node {i}");
+            // Dropped here: without the memo's pins the next iteration's
+            // nodes may be allocated at the same addresses.
+        }
     }
 }

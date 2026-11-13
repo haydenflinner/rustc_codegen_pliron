@@ -3288,12 +3288,90 @@ fn pre(
             func.dfg.remove_block_param(v);
         }
     }
+    // Params that can only ever hold one value (`PLIRON_LF_TRIVPHI=0`
+    // off). Every merge a location is live into gets a param above, so a
+    // value loaded once ahead of a loop nest (LICM's hoist of a `&mut`
+    // field, read again in the outer body) came out as a web of params
+    // through every header and join of the nest, all fed by that one load
+    // or by each other. `sameargs2` dissolved the web much later; until
+    // then the inner loops carried the extra params, and the passes in
+    // between that match loop shapes (`taildup2`, `mergechain`, the late
+    // threading) refused them: regex's `Fsm::next_state` kept its varint
+    // loop's `select`s (`PLIRON_LICM_INNERPRESS=2`, +1.07M instructions).
+    // A live param whose arguments, followed through other new params,
+    // reach exactly one other value `V` is `V`: on every path into the
+    // block the first non-param argument met going backwards is `V`, so
+    // `V` dominates the block.
+    let mut trivial: FxHashMap<(Block, Loc), Value> = FxHashMap::default();
+    if crate::pass_enabled("PLIRON_LF_TRIVPHI") && !resolved.is_empty() {
+        // Leaf lattice per pair: none yet, one value, or many (`None`).
+        #[derive(Clone, Copy, PartialEq)]
+        enum Leaf {
+            Bot,
+            One(Value),
+            Many,
+        }
+        let join = |a: Leaf, b: Leaf| match (a, b) {
+            (Leaf::Bot, x) | (x, Leaf::Bot) => x,
+            (Leaf::One(x), Leaf::One(y)) if x == y => a,
+            _ => Leaf::Many,
+        };
+        let mut leaf: FxHashMap<(Block, Loc), Leaf> = FxHashMap::default();
+        let mut users: FxHashMap<(Block, Loc), Vec<(Block, Loc)>> = FxHashMap::default();
+        let mut work: Vec<(Block, Loc)> = Vec::new();
+        for (k, args) in &resolved {
+            if dead.contains(k) {
+                continue;
+            }
+            let own = pre.start.get(k).copied();
+            let mut l = Leaf::Bot;
+            for &(_, _, v) in args {
+                if Some(v) == own {
+                    continue;
+                }
+                match param_of.get(&v) {
+                    Some(d) => users.entry(*d).or_default().push(*k),
+                    None => l = join(l, Leaf::One(func.dfg.resolve_aliases(v))),
+                }
+            }
+            leaf.insert(*k, l);
+            work.push(*k);
+        }
+        // Each pair's leaf only climbs Bot -> One -> Many: at most two
+        // requeues per user edge.
+        while let Some(k) = work.pop() {
+            let l = leaf[&k];
+            if l == Leaf::Bot {
+                continue;
+            }
+            if let Some(us) = users.get(&k) {
+                for u in us {
+                    let old = leaf[u];
+                    let new = join(old, l);
+                    if new != old {
+                        leaf.insert(*u, new);
+                        work.push(*u);
+                    }
+                }
+            }
+        }
+        for (k, l) in &leaf {
+            if let Leaf::One(v) = *l {
+                trivial.insert(*k, v);
+            }
+        }
+        for (k, &v) in &trivial {
+            let p = pre.start[k];
+            func.dfg.remove_block_param(p);
+            func.dfg.change_to_alias(p, v);
+        }
+    }
     for (b, loc) in pre.pending.iter().copied() {
         // A pair that died during propagation had its param removed — its
         // resolved args (which can be dead pairs' own params, now
         // unattached) must not reach the edges (rustlantis seed 410:
         // dangling `v5971` in a block10 call arg).
-        if dead.contains(&(b, loc)) {
+        if dead.contains(&(b, loc)) || trivial.contains_key(&(b, loc)) {
             continue;
         }
         let Some(args) = resolved.get(&(b, loc)) else {

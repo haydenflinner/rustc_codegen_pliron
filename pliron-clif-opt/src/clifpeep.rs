@@ -4231,7 +4231,7 @@ impl WmCtx {
 /// only fires between keys sharing a subtree.
 fn subtree_hashes(
     k: &crate::proots::Key,
-    hm: &mut FxHashMap<*const crate::proots::Key, u64>,
+    hm: &mut crate::proots::KHash,
     seen: &mut FxHashSet<*const crate::proots::Key>,
     out: &mut FxHashSet<u64>,
 ) {
@@ -4336,6 +4336,7 @@ pub fn webmerge_ctx(
     let t0 = wmprof.then(std::time::Instant::now);
     let WmCtx { cfg, dom, edges, keep_count } = ctx;
     let keep_count = *keep_count;
+    let wide = crate::pass_enabled("PLIRON_WM_WIDE");
     // One edge-fact scan feeds both the web normal forms and the
     // canonical-class proots — nothing mutates between them.
     let facts = crate::proots::facts_cfg(func, cfg);
@@ -4577,7 +4578,7 @@ pub fn webmerge_ctx(
         // per-node key hashes (`Rc` sharing → O(1) amortized). Built
         // lazily: an `E×P` hash table is a real cost on megablocks and
         // `paramize` is its only consumer.
-        let hmemo: FxHashMap<*const Key, u64> = FxHashMap::default();
+        let hmemo = crate::proots::KHash::default();
         let hmaps: std::cell::OnceCell<Vec<FxHashMap<u64, u32>>> = std::cell::OnceCell::new();
         // Each cell carries the key's hash alongside — the scan
         // compares keys `O(slots × edges)` times and a failed
@@ -5153,6 +5154,47 @@ pub fn webmerge_ctx(
         // the pointer, which `bytescan` and `punroll` read (escape's
         // `position` over a byte table lost its 16-byte scan otherwise:
         // pulldown-cmark +4% instructions).
+        // A slot that is a narrower sibling extended (`p_j = uextend
+        // p_i`) is kept, and the narrow one becomes `ireduce p_j`
+        // (`PLIRON_WM_WIDE=0` off). Both hold: the reduction of an
+        // extension is the value. Dropping the wide slot leaves an
+        // extension at the head of the block — of a block param, which
+        // the backend cannot know to be extended already, so a `mov w,
+        // w` on every entry; `ireduce` is no instruction. regex's
+        // `follow_epsilons` carries its instruction pointer as `u32`
+        // and indexes with it: once the loop had one latch
+        // (`PLIRON_LOOPROT_MERGE`), the header received both forms from
+        // it, kept the `u32`, and re-extended it on each of 439k trips.
+        if wide {
+            for c in 0..cands.len() {
+                let (j, i) = match &cands[c].1 {
+                    crate::proots::Key::N(Opcode::Uextend | Opcode::Sextend, _, args, _) => match &args[..] {
+                        [crate::proots::Key::P(i)] => (cands[c].0, *i as usize),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                let (ti, tj) = (func.dfg.value_type(ps[i]), func.dfg.value_type(ps[j]));
+                if i == j
+                    || !ti.is_int()
+                    || !tj.is_int()
+                    || ti.bits() >= tj.bits()
+                    || pmap.contains_key(&ps[i])
+                    || cands.iter().any(|&(x, _)| x == i)
+                {
+                    continue;
+                }
+                cands[c] = (
+                    i,
+                    crate::proots::Key::N(
+                        Opcode::Ireduce,
+                        ti,
+                        std::rc::Rc::from(vec![crate::proots::Key::P(j as u32)]),
+                        crate::proots::tag::UNARY,
+                    ),
+                );
+            }
+        }
         if keep_count && cands.len() > 1 {
             cands.sort_by_key(|&(ix, _)| {
                 !(0..es.len()).any(|e| matches!(skey_of(e, ix), crate::proots::Key::K(..)))

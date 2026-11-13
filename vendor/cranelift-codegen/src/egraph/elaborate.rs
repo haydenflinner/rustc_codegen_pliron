@@ -46,6 +46,43 @@ pub(crate) fn elab_hot_on() -> bool {
     *ON.get_or_init(|| std::env::var("PLIRON_ELABHOT").as_deref() == Ok("1"))
 }
 
+/// PLIRON: `PLIRON_ELABKEEP` (default on; `=0` off) — elaboration does
+/// not move a pure instruction into a loop the incoming function had it
+/// outside of. See `Elaborator::keep_out_of_loop`.
+pub(crate) fn elab_keep_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP").as_deref() != Ok("0"))
+}
+
+/// PLIRON (`PLIRON_ELABKEEP`): the blocks that use a value in the
+/// function the egraph pass was given, up to three.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UseBlocks {
+    n: u8,
+    b: [u32; 3],
+}
+
+impl UseBlocks {
+    pub(crate) fn add(&mut self, block: Block) {
+        use cranelift_entity::EntityRef;
+        let x = block.index() as u32;
+        let n = self.n as usize;
+        if n > 3 || self.b[..n].contains(&x) {
+            return;
+        }
+        if n < 3 {
+            self.b[n] = x;
+        }
+        self.n += 1;
+    }
+
+    /// Known to have no use in loop `lp`.
+    fn none_in(&self, la: &LoopAnalysis, lp: Loop) -> bool {
+        use cranelift_entity::EntityRef;
+        self.n <= 3 && self.b[..self.n as usize].iter().all(|&x| !la.is_in_loop(Block::new(x as usize), lp))
+    }
+}
+
 /// PLIRON: `PLIRON_ELABLOOPS=2` (opt-in) — `=1`, pressure-aware: a cheap
 /// invariant is not hoisted out of a loop that contains a call. Hoisted,
 /// it is live across the whole loop, so across the call: it takes a
@@ -121,6 +158,10 @@ pub(crate) struct Elaborator<'a> {
     /// whose header has been visited, so `start_block` can rebuild
     /// `loop_stack` from a block's loop nest.
     loop_entries: FxHashMap<Loop, LoopStackEntry>,
+    /// PLIRON (`PLIRON_ELABKEEP`): where each pure instruction was
+    /// before the egraph pass removed it from the layout.
+    orig_block: &'a FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+    use_blocks: &'a SecondaryMap<Value, UseBlocks>,
     /// The current block into which we are elaborating.
     cur_block: Block,
     /// Values that opt rules have indicated should be rematerialized
@@ -224,6 +265,8 @@ impl<'a> Elaborator<'a> {
         domtree: &'a DominatorTree,
         loop_analysis: &'a LoopAnalysis,
         remat_values: &'a FxHashSet<Value>,
+        orig_block: &'a FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+        use_blocks: &'a SecondaryMap<Value, UseBlocks>,
         stats: &'a mut Stats,
         ctrl_plane: &'a mut ControlPlane,
     ) -> Self {
@@ -289,6 +332,8 @@ impl<'a> Elaborator<'a> {
             value_to_best_value,
             loop_stack: smallvec![],
             loop_entries: FxHashMap::default(),
+            orig_block,
+            use_blocks,
             cur_block: Block::reserved_value(),
             remat_values,
             elab_stack: vec![],
@@ -299,6 +344,67 @@ impl<'a> Elaborator<'a> {
             stats,
             ctrl_plane,
         }
+    }
+
+    /// PLIRON (`PLIRON_ELABKEEP`): the entry of the outermost loop that
+    /// holds `insert_block`, where elaboration is about to put `inst`,
+    /// but did not hold the block the incoming function had `inst` in.
+    ///
+    /// Elaboration places a pure value at its first use in the domtree
+    /// preorder and hoists it as far as `loop_stack` reaches. That stack
+    /// loses a loop's entry as soon as the preorder visits a block
+    /// outside the loop, and a loop's exit and cold blocks are domtree
+    /// children of loop blocks, so they often come before the rest of
+    /// the body: every body block visited after them places its
+    /// invariants at their use. The pipeline's LICM had put them ahead of
+    /// the loop; they came back inside it, once per using block, and
+    /// their operands stayed live around the loop instead (a rotated
+    /// loop's end pointer `base + len * 8`, recomputed in each latch with
+    /// `base` and `len` held in callee-saved registers across the call:
+    /// `tests/parity/prog_loop.rs`, why `PLIRON_LOOPROT_MERGE` lost).
+    /// `PLIRON_ELABLOOPS=1` restores every entry, which also hoists what
+    /// the pipeline deliberately left on a conditional path of a loop
+    /// (pulldown-cmark +2.4% instructions); this only refuses to undo a
+    /// hoist the pipeline made, and of those only the ones that cost no
+    /// register: an instruction with an operand the loop does not use
+    /// otherwise (`use_blocks`: the operand had no use inside the loop in
+    /// the incoming function). Placed in the loop, the instruction is
+    /// what keeps that operand alive through it; hoisted, its result
+    /// takes the operand's place. An instruction whose operands the
+    /// loop needs anyway (`b as u8` next to tests of `b`) adds a live
+    /// value instead, and keeping every hoist cost pulldown-cmark 1.3M
+    /// instructions (`parse_block`, +0.9M) for the 0.9M it gained in
+    /// `scan_list_marker`. Instructions the rewrite rules created have
+    /// no original block and are placed as before.
+    ///
+    /// The hoist block dominates `insert_block` (it is the immediate
+    /// dominator of a header of a loop that holds it) and its scope is
+    /// still open; an operand not in that loop is defined on the
+    /// dominator chain above the header, as for the stack's own hoists.
+    fn keep_out_of_loop(
+        loop_analysis: &LoopAnalysis,
+        orig_block: &FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+        use_blocks: &SecondaryMap<Value, UseBlocks>,
+        loop_entries: &FxHashMap<Loop, LoopStackEntry>,
+        inst: Inst,
+        insert_block: Block,
+        args: &[ElaboratedValue],
+    ) -> Option<LoopStackEntry> {
+        let (orig, ops) = orig_block.get(&inst)?;
+        let mut best = None;
+        let mut lp = loop_analysis.innermost_loop(insert_block);
+        while let Some(l) = lp {
+            if loop_analysis.is_in_loop(*orig, l)
+                || args.iter().any(|a| loop_analysis.is_in_loop(a.in_block, l))
+                || !ops.iter().any(|&x| use_blocks[x].none_in(loop_analysis, l))
+            {
+                break;
+            }
+            let Some(e) = loop_entries.get(&l) else { break };
+            best = Some(e.clone());
+            lp = loop_analysis.loop_parent(l);
+        }
+        best
     }
 
     fn start_block(&mut self, idom: Option<Block>, block: Block) {
@@ -374,7 +480,7 @@ impl<'a> Elaborator<'a> {
                     hoist_block: idom,
                     scope_depth: (self.value_to_elaborated_value.depth() - 1) as u32,
                 };
-                if elab_hot_on() {
+                if elab_hot_on() || elab_keep_on() {
                     self.loop_entries.insert(lp, e.clone());
                 }
                 self.loop_stack.push(e);
@@ -902,6 +1008,24 @@ impl<'a> Elaborator<'a> {
                         // insert in `data.hoist_block`.
                         let before = self.func.layout.last_inst(data.hoist_block).unwrap();
                         (data.scope_depth as usize, before, data.hoist_block)
+                    };
+
+                    // PLIRON_ELABKEEP: not deeper than the pipeline had it.
+                    let (scope_depth, before, insert_block) = match Self::keep_out_of_loop(
+                        self.loop_analysis,
+                        self.orig_block,
+                        self.use_blocks,
+                        &self.loop_entries,
+                        inst,
+                        insert_block,
+                        arg_values,
+                    ) {
+                        Some(e) => {
+                            self.stats.elaborate_licm_hoist += 1;
+                            let before = self.func.layout.last_inst(e.hoist_block).unwrap();
+                            (e.scope_depth as usize, before, e.hoist_block)
+                        }
+                        None => (scope_depth, before, insert_block),
                     };
 
                     trace!(

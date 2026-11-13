@@ -146,9 +146,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // (sym + n) - sym folds, so static-string copies get a constant size
     // and expand inline: json 1.118 -> 1.058, pulldown -0.9% (6 layouts).
     "PLIRON_SYMSUB",
-    // Outer-only loads stay out of nested-loop preheaders: geomean
-    // 0.997 / 0.998 in two layout-averaged runs (regex -0.8% both).
-    "PLIRON_LICM_INNERPRESS",
+    // (`PLIRON_LICM_INNERPRESS` is a valued default now: `DEFAULT_VALUES`.)
+    // Loop-only unswitching when the loop's closed region is too big to
+    // clone (docs/loop-unswitch-pressure.md section 3): regex's
+    // `next_state` tests `b == EOF` once instead of per `Bytes` state.
+    // Exact counts 2026-11-13: regex -0.29M, the other seven unchanged.
+    "PLIRON_UNSWITCH_LOOP",
     // Static branch hints for emission-time placement (Cranelift patch 98
     // reads PLIRON_PLACE itself, on by default; docs/codegen-plan.md
     // 2026-11-02/03): held-out 1.111 -> 1.104 with the check set.
@@ -226,6 +229,20 @@ pub const DEFAULT_ON: &[&str] = &[
     // 1.001 neutral, rust-compression 0.984; regex-syntax .text +64B.
     // `=0` off.
     "PLIRON_LOADFWD_SRCCOPY",
+    // Per-callee clobber sets (aarch64, not Windows): a direct call to a
+    // function compiled in the same object destroys only the registers
+    // that function's code writes on a path that returns
+    // (`pliron-clif-lower` `fastcc_compile`). Exact counts 2026-11-13:
+    // pulldown-cmark 52.82M -> 52.53M (-0.55%), the other five held-out
+    // programs within 0.01% (their hot calls leave the CGU or are
+    // `try_call`s); compile CPU and peak RSS unchanged. Validation:
+    // docs/history/2026-11-13-six-features.md. `=0` off.
+    "PLIRON_FASTCC",
+    // Cold `call f(..); trap` tails of one callee share one block per
+    // function (`panicstub`). A size change only: .text -0.15% on
+    // pulldown-cmark, regex and html-rewriter, executed instructions
+    // within +-0.05%. `=0` off.
+    "PLIRON_PANICSTUB",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
@@ -234,6 +251,16 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // Outer-only loads stay out of nested-loop preheaders (`1`: geomean
+    // 0.997 / 0.998 in two layout-averaged runs) unless every inner loop
+    // has register room for them (`2`, docs/loop-unswitch-pressure.md
+    // section 2). `2` lost 1.07M instructions on regex until `loadfwd`
+    // stopped threading the hoisted loads through the nest as block
+    // params (`PLIRON_LF_TRIVPHI`); with that, exact counts 2026-11-13:
+    // regex -1.21M (`next_state`'s decode loop keeps the `SparseSet`
+    // fields in registers), pulldown-cmark -0.18M, rust-protobuf and
+    // blind-sig -0.04M, the rest within 0.03M. `=1` restores, `=0` off.
+    ("PLIRON_LICM_INNERPRESS", "2"),
     // At most 8 CGUs past the start of stage A (2026-10-27-memory2.md).
     // Tuned on a 14-core Mac; `=0` disables the cap.
     ("PLIRON_CGU_ACAP", "8"),

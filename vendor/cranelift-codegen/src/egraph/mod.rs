@@ -1,6 +1,6 @@
 //! Support for egraphs represented in the DataFlowGraph.
 
-use crate::FxHashSet;
+use crate::{FxHashMap, FxHashSet};
 use crate::alias_analysis::{AliasAnalysis, LastStores, OptResult};
 use crate::branch_to_trap::BranchToTrapAnalysis;
 use crate::ctxhash::{CtxEq, CtxHash, NullCtx};
@@ -120,6 +120,14 @@ pub struct EgraphPass<'a> {
     /// Which Values do we want to rematerialize in each block where
     /// they're used?
     remat_values: FxHashSet<Value>,
+    /// PLIRON (`PLIRON_ELABKEEP`): the block each pure instruction was in
+    /// before it was taken out of the layout; see
+    /// `Elaborator::keep_out_of_loop`.
+    orig_block: FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+    /// PLIRON (`PLIRON_ELABKEEP`): where the incoming function used each
+    /// value.
+    use_blocks: SecondaryMap<Value, elaborate::UseBlocks>,
+    keep_on: bool,
     /// Stats collected while we run this pass.
     pub(crate) stats: Stats,
 }
@@ -800,6 +808,9 @@ impl<'a> EgraphPass<'a> {
             branch_to_trap_analysis: BranchToTrapAnalysis::default(),
             stats: Stats::default(),
             remat_values: FxHashSet::default(),
+            orig_block: FxHashMap::default(),
+            use_blocks: SecondaryMap::new(),
+            keep_on: false,
         }
     }
 
@@ -866,6 +877,19 @@ impl<'a> EgraphPass<'a> {
     /// Returns whether we may have modified the CFG (i.e. rewrote a
     /// terminator).
     fn remove_pure_and_optimize(&mut self) -> bool {
+        // PLIRON (`PLIRON_ELABKEEP`): the blocks in which the incoming
+        // function uses each value (up to three; more is "everywhere").
+        if elaborate::elab_keep_on() && self.loop_analysis.loops().next().is_some() {
+            for block in self.func.layout.blocks() {
+                for inst in self.func.layout.block_insts(block) {
+                    for v in self.func.dfg.inst_values(inst) {
+                        let v = self.func.dfg.resolve_aliases(v);
+                        self.use_blocks[v].add(block);
+                    }
+                }
+            }
+            self.keep_on = true;
+        }
         let mut cursor = FuncCursor::new(self.func);
 
         // Set to `true` if any skeleton simplification rewrites a terminator and
@@ -970,6 +994,26 @@ impl<'a> EgraphPass<'a> {
                     cursor.func.dfg.display_inst(inst),
                 );
 
+                // PLIRON_ELABKEEP: the operands as the pipeline wrote them
+                // (constants aside), before they become eclass values.
+                let mut kept_ops: SmallVec<[Value; 3]> = SmallVec::new();
+                if self.keep_on {
+                    for v in cursor.func.dfg.inst_values(inst) {
+                        let v = cursor.func.dfg.resolve_aliases(v);
+                        let is_const = cursor.func.dfg.value_def(v).inst().is_some_and(|d| {
+                            matches!(
+                                cursor.func.dfg.insts[d].opcode(),
+                                crate::ir::Opcode::Iconst
+                                    | crate::ir::Opcode::F32const
+                                    | crate::ir::Opcode::F64const
+                            )
+                        });
+                        if !is_const && kept_ops.len() < 3 {
+                            kept_ops.push(v);
+                        }
+                    }
+                }
+
                 // Rewrite args of *all* instructions using the
                 // value-to-opt-value map.
                 cursor.func.dfg.map_inst_values(inst, |arg| {
@@ -1012,6 +1056,10 @@ impl<'a> EgraphPass<'a> {
                 };
 
                 if is_pure_for_egraph(ctx.func, inst) {
+                    // PLIRON: remember where the pipeline had it.
+                    if !kept_ops.is_empty() {
+                        self.orig_block.insert(inst, (block, kept_ops));
+                    }
                     // Insert into GVN map and optimize any new nodes
                     // inserted (recursively performing this work for
                     // any nodes the optimization rules produce).
@@ -1256,6 +1304,8 @@ impl<'a> EgraphPass<'a> {
             &self.domtree,
             self.loop_analysis,
             &self.remat_values,
+            &self.orig_block,
+            &self.use_blocks,
             &mut self.stats,
             self.ctrl_plane,
         );

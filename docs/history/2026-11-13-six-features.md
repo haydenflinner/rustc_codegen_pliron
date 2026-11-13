@@ -224,7 +224,7 @@ Plain `call` only (`try_call` keeps its edge); sound without a noreturn fact. Th
 the call's debug line; the `&Location` argument is unaffected). (b) location tables not done: CLIF passes cannot declare data (only lowering's
 `write_data_addr`), and an 8-byte relocated entry per site costs more than the `adrp+add` it replaces.
 Expected gain is small: `bl`->`b` is size-neutral on aarch64 and `NORETURN_CALL` traps were already dropped; it saves per-site wrappers and
-duplicate constants. State: unit tests + `cargo check`; not run on real code, no corpus/fuzz/benchmark.
+duplicate constants. State: default on, see "Features 1, 2 and 6 on real programs" below.
 
 ## 2. Internal calling convention (FASTCC)
 
@@ -240,7 +240,8 @@ a direct, non-`try_call`, non-patchable call's ABI clobbers with the callee's se
 when a return value comes back on the stack). Callees without a set keep the full ABI set, so compile
 order affects only coverage, not correctness. Cost: the Cranelift compile of a CGU is no longer spread
 over the fn pool. Not done: x64 consumer, level-parallel compile, cross-CGU sets.
-State: compiles (`cargo check`); not yet run on real code, no gate/fuzz/benchmark run.
+State: default on, with changes to what is recorded, who is eligible and how the CGU compiles:
+see "Features 1, 2 and 6 on real programs" below.
 
 ## 4. Profile-guided field order
 
@@ -274,7 +275,221 @@ pipeline start (`loadfwd::scoped_seed`), so facts carried onto merge survivors n
 Under the knob the inliner records param facts only when the clone entry still has the declared
 leaf layout, and `cleanup::merge_blocks` does not merge blocks across a region boundary (a caller
 continuation would otherwise run "inside" the callee). licm/dse do not use the fact yet.
-State: `cargo check` + `pliron-clif-opt/tests/loadfwd_scoped_noalias.rs` (4 cases) pass; no fuzz/gate.
+State: opt-in; the representation changed (the param is not a `noalias` root any more) and the
+fact is used by a step of its own: see "Features 1, 2 and 6 on real programs" below.
+
+## Features 1, 2 and 6 on real programs
+
+Run the same day, after the three sections above were written. All
+counts are callgrind instruction totals on `aarch64-unknown-linux-musl`
+(the `irdiff.py` setup; the pliron side only, one backend build per
+table, the knob off against on; a rerun of one binary moves the total by
+under 10 instructions, except regex, about 300). The baseline moved
+during the day with other work, so compare within a table.
+
+### FASTCC: default on
+
+`PLIRON_FASTCC` is in `DEFAULT_ON` (aarch64 ELF and Mach-O; `=0` off).
+
+| program | off | on | |
+|---|---|---|---|
+| pulldown-cmark | 52,816,871 | 52,528,747 | -0.55% |
+| regex | 51,585,397 | 51,582,068 | -0.006% |
+| rust-html-rewriter | 104,539,329 | 104,539,299 | 0 |
+| rust-json | 51,852,558 | 51,852,402 | 0 |
+| rust-protobuf | 65,691,065 | 65,689,927 | -0.002% |
+| blake3-scalar | 49,075,170 | 49,075,163 | 0 |
+
+As first written the feature did almost nothing (pulldown-cmark -0.06%,
+the rest zero): 285 of regex's 2082 functions got a set and most sets
+were the whole ABI set. Three changes:
+
+- **Paths that never return do not count** (`VCode::pliron_written_regs`,
+  `PLIRON_FASTCC_NORET=0` off). A bounds check gave a leaf the whole ABI
+  set through its `panic_bounds_check` call. The set is now taken over
+  the blocks from which a `ret` is reachable: what a path that ends in a
+  trap or a noreturn call writes is not seen by a caller that resumes
+  after a plain `call`, and a caller that resumes at a landing pad used
+  a `try_call`, which is never narrowed.
+- **Hidden definitions are eligible** (`PLIRON_FASTCC_HIDDEN=0` off): a
+  function shared between the crate's CGUs is a strong hidden
+  definition, bound at static link time to the body in this object.
+  `Export` stays out (an ELF dylib may reach it through the PLT
+  resolver, which preserves only argument registers). The
+  address-not-taken condition is gone: only direct calls consume a set.
+- **Compile order is dependency-driven and parallel**: a call-graph
+  component starts when the components it calls are done, on the fn
+  pool, instead of the whole CGU compiling serially on its thread. Clean
+  builds, fast-profile backend, three alternating rounds: regex 24.2
+  against 24.0 CPU-seconds and the same peak RSS (490-516 MB);
+  rust-html-rewriter 34.2 against 34.7 CPU-seconds, peak RSS 518-528
+  against 535-548 MB (the optimized CLIF of a CGU waits for its
+  callees). Wall time was noise on the loaded machine (11-20 s for the
+  same build).
+
+With the first two, pulldown-cmark -0.36% (NORET off: -0.34%; HIDDEN
+off: -0.08%). The mechanism on `tests/fastcc/main.rs` (sixteen values
+live across each call): the caller of a leaf goes from 68 instructions,
+5 callee-saved stores and 24 stack references to 50, 1 and 6; the
+caller of a callee with a panic path from 72 to 56.
+
+What happens to the direct call sites (`PLIRON_TRACE=pliron::fastcc`,
+one `fastcc-sites` line per CGU; static counts over the program's own
+crates):
+
+| program | plain calls | callee outside the CGU | set is the whole ABI set | narrowed | not eligible / in a cycle | `try_call` to a useful set |
+|---|---|---|---|---|---|---|
+| pulldown-cmark | 1431 | 1098 | 251 | 63 | 19 / 0 | 4 |
+| regex | 5419 | 4471 | 644 | 99 | 76 / 129 | 120 |
+| rust-html-rewriter | 4495 | 3271 | 1088 | 49 | 43 / 44 | 11 |
+| rust-json | 1806 | 1421 | 329 | 7 | 17 / 32 | 2 |
+| rust-protobuf | 2936 | 2387 | 476 | 7 | 32 / 34 | 2 |
+
+So 73-83% of the sites call out of the CGU (the prebuilt std, another
+crate, another CGU of the same crate), and most local callees call out
+themselves, which makes their set the whole ABI set. Weighted by
+callgrind's call counts (`=debug` prints one `fastcc-site` line per
+site; callgrind's call graph is approximate on our code, it also
+reports returns and some jumps as calls): pulldown-cmark makes about
+66k narrowed calls a run, 70k to a full set, 196k out of the CGU and
+99k `try_call`s; regex 0.5k narrowed of about 90k; rust-html-rewriter
+and rust-json practically none. That is the whole result: pulldown-cmark
+calls small scanners from its parse loop, the others do not have that
+shape.
+
+The next blocker would be sets across CGUs. Measured before building
+it: with every crate compiled as one CGU (`-Ccodegen-units=1`) every
+same-crate call is local, which is all that cross-CGU sets could give.
+Off against on: pulldown-cmark 55,459,625 -> 55,418,730 (-0.07%), regex
+-0.005%, rust-html-rewriter, rust-json and rust-protobuf 0. The calls
+that remain go to the prebuilt std and to other crates or are
+`try_call`s; cross-CGU sets would cost the CGUs' parallel compile for
+nothing on these programs.
+
+Checked:
+- `harness/fastcc_check.py`: disassembles the objects and reports any
+  instruction that writes a caller-saved register missing from its
+  function's recorded set (build with `PLIRON_FASTCC_NORET=0` and
+  `PLIRON_TRACE=pliron::fastcc=debug`). All eight held-out programs
+  (macOS) and five on linux-musl: no violation among the functions this
+  backend compiled, 14k-123k instructions checked per program. (One
+  report on blind-sig was the prebuilt std's own copy of
+  `decode_error_kind` next to our local copy of the same name: check
+  objects, not the linked binary.) A set zeroed by hand is reported.
+- `tests/fastcc/main.rs`, stanza `fastcc` (new): leaf, chain,
+  recursion, mutual recursion, fn pointers and `dyn`, calls into std,
+  floats, `u128`, ten-value and array returns, a callee whose cold path
+  panics, a panic caught above a narrowed call; output equals stock
+  rustc's with 1 and 4 CGUs and with each sub-knob off, the leaf's
+  caller must get shorter, and the checker must pass.
+- All eight held-out programs print the expected output natively, the
+  six callgrind ones also under valgrind on linux-musl.
+- Fuzz, `PLIRON_FASTCC=1`: seeds 91000:91600 (first version),
+  95000:95600 (with the two rule changes) FUZZ_FCC_PLACEHOLDER
+- Two builds of regex and rust-json are byte-identical. `PLIRON_PAR=0`
+  gives a different binary than the parallel build, with the knob on
+  and off alike (rust-json: the same two hashes either way), so that
+  difference is not this feature's.
+- CRATES_PLACEHOLDER
+
+Not done: an x64 consumer; cross-CGU and cross-crate sets; `try_call`
+(regalloc2 has one clobber set per instruction, the unwind edge needs
+the full one); Windows (the knob is off there); a self-hosted rustc was
+not built with it.
+
+### Shared panic tails: default on, a size change
+
+`PLIRON_PANICSTUB` is in `DEFAULT_ON` (native targets; `=0` off).
+
+| program | cold `call; trap` tails | sharing a tail | shared tails | alone in their function | .text, off -> on | instructions |
+|---|---|---|---|---|---|---|
+| pulldown-cmark | 398 | 118 | 48 | 280 | 500,676 -> 499,940 (-0.15%) | +0.05% |
+| regex | 1575 | 542 | 173 | 1033 | 835,616 -> 834,176 (-0.17%) | +0.03% |
+| rust-html-rewriter | 5260 | 488 | 169 | 4772 | 851,380 -> 850,228 (-0.14%) | -0.01% |
+| rust-json | 3415 | 213 | 67 | 3202 | 442,580 -> 442,548 | 0 |
+| rust-protobuf | 9160 | 354 | 123 | 8806 | 366,628 -> 366,500 (-0.03%) | 0 |
+
+(Tail counts: `PLIRON_TRACE=pliron::panicstub`, the whole crate graph
+of a native build; .text: the linux-musl binary, prebuilt std
+included.) Executed instructions do not move beyond what one
+instruction in one hot function is worth, and that moves with the tree:
+across four backend builds of the day the same knob measured
+pulldown-cmark -0.06%, -0.06%, 0 and +0.05%, regex +0.30%
+(`Fsm::next_state`, +153k), 0, -0.01% and +0.03%, rust-json 0, 0,
++0.07% (`parse_str`, one instruction a call) and 0. Of the two
+sub-knobs, `PLIRON_PANICSTUB_STRIP=0` changed nothing and
+`PLIRON_PANICSTUB_FWD=0` gave up pulldown-cmark's -0.06% in the build
+that had it; both stay on.
+
+What blocks the rest: 66-96% of the tails are the only one of their
+(callee, trap code, argument types) in their function, usually because
+`tailmergep` already merged the same-shaped ones. Sharing across
+functions would need an outlined stub per location, which is the
+`adrp+add` it would save.
+
+One change: sites share a tail only if their calls have the same source
+location. With line tables the panicking frame's line comes from the
+call's return address, and one shared call reported the first site's
+line for all of them; without debug info every location is the default
+and nothing is kept apart (unit test `source_lines_stay_apart`). Not run
+on wasm (the step returns early there).
+
+Checked: all eight programs' output; fuzz seeds FUZZ_PS_PLACEHOLDER;
+the gate with the knob on by default.
+
+### Scoped noalias: sound now, still opt-in
+
+As written the `&mut` half never fired. `PLIRON_TRACE=pliron::scopedna`
+(new: one line per `loadfwd` run with a candidate, why candidates drop
+out) on five programs: every candidate failed "no longer a clone-entry
+param" (regex 672 of 672 over 194 runs, pulldown-cmark 248 of 248).
+The pipeline's first block merge folds the clone's entry param into its
+source before `loadfwd` runs, and on a small example `phisimp` had
+already folded it in the IR.
+
+Keeping the param alive long enough (first by holding it back in
+`phisimp` and `jumpthread`) made the fact reach the passes and four of
+six programs miscompiled. Four bugs, each with a test that fails
+without its fix:
+
+- `pipeline::carry_one` inserted `noalias` on the surviving value and
+  then asked whether that value was function-wide `noalias`, so a
+  region-scoped fact always became function-wide: licm hoisted a load
+  out of a loop that writes it (aho-corasick `Compiler::compile`).
+  Test `carry_keeps_noalias_scope`.
+- The same carry copied a scoped param's read-only `deref` onto the
+  caller's own `&mut` param, replacing its writable one: an inlined
+  `&self` method made `self.stack` "never written" in
+  regex-syntax's `HeapVisitor::visit`. Test
+  `carry_keeps_scoped_deref_off_wide_values`.
+- A `&mut` param was a `noalias` root, i.e. a distinct object to every
+  pass, while it is the caller's memory under a second name. Lowering
+  now gives it the scoped mark only (under the knob); `loadfwd` alone
+  treats it as a root stop with two names, on the machinery the
+  operand-frozen stops already use (kill under both names,
+  `kill_stops`), plus: a load through the stop also finds what is known
+  under the caller's name, a store through it is recorded under both,
+  and a store keeps locs of the same object that it does not overlap.
+  Tests `store_through_the_param_kills_the_caller_name`,
+  `caller_name_of_the_same_object_kills`, stanza `scopedna`
+  (`tests/scopedna/main.rs`: wrong output on the first live version).
+- Publishing a load's result under the caller's name ended in a value
+  aliased to itself (rust-compression, verifier error): the load side
+  is lookup only.
+
+Holding the params back was also the wrong mechanism: with every
+candidate kept through the first `loadfwd`, regex ran 7.1% more
+instructions (`follow_epsilons` +15%, `next_state` +17%: the callee's
+param hid the caller's function-wide `noalias` root), and after
+dropping those candidates pulldown-cmark, rust-json and rust-protobuf
+still ran 0.6-0.9% more (not traced to a pass). The final form holds
+nothing back: a first pipeline step
+`scopedfwd` runs `loadfwd` once on the function as lowered, only in
+functions with a candidate, and candidates whose caller-side root is a
+stack slot or the caller's own function-wide `noalias` param are not
+seeded.
+
+SNA_RESULT_PLACEHOLDER
 
 ## Parity by exact counts (`bench/heldout/irdiff.py`)
 
@@ -608,3 +823,141 @@ stanza (`slotpromlt`) measures what `PLIRON_RA2_XBLOCK` removes and
 needed `PLIRON_LICM_DOMCOND=0` pinned in its comparison builds, like
 the other passes that delete the same moves first.
 
+
+### Sixth item: what HEAD measures, regex's `next_state`, the allocator-independent parts of the one-latch rotation
+
+**The 54.56M pulldown-cmark figure.** HEAD (cbc0840) built `--release`
+gives the fifth item's numbers exactly (pulldown-cmark 52.93M). The same
+tree built with `--profile fast` gave 54.56M, and regex 52.80M instead
+of 53.11M: the backend's output depended on how the backend was
+compiled. `webmerge` memoized structural key hashes by node address
+(`proots::khash_m`), including stack temporaries and keys that
+`key_sub_h` builds and drops, and returned the hash of whatever had
+been at that address before. Every hit is confirmed with `==`, so a
+stale hash only lost a merge, but which ones depended on stack layout:
+without crate-local ThinLTO the scanners' pointer/counter pair was not
+recognized and `WM_KEEPCOUNT` did nothing. The memo now hashes the node
+it is given from its children and remembers only nodes held by an `Rc`,
+keeping a clone so the address cannot be reused (`proots::KHash`, test
+`khash_m_ignores_recycled_addresses`). `fast`, `dev` and `release`
+backends now produce the same code; measurements below are from `fast`
+builds and reproduce the release numbers where both were run.
+
+Exact totals, HEAD -> this item's defaults:
+
+| program | LLVM | before | after | |
+|---|---|---|---|---|
+| regex | 45.97M | 53.11M (x1.155) | 51.58M (x1.122) | -2.9% |
+| rust-compression | 39.72M | 44.51M (x1.120) | 44.28M (x1.115) | -0.5% |
+| pulldown-cmark | 45.33M | 52.93M (x1.168) | 52.82M (x1.165) | -0.2% |
+| rust-json | 45.55M | 51.91M (x1.139) | 51.85M (x1.138) | -0.1% |
+| blind-sig | 31.51M | 34.71M (x1.101) | 34.68M (x1.100) | -0.1% |
+| rust-protobuf | 60.76M | 65.72M (x1.082) | 65.69M (x1.081) | 0 |
+| rust-html-rewriter | 85.83M | 104.49M (x1.218) | 104.54M (x1.218) | 0 |
+| blake3-scalar | 46.63M | 49.08M | 49.08M | 0 |
+
+**regex: why `PLIRON_LICM_INNERPRESS=2` lost, and the fix**
+(`PLIRON_LF_TRIVPHI`, default on). With the `SparseSet` fields hoisted
+out of the state-decode loop, `loadfwd2` forwarded the hoisted loads to
+their re-reads in the outer body by giving every header and join of the
+nest a block param, each fed by the one load or by another such param.
+`sameargs2` dissolved the web thirty steps later; in between the varint
+loop carried four extra params, `taildup2`/`mergechain` refused it, the
+late threading never saw the iterator's `Option` test decided, and the
+loop kept its `select`s (found by replaying the recorded function,
+`clif-check pipeline`, and comparing which steps changed it). The PRE
+now drops a new param whose arguments, followed through other new
+params, reach exactly one value. `INNERPRESS=2` is the default: regex
+53.09M -> 51.88M (`next_state` 9.70M -> 8.18M; the decode loop no
+longer loads the fields), pulldown-cmark -0.18M, others within 0.04M.
+Without `LF_TRIVPHI` regex is 53.27M. `PLIRON_UNSWITCH_LOOP` (the
+per-state `b == EOF` test, written and tested on 2026-11-02, neutral by
+wall time then) is default on too: regex -0.29M, nothing else moves.
+`test.sh`'s `slotpromlt` stanza pins `LF_TRIVPHI=0` in the builds that
+measure `RA2_XBLOCK`: the edge moves that knob removed were these
+params'.
+
+`hash_one::<&State>` (0.95M against LLVM's 0.04M) is not an inlining
+miss: LLVM keeps `hash_one` out of line as well and calls
+`Hasher::write` from it (0.66M). The pair costs LLVM 0.70M and us
+0.95M; the difference is our inlined SipHash, not a call.
+
+`next_state` after this: 8.18M against 6.63M. What is left in its two
+loops: `b` and the `SparseSet` pointer are reloaded from the stack in
+the dispatch loop (about 37 values live across `follow_epsilons`, see
+`docs/loop-unswitch-pressure.md`), the dispatch is two range checks and
+a compare where LLVM has two compares, and the loop is not rotated
+(below).
+
+**The one-latch rotation** (`PLIRON_LOOPROT_MERGE`, still opt-in). The
+two effects named in the fifth item are fixed, each default on:
+
+- *End pointer recomputed in the latch*: `PLIRON_ELABKEEP` (vendored
+  elaborator, patch 134). A pure instruction the pipeline placed outside
+  a loop is not elaborated inside it when one of its operands has no
+  other use in that loop. The first version kept every hoist and cost
+  pulldown-cmark 1.3M (`parse_block`: hoists whose operands the loop
+  needs anyway add a live value each); with the operand test:
+  rust-compression -0.23M, pulldown-cmark +0.08M.
+- *Cursor copied around the loop*: the rotated loop's top block only
+  stepped the cursor (`q = p + 8`, `p` otherwise unused), and the
+  elaborator recomputed `p + 8` in each of three blocks with `p` kept
+  live. New step `bumpedge` (last in the pipeline): such a param is
+  stepped on the edges into the block, next to the load of the same
+  pointer, which becomes `ldr x, [p], #8`.
+- Found on the way: with one latch, regex's `follow_epsilons` header
+  received its `u32` instruction pointer and the extended copy from the
+  same block, `webmerge` kept the `u32` and re-extended it every trip
+  (+0.44M). It now keeps the wide slot and makes the narrow one an
+  `ireduce` (`PLIRON_WM_WIDE`).
+
+`tests/parity/prog_loop.rs` with the knob: 20 instructions for a
+skipped state -> 11 (LLVM 12, default 16). The programs, knob on
+against off: rust-html-rewriter -0.39M, rust-json -0.17M,
+rust-protobuf -0.03M, regex +0.25M (was +0.63M), pulldown-cmark
++0.78M, blind-sig +0.29M, rust-compression +0.04M. By ELF symbol
+(the irdiff function table is by inlined function and shifts with
+block merging) pulldown-cmark loses in `handle_inline_pass1` +0.32M,
+`parse_block` +0.18M, `handle_inline` +0.15M, `unescape` +0.11M. In
+`unescape` the body is unchanged and the back edge is `mov x19, x1;
+mov x21, x23; cmp; b.hs; mov x23, x28; mov x25, x22; mov x1, x19; mov
+x22, x25; mov x28, x23; b`: values live through the merged latch are
+given a different register there than in the body and moved back.
+`PLIRON_RA2_XBLOCK=1` does not remove the pairs. That is the blocker:
+regalloc2's choice for a bundle piece in a block that only joins.
+
+**irdiff runs all eight programs.**
+- rust-compression: we do emit stack probes (inline, every guard page);
+  Cranelift's probe loop stored below an unmoved `sp`, which Linux
+  serves and valgrind does not. The loop now moves `sp` (patch 133,
+  `PLIRON_PROBE_SP=0` off, `pliron-clif-opt/tests/stack_probe.rs`). Any
+  program of ours with a frame over three pages crashed under valgrind
+  before this. rust-compression: LLVM 39.72M, ours 44.51M.
+- blind-sig: `open64` is aliased to `open` at link (musl 1.2.4 dropped
+  the LFS64 names). LLVM 31.51M, ours 34.71M; 26.4M of ours is
+  `montgomery` inlined where LLVM calls `SmallVec::extend`.
+- `--tag T` gives our side its own build directory (parallel runs);
+  LLVM's counts are reused while its binary is unchanged.
+
+**Tried, not adopted.**
+- `PLIRON_XCGU_SIZE=100/200` (the `to_ascii_lowercase` chain:
+  `slice::Iter::fold` is 73 MIR statements, over the 50 cap, so
+  `Map::fold` has no body in `extend_trusted`'s CGU and the chain stays
+  three calls): rust-html-rewriter -0.83M / -0.93M and pulldown-cmark
+  -0.8M, but rust-json +8.9M / +1.2M (`serialize_str` 20.9M -> 28.7M)
+  and rust-protobuf +2.2M / +1.3M: the extra bodies change what the
+  inliner spends its growth on elsewhere. Needs a rule for the chain,
+  not a larger cap.
+- `PLIRON_RA2_POSTOPT=3`: no change in any of six programs.
+- `PLIRON_WM_KEEPCOUNT=0` on regex (suspected from the stale-hash
+  build's 52.80M): no gain.
+
+Not started: the html-rewriter line table beyond the chain above, the
+three `closing` leftovers, the pulldown-cmark line list.
+
+Validation: `harness/gate.py` (fast profile) passes after the
+`slotpromlt` pin; fuzz seeds 93000:93700 pass (700); all eight programs
+build and exit 0 under callgrind with the final defaults. Measured
+again on the working tree at the end, which by then also held another
+session's edits: pulldown-cmark 52.53M and blind-sig 34.65M, the other
+six as in the table.

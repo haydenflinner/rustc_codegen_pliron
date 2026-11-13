@@ -50,6 +50,7 @@ pub mod ifconv;
 pub mod foldcommon;
 pub mod indvars;
 pub mod ivalign;
+pub mod bumpedge;
 pub mod ivrefold;
 pub mod ivretro;
 pub mod jumpthread;

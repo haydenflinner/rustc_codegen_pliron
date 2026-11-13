@@ -75,6 +75,15 @@ opt-level 2 for our crates gets 4% of that back at the same rebuild time
 (not adopted). Results are the same: verdict counts and instruction
 totals match.
 
+Until 2026-11-13 the last sentence was false for `fast`: `webmerge`
+memoized structural hashes by node address (`proots::khash_m`) and
+reused the hash of whatever had been at a recycled stack or heap
+address, so which merges it found depended on the build's stack layout.
+A `fast` backend compiled pulldown-cmark to 54.56M executed
+instructions where `dev` and `release` gave 52.93M (the scanners kept a
+pointer walk instead of the counter). The memo now pins what it
+remembers (`proots::KHash`); `fast`, `dev` and `release` agree again.
+
 Three more fixes that apply to every profile:
 
 - **One build of each crate instead of one per command.** Cargo resolves

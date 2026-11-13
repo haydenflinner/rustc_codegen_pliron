@@ -134,14 +134,20 @@ pub fn run_with(
 /// instruction that is skipped, 12 in LLVM's rotated loop). With one
 /// latch the rotated test sits there once.
 ///
-/// Opt-in: exact counts are mixed (rust-html-rewriter -0.27M,
-/// rust-json -0.16M, but regex +0.63M and pulldown-cmark +0.64M). In
-/// the repro the rotated loop recomputes the invariant end pointer
-/// (`base + len*8`) in the latch — the elaborator's pop-on-leave rule
-/// places it there once the latch follows an exit block in the
-/// domtree walk — and the pointer is copied between a caller-saved
-/// and a callee-saved register on each path around the call. Those
-/// two have to go first.
+/// Opt-in: exact counts are mixed (2026-11-13, second round:
+/// rust-html-rewriter -0.39M, rust-json -0.17M, rust-protobuf -0.03M,
+/// but pulldown-cmark +0.78M, regex +0.25M, blind-sig +0.29M). The two
+/// effects first blamed are fixed and the repro runs 11 instructions
+/// for a skipped state: the end pointer stays ahead of the loop
+/// (`PLIRON_ELABKEEP`, vendored elaborator) and the cursor is stepped
+/// next to its load (`bumpedge`); `webmerge` no longer re-extends a
+/// `u32` loop variable in the header (`PLIRON_WM_WIDE`, regex's
+/// `follow_epsilons` +0.44M). What is left is the allocator: values
+/// live through the merged latch get a different register in it than
+/// in the body, and the back edge becomes a rotation
+/// (pulldown-cmark's `scanners::unescape`: `mov x23, x28; mov x25,
+/// x22; mov x1, x19; mov x22, x25; mov x28, x23` every trip, +17%).
+/// `PLIRON_RA2_XBLOCK=1` does not remove the pairs.
 ///
 /// Only when every back edge is a `jump`, or one arm of a `brif`, at
 /// the end of its block with plain value arguments. Returns whether

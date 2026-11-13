@@ -751,6 +751,12 @@ impl EmitInfo {
     }
 }
 
+/// PLIRON: `PLIRON_PROBE_SP` (default on): the stack-probe loop moves `sp`.
+fn pliron_probe_sp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_PROBE_SP").map_or(true, |v| v != "0"))
+}
+
 impl MachInstEmit for Inst {
     type State = EmitState;
     type Info = EmitInfo;
@@ -3903,15 +3909,47 @@ impl MachInstEmit for Inst {
                     imm12: step,
                 }
                 .emit(sink, emit_info, state);
-                Inst::Store32 {
-                    rd: regs::zero_reg(),
-                    mem: AMode::RegReg {
+                // PLIRON: move `sp` with the probe and store at `[sp]`
+                // (`PLIRON_PROBE_SP=0` restores the store below `sp`).
+                // Upstream writes `[sp, start]` with `sp` unmoved; the
+                // kernel grows the stack for that, but valgrind only
+                // extends it for accesses at or above `sp`, so any
+                // program with a frame of more than three guard pages
+                // died under valgrind with SIGSEGV in the prologue
+                // (rust-compression's `main`, 17KB; the unrolled probes
+                // already move `sp`, wasmtime#7454). One more
+                // instruction a page, and one after the loop to put
+                // `sp` back (`start` is minus the distance moved).
+                let move_sp = pliron_probe_sp();
+                if move_sp {
+                    Inst::AluRRImm12 {
+                        alu_op: ALUOp::Sub,
+                        size: OperandSize::Size64,
+                        rd: regs::writable_stack_reg(),
                         rn: regs::stack_reg(),
-                        rm: start.to_reg(),
-                    },
-                    flags: MemFlagsData::trusted(),
+                        imm12: step,
+                    }
+                    .emit(sink, emit_info, state);
+                    Inst::Store32 {
+                        rd: regs::zero_reg(),
+                        mem: AMode::UnsignedOffset {
+                            rn: regs::stack_reg(),
+                            uimm12: UImm12Scaled::zero(I32),
+                        },
+                        flags: MemFlagsData::trusted(),
+                    }
+                    .emit(sink, emit_info, state);
+                } else {
+                    Inst::Store32 {
+                        rd: regs::zero_reg(),
+                        mem: AMode::RegReg {
+                            rn: regs::stack_reg(),
+                            rm: start.to_reg(),
+                        },
+                        flags: MemFlagsData::trusted(),
+                    }
+                    .emit(sink, emit_info, state);
                 }
-                .emit(sink, emit_info, state);
                 Inst::AluRRR {
                     alu_op: ALUOp::AddS,
                     size: OperandSize::Size64,
@@ -3929,6 +3967,17 @@ impl MachInstEmit for Inst {
                 }
                 .emit(sink, emit_info, state);
                 sink.bind_label(loop_end, &mut state.ctrl_plane);
+                if move_sp {
+                    Inst::AluRRRExtend {
+                        alu_op: ALUOp::Sub,
+                        size: OperandSize::Size64,
+                        rd: regs::writable_stack_reg(),
+                        rn: regs::stack_reg(),
+                        rm: start.to_reg(),
+                        extendop: ExtendOp::UXTX,
+                    }
+                    .emit(sink, emit_info, state);
+                }
             }
         }
 

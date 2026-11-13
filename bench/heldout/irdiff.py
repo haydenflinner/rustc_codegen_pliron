@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """Exact instruction counts, ours against LLVM's, per function and per source line.
 
-  bench/heldout/irdiff.py PROG [--env K=V ...] [--top N] [--fn SUBSTR | --line FILE:LINE] [--skip-build]
+  bench/heldout/irdiff.py PROG [--env K=V ...] [--top N] [--fn SUBSTR | --line FILE:LINE] [--skip-build] [--tag T]
 
 Sampling cannot say where we execute more instructions than LLVM: the
 whole-process count is exact (`ab.py`) but the breakdown is samples,
@@ -44,14 +44,17 @@ run = load("run")
 
 
 def linker_flags():
+    # musl 1.2.4 dropped the LFS64 names; getrandom 0.2.8 (blind-sig) still
+    # calls `open64` through an old libc crate. Same function, so alias it.
+    lfs = "-Clink-arg=--defsym=open64=open"
     wild = shutil.which("wild")
     if wild:
-        return f"-Clinker={wild} -Clinker-flavor=ld.lld"
-    return "-Clinker=rust-lld -Clinker-flavor=ld.lld"
+        return f"-Clinker={wild} -Clinker-flavor=ld.lld {lfs}"
+    return f"-Clinker=rust-lld -Clinker-flavor=ld.lld {lfs}"
 
 
-def build(prog, binary, side, backend, env_extra, skip):
-    tdir = os.path.join(run.OUT, f"ir-{side}", prog)
+def build(prog, binary, side, backend, env_extra, skip, tag=""):
+    tdir = os.path.join(run.OUT, f"ir-{side}{'-' + tag if tag and side != 'llvm' else ''}", prog)
     exe = os.path.join(tdir, TARGET, "release", binary)
     if skip and os.path.exists(exe):
         return exe
@@ -90,6 +93,9 @@ def callgrind(prog, exe, tag):
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, f"{prog}.{tag}.callgrind")
     if os.path.exists(out):
+        # LLVM's binary only changes when cargo relinks it: reuse its counts.
+        if tag == "llvm" and os.path.getmtime(out) > os.path.getmtime(exe) and os.path.getsize(out) > 0:
+            return out
         os.remove(out)
     cmd = ["docker", "run", "--rm",
            "-v", f"{run.src_dir(prog)}:/src:ro", "-v", f"{os.path.dirname(exe)}:/exe:ro", "-v", f"{out_dir}:/out",
@@ -172,6 +178,7 @@ def main():
     ap.add_argument("--fn")
     ap.add_argument("--line", help="FILE:LINE (a suffix of the table's spelling): the functions that execute it")
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--tag", default="", help="separate build dir and output for our side (parallel runs)")
     ap.add_argument("--backend", default=os.path.join(run.ROOT, "target", "release", run.DYLIB))
     a = ap.parse_args()
     binary = next((b for n, b, _ in run.BENCHES if n == a.prog), None)
@@ -181,8 +188,8 @@ def main():
     ensure_image()
     sides = {}
     for side in ("llvm", "pliron"):
-        exe = build(a.prog, binary, side, a.backend, env, a.skip_build)
-        sides[side] = parse(callgrind(a.prog, exe, side))
+        exe = build(a.prog, binary, side, a.backend, env, a.skip_build, a.tag)
+        sides[side] = parse(callgrind(a.prog, exe, side if side == "llvm" or not a.tag else f"{side}-{a.tag}"))
     (lt, lf, ll, lb), (pt, pf, pl, pb) = sides["llvm"], sides["pliron"]
     print(f"{a.prog}: instructions llvm {lt / 1e6:.2f}M  pliron {pt / 1e6:.2f}M  x{pt / lt:.3f}  (+{(pt - lt) / 1e6:.2f}M)")
     dm = demangle(set(lf) | set(pf))

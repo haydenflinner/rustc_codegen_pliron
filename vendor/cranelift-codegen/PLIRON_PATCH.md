@@ -1917,6 +1917,37 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      q`: regex's `ExecBuilder::build` (14KB frame) stopped
      `bench/heldout/irdiff.py` with SIGILL on `ldr q0, [sp, x16, sxtx]`.
 
+133. aarch64 stack-probe loop moves `sp` (default-on; `PLIRON_PROBE_SP=0`
+    restores; `isa/aarch64/inst/emit.rs`, `Inst::StackProbeLoop`).
+    Upstream's loop stores at `[sp, x16]` with `sp` unmoved. Linux grows
+    the stack for that; valgrind extends it only for accesses at or
+    above `sp`, so a program with a frame of more than three guard
+    pages died under valgrind with SIGSEGV in that prologue
+    (rust-compression's `main`, 17KB; regex's `RegexBuilder::build`
+    once more was inlined into it). The loop is now `sub x16, x16,
+    #step; sub sp, sp, #step; str wzr, [sp]; cmn x16, x17; b.gt`, then
+    `sub sp, sp, x16, uxtx` puts `sp` back. The unrolled probes (up to
+    three pages) already moved `sp` (wasmtime#7454). Test:
+    `pliron-clif-opt/tests/stack_probe.rs`.
+
+134. Elaboration keeps the pipeline's hoists (default-on;
+    `PLIRON_ELABKEEP=0` off; `egraph/mod.rs` records, per pure
+    instruction, its block and operands and, per value, the blocks that
+    use it; `egraph/elaborate.rs` `Elaborator::keep_out_of_loop`). The
+    elaborator's loop stack loses a loop's entry when the domtree
+    preorder visits a block outside the loop, so body blocks visited
+    after an exit or cold block place their invariants at the use: a
+    value our LICM had put ahead of the loop came back inside it, once
+    per using block. A pure instruction is now placed at the entry of
+    the outermost loop that holds its use but held neither its original
+    block nor any use of one of its operands (hoisted, the result then
+    takes that operand's register; without the operand test the rule
+    cost pulldown-cmark 1.3M instructions). `PLIRON_ELABLOOPS=1` hoists
+    every invariant instead. Exact counts: rust-compression -0.23M,
+    pulldown-cmark +0.08M, others within 0.02M; `tests/parity/
+    prog_loop.rs` with `PLIRON_LOOPROT_MERGE=1` keeps its end pointer
+    in one register. Test: `pliron-clif-opt/tests/elabkeep.rs`.
+
 ## `PLIRON_ELABLOOPS=2` (opt-in): pressure-aware egraph hoisting
 
 `src/egraph/elaborate.rs` (`elab_loops_pressure`, `cheap_to_recompute`,
@@ -1939,3 +1970,11 @@ callee whose written-register set the embedder installed gets
 `ABI clobbers ∩ (callee set ∪ {x16, x17, x30, x9 if a stack return})`
 as its clobber set. Never for `try_call` or patchable calls. Nothing
 changes unless the embedder calls `pliron_fastcc_begin` on the thread.
+The recorded set counts only blocks from which a `ret` is reachable
+(`PLIRON_FASTCC_NORET=0`: every block): a path that ends in a trap, a
+noreturn call or an endless loop is never resumed by a caller of a
+plain `call`, and without the rule one bounds-check panic gave a leaf
+the whole ABI set. `PlironRegSet::contains_enc` exposes membership by
+hardware encoding for the embedder's trace (`fastcc-set` lines, read by
+`harness/fastcc_check.py`, which checks the sets against the
+disassembled code).
