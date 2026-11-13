@@ -71,6 +71,7 @@ BENCHES = [
     ("rust-protobuf", "benchmark", []),
 ]
 CRATE = "rust-benchmark"
+CLEAN_ALL = False
 
 
 def sh(cmd, **kw):
@@ -81,8 +82,9 @@ def build(name, binary, side, env):
     """Build one side; returns the binary path or None (with the log saved)."""
     src = os.path.join(OUT, "src", name)
     tdir = os.path.join(OUT, side, name)
-    if side.startswith("pliron"):
+    if side.startswith("pliron") or CLEAN_ALL:
         # Cargo's fingerprint ignores the backend dylib: start clean.
+        # (`--pgo` cleans every side: it reports build times.)
         shutil.rmtree(tdir, ignore_errors=True)
     cmd = ["cargo", "build", "--release", "--target-dir", tdir,
            "--config", f'patch.crates-io.sightglass-api.path="{SHIM}"']
@@ -98,6 +100,95 @@ def build(name, binary, side, env):
         print(f"  {name}: {side}: no {exe}")
         return None
     return exe
+
+
+def llvm_tool(name):
+    rl = os.path.expanduser(f"~/.rustup/toolchains")
+    for d in sorted(os.listdir(rl)) if os.path.isdir(rl) else []:
+        if not d.startswith(TOOLCHAIN):
+            continue
+        for root, _, files in os.walk(os.path.join(rl, d, "lib", "rustlib")):
+            if name in files:
+                return os.path.join(root, name)
+    return shutil.which(name)
+
+
+def prof_tools():
+    """(pliron-prof CLI, thin runtime archive) for `--pgo`, built on demand.
+
+    The archive holds only the runtime object, with its panic shims
+    renamed: the full staticlib's bundled core members collide with the
+    link's own std (test.sh `t_pgo` does the same)."""
+    cli = os.path.join(ROOT, "tools", "pliron-prof", "target", "release", "pliron-prof")
+    full = os.path.join(ROOT, "tools", "pliron-prof-rt", "target", "release", "libpliron_prof_rt.a")
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)
+    env.pop("RUSTFLAGS", None)
+    for d in ("pliron-prof", "pliron-prof-rt"):
+        r = sh(["cargo", "build", "--release", "-q"], cwd=os.path.join(ROOT, "tools", d), env=env)
+        if r.returncode != 0:
+            sys.exit(f"heldout: building tools/{d} failed:\n{r.stderr[-600:]}")
+    thin_dir = os.path.join(OUT, "pgo", "rt")
+    thin = os.path.join(thin_dir, "libpliron_prof_rt.a")
+    shutil.rmtree(thin_dir, ignore_errors=True)
+    os.makedirs(thin_dir)
+    ar, nm, oc = llvm_tool("llvm-ar"), llvm_tool("llvm-nm"), llvm_tool("llvm-objcopy")
+    sh([ar, "x", full], cwd=thin_dir)
+    objs = [f for f in os.listdir(thin_dir) if f.startswith("pliron_prof_rt-") and f.endswith(".o")]
+    for o in objs:
+        syms = sh([nm, "-g", "--defined-only", o], cwd=thin_dir).stdout.split("\n")
+        for l in syms:
+            sym = l.split()[-1] if l.split() else ""
+            if "rust_begin_unwind" in sym or "rust_eh_personality" in sym:
+                sh([oc, "--redefine-sym", f"{sym}=__pliron_rt_shim_{sym}", o], cwd=thin_dir)
+    if not objs or sh([ar, "rcs", thin] + objs, cwd=thin_dir).returncode != 0:
+        sys.exit("heldout: could not thin the profile runtime archive")
+    return cli, thin
+
+
+def pgo_build(name, binary, base, backend, tools):
+    """`--pgo`: profile one run of the benchmark, then build with the profile.
+
+    Ours (`pliron-pgo`): instrumented build (`PLIRON_PGO`), one run,
+    `pliron-prof merge`, `PLIRON_PGO_USE` build. LLVM (`llvm-pgo`):
+    `-Cprofile-generate`, one run, `llvm-profdata merge`, `-Cprofile-use`.
+    Returns ({side: exe or None}, {side: seconds for the whole loop})."""
+    import time
+    pdir = os.path.join(OUT, "pgo", name)
+    shutil.rmtree(pdir, ignore_errors=True)
+    os.makedirs(pdir)
+    src = os.path.join(OUT, "src", name)
+    exes, secs = {}, {}
+
+    cli, rt = tools
+    t0 = time.time()
+    raw, merged = os.path.join(pdir, "pliron.raw"), os.path.join(pdir, "pliron.prof")
+    be = f"-Zcodegen-backend={backend}"
+    # Build scripts and proc macros are instrumented too and dump when
+    # they exit: keep those dumps out of the package directories.
+    gen = build(name, binary, "pliron-pgogen",
+                dict(base, RUSTFLAGS=f"{be} -Clink-arg={rt}", PLIRON_PGO="1",
+                     PLIRON_PROFILE_FILE=os.path.join(pdir, "build-time.raw")))
+    ok = gen is not None
+    if ok:
+        r = sh([gen], cwd=src, env=dict(os.environ, PLIRON_PROFILE_FILE=raw))
+        ok = r.returncode == 0 and os.path.exists(raw) and sh([cli, "merge", raw, "-o", merged]).returncode == 0
+    exes["pliron-pgo"] = build(name, binary, "pliron-pgo",
+                               dict(base, RUSTFLAGS=be, PLIRON_PGO_USE=merged)) if ok else None
+    secs["pliron-pgo"] = time.time() - t0
+
+    t0 = time.time()
+    ldir, ldata = os.path.join(pdir, "llvm-raw"), os.path.join(pdir, "llvm.profdata")
+    gen = build(name, binary, "llvm-pgogen", dict(base, RUSTFLAGS=f"-Cprofile-generate={ldir}"))
+    ok = gen is not None
+    if ok:
+        r = sh([gen], cwd=src)
+        raws = [os.path.join(ldir, f) for f in os.listdir(ldir)] if os.path.isdir(ldir) else []
+        ok = r.returncode == 0 and raws and \
+            sh([llvm_tool("llvm-profdata"), "merge", "-o", ldata] + raws).returncode == 0
+    exes["llvm-pgo"] = build(name, binary, "llvm-pgo",
+                             dict(base, RUSTFLAGS=f"-Cprofile-use={ldata}")) if ok else None
+    secs["llvm-pgo"] = time.time() - t0
+    return exes, secs
 
 
 def layouts(name, binary, side, env, k):
@@ -203,6 +294,10 @@ def boot_geomean(pairs, reps=1000, seed=0):
     return g, bs[int(0.025 * reps)], bs[int(0.975 * reps) - 1]
 
 
+def short(side):
+    return side[7:] if side.startswith("pliron-") else side
+
+
 def fmt(r, lo, hi):
     return f"{r:.3f} [{lo:.3f},{hi:.3f}]" + ("*" if lo > 1 or hi < 1 else " ")
 
@@ -221,6 +316,9 @@ def main():
     ap.add_argument("--variant", action="append", default=[],
                     help="NAME:K=V,K=V -- another pliron build with extra backend env, "
                          "measured interleaved with the others (ratio vs LLVM each)")
+    ap.add_argument("--pgo", action="store_true",
+                    help="also time `pliron-pgo` and `llvm-pgo`: each side profiles one run of the "
+                         "benchmark and rebuilds with the profile (the whole loop's build time is reported)")
     ap.add_argument("--aa", action="store_true",
                     help="time the pliron binaries again as the variant `aa` (noise floor)")
     a = ap.parse_args()
@@ -239,7 +337,11 @@ def main():
     for v in a.variant:
         vname, _, kvs = v.partition(":")
         envs[f"pliron-{vname}"] = dict(envs["pliron"], **dict(kv.split("=", 1) for kv in kvs.split(",") if kv))
-    allsides = list(envs) + (["pliron-aa"] if a.aa else [])
+    allsides = list(envs) + (["pliron-aa"] if a.aa else []) + (["pliron-pgo", "llvm-pgo"] if a.pgo else [])
+    tools = prof_tools() if a.pgo and not a.skip_build else None
+    global CLEAN_ALL
+    CLEAN_ALL = a.pgo
+    build_secs = {}
     exes = {}
     for name, binary, update in benches:
         dst = os.path.join(OUT, "src", name)
@@ -249,16 +351,30 @@ def main():
                             ignore=shutil.ignore_patterns("target", "*.wasm"))
             for c in update:
                 sh(["cargo", "update", "-q", "-p", c], cwd=os.path.join(dst, CRATE), env=base)
+        if a.pgo and not a.skip_build:
+            print(f"build {name} (pgo loops)", flush=True)
+            pe, ps = pgo_build(name, binary, base, a.backend, tools)
+            for side, exe in pe.items():
+                exes[(name, side)] = [exe] if exe else None
+                build_secs[(name, side)] = ps[side]
         for side in allsides:
             if side == "pliron-aa":
                 exes[(name, side)] = exes.get((name, "pliron"))
+                continue
+            if side in ("pliron-pgo", "llvm-pgo"):
+                if a.skip_build:
+                    exe = os.path.join(OUT, side, name, "release", binary)
+                    exes[(name, side)] = [exe] if os.path.exists(exe) else None
                 continue
             if a.skip_build:
                 exe = os.path.join(OUT, side, name, "release", binary)
                 exes[(name, side)] = exe if os.path.exists(exe) else None
             else:
                 print(f"build {name} ({side})", flush=True)
+                import time
+                t0 = time.time()
                 exes[(name, side)] = build(name, binary, side, envs[side])
+                build_secs[(name, side)] = time.time() - t0
             if exes[(name, side)] and a.layouts > 0 and sys.platform == "darwin":
                 exes[(name, side)] = layouts(name, binary, side, envs[side], a.layouts)
             elif exes[(name, side)]:
@@ -308,7 +424,7 @@ def main():
                      "rounds_ns": rounds}
         print(f"  {name:20} llvm {med['llvm']/1e6:8.2f} ms  pliron {med['pliron']/1e6:8.2f} ms "
               f" {fmt(*pl)}"
-              + "".join(f"  {s[7:]}/pliron {fmt(*v)}" for s, v in vs.items()), flush=True)
+              + "".join(f"  {short(s)}/pliron {fmt(*v)}" for s, v in vs.items()), flush=True)
 
     ok = [n for n, _, _ in benches if res.get(n, {}).get("status") == "ok"]
     gm = None
@@ -319,9 +435,23 @@ def main():
         for s in res.get("variants", {}):
             vl = boot_geomean([(res[n]["rounds_ns"][s], res[n]["rounds_ns"]["llvm"]) for n in ok])
             vp = boot_geomean([(res[n]["rounds_ns"][s], res[n]["rounds_ns"]["pliron"]) for n in ok])
-            print(f"geomean {s}/llvm over {len(ok)}: {fmt(*vl)}  {s[7:]}/pliron {fmt(*vp)}")
+            print(f"geomean {s}/llvm over {len(ok)}: {fmt(*vl)}  {short(s)}/pliron {fmt(*vp)}")
+    if a.pgo and ok:
+        # The differentiator: our profiled code against LLVM's plain and
+        # profiled code, and what the profile loop costs to build.
+        for num, den in (("pliron-pgo", "llvm"), ("pliron-pgo", "llvm-pgo"), ("llvm-pgo", "llvm")):
+            g = boot_geomean([(res[n]["rounds_ns"][num], res[n]["rounds_ns"][den]) for n in ok])
+            print(f"geomean {num}/{den}: {fmt(*g)}")
+        if build_secs:
+            def tot(side):
+                return sum(build_secs.get((n, side), 0.0) for n in ok)
+            print("build seconds (pgo sides: instrumented build + one run + profiled build): "
+                  + "  ".join(f"{sd} {tot(sd):.0f}" for sd in ("llvm", "pliron", "pliron-pgo", "llvm-pgo")))
+            if tot("llvm") > 0:
+                print(f"pliron-pgo loop / plain llvm build: {tot('pliron-pgo') / tot('llvm'):.2f}x")
     with open(a.json, "w") as f:
         json.dump({"rounds": a.rounds, "pads": pads, "power": power, "geomean": gm,
+                   "build_secs": {f"{n}/{sd}": v for (n, sd), v in build_secs.items()},
                    "benches": res}, f, indent=1)
 
 

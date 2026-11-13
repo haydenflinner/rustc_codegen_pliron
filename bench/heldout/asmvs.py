@@ -151,6 +151,7 @@ class Side:
                 mn, ops = m.group(2), m.group(3).strip()
                 self.addr.append(int(m.group(1), 16))
                 self.inst.append((fn, line, classify(mn, ops), f"{mn}\t{ops}".rstrip()))
+        self._framed = set()  # functions seen allocating a fixed frame
         self.samples = collections.Counter()  # instruction index -> self samples
         self.total = 0
 
@@ -159,9 +160,28 @@ class Side:
         (explicit stack slots: allocas the mid-end left in memory), by the
         `[sp, #off]` offset against the function's frame regions (`frame`
         remarks: sp + outgoing args, then slots, then spills)."""
+        # Offsets only mean frame regions while the fixed frame is open:
+        # the prologue's callee-save pushes and the epilogue's pops address
+        # `[sp, #off]` too, before `sub sp, sp` / after `add sp, sp`.
+        cur, is_open = None, False
         for k, (fn, line, cls, text) in enumerate(self.inst):
+            if fn != cur:
+                cur, is_open = fn, False
+            mn = text.split("\t", 1)[0]
+            if text.startswith("sub\tsp, sp"):
+                is_open = True
+            elif text.startswith("add\tsp, sp"):
+                is_open = False
+            elif mn in ("ret", "b", "br") and not is_open:
+                # Past an epilogue: the next block runs with the frame set up
+                # (if this function has one at all).
+                is_open = fn in self._framed
+            if text.startswith("sub\tsp, sp"):
+                self._framed.add(fn)
             fr = frames.get(fn)
-            if not cls.startswith("stack-") or fr is None:
+            if not is_open or not cls.startswith("stack-") or fr is None:
+                continue
+            if "]!" in text or re.search(r"\], #", text):
                 continue
             m = re.search(r"\[sp(?:, #(-?(?:0x)?[0-9a-f]+))?\]", text)
             if not m:
