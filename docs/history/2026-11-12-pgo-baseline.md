@@ -478,3 +478,12 @@ at 0.9999); the best four and six stacked: 0.9997, 0.9992. None is a
 default candidate on this set. Also tried and reverted: isolating
 larger loops (64/200/1000 instructions) for values used on the loop's
 hot path — instructions 1.001..1.005.
+
+**Full run on the new defaults** (`run.py --pgo`, 7 rounds, quiet
+machine): pliron/llvm 1.083 [1.065, 1.107], pliron-pgo/llvm 1.066,
+pgo/pliron 0.985 [0.962, 1.016], llvm-pgo/llvm 0.941, loop 2.28x. The
+profiled build had stopped beating the plain one on rust-protobuf
+(1.065) and rust-json (1.005): the plain default now inlines small
+copies in loops and the bundle's `hot` took fewer. Bundle value is now
+`hotloop` (hot blocks, plus loops the profile saw run): eight programs,
+11 rounds, pgo/pliron 0.977 with it against 0.987 with `hot`.

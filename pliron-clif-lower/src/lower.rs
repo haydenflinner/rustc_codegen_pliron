@@ -3580,7 +3580,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.vars.insert(a, vs);
             }
         }
-        if pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot").unwrap_or("loop") == "loop" {
+        if matches!(pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hotloop").unwrap_or("loop"), "loop" | "hotloop") {
             self.cycles = cycle_blocks(ctx, &pblocks);
         }
         if self.ltundef && !crate::env_is("PLIRON_LTUNDEF_ALL", "1") {
@@ -7836,7 +7836,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     // Default without a profile: `loop` (2026-11-13: 0.980
                     // time on the held-out programs for +0.5% code);
                     // `=0` turns it off.
-                    let small = match pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hot").or(Some("loop")) {
+                    let small = match pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hotloop").or(Some("loop")) {
+                        // The bundle's value: what `hot` takes, and what
+                        // the no-profile default (`loop`) takes unless
+                        // the profile saw the block never run. A profiled
+                        // build must not inline fewer of these than a
+                        // plain one (rust-protobuf, rust-json).
+                        Some("hotloop") => {
+                            let b = op.deref(self.ctx).get_parent_block();
+                            let c = b.and_then(|b| crate::pgo::block_count(self.st, b));
+                            c.zip(self.st.prof_hot).is_some_and(|(c, h)| c >= h)
+                                || (b.is_some_and(|b| self.cycles.contains(&b)) && c != Some(0))
+                        }
                         Some("1") => true,
                         Some("hot") => op
                             .deref(self.ctx)

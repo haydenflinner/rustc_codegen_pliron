@@ -186,7 +186,7 @@ With `PLIRON_PGO_USE` set, these are on unless `PLIRON_PGO_BUNDLE=0`
 | `PLIRON_PGO_HOT` | 13 | a call site whose count reaches the profile's hot count (the blocks carrying 99% of all counts, LLVM's `ProfileSummary` rule) gets 13x the inline limit and skips `loopy`/`fanin`/growth |
 | `PLIRON_PGO_XCGU` | 4000 | a callee entered at least hot-count times is copyable across codegen units up to 4000 MIR statements (default limit 50), so the hot inliner has its body |
 | `PLIRON_XCGU_CAP` | 100000 | no per-CGU bound on copies |
-| `PLIRON_MEMFAST_SMALL` | hot | runtime-size copies in hot blocks handle sizes below 16 bytes inline (without a profile the default is `loop`: copies on a CFG cycle; `0` off, `1` everywhere) |
+| `PLIRON_MEMFAST_SMALL` | hotloop | runtime-size copies handle sizes below 16 bytes inline in hot blocks, and in loops the profile saw run (without a profile the default is `loop`: copies on a CFG cycle; `0` off, `1` everywhere, `hot` hot blocks only) |
 | `PLIRON_PGO_HEAVY` | 256 | a callee that runs more than 256 blocks per call in the profile gets neither the hot nor the warm call-site bonus: there is no call overhead worth buying back (regex `follow_epsilons` into `next_state`: -3.5% instructions) |
 | `PLIRON_PGO_FREQ` | 1 | block placement uses measured edge probabilities (bit 2, spill weights, measured worse and stays off) |
 
