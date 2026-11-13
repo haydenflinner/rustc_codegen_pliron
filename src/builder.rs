@@ -325,14 +325,23 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             (String::new(), String::new())
         };
         match &targets {
-            Ok(t) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){}{}: {}",
+            Ok((t, note)) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){}{} [{note}]: {}",
                 t.len(),
                 if catch.is_some() { " (invoke)" } else { "" },
                 if crate::devirt::profile_mode() { " (profile build)" } else { "" },
                 t.iter().map(|i| self.tcx.symbol_name(*i).name).collect::<Vec<_>>().join(" ")),
-            Err(why) => pliron_cfg::remark!("devirt", caller, what; "reject ({why})"),
+            Err(why) => {
+                pliron_cfg::remark!("devirt", caller, what; "reject ({why})");
+                if pliron_cfg::remarks_on()
+                    && crate::env_set("PLIRON_PGO_USE")
+                    && !why.contains("virtual drop")
+                {
+                    let b = self.block;
+                    self.st.borrow_mut().devirt_rejects.push((b, caller.clone(), what.clone(), why.clone()));
+                }
+            }
         }
-        let targets = targets.ok()?;
+        let targets = targets.ok()?.0;
         let ret = match self.kind(llty) {
             TyK::Func(r, ..) => r,
             _ => return None,
@@ -361,21 +370,38 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let guards: Vec<_> = targets.iter().map(|_| self.append_sibling_block("devirt_guard")).collect();
         let fallback = self.append_sibling_block("devirt_fallback");
         let mut arms = Vec::with_capacity(targets.len());
+        let mut local = Vec::with_capacity(targets.len());
         self.br(guards[0]);
         for (k, t) in targets.into_iter().enumerate() {
             self.switch_to_block(guards[k]);
             let addr = self.get_fn_addr(t, None);
+            // A copy this CGU has only because the profile called the
+            // target hot did not exist in the instrumented build: here
+            // the guard compares against the copy's address, there it
+            // compared against the home definition's, so its counts say
+            // nothing about this guard. Pruned in `devirt::prune`.
+            let stale = crate::env_set("PLIRON_PGO_USE")
+                && self.st.borrow().xcgu_extra.contains(self.tcx.symbol_name(t).name)
+                && crate::xcgu::pgo_only_copy(self.tcx, t);
             let hit = self.append_sibling_block("devirt_hit");
             let eq = self.icmp(IntPredicate::IntEQ, llfn, addr);
             self.cond_br(eq, hit, guards.get(k + 1).copied().unwrap_or(fallback));
             self.switch_to_block(hit);
             let abi = self.fn_abi_of_instance(t, ty::List::empty());
             arm(self, addr, abi, Some(t));
-            arms.push((guards[k], hit));
+            arms.push((guards[k], hit, stale));
+            local.push(
+                self.st
+                    .borrow()
+                    .funcs
+                    .get(self.tcx.symbol_name(t).name)
+                    .is_some_and(|f| f.linkage != cranelift_module::Linkage::Import),
+            );
         }
         if crate::env_set("PLIRON_PGO_USE") {
             self.st.borrow_mut().devirt_sites.push(crate::context::DevirtSite {
                 arms,
+                local,
                 fallback,
                 caller,
                 what,

@@ -1,7 +1,8 @@
 //! Guarded devirtualization of `dyn Trait` calls (`PLIRON_DEVIRT=1`,
-//! opt-in). rustc knows the set of impls of a trait; when few of them can
-//! be the callee (`PLIRON_DEVIRT_MAX`, default 2), or a profile says
-//! which ones are (see [`plan`]), a virtual call becomes
+//! opt-in). rustc knows which methods the vtables of this crate hold (see
+//! `index`); when few of them can be the callee (`PLIRON_DEVIRT_MAX`,
+//! default 2), or a profile says which ones are (see [`plan`]), a virtual
+//! call becomes
 //!
 //! ```text
 //! fnptr = load vtable[idx]
@@ -18,7 +19,8 @@
 //! `builder.rs` emits the diamond.
 
 use rustc_middle::ty::layout::FnAbiOf;
-use rustc_middle::ty::{self, Instance, InstanceKind, Ty};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_middle::ty::{self, Instance, InstanceKind, Ty, TyCtxt, TypeVisitableExt};
 use rustc_target::callconv::FnAbi;
 
 use crate::context::CodegenCx;
@@ -39,38 +41,236 @@ pub fn profile_mode() -> bool {
 }
 
 /// The targets to guard at one site, from its usable candidates (sorted
-/// by symbol). Without a profile: all of them when there are at most
-/// `PLIRON_DEVIRT_MAX` (default 2), else none — nothing says which to
-/// prefer. In a profile build: the first `PLIRON_DEVIRT_PROF_MAX`
-/// (default 8); the hit blocks' counters rank them and
-/// `pliron_ir_opt::devirt::prune` keeps the hot ones.
-pub fn plan<'tcx>(mut cands: Vec<Instance<'tcx>>) -> Result<Vec<Instance<'tcx>>, String> {
+/// by symbol), and how many were left without a guard. Without a
+/// profile: all of them when there are at most `PLIRON_DEVIRT_MAX`
+/// (default 2), else none — nothing says which to prefer. In a profile
+/// build: the first `PLIRON_DEVIRT_PROF_MAX` (default 16); the hit
+/// blocks' counters rank them and `pliron_ir_opt::devirt::prune` keeps
+/// the hot ones.
+pub fn plan<'tcx>(c: Cands<'tcx>) -> Result<(Vec<Instance<'tcx>>, String), String> {
+    let Cands { mut targets, note } = c;
     if profile_mode() {
-        cands.truncate(knob("PLIRON_DEVIRT_PROF_MAX", 8));
-        if cands.is_empty() {
+        let max = knob("PLIRON_DEVIRT_PROF_MAX", 16);
+        let left = targets.len().saturating_sub(max);
+        targets.truncate(max);
+        if targets.is_empty() {
             return Err("PLIRON_DEVIRT_PROF_MAX is 0".into());
         }
-        return Ok(cands);
+        let note = if left > 0 { format!("{note}; {left} usable left unguarded") } else { note };
+        return Ok((targets, note));
     }
     let max = knob("PLIRON_DEVIRT_MAX", 2);
-    if cands.len() > max {
-        return Err(format!("{} candidates, more than {max}, and no profile to rank them", cands.len()));
+    if targets.len() > max {
+        return Err(format!(
+            "{} candidates, more than {max}, and no profile to rank them; {note}",
+            targets.len()
+        ));
     }
-    Ok(cands)
+    Ok((targets, note))
+}
+
+/// What the vtables instantiated in this crate hold, per trait method:
+/// `(trait method, its args past Self)` -> the slot instances, one per
+/// concrete `Self` that some code of this crate unsizes to a `dyn` of
+/// that trait (or of a subtrait). The slot instance comes from
+/// `Instance::expect_resolve_for_vtable`, the function rustc fills
+/// vtables with, so impl methods, provided methods, closure bodies and
+/// shims (`VTable`, `ClosureOnce`, `Reify`, ...) are all exactly the
+/// address a vtable holds.
+///
+/// The `(Self, dyn Trait)` pairs are recomputed the way the mono
+/// collector finds them: every `Unsize` pointer coercion in the MIR of
+/// every mono item. Not seen: vtables built in upstream crates and
+/// vtables that only exist in constants (`static T: &dyn Tr = &X`,
+/// promoted `&dyn` values); calls on those objects take the indirect arm.
+type Key<'tcx> = (rustc_hir::def_id::DefId, Vec<ty::GenericArg<'tcx>>);
+type Index<'tcx> = FxHashMap<Key<'tcx>, Vec<Instance<'tcx>>>;
+
+fn index<'tcx>(tcx: TyCtxt<'tcx>) -> &'tcx Index<'tcx> {
+    // One rustc process compiles one crate with one `TyCtxt`, and every
+    // CGU's codegen runs inside it: the interned types stored here are
+    // only read back under the same `'tcx`.
+    static INDEX: std::sync::OnceLock<Index<'static>> = std::sync::OnceLock::new();
+    let ix = INDEX.get_or_init(|| unsafe {
+        std::mem::transmute::<Index<'tcx>, Index<'static>>(build_index(tcx))
+    });
+    unsafe { std::mem::transmute::<&'static Index<'static>, &'tcx Index<'tcx>>(ix) }
+}
+
+fn build_index<'tcx>(tcx: TyCtxt<'tcx>) -> Index<'tcx> {
+    use rustc_middle::mir::{CastKind, Rvalue, StatementKind};
+    use rustc_middle::mono::MonoItem;
+    use rustc_middle::ty::adjustment::PointerCoercion;
+    let env = ty::TypingEnv::fully_monomorphized();
+    let mut seen: FxHashSet<Instance<'tcx>> = FxHashSet::default();
+    let mut pairs: FxHashSet<(Ty<'tcx>, Ty<'tcx>)> = FxHashSet::default();
+    for cgu in tcx.collect_and_partition_mono_items(()).codegen_units {
+        for item in cgu.items().keys() {
+            let MonoItem::Fn(inst) = *item else { continue };
+            if !seen.insert(inst) {
+                continue;
+            }
+            let body = tcx.instance_mir(inst.def);
+            for bb in body.basic_blocks.iter() {
+                for st in &bb.statements {
+                    let StatementKind::Assign(asg) = &st.kind else { continue };
+                    let rv = &asg.1;
+                    let Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::Unsize, _), op, target) = rv
+                    else {
+                        continue;
+                    };
+                    let mono = |t: Ty<'tcx>| {
+                        inst.try_instantiate_mir_and_normalize_erasing_regions(
+                            tcx,
+                            env,
+                            ty::EarlyBinder::bind(tcx, t),
+                        )
+                        .ok()
+                    };
+                    let (Some(src), Some(dst)) = (mono(op.ty(body, tcx)), mono(*target)) else {
+                        continue;
+                    };
+                    if let Some((src, dst)) = unsize_tails(tcx, src, dst, 0)
+                        && dst.is_trait()
+                        && !src.is_trait()
+                    {
+                        pairs.insert((src, dst));
+                    }
+                }
+            }
+        }
+    }
+    let mut ix: Index<'tcx> = FxHashMap::default();
+    for (self_ty, dyn_ty) in pairs {
+        let ty::Dynamic(preds, ..) = dyn_ty.kind() else { continue };
+        let Some(principal) = preds.principal() else { continue };
+        if self_ty.has_escaping_bound_vars() || dyn_ty.has_escaping_bound_vars() {
+            continue;
+        }
+        let root = tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, self_ty));
+        for sup in rustc_type_ir::elaborate::supertraits(tcx, ty::Binder::dummy(root)) {
+            let tr = tcx.instantiate_bound_regions_with_erased(sup);
+            let Ok(tr) = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(tr)) else {
+                continue;
+            };
+            for &method in tcx.own_existential_vtable_entries(tr.def_id) {
+                // As `vtable_entries` builds the slot.
+                let args = ty::GenericArgs::for_item(tcx, method, |param, _| match param.kind {
+                    ty::GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+                    _ => tr.args[param.index as usize],
+                });
+                let Ok(args) = tcx.try_normalize_erasing_regions(env, ty::Unnormalized::new_wip(args))
+                else {
+                    continue;
+                };
+                if tcx.instantiate_and_check_impossible_clauses((method, args)) {
+                    continue;
+                }
+                let slot =
+                    Instance::expect_resolve_for_vtable(tcx, env, method, args, rustc_span::DUMMY_SP);
+                let e = ix.entry((method, args[1..].to_vec())).or_default();
+                if !e.contains(&slot) {
+                    e.push(slot);
+                }
+            }
+        }
+    }
+    // Hash-set iteration order must not leak into the guard order.
+    for v in ix.values_mut() {
+        v.sort_by_key(|i| tcx.symbol_name(*i).name);
+    }
+    ix
+}
+
+/// Symbols of vtable slot instances that live `Internal` in exactly one
+/// CGU (closures, private impl methods): `xcgu::promoted` adds them, so
+/// their home CGU defines them hidden-external and a guard in any other
+/// CGU of the crate can name them. They are address-taken already (a
+/// vtable holds them), so nothing that needs a private symbol applied.
+/// Depends only on the partition, never on a profile.
+pub fn promotable<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<String> {
+    use rustc_middle::mono::MonoItem;
+    if !enabled() {
+        return Vec::new();
+    }
+    let mut home: FxHashMap<MonoItem<'tcx>, (bool, u32)> = FxHashMap::default();
+    for p in tcx.collect_and_partition_mono_items(()).codegen_units {
+        for (&item, data) in p.items() {
+            let e = home
+                .entry(item)
+                .or_insert((data.linkage == rustc_attr_ir::Linkage::Internal && !data.inlined, 0));
+            e.1 += 1;
+        }
+    }
+    let mut out: Vec<String> = index(tcx)
+        .values()
+        .flatten()
+        .filter(|i| matches!(home.get(&MonoItem::Fn(**i)), Some(&(true, 1))))
+        .map(|i| tcx.symbol_name(*i).name.to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The collector's `find_tails_for_unsizing`: the (sized, unsized) pair of
+/// innermost types an unsizing coercion `src -> dst` changes.
+fn unsize_tails<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    src: Ty<'tcx>,
+    dst: Ty<'tcx>,
+    depth: usize,
+) -> Option<(Ty<'tcx>, Ty<'tcx>)> {
+    let env = ty::TypingEnv::fully_monomorphized();
+    if depth > 16 {
+        return None;
+    }
+    match (src.kind(), dst.kind()) {
+        (&ty::Pat(a, _), &ty::Pat(b, _)) => unsize_tails(tcx, a, b, depth + 1),
+        (&ty::Ref(_, a, _), &ty::Ref(_, b, _) | &ty::RawPtr(b, _))
+        | (&ty::RawPtr(a, _), &ty::RawPtr(b, _)) => {
+            Some(tcx.struct_lockstep_tails_for_codegen(a, b, env))
+        }
+        _ if let (Some(a), Some(b)) = (src.boxed_ty(), dst.boxed_ty()) => {
+            Some(tcx.struct_lockstep_tails_for_codegen(a, b, env))
+        }
+        (&ty::Adt(a_def, a_args), &ty::Adt(b_def, b_args)) if a_def == b_def => {
+            use rustc_middle::traits::{ImplSource, ImplSourceUserDefinedData};
+            let cu = tcx.lang_items().coerce_unsized_trait()?;
+            let tr = ty::TraitRef::new(tcx, cu, [src, dst]);
+            let Ok(ImplSource::UserDefined(ImplSourceUserDefinedData { impl_def_id, .. })) =
+                tcx.codegen_select_candidate(env.as_query_input(tr))
+            else {
+                return None;
+            };
+            let ty::adjustment::CustomCoerceUnsized::Struct(idx) =
+                tcx.coerce_unsized_info(*impl_def_id).ok()?.custom_kind?;
+            let field = &a_def.non_enum_variant().fields[idx];
+            let norm = |t| tcx.try_normalize_erasing_regions(env, t).ok();
+            unsize_tails(tcx, norm(field.ty(tcx, a_args))?, norm(field.ty(tcx, b_args))?, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// The usable targets of one virtual call, sorted by symbol name, and a
+/// note on what was not usable.
+#[derive(Clone)]
+pub struct Cands<'tcx> {
+    pub targets: Vec<Instance<'tcx>>,
+    /// e.g. `7 instantiated, 3 usable (2 not linkable, 2 ABI differs)`.
+    pub note: String,
 }
 
 /// Direct-call targets for the virtual call `virt` (an
 /// `InstanceKind::Virtual` instance whose `args` are the trait method's
-/// with `Self = dyn Trait`), sorted by symbol name, or the reason there
-/// are none. Memoized per CGU: the answer depends on which symbols this
-/// CGU can link to. Impls that cannot serve this call (other trait args)
-/// or have no single instance (generic, blanket) are simply not
-/// candidates; the indirect arm covers them.
+/// with `Self = dyn Trait`), or the reason there are none. Memoized per
+/// CGU: the answer depends on which symbols this CGU can link to.
 pub fn candidates<'tcx>(
     cx: &CodegenCx<'tcx>,
     virt: Instance<'tcx>,
     fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-) -> Result<Vec<Instance<'tcx>>, String> {
+) -> Result<Cands<'tcx>, String> {
     if let Some(r) = cx.devirt.borrow().get(&virt) {
         return r.clone();
     }
@@ -83,104 +283,64 @@ fn compute<'tcx>(
     cx: &CodegenCx<'tcx>,
     virt: Instance<'tcx>,
     fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-) -> Result<Vec<Instance<'tcx>>, String> {
+) -> Result<Cands<'tcx>, String> {
     let tcx = cx.tcx;
     let InstanceKind::Virtual(method, _) = virt.def else {
         return Err("not a virtual call".into());
     };
     // Virtual drop glue reaches `call` as `Virtual(drop_in_place, 0)`.
-    let Some(trait_def) = tcx.trait_of_assoc(method) else {
+    if tcx.trait_of_assoc(method).is_none() {
         return Err("not a trait method (virtual drop)".into());
-    };
-    // A by-value `self` method sits in the vtable as a `VTable` shim that
-    // takes the pointer; the method itself has another ABI.
-    let sig = tcx.fn_sig(method).instantiate_identity().skip_norm_wip();
-    if sig.inputs().skip_binder().is_empty()
-        || sig.input(0).skip_binder().is_param(0)
-        || !tcx.generics_of(method).has_self
-    {
-        return Err("by-value self receiver".into());
     }
-    // Compile-time bound only: every impl examined costs a normalize, a
-    // resolve and an fn ABI, and `dyn Debug` has thousands.
-    let scan = knob("PLIRON_DEVIRT_SCAN", 64);
-    if tcx.all_impls(trait_def).take(scan + 1).count() > scan {
-        return Err(format!("more than {scan} impls to scan"));
-    }
-    let env = ty::TypingEnv::fully_monomorphized();
-    let ntrait = tcx.generics_of(trait_def).count();
-    if virt.args.len() < ntrait || ntrait == 0 {
+    if virt.args.is_empty() {
         return Err("unexpected generic args".into());
+    }
+    let Some(slots) = index(tcx).get(&(method, virt.args[1..].to_vec())) else {
+        return Err("no vtable for this trait instantiated in this crate (upstream or constant vtables only)".into());
+    };
+    // Compile-time bound: each slot costs an fn ABI and a signature.
+    let scan = knob("PLIRON_DEVIRT_SCAN", 512);
+    if slots.len() > scan {
+        return Err(format!("{} instantiated targets, more than {scan} to scan", slots.len()));
     }
     let (want_ty, want_exts) = cx.fn_sig(fn_abi);
     let want_exts = format!("{want_exts:?}");
     let mut out = Vec::new();
-    let mut why = String::from("no impls");
-    for imp in tcx.all_impls(trait_def) {
-        if tcx.impl_polarity(imp) != ty::ImplPolarity::Positive {
-            why = "negative impl".into();
-            continue;
-        }
-        // Lifetime-only generics are fine (erased); type/const params
-        // (including blanket impls) have no single instance.
-        if tcx.generics_of(imp).requires_monomorphization(tcx) {
-            why = "generic impl".into();
-            continue;
-        }
-        let impl_args = ty::GenericArgs::for_item(tcx, imp, |_, _| tcx.lifetimes.re_erased.into());
-        let Ok(tr) = tcx.try_instantiate_and_normalize_erasing_regions(
-            impl_args,
-            env,
-            tcx.impl_trait_ref(imp),
-        ) else {
-            why = "impl trait ref does not normalize".into();
-            continue;
-        };
-        // `impl Trait<A> for T` only serves `dyn Trait<A>` calls.
-        if tr.args.len() != ntrait || tr.args[1..] != virt.args[1..ntrait] {
-            why = "impl for other trait args".into();
-            continue;
-        }
-        let args = tcx.mk_args_from_iter(
-            std::iter::once(tr.args[0]).chain(virt.args[1..].iter().copied()),
-        );
-        let Ok(Some(inst)) = Instance::try_resolve(tcx, env, method, args) else {
-            why = "method does not resolve".into();
-            continue;
-        };
-        // What `resolve_for_vtable` would wrap in a shim (`#[track_caller]`,
-        // closures, nested virtual) is not what the vtable holds.
-        if !matches!(inst.def, InstanceKind::Item(_)) || inst.def.requires_caller_location(tcx) {
-            why = "vtable entry is a shim".into();
-            continue;
-        }
-        if tcx.is_foreign_item(inst.def_id()) {
-            why = "foreign item".into();
+    let mut why: Vec<(String, usize)> = Vec::new();
+    let mut reject = |w: String| match why.iter_mut().find(|(x, _)| *x == w) {
+        Some(e) => e.1 += 1,
+        None => why.push((w, 1)),
+    };
+    for &inst in slots {
+        if matches!(inst.def, InstanceKind::Item(_)) && tcx.is_foreign_item(inst.def_id()) {
+            reject("foreign item".into());
             continue;
         }
         if let Err(e) = same_abi(cx, inst, fn_abi, want_ty, &want_exts) {
-            why = e;
+            reject(e);
             continue;
         }
         if !linkable(cx, inst) {
-            why = "target not linkable from this CGU".into();
+            reject("not linkable from this CGU".into());
             continue;
         }
-        if !out.contains(&inst) {
-            out.push(inst);
-        }
+        out.push(inst);
     }
+    let rejects =
+        why.iter().map(|(w, n)| format!("{n} {w}")).collect::<Vec<_>>().join(", ");
     if out.is_empty() {
-        return Err(why);
+        return Err(format!("{} instantiated, none usable ({rejects})", slots.len()));
     }
-    // One order for every build of this crate: the instrumented and the
-    // profile-use build must lay the chain out identically.
-    out.sort_by_key(|i| tcx.symbol_name(*i).name);
-    Ok(out)
+    let note = if rejects.is_empty() {
+        format!("{} instantiated, all usable", slots.len())
+    } else {
+        format!("{} instantiated, {} usable ({rejects})", slots.len(), out.len())
+    };
+    Ok(Cands { targets: out, note })
 }
 
 /// The direct callee must take exactly the lowered argument list of the
-/// virtual call: same convention, same pass modes, same types past the
+/// virtual call: same convention, same pass modes, same layouts past the
 /// receiver, and a receiver that is one thin pointer (`&self`,
 /// `Box<Self>`, `Rc<Self>`, `Pin<&mut Self>`, ... all are).
 fn same_abi<'tcx>(
@@ -199,7 +359,15 @@ fn same_abi<'tcx>(
     {
         return Err("ABI differs (convention or arity)".into());
     }
-    if abi.ret.layout.ty != virt_abi.ret.layout.ty || abi.ret.mode != virt_abi.ret.mode {
+    // Layouts, not types: the two signatures can spell one type with
+    // different (erased vs bound) regions.
+    if abi.ret.layout.layout != virt_abi.ret.layout.layout || abi.ret.mode != virt_abi.ret.mode {
+        if crate::env_set("PLIRON_DEVIRT_DEBUG") {
+            return Err(format!(
+                "ABI differs (return: {:?} {:?} vs {:?} {:?})",
+                abi.ret.layout.ty, abi.ret.mode, virt_abi.ret.layout.ty, virt_abi.ret.mode
+            ));
+        }
         return Err("ABI differs (return)".into());
     }
     let ptr = |a: &rustc_target::callconv::ArgAbi<'tcx, Ty<'tcx>>| {
@@ -214,7 +382,7 @@ fn same_abi<'tcx>(
         return Err("receiver is not a thin pointer".into());
     }
     for (a, v) in abi.args.iter().zip(virt_abi.args.iter()).skip(1) {
-        if a.layout.ty != v.layout.ty || a.mode != v.mode {
+        if a.layout.layout != v.layout.layout || a.mode != v.mode {
             return Err("ABI differs (argument)".into());
         }
     }

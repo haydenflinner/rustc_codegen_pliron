@@ -27,6 +27,15 @@ fn knob(name: &str, default: u64) -> u64 {
 /// call. Dropped arms' counts move to the fallback block. Returns the
 /// number of sites rewritten.
 pub fn prune(ctx: &mut Context, st: &mut State) -> usize {
+    // What the unguarded sites cost: their calls, by reason.
+    for (b, caller, what, why) in std::mem::take(&mut st.devirt_rejects) {
+        if b.is_live(ctx)
+            && let Some(c) = st.prof_bcount.get(b).copied()
+            && c > 0
+        {
+            pliron_cfg::remark!("devirt", caller, what; "profile: unguarded calls {c} ({why})");
+        }
+    }
     let sites = std::mem::take(&mut st.devirt_sites);
     if sites.is_empty() {
         return 0;
@@ -35,7 +44,7 @@ pub fn prune(ctx: &mut Context, st: &mut State) -> usize {
     let share = knob("PLIRON_DEVIRT_MIN_SHARE", 10) as u128;
     let mut touched: Vec<Ptr<Operation>> = Vec::new();
     for s in sites {
-        if !s.fallback.is_live(ctx) || s.arms.iter().any(|(g, h)| !g.is_live(ctx) || !h.is_live(ctx)) {
+        if !s.fallback.is_live(ctx) || s.arms.iter().any(|(g, h, _)| !g.is_live(ctx) || !h.is_live(ctx)) {
             continue;
         }
         // The recorded shape must still hold: guard i ends in
@@ -43,7 +52,7 @@ pub fn prune(ctx: &mut Context, st: &mut State) -> usize {
         let n = s.arms.len();
         let terms: Vec<Option<Ptr<Operation>>> = (0..n)
             .map(|i| {
-                let (g, h) = s.arms[i];
+                let (g, h, _) = s.arms[i];
                 let next = s.arms.get(i + 1).map_or(s.fallback, |a| a.0);
                 let t = g.deref(ctx).iter(ctx).last()?;
                 let o = t.deref(ctx);
@@ -66,20 +75,29 @@ pub fn prune(ctx: &mut Context, st: &mut State) -> usize {
         let counts: Vec<u64> = s
             .arms
             .iter()
-            .map(|(_, h)| st.prof_bcount.get(*h).copied().unwrap_or(0))
+            .map(|(_, h, _)| st.prof_bcount.get(*h).copied().unwrap_or(0))
             .collect();
         let fb = st.prof_bcount.get(s.fallback).copied().unwrap_or(0);
         let total: u64 = counts.iter().fold(fb, |a, c| a.saturating_add(*c));
         let mut order: Vec<usize> = (0..n)
-            .filter(|&i| counts[i] > 0 && counts[i] as u128 * 100 >= share * total as u128)
+            .filter(|&i| !s.arms[i].2 && counts[i] > 0 && counts[i] as u128 * 100 >= share * total as u128)
             .collect();
         order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
         order.truncate(max);
         if pliron_cfg::remarks_on() {
             let pct = |c: u64| if total == 0 { 0 } else { (c as u128 * 100 / total as u128) as u64 };
-            let shares: Vec<String> = counts.iter().map(|&c| format!("{}%", pct(c))).collect();
+            let shares: Vec<String> = (0..n)
+                .map(|i| {
+                    format!(
+                        "{}%{}{}",
+                        pct(counts[i]),
+                        if s.local.get(i).copied().unwrap_or(false) { "L" } else { "X" },
+                        if s.arms[i].2 { "(pgo-only copy)" } else { "" }
+                    )
+                })
+                .collect();
             pliron_cfg::remark!("devirt", s.caller, s.what;
-                "profile: kept {} of {} arms (shares {} fallback {}% calls {}{})",
+                "profile: kept {} of {} arms (shares {} fallback {}% calls {}{}; L = body in this CGU, X = other CGU or crate)",
                 order.len(), n, shares.join(" "), pct(fb), total,
                 if profiled { "" } else { ", no profile for function" });
         }
@@ -110,7 +128,7 @@ pub fn prune(ctx: &mut Context, st: &mut State) -> usize {
             st.prof_bcount.insert(s.fallback, remaining);
         }
         for i in (0..n).filter(|i| !order.contains(i)) {
-            let (g, h) = s.arms[i];
+            let (g, h, _) = s.arms[i];
             st.prof_bcount.remove(g);
             st.prof_bcount.remove(h);
             st.prof_edges.remove(terms[i]);

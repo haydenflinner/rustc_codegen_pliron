@@ -304,6 +304,32 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
   one. Recording pairs per MIR block is straightforward but nothing
   measured here would show it.
 
+## Devirtualization
+
+`PLIRON_DEVIRT=1` turns a `dyn Trait` call into guards on the function
+pointer loaded from the vtable, each followed by a direct call, with the
+indirect call kept as the last arm (`src/devirt.rs`). The profile says
+which targets deserve a guard, and it needs no value-profiling runtime:
+every guard's hit block has an ordinary block counter. The candidates
+are the slot instances of the vtables this crate instantiates (impl
+methods, provided methods, closure bodies behind `dyn Fn*`); the
+instrumented build emits a guard for up to `PLIRON_DEVIRT_PROF_MAX`
+(16) of them, in symbol order, and the remark says how many were left
+without one. The profile-use build emits exactly the same chain, so
+the function's fingerprint matches, and right after `pgo::load`
+`pliron_ir_opt::devirt::prune` rewrites each chain: arms with at least
+`PLIRON_DEVIRT_MIN_SHARE` (10) percent of the site's calls stay, at
+most `PLIRON_DEVIRT_MAX` (2), hottest first; the rest are deleted and
+their counts added to the fallback block. A site with no calls, or in a
+function without a matching record, becomes the plain indirect call
+again. The knob must be set for both builds
+(`run.py --pgo-gen-env PLIRON_DEVIRT=1 --pgo-env PLIRON_DEVIRT=1`);
+set on one side only, every function with a site goes stale.
+`PLIRON_REMARKS` lists each site's shares, and for the sites left
+indirect their call counts and the reason (vtable built in another
+crate, target not linkable from the CGU, ABI). Numbers:
+`docs/history/2026-11-13-six-features.md`, section 3.
+
 ## Knobs
 
 | env | effect |

@@ -91,8 +91,14 @@ def ensure(prog, binary, side, backend):
             sys.exit(f"ab: {exe} missing; run bench/heldout/run.py first")
         return exe
     be = os.path.getmtime(backend) if "codegen-backend" in env.get("RUSTFLAGS", "") else 0
+    # The profile's content, not only its path: `run.py --pgo` rewrites
+    # `pliron.prof` in place, and a side built from the previous one is a
+    # different build (a profile generated under another CFG-changing
+    # knob leaves every affected function stale).
+    prof = env.get("PLIRON_PGO_USE")
+    prof = hashlib.sha1(open(prof, "rb").read()).hexdigest() if prof and os.path.isfile(prof) else ""
     stamp = hashlib.sha1(repr((sorted((k, v) for k, v in env.items() if k.startswith(("PLIRON_", "RUSTFLAGS"))),
-                               be)).encode()).hexdigest()
+                               be, prof)).encode()).hexdigest()
     sfile = os.path.join(OUT, d, prog + ".stamp")
     if os.path.exists(exe) and os.path.exists(sfile) and open(sfile).read() == stamp:
         return exe

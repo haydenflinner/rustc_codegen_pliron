@@ -350,8 +350,13 @@ pub struct CallInfo {
 /// its hit block (the direct call) or to the next guard; the last guard
 /// misses to `fallback`, the indirect call.
 pub struct DevirtSite {
-    /// (guard block, hit block) in chain order.
-    pub arms: Vec<(Ptr<BasicBlock>, Ptr<BasicBlock>)>,
+    /// (guard block, hit block, counts unusable) in chain order. The flag
+    /// marks an arm whose hit count from the instrumented build does not
+    /// describe this build's guard; it is always dropped.
+    pub arms: Vec<(Ptr<BasicBlock>, Ptr<BasicBlock>, bool)>,
+    /// Per arm: the target has a body in this CGU (the direct call can
+    /// inline). Remarks only.
+    pub local: Vec<bool>,
     pub fallback: Ptr<BasicBlock>,
     /// Caller symbol and trait method path, for remarks (empty when off).
     pub caller: String,
@@ -624,6 +629,9 @@ pub struct State {
     /// `PLIRON_DEVIRT` guard chains built for a profile-use build
     /// (`PLIRON_PGO_USE`), pruned by `devirt::prune` once counts are loaded.
     pub devirt_sites: Vec<DevirtSite>,
+    /// Virtual calls `PLIRON_DEVIRT` left alone in a profile-use build,
+    /// kept only for remarks: (block of the call, caller, method, reason).
+    pub devirt_rejects: Vec<(Ptr<BasicBlock>, String, String, String)>,
     /// The profile's hot count: the smallest block count among the blocks
     /// that together carry 99% of all counted executions (LLVM's
     /// `ProfileSummary` hot threshold). A call site at or above it is hot.
@@ -683,8 +691,9 @@ impl State {
         self.region_blocks.retain(lb);
         self.region_parent.retain(lb);
         self.prof_bcount.retain(lb);
+        self.devirt_rejects.retain(|r| lb(&r.0));
         self.devirt_sites
-            .retain(|s| lb(&s.fallback) && s.arms.iter().all(|(g, h)| lb(g) && lb(h)));
+            .retain(|s| lb(&s.fallback) && s.arms.iter().all(|(g, h, _)| lb(g) && lb(h)));
         if self.last_call.is_some_and(|c| !c.is_live(ctx)) {
             self.last_call = None;
         }

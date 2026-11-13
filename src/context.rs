@@ -58,7 +58,7 @@ pub struct CodegenCx<'tcx> {
     pub cgu_name: String,
     /// `PLIRON_DEVIRT`: direct-call targets per virtual-call instance
     /// (`devirt::candidates`), or why there are none.
-    pub devirt: RefCell<FxHashMap<Instance<'tcx>, Result<Vec<Instance<'tcx>>, String>>>,
+    pub devirt: RefCell<FxHashMap<Instance<'tcx>, Result<crate::devirt::Cands<'tcx>, String>>>,
 }
 
 // r[impl front.ir.symbols]
