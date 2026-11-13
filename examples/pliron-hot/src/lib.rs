@@ -322,7 +322,11 @@ impl<'d> Parsed<'d> {
                     if t.undef || t.kind == SymbolKind::Text || is_mangled(t.name) {
                         t.name.hash(h);
                     } else if let (Some(ti), true) = (t.sec, deep) {
-                        t.addr.hash(h);
+                        // By content only, not by address: an anonymous
+                        // blob moves whenever an earlier one grows, and
+                        // hashing where it sits made every function that
+                        // names a constant look changed after an edit
+                        // elsewhere (tests-on-save reran everything).
                         let (tlo, thi) = self.extent(ti, t.addr, t.size);
                         self.hash_range(ti, tlo, thi, h, false);
                     }
@@ -562,7 +566,7 @@ fn retire(mem: usize, len: usize) {
     static HANDLER: std::sync::Once = std::sync::Once::new();
     HANDLER.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = retired_fault as usize;
+        sa.sa_sigaction = retired_fault as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO;
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
