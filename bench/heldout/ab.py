@@ -142,7 +142,7 @@ def once(prog, exe):
 
 
 def main():
-    ap = argparse.ArgumentParser(usage=__doc__)
+    ap = argparse.ArgumentParser(usage=__doc__.replace("%", "%%"))
     ap.add_argument("prog")
     ap.add_argument("sides", nargs="+")
     ap.add_argument("--rounds", type=int, default=15)

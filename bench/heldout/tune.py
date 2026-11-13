@@ -71,7 +71,7 @@ def measure(prog, binary, sides, rounds, backend):
 
 
 def main():
-    ap = argparse.ArgumentParser(usage=__doc__)
+    ap = argparse.ArgumentParser(usage=__doc__.replace("%", "%%"))
     ap.add_argument("prog")
     ap.add_argument("--rounds", type=int, default=11)
     ap.add_argument("--json")

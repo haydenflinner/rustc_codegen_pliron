@@ -73,7 +73,7 @@ def one(seed, extra):
 
 
 def main():
-    ap = argparse.ArgumentParser(usage=__doc__)
+    ap = argparse.ArgumentParser(usage=__doc__.replace("%", "%%"))
     ap.add_argument("seeds")
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--env", action="append", default=[])
