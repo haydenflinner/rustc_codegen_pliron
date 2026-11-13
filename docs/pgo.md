@@ -259,32 +259,50 @@ PLIRON_PGO_USE=pliron.prof PLIRON_FIELD_ORDER=$PWD/fields.heat cargo build --rel
   coarser.
 - **Check**: `tests/field_order/run.sh` builds one program plain, with
   heat, and under three order files, and diffs sizes, alignments and
-  values. Measured 2026-11-13 with static heat (no profile), 5 rounds of
-  `bench/heldout/ab.py`: pulldown-cmark 15 structs permuted,
-  instructions 1.000-1.004; rust-json 54 structs, 1.002;
-  rust-html-rewriter 152 structs, 1.000; cycles within noise; output
-  matches `benchmark.stdout.expected` on all three. Correct, and so far
-  neutral.
+  values.
+- **Profile path** (2026-11-13): the full loop (`PLIRON_PGO` build, run,
+  `pliron-prof merge`, `PLIRON_PGO_USE` + `PLIRON_FIELD_HEAT`, then
+  `PLIRON_PGO_USE` + `PLIRON_FIELD_ORDER`) runs on the cache benchmark
+  and three held-out programs. Weights are measured counts
+  (`PLIRON_TRACE=pliron::field_order` prints, per CGU, how many
+  `(block, field)` pairs found a count: pulldown-cmark 913 counted, 607
+  count 0, 287 in functions the profile does not have, 0 without a
+  backend block). Reordering does not stale the profile: the same
+  functions match with and without the order file (pulldown-cmark
+  2144, rust-html-rewriter 8196, rust-protobuf 1804; 0 stale).
+- **What it buys** (`tests/field_order/cache.sh`, Apple M3 Max, 128-byte
+  lines; `Particle` 160 bytes and `Node` 192 bytes with four hot fields
+  spread over two lines, ns per element, plain -> reordered; stock
+  rustc/LLVM equals plain within noise, it has the same layout):
 
-## Devirtualization
+  | elements | gather (shuffled, independent) | walk (shuffled, linked) | sweep (sequential) |
+  | --- | --- | --- | --- |
+  | 20k (fits L2) | 2.58 -> 1.07 | 11.2 -> 9.5 | 1.42 -> 1.05 |
+  | 100k | 4.90 -> 2.98 | noise | 2.31 -> 5.87 |
+  | 1M (160-190 MB) | 14.3 -> 9.4 | 149 -> 136 | 2.59 -> 7.12 |
 
-`PLIRON_DEVIRT=1` turns a `dyn Trait` call into guards on the function
-pointer loaded from the vtable, each followed by a direct call, with the
-indirect call kept as the last arm (`src/devirt.rs`). The profile says
-which targets deserve a guard, and it needs no value-profiling runtime:
-every guard's hit block has an ordinary block counter. The instrumented
-build emits a guard for up to `PLIRON_DEVIRT_PROF_MAX` (8) concrete
-impls, in symbol order. The profile-use build emits exactly the same
-chain, so the function's fingerprint matches, and right after
-`pgo::load` `pliron_ir_opt::devirt::prune` rewrites each chain: arms
-with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the site's
-calls stay, at most `PLIRON_DEVIRT_MAX` (2), hottest first; the rest
-are deleted and their counts added to the fallback block. A site with
-no calls, or in a function without a matching record, becomes the plain
-indirect call again. The knob must be set for both builds
-(`run.py --pgo-gen-env PLIRON_DEVIRT=1 --pgo-env PLIRON_DEVIRT=1`);
-set on one side only, every function with a site goes stale.
-`PLIRON_REMARKS` lists each site's shares.
+  Random access to big structs gains 35-60% at every size; a linked
+  walk gains 10-15% in cache and little beyond it (its misses already
+  overlap inside one node; the chain is latency-bound). The sequential
+  sweep is the warning: 25% faster in cache, **2.5x slower** once the
+  array leaves the cache. A stock-LLVM build with the hot fields placed
+  first by hand in a `repr(C)` struct shows the same slowdown, so it is
+  the layout, not our code. The likely cause (not verified with
+  counters): with the hot fields spread out, the sweep
+  touches every line and several load streams prefetch ahead; packed,
+  it is one sparse stream. The profile cannot tell a sweep from a
+  gather, so this stays opt-in.
+- **Held-out programs**, profile-weighted heat, `ab.py`, cycles
+  reordered/plain: pulldown-cmark 1.014 (5 rounds, 8 structs),
+  rust-html-rewriter 1.006 (15 rounds, 44 structs), rust-protobuf 0.989
+  (15 rounds, 2 structs), on a loaded machine (noise about 2%). No
+  signal: their hot structs are small and their data sits in cache. On
+  the cache benchmark the effect needs structs wider than one line and
+  either random access or a working set that fits in cache.
+- **Not done**: co-access. Heat ranks fields one by one; fields read in
+  the same hot block should share a line when the hot set is wider than
+  one. Recording pairs per MIR block is straightforward but nothing
+  measured here would show it.
 
 ## Knobs
 

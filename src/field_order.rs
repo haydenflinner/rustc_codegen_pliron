@@ -384,6 +384,9 @@ pub(crate) fn note_block(llfn: Ptr<Operation>, name: &str, bb: Ptr<BasicBlock>) 
 struct Pending {
     keys: Vec<(String, String)>,
     hits: Vec<(Ptr<BasicBlock>, u32, u64)>,
+    /// `(MIR block, field)` pairs with no backend block / in instances
+    /// whose function was not found (for the trace line).
+    unmapped: (u64, u64),
 }
 
 static PENDING: Mutex<Option<HashMap<String, Pending>>> = Mutex::new(None);
@@ -513,6 +516,7 @@ pub(crate) fn record_cgu<'tcx>(
     let mut keys = Vec::new();
     let mut pend: Vec<(Ptr<BasicBlock>, u32, u64)> = Vec::new();
     let mut stat: HashMap<u32, u64> = HashMap::new();
+    let mut unmapped = (0u64, 0u64);
     for inst in insts {
         let body = tcx.instance_mir(inst.def);
         let mut walk = Walk { tcx, body, ids: &mut ids, keys: &mut keys, hits: HashMap::new() };
@@ -531,7 +535,10 @@ pub(crate) fn record_cgu<'tcx>(
             continue;
         }
         let op = cx.st.borrow().funcs.get(tcx.symbol_name(inst).name).map(|f| f.op);
-        let Some(list) = op.and_then(|op| blocks.get(&op)) else { continue };
+        let Some(list) = op.and_then(|op| blocks.get(&op)) else {
+            unmapped.1 += hits.len() as u64;
+            continue;
+        };
         let mut llbb: Vec<Option<Ptr<BasicBlock>>> = vec![None; body.basic_blocks.len()];
         for &(i, b) in list {
             if let Some(s) = llbb.get_mut(i as usize) {
@@ -554,8 +561,9 @@ pub(crate) fn record_cgu<'tcx>(
                 }
                 cur = p;
             };
-            if let Some(b) = b {
-                pend.push((b, k, c));
+            match b {
+                Some(b) => pend.push((b, k, c)),
+                None => unmapped.0 += 1,
             }
         }
     }
@@ -567,7 +575,7 @@ pub(crate) fn record_cgu<'tcx>(
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
-            .insert(cgu.to_string(), Pending { keys, hits: pend });
+            .insert(cgu.to_string(), Pending { keys, hits: pend, unmapped });
     }
 }
 
@@ -580,11 +588,27 @@ pub(crate) fn resolve(cgu: &str, st: &pliron_ir_opt::state::State) {
     }
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(cgu)) else { return };
     let mut sums: HashMap<u32, u64> = HashMap::new();
+    let (mut counted, mut zero, mut nocount) = (0u64, 0u64, 0u64);
     for (b, k, c) in p.hits {
-        if let Some(n) = pliron_ir_opt::pgo::block_count(st, b) {
-            let e = sums.entry(k).or_insert(0);
-            *e = e.saturating_add(n.saturating_mul(c));
+        match pliron_ir_opt::pgo::block_count(st, b) {
+            Some(n) => {
+                if n == 0 {
+                    zero += 1;
+                } else {
+                    counted += 1;
+                }
+                let e = sums.entry(k).or_insert(0);
+                *e = e.saturating_add(n.saturating_mul(c));
+            }
+            None => nocount += 1,
         }
+    }
+    // `PLIRON_TRACE=pliron::field_order`: how the `(block, field)` pairs
+    // of this CGU found their counts.
+    if pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::field_order",
+            "field-heat {cgu}: {counted} counted, {zero} count 0, {nocount} no profile, {} no backend block, {} no function",
+            p.unmapped.0, p.unmapped.1);
     }
     add_totals(sums.into_iter().map(|(k, w)| (p.keys[k as usize].clone(), w)));
 }
