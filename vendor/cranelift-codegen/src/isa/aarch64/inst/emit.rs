@@ -64,6 +64,25 @@ pub fn mem_finalize(
                     uimm12,
                 };
                 (smallvec![], mem)
+            } else if let Some(imm12) = u64::try_from(off).ok().and_then(Imm12::maybe_from_u64) {
+                // PLIRON: an offset an `add` immediate holds (a 16-byte
+                // vector slot at an offset that is not a multiple of 16,
+                // past the unscaled range): `add tmp, base, #off` and a
+                // plain `[tmp]`, not `mov tmp, #off` and `[base, tmp,
+                // sxtx]`. Same count, one register read less on the
+                // access, and a form every tool decodes (valgrind does
+                // not know the extended-register `ldr q`).
+                let tmp = writable_spilltmp_reg();
+                (
+                    smallvec![Inst::AluRRImm12 {
+                        alu_op: ALUOp::Add,
+                        size: OperandSize::Size64,
+                        rd: tmp,
+                        rn: basereg,
+                        imm12,
+                    }],
+                    AMode::UnsignedOffset { rn: tmp.to_reg(), uimm12: UImm12Scaled::zero(access_ty) },
+                )
             } else {
                 let tmp = writable_spilltmp_reg();
                 (
