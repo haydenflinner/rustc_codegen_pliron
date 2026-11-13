@@ -543,6 +543,24 @@ in the scoreboard and in the linked history files.
   shims always elect since they survive inlining regardless.
   `=1`/`=all`/`=0` keep the older copy modes.
   `history/2026-11-06-xcgu-dedup.md`.
+- **Emulated-EH tax (measured 2026-11-12, x86-64 COFF).** On a
+  call-heavy probe (5254 B vs 2437 B LLVM = 2.16x, 1226 vs 694
+  insts): every maythrow call site pays `load __pliron_eh.flag;
+  brif` plus register shuffling (~10-15 B), and every function
+  containing one pays the ~25 B `_tls_index`/`gs:[0x58]` chain —
+  zero inline cost under LLVM's SEH `.xdata`. Forwarding shims
+  (`__rust_alloc` et al.) show it worst: 59 B vs LLVM's 5-byte
+  `jmp`. Secondary: no push/pop prologue (movq spill pairs at
+  ~4-5 B vs 1 B), movq traffic 379 vs 157 (call arg shuffling +
+  EH spills), no tail calls, dead `jmp` stubs after `ret`.
+  Landed: strict-`nowrite` callees now skip `eh_check` (an
+  emulated raise is a TLS store; a write-free callee can contain
+  none) — nounwind inference already covered `nounwind` callees;
+  `stubhoist` sweeps orphaned forwarder blocks unconditionally.
+  Import/indirect calls keep the check — a foreign callee can
+  call back into pliron code that raises (the `sort_by` callback
+  case), so they legitimately maythrow. The remaining big lever
+  is real SEH (`docs/seh-design.md`, unlanded).
 - **wasm.** Op density, not dead code: `local.get`/`local.set`, `br` and
   `if`/`else` counts are several times LLVM's (see the runtime entry on
   local traffic). The default-on wasm size set (`PLIRON_WASM_NOIRRED`,

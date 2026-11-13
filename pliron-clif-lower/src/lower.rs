@@ -6871,6 +6871,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let sym = &self.st.ident_to_sym[&ident.to_string()].clone();
                 callee_sym = Some(sym.clone());
                 maythrow = !self.st.funcs.get(sym).is_some_and(|f| f.nounwind)
+                    // An emulated raise is a store to the `__pliron_eh` TLS
+                    // slot; a strict-nowrite callee can contain none.
+                    && self.st.nowrite.get(sym).copied() != Some(true)
                     && !(sym.starts_with("__pliron_asm_")
                         || sym.starts_with("__pliron_llvm_")
                         || sym.starts_with("__pliron_a64_"));

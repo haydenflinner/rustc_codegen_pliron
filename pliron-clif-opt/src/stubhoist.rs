@@ -290,8 +290,9 @@ pub fn run(func: &mut Function) -> usize {
             break;
         }
     }
-    if n > 0 {
-        remove_unreachable_blocks(func);
-    }
+    // Orphaned blocks from earlier edge folds (edgesel, jumpthread
+    // stubs whose last pred was retargeted) emit dead `jmp` tails;
+    // sweep every run, not only when this pass folded something.
+    n += remove_unreachable_blocks(func);
     n
 }
