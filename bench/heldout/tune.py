@@ -13,7 +13,8 @@ program, greedily over the knobs below, starting from the bundle:
   for each candidate setting:
       build it on top of the best so far, time both interleaved;
       keep it if the timed region's median improves by more than 1%
-      and its fastest run by more than 0.5%.
+      and its fastest run by more than 0.5% -- twice, in two independent
+      measurements.
 
 then times the winner against plain pliron, LLVM and LLVM with its own
 profile. One build per candidate (cached, like `ab.py`), so a full
@@ -94,6 +95,15 @@ def main():
             m = measure(a.prog, binary, [side(best), side(cand)], a.rounds, a.backend)
             (bm, bmin, bi), (cm, cmin, ci) = m[side(best)], m[side(cand)]
             keep = cm < bm * 0.99 and cmin < bmin * 0.995
+            if keep:
+                # Two runs of this search picked different winners: a 1%
+                # median over 11 rounds is inside this machine's noise.
+                # A candidate has to win a second, independent
+                # measurement (no rebuild) before it is kept.
+                m2 = measure(a.prog, binary, [side(cand), side(best)], a.rounds, a.backend)
+                keep = m2[side(cand)][0] < m2[side(best)][0] * 0.99 and m2[side(cand)][1] < m2[side(best)][1] * 0.995
+                if not keep:
+                    print(f"{knob}={v}: won once, lost the confirmation run", flush=True)
             print(f"{knob}={v}: median {cm / bm:.3f} min {cmin / bmin:.3f} instr {ci / bi:.3f}"
                   f"{'  <- kept' if keep else ''}", flush=True)
             log.append({"knob": knob, "value": v, "median": cm / bm, "min": cmin / bmin, "instr": ci / bi,

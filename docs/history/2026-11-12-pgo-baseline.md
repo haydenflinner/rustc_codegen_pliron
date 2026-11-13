@@ -374,3 +374,12 @@ space instead.
 
 Gate: passed on a01e55a (101 jobs). Fuzz: 600 seeds with
 `MEMFAST_SMALL=loop`, 400 with `EDGEKNOWN=1`, all pass.
+
+**The tuner's picks were not stable.** A second full run (extended
+space) chose differently from the first: rust-protobuf's 0.90 setting
+and pulldown-cmark's 1.01 setting were not found again (both kept the
+bundle), regex kept only `PGO_INLINE=0` in common, rust-compression
+only `ELABLOOPS=2`. Read the first table as an upper bound with
+selection bias, not a result: what repeated is regex 1.18-1.20 -> 1.10-1.11
+and rust-compression 1.09-1.11 -> 1.05-1.06 of LLVM. `tune.py` now
+keeps a candidate only if it wins twice in independent measurements.
