@@ -509,3 +509,8 @@ its rounds. At the default 16 units `INLINE_COLDONCE` is 1.0015
 (rust-protobuf +1.2%) and the caps only cost. No default changed; the
 missing piece is a caller-growth rule that tells `parse_block` from
 blake3's `compress`.
+Tried and dropped: excluding cross-CGU copies from the free
+single-caller inline (`single`), on the theory that larger copy limits
+hurt rust-protobuf through it — instructions 1.006 alone, 1.009 with
+`XCGU_DEPTH=16 XCGU_SIZE=120` (1.001 without). The free inline of
+copies is doing good work.
