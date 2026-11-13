@@ -1407,6 +1407,7 @@ pub fn run(
     } else {
         FxHashMap::default()
     };
+    let pgo_inline = !crate::env_is("PLIRON_PGO_INLINE", "0");
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
@@ -1550,7 +1551,9 @@ pub fn run(
                     // PGO: a callsite the profile says never ran isn't
                     // worth growing the caller for (`always_inline` is a
                     // semantic requirement and still fires).
-                    let site_count = crate::pgo::block_count(st, b);
+                    // `PLIRON_PGO_INLINE=0`: ablation, the inliner ignores
+                    // callsite counts.
+                    let site_count = if pgo_inline { crate::pgo::block_count(st, b) } else { None };
                     if !f.always_inline && site_count == Some(0) {
                         pliron_cfg::remark!("inline", sym, cs; "reject (cold callsite: profile count 0)");
                         if verbose {

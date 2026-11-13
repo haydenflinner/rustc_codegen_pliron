@@ -8187,7 +8187,8 @@ fn cold_blocks(
             Operation::is_op::<UnreachableOp>(op, ctx)
                 || crate::inline::direct_callee(ctx, st, op)
                     .is_some_and(|s| st.funcs.get(s).is_some_and(|f| f.cold))
-        }) || crate::pgo::block_count(st, b).is_some_and(|c| c == 0);
+        }) || (!pliron_cfg::env_is("PLIRON_PGO_COLD", "0")
+            && crate::pgo::block_count(st, b).is_some_and(|c| c == 0));
         if hit {
             cold.insert(b);
         }

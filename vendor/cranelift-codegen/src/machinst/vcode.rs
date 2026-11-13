@@ -2927,9 +2927,14 @@ impl<I: VCodeInst> VCode<I> {
             // header rather than executing a trampoline branch over them
             // (MachBuffer can only fold a jump into the following label when
             // they're byte-adjacent, which pre-label padding breaks).
+            // Not when the header's own code is skipped (`merged`: a
+            // bare-jump header aliased to its target by `PLIRON_BJALIAS`,
+            // an `EDGEMERGE` duplicate): the fallthrough would land in
+            // whatever block is emitted next (blind-sig under a profile:
+            // `rsa::internals::blind` fell into the wrong loop).
             let skip_jmp = final_order
                 .get(oi + 1)
-                .filter(|nb| loop_head[nb.index()])
+                .filter(|nb| loop_head[nb.index()] && !merged[nb.index()])
                 .and_then(|_nb| {
                     let succs =
                         &self.block_succs[self.block_succ_range.get(block.index())];

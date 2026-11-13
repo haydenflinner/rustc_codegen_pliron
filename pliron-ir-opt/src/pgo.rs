@@ -695,7 +695,11 @@ pub fn load(ctx: &Context, st: &mut State, path: &str) -> usize {
                     let (a, c) = (counts[0], counts[1]);
                     let tot = a + c;
                     if tot >= 8 && (a >= 4 * c || c >= 4 * a) {
-                        st.expect.insert(t, a >= c);
+                        // `PLIRON_PGO_EXPECT=0`: ablation, no branch
+                        // expectations from the profile.
+                        if !crate::env_is("PLIRON_PGO_EXPECT", "0") {
+                            st.expect.insert(t, a >= c);
+                        }
                     }
                 }
                 st.prof_edges.insert(t, counts);
