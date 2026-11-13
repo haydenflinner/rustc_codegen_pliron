@@ -281,3 +281,12 @@ sites only. The rest are inside the noise of a 9-round run.
 Candidate bundle changes (`PGO_LOOP=0`, `PGO_WARM=0`, `PLACE_ROT=1`),
 eight programs, 9 rounds: 0.977 / 1.008 / 0.993 geomean with one noisy
 program driving the first — no change made.
+
+## Validation at the end of the night (main at this commit)
+
+- gate: passed (101 jobs).
+- fuzz at defaults, seeds 34000..36000: the first 1,300 clean before
+  the disk filled (cached A/B builds; `ab.py` now keeps 24 sides), the
+  remaining 700 rerun: 700 pass.
+- `harness/pgofuzz.py`: 400 seeds through generate/run/use, all pass.
+- `harness/crates.py --tier 1`: 20 crates, 0 pliron-only problems.
