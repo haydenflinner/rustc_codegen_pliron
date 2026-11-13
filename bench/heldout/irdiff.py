@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """Exact instruction counts, ours against LLVM's, per function and per source line.
 
-  bench/heldout/irdiff.py PROG [--env K=V ...] [--top N] [--fn SUBSTR] [--skip-build]
+  bench/heldout/irdiff.py PROG [--env K=V ...] [--top N] [--fn SUBSTR | --line FILE:LINE] [--skip-build]
 
 Sampling cannot say where we execute more instructions than LLVM: the
 whole-process count is exact (`ab.py`) but the breakdown is samples,
@@ -114,6 +114,7 @@ def demangle(names):
 
 
 def short_path(p):
+    p = os.path.normpath(p) if p and p != "?" else p
     for marker in ("/registry/src/", "/rustlib/src/rust/", "/rustc/"):
         i = p.find(marker)
         if i >= 0:
@@ -124,7 +125,7 @@ def short_path(p):
 
 def parse(path):
     """callgrind out -> (total, {fn: self Ir}, {(file, line): self Ir})."""
-    fns, lines = collections.Counter(), collections.Counter()
+    fns, lines, by = collections.Counter(), collections.Counter(), collections.Counter()
     fl = fn = cur = None
     skip = False
     for l in open(path, errors="replace"):
@@ -141,6 +142,7 @@ def parse(path):
                 ir = int(p[1])
                 fns[fn] += ir
                 lines[(cur, int(p[0]))] += ir
+                by[(fn, cur, int(p[0]))] += ir
             continue
         if l.startswith("fl="):
             fl = cur = l[3:]
@@ -151,7 +153,7 @@ def parse(path):
             cur = fl
         elif l.startswith("calls="):
             skip = True
-    return sum(fns.values()), fns, lines
+    return sum(fns.values()), fns, lines, by
 
 
 def norm_fn(n):
@@ -168,6 +170,7 @@ def main():
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--fn")
+    ap.add_argument("--line", help="FILE:LINE (a suffix of the table's spelling): the functions that execute it")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--backend", default=os.path.join(run.ROOT, "target", "release", run.DYLIB))
     a = ap.parse_args()
@@ -180,7 +183,7 @@ def main():
     for side in ("llvm", "pliron"):
         exe = build(a.prog, binary, side, a.backend, env, a.skip_build)
         sides[side] = parse(callgrind(a.prog, exe, side))
-    (lt, lf, ll), (pt, pf, pl) = sides["llvm"], sides["pliron"]
+    (lt, lf, ll, lb), (pt, pf, pl, pb) = sides["llvm"], sides["pliron"]
     print(f"{a.prog}: instructions llvm {lt / 1e6:.2f}M  pliron {pt / 1e6:.2f}M  x{pt / lt:.3f}  (+{(pt - lt) / 1e6:.2f}M)")
     dm = demangle(set(lf) | set(pf))
     lfn, pfn = collections.Counter(), collections.Counter()
@@ -201,6 +204,18 @@ def main():
             d = pc[k] - lc[k]
             print(f"  {d:+11d} {100 * d / gap if gap else 0:+6.1f}%  {lc[k]:>10d} -> {pc[k]:>10d}  {fmt(k)}")
 
+    if a.line:
+        # Which functions execute this line's instructions, each side.
+        want_f, _, want_n = a.line.rpartition(":")
+        for name, tab in (("llvm", lb), ("pliron", pb)):
+            c = collections.Counter()
+            for (fn, f, n), v in tab.items():
+                if n == int(want_n) and short_path(f or "?").endswith(want_f):
+                    c[norm_fn(dm.get(fn, fn))] += v
+            print(f"\n{a.line} in {name}: {sum(c.values())} instructions")
+            for k, v in c.most_common(a.top):
+                print(f"  {v:>10d}  {k[:120]}")
+        return
     if a.fn:
         lfn = collections.Counter({k: v for k, v in lfn.items() if a.fn in k})
         pfn = collections.Counter({k: v for k, v in pfn.items() if a.fn in k})

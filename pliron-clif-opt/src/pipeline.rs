@@ -2333,9 +2333,9 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
     } else {
         Vec::new()
     };
-    // `PLIRON_SLOTPROM_SYNCCOST=1`: block-frequency estimate for the
+    // `PLIRON_SLOTPROM_SYNCCOST` (default on since 2026-11-13, `=0` off): block-frequency estimate for the
     // sync cost check, 8x per loop level (to 512x), /8 in cold blocks.
-    let weight = env_is("PLIRON_SLOTPROM_SYNCCOST", "1").then(|| {
+    let weight = (!env_is("PLIRON_SLOTPROM_SYNCCOST", "0")).then(|| {
         let a = an.cfg_dt_la(&p.clctx.func);
         let f = &p.clctx.func;
         f.layout
@@ -5162,7 +5162,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // The late refold expressed walked pointers as `base + idx`;
         // their exit tests still compare `base + idx + 1` with `base +
         // len`.
-        step("cmpcancel", "cmpcancel", Gate::OptIn("PLIRON_CMPCANCEL"), s_cmpcancel),
+        step("cmpcancel", "cmpcancel", Gate::Env("PLIRON_CMPCANCEL"), s_cmpcancel),
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one
         // `brif` edge's args (parse_only's `ParseIntError` pack on every
@@ -5332,7 +5332,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // The last sinks and hoists re-create values a dominating block
         // already holds (`idx + 1` on a loop's exit edge next to the
         // counter's own step): one more dominator GVN.
-        step("dgvn3", "dgvn", Gate::OptIn("PLIRON_LATEGVN"), s_dgvn),
+        step("dgvn3", "dgvn", Gate::Env("PLIRON_LATEGVN"), s_dgvn),
         step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
             .needs(shape::CALL),
         // Last: static branch hints for emission-time placement

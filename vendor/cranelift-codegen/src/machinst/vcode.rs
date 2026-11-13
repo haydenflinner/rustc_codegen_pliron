@@ -4861,6 +4861,11 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
         self.block_freq.get(block.index()).copied()
     }
 
+    // PLIRON: the frontend's cold marks, for `PLIRON_RA2_COLDSPLIT`.
+    fn block_is_cold(&self, block: BlockIndex) -> bool {
+        self.block_order.is_cold(block)
+    }
+
     fn num_blocks(&self) -> usize {
         self.block_ranges.len()
     }

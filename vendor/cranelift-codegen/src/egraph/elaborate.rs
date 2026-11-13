@@ -598,7 +598,8 @@ impl<'a> Elaborator<'a> {
             {
                 return false;
             }
-            // PLIRON `PLIRON_REMAT_CARRIED=0` (opt-in): no remat of a
+            // PLIRON (default since 2026-11-13; `PLIRON_REMAT_CARRIED=1`
+            // restores the remat): no remat of a
             // value its own block passes on as a branch argument. Remat
             // pays when it lets the *result* die at the end of its block;
             // a loop counter's step (`i + 1`, handed to the header) is
@@ -609,7 +610,7 @@ impl<'a> Elaborator<'a> {
             // (pulldown-cmark `scan_ch`: 8 instructions a trip, 6 without
             // the clone).
             static CARRIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if !*CARRIED.get_or_init(|| std::env::var("PLIRON_REMAT_CARRIED").as_deref() != Ok("0"))
+            if !*CARRIED.get_or_init(|| std::env::var("PLIRON_REMAT_CARRIED").as_deref() == Ok("1"))
                 && let Some(def) = func.dfg.value_def(arg.value).inst()
                 && !func.dfg.inst_args(def).is_empty()
                 && let Some(t) = func.layout.last_inst(arg.in_block)

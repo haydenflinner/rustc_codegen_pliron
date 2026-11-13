@@ -49,10 +49,16 @@ pub struct CFGInfo {
     /// under `PLIRON_RA2_FREQ` the frontend's block frequency scaled; see
     /// `init`).
     pub hot_bonus: Vec<f32>,
-    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): per block, the first and last
-    /// instruction index with clobbers (`(u32::MAX, 0)` when none). Empty
-    /// unless the knob is on.
-    pub block_clobbers: Vec<(u32, u32)>,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): `clobber_prefix[i]` is the number
+    /// of instructions before `i` that have clobbers (length
+    /// `num_insts + 1`), so "does `[a, b)` contain a clobber" is one
+    /// subtraction. Empty unless the knob is on.
+    pub clobber_prefix: Vec<u32>,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): per block, `hot_bonus` with the
+    /// frontend's cold marks applied (`coldsplit_colddiv`): the
+    /// frequencies the cold split tests and costs with. Empty unless the
+    /// knob is on.
+    pub cold_freq: Vec<f32>,
 }
 
 impl CFGInfo {
@@ -94,24 +100,24 @@ impl CFGInfo {
         let mut back_edges = core::mem::take(&mut self.back_edges);
         back_edges.clear();
 
-        // PLIRON (`PLIRON_RA2_COLDSPLIT`): which blocks contain a clobber.
-        let coldsplit = crate::coldsplit_on();
-        self.block_clobbers.clear();
-        if coldsplit {
-            self.block_clobbers.resize(nb, (u32::MAX, 0));
+        // PLIRON (`PLIRON_RA2_COLDSPLIT`): where the clobbers are.
+        self.clobber_prefix.clear();
+        if crate::coldsplit_on() {
+            self.clobber_prefix.reserve(f.num_insts() + 1);
+            let mut n = 0u32;
+            self.clobber_prefix.push(0);
+            for inst in 0..f.num_insts() {
+                if f.inst_clobbers(Inst::new(inst)) != crate::PRegSet::empty() {
+                    n += 1;
+                }
+                self.clobber_prefix.push(n);
+            }
         }
 
         for block in 0..f.num_blocks() {
             let block = Block::new(block);
             for inst in f.block_insns(block).iter() {
                 insn_block[inst.index()] = block;
-                if coldsplit && f.inst_clobbers(inst) != crate::PRegSet::empty() {
-                    let e = &mut self.block_clobbers[block.index()];
-                    if e.0 == u32::MAX {
-                        e.0 = inst.index() as u32;
-                    }
-                    e.1 = inst.index() as u32;
-                }
             }
             block_entry[block.index()] = ProgPoint::before(f.block_insns(block).first());
             block_exit[block.index()] = ProgPoint::after(f.block_insns(block).last());
@@ -271,6 +277,14 @@ impl CFGInfo {
                 _ => by_depth,
             };
             hot_bonus.push(bonus);
+        }
+        self.cold_freq.clear();
+        if crate::coldsplit_on() {
+            let div = crate::coldsplit_colddiv();
+            for block in 0..nb {
+                let h = self.hot_bonus[block];
+                self.cold_freq.push(if f.block_is_cold(Block::new(block)) { h / div } else { h });
+            }
         }
 
         Ok(())

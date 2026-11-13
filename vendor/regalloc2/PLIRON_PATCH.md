@@ -267,16 +267,27 @@ stack loads -4.3% (pulldown-cmark), -3.5% (regex), -3.6%
 
 ## `PLIRON_RA2_COLDSPLIT=1` (runtime, opt-in): cut cold call blocks out of a hot bundle
 
-`src/ion/process.rs` (`try_cold_split`, `cold_split_range`, the hook in
-`process_bundle`), `src/cfg.rs` (`CFGInfo::block_clobbers`, filled only
-under the knob), `src/ion/data_structures.rs` (`LiveBundle::cold_split`),
-`src/lib.rs` (`coldsplit_on`, `coldsplit_ratio`). When a bundle finds no
-register and a clobber in a cold block blocked a caller-saved one, every
-run of consecutive cold blocks in which the bundle is live across a
-clobber is cut out at its block boundaries. Cold: hot bonus at most `1/K`
-(`PLIRON_RA2_COLDSPLIT_RATIO`, default 16) of the hottest block with a
-use or def of the bundle. The remainder stays one bundle (with holes) and
-is requeued untrimmed; a cold piece without uses goes to the spill
-bundle, one with uses is requeued. Once per original bundle. Held-out
-programs pass with `PLIRON_RA_CHECK=1`; instructions 0.987..1.004x of
-default (noise level), no fuzz sweep yet.
+`src/ion/process.rs` (`try_cold_split` with the rule in its doc comment,
+`cold_split_range`, `cold_remainder_fits`, two hooks in `process_bundle`,
+flag inheritance in `split_and_requeue_bundle`), `src/cfg.rs`
+(`CFGInfo::clobber_prefix`, `cold_freq`, filled only under the knob),
+`src/ion/data_structures.rs` (`LiveBundle::cold_split`,
+`SpillSet::cold_spill`), `src/ion/spill.rs` (a `cold_spill` spill bundle
+does not open an unused callee-saved register at second chance),
+`src/lib.rs` (`Function::block_is_cold`, `coldsplit_on`/`_mode`/`_ratio`/
+`_colddiv`/`_bias`). Cranelift implements `block_is_cold` from its cold
+block marks (`machinst/vcode.rs`).
+
+When a bundle is given a callee-saved register that nothing else uses,
+or gets no register at all, the cold blocks in which it is live across a
+clobbering instruction are cut out of it at block boundaries; the cold
+part goes to the spill slot (uses inside become minimal bundles), the
+rest stays one bundle and takes a caller-saved register. The first case
+is cost-tested against 2 x entry frequency and requires that the rest
+fits a caller-saved register. `=2`/`=3` select one trigger;
+`PLIRON_RA2_COLDSPLIT_RATIO` (16), `_COLDDIV` (64), `_BIAS` (1.0).
+`tests/coldsplit/main.rs` shows the pattern (6 -> 0 saved registers
+around a `#[cold]` call in a loop). Held-out programs: prologue
+callee-saved saves -0.1..-5.1%, retired instructions unchanged
+(0.993..1.007); `PLIRON_RA_CHECK=1` clean. See
+`docs/history/2026-11-13-six-features.md` section 5 for the accounting.

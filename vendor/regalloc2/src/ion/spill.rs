@@ -50,6 +50,15 @@ impl<'a, F: Function> Env<'a, F> {
             let limit = self.bundles[bundle].limit.map(|l| l as usize);
             for preg in RegTraversalIter::new(self.env, class, None, hint, bundle.index(), limit) {
                 trace!("trying bundle {:?} to preg {:?}", bundle, preg);
+                // PLIRON (`PLIRON_RA2_COLDSPLIT`): ranges a cold split put
+                // on the stack to keep a callee-saved register closed do
+                // not open one here either.
+                if self.ctx.spillsets[self.ctx.bundles[bundle].spillset].cold_spill
+                    && !self.env.preferred_regs_by_class[class as u8 as usize].contains(preg)
+                    && self.ctx.pregs[preg.index()].allocations.btree.is_empty()
+                {
+                    continue;
+                }
                 let preg_idx = PRegIndex::new(preg.index());
                 if let AllocRegResult::Allocated(_) =
                     self.try_to_allocate_bundle_to_reg(bundle, preg_idx, None, &mut scratch)

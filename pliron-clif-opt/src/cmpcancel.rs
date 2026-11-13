@@ -1,4 +1,4 @@
-//! Cancel common addends in equality tests (`PLIRON_CMPCANCEL=1`, opt-in).
+//! Cancel common addends in equality tests (default on; `PLIRON_CMPCANCEL=0` off).
 //!
 //! `icmp eq/ne (a + b + k1), (b + c + k2)` is `icmp eq/ne (a + (k1-k2)), c`:
 //! addition wraps, so adding the same value to both sides of an equality

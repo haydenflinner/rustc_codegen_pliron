@@ -2,21 +2,51 @@
 
 ## 5. Cold-region splitting in the allocator
 
-`PLIRON_RA2_COLDSPLIT=1` (opt-in, default off; `PLIRON_RA2_COLDSPLIT_RATIO=<K>`, default 16) in
-`vendor/regalloc2/src/ion/process.rs` (`try_cold_split`). When a bundle finds no register and a
-call clobber in a cold block is what kept it out of a caller-saved one, the cold blocks it is live
-across a clobber in are cut out of it at their block boundaries. Cold = block frequency
-(`CFGInfo::hot_bonus`) at most `1/K` of the hottest block the bundle has a use or def in; cold
-blocks without a clobber stay. The hot remainder stays one bundle with holes and is requeued; a
-cold piece without uses goes straight to the spill bundle, one with uses is requeued with its low
-weight. The store and reload then come from the normal edge moves, on the cold edges.
-Finding: regalloc2 does not see cold code as one contiguous tail. Cranelift sinks cold blocks only
-at emission (`VCode::emit`'s `final_order`); the lowered order regalloc2 allocates on is the
-chained RPO with cold blocks interleaved. Hence one bundle with holes rather than a
-before/middle/after three-way split, which would cut the hot code into pieces at every panic block.
-Runs at most once per original bundle (`LiveBundle::cold_split`, inherited by later splits).
-State: the eight held-out programs build and run with the knob, also under `PLIRON_RA_CHECK=1`;
-instructions 0.987..1.004x of default, inside the run-to-run spread of these 3-round runs. No fuzz yet.
+`PLIRON_RA2_COLDSPLIT=1` (opt-in, default off) in `vendor/regalloc2/src/ion/process.rs`
+(`try_cold_split`); `=2`/`=3` run only the first/second trigger below. Knobs:
+`PLIRON_RA2_COLDSPLIT_RATIO` (16), `_COLDDIV` (64), `_BIAS` (1.0).
+
+The rule: a block is cold for a bundle when its frequency is at most 1/RATIO of the hottest block
+with a use or def of the bundle; the frequency is `CFGInfo::hot_bonus`, divided by COLDDIV in
+blocks the frontend marked cold (new `Function::block_is_cold`, from Cranelift's cold marks).
+The cold blocks in which the bundle is live across a clobbering instruction are cut out at their
+block boundaries. The rest stays one bundle with holes (the lowered block order regalloc2 sees is
+the chained RPO with cold blocks interleaved; they are only sunk at emission). Use-less cold
+ranges go straight to the spill slot; cold ranges with uses become minimal bundles around the uses.
+Triggers: (1) the bundle was just given a callee-saved register nothing else is in: split if the
+split's cost (store edges in, reload edges out, uses inside, x BIAS) is below 2 x entry frequency
+and the rest fits a caller-saved register right now, which it is then given; (2) no register at
+all and a cold clobber among the obstacles: split without a cost test.
+
+What had to be fixed to make it work on its own pattern (`tests/coldsplit/main.rs`):
+- the static frequencies give a cold-marked arm 1/33 of its predecessor, so a `#[cold]` call in a
+  loop counted ~2x the entry block and never beat a callee-saved register: hence COLDDIV;
+- a merely cool block next to the call block (the exit block with the value's last uses) was
+  swallowed into the region and its uses priced the split out: regions are now only the blocks
+  with a live-across clobber;
+- use-less cold ranges put in the spill bundle kept its other ranges out of a second-chance
+  register (reload inside the loop): they now bypass the spill bundle.
+Result there: `cs_cold_call` 6 -> 0 callee-saved registers saved, `cs_err` 2 -> 0, `cs_flush`
+8 -> 4 (the other four are live across the entry block's `memset`), loops without stack traffic,
+stores/reloads in the cold block; LLVM saves 6, 4 and 10. `cs_push`/`cs_two` do not change:
+`Vec::push`'s grow call is not marked cold and its block is 1/4 of the loop by the static model
+(LLVM keeps the callee-saved registers there too). Bounds-check and `expect` panics are noreturn:
+nothing is live across them.
+
+Held-out programs (whole binaries, std included): prologue callee-saved saves -0.1..-5.1%
+(regex -2.5%, html-rewriter -5.1%, json -3.3%), stack loads/stores up to +5%, code +0.2..1.1%;
+retired instructions 0.993..1.007 at 11 rounds, i.e. no measurable change. Why, from the explain
+logs (regex, trigger 1): of 10768 callee-saved allocations, 2143 were of an unused register by a
+bundle with cold call regions; 575 were split, 126 failed the cost test and 1442 had no
+caller-saved register for the rest, on average 14.9 of 16 of them closed by a fixed reservation:
+the value is also live across a call that is not cold. 575 splits removed 107 saved registers:
+a freed register is usually taken by a later bundle that needs it. The hot functions have
+little to give: `Fsm::next_state` uses no callee-saved register, `Fsm::exec_at` 4 (1 split).
+Trigger 2 removes no saves and only adds stack traffic statically.
+Checked: `PLIRON_RA_CHECK=1` on all eight programs and the test; fuzz seeds 50000..50600.
+Open: real (PGO) frequencies should widen the cold set (`Vec::push` growth); shrink-wrapping
+lowers the callee-saved cost the test compares against and is ignored; the test is not a
+`test.sh` stanza yet.
 
 ## 3. Guarded devirtualization
 

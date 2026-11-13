@@ -1227,7 +1227,7 @@ fn split(
     let syncable: Vec<bool> = (0..sl.len())
         .map(|i| sl[i].pinned && covered[i] && !bad[i])
         .collect();
-    // `PLIRON_SROA_PINWHOLE=1` (opt-in): an aggregate a call fills in and
+    // `PLIRON_SROA_PINWHOLE` (default on since 2026-11-13; `=0` off): an aggregate a call fills in and
     // the function then moves whole stays whole. Every slice is pinned
     // under a syncable call operand (an `sret` temporary), some `memcpy`
     // covers the whole alloca, and direct loads/stores touch at most a
@@ -1249,7 +1249,7 @@ fn split(
     // copied as eleven pieces at offsets 0, 1, 9, 17, ..).
     let all_pinned = sl.iter().all(|x| x.pinned);
     let none_sync = !syncable.iter().any(|&x| x);
-    if crate::env_is("PLIRON_SROA_PINWHOLE", "1")
+    if !crate::env_is("PLIRON_SROA_PINWHOLE", "0")
         && sl.len() >= 3
         && all_pinned
         && (none_sync || syncable.iter().all(|&x| x))

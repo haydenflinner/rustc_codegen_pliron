@@ -102,11 +102,29 @@ pub(crate) fn loopsplit_max() -> usize {
 pub(crate) fn coldsplit_on() -> bool {
     #[cfg(feature = "std")]
     {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_COLDSPLIT").as_deref() == Ok("1"))
+        coldsplit_mode() != 0
     }
     #[cfg(not(feature = "std"))]
     false
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT=<mode>`: 0/unset off, 1 both triggers
+/// of `Env::try_cold_split`, 2 only the callee-saved trigger, 3 only the
+/// no-register trigger (2 and 3 are for taking the effect apart).
+pub(crate) fn coldsplit_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .filter(|m| *m <= 3)
+                .unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
 }
 
 /// PLIRON: `PLIRON_RA2_COLDSPLIT_RATIO=<K>` (default 16, at least 2): a
@@ -126,6 +144,48 @@ pub(crate) fn coldsplit_ratio() -> f32 {
     }
     #[cfg(not(feature = "std"))]
     16.0
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT_BIAS=<f>` (default 1.0): multiplier on
+/// the cold split's cost when it is compared with the cost of opening a
+/// callee-saved register (see `Env::try_cold_split`); below 1 splits
+/// more, above 1 less.
+pub(crate) fn coldsplit_bias() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *B.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT_BIAS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|b| b.is_finite() && *b >= 0.0)
+                .unwrap_or(1.0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    1.0
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT_COLDDIV=<d>` (default 64, at least 1):
+/// for the cold split, a block the frontend marked cold
+/// (`Function::block_is_cold`) counts at `1/d` of its block frequency.
+/// The static frequencies give a cold-marked arm 1/33 of its
+/// predecessor (a layout weight), which inside a loop is still about
+/// twice the entry block's frequency.
+pub(crate) fn coldsplit_colddiv() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *D.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT_COLDDIV")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|d| d.is_finite())
+                .map_or(64.0, |d| d.max(1.0))
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    64.0
 }
 
 /// PLIRON: `PLIRON_RA2_NOPINMERGE` (default on, `=0` off): refuse
@@ -1517,6 +1577,14 @@ pub trait Function {
     /// estimate for the block.
     fn block_hotness(&self, _block: Block) -> Option<f32> {
         None
+    }
+
+    /// PLIRON: did the frontend mark this block cold (a panic path, a
+    /// call of a `#[cold]` function, the unlikely arm of a hint, a block
+    /// the profile never saw)? `PLIRON_RA2_COLDSPLIT` divides such a
+    /// block's frequency by `PLIRON_RA2_COLDSPLIT_COLDDIV`.
+    fn block_is_cold(&self, _block: Block) -> bool {
+        false
     }
 
     // --------------
