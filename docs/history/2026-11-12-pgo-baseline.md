@@ -514,3 +514,9 @@ single-caller inline (`single`), on the theory that larger copy limits
 hurt rust-protobuf through it — instructions 1.006 alone, 1.009 with
 `XCGU_DEPTH=16 XCGU_SIZE=120` (1.001 without). The free inline of
 copies is doing good work.
+
+Profiled builds as one codegen unit (instructions against the bundle):
+geomean 1.006; rust-html-rewriter 0.966, rust-protobuf 0.965,
+rust-compression 0.988, rust-json 1.072, pulldown-cmark 1.045, regex
+1.018. Build time 32 s against 30 s for the eight. Program-dependent
+again: `tune.py` now tries it (and `INLINE_COLDONCE`).

@@ -60,11 +60,20 @@ SPACE = [
     ("PLIRON_XCGU_DEPTH", ["16"]),
     ("PLIRON_XCGU_SIZE", ["120"]),
     ("PLIRON_EDGEKNOWN", ["1"]),
+    # One codegen unit (a RUSTFLAGS entry, not a knob): every body
+    # visible to the inliner. rust-html-rewriter and rust-protobuf run
+    # ~3.5% fewer instructions under the profile, rust-json 7% more.
+    ("@", ["-Ccodegen-units=1"]),
+    ("PLIRON_INLINE_COLDONCE", ["1"]),
 ]
 
 
 def side(env):
-    return "pgo-t:" + ",".join(f"{k}={v}" for k, v in sorted(env.items())) if env else "pgo"
+    if not env:
+        return "pgo"
+    knobs = ",".join(f"{k}={v}" for k, v in sorted(env.items()) if k != "@")
+    flags = "@" + env["@"] if "@" in env else ""
+    return "pgo-t:" + knobs + flags
 
 
 def measure(prog, binary, sides, rounds, backend):
@@ -121,7 +130,8 @@ def main():
         print("the tuned setting does not beat the bundle in the final run: keeping the bundle")
         sides.remove(side(best))
         best = {}
-    print(f"\n{a.prog}: tuned environment: {' '.join(f'{k}={v}' for k, v in sorted(best.items())) or '(the bundle as is)'}")
+    shown = " ".join(f"RUSTFLAGS+={v}" if k == "@" else f"{k}={v}" for k, v in sorted(best.items()))
+    print(f"\n{a.prog}: tuned environment: {shown or '(the bundle as is)'}")
     for s in sides:
         name = "tuned" if s.startswith("pgo-t:") else s
         print(f"  {name:<9} {m[s][0] / 1e6:7.3f} ms  x{m[s][0] / b[0]:.3f} of llvm  (min x{m[s][1] / b[1]:.3f}, instr x{m[s][2] / b[2]:.3f})")
