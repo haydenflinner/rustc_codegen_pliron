@@ -15,24 +15,43 @@ at emission (`VCode::emit`'s `final_order`); the lowered order regalloc2 allocat
 chained RPO with cold blocks interleaved. Hence one bundle with holes rather than a
 before/middle/after three-way split, which would cut the hot code into pieces at every panic block.
 Runs at most once per original bundle (`LiveBundle::cold_split`, inherited by later splits).
-State: compiles (`cargo check`); not yet run on real code, no checker/fuzz/benchmark run.
+State: the eight held-out programs build and run with the knob, also under `PLIRON_RA_CHECK=1`;
+instructions 0.987..1.004x of default, inside the run-to-run spread of these 3-round runs. No fuzz yet.
 
 ## 3. Guarded devirtualization
 
-`PLIRON_DEVIRT=1` (opt-in; `PLIRON_DEVIRT_MAX`, default 2, caps the trait's impl count).
-`Builder::call`/`invoke` see a virtual call as `instance = Virtual(trait_method, idx)`;
-`src/devirt.rs` lists the trait's impls (`tcx.all_impls`), keeps non-generic positive
-ones for the same trait args, resolves the method (`Instance::try_resolve`, provided
-methods included) and rejects by-value `self`, `#[track_caller]`/shim vtable entries,
-any ABI or lowered-signature difference, and targets this CGU cannot link (not defined
-here, not `xcgu::home_linkable`, not an upstream reachable non-generic).
-`Builder::devirt_call` then emits `fnptr == &target` guards with direct calls and
-always keeps the indirect call as the last arm; results merge through a block
-argument, and for invokes every arm's call gets the unwind destination.
-Each site writes a `devirt` remark (targets or reject reason). Not done: speculative
-targets are not xcgu copy candidates (virtual calls are absent from `items_of_instance`),
-so a target in another CGU is called directly but not inlined. Only `cargo check`ed;
-`tests/devirt/main.rs` is the (unwired) run test.
+`PLIRON_DEVIRT=1` (opt-in). `Builder::call`/`invoke` see a virtual call as
+`instance = Virtual(trait_method, idx)`; `src/devirt.rs` lists the trait's impls
+(`tcx.all_impls`, at most `PLIRON_DEVIRT_SCAN`=64 examined), and the usable candidates
+are the non-generic positive impls for the same trait args whose method resolves
+(`Instance::try_resolve`, provided methods included) to a plain item with the virtual
+call's ABI and lowered signature, linkable from this CGU (defined here,
+`xcgu::home_linkable`, or an upstream reachable non-generic). Generic/blanket impls,
+by-value `self` and `#[track_caller]` shims are never candidates and do not reject
+the site: the indirect arm, always kept last, covers them. `Builder::devirt_call`
+emits one guard block per target (`fnptr == &target`, nothing else) with a hit block
+holding the direct call; results merge through a block argument and every arm of an
+invoke gets the unwind destination.
+Which candidates get a guard: without a profile, all of them if there are at most
+`PLIRON_DEVIRT_MAX` (2), else none. In a profile build (`PLIRON_PGO` or
+`PLIRON_PGO_USE`) the first `PLIRON_DEVIRT_PROF_MAX` (8) by symbol name, identically
+in both builds so the CFG fingerprints agree; the hit blocks' counters are the value
+profile, and `pliron_ir_opt::devirt::prune` (right after `pgo::load`) keeps at most
+`PLIRON_DEVIRT_MAX` arms with at least `PLIRON_DEVIRT_MIN_SHARE` (10) percent of the
+site's calls, hottest first, moves the dropped counts to the fallback block and turns
+a site that never ran back into the plain indirect call.
+Measured (release dylib): `tests/devirt/main.rs` prints the same with and without the
+knob, at O0, with 8 CGUs and through the profile loop (shares as expected, e.g.
+`kept 2 of 3 arms (shares 40% 20% 40%)`). rust-html-rewriter and rust-protobuf:
+instructions 1.000-1.001 blind, 1.001 for pgo+devirt vs pgo; 8196/1804 functions
+matched, 0 stale, with the knob on both builds. Neither program runs an eligible
+site: their sites are `fmt::Write::write_str`, `log::Log` and regex `Strategy`, all
+with zero calls in the profile; the hot `dyn` calls go to generic impls or to traits
+with more than 64 impls (`Iterator`). `bench/heldout/run.py --pgo-gen-env K=V`
+passes a knob to the instrumented build.
+Not done: speculative targets are not xcgu copy candidates (virtual calls are absent
+from `items_of_instance`), so a target in another CGU is called directly but not
+inlined. `tests/devirt/main.rs` is not wired into `test.sh`.
 
 ## 6. Shared panic tails
 
@@ -72,10 +91,13 @@ State: compiles (`cargo check`); not yet run on real code, no gate/fuzz/benchmar
 
 `PLIRON_FIELD_HEAT=<file>` records, `PLIRON_FIELD_ORDER=<file>` applies (`src/field_order.rs`, both opt-in; unset, no provider is installed and output is unchanged).
 Heat: the builder only sees byte offsets (`project_field` emits nothing at offset 0), so it is a MIR walk per codegen'd instance: each `Field` projection on a struct, times the profile count of its MIR block (`append_block` is handed the `bbN` name, `resolve` reads `pgo::block_count` after `pgo::load`; a block merged into its only predecessor takes that block's count); without `PLIRON_PGO_USE`, `8^loop depth`. Lines are `<crate>::<path>\t<field>\t<weight>`, appended per crate; `harness/field_order.py` prints the ranking.
-Order: a `layout_of` wrapper. For plain `repr(Rust)` structs named in the file, fields of identical size and alignment swap slots (offset and memory-order position) hottest first, ties in rustc's order, so size, alignment and padding are unchanged by construction. Only `BackendRepr::Memory { sized: true }` / `FieldsShape::Arbitrary` / `Variants::Single` layouts; structs whose tail may be unsized, lang items, enums and unions are skipped. The largest niche moves by its field's delta when the field's own layout confirms the niche, else the struct is left alone.
+Order: a `layout_of` wrapper. For plain `repr(Rust)` structs named in the file, non-zero-sized fields are handled per ABI-alignment class: a class that tiles one contiguous span in rustc's layout is re-packed hottest first (ties in rustc's order) — same alignment `a`, sizes multiples of `a`, so any order fills the span exactly and nothing outside it moves; a non-contiguous class only swaps equal-size fields. Size, alignment and padding are unchanged by construction; ZSTs keep their offsets and `in_memory_order` is re-sorted by the new offsets. Only `BackendRepr::Memory { sized: true }` / `FieldsShape::Arbitrary` / `Variants::Single` layouts; structs whose tail may be unsized, lang items, enums and unions are skipped. The largest niche moves by its field's delta when the field's own layout confirms the niche, else the struct is left alone. No padding trade (`PLIRON_FIELD_ORDER_PAD`) was added: no type ever grows.
 Cross-crate rule: eligibility is by the defining crate (the crate being compiled, or a dependency whose rlib/rmeta is outside the sysroot; never `core`/`alloc`/`std`/`proc_macro`/`test`/`compiler_builtins`) and the key is crate name + def path, so every crate computes the same layout for a type.
 Soundness: nothing may assume a `repr(Rust)` order, and `offset_of!`, derives, const eval and debuginfo read the same query. Limits: every non-sysroot crate in the link must be built by this backend with the same file — mixing objects built with and without the knob, with different files, or with stock-rustc dependencies (`crates.py --deps stock`) is unsound and not diagnosed; use a fresh target dir.
-Status: `cargo check` only — not built, run or measured. Equal-size swaps cannot change padding, so the expected win is small (offset 0, first cache line); reordering across size classes is the follow-up.
+Status (built and run): `tests/field_order/run.sh` (integer widths, arrays, nested structs, `Option<Box<_>>`, generics, niche fields, a `Vec` element, a tuple struct, an unsize-coerced tail) prints identical sizes, alignments and values plain, with heat, and under three order files at `-O` and `-Copt-level=0`; only `offset_of!` lines differ. `PLIRON_FIELD_ORDER_LOG=<file>` lists permuted layouts.
+Profile path, end to end (`PLIRON_PGO` build, run, merge, `PLIRON_PGO_USE` + `PLIRON_FIELD_HEAT`, `PLIRON_PGO_USE` + `PLIRON_FIELD_ORDER`): weights are measured counts; `PLIRON_TRACE=pliron::field_order` shows every `(block, field)` pair mapped to a backend block (pulldown-cmark: 913 counted, 607 count 0, 287 in functions absent from the profile, 0 unmapped); the order file does not stale the profile (matched with/without: pulldown-cmark 2144/2144, rust-html-rewriter 8196/8196, rust-protobuf 1804/1804, 0 stale); stdout matches the expected output.
+Cache benchmark (`tests/field_order/cache.sh`, M3 Max, 128-byte lines, 160/192-byte structs with four hot fields on two lines; plain -> reordered ns/element; stock LLVM equals plain): 20k elements (in L2) gather 2.58 -> 1.07, walk 11.2 -> 9.5, sweep 1.42 -> 1.05; 1M elements gather 14.3 -> 9.4, walk 149 -> 136 (noise-level), sweep 2.59 -> 7.12. So random access gains 35-60%, a linked walk 10-15% in cache, and an out-of-cache sequential sweep gets 2.5x slower — reproduced with stock LLVM and a hand-ordered `repr(C)` struct, so it is the layout (likely, not verified: hot fields packed = one sparse prefetch stream instead of several dense ones). The profile cannot tell a sweep from a gather: the knob stays opt-in.
+Held-out, profile-weighted heat, cycles reordered/plain: pulldown-cmark 1.014 (5 rounds), rust-html-rewriter 1.006 (15), rust-protobuf 0.989 (15), load average 12-17, noise about 2%: no signal at this data size. Not done: co-access pairs, `PLIRON_FIELD_ORDER_PAD`, wasm, `crates.py --deps pliron`.
 
 ## 1. Scoped noalias
 
@@ -96,3 +118,27 @@ Under the knob the inliner records param facts only when the clone entry still h
 leaf layout, and `cleanup::merge_blocks` does not merge blocks across a region boundary (a caller
 continuation would otherwise run "inside" the callee). licm/dse do not use the fact yet.
 State: `cargo check` + `pliron-clif-opt/tests/loadfwd_scoped_noalias.rs` (4 cases) pass; no fuzz/gate.
+
+## Parity by exact counts (`bench/heldout/irdiff.py`)
+
+Both compilers build a program for `aarch64-unknown-linux-musl`; each
+binary runs once under callgrind in a container, which charges every
+executed instruction to its function and source line. pulldown-cmark:
+LLVM 45.33M, pliron 56.57M (x1.248). The per-line table is independent
+of inlining decisions and names the code to fix.
+
+First item taken from it, `parse.rs:3051-3052` (+1.46M, 13% of the gap):
+`let event = item_to_event(..); if let Event::Start(..) = event {..};
+Some(event)`. IR-level SROA split the 64-byte `Event` temporary although
+its callee pin kept every slice in memory, so the whole-copy became
+eleven byte-offset load/store pairs; in the isolated repro (callee
+visible) the slices were promoted and nine values rode callee-saved
+registers across `Vec::push`'s grow path. `PLIRON_SROA_PINWHOLE=1`
+(opt-in): an alloca whose slices are all pinned under a call operand and
+that is copied whole stays whole when nothing can leave memory, or when
+direct accesses touch at most a third of the slices. With the existing
+`PLIRON_SLOTPROM_SYNCCOST=1` (CLIF slot promotion's sync cost test) the
+repro goes 94 -> 55 instructions (LLVM: 57), and pulldown-cmark
+56.57M -> 55.17M (x1.248 -> x1.217). Eight programs (macOS, 5 rounds):
+all correct; instructions 0.9957 with both (pulldown-cmark 0.981,
+blake3-scalar 0.990, rust-html-rewriter 1.005).

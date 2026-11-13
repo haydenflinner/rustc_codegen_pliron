@@ -1227,6 +1227,53 @@ fn split(
     let syncable: Vec<bool> = (0..sl.len())
         .map(|i| sl[i].pinned && covered[i] && !bad[i])
         .collect();
+    // `PLIRON_SROA_PINWHOLE=1` (opt-in): an aggregate a call fills in and
+    // the function then moves whole stays whole. Every slice is pinned
+    // under a syncable call operand (an `sret` temporary), some `memcpy`
+    // covers the whole alloca, and direct loads/stores touch at most a
+    // third of the slices (a tag test). Split, each call pays a writeback
+    // of every slice before it and a reload of every slice after it, the
+    // whole-copy becomes one load and one store per slice, and the
+    // slices ride registers across whatever sits between: pulldown-cmark's
+    // `let event = item_to_event(..); if let Event::Start(..) = event
+    // {..}; Some(event)` carried nine values (most in callee-saved
+    // registers, across `Vec::push`'s grow path) for a 48-byte enum that
+    // LLVM copies with three vector moves — 94 instructions against 57,
+    // 13% of that program's instruction gap (parse.rs:3051-3052).
+    //
+    // The same when no slice can leave memory at all (every slice pinned
+    // and none syncable: the callee is not known to be nonretaining —
+    // the real `item_to_event` lives in another CGU): the split then
+    // promotes nothing and only chops the whole-copy into one load/store
+    // pair per slice, byte-offset slices included (a 64-byte `Event`
+    // copied as eleven pieces at offsets 0, 1, 9, 17, ..).
+    let all_pinned = sl.iter().all(|x| x.pinned);
+    let none_sync = !syncable.iter().any(|&x| x);
+    if crate::env_is("PLIRON_SROA_PINWHOLE", "1")
+        && sl.len() >= 3
+        && all_pinned
+        && (none_sync || syncable.iter().all(|&x| x))
+    {
+        let whole_copy = acc
+            .iter()
+            .any(|x| matches!(x.kind, Kind::Copy { n, .. } if x.off == 0 && n == size));
+        let mut touched = vec![false; sl.len()];
+        for x in &acc {
+            if !matches!(x.kind, Kind::Load | Kind::Store) || x.flow {
+                continue;
+            }
+            let n = access_ty(ctx, x).map(|t| size_align(ctx, t).0).unwrap_or(size);
+            for (i, sx) in sl.iter().enumerate() {
+                if x.off < sx.off + sx.size && sx.off < x.off + n {
+                    touched[i] = true;
+                }
+            }
+        }
+        let nt = touched.iter().filter(|&&t| t).count();
+        if whole_copy && (none_sync || nt * 3 <= sl.len()) {
+            return false;
+        }
+    }
     // `PLIRON_SROA_TAILSPLIT=1`: a pinned-but-unsyncable slice whose pin
     // is a bodiless-callee operand may turn syncable once `iropt_tail`
     // adopts cross-CGU nocapture/nowrite facts. Deferring keeps the
