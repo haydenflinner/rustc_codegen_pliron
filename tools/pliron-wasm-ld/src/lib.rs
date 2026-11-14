@@ -837,8 +837,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
         fout.insert(oi, v);
     }
-    // `__wasm_call_ctors` is synthesized after every object's bodies.
+    // `__wasm_call_ctors` is synthesized after every object's bodies,
+    // then a tombstone `unreachable` function that dead-region
+    // `ref.func`/`call` references are remapped onto: it is *not* a
+    // borrowed import slot, so it can be declared without keeping a
+    // real import alive (wasm-bindgen strips `__wbindgen_describe`, a
+    // typical import 0).
     let ctors_fn = next;
+    let tomb_fn = ctors_fn + 1;
     let func_out = |d: Def| -> Option<u32> {
         match d {
             Def::Func(oi, f) => {
@@ -857,26 +863,27 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         let mut m = Vec::new();
         for (md, n, _) in &o.fimports {
             m.push(match resolve(oi, n).filter(|_| md == "env") {
-                Some(d @ Def::Func(..)) => func_out(d).unwrap_or(0),
+                Some(d @ Def::Func(..)) => func_out(d).unwrap_or(tomb_fn),
                 Some(Def::Data(..)) => {
                     return Err(format!("{}: {n} is data, called as a function", o.name));
                 }
                 None if md == "env" && n == CALL_CTORS => ctors_fn,
-                // Unused imports were dropped from `host`; a slot of 0 is
-                // only ever referenced from dead code.
+                // Unused imports were dropped from `host`; a tombstone
+                // slot is only ever referenced from dead code.
                 None => host_idx
                     .get(&(md.as_str(), n.as_str()))
                     .copied()
-                    .unwrap_or(0),
+                    .unwrap_or(tomb_fn),
             });
         }
         let nimp = o.fimports.len() as u32;
         m.extend(fout[&oi].iter().enumerate().map(|(bi, &f)| {
             if let Some(&(woi, wf)) = alias_f.get(&(oi, bi as u32 + nimp)) {
-                return fout[&woi][(wf - objs[woi].fimports.len() as u32) as usize];
+                let f = fout[&woi][(wf - objs[woi].fimports.len() as u32) as usize];
+                return if f == u32::MAX { tomb_fn } else { f };
             }
             if f == u32::MAX {
-                0
+                tomb_fn
             } else {
                 f
             }
@@ -1107,7 +1114,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         }
     });
-    let main_fn = ctors_fn + 1;
+    let main_fn = tomb_fn + 1;
 
     // Exports.
     let mut ex: Vec<(String, u32)> = Vec::new();
@@ -1150,6 +1157,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         }
     }
+    fs.function(void_ty);
     fs.function(void_ty);
     if let Some(t) = argc_ty {
         fs.function(t);
@@ -1235,9 +1243,9 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         we::Elements::Functions(table.clone().into()),
     );
     // A `ref.func`/`call` inside a dead region of a live body is remapped
-    // to function index 0; declare it so the instruction still validates
+    // to the tombstone; declare it so the instruction still validates
     // (`ref.func` requires a declared function).
-    els.declared(we::Elements::Functions(vec![0].into()));
+    els.declared(we::Elements::Functions(vec![tomb_fn].into()));
     module.section(&els);
     let mut code = we::CodeSection::new();
     for &oi in &included {
@@ -1261,6 +1269,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     call_ctors.instruction(&we::Instruction::End);
     code.function(&call_ctors);
+    let mut tomb = we::Function::new([]);
+    tomb.instruction(&we::Instruction::Unreachable);
+    tomb.instruction(&we::Instruction::End);
+    code.function(&tomb);
     if let Some(orig) = main_void {
         let mut w = we::Function::new([]);
         w.instruction(&we::Instruction::Call(orig));
@@ -1282,6 +1294,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
     named.push((ctors_fn, CALL_CTORS));
+    named.push((tomb_fn, "__pliron_dead"));
     if let Some(orig) = main_void {
         named.push((orig, "__original_main"));
         named.push((main_fn, "main"));
