@@ -42,107 +42,82 @@ The CubeCL CPU-kernel path has its own card (`harness/cubecl_card.py`,
 ## Scoreboard
 
 <!-- SCOREBOARD:BEGIN -->
-**Last measured 2026-11-07** (STK re-measured 2026-11-11 after the
-`memcpyopt` memset/sret-temp sink below), aarch64-apple-darwin, backend
-`862ce3a`, nightly-2026-10-22. `PLIRON_COPYPAIR` is default-on since
-`862ce3a`
-(held-out A/B 0.982 [0.971, 0.998] with `AMODESHARE`); this card is the
-first under that default — the 2026-10-30 card's CMP/SIZ cells came from
-a stale mix of flag states.
+**Last measured 2026-11-13**, aarch64-apple-darwin, backend `1611e97`,
+nightly-2026-10-22.
 
-**Overall 94** (2026-10-30: 95).
+**Overall 94** (2026-11-07: 94, 2026-10-30: 95).
 
 | SPD | CMP | MEM | SIZ | STK | COR |
 |---|---|---|---|---|---|
-| **102** | **101** | **70** | **61** | **98** | **100** |
+| **103** | **106** | **75** | **70** | **83** | **100** |
 
 | category | weight | pliron/LLVM | rating | from |
 |---|---|---|---|---|
-| SPD runtime speed | 30 | 0.979 | 102 | native 0.980 · wasm 0.977 |
-| CMP compile time | 15 | 0.993 | 101 | 5 inputs |
-| MEM compile memory | 10 | 1.524 | 70 | peak RSS, 5 inputs |
-| SIZ code size | 10 | 1.710 | 61 | machine code, 5 inputs + wasm module 1.84 |
-| STK stack frames | 15 | 1.047 | 96 | regex-syntax, 336 shared fns |
-| COR correctness | 20 | 1.000 | 100 | ui: 0 stage-2-only vs 3 stage-1-only (11 d old) |
+| SPD runtime speed | 30 | 0.962 | 103 | native 0.908 · wasm 1.019 |
+| CMP compile time | 15 | 0.918 | 106 | 5 inputs |
+| MEM compile memory | 10 | 1.424 | 75 | peak RSS, 5 inputs |
+| SIZ code size | 10 | 1.519 | 70 | machine code, 5 inputs + wasm module 1.73 |
+| STK stack frames | 15 | 1.260 | 83 | regex-syntax, 337 shared fns |
+| COR correctness | 20 | 1.000 | 100 | crates: 0 pliron-only across 20 crates (same day) |
 
 Correctness inputs: crates tier 1 run in the default `--deps stock` mode
 (the crates' own code only); the UI input is the 2026-10-27 stage-2
-self-host run. x86-64 was last measured 2026-10-22. The CMP rating drop
-(112 → 101) is mostly the corrected measurement mix, not a slowdown —
-the same 0.85–0.99 ratio band, weighted differently across the five
-inputs; STK drifted up to 1.207, then dropped to ~1.03 once `memcpyopt`
-learned to sink a memset/sret-written temp into the alloca a `memcpy`
-copies it to (was: two 4 KiB `driftsort` scratch slots + a 4 KiB copy).
-The generalisation to multi-writer temps, `memmove` and
-struct-field/`sret` destinations landed with the quiescence rule for
-post-copy temp reads (fuzz 24242). `memcpyopt` now also resolves copy
-destinations through block parameters — every incoming edge must agree
-on (alloca, offset) — and follows destination pointers into block
-params when scanning the writer→copy and copy→read windows
-(`1ed006c`; regex-syntax forwards 1257→1398). Fresh measurement
-2026-11-11 puts STK at 1.047; the residual is `visit_post`
-register-pressure spills, not retained slots — `slotmerge` already
-packs 125 explicit slots down to 288 B and the rest of the ~1.5 KB
-frame is spill traffic, which tracks the function's inlining shape
-(204 calls vs LLVM's 142 — see `PLIRON_INLINE_GLUEWARM` in the work
-list and the `eh callee at invoke` stats).
+self-host run. x86-64 was last measured 2026-10-22.
+
+What moved since the 2026-11-07 card: CMP 0.993 → 0.918, MEM 1.524 →
+1.424, SIZ 1.710 → 1.519 (all better — the session's copy elision and
+shared-panic-tail work, see `history/2026-11-13-six-features.md`).
+STK regressed 1.047 → 1.260: the two `driftsort_main` monomorphs are
+back to 8 KB frames against LLVM's 4 KB, so the `memcpyopt`
+memset/sret-temp sink no longer fires there — suspect the
+`frag_copy_stays_whole` SROA refactor that landed after the last
+measurement. The rest of the STK gap is `visit_`/`parse_` spill
+traffic as before.
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| arrayvec | 4.011 ms | 3.744 ms | 0.934 ◄ faster |
-| chars_alpha | 2.082 ms | 2.098 ms | 1.008 |
-| chars_ascii | 1.567 ms | 1.658 ms | 1.058 |
-| chars_mixed | 11.150 ms | 11.640 ms | 1.044 ▲ slower |
-| contains_rng | 1.570 ms | 1.054 ms | 0.671 ◄ faster |
-| eqbug | 0.080 ms | 0.095 ms | 1.194 ▲ slower |
-| fib | 10.265 ms | 9.941 ms | 0.968 ◄ faster |
-| hashmap | 39.799 ms | 41.528 ms | 1.043 ▲ slower |
-| hmget | 8.412 ms | 8.164 ms | 0.971 |
-| iterw | 14.293 ms | 9.860 ms | 0.690 ◄ faster |
-| matmul | 6.258 ms | 6.072 ms | 0.970 |
-| nbody | 83.731 ms | 64.450 ms | 0.770 ◄ faster |
-| parse_only | 271.165 ms | 239.094 ms | 0.882 ◄ faster |
-| sieve | 8.719 ms | 8.726 ms | 1.001 |
-| sortw | 4.982 ms | 4.464 ms | 0.896 ◄ faster |
-| strwork | 10.530 ms | 10.279 ms | 0.976 |
-| tokenize | 4.270 ms | 5.379 ms | 1.260 ▲ slower |
-| varint | 5.724 ms | 4.350 ms | 0.760 ◄ faster |
-| varint_postcard | 5.638 ms | 3.564 ms | 0.632 ◄ faster |
-
-`chars_ascii` is back near parity after `esplit` (the merge tail is
-cloned per-edge and the ASCII arm's `icmp ult c, 128` folds to the
-bump, 7 insns/char) plus the `brhint` masked-test fix (don't mark the
-zero arm of `band`/`bor`/`bxor` tests unlikely — UTF-8's
-`c & 0x80 == 0` is the *hot* ASCII case). `chars_alpha` closed at
-1.008 (2.098 vs 2.082 ms): `brhint` marks the single-bit `band`'s
-bit-set arm unlikely so ASCII falls through (`tbnz`-away like LLVM),
-`bump_hoist`+post-index emit `ldrb [x], #1`, and `PLIRON_RETNN`+
-`PLIRON_NNBB` (now default-on) fold the `Option<NonNull>` niche `cbz`
-through `black_box`. See
-[`history/2026-11-09-hqzopfli-insn-bloat.md`](history/2026-11-09-hqzopfli-insn-bloat.md).
+| arrayvec | 3.991 ms | 3.771 ms | 0.945 ◄ faster |
+| chars_alpha | 1.519 ms | 1.505 ms | 0.991 |
+| chars_ascii | 1.569 ms | 0.835 ms | 0.532 ◄ faster |
+| chars_mixed | 11.179 ms | 11.531 ms | 1.031 ▲ slower |
+| contains_rng | 1.589 ms | 1.224 ms | 0.770 ◄ faster |
+| eqbug | 0.081 ms | 0.094 ms | 1.165 ▲ slower |
+| fib | 10.414 ms | 9.338 ms | 0.897 ◄ faster |
+| hashmap | 38.933 ms | 41.837 ms | 1.075 ▲ slower |
+| hmget | 8.290 ms | 7.690 ms | 0.928 ◄ faster |
+| iterw | 14.269 ms | 9.886 ms | 0.693 ◄ faster |
+| matmul | 6.142 ms | 6.114 ms | 0.996 |
+| nbody | 81.849 ms | 65.088 ms | 0.795 ◄ faster |
+| parse_only | 265.221 ms | 234.877 ms | 0.886 ◄ faster |
+| sieve | 8.676 ms | 8.416 ms | 0.970 |
+| sortw | 5.006 ms | 4.515 ms | 0.902 ◄ faster |
+| strwork | 10.198 ms | 10.496 ms | 1.029 |
+| tokenize | 4.240 ms | 4.223 ms | 0.996 |
+| varint | 4.645 ms | 4.827 ms | 1.039 ▲ slower |
+| varint_postcard | 4.340 ms | 3.755 ms | 0.865 ◄ faster |
 
 **wasm kernels** (node, interleaved rounds):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| chars_alpha | 3.269 ms | 2.851 ms | 0.878 ◄ faster |
-| chars_ascii | 1.652 ms | 1.662 ms | 1.004 |
-| chars_mixed | 13.052 ms | 13.927 ms | 1.067 ▲ slower |
-| contains_rng | 3.513 ms | 3.675 ms | 1.051 ▲ slower |
-| eqbug | 0.097 ms | 0.093 ms | 0.966 ◄ faster |
-| fib | 6.721 ms | 6.389 ms | 0.955 ◄ faster |
-| hashmap | 47.192 ms | 48.665 ms | 1.029 |
-| hmget | 8.192 ms | 8.288 ms | 1.012 |
-| iterw | 47.669 ms | 66.542 ms | 1.402 ▲ slower |
-| matmul | 21.865 ms | 10.810 ms | 0.493 ◄ faster |
-| nbody | 59.478 ms | 59.240 ms | 0.999 |
-| parse_only | 275.676 ms | 376.178 ms | 1.374 ▲ slower |
-| sieve | 10.166 ms | 9.206 ms | 0.906 ◄ faster |
-| sortw | 4.462 ms | 4.148 ms | 0.926 ◄ faster |
-| strwork | 12.776 ms | 14.145 ms | 1.107 ▲ slower |
-| tokenize | 5.512 ms | 4.533 ms | 0.824 ◄ faster |
+| chars_alpha | 3.302 ms | 2.911 ms | 0.882 ◄ faster |
+| chars_ascii | 1.674 ms | 1.652 ms | 0.984 |
+| chars_mixed | 13.338 ms | 15.905 ms | 1.191 ▲ slower |
+| contains_rng | 3.529 ms | 3.695 ms | 1.043 ▲ slower |
+| eqbug | 0.099 ms | 0.095 ms | 0.970 |
+| fib | 6.828 ms | 6.452 ms | 0.943 ◄ faster |
+| hashmap | 47.916 ms | 49.395 ms | 1.030 |
+| hmget | 8.329 ms | 8.389 ms | 1.008 |
+| iterw | 48.214 ms | 37.563 ms | 0.778 ◄ faster |
+| matmul | 22.293 ms | 18.306 ms | 0.819 ◄ faster |
+| nbody | 60.803 ms | 60.932 ms | 1.000 |
+| parse_only | 276.055 ms | 406.480 ms | 1.469 ▲ slower |
+| sieve | 10.098 ms | 9.873 ms | 0.974 |
+| sortw | 4.427 ms | 5.647 ms | 1.281 ▲ slower |
+| strwork | 12.720 ms | 13.912 ms | 1.095 ▲ slower |
+| tokenize | 5.628 ms | 5.797 ms | 1.030 |
 <!-- SCOREBOARD:END -->
 
 ### Held-out runtime (not in the card)

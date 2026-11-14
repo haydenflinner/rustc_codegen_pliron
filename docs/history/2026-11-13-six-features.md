@@ -1547,3 +1547,11 @@ the web tests that load the pliron-built `pkg-lite` pass (caps, carry,
 shelfmerge, warc, wireimport). Two web tests failed (tablekit,
 syntax_peers) but run against the stock `pkg/` module, not pliron —
 the tree was mid-refactor at the time. Still not run: x86-64.
+
+A fresh `harness/parity.py` card ran at the end of the day: overall
+94 (was 94 on 11-07). CMP 0.993 → 0.918, MEM 1.524 → 1.424, SIZ
+1.710 → 1.519 all improved. **STK regressed 1.047 → 1.260**: the two
+`driftsort_main` monomorphs are back to 8 KB frames against LLVM's
+4 KB — the `memcpyopt` memset/sret-temp sink no longer fires there,
+suspect the `frag_copy_stays_whole` SROA refactor. That is the first
+thing to check next session.
