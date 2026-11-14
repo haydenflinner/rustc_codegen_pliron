@@ -4719,6 +4719,11 @@ pub fn webmerge_ctx(
                 }
             }
             if let Some(se) = seed.filter(|_| uniform) {
+                if pliron_cfg::bisect_limit().is_some()
+                    && !pliron_cfg::bisect_in("wmA", &format!("{b} slot{ix} p{p}"))
+                {
+                    continue;
+                }
                 let key = skey_of(se, ix);
                 match member {
                     // A carrier that already resolves back to `p` through
@@ -4789,6 +4794,8 @@ pub fn webmerge_ctx(
             if uni
                 && let Some((_, rk)) = rel
                 && has_p(rk)
+                && (pliron_cfg::bisect_limit().is_none()
+                    || pliron_cfg::bisect_in("wmB", &format!("{b} slot{ix} p{}", ps[ix])))
             {
                 cands.push((ix, rk.clone()));
                 continue;
@@ -4819,27 +4826,77 @@ pub fn webmerge_ctx(
             // `arg_j = p_j + o_j` while every slot `i` in `r`'s
             // reference set steps `arg_i = p_i + o_i` with
             // `Σ slope_i·o_i = o_j`.
-            let defers = |e: usize, r: &Key, rh: u64, proven: &FxHashSet<usize>| -> bool {
+            // Slot `k` carries `p_k` through edge `e` unchanged —
+            // `arg_k`'s key peels to `Q(k)` with no step.
+            let echoes = |e: usize, k: u32| -> bool {
+                matches!(
+                    crate::proots::peel_off(pk_of(e, k as usize)),
+                    (Key::Q(x), 0) if *x == k
+                )
+            };
+            let defers = |e: usize, r: &Key, rh: u64, proven: &FxHashSet<usize>, heads: &FxHashSet<usize>| -> bool {
                 let kj = &kjs[e];
+                let dbg = |v: bool| {
+                    if wm_rel {
+                        tracing::info!(target: "pliron::clifpeep", "wmd {b} slot{ix} e{e} arg={:?} kj={kj:?} r={r:?} -> {v}", eargs[e][ix]);
+                    }
+                    v
+                };
                 if (pkh(e, ix) == rh && **kj == *r) || proven.contains(&e) {
-                    return true;
+                    // The edge was shown to supply `r` — but a `Q(k)`
+                    // leaf inside `r` bound `p_k` as the edge source
+                    // read it, and materialization replays it as the
+                    // incoming `arg_k`. Sound only when every `Q` slot
+                    // echoes through the edge.
+                    return dbg(crate::proots::qset(r)
+                        .iter()
+                        .all(|&k| echoes(e, k)));
+                }
+                if heads.contains(&e) {
+                    // `Head`: `arg_i - arg_j = p_i - p_j` — the head
+                    // pair's own diff carried through — so the edge
+                    // supplies `arg_j = arg_i ∓ D` with `D` evaluated
+                    // at the OLD head slots. Materialization replays
+                    // `D` against the incoming args; equal only when
+                    // every slot `D` references either echoes or steps
+                    // under a cancelling affine term (`Σ slope_k·o_k
+                    // = 0`).
+                    let Key::N(_, _, rargs, _) = r else {
+                        return dbg(false);
+                    };
+                    let d = &rargs[1];
+                    let mut sum = 0i64;
+                    for &k in &crate::proots::pset(d) {
+                        let (bk, ok) = crate::proots::peel_off(pk_of(e, k as usize));
+                        if !matches!(bk, Key::Q(x) if *x == k) {
+                            return dbg(false);
+                        }
+                        if ok == 0 {
+                            continue;
+                        }
+                        let Some(s) = crate::proots::slope(d, k) else {
+                            return dbg(false);
+                        };
+                        sum += s * ok;
+                    }
+                    return dbg(sum == 0);
                 }
                 let (bj, oj) = crate::proots::peel_off(kj);
                 if !matches!(bj, Key::Q(x) if *x == ix as u32) {
-                    return false;
+                    return dbg(false);
                 }
                 let mut sum = 0i64;
                 for &i in &crate::proots::pset(r) {
                     let (bi, oi) = crate::proots::peel_off(pk_of(e, i as usize));
                     let Some(s) = crate::proots::slope(r, i) else {
-                        return false;
+                        return dbg(false);
                     };
                     if !matches!(bi, Key::Q(x) if *x == i) {
-                        return false;
+                        return dbg(false);
                     }
                     sum += s * oi;
                 }
-                sum == oj
+                dbg(sum == oj)
             };
             // (1) Uniform `R` among non-self-step edges.
             let mut seed: Option<usize> = None;
@@ -4864,7 +4921,7 @@ pub fn webmerge_ctx(
             // without `arg_j` being textually `isub`-shaped, so `defers`
             // can't re-derive them from `kj` alone.
             let khash = |k: &Key| crate::proots::khash_m(k, &mut hmemo.borrow_mut());
-            let mut rels: Vec<(Key, FxHashSet<usize>)> = vec![];
+            let mut rels: Vec<(Key, FxHashSet<usize>, FxHashSet<usize>)> = vec![];
             if ok
                 && let Some(se) = seed
                 && has_p(kjs[se])
@@ -4876,6 +4933,7 @@ pub fn webmerge_ctx(
                         .filter(|(e, k)| pkh(*e, ix) == pkh(se, ix) && ***k == *kjs[se])
                         .map(|(e, _)| e)
                         .collect(),
+                    FxHashSet::default(),
                 ));
             }
             // (2) Diff-seeded: `arg_j = arg_i ∓ D` uniformly per sibling
@@ -4893,7 +4951,7 @@ pub fn webmerge_ctx(
             // `O(slots × edges)` dom-query tax on wide headers.
             if !rels
                 .iter()
-                .any(|(r, pr)| (0..es.len()).all(|e| defers(e, r, khash(r), pr)))
+                .any(|(r, pr, hd)| (0..es.len()).all(|e| defers(e, r, khash(r), pr, hd)))
                 && is_header
                 && func.dfg.value_type(ps[ix]).is_int()
             {
@@ -4981,7 +5039,7 @@ pub fn webmerge_ctx(
                         aj,
                         8,
                         &mut *dbmemo.borrow_mut(),
-                        false,
+                        wm_rel && pliron_cfg::tracing_on(),
                     ) {
                         Some(crate::indvars::Diff::Lit(bv)) => {
                             // A bound that is itself a param of `b`
@@ -5071,6 +5129,7 @@ pub fn webmerge_ctx(
                     }
                     let mut rel: Option<Key> = None;
                     let mut proven: FxHashSet<usize> = FxHashSet::default();
+                    let mut heads: FxHashSet<usize> = FxHashSet::default();
                     let mut uni_ok = true;
                     for (e, kj) in kjs.iter().enumerate() {
                         if selfstep(kj) {
@@ -5083,9 +5142,9 @@ pub fn webmerge_ctx(
                         // Oracle-deferred (`Head`): the chase proved
                         // this edge preserves the pair invariant even
                         // when `kj` isn't structurally `Q(ix)`-based —
-                        // count it as proven.
+                        // `defers` still verifies `D`'s slots echo.
                         let Some(r) = r else {
-                            proven.insert(e);
+                            heads.insert(e);
                             continue;
                         };
                         match &rel {
@@ -5099,18 +5158,21 @@ pub fn webmerge_ctx(
                         proven.insert(e);
                     }
                     if uni_ok && let Some(r) = rel {
-                        rels.push((r, proven));
+                        rels.push((r, proven, heads));
                     }
                 }
             }
-            for (rk, pr) in rels {
-                let hold = has_p(&rk) && (0..es.len()).all(|e| defers(e, &rk, khash(&rk), &pr));
+            for (rk, pr, hd) in rels {
+                let hold = has_p(&rk) && (0..es.len()).all(|e| defers(e, &rk, khash(&rk), &pr, &hd));
                 if wm_rel {
                     if pliron_cfg::tracing_on() {
                         tracing::info!(target: "pliron::clifpeep", "webmerge-rel {b} slot{ix} cand {rk:?} hold={hold}")
                     };
                 }
-                if hold {
+                if hold
+                    && (pliron_cfg::bisect_limit().is_none()
+                        || pliron_cfg::bisect_in("wmD", &format!("{b} slot{ix} p{}", ps[ix])))
+                {
                     cands.push((ix, rk));
                     break;
                 }
@@ -5350,6 +5412,11 @@ pub fn webmerge_ctx(
             for &i in &surv {
                 let l = cls[&i];
                 if l == i {
+                    continue;
+                }
+                if pliron_cfg::bisect_limit().is_some()
+                    && !pliron_cfg::bisect_in("wmC", &format!("{b} slot{i} p{}", ps[i]))
+                {
                     continue;
                 }
                 pmap.insert(ps[i], ps[l]);

@@ -1081,6 +1081,26 @@ pub fn within(k: &Key, cap: usize) -> bool {
     go(k, &mut left)
 }
 
+/// The set of slot indices `k` references through `Q` leaves only —
+/// a `Q(i)` binds the head value `p_i` as the edge source read it,
+/// while `P(i)` names the incoming `arg_i`; the distinction matters
+/// when checking which parts of a relation step with the edge.
+pub fn qset(k: &Key) -> FxHashSet<u32> {
+    let mut s = FxHashSet::default();
+    fn go(k: &Key, s: &mut FxHashSet<u32>) {
+        match k {
+            Key::Q(i) => {
+                s.insert(*i);
+            }
+            Key::A(_, b, _) => go(b, s),
+            Key::N(_, _, args, _) => args.iter().for_each(|a| go(a, s)),
+            _ => {}
+        }
+    }
+    go(k, &mut s);
+    s
+}
+
 /// The set of slot indices `k` references — `P` and `Q` leaves both
 /// name slot `i`'s incoming value, so both count.
 pub fn pset(k: &Key) -> FxHashSet<u32> {

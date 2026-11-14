@@ -285,6 +285,61 @@ block2(v20: i64):
     assert!(!f.display().to_string().contains("umin"), "{}\n{before}", f.display());
 }
 
+/// The `units::parse` crash of 2026-11-14: a cursor/index pair where
+/// the back edge carries `arg0 - arg2 = p0 - p2` (`idx` steps by the
+/// cursor's delta), so `diff_b` defers the edge as `Head`. The entry
+/// edge's `arg0` is `select(sep == 0, base, sep)` whose constant `0`
+/// paramizes to `P(2)` because `arg2` is `0` there — the seeded
+/// relation `p0 = p2 + SEL` then reads `P(2)` as "the constant 0",
+/// which steps to the running index on the back edge. `Head` proves
+/// only that the pair's diff is preserved; it does not make `D`'s
+/// slot references invariant — those must echo through the edge, and
+/// here slot 2 steps, so the merge is unsound. The back edge passes
+/// `block2`'s params so `key_sub` cannot diff them and the `Head`
+/// deferral is what `defers` must check.
+#[test]
+fn webmerge_head_deferral_must_echo_its_slots() {
+    let mut f = parse(
+        "function %f(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64):
+    v10 = iconst.i64 0
+    v11 = icmp eq v2, v10
+    v12 = select v11, v0, v2
+    jump block1(v12, v1, v10)
+block1(v3: i64, v4: i64, v5: i64):
+    v20 = load.i8 notrap v3
+    v30 = uextend.i64 v20
+    v22 = iadd v3, v30
+    v23 = isub v22, v3
+    v24 = iadd v5, v23
+    v25 = icmp ne v22, v4
+    brif v25, block2(v22, v4, v24), block3
+block2(v40: i64, v41: i64, v42: i64):
+    v43 = icmp ne v40, v41
+    brif v43, block1(v40, v41, v42), block3
+block3:
+    return v5
+}",
+    );
+    clifpeep::sameargs(&mut f);
+    verify(&f);
+    // The byte load still reads the cursor param itself — not a
+    // `p2 + SEL` reconstruction that turns the index into a pointer.
+    let li = f
+        .layout
+        .block_insts(block(&f, 1))
+        .find(|&i| f.dfg.insts[i].opcode() == Opcode::Load)
+        .unwrap();
+    assert!(
+        matches!(
+            f.dfg.value_def(f.dfg.resolve_aliases(f.dfg.inst_args(li)[0])),
+            ValueDef::Param(b, _) if b == block(&f, 1)
+        ),
+        "{}",
+        f.display()
+    );
+}
+
 /// Fuzz seed 74256: `d = 0 + w` in an inner loop, `w` the *outer*
 /// header's parameter, and the outer back edge passes `d` for `w` — so
 /// `d` is `w`'s step in the outer loop. Sinking `d` out of the inner
