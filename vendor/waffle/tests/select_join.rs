@@ -198,4 +198,3 @@ fn select_join_reads_operands_before_writes() {
     // Some(7): tag=1 -> Continue(7) = (0, 7)
     assert_eq!(eval(func, &[1, 7]), vec![0, 7]);
 }
-
