@@ -1061,3 +1061,21 @@ pub fn block_count(st: &State, b: Ptr<BasicBlock>) -> Option<u64> {
 pub fn func_count(st: &State, f: Ptr<Operation>) -> Option<u64> {
     st.prof.get(f)?.blocks.first().copied()
 }
+
+/// `PLIRON_FNORDER=pgo` emit-order key, used with a stable
+/// `sort_by_key`: profiled-hot functions first (descending entry
+/// count), unprofiled next in declaration order, recorded-cold and
+/// `#[cold]` last. Ordering is per emitted object — linkers keep an
+/// object's function order, so a CGU's hot code lands together
+/// (BOLT's function reordering, scoped to what codegen controls).
+pub fn fnorder_key(st: &State, sym: &str) -> (u8, std::cmp::Reverse<u64>) {
+    let info = st.funcs.get(sym);
+    if info.is_some_and(|f| f.cold) {
+        return (2, std::cmp::Reverse(0));
+    }
+    match info.and_then(|f| func_count(st, f.op)) {
+        Some(c) if c > 0 => (0, std::cmp::Reverse(c)),
+        Some(_) => (2, std::cmp::Reverse(0)),
+        None => (1, std::cmp::Reverse(0)),
+    }
+}

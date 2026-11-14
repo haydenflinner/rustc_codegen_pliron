@@ -142,6 +142,19 @@ Consumers:
 5. **Switch lowering** (`brchain.rs`, under `PLIRON_JT_SHAPE`, default
    on): chain tests are ordered hottest first and a dominant case is
    peeled ahead of the table (`history/2026-10-27-jump-tables.md`).
+6. **Function order** (`PLIRON_FNORDER=pgo`, opt-in): emitted objects
+   place functions hottest-first by entry count — profiled-hot ahead of
+   unprofiled ahead of recorded-cold/`#[cold]`. Linkers keep an
+   object's function order, so a CGU's hot code lands together. Same
+   knob sorts wasm `emit_obj` bodies in the code section.
+
+   Whole-binary ordering needs the linker's cooperation:
+   `PLIRON_FNORDER_FILE=<path>` makes every object emission append
+   `sym<TAB>entry_count` lines; `pliron-prof fnorder <files>... -o
+   order.txt` merges them into a linker order file (ld64
+   `-order_file`, lld `--symbol-ordering-file`). That is BOLT's
+   function reordering end to end; the scratchpad order-file numbers
+   measured ~0.5% (codegen-plan.md).
 
 Possible later consumers (design only):
 

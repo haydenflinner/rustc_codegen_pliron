@@ -406,10 +406,21 @@ fn emit_obj(
         }
     }
     // wasm numbers imported functions first.
-    let order: Vec<usize> = (0..o.funcs.len())
+    let mut order: Vec<usize> = (0..o.funcs.len())
         .filter(|&i| o.funcs[i].body.is_none() && called[i])
         .chain((0..o.funcs.len()).filter(|&i| o.funcs[i].body.is_some()))
         .collect();
+    // `PLIRON_FNORDER=pgo`: sort defined bodies by profiled entry
+    // count so a module's hot code sits together in the code section
+    // (imports keep wasm's number-first rule).
+    if crate::env_get("PLIRON_FNORDER") == Some("pgo") {
+        let first_def = order
+            .iter()
+            .position(|&i| o.funcs[i].body.is_some())
+            .unwrap_or(order.len());
+        order[first_def..]
+            .sort_by_key(|&i| pliron_clif_lower::pgo::fnorder_key(st, &o.funcs[i].name));
+    }
     let mut remap = vec![0usize; o.funcs.len()];
     for (new, &old) in order.iter().enumerate() {
         remap[old] = new;

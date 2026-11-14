@@ -2462,19 +2462,52 @@ pub fn lower_module<'a>(
     // code of a CGU sits together in the text section (ld64 and the ELF
     // linkers keep an object's function order). Placement otherwise
     // follows declaration order, which mixes hot loops with cold paths.
+    // `PLIRON_FNORDER=pgo` (opt-in): same idea with measured hotness —
+    // functions sort by descending profiled entry count (BOLT's
+    // reordering, at the granularity codegen controls).
     let mut emit: Vec<usize> = (0..jobs.len()).collect();
-    if crate::env_is("PLIRON_FNORDER", "1") {
-        let class = |j: &FnJob| -> u8 {
-            if st.funcs.get(j.name.as_str()).is_some_and(|f| f.cold) {
-                2
-            } else if has_back_edge(&j.func) {
-                0
-            } else {
-                1
-            }
-        };
-        let keys: Vec<u8> = jobs.iter().map(class).collect();
-        emit.sort_by_key(|&i| keys[i]);
+    match crate::env_get("PLIRON_FNORDER") {
+        Some("pgo") => {
+            let keys: Vec<_> = jobs
+                .iter()
+                .map(|j| crate::pgo::fnorder_key(st, j.name.as_str()))
+                .collect();
+            emit.sort_by_key(|&i| keys[i]);
+        }
+        Some("1") => {
+            let class = |j: &FnJob| -> u8 {
+                if st.funcs.get(j.name.as_str()).is_some_and(|f| f.cold) {
+                    2
+                } else if has_back_edge(&j.func) {
+                    0
+                } else {
+                    1
+                }
+            };
+            let keys: Vec<u8> = jobs.iter().map(class).collect();
+            emit.sort_by_key(|&i| keys[i]);
+        }
+        _ => {}
+    }
+    // `PLIRON_FNORDER_FILE=<path>`: append `sym<TAB>entry_count` for
+    // each emitted function. `pliron-prof fnorder` merges the files
+    // from every object into a linker order file (`ld64 -order_file`,
+    // `lld --symbol-ordering-file`) — whole-binary hot-first layout,
+    // which per-object ordering alone can't reach.
+    if let Some(path) = crate::env_get("PLIRON_FNORDER_FILE") {
+        use std::io::Write;
+        let mut buf = String::new();
+        for &i in &emit {
+            let j = &jobs[i];
+            let (_, std::cmp::Reverse(c)) = crate::pgo::fnorder_key(st, j.name.as_str());
+            buf.push_str(&j.name);
+            buf.push('\t');
+            buf.push_str(&c.to_string());
+            buf.push('\n');
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+            let _ = f.write_all(buf.as_bytes());
+        }
     }
     for j in emit.iter().map(|&i| &jobs[i]) {
         stats.merge(&j.stats);
