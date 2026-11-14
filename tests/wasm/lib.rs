@@ -36,6 +36,19 @@ pub extern "C" fn hypot(a: f64, b: f64) -> f64 {
     unsafe { core::intrinsics::sqrtf64(a * a + b * b) }
 }
 
+// Narrow smul_overflow: the flag compares the high half against the sign of
+// the low half — both must be in the same (w-bit) rep, or every negative
+// product reads as overflowing. -1000 marks None.
+#[unsafe(no_mangle)]
+pub extern "C" fn smul_i8(a: i32, b: i32) -> i32 {
+    (a as i8).checked_mul(b as i8).map_or(-1000, i32::from)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn smul_i16(a: i32, b: i32) -> i32 {
+    (a as i16).checked_mul(b as i16).map_or(-1000, i32::from)
+}
+
 static mut COUNTER: u32 = 0;
 static TABLE: [u16; 5] = [3, 1, 4, 1, 5];
 

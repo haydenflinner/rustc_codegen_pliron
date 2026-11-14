@@ -8410,7 +8410,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 if wsel(b) {
                     fixup_edges(b);
                     check_targets(b, &funcs[ci].name);
-                    b.optimize(&waffle::OptOptions::default());
+                    if !crate::env_is("PLIRON_WASM_BASICOPT", "0") {
+                        b.optimize(&waffle::OptOptions::default());
+                    }
                 }
             }
             // Loop-member blocks of this caller, for the hot rule.
@@ -8580,7 +8582,9 @@ fn winline(funcs: &mut [FDecl], verbose: bool, sp: waffle::Global) {
                 let b = funcs[ci].body.as_mut().unwrap();
                 fixup_edges(b);
                 check_targets(b, &funcs[ci].name);
-                b.optimize(&waffle::OptOptions::default());
+                if !crate::env_is("PLIRON_WASM_BASICOPT", "0") {
+                    b.optimize(&waffle::OptOptions::default());
+                }
                 if irred_log && !was_irred && wirreducible(b) {
                     eprintln!("irred-opt {}", funcs[ci].name);
                 }
@@ -9836,7 +9840,9 @@ mod clif_emit {
             wrange(&mut self.b);
             waddr(&mut self.b);
             check_targets(&self.b, &self.name);
-            self.b.optimize(&waffle::OptOptions::default());
+            if !crate::env_is("PLIRON_WASM_BASICOPT", "0") {
+                self.b.optimize(&waffle::OptOptions::default());
+            }
             if crate::env_get("PLIRON_WASM_DUMP")
                 .map(|f| f.is_empty() || self.name.contains(&f))
                 .unwrap_or(false)
@@ -11492,8 +11498,12 @@ mod clif_emit {
                     let hi = self.umulhi(t, a, b, signed);
                     let c = if signed {
                         // hi should equal the sign-extension of prod's top bit.
+                        // Narrow prods are zero-extended, so extend before the
+                        // shift or the flag ends up 0/1 next to hi's 0/all-ones.
                         let sh = self.leaf_const(t, w as u64 - 1);
-                        let e = self.binop(t, O::I32ShrS, O::I64ShrS, prod, sh);
+                        let e = self.sext(prod, w);
+                        let e = self.binop(t, O::I32ShrS, O::I64ShrS, e, sh);
+                        let e = self.norm(e, w);
                         self.cbinop(t, O::I32Ne, O::I64Ne, hi, e)
                     } else {
                         let z = self.leaf_const(t, 0);
