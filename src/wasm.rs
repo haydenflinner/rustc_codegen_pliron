@@ -1403,6 +1403,27 @@ fn peep_body_opts(
         // Candidate rewrites: (producer idx, copy-get idx, copy-set idx,
         // temp local, dest local). A producer is the last set/tee of the
         // temp before the copy-get.
+        // Locals carry a wasm valtype; retargeting a producer of `t`
+        // onto `x` is only sound when both have the same known type.
+        // Without this, opt-level≥2 float-heavy crates (moxcms /
+        // polars_core) emitted `f32.demote; local.set <f64-slot>` and
+        // failed validation — Devin's DSA literate-wasm Bug 1.
+        // Params (index < nparams) aren't in `groups`; refuse those
+        // too until the driver passes their types through.
+        // r[impl wasm.peep.copyfwd.types]
+        let lty = |l: u32| -> Option<u8> {
+            if l < nparams {
+                return None;
+            }
+            let mut i = nparams;
+            for &(c, ty) in &groups {
+                if l < i + c {
+                    return Some(ty);
+                }
+                i += c;
+            }
+            None
+        };
         let mut cand: Vec<(usize, usize, usize, u32, u32)> = Vec::new();
         for &(gi, si) in &pairs {
             let (WPeek::Get(t), WPeek::Set(x)) = (ins[gi].0, ins[si].0) else {
@@ -1410,6 +1431,10 @@ fn peep_body_opts(
             };
             if t == x {
                 continue; // get x ... set x: stack-neutral no-op, leave it
+            }
+            match (lty(t), lty(x)) {
+                (Some(a), Some(b)) if a == b => {}
+                _ => continue,
             }
             // A Nop marker can never be the producer: it writes back the
             // value it read, so retargeting it would leave x unwritten.
@@ -3198,17 +3223,23 @@ fn peep_body_opts(
                     _ => return None,
                 })
             };
+            // Result valtype of the last op in a hoistable pure chain.
+            // Opcode map is the MVP numeric encoding (convert/reinterpret
+            // included); a wrong entry mints a local of the wrong type —
+            // cadcore `chord_params` failed validation when `0xb8`
+            // (`f64.convert_i32_u`) was listed as i32.
+            // r[impl wasm.peep.licm.chain_vt]
             let chain_vt = |op: u8| -> Option<u8> {
                 Some(match op {
-                    // i32.const/eqz/cmps/i32-arith/wrap/i32-extends -> i32
+                    // -> i32: const/eqz/cmps/unary/arith/wrap/extend*/reinterpret
                     0x41 | 0x45 | 0x50 | 0x46..=0x4f | 0x51..=0x66 | 0x67..=0x69
-                    | 0x6a..=0x78 | 0xa7 | 0xb8 | 0xc0 | 0xc1 => 0x7f,
-                    // i64.const/i64-unary/arith/extend-i32/i64-extends/reint -> i64
-                    0x42 | 0x79..=0x8a | 0xac | 0xad | 0xb9 | 0xc2..=0xc4 => 0x7e,
-                    // f32.const/unary/arith/convert-i32/demote/reint -> f32
-                    0x43 | 0x8b..=0x98 | 0xb2 | 0xb3 | 0xb4 | 0xba => 0x7d,
-                    // f64.const/unary/arith/convert-i32/promote/reint -> f64
-                    0x44 | 0x99..=0xa6 | 0xb5 | 0xb6 | 0xb7 | 0xbb => 0x7c,
+                    | 0x6a..=0x78 | 0xa7 | 0xbc | 0xc0 | 0xc1 => 0x7f,
+                    // -> i64: const/unary/arith/extend_i32/extend*/reinterpret
+                    0x42 | 0x79..=0x8a | 0xac | 0xad | 0xbd | 0xc2..=0xc4 => 0x7e,
+                    // -> f32: const/unary/arith/convert_i*/demote/reinterpret
+                    0x43 | 0x8b..=0x98 | 0xb2..=0xb6 | 0xbe => 0x7d,
+                    // -> f64: const/unary/arith/convert_i*/promote/reinterpret
+                    0x44 | 0x99..=0xa6 | 0xb7..=0xbb | 0xbf => 0x7c,
                     _ => return None,
                 })
             };
@@ -5527,8 +5558,51 @@ mod wpeep_tests {
         b
     }
 
+    /// Like `body`, but with explicit `(count, valtype)` local groups.
+    fn body_typed(groups: &[(u32, u8)], ins: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        leb(&mut b, groups.len() as u32);
+        for &(c, t) in groups {
+            leb(&mut b, c);
+            b.push(t);
+        }
+        b.extend_from_slice(ins);
+        b.push(0x0b);
+        b
+    }
+
     fn has_seq(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // Regression (DSA literate-wasm Bug 1): copy-forward must not
+    // retarget a producer onto a local of a different valtype. Both
+    // locals stay live via `global.set` so dead-write can't erase the
+    // pair; without the type check the f32 producer becomes `set 0`.
+    #[test]
+    fn copyfwd_refuses_cross_type_retarget() {
+        // locals: 0 = i32, 1 = f32
+        let b = body_typed(
+            &[(1, 0x7f), (1, 0x7d)],
+            &[
+                0x41, 0x00, 0x21, 0x00, // i32.const 0; set 0
+                0x43, 0x00, 0x00, 0x80, 0x3f, // f32.const 1.0
+                0x21, 0x01, // set 1 (f32)
+                0x20, 0x01, // get 1
+                0x21, 0x00, // set 0 (i32) — mismatched copy
+                0x20, 0x01, 0x24, 0x00, // get 1; global.set 0
+                0x20, 0x00, 0x24, 0x01, // get 0; global.set 1
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        let on_1 = has_seq(&out, &[0x43, 0x00, 0x00, 0x80, 0x3f, 0x21, 0x01])
+            || has_seq(&out, &[0x43, 0x00, 0x00, 0x80, 0x3f, 0x22, 0x01]);
+        assert!(on_1, "producer left local 1: {out:02x?}");
+        assert!(
+            !has_seq(&out, &[0x43, 0x00, 0x00, 0x80, 0x3f, 0x21, 0x00])
+                && !has_seq(&out, &[0x43, 0x00, 0x00, 0x80, 0x3f, 0x22, 0x00]),
+            "f32 producer wrote i32 local: {out:02x?}"
+        );
     }
 
     // Regression: the `btr` dead-region model must resume liveness at a
@@ -6612,6 +6686,56 @@ mod wpeep_tests {
         );
         let out = peep_body(&b, &[], &[], 0).unwrap();
         assert!(has_seq(&out, &[0x28]), "unsound fwd: {out:02x?}");
+    }
+
+    // Regression (DSA cadcore `chord_params`): LICM chain-hoist of
+    // `get; i32.const; i32.sub; f64.convert_i32_u` must mint an f64
+    // local. `chain_vt` previously mapped `0xb8` to i32, so the hoist
+    // emitted `f64.convert_i32_u; local.set <i32>` and failed validation.
+    #[test]
+    fn licm_chain_convert_i32_u_mints_f64() {
+        let b = body_typed(
+            &[(1, 0x7f), (1, 0x7c)], // local 0 = i32, local 1 = f64
+            &[
+                0x03, 0x40, // loop
+                0x20, 0x00, //   get 0
+                0x41, 0x01, //   i32.const 1
+                0x6b,       //   i32.sub
+                0xb8,       //   f64.convert_i32_u
+                0x21, 0x01, //   set 1
+                0x0b,       // end
+            ],
+        );
+        let out = peep_body(&b, &[], &[], 0).unwrap();
+        let mut p = 0usize;
+        let ng = urd(&out, &mut p).unwrap();
+        let mut types = Vec::new();
+        for _ in 0..ng {
+            let c = urd(&out, &mut p).unwrap();
+            let t = out[p];
+            p += 1;
+            for _ in 0..c {
+                types.push(t);
+            }
+        }
+        // Find `0xb8; 0x21 <idx>` (convert; set) — the set's local must
+        // be f64. Without the fix the minted temp is i32.
+        let mut ok = false;
+        let mut i = p;
+        while i + 2 < out.len() {
+            if out[i] == 0xb8 && out[i + 1] == 0x21 {
+                let idx = out[i + 2] as usize;
+                assert!(
+                    idx < types.len() && types[idx] == 0x7c,
+                    "convert set local {idx} type={:?} (want f64): {out:02x?}",
+                    types.get(idx)
+                );
+                ok = true;
+                break;
+            }
+            i += 1;
+        }
+        assert!(ok, "expected convert;set hoist: {out:02x?}");
     }
 
     // Loop-invariant `get;get;binop` hoists before the loop into a
