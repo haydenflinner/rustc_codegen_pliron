@@ -149,22 +149,22 @@ through `black_box`. See
 
 SPD is measured on the kernels above, which the backend has been tuned
 against for weeks. On real programs it was never tuned on, native code is
-**1.076x slower** than LLVM (geomean of 8; 2026-11-11, 5 interleaved
-rounds, `bench/heldout/run.py`; was 1.054x on 11-10 — within
-day-to-day machine drift):
+**1.054x slower** than LLVM (geomean of 8; 2026-11-13, 5 interleaved
+rounds, `bench/heldout/run.py`, AC power; was 1.076x on 11-11 and
+1.054x on 11-10 — within day-to-day machine drift):
 
 | program (sightglass) | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| blake3-scalar | 2.90 ms | 3.07 ms | 1.057 |
-| blind-sig | 1.35 ms | 1.40 ms | 1.043 |
-| pulldown-cmark | 3.60 ms | 4.12 ms | 1.147 |
-| rust-compression | 2.22 ms | 2.50 ms | 1.122 |
-| rust-html-rewriter | 4.88 ms | 5.54 ms | 1.134 |
-| regex | 2.68 ms | 2.90 ms | 1.082 |
-| rust-json | 3.02 ms | 3.18 ms | 1.053 |
-| rust-protobuf | 5.26 ms | 5.17 ms | 0.983 |
+| blake3-scalar | 4.32 ms | 4.05 ms | 0.939 |
+| blind-sig | 1.36 ms | 1.50 ms | 1.096 |
+| pulldown-cmark | 4.81 ms | 5.51 ms | 1.147 |
+| rust-compression | 3.65 ms | 3.32 ms | 0.910 |
+| rust-html-rewriter | 5.69 ms | 7.36 ms | 1.293 |
+| regex | 3.42 ms | 4.13 ms | 1.209 |
+| rust-json | 3.60 ms | 3.85 ms | 1.068 |
+| rust-protobuf | 8.23 ms | 7.00 ms | 0.851 |
 
-Since then `PLIRON_BJALIAS` (default on, afcc31b) removed ~600 dead
+Since the 11-09 measurement `PLIRON_BJALIAS` (default on, afcc31b) removed ~600 dead
 `b .+4` fallthrough branches per binary — eager aliasing of bare-jump
 edge-block labels so MachBuffer's purgatory sees the real target;
 held-out A/B `bja/pliron` geomean 0.985
