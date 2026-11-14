@@ -46,6 +46,21 @@ holds it until the rlib is written), or have rustc wait for rlibs before code ge
 already does for `-Clto`. `src/field_order.rs` only looks at paths and `src/lto.rs` runs under
 `-Clto`, which the series already covers.
 
+## Status 2026-11-13: landed in `haydenflinner/rust`
+
+The rebase barrier (point 1 below) dissolved: the metadata-encoding rework the series
+conflicted with landed upstream, so the patches were ported onto the fork's rustc
+(`main`, commits `178d0f3`…`ad368bc` + `78f392a`/`6c06749`/`c728ce1` — encoder refactor,
+`analysis_interfaces`, `-Zearly-metadata`, early→full swap, `-Zearly-metadata-verify`,
+plus the port adaptations) and `src/tools/cargo` points at `haydenflinner/cargo`
+branch `headstart` (`634a4f5`), the three cargo patches rebased on cargo 0.103.0.
+`./x check compiler` is green and `tests/run-make/early-metadata` +
+`tests/ui/rmeta` pass. The licence caveat stands and still matters more now:
+the ported series lives in the fork's history as a derived work of unlicensed
+code — fine for the personal fork, not upstreamable or safely redistributable.
+Still open: the `src/devirt.rs` rlib-read race noted below, and timing numbers
+(never measured under pliron; the replay table below is the model only).
+
 ## Why there is no headstart toolchain here
 
 1. Our pin is `nightly-2026-10-22` (`1a2c4797e`); the series is made for `6006fd0`

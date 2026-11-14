@@ -358,7 +358,20 @@ impl Dep {
         use object::{Object, ObjectSymbol};
         self.syms
             .get_or_init(|| {
-                let data = std::fs::read(self.rlib.as_ref()?).ok()?;
+                let rlib = self.rlib.as_ref()?;
+                // `-Zearly-metadata`: a linked crate can start codegen while a
+                // dependency's rlib is still being written; its producer holds
+                // an exclusive `<rlib>.lock` until it finishes, so a shared
+                // lock here waits that out. No lock file means the rlib is
+                // already final (or headstart is off, and cargo only started
+                // us once it was complete anyway).
+                let mut lock_path = rlib.as_os_str().to_owned();
+                lock_path.push(".lock");
+                if let Ok(lock) = std::fs::File::open(&lock_path) {
+                    let _ = lock.lock_shared();
+                    let _ = lock.unlock();
+                }
+                let data = std::fs::read(rlib).ok()?;
                 let ar = ArchiveFile::parse(&*data).ok()?;
                 let mut out = rustc_hash::FxHashSet::default();
                 for m in ar.members() {
