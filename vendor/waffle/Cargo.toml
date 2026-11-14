@@ -51,6 +51,10 @@ required-features = ["cli"]
 name = "roundtrip"
 path = "tests/roundtrip.rs"
 
+[[test]]
+name = "select_join"
+path = "tests/select_join.rs"
+
 [dependencies.addr2line]
 version = "0.21"
 optional = true

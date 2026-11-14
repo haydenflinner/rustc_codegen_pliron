@@ -346,6 +346,10 @@ impl<'a> WasmFuncBackend<'a> {
                 }
             }
             // PLIRON: same-join CondBr — one `select` per differing param.
+            // Evaluate every param's select first, then write all of the
+            // locals (like `BlockParams` above): `cond` is rematerialized
+            // per select and `vt`/`vf` reads can reach locals that an
+            // earlier param's `local.set` would clobber mid-loop.
             WasmBlock::SelectJoin {
                 cond,
                 if_true,
@@ -354,6 +358,7 @@ impl<'a> WasmFuncBackend<'a> {
             } => {
                 debug_assert_eq!(if_true.len(), if_false.len());
                 debug_assert_eq!(if_true.len(), to.len());
+                let mut sets: Vec<(Type, Value)> = Vec::with_capacity(to.len());
                 for ((&vt, &vf), &(to_ty, vp)) in
                     if_true.iter().zip(if_false.iter()).zip(to.iter())
                 {
@@ -373,8 +378,7 @@ impl<'a> WasmFuncBackend<'a> {
                             continue;
                         }
                         self.lower_value(ctx, vt, func);
-                        self.lower_set_value(ctx, vp, func);
-                        let _ = to_ty;
+                        sets.push((to_ty, vp));
                         continue;
                     }
                     // select: val1 if cond!=0 else val2 → true arm first.
@@ -382,6 +386,9 @@ impl<'a> WasmFuncBackend<'a> {
                     self.lower_value(ctx, vf, func);
                     self.lower_value(ctx, *cond, func);
                     func.instruction(&wasm_encoder::Instruction::Select);
+                    sets.push((to_ty, vp));
+                }
+                for &(to_ty, vp) in sets.iter().rev() {
                     if ctx.locals.values[vp].len() == 1 {
                         assert_eq!(to_ty, ctx.locals.locals[ctx.locals.values[vp][0]]);
                     }
