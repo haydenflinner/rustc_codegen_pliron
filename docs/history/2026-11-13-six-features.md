@@ -1485,3 +1485,65 @@ opt-in and the `frag_copy_stays_whole` refactor). Not run at any
 point in this session: fresh fuzz seeds (700 were required), `harness/crates.py`, wasm, x86-64.
 `PLIRON_RA_CHECK=1` builds of all eight ran for `REHOME` only, before
 the later changes.
+
+## Evening: handoff items run
+
+The four items the handoff listed as not run, in the evening of the
+same day. The tree moved on meanwhile (`283ad02`, `6091329`,
+`35eba67`: the wasm-ld tombstone and the SelectJoin fix below), but
+none of it touches the native pipeline these measure.
+
+**Fresh fuzz.** Seeds 130000:130700 on default flags: 700/700 pass.
+A parallel 120000:122000 sweep under scoped noalias: 1998/2000; the two
+failures are compile crashes the verifier catches (a `loadfwd`
+overflow panic and an `esplit` dominance break), not silent
+miscompiles.
+
+**Crates.** `harness/crates.py` tier 1, 20 crates: 0 pliron-only
+problems. hashbrown 388/0, so both doc-tests that failed earlier now
+pass. Report at `target/crates/report.md`.
+
+**Re-measure of the eight programs.** `bench/heldout/run.py --rounds
+5`, wall-clock A/B against LLVM (`/tmp/heldout.log`):
+
+| program | LLVM ms | pliron ms | ratio | CI |
+|---|---|---|---|---|
+| blake3-scalar | 4.32 | 4.05 | 0.939 | [0.752, 1.482] |
+| blind-sig | 1.36 | 1.50 | 1.096 | [1.030, 1.908] |
+| pulldown-cmark | 4.81 | 5.51 | 1.147 | [0.621, 1.669] |
+| regex | 3.42 | 4.13 | 1.209 | [0.601, 1.905] |
+| rust-compression | 3.65 | 3.32 | 0.910 | [0.790, 1.611] |
+| rust-html-rewriter | 5.69 | 7.36 | 1.293 | [0.896, 2.574] |
+| rust-json | 3.60 | 3.85 | 1.068 | [0.591, 1.441] |
+| rust-protobuf | 8.23 | 7.00 | 0.851 | [0.383, 1.700] |
+
+Geomean pliron/LLVM 1.054 [0.917, 1.278], 8 of 8. Only blind-sig's
+interval excludes 1.0 (slower); the rest are inside the noise on this
+machine. Callgrind counts, which are stable, were not re-run.
+
+**Wasm.** The full DSA `literate_wasm` module now instantiates and
+runs under the pliron toolchain. Two bugs fixed:
+
+- `pliron-wasm-ld` emitted `els.declared([0])` so remapped dead-region
+  `ref.func`s validated. That pinned import 0 — here
+  `__wbindgen_describe` — alive through wasm-bindgen's GC, and the
+  generated module then demanded a `__wbindgen_placeholder__` import
+  that nothing provides. Dead refs now map to a synthesized
+  unreachable tombstone function (`283ad02`).
+- `WasmBlock::SelectJoin` lowering evaluated each param's `select`
+  and immediately wrote its destination local. A param select result
+  could take a local that a later param's rematerialized condition or
+  arm still read — in `Option<usize>::branch` the payload select
+  consumed the out-discriminant just written, so `x?` on `Some(v)`
+  yielded `Continue(0)` (found by `PLIRON_OPT_FNS` bisection of the
+  DSA crash, a `ptr::sub` precondition panic inside hashbrown probing
+  fed by a `?` on `Option<usize>`). The lowering now evaluates every
+  select before writing any local, the same pattern `BlockParams`
+  already used (`6091329`, test `vendor/waffle/tests/select_join.rs`).
+
+Verified: `harness/quick.py` 13 steps; a full-opt
+(`PLIRON_OPT_FNS=0..0x100000000`) DSA build passes `PageHandle.bare()`;
+the web tests that load the pliron-built `pkg-lite` pass (caps, carry,
+shelfmerge, warc, wireimport). Two web tests failed (tablekit,
+syntax_peers) but run against the stock `pkg/` module, not pliron —
+the tree was mid-refactor at the time. Still not run: x86-64.
