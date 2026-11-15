@@ -343,9 +343,15 @@ in the scoreboard and in the linked history files.
   bit-test (`PLIRON_SWITCH_NOBIT` plus `PLIRON_BITTAB=0`, which
   rebuilds the same `mask >> c` from the compare tree) removes
   the shift and leaves the store. Not landed.
-  Both knobs are now the wasm default (native `SWITCH_GCC` stays
-  opt-in because of that store). Still open: the sign split
-  without the whitespace tree, so tokenize keeps its −18%.
+  Both knobs are the wasm default (native `SWITCH_GCC` stays
+  opt-in). The store is not the ASCII bit-test: it is the
+  4-case `c >> 8` bucket switch in
+  `CharPredicateSearcher<IsWhitespace>::next_match` (cases
+  0/22/32/48). `PLIRON_SWITCH_GCC_MAX` (default 2, `=0` no cap)
+  clusters only the 2-case `'+'`/`'-'` split. `--layouts=3`:
+  parse_only **0.994×** (274 vs 276 ms), tokenize **−17%**
+  (the no-cap tree was +3%), geomean **0.921**. The other
+  kernels match clustering-off; `strwork` improves 10.0% → 8.6%.
   Profile: `harness/v8/{cpuprof,hotw,mcode}.sh`.
 - **`varint_postcard` native.** Fixed by `bunroll`'s LCSSA
   exit-cone repair (`95cab3a`, default-on `3f6a2ff`): the

@@ -4589,7 +4589,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// forces on, `=0` off). Wasm `parse_only` needs the sign split
     /// (`byte < '+'`) together with `WBRIF` to land at or under LLVM;
     /// the same tree stores a searcher cursor on every byte of
-    /// `split_whitespace`, so native stays opt-in.
+    /// `split_whitespace`, so native stays opt-in. Only switches
+    /// with at most `PLIRON_SWITCH_GCC_MAX` cases (default 2) are
+    /// clustered: that is the `'+'`/`'-'` split, and not the
+    /// 4-case `c >> 8` bucket switch in
+    /// `CharPredicateSearcher<IsWhitespace>::next_match`, whose
+    /// tree is what stores the cursor. `=0` clusters every switch.
     /// `PLIRON_SWITCH_JT_RATIO` (default 8) and `PLIRON_SWITCH_JT_MIN`
     /// (default 4 wasm / 5 native) tune tables.
     fn gcc_switch(
@@ -4643,6 +4648,21 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .iter()
             .map(|&(v, b)| (v as u64 & mask, b))
             .collect();
+        // Two cases is the `from_str` sign split (`'+'` / `'-'`).
+        // The whitespace searcher's bucket switch is four cases
+        // (`c >> 8` against 0/22/32/48); clustering that tree stores
+        // the cursor on every byte. `PLIRON_SWITCH_GCC_MAX=0` lifts
+        // the cap.
+        static MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            match pliron_cfg::env_get("PLIRON_SWITCH_GCC_MAX") {
+                Some("0") => usize::MAX,
+                Some(s) => s.parse().unwrap_or(2),
+                None => 2,
+            }
+        });
+        if pairs.len() > *MAX {
+            return false;
+        }
         let clusters = crate::switch_gcc::clusterize(&pairs, *RATIO, jt_min);
         self.emit_gcc_clusters(x, &clusters, 0, clusters.len(), d, dead_default);
         true

@@ -158,11 +158,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   a.wasm [b.wasm] --layouts=3`. Wasm defaults for parse_only ≤1×:
   `WBRIF` on (`PLIRON_WBRIF=0` off) and `SWITCH_GCC` on for wasm
   only (`PLIRON_SWITCH_GCC=0` off, `=1` also on native). Together
-  parse_only is **0.99×** LLVM (geomean ~0.93). The win is a
-  `byte < '+'` split that skips the sign selects; the same tree
-  stores a searcher cursor on every byte of `split_whitespace`
-  (tokenize ~+3%, `hotw`). WBRIF alone is a better geomean (0.922)
-  but parse stays ~1.06×. GCC alone does not move parse. Native
+  parse_only is **0.99×** LLVM and tokenize **−17%** (geomean
+  0.921). The parse win is a 2-case `byte < '+'` split.
+  `PLIRON_SWITCH_GCC_MAX` (default 2, `=0` no cap) keeps that
+  and leaves the 4-case `c >> 8` bucket switch in
+  `IsWhitespace::next_match` alone — clustering it stores the
+  searcher cursor on every byte (tokenize ~+3%). Native
   `SWITCH_GCC` stays opt-in.
   `divconst` before the egraph on wasm is what narrowed `i % 5`.
   `PLIRON_WASM_BRI_NEST=1` and that plus `PLIRON_EGRAPH_IMULCAP=1`

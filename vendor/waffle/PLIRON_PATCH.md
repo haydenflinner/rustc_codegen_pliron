@@ -77,8 +77,9 @@ per-block SSA liveness and greedily recolors same-type locals
 - `PLIRON_WBFORK=1`: different-join CondBr → `block`+`br_if` fork.
   Removes if/else but **grows** CODE (~+7 KiB regex); opt-in only.
 - `PLIRON_WBRIF` (default on, `=0` off, `=exit` both-exit Ifs only):
-  post-pass If→block+br_if. Grows CODE. With wasm `SWITCH_GCC`,
-  parse_only is ≤1× LLVM; alone it is the best wasm geomean.
+  post-pass If→block+br_if. Grows CODE. With wasm `SWITCH_GCC`
+  limited to 2-case switches, parse_only is ≤1× LLVM and
+  tokenize keeps its −17% (geomean 0.921).
 - `PLIRON_WASM_COLDBR=1`: force `FunctionBody.cold` (CLIF cold marks)
   and short CondBr→join error tails into `merge_nodes`, so stackify
   emits a labeled `br` instead of inlining them into an `if` arm.
