@@ -270,6 +270,58 @@ block3:
     }
 }
 
+/// The parse_only loop: header phi, `urem` of that phi, latch
+/// `brif (uge i+1, 1e8)` back to the header. The back-edge fact has
+/// to bound the phi or wasm keeps the 64-bit magic remainder.
+#[test]
+fn narrow_loop_phi_dividend() {
+    let src = "function %f() -> i64 {
+block0:
+    v0 = iconst.i64 0
+    jump block1(v0)
+block1(v1: i64):
+    v2 = iconst.i64 5
+    v3 = urem.i64 v1, v2
+    v4 = iconst.i64 1
+    v5 = iadd.i64 v1, v4
+    v6 = iconst.i64 100000000
+    v7 = icmp.i64 uge v5, v6
+    brif v7, block2, block1(v5)
+block2:
+    return v3
+}";
+    let before = parse(src);
+    let mut f = before.clone();
+    let k = pliron_clif_opt::divconst::run(&mut f, true);
+    assert_eq!(k, 1, "no expansion:\n{}", f.display());
+    let mut hi64 = 0;
+    let mut hi32 = 0;
+    for b in f.layout.blocks() {
+        for i in f.layout.block_insts(b) {
+            if let InstructionData::Binary {
+                opcode: Opcode::Umulhi,
+                ..
+            } = f.dfg.insts[i]
+            {
+                if f.dfg.value_type(f.dfg.first_result(i)) == types::I32 {
+                    hi32 += 1;
+                } else {
+                    hi64 += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(hi64, 0, "umulhi.i64 left:\n{}", f.display());
+    assert_eq!(hi32, 1, "no umulhi.i32:\n{}", f.display());
+    let cfg = Config {
+        trials: 32,
+        ..Config::default()
+    };
+    if let Err(m) = check(&before, &f, &Facts::default(), &cfg) {
+        panic!("narrow loop: {m}\n---- after\n{}", f.display());
+    }
+}
+
 /// Targets with a native i64 mulhi (`mulhi64_expensive = false`) keep
 /// the i64 expansion even when the dividend provably narrows — the
 /// ireduce/uextend wrap is pure overhead next to one `umulh`

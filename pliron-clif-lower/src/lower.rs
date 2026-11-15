@@ -4582,6 +4582,230 @@ impl<'a, 'b> FnLower<'a, 'b> {
         true
     }
 
+    /// GCC-style switch clustering (`docs` / xoranth.net/gcc-switch):
+    /// bit-test packs, density jump tables (with outlier peel via DP),
+    /// then a balanced decision tree of leftover ranges.
+    /// Unset is on for wasm and off for native (`PLIRON_SWITCH_GCC=1`
+    /// forces on, `=0` off). Wasm `parse_only` needs the sign split
+    /// (`byte < '+'`) together with `WBRIF` to land at or under LLVM;
+    /// the same tree stores a searcher cursor on every byte of
+    /// `split_whitespace`, so native stays opt-in.
+    /// `PLIRON_SWITCH_JT_RATIO` (default 8) and `PLIRON_SWITCH_JT_MIN`
+    /// (default 4 wasm / 5 native) tune tables.
+    fn gcc_switch(
+        &mut self,
+        x: ir::Value,
+        vals: &[(u128, Block)],
+        d: Block,
+        dead_default: bool,
+    ) -> bool {
+        // 0 off, 1 on, 2 wasm only.
+        static MODE: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+            match pliron_cfg::env_get("PLIRON_SWITCH_GCC") {
+                Some("0") => 0,
+                Some("1") => 1,
+                _ => 2,
+            }
+        });
+        let on = match *MODE {
+            0 => false,
+            1 => true,
+            _ => self.wasm,
+        };
+        let ty = self.b.func.dfg.value_type(x);
+        if !on || vals.is_empty() || ty.bits() > 64 {
+            return false;
+        }
+        static RATIO: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            pliron_cfg::env_get("PLIRON_SWITCH_JT_RATIO")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8)
+        });
+        static JT_MIN_N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            pliron_cfg::env_get("PLIRON_SWITCH_JT_MIN")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5)
+        });
+        let jt_min = if self.wasm {
+            pliron_cfg::env_get("PLIRON_SWITCH_JT_MIN")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4)
+        } else {
+            *JT_MIN_N
+        };
+        let bits = ty.bits();
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let pairs: Vec<(u64, Block)> = vals
+            .iter()
+            .map(|&(v, b)| (v as u64 & mask, b))
+            .collect();
+        let clusters = crate::switch_gcc::clusterize(&pairs, *RATIO, jt_min);
+        self.emit_gcc_clusters(x, &clusters, 0, clusters.len(), d, dead_default);
+        true
+    }
+
+    fn emit_gcc_clusters(
+        &mut self,
+        x: ir::Value,
+        clusters: &[crate::switch_gcc::Cluster<Block>],
+        start: usize,
+        end: usize,
+        d: Block,
+        dead_default: bool,
+    ) {
+        use crate::switch_gcc::{cluster_hi, cluster_weight};
+        let n = end.saturating_sub(start);
+        if n == 0 {
+            self.b.ins().jump(d, &[]);
+            return;
+        }
+        if n == 1 {
+            self.emit_gcc_cluster(x, &clusters[start], d, dead_default);
+            return;
+        }
+        let total: u64 = clusters[start..end].iter().map(cluster_weight).sum();
+        let mut acc = 0u64;
+        let mut mid = start + 1;
+        for i in start..end - 1 {
+            acc = acc.saturating_add(cluster_weight(&clusters[i]));
+            mid = i + 1;
+            if acc.saturating_mul(2) >= total {
+                break;
+            }
+        }
+        let pivot = cluster_hi(&clusters[mid - 1]);
+        let left = self.b.create_block();
+        let right = self.b.create_block();
+        let c = self
+            .b
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, x, pivot as i64);
+        self.b.ins().brif(c, left, &[], right, &[]);
+        self.b.seal_block(left);
+        self.b.switch_to_block(left);
+        self.emit_gcc_clusters(x, clusters, start, mid, d, dead_default);
+        self.b.seal_block(right);
+        self.b.switch_to_block(right);
+        self.emit_gcc_clusters(x, clusters, mid, end, d, dead_default);
+    }
+
+    fn emit_gcc_cluster(
+        &mut self,
+        x: ir::Value,
+        cluster: &crate::switch_gcc::Cluster<Block>,
+        d: Block,
+        dead_default: bool,
+    ) {
+        use crate::switch_gcc::{Cluster, Range};
+        match cluster {
+            Cluster::Leaf(Range { lo, hi, dest }) => {
+                if lo == hi {
+                    let c = self.b.ins().icmp_imm_u(IntCC::Equal, x, *lo as i64);
+                    self.b.ins().brif(c, *dest, &[], d, &[]);
+                } else {
+                    let off = self.b.ins().iadd_imm_s(x, (*lo as i64).wrapping_neg());
+                    let c = self.b.ins().icmp_imm_u(
+                        IntCC::UnsignedLessThanOrEqual,
+                        off,
+                        (*hi - *lo) as i64,
+                    );
+                    self.b.ins().brif(c, *dest, &[], d, &[]);
+                }
+            }
+            Cluster::JumpTable { lo, hi, slots } => {
+                let span = (*hi - *lo + 1) as usize;
+                let ty = self.b.func.dfg.value_type(x);
+                let mut idx = if *lo == 0 {
+                    x
+                } else {
+                    self.b.ins().iadd_imm_s(x, (*lo as i64).wrapping_neg())
+                };
+                static RAW: std::sync::LazyLock<bool> =
+                    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_RAW", "1"));
+                // Match `dense_switch`: explicit oob only when narrowing
+                // from >32 bits (Cranelift clamps `br_table` on i32).
+                // `SWITCH_RAW` + dead default skips the clamp entirely.
+                let skip_oob = dead_default && *RAW;
+                if ty.bits() > 32 {
+                    if !skip_oob {
+                        let ok = self.b.create_block();
+                        let oob = self.b.ins().icmp_imm_u(
+                            IntCC::UnsignedGreaterThan,
+                            idx,
+                            (span as u64 - 1) as i64,
+                        );
+                        self.b.ins().brif(oob, d, &[], ok, &[]);
+                        self.b.seal_block(ok);
+                        self.b.switch_to_block(ok);
+                    }
+                    idx = self.b.ins().ireduce(clt::I32, idx);
+                } else if ty.bits() < 32 {
+                    idx = self.b.ins().uextend(clt::I32, idx);
+                }
+                let mut table = vec![d; span];
+                for (i, s) in slots.iter().enumerate() {
+                    if let Some(b) = *s {
+                        table[i] = b;
+                    }
+                }
+                let pool = &mut self.b.func.dfg.value_lists;
+                let def = ir::BlockCall::new(d, std::iter::empty(), pool);
+                let entries: Vec<ir::BlockCall> = table
+                    .iter()
+                    .map(|&b| ir::BlockCall::new(b, std::iter::empty(), pool))
+                    .collect();
+                let jt = self
+                    .b
+                    .create_jump_table(ir::JumpTableData::new(def, &entries));
+                self.b.ins().br_table(idx, jt);
+            }
+            Cluster::BitTest { lo, hi, edges } => {
+                let ty = self.b.func.dfg.value_type(x);
+                // Widen to i64 so a span up to 63 fits the mask (an i32
+                // index with hi-lo > 31 would truncate `(1<<off)&mask`).
+                let mut off = if *lo == 0 {
+                    x
+                } else {
+                    self.b.ins().iadd_imm_s(x, (*lo as i64).wrapping_neg())
+                };
+                if ty.bits() < 64 {
+                    off = self.b.ins().uextend(clt::I64, off);
+                }
+                let ok = self.b.create_block();
+                let oob = self.b.ins().icmp_imm_u(
+                    IntCC::UnsignedGreaterThan,
+                    off,
+                    (*hi - *lo) as i64,
+                );
+                self.b.ins().brif(oob, d, &[], ok, &[]);
+                self.b.seal_block(ok);
+                self.b.switch_to_block(ok);
+                // Prefer `(1 << off) & mask` so the shift amount is `off`.
+                let one = self.b.ins().iconst(clt::I64, 1);
+                let sh = self.b.ins().ishl(one, off);
+                let n = edges.len();
+                for (i, &(mask, dest)) in edges.iter().enumerate() {
+                    // Bit-test masks span < 64; bit 63 may be set.
+                    let m = self.b.ins().iconst(clt::I64, mask as i64);
+                    let bit = self.b.ins().band(sh, m);
+                    let c = self.b.ins().icmp_imm_u(IntCC::NotEqual, bit, 0);
+                    if i + 1 == n {
+                        self.b.ins().brif(c, dest, &[], d, &[]);
+                    } else {
+                        let next = self.b.create_block();
+                        self.b.ins().brif(c, dest, &[], next, &[]);
+                        self.b.seal_block(next);
+                        self.b.switch_to_block(next);
+                    }
+                }
+            }
+        }
+    }
+
     /// `PLIRON_SWITCH_CHAIN`: a switch with at most four cases becomes a
     /// compare chain on `x` itself, with consecutive values that share a
     /// target tested as one range (`x - lo <=u hi - lo`). Cranelift's
@@ -4602,7 +4826,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_CHAIN", "1"));
         let ty = self.b.func.dfg.value_type(x);
-        if !*ON || vals.is_empty() || vals.len() > 4 || ty.bits() > 64 {
+        // Wasm: keep `dense_switch`/`br_table` for length/`match` (LLVM's
+        // from_str shape). Compare chains here get ifconv'd into
+        // speculated digit unrolls (parse_only: 7→45 `i32.mul`).
+        if self.wasm || !*ON || vals.is_empty() || vals.len() > 4 || ty.bits() > 64 {
             return false;
         }
         let mask = if ty.bits() >= 64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
@@ -6022,7 +6249,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .iter(ctx)
                 .next()
                 .is_some_and(|o| Operation::is_op::<UnreachableOp>(o, ctx));
-            if !self.small_switch(x, &vals, d, dead_default)
+            if !self.gcc_switch(x, &vals, d, dead_default)
+                && !self.small_switch(x, &vals, d, dead_default)
                 && !self.dense_switch(x, &vals, d, dead_default)
             {
                 if self.b.func.dfg.value_type(x) == clt::I128 {

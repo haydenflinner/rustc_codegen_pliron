@@ -9,6 +9,7 @@ pub mod lower;
 pub mod objmerge;
 pub mod scalarize;
 pub mod scan;
+pub mod switch_gcc;
 
 pub mod context {
     pub use pliron_ir_opt::state::*;

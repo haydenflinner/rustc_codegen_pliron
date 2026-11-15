@@ -261,10 +261,92 @@ in the scoreboard and in the linked history files.
   than LLVM (`bignum.rs` `i < 40` checks) and more inlined `push_str` /
   `extend` / fmt wrappers that LLVM keeps as calls (inline policy in
   `pliron-ir-opt/src/inline.rs`).
-- **`parse_only` on wasm.** TurboFan code matches LLVM per instruction;
-  the cold `Err` arm carries block-arg moves, so V8 places an edge block
-  inline on the hot path. Levers: no moves on cold edges, or wasm branch
-  hints.
+- **`parse_only` on wasm.** ~1.45× LLVM (2026-11-14). Cold edges /
+  `ERRCOLD` / `COLDBR` / `WBRIF` are neutral. Residual is **digit
+  `from_str` shape**: hot TF 517 vs 229 insns (`madd` 50 vs 7); wasm
+  `i32.mul` 45 vs 7. Cause: `ifconv` speculates several length/sign
+  arms' digit unrolls into selects (all paths' muls run); `IFCONV=0`
+  drops to 3 muls / loop form and is *slower* (~1.54×). LLVM keeps one
+  unroll behind `br_table`. Landed toward that: SwitchOp on wasm,
+  no `small_switch` on wasm, no `br_table`→select ifconv on wasm
+  (module `br_table` 0→19) — parse's hot fn has 0 tables / 45 muls.
+  `PLIRON_SWITCH_GCC=1` (opt-in)
+  adds GCC-style clustering (xoranth.net/gcc-switch): bit-test packs,
+  density jump tables with outlier peel, balanced decision tree of
+  leftover ranges (`pliron-clif-lower/src/switch_gcc.rs`). Wasm A/B:
+  parse_only ~1.46× → ~1.23× (win is bit tests elsewhere). Digit-shape
+  bisect (CLIF dumps of `k_parse_only`): **not** `ifconv2`
+  (stays at 2 imuls). Peel/punroll → ~10; late **`egraph2` remats
+  the shared Horner `*10` into every `len==k` early-exit** →
+  15→45 static muls. Skipping `egraph2` leaves 17 muls but is
+  *slower* on V8 (~1.52× vs ~1.46×): specialized straight-line
+  length arms beat the shared branched unroll. `SWITCH_GCC=1` is
+  the measured win (~1.23×) via bit tests, not the digit shape.
+  LLVM `k_parse_only`: **7 mul / 2 br_table / 335 ins** (br_tables
+  are sign/mode dispatch, not length; digit path is a 7-mul
+  shared unroll with `len==k` br_ifs). Ours: 45 mul / 0 br_table /
+  ~826 ins. Clean ≤8 digit peel pinned in
+  `pliron-clif-opt/tests/parse_digit_llvm_shape.rs`. Still open:
+  emit LLVM's compact shared unroll (not the egraph2-rematted
+  arms). `SWITCH_GCC` is the wasm default; see the card below.
+  V8 profile loop (2026-11-15, `hotw`/`mcode`/`run.mjs --layouts=3`):
+  both sides are `load8_u`-bound; tick ratio ≈ wall time. TF `madd`
+  50 vs LLVM 7 / `ldrb` 26 vs 14 — rematted Horner, not mul latency.
+  LLVM `k_parse_only`: flat `br_if`/`br_table` (0 `if`, 2 `br_table`,
+  7 mul, 335 ins); ours: ~34 nested `if`/`else`, 0 `br_table`, 45 mul.
+  Before the `divconst` order fix, `SWITCH_GCC`+`WBRIF` was parse
+  ~1.21× and geomean 0.940 (the win was `if`→`br_if`, not fewer
+  muls). Progressive
+  peel (`EGRAPH2=0` / `PLIRON_EGRAPH_IMULCAP=1`) stays slower on parse
+  under V8 even with WBRIF. `PLIRON_PEEL_DIGIT=1` (opt-in) peels a
+  `* 10` loop 8 copies instead of 4 when the body exceeds the 12-inst
+  cap; with GCC+WBRIF, parse_only went ~1.21× → ~1.23×, so it stays
+  off. Flattening a nest of `if { br } else` (`PLIRON_WASM_BRI_NEST=1`,
+  opt-in; one pass only folds the outermost if, and a `Nop` from a
+  dead `get t; set t` used to hide the inner `br`) on the rematted
+  arms: parse ~1.23×, geomean 0.963 vs WBRIF’s 0.944, and it drops
+  chars_ascii’s −25%. The same flatten on the 17-mul progressive
+  chain (`IMULCAP` + `BRI_NEST`): parse ~1.28×, geomean 0.951.
+  LLVM’s short path is one `cmp remaining, #9; b.lo` into a single
+  w32 `madd` chain (no `0x19999999` overflow check — len≤8 cannot
+  overflow); the i64 `mul` loop is only len≥9.
+  The remaining gap was not that chain. TurboFan’s hot loop spent
+  ~20 instructions on `i % 5` because the egraph rewrote `urem.i64`
+  to a 64-bit magic multiply before `divconst` could narrow a
+  dividend proved `< 2^32` (the `0..1e8` counter) to `umulhi.i32`.
+  `s_egraph` now runs `divconst` first on wasm. That alone is
+  parse_only **1.09×** (294 vs 270 ms), wasm geomean 0.943.
+  `SWITCH_GCC` (wasm default; `PLIRON_SWITCH_GCC=0` off, `=1`
+  forces it on native too) plus `WBRIF` (default on, `=0` off):
+  parse_only **0.986×** (265 vs 270 ms), geomean **0.932**, every
+  kernel result matches LLVM. Module ~171 KB vs LLVM 98 KB.
+  WBRIF alone was the best card (parse 1.057×, geomean 0.922,
+  tokenize −18%) but does not get parse to 1×. GCC alone does
+  not move parse. Native stays off `SWITCH_GCC`: the tree stores
+  a searcher cursor on every byte of `split_whitespace`.
+  Knob split after that fix (`--layouts=3`, same llvm.wasm):
+  WBRIF alone is the best card — parse **1.057×**, geomean
+  **0.922**, tokenize −18%, `chars_ascii` −25%. GCC alone does
+  not move parse (~1.086×) and gives tokenize back (+1.8%,
+  geomean 0.956). GCC+WBRIF is the only ≤1× parse config and
+  costs tokenize (+3%, geomean 0.932). The parse win is one
+  `byte < '+'+1` split so the digit path skips the sign
+  `select`s; the len==1 bit-test is cold for this bench.
+  `PLIRON_SWITCH_JT_MIN=1000000` (bit tests, no jump tables) is
+  byte-identical to full GCC+WBRIF. Raising the wide-span bail
+  so Cranelift keeps huge switches kept the parse win (−1.4%)
+  and did not save tokenize (still ~+2%, geomean 0.936) — the
+  ASCII whitespace switch is narrow, so it still clusters.
+  `hotw` on `tokenize::run`: WBRIF's ticks are `load8`/`load`;
+  GCC's are a per-character `i32.store` of the searcher cursor
+  in front of the whitespace test (~60% of ticks). Dropping the
+  bit-test (`PLIRON_SWITCH_NOBIT` plus `PLIRON_BITTAB=0`, which
+  rebuilds the same `mask >> c` from the compare tree) removes
+  the shift and leaves the store. Not landed.
+  Both knobs are now the wasm default (native `SWITCH_GCC` stays
+  opt-in because of that store). Still open: the sign split
+  without the whitespace tree, so tokenize keeps its −18%.
+  Profile: `harness/v8/{cpuprof,hotw,mcode}.sh`.
 - **`varint_postcard` native.** Fixed by `bunroll`'s LCSSA
   exit-cone repair (`95cab3a`, default-on `3f6a2ff`): the
   `0..varint_max` decode loops now fully unroll to the

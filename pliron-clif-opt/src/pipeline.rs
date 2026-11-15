@@ -2620,6 +2620,15 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if unsupported || !p.clctx.egraph_safe() {
         return 0;
     }
+    // The egraph's `urem`/`udiv` rules emit a full-width magic multiply.
+    // On wasm, `umulhi.i64` is ~20 ops and `divconst` would rather narrow
+    // a dividend proved `< 2^32` — the `i % 5` of `for i in 0..1e8` —
+    // to `umulhi.i32`. That narrowing never sees the `urem` if the
+    // egraph runs first (parse_only's loop header). Expand while the
+    // `urem` and the loop-exit bound are both still there.
+    if p.wasm {
+        divconst::run(&mut p.clctx.func, true);
+    }
     let mut cp = ControlPlane::default();
     // The egraph indexes values directly; our passes leave
     // `Value` aliases it doesn't resolve.

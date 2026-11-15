@@ -11,7 +11,8 @@
 
 use crate::cfg::CFGInfo;
 use crate::entity::EntityRef;
-use crate::ir::{Block, BlockTarget, FunctionBody, Terminator, Type, Value};
+use crate::ir::{Block, BlockTarget, FunctionBody, Terminator, Type, Value, ValueDef};
+use crate::Operator;
 use fxhash::FxHashSet as HashSet;
 use std::convert::TryFrom;
 
@@ -231,6 +232,20 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
 
+        // PLIRON: cold / short CondBr error tails as merges so a hot
+        // `br_if`/`if` edge carries no BlockParams (moves sit in the
+        // cold region). `PLIRON_WASM_COLDBR=1` (default off).
+        if std::env::var_os("PLIRON_WASM_COLDBR").is_some_and(|v| v == "1") {
+            for &b in &body.cold {
+                if b != body.entry {
+                    merge_nodes.insert(b);
+                }
+            }
+            for b in trivial_cold_tails(body) {
+                merge_nodes.insert(b);
+            }
+        }
+
         Ok((merge_nodes, loop_headers))
     }
 
@@ -243,14 +258,14 @@ impl<'a, 'b> Context<'a, 'b> {
         }
         let mut out = self.result.pop().unwrap();
         // PLIRON: rewrite `if`/`else` into `block`+`br_if` (LLVM's
-        // shape). `PLIRON_WBRIF=1` rewrites every If (grows CODE —
-        // defeats wpeep). `=exit` only rewrites Ifs whose both arms
-        // already exit past the if (no fallthrough) — denser and
-        // wpeep-friendlier. Default off.
+        // shape). Default on — with wasm `SWITCH_GCC` this is the
+        // parse_only ≤1× config (the sign split only pays once the
+        // `if`s are flat). Grows CODE. `PLIRON_WBRIF=0` off; `=exit`
+        // rewrites only Ifs whose both arms already exit past the if.
         match std::env::var_os("PLIRON_WBRIF").as_deref().and_then(|v| v.to_str()) {
-            Some("1") => rewrite_ifs_to_brif(&mut out, /* only_exits */ false),
+            Some("0") => {}
             Some("exit") => rewrite_ifs_to_brif(&mut out, /* only_exits */ true),
-            _ => {}
+            _ => rewrite_ifs_to_brif(&mut out, /* only_exits */ false),
         }
         // PLIRON: promote If arms that both end in the same BlockParams
         // into a typed if (values on stack, one set after). Default on;
@@ -596,30 +611,99 @@ impl<'a, 'b> Context<'a, 'b> {
     }
 }
 
-/// PLIRON: bump every `Br`/`BrIf` label by `extra` (wrapping new
-/// `block`s around an arm shifts relative depths).
+/// PLIRON: single-pred CondBr arm that only rematerializes constants
+/// and jumps to a multi-pred join — the `Result::Err` / `len == 0`
+/// shape. Without a merge label, stackify inlines it into the `if` arm
+/// so V8 sees block-arg moves on the hot edge.
+fn trivial_cold_tails(body: &FunctionBody) -> HashSet<Block> {
+    let mut out = HashSet::default();
+    for (b, def) in body.blocks.entries() {
+        if b == body.entry || def.preds.len() != 1 || def.insts.len() > 8 {
+            continue;
+        }
+        let pred = def.preds[0];
+        let Terminator::CondBr {
+            if_true, if_false, ..
+        } = &body.blocks[pred].terminator
+        else {
+            continue;
+        };
+        if if_true.block != b && if_false.block != b {
+            continue;
+        }
+        let Terminator::Br { target } = &def.terminator else {
+            continue;
+        };
+        if body.blocks[target.block].preds.len() < 2 {
+            continue;
+        }
+        // Const-only *payload* (Err tag / None): not a live Ok value.
+        // Otherwise both CondBr arms look like empty→join tails and the
+        // hot arm gets labeled too.
+        if !def.insts.iter().all(|&v| is_remat_const(body, v)) {
+            continue;
+        }
+        if !target.args.iter().all(|&v| is_remat_const(body, v)) {
+            continue;
+        }
+        out.insert(b);
+    }
+    out
+}
+
+fn is_remat_const(body: &FunctionBody, v: Value) -> bool {
+    match &body.values[v] {
+        ValueDef::Operator(
+            Operator::I32Const { .. }
+            | Operator::I64Const { .. }
+            | Operator::F32Const { .. }
+            | Operator::F64Const { .. }
+            | Operator::RefNull { .. }
+            | Operator::Nop,
+            ..,
+        ) => true,
+        _ => false,
+    }
+}
+
+/// PLIRON: bump `Br`/`BrIf`/`br_table` labels that escape `body` by
+/// `extra` (wrapping new `block`s around an arm). Labels that target a
+/// construct nested inside `body` stay put — a naive +1 on every label
+/// retargets an inner `br 0` at the wrapper and miscompiles (hmget hang,
+/// sortw/`strwork` unreachable, parse_only wrong ret under
+/// `PLIRON_WBRIF=exit`).
 fn bump_br_labels<'a>(body: &mut [WasmBlock<'a>], extra: u32) {
+    bump_br_labels_at(body, extra, 0);
+}
+
+fn bump_br_labels_at<'a>(body: &mut [WasmBlock<'a>], extra: u32, depth: u32) {
     for b in body {
         match b {
             WasmBlock::Br { target } | WasmBlock::BrIf { target, .. } => {
-                target.0 = target.0.saturating_add(extra);
+                if target.index() >= depth {
+                    target.0 = target.0.saturating_add(extra);
+                }
             }
             WasmBlock::Block { body, .. } | WasmBlock::Loop { body, .. } => {
-                bump_br_labels(body, extra);
+                bump_br_labels_at(body, extra, depth + 1);
             }
             WasmBlock::If {
                 if_true,
                 if_false,
                 ..
             } => {
-                bump_br_labels(if_true, extra);
-                bump_br_labels(if_false, extra);
+                bump_br_labels_at(if_true, extra, depth + 1);
+                bump_br_labels_at(if_false, extra, depth + 1);
             }
             WasmBlock::Select { targets, default, .. } => {
                 for t in targets {
-                    t.0 = t.0.saturating_add(extra);
+                    if t.index() >= depth {
+                        t.0 = t.0.saturating_add(extra);
+                    }
                 }
-                default.0 = default.0.saturating_add(extra);
+                if default.index() >= depth {
+                    default.0 = default.0.saturating_add(extra);
+                }
             }
             _ => {}
         }
@@ -703,7 +787,19 @@ fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
             i += 1;
             continue;
         }
-        let _ = results; // WBRIF drops typed results (arms become br_if bodies).
+        // Typed-`if` results live on the operand stack; the block+br_if
+        // shape has no place for them. Leave those Ifs alone (WIFRET runs
+        // after us, so this is a defensive skip for any earlier setter).
+        if results.is_some() {
+            body[i] = WasmBlock::If {
+                cond,
+                if_true,
+                if_false,
+                results,
+            };
+            i += 1;
+            continue;
+        }
         strip_trailing_br0(&mut if_false);
         strip_trailing_br0(&mut if_true);
         bump_br_labels(&mut if_false, 1);
@@ -880,5 +976,46 @@ fn promote_if_results<'a>(body: &mut Vec<WasmBlock<'a>>) {
         } else {
             i += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod bump_tests {
+    use super::*;
+
+    fn br(d: u32) -> WasmBlock<'static> {
+        WasmBlock::Br {
+            target: WasmLabel(d),
+        }
+    }
+
+    #[test]
+    fn nested_br0_stays_local() {
+        // Wrapping an arm in one `block` must not retarget an inner `br 0`.
+        let mut arm = vec![
+            WasmBlock::Block {
+                body: vec![br(0), br(1)],
+                out: Block::invalid(),
+            },
+            br(1),
+        ];
+        bump_br_labels(&mut arm, 1);
+        match &arm[0] {
+            WasmBlock::Block { body, .. } => {
+                assert!(
+                    matches!(body[0], WasmBlock::Br { target } if target.0 == 0),
+                    "nested br 0 must stay"
+                );
+                assert!(
+                    matches!(body[1], WasmBlock::Br { target } if target.0 == 2),
+                    "nested br 1 escapes → 2"
+                );
+            }
+            _ => panic!("expected Block"),
+        }
+        assert!(
+            matches!(arm[1], WasmBlock::Br { target } if target.0 == 2),
+            "top-level br 1 escapes → 2"
+        );
     }
 }

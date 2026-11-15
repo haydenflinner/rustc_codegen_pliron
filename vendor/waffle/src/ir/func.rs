@@ -173,6 +173,11 @@ pub struct FunctionBody {
     pub value_locals: PerEntity<Value, Option<Local>>,
     /// Debug source locations of each value.
     pub source_locs: PerEntity<Value, SourceLoc>,
+    /// PLIRON: blocks marked cold by the producer (CLIF `layout.is_cold`).
+    /// Under `PLIRON_WASM_COLDBR=1`, stackify treats these (and short
+    /// CondBr error tails) as merge nodes so hot→cold edges stay bare:
+    /// block-arg moves live inside the cold region, not on the branch.
+    pub cold: HashSet<Block>,
 }
 
 impl FunctionBody {
@@ -206,6 +211,7 @@ impl FunctionBody {
             value_blocks,
             value_locals: PerEntity::default(),
             source_locs: PerEntity::default(),
+            cold: HashSet::default(),
         }
     }
 

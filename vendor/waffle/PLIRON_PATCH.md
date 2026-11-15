@@ -76,7 +76,15 @@ per-block SSA liveness and greedily recolors same-type locals
   `SelectJoin` (per-param `select` + `br`) instead of `if`/`else`.
 - `PLIRON_WBFORK=1`: different-join CondBr → `block`+`br_if` fork.
   Removes if/else but **grows** CODE (~+7 KiB regex); opt-in only.
-- `PLIRON_WBRIF=1`: post-pass If→block+br_if; also grows CODE ~16%.
+- `PLIRON_WBRIF` (default on, `=0` off, `=exit` both-exit Ifs only):
+  post-pass If→block+br_if. Grows CODE. With wasm `SWITCH_GCC`,
+  parse_only is ≤1× LLVM; alone it is the best wasm geomean.
+- `PLIRON_WASM_COLDBR=1`: force `FunctionBody.cold` (CLIF cold marks)
+  and short CondBr→join error tails into `merge_nodes`, so stackify
+  emits a labeled `br` instead of inlining them into an `if` arm.
+  Block-arg moves for the join then live inside the cold region; the
+  hot edge stays bare (LLVM's shape for `Result::Err` / `len == 0`).
+  Default off: parse_only A/B 2026-11-14 was neutral (±0.5%).
 
 ## `src/backend/mod.rs` — BlockParams identity skip + SelectJoin
 
@@ -93,7 +101,10 @@ single-param if results → 375 KiB (1.79×). `PLIRON_WIFRET=0` off.
 Multi-param typed if (`PLIRON_WIFRET_MULTI=1` + `BlockTypeIntern`) is
 wired but default-off — grew regex-wasm CODE in 2026-10-28 trials.
 `PLIRON_WBRIF=exit` rewrites only both-exit Ifs to block+br_if (still
-grows CODE vs off; full `=1` grows more).
+grows CODE vs off; full `=1` grows more). Label bump for the wrapper
+block is depth-aware: only escaping `br`/`br_if`/`br_table` depths move
+(+1); a nested `br 0` stays (blind bump miscompiled hmget/sortw/
+parse_only under `=exit`).
 
 All changes are marked `// PLIRON:` in the source.
 

@@ -145,10 +145,30 @@ time, memory, code size, stack frames) in ~20 min and writes
   no rebuild — try them before editing code.
 - The live dashboard's "size movers" panel shows which corpus functions
   your edit made bigger or smaller.
-- wasm runtime under V8: `harness/v8/` (per-function and per-instruction
-  tick attribution, TurboFan listings, bench variants) — read
-  `docs/history/2026-10-21-wasm-experiments.md` first for what has
-  already been tried.
+- wasm runtime under V8 — **profile, don't guess from insn counts**
+  (static `i32.mul` / size lied on parse_only: 17-mul shared form was
+  *slower* under TurboFan than 45-mul rematted arms; `hotw` shows both
+  sides `load8_u`-bound with tick ratio ≈ wall time). Loop:
+  `harness/v8/variant.sh NAME [PLIRON_X=…]` → `target/v8prof/NAME.wasm`;
+  `cpuprof.sh mod k_parse_only iters reps` (per-fn self time);
+  `hotw.sh mod k_parse_only parse_only iters reps` (ticks → wasm ops;
+  paths may be relative — scripts absolutize);
+  `mcode.sh mod k_parse_only parse_only` (TurboFan listing; diff before
+  trusting a delta). Score with `node bench/wasm/run.mjs llvm.wasm
+  a.wasm [b.wasm] --layouts=3`. Wasm defaults for parse_only ≤1×:
+  `WBRIF` on (`PLIRON_WBRIF=0` off) and `SWITCH_GCC` on for wasm
+  only (`PLIRON_SWITCH_GCC=0` off, `=1` also on native). Together
+  parse_only is **0.99×** LLVM (geomean ~0.93). The win is a
+  `byte < '+'` split that skips the sign selects; the same tree
+  stores a searcher cursor on every byte of `split_whitespace`
+  (tokenize ~+3%, `hotw`). WBRIF alone is a better geomean (0.922)
+  but parse stays ~1.06×. GCC alone does not move parse. Native
+  `SWITCH_GCC` stays opt-in.
+  `divconst` before the egraph on wasm is what narrowed `i % 5`.
+  `PLIRON_WASM_BRI_NEST=1` and that plus `PLIRON_EGRAPH_IMULCAP=1`
+  were slower (parse ~1.23× and ~1.28×).
+  Details: `harness/v8/README.md`; what was already tried:
+  `docs/history/2026-10-21-wasm-experiments.md`.
 
 ### Compile time
 

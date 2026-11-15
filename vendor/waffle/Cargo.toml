@@ -55,6 +55,10 @@ path = "tests/roundtrip.rs"
 name = "select_join"
 path = "tests/select_join.rs"
 
+[[test]]
+name = "cold_br"
+path = "tests/cold_br.rs"
+
 [dependencies.addr2line]
 version = "0.21"
 optional = true
