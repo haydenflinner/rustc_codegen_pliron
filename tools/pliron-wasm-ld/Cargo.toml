@@ -2,7 +2,7 @@
 name = "pliron-wasm-ld"
 version = "0.1.0"
 edition = "2024"
-description = "Links rustc_codegen_pliron wasm32 objects into one module (no wasm-ld/LLVM)."
+description = "Links rustc_codegen_pliron wasm32 objects (and LLVM relocatable wasm from clang) into one module."
 
 [dependencies]
 wasmparser = "0.248"

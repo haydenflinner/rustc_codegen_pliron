@@ -4,8 +4,14 @@
 //! flags are ignored. Archive members are pulled in only when they define a
 //! symbol that is still undefined.
 //!
+//! Also ingests LLVM relocatable wasm (`linking` + `reloc.*`) from clang/`cc`
+//! C archives (zstd, lz4, psm, …) into the same symbol model. Native
+//! ELF/Mach-O objects are not handled here yet.
+//!
 //! Memory layout: [0, 1024) unused, then the stack (grows down to 1024),
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
+
+mod llvm;
 
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -30,22 +36,32 @@ fn set_z_option(opt: &str) {
         STACK_SIZE.store(n.next_multiple_of(16), std::sync::atomic::Ordering::Relaxed);
     }
 }
-const GLOBAL: u8 = 1;
-const INIT_ARRAY: u8 = 4;
+pub(crate) const GLOBAL: u8 = 1;
+pub(crate) const INIT_ARRAY: u8 = 4;
 /// `#[used(linker)]`: keep through GC even when unreferenced.
-const USED: u8 = 8;
+pub(crate) const USED: u8 = 8;
 const CALL_CTORS: &str = "__wasm_call_ctors";
 
-struct DataObj {
-    name: String,
-    flags: u8,
-    align: u32,
-    bytes: Vec<u8>,
-    relocs: Vec<(u32, bool, String, i32)>,
+pub(crate) struct DataObj {
+    pub(crate) name: String,
+    pub(crate) flags: u8,
+    pub(crate) align: u32,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) relocs: Vec<(u32, bool, String, i32)>,
 }
 
-struct Obj<'a> {
-    name: String,
+/// Late MEMORY_ADDR / TABLE_INDEX patch in a function body (LLVM objects).
+pub(crate) struct CodeAbsReloc {
+    pub(crate) body: u32,
+    pub(crate) off: u32,
+    pub(crate) func: bool,
+    pub(crate) sleb: bool,
+    pub(crate) sym: String,
+    pub(crate) addend: i32,
+}
+
+pub(crate) struct Obj<'a> {
+    pub(crate) name: String,
     types: Vec<wp::FuncType>,
     /// Function imports: (module, name, type).
     fimports: Vec<(String, String, u32)>,
@@ -54,14 +70,20 @@ struct Obj<'a> {
     ftypes: Vec<u32>,
     exports: HashMap<String, u32>,
     bodies: Vec<wp::FunctionBody<'a>>,
-    funcs: Vec<(String, u8)>,
-    data: Vec<DataObj>,
+    pub(crate) funcs: Vec<(String, u8)>,
+    pub(crate) data: Vec<DataObj>,
     /// Data-object name -> `data` index, built lazily for `local` lookups.
-    data_names: HashMap<String, usize>,
+    pub(crate) data_names: HashMap<String, usize>,
     /// Custom sections other than our own, concatenated by name into the output.
     customs: Vec<(String, &'a [u8])>,
     /// `+feature` names from the `target_features` section.
     features: Vec<String>,
+    /// LLVM relocatable object (ingested from `linking` / `reloc.*`).
+    llvm: bool,
+    /// Defined data-symbol name → offset within its DataObj.
+    data_sym_off: HashMap<String, u32>,
+    /// Absolute address / table-slot patches applied at emit.
+    code_abs: Vec<CodeAbsReloc>,
 }
 
 struct Rd<'a>(&'a [u8]);
@@ -88,7 +110,7 @@ impl<'a> Rd<'a> {
     }
 }
 
-fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
+fn parse<'a>(name: String, bytes: &'a [u8]) -> Result<Obj<'a>, String> {
     let mut o = Obj {
         name,
         types: vec![],
@@ -102,17 +124,20 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
         data_names: HashMap::default(),
         customs: vec![],
         features: vec![],
+        llvm: false,
+        data_sym_off: HashMap::default(),
+        code_abs: vec![],
     };
     for p in wp::Parser::new(0).parse_all(bytes) {
-        match p? {
+        match p.map_err(|e| format!("{}: {e}", o.name))? {
             wp::Payload::TypeSection(r) => {
                 for t in r.into_iter_err_on_gc_types() {
-                    o.types.push(t?);
+                    o.types.push(t.map_err(|e| format!("{}: {e}", o.name))?);
                 }
             }
             wp::Payload::ImportSection(r) => {
                 for imp in r.into_imports() {
-                    let imp = imp?;
+                    let imp = imp.map_err(|e| format!("{}: {e}", o.name))?;
                     match imp.ty {
                         wp::TypeRef::Func(t) => {
                             o.fimports.push((imp.module.into(), imp.name.into(), t))
@@ -126,12 +151,13 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
             }
             wp::Payload::FunctionSection(r) => {
                 for t in r {
-                    o.ftypes.push(t?);
+                    o.ftypes
+                        .push(t.map_err(|e| format!("{}: {e}", o.name))?);
                 }
             }
             wp::Payload::ExportSection(r) => {
                 for e in r {
-                    let e = e?;
+                    let e = e.map_err(|e| format!("{}: {e}", o.name))?;
                     if e.kind == wp::ExternalKind::Func {
                         o.exports.insert(e.name.into(), e.index);
                     }
@@ -139,16 +165,22 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
             }
             wp::Payload::CodeSectionEntry(b) => o.bodies.push(b),
             wp::Payload::CustomSection(c)
-                if !matches!(c.name(), "pliron.link" | "name" | "producers" | "target_features")
-                    && !c.name().starts_with("reloc.") =>
+                if !matches!(
+                    c.name(),
+                    "pliron.link" | "name" | "producers" | "target_features" | "linking"
+                ) && !c.name().starts_with("reloc.")
+                    && !c.name().starts_with(".debug") =>
             {
                 o.customs.push((c.name().to_string(), c.data()));
             }
             wp::Payload::CustomSection(c) if c.name() == "target_features" => {
                 let mut r = wp::BinaryReader::new(c.data(), 0);
-                for _ in 0..r.read_var_u32()? {
-                    let prefix = r.read_u8()?;
-                    let name = r.read_string()?;
+                for _ in 0..r
+                    .read_var_u32()
+                    .map_err(|e| format!("{}: {e}", o.name))?
+                {
+                    let prefix = r.read_u8().map_err(|e| format!("{}: {e}", o.name))?;
+                    let name = r.read_string().map_err(|e| format!("{}: {e}", o.name))?;
                     if prefix == b'+' {
                         o.features.push(name.to_string());
                     }
@@ -187,6 +219,7 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
             _ => {}
         }
     }
+    llvm::ingest(&mut o, bytes)?;
     Ok(o)
 }
 
@@ -234,7 +267,8 @@ impl Obj<'_> {
             .data
             .iter()
             .flat_map(|d| d.relocs.iter().map(|r| &r.2[..]));
-        fi.chain(gi).chain(dr)
+        let ca = self.code_abs.iter().map(|r| &r.sym[..]);
+        fi.chain(gi).chain(dr).chain(ca)
     }
 }
 
@@ -365,9 +399,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             blobs.push((path.clone(), data, false));
         }
     }
+    // LLVM index relocs must be rewritten before FunctionBody borrows the
+    // bytes (GC/Mapper expect object-local indices already in place).
+    for (_, b, _) in &mut blobs {
+        llvm::prepatch(b)?;
+    }
     let mut objs = Vec::new();
     for (n, b, _) in &blobs {
-        objs.push(parse(n.clone(), b).map_err(|e| format!("{n}: {e}"))?);
+        objs.push(parse(n.clone(), b)?);
     }
 
     // r[impl wasm.ld.resolve]
@@ -620,6 +659,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                 if !uref.is_empty() {
                     trefs.entry(oi).or_default().push((bi, uref));
                 }
+                // LLVM MEMORY_ADDR / TABLE_INDEX in this body.
+                for r in &objs[oi].code_abs {
+                    if r.body == bi
+                        && let Some(d) = resolve(oi, &r.sym)
+                    {
+                        wl.push(d);
+                    }
+                }
             }
             Def::Data(oi, di) => {
                 if !live_d.insert((oi, di)) {
@@ -733,6 +780,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
                         want.insert(sym);
                     }
                 }
+            }
+        }
+        for r in &objs[oi].code_abs {
+            if r.func
+                && live_f.contains(&(oi, r.body))
+                && resolve(oi, &r.sym).is_none()
+            {
+                want.insert(&r.sym);
             }
         }
     }
@@ -955,10 +1010,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     let value_of =
         |oi: usize, sym: &str, func: bool, table: &mut Vec<u32>| -> Result<u32, String> {
             match (resolve(oi, sym), sym) {
-                (Some(Def::Data(o, d)), _) if !func => addr
-                    .get(&(o, d))
-                    .copied()
-                    .ok_or_else(|| format!("{sym}: dead data referenced")),
+                (Some(Def::Data(o, d)), _) if !func => {
+                    let base = addr
+                        .get(&(o, d))
+                        .copied()
+                        .ok_or_else(|| format!("{sym}: dead data referenced"))?;
+                    let extra = objs[o].data_sym_off.get(sym).copied().unwrap_or(0);
+                    Ok(base.wrapping_add(extra))
+                }
                 (Some(d @ Def::Func(..)), _) if func => Ok(slot(
                     func_out(d)
                         .ok_or_else(|| format!("{sym}: dead function referenced"))?,
@@ -1052,6 +1111,15 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
             if bytes.iter().any(|&b| b != 0) {
                 segs.push((addr[&(oi, di)], bytes));
+            }
+        }
+    }
+    // Reserve table slots for LLVM TABLE_INDEX immediates in live bodies
+    // before the element section is encoded.
+    for &oi in &included {
+        for r in &objs[oi].code_abs {
+            if r.func && live_f.contains(&(oi, r.body)) {
+                let _ = value_of(oi, &r.sym, true, &mut table)?;
             }
         }
     }
@@ -1259,8 +1327,32 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             if !live_f.contains(&(oi, i as u32)) {
                 continue;
             }
-            m.parse_function_body(&mut code, b.clone())
-                .map_err(|e| format!("{}: {e:?}", objs[oi].name))?;
+            // LLVM absolute / table-index immediates are patched now that
+            // addresses and table slots are known.
+            let abs: Vec<_> = objs[oi]
+                .code_abs
+                .iter()
+                .filter(|r| r.body == i as u32)
+                .collect();
+            if abs.is_empty() {
+                m.parse_function_body(&mut code, b.clone())
+                    .map_err(|e| format!("{}: {e:?}", objs[oi].name))?;
+            } else {
+                let mut bytes = b.as_bytes().to_vec();
+                for r in abs {
+                    let v = value_of(oi, &r.sym, r.func, &mut table)?
+                        .wrapping_add(r.addend as u32);
+                    let slot = &mut bytes[r.off as usize..];
+                    if r.sleb {
+                        llvm::write_sleb5(slot, v as i32);
+                    } else {
+                        slot[..4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                let body = wp::FunctionBody::new(wp::BinaryReader::new(&bytes, 0));
+                m.parse_function_body(&mut code, body)
+                    .map_err(|e| format!("{}: {e:?}", objs[oi].name))?;
+            }
         }
     }
     let mut call_ctors = we::Function::new([]);
