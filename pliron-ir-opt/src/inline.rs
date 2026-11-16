@@ -1189,6 +1189,15 @@ pub fn run(
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
     let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    // `PLIRON_INLINE_ONCE=2`: the single-caller bonus only for callees
+    // without a loop. A loop moved into its caller loses what the callee's
+    // signature said about its pointers: hmget's map is a `noalias` param
+    // of the kernel closure, and licm hoists its header loads past the
+    // loop's stack stores on that fact alone; inlined next to the set-up
+    // code the map is an ordinary pointer and the loads stay in the inner
+    // loop (wasm kernels hmget +14 points, tokenize +17, sieve +6 with
+    // `=1`). Loop-free single-caller bodies carry no such loop.
+    let once_noloop = crate::env_is("PLIRON_INLINE_ONCE", "2");
     // `PLIRON_INLINE_FANIN=<m>` (0 = off; default 8 via DEFAULT_VALUES):
     // a callee is inlined at a plain site only while `its size x its
     // remaining call sites <= m x the site's threshold` — a fat helper
@@ -1642,7 +1651,11 @@ pub fn run(
                             && !rec_caller
                             && !(cold_once && f.cold && !f.inline_hint)
                             && !(once1 && free_used.contains(cs.as_str()))
-                            && freemax.is_none_or(|m| ci.n <= m));
+                            && freemax.is_none_or(|m| ci.n <= m)
+                            && !(once_noloop
+                                && *has_loop
+                                    .entry(cs.clone())
+                                    .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty())));
                     // `PLIRON_INLINE_WASM_COLD=<n>` (small mode only; unset =
                     // `limit`): flat non-loop threshold. Loop-site `hot`x still
                     // uses `limit` so `hash_one` (~926) keeps inlining at
