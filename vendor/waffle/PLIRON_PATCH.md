@@ -152,3 +152,15 @@ root is pure or another load:
   edges that never reached its def.
 
 On by default; `PLIRON_WTREELOAD=0` disables it.
+
+A load is never owned by a rematerialized tree (2026-11-16). A value in
+`remat` (a constant, an edge-only pure value, a cheap unary with at most
+two uses) is emitted again at each use, so a load inside its operand
+tree would run at every use position, wherever those are; the
+def-to-root check above only describes a tree emitted once. Unoptimized
+code hit it: `x = wrap(load slot); slot = f(x); y = x - ..` re-read the
+slot after the store (itoa printed 99 as "00"; every unoptimized dsa
+page failed). `validate_load_sinks` now drops such loads from the tree
+(they get a local), and also loads whose owner chain is longer than
+its 64-step walk. Regression: `tests/wasm/smoke/raw.rs`, compiled with
+`PLIRON_OPT_BISECT=0`.

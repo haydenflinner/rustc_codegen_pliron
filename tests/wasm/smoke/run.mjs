@@ -26,6 +26,17 @@ const rows = [
   ["crosscall(21)", e.crosscall(21), helper(21) * 2],
   ["genes_hash()", e.genes_hash(), gh],
 ];
+// raw.rs (compiled unoptimized): narrowed value used on both sides of a store.
+for (const n of [0n, 7n, 31n, 99n, 100n, 657n, 7811n, 9999n]) {
+  const div = Number(n) * 5243 >>> 19;
+  rows.push([`raw_divmod(${n})`, e.raw_divmod(n) >>> 0, (div << 8 | (Number(n) - div * 100)) >>> 0]);
+}
+for (const n of [0n, 5n, 42n, 99n, 100n, 317811n, 857141n, 6570288n, 9999999999999999n]) {
+  let want = 0n, sh = 0n, r = n;
+  while (r > 99n) { const q = r % 100n; r /= 100n; want |= ((q / 10n) << 4n | q % 10n) << sh; sh += 8n; }
+  want |= ((r / 10n) << 4n | r % 10n) << sh;
+  rows.push([`raw_digits(${n})`, BigInt.asUintN(64, e.raw_digits(n)), BigInt.asUintN(64, want)]);
+}
 // cmp128: every pair of a few 128-bit values, against BigInt.
 const M64 = (1n << 64n) - 1n;
 const W = [0n, 1n, 127n, 128n, M64, 1n << 64n, (1n << 64n) + 5n, (1n << 127n) - 1n, 1n << 127n, (1n << 128n) - 1n];

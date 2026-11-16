@@ -261,7 +261,7 @@ impl Trees {
         // also be in the def's own block: sinking onto a successor's
         // path would execute the load on edges that never reached it.
         if loads_ok {
-            Self::validate_load_sinks(body, &mut owner, &mut owned);
+            Self::validate_load_sinks(body, &mut owner, &mut owned, &remat);
         }
 
         Trees {
@@ -273,10 +273,19 @@ impl Trees {
 
     /// PLIRON: drop owned loads whose consumer tree would emit them in
     /// a different block or past an effectful inst.
+    ///
+    /// PLIRON: a load is also dropped from a tree that is rematerialized
+    /// (`remat`). Such a tree is emitted again at every use, not once at
+    /// its root's position, so the position check below says nothing
+    /// about where the load runs: `x = wrap(load slot); slot = f(x);
+    /// y = x - ..` re-read the slot after the store for the second use
+    /// (itoa's `divmod100(remain as u32)` in unoptimized code printed 99
+    /// as "00"; the optimizer normally forwards such loads away first).
     fn validate_load_sinks(
         body: &FunctionBody,
         owner: &mut HashMap<Value, ValueArg>,
         owned: &mut HashMap<ValueArg, Value>,
+        remat: &HashSet<Value>,
     ) {
         let is_load = |v: Value| match &body.values[v] {
             &ValueDef::Operator(op, _, _) => op.is_load(),
@@ -324,11 +333,20 @@ impl Trees {
             for v in vs {
                 // Walk the owner chain to the emitting root.
                 let mut root = owner[&v].0;
+                let mut rematted = remat.contains(&root);
                 for _ in 0..64 {
                     match owner.get(&root) {
-                        Some(&va) => root = va.0,
+                        Some(&va) => {
+                            root = va.0;
+                            rematted |= remat.contains(&root);
+                        }
                         None => break,
                     }
+                }
+                // (A chain longer than the walk has an unknown root.)
+                if rematted || owner.contains_key(&root) {
+                    unown.push(v);
+                    continue;
                 }
                 let (Some(&p), Some(&q)) = (pos.get(&v), pos.get(&root)) else {
                     unown.push(v);
