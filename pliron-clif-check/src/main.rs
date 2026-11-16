@@ -324,7 +324,6 @@ fn with_pipe_lts<R>(
         .map(FuncId::from_u32)
         // No self-call in the text: an id no callee can have.
         .unwrap_or(FuncId::from_u32(u32::MAX - 1));
-    let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
     let (e1, e2, e3, mut e5, mut e6, mut e7, e8): (
         _,
         _,
@@ -474,7 +473,6 @@ fn with_pipe_lts<R>(
         // The wasm backend runs the pipeline with `simd` (no simd128 by
         // default), `x64` and `cmp64` off.
         simd: !wasm_mode,
-        x64: x64 && !wasm_mode,
         cmp64: !wasm_mode,
         // `PLIRON_CLIF_WASM=1`: replay as the wasm backend runs the
         // pipeline (`Pipe::wasm`, stepped-pointer indvars). The
@@ -482,8 +480,6 @@ fn with_pipe_lts<R>(
         // the wasm-only transforms run and `PLIRON_VERIFY=full` checks
         // every step: three of the four compiler panics the dsa build
         // hit on 2026-11-16 were in paths a native replay never takes.
-        amode_scale: !wasm_mode && pipeline::amode_scale(isa),
-        wasm: wasm_mode,
         has_eh: false,
         flags: &flags,
         // `PLIRON_CLIF=<substr of the file's self name>` dumps steps.

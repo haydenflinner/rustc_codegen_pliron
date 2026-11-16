@@ -1035,12 +1035,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 target: sh.target,
                 tcfg: sh.tcfg,
                 simd: sh.simd,
-                x64: sh.x64,
                 cmp64: sh.cmp64,
-                // wasm: the waffle emitter computes `base + iv*s` addresses
-                // explicitly, so indvars should produce stepped pointer IVs.
-                amode_scale: !sh.wasm && crate::pipeline::amode_scale(&*sh.isa),
-                wasm: sh.wasm,
                 has_eh: sh.has_eh,
                 flags: &sh.fn_flags,
                 dump: j.dump,

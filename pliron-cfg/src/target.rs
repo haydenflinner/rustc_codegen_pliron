@@ -97,6 +97,47 @@ impl Target {
         matches!(self.arch, Arch::X86_64)
     }
 
+    /// The pipeline's `Pipe::isa` is this target's own ISA. False on
+    /// wasm32, where it is the host's and only bookkeeping: steps that
+    /// would consult it for legality (the egraph, unreachable-code
+    /// elimination) take the flags alone, and nothing may tune for the
+    /// host's encoder (`clifpeep::set_bigoff`).
+    pub const fn own_isa(&self) -> bool {
+        !self.is_wasm()
+    }
+
+    /// Code goes through our register allocator (regalloc2), so a step
+    /// can shape it for register pressure and ABI pinning. False on
+    /// wasm32 (V8 allocates). Uses: `coldarg`.
+    pub const fn has_regalloc(&self) -> bool {
+        !self.is_wasm()
+    }
+
+    /// A `br_table` is a real jump-table dispatch the engine compiles
+    /// well, so it is not worth turning into compare chains or selects.
+    /// True on wasm32 (V8's `br_table`). Uses: `brchain`, ifconv's
+    /// `br_table` arm (`ifconv::run`, jumpthread's `ifconv_tables`).
+    pub const fn cheap_br_table(&self) -> bool {
+        self.is_wasm()
+    }
+
+    /// A 64-bit multiply-high (`umulhi.i64`) is one instruction. False on
+    /// wasm32, where it is a ~20-op sequence, so `divconst` narrows
+    /// divisions by constants proved below 2^32 to `umulhi.i32` and runs
+    /// ahead of the egraph there.
+    pub const fn mulhi64(&self) -> bool {
+        !self.is_wasm()
+    }
+
+    /// The code emitter folds `base + reg*{1,2,4,8}` into a load's
+    /// addressing mode (x86 SIB, aarch64 extended register). False on
+    /// wasm32, where every address is computed explicitly, and on
+    /// targets we have not tuned for: indvars then wants stepped pointer
+    /// induction variables rather than `base + iv*s`.
+    pub const fn amode_scale(&self) -> bool {
+        matches!(self.arch, Arch::Aarch64 | Arch::X86_64)
+    }
+
     /// Size of a pointer in bytes.
     pub const fn ptr_bytes(&self) -> u64 {
         (self.ptr_bits / 8) as u64

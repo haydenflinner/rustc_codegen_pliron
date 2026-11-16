@@ -265,18 +265,7 @@ pub struct Pipe<'a> {
     /// that build libcall signatures. Its pointer width is `target`'s.
     pub tcfg: TargetFrontendConfig,
     pub simd: bool,
-    pub x64: bool,
     pub cmp64: bool,
-    /// The code emitter folds `base + reg*{1,2,4,8}` into the load's
-    /// addressing mode (x86 SIB, aarch64 extended-register). False on
-    /// wasm, where the bookkeeping ISA is the host's but the waffle
-    /// output computes every address explicitly — indvars then wants
-    /// stepped pointer IVs rather than leaving `base + iv*s` inside.
-    pub amode_scale: bool,
-    /// Emit goes through waffle to wasm rather than a register-allocated
-    /// ISA — passes whose only payoff is shaping code for regalloc
-    /// (`coldarg`'s cold-site arg rebinding) have nothing to fix.
-    pub wasm: bool,
     pub has_eh: bool,
     pub flags: &'a FnFlags,
     /// `PLIRON_CLIF=<substr>` matched this function's name.
@@ -1162,11 +1151,7 @@ pub fn run_pipeline(p: &mut Pipe) {
     // lcse splits offsets the aarch64 encoder cannot take as an
     // immediate (clifpeep `amode_off_fits`; `PLIRON_BIGOFF=0` disables).
     // Not for wasm, whose host ISA is bookkeeping only.
-    clifpeep::set_bigoff(
-        !p.wasm
-            && !pliron_cfg::env_is("PLIRON_BIGOFF", "0")
-            && matches!(p.isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)),
-    );
+    clifpeep::set_bigoff(p.target.is_aarch64() && !pliron_cfg::env_is("PLIRON_BIGOFF", "0"));
     // `PLIRON_LIVEREGION=0` falls back to the lowering-time block regions.
     if !p.block_region.is_empty() && crate::pass_enabled("PLIRON_LIVEREGION") {
         let func = &p.clctx.func;
@@ -2357,7 +2342,7 @@ fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
         sh,
         rnn.as_ref(),
         &p.site_facts,
-        /* ifconv_tables */ !p.wasm,
+        /* ifconv_tables */ !p.target.cheap_br_table(),
     );
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
@@ -2420,8 +2405,9 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
-    // Symbolic cursors: wasm only (native was not timed).
-    let sym = p.wasm && pliron_cfg::env_is("PLIRON_UNROLL_SYM", "1");
+    // Symbolic cursors: wasm only, a measurement boundary (native was
+    // not timed).
+    let sym = p.target.is_wasm() && pliron_cfg::env_is("PLIRON_UNROLL_SYM", "1");
     let k = unroll::run_with(&mut p.clctx.func, an, p.nonnull, p.derived, p.prof, sym);
     // The skipped loop is now unreachable, and its trip count still
     // flows into dead params/branches; dropping them frees the slot
@@ -2474,19 +2460,21 @@ fn s_bunroll(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    // The fact fold is wasm-only. Native was not timed; `p.wasm` is
-    // false there, so native keeps the edge-drop this pass had.
-    // Constant-edge threading is wasm-only for the same reason.
-    let phi = p.wasm && pliron_cfg::env_is("PLIRON_UNREACH_PHI", "1");
-    let k = unreach::run_with(&mut p.clctx.func, p.wasm, phi);
+    // The fact fold is wasm-only, a measurement boundary: native was not
+    // timed, so native keeps the edge-drop this pass had. Constant-edge
+    // threading is wasm-only for the same reason.
+    let wasm = p.target.is_wasm();
+    let phi = wasm && pliron_cfg::env_is("PLIRON_UNREACH_PHI", "1");
+    let k = unreach::run_with(&mut p.clctx.func, wasm, phi);
     p.stats.unreached += k;
     k
 }
 
 /// `unreach` ahead of jumpthread, in functions with an assume edge.
-/// Wasm only: the frontend emits range assumes there only.
+/// Wasm only: the frontend emits range assumes there only
+/// (`PLIRON_ASSUME_RANGE`, measured on wasm).
 fn s_unreach0(p: &mut Pipe, an: &mut Analysis) -> usize {
-    if !p.wasm || !unreach::has_assume_edge(&p.clctx.func) {
+    if !p.target.is_wasm() || !unreach::has_assume_edge(&p.clctx.func) {
         return 0;
     }
     let k = s_unreach(p, an);
@@ -2498,7 +2486,7 @@ fn s_unreach0(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_clifpeep(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = clifpeep::run(&mut p.clctx.func, p.x64);
+    let k = clifpeep::run(&mut p.clctx.func, p.target.is_x64());
     p.stats.peeped += k;
     k
 }
@@ -2702,7 +2690,7 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // to `umulhi.i32`. That narrowing never sees the `urem` if the
     // egraph runs first (parse_only's loop header). Expand while the
     // `urem` and the loop-exit bound are both still there.
-    if p.wasm {
+    if !p.target.mulhi64() {
         divconst::run(&mut p.clctx.func, true);
     }
     // PLIRON_EGRAPH_IMULCAP=1 (opt-in, wasm): egraph2 sinks a peeled
@@ -2712,7 +2700,8 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // keep the pre-egraph body — closer to LLVM's progressive chain.
     // Rematted arms still win some V8 layouts; measure with
     // `harness/v8/` before default-on.
-    let imulcap = p.wasm && pliron_cfg::env_is("PLIRON_EGRAPH_IMULCAP", "1");
+    // Measured on wasm only.
+    let imulcap = p.target.is_wasm() && pliron_cfg::env_is("PLIRON_EGRAPH_IMULCAP", "1");
     let imul_before = imulcap
         .then(|| {
             p.clctx
@@ -2732,7 +2721,7 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     p.clctx.compute_cfg();
     p.clctx.compute_domtree();
     let flags = p.isa.flags().clone();
-    if p.wasm {
+    if !p.target.own_isa() {
         p.clctx.eliminate_unreachable_code(&flags).unwrap();
         p.clctx.compute_cfg();
         p.clctx.compute_domtree();
@@ -2741,7 +2730,7 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
         p.clctx.compute_cfg();
         p.clctx.compute_domtree();
     }
-    let r = if p.wasm {
+    let r = if !p.target.own_isa() {
         p.clctx.egraph_pass(&flags, &mut cp)
     } else {
         p.clctx.egraph_pass(p.isa, &mut cp)
@@ -2835,7 +2824,7 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
     // Other widths were not timed alone — the wasm build that
     // rotated every width also had `PLIRON_ASSUME_RANGE` and lost
     // chars_ascii, and those two were not split.
-    let pairs = p.wasm && config().enabled("PLIRON_LDROT_PAIR");
+    let pairs = p.target.is_wasm() && config().enabled("PLIRON_LDROT_PAIR");
     let k = indvars::rotld(&mut p.clctx.func, an, pairs);
     // Rotation drops the carried load's address chain; its leftover
     // `base + (iv-1)*s` computation is then dead, and a second indvars
@@ -2843,7 +2832,7 @@ fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
     // shared base from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         an.invalidate(&p.clctx.func);
-        indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
+        indvars::run(&mut p.clctx.func, an, p.target.amode_scale(), p.derived);
     }
     k
 }
@@ -2893,7 +2882,7 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         if p.dump {
             p.dump("licm (before indvars2)");
         }
-        indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
+        indvars::run(&mut p.clctx.func, an, p.target.amode_scale(), p.derived);
     }
     if k > 0 && p.dump {
         p.dump("licm");
@@ -2961,7 +2950,7 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = if shape_of(&p.clctx.func) & (shape::CONDBR | shape::JUMP)
         == (shape::CONDBR | shape::JUMP)
     {
-        ifconv::run(&mut p.clctx.func, p.derived, None, /* tables */ !p.wasm)
+        ifconv::run(&mut p.clctx.func, p.derived, None, /* tables */ !p.target.cheap_br_table())
     } else {
         0
     };
@@ -3033,7 +3022,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
             128
         };
         loopvec::WideCaps {
-            vbits: if p.x64 { vb.min(x64_wide_bits()) } else { 128 },
+            vbits: if p.target.is_x64() { vb.min(x64_wide_bits()) } else { 128 },
             fma: isa_flag("has_fma"),
             avx512bw: isa_flag("has_avx512bw"),
         }
@@ -3045,7 +3034,7 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.noalias,
         p.tcfg,
         p.simd,
-        p.x64,
+        p.target.is_x64(),
         p.cmp64,
         p.prof,
         wc,
@@ -3055,13 +3044,13 @@ fn s_loopvec(p: &mut Pipe, an: &mut Analysis) -> usize {
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         // loopvec rewrote the loop the cache describes.
         an.invalidate(&p.clctx.func);
-        indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
+        indvars::run(&mut p.clctx.func, an, p.target.amode_scale(), p.derived);
     }
     k
 }
 
 fn s_slp(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = slp::run(&mut p.clctx.func, an, p.noalias, p.simd, p.x64);
+    let k = slp::run(&mut p.clctx.func, an, p.noalias, p.simd, p.target.is_x64());
     p.dump("slp");
     k
 }
@@ -3111,7 +3100,8 @@ fn s_constbr2(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_punroll(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = punroll::run(&mut p.clctx.func, an, p.fname, p.prof, p.wasm);
+    // The wasm-only rules in punroll are measurement boundaries.
+    let k = punroll::run(&mut p.clctx.func, an, p.fname, p.prof, p.target.is_wasm());
     if k > 0 && p.dump {
         p.dump("punroll");
     }
@@ -3127,7 +3117,7 @@ fn s_constdedup(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 fn s_splink(p: &mut Pipe, an: &mut Analysis) -> usize {
     let CfgDtLa { la, .. } = an.cfg_dt_la(&p.clctx.func);
-    let k = splink::run(&mut p.clctx.func, la, p.x64);
+    let k = splink::run(&mut p.clctx.func, la, p.target.is_x64());
     p.dump("splink");
     k
 }
@@ -3228,9 +3218,10 @@ fn s_wide_minmax(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // pinning lands at the cold call site instead of constraining the
 // whole hot loop's register allocation.
 fn s_coldarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    // Nothing pins registers on wasm; the disguised `umulhi x, 0` zero
-    // would only cost a widened-mul expansion per cold arg.
-    let k = if p.wasm {
+    // Nothing pins registers without our allocator (wasm); the disguised
+    // `umulhi x, 0` zero would only cost a widened-mul expansion per
+    // cold arg.
+    let k = if !p.target.has_regalloc() {
         0
     } else {
         clifpeep::coldargs(&mut p.clctx.func, pliron_cfg::env_is("PLIRON_COLDCOPY", "1"))
@@ -3358,7 +3349,7 @@ fn s_tripfold(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_ivrefold(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let (k, pmap) = ivrefold::run(&mut p.clctx.func, an, p.amode_scale);
+    let (k, pmap) = ivrefold::run(&mut p.clctx.func, an, p.target.amode_scale());
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }
@@ -4334,7 +4325,7 @@ fn s_armmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // shared `if`-input terms). Shrinks arms toward armmerge's isomorphic
 // shape, so it runs just ahead of it.
 fn s_copypair(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    if !p.simd || p.x64 {
+    if !p.simd || p.target.is_x64() {
         return 0;
     }
     let k = copypair::run(&mut p.clctx.func);
@@ -4378,7 +4369,7 @@ fn s_boundcmp(p: &mut Pipe, an: &mut Analysis) -> usize {
     // x64 `cmp reg, imm32` sign-extends the immediate, so unsigned bounds
     // up to i32::MAX compare for free — the countdown only earns its
     // extra param and isub past that. Other targets keep the old floor.
-    let kmin = if p.x64 { i32::MAX as i64 + 1 } else { 4096 };
+    let kmin = if p.target.is_x64() { i32::MAX as i64 + 1 } else { 4096 };
     let k = indvars::boundcmp(&mut p.clctx.func, an, kmin);
     if k > 0 && p.dump {
         p.dump("boundcmp");
@@ -4404,7 +4395,7 @@ fn s_selfarg(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Runs last so nothing un-does the chains and adapters/edge
 // forwarding have already collapsed the surrounding shape.
 fn s_brchain(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    if p.wasm {
+    if p.target.cheap_br_table() {
         // wasm has a real `br_table`; chains only add compares.
         return 0;
     }
@@ -4528,13 +4519,9 @@ fn s_coldret(p: &mut Pipe, an: &mut Analysis) -> usize {
 /// addresses explicitly — stepped pointer IVs still pay off there.
 /// Callers whose emit target differs from `isa` (the wasm path keeps a
 /// host ISA purely for bookkeeping) pass their own `Pipe::amode_scale`.
-pub fn amode_scale(isa: &dyn TargetIsa) -> bool {
-    use target_lexicon::Architecture as A;
-    matches!(isa.triple().architecture, A::X86_64 | A::Aarch64(_))
-}
 
 fn s_indvars(p: &mut Pipe, an: &mut Analysis) -> usize {
-    indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived)
+    indvars::run(&mut p.clctx.func, an, p.target.amode_scale(), p.derived)
 }
 
 fn s_zipiv(p: &mut Pipe, an: &mut Analysis) -> usize {
@@ -4606,7 +4593,8 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_armhoist(p: &mut Pipe, an: &mut Analysis) -> usize {
-    if !p.wasm {
+    // Opt-in, measured on wasm only.
+    if !p.target.is_wasm() {
         return 0;
     }
     let k = {
@@ -4621,7 +4609,8 @@ fn s_armhoist(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_vrp2(p: &mut Pipe, an: &mut Analysis) -> usize {
-    if !p.wasm {
+    // Wasm only, a measurement boundary (native was not timed).
+    if !p.target.is_wasm() {
         return 0;
     }
     let k = crate::vrp::run(&mut p.clctx.func, an);
@@ -4633,7 +4622,8 @@ fn s_vrp2(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_vrp0(p: &mut Pipe, an: &mut Analysis) -> usize {
-    if !p.wasm || !unreach::has_assume_edge(&p.clctx.func) {
+    // Assume edges exist on wasm only (see `s_unreach0`).
+    if !p.target.is_wasm() || !unreach::has_assume_edge(&p.clctx.func) {
         return 0;
     }
     let k = crate::vrp::run(&mut p.clctx.func, an);
@@ -4656,7 +4646,7 @@ fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
 // function (`panicstub`); members keep their argument setup and jump.
 fn s_panicstub(p: &mut Pipe, an: &mut Analysis) -> usize {
     // Native only: never run or measured on wasm.
-    if p.wasm {
+    if p.target.is_wasm() {
         return 0;
     }
     let k = crate::panicstub::run(&mut p.clctx.func, pliron_cfg::env_is("PLIRON_COLDCOPY", "1"));
@@ -4703,7 +4693,7 @@ fn s_brifsel(p: &mut Pipe, _an: &mut Analysis) -> usize {
 
 fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
     // aarch64 only: the movemask lowering (`ushr`/`unarrow`) is tuned there.
-    if !p.simd || p.x64 || p.wasm {
+    if !p.simd || !p.target.is_aarch64() {
         return 0;
     }
     let k = crate::bytescan::run(&mut p.clctx.func, an, p.const_tables);
@@ -4714,8 +4704,8 @@ fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_revcmp(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    // Wasm only: native was not timed.
-    if !p.wasm {
+    // Wasm only, a measurement boundary: native was not timed.
+    if !p.target.is_wasm() {
         return 0;
     }
     revcmp::run(&mut p.clctx.func)
@@ -5632,7 +5622,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: |p, _an| {
                 let reap = p.since_reap;
                 p.since_reap = false;
-                clifpeep::iconst128(&mut p.clctx.func, reap, p.x64)
+                clifpeep::iconst128(&mut p.clctx.func, reap, p.target.is_x64())
             },
             site: std::sync::OnceLock::new(),
         },
@@ -5817,10 +5807,7 @@ mod tests {
         target: crate::target::of_isa(&*isa),
         tcfg: isa.frontend_config(),
         simd: true,
-        x64: false,
         cmp64: true,
-        amode_scale: amode_scale(&*isa),
-        wasm: false,
         has_eh: false,
         flags: &flags,
         prof_hook: None,

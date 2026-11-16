@@ -54,7 +54,6 @@ fn main() {
         .and_then(|n| n.parse().ok())
         .map(FuncId::from_u32)
         .unwrap_or(FuncId::from_u32(0));
-    let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
     let (e1, e2, e3, e5, e6, mut e7, e8): (
         _,
         _,
@@ -108,7 +107,6 @@ fn main() {
         nounwind: &Default::default(),
         inst_region: Default::default(),
         edge_kills: Vec::new(),
-        wasm: false,
         since_reap: false,
         unopt: false,
         clctx: &mut clctx,
@@ -138,9 +136,7 @@ fn main() {
         target: pliron_clif_opt::target::of_isa(&*isa),
         tcfg: isa.frontend_config(),
         simd: true,
-        x64,
         cmp64: true,
-        amode_scale: pipeline::amode_scale(&*isa),
         has_eh: false,
         flags: &flags,
         dump: false,
