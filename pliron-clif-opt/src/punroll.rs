@@ -583,6 +583,7 @@ fn apply_halving(func: &mut Function, info: Half) -> bool {
         })
         .collect();
     let body: Vec<Inst> = func.layout.block_insts(h).filter(|&i| i != term).collect();
+    let mut last_vmap: FxHashMap<Value, Value> = FxHashMap::default();
     for (k, &dst) in copies.iter().enumerate() {
         let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
         for (i, &p) in params.iter().enumerate() {
@@ -595,6 +596,9 @@ fn apply_halving(func: &mut Function, info: Half) -> bool {
             for (o, n) in old.into_iter().zip(newr) {
                 map_val(func, &mut vmap, o, n);
             }
+        }
+        if k + 1 == trip as usize {
+            last_vmap = vmap.clone();
         }
         let Some(cont_vals) = remap_call(func, cont, &vmap) else {
             seal_halving(func, &copies);
@@ -615,6 +619,14 @@ fn apply_halving(func: &mut Function, info: Half) -> bool {
         }
         let _ = cont_args;
     }
+    // The exit region was dominated by the loop block and may name its
+    // values directly, not only through the exit edge's arguments
+    // (regex-syntax's `unicode::class`: the found index of an 18-entry
+    // `binary_search_by` feeds the code after the loop). Those uses
+    // take the last copy's values, as in the chain form.
+    let mut skip: FxHashSet<Block> = copies.iter().copied().collect();
+    skip.insert(h);
+    rewrite_carried_uses(func, exit_block, &skip, &last_vmap);
     let dfg = &mut func.dfg;
     let new_bc = BlockCall::new(copies[0], std::iter::empty(), &mut dfg.value_lists);
     dfg.insts[entry_inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
@@ -842,6 +854,11 @@ fn apply_halving_body(func: &mut Function, info: HalfBody) -> bool {
             };
             let exit_args: Vec<BlockArg> = exit_vals.into_iter().map(BlockArg::Value).collect();
             FuncCursor::new(func).at_bottom(dst).ins().jump(exit_block, &exit_args);
+            // Header values named past the exit: the final test's copy.
+            let mut skip: FxHashSet<Block> = copies.iter().copied().collect();
+            skip.insert(h);
+            skip.insert(body);
+            rewrite_carried_uses(func, exit_block, &skip, &end_map);
         } else {
             FuncCursor::new(func)
                 .at_bottom(dst)
