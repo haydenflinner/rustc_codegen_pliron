@@ -1292,6 +1292,23 @@ pub(crate) fn iropt_head(
         pt!(prof, cgu, "domcheck:ps", domcheck::run(ctx, st, "phisimp"));
         dumpfn(ctx, st, "phisimp");
     }
+    // `PLIRON_CONSTCOPY2`: `forward_copies` again now that phisimp has
+    // replaced the block arguments the inliner bound callee parameters
+    // through. A row of a constant table selected by an inlined callee's
+    // constant argument (blake3's `MSG_SCHEDULE[round]`, `round` inlined
+    // seven times) has a constant address only from here on; the first
+    // run saw `gep(table, param)`. sroa rescues the native build by
+    // splitting the row copy into word loads, but 4-byte `usize` pieces
+    // stay whole under `PLIRON_SROA_FRAGCOPY`, and wasm kept the copy,
+    // 112 index loads and their bounds checks (5088 instructions for
+    // `compress_in_place` against LLVM's 2106).
+    if pass_enabled("PLIRON_CONSTLOAD")
+        && pass_enabled("PLIRON_CONSTCOPY")
+        && env_is("PLIRON_CONSTCOPY2", "1")
+    {
+        pt!(prof, cgu, "constcopy2", constload::forward_copies(ctx, st));
+        pt!(prof, cgu, "domcheck:cc2", domcheck::run(ctx, st, "constcopy2"));
+    }
     // Run ahead of sroa: its `copyable_arg` check consults `st.nowrite`
     // and `st.nocapture` to decide which call args can take a fresh copy.
     if pass_enabled("PLIRON_NOWRITE") {
