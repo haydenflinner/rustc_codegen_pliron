@@ -275,6 +275,31 @@ script that carries each one.
   assumptions the rewrite states, and a failed check fails the build.
 ]
 
+#r("verify.peepdiff.wasm", title: "wasm peepholes are run against their input in the gate", level: "must",
+   refines: "model.equiv", depends: "wasm.peep.equiv", checked: "tests/wasm/smoke.sh")[
+  `tests/wasm/smoke.sh` MUST build its objects with
+  `PLIRON_WASM_MODDUMP=<dir>`, which writes every #term("wasm-object")
+  before and after #term("wpeep"), and MUST run
+  `harness/wasm/peepdiff.mjs` on that directory. The tool calls every
+  function body of both modules in V8 with the same seeded arguments on
+  the same seeded memory and fails the run when the two sides differ in
+  an import call (callee, arguments, the memory the callee can read, the
+  stack pointer), in a result, in a trap, or in memory, globals or the
+  stack pointer where both return or both exhaust the same budget. Bytes
+  below the stack pointer are not compared. A function that differs is
+  re-run with every other body taken from the input module, which
+  separates a wrong body from its callers. The check covers only the
+  paths its inputs reach: a clean run is not a proof.
+]
+
+#llvm(kind: "extra", summary: [Every function the wasm peepholes rewrite is executed before and after, on the same inputs, in every gate run.])[
+  LLVM has no pass that is run against its own input inside the test
+  suite; `llvm-stress` and Csmith compare whole programs. Here the unit
+  is one function body of a real object, the oracle is the same body
+  before the rewrite, and the same tool runs on any build's dump
+  (`PLIRON_WASM_MODDUMP`) at about a millisecond per function.
+]
+
 == The corpus
 
 #r("verify.corpus.record", title: "Recording a corpus", level: "must", tier: 2,
