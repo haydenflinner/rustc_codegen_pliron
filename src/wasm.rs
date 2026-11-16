@@ -2182,17 +2182,24 @@ fn peep_body_opts(
             // read, or an earlier one through a shared-loop
             // back-edge), drop the write entirely; else keep it as a
             // tee.
-            let dead = !ins.iter().enumerate().any(|(v, &(k2, _, _, _))| {
-                if !matches!(k2, WPeek::Get(l2) if l2 == t) || v == u {
-                    return false;
-                }
-                if v > s {
-                    return true;
-                }
-                ctx[ins[s].3]
-                    .iter()
-                    .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[v].3].contains(e))
-            });
+            // A read hoisted by an earlier rewrite is a prelude now, not
+            // an entry of `ins`: it still reads `t`. Any pending prelude
+            // of `t` keeps the write (blake3's `compress_in_place`: round
+            // two deleted a `local.set` whose value a round-one prelude
+            // read, and `hash(b"abc")` came out wrong).
+            let prel_reads = prel.iter().any(|&(_, lx)| lx == t);
+            let dead = !prel_reads
+                && !ins.iter().enumerate().any(|(v, &(k2, _, _, _))| {
+                    if !matches!(k2, WPeek::Get(l2) if l2 == t) || v == u {
+                        return false;
+                    }
+                    if v > s {
+                        return true;
+                    }
+                    ctx[ins[s].3]
+                        .iter()
+                        .any(|e| dop[e.0 as usize] == 0x03 && ctx[ins[v].3].contains(e))
+                });
             ins[s].0 = if dead { WPeek::Del } else { WPeek::Tee(t) };
             ins[u].0 = WPeek::Del;
         }
@@ -7272,6 +7279,319 @@ mod wpeep_tests {
         // is unsound while the loop's `set 2` can re-enter via the
         // back-edge.
         assert!(has_seq(&r, &[0x20, 0x01, 0x36, 0x00, 0x00])); // get 1; i32.store
+    }
+
+    /// A straight-line body (no control flow) run on integers: the
+    /// final locals, the stores in order and what is left on the
+    /// stack. Enough for the wasm a hash round or a bignum step is
+    /// made of. `None` on an opcode outside the list. Loads read back
+    /// earlier stores of the same address and width, and otherwise a
+    /// value derived from the address, so both sides of a differential
+    /// test see the same memory.
+    #[allow(clippy::type_complexity)]
+    fn run_straight(code: &[u8], init: &[u64]) -> Option<(Vec<u64>, Vec<(u64, u64, u8)>, Vec<u64>)> {
+        let mut loc = init.to_vec();
+        let mut st: Vec<u64> = Vec::new();
+        let mut stores: Vec<(u64, u64, u8)> = Vec::new();
+        let mut p = 0usize;
+        let sleb = |p: &mut usize| -> Option<i64> {
+            let (mut v, mut sh) = (0i64, 0u32);
+            loop {
+                let c = *code.get(*p)?;
+                *p += 1;
+                v |= ((c & 0x7f) as i64) << sh;
+                sh += 7;
+                if c & 0x80 == 0 {
+                    if sh < 64 && c & 0x40 != 0 {
+                        v |= -1i64 << sh;
+                    }
+                    return Some(v);
+                }
+            }
+        };
+        let m32 = |x: u64| x & 0xffff_ffff;
+        while p < code.len() {
+            let op = code[p];
+            p += 1;
+            match op {
+                0x0b => break,
+                0x20 => st.push(*loc.get(urd(code, &mut p)? as usize)?),
+                0x21 => {
+                    let l = urd(code, &mut p)? as usize;
+                    *loc.get_mut(l)? = st.pop()?;
+                }
+                0x22 => {
+                    let l = urd(code, &mut p)? as usize;
+                    *loc.get_mut(l)? = *st.last()?;
+                }
+                0x1a => {
+                    st.pop()?;
+                }
+                0x41 => st.push(m32(sleb(&mut p)? as u64)),
+                0x42 => st.push(sleb(&mut p)? as u64),
+                0x28 | 0x29 => {
+                    let _al = urd(code, &mut p)?;
+                    let off = urd(code, &mut p)? as u64;
+                    let a = st.pop()?.wrapping_add(off);
+                    let w = if op == 0x28 { 4 } else { 8 };
+                    let v = stores
+                        .iter()
+                        .rev()
+                        .find(|s| s.0 == a && s.2 == w)
+                        .map(|s| s.1)
+                        .unwrap_or(a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5555);
+                    st.push(if w == 4 { m32(v) } else { v });
+                }
+                0x36 | 0x37 => {
+                    let _al = urd(code, &mut p)?;
+                    let off = urd(code, &mut p)? as u64;
+                    let v = st.pop()?;
+                    let a = st.pop()?.wrapping_add(off);
+                    stores.push((a, v, if op == 0x36 { 4 } else { 8 }));
+                }
+                0xa7 => {
+                    let v = st.pop()?;
+                    st.push(m32(v));
+                }
+                0xad => {} // i64.extend_i32_u: values are kept zero-extended
+                0x23 => {
+                    let g = urd(code, &mut p)? as u64;
+                    st.push(m32(g.wrapping_mul(0x85eb_ca6b) ^ 0x1234));
+                }
+                0x24 => {
+                    let g = urd(code, &mut p)? as u64;
+                    let v = st.pop()?;
+                    stores.push((u64::MAX - g, v, 0));
+                }
+                0x45 | 0x50 => {
+                    let a = st.pop()?;
+                    st.push(u64::from(a == 0));
+                }
+                0x46..=0x4f => {
+                    let (b, a) = (st.pop()? as u32, st.pop()? as u32);
+                    let (sa, sb) = (a as i32, b as i32);
+                    st.push(u64::from(match op {
+                        0x46 => a == b,
+                        0x47 => a != b,
+                        0x48 => sa < sb,
+                        0x49 => a < b,
+                        0x4a => sa > sb,
+                        0x4b => a > b,
+                        0x4c => sa <= sb,
+                        0x4d => a <= b,
+                        0x4e => sa >= sb,
+                        _ => a >= b,
+                    }));
+                }
+                0x51..=0x5a => {
+                    let (b, a) = (st.pop()?, st.pop()?);
+                    let (sa, sb) = (a as i64, b as i64);
+                    st.push(u64::from(match op {
+                        0x51 => a == b,
+                        0x52 => a != b,
+                        0x53 => sa < sb,
+                        0x54 => a < b,
+                        0x55 => sa > sb,
+                        0x56 => a > b,
+                        0x57 => sa <= sb,
+                        0x58 => a <= b,
+                        0x59 => sa >= sb,
+                        _ => a >= b,
+                    }));
+                }
+                0x6a..=0x78 => {
+                    let (b, a) = (st.pop()? as u32, st.pop()? as u32);
+                    st.push(u64::from(match op {
+                        0x6a => a.wrapping_add(b),
+                        0x6b => a.wrapping_sub(b),
+                        0x6c => a.wrapping_mul(b),
+                        0x71 => a & b,
+                        0x72 => a | b,
+                        0x73 => a ^ b,
+                        0x74 => a.wrapping_shl(b),
+                        0x76 => a.wrapping_shr(b),
+                        0x77 => a.rotate_left(b),
+                        0x78 => a.rotate_right(b),
+                        _ => return None,
+                    }));
+                }
+                0x7c..=0x8a => {
+                    let (b, a) = (st.pop()?, st.pop()?);
+                    st.push(match op {
+                        0x7c => a.wrapping_add(b),
+                        0x7d => a.wrapping_sub(b),
+                        0x7e => a.wrapping_mul(b),
+                        0x83 => a & b,
+                        0x84 => a | b,
+                        0x85 => a ^ b,
+                        0x86 => a.wrapping_shl(b as u32),
+                        0x88 => a.wrapping_shr(b as u32),
+                        0x89 => a.rotate_left(b as u32),
+                        0x8a => a.rotate_right(b as u32),
+                        _ => return None,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        Some((loc, stores, st))
+    }
+
+    /// The instructions of a body: skips its local declarations.
+    fn code_of(body: &[u8]) -> &[u8] {
+        let mut p = 0;
+        let groups = urd(body, &mut p).unwrap();
+        for _ in 0..groups {
+            urd(body, &mut p).unwrap();
+            p += 1;
+        }
+        &body[p..]
+    }
+
+    /// A tool, not a test: `WPEEP_FIND=<pre.bin> WPEEP_NLOC=<n>` (a
+    /// `PLIRON_WASM_BODYDUMP` pre-body and its local count, params
+    /// included) finds the shortest tail of the body's longest
+    /// control-free stretch whose stores the peephole changes (every
+    /// local is a param, so each starts with an arbitrary value) and
+    /// prints its bytes. That is how the regression above was cut out
+    /// of a 10 KB body.
+    #[test]
+    fn find_straight_line_miscompile() {
+        let (Ok(path), Ok(nloc)) = (std::env::var("WPEEP_FIND"), std::env::var("WPEEP_NLOC")) else {
+            return;
+        };
+        let nloc: usize = nloc.parse().unwrap();
+        let pre = std::fs::read(path).unwrap();
+        let code = code_of(&pre);
+        // Statement starts in the last control-free stretch.
+        let mut dec: Vec<(u8, usize, usize)> = Vec::new();
+        let mut p = 0usize;
+        while p < code.len() {
+            let (op, s0) = (code[p], p);
+            p += 1;
+            match op {
+                0x20..=0x24 | 0x0c | 0x0d | 0x10 => {
+                    urd(code, &mut p).unwrap();
+                }
+                0x41 | 0x42 => sleb_skip(code, &mut p).unwrap(),
+                0x28..=0x3e | 0x11 => {
+                    urd(code, &mut p).unwrap();
+                    urd(code, &mut p).unwrap();
+                }
+                0x02..=0x04 => p += 1,
+                _ => {}
+            }
+            dec.push((op, s0, p));
+        }
+        let is_ctl = |op: u8| matches!(op, 0x00 | 0x02..=0x05 | 0x0b..=0x11);
+        // The longest control-free stretch, [lo, hi) in `dec`.
+        let (mut lo, mut hi, mut run) = (0usize, 0usize, 0usize);
+        for (i, d) in dec.iter().enumerate() {
+            if is_ctl(d.0) {
+                run = i + 1;
+            } else if i + 1 - run > hi - lo {
+                (lo, hi) = (run, i + 1);
+            }
+        }
+        let code = &code[..dec[hi - 1].2];
+        let init: Vec<u64> = (0..nloc as u64).map(|i| (i + 1).wrapping_mul(0x9e37_79b9) & 0xffff_ffff).collect();
+        let mut starts: Vec<usize> = vec![dec[lo].1];
+        for d in &dec[lo..hi] {
+            if matches!(d.0, 0x21 | 0x36 | 0x37) {
+                starts.push(d.2);
+            }
+        }
+        let (mut n_unk, mut n_stack, mut n_peep, mut n_unk2, mut n_cmp) = (0, 0, 0, 0, 0);
+        for &st in starts.iter().rev() {
+            let slice = &code[st..];
+            if slice.is_empty() {
+                continue;
+            }
+            let mut body = vec![0x00];
+            body.extend_from_slice(slice);
+            body.push(0x0b);
+            let Some(want) = run_straight(slice, &init) else {
+                n_unk += 1;
+                continue;
+            };
+            if !want.2.is_empty() {
+                n_stack += 1;
+                continue;
+            }
+            let Some(out) = peep_body_opts(&body, &[], &[], nloc as u32, &PeepOpts::from_env()) else {
+                n_peep += 1;
+                continue;
+            };
+            let oc = code_of(&out);
+            // The peephole may declare scratch locals past the params.
+            let mut init2 = init.clone();
+            init2.resize(nloc + 64, 0);
+            let Some(got) = run_straight(oc, &init2) else { n_unk2 += 1; continue };
+            n_cmp += 1;
+            // Stores are what the body does: a local nobody reads again
+            // may legitimately end up different.
+            if got.1 != want.1 {
+                eprintln!("MISCOMPILE at tail len {} bytes: {:02x?}", slice.len(), slice);
+                panic!("found");
+            }
+        }
+        eprintln!("no straight-line tail miscompiles ({} starts; unk {n_unk} stack {n_stack} peep-none {n_peep} unk-post {n_unk2} compared {n_cmp})", starts.len());
+    }
+
+    // Regression (blake3 `compress_in_place`, `hash(b"abc")` wrong on
+    // wasm32, found building `~/code/dsa`): keep-on-stack hoists a
+    // window's `local.get`s below the producer as preludes, which are no
+    // longer entries of `ins`. A later round then judged a `local.set`
+    // dead because the only *listed* reader was the get it was folding,
+    // deleted it, and the earlier round's prelude read the local's old
+    // value.
+    //
+    // The body is the tail of the function as lowered (the last quarter
+    // rounds and the eight state stores), with every local a param so
+    // each starts with an arbitrary value. Both versions run in
+    // `run_straight`; the stores must agree.
+    #[test]
+    fn kos_keeps_a_write_that_a_hoisted_get_reads() {
+        const TAIL: &[u8] = &[
+            0x20, 0x1f, 0x20, 0x12, 0x6a, 0x20, 0x0b, 0x6a, 0x21, 0x15, 0x20, 0x18, 0x20, 0x1e, 0x73, 0x41,
+            0x08, 0x78, 0x21, 0x12, 0x20, 0x08, 0x20, 0x12, 0x6a, 0x21, 0x18, 0x20, 0x10, 0x20, 0x1d, 0x6a,
+            0x21, 0x08, 0x20, 0x1c, 0x20, 0x08, 0x73, 0x41, 0x07, 0x78, 0x21, 0x10, 0x20, 0x01, 0x20, 0x06,
+            0x6a, 0x20, 0x10, 0x6a, 0x21, 0x1c, 0x20, 0x13, 0x20, 0x1c, 0x73, 0x41, 0x10, 0x78, 0x21, 0x06,
+            0x20, 0x18, 0x20, 0x06, 0x6a, 0x21, 0x13, 0x20, 0x10, 0x20, 0x13, 0x73, 0x41, 0x0c, 0x78, 0x21,
+            0x01, 0x20, 0x1c, 0x20, 0x0c, 0x6a, 0x20, 0x01, 0x6a, 0x21, 0x10, 0x20, 0x06, 0x20, 0x10, 0x73,
+            0x41, 0x08, 0x78, 0x21, 0x0c, 0x20, 0x13, 0x20, 0x0c, 0x6a, 0x21, 0x06, 0x20, 0x00, 0x20, 0x15,
+            0x20, 0x06, 0x73, 0x36, 0x02, 0x00, 0x20, 0x19, 0x20, 0x1b, 0x73, 0x41, 0x07, 0x78, 0x21, 0x13,
+            0x20, 0x1a, 0x20, 0x0a, 0x6a, 0x20, 0x13, 0x6a, 0x21, 0x19, 0x20, 0x12, 0x20, 0x19, 0x73, 0x41,
+            0x10, 0x78, 0x21, 0x0a, 0x20, 0x08, 0x20, 0x0a, 0x6a, 0x21, 0x12, 0x20, 0x13, 0x20, 0x12, 0x73,
+            0x41, 0x0c, 0x78, 0x21, 0x08, 0x20, 0x19, 0x20, 0x11, 0x6a, 0x20, 0x08, 0x6a, 0x21, 0x13, 0x20,
+            0x16, 0x20, 0x18, 0x73, 0x41, 0x07, 0x78, 0x21, 0x11, 0x20, 0x17, 0x20, 0x0f, 0x6a, 0x20, 0x11,
+            0x6a, 0x21, 0x16, 0x20, 0x07, 0x20, 0x16, 0x73, 0x41, 0x10, 0x78, 0x21, 0x0f, 0x20, 0x0e, 0x20,
+            0x0f, 0x6a, 0x21, 0x07, 0x20, 0x11, 0x20, 0x07, 0x73, 0x41, 0x0c, 0x78, 0x21, 0x0e, 0x20, 0x16,
+            0x20, 0x09, 0x6a, 0x20, 0x0e, 0x6a, 0x21, 0x11, 0x20, 0x0f, 0x20, 0x11, 0x73, 0x41, 0x08, 0x78,
+            0x21, 0x09, 0x20, 0x07, 0x20, 0x09, 0x6a, 0x21, 0x0f, 0x20, 0x00, 0x20, 0x13, 0x20, 0x0f, 0x73,
+            0x36, 0x02, 0x04, 0x20, 0x0d, 0x20, 0x15, 0x73, 0x41, 0x08, 0x78, 0x21, 0x07, 0x20, 0x14, 0x20,
+            0x07, 0x6a, 0x21, 0x0d, 0x20, 0x00, 0x20, 0x10, 0x20, 0x0d, 0x73, 0x36, 0x02, 0x08, 0x20, 0x0a,
+            0x20, 0x13, 0x73, 0x41, 0x08, 0x78, 0x21, 0x10, 0x20, 0x12, 0x20, 0x10, 0x6a, 0x21, 0x0a, 0x20,
+            0x00, 0x20, 0x11, 0x20, 0x0a, 0x73, 0x36, 0x02, 0x0c, 0x20, 0x00, 0x20, 0x0e, 0x20, 0x0f, 0x73,
+            0x41, 0x07, 0x78, 0x20, 0x10, 0x73, 0x36, 0x02, 0x10, 0x20, 0x00, 0x20, 0x0b, 0x20, 0x0d, 0x73,
+            0x41, 0x07, 0x78, 0x20, 0x0c, 0x73, 0x36, 0x02, 0x14, 0x20, 0x00, 0x20, 0x08, 0x20, 0x0a, 0x73,
+            0x41, 0x07, 0x78, 0x20, 0x09, 0x73, 0x36, 0x02, 0x18, 0x20, 0x00, 0x20, 0x01, 0x20, 0x06, 0x73,
+            0x41, 0x07, 0x78, 0x20, 0x07, 0x73, 0x36, 0x02, 0x1c, 0x20, 0x05, 0x24, 0x00,
+        ];
+        const NLOC: usize = 32;
+        let mut b = vec![0x00];
+        b.extend_from_slice(TAIL);
+        b.push(0x0b);
+        let init: Vec<u64> = (0..NLOC as u64)
+            .map(|i| (i + 1).wrapping_mul(0x9e37_79b9) & 0xffff_ffff)
+            .collect();
+        let want = run_straight(TAIL, &init).expect("the tail is in the interpreter's subset");
+        assert!(want.2.is_empty() && want.1.len() == 9, "eight stores and the stack pointer");
+        let out = peep_body_opts(&b, &[], &[], NLOC as u32, &PeepOpts::from_env()).unwrap();
+        let mut init2 = init.clone();
+        init2.resize(NLOC + 64, 0);
+        let got = run_straight(code_of(&out), &init2).expect("output stays straight-line");
+        assert_eq!(got.1, want.1, "the peephole changed what the body stores: {:02x?}", code_of(&out));
     }
 
     // `PLIRON_WASM_BDSCAN=<dir>`: run every PLIRON_WASM_BODYDUMP pre-body
