@@ -343,6 +343,14 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_OPT_FNS=lo..hi|~substr|@file` (`!` inverts),
   `PLIRON_OPT_FNS_LOG=<file>` — per-function optimization selection.
 - `PLIRON_OPT_BISECT=N`, `PLIRON_OPT_BISECT_DEBUG=1` — transform budget.
+- `PLIRON_MEMCPYOPT_PATHWIN=0`, `PLIRON_CONSTCOPY2=0`,
+  `PLIRON_WASM_SMALLCOPY=0` — off switches for the 2026-11-16 dsa round
+  (`docs/history/2026-11-16-wasm-night.md`, "dsa, performance"), each
+  default on: memcpyopt's writer-to-copy window follows paths instead
+  of dominators alone (a function's several `return` sites each
+  forward their `store tmp; memcpy(sret, tmp)`), `constload::forward_copies`
+  runs again after phisimp, and the wasm emitter expands constant
+  copies of at most 16 bytes instead of emitting `memory.copy`.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

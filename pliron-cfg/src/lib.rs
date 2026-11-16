@@ -35,6 +35,21 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-16, the dsa wasm module (docs/history/2026-11-16-wasm-night.md,
+    // "dsa, performance"). Gate and `harness/crates.py --tier 1` clean
+    // with all three on; the wasm kernels are unchanged (geomean 0.931 ->
+    // 0.919 with a build running beside them).
+    // memcpyopt: a sibling block is not between a writer and its copy,
+    // so each `return` site's `store tmp; memcpy(sret, tmp)` forwards
+    // (the interpreter's `step_one`: vm_* 1.17..1.56x LLVM -> 0.96..1.06x).
+    "PLIRON_MEMCPYOPT_PATHWIN",
+    // `forward_copies` again after phisimp: a constant table row
+    // selected by an inlined callee's constant argument (blake3's
+    // `MSG_SCHEDULE[round]` on wasm32: 4990 -> 2342 instructions).
+    "PLIRON_CONSTCOPY2",
+    // wasm emitter: constant copies of at most 16 bytes as loads and
+    // stores instead of `memory.copy` (a C++ call in V8).
+    "PLIRON_WASM_SMALLCOPY",
     // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
     // test; native was not timed). 2026-11-16, `--layouts=3` against
     // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
