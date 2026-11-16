@@ -1582,11 +1582,12 @@ mod tests {
     }
 
     /// The sync store and the reload take their slot address in the
-    /// function's own pointer type. They were `stack_addr.i64` on every
-    /// target; on wasm32 the emitter then wrapped the i32 frame pointer
-    /// as an i64 and the module did not validate.
+    /// target's pointer type (`Target::wasm32()`: i32). They were
+    /// `stack_addr.i64` on every target; on wasm32 the emitter then
+    /// wrapped the i32 frame pointer as an i64 and the module did not
+    /// validate.
     #[test]
-    fn sync_addresses_use_the_functions_pointer_type() {
+    fn sync_addresses_use_the_targets_pointer_type() {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
@@ -1617,7 +1618,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
+        let n = run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::wasm32());
         assert!(n > 0, "expected promotion");
         assert_eq!(memops(&func), 2, "the sync store and the reload");
         for b in func.layout.blocks() {
