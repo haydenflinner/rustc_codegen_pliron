@@ -153,6 +153,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   optimize: each call the inliner kept (reason, cost vs threshold, cap,
   growth) and each loop `loopvec` left scalar. New passes report
   refusals with `pliron_cfg::remark!`.
+- **A whole wasm program: `harness/dsa/`.** `build.sh {llvm,pliron}
+  NAME` builds `~/code/dsa`'s `literate-wasm` (Loro CRDT, the Mimas
+  compiler and interpreter, rapier2d) into `/tmp/dsa-bench/pkg-*`
+  (about 5 min; copy the backend dylib aside and pass
+  `PLIRON_BACKEND=`), `node harness/dsa/bench.mjs --llvm=DIR
+  --pliron=DIR [--extra=DIR] [WORKLOAD..]` times 19 workloads
+  interleaved and cross-checks every result (a mismatch is a
+  miscompile until shown otherwise: five were, 2026-11-16).
+  `prof.sh WORKLOAD` gives per-function self time on both sides,
+  `cmpprof.py` joins the two profiles, and `hot.sh SIDE PKG FUNC
+  WORKLOAD` attributes V8 ticks to machine instructions of one
+  function and names V8 runtime calls (a `memory.copy` is one). The
+  workload sources are not in the repo. Numbers and open gaps:
+  `docs/PARITY.md` "Held-out wasm program"; how each bug was bisected
+  (crate swap, stage knobs, `PLIRON_STEP_FNS`, per-body `wasm2wat`
+  diff): `docs/history/2026-11-16-wasm-night.md`.
 - To see why a kernel is slow: `PLIRON_CLIF=<fn substr>` dumps CLIF
   after every step; `rustc --emit obj` + `llvm-objdump -d` (or
   `wasm2wat`) for final code; compare with stock rustc's output for the
