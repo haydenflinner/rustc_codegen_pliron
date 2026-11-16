@@ -167,27 +167,42 @@ impl std::fmt::Display for Mismatch {
         write!(f, "  after:  {}", describe(&self.after))?;
         // The lists above stop at 64 bytes each; name the bytes that
         // decided it. `-` is a byte left at its seeded value.
-        if let (
-            Outcome::Returned { writes: w0, .. },
-            Outcome::Returned { writes: wa, .. },
-            Some(Outcome::Returned { writes: w1, .. }),
-        ) = (&self.before, &self.after, &self.rerun)
+        // Without a rerun that returned, no byte is known undetermined:
+        // every differing byte is listed.
+        if let (Outcome::Returned { writes: w0, .. }, Outcome::Returned { writes: wa, .. }) =
+            (&self.before, &self.after)
         {
             let m = |w: &Vec<(u64, u8)>| w.iter().copied().collect::<BTreeMap<u64, u8>>();
-            let (m0, m1, ma) = (m(w0), m(w1), m(wa));
-            let keys: std::collections::BTreeSet<u64> =
-                m0.keys().chain(m1.keys()).chain(ma.keys()).copied().collect();
+            let (m0, ma) = (m(w0), m(wa));
+            let m1 = match &self.rerun {
+                Some(Outcome::Returned { writes: w1, .. }) => Some(m(w1)),
+                _ => None,
+            };
+            let keys: std::collections::BTreeSet<u64> = m0
+                .keys()
+                .chain(m1.iter().flat_map(|m| m.keys()))
+                .chain(ma.keys())
+                .copied()
+                .collect();
             let bad: Vec<u64> = keys
                 .into_iter()
-                .filter(|k| m0.get(k) == m1.get(k) && ma.get(k) != m0.get(k))
+                .filter(|k| {
+                    m1.as_ref().is_none_or(|m1| m0.get(k) == m1.get(k)) && ma.get(k) != m0.get(k)
+                })
                 .collect();
             if !bad.is_empty() {
                 let show = |v: Option<&u8>| v.map_or("-".to_string(), |b| format!("{b:x}"));
-                write!(f, "\n  {} determined bytes differ (address: before, after):", bad.len())?;
+                let what = if m1.is_some() { "determined bytes" } else { "bytes" };
+                write!(f, "\n  {} {what} differ (address: before, after):", bad.len())?;
                 for k in bad.iter().take(32) {
                     write!(f, " {k:x}: {}, {};", show(m0.get(k)), show(ma.get(k)))?;
                 }
             }
+        }
+        // A rerun that did not return pins nothing down and forgives
+        // nothing: say so, or the report reads as if every byte counted.
+        if let Some(r @ (Outcome::Trapped(_) | Outcome::Inconclusive(_))) = &self.rerun {
+            write!(f, "\n  before, other stack fill: {}", describe(r))?;
         }
         Ok(())
     }
@@ -913,6 +928,15 @@ struct Sandbox<'a> {
     pinned: DataValue,
     /// Last address a load or store fell outside the sandbox at.
     fault: Cell<Option<u64>>,
+    /// `PLIRON_DIFFCHECK_WATCH=<hex address>`: every write that covers
+    /// this byte is logged (`PLIRON_TRACE=pliron::diffcheck`) with the
+    /// instruction that made it and, for a copy, the byte it came from —
+    /// follow a differing byte of a report back to where the two runs
+    /// part. The second field says which run this is.
+    watch: Option<(u64, &'static str)>,
+    /// `PLIRON_DIFFCHECK_PATH=1`: log every block entered, to diff the
+    /// two runs' paths (a pass that keeps block numbers: slotmerge).
+    path: Option<&'static str>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -933,6 +957,25 @@ impl<'a> Sandbox<'a> {
         let r = self.regions.get_mut(&base)?;
         let o = (addr - base) as usize;
         Some(&mut r.data[o..o + len as usize])
+    }
+
+    /// Log a write of `len` bytes at `addr` when it covers the watched
+    /// byte; `what(k)` describes it, `k` the watched byte's offset in it.
+    fn note_write(&self, addr: u64, len: u64, what: impl FnOnce(u64) -> String) {
+        let Some((w, run)) = self.watch else { return };
+        if addr <= w && w - addr < len {
+            let at = CUR_INST
+                .with(Cell::get)
+                .filter(|&i| self.func.dfg.inst_is_valid(i))
+                .map(|i| format!("{i}: {}", self.func.dfg.display_inst(i)))
+                .unwrap_or_default();
+            tracing::info!(
+                target: "pliron::diffcheck",
+                "watch {w:#x} [{run}, fill {:#x}]: {} at {at}",
+                self.stack_fill,
+                what(w - addr)
+            );
+        }
     }
 
     fn symbol_addr(&mut self, name: &str) -> u64 {
@@ -1063,7 +1106,9 @@ impl<'a> State<'a> for Sandbox<'a> {
             load_size: n as usize,
             mem_flags,
         })?;
-        Ok(DataValue::read_from_slice_le(src, ty))
+        let v = DataValue::read_from_slice_le(src, ty);
+        self.note_write(a, n, |_| format!("load of {v:?} from {a:#x}"));
+        Ok(v)
     }
     fn checked_store(
         &mut self,
@@ -1076,6 +1121,7 @@ impl<'a> State<'a> for Sandbox<'a> {
         if self.find(a, n).is_none() {
             self.fault.set(Some(a));
         }
+        self.note_write(a, n, |_| format!("store of {v:?} to {a:#x}"));
         let dst = self.bytes_mut(a, n).ok_or(MemoryError::OutOfBoundsStore {
             addr: address,
             store_size: n as usize,
@@ -1166,6 +1212,8 @@ thread_local! {
     static QUIET: Cell<bool> = const { Cell::new(false) };
     /// Where the last quiet panic happened, for the inconclusive message.
     static PANIC_AT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The instruction being interpreted, for the same message.
+    static CUR_INST: Cell<Option<Inst>> = const { Cell::new(None) };
 }
 
 /// Interpreter `unimplemented!()`s are expected here; keep them off stderr.
@@ -1209,7 +1257,12 @@ fn run(
                 .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_default();
             let at = PANIC_AT.with(|p| std::mem::take(&mut *p.borrow_mut()));
-            Outcome::Inconclusive(format!("interpreter panic: {msg}{at}"))
+            let inst = CUR_INST
+                .with(Cell::get)
+                .filter(|&i| f.dfg.inst_is_valid(i))
+                .map(|i| format!(" ({i}: {})", f.dfg.display_inst(i)))
+                .unwrap_or_default();
+            Outcome::Inconclusive(format!("interpreter panic: {msg}{at}{inst}"))
         }
     }
 }
@@ -1267,6 +1320,11 @@ fn run_inner(
         slot_pad: world.slot_pad,
         pinned: DataValue::I64(0),
         fault: Cell::new(None),
+        watch: crate::config::env_get("PLIRON_DIFFCHECK_WATCH")
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .map(|w| (w, if check_nonnull { "before" } else { "after" })),
+        path: crate::config::env_is("PLIRON_DIFFCHECK_PATH", "1")
+            .then_some(if check_nonnull { "before" } else { "after" }),
     };
     // Data symbols: same name, same address and contents in every run.
     let mut names: Vec<String> = f
@@ -1316,6 +1374,7 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
             return Err(Stop::Unsupported("out of fuel".into()));
         }
         *left -= 1;
+        CUR_INST.with(|c| c.set(Some(i)));
         let data = &f.dfg.insts[i];
         match data.opcode() {
             Opcode::Call
@@ -1439,13 +1498,17 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
             }
             ControlFlow::Continue => inst = f.layout.next_inst(i),
             ControlFlow::ContinueAt(b, vals) => {
+                if let Some(run) = s.path {
+                    tracing::info!(target: "pliron::diffcheck", "path [{run}, fill {:#x}]: {b} {vals:?}", s.stack_fill);
+                }
                 s.current_frame_mut()
                     .set_all(f.dfg.block_params(b), vals.to_vec());
                 inst = f.layout.first_inst(b);
             }
             ControlFlow::Return(vals) => return Ok(vals.to_vec()),
             ControlFlow::Trap(t) => {
-                return Err(Stop::Trap(format!("{t} at {i}: {}", f.dfg.display_inst(i))));
+                let blk = f.layout.inst_block(i).map(|b| format!(" in {b}")).unwrap_or_default();
+                return Err(Stop::Trap(format!("{t} at {i}{blk}: {}", f.dfg.display_inst(i))));
             }
             ControlFlow::Call(..) | ControlFlow::ReturnCall(..) => {
                 return Err(Stop::Unsupported("unexpected call".into()));
@@ -1566,6 +1629,7 @@ fn stub(
                     let v: Vec<u8> = (0..n)
                         .map(|j| (mix(h, k as u64) >> ((j % 8) * 8)) as u8 ^ j as u8)
                         .collect();
+                    s.note_write(p, n as u64, |_| format!("stub fill of {n} bytes at {p:#x} (argument {k})"));
                     if let Some(b) = s.bytes_mut(p, n as u64) {
                         b.copy_from_slice(&v[..n]);
                     }
@@ -1576,6 +1640,7 @@ fn stub(
                     .is_some_and(|(base, r)| r.stub_writable && base < stack_base());
                 if writable && ext >= 8 {
                     let v = mix(h, k as u64).to_le_bytes();
+                    s.note_write(p, 8, |_| format!("stub fill of 8 bytes at {p:#x} (argument {k})"));
                     s.bytes_mut(p, 8).unwrap().copy_from_slice(&v);
                 }
             }
@@ -1615,6 +1680,9 @@ fn libcall(
             let (d, src, n) = (int(&a[0]), int(&a[1]), int(&a[2]));
             if n > 0 {
                 let tmp = s.bytes(src, n).ok_or_else(oob)?.to_vec();
+                s.note_write(d, n, |k| {
+                    format!("copy of {n} bytes to {d:#x}: byte {:#x} from {:#x}", tmp[k as usize], src + k)
+                });
                 s.bytes_mut(d, n).ok_or_else(oob)?.copy_from_slice(&tmp);
             }
             Ok(rets.iter().map(|_| ptr(d)).collect())
@@ -1622,6 +1690,7 @@ fn libcall(
         LibCall::Memset => {
             let (d, c, n) = (int(&a[0]), int(&a[1]), int(&a[2]));
             if n > 0 {
+                s.note_write(d, n, |_| format!("memset of {n} bytes at {d:#x} to {:#x}", c as u8));
                 s.bytes_mut(d, n).ok_or_else(oob)?.fill(c as u8);
             }
             Ok(rets.iter().map(|_| ptr(d)).collect())

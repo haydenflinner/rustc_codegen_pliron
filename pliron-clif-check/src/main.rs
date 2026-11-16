@@ -67,6 +67,11 @@ fn main() -> ExitCode {
             .init();
         pliron_cfg::mark_tracing_on();
     }
+    // `PLIRON_CLIF_WASM=1`: i32 pointers in the checker's sandbox. Set
+    // here and not only where a `Pipe` is built: `pair` builds none, and
+    // checked a wasm pair with 64-bit addresses (every trial inconclusive,
+    // `heap_oob` at the first `stack_addr.i32`).
+    diffcheck::set_ptr32(pliron_cfg::env_is("PLIRON_CLIF_WASM", "1"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut pos = Vec::new();
     let mut opts = Opts {
@@ -682,6 +687,9 @@ fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &s
     // Name the function after its corpus file so per-function traces
     // (`PLIRON_TRACE=pliron::<step>`) can be grepped.
     let stem = std::path::Path::new(&row.file).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    // Only what the reader accepts in a `%name`: a `.` in it (the corpus
+    // file's `.<n>` suffix) made a saved `before.clif` unparseable.
+    let stem: String = stem.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
     func.name = cranelift_codegen::ir::UserFuncName::testcase(stem.as_bytes());
     let before = func.clone();
     let (ib, bb) = size_of(&before);
@@ -731,7 +739,7 @@ fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &s
             Ok(Ok(_)) => {}
             Ok(Err(m)) => {
                 row.status = "mismatch";
-                row.msg = m.lines().take(4).collect::<Vec<_>>().join(" | ");
+                row.msg = m.lines().take(5).collect::<Vec<_>>().join(" | ");
             }
             Err(_) => {
                 row.status = "inconclusive";
