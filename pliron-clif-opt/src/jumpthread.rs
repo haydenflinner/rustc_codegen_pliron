@@ -3297,6 +3297,30 @@ pub(crate) fn side_enters(func: &Function, la: &LoopAnalysis, p: Block, y: Block
     let Some(t) = func.layout.last_inst(y) else {
         return false;
     };
+    // `y` heads a loop that `p` is in (`p -> y` is a back edge) and two of
+    // `y`'s successors are inside it: `y` is a dispatch, not an exit test
+    // (`loop { match inst { .. } }`). With the copy the latch branches to
+    // both arms itself, and the cycle it closes is entered at each arm
+    // from `y`: two entries, no header. `looprot` has the same rule
+    // (`both_in`); without it here `Compiler::compile` of the dsa program
+    // went to waffle with two such edges and came back 305 KB of wasm
+    // instead of 48 (LLVM: 74), 86% of it copies on branch edges.
+    if let Some(lh) = la.is_loop_header(y)
+        && la.is_in_loop(p, lh)
+    {
+        let mut inside: Option<Block> = None;
+        for bc in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            let s = bc.block(&func.dfg.value_lists);
+            if s == y || !la.is_in_loop(s, lh) {
+                continue;
+            }
+            match inside {
+                None => inside = Some(s),
+                Some(x) if x != s => return true,
+                Some(_) => {}
+            }
+        }
+    }
     func.dfg.insts[t]
         .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
         .iter()
