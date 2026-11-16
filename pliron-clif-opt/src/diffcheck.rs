@@ -309,8 +309,14 @@ pub fn check(
                 let b1 = run(before, &world1, &nowrite_names, &self_name, cfg.fuel, true);
                 if underdetermined(&a, &b, &b1) {
                     sum.inconclusive += 1;
-                    sum.why.get_or_insert_with(|| {
-                        "before's output depends on uninit stack bytes or slot addresses".into()
+                    sum.why.get_or_insert_with(|| match &b1 {
+                        Outcome::Returned { .. } => {
+                            "before's output depends on uninit stack bytes or slot addresses".into()
+                        }
+                        o => format!(
+                            "before depends on uninit stack bytes or slot addresses (under the other stack fill: {})",
+                            describe(o)
+                        ),
                     });
                 } else {
                     return Err(Mismatch {
@@ -391,10 +397,28 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
         },
     ) = (b0, b1)
     else {
-        // The other fill traps where the first returned: the original's
-        // control flow depends on uninit bytes, so nothing here is pinned.
-        // An inconclusive rerun says nothing either way — keep the report.
-        return matches!(b1, Outcome::Trapped(_));
+        // The other fill does not return where the first did: the
+        // original's control flow, or the address of one of its accesses,
+        // depends on bytes of the frame it never wrote. Such a byte has
+        // no value the program determines (LLVM: a load of uninitialized
+        // `alloca` memory is `undef`; Rust: reading it is undefined
+        // behavior), so the run under the zero fill is one of many the
+        // original allows and nothing in it is pinned.
+        //
+        // That holds for a rerun that is inconclusive as much as for one
+        // that traps: the sandbox is deterministic and the two runs of
+        // the original differ in the fill and the slots' place alone, so
+        // whatever stopped the second (a `notrap` load through a pointer
+        // made of fill bytes, which the interpreter reports as a panic;
+        // fuel; an operation only the other path has) is a consequence of
+        // those bytes. Until 2026-11-16 only a trap counted, and an
+        // inconclusive rerun kept the report: two functions whose
+        // original copies an enum's never-written payload to the caller's
+        // memory (`FlattenCompat::next`: `self.frontiter = None`, a tag
+        // store and a 364-byte copy; aarch64 `emit`: a 48-byte one) and
+        // elsewhere tests a byte a stub left unfilled were reported for
+        // the stale bytes slotmerge put under that payload.
+        return !matches!(b1, Outcome::Returned { .. });
     };
     // The original's own shape moved with the fill: nothing to compare.
     if r0.len() != r1.len() || c0.len() != c1.len() {

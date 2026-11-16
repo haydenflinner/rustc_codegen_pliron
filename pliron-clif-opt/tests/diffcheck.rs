@@ -810,3 +810,85 @@ fn stub_finds_slots_behind_a_large_one() {
     assert!(check(&f(0), &konst, &Facts::default(), &cfg()).is_err(), "the stub did not fill ss1");
     assert!(check(&f(0), &f(1), &Facts::default(), &cfg()).is_err());
 }
+
+/// The original branches on a frame word it never wrote and copies
+/// another one to the caller's memory (an enum built by storing its tag,
+/// then copied whole: `self.frontiter = None`). Neither word has a value
+/// the program determines, so a rewrite may leave anything in the copied
+/// bytes (slotmerge puts the slot on storage with stale contents). The
+/// rerun under the other stack fill is how the checker finds such bytes;
+/// here it follows the branch the zero fill skipped and loads through a
+/// pointer made of fill bytes, which the interpreter reports as a panic
+/// (`op with notrap flag should not trap`), not a trap. That rerun used
+/// to "say nothing" and the report stood (`FlattenCompat::next` in the
+/// dsa corpus, aarch64 `emit` in clcg).
+#[test]
+fn rerun_that_does_not_return_pins_nothing() {
+    // `guard`: the test of the never-written word and the load behind it.
+    let orig = |guard: bool| {
+        parse(&format!(
+            "function %f(i64) {{
+            ss0 = explicit_slot 16
+        block0(v0: i64):
+            v1 = stack_addr.i64 ss0
+            v2 = load.i64 v1
+            v3 = load.i64 v1+8
+            {}
+        block1:
+            v4 = iconst.i64 255
+            v5 = band v2, v4
+            v6 = iconst.i64 36
+            v7 = ishl v5, v6
+            v8 = load.i64 notrap v7
+            jump block2
+        block2:
+            store v3, v0
+            v9 = iconst.i64 7
+            store v9, v0+8
+            return
+        }}",
+            if guard { "brif v2, block1, block2" } else { "jump block2" }
+        ))
+    };
+    // The rewritten function: other bytes where the never-written word
+    // went, and `seven` at the word the program does determine.
+    let after = |seven: u32| {
+        parse(&format!(
+            "function %f(i64) {{
+        block0(v0: i64):
+            v1 = iconst.i64 0x5555_5555_5555_5555
+            store v1, v0
+            v2 = iconst.i64 {seven}
+            store v2, v0+8
+            return
+        }}"
+        ))
+    };
+    let s = check(&orig(true), &after(7), &Facts::default(), &cfg()).unwrap_or_else(|m| panic!("{m}"));
+    // Not a comparison either: the trials are inconclusive, with the reason.
+    assert_eq!((s.compared, s.inconclusive), (0, 32));
+    assert!(s.why.as_deref().is_some_and(|w| w.contains("other stack fill")), "{:?}", s.why);
+    // Without the branch the rerun returns and says which bytes are
+    // pinned: the copied word still is not, the 7 is.
+    assert!(check(&orig(false), &after(7), &Facts::default(), &cfg()).is_ok());
+    let m = check(&orig(false), &after(8), &Facts::default(), &cfg()).unwrap_err();
+    assert!(m.to_string().contains("determined bytes differ"), "{m}");
+    // And a function with no never-written byte in it is compared in
+    // full, whatever its rewrite does.
+    let init = parse(
+        "function %f(i64) {
+            ss0 = explicit_slot 16
+        block0(v0: i64):
+            v1 = stack_addr.i64 ss0
+            v2 = iconst.i64 0
+            store v2, v1
+            store v2, v1+8
+            v3 = load.i64 v1+8
+            store v3, v0
+            v9 = iconst.i64 7
+            store v9, v0+8
+            return
+        }",
+    );
+    assert!(check(&init, &after(7), &Facts::default(), &cfg()).is_err());
+}
