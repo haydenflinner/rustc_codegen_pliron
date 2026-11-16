@@ -455,3 +455,89 @@ Last leads and housekeeping (08:50):
   lines, expect a relink of dependents: the backend path is part of the
   crate hash). The bugs they reproduce are fixed and have tests in the
   repo.
+
+## Architecture observations
+
+What the night's evidence says about the compiler as a whole, as
+opposed to the individual fixes. Each has the cases behind it.
+
+1. **Checking stops at CLIF, and that is where the bugs are not.** The
+   differential checker, the corpora and the verifier cover the CLIF
+   pipeline. The dsa module found six wrong-code or invalid-output
+   bugs in one night and none was a CLIF pass: an IR pass
+   (`memcpyopt` and lifetime markers), the wasm emitter (i128 `>=`),
+   two wasm peepholes (keep-on-stack, loop-entry forwarding), the
+   linker (constructors), and a CLIF pass whose output was valid CLIF
+   but wrong for the target (`slotprom`'s i64 addresses). Every one
+   was found by a whole program and a bisect. What would have caught
+   them mechanically:
+   - *IR passes:* lower the function before and after the IR pipeline
+     and run the existing CLIF interpreter diff on the pair. No new
+     interpreter; the lowering exists.
+   - *Emitter and wpeep:* run each emitted body in a wasm interpreter
+     on the diffcheck's inputs and compare with the CLIF result (waffle
+     ships an interpreter; `run_straight` in `src/wasm.rs` is the
+     straight-line start of one). Until then, validate every emitted
+     module in the gate, and keep table tests like `ops128` for each
+     hand-lowered family (floats are next: the sub-agent's
+     `repro-fmath` compares 120 float functions against an LLVM build
+     and could be a smoke leg).
+   - *Whole programs on wasm:* `harness/crates.py` is native only. A
+     wasm leg (the same crates' tests under node or wasmtime) would
+     have hit the i128 compare on the first crate that prints a u128.
+2. **Side information that passes must remember to maintain gets
+   stale.** Lifetime markers are consumed by `slotmerge` as kills, and
+   any pass that moves a write has to move them too; `memcpyopt` did
+   not, and `stale_markers`, the safety net, is defeated by a partial
+   write. The same shape: `wpeep`'s forwarding table with one aliasing
+   rule in line and a weaker one at loop entries. Where two pieces of
+   code must agree on a rule, make it one function; where a fact is
+   derived (liveness), prefer computing it from the accesses and using
+   the marker as an upper bound that is checked, not trusted.
+3. **Target facts live in constants scattered through passes.** `8`
+   as the word size in `sroa`'s fragment rule and `types::I64` as the
+   pointer type in `slotprom` were both wrong on wasm32, one a
+   performance loss and one an invalid module. A `Target` value
+   (pointer type, word size, what a call costs, "memory.copy is a
+   call") handed to the IR and CLIF passes, and a lint for `types::I64`
+   next to `stack_addr`/address arithmetic in non-test code, would
+   remove the class.
+4. **Pass order hides constants.** The inliner binds a callee's
+   parameters through block arguments that only `phisimp` removes, so
+   every pass between them sees `gep(table, param)` where the argument
+   is a constant (`constcopy` and blake3; the bounds checks that then
+   survive). Either substitute constant arguments at inline time or
+   run the cheap canonicalisation (phisimp, constant folding)
+   immediately after inlining and before anything that pattern-matches.
+5. **The cost model for wasm is V8's, and it is not instruction
+   count.** Measured tonight: `memory.copy` of any size is a C++ call
+   (one per interpreter step was a 50% slowdown); an immutable
+   `global.get` costs nothing against `i32.const`; a function-level
+   profile cannot show either. `harness/dsa/hot.sh` (ticks per machine
+   instruction of one function, with V8's runtime calls named) is the
+   tool that showed it and is now in the repo, with `cmpprof.py` to
+   join two profiles by function. Earlier findings of the same kind
+   are in "Findings worth keeping": V8's inlining budget depends on
+   the module's share of small functions; a move-only branch arm is
+   free and an arm with one instruction is a block and a jump.
+6. **`return` through a temporary is the shape rustc emits, so its
+   removal has to be complete.** `tmp = value; memcpy(sret, tmp)`
+   appears at every `return` of an aggregate. One conservative test in
+   `memcpyopt` (dominators instead of paths) left all of them in any
+   function with more than one return site. Worth a census on a real
+   module: how many `memcpy(sret, alloca)` survive, and why.
+7. **Inlining on wasm has no notion of a body that dies.** A flat
+   512-op limit, no single-caller rule, no growth budget: 35,000
+   functions and 49 MB against 19,544 and 18 MB, with the difference
+   in the 1-10 KB range (three times as many functions, three times
+   the bytes). The single-caller rule fixes the function count and
+   speeds the pages up, and slows two kernels by putting a hot loop in
+   one function with its set-up code. Splitting cold set-up out of a
+   function (or not inlining *into* a function whose hot loop it does
+   not feed) is the missing half; a caller-size cap is not (it cost
+   speed everywhere for 10% of size).
+8. **Benchmarks need their own checks.** `hash_text` swings 1.0 to 1.3
+   in the interleaved table and is at parity run alone; the CRDT rows
+   compare our once-run constructors with lld's rerun-on-every-call
+   wrappers. A row that is mostly JS, or mostly a toolchain artifact,
+   should say so in the harness output.
