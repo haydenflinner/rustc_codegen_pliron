@@ -344,7 +344,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   single forwarded load inside it).
 - **Did a wasm peephole change behaviour?** `node
   harness/wasm/peepdiff.mjs <dir>` on a `PLIRON_WASM_MODDUMP=<dir>` dump
-  (wipe the directory first) calls every function body before and after
+  (a new directory per build) calls every function body before and after
   `wpeep` in V8 with the same seeded arguments on the same seeded
   memory and lists the bodies that differ: import calls (callee,
   arguments, visible memory), results, traps, memory at return. A wrong

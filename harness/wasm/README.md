@@ -11,15 +11,19 @@ peepholes in V8 on the same inputs and reports the bodies that behave
 differently.
 
     # any wasm build, with the dump knob
-    PLIRON_WASM_MODDUMP=/tmp/md harness/v8/variant.sh x      # bench + std
+    harness/v8/variant.sh x PLIRON_WASM_MODDUMP=/tmp/md      # bench + std, 30 s
     PLIRON_WASM_MODDUMP=/tmp/md harness/dsa/build.sh pliron x
     node harness/wasm/peepdiff.mjs /tmp/md
 
 `PLIRON_WASM_MODDUMP=<dir>` writes `<name>.pre.wasm` and
-`<name>.post.wasm` for every object the backend emits (wipe the directory
-between builds: file names carry the crate hash, stale pairs stay).
-Node only, no npm packages. `tests/wasm/smoke.sh` runs it on the three
-smoke objects, so `wasm_smoke` (gate, quick) fails on a difference.
+`<name>.post.wasm` for every object the backend emits. Give every build
+a new directory: file names carry the crate hash, so stale pairs of an
+earlier build stay, and the directory name is part of the keyed backend
+path (`harness/backend_path.py`), so a new name recompiles everything
+while a wiped old one compiles nothing in a kept target dir
+(`harness/dsa/build.sh` without `DSA_WIPE=1`) and stays empty.
+Node only, no npm packages. `tests/wasm/smoke.sh` runs it on the smoke
+objects, so `wasm_smoke` (gate, quick) fails on a difference.
 
 | option | |
 |---|---|
