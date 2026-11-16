@@ -32,13 +32,18 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
 
 /// Identity of an associative+commutative integer op.
 fn accop(op: Opcode, t: Type) -> Option<i64> {
-    let bits = t.bits() as i64;
+    let bits = t.bits();
     Some(match op {
         Opcode::Iadd | Opcode::Bor | Opcode::Bxor | Opcode::Umax => 0,
         Opcode::Imul => 1,
         Opcode::Band | Opcode::Umin => -1,
-        Opcode::Smin => (1i64 << (bits - 1)) - 1,
-        Opcode::Smax => -1i64 << (bits - 1),
+        // The signed extremes of the type. `(1 << (bits - 1)) - 1`
+        // overflowed for i64 (a debug-profile backend panicked on
+        // literate-eval's `min` recursion), and a 128-bit extreme does
+        // not fit the `iconst` the identity is emitted as.
+        Opcode::Smin | Opcode::Smax if !(8..=64).contains(&bits) => return None,
+        Opcode::Smin => i64::MAX >> (64 - bits),
+        Opcode::Smax => i64::MIN >> (64 - bits),
         _ => return None,
     })
 }
@@ -271,4 +276,24 @@ pub fn run(func: &mut Function, id: FuncId) -> usize {
     func.layout.remove_inst(bi);
     func.layout.remove_inst(ri);
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The identities of signed min/max are the type's extremes, for
+    /// every width `iconst` can hold. `(1 << 63) - 1` used to overflow
+    /// (a panic in a backend built with overflow checks).
+    #[test]
+    fn signed_extreme_identities() {
+        assert_eq!(accop(Opcode::Smin, types::I64), Some(i64::MAX));
+        assert_eq!(accop(Opcode::Smax, types::I64), Some(i64::MIN));
+        assert_eq!(accop(Opcode::Smin, types::I32), Some(i32::MAX as i64));
+        assert_eq!(accop(Opcode::Smax, types::I32), Some(i32::MIN as i64));
+        assert_eq!(accop(Opcode::Smin, types::I8), Some(127));
+        assert_eq!(accop(Opcode::Smax, types::I8), Some(-128));
+        assert_eq!(accop(Opcode::Smin, types::I128), None);
+        assert_eq!(accop(Opcode::Smax, types::I128), None);
+    }
 }
