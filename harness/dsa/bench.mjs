@@ -15,6 +15,7 @@
 //   --target-ms=N   one timed call is `iters` workload calls, ~N ms (150)
 //   --json=FILE     also write the table as JSON
 //   --list          print the workloads and exit
+//   --no-probe      skip the self-checks (below)
 //   --side=TAG --loop=N   profile mode: load only that side (llvm, pliron,
 //                   extra), warm up, then run each selected workload N
 //                   times. Use under `node --cpu-prof` (harness/dsa/prof.sh).
@@ -32,6 +33,15 @@
 // miscompile on one side (or nondeterminism in the workload — the
 // workloads here pin peer ids, seeds and inputs, and LLVM agrees with
 // itself across runs).
+//
+// Self-checks: a second, instrumented instance of each side counts the
+// entries from JS into the module and the time spent inside it, and a
+// no-op export is timed on its own. A row gets a note when more than 30%
+// of a call is outside the module (`hash_text` is 62% JS string copies and
+// swings with the interleaving), or when the export wrappers themselves
+// are 5% or more of a call on some side (the CRDT rows: rust-lld's
+// `command_export` wrappers rerun the static constructors on every
+// entry). A second geomean leaves the noted rows out.
 //
 // Workloads whose cargo feature is missing from either package
 // (`capabilities()`) are skipped and named.
@@ -53,17 +63,38 @@ const BASE = process.env.DSA_BENCH ?? "/tmp/dsa-bench";
 
 // ---------------------------------------------------------------- loading
 let generation = 0;
-async function load(tag, dir) {
+// With `stat`, the instance's exports are wrapped: `stat.calls` counts
+// every entry from JS into the module (allocator calls of the glue
+// included) and `stat.inside` is the time between an outermost entry and
+// its return. Such an instance is for the self-checks only, never timed.
+async function load(tag, dir, stat = null) {
   dir = resolve(dir);
   const wasm = readFileSync(join(dir, "literate_wasm_bg.wasm"));
   const t0 = performance.now();
+  const instantiate = WebAssembly.instantiate;
+  if (stat) {
+    WebAssembly.instantiate = async (bytes, imports) => {
+      const r = await instantiate(bytes, imports);
+      const real = (r.instance ?? r).exports;
+      const wrapped = {};
+      for (const [k, v] of Object.entries(real)) {
+        wrapped[k] = typeof v !== "function" ? v : function (...a) {
+          stat.calls++;
+          if (stat.depth++ === 0) stat.t0 = performance.now();
+          try { return v.apply(this, a); } finally { if (--stat.depth === 0) stat.inside += performance.now() - stat.t0; }
+        };
+      }
+      stat.real = real;
+      return { instance: { exports: wrapped }, module: r.module };
+    };
+  }
   // The query string keeps two packages with the same glue apart in the
   // ESM cache even if the dirs are symlinks to one another.
   // A new generation is a new instance: a side is reloaded after a trap,
   // because a Rust panic or a stack overflow leaves the old instance's
   // shadow stack and borrow flags in an unknown state.
   const m = await import(pathToFileURL(join(dir, "literate_wasm.js")).href + `?side=${tag}&gen=${generation++}`);
-  await m.default({ module_or_path: wasm });
+  try { await m.default({ module_or_path: wasm }); } finally { WebAssembly.instantiate = instantiate; }
   let info = "";
   try { info = readFileSync(join(dir, "BUILDINFO"), "utf8"); } catch {}
   return { tag, dir, m, bytes: wasm.length, initMs: performance.now() - t0, caps: new Set(m.capabilities()), info };
@@ -381,6 +412,49 @@ if (new Set(sides.map((s) => s.m.buildStamp())).size > 1) {
   console.log("note: source stamps differ. The stamp is dsa HEAD + a hash of `git status --porcelain`, so a new untracked file between the two builds changes it too; compare the HEAD part.");
 }
 console.log(`rounds ${ROUNDS}, target ${TARGET_MS} ms per timed call, node ${process.version}`);
+
+// ---- self-checks (`--no-probe` skips them)
+// A second, instrumented instance of every side says what a row measures:
+// how much of a call is spent inside the module at all, and how many
+// times JS enters it. The entry cost is a no-op export timed on its own:
+// rust-lld wraps every export of a cdylib in a `command_export` function
+// that reruns the static constructors, so a row that enters the module
+// thousands of times mostly times those wrappers.
+const PROBE = !flag("no-probe");
+const probes = [];
+if (PROBE) {
+  for (const s of sides) {
+    const stat = { calls: 0, inside: 0, depth: 0, t0: 0, real: null };
+    const side = await load(s.tag, s.dir, stat);
+    const free = Object.entries(stat.real).find(([k]) => /^__wbindgen_free/.test(k))?.[1];
+    let entryNs = null;
+    if (free) {
+      // `free(ptr, 0, align)` returns at once.
+      const N = 200000;
+      for (let i = 0; i < 20000; i++) free(0, 0, 1);
+      entryNs = Infinity;
+      for (let rep = 0; rep < 5; rep++) {
+        const t0 = performance.now();
+        for (let i = 0; i < N; i++) free(0, 0, 1);
+        entryNs = Math.min(entryNs, (performance.now() - t0) * 1e6 / N);
+      }
+    }
+    probes.push({ side, stat, entryNs });
+  }
+  console.log(`entry cost per export call (a no-op export): ${probes.map((p) => `${p.side.tag} ${p.entryNs == null ? "?" : p.entryNs.toFixed(0)} ns`).join(", ")}`);
+}
+// One workload on the instrumented instance: entries per call, the share
+// of the call spent inside the module, and the entry cost as a share.
+function probe(k, name) {
+  const { side, stat, entryNs } = probes[k];
+  const r = runner(side, name);
+  r.call(2);
+  stat.calls = 0; stat.inside = 0;
+  const N = 2;
+  const ms = r.call(N);
+  return { calls: stat.calls / N, wasm: Math.min(1, stat.inside / ms), entry: entryNs == null ? 0 : stat.calls * entryNs / 1e6 / ms };
+}
+const noted = new Set();
 console.log("");
 const others = sides.slice(1);
 console.log(`${"workload".padEnd(16)} ${"iters".padStart(5)} ${"llvm ms".padStart(9)}` +
@@ -466,6 +540,24 @@ for (const name of names) {
     row.sides[s.tag] = { ms: median(ts[k + 1]), ratio: r, min: Math.min(...rr[k]), max: Math.max(...rr[k]), best, best_ms: Math.min(...ts[k + 1]) };
     line += ` ${fmt(median(ts[k + 1]))} ${r.toFixed(3).padStart(6)} ${`${Math.min(...rr[k]).toFixed(2)}..${Math.max(...rr[k]).toFixed(2)}`.padStart(12)} ${best.toFixed(3).padStart(6)}`;
   });
+  if (PROBE) {
+    try {
+      const ps = sides.map((_, k) => probe(k, name));
+      row.probe = Object.fromEntries(ps.map((p, k) => [sides[k].tag, p]));
+      const notes = [];
+      const wasm = Math.max(...ps.map((p) => p.wasm));
+      if (wasm < 0.7) notes.push(`${((1 - wasm) * 100).toFixed(0)}% of a call is JS`);
+      const ent = ps.map((p, k) => [sides[k].tag, p.entry]).filter(([, e]) => e >= 0.05);
+      if (ent.length) notes.push(`${ps[0].calls.toFixed(0)} entries/call, entry cost ${ent.map(([t, e]) => `${t} ${(e * 100).toFixed(0)}%`).join(" ")}`);
+      if (notes.length) { line += `  [${notes.join("; ")}]`; row.notes = notes; noted.add(name); }
+    } catch (e) {
+      line += `  [probe failed: ${describe(e)}]`;
+      for (let k = 0; k < probes.length; k++) {
+        const stat = { calls: 0, inside: 0, depth: 0, t0: 0, real: null };
+        probes[k] = { side: await load(sides[k].tag, sides[k].dir, stat), stat, entryNs: probes[k].entryNs };
+      }
+    }
+  }
   console.log(line);
   if (mism) {
     const msg = `MISMATCH ${name} call ${mism.i}: llvm=${JSON.stringify(String(mism.llvm).slice(0, 200))} ${mism.side}=${JSON.stringify(String(mism.other).slice(0, 200))}`;
@@ -480,6 +572,13 @@ console.log("");
 others.forEach((s, k) => {
   if (ratios[k].length) console.log(`geomean ${s.tag}/llvm = ${geomean(ratios[k]).toFixed(3)} by median round ratio, ${geomean(bests[k]).toFixed(3)} by best round (${ratios[k].length} workloads with equal results; <1 means ${s.tag} is faster)`);
 });
+if (noted.size) {
+  others.forEach((s, k) => {
+    const keep = table.filter((r) => r.sides?.[s.tag] && !r.mismatch && !noted.has(r.name)).map((r) => r.sides[s.tag].ratio);
+    if (keep.length) console.log(`geomean ${s.tag}/llvm = ${geomean(keep).toFixed(3)} over the ${keep.length} rows without a note`);
+  });
+  console.log("notes: a row marked JS spends that share of each call outside the module (glue, string copies), which no backend changes; an entry-cost share is time in the export wrappers themselves (measured on a no-op export, times the entries per call).");
+}
 console.log(problems.length ? `\n${problems.length} problem(s):\n${problems.map((p) => `  ${p}`).join("\n")}` : "results: every workload returned the same value on every side");
 if (opt("json", null)) {
   const { writeFileSync } = await import("node:fs");
