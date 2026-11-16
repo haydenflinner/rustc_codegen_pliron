@@ -434,9 +434,15 @@ time, memory, code size, stack frames) in ~20 min and writes
   (`docs/history/2026-11-16-wasm-night.md`, "Afternoon"):
   `PLIRON_INLINE_ONCE=2` (wasm: the single-caller bonus for loop-free
   callees only; `=1` moves loops into their callers and costs hmget,
-  tokenize and sieve), `PLIRON_INLINE_RECX=1` (a site cloned out of an
-  inlined body does not inline a member of a call-graph cycle its
-  clone chain already entered: derived `Clone` of a recursive AST),
+  tokenize and sieve; `=3` allows one loop-carrying callee into a
+  loop-free caller, keeps tokenize and sieve, loses hmget, and **its
+  dsa build corrupts the heap, not yet found**;
+  `PLIRON_INLINE_ONCE_WASM` is the same knob read on wasm only),
+  `PLIRON_INLINE_RECX=1` (a site cloned out of an inlined body does not
+  inline a member of a call-graph cycle its clone chain already
+  entered: derived `Clone` of a recursive AST; **on by default for
+  wasm** as `PLIRON_INLINE_RECX_WASM`, `PLIRON_INLINE_RECX=0` turns it
+  off, test stanza `inlinerecx`),
   `PLIRON_LICM_SLOTPROV=1` (a stack slot indexed by a loop counter is
   still an object of its own for licm's clobber test,
   `pliron-clif-opt/src/slotprov.rs`), `PLIRON_PHISIMP_EARLY=1` (phisimp

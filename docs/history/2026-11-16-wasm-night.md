@@ -719,19 +719,84 @@ LLVM): hmget +5.0% to +18.8%, tokenize -15.2% to +3.1%, sieve -2.7% to
 - **sieve.** `sieve::sieve` takes `Vec::from_elem` (1,586 to 1,891 wasm
   instructions); 1.6 points, not looked at further.
 
-### Keeping the pages gain: `PLIRON_INLINE_ONCE=2` (`fe28de4`, opt-in)
+### Keeping the pages gain: three modes, measured on a quiet machine
 
-All three losses are a callee *with a loop* moved into its caller before
-the CLIF pipeline. `=2` gives the single-caller bonus to loop-free
-callees only. Kernels: geomean 0.920 against 0.920, hmget, tokenize and
-sieve unchanged. dsa (same LLVM package on both sides of the comparison,
-9 rounds): compile_page 1.026 to 1.011, checks_page 1.011 to 1.002,
-live_page 1.021 to 1.017, game_tetris 0.744 to 0.698, vm_fib_rec 0.984
-to 0.967, the other rows within a point; module 49.81 MB to 48.97 MB;
-all 19 results equal. (The build needed a fix first: `webmerge` wrote a
-key's i64 offset sum into an `iconst.i32` unmasked and the verifier
-rejected `SpecFromIterNested::from_iter` in mimas-vm, `6d4a4d1`.)
-Not flipped: one dsa run on a loaded machine is not enough for a default.
+All three kernel losses are a callee *with a loop* moved into its caller
+before the CLIF pipeline, so two restricted modes exist (both opt-in):
+`=2` gives the single-caller bonus to loop-free callees only (`fe28de4`),
+`=3` also to a callee with a loop when its caller has no loop and has
+taken no such callee yet (`126ec04`).
+
+dsa, each column against the same LLVM package (`pkg-llvm-eval2`, the
+same dsa HEAD as ours), 9 rounds, machine at load 3; the geomean is over
+the 14 like-for-like rows (vm, pages, asteroids). `rx` is the recursion
+rule of the last section, which is what the default is now:
+
+| | default | `=2` + rx | `=1` | `=3` + rx |
+|---|---|---|---|---|
+| vm_loop | 1.082 | 1.068 | 1.040 | 1.051 |
+| vm_collections | 0.959 | 0.946 | 0.881 | 0.886 |
+| vm_strings | 1.077 | 1.025 | 0.975 | 0.969 |
+| compile_page | 1.023 | 1.018 | 0.990 | panics |
+| checks_page | 1.025 | 1.007 | 0.980 | panics |
+| live_page | 1.020 | 1.010 | 0.988 | panics |
+| dims_page | 1.240 | 1.231 | 1.200 | panics |
+| game_asteroids | 1.412 | 1.384 | 1.364 | panics |
+| geomean, 14 rows | 1.063 | 1.056 | 1.025 | (0.993 on the 9 vm rows) |
+| module, MB | 49.81 | 44.40 | 49.57 | 43.47 |
+
+So the full bonus is worth 3.6% on this program and `=2` keeps about a
+fifth of it. The earlier reading ("pages 2-3%") came from a loaded
+machine and undersold it.
+
+Wasm kernels against LLVM, same quiet machine:
+
+| | default | `=1` | `=3` |
+|---|---|---|---|
+| hmget | +5.6% | +18.8% | +19.0% |
+| tokenize | -14.2% | +3.1% | -14.1% |
+| sieve | +0.7% | (+1.6 pts) | -0.4% |
+| hashmap | +2.5% | +0.5% | +0.3% |
+| sortw | +4.6% | | +1.4% |
+| geomean, 16 | 0.930 | 0.955 | 0.938 |
+
+`=2` leaves every kernel where it is (0.920 against 0.920, measured
+earlier). `=3` protects tokenize and sieve and still loses hmget. The
+inliner's trace says why: the hot closure stays out of line and is
+optimized alone (the waffle inliner merges it afterwards), but
+`hmget::setup` now moves into `k_hmget`, which has no loop of its own.
+There the map is a local whose address goes to calls
+(`reserve_rehash`), where in `setup` it was the `noalias` out
+parameter, and the insert loop reloads its header. With
+`PLIRON_LICM_NCC=1 PLIRON_LICM_SLOTPROV=1 PLIRON_SCOPED_NOALIAS=1` on
+top hmget is +11.7%, the same residue as under `=1`. The root is one
+thing in both modes: **a local that escapes only to calls is treated
+worse than a `noalias` parameter**, and single-caller inlining turns the
+second into the first. That is the work item, not another inliner mode.
+
+**`=3` + rx miscompiles the dsa module**: every page and game workload
+dies in dlmalloc's `assertion failed: psize <= size + max_overhead`
+(heap corruption); the vm rows pass. `=1`, `=2` + rx, rx alone and the
+default all return LLVM's results on all 19 workloads, so the new
+inlining decisions expose a bug that is latent in the others. A
+sub-agent is bisecting it. Until it is found **no single-caller mode is
+turned on for wasm**: `=2` is validated by the same 19 workloads that
+`=3` fails, which is not enough once a neighbouring configuration is
+known to corrupt the heap.
+
+(The first dsa build under `=2` needed a fix: `webmerge` wrote a key's
+i64 offset sum into an `iconst.i32` unmasked and the verifier rejected
+`SpecFromIterNested::from_iter` in mimas-vm, `6d4a4d1`.)
+
+The other opt-in knobs on the same quiet run, 14-row geomean against
+the default's 1.063: `PLIRON_LICM_SLOTPROV` 1.059,
+`PLIRON_MEMCPYOPT_MOVEMARK` 1.062, `PLIRON_WASM_SMALLCOPY` 1.061
+(vm_mandelbrot and vm_physics two points better, the rest equal). All
+19 results equal in each. None is worth a default on these numbers.
+
+`hash_text` reads 1.18 for whichever module is loaded third and 0.99
+for the second; alone each module takes 107 ms. It is a position
+artifact of the harness on a row that is 63% JS.
 
 ### The benchmark's own checks (item 8, `658b519`)
 
@@ -796,7 +861,7 @@ Block coverage is 27% on dsa, so a clean run is not a proof.
   and 6).
 - A source lint against literal `types::I64` addresses in CLIF passes,
   and emitter asserts for `func_addr`/`symbol_value` (item 3, `2371f52`).
-- `PLIRON_INLINE_RECX=1` (opt-in, in progress): see the next section.
+- `PLIRON_INLINE_RECX`: see the next section; on by default for wasm.
 
 ### The size outliers
 
@@ -814,4 +879,35 @@ its cost counts 25 per call, so a clone with a dozen calls is over the
 225 threshold. `PLIRON_INLINE_RECX=1`: a site cloned out of an inlined
 body may not inline a member of a cycle its chain has already entered.
 The kernel module is byte-identical with it on.
+
+On dsa (`5564e82`, test stanza `inlinerecx`): module 49.81 to 45.15 MB,
+code bytes 40.1 to 35.5 MB, 35,766 to 35,550 functions.
+`Matrix::defaulted` 192,843 to 1,597 bytes, `fold_mimas_call` 136,536
+to 7,485, `check_call_wheres` 122,306 to 4,341, `Diff::compose_ref`
+71,028 to 2,674. All 19 workloads equal; the 14 like-for-like rows
+1.063 to 1.061. **On by default for wasm** as
+`PLIRON_INLINE_RECX_WASM` (`bbd0cc5`); native is unchanged and
+unmeasured. What is left at the top: `Compiler::compile` 305 KB (LLVM
+74 KB), `Search::go_explore` 276 KB, `MovableListState` 110 KB: single
+large functions, not this pattern.
+
+### Things that went wrong in the process
+
+- A benchmark chain ran while a dsa build and the gate were running:
+  ratios of 0.26 to 6.69 inside one row. Every dsa number above is from
+  a rerun with nothing else of mine running. Benchmarks and builds do
+  not share this machine.
+- I edited `test.sh` while the gate was running it; bash reads a script
+  as it executes, and six stanzas failed with "command not found" on
+  half-read lines. The rerun was green.
+- The disk filled (thirty 0.8 GB dsa trees, four agent worktrees with
+  their own `target/`): a build died with "No space left on device",
+  which rustc reports as "the compiler unexpectedly panicked". 41 GB
+  freed by deleting finished configurations' trees and the finished
+  worktrees' `target/`.
+- `gate.py --full` replays the whole dsa corpus and reports two
+  functions: the `memcpyopt` marker miscompile fixed at 06:18, in a
+  corpus recorded at 04:45 (the sub-agent's finding,
+  `docs/history/2026-11-16-diffcheck-five.md`). The corpus is being
+  re-recorded.
 
