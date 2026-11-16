@@ -35,6 +35,24 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
+    // test; native was not timed). 2026-11-16, `--layouts=3` against
+    // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
+    // +1.3%, module 183229 -> 180241 B
+    // (docs/history/2026-11-16-wasm-night.md).
+    // `assume(i < CONST)` as an `llvm.assume` marker that `lower.rs`
+    // turns into a branch to the unreachable trap.
+    "PLIRON_ASSUME_RANGE",
+    // `vrp0` + `unreach0` ahead of jumpthread fold what such an edge
+    // implies and drop it.
+    "PLIRON_UNREACH_EARLY",
+    // Edges that decide a test toward the unreachable trap are dropped
+    // with their guard (`unwrap_unchecked` on a branchy `Option<&T>`).
+    "PLIRON_UNREACH_PHI",
+    // Full unroll of fixed-array pointer loops (`p == arr + N*size`).
+    "PLIRON_UNROLL_SYM",
+    // `binary_search` over a constant-length table as a select chain.
+    "PLIRON_HALFUNROLL",
     // Fold branches a dominating check decides before LICM looks for
     // escapes (regex's `follow_epsilons`: `assert!(len < cap)` then
     // `Vec::push`'s dead grow call, which took the set). Exact counts:

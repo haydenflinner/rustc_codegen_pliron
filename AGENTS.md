@@ -431,6 +431,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   jump (aarch64), `loopvec`'s short-trip dispatch, the zigzag select
   fold, and the dominated-branch fold ahead of LICM
   (`docs/history/2026-11-13-six-features.md`, "Fifth item").
+- 2026-11-16 wasm round (`docs/history/2026-11-16-wasm-night.md`),
+  each default on and wasm only (native was not timed):
+  `PLIRON_ASSUME_RANGE=0` (`assume(i < CONST)` as an `llvm.assume`
+  marker op that `lower.rs` turns into a branch to the unreachable
+  trap), `PLIRON_UNREACH_EARLY=0` (`vrp0` + `unreach0` first in the
+  pipeline: fold what an assume edge implies, then drop it),
+  `PLIRON_UNREACH_PHI=0` (edges that decide a test toward the
+  unreachable trap go with their guard: `unwrap_unchecked` on a
+  branchy `Option<&T>`), `PLIRON_UNROLL_SYM=0` (full unroll of
+  fixed-array pointer loops), `PLIRON_HALFUNROLL=0` (constant-length
+  `binary_search` as a select chain).
 - `PLIRON_FASTCC=0` — off switch for per-callee clobber sets (aarch64
   ELF/Mach-O, default on): a direct call to a function compiled in the
   same object destroys only the registers that function's code writes
