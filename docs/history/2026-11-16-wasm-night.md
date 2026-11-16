@@ -774,6 +774,17 @@ thing in both modes: **a local that escapes only to calls is treated
 worse than a `noalias` parameter**, and single-caller inlining turns the
 second into the first. That is the work item, not another inliner mode.
 
+What the residue is not (V8 profile, `harness/v8/cpuprof.sh` and
+`hotw.sh`, `=1` with NCC and SLOTPROV): all of the kernel's time is the
+lookup loop in both builds (`repeat::<closure>` by default, `k_hmget`
+when merged; the map's set-up is outside the timed region, so the
+`setup` explanation above accounts for the CLIF difference but not for
+the time), the merged function takes 6.6% more samples, and the ticks
+sit on the same three table loads. With the loop's CLIF identical, what
+differs is produced after CLIF, for a loop that shares a wasm function
+with 650 instructions of set-up code that has calls. The TurboFan
+listings (`mcode.sh`) were not compared.
+
 **`=3` + rx miscompiles the dsa module**: every page and game workload
 dies in dlmalloc's `assertion failed: psize <= size + max_overhead`
 (heap corruption); the vm rows pass. `=1`, `=2` + rx, rx alone and the
