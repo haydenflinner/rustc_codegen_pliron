@@ -258,3 +258,112 @@ Both bugs sit in the two places the 05:20 note called uncovered: a
 pliron-IR pass and the CLIF-to-wasm emitter. Neither has a
 differential check. See "Architecture" in the summary for what I
 would build.
+
+## dsa, performance (07:30)
+
+The module runs, so there is a benchmark. `harness/dsa/bench.mjs`,
+features `eval,squish,cad`, node 26, ratio = pliron/LLVM, median of 9
+interleaved rounds. "05:56" is the first table (snapshot 6 with
+`PLIRON_SLOTMERGE_MARK=0` to dodge the memcpyopt bug); "now" is main at
+`f13cb0d`.
+
+| workload | 05:56 | now | |
+|---|---|---|---|
+| vm_loop | 1.56 | 1.03 | |
+| vm_fib_rec | 1.25 | 0.97 | |
+| vm_mandelbrot | 1.54 | 1.07 | |
+| vm_physics | 1.49 | 0.97 | |
+| vm_sieve | 1.42 | 1.02 | |
+| vm_collections | 1.18 | 0.97 | |
+| vm_strings | 1.21 | 1.05 | |
+| vm_match | 1.22 | 1.03 | |
+| vm_closures | 1.29 | 1.04 | |
+| hash_text | 1.18 | 0.99..1.17 | bimodal between links of the same code |
+| compile_page | failed | 1.05 | |
+| checks_page | failed | 1.04 | |
+| live_page | failed | 1.04 | |
+| dims_page | wrong result | 1.24 | flat profile: allocator, `Ty::clone`, lexer |
+| game_tetris | failed | 0.79 | |
+| game_asteroids | failed | 1.44, **wrong result** | open, see below |
+| crdt_edits | panic | 0.49 | not like for like, see below |
+| crdt_sync | error | 0.51 | same |
+| ink_strokes | panic | 0.37 | same |
+
+The nine interpreter rows and hash_text: geomean 1.32 at 05:56, 1.02
+now. The three CRDT rows flatter us: rust-lld wraps every export of the
+LLVM module so that all static constructors run again on every call
+(35% of `crdt_edits` there is `__wasm_call_ctors` and
+`inventory::Registry::submit`); our linker now runs them once.
+
+What moved it:
+
+1. **`PLIRON_MEMCPYOPT_PATHWIN`** (`f9e1608`, default on in `f13cb0d`).
+   The interpreter's `step_one` returns a 160-byte `RtResult<Flow>`.
+   rustc emits `tmp = Flow::Next; memcpy(sret, tmp, 160)` at every
+   `return`; `memcpyopt` forwards that into the `sret` slot, but its
+   "nothing touches dst between the writer and the copy" test was
+   dominators only, so every other return site's copy counted as
+   "between" and every site was refused. Each interpreter step then
+   executed a 160-byte `memory.copy`, which V8 runs as a call into C++
+   (`wasm::memory_copy`: 17.5% of `step_one`'s own ticks at the call
+   instruction, plus the callee). LLVM writes one word. Found with
+   ticks per machine instruction of V8's TurboFan code for the one
+   function, which is the only view that showed it: the function-level
+   profile said "step_one is 2.2x slower" and the wasm text showed 17
+   `memory.copy` in 14,000 instructions.
+2. **`PLIRON_CONSTCOPY2`** (`bf4bba6`): blake3 on wasm32 kept 112
+   bounds checks and table loads per block that LLVM folds
+   (`compress_in_place` 5088 instructions against 2106). The pass that
+   folds copies of constant tables ran before phisimp turned the
+   inlined `round` argument into a constant; sroa hides that on native
+   by splitting the row copy into word loads, and
+   `PLIRON_SROA_FRAGCOPY` keeps 4-byte pieces whole. *Iffy:* that
+   FRAGCOPY rule counts "words" as 8 bytes on every target; on wasm32
+   a `[usize; 16]` is sixteen sub-word pieces to it. I reran the
+   constant-copy pass instead of touching the rule. Worth a look.
+3. **`PLIRON_WASM_SMALLCOPY`** (`03668fd`): 670 `memory.copy` of at
+   most 16 constant bytes in the module (359 of zero bytes: BTree
+   nodes of zero-sized values) become 39. No measured effect on these
+   workloads; kept because each one is a C++ call when it runs.
+4. **Static constructors** (`30ff21b`, by a sub-agent in a worktree,
+   reviewed and cherry-picked): `pliron-wasm-ld` built
+   `__wasm_call_ctors` and nothing called it in a `--no-entry` link, so
+   `inventory::submit!` registered nothing and every page that converts
+   units failed to compile ("invalid evaluation"). Exports are now
+   wrapped to run constructors once, by priority. *Deliberately not
+   lld's behaviour:* lld calls them on every export call. Also not done:
+   `__wasm_call_dtors` is never called; the once-guard is a plain
+   load/store (two threads entering at once could both run them).
+
+Tried and not kept:
+
+- `PLIRON_INLINE_CALLER_MAX=4000` (default 20000): module 50.3 -> 44.9
+  MB, but vm_physics 0.99 -> 1.24, vm_match 1.01 -> 1.09, hash_text
+  1.00 -> 1.32. A caller size cap is the wrong lever for the size gap.
+- Folding every GOT `global.get` to `i32.const` in the linker (2404
+  globals -> 1, +0.18% size): no change outside noise. V8 handles an
+  immutable global as well as a constant here.
+
+Still open:
+
+- **`game_asteroids` returns a different result** (and is 1.44x). The
+  only difference is in the `squish` soft bodies (rapier2d): f32
+  coordinates off in the last bits from the first frame, drifting from
+  there. It is there without tonight's knobs. 70 std float operations
+  and 50 `libm` functions were checked bit for bit against the LLVM
+  build (`/tmp/dsa-bench/repro-fmath`) and agree, so it is not a scalar
+  primitive; notes in `/tmp/dsa-bench/findings/asteroids.md`.
+- **Code size: 50.3 MB against LLVM's 18.4 MB.** Not improved tonight.
+- `dims_page` 1.24x: diffuse.
+- The default feature set (polars, typst, vortex) was never built with
+  pliron: 5-7 GB per rustc.
+- `PLIRON_WASM_ADDROFF=1` (opt-in, used by nothing) miscompiles a store
+  in the new constructor smoke test: it folds a `+3` on the stored
+  *value* into the address offset. Found by the sub-agent, not fixed.
+- No fuzz sweep on any of tonight's default flips: this machine has no
+  rustlantis generator (`harness/run.py --suite fuzz` runs zero
+  tests). Gate and `harness/crates.py --tier 1` (20 crates) are clean.
+- `harness/dsa/workloads/` is untracked on purpose: the page sources
+  are copies from the dsa repository and this fork is public.
+- Four `host/rustc-ice-2026-11-16T09_*.txt` files appeared in
+  `~/code/dsa` (a command replayed without `RUSTC_ICE`). Not touched.
