@@ -4552,6 +4552,18 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_vrp2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !p.wasm {
+        return 0;
+    }
+    let k = crate::vrp::run(&mut p.clctx.func, an);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("vrp2");
+    }
+    k
+}
+
 fn s_vrp0(p: &mut Pipe, an: &mut Analysis) -> usize {
     if !p.wasm || !unreach::has_assume_edge(&p.clctx.func) {
         return 0;
@@ -4634,6 +4646,10 @@ fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_revcmp(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    // Wasm only: native was not timed.
+    if !p.wasm {
+        return 0;
+    }
     revcmp::run(&mut p.clctx.func)
 }
 
@@ -5498,6 +5514,13 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // skipping it is *slower* (~1.52× vs ~1.46×): the specialized
         // straight-line arms win over the shared branched unroll under
         // V8. LLVM's 7-mul shared form is still the target.
+        // A second range pass over what the late steps built: `cmp3`,
+        // `niche` and the select folds leave tests like `(gt + 2) & 255
+        // == lt` on two 0/1 values (an `Ordering` re-tested for
+        // `Continue` after `a != b`), which the ranges decide. Ahead of
+        // egraph2 so the dead arms go with it. Wasm only, opt-in:
+        // `PLIRON_VRP2=1`.
+        step("vrp2", "vrp", Gate::OptIn("PLIRON_VRP2"), s_vrp2),
         Step {
             name: "egraph2",
             bisect: Some("egraph2"),

@@ -17,6 +17,12 @@ import { performance } from "node:perf_hooks";
 
 const args = process.argv.slice(2);
 const LAYOUTS = Number(args.find((a) => a.startsWith("--layouts="))?.slice(10) ?? 1);
+// `--best`: on a loaded machine (other jobs, a thread parked on an
+// efficiency core) the median round-ratio wanders by tens of percent.
+// Each layout then reports min(pliron samples) / min(LLVM samples): a
+// sample only has to run undisturbed once per side. Use it when the
+// default run shows wide [min..max] ranges or inflated LLVM times.
+const BEST = args.includes("--best");
 const filter = args.find((a) => !a.endsWith(".wasm") && !a.startsWith("--")) ?? "";
 const [llvmPath, plirPath, extraPath] = args.filter((a) => a.endsWith(".wasm"));
 if (!llvmPath || !plirPath) {
@@ -137,11 +143,13 @@ for (const name of Object.keys(L.e)
   }
   const ls = per.flatMap((x) => x.ls);
   const pss = mods.map((_, i) => per.flatMap((x) => x.pss[i]));
-  const rrs = mods.map((_, i) => per.map((x) => median(x.rrs[i])));
-  const lm = median(ls);
+  const rrs = mods.map((_, i) =>
+    per.map((x) => (BEST ? Math.min(...x.pss[i]) / Math.min(...x.ls) : median(x.rrs[i]))),
+  );
+  const lm = BEST ? Math.min(...ls) : median(ls);
   let row = `${tag.padEnd(14)} ${ms(lm)}`;
   mods.forEach((m, i) => {
-    const pm = median(pss[i]);
+    const pm = BEST ? Math.min(...pss[i]) : median(pss[i]);
     const r = median(rrs[i]);
     ratios[i].push(r);
     row += ` ${ms(pm)} ${pct(r)}`;
