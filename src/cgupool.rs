@@ -1222,6 +1222,7 @@ pub(crate) fn iropt_head(
         domcheck::run(ctx, st, "inline")
     );
     pliron_ir_opt::irstat::report(ctx, st, "post-inline");
+    dumpfn(ctx, st, "inline");
     pt!(prof, cgu, "xcgu-home", inline::home_copies(ctx, st));
     // Inlining kills most copy callsites — mark the dead ones now so
     // spec/sroa/constload/devirt never walk their emit-only bodies.
@@ -1278,6 +1279,7 @@ pub(crate) fn iropt_head(
             "domcheck:ic",
             domcheck::run(ctx, st, "instcombine")
         );
+        dumpfn(ctx, st, "instcombine");
     }
     if pass_enabled("PLIRON_MEMCPYOPT") {
         pt!(prof, cgu, "memcpyopt", memcpyopt::run(ctx, st));
@@ -1287,14 +1289,17 @@ pub(crate) fn iropt_head(
             "domcheck:mc",
             domcheck::run(ctx, st, "memcpyopt")
         );
+        dumpfn(ctx, st, "memcpyopt");
     }
     if pass_enabled("PLIRON_CONSTLOAD") && pass_enabled("PLIRON_CONSTCOPY") {
         pt!(prof, cgu, "constcopy", constload::forward_copies(ctx, st));
         pt!(prof, cgu, "domcheck:cc", domcheck::run(ctx, st, "constcopy"));
+        dumpfn(ctx, st, "constcopy");
     }
     if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
         pt!(prof, cgu, "sroa-fwd", sroa::forward(ctx, st));
         pt!(prof, cgu, "domcheck:sf", domcheck::run(ctx, st, "sroa-fwd"));
+        dumpfn(ctx, st, "sroa-fwd");
     }
     if pass_enabled("PLIRON_PHISIMP") {
         pt!(prof, cgu, "phisimp", phisimp::run(ctx, st));
