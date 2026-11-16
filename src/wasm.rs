@@ -9248,6 +9248,20 @@ const INIT_ARRAY: u8 = 4;
 /// `#[used(linker)]`: keep the object alive through link-time GC even
 /// when nothing references it.
 const USED: u8 = 8;
+/// Priority of a plain `.init_array` entry (LLVM's `UINT16_MAX`).
+const INIT_PRIO_DEFAULT: u32 = 65535;
+
+/// The constructor priority of a `#[link_section]` name: `None` unless it
+/// is `.init_array` (65535) or `.init_array.N` (`N`, decimal, 16 bits;
+/// lower runs first). A suffix that is not such a number gets the default.
+fn init_array_priority(section: &str) -> Option<u32> {
+    let rest = section.strip_prefix(".init_array")?;
+    Some(
+        rest.strip_prefix('.')
+            .and_then(|n| n.parse::<u16>().ok())
+            .map_or(INIT_PRIO_DEFAULT, u32::from),
+    )
+}
 
 fn link_flags(l: Linkage) -> u8 {
     match l {
@@ -9262,7 +9276,10 @@ fn link_flags(l: Linkage) -> u8 {
 /// `ndata { name, u8 flags, align, bytes, nrelocs { off, u8 is_func, sym, i32 addend } }`
 /// for defined data objects. Flags: bit 0 global, bit 1 preemptible, bit 2 an
 /// `.init_array` entry (constructor pointers the linker calls from
-/// `__wasm_call_ctors`), bit 3 `#[used(linker)]` (GC root).
+/// `__wasm_call_ctors`), bit 3 `#[used(linker)]` (GC root). When a data
+/// object is an `.init_array.N` entry with `N` other than the default
+/// 65535, the section ends with `nprios { data index, priority }`: a
+/// trailer, so a linker that does not know it reads the rest unchanged.
 // r[impl wasm.obj.link]
 fn link_funcs(ctx: &Context, st: &State) -> Vec<(String, u8)> {
     st.funcs
@@ -9290,7 +9307,9 @@ fn link_data(ctx: &Context, st: &State) -> Vec<u8> {
         })
         .collect();
     put_u32(&mut out, gs.len() as u32);
-    for (n, g) in gs {
+    // (data index, priority) of the `.init_array.N` entries.
+    let mut prios: Vec<(u32, u32)> = Vec::new();
+    for (di, (n, g)) in gs.into_iter().enumerate() {
         let init = g.init.unwrap();
         let (size, _) = size_align(ctx, init.get_type(ctx));
         let mut bytes = vec![0u8; size as usize];
@@ -9302,11 +9321,12 @@ fn link_data(ctx: &Context, st: &State) -> Vec<u8> {
         } else {
             g.linkage
         };
-        let ctor = g
-            .section
-            .as_deref()
-            .is_some_and(|s| s.starts_with(".init_array"));
-        out.push(link_flags(l) | if ctor { INIT_ARRAY } else { 0 } | if g.used {
+        let prio = g.section.as_deref().and_then(init_array_priority);
+        prios.extend(
+            prio.filter(|&p| p != INIT_PRIO_DEFAULT)
+                .map(|p| (di as u32, p)),
+        );
+        out.push(link_flags(l) | if prio.is_some() { INIT_ARRAY } else { 0 } | if g.used {
             USED
         } else {
             0
@@ -9320,6 +9340,13 @@ fn link_data(ctx: &Context, st: &State) -> Vec<u8> {
             out.push(st.funcs.contains_key(&sym) as u8);
             put_str(&mut out, &sym);
             out.extend_from_slice(&(addend as i32).to_le_bytes());
+        }
+    }
+    if !prios.is_empty() {
+        put_u32(&mut out, prios.len() as u32);
+        for (di, p) in prios {
+            put_u32(&mut out, di);
+            put_u32(&mut out, p);
         }
     }
     out

@@ -10,6 +10,12 @@
 //!
 //! Memory layout: [0, 1024) unused, then the stack (grows down to 1024),
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
+//!
+//! Static constructors (`.init_array[.N]` entries, LLVM init functions) are
+//! called from a synthesized `__wasm_call_ctors`, by priority. A program
+//! that calls or exports that function runs them itself; in any other
+//! module every exported function gets a wrapper that runs them once,
+//! before the first export's body (`wrap_exports` below).
 
 mod addroff;
 mod brhint;
@@ -42,11 +48,15 @@ pub(crate) const GLOBAL: u8 = 1;
 pub(crate) const INIT_ARRAY: u8 = 4;
 /// `#[used(linker)]`: keep through GC even when unreferenced.
 pub(crate) const USED: u8 = 8;
+/// Constructor priority of a plain `.init_array` entry (LLVM's default).
+pub(crate) const DEFAULT_PRIO: u32 = 65535;
 const CALL_CTORS: &str = "__wasm_call_ctors";
 
 pub(crate) struct DataObj {
     pub(crate) name: String,
     pub(crate) flags: u8,
+    /// Constructor priority of an `INIT_ARRAY` object (lower runs first).
+    pub(crate) prio: u32,
     pub(crate) align: u32,
     pub(crate) bytes: Vec<u8>,
     pub(crate) relocs: Vec<(u32, bool, String, i32)>,
@@ -86,6 +96,9 @@ pub(crate) struct Obj<'a> {
     data_sym_off: HashMap<String, u32>,
     /// Absolute address / table-slot patches applied at emit.
     code_abs: Vec<CodeAbsReloc>,
+    /// Constructors of an LLVM object (`WASM_INIT_FUNCS`): (priority,
+    /// function symbol). LLVM keeps no `.init_array` data in the object.
+    pub(crate) init_funcs: Vec<(u32, String)>,
 }
 
 struct Rd<'a>(&'a [u8]);
@@ -129,6 +142,7 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> Result<Obj<'a>, String> {
         llvm: false,
         data_sym_off: HashMap::default(),
         code_abs: vec![],
+        init_funcs: vec![],
     };
     for p in wp::Parser::new(0).parse_all(bytes) {
         match p.map_err(|e| format!("{}: {e}", o.name))? {
@@ -212,10 +226,22 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> Result<Obj<'a>, String> {
                     o.data.push(DataObj {
                         name,
                         flags,
+                        prio: DEFAULT_PRIO,
                         align,
                         bytes,
                         relocs,
                     });
+                }
+                // Trailer (absent in objects without one): the priorities
+                // of the `.init_array.N` entries, by data index.
+                if !r.0.is_empty() {
+                    for _ in 0..r.u32() {
+                        let (di, prio) = (r.u32() as usize, r.u32());
+                        o.data
+                            .get_mut(di)
+                            .ok_or_else(|| format!("{}: priority of data object {di}", o.name))?
+                            .prio = prio;
+                    }
                 }
             }
             _ => {}
@@ -484,8 +510,8 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // Mark-sweep GC at symbol granularity. Roots: the command-line exports
     // (or every global function of a non-archive object when none are
     // given, matching the default export list below), `_start`, every
-    // `.init_array` object, every `#[used(linker)]` datum, and
-    // `__pliron_prof_*` objects.
+    // `.init_array` object and LLVM init function, every `#[used(linker)]`
+    // datum, and `__pliron_prof_*` objects.
     // Edges: a live function's *reachable* `call`/`ref.func`/`return_call`
     // operands (imports resolve by symbol, defined functions by index) and
     // its `global.get`/`global.set` of GOT.mem/GOT.func imports; a live
@@ -532,6 +558,9 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             if d.flags & (INIT_ARRAY | USED) != 0 || d.name.starts_with("__pliron_prof_") {
                 wl.push(Def::Data(oi, di));
             }
+        }
+        for (_, sym) in &objs[oi].init_funcs {
+            wl.extend(resolve(oi, sym));
         }
     }
     while let Some(d) = wl.pop() {
@@ -800,6 +829,30 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         }
     }
+    // r[impl wasm.ld.ctors]
+    // Who runs the constructors? As in wasm-ld: when the program takes
+    // care of it — live code calls `__wasm_call_ctors` or takes its address
+    // (a WASI `_start`/`_initialize` does), an input defines it, or it is
+    // exported for the embedder — nothing more happens. Otherwise, in a
+    // module that has constructors, every exported function is wrapped so
+    // they have run before its body does (the wrappers are built below).
+    // `PLIRON_WASM_CTORWRAP=0` leaves the exports alone.
+    let has_ctors = included.iter().any(|&oi| {
+        !objs[oi].init_funcs.is_empty()
+            || objs[oi].data.iter().enumerate().any(|(di, d)| {
+                d.flags & INIT_ARRAY != 0 && !d.relocs.is_empty() && live_d.contains(&(oi, di))
+            })
+    });
+    let ctors_called = defs.contains_key(CALL_CTORS)
+        || exports.iter().any(|n| n == CALL_CTORS)
+        || want.contains(CALL_CTORS)
+        || used_imp.iter().any(|&(oi, i)| {
+            let (m, n, _) = &objs[oi].fimports[i as usize];
+            m == "env" && n == CALL_CTORS
+        });
+    let wrap_exports = has_ctors
+        && !ctors_called
+        && std::env::var_os("PLIRON_WASM_CTORWRAP").is_none_or(|v| v != "0");
     // Does the output still need this import? `env` imports that resolve
     // to a definition (or `__wasm_call_ctors`) are linked, not imported.
     // r[impl wasm.ld.imports]
@@ -899,7 +952,8 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // `ref.func`/`call` references are remapped onto: it is *not* a
     // borrowed import slot, so it can be declared without keeping a
     // real import alive (wasm-bindgen strips `__wbindgen_describe`, a
-    // typical import 0).
+    // typical import 0). The `main` wrapper, `__wasm_call_ctors_once` and
+    // the export wrappers follow when the module has them.
     let ctors_fn = next;
     let tomb_fn = ctors_fn + 1;
     let func_out = |d: Def| -> Option<u32> {
@@ -993,6 +1047,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // r[impl wasm.eh.word]
     let eh = cur.next_multiple_of(8);
     cur = eh + 8;
+    // The "constructors have run" word of the export wrappers: zero until
+    // the first export call. It lives in memory, next to the state the
+    // constructors build, rather than in a global: instances that share
+    // a memory share it, and a memory snapshot keeps it.
+    let ctors_done = cur;
+    if wrap_exports {
+        cur += 4;
+    }
     let data_end = cur;
     let heap_base = cur.next_multiple_of(16);
     let pages = (heap_base as u64).div_ceil(65536) + 1;
@@ -1135,22 +1197,31 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
 
     // r[impl wasm.ld.ctors]
-    // Constructors: every pointer in an `.init_array` entry, in link order.
-    let mut ctors: Vec<u32> = Vec::new();
+    // Constructors: every pointer in an `.init_array` entry and every
+    // LLVM init function, by priority (lower first), ties in link order.
+    let mut ctors: Vec<(u32, u32)> = Vec::new();
     for &oi in &included {
+        let ctor = |sym: &str, func: bool| {
+            resolve(oi, sym)
+                .filter(|_| func)
+                .and_then(func_out)
+                .ok_or_else(|| format!("{}: bad constructor {sym}", objs[oi].name))
+        };
+        for (prio, sym) in &objs[oi].init_funcs {
+            ctors.push((*prio, ctor(sym, true)?));
+        }
         for (di, d) in objs[oi].data.iter().enumerate() {
             if d.flags & INIT_ARRAY == 0 || !live_d.contains(&(oi, di)) {
                 continue;
             }
-            for (_, func, sym, _) in &d.relocs {
-                let f = resolve(oi, sym)
-                    .filter(|_| *func)
-                    .and_then(func_out)
-                    .ok_or_else(|| format!("{}: bad constructor {sym}", objs[oi].name))?;
-                ctors.push(f);
+            let mut ptrs: Vec<_> = d.relocs.iter().collect();
+            ptrs.sort_by_key(|r| r.0);
+            for (_, func, sym, _) in ptrs {
+                ctors.push((d.prio, ctor(sym, *func)?));
             }
         }
     }
+    ctors.sort_by_key(|c| c.0);
     let void_ty = match types
         .iter()
         .position(|t| t.params().is_empty() && t.results().is_empty())
@@ -1203,6 +1274,44 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             None => ex.push(("main".into(), main_fn)),
         }
     }
+    // `--export __wasm_call_ctors`: the embedder runs the constructors.
+    if exports.iter().any(|n| n == CALL_CTORS) && !defs.contains_key(CALL_CTORS) {
+        ex.push((CALL_CTORS.into(), ctors_fn));
+    }
+
+    // Output type of every defined function, in index order: the live
+    // bodies, `__wasm_call_ctors`, the tombstone, the `main` wrapper.
+    let mut ftys: Vec<u32> = Vec::new();
+    for &oi in &included {
+        for (i, t) in objs[oi].ftypes.iter().enumerate() {
+            if live_f.contains(&(oi, i as u32)) {
+                ftys.push(tmaps[&oi][*t as usize]);
+            }
+        }
+    }
+    ftys.extend([void_ty, void_ty]);
+    ftys.extend(argc_ty);
+
+    // r[impl wasm.ld.ctors]
+    // Export wrappers (wasm-ld's "command exports", but the constructors
+    // run once, not on every call): each exported function `f` becomes
+    // `f.command_export`, which calls `__wasm_call_ctors_once` and then
+    // `f` with its own arguments. The test of the "done" word is in that
+    // callee, not in the wrapper: wasm-bindgen's descriptor interpreter
+    // skips the direct calls it finds at the top of the wrapper of
+    // `__wbindgen_skip_interpret_calls`, and nothing else.
+    let once_fn = ftys.len() as u32 + host.len() as u32;
+    let mut wrappers: Vec<(String, u32)> = Vec::new();
+    if wrap_exports && !ex.is_empty() {
+        ftys.push(void_ty);
+        for (n, f) in ex.iter_mut() {
+            let target = std::mem::replace(f, once_fn + 1 + wrappers.len() as u32);
+            wrappers.push((format!("{n}.command_export"), target));
+        }
+        for (_, target) in &wrappers {
+            ftys.push(ftys[(target - host.len() as u32) as usize]);
+        }
+    }
 
     // Encode.
     let mut module = we::Module::new();
@@ -1220,17 +1329,8 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     module.section(&is);
     let mut fs = we::FunctionSection::new();
-    for &oi in &included {
-        for (i, t) in objs[oi].ftypes.iter().enumerate() {
-            if live_f.contains(&(oi, i as u32)) {
-                fs.function(tmaps[&oi][*t as usize]);
-            }
-        }
-    }
-    fs.function(void_ty);
-    fs.function(void_ty);
-    if let Some(t) = argc_ty {
-        fs.function(t);
+    for t in &ftys {
+        fs.function(*t);
     }
     module.section(&fs);
     let mut tab = we::TableSection::new();
@@ -1358,7 +1458,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         }
     }
     let mut call_ctors = we::Function::new([]);
-    for f in &ctors {
+    for (_, f) in &ctors {
         call_ctors.instruction(&we::Instruction::Call(*f));
     }
     call_ctors.instruction(&we::Instruction::End);
@@ -1372,6 +1472,45 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         w.instruction(&we::Instruction::Call(orig));
         w.instruction(&we::Instruction::End);
         code.function(&w);
+    }
+    if !wrappers.is_empty() {
+        // `__wasm_call_ctors_once`. The word is set before the call, so an
+        // export entered from a constructor (through the host) does not
+        // start them again.
+        let word = we::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        };
+        let mut once = we::Function::new([]);
+        for i in [
+            we::Instruction::I32Const(ctors_done as i32),
+            we::Instruction::I32Load(word),
+            we::Instruction::I32Eqz,
+            we::Instruction::If(we::BlockType::Empty),
+            we::Instruction::I32Const(ctors_done as i32),
+            we::Instruction::I32Const(1),
+            we::Instruction::I32Store(word),
+            we::Instruction::Call(ctors_fn),
+            we::Instruction::End,
+            we::Instruction::End,
+        ] {
+            once.instruction(&i);
+        }
+        code.function(&once);
+        for (_, target) in &wrappers {
+            let nparams = types[ftys[(target - host.len() as u32) as usize] as usize]
+                .params()
+                .len() as u32;
+            let mut w = we::Function::new([]);
+            w.instruction(&we::Instruction::Call(once_fn));
+            for p in 0..nparams {
+                w.instruction(&we::Instruction::LocalGet(p));
+            }
+            w.instruction(&we::Instruction::Call(*target));
+            w.instruction(&we::Instruction::End);
+            code.function(&w);
+        }
     }
     module.section(&code);
     let mut named: Vec<(u32, &str)> = host
@@ -1392,6 +1531,12 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     if let Some(orig) = main_void {
         named.push((orig, "__original_main"));
         named.push((main_fn, "main"));
+    }
+    if !wrappers.is_empty() {
+        named.push((once_fn, "__wasm_call_ctors_once"));
+    }
+    for (i, (n, _)) in wrappers.iter().enumerate() {
+        named.push((once_fn + 1 + i as u32, n));
     }
     named.sort();
     named.dedup_by_key(|x| x.0);

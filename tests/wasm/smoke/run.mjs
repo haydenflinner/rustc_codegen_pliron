@@ -12,7 +12,11 @@ const helper = (x) => (((x * 3 >>> 0) << 5 | (x * 3 >>> 0) >>> 27) >>> 0) ^ 0x12
 const P = 0x0000_0100_0000_01B3n, MASK = (1n << 64n) - 1n;
 let gh = 0xcbf2_9ce4_8422_2325n;
 for (const m of [1n, MASK, 0n]) gh = ((gh ^ m) * P) & MASK;
+// `ctors()` is the first export called: the three `.init_array`
+// constructors must already have run, by priority (b.rs's 100, then a.rs's
+// 200 and its default 65535), giving the digits 1, 2, 3.
 const rows = [
+  ["ctors() first", e.ctors(), 123],
   ["fib(20)", e.fib(20), 6765],
   ["sum_sq(100)", e.sum_sq(100), 338350n],
   ["hypot(3,4)", e.hypot(3, 4), 5],
@@ -66,6 +70,9 @@ for (const a of W) {
     });
   }
 }
+// ... and they ran once, not on every export call.
+rows.push(["ctors() last", e.ctors(), 123]);
+rows.push(["ctor exports", Object.keys(e).filter((k) => /ctors$|^_initialize$/.test(k)).join(), "ctors"]);
 let bad = 0;
 for (const [name, got, want] of rows) {
   const ok = got === want;

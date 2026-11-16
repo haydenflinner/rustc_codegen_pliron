@@ -145,3 +145,40 @@ pub fn tape_hash(t: &[Gene]) -> u64 {
 pub fn genes_hash() -> u64 {
     tape_hash(&GENES)
 }
+
+/// What the constructors wrote: one decimal digit per run, in run order.
+static CTOR_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Called by every constructor (b.rs's too) with its digit.
+#[unsafe(no_mangle)]
+pub extern "C" fn ctor_note(digit: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    CTOR_LOG.store(CTOR_LOG.load(Relaxed) * 10 + digit, Relaxed);
+}
+
+extern "C" fn ctor_default() {
+    ctor_note(3);
+}
+extern "C" fn ctor_200() {
+    ctor_note(2);
+}
+
+// Static constructors (what `inventory` and `ctor` expand to on wasm): a
+// function pointer in `.init_array`, or in `.init_array.N` for priority N
+// (lower runs first; no suffix is 65535). b.rs, linked after this object,
+// has the priority-100 one, so the wanted order 1, 2, 3 is not link order.
+// Nothing references these statics: the linker keeps them, calls them from
+// `__wasm_call_ctors`, and runs that once before the first export's body
+// (in a `--no-entry` link nothing used to call it).
+#[used]
+#[unsafe(link_section = ".init_array")]
+static CTOR_DEFAULT: extern "C" fn() = ctor_default;
+#[used]
+#[unsafe(link_section = ".init_array.00200")]
+static CTOR_200: extern "C" fn() = ctor_200;
+
+/// The constructor log: 123 when each ran once, in priority order.
+#[unsafe(no_mangle)]
+pub extern "C" fn ctors() -> u32 {
+    CTOR_LOG.load(core::sync::atomic::Ordering::Relaxed)
+}

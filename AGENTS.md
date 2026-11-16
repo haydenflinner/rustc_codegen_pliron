@@ -292,6 +292,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   after each `wpeep` sub-pass, `PLIRON_WASM_BODYDUMP=<dir>` saves raw
   pre/post bytes), `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies,
   `PLIRON_WASM_STUBLOG=<file>` lists functions that fell back to stubs.
+- **wasm static constructors** (`.init_array[.N]` statics: `inventory`,
+  `ctor`): `pliron-wasm-ld` calls them from `__wasm_call_ctors` by
+  priority. A module that neither calls nor exports that function (a
+  cdylib) gets every export wrapped (`<name>.command_export`) so they
+  run once before the first export's body; `PLIRON_WASM_CTORWRAP=0`
+  (read by the linker) leaves the exports alone. Tests: the `ctors`
+  rows of `tests/wasm/smoke.sh`, `tools/pliron-wasm-ld/tests/ctors.rs`.
 - **Audits** (`docs/audit.md`): `PLIRON_WASM_AUDIT=1|panic` checks
   every wpeep copy-forward round with a Datalog translation validator
   (the code and the rewrite's assumptions as one fact stream) and

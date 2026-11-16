@@ -182,6 +182,15 @@ result differs from what stock rustc + LLVM produce for the same targets.
   the target (its address, or its table slot when `is_func` is 1) plus the
   addend. Data objects placed in a custom section by `#[link_section]` are
   not listed (#refr("wasm.obj.custom")).
+
+  A data object whose `#[link_section]` starts with `.init_array` MUST
+  carry flag 4. Its constructor priority is the decimal 16-bit `N` of
+  `.init_array.N`, and 65535 for any other name. When an object has
+  entries with a priority other than 65535, the payload MUST end with a
+  trailer: `nprios`, then per such entry its index in the data list and
+  its priority; otherwise the payload MUST end after the data list (a
+  reader that does not know the trailer reads everything before it
+  unchanged).
 ]
 
 #r("wasm.obj.features", title: "The target_features section", level: "must", tier: 2,
@@ -550,14 +559,16 @@ result differs from what stock rustc + LLVM produce for the same targets.
   from the roots: the `--export` names, or when there are none every
   global function of the directly named objects; `_start` unless
   `--no-entry`; every data object with the `.init_array` or
-  `#[used(linker)]` flag; and every `__pliron_prof_*` data object. Edges are
+  `#[used(linker)]` flag; every init function of an LLVM object
+  (`WASM_INIT_FUNCS`); and every `__pliron_prof_*` data object. Edges are
   the `call`, `ref.func` and `return_call` targets and the `GOT.mem`/
   `GOT.func` reads of reachable code in live bodies, and the relocation
   targets of live data. Code after an unconditional transfer (`br`,
   `br_table`, `return`, `unreachable`, a tail call) up to the end of its
   block is unreachable and contributes no edges. The output MUST export
   `memory`, the roots that are defined functions, and `_start` when it is
-  defined and an entry is wanted.
+  defined and an entry is wanted (each through its wrapper when
+  #refr("wasm.ld.ctors") asks for one).
 ]
 
 #llvm(kind: "extra", summary: [Link-time GC ignores calls in unreachable code inside a live body.])[
@@ -595,6 +606,8 @@ result differs from what stock rustc + LLVM produce for the same targets.
   + live data objects in link order, each at its alignment;
   + the `__pliron_prof_hdrs` table when profiling headers exist;
   + the #term("wasm-eh-word") (#refr("wasm.eh.word"));
+  + the 4-byte "constructors have run" word when exports are wrapped
+    (#refr("wasm.ld.ctors"));
   + the heap: `__heap_base` (16-aligned) to `__heap_end`, the end of
     initial memory, which is the pages needed to reach `__heap_base` plus
     one; no maximum.
@@ -647,13 +660,44 @@ result differs from what stock rustc + LLVM produce for the same targets.
   and other hosts look for.
 ]
 
-#r("wasm.ld.ctors", title: "Constructors run from __wasm_call_ctors", level: "must", tier: 2,
-   refines: "model.abi")[
+#r("wasm.ld.ctors", title: "Constructors run once, before the first export", level: "must", tier: 2,
+   refines: "model.abi", checked: ("test.sh wasm_smoke", "tools/pliron-wasm-ld/tests/ctors.rs"))[
   #term("pliron-wasm-ld") MUST synthesize `__wasm_call_ctors` as a function
-  that calls, in link order, every function pointer stored in a live data
-  object flagged `.init_array`, and MUST resolve references to
-  `__wasm_call_ctors` (calls and table slots) to it. A relocation in such
-  an object that does not name a live function MUST fail the link.
+  that calls every constructor: every function pointer stored in a live
+  data object flagged `.init_array` (#refr("wasm.obj.link")), and every
+  init function of an LLVM object. They MUST be called in ascending
+  priority; constructors of equal priority in link order, the pointers of
+  one data object by offset. The linker MUST resolve references to
+  `__wasm_call_ctors` (calls and table slots) to this function, and export
+  it when `--export __wasm_call_ctors` asks. A relocation in an
+  `.init_array` object that does not name a live function MUST fail the
+  link.
+
+  When the module has a constructor and the program does not run them
+  itself, every exported function MUST be replaced in the export section
+  by a wrapper, named `<export>.command_export` in the name section, that
+  calls `__wasm_call_ctors_once` and then the function with the wrapper's
+  own arguments, returning its results. `__wasm_call_ctors_once` MUST call
+  `__wasm_call_ctors` if the "constructors have run" word
+  (#refr("wasm.ld.layout")) is zero, and MUST set the word to 1 before
+  that call. The program runs them itself when an input defines
+  `__wasm_call_ctors`, when it is exported by `--export`, or when live
+  code calls it or a live data object or a `GOT.func` global names it
+  (the `_start` and `_initialize` of a WASI libc do); then no export is
+  wrapped. `PLIRON_WASM_CTORWRAP=0` turns the wrappers off.
+]
+
+#llvm(kind: "choice", summary: [Export wrappers run the constructors once per memory, not on every export call.])[
+  `wasm-ld` wraps the exports of such a module the same way ("command
+  exports"), but its wrapper calls `__wasm_call_ctors` unconditionally, so
+  every call of an export from the host runs every constructor again
+  (and `__wasm_call_dtors` afterwards, which is not called here at all).
+  The test of the word is inside `__wasm_call_ctors_once`, not in the
+  wrapper, because wasm-bindgen's descriptor interpreter skips exactly
+  the direct calls at the top of the wrapper of
+  `__wbindgen_skip_interpret_calls`. `wasm-ld` also leaves the exports
+  alone when any input object mentions `__wasm_call_ctors`, even from
+  code that link-time GC removes; here only a live reference counts.
 ]
 
 #r("wasm.ld.sections", title: "Custom sections, names and features", level: "must",

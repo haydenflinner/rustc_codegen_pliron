@@ -12,7 +12,7 @@
 
 use wasmparser as wp;
 
-use crate::{CodeAbsReloc, DataObj, Obj, GLOBAL, INIT_ARRAY, USED};
+use crate::{CodeAbsReloc, DataObj, Obj, DEFAULT_PRIO, GLOBAL, USED};
 
 /// Write a 5-byte padded unsigned LEB128 (LLVM reloc width).
 pub fn write_uleb5(buf: &mut [u8], mut v: u32) {
@@ -172,6 +172,7 @@ pub fn ingest(o: &mut Obj<'_>, bytes: &[u8]) -> Result<(), String> {
     };
     let mut syms: Vec<Sym> = Vec::new();
     let mut seg_meta: Vec<(String, u32)> = Vec::new();
+    let mut init_funcs: Vec<(u32, u32)> = Vec::new();
     for sub in linking.subsections() {
         let sub = sub.map_err(|e| format!("{}: linking: {e}", o.name))?;
         match sub {
@@ -187,7 +188,23 @@ pub fn ingest(o: &mut Obj<'_>, bytes: &[u8]) -> Result<(), String> {
                     seg_meta.push((s.name.to_string(), 1u32 << s.alignment.min(31)));
                 }
             }
-            wp::Linking::InitFuncs(_) | wp::Linking::ComdatInfo(_) | wp::Linking::Unknown { .. } => {}
+            wp::Linking::InitFuncs(r) => {
+                for f in r {
+                    let f = f.map_err(|e| format!("{}: init funcs: {e}", o.name))?;
+                    init_funcs.push((f.priority, f.symbol_index));
+                }
+            }
+            wp::Linking::ComdatInfo(_) | wp::Linking::Unknown { .. } => {}
+        }
+    }
+    // Constructors. LLVM's object writer turns each `.init_array[.N]`
+    // pointer into a `WASM_INIT_FUNCS` record (priority, function symbol)
+    // and leaves the section out of the data, unless a symbol refers to
+    // it; then the segment is ordinary data here, not a second list.
+    for (prio, si) in init_funcs {
+        match syms.get(si as usize) {
+            Some(Sym::Func { name, .. }) => o.init_funcs.push((prio, name.clone())),
+            _ => return Err(format!("{}: init function: bad symbol {si}", o.name)),
         }
     }
 
@@ -197,14 +214,11 @@ pub fn ingest(o: &mut Obj<'_>, bytes: &[u8]) -> Result<(), String> {
             .get(i)
             .cloned()
             .unwrap_or_else(|| (format!("__llvm_seg{i}"), 1));
-        let mut flags = 0u8;
-        if name.contains("init_array") {
-            flags |= INIT_ARRAY | USED;
-        }
         o.data_names.entry(name.clone()).or_insert(o.data.len());
         o.data.push(DataObj {
             name,
-            flags,
+            flags: 0,
+            prio: DEFAULT_PRIO,
             align,
             bytes: seg.bytes.clone(),
             relocs: vec![],

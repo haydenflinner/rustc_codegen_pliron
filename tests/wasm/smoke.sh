@@ -29,5 +29,12 @@ rustc $BE --edition 2024 -O --target wasm32-unknown-unknown --crate-type lib \
 "$LD" "$out/smoke_a.o" "$out/smoke_b.o" \
   --export fib --export sum_sq --export hypot --export statics \
   --export indirect --export crosscall --export genes_hash --export cmp128 --export ops128 \
+  --export ctors \
   --no-entry -o "$out/smoke.wasm"
 node tests/wasm/smoke/run.mjs "$out/smoke.wasm"
+# r[verify wasm.ld.ctors]
+# The same objects with `__wasm_call_ctors` exported: the embedder calls it,
+# the exports are not wrapped.
+"$LD" "$out/smoke_a.o" "$out/smoke_b.o" --export fib --export ctors \
+  --export __wasm_call_ctors --no-entry -o "$out/smoke_ctors.wasm"
+node tests/wasm/smoke/ctors_manual.mjs "$out/smoke_ctors.wasm"
