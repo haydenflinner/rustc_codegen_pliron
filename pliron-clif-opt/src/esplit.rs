@@ -428,6 +428,20 @@ fn clone_for_edge(func: &mut Function, b: Block, plan: &Plan) {
     for &i in &insts {
         let ni = func.dfg.clone_inst(i);
         func.set_srcloc(ni, func.srcloc(i));
+        // Operands are looked up by their alias root: an operand that
+        // names a param or an earlier result of `b` through an alias
+        // (what GVN leaves) missed the map and kept pointing at `b`'s
+        // own value, which does not dominate the clone
+        // (`loro_internal::state::movable_list_state`: `ireduce v3948`
+        // "from non-dominating inst"; nothing verifies between this
+        // step and the wasm emitter, which then read a local the
+        // clone's path never wrote).
+        let mut rmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for v in func.dfg.inst_values(ni) {
+            if let Some(&nv) = vmap.get(&func.dfg.resolve_aliases(v)) {
+                rmap.insert(v, nv);
+            }
+        }
         let mut data = func.dfg.insts[ni];
         {
             let dfg = &mut func.dfg;
@@ -435,7 +449,7 @@ fn clone_for_edge(func: &mut Function, b: Block, plan: &Plan) {
                 &mut dfg.value_lists,
                 &mut dfg.jump_tables,
                 &mut dfg.exception_tables,
-                |v| vmap.get(&v).copied().unwrap_or(v),
+                |v| rmap.get(&v).copied().unwrap_or(v),
             );
         }
         func.dfg.insts[ni] = data;

@@ -447,9 +447,11 @@ fn with_pipe<R>(
         dbg_slots: &Default::default(),
         fn_names: &fn_names,
         tcfg: isa.frontend_config(),
-        simd: true,
-        x64,
-        cmp64: true,
+        // The wasm backend runs the pipeline with `simd` (no simd128 by
+        // default), `x64` and `cmp64` off.
+        simd: !wasm_mode,
+        x64: x64 && !wasm_mode,
+        cmp64: !wasm_mode,
         // `PLIRON_CLIF_WASM=1`: replay as the wasm backend runs the
         // pipeline (`Pipe::wasm`, stepped-pointer indvars). The
         // interpreter diff stays inconclusive for i32-pointer code, but
