@@ -42,103 +42,92 @@ The CubeCL CPU-kernel path has its own card (`harness/cubecl_card.py`,
 ## Scoreboard
 
 <!-- SCOREBOARD:BEGIN -->
-**Last measured 2026-11-13**, aarch64-apple-darwin, backend `1611e97`,
+**Last measured 2026-11-16**, aarch64-apple-darwin, backend `6c7fd69`,
 nightly-2026-10-22.
 
-**Overall 94** (2026-11-07: 94, 2026-10-30: 95).
+**Overall 95** (2026-11-13: 94, 2026-11-07: 94, 2026-10-30: 95).
 
 | SPD | CMP | MEM | SIZ | STK | COR |
 |---|---|---|---|---|---|
-| **103** | **106** | **75** | **70** | **83** | **100** |
+| **108** | **105** | **73** | **67** | **83** | **100** |
 
 | category | weight | pliron/LLVM | rating | from |
 |---|---|---|---|---|
-| SPD runtime speed | 30 | 0.962 | 103 | native 0.908 · wasm 1.019 |
-| CMP compile time | 15 | 0.918 | 106 | 5 inputs |
-| MEM compile memory | 10 | 1.424 | 75 | peak RSS, 5 inputs |
-| SIZ code size | 10 | 1.519 | 70 | machine code, 5 inputs + wasm module 1.73 |
-| STK stack frames | 15 | 1.260 | 83 | regex-syntax, 337 shared fns |
+| SPD runtime speed | 30 | 0.897 | 108 | native 0.873 · wasm 0.922 |
+| CMP compile time | 15 | 0.930 | 105 | 5 inputs |
+| MEM compile memory | 10 | 1.454 | 73 | peak RSS, 5 inputs |
+| SIZ code size | 10 | 1.580 | 67 | machine code, 5 inputs + wasm module 1.83 |
+| STK stack frames | 15 | 1.259 | 83 | regex-syntax, 337 shared fns |
 | COR correctness | 20 | 1.000 | 100 | crates: 0 pliron-only across 20 crates (same day) |
 
 Correctness inputs: crates tier 1 run in the default `--deps stock` mode
 (the crates' own code only); the UI input is the 2026-10-27 stage-2
-self-host run. x86-64 was last measured 2026-10-22.
+self-host run. x86-64 was last measured 2026-10-22. The fuzz suite did
+not run for this card (no rustlantis generator on the machine).
 
-What moved since the 2026-11-07 card: CMP 0.993 → 0.918, MEM 1.524 →
-1.424, SIZ 1.710 → 1.519 (all better — the session's copy elision and
-shared-panic-tail work, see `history/2026-11-13-six-features.md`).
-STK regressed 1.047 → 1.260: the two `driftsort_main` monomorphs are
-back to 8 KB frames against LLVM's 4 KB, so the `memcpyopt`
-memset/sret-temp sink no longer fires there — suspect the
-`frag_copy_stays_whole` SROA refactor that landed after the last
-measurement. The rest of the STK gap is `visit_`/`parse_` spill
-traffic as before.
+What moved since the 2026-11-13 card: SPD 0.962 -> 0.897, wasm 1.019
+-> 0.922 (the 2026-11-16 wasm work: `history/2026-11-16-wasm-night.md`)
+and native 0.908 -> 0.873 (not worked on that night; two of its
+transforms, the memcpyopt path window and the second constant-copy
+run, apply to native too, and nothing regressed). SIZ 1.519 -> 1.580
+and MEM 1.424 -> 1.454 are worse and were not attributed: the wasm
+bench module was 183.2 KB when the 11-16 session started and is 178.4
+KB now, so that part grew between the two cards, not during it. CMP
+0.918 -> 0.930 is inside the machine's noise.
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| arrayvec | 3.991 ms | 3.771 ms | 0.945 ◄ faster |
-| chars_alpha | 1.519 ms | 1.505 ms | 0.991 |
-| chars_ascii | 1.569 ms | 0.835 ms | 0.532 ◄ faster |
-| chars_mixed | 11.179 ms | 11.531 ms | 1.031 ▲ slower |
-| contains_rng | 1.589 ms | 1.224 ms | 0.770 ◄ faster |
-| eqbug | 0.081 ms | 0.094 ms | 1.165 ▲ slower |
-| fib | 10.414 ms | 9.338 ms | 0.897 ◄ faster |
-| hashmap | 38.933 ms | 41.837 ms | 1.075 ▲ slower |
-| hmget | 8.290 ms | 7.690 ms | 0.928 ◄ faster |
-| iterw | 14.269 ms | 9.886 ms | 0.693 ◄ faster |
-| matmul | 6.142 ms | 6.114 ms | 0.996 |
-| nbody | 81.849 ms | 65.088 ms | 0.795 ◄ faster |
-| parse_only | 265.221 ms | 234.877 ms | 0.886 ◄ faster |
-| sieve | 8.676 ms | 8.416 ms | 0.970 |
-| sortw | 5.006 ms | 4.515 ms | 0.902 ◄ faster |
-| strwork | 10.198 ms | 10.496 ms | 1.029 |
-| tokenize | 4.240 ms | 4.223 ms | 0.996 |
-| varint | 4.645 ms | 4.827 ms | 1.039 ▲ slower |
-| varint_postcard | 4.340 ms | 3.755 ms | 0.865 ◄ faster |
+| arrayvec | 3.672 ms | 3.506 ms | 0.955 ◄ faster |
+| chars_alpha | 1.426 ms | 1.398 ms | 0.981 |
+| chars_ascii | 1.534 ms | 0.797 ms | 0.519 ◄ faster |
+| chars_mixed | 10.835 ms | 10.310 ms | 0.951 ◄ faster |
+| contains_rng | 1.575 ms | 1.154 ms | 0.733 ◄ faster |
+| eqbug | 0.082 ms | 0.090 ms | 1.101 ▲ slower |
+| fib | 10.825 ms | 8.797 ms | 0.813 ◄ faster |
+| hashmap | 38.786 ms | 39.834 ms | 1.027 |
+| hmget | 8.028 ms | 7.342 ms | 0.915 ◄ faster |
+| iterw | 13.440 ms | 9.403 ms | 0.700 ◄ faster |
+| matmul | 5.924 ms | 5.872 ms | 0.991 |
+| nbody | 78.533 ms | 62.963 ms | 0.802 ◄ faster |
+| parse_only | 253.364 ms | 225.123 ms | 0.889 ◄ faster |
+| sieve | 8.248 ms | 7.546 ms | 0.915 ◄ faster |
+| sortw | 4.696 ms | 4.230 ms | 0.901 ◄ faster |
+| strwork | 10.078 ms | 10.020 ms | 0.994 |
+| tokenize | 3.849 ms | 2.889 ms | 0.750 ◄ faster |
+| varint | 4.266 ms | 4.346 ms | 1.019 |
+| varint_postcard | 4.088 ms | 3.532 ms | 0.864 ◄ faster |
 
 **wasm kernels** (node, interleaved rounds):
 
 | kernel | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| chars_alpha | 3.302 ms | 2.911 ms | 0.882 ◄ faster |
-| chars_ascii | 1.674 ms | 1.652 ms | 0.984 |
-| chars_mixed | 13.338 ms | 15.905 ms | 1.191 ▲ slower |
-| contains_rng | 3.529 ms | 3.695 ms | 1.043 ▲ slower |
-| eqbug | 0.099 ms | 0.095 ms | 0.970 |
-| fib | 6.828 ms | 6.452 ms | 0.943 ◄ faster |
-| hashmap | 47.916 ms | 49.395 ms | 1.030 |
-| hmget | 8.329 ms | 8.389 ms | 1.008 |
-| iterw | 48.214 ms | 37.563 ms | 0.778 ◄ faster |
-| matmul | 22.293 ms | 18.306 ms | 0.819 ◄ faster |
-| nbody | 60.803 ms | 60.932 ms | 1.000 |
-| parse_only | 276.055 ms | 406.480 ms | 1.469 ▲ slower |
-| sieve | 10.098 ms | 9.873 ms | 0.974 |
-| sortw | 4.427 ms | 5.647 ms | 1.281 ▲ slower |
-| strwork | 12.720 ms | 13.912 ms | 1.095 ▲ slower |
-| tokenize | 5.628 ms | 5.797 ms | 1.030 |
+| chars_alpha | 3.279 ms | 2.809 ms | 0.846 ◄ faster |
+| chars_ascii | 1.673 ms | 1.259 ms | 0.743 ◄ faster |
+| chars_mixed | 12.763 ms | 12.476 ms | 0.993 |
+| contains_rng | 3.336 ms | 3.329 ms | 1.000 |
+| eqbug | 0.093 ms | 0.090 ms | 0.968 ◄ faster |
+| fib | 6.325 ms | 5.933 ms | 0.937 ◄ faster |
+| hashmap | 45.278 ms | 46.349 ms | 1.023 |
+| hmget | 7.847 ms | 8.279 ms | 1.054 ▲ slower |
+| iterw | 45.752 ms | 35.556 ms | 0.777 ◄ faster |
+| matmul | 21.116 ms | 15.426 ms | 0.731 ◄ faster |
+| nbody | 57.878 ms | 58.431 ms | 1.010 |
+| parse_only | 262.750 ms | 232.967 ms | 0.888 ◄ faster |
+| sieve | 9.595 ms | 9.216 ms | 0.967 ◄ faster |
+| sortw | 4.138 ms | 4.134 ms | 1.002 |
+| strwork | 11.894 ms | 12.215 ms | 1.028 |
+| tokenize | 5.033 ms | 4.407 ms | 0.875 ◄ faster |
 <!-- SCOREBOARD:END -->
 
-**wasm kernels, 2026-11-16** (the table above is the last `parity.py`
-run and predates this; `node bench/wasm/run.mjs llvm.wasm pliron.wasm
---layouts=3 --best`, min/min per layout, main at `f13cb0d`; `532caf8`
-measures 0.928): geomean **0.924** of 16 (was 1.019 in the card, 0.945 at the start of
-2026-11-16).
-
-| kernel | change vs LLVM | | kernel | change vs LLVM |
-|---|---|---|---|---|
-| chars_alpha | -12.6% | | iterw | -22.6% |
-| chars_ascii | -25.2% | | matmul | -27.0% |
-| chars_mixed | -0.7% | | nbody | +1.0% |
-| contains_rng | -0.3% | | parse_only | -11.0% |
-| eqbug | -3.4% | | sieve | -2.1% |
-| fib | -7.3% | | sortw | +0.7% |
-| hashmap | +2.2% | | strwork | +5.8% |
-| hmget | +5.5% | | tokenize | -14.4% |
-
-Behind LLVM: strwork (`dragon::format_exact`), hmget and hashmap (a
-few percent more moves in V8's code for the same probe loop).
+The wasm table above is one interleaved `parity.py` run. The
+layout-averaged `node bench/wasm/run.mjs llvm.wasm pliron.wasm
+--layouts=3 --best` on the same commit gives geomean 0.928 with strwork
++6.5%, hmget +6.0%, hashmap +2.8%, nbody +1.0%, sortw +0.6%, chars_mixed
++0.4% behind and the other ten ahead by 3 to 27%. Behind LLVM: strwork
+(`dragon::format_exact`), hmget and hashmap (a few percent more moves
+in V8's code for the same probe loop).
 `docs/history/2026-11-16-wasm-night.md` has what moved and what was
 tried.
 
