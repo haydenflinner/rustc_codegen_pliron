@@ -524,8 +524,18 @@ opposed to the individual fixes. Each has the cases behind it.
    removal has to be complete.** `tmp = value; memcpy(sret, tmp)`
    appears at every `return` of an aggregate. One conservative test in
    `memcpyopt` (dominators instead of paths) left all of them in any
-   function with more than one return site. Worth a census on a real
-   module: how many `memcpy(sret, alloca)` survive, and why.
+   function with more than one return site. A first census, rapier2d
+   on wasm32 at `c6989d3` (`PLIRON_TRACE=pliron::memcpyopt=debug`):
+   10,464 copies forwarded; refused: 3,227 "dst has no provable base"
+   (the destination is a loaded pointer or a parameter that is not
+   `sret`: `vec.push(value)`), 998 opaque uses of the temp, 911 "copy
+   writer's src may alias dst", 656 "writer does not dominate the copy"
+   (sibling-arm partial writers), 479 kept for promotion, 238 + 176
+   window and route touches. The first class needs the `&mut`/`noalias`
+   facts the CLIF side already has; the fourth is the next cheap one.
+   And 1,991 of the forwards (19%) now drop the destination's lifetime
+   markers (the 06:00 fix): moving the start marker up to the first
+   writer instead would keep those slots mergeable.
 7. **Inlining on wasm has no notion of a body that dies.** A flat
    512-op limit, no single-caller rule, no growth budget: 35,000
    functions and 49 MB against 19,544 and 18 MB, with the difference
