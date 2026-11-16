@@ -63,7 +63,7 @@ fn pass(name: &str) -> Pass {
         },
         "ivrefold" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
-            pliron_clif_opt::ivrefold::run(f, &mut an).0
+            pliron_clif_opt::ivrefold::run(f, &mut an, true).0
         },
         "looprot" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
@@ -146,7 +146,7 @@ fn pass(name: &str) -> Pass {
         "punroll" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             let prof = std::collections::HashMap::default();
-            pliron_clif_opt::punroll::run(f, &mut an, "filetest", &prof)
+            pliron_clif_opt::punroll::run(f, &mut an, "filetest", &prof, false)
         },
         "rangefold" => rangefold::run,
         "rebase" => |f| {

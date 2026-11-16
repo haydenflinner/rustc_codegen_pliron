@@ -64,7 +64,7 @@ fn run(f: &mut Function) -> usize {
         std::env::set_var("PLIRON_PUNROLL_SEARCH", "1");
     }
     let mut an = Analysis::default();
-    pliron_clif_opt::punroll::run(f, &mut an, "conecost", &Default::default())
+    pliron_clif_opt::punroll::run(f, &mut an, "conecost", &Default::default(), false)
 }
 
 /// Two ~30-inst cones against a 7-inst body: 60 clone insts exceed the

@@ -3092,6 +3092,102 @@ fn deflag(func: &mut Function) -> usize {
 /// `a: jump C(args)`: the same parallel copy then materializes inside
 /// cold code, while the arg vregs are merely live-in to the adapter and
 /// the hot edge carries no args at all.
+/// Mark short `Result::Err` / `Option::None` tails cold: a single-pred
+/// CondBr arm whose body is only rematerializable constants and whose
+/// terminator jumps to a multi-pred join with const-only args. Layout
+/// sinks them out of the hot region; `coldedges` can then bare any
+/// param'd hot→tail edge; wasm `COLDBR` keeps them labeled instead of
+/// inlining into an `if` arm. Runs before `coldedges`.
+pub fn errcold(func: &mut Function) -> usize {
+    let mut npred: FxHashMap<Block, u32> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        for bc in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            *npred
+                .entry(bc.block(&func.dfg.value_lists))
+                .or_default() += 1;
+        }
+    }
+    let entry = func.layout.entry_block();
+    let mut mark = Vec::new();
+    for b in func.layout.blocks() {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        if func.dfg.insts[t].opcode() != Opcode::Brif {
+            continue;
+        }
+        for bc in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            let arm = bc.block(&func.dfg.value_lists);
+            if Some(arm) == entry || func.layout.is_cold(arm) {
+                continue;
+            }
+            if npred.get(&arm).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if is_err_tail(func, arm, &npred) {
+                mark.push(arm);
+            }
+        }
+    }
+    mark.sort_unstable();
+    mark.dedup();
+    let n = mark.len();
+    for b in mark {
+        func.layout.set_cold(b);
+    }
+    n
+}
+
+fn is_err_tail(func: &Function, b: Block, npred: &FxHashMap<Block, u32>) -> bool {
+    let Some(term) = func.layout.last_inst(b) else {
+        return false;
+    };
+    let mut n_inst = 0usize;
+    for inst in func.layout.block_insts(b) {
+        if inst == term {
+            break;
+        }
+        n_inst += 1;
+        if n_inst > 8 || !inst_is_remat_const(func, inst) {
+            return false;
+        }
+    }
+    if func.dfg.insts[term].opcode() != Opcode::Jump {
+        return false;
+    }
+    let dests = func.dfg.insts[term]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+    let Some(jc) = dests.first() else {
+        return false;
+    };
+    let join = jc.block(&func.dfg.value_lists);
+    if npred.get(&join).copied().unwrap_or(0) < 2 {
+        return false;
+    }
+    // Const-only edge args (Err tag), not a live Ok payload.
+    jc.args(&func.dfg.value_lists)
+        .all(|a| matches!(a, BlockArg::Value(v) if value_is_remat_const(func, v)))
+}
+
+fn inst_is_remat_const(func: &Function, inst: Inst) -> bool {
+    matches!(
+        func.dfg.insts[inst].opcode(),
+        Opcode::Iconst | Opcode::F32const | Opcode::F64const | Opcode::Vconst
+    )
+}
+
+fn value_is_remat_const(func: &Function, v: Value) -> bool {
+    match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => inst_is_remat_const(func, i),
+        _ => false,
+    }
+}
+
 pub fn coldedges(func: &mut Function) -> usize {
     // Collect (pred terminator, edge index, cold target, edge args)
     // first: new blocks are appended while rewriting.
@@ -4127,7 +4223,7 @@ pub fn const_sweep(func: &mut Function) -> usize {
         // Replacements can expose constant branch conditions.
         let f = crate::jumpthread::fold_const_branches(func);
         if f > 0 {
-            crate::unreach::run(func);
+            crate::unreach::run(func, false);
         }
         n += f;
     }

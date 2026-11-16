@@ -82,6 +82,22 @@ Pinned toolchain `nightly-2026-10-22` (`rust-toolchain.toml`; needs
   (`target/fast`, 2-4x quicker to rebuild than `dev`) and prints
   before/after; `PLIRON_PROFILE=fast` points gate/quick/test.sh/run.py at
   the same build. Numbers and details: [`docs/dev-loop.md`](docs/dev-loop.md).
+- **Unit tests on save: relax.** `../relax` (sibling checkout; override
+  with `RELAX=<path>`) is a from-scratch Rust JIT that compiles and runs
+  `pliron-clif-opt` / `clif-check` from source. Prefer it over
+  `cargo test` when iterating on a CLIF pass or a shape/`tests/*.rs`
+  oracle: after `harness/dev.py relax-build` once,
+  `harness/dev.py test [FILTER]` (or `--test NAME`) runs
+  `relax test --live` — tests stay loaded, a save recompiles only the
+  changed functions and reruns the tests that entered them (~1–3 s vs
+  ~35 s for `cargo test -p pliron-clif-opt --lib licm`). Use a filter;
+  the first cold run and `target/relax` cache are large. Also
+  `harness/dev.py test --test parse_digit_llvm_shape`,
+  `harness/dev.py relax ARGS` (`clif-check` under the JIT). Cannot run
+  the backend dylib (`rustc_private`) or `pliron-ir-opt` tests (no
+  `linkme`/`inventory` sections). `dev.py` sets `RELAX_LAZY_BODIES=0`.
+  Full notes: [`docs/dev-loop.md`](docs/dev-loop.md) "Unit tests on
+  save: relax".
 - One file: `rustc -O -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs`
 - cargo does not track the backend dylib or `PLIRON_*` vars: after
   changing either, use a fresh `CARGO_TARGET_DIR` or `cargo clean -p`.
@@ -233,8 +249,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   → `PLIRON_OPT_FNS=~fn PLIRON_OPT_BISECT=N` (licm load hoists are
   separate `licm-load` units).
 - **Live loop**: `harness/live/live.py` → http://localhost:8765. On
-  every save to a pass it rebuilds `clif-check`, replays the corpora and
-  shows new failures (with repro commands), size movers and step times.
+  every save to a pass it rebuilds `clif-check` (`PLIRON_PROFILE=fast`
+  by default, ~3 s warm), replays corpora (defaults to `smoke` when
+  present; larger sets sampled with `--every 8`), and shows new
+  failures (with repro commands), size movers and step times. Full
+  std: `--corpus std --every 1`. For pass **unit tests** on save, use
+  relax (`harness/dev.py test`, under Build) — faster than cargo, and
+  better than this dashboard for a single shape/`#[test]` oracle.
 - **Which function?** `harness/fnbisect.py [--names F] -- <cmd>`
   delta-debugs `PLIRON_OPT_FNS` (optimize only selected symbols; stable
   across CGUs, processes, rebuilds). `<cmd>` exits nonzero when broken

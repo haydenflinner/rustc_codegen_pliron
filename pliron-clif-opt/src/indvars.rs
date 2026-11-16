@@ -3,6 +3,11 @@
 //! block params, stepped by `K*step` per back edge instead of multiplied.
 //! Wrapping integer arithmetic makes the recurrence exact even on overflow,
 //! so no legality check is needed beyond shape-matching the step.
+//! On wasm (`amode_scale` false) a reversed index `base + ((A - iv) << k)`
+//! is the same recurrence with a negative step: the shift sits on the
+//! load in a reverse/swap loop, and a stepped pointer removes it.
+//! `PLIRON_REVIND=0` keeps the shift. Native keeps the index form for
+//! scaled addressing either way; that path was not re-timed.
 //! `PLIRON_INDUCT=0` disables it; `PLIRON_INDUCT_DEBUG` logs rewrites.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
@@ -318,21 +323,40 @@ fn edge_value(
     }
 }
 
+
 /// Every use of `insts`' results only ever forms a machine address:
 /// the value is a load/store address operand directly, or one operand
 /// of an `iadd` whose other operand is loop-invariant and whose result
 /// is itself address-only — `base + iv*scale` two levels deep still
 /// folds into one reg+reg*scale amode.
-fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bool {
+fn mem_addr_only(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    insts: &[Inst],
+    follow_block_params: bool,
+) -> bool {
     let mut addr: FxHashSet<Value> = insts.iter().map(|&i| func.dfg.first_result(i)).collect();
     loop {
         let mut grew = false;
         for b in func.layout.blocks() {
             for i in func.layout.block_insts(b) {
+                let op = func.dfg.insts[i].opcode();
+                let fixed = op.constraints().num_fixed_value_arguments();
                 for (k, &a) in func.dfg.inst_args(i).iter().enumerate() {
                     let a = func.dfg.resolve_aliases(a);
                     if !addr.contains(&a) {
                         continue;
+                    }
+                    // Branch arguments are the successor's params. A
+                    // wasm loop often computes `base+iv` in the latch
+                    // and loads it in the header. Following the param
+                    // is wasm-only; the native check still rejects any
+                    // branch use so a folded amode is not disturbed.
+                    if k >= fixed {
+                        if follow_block_params && op.is_branch() {
+                            continue;
+                        }
+                        return false;
                     }
                     match func.dfg.insts[i] {
                         InstructionData::Load { .. } if k == 0 => {}
@@ -358,14 +382,27 @@ fn mem_addr_only(func: &Function, body: &FxHashSet<Block>, insts: &[Inst]) -> bo
                         _ => return false,
                     }
                 }
+                let params_of = |dst: Block| func.dfg.block_params(dst).to_vec();
                 for bc in func.dfg.insts[i]
                     .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
-                    for a in bc.args(&func.dfg.value_lists) {
-                        if let BlockArg::Value(v) = a
-                            && addr.contains(&func.dfg.resolve_aliases(v))
-                        {
+                    let params = follow_block_params
+                        .then(|| params_of(bc.block(&func.dfg.value_lists)));
+                    for (ai, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                        let BlockArg::Value(v) = a else {
+                            continue;
+                        };
+                        if !addr.contains(&func.dfg.resolve_aliases(v)) {
+                            continue;
+                        }
+                        let Some(params) = params.as_ref() else {
                             return false;
+                        };
+                        let Some(&p) = params.get(ai) else {
+                            return false;
+                        };
+                        if addr.insert(func.dfg.resolve_aliases(p)) {
+                            grew = true;
                         }
                     }
                 }
@@ -1416,6 +1453,13 @@ fn run_loop(
         .blocks()
         .filter(|&b| la.is_in_loop(b, lp))
         .collect();
+    // Before the forward `base + iv*K` scan, so the unroller later sees
+    // a pointer rather than a shift of `A - iv`.
+    let n_rev = if amode_scale {
+        0
+    } else {
+        rev_index_ptrs(func, cfg, dt, &body, h, debug)
+    };
     let edges = edges_to(func, cfg, h);
     let params = func.dfg.block_params(h).to_vec();
     let mut n = 0;
@@ -1476,15 +1520,30 @@ fn run_loop(
             // and `iv`'s param all leave the loop at once. A real
             // `imul iv, 1` is a genuine dead multiply — stepping it away
             // removes two insts per iteration.
-            if mul == Mul::K(0)
-                || (mul == Mul::K(1)
-                    && bare
-                    && !base.is_some_and(|b| {
-                        iconst(func, b).is_none()
-                            && frees_base(func, &body, insts, b)
-                            && iv_only_affine(func, &body, h, iv, idx, insts)
-                    }))
-            {
+            //
+            // Wasm has no scaled addressing, so `load (base + iv)` is an
+            // add on the load's address path every trip even when `base`
+            // stays live for other uses. A stepped pointer keeps that add
+            // off the load. Native still requires `frees_base`
+            // (`amode_scale`); that path was not re-timed.
+            let bare_worth = base.is_some_and(|b| {
+                // The iv dies with the add, and so does `base`'s live
+                // range inside the loop. A constant base is left for
+                // the load-offset fold on that path.
+                if iconst(func, b).is_none()
+                    && frees_base(func, &body, insts, b)
+                    && iv_only_affine(func, &body, h, iv, idx, insts)
+                {
+                    return true;
+                }
+                // Wasm: `load (base+iv)` is on the address path even
+                // when `iv` stays for the exit value, and even when
+                // `base` is a constant the offset fold cannot see
+                // through a block param. The stepped pointer replaces
+                // that add. Native keeps the add (`amode_scale`).
+                !amode_scale && mem_addr_only(func, &body, insts, true)
+            });
+            if mul == Mul::K(0) || (mul == Mul::K(1) && bare && !bare_worth) {
                 continue;
             }
             // `base + iv*{1,2,4,8}` feeding only memory addresses folds
@@ -1499,7 +1558,7 @@ fn run_loop(
             // buys back the register and the liverange-split copies.
             if amode_scale
                 && matches!(mul, Mul::K(1 | 2 | 4 | 8))
-                && mem_addr_only(func, &body, insts)
+                && mem_addr_only(func, &body, insts, false)
                 && !base.is_some_and(|b| evicts_base(func, &body, insts, b))
             {
                 continue;
@@ -1577,6 +1636,322 @@ fn run_loop(
     }
     for (iv, np, b, k) in cands {
         n += elim_shadowed(func, dt, cfg, &body, h, &edges, iv, np, b, k, debug);
+    }
+    n + n_rev
+}
+
+/// `v` is ` (A - iv) << s ` or `A - iv`, with `A` loop-invariant.
+/// Returns `(A, K, scale inst, isub inst when the scale is a shift)`.
+fn neg_scaled(
+    func: &Function,
+    iv: Value,
+    body: &FxHashSet<Block>,
+    h: Block,
+    edges: &[Edge],
+    v: Value,
+) -> Option<(Value, i64, Inst, Option<Inst>)> {
+    let v = func.dfg.resolve_aliases(v);
+    let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return None;
+    };
+    let isub_iv = |inst: Inst| -> Option<Value> {
+        let InstructionData::Binary {
+            opcode: Opcode::Isub,
+            args: [a, b],
+        } = func.dfg.insts[inst]
+        else {
+            return None;
+        };
+        if func.dfg.resolve_aliases(b) != iv {
+            return None;
+        }
+        let a = func.dfg.resolve_aliases(a);
+        loop_invariant(func, body, h, edges, a).then_some(a)
+    };
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, b],
+        } => {
+            let s = iconst(func, b)?;
+            let bits = i64::from(func.dfg.value_type(iv).bits());
+            if !(0..bits).contains(&s) {
+                return None;
+            }
+            let a = func.dfg.resolve_aliases(a);
+            let ValueDef::Result(si, _) = func.dfg.value_def(a) else {
+                return None;
+            };
+            let aval = isub_iv(si)?;
+            Some((aval, 1i64 << s, i, Some(si)))
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Isub,
+            ..
+        } => {
+            let aval = isub_iv(i)?;
+            Some((aval, 1, i, None))
+        }
+        _ => None,
+    }
+}
+
+fn loop_invariant(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    h: Block,
+    edges: &[Edge],
+    v: Value,
+) -> bool {
+    if iconst(func, v).is_some() {
+        return true;
+    }
+    if def_block(func, v).is_some_and(|d| !body.contains(&d)) {
+        return true;
+    }
+    // A header param copied unchanged on every backedge is invariant.
+    // The entry edge holds the seed; `on_edge` reads it there.
+    let ValueDef::Param(b, pidx) = func.dfg.value_def(v) else {
+        return false;
+    };
+    if b != h {
+        return false;
+    }
+    edges.iter().all(|e| {
+        let Some(src) = func.layout.inst_block(e.inst) else {
+            return false;
+        };
+        if !body.contains(&src) {
+            return true;
+        }
+        edge_arg(func, e, pidx) == Some(v)
+    })
+}
+
+/// The value `v` has at branch `e`. A carried header param contributes
+/// that edge's argument (the entry seed); an iconst is rematerialized
+/// by the caller.
+fn on_edge(
+    func: &Function,
+    dt: &DominatorTree,
+    h: Block,
+    v: Value,
+    e: &Edge,
+) -> Option<Value> {
+    if iconst(func, v).is_some() {
+        return Some(v);
+    }
+    match func.dfg.value_def(v) {
+        ValueDef::Param(b, pidx) if b == h => edge_arg(func, e, pidx),
+        ValueDef::Result(i, _) if dt.try_dominates(i, e.inst, &func.layout) => Some(v),
+        ValueDef::Param(b, _) if dt.try_dominates(b, e.inst, &func.layout) => Some(v),
+        _ => None,
+    }
+}
+
+/// Entry value of `B + (A - arg)*K`, placed just before the branch.
+fn emit_rev_entry(
+    func: &mut Function,
+    inst: Inst,
+    b: Value,
+    a: Value,
+    k: i64,
+    arg: Value,
+) -> Value {
+    let t = func.dfg.value_type(arg);
+    let a_k = iconst(func, a);
+    let b_k = iconst(func, b);
+    let mut pos = FuncCursor::new(func).at_inst(inst);
+    let a = if let Some(c) = a_k {
+        iconst_masked(&mut pos, t, c)
+    } else {
+        a
+    };
+    let b = if let Some(c) = b_k {
+        iconst_masked(&mut pos, t, c)
+    } else {
+        b
+    };
+    let ak = if k == 1 {
+        a
+    } else {
+        let sh = iconst_masked(&mut pos, t, i64::from(k.trailing_zeros()));
+        pos.ins().ishl(a, sh)
+    };
+    let sum = pos.ins().iadd(b, ak);
+    let nk = iconst_masked(&mut pos, t, k.wrapping_neg());
+    let neg = pos.ins().imul(arg, nk);
+    pos.ins().iadd(sum, neg)
+}
+
+fn inst_users(func: &Function) -> FxHashMap<Value, FxHashSet<Inst>> {
+    let mut users: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for &a in func.dfg.inst_args(i) {
+                users
+                    .entry(func.dfg.resolve_aliases(a))
+                    .or_default()
+                    .insert(i);
+            }
+        }
+    }
+    users
+}
+
+/// Wasm: `base + ((A - iv) << k)` becomes a pointer stepped by `-k`
+/// per iv step. The shift is what a reverse or swap loop recomputes
+/// on every element. Only when the shift (or the bare sub) has no
+/// other use, so it actually leaves the loop.
+fn rev_index_ptrs(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    body: &FxHashSet<Block>,
+    h: Block,
+    debug: bool,
+) -> usize {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::pass_enabled("PLIRON_REVIND"));
+    if !*ON {
+        return 0;
+    }
+    let params = func.dfg.block_params(h).to_vec();
+    let edges = edges_to(func, cfg, h);
+    if edges.is_empty() || params.is_empty() {
+        return 0;
+    }
+    let users = inst_users(func);
+    let mut n = 0;
+    for (idx, &iv) in params.iter().enumerate() {
+        if n >= MAX_PARAMS {
+            break;
+        }
+        if !func.dfg.value_type(iv).is_int() {
+            continue;
+        }
+        // (scale result, base) -> the adds that compute `base + scale`.
+        let mut groups: FxHashMap<(Value, Value), Vec<Inst>> = FxHashMap::default();
+        let mut shape: FxHashMap<Value, (Value, i64, Inst, Option<Inst>)> = FxHashMap::default();
+        for &b in body {
+            for i in func.layout.block_insts(b) {
+                let InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args: [x, y],
+                } = func.dfg.insts[i]
+                else {
+                    continue;
+                };
+                for (base, idxv) in [(x, y), (y, x)] {
+                    let base = func.dfg.resolve_aliases(base);
+                    if !loop_invariant(func, body, h, &edges, base) {
+                        continue;
+                    }
+                    let Some((a, k, scale, sub)) = neg_scaled(func, iv, body, h, &edges, idxv) else {
+                        continue;
+                    };
+                    let idxv = func.dfg.resolve_aliases(idxv);
+                    shape.entry(idxv).or_insert((a, k, scale, sub));
+                    let g = groups.entry((idxv, base)).or_default();
+                    if !g.contains(&i) {
+                        g.push(i);
+                    }
+                }
+            }
+        }
+        let mut planned: Vec<(Value, Value, Vec<Inst>)> = groups
+            .into_iter()
+            .map(|((idxv, base), adds)| (idxv, base, adds))
+            .collect();
+        planned.sort_by_key(|(idxv, base, _)| (*idxv, *base));
+        for (idxv, base, adds) in planned {
+            if n >= MAX_PARAMS {
+                break;
+            }
+            let Some(&(a, k, scale, sub)) = shape.get(&idxv) else {
+                continue;
+            };
+            let Some(&scale_v) = func.dfg.inst_results(scale).first() else {
+                continue;
+            };
+            let scale_v = func.dfg.resolve_aliases(scale_v);
+            let used = users.get(&scale_v).cloned().unwrap_or_default();
+            if used.len() != adds.len() || adds.iter().any(|i| !used.contains(i)) {
+                continue;
+            }
+            let args: Option<Vec<Value>> = edges.iter().map(|e| edge_arg(func, e, idx)).collect();
+            let Some(args) = args else {
+                continue;
+            };
+            // A backedge whose iv steps doesn't read A or B. An entry
+            // edge does, and both seeds have to exist there.
+            let mut seeds: Vec<Option<(Value, Value)>> = Vec::with_capacity(edges.len());
+            let mut seeds_ok = true;
+            for (e, &arg) in edges.iter().zip(args.iter()) {
+                if step_form(func, iv, body, arg).is_some() {
+                    seeds.push(None);
+                    continue;
+                }
+                match (on_edge(func, dt, h, a, e), on_edge(func, dt, h, base, e)) {
+                    (Some(ae), Some(be)) => seeds.push(Some((ae, be))),
+                    _ => {
+                        seeds_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !seeds_ok {
+                continue;
+            }
+            let ty = func.dfg.value_type(func.dfg.first_result(adds[0]));
+            if !ty.is_int() {
+                continue;
+            }
+            let np = func.dfg.append_block_param(h, ty);
+            for ((e, arg), seed) in edges.iter().zip(args).zip(seeds) {
+                let v = match step_form(func, iv, body, arg) {
+                    Some(s) => emit_add(func, e.inst, np, Mul::K(k.wrapping_neg()), s),
+                    None => {
+                        let (ae, be) = seed.unwrap();
+                        emit_rev_entry(func, e.inst, be, ae, k, arg)
+                    }
+                };
+                let dfg = &mut func.dfg;
+                let bc = &mut dfg.insts[e.inst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    [e.slot];
+                bc.append_argument(v, &mut dfg.value_lists);
+            }
+            for &i in &adds {
+                let r = func.dfg.first_result(i);
+                func.layout.remove_inst(i);
+                func.dfg.clear_results(i);
+                func.dfg.change_to_alias(r, np);
+            }
+            func.layout.remove_inst(scale);
+            func.dfg.clear_results(scale);
+            if let Some(si) = sub {
+                let sv = func.dfg.inst_results(si).first().copied();
+                let only_scale = sv.is_some_and(|sv| {
+                    let sv = func.dfg.resolve_aliases(sv);
+                    let u = users.get(&sv).cloned().unwrap_or_default();
+                    u.len() == 1 && u.contains(&scale)
+                });
+                // `clear_results` above dropped the shift. The sub's
+                // result is still recorded in `users` from before.
+                if only_scale {
+                    func.layout.remove_inst(si);
+                    func.dfg.clear_results(si);
+                }
+            }
+            if debug && pliron_cfg::tracing_on() {
+                tracing::debug!(
+                    target: "pliron::indvars",
+                    "indvars {h}: rev base {base} A {a} K {k} -> {np}"
+                );
+            }
+            n += 1;
+        }
     }
     n
 }
@@ -2082,6 +2457,38 @@ enum Seed {
     Load,
 }
 
+/// `stores` do not overlap `load`. An isolated stack slot — the scan's
+/// own index, whose address never escapes — is disjoint from every
+/// other root, so it must not keep the carried element in memory.
+fn stores_spare(
+    func: &Function,
+    ps: &VMap<Value>,
+    iso: &FxHashSet<crate::loadfwd::Root>,
+    stores: &[Inst],
+    load: Inst,
+) -> bool {
+    let InstructionData::Load { arg, .. } = func.dfg.insts[load] else {
+        return false;
+    };
+    let lty = func.dfg.value_type(func.dfg.first_result(load));
+    let na = FxHashSet::default();
+    let ncc = FxHashSet::default();
+    let (lr, lo) = crate::loadfwd::norm_root(func, ps, &na, arg);
+    let loc = (lr, lo, lty);
+    for &s in stores {
+        let InstructionData::Store { args, offset, .. } = func.dfg.insts[s] else {
+            return false;
+        };
+        let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
+        let (sr, so) = crate::loadfwd::norm_root(func, ps, &na, args[1]);
+        let w = (sr, so.wrapping_add(i64::from(i32::from(offset))), ty);
+        if crate::loadfwd::may_write_iso(w, None, loc, &iso, &ncc) {
+            return false;
+        }
+    }
+    true
+}
+
 fn rot_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -2091,6 +2498,7 @@ fn rot_loop(
     ps: &VMap<Value>,
     na: &FxHashSet<Value>,
     debug: bool,
+    rotate_pairs: bool,
 ) -> usize {
     let h = la.loop_header(lp);
     if !dt.is_reachable(h) {
@@ -2102,12 +2510,17 @@ fn rot_loop(
         .filter(|&b| la.is_in_loop(b, lp))
         .collect();
     // The carried location must be stable between `A`'s load and the next
-    // iteration's read: no stores or calls anywhere in the loop.
+    // iteration's read: no calls anywhere in the loop, and no store that
+    // may overlap the loaded address. A non-escaping stack slot (the
+    // scan's own index) does not overlap it. That exception is gated on
+    // `rotate_pairs` so native keeps the old any-store bail. It was
+    // timed on wasm only; there is no native number for it, and no
+    // evidence it would be slower there.
+    let mut stores: Vec<Inst> = Vec::new();
     for &b in &body {
         for i in func.layout.block_insts(b) {
             let op = func.dfg.insts[i].opcode();
-            if op.can_store()
-                || op.other_side_effects()
+            let hard = op.other_side_effects()
                 || matches!(
                     op,
                     Opcode::Call
@@ -2118,14 +2531,17 @@ fn rot_loop(
                         | Opcode::AtomicRmw
                         | Opcode::AtomicLoad
                         | Opcode::Fence
-                )
-            {
+                );
+            if hard || (op.can_store() && !rotate_pairs) {
                 if debug {
                     if pliron_cfg::tracing_on() {
                         tracing::debug!(target: "pliron::indvars", "ldrot {h}: bail {op} at {b}")
                     };
                 }
                 return 0;
+            }
+            if op.can_store() {
+                stores.push(i);
             }
         }
     }
@@ -2246,9 +2662,17 @@ fn rot_loop(
     // group one step apart, the `v[i] vs v[i+1]` is_sorted shape):
     // rotating one load into a `prev` param hides the pair from
     // loopvec's elementwise compare, trading a per-iteration saved
-    // scalar load for a lost SIMD pass (~17% on sortw's run scan).
-    // Keep both loads scalar-visible; same-address reuse above still
-    // applies.
+    // scalar load for a lost SIMD pass (~17% on native sortw's run
+    // scan — that number is why native leaves the pair, and it was
+    // not re-run when the wasm flag was added). Keep both loads
+    // scalar-visible; same-address reuse above still applies.
+    // `rotate_pairs` (wasm default, `PLIRON_LDROT_PAIR=0` off) rotates
+    // an i64 pair only. The wasm ipnsort body we dumped had no vector
+    // compare, and that i64 pair is the one the wasm wall time moved
+    // (+29% to +11%). Narrower pairs stay skipped: not because a
+    // wasm run showed they decay, but because the only wasm build
+    // that rotated every width also enabled `PLIRON_ASSUME_RANGE`
+    // and lost chars_ascii, and the two were not split.
     let mut paired: FxHashSet<Inst> = FxHashSet::default();
     for b in func.layout.blocks().filter(|b| body.contains(b)) {
         for i in func.layout.block_insts(b) {
@@ -2274,7 +2698,10 @@ fn rot_loop(
                         && dx.1 != 0
                         && dx.2.wrapping_sub(dy.2).unsigned_abs() == dx.1.unsigned_abs()
                     {
-                        paired.extend([ls[x], ls[y]]);
+                        let ty = func.dfg.value_type(func.dfg.first_result(ls[x]));
+                        if !(rotate_pairs && ty == types::I64) {
+                            paired.extend([ls[x], ls[y]]);
+                        }
                     }
                 }
             }
@@ -2283,6 +2710,17 @@ fn rot_loop(
     let mut removed = FxHashSet::default();
     let mut rot = 0;
     let mut n = 0;
+    let iso = if stores.is_empty() {
+        FxHashSet::default()
+    } else {
+        crate::loadfwd::isolated(
+            func,
+            &FxHashSet::default(),
+            ps,
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        )
+    };
     for ((_, shift), ls) in &groups {
         // Same-address reuse: a load whose `dec` matches an earlier
         // dominating load reads the same address this iteration — the
@@ -2317,6 +2755,9 @@ fn rot_loop(
                 break;
             }
             if removed.contains(&bi) || paired.contains(&bi) {
+                continue;
+            }
+            if !stores.is_empty() && !stores_spare(func, ps, &iso, &stores, bi) {
                 continue;
             }
             let want = koff.wrapping_add(*shift);
@@ -2392,7 +2833,11 @@ fn rot_loop(
     n
 }
 
-pub fn rotld(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
+pub fn rotld(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    rotate_pairs: bool,
+) -> usize {
     let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let debug = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::indvars", tracing::Level::DEBUG);
@@ -2401,7 +2846,7 @@ pub fn rotld(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let loops = deepest_first(la);
     let mut n = 0;
     for lp in loops.into_iter().take(MAX_LOOPS) {
-        n += rot_loop(func, cfg, dt, la, lp, &ps, &na, debug);
+        n += rot_loop(func, cfg, dt, la, lp, &ps, &na, debug, rotate_pairs);
     }
     n
 }
@@ -3462,7 +3907,7 @@ mod tests {
             .return_(&[]);
 
         let mut an = crate::pipeline::Analysis::default();
-        assert_eq!(rotld(&mut func, &mut an), 1);
+        assert_eq!(rotld(&mut func, &mut an, false), 1);
         // `h` gained the `prev` param; `lb` folded into it, leaving the
         // entry seed load and `la` as the only loads.
         assert_eq!(func.dfg.block_params(h).len(), 2);
@@ -3483,11 +3928,11 @@ mod tests {
         }
     }
 
-    /// The same scan with `icmp v[i], v[i-1]` — the adjacent-pair shape
-    /// loopvec turns into vector compares — must NOT rotate: hiding one
-    /// load behind `prev` blocks vectorization (sortw's run scan).
-    #[test]
-    fn ldrot_skips_adjacent_pair_scan() {
+    /// `icmp v[i], v[i-1]` — the adjacent-pair shape loopvec turns into
+    /// vector compares on native (~17% on sortw if rotated; not
+    /// re-timed here). Default rotld leaves it. `rotate_pairs` is the
+    /// wasm path, timed on wasm only.
+    fn adjacent_pair_scan() -> Function {
         let mut sig = Signature::new(CallConv::Fast);
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
@@ -3539,10 +3984,40 @@ mod tests {
             .at_bottom(done)
             .ins()
             .return_(&[]);
+        func
+    }
 
+    #[test]
+    fn ldrot_skips_adjacent_pair_scan() {
+        let mut func = adjacent_pair_scan();
+        let h = func.layout.blocks().nth(1).unwrap();
         let mut an = crate::pipeline::Analysis::default();
-        assert_eq!(rotld(&mut func, &mut an), 0);
+        assert_eq!(rotld(&mut func, &mut an, false), 0);
         assert_eq!(func.dfg.block_params(h).len(), 1);
+    }
+
+    #[test]
+    fn ldrot_rotates_adjacent_pair_when_asked() {
+        let mut func = adjacent_pair_scan();
+        let h = func.layout.blocks().nth(1).unwrap();
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(rotld(&mut func, &mut an, true), 1);
+        assert_eq!(func.dfg.block_params(h).len(), 2);
+        let nloads = func
+            .layout
+            .blocks()
+            .map(|b| {
+                func.layout
+                    .block_insts(b)
+                    .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(nloads, 2);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("ldrot produced invalid IR: {e}\n{}", func.display());
+        }
     }
 
     /// The seed scan must not reuse a dominating access across a merge:
@@ -3624,7 +4099,7 @@ mod tests {
         // `body` doesn't run every iteration (its exit to `done` isn't
         // dominated by it), so `Seed::Load` is also out: no rotation.
         let mut an = crate::pipeline::Analysis::default();
-        assert_eq!(rotld(&mut func, &mut an), 0);
+        assert_eq!(rotld(&mut func, &mut an, false), 0);
         assert_eq!(func.dfg.block_params(h).len(), 1);
     }
 

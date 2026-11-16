@@ -5396,10 +5396,11 @@ pub fn run(
     derived: &mut VMap<Value>,
     sh: u32,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
-    run_rnn(func, loads, derived, sh, None, &SiteFacts::default())
+    run_rnn(func, loads, derived, sh, None, &SiteFacts::default(), true)
 }
 
 /// [`run`] with region-scoped non-null facts for the null-test folds.
+/// `ifconv_tables`: allow `br_table`→select ifconv (off on wasm).
 pub fn run_rnn(
     func: &mut Function,
     loads: &FxHashSet<Value>,
@@ -5407,6 +5408,7 @@ pub fn run_rnn(
     sh: u32,
     rnn: Option<&RegionNN>,
     sites: &SiteFacts,
+    ifconv_tables: bool,
 ) -> (usize, usize, usize, FxHashMap<Value, Value>) {
     use crate::pipeline::shape;
     let prof = pliron_cfg::tracing_on()
@@ -5576,11 +5578,7 @@ pub fn run_rnn(
         // covers the prefix param/param-delete phases.
         let ic = if ifconv && sh & shape::CONDBR != 0 && (ic_dirty || changed || dc > 0) {
             ic_dirty = false;
-            crate::ifconv::run(
-                func,
-                derived,
-                cd.as_mut(),
-            )
+            crate::ifconv::run(func, derived, cd.as_mut(), ifconv_tables)
         } else {
             0
         };

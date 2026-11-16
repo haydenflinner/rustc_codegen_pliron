@@ -550,6 +550,9 @@ fn emit_obj(
     }
     pliron_cfg::trace("*wasm-peep*", t0.elapsed().as_secs_f64() * 1e3, name);
     pliron_cfg::mark(&format!("wasm-peep {name}"));
+    // Branch hints (`PLIRON_WASM_BRHINT`) run in pliron-wasm-ld on the
+    // linked module — per-CGU indices are not final and locate_code
+    // fails on relocatable objects.
     custom_section(&mut bytes, "pliron.link", &tail.link(&dropped));
     let mut tf = Vec::new();
     leb(&mut tf, features.len() as u32);
@@ -713,6 +716,8 @@ fn peep_body(b: &[u8], fsig: &[(u32, u32)], tsig: &[(u32, u32)], nparams: u32) -
 mod wpeep_audit;
 #[path = "wpeep_elide.rs"]
 mod wpeep_elide;
+#[path = "wasm_brhint.rs"]
+mod wasm_brhint;
 
 /// `wpeep` switches. `from_env`: `PLIRON_WASM_AUDIT=1` audits every
 /// copy-forward round with the Datalog checker in `wpeep_audit` and
@@ -737,6 +742,11 @@ struct PeepOpts {
     delse: bool,
     /// `if {br K} else {A}` → `br_if` flush (`PLIRON_WASM_BRI`).
     bri: bool,
+    /// Repeat the flush so a nest of `if { br } else { ... }` flattens
+    /// every level (`PLIRON_WASM_BRI_NEST=1`, opt-in). One pass only
+    /// folds the outermost if; the measured wasm card did not want the
+    /// rest on by default.
+    bri_nest: bool,
     /// `if {A} else {br K}` → `i32.eqz; br_if` flush (`PLIRON_WASM_BRI2`).
     bri2: bool,
     /// `br K` before its K+1 enclosing `end`s (`PLIRON_WASM_BTR=0` off).
@@ -760,6 +770,7 @@ impl PeepOpts {
             ddrop: crate::env_get("PLIRON_WASM_DDROP") != Some("0"),
             delse: crate::env_get("PLIRON_WASM_DELSE") != Some("0"),
             bri: crate::env_get("PLIRON_WASM_BRI") != Some("0"),
+            bri_nest: crate::env_is("PLIRON_WASM_BRI_NEST", "1"),
             bri2: crate::env_get("PLIRON_WASM_BRI2") != Some("0"),
             btr: crate::env_get("PLIRON_WASM_BTR") != Some("0"),
             // Default on: −1.5 KiB regex-wasm CODE (11415→10917 blocks);
@@ -2622,6 +2633,14 @@ fn peep_body_opts(
     // `if` — unrepresentable). `PLIRON_WASM_BRI=0` off.
     if opts.bri {
         let safe_ctl = |op: u8| matches!(op, 0x00 | 0x01 | 0x0f | 0x10..=0x14);
+        // One pass folds the outermost `if { br } else { A }` and copies
+        // A through, so a nest (`if { br } else { if { br } else { A } }`,
+        // the digit checks) needs one pass per level. Default is one
+        // pass: flattening the nest measured slower under V8.
+        // `PLIRON_WASM_BRI_NEST=1` repeats until a round folds nothing.
+        let rounds = if opts.bri_nest { 32 } else { 1 };
+        for _ in 0..rounds {
+        let mut folded = false;
         let mut out: Vec<(WPeek, usize, usize, usize)> = Vec::with_capacity(ins.len());
         let mut i = 0;
         'iter: while i < ins.len() {
@@ -2635,7 +2654,21 @@ fn peep_body_opts(
             'fold: {
                 // arm1 must be exactly `br K` (K >= 1); then the else
                 // arm runs to the `if`'s `end` at rel 0.
-                let Some(&a1) = ins.get(i + 1) else { break 'fold };
+                // Coalesce leaves `Nop`/`Del` markers that emit nothing,
+                // so `if; nop; br; else` is the same bytes as `if; br;
+                // else` and has to fold the same way.
+                let skip_dead = |mut p: usize| {
+                    while p < ins.len() && matches!(ins[p].0, WPeek::Nop(_) | WPeek::Del) {
+                        p += 1;
+                    }
+                    p
+                };
+                let a1i = skip_dead(i + 1);
+                let Some(&a1) = ins.get(a1i) else { break 'fold };
+                // Markers emit nothing but later copy-forward still has
+                // to see the read and the reaffirming write.
+                let mut dead: Vec<(WPeek, usize, usize, usize)> =
+                    ins[i + 1..a1i].to_vec();
                 let k = match a1.0 {
                     WPeek::Br(d) => Some(d as usize),
                     WPeek::Ctl if b[a1.1] == 0x0c => {
@@ -2648,32 +2681,35 @@ fn peep_body_opts(
                 if k == 0 {
                     break 'fold;
                 }
-                match ins.get(i + 2).map(|x| (x.0, b[x.1])) {
+                let e1 = skip_dead(a1i + 1);
+                dead.extend_from_slice(&ins[a1i + 1..e1]);
+                match ins.get(e1).map(|x| (x.0, b[x.1])) {
                     // `if c { br K } end` — implicit empty else: the
                     // whole construct is just `br_if`.
                     Some((WPeek::Ctl, 0x0b)) => {
                         if prel.iter().any(|&(pp, _)| {
-                            pp == ins[i].1 || pp == a1.1 || pp == ins[i + 2].1
+                            pp == ins[i].1 || pp == a1.1 || pp == ins[e1].1
                         }) {
                             break 'fold;
                         }
+                        out.extend(dead);
                         out.push((
                             WPeek::BrIf((k - 1) as u32),
                             ins[i].1,
                             ins[i].1,
                             ins[i].3,
                         ));
-                        i += 3;
+                        i = e1 + 1;
                         continue 'iter;
                     }
                     Some((WPeek::Ctl, 0x05)) => {}
                     _ => break 'fold,
                 }
-                // Scan the else arm (i+3 .. j) retargeting `br`/`br_if`
-                // label operands for the removed `if` level.
+                // Scan the else arm (after the else .. j) retargeting
+                // `br`/`br_if` label operands for the removed `if` level.
                 let mut rel = 0usize;
                 let mut arm: Vec<(WPeek, usize, usize, usize)> = Vec::new();
-                let mut j = i + 3;
+                let mut j = e1 + 1;
                 let mut bad = false;
                 while j < ins.len() {
                     let (k2, s2, _e2, c2) = ins[j];
@@ -2766,11 +2802,13 @@ fn peep_body_opts(
                 if prel.iter().any(|&(pp, _)| {
                     pp == ins[i].1
                         || pp == a1.1
-                        || pp == ins[i + 2].1
+                        || pp == ins[e1].1
                         || pp == ins[j].1
                 }) {
                     break 'fold;
                 }
+                folded = true;
+                out.extend(dead);
                 out.push((WPeek::BrIf((k - 1) as u32), ins[i].1, ins[i].1, ins[i].3));
                 out.extend(arm);
                 i = j + 1;
@@ -2780,6 +2818,10 @@ fn peep_body_opts(
             i += 1;
         }
         ins = out;
+        if !folded {
+            break;
+        }
+        }
     }
     // Branch-tail: `br K` followed directly by the K+1 `end`s it would
     // jump through — the fallthrough lands on the same continuation, so
@@ -5171,10 +5213,12 @@ fn peep_body_opts(
         }
     }
     // Residual if/else→br_if: stackify `PLIRON_WBRIF=1` rewrites If
-    // nodes but grows CODE (~16%) by defeating wpeep's if-based folds.
-    // A late bytecode ibrk was tried and corrupted bodies (2026-10-28).
-    // Next: emit br_if shapes from stackify CondBr in a wpeep-friendly
-    // form, or port bri/brf to block+br_if.
+    // nodes but grows CODE (~16%) and fails validation on fallthrough
+    // arms; `=exit` rewrites only both-exit Ifs (correct after
+    // depth-aware label bump in waffle stackify — nested `br 0` must
+    // not move). Kernels 2026-11-14: `=exit` geomean 1.019→1.004,
+    // strwork +8.5%→+1.8%, parse_only flat. Still opt-in; next is
+    // cold-edge moves / wpeep on block+br_if, or default-on after gate.
     // (Local renumbering — hot-first index compaction — was tried and
     // reverted: the `groups` regroup it forces costs more than the
     // 1-byte-LEB savings it buys; ~+18B net on the module.)
@@ -5752,6 +5796,7 @@ mod wpeep_tests {
             ddrop: false,
             delse: false,
             bri: false,
+            bri_nest: false,
             bri2: false,
             btr: false,
             elideblk: false,
@@ -6209,6 +6254,67 @@ mod wpeep_tests {
                 0x02, 0x40, // block P
                 0x20, 0x00, // get 0 -> c
                 0x04, 0x40, // if
+                0x0c, 0x01, // br 1 -> P's end
+                0x05, // else
+                0x10, 0x05, // call 5
+                0x0b, // end (if)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts_delse();
+        o.bri = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(has_seq(&out, &[0x0d, 0x00, 0x10, 0x05]), "no br_if+A: {out:02x?}");
+        assert!(!has_seq(&out, &[0x04, 0x40]), "if kept: {out:02x?}");
+    }
+
+    // Coalesce turns `get t; set t` into a `Nop` marker that emits no
+    // bytes, so `if { get t; set t; br K } else { A }` is the same
+    // shape as `if { br K } else { A }` and has to flatten the same way.
+    // The marker stays in the instruction list (later copy-forward
+    // still has to see the read).
+    // A nest of `if { br } else { ... }` (the digit checks) is one
+    // `br_if` per level. One pass only flattens the outermost if.
+    #[test]
+    fn bri_nested_if_br_else_folds_each_level() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x0c, 0x01, // br 1 -> P
+                0x05, // else
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x0c, 0x02, // br 2 -> P
+                0x05, // else
+                0x10, 0x05, // call 5
+                0x0b, // end (inner if)
+                0x0b, // end (outer if)
+                0x0b, // end (P)
+            ],
+        );
+        let mut o = opts_delse();
+        o.bri = true;
+        o.bri_nest = true;
+        let out = peep_body_opts(&b, &[], &[], 0, &o).unwrap();
+        assert!(
+            has_seq(&out, &[0x0d, 0x00, 0x20, 0x00, 0x0d, 0x00, 0x10, 0x05]),
+            "nest not flattened: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0x04, 0x40]), "if kept: {out:02x?}");
+    }
+
+    #[test]
+    fn bri_if_self_copy_br_else_folds_to_br_if() {
+        let b = body(
+            4,
+            &[
+                0x02, 0x40, // block P
+                0x20, 0x00, // get 0 -> c
+                0x04, 0x40, // if
+                0x20, 0x01, 0x21, 0x01, // get 1; set 1
                 0x0c, 0x01, // br 1 -> P's end
                 0x05, // else
                 0x10, 0x05, // call 5
@@ -9893,6 +9999,13 @@ mod clif_emit {
                     continue;
                 }
                 self.wbs.insert(b, self.b.add_block());
+            }
+            // PLIRON: CLIF cold marks → waffle (`PLIRON_WASM_COLDBR` makes
+            // stackify keep hot→cold edges bare; see waffle PLIRON_PATCH).
+            for b in f.layout.blocks() {
+                if f.layout.is_cold(b) {
+                    self.b.cold.insert(self.wbs[&b]);
+                }
             }
             // Block params for non-entry blocks (flattened like the sig).
             for b in f.layout.blocks() {

@@ -2524,7 +2524,13 @@ pub(crate) fn may_write(w: Loc, ms: Option<(Root, i64)>, l: Loc) -> bool {
 /// it was computed against, or a store to an unrelated `Vec` header
 /// (`v25+152` in regex's `follow_epsilons`) blocks PRE of a `noalias`
 /// param's fields.
-fn may_write_iso(w: Loc, ms: Option<(Root, i64)>, l: Loc, iso: &FxHashSet<Root>, ncc: &FxHashSet<Root>) -> bool {
+pub(crate) fn may_write_iso(
+    w: Loc,
+    ms: Option<(Root, i64)>,
+    l: Loc,
+    iso: &FxHashSet<Root>,
+    ncc: &FxHashSet<Root>,
+) -> bool {
     let shel = |x: &Root| iso.contains(x) || ncc.contains(x);
     if w.0 != l.0 && (shel(&w.0) || shel(&l.0)) {
         return false;

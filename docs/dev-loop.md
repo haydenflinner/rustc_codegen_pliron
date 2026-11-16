@@ -29,11 +29,23 @@ sources and prints `save -> result` seconds.
 `PLIRON_PROFILE=fast` makes `harness/gate.py`, `harness/quick.py`,
 `test.sh`, `harness/run.py`, `harness/live/live.py` and
 `harness/corpus.sh` build and load `target/fast` instead of
-`target/debug` (default unchanged). `bench/heldout/ab.py --backend
-target/fast/librustc_codegen_pliron.dylib` does the same for the
-held-out A/B: the runtime of the *generated* program does not depend on
-how the backend was built, so only compile-time measurements still need
-`cargo build --release`.
+`target/debug`. `harness/live/live.py` defaults to `fast` when the
+env var is unset (warm pass edit → rebuild ~3 s); other harnesses
+still default to `debug` unless you set the var. `bench/heldout/ab.py
+--backend target/fast/librustc_codegen_pliron.dylib` does the same for
+the held-out A/B: the runtime of the *generated* program does not
+depend on how the backend was built, so only compile-time measurements
+still need `cargo build --release`.
+
+### `harness/live/live.py` defaults
+
+| | default | full / slow |
+|---|---|---|
+| profile | `fast` | `PLIRON_PROFILE=debug` |
+| corpus | `smoke` if present | `--corpus std` or `smoke,std` |
+| sample | `--every 8` on non-smoke | `--every 1` |
+
+Stdout each cycle: `live: build Xs  run Ys  [smoke:every=1]  profile=fast`.
 
 ## Numbers
 
@@ -47,7 +59,7 @@ order. Release is `CARGO_INCREMENTAL=0 cargo build --release --jobs 4`.
 |---|---|---|---|
 | backend dylib, wall | 51-82 s | 22-25 s | 10-13 s |
 | backend dylib, CPU | 150-255 s | 62-70 s | 15-25 s |
-| `clif-check`, wall | - | 19-41 s | 7-14 s |
+| `clif-check`, wall | - | 19-41 s | 7-14 s (idle warm ~3 s) |
 | `clif-check`, CPU | - | 63-72 s | 11-22 s |
 
 Where the time went (`-Ztime-passes` on `pliron-clif-opt`, 130k lines,
@@ -192,14 +204,15 @@ passes under rustc:
   `clif-check pipeline target/devloop/repro/mask01-vec-extend-trusted.clif`
   (`mask01: VERIFIER ERROR ... v807 is defined by inst927 which has no
   block`). In the working tree `edgesink` and `lcse2` fail the same way
-  on other functions. Even fixed, it would not help this loop: our
-  backend has no incremental reuse, so every edit would recompile all of
-  `pliron-clif-opt`, against 4-6 s for incremental LLVM in `fast`. The
-  dependencies took as long as with LLVM (2 min 53 s). It is a good test
-  corpus, though: `target/devloop/corpus-clcg` (cranelift-codegen through
-  the HEAD backend, 18973 functions) replays with 8 interpreter
-  mismatches (`DebugMap::entries`, `HashMap` `Debug`) that the std corpus
-  does not have.
+  on other functions. Even fixed, dogfood with a pinned dylib only
+  shaves the rustc codegen slice (CGU reuse already works — thin
+  incremental is ~36% faster inside rustc than stock); warm
+  `cargo build --profile fast -p pliron-clif-check` after a pass edit
+  is already ~3 s under LLVM. Deps took as long as with LLVM (2 min
+  53 s). It is a good test corpus, though: `target/devloop/corpus-clcg`
+  (cranelift-codegen through the HEAD backend, 18973 functions) replays
+  with 8 interpreter mismatches (`DebugMap::entries`, `HashMap`
+  `Debug`) that the std corpus does not have.
 - **Hot-patching the backend inside rustc or `clif-check`** with
   `PLIRON_HOT`. It needs the patched crate compiled by our backend as one
   CGU, which is the item above, and a patch is a whole-crate recompile.

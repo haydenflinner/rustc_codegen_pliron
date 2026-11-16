@@ -244,6 +244,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // regex and html-rewriter, less elsewhere, executed instructions
     // within +-0.05%. `=0` off.
     "PLIRON_PANICSTUB",
+    // Const-only CondBr→join `Err`/`None` tails marked cold before
+    // `coldedges` (`errcold`): native layout sinks them; wasm COLDBR
+    // can keep the hot edge bare. `=0` off.
+    "PLIRON_ERRCOLD",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

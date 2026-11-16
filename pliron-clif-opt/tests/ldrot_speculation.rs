@@ -43,7 +43,7 @@ block3(v13: i64):
 fn rotated_load_is_not_hoisted_above_the_exit_test() {
     let before = parse(SUM_PAIRS);
     let mut after = before.clone();
-    pliron_clif_opt::indvars::rotld(&mut after, &mut Analysis::default());
+    pliron_clif_opt::indvars::rotld(&mut after, &mut Analysis::default(), false);
     let cfg = Config {
         trials: 64,
         ..Config::default()
@@ -84,7 +84,7 @@ fn rotated_load_still_fires_when_the_load_always_runs() {
     );
     let mut after = before.clone();
     assert!(
-        pliron_clif_opt::indvars::rotld(&mut after, &mut Analysis::default()) > 0,
+        pliron_clif_opt::indvars::rotld(&mut after, &mut Analysis::default(), false) > 0,
         "{}",
         after.display()
     );

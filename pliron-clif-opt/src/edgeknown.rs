@@ -199,6 +199,23 @@ pub fn run(func: &mut Function) -> usize {
     n
 }
 
+/// Same relational compare: identical predicate and operands. Equality
+/// tests stay on `eq_key`, which also folds a swapped `==`/`!=`.
+fn rel_key(func: &Function, v: Value) -> Option<(IntCC, Value, Value)> {
+    match func.dfg.insts[func.dfg.value_def(v).inst()?] {
+        InstructionData::IntCompare { cond, args, .. }
+            if !matches!(cond, IntCC::Equal | IntCC::NotEqual) =>
+        {
+            Some((
+                cond,
+                func.dfg.resolve_aliases(args[0]),
+                func.dfg.resolve_aliases(args[1]),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// `(a, b, true)` for `a != b`, `false` for `a == b`, operands in a fixed
 /// order.
 fn eq_key(func: &Function, v: Value) -> Option<(Value, Value, bool)> {
@@ -219,7 +236,10 @@ fn eq_key(func: &Function, v: Value) -> Option<(Value, Value, bool)> {
 /// after every pass that folds decided branches has run
 /// (`tests/parity/closing.rs`: `cbz x1` twice in a row). Climbs
 /// single-predecessor edges (at most eight) looking for a `brif` on the
-/// same value, or on an `icmp eq/ne` of the same operands.
+/// same value, or on an `icmp eq/ne` of the same operands. A repeated
+/// relational compare (`ult`/`ule`/`slt`/`sle` and the rest) with the
+/// same operands is the same fact: `assume(i < n)` lowered as a branch
+/// to unreachable, then the slice bounds check on `i < n`.
 pub fn retests(func: &mut Function) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
@@ -231,6 +251,7 @@ pub fn retests(func: &mut Function) -> usize {
         };
         let c = func.dfg.resolve_aliases(arg);
         let ck = eq_key(func, c);
+        let rk = rel_key(func, c);
         let mut cur = b;
         let mut known: Option<bool> = None;
         for _ in 0..8 {
@@ -253,6 +274,12 @@ pub fn retests(func: &mut Function) -> usize {
                     {
                         // The operands differ on this edge iff `pne == taken`.
                         known = Some((pne == taken) == ne);
+                        break;
+                    }
+                    if let (Some(rc), Some(prc)) = (rk, rel_key(func, pc))
+                        && rc == prc
+                    {
+                        known = Some(taken);
                         break;
                     }
                 }
@@ -430,4 +457,48 @@ pub fn selects(func: &mut Function) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::{
+        AbiParam, Function, InstBuilder, Signature, UserFuncName, types,
+    };
+    use cranelift_codegen::isa::CallConv;
+
+    /// `assume(i < 54)` as a branch, then the slice check on a fresh
+    /// `icmp ult` of the same operands: the second branch is decided.
+    #[test]
+    fn retests_folds_repeated_ult() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I32));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let mid = func.dfg.make_block();
+        let ok = func.dfg.make_block();
+        let bad = func.dfg.make_block();
+        let dead = func.dfg.make_block();
+        for b in [entry, mid, ok, bad, dead] {
+            func.layout.append_block(b);
+        }
+        let i = func.dfg.append_block_param(entry, types::I32);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let k = cur.ins().iconst(types::I32, 54);
+        let c1 = cur.ins().icmp(IntCC::UnsignedLessThan, i, k);
+        cur.ins().brif(c1, mid, &[], dead, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(mid);
+        let c2 = cur.ins().icmp(IntCC::UnsignedLessThan, i, k);
+        cur.ins().brif(c2, ok, &[], bad, &[]);
+
+        for b in [ok, bad, dead] {
+            FuncCursor::new(&mut func).at_bottom(b).ins().return_(&[]);
+        }
+
+        assert_eq!(retests(&mut func), 1);
+        let term = func.layout.last_inst(mid).unwrap();
+        assert_eq!(func.dfg.insts[term].opcode(), Opcode::Jump);
+    }
 }

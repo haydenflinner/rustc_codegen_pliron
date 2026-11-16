@@ -243,7 +243,7 @@ fn punroll_leaves_search_loops_rolled() {
     let mut f = parse(ANY);
     let bound = f.dfg.block_params(block(&f, 0))[1];
     let mut an = Analysis::default();
-    pliron_clif_opt::punroll::run(&mut f, &mut an, "any", &Default::default());
+    pliron_clif_opt::punroll::run(&mut f, &mut an, "any", &Default::default(), false);
     verify(&f);
     // No group guard: whatever copies exist (peeling may add some),
     // each byte load still has its own `p == end` test in front.
@@ -278,7 +278,7 @@ block2(v20: i64):
     );
     let before = f.display().to_string();
     let mut an = Analysis::default();
-    pliron_clif_opt::punroll::run(&mut f, &mut an, "dowhile", &Default::default());
+    pliron_clif_opt::punroll::run(&mut f, &mut an, "dowhile", &Default::default(), false);
     verify(&f);
     // (Peeling may still copy the body; the group guard's `umin` is
     // what marks an unroll.)

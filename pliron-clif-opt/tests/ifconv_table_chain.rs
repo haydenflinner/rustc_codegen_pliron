@@ -69,7 +69,7 @@ block4:
 fn table_arms_through_shared_chain_stay_apart() {
     let before = parse(SRC);
     let mut after = before.clone();
-    ifconv::run(&mut after, &mut VMap::default(), None);
+    ifconv::run(&mut after, &mut VMap::default(), None, /* tables */ true);
     let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
     cranelift_codegen::verify_function(&after, &flags).unwrap();
     // 5 of 8 tag values take the table arm; 256 trials hit it many times.

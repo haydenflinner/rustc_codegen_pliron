@@ -11,6 +11,8 @@
 //! Memory layout: [0, 1024) unused, then the stack (grows down to 1024),
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
 
+mod addroff;
+mod brhint;
 mod llvm;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -1460,7 +1462,13 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             data: tf.into(),
         });
     }
-    std::fs::write(&out, module.finish()).map_err(|e| format!("{out}: {e}"))?;
+    let mut out_bytes = module.finish();
+    // Post-link: GOT reads are i32.const now. Folding one into a memarg
+    // is opt-in (`PLIRON_WASM_ADDROFF=1`); the chars_mixed probes got
+    // slower with it on. Branch hints stay opt-in via PLIRON_WASM_BRHINT.
+    addroff::apply(&mut out_bytes);
+    brhint::apply(&mut out_bytes);
+    std::fs::write(&out, out_bytes).map_err(|e| format!("{out}: {e}"))?;
     if std::env::var_os("PLIRON_WASM_LD_VERBOSE").is_some() {
         eprintln!(
             "pliron-wasm-ld: {} objects ({} from archives), {} functions, {} host imports, {} bytes data",

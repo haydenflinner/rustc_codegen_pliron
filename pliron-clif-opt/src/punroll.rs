@@ -279,6 +279,957 @@ pub(crate) struct Cnt {
     pub(crate) eq: bool,
 }
 
+/// `size -= size/2` until `size <= 1`, entry size a constant in 2..=64.
+/// One block: the header is the latch, its `brif` continues on the
+/// updated size and exits otherwise. Each copy is straight-line; the
+/// last jumps to the original exit. The orphaned header is deleted.
+fn halving_unroll(func: &mut Function, an: &mut crate::pipeline::Analysis, name: &str) -> usize {
+    let mut n = 0;
+    for _ in 0..4 {
+        let hit = {
+            let crate::pipeline::CfgDtLa { cfg, la, .. } = an.cfg_dt_la(func);
+            let mut found = None;
+            for lp in la.loops() {
+                let h = la.loop_header(lp);
+                if match_halving(func, &cfg, h).is_some()
+                    || match_halving_body(func, &cfg, h).is_some()
+                    || match_halving_chain(func, &cfg, h).is_some()
+                {
+                    found = Some(h);
+                    break;
+                }
+            }
+            found
+        };
+        let Some(h) = hit else { break };
+        let crate::pipeline::CfgDtLa { cfg, .. } = an.cfg_dt_la(func);
+        let single = match_halving(func, &cfg, h);
+        let body = if single.is_none() { match_halving_body(func, &cfg, h) } else { None };
+        let chain = if single.is_none() && body.is_none() {
+            match_halving_chain(func, &cfg, h)
+        } else {
+            None
+        };
+        drop(cfg);
+        let ok = if let Some(info) = single {
+            apply_halving(func, info)
+        } else if let Some(info) = body {
+            apply_halving_body(func, info)
+        } else if let Some(info) = chain {
+            tracing::debug!(target: "pliron::punroll", "half-chain {name} trip {}", info.trip);
+            apply_halving_chain(func, info)
+        } else {
+            false
+        };
+        if !ok {
+            break;
+        }
+        crate::jumpthread::remove_unreachable_blocks(func);
+        an.invalidate(func);
+        n += 1;
+    }
+    n
+}
+
+struct Half {
+    h: Block,
+    entry_inst: Inst,
+    entry_slot: usize,
+    trip: u32,
+}
+
+fn halving_trips(mut c: i64) -> Option<u32> {
+    if !(2..=64).contains(&c) {
+        return None;
+    }
+    let mut n = 0u32;
+    while c > 1 {
+        c -= c >> 1;
+        n += 1;
+        if n > 8 {
+            return None;
+        }
+    }
+    Some(n)
+}
+
+fn is_half(func: &Function, v: Value, size: Value) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let cranelift_codegen::ir::ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return false;
+    };
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Ushr | Opcode::Sshr,
+            args,
+        } if func.dfg.resolve_aliases(args[0]) == size && iconst(func, args[1]) == Some(1) => true,
+        InstructionData::Binary {
+            opcode: Opcode::Udiv,
+            args,
+        } if func.dfg.resolve_aliases(args[0]) == size && iconst(func, args[1]) == Some(2) => true,
+        _ => false,
+    }
+}
+
+/// `isub size, size/2`.
+fn is_halving_step(func: &Function, v: Value, size: Value) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let cranelift_codegen::ir::ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+        return false;
+    };
+    let InstructionData::Binary {
+        opcode: Opcode::Isub,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return false;
+    };
+    func.dfg.resolve_aliases(args[0]) == size && is_half(func, args[1], size)
+}
+
+/// Continue iff the updated size is still above 1.
+fn continues_while_big(cc: IntCC, new_on_left: bool, k: i64, then_continues: bool) -> bool {
+    let cont_if_true = then_continues;
+    match (new_on_left, k, cc) {
+        (true, 2, IntCC::UnsignedGreaterThanOrEqual) => cont_if_true,
+        (true, 2, IntCC::UnsignedLessThan) => !cont_if_true,
+        (true, 1, IntCC::UnsignedGreaterThan) => cont_if_true,
+        (true, 1, IntCC::UnsignedLessThanOrEqual) => !cont_if_true,
+        (false, 2, IntCC::UnsignedLessThanOrEqual) => cont_if_true,
+        (false, 2, IntCC::UnsignedGreaterThan) => !cont_if_true,
+        (false, 1, IntCC::UnsignedLessThan) => cont_if_true,
+        (false, 1, IntCC::UnsignedGreaterThanOrEqual) => !cont_if_true,
+        _ => false,
+    }
+}
+
+fn match_halving(func: &Function, cfg: &ControlFlowGraph, h: Block) -> Option<Half> {
+    let mut insts = func.layout.block_insts(h);
+    let first = insts.next()?;
+    let ninst = 1 + insts.count();
+    if ninst > 32 {
+        return None;
+    }
+    let term = func.layout.last_inst(h)?;
+    if func.layout.block_insts(h).any(|i| {
+        i != term && func.dfg.insts[i].opcode().is_branch()
+    }) {
+        return None;
+    }
+    let InstructionData::Brif {
+        arg,
+        blocks: [bt, bf],
+        ..
+    } = func.dfg.insts[term]
+    else {
+        return None;
+    };
+    let (tb, fb) = (
+        bt.block(&func.dfg.value_lists),
+        bf.block(&func.dfg.value_lists),
+    );
+    let (cont, then_continues) = if tb == h && fb != h {
+        (bt, true)
+    } else if fb == h && tb != h {
+        (bf, false)
+    } else {
+        return None;
+    };
+    let params = func.dfg.block_params(h);
+    let cont_args: Vec<Value> = cont
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if cont_args.len() != params.len() {
+        return None;
+    }
+    let mut size_slot = None;
+    for (i, &p) in params.iter().enumerate() {
+        if is_halving_step(func, cont_args[i], p) {
+            if size_slot.is_some() {
+                return None;
+            }
+            size_slot = Some(i);
+        }
+    }
+    let slot = size_slot?;
+    let new_size = cont_args[slot];
+    let cranelift_codegen::ir::ValueDef::Result(ci, _) = func.dfg.value_def(func.dfg.resolve_aliases(arg)) else {
+        return None;
+    };
+    let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[ci] else {
+        return None;
+    };
+    let (x, y) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    let (new_on_left, k) = if x == new_size {
+        (true, iconst(func, y)?)
+    } else if y == new_size {
+        (false, iconst(func, x)?)
+    } else {
+        return None;
+    };
+    if !continues_while_big(cond, new_on_left, k, then_continues) {
+        return None;
+    }
+    let mut entry = None;
+    for p in cfg.pred_iter(h) {
+        if p.block == h {
+            continue;
+        }
+        if entry.is_some() {
+            return None;
+        }
+        let dests = func.dfg.insts[p.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let mut slot_i = None;
+        for (s, bc) in dests.iter().enumerate() {
+            if bc.block(&func.dfg.value_lists) == h {
+                if slot_i.is_some() {
+                    return None;
+                }
+                slot_i = Some(s);
+            }
+        }
+        entry = Some((p.inst, slot_i?));
+    }
+    let (entry_inst, entry_slot) = entry?;
+    let ebc = func.dfg.insts[entry_inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[entry_slot];
+    let eargs: Vec<Value> = ebc
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let c0 = iconst(func, *eargs.get(slot)?)?;
+    let trip = halving_trips(c0)?;
+    // The exit edge's args are cloned on the last copy; a non-value
+    // arg (a block param of the target) has nothing to remap.
+    let exit_bc = if then_continues { bf } else { bt };
+    for a in exit_bc.args(&func.dfg.value_lists) {
+        if !matches!(a, BlockArg::Value(_)) {
+            return None;
+        }
+    }
+    let _ = first;
+    Some(Half { h, entry_inst, entry_slot, trip })
+}
+
+/// Record `old -> new` under the alias root. Cloned uses resolve
+/// aliases before the lookup (`Vm::mv`), so the key has to be the root
+/// or a GVN'd operand misses the map and keeps pointing at the
+/// original inst after the loop is deleted.
+fn map_val(func: &Function, vmap: &mut FxHashMap<Value, Value>, old: Value, new: Value) {
+    vmap.insert(func.dfg.resolve_aliases(old), new);
+}
+
+fn remap_call(func: &Function, bc: BlockCall, vmap: &FxHashMap<Value, Value>) -> Option<Vec<Value>> {
+    let mut out = Vec::new();
+    for a in bc.args(&func.dfg.value_lists) {
+        match a {
+            BlockArg::Value(v) => {
+                let v = func.dfg.resolve_aliases(v);
+                out.push(vmap.get(&v).copied().unwrap_or(v));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn seal_halving(func: &mut Function, copies: &[Block]) {
+    for &b in copies {
+        if func.layout.last_inst(b).is_none() {
+            FuncCursor::new(func).at_bottom(b).ins().trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+        }
+    }
+}
+
+fn apply_halving(func: &mut Function, info: Half) -> bool {
+    let Half { h, entry_inst, entry_slot, trip } = info;
+    let params: Vec<Value> = func.dfg.block_params(h).to_vec();
+    let term = func.layout.last_inst(h).unwrap();
+    let InstructionData::Brif { blocks: [bt, bf], .. } = func.dfg.insts[term] else {
+        return false;
+    };
+    let (cont, exit) = if bt.block(&func.dfg.value_lists) == h {
+        (bt, bf)
+    } else {
+        (bf, bt)
+    };
+    let exit_block = exit.block(&func.dfg.value_lists);
+    let ebc = func.dfg.insts[entry_inst].branch_destination(
+        &func.dfg.jump_tables,
+        &func.dfg.exception_tables,
+    )[entry_slot];
+    let mut incoming: Vec<Value> = Vec::new();
+    for a in ebc.args(&func.dfg.value_lists) {
+        let BlockArg::Value(v) = a else { return false };
+        incoming.push(func.dfg.resolve_aliases(v));
+    }
+    if incoming.len() != params.len() {
+        return false;
+    }
+    let copies: Vec<Block> = (0..trip)
+        .map(|_| {
+            let b = func.dfg.make_block();
+            func.layout.append_block(b);
+            b
+        })
+        .collect();
+    let body: Vec<Inst> = func.layout.block_insts(h).filter(|&i| i != term).collect();
+    for (k, &dst) in copies.iter().enumerate() {
+        let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for (i, &p) in params.iter().enumerate() {
+            map_val(func, &mut vmap, p, incoming[i]);
+        }
+        for &ii in &body {
+            let old: Vec<Value> = func.dfg.inst_results(ii).to_vec();
+            let ni = clone_inst_into(func, ii, dst, &vmap);
+            let newr: Vec<Value> = func.dfg.inst_results(ni).to_vec();
+            for (o, n) in old.into_iter().zip(newr) {
+                map_val(func, &mut vmap, o, n);
+            }
+        }
+        let Some(cont_vals) = remap_call(func, cont, &vmap) else {
+            seal_halving(func, &copies);
+            return false;
+        };
+        let Some(exit_vals) = remap_call(func, exit, &vmap) else {
+            seal_halving(func, &copies);
+            return false;
+        };
+        let cont_args: Vec<BlockArg> = cont_vals.iter().copied().map(BlockArg::Value).collect();
+        let exit_args: Vec<BlockArg> = exit_vals.iter().copied().map(BlockArg::Value).collect();
+        let mut pos = FuncCursor::new(func).at_bottom(dst);
+        if k + 1 == trip as usize {
+            pos.ins().jump(exit_block, &exit_args);
+        } else {
+            pos.ins().jump(copies[k + 1], &[] as &[BlockArg]);
+            incoming = cont_vals;
+        }
+        let _ = cont_args;
+    }
+    let dfg = &mut func.dfg;
+    let new_bc = BlockCall::new(copies[0], std::iter::empty(), &mut dfg.value_lists);
+    dfg.insts[entry_inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        [entry_slot] = new_bc;
+    true
+}
+
+/// Header tests the incoming size, body is one param-less block that
+/// jumps back with `size - size/2`. The shape `looprot` leaves for a
+/// `while size > 1` whose step is not an affine add.
+struct HalfBody {
+    h: Block,
+    body: Block,
+    entry_inst: Inst,
+    entry_slot: usize,
+    trip: u32,
+}
+
+fn match_halving_body(func: &Function, cfg: &ControlFlowGraph, h: Block) -> Option<HalfBody> {
+    let term = func.layout.last_inst(h)?;
+    let InstructionData::Brif {
+        arg,
+        blocks: [bt, bf],
+        ..
+    } = func.dfg.insts[term]
+    else {
+        return None;
+    };
+    let (tb, fb) = (
+        bt.block(&func.dfg.value_lists),
+        bf.block(&func.dfg.value_lists),
+    );
+    if tb == h || fb == h {
+        return None;
+    }
+    // The continue arm is the body: its terminator jumps back to `h`.
+    let body_of = |b: Block| -> Option<Block> {
+        if func.dfg.block_params(b).is_empty()
+            && func.layout.last_inst(b).is_some_and(|t| {
+                matches!(
+                    func.dfg.insts[t],
+                    InstructionData::Jump { destination, .. }
+                        if destination.block(&func.dfg.value_lists) == h
+                )
+            })
+        {
+            Some(b)
+        } else {
+            None
+        }
+    };
+    let (body, then_continues) = if let Some(b) = body_of(tb) {
+        (b, true)
+    } else if let Some(b) = body_of(fb) {
+        (b, false)
+    } else {
+        return None;
+    };
+    let ninst = func.layout.block_insts(h).count() + func.layout.block_insts(body).count();
+    if ninst > 32 {
+        return None;
+    }
+    let jump = func.layout.last_inst(body)?;
+    let InstructionData::Jump { destination, .. } = func.dfg.insts[jump] else {
+        return None;
+    };
+    let params = func.dfg.block_params(h);
+    let back: Vec<Value> = destination
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if back.len() != params.len() {
+        return None;
+    }
+    let mut size_slot = None;
+    for (i, &p) in params.iter().enumerate() {
+        if is_halving_step(func, back[i], p) {
+            if size_slot.is_some() {
+                return None;
+            }
+            size_slot = Some(i);
+        }
+    }
+    let slot = size_slot?;
+    let size = params[slot];
+    let cranelift_codegen::ir::ValueDef::Result(ci, _) =
+        func.dfg.value_def(func.dfg.resolve_aliases(arg))
+    else {
+        return None;
+    };
+    let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[ci] else {
+        return None;
+    };
+    let (x, y) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    let (on_left, k) = if x == size {
+        (true, iconst(func, y)?)
+    } else if y == size {
+        (false, iconst(func, x)?)
+    } else {
+        return None;
+    };
+    if !continues_while_big(cond, on_left, k, then_continues) {
+        return None;
+    }
+    let exit_bc = if then_continues { bf } else { bt };
+    for a in exit_bc.args(&func.dfg.value_lists) {
+        if !matches!(a, BlockArg::Value(_)) {
+            return None;
+        }
+    }
+    // The branch into the body carries no args (the body reads `h`'s params).
+    let into = if then_continues { bt } else { bf };
+    if into.args(&func.dfg.value_lists).next().is_some() {
+        return None;
+    }
+    let mut entry = None;
+    for p in cfg.pred_iter(h) {
+        if p.block == body || p.block == h {
+            continue;
+        }
+        if entry.is_some() {
+            return None;
+        }
+        let dests = func.dfg.insts[p.inst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let mut slot_i = None;
+        for (s, bc) in dests.iter().enumerate() {
+            if bc.block(&func.dfg.value_lists) == h {
+                if slot_i.is_some() {
+                    return None;
+                }
+                slot_i = Some(s);
+            }
+        }
+        entry = Some((p.inst, slot_i?));
+    }
+    let (entry_inst, entry_slot) = entry?;
+    let ebc = func.dfg.insts[entry_inst].branch_destination(
+        &func.dfg.jump_tables,
+        &func.dfg.exception_tables,
+    )[entry_slot];
+    let eargs: Vec<Value> = ebc
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let trip = halving_trips(iconst(func, *eargs.get(slot)?)?)?;
+    Some(HalfBody { h, body, entry_inst, entry_slot, trip })
+}
+
+fn apply_halving_body(func: &mut Function, info: HalfBody) -> bool {
+    let HalfBody { h, body, entry_inst, entry_slot, trip } = info;
+    let params: Vec<Value> = func.dfg.block_params(h).to_vec();
+    let term = func.layout.last_inst(h).unwrap();
+    let InstructionData::Brif { blocks: [bt, bf], .. } = func.dfg.insts[term] else {
+        return false;
+    };
+    let exit = if bt.block(&func.dfg.value_lists) == body { bf } else { bt };
+    let exit_block = exit.block(&func.dfg.value_lists);
+    let jump = func.layout.last_inst(body).unwrap();
+    let InstructionData::Jump { destination, .. } = func.dfg.insts[jump] else {
+        return false;
+    };
+    let ebc = func.dfg.insts[entry_inst].branch_destination(
+        &func.dfg.jump_tables,
+        &func.dfg.exception_tables,
+    )[entry_slot];
+    let mut incoming = Vec::new();
+    for a in ebc.args(&func.dfg.value_lists) {
+        let BlockArg::Value(v) = a else { return false };
+        incoming.push(func.dfg.resolve_aliases(v));
+    }
+    if incoming.len() != params.len() {
+        return false;
+    }
+    let copies: Vec<Block> = (0..trip)
+        .map(|_| {
+            let b = func.dfg.make_block();
+            func.layout.append_block(b);
+            b
+        })
+        .collect();
+    let body_insts: Vec<Inst> = func.layout.block_insts(body).filter(|&i| i != jump).collect();
+    let head_insts: Vec<Inst> = func.layout.block_insts(h).filter(|&i| i != term).collect();
+    for (k, &dst) in copies.iter().enumerate() {
+        let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for (i, &p) in params.iter().enumerate() {
+            map_val(func, &mut vmap, p, incoming[i]);
+        }
+        for &ii in &body_insts {
+            let old: Vec<Value> = func.dfg.inst_results(ii).to_vec();
+            let ni = clone_inst_into(func, ii, dst, &vmap);
+            for (o, n) in old.into_iter().zip(func.dfg.inst_results(ni).to_vec()) {
+                map_val(func, &mut vmap, o, n);
+            }
+        }
+        let Some(next) = remap_call(func, destination, &vmap) else {
+            seal_halving(func, &copies);
+            return false;
+        };
+        let last = k + 1 == trip as usize;
+        if last {
+            let mut end_map = FxHashMap::default();
+            for (i, &p) in params.iter().enumerate() {
+                map_val(func, &mut end_map, p, next[i]);
+            }
+            for &ii in &head_insts {
+                let old: Vec<Value> = func.dfg.inst_results(ii).to_vec();
+                let ni = clone_inst_into(func, ii, dst, &end_map);
+                for (o, n) in old.into_iter().zip(func.dfg.inst_results(ni).to_vec()) {
+                    map_val(func, &mut end_map, o, n);
+                }
+            }
+            let Some(exit_vals) = remap_call(func, exit, &end_map) else {
+                seal_halving(func, &copies);
+                return false;
+            };
+            let exit_args: Vec<BlockArg> = exit_vals.into_iter().map(BlockArg::Value).collect();
+            FuncCursor::new(func).at_bottom(dst).ins().jump(exit_block, &exit_args);
+        } else {
+            FuncCursor::new(func)
+                .at_bottom(dst)
+                .ins()
+                .jump(copies[k + 1], &[] as &[BlockArg]);
+            incoming = next;
+        }
+    }
+    let dfg = &mut func.dfg;
+    let new_bc = BlockCall::new(copies[0], std::iter::empty(), &mut dfg.value_lists);
+    dfg.insts[entry_inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        [entry_slot] = new_bc;
+    true
+}
+
+/// Rotated halving loop: the header is the body (`half = size >> 1`,
+/// the load, the select) and a later block's `brif` is the
+/// `new_size >= 2` test that jumps back. `binary_search`'s
+/// `while size > 1` lands here once the latch is rotated out of the
+/// header. The chain is a straight line of jumps ending at that brif.
+struct HalfChain {
+    h: Block,
+    /// Header first, latch (the brif block) last.
+    chain: Vec<Block>,
+    entry_inst: Inst,
+    entry_slot: usize,
+    trip: u32,
+}
+
+fn bare_edge(func: &Function, bc: BlockCall) -> bool {
+    bc.args(&func.dfg.value_lists).next().is_none()
+}
+
+fn match_halving_chain(func: &Function, cfg: &ControlFlowGraph, h: Block) -> Option<HalfChain> {
+    let term = func.layout.last_inst(h)?;
+    let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
+        return None;
+    };
+    if !bare_edge(func, destination) {
+        return None;
+    }
+    let mut chain = vec![h];
+    let mut b = destination.block(&func.dfg.value_lists);
+    let latch = loop {
+        if chain.len() > 6 || b == h || chain.contains(&b) {
+            return None;
+        }
+        if !func.dfg.block_params(b).is_empty() {
+            return None;
+        }
+        chain.push(b);
+        let t = func.layout.last_inst(b)?;
+        match func.dfg.insts[t] {
+            InstructionData::Jump { destination, .. } => {
+                if !bare_edge(func, destination) {
+                    return None;
+                }
+                b = destination.block(&func.dfg.value_lists);
+            }
+            InstructionData::Brif { .. } => break b,
+            _ => return None,
+        }
+    };
+    let t = func.layout.last_inst(latch)?;
+    let InstructionData::Brif {
+        arg,
+        blocks: [bt, bf],
+        ..
+    } = func.dfg.insts[t]
+    else {
+        return None;
+    };
+    let (tb, fb) = (
+        bt.block(&func.dfg.value_lists),
+        bf.block(&func.dfg.value_lists),
+    );
+    let (cont, exit_bc, then_continues) = if tb == h && fb != h {
+        (bt, bf, true)
+    } else if fb == h && tb != h {
+        (bf, bt, false)
+    } else {
+        return None;
+    };
+    let exit_b = exit_bc.block(&func.dfg.value_lists);
+    if chain.contains(&exit_b) {
+        return None;
+    }
+    let ninst: usize = chain.iter().map(|&b| func.layout.block_insts(b).count()).sum();
+    if ninst > 32 {
+        return None;
+    }
+    let params = func.dfg.block_params(h);
+    let cont_args: Vec<Value> = cont
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if cont_args.len() != params.len() {
+        return None;
+    }
+    let mut size_slot = None;
+    for (i, &p) in params.iter().enumerate() {
+        if is_halving_step(func, cont_args[i], p) {
+            if size_slot.is_some() {
+                return None;
+            }
+            size_slot = Some(i);
+        }
+    }
+    let slot = size_slot?;
+    let new_size = cont_args[slot];
+    let cranelift_codegen::ir::ValueDef::Result(ci, _) =
+        func.dfg.value_def(func.dfg.resolve_aliases(arg))
+    else {
+        return None;
+    };
+    let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[ci] else {
+        return None;
+    };
+    let (x, y) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    let (on_left, k) = if x == new_size {
+        (true, iconst(func, y)?)
+    } else if y == new_size {
+        (false, iconst(func, x)?)
+    } else {
+        return None;
+    };
+    if !continues_while_big(cond, on_left, k, then_continues) {
+        return None;
+    }
+    for a in exit_bc.args(&func.dfg.value_lists) {
+        if !matches!(a, BlockArg::Value(_)) {
+            return None;
+        }
+    }
+    let mut entry = None;
+    for p in cfg.pred_iter(h) {
+        if p.block == latch {
+            continue;
+        }
+        if entry.is_some() {
+            return None;
+        }
+        let dests = func.dfg.insts[p.inst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let mut slot_i = None;
+        for (s, bc) in dests.iter().enumerate() {
+            if bc.block(&func.dfg.value_lists) == h {
+                if slot_i.is_some() {
+                    return None;
+                }
+                slot_i = Some(s);
+            }
+        }
+        entry = Some((p.inst, slot_i?));
+    }
+    let (entry_inst, entry_slot) = entry?;
+    let ebc = func.dfg.insts[entry_inst].branch_destination(
+        &func.dfg.jump_tables,
+        &func.dfg.exception_tables,
+    )[entry_slot];
+    let eargs: Vec<Value> = ebc
+        .args(&func.dfg.value_lists)
+        .map(|a| match a {
+            BlockArg::Value(v) => Some(func.dfg.resolve_aliases(v)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let trip = halving_trips(iconst(func, *eargs.get(slot)?)?)?;
+    Some(HalfChain { h, chain, entry_inst, entry_slot, trip })
+}
+
+fn apply_halving_chain(func: &mut Function, info: HalfChain) -> bool {
+    let HalfChain { h, chain, entry_inst, entry_slot, trip } = info;
+    let params: Vec<Value> = func.dfg.block_params(h).to_vec();
+    let latch = *chain.last().unwrap();
+    let lterm = func.layout.last_inst(latch).unwrap();
+    let InstructionData::Brif { blocks: [bt, bf], .. } = func.dfg.insts[lterm] else {
+        return false;
+    };
+    let (cont, exit) = if bt.block(&func.dfg.value_lists) == h {
+        (bt, bf)
+    } else if bf.block(&func.dfg.value_lists) == h {
+        (bf, bt)
+    } else {
+        return false;
+    };
+    let exit_block = exit.block(&func.dfg.value_lists);
+    let ebc = func.dfg.insts[entry_inst].branch_destination(
+        &func.dfg.jump_tables,
+        &func.dfg.exception_tables,
+    )[entry_slot];
+    let mut incoming = Vec::new();
+    for a in ebc.args(&func.dfg.value_lists) {
+        let BlockArg::Value(v) = a else { return false };
+        incoming.push(func.dfg.resolve_aliases(v));
+    }
+    if incoming.len() != params.len() {
+        return false;
+    }
+    let bodies: Vec<Vec<Inst>> = chain
+        .iter()
+        .map(|&b| {
+            let term = func.layout.last_inst(b).unwrap();
+            func.layout.block_insts(b).filter(|&i| i != term).collect()
+        })
+        .collect();
+    let copies: Vec<Vec<Block>> = (0..trip)
+        .map(|_| {
+            chain
+                .iter()
+                .map(|_| {
+                    let b = func.dfg.make_block();
+                    func.layout.append_block(b);
+                    b
+                })
+                .collect()
+        })
+        .collect();
+    let flat: Vec<Block> = copies.iter().flatten().copied().collect();
+    let mut last_vmap: FxHashMap<Value, Value> = FxHashMap::default();
+    for k in 0..copies.len() {
+        let row = copies[k].clone();
+        let next_header = copies.get(k + 1).map(|r| r[0]);
+        let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+        for (i, &p) in params.iter().enumerate() {
+            map_val(func, &mut vmap, p, incoming[i]);
+        }
+        for (bi, dst) in row.iter().copied().enumerate() {
+            for &ii in &bodies[bi] {
+                let old: Vec<Value> = func.dfg.inst_results(ii).to_vec();
+                let ni = clone_inst_into(func, ii, dst, &vmap);
+                for (o, n) in old.into_iter().zip(func.dfg.inst_results(ni).to_vec()) {
+                    map_val(func, &mut vmap, o, n);
+                }
+            }
+            if let Some(&nb) = row.get(bi + 1) {
+                FuncCursor::new(func).at_bottom(dst).ins().jump(nb, &[] as &[BlockArg]);
+            } else if k + 1 == trip as usize {
+                let Some(exit_vals) = remap_call(func, exit, &vmap) else {
+                    seal_halving(func, &flat);
+                    return false;
+                };
+                let exit_args: Vec<BlockArg> = exit_vals.into_iter().map(BlockArg::Value).collect();
+                FuncCursor::new(func).at_bottom(dst).ins().jump(exit_block, &exit_args);
+            } else {
+                let Some(next) = remap_call(func, cont, &vmap) else {
+                    seal_halving(func, &flat);
+                    return false;
+                };
+                FuncCursor::new(func)
+                    .at_bottom(dst)
+                    .ins()
+                    .jump(next_header.unwrap(), &[] as &[BlockArg]);
+                incoming = next;
+            }
+        }
+        if k + 1 == copies.len() {
+            last_vmap = vmap;
+        }
+    }
+    // The exit (and everything it reaches) was dominated by the old
+    // loop, so it uses the last iteration's values directly. Point
+    // those uses at the last copy. The copy jumps to the exit, so the
+    // new defs dominate. Blocks inside the old loop stay as they are
+    // and become unreachable once the entry moves.
+    let skip: FxHashSet<Block> = chain.iter().copied().chain(flat.iter().copied()).collect();
+    rewrite_carried_uses(func, exit_block, &skip, &last_vmap);
+    // Anything defined in the old loop is about to become unreachable.
+    // A cloned operand that still names one of those values dangles
+    // once the entry skips the header. Bail and drop the copies.
+    let mut region: FxHashSet<Block> = FxHashSet::default();
+    let mut stack = vec![h];
+    while let Some(b) = stack.pop() {
+        if !region.insert(b) {
+            continue;
+        }
+        let Some(t) = func.layout.last_inst(b) else { continue };
+        for bc in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            let d = bc.block(&func.dfg.value_lists);
+            if d != exit_block {
+                stack.push(d);
+            }
+        }
+    }
+    let mut dangling = None;
+    for &b in &flat {
+        for ii in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(ii) {
+                let home = match func.dfg.value_def(v) {
+                    cranelift_codegen::ir::ValueDef::Result(def, _) => func.layout.inst_block(def),
+                    cranelift_codegen::ir::ValueDef::Param(pb, _) => Some(pb),
+                    cranelift_codegen::ir::ValueDef::Union(_, _) => None,
+                };
+                let bad = match home {
+                    Some(hb) => region.contains(&hb),
+                    None => true,
+                };
+                if bad {
+                    dangling = Some((ii, v, home));
+                    break;
+                }
+            }
+            if dangling.is_some() {
+                break;
+            }
+        }
+        if dangling.is_some() {
+            break;
+        }
+    }
+    if let Some((ii, v, home)) = dangling {
+        tracing::debug!(
+            target: "pliron::punroll",
+            "half-chain bail {:?} uses {v:?} defblock {home:?} op {:?}",
+            func.dfg.insts[ii].opcode(),
+            func.dfg.value_def(v)
+        );
+        crate::jumpthread::remove_unreachable_blocks(func);
+        return false;
+    }
+    let old_bc = {
+        let dfg = &mut func.dfg;
+        let old_bc = dfg.insts[entry_inst]
+            .branch_destination(&dfg.jump_tables, &dfg.exception_tables)[entry_slot];
+        let new_bc = BlockCall::new(copies[0][0], std::iter::empty(), &mut dfg.value_lists);
+        dfg.insts[entry_inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            [entry_slot] = new_bc;
+        old_bc
+    };
+    let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+    if let Err(e) = cranelift_codegen::verify_function(func, &flags) {
+        let dfg = &mut func.dfg;
+        dfg.insts[entry_inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            [entry_slot] = old_bc;
+        tracing::debug!(target: "pliron::punroll", "half-chain verify: {e}");
+        crate::jumpthread::remove_unreachable_blocks(func);
+        return false;
+    }
+    true
+}
+
+/// Rewrite uses of the old loop's values in the exit region to the
+/// last unrolled copy. `skip` is the loop and the copies.
+fn rewrite_carried_uses(
+    func: &mut Function,
+    exit: Block,
+    skip: &FxHashSet<Block>,
+    vmap: &FxHashMap<Value, Value>,
+) {
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut stack = vec![exit];
+    let mut users = Vec::new();
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) || skip.contains(&b) {
+            continue;
+        }
+        if let Some(t) = func.layout.last_inst(b) {
+            for bc in func.dfg.insts[t]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                stack.push(bc.block(&func.dfg.value_lists));
+            }
+        }
+        for ii in func.layout.block_insts(b) {
+            users.push(ii);
+        }
+    }
+    let mut root: FxHashMap<Value, Value> = FxHashMap::default();
+    for &ii in &users {
+        for v in func.dfg.inst_values(ii) {
+            root.insert(v, func.dfg.resolve_aliases(v));
+        }
+    }
+    for ii in users {
+        func.dfg.map_inst_values(ii, |v| {
+            let r = root.get(&v).copied().unwrap_or(v);
+            vmap.get(&r).copied().unwrap_or(v)
+        });
+    }
+}
+
 /// Measured average trip count: header executions per loop entry (the
 /// header runs once per iteration plus the exit check, so the ratio is
 /// within one of the real mean). `None` without `PLIRON_PGO_USE`.
@@ -377,6 +1328,9 @@ pub fn run(
     an: &mut crate::pipeline::Analysis,
     name: &str,
     prof: &FxHashMap<Block, u64>,
+    // Wasm pipeline: opt-in `PLIRON_PEEL_MULONCE` peels at most one
+    // mul-loop (parse_only: avoid 45 always-reachable `imul`s).
+    wasm: bool,
 ) -> usize {
     // `PLIRON_PUNROLL_FNMAX=N`: skip duplicating loops when the function
     // already exceeds N instructions — every clone in a huge function is
@@ -398,11 +1352,35 @@ pub fn run(
     };
     let jam_on = crate::pass_enabled("PLIRON_JAM");
     let peel_on = crate::pass_enabled("PLIRON_PEEL");
+    // Opt-in: fully peel a proved ≤10-trip `* 10` loop on wasm (u32
+    // `from_str`'s can_not_overflow path). The 12-inst / 16-site caps
+    // otherwise stop at 4 copies and leave a residual loop the 8-digit
+    // word still runs. Live env read so a unit test can flip it.
+    let peel_digit = wasm
+        && std::env::var_os("PLIRON_PEEL_DIGIT").as_deref() == Some(std::ffi::OsStr::new("1"));
+    // Wasm `from_str`: ifconv2 can leave several digit-loop clones; peeling
+    // each yields ~45 always-reachable `imul 10`s. Peel at most one
+    // mul-loop per function when `PLIRON_PEEL_MULONCE=1`.
+    let peel_mul_once = wasm
+        && pliron_cfg::env_is("PLIRON_PEEL_MULONCE", "1")
+        && !pliron_cfg::env_is("PLIRON_PEEL_MULMANY", "1");
+    let mut peeled_mul = false;
+    let peel_mul_only = peel_mul_once;
     let mut tried: FxHashSet<Block> = FxHashSet::default();
     let mut normed: FxHashSet<Block> = FxHashSet::default();
     let max = crate::env_get("PLIRON_PUNROLL_MAX")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(MAX_LOOPS);
+    // Data-independent halving loops (`binary_search`: `size -= size/2`
+    // while `size > 1`). The trip count is a function of the entry size
+    // only, so a small constant entry fully unrolls. Opt-in, wasm only:
+    // native was not timed. `PLIRON_HALFUNROLL=1`. Kept off the `n`
+    // budget below so a search unroll doesn't eat a counted one.
+    let half = if wasm && pliron_cfg::env_is("PLIRON_HALFUNROLL", "1") {
+        halving_unroll(func, an, name)
+    } else {
+        0
+    };
     let mut n = 0;
     while n < max {
         let mut hit = false;
@@ -500,12 +1478,33 @@ pub fn run(
                     hit = true;
                     break; // cfg/la stale; rescan
                 }
-                if peel_on
-                    && run_peel(func, cfg, dt, la, lp, h, name, trip).is_some()
-                {
-                    n += 1;
-                    hit = true;
-                    break; // cfg/la stale; rescan
+                if peel_on {
+                    if peel_mul_once && peeled_mul {
+                        continue;
+                    }
+                    if peel_mul_only {
+                        let has_mul = walk(func, cfg, dt, la, lp, h, name).is_some_and(|w| {
+                            w.body.iter().any(|&b| {
+                                func.layout.block_insts(b).any(|i| {
+                                    matches!(
+                                        func.dfg.insts[i].opcode(),
+                                        Opcode::Imul | Opcode::Umulhi | Opcode::Smulhi
+                                    )
+                                })
+                            })
+                        });
+                        if !has_mul {
+                            continue;
+                        }
+                    }
+                    if run_peel(func, cfg, dt, la, lp, h, name, trip, peel_digit).is_some() {
+                        if peel_mul_once {
+                            peeled_mul = true;
+                        }
+                        n += 1;
+                        hit = true;
+                        break; // cfg/la stale; rescan
+                    }
                 }
             }
         }
@@ -514,7 +1513,7 @@ pub fn run(
         }
         an.invalidate(func);
     }
-    n
+    n + half
 }
 
 /// `PLIRON_PUNROLL_SEARCH=1`: unroll search loops too (see `warm_exit`).
@@ -2767,6 +3766,36 @@ fn peel_trip_cap(
 /// original loop, so the peel is correct for ANY trip count — no bound
 /// proof needed, trips > K simply flow into the residual. The cost is
 /// pure code size, capped by the small-body budget.
+/// `imul` / `umul_overflow` by the constant 10 — a decimal digit Horner.
+fn chain_mul10(func: &Function, chain: &[Block]) -> bool {
+    chain.iter().any(|&b| {
+        func.layout.block_insts(b).any(|i| {
+            let op = func.dfg.insts[i].opcode();
+            if !matches!(
+                op,
+                Opcode::Imul | Opcode::UmulOverflow | Opcode::SmulOverflow
+            ) {
+                return false;
+            }
+            func.dfg.inst_args(i).iter().any(|&v| {
+                let v = func.dfg.resolve_aliases(v);
+                match func.dfg.value_def(v) {
+                    cranelift_codegen::ir::ValueDef::Result(def, _) => {
+                        matches!(
+                            func.dfg.insts[def],
+                            InstructionData::UnaryImm {
+                                opcode: Opcode::Iconst,
+                                imm,
+                            } if imm.bits() == 10
+                        )
+                    }
+                    _ => false,
+                }
+            })
+        })
+    })
+}
+
 fn run_peel(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -2776,6 +3805,7 @@ fn run_peel(
     h: Block,
     name: &str,
     trip: Option<u64>,
+    peel_digit: bool,
 ) -> Option<()> {
     macro_rules! bail {
         ($why:expr) => {{
@@ -2817,7 +3847,21 @@ fn run_peel(
         .iter()
         .map(|&b| func.layout.block_insts(b).count() - 1)
         .sum();
-    let kmax = if n_insts <= 12 {
+    // Copies past the loop's trip bound never run (`for i in 1..4` got
+    // eight): peel at most that many, which unrolls it fully.
+    let trip_cap = peel_trip_cap(func, cfg, dt, h, latch, &body);
+    // `* 10` Horner: the ordinary caps (12 insts → k=4, 16 branch sites)
+    // leave `from_str`'s digit loop half-unrolled plus a residual the
+    // 8-digit word still executes.
+    let mul10 = chain_mul10(func, &chain);
+    // The latch often isn't the trip test (a digit-validity `brif` sits
+    // there), so `trip_cap` is None and the 12-inst cap stops at 4.
+    // Eight copies cover `from_str`'s short words; a proved smaller
+    // cap below still shrinks `k`.
+    let digit_full = peel_digit && mul10 && n_insts <= 40;
+    let kmax = if digit_full {
+        8
+    } else if n_insts <= 12 {
         8usize
     } else if n_insts <= MAX_BODY {
         4
@@ -2829,16 +3873,22 @@ fn run_peel(
     // sites the straight-line copies predict worse than the rolled loop
     // they replace (measured on strwork's variable-length parse).
     let exits = mid_exits.len() + 1;
-    let mut k = kmax.min(16 / exits.max(1)).max(1);
-    // Copies past the loop's trip bound never run (`for i in 1..4` got
-    // eight): peel at most that many, which unrolls it fully.
-    if let Some(m) = peel_trip_cap(func, cfg, dt, h, latch, &body) {
+    let mut k = if digit_full {
+        kmax
+    } else {
+        kmax.min(16 / exits.max(1)).max(1)
+    };
+    if let Some(m) = trip_cap {
         k = k.min(usize::try_from(m).unwrap_or(usize::MAX)).max(1);
     }
     // Copies past the measured average mostly do not run either.
     if let Some(t) = trip {
         k = k.min(usize::try_from(t.saturating_add(1)).unwrap_or(usize::MAX)).max(1);
     }
+    // `trip_max` rounds up by one. When we've peeled at least that bound
+    // minus the round-up, the residual continue is dead under the
+    // dominating guards — LLVM's full unroll (digit `from_str`).
+    let full_unroll = trip_cap.is_some_and(|m| (k as u64).saturating_add(1) >= m);
     for &b in &chain {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for &i in &insts[..insts.len() - 1] {
@@ -3014,6 +4064,37 @@ fn run_peel(
     // uniform affine base (`entry + k·s`) and gives multi-entry loops one
     // merge point. Copy blocks take no params at all: the chain is
     // single-pred, so each param binds eagerly from its incoming edge.
+    //
+    // When every outside entry passes the same `iconst` for a param
+    // (digit loops: `acc=0`, `i=0`), seed copies with that constant so
+    // `0*10+d` folds to `d` — LLVM's first digit is just the load.
+    let entries_pre: Vec<Inst> = cfg
+        .pred_iter(h)
+        .filter(|p| !body.contains(&p.block))
+        .map(|p| p.inst)
+        .collect();
+    let pe_iconst: Vec<Option<i64>> = (0..hparams.len())
+        .map(|j| {
+            let mut seen: Option<i64> = None;
+            for &pi in &entries_pre {
+                for bc in func.dfg.insts[pi]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    if bc.block(&func.dfg.value_lists) != h {
+                        continue;
+                    }
+                    let BlockArg::Value(v) = bc.args(&func.dfg.value_lists).nth(j)? else {
+                        return None;
+                    };
+                    let c = iconst(func, v)?;
+                    if *seen.get_or_insert(c) != c {
+                        return None;
+                    }
+                }
+            }
+            seen
+        })
+        .collect();
     let pe = func.dfg.make_block();
     for &p in &hparams {
         let ty = func.dfg.value_type(p);
@@ -3033,6 +4114,17 @@ fn run_peel(
                 .collect()
         })
         .collect();
+    let pe_bases: Vec<Value> = peps
+        .iter()
+        .enumerate()
+        .map(|(j, &p)| match pe_iconst[j] {
+            Some(c) => {
+                let ty = func.dfg.value_type(p);
+                FuncCursor::new(func).at_bottom(pe).ins().iconst(ty, c)
+            }
+            None => p,
+        })
+        .collect();
     FuncCursor::new(func)
         .at_bottom(pe)
         .ins()
@@ -3045,12 +4137,12 @@ fn run_peel(
         .collect();
     // `nxt[j]` is the seed for h's param j at the NEXT copy — affine params
     // get their `entry + k·s` form regardless of the carried value.
-    let mut nxt: Vec<Seed> = peps.iter().map(|&p| Seed::Val(p)).collect();
+    let mut nxt: Vec<Seed> = pe_bases.iter().map(|&p| Seed::Val(p)).collect();
     for kk in 0..k {
         let mut smap: FxHashMap<Value, Seed> = FxHashMap::default();
         for (j, &p) in hparams.iter().enumerate() {
             let s = match steps[j] {
-                Some(s) => Seed::Aff(peps[j], s.wrapping_mul(kk as i64)),
+                Some(s) => Seed::Aff(pe_bases[j], s.wrapping_mul(kk as i64)),
                 None => nxt[j],
             };
             smap.insert(p, s);
@@ -3153,6 +4245,15 @@ fn run_peel(
                             .at_bottom(nb)
                             .ins()
                             .jump(cblks[kk + 1][0], &[]);
+                    } else if full_unroll {
+                        if let Some(ebc) = lexit {
+                            let ex = eargs(func, nb, &mut smap, ebc);
+                            let eblk = ebc.block(&func.dfg.value_lists);
+                            FuncCursor::new(func).at_bottom(nb).ins().jump(eblk, &ex);
+                        } else {
+                            let cont = eargs(func, nb, &mut smap, back_bc);
+                            FuncCursor::new(func).at_bottom(nb).ins().jump(h, &cont);
+                        }
                     } else {
                         let cont = eargs(func, nb, &mut smap, back_bc);
                         FuncCursor::new(func).at_bottom(nb).ins().jump(h, &cont);
@@ -3176,22 +4277,26 @@ fn run_peel(
                     let carg = matv(func, nb, &mut smap, c);
                     let ebc = lexit.unwrap();
                     let ex = eargs(func, nb, &mut smap, ebc);
-                    let (ctgt, cargs) = if kk + 1 < k {
-                        nxt = sargs(func, &smap, back_bc);
-                        (cblks[kk + 1][0], Vec::new())
-                    } else {
-                        (h, eargs(func, nb, &mut smap, back_bc))
-                    };
-                    let cpos = bcs
-                        .iter()
-                        .position(|bc| bc.block(&func.dfg.value_lists) == h)
-                        .unwrap();
                     let eblk = ebc.block(&func.dfg.value_lists);
-                    let mut pos = FuncCursor::new(func).at_bottom(nb);
-                    if cpos == 0 {
-                        pos.ins().brif(carg, ctgt, &cargs, eblk, &ex);
+                    if full_unroll && kk + 1 >= k {
+                        FuncCursor::new(func).at_bottom(nb).ins().jump(eblk, &ex);
                     } else {
-                        pos.ins().brif(carg, eblk, &ex, ctgt, &cargs);
+                        let (ctgt, cargs) = if kk + 1 < k {
+                            nxt = sargs(func, &smap, back_bc);
+                            (cblks[kk + 1][0], Vec::new())
+                        } else {
+                            (h, eargs(func, nb, &mut smap, back_bc))
+                        };
+                        let cpos = bcs
+                            .iter()
+                            .position(|bc| bc.block(&func.dfg.value_lists) == h)
+                            .unwrap();
+                        let mut pos = FuncCursor::new(func).at_bottom(nb);
+                        if cpos == 0 {
+                            pos.ins().brif(carg, ctgt, &cargs, eblk, &ex);
+                        } else {
+                            pos.ins().brif(carg, eblk, &ex, ctgt, &cargs);
+                        }
                     }
                 }
                 _ => unreachable!(),
@@ -6476,6 +7581,193 @@ fn jam_emit_flat(
             .zip(func.dfg.inst_results(ni).iter())
         {
             vmaps[d].insert(func.dfg.resolve_aliases(o), nv);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::{AbiParam, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
+
+    /// `size` starts at 54 and steps `size - size/2` while `size >= 2`.
+    /// Six copies, no loop left, verifier-clean.
+    #[test]
+    fn halving_unrolls_a_constant_54() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I32));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for b in [entry, h, exit] {
+            func.layout.append_block(b);
+        }
+        let size = func.dfg.append_block_param(h, types::I32);
+        let base = func.dfg.append_block_param(h, types::I32);
+        func.dfg.append_block_param(exit, types::I32);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let k = cur.ins().iconst(types::I32, 54);
+        let z = cur.ins().iconst(types::I32, 0);
+        cur.ins().jump(h, &[BlockArg::Value(k), BlockArg::Value(z)]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I32, 1);
+        let two = cur.ins().iconst(types::I32, 2);
+        let half = cur.ins().ushr(size, one);
+        let mid = cur.ins().iadd(base, half);
+        let new_size = cur.ins().isub(size, half);
+        let c = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, new_size, two);
+        cur.ins().brif(
+            c,
+            h,
+            &[BlockArg::Value(new_size), BlockArg::Value(mid)],
+            exit,
+            &[BlockArg::Value(mid)],
+        );
+
+        let rv = func.dfg.block_params(exit)[0];
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[rv]);
+
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(halving_unroll(&mut func, &mut an, "t"), 1);
+        let back = func.layout.blocks().any(|b| {
+            func.layout.last_inst(b).is_some_and(|t| {
+                func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .any(|bc| bc.block(&func.dfg.value_lists) == b)
+            })
+        });
+        assert!(!back, "the halving loop is gone");
+        let shifts = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .filter(|i| func.dfg.insts[*i].opcode() == Opcode::Ushr)
+            .count();
+        assert_eq!(shifts, 6);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("halving produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Rotated `while size > 1`: the test is on the header param and the
+    /// body block jumps back with the halved size.
+    #[test]
+    fn halving_unrolls_a_header_tested_54() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I32));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for b in [entry, h, body, exit] {
+            func.layout.append_block(b);
+        }
+        let size = func.dfg.append_block_param(h, types::I32);
+        let base = func.dfg.append_block_param(h, types::I32);
+        func.dfg.append_block_param(exit, types::I32);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let k = cur.ins().iconst(types::I32, 54);
+        let z = cur.ins().iconst(types::I32, 0);
+        cur.ins().jump(h, &[BlockArg::Value(k), BlockArg::Value(z)]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I32, 1);
+        let c = cur.ins().icmp(IntCC::UnsignedGreaterThan, size, one);
+        cur.ins().brif(c, body, &[], exit, &[BlockArg::Value(base)]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let one = cur.ins().iconst(types::I32, 1);
+        let half = cur.ins().ushr(size, one);
+        let mid = cur.ins().iadd(base, half);
+        let new_size = cur.ins().isub(size, half);
+        cur.ins().jump(h, &[BlockArg::Value(new_size), BlockArg::Value(mid)]);
+
+        let rv = func.dfg.block_params(exit)[0];
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[rv]);
+
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(halving_unroll(&mut func, &mut an, "t"), 1);
+        let shifts = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .filter(|i| func.dfg.insts[*i].opcode() == Opcode::Ushr)
+            .count();
+        assert_eq!(shifts, 6);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("halving produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Rotated search: the header is the body and a later block tests
+    /// `new_size >= 2`, which is the shape `lookup_slow` actually has.
+    #[test]
+    fn halving_unrolls_a_rotated_chain_54() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I32));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let mid_b = func.dfg.make_block();
+        let latch = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        for b in [entry, h, mid_b, latch, exit] {
+            func.layout.append_block(b);
+        }
+        let size = func.dfg.append_block_param(h, types::I32);
+        let base = func.dfg.append_block_param(h, types::I32);
+        func.dfg.append_block_param(exit, types::I32);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        let k = cur.ins().iconst(types::I32, 54);
+        let z = cur.ins().iconst(types::I32, 0);
+        cur.ins().jump(h, &[BlockArg::Value(k), BlockArg::Value(z)]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let one = cur.ins().iconst(types::I32, 1);
+        let half = cur.ins().ushr(size, one);
+        let mid = cur.ins().iadd(base, half);
+        cur.ins().jump(mid_b, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(mid_b);
+        let new_size = cur.ins().isub(size, half);
+        cur.ins().jump(latch, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+        let two = cur.ins().iconst(types::I32, 2);
+        let c = cur.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, new_size, two);
+        cur.ins().brif(
+            c,
+            h,
+            &[BlockArg::Value(new_size), BlockArg::Value(mid)],
+            exit,
+            &[BlockArg::Value(mid)],
+        );
+
+        let rv = func.dfg.block_params(exit)[0];
+        FuncCursor::new(&mut func).at_bottom(exit).ins().return_(&[rv]);
+
+        let mut an = crate::pipeline::Analysis::default();
+        assert_eq!(halving_unroll(&mut func, &mut an, "t"), 1);
+        let shifts = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .filter(|i| func.dfg.insts[*i].opcode() == Opcode::Ushr)
+            .count();
+        assert_eq!(shifts, 6);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("halving produced invalid IR: {e}\n{}", func.display());
         }
     }
 }

@@ -2,7 +2,9 @@
 
 use pliron::r#type::TypeHandle;
 use pliron::value::Value;
-use pliron_llvm::ops::XorOp;
+use pliron::operation::Operation;
+use pliron_llvm::attributes::ICmpPredicateAttr;
+use pliron_llvm::ops::{ICmpOp, XorOp};
 use rustc_abi::{Align, BackendRepr};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::IntPredicate;
@@ -58,6 +60,51 @@ fn eq_bytes<'a, 'tcx>(
         }
     }
     (acc.unwrap(), acc_ty)
+}
+
+/// `assume(i < N)` with a constant `N` as a real branch to unreachable.
+/// `PLIRON_ASSUME_RANGE=1`, and the env var does nothing unless the
+/// target is wasm. Native was not timed.
+///
+/// Emitting every `assume(i < n)`, including a dynamic length, was
+/// scored on its own (`assume.wasm` vs `bchk.wasm`, both with
+/// `PLIRON_HALFUNROLL=1`): chars_ascii went from −25% to 0%,
+/// chars_alpha from −11% to +14%, and chars_mixed from +10% to +18%.
+/// The cold `index < 1547` loop in `lookup_slow` is `assume(i < N)`
+/// for the const-generic table length, so only a constant bound is
+/// emitted. Dynamic `i < len` stays a pure assume. `unreach` on wasm
+/// folds a dominated copy of the compare and then drops the branch.
+fn assume_range<'a, 'tcx>(b: &mut Builder<'a, 'tcx>, val: Value) {
+    if !b.tcx.sess.target.is_like_wasm || !pliron_cfg::env_is("PLIRON_ASSUME_RANGE", "1") {
+        return;
+    }
+    let Some(vop) = val.defining_op() else { return };
+    let rhs = {
+        let ctx = b.cx.pctx.borrow();
+        let range = Operation::get_op::<ICmpOp>(vop, &ctx).is_some_and(|op| {
+            matches!(
+                op.predicate(&ctx),
+                ICmpPredicateAttr::ULT
+                    | ICmpPredicateAttr::ULE
+                    | ICmpPredicateAttr::SLT
+                    | ICmpPredicateAttr::SLE
+            )
+        });
+        if !range {
+            return;
+        }
+        vop.deref(&ctx).operands(&ctx).nth(1)
+    };
+    let Some(rhs) = rhs else { return };
+    if b.cx.const_to_opt_uint(rhs).is_none() {
+        return;
+    }
+    let rest = b.append_sibling_block("assume_range");
+    let dead = b.append_sibling_block("assume_fail");
+    b.cond_br(val, rest, dead);
+    b.switch_to_block(dead);
+    b.unreachable();
+    b.switch_to_block(rest);
 }
 
 impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
@@ -578,6 +625,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             self.unreachable();
             self.switch_to_block(rest);
         }
+        assume_range(self, val);
     }
     fn retag_mem(&mut self, _place: Value, _info: &rustc_codegen_ssa::RetagInfo<Value>) {}
     fn retag_reg(&mut self, ptr: Value, _info: &rustc_codegen_ssa::RetagInfo<Value>) -> Value {

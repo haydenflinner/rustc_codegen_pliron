@@ -353,6 +353,48 @@ in the scoreboard and in the linked history files.
   (the no-cap tree was +3%), geomean **0.921**. The other
   kernels match clustering-off; `strwork` improves 10.0% → 8.6%.
   Profile: `harness/v8/{cpuprof,hotw,mcode}.sh`.
+  **`sortw`:** the hot path is `ipnsort`'s descending-run scan
+  (`v[i]` vs `v[i-1]` over the reversed 200k array). `ldrot`
+  already knew that pair. It skips the pair on native because
+  rotating it hides the loads from `loopvec`: the pass comment
+  records ~17% on native sortw's run scan. That native number
+  was not re-run here. The same pass also bailed when the index
+  was still a stack store. `PLIRON_LDROT_PAIR` (wasm default,
+  `=0` off) rotates i64 pairs and ignores an isolated stack
+  store. Native stays off so that loopvec result is left in
+  place; the stack-store exception was timed on wasm only, and
+  there is no native number saying it would be slower.
+  Wasm `--layouts=3`: sortw **1.007×** (6.147 vs 6.091 ms; was
+  1.29×, then 1.11× after i64 `ldrot`). Only i64 pairs: the
+  dumped ipnsort body had no vector compare, and that is the
+  pair the wall time moved. A wasm build that rotated every
+  width also had `PLIRON_ASSUME_RANGE=1` and lost chars_ascii's
+  −25%; those two were not split, so narrower pairs are left
+  alone. With i64-only and assume-range off, chars_ascii stayed
+  −25%, tokenize −17%, strwork flat, parse_only ≤1×.
+  The scan is now a carried pointer (`local.get p; i64.load;
+  p += 8`). Two wasm-only indvars changes, neither re-timed on
+  native: `ivrefold` keeps a ratio-1 pointer whose base is not
+  a constant (a constant base still folds into the load
+  offset; native `amode_scale` still refolds every ratio), and
+  a bare `load (base + iv)` becomes a stepped pointer even
+  when `base` stays live, following the block param the latch
+  passes into the load. The same pass steps
+  `base + ((A - iv) << k)` by `-k` per iv step, so the reverse
+  or swap loop stops recomputing `index << 3` on the other
+  address. Native keeps that index form for scaled addressing;
+  it was not timed. Same-run `--layouts=3` against the
+  forward-pointer binary: sortw 0.7% [0.5..1.1] vs 6.4%
+  [5.5..6.5]. chars_ascii −24.9%, chars_alpha −11%, strwork
+  still ~1.10×. `chars_mixed` is **1.10×** with
+  `PLIRON_HALFUNROLL=1` (opt-in, wasm only, not timed on
+  native): the 54-entry probe chain unrolls; the byte scan
+  does not. Folding the probe table into the memarg
+  (`PLIRON_WASM_ADDROFF=1`, opt-in) made chars_mixed about 1
+  point slower and left ascii at −25%, so it stays off.
+  `PLIRON_ASSUME_RANGE` (`=1`, and ignored on native, which
+  was not timed) turns `assume(i < n)` into a branch. It
+  stays off; it was only timed in that confounded wasm binary.
 - **`varint_postcard` native.** Fixed by `bunroll`'s LCSSA
   exit-cone repair (`95cab3a`, default-on `3f6a2ff`): the
   `0..varint_max` decode loops now fully unroll to the

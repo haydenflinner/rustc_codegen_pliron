@@ -38,7 +38,7 @@ fn stores(f: &Function) -> usize {
 
 fn unroll(src: &str) -> Function {
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
-    pliron_clif_opt::punroll::run(&mut f, &mut Analysis::default(), "t", &Default::default());
+    pliron_clif_opt::punroll::run(&mut f, &mut Analysis::default(), "t", &Default::default(), false);
     f
 }
 

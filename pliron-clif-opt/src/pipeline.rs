@@ -2302,8 +2302,15 @@ fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
         block_region: p.block_region,
         region_parent: p.region_parent,
     });
-    let (n, dead, folds, pmap) =
-        jumpthread::run_rnn(&mut p.clctx.func, p.nonnull, p.derived, sh, rnn.as_ref(), &p.site_facts);
+    let (n, dead, folds, pmap) = jumpthread::run_rnn(
+        &mut p.clctx.func,
+        p.nonnull,
+        p.derived,
+        sh,
+        rnn.as_ref(),
+        &p.site_facts,
+        /* ifconv_tables */ !p.wasm,
+    );
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }
@@ -2416,7 +2423,9 @@ fn s_bunroll(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = unreach::run(&mut p.clctx.func);
+    // The fact fold is wasm-only. Native was not timed; `p.wasm` is
+    // false there, so native keeps the edge-drop this pass had.
+    let k = unreach::run(&mut p.clctx.func, p.wasm);
     p.stats.unreached += k;
     k
 }
@@ -2629,6 +2638,26 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if p.wasm {
         divconst::run(&mut p.clctx.func, true);
     }
+    // PLIRON_EGRAPH_IMULCAP=1 (opt-in, wasm): egraph2 sinks a peeled
+    // digit Horner into every `len==k` early-exit (parse_only 15→45
+    // `i32.mul`, TF `madd` 15→50). When a body already has a shared
+    // unroll's worth of `imul`s and the pass more than doubles them,
+    // keep the pre-egraph body — closer to LLVM's progressive chain.
+    // Rematted arms still win some V8 layouts; measure with
+    // `harness/v8/` before default-on.
+    let imulcap = p.wasm && pliron_cfg::env_is("PLIRON_EGRAPH_IMULCAP", "1");
+    let imul_before = imulcap
+        .then(|| {
+            p.clctx
+                .func
+                .layout
+                .blocks()
+                .flat_map(|b| p.clctx.func.layout.block_insts(b))
+                .filter(|&i| p.clctx.func.dfg.insts[i].opcode() == Opcode::Imul)
+                .count()
+        })
+        .unwrap_or(0);
+    let snap = (imulcap && (8..64).contains(&imul_before)).then(|| p.clctx.func.clone());
     let mut cp = ControlPlane::default();
     // The egraph indexes values directly; our passes leave
     // `Value` aliases it doesn't resolve.
@@ -2659,6 +2688,19 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
         };
         panic!("egraph broke `{}`: {detail}", p.fname)
     });
+    if let Some(before) = snap {
+        let imul_after = p
+            .clctx
+            .func
+            .layout
+            .blocks()
+            .flat_map(|b| p.clctx.func.layout.block_insts(b))
+            .filter(|&i| p.clctx.func.dfg.insts[i].opcode() == Opcode::Imul)
+            .count();
+        if imul_after > imul_before.saturating_mul(2) {
+            p.clctx.func = before;
+        }
+    }
     // Re-canonicalize at the boundary: the egraph folds `brif (icmp ne
     // x, 0)` to `brif x`, and every pliron pass that reasons about a
     // branch (celim, bcheck, rangefold, edgespec, the null folds) keys
@@ -2715,7 +2757,19 @@ fn s_egraph(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Loop-carried load reuse: sibling to indvars since it grows
 // stepped header params the same machinery produces.
 fn s_ldrot(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = indvars::rotld(&mut p.clctx.func, an);
+    // Wasm rotates i64 adjacent pairs (`PLIRON_LDROT_PAIR=0` off).
+    // Native does not. That split is the older native measurement
+    // recorded on the skip in `rot_loop`: rotating `v[i]`/`v[i-1]`
+    // hides the pair from `loopvec` and cost ~17% on native sortw's
+    // run scan. This session did not re-time native. The flag also
+    // carries the isolated-stack-store exception, which was timed
+    // only on wasm, so native's any-store bail stays as it was.
+    // Only i64 on wasm: that is the pair the sortw wall time moved.
+    // Other widths were not timed alone — the wasm build that
+    // rotated every width also had `PLIRON_ASSUME_RANGE` and lost
+    // chars_ascii, and those two were not split.
+    let pairs = p.wasm && config().enabled("PLIRON_LDROT_PAIR");
+    let k = indvars::rotld(&mut p.clctx.func, an, pairs);
     // Rotation drops the carried load's address chain; its leftover
     // `base + (iv-1)*s` computation is then dead, and a second indvars
     // round can step the remaining address into a param and evict the
@@ -2836,7 +2890,7 @@ fn s_ifconv2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = if shape_of(&p.clctx.func) & (shape::CONDBR | shape::JUMP)
         == (shape::CONDBR | shape::JUMP)
     {
-        ifconv::run(&mut p.clctx.func, p.derived, None)
+        ifconv::run(&mut p.clctx.func, p.derived, None, /* tables */ !p.wasm)
     } else {
         0
     };
@@ -2986,7 +3040,7 @@ fn s_constbr2(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_punroll(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = punroll::run(&mut p.clctx.func, an, p.fname, p.prof);
+    let k = punroll::run(&mut p.clctx.func, an, p.fname, p.prof, p.wasm);
     if k > 0 && p.dump {
         p.dump("punroll");
     }
@@ -3224,8 +3278,16 @@ fn s_hreassoc(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // per use that folds into a base+index*scale amode, so no
 // address math materializes; constant-trip counters fold their
 // exit test onto the anchor's step value and die with deadrecs.
+fn s_tripfold(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = tripfold::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("tripfold");
+    }
+    k
+}
+
 fn s_ivrefold(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let (k, pmap) = ivrefold::run(&mut p.clctx.func, an);
+    let (k, pmap) = ivrefold::run(&mut p.clctx.func, an, p.amode_scale);
     if !pmap.is_empty() {
         carry_pmap(p, &pmap);
     }
@@ -3620,6 +3682,14 @@ fn s_bittab(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // Runs after edgefwd: its bypass has no cold check and would
 // retarget straight through the adapters, putting the parallel
 // copy back in the hot predecessor tail.
+fn s_errcold(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::errcold(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("errcold");
+    }
+    k
+}
+
 fn s_coldedge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = clifpeep::coldedges(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -4533,6 +4603,14 @@ fn s_bytescan(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_revcmp(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    revcmp::run(&mut p.clctx.func)
+}
+
+fn s_regionfold(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    regionfold::run(&mut p.clctx.func)
+}
+
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = looprot::run(&mut p.clctx.func, an, p.derived, p.prof);
     p.dump("looprot");
@@ -4917,6 +4995,14 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // chains resolve too, not just conditional dispatches.
         .needs_any(shape::JUMP | shape::CONDBR | shape::BPARAM | shape::EPARAM),
         cstep("bittab", "bittab", Gate::Env("PLIRON_BITTAB"), s_bittab).needs(shape::CONDBR),
+        // Const-only CondBr→join Err/None tails → cold (before coldedges).
+        step(
+            "errcold",
+            "errcold",
+            Gate::OptIn("PLIRON_ERRCOLD"),
+            s_errcold,
+        )
+        .needs(shape::CONDBR),
         step(
             "coldedge",
             "coldedge",
@@ -5266,6 +5352,24 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // becomes one bottom `brif`.
         step("ivrefold2", "ivrefold", Gate::Env("PLIRON_IVREFOLD2"), s_ivrefold).needs(shape::LOOPS),
         step("looprot2", "looprot", Gate::Env("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
+        // Two `base[..n].rev()` cursors with the same `n` hit their bases
+        // together, so the second end test and its freeze-select are dead
+        // (`Big::cmp` inside `format_exact`). After looprot2: that is the
+        // shape the walk has once the iterator state is gone. Native was
+        // not timed.
+        step("revcmp", "revcmp", Gate::OptIn("PLIRON_REVCMP"), s_revcmp).needs(shape::CONDBR),
+        // Identical single-entry regions (`write_formatted_parts` inlined
+        // three times into `pad_formatted_parts`) share one body. Each
+        // entry becomes a jump with a tag for exits that differ. After
+        // revcmp so a compare that folded in every copy folds once.
+        // Native was not timed.
+        step(
+            "regionfold",
+            "regionfold",
+            Gate::OptIn("PLIRON_REGIONFOLD"),
+            s_regionfold,
+        )
+        .needs(shape::BLOCKS2),
         // Loop-invariant header params onto a preheader (no back-edge
         // param webs for regalloc2 to spill around; serde_json's escape scan).
         // After the late rotation: a rotated loop's guard sits on both
@@ -5346,6 +5450,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // rust-compression), which the migrated ISLE rules only see
         // here. Measured against the late sweep's counters, size, and
         // the elaborator's placement (docs/codegen-plan.md "Direction").
+        // Note (parse_only wasm): egraph2 remats a peeled digit Horner
+        // into each `len==k` early-exit (15→45 static `i32.mul`), but
+        // skipping it is *slower* (~1.52× vs ~1.46×): the specialized
+        // straight-line arms win over the shared branched unroll under
+        // V8. LLVM's 7-mul shared form is still the target.
         Step {
             name: "egraph2",
             bisect: Some("egraph2"),
@@ -5464,6 +5573,14 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),
         step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
             .needs(shape::CALL),
+        // A zero counter stepped in lockstep with an index, whose only
+        // use is `counter < bound`, is `index < start + bound` once
+        // every entry proved `start + (bound - 1)` does not wrap. The
+        // chars_mixed byte scan still has that counter after the last
+        // GVN (the proof is `i0 + (length - 2)` against a bound of
+        // `length - 1`). After the sinks, so nothing puts the
+        // increment back. Opt-in: native was not timed.
+        step("tripfold", "tripfold", Gate::OptIn("PLIRON_TRIPFOLD"), s_tripfold).needs(shape::LOOPS),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

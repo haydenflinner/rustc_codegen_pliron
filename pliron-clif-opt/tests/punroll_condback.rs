@@ -73,7 +73,7 @@ fn conditional_backedge_unrolls_with_one_group_test() {
     let mut f = cranelift_reader::parse_functions(ANY).unwrap().remove(0);
     let bound = f.dfg.block_params(f.layout.entry_block().unwrap())[1];
     let mut an = Analysis::default();
-    let n = pliron_clif_opt::punroll::run(&mut f, &mut an, "condback", &Default::default());
+    let n = pliron_clif_opt::punroll::run(&mut f, &mut an, "condback", &Default::default(), false);
     assert!(n > 0, "loop not unrolled:\n{}", f.display());
     let flags = settings::Flags::new(settings::builder());
     cranelift_codegen::verify_function(&f, &flags)
@@ -114,7 +114,7 @@ block2(v20: i64):
 }";
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let mut an = Analysis::default();
-    let n = pliron_clif_opt::punroll::run(&mut f, &mut an, "dowhile", &Default::default());
+    let n = pliron_clif_opt::punroll::run(&mut f, &mut an, "dowhile", &Default::default(), false);
     assert!(n > 0, "do-while loop not unrolled:\n{}", f.display());
     let flags = settings::Flags::new(settings::builder());
     cranelift_codegen::verify_function(&f, &flags)

@@ -664,7 +664,13 @@ pub fn trip_max(
     let budget = std::cell::Cell::new(256);
     let span = match sub_cancel(func, cfg, bound, iv0) {
         Some(x) => val_umax(func, cfg, x, &g, 8, &budget),
-        None if iconst(func, iv0) == Some(0) => val_umax(func, cfg, bound, &g, 8, &budget),
+        // `iv0 == 0`, or a non-const entry after looprot peeled the first
+        // trip (`iadd i, 1` into the residual): over-approx by treating
+        // start as 0. Still an upper bound — peel uses it to cap copies
+        // and to drop a dead residual (`full_unroll`).
+        None if iconst(func, iv0).unwrap_or(0) >= 0 => {
+            val_umax(func, cfg, bound, &g, 8, &budget)
+        }
         None => return None,
     };
     (span / step as u64).checked_add(u64::from(le) + 1)

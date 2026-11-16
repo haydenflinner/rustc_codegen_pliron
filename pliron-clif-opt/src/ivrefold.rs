@@ -15,7 +15,16 @@
 //! chosen as anchor over the icmp counter.
 //!
 //! Ring arithmetic makes the refold exact: `(p0 - r*i0) + r*(i0 + t*s)`
-//! reduces to `p0 + r*t*s` mod 2^w with no nowrap requirement. Params
+//! reduces to `p0 + r*t*s` mod 2^w with no nowrap requirement. A ratio
+//! other than 1 is only dropped when the emitter folds `base+iv*scale`
+//! into the load (`amode_scale`: x86_64 and aarch64). Wasm computes the
+//! shift explicitly, so dropping a `p += 8` pointer puts `i<<3` back at
+//! the load — the form indvars had already removed. Ratio 1 on wasm
+//! stays only when the base is a constant small enough to fold into
+//! the load offset (`0..4096`); a table address keeps the carried
+//! step. Native is unchanged
+//! because `amode_scale` is true there; that native path was not re-timed
+//! for this split. Params
 //! whose back edge passes the param itself (`jump h(p)` — a wasted
 //! carried copy) are replaced by their entry value outright. A
 //! constant-trip counter whose only remaining use is its own step +
@@ -267,6 +276,46 @@ fn base_leaf(func: &Function, v: Value) -> Value {
     v
 }
 
+/// `v` when it is only constants combined with `iadd`/`isub`.
+fn const_expr(func: &Function, v: Value) -> Option<i64> {
+    let mut v = func.dfg.resolve_aliases(v);
+    let mut acc = 0i64;
+    for _ in 0..8 {
+        if let Some(c) = iconst(func, v) {
+            return Some(acc.wrapping_add(c));
+        }
+        let ValueDef::Result(i, _) = func.dfg.value_def(v) else {
+            return None;
+        };
+        match func.dfg.insts[i] {
+            InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args: [a, b],
+            } => {
+                if let Some(c) = iconst(func, b) {
+                    acc = acc.wrapping_add(c);
+                    v = func.dfg.resolve_aliases(a);
+                } else if let Some(c) = iconst(func, a) {
+                    acc = acc.wrapping_add(c);
+                    v = func.dfg.resolve_aliases(b);
+                } else {
+                    return None;
+                }
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Isub,
+                args: [a, b],
+            } => {
+                let c = iconst(func, b)?;
+                acc = acc.wrapping_sub(c);
+                v = func.dfg.resolve_aliases(a);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// `h`'s natural loop body: `h` plus every block that can reach a
 /// back-edge source without passing through `h`.
 fn loop_body(
@@ -312,6 +361,7 @@ fn refold_header(
     edges: &FxHashMap<Block, Vec<(Inst, usize)>>,
     h: Block,
     debug: bool,
+    amode_scale: bool,
     pmap_out: &mut FxHashMap<Value, Value>,
 ) -> usize {
     let params = func.dfg.block_params(h).to_vec();
@@ -583,6 +633,23 @@ fn refold_header(
         drops.retain(|&(ix, _)| {
             let leaf = base_leaf(func, entry_args[ix]);
             iconst(func, leaf).is_some() || in_use.contains(&leaf) || !out_live.contains(&leaf)
+        });
+    }
+    // No scaled addressing: `bp + iv*scale` is a shift plus an add at
+    // the use, and the carried `p += k` is the cheaper form. Ratio 1
+    // with a constant base still refolds when that constant fits a
+    // 12-bit load offset (`0..4096`): `load (K + iv)` folds K into the
+    // memarg and the add disappears. A larger constant is a table
+    // address. Folding one into the memarg made the chars_mixed probes
+    // slower (V8 rematerializes a 20-bit immediate), so the carried
+    // `p += 1` stays and the add of the table happens once, ahead of
+    // the loop. A non-constant base is an add in front of the load
+    // every trip; keeping the carried step leaves that add off the
+    // address path. Native keeps every ratio (`amode_scale`); that
+    // path was not re-timed.
+    if !amode_scale {
+        drops.retain(|&(ix, r)| {
+            r == 1 && const_expr(func, entry_args[ix]).is_some_and(|k| (0..4096).contains(&k))
         });
     }
     if drops.is_empty() && idents.is_empty() {
@@ -1244,6 +1311,7 @@ pub fn deadrecs(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usiz
 pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
+    amode_scale: bool,
 ) -> (usize, FxHashMap<Value, Value>) {
     let (_, domtree) = an.cfg_dt(func);
     let edges = edges_to(func);
@@ -1252,7 +1320,7 @@ pub fn run(
     let mut n = 0;
     let mut pmap = FxHashMap::default();
     for h in func.layout.blocks().collect::<Vec<_>>() {
-        let k = refold_header(func, domtree, &edges, h, debug, &mut pmap);
+        let k = refold_header(func, domtree, &edges, h, debug, amode_scale, &mut pmap);
         if debug && pliron_cfg::tracing_on() && func.dfg.block_params(h).len() > 1 {
             tracing::debug!(target: "pliron::ivrefold", "ivrefold {h}: {} params -> {k}", func.dfg.block_params(h).len());
         }

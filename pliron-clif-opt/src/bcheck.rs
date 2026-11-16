@@ -80,6 +80,23 @@ enum Step {
     K(i64),
 }
 
+/// Trip count of a pointer walk. `K` is a constant number of steps.
+#[derive(Clone, Copy)]
+enum TripN {
+    V(Value),
+    K(i64),
+}
+
+/// `ptr` starts at `base`, steps by `stride`, and the header exits when
+/// `ptr == base + n*stride`. That is `n` iterations when `n*stride` does
+/// not wrap.
+#[derive(Clone, Copy)]
+struct Span {
+    base: Value,
+    stride: i64,
+    n: TripN,
+}
+
 struct LoopInfo {
     /// Header param stepping by `istep` per iteration.
     iv: Value,
@@ -102,6 +119,9 @@ struct LoopInfo {
     /// Resolved entry arg for each header param when all entry edges pass
     /// the same value (None = they disagree or are unanalyzable).
     eargs: Vec<Option<Value>>,
+    /// Pointer-walk trip. `bound` is unused; the guard uses `entry(iv) + n`
+    /// and rejects a wrapping `n*stride`.
+    span: Option<Span>,
 }
 
 /// A `brif` whose in-bounds edge is provably always taken given `hi < len`.
@@ -116,6 +136,7 @@ struct Chk {
     /// `B - adj + k < len` rather than a trip-count `hi`.
     bsub: Option<i64>,
 }
+
 
 fn iconst(func: &Function, v: Value) -> Option<i64> {
     let i = func.dfg.resolved_value_def(v).inst()?;
@@ -212,6 +233,17 @@ fn edge_arg(func: &Function, e: &Edge, idx: usize) -> Option<Value> {
     }
 }
 
+/// Every entry edge feeds header param `p` with the constant 0.
+fn zero_entry(func: &Function, params: &[Value], eargs: &[Option<Value>], p: Value) -> bool {
+    let Some(i) = params.iter().position(|&q| q == p) else {
+        return false;
+    };
+    eargs
+        .get(i)
+        .and_then(|v| *v)
+        .is_some_and(|v| iconst(func, v) == Some(0))
+}
+
 /// `arg` is `P + step` for header param `P`: the per-iteration delta.
 fn step_of(func: &Function, p: Value, arg: Value) -> Option<Step> {
     let arg = func.dfg.resolve_aliases(arg);
@@ -232,6 +264,313 @@ fn step_of(func: &Function, p: Value, arg: Value) -> Option<Step> {
         }
         _ => None,
     }
+}
+
+/// `iadd v, 0` is a copy. One peel is not always enough (`iadd (iadd v, 0), 0`).
+fn peel_add0(func: &Function, v: Value) -> Value {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..4 {
+        let Some(i) = func.dfg.value_def(v).inst() else {
+            break;
+        };
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args: [a, b],
+        } = func.dfg.insts[i]
+        else {
+            break;
+        };
+        let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+        let next = if iconst(func, b) == Some(0) {
+            a
+        } else if iconst(func, a) == Some(0) {
+            b
+        } else {
+            break;
+        };
+        if next == v {
+            break;
+        }
+        v = next;
+    }
+    v
+}
+
+fn iadd_pair(func: &Function, v: Value) -> Option<(Value, Value)> {
+    let i = func.dfg.value_def(v).inst()?;
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args: [a, b],
+        } => Some((func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b))),
+        _ => None,
+    }
+}
+
+/// `delta` is `n << log`, and `log` is in range for `delta`'s type so the
+/// shift is a multiply by `1 << log` rather than a masked count.
+fn shl_arg(func: &Function, delta: Value, log: i64) -> Option<Value> {
+    let delta = func.dfg.resolve_aliases(delta);
+    let bits = func.dfg.value_type(delta).bits() as i64;
+    if log < 0 || log >= bits {
+        return None;
+    }
+    let i = func.dfg.value_def(delta).inst()?;
+    match func.dfg.insts[i] {
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, b],
+        } => {
+            let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+            (iconst(func, b) == Some(log)).then_some(a)
+        }
+        _ => None,
+    }
+}
+
+/// Same address, not only the same SSA value. Two `stack_addr`s of one
+/// slot, two `symbol_value`s of one symbol, or two equal constants.
+fn same_addr(func: &Function, a: Value, b: Value) -> bool {
+    let a = peel_add0(func, a);
+    let b = peel_add0(func, b);
+    if a == b {
+        return true;
+    }
+    if let (Some(x), Some(y)) = (iconst(func, a), iconst(func, b)) {
+        return x == y;
+    }
+    let (Some(ia), Some(ib)) = (func.dfg.value_def(a).inst(), func.dfg.value_def(b).inst()) else {
+        return false;
+    };
+    match (func.dfg.insts[ia], func.dfg.insts[ib]) {
+        (
+            InstructionData::StackAddr {
+                stack_slot: sa,
+                offset: oa,
+                ..
+            },
+            InstructionData::StackAddr {
+                stack_slot: sb,
+                offset: ob,
+                ..
+            },
+        ) => sa == sb && oa == ob,
+        (
+            InstructionData::UnaryGlobalValue {
+                opcode: Opcode::SymbolValue,
+                global_value: ga,
+            },
+            InstructionData::UnaryGlobalValue {
+                opcode: Opcode::SymbolValue,
+                global_value: gb,
+            },
+        ) => ga == gb,
+        _ => false,
+    }
+}
+
+/// `end` is `base + n*stride` (or `n << log2(stride)` when `base` is 0).
+/// `n` is the number of `stride`-steps from `base` to `end`.
+fn span_n(func: &Function, end: Value, base: Value, stride: i64) -> Option<TripN> {
+    if stride <= 0 {
+        return None;
+    }
+    let base = peel_add0(func, base);
+    let end = func.dfg.resolve_aliases(end);
+    let delta = if let Some((a, b)) = iadd_pair(func, end) {
+        let (a, b) = (peel_add0(func, a), peel_add0(func, b));
+        if same_addr(func, a, base) {
+            b
+        } else if same_addr(func, b, base) {
+            a
+        } else {
+            return None;
+        }
+    } else if iconst(func, base) == Some(0) {
+        end
+    } else {
+        return None;
+    };
+    let delta = peel_add0(func, delta);
+    if let Some(c) = iconst(func, delta) {
+        if c > 0 && c % stride == 0 {
+            return Some(TripN::K(c / stride));
+        }
+        return None;
+    }
+    if stride.count_ones() != 1 {
+        return None;
+    }
+    let n = shl_arg(func, delta, stride.trailing_zeros() as i64)?;
+    Some(TripN::V(func.dfg.resolve_aliases(n)))
+}
+
+fn dominates_header(
+    func: &Function,
+    dt: &DominatorTree,
+    body: &FxHashSet<Block>,
+    h: Block,
+    v: Value,
+) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if iconst(func, v).is_some() {
+        return true;
+    }
+    match def_block(func, v) {
+        Some(b) if b != h && !body.contains(&b) => dt.try_dominates(b, h, &func.layout),
+        _ => false,
+    }
+}
+
+/// Header `brif` whose continue-condition is `p != end`.
+fn header_ne(func: &Function, body: &FxHashSet<Block>, h: Block, p: Value) -> Option<Value> {
+    let i = func.layout.last_inst(h)?;
+    if func.dfg.insts[i].opcode() != Opcode::Brif {
+        return None;
+    }
+    let dests =
+        func.dfg.insts[i].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+    let mut cs = None;
+    for (s, bc) in dests.iter().enumerate() {
+        if body.contains(&bc.block(&func.dfg.value_lists)) {
+            if cs.replace(s).is_some() {
+                return None;
+            }
+        }
+    }
+    let cs = cs?;
+    if body.contains(&dests[1 - cs].block(&func.dfg.value_lists)) {
+        return None;
+    }
+    let InstructionData::Brif { arg: c, .. } = func.dfg.insts[i] else {
+        return None;
+    };
+    let ci = func.dfg.resolved_value_def(c).inst()?;
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args: [x, y],
+    } = func.dfg.insts[ci]
+    else {
+        return None;
+    };
+    let cond = if cs == 0 { cond } else { cond.complement() };
+    if cond != IntCC::NotEqual {
+        return None;
+    }
+    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+    if x == p {
+        Some(y)
+    } else if y == p {
+        Some(x)
+    } else {
+        None
+    }
+}
+
+/// A digit loop whose exit is `ptr == base + n*stride` and whose index
+/// steps by 1. The index values that enter the body are `entry .. entry+n`
+/// when `n*stride` does not wrap; the guard checks that and keeps the
+/// original loop otherwise. Native was not timed.
+fn ptr_counted(
+    func: &Function,
+    dt: &DominatorTree,
+    h: Block,
+    body: &FxHashSet<Block>,
+    params: &[Value],
+    eargs: &[Option<Value>],
+    bargs: &[Option<Value>],
+) -> Option<LoopInfo> {
+    let mut ptr_i = None;
+    let mut stride = 0;
+    for (i, &p) in params.iter().enumerate() {
+        let ty = func.dfg.value_type(p);
+        if !ty.is_int() || ty.bits() > 64 {
+            continue;
+        }
+        let Some(ba) = bargs.get(i).copied().flatten() else {
+            continue;
+        };
+        let Some(Step::K(k)) = step_of(func, p, ba) else {
+            continue;
+        };
+        if k <= 0 {
+            continue;
+        }
+        if header_ne(func, body, h, p).is_some() {
+            ptr_i = Some(i);
+            stride = k;
+            break;
+        }
+    }
+    let i = ptr_i?;
+    let p = params[i];
+    let end = header_ne(func, body, h, p)?;
+    let base = eargs.get(i).copied().flatten()?;
+    if !dominates_header(func, dt, body, h, base) || !dominates_header(func, dt, body, h, end) {
+        return None;
+    }
+    let n = span_n(func, end, base, stride)?;
+    if let TripN::V(v) = n {
+        let ty = func.dfg.value_type(p);
+        if func.dfg.value_type(v) != ty || !dominates_header(func, dt, body, h, v) {
+            return None;
+        }
+    }
+    let mut idx = None;
+    for (j, &q) in params.iter().enumerate() {
+        if j == i {
+            continue;
+        }
+        let ty = func.dfg.value_type(q);
+        if !ty.is_int() || ty.bits() > 64 || ty != func.dfg.value_type(p) {
+            continue;
+        }
+        let Some(ba) = bargs.get(j).copied().flatten() else {
+            continue;
+        };
+        if !matches!(step_of(func, q, ba), Some(Step::K(1))) {
+            continue;
+        }
+        if let Some(e) = eargs.get(j).copied().flatten() {
+            if !dominates_header(func, dt, body, h, e) {
+                continue;
+            }
+        }
+        idx = Some(j);
+        break;
+    }
+    let idx = idx?;
+    let mut stepped = FxHashMap::default();
+    for (j, &q) in params.iter().enumerate() {
+        if j == idx {
+            continue;
+        }
+        let Some(ba) = bargs.get(j).copied().flatten() else {
+            continue;
+        };
+        if let Some(Step::K(k)) = step_of(func, q, ba) {
+            stepped.insert(q, (j, Step::K(k)));
+        }
+    }
+    let iv0k = eargs.get(idx).copied().flatten().and_then(|v| iconst(func, v));
+    Some(LoopInfo {
+        iv: params[idx],
+        iv0: idx,
+        iv0k,
+        bound: params[idx],
+        adj: 1,
+        stepped,
+        g: None,
+        h,
+        bargs: bargs.to_vec(),
+        eargs: eargs.to_vec(),
+        span: Some(Span {
+            base,
+            stride,
+            n,
+        }),
+    })
 }
 
 /// `v` is loop-invariant: defined outside the body, or a header param whose
@@ -1280,6 +1619,17 @@ fn run_loop(
                 (IntCC::UnsignedLessThanOrEqual, true, false, true) => -1,
                 (IntCC::UnsignedLessThan, false, _, true) => 1,
                 (IntCC::UnsignedLessThanOrEqual, false, _, true) => 0,
+                // `brif (iv == limit), exit, body` with `iv` starting at 0
+                // and stepping by 1. The values that enter the body are
+                // `0, 1, ..., limit-1`: the same set as `iv < limit`. A
+                // nonzero entry can sit above `limit` and wrap all the way
+                // around, which `<` would not, so that stays uncounted.
+                (IntCC::NotEqual, false, _, true)
+                    if matches!(step_of(func, p, ba), Some(Step::K(1)))
+                        && zero_entry(func, &params, &eargs, p) =>
+                {
+                    1
+                }
                 _ => continue,
             };
             return Some((b, adj, i));
@@ -1329,6 +1679,7 @@ fn run_loop(
                 h,
                 bargs: bargs.clone(),
                 eargs: eargs.clone(),
+                span: None,
             };
             if !invariant_v(func, cfg, dt, &lo, &body, bound, &mut FxHashSet::default(), 8)
                 || matches!(istep, Step::V(sv) if !invariant_v(func, cfg, dt, &lo, &body, sv, &mut FxHashSet::default(), 8))
@@ -1383,17 +1734,21 @@ fn run_loop(
                     h,
                     bargs: bargs.clone(),
                     eargs: eargs.clone(),
+                    span: None,
                 };
                 if invariant_v(func, cfg, dt, &lo, &body, bound, &mut FxHashSet::default(), 8) {
                     found = Some(lo);
                     break;
                 }
             }
-            let Some(lo) = found else {
+            if let Some(lo) = found {
+                let iv = lo.iv;
+                (lo, Some(iv))
+            } else if let Some(lo) = ptr_counted(func, dt, h, &body, &params, &eargs, &bargs) {
+                (lo, None)
+            } else {
                 bail!("no counting iv")
-            };
-            let iv = lo.iv;
-            (lo, Some(iv))
+            }
         }
     };
 
@@ -1769,7 +2124,37 @@ fn run_loop(
             pos.ins().uextend(wty, v)
         }
     };
-    let boundv = gval(&info, &gp, &body, &mut pos, info.bound);
+    let mut flags: Vec<Value> = Vec::new();
+    let boundv = if let Some(span) = info.span {
+        // Last index is `entry + n - 1`. A wrapping `entry + n` or
+        // `n * stride` takes the original loop.
+        let n = match span.n {
+            TripN::K(k) => iconst_masked(&mut pos, ity, k),
+            TripN::V(v) => gval(&info, &gp, &body, &mut pos, v),
+        };
+        let ev = gval(&info, &gp, &body, &mut pos, info.iv);
+        let (sum, of) = pos.ins().uadd_overflow(ev, n);
+        flags.push(of);
+        let base = gval(&info, &gp, &body, &mut pos, span.base);
+        let bty = pos.func.dfg.value_type(base);
+        let pn = match span.n {
+            TripN::K(k) => iconst_masked(&mut pos, bty, k),
+            TripN::V(_) => n,
+        };
+        let prod = if span.stride == 1 {
+            pn
+        } else {
+            let s = iconst_masked(&mut pos, bty, span.stride);
+            let (p, pof) = pos.ins().umul_overflow(pn, s);
+            flags.push(pof);
+            p
+        };
+        let (_end, eof) = pos.ins().uadd_overflow(base, prod);
+        flags.push(eof);
+        sum
+    } else {
+        gval(&info, &gp, &body, &mut pos, info.bound)
+    };
     // Trip-count terms are only needed by affine checks. `t` is the last
     // counter value, in the index type; the wide path zextends it. `t_k`
     // is `t` when `bound`/`iv0` are entry constants — an `m*t` extremal
@@ -1851,7 +2236,6 @@ fn run_loop(
     } else {
         (None, None, None)
     };
-    let mut flags: Vec<Value> = Vec::new();
     let mut ok: Option<Value> = None;
     for c in &checks {
         let lenv = gval(&info, &gp, &body, &mut pos, c.len);

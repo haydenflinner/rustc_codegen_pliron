@@ -57,6 +57,21 @@ struct Arm {
 const SPEC_NARROW: usize = 4;
 const SPEC_WIDE: usize = 8;
 
+/// Arm body that would clone a multiply into the predecessor. Speculating
+/// `from_str`'s digit `wrapping_mul` / `checked_mul` across length/sign
+/// arms turns one unroll into N always-paid muls (wasm parse_only:
+/// 7 → 45 `i32.mul`, TF madd 7 → 50). LLVM keeps the muls behind
+/// `br_table` / branches. `PLIRON_IFCONV_SPECMUL=1` restores the old
+/// "speculate muls" behaviour.
+fn arm_speculates_mul(func: &Function, arm: &Arm) -> bool {
+    arm.clone.iter().any(|&i| {
+        matches!(
+            func.dfg.insts[i].opcode(),
+            Opcode::Imul | Opcode::Umulhi | Opcode::Smulhi
+        )
+    })
+}
+
 /// `iconst` value bits, if `v` is one.
 fn iconst_bits(func: &Function, v: Value) -> Option<i64> {
     let v = func.dfg.resolve_aliases(v);
@@ -809,11 +824,23 @@ thread_local! {
 }
 
 
+/// `tables`: convert `br_table`→selects. Off on wasm (V8 has a real
+/// `br_table`; `PLIRON_IFCONV_TABLE=0|1` overrides).
 pub fn run(
     func: &mut Function,
     derived: &mut VMap<Value>,
     cd: Option<(&mut ControlFlowGraph, &mut DominatorTree)>,
+    tables: bool,
 ) -> usize {
+    let tables = match pliron_cfg::env_get("PLIRON_IFCONV_TABLE") {
+        Some("0") => false,
+        Some("1") => true,
+        _ => tables,
+    };
+    // Default: do not speculate `imul` (see `arm_speculates_mul`).
+    static SPECMUL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_IFCONV_SPECMUL", "1"));
+    let specmul = *SPECMUL;
     EDGE_NS.set(0);
     EDGE_PROF.set(
         pliron_cfg::tracing_on()
@@ -878,7 +905,9 @@ pub fn run(
                 continue;
             };
             let InstructionData::Brif { arg: cond, .. } = func.dfg.insts[term] else {
-                if matches!(func.dfg.insts[term], InstructionData::BranchTable { .. }) {
+                if tables
+                    && matches!(func.dfg.insts[term], InstructionData::BranchTable { .. })
+                {
                     nbt += 1;
                     if conv_table(
                         func,
@@ -959,6 +988,15 @@ pub fn run(
                 && !ea.chained
                 && (ta.clone.len() > SPEC_NARROW || ea.clone.len() > SPEC_NARROW)
                 && !bool_merge(func, &[&ta, &ea])
+            {
+                continue;
+            }
+            // Never speculate integer multiplies across a diamond: the
+            // digit-unroll arms of `from_str` each carry `imul 10`, and
+            // folding them into selects runs every length's muls on the
+            // hot path. Opt back in with `PLIRON_IFCONV_SPECMUL=1`.
+            if !specmul
+                && (arm_speculates_mul(func, &ta) || arm_speculates_mul(func, &ea))
             {
                 continue;
             }
@@ -1208,7 +1246,7 @@ mod tests {
         };
 
         let mut derived = VMap::default();
-        assert_eq!(run(&mut func, &mut derived, None), 1);
+        assert_eq!(run(&mut func, &mut derived, None, /* tables */ true), 1);
         let term = func.layout.last_inst(b).unwrap();
         let InstructionData::Jump { destination, .. } = &func.dfg.insts[term] else {
             panic!("table not folded: {}", func.display());
@@ -1344,7 +1382,7 @@ mod tests {
         };
 
         let mut derived = VMap::default();
-        let _ = run(&mut func, &mut derived, None);
+        let _ = run(&mut func, &mut derived, None, /* tables */ true);
         // hop's own diamond fold is legitimate; the latch's fold must be
         // rejected — its arms resolve through `hop` while `hop`'s params
         // and `cnd` still feed blocks below `merge`.
