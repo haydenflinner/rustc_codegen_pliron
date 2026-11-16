@@ -35,6 +35,16 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-16 afternoon, wasm only (read in the inliner's small mode;
+    // `PLIRON_INLINE_RECX=0` turns it off, `=1` turns it on for native
+    // too): a site cloned out of an inlined body does not inline a member
+    // of a call-graph cycle its clone chain already entered. The derived
+    // `Clone` of a recursive AST is such a cycle, and callers outside it
+    // unrolled it to the 20,000-op caller cap. dsa: module 49.81 -> 45.15
+    // MB, code 40.1 -> 35.5 MB (`Matrix::defaulted` 193 KB -> 1.6 KB),
+    // all 19 workloads equal, the 14 like-for-like rows 1.063 -> 1.061
+    // against LLVM; the wasm kernel module is byte-identical.
+    "PLIRON_INLINE_RECX_WASM",
     // 2026-11-16, the dsa wasm module (docs/history/2026-11-16-wasm-night.md,
     // "dsa, performance"). Gate and `harness/crates.py --tier 1` clean
     // with both on; the wasm kernels are unchanged (geomean 0.931 ->
