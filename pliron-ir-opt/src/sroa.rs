@@ -1292,7 +1292,19 @@ fn split(
             .any(|x| matches!(x.kind, Kind::Copy { n, .. } if x.off == 0 && n == size));
         let direct = acc.iter().filter(|x| matches!(x.kind, Kind::Load | Kind::Store)).count();
         let pieces: Vec<(u64, u64)> = sl.iter().map(|x| (x.off, x.size)).collect();
-        if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per) {
+        // `PLIRON_SROA_FRAGWORD=<bytes>` (default 8): the word the rule
+        // counts in. On wasm32 an i32 is a whole register value, yet a
+        // `[u32; 16]` reads as sixteen sub-word pieces; `=4` is the
+        // experiment (docs/history/2026-11-16-wasm-night.md): kernels
+        // unchanged but strwork +5.6% -> +3.9%. NOT ready: the dsa
+        // module built with `=4` does not validate (`i32.wrap_i64` on an
+        // i32 local in `literate_page::Page::tape_pack`), a bug after
+        // CLIF that the new shapes reach. Find that first.
+        let word: u64 = crate::env_get("PLIRON_SROA_FRAGWORD")
+            .and_then(|v| v.parse().ok())
+            .filter(|w: &u64| w.is_power_of_two())
+            .unwrap_or(8);
+        if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per, word) {
             return false;
         }
     }
@@ -2297,9 +2309,9 @@ fn forward_single_store_d(
 /// into `pieces` (`(offset, size)`) with `direct` loads and stores stays
 /// whole: more pieces than words, at least two of them not a whole word
 /// on a word boundary, and at most `per` direct accesses a piece.
-fn frag_copy_stays_whole(size: u64, pieces: &[(u64, u64)], direct: usize, per: usize) -> bool {
-    pieces.len() as u64 > size.div_ceil(8)
-        && pieces.iter().filter(|&&(off, sz)| off % 8 != 0 || sz % 8 != 0).count() >= 2
+fn frag_copy_stays_whole(size: u64, pieces: &[(u64, u64)], direct: usize, per: usize, word: u64) -> bool {
+    pieces.len() as u64 > size.div_ceil(word)
+        && pieces.iter().filter(|&&(off, sz)| off % word != 0 || sz % word != 0).count() >= 2
         && direct <= per * pieces.len()
 }
 
@@ -2314,12 +2326,14 @@ mod tests {
     #[test]
     fn frag_copy_rule() {
         let cowstr = [(0, 1), (1, 4), (5, 2), (7, 1), (8, 8), (16, 8)];
-        assert!(frag_copy_stays_whole(24, &cowstr, 7, 8));
-        assert!(!frag_copy_stays_whole(24, &[(0, 8), (8, 8), (16, 8)], 6, 8));
-        assert!(!frag_copy_stays_whole(24, &[(0, 1), (8, 8), (16, 8)], 6, 8));
+        assert!(frag_copy_stays_whole(24, &cowstr, 7, 8, 8));
+        assert!(!frag_copy_stays_whole(24, &[(0, 8), (8, 8), (16, 8)], 6, 8, 8));
+        assert!(!frag_copy_stays_whole(24, &[(0, 1), (8, 8), (16, 8)], 6, 8, 8));
         let words: Vec<(u64, u64)> = (0..16).map(|i| (4 * i, 4)).collect();
-        assert!(frag_copy_stays_whole(64, &words, 32, 8));
-        assert!(!frag_copy_stays_whole(64, &words, 16 * 8 + 1, 8));
+        assert!(frag_copy_stays_whole(64, &words, 32, 8, 8));
+        assert!(!frag_copy_stays_whole(64, &words, 16 * 8 + 1, 8, 8));
+        // Counted in 4-byte words (wasm32) the same array is whole words.
+        assert!(!frag_copy_stays_whole(64, &words, 32, 8, 4));
     }
 
     use pliron::builtin::ops::ModuleOp;

@@ -348,6 +348,19 @@ Tried and not kept:
   caller) lands in the exported function next to its set-up code and
   the same loop runs slower there. That is the thing to understand
   before turning it on; LLVM inlines the same way and does not pay.
+- `PLIRON_SROA_FRAGWORD=4` (new knob, default 8 = unchanged): count
+  `PLIRON_SROA_FRAGCOPY`'s "words" in 4 bytes on wasm32 so u32 arrays
+  split as u64 arrays do on native. Kernels unchanged except strwork
+  +5.6% -> +3.9%, module -0.5%. **But the dsa module built with it is
+  invalid wasm**: `wasm-validate` reports `type mismatch in
+  i32.wrap_i64, expected [i64] but got [i32]` in
+  `literate_page::Page::tape_pack` (`local.get 7; i32.wrap_i64` where
+  local 7 is the i32 frame pointer, right after a `drop_glue` call).
+  CLIF verified, so the emitter or wpeep mistypes a value; not
+  reproduced in the small loro repro, not found. The build that showed
+  it is `/tmp/dsa-bench/target-pliron-fw4`. This is a second latent
+  bug of the same family as the asteroids one (below) and worth more
+  than the knob.
 - Folding every GOT `global.get` to `i32.const` in the linker (2404
   globals -> 1, +0.18% size): no change outside noise. V8 handles an
   immutable global as well as a constant here.
