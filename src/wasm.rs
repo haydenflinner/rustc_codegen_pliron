@@ -4371,6 +4371,20 @@ fn peep_body_opts(
             let off = urd(b, &mut q)?;
             Some((op, off))
         };
+        // A full-width access whose alignment hint is below its width is
+        // a volatile one (`CX::ma`): never a forwarding source or target,
+        // never a dead store. Narrow accesses forward nothing anyway.
+        let volatile = |i: usize| -> bool {
+            let s = ins[i].1;
+            let op = b[s];
+            let nat = match op {
+                0x28 | 0x2a | 0x36 | 0x38 => 2,
+                0x29 | 0x2b | 0x37 | 0x39 => 3,
+                _ => return false,
+            };
+            let mut q = s + 1;
+            urd(b, &mut q).is_some_and(|a| a < nat)
+        };
         let swidth = |op: u8| -> u32 {
             match op {
                 0x3a | 0x3b => 1,         // i32/i64 store8
@@ -4845,8 +4859,8 @@ fn peep_body_opts(
                                 eprintln!("  store@{i} off={off} retain-killed {gone:?}");
                             }
                         }
-                        if !(0x36..=0x39).contains(&sop) {
-                            continue; // narrow stores forward nothing
+                        if !(0x36..=0x39).contains(&sop) || volatile(i) {
+                            continue; // narrow and volatile stores forward nothing
                         }
                         // `get V` producers forward V directly; a
                         // computed value records `u32::MAX` and a
@@ -4883,6 +4897,7 @@ fn peep_body_opts(
                         };
                         let mut forwarded = false;
                         if (0x28..=0x2b).contains(&lop)
+                            && !volatile(i)
                             && let Some(e) = fmap.get_mut(&(bx, off))
                             && lop + 0x0e == e.1
                         {
@@ -7606,6 +7621,34 @@ mod wpeep_tests {
         assert_eq!(got.1, want.1, "the peephole changed what the body stores: {:02x?}", code_of(&out));
     }
 
+    // A full-width load whose alignment hint is below its width is a
+    // volatile load (`black_box`'s reload, `read_volatile`): it stays a
+    // load. Forwarded, the barrier would be a copy.
+    #[test]
+    fn sfwd_leaves_a_volatile_load_alone() {
+        const CODE: &[u8] = &[
+            0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, // [B+0] = V
+            0x20, 0x00, 0x28, 0x00, 0x00, 0x21, 0x02, // x = volatile [B+0]
+            0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x04, // [B+4] = x
+        ];
+        let mut b = vec![0x00];
+        b.extend_from_slice(CODE);
+        b.push(0x0b);
+        let out = peep_body_opts(&b, &[], &[], 3, &PeepOpts::from_env()).unwrap();
+        let code = code_of(&out);
+        assert!(
+            code.windows(3).any(|w| w == [0x28, 0x00, 0x00]),
+            "the volatile load was forwarded: {code:02x?}"
+        );
+        // The same body with a plain (aligned) load does forward: the test
+        // would be vacuous otherwise.
+        let mut plain = b.clone();
+        let at = plain.windows(3).position(|w| w == [0x28, 0x00, 0x00]).unwrap();
+        plain[at + 1] = 0x02;
+        let out = peep_body_opts(&plain, &[], &[], 3, &PeepOpts::from_env()).unwrap();
+        assert!(!code_of(&out).windows(2).any(|w| w == [0x28, 0x02]), "plain load not forwarded");
+    }
+
     // Store-to-load forwarding across a loop entry. `[B+0] = V` before the
     // loop, `acc += [B+0]` at its top, `[C+0] = acc` at its bottom: `B` and
     // `C` are different locals that may hold the same address, so from
@@ -9579,6 +9622,12 @@ mod clif_emit {
         frame: u64,
         frame_align: u64,
         name: String,
+        /// The access being emitted is volatile (a CLIF load/store
+        /// without `notrap`): `ma` gives it an alignment hint below its
+        /// width. Engines ignore the hint; `wpeep` reads it as "do not
+        /// forward to or from this access" (see `sfwd`). wasm's
+        /// `black_box` is a plain store and a volatile reload.
+        vol: bool,
     }
 
     impl<'o, 'a> CX<'o, 'a> {
@@ -9604,6 +9653,7 @@ mod clif_emit {
                 mask_c: WV::invalid(),
                 frame: 0,
                 frame_align: 16,
+                vol: false,
                 name: String::new(),
             };
             let cur = cx.b.entry;
@@ -9664,7 +9714,7 @@ mod clif_emit {
 
         fn ma(&self, off: u64, bytes: u64) -> MemoryArg {
             MemoryArg {
-                align: bytes.trailing_zeros(),
+                align: if self.vol { 0 } else { bytes.trailing_zeros() },
                 offset: off as u32,
                 memory: self.o.mem,
             }
@@ -10822,12 +10872,41 @@ mod clif_emit {
                             self.set(rs[1], vs[1]);
                         }
                         P::BlackBox => {
-                            // Identity marker.
+                            // The barrier itself: store the value to a
+                            // scratch frame slot and reload it with a
+                            // volatile load (`vol`: a hint wpeep will not
+                            // forward through). That is what stock rustc
+                            // emits for `black_box` on wasm, and no CLIF
+                            // pass can fold it: the op is opaque until
+                            // here. (As an alloca and a volatile load in
+                            // the IR it was folded by slotprom, the egraph's
+                            // alias analysis and licm's slot promotion.)
+                            // One slot per barrier, as wide as the value
+                            // (narrow stores and loads for i8/i16, like
+                            // LLVM's): a slot shared by every barrier in
+                            // the function chained each reload behind the
+                            // previous barrier's store (eqbug, six
+                            // barriers an iteration: +20% against LLVM).
                             let vs = self.get(arg).clone();
-                            let rs = f.dfg.inst_results(i);
-                            for (r, &v) in rs.iter().zip(vs.iter()) {
-                                self.set(*r, v);
+                            let ct = self.vty(f, arg);
+                            let bytes = u64::from(ct.bytes()).max(1);
+                            let slot = self.frame_slot(bytes, bytes.min(16).next_power_of_two());
+                            let p = self.addr(i64::from(slot));
+                            let mut out = Vals::new();
+                            if vs.len() == 2 {
+                                // i128/f128: two i64 halves.
+                                self.store(clt::I64, vs[0], p, 0);
+                                self.store(clt::I64, vs[1], p, 8);
+                                self.vol = true;
+                                out.push(self.load(clt::I64, p, 0));
+                                out.push(self.load(clt::I64, p, 8));
+                            } else {
+                                self.store(ct, vs[0], p, 0);
+                                self.vol = true;
+                                out.push(self.load(ct, p, 0));
                             }
+                            self.vol = false;
+                            self.bind(f, i, out);
                         }
                         P::Bitcast => {
                             let a = self.get1(arg);
@@ -11001,7 +11080,9 @@ mod clif_emit {
                         _ => 0,
                     };
                     let p = self.base32(arg);
+                    self.vol = f.dfg.insts[i].memflags_trap_code(&f.dfg).is_some();
                     let vs = self.do_load(opcode, rt, p, off as u64);
+                    self.vol = false;
                     self.bind(f, i, vs);
                 }
                 ir::InstructionData::Store { opcode, args, .. }
@@ -11017,7 +11098,9 @@ mod clif_emit {
                         _ => 0,
                     };
                     let p = self.base32(args[1]);
+                    self.vol = f.dfg.insts[i].memflags_trap_code(&f.dfg).is_some();
                     self.do_store(f, opcode, st, args[0], p, off as u64);
+                    self.vol = false;
                 }
                 ir::InstructionData::StackAddr {
                     stack_slot, offset, ..
@@ -11103,26 +11186,29 @@ mod clif_emit {
                                 }
                                 let d = self.cvt(self.get1(args[0]), WT::I32);
                                 let s = self.cvt(self.get1(args[1]), WT::I32);
-                                let ma = |off: u64| MemoryArg {
-                                    align: 0,
+                                // Natural hints (a hint below the width
+                                // marks a volatile access for wpeep); the
+                                // address need not be aligned.
+                                let ma = |off: u64, w: u64| MemoryArg {
+                                    align: w.trailing_zeros(),
                                     offset: off as u32,
                                     memory: mem,
                                 };
                                 let vals: SmallVec<[WV; 2]> = pieces
                                     .iter()
                                     .map(|&(off, w)| match w {
-                                        8 => self.op(O::I64Load { memory: ma(off) }, &[s], WT::I64),
-                                        4 => self.op(O::I32Load { memory: ma(off) }, &[s], WT::I32),
-                                        2 => self.op(O::I32Load16U { memory: ma(off) }, &[s], WT::I32),
-                                        _ => self.op(O::I32Load8U { memory: ma(off) }, &[s], WT::I32),
+                                        8 => self.op(O::I64Load { memory: ma(off, 8) }, &[s], WT::I64),
+                                        4 => self.op(O::I32Load { memory: ma(off, 4) }, &[s], WT::I32),
+                                        2 => self.op(O::I32Load16U { memory: ma(off, 2) }, &[s], WT::I32),
+                                        _ => self.op(O::I32Load8U { memory: ma(off, 1) }, &[s], WT::I32),
                                     })
                                     .collect();
                                 for (&(off, w), &v) in pieces.iter().zip(&vals) {
                                     match w {
-                                        8 => self.op0(O::I64Store { memory: ma(off) }, &[d, v]),
-                                        4 => self.op0(O::I32Store { memory: ma(off) }, &[d, v]),
-                                        2 => self.op0(O::I32Store16 { memory: ma(off) }, &[d, v]),
-                                        _ => self.op0(O::I32Store8 { memory: ma(off) }, &[d, v]),
+                                        8 => self.op0(O::I64Store { memory: ma(off, 8) }, &[d, v]),
+                                        4 => self.op0(O::I32Store { memory: ma(off, 4) }, &[d, v]),
+                                        2 => self.op0(O::I32Store16 { memory: ma(off, 2) }, &[d, v]),
+                                        _ => self.op0(O::I32Store8 { memory: ma(off, 1) }, &[d, v]),
                                     }
                                 }
                                 return;

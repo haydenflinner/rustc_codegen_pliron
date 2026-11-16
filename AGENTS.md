@@ -62,11 +62,20 @@ Read it before picking a task.
 
 `black_box` is a real optimization barrier: a call to a never-defined
 `__pliron_bb*` symbol (opaque to every IR pass) that `lower.rs` turns
-into the CLIF `black_box` op (zero instructions). Don't "simplify" it to
-a pass-through. wasm deliberately keeps an alloca + volatile-load round
-trip instead (`intrinsic.rs`, `clif_bb = !is_like_wasm`): that is what
-LLVM emits on wasm too, and a bare identity would let V8 fold through it
-and make our wasm benchmarks look better than they are.
+into the CLIF `black_box` op. Don't "simplify" it to a pass-through,
+and don't let a pass number, hoist or forward it (`cse_key` returns
+`None` for it: two executions are two opaque values). Native emits zero
+instructions for the op. wasm emits what stock rustc emits there: a
+store to a frame slot of its own and a reload (`clif_emit`,
+`P::BlackBox`), because a bare identity would let V8 fold through it
+and make our wasm benchmarks look better than they are. The reload is
+a *volatile* load: the emitter gives it an alignment hint below its
+width (`i32.load align=1`), which engines ignore and `wpeep` reads as
+"never forward to or from this access". Until 2026-11-16 wasm used an
+alloca and a volatile load in the IR instead, and our own CLIF passes
+folded it (`k_fib`, `k_eqbug` and hmget's loop ran with no barrier);
+`PLIRON_WASM_BBOP=0` restores that form for comparison.
+`tests/wasm/smoke` checks the reload is still in the module.
 
 ## Build
 

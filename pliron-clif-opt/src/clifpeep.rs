@@ -10720,6 +10720,11 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
     let r = |v: Value| func.dfg.resolve_aliases(v);
     let t = func.dfg.value_type(func.dfg.first_result(i));
     match func.dfg.insts[i] {
+        // `black_box` is not a value: two executions give two opaque
+        // results. Numbering it merged the barriers of unrolled loop
+        // iterations, and with them everything computed from them
+        // (`a += black_box(7) * black_box(6)` became one multiply).
+        InstructionData::Unary { opcode: Opcode::BlackBox, .. } => None,
         InstructionData::Unary { opcode, arg } => Some(CseKey::U(opcode, t, r(arg))),
         InstructionData::UnaryImm { opcode, imm } => Some(CseKey::UI(opcode, t, imm.bits())),
         InstructionData::UnaryIeee32 { opcode: _, imm } => Some(CseKey::F32(t, imm.bits())),

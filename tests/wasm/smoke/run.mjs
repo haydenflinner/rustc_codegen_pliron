@@ -26,6 +26,21 @@ const rows = [
   ["crosscall(21)", e.crosscall(21), helper(21) * 2],
   ["genes_hash()", e.genes_hash(), gh],
 ];
+// bb_keep: `black_box(x)` must still be a store and a volatile reload. The
+// emitter marks a volatile load with an alignment hint below its width
+// (`i32.load align=1`, bytes 28 00); nothing else in the module has one.
+{
+  const bin = readFileSync(process.argv[2]);
+  let p = 8, vol = 0;
+  const leb = () => { let r = 0, s = 0, b; do { b = bin[p++]; r |= (b & 127) << s; s += 7; } while (b & 128); return r >>> 0; };
+  while (p < bin.length) {
+    const id = bin[p++], size = leb(), end = p + size;
+    if (id === 10) for (let q = p; q + 1 < end; q++) if (bin[q] === 0x28 && bin[q + 1] === 0x00) vol++;
+    p = end;
+  }
+  rows.push(["bb_keep(41)", e.bb_keep(41), 41]);
+  rows.push(["bb_keep: volatile reloads in the module", vol >= 1, true]);
+}
 // raw.rs (compiled unoptimized): narrowed value used on both sides of a store.
 for (const n of [0n, 7n, 31n, 99n, 100n, 657n, 7811n, 9999n]) {
   const div = Number(n) * 5243 >>> 19;

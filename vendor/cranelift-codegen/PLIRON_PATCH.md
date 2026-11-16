@@ -1978,3 +1978,12 @@ the whole ABI set. `PlironRegSet::contains_enc` exposes membership by
 hardware encoding for the embedder's trace (`fastcc-set` lines, read by
 `harness/fastcc_check.py`, which checks the sets against the
 disassembled code).
+
+## `alias_analysis.rs`: volatile accesses (2026-11-16)
+
+A load that may trap (no `notrap`) is our volatile load. The egraph
+pass's alias analysis replaced it with the value of a preceding store to
+the same address and recorded it as a known value for later loads; a
+may-trap store could be removed as dead. `process_inst` now skips both
+for accesses with a trap code. (The `black_box` op no longer depends on
+this on wasm, see `src/wasm.rs` `P::BlackBox`; `read_volatile` does.)

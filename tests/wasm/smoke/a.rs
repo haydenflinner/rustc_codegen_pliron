@@ -154,6 +154,14 @@ pub extern "C" fn fops32(a: f32, b: f32, op: u32) -> f32 {
     }
 }
 
+/// `black_box` on wasm is a stack store and a reload, as in stock
+/// rustc's output. `run.mjs` checks the body still has the load: our own
+/// pipeline used to fold it to `local.get 0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn bb_keep(x: u32) -> u32 {
+    core::hint::black_box(x)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn hypot(a: f64, b: f64) -> f64 {
     unsafe { core::intrinsics::sqrtf64(a * a + b * b) }

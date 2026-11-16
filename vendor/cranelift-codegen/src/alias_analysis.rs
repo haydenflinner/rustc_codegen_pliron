@@ -807,6 +807,8 @@ impl<'a> AliasAnalysis<'a> {
                         // atomic store) is observable by other threads, so it
                         // can never be eliminated.
                         && !has_memory_fence_semantics(func.dfg.insts[last_store].opcode())
+                        // PLIRON: nor can a volatile (may-trap) store.
+                        && func.dfg.insts[last_store].memflags_trap_code(&func.dfg).is_none()
                         // `last_store` must really be a store that
                         // writes exactly the bytes this store
                         // overwrites (same region, address, offset,
@@ -941,7 +943,14 @@ impl<'a> AliasAnalysis<'a> {
                 );
 
                 OptResult::None
-            } else if opcode.can_load() {
+            } else if opcode.can_load()
+                // PLIRON: a load that may trap is a volatile load (the
+                // lowering leaves `notrap` off exactly those when
+                // optimizing): it is neither replaced by a known value nor
+                // recorded as one. wasm's `black_box` is a stack store and
+                // such a reload; forwarding it folded the barrier away.
+                && func.dfg.insts[inst].memflags_trap_code(&func.dfg).is_none()
+            {
                 let last_store = state.get_last_store(func, inst);
                 let load_result = func.dfg.inst_results(inst)[0];
                 let mem_loc = MemoryLoc {

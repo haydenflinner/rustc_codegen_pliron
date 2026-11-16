@@ -334,9 +334,19 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 // 0.1219 → 0.1254 ms: the store→load pair costs more
                 // than the extend it replaces.
                 // r[impl wasm.bb]
-                let clif_bb = !self.tcx.sess.target.is_like_wasm;
+                //
+                // 2026-11-16: that round trip did not survive our own CLIF
+                // pipeline (slotprom, the egraph's alias analysis and
+                // licm's slot promotion each forwarded the "volatile"
+                // reload: `k_fib`, `k_eqbug` and hmget's `repeat` had no
+                // barrier at all). wasm now takes the opaque-call route
+                // too, and `clif_emit` expands the CLIF `black_box` op
+                // into the store and volatile reload at the very end.
+                // `PLIRON_WASM_BBOP=0` restores the alloca form.
+                let wasm = self.tcx.sess.target.is_like_wasm;
+                let clif_bb = !wasm || !pliron_cfg::env_is("PLIRON_WASM_BBOP", "0");
                 if layout.is_zst() {
-                    if clif_bb {
+                    if clif_bb && !wasm {
                         let p = self.const_null(self.type_ptr());
                         self.call_bb("__pliron_bbm", self.type_void(), &[p]);
                     }
