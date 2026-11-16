@@ -12,6 +12,7 @@ what they found). All take a built module (`bench/wasm/run.sh` output, or
 | `hot.sh mod k_x fn iters reps` | per-instruction tick heat on that listing (`--prof`, 50 µs) |
 | `hotw.sh mod k_x fn iters reps` | ticks attributed to wasm instructions via TurboFan source positions |
 | `place.mjs mod k_x [warm,…]` | time a kernel after tiering up other exports first — code placement probe (keep iters small for slow kernels) |
+| `hotloops.sh mod k_x fn iters reps` | ticks per innermost *machine-code* loop of the function (instructions, share, wasm offsets inside) and the hottest single instructions; `mcrange.py code.txt LO HI [ninsts]` prints the listing for an offset range of the kept `code.txt` |
 | `wasmloops.py f.wat` | innermost loops of a `wasm2wat` function: op count, non-local op count, op sequence |
 | `bclocs.py mod.wasm mod.wat fn [callee]` | decode each `panic_bounds_check` call's `&Location` (file:line:col) via GOT globals + data segments |
 
