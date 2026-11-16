@@ -926,3 +926,72 @@ large functions, not this pattern.
   `docs/history/2026-11-16-diffcheck-five.md`). The corpus is being
   re-recorded.
 
+## Evening: `Compiler::compile`, 305 KB against LLVM's 74 KB
+
+Two Opus sub-agents, one on the two final wasm functions, one building
+only `mimas-compile` through the backend (it reproduces the
+whole-program sizes; a rebuild of the one crate is 9 s). Their notes:
+`$TMPDIR/cmpfn/NOTES.md` and `$TMPDIR/mcomp/NOTES.md`.
+
+**It was not inlining.** LLVM inlines more into this function than we
+do (661 call sites against our 261; it takes the 10,893-op
+`Op::from_inst`, which we reject). Stage by stage:
+
+| stage | size |
+|---|---|
+| pliron IR before / after inlining | 6,289 / 20,094 ops (the caller cap) |
+| CLIF as lowered / after the pipeline | 20,294 / 5,199 instructions |
+| waffle body | 4,752 instructions |
+| wasm | **123,047 instructions**, 306,571 bytes |
+
+86% of the wasm (262 KB) was local-to-local copies on branch edges: one
+join received 107 edges with about 232 copies each, and 220 of its 331
+locals got the same value on every edge. Half the function was
+byte-identical edge blocks, one per `br_table` entry.
+
+**Cause.** The CLIF transform `dispatch_dup` (in the `mergechain` step)
+copies a small dispatch block's test into a `jump` predecessor. When
+the dispatch heads a loop, the predecessor is the latch and both arms
+stay in the loop (`loop { match inst { .. } }`), the cycle the latch
+then closes is entered at each arm from the old header: irreducible.
+Its guard (`side_enters`, `PLIRON_REDUCIBLE`, default on) only refused
+edges into loops the predecessor is *not* in; `looprot` had the right
+rule (`both_in`) and this transform and `taildup` did not. Cranelift
+does not care; waffle's `Reducifier` repairs an irreducible CFG by
+converting to max-SSA with the cut blocks' parameters kept even when
+every predecessor passes the same value (`maxssa.rs`), which is where
+4,752 instructions became 123,047.
+
+**Fix** (`f4cf460`, test `dispatch_dup_reducible.rs`): the rule in
+`side_enters`. `compile` 306,571 to 49,470 bytes, below LLVM's;
+`mimas-compile`'s code 1.73 MB to 1.45 MB. It changes 132 of 69,474
+functions of the dsa corpus and 2 of 4,925 of native std; the wasm
+kernel module is byte-identical. `PLIRON_CHECK_REDUCIBLE=1` names the
+step that makes a function irreducible; it named `mergechain` for six
+functions of this one crate.
+
+Still open from the same reports:
+- waffle should not be this fragile: apply the all-predecessors-same
+  alias rule at cut blocks where safe, and share one edge block per
+  distinct (target, arguments) pair of a `br_table`
+  (`stackify.rs::do_branch_select` gives every entry its own). 98
+  functions of the dsa module had edge-copy runs of 32 or more (878 KB),
+  `go_explore` 221 KB of them; how many remain after the fix is not
+  measured yet.
+- `export` (24 KB against 7 KB) and `exported_fn` (1.8 KB against 335
+  bytes) *are* inlining: the wasm loop-site bonus (threshold 3 x 512)
+  pastes SipHash `write_str` (930 ops) and `IndexMap::insert_full` (472)
+  four times each where LLVM calls them; `PLIRON_INLINE_HOT=1` takes
+  `export` to 18 KB. The bonus exists for hashbrown's `hash_one` in
+  probe loops, so its runtime cost has to be measured before it moves.
+- the byte peepholes skip any body with a `v128` opcode (their decoder
+  gives up on the 0xfd prefix), which a 24-byte copy lowered as
+  `i8x16` + `i64` puts into `compile`, `export` and 45 other bodies of
+  that crate; similar bodies gain 5-10% from the peepholes.
+- `PLIRON_JUMPTHREAD=0` crashes the backend on that crate
+  (`loopidiom.rs:3030`, index out of bounds).
+- module-wide the excess over LLVM is elsewhere: 19 MB sit in about
+  20,000 functions LLVM's module does not have (helpers it inlined
+  away), and functions present in both are 1.4x LLVM's size, mostly
+  local traffic; edge copies were 2.6 MB of the 22 MB.
+
