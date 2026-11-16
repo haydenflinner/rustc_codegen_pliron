@@ -60,6 +60,27 @@ Read it before picking a task.
 | `tests/` | `test.sh` programs (one dir per stanza) |
 | `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `backend-path.md` (cargo/sccache and the keyed `-Zcodegen-backend` path), `seh-design.md` (planned real SEH catch), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
 
+**Target facts.** A pass asks `Target` (`pliron-cfg/src/target.rs`):
+architecture family (`is_wasm`/`is_aarch64`/`is_x64`), pointer width
+(`ptr_bits`, `ptr_bytes`; the CLIF type is
+`pliron_clif_opt::target::ptr_type`), the cost-rule word
+(`word_bytes`), `opt_size`, register counts (`int_regs`) and named
+facts (`cheap_br_table`, `mulhi64`, `own_isa`, `has_regalloc`,
+`amode_scale`). It is built once from rustc's target in `src/target.rs`
+and reaches IR passes as `st.target` and CLIF steps as `p.target`
+(clif-check and tests: `Target::wasm32()`, `Target::host()`,
+`target::of_isa(isa)`). The rule: no literal word sizes, no literal
+pointer types, no private `wasm: bool` in a pass. A gate that only
+records where something was measured stays `target.is_wasm()` with a
+comment saying so; a new fact becomes a field or method when a pass
+needs it. Lints: `pliron-clif-opt/tests/no_hardcoded_pointer_type.rs`
+(address types and defaulted pointer types) and
+`pliron-ir-opt/tests/no_target_literals.rs` (no `ptr32()` or
+pointer-width CLIF type in IR passes). Not in `Target`: CPU features
+(`Pipe::simd`, `Pipe::cmp64`) and the lowering's ABI (`Pipe::tcfg`, its
+own `wasm` flag); `types::PTR32` is the layout's mirror of
+`ptr_bits`.
+
 `black_box` is a real optimization barrier: a call to a never-defined
 `__pliron_bb*` symbol (opaque to every IR pass) that `lower.rs` turns
 into the CLIF `black_box` op. Don't "simplify" it to a pass-through,
