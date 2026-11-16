@@ -145,3 +145,51 @@ Running log. Newest decisions that want a second look are under
   machine-code loop and per instruction, with the wasm offsets inside),
   `mcrange.py` (TurboFan listing of an offset range). Worth moving into
   `harness/v8/` if they are wanted.
+
+## `~/code/dsa` (literate-wasm, features eval,squish,cad), as of 05:20
+
+Harness: `harness/dsa/build.sh` (both compilers, wasm-bindgen),
+`harness/dsa/bench.mjs` (23 workloads, interleaved, result cross-check),
+`/tmp/dsa-bench/findings/` (STATUS.md by the build agent, COORD.md by me).
+
+**Code size.** LLVM: 19,544 functions, 14.3 MB of code. pliron
+(snapshot 6): 35,562 functions, 42.0 MB — 2.95x. Matching functions by
+demangled name:
+
+- 10,818 names are in both: 9.26 MB under LLVM, 15.07 MB under pliron
+  (1.63x).
+- 27.0 MB of pliron's code is in functions LLVM's module does not have
+  at all (core 3.8 MB, alloc 3.4, parse 3.3, literate_eval 2.4,
+  hashbrown 2.1, solve 1.9, loro_internal 1.9, ...): instances LLVM
+  inlined everywhere and dropped, or never needed.
+- The common names have a few enormous outliers, all inlining:
+  `solve::exhaustion::Matrix::defaulted` 732 B -> 721,540 B,
+  `Solver::check_call_wheres` 1,974 -> 409,553,
+  `mimas_compile::..::Compiler::compile` 73,738 -> 437,235,
+  `ResolvedDeclKind::clone` 570 -> 56,276.
+
+The wasm inline limit is a flat 512 ops per callee (x3 at loop
+sites) with no caller growth budget (`small` mode turns the budget
+off; `PLIRON_INLINE_CALLER_MAX` is 20,000 ops). That was tuned on the
+bench kernels (hashbrown's `hash_one`). On this program it is the
+first thing to revisit once the module runs: LLVM's threshold is
+about a tenth of that per call site.
+
+**Correctness.** See "Review these" item 6 for the list. The stage
+experiments (05:15): with `PLIRON_OPT_BISECT=0` the interpreter
+workload runs and matches LLVM (2.45x slower); a crate-level bisect
+puts the interpreter miscompile in `literate-eval`'s own code. For
+loro the agent's repro shows two independent bugs, one that needs the
+IR `sroa` pass and one that needs the CLIF pipeline. The linker's
+same-name fold (`PLIRON_LDEDUP=0`, a 23 s relink) and the waffle/wpeep
+stages are not the cause.
+
+**The wasm verification gap** is the structural lesson. Before
+tonight the gate's corpora and the differential checker only
+exercised the native pipeline; wasm-only transforms and everything
+after CLIF were covered by a smoke test and a sysroot build. Tonight's
+additions: `PLIRON_CLIF_WASM=1 clif-check` (wasm replay), the i32
+sandbox in diffcheck, the default end-of-pipeline verifier on wasm,
+and `run_straight` for wpeep. Still uncovered: the pliron-IR passes
+(sroa, inline, IPO summaries) and the waffle stages have no
+differential check at all, and that is where the open dsa bugs are.
