@@ -614,6 +614,7 @@ fn apply(func: &mut Function, plan: &Plan) {
             bmap.insert(b, nb);
         }
         let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+        let mut cloned: Vec<Inst> = Vec::new();
         for &b in &plan.blocks {
             let nb = bmap[&b];
             for (pi, &pv) in func.dfg.block_params(b).to_vec().iter().enumerate() {
@@ -654,6 +655,7 @@ fn apply(func: &mut Function, plan: &Plan) {
                 func.set_srcloc(ni, func.srcloc(ii));
                 func.dfg.make_inst_results(ni, ctv);
                 func.layout.append_inst(ni, nb);
+                cloned.push(ni);
                 for (&o, &nv) in func
                     .dfg
                     .inst_results(ii)
@@ -662,6 +664,25 @@ fn apply(func: &mut Function, plan: &Plan) {
                 {
                     vmap.insert(func.dfg.resolve_aliases(o), nv);
                 }
+            }
+        }
+        // `plan.blocks` is not in dominance order: a latch laid out
+        // ahead of the body it follows was cloned before the body's
+        // values had copies, so its back-edge arguments kept naming
+        // the original loop (rapier2d's `smallest_abs_diff_between_angles
+        // ::<WideF32x4>`: `brif c, h(i, v512, v513)` with `v512`/`v513`
+        // loads of the body). Now that every def of this copy is in
+        // `vmap`, map what the first pass could not.
+        for &ni in &cloned {
+            let mut rmap: FxHashMap<Value, Value> = FxHashMap::default();
+            for v in func.dfg.inst_values(ni) {
+                let r = func.dfg.resolve_aliases(v);
+                if let Some(&nv) = vmap.get(&r) {
+                    rmap.insert(v, nv);
+                }
+            }
+            if !rmap.is_empty() {
+                func.dfg.map_inst_values(ni, |v| rmap.get(&v).copied().unwrap_or(v));
             }
         }
         cmap.push(bmap);
