@@ -20,6 +20,7 @@
 #   DSA_CARGO_ARGS   extra cargo args, e.g. --config profile.release.lto=false
 #   DSA_JOBS         cargo -j                         (5)
 #   DSA_WIPE=1       pliron: remove the wasm32 half of the target dir first (see below)
+#   DSA_BACKEND_RAW=1  pliron: pass $PLIRON_BACKEND unkeyed (single-crate bisects, see below)
 #   DSA_RUSTC_WRAPPER  rustc wrapper for cargo, e.g. sccache (default none: see below)
 #   DSA_RETRIES      reruns after a signal-killed cargo/rustc (30; see earlyoom below)
 #   DSA_PLIRON_FALLBACK  PLIRON_* settings for a second pass (see below; default none)
@@ -131,8 +132,17 @@ case $side in
     # The keyed copy: its path changes when the dylib or a code-affecting
     # PLIRON_* variable does, and only then. The fallback string is part of
     # the key because pass 2 compiles under this same path.
-    backend_keyed=$("$ROOT/harness/backend_path.py" --dylib "$PLIRON_BACKEND" \
-      --salt "${DSA_PLIRON_FALLBACK:+fallback:$DSA_PLIRON_FALLBACK}" --gc "$target")
+    # DSA_BACKEND_RAW=1 passes $PLIRON_BACKEND itself, for bisecting one
+    # crate: cargo then does not notice a changed knob or dylib, so a
+    # knob reaches only the crates whose build dirs the caller removed
+    # (`rm -rf $target/wasm32-unknown-unknown/release/build/<crate>`) and
+    # their dependents; everything else stays as built.
+    if [ "${DSA_BACKEND_RAW:-0}" = 1 ]; then
+      backend_keyed=$PLIRON_BACKEND
+    else
+      backend_keyed=$("$ROOT/harness/backend_path.py" --dylib "$PLIRON_BACKEND" \
+        --salt "${DSA_PLIRON_FALLBACK:+fallback:$DSA_PLIRON_FALLBACK}" --gc "$target")
+    fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-Zcodegen-backend=$backend_keyed -Clinker=$PLIRON_WASM_LD"
     # std at one codegen unit, as bench/wasm/run.sh builds it (the dsa
     # release profile already says codegen-units = 1 for everything).
