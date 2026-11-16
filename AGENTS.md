@@ -308,6 +308,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   after each `wpeep` sub-pass, `PLIRON_WASM_BODYDUMP=<dir>` saves raw
   pre/post bytes), `PLIRON_WASM_DUMP=<substr>` dumps waffle bodies,
   `PLIRON_WASM_STUBLOG=<file>` lists functions that fell back to stubs.
+  `PLIRON_WASM_MODDUMP=<dir>` writes each module before and after the
+  peepholes (`<name>.pre.wasm` / `.post.wasm`): `wasm-objdump -d` both
+  and diff one function (`PLIRON_WASM_SFWD_FWLIM=N` / `_FWSKIP=N` pin a
+  single forwarded load inside it).
 - **wasm static constructors** (`.init_array[.N]` statics: `inventory`,
   `ctor`): `pliron-wasm-ld` calls them from `__wasm_call_ctors` by
   priority. A module that neither calls nor exports that function (a

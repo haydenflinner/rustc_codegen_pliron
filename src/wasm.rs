@@ -4560,6 +4560,17 @@ fn peep_body_opts(
                 rem = rem - covered + pops;
             }
         };
+        // Is local `l` written between the `local.get l` at `from` and the
+        // memory op at `to` that consumes it? The operand was pushed
+        // before the write, so the op uses the OLD value: the local no
+        // longer names the stored value (or the address). Keep-on-stack
+        // builds exactly this (`get B; get V; ..; set V; store`), and a
+        // later load of the slot was forwarded to the overwritten `V`
+        // (`debugsession_compileInfo` in the unoptimized dsa module: the
+        // wrong `self` pointer went into `compile_info`).
+        let set_between = |l: u32, from: usize, to: usize| -> bool {
+            (from + 1..to).any(|j| matches!(ins[j].0, WPeek::Set(x) | WPeek::Tee(x) if x == l))
+        };
         for i in 0..ins.len() {
             match ins[i].0 {
                 WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
@@ -4619,7 +4630,9 @@ fn peep_body_opts(
                                                 kill_all = true;
                                                 break;
                                             };
-                                            match operands(j, 2).and_then(|(a, _)| get_of(a)) {
+                                            match operands(j, 2)
+                                                .and_then(|(a, _)| get_of(a).filter(|&bx| !set_between(bx, a, j)))
+                                            {
                                                 Some(bx) => slots.push((bx, off, swidth(sop))),
                                                 None => kill_all = true,
                                             }
@@ -4789,8 +4802,9 @@ fn peep_body_opts(
                             fmap.clear();
                             continue;
                         };
-                        let Some(bx) = get_of(a_ins) else {
-                            // Computed address — could alias any slot.
+                        let Some(bx) = get_of(a_ins).filter(|&bx| !set_between(bx, a_ins, i)) else {
+                            // Computed address (or a base local rewritten
+                            // since it was pushed) — could alias any slot.
                             n_clear += 1;
                             fmap.clear();
                             continue;
@@ -4839,7 +4853,9 @@ fn peep_body_opts(
                         // `tee T` is only minted when a load actually
                         // forwards through this entry — killing the
                         // store later costs no capture either way.
-                        let fwd = v_ins.and_then(get_of).unwrap_or(u32::MAX);
+                        let fwd = v_ins
+                            .and_then(|v| get_of(v).filter(|&l| !set_between(l, v, i)))
+                            .unwrap_or(u32::MAX);
                         fmap.insert((bx, off), (fwd, sop, i, a_ins, false, flow));
                         if dbg {
                             eprintln!("  store@{i} insert ({bx},{off}) fwd={fwd}");
@@ -4855,7 +4871,7 @@ fn peep_body_opts(
                         let lw = lwidth(lop);
                         // An unresolvable address could read anything.
                         let Some((a_ins, bx)) = operands(i, 1)
-                            .and_then(|(a, _)| get_of(a).map(|bx| (a, bx)))
+                            .and_then(|(a, _)| get_of(a).filter(|&bx| !set_between(bx, a, i)).map(|bx| (a, bx)))
                         else {
                             n_walkfail += 1;
                             if dbg { eprintln!("  walkfail load@{i} ({})", last_fail.borrow()); }
@@ -5382,6 +5398,14 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
     if bytes.len() < 8 || &bytes[..8] != b"\0asm\x01\0\0\0" {
         return;
     }
+    // `PLIRON_WASM_MODDUMP=<dir>`: the whole module before and after the
+    // peepholes, for `harness/wasm/peepdiff.mjs` (runs every body of the
+    // two in V8 on the same inputs and reports the ones that differ).
+    let moddump = crate::env_get("PLIRON_WASM_MODDUMP");
+    if let Some(dir) = &moddump {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(format!("{dir}/{name}.pre.wasm"), &bytes[..]);
+    }
     let mut out = bytes[..8].to_vec();
     // (pops, pushes) per type index and per function index, for
     // stack-effect tracking inside `peep_body`.
@@ -5607,6 +5631,9 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
         leb(&mut out, body_out.len() as u32);
         out.extend_from_slice(&body_out);
         p = e;
+    }
+    if let Some(dir) = &moddump {
+        let _ = std::fs::write(format!("{dir}/{name}.post.wasm"), &out[..]);
     }
     *bytes = out;
 }
@@ -7551,6 +7578,32 @@ mod wpeep_tests {
             }
         }
         eprintln!("no straight-line tail miscompiles ({} starts; unk {n_unk} stack {n_stack} peep-none {n_peep} unk-post {n_unk2} compared {n_cmp})", starts.len());
+    }
+
+    // `[B+0] = V` where `V` is overwritten between the `local.get V` that
+    // pushed the value and the store (keep-on-stack leaves that shape):
+    // the slot holds the OLD `V`. Forwarding once named the local, so
+    // the load below read the new one.
+    #[test]
+    fn sfwd_does_not_forward_a_local_overwritten_before_the_store() {
+        const CODE: &[u8] = &[
+            0x20, 0x00, 0x20, 0x01, // B, V
+            0x41, 0x07, 0x21, 0x01, // V = 7
+            0x36, 0x02, 0x00, // [B+0] = old V
+            0x20, 0x00, 0x28, 0x02, 0x00, 0x21, 0x02, // x = [B+0]
+            0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x04, // [B+4] = x
+            0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x08, // [B+8] = V (keeps the write of V live)
+        ];
+        let init: Vec<u64> = vec![64, 1234, 0, 0];
+        let want = run_straight(CODE, &init).expect("straight-line");
+        let mut b = vec![0x00];
+        b.extend_from_slice(CODE);
+        b.push(0x0b);
+        let out = peep_body_opts(&b, &[], &[], 4, &PeepOpts::from_env()).unwrap();
+        let mut init2 = init.clone();
+        init2.resize(4 + 64, 0);
+        let got = run_straight(code_of(&out), &init2).expect("output stays straight-line");
+        assert_eq!(got.1, want.1, "the peephole changed what the body stores: {:02x?}", code_of(&out));
     }
 
     // Store-to-load forwarding across a loop entry. `[B+0] = V` before the
