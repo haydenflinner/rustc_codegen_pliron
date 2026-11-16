@@ -796,6 +796,86 @@ in the scoreboard and in the linked history files.
 
 ## Work list
 
+### Next: wasm code size and robustness (queued 2026-11-16 evening)
+
+From the `Compiler::compile` investigation
+(`history/2026-11-16-wasm-night.md`, "Evening"). Each item is sized
+for one agent; take them as agents free up. The single-crate loop is
+the fast way to measure all of them: build only `mimas-compile` from
+`~/code/dsa/host` through the backend (it reproduces the whole-program
+function sizes, and rerunning the one crate's rustc command takes 9 s;
+recipe in `$TMPDIR/mcomp/NOTES.md`, script `bin/run.sh TAG K=V..`),
+then a whole dsa build and `bench.mjs` for the result cross-check.
+
+- **N1. The wasm loop-site inline bonus.** In small (wasm) mode a call
+  in a loop gets 3x the 512-op limit (`t=1536`, `PLIRON_INLINE_HOT`).
+  It pastes SipHash `write_str` (930 ops) and `IndexMap::insert_full`
+  (472) four times each into `Compiler::compile::export`, where LLVM
+  calls them: 24 KB against LLVM's 7 KB; `PLIRON_INLINE_HOT=1` gives
+  18 KB, and it carried 58% of the ops inlined into `compile`. The
+  bonus exists for hashbrown's `hash_one` in probe loops (the hmget and
+  hashmap kernels). Find a rule that keeps those and stops the rest
+  (callee in a loop of the *callee's own* hot path, a cap per callee
+  per caller, or the bonus only for callees below some size), measure
+  the kernels (`bench/wasm/run.mjs`, no kernel may lose: user rule) and
+  the dsa module (size and the 14 like-for-like rows).
+- **N2. waffle's handling of an irreducible CFG.** One irreducible edge
+  pair turned 4,752 waffle instructions into 123,047 wasm instructions:
+  the `Reducifier`'s max-SSA conversion keeps every cut block's
+  parameter even when all predecessors pass the same value
+  (`vendor/waffle/src/passes/maxssa.rs`, the `is_cut_block` exception),
+  and `stackify.rs::do_branch_select` gives every `br_table` entry its
+  own edge block (520 of 915 were byte-identical repeats; a 35-entry
+  table had 35 distinct depths where LLVM's 93-entry table has 4).
+  Two fixes, each a `PLIRON:` patch with a `PLIRON_PATCH.md` entry:
+  share one edge block per distinct (target, arguments) and branch
+  straight to the target when there are no arguments; apply the
+  all-same alias rule at cut blocks where it is sound (work out when
+  that is: the cut exists to give the loop one entry). Measure on a
+  function that still reaches waffle irreducible (force one with
+  `PLIRON_REDUCIBLE=0` on `mimas-compile`) and module-wide: 98 dsa
+  functions had edge-copy runs of 32+ copies (878 KB) before
+  `f4cf460`; count again after it. `peepdiff` and the gate's wasm leg
+  check the output.
+- **N3. Byte peepholes on bodies with SIMD.** `wpeep`'s decoder gives up
+  on any `0xfd`-prefixed opcode, so a body containing one `v128.load`
+  gets no peepholes at all. The emitter lowers a 24-byte constant copy
+  as `i8x16` + `i64` (independently of `PLIRON_WASM_SMALLCOPY`), which
+  put `compile`, `export` and 45 other bodies of `mimas-compile` out of
+  reach; similar bodies shrink 5-10% under the peepholes. Teach the
+  decoder the `0xfd` immediates (memarg for loads/stores, lane index,
+  16-byte `v128.const`, `i8x16.shuffle`) and treat SIMD values as
+  opaque to the forwarding rules. Count the bodies skipped before and
+  after (`PLIRON_WASM_SIZELOG=1`), `peepdiff` the result (it skips
+  v128 signatures as entry points: check it still runs the bodies),
+  `PLIRON_WASM_AUDIT=panic` in the gate.
+- **N4. `PLIRON_JUMPTHREAD=0` crashes the backend** on `mimas-compile`:
+  index out of bounds at `pliron-clif-opt/src/loopidiom.rs:3030`. An
+  off switch must not crash (AGENTS.md rule 2). Reproduce with the
+  single-crate loop, record the function as a corpus file
+  (`PLIRON_CORPUS`), reduce, fix with a test, and run the corpora with
+  every pass's `=0` switch in turn to find others like it (a
+  `clif-check report` per switch is seconds on std).
+- **N5. The 19 MB in functions LLVM's module does not have.** About
+  20,000 of our 35,550 dsa functions have no counterpart in LLVM's
+  module, 19.1 MB of the 22 MB excess; functions present in both are
+  1.4x LLVM's size (median 1.35x), mostly local traffic. Classify the
+  extra 20,000 by why they exist: single-caller instances LLVM inlined
+  and dropped (`PLIRON_INLINE_ONCE` covers some: 1,225 `from_iter`
+  alone), generic instances LLVM shared or never instantiated, `xcgu`
+  copies the linker's same-name fold (`PLIRON_LDEDUP`) does not merge,
+  dead functions the linker keeps, drop glue. Rank the classes by
+  bytes with a name-section script (`$TMPDIR/cmpfn/` has the
+  per-function tables), then attack the largest.
+
+In flight at the same time (agents): the IR-pass differential checker
+(`clif-check xcorpus`, gate for further `memcpyopt` work: `noalias`
+destinations, then sibling-arm writers whose arms together cover every
+path into the copy), the `Target` facts struct, and why hmget loses 6
+points when its loop shares a wasm function with the set-up code.
+
+### Standing list
+
 Ranked by expected card gain per effort. Each item links its evidence.
 
 1. **Runtime parity on held-out programs** (`bench/heldout/run.py`,
