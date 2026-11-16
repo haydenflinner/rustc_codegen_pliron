@@ -121,12 +121,14 @@ the copy to the reader.
 
 ## Result
 
-- `cargo test -p pliron-ir-opt --lib memcpyopt`: 20 pass;
+- `cargo test -p pliron-ir-opt --lib memcpyopt`: 21 pass;
   `post_copy_reader_in_loop_with_dst_write_refused` fails under
-  `PLIRON_MEMCPYOPT_RDWRAP=0`.
+  `PLIRON_MEMCPYOPT_RDWRAP=0`; the full-writer twin
+  (`full_writer_post_copy_reader_in_loop_refused`) passes either way.
 - `tests/mcrdwrap` (stanza `mcrdwrap`), native, defaults: correct
   output with the scan, exit 133 (abort in the allocator) with
-  `PLIRON_MEMCPYOPT_RDWRAP=0`.
+  `PLIRON_MEMCPYOPT_RDWRAP=0`; the full-writer twin
+  (`full_writer_post_copy_reader_in_loop_refused`) passes either way.
 - mimas-parse alone recompiled with the fixed backend under `RECX=1
   ONCE=3`, relinked into the otherwise-`ONCE=2` tree: the four probe
   workloads equal; the same dylib with `PLIRON_MEMCPYOPT_RDWRAP=0`

@@ -2182,6 +2182,24 @@ mod tests {
         assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
     }
 
+    /// The same loop with a writer that covers all of `tmp`: the route
+    /// scan of the full-writer path meets the loop's `dst` write on the
+    /// way back from the reader and refuses, with or without the wrap
+    /// scan of the partial path.
+    #[test]
+    fn full_writer_post_copy_reader_in_loop_refused() {
+        let pre = format!("            llvm.store *tmp <- v;\n{MC}            llvm.br ^loop()\n          ^loop():\n");
+        let head = HEAD.replace("            llvm.br ^loop()\n          ^loop():\n", &pre);
+        assert_ne!(head, HEAD);
+        let input = format!(
+            "{head}            r = llvm.load tmp : builtin.integer i64;\n            llvm.store *dst <- v;\n{TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
     const ESC_HEAD: &str = r#"
         builtin.module @m {
         ^block_0_0():
