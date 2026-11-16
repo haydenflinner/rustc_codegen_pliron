@@ -1040,6 +1040,18 @@ pub fn run_lt(
     }
     let t4 = timer.then(std::time::Instant::now);
 
+    // The address type of the slot addresses the sync stores and reloads
+    // below create: whatever the function's own `stack_addr`s use (i32 on
+    // wasm32). They were i64 outright, and the wasm emitter then wrapped
+    // an i32 frame pointer as if it were i64: an invalid module, the
+    // first time a synced call met a promoted slot on wasm (the dsa
+    // module under `PLIRON_SROA_FRAGWORD=4`, `Page::tape_pack`).
+    let pty = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .find(|&i| func.dfg.insts[i].opcode() == Opcode::StackAddr)
+        .map_or(types::I64, |i| func.dfg.value_type(func.dfg.first_result(i)));
     // Rewrite: alias loads, drop stores, append reaching values on edges.
     let mut n = 0;
     let mut writebacks: Vec<(Inst, usize)> = Vec::new();
@@ -1074,7 +1086,7 @@ pub fn run_lt(
                 let f = fields[kept[ki]];
                 let sa = *sas
                     .entry(f.slot)
-                    .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
+                    .or_insert_with(|| pos.ins().stack_addr(pty, f.slot, 0));
                 let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
                 dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
                 reloads.insert(v, ki);
@@ -1109,7 +1121,7 @@ pub fn run_lt(
                         let f = fields[kept[ki]];
                         let sa = *sas
                             .entry(f.slot)
-                            .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
+                            .or_insert_with(|| pos.ins().stack_addr(pty, f.slot, 0));
                         if let Some(v) = cur[ki]
                             && !undefs.contains(&v)
                         {
@@ -1133,7 +1145,7 @@ pub fn run_lt(
                         let f = fields[kept[ki]];
                         let sa = *sas
                             .entry(f.slot)
-                            .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
+                            .or_insert_with(|| pos.ins().stack_addr(pty, f.slot, 0));
                         let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
                         dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
                         reloads.insert(v, ki);
@@ -1569,6 +1581,54 @@ mod tests {
         // Only the sync pair (writeback store + reload) remains.
         assert_eq!(memops(&func), 2);
         verify(&func);
+    }
+
+    /// The sync store and the reload take their slot address in the
+    /// function's own pointer type. They were `stack_addr.i64` on every
+    /// target; on wasm32 the emitter then wrapped the i32 frame pointer
+    /// as an i64 and the module did not validate.
+    #[test]
+    fn sync_addresses_use_the_functions_pointer_type() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let mut csig = Signature::new(CallConv::Fast);
+        csig.params.push(AbiParam::new(types::I32));
+        let esig = func.import_signature(csig);
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I32, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let call = cur.ins().call(ext, &[a]);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 0), u64::MAX);
+        let cfg = ControlFlowGraph::with_function(&func);
+        let n = run(&mut func, &cfg, &nocap, false, &Default::default());
+        assert!(n > 0, "expected promotion");
+        assert_eq!(memops(&func), 2, "the sync store and the reload");
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                if func.dfg.insts[i].opcode() == Opcode::StackAddr {
+                    assert_eq!(func.dfg.value_type(func.dfg.first_result(i)), types::I32, "{}", func.display());
+                }
+            }
+        }
     }
 
     /// A field stored on a predecessor path and read only through a
