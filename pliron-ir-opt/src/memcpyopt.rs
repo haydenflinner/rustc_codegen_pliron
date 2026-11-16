@@ -2319,6 +2319,22 @@ mod tests {
         assert_eq!(n, 0, "dst's lifetime.start still sits after the forwarded write");
     }
 
+    /// The same with the writer in an earlier block and the marker at
+    /// the head of the copy's block: the shape of the two dsa corpus
+    /// functions recorded before the marker scan existed
+    /// (`DragSession::drop`: 12 bytes stored to `dst` in one block,
+    /// `lifetime.start(dst)` heading the block that reads them back;
+    /// bincode's `next_element_seed`: three field stores and a 240-byte
+    /// copy ahead of the tuple's marker). slotmerge gave the bytes to
+    /// another slot there and the CLIF checker reported it.
+    #[test]
+    fn dst_marker_heading_the_copy_block_dropped() {
+        let n = dst_markers_after_forward(&format!(
+            "            llvm.store *tmp <- v;\n            llvm.br ^tail()\n          ^tail():\n{LT}{MC}"
+        ));
+        assert_eq!(n, 0, "dst's lifetime.start still sits between the forwarded write and its read");
+    }
+
     /// `PLIRON_MEMCPYOPT_MOVEMARK`: in one block with nothing touching
     /// `dst` on the way, the marker moves ahead of the writer instead: it
     /// is kept, and it now precedes the forwarded store.
