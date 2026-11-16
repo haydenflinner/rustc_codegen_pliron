@@ -98,6 +98,21 @@ fn any_between(
     prod: Ptr<Operation>,
     set: &FxHashSet<Ptr<Operation>>,
 ) -> bool {
+    let pathwin = pliron_cfg::env_is("PLIRON_MEMCPYOPT_PATHWIN", "1");
+    any_between_with(ctx, st, dom, f, m, prod, set, pathwin)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn any_between_with(
+    ctx: &Context,
+    st: &State,
+    dom: &mut Option<Dom>,
+    f: Ptr<Operation>,
+    m: Ptr<Operation>,
+    prod: Ptr<Operation>,
+    set: &FxHashSet<Ptr<Operation>>,
+    pathwin: bool,
+) -> bool {
     let (mb, pb) = (
         m.deref(ctx).get_parent_block().unwrap(),
         prod.deref(ctx).get_parent_block().unwrap(),
@@ -155,7 +170,40 @@ fn any_between(
         }
     }
     if let Some(d) = (!other.is_empty()).then(|| dom_of(ctx, st, dom, f)).flatten() {
-        other.iter().any(|&b| !(d.dominates(mb, b) || d.dominates(b, pb)))
+        let cand: Vec<Ptr<BasicBlock>> = other
+            .iter()
+            .copied()
+            .filter(|&b| !(d.dominates(mb, b) || d.dominates(b, pb)))
+            .collect();
+        if cand.is_empty() || !pathwin {
+            return !cand.is_empty();
+        }
+        // `PLIRON_MEMCPYOPT_PATHWIN`: the dominator test calls every
+        // sibling block "between" — in a function with several `return`
+        // sites each `store tmp; memcpy(sret, tmp)` pair was refused for
+        // the other sites' copies into the same `sret` (the dsa
+        // interpreter's `step_one` copied its 160-byte result on every
+        // step). A block is between only if it lies on a path from
+        // `prod` to `m`: with both in one block there is none, and
+        // otherwise it reaches `m`'s block backwards without crossing
+        // `prod`'s (which dominates `m`'s, so such a block is also
+        // reachable from it). Routes that leave through `m` and come
+        // back are the callers' wrap checks, not this window.
+        if pb == mb {
+            return false;
+        }
+        let mut seen: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
+        let mut stack: Vec<Ptr<BasicBlock>> = mb.preds(ctx).into_iter().collect();
+        while let Some(b) = stack.pop() {
+            if b == pb || !seen.insert(b) {
+                continue;
+            }
+            if seen.len() > 256 {
+                return true;
+            }
+            stack.extend(b.preds(ctx));
+        }
+        cand.iter().any(|b| seen.contains(b))
     } else {
         !other.is_empty()
     }
@@ -2051,6 +2099,59 @@ mod tests {
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
         assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// `entry -> a -> a2 -> join`, `entry -> b -> join`; `tmp` is written
+    /// in `a`, `dst` in `b`, the copy sits in `a` or in `a2`.
+    fn window_fixture(copy_in_a2: bool) -> (Context, State, Ptr<Operation>, Ptr<Operation>, Ptr<Operation>, Ptr<Operation>) {
+        let (in_a, in_a2) = if copy_in_a2 { ("", MC) } else { (MC, "") };
+        let input = format!(
+            "{ESC_HEAD}            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;\n            llvm.cond_br if flag ^a() else ^b()\n          ^a():\n            llvm.store *tmp <- v;\n{in_a}            llvm.br ^a2()\n          ^a2():\n{in_a2}            llvm.br ^join()\n          ^b():\n            llvm.store *dst <- v;\n            llvm.br ^join()\n          ^join():\n            llvm.return\n        }}\n    }}\n"
+        );
+        let mut ctx = Context::new();
+        let mut st = State::default();
+        let (f, m) = fixture(&input, &mut st, &mut ctx);
+        let stores: Vec<Ptr<Operation>> = blocks(&ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(&ctx, b))
+            .filter(|&o| Operation::is_op::<StoreOp>(o, &ctx))
+            .collect();
+        // Layout order: the `tmp` store in `a`, then the `dst` store in `b`.
+        (ctx, st, f, m, stores[0], stores[1])
+    }
+
+    /// A `dst` write in a sibling arm is not between a writer and a copy
+    /// that share a block, nor between two blocks of the other arm: no
+    /// path from the writer to the copy passes it. The dominator test
+    /// alone says it is (every `return` site of the dsa interpreter's
+    /// `step_one` kept its 160-byte copy into `sret` for that).
+    #[test]
+    fn sibling_arm_touch_is_not_in_the_window() {
+        for copy_in_a2 in [false, true] {
+            let (ctx, st, f, m, w, sib) = window_fixture(copy_in_a2);
+            let set: FxHashSet<Ptr<Operation>> = [sib].into_iter().collect();
+            assert!(any_between_with(&ctx, &st, &mut None, f, m, w, &set, false));
+            assert!(!any_between_with(&ctx, &st, &mut None, f, m, w, &set, true), "copy_in_a2={copy_in_a2}");
+        }
+    }
+
+    /// A touch on the path from the writer's block to the copy's block
+    /// stays in the window.
+    #[test]
+    fn touch_on_the_path_stays_in_the_window() {
+        let input = format!(
+            "{ESC_HEAD}            llvm.store *tmp <- v;\n            llvm.br ^mid()\n          ^mid():\n            llvm.store *dst <- v;\n            llvm.br ^tail()\n          ^tail():\n{MC}            llvm.return\n        }}\n    }}\n"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        let stores: Vec<Ptr<Operation>> = blocks(ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .filter(|&o| Operation::is_op::<StoreOp>(o, ctx))
+            .collect();
+        let set: FxHashSet<Ptr<Operation>> = [stores[1]].into_iter().collect();
+        assert!(any_between_with(ctx, st, &mut None, f, m, stores[0], &set, true));
     }
 
     const LT_HEAD: &str = r#"
