@@ -79,6 +79,7 @@ pub mod lsr;
 pub mod hreassoc;
 pub mod revnorm;
 pub mod slotmerge;
+pub mod slotprov;
 pub mod slotprom;
 pub mod slp;
 pub mod splink;

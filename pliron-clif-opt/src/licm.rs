@@ -161,6 +161,35 @@ struct Shel<'a> {
     live: FxHashMap<Value, u64>,
 }
 
+thread_local! {
+    /// `PLIRON_LICM_SLOTPROV=1`: the running function's contained slots
+    /// (`slotprov`), set for the span of `run`. The snapshot stays valid
+    /// while licm mutates: it moves instructions and adds loads, and
+    /// neither makes a new address value.
+    static SLOTS: std::cell::RefCell<Option<crate::slotprov::SlotProv>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clears `SLOTS` when `run` returns or unwinds.
+struct SlotsGuard;
+
+impl Drop for SlotsGuard {
+    fn drop(&mut self) {
+        SLOTS.with(|s| s.borrow_mut().take());
+    }
+}
+
+/// `a` and `b` root in different objects by `slotprov`'s account.
+fn slots_apart(func: &Function, a: Root, b: Root) -> bool {
+    SLOTS.with(|s| s.borrow().as_ref().is_some_and(|sp| sp.apart(func, a, b)))
+}
+
+/// `r` points into a contained slot: no call and no access through an
+/// address outside the slot's class reaches it.
+fn slot_contained(func: &Function, r: Root) -> bool {
+    SLOTS.with(|s| s.borrow().as_ref().is_some_and(|sp| sp.slot_of(func, r).is_some()))
+}
+
 /// Whether a write-ish instruction `w` can touch `loc`.
 #[allow(clippy::too_many_arguments)]
 fn clobbers(
@@ -227,7 +256,9 @@ fn clobbers(
         {
             return false;
         }
-        return !loadfwd::write_free(func, w, nw, false) && !iso.contains(&cloc.0);
+        return !loadfwd::write_free(func, w, nw, false)
+            && !iso.contains(&cloc.0)
+            && !slot_contained(func, cloc.0);
     }
     match func.dfg.insts[w] {
         // Every `store`'s address resolves through `root`, flag or not: an
@@ -270,13 +301,13 @@ fn clobbers(
                     return !not_derived(func, x, noalias, scoped_na, rv);
                 }
             }
-            !overlap_keeps((r2, o2, ty), cloc, iso)
+            !overlap_keeps(func, (r2, o2, ty), cloc, iso)
         }
         _ if op.can_store()
             || op.other_side_effects()
             || matches!(op, Opcode::AtomicLoad | Opcode::Fence) =>
         {
-            !iso.contains(&cloc.0)
+            !iso.contains(&cloc.0) && !slot_contained(func, cloc.0)
         }
         _ => false,
     }
@@ -285,6 +316,7 @@ fn clobbers(
 /// Whether a store of `w = (r2,o2,ty2)` provably leaves `loc` intact; mirrors
 /// `loadfwd::kill`'s keep-rule.
 fn overlap_keeps(
+    func: &Function,
     w: (Root, i64, cranelift_codegen::ir::Type),
     loc: Loc,
     iso: &FxHashSet<Root>,
@@ -298,7 +330,7 @@ fn overlap_keeps(
             o >= o2 + i128::from(ty2.bytes()) || o2 >= o + i128::from(ty.bytes())
         }
         (Root::S(_), Root::S(_)) => true,
-        _ => iso.contains(&r) || iso.contains(&r2),
+        _ => iso.contains(&r) || iso.contains(&r2) || slots_apart(func, r, r2),
     }
 }
 
@@ -1109,7 +1141,7 @@ fn run_loop(
                         }
                         let (r, o) = loadfwd::norm_root(func, ps, na, arg);
                         let lloc = (r, o.wrapping_add(i64::from(i32::from(offset))), ty);
-                        if !overlap_keeps(sloc, lloc, iso) {
+                        if !overlap_keeps(func, sloc, lloc, iso) {
                             ok = false;
                             break;
                         }
@@ -1907,6 +1939,19 @@ pub fn run(
     let ps = &loadfwd::param_src(func);
     let (iso, escapes, ncc) =
         loadfwd::isolated_escapes(func, noalias, ps, cfrozen, nocap, scoped_na);
+    // `PLIRON_LICM_SLOTPROV=1` (opt-in): slots that escaped only by a
+    // variable index (`buf[i]`) still name an object of their own.
+    let _slots = SlotsGuard;
+    if escapes.keys().any(|r| matches!(r, Root::S(_))) && crate::env_is("PLIRON_LICM_SLOTPROV", "1") {
+        let uses = an.uses(func);
+        let sp = crate::slotprov::compute(func, &uses);
+        if let Some(sp) = &sp
+            && pliron_cfg::tracing_on()
+        {
+            tracing::debug!(target: "pliron::licm", "licm slotprov {}: contained={:?}", func.name, sp.contained());
+        }
+        SLOTS.with(|s| *s.borrow_mut() = sp);
+    }
     // `PLIRON_LICM_NASHEL`: function-local `captures(none)` for the
     // entry `noalias` params — which provenance escapes where, so each
     // loop can tell which roots it shelters (`Shel` in `run_loop`).
