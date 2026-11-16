@@ -37,6 +37,7 @@ mod context;
 mod intrinsic;
 mod lto;
 mod simd;
+mod target;
 mod type_of;
 mod types;
 mod wasm;

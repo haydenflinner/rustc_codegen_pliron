@@ -92,6 +92,7 @@ impl<'tcx> CodegenCx<'tcx> {
             pctx: RefCell::new(ctx),
             module,
             st: RefCell::new(State {
+                target: crate::target::of(tcx.sess),
                 eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx),
                 dbg: crate::debuginfo::cu_info(tcx, name),
                 ..State::default()

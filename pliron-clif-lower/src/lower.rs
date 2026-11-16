@@ -719,6 +719,8 @@ struct JobShared {
     /// `-g`: functions carry source locations (see `dbg_const_srclocs`).
     dbg: bool,
     isa: Arc<dyn TargetIsa>,
+    /// `State::target`, handed on to every job's `Pipe`.
+    target: crate::target::Target,
     tcfg: TargetFrontendConfig,
     simd: bool,
     x64: bool,
@@ -1030,6 +1032,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 nocap: &j.nocap,
                 edge_kills: Vec::new(),
                 dbg_slots: &j.dbg_slots,
+                target: sh.target,
                 tcfg: sh.tcfg,
                 simd: sh.simd,
                 x64: sh.x64,
@@ -1959,6 +1962,14 @@ pub fn lower_module<'a>(
     };
     let mut eh = crate::eh::UnwindContext::new(m, true, unwind, personality);
     let cfg = m.target_config();
+    // The passes' `Target` came from rustc (or is the embedder's
+    // `State::default()`, the host); the ISA came from the same session.
+    // A mismatch means a `State` built for another target.
+    assert_eq!(
+        st.target,
+        crate::target::of_isa(&**isa),
+        "State::target does not describe the ISA this module is lowered for"
+    );
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
     let mut asm_stubs = rustc_hash::FxHashSet::default();
@@ -2102,6 +2113,7 @@ pub fn lower_module<'a>(
     let shared = Arc::new(JobShared {
         dbg: st.dbg.is_some(),
         isa: isa.clone(),
+        target: st.target,
         tcfg: cfg,
         simd,
         x64,
@@ -3164,6 +3176,11 @@ pub fn lower_clif_wasm(
         pointer_width: target_lexicon::PointerWidth::U32,
         page_size_align_log2: isa.page_size_align_log2(),
     };
+    assert!(
+        st.target.is_wasm() && u32::from(tcfg.pointer_bits()) == st.target.ptr_bits,
+        "lower_clif_wasm: State::target is {:?}",
+        st.target
+    );
     let cc = CallConv::SystemV;
     let internal = internal_fns(ctx, st);
     let cc_of = |n: &str| {
@@ -3254,6 +3271,7 @@ pub fn lower_clif_wasm(
     let shared = Arc::new(JobShared {
         dbg: st.dbg.is_some(),
         isa: isa.clone(),
+        target: st.target,
         tcfg: cfg,
         simd,
         x64: false,

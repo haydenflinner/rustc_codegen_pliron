@@ -6,6 +6,7 @@
 //! unless `=0`, debug flags are presence-checked, opt-ins compare `=1`.
 
 pub mod jearena;
+pub mod target;
 
 use rustc_hash::FxHashMap;
 use std::sync::LazyLock;

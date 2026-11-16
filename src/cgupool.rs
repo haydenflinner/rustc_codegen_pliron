@@ -67,6 +67,9 @@ pub(crate) struct CrateCfg {
     pub optimize: bool,
     /// This crate participates in the xfacts merge (`PLIRON_XFACTS`).
     pub xfacts: bool,
+    /// The passes' view of rustc's target (`src/target.rs`); every CGU's
+    /// `State::target` is the same value.
+    pub target: crate::target::Target,
     pub wasm: bool,
     /// `panic_strategy() == Unwind` — lowering needs the EH paths.
     pub unwind: bool,
@@ -131,6 +134,7 @@ impl CrateCfg {
         CrateCfg {
             optimize,
             xfacts: pass_enabled("PLIRON_XFACTS"),
+            target: crate::target::of(sess),
             wasm,
             unwind,
             coff_eh: binary_format == rustc_target::spec::BinaryFormat::Coff && unwind,

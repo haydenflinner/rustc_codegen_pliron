@@ -469,6 +469,7 @@ fn with_pipe_lts<R>(
         edge_kills: Vec::new(),
         dbg_slots: &Default::default(),
         fn_names: &fn_names,
+        target: if wasm_mode { pliron_clif_opt::target::Target::wasm32() } else { pliron_clif_opt::target::of_isa(isa) },
         tcfg: isa.frontend_config(),
         // The wasm backend runs the pipeline with `simd` (no simd128 by
         // default), `x64` and `cmp64` off.

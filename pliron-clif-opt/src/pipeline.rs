@@ -257,6 +257,12 @@ pub struct Pipe<'a> {
     pub edge_kills: Vec<(StackSlot, Inst, u32)>,
     /// `-g`: variable slots' pieces (`dbglabel`), for slotprom.
     pub dbg_slots: &'a crate::dbglabel::DbgSlots,
+    /// What a step may ask about the compilation target
+    /// (`pliron_cfg::target`): architecture family, pointer width. The
+    /// one place to ask; no step hardcodes a word size or a pointer type.
+    pub target: crate::target::Target,
+    /// Cranelift's ABI view (call convention, page size) for the steps
+    /// that build libcall signatures. Its pointer width is `target`'s.
     pub tcfg: TargetFrontendConfig,
     pub simd: bool,
     pub x64: bool,
@@ -5807,6 +5813,7 @@ mod tests {
         nocap: &nocap,
         edge_kills: Vec::new(),
         dbg_slots: &Default::default(),
+        target: crate::target::of_isa(&*isa),
         tcfg: isa.frontend_config(),
         simd: true,
         x64: false,

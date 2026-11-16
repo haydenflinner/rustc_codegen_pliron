@@ -135,6 +135,7 @@ fn main() {
                 site_facts: Default::default(),
         nocap: &e7,
         dbg_slots: &Default::default(),
+        target: pliron_clif_opt::target::of_isa(&*isa),
         tcfg: isa.frontend_config(),
         simd: true,
         x64,

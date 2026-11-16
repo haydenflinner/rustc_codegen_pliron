@@ -349,6 +349,11 @@ pub struct CallInfo {
 // r[impl front.ir.sidetables]
 // r[impl iropt.state]
 pub struct State {
+    /// What a pass may ask about the compilation target
+    /// (`pliron_cfg::target`): set from rustc's target when the CGU's
+    /// `State` is created (`src/target.rs`), `Target::host()` in unit
+    /// tests. The lowering hands it on to the CLIF pipeline.
+    pub target: pliron_cfg::target::Target,
     pub consts: ColMap<Value, ConstVal>,
     pub funcs: SymMap<FuncInfo>,
     pub globals: SymMap<GlobalInfo>,
