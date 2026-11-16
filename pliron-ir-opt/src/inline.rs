@@ -57,6 +57,48 @@ pub const WASM_LIMIT: usize = 512;
 /// is where most of the `bench/wasm` hashmap gap lives. Kept off for
 /// -Os/-Oz, where growth is the point of `small`.
 pub const WASM_HOT: usize = 3;
+
+/// The inliner's size-versus-speed settings for one compilation.
+#[derive(Clone, Copy, Debug)]
+pub struct Mode {
+    /// Size-sensitive output: the flat no-bonus rules (see [`run`]).
+    pub small: bool,
+    /// The flat limit in small mode.
+    pub small_limit: usize,
+    /// Small mode: loop callsites get `hot`x the limit; 0 disables.
+    pub hot: usize,
+}
+
+impl Mode {
+    /// The mode for `t`. Small on wasm32 and at `-Copt-level=s|z`. The
+    /// wasm limit and loop bonus are measurement results on wasm
+    /// ([`WASM_LIMIT`], [`WASM_HOT`]); -Os/-Oz keep the old 40-op limit
+    /// and no bonus.
+    // r[impl iropt.inline.small]
+    pub fn of(t: &pliron_cfg::target::Target) -> Mode {
+        let wasm = t.is_wasm();
+        Mode {
+            small: wasm || t.opt_size,
+            small_limit: if wasm { WASM_LIMIT } else { SMALL_LIMIT },
+            // wasm only: callsites in loops get WASM_HOT x the flat
+            // limit (std `hash_one` into hashbrown's probe loop).
+            hot: if wasm && !t.opt_size {
+                crate::env_get("PLIRON_INLINE_HOT")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(WASM_HOT)
+            } else {
+                0
+            },
+        }
+    }
+
+    /// `-O0`'s `#[inline(always)]`-only round.
+    pub const ALWAYS_ONLY: Mode = Mode {
+        small: true,
+        small_limit: SMALL_LIMIT,
+        hot: 0,
+    };
+}
 /// Above this size, cold callsites under `PLIRON_INLINE_WASM_COLDKEEP`
 /// (default off, `=1` on) only give allowlisted callees (hash/num/str/ast-parse)
 /// the full `WASM_LIMIT`; everything else uses this flat cold cap — same
@@ -1169,14 +1211,17 @@ fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
 pub fn run(
     ctx: &mut Context,
     st: &mut State,
-    small: bool,
-    small_limit: usize,
-    hot: usize,
+    mode: Mode,
     only: Option<&FxHashSet<Ptr<Operation>>>,
     always_only: bool,
     callers: Option<&FxHashSet<String>>,
     adj: &mut Option<Adj>,
 ) -> Delta {
+    let Mode {
+        small,
+        small_limit,
+        hot,
+    } = mode;
     let limit = crate::env_get("PLIRON_INLINE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(if small { small_limit } else { DEFAULT_LIMIT });

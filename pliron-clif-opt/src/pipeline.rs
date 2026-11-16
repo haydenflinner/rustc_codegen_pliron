@@ -1563,10 +1563,15 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
     }
     lt_probe(p, "start");
     let mut an = Analysis::default();
-    an.regs = Some(match p.isa.triple().architecture {
+    // wasm32 has no register file of ours, and licm's pressure model
+    // has always used the *host* ISA's counts there (`Pipe::isa` is the
+    // compiling machine's): a wasm module built on x86-64 can differ
+    // from one built on aarch64. Kept as it was, so that no output
+    // changes; `Target::int_regs` is `None` for wasm32 to say so.
+    an.regs = Some(p.target.int_regs().unwrap_or_else(|| match p.isa.triple().architecture {
         target_lexicon::Architecture::Aarch64(_) => (26, 10),
         _ => (14, 5),
-    });
+    }));
     // `-g` value labels name this CGU's variable pieces, and cache keys
     // don't see them: a hit would replay another function's labels.
     let labelled = p.clctx.func.dfg.values_labels.is_some();

@@ -84,32 +84,16 @@ pub(crate) struct CrateCfg {
     pub sse42: bool,
     pub fmt: pgo::ObjFmt,
     pub aarch64: bool,
-    /// `small`/`small_limit`/`ihot`: the inline cost knobs, precomputed.
-    pub small: bool,
-    pub small_limit: usize,
-    pub ihot: usize,
     /// Indirect-call promotion (`PLIRON_DEVIRT` in a profile build).
     pub icp: Option<crate::devirt::IcpCfg>,
 }
 
 impl CrateCfg {
-    // r[impl iropt.inline.small]
     pub fn new(tcx: TyCtxt<'_>) -> Self {
         let sess = tcx.sess;
         let wasm = sess.target.arch == rustc_target::spec::Arch::Wasm32;
         let opt = sess.opts.optimize;
         let optimize = opt != OptLevel::No;
-        let size_opt = matches!(opt, OptLevel::Size | OptLevel::SizeMin);
-        let small = wasm || size_opt;
-        // wasm only: callsites in loops get WASM_HOT x the flat limit —
-        // std `hash_one` into hashbrown's probe loop. -Os/-Oz stay flat.
-        let ihot = if wasm && !size_opt {
-            env_get("PLIRON_INLINE_HOT")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(inline::WASM_HOT)
-        } else {
-            0
-        };
         let unwind = sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind;
         let binary_format = sess.target.options.binary_format;
         let fmt = match binary_format {
@@ -156,13 +140,6 @@ impl CrateCfg {
                 .contains(&rustc_span::Symbol::intern("sse4.2")),
             fmt,
             aarch64: sess.target.arch == rustc_target::spec::Arch::AArch64,
-            small,
-            small_limit: if wasm {
-                inline::WASM_LIMIT
-            } else {
-                inline::SMALL_LIMIT
-            },
-            ihot,
             icp: crate::devirt::IcpCfg::new(tcx),
         }
     }
@@ -1010,9 +987,7 @@ pub(crate) fn finish_pre(
         inline::run(
             ctx,
             st,
-            true,
-            inline::SMALL_LIMIT,
-            0,
+            inline::Mode::ALWAYS_ONLY,
             None,
             true,
             None,
@@ -1131,9 +1106,7 @@ pub(crate) fn iropt_head(
             pt!(prof, cgu, "earlydead", inline::mark_dead_unopt(ctx, st));
         }
     }
-    let small = cfg.small;
-    let small_limit = cfg.small_limit;
-    let hot = cfg.ihot;
+    let mode = inline::Mode::of(&st.target);
     // `PLIRON_INLINE_CLEAN=1`: DCE + block merge on every body before the
     // inliner clones them (and again per caller inside `inline::run`).
     // Before the frozen-region tags, which pin blocks.
@@ -1178,9 +1151,7 @@ pub(crate) fn iropt_head(
         inline::run(
             ctx,
             st,
-            small,
-            small_limit,
-            hot,
+            mode,
             None,
             false,
             None,
@@ -1209,9 +1180,7 @@ pub(crate) fn iropt_head(
             inline::run(
                 ctx,
                 st,
-                small,
-                small_limit,
-                hot,
+                mode,
                 None,
                 false,
                 Some(&touched),
@@ -1376,9 +1345,7 @@ pub(crate) fn iropt_head(
                     inline::run(
                         ctx,
                         st,
-                        small,
-                        small_limit,
-                        hot,
+                        mode,
                         Some(&sites),
                         false,
                         Some(&owners),

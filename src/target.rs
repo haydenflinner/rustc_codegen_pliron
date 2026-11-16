@@ -23,6 +23,10 @@ pub(crate) fn of(sess: &Session) -> Target {
     };
     let t = Target {
         ptr_bits: sess.target.pointer_width as u32,
+        opt_size: matches!(
+            sess.opts.optimize,
+            rustc_session::config::OptLevel::Size | rustc_session::config::OptLevel::SizeMin
+        ),
         ..base
     };
     // `types::size_align` lays out pointers from a process-wide mirror

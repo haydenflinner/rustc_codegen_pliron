@@ -41,6 +41,9 @@ pub struct Target {
     /// The CLIF pointer type is `pliron_clif_opt::target::ptr_type`;
     /// `pliron_ir_opt::types::size_align` lays out `ptr` with it.
     pub ptr_bits: u32,
+    /// `-Copt-level=s|z`: code size comes before speed. With wasm32 it
+    /// puts the inliner in its size-first mode (`inline::Mode::of`).
+    pub opt_size: bool,
 }
 
 impl Target {
@@ -48,6 +51,7 @@ impl Target {
         Target {
             arch: Arch::Aarch64,
             ptr_bits: 64,
+            opt_size: false,
         }
     }
 
@@ -55,6 +59,7 @@ impl Target {
         Target {
             arch: Arch::X86_64,
             ptr_bits: 64,
+            opt_size: false,
         }
     }
 
@@ -62,6 +67,7 @@ impl Target {
         Target {
             arch: Arch::Wasm32,
             ptr_bits: 32,
+            opt_size: false,
         }
     }
 
@@ -70,6 +76,7 @@ impl Target {
         Target {
             arch: Arch::Other,
             ptr_bits: 64,
+            opt_size: false,
         }
     }
 
@@ -136,6 +143,23 @@ impl Target {
     /// induction variables rather than `base + iv*s`.
     pub const fn amode_scale(&self) -> bool {
         matches!(self.arch, Arch::Aarch64 | Arch::X86_64)
+    }
+
+    /// (allocatable, callee-saved) integer registers, for register
+    /// pressure estimates (licm's `PLIRON_LICM_INNERPRESS=2`). `None` on
+    /// wasm32, which has no register file of ours.
+    pub const fn int_regs(&self) -> Option<(u32, u32)> {
+        match self.arch {
+            Arch::Aarch64 => Some((26, 10)),
+            Arch::X86_64 | Arch::Other => Some((14, 5)),
+            Arch::Wasm32 => None,
+        }
+    }
+
+    /// Same architecture and pointer width: what the lowering checks
+    /// against the ISA it is handed (`opt_size` is not an ISA fact).
+    pub const fn same_machine(&self, o: &Target) -> bool {
+        self.arch as u8 == o.arch as u8 && self.ptr_bits == o.ptr_bits
     }
 
     /// Size of a pointer in bytes.

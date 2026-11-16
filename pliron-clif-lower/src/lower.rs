@@ -1960,10 +1960,10 @@ pub fn lower_module<'a>(
     // The passes' `Target` came from rustc (or is the embedder's
     // `State::default()`, the host); the ISA came from the same session.
     // A mismatch means a `State` built for another target.
-    assert_eq!(
-        st.target,
-        crate::target::of_isa(&**isa),
-        "State::target does not describe the ISA this module is lowered for"
+    assert!(
+        st.target.same_machine(&crate::target::of_isa(&**isa)),
+        "State::target {:?} does not describe the ISA this module is lowered for",
+        st.target
     );
     let mut fbc = FunctionBuilderContext::new();
     let mut clctx = m.make_context();
