@@ -10969,8 +10969,19 @@ mod clif_emit {
                 ir::InstructionData::StackAddr {
                     stack_slot, offset, ..
                 } => {
+                    // A pass that builds a slot address as i64 (the native
+                    // pointer type) would otherwise get an i32 frame
+                    // pointer wrapped as an i64 at its uses: a module that
+                    // does not validate (slotprom did, 2026-11-16).
+                    let r = f.dfg.inst_results(i)[0];
+                    assert_eq!(
+                        f.dfg.value_type(r),
+                        clt::I32,
+                        "wasm32: stack_addr of type {} (some pass used the 64-bit pointer type)",
+                        f.dfg.value_type(r)
+                    );
                     let v = self.slot_addr(f, stack_slot, i64::from(offset));
-                    self.set(f.dfg.inst_results(i)[0], v);
+                    self.set(r, v);
                 }
                 ir::InstructionData::DynamicStackAddr { .. } => panic!("dynamic stack slot"),
                 ir::InstructionData::FuncAddr { func_ref, .. } => {
