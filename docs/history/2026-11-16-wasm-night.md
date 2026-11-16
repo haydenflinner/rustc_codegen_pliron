@@ -81,6 +81,39 @@ Running log. Newest decisions that want a second look are under
    are replayed on the native pipeline, so wasm-only paths are only
    covered by `wasm_smoke` and the wasm sysroot leg.
 
+9. **Three transforms and one rule change went default-on with no fuzz
+   sweep** (`f13cb0d`: `PLIRON_MEMCPYOPT_PATHWIN`, `PLIRON_CONSTCOPY2`,
+   `PLIRON_WASM_SMALLCOPY`; `532caf8`: the SROA fragment word is the
+   pointer width, wasm32 only). The first two apply to native too.
+   Checked with the gate, `harness/crates.py --tier 1` (20 crates,
+   knobs forced on), the wasm kernels, the 19 cross-checked dsa
+   workloads and the 09:00 parity card (native 0.908 -> 0.873). The
+   fuzz suite cannot run here (no rustlantis generator). Each has an
+   off switch.
+10. **`memcpyopt` now drops a destination's lifetime markers** when a
+    forwarded write crosses one (`7ee65e8`): 19% of forwards on
+    rapier2d. Sound, but it gives up slot sharing for those
+    destinations; moving the start marker up would keep it. The stack
+    axis of the card did not move.
+11. **Static constructors run once, not on every export call**
+    (`30ff21b`, written by a sub-agent, reviewed by me). That is not
+    what rust-lld does, on purpose. `__wasm_call_dtors` is never
+    called and the once-guard is not thread-safe.
+12. **The wasm emitter now panics on a non-i32 `stack_addr`**
+    (`96e7801`). A compile-time ICE instead of an invalid module; if
+    another pass builds one, a build that used to "work" (and fail at
+    instantiation) now stops in rustc.
+13. **I deleted build trees and backend snapshots** under
+    `/tmp/dsa-bench` and `target/dsa-snap*` (all made tonight) to free
+    14 GB; the repro scripts there name paths that are gone.
+14. **`harness/dsa/workloads/` is uncommitted** because this fork is
+    public and those files are copies of dsa page sources. The harness
+    needs them to run from a fresh clone. Your call.
+15. Not turned on, each measured, each a lead: `PLIRON_INLINE_ONCE=1`
+    on wasm (pages +2-3%, three kernels worse),
+    `PLIRON_INLINE_CALLER_MAX=4000` (size -10%, speed worse). See
+    "dsa, performance".
+
 ## What landed
 
 | commit | what |
