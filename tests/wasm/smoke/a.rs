@@ -86,6 +86,74 @@ pub extern "C" fn ops128(alo: u64, ahi: u64, blo: u64, bhi: u64, op: u32, half: 
     if half == 0 { r as u64 } else { (r >> 64) as u64 }
 }
 
+/// One f64 operation per `op`; `run.mjs` checks each result against
+/// JavaScript's IEEE arithmetic on ordinary and special values. The
+/// conversions are Rust's saturating `as` casts, returned as floats.
+#[unsafe(no_mangle)]
+pub extern "C" fn fops64(a: f64, b: f64, op: u32) -> f64 {
+    use core::intrinsics as i;
+    match op {
+        0 => a + b,
+        1 => a - b,
+        2 => a * b,
+        3 => a / b,
+        4 => unsafe { i::sqrtf64(a) },
+        5 => a.abs(),
+        6 => -a,
+        7 => unsafe { i::floorf64(a) },
+        8 => unsafe { i::ceilf64(a) },
+        9 => unsafe { i::truncf64(a) },
+        10 => a.copysign(b),
+        11 => a.min(b),
+        12 => a.max(b),
+        13 => ((a < b) as u32
+            | ((a <= b) as u32) << 1
+            | ((a > b) as u32) << 2
+            | ((a >= b) as u32) << 3
+            | ((a == b) as u32) << 4
+            | ((a != b) as u32) << 5) as f64,
+        14 => (a as i32) as f64,
+        15 => (a as u32) as f64,
+        16 => (a as i64) as f64,
+        17 => (a as u64) as f64,
+        18 => (a as f32) as f64,
+        _ => 0.0,
+    }
+}
+
+/// The same table in f32.
+#[unsafe(no_mangle)]
+pub extern "C" fn fops32(a: f32, b: f32, op: u32) -> f32 {
+    use core::intrinsics as i;
+    match op {
+        0 => a + b,
+        1 => a - b,
+        2 => a * b,
+        3 => a / b,
+        4 => unsafe { i::sqrtf32(a) },
+        5 => a.abs(),
+        6 => -a,
+        7 => unsafe { i::floorf32(a) },
+        8 => unsafe { i::ceilf32(a) },
+        9 => unsafe { i::truncf32(a) },
+        10 => a.copysign(b),
+        11 => a.min(b),
+        12 => a.max(b),
+        13 => ((a < b) as u32
+            | ((a <= b) as u32) << 1
+            | ((a > b) as u32) << 2
+            | ((a >= b) as u32) << 3
+            | ((a == b) as u32) << 4
+            | ((a != b) as u32) << 5) as f32,
+        14 => (a as i32) as f32,
+        15 => (a as u32) as f32,
+        16 => (a as i64) as f32,
+        17 => (a as u64) as f32,
+        18 => ((a as f64) * 0.5) as f32,
+        _ => 0.0,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn hypot(a: f64, b: f64) -> f64 {
     unsafe { core::intrinsics::sqrtf64(a * a + b * b) }

@@ -28,7 +28,7 @@ rustc $BE --edition 2024 -O --target wasm32-unknown-unknown --crate-type lib \
   --emit obj -o "$out/smoke_b.o" tests/wasm/smoke/b.rs
 "$LD" "$out/smoke_a.o" "$out/smoke_b.o" \
   --export fib --export sum_sq --export hypot --export statics \
-  --export indirect --export crosscall --export genes_hash --export cmp128 --export ops128 \
+  --export indirect --export crosscall --export genes_hash --export cmp128 --export ops128 --export fops64 --export fops32 \
   --export ctors \
   --no-entry -o "$out/smoke.wasm"
 node tests/wasm/smoke/run.mjs "$out/smoke.wasm"
