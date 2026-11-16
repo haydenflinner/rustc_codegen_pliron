@@ -11122,8 +11122,10 @@ mod clif_emit {
                 ir::InstructionData::DynamicStackAddr { .. } => panic!("dynamic stack slot"),
                 ir::InstructionData::FuncAddr { func_ref, .. } => {
                     let name = self.fr_name(f, func_ref);
+                    let r = f.dfg.inst_results(i)[0];
+                    assert_eq!(f.dfg.value_type(r), clt::I32, "wasm32: func_addr of type {}", f.dfg.value_type(r));
                     let v = self.sym_got(true, &name, 0);
-                    self.set(f.dfg.inst_results(i)[0], v);
+                    self.set(r, v);
                 }
                 ir::InstructionData::UnaryGlobalValue {
                     opcode,
@@ -11131,8 +11133,10 @@ mod clif_emit {
                 } => match opcode {
                     P::SymbolValue => {
                         let (func, name, off) = self.gv_sym(f, global_value);
+                        let r = f.dfg.inst_results(i)[0];
+                        assert_eq!(f.dfg.value_type(r), clt::I32, "wasm32: symbol_value of type {}", f.dfg.value_type(r));
                         let v = self.sym_got(func, &name, off);
-                        self.set(f.dfg.inst_results(i)[0], v);
+                        self.set(r, v);
                     }
                     P::TlsValue => panic!("tls on wasm"),
                     _ => panic!("gv op {opcode}"),
