@@ -25,3 +25,8 @@ Changes, all in `src/step.rs`:
 
 Used by `pliron-clif-opt`'s differential checker (`src/diffcheck.rs`).
 Drop this copy once those opcodes are upstream or no longer vendored.
+- `uload32`/`sload32` extend to `i64` (marked `PLIRON:`). Upstream
+  extends to the controlling type, which for these two opcodes is the
+  *address* type: right with 64-bit addresses, an `I32` result with
+  32-bit ones (wasm32), which made the differential checker report
+  false miscompiles after the `uload32` step.

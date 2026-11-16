@@ -1623,6 +1623,8 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
         let before_text = before.display().to_string();
         run_step(p, s, &mut an, &mut step_t[i]);
         if p.clctx.func.display().to_string() != before_text {
+            // wasm32: i32 pointers in the sandbox.
+            crate::diffcheck::set_ptr32(p.wasm);
             found |= crate::diffcheck::check_and_report(
                 p.fname,
                 s.name,
@@ -1702,6 +1704,7 @@ fn run_whole_checked(p: &mut Pipe) {
     let derived0 = p.derived.clone();
     run_steps(p, false);
     let facts = facts_of(p);
+    crate::diffcheck::set_ptr32(p.wasm);
     let m = match crate::diffcheck::check(
         &initial,
         &p.clctx.func,

@@ -410,6 +410,8 @@ fn with_pipe<R>(
     }
     let mut fact_bits = cranelift_codegen::entity::SecondaryMap::new();
     let uen_syms = Default::default();
+    let wasm_mode = pliron_cfg::env_is("PLIRON_CLIF_WASM", "1");
+    pliron_clif_opt::diffcheck::set_ptr32(wasm_mode);
     let mut p = Pipe {
         const_tables: &pipeline::EMPTY_TABLES,
         region_nn: &region_nn,
@@ -448,8 +450,14 @@ fn with_pipe<R>(
         simd: true,
         x64,
         cmp64: true,
-        amode_scale: pipeline::amode_scale(isa),
-        wasm: false,
+        // `PLIRON_CLIF_WASM=1`: replay as the wasm backend runs the
+        // pipeline (`Pipe::wasm`, stepped-pointer indvars). The
+        // interpreter diff stays inconclusive for i32-pointer code, but
+        // the wasm-only transforms run and `PLIRON_VERIFY=full` checks
+        // every step: three of the four compiler panics the dsa build
+        // hit on 2026-11-16 were in paths a native replay never takes.
+        amode_scale: !wasm_mode && pipeline::amode_scale(isa),
+        wasm: wasm_mode,
         has_eh: false,
         flags: &flags,
         // `PLIRON_CLIF=<substr of the file's self name>` dumps steps.

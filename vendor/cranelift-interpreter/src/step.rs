@@ -486,8 +486,13 @@ where
                 Opcode::Sload8 => (types::I8, Some(ValueConversionKind::SignExtend(ctrl_ty))),
                 Opcode::Uload16 => (types::I16, Some(ValueConversionKind::ZeroExtend(ctrl_ty))),
                 Opcode::Sload16 => (types::I16, Some(ValueConversionKind::SignExtend(ctrl_ty))),
-                Opcode::Uload32 => (types::I32, Some(ValueConversionKind::ZeroExtend(ctrl_ty))),
-                Opcode::Sload32 => (types::I32, Some(ValueConversionKind::SignExtend(ctrl_ty))),
+                // PLIRON: `uload32`/`sload32` always produce an i64; their
+                // controlling type is the *address* type. Upstream extends
+                // to `ctrl_ty`, which is only right when addresses are
+                // 64-bit: with i32 addresses (wasm32) the result stayed an
+                // I32 and every use downstream saw the wrong type.
+                Opcode::Uload32 => (types::I32, Some(ValueConversionKind::ZeroExtend(types::I64))),
+                Opcode::Sload32 => (types::I32, Some(ValueConversionKind::SignExtend(types::I64))),
                 Opcode::Uload8x8
                 | Opcode::Sload8x8
                 | Opcode::Uload16x4

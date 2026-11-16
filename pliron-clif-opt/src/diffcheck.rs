@@ -210,7 +210,7 @@ pub fn check(
     let mut all_ptrs = ptrs.clone();
     if let Some(entry) = before.layout.entry_block() {
         for &p in before.dfg.block_params(entry) {
-            if before.dfg.value_type(p) == types::I64 {
+            if before.dfg.value_type(p) == ptr_ty() {
                 all_ptrs.entry(p).or_default();
             }
         }
@@ -445,12 +445,59 @@ impl Rng {
 
 // Sandbox address map. All addresses sit in the interpreter's `Stack`
 // region (top two bits clear), which it passes through as plain offsets.
-// They must exceed `u32::MAX`: the interpreter decodes a smaller computed
-// address as a 32-bit one, whose top bits name a different region.
-const PARAM_BASE: u64 = 0x10_0000_0000;
-const HEAP_BASE: u64 = 0x20_0000_0000;
-const SYM_BASE: u64 = 0x30_0000_0000;
-const STACK_BASE: u64 = 0x40_0000_0000;
+// With 64-bit pointers they must exceed `u32::MAX`: the interpreter
+// decodes a smaller computed address as a 32-bit one, whose top bits
+// name a different region.
+//
+// With 32-bit pointers (wasm32: `set_ptr32`) the same four areas sit
+// below `1 << 30`, where a 32-bit address still decodes as a `Stack`
+// offset, and pointer values are `I32`. Before this, every wasm32
+// function that touched memory came back inconclusive
+// (`heap_oob at stack_addr.i32`).
+static PTR32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Check functions whose pointers are `i32` (the wasm backend, and
+/// `clif-check` under `PLIRON_CLIF_WASM=1`). Process-wide: one process
+/// compiles for one target.
+pub fn set_ptr32(on: bool) {
+    PTR32.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn p32() -> bool {
+    PTR32.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn param_base() -> u64 {
+    if p32() { 0x0100_0000 } else { 0x10_0000_0000 }
+}
+fn heap_base() -> u64 {
+    if p32() { 0x0200_0000 } else { 0x20_0000_0000 }
+}
+fn sym_base() -> u64 {
+    if p32() { 0x0300_0000 } else { 0x30_0000_0000 }
+}
+fn stack_base() -> u64 {
+    if p32() { 0x0400_0000 } else { 0x40_0000_0000 }
+}
+/// Bytes above `stack_base` that are frames.
+fn stack_span() -> u64 {
+    if p32() { 0x3000_0000 } else { 0x1000_0000 }
+}
+/// Regions an area holds before it runs into the next one (32-bit).
+const AREA_REGIONS: u64 = 256;
+fn ptr_ty() -> Type {
+    if p32() { types::I32 } else { types::I64 }
+}
+/// The sandbox address `a` as a pointer value.
+fn ptr(a: u64) -> DataValue {
+    if p32() { DataValue::I32(a as u32 as i32) } else { DataValue::I64(a as i64) }
+}
+/// A value that can be a pointer, as an address.
+fn as_ptr(v: &DataValue) -> Option<u64> {
+    match v {
+        DataValue::I64(p) if !p32() => Some(*p as u64),
+        DataValue::I32(p) if p32() => Some(*p as u32 as u64),
+        _ => None,
+    }
+}
 const REGION_STRIDE: u64 = 0x1_0000;
 /// Pointers point this far into their region, so small negative offsets work.
 const PTR_SLACK: u64 = 64;
@@ -497,14 +544,14 @@ impl World {
         let mut regions = BTreeMap::new();
         let mut targets: Vec<u64> = Vec::new();
         for h in 0..HEAPS {
-            targets.push(HEAP_BASE + h * REGION_STRIDE + PTR_SLACK);
+            targets.push(heap_base() + h * REGION_STRIDE + PTR_SLACK);
         }
         let entry = f.layout.entry_block().expect("function has an entry block");
         let params = f.dfg.block_params(entry);
         for (i, p) in params.iter().enumerate() {
             if let Some(pi) = ptrs.get(p) {
                 let size = pi.size.max(256).min(REGION_STRIDE - 2 * PTR_SLACK);
-                let base = PARAM_BASE + i as u64 * REGION_STRIDE;
+                let base = param_base() + i as u64 * REGION_STRIDE;
                 regions.insert(
                     base,
                     Region {
@@ -522,7 +569,7 @@ impl World {
         }
         for h in 0..HEAPS {
             regions.insert(
-                HEAP_BASE + h * REGION_STRIDE,
+                heap_base() + h * REGION_STRIDE,
                 Region {
                     data: vec![0; (HEAP_SIZE + 2 * PTR_SLACK) as usize],
                     init: Vec::new(),
@@ -539,7 +586,7 @@ impl World {
             let ty = f.dfg.value_type(*p);
             let v = if let Some(pi) = ptrs.get(p) {
                 let _ = pi;
-                DataValue::I64((PARAM_BASE + i as u64 * REGION_STRIDE + PTR_SLACK) as i64)
+                ptr(param_base() + i as u64 * REGION_STRIDE + PTR_SLACK)
             } else {
                 let nonnull = facts.nonnull.is_some_and(|s| s.contains(p));
                 random_value(ty, &mut rng, nonnull)
@@ -575,7 +622,8 @@ impl World {
 }
 
 fn fill(data: &mut [u8], targets: &[u64], rng: &mut Rng) {
-    for w in data.chunks_mut(8) {
+    // A pointer-sized cell at a time, so a loaded pointer is whole.
+    for w in data.chunks_mut(if p32() { 4 } else { 8 }) {
         let v: u64 = match rng.below(10) {
             0..=4 => targets[rng.below(targets.len() as u64) as usize] + rng.below(8) * 8,
             // Zero gets its own share: null pointers and empty lengths.
@@ -649,7 +697,7 @@ fn pointer_params(f: &Function, facts: &Facts) -> FxHashMap<Value, PtrInfo> {
     };
     let params = f.dfg.block_params(entry).to_vec();
     for &p in &params {
-        if f.dfg.value_type(p) != types::I64 {
+        if f.dfg.value_type(p) != ptr_ty() {
             continue;
         }
         let mut pi = PtrInfo::default();
@@ -808,10 +856,18 @@ impl<'a> Sandbox<'a> {
         if let Some(&a) = self.syms.get(name) {
             return a;
         }
-        let base = SYM_BASE + self.syms.len() as u64 * REGION_STRIDE;
+        if p32() && self.syms.len() as u64 >= AREA_REGIONS {
+            // The 32-bit symbol area is full: an address with nothing
+            // mapped, so a read through it ends the trial inconclusive
+            // instead of landing in the stack area.
+            let a = 0x3f00_0000 + self.syms.len() as u64 * 16;
+            self.syms.insert(name.to_string(), a);
+            return a;
+        }
+        let base = sym_base() + self.syms.len() as u64 * REGION_STRIDE;
         let mut rng = Rng(mix(self.seed, hash_str(name)));
         let targets: Vec<u64> = (0..HEAPS)
-            .map(|h| HEAP_BASE + h * REGION_STRIDE + PTR_SLACK)
+            .map(|h| heap_base() + h * REGION_STRIDE + PTR_SLACK)
             .collect();
         let mut data = vec![0u8; 1024];
         fill(&mut data, &targets, &mut rng);
@@ -830,7 +886,7 @@ impl<'a> Sandbox<'a> {
     fn writes(&self) -> Vec<(u64, u8)> {
         let mut out = Vec::new();
         for (&base, r) in &self.regions {
-            if base >= STACK_BASE {
+            if base >= stack_base() {
                 continue;
             }
             for (i, (a, b)) in r.data.iter().zip(&r.init).enumerate() {
@@ -861,7 +917,7 @@ impl<'a> State<'a> for Sandbox<'a> {
         |_, _| Err(CraneliftTrap::UnreachableCodeReached)
     }
     fn push_frame(&mut self, function: &'a Function) {
-        let base = STACK_BASE + self.frames.len() as u64 * self.frame_size;
+        let base = stack_base() + self.frames.len() as u64 * self.frame_size;
         self.regions.insert(
             base,
             Region {
@@ -993,16 +1049,14 @@ fn resolve_gv(s: &Sandbox, gv: GlobalValue) -> Result<DataValue, MemoryError> {
                 .syms
                 .get(&name)
                 .ok_or(MemoryError::InvalidAddress(DataValue::I64(0)))?;
-            Ok(DataValue::I64(
-                base.wrapping_add(offset.bits() as u64) as i64
-            ))
+            Ok(ptr(base.wrapping_add(offset.bits() as u64)))
         }
         GlobalValueData::IAddImm { base, offset, .. } => {
             let b = resolve_gv(s, *base)?;
-            let DataValue::I64(b) = b else {
+            let Some(a) = as_ptr(&b) else {
                 return Err(MemoryError::InvalidAddress(b));
             };
-            Ok(DataValue::I64(b.wrapping_add(offset.bits())))
+            Ok(ptr(a.wrapping_add(offset.bits() as u64)))
         }
         GlobalValueData::Load {
             base,
@@ -1010,10 +1064,10 @@ fn resolve_gv(s: &Sandbox, gv: GlobalValue) -> Result<DataValue, MemoryError> {
             global_type,
             ..
         } => {
-            let DataValue::I64(b) = resolve_gv(s, *base)? else {
+            let Some(b) = as_ptr(&resolve_gv(s, *base)?) else {
                 return Err(MemoryError::InvalidAddress(DataValue::I64(0)));
             };
-            let a = (b as u64).wrapping_add(i64::from(*offset) as u64);
+            let a = b.wrapping_add(i64::from(*offset) as u64);
             let src = s
                 .bytes(a, global_type.bytes() as u64)
                 .ok_or(MemoryError::InvalidAddress(DataValue::I64(a as i64)))?;
@@ -1244,14 +1298,14 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
                 // call returning 32 into `p - 32` breaks the premise, not
                 // the pass (hashbrown's `next().map(|b| b.as_ptr())`
                 // under `DebugMap::entries`).
-                if matches!(vals.first(), Some(DataValue::I64(0)))
+                if vals.first().and_then(as_ptr) == Some(0)
                     && let Some(&r) = f.dfg.inst_results(i).first()
                     && let Some(&base) = s.derived.get(&r)
                     && let Some(base) = f.dfg.try_resolve_aliases(base)
                     && f.dfg.value_is_valid(base)
                     && matches!(
                         s.current_frame_mut().entries_mut().get(base.index()),
-                        Some(Some(DataValue::I64(b))) if *b != 0
+                        Some(Some(b)) if as_ptr(b).is_some_and(|b| b != 0)
                     )
                 {
                     return Err(Stop::Trap(format!(
@@ -1344,11 +1398,9 @@ fn stub(
     let orig_args = args.clone();
     let args: Vec<DataValue> = args
         .into_iter()
-        .map(|a| match a {
-            DataValue::I64(p) if (STACK_BASE..STACK_BASE + 0x1000_0000).contains(&(p as u64)) => {
-                DataValue::I64(STACK_BASE as i64)
-            }
-            a => a,
+        .map(|a| match as_ptr(&a) {
+            Some(p) if (stack_base()..stack_base() + stack_span()).contains(&p) => ptr(stack_base()),
+            _ => a,
         })
         .collect();
     let mut h = mix(s.seed, hash_str(&name));
@@ -1361,20 +1413,19 @@ fn stub(
     }
     if !s.nowrite.contains(&name) {
         for (k, a) in orig_args.iter().enumerate() {
-            if let DataValue::I64(p) = a {
-                let p = *p as u64;
+            if let Some(p) = as_ptr(a) {
                 // The callee reaches at most this many bytes through the
                 // operand (`&mut RawVecInner` inside a `String` slot: 16
                 // of its 24; the `len` beyond is the caller's to keep in
                 // a register).
                 let ext = s.extent.get(&(name.clone(), k as u32)).copied().unwrap_or(u64::MAX);
-                if (STACK_BASE..STACK_BASE + 0x1000_0000).contains(&p) {
+                if (stack_base()..stack_base() + stack_span()).contains(&p) {
                     // Frame pointer: bound the fill to the containing
                     // slot's extent so it can't spill into a neighbor.
                     // Slots sit one per 4KiB page inside each frame's
                     // fixed-size page (outer frames count too — a callee
                     // can out-param into a caller's slot).
-                    let d = p - STACK_BASE;
+                    let d = p - stack_base();
                     let fidx = d / s.frame_size;
                     if fidx as usize >= s.frames.len() {
                         continue;
@@ -1401,7 +1452,7 @@ fn stub(
                 }
                 let writable = s
                     .find(p, 8)
-                    .is_some_and(|(base, r)| r.stub_writable && base < STACK_BASE);
+                    .is_some_and(|(base, r)| r.stub_writable && base < stack_base());
                 if writable && ext >= 8 {
                     let v = mix(h, k as u64).to_le_bytes();
                     s.bytes_mut(p, 8).unwrap().copy_from_slice(&v);
@@ -1413,11 +1464,8 @@ fn stub(
     let mut rets = Vec::new();
     for (k, r) in f.dfg.signatures[sig].returns.iter().enumerate() {
         let mut rng = Rng(mix(h, 1000 + k as u64));
-        let v = if r.value_type == types::I64 && rng.below(2) == 0 {
-            DataValue::I64(
-                (HEAP_BASE + rng.below(HEAPS) * REGION_STRIDE + PTR_SLACK + rng.below(8) * 8)
-                    as i64,
-            )
+        let v = if r.value_type == ptr_ty() && rng.below(2) == 0 {
+            ptr(heap_base() + rng.below(HEAPS) * REGION_STRIDE + PTR_SLACK + rng.below(8) * 8)
         } else {
             random_value(r.value_type, &mut rng, true)
         };
@@ -1448,14 +1496,14 @@ fn libcall(
                 let tmp = s.bytes(src, n).ok_or_else(oob)?.to_vec();
                 s.bytes_mut(d, n).ok_or_else(oob)?.copy_from_slice(&tmp);
             }
-            Ok(rets.iter().map(|_| DataValue::I64(d as i64)).collect())
+            Ok(rets.iter().map(|_| ptr(d)).collect())
         }
         LibCall::Memset => {
             let (d, c, n) = (int(&a[0]), int(&a[1]), int(&a[2]));
             if n > 0 {
                 s.bytes_mut(d, n).ok_or_else(oob)?.fill(c as u8);
             }
-            Ok(rets.iter().map(|_| DataValue::I64(d as i64)).collect())
+            Ok(rets.iter().map(|_| ptr(d)).collect())
         }
         LibCall::Memcmp => {
             let (x, y, n) = (int(&a[0]), int(&a[1]), int(&a[2]));

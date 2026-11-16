@@ -276,8 +276,13 @@ time, memory, code size, stack frames) in ~20 min and writes
 - **Is that step wrong?** `PLIRON_DIFFCHECK=1` (`=step` for every step)
   interprets CLIF before/after on random inputs and saves
   `before.clif`/`after.clif` on a mismatch; `clif-check step <step>
-  before.clif` replays in a second. Limits: the interpreter runs on the
-  host ISA, so wasm32 (i32-pointer) functions come back inconclusive.
+  before.clif` replays in a second. wasm32 functions are checked too
+  (i32 pointers in the sandbox since 2026-11-16): in the backend it
+  follows the target, and `PLIRON_CLIF_WASM=1 clif-check ...` replays a
+  corpus recorded from a wasm build (`PLIRON_CORPUS=<dir>` on
+  `harness/v8/variant.sh` or `harness/dsa/build.sh`) the way the wasm
+  backend runs the pipeline. The stages after CLIF (waffle, `wpeep`)
+  are not covered by it.
 - **wasm-only stages** (after CLIF): the waffle inliner
   (`PLIRON_WASM_INLINE=0`), byte peepholes (`PLIRON_WASM_PEEP=0`,
   `PLIRON_WASM_PEEP_LIMIT=N` peepholes only the first N bodies — bisect
