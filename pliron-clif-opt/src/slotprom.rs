@@ -252,8 +252,9 @@ pub fn run(
     nocap: &FxHashMap<(Inst, u32), u64>,
     keep_keyed: bool,
     dbg_slots: &crate::dbglabel::DbgSlots,
+    target: &crate::target::Target,
 ) -> usize {
-    run_lt(func, cfg, nocap, keep_keyed, dbg_slots, &[], None)
+    run_lt(func, cfg, nocap, keep_keyed, dbg_slots, &[], None, target)
 }
 
 /// A lifetime marker slotprom may cut a promoted field's live range at:
@@ -311,6 +312,7 @@ pub fn run_lt(
     dbg_slots: &crate::dbglabel::DbgSlots,
     kills: &[Kill],
     weight: Option<&FxHashMap<Block, u32>>,
+    target: &crate::target::Target,
 ) -> usize {
     let Some(entry) = func.layout.entry_block() else {
         return 0;
@@ -1041,17 +1043,13 @@ pub fn run_lt(
     let t4 = timer.then(std::time::Instant::now);
 
     // The address type of the slot addresses the sync stores and reloads
-    // below create: whatever the function's own `stack_addr`s use (i32 on
-    // wasm32). They were i64 outright, and the wasm emitter then wrapped
-    // an i32 frame pointer as if it were i64: an invalid module, the
-    // first time a synced call met a promoted slot on wasm (the dsa
-    // module under `PLIRON_SROA_FRAGWORD=4`, `Page::tape_pack`).
-    let pty = func
-        .layout
-        .blocks()
-        .flat_map(|b| func.layout.block_insts(b))
-        .find(|&i| func.dfg.insts[i].opcode() == Opcode::StackAddr)
-        .map_or(types::I64, |i| func.dfg.value_type(func.dfg.first_result(i)));
+    // below create: the target's pointer type (i32 on wasm32). They were
+    // i64 outright, and the wasm emitter then wrapped an i32 frame
+    // pointer as if it were i64: an invalid module, the first time a
+    // synced call met a promoted slot on wasm (the dsa module under
+    // `PLIRON_SROA_FRAGWORD=4`, `Page::tape_pack`). Then it was the type
+    // of the function's first `stack_addr`, i64 when there was none.
+    let pty = crate::target::ptr_type(target);
     // Rewrite: alias loads, drop stores, append reaching values on edges.
     let mut n = 0;
     let mut writebacks: Vec<(Inst, usize)> = Vec::new();
@@ -2179,7 +2177,7 @@ mod tests {
         }];
         let cfg = ControlFlowGraph::with_function(&func);
         let k: &[Kill] = if kill { &kills } else { &[] };
-        let n = run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), k, None);
+        let n = run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), k, None, &crate::target::Target::host());
         assert!(n > 0, "expected promotion");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -2224,7 +2222,7 @@ mod tests {
             block: b0,
         }];
         let cfg = ControlFlowGraph::with_function(&func);
-        run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &kills, None);
+        run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &kills, None, &crate::target::Target::host());
         assert_eq!(memops(&func), 0);
         assert_eq!(func.dfg.resolve_aliases(x), arg0, "{func}");
         assert_ne!(func.dfg.resolve_aliases(y), arg0, "{func}");
@@ -2370,7 +2368,7 @@ mod tests {
             nocap.insert((call, 0), u64::MAX);
             let w = weights(&func);
             let cfg = ControlFlowGraph::with_function(&func);
-            let n = run_lt(&mut func, &cfg, &nocap, false, &Default::default(), &[], Some(&w));
+            let n = run_lt(&mut func, &cfg, &nocap, false, &Default::default(), &[], Some(&w), &crate::target::Target::host());
             assert_eq!(n > 0, want, "in_loop={in_loop}:\n{func}");
             if !want {
                 assert_eq!(memops(&func), before);

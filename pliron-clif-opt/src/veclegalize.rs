@@ -33,10 +33,11 @@ fn emit_vec_result(
     ss: StackSlot,
     int_v: Value,
     target: Type,
+    pty: Type,
 ) {
     let it = int_ty(target.bits() as u16);
     pos.ins().stack_store(it, int_v, ss, 0);
-    let a = pos.ins().stack_addr(ir::types::I64, ss, 0);
+    let a = pos.ins().stack_addr(pty, ss, 0);
     pos.func.replace(inst).load(
         target,
         MemFlagsData::trusted(),
@@ -191,7 +192,9 @@ fn copy_to(pos: &mut FuncCursor, inst: ir::Inst, v: ir::Value) {
     pos.func.dfg.change_to_alias(r, v);
 }
 
-pub fn run(func: &mut ir::Function, target: Type) -> usize {
+pub fn run(func: &mut ir::Function, target: Type, tgt: &crate::target::Target) -> usize {
+    // Address type of the spill slots below.
+    let pty = crate::target::ptr_type(tgt);
     let mut jobs = Vec::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
@@ -286,7 +289,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                     s
                 };
                 let r = pos.ins().bor(masked, sin);
-                emit_vec_result(&mut pos, inst, ss, r, target);
+                emit_vec_result(&mut pos, inst, ss, r, target, pty);
             }
             Opcode::Store => {
                 let flags = pos.func.dfg.mem_flags[mfo.unwrap()];
@@ -297,7 +300,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
             Opcode::Load => {
                 let flags = pos.func.dfg.mem_flags[mfo.unwrap()];
                 let w = pos.ins().load(it, flags, args[0], off);
-                emit_vec_result(&mut pos, inst, ss, w, target);
+                emit_vec_result(&mut pos, inst, ss, w, target, pty);
             }
             Opcode::Splat => {
                 let s = lane_to_int(&mut pos, args[0], lt, it);
@@ -307,7 +310,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 }
                 let m = iconst_wide(&mut pos, it, mult);
                 let r = pos.ins().imul(s, m);
-                emit_vec_result(&mut pos, inst, ss, r, target);
+                emit_vec_result(&mut pos, inst, ss, r, target, pty);
             }
             Opcode::Iconcat => {
                 // concat(lo, hi): result lanes = lo lanes then hi lanes.
@@ -318,7 +321,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 let hi = pos.ins().uextend(it, hi);
                 let hi = pos.ins().ishl_imm_u(hi, lo_bits as i64);
                 let r = pos.ins().bor(lo, hi);
-                emit_vec_result(&mut pos, inst, ss, r, target);
+                emit_vec_result(&mut pos, inst, ss, r, target, pty);
             }
             Opcode::Isplit => {
                 let v = pos.ins().bitcast(it, le, args[0]);
@@ -416,7 +419,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                 };
                 let out_t = res_ts[0];
                 if out_t == target || out_t.is_vector() {
-                    emit_vec_result(&mut pos, inst, ss, r, out_t);
+                    emit_vec_result(&mut pos, inst, ss, r, out_t, pty);
                 } else {
                     copy_to(&mut pos, inst, r);
                 }
@@ -470,7 +473,7 @@ pub fn run(func: &mut ir::Function, target: Type) -> usize {
                         };
                         acc = pos.ins().bor(acc, w);
                     }
-                    emit_vec_result(&mut pos, inst, ss, acc, out_vt);
+                    emit_vec_result(&mut pos, inst, ss, acc, out_vt, pty);
                 } else {
                     // Wide output: seed with splat(0), chain insertlane.
                     let z = pos.ins().iconst(int_ty(out_lt.bits() as u16), 0);

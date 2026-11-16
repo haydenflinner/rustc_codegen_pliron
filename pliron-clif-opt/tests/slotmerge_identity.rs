@@ -12,7 +12,7 @@ fn parse(src: &str) -> Function {
 }
 
 fn merge(f: &mut Function) -> usize {
-    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashMap::default())
+    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashMap::default(), &pliron_clif_opt::target::Target::host())
 }
 
 /// The slot a `stack_addr` result names after merging.

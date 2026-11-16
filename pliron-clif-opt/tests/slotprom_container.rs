@@ -14,7 +14,7 @@ fn run(src: &str) -> (Function, Function) {
     let before = cranelift_reader::parse_functions(src).unwrap().remove(0);
     let mut f = before.clone();
     let cfg = ControlFlowGraph::with_function(&f);
-    pliron_clif_opt::slotprom::run(&mut f, &cfg, &FxHashMap::default(), false, &Default::default());
+    pliron_clif_opt::slotprom::run(&mut f, &cfg, &FxHashMap::default(), false, &Default::default(), &pliron_clif_opt::target::Target::host());
     (before, f)
 }
 

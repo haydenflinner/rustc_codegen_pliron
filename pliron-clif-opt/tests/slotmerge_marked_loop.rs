@@ -51,6 +51,6 @@ fn marked_slot_keeps_loop_span() {
     let end = f.layout.first_inst(b2); // after `iadd` in the exit
     let ss0 = StackSlot::from_u32(0);
     let lifetimes = vec![(vec![ss0], start, b0, true), (vec![ss0], end, b2, false)];
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &pliron_clif_opt::target::Target::host());
     assert_ne!(slot_of(&f, 3), slot_of(&f, 5), "the loop-body temp was folded onto the marked slot:\n{}", f.display());
 }

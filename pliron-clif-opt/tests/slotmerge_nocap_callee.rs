@@ -46,6 +46,6 @@ fn copied_call_keeps_callee_nocap() {
         f.layout.remove_inst(i);
     }
     f.layout.remove_block(b1);
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &nocap);
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &nocap, &pliron_clif_opt::target::Target::host());
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "the copies' by-value args didn't share:\n{}", f.display());
 }

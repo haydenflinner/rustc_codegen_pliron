@@ -1630,7 +1630,7 @@ fn run_steps(p: &mut Pipe, check_each: bool) -> bool {
         run_step(p, s, &mut an, &mut step_t[i]);
         if p.clctx.func.display().to_string() != before_text {
             // wasm32: i32 pointers in the sandbox.
-            crate::diffcheck::set_ptr32(p.wasm);
+            crate::diffcheck::set_ptr32(p.target.ptr_bits == 32);
             found |= crate::diffcheck::check_and_report(
                 p.fname,
                 s.name,
@@ -1710,7 +1710,7 @@ fn run_whole_checked(p: &mut Pipe) {
     let derived0 = p.derived.clone();
     run_steps(p, false);
     let facts = facts_of(p);
-    crate::diffcheck::set_ptr32(p.wasm);
+    crate::diffcheck::set_ptr32(p.target.ptr_bits == 32);
     let m = match crate::diffcheck::check(
         &initial,
         &p.clctx.func,
@@ -2413,6 +2413,7 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.dbg_slots,
         &kills,
         weight.as_ref(),
+        &p.target,
     );
     p.dump("slotprom");
     k
@@ -4441,7 +4442,7 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     if env_set("PLIRON_SM_INFO_FN") {
         slotmerge::CUR_FN.with(|c| *c.borrow_mut() = p.fname.to_string());
     }
-    let k = slotmerge::run_with(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap, &p.edge_kills);
+    let k = slotmerge::run_with(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap, &p.edge_kills, &p.target);
     if smdbg {
         let after: u64 = p
             .clctx

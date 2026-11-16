@@ -20,7 +20,7 @@ fn run(src: &str) -> Function {
     // SAFETY: set before any config read in this test binary.
     unsafe { std::env::set_var("PLIRON_SM_FLOWIV", "1") };
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &FxHashMap::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &FxHashMap::default(), &pliron_clif_opt::target::Target::host());
     f
 }
 

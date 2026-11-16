@@ -15,7 +15,7 @@ fn main() {
     let lifetimes = Vec::new();
     let nocap = FxHashMap::default();
     for f in &mut funcs {
-        let n = slotmerge::run(f, &nowrite, &lifetimes, &nocap);
+        let n = slotmerge::run(f, &nowrite, &lifetimes, &nocap, &pliron_clif_opt::target::Target::host());
         eprintln!("merged {n} in {}", f.name);
     }
 }

@@ -1618,8 +1618,9 @@ pub fn run(
     nowrite: &FxHashMap<FuncRef, bool>,
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
     nocap: &FxHashMap<(Inst, u32), u64>,
+    target: &crate::target::Target,
 ) -> usize {
-    run_with(func, nowrite, lifetimes, nocap, &[])
+    run_with(func, nowrite, lifetimes, nocap, &[], target)
 }
 
 /// `run` plus `entry_kills`' edge kills (`PLIRON_SM_MARKFLOW`).
@@ -1629,6 +1630,7 @@ pub fn run_with(
     lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
     nocap: &FxHashMap<(Inst, u32), u64>,
     edge_kills: &[(StackSlot, Inst, u32)],
+    target: &crate::target::Target,
 ) -> usize {
     let wide = nocap_by_callee(func, nocap);
     let nocap = wide.as_ref().unwrap_or(nocap);
@@ -2872,7 +2874,7 @@ pub fn run_with(
     // so a wrong interval reads garbage at its first stale access, in
     // every run, whether or not a merge would have reused the bytes.
     if crate::env_set("PLIRON_SM_POISON") {
-        return poison_dead(func, &order, &bfirst, &blast, &succ_map, &iv, &segs, &escaped);
+        return poison_dead(func, &order, &bfirst, &blast, &succ_map, &iv, &segs, &escaped, crate::target::ptr_type(target));
     }
 
     // `PLIRON_SM_COALESCE=1`: copy coalescing (LLVM MemCpyOpt's stack
@@ -3229,6 +3231,8 @@ fn poison_dead(
     iv: &[(u32, u32)],
     segs: &[Option<Vec<(u32, u32)>>],
     escaped: &[bool],
+    // The pointer type `stack_store` needs (i32 on wasm32).
+    pty: cranelift_codegen::ir::Type,
 ) -> usize {
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
     use cranelift_codegen::ir::{InstBuilder, types};
@@ -3293,15 +3297,6 @@ fn poison_dead(
         }
     }
     let n = sites.len();
-    // The pointer type `stack_store` needs: whatever this function's
-    // `stack_addr`s produce (i32 on wasm32).
-    let pty = func
-        .layout
-        .blocks()
-        .flat_map(|b| func.layout.block_insts(b))
-        .find(|&i| matches!(func.dfg.insts[i], InstructionData::StackAddr { .. }))
-        .map(|i| func.dfg.value_type(func.dfg.first_result(i)))
-        .unwrap_or(types::I64);
     for (ss, head, after) in sites {
         let size = func.sized_stack_slots[ss].size.min(POISON_MAX);
         let mut cur = FuncCursor::new(func);

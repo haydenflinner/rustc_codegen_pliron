@@ -17,18 +17,13 @@ use rustc_hash::FxHashMap;
 use crate::opt_body;
 use crate::sroa::{gep_offset, mk_const};
 use crate::state::{ConstVal, State};
-use crate::types::{TyK, classify, ptr32, size_align, struct_offsets};
+use crate::types::{TyK, classify, size_align, struct_offsets};
 
 /// Byte image of a constant: known bytes, plus pointer relocations by offset.
 #[derive(Default)]
 struct Image {
     bytes: Vec<Option<u8>>,
     relocs: FxHashMap<usize, (String, i64)>,
-}
-
-/// Pointer size for the target (4 on wasm32, 8 elsewhere).
-fn ptrsz() -> u64 {
-    if ptr32() { 4 } else { 8 }
 }
 
 fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
@@ -45,7 +40,7 @@ fn image(ctx: &Context, st: &State, v: Value, out: &mut Image) -> Option<()> {
         }
         // Pointer-sized reloc (a fn/struct address): on wasm32 pointers
         // are 4 bytes, so this must not assume 8.
-        ConstVal::Sym { sym, off } if size == ptrsz() => {
+        ConstVal::Sym { sym, off } if size == st.target.ptr_bytes() => {
             out.relocs.insert(start, (sym.clone(), *off));
             out.bytes.extend(vec![None; size as usize]);
         }

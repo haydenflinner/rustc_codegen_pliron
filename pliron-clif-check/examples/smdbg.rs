@@ -26,7 +26,7 @@ fn main() {
         }
     }
     let lt = facts.lifetimes(&f);
-    let k = pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lt, &nocap);
+    let k = pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lt, &nocap, &pliron_clif_opt::target::Target::host());
     println!("merged={k} lts={}", lt.len());
     let mut bytes = 0u64;
     let mut live = 0;

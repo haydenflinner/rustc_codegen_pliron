@@ -46,7 +46,7 @@ fn run(src: &str, lt: impl Fn(&Function) -> Lifetimes, extra_kill: Option<(u32, 
         let i = f.layout.block_insts(Block::from_u32(b)).nth(n).unwrap();
         kills.push((StackSlot::from_u32(u32::MAX - 1), i, pliron_clif_opt::slotmerge::KILL_ALL));
     }
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills, &pliron_clif_opt::target::Target::host());
     f
 }
 
@@ -195,11 +195,11 @@ block3:
     }
     f.layout.remove_block(b3);
     let mut g = f.clone();
-    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills);
+    pliron_clif_opt::slotmerge::run_with(&mut f, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &kills, &pliron_clif_opt::target::Target::host());
     assert_eq!(slot_of(&f, 1), slot_of(&f, 2), "ss0 stayed live past the collapsed chain:\n{}", f.display());
     // Only the after-call kill (`u32::MAX - 3`) still resolves.
     let without: Vec<_> = kills.iter().copied().filter(|k| k.2 != u32::MAX - 3).collect();
-    pliron_clif_opt::slotmerge::run_with(&mut g, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &without);
+    pliron_clif_opt::slotmerge::run_with(&mut g, &FxHashMap::default(), &lifetimes, &FxHashMap::default(), &without, &pliron_clif_opt::target::Target::host());
     assert_ne!(slot_of(&g, 1), slot_of(&g, 2), "test lost its point: another kill survived");
 }
 

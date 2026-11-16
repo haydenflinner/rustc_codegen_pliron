@@ -41,7 +41,7 @@ fn run(src: &str, lt: impl Fn(&Function) -> Lifetimes) -> Function {
         .map(|i| ((i, 0), u64::MAX))
         .collect();
     let lifetimes = lt(&f);
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &nocap);
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &lifetimes, &nocap, &pliron_clif_opt::target::Target::host());
     f
 }
 

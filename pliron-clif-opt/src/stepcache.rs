@@ -677,6 +677,7 @@ fn fn_inputs(p: &Pipe, an: &mut Analysis) -> [u8; 32] {
     // `p.unopt` keys *which* steps run like the flag fields — a dead-
     // candidate fn must not replay a full-pipeline variant nor publish
     // one (uncached output would diverge either way).
+    p.target.hash(&mut h);
     (p.simd, p.x64, p.cmp64, p.has_eh, p.dump, p.verify_full, p.unopt).hash(&mut h);
     let r = h.0.finalize().into();
     an.fnh = Some(r);

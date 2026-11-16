@@ -35,7 +35,7 @@ fn run(src: &str) -> Function {
         .filter(|&i| f.dfg.insts[i].opcode().is_call())
         .map(|i| ((i, 0), u64::MAX))
         .collect();
-    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &nocap);
+    pliron_clif_opt::slotmerge::run(&mut f, &FxHashMap::default(), &[], &nocap, &pliron_clif_opt::target::Target::host());
     f
 }
 

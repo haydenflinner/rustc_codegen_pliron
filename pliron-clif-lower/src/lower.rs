@@ -1252,7 +1252,7 @@ fn compile_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobSh
                 .map(|(_, ty)| *ty)
         };
         if let Some(t) = vt.filter(|t| t.is_vector() && t.bits() < 128 && sh.x64) {
-            if vec_retry >= 4 || crate::veclegalize::run(&mut clctx.func, t) == 0 {
+            if vec_retry >= 4 || crate::veclegalize::run(&mut clctx.func, t, &sh.target) == 0 {
                 break defr;
             }
             vec_retry += 1;

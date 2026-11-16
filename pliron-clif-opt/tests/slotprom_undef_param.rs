@@ -55,7 +55,7 @@ fn undefined_field_gets_no_writeback() {
         .unwrap();
     let nocap: FxHashMap<(Inst, u32), u64> = [(call, 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     let cfg = ControlFlowGraph::with_function(&f);
-    pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default());
+    pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default(), &pliron_clif_opt::target::Target::host());
     let st = stores(&f);
     // Only field +8's writeback remains.
     assert_eq!(st.len(), 1, "{st:?}\n{}", f.display());
@@ -100,7 +100,7 @@ fn reloaded_field_gets_no_writeback() {
         .unwrap();
     let nocap: FxHashMap<(Inst, u32), u64> = [(call, 0)].into_iter().map(|k| (k, u64::MAX)).collect();
     let cfg = ControlFlowGraph::with_function(&f);
-    pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default());
+    pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default(), &pliron_clif_opt::target::Target::host());
     assert!(stores(&f).is_empty(), "{:?}\n{}", stores(&f), f.display());
     cranelift_codegen::verify_function(&f, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
         .expect("verifier");
@@ -140,7 +140,7 @@ fn copied_reload_keeps_its_writeback() {
         .collect();
     let nocap: FxHashMap<(Inst, u32), u64> = calls.iter().map(|&c| ((c, 0), u64::MAX)).collect();
     let cfg = ControlFlowGraph::with_function(&f);
-    pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default());
+    pliron_clif_opt::slotprom::run(&mut f, &cfg, &nocap, false, &Default::default(), &pliron_clif_opt::target::Target::host());
     // ss1's writeback before `fn1` (the copied reload) must remain.
     assert_eq!(stores(&f).len(), 1, "{:?}\n{}", stores(&f), f.display());
     cranelift_codegen::verify_function(&f, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))

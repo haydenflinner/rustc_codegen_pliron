@@ -73,7 +73,11 @@ pub fn classify(ctx: &Context, ty: TypeHandle) -> TyK {
     TyK::Other
 }
 
-/// Set for 32-bit-pointer targets (wasm32) before any layout query.
+/// Set for 32-bit-pointer targets (wasm32) before any layout query: the
+/// layout's mirror of `Target::ptr_bits` (`pliron_cfg::target`), for
+/// [`size_align`] and [`leaves`], which are called with a `Context` and
+/// no `State` from the frontend onwards. A pass does not read it: it asks
+/// `st.target` (`tests/no_target_literals.rs`).
 pub static PTR32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether 64/128-bit vectors lower to native SIMD values. Cleared for wasm

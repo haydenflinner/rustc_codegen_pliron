@@ -14,7 +14,7 @@ block0(v0: i64):
     return v2
 }";
     let mut f = cranelift_reader::parse_functions(src).unwrap().remove(0);
-    let n = pliron_clif_opt::veclegalize::run(&mut f, types::F32X2);
+    let n = pliron_clif_opt::veclegalize::run(&mut f, types::F32X2, &pliron_clif_opt::target::Target::host());
     assert!(n > 0, "veclegalize did nothing:\n{}", f.display());
     let flags = settings::Flags::new(settings::builder());
     if let Err(e) = cranelift_codegen::verify_function(&f, &flags) {

@@ -42,7 +42,7 @@ fn slot_of(f: &Function, v: Value) -> StackSlot {
 }
 
 fn run(f: &mut Function) {
-    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashMap::default());
+    pliron_clif_opt::slotmerge::run(f, &FxHashMap::default(), &[], &FxHashMap::default(), &pliron_clif_opt::target::Target::host());
 }
 
 /// ss0 (16 bytes) is written in full before the loop; each trip stores

@@ -65,7 +65,7 @@ fn check(self_loop: bool) {
     // The reader writes nothing, so passing the env doesn't escape it.
     let fr = f.dfg.ext_funcs.keys().next().unwrap();
     let nowrite: FxHashMap<_, _> = [(fr, true)].into_iter().collect();
-    pliron_clif_opt::slotmerge::run(&mut f, &nowrite, &[], &FxHashMap::default());
+    pliron_clif_opt::slotmerge::run(&mut f, &nowrite, &[], &FxHashMap::default(), &pliron_clif_opt::target::Target::host());
     let req = slot_of(&f, Value::from_u32(2));
     let tmp = slot_of(&f, Value::from_u32(7));
     assert_ne!(req, tmp, "the loop temp was folded onto the env-read slot:\n{}", f.display());
