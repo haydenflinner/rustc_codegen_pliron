@@ -16,6 +16,8 @@
 //   --json=FILE     also write the table as JSON
 //   --list          print the workloads and exit
 //   --no-probe      skip the self-checks (below)
+//   --allow-stale   time packages built from different dsa revisions (the
+//                   result cross-check is then meaningless; refused otherwise)
 //   --side=TAG --loop=N   profile mode: load only that side (llvm, pliron,
 //                   extra), warm up, then run each selected workload N
 //                   times. Use under `node --cpu-prof` (harness/dsa/prof.sh).
@@ -409,7 +411,20 @@ for (const s of sides) {
   console.log(`${s.tag.padEnd(7)}${s.dir}  ${s.bytes} B  init ${s.initMs.toFixed(0)} ms  caps ${[...s.caps].join(",")}  stamp ${s.m.buildStamp()}`);
 }
 if (new Set(sides.map((s) => s.m.buildStamp())).size > 1) {
-  console.log("note: source stamps differ. The stamp is dsa HEAD + a hash of `git status --porcelain`, so a new untracked file between the two builds changes it too; compare the HEAD part.");
+  // The stamp is `<dsa HEAD>+<hash of git status --porcelain>`. A
+  // different HEAD means different source: a result mismatch is then a
+  // source change, not a miscompile (2026-11-16: dsa moved at 17:42, the
+  // LLVM package was from 12:58, and `dims_page` "mismatched" for an
+  // hour of bisecting). Refuse unless asked; a different status hash
+  // alone (a new untracked file) is only a note.
+  const heads = new Set(sides.map((s) => String(s.m.buildStamp()).split("+")[0]));
+  if (heads.size > 1 && !flag("allow-stale")) {
+    console.log(`ERROR: the packages were built from different dsa revisions (${sides.map((s) => `${s.tag} ${String(s.m.buildStamp()).split("+")[0]}`).join(", ")}): their results cannot be cross-checked. Rebuild the stale side at the current HEAD (harness/dsa/build.sh), or pass --allow-stale to time them anyway.`);
+    process.exit(2);
+  }
+  console.log(heads.size > 1
+    ? "WARNING: --allow-stale: the packages come from different dsa revisions; MISMATCH lines below are not evidence of a miscompile."
+    : "note: source stamps differ in the working-tree hash only (an untracked or modified file between the builds); the HEAD is the same.");
 }
 console.log(`rounds ${ROUNDS}, target ${TARGET_MS} ms per timed call, node ${process.version}`);
 
