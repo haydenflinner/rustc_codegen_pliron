@@ -155,13 +155,41 @@ pub struct Mismatch {
     pub args: Vec<DataValue>,
     pub before: Outcome,
     pub after: Outcome,
+    /// `before` run again under the other stack fill: a byte the two
+    /// original runs agree on is one the source program determines.
+    pub rerun: Option<Outcome>,
 }
 
 impl std::fmt::Display for Mismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "trial {} args {:?}", self.trial, self.args)?;
         writeln!(f, "  before: {}", describe(&self.before))?;
-        write!(f, "  after:  {}", describe(&self.after))
+        write!(f, "  after:  {}", describe(&self.after))?;
+        // The lists above stop at 64 bytes each; name the bytes that
+        // decided it. `-` is a byte left at its seeded value.
+        if let (
+            Outcome::Returned { writes: w0, .. },
+            Outcome::Returned { writes: wa, .. },
+            Some(Outcome::Returned { writes: w1, .. }),
+        ) = (&self.before, &self.after, &self.rerun)
+        {
+            let m = |w: &Vec<(u64, u8)>| w.iter().copied().collect::<BTreeMap<u64, u8>>();
+            let (m0, m1, ma) = (m(w0), m(w1), m(wa));
+            let keys: std::collections::BTreeSet<u64> =
+                m0.keys().chain(m1.keys()).chain(ma.keys()).copied().collect();
+            let bad: Vec<u64> = keys
+                .into_iter()
+                .filter(|k| m0.get(k) == m1.get(k) && ma.get(k) != m0.get(k))
+                .collect();
+            if !bad.is_empty() {
+                let show = |v: Option<&u8>| v.map_or("-".to_string(), |b| format!("{b:x}"));
+                write!(f, "\n  {} determined bytes differ (address: before, after):", bad.len())?;
+                for k in bad.iter().take(32) {
+                    write!(f, " {k:x}: {}, {};", show(m0.get(k)), show(ma.get(k)))?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -273,6 +301,7 @@ pub fn check(
                         args: world.args.clone(),
                         before: b,
                         after: a,
+                        rerun: Some(b1),
                     });
                 }
             }
@@ -405,18 +434,20 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
     if !lanes_ok(ra, r0, r1) {
         return false;
     }
-    // Written bytes, by address. A fill-dependent write set means the
-    // original's memory traffic itself is underdetermined.
+    // Written bytes, by address. A write list holds the bytes that ended
+    // up different from the seeded memory, so an absent address reads as
+    // "the seed's byte" and is compared like any other value: an
+    // undetermined byte may come out equal to the seed in one run and not
+    // in another (slotmerge moved a padding byte of the returned struct
+    // onto a slot whose byte matched the seed; the address sets differed
+    // and that alone was reported). A byte is determined iff the two
+    // original runs agree on it, absent or not.
     let m = |w: &Vec<(u64, u8)>| w.iter().copied().collect::<BTreeMap<u64, u8>>();
     let (m0, m1, ma) = (m(w0), m(w1), m(wa));
-    if m0.keys().ne(m1.keys()) {
-        return true;
-    }
-    if ma.keys().ne(m0.keys()) {
-        return false;
-    }
-    m0.iter()
-        .all(|(k, v)| m1[k] != *v || ma[k] == *v)
+    m0.keys()
+        .chain(m1.keys())
+        .chain(ma.keys())
+        .all(|k| m0.get(k) != m1.get(k) || ma.get(k) == m0.get(k))
 }
 
 fn mix(a: u64, b: u64) -> u64 {
@@ -616,9 +647,61 @@ impl World {
                 .filter_map(|fr| f.dfg.ext_funcs.get(*fr))
                 .map(|d| d.name.display(Some(&f.params)).to_string())
                 .collect(),
-            extent: facts.stub_extent.clone(),
+            extent: {
+                // A callee handed the address of a slot reaches that slot
+                // and no further, so the slot's size bounds its operand
+                // like a `nocap` extent does. The stub fills up to the end
+                // of the slot the pointer lands in: without this bound,
+                // slotmerge folding a 12-byte out-slot into the head of a
+                // 128-byte one made the stub write 64 bytes over the
+                // larger slot's live fields in the rewritten function only
+                // (jiff's `Database::from_dir` and two more in the dsa
+                // corpus). `f` is the original: both runs share its table.
+                let slots = stub_extents(f, |i, k| slot_extent(f, f.dfg.inst_args(i)[k as usize]));
+                let mut e = facts.stub_extent.clone();
+                for (key, n) in slots {
+                    let x = e.entry(key).or_insert(n);
+                    *x = (*x).min(n);
+                }
+                e
+            },
         }
     }
+}
+
+/// Bytes from `v` to the end of its stack slot, when `v` is a slot's
+/// address plus constants.
+fn slot_extent(f: &Function, v: Value) -> Option<u64> {
+    let mut v = f.dfg.resolve_aliases(v);
+    let mut off = 0i64;
+    for _ in 0..16 {
+        let i = f.dfg.value_def(v).inst()?;
+        match f.dfg.insts[i] {
+            InstructionData::StackAddr { stack_slot, offset, .. } => {
+                let size = i64::from(f.sized_stack_slots[stack_slot].size);
+                let at = off.checked_add(i64::from(i32::from(offset)))?;
+                return (0..=size).contains(&at).then(|| (size - at) as u64);
+            }
+            InstructionData::Binary { opcode: Opcode::Iadd, args } => {
+                let (a, b) = (f.dfg.resolve_aliases(args[0]), f.dfg.resolve_aliases(args[1]));
+                let konst = |x: Value| match f.dfg.value_def(x).inst().map(|d| f.dfg.insts[d]) {
+                    Some(InstructionData::UnaryImm { opcode: Opcode::Iconst, imm }) => Some(imm.bits()),
+                    _ => None,
+                };
+                if let Some(c) = konst(b) {
+                    off = off.checked_add(c)?;
+                    v = a;
+                } else if let Some(c) = konst(a) {
+                    off = off.checked_add(c)?;
+                    v = b;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn fill(data: &mut [u8], targets: &[u64], rng: &mut Rng) {
@@ -1285,7 +1368,45 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
         let ctx = DfgInstructionContext::new(i, &f.dfg);
         let cf = step(s, ctx).map_err(|e| Stop::Unsupported(format!("{}: {e}", data.opcode())))?;
         match cf {
-            ControlFlow::Assign(vals) => {
+            ControlFlow::Assign(mut vals) => {
+                // The sign and payload of a NaN that arithmetic produces
+                // are not determined (Rust, wasm and IEEE 754 agree), and
+                // passes change them legally: `commute` swaps the operands
+                // of an `fadd` of two NaNs and another one's bits come
+                // out. `norm` forgives that in returned values and call
+                // arguments; a NaN stored to memory is bytes by then. So
+                // every arithmetic NaN is the canonical one in both runs.
+                // `fneg`, `fabs`, `fcopysign`, casts and copies are exact
+                // on NaNs and stay so.
+                if matches!(
+                    data.opcode(),
+                    Opcode::Fadd
+                        | Opcode::Fsub
+                        | Opcode::Fmul
+                        | Opcode::Fdiv
+                        | Opcode::Fma
+                        | Opcode::Sqrt
+                        | Opcode::Fmin
+                        | Opcode::Fmax
+                        | Opcode::Ceil
+                        | Opcode::Floor
+                        | Opcode::Trunc
+                        | Opcode::Nearest
+                        | Opcode::Fpromote
+                        | Opcode::Fdemote
+                ) {
+                    for v in vals.iter_mut() {
+                        match v {
+                            DataValue::F32(f) if f.is_nan() => {
+                                *v = DataValue::F32(ir::immediates::Ieee32::with_bits(0x7fc0_0000))
+                            }
+                            DataValue::F64(f) if f.is_nan() => {
+                                *v = DataValue::F64(ir::immediates::Ieee64::with_bits(0x7ff8_0000_0000_0000))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if data.opcode().can_load()
                     && let Some(&r) = f.dfg.inst_results(i).first()
                     && s.nonnull.contains(&r)

@@ -604,3 +604,77 @@ fn noalias_param_memory_is_not_reachable_from_other_memory() {
     };
     check(&a, &b, &facts, &cfg).unwrap();
 }
+
+/// A copy of a padded struct through a slot writes the padding (uninit,
+/// zero by the interpreter's convention); storing the fields one by one
+/// leaves the destination's padding alone. Both are right. The write
+/// lists differ in which addresses they hold (a list holds the bytes that
+/// ended up different from the seeded memory), and that alone used to be
+/// reported: 7 functions of the dsa corpus, `ImportTable::hint_name`
+/// among them, after slotmerge. A wrong field byte is still a mismatch.
+#[test]
+fn uninit_bytes_written_to_memory_are_not_pinned() {
+    let a = parse(
+        "function %f(i64, i16, i32) {
+            ss0 = explicit_slot 8, align = 4
+        block0(v0: i64, v1: i16, v2: i32):
+            v3 = stack_addr.i64 ss0
+            store v1, v3
+            store v2, v3+4
+            v4 = load.i64 v3
+            store v4, v0
+            return
+        }",
+    );
+    let b = parse(
+        "function %f(i64, i16, i32) {
+        block0(v0: i64, v1: i16, v2: i32):
+            store v1, v0
+            store v2, v0+4
+            return
+        }",
+    );
+    check(&a, &b, &Facts::default(), &cfg()).unwrap();
+    let c = parse(
+        "function %f(i64, i16, i32) {
+        block0(v0: i64, v1: i16, v2: i32):
+            store v1, v0
+            v3 = iconst.i32 1
+            v4 = bxor v2, v3
+            store v4, v0+4
+            return
+        }",
+    );
+    assert!(check(&a, &c, &Facts::default(), &cfg()).is_err());
+}
+
+/// `fadd` of two NaNs returns one operand's bits, so swapping the operands
+/// changes the sign and payload of the sum. No language pins those, and
+/// `norm` already forgives them in returned values; stored to memory they
+/// are bytes and were compared exactly (`commute` on 6 float-heavy
+/// functions of the dsa corpus). Arithmetic NaNs are canonical in both
+/// runs now. `fneg` is exact on a NaN and must stay checked.
+#[test]
+fn arithmetic_nan_bits_in_memory_are_not_pinned() {
+    let body = |sum: &str| {
+        format!(
+            "function %f(i64) {{
+            block0(v0: i64):
+                v1 = iconst.i32 0x7ffd_2cf6
+                v2 = iconst.i32 0xffc0_0001
+                v3 = bitcast.f32 v1
+                v4 = bitcast.f32 v2
+                {sum}
+                store v5, v0
+                return
+            }}"
+        )
+    };
+    let a = parse(&body("v5 = fadd v3, v4"));
+    let b = parse(&body("v5 = fadd v4, v3"));
+    let s = check(&a, &b, &Facts::default(), &cfg()).unwrap();
+    assert_eq!(s.compared, 32, "{s:?}");
+    let c = parse(&body("v5 = fneg v3"));
+    let d = parse(&body("v5 = fabs v3"));
+    assert!(check(&c, &d, &Facts::default(), &cfg()).is_err());
+}
