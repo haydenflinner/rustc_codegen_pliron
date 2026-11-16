@@ -70,7 +70,6 @@ pub(crate) struct CrateCfg {
     /// The passes' view of rustc's target (`src/target.rs`); every CGU's
     /// `State::target` is the same value.
     pub target: crate::target::Target,
-    pub wasm: bool,
     /// `panic_strategy() == Unwind` — lowering needs the EH paths.
     pub unwind: bool,
     /// COFF+unwind: emulated EH makes `nounwind` load-bearing in lower.
@@ -83,7 +82,6 @@ pub(crate) struct CrateCfg {
     pub wasm_features: Vec<String>,
     pub sse42: bool,
     pub fmt: pgo::ObjFmt,
-    pub aarch64: bool,
     /// Indirect-call promotion (`PLIRON_DEVIRT` in a profile build).
     pub icp: Option<crate::devirt::IcpCfg>,
 }
@@ -119,7 +117,6 @@ impl CrateCfg {
             optimize,
             xfacts: pass_enabled("PLIRON_XFACTS"),
             target: crate::target::of(sess),
-            wasm,
             unwind,
             coff_eh: binary_format == rustc_target::spec::BinaryFormat::Coff && unwind,
             emit_ir,
@@ -139,7 +136,6 @@ impl CrateCfg {
                 .internal_target_features
                 .contains(&rustc_span::Symbol::intern("sse4.2")),
             fmt,
-            aarch64: sess.target.arch == rustc_target::spec::Arch::AArch64,
             icp: crate::devirt::IcpCfg::new(tcx),
         }
     }
@@ -1025,7 +1021,7 @@ pub(crate) fn finish_pre(
             let crate_id = cfg.icp.as_ref().map_or((0, 0), |c| (c.crate_id, c.crate_hash));
             let (hdr, ctor, _) = pgo::instrument(ctx, st, name, fmt, crate_id);
             if !hdr.is_empty() {
-                asm = pgo::ctor_asm(&hdr, &ctor, cfg.aarch64, fmt);
+                asm = pgo::ctor_asm(&hdr, &ctor, cfg.target.is_aarch64(), fmt);
             }
         }
         if let Some(f) = env_get("PLIRON_PGO_USE") {
@@ -1547,7 +1543,7 @@ pub(crate) fn finish_b(
     if env_set("PLIRON_DUMP_OPT") && pliron_cfg::tracing_on() {
         tracing::info!(target: "pliron::dump", "==== {name} (optimized) ====\n{}", print_ir(ctx.get(), module))
     }
-    let obj = if cfg.wasm {
+    let obj = if cfg.target.is_wasm() {
         wasm::lower_to_wasm_clif(ctx, st, host, name, &cfg.wasm_features, cfg.unwind)
     } else {
         lower::lower_to_object(
