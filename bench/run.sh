@@ -65,15 +65,27 @@ benchstat_bin() {
   fi
 }
 
+# Cargo's fingerprint does not cover the backend dylib or PLIRON_* variables,
+# but it does cover `cargo rustc` args (they are in the unit's file-name
+# hash: the stock and the pliron build below are two units that stay side
+# by side). The pliron build's flag names a keyed copy of the dylib
+# (harness/backend_path.py), so the bench crate is recompiled when the
+# backend or a knob changed, and neither side is when nothing did. The
+# bench crate is removed when the keyed path moved, so the units of earlier
+# backends do not pile up, and always where the helper cannot run.
+if ! BE=$(harness/backend_path.py --dylib "$PWD/target/debug/$lib"); then
+  BE=$PWD/target/debug/$lib
+  cargo clean -p pliron-bench --profile bench
+elif [ "$(cat "$OUT/backend.path" 2>/dev/null)" != "$BE" ]; then
+  cargo clean -p pliron-bench --profile bench
+  echo "$BE" > "$OUT/backend.path"
+fi
+
 llvm_bin=$(bench_bin)
 "$llvm_bin" -benchtime "$BENCHTIME" -count "$COUNT" -cpu 1 -benchmem "$@" \
   | tee "$OUT/llvm.txt"
 
-# Cargo's fingerprint does not cover the backend dylib, so without this the
-# flag-identical second build would reuse the stale artifact. `cargo rustc`
-# args are fingerprinted though, so only the bench crate itself is removed.
-cargo clean -p pliron-bench --profile bench
-plir_bin=$(bench_bin -Z "codegen-backend=$PWD/target/debug/$lib")
+plir_bin=$(bench_bin -Z "codegen-backend=$BE")
 "$plir_bin" -benchtime "$BENCHTIME" -count "$COUNT" -cpu 1 -benchmem "$@" \
   | tee "$OUT/pliron.txt"
 

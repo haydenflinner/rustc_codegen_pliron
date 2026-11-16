@@ -14,8 +14,10 @@ twice: stock, and with the pliron backend. With `--deps pliron` that is
 RUSTFLAGS *and* RUSTDOCFLAGS, so dependencies and doc-tests go through pliron
 too; the default `--deps stock` builds dependencies with stock rustc and only
 the crate's own code with pliron (doc-tests stay stock). Each side shares one target dir across
-crates; cargo doesn't track the backend dylib, so the pliron side is wiped
-when the dylib changes. `--release` by default: the optimizer is where
+crates; cargo doesn't track the backend dylib or `PLIRON_*` variables, so the
+pliron side gets the keyed copy of harness/backend_path.py: its path changes
+with the dylib's contents and the knobs, and cargo then recompiles what was
+built with it. `--release` by default: the optimizer is where
 miscompiles live (bevy_math's rect_union_pt, 2026-10-21).
 
 Outputs target/crates/report.md (+ report.json, per-crate logs). For a
@@ -26,6 +28,9 @@ PLIRON_DIFFCHECK=step PLIRON_DIFFCHECK_FN=<fn> to name the pass.
 import argparse, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "harness"))  # `-I` leaves the script dir out
+import backend_path
+
 OUT = os.path.join(ROOT, "target", "crates")
 TOOLCHAIN = "nightly-2026-10-22"
 
@@ -150,28 +155,13 @@ def dylib(profile):
     return os.path.join(ROOT, "target", profile, f"librustc_codegen_pliron.{ext}")
 
 
-def stamp_ok(tdir, lib):
-    """Wipe `tdir` when the backend dylib changed since its last use."""
-    h = hashlib.sha256()
-    with open(lib, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    want = h.hexdigest()
-    sp = os.path.join(tdir, ".pliron-backend")
-    if os.path.exists(sp) and open(sp).read() == want:
-        return
-    if os.path.exists(tdir):
-        shutil.rmtree(tdir)
-    os.makedirs(tdir, exist_ok=True)
-    open(sp, "w").write(want)
-
-
 def ws_wrapper(lib):
     """rustc wrapper that adds the backend to *workspace members only* (cargo's
-    RUSTC_WORKSPACE_WRAPPER skips registry/git deps). The path embeds the dylib
-    hash, so cargo's fingerprint rebuilds just the members when the backend
+    RUSTC_WORKSPACE_WRAPPER skips registry/git deps). `lib` is the keyed copy
+    and the wrapper is named after its key (dylib contents + `PLIRON_*`), so
+    cargo's fingerprint rebuilds just the members when the backend or a knob
     changes while the stock-built deps stay cached (`--deps stock`)."""
-    h = hashlib.sha256(open(lib, "rb").read()).hexdigest()[:12]
+    h = os.path.basename(os.path.dirname(lib))
     w = os.path.join(OUT, f"wrap-{h}.sh")
     if not os.path.exists(w):
         os.makedirs(OUT, exist_ok=True)
@@ -279,8 +269,13 @@ def main():
     if not os.path.exists(lib):
         sys.exit(f"no backend dylib at {lib}: cargo build --{a.profile}")
     os.makedirs(os.path.join(OUT, "logs"), exist_ok=True)
+    # From here on `lib` is the keyed copy: the flag (or the wrapper's name)
+    # changes when the dylib or a code-affecting PLIRON_* variable does.
+    lib = backend_path.backend_path(lib)
     if a.deps == "pliron":
-        stamp_ok(os.path.join(OUT, "target-pliron"), lib)
+        # Every unit there carries the flag: drop the ones of other backends
+        # (what wiping the dir on a dylib change used to do).
+        backend_path.gc(os.path.join(OUT, "target-pliron"), lib)
     rows = []
     for name, ver, args, tier, *git in CRATES:
         if tier > a.tier or (only and name not in only):
@@ -296,6 +291,7 @@ def main():
             print(f"{name}: fetch failed: {e}")
             continue
         row = {"crate": f"{name}-{ver}"}
+        os.utime(os.path.dirname(lib))  # in use: keyed copies are pruned by last use
         for side in ("stock", "pliron"):
             go = lambda: run_tests(src, side, args, lib, a.jobs, TIMEOUTS.get(name, a.timeout),
                                    not a.debug, a.deps == "stock")

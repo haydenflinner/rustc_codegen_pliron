@@ -19,7 +19,11 @@ cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml
 # Keep the wpeep Datalog audit on the smoke bodies too.
 # r[impl verify.audit.wasm]
 export PLIRON_WASM_AUDIT=${PLIRON_WASM_AUDIT:-panic}
-BE="-Zcodegen-backend=${BACKEND:-$ROOT/target/debug/$lib}"
+# The keyed private copy of the dylib (harness/backend_path.py), as every
+# script that passes the flag uses. Nothing here is cached (plain rustc,
+# --emit obj), so the dylib itself is as good where the helper cannot run.
+DY=${BACKEND:-$ROOT/target/debug/$lib}
+BE="-Zcodegen-backend=$(harness/backend_path.py --dylib "$DY" 2>/dev/null || echo "$DY")"
 LD=$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe
 out=$ROOT/target/wasm-smoke; mkdir -p "$out"
 rustc $BE --edition 2024 -O --target wasm32-unknown-unknown --crate-type lib \

@@ -19,10 +19,12 @@
 #                    DSA_FEATURES="--no-default-features --features eval,squish,cad"
 #   DSA_CARGO_ARGS   extra cargo args, e.g. --config profile.release.lto=false
 #   DSA_JOBS         cargo -j                         (5)
-#   DSA_KEEP=1       pliron: keep the wasm32 half of the target dir (see below)
+#   DSA_WIPE=1       pliron: remove the wasm32 half of the target dir first (see below)
+#   DSA_RUSTC_WRAPPER  rustc wrapper for cargo, e.g. sccache (default none: see below)
 #   DSA_RETRIES      reruns after a signal-killed cargo/rustc (30; see earlyoom below)
 #   DSA_PLIRON_FALLBACK  PLIRON_* settings for a second pass (see below; default none)
-#   PLIRON_BACKEND   backend dylib   (<repo>/target/debug/...; copy the dylib aside and point here to keep working on the backend during a build)
+#   PLIRON_BACKEND   backend dylib   (<repo>/target/debug/...). The build loads a keyed
+#                    private copy of it (below), so the backend can be rebuilt meanwhile.
 #   PLIRON_WASM_LD   linker          (<repo>/tools/pliron-wasm-ld/target/release/pliron-wasm-ld)
 #   WASM_BINDGEN     wasm-bindgen CLI; must be 0.2.127 to match the crate
 #   PLIRON_*         every other PLIRON_* variable reaches the pliron rustc
@@ -42,17 +44,32 @@
 # unit (`cargo -v`: `--crate-type cdylib --crate-type rlib -C opt-level=3
 # -C codegen-units=1 -C strip=debuginfo`).
 #
-# Cargo does not track the backend dylib or PLIRON_* variables, so a pliron
-# build first removes $target/wasm32-unknown-unknown (host proc macros and
-# build scripts are kept). DSA_KEEP=1 skips that — only correct when neither
-# the dylib nor any PLIRON_* variable changed.
+# Cargo does not track the backend dylib or PLIRON_* variables, so the flag
+# is `-Zcodegen-backend=<repo>/target/backends/<key>/...`, where <key> names
+# the dylib's contents and the code-affecting PLIRON_* variables
+# (harness/backend_path.py). A rebuild with neither changed compiles nothing
+# (no-op 1-2 s); with either changed cargo recompiles the wasm32 half, and
+# the helper's `--gc` drops the units of the previous backend from $target
+# (about 650 MB each for the eval set; host proc macros and build scripts
+# carry no flag and are kept). DSA_WIPE=1 removes $target/wasm32-unknown-unknown
+# first, as every build did before 2026-11-16: use it to get the side
+# output of a knob again (PLIRON_CORPUS, PLIRON_WASM_STUBLOG, any of the
+# reporting knobs the key leaves out), which only a rustc that runs writes.
+#
+# sccache: the same path makes a rustc wrapper safe on the pliron side (its
+# key holds the flag string, not the dylib or PLIRON_*). It stays off by
+# default so cargo_secs in BUILDINFO is a compile time; DSA_RUSTC_WRAPPER=sccache
+# turns it on (BUILDINFO then says `wrapper=sccache`).
 #
 # Two-pass fallback. With DSA_PLIRON_FALLBACK set (e.g. "PLIRON_BUNROLL=0"),
 # pass 1 runs `cargo build --keep-going` under the caller's environment and
 # compiles everything that can be; if crates failed, pass 2 exports the
 # fallback settings and builds the rest (the crates that panicked the backend
 # and everything downstream of them); BUILDINFO lists them
-# (`fallback_crates`). dsa-snap (03:07) needed PLIRON_HALFUNROLL=0
+# (`fallback_crates`). Both passes use one backend path, keyed on the
+# caller's environment plus the fallback string, so pass 2 does not redo
+# pass 1 and a later run without the fallback does not reuse its crates.
+# dsa-snap (03:07) needed PLIRON_HALFUNROLL=0
 # (regex-syntax), PLIRON_INDUCT2=0 (jiff), PLIRON_BUNROLL=0 (rapier2d) and
 # PLIRON_TAILREC=0 (literate-eval) this way; from dsa-snap4 on the eval
 # feature set compiles with no knob, so the default is no fallback.
@@ -62,8 +79,9 @@
 # (so +-50%), 2026-11-16; each package's BUILDINFO has its own numbers:
 #   llvm    cold (host deps included)  306 s at -j 3;  no-op rebuild 1-2 s;
 #           default features, cold     269 s at -j 5
-#   pliron  wasm32 half wiped, host deps kept ("warm", what every rebuild
-#           does)                      218-440 s at -j 3, 288 s at -j 4
+#   pliron  wasm32 half rebuilt, host deps kept ("warm", what a rebuild with
+#           a changed backend or knob does)
+#                                      218-440 s at -j 3, 288 s at -j 4
 #           cold adds the host proc macros/build scripts, about 1 min.
 #   Peak rustc footprint under pliron is 4-7 GB for the big crates
 #   (loro-internal 4.1 GB, literate-eval 5.5 GB, polars-core 6.8 GB):
@@ -90,9 +108,10 @@ log=$DSA_BENCH/logs/$tag.log
 rm -f "$DSA_BENCH/logs/$tag.exit"
 trap 'echo $? > "$DSA_BENCH/logs/$tag.exit"' EXIT
 
-# The global ~/.cargo/config.toml sets rustc-wrapper = "sccache", which
-# returns stale objects for this backend: an empty RUSTC_WRAPPER turns it off.
-export RUSTC_WRAPPER= GIT_OPTIONAL_LOCKS=0 RUSTC_ICE=$DSA_BENCH/ices
+# The global ~/.cargo/config.toml sets rustc-wrapper = "sccache". An empty
+# RUSTC_WRAPPER turns it off so the build time is a compile time, on both
+# sides; DSA_RUSTC_WRAPPER names one to use (safe with the keyed path below).
+export RUSTC_WRAPPER=${DSA_RUSTC_WRAPPER-} GIT_OPTIONAL_LOCKS=0 RUSTC_ICE=$DSA_BENCH/ices
 export CARGO_TARGET_DIR=$target
 
 args=(build --release --locked --target wasm32-unknown-unknown -p literate-wasm -j "$DSA_JOBS")
@@ -108,11 +127,16 @@ case $side in
     PLIRON_WASM_LD=${PLIRON_WASM_LD:-$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld}
     [ -f "$PLIRON_BACKEND" ] || { echo "no backend dylib at $PLIRON_BACKEND" >&2; exit 2; }
     [ -x "$PLIRON_WASM_LD" ] || { echo "no linker at $PLIRON_WASM_LD" >&2; exit 2; }
-    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-Zcodegen-backend=$PLIRON_BACKEND -Clinker=$PLIRON_WASM_LD"
+    if [ "${DSA_WIPE:-0}" = 1 ]; then rm -rf "$target/wasm32-unknown-unknown"; fi
+    # The keyed copy: its path changes when the dylib or a code-affecting
+    # PLIRON_* variable does, and only then. The fallback string is part of
+    # the key because pass 2 compiles under this same path.
+    backend_keyed=$("$ROOT/harness/backend_path.py" --dylib "$PLIRON_BACKEND" \
+      --salt "${DSA_PLIRON_FALLBACK:+fallback:$DSA_PLIRON_FALLBACK}" --gc "$target")
+    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-Zcodegen-backend=$backend_keyed -Clinker=$PLIRON_WASM_LD"
     # std at one codegen unit, as bench/wasm/run.sh builds it (the dsa
     # release profile already says codegen-units = 1 for everything).
     args+=(-Zbuild-std=std,panic_abort --config 'profile.release.package."*".codegen-units=1')
-    if [ "${DSA_KEEP:-0}" != 1 ]; then rm -rf "$target/wasm32-unknown-unknown"; fi
     ;;
   *) echo "usage: build.sh llvm|pliron [NAME]" >&2; exit 2 ;;
 esac
@@ -130,6 +154,8 @@ run_cargo() { # run_cargo EXTRA_CARGO_ARGS... ; sets rc
   while :; do
     n=$((n + 1)); attempts=$((attempts + 1))
     mark=$(wc -l < "$log")
+    # Still in use: the helper prunes keyed copies by last use.
+    [ -z "${backend_keyed:-}" ] || touch "$(dirname "$backend_keyed")"
     set +e
     (cd "$DSA_HOST" && cargo "+$TOOLCHAIN" "${args[@]}" "$@") >> "$log" 2>&1
     rc=$?
@@ -191,9 +217,11 @@ t2=$(date +%s)
   echo "raw_wasm_bytes=$(stat -f %z "$raw")"
   echo "pkg_wasm_bytes=$(stat -f %z "$pkg/literate_wasm_bg.wasm")"
   echo "dsa_head=$(git -C "$DSA_HOST" rev-parse --short=12 HEAD 2>/dev/null || echo ?)"
+  echo "wrapper=${RUSTC_WRAPPER:-<none>}"
   if [ "$side" = pliron ]; then
     echo "backend=$PLIRON_BACKEND"
-    echo "backend_sha256=$(shasum -a 256 "$PLIRON_BACKEND" | cut -d' ' -f1)"
+    echo "backend_keyed=$backend_keyed"
+    echo "backend_sha256=$(shasum -a 256 "$backend_keyed" | cut -d' ' -f1)"
     echo "linker=$PLIRON_WASM_LD"
     echo "env=${pass1_env:-<backend defaults>}"
     echo "fallback_env=${fallback_crates:+$DSA_PLIRON_FALLBACK}"
