@@ -1,0 +1,6 @@
+# The backend dylib and PLIRON_* variables are not part of sccache's key:
+# with a wrapper, a rebuild into the same target dir returns objects
+# compiled by an older backend or other knobs (stale A/B results).
+# An empty value disables a wrapper set in ~/.cargo/config.toml.
+[build]
+rustc-wrapper = ""
