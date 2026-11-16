@@ -1188,7 +1188,13 @@ pub fn run(
     }
     // Local fns with one direct call site and no address use get 10x the limit:
     // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
-    let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    // The mode is `PLIRON_INLINE_ONCE` on every target; unset, small
+    // (wasm) mode reads `PLIRON_INLINE_ONCE_WASM`, and the fallback is
+    // on (`1`) for native and off for wasm.
+    let once_mode = crate::env_get("PLIRON_INLINE_ONCE")
+        .or_else(|| if small { crate::env_get("PLIRON_INLINE_ONCE_WASM") } else { None })
+        .unwrap_or(if small { "0" } else { "1" });
+    let once = !always_only && once_mode != "0";
     // `PLIRON_INLINE_ONCE=2`: the single-caller bonus only for callees
     // without a loop. A loop moved into its caller loses what the callee's
     // signature said about its pointers: hmget's map is a `noalias` param
@@ -1197,7 +1203,22 @@ pub fn run(
     // code the map is an ordinary pointer and the loads stay in the inner
     // loop (wasm kernels hmget +14 points, tokenize +17, sieve +6 with
     // `=1`). Loop-free single-caller bodies carry no such loop.
-    let once_noloop = crate::env_is("PLIRON_INLINE_ONCE", "2");
+    let once_noloop = once_mode == "2";
+    // `PLIRON_INLINE_ONCE=3`: the bonus for loop-free callees as in `=2`,
+    // and for a callee with a loop only into a caller that has no loop
+    // and has taken no such callee yet. One loop nest per function: the
+    // kernel losses are a hot loop joined to another loop's code
+    // (hmget's lookup loop to the map's set-up loop, tokenize's `next`
+    // to its counting loop, sieve's fill to its sieve loop), while the
+    // dsa gains of `=1` over `=2` (pages 3 points, `vm_collections` 8)
+    // come from `from_iter`-style bodies moved into straight-line
+    // callers.
+    // Measured (wasm kernels): tokenize and sieve keep their numbers,
+    // hashmap and sortw gain 2-3 points, hmget still goes +5.6% -> +19%:
+    // `hmget::setup` moves into the loop-free `k_hmget`, where the map
+    // is a local that escapes to calls instead of a `noalias` out
+    // parameter.
+    let once_oneloop = once_mode == "3";
     // `PLIRON_INLINE_FANIN=<m>` (0 = off; default 8 via DEFAULT_VALUES):
     // a callee is inlined at a plain site only while `its size x its
     // remaining call sites <= m x the site's threshold` — a fat helper
@@ -1441,7 +1462,10 @@ pub fn run(
     // repeat: `Matrix::defaulted` (732 bytes under LLVM) took 317 of them
     // and stopped at the 20,000-op caller cap, 721 KB. One level of a
     // foreign recursion is what the original site asked for.
-    let recx = crate::env_is("PLIRON_INLINE_RECX", "1");
+    // `PLIRON_INLINE_RECX_WASM=1` is the same switch for small (wasm)
+    // mode only; `PLIRON_INLINE_RECX=0` turns both off.
+    let recx = crate::env_is("PLIRON_INLINE_RECX", "1")
+        || (small && crate::env_is("PLIRON_INLINE_RECX_WASM", "1") && !crate::env_is("PLIRON_INLINE_RECX", "0"));
     let op_scc: FxHashMap<Ptr<Operation>, u32> = if recx {
         scc.iter().filter_map(|(name, &c)| st.funcs.get(name).map(|f| (f.op, c))).collect()
     } else {
@@ -1558,6 +1582,9 @@ pub fn run(
         let mut blklist = blocks(ctx, caller);
         let mut pending: crate::helpers::SparseMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
             Default::default();
+        // `PLIRON_INLINE_ONCE=3`: this caller already took a single-caller
+        // callee that has a loop.
+        let mut took_loop = false;
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut lean_add: Vec<[usize; 3]> = Vec::new();
@@ -1671,7 +1698,15 @@ pub fn run(
                             && !(once_noloop
                                 && *has_loop
                                     .entry(cs.clone())
-                                    .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty())));
+                                    .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty()))
+                            && !(once_oneloop
+                                && *has_loop
+                                    .entry(cs.clone())
+                                    .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty())
+                                && (took_loop
+                                    || !loops
+                                        .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                                        .is_empty())));
                     // `PLIRON_INLINE_WASM_COLD=<n>` (small mode only; unset =
                     // `limit`): flat non-loop threshold. Loop-site `hot`x still
                     // uses `limit` so `hash_one` (~926) keeps inlining at
@@ -2030,6 +2065,9 @@ pub fn run(
                         }
                         if once1 && free && !f.always_inline {
                             free_used.insert(cs.clone());
+                        }
+                        if once_oneloop && free && has_loop.get(cs.as_str()).copied().unwrap_or(false) {
+                            took_loop = true;
                         }
                         if dupcost {
                             *copies.entry(cs.clone()).or_default() += 1;
