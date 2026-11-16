@@ -1261,6 +1261,15 @@ pub(crate) fn iropt_head(
     if env_is("PLIRON_DEADARG", "1") {
         pt!(prof, cgu, "deadarg", abi::dead_args(ctx, st));
     }
+    // `PLIRON_PHISIMP_EARLY=1` (opt-in): phisimp once before the passes
+    // that pattern-match on constants. The inliner binds a callee's
+    // parameters through block arguments, so until phisimp (five passes
+    // further down) an inlined constant argument is not a constant to
+    // instcombine, memcpyopt, constcopy or sroa-fwd.
+    if pass_enabled("PLIRON_PHISIMP") && env_is("PLIRON_PHISIMP_EARLY", "1") {
+        pt!(prof, cgu, "phisimp0", phisimp::run(ctx, st));
+        pt!(prof, cgu, "domcheck:ps0", domcheck::run(ctx, st, "phisimp0"));
+    }
     if pass_enabled("PLIRON_INSTCOMBINE") {
         pt!(prof, cgu, "instcombine", instcombine::run(ctx, st));
         pt!(
