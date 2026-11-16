@@ -136,7 +136,14 @@ def corpus_job(dirname, full=False):
     # The verifier after every step: a step that leaves invalid IR which a
     # later step happens to clean up is otherwise invisible to a replay
     # (webmerge on a dead self-loop, found compiling cranelift-codegen).
-    res = run(name, [CLIF_CHECK, "report", src, out, "--check", "--every", str(every)], {"PLIRON_VERIFY": "full"})
+    env = {"PLIRON_VERIFY": "full"}
+    # A corpus recorded from a wasm32 build (`PLIRON_CORPUS=<dir>` on
+    # harness/v8/variant.sh or harness/dsa/build.sh) has i32 pointers and
+    # went through the wasm step list: name its directory `wasm-*` and it
+    # is replayed that way. Replayed as native code every function panics.
+    if dirname.startswith("wasm"):
+        env["PLIRON_CLIF_WASM"] = "1"
+    res = run(name, [CLIF_CHECK, "report", src, out, "--check", "--every", str(every)], env)
     known = set()
     if os.path.exists(KNOWN):
         known = {l.split("#")[0].strip() for l in open(KNOWN)} - {""}

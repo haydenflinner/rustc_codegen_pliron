@@ -33,3 +33,6 @@ std/_RNvMsa_NtNtNtNtCsezvQIlbnYx8_3std3sys3net10connection6socketNtB5_9UdpSocket
 std/_RNvMsi_NtNtNtCsezvQIlbnYx8_3std3sys2fs4unixNtB5_4File9duplicate.6042.clif # slotmerge undef-byte reshuffle: calls+writes identical, only unstored return-slot bytes differ
 std/_RNvNtNtNtCsezvQIlbnYx8_3std2os4unix2io7null_fd.3594.clif # slotmerge undef-byte reshuffle: calls+writes identical, only unstored return-slot bytes differ
 std/_RNvXs2_NtNtCsiB6YHcUgcdd_4core3net6parserNtNtB7_7ip_addr8Ipv4AddrNtNtNtB9_3str6.970.clif # slotmerge undef-byte reshuffle: calls+writes identical, only unstored return-slot bytes differ
+wasm-bench/_RNvMs4_NtNtNtCs9LuVBnccpQe_6object4read2pe6importNtB5_20DelayLoadImportTable9hi_b76b0b17.47.clif # padding bytes of a 16-byte copy out of a partly written slot (wasm replay): calls and stored fields identical
+wasm-bench/_RNvMsP_CsiLfffeZKlCi_10proc_macroNtB5_7Literal12f32_suffixed.146.clif # padding bytes of a 16-byte copy out of a partly written slot (wasm replay): calls and stored fields identical
+wasm-bench/_RNvMsP_CsiLfffeZKlCi_10proc_macroNtB5_7Literal14f32_unsuffixed.160.clif # padding bytes of a 16-byte copy out of a partly written slot (wasm replay): calls and stored fields identical
