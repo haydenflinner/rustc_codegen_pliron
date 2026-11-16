@@ -707,6 +707,11 @@ fn const_syms<'a>(st: &'a State, v: Value, out: &mut FxHashSet<&'a str>) {
     }
 }
 
+/// The wasm default of one verifier run after the pipeline
+/// (`PLIRON_VERIFY=0` off). See the check in `run_job`.
+static WASM_VERIFY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| crate::env_get("PLIRON_VERIFY").as_deref() != Some("0"));
+
 /// Read-only inputs shared by every job in phase (B). Fully owned
 /// (`'static`): the global fn pool drains jobs from all live CGUs, so
 /// nothing may borrow the producing CGU's stack.
@@ -1058,9 +1063,24 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         if crate::env_get("PLIRON_VCODE").is_some_and(|f| n.contains(f)) {
             clctx.set_disasm(true);
         }
-        if sh.verify_env
+        // wasm: the verifier runs once after the pipeline by default.
+        // A native build hands the function to Cranelift, whose
+        // lowering and register allocator reject (most) invalid IR; the
+        // wasm emitter takes it as it is, so a pass that left a use of
+        // a non-dominating value produced a module that read a local
+        // its path never wrote (esplit in loro's movable_list_state,
+        // found 2026-11-16). No snapshot is kept for this default: the
+        // panic says to rerun with `PLIRON_VERIFY=full` for the step.
+        // `PLIRON_VERIFY=0` turns it off.
+        let verify_end = sh.verify_env || (sh.wasm && *WASM_VERIFY);
+        if verify_end
             && let Err(e) = cranelift_codegen::verify_function(&clctx.func, sh.isa.flags())
         {
+            if !sh.verify_env {
+                panic!(
+                    "pipeline broke `{n}` (rerun with PLIRON_VERIFY=full to name the step): {e}"
+                );
+            }
             if !verify_full && let Some(snap) = &snapshot {
                 // Which pass broke it is unknown until the per-pass
                 // checks run — restore and re-run them.

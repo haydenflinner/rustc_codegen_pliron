@@ -338,6 +338,8 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_OPT_BISECT=N`, `PLIRON_OPT_BISECT_DEBUG=1` — transform budget.
 - `PLIRON_PAR=0|N` — lowering threads.
 - `PLIRON_VERIFY=1|full` — Cranelift verifier after the pipeline / each step.
+  On wasm the verifier runs once after the pipeline by default (nothing
+  after the pipeline would reject invalid IR there); `PLIRON_VERIFY=0` off.
 - `PLIRON_RA_EXPLAIN=<symbol substring>` — regalloc2's decisions for
   matching functions (`ra2x:` lines: splits, evictions, weights, loop
   depth, minimal-bundle fallbacks) plus their pre-regalloc VCode, on
