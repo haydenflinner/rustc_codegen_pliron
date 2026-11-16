@@ -67,6 +67,8 @@ Running log. Newest decisions that want a second look are under
    `FnHeader::clone` recursion. Both survive `PLIRON_WASM_PEEP=0`.
    yaml-rust (default features only) also fails the verifier.
    No dsa benchmark number exists until the module runs.
+   **06:20 update: both are fixed, see "dsa, 06:20" at the end.** Each
+   was one root cause, neither in the pass the bisects first pointed at.
 7. **The default-features dsa build needs 5-7 GB per rustc under
    pliron** (polars-core 6.8 GB, typst-library 5.9 GB, vortex-array
    5.7 GB when `earlyoom` killed them). At `-j 5` that pushed the
@@ -193,3 +195,66 @@ sandbox in diffcheck, the default end-of-pipeline verifier on wasm,
 and `run_straight` for wpeep. Still uncovered: the pliron-IR passes
 (sroa, inline, IPO summaries) and the waffle stages have no
 differential check at all, and that is where the open dsa bugs are.
+
+## dsa, 06:20: the two runtime miscompiles
+
+Both were found by bisecting to a function and then reading the
+function, and in both the pass the bisect named was innocent.
+
+1. **Interpreter recursion (`Ty::clone` forever): IR `memcpyopt`,
+   exposed by `slotmerge`.** `PLIRON_OPT_BISECT` named `slotmerge` in
+   mimas-library's `install_assoc`; `PLIRON_SM_FLOWIV=0` and
+   `PLIRON_SLOTMERGE_MARK=0` each hid it. slotmerge had put a 36-byte
+   temporary on top of bytes 12..24 of a 188-byte struct that held a
+   live `Vec` header, because the struct's `lifetime.start` marker sat
+   *after* the stores that built the header. The marker was right when
+   rustc emitted it: `memcpyopt::try_forward` had rebased a temp's
+   writers onto the destination (deleting `memcpy(dst+12, tmp)`) and
+   left `dst`'s marker between the moved writes and their read.
+   slotmerge's `stale_markers` check is meant to catch that, but any
+   later partial write of the slot clears its "dead" state, so a slot
+   that is written in pieces is never caught. Fix (`7ee65e8`): the
+   forward walks back from the copy and the temp's readers, cutting at
+   writers; a `dst` marker on the way drops `dst`'s markers. Unit tests
+   in `memcpyopt.rs`. *Iffy:* dropping all of `dst`'s markers costs
+   slot sharing for that slot; moving the start marker up to the first
+   writer would keep it. Not measured.
+2. **Loro panics and the postcard varint error: the wasm emitter's
+   i128 `>=`.** `src/wasm.rs::icmp128` compared the high words with
+   `>=` in its `uge`/`sge` arm, so `a >= b` was true whenever the high
+   words were equal — any `u128`/`i128` `>=` on wasm, since the emitter
+   was written. rustc mostly emits `<`, which is why it survived:
+   `looprot` inverted an exit test in serde_columnar's
+   `AnyRleEncoder<i128>::flush_lit_run` (a LEB128 writer) and the loop
+   stopped seeing its last byte. The stage table had said "one bug
+   needs sroa, one needs the CLIF pipeline, either alone breaks it":
+   both were this, reached through different inlining. Fix `716d8ff`;
+   the wasm smoke module now checks all eight ordered compares and 26
+   other i128 operations against BigInt (`cmp128`, `ops128`: all pass
+   after the fix).
+
+How they were found, for next time:
+
+- `PLIRON_STEP_FNS=<step>=<lo>..<hi>` (new, `9e8c208`): one CLIF step
+  only in a hash range of functions, the rest of the build untouched
+  and parallel. 18 probes of 45 s named one function out of 33,000 in
+  loro-internal. `fnbisect.py` could not: with nothing optimized the
+  module fails differently.
+- With `PLIRON_WASM_INLINE=0` the function stays whole, so `wasm2wat`
+  of a good and a bad build differ in exactly one body. Reading that
+  body found the compare in two minutes; the CLIF before and after
+  `looprot` was correct, which is what said to look below CLIF.
+- **Not a miscompile:** with `PLIRON_WASM_INLINE=0 PLIRON_WASM_BASICOPT=0
+  PLIRON_WASM_PEEP=0` together the emitter cannot emit some bodies and
+  stubs them (`pliron-wasm: loro_internal: 592/7416 functions stubbed`
+  in the cargo log); a stub traps. The earlier "third bug with all
+  wasm stages off" was that. A stubbed function is a silent runtime
+  trap: the count should be an error unless asked for.
+- The gate now replays `target/corpus/wasm-*` as wasm (`76b33be`).
+  Before, a wasm corpus in `target/corpus/` made the gate red (every
+  function panics as native code).
+
+Both bugs sit in the two places the 05:20 note called uncovered: a
+pliron-IR pass and the CLIF-to-wasm emitter. Neither has a
+differential check. See "Architecture" in the summary for what I
+would build.
