@@ -5701,6 +5701,16 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
         order.push(ni);
         Some(func.dfg.first_result(ni))
     };
+    // A key's constant is the sum the scan accumulated in an i64; an
+    // `iconst` narrower than that must carry it reduced to its width
+    // (`p - 8 + 16` on i32 pointers summed to 0x1_0000_0008: "constant
+    // immediate is out of bounds", a compiler panic on a wasm build).
+    let fit = |ty: Type, k: i64| -> i64 {
+        match ty.bits() {
+            b if b < 64 => k & ((1i64 << b) - 1),
+            _ => k,
+        }
+    };
     match key {
         Key::V(w) => Some(*w),
         // `P`/`Q` must be gone by here — `resolve_p` ran at scan time;
@@ -5713,7 +5723,7 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
             order,
             InstructionData::UnaryImm {
                 opcode: Opcode::Iconst,
-                imm: cranelift_codegen::ir::immediates::Imm64::new(*bits),
+                imm: cranelift_codegen::ir::immediates::Imm64::new(fit(*ty, *bits)),
             },
             *ty,
         ),
@@ -5724,7 +5734,7 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
                 order,
                 InstructionData::UnaryImm {
                     opcode: Opcode::Iconst,
-                    imm: cranelift_codegen::ir::immediates::Imm64::new(*k),
+                    imm: cranelift_codegen::ir::immediates::Imm64::new(fit(*ty, *k)),
                 },
                 *ty,
             )?;
@@ -12216,6 +12226,34 @@ pub fn memcall(func: &mut Function) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// `emit_key` reduces a key's constant to the width of the `iconst` it
+    /// emits: the sum is kept in an i64 and can exceed an i32's range.
+    #[test]
+    fn emit_key_constants_fit_their_type() {
+        use crate::proots::Key;
+        use cranelift_codegen::ir::{Signature, UserFuncName};
+        use cranelift_codegen::isa::CallConv;
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I32));
+        sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I32));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let v0 = func.dfg.append_block_param(b0, types::I32);
+        let mut order = Vec::new();
+        let key = Key::A(types::I32, std::rc::Rc::new(Key::V(v0)), 0x1_0000_0008);
+        let r = emit_key(&mut func, &mut order, &key).unwrap();
+        for i in order {
+            func.layout.append_inst(i, b0);
+        }
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        cur.ins().return_(&[r]);
+        let mut b = cranelift_codegen::settings::builder();
+        cranelift_codegen::settings::Configurable::enable(&mut b, "enable_verifier").unwrap();
+        cranelift_codegen::verifier::verify_function(&func, &cranelift_codegen::settings::Flags::new(b))
+            .unwrap_or_else(|e| panic!("{e}\n{}", func.display()));
+    }
+
     use super::*;
     use cranelift_codegen::ir::{AbiParam, ExtFuncData, MemFlagsData, Signature, UserFuncName};
     use cranelift_codegen::isa::CallConv;
