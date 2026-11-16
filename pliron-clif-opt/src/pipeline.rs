@@ -4552,6 +4552,21 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_armhoist(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !p.wasm {
+        return 0;
+    }
+    let k = {
+        let CfgDtLa { cfg, la, .. } = an.cfg_dt_la(&p.clctx.func);
+        crate::armhoist::run(&mut p.clctx.func, cfg, la)
+    };
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("armhoist");
+    }
+    k
+}
+
 fn s_vrp2(p: &mut Pipe, an: &mut Analysis) -> usize {
     if !p.wasm {
         return 0;
@@ -5647,6 +5662,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `length - 1`). After the sinks, so nothing puts the
         // increment back. Opt-in: native was not timed.
         step("tripfold", "tripfold", Gate::OptIn("PLIRON_TRIPFOLD"), s_tripfold).needs(shape::LOOPS),
+        // After every placement pass (the egraph elaborates a pure value
+        // into the only arm that uses it): an arm holding one cheap
+        // instruction gives it to the branch block and is move-only
+        // again. Wasm only, opt-in: `PLIRON_ARMHOIST=1`.
+        step("armhoist", "armhoist", Gate::OptIn("PLIRON_ARMHOIST"), s_armhoist).needs(shape::CONDBR),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

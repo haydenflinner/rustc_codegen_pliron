@@ -5,6 +5,7 @@
 //! host `.clif` filetests and differential tests without relinking the
 //! backend dylib.
 
+pub mod armhoist;
 pub mod armmerge;
 pub mod scev;
 pub mod brhint;

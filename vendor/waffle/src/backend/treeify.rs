@@ -155,7 +155,23 @@ impl Trees {
         if !std::env::var_os("PLIRON_WTREEREMAT").is_some_and(|v| v == "0") {
             let mut inst_uses = vec![0u32; body.values.len()];
             let mut term_uses = vec![0u32; body.values.len()];
-            for block in body.blocks.values() {
+            // PLIRON: values passed to a target of a conditional branch
+            // (`CondBr`/`Select` target args, not the condition). A remat
+            // there turns an arm that only moves values — which an
+            // engine compiles as a branch straight to the join — into an
+            // arm with code and a jump of its own (tokenize's ASCII arm,
+            // `next = p + 1`: V8 `tbnz; add; b join` instead of `tbz
+            // join`, ~3% of the kernel). `PLIRON_WTREEREMAT_CONDARG=0`
+            // keeps such a value where the pipeline placed it. An edge
+            // that leaves a loop of the branch block still remats: there
+            // the edge is the cheaper place (matmul's `i + 1` and row
+            // step, used only once the inner loop is done, would run on
+            // every inner trip). Back edges remat too.
+            let keep_condarg =
+                std::env::var_os("PLIRON_WTREEREMAT_CONDARG").is_some_and(|v| v == "0");
+            let cond_nest = keep_condarg.then(|| LoopNest::compute(cfg));
+            let mut cond_arg = vec![false; body.values.len()];
+            for (src, block) in body.blocks.entries() {
                 for &iv in &block.insts {
                     if let &ValueDef::Operator(_, args, _) = &body.values[iv] {
                         for &a in &body.arg_pool[args] {
@@ -172,6 +188,33 @@ impl Trees {
                         *slot = slot.saturating_add(1);
                     }
                 });
+                if let Some(nest) = &cond_nest {
+                    let mut mark = |t: &crate::ir::BlockTarget| {
+                        // Loop exits and back edges keep the remat (the
+                        // latch's `i + 1` on the back edge measured 2%
+                        // better on matmul than ahead of the test).
+                        if !nest.encloses(t.block, src) || cfg.dominates(t.block, src) {
+                            return;
+                        }
+                        for &a in &t.args {
+                            let a = body.resolve_alias(a);
+                            if let Some(slot) = cond_arg.get_mut(a.index()) {
+                                *slot = true;
+                            }
+                        }
+                    };
+                    match &block.terminator {
+                        crate::ir::Terminator::CondBr { if_true, if_false, .. } => {
+                            mark(if_true);
+                            mark(if_false);
+                        }
+                        crate::ir::Terminator::Select { targets, default, .. } => {
+                            targets.iter().for_each(&mut mark);
+                            mark(default);
+                        }
+                        _ => {}
+                    }
+                }
             }
             let unary_ok = !std::env::var_os("PLIRON_WTREEREMAT_UNARY")
                 .is_some_and(|x| x == "0");
@@ -188,9 +231,12 @@ impl Trees {
                 if tys.len() != 1 || !op.is_pure() || total == 0 {
                     continue;
                 }
-                // Single edge-only use: always remat.
+                // Single edge-only use: remat, unless it is an arm's
+                // argument (see `keep_condarg`).
                 if iu == 0 && tu == 1 {
-                    remat.insert(v);
+                    if !cond_arg[v.index()] {
+                        remat.insert(v);
+                    }
                     continue;
                 }
                 // Cheap unary, ≤2 uses total.
