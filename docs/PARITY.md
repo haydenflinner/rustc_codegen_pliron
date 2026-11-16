@@ -143,42 +143,56 @@ features `eval,squish,cad`, never tuned on before 2026-11-16.
 `harness/dsa/build.sh {llvm,pliron} NAME` then `node
 harness/dsa/bench.mjs --llvm=DIR --pliron=DIR` (results are
 cross-checked; a mismatch is reported and left out of the geomean).
-2026-11-16, main at `532caf8` (remeasured within a point at `d166d97`),
-pliron/LLVM, median of 9 rounds; all 19 workloads return LLVM's
-results:
+2026-11-16, main at `bbd0cc5`, pliron/LLVM, median of 9 rounds on a
+quiet machine, both packages built from the same dsa HEAD; all 19
+workloads return LLVM's results:
 
 | workload | pliron/LLVM | | workload | pliron/LLVM |
 |---|---|---|---|---|
-| vm_loop | 1.04 | | compile_page | 1.02 |
-| vm_fib_rec | 0.97 | | checks_page | 1.02 |
-| vm_mandelbrot | 1.08 | | live_page | 1.02 |
-| vm_physics | 0.99 | | dims_page | 1.22 |
-| vm_sieve | 1.01 | | game_tetris | 0.78 |
-| vm_collections | 0.97 | | game_asteroids | 1.31 |
-| vm_strings | 1.05 | | crdt_edits | 0.50 * |
-| vm_match | 1.01 | | crdt_sync | 0.52 * |
-| vm_closures | 1.02 | | ink_strokes | 0.38 * |
-| hash_text | 1.18 ** | | | |
+| vm_loop | 1.08 | | compile_page | 1.02 |
+| vm_fib_rec | 0.98 | | checks_page | 1.02 |
+| vm_mandelbrot | 1.11 | | live_page | 1.02 |
+| vm_physics | 0.99 | | dims_page | 1.25 |
+| vm_sieve | 1.02 | | game_asteroids | 1.41 |
+| vm_collections | 0.96 | | game_tetris | 0.97 * |
+| vm_strings | 1.07 | | crdt_edits | 0.48 * |
+| vm_match | 1.01 | | crdt_sync | 0.50 * |
+| vm_closures | 1.00 | | ink_strokes | 0.35 * |
+| hash_text | 0.99 ** | | | |
 
-\* not like for like: rust-lld's export wrappers rerun every static
-constructor on each call into the LLVM module; ours run them once.
-\*\* a harness artifact (62% of it is JS copying the string in; run
-alone the two modules take 81.3 and 82.0 ms). The fifteen other
-comparable rows are geomean **1.03**. At the first run that morning
-nine workloads failed or returned wrong results and the interpreter
-rows were 1.17 to 1.56.
+\* not like for like: a no-op export costs 11.4 us in the LLVM module
+(rust-lld's export wrappers rerun every static constructor on each
+call) and 9 ns in ours; that is 16% of LLVM's `game_tetris`, 30% of
+`crdt_edits`, 22% of `crdt_sync` and 49% of `ink_strokes`
+(`bench.mjs` measures it and marks the rows).
+\*\* 63% of a call is JS; the row reads 1.18 for whichever module is
+loaded third.
+The fourteen like-for-like rows (vm, pages, asteroids) are geomean
+**1.06**. (The morning's table had `game_tetris` at 0.78 and the
+comparable rows at 1.03: its LLVM package was built from an older dsa
+HEAD.)
 
-Open on this program: **code size 49.4 MB against LLVM's 18.4 MB**
-(35,000 functions against 19,544; LLVM inlines and deletes
-single-caller instances such as each `collect()`'s `from_iter`, we
-keep 1,225 of those; `PLIRON_INLINE_ONCE=1` does that on wasm and is
-2-3% faster on the page rows but 14-17 points slower on the `hmget`
-and `tokenize` kernels, so it is not on), `game_asteroids` (rapier2d's
-soft-FEM assembly and solve), `dims_page` (diffuse), **the module
-built with `PLIRON_OPT_BISECT=0` is wrong** (two mismatches, a failed
-game, a mutex panic: the all-passes-off path, not looked at), and compile
-memory (the default feature set with polars and typst needs 5-7 GB
-per rustc and was not built).
+Open on this program:
+- **Single-caller inlining**, the largest known lever: with
+  `PLIRON_INLINE_ONCE=1` the fourteen rows are **1.025** (pages 0.98 to
+  0.99, `vm_collections` 0.88), but the wasm kernels `hmget` and
+  `tokenize` lose 13 and 17 points. The restricted modes: `=2`
+  (loop-free callees) keeps every kernel and gets 1.056; `=3` (one loop
+  nest per function) keeps tokenize, loses hmget, and **its dsa build
+  corrupts the heap** (being bisected). The root of the hmget loss is
+  that a local whose address goes to calls is treated worse than the
+  `noalias` out parameter it was before inlining.
+- **Code size 45.2 MB against LLVM's 18.4 MB** (49.8 before the
+  recursion rule `PLIRON_INLINE_RECX_WASM`, default since `bbd0cc5`;
+  35,550 functions against 19,544). Largest single functions:
+  `Compiler::compile` 305 KB (LLVM 74 KB), `Search::go_explore` 276 KB.
+- `game_asteroids` (rapier2d's soft-FEM assembly and solve) and
+  `dims_page` (diffuse).
+- Compile memory: the default feature set with polars and typst needs
+  5-7 GB per rustc and was not built.
+
+The module built with `PLIRON_OPT_BISECT=0` returns LLVM's results too
+since `5d703d0` (two bugs in stages that run with every pass off).
 `docs/history/2026-11-16-wasm-night.md` has the five bugs this program
 found and what moved the numbers.
 
