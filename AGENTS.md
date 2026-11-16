@@ -423,9 +423,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   forward their `store tmp; memcpy(sret, tmp)`), and
   `constload::forward_copies` runs again after phisimp.
   `PLIRON_WASM_SMALLCOPY=1` (opt-in): the wasm emitter expands constant
-  copies of at most 16 bytes instead of emitting `memory.copy`. **Not
-  safe yet**: under `PLIRON_OPT_BISECT=0` it corrupts a 2-byte copy
-  (dsa `vm_strings`); find that before using it.
+  copies of at most 16 bytes instead of emitting `memory.copy`. (The
+  corruption once blamed on it was a waffle rematerialization bug,
+  fixed in `5d703d0`.)
+- 2026-11-16 afternoon, each opt-in
+  (`docs/history/2026-11-16-wasm-night.md`, "Afternoon"):
+  `PLIRON_INLINE_ONCE=2` (wasm: the single-caller bonus for loop-free
+  callees only; `=1` moves loops into their callers and costs hmget,
+  tokenize and sieve), `PLIRON_INLINE_RECX=1` (a site cloned out of an
+  inlined body does not inline a member of a call-graph cycle its
+  clone chain already entered: derived `Clone` of a recursive AST),
+  `PLIRON_LICM_SLOTPROV=1` (a stack slot indexed by a loop counter is
+  still an object of its own for licm's clobber test,
+  `pliron-clif-opt/src/slotprov.rs`), `PLIRON_PHISIMP_EARLY=1` (phisimp
+  once before instcombine), `PLIRON_MEMCPYOPT_MOVEMARK=1` (a forward
+  moves `dst`'s `lifetime.start` ahead of its writers instead of
+  dropping `dst`'s markers).
 - `PLIRON_SROA_FRAGWORD=<bytes>` — the word size `PLIRON_SROA_FRAGCOPY`
   counts in; default the pointer width (4 on wasm32 since 2026-11-16,
   `=8` restores the old rule there; native is 8).

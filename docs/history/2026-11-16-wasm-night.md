@@ -111,7 +111,13 @@ Running log. Newest decisions that want a second look are under
 14. **`harness/dsa/workloads/` is uncommitted** because this fork is
     public and those files are copies of dsa page sources. The harness
     needs them to run from a fresh clone. Your call.
-15. **`PLIRON_WASM_SMALLCOPY` was on by default for 2h20 with a bug in
+15. **Superseded (afternoon): SMALLCOPY was not the cause, and the
+    unoptimized build is fixed.** See "Afternoon" at the end: two bugs
+    in stages that run with every optimization off (a wpeep forward
+    and a waffle rematerialization), both fixed with tests; the module
+    built with `PLIRON_OPT_BISECT=0` now returns LLVM's results on all
+    19 workloads. The original entry follows.
+    **`PLIRON_WASM_SMALLCOPY` was on by default for 2h20 with a bug in
     it, and the unoptimized build of dsa is wrong in three more ways.**
     At 09:15 I built the module with `PLIRON_OPT_BISECT=0` on the
     final backend to close the "does it work with optimizations off"
@@ -619,3 +625,190 @@ Final table on `d166d97` (SMALLCOPY off again), `pkg-pliron-final3`: all
 19 workloads equal; the rows are those of the 08:40 table within a
 point (vm 0.96..1.07, pages 1.02..1.03, dims_page 1.22, tetris 0.75,
 asteroids 1.31).
+
+## Afternoon (10:00 to 15:00): the review list, worked through
+
+Asked for: SMALLCOPY, the unoptimized build first, how single-caller
+inlining slows three kernels and whether the pages gain can be kept
+without that, the eight architecture items, sccache, the size outliers.
+
+### The unoptimized build (fixed), and SMALLCOPY (innocent)
+
+The `PLIRON_OPT_BISECT=0` module was wrong in four workloads. Two bugs,
+both in stages that run with every pass off:
+
+- **wpeep store-to-load forwarding** named a slot by a local that was
+  overwritten between its `local.get` and the `store` (the keep-on-stack
+  shape). `2ba0f69`, test
+  `sfwd_does_not_forward_a_local_overwritten_before_the_store`. Found by
+  `PLIRON_WASM_PEEP_LIMIT` (body 2077 of `literate_wasm`,
+  `debugsession_compileInfo`) and `PLIRON_WASM_SFWD_FWLIM`.
+- **waffle treeify** rematerialized a tree that owned a load, so the
+  load ran again after a store to the same address. `5d703d0`
+  (`validate_load_sinks` now sees the `remat` set).
+
+With both, the unoptimized module returns LLVM's results on all 19
+workloads, with SMALLCOPY on or off: the `vm_strings` garbage blamed on
+SMALLCOPY in item 15 was the treeify bug, whose output depended on what
+the stale load happened to read (the `ob0c` and `ob0d` modules are
+byte-identical where I had said they differed). `tests/wasm/smoke` has a
+third object compiled with `PLIRON_OPT_BISECT=0` now.
+
+### `black_box` was not a barrier on wasm (`90c2c6f`)
+
+Found while reading kernel code for the inlining question: the wasm
+`black_box` was an alloca and a volatile load in the IR, and our own
+CLIF passes folded it (`k_fib`, `k_eqbug` and hmget's loop ran with no
+barrier, so those kernels were flattered). It is the opaque call and the
+CLIF `black_box` op again; the emitter expands it to a store to a frame
+slot of its own and a reload whose alignment hint is below its width,
+which `wpeep` reads as "do not forward". `cse_key` returns `None` for
+the op (dgvn had merged the barriers of unrolled iterations). Honest
+numbers after the fix: eqbug -3.3% to -1.6%, contains_rng -0.6% to
+about +9% (a real gap now: its bounds are no longer constants), the rest
+unchanged; geomean about 0.93.
+
+### sccache and cargo (`e624fb9`, `9202d0f`)
+
+`harness/backend_path.py` prints a private copy of the dylib under
+`target/backends/<key>/`, the key hashing the dylib's contents and the
+code-affecting `PLIRON_*` environment. Passed as `-Zcodegen-backend`,
+that path makes both cargo's fingerprint and sccache's key right, with
+no wipe. The dsa, variant, bench, smoke and crates scripts use it.
+Measured by a sub-agent: sccache 0.19.0 hashes the arguments as text
+and `CARGO_*` only; stale hits without the keyed path, none with it.
+
+### How single-caller inlining slows the three kernels
+
+Measured again on the fixed backend (`PLIRON_INLINE_ONCE=1`, against
+LLVM): hmget +5.0% to +18.8%, tokenize -15.2% to +3.1%, sieve -2.7% to
+-1.1%; hashmap and strwork gain 1.6 and 2.6 points; geomean 0.934 to
+0.955.
+
+- **hmget.** In the separate closure the map is a `noalias` parameter,
+  and licm hoists the five loads of its header (items, the two hash
+  keys, mask, control pointer) on that fact. Inlined into `k_hmget` next
+  to the set-up code the map is `black_box`'s result, an ordinary
+  pointer, and SipHasher's tail buffer is a stack slot that
+  `isolated_escapes` calls escaped because it is read at a variable
+  offset (`buf[i]`). A store to an escaped slot may write anything, so
+  the five loads stay in the inner loop.
+  `PLIRON_LICM_SLOTPROV=1` (`0ec8c12`, opt-in) is the root fix for that
+  half: `slotprov` tracks slots whose address only feeds loads, stores,
+  compares and `iadd`s with an integer that cannot hold an address (one
+  computed from constants and loop counters; CLIF has no
+  `getelementptr`, so `heap.wrapping_add(&local as usize)` has to be
+  excluded this way). Such a slot and a root outside its class are
+  different objects. The loads hoist again: +18.8% to +11.2%. The
+  default build is byte-identical with the knob on; on the dsa corpus it
+  changes two functions' sizes. The remaining 6 points are not explained
+  yet.
+- **tokenize.** `run` is `for _ in 0..10 { n += s.split_whitespace().count() }`.
+  By default the IR inliner leaves the iterator's `next` (one caller,
+  has a loop) out of line, the CLIF pipeline optimizes it alone, and the
+  *waffle* inliner puts it into `run` afterwards. With the bonus the IR
+  inliner merges them first (68 blocks become 225 going into the
+  pipeline) and the pipeline does worse on the merged loop nest (3 loops
+  and no memory traffic instead of 4 loops with the cursor in memory,
+  and 19 points slower). The -15% we hold over LLVM there is a property
+  of the split function; what exactly the merged form loses was not
+  profiled.
+- **sieve.** `sieve::sieve` takes `Vec::from_elem` (1,586 to 1,891 wasm
+  instructions); 1.6 points, not looked at further.
+
+### Keeping the pages gain: `PLIRON_INLINE_ONCE=2` (`fe28de4`, opt-in)
+
+All three losses are a callee *with a loop* moved into its caller before
+the CLIF pipeline. `=2` gives the single-caller bonus to loop-free
+callees only. Kernels: geomean 0.920 against 0.920, hmget, tokenize and
+sieve unchanged. dsa (same LLVM package on both sides of the comparison,
+9 rounds): compile_page 1.026 to 1.011, checks_page 1.011 to 1.002,
+live_page 1.021 to 1.017, game_tetris 0.744 to 0.698, vm_fib_rec 0.984
+to 0.967, the other rows within a point; module 49.81 MB to 48.97 MB;
+all 19 results equal. (The build needed a fix first: `webmerge` wrote a
+key's i64 offset sum into an `iconst.i32` unmasked and the verifier
+rejected `SpecFromIterNested::from_iter` in mimas-vm, `6d4a4d1`.)
+Not flipped: one dsa run on a loaded machine is not enough for a default.
+
+### The benchmark's own checks (item 8, `658b519`)
+
+`bench.mjs` loads a second, instrumented instance of each side and
+reports per row how much of a call is spent outside the module and how
+many times JS enters it; a no-op export is timed alone. Measured:
+
+- a no-op export costs **11.4 us in the LLVM module and 9 ns in ours**
+  (rust-lld's `command_export` wrappers rerun the static constructors
+  on every entry). That is 43% of LLVM's `crdt_edits` and 63% of its
+  `ink_strokes`: those two rows and `crdt_sync` time the wrappers, not
+  generated code.
+- `hash_text` is 63% JS.
+
+Rows like that get a note and a second geomean leaves them out. **The
+headline dsa geomean of about 0.90 is mostly those rows**; without them
+the module is a few percent slower than LLVM's, which is what the vm
+and page rows always said.
+
+### The differential checker on the whole dsa corpus (`9f9fba1`)
+
+The gate replays every 8th function of `wasm-dsa-eval`. All 69,698
+showed 15 interpreter mismatches the sample never met. None was a wrong
+transform; three checker rules were:
+
+- undetermined bytes were compared by address *set* (a write list holds
+  the bytes that differ from the seeded memory, so a padding byte equal
+  to the seed dropped out of one list): 7 functions after slotmerge;
+- NaN sign and payload in memory were compared exactly: 8 functions
+  after `commute` and the egraph;
+- the call stub filled to the end of whatever slot its pointer landed
+  in, so an out-slot merged into a larger slot took a longer fill in the
+  rewritten function only.
+
+A mismatch also prints the determined bytes that differ now. The per-
+address rule is stricter than the old one in one way (a fill-dependent
+write set used to forgive the whole trial) and that exposed 3 more
+functions; with the stub bound, 4 are left on the dsa corpus and 1 on a
+clcg sample, one of them a trap in the rewritten function
+(`robust::incircleadapt`). A sub-agent is on those five.
+
+### wpeep differential (`19d4dd6`..`ed5771f`, sub-agent)
+
+`harness/wasm/peepdiff.mjs` runs every body before and after the
+peepholes in V8 on a `PLIRON_WASM_MODDUMP` dump and compares calls,
+results, traps, memory and globals; fuel instead of a deadline, typed
+stubs for indirect calls, aliasing pointer inputs. With each of the
+three wpeep bugs of this session put back it names the function of the
+original report; on the fixed backend it is clean on 68,555 dsa bodies
+and on the unoptimized build. It is a leg of `tests/wasm/smoke.sh`.
+Block coverage is 27% on dsa, so a clean run is not a proof.
+
+### Smaller items
+
+- `PLIRON_PHISIMP_EARLY=1` (`f80753a`, opt-in): phisimp before
+  instcombine, for inlined constant arguments (item 4). Kernel module
+  180,013 to 179,793 bytes; not timed.
+- `PLIRON_MEMCPYOPT_MOVEMARK=1` (`92d914a`, opt-in): a forward whose
+  writers land ahead of `lifetime.start(dst)` moves the marker ahead of
+  the first writer when everything is in one block and nothing touches
+  `dst` on the way, instead of dropping all of `dst`'s markers (items 2
+  and 6).
+- A source lint against literal `types::I64` addresses in CLIF passes,
+  and emitter asserts for `func_addr`/`symbol_value` (item 3, `2371f52`).
+- `PLIRON_INLINE_RECX=1` (opt-in, in progress): see the next section.
+
+### The size outliers
+
+`Matrix::defaulted` is 732 bytes under LLVM and 721 KB under pliron.
+The inliner's trace for it (`PLIRON_TRACE=pliron::inline=debug` on a
+rebuild of `mimas-solve`): 317 accepted sites, 664 "recursive"
+rejections, 126 "cap". Its body calls `rest.to_vec()` on a slice of AST
+patterns, and the derived `Clone` of the AST is a call-graph cycle of
+dozens of functions (`ExprKind::clone`, `Box<Expr>::clone`,
+`to_vec::<Expr>`, `to_vec::<Stmt>`, ...), each under the 512-op limit.
+The inline history stops the *same* function twice on one chain; a
+caller outside the cycle still unrolls the cycle along every path
+without a repeat, until the 20,000-op caller cap. LLVM never starts:
+its cost counts 25 per call, so a clone with a dozen calls is over the
+225 threshold. `PLIRON_INLINE_RECX=1`: a site cloned out of an inlined
+body may not inline a member of a cycle its chain has already entered.
+The kernel module is byte-identical with it on.
+
