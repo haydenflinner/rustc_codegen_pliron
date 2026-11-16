@@ -57,12 +57,15 @@ pub const DEFAULT_ON: &[&str] = &[
     // selected by an inlined callee's constant argument (blake3's
     // `MSG_SCHEDULE[round]` on wasm32: 4990 -> 2342 instructions).
     "PLIRON_CONSTCOPY2",
-    // (`PLIRON_WASM_SMALLCOPY`, the wasm emitter's expansion of constant
-    // copies of at most 16 bytes, was on here from f13cb0d until the same
-    // morning: with `PLIRON_OPT_BISECT=0` it corrupts a 2-byte copy in
-    // itoa (dsa vm_strings prints "6\x04\x000288" for 6570288). No
-    // optimized build showed it, it is not root-caused, and it had no
-    // measured speed effect, so it is opt-in again.)
+    // wasm emitter: constant copies of at most 16 bytes as loads and
+    // stores instead of `memory.copy` (a C++ call in V8). On from f13cb0d,
+    // off the same morning for a corrupted 2-byte copy in the
+    // `PLIRON_OPT_BISECT=0` build that turned out to be waffle
+    // rematerializing a load (5d703d0), on again in the afternoon: the
+    // unoptimized and the optimized dsa modules return LLVM's results on
+    // all 19 workloads with it, vm_mandelbrot and vm_physics are two
+    // points better and the rest equal, the kernel module is identical.
+    "PLIRON_WASM_SMALLCOPY",
     // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
     // test; native was not timed). 2026-11-16, `--layouts=3` against
     // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
