@@ -348,6 +348,11 @@ Tried and not kept:
   caller) lands in the exported function next to its set-up code and
   the same loop runs slower there. That is the thing to understand
   before turning it on; LLVM inlines the same way and does not pay.
+  Limiting it to small callees does not dodge it:
+  `PLIRON_INLINE_ONCE=1 PLIRON_INLINE_FREEMAX=256` leaves hmget and
+  tokenize alone but moves sieve from -3.9% to +2.1% (module -1.0%).
+  In all three the kernel body ends up nested inside the exported
+  function's `repeat` loop instead of being called from it.
 - Folding every GOT `global.get` to `i32.const` in the linker (2404
   globals -> 1, +0.18% size): no change outside noise. V8 handles an
   immutable global as well as a constant here.
