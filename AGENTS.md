@@ -58,7 +58,7 @@ Read it before picking a task.
 | `harness/` | gate, corpus, live dashboard, bisectors, compile-time and disk tools |
 | `bench/` | runtime kernels (benchfmt/benchstat native, `bench/wasm/` node) |
 | `tests/` | `test.sh` programs (one dir per stanza) |
-| `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `seh-design.md` (planned real SEH catch), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
+| `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `backend-path.md` (cargo/sccache and the keyed `-Zcodegen-backend` path), `seh-design.md` (planned real SEH catch), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
 
 `black_box` is a real optimization barrier: a call to a never-defined
 `__pliron_bb*` symbol (opaque to every IR pass) that `lower.rs` turns
@@ -108,8 +108,27 @@ Pinned toolchain `nightly-2026-10-22` (`rust-toolchain.toml`; needs
   Full notes: [`docs/dev-loop.md`](docs/dev-loop.md) "Unit tests on
   save: relax".
 - One file: `rustc -O -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs`
-- cargo does not track the backend dylib or `PLIRON_*` vars: after
-  changing either, use a fresh `CARGO_TARGET_DIR` or `cargo clean -p`.
+- cargo does not track the backend dylib or `PLIRON_*` vars, and neither
+  does sccache (`~/.cargo/config.toml` may set it as `rustc-wrapper`): both
+  see `-Zcodegen-backend=PATH` as a string. For a cargo build through the
+  backend, pass the keyed path:
+  `RUSTFLAGS="-Zcodegen-backend=$(harness/backend_path.py [--gc TARGET_DIR] [K=V ...])"`.
+  It prints `target/backends/<key>/librustc_codegen_pliron.*`, a private
+  copy whose name hashes the dylib's contents and the code-affecting
+  `PLIRON_*` environment, so cargo recompiles exactly when either changed
+  (no wipe, no `cargo clean -p`) and a rustc wrapper cannot return another
+  backend's objects. Rules: run the helper under the same `PLIRON_*` as the
+  build (per-build knobs as `K=V` arguments); every path leaves its own
+  units in a target dir, `--gc` drops the others; reporting-only knobs
+  (`PLIRON_TRACE`, `PLIRON_STATS`, `PLIRON_TIMING`, ..., the `IGNORED` list
+  in the script) are not in the key and do not force a rebuild; crates
+  compiled under two paths do not link together (E0460). With the raw
+  `target/debug/...` path the old rule stands: a fresh `CARGO_TARGET_DIR`
+  or `cargo clean -p` after changing the dylib or a knob, and no rustc
+  wrapper (the repo's `.cargo/config.toml` turns it off for builds started
+  inside the repo; outside it, `RUSTC_WRAPPER=`). Scripts on the keyed
+  path, measurements and what sccache keys on:
+  [`docs/backend-path.md`](docs/backend-path.md).
 
 ## Pick the loop for your task
 
@@ -165,8 +184,10 @@ time, memory, code size, stack frames) in ~20 min and writes
 - **A whole wasm program: `harness/dsa/`.** `build.sh {llvm,pliron}
   NAME` builds `~/code/dsa`'s `literate-wasm` (Loro CRDT, the Mimas
   compiler and interpreter, rapier2d) into `/tmp/dsa-bench/pkg-*`
-  (about 5 min; copy the backend dylib aside and pass
-  `PLIRON_BACKEND=`), `node harness/dsa/bench.mjs --llvm=DIR
+  (about 5 min; the build loads a keyed private copy of the dylib, so
+  the backend can be rebuilt meanwhile, and a rerun with the same dylib
+  and knobs compiles nothing: `DSA_WIPE=1` forces it),
+  `node harness/dsa/bench.mjs --llvm=DIR
   --pliron=DIR [--extra=DIR] [WORKLOAD..]` times 19 workloads
   interleaved and cross-checks every result (a mismatch is a
   miscompile until shown otherwise: five were, 2026-11-16).
@@ -597,5 +618,10 @@ time, memory, code size, stack frames) in ~20 min and writes
 
 - `harness/disk.sh [--sweep|--prune]` — build-dir sizes; drop stale
   build units / scratch `target-*` dirs.
+- `target/backends/` holds the keyed dylib copies of
+  `harness/backend_path.py` (`--list` shows them). Each call keeps the 8
+  most recently used and anything used in the last 2 hours;
+  `harness/backend_path.py --prune --keep N [--min-age 0]` or
+  `disk.sh --sweep` (keeps 2) removes more.
 - Worktrees: reclaim space with `cargo clean` inside one rather than
   `git worktree remove`, which loses uncommitted work.

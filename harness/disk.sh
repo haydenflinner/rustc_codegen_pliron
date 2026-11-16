@@ -14,7 +14,11 @@
 #                              its own fingerprint, so a deleted one that is
 #                              still needed just rebuilds. Dependencies are
 #                              left alone, so the next build stays warm.
-#                              Also runs --objs.
+#                              Also runs --objs and keeps only the two most
+#                              recently used keyed backend copies in
+#                              target/backends, plus any used in the last
+#                              2 hours (harness/backend_path.py prunes to 8
+#                              on its own).
 #   harness/disk.sh --objs     delete stale `*.rcgu.o` (objects older than
 #                              their unit's current library — every
 #                              incremental session leaves its CGU objects
@@ -36,6 +40,7 @@ if [[ "${1:-}" == --sweep ]]; then
   done
   find target/debug/incremental -mindepth 1 -maxdepth 1 -mtime +2 -exec rm -rf {} + 2>/dev/null || true
   harness/objgc.py
+  harness/backend_path.py --prune --keep 2
   echo "after sweep: $(du -sh target | cut -f1) in target/"
 fi
 if [[ "${1:-}" == --objs ]]; then
