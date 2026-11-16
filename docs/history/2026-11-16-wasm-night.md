@@ -995,3 +995,24 @@ Still open from the same reports:
   away), and functions present in both are 1.4x LLVM's size, mostly
   local traffic; edge copies were 2.6 MB of the 22 MB.
 
+### A false alarm, and the harness fix for it
+
+The first default dsa build with `f4cf460` returned a different result
+for `dims_page`, and so did a build with the `memcpyopt` fix switched
+off and one with the new `side_enters` rule switched off. None was a
+miscompile: the dsa repository moved at 17:42 (`239d6cad` to
+`0caf4bb8`, its owner works in it) and the LLVM reference was built at
+12:58. Against an LLVM build of `0caf4bb8` (`pkg-llvm-eval3`) both the
+rule-on and the rule-off modules return LLVM's results on all 19
+workloads. `bench.mjs` had printed a one-line note that the stamps
+differ; it now refuses to cross-check packages whose dsa HEADs differ
+(`--allow-stale` to time them anyway). The rule stays on.
+
+With the rule on, the default dsa module is 35.29 MB of code against
+35.48 (36,024 functions against 35,550: the 132 functions whose shape
+changed are smaller, and the rest of the difference is the source
+change). `Compiler::compile` 305,002 to 48,775 bytes, `go_explore`
+275,735 to 62,863, `plan_full_state_batch` 98,287 to 21,301,
+`grades::check` 68,603 to 25,180: four of the six largest functions
+were this one shape.
+
