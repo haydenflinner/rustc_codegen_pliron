@@ -408,6 +408,73 @@ fn tmp_flow(
     Some((roots, writers, readers, marks))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests turn `PLIRON_MEMCPYOPT_MOVEMARK` on for one case.
+    static TEST_MOVEMARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn movemark() -> bool {
+    #[cfg(test)]
+    if TEST_MOVEMARK.with(|c| c.get()) {
+        return true;
+    }
+    crate::env_is("PLIRON_MEMCPYOPT_MOVEMARK", "1")
+}
+
+/// Move `mk`, a `lifetime.start` of `dbase` that sits between the
+/// forwarded writers and their copy, to just ahead of the first writer.
+/// Only when every writer is in `mk`'s block ahead of it, no operation
+/// from the first writer up to `mk` touches `dbase` (the writers still
+/// address the temp here) or is another of its markers, and `mk`'s
+/// operands are defined ahead of the new place. `false` leaves it alone.
+fn move_start_marker(
+    ctx: &mut Context,
+    st: &State,
+    dbase: Value,
+    size: u64,
+    mk: Ptr<Operation>,
+    wset: &FxHashSet<Ptr<Operation>>,
+    dmarks: &FxHashSet<Ptr<Operation>>,
+) -> bool {
+    if st.intrinsics.get(mk).map(|s| s.as_str()) != Some("llvm.lifetime.start") {
+        return false;
+    }
+    let Some(b) = mk.deref(ctx).get_parent_block() else {
+        return false;
+    };
+    let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+    let Some(mi) = ops.iter().position(|&o| o == mk) else {
+        return false;
+    };
+    let Some(first) = ops[..mi].iter().position(|o| wset.contains(o)) else {
+        return false;
+    };
+    // Every writer is in this block, ahead of the marker.
+    if ops[..mi].iter().filter(|o| wset.contains(o)).count() != wset.len() {
+        return false;
+    }
+    let Some(touch) = base_touches(ctx, st, dbase, size, 0, size) else {
+        return false;
+    };
+    let window: FxHashSet<Ptr<Operation>> = ops[first..mi].iter().copied().collect();
+    if window.iter().any(|o| dmarks.contains(o) || touch.contains_key(o)) {
+        return false;
+    }
+    // An operand computed inside the window would be used before its
+    // definition.
+    let n = mk.deref(ctx).get_num_operands();
+    for k in 0..n {
+        let v = mk.deref(ctx).get_operand(ctx, k);
+        if v.defining_op().is_some_and(|d| window.contains(&d)) {
+            return false;
+        }
+    }
+    mk.unlink(ctx);
+    mk.insert_before(ctx, ops[first]);
+    true
+}
+
 /// Forward `m = memcpy|memmove(dst, tmp, n)` where `tmp` is an `n`-byte
 /// alloca: rebase every `tmp`-rooted pointer to `dbase + doff` and drop
 /// `m`, the temp and its markers. Each writer's bytes then land in `dst`
@@ -922,7 +989,10 @@ fn try_forward(
             let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
                 FxHashSet::default();
             let mut steps = 0usize;
-            let mut hit = false;
+            // Markers met on the way back from a consumer; `over`: the
+            // scan ran out of budget and may have missed some.
+            let mut hits: Vec<Ptr<Operation>> = Vec::new();
+            let mut over = false;
             'scan: while let Some((b, upto)) = stack.pop() {
                 if !seen.insert((b, upto)) {
                     continue;
@@ -934,9 +1004,16 @@ fn try_forward(
                 let mut cut = false;
                 for &o in ops[..end].iter().rev() {
                     steps += 1;
-                    if steps > 8192 || dmarks.contains(&o) {
-                        hit = true;
+                    if steps > 8192 {
+                        over = true;
                         break 'scan;
+                    }
+                    if dmarks.contains(&o) {
+                        if !hits.contains(&o) {
+                            hits.push(o);
+                        }
+                        cut = true;
+                        break;
                     }
                     if wset.contains(&o) {
                         cut = true;
@@ -947,13 +1024,30 @@ fn try_forward(
                     stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
                 }
             }
-            if hit {
-                if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::memcpyopt", "fwd: dropping {} dst markers of {dbase:?}", dmarks.len());
-                }
-                for o in dmarks {
-                    st.intrinsics.remove(o);
-                    Operation::erase(o, ctx);
+            if over || !hits.is_empty() {
+                // `PLIRON_MEMCPYOPT_MOVEMARK=1` (opt-in): the usual shape
+                // is one block, `writers..; lifetime.start(dst); copy`.
+                // The marker says `dst`'s bytes are dead where it stands;
+                // with nothing touching `dst` between the first writer
+                // and the marker they are as dead ahead of that writer,
+                // so the marker moves there and the slot keeps its
+                // bounds. Anything else drops the markers as before.
+                let moved = !over
+                    && hits.len() == 1
+                    && movemark()
+                    && move_start_marker(ctx, st, dbase, size, hits[0], &wset, &dmarks);
+                if moved {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::memcpyopt", "fwd: moved the dst start marker of {dbase:?} ahead of the writers");
+                    }
+                } else {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::memcpyopt", "fwd: dropping {} dst markers of {dbase:?}", dmarks.len());
+                    }
+                    for o in dmarks {
+                        st.intrinsics.remove(o);
+                        Operation::erase(o, ctx);
+                    }
                 }
             }
         }
@@ -2171,29 +2265,40 @@ mod tests {
     /// registered as `dst`'s `llvm.lifetime.start`; returns how many of
     /// `dst`'s markers are left.
     fn dst_markers_after_forward(body: &str) -> usize {
+        let (mut ctx, mut st, f, m) = lt_fixture(body);
+        assert!(try_forward(&mut ctx, &mut st, f, &mut None, &mut None, &[], m));
+        st.intrinsics
+            .iter()
+            .filter(|(_, n)| n.as_str() == "llvm.lifetime.start")
+            .count()
+    }
+
+    /// `LT_HEAD` + `body` + `LT_TAIL` parsed, allocas and intrinsics
+    /// registered; returns the function and the copy.
+    fn lt_fixture(body: &str) -> (Context, State, Ptr<Operation>, Ptr<Operation>) {
         let input = format!("{LT_HEAD}{body}{LT_TAIL}");
-        let ctx = &mut Context::new();
-        let st = &mut State::default();
-        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, &input).expect("parse");
-        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
-        let f = blocks(ctx, mop.get_operation())
+        let mut ctx = Context::new();
+        let mut st = State::default();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), &mut ctx, &input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, &ctx).unwrap();
+        let f = blocks(&ctx, mop.get_operation())
             .into_iter()
-            .flat_map(|b| ops(ctx, b))
-            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .flat_map(|b| ops(&ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, &ctx))
             .unwrap();
         let mut m = None;
-        for b in blocks(ctx, f) {
-            for o in ops(ctx, b) {
-                if Operation::is_op::<AllocaOp>(o, ctx) {
-                    st.allocas.insert(o.deref(ctx).get_result(ctx, 0), (8, 8));
+        for b in blocks(&ctx, f) {
+            for o in ops(&ctx, b) {
+                if Operation::is_op::<AllocaOp>(o, &ctx) {
+                    st.allocas.insert(o.deref(&ctx).get_result(&ctx, 0), (8, 8));
                 }
-                if Operation::is_op::<CallIntrinsicOp>(o, ctx) {
-                    if o.deref(ctx).get_num_operands() == 2 {
+                if Operation::is_op::<CallIntrinsicOp>(o, &ctx) {
+                    if o.deref(&ctx).get_num_operands() == 2 {
                         st.intrinsics.insert(o, "llvm.lifetime.start".to_string());
                     } else {
                         st.intrinsics.insert(o, "llvm.memcpy".to_string());
                         st.consts.insert(
-                            o.deref(ctx).get_operand(ctx, 2),
+                            o.deref(&ctx).get_operand(&ctx, 2),
                             crate::state::ConstVal::Bits(8),
                         );
                         m = Some(o);
@@ -2201,11 +2306,7 @@ mod tests {
                 }
             }
         }
-        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m.unwrap()));
-        st.intrinsics
-            .iter()
-            .filter(|(_, n)| n.as_str() == "llvm.lifetime.start")
-            .count()
+        (ctx, st, f, m.unwrap())
     }
 
     /// `store tmp; lifetime.start(dst); memcpy(dst, tmp)`: the forwarded
@@ -2216,6 +2317,42 @@ mod tests {
     fn dst_marker_between_writer_and_copy_dropped() {
         let n = dst_markers_after_forward(&format!("            llvm.store *tmp <- v;\n{LT}{MC}"));
         assert_eq!(n, 0, "dst's lifetime.start still sits after the forwarded write");
+    }
+
+    /// `PLIRON_MEMCPYOPT_MOVEMARK`: in one block with nothing touching
+    /// `dst` on the way, the marker moves ahead of the writer instead: it
+    /// is kept, and it now precedes the forwarded store.
+    #[test]
+    fn dst_marker_moves_ahead_of_the_writer() {
+        TEST_MOVEMARK.with(|c| c.set(true));
+        let (mut ctx, mut st, f, m) = lt_fixture(&format!("            llvm.store *tmp <- v;\n{LT}{MC}"));
+        let ok = try_forward(&mut ctx, &mut st, f, &mut None, &mut None, &[], m);
+        TEST_MOVEMARK.with(|c| c.set(false));
+        assert!(ok);
+        let all: Vec<Ptr<Operation>> = blocks(&ctx, f).into_iter().flat_map(|b| ops(&ctx, b)).collect();
+        let mk = all.iter().position(|o| st.intrinsics.get(*o).is_some_and(|n| n == "llvm.lifetime.start"));
+        let w = all.iter().position(|&o| Operation::is_op::<StoreOp>(o, &ctx)).unwrap();
+        assert!(mk.is_some_and(|k| k < w), "start marker dropped or still behind the forwarded store");
+    }
+
+    /// A read of `dst` between the writer and the marker sees bytes the
+    /// marker has not killed yet; so does a second marker. Neither may
+    /// end up behind the moved marker.
+    #[test]
+    fn dst_marker_stays_behind_a_dst_touch() {
+        let lt2 = LT.replace("lt = ", "lt2 = ");
+        for mid in ["            old = llvm.load dst : builtin.integer i64;\n", lt2.as_str()] {
+            let (mut ctx, st, f, _m) = lt_fixture(&format!("            llvm.store *tmp <- v;\n{mid}{LT}{MC}"));
+            let all: Vec<Ptr<Operation>> = blocks(&ctx, f).into_iter().flat_map(|b| ops(&ctx, b)).collect();
+            let w = *all.iter().find(|&&o| Operation::is_op::<StoreOp>(o, &ctx)).unwrap();
+            let marks: Vec<Ptr<Operation>> =
+                all.iter().copied().filter(|o| st.intrinsics.get(*o).is_some_and(|n| n == "llvm.lifetime.start")).collect();
+            let mk = *marks.last().unwrap();
+            let dbase = mk.deref(&ctx).get_operand(&ctx, 1);
+            let wset: FxHashSet<Ptr<Operation>> = [w].into_iter().collect();
+            let dmarks: FxHashSet<Ptr<Operation>> = marks.iter().copied().collect();
+            assert!(!move_start_marker(&mut ctx, &st, dbase, 8, mk, &wset, &dmarks), "moved over {mid}");
+        }
     }
 
     /// The marker ahead of the writer still bounds `dst` correctly.
