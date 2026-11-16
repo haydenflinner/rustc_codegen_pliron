@@ -161,14 +161,14 @@ impl Trees {
             // engine compiles as a branch straight to the join — into an
             // arm with code and a jump of its own (tokenize's ASCII arm,
             // `next = p + 1`: V8 `tbnz; add; b join` instead of `tbz
-            // join`, ~3% of the kernel). `PLIRON_WTREEREMAT_CONDARG=0`
-            // keeps such a value where the pipeline placed it. An edge
+            // join`). Such a value stays where the pipeline placed it;
+            // `PLIRON_WTREEREMAT_CONDARG=1` remats it again. An edge
             // that leaves a loop of the branch block still remats: there
             // the edge is the cheaper place (matmul's `i + 1` and row
             // step, used only once the inner loop is done, would run on
             // every inner trip). Back edges remat too.
             let keep_condarg =
-                std::env::var_os("PLIRON_WTREEREMAT_CONDARG").is_some_and(|v| v == "0");
+                !std::env::var_os("PLIRON_WTREEREMAT_CONDARG").is_some_and(|v| v == "1");
             let cond_nest = keep_condarg.then(|| LoopNest::compute(cfg));
             let mut cond_arg = vec![false; body.values.len()];
             for (src, block) in body.blocks.entries() {

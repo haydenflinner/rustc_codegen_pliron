@@ -107,6 +107,16 @@ block is depth-aware: only escaping `br`/`br_if`/`br_table` depths move
 (+1); a nested `br 0` stays (blind bump miscompiled hmget/sortw/
 parse_only under `=exit`).
 
+`PLIRON_WTREEREMAT_CONDARG` (2026-11-16): a single-use value passed
+to a target of a `CondBr`/`Select` is not rematerialized on that edge
+when the edge stays inside the branch block's loops and is not a back
+edge. The remat made a move-only arm (compiled by V8 as a branch
+straight to the join) into an arm with code and its own jump. Loop
+exits and back edges keep the remat (matmul's outer-loop steps on the
+inner loop's exit; `i + 1` on the latch's back edge measured 2% better
+than ahead of the test). parse_only -0.7% -> -11% against LLVM,
+module +200 B. `=1` restores the remat on every edge.
+
 All changes are marked `// PLIRON:` in the source.
 
 ## `src/backend/treeify.rs` — loop-nest guard (`PLIRON_WTREE_LOOP=0` off)

@@ -443,7 +443,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   fixed-array pointer loops), `PLIRON_HALFUNROLL=0` (constant-length
   `binary_search` as a select chain), `PLIRON_REVCMP=0` (equal-length
   reverse compares drop the second end test) and `PLIRON_VRP2=0` (a
-  second range pass ahead of `egraph2`).
+  second range pass ahead of `egraph2`). `PLIRON_WTREEREMAT_CONDARG=1`
+  (vendored waffle) rematerializes arm arguments on their edge again
+  (off: parse_only -11% against LLVM); `PLIRON_ARMHOIST=1` is opt-in.
 - `PLIRON_FASTCC=0` — off switch for per-callee clobber sets (aarch64
   ELF/Mach-O, default on): a direct call to a function compiled in the
   same object destroys only the registers that function's code writes
