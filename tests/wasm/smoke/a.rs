@@ -46,6 +46,46 @@ pub extern "C" fn cmp128(alo: u64, ahi: u64, blo: u64, bhi: u64) -> u32 {
         | ((sa >= sb) as u32) << 7
 }
 
+/// One 128-bit operation per `op`, the result's low or high word by
+/// `half`. `run.mjs` checks each against BigInt arithmetic: the wasm
+/// emitter lowers every i128 op to pairs of i64 by hand.
+#[unsafe(no_mangle)]
+pub extern "C" fn ops128(alo: u64, ahi: u64, blo: u64, bhi: u64, op: u32, half: u32) -> u64 {
+    let a = (ahi as u128) << 64 | alo as u128;
+    let b = (bhi as u128) << 64 | blo as u128;
+    let sh = (blo & 127) as u32;
+    let r: u128 = match op {
+        0 => a.wrapping_add(b),
+        1 => a.wrapping_sub(b),
+        2 => a & b,
+        3 => a | b,
+        4 => a ^ b,
+        5 => a << sh,
+        6 => a >> sh,
+        7 => ((a as i128) >> sh) as u128,
+        8 => a.rotate_left(sh),
+        9 => a.rotate_right(sh),
+        10 => a.leading_zeros() as u128,
+        11 => a.trailing_zeros() as u128,
+        12 => a.count_ones() as u128,
+        13 => a.wrapping_neg(),
+        14 => !a,
+        15 => a.min(b),
+        16 => a.max(b),
+        17 => (a as i128).min(b as i128) as u128,
+        18 => (a as i128).max(b as i128) as u128,
+        19 => a.swap_bytes(),
+        20 => (a == b) as u128 | ((a != b) as u128) << 1,
+        21 => a.wrapping_add(b).wrapping_add((alo & 1) as u128),
+        22 => if a > b { a - b } else { b - a },
+        23 => (a as i128).wrapping_abs() as u128,
+        24 => (alo as i64 as i128) as u128 ^ (bhi as u128) << 64,
+        25 => if (a as i128) <= (b as i128) { a ^ b } else { a.wrapping_sub(b) },
+        _ => 0,
+    };
+    if half == 0 { r as u64 } else { (r >> 64) as u64 }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn hypot(a: f64, b: f64) -> f64 {
     unsafe { core::intrinsics::sqrtf64(a * a + b * b) }

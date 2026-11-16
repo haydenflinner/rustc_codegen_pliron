@@ -34,14 +34,47 @@ for (const a of W) {
     rows.push([`cmp128(${a}, ${b})`, e.cmp128(a & M64, a >> 64n, b & M64, b >> 64n), want]);
   }
 }
+// ops128: the same values through every 128-bit operation.
+const M128 = (1n << 128n) - 1n;
+const rotl = (x, n) => ((x << n) | (x >> (128n - n))) & M128;
+const clz = (x) => { let n = 0n; for (let i = 127n; i >= 0n && !((x >> i) & 1n); i--) n++; return n; };
+const ctz = (x) => { let n = 0n; for (let i = 0n; i < 128n && !((x >> i) & 1n); i++) n++; return n; };
+const pop = (x) => { let n = 0n; for (let i = 0n; i < 128n; i++) n += (x >> i) & 1n; return n; };
+const bswap = (x) => { let r = 0n; for (let i = 0n; i < 16n; i++) r = (r << 8n) | ((x >> (8n * i)) & 255n); return r; };
+const s64 = (x) => BigInt.asIntN(64, x);
+const OPS = [
+  (a, b) => a + b, (a, b) => a - b, (a, b) => a & b, (a, b) => a | b, (a, b) => a ^ b,
+  (a, b) => a << (b & 127n), (a, b) => a >> (b & 127n), (a, b) => sgn(a) >> (b & 127n),
+  (a, b) => rotl(a, b & 127n), (a, b) => rotl(a, (128n - (b & 127n)) & 127n),
+  (a) => clz(a), (a) => ctz(a), (a) => pop(a), (a) => -a, (a) => ~a,
+  (a, b) => (a < b ? a : b), (a, b) => (a > b ? a : b),
+  (a, b) => (sgn(a) < sgn(b) ? a : b), (a, b) => (sgn(a) > sgn(b) ? a : b),
+  (a) => bswap(a), (a, b) => BigInt(a === b) | BigInt(a !== b) << 1n,
+  (a, b) => a + b + (a & 1n), (a, b) => (a > b ? a - b : b - a), (a) => (sgn(a) < 0n ? -a : a),
+  (a, b) => s64(a & M64) ^ ((b >> 64n) << 64n), (a, b) => (sgn(a) <= sgn(b) ? a ^ b : a - b),
+];
+let nops = 0;
+for (const a of W) {
+  for (const b of W) {
+    OPS.forEach((f, op) => {
+      const want = f(a, b) & M128;
+      for (const half of [0, 1]) {
+        const got = BigInt.asUintN(64, e.ops128(a & M64, a >> 64n, b & M64, b >> 64n, op, half));
+        rows.push([`ops128 op ${op} half ${half} (${a}, ${b})`, got, half ? want >> 64n : want & M64]);
+        nops++;
+      }
+    });
+  }
+}
 let bad = 0;
 for (const [name, got, want] of rows) {
   const ok = got === want;
   if (!ok) bad++;
-  if (!ok || !name.startsWith("cmp128")) {
+  if (!ok || !/^(cmp|ops)128/.test(name)) {
     console.log(`${ok ? "ok  " : "FAIL"} ${name} = ${got}${ok ? "" : ` (want ${want})`}`);
   }
 }
 if (bad) process.exit(1);
 console.log(`ok   cmp128: ${W.length * W.length} pairs`);
+console.log(`ok   ops128: ${nops} results`);
 console.log("wasm smoke OK");
