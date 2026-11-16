@@ -22,11 +22,26 @@ const rows = [
   ["crosscall(21)", e.crosscall(21), helper(21) * 2],
   ["genes_hash()", e.genes_hash(), gh],
 ];
+// cmp128: every pair of a few 128-bit values, against BigInt.
+const M64 = (1n << 64n) - 1n;
+const W = [0n, 1n, 127n, 128n, M64, 1n << 64n, (1n << 64n) + 5n, (1n << 127n) - 1n, 1n << 127n, (1n << 128n) - 1n];
+const sgn = (x) => (x >> 127n ? x - (1n << 128n) : x);
+for (const a of W) {
+  for (const b of W) {
+    const [sa, sb] = [sgn(a), sgn(b)];
+    const want = (a < b) | (a <= b) << 1 | (a > b) << 2 | (a >= b) << 3
+      | (sa < sb) << 4 | (sa <= sb) << 5 | (sa > sb) << 6 | (sa >= sb) << 7;
+    rows.push([`cmp128(${a}, ${b})`, e.cmp128(a & M64, a >> 64n, b & M64, b >> 64n), want]);
+  }
+}
 let bad = 0;
 for (const [name, got, want] of rows) {
   const ok = got === want;
   if (!ok) bad++;
-  console.log(`${ok ? "ok  " : "FAIL"} ${name} = ${got}${ok ? "" : ` (want ${want})`}`);
+  if (!ok || !name.startsWith("cmp128")) {
+    console.log(`${ok ? "ok  " : "FAIL"} ${name} = ${got}${ok ? "" : ` (want ${want})`}`);
+  }
 }
 if (bad) process.exit(1);
+console.log(`ok   cmp128: ${W.length * W.length} pairs`);
 console.log("wasm smoke OK");

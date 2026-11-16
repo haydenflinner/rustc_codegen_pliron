@@ -25,6 +25,27 @@ pub extern "C" fn sum_sq(n: u32) -> u64 {
     (1..=n as u64).map(|x| x * x).sum()
 }
 
+/// All eight ordered compares of two 128-bit values, one bit each
+/// (unsigned `< <= > >=` in bits 0..4, signed in bits 4..8). The wasm
+/// emitter splits an i128 compare into a high-word test and a low-word
+/// test; `>=` once used `>=` for the high words too, so it was true
+/// whenever the high words were equal (loro's LEB128 writer for `i128`
+/// never saw its last byte).
+#[unsafe(no_mangle)]
+pub extern "C" fn cmp128(alo: u64, ahi: u64, blo: u64, bhi: u64) -> u32 {
+    let a = (ahi as u128) << 64 | alo as u128;
+    let b = (bhi as u128) << 64 | blo as u128;
+    let (sa, sb) = (a as i128, b as i128);
+    (a < b) as u32
+        | ((a <= b) as u32) << 1
+        | ((a > b) as u32) << 2
+        | ((a >= b) as u32) << 3
+        | ((sa < sb) as u32) << 4
+        | ((sa <= sb) as u32) << 5
+        | ((sa > sb) as u32) << 6
+        | ((sa >= sb) as u32) << 7
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn hypot(a: f64, b: f64) -> f64 {
     unsafe { core::intrinsics::sqrtf64(a * a + b * b) }

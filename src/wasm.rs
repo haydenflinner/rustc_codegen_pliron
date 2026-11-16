@@ -9966,8 +9966,9 @@ mod clif_emit {
                     } else {
                         (ah, bh)
                     };
+                    // The high words always compare strictly: equal high
+                    // words leave the answer to the low words (`heq & l`).
                     let (hlt, hgt) = (O::I64LtU, O::I64GtU);
-                    let hge = O::I64GeU;
                     let (llt, lle, lgt, lge) = (O::I64LtU, O::I64LeU, O::I64GtU, O::I64GeU);
                     let heq = self.op(O::I64Eq, &[ah2, bh2], WT::I32);
                     match cond {
@@ -9990,7 +9991,7 @@ mod clif_emit {
                             self.op(O::I32Or, &[h, e], WT::I32)
                         }
                         _ => {
-                            let h = self.op(hge, &[ah2, bh2], WT::I32);
+                            let h = self.op(hgt, &[ah2, bh2], WT::I32);
                             let l = self.op(lge, &[al, bl], WT::I32);
                             let e = self.op(O::I32And, &[heq, l], WT::I32);
                             self.op(O::I32Or, &[h, e], WT::I32)
