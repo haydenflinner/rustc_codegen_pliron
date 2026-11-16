@@ -367,13 +367,21 @@ Tried and not kept:
 
 Still open:
 
-- **`game_asteroids` returns a different result** (and is 1.44x). The
-  only difference is in the `squish` soft bodies (rapier2d): f32
-  coordinates off in the last bits from the first frame, drifting from
-  there. It is there without tonight's knobs. 70 std float operations
-  and 50 `libm` functions were checked bit for bit against the LLVM
-  build (`/tmp/dsa-bench/repro-fmath`) and agree, so it is not a scalar
-  primitive; notes in `/tmp/dsa-bench/findings/asteroids.md`.
+- ~~`game_asteroids` returns a different result~~ **Fixed 08:00
+  (`154456d`), the third silent miscompile of the night.** f32
+  coordinates of the rapier2d soft bodies were off in the last bits
+  from the first frame. The sub-agent bisected it in an hour: crate
+  rapier2d, stage wpeep, sub-pass store-to-load forwarding
+  (`PLIRON_WASM_SFWD_FW=0`), function `symmetric_eigen`; 70 std float
+  operations and 50 `libm` functions had been checked bit for bit first
+  (`/tmp/dsa-bench/repro-fmath`) and agreed. With the pass named, the
+  bug was readable: at a loop entry the forwarding table kept every
+  entry whose base local differs from the body's stores (`b3 != b2 ||`),
+  where the in-line rule drops them because two locals may hold one
+  address. A load at the top of a loop then returned the pre-loop value
+  on every iteration: the eigen solver iterated on stale values. The
+  kernels are unchanged by the fix. Notes:
+  `/tmp/dsa-bench/findings/asteroids.md`.
 - **Code size: 50.3 MB against LLVM's 18.4 MB.** Not improved tonight.
 - `dims_page` 1.24x: diffuse.
 - The default feature set (polars, typst, vortex) was never built with

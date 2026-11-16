@@ -171,8 +171,11 @@ The fifteen comparable rows are geomean **1.02**. At the first run that
 morning nine workloads failed or returned wrong results and the
 interpreter rows were 1.17 to 1.56.
 
-Open on this program: `game_asteroids` (f32 last-bit drift in
-rapier2d, narrowed to that crate), **code size 50.3 MB against LLVM's
+(`game_asteroids`: a wasm peephole forwarded a pre-loop value into
+every iteration of rapier2d's eigen solver; fixed in `154456d`, the
+number above is from before the fix.)
+
+Open on this program: **code size 50.3 MB against LLVM's
 18.4 MB** (35,774 functions against 19,544; LLVM inlines and deletes
 single-caller instances such as each `collect()`'s `from_iter`, we
 keep 1,225 of those; `PLIRON_INLINE_ONCE=1` does that on wasm and is
