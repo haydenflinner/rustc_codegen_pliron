@@ -441,7 +441,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   unreachable trap go with their guard: `unwrap_unchecked` on a
   branchy `Option<&T>`), `PLIRON_UNROLL_SYM=0` (full unroll of
   fixed-array pointer loops), `PLIRON_HALFUNROLL=0` (constant-length
-  `binary_search` as a select chain).
+  `binary_search` as a select chain), `PLIRON_REVCMP=0` (equal-length
+  reverse compares drop the second end test) and `PLIRON_VRP2=0` (a
+  second range pass ahead of `egraph2`).
 - `PLIRON_FASTCC=0` — off switch for per-callee clobber sets (aarch64
   ELF/Mach-O, default on): a direct call to a function compiled in the
   same object destroys only the registers that function's code writes

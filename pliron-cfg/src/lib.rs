@@ -53,6 +53,12 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_UNROLL_SYM",
     // `binary_search` over a constant-length table as a select chain.
     "PLIRON_HALFUNROLL",
+    // Equal-length reverse compares lose the second end test, and a
+    // second range pass ahead of egraph2 folds what the late steps
+    // built (both wasm only). strwork +10.6% -> +7.1%, parse_only
+    // unchanged (`--layouts=3 --best`).
+    "PLIRON_REVCMP",
+    "PLIRON_VRP2",
     // Fold branches a dominating check decides before LICM looks for
     // escapes (regex's `follow_epsilons`: `assert!(len < cap)` then
     // `Vec::push`'s dead grow call, which took the set). Exact counts:
