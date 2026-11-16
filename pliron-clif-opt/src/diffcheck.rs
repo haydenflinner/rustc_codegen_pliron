@@ -259,6 +259,7 @@ pub fn check(
         }
     }
     let nowrite_names = nowrite_by_name(before, facts);
+    let layout = slot_layout(&[before, after]);
     for trial in 0..cfg.trials {
         let seed = mix(cfg.seed, trial as u64);
         let world = World::new(
@@ -266,6 +267,7 @@ pub fn check(
             if trial % 2 == 1 { &all_ptrs } else { &ptrs },
             facts,
             seed,
+            &layout,
         );
         let self_name = facts
             .self_name
@@ -572,6 +574,11 @@ struct World {
     /// Unused pages ahead of the first stack slot in every frame. Normally
     /// 0; the re-run of `before` moves the slots with it.
     slot_pad: u64,
+    /// [`slot_layout`] of the pair under check: every run of the trial
+    /// puts slot `k` at the same place.
+    slot_at: Vec<u64>,
+    /// Bytes the slots of `slot_at` take.
+    slots_len: u64,
     /// Values the optimizer may assume nonzero (`!nonnull` loads too): a
     /// load that yields 0 into one is undefined behavior, so the run stops.
     nonnull: FxHashSet<Value>,
@@ -585,7 +592,13 @@ struct World {
 }
 
 impl World {
-    fn new(f: &Function, ptrs: &FxHashMap<Value, PtrInfo>, facts: &Facts, seed: u64) -> Self {
+    fn new(
+        f: &Function,
+        ptrs: &FxHashMap<Value, PtrInfo>,
+        facts: &Facts,
+        seed: u64,
+        layout: &(Vec<u64>, u64),
+    ) -> Self {
         let mut rng = Rng(seed);
         let mut regions = BTreeMap::new();
         let mut targets: Vec<u64> = Vec::new();
@@ -651,6 +664,8 @@ impl World {
                 .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0),
             slot_pad: 0,
+            slot_at: layout.0.clone(),
+            slots_len: layout.1,
             nonnull: facts.nonnull.cloned().unwrap_or_default(),
             derived: facts
                 .derived
@@ -682,6 +697,47 @@ impl World {
             },
         }
     }
+}
+
+/// A stack slot's place in a frame is a multiple of this, and its room.
+const SLOT_PAGE: u64 = 0x1000;
+
+/// Room for a slot of `size` bytes: whole pages, at least one.
+fn slot_room(size: u32) -> u64 {
+    u64::from(size).max(1).next_multiple_of(SLOT_PAGE)
+}
+
+/// Where each stack slot sits in a frame, by slot index, and the bytes
+/// they take together. Distinct slots are distinct objects: an access
+/// inside one never reaches another, so each gets room for its size.
+/// Until 2026-11-16 every slot had one 4 KiB page whatever its size, and
+/// a write past byte 4095 of a larger slot landed in the next slots
+/// (`robust::incircleadapt`: the `memset` of a `[f64; 1152]` zeroed the
+/// two arrays declared after it, in the original only once slotmerge had
+/// moved one of them).
+///
+/// The place of slot `k` must not depend on which function of the pair
+/// runs: a pass that shrinks a dead slot (slotmerge sets a merged slot's
+/// size to 0) would otherwise shift every later slot's bytes, which the
+/// function may read back without having written them (a callee fills
+/// them through an escaped pointer) — a false mismatch. So the room of
+/// slot `k` is that of its largest size in `fs`, the functions of the
+/// pair; passes keep slot indices.
+fn slot_layout(fs: &[&Function]) -> (Vec<u64>, u64) {
+    let n = fs.iter().map(|f| f.sized_stack_slots.len()).max().unwrap_or(0);
+    let mut at = Vec::with_capacity(n);
+    let mut off = 0u64;
+    for k in 0..n {
+        let size = fs
+            .iter()
+            .filter_map(|f| f.sized_stack_slots.get(StackSlot::from_u32(k as u32)))
+            .map(|d| d.size)
+            .max()
+            .unwrap_or(0);
+        at.push(off);
+        off += slot_room(size);
+    }
+    (at, off)
 }
 
 /// Bytes from `v` to the end of its stack slot, when `v` is a slot's
@@ -911,8 +967,9 @@ struct Sandbox<'a> {
     /// `func`'s own name as callers spell it.
     self_name: String,
     regions: BTreeMap<u64, Region>,
-    /// Byte offset of each stack slot within the frame.
-    slot_off: FxHashMap<StackSlot, u64>,
+    /// Byte offset of each stack slot within the frame, by slot index,
+    /// ascending (`slot_layout`, after the `slot_pad` pages).
+    slot_at: Vec<u64>,
     syms: FxHashMap<String, u64>,
     calls: Vec<(String, Vec<DataValue>)>,
     nowrite: &'a FxHashSet<String>,
@@ -923,8 +980,6 @@ struct Sandbox<'a> {
     extent: &'a FxHashMap<(String, u32), u64>,
     seed: u64,
     stack_fill: u8,
-    /// `World::slot_pad`.
-    slot_pad: u64,
     pinned: DataValue,
     /// Last address a load or store fell outside the sandbox at.
     fault: Cell<Option<u64>>,
@@ -1087,7 +1142,7 @@ impl<'a> State<'a> for Sandbox<'a> {
             size,
             AddressRegion::Stack,
             0,
-            base + self.slot_off[&slot] + offset,
+            base + self.slot_at[slot.index()] + offset,
         )
     }
     fn checked_load(
@@ -1282,16 +1337,15 @@ fn run_inner(
 ) -> Outcome {
     let no_facts = FxHashSet::default();
     let no_derived = FxHashMap::default();
-    // Stack frame: one fixed-stride page per slot. Packing by declared
-    // size would let a pass that shrinks a dead slot (slotmerge) shift
-    // every later slot's seeded bytes — bytes the function never wrote
-    // but may read back (e.g. after a callee fills them through an
-    // escaped pointer) — a false mismatch.
-    let mut slot_off = FxHashMap::default();
-    let mut off = world.slot_pad * 0x1000;
-    for (slot, _d) in f.sized_stack_slots.iter() {
-        slot_off.insert(slot, off);
-        off += 0x1000;
+    // Stack frame: the pair's layout (`slot_layout`), the same for
+    // every run of the trial, behind the rerun's pad. A slot the layout
+    // does not know (a function outside the pair) goes after the rest.
+    let pad = world.slot_pad * SLOT_PAGE;
+    let mut slot_at: Vec<u64> = world.slot_at.iter().map(|o| o + pad).collect();
+    let mut off = pad + world.slots_len;
+    for (_, d) in f.sized_stack_slots.iter().skip(slot_at.len()) {
+        slot_at.push(off);
+        off += slot_room(d.size);
     }
     let mut s = Sandbox {
         func: f,
@@ -1299,7 +1353,7 @@ fn run_inner(
         frame_size: off.next_multiple_of(16) + 16,
         self_name: self_name.to_string(),
         regions: world.regions.clone(),
-        slot_off,
+        slot_at,
         syms: FxHashMap::default(),
         calls: Vec::new(),
         nowrite,
@@ -1317,7 +1371,6 @@ fn run_inner(
         extent: &world.extent,
         seed: world.seed,
         stack_fill: world.stack_fill,
-        slot_pad: world.slot_pad,
         pinned: DataValue::I64(0),
         fault: Cell::new(None),
         watch: crate::config::env_get("PLIRON_DIFFCHECK_WATCH")
@@ -1606,22 +1659,25 @@ fn stub(
                 if (stack_base()..stack_base() + stack_span()).contains(&p) {
                     // Frame pointer: bound the fill to the containing
                     // slot's extent so it can't spill into a neighbor.
-                    // Slots sit one per 4KiB page inside each frame's
-                    // fixed-size page (outer frames count too — a callee
-                    // can out-param into a caller's slot).
+                    // Each frame holds the slots at `slot_at` (outer
+                    // frames count too — a callee can out-param into a
+                    // caller's slot).
                     let d = p - stack_base();
                     let fidx = d / s.frame_size;
                     if fidx as usize >= s.frames.len() {
                         continue;
                     }
-                    let Some(rel) = ((d % s.frame_size) / 0x1000).checked_sub(s.slot_pad) else {
+                    // The slot whose room holds the address: the last
+                    // one that starts at or before it.
+                    let rel = d % s.frame_size;
+                    let Some(slot) = s.slot_at.partition_point(|&o| o <= rel).checked_sub(1) else {
                         continue;
                     };
-                    let in_off = (d % s.frame_size) % 0x1000;
-                    let Some((slot, _)) = s.func.sized_stack_slots.iter().nth(rel as usize) else {
+                    let in_off = rel - s.slot_at[slot];
+                    let Some(sd) = s.func.sized_stack_slots.get(StackSlot::from_u32(slot as u32)) else {
                         continue;
                     };
-                    let sz = s.func.sized_stack_slots[slot].size as u64;
+                    let sz = sd.size as u64;
                     if in_off >= sz {
                         continue;
                     }

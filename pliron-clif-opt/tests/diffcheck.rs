@@ -678,3 +678,135 @@ fn arithmetic_nan_bits_in_memory_are_not_pinned() {
     let d = parse(&body("v5 = fabs v3"));
     assert!(check(&c, &d, &Facts::default(), &cfg()).is_err());
 }
+
+/// Distinct stack slots are distinct objects: a write inside one never
+/// changes another, however large the slot is. The sandbox gave every
+/// slot one 4 KiB page, so the store at byte 4096 of the 8 KiB `ss1` hit
+/// `ss2` in the original and the load came back as the argument instead
+/// of 7. Once slotmerge had put `ss2`'s bytes on `ss0`, ahead of the
+/// large slot, the rewritten function read the 7 it should: reported as
+/// a mismatch (`robust::incircleadapt` in the dsa corpus: two
+/// `[f64; 1152]` arrays, the rewritten function "trapping" in a bounds
+/// check the original never reached).
+#[test]
+fn large_slot_does_not_overlap_its_neighbours() {
+    let before = "function %f(i64) -> i64 {
+            ss0 = explicit_slot 8
+            ss1 = explicit_slot 8192
+            ss2 = explicit_slot 8
+        block0(v0: i64):
+            v1 = iconst.i64 7
+            v2 = stack_addr.i64 ss2
+            store v1, v2
+            v3 = stack_addr.i64 ss1
+            store v0, v3+4096
+            v4 = load.i64 v2
+            return v4
+        }";
+    // What slotmerge leaves: `ss2` folded onto the dead `ss0`.
+    let merged = |ret: &str| {
+        format!(
+            "function %f(i64) -> i64 {{
+            ss0 = explicit_slot 8
+            ss1 = explicit_slot 8192
+            ss2 = explicit_slot 0
+        block0(v0: i64):
+            v1 = iconst.i64 7
+            v2 = stack_addr.i64 ss0
+            store v1, v2
+            v3 = stack_addr.i64 ss1
+            store v0, v3+4096
+            v4 = load.i64 v2
+            v5 = iconst.i64 1
+            v6 = iadd v4, v5
+            return {ret}
+        }}"
+        )
+    };
+    let (a, b) = (parse(before), parse(&merged("v4")));
+    let s = check(&a, &b, &Facts::default(), &cfg()).unwrap_or_else(|m| panic!("{m}"));
+    assert_eq!(s.compared, 32);
+    // The same with the roles swapped: the layout is the pair's, not the
+    // running function's.
+    let s = check(&b, &a, &Facts::default(), &cfg()).unwrap_or_else(|m| panic!("{m}"));
+    assert_eq!(s.compared, 32);
+    // A wrong value out of the small slot is still a mismatch...
+    assert!(check(&a, &parse(&merged("v6")), &Facts::default(), &cfg()).is_err());
+    // ...and so is one out of the large slot's bytes past the first page.
+    let big = |k: u32| {
+        parse(&format!(
+            "function %f(i64) -> i64 {{
+            ss0 = explicit_slot 8192
+            ss1 = explicit_slot 8
+        block0(v0: i64):
+            v1 = stack_addr.i64 ss0
+            store v0, v1+4096
+            v2 = iconst.i64 9
+            v3 = stack_addr.i64 ss1
+            store v2, v3
+            v4 = load.i64 v1+4096
+            v5 = iconst.i64 {k}
+            v6 = iadd v4, v5
+            return v6
+        }}"
+        ))
+    };
+    assert_eq!(check(&big(0), &big(0), &Facts::default(), &cfg()).unwrap().compared, 32);
+    assert!(check(&big(0), &big(1), &Facts::default(), &cfg()).is_err());
+    // The original alone must read back what it stored past the first
+    // page, not the 9 stored to the next slot: against a function that
+    // returns the argument.
+    let ident = parse("function %f(i64) -> i64 { block0(v0: i64): return v0 }");
+    let s = check(&big(0), &ident, &Facts::default(), &cfg()).unwrap_or_else(|m| panic!("{m}"));
+    assert_eq!(s.compared, 32);
+}
+
+/// A call's out-slot behind a large slot is still found by the stub (it
+/// maps an address back to its slot), and the fill stays inside it.
+#[test]
+fn stub_finds_slots_behind_a_large_one() {
+    let f = |add: u32| {
+        parse(&format!(
+            "function %f() -> i64, i64 {{
+            ss0 = explicit_slot 12288
+            ss1 = explicit_slot 16
+            ss2 = explicit_slot 8
+            sig0 = (i64)
+            fn0 = %g sig0
+        block0:
+            v0 = iconst.i64 3
+            v1 = stack_addr.i64 ss2
+            store v0, v1
+            v2 = stack_addr.i64 ss1
+            call fn0(v2)
+            v3 = load.i64 v2+8
+            v4 = load.i64 v1
+            v5 = iconst.i64 {add}
+            v6 = iadd v3, v5
+            return v6, v4
+        }}"
+        ))
+    };
+    let s = check(&f(0), &f(0), &Facts::default(), &cfg()).unwrap_or_else(|m| panic!("{m}"));
+    assert_eq!(s.compared, 32);
+    // The fill of `ss1` reaches the caller's result (a zero there would
+    // be the frame's fill, the stub having missed the slot), and `ss2`
+    // keeps its 3.
+    let konst = parse(
+        "function %f() -> i64, i64 {
+            ss0 = explicit_slot 12288
+            ss1 = explicit_slot 16
+            ss2 = explicit_slot 8
+            sig0 = (i64)
+            fn0 = %g sig0
+        block0:
+            v2 = stack_addr.i64 ss1
+            call fn0(v2)
+            v3 = iconst.i64 0
+            v4 = iconst.i64 3
+            return v3, v4
+        }",
+    );
+    assert!(check(&f(0), &konst, &Facts::default(), &cfg()).is_err(), "the stub did not fill ss1");
+    assert!(check(&f(0), &f(1), &Facts::default(), &cfg()).is_err());
+}
