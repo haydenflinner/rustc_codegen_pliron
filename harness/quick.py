@@ -175,6 +175,11 @@ class Plan:
                     self.add_stanzas(["wasm_smoke"])
                 self.add_stanzas([n for n in self.stanza_all if n.replace("_", "") == d.replace("_", "")])
                 continue
+            if f.startswith("harness/wasm/"):
+                # peepdiff.mjs runs inside the wasm smoke stanza.
+                self.add_stanzas(["wasm_smoke"])
+                self.flags.add("harness")
+                continue
             if f.startswith("harness/") or f.startswith("bench/") or f.startswith("selfhost/"):
                 self.flags.add("harness")
                 continue

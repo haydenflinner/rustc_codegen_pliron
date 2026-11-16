@@ -342,6 +342,28 @@ time, memory, code size, stack frames) in ~20 min and writes
   peepholes (`<name>.pre.wasm` / `.post.wasm`): `wasm-objdump -d` both
   and diff one function (`PLIRON_WASM_SFWD_FWLIM=N` / `_FWSKIP=N` pin a
   single forwarded load inside it).
+- **Did a wasm peephole change behaviour?** `node
+  harness/wasm/peepdiff.mjs <dir>` on a `PLIRON_WASM_MODDUMP=<dir>` dump
+  (wipe the directory first) calls every function body before and after
+  `wpeep` in V8 with the same seeded arguments on the same seeded
+  memory and lists the bodies that differ: import calls (callee,
+  arguments, visible memory), results, traps, memory at return. A wrong
+  body is told from its callers (`ISOLATED`: differs with every other
+  body unchanged) and comes with a `--fn N --seed S --trace` replay
+  line. Use it before bisecting a wasm-only miscompile, on the dump of
+  the failing build: 0.8 ms per function (wasm bench + std 2,643
+  functions 1.3 s, dsa 68,555 functions 52 s), no false positive on
+  either, optimized or not. With the three wpeep bugs of 2026-11-16 put
+  back one at a time it names the function of each report:
+  `blake3::portable::compress_in_place`, rapier2d's `symmetric_eigen`
+  and dsa's unoptimized `debugsession_compileInfo` shim.
+  `tests/wasm/smoke.sh` runs it on the smoke objects plus the three
+  shapes (`tests/wasm/smoke/peep.rs`, `peep_raw.rs`), so it is in the
+  gate. A clean run is not a proof: `--coverage` says how much code the
+  trials ran (40% of blocks on the bench, 27% on dsa) and `--mutate`
+  how many one-instruction mutants they detect (67%, 62%); waffle and
+  the CLIF pipeline are upstream of both dumps and not checked. Blind
+  spots and how to read a report: `harness/wasm/README.md`.
 - **wasm static constructors** (`.init_array[.N]` statics: `inventory`,
   `ctor`): `pliron-wasm-ld` calls them from `__wasm_call_ctors` by
   priority. A module that neither calls nor exports that function (a

@@ -69,21 +69,27 @@ is in the header of `peepdiff.mjs`.
 
 ### What it found (2026-11-16)
 
-Each of the day's three wpeep bugs reintroduced alone (one reverted hunk),
-rebuilt, dumped:
+Each of the day's three wpeep bugs put back alone (one reverted hunk),
+rebuilt, dumped, and run with the defaults (16 trials, seed 1). "Changed"
+is the number of bodies whose output differs between the buggy and the
+fixed backend: the most that could be wrong.
 
-| bug | corpus | bodies the bug changed | flagged |
+| bug | corpus | changed | flagged as wrong in isolation |
 |---|---|---|---|
-| keep-on-stack drops a write a hoisted get reads (`b60ceb0`) | blake3 1.8.7 + std | 10 | `blake3::portable::compress_in_place`, `compress_xof`: the two where the dropped `local.tee` is read again. The other 8 drop a dead write (checked statically) |
-| | wasm bench + std | 9 | none: all 9 drop a dead write |
-| loop entry keeps entries of another base (`154456d`) | dsa (rapier2d, Loro, Mimas) | 8 | rapier2d's `symmetric_eigen`, the function of the original report (found directly in 8 of 20 seeds, through its caller `NeoHookeanConstraint::hessian` in all 7 seeds tried). The other 7 were not shown wrong or right |
-| | wasm bench + std, optimized | 0 | |
-| | a 4-function crate with the shape (`[b]=v; loop { acc+=[b]; [c]=acc }`) | 4 | 4 of 4 in 9 of 9 seeds |
-| a local overwritten between its get and the store (`2ba0f69`) | wasm bench + std, `PLIRON_OPT_BISECT=0` | 1 | that one (`<&mut IsNotEmpty as FnMut>::call_mut`: the load after the store reads the new local) |
+| keep-on-stack drops a write a hoisted get reads (`b60ceb0`) | blake3 1.8.7 + std | 10 | 2: `blake3::portable::compress_in_place` (the function of the report) and `compress_xof`, the two where the dropped `local.tee` is read again. The other 8 drop a dead write (checked statically) |
+| | wasm bench + std | 9 | 0: all 9 drop a dead write |
+| | the same, `PLIRON_OPT_BISECT=0` | 23 | 0: 14 drop a dead write, 9 not classified |
+| loop entry keeps entries of another base (`154456d`) | dsa (rapier2d, Loro, Mimas; 68,555 functions) | 8 | 1: rapier2d's `symmetric_eigen`, the function of the report. Its own trials catch it in 8 of 20 seeds; its caller `NeoHookeanConstraint::hessian` differs in every seed tried (7) and the bisection of the caller's callees names it. Of the other 7, 4 ran every changed place 400 times without a difference and 3 were not fully reached |
+| | wasm bench + std; nalgebra's `symmetric_eigen` alone | 0 | |
+| | wasm bench + std, `PLIRON_OPT_BISECT=0` | 14 | 0: 4 ran every changed place without a difference, 10 were not fully reached |
+| a local overwritten between its get and the store (`2ba0f69`) | dsa, `PLIRON_OPT_BISECT=0` (69,461 functions) | 74 | 60, all wasm-bindgen shims of `literate_wasm`, `debugsession_compileInfo` (the function of the report: `Session::prog_diags` gets a stack address for `self`) among them; 71 with `--trials 200`. Nothing outside the changed set |
+| | wasm bench + std, `PLIRON_OPT_BISECT=0` | 1 | 1 (`<&mut IsNotEmpty as FnMut>::call_mut`) |
+| each of the three | the smoke objects (`tests/wasm/smoke/peep.rs`, `peep_raw.rs`) | 1, 3, 1 | all; `tests/wasm/smoke.sh` fails |
 
-Fixed backend: no difference on the wasm bench + std (2,643 functions,
-31 seeds), the same unoptimized, blake3, and dsa (68,555 functions, three
-seeds, one of them `--strict`).
+Fixed backend, no difference: the wasm bench + std (2,643 functions, 31
+seeds), the same unoptimized, blake3, dsa (68,555 functions, three seeds,
+one with `--strict`), dsa unoptimized (69,461 functions), the smoke
+objects (100 seeds).
 
 ### How much a clean run means
 
@@ -91,20 +97,23 @@ Not a proof. Measured with the default 16 trials:
 
 | corpus | functions | time | blocks executed (`--coverage`) | mutants found (`--mutate`) |
 |---|---|---|---|---|
-| smoke objects (64 trials) | 24 | 0.3 s | 61% | 80% |
-| wasm bench + std | 2,643 | 1.3 s | 40% (47% at 64 trials) | 67% (74% at 64) |
-| dsa | 68,555 | 52 s | 27% | not run |
+| smoke objects (64 trials) | 33 | 0.1 s | 65% | 81% |
+| wasm bench + std | 2,643 | 1.3 s | 40% (46% at 64 trials) | 67% (74% at 64) |
+| dsa | 68,555 | 52 s | 27% | 62% (every 40th function) |
 
-About 0.8 ms per function, one thread, 0.6 GB for dsa. Small functions
-are covered well, big ones badly: a wild pointer or a failed bounds check
-ends most trials of a large function early. The header of `peepdiff.mjs`
-lists the blind spots; the ones that matter most:
+About 0.8 ms per function on one thread (twice that on a loaded
+machine), 0.6 GB for dsa. Small functions are covered well, big ones
+badly: a wild pointer or a failed bounds check ends most trials of a
+large function early. A wrong body that its own trials miss is still
+found when a caller in the same module feeds it real data and differs
+(`symmetric_eigen` above). The header of `peepdiff.mjs` lists the blind
+spots; the ones that matter most:
 
 - paths random arguments and random memory do not reach;
 - no constant data (`pliron.link` is added after the peepholes): lookup
   tables, strings and vtables are random words;
 - imports are stubs, and so is an indirect call through a pointer that is
-  not a function of the module;
+  not a function of the module, so nothing is checked across crates;
 - a difference that needs two pointers to alias shows only in the trials
   where the generator made them alias (half of the pointer arguments
   repeat an earlier one);

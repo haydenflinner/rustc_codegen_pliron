@@ -117,9 +117,10 @@
 // --------------------------
 // `--coverage` adds a probe at every function entry, block, loop, if and
 // else header, after every `end` and `br_if` (a byte in an appended
-// memory) and prints the share that ran: 38% of the probes on the wasm
-// bench (std included) with the default 16 trials, 47% with 64. Small
-// functions are covered well (74% under 40 probes), big ones badly (33%
+// memory) and prints the share that ran: 40% of the probes on the wasm
+// bench (std included) with the default 16 trials, 46% with 64, 27% on
+// the dsa program. Small functions are covered well (three quarters of
+// the probes of functions under 40 probes), big ones badly (a third
 // over 200).
 // `--mutate` ignores the post modules: for every function it builds one
 // mutant of the pre body (one seeded site: an integer or float add/sub,
@@ -127,8 +128,8 @@
 // of a load or store moved by 4), runs that body against the original
 // with every other body unchanged, and prints the share of mutants
 // detected and after how many trials (bench: 67% with 16 trials, 74%
-// with 64). A wrong peephole in a body is found about as often as a
-// wrong instruction in it.
+// with 64; dsa: 62%). A wrong peephole in a body is found about as often
+// as a wrong instruction in it.
 //
 // Blind spots
 // -----------
