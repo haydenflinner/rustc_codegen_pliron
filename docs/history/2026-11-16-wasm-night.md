@@ -803,7 +803,11 @@ The other opt-in knobs on the same quiet run, 14-row geomean against
 the default's 1.063: `PLIRON_LICM_SLOTPROV` 1.059,
 `PLIRON_MEMCPYOPT_MOVEMARK` 1.062, `PLIRON_WASM_SMALLCOPY` 1.061
 (vm_mandelbrot and vm_physics two points better, the rest equal). All
-19 results equal in each. None is worth a default on these numbers.
+19 results equal in each. SMALLCOPY is back on by default (`8e1bf79`; it was
+off only for the corruption that turned out to be the waffle bug): the
+kernel module is byte-identical with it, and the dsa module with it and
+the recursion rule together returns LLVM's results on all 19 workloads.
+The other two stay opt-in: nothing to gain on these numbers.
 
 `hash_text` reads 1.18 for whichever module is loaded third and 0.99
 for the second; alone each module takes 107 ms. It is a position
