@@ -839,6 +839,77 @@ fn try_forward(
             why!("dst touched between copy and post-copy read");
         }
     }
+    // `dst`'s own lifetime markers. The rebase moves `tmp`'s writes into
+    // `dst` at the writers' positions, and `tmp`'s later reads onto `dst`:
+    // a `dst` marker between a writer and a consumer of the copy's value
+    // (`m` or a `tmp` reader) then calls bytes dead that are in fact
+    // carried across it — `lifetime.start(dst)` right before the copy is
+    // rustc's usual shape for a moved temporary. slotmerge trusts such a
+    // marker as a kill and hands the bytes to another slot (mimas
+    // `install_assoc`: a `Vec` header built early, moved into a struct
+    // whose storage starts late; the header was overwritten by a 36-byte
+    // temporary and the interpreter recursed forever). Walk back from
+    // every consumer, cutting at writers; a marker on the way (or a scan
+    // over budget) drops all of `dst`'s markers, which leaves the slot
+    // live wherever its bytes are used.
+    if st.allocas.get(dbase).is_some() {
+        let dmarks: FxHashSet<Ptr<Operation>> = dbase
+            .uses_iter(ctx)
+            .map(|u| u.user_op())
+            .filter(|&o| {
+                matches!(
+                    st.intrinsics.get(o).map(|s| s.as_str()),
+                    Some("llvm.lifetime.start" | "llvm.lifetime.end")
+                )
+            })
+            .collect();
+        if !dmarks.is_empty() {
+            let wset: FxHashSet<Ptr<Operation>> = writers.iter().map(|&(w, _, _)| w).collect();
+            let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
+            for c in std::iter::once(m).chain(readers.iter().map(|r| r.0)) {
+                if let Some(cb) = c.deref(ctx).get_parent_block() {
+                    stack.push((cb, Some(c)));
+                }
+            }
+            let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
+                FxHashSet::default();
+            let mut steps = 0usize;
+            let mut hit = false;
+            'scan: while let Some((b, upto)) = stack.pop() {
+                if !seen.insert((b, upto)) {
+                    continue;
+                }
+                let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+                let end = upto
+                    .and_then(|u| ops.iter().position(|&o| o == u))
+                    .unwrap_or(ops.len());
+                let mut cut = false;
+                for &o in ops[..end].iter().rev() {
+                    steps += 1;
+                    if steps > 8192 || dmarks.contains(&o) {
+                        hit = true;
+                        break 'scan;
+                    }
+                    if wset.contains(&o) {
+                        cut = true;
+                        break;
+                    }
+                }
+                if !cut {
+                    stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
+                }
+            }
+            if hit {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::memcpyopt", "fwd: dropping {} dst markers of {dbase:?}", dmarks.len());
+                }
+                for o in dmarks {
+                    st.intrinsics.remove(o);
+                    Operation::erase(o, ctx);
+                }
+            }
+        }
+    }
     for &(u, i) in &roots {
         let p = crate::sroa::ptr_plus(ctx, st, dbase, doff, u);
         Operation::replace_operand(u, ctx, i, p);
@@ -1980,5 +2051,76 @@ mod tests {
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
         assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    const LT_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+    "#;
+    const LT: &str = "            lt = llvm.call_intrinsic @\"llvm.lifetime.start\" (eight, dst) : llvm.func <llvm.void (builtin.integer i64, llvm.ptr (0)) variadic = false>;\n";
+    const LT_TAIL: &str = "            r = llvm.load dst : builtin.integer i64;\n            llvm.return\n        }\n    }\n";
+
+    /// Forward the copy in `body`, with its two-operand intrinsic
+    /// registered as `dst`'s `llvm.lifetime.start`; returns how many of
+    /// `dst`'s markers are left.
+    fn dst_markers_after_forward(body: &str) -> usize {
+        let input = format!("{LT_HEAD}{body}{LT_TAIL}");
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, &input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let f = blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .unwrap();
+        let mut m = None;
+        for b in blocks(ctx, f) {
+            for o in ops(ctx, b) {
+                if Operation::is_op::<AllocaOp>(o, ctx) {
+                    st.allocas.insert(o.deref(ctx).get_result(ctx, 0), (8, 8));
+                }
+                if Operation::is_op::<CallIntrinsicOp>(o, ctx) {
+                    if o.deref(ctx).get_num_operands() == 2 {
+                        st.intrinsics.insert(o, "llvm.lifetime.start".to_string());
+                    } else {
+                        st.intrinsics.insert(o, "llvm.memcpy".to_string());
+                        st.consts.insert(
+                            o.deref(ctx).get_operand(ctx, 2),
+                            crate::state::ConstVal::Bits(8),
+                        );
+                        m = Some(o);
+                    }
+                }
+            }
+        }
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m.unwrap()));
+        st.intrinsics
+            .iter()
+            .filter(|(_, n)| n.as_str() == "llvm.lifetime.start")
+            .count()
+    }
+
+    /// `store tmp; lifetime.start(dst); memcpy(dst, tmp)`: the forwarded
+    /// store lands in `dst` ahead of `dst`'s start marker, which would
+    /// then call the stored bytes dead (slotmerge reused them: mimas
+    /// `install_assoc`). The marker has to go with the copy.
+    #[test]
+    fn dst_marker_between_writer_and_copy_dropped() {
+        let n = dst_markers_after_forward(&format!("            llvm.store *tmp <- v;\n{LT}{MC}"));
+        assert_eq!(n, 0, "dst's lifetime.start still sits after the forwarded write");
+    }
+
+    /// The marker ahead of the writer still bounds `dst` correctly.
+    #[test]
+    fn dst_marker_before_writer_kept() {
+        let n = dst_markers_after_forward(&format!("{LT}            llvm.store *tmp <- v;\n{MC}"));
+        assert_eq!(n, 1);
     }
 }
