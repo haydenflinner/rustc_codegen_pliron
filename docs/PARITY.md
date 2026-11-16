@@ -73,7 +73,11 @@ run, apply to native too, and nothing regressed). SIZ 1.519 -> 1.580
 and MEM 1.424 -> 1.454 are worse and were not attributed: the wasm
 bench module was 183.2 KB when the 11-16 session started and is 178.4
 KB now, so that part grew between the two cards, not during it. CMP
-0.918 -> 0.930 is inside the machine's noise.
+0.918 -> 0.930 is inside the machine's noise. STK is where the 11-13
+card left it (1.260 then: the two `driftsort_main` monomorphs have 8 KB
+frames against LLVM's 4 KB because the `memcpyopt` memset/sret-temp
+sink stopped firing there, suspected to be the `frag_copy_stays_whole`
+SROA rule; the rest is `visit_`/`parse_` spill traffic).
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
