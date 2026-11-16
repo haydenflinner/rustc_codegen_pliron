@@ -2840,6 +2840,10 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
     // range from the loop.
     if k > 0 && p.flags.indvars && config().enabled("PLIRON_INDUCT2") && bisect("indvars2") {
         an.invalidate(&p.clctx.func);
+        // The state the second indvars round starts from, for replays.
+        if p.dump {
+            p.dump("licm (before indvars2)");
+        }
         indvars::run(&mut p.clctx.func, an, p.amode_scale, p.derived);
     }
     if k > 0 && p.dump {

@@ -1784,11 +1784,14 @@ fn emit_rev_entry(
     pos.ins().iadd(sum, neg)
 }
 
+/// Every instruction that reads a value, branch arguments included
+/// (`inst_values`, not `inst_args`: a shift or sub that is also passed
+/// on an exit edge has that `brif` as a user and must stay).
 fn inst_users(func: &Function) -> FxHashMap<Value, FxHashSet<Inst>> {
     let mut users: FxHashMap<Value, FxHashSet<Inst>> = FxHashMap::default();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
-            for &a in func.dfg.inst_args(i) {
+            for a in func.dfg.inst_values(i) {
                 users
                     .entry(func.dfg.resolve_aliases(a))
                     .or_default()
