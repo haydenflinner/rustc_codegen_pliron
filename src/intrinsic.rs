@@ -99,12 +99,13 @@ fn assume_range<'a, 'tcx>(b: &mut Builder<'a, 'tcx>, val: Value) {
     if b.cx.const_to_opt_uint(rhs).is_none() {
         return;
     }
-    let rest = b.append_sibling_block("assume_range");
-    let dead = b.append_sibling_block("assume_fail");
-    b.cond_br(val, rest, dead);
-    b.switch_to_block(dead);
-    b.unreachable();
-    b.switch_to_block(rest);
+    // One marker op, not a branch: the IR passes (inline cost, phisimp,
+    // sroa) see the block structure they would without the assume, and
+    // `lower.rs` turns the op into the branch to the `unreachable` trap.
+    // As a `cond_br` here, two helpers of the wasm bench dropped out of
+    // the inliner's 40-op limit.
+    let void = b.type_void();
+    b.intrinsic("llvm.assume", void, &[val]);
 }
 
 impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {

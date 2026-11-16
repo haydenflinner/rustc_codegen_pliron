@@ -270,9 +270,15 @@ fn callee_info(
         let mut bn = 0usize;
         let mut panic_block = false;
         for op in b.deref(ctx).iter(ctx) {
+            let intr = st.intrinsics.get(op);
+            // An `assume` marker emits no code: the body costs what it
+            // would without it. (Its compare is counted either way: the
+            // frontend emits it with or without the marker.)
+            if intr.is_some_and(|s| s == "llvm.assume") {
+                continue;
+            }
             n += 1;
             bn += 1;
-            let intr = st.intrinsics.get(op);
             if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
                 || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
             {

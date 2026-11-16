@@ -54,6 +54,21 @@ pub fn run(
     derived: &VMap<Value>,
     prof: &FxHashMap<Block, u64>,
 ) -> usize {
+    run_with(func, an, loads, derived, prof, false)
+}
+
+/// [`run`]; with `symon` the trip walk also tracks `outside value +
+/// constant` cursors (`PLIRON_UNROLL_SYM`), so a pointer loop over a
+/// fixed-size array (`for b in arr.iter_mut()`: `p == arr + N*size`)
+/// has a decided exit. nbody's position update is that loop.
+pub fn run_with(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    loads: &FxHashSet<Value>,
+    derived: &VMap<Value>,
+    prof: &FxHashMap<Block, u64>,
+    symon: bool,
+) -> usize {
     // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
     let empty_prof = FxHashMap::default();
     let prof: &FxHashMap<Block, u64> = if crate::pass_enabled("PLIRON_PGO_LOOP") {
@@ -99,7 +114,7 @@ pub fn run(
                 };
             }
             let nn = nn.get_or_insert_with(|| NonNull::new(func, cfg, loads, derived));
-            match trip(func, nn, &body, h, entry.clone(), None) {
+            match trip(func, nn, &body, h, entry.clone(), None, symon) {
                 Some((_, _, map)) if used_out.iter().all(|v| map.contains_key(v)) => {}
                 _ => {
                     if pliron_cfg::tracing_on()
@@ -115,7 +130,7 @@ pub fn run(
             }
             let nb = func.dfg.make_block();
             func.layout.insert_block_after(nb, pred);
-            let (exit, out, map) = trip(func, &nn, &body, h, entry, Some(nb)).unwrap();
+            let (exit, out, map) = trip(func, &nn, &body, h, entry, Some(nb), symon).unwrap();
             // Uses past the loop see the last trip's definitions (the loop is
             // only entered via `pred`, so `nb` dominates them now).
             if !used_out.is_empty() {
@@ -280,6 +295,7 @@ fn trip(
     h: Block,
     entry: Vec<Value>,
     nb: Option<Block>,
+    symon: bool,
 ) -> Option<(Block, Vec<Value>, FxHashMap<Value, Value>)> {
     let mut env: FxHashMap<Value, u64> = FxHashMap::default();
     // Constants defined before the loop that `known` alone can't see.
@@ -309,6 +325,9 @@ fn trip(
     let mut slots: FxHashMap<Value, (StackSlot, i64)> = FxHashMap::default();
     let mut mem: FxHashMap<(StackSlot, i64), Byte> = FxHashMap::default();
     let mut vbytes: FxHashMap<Value, Vec<Option<Byte>>> = FxHashMap::default();
+    // Loop values that are `outside value + constant` in the current trip
+    // (a slice iterator's cursor): `p == end` is decided by the offsets.
+    let mut sym: FxHashMap<Value, (Value, i64)> = FxHashMap::default();
     let (mut b, mut args) = (h, entry);
     let (mut visits, mut insts) = (0, 0);
     loop {
@@ -334,13 +353,18 @@ fn trip(
                     *map.get(&a).unwrap_or(&a),
                     *src.get(&a).unwrap_or(&a),
                     addr_of(func, &env, &slots, body, a),
+                    if symon { symof(func, body, &sym, a, 6) } else { None },
                 )
             })
             .collect();
-        for (&p, (c, m, s, sa)) in params.iter().zip(bind) {
+        for (&p, (c, m, s, sa, sy)) in params.iter().zip(bind) {
             match sa {
                 Some(sa) => slots.insert(p, sa),
                 None => slots.remove(&p),
+            };
+            match sy {
+                Some(sy) => sym.insert(p, sy),
+                None => sym.remove(&p),
             };
             match c {
                 Some(c) => env.insert(p, c),
@@ -361,6 +385,10 @@ fn trip(
                 match addr_step(func, &env, &slots, body, i) {
                     Some(a) => slots.insert(rs[0], a),
                     None => slots.remove(&rs[0]),
+                };
+                match if symon { sym_step(func, body, &sym, &env, i) } else { None } {
+                    Some(a) => sym.insert(rs[0], a),
+                    None => sym.remove(&rs[0]),
                 };
             }
             let mut lbytes = None;
@@ -476,6 +504,7 @@ fn trip(
             } else {
                 None
             };
+            let c = c.or_else(|| if symon { sym_cmp(func, body, &sym, i) } else { None });
             if let Some(c) = c {
                 env.insert(rs[0], c);
                 let v = match nb {
@@ -690,6 +719,104 @@ fn why<T>(r: &str) -> Option<T> {
 /// Constant value of `v`, defined outside `body`, folding a few integer ops
 /// (and `(x + c) - x`) and block params whose every incoming argument folds to
 /// the same constant.
+/// `v` as `base + offset`: `base` is defined outside the loop, `offset`
+/// wraps in `v`'s width. Loop values answer from `sym` (the current
+/// trip's bindings); outside values peel their own `iadd`/`isub` of a
+/// constant.
+fn symof(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    sym: &FxHashMap<Value, (Value, i64)>,
+    v: Value,
+    depth: u32,
+) -> Option<(Value, i64)> {
+    use cranelift_codegen::ir::ValueDef;
+    let v = func.dfg.resolve_aliases(v);
+    let ty = func.dfg.value_type(v);
+    if !ty.is_int() || ty.bits() > 64 {
+        return None;
+    }
+    if let Some(&s) = sym.get(&v) {
+        return Some(s);
+    }
+    match func.dfg.value_def(v) {
+        ValueDef::Result(i, 0) => {
+            if func.layout.inst_block(i).is_some_and(|b| body.contains(&b)) {
+                return None;
+            }
+            if depth > 0
+                && let InstructionData::Binary { opcode, args } = func.dfg.insts[i]
+                && matches!(opcode, Opcode::Iadd | Opcode::Isub)
+            {
+                let k = |x: Value| cval(func, body, x, 4).map(|c| c as i64);
+                let peeled = match (opcode, k(args[0]), k(args[1])) {
+                    (Opcode::Iadd, _, Some(c)) => Some((args[0], c)),
+                    (Opcode::Iadd, Some(c), _) => Some((args[1], c)),
+                    (Opcode::Isub, _, Some(c)) => Some((args[0], c.wrapping_neg())),
+                    _ => None,
+                };
+                if let Some((x, c)) = peeled
+                    && let Some((base, o)) = symof(func, body, sym, x, depth - 1)
+                {
+                    return Some((base, o.wrapping_add(c)));
+                }
+            }
+            Some((v, 0))
+        }
+        ValueDef::Param(b, _) if !body.contains(&b) => Some((v, 0)),
+        _ => None,
+    }
+}
+
+/// The `base + offset` of loop instruction `i`'s result, if it steps a
+/// tracked value by a known constant.
+fn sym_step(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    sym: &FxHashMap<Value, (Value, i64)>,
+    env: &FxHashMap<Value, u64>,
+    i: Inst,
+) -> Option<(Value, i64)> {
+    let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else {
+        return None;
+    };
+    let k = |x: Value| known(func, env, x).map(|c| c as i64);
+    let (x, c) = match (opcode, k(args[0]), k(args[1])) {
+        (Opcode::Iadd, _, Some(c)) => (args[0], c),
+        (Opcode::Iadd, Some(c), _) => (args[1], c),
+        (Opcode::Isub, _, Some(c)) => (args[0], c.wrapping_neg()),
+        _ => return None,
+    };
+    let (base, o) = symof(func, body, sym, x, 6)?;
+    Some((base, o.wrapping_add(c)))
+}
+
+/// `icmp eq/ne` of two values on the same base: equal exactly when the
+/// offsets agree in the operands' width (no wrap assumption needed).
+fn sym_cmp(
+    func: &Function,
+    body: &FxHashSet<Block>,
+    sym: &FxHashMap<Value, (Value, i64)>,
+    i: Inst,
+) -> Option<u64> {
+    use cranelift_codegen::ir::condcodes::IntCC;
+    let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] else {
+        return None;
+    };
+    if !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+        return None;
+    }
+    let (bx, ox) = symof(func, body, sym, args[0], 6)?;
+    let (by, oy) = symof(func, body, sym, args[1], 6)?;
+    if bx != by {
+        return None;
+    }
+    let w = func.dfg.value_type(func.dfg.resolve_aliases(args[0])).bits();
+    let d = ox.wrapping_sub(oy) as u64;
+    let d = if w >= 64 { d } else { d & ((1u64 << w) - 1) };
+    Some(u64::from((d == 0) == (cond == IntCC::Equal)))
+}
+
 fn cval(func: &Function, body: &FxHashSet<Block>, v: Value, depth: u32) -> Option<u64> {
     use cranelift_codegen::ir::{Opcode, ValueDef};
     let v = func.dfg.resolve_aliases(v);

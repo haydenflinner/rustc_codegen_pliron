@@ -8507,6 +8507,22 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let r = self.is_fpclass(x, m as u32);
             return self.set1(op, r);
         }
+        if name == "llvm.assume" {
+            // The condition holds here, as a fact on a branch edge: the
+            // other edge is the `unreachable` trap. The CLIF passes read
+            // it like any dominating test (`vrp0`), and `unreach` drops
+            // the branch. The frontend only emits the op for conditions
+            // those passes use (`intrinsic.rs::assume_range`).
+            let c = self.get1(opnds[0]);
+            let ok = self.b.create_block();
+            let dead = self.b.create_block();
+            self.b.set_cold_block(dead);
+            self.b.ins().brif(c, ok, &[], dead, &[]);
+            self.b.switch_to_block(dead);
+            self.b.ins().trap(TrapCode::unwrap_user(2));
+            self.b.switch_to_block(ok);
+            return;
+        }
         if matches!(name, "llvm.lifetime.start" | "llvm.lifetime.end") {
             // `PLIRON_LTUNDEF=1`: outside its lifetime a local's bytes are
             // undefined, so a promoted alloca's variables restart at zero

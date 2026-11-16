@@ -2371,7 +2371,9 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = unroll::run(&mut p.clctx.func, an, p.nonnull, p.derived, p.prof);
+    // Symbolic cursors: wasm only (native was not timed).
+    let sym = p.wasm && pliron_cfg::env_is("PLIRON_UNROLL_SYM", "1");
+    let k = unroll::run_with(&mut p.clctx.func, an, p.nonnull, p.derived, p.prof, sym);
     // The skipped loop is now unreachable, and its trip count still
     // flows into dead params/branches; dropping them frees the slot
     // address arithmetic so slot DSE can see the slot doesn't escape.
@@ -2425,8 +2427,24 @@ fn s_bunroll(p: &mut Pipe, an: &mut Analysis) -> usize {
 fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // The fact fold is wasm-only. Native was not timed; `p.wasm` is
     // false there, so native keeps the edge-drop this pass had.
-    let k = unreach::run(&mut p.clctx.func, p.wasm);
+    // Constant-edge threading is wasm-only for the same reason.
+    let phi = p.wasm && pliron_cfg::env_is("PLIRON_UNREACH_PHI", "1");
+    let k = unreach::run_with(&mut p.clctx.func, p.wasm, phi);
     p.stats.unreached += k;
+    k
+}
+
+/// `unreach` ahead of jumpthread, in functions with an assume edge.
+/// Wasm only: the frontend emits range assumes there only.
+fn s_unreach0(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !p.wasm || !unreach::has_assume_edge(&p.clctx.func) {
+        return 0;
+    }
+    let k = s_unreach(p, an);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("unreach0");
+    }
     k
 }
 
@@ -4534,6 +4552,18 @@ fn s_ivptr(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_vrp0(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !p.wasm || !unreach::has_assume_edge(&p.clctx.func) {
+        return 0;
+    }
+    let k = crate::vrp::run(&mut p.clctx.func, an);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("vrp0");
+    }
+    k
+}
+
 fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::vrp::run(&mut p.clctx.func, an);
     if k > 0 {
@@ -4625,6 +4655,19 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Before any block merge: see `s_scopedfwd`.
         step("scopedfwd", "loadfwd", Gate::OptIn("PLIRON_SCOPED_NOALIAS"), s_scopedfwd)
             .needs(shape::LOAD),
+        // `assume` branches are consumed before anything can trip over
+        // them: an `assume(c <= char::MAX)` branch between a decode join
+        // and its use kept jumpthread from specialising the ASCII arm
+        // (chars_ascii -25% -> 0%). The step folds what the assume
+        // dominates, then drops the branch. `PLIRON_UNREACH_EARLY=1`.
+        // `vrp0` first: the ranges read an assume edge like any other
+        // dominating branch, so facts the assume only implies fold too
+        // (`assume(i < N)` and `i != 0` decide the check on `i - 1`).
+        // Both steps only run in functions that have such a trap.
+        step("vrp0", "vrp", Gate::All(&[Gate::Flag(FlagId::Unreach), Gate::OptIn("PLIRON_UNREACH_EARLY")]), s_vrp0)
+            .needs(shape::BLOCKS2),
+        step("unreach0", "", Gate::All(&[Gate::Flag(FlagId::Unreach), Gate::OptIn("PLIRON_UNREACH_EARLY")]), s_unreach0)
+            .needs(shape::BLOCKS2),
         // Straight-line `jump` pairs merge first, so jumpthread sees a
         // param block and the `brif` it feeds as one (see `mergejump`).
         step("mergejump", "mergejump", Gate::OptIn("PLIRON_MERGEJUMP"), s_mergejump).needs(shape::MULTI),
