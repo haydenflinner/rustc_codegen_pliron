@@ -426,10 +426,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   of dominators alone (a function's several `return` sites each
   forward their `store tmp; memcpy(sret, tmp)`), and
   `constload::forward_copies` runs again after phisimp.
-  `PLIRON_WASM_SMALLCOPY=1` (opt-in): the wasm emitter expands constant
-  copies of at most 16 bytes instead of emitting `memory.copy`. (The
-  corruption once blamed on it was a waffle rematerialization bug,
-  fixed in `5d703d0`.)
+  `PLIRON_WASM_SMALLCOPY=0`: off switch, default on again since the
+  afternoon: the wasm emitter expands constant copies of at most 16
+  bytes instead of emitting `memory.copy`. (The corruption once blamed
+  on it was a waffle rematerialization bug, fixed in `5d703d0`.)
 - 2026-11-16 afternoon, each opt-in
   (`docs/history/2026-11-16-wasm-night.md`, "Afternoon"):
   `PLIRON_INLINE_ONCE=2` (wasm: the single-caller bonus for loop-free
