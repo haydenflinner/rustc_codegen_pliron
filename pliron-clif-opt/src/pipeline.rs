@@ -1846,7 +1846,46 @@ fn giant_steps_env() -> Vec<String> {
 
 // r[impl clif.step.giant]
 // r[impl clif.step.shape]
+/// `PLIRON_STEP_FNS=<step>=<lo>..<hi>`: run step `<step>` only in the
+/// functions whose `fn_hash` is in `[lo, hi)` (decimal or `0x` hex), and
+/// everywhere else as usual. `PLIRON_OPT_FNS` selects functions for the
+/// whole optimizer and `PLIRON_OPT_BISECT` needs the serial paths; this
+/// halves one step's function set per probe with the build left
+/// parallel, which is what the looprot hunt in loro-internal needed
+/// (33,000 functions, one step). `PLIRON_STEP_FNS_LOG=<file>` appends
+/// `<hash> <name>` for every function the step was allowed in.
+fn step_fn_allowed(step: &str, fname: &str) -> bool {
+    static SEL: std::sync::LazyLock<Option<(String, u32, u64)>> = std::sync::LazyLock::new(|| {
+        let v = crate::env_get("PLIRON_STEP_FNS")?;
+        let (step, range) = v.split_once('=')?;
+        let (lo, hi) = range.split_once("..")?;
+        let num = |x: &str| match x.strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16).ok(),
+            None => x.parse::<u64>().ok(),
+        };
+        Some((step.to_string(), num(lo)? as u32, num(hi)?))
+    });
+    let Some((st, lo, hi)) = SEL.as_ref() else {
+        return true;
+    };
+    if st != step {
+        return true;
+    }
+    let h = pliron_cfg::fn_hash(fname);
+    let ok = h >= *lo && u64::from(h) < *hi;
+    if ok && let Some(f) = crate::env_get("PLIRON_STEP_FNS_LOG") {
+        use std::io::Write;
+        if let Ok(mut o) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(o, "{h:#010x} {fname}");
+        }
+    }
+    ok
+}
+
 fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Duration) {
+    if !step_fn_allowed(s.name, p.fname) {
+        return;
+    }
     if let Some(b) = s.bisect
         && !crate::config::bisect_in(b, p.fname)
     {

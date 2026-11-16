@@ -336,6 +336,11 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_OPT_FNS=lo..hi|~substr|@file` (`!` inverts),
   `PLIRON_OPT_FNS_LOG=<file>` — per-function optimization selection.
 - `PLIRON_OPT_BISECT=N`, `PLIRON_OPT_BISECT_DEBUG=1` — transform budget.
+- `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
+  functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
+  `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
+  find the function one step breaks in a crate too big for the serial
+  `PLIRON_OPT_BISECT` paths; set `PLIRON_MEMCACHE=0` with it.
 - `PLIRON_PAR=0|N` — lowering threads.
 - `PLIRON_VERIFY=1|full` — Cranelift verifier after the pipeline / each step.
   On wasm the verifier runs once after the pipeline by default (nothing
