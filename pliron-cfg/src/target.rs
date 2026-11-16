@@ -101,6 +101,16 @@ impl Target {
     pub const fn ptr_bytes(&self) -> u64 {
         (self.ptr_bits / 8) as u64
     }
+
+    /// The machine word in bytes, for cost rules that count in register
+    /// values: an integer or float of this size or less is one register
+    /// value (one wasm local, one GPR). The pointer width on every target
+    /// we compile for (4 on wasm32, where an `i32` or `f32` is a whole
+    /// value). Uses: sroa's fragment rule (`PLIRON_SROA_FRAGWORD`
+    /// overrides it).
+    pub const fn word_bytes(&self) -> u64 {
+        self.ptr_bytes()
+    }
 }
 
 /// [`Target::host`]: what `State::default()` carries in unit tests. The
@@ -120,6 +130,8 @@ mod tests {
     fn constructors() {
         assert_eq!(Target::wasm32().ptr_bytes(), 4);
         assert_eq!(Target::aarch64().ptr_bytes(), 8);
+        assert_eq!(Target::wasm32().word_bytes(), 4);
+        assert_eq!(Target::x86_64().word_bytes(), 8);
         assert!(Target::wasm32().is_wasm() && !Target::x86_64().is_wasm());
         assert_eq!(Target::default(), Target::host());
         assert_eq!(Target::host().ptr_bits, usize::BITS);
