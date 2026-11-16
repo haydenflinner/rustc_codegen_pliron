@@ -86,7 +86,7 @@ Running log. Newest decisions that want a second look are under
    `532caf8`: the SROA fragment word is the pointer width, wasm32
    only). The first two apply to native too. **A third,
    `PLIRON_WASM_SMALLCOPY`, was default-on from 07:10 to 09:30 and I
-   took it out again (`d166d97`): see item 16.**
+   took it out again (`d166d97`): see item 15.**
    Checked with the gate, `harness/crates.py --tier 1` (20 crates,
    knobs forced on), the wasm kernels, the 19 cross-checked dsa
    workloads and the 09:00 parity card (native 0.908 -> 0.873). The
@@ -111,7 +111,7 @@ Running log. Newest decisions that want a second look are under
 14. **`harness/dsa/workloads/` is uncommitted** because this fork is
     public and those files are copies of dsa page sources. The harness
     needs them to run from a fresh clone. Your call.
-16. **`PLIRON_WASM_SMALLCOPY` was on by default for 2h20 with a bug in
+15. **`PLIRON_WASM_SMALLCOPY` was on by default for 2h20 with a bug in
     it, and the unoptimized build of dsa is wrong in three more ways.**
     At 09:15 I built the module with `PLIRON_OPT_BISECT=0` on the
     final backend to close the "does it work with optimizations off"
@@ -134,7 +134,7 @@ Running log. Newest decisions that want a second look are under
     `PLIRON_OPT_BISECT` hunt compares against. Packages:
     `/tmp/dsa-bench/pkg-pliron-ob0b` (defaults), `ob0c`
     (`ASSUME_RANGE=0`), `ob0d` (also `SMALLCOPY=0`).
-15. Not turned on, each measured, each a lead: `PLIRON_INLINE_ONCE=1`
+16. Not turned on, each measured, each a lead: `PLIRON_INLINE_ONCE=1`
     on wasm (pages +2-3%, three kernels worse),
     `PLIRON_INLINE_CALLER_MAX=4000` (size -10%, speed worse). See
     "dsa, performance".
@@ -382,7 +382,7 @@ What moved it:
 3. **`PLIRON_WASM_SMALLCOPY`** (`03668fd`): 670 `memory.copy` of at
    most 16 constant bytes in the module (359 of zero bytes: BTree
    nodes of zero-sized values) become 39. No measured effect on these
-   workloads. **Opt-in again since 09:30** ("Review these" item 16).
+   workloads. **Opt-in again since 09:30** ("Review these" item 15).
 4. **Static constructors** (`30ff21b`, by a sub-agent in a worktree,
    reviewed and cherry-picked): `pliron-wasm-ld` built
    `__wasm_call_ctors` and nothing called it in a `--no-entry` link, so
