@@ -32,7 +32,7 @@ use std::process::ExitCode;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::entity::EntityRef as _;
-use cranelift_codegen::ir::Function;
+use cranelift_codegen::ir::{Block, Function, Inst, StackSlot};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::Configurable;
 use cranelift_module::FuncId;
@@ -119,7 +119,7 @@ fn main() -> ExitCode {
         }
         ["step", name, file] => {
             let (f, facts) = load(Path::new(file));
-            run_one(&*isa, name, f, &facts, &opts).0
+            run_one(&*isa, name, f, &facts, &opts, &mut None).0
         }
         ["pipeline", file] => pipeline_checked(&*isa, Path::new(file), &opts),
         ["pair", before, after] => {
@@ -269,12 +269,30 @@ fn collect_clif(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `Pipe::lifetimes`: the lifetime markers as the pipeline carries them.
+type Lts = Vec<(Vec<StackSlot>, Option<Inst>, Block, bool)>;
+
 /// A `Pipe` over `func` with the saved facts, empty pliron-side maps, and
 /// every pass category on (as at -O with no `PLIRON_*` overrides).
 fn with_pipe<R>(
     isa: &dyn TargetIsa,
     func: Function,
     facts: &OwnedFacts,
+    k: impl FnOnce(&mut Pipe) -> R,
+) -> R {
+    with_pipe_lts(isa, func, facts, None, k)
+}
+
+/// [`with_pipe`] with the lifetime markers given (`lts`) instead of read
+/// from the file's header. The header places a marker by the ordinal of
+/// its anchor instruction in the function *as recorded*; for a function
+/// some steps have already rewritten, those ordinals name other
+/// instructions.
+fn with_pipe_lts<R>(
+    isa: &dyn TargetIsa,
+    func: Function,
+    facts: &OwnedFacts,
+    lts: Option<Lts>,
     k: impl FnOnce(&mut Pipe) -> R,
 ) -> R {
     let mut clctx = Context::for_function(func);
@@ -393,7 +411,7 @@ fn with_pipe<R>(
         facts.scoped_na.clone(),
         facts.deref.clone(),
         Default::default(),
-        facts.lifetimes(&clctx.func),
+        lts.unwrap_or_else(|| facts.lifetimes(&clctx.func)),
     );
     // `; diffcheck-names:` (FuncRef -> symbol) back into the module's
     // symbol table by user-name index, so name-keyed steps (`memcmpk`)
@@ -483,15 +501,19 @@ fn with_pipe<R>(
 }
 
 /// Runs step `name` on `func` and checks it. Returns (ok, function after).
+/// `lts`: the lifetime markers a previous step of the same function left
+/// (`None`: the file's), replaced by the ones this step leaves.
 fn run_one(
     isa: &dyn TargetIsa,
     name: &str,
     func: Function,
     facts: &OwnedFacts,
     o: &Opts,
+    lts: &mut Option<Lts>,
 ) -> (bool, Function) {
     let before = func.clone();
-    let after = with_pipe(isa, func, facts, |p| {
+    let carried = lts.take();
+    let after = with_pipe_lts(isa, func, facts, carried, |p| {
         // A saved `before.clif` comes from mid-pipeline, possibly with
         // edits the pipeline hadn't reaped yet: replay reap-gated steps
         // (`iconst128`'s `post_sweep`) as the pipeline would have, or a
@@ -506,6 +528,7 @@ fn run_one(
                 eprintln!("carry@{name} {d} -> {w}");
             }
         }
+        *lts = Some(p.lifetimes.clone());
         p.clctx.func.clone()
     });
     if after.display().to_string() == before.display().to_string() {
@@ -598,8 +621,15 @@ fn pipeline_checked(isa: &dyn TargetIsa, file: &Path, o: &Opts) -> bool {
         pipeline::selected_names(p)
     });
     let mut ok = true;
+    // The markers go from step to step as in the pipeline. Each step
+    // used to read them from the header again, against a function the
+    // earlier steps had rewritten: slotmerge then merged by markers at
+    // the wrong instructions, and a function the whole pipeline breaks
+    // passed every step here (two of the dsa corpus, 2026-11-16, where
+    // this now names slotmerge as `PLIRON_DIFFCHECK=step` does).
+    let mut lts = None;
     for n in names {
-        let r = run_one(isa, n, func, &facts, o);
+        let r = run_one(isa, n, func, &facts, o, &mut lts);
         ok &= r.0;
         func = r.1;
         if !r.0 {

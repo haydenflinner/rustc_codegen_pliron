@@ -92,6 +92,44 @@ function. Consequences:
 - A clean corpus replay does **not** exonerate a step.
 - A step that does nothing offline may still be the corruptor.
 
+### Reading a corpus mismatch
+
+`report --check` compares the recorded function with the pipeline's
+output. To go from "mismatch" to a cause (the five reports of
+2026-11-16 took these steps; three were the checker, two a stale corpus):
+
+1. **Which step.** Copy the file into a directory of its own and run
+   `PLIRON_DIFFCHECK=step PLIRON_DIFFCHECK_DIR=<out> clif-check report
+   <dir> out.json --check` (`PLIRON_CLIF_WASM=1` for a wasm corpus): the
+   pipeline checks every step inside its one `Pipe` and saves
+   `<out>/<fn>.<step>/{before,after}.clif`. `clif-check pair before.clif
+   after.clif` replays that pair. (`clif-check pipeline <file>` builds a
+   `Pipe` per step; it carries the lifetime markers from step to step
+   since 2026-11-16, before that slotmerge replayed with markers at the
+   wrong instructions and passed.)
+2. **Which bytes.** The message lists the differing bytes (`-`: left at
+   the seeded value) and, when the original did not return under the
+   other stack fill, what it did instead.
+3. **Where they come from.** `PLIRON_DIFFCHECK_WATCH=<hex address>
+   PLIRON_TRACE=pliron::diffcheck=info` logs every load, store, copy and
+   stub fill covering that byte in each run, with the instruction; a copy
+   names its source byte, so watch that next. `PLIRON_DIFFCHECK_PATH=1`
+   logs the blocks each run enters (diff the two for a step that keeps
+   block numbers). A stack address is `stack_base + slot offset`: slots
+   sit one per 4 KiB page in index order, larger ones on as many pages as
+   they need.
+4. **Is the original's value one the program determines?** A byte the
+   original never wrote (an enum's payload behind a stored tag, copied
+   whole) may differ. A byte written *ahead of the slot's
+   `lifetime.start`* and read after it may not, but slotmerge is right
+   to reuse it: the marker is wrong, and the pass that put the write
+   there is upstream (`memcpyopt` until `7ee65e8`). Check the markers
+   against the code before blaming a CLIF step.
+5. **How old is the corpus?** A recorded function is the IR passes'
+   output at recording time. `ls -lT target/corpus/<set> | head` against
+   `git log` of `pliron-ir-opt/` and `pliron-clif-lower/`: a mismatch can
+   be a bug fixed since. Re-record before spending time on one.
+
 Fix direction: extend `OwnedFacts`/`corpus_dump` to serialize the remaining
 `Pipe` fact tables (done for `scoped_na`, since 2026-11-13 including the
 clone-entry block params that are `PLIRON_SCOPED_NOALIAS` candidates, and
