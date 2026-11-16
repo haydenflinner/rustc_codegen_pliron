@@ -64,7 +64,7 @@ ALIAS = {
     "lib": CORE,
     "inline": ["inlinecm", "inlinerec", "inlinerecx", "std", "sroa"],
     "sroa": ["sroa"],
-    "memcpyopt": ["sroa", "std"],
+    "memcpyopt": ["sroa", "std", "mcrdwrap"],
     "xcgu": ["xcgurot", "xcgufnptr", "std"],
     "wasm": ["wasm_smoke"],
     "lto": ["lto"],

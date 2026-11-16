@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std
+#   o0std mcrdwrap
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -563,6 +563,21 @@ t_inlinerecx() {
   if [ "$n" -gt 8 ]; then echo "inlinerecx: $n sites inlined into defaulted, the clone cycle was unrolled" >&2; return 1; fi
   grep -aqE '9defaulted.* -> .*reject \(rec-chain\)' $out/inlinerecx.log || { echo "inlinerecx: no rec-chain rejection in defaulted" >&2; return 1; }
   $out/inlinerecx$exe | diff --strip-trailing-cr - tests/inlinerecx/expected.out
+}
+
+t_mcrdwrap() {
+  # memcpyopt: one temporary feeds two `String::new()` values, the first
+  # built before a loop and appended to in it, the second built in the
+  # loop. Forwarding the first copy rebased the temporary onto the outer
+  # string, so from the second iteration on the inner one started as a
+  # copy of it: two owners of one heap block, an abort in the allocator
+  # (dsa `emit_shrink`, 2026-11-16; this program aborted the same way on
+  # defaults). The wrap scan of post-copy readers must refuse that
+  # forward here (if it has nothing to refuse, the program no longer
+  # tests the rule), and the output matches stock rustc's.
+  PLIRON_TRACE=pliron::memcpyopt=debug rustc $BE --edition 2021 -O tests/mcrdwrap/main.rs -o $out/mcrdwrap$exe 2> $out/mcrdwrap.log || { tail -20 $out/mcrdwrap.log >&2; return 1; }
+  grep -aq 'dst changed on a route from the copy to a post-copy read' $out/mcrdwrap.log || { echo "mcrdwrap: the reader wrap scan refused no forward" >&2; return 1; }
+  $out/mcrdwrap$exe | diff --strip-trailing-cr - tests/mcrdwrap/expected.out
 }
 
 # r[verify par.facts.thin-claim]
@@ -1393,6 +1408,7 @@ want invokeblk && t_invokeblk
 [[ -z "$exe" ]] && want resumehoist && t_resumehoist
 want inlinerec && t_inlinerec
 want inlinerecx && t_inlinerecx
+want mcrdwrap && t_mcrdwrap
 want xfactsplugin && t_xfactsplugin
 want deadfree && t_deadfree
 want lowerfree && t_lowerfree

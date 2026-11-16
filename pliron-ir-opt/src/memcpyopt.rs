@@ -899,6 +899,9 @@ fn try_forward(
     // Under the writer-cut rule the route scan has already proven the
     // same property for every reader, so these checks are only needed
     // when it did not run.
+    // `PLIRON_MEMCPYOPT_RDWRAP=0`: without the wrap scan of post-copy
+    // readers below (the rule until 2026-11-16; for bisecting only).
+    let rdwrap = pliron_cfg::pass_enabled("PLIRON_MEMCPYOPT_RDWRAP");
     for &(r, ro, rh) in &readers {
         if full {
             continue;
@@ -952,6 +955,56 @@ fn try_forward(
         }
         if any_between(ctx, st, dom, f, r, m, &set) {
             why!("dst touched between copy and post-copy read");
+        }
+        // The window above is the first visit only: it calls everything
+        // the reader's block dominates "after the reader". A reader in a
+        // loop the copy sits outside of runs again, and what the loop did
+        // to `dst` after the reader is then ahead of it (`let mut body =
+        // String::new();` before a loop whose body builds another empty
+        // `String` from the same constant temporary and then appends to
+        // `body`: rebased, the second string started as a copy of `body`
+        // — two owners of one heap block, dsa's `emit_shrink`). `tmp`
+        // itself never changes there (no writer lies on a route from the
+        // copy to a reader it dominates), so on every route from `r` back
+        // to `m` nothing may change the reader's range of `dst`: walk
+        // backward from `r`, cut at `m`, refuse at a `Write`/`Other`
+        // touch. Reads are fine. `r`'s own block is scanned whole when a
+        // route comes back to it.
+        if rdwrap {
+            let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
+            if let Some(rb) = r.deref(ctx).get_parent_block() {
+                stack.push((rb, Some(r)));
+            }
+            let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
+                FxHashSet::default();
+            let mut steps = 0usize;
+            while let Some((b, upto)) = stack.pop() {
+                if !seen.insert((b, upto)) {
+                    continue;
+                }
+                let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
+                let end = upto
+                    .and_then(|u| ops.iter().position(|&o| o == u))
+                    .unwrap_or(ops.len());
+                let mut cut = false;
+                for &o in ops[..end].iter().rev() {
+                    steps += 1;
+                    if steps > 8192 {
+                        why!("reader wrap scan over budget");
+                    }
+                    if o == m {
+                        cut = true;
+                        break;
+                    }
+                    if t.get(&o).is_some_and(|&k| k != TouchKind::Read) {
+                        why!("dst changed on a route from the copy to a post-copy read");
+                    }
+                }
+                if cut {
+                    continue;
+                }
+                stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
+            }
         }
     }
     // `dst`'s own lifetime markers. The rebase moves `tmp`'s writes into
@@ -1884,14 +1937,20 @@ fn try_byval(ctx: &mut Context, st: &mut State, m: Ptr<Operation>) -> bool {
 // r[impl iropt.memcpyopt]
 pub fn run(ctx: &mut Context, st: &mut State) {
     let mut n = 0;
+    // The symbol is only for the trace: the `fwd:` lines that follow a
+    // `fn` line belong to that function.
+    let trace = pliron_cfg::tracing_on();
     let funcs: Vec<_> = st
         .funcs
-        .values()
-        .map(|f| (f.op, f.exts.params.clone()))
+        .iter()
+        .map(|(name, f)| (f.op, f.exts.params.clone(), trace.then(|| name.clone())))
         .collect();
-    for (f, params) in funcs {
+    for (f, params, name) in funcs {
         if !opt_body(ctx, st, f) {
             continue;
+        }
+        if let Some(name) = name {
+            tracing::debug!(target: "pliron::memcpyopt", "fn {name}");
         }
         let bname = crate::bisect_name(st, f);
         let Some(entry) = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head() else {
@@ -2068,6 +2127,59 @@ mod tests {
         let st = &mut State::default();
         let (f, m) = fixture(&input, st, ctx);
         assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// `HEAD` with a partial writer of `tmp` and the copy ahead of the
+    /// loop; the caller supplies the loop body.
+    fn copy_before_loop(body: &str) -> String {
+        let pre = format!("            four = llvm.constant <builtin.integer <3: i32>> : builtin.integer i32;\n            llvm.store *tmp <- four;\n{MC}            llvm.br ^loop()\n          ^loop():\n");
+        let head = HEAD.replace("            llvm.br ^loop()\n          ^loop():\n", &pre);
+        assert_ne!(head, HEAD);
+        format!("{head}{body}{TAIL}")
+    }
+
+    /// A partial writer and the copy before the loop, a `tmp` reader in
+    /// it, and `dst` changed after the reader: the reader's second visit
+    /// still read the writer's bytes from `tmp`, rebased it would read
+    /// what the loop left in `dst` (dsa `emit_shrink`: `to_string`'s
+    /// empty buffer became a copy of the `String` the loop appends to,
+    /// and the allocator met a block with two owners). Must refuse.
+    #[test]
+    fn post_copy_reader_in_loop_with_dst_write_refused() {
+        let input = copy_before_loop(
+            "            r = llvm.load tmp : builtin.integer i64;\n            llvm.store *dst <- v;\n",
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// Same shape with `dst` only read in the loop: every visit of the
+    /// reader sees the writer's bytes in `dst` — still forwarded.
+    #[test]
+    fn post_copy_reader_in_loop_read_only_forwarded() {
+        let input = copy_before_loop(
+            "            r = llvm.load tmp : builtin.integer i64;\n            r2 = llvm.load dst : builtin.integer i64;\n",
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+    }
+
+    /// The `dst` write sits ahead of the reader in the loop body: the
+    /// first visit already reads changed bytes. Must refuse (the window
+    /// check, before and after the wrap scan).
+    #[test]
+    fn post_copy_reader_in_loop_dst_write_first_refused() {
+        let input = copy_before_loop(
+            "            llvm.store *dst <- v;\n            r = llvm.load tmp : builtin.integer i64;\n",
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
     }
 
     const ESC_HEAD: &str = r#"

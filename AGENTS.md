@@ -430,6 +430,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   afternoon: the wasm emitter expands constant copies of at most 16
   bytes instead of emitting `memory.copy`. (The corruption once blamed
   on it was a waffle rematerialization bug, fixed in `5d703d0`.)
+- `PLIRON_MEMCPYOPT_RDWRAP=0` — memcpyopt without the loop-wrap scan
+  of post-copy readers (a miscompile, for bisecting only: a temporary
+  read again inside a loop that changes the copy's destination;
+  `docs/history/2026-11-16-memcpyopt-reader-wrap.md`, stanza
+  `mcrdwrap`). `PLIRON_TRACE=pliron::memcpyopt=debug` names the
+  function (`fn <symbol>`) ahead of its `fwd:` lines.
 - 2026-11-16 afternoon, each opt-in
   (`docs/history/2026-11-16-wasm-night.md`, "Afternoon"):
   `PLIRON_INLINE_ONCE=2` (wasm: the single-caller bonus for loop-free
