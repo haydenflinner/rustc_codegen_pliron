@@ -52,6 +52,33 @@ Running log. Newest decisions that want a second look are under
    log below. Left on because chars_mixed (+19.9% -> -1.4%) and the
    module size depend on the same two knobs.
 
+6. **`~/code/dsa` (`literate-wasm`, features `eval,squish,cad`) does not
+   run yet under pliron.** A background agent built it with both
+   compilers (scripts in `harness/dsa/`, state in
+   `/tmp/dsa-bench/findings/STATUS.md`). At the start of the night the
+   pliron build hit four compiler panics and three runtime failures.
+   Fixed so far, each with a regression test: regex-syntax
+   (`punroll`/HALFUNROLL), jiff (second indvars round), literate-eval
+   (`tailrec` overflow), rapier2d (`bunroll`), blake3 (`wpeep`
+   keep-on-stack, a silent miscompile at default settings since before
+   tonight). **Still open when this was written:** loro CRDT panics
+   (`oplog.rs:1432 unwrap on None`, postcard "varint that didn't
+   terminate") and the interpreter's endless `Ty::clone` /
+   `FnHeader::clone` recursion. Both survive `PLIRON_WASM_PEEP=0`.
+   yaml-rust (default features only) also fails the verifier.
+   No dsa benchmark number exists until the module runs.
+7. **The default-features dsa build needs 5-7 GB per rustc under
+   pliron** (polars-core 6.8 GB, typst-library 5.9 GB, vortex-array
+   5.7 GB when `earlyoom` killed them). At `-j 5` that pushed the
+   machine into swap. Not looked at.
+8. **`HALFUNROLL` was default-on for about an hour with the
+   regex-syntax bug in it** (`8c83f1d` to `e843306`). The verifier
+   caught it at compile time; nothing was miscompiled silently. The
+   kernels and the gate have no `binary_search_by` whose result leaves
+   the loop as a plain SSA use. The gate's corpora (std, smoke, clcg)
+   are replayed on the native pipeline, so wasm-only paths are only
+   covered by `wasm_smoke` and the wasm sysroot leg.
+
 ## What landed
 
 | commit | what |
@@ -59,6 +86,15 @@ Running log. Newest decisions that want a second look are under
 | `06626f0` | punroll: the peel's `full_unroll` deleted the residual loop on `trip_max`, a cost estimate (unknown start read as 0, `!=` bounds a stepping counter can skip). `while i != 0 { i += 2 }` lost its loop. `loopidiom::trip_max_exact` is the bound that may delete code. |
 | `c29809a` | `.cargo/config.toml`: no rustc wrapper inside the repo. |
 | `aa5dbf3` | `PLIRON_UNREACH_PHI`, `PLIRON_ASSUME_RANGE` as a marker op + `PLIRON_UNREACH_EARLY` (`vrp0`, `unreach0`), `PLIRON_UNROLL_SYM`; all opt-in in that commit. |
+
+| `8c83f1d` | ASSUME_RANGE, UNREACH_EARLY, UNREACH_PHI, UNROLL_SYM, HALFUNROLL default on (wasm). |
+| `4f4b3bf`, `68d4e93` | `vrp2` (late range pass) and REVCMP, then default on (wasm): strwork +10.6% -> +7.1%. `run.mjs --best`. |
+| `28473ee`, `98553c9` | waffle: arm arguments stay out of the edge remat (`PLIRON_WTREEREMAT_CONDARG`), then default: parse_only -0.7% -> -11%. `armhoist` (opt-in). |
+| `e843306` | punroll halving unroll: loop values named past the exit (regex-syntax). |
+| `b67567f` | indvars reverse index: a sub passed on an exit edge is still used (jiff). |
+| `98a6df2` | tailrec: signed min/max identities without overflow (literate-eval). |
+| `b60ceb0` | wpeep keep-on-stack: keep a write a hoisted get reads (blake3 miscompile). `run_straight` differential interpreter for wpeep tests. |
+| `faf61bc` | bunroll: remap a copy's clones once the whole copy exists (rapier2d). |
 
 ## Findings worth keeping
 
@@ -88,3 +124,24 @@ Running log. Newest decisions that want a second look are under
   compare is `load a[off]; load b[off]; br_if ne; off -= 4; br_if`;
   ours walks two pointers with two end tests and builds an `Ordering`
   it then re-tests.
+- **V8 does not make up for inlining we skip.** A flat 30-op inline
+  limit (`PLIRON_INLINE=30`) is geomean 1.47 on the bench; non-loop
+  thresholds of 128 and 64 (`PLIRON_INLINE_WASM_COLD`) are +75..150%
+  on the chars kernels and also drop V8's own budget for `fib`. The
+  512-op wasm limit stays.
+- **A move-only arm is free in V8, an arm with one instruction is
+  not.** `brif c, join(args), other` whose edge only moves values
+  compiles to a branch straight to the join; with one `add` on the edge
+  V8 emits the arm as a block plus a jump. waffle's edge remat was
+  creating those. Loop exits and back edges are the cases where the
+  edge is still the right place.
+- **Timing on this machine tonight**: load average 30-60 from other
+  workspaces. Median round-ratios wander by tens of percent;
+  `run.mjs --best` (min/min per layout) holds to about a point. Spotlight
+  was indexing `target/` after the rebuild; `target/.metadata_never_index`
+  stops it.
+- `harness`-level tools written tonight and left in the scratchpad, not
+  the repo: per-loop V8 tick attribution (`hotloops.py`: ticks per
+  machine-code loop and per instruction, with the wasm offsets inside),
+  `mcrange.py` (TurboFan listing of an offset range). Worth moving into
+  `harness/v8/` if they are wanted.
