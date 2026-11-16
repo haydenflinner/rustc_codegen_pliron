@@ -120,6 +120,67 @@ traffic as before.
 | tokenize | 5.628 ms | 5.797 ms | 1.030 |
 <!-- SCOREBOARD:END -->
 
+**wasm kernels, 2026-11-16** (the table above is the last `parity.py`
+run and predates this; `node bench/wasm/run.mjs llvm.wasm pliron.wasm
+--layouts=3 --best`, min/min per layout, main at `f13cb0d`): geomean
+**0.924** of 16 (was 1.019 in the card, 0.945 at the start of
+2026-11-16).
+
+| kernel | change vs LLVM | | kernel | change vs LLVM |
+|---|---|---|---|---|
+| chars_alpha | -12.6% | | iterw | -22.6% |
+| chars_ascii | -25.2% | | matmul | -27.0% |
+| chars_mixed | -0.7% | | nbody | +1.0% |
+| contains_rng | -0.3% | | parse_only | -11.0% |
+| eqbug | -3.4% | | sieve | -2.1% |
+| fib | -7.3% | | sortw | +0.7% |
+| hashmap | +2.2% | | strwork | +5.8% |
+| hmget | +5.5% | | tokenize | -14.4% |
+
+Behind LLVM: strwork (`dragon::format_exact`), hmget and hashmap (a
+few percent more moves in V8's code for the same probe loop).
+`docs/history/2026-11-16-wasm-night.md` has what moved and what was
+tried.
+
+### Held-out wasm program: dsa (not in the card)
+
+`~/code/dsa`'s `literate-wasm` (wasm-bindgen cdylib: Loro CRDT page,
+the Mimas compiler and bytecode interpreter, rapier2d soft bodies),
+features `eval,squish,cad`, never tuned on before 2026-11-16.
+`harness/dsa/build.sh {llvm,pliron} NAME` then `node
+harness/dsa/bench.mjs --llvm=DIR --pliron=DIR` (results are
+cross-checked; a mismatch is reported and left out of the geomean).
+2026-11-16, main at `f13cb0d`, pliron/LLVM, median of 9 rounds:
+
+| workload | pliron/LLVM | | workload | pliron/LLVM |
+|---|---|---|---|---|
+| vm_loop | 1.03 | | compile_page | 1.05 |
+| vm_fib_rec | 0.97 | | checks_page | 1.04 |
+| vm_mandelbrot | 1.07 | | live_page | 1.04 |
+| vm_physics | 0.97 | | dims_page | 1.24 |
+| vm_sieve | 1.02 | | game_tetris | 0.79 |
+| vm_collections | 0.97 | | game_asteroids | 1.44, **wrong result** |
+| vm_strings | 1.05 | | crdt_edits | 0.49 * |
+| vm_match | 1.03 | | crdt_sync | 0.51 * |
+| vm_closures | 1.04 | | ink_strokes | 0.37 * |
+| hash_text | 0.99..1.17 | | | |
+
+\* not like for like: rust-lld's export wrappers rerun every static
+constructor on each call into the LLVM module; ours run them once.
+The fifteen comparable rows are geomean **1.02**. At the first run that
+morning nine workloads failed or returned wrong results and the
+interpreter rows were 1.17 to 1.56.
+
+Open on this program: `game_asteroids` (f32 last-bit drift in
+rapier2d, narrowed to that crate), **code size 50.3 MB against LLVM's
+18.4 MB** (35,774 functions against 19,544; LLVM inlines and deletes
+single-caller instances such as each `collect()`'s `from_iter`, we
+keep 1,225 of those; `PLIRON_INLINE_ONCE=1` does that on wasm and is
+2-3% faster on the page rows but 14-17 points slower on the `hmget`
+and `tokenize` kernels, so it is not on), compile memory (the default
+feature set with polars and typst needs 5-7 GB per rustc and was not
+built), and `dims_page`.
+
 ### Held-out runtime (not in the card)
 
 SPD is measured on the kernels above, which the backend has been tuned

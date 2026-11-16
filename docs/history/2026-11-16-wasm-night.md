@@ -340,6 +340,14 @@ Tried and not kept:
 - `PLIRON_INLINE_CALLER_MAX=4000` (default 20000): module 50.3 -> 44.9
   MB, but vm_physics 0.99 -> 1.24, vm_match 1.01 -> 1.09, hash_text
   1.00 -> 1.32. A caller size cap is the wrong lever for the size gap.
+- `PLIRON_INLINE_ONCE=1` (single-caller inlining, off on wasm since
+  the 40-op days): functions 35,774 -> 27,066, but code 40.6 -> 43.9 MB.
+  Pages 2-3% faster (compile_page 1.03 -> 1.00, dims_page 1.26 -> 1.22,
+  tetris 0.78 -> 0.71), kernels `hmget` +5.5% -> +19.9% and `tokenize`
+  -14.4% -> +3.1%: with it the whole kernel (`repeat`'s closure, one
+  caller) lands in the exported function next to its set-up code and
+  the same loop runs slower there. That is the thing to understand
+  before turning it on; LLVM inlines the same way and does not pay.
 - Folding every GOT `global.get` to `i32.const` in the linker (2404
   globals -> 1, +0.18% size): no change outside noise. V8 handles an
   immutable global as well as a constant here.
