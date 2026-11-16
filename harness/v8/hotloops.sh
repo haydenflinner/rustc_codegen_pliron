@@ -5,7 +5,9 @@
 # instructions. hotw.sh attributes ticks to the nearest source position,
 # which smears a loop without trapping ops over whatever precedes it.
 H=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$H/../.." && pwd); OUT=$ROOT/target/v8prof; mkdir -p "$OUT"
-wasm=$1; idx=$(wasm-objdump -x "$wasm" | grep -E "^ - func\[[0-9]+\] sig=.*<[^>]*$3[^>]*>" | head -1 | sed -E 's/.*func\[([0-9]+)\].*/\1/')
+wasm=$1
+case $wasm in /*) ;; *) wasm=$PWD/$wasm ;; esac
+idx=$(wasm-objdump -x "$wasm" | grep -E "^ - func\[[0-9]+\] sig=.*<[^>]*$3[^>]*>" | head -1 | sed -E 's/.*func\[([0-9]+)\].*/\1/')
 T=$(mktemp -d "$OUT/hl.XXXX"); cd "$T"
 node --prof --prof-sampling-interval=50 --logfile=v8.log --no-logfile-per-isolate --print-wasm-code --print-wasm-code-function-index="$idx" "$H/prof.mjs" "$wasm" "$2" "$4" "$5" > code.txt 2>&1
 wasm-objdump -d "$wasm" > od.txt
