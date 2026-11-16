@@ -435,3 +435,23 @@ against LLVM's 670 before the word change). Not looked at further.
 wasm kernels on the same commit (`--layouts=3 --best`): geomean 0.928;
 strwork +6.5%, hmget +6.0%, hashmap +2.8%, nbody +1.0%, sortw +0.6%,
 chars_mixed +0.4% behind; the other ten ahead by 3 to 27%.
+
+Last leads and housekeeping (08:50):
+
+- `assemble_operator` (the game_asteroids gap): ours is 6,938 wasm
+  instructions with 43 loops, LLVM's 3,497 with the small fixed-size
+  matrix loops flattened (258 `f32.mul` in line). `unroll` sees only 16
+  candidate loops there and calls 14 undecidable (`no: undecided blockN
+  brif`: the trip walk meets a branch on a value it cannot evaluate).
+  Raising its 8-loops-per-function cap to 64 changed nothing, so the cap
+  is not it. `PLIRON_OPT_FNS=~assemble_operator
+  PLIRON_TRACE=pliron::unroll=trace` on rapier2d shows the list.
+- `gate.py` and `gate.py --only wasm` pass on `83fa711`.
+- I removed tonight's superseded build trees under `/tmp/dsa-bench`
+  (37 -> 23 GB) and the backend snapshots `target/dsa-snap*` except
+  `snap19` (= the dylib of `532caf8`). The repro scripts under
+  `/tmp/dsa-bench/repro-*` and `asteroids/` name snapshot paths that
+  are gone; pass `PLIRON_BACKEND=` (and for the single-crate rustc
+  lines, expect a relink of dependents: the backend path is part of the
+  crate hash). The bugs they reproduce are fixed and have tests in the
+  repo.
