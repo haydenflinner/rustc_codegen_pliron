@@ -1408,7 +1408,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host());
         assert!(n > 0, "expected promotion");
         assert_eq!(memops(&func), 0, "no plain load/store should remain");
         assert!(func.dfg.num_block_params(h) >= 1);
@@ -1455,7 +1455,7 @@ mod tests {
         let mut dbg = crate::dbglabel::DbgSlots::default();
         dbg.insert((5, 0, 8), vec![7]);
         let cfg = ControlFlowGraph::with_function(&func);
-        assert!(run(&mut func, &cfg, &empty_nocap(), false, &dbg) > 0);
+        assert!(run(&mut func, &cfg, &empty_nocap(), false, &dbg, &crate::target::Target::host()) > 0);
         verify(&func);
         assert!(func.sized_stack_slots[ss].key.is_none(), "key kept:\n{func}");
         let labelled = |v| match func.dfg.values_labels.as_ref().and_then(|l| l.get(&v)) {
@@ -1499,7 +1499,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host());
         assert!(n >= 4, "two stores + two loads should fold, got {n}");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -1536,7 +1536,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host()), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
     }
@@ -1574,7 +1574,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &nocap, false, &Default::default());
+        let n = run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
         assert!(n > 0, "expected promotion");
         // Only the sync pair (writeback store + reload) remains.
         assert_eq!(memops(&func), 2);
@@ -1617,7 +1617,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &nocap, false, &Default::default());
+        let n = run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
         assert!(n > 0, "expected promotion");
         assert_eq!(memops(&func), 2, "the sync store and the reload");
         for b in func.layout.blocks() {
@@ -1671,7 +1671,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false, &Default::default());
+        run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
         // The callee must see arg0 in *a: writeback store + post-call
         // reload — if the store is silently dropped the callee reads
         // uninitialized slot memory.
@@ -1716,7 +1716,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 0), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false, &Default::default());
+        run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
         let stores = func
             .layout
             .blocks()
@@ -1773,7 +1773,7 @@ mod tests {
         nocap.insert((call, 0), u64::MAX);
         nocap.insert((call, 1), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false, &Default::default());
+        run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
         // Each arg's bytes reach the callee through memory: two
         // writebacks before the call, two reloads after.
         assert_eq!(memops(&func), 4, "missing writeback/reload pairs");
@@ -1809,7 +1809,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host()), 0);
         verify(&func);
     }
 
@@ -1844,7 +1844,7 @@ mod tests {
         cur.ins().return_(&[w]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host());
         // The i32 field overlaps the byte load; it must stay in memory
         // (its store + the uload8 itself = 2 memory ops). The i64 field
         // at +0 is disjoint and promotes away its store.
@@ -1896,7 +1896,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host());
         assert!(n > 0, "guarded load through nullable param should promote");
         assert_eq!(memops(&func), 0);
         verify(&func);
@@ -1953,7 +1953,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host());
         assert!(n > 0, "correlated sibling store must not escape the slot");
         // Only the real heap store remains.
         assert_eq!(memops(&func), 1);
@@ -2010,7 +2010,7 @@ mod tests {
         cur.ins().return_(&[z3]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host()), 0);
         verify(&func);
     }
 
@@ -2079,7 +2079,7 @@ mod tests {
         let mut nocap = empty_nocap();
         nocap.insert((call, 1), u64::MAX);
         let cfg = ControlFlowGraph::with_function(&func);
-        run(&mut func, &cfg, &nocap, false, &Default::default());
+        run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host());
         // The callee reads ss29 through `a`: 4 writeback stores before
         // the call plus 4 reloads after it — none may be dropped.
         assert_eq!(memops(&func), 8, "missing writeback/reload pairs:\n{func}");
@@ -2118,7 +2118,7 @@ mod tests {
         cur.ins().return_(&[r]);
 
         let cfg = ControlFlowGraph::with_function(&func);
-        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &crate::target::Target::host()), 0);
         assert_eq!(memops(&func), 2);
         verify(&func);
     }
@@ -2379,7 +2379,7 @@ mod tests {
             let mut nocap = empty_nocap();
             nocap.insert((call, 0), u64::MAX);
             let cfg = ControlFlowGraph::with_function(&func);
-            assert!(run(&mut func, &cfg, &nocap, false, &Default::default()) > 0);
+            assert!(run(&mut func, &cfg, &nocap, false, &Default::default(), &crate::target::Target::host()) > 0);
         }
     }
 }
