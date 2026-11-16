@@ -7,8 +7,9 @@
 // interleaved, after a warm-up for V8's tier-up — the same shape as
 // bench/wasm/run.mjs.
 //
-//   --llvm=DIR      LLVM package dir     (/tmp/dsa-bench/pkg-llvm)
-//   --pliron=DIR    pliron package dir   (/tmp/dsa-bench/pkg-pliron)
+//   --llvm=DIR      LLVM package dir     (/tmp/dsa-bench/pkg-llvm-eval)
+//   --pliron=DIR    pliron package dir   (/tmp/dsa-bench/pkg-pliron-eval)
+//                   (the -eval packages: features eval,squish,cad, see build.sh)
 //   --extra=DIR     a second pliron build, compared against LLVM as well
 //   --rounds=N      timed rounds per workload (9)
 //   --target-ms=N   one timed call is `iters` workload calls, ~N ms (150)
@@ -359,7 +360,7 @@ function runner(side, name) {
 // ---- profile mode
 const profSide = opt("side", null);
 if (profSide) {
-  const dir = opt(profSide, join(BASE, `pkg-${profSide}`));
+  const dir = opt(profSide, join(BASE, `pkg-${profSide}-eval`));
   const side = await load(profSide, dir);
   const loops = Number(opt("loop", 20));
   for (const name of names) {
@@ -371,13 +372,13 @@ if (profSide) {
   process.exit(0);
 }
 
-const sides = [await load("llvm", opt("llvm", join(BASE, "pkg-llvm"))), await load("pliron", opt("pliron", join(BASE, "pkg-pliron")))];
+const sides = [await load("llvm", opt("llvm", join(BASE, "pkg-llvm-eval"))), await load("pliron", opt("pliron", join(BASE, "pkg-pliron-eval")))];
 if (opt("extra", null)) sides.push(await load("extra", opt("extra")));
 for (const s of sides) {
   console.log(`${s.tag.padEnd(7)}${s.dir}  ${s.bytes} B  init ${s.initMs.toFixed(0)} ms  caps ${[...s.caps].join(",")}  stamp ${s.m.buildStamp()}`);
 }
 if (new Set(sides.map((s) => s.m.buildStamp())).size > 1) {
-  console.log("WARNING: source stamps differ — the packages were built from different dsa trees");
+  console.log("note: source stamps differ. The stamp is dsa HEAD + a hash of `git status --porcelain`, so a new untracked file between the two builds changes it too; compare the HEAD part.");
 }
 console.log(`rounds ${ROUNDS}, target ${TARGET_MS} ms per timed call, node ${process.version}`);
 console.log("");
@@ -458,9 +459,10 @@ for (const name of names) {
   let line = `${name.padEnd(16)} ${String(iters).padStart(5)} ${fmt(row.llvm_ms)}`;
   others.forEach((s, k) => {
     const r = median(rr[k]);
-    ratios[k].push(r);
+    // A workload whose result differs is not the same work: keep it out of the geomean.
+    if (!mism) ratios[k].push(r);
     const best = Math.min(...ts[k + 1]) / Math.min(...ts[0]);
-    bests[k].push(best);
+    if (!mism) bests[k].push(best);
     row.sides[s.tag] = { ms: median(ts[k + 1]), ratio: r, min: Math.min(...rr[k]), max: Math.max(...rr[k]), best, best_ms: Math.min(...ts[k + 1]) };
     line += ` ${fmt(median(ts[k + 1]))} ${r.toFixed(3).padStart(6)} ${`${Math.min(...rr[k]).toFixed(2)}..${Math.max(...rr[k]).toFixed(2)}`.padStart(12)} ${best.toFixed(3).padStart(6)}`;
   });
@@ -476,7 +478,7 @@ for (const name of names) {
 
 console.log("");
 others.forEach((s, k) => {
-  if (ratios[k].length) console.log(`geomean ${s.tag}/llvm = ${geomean(ratios[k]).toFixed(3)} by median round ratio, ${geomean(bests[k]).toFixed(3)} by best round (${ratios[k].length} workloads; <1 means ${s.tag} is faster)`);
+  if (ratios[k].length) console.log(`geomean ${s.tag}/llvm = ${geomean(ratios[k]).toFixed(3)} by median round ratio, ${geomean(bests[k]).toFixed(3)} by best round (${ratios[k].length} workloads with equal results; <1 means ${s.tag} is faster)`);
 });
 console.log(problems.length ? `\n${problems.length} problem(s):\n${problems.map((p) => `  ${p}`).join("\n")}` : "results: every workload returned the same value on every side");
 if (opt("json", null)) {

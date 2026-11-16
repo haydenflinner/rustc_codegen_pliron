@@ -15,13 +15,14 @@
 #   DSA_BENCH        output root                      (/tmp/dsa-bench)
 #   DSA_HOST         the dsa `host` workspace         ($HOME/code/dsa/host)
 #   DSA_FEATURES     cargo feature flags, both sides  ("" = the crate's default set)
-#                    e.g. DSA_FEATURES="--no-default-features --features eval"
+#                    The set the 2026-11-16 comparison used:
+#                    DSA_FEATURES="--no-default-features --features eval,squish,cad"
 #   DSA_CARGO_ARGS   extra cargo args, e.g. --config profile.release.lto=false
 #   DSA_JOBS         cargo -j                         (5)
 #   DSA_KEEP=1       pliron: keep the wasm32 half of the target dir (see below)
 #   DSA_RETRIES      reruns after a signal-killed cargo/rustc (30; see earlyoom below)
-#   DSA_PLIRON_FALLBACK  PLIRON_* settings for pass 2 (see below)
-#   PLIRON_BACKEND   backend dylib   (<repo>/target/dsa-snap6/librustc_codegen_pliron.dylib)
+#   DSA_PLIRON_FALLBACK  PLIRON_* settings for a second pass (see below; default none)
+#   PLIRON_BACKEND   backend dylib   (<repo>/target/debug/...; copy the dylib aside and point here to keep working on the backend during a build)
 #   PLIRON_WASM_LD   linker          (<repo>/tools/pliron-wasm-ld/target/release/pliron-wasm-ld)
 #   WASM_BINDGEN     wasm-bindgen CLI; must be 0.2.127 to match the crate
 #   PLIRON_*         every other PLIRON_* variable reaches the pliron rustc
@@ -32,39 +33,41 @@
 # CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS so host build scripts and
 # proc macros stay on LLVM; cargo merges that variable with the workspace's
 # `--cfg getrandom_backend="wasm_js"` (checked with `cargo -v`).
-# The workspace release profile is `lto = "thin"`, `codegen-units = 1`,
-# opt-level 3 (opt-level "z" for the polars/vortex/typst crates). The backend
-# claims no ThinLTO, so rustc falls back to its fat-LTO path for the cdylib.
+#
+# Effective profile, both sides: opt-level 3 (opt-level "z" for the
+# polars/vortex/typst crates of the default feature set), codegen-units 1,
+# strip=debuginfo (function names stay), panic=abort (target default), and
+# NO LTO: the workspace says `lto = "thin"`, but literate-wasm is
+# `crate-type = ["cdylib", "rlib"]` and cargo passes no `-C lto` to such a
+# unit (`cargo -v`: `--crate-type cdylib --crate-type rlib -C opt-level=3
+# -C codegen-units=1 -C strip=debuginfo`).
 #
 # Cargo does not track the backend dylib or PLIRON_* variables, so a pliron
 # build first removes $target/wasm32-unknown-unknown (host proc macros and
 # build scripts are kept). DSA_KEEP=1 skips that — only correct when neither
 # the dylib nor any PLIRON_* variable changed.
 #
-# The snapshot backends cannot compile every crate of this tree with their
-# defaults, so a pliron build is two passes. Pass 1 runs `cargo build
-# --keep-going` under the caller's environment and compiles everything that
-# can be. If crates failed, pass 2 exports DSA_PLIRON_FALLBACK (default
-# below) and builds the rest: the crates that panicked the backend and
-# everything downstream of them. BUILDINFO lists those crates
-# (`fallback_crates`). DSA_PLIRON_FALLBACK="" turns pass 2 off, so the build
-# stops at the backend panics; to apply a knob to every crate instead,
-# export it yourself. The panics (logs naming the function are in
-# $DSA_BENCH/findings/, see STATUS.md and REPRO.md there):
-#   PLIRON_BUNROLL=0     `bunroll` broke `rapier2d::utils::
-#                        smallest_abs_diff_between_angles::<WideF32x4>`:
-#                        use of a non-dominating value.
-#   PLIRON_TAILREC=0     literate-eval: pliron-clif-opt/src/tailrec.rs:40
-#                        "attempt to subtract with overflow" (`accop`'s Smin
-#                        identity `(1i64 << 63) - 1`; the snapshot dylib has
-#                        overflow checks on).
-# dsa-snap (03:07) also needed PLIRON_HALFUNROLL=0 (`punroll` broke
-# `regex_syntax::unicode::class`) and PLIRON_INDUCT2=0 (`licm2` broke five
-# jiff functions); dsa-snap2 (b67567f) fixes both.
+# Two-pass fallback. With DSA_PLIRON_FALLBACK set (e.g. "PLIRON_BUNROLL=0"),
+# pass 1 runs `cargo build --keep-going` under the caller's environment and
+# compiles everything that can be; if crates failed, pass 2 exports the
+# fallback settings and builds the rest (the crates that panicked the backend
+# and everything downstream of them); BUILDINFO lists them
+# (`fallback_crates`). dsa-snap (03:07) needed PLIRON_HALFUNROLL=0
+# (regex-syntax), PLIRON_INDUCT2=0 (jiff), PLIRON_BUNROLL=0 (rapier2d) and
+# PLIRON_TAILREC=0 (literate-eval) this way; from dsa-snap4 on the eval
+# feature set compiles with no knob, so the default is no fallback.
+# History and repros: $DSA_BENCH/findings/STATUS.md.
 #
-# Times (14-core M-series, shared and loaded), 2026-11-16 — the BUILDINFO
-# file of each package has its own numbers:
-# TIMES-PLACEHOLDER
+# Times, features eval,squish,cad, 14-core M-series shared with other builds
+# (so +-50%), 2026-11-16; each package's BUILDINFO has its own numbers:
+#   llvm    cold (host deps included)  306 s at -j 3;  no-op rebuild 1-2 s;
+#           default features, cold     269 s at -j 5
+#   pliron  wasm32 half wiped, host deps kept ("warm", what every rebuild
+#           does)                      218-440 s at -j 3, 288 s at -j 4
+#           cold adds the host proc macros/build scripts, about 1 min.
+#   Peak rustc footprint under pliron is 4-7 GB for the big crates
+#   (loro-internal 4.1 GB, literate-eval 5.5 GB, polars-core 6.8 GB):
+#   more than two such builds at once trip the machine's earlyoom.
 set -euo pipefail
 
 side=${1:?usage: build.sh llvm|pliron [NAME]}
@@ -101,7 +104,7 @@ case $side in
     # Stock rustc, prebuilt std, rustc's own wasm-ld (rust-lld).
     ;;
   pliron)
-    PLIRON_BACKEND=${PLIRON_BACKEND:-$ROOT/target/dsa-snap6/librustc_codegen_pliron.dylib}
+    PLIRON_BACKEND=${PLIRON_BACKEND:-$ROOT/target/debug/librustc_codegen_pliron.dylib}
     PLIRON_WASM_LD=${PLIRON_WASM_LD:-$ROOT/tools/pliron-wasm-ld/target/release/pliron-wasm-ld}
     [ -f "$PLIRON_BACKEND" ] || { echo "no backend dylib at $PLIRON_BACKEND" >&2; exit 2; }
     [ -x "$PLIRON_WASM_LD" ] || { echo "no linker at $PLIRON_WASM_LD" >&2; exit 2; }

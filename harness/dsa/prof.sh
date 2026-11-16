@@ -20,7 +20,7 @@ w=${1:?usage: prof.sh WORKLOAD [LOOPS] [TOP]}
 loops=${2:-30}
 top=${3:-10}
 for side in llvm pliron; do
-  if [ "$side" = llvm ]; then dir=${LLVM_PKG:-$BASE/pkg-llvm}; else dir=${PLIRON_PKG:-$BASE/pkg-pliron}; fi
+  if [ "$side" = llvm ]; then dir=${LLVM_PKG:-$BASE/pkg-llvm-eval}; else dir=${PLIRON_PKG:-$BASE/pkg-pliron-eval}; fi
   D=$BASE/prof/$w-$side
   rm -rf "$D"; mkdir -p "$D"
   echo "== $side ($dir)"
