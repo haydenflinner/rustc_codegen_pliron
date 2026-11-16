@@ -1431,6 +1431,22 @@ pub fn run(
     } else {
         FxHashMap::default()
     };
+    // `PLIRON_INLINE_RECX=1` (opt-in): a site cloned out of an inlined
+    // body may not inline a member of a call-graph cycle that its clone
+    // chain has already entered. `on_chain` stops the same function
+    // twice on a chain; a derived `Clone` of a recursive AST is a cycle of
+    // dozens of functions (`ExprKind::clone`, `Box<Expr>::clone`,
+    // `to_vec::<Expr>`, `to_vec::<Stmt>`, ...), each under the limit, and
+    // a caller outside the cycle unrolled it along every path without a
+    // repeat: `Matrix::defaulted` (732 bytes under LLVM) took 317 of them
+    // and stopped at the 20,000-op caller cap, 721 KB. One level of a
+    // foreign recursion is what the original site asked for.
+    let recx = crate::env_is("PLIRON_INLINE_RECX", "1");
+    let op_scc: FxHashMap<Ptr<Operation>, u32> = if recx {
+        scc.iter().filter_map(|(name, &c)| st.funcs.get(name).map(|f| (f.op, c))).collect()
+    } else {
+        FxHashMap::default()
+    };
     let pgo_inline = !crate::env_is("PLIRON_PGO_INLINE", "0");
     // Ablations of the two older call-site rules: `PLIRON_PGO_COLDSITE=0`
     // keeps never-run sites inlinable, `PLIRON_PGO_WARM=0` drops the
@@ -1969,6 +1985,8 @@ pub fn run(
                         "reject (self/fnty)"
                     } else if hist && on_chain(st, op, ci.op) {
                         "reject (recursive)"
+                    } else if recx && scc.get(cs).is_some_and(|&c| chain_in_scc(st, op, &op_scc, c)) {
+                        "reject (rec-chain)"
                     } else if scc_rule
                         && st.inline_hist.contains(op)
                         && scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
@@ -2287,6 +2305,19 @@ fn scc_ids(ctx: &Context, st: &State) -> FxHashMap<String, u32> {
         }
     }
     out
+}
+
+/// Whether a function of call-graph cycle `c` was already inlined
+/// somewhere on `site`'s clone chain.
+fn chain_in_scc(st: &State, site: Ptr<Operation>, op_scc: &FxHashMap<Ptr<Operation>, u32>, c: u32) -> bool {
+    let mut i = st.inline_hist.get(site).copied().unwrap_or(u32::MAX);
+    while let Some(&(f, p)) = st.inline_hist_nodes.get(i as usize) {
+        if op_scc.get(&f) == Some(&c) {
+            return true;
+        }
+        i = p;
+    }
+    false
 }
 
 /// Whether `callee` was already inlined somewhere on `site`'s clone chain.
