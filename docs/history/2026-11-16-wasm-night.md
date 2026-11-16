@@ -81,10 +81,12 @@ Running log. Newest decisions that want a second look are under
    are replayed on the native pipeline, so wasm-only paths are only
    covered by `wasm_smoke` and the wasm sysroot leg.
 
-9. **Three transforms and one rule change went default-on with no fuzz
-   sweep** (`f13cb0d`: `PLIRON_MEMCPYOPT_PATHWIN`, `PLIRON_CONSTCOPY2`,
-   `PLIRON_WASM_SMALLCOPY`; `532caf8`: the SROA fragment word is the
-   pointer width, wasm32 only). The first two apply to native too.
+9. **Two transforms and one rule change went default-on with no fuzz
+   sweep** (`f13cb0d`: `PLIRON_MEMCPYOPT_PATHWIN`, `PLIRON_CONSTCOPY2`;
+   `532caf8`: the SROA fragment word is the pointer width, wasm32
+   only). The first two apply to native too. **A third,
+   `PLIRON_WASM_SMALLCOPY`, was default-on from 07:10 to 09:30 and I
+   took it out again (`d166d97`): see item 16.**
    Checked with the gate, `harness/crates.py --tier 1` (20 crates,
    knobs forced on), the wasm kernels, the 19 cross-checked dsa
    workloads and the 09:00 parity card (native 0.908 -> 0.873). The
@@ -109,6 +111,29 @@ Running log. Newest decisions that want a second look are under
 14. **`harness/dsa/workloads/` is uncommitted** because this fork is
     public and those files are copies of dsa page sources. The harness
     needs them to run from a fresh clone. Your call.
+16. **`PLIRON_WASM_SMALLCOPY` was on by default for 2h20 with a bug in
+    it, and the unoptimized build of dsa is wrong in three more ways.**
+    At 09:15 I built the module with `PLIRON_OPT_BISECT=0` on the
+    final backend to close the "does it work with optimizations off"
+    question from 05:15. It does not:
+    - with SMALLCOPY on, `vm_strings` prints `6\x04\x000288` for
+      6570288 (itoa's 2-byte table copy); with `PLIRON_WASM_SMALLCOPY=0`
+      it is right. No optimized build showed a wrong result with it on
+      (all 19 workloads matched), it had no measured speed effect, and
+      I did not find the cause in the time left, so it is opt-in again.
+      (With the assume lowering on, the same build traps in itoa
+      instead: the `assume` is right, the index it guards is garbage.)
+    - independent of SMALLCOPY, and so older than tonight:
+      `dims_page` and `compile_page` return different results,
+      `game_tetris` fails with "no game running in slot 0", and the
+      three CRDT workloads panic in std's `no_threads` mutex ("cannot
+      recursively acquire mutex").
+    Not investigated. It matters twice: something in the
+    all-passes-off path is wrong (lowering, the emitter or a wasm stage
+    that still runs), and that path is the baseline every
+    `PLIRON_OPT_BISECT` hunt compares against. Packages:
+    `/tmp/dsa-bench/pkg-pliron-ob0b` (defaults), `ob0c`
+    (`ASSUME_RANGE=0`), `ob0d` (also `SMALLCOPY=0`).
 15. Not turned on, each measured, each a lead: `PLIRON_INLINE_ONCE=1`
     on wasm (pages +2-3%, three kernels worse),
     `PLIRON_INLINE_CALLER_MAX=4000` (size -10%, speed worse). See
@@ -357,7 +382,7 @@ What moved it:
 3. **`PLIRON_WASM_SMALLCOPY`** (`03668fd`): 670 `memory.copy` of at
    most 16 constant bytes in the module (359 of zero bytes: BTree
    nodes of zero-sized values) become 39. No measured effect on these
-   workloads; kept because each one is a C++ call when it runs.
+   workloads. **Opt-in again since 09:30** ("Review these" item 16).
 4. **Static constructors** (`30ff21b`, by a sub-agent in a worktree,
    reviewed and cherry-picked): `pliron-wasm-ld` built
    `__wasm_call_ctors` and nothing called it in a `--no-entry` link, so
@@ -589,3 +614,8 @@ opposed to the individual fixes. Each has the cases behind it.
    compare our once-run constructors with lld's rerun-on-every-call
    wrappers. A row that is mostly JS, or mostly a toolchain artifact,
    should say so in the harness output.
+
+Final table on `d166d97` (SMALLCOPY off again), `pkg-pliron-final3`: all
+19 workloads equal; the rows are those of the 08:40 table within a
+point (vm 0.96..1.07, pages 1.02..1.03, dims_page 1.22, tetris 0.75,
+asteroids 1.31).

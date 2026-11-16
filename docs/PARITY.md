@@ -143,8 +143,9 @@ features `eval,squish,cad`, never tuned on before 2026-11-16.
 `harness/dsa/build.sh {llvm,pliron} NAME` then `node
 harness/dsa/bench.mjs --llvm=DIR --pliron=DIR` (results are
 cross-checked; a mismatch is reported and left out of the geomean).
-2026-11-16, main at `532caf8`, pliron/LLVM, median of 9 rounds; all 19
-workloads return LLVM's results:
+2026-11-16, main at `532caf8` (remeasured within a point at `d166d97`),
+pliron/LLVM, median of 9 rounds; all 19 workloads return LLVM's
+results:
 
 | workload | pliron/LLVM | | workload | pliron/LLVM |
 |---|---|---|---|---|
@@ -173,7 +174,9 @@ single-caller instances such as each `collect()`'s `from_iter`, we
 keep 1,225 of those; `PLIRON_INLINE_ONCE=1` does that on wasm and is
 2-3% faster on the page rows but 14-17 points slower on the `hmget`
 and `tokenize` kernels, so it is not on), `game_asteroids` (rapier2d's
-soft-FEM assembly and solve), `dims_page` (diffuse), and compile
+soft-FEM assembly and solve), `dims_page` (diffuse), **the module
+built with `PLIRON_OPT_BISECT=0` is wrong** (two mismatches, a failed
+game, a mutex panic: the all-passes-off path, not looked at), and compile
 memory (the default feature set with polars and typst needs 5-7 GB
 per rustc and was not built).
 `docs/history/2026-11-16-wasm-night.md` has the five bugs this program
