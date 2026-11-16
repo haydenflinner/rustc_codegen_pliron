@@ -62,7 +62,7 @@ ALIAS = {
     "constdedup": ["std"],
     "pipeline": CORE + ["slotmerge", "loopvec"],
     "lib": CORE,
-    "inline": ["inlinecm", "inlinerec", "std", "sroa"],
+    "inline": ["inlinecm", "inlinerec", "inlinerecx", "std", "sroa"],
     "sroa": ["sroa"],
     "memcpyopt": ["sroa", "std"],
     "xcgu": ["xcgurot", "xcgufnptr", "std"],

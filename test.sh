@@ -553,6 +553,18 @@ t_inlinerec() {
   $out/inlinerec$exe | diff --strip-trailing-cr - tests/inlinerec/expected.out
 }
 
+t_inlinerecx() {
+  # A caller outside a derived-Clone cycle enters the cycle once
+  # (PLIRON_INLINE_RECX): the sites cloned out of that inline stay calls
+  # (66 sites into `defaulted` without the rule, 2 with it); output
+  # matches stock rustc's.
+  PLIRON_INLINE_RECX=1 PLIRON_TRACE=pliron::inline=debug rustc $BE --edition 2021 -O tests/inlinerecx/main.rs -o $out/inlinerecx$exe 2> $out/inlinerecx.log || { tail -20 $out/inlinerecx.log >&2; return 1; }
+  local n; n=$(grep -acE '9defaulted.* -> .*: accept' $out/inlinerecx.log)
+  if [ "$n" -gt 8 ]; then echo "inlinerecx: $n sites inlined into defaulted, the clone cycle was unrolled" >&2; return 1; fi
+  grep -aqE '9defaulted.* -> .*reject \(rec-chain\)' $out/inlinerecx.log || { echo "inlinerecx: no rec-chain rejection in defaulted" >&2; return 1; }
+  $out/inlinerecx$exe | diff --strip-trailing-cr - tests/inlinerecx/expected.out
+}
+
 # r[verify par.facts.thin-claim]
 t_xfactsplugin() {
   # Two-phase facts must not hold modules when rustc skips the thin step
@@ -1380,6 +1392,7 @@ want invokeblk && t_invokeblk
 # SEH throws anyway.
 [[ -z "$exe" ]] && want resumehoist && t_resumehoist
 want inlinerec && t_inlinerec
+want inlinerecx && t_inlinerecx
 want xfactsplugin && t_xfactsplugin
 want deadfree && t_deadfree
 want lowerfree && t_lowerfree
