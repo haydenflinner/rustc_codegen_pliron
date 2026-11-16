@@ -10928,6 +10928,69 @@ mod clif_emit {
                         use ir::LibCall as L;
                         if matches!(lc, L::Memcpy | L::Memmove | L::Memset | L::Memcmp) {
                             let mem = self.o.mem;
+                            // `PLIRON_WASM_SMALLCOPY`: a copy of at most 16
+                            // constant bytes as loads then stores (every
+                            // load first, so overlap is fine for memmove
+                            // too), none at all for length 0. V8 runs
+                            // `memory.copy` as a call into C++ whatever the
+                            // length. These reach the emitter when the
+                            // length only became a constant inside the CLIF
+                            // pipeline, after the lowering's own expansion:
+                            // the dsa module had 349 copies of 0 bytes and
+                            // 226 of 1.
+                            if matches!(lc, L::Memcpy | L::Memmove)
+                                && pliron_cfg::env_is("PLIRON_WASM_SMALLCOPY", "1")
+                                && let Some(n) = f
+                                    .dfg
+                                    .value_def(f.dfg.resolve_aliases(args[2]))
+                                    .inst()
+                                    .and_then(|d| match f.dfg.insts[d] {
+                                        ir::InstructionData::UnaryImm {
+                                            opcode: Opcode::Iconst,
+                                            imm,
+                                        } => u64::try_from(imm.bits()).ok(),
+                                        _ => None,
+                                    })
+                                && n <= 16
+                            {
+                                // (offset, width) pieces; two pieces may
+                                // overlap (5..7 bytes = two i32, 9..16 = two i64).
+                                let pieces: SmallVec<[(u64, u64); 2]> = match n {
+                                    0 => smallvec![],
+                                    1 | 2 | 4 | 8 => smallvec![(0, n)],
+                                    3 => smallvec![(0, 2), (2, 1)],
+                                    5..=7 => smallvec![(0, 4), (n - 4, 4)],
+                                    _ => smallvec![(0, 8), (n - 8, 8)],
+                                };
+                                if pieces.is_empty() {
+                                    return;
+                                }
+                                let d = self.cvt(self.get1(args[0]), WT::I32);
+                                let s = self.cvt(self.get1(args[1]), WT::I32);
+                                let ma = |off: u64| MemoryArg {
+                                    align: 0,
+                                    offset: off as u32,
+                                    memory: mem,
+                                };
+                                let vals: SmallVec<[WV; 2]> = pieces
+                                    .iter()
+                                    .map(|&(off, w)| match w {
+                                        8 => self.op(O::I64Load { memory: ma(off) }, &[s], WT::I64),
+                                        4 => self.op(O::I32Load { memory: ma(off) }, &[s], WT::I32),
+                                        2 => self.op(O::I32Load16U { memory: ma(off) }, &[s], WT::I32),
+                                        _ => self.op(O::I32Load8U { memory: ma(off) }, &[s], WT::I32),
+                                    })
+                                    .collect();
+                                for (&(off, w), &v) in pieces.iter().zip(&vals) {
+                                    match w {
+                                        8 => self.op0(O::I64Store { memory: ma(off) }, &[d, v]),
+                                        4 => self.op0(O::I32Store { memory: ma(off) }, &[d, v]),
+                                        2 => self.op0(O::I32Store16 { memory: ma(off) }, &[d, v]),
+                                        _ => self.op0(O::I32Store8 { memory: ma(off) }, &[d, v]),
+                                    }
+                                }
+                                return;
+                            }
                             let d = self.cvt(self.get1(args[0]), WT::I32);
                             let s = self.cvt(self.get1(args[1]), WT::I32);
                             let n = self.cvt(self.get1(args[2]), WT::I32);
