@@ -4631,9 +4631,24 @@ fn peep_body_opts(
                                 if kill_all || depth > 0 {
                                     fmap.clear();
                                 } else if !slots.is_empty() {
+                                    // The same rule as a store met in
+                                    // line (below): only a store through
+                                    // the entry's own base local at a
+                                    // disjoint range leaves it alone. Two
+                                    // locals may hold the same address, so
+                                    // a body store through another base
+                                    // can rewrite the slot for the next
+                                    // iteration. This test once kept every
+                                    // entry of a different base
+                                    // (`b3 != b2 ||`), and a load at the
+                                    // top of the loop then returned the
+                                    // value from before the loop on every
+                                    // iteration: rapier2d's soft bodies
+                                    // read one-step-old f32 coordinates
+                                    // (the dsa `game_asteroids` frames).
                                     fmap.retain(|&(b2, o2), e| {
                                         slots.iter().all(|&(b3, o3, w3)| {
-                                            b3 != b2 || o3 + w3 <= o2 || o2 + swidth(e.1) <= o3
+                                            b3 == b2 && (o3 + w3 <= o2 || o2 + swidth(e.1) <= o3)
                                         })
                                     });
                                 }
@@ -7536,6 +7551,36 @@ mod wpeep_tests {
             }
         }
         eprintln!("no straight-line tail miscompiles ({} starts; unk {n_unk} stack {n_stack} peep-none {n_peep} unk-post {n_unk2} compared {n_cmp})", starts.len());
+    }
+
+    // Store-to-load forwarding across a loop entry. `[B+0] = V` before the
+    // loop, `acc += [B+0]` at its top, `[C+0] = acc` at its bottom: `B` and
+    // `C` are different locals that may hold the same address, so from
+    // the second iteration on the load must see what the body stored.
+    // The loop-entry filter once kept the `(B, 0) -> V` entry because the
+    // body's only store went through another base, and the load became
+    // `local.get V` (rapier2d soft bodies stepping on one-iteration-old
+    // coordinates: the dsa `game_asteroids` frames).
+    #[test]
+    fn sfwd_loop_entry_drops_entries_a_store_through_another_base_may_hit() {
+        const CODE: &[u8] = &[
+            0x20, 0x00, 0x20, 0x02, 0x36, 0x02, 0x00, // [B+0] = V
+            0x03, 0x40, // loop
+            0x20, 0x03, 0x20, 0x00, 0x28, 0x02, 0x00, 0x6a, 0x21, 0x03, // acc += [B+0]
+            0x20, 0x01, 0x20, 0x03, 0x36, 0x02, 0x00, // [C+0] = acc
+            0x20, 0x04, 0x41, 0x01, 0x6b, 0x22, 0x04, 0x0d, 0x00, // br_if (--n)
+            0x0b, // end
+            0x20, 0x00, 0x20, 0x03, 0x36, 0x02, 0x04, // [B+4] = acc
+        ];
+        let mut b = vec![0x00];
+        b.extend_from_slice(CODE);
+        b.push(0x0b);
+        let out = peep_body_opts(&b, &[], &[], 5, &PeepOpts::from_env()).unwrap();
+        let code = code_of(&out);
+        assert!(
+            code.windows(3).any(|w| w == [0x28, 0x02, 0x00]),
+            "the load at the top of the loop was forwarded to the pre-loop value: {code:02x?}"
+        );
     }
 
     // Regression (blake3 `compress_in_place`, `hash(b"abc")` wrong on
