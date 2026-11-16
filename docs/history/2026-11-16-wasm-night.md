@@ -348,19 +348,6 @@ Tried and not kept:
   caller) lands in the exported function next to its set-up code and
   the same loop runs slower there. That is the thing to understand
   before turning it on; LLVM inlines the same way and does not pay.
-- `PLIRON_SROA_FRAGWORD=4` (new knob, default 8 = unchanged): count
-  `PLIRON_SROA_FRAGCOPY`'s "words" in 4 bytes on wasm32 so u32 arrays
-  split as u64 arrays do on native. Kernels unchanged except strwork
-  +5.6% -> +3.9%, module -0.5%. **But the dsa module built with it is
-  invalid wasm**: `wasm-validate` reports `type mismatch in
-  i32.wrap_i64, expected [i64] but got [i32]` in
-  `literate_page::Page::tape_pack` (`local.get 7; i32.wrap_i64` where
-  local 7 is the i32 frame pointer, right after a `drop_glue` call).
-  CLIF verified, so the emitter or wpeep mistypes a value; not
-  reproduced in the small loro repro, not found. The build that showed
-  it is `/tmp/dsa-bench/target-pliron-fw4`. This is a second latent
-  bug of the same family as the asteroids one (below) and worth more
-  than the knob.
 - Folding every GOT `global.get` to `i32.const` in the linker (2404
   globals -> 1, +0.18% size): no change outside noise. V8 handles an
   immutable global as well as a constant here.
@@ -396,3 +383,55 @@ Still open:
   are copies from the dsa repository and this fork is public.
 - Four `host/rustc-ice-2026-11-16T09_*.txt` files appeared in
   `~/code/dsa` (a command replayed without `RUSTC_ICE`). Not touched.
+
+## dsa, 08:40: final state
+
+`main` at `532caf8`, defaults, quiet machine, all 19 workloads return
+LLVM's results (`/tmp/dsa-bench/pkg-pliron-final2`, 49.4 MB):
+
+| workload | pliron/LLVM | | workload | pliron/LLVM |
+|---|---|---|---|---|
+| vm_loop | 1.04 | | compile_page | 1.02 |
+| vm_fib_rec | 0.97 | | checks_page | 1.02 |
+| vm_mandelbrot | 1.08 | | live_page | 1.02 |
+| vm_physics | 0.99 | | dims_page | 1.22 |
+| vm_sieve | 1.01 | | game_tetris | 0.78 |
+| vm_collections | 0.97 | | game_asteroids | 1.31 |
+| vm_strings | 1.05 | | crdt_edits | 0.50 * |
+| vm_match | 1.01 | | crdt_sync | 0.52 * |
+| vm_closures | 1.02 | | ink_strokes | 0.38 * |
+| hash_text | 1.18 ** | | | |
+
+\* constructors, see above. \*\* an artifact of the interleaved
+harness: 62% of that workload is JS copying the string in, and run
+alone the three modules take 81.3 (ours), 81.3 (`FRAGWORD=4`) and 82.0
+ms (LLVM) with blake3 at 32-33% of each. Fifteen rows without it:
+geomean 1.03.
+
+Two more fixes after 08:00, both found through the `FRAGWORD`
+experiment:
+
+- **`slotprom` built slot addresses as i64 on every target**
+  (`fbcf813`). The dsa module compiled with `PLIRON_SROA_FRAGWORD=4`
+  did not validate (`local.get fp; i32.wrap_i64` in
+  `Page::tape_pack`): slotprom's writeback before a synced call and
+  its reload after it used `stack_addr.i64`, and on wasm32 the emitter
+  resolves a slot address to the i32 frame pointer and then "narrows"
+  it. Nothing in a default build reached that path on wasm, and the
+  CLIF verifier accepts the type. The emitter now refuses a non-i32
+  `stack_addr` with a panic naming the cause (`96e7801`) instead of
+  writing a module that fails at instantiation.
+- **The `PLIRON_SROA_FRAGCOPY` word is the pointer width**
+  (`532caf8`): 8 bytes on native as before, 4 on wasm32, where a
+  `[u32; 16]` or a 2x2 f32 block was "sixteen sub-word fragments" and
+  stayed in memory. rapier2d's FEM assembly: game_asteroids 1.43 ->
+  1.31. strwork +5.6% -> +3.9% in a same-run A/B. Module 50.3 -> 49.4
+  MB.
+
+`game_asteroids` at 1.31 is `SoftFemSystem::assemble_operator` and the
+conjugate-gradient solve (soft FEM group: about 1220 ms of samples
+against LLVM's 670 before the word change). Not looked at further.
+
+wasm kernels on the same commit (`--layouts=3 --best`): geomean 0.928;
+strwork +6.5%, hmget +6.0%, hashmap +2.8%, nbody +1.0%, sortw +0.6%,
+chars_mixed +0.4% behind; the other ten ahead by 3 to 27%.

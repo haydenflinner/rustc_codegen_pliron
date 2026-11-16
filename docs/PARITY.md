@@ -122,8 +122,8 @@ traffic as before.
 
 **wasm kernels, 2026-11-16** (the table above is the last `parity.py`
 run and predates this; `node bench/wasm/run.mjs llvm.wasm pliron.wasm
---layouts=3 --best`, min/min per layout, main at `f13cb0d`): geomean
-**0.924** of 16 (was 1.019 in the card, 0.945 at the start of
+--layouts=3 --best`, min/min per layout, main at `f13cb0d`; `532caf8`
+measures 0.928): geomean **0.924** of 16 (was 1.019 in the card, 0.945 at the start of
 2026-11-16).
 
 | kernel | change vs LLVM | | kernel | change vs LLVM |
@@ -150,39 +150,41 @@ features `eval,squish,cad`, never tuned on before 2026-11-16.
 `harness/dsa/build.sh {llvm,pliron} NAME` then `node
 harness/dsa/bench.mjs --llvm=DIR --pliron=DIR` (results are
 cross-checked; a mismatch is reported and left out of the geomean).
-2026-11-16, main at `f13cb0d`, pliron/LLVM, median of 9 rounds:
+2026-11-16, main at `532caf8`, pliron/LLVM, median of 9 rounds; all 19
+workloads return LLVM's results:
 
 | workload | pliron/LLVM | | workload | pliron/LLVM |
 |---|---|---|---|---|
-| vm_loop | 1.03 | | compile_page | 1.05 |
-| vm_fib_rec | 0.97 | | checks_page | 1.04 |
-| vm_mandelbrot | 1.07 | | live_page | 1.04 |
-| vm_physics | 0.97 | | dims_page | 1.24 |
-| vm_sieve | 1.02 | | game_tetris | 0.79 |
-| vm_collections | 0.97 | | game_asteroids | 1.44, **wrong result** |
-| vm_strings | 1.05 | | crdt_edits | 0.49 * |
-| vm_match | 1.03 | | crdt_sync | 0.51 * |
-| vm_closures | 1.04 | | ink_strokes | 0.37 * |
-| hash_text | 0.99..1.17 | | | |
+| vm_loop | 1.04 | | compile_page | 1.02 |
+| vm_fib_rec | 0.97 | | checks_page | 1.02 |
+| vm_mandelbrot | 1.08 | | live_page | 1.02 |
+| vm_physics | 0.99 | | dims_page | 1.22 |
+| vm_sieve | 1.01 | | game_tetris | 0.78 |
+| vm_collections | 0.97 | | game_asteroids | 1.31 |
+| vm_strings | 1.05 | | crdt_edits | 0.50 * |
+| vm_match | 1.01 | | crdt_sync | 0.52 * |
+| vm_closures | 1.02 | | ink_strokes | 0.38 * |
+| hash_text | 1.18 ** | | | |
 
 \* not like for like: rust-lld's export wrappers rerun every static
 constructor on each call into the LLVM module; ours run them once.
-The fifteen comparable rows are geomean **1.02**. At the first run that
-morning nine workloads failed or returned wrong results and the
-interpreter rows were 1.17 to 1.56.
+\*\* a harness artifact (62% of it is JS copying the string in; run
+alone the two modules take 81.3 and 82.0 ms). The fifteen other
+comparable rows are geomean **1.03**. At the first run that morning
+nine workloads failed or returned wrong results and the interpreter
+rows were 1.17 to 1.56.
 
-(`game_asteroids`: a wasm peephole forwarded a pre-loop value into
-every iteration of rapier2d's eigen solver; fixed in `154456d`, the
-number above is from before the fix.)
-
-Open on this program: **code size 50.3 MB against LLVM's
-18.4 MB** (35,774 functions against 19,544; LLVM inlines and deletes
+Open on this program: **code size 49.4 MB against LLVM's 18.4 MB**
+(35,000 functions against 19,544; LLVM inlines and deletes
 single-caller instances such as each `collect()`'s `from_iter`, we
 keep 1,225 of those; `PLIRON_INLINE_ONCE=1` does that on wasm and is
 2-3% faster on the page rows but 14-17 points slower on the `hmget`
-and `tokenize` kernels, so it is not on), compile memory (the default
-feature set with polars and typst needs 5-7 GB per rustc and was not
-built), and `dims_page`.
+and `tokenize` kernels, so it is not on), `game_asteroids` (rapier2d's
+soft-FEM assembly and solve), `dims_page` (diffuse), and compile
+memory (the default feature set with polars and typst needs 5-7 GB
+per rustc and was not built).
+`docs/history/2026-11-16-wasm-night.md` has the five bugs this program
+found and what moved the numbers.
 
 ### Held-out runtime (not in the card)
 
