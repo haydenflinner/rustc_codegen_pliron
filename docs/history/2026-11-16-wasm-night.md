@@ -701,8 +701,11 @@ LLVM): hmget +5.0% to +18.8%, tokenize -15.2% to +3.1%, sieve -2.7% to
   excluded this way). Such a slot and a root outside its class are
   different objects. The loads hoist again: +18.8% to +11.2%. The
   default build is byte-identical with the knob on; on the dsa corpus it
-  changes two functions' sizes. The remaining 6 points are not explained
-  yet.
+  changes two functions' sizes. With the rule the lookup loop's final
+  CLIF is block for block the closure's (the same 21 blocks with the
+  same instruction counts and the same eight loads), so the remaining 6
+  points arise after CLIF: the loop now shares one wasm function with
+  the map's set-up code. Not profiled under V8.
 - **tokenize.** `run` is `for _ in 0..10 { n += s.split_whitespace().count() }`.
   By default the IR inliner leaves the iterator's `next` (one caller,
   has a loop) out of line, the CLIF pipeline optimizes it alone, and the
