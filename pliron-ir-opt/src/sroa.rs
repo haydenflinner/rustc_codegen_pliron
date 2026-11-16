@@ -1292,18 +1292,19 @@ fn split(
             .any(|x| matches!(x.kind, Kind::Copy { n, .. } if x.off == 0 && n == size));
         let direct = acc.iter().filter(|x| matches!(x.kind, Kind::Load | Kind::Store)).count();
         let pieces: Vec<(u64, u64)> = sl.iter().map(|x| (x.off, x.size)).collect();
-        // `PLIRON_SROA_FRAGWORD=<bytes>` (default 8): the word the rule
-        // counts in. On wasm32 an i32 is a whole register value, yet a
-        // `[u32; 16]` reads as sixteen sub-word pieces; `=4` is the
-        // experiment (docs/history/2026-11-16-wasm-night.md): kernels
-        // unchanged but strwork +5.6% -> +3.9%. NOT ready: the dsa
-        // module built with `=4` does not validate (`i32.wrap_i64` on an
-        // i32 local in `literate_page::Page::tape_pack`), a bug after
-        // CLIF that the new shapes reach. Find that first.
+        // `PLIRON_SROA_FRAGWORD=<bytes>`: the word the rule counts in.
+        // Default: the pointer width, so 4 on wasm32, where an i32 or
+        // f32 is a whole register value and a `[u32; 16]` or a small
+        // f32 matrix read as sixteen sub-word pieces under the 8-byte
+        // word (`=8` restores that). 2026-11-16, wasm: rapier2d's FEM
+        // assembly keeps its f32 blocks in locals (dsa game_asteroids
+        // 1.44x -> 1.23x LLVM), strwork +5.6% -> +3.9%, the other
+        // kernels and dsa rows unchanged, module -1.7%. Native is 8
+        // either way.
         let word: u64 = crate::env_get("PLIRON_SROA_FRAGWORD")
             .and_then(|v| v.parse().ok())
             .filter(|w: &u64| w.is_power_of_two())
-            .unwrap_or(8);
+            .unwrap_or(if crate::types::ptr32() { 4 } else { 8 });
         if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per, word) {
             return false;
         }

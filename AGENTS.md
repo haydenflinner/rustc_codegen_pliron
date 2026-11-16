@@ -351,6 +351,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   forward their `store tmp; memcpy(sret, tmp)`), `constload::forward_copies`
   runs again after phisimp, and the wasm emitter expands constant
   copies of at most 16 bytes instead of emitting `memory.copy`.
+- `PLIRON_SROA_FRAGWORD=<bytes>` — the word size `PLIRON_SROA_FRAGCOPY`
+  counts in; default the pointer width (4 on wasm32 since 2026-11-16,
+  `=8` restores the old rule there; native is 8).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
