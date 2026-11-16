@@ -328,7 +328,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   corpus recorded from a wasm build (`PLIRON_CORPUS=<dir>` on
   `harness/v8/variant.sh` or `harness/dsa/build.sh`) the way the wasm
   backend runs the pipeline. The stages after CLIF (waffle, `wpeep`)
-  are not covered by it.
+  are not covered by it. Reading a report (which step of a corpus
+  function, `PLIRON_DIFFCHECK_WATCH=<address>` / `PLIRON_DIFFCHECK_PATH=1`
+  to follow a differing byte back, never-written bytes, lifetime markers
+  an IR pass left stale, a corpus older than a fix):
+  `docs/miscompile-triage.md` "Reading a corpus mismatch".
 - **wasm-only stages** (after CLIF): the waffle inliner
   (`PLIRON_WASM_INLINE=0`), byte peepholes (`PLIRON_WASM_PEEP=0`,
   `PLIRON_WASM_PEEP_LIMIT=N` peepholes only the first N bodies — bisect
