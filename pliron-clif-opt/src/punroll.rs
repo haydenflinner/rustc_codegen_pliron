@@ -3723,8 +3723,10 @@ fn matv(func: &mut Function, nb: Block, smap: &mut FxHashMap<Value, Seed>, v: Va
     }
 }
 
-/// The trip bound `trip_max` proves for the latch's counting test, if
-/// the latch is a `brif` continuing to `h` on a counted test.
+/// The trip bound `trip_max` estimates for the latch's counting test, if
+/// the latch is a `brif` continuing to `h` on a counted test, and the
+/// bound that is a fact (`trip_max_exact`), if there is one. Copies are
+/// capped by the first; only the second may drop the residual loop.
 fn peel_trip_cap(
     func: &Function,
     cfg: &ControlFlowGraph,
@@ -3732,7 +3734,7 @@ fn peel_trip_cap(
     h: Block,
     latch: Block,
     body: &FxHashSet<Block>,
-) -> Option<u64> {
+) -> Option<(u64, Option<u64>)> {
     let t = func.layout.last_inst(latch)?;
     let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else { return None };
     let cpos = blocks.iter().position(|bc| bc.block(&func.dfg.value_lists) == h)?;
@@ -3754,7 +3756,11 @@ fn peel_trip_cap(
     }
     let cnt = find_count(func, h, body, cfg, dt, x, y, cond, &hparams, &cont_args)?;
     let iv0 = crate::loopidiom::entry_arg(func, cfg, dt, h, cnt.pidx)?;
-    crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le)
+    let cap = crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le)?;
+    let exact = crate::loopidiom::trip_max_exact(
+        func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le, cnt.eq, cnt.signed,
+    );
+    Some((cap, exact))
 }
 
 /// Loop peeling: emit K sequential clones of the chain ahead of the
@@ -3849,7 +3855,10 @@ fn run_peel(
         .sum();
     // Copies past the loop's trip bound never run (`for i in 1..4` got
     // eight): peel at most that many, which unrolls it fully.
-    let trip_cap = peel_trip_cap(func, cfg, dt, h, latch, &body);
+    let (trip_cap, trip_exact) = match peel_trip_cap(func, cfg, dt, h, latch, &body) {
+        Some((cap, exact)) => (Some(cap), exact),
+        None => (None, None),
+    };
     // `* 10` Horner: the ordinary caps (12 insts → k=4, 16 branch sites)
     // leave `from_str`'s digit loop half-unrolled plus a residual the
     // 8-digit word still executes.
@@ -3888,7 +3897,10 @@ fn run_peel(
     // `trip_max` rounds up by one. When we've peeled at least that bound
     // minus the round-up, the residual continue is dead under the
     // dominating guards — LLVM's full unroll (digit `from_str`).
-    let full_unroll = trip_cap.is_some_and(|m| (k as u64).saturating_add(1) >= m);
+    // Only a bound that is a fact may delete the loop: `trip_max` is a
+    // cost estimate (stanza `willret`: `while i != 0 { i += 2 }` lost
+    // its loop on a "one trip" estimate).
+    let full_unroll = trip_exact.is_some_and(|m| (k as u64).saturating_add(1) >= m);
     for &b in &chain {
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for &i in &insts[..insts.len() - 1] {

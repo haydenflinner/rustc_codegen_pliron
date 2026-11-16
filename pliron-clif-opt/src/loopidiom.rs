@@ -568,18 +568,26 @@ fn param_umax(
 /// non-negative constant offsets are stripped from `b` — `(y + X) - (y + c)
 /// <= X` keeps `X` an upper bound (a rotated loop starts one step in).
 fn sub_cancel(func: &Function, cfg: &ControlFlowGraph, a: Value, b: Value) -> Option<Value> {
+    sub_cancel_k(func, cfg, a, b).map(|(x, _)| x)
+}
+
+/// [`sub_cancel`] with the constant stripped from `b`: `a - b` is
+/// exactly `X - c` (mod the width).
+fn sub_cancel_k(func: &Function, cfg: &ControlFlowGraph, a: Value, b: Value) -> Option<(Value, i64)> {
     let a = fwd_param(func, cfg, a);
     let mut b = fwd_param(func, cfg, b);
+    let mut c = 0i64;
     for _ in 0..4 {
         let Some(bi) = func.dfg.value_def(b).inst() else { break };
         let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[bi] else {
             break;
         };
-        let nxt = match (iconst(func, args[0]), iconst(func, args[1])) {
-            (_, Some(k)) if k >= 0 => args[0],
-            (Some(k), _) if k >= 0 => args[1],
+        let (nxt, k) = match (iconst(func, args[0]), iconst(func, args[1])) {
+            (_, Some(k)) if k >= 0 => (args[0], k),
+            (Some(k), _) if k >= 0 => (args[1], k),
             _ => break,
         };
+        c = c.checked_add(k)?;
         b = fwd_param(func, cfg, nxt);
     }
     let ai = func.dfg.value_def(a).inst()?;
@@ -587,7 +595,10 @@ fn sub_cancel(func: &Function, cfg: &ControlFlowGraph, a: Value, b: Value) -> Op
         return None;
     };
     let args = args.map(|x| fwd_param(func, cfg, x));
-    (args[0] == b).then_some(args[1]).or((args[1] == b).then_some(args[0]))
+    (args[0] == b)
+        .then_some(args[1])
+        .or((args[1] == b).then_some(args[0]))
+        .map(|x| (x, c))
 }
 
 /// `v`, or — while it is a param of a block with exactly one incoming edge
@@ -674,6 +685,101 @@ pub fn trip_max(
         None => return None,
     };
     (span / step as u64).checked_add(u64::from(le) + 1)
+}
+
+/// `v` as a constant: an `iconst`, or `iadd`s of constants (a rotated
+/// loop enters its residual at `0 + 1`), through single-edge params.
+fn const_sum(func: &Function, cfg: &ControlFlowGraph, v: Value, depth: u32) -> Option<i64> {
+    let v = fwd_param(func, cfg, v);
+    if let Some(k) = iconst(func, v) {
+        return Some(k);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let i = func.dfg.value_def(v).inst()?;
+    let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] else {
+        return None;
+    };
+    const_sum(func, cfg, args[0], depth - 1)?.checked_add(const_sum(func, cfg, args[1], depth - 1)?)
+}
+
+/// [`trip_max`] as a fact the caller may delete code on, where
+/// `trip_max` itself is a cost input (it treats an unknown start as 0
+/// and ignores a counter that wraps past an `!=` bound: `while i != 0
+/// { i += 2 }` from an odd `i` never ends, and got a bound of one trip).
+/// Same rounding (one above the trips). `None` unless the count is
+/// forced:
+///
+/// - constant start and bound, `0 <= a <= b`, the step divides `b - a`
+///   (an `!=` test lands on the bound) and `b + step` does not leave the
+///   counter's signed range (a `<` test sees the counter pass it);
+/// - or a step of one from `y + c` to `y + X`: the counter meets every
+///   value on the way, so it runs `X - c` trips whatever the test, given
+///   `c <= X` (ranges at the header) and `X`'s guard bound;
+/// - or a step of one under a `<` test (`eq` false) against a bound the
+///   guards keep at most `B`, below the signed maximum: from a constant
+///   `a >= 0` that is `B - a` trips; from an unknown start, unsigned
+///   only, at most `B + 1` (a start at the type's maximum wraps to 0
+///   after its one trip and then counts up to the bound).
+///
+/// `<=` tests are left out (a bound at the type's maximum never exits).
+#[allow(clippy::too_many_arguments)]
+pub fn trip_max_exact(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    h: Block,
+    iv0: Value,
+    bound: Value,
+    step: i64,
+    le: bool,
+    eq: bool,
+    signed: bool,
+) -> Option<u64> {
+    if !crate::pass_enabled("PLIRON_TRIPMAX") || step <= 0 || le {
+        return None;
+    }
+    let w = func.dfg.value_type(func.dfg.resolve_aliases(iv0)).bits();
+    if !(8..=64).contains(&w) {
+        return None;
+    }
+    let smax = if w >= 64 { i64::MAX } else { (1i64 << (w - 1)) - 1 };
+    if let (Some(a), Some(b)) = (iconst(func, iv0), iconst(func, bound)) {
+        if 0 <= a && a <= b && (b - a) % step == 0 && b.checked_add(step).is_some_and(|e| e <= smax) {
+            return ((b - a) as u64 / step as u64).checked_add(1);
+        }
+        return None;
+    }
+    if step != 1 {
+        return None;
+    }
+    let g = dom_guards(func, cfg, dt, h);
+    let budget = std::cell::Cell::new(256);
+    let Some((x, c)) = sub_cancel_k(func, cfg, bound, iv0) else {
+        if eq {
+            return None;
+        }
+        let b = val_umax(func, cfg, bound, &g, 8, &budget);
+        if b >= smax as u64 {
+            return None;
+        }
+        return match const_sum(func, cfg, iv0, 4) {
+            Some(a) if a >= 0 => b.saturating_sub(a as u64).checked_add(1),
+            Some(_) => None,
+            None if !signed => b.checked_add(2),
+            None => None,
+        };
+    };
+    let span = val_umax(func, cfg, x, &g, 8, &budget);
+    if c > 0 {
+        let mut rs = crate::ranges::Ranges::new(func, cfg);
+        let r = rs.at(func, dt, func.dfg.resolve_aliases(x), h);
+        if r.ulo < c as u64 {
+            return None;
+        }
+    }
+    span.checked_add(1)
 }
 
 /// The value header param `idx` of `h` takes on every edge from outside the
