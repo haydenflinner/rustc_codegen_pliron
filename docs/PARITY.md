@@ -864,6 +864,23 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   per caller, or the bonus only for callees below some size), measure
   the kernels (`bench/wasm/run.mjs`, no kernel may lose: user rule) and
   the dsa module (size and the 14 like-for-like rows).
+  **2026-11-17, on main with single-caller inlining:** the `export`
+  case is gone: no `write_str`/`insert_full` copies, one bonus
+  `hash_one`; `export` is 18,376 B with the bonus and 18,301 B without
+  (`mimas_compile` alone, crate 1,482,364 B; `PLIRON_INLINE_HOT=1`
+  1,466,697 B, `=2` 1,488,188 B). Accepts that need the bonus (cost
+  above 512): 18 on kernels+std (`hash_one` 2x in `hashmap::run`, 1x in
+  `hmget::run`/`setup`; `Big32x40::cmp` 4x in `format_exact`, which
+  `strwork` runs; quicksort `partition`), 1,398 on dsa (1.1 M ops, mostly
+  `hash_one` again, up to 9 copies in one caller). Opt-in
+  `PLIRON_INLINE_HOTCAP=k` caps the bonus copies of one callee per
+  caller, `PLIRON_INLINE_HOTCAP_MIN=c` only for callees costing more
+  than `c`. Without the floor the cap loses kernels (cap 2: `strwork`
+  +1.4 points; cap 1: `hashmap` +1.5, quiet machine). `HOTCAP=2
+  HOTCAP_MIN=600` leaves the kernel module byte-identical, takes 0.46%
+  off `mimas_compile` and 9.1% of the dsa bonus ops by the trace; the
+  dsa module size and rows are not measured yet (dsa HEAD 8e943d64 did
+  not build: its `mimas` submodule was behind).
 - **N2. waffle's handling of an irreducible CFG.** One irreducible edge
   pair turned 4,752 waffle instructions into 123,047 wasm instructions:
   the `Reducifier`'s max-SSA conversion keeps every cut block's
