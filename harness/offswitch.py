@@ -86,6 +86,8 @@ def run(clif_check, corpus, every, jobs, env_extra, out):
 
 
 def main():
+    # One line per switch as it finishes, also when piped to a log.
+    sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--corpus", default=None)
     ap.add_argument("--every", type=int, default=4)
