@@ -1373,7 +1373,8 @@ impl Context {
     /// PLIRON: does block `b` hold a call that some value may live across
     /// (see `shrink_split`)? A call followed only by the block's
     /// terminator, a `return` or a `jump` to a return-only block whose
-    /// arguments are all results of that call, is in tail position.
+    /// arguments are all results of that call, or a `trap`, is in tail
+    /// position.
     fn shrink_live_call(&self, b: crate::ir::Block) -> bool {
         use crate::ir::{BlockArg, Opcode};
         let f = &self.func;
@@ -1393,6 +1394,10 @@ impl Context {
                     let op = f.dfg.insts[*t].opcode();
                     if op == Opcode::Return {
                         f.dfg.inst_args(*t).iter().all(|&v| from_call(v))
+                    } else if op == Opcode::Trap {
+                        // A call that does not return (a panic) keeps
+                        // nothing live either.
+                        true
                     } else if op == Opcode::Jump {
                         f.dfg.insts[*t]
                             .branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
@@ -1454,7 +1459,12 @@ impl Context {
         if off {
             return;
         }
-        const MAX_LIVEIN: usize = 16;
+        // `PLIRON_SHRINKWRAP_MAXLIVEIN=<n>` (default 16): no split when more
+        // values than this are live into S (each is a copy on S's path).
+        static MAXLI: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let max_livein = *MAXLI.get_or_init(|| {
+            std::env::var("PLIRON_SHRINKWRAP_MAXLIVEIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+        });
         let Some(entry) = self.func.layout.entry_block() else { return };
         let frame_op = |op: Opcode| {
             op.is_call()
@@ -1563,6 +1573,30 @@ impl Context {
         if dbg {
             eprintln!("shrink_split: closed save block {sb} after {climbs} climbs");
         }
+        // Only an early exit that is not cold pays for the split: when every
+        // way out that avoids S is a cold block (an `Err` return, a panic),
+        // S runs on every warm call and its edge copies are pure cost
+        // (`RawVecInner::grow_amortized`: the capacity-overflow return;
+        // rust-protobuf +0.3%). The save point is still chosen after
+        // regalloc. `PLIRON_SHRINKWRAP_COLD=1` splits anyway.
+        static COLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*COLD.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP_COLD").as_deref() == Ok("1")) {
+            let f = &self.func;
+            let is_ret = |b: crate::ir::Block| {
+                f.layout.last_inst(b).is_some_and(|t| f.dfg.insts[t].opcode().is_return())
+            };
+            let warm_exit = f.layout.blocks().any(|b| {
+                !self.domtree.block_dominates(sb, b)
+                    && !f.layout.is_cold(b)
+                    && (is_ret(b) || self.cfg.succ_iter(b).any(|s| s != sb && is_ret(s)))
+            });
+            if !warm_exit {
+                if dbg {
+                    eprintln!("shrink_split: no warm exit avoids {sb}");
+                }
+                return;
+            }
+        }
         // A small return block reached from both sides of S gets a copy for
         // the edges from outside S's region, so every return reachable
         // from S is dominated by it (VCode's shrink-wrap condition).
@@ -1650,7 +1684,7 @@ impl Context {
         if dbg {
             eprintln!("shrink_split: {} live-ins into {sb}", liveins.len());
         }
-        if liveins.is_empty() || liveins.len() > MAX_LIVEIN {
+        if liveins.is_empty() || liveins.len() > max_livein {
             return;
         }
         crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(Some(sb)));
