@@ -531,6 +531,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   1,329 bytes (LLVM 294) and `memcmp` 602 (LLVM 74), with `=120` they are
   340 and 116. A scratch string-search driver goes from 1.33x to 1.14x
   LLVM's time; the kernel module changes in one cold function.
+- `PLIRON_INLINE_V8CAP=<lean ops>` (opt-in, wasm, 2026-11-17): the
+  inliner refuses an inline that would take a caller from at most that
+  many `lean_cost` ops past it, when the caller has at least
+  `PLIRON_INLINE_V8CAP_SITES` (2) call sites and at most
+  `PLIRON_INLINE_V8CAP_CALLS` (3) calls of its own, and the callee is
+  over `PLIRON_INLINE_V8CAP_TINY` (8) lean ops: V8 inlines a wasm callee
+  only up to 500 body bytes, about 115 lean ops (calibration on
+  rapier2d's 2,401 functions: median 4.4 bytes per lean op, `lean > 100`
+  predicts `> 500 B` for 93%; `PLIRON_INLINE_SIZELOG=<prefix>` writes
+  every function's raw and lean counts after inlining). The calls bound
+  matters: without it dragon's `mul_pow10` stayed small, was inlined
+  into `format_shortest`/`format_exact` with its twenty calls, and the
+  kernel module grew 25%. dims driver with `PLIRON_WASM_SMALLFN=120`:
+  1.114 -> 1.043; alone 1.326 -> 1.340; rapier2d driver unchanged.
 - `PLIRON_INLINE_LEANCOST=<w>` and `PLIRON_UNROLL2_BUNROLL=<insts>`
   (opt-in, 2026-11-17, queue item 3). The first scores a callee with at
   most `w` warm calls by its `inline_cost::lean_cost` (jumps, slots,

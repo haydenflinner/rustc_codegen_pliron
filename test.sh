@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa spills slotpromlt byvalhome inlinecm inlinelean retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
@@ -498,6 +498,27 @@ t_inlinelean() {
   k_on=$(cat $out/inlinelean_on.rem.* | grep '8assemble' | grep 'E3mul' | grep -c 'reject (score)' || true)
   if [ "$k_off" -eq 0 ] || [ "$k_on" -ne 0 ]; then
     echo "inlinelean: Mat::mul score rejects in assemble: $k_off without the knob, $k_on with it (want >0, 0)" >&2
+    return 1
+  fi
+}
+
+t_inlinev8cap() {
+  # PLIRON_INLINE_V8CAP (wasm): a small caller with several call sites
+  # (`pick`) keeps a callee (`mix`) that would take it past the cap as a
+  # call; a caller nobody calls (`drive`) inlines it. Remarks decide.
+  local f n_pick n_drive
+  for f in off on; do
+    rm -f $out/inlinev8cap_$f.rem.*
+    if [ $f = on ]; then cap=30; else cap=0; fi
+    PLIRON_INLINE_V8CAP=$cap PLIRON_REMARKS=$out/inlinev8cap_$f.rem \
+      rustc $BE --crate-type=lib --edition 2021 -O -C codegen-units=1 --target wasm32-unknown-unknown \
+        --emit obj -o $out/inlinev8cap_$f.o tests/inlinev8cap/lib.rs || return 1
+  done
+  n_off=$(cat $out/inlinev8cap_off.rem.* 2>/dev/null | grep -c 'reject (v8cap)' || true)
+  n_pick=$(cat $out/inlinev8cap_on.rem.* | grep '4pick' | grep '3mix' | grep -c 'reject (v8cap)' || true)
+  n_drive=$(cat $out/inlinev8cap_on.rem.* | grep '5drive' | grep -c 'reject (v8cap)' || true)
+  if [ "$n_off" -ne 0 ] || [ "$n_pick" -eq 0 ] || [ "$n_drive" -ne 0 ]; then
+    echo "inlinev8cap: v8cap rejects: off $n_off, pick->mix $n_pick, drive $n_drive (want 0, >0, 0)" >&2
     return 1
   fi
 }
@@ -1429,6 +1450,7 @@ want tailrec && t_tailrec
 want sroa && t_sroa
 want inlinecm && t_inlinecm
 want inlinelean && t_inlinelean
+want inlinev8cap && t_inlinev8cap
 want spills && t_spills
 want slotpromlt && t_slotpromlt
 want byvalhome && t_byvalhome
