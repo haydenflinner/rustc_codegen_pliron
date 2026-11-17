@@ -1326,7 +1326,28 @@ fn split(
             .and_then(|v| v.parse().ok())
             .filter(|w: &u64| w.is_power_of_two())
             .unwrap_or(st.target.word_bytes());
-        if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per, word) {
+        // `PLIRON_SROA_FRAGCOPY_OUT=1`: an aggregate that only direct
+        // stores write and that one copy moves out is built in place:
+        // split, its pieces are SSA values at the copy, which becomes the
+        // stores themselves into the destination, and no slot is left.
+        // Whole, the stores go to a stack slot the copy then reads back.
+        // regex-syntax's `Box::new(PropertiesI { .. })` (80 bytes, copied
+        // into the new box) and `Parser::new` kept such slots (STK).
+        let built_in_place = || {
+            let mut outs = 0;
+            for x in &acc {
+                match x.kind {
+                    Kind::Load | Kind::Store => {}
+                    Kind::Copy { dst: false, .. } => outs += 1,
+                    _ => return false,
+                }
+            }
+            outs == 1
+        };
+        if whole_copy
+            && frag_copy_stays_whole(size, &pieces, direct, per, word)
+            && !(crate::env_is("PLIRON_SROA_FRAGCOPY_OUT", "1") && built_in_place())
+        {
             return false;
         }
     }
