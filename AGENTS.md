@@ -538,7 +538,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   seven unchanged). `PLIRON_WASM_MASKELIM`
   starts its fixpoint's operators at 0 bits (loop-carried carries lose
   their `& 255`); `PLIRON_WASM_MASKELIM_OPT=0` restores the old start.
-- `PLIRON_IVMERGE=1` (opt-in, 2026-11-17, PARITY item 10) — step
+- `PLIRON_IVMERGE` (default on since 2026-11-17, `=0` off; PARITY item 10) — step
   `ivmerge` after `retest`: loop-header params of one integer type in
   lockstep (`q = p + D`, `D` invariant, proven by joint induction over
   linear forms; a `select` the edge decides is its pick) share one

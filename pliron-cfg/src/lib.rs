@@ -403,6 +403,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // other seven unchanged (their differences, at most 0.002%, are all in
     // `RandomState` hashing and libc malloc). `=0` off.
     "PLIRON_VRP_SIGNEDEQ",
+    // 2026-11-17 (PARITY item 10): `ivmerge`, lockstep loop params share
+    // one register and the dropped one's end test folds. Native exact
+    // counts: pulldown-cmark -0.68%, compression -0.25%, regex -4.2k,
+    // blind-sig -3.7k, the other four unchanged; wasm kernel module -1.2%,
+    // geomean 0.889 -> 0.884 with no kernel outside its `--perturb=4`
+    // range. Corpus replays clean. `=0` off.
+    "PLIRON_IVMERGE",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
