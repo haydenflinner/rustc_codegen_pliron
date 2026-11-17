@@ -15,7 +15,7 @@ use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::entity::packed_option::ReservedValue;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
+use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
@@ -67,6 +67,50 @@ pub fn known(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u
     }
 }
 
+/// The value of an `f32const`/`f64const` (widened: f32 -> f64 is exact,
+/// so comparisons of the widened values are the f32 comparisons).
+pub fn fconst(func: &Function, v: Value) -> Option<f64> {
+    let v = func.dfg.resolve_aliases(v);
+    let ValueDef::Result(inst, 0) = func.dfg.value_def(v) else {
+        return None;
+    };
+    match func.dfg.insts[inst] {
+        InstructionData::UnaryIeee32 {
+            opcode: Opcode::F32const,
+            imm,
+        } => Some(f64::from(f32::from_bits(imm.bits()))),
+        InstructionData::UnaryIeee64 {
+            opcode: Opcode::F64const,
+            imm,
+        } => Some(f64::from_bits(imm.bits())),
+        _ => None,
+    }
+}
+
+/// `fcmp cond a, b` with Cranelift's `FloatCC` semantics (an unordered
+/// pair satisfies exactly the `Unordered*`, `NotEqual` and `Unordered`
+/// codes).
+pub fn fcmp(cond: FloatCC, a: f64, b: f64) -> bool {
+    use std::cmp::Ordering::*;
+    let o = a.partial_cmp(&b);
+    match cond {
+        FloatCC::Ordered => o.is_some(),
+        FloatCC::Unordered => o.is_none(),
+        FloatCC::Equal => o == Some(Equal),
+        FloatCC::NotEqual => o != Some(Equal),
+        FloatCC::OrderedNotEqual => matches!(o, Some(Less | Greater)),
+        FloatCC::UnorderedOrEqual => matches!(o, None | Some(Equal)),
+        FloatCC::LessThan => o == Some(Less),
+        FloatCC::LessThanOrEqual => matches!(o, Some(Less | Equal)),
+        FloatCC::GreaterThan => o == Some(Greater),
+        FloatCC::GreaterThanOrEqual => matches!(o, Some(Greater | Equal)),
+        FloatCC::UnorderedOrLessThan => matches!(o, None | Some(Less)),
+        FloatCC::UnorderedOrLessThanOrEqual => matches!(o, None | Some(Less | Equal)),
+        FloatCC::UnorderedOrGreaterThan => matches!(o, None | Some(Greater)),
+        FloatCC::UnorderedOrGreaterThanOrEqual => matches!(o, None | Some(Greater | Equal)),
+    }
+}
+
 fn icmp(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
     let (sa, sb) = (sext(a, w), sext(b, w));
     match cc {
@@ -93,6 +137,8 @@ pub fn eval(
 ) -> Option<u64> {
     static ARITH: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_EVAL_ARITH"));
+    static FCMP: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_FCMPFOLD", "1"));
     let res = func.dfg.first_result(inst);
     let w = bits(func, res)?;
     let r = match func.dfg.insts[inst] {
@@ -117,6 +163,11 @@ pub fn eval(
                 }
                 _ => return None,
             }
+        }
+        // `PLIRON_FCMPFOLD=1`: a compare of two float constants (nalgebra's
+        // `if !beta.is_zero()` once `beta`'s store is forwarded).
+        InstructionData::FloatCompare { cond, args, .. } if *FCMP => {
+            u64::from(fcmp(cond, fconst(func, args[0])?, fconst(func, args[1])?))
         }
         InstructionData::Unary { opcode, arg } => {
             let aw = bits(func, arg)?;

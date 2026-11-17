@@ -58,3 +58,42 @@
 (rule (simplify (ne cty (ineg (fits_in_64 ty) x) (iconst ty c)))
       (if-let true (pliron_rules_on))
       (ne cty x (iconst ty (imm64_neg ty c))))
+
+;;;; fcmpfold (PLIRON_FCMPFOLD=1, opt-in): a compare of two float constants
+;; is a constant. Upstream's cprop leaves `fcmp` as a TODO; nalgebra's
+;; `gemv` tests `!beta.is_zero()` on a `beta` that is the constant 0.0
+;; or 1.0 once its store is forwarded, and the untaken arm keeps a
+;; second copy of every loop.
+(decl pure pliron_fcmpfold_on () bool)
+(extern constructor pliron_fcmpfold_on pliron_fcmpfold_on)
+(decl pure f32_cmp_fold (FloatCC Ieee32 Ieee32) u64)
+(extern constructor f32_cmp_fold f32_cmp_fold)
+(decl pure f64_cmp_fold (FloatCC Ieee64 Ieee64) u64)
+(extern constructor f64_cmp_fold f64_cmp_fold)
+(rule (simplify (fcmp (fits_in_64 ty) cc (f32const $F32 a) (f32const $F32 b)))
+      (if-let true (pliron_fcmpfold_on))
+      (subsume (iconst_u ty (f32_cmp_fold cc a b))))
+(rule (simplify (fcmp (fits_in_64 ty) cc (f64const $F64 a) (f64const $F64 b)))
+      (if-let true (pliron_fcmpfold_on))
+      (subsume (iconst_u ty (f64_cmp_fold cc a b))))
+
+;;;; fmul1 (PLIRON_FMUL1=1, opt-in): x * 1.0 --> x. Exact for every
+;; non-NaN x (including -0.0 and infinities); for a NaN x the result is
+;; a NaN either way, and Rust leaves the payload (and, for a signaling
+;; input, the quiet bit) of an arithmetic NaN unspecified, which is why
+;; LLVM folds it too. nalgebra's `gemm` passes `alpha = 1.0` into every
+;; `axcpy` (`y = a * x * c + b * y`).
+(decl pure pliron_fmul1_on () bool)
+(extern constructor pliron_fmul1_on pliron_fmul1_on)
+(rule (simplify (fmul $F32 x (f32const $F32 (u32_from_ieee32 0x3f800000))))
+      (if-let true (pliron_fmul1_on))
+      (subsume x))
+(rule (simplify (fmul $F32 (f32const $F32 (u32_from_ieee32 0x3f800000)) x))
+      (if-let true (pliron_fmul1_on))
+      (subsume x))
+(rule (simplify (fmul $F64 x (f64const $F64 (u64_from_ieee64 0x3ff0000000000000))))
+      (if-let true (pliron_fmul1_on))
+      (subsume x))
+(rule (simplify (fmul $F64 (f64const $F64 (u64_from_ieee64 0x3ff0000000000000)) x))
+      (if-let true (pliron_fmul1_on))
+      (subsume x))

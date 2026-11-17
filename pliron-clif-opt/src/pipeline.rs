@@ -2493,6 +2493,41 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// `PLIRON_UNROLL2=1` (opt-in): `unroll` once more after the first
+// `loadfwd`/`egraph`, for the small loops whose trip only becomes
+// constant there. nalgebra's `gemm` for a 2x3 times 3x2 product tests
+// `!beta.is_zero()` inside its column loop on a `beta` that sits in a
+// stack slot until `loadfwd` forwards the `0.0` stored into it, so the
+// early `unroll` finds the trip undecided and the six loops of every
+// small matrix product stay (rapier2d's soft-body FEM assembly, the
+// dsa `game_asteroids` row). When it unrolls anything, the steps that
+// clean up after the early `unroll` run again on the straight-line
+// result: `loadfwd` (the per-element stores become values), `slotprom`,
+// `dse` and the `egraph`.
+fn s_unroll2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = s_unroll(p, an);
+    if k == 0 {
+        return 0;
+    }
+    an.bump(&p.clctx.func, shape::CREATED);
+    if p.flags.get(FlagId::Loadfwd) {
+        s_loadfwd(p, an);
+        an.bump(&p.clctx.func, shape::CREATED);
+    }
+    if config().enabled("PLIRON_SLOTPROM") && an.shape_bits(&p.clctx.func) & shape::MEM != 0 {
+        s_slotprom(p, an);
+        an.bump(&p.clctx.func, u32::MAX);
+    }
+    if p.flags.get(FlagId::Dse) && an.shape_bits(&p.clctx.func) & shape::STORE != 0 {
+        s_dse(p, an);
+        an.bump(&p.clctx.func, shape::CREATED);
+    }
+    if config().enabled("PLIRON_EGRAPH") {
+        s_egraph(p, an);
+    }
+    k
+}
+
 fn s_bunroll(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = bunroll::run(&mut p.clctx.func, an);
     if k > 0 {
@@ -4893,6 +4928,21 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             creates: u32::MAX,
             gate: Gate::Env("PLIRON_EGRAPH"),
             run: s_egraph,
+            site: std::sync::OnceLock::new(),
+        },
+        // Trips that loadfwd/egraph just made constant (`s_unroll2`).
+        Step {
+            name: "unroll2",
+            bisect: Some("unroll"),
+            stat: "",
+            verify: true,
+            mutates: true,
+            cached: true,
+            shape: shape::LOOPS,
+            any: 0,
+            creates: u32::MAX,
+            gate: Gate::All(&[JT, Gate::Env("PLIRON_UNROLL"), Gate::OptIn("PLIRON_UNROLL2")]),
+            run: s_unroll2,
             site: std::sync::OnceLock::new(),
         },
         // `prev` seed materialization emits loads.

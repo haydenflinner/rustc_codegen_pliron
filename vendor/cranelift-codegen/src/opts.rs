@@ -322,6 +322,31 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         *ON.get_or_init(|| std::env::var("PLIRON_EGRAPH_RULES").as_deref() != Ok("0"))
     }
 
+    /// PLIRON: `PLIRON_FCMPFOLD=1` (opt-in), the `fcmpfold` rules of
+    /// `opts/pliron.isle`.
+    fn pliron_fcmpfold_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_FCMPFOLD").as_deref() == Ok("1"))
+    }
+
+    /// PLIRON: `PLIRON_FMUL1=1` (opt-in), the `fmul1` rules.
+    fn pliron_fmul1_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_FMUL1").as_deref() == Ok("1"))
+    }
+
+    fn f32_cmp_fold(&mut self, cc: &FloatCC, a: Ieee32, b: Ieee32) -> u64 {
+        pliron_fcmp(
+            *cc,
+            f64::from(f32::from_bits(a.bits())),
+            f64::from(f32::from_bits(b.bits())),
+        )
+    }
+
+    fn f64_cmp_fold(&mut self, cc: &FloatCC, a: Ieee64, b: Ieee64) -> u64 {
+        pliron_fcmp(*cc, f64::from_bits(a.bits()), f64::from_bits(b.bits()))
+    }
+
     fn imm64_addsub_imm(&mut self, ty: Type, imm: Imm64) -> Option<()> {
         let v = self.i64_sextend_imm64(ty, imm).unsigned_abs();
         (v <= 0xfff || (v & 0xfff == 0 && v <= 0xfff_000)).then_some(())
@@ -493,4 +518,28 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
             shift_by: shift_by.try_into().unwrap(),
         }
     }
+}
+
+/// PLIRON: `fcmp cc, a, b` on two constants (f32 operands widened, which
+/// is exact), with `FloatCC`'s semantics: an unordered pair satisfies
+/// exactly the `Unordered*` codes, `Unordered` and `NotEqual`.
+fn pliron_fcmp(cc: FloatCC, a: f64, b: f64) -> u64 {
+    use core::cmp::Ordering::*;
+    let o = a.partial_cmp(&b);
+    u64::from(match cc {
+        FloatCC::Ordered => o.is_some(),
+        FloatCC::Unordered => o.is_none(),
+        FloatCC::Equal => o == Some(Equal),
+        FloatCC::NotEqual => o != Some(Equal),
+        FloatCC::OrderedNotEqual => matches!(o, Some(Less | Greater)),
+        FloatCC::UnorderedOrEqual => matches!(o, None | Some(Equal)),
+        FloatCC::LessThan => o == Some(Less),
+        FloatCC::LessThanOrEqual => matches!(o, Some(Less | Equal)),
+        FloatCC::GreaterThan => o == Some(Greater),
+        FloatCC::GreaterThanOrEqual => matches!(o, Some(Greater | Equal)),
+        FloatCC::UnorderedOrLessThan => matches!(o, None | Some(Less)),
+        FloatCC::UnorderedOrLessThanOrEqual => matches!(o, None | Some(Less | Equal)),
+        FloatCC::UnorderedOrGreaterThan => matches!(o, None | Some(Greater)),
+        FloatCC::UnorderedOrGreaterThanOrEqual => matches!(o, None | Some(Greater | Equal)),
+    })
 }
