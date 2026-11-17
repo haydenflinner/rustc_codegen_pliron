@@ -249,7 +249,7 @@ prints one `ra2post:` line per changed function. Checked with
 `PLIRON_RA_CHECK=1` on the eight held-out programs (identical output);
 static effect at `=15`: stack stores -1..3%, instructions -0.1..0.3%.
 
-## `PLIRON_RA2_SRCVREG=1` (runtime, default off): block-parameter moves carry the argument's vreg
+## `PLIRON_RA2_SRCVREG` (runtime, default on since 2026-11-17, `=0` off): block-parameter moves carry the argument's vreg
 
 `src/ion/moves.rs` (`block_param_src_vreg`, the block-param move
 insertion), `src/lib.rs` (`srcvreg_on`): the `edit_vregs` entry of a

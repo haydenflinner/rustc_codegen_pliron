@@ -58,7 +58,7 @@ KNOBS = [
     ("PLIRON_RA2_NOPINMERGE", "1", ["0"], "ra2", "1"),
     ("PLIRON_RA2_SLOTPAIR", "1", ["0"], "ra2", "1"),
     ("PLIRON_RA2_POSTOPT", "15", ["0", "1", "2", "4", "8", "3", "12"], "ra2", "15"),
-    ("PLIRON_RA2_SRCVREG", "0", ["1"], "ra2", "1"),
+    ("PLIRON_RA2_SRCVREG", "1", ["0"], "ra2", "1"),
     ("PLIRON_RA2_REHOME", "2", ["0", "1"], "ra2", "2"),
     ("PLIRON_RA2_XBLOCK", "0", ["1"], "ra2", "1"),
     ("PLIRON_RA2_MERGEDEPTH", "0", ["1", "2", "3"], "ra2", "2"),

@@ -212,7 +212,7 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 | `PLIRON_RA2_NOPINMERGE` | regalloc2 `merge.rs` | refuse merges that spread a fixed-register pin | on |
 | `PLIRON_RA2_SLOTPAIR` | regalloc2 `spill.rs` | repack spill slots so consecutive spills pair (`stp`/`ldp`) | on |
 | `PLIRON_RA2_POSTOPT=<bits>` | regalloc2 `postopt.rs` | post-allocation cleanup: 1 redundant reloads, 2 reload as copy, 4 redundant spill stores, 8 dead spill stores | on (15) since 2026-11-17 |
-| `PLIRON_RA2_SRCVREG=1` | regalloc2 `moves.rs` | block-param moves carry the argument's vreg (constant args rematerialize) | opt-in, eval |
+| `PLIRON_RA2_SRCVREG` | regalloc2 `moves.rs` | block-param moves carry the argument's vreg (constant args rematerialize) | on since 2026-11-17 |
 | `PLIRON_RA2_REHOME` | regalloc2 `rehome.rs` | a value's register in a join-only block follows the cheaper side | on (2) |
 | `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in, eval |
 | `PLIRON_RA2_MERGEDEPTH=1..3` | regalloc2 `merge.rs` | merge blockparams of the deepest loops first | opt-in, eval |

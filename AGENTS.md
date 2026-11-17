@@ -857,7 +857,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   from a register that already mirrors the slot, 4 redundant spill
   stores, 8 dead spill stores (`vendor/regalloc2/src/ion/postopt.rs`;
   `PLIRON_RA2_POSTOPT_STATS=1` counts). Check with `PLIRON_RA_CHECK=1`.
-- `PLIRON_RA2_SRCVREG=1` (opt-in) — a block-parameter move is labelled
+- `PLIRON_RA2_SRCVREG` (default on since 2026-11-17, `=0` off; docs/regalloc.md) — a block-parameter move is labelled
   with the branch argument's vreg, so a constant passed to a spilled
   parameter is rematerialized instead of loaded from its own spill
   slot (stack loads -3.5..-4.3% on three held-out binaries).

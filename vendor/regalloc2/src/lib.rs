@@ -225,14 +225,17 @@ pub(crate) fn postopt_bits() -> u32 {
     0
 }
 
-/// PLIRON (`PLIRON_RA2_SRCVREG=1`, default off): a block-parameter move's
-/// `edit_vregs` entry names the branch argument's vreg instead of the
-/// parameter's. See `ion/moves.rs`.
+/// PLIRON (`PLIRON_RA2_SRCVREG`, default on since 2026-11-17, `=0` off): a
+/// block-parameter move's `edit_vregs` entry names the branch argument's
+/// vreg instead of the parameter's. See `ion/moves.rs`. Executed
+/// instructions (docs/regalloc.md): pulldown-cmark -130k, html-rewriter
+/// -57k, rust-protobuf -54k, blind-sig -38k, regex -4.5k, blake3 0,
+/// rust-json +615 of 51.5M.
 pub(crate) fn srcvreg_on() -> bool {
     #[cfg(feature = "std")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SRCVREG").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SRCVREG").as_deref() != Ok("0"))
     }
     #[cfg(not(feature = "std"))]
     false
