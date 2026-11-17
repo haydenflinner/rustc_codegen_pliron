@@ -375,13 +375,13 @@ When a bundle must split, every block it is live in is a node labelled R
 (in one physical register) or S (on the stack). For a candidate register,
 blocks where the register is not free over the bundle's part of the block
 must be S. An S block costs `hot_bonus x min(register uses, CAP)` (CAP =
-`PLIRON_RA2_REGION_CAP`, default 2: a block-local piece reloads once per
+`PLIRON_RA2_REGION_CAP`, default 1: a block-local piece reloads once per
 stretch); an edge the bundle is live across costs `min(hot(pred),
 hot(succ))` when its ends differ. The cheapest labelling is a minimum s-t
 cut (symmetric pairwise costs: submodular), found by Dinic's max-flow with
 a budget linear in the graph. The `K` registers with the largest possible
 gain (sum of S costs of their free blocks; `PLIRON_RA2_REGION_K`, default
-4) are cut; the cheapest wins if it costs less than `RATIO` (1.0) x all
+8) are cut; the cheapest wins if it costs less than `RATIO` (1.0) x all
 blocks S. The ranges are cut at block boundaries only: the R blocks become
 one bundle with holes, assigned the register at once; mode 1 gives each S
 block with register uses a block-local piece from its first to its last
@@ -400,7 +400,8 @@ too). Unit tests for the max-flow in the module; stanza `regionsplit`
 (stock output, modes 0/1/2 under `PLIRON_RA_CHECK=1`).
 
 Exact executed instructions (2026-11-17, aarch64-linux-musl, callgrind),
-default -> `PLIRON_RA2_REGION=1` (built with `PLIRON_RA_CHECK=1`):
+default -> `PLIRON_RA2_REGION=1` with the first parameters (CAP 2, K 4;
+built with `PLIRON_RA_CHECK=1`):
 rust-compression 44,095,655 -> 42,728,743 (-3.10%: Zopfli -772k,
 `BrotliEstimateBitCostsForLiterals` -298k, `compress_inner` -125k),
 rust-html-rewriter 101,452,418 -> 100,774,931 (-0.67%), pulldown-cmark
@@ -416,3 +417,56 @@ limit that inlines `HistogramSelfAddHistogram`): compression 44,196,946
 1,777,062, so the copy change costs +12k with the region split instead of
 +101k. Compile time: html-rewriter corpus `clif-check codegen` 17.4-17.9 s
 user either way.
+
+Parameters (exact counts against CAP 2 / K 4, four programs): CAP 1
+pulldown -95k, others within +-16k; CAP 3 identical; K 8 pulldown -43k;
+CAP 1 + K 8 + `SPILLHOIST`: pulldown -170k, protobuf -26k, regex +21k,
+compression -18k, html -6k (now the defaults). `RATIO` 0.8 (skip cuts that
+save under 20% of all-stack) gives blake3 back its 6k but costs
+compression +452k: stays 1.0.
+
+**Flip candidate, `PLIRON_RA2_REGION=1 PLIRON_RA2_SPILLHOIST=1`** (CAP 1,
+K 8), default -> both, exact counts:
+
+| program | default | region + hoist | change |
+|---|---|---|---|
+| rust-compression | 44,095,655 | 42,710,634 | -3.14% |
+| rust-html-rewriter | 101,452,418 | 100,768,438 | -0.67% |
+| pulldown-cmark | 51,914,147 | 51,375,285 | -1.04% |
+| regex | 50,528,248 | 50,088,239 | -0.87% |
+| rust-json | 51,478,425 | 51,373,365 | -0.20% |
+| rust-protobuf | 65,262,081 | 64,912,380 | -0.54% |
+| blind-sig | 34,687,507 | 34,691,980 | +0.01% (noise: +-35k between identical builds, random keys) |
+| blake3-scalar | 49,040,376 | 49,046,430 | +0.012% |
+
+blake3's +6,054 is `compress_chunks_parallel`, two reloads at the outer
+loop's exit edge per call (3,032 calls): two values the cut puts on the
+stack inside the loop and back in a register after it, where the default
+kept one in `x23` throughout. Checker: `clif-check codegen` with
+`PLIRON_RA_CHECK=1` over the eight held-out corpora, `compression-xc`, std
+and clcg (every 4th), macOS and `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`,
+modes 1 and 2: the same failures as the default (pre-existing compile
+errors), none from the checker.
+
+## `PLIRON_RA2_SPILLHOIST=1` (runtime, opt-in): one spill store at the definition
+
+`src/ion/spillhoist.rs` (new), called from `ion::run` before `postopt`;
+`src/lib.rs` (`spillhoist_on`). regalloc2 stores a value to its slot at
+every register-to-stack boundary: every split point, every edge from a
+register region into a stack region (the region split stores on each
+entry into a call-heavy loop, inside an outer loop on every trip). The
+values are SSA, so per vreg the stores to its slot (register-to-stack
+edits whose `edit_vregs` entry names it) are summed by block frequency
+and, when 1.5 x the defining block's frequency is below that (the margin:
+split-point stores often pair into `stp`, a lone store at the definition
+does not), replaced by one store at `After(def)`, ahead of the other edits
+there. Sound because the definition dominates every point the vreg is
+live at, a slot is shared only between spillsets with disjoint extents
+(an extent covers every path the vreg is live along) and the vregs of one
+spillset never overlap. Block parameters and definitions on a block's
+last instruction are left alone. Static, region split on: html-rewriter
+corpus weighted stack accesses -1.6%, compression -0.9%; in
+`BrotliCreateHqZopfliBackwardReferences` 5 stores replace 39. Exact counts
+alone (default allocator + hoist): compression -29k, pulldown -12k, the
+others within +-3k (blind-sig noise). With the region split: compression
+-15k, pulldown -24k. `PLIRON_RA_CHECK=1` clean (same runs as above).
