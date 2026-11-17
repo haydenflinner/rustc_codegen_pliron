@@ -1303,6 +1303,60 @@ fn succ_masks(
         .collect()
 }
 
+/// `PLIRON_SM_KILLSLIDE=1`: an end kill moves past the reads of its slot
+/// that follow it in the same block, up to the first write or start of
+/// that slot. A pass that sinks a load within its block does not move
+/// the marker anchored on the load before it: `slp` pairs two `i64`
+/// loads of an `sret` result into one `i64x2` load at the position of
+/// the stores it feeds, after the end marker
+/// (`Parser::parse_with_comments`). `stale_markers` then drops every
+/// marker of the slot, its live range becomes the whole loop it sits in,
+/// and the seven 128-byte `Result` slots of the parser's match arms
+/// cannot share. A later kill only makes the slot live longer;
+/// `stale_markers` still checks the moved kill against every other read.
+fn slide_kills(
+    func: &Function,
+    ipos: &SecondaryMap<Inst, u32>,
+    reads: &[Vec<Inst>],
+    writes: &[Vec<Inst>],
+    starts: &[(StackSlot, Block, u32, u8)],
+    kills: &mut [(StackSlot, Block, u32, bool)],
+) {
+    let mut starts_of: FxHashMap<StackSlot, Vec<(Block, u32, u8)>> = FxHashMap::default();
+    for &(s, b, p, o) in starts {
+        starts_of.entry(s).or_default().push((b, p, o));
+    }
+    for k in kills.iter_mut() {
+        let (s, b, p, _) = *k;
+        let si = s.index();
+        if si >= reads.len() {
+            continue;
+        }
+        // Events after the kill in its block: (pos, order, kind), order as
+        // in `stale_markers` (0 before the inst at pos, 1 at it, 2 after
+        // it), kind 0 a read, 1 a write or start. A read and a write at
+        // one inst (a call that reads and fills the slot) read first.
+        let in_b = |i: &Inst| func.layout.inst_block(*i) == Some(b) && ipos[*i] > p;
+        let mut ev: Vec<(u32, u8, u8)> = reads[si].iter().filter(|i| in_b(i)).map(|&i| (ipos[i], 1, 0)).collect();
+        if ev.is_empty() {
+            continue;
+        }
+        ev.extend(writes[si].iter().filter(|i| in_b(i)).map(|&i| (ipos[i], 1, 1)));
+        if let Some(v) = starts_of.get(&s) {
+            ev.extend(v.iter().filter(|st| st.0 == b && st.1 > p).map(|st| (st.1, st.2, 1)));
+        }
+        ev.sort_unstable();
+        let mut q = p;
+        for (pos, _, kind) in ev {
+            if kind == 1 {
+                break;
+            }
+            q = pos;
+        }
+        k.2 = q;
+    }
+}
+
 /// Slots whose lifetime markers the code contradicts: a recorded read is
 /// reachable from one of the slot's kills (end markers, edge and
 /// before-inst kills, exactly placed start markers — the set `mark_flow`
@@ -2503,6 +2557,9 @@ pub fn run_with(
     // `PLIRON_SM_STALECHECK=0` trusts the markers as before.
     let mut ek_ok: Vec<(StackSlot, Inst, u32)> = edge_kills.to_vec();
     if markflow && crate::pass_enabled("PLIRON_SM_STALECHECK") {
+        if crate::env_is("PLIRON_SM_KILLSLIDE", "1") {
+            slide_kills(func, &ipos, &reads, &writes, &starts, &mut kills);
+        }
         let stale = stale_markers(func, &order, &bfirst, &ipos, &uses, &reads, &writes, &kills, edge_kills, &starts);
         let gone = |s: StackSlot| stale.get(s.index()).copied().unwrap_or(false);
         kills.retain(|k| !gone(k.0));
