@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--jobs", type=int, default=0)
     ap.add_argument("--out", default=None, help="keep the per-switch JSON reports here")
     ap.add_argument("--no-verify", action="store_true", help="skip PLIRON_VERIFY=full")
+    ap.add_argument("--resume", action="store_true",
+                    help="with --out: reuse a switch's report when it is newer than clif-check")
     a = ap.parse_args()
 
     names = switches()
@@ -139,7 +141,13 @@ def main():
         env = dict(base_env)
         if n != "(none)":
             env[n] = "0"
-        res, dt, err = run(clif_check, corpus, a.every, a.jobs, env, out / f"{n.strip('()')}.json")
+        rep = out / f"{n.strip('()')}.json"
+        if a.resume and rep.exists() and rep.stat().st_mtime > clif_check.stat().st_mtime:
+            r = json.loads(rep.read_text())
+            bad = [(f["status"], f["file"], f.get("msg", "")[:160]) for f in r["functions"] if f["status"] != "ok"]
+            res, dt, err = (len(r["functions"]), bad), 0.0, ""
+        else:
+            res, dt, err = run(clif_check, corpus, a.every, a.jobs, env, rep)
         if res is None:
             print(f"  FAIL {n:<32} clif-check exited: {err.strip()}")
             failed.append(n)
