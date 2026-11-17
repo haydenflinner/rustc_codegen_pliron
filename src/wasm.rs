@@ -10189,6 +10189,61 @@ fn mask_elim(b: &mut FunctionBody) -> usize {
     n
 }
 
+#[cfg(test)]
+mod mask_elim_tests {
+    use super::*;
+
+    /// `entry(p): br_if p, j(a), j(b); j(q): ret q & 255` with `b` a
+    /// compare (1 bit) and `a` either a constant 7 (fits) or `p + p`.
+    fn body(a_fits: bool) -> (FunctionBody, WV) {
+        let mut m = Module::empty();
+        let sig = m.signatures.push(SignatureData {
+            params: vec![WT::I32],
+            returns: vec![WT::I32],
+        });
+        let mut b = FunctionBody::new(&m, sig);
+        let e = b.entry;
+        let p = b.blocks[e].params[0].1;
+        let a = if a_fits {
+            b.add_op(e, O::I32Const { value: 7 }, &[], &[WT::I32])
+        } else {
+            b.add_op(e, O::I32Add, &[p, p], &[WT::I32])
+        };
+        let c = b.add_op(e, O::I32LtU, &[p, a], &[WT::I32]);
+        let j = b.add_block();
+        let q = b.add_blockparam(j, WT::I32);
+        let mk = b.add_op(j, O::I32Const { value: 255 }, &[], &[WT::I32]);
+        let and = b.add_op(j, O::I32And, &[q, mk], &[WT::I32]);
+        b.set_terminator(j, Terminator::Return { values: vec![and] });
+        b.set_terminator(
+            e,
+            Terminator::CondBr {
+                cond: p,
+                if_true: BlockTarget { block: j, args: vec![a] },
+                if_false: BlockTarget { block: j, args: vec![c] },
+            },
+        );
+        (b, q)
+    }
+
+    #[test]
+    fn mask_of_narrow_block_param_goes() {
+        let (mut b, q) = body(true);
+        assert_eq!(mask_elim(&mut b), 1);
+        let j = b.blocks.iter().nth(1).unwrap();
+        assert!(matches!(&b.blocks[j].terminator,
+            Terminator::Return { values } if values == &vec![q]));
+        assert!(b.blocks[j].insts.is_empty(), "dead mask const kept");
+    }
+
+    // Near miss: one incoming value is a full-width add.
+    #[test]
+    fn mask_of_wide_block_param_stays() {
+        let (mut b, _) = body(false);
+        assert_eq!(mask_elim(&mut b), 0);
+    }
+}
+
 // ---------- CLIF -> waffle emit ----
 //
 // `lower_to_wasm_clif` runs FnLower + the pliron-clif-opt suite (same as the
