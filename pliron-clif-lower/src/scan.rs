@@ -164,23 +164,23 @@ fn walk_block(ctx: &Context, st: &mut State, b: Ptr<BasicBlock>) {
 
 /// Cranelift-level pass switches (`PLIRON_<PASS>=0` disables one).
 pub fn pass_flags(st: &mut State) {
-    use pliron_cfg::pass_enabled;
-    st.notrap = pass_enabled("PLIRON_NOTRAP");
-    st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
-    st.loadfwd = pass_enabled("PLIRON_LOADFWD");
-    st.slot_dse = pass_enabled("PLIRON_SLOT_DSE");
-    st.dse = pass_enabled("PLIRON_DSE");
-    st.peep = pass_enabled("PLIRON_PEEP");
-    st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
-    st.unreach = pass_enabled("PLIRON_UNREACH");
-    st.taildup = pass_enabled("PLIRON_TAILDUP");
-    st.licm = pass_enabled("PLIRON_LICM");
-    st.indvars = pass_enabled("PLIRON_INDUCT");
-    st.loopidiom = pass_enabled("PLIRON_IDIOM");
-    st.loopvec = pass_enabled("PLIRON_VEC");
-    st.slp = pass_enabled("PLIRON_SLP");
-    st.bcheck = pass_enabled("PLIRON_BCHECK");
-    st.tailrec = pass_enabled("PLIRON_TAILREC");
+    st.notrap = pliron_cfg::pass_enabled("PLIRON_NOTRAP");
+    let f = crate::pipeline::FnFlags::from_env();
+    st.jumpthread = f.jumpthread;
+    st.loadfwd = f.loadfwd;
+    st.slot_dse = f.slot_dse;
+    st.dse = f.dse;
+    st.peep = f.peep;
+    st.tailmerge = f.tailmerge;
+    st.unreach = f.unreach;
+    st.taildup = f.taildup;
+    st.licm = f.licm;
+    st.indvars = f.indvars;
+    st.loopidiom = f.loopidiom;
+    st.loopvec = f.loopvec;
+    st.slp = f.slp;
+    st.bcheck = f.bcheck;
+    st.tailrec = f.tailrec;
 }
 
 /// Build the side tables [`crate::lower::lower_module`] reads for a module

@@ -79,6 +79,33 @@ pub enum FlagId {
 }
 
 impl FnFlags {
+    /// The step-category switches from `PLIRON_<PASS>=0` (each on unless
+    /// `=0`): the one place their names are read, by the backend
+    /// (`pliron_clif_lower::scan::pass_flags`) and by `clif-check`, so a
+    /// corpus replay under `PLIRON_JUMPTHREAD=0` runs what the backend
+    /// runs. `keep_dbg_slots` is a compile option, not a switch: false.
+    pub fn from_env() -> FnFlags {
+        use pliron_cfg::pass_enabled as on;
+        FnFlags {
+            jumpthread: on("PLIRON_JUMPTHREAD"),
+            unreach: on("PLIRON_UNREACH"),
+            peep: on("PLIRON_PEEP"),
+            tailmerge: on("PLIRON_TAILMERGE"),
+            taildup: on("PLIRON_TAILDUP"),
+            tailrec: on("PLIRON_TAILREC"),
+            loadfwd: on("PLIRON_LOADFWD"),
+            slot_dse: on("PLIRON_SLOT_DSE"),
+            dse: on("PLIRON_DSE"),
+            indvars: on("PLIRON_INDUCT"),
+            licm: on("PLIRON_LICM"),
+            loopidiom: on("PLIRON_IDIOM"),
+            loopvec: on("PLIRON_VEC"),
+            bcheck: on("PLIRON_BCHECK"),
+            slp: on("PLIRON_SLP"),
+            keep_dbg_slots: false,
+        }
+    }
+
     fn get(&self, id: FlagId) -> bool {
         match id {
             FlagId::Jumpthread => self.jumpthread,

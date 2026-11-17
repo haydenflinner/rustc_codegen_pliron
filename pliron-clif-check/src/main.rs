@@ -298,24 +298,8 @@ fn with_pipe_lts<R>(
     let mut clctx = Context::for_function(func);
     let mut derived = facts.derived.clone();
     let mut stats = Stats::default();
-    let flags = FnFlags {
-        jumpthread: true,
-        unreach: true,
-        peep: true,
-        tailmerge: true,
-        taildup: true,
-        tailrec: true,
-        loadfwd: true,
-        slot_dse: true,
-        dse: true,
-        indvars: true,
-        licm: true,
-        loopidiom: true,
-        loopvec: true,
-        bcheck: true,
-        slp: true,
-        keep_dbg_slots: false,
-    };
+    // `PLIRON_<PASS>=0` switches, read as the backend reads them.
+    let flags = FnFlags::from_env();
     let func_id = facts
         .self_name
         .as_deref()
