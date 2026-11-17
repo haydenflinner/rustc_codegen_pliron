@@ -98,6 +98,70 @@ quick leg replays those under every quick combination) and, for a bug
 reachable from Cranelift, a unit test next to the fix. Record it in the
 fuzz log below.
 
+## Metric (`harness/rastat.py`)
+
+One classifier (aarch64) for both compilers and both modes:
+
+| class | what |
+|---|---|
+| `st` | store addressed off sp/x29 outside the prologue (spills, and locals kept in memory) |
+| `ld` | load addressed off sp/x29 outside the epilogue's restores |
+| `mov` | register-to-register copy within one bank (`mov xA, xB`, `fmov dA, dB`, `mov vA.16b, vB.16b`) |
+| `csr` | callee-saved (x19-x28, d8-d15) saves (a store of one no earlier instruction wrote) and the epilogue's restores (the loads in the run before `ret` or a tail branch) |
+| `frame` | frame record and sp moves (reported, not overhead) |
+| `slot` | static only: sp/fp accesses to explicit stack slots and incoming arguments, kept apart from spill-slot `st`/`ld` |
+
+**overhead = st + ld + mov + csr.**
+
+- `rastat.py dyn [--only P] [--env K=V] [--tag T] [--save F]`: exact
+  executed counts. Both sides build each held-out program for
+  aarch64-unknown-linux-musl (`irdiff.py`'s builds), run once under
+  callgrind `--dump-instr=yes` (docker); every executed address is
+  classified from llvm-objdump. Per program ours/LLVM per class, then
+  the functions with the most excess overhead. The dynamic `st`/`ld`
+  include locals (LLVM's side cannot be split); it is the same rule on
+  both sides. About 5 minutes a program on a loaded machine; delete
+  `target/heldout/ir-pliron-<tag>` afterwards.
+- `rastat.py static [--corpus std|html|smoke|clcg] [--env K=V] [--save F]`:
+  the fast loop, no docker. `clif-check codegen --vcode` (pipeline +
+  Cranelift with the backend's flags), the same classes per function,
+  each instruction weighted 8^min(loop depth, 3). std 20 s, html (15,348
+  functions) 12 s.
+- `rastat.py cmp A.json B.json`: two saved runs, totals and the functions
+  that moved most.
+
+`target/corpus/html` is html-rewriter's corpus (15,348 functions,
+recorded from the held-out build); copy it from another checkout or
+record it with `PLIRON_CORPUS`.
+
+### Static baseline (main at d74c3554 + the harness, 2026-11-17)
+
+Weighted (8^depth) counts; static counts in parentheses.
+
+| corpus | fns | st | ld | mov | csr | overhead | slot |
+|---|---|---|---|---|---|---|---|
+| std | 4,917 | 355,457 (5,772) | 443,806 (8,644) | 673,590 (52,858) | 12,001 (11,952) | 1,484,854 (79,226) | 482,131 |
+| html | 15,348 | 115,876 (3,554) | 301,569 (5,630) | 683,317 (88,324) | 22,808 (22,724) | 1,123,570 (120,232) | 232,603 |
+| smoke | 2,979 | 238,356 (3,499) | 997,677 (6,939) | 949,651 (25,462) | 5,449 (5,323) | 2,191,133 (41,223) | 1,171,475 |
+
+### Static, the opt-in knobs one at a time (overhead change against the baseline)
+
+| knob | std st | std ld | std mov | std overhead | html st | html ld | html mov | html overhead |
+|---|---|---|---|---|---|---|---|---|
+| `POSTOPT=15` | -4.95% | -0.20% | +0.19% | -1.16% | -23.88% | -1.42% | +0.34% | -2.64% |
+| `POSTOPT=7` | -1.53% | -0.20% | +0.20% | -0.34% | -5.07% | -1.17% | +0.41% | -0.58% |
+| `POSTOPT=8` | -2.39% | 0 | 0 | -0.57% | -7.47% | -0.04% | 0 | -0.78% |
+| `SRCVREG=1` | -1.71% | -6.23% | -0.78% | -2.63% | -6.20% | -18.98% | -0.62% | -6.11% |
+| `REMATW=1` | -1.05% | +0.08% | -2.14% | -1.20% | -11.68% | -16.12% | -3.51% | -7.67% |
+| `XBLOCK=1` | -0.08% | 0 | -0.01% | -0.02% | -0.08% | -0.17% | +0.05% | -0.02% |
+| `MERGEDEPTH=1` | -25.55% | -12.30% | -9.51% | -14.11% | +0.57% | +1.14% | -4.21% | -2.20% |
+| `MERGEDEPTH=2` | -26.50% | -12.93% | -8.58% | -14.10% | -7.73% | -0.86% | -7.41% | -5.54% |
+| `MERGEDEPTH=3` | -25.69% | -12.61% | -9.22% | -14.10% | +0.12% | +0.06% | -4.86% | -2.93% |
+| `POSTOPT=15 SRCVREG=1 REMATW=1 MERGEDEPTH=2` | -35.88% | -24.37% | -7.77% | -19.40% | -37.36% | -38.82% | -6.52% | -18.24% |
+
+csr moved under 0.12% in every row. Static is a ranking aid, not the
+verdict: the dynamic counts and exact instruction totals below decide.
+
 ## Knobs
 
 Status: **on** = default on; **opt-in**; **eval** = under evaluation.
