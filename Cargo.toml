@@ -29,12 +29,13 @@ pliron-clif-opt = { path = "pliron-clif-opt" }
 pliron-clif-lower = { path = "pliron-clif-lower" }
 pliron-ir-opt = { path = "pliron-ir-opt" }
 pliron-cfg = { path = "pliron-cfg" }
+pliron-wasm = { path = "pliron-wasm" }
 rustc-hash = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace]
-members = ["pliron-clif-opt", "pliron-clif-lower", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "pliron-hack", "bench"]
+members = ["pliron-clif-opt", "pliron-clif-lower", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "pliron-hack", "bench", "pliron-wasm"]
 exclude = ["vendor"]
 
 [profile.dev]
