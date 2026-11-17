@@ -868,6 +868,33 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   bytes with a name-section script (`$TMPDIR/cmpfn/` has the
   per-function tables), then attack the largest.
 
+- **N6. hmget's loss under single-caller inlining is two licm refusals**
+  (the V8 comparison, notes in the session scratchpad `hmget_notes.md`,
+  summarised in `history/2026-11-16-wasm-night.md`). Not alignment: the
+  loop head sits at the same offset mod 64 in the fast and the slow
+  build. (a) Under `PLIRON_INLINE_ONCE=3` the closure's loop keeps the
+  five header loads of the map and the key-only SipHash prefix (26 more
+  machine instructions per lookup, +19% against LLVM's +5%): licm
+  refuses each with `deref=None -> safe=false`, because `&HashMap` is
+  read out of the closure environment and carries no dereferenceable
+  fact, and licm (`licm.rs` ~476-510) needs an unconditional
+  dereferenceability proof for any load hoist. Either give a pointer
+  loaded from a reference-typed place a dereferenceable fact (rustc
+  knows the pointee type; the IR has `noalias`/`frozen` facts for
+  parameters only) or let licm hoist a load that executes on every
+  iteration (header to preheader is not speculation when the header
+  dominates every exit and the loop is entered). (b) Under `=1` with
+  NCC and SLOTPROV one load (k0) stays because
+  `PLIRON_LICM_INNERPRESS=2` caps hoists by a native register-pressure
+  estimate; on wasm TurboFan allocates registers. A build with
+  `PLIRON_LICM_INNERPRESS=0` has 96 machine instructions per lookup
+  against the default's 102 (timing pending). Each fix must keep every
+  other kernel (`bench/wasm/run.mjs`) and the default dsa rows.
+- **N7. Why the default hmget is itself +5% against LLVM**: its lookup
+  loop reloads 8 spilled values per lookup, the memory base among them.
+  Compare with LLVM's TurboFan code for the same loop
+  (`harness/v8/mcode.sh`, fixed 2026-11-16 to pick the right function).
+
 In flight at the same time (agents): the IR-pass differential checker
 (`clif-check xcorpus`, gate for further `memcpyopt` work: `noalias`
 destinations, then sibling-arm writers whose arms together cover every
