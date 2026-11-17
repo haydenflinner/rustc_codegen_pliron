@@ -2689,7 +2689,7 @@ fn s_i128id(p: &mut Pipe, _an: &mut Analysis) -> usize {
 // 128-bit integer operations on word halves (`wide128`), ahead of the
 // egraph so it folds the halves.
 fn s_wide128(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = crate::wide128::run(&mut p.clctx.func);
+    let k = crate::wide128::run(&mut p.clctx.func, p.target.mulhi64());
     if k > 0 && p.dump {
         p.dump("wide128");
     }

@@ -25,7 +25,7 @@ fn count(f: &Function, op: Opcode) -> usize {
 fn run(src: &str) -> (Function, usize) {
     let before = parse(src);
     let mut after = before.clone();
-    let n = wide128::run(&mut after);
+    let n = wide128::run(&mut after, true);
     cranelift_codegen::verify_function(&after, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
         .unwrap_or_else(|e| panic!("invalid after wide128: {e}\n{after}"));
     check(&before, &after, &Facts::default(), &Config { trials: 64, ..Config::default() })

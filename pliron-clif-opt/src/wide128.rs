@@ -19,7 +19,8 @@
 //!   through `uextend`/`iconcat`)
 //! * `bor|bxor|band c1, c2` -> `iconcat (op a1 a2), (op b1 b2)`
 //! * `imul (iconcat a, 0), (iconcat b, 0)` -> `iconcat (imul a b),
-//!   (umulhi a b)`
+//!   (umulhi a b)` where `umulhi.i64` is one instruction
+//!   (`Target::mulhi64`)
 //! * `ireduce.i64 c` -> `a`; `ireduce.iN c` -> `ireduce.iN a`;
 //!   `isplit c` -> `a, b`
 //!
@@ -72,10 +73,10 @@ fn is_zero(func: &Function, v: Value) -> bool {
 /// always dominance order (a cold block laid out last can define a value
 /// a later-visited block uses), so the pass repeats while it changes
 /// something, at most four times.
-pub fn run(func: &mut Function) -> usize {
+pub fn run(func: &mut Function, mulhi64: bool) -> usize {
     let mut n = 0;
     for _ in 0..4 {
-        let k = pass(func);
+        let k = pass(func, mulhi64);
         n += k;
         if k == 0 {
             break;
@@ -84,7 +85,7 @@ pub fn run(func: &mut Function) -> usize {
     n
 }
 
-fn pass(func: &mut Function) -> usize {
+fn pass(func: &mut Function, mulhi64: bool) -> usize {
     let mut n = 0;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
@@ -140,7 +141,10 @@ fn pass(func: &mut Function) -> usize {
                     pos.func.replace(inst).iconcat(lo, hi);
                     n += 1;
                 }
-                InstructionData::Binary { opcode: Opcode::Imul, args } if rty == types::I128 => {
+                // Only where `umulhi.i64` is one instruction
+                // (`Target::mulhi64`): on wasm32 it is a long sequence and
+                // the multiply stays a `__multi3` call (dragon/grisu grew).
+                InstructionData::Binary { opcode: Opcode::Imul, args } if rty == types::I128 && mulhi64 => {
                     let (Some((a, ah)), Some((b, bh))) = (cat(pos.func, args[0]), cat(pos.func, args[1])) else {
                         continue;
                     };
