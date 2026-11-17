@@ -856,18 +856,56 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   (`PLIRON_CORPUS`), reduce, fix with a test, and run the corpora with
   every pass's `=0` switch in turn to find others like it (a
   `clif-check report` per switch is seconds on std).
-- **N5. The 19 MB in functions LLVM's module does not have.** About
-  20,000 of our 35,550 dsa functions have no counterpart in LLVM's
-  module, 19.1 MB of the 22 MB excess; functions present in both are
-  1.4x LLVM's size (median 1.35x), mostly local traffic. Classify the
-  extra 20,000 by why they exist: single-caller instances LLVM inlined
-  and dropped (`PLIRON_INLINE_ONCE` covers some: 1,225 `from_iter`
-  alone), generic instances LLVM shared or never instantiated, `xcgu`
-  copies the linker's same-name fold (`PLIRON_LDEDUP`) does not merge,
-  dead functions the linker keeps, drop glue. Rank the classes by
-  bytes with a name-section script (`$TMPDIR/cmpfn/` has the
-  per-function tables), then attack the largest.
+- **N5. The 19 MB in functions LLVM's module does not have: analysed**
+  (2026-11-16, both modules from dsa `0caf4bb8`; scripts and every
+  number in the session scratchpad `n5/NOTES.md`). Ours 36,046
+  functions / 36.10 MB of code, LLVM's 19,845 / 14.48 MB. By normalized
+  name 15,010 of ours have a counterpart (16.37 MB); 21,036 do not
+  (19.73 MB). First-match classes of those 21,036:
 
+  | class | functions | MB |
+  |---|---|---|
+  | one direct caller, not exported or in a table | 9,468 | 14.70 |
+  | identical code to another of our functions | 9,271 | 2.57 |
+  | same path in LLVM with other generic arguments | 1,540 | 1.48 |
+  | the rest | 757 | 0.98 |
+
+  The bytes sit in 256 B-4 KB and larger functions, not in tiny ones
+  (5,354 functions under 64 B hold 90 KB). The linker's dead-function
+  GC is already complete (2 unreachable functions). **Inlining the
+  single-caller ones does not shrink the module today**:
+  `PLIRON_INLINE_ONCE=1` removed 8,492 functions and added 7.65 MB
+  (locals +4.25 MB, control +1.70 MB, functions of 50 KB+ from 10 to
+  56), because our code inlined into a large function grows local
+  traffic: the single-caller clusters are 2.64x LLVM's bytes for the
+  same work while their roots alone are 1.39x. So the order is density
+  first (N9), then single-caller inlining. What is left of this item:
+- **N8. Identical-code folding in `pliron-wasm-ld`**: 9,271 bodies are
+  byte-identical to another of ours (signature and code equal, call
+  targets compared by class), 2.99 MB module-wide. Examples: 19
+  `quicksort<Hap>` copies (41 KB), 67 `Vec<String>::extend_trusted`
+  (40 KB), 13 local copies of SipHash `write_str` at 2,687 B each (the
+  same-name fold `PLIRON_LDEDUP` only folds exported mangled symbols).
+  Fold to one body and redirect calls and table entries; keep functions
+  whose address is compared if any (Rust does not promise distinct
+  function pointers; check exports and `ref.func` uses). Iterate to a
+  fixpoint (folding callees makes callers identical). Measure module
+  bytes and that all 19 dsa workloads still return LLVM's results.
+- **N9. Code density: the same function is 1.42x LLVM's bytes, and the
+  excess is in small functions** (13,089 functions present in both:
+  under 256 B 2.45x, 256 B-1 KB 2.00x, 1-4 KB 1.42x, 4-16 KB 1.29x,
+  16 KB+ 0.81x). 65% of the excess is local traffic (a quarter of it
+  runs of pure local-to-local copies), 28% control structure, 4%
+  constants; loads, stores and calls account for nothing. Module-wide
+  the 21.6 MB gap is locals 10.5 MB, control 4.5, constants 2.6. A
+  concrete lead: we realign the shadow stack pointer (`i32.const -16;
+  i32.and`) about 17,229 times against LLVM's 101, and restore it
+  (`global.set 0`) about 60,551 times against 20,855 (byte-pattern
+  counts): a frame that needs no 16-byte alignment should not realign,
+  and one exit should restore once. Then the waffle backend's local
+  allocation and block structure for small functions (`stackify`,
+  `localify`), compared function by function with LLVM's output for a
+  sample of the 256 B-1 KB bucket.
 - **N6. hmget's loss under single-caller inlining is two licm refusals**
   (the V8 comparison, notes in the session scratchpad `hmget_notes.md`,
   summarised in `history/2026-11-16-wasm-night.md`). Not alignment: the
