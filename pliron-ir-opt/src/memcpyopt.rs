@@ -680,8 +680,8 @@ fn try_forward(
                 why!("noalias dst: a writer may unwind after a partial write");
             }
         }
-        if exits_between(ctx, st, &writers, m) {
-            why!("noalias dst: the caller may see it between a writer and the copy");
+        if let Some(e) = exits_between(ctx, st, &writers, m) {
+            why!("noalias dst: the caller may see it between a writer and the copy ({e})");
         }
     }
     let mut all_touch = None;
@@ -884,8 +884,8 @@ fn try_forward(
                     why!("sret dst: a writer may unwind after a partial write");
                 }
             }
-            if exits_between(ctx, st, &writers, m) {
-                why!("sret dst: the caller may see it between a writer and the copy");
+            if let Some(e) = exits_between(ctx, st, &writers, m) {
+                why!("sret dst: the caller may see it between a writer and the copy ({e})");
             }
         }
         // `dst` readers get the mirror check: the transform drops `m`'s
@@ -1409,13 +1409,14 @@ fn may_unwind(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
 /// observes memory (a return, an op that may unwind) that does not pass
 /// through the copy `m`? Walked forward from each writer, stopping at
 /// `m`; a path that ends in `unreachable` observes nothing. Over budget
-/// counts as "yes".
+/// counts as "yes". Returns what was found: `"return"`, `"unwind"` or
+/// `"budget"`.
 fn exits_between(
     ctx: &Context,
     st: &State,
     writers: &[(Ptr<Operation>, u64, u64)],
     m: Ptr<Operation>,
-) -> bool {
+) -> Option<&'static str> {
     let mut seen: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
     let mut steps = 0usize;
     let mut stack: Vec<Option<Ptr<Operation>>> = writers.iter().map(|&(w, _, _)| w.get_next(ctx)).collect();
@@ -1425,14 +1426,17 @@ fn exits_between(
         while let Some(o) = cur {
             steps += 1;
             if steps > 8192 {
-                return true;
+                return Some("budget");
             }
             if o == m {
                 last = None;
                 break;
             }
-            if may_unwind(ctx, st, o) || Operation::is_op::<pliron_llvm::ops::ReturnOp>(o, ctx) {
-                return true;
+            if Operation::is_op::<pliron_llvm::ops::ReturnOp>(o, ctx) {
+                return Some("return");
+            }
+            if may_unwind(ctx, st, o) {
+                return Some("unwind");
             }
             last = Some(o);
             cur = o.get_next(ctx);
@@ -1444,7 +1448,7 @@ fn exits_between(
             }
         }
     }
-    false
+    None
 }
 
 /// The alloca `v` points into and the constant byte offset, through a chain
