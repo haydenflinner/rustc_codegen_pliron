@@ -2525,6 +2525,14 @@ fn stub(
         let mut rng = Rng(mix(h, 1000 + k as u64));
         let v = if r.value_type == ptr_ty() && rng.below(2) == 0 {
             ptr(heap_base() + rng.below(HEAPS) * REGION_STRIDE + PTR_SLACK + rng.below(8) * 8)
+        } else if xmode && k == 0 && f.dfg.signatures[sig].returns.len() >= 2 && r.value_type.is_int() {
+            // A value returned in several registers whose first is an
+            // integer is most often an enum with its tag first
+            // (`Result<(u32, u32), E>`): 0 or 1, as for an `sret` result
+            // (bincode's `deserialize_tuple`: `tag as u8 != 0` in one build,
+            // `tag & 1` in the other, on a random tag).
+            let t = i128::from(rng.below(4) == 0);
+            DataValue::read_from_slice_le(&t.to_le_bytes()[..r.value_type.bytes() as usize], r.value_type)
         } else if xmode && r.value_type == types::I8 {
             // A byte result is mostly a `bool` or the tag of a
             // `Result<(), E>`: 0 or 1, mostly 0. `random_value` never

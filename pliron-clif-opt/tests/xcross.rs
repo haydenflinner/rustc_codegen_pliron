@@ -264,3 +264,28 @@ fn sret_result_tag_is_zero_or_one() {
     s.sret.insert("foo".into(), 16);
     cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
 }
+
+const TEST_REG_TAG: &str = "function %f(i64) -> i64 {
+    sig0 = (i64) -> i32, i32, i32
+    fn0 = u0:3 sig0
+block0(v0: i64):
+    v1, v2, v3 = call fn0(v0)
+    TEST
+    brif v4, block1, block2
+block1:
+    v5 = iconst.i64 1
+    return v5
+block2:
+    v6 = iconst.i64 0
+    return v6
+}";
+
+/// The same for a `Result` returned in registers: the first of several
+/// returned integers is its tag, 0 or 1 (bincode's `deserialize_tuple`).
+#[test]
+fn register_result_tag_is_zero_or_one() {
+    let a = parse(&TEST_REG_TAG.replace("TEST", "v4 = ireduce.i8 v1"));
+    let b = parse(&TEST_REG_TAG.replace("TEST", "v7 = iconst.i32 1\n    v4 = band v1, v7"));
+    let s = syms(&[("u0:3", "foo")]);
+    cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
+}
