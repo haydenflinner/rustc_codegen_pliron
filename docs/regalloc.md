@@ -232,6 +232,16 @@ program) and in regalloc overhead (st+ld+mov+csr), pliron side:
   +0.76M, `st` +0.29M) though it helps compression and json. The static
   metric ranked it first (std -14%): std's number is dominated by
   miniz's `decompress_with_limit`. Read static as a ranking aid only.
+- Both together (the new defaults, measured after the flips, against the
+  baseline): instructions blake3 +2, blind-sig -74,297, pulldown
+  -202,278, regex -11,018, compression -16,977, html -90,049, json -250,
+  protobuf -81,218; overhead lower in seven, blake3 unchanged. Overhead
+  ratios against LLVM now: blake3 1.265, blind-sig 1.585, pulldown
+  1.413, regex 1.262, compression 1.905, html 1.379, json 1.291,
+  protobuf 1.221 (`target/rastat/dyn-newdef.json`).
+- `test.sh` stanza `slotpromlt` measured XBLOCK's and SPILLCSE's size
+  effect against a baseline that now includes POSTOPT's store-back
+  removal; it pins `PLIRON_RA2_POSTOPT=0` there now.
 - Native kernel timings (`bench/run.sh`) were not taken: the machine ran
   at load 30-45 throughout (other agents), so timings would be noise; the
   exact counts above are the evidence.

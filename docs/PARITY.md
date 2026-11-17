@@ -350,6 +350,15 @@ in the scoreboard and in the linked history files.
 
 ### Runtime speed
 
+- **Register allocation (2026-11-17, `docs/regalloc.md`).** Executed
+  regalloc overhead (spill stores, reloads, register moves, callee-save
+  saves/restores; `harness/rastat.py dyn`) is 1.22x-1.99x LLVM's on the
+  eight held-out programs and 15-51% of each program's instruction gap
+  (moves the largest excess class in five). `PLIRON_RA2_POSTOPT=15` and
+  `PLIRON_RA2_SRCVREG` are default on: seven programs fewer executed
+  instructions (pulldown -202k, html -90k, protobuf -81k, blind-sig
+  -74k), blake3 +2. Fuzzing: `harness/rafuzz.py`.
+
 - **Held-out programs: 1.08x** (was 1.57x on 2026-10-31). The livelock
   behind blind-sig's 2.1x is fixed
   (`history/2026-11-06-licm-frozen-clobber.md`); the remaining spread is
