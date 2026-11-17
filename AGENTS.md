@@ -852,7 +852,7 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_SLOTPROM_EXT=0` — slotprom whole-slot call coverage, i.e.
   revert extent-limited syncs (`nocap` carries per-operand byte
   extents from `arg_extent`).
-- `PLIRON_RA2_POSTOPT=<bits>` (opt-in) — regalloc2 post-allocation
+- `PLIRON_RA2_POSTOPT=<bits>` (default 15 since 2026-11-17, `=0` off; docs/regalloc.md) — regalloc2 post-allocation
   cleanup over the whole CFG: 1 redundant reloads, 2 reloads served
   from a register that already mirrors the slot, 4 redundant spill
   stores, 8 dead spill stores (`vendor/regalloc2/src/ion/postopt.rs`;

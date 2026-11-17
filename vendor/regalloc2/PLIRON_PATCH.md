@@ -224,7 +224,7 @@ or any stack allocation whose extent is unknown. Pairs with the
 emit-side `PLIRON_EDITPAIR` peek in `vcode.rs` and the fp-relative
 `pair_amode` fallback in aarch64 `emit.rs` (`PLIRON_PATCH.md` there).
 
-## `PLIRON_RA2_POSTOPT=<bits>` (runtime, default 0): spill-traffic cleanup after allocation
+## `PLIRON_RA2_POSTOPT=<bits>` (runtime, default 15 since 2026-11-17, `=0` off): spill-traffic cleanup after allocation
 
 `src/ion/postopt.rs`, called from `ion::run` before the slot-pair
 repack; knobs in `src/lib.rs` (`postopt_bits`, `postopt_stats`). Two

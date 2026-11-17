@@ -206,16 +206,19 @@ pub(crate) fn nopinmerge_on() -> bool {
     true
 }
 
-/// PLIRON (`PLIRON_RA2_POSTOPT=<bits>`, default 0): post-allocation
-/// spill-traffic cleanup, see `ion/postopt.rs`. 1 = redundant reloads,
-/// 2 = reloads served from another register, 4 = redundant spill stores,
-/// 8 = dead spill stores.
+/// PLIRON (`PLIRON_RA2_POSTOPT=<bits>`, default 15 since 2026-11-17,
+/// `=0` off): post-allocation spill-traffic cleanup, see
+/// `ion/postopt.rs`. 1 = redundant reloads, 2 = reloads served from
+/// another register, 4 = redundant spill stores, 8 = dead spill stores.
+/// Executed instructions (docs/regalloc.md): seven held-out programs
+/// fewer (pulldown-cmark -73k, blind-sig -41k, html-rewriter -33k), blake3
+/// unchanged; regalloc overhead lower or equal in all eight.
 pub(crate) fn postopt_bits() -> u32 {
     #[cfg(feature = "std")]
     {
         static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         *BITS.get_or_init(|| {
-            std::env::var("PLIRON_RA2_POSTOPT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("PLIRON_RA2_POSTOPT").ok().and_then(|v| v.parse().ok()).unwrap_or(15)
         })
     }
     #[cfg(not(feature = "std"))]
