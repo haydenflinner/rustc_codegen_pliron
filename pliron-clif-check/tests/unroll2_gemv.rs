@@ -17,6 +17,9 @@ fn final_brifs(env: &[(&str, &str)]) -> usize {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clif-check"));
     cmd.args(["pipeline", data, "--trials", "20", "--print"]);
     cmd.env("PLIRON_BUNROLL", "0");
+    for k in ["PLIRON_FCMPFOLD", "PLIRON_FMUL1", "PLIRON_UNROLL2"] {
+        cmd.env_remove(k);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
