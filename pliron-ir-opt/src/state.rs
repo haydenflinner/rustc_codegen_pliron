@@ -221,6 +221,10 @@ pub enum ArgExt {
 pub struct Exts {
     pub params: Vec<ArgExt>,
     pub ret: ArgExt,
+    /// Bytes of the value an `sret` parameter returns (0: unknown). Only
+    /// the corpus recorder reads it: the differential checker's stub
+    /// writes this much through the return pointer and no more.
+    pub sret_size: u64,
 }
 
 pub struct FuncInfo {

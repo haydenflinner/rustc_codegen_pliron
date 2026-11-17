@@ -34,7 +34,10 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
     let mut e = Exts::default();
     match &fn_abi.ret.mode {
         PassMode::Direct(a) => e.ret = ext(a),
-        PassMode::Indirect { .. } => e.params.push(ArgExt::SRet),
+        PassMode::Indirect { .. } => {
+            e.params.push(ArgExt::SRet);
+            e.sret_size = fn_abi.ret.layout.size.bytes();
+        }
         _ => {}
     }
     for arg in fn_abi.args.iter() {

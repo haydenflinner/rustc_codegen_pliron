@@ -52,6 +52,7 @@ fn exts(ctx: &Context, fty: TypeHandle) -> Exts {
     Exts {
         params: vec![ArgExt::None; n],
         ret: ArgExt::None,
+        sret_size: 0,
     }
 }
 

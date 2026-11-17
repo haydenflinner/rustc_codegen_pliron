@@ -387,6 +387,10 @@ fn corpus_syms_of(
         match n.namespace {
             0 if n.index < n_fn => {
                 if let Some(s) = decls.get_function_decl(FuncId::from_u32(n.index)).name.clone() {
+                    let f = st.funcs.get(&s).or_else(|| st.funcs.get(&format!("\u{1}{s}")));
+                    if let Some(sz) = f.map(|f| f.exts.sret_size).filter(|&z| z > 0) {
+                        out.sret.insert(s.clone(), sz);
+                    }
                     out.names.insert(text, s);
                 }
             }

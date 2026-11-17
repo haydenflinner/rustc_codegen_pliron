@@ -176,3 +176,32 @@ fn trap_after_an_undetermined_call_argument_pins_nothing() {
     let c = parse(&PADDING_TO_CALLEE.replace("PRE", "trap user2\nblock9:"));
     assert!(check(&a, &c, &Facts::default(), &cfg).is_err());
 }
+
+const SRET_INTO_TUPLE: &str = "function %f(i64) -> i64 {
+    ss0 = explicit_slot 16
+    sig0 = (i64 sret)
+    fn0 = u0:3 sig0
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    v2 = iconst.i64 7
+    BEFORE
+    call fn0(v1)
+    AFTER
+    v3 = load.i64 v1+8
+    return v3
+}";
+
+/// A callee that returns through `sret` writes its value's size, not the
+/// rest of the slot (`<[(FieldKey, Expr)]>::to_vec`: `Expr::clone` into the
+/// head of a tuple temporary whose other field one build writes before the
+/// call and the other after it). With the size recorded (`; diffcheck-sret:`)
+/// the stub stops there.
+#[test]
+fn sret_fill_stops_at_the_returned_value() {
+    let a = parse(&SRET_INTO_TUPLE.replace("BEFORE", "store v2, v1+8").replace("AFTER", ""));
+    let b = parse(&SRET_INTO_TUPLE.replace("BEFORE", "").replace("AFTER", "store v2, v1+8"));
+    let mut s = syms(&[("u0:3", "foo")]);
+    assert!(cross_check(&a, &b, &s, &s, &Facts::default()).is_err(), "a fill to the end of the slot clobbers +8 in A");
+    s.sret.insert("foo".into(), 8);
+    cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
+}

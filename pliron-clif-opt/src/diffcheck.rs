@@ -151,6 +151,10 @@ pub struct Syms {
     /// function as recorded cannot be told from one that means the 0.
     /// See [`Facts::undef`].
     pub undef: Vec<Value>,
+    /// Callee symbol -> the bytes its `sret` parameter returns
+    /// (`; diffcheck-sret:`): a stub writes that much through the return
+    /// pointer, not to the end of whatever slot holds it.
+    pub sret: FxHashMap<String, u64>,
 }
 
 /// A pair recorded from two builds of the same program ([`check_cross`]):
@@ -400,6 +404,15 @@ pub fn check_cross(
         if let (Some(c), Some((names, images))) = (cross, &pair_syms) {
             for (key, n) in c.extent {
                 let x = world.extent.entry(key.clone()).or_insert(*n);
+                *x = (*x).min(*n);
+            }
+            // A callee returning through `sret` writes its value's size
+            // there, not to the end of the slot (`<[(FieldKey, Expr)]>::to_vec`
+            // in dsa: `Expr::clone` into the head of a 64-byte tuple
+            // temporary whose other field A had written before the call;
+            // a fill to the end of the slot clobbered it in A only).
+            for (sym, n) in c.before.sret.iter().chain(&c.after.sret) {
+                let x = world.extent.entry((sym.clone(), 0)).or_insert(*n);
                 *x = (*x).min(*n);
             }
             world.add_symbols(names, images);
@@ -2755,6 +2768,16 @@ impl Syms {
             let vs: Vec<String> = vs.iter().map(|v| format!("v{v}")).collect();
             let _ = writeln!(out, "; diffcheck-undef: {}", vs.join(","));
         }
+        if !self.sret.is_empty() {
+            let mut v: Vec<String> = self
+                .sret
+                .iter()
+                .filter(|(s, _)| Self::plain(s))
+                .map(|(s, n)| format!("{s}={n}"))
+                .collect();
+            v.sort();
+            let _ = writeln!(out, "; diffcheck-sret: {}", v.join(","));
+        }
         if !names.is_empty() {
             let _ = writeln!(out, "; diffcheck-syms: {}", names.join(","));
         }
@@ -2765,6 +2788,16 @@ impl Syms {
     }
 
     fn parse_line(&mut self, line: &str) {
+        if let Some(list) = line.strip_prefix("; diffcheck-sret:") {
+            for item in list.split(',') {
+                if let Some((s, n)) = item.trim().split_once('=')
+                    && let Ok(n) = n.parse()
+                {
+                    self.sret.insert(s.to_string(), n);
+                }
+            }
+            return;
+        }
         if let Some(list) = line.strip_prefix("; diffcheck-syms:") {
             for item in list.split(',') {
                 if let Some((d, s)) = item.trim().split_once('=') {
