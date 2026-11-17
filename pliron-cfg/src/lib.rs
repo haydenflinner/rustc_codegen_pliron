@@ -67,6 +67,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // all 19 workloads with it, vm_mandelbrot and vm_physics are two
     // points better and the rest equal, the kernel module is identical.
     "PLIRON_WASM_SMALLCOPY",
+    // wasm emitter (N9 #9): no `i32.const -16; i32.and` realignment of a
+    // frame that needs at most 16-byte alignment; the stack pointer is
+    // 16-aligned at entry (`strip_realign`). Kernel module -204 B (68
+    // frames), every kernel returns LLVM's value, smoke + peepdiff clean.
+    "PLIRON_WASM_NOREALIGN",
     // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
     // test; native was not timed). 2026-11-16, `--layouts=3` against
     // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
