@@ -23,6 +23,8 @@
 #   DSA_BACKEND_RAW=1  pliron: pass $PLIRON_BACKEND unkeyed (single-crate bisects, see below)
 #   DSA_RUSTC_WRAPPER  rustc wrapper for cargo, e.g. sccache (default none: see below)
 #   DSA_RETRIES      reruns after a signal-killed cargo/rustc (30; see earlyoom below)
+#   DSA_RETRY_SLEEP  seconds between them (20)
+#   DSA_CARGO        cargo command (cargo; harness/dsa/test_retry.sh fakes one)
 #   DSA_PLIRON_FALLBACK  PLIRON_* settings for a second pass (see below; default none)
 #   PLIRON_BACKEND   backend dylib   (<repo>/target/debug/...). The build loads a keyed
 #                    private copy of it (below), so the backend can be rebuilt meanwhile.
@@ -159,6 +161,8 @@ echo "build.sh: $tag -> $pkg (log $log)"
 # times. cargo_secs in BUILDINFO is the sum over attempts.
 : > "$log"
 attempts=0
+# shellcheck source=retry.sh
+. "$ROOT/harness/dsa/retry.sh"
 run_cargo() { # run_cargo EXTRA_CARGO_ARGS... ; sets rc
   local n=0 mark
   while :; do
@@ -167,14 +171,13 @@ run_cargo() { # run_cargo EXTRA_CARGO_ARGS... ; sets rc
     # Still in use: the helper prunes keyed copies by last use.
     [ -z "${backend_keyed:-}" ] || touch "$(dirname "$backend_keyed")"
     set +e
-    (cd "$DSA_HOST" && cargo "+$TOOLCHAIN" "${args[@]}" "$@") >> "$log" 2>&1
+    (cd "$DSA_HOST" && ${DSA_CARGO:-cargo} "+$TOOLCHAIN" "${args[@]}" "$@") >> "$log" 2>&1
     rc=$?
     set -e
     [ $rc -eq 0 ] && return 0
-    if [ "$n" -lt "${DSA_RETRIES:-30}" ] &&
-       { [ $rc -ge 128 ] || tail -n "+$((mark + 1))" "$log" | grep -q 'signal: 15'; }; then
+    if [ "$n" -lt "${DSA_RETRIES:-30}" ] && lost_to_signal "$log" "$mark" "$rc"; then
       echo "build.sh: attempt $n lost a process to a signal (exit $rc); retrying" | tee -a "$log"
-      sleep 20
+      sleep "${DSA_RETRY_SLEEP:-20}"
       continue
     fi
     return 0
