@@ -661,6 +661,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   wasm `i32.load8_u` instead of `i32.load` + `&255`, aarch64 `ldrb`).
   Native exact counts: pulldown-cmark -0.28%, html-rewriter -0.14%,
   protobuf -0.09%, none worse (PARITY item 8).
+- `PLIRON_DEMANDED=1` (opt-in, 2026-11-17) — step `demanded` after
+  `egraph2` (`pliron-clif-opt/src/demanded.rs`): a demanded-bits
+  analysis (LLVM's `DemandedBits`); constant `band`/`bor`/`bxor` on bits
+  nobody reads drop, and `i8`/`i16` webs that are only extended or
+  stored narrow are rebuilt at 32/64 bits when a per-target count says
+  so (`Target::narrow_masked`: wasm masks every narrow op). Measure it
+  with `PLIRON_LUCARRY=1` (vendored Cranelift, opt-in): `lastuse_schedule`
+  no longer computes a block parameter's next value ahead of a read of
+  it (regex's varint loop paid a back-edge `mov` without it). Both:
+  exact counts better on all eight held-out programs, html `uxtb`/`uxth`
+  637 -> 542, wasm kernel module -444 B; `LUCARRY` alone: blind-sig
+  -0.8%, regex -0.18%, the rest equal
+  (`docs/history/2026-11-17-demanded-bits.md`). `clif-check codegen`
+  also reports `ext` (standalone narrow extensions).
 - `PLIRON_SHRINKWRAP=1` (opt-in, aarch64; vendored Cranelift) — callee
   saves and frame allocation move to the nearest closed dominator of the
   blocks that need them (`VCode::pliron_shrink_wrap`), after a CLIF
