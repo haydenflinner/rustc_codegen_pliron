@@ -412,7 +412,12 @@ pub fn xcorpus(isa: &std::sync::Arc<dyn TargetIsa>, dir_a: &Path, dir_b: &Path, 
                 for _ in 0..same {
                     work.push((s.clone(), None, None, "identical"));
                 }
-                if ta.len() == 1 && tb.len() == 1 {
+                // The copies left are one function only if they name the
+                // same symbols: a generic instantiated in two crates holds
+                // each crate's own instances (`TryFromIntError`'s `Debug`,
+                // its vtable pointing at `IntErrorKind::fmt` of miette in one
+                // and of rustc_demangle in the other).
+                if ta.len() == 1 && tb.len() == 1 && named(&ta[0].1) == named(&tb[0].1) {
                     work.push((s.clone(), Some(ta.remove(0).0), Some(tb.remove(0).0), ""));
                 } else {
                     for _ in 0..ta.len().max(tb.len()) {
@@ -509,4 +514,22 @@ pub fn xcorpus(isa: &std::sync::Arc<dyn TargetIsa>, dir_a: &Path, dir_b: &Path, 
         );
     }
     !rows.iter().any(bad)
+}
+
+/// The symbols a corpus file names (`; diffcheck-syms:` and the
+/// relocations of `; diffcheck-data:`), made-up constants left out: their
+/// numbers are the build's own.
+fn named(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in text.lines().take_while(|l| l.starts_with(';')) {
+        if let Some(list) = line.strip_prefix("; diffcheck-syms:") {
+            out.extend(list.split(',').filter_map(|i| i.trim().split_once('=')).map(|(_, s)| s.to_string()));
+        } else if let Some(list) = line.strip_prefix("; diffcheck-data:") {
+            for item in list.split(',') {
+                out.extend(item.split('/').skip(1).filter_map(|r| r.split('+').nth(2)).map(str::to_string));
+            }
+        }
+    }
+    out.retain(|s| !s.starts_with("__rcg_alloc."));
+    out
 }
