@@ -861,6 +861,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   with the branch argument's vreg, so a constant passed to a spilled
   parameter is rematerialized instead of loaded from its own spill
   slot (stack loads -3.5..-4.3% on three held-out binaries).
+- `PLIRON_RA2_REGION=1|2` and `PLIRON_RA2_SPILLHOIST=1` (opt-in,
+  2026-11-17, flip candidates) — regalloc2 region splitting by an exact
+  min-cut over the bundle's blocks per candidate register (LLVM's
+  `tryRegionSplit`/`SpillPlacement`; `vendor/regalloc2/src/ion/
+  regionsplit.rs`, knobs `_CAP`, `_K`, `_RATIO`, `_MAX`, `_MAXB`), and one
+  spill store at the definition instead of one per split point
+  (`spillhoist.rs`). Together, exact counts: compression -3.14%, pulldown
+  -1.04%, regex -0.87%, html-rewriter -0.67%, protobuf -0.54%, json
+  -0.20%, blake3 +0.012%. `PLIRON_RA_EXPLAIN` prints `region` lines;
+  `clif-check vcode` honours it, `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`
+  matches irdiff's target. Stanza `regionsplit`.
 - `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but
   cheap invariants stay inside loops that contain a call.
 - `PLIRON_HOT_LAYOUT=1` — type-layout table in each object for the
