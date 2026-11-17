@@ -77,7 +77,12 @@ KB now, so that part grew between the two cards, not during it. CMP
 card left it (1.260 then: the two `driftsort_main` monomorphs have 8 KB
 frames against LLVM's 4 KB because the `memcpyopt` memset/sret-temp
 sink stopped firing there, suspected to be the `frag_copy_stays_whole`
-SROA rule; the rest is `visit_`/`parse_` spill traffic).
+SROA rule; the rest is `visit_`/`parse_` spill traffic). **Later on
+2026-11-17 STK moved 1.264 -> 1.043** (`harness/frames.py`, not yet a
+card): the cause was memcpyopt's "tmp could promote" guard, not
+FRAGCOPY (`PLIRON_MEMCPYOPT_BIGTMP`), plus `PLIRON_SM_KILLSLIDE` and
+`PLIRON_SROA_FRAGCOPY_OUT=64`; see "Stack frames" below and
+`history/2026-11-17-stk.md`.
 
 **Native kernels** (benchfmt + benchstat, pliron vs LLVM measured minutes earlier):
 
@@ -804,6 +809,16 @@ in the scoreboard and in the linked history files.
 
 ### Stack frames
 
+- 2026-11-17: regex-syntax STK 1.043 (51,120 B against 49,008). 166
+  functions are over LLVM by 7.5 KB, offset by 5.4 KB under it. In
+  the 17 `visit_`/`parse_` functions over LLVM, 2.3 KB of 2.35 KB
+  excess is regalloc2 spill area: `visit_class_set_item_post` gets
+  1200 B of spill slots from CLIF that, with `PLIRON_SROA_FRAGCOPY=0`,
+  differs in a few instructions and gets 512 B (spill-slot
+  assignment, not pressure). Slots left: `pop_class_op` 576 B vs
+  LLVM's 448 frame, `push_class_open` 808 B; 8 slots in regex-syntax
+  still have markers the stale check drops (reads in a later block).
+  History: `history/2026-11-17-stk.md`.
 - Copy-only aggregates (regex-syntax `pop_group`/`pop_class`, 160–224 B
   states taken apart field by field) get one spill slot per scalarized
   field. Lever: memcpy-chain forwarding so a copy-only alloca can stay in

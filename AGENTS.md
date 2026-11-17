@@ -603,6 +603,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   rapier2d soft-FEM driver on wasm from 1.57x to 1.37x LLVM's time. The
   wasm kernel module is byte-identical with them on. Not yet timed on
   dsa (its tree did not build) or on native.
+- 2026-11-17 STK round (`docs/history/2026-11-17-stk.md`), each default
+  on: `PLIRON_MEMCPYOPT_BIGTMP=0` (memcpyopt's "tmp could promote" guard
+  protects temps sroa could scalarize only, at most 512 B:
+  `driftsort_main`'s 4 KiB scratch, stanza `bigtmp`),
+  `PLIRON_SM_KILLSLIDE=0` (slotmerge moves an end kill past same-block
+  reads a pass sank behind it instead of distrusting the slot's markers,
+  test `slotmerge_killslide`), `PLIRON_SROA_FRAGCOPY_OUT=<min bytes>`
+  (default 64, `=0` off: FRAGCOPY does not keep whole an aggregate that
+  stores build, all but under a word of padding, and one copy moves out;
+  stanza `fragcopyout`; `PLIRON_TRACE=pliron::sroa=debug` prints
+  `fragcopy-out kept|split` lines with the unwritten pieces).
 - `PLIRON_SROA_FRAGWORD=<bytes>` — the word size `PLIRON_SROA_FRAGCOPY`
   counts in; default the pointer width (4 on wasm32 since 2026-11-16,
   `=8` restores the old rule there; native is 8).
