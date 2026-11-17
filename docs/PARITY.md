@@ -849,6 +849,21 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   after (`PLIRON_WASM_SIZELOG=1`), `peepdiff` the result (it skips
   v128 signatures as entry points: check it still runs the bodies),
   `PLIRON_WASM_AUDIT=panic` in the gate.
+  **Implemented 2026-11-16, opt-in `PLIRON_WASM_PEEP_SIMD=1`.** The
+  decoder reads every `0xfd` immediate; SIMD instructions stay opaque to
+  the forwarding rules (unknown to their effect tables, a clobber for
+  `sfwd`), v128 locals are never a candidate of a local rewrite, and a
+  body whose signature has a v128 param is still skipped; `btr` and `bob`
+  size SIMD instructions (`simd_eff`, depth only). dsa: all 2,456 SIMD
+  bodies are now peepholed (none before; 6.44 -> 5.81 MB in the
+  objects), code 34,293,484 -> 33,810,313 B (-483 KB), untargeted
+  blocks in SIMD bodies 45k -> 1.9k, branch-over-branch 15k -> 0,
+  fallthrough `br` 15k -> 651; all 19 workloads equal; peepdiff clean
+  on 68,923 bodies (a sample of 9 SIMD bodies: 8 ran to a `return` in
+  some trial), built and run under `PLIRON_WASM_AUDIT=panic`. Kernels:
+  145,300 -> 145,003 B (three SIMD bodies: hashbrown `reserve_rehash`,
+  two `type_id`). Not flipped: the kernel module is not byte-identical
+  and the machine never got quiet enough to time it (load 20-140).
 - **N4. Done 2026-11-16.** `PLIRON_JUMPTHREAD=0` crashed loopidiom's
   dead-loop deletion: its walk over the exit's forwarder blocks stopped
   at its 8-block budget one step past the block its args described
