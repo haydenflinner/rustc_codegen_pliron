@@ -344,6 +344,15 @@ pub const DEFAULT_ON: &[&str] = &[
     // `coldedges` (`errcold`): native layout sinks them; wasm COLDBR
     // can keep the hot edge bare. `=0` off.
     "PLIRON_ERRCOLD",
+    // 2026-11-17 (PARITY item 9): sroa does not write a split temporary
+    // back before a call whose only pin on it is its whole `sret` argument.
+    // Exact callgrind counts, aarch64-linux-musl, against the default:
+    // pulldown-cmark -18.8k, rust-json -22.4k, regex -1.0k, html-rewriter
+    // and blind-sig within noise, blake3/compression/protobuf unchanged;
+    // native kernel `varint_postcard` -4.8% retired instructions; wasm
+    // kernels: `k_sieve` loses two dead stores, timings unchanged
+    // (PARITY item 7). Stanza `sretnosync`. `=0` off.
+    "PLIRON_SROA_SRETNOSYNC",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
