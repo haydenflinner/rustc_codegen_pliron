@@ -921,8 +921,28 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `sretnosync`) skips that writeback (21.5 ms). On the wasm kernels
    it changes only `k_sieve` (two dead stores; timing unchanged under
    `--perturb=4`), and on std 60 of 4,925 functions (`xcorpus`: no
-   mismatch on wasm or std). Open: what makes `step_one`'s frame
-   larger, and the byte tag loads.
+   mismatch on wasm or std). The two residues, looked at the same
+   evening: (a) the 240-byte frame is TurboFan's spill area, not our
+   shadow-stack frame. Our `step_one` sets no shadow frame on the hot
+   path (LLVM's allocates 720 bytes on every call); TurboFan's area
+   follows the wasm locals (ours 28, LLVM's 12), but the profile has no
+   hot spill or reload in `step_one`: the only cost is one more
+   `sub sp` in the prologue. (b) The `ldr`+`and` tag loads are
+   `ireduce.i8 (load.i32)`: `loadfwd` forwards the tag byte read of a
+   copied `Val` out of the copy's first word and `dem64` narrows that
+   word to i32, so wasm loads 4 bytes and masks. `PLIRON_LDNARROW=1`
+   (opt-in, step `ldnarrow` after `dem64`, `clifpeep::ldnarrow`, tests
+   `pliron-clif-opt/tests/ldnarrow.rs`) loads the reduced width when
+   every use is an `ireduce`. The reduction: `&255` 32 -> 14 (LLVM 17),
+   `load8_u` 24 -> 42, time unchanged (139 vs 141 ms, LLVM 130). wasm
+   kernels: 4 functions, -8 instructions, `nbody` unchanged under
+   `--perturb=4`. Corpus replays (`--check`, `PLIRON_VERIFY=full`): std
+   290 of 2,463 functions change, the dsa corpus 402 of 8,685 (every
+   8th), verdicts identical. Native, exact counts: pulldown-cmark
+   -149.0k (-0.28%), rust-html-rewriter -144.8k (-0.14%),
+   rust-protobuf -61.2k (-0.09%), regex -13.0k, the rest within noise,
+   native kernels unchanged. Ready to turn on for native; the dsa
+   cross-check is pending until dsa builds.
 9. **Native**: the held-out programs (`bench/heldout/run.py`, 1.08x
    on 2026-11-09) with tonight's wasm-only defaults tried on native one
    at a time (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`,

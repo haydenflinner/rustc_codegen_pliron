@@ -582,6 +582,12 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_PUNROLL_DWLATCH` (default on since 2026-11-17, `=0` off) —
   `punroll` does not keep a do-while's counting latch test in every
   copy (PARITY items 5 and 9).
+- `PLIRON_LDNARROW=1` (opt-in, 2026-11-17) — step `ldnarrow` after
+  `dem64`: a `notrap` integer load whose every use is an `ireduce` loads
+  the widest reduced type (enum tag reads forwarded out of a copy word:
+  wasm `i32.load8_u` instead of `i32.load` + `&255`, aarch64 `ldrb`).
+  Native exact counts: pulldown-cmark -0.28%, html-rewriter -0.14%,
+  protobuf -0.09%, none worse (PARITY item 8).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
