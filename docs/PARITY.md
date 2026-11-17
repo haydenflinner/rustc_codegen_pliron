@@ -979,6 +979,19 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   `PLIRON_LICM_INNERPRESS=0` has 96 machine instructions per lookup
   against the default's 102 (timing pending). Each fix must keep every
   other kernel (`bench/wasm/run.mjs`) and the default dsa rows.
+  **Fixed behind `PLIRON_LICM_GTE=1` (opt-in, 2026-11-16):** licm hoists
+  a `notrap` load on the header's straight line (before any branch,
+  call or trapping instruction) without a dereferenceability fact: the
+  loop's first iteration would make the access anyway. hmget against
+  LLVM (load ~50, `--layouts=3`): ONCE=1+NCC+SLOTPROV 10.7% -> 1.1%,
+  ONCE=3+SLOTPROV 11.5% -> 2.2%, default 5.5% (unchanged: the default
+  module is byte-identical with the knob). In the kernel module only
+  `k_hmget` changes under single-caller inlining. The pressure cap off
+  on wasm (`PLIRON_LICM_NOPRESS_WASM=1`) gives hmget the same code but
+  also changes `reserve_rehash` and `dragon::mul_pow10`; not needed with
+  GTE. Without SLOTPROV the SipHash tail-buffer store still clobbers
+  (ONCE=1 or 3 alone stay at +19%). Details:
+  `history/2026-11-16-licm-gte.md`.
 - **N7. The default hmget, +5% against LLVM: analysed.** Our lookup
   miss path is 102 TurboFan instructions against LLVM's 96. `invparam`
   splits the lookup loop into two headers, and TurboFan reloads the

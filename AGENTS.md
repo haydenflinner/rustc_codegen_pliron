@@ -592,6 +592,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   open), `PLIRON_VTRUNC_UZP=1` (aarch64 lane narrowing as `uzp1`; fails
   the `simdshift` stanza when on), `PLIRON_PADJUMP=<n>` (vendored Cranelift: jump over alignment
   pads of `n`+ instructions; unmeasured).
+- `PLIRON_LICM_GTE=1` (opt-in) — licm hoists a `notrap` load that runs
+  on every loop entry (the header's straight line, before any branch,
+  call or trapping instruction) without a dereferenceability fact;
+  with `PLIRON_INLINE_ONCE=1|3` and `PLIRON_LICM_SLOTPROV=1` (+`NCC` for
+  `=1`) hmget goes from +11% to +1..2% against LLVM.
+  `PLIRON_LICM_NOPRESS_WASM=1` (opt-in): no `INNERPRESS` cap on wasm32
+  (`docs/history/2026-11-16-licm-gte.md`).
 - `PLIRON_LICM_INNERPRESS` (default `2`; `=1` the old rule, `=0` off),
   `PLIRON_UNSWITCH_LOOP=0`, `PLIRON_LF_TRIVPHI=0`, `PLIRON_ELABKEEP=0`
   (vendored elaborator), `PLIRON_BUMPEDGE=0`, `PLIRON_WM_WIDE=0`,
