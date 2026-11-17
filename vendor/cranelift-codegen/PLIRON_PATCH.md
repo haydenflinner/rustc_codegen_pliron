@@ -1987,3 +1987,17 @@ the same address and recorded it as a known value for later loads; a
 may-trap store could be removed as dead. `process_inst` now skips both
 for accesses with a trap code. (The `black_box` op no longer depends on
 this on wasm, see `src/wasm.rs` `P::BlackBox`; `read_volatile` does.)
+
+## `PLIRON_FCMPFOLD=1`, `PLIRON_FMUL1=1` (opt-in): float constant rules (2026-11-17)
+
+`src/opts/pliron.isle` (`fcmpfold`, `fmul1`), `src/opts.rs`
+(`pliron_fcmpfold_on`, `pliron_fmul1_on`, `f32_cmp_fold`,
+`f64_cmp_fold`, `pliron_fcmp`): `fcmp cc` of two `f32const`/`f64const`
+operands folds to `iconst` 0/1 with `FloatCC`'s unordered semantics
+(upstream's cprop lists `fcmp` as a TODO), and `fmul x, 1.0` (either
+operand order, f32 and f64) is `x`. The second is exact for every
+non-NaN `x`; for a NaN it keeps `x`'s payload (and a signaling NaN stays
+signaling), which Rust's NaN rules allow and LLVM does too. Both exist
+for nalgebra's `gemm`/`gemv` (`!beta.is_zero()` on a constant `beta`,
+`alpha = 1.0`), with the pipeline's `PLIRON_UNROLL2` step; tests in
+`pliron-clif-opt/tests/fcmpfold.rs`.
