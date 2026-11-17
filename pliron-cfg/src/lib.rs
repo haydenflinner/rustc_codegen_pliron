@@ -45,6 +45,17 @@ pub const DEFAULT_ON: &[&str] = &[
     // kernels and the wasm kernel module byte-identical. Stanza bigtmp.
     // `PLIRON_MEMCPYOPT_BIGTMP=0` off.
     "PLIRON_MEMCPYOPT_BIGTMP",
+    // 2026-11-17, STK: slotmerge slides an end kill past the reads of its
+    // slot a pass sank behind it in the same block (slp's paired vector
+    // load), instead of dropping all the slot's markers: the seven
+    // 128-byte Result slots of Parser::parse_with_comments share again
+    // (1712 -> 816 B, LLVM 992; STK 1.097 -> 1.076 with BIGTMP; stale
+    // slots 20 -> 8). Exact counts with BIGTMP: regex -9.2k, protobuf
+    // -1.7k, compression -1.8k, none worse. Native kernels: k_hmget loses
+    // a 48-byte copy, retired instructions and cycles within noise; wasm
+    // module byte-identical. Poison stanzas pass. Test
+    // slotmerge_killslide. `PLIRON_SM_KILLSLIDE=0` off.
+    "PLIRON_SM_KILLSLIDE",
     // 2026-11-17, N7: repeated leaves of an xor tree cancel (SipHash's last
     // round: `v0` drops out of `v0 ^ v1 ^ v2 ^ (rotl(v3,21) ^ v0)`, and its
     // last `rotl`/`iadd` die). Quiet wasm kernels with --perturb=4 against
