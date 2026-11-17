@@ -519,11 +519,17 @@ fn canon_eq(st: &State, a: Value, b: Value) -> bool {
 // op — the self-cancelling add/sub and xor chains — consult the defining
 // op's node via `defop`.
 
-/// A canonical value: an SSA value or a width-masked constant.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// A canonical value: an SSA value or a width-masked constant. The width
+/// travels with `C`: `0:i1` and `0:i64` must never share a class — a
+/// `K::V` graft (`and` folding to a leaf) on the merged class would let
+/// a same-value constant of the wrong width replace a result, and the
+/// replacement loop's `replace_all_uses_with` puts it in a wrong-width
+/// operand slot (seen live: an i1 `and` operand aliased to `0:i64`,
+/// malformed `band.i8 v, iconst.i64` after lowering).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum K {
     V(Value),
-    C(u128),
+    C(u32, u128),
 }
 
 /// Union-find over `K` with path compression.
@@ -562,7 +568,7 @@ struct POp {
 /// Covered op kinds. `Cmp` holds the canonicalized predicate (`pk_of`
 /// swaps operand order for `UGT/UGE/SGT/SGE`, so the fold code sees only
 /// the </<= forms).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Pk {
     Add,
     Sub,
@@ -577,7 +583,7 @@ enum Pk {
     Select,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ck {
     Eq,
     Ne,
@@ -669,11 +675,12 @@ fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize
         let i = i as usize;
         inw[i] = false;
         let o = &ops[i];
-        let mut a = [K::C(0); 3];
+        let mut a = [K::C(0, 0); 3];
         for (j, &v) in o.args.iter().take(o.nargs()).enumerate() {
             a[j] = canon(&mut uf, st, v, o.aws[j]);
         }
-        if let Some(t) = fold_op(&mut uf, st, &defop, &ops, o.ic, o.aws[0], o.rw, &a) {
+        let ft = fold_op(&mut uf, st, &defop, &ops, o.ic, o.aws[0], o.rw, &a);
+        if let Some(t) = ft {
             let rk = uf.find(key(st, o.result, o.rw));
             if rk != t {
                 // Result canonical joins the fold target's class; ops that
@@ -702,7 +709,7 @@ fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>) -> (usize, usize
         }
         let k = uf.find(key(st, r, o.rw));
         let new = match k {
-            K::C(c) => {
+            K::C(_, c) => {
                 nc += 1;
                 let ty = r.get_type(ctx);
                 let kv = UndefOp::new(ctx, ty).get_operation();
@@ -759,8 +766,8 @@ fn safe_leaf(ops: &[POp], defop: &FxHashMap<Value, usize>, i: usize, v: Value) -
 /// everything else by SSA name.
 fn key(st: &State, v: Value, w: u32) -> K {
     match st.consts.get(v) {
-        Some(ConstVal::Bits(c)) => K::C(mask(*c, w)),
-        Some(ConstVal::Zero) => K::C(0),
+        Some(ConstVal::Bits(c)) => K::C(w, mask(*c, w)),
+        Some(ConstVal::Zero) => K::C(w, 0),
         _ => K::V(v),
     }
 }
@@ -784,7 +791,7 @@ fn fold_op(
     rw: u32,
     a: &[K; 3],
 ) -> Option<K> {
-    let c = |v: u128| Some(K::C(mask(v, rw)));
+    let c = |v: u128| Some(K::C(rw, mask(v, rw)));
     let (x, y) = (a[0], a[1]);
     // Look through a still-live defining op for the self-cancelling
     // chains: if `k`'s producer is itself a covered op, yield its kind
@@ -802,8 +809,8 @@ fn fold_op(
     };
     match ic {
         Pk::Add => match (x, y) {
-            (K::C(v), K::C(w)) => c(v.wrapping_add(w)),
-            (K::C(0), o) | (o, K::C(0)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c(v.wrapping_add(w)),
+            (K::C(_, 0), o) | (o, K::C(_, 0)) => Some(o),
             _ => {
                 // (add (sub p q) q) -> p, on either operand position.
                 for (i, o) in [(x, y), (y, x)] {
@@ -817,8 +824,8 @@ fn fold_op(
             }
         },
         Pk::Sub => match (x, y) {
-            (K::C(v), K::C(w)) => c(v.wrapping_sub(w)),
-            (o, K::C(0)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c(v.wrapping_sub(w)),
+            (o, K::C(_, 0)) => Some(o),
             _ if x == y => c(0),
             _ => {
                 // (sub (add p q) q) -> p and (sub (add p q) p) -> q.
@@ -834,25 +841,25 @@ fn fold_op(
             }
         },
         Pk::Mul => match (x, y) {
-            (K::C(v), K::C(w)) => c(v.wrapping_mul(w)),
-            (K::C(1), o) | (o, K::C(1)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c(v.wrapping_mul(w)),
+            (K::C(_, 1), o) | (o, K::C(_, 1)) => Some(o),
             _ => None,
         },
         Pk::And => match (x, y) {
-            (K::C(v), K::C(w)) => c(v & w),
+            (K::C(_, v), K::C(_, w)) => c(v & w),
             _ if x == y => Some(x),
-            (K::C(v), o) | (o, K::C(v)) if v == mask(!0, aw) => Some(o),
+            (K::C(_, v), o) | (o, K::C(_, v)) if v == mask(!0, aw) => Some(o),
             _ => None,
         },
         Pk::Or => match (x, y) {
-            (K::C(v), K::C(w)) => c(v | w),
+            (K::C(_, v), K::C(_, w)) => c(v | w),
             _ if x == y => Some(x),
-            (K::C(0), o) | (o, K::C(0)) => Some(o),
+            (K::C(_, 0), o) | (o, K::C(_, 0)) => Some(o),
             _ => None,
         },
         Pk::Xor => match (x, y) {
-            (K::C(v), K::C(w)) => c(v ^ w),
-            (K::C(0), o) | (o, K::C(0)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c(v ^ w),
+            (K::C(_, 0), o) | (o, K::C(_, 0)) => Some(o),
             _ if x == y => c(0),
             _ => {
                 // (xor (xor p q) q) -> p, on either operand position and
@@ -873,60 +880,60 @@ fn fold_op(
         // Out-of-range shift amounts are poison in LLVM; the Cranelift
         // lowering wraps them, so the folds do too.
         Pk::Shl => match (x, y) {
-            (K::C(v), K::C(w)) => c(v << (w % aw as u128)),
-            (o, K::C(0)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c(v << (w % aw as u128)),
+            (o, K::C(_, 0)) => Some(o),
             _ => None,
         },
         Pk::LShr => match (x, y) {
-            (K::C(v), K::C(w)) => c(v >> (w % aw as u128)),
-            (o, K::C(0)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c(v >> (w % aw as u128)),
+            (o, K::C(_, 0)) => Some(o),
             _ => None,
         },
         Pk::AShr => match (x, y) {
-            (K::C(v), K::C(w)) => c((sext(v, aw) >> (w % aw as u128)) as u128),
-            (o, K::C(0)) => Some(o),
+            (K::C(_, v), K::C(_, w)) => c((sext(v, aw) >> (w % aw as u128)) as u128),
+            (o, K::C(_, 0)) => Some(o),
             _ => None,
         },
         Pk::Cmp(p) => {
             let (tr, fl) = (c(1), c(0));
             match p {
                 Ck::Eq => match (x, y) {
-                    (K::C(v), K::C(w)) => c((v == w) as u128),
+                    (K::C(_, v), K::C(_, w)) => c((v == w) as u128),
                     _ if x == y => tr,
                     _ => None,
                 },
                 Ck::Ne => match (x, y) {
-                    (K::C(v), K::C(w)) => c((v != w) as u128),
+                    (K::C(_, v), K::C(_, w)) => c((v != w) as u128),
                     _ if x == y => fl,
-                    (K::C(0), o) | (o, K::C(0)) if aw == 1 => Some(o),
+                    (K::C(_, 0), o) | (o, K::C(_, 0)) if aw == 1 => Some(o),
                     _ => None,
                 },
                 Ck::Ult => match (x, y) {
-                    (K::C(v), K::C(w)) => c((v < w) as u128),
+                    (K::C(_, v), K::C(_, w)) => c((v < w) as u128),
                     _ if x == y => fl,
-                    (_, K::C(0)) => fl,
+                    (_, K::C(_, 0)) => fl,
                     _ => None,
                 },
                 Ck::Ule => match (x, y) {
-                    (K::C(v), K::C(w)) => c((v <= w) as u128),
+                    (K::C(_, v), K::C(_, w)) => c((v <= w) as u128),
                     _ if x == y => tr,
                     _ => None,
                 },
                 Ck::Slt => match (x, y) {
-                    (K::C(v), K::C(w)) => c((sext(v, aw) < sext(w, aw)) as u128),
+                    (K::C(_, v), K::C(_, w)) => c((sext(v, aw) < sext(w, aw)) as u128),
                     _ if x == y => fl,
                     _ => None,
                 },
                 Ck::Sle => match (x, y) {
-                    (K::C(v), K::C(w)) => c((sext(v, aw) <= sext(w, aw)) as u128),
+                    (K::C(_, v), K::C(_, w)) => c((sext(v, aw) <= sext(w, aw)) as u128),
                     _ if x == y => tr,
                     _ => None,
                 },
             }
         }
         Pk::Select => match a[0] {
-            K::C(0) => Some(a[2]),
-            K::C(_) => Some(a[1]),
+            K::C(_, 0) => Some(a[2]),
+            K::C(..) => Some(a[1]),
             _ if a[1] == a[2] => Some(a[1]),
             _ => None,
         },
@@ -1045,5 +1052,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `st.consts` maps values of *different* widths to the same bit
+    /// pattern (inline clones and spec's arg marking can put a covered
+    /// op's own result in the table). A covered `and x, -1:i64` whose
+    /// result is registered `Zero` folds to `K::V(x)` and grafts its
+    /// constant class under `x`; a widthless `K::C` key makes every
+    /// `0`-valued fold — at any width — join that class, so a `0:i8`
+    /// fold resolves to the i64 leaf `x` instead of materializing an
+    /// `i8` constant (seen live as `band.i8 v, iconst.i64` after
+    /// lowering). Constants must key by (width, bits).
+    #[test]
+    fn const_classes_keep_width() {
+        let input = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <builtin.integer i8(builtin.integer i64) variadic = false> [] {
+          ^entry(x: builtin.integer i64):
+            m1 = llvm.constant <builtin.integer <-1: i64>> : builtin.integer i64;
+            o = llvm.and x, m1 : builtin.integer i64;
+            s = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            n = llvm.constant <builtin.integer <-1: i64>> : builtin.integer i64;
+            bm = llvm.icmp s <EQ> n : builtin.integer i8;
+            llvm.return bm
+          }
+        }
+        "#;
+        let ctx = &mut Context::new();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let st = &mut State::default();
+        let f = crate::inline::blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| crate::inline::ops(ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .unwrap();
+        let es: Vec<_> = crate::inline::ops(ctx, crate::inline::blocks(ctx, f)[0])
+            .into_iter()
+            .collect();
+        let res = |i: usize| es[i].deref(ctx).get_result(ctx, 0);
+        // Constants as `st.consts` entries, and the poison: `o`'s own
+        // result registered `Zero` (the inline-clone marking that put a
+        // covered op's result into the class).
+        st.consts.insert(res(0), ConstVal::Bits(u64::MAX as u128));
+        st.consts.insert(res(2), ConstVal::Bits(7));
+        st.consts.insert(res(3), ConstVal::Bits(u64::MAX as u128));
+        st.consts.insert(res(1), ConstVal::Zero);
+        let (nc, _nv) = run_fn(ctx, st, f);
+        // `o` folds `x & -1` to `x` and grafts the zero class under
+        // `K::V(x)`; `bm` then folds `7 == -1` to `0:i8`. Width-keyed
+        // constants keep `bm` in the `0:i8` class, so it materializes a
+        // properly-typed constant; a shared `0` class would hand it the
+        // i64 leaf `x` and `safe_leaf` would leave `bm` unfolded.
+        assert!(nc >= 1, "bm must resolve to a same-width constant");
     }
 }
