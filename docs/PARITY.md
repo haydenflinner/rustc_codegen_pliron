@@ -1146,6 +1146,35 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    loop shape: `Iterator::cmp_by` over two `Rev` iterators tests both
    ends every limb (two pointer IVs of equal length), where LLVM keeps
    one index.
+11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
+   scanners** (looked at 2026-11-17, not fixed). Exact counts
+   (`irdiff.py`, callgrind with `--dump-instr=yes` for per-instruction
+   counts): 52.27M against LLVM's 45.33M. The line table's top entry,
+   `slice/iter/macros.rs:180` (+2.4M, `escape_html_scalar`'s `position`),
+   is attribution only: the function is 8.30M on our side and 8.33M on
+   LLVM's (we copy inline where LLVM calls `memcpy`). Samples blame
+   spills at `scalar_iterate_special_bytes`' `lut` test, but the stores
+   sit after a branch and LLVM shows the same skid; that function equals
+   LLVM's `parse_line` that inlines it (5.44M vs 5.47M). What is real:
+   `scan_closing_code_fence` (50k calls, 31 instructions a call),
+   `scan_code_fence`, `scan_nextline`, `scan_list_marker` stay calls from
+   `parse_block` because they live in another CGU (remark `external (no
+   body in this CGU)`) and are past the native `xcgu` copy limit of 50
+   (`tcx.size_estimate` 55-145). LLVM's thin-local LTO inlines them.
+   `PLIRON_XCGU_SIZE=200`: pulldown-cmark -1.9%, html-rewriter -0.6%,
+   regex -0.3%, but rust-protobuf +1.8% (its `Vec` growth and `merge`
+   paths copied and inlined) and rust-json +1.1%; `=100`: pulldown -1.6%,
+   json -1.0%, protobuf +1.7%, regex +0.4%. `PLIRON_XCGU_LEAF=200`
+   (opt-in, `src/xcgu.rs`: leaf callees only, transitively through small
+   leaves, cold calls and intrinsics): json -1.7%, html-rewriter -0.8%,
+   pulldown -0.3%, protobuf +3.3%, regex +0.5%. An allocator-free filter
+   made pulldown worse. Next: why extra cross-CGU bodies cost
+   rust-protobuf (`merge_loop`, `do_reserve_and_handle` and
+   `finish_grow` grow when `grow_amortized` and `merge_field` are
+   inlined), so the bigger limit can apply where it pays. Small, real,
+   per call in `scan_closing_code_fence`: a peeled first iteration in
+   each `scan_ch_repeat` and two compares where LLVM's `subs` serves a
+   bounds check and an emptiness test.
 
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
