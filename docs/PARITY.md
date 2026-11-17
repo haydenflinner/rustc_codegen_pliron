@@ -950,7 +950,13 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   parse_only is identical but for the dropped `and`
   (`harness/v8/mcode.sh`): a 4-byte shift of the hot loop, code
   alignment rather than work. #8 and #6 are small and touch hot
-  kernel bodies; not timed on a quiet machine.
+  kernel bodies; not timed on a quiet machine. dsa with the three
+  defaults alone: 35,337,904 -> 34,293,484 B (-1.04 MB), all 19
+  workloads equal. Open: `hash_text` reads 0.996 against 1.224 of
+  LLVM's time (7 rounds, load ~60) although its hot body
+  `blake3::compress_in_place` is byte-identical and each side alone
+  costs 80.4 against 82.6 ms per call (63% of it in JS
+  `passStringToWasm0`); not explained.
 - **N6. hmget's loss under single-caller inlining is two licm refusals**
   (the V8 comparison, notes in the session scratchpad `hmget_notes.md`,
   summarised in `history/2026-11-16-wasm-night.md`). Not alignment: the
