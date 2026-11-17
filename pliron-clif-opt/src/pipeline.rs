@@ -2686,6 +2686,16 @@ fn s_i128id(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// 128-bit integer operations on word halves (`wide128`), ahead of the
+// egraph so it folds the halves.
+fn s_wide128(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::wide128::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("wide128");
+    }
+    k
+}
+
 fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     let prof = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
@@ -5061,6 +5071,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         .creates_all(),
         cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::STORE),
         step("i128id", "i128id", Gate::OptIn("PLIRON_I128ID"), s_i128id),
+        step("wide128", "wide128", Gate::OptIn("PLIRON_WIDE128"), s_wide128),
         Step {
             name: "egraph",
             bisect: Some("egraph"),
@@ -5825,6 +5836,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // egraph2 so the dead arms go with it. Wasm only, opt-in:
         // `PLIRON_VRP2=1`.
         step("vrp2", "vrp", Gate::OptIn("PLIRON_VRP2"), s_vrp2),
+        // Again once the late steps made loop-carried shift amounts
+        // (foldhash's `sponge_len`) constant.
+        step("wide128b", "wide128", Gate::OptIn("PLIRON_WIDE128"), s_wide128),
         Step {
             name: "egraph2",
             bisect: Some("egraph2"),
