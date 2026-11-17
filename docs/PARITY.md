@@ -881,6 +881,23 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `pad_integral` loops that lost their peel. Not flippable until
    `strwork` keeps its time. `DWLATCH` alone leaves the kernel module
    byte-identical.
+   **strwork, later 2026-11-17:** not the peel. A profile puts 47% of
+   `strwork` in dragon's `format_exact`, whose bignum loops (a few limbs)
+   unrolled: its samples +5% at K=4. Peeling first
+   (`PLIRON_PUNROLL_PEELFIRST=1`) made `strwork` worse (+4 points);
+   unrolling only store-free loops (`PLIRON_PUNROLL_COUNTED_WASM_NOSTORE=1`)
+   kept `strwork` but lost `matmul` and `sieve`. What separates them is
+   function size: the kernels' loops sit in functions of 300-750
+   instructions, dragon's in 1,270-6,146, `pad`/`pad_integral`/
+   `do_count_chars` in 865-1,071. `PLIRON_PUNROLL_COUNTED_WASM_FNMAX=800`
+   (on top of main with `DWLATCH` default on; `--perturb=4`, quiet
+   machine): `contains_rng` +10.2% -> -0.6%, `matmul` -26.0% -> -53.9%,
+   `sieve` -3.9% -> -9.6% (`vec![true; n]`'s fill loop), `parse_only`
+   -4.8% -> -6.1%, `strwork` +4.2% -> +4.5% (ranges overlap), every
+   other kernel within its range, geomean 0.942 -> 0.897; plain K=4 in
+   the same session: `strwork` +4.5% -> +6.1%. Corpus replays (wasm
+   bench, dsa every 8th) clean. Proposed flip: `COUNTED_WASM=4` with
+   `COUNTED_WASM_FNMAX=800`.
 6. **N7, the default hmget +5% / 102 vs 96 TurboFan instructions per
    lookup**: `invparam` splits the lookup loop into two headers (the
    memory base reloads at both), the hash expression has two extra
