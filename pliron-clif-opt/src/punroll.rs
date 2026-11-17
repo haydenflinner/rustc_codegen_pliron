@@ -1369,6 +1369,7 @@ pub fn run(
     };
     let jam_on = crate::pass_enabled("PLIRON_JAM");
     let peel_on = crate::pass_enabled("PLIRON_PEEL");
+    PEELED.with(|s| s.borrow_mut().clear());
     // Opt-in: fully peel a proved ≤10-trip `* 10` loop on wasm (u32
     // `from_str`'s can_not_overflow path). The 12-inst / 16-site caps
     // otherwise stop at 4 copies and leave a residual loop the 8-digit
@@ -1488,12 +1489,29 @@ pub fn run(
                         tracing::debug!(target: "pliron::punroll", "punroll {name} try block{}", h.as_u32())
                     };
                 }
+                WANT_PEEL.with(|c| c.set(false));
                 if run_loop(func, cfg, dt, la, lp, h, name, trip, wasm).is_some()
                     || run_region(func, cfg, dt, la, lp, h, name, trip).is_some()
                 {
                     n += 1;
                     hit = true;
                     break; // cfg/la stale; rescan
+                }
+                // `PLIRON_PUNROLL_PEELFIRST`: `run_loop` would unroll this
+                // loop of unknown length; peel it first and leave the
+                // header untried, so the rescan unrolls what remains.
+                if peel_on
+                    && WANT_PEEL.with(|c| c.replace(false))
+                    && run_peel(func, cfg, dt, la, lp, h, name, trip, peel_digit).is_some()
+                {
+                    PEELED.with(|s| s.borrow_mut().insert(h));
+                    tried.remove(&h);
+                    n += 1;
+                    hit = true;
+                    break; // cfg/la stale; rescan
+                }
+                if PEELED.with(|s| s.borrow().contains(&h)) {
+                    continue;
                 }
                 if peel_on {
                     if peel_mul_once && peeled_mul {
@@ -1541,6 +1559,28 @@ fn search_on() -> bool {
 
 /// `PLIRON_PUNROLL_COUNTED=1`: unroll counted loops of unknown length
 /// without a profile (the behaviour before 2026-11-13).
+/// `PLIRON_PUNROLL_COUNTED_WASM_NOSTORE=1`: the `COUNTED_WASM` rule only
+/// for loops without stores (see `run_loop`).
+fn nostore_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_COUNTED_WASM_NOSTORE", "1"));
+    *ON
+}
+
+/// `PLIRON_PUNROLL_PEELFIRST=1`: a loop the `COUNTED_WASM` rule would
+/// unroll is peeled first (see `run_loop`).
+fn peelfirst_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_PEELFIRST", "1"));
+    *ON
+}
+
+thread_local! {
+    /// `run_loop` asks `run` to peel the loop before it unrolls it.
+    static WANT_PEEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Headers this `run` call peeled for `PLIRON_PUNROLL_PEELFIRST`.
+    static PEELED: std::cell::RefCell<FxHashSet<Block>> = std::cell::RefCell::new(FxHashSet::default());
+}
+
 /// `PLIRON_PUNROLL_DWLATCH=1`: a do-while's counting latch test is not
 /// kept per copy (see `run_loop`).
 fn dw_latch_on() -> bool {
@@ -2549,6 +2589,25 @@ fn run_loop(
         if known.is_none_or(|t| t < 2 * k) {
             if wk < 2 {
                 bail!("counted loop of unknown length");
+            }
+            // `PLIRON_PUNROLL_COUNTED_WASM_NOSTORE=1`: only loops that store
+            // nothing (reductions and scans: `contains_rng`'s count,
+            // `matmul`'s dot product). The bignum loops of dragon's
+            // `format_exact` store a limb per iteration over a few limbs,
+            // and `strwork` lost time when they unrolled.
+            if nostore_on()
+                && chain.iter().any(|&b| {
+                    func.layout.block_insts(b).any(|i| func.dfg.insts[i].opcode().can_store())
+                })
+            {
+                bail!("counted loop of unknown length that stores");
+            }
+            // `PLIRON_PUNROLL_PEELFIRST=1`: short trips keep the peel the
+            // rolled loop would have had (`run` peels, then unrolls what
+            // is left on the rescan).
+            if peelfirst_on() && !PEELED.with(|s| s.borrow().contains(&h)) {
+                WANT_PEEL.with(|c| c.set(true));
+                bail!("peel first");
             }
             k = k.min(wk);
         }
