@@ -1336,13 +1336,16 @@ fn split(
         // value is the smallest aggregate (bytes) the rule takes: small
         // structs of byte fields (regex's `EmptyFlags`) are cheaper as one
         // wide copy than as a store per field (`=1`: regex +0.36%). Every
-        // piece must be written by a direct store: a piece nothing writes
+        // piece but less than a word of padding must be written by a
+        // direct store: a piece nothing writes
         // (an enum variant's padding and unused fields) still costs the
         // split copy a store, where the whole copy moved it for free
         // (regex's `CompileClass::c_utf8_seq`, 32 bytes, 7 pieces, 4
         // accesses: +96k executed instructions).
         let out_min: u64 = crate::env_get("PLIRON_SROA_FRAGCOPY_OUT").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let built_in_place = || {
+        // `Some(written)` per piece when only direct accesses and one
+        // copy out touch the aggregate.
+        let built_in_place = || -> Option<Vec<bool>> {
             let mut outs = 0;
             let mut written = vec![false; sl.len()];
             for x in &acc {
@@ -1350,7 +1353,7 @@ fn split(
                     Kind::Load => {}
                     Kind::Store => {
                         if x.flow {
-                            return false;
+                            return None;
                         }
                         let n = access_ty(ctx, x).map(|t| size_align(ctx, t).0).unwrap_or(size);
                         for (i, sx) in sl.iter().enumerate() {
@@ -1360,20 +1363,33 @@ fn split(
                         }
                     }
                     Kind::Copy { dst: false, .. } => outs += 1,
-                    _ => return false,
+                    _ => return None,
                 }
             }
-            outs == 1 && written.iter().all(|&w| w)
+            (outs == 1).then_some(written)
         };
         if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per, word) {
-            if !(out_min > 0 && size >= out_min && built_in_place()) {
-                return false;
-            }
-            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::sroa", tracing::Level::DEBUG) {
+            let w = if out_min > 0 && size >= out_min { built_in_place() } else { None };
+            // Padding is the exception: unwritten pieces of less than a
+            // word in all (`PropertiesI`'s last byte).
+            let take = w.as_ref().is_some_and(|w| {
+                w.iter().zip(&pieces).filter(|(x, _)| !**x).map(|(_, p)| p.1).sum::<u64>() < word
+            });
+            if pliron_cfg::tracing_on() && w.is_some() && tracing::enabled!(target: "pliron::sroa", tracing::Level::DEBUG) {
                 let fop = alloca_fn(ctx, alloca);
                 let name = st.funcs.iter().find(|(_, f)| f.op == fop).map(|(n, _)| n.as_str()).unwrap_or("?");
-                tracing::debug!(target: "pliron::sroa", "sroa: fragcopy-out split {size} B, {} pieces, {direct} direct in {name}",
-                    pieces.len());
+                let unwritten: Vec<(u64, u64)> = w
+                    .iter()
+                    .flatten()
+                    .zip(&pieces)
+                    .filter(|(x, _)| !**x)
+                    .map(|(_, &p)| p)
+                    .collect();
+                tracing::debug!(target: "pliron::sroa", "sroa: fragcopy-out {} {size} B, {} pieces, {direct} direct, unwritten {unwritten:?} in {name}",
+                    if take { "split" } else { "kept" }, pieces.len());
+            }
+            if !take {
+                return false;
             }
         }
     }
