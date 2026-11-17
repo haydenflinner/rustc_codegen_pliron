@@ -19,6 +19,7 @@ pub mod mergejump;
 pub mod bittab;
 pub mod brifsel;
 pub mod demand;
+pub mod demanded;
 pub mod ivdown;
 pub mod ivmerge;
 pub mod tripfold;

@@ -910,6 +910,9 @@ struct CgRow {
     /// `PLIRON_RA2_MOVESTATS=1`: the allocator's moves by kind, weighted
     /// by block frequency (`regalloc2::MV_NAMES`; `16 + k` stack side).
     mv: [u64; 32],
+    /// Standalone narrow extensions: `uxtb`/`uxth`/`sxtb`/`sxth` and
+    /// `and w, w, #0xff`/`#0xffff`.
+    ext: u64,
 }
 
 /// Labels gain the CLIF loop depth: `block3: ; block7 depth=2` (a split
@@ -1008,6 +1011,12 @@ fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64, depth_of: &dyn Fn(&str
         for t in insts {
             row.insts += 1;
             row.winsts += w;
+            let mn = t.split_whitespace().next().unwrap_or("");
+            if matches!(mn, "uxtb" | "uxth" | "sxtb" | "sxth")
+                || (mn == "and" && (t.ends_with("#255") || t.ends_with("#65535") || t.ends_with("#0xff") || t.ends_with("#0xffff")))
+            {
+                row.ext += 1;
+            }
             if is_reg_copy(t) {
                 row.movs += 1;
                 row.wmov += w;
@@ -1139,14 +1148,14 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     let json = serde_json::json!({
         "corpus": dir.display().to_string(),
         "insts": sum(|r| r.insts as u64), "stack": sum(|r| r.stack as u64),
-        "winsts": sum(|r| r.winsts), "wstack": sum(|r| r.wstack), "wspill": sum(|r| r.wspill),
+        "winsts": sum(|r| r.winsts), "wstack": sum(|r| r.wstack), "wspill": sum(|r| r.wspill), "ext": sum(|r| r.ext),
         "movs": sum(|r| r.movs as u64), "wmov": sum(|r| r.wmov),
         "deadmov": sum(|r| r.deadmov as u64), "wdeadmov": sum(|r| r.wdeadmov),
         "functions": rows.iter().map(|r| {
             let mut j = serde_json::json!({
                 "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
                 "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
-                "movs": r.movs, "wmov": r.wmov, "mv": r.mv, "deadmov": r.deadmov,
+                "movs": r.movs, "wmov": r.wmov, "mv": r.mv, "deadmov": r.deadmov, "ext": r.ext,
             });
             if !r.msg.is_empty() {
                 j["msg"] = r.msg.chars().take(4000).collect::<String>().into();
@@ -1175,9 +1184,9 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
         }
     }
     println!(
-        "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} (dead {} / {}) -> {}",
+        "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} (dead {} / {}) | ext {} -> {}",
         rows.len(),
-        json["insts"], json["stack"], json["movs"], json["winsts"], json["wstack"], json["wspill"], json["wmov"], json["deadmov"], json["wdeadmov"],
+        json["insts"], json["stack"], json["movs"], json["winsts"], json["wstack"], json["wspill"], json["wmov"], json["deadmov"], json["wdeadmov"], json["ext"],
         out.display()
     );
     bad == 0

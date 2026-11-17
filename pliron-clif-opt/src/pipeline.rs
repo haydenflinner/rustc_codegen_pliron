@@ -4721,6 +4721,14 @@ fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_demanded(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::demanded::run(&mut p.clctx.func, &p.target);
+    if k > 0 {
+        p.dump("demanded");
+    }
+    k
+}
+
 fn s_memcmpk(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let little = p.isa.endianness() == cranelift_codegen::ir::Endianness::Little;
     let k = crate::memcmpk::run_with(&mut p.clctx.func, p.fn_names, p.fname, p.const_tables, little);
@@ -5861,6 +5869,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_egraph,
             site: std::sync::OnceLock::new(),
         },
+        // Demanded bits: masks nobody reads go, and narrow i8/i16 chains
+        // that are extended or stored narrow are rebuilt wide (the
+        // `ireduce` `uxtb`s and the root extend on aarch64, the per-op
+        // `& 255` on wasm). After egraph2, whose `ireduce` push-down
+        // would undo the widening.
+        step("demanded", "demanded", Gate::OptIn("PLIRON_DEMANDED"), s_demanded),
         // Clone a small merge block for the pred edge whose arm fact +
         // arg ranges decide insts the join cannot (UTF-8 decode `c <
         // 128` on the ASCII edge): `icmp`/`uextend`/`iadd` -> `+1`.

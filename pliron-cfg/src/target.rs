@@ -162,6 +162,17 @@ impl Target {
         self.is_aarch64()
     }
 
+    /// Narrow integers (`i8`/`i16`) are kept zero-extended in their
+    /// container: the emitter masks after every narrow add, subtract,
+    /// multiply and shift, so a narrow value's extension is free and its
+    /// arithmetic is not. True on wasm32 (`& 255`/`& 65535`); the native
+    /// lowerings leave the high bits undefined and extend at the use
+    /// (aarch64 `uxtb`/`uxth`). Uses: `demanded`'s cost of rebuilding a
+    /// narrow chain wide.
+    pub const fn narrow_masked(&self) -> bool {
+        self.is_wasm()
+    }
+
     /// (allocatable, callee-saved) integer registers, for register
     /// pressure estimates (licm's `PLIRON_LICM_INNERPRESS=2`). `None` on
     /// wasm32, which has no register file of ours.
