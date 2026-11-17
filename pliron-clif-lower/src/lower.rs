@@ -2428,6 +2428,12 @@ pub fn lower_module<'a>(
                         .map(|u| u.index),
                 );
             }
+            // `PLIRON_UNDEFPHI=1` (opt-in): joins of one value and the
+            // lowering's undefined zeros take that value
+            // (`pliron_clif_opt::undefphi`).
+            if crate::env_is("PLIRON_UNDEFPHI", "1") {
+                pliron_clif_opt::undefphi::run(&mut clctx.func, &undef);
+            }
             let uen_syms = uen_syms_of(m, &clctx.func);
             let corpus_syms = corpus_syms_of(m, ctx, st, &clctx.func, undef);
             emit(
@@ -3502,6 +3508,9 @@ pub fn lower_clif_wasm(
                 fl.undef,
             )
         };
+        if crate::env_is("PLIRON_UNDEFPHI", "1") {
+            pliron_clif_opt::undefphi::run(&mut clctx.func, &undef);
+        }
         let uen_syms = uen_syms_of(&m, &clctx.func);
         let corpus_syms = corpus_syms_of(&m, ctx, st, &clctx.func, undef);
         emit(
