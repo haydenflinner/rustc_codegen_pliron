@@ -820,7 +820,7 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
 `bench.mjs` refuses otherwise).
 
 1. **N1, the wasm loop-site inline bonus** (in progress 2026-11-17).
-2. **`game_asteroids` 1.39x against LLVM** (in progress 2026-11-17), the worst like-for-like dsa
+2. **`game_asteroids` 1.39x against LLVM** (2026-11-17: `PLIRON_FCMPFOLD`, `PLIRON_FMUL1`, `PLIRON_UNROLL2` landed opt-in, see "Held-out wasm program"; flip once the dsa row is timed; next lever: inlining nalgebra's products), the worst like-for-like dsa
    row (rapier2d's soft-FEM assembly and solve). Profile both sides
    (`harness/dsa/prof.sh game_asteroids`, `cmpprof.py`, `hot.sh`), find
    the top functions by self time and what our code does worse there
