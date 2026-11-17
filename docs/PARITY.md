@@ -796,6 +796,51 @@ in the scoreboard and in the linked history files.
 
 ## Work list
 
+### Codegen queue (2026-11-17, overnight)
+
+Ranked work for the agents that keep improving generated code; take the
+top item nobody holds, mark it with the date when you start, move it to
+the history log when it lands. Every item: default-off knob, unit tests,
+corpus replays, `harness/xcorpus.py` for IR-pass changes, the wasm
+kernels (no kernel may lose; time only at load under ~10, else report
+bytes and leave it opt-in), one dsa build with the 19-workload
+cross-check (the LLVM side must be built from the same dsa HEAD:
+`bench.mjs` refuses otherwise).
+
+1. **N1, the wasm loop-site inline bonus** (in progress 2026-11-17).
+2. **`game_asteroids` 1.39x against LLVM**, the worst like-for-like dsa
+   row (rapier2d's soft-FEM assembly and solve). Profile both sides
+   (`harness/dsa/prof.sh game_asteroids`, `cmpprof.py`, `hot.sh`), find
+   the top functions by self time and what our code does worse there
+   (V8 machine code via `harness/v8/mcode.sh`-style listings), fix the
+   largest cause.
+3. **`dims_page` 1.2x** (diffuse in the profile): same method; the
+   self-time join first.
+4. **`contains_rng` +9.5% on wasm** (an honest gap since the `black_box`
+   fix: its bounds are no longer constants). Compare with LLVM's wasm and
+   TurboFan code for the loop.
+5. **N7, the default hmget +5% / 102 vs 96 TurboFan instructions per
+   lookup**: `invparam` splits the lookup loop into two headers (the
+   memory base reloads at both), the hash expression has two extra
+   xor/rotate pairs, `k + (round & 1)` is recomputed per lookup.
+6. **N9 #3 and #4**, constant rematerialization (up to 824 KB on dsa)
+   and values parked in locals across block openers (0.3-0.6 MB):
+   waffle `treeify.rs::is_remat`, `stackify.rs`.
+7. **vm_loop / vm_mandelbrot +5-10%** (the Mimas interpreter's dispatch
+   loop): profile `step_one`.
+8. **Native**: the held-out programs (`bench/heldout/run.py`, 1.08x
+   on 2026-11-09) with tonight's wasm-only defaults tried on native one
+   at a time (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`,
+   `PLIRON_INLINE_RECX=1`): exact instruction counts with
+   `bench/heldout/irdiff.py` decide.
+
+Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
+times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
+`PLIRON_WASM_BRTAB_SHARE`, `PLIRON_WCOAL_EDGE`,
+`PLIRON_MEMCPYOPT_SIBARMS`, `PLIRON_WASM_ONEEXIT`, `PLIRON_WASM_MASKELIM`.
+Blocked on V8 code placement (being investigated): `PLIRON_WASM_ICF`,
+`PLIRON_WASM_NOREALIGN`.
+
 ### Next: wasm code size and robustness (queued 2026-11-16 evening)
 
 From the `Compiler::compile` investigation
