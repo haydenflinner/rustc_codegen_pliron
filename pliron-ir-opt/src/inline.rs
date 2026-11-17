@@ -1563,6 +1563,26 @@ pub fn run(
     } else {
         crate::env_get("PLIRON_INLINE_LEAN").and_then(|s| s.parse().ok()).unwrap_or(0)
     };
+    // `PLIRON_INLINE_LEANCOST=<w>` (opt-in, `0` off): a callee with at
+    // most `w` warm calls scores by its `lean_cost` (constant branches
+    // folded; slot loads/stores, jumps, allocas, markers and dead compares
+    // free) when that is below the threshold its raw count missed.
+    // nalgebra's `Matrix<2,3> * Matrix<3,2>` is 2,294 raw ops (765 `br`,
+    // 431 lifetime markers, 225 allocas) and 478 lean, and becomes 33
+    // instructions once the CLIF pipeline unrolls `gemm`; LLVM, which
+    // scores the simplified body, inlines it into rapier2d's
+    // `assemble_operator` and unrolls the loops around it.
+    let leancost_w: Option<usize> = if always_only {
+        None
+    } else {
+        crate::env_get("PLIRON_INLINE_LEANCOST").and_then(|s| s.parse().ok()).filter(|&w| w > 0)
+    };
+    // `PLIRON_INLINE_LEANCOST_PCT` (default 30): only a callee whose lean
+    // size is at most this share of its raw count, i.e. one that is mostly
+    // scaffolding (the nalgebra product is 21%; dlmalloc's helpers, real
+    // code, are not).
+    let leancost_pct: usize =
+        crate::env_get("PLIRON_INLINE_LEANCOST_PCT").and_then(|s| s.parse().ok()).unwrap_or(30);
     let lean_pure = crate::cleanup::Pure::new();
     let mut lean_memo: FxHashMap<String, crate::inline_cost::SpecCost> = FxHashMap::default();
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
@@ -2075,6 +2095,23 @@ pub fn run(
                     if lean {
                         t = cost;
                     }
+                    // `PLIRON_INLINE_LEANCOST`: scored by its lean size.
+                    let mut leancost = false;
+                    if let Some(w) = leancost_w
+                        && !lean
+                        && !f.cold
+                        && cost > t
+                        && ci.nwarm <= w
+                    {
+                        let lc = *lean_memo
+                            .entry(cs.clone())
+                            .or_insert_with(|| crate::inline_cost::lean_cost(ctx, st, ci.op, &lean_pure));
+                        lean_n = lc.n;
+                        if lc.n <= t && lc.n.saturating_mul(100) <= ci.n.saturating_mul(leancost_pct) {
+                            leancost = true;
+                            t = cost;
+                        }
+                    }
                     // `#[inline(always)]` skips the score like LLVM's
                     // AlwaysInliner (`PLIRON_INLINE_ALWAYS=0` restores it; the
                     // caller `cap` and the recursion/EH rules still apply).
@@ -2155,6 +2192,10 @@ pub fn run(
                             d[0] += ci.n.saturating_sub(1);
                             d[1] += ci.ncalls.saturating_sub(1);
                             d[2] += ci.nwarm.saturating_sub(1);
+                        }
+                        if leancost {
+                            // Its caller is scored as what it absorbed.
+                            d[0] += ci.n.saturating_sub(lean_n);
                         }
                         if d != [0; 3] {
                             lean_add.push(d);

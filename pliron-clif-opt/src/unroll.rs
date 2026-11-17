@@ -54,6 +54,7 @@ fn max_insts() -> usize {
 /// RNG's refill, uuid's parser, a 112-entry `binary_search`) were all
 /// past 256.
 const LATE_INSTS: usize = 256;
+const LATE_LOOPS: usize = 32;
 
 thread_local! {
     /// `max_insts` for the round in progress (`run_opts`).
@@ -106,8 +107,19 @@ pub fn run_opts(
     } else {
         usize::MAX
     };
+    // The late round's loop budget (`PLIRON_UNROLL2_LOOPS`, default
+    // [`LATE_LOOPS`]): with nalgebra's products inlined
+    // (`PLIRON_INLINE_LEANCOST`), rapier2d's `assemble_operator` holds six
+    // small loops per product and both rounds stopped at `MAX_LOOPS`.
+    let max_loops = if pure_only {
+        crate::env_get("PLIRON_UNROLL2_LOOPS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LATE_LOOPS)
+    } else {
+        MAX_LOOPS
+    };
     ROUND_CAP.with(|c| c.set(cap));
-    let n = run_round(func, an, loads, derived, prof, symon, pure_only);
+    let n = run_round(func, an, loads, derived, prof, symon, pure_only, max_loops);
     ROUND_CAP.with(|c| c.set(usize::MAX));
     n
 }
@@ -120,6 +132,7 @@ fn run_round(
     prof: &FxHashMap<Block, u64>,
     symon: bool,
     pure_only: bool,
+    max_loops: usize,
 ) -> usize {
     // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
     let empty_prof = FxHashMap::default();
@@ -140,7 +153,7 @@ fn run_round(
     // `uses` feeds each candidate's `used_out` query: without it the
     // outside-use scan is O(fn) per loop header. Shared index; an
     // unroll's `an.invalidate()` rebuilds it for the next round.
-    'outer: while n < MAX_LOOPS {
+    'outer: while n < max_loops {
         // Fetched before `cfg_dt` — its `&mut` borrow would block the
         // shared index call.
         let u = an.uses(func);
