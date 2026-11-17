@@ -1,0 +1,66 @@
+function u0:0(i64, i64) -> f32, f32 fast {
+    ss0 = explicit_slot 4, align = 4
+    ss1 = explicit_slot 8, align = 4
+
+block0(v0: i64, v1: i64):
+    v2 = f32const 0.0
+    v3 = stack_addr.i64 ss0
+    store notrap v2, v3
+    v4 = stack_addr.i64 ss1
+    store notrap v2, v4
+    store notrap v2, v4+4
+    v5 = iconst.i64 0
+    v6 = iconst.i64 1
+    v7 = iconst.i64 2
+    v8 = iconst.i64 3
+    v9 = iconst.i64 4
+    jump block1(v5)
+
+block1(v10: i64):
+    v11 = load.f32 notrap v3
+    v12 = f32const 0.0
+    v13 = fcmp eq v11, v12
+    v14 = imul v10, v9
+    v15 = iadd v1, v14
+    v16 = load.f32 notrap v15
+    v17 = ishl v10, v8
+    v18 = iadd v0, v17
+    brif v13, block2(v5), block3(v5)
+
+block2(v20: i64):
+    v21 = imul v20, v9
+    v22 = iadd v4, v21
+    v23 = iadd v18, v21
+    v24 = load.f32 notrap v23
+    v25 = load.f32 notrap v22
+    v26 = fmul v24, v16
+    v27 = fadd v25, v26
+    store notrap v27, v22
+    v28 = iadd v20, v6
+    v29 = icmp ult v28, v7
+    brif v29, block2(v28), block4
+
+block3(v30: i64):
+    v31 = imul v30, v9
+    v32 = iadd v4, v31
+    v33 = iadd v18, v31
+    v34 = load.f32 notrap v33
+    v35 = load.f32 notrap v32
+    v36 = fmul v35, v11
+    v37 = fmul v34, v16
+    v38 = fadd v36, v37
+    store notrap v38, v32
+    v39 = iadd v30, v6
+    v40 = icmp ult v39, v7
+    brif v40, block3(v39), block4
+
+block4:
+    v41 = iadd v10, v6
+    v42 = icmp ult v41, v8
+    brif v42, block1(v41), block5
+
+block5:
+    v43 = load.f32 notrap v4
+    v44 = load.f32 notrap v4+4
+    return v43, v44
+}

@@ -2448,10 +2448,14 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
+    unroll_round(p, an, false)
+}
+
+fn unroll_round(p: &mut Pipe, an: &mut Analysis, pure_only: bool) -> usize {
     // Symbolic cursors: wasm only, a measurement boundary (native was
     // not timed).
     let sym = p.target.is_wasm() && pliron_cfg::env_is("PLIRON_UNROLL_SYM", "1");
-    let k = unroll::run_with(&mut p.clctx.func, an, p.nonnull, p.derived, p.prof, sym);
+    let k = unroll::run_opts(&mut p.clctx.func, an, p.nonnull, p.derived, p.prof, sym, pure_only);
     // The skipped loop is now unreachable, and its trip count still
     // flows into dead params/branches; dropping them frees the slot
     // address arithmetic so slot DSE can see the slot doesn't escape.
@@ -2505,7 +2509,8 @@ fn s_unroll(p: &mut Pipe, an: &mut Analysis) -> usize {
 // result: `loadfwd` (the per-element stores become values), `slotprom`,
 // `dse` and the `egraph`.
 fn s_unroll2(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = s_unroll(p, an);
+    // Loops with a call or a `black_box` stay (`unroll::run_opts`).
+    let k = unroll_round(p, an, true);
     if k == 0 {
         return 0;
     }

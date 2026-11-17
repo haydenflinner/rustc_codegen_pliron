@@ -69,6 +69,23 @@ pub fn run_with(
     prof: &FxHashMap<Block, u64>,
     symon: bool,
 ) -> usize {
+    run_opts(func, an, loads, derived, prof, symon, false)
+}
+
+/// [`run_with`]; with `pure_only` a loop whose body calls a function or
+/// holds a `black_box` is left alone. The late round (`PLIRON_UNROLL2`)
+/// is for small arithmetic nests: a call costs more than the loop's own
+/// branch, and copying a benchmark's `black_box` loop only moves code
+/// (wasm `k_fib`'s eight `fib(black_box(28))` calls).
+pub fn run_opts(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    loads: &FxHashSet<Value>,
+    derived: &VMap<Value>,
+    prof: &FxHashMap<Block, u64>,
+    symon: bool,
+    pure_only: bool,
+) -> usize {
     // PGO ablation: PLIRON_PGO_LOOP=0 blinds all profile reads.
     let empty_prof = FxHashMap::default();
     let prof: &FxHashMap<Block, u64> = if crate::pass_enabled("PLIRON_PGO_LOOP") {
@@ -106,6 +123,18 @@ pub fn run_with(
             let Some((pred, pinst, body, entry, used_out)) = candidate(func, cfg, dt, &u, h) else {
                 continue;
             };
+            // A panic path (`call panic_*; trap`) never reaches a latch, so
+            // it is outside `body` and does not count.
+            if pure_only
+                && body.iter().any(|&b| {
+                    func.layout.block_insts(b).any(|i| {
+                        let op = func.dfg.insts[i].opcode();
+                        op.is_call() || op == cranelift_codegen::ir::Opcode::BlackBox
+                    })
+                })
+            {
+                continue;
+            }
             if pliron_cfg::tracing_on()
                 && tracing::enabled!(target: "pliron::unroll", tracing::Level::DEBUG)
             {
