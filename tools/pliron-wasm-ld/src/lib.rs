@@ -18,6 +18,7 @@
 //! before the first export's body (`wrap_exports` below).
 
 mod addroff;
+pub mod icf;
 mod brhint;
 mod llvm;
 
@@ -1608,6 +1609,27 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         });
     }
     let mut out_bytes = module.finish();
+    // Post-link: identical-code folding first, while the module is still
+    // plain (`addroff`/`brhint` work on its final bytes).
+    // `PLIRON_WASM_ICF=1` (opt-in).
+    if std::env::var_os("PLIRON_WASM_ICF").is_some_and(|v| v == "1") {
+        let t0 = std::time::Instant::now();
+        if let Some((b, st)) = icf::fold(&out_bytes)? {
+            if std::env::var_os("PLIRON_WASM_LD_VERBOSE").is_some() {
+                eprintln!(
+                    "pliron-wasm-ld: icf: {} of {} functions folded into {} kept ({} rounds), {} -> {} bytes, {:?}",
+                    st.removed,
+                    st.defined,
+                    st.classes_folded,
+                    st.rounds,
+                    st.bytes_before,
+                    st.bytes_after,
+                    t0.elapsed()
+                );
+            }
+            out_bytes = b;
+        }
+    }
     // Post-link: GOT reads are i32.const now. Folding one into a memarg
     // is opt-in (`PLIRON_WASM_ADDROFF=1`); the chars_mixed probes got
     // slower with it on. Branch hints stay opt-in via PLIRON_WASM_BRHINT.
