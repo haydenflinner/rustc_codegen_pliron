@@ -4656,6 +4656,17 @@ fn s_mintrip(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_stkorder(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    if !p.target.is_wasm() {
+        return 0;
+    }
+    let k = crate::stkorder::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("stkorder");
+    }
+    k
+}
+
 fn s_xorcancel(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = crate::xorcancel::run(&mut p.clctx.func);
     if k > 0 {
@@ -5922,6 +5933,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // instruction gives it to the branch block and is move-only
         // again. Wasm only, opt-in: `PLIRON_ARMHOIST=1`.
         step("armhoist", "armhoist", Gate::OptIn("PLIRON_ARMHOIST"), s_armhoist).needs(shape::CONDBR),
+        // Wasm: a value used twice moves next to its first use, and a
+        // commutative first use takes it as its first operand, so the
+        // emitter can `local.tee` it (`stkorder.rs`). After every
+        // placement pass. Opt-in: `PLIRON_WASM_STKORDER=1`.
+        step("stkorder", "stkorder", Gate::OptIn("PLIRON_WASM_STKORDER"), s_stkorder),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
