@@ -33,10 +33,12 @@ objects), which moves every function's page and set bits.
             evidence. Cycles: the macOS build of each copy (`ab.py`'s build
             cache) timed `--rounds` times interleaved under `/usr/bin/time -l`.
   kernels   The native kernels (`bench/run.sh`), each copy built with the
-            keyed backend path. Per kernel: ns/op over `--rounds`
-            interleaved epochs per copy, and exact instructions per op on
-            macOS from two fixed-count runs (`-benchtime Nx` and 2N:
-            the difference over N cancels setup). No `nop` split.
+            keyed backend path. Per kernel: retired instructions and
+            cycles per op at a fixed iteration count (`-benchtime Nx` and
+            2N under `/usr/bin/time -l`, the difference over N cancels
+            setup; the smallest of `--tries` runs). Counters barely move
+            with the machine's load, wall time does: `--wall` adds
+            `--rounds` interleaved `-benchtime` epochs. No `nop` split.
 
 `--cand NAME:K=V,..` (repeatable) builds the same copies with that
 environment. Verdict per program and kernel: the base's range over its
@@ -487,14 +489,32 @@ def bench_epoch(exe, filt, benchtime):
     return res
 
 
-def retired(exe, kernel, n):
+def counters(exe, kernel, n):
+    """(instructions, cycles) of one process running `kernel` n times."""
     p = subprocess.run(["/usr/bin/time", "-l", exe, "=" + kernel, "-benchtime", f"{n}x", "-count", "1", "-cpu", "1"],
                        capture_output=True, text=True, cwd=ROOT)
-    m = re.search(r"^\s*(\d+)\s+instructions retired", p.stderr, re.M)
-    return int(m.group(1)) if m else 0
+    ins = re.search(r"^\s*(\d+)\s+instructions retired", p.stderr, re.M)
+    cyc = re.search(r"^\s*(\d+)\s+cycles elapsed", p.stderr, re.M)
+    return (int(ins.group(1)) if ins else 0), (int(cyc.group(1)) if cyc else 0)
+
+
+def per_op(exe, kernel, n, tries):
+    """Instructions and cycles per op at a fixed iteration count:
+    (X(2N) - X(N)) / N, the smallest of `tries` runs of each (setup and a
+    loaded machine only ever add). Counters, not wall time: a core's
+    cycles while the process runs barely move with the machine's load."""
+    a = [counters(exe, kernel, n) for _ in range(tries)]
+    b = [counters(exe, kernel, 2 * n) for _ in range(tries)]
+    return ((min(x[0] for x in b) - min(x[0] for x in a)) / n,
+            (min(x[1] for x in b) - min(x[1] for x in a)) / n)
 
 
 STAT = {"min": min, "median": statistics.median}
+
+
+def kernel_names(exe, filt):
+    """Kernel names (lower case) and a rough ns/op from one short epoch each."""
+    return bench_epoch(exe, filt, "50ms")
 
 
 def kernels(a):
@@ -511,35 +531,41 @@ def kernels(a):
             exes[(lab, i)] = kernel_bin(lab, envs[lab], p, i)
             log(f"  kernels {lab} p{p} s{i}: {time.time() - t0:.0f}s")
     cells = list(exes)
-    data = collections.defaultdict(lambda: collections.defaultdict(list))
-    for r in range(a.rounds):
-        for cell in (cells if r % 2 == 0 else cells[::-1]):
-            for k, ns in bench_epoch(exes[cell], a.filter, a.benchtime).items():
-                data[cell][k].append(ns)
-    names = sorted({k for c in cells for k in data[c]})
+    rough = kernel_names(exes[("base", 0)], a.filter)
+    wall = collections.defaultdict(lambda: collections.defaultdict(list))
+    if a.wall:
+        for r in range(a.rounds):
+            for cell in (cells if r % 2 == 0 else cells[::-1]):
+                for k, ns in bench_epoch(exes[cell], a.filter, a.benchtime).items():
+                    wall[cell][k].append(ns)
     out = {}
-    for k in names:
-        med = {c: STAT[a.stat](data[c][k]) for c in cells if data[c][k]}
-        # Exact instructions per op: (I(2N) - I(N)) / N, N ~ 0.3 s of work;
-        # the smaller of two tries of each (a process's setup moves ~1M).
-        n = max(1, int(0.3e9 / med[("base", 0)]))
-        ipo = {c: (min(retired(exes[c], k, 2 * n) for _ in range(2))
-                   - min(retired(exes[c], k, n) for _ in range(2))) / n for c in cells}
-        base_t = [med[("base", i)] for i in range(len(phases))]
-        base_i = [ipo[("base", i)] for i in range(len(phases))]
-        c0 = data[("base", 0)][k]
-        print(f"\n{k}: ns/op copy 0 {base_t[0]:.1f}  base range {rng(base_t, statistics.median(base_t))}"
-              f" (copy 0's own rounds: median/min {100 * (statistics.median(c0) / min(c0) - 1):+.1f}%)"
-              f";  instructions/op {base_i[0]:.0f}, range {rng(base_i, statistics.median(base_i))}")
-        out[k] = {"base": {"ns": base_t, "ipo": base_i}}
+    for k in sorted(rough):
+        # N ~ 0.1 s of work per run at the rough speed.
+        n = max(1, int(0.1e9 / max(rough[k], 1.0)))
+        po = {c: per_op(exes[c], k, n, a.tries) for c in cells}
+        bi = [po[("base", i)][0] for i in range(len(phases))]
+        bc = [po[("base", i)][1] for i in range(len(phases))]
+        print(f"\n{k}: per op (N={n}): instructions {bi[0]:.0f}, base range {rng(bi, statistics.median(bi))};"
+              f"  cycles {bc[0]:.0f}, base range {rng(bc, statistics.median(bc))}", flush=True)
+        out[k] = {"base": {"ipo": bi, "cpo": bc}}
+        if a.wall:
+            bt = [STAT[a.stat](wall[("base", i)][k]) for i in range(len(phases))]
+            print(f"  wall ns/op base range {rng(bt, statistics.median(bt))}")
+            out[k]["base"]["ns"] = bt
         for lab in labels[1:]:
-            ct = [med[(lab, i)] for i in range(len(phases))]
-            ci = [ipo[(lab, i)] for i in range(len(phases))]
-            bm, cm, v = verdict(base_t, ct)
-            bi, cim, vi = verdict(base_i, ci)
-            print(f"  {lab:<10} ns/op median {100 * (cm / bm - 1):+.2f}% (copy 0 {100 * (ct[0] / base_t[0] - 1):+.2f}%,"
-                  f" own range {rng(ct, cm)}) -> {v};  instructions/op median {100 * (cim / bi - 1):+.3f}% -> {vi}")
-            out[k][lab] = {"ns": ct, "ipo": ci, "verdict": v, "verdict_ipo": vi}
+            ci = [po[(lab, i)][0] for i in range(len(phases))]
+            cc = [po[(lab, i)][1] for i in range(len(phases))]
+            _, _, vi = verdict(bi, ci)
+            bm, cm, vc = verdict(bc, cc)
+            im = statistics.median(ci) / statistics.median(bi) - 1
+            print(f"  {lab:<10} instructions/op median {100 * im:+.3f}% (copy 0 {100 * (ci[0] / bi[0] - 1):+.3f}%) -> {vi};"
+                  f"  cycles/op median {100 * (cm / bm - 1):+.2f}% (own range {rng(cc, cm)}) -> {vc}", flush=True)
+            out[k][lab] = {"ipo": ci, "cpo": cc, "verdict_ipo": vi, "verdict_cpo": vc}
+            if a.wall:
+                ct = [STAT[a.stat](wall[(lab, i)][k]) for i in range(len(phases))]
+                _, _, vt = verdict(bt, ct)
+                print(f"  {'':<10} wall ns/op median {100 * (statistics.median(ct) / statistics.median(bt) - 1):+.2f}% -> {vt}")
+                out[k][lab]["ns"] = ct
     os.makedirs(OUT, exist_ok=True)
     json.dump(out, open(os.path.join(OUT, f"kernels.{'-'.join(labels)}.json"), "w"), indent=1)
 
@@ -565,7 +591,9 @@ def main():
             p.add_argument("--clean", action="store_true")
             p.add_argument("--top", type=int, default=8)
         else:
-            p.add_argument("--benchtime", default="500ms")
+            p.add_argument("--benchtime", default="500ms", help="with --wall")
+            p.add_argument("--wall", action="store_true", help="also time -benchtime epochs (load-sensitive)")
+            p.add_argument("--tries", type=int, default=3, help="runs per count, the smallest kept")
     a = ap.parse_args()
     DYLIB = os.path.abspath(a.backend)
     a.copies = max(1, min(len(PHASES), a.copies))
