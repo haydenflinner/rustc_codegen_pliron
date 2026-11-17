@@ -45,8 +45,58 @@ fn load_side(text: &str) -> Option<Side> {
     }
     let func = fs.remove(0);
     let facts = parse_facts(text, &func);
-    let syms = facts.syms_of(&func);
+    let syms = anon_by_content(facts.syms_of(&func));
     Some(Side { func, facts, syms })
+}
+
+/// The backend names a constant it makes up `__rcg_alloc.<n>`, `n` counting
+/// in the order the build declared them: two builds of one program number
+/// them differently, and one constant got two addresses in the pair
+/// (`TryFromIntError`'s `Debug`: its vtable). Such a symbol whose image is
+/// recorded goes by its content instead: bytes, and the relocations with
+/// their targets renamed the same way (to a fixed depth).
+fn anon_by_content(mut s: Syms) -> Syms {
+    const ANON: &str = "__rcg_alloc.";
+    let mut rename: FxHashMap<String, String> = FxHashMap::default();
+    for _ in 0..3 {
+        let mut next: FxHashMap<String, String> = FxHashMap::default();
+        for (sym, img) in &s.data {
+            if !sym.starts_with(ANON) {
+                continue;
+            }
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut eat = |b: &[u8]| {
+                for &x in b {
+                    h = (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3);
+                }
+            };
+            eat(&img.bytes);
+            for r in &img.relocs {
+                eat(&r.off.to_le_bytes());
+                eat(rename.get(&r.sym).unwrap_or(&r.sym).as_bytes());
+                eat(&r.addend.to_le_bytes());
+            }
+            next.insert(sym.clone(), format!("__rcg_alloc#{h:016x}"));
+        }
+        rename = next;
+    }
+    if rename.is_empty() {
+        return s;
+    }
+    let re = |n: &String| rename.get(n).cloned().unwrap_or_else(|| n.clone());
+    for v in s.names.values_mut() {
+        *v = re(v);
+    }
+    s.data = std::mem::take(&mut s.data)
+        .into_iter()
+        .map(|(k, mut img)| {
+            for r in &mut img.relocs {
+                r.sym = re(&r.sym);
+            }
+            (re(&k), img)
+        })
+        .collect();
+    s
 }
 
 /// The symbol a corpus file was recorded for: `self=` of its facts line,
