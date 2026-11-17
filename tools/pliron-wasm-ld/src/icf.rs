@@ -249,7 +249,23 @@ pub fn fold(m: &[u8]) -> Result<Option<(Vec<u8>, Stats)>, String> {
     for (i, &c) in cls.iter().enumerate() {
         rep.entry(c).or_insert(i as u32);
     }
-    let keep: Vec<bool> = cls.iter().enumerate().map(|(i, c)| rep[c] == i as u32).collect();
+    // `PLIRON_WASM_ICF_MAX=N`: fold only the first N removable functions
+    // (by index); the rest stay. For bisecting a folded module.
+    let max = std::env::var("PLIRON_WASM_ICF_MAX").ok().and_then(|v| v.parse::<usize>().ok());
+    let mut seen = 0usize;
+    let rep_of: Vec<u32> = cls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let r = rep[c];
+            if r == i as u32 {
+                return r;
+            }
+            seen += 1;
+            if max.is_some_and(|m| seen > m) { i as u32 } else { r }
+        })
+        .collect();
+    let keep: Vec<bool> = rep_of.iter().enumerate().map(|(i, &r)| r == i as u32).collect();
     let mut new_def = vec![u32::MAX; n];
     let mut k = nimp;
     for i in 0..n {
@@ -260,7 +276,7 @@ pub fn fold(m: &[u8]) -> Result<Option<(Vec<u8>, Stats)>, String> {
     }
     // Old function index -> new index of its class's kept member.
     let map: Vec<u32> = (0..nimp)
-        .chain((0..n).map(|i| new_def[rep[&cls[i]] as usize]))
+        .chain((0..n).map(|i| new_def[rep_of[i] as usize]))
         .collect();
     let removed = keep.iter().filter(|&&x| !x).count();
     let mut folded_cls: FxHashMap<u32, usize> = FxHashMap::default();
